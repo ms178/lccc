@@ -192,6 +192,7 @@ pub(super) mod parsed_attr_flag {
     /// honours it for functions not defined in the same translation unit
     /// (measured 2026-10-30: a same-TU definition still gets `R_X86_64_PLT32`).
     pub const NOPLT: u64 = 1 << 37;
+    pub const DESIGNATED_INIT: u64 = 1 << 38;
     /// The storage-class specifiers a declaration carries (C11 6.7.1; GNU
     /// `auto` is NESTED_FN). `register` is not tracked.
     pub const STORAGE_CLASSES: u64 =
@@ -320,6 +321,7 @@ pub(super) struct ParsedDeclAttrs {
     pub parsing_diagnose_as: Option<String>,
     /// `__attribute__((regparm(N)))` register-argument count.
     pub parsing_regparm: Option<u8>,
+    pub parsing_calling_convention: Option<crate::common::types::CallingConvention>,
     /// `__attribute__((stack_protect))` encountered.
     pub parsing_stack_protect: bool,
     /// `__attribute__((no_stack_protector))` encountered.
@@ -532,6 +534,10 @@ impl ParsedDeclAttrs {
         self.flags & parsed_attr_flag::ERROR_ATTR != 0
     }
     #[inline]
+    pub fn parsing_designated_init(&self) -> bool {
+        self.flags & parsed_attr_flag::DESIGNATED_INIT != 0
+    }
+    #[inline]
     pub fn parsing_transparent_union(&self) -> bool {
         self.flags & parsed_attr_flag::TRANSPARENT_UNION != 0
     }
@@ -649,6 +655,10 @@ impl ParsedDeclAttrs {
     #[inline]
     pub fn set_error_attr(&mut self, v: bool) {
         self.set_flag(parsed_attr_flag::ERROR_ATTR, v)
+    }
+    #[inline]
+    pub fn set_designated_init(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::DESIGNATED_INIT, v)
     }
     #[inline]
     pub fn set_transparent_union(&mut self, v: bool) {
@@ -1353,6 +1363,7 @@ impl Parser {
             // <stdarg.h>
             "va_list",
             "__builtin_va_list",
+            "__builtin_ms_va_list",
             "__gnuc_va_list",
             // <locale.h>
             "locale_t",
@@ -2370,7 +2381,12 @@ impl Parser {
             // The attribute names the convention this target already emits.
             // Applying nothing is the whole implementation, and gcc is silent
             // here too, so silence is parity as well as correctness.
-            AbiEffect::Default => {}
+            AbiEffect::Default => {
+                if spelling == "sysv_abi" && !is_32bit {
+                    self.attrs.parsing_calling_convention =
+                        Some(crate::common::types::CallingConvention::Default);
+                }
+            }
             // Unreachable: `abi_effect` hands implemented conventions back to
             // the dispatcher instead of returning a verdict for them. Kept
             // explicit so a future table edit cannot silently swallow one.
@@ -2468,9 +2484,10 @@ impl Parser {
         explicit_only: bool,
     ) {
         if explicit_only
-            && !self
-                .diagnostics
-                .warning_explicitly_requested(crate::common::error::WarningKind::Attributes)
+            && !self.diagnostics.warning_explicitly_requested_at(
+                crate::common::error::WarningKind::Attributes,
+                span,
+            )
         {
             return;
         }
@@ -2715,6 +2732,21 @@ impl Parser {
             return;
         }
         match name {
+            "ms_abi" | "__ms_abi__" => {
+                if super::attribute_registry::abi_target()
+                    == super::attribute_registry::AbiTarget::X86_64
+                {
+                    self.attrs.parsing_calling_convention =
+                        Some(crate::common::types::CallingConvention::MicrosoftX64);
+                } else {
+                    self.attribute_warning(
+                        "'ms_abi' attribute ignored".to_string(),
+                        abi_span,
+                        false,
+                    );
+                }
+                self.advance();
+            }
             "constructor" | "__constructor__" => {
                 self.attrs.set_constructor(true);
                 self.advance();
@@ -2762,6 +2794,10 @@ impl Parser {
             }
             "common" | "__common__" => {
                 *is_common = true;
+                self.advance();
+            }
+            "designated_init" | "__designated_init__" => {
+                self.attrs.set_designated_init(true);
                 self.advance();
             }
             "transparent_union" | "__transparent_union__" => {
@@ -2928,6 +2964,8 @@ impl Parser {
             "fastcall" | "__fastcall__" => {
                 let span = self.peek_span();
                 self.attrs.set_fastcall(true);
+                self.attrs.parsing_calling_convention =
+                    Some(crate::common::types::CallingConvention::I686Fastcall);
                 self.advance();
                 // GCC: "fastcall and regparm attributes are not compatible"
                 if self.attrs.parsing_regparm.is_some() {
@@ -3981,7 +4019,16 @@ impl Parser {
                 }
             }
             TypeSpecifier::Array(elem, _) => return Self::alignof_type_spec(elem, tag_aligns),
-            TypeSpecifier::Struct(name, fields, is_packed, pragma_pack, struct_aligned, _, _)
+            TypeSpecifier::Struct(
+                name,
+                fields,
+                is_packed,
+                pragma_pack,
+                struct_aligned,
+                _,
+                _,
+                _,
+            )
             | TypeSpecifier::Union(name, fields, is_packed, pragma_pack, struct_aligned, _, _) => {
                 // Cache hit for previously DEFINED named records: definitions
                 // insert their final alignment into struct_tag_alignments the

@@ -201,7 +201,7 @@ pub(super) fn find_dead_param_allocas(
     let x86_param_classes = if vector_direct.iter().any(Option::is_some) {
         crate::backend::call_abi::classify_params(
             func,
-            &crate::backend::call_abi::CallAbiConfig::sysv_x86_64(),
+            &crate::backend::call_abi::CallAbiConfig::x86_64(func.calling_convention),
         )
     } else {
         Vec::new()

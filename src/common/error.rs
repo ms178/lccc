@@ -98,6 +98,34 @@ pub enum WarningKind {
     /// A `#warning` preprocessor directive was encountered.
     /// GCC flag: -Wcpp
     Cpp,
+    /// An evaluated #if/#elif operand names an undefined identifier.
+    Undef,
+    /// An externally visible definition lacks a previous file-scope prototype.
+    MissingPrototypes,
+    /// An externally visible definition lacks a previous file-scope declaration.
+    MissingDeclarations,
+    /// A function-pointer cast changes significant return/parameter types.
+    CastFunctionType,
+    /// A definition uses an empty pre-C23 list or K&R identifier list.
+    OldStyleDefinition,
+    /// Expansion of a builtin date/time macro prevents reproducible output.
+    DateTime,
+    /// An explicitly supplied include search directory does not exist.
+    MissingIncludeDirs,
+    /// A packed record or member violates an explicitly aligned record type.
+    PackedNotAligned,
+    /// Implicit conversion between distinct enumeration types.
+    EnumConversion,
+    /// Positional initialization of a record requiring named members.
+    DesignatedInit,
+    /// Fixed backend frame reservation exceeds an explicit byte threshold.
+    FrameLargerThan,
+    /// Optimized VLA bounds may exceed the requested byte limit.
+    VlaLargerThan,
+    /// An unreferenced file-scope const object with internal linkage.
+    UnusedConstVariable,
+    /// A local variable is written but its value is not used.
+    UnusedButSetVariable,
     /// Control reaches end of non-void function, or non-void function does
     /// not return a value in all control paths.
     /// GCC flag: -Wreturn-type
@@ -265,6 +293,38 @@ macro_rules! warning {
 /// a hard error, not an emitted warning. Pedantic has no implemented members.
 pub const WARNING_REGISTRY: &[WarningDescriptor] = &[
     warning!(
+        VlaLargerThan,
+        "vla-larger-than",
+        false,
+        [],
+        false,
+        "VLA bound may exceed the selected byte threshold"
+    ),
+    warning!(
+        FrameLargerThan,
+        "frame-larger-than",
+        false,
+        [],
+        false,
+        "fixed stack frame exceeds the selected byte threshold"
+    ),
+    warning!(
+        DesignatedInit,
+        "designated-init",
+        true,
+        [],
+        false,
+        "positional initialization of a designated-init record"
+    ),
+    warning!(
+        EnumConversion,
+        "enum-conversion",
+        false,
+        [Extra],
+        false,
+        "implicit conversion between distinct enumeration types"
+    ),
+    warning!(
         Undeclared,
         "undeclared",
         true,
@@ -281,6 +341,78 @@ pub const WARNING_REGISTRY: &[WarningDescriptor] = &[
         "undeclared function call"
     ),
     warning!(Cpp, "cpp", true, [], false, "preprocessor #warning"),
+    warning!(
+        Undef,
+        "undef",
+        false,
+        [],
+        false,
+        "undefined preprocessor conditional identifier"
+    ),
+    warning!(
+        MissingPrototypes,
+        "missing-prototypes",
+        false,
+        [],
+        false,
+        "external function definition without a prior prototype"
+    ),
+    warning!(
+        MissingDeclarations,
+        "missing-declarations",
+        false,
+        [],
+        false,
+        "external function definition without a prior declaration"
+    ),
+    warning!(
+        DateTime,
+        "date-time",
+        false,
+        [],
+        false,
+        "builtin date or time macro expansion"
+    ),
+    warning!(
+        OldStyleDefinition,
+        "old-style-definition",
+        false,
+        [],
+        false,
+        "old-style function definition"
+    ),
+    warning!(
+        MissingIncludeDirs,
+        "missing-include-dirs",
+        false,
+        [],
+        false,
+        "nonexistent explicit include search directory"
+    ),
+    warning!(
+        PackedNotAligned,
+        "packed-not-aligned",
+        false,
+        [All],
+        false,
+        "packed record member violates an explicitly requested type alignment"
+    ),
+    warning!(
+        UnusedButSetVariable,
+        "unused-but-set-variable",
+        false,
+        [All, Unused],
+        false,
+        "local object is set but its value is not used"
+    ),
+    warning!(
+        UnusedConstVariable,
+        "unused-const-variable",
+        false,
+        [],
+        false,
+        "unused internal-linkage file-scope const object"
+    ),
     warning!(
         ReturnType,
         "return-type",
@@ -320,6 +452,14 @@ pub const WARNING_REGISTRY: &[WarningDescriptor] = &[
         [Extra],
         false,
         "mixed-sign integer comparison"
+    ),
+    warning!(
+        CastFunctionType,
+        "cast-function-type",
+        false,
+        [Extra],
+        false,
+        "cast between incompatible function types"
     ),
     warning!(
         DivByZero,
@@ -480,6 +620,10 @@ impl WarningKind {
     pub fn flag_suffix(self) -> &'static str {
         match self {
             WarningKind::Format => "format=",
+            WarningKind::FrameLargerThan => "frame-larger-than=",
+            WarningKind::VlaLargerThan => "vla-larger-than=",
+            WarningKind::UnusedConstVariable => "unused-const-variable=",
+            WarningKind::UnusedButSetVariable => "unused-but-set-variable=",
             other => other.flag_name(),
         }
     }
@@ -517,6 +661,10 @@ pub struct WarningConfig {
     bare_return_enabled: bool,
     pub werror_all: bool,
     inhibit_all: bool,
+    frame_limit: u64,
+    vla_limit: u64,
+    unused_const_level: u8,
+    unused_but_set_level: u8,
 }
 
 impl WarningConfig {
@@ -539,6 +687,10 @@ impl WarningConfig {
             bare_return_enabled: true,
             werror_all: false,
             inhibit_all: false,
+            frame_limit: u64::MAX,
+            vla_limit: u64::MAX,
+            unused_const_level: 2,
+            unused_but_set_level: 3,
         }
     }
 
@@ -558,6 +710,20 @@ impl WarningConfig {
         {
             return;
         }
+        // -Wunused-variable selects the level-1 const subwarning, but a
+        // specifically selected -Wunused-const-variable takes precedence.
+        if kind == WarningKind::UnusedVariable {
+            let child = WarningKind::UnusedConstVariable;
+            let child_priority = priority.min(2);
+            if self
+                .enable_priority
+                .get(&child)
+                .is_none_or(|&p| p <= child_priority)
+            {
+                self.unused_const_level = 1;
+                self.select(child, enabled, child_priority);
+            }
+        }
         self.enable_priority.insert(kind, priority);
         if enabled {
             self.enabled.insert(kind);
@@ -575,6 +741,12 @@ impl WarningConfig {
     }
 
     pub fn enable(&mut self, kind: WarningKind) {
+        if kind == WarningKind::UnusedConstVariable {
+            self.unused_const_level = 2;
+        }
+        if kind == WarningKind::UnusedButSetVariable {
+            self.unused_but_set_level = 3;
+        }
         self.select(kind, true, 3);
         self.explicit_enable.insert(kind);
     }
@@ -594,6 +766,10 @@ impl WarningConfig {
     pub fn set_werror(&mut self, kind: WarningKind) {
         self.errors.insert(kind);
         self.not_errors.remove(&kind);
+        if kind == WarningKind::UnusedVariable {
+            self.errors.insert(WarningKind::UnusedConstVariable);
+            self.not_errors.remove(&WarningKind::UnusedConstVariable);
+        }
         self.enable(kind);
     }
 
@@ -622,6 +798,10 @@ impl WarningConfig {
                 self.select(entry.kind, true, group.priority());
                 self.errors.insert(entry.kind);
                 self.not_errors.remove(&entry.kind);
+                if entry.kind == WarningKind::UnusedVariable {
+                    self.errors.insert(WarningKind::UnusedConstVariable);
+                    self.not_errors.remove(&WarningKind::UnusedConstVariable);
+                }
             }
         }
     }
@@ -734,9 +914,25 @@ impl WarningConfig {
             }
             _ if flag.starts_with("no-error=") => {
                 let name = &flag[9..];
+                let name = match name {
+                    "frame-larger-than=" => "frame-larger-than",
+                    "vla-larger-than=" => "vla-larger-than",
+                    other => other,
+                };
                 if let Some(kind) = WarningKind::from_flag_name(name) {
                     self.clear_werror(kind);
                     true
+                } else if let Some((base, level)) = name.split_once('=') {
+                    if let Some(kind) = WarningKind::from_flag_name(base)
+                        && Self::valid_warning_level(kind, level)
+                    {
+                        // Demotion neither enables the warning nor changes its
+                        // numeric level (including under an existing =1).
+                        self.clear_werror(kind);
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     // GCC 16.2 accepts group demotions but does not expand
                     // them to the leaf warning classifications we emit.
@@ -763,13 +959,9 @@ impl WarningConfig {
                     self.select_group(group, true);
                     true
                 } else if let Some((base, level)) = flag.split_once('=') {
-                    // `-W<name>=<level>`: only leveled warnings accept
-                    // levels. Measured on gcc-16.2: `-Wformat=0|1|2` are
-                    // recognized (2 = the -Wformat family, of which LCCC
-                    // implements -Wformat-security); every other
-                    // `-W<name>=N` is a driver error there, and false lets
-                    // the tolerated-option diagnostic stand in.
-                    if !level.is_empty() && level.bytes().all(|b| b.is_ascii_digit()) {
+                    // Only implemented leveled families accept numeric
+                    // arguments; do not advertise option tolerance as support.
+                    if !level.is_empty() {
                         self.apply_level(base, level, false)
                     } else {
                         false
@@ -781,17 +973,85 @@ impl WarningConfig {
         }
     }
 
-    /// Apply a numeric level to a leveled warning: GCC 16.2 accepts levels
-    /// only for `-Wformat` (measured — `=0` disables, `=1` enables, `=2`
-    /// enables the -Wformat family, of which LCCC implements the core
-    /// warning and -Wformat-security). `promote` marks the
+    /// GNU's leveled warnings reject `-Wno-name=N` as a malformed option,
+    /// rather than silently accepting it as an unknown negative warning.
+    pub fn rejects_negative_level(flag: &str) -> bool {
+        flag.strip_prefix("no-")
+            .and_then(|name| name.split_once('='))
+            .and_then(|(name, _)| WarningKind::from_flag_name(name))
+            .is_some_and(|kind| Self::valid_warning_level(kind, "0"))
+    }
+
+    pub fn byte_threshold(text: &str) -> Option<u64> {
+        let end = text.bytes().take_while(u8::is_ascii_digit).count();
+        if end == 0 {
+            return None;
+        }
+        // GCC saturates decimal and unit multiplication at ULLONG_MAX.
+        let n = text[..end].bytes().fold(0u64, |n, b| {
+            n.saturating_mul(10).saturating_add(u64::from(b - b'0'))
+        });
+        let suffix = text[end..].to_ascii_lowercase();
+        let (base, power): (u64, u32) = match suffix.as_str() {
+            "" => (1, 0),
+            "kb" => (1000, 1),
+            "kib" => (1024, 1),
+            "mb" => (1000, 2),
+            "mib" => (1024, 2),
+            "gb" => (1000, 3),
+            "gib" => (1024, 3),
+            "tb" => (1000, 4),
+            "tib" => (1024, 4),
+            "pb" => (1000, 5),
+            "pib" => (1024, 5),
+            "eb" => (1000, 6),
+            "eib" => (1024, 6),
+            _ => return None,
+        };
+        Some(n.saturating_mul(base.checked_pow(power)?))
+    }
+
+    fn valid_warning_level(kind: WarningKind, level: &str) -> bool {
+        match kind {
+            WarningKind::FrameLargerThan | WarningKind::VlaLargerThan => {
+                Self::byte_threshold(level).is_some()
+            }
+            WarningKind::UnusedButSetVariable => matches!(level, "0" | "1" | "2" | "3"),
+            WarningKind::Format | WarningKind::UnusedConstVariable => {
+                matches!(level, "0" | "1" | "2")
+            }
+            _ => false,
+        }
+    }
+
+    /// Apply a supported numeric warning level. `=0` disables; positive
+    /// levels enable with family-specific semantics. Format level 2 also
+    /// enables the implemented format-security warning. `promote` marks the
     /// `-Werror=<name>=<level>` spelling, where `>=1` also promotes.
     /// Returns false for anything GCC would not recognize here.
     fn apply_level(&mut self, base: &str, level: &str, promote: bool) -> bool {
         let Some(kind) = WarningKind::from_flag_name(base) else {
             return false;
         };
-        if kind != WarningKind::Format || !matches!(level, "0" | "1" | "2") {
+        if !Self::valid_warning_level(kind, level) {
+            return false;
+        }
+        if matches!(
+            kind,
+            WarningKind::FrameLargerThan | WarningKind::VlaLargerThan
+        ) {
+            if let Some(limit) = Self::byte_threshold(level) {
+                if kind == WarningKind::FrameLargerThan {
+                    self.frame_limit = limit;
+                } else {
+                    self.vla_limit = limit;
+                }
+                self.enable(kind);
+                if promote {
+                    self.set_werror(kind);
+                }
+                return true;
+            }
             return false;
         }
         match level {
@@ -800,13 +1060,19 @@ impl WarningConfig {
             "0" => self.disable(kind),
             _ => {
                 self.enable(kind);
-                if level == "2" {
+                if kind == WarningKind::Format && level == "2" {
                     self.enable(WarningKind::FormatSecurity);
                 }
                 if promote {
                     self.set_werror(kind);
                 }
             }
+        }
+        if kind == WarningKind::UnusedConstVariable {
+            self.unused_const_level = level.parse().unwrap_or(0);
+        }
+        if kind == WarningKind::UnusedButSetVariable {
+            self.unused_but_set_level = level.parse().unwrap_or(0);
         }
         true
     }
@@ -970,6 +1236,7 @@ pub struct DiagnosticEngine {
     /// Warning configuration: controls which warnings are enabled and
     /// which are promoted to errors.
     warning_config: WarningConfig,
+    warning_scopes: Vec<(usize, WarningConfig, WarningConfig)>,
     /// Reference to the source manager for span resolution and snippet display.
     /// Set after the preprocessing/lexing phase creates the SourceManager.
     source_manager: Option<std::rc::Rc<SourceManager>>,
@@ -1034,6 +1301,7 @@ impl DiagnosticEngine {
             error_count: 0,
             warning_count: 0,
             warning_config: WarningConfig::new(),
+            warning_scopes: Vec::new(),
             source_manager: None,
             use_color: ColorMode::Auto.use_color(),
             last_include_trace_file: None,
@@ -1118,14 +1386,85 @@ impl DiagnosticEngine {
     /// expensive analysis for that warning category.
     pub fn warning_enabled(&self, kind: WarningKind) -> bool {
         self.warning_config.is_enabled(kind)
+            || self
+                .warning_scopes
+                .iter()
+                .any(|(_, config, _)| config.is_enabled(kind))
+    }
+
+    /// Select by preprocessed byte offset, not original file/line: repeated
+    /// includes and same-line _Pragma operators may have different settings.
+    pub fn warning_enabled_at(&self, kind: WarningKind, span: Span) -> bool {
+        // GCC's positive pragma classifications enable analysis from this
+        // point onward; ignored/pop only change reporting classifications.
+        // In particular, ignoring missing-prototypes must not accidentally
+        // fall through to missing-declarations when its analysis is enabled.
+        let index = self
+            .warning_scopes
+            .partition_point(|(offset, _, _)| *offset <= span.start as usize);
+        if span.file_id != 0 || index == 0 {
+            self.warning_config.is_enabled(kind)
+        } else {
+            self.warning_scopes[index - 1].2.is_enabled(kind)
+        }
+    }
+
+    fn warning_config_at(&self, span: Span) -> &WarningConfig {
+        if span.file_id != 0 {
+            return &self.warning_config;
+        }
+        let index = self
+            .warning_scopes
+            .partition_point(|(offset, _, _)| *offset <= span.start as usize);
+        if index == 0 {
+            &self.warning_config
+        } else {
+            &self.warning_scopes[index - 1].1
+        }
+    }
+
+    /// Call only with preprocessed source attached (comments already removed).
+    pub fn build_warning_scopes(&mut self) {
+        self.warning_scopes.clear();
+        let Some(sm) = &self.source_manager else {
+            return;
+        };
+        let mut state =
+            super::diagnostic_pragma::DiagnosticPragmas::new(self.warning_config.clone());
+        let mut offset = 0;
+        for line in sm.get_content(0).split_inclusive('\n') {
+            if let Some(text) = line
+                .trim_start()
+                .strip_prefix('#')
+                .and_then(|s| s.trim_start().strip_prefix("pragma"))
+                .filter(|s| s.starts_with(char::is_whitespace))
+            {
+                if state.apply(text.trim()) {
+                    self.warning_scopes.push((
+                        offset + line.len(),
+                        state.current.clone(),
+                        state.analysis.clone(),
+                    ));
+                }
+            }
+            offset += line.len();
+        }
+    }
+
+    /// Preprocessor diagnostics have explicit locations rather than spans; the
+    /// preprocessor records their configuration at the actual occurrence.
+    pub fn emit_with_warning_config(&mut self, diag: &Diagnostic, config: &WarningConfig) {
+        let old = std::mem::replace(&mut self.warning_config, config.clone());
+        self.emit_inner(diag);
+        self.warning_config = old;
     }
 
     /// Whether the user asked for this warning class with a positive
     /// `-W<name>` or `-Werror=<name>` flag (not merely its default state).
     /// Used by the attribute inventory: GCC-known-but-unimplemented
     /// attributes diagnose only on an explicit `-Wattributes` request.
-    pub fn warning_explicitly_requested(&self, kind: WarningKind) -> bool {
-        self.warning_config.is_explicitly_requested(kind)
+    pub fn warning_explicitly_requested_at(&self, kind: WarningKind, span: Span) -> bool {
+        self.warning_config_at(span).is_explicitly_requested(kind)
     }
 
     /// Set the source manager for span resolution and snippet display.
@@ -1150,6 +1489,18 @@ impl DiagnosticEngine {
         self.source_manager.take()
     }
 
+    pub fn set_shared_source_manager(&mut self, sm: std::rc::Rc<SourceManager>) {
+        self.source_manager = Some(sm);
+    }
+
+    pub fn vla_limit_at(&self, span: Span) -> u64 {
+        self.warning_config_at(span).vla_limit
+    }
+
+    pub fn frame_limit_at(&self, span: Span) -> u64 {
+        self.warning_config_at(span).frame_limit
+    }
+
     /// Set the color mode for diagnostic output.
     /// Resolves the mode immediately (e.g., checking isatty for Auto).
     pub fn set_color_mode(&mut self, mode: ColorMode) {
@@ -1164,6 +1515,17 @@ impl DiagnosticEngine {
     /// - If -Werror or -Werror=<name> applies, it is promoted to an error.
     /// - The GCC-style `[-W<name>]` suffix is appended to the message.
     pub fn emit(&mut self, diag: &Diagnostic) {
+        if let Some(span) = diag.span {
+            if !self.warning_scopes.is_empty() {
+                let config = self.warning_config_at(span).clone();
+                self.emit_with_warning_config(diag, &config);
+                return;
+            }
+        }
+        self.emit_inner(diag);
+    }
+
+    fn emit_inner(&mut self, diag: &Diagnostic) {
         // GCC suppresses diagnostics that come from a system header unless
         // -Wsystem-headers asks for them; the suppression applies to warnings
         // only. Without this, a project that merely includes <pthread.h>
@@ -1314,6 +1676,36 @@ impl DiagnosticEngine {
     }
 
     /// Emit a categorized warning with a message, span, and kind.
+    /// Level 1 omits included headers, level 2 includes non-system headers.
+    /// GCC compares the declaration's logical filename with the main input
+    /// spelling. In particular, #line renaming also affects its level-1 rule.
+    pub fn unused_file_const(&mut self, name: &str, span: Span) {
+        let config = self.warning_config_at(span);
+        let in_header = self.source_manager.as_ref().is_some_and(|sm| {
+            sm.main_file_name()
+                .is_some_and(|main| sm.resolve_span(span).file != main)
+        });
+        if config.unused_const_level == 1 && in_header {
+            return;
+        }
+        self.warning_with_kind(
+            format!("'{name}' defined but not used"),
+            span,
+            WarningKind::UnusedConstVariable,
+        );
+    }
+
+    pub fn unused_set_variable(&mut self, name: &str, span: Span, minimum_level: u8) {
+        if self.warning_config_at(span).unused_but_set_level < minimum_level {
+            return;
+        }
+        self.warning_with_kind(
+            format!("variable '{name}' set but not used"),
+            span,
+            WarningKind::UnusedButSetVariable,
+        );
+    }
+
     pub fn warning_with_kind(&mut self, message: impl Into<String>, span: Span, kind: WarningKind) {
         let diag = Diagnostic::warning_with_kind(message, kind).with_span(span);
         self.emit(&diag);
@@ -1779,11 +2171,25 @@ mod dialect_severity_redteam_tests {
             WarningKind::Undeclared,
             WarningKind::ImplicitFunctionDeclaration,
             WarningKind::Cpp,
+            WarningKind::Undef,
+            WarningKind::MissingPrototypes,
+            WarningKind::MissingDeclarations,
             WarningKind::ReturnType,
             WarningKind::IncompatiblePointerTypes,
             WarningKind::Attributes,
             WarningKind::UnusedVariable,
             WarningKind::SignCompare,
+            WarningKind::CastFunctionType,
+            WarningKind::OldStyleDefinition,
+            WarningKind::DateTime,
+            WarningKind::MissingIncludeDirs,
+            WarningKind::PackedNotAligned,
+            WarningKind::EnumConversion,
+            WarningKind::DesignatedInit,
+            WarningKind::FrameLargerThan,
+            WarningKind::VlaLargerThan,
+            WarningKind::UnusedConstVariable,
+            WarningKind::UnusedButSetVariable,
             WarningKind::DivByZero,
             WarningKind::StrictPrototypes,
             WarningKind::Format,
@@ -1799,12 +2205,15 @@ mod dialect_severity_redteam_tests {
             WarningKind::Pedantic,
             WarningKind::Vla,
             WarningKind::Multichar,
-            WarningKind::DivByZero,
-            WarningKind::StrictPrototypes,
             WarningKind::ReturnLocalAddr,
             WarningKind::Pragmas,
         ];
         let expected: HashSet<_> = kinds.into_iter().collect();
+        assert_eq!(
+            kinds.len(),
+            expected.len(),
+            "duplicate expected warning kind"
+        );
         let registered: HashSet<_> = WARNING_REGISTRY.iter().map(|entry| entry.kind).collect();
         let names: HashSet<_> = WARNING_REGISTRY.iter().map(|entry| entry.name).collect();
         // The registry must be a bijection onto the measured warning kinds:
@@ -1890,6 +2299,9 @@ mod dialect_severity_redteam_tests {
             .collect();
         default_on.sort_unstable();
         let mut expected_defaults = [
+            // GCC 16.2 warns on positional initializers of annotated records
+            // even without -Wdesignated-init (the live four-target gate checks it).
+            "designated-init",
             "implicit-function-declaration",
             "cpp",
             "incompatible-pointer-types",
@@ -1939,27 +2351,42 @@ mod dialect_severity_redteam_tests {
             .filter(|entry| !entry.default_on && entry.groups.contains(&WarningGroup::All))
             .map(|entry| entry.name)
             .collect();
-        assert_eq!(wall, ["return-type", "unused-variable", "format"]);
+        assert_eq!(
+            wall,
+            [
+                "packed-not-aligned",
+                "unused-but-set-variable",
+                "return-type",
+                "unused-variable",
+                "format"
+            ]
+        );
         let wextra: Vec<&str> = WARNING_REGISTRY
             .iter()
             .filter(|entry| !entry.default_on && entry.groups.contains(&WarningGroup::Extra))
             .map(|entry| entry.name)
             .collect();
-        assert_eq!(wextra, ["sign-compare"]);
+        assert_eq!(
+            wextra,
+            ["enum-conversion", "sign-compare", "cast-function-type"]
+        );
         assert!(
             !WARNING_REGISTRY
                 .iter()
                 .any(|entry| entry.groups.contains(&WarningGroup::Pedantic))
         );
-        // Diagnostic labels: `-Wformat` prints with a trailing `=`.
+        // GCC leveled-warning labels retain a trailing `=`.
         for entry in WARNING_REGISTRY {
             let suffix = entry.kind.flag_suffix();
             assert_eq!(
                 suffix,
-                if entry.kind == WarningKind::Format {
-                    "format="
-                } else {
-                    entry.name
+                match entry.kind {
+                    WarningKind::Format => "format=",
+                    WarningKind::FrameLargerThan => "frame-larger-than=",
+                    WarningKind::VlaLargerThan => "vla-larger-than=",
+                    WarningKind::UnusedConstVariable => "unused-const-variable=",
+                    WarningKind::UnusedButSetVariable => "unused-but-set-variable=",
+                    _ => entry.name,
                 },
                 "{} label",
                 entry.name

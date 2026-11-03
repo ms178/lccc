@@ -207,7 +207,11 @@ scan_obj() { # scan_obj <file> ; echoes the offending mnemonics, rc 1 on a hit
     # Within ZSTD DYNAMIC_BMI2 runtime-dispatched clones only, strip the
     # `lzcnt,bmi,bmi2` mnemonics explicitly authorized by ZSTD's target attr.
     hits=$(objdump -d --no-show-raw-insn "$file" 2>/dev/null \
-           | awk -v sym_re="$ZSTD_DYN_BMI2_SYM_RE" -v allow_re="$ZSTD_DYN_BMI2_ALLOWED_RE" '
+           | LCCC_SCAN_SYM_RE="$ZSTD_DYN_BMI2_SYM_RE" LCCC_SCAN_ALLOW_RE="$ZSTD_DYN_BMI2_ALLOWED_RE" awk '
+               BEGIN {
+                   sym_re = ENVIRON["LCCC_SCAN_SYM_RE"]
+                   allow_re = ENVIRON["LCCC_SCAN_ALLOW_RE"]
+               }
                /^[0-9a-fA-F]+[[:space:]]+<[^>]+>:/ {
                    s = $0
                    sub(/^[^<]*</, "", s)

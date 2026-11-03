@@ -110,7 +110,7 @@ impl Lowerer {
         // so the pointer count is the ABI-relevant summary the meta needs.
         let func_info = if DerivedDeclarator::declares_function(&declarator.derived) {
             match declarator.derived.last() {
-                Some(DerivedDeclarator::Function(p, v, _)) => Some((p.clone(), *v)),
+                Some(DerivedDeclarator::Function(p, v, _, _)) => Some((p.clone(), *v)),
                 _ => None,
             }
         } else {
@@ -911,6 +911,7 @@ impl Lowerer {
             // braced lists, compound literals (`memcpy`), and nested designators.
             if !trailing_designators.is_empty() {
                 let sub_item = InitializerItem {
+                    span: crate::common::source::Span::dummy(),
                     designators: trailing_designators.to_vec(),
                     init: item.init.clone(),
                 };

@@ -2651,6 +2651,7 @@ mod tests {
             struct_arg_is_f128_sse: Vec::new(),
             ret_is_f128_sse: false,
             is_sret: false,
+            calling_convention: crate::common::types::CallingConvention::Default,
             is_fastcall: false,
             regparm: None,
             is_pure: false,
@@ -4228,5 +4229,23 @@ mod program_point_capacity_tests {
             None
         );
         assert_eq!(checked_program_point_count([usize::MAX]), None);
+    }
+}
+
+#[cfg(test)]
+mod trampoline_clobber_tests {
+    use super::instruction_is_call_point;
+    use crate::ir::reexports::{Instruction, Operand, Value};
+
+    #[test]
+    fn trampoline_staging_clobbers_but_reading_a_chain_does_not() {
+        assert!(instruction_is_call_point(&Instruction::InitTrampoline {
+            buffer: Value(1),
+            chain: Operand::Value(Value(2)),
+            func: "nested".into(),
+        }));
+        assert!(!instruction_is_call_point(&Instruction::GetStaticChain {
+            dest: Value(3),
+        }));
     }
 }

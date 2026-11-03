@@ -34,7 +34,7 @@
 //! | data-model / ABI requests — `-fshort-enums`, `-fpack-struct[=n]` | **hard error**, because ignoring one silently returns objects whose layout disagrees with the libraries they link against. `-funsigned-char` and `-fshort-wchar` are *not* here: both are implemented (`char_is_unsigned()` / `set_short_wchar`), and `-fsigned-char` names the x86-64 SysV default LCCC already emits |
 //! | `-g<selector>` that GNU rejects (`-g4`, `-ggdb9`, `-gdwarf-9`, `-gz=bogus`, `-gno-bogus`, `-gbogus`) | **hard error** — the selector grammar is closed and was measured exhaustively, so a name outside it is a typo, not a newer GNU (GCC 14.2/16.2, Clang 23.1 and ICX all reject these) |
 //! | *off-requests* — `-Wno-<unknown>`, `-gno-<feature>`, `-fno-delete-null-pointer-checks` | **accepted silently**: the thing asked to be switched off does not exist here, so the requested state is already the state (all four reference compilers accept `-Wno-<unknown>`, measured; for the `-f` spelling, nine measured null-guard shapes keep their checks with and without the flag, pinned by `tests/regression/check_nullptr_check_policy.sh`) |
-//! | everything else unimplemented — `-f*`, `-m*`, `--*`, `-W<name>`, `-Werror=<name>`, `--param`, GNU-accepted `-g` selectors, presentation namespaces (`-fdiagnostics-*`, `-fmessage-length=`, `-fmax-errors=`, `-f*prefix-map=`, `-fverbose-asm`) | **warning naming the option**, once per compilation; `LCCC_STRICT_OPTIONS=1` makes it fatal |
+//! | everything else unimplemented — `-f*`, `-m*`, `--*`, `-W<name>`, `-Werror=<name>`, `--param`, GNU-accepted `-g` selectors, presentation namespaces (`-fdiagnostics-*`, `-fmessage-length=`, `-fmax-errors=`, `-f*prefix-map=`) | **warning naming the option**, once per compilation; `LCCC_STRICT_OPTIONS=1` makes it fatal |
 //!
 //! The open option namespace cannot distinguish typos from newer GCC flags.
 //! Ignoring an option can change program semantics: in particular, signed
@@ -2254,54 +2254,63 @@ impl Driver {
                 // Optimization levels.  Numeric values are interpreted by
                 // passes::run_passes(): 0=-O0, 1=-O1, 2=-O2, 3=-O3, 4=-Os, 5=-Oz.
                 "-O0" => {
+                    self.optimize_debug = false;
                     self.opt_level = 0;
                     self.optimize = false;
                     self.optimize_size = false;
                     self.omit_frame_pointer = false;
                 }
                 "-O" | "-O1" => {
+                    self.optimize_debug = false;
                     self.opt_level = 1;
                     self.optimize = true;
                     self.optimize_size = false;
                     self.omit_frame_pointer = true;
                 }
                 "-O2" => {
+                    self.optimize_debug = false;
                     self.opt_level = 2;
                     self.optimize = true;
                     self.optimize_size = false;
                     self.omit_frame_pointer = true;
                 }
                 "-O3" => {
+                    self.optimize_debug = false;
                     self.opt_level = 3;
                     self.optimize = true;
                     self.optimize_size = false;
                     self.omit_frame_pointer = true;
                 }
                 "-Os" => {
+                    self.optimize_debug = false;
                     self.opt_level = 4;
                     self.optimize = true;
                     self.optimize_size = true;
                     self.omit_frame_pointer = true;
                 }
                 "-Oz" => {
+                    self.optimize_debug = false;
                     self.opt_level = 5;
                     self.optimize = true;
                     self.optimize_size = true;
                     self.omit_frame_pointer = true;
                 }
-                // Measured on GCC 16.2 (probe set, 2026-10-28): `-Og`
-                // compiles byte-identically to its `-O1` and `-Ofast` to
-                // its `-O3`. LCCC implements -O1/-O3 and fast-math already,
+                // Scalar probes matched -O1/-O3 code for -Og/-Ofast.
+                // This is not universal equivalence: GCC skips VLA range
+                // diagnostics at -Og, so retain its distinct debug policy.
+                // LCCC implements -O1/-O3 and fast-math already,
                 // so both requests become real pipeline settings instead of
                 // tolerated no-ops (GP-22 option-effect ledger: an accepted
                 // spelling must change an artifact).
                 "-Og" => {
+                    self.optimize_debug = true;
                     self.opt_level = 1;
                     self.optimize = true;
                     self.optimize_size = false;
                     self.omit_frame_pointer = true;
                 }
                 "-Ofast" => {
+                    self.optimize_debug = false;
                     self.opt_level = 3;
                     self.optimize = true;
                     self.optimize_size = false;
@@ -2551,6 +2560,27 @@ impl Driver {
 
                 arg if arg.starts_with("-W") => {
                     let flag = &arg[2..];
+                    let size_flag = flag
+                        .strip_prefix("error=")
+                        .or_else(|| flag.strip_prefix("no-error="))
+                        .unwrap_or(flag);
+                    for family in ["frame-larger-than", "vla-larger-than"] {
+                        if size_flag == family
+                            || size_flag
+                                .strip_prefix(family)
+                                .and_then(|v| v.strip_prefix('='))
+                                .is_some_and(|v| {
+                                    !(v.is_empty() && flag.starts_with("no-error="))
+                                        && crate::common::error::WarningConfig::byte_threshold(v)
+                                            .is_none()
+                                })
+                        {
+                            return Err(format!("invalid byte threshold in '{arg}'"));
+                        }
+                    }
+                    if crate::common::error::WarningConfig::rejects_negative_level(flag) {
+                        return Err(format!("unrecognized command-line option '{arg}'"));
+                    }
                     // Every flag reaches the warning configuration first
                     // (`-Wno-return-type`, `-Wno-error=cpp` are real
                     // requests: short-circuiting on the `no-` prefix once
@@ -3315,6 +3345,14 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                 "-fno-align-loops" => self.align_loops = AlignControl::Off,
                 "-falign-jumps" => self.align_jumps = AlignControl::Auto,
                 "-fno-align-jumps" => self.align_jumps = AlignControl::Off,
+                arg if arg.starts_with("-fmin-function-alignment=") => {
+                    let value = &arg["-fmin-function-alignment=".len()..];
+                    self.min_function_alignment = value.parse::<u32>()
+                        .ok()
+                        .filter(|n| *n <= i32::MAX as u32 && !value.is_empty()
+                            && value.bytes().all(|b| b.is_ascii_digit()))
+                        .ok_or_else(|| format!("argument to '-fmin-function-alignment=' must be a non-negative integer no bigger than {}", i32::MAX))?;
+                }
                 "-falign-functions" => self.align_functions = AlignControl::Auto,
                 "-fno-align-functions" => self.align_functions = AlignControl::Off,
                 arg if arg.starts_with("-falign-loops=")
@@ -3623,6 +3661,8 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                     self.stack_protector_mode =
                         crate::backend::stack_protector::StackProtectorMode::None;
                 }
+                "-fverbose-asm" => self.verbose_asm = true,
+                "-fno-verbose-asm" => self.verbose_asm = false,
                 "-fstack-clash-protection" => {
                     self.stack_clash_protection = true;
                 }
@@ -6452,6 +6492,7 @@ mod cli_tests {
             "-fvar-tracking-assignments",
             "-falign-loops=32",
             "-falign-functions=16",
+            "-fmin-function-alignment=16",
             "-funroll-loops",
             "-ftree-vectorize",
             "-fno-tree-vectorize",
@@ -7084,7 +7125,9 @@ mod prefetch_isa_tests {
             // vectorizer ceiling; the resolved SSE3 level must agree with
             // the predefines.
             let mut pp = crate::frontend::preprocessor::Preprocessor::new();
-            driver.configure_preprocessor(&mut pp);
+            driver
+                .configure_preprocessor(&mut pp)
+                .expect("valid preprocessor configuration");
             let probe: String = [
                 "__SSE2__",
                 "__SSE3__",

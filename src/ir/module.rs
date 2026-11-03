@@ -1,6 +1,6 @@
 use super::constants::IrConst;
 use super::instruction::{BasicBlock, BlockId, Instruction, Terminator, Value};
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
 /// IR module, function, and global variable definitions.
 ///
@@ -383,6 +383,7 @@ impl TerminatorSpans {
 /// An IR function.
 #[derive(Debug, Clone)]
 pub struct IrFunction {
+    pub calling_convention: crate::common::types::CallingConvention,
     /// Immutable language contract for this function; clones retain it and
     /// outlined functions inherit it. run_passes initializes it even at O0.
     pub pass_policy: crate::common::pass_policy::PassPolicy,
@@ -569,6 +570,85 @@ pub struct IrParam {
 }
 
 impl IrModule {
+    /// Symbols whose exposure is not limited to visible direct C calls.
+    /// Shared by callback propagation, inliner cost proofs and IPCP: replacing
+    /// an outlined body's parameters requires a closed set of callers.
+    /// Explicit retention/export metadata is opaque exposure, not proof of
+    /// particular argument values. Assembly templates use the shared context.
+    pub(crate) fn value_referenced_symbols(&self) -> (FxHashSet<String>, Vec<String>) {
+        let mut names: FxHashSet<String> = FxHashSet::default();
+        let mut asm_templates: Vec<String> = self.toplevel_asm.clone();
+        for function in &self.functions {
+            if function.is_used {
+                names.insert(function.name.clone());
+            }
+            for block in &function.blocks {
+                for instruction in &block.instructions {
+                    match instruction {
+                        Instruction::GlobalAddr { name, .. } => {
+                            names.insert(name.clone());
+                        }
+                        Instruction::InlineAsm {
+                            template,
+                            input_symbols,
+                            ..
+                        } => {
+                            asm_templates.push(template.clone());
+                            for sym in input_symbols {
+                                if let Some(s) = sym {
+                                    names
+                                        .insert(crate::common::asm_scan::asm_symbol_base(s).into());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        for global in &self.globals {
+            global.init.for_each_ref(&mut |r| {
+                names.insert(r.to_string());
+            });
+        }
+        for (_, target, _) in &self.aliases {
+            names.insert(target.clone());
+        }
+        for (_, resolver, _, _) in &self.ifuncs {
+            names.insert(resolver.clone());
+        }
+        for ctor in &self.constructors {
+            names.insert(ctor.clone());
+        }
+        for dtor in &self.destructors {
+            names.insert(dtor.clone());
+        }
+        names.extend(self.retained_functions.iter().cloned());
+        names.extend(self.externally_visible_symbols.iter().cloned());
+        names.extend(self.asm_labels.keys().cloned());
+        names.extend(self.asm_labels.values().cloned());
+        names.extend(self.symver_directives.iter().map(|(name, _)| name.clone()));
+        (names, asm_templates)
+    }
+
+    /// Inspect the complete assembly environment, not each blob in isolation:
+    /// top-level macros can shadow mnemonics used by later inline assembly.
+    pub(crate) fn asm_symbol_context(&self) -> crate::common::asm_scan::AsmSymbolContext {
+        let inline = self
+            .functions
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.instructions.iter())
+            .filter_map(|inst| match inst {
+                Instruction::InlineAsm { template, .. } => Some(template.as_str()),
+                _ => None,
+            });
+        crate::common::asm_scan::AsmSymbolContext::new(
+            self.toplevel_asm.iter().map(String::as_str).chain(inline),
+            crate::common::types::target_elf_machine(),
+        )
+    }
+
     pub fn new() -> Self {
         Self {
             functions: Vec::new(),
@@ -644,6 +724,7 @@ impl IrFunction {
             has_inlined_calls: false,
             param_alloca_values: Vec::new(),
             uses_sret: false,
+            calling_convention: crate::common::types::CallingConvention::Default,
             is_fastcall: false,
             regparm: None,
             is_naked: false,

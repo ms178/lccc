@@ -271,6 +271,7 @@ impl BasicBlock {
 /// it easier to add new call-related fields in the future.
 #[derive(Debug, Clone, Default)]
 pub struct CallInfo {
+    pub calling_convention: crate::common::types::CallingConvention,
     /// Destination value for the return, or None for void calls.
     pub dest: Option<Value>,
     /// Argument operands.
@@ -360,6 +361,8 @@ pub enum Instruction {
         dest: Value,
         size: Operand,
         align: usize,
+        /// Written VLA origin; None for alloca and compiler-private dynamic areas.
+        vla_span: Option<Span>,
     },
 
     /// Store to memory: store val, ptr (type indicates size of store)

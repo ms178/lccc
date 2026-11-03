@@ -2200,7 +2200,17 @@ impl IntrinsicOp {
             | Pmulld256 | Psubd256 | Paddq256 | Psubq256 | Pandn256
             | Pcmpeqd256 | Pcmpeqq256 | Pcmpgtd256 | Pcmpgtq256
             | Setzero256 | AddPs256 | SubPs256 | MulPs256 | AddPd256
-            | SubPd256 | MulPd256 | LoaduPs256 | StoreuPs256 | LoaduPd256
+            | SubPd256 | MulPd256
+            // Explicit AVX FP producers use the same 32-byte result homes
+            // as add/mul. Omitting them leaves private min/max/compare
+            // temporaries opaque to promotion and alignment relaxation.
+            | DivPs256 | MinPs256 | MaxPs256 | SqrtPs256 | CmpPs256 | ShufPs256
+            | DivPd256 | MinPd256 | MaxPd256 | SqrtPd256 | CmpPd256 | ShufPd256
+            | UnpcklPs256 | UnpckhPs256 | UnpcklPd256 | UnpckhPd256
+            | HaddPs256 | HsubPs256 | AddsubPs256
+            | RoundPs256 | RoundPd256 | VpermilPs256 | VpermilPd256
+            | VpermilvarPs256 | VpermilvarPd256 | BlendPs256 | BlendPd256
+            | LoaduPs256 | StoreuPs256 | LoaduPd256
             | StoreuPd256 | Permute2x128 | Permute4x64 | Permutevar8x32 | Pshufd256
             | Punpcklbw256 | Punpckhbw256 | Punpcklwd256 | Punpckhwd256
             | Punpckldq256 | Punpckhdq256 | Punpcklqdq256 | Punpckhqdq256

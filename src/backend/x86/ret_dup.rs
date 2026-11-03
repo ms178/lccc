@@ -99,7 +99,12 @@ fn tail_call_info(inst: &Instruction) -> Option<&CallInfo> {
         Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => info,
         _ => return None,
     };
-    if info.is_variadic || info.is_sret || info.is_fastcall || info.regparm.is_some() {
+    if info.calling_convention != crate::common::types::CallingConvention::Default
+        || info.is_variadic
+        || info.is_sret
+        || info.is_fastcall
+        || info.regparm.is_some()
+    {
         return None;
     }
     register_only_args(info).then_some(info)

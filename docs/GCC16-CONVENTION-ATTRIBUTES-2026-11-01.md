@@ -1,5 +1,10 @@
 # Calling-convention attributes: the measured contract (2026-11-01)
 
+> Update: x86-64 scalar `ms_abi` now has ABI-aware lowering and native
+> interoperability/unwind tests. The original refusal measurements below are
+> historical. See [current implementation status](MICROSOFT-X64-ABI-STATUS.md)
+> for supported classes, fail-closed boundaries and remaining kernel gates.
+
 GP-02 of [`GCC16-PARITY-ASSESSMENT-2026-10-27.md`](GCC16-PARITY-ASSESSMENT-2026-10-27.md)
 is the only entry in the campaign register whose defect class is *silently
 wrong executables*. Every other gap loses an optimisation, a warning or a

@@ -49,6 +49,23 @@ CASES = (
     ("c23-compatible-enum", "gnu23", "enum E { A }; enum E { A };", True),
     ("c23-incompatible-enum", "gnu23", "enum E { A }; enum E { B };", False),
     ("c23-cross-kind-tag", "gnu23", "struct X { int x; }; union X { int x; };", False),
+    # Re-resolving the same definition for array initialization is not a
+    # second lexical definition, including pre-C23 (kernel GNU11) semantics.
+    ("c11-record-array-pointer", "gnu11", "static struct S { const char *p; unsigned a; unsigned char b; unsigned c; } rows[]={{\"x\",1,2,3}}; unsigned f(unsigned n){ struct S *p=&rows[n]; return p->c; }", True),
+    ("c17-record-array-pointer", "gnu17", "struct S { int x; } rows[]={{1},{2}}; int f(unsigned n){ struct S *p=&rows[n]; return p->x; }", True),
+    ("c11-union-array-pointer", "gnu11", "union U { int x; long y; } rows[]={{.x=1},{.y=2}}; long f(unsigned n){union U *p=&rows[n];return p->y;}", True),
+    ("c11-local-record-array", "gnu11", "int f(unsigned n){struct S {int x;} rows[]={{1},{2}};struct S *p=&rows[n];return p->x;}", True),
+    ("c11-forward-record-array", "gnu11", "struct S; struct S {int x;} rows[]={{1},{2}}; int f(void){struct S *p=&rows[1];return p->x;}", True),
+    ("c11-identical-inner-still-distinct", "gnu11", "struct S {int x;} outer; void f(void){struct S {int x;} inner;struct S *p=&outer;(void)inner;(void)p;}", False),
+    ("c11-designated-record-array", "gnu11", "struct __attribute__((designated_init)) S {int x;} rows[]={{.x=1},{.x=2}};int f(void){struct S *p=&rows[1];return p->x;}", True),
+    # Integration contracts: definition spans, designated-init metadata and
+    # scoped enum identities must coexist when main and the ABI branch merge.
+    ("designated-duplicate", "gnu17", "struct __attribute__((designated_init)) S { int x; }; struct S { int y; };", False),
+    ("designated-inner-shadow", "gnu17", "struct __attribute__((designated_init)) S { int x; }; int f(void) { struct S { char y; }; struct S s = {1}; return s.y; }", True),
+    ("enum-disjoint-blocks", "gnu17", "int f(void) { { enum E { A }; } { enum E { A }; } return 0; }", True),
+    ("enum-outer-duplicate-after-shadow", "gnu17", "enum E { A }; int f(void) { enum E { B }; return B; } enum E { C };", False),
+    ("enum-fixed-forward-completion", "gnu23", "enum E : int; enum E : int { A };", True),
+    ("enum-fixed-inner-shadow", "gnu23", "enum E : int { A }; int f(void) { enum E : unsigned { B }; return B; }", True),
 )
 
 

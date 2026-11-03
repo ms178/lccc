@@ -1775,8 +1775,8 @@ pub(super) fn emit_executable(
                         && sym.is_local()
                         && !sym.name.is_empty()
                         && sym.shndx != SHN_UNDEF
-                        && sym.shndx != SHN_ABS
-                        && section_map.contains_key(&(obj_idx, sym.shndx as usize))
+                        && (sym.shndx == SHN_ABS
+                            || section_map.contains_key(&(obj_idx, sym.shndx as usize)))
                         // Collected away: the section was never laid out, so the
                         // symbol has no address.  Emitting it anyway produced a
                         // `.symtab` dominated by value-0/size!=0 entries -- on a
@@ -1799,6 +1799,13 @@ pub(super) fn emit_executable(
             .then_with(|| a.name.cmp(&b.name))
     });
     for (obj_idx, sym) in locals {
+        if sym.shndx == SHN_ABS {
+            let off = push_strtab_name(&mut symtab_names, sym.name.as_bytes());
+            symtab_entries.push(elf64_sym_entry(
+                off, sym.info, sym.other, SHN_ABS, sym.value, sym.size,
+            ));
+            continue;
+        }
         let (oi, sec_off) = section_map[&(obj_idx, sym.shndx as usize)];
         let Some(&shndx) = out_sec_to_hdr.get(&oi) else {
             continue;

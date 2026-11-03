@@ -30,7 +30,12 @@ pub(super) struct AbstractDeclaratorLevel {
 
 pub(super) enum AbstractDeclSuffix {
     Array(Option<Box<Expr>>),
-    Function(Vec<ParamDecl>, bool, bool),
+    Function(
+        Vec<ParamDecl>,
+        bool,
+        bool,
+        Option<crate::common::types::CallingConvention>,
+    ),
 }
 
 impl AbstractDeclaratorLevel {
@@ -50,10 +55,10 @@ impl AbstractDeclaratorLevel {
         while let Some(level) = cur {
             for &(star_space, star_cvr) in &level.stars {
                 ty = match ty {
-                    TypeSpecifier::BareFunction(ret, params, variadic, has_prototype)
+                    TypeSpecifier::BareFunction(ret, params, variadic, has_prototype, abi)
                         if space == AddressSpace::Default =>
                     {
-                        TypeSpecifier::FunctionPointer(ret, params, variadic, has_prototype)
+                        TypeSpecifier::FunctionPointer(ret, params, variadic, has_prototype, abi)
                     }
                     other => TypeSpecifier::Pointer(Box::new(other), space),
                 };
@@ -70,12 +75,13 @@ impl AbstractDeclaratorLevel {
                             q.push(0);
                         }
                     }
-                    AbstractDeclSuffix::Function(params, variadic, has_prototype) => {
+                    AbstractDeclSuffix::Function(params, variadic, has_prototype, abi) => {
                         ty = TypeSpecifier::BareFunction(
                             Box::new(ty),
                             params.clone(),
                             *variadic,
                             *has_prototype,
+                            abi.unwrap_or_default(),
                         );
                         if let Some(q) = quals.as_deref_mut() {
                             q.clear();
@@ -271,6 +277,7 @@ impl Parser {
                         params,
                         variadic,
                         has_prototype,
+                        self.attrs.parsing_calling_convention,
                     ));
                 }
                 _ => break,
@@ -278,7 +285,7 @@ impl Parser {
         }
 
         // Combine using inside-out rule
-        let combined = self.combine_declarator_parts(derived, inner_derived, outer_suffixes);
+        let mut combined = self.combine_declarator_parts(derived, inner_derived, outer_suffixes);
 
         let (post_packed, post_aligned, mode_kind, has_common, _) =
             self.parse_gcc_attributes_spec();
@@ -289,6 +296,24 @@ impl Parser {
             (None, Some(b)) => Some(b),
             (None, None) => None,
         };
+
+        if let Some(abi) = self.attrs.parsing_calling_convention.take() {
+            if let Some(
+                DerivedDeclarator::Function(_, _, _, cc)
+                | DerivedDeclarator::FunctionPointer(_, _, _, cc),
+            ) = combined.iter_mut().rev().find(|d| {
+                matches!(
+                    d,
+                    DerivedDeclarator::Function(..) | DerivedDeclarator::FunctionPointer(..)
+                )
+            }) {
+                *cc = Some(abi);
+            } else {
+                // A parenthesized inner star may precede the outer parameter
+                // list. Carry its attribute back to that list, not to a name.
+                self.attrs.parsing_calling_convention = Some(abi);
+            }
+        }
 
         // The outermost stars name the object when present; otherwise the
         // parenthesised declarator's object space stands.
@@ -619,13 +644,14 @@ impl Parser {
                 AddressSpace::Default,
                 marker_cvr,
             ));
-            if let Some(DerivedDeclarator::Function(params, variadic, has_prototype)) =
+            if let Some(DerivedDeclarator::Function(params, variadic, has_prototype, abi)) =
                 outer_suffixes.into_iter().next()
             {
                 result.push(DerivedDeclarator::FunctionPointer(
                     params,
                     variadic,
                     has_prototype,
+                    abi,
                 ));
             }
 
@@ -803,13 +829,14 @@ impl Parser {
                 let mut result = outer_pointers;
                 result.extend_from_slice(&inner_prefix[..first_ptr_idx]);
                 result.push(inner_prefix[first_ptr_idx].clone());
-                if let Some(DerivedDeclarator::Function(params, variadic, has_prototype)) =
+                if let Some(DerivedDeclarator::Function(params, variadic, has_prototype, abi)) =
                     outer_suffixes.into_iter().next()
                 {
                     result.push(DerivedDeclarator::FunctionPointer(
                         params,
                         variadic,
                         has_prototype,
+                        abi,
                     ));
                 }
                 result.extend_from_slice(&inner_prefix[first_ptr_idx + 1..]);
@@ -842,6 +869,7 @@ impl Parser {
     /// which is also what removes the leak into the next parameter that the take
     /// exists to prevent.
     pub(super) fn parse_param_list(&mut self) -> (Vec<ParamDecl>, bool, bool) {
+        let decl_abi = self.attrs.parsing_calling_convention.take();
         let decl_alignas = self.attrs.parsed_alignas.take();
         let decl_alignas_type = self.attrs.parsed_alignas_type.take();
         // The enclosing declaration's volatile and typedef-use state is read
@@ -855,6 +883,7 @@ impl Parser {
         // Single restore point, deliberately: every exit from the list --
         // including the K&R identifier-list path -- goes through here, so no
         // early return can drop an enclosing declaration's alignment.
+        self.attrs.parsing_calling_convention = decl_abi;
         self.attrs.parsed_alignas = decl_alignas;
         self.attrs.parsed_alignas_type = decl_alignas_type;
         self.attrs.set_volatile(decl_volatile);
@@ -1081,6 +1110,7 @@ impl Parser {
                         ret_params,
                         ret_variadic,
                         ret_has_prototype,
+                        crate::common::types::CallingConvention::Default,
                     );
                     for _ in 0..extra_ptrs {
                         type_spec =
@@ -1122,6 +1152,11 @@ impl Parser {
                     fptr_params: fptr_param_decls,
                     fptr_variadic,
                     fptr_has_prototype,
+                    fptr_calling_convention: self
+                        .attrs
+                        .parsing_calling_convention
+                        .take()
+                        .unwrap_or_default(),
                     is_const: param_is_const,
                     is_volatile: param_is_volatile,
                     is_restrict: param_is_restrict,
@@ -1230,6 +1265,7 @@ impl Parser {
                 fptr_params: None,
                 fptr_variadic: false,
                 fptr_has_prototype: false,
+                fptr_calling_convention: crate::common::types::CallingConvention::Default,
                 is_const: false,
                 is_volatile: false,
                 is_restrict: false,
@@ -1862,6 +1898,7 @@ impl Parser {
                         params,
                         variadic,
                         has_prototype,
+                        self.attrs.parsing_calling_convention,
                     ));
                 }
                 _ => break,

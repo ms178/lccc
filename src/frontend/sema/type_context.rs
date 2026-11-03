@@ -17,7 +17,8 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
 use crate::common::types::{AddressSpace, CType, PtrQuals, RcLayout, StructLayout};
 use crate::frontend::parser::ast::{DerivedDeclarator, ParamDecl, TypeSpecifier};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::num::NonZeroU64;
 use std::rc::Rc;
 
 /// Information about a function typedef (e.g., `typedef int func_t(int, int);`).
@@ -28,6 +29,7 @@ use std::rc::Rc;
 /// to resolve function declarations through typedefs).
 #[derive(Debug, Clone)]
 pub struct FunctionTypedefInfo {
+    pub calling_convention: crate::common::types::CallingConvention,
     /// The return TypeSpecifier of the function typedef
     pub return_type: TypeSpecifier,
     /// Parameters of the function typedef
@@ -53,14 +55,19 @@ pub fn build_prefix_return_type_spec(
     while i < prefix.len() {
         match &prefix[i] {
             DerivedDeclarator::Pointer(..) => {
-                if let Some(DerivedDeclarator::FunctionPointer(params, variadic, has_prototype)) =
-                    prefix.get(i + 1)
+                if let Some(DerivedDeclarator::FunctionPointer(
+                    params,
+                    variadic,
+                    has_prototype,
+                    abi,
+                )) = prefix.get(i + 1)
                 {
                     return_type = TypeSpecifier::FunctionPointer(
                         Box::new(return_type),
                         params.clone(),
                         *variadic,
                         *has_prototype,
+                        abi.unwrap_or_default(),
                     );
                     i += 2;
                 } else {
@@ -71,12 +78,13 @@ pub fn build_prefix_return_type_spec(
                     i += 1;
                 }
             }
-            DerivedDeclarator::FunctionPointer(params, variadic, has_prototype) => {
+            DerivedDeclarator::FunctionPointer(params, variadic, has_prototype, abi) => {
                 return_type = TypeSpecifier::FunctionPointer(
                     Box::new(return_type),
                     params.clone(),
                     *variadic,
                     *has_prototype,
+                    abi.unwrap_or_default(),
                 );
                 i += 1;
             }
@@ -113,7 +121,8 @@ pub fn extract_fptr_typedef_info(
     base_type: &TypeSpecifier,
     derived: &[DerivedDeclarator],
 ) -> Option<FunctionTypedefInfo> {
-    let Some(DerivedDeclarator::FunctionPointer(params, variadic, has_prototype)) = derived.last()
+    let Some(DerivedDeclarator::FunctionPointer(params, variadic, has_prototype, abi)) =
+        derived.last()
     else {
         return None;
     };
@@ -127,6 +136,7 @@ pub fn extract_fptr_typedef_info(
     };
     let return_type = build_prefix_return_type_spec(base_type, derived, prefix_len);
     Some(FunctionTypedefInfo {
+        calling_convention: abi.unwrap_or_default(),
         return_type,
         params: params.clone(),
         variadic: *variadic,
@@ -144,6 +154,10 @@ pub fn extract_fptr_typedef_info(
 pub struct EnumConstant {
     pub value: i64,
     pub ty: CType,
+    /// Diagnostic provenance is distinct from the enumerator's C type,
+    /// which can be int in C11. Stored with the scoped constant so shadowing
+    /// and scope undo preserve both together.
+    pub origin: Option<Rc<crate::common::types::EnumType>>,
 }
 
 impl EnumConstant {
@@ -160,7 +174,11 @@ impl EnumConstant {
         } else {
             CType::LongLong
         };
-        Self { value, ty }
+        Self {
+            value,
+            ty,
+            origin: None,
+        }
     }
 }
 
@@ -204,6 +222,8 @@ pub struct TypeScopeFrame {
     pub enum_types_added: Vec<String>,
     pub enum_types_shadowed: Vec<(String, crate::common::types::EnumType)>,
     pub enum_types_tracked: FxHashSet<String>,
+    enum_ids_changed: Vec<(String, Option<NonZeroU64>)>,
+    enum_ids_tracked: FxHashSet<String>,
     /// Complete tag definitions seen in this lexical scope, keyed by tag name;
     /// each distinct source site is retained so repeated resolution is idempotent.
     pub tag_definitions: FxHashMap<String, TagDefinitionSites>,
@@ -249,6 +269,8 @@ impl TypeScopeFrame {
             enum_types_added: Vec::new(),
             enum_types_shadowed: Vec::new(),
             enum_types_tracked: FxHashSet::default(),
+            enum_ids_changed: Vec::new(),
+            enum_ids_tracked: FxHashSet::default(),
             tag_definitions: FxHashMap::default(),
             struct_layouts_added: Vec::new(),
             struct_layouts_shadowed: Vec::new(),
@@ -276,6 +298,9 @@ impl TypeScopeFrame {
 /// to the lowerer by ownership for IR emission.
 #[derive(Debug)]
 pub struct TypeContext {
+    next_enum_id: Cell<Option<NonZeroU64>>,
+    enum_tag_ids: RefCell<FxHashMap<String, NonZeroU64>>,
+    anonymous_enum_ids: RefCell<FxHashMap<(u32, u32), NonZeroU64>>,
     /// Struct/union layouts indexed by tag name.
     /// Uses Rc<StructLayout> so lookups/clones are cheap refcount bumps
     /// instead of deep-copying all field names and types.
@@ -366,6 +391,9 @@ pub struct TypeContext {
 impl TypeContext {
     pub fn new() -> Self {
         let mut tc = Self {
+            next_enum_id: Cell::new(Some(NonZeroU64::MIN)),
+            enum_tag_ids: RefCell::default(),
+            anonymous_enum_ids: RefCell::default(),
             struct_layouts: RefCell::new(FxHashMap::default()),
             record_alias: RefCell::new(FxHashMap::default()),
             enum_constants: FxHashMap::default(),
@@ -585,6 +613,61 @@ impl TypeContext {
         for (name, ct) in builtins {
             self.typedefs.insert(name.to_string(), ct.clone());
         }
+        if crate::common::types::target_elf_machine() == 62 {
+            // Keep the SysV record distinct from Microsoft's char* cursor.
+            // A char[24] approximation makes a decayed SysV parameter
+            // indistinguishable from __builtin_ms_va_list in va_arg.
+            let tag = "__lccc_builtin_sysv_va_list";
+            let mut layout = StructLayout::empty();
+            layout.is_complete = true;
+            layout.size = 24;
+            layout.align = 8;
+            layout.fields = [
+                ("gp_offset", 0, CType::UInt),
+                ("fp_offset", 4, CType::UInt),
+                (
+                    "overflow_arg_area",
+                    8,
+                    CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
+                ),
+                (
+                    "reg_save_area",
+                    16,
+                    CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
+                ),
+            ]
+            .into_iter()
+            .map(
+                |(name, offset, ty)| crate::common::types::StructFieldLayout {
+                    name: name.to_string(),
+                    offset,
+                    ty,
+                    bit_offset: None,
+                    bit_width: None,
+                    sso: Default::default(),
+                    sso_storage_ty: None,
+                    base_volatile: false,
+                    base_const: false,
+                    object_volatile: false,
+                    object_const: false,
+                    counted_by: None,
+                    pointer_quals: Vec::new(),
+                    own_cvr: Some(0),
+                },
+            )
+            .collect();
+            self.struct_layouts
+                .borrow_mut()
+                .insert(tag.to_string(), Rc::new(layout));
+            let sysv = CType::Array(Box::new(CType::Struct(tag.into())), Some(1));
+            for name in ["va_list", "__builtin_va_list", "__gnuc_va_list"] {
+                self.typedefs.insert(name.to_string(), sysv.clone());
+            }
+            self.typedefs.insert(
+                "__builtin_ms_va_list".to_string(),
+                CType::Pointer(Box::new(CType::plain_char()), PtrQuals::GENERIC),
+            );
+        }
     }
 
     /// Borrow the struct layouts map immutably.
@@ -697,6 +780,28 @@ impl TypeContext {
         false
     }
 
+    /// Whether this exact AST definition was already resolved in the active
+    /// lexical scope. Replaying it must not manufacture a new record identity;
+    /// a definition in a fresh inner scope must still shadow the outer tag.
+    pub fn tag_definition_seen_in_current_scope(&self, name: &str, span: Span) -> bool {
+        let scopes = self.scope_stack.borrow();
+        let contains = |sites: &TagDefinitionSites| {
+            sites.first == span
+                || sites
+                    .additional
+                    .as_ref()
+                    .is_some_and(|more| more.contains(&span))
+        };
+        if let Some(scope) = scopes.last() {
+            scope.tag_definitions.get(name).is_some_and(contains)
+        } else {
+            self.file_scope_tag_definitions
+                .borrow()
+                .get(name)
+                .is_some_and(contains)
+        }
+    }
+
     /// Record a complete tag definition in the active lexical scope.
     /// Returns true once for each distinct redefinition site; repeated semantic
     /// resolution of one AST node (same span) cannot duplicate its diagnostic.
@@ -733,6 +838,16 @@ impl TypeContext {
     /// enum_constants, struct_layouts, ctype_cache, and typedefs.
     pub fn pop_scope(&mut self) {
         if let Some(frame) = self.scope_stack.get_mut().pop() {
+            for (name, previous) in frame.enum_ids_changed.into_iter().rev() {
+                match previous {
+                    Some(id) => {
+                        self.enum_tag_ids.get_mut().insert(name, id);
+                    }
+                    None => {
+                        self.enum_tag_ids.get_mut().remove(&name);
+                    }
+                }
+            }
             // Last-write-first: each entry holds the value that write
             // replaced, so restoring in reverse rebuilds the pre-scope state
             // exactly.  `None` marks a name this scope introduced.
@@ -899,10 +1014,14 @@ impl TypeContext {
         scoped: bool,
     ) -> CType {
         let ty = enum_type.constant_ctype();
+        // Share provenance: copying all variants into every enumerator is
+        // quadratic in the size of large kernel enum declarations.
+        let origin = Rc::new(enum_type.clone());
         for (name, value) in &enum_type.variants {
             let constant = EnumConstant {
                 value: *value,
                 ty: ty.clone(),
+                origin: Some(Rc::clone(&origin)),
             };
             if scoped {
                 self.insert_enum_scoped(name.clone(), constant);
@@ -911,6 +1030,59 @@ impl TypeContext {
             }
         }
         ty
+    }
+
+    fn fresh_enum_identity(&self) -> Option<NonZeroU64> {
+        // Exhaustion is unreachable for a parsed TU (source offsets are u32),
+        // but do not wrap, recycle an ID, or add a hot-path panic anyway.
+        let id = self.next_enum_id.get()?;
+        self.next_enum_id.set(id.checked_add(1));
+        Some(id)
+    }
+
+    /// Resolve declaration identity without depending on completion, packing,
+    /// or an enum's current list of values. A definition/standalone tag
+    /// declaration may shadow a visible outer tag; a mere reference may not.
+    /// The same scoped undo mechanism as enum definitions restores visibility.
+    pub fn enum_identity(
+        &self,
+        name: Option<&str>,
+        variants: Option<&[crate::frontend::parser::ast::EnumVariant]>,
+        declares: bool,
+    ) -> Option<NonZeroU64> {
+        if let Some(name) = name {
+            let mut scopes = self.scope_stack.borrow_mut();
+            let current = scopes
+                .last()
+                .is_none_or(|f| f.enum_ids_tracked.contains(name));
+            let mut ids = self.enum_tag_ids.borrow_mut();
+            if (!declares || current)
+                && let Some(id) = ids.get(name)
+            {
+                return Some(*id);
+            }
+            let id = self.fresh_enum_identity()?;
+            let previous = ids.insert(name.to_string(), id);
+            if let Some(frame) = scopes.last_mut()
+                && frame.enum_ids_tracked.insert(name.to_string())
+            {
+                frame.enum_ids_changed.push((name.to_string(), previous));
+            }
+            Some(id)
+        } else {
+            // An AST definition can be resolved repeatedly (typeof, casts,
+            // typedefs). Preprocessed source positions distinguish otherwise
+            // identical anonymous definitions without a process-global ID.
+            let span = variants?.first()?.span;
+            let mut ids = self.anonymous_enum_ids.borrow_mut();
+            let key = (span.file_id, span.start);
+            if let Some(id) = ids.get(&key) {
+                return Some(*id);
+            }
+            let id = self.fresh_enum_identity()?;
+            ids.insert(key, id);
+            Some(id)
+        }
     }
 
     /// The enum tag `name` declared in the innermost scope, if any (C11
@@ -1257,11 +1429,75 @@ mod enum_type_scope_tests {
 
     fn enum_type(name: &str, variant: (&str, i64), is_packed: bool) -> EnumType {
         EnumType {
+            identity: None,
             name: Some(name.to_string()),
             variants: vec![(variant.0.to_string(), variant.1)],
             is_packed,
             fixed: None,
         }
+    }
+
+    #[test]
+    fn enum_identity_exhaustion_neither_wraps_nor_breaks_existing_types() {
+        let ctx = TypeContext::new();
+        ctx.next_enum_id.set(Some(std::num::NonZeroU64::MAX));
+        let last = ctx.enum_identity(Some("Last"), None, false);
+        assert_eq!(last, Some(std::num::NonZeroU64::MAX));
+        assert_eq!(ctx.enum_identity(Some("Overflow"), None, false), None);
+        assert_eq!(ctx.enum_identity(Some("Last"), None, false), last);
+    }
+
+    #[test]
+    fn enum_identity_is_compact_and_never_reused_across_scope_lifetimes() {
+        use std::collections::HashSet;
+        use std::num::NonZeroU64;
+        assert_eq!(std::mem::size_of::<Option<NonZeroU64>>(), 8);
+        let mut ctx = TypeContext::new();
+        let outer = ctx.enum_identity(Some("E"), None, false);
+        let mut seen = HashSet::new();
+        seen.insert(outer);
+        for _ in 0..1024 {
+            ctx.push_scope();
+            let inner = ctx.enum_identity(Some("E"), None, true);
+            assert!(
+                seen.insert(inner),
+                "scope lifetimes must not recycle identity"
+            );
+            ctx.pop_scope();
+            assert_eq!(outer, ctx.enum_identity(Some("E"), None, false));
+        }
+    }
+
+    #[test]
+    fn enum_identity_survives_completion_and_scope_undo() {
+        let mut ctx = TypeContext::new();
+        let outer = ctx.enum_identity(Some("E"), None, false);
+        assert!(outer.is_some());
+        assert_eq!(outer, ctx.enum_identity(Some("E"), None, true));
+        ctx.push_scope();
+        assert_eq!(outer, ctx.enum_identity(Some("E"), None, false));
+        let inner = ctx.enum_identity(Some("E"), None, true);
+        assert_ne!(
+            outer, inner,
+            "a shadow cannot inherit the outer declaration"
+        );
+        assert_eq!(inner, ctx.enum_identity(Some("E"), None, true));
+        ctx.push_scope();
+        let nested = ctx.enum_identity(Some("E"), None, true);
+        assert_ne!(inner, nested);
+        ctx.pop_scope();
+        assert_eq!(inner, ctx.enum_identity(Some("E"), None, false));
+        ctx.pop_scope();
+        assert_eq!(outer, ctx.enum_identity(Some("E"), None, false));
+    }
+
+    #[test]
+    fn enum_identity_local_names_do_not_escape_or_get_recycled() {
+        let mut ctx = TypeContext::new();
+        ctx.push_scope();
+        let local = ctx.enum_identity(Some("E"), None, false);
+        ctx.pop_scope();
+        assert_ne!(local, ctx.enum_identity(Some("E"), None, false));
     }
 
     #[test]
@@ -1431,6 +1667,33 @@ mod typedef_cvr_scope_tests {
 mod tag_definition_scope_tests {
     use super::TypeContext;
     use crate::common::source::Span;
+
+    #[test]
+    fn definition_replay_checks_exact_sites_only_in_the_current_scope() {
+        let mut types = TypeContext::new();
+        let first = Span::new(1, 2, 0);
+        let second = Span::new(3, 4, 0);
+        let other_file = Span::new(1, 2, 1);
+        assert!(!types.tag_definition_seen_in_current_scope("S", first));
+        types.record_tag_definition("S", first);
+        assert!(types.tag_definition_seen_in_current_scope("S", first));
+        assert!(!types.tag_definition_seen_in_current_scope("S", second));
+        assert!(!types.tag_definition_seen_in_current_scope("S", other_file));
+        assert!(!types.tag_definition_seen_in_current_scope("T", first));
+        types.record_tag_definition("S", second);
+        assert!(types.tag_definition_seen_in_current_scope("S", second));
+        types.push_scope();
+        assert!(!types.tag_definition_seen_in_current_scope("S", first));
+        types.record_tag_definition("S", first);
+        assert!(types.tag_definition_seen_in_current_scope("S", first));
+        assert!(!types.tag_definition_seen_in_current_scope("S", second));
+        types.pop_scope();
+        assert!(types.tag_definition_seen_in_current_scope("S", first));
+        assert!(types.tag_definition_seen_in_current_scope("S", second));
+        types.push_scope();
+        assert!(!types.tag_definition_seen_in_current_scope("S", first));
+        types.pop_scope();
+    }
 
     #[test]
     fn duplicate_site_is_reported_once_and_scopes_are_isolated() {

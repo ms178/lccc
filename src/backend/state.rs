@@ -300,6 +300,7 @@ pub struct FnEntryRows {
 }
 
 pub struct CodegenState {
+    pub(crate) frame_report: Option<crate::backend::FrameReport>,
     pub out: AsmOutput,
     /// Set from CodegenOptions for -O0 non-SSA correctness.
     pub disable_regalloc: bool,
@@ -510,6 +511,8 @@ pub struct CodegenState {
     /// Set of symbol names that are locally defined (not extern) and have internal
     /// linkage (static) — these can use direct addressing even in PIC mode.
     pub local_symbols: FxHashSet<String>,
+    /// Canonical IR fastcall definitions, used by i386 trampoline templates.
+    pub i686_fastcall_symbols: FxHashSet<String>,
     /// Set of symbol names defined in this translation unit (functions, globals,
     /// aliases, IFUNCs) — non-preemptible in `-fPIE` / `-fno-pic` executables.
     pub defined_symbols: FxHashSet<String>,
@@ -616,6 +619,8 @@ pub struct CodegenState {
     /// when the callee is variadic; for a prototyped non-variadic callee the
     /// `xorl %eax,%eax` is pure waste. GCC omits it there.
     pub call_is_variadic: bool,
+    pub call_calling_convention: crate::common::types::CallingConvention,
+    pub call_shadow_active: bool,
     /// Does the call being emitted pass a 256/512-bit vector in a YMM/ZMM
     /// register (`CallArgClass::StructXmmReg` wider than 16 bytes)?
     ///
@@ -766,6 +771,9 @@ pub struct CodegenState {
     pub num_params: usize,
     /// Whether the current function is variadic (for ParamRef ABI handling).
     pub func_is_variadic: bool,
+    /// Owning function ABI; unlike per-call state this cannot be overwritten
+    /// by emitting a call with a different convention.
+    pub func_calling_convention: crate::common::types::CallingConvention,
     /// Stack slots for parameter allocas, indexed by param_idx.
     /// Populated by `emit_store_params` so that `emit_param_ref` can load the
     /// parameter value from its alloca slot (where emit_store_params saved it)
@@ -807,6 +815,8 @@ pub struct CodegenState {
     pub uses_sret: bool,
     /// Whether to place each function in its own section (-ffunction-sections).
     pub function_sections: bool,
+    /// Hard alignment floor for every generated function, in bytes (0/1 = none).
+    pub min_function_alignment: u32,
     /// Whether to place each data object in its own section (-fdata-sections).
     pub data_sections: bool,
     /// Whether any 64-bit division/modulo runtime helper (i686: lccc's private
@@ -943,6 +953,7 @@ impl CodegenState {
 
     pub fn new_with_ra_config(ra_config: Arc<crate::backend::regalloc::RaConfig>) -> Self {
         Self {
+            frame_report: None,
             out: AsmOutput::new(),
             disable_regalloc: false,
             ra_config,
@@ -990,6 +1001,7 @@ impl CodegenState {
             pie_mode: false,
             no_plt: false,
             local_symbols: FxHashSet::default(),
+            i686_fastcall_symbols: FxHashSet::default(),
             defined_symbols: FxHashSet::default(),
             extern_function_symbols: FxHashSet::default(),
             noplt_symbols: FxHashSet::default(),
@@ -1016,6 +1028,8 @@ impl CodegenState {
             indirect_branch_thunk: false,
             indirect_branch_thunk_inline: false,
             call_is_variadic: false,
+            call_calling_convention: Default::default(),
+            call_shadow_active: false,
             call_passes_wide_vector: false,
             chain_call: false,
             call_gp_arg_count: 6,
@@ -1045,6 +1059,7 @@ impl CodegenState {
             param_classes: Vec::new(),
             num_params: 0,
             func_is_variadic: false,
+            func_calling_convention: Default::default(),
             param_alloca_slots: Vec::new(),
             param_homing_stores: FxHashSet::default(),
             frame_gep_direct: false,
@@ -1054,6 +1069,7 @@ impl CodegenState {
             vec_param_preloaded: FxHashSet::default(),
             uses_sret: false,
             function_sections: false,
+            min_function_alignment: 0,
             data_sections: false,
             needs_divdi3_helpers: false,
             emit_cfi: true,
@@ -1610,6 +1626,7 @@ impl CodegenState {
     /// Set the compilation-wide TLS inputs from the codegen options (shared by
     /// every backend's `apply_options`).
     pub fn apply_tls_options(&mut self, opts: &crate::backend::CodegenOptions) {
+        self.frame_report = opts.frame_report.clone();
         self.shared_lib = opts.shared_lib;
         self.stack_clash_protection = opts.stack_clash_protection;
         self.stack_protector_guard = opts.stack_protector_guard.clone();

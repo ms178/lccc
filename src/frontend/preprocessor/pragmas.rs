@@ -11,7 +11,7 @@ use super::utils::is_ident_cont_byte;
 
 /// `text` after a leading `keyword` token, or `None` when `text` does not
 /// start with that whole token (`warning` must not match `warnings`).
-fn strip_pragma_keyword<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
+pub(super) fn strip_pragma_keyword<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
     let rest = text.strip_prefix(keyword)?;
     if rest.bytes().next().is_some_and(is_ident_cont_byte) {
         return None;
@@ -128,6 +128,21 @@ impl Preprocessor {
         col: usize,
     ) -> Option<String> {
         let rest = rest.trim();
+        if let Some(message) = crate::common::diagnostic_pragma::threshold_error(rest) {
+            self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                kind: crate::common::error::WarningKind::Cpp,
+                file: self.current_file(),
+                line: line_num,
+                col,
+                message,
+            });
+            return None;
+        }
+
+        if self.diagnostic_pragmas.apply(rest) {
+            // Keep the directive at its exact output position for parser/sema.
+            return Some(format!("#pragma {rest}\n"));
+        }
         if rest.starts_with("STDC") && rest.split_whitespace().eq(["STDC", "FENV_ACCESS", "ON"]) {
             self.fenv_access_requested = true;
             return None;
@@ -198,8 +213,19 @@ impl Preprocessor {
 
         // `#pragma message "..."` / `#pragma message ("...")`.
         if let Some(operand) = strip_pragma_keyword(rest, "message") {
-            self.handle_pragma_message(operand, line_num, col);
-            return None;
+            let expanded = self.macros.expand_line(operand);
+            // Operand effects (e.g. -Wdate-time or a nested _Pragma) precede
+            // this message, including on assembly paths that discard it.
+            self.drain_expansion_effects();
+            // Assembly mode expands the operand, but neither handles the
+            // C-frontend message nor preserves its directive (GCC 16.2).
+            if self.macros.asm_mode {
+                return None;
+            }
+            self.handle_pragma_message(&expanded, line_num, col);
+            // Preserve the frontend directive in -E output. The lexer ignores
+            // it on direct compilations; collected diagnostics own reporting.
+            return Some(format!("#pragma message {expanded}\n"));
         }
 
         // Other pragmas (GCC, diagnostic, etc.) are silently ignored
@@ -221,6 +247,7 @@ impl Preprocessor {
                 Some(end) => (r[..end].to_string(), false, &r[end + 1..]),
                 None => {
                     self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                        kind: crate::common::error::WarningKind::Cpp,
                         file: self.current_file(),
                         line: line_num,
                         col,
@@ -234,6 +261,7 @@ impl Preprocessor {
                 Some(end) => (r[..end].to_string(), true, &r[end + 1..]),
                 None => {
                     self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                        kind: crate::common::error::WarningKind::Cpp,
                         file: self.current_file(),
                         line: line_num,
                         col,
@@ -244,6 +272,7 @@ impl Preprocessor {
             }
         } else {
             self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                kind: crate::common::error::WarningKind::Cpp,
                 file: self.current_file(),
                 line: line_num,
                 col,
@@ -253,6 +282,7 @@ impl Preprocessor {
         };
         let Some(resolved) = self.resolve_include_path(&filename, is_system) else {
             self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                kind: crate::common::error::WarningKind::Cpp,
                 file: self.current_file(),
                 line: line_num,
                 col,
@@ -280,7 +310,8 @@ impl Preprocessor {
                     filename, message
                 )
             };
-            self.warnings.push(super::pipeline::PreprocessorDiagnostic {
+            self.push_warning(super::pipeline::PreprocessorDiagnostic {
+                kind: crate::common::error::WarningKind::Cpp,
                 file: self.current_file(),
                 line: line_num,
                 col,
@@ -310,6 +341,7 @@ impl Preprocessor {
             None => (format!("invalid '#pragma GCC {keyword}' directive"), true),
         };
         let diagnostic = PreprocessorDiagnostic {
+            kind: crate::common::error::WarningKind::Pragmas,
             file: self.current_file(),
             line: line_num,
             col,
@@ -318,9 +350,10 @@ impl Preprocessor {
         if is_error {
             self.errors.push(diagnostic);
         } else {
-            self.pragma_diagnostics.push(PragmaDiagnostic {
+            self.push_pragma_diagnostic(PragmaDiagnostic {
                 severity: PragmaSeverity::Warning,
                 diagnostic,
+                warning_config: None,
             });
         }
     }
@@ -332,12 +365,14 @@ impl Preprocessor {
     /// shapes are `-Wpragmas` warnings and print nothing else, except junk
     /// after a complete operand, which warns and still prints the note.
     fn handle_pragma_message(&mut self, operand: &str, line_num: usize, col: usize) {
-        let expanded = self.macros.expand_line(operand);
         let file = self.current_file();
         let mut push = |severity: PragmaSeverity, message: String| {
-            self.pragma_diagnostics.push(PragmaDiagnostic {
+            self.push_pragma_diagnostic(PragmaDiagnostic {
                 severity,
+                warning_config: matches!(severity, PragmaSeverity::PragmasWarning)
+                    .then(|| Box::new(self.diagnostic_pragmas.current.clone())),
                 diagnostic: PreprocessorDiagnostic {
+                    kind: crate::common::error::WarningKind::Pragmas,
                     file: file.clone(),
                     line: line_num,
                     col,
@@ -345,7 +380,7 @@ impl Preprocessor {
                 },
             });
         };
-        match parse_message_operand(&expanded) {
+        match parse_message_operand(operand) {
             MessageOperand::Message { text, junk } => {
                 if junk {
                     push(
@@ -396,7 +431,7 @@ impl Preprocessor {
     /// Handle #pragma push_macro("name") - save the current definition of macro.
     fn handle_pragma_push_macro(&mut self, content: &str) {
         if let Some(name) = Self::extract_pragma_macro_name(content) {
-            let saved = self.macros.get(&name).cloned();
+            let saved = self.macros.snapshot_definition(&name);
             self.macro_save_stack.entry(name).or_default().push(saved);
         }
     }
@@ -406,10 +441,7 @@ impl Preprocessor {
         if let Some(name) = Self::extract_pragma_macro_name(content) {
             if let Some(stack) = self.macro_save_stack.get_mut(&name) {
                 if let Some(saved) = stack.pop() {
-                    match saved {
-                        Some(def) => self.macros.define(def),
-                        None => self.macros.undefine(&name),
-                    }
+                    self.macros.restore_definition(&name, saved);
                 }
             }
         }

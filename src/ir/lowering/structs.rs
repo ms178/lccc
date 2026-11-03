@@ -256,6 +256,7 @@ impl Lowerer {
                 struct_aligned,
                 reverse_sso,
                 _,
+                _,
             ) => {
                 // Recursively register nested struct/union types in fields
                 self.register_nested_struct_types(fields);
@@ -401,6 +402,7 @@ impl Lowerer {
                 pragma_pack,
                 struct_aligned,
                 reverse_sso,
+                _,
                 _,
             ) => (
                 tag,
@@ -598,7 +600,16 @@ impl Lowerer {
         }
         let ts = self.resolve_type_spec(ts);
         match ts {
-            TypeSpecifier::Struct(tag, Some(fields), is_packed, pragma_pack, _, reverse_sso, _) => {
+            TypeSpecifier::Struct(
+                tag,
+                Some(fields),
+                is_packed,
+                pragma_pack,
+                _,
+                reverse_sso,
+                _,
+                _,
+            ) => {
                 if let Some(tag) = tag {
                     let layouts = self.types.borrow_struct_layouts();
                     if let Some(layout) = layouts

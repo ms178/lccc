@@ -396,7 +396,8 @@ pub(crate) fn summarizable(func: &IrFunction, binds_locally: bool) -> bool {
 /// realignment), by-value aggregates (copy loops), sret, variadic (`%al`),
 /// fastcall/regparm, and non-scalar values.
 pub(crate) fn call_staging(info: &CallInfo) -> Option<u16> {
-    if info.is_variadic
+    if info.calling_convention != crate::common::types::CallingConvention::Default
+        || info.is_variadic
         || info.is_sret
         || info.is_fastcall
         || info.regparm.is_some()

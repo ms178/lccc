@@ -1507,6 +1507,7 @@ fn make_copy_call(
             struct_arg_riscv_float_classes: Vec::new(),
             struct_arg_is_f128_sse: vec![false, false, false],
             is_sret: false,
+            calling_convention: crate::common::types::CallingConvention::Default,
             is_fastcall: false,
             regparm: None,
             is_pure: false,

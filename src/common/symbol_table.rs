@@ -54,6 +54,10 @@ struct Scope {
     local_objects: Vec<LocalObject>,
     /// Names of local objects whose visible binding was referenced.
     used_local_objects: FxHashSet<String>,
+    /// Per-level value reads: level 2 excludes discarded ++/--, level 3
+    /// additionally excludes discarded compound assignments (GCC 16.2).
+    local_value_reads: FxHashMap<String, [usize; 3]>,
+    written_local_objects: FxHashSet<String>,
     /// Const-qualified objects whose initializer is a constant expression.
     /// GCC folds their value in constant contexts (`const int c = 5;
     /// static int v = c;` is accepted); their address is still not constant
@@ -138,6 +142,8 @@ impl Scope {
             automatic: FxHashSet::default(),
             local_objects: Vec::new(),
             used_local_objects: FxHashSet::default(),
+            local_value_reads: FxHashMap::default(),
+            written_local_objects: FxHashSet::default(),
             folded: FxHashSet::default(),
             constexpr_objects: FxHashSet::default(),
             constexpr_members: FxHashMap::default(),
@@ -257,6 +263,9 @@ impl SymbolTable {
             if scope.symbols.contains_key(name) {
                 if scope.local_objects.iter().any(|object| object.name == name) {
                     scope.used_local_objects.insert(name.to_string());
+                    for count in scope.local_value_reads.entry(name.to_string()).or_default() {
+                        *count += 1;
+                    }
                 }
                 // A parameter, typedef, function, or enum constant can hide
                 // an outer tracked object, so never continue past this binding.
@@ -265,19 +274,50 @@ impl SymbolTable {
         }
     }
 
-    /// Return the unused, unsuppressed block objects of the current scope in
-    /// declaration order. Callers use this immediately before popping scope.
-    pub fn unused_local_objects(&self) -> Vec<(String, Span)> {
+    /// An lvalue reference was counted by normal expression analysis. Remove
+    /// just that reference at the relevant levels, retaining other reads in
+    /// an index expression (a[a[0]]), and respecting shadowing. File-scope
+    /// writes are references for GCC's separate unused-global diagnostic.
+    pub fn mark_write_only(&mut self, name: &str, minimum_level: u8) {
+        for (index, scope) in self.scopes.iter_mut().enumerate().rev() {
+            if !scope.symbols.contains_key(name) {
+                continue;
+            }
+            if index != 0 && scope.local_objects.iter().any(|o| o.name == name) {
+                scope.written_local_objects.insert(name.to_string());
+                if let Some(reads) = scope.local_value_reads.get_mut(name) {
+                    for count in &mut reads[usize::from(minimum_level - 1)..] {
+                        *count = count.saturating_sub(1);
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    /// Unused objects in declaration order. The optional level distinguishes
+    /// a truly unreferenced declaration from a referenced, write-only object.
+    pub fn unused_local_objects(&self) -> Vec<(String, Span, Option<u8>)> {
         let Some(scope) = self.scopes.last() else {
             return Vec::new();
         };
         scope
             .local_objects
             .iter()
-            .filter(|object| {
-                !object.suppress_warning && !scope.used_local_objects.contains(&object.name)
+            .filter_map(|object| {
+                if object.suppress_warning {
+                    return None;
+                }
+                if !scope.used_local_objects.contains(&object.name) {
+                    return Some((object.name.clone(), object.span, None));
+                }
+                if scope.written_local_objects.contains(&object.name) {
+                    let reads = scope.local_value_reads.get(&object.name)?;
+                    let level = reads.iter().position(|&count| count == 0)? as u8 + 1;
+                    return Some((object.name.clone(), object.span, Some(level)));
+                }
+                None
             })
-            .map(|object| (object.name.clone(), object.span))
             .collect()
     }
 
@@ -608,6 +648,7 @@ mod binding_depth_tests {
         Symbol {
             name: name.to_string(),
             ty: CType::Function(Box::new(FunctionType {
+                calling_convention: crate::common::types::CallingConvention::Default,
                 return_type: CType::Int,
                 params: Vec::new(),
                 variadic: false,

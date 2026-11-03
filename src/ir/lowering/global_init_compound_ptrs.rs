@@ -164,6 +164,7 @@ impl Lowerer {
 
                 if !trailing_designators.is_empty() {
                     let sub_item = InitializerItem {
+                        span: crate::common::source::Span::dummy(),
                         designators: trailing_designators.to_vec(),
                         init: item.init.clone(),
                     };
@@ -247,6 +248,7 @@ impl Lowerer {
 
             if !trailing_designators.is_empty() {
                 let sub_item = InitializerItem {
+                    span: crate::common::source::Span::dummy(),
                     designators: trailing_designators.to_vec(),
                     init: item.init.clone(),
                 };
@@ -738,6 +740,7 @@ impl Lowerer {
                             let field = &layout.fields[0];
                             let field_offset = base_offset + field.offset;
                             let synth_item = InitializerItem {
+                                span: crate::common::source::Span::dummy(),
                                 designators: Vec::new(),
                                 init: Initializer::Expr(inner_expr.clone()),
                             };
@@ -913,6 +916,7 @@ impl Lowerer {
                     v
                 };
                 let remaining_item = InitializerItem {
+                    span: crate::common::source::Span::dummy(),
                     designators: desigs,
                     init: item.init.clone(),
                 };
@@ -1033,6 +1037,7 @@ impl Lowerer {
                             synth_desigs.extend(inner_item.designators[1..].iter().cloned());
                         }
                         let sub_item = InitializerItem {
+                            span: crate::common::source::Span::dummy(),
                             designators: synth_desigs,
                             init: inner_item.init.clone(),
                         };
@@ -1670,6 +1675,7 @@ impl Lowerer {
                     let anon_offset = base_offset + anon_field.offset;
                     if let Some(anon_layout) = self.get_struct_layout_for_ctype(&anon_field.ty) {
                         let sub_item = InitializerItem {
+                            span: crate::common::source::Span::dummy(),
                             designators: vec![Designator::Field(inner_name.clone())],
                             init: inner_item.init.clone(),
                         };

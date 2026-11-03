@@ -9,80 +9,11 @@
 
 use super::pipeline::Preprocessor;
 use super::utils::{
-    bytes_to_str, c23_dialect, is_digit_separator, is_ident_cont_byte, is_ident_start_byte,
-    is_literal_prefix, push_char_at, skip_literal_bytes,
+    bytes_to_str, is_digit_separator, is_ident_cont_byte, is_ident_start_byte, push_char_at,
+    skip_literal_bytes,
 };
 
 impl Preprocessor {
-    /// Replace remaining identifiers (not keywords) with 0 in a #if expression.
-    /// Per C standard, after macro expansion, undefined identifiers in #if evaluate to 0.
-    ///
-    /// Everything that is not a replaced identifier is copied byte for byte:
-    /// a character constant such as `'é'` must reach the evaluator as the
-    /// same UTF-8 bytes (C3 A9, the constant 0xC3A9), not as one `char` per
-    /// byte (`'Ã©'`, four bytes and a different value).
-    pub(super) fn replace_remaining_idents_with_zero(&self, expr: &str) -> String {
-        let mut result: Vec<u8> = Vec::with_capacity(expr.len() + 8);
-        let bytes = expr.as_bytes();
-        let len = bytes.len();
-        let mut i = 0;
-
-        while i < len {
-            // Character and string literals are copied verbatim.
-            if (bytes[i] == b'\'' && !is_digit_separator(bytes, i)) || bytes[i] == b'"' {
-                let end = skip_literal_bytes(bytes, i, bytes[i]).min(len);
-                result.extend_from_slice(&bytes[i..end]);
-                i = end;
-                continue;
-            }
-            if bytes[i].is_ascii_digit() {
-                // Skip entire number literal
-                result.push(bytes[i]);
-                i += 1;
-                if i < len
-                    && bytes[i - 1] == b'0'
-                    && (bytes[i] == b'x'
-                        || bytes[i] == b'X'
-                        || bytes[i] == b'b'
-                        || bytes[i] == b'B')
-                {
-                    result.push(bytes[i]);
-                    i += 1;
-                }
-                while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'.') {
-                    result.push(bytes[i]);
-                    i += 1;
-                }
-            } else if is_ident_start_byte(bytes[i]) {
-                let start = i;
-                i += 1;
-                while i < len && is_ident_cont_byte(bytes[i]) {
-                    i += 1;
-                }
-                let ident = bytes_to_str(bytes, start, i);
-                // An encoding prefix belongs to the literal after it, which the
-                // next iteration copies verbatim (`L'\400'` must not become
-                // `0'\400'`).
-                if ident == "defined"
-                    || (c23_dialect() && (ident == "true" || ident == "false"))
-                    || is_literal_prefix(ident, bytes.get(i).copied())
-                {
-                    result.extend_from_slice(ident.as_bytes());
-                } else {
-                    result.push(b'0');
-                }
-            } else {
-                result.push(bytes[i]);
-                i += 1;
-            }
-        }
-
-        // Only whole identifiers were replaced, by ASCII, and every other byte
-        // was copied in order, so the input's UTF-8 is intact.
-        String::from_utf8(result)
-            .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
-    }
-
     /// Replace `defined(X)`, `defined X`, `__has_builtin(X)`, `__has_attribute(X)`,
     /// `__has_feature(X)`, `__has_extension(X)`, `__has_include(X)`, and
     /// `__has_include_next(X)` with 0 or 1 in a #if expression.
@@ -188,6 +119,7 @@ impl Preprocessor {
         macro_rules! diag {
             ($msg:expr) => {
                 self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                    kind: crate::common::error::WarningKind::Cpp,
                     file: self.current_file(),
                     line: diag_line,
                     col: 0,
@@ -200,7 +132,8 @@ impl Preprocessor {
         // option name is only a WARNING (it must not reject the TU).
         macro_rules! warn {
             ($msg:expr) => {
-                self.warnings.push(super::pipeline::PreprocessorDiagnostic {
+                self.push_warning(super::pipeline::PreprocessorDiagnostic {
+                    kind: crate::common::error::WarningKind::Cpp,
                     file: self.current_file(),
                     line: diag_line,
                     col: 0,

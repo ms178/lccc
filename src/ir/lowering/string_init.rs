@@ -265,6 +265,7 @@ mod tests {
         assert_eq!(v[1], IrConst::from_i64(0xE9, IrType::I8));
         assert_eq!(v[4], IrConst::from_i64(0, IrType::I8));
         let braced = [InitializerItem {
+            span: crate::common::source::Span::dummy(),
             designators: vec![],
             init: Initializer::Expr(n.clone()),
         }];

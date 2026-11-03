@@ -91,6 +91,7 @@ fn walk<'a>(
                 // `int a[2] = 1;`-like: the expression initializes the first
                 // scalar (an error for arrays elsewhere; harmless here).
                 let items = [InitializerItem {
+                    span: crate::common::source::Span::dummy(),
                     designators: Vec::new(),
                     init: Initializer::Expr(expr.clone()),
                 }];
@@ -375,12 +376,14 @@ mod tests {
     }
     fn item(init: Initializer) -> InitializerItem {
         InitializerItem {
+            span: crate::common::source::Span::dummy(),
             designators: Vec::new(),
             init,
         }
     }
     fn field(name: &str, init: Initializer) -> InitializerItem {
         InitializerItem {
+            span: crate::common::source::Span::dummy(),
             designators: vec![Designator::Field(name.to_string())],
             init,
         }
@@ -424,6 +427,7 @@ mod tests {
         assert_eq!(paths(&s, &init), [".b=9"]);
         let a = CType::Array(Box::new(CType::Int), Some(4));
         let idx = InitializerItem {
+            span: crate::common::source::Span::dummy(),
             designators: vec![Designator::Index(Expr::IntLiteral(2, Span::dummy()))],
             init: int(7),
         };

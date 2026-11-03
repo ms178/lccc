@@ -80,9 +80,16 @@ pub(crate) struct McountInstrumentation {
     pub nop: bool,
 }
 
+/// Invocation-local observations: later shipped IPA retries replace earlier
+/// observations; exploratory layout emissions never enter this report.
+pub(crate) type FrameReport = std::sync::Arc<
+    std::sync::Mutex<std::collections::BTreeMap<String, (crate::common::source::Span, u64)>>,
+>;
+
 /// Options that control code generation, parsed from CLI flags.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CodegenOptions {
+    pub(crate) frame_report: Option<FrameReport>,
     /// Invocation-owned RA/codegen policy, parsed once by the driver before
     /// any per-function backend work starts.
     pub(crate) ra_config: std::sync::Arc<regalloc::RaConfig>,
@@ -146,6 +153,8 @@ pub(crate) struct CodegenOptions {
     /// Byte alignment for function entry labels (`.p2align log2`). 0 = none.
     /// GCC/Clang use 16 at -O1..-O3 and none at -Os/-Oz.
     pub(crate) function_alignment: u32,
+    /// Hard floor from -fmin-function-alignment=, including cold/size/attributed functions.
+    pub(crate) min_function_alignment: u32,
     /// -mskip-rax-setup: omit the `xorl %eax,%eax` / `movb $n,%al` reporting the
     /// number of live SSE argument registers to a variadic callee. Only honoured
     /// together with `no_sse`, where no such register can be in use.
@@ -737,6 +746,7 @@ impl Target {
                     cg.apply_options(opts);
                     cg.state.fpo_requested = opts.omit_frame_pointer;
                     cg.state.function_sections = opts.function_sections;
+                    cg.state.min_function_alignment = opts.min_function_alignment;
                     cg.state.data_sections = opts.data_sections;
                     cg.ipa = x86::codegen::ipa_ra::IpaRaState::new(
                         ipa_wanted && round < IPA_RA_MAX_ROUNDS,
@@ -802,6 +812,7 @@ impl Target {
                 cg.apply_options(opts);
                 cg.state.fpo_requested = opts.omit_frame_pointer;
                 cg.state.function_sections = opts.function_sections;
+                cg.state.min_function_alignment = opts.min_function_alignment;
                 cg.state.data_sections = opts.data_sections;
                 let raw = generation::generate_module_with_debug(
                     &mut cg,
@@ -849,6 +860,7 @@ impl Target {
                 cg.apply_options(opts);
                 cg.state.fpo_requested = opts.omit_frame_pointer;
                 cg.state.function_sections = opts.function_sections;
+                cg.state.min_function_alignment = opts.min_function_alignment;
                 cg.state.data_sections = opts.data_sections;
                 let raw = generation::generate_module_with_debug(
                     &mut cg,
@@ -876,6 +888,7 @@ impl Target {
                 cg.apply_options(opts);
                 cg.state.fpo_requested = opts.omit_frame_pointer;
                 cg.state.function_sections = opts.function_sections;
+                cg.state.min_function_alignment = opts.min_function_alignment;
                 cg.state.data_sections = opts.data_sections;
                 cg.emit_pre_directives();
                 let raw = generation::generate_module_with_debug(

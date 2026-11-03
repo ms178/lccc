@@ -201,6 +201,7 @@ const IMPLEMENTED: &[&str] = &[
     "constructor",
     "counted_by",
     "destructor",
+    "designated_init",
     "diagnose_as",
     "diagnose_as_builtin",
     "error",
@@ -210,6 +211,7 @@ const IMPLEMENTED: &[&str] = &[
     "gnu_inline",
     "ifunc",
     "mode",
+    "ms_abi",
     "naked",
     "no_instrument_function",
     "no_sanitize",
@@ -469,7 +471,7 @@ pub(crate) enum AbiPlacement {
 /// names carry their record-tag verdict here and their elsewhere verdict in
 /// [`abi_effect`], which is the only place placement is consulted.
 pub(crate) const ABI_VERDICTS: &[(&str, AbiEffect, AbiEffect)] = &[
-    ("ms_abi", AbiEffect::Unsupported, AbiEffect::Unsupported),
+    ("ms_abi", AbiEffect::Implemented, AbiEffect::Unsupported),
     ("sysv_abi", AbiEffect::Default, AbiEffect::Default),
     ("cdecl", AbiEffect::GccIgnored, AbiEffect::Default),
     ("stdcall", AbiEffect::GccIgnored, AbiEffect::Unsupported),

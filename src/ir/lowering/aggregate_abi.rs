@@ -8,7 +8,7 @@
 
 use super::lower::Lowerer;
 use crate::common::sysv_classify::SysvPassing;
-use crate::common::types::{CType, EightbyteClass};
+use crate::common::types::{CType, CallingConvention, EightbyteClass};
 use crate::frontend::parser::ast::Expr;
 
 /// Return convention of a function returning an aggregate by value.
@@ -103,7 +103,28 @@ impl Lowerer {
 
     /// Return convention for a function returning `ret_ct` (a struct,
     /// union or vector of `size` bytes) by value.
-    pub(super) fn aggregate_return(&self, ret_ct: &CType, size: usize) -> AggregateReturn {
+    pub(super) fn aggregate_return(
+        &self,
+        ret_ct: &CType,
+        size: usize,
+        convention: CallingConvention,
+    ) -> AggregateReturn {
+        if convention == CallingConvention::MicrosoftX64 {
+            // GNU Microsoft x64 returns 1/2/4/8-byte C records in RAX,
+            // regardless of their fields. Other records use a hidden RCX
+            // buffer pointer, returned again in RAX.
+            return if matches!(size, 1 | 2 | 4 | 8) {
+                AggregateReturn {
+                    classes: vec![EightbyteClass::Integer],
+                    ..Default::default()
+                }
+            } else {
+                AggregateReturn {
+                    sret_size: Some(size),
+                    ..Default::default()
+                }
+            };
+        }
         // ExtVector register returns on i386 are not SysV record returns.
         // Definitions already use this carrier table; indirect calls must
         // consult it too, rather than adding a hidden record-return pointer
@@ -181,6 +202,19 @@ impl Lowerer {
         callee
     }
 
+    pub(super) fn callee_calling_convention(&self, callee: &Expr) -> CallingConvention {
+        self.get_expr_ctype(callee)
+            .and_then(|ct| match ct {
+                CType::Function(ft) => Some(ft.calling_convention),
+                CType::Pointer(inner, _) => match *inner {
+                    CType::Function(ft) => Some(ft.calling_convention),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
     /// The return convention of a call to the resolved `callee`: the
     /// signature of a named function; for anything else (function pointers,
     /// computed callees) the callee expression's function type, classified
@@ -203,7 +237,17 @@ impl Lowerer {
             _ => match self.call_return_ctype(callee) {
                 Some(ct) if ct.is_struct_or_union() || ct.is_vector() => {
                     let size = self.resolve_ctype_size(&ct);
-                    self.aggregate_return(&ct, size)
+                    self.aggregate_return(&ct, size, self.callee_calling_convention(callee))
+                }
+                Some(CType::Int128 | CType::UInt128)
+                    if self.callee_calling_convention(callee)
+                        == CallingConvention::MicrosoftX64 =>
+                {
+                    AggregateReturn {
+                        one_xmm: true,
+                        classes: vec![EightbyteClass::Sse, EightbyteClass::SseUp],
+                        ..AggregateReturn::default()
+                    }
                 }
                 Some(ct) if ct.is_half_float() => AggregateReturn {
                     one_xmm: true,

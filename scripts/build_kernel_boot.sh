@@ -78,12 +78,9 @@ trap 'rm -rf -- "$header_stage"' EXIT
 lccc_boot_stage_header "$header_stage"
 
 # ---- generated headers -----------------------------------------------------
-# cpustr.h (needs the mkcpustr host tool)
-if [[ ! -f arch/x86/boot/cpustr.h ]]; then
-  "$HOSTCC" -O2 -Iarch/x86/include -Iarch/x86/include/generated -Iinclude \
-      arch/x86/boot/mkcpustr.c -o "$OUT/mkcpustr"
-  "$OUT/mkcpustr" > arch/x86/boot/cpustr.h
-fi
+# shellcheck source=boot_cpustr.sh
+. "$SCRIPT_DIR/boot_cpustr.sh"
+lccc_boot_generate_cpustr "$OUT" "$HOSTCC"
 
 # ---- assemble the .S files -------------------------------------------------
 ASM_FILES=("${LCCC_BOOT_ASM_FILES[@]}")

@@ -37,6 +37,7 @@ struct DeclContext {
     spec_visibility: Option<String>,
     spec_tls_model: Option<crate::common::tls::TlsModel>,
     spec_noinline: bool,
+    spec_calling_convention: Option<crate::common::types::CallingConvention>,
 }
 
 /// Parser-side mirror of `common::type_builder::apply_declaration_address_space`
@@ -93,6 +94,8 @@ impl Parser {
     fn parse_external_bare_type(&mut self, type_spec: TypeSpecifier, start: Span) -> ExternalDecl {
         self.consume_if(&TokenKind::Semicolon);
         let is_transparent_union = self.take_transparent_union();
+        let is_designated_init = self.attrs.parsing_designated_init();
+        self.attrs.set_designated_init(false);
         let mut d = Declaration::new(
             type_spec,
             Vec::new(),
@@ -115,6 +118,7 @@ impl Parser {
         d.set_pointer_const(self.attrs.parsing_pointer_const());
         d.set_thread_local(self.attrs.parsing_thread_local());
         d.set_transparent_union(is_transparent_union);
+        d.set_designated_init(is_designated_init);
         ExternalDecl::Declaration(d)
     }
 
@@ -185,6 +189,7 @@ impl Parser {
         let spec_visibility = self.attrs.parsing_visibility.clone();
         let spec_tls_model = self.attrs.parsing_tls_model;
         let spec_noinline = self.attrs.parsing_noinline();
+        let spec_calling_convention = self.attrs.parsing_calling_convention;
 
         // Bare type with no declarator (e.g., struct definition)
         if self.at_eof() || matches!(self.peek(), TokenKind::Semicolon) {
@@ -404,6 +409,7 @@ impl Parser {
                 spec_visibility,
                 spec_tls_model,
                 spec_noinline,
+                spec_calling_convention,
             };
             self.parse_declaration_rest(type_spec, name, derived, start, ctx)
         }
@@ -511,7 +517,7 @@ impl Parser {
         // further declarations, and each of those overwrites the field.
         let def_name_span = self.attrs.last_decl_name_span;
         let (params, variadic, has_prototype) =
-            if let Some(DerivedDeclarator::Function(p, v, has_prototype)) = derived.last() {
+            if let Some(DerivedDeclarator::Function(p, v, has_prototype, _)) = derived.last() {
                 (p.clone(), *v, *has_prototype)
             } else {
                 (vec![], false, false)
@@ -615,6 +621,10 @@ impl Parser {
             false,
         );
         Some(ExternalDecl::FunctionDef(FunctionDef {
+            calling_convention: match derived.last() {
+                Some(DerivedDeclarator::Function(_, _, _, abi)) => *abi,
+                _ => Default::default(),
+            },
             alignment,
             return_base_const,
             return_pointer_const_levels: crate::frontend::parser::ast::return_pointer_const_levels(
@@ -703,6 +713,7 @@ impl Parser {
                             params,
                             variadic,
                             has_prototype,
+                            abi,
                         )) = prefix.get(i + 1)
                         {
                             return_type = TypeSpecifier::FunctionPointer(
@@ -710,6 +721,7 @@ impl Parser {
                                 params.clone(),
                                 *variadic,
                                 *has_prototype,
+                                abi.unwrap_or_default(),
                             );
                             i += 2;
                         } else {
@@ -729,12 +741,13 @@ impl Parser {
                             i += 1;
                         }
                     }
-                    DerivedDeclarator::FunctionPointer(params, variadic, has_prototype) => {
+                    DerivedDeclarator::FunctionPointer(params, variadic, has_prototype, abi) => {
                         return_type = TypeSpecifier::FunctionPointer(
                             Box::new(return_type),
                             params.clone(),
                             *variadic,
                             *has_prototype,
+                            abi.unwrap_or_default(),
                         );
                         i += 1;
                     }
@@ -779,6 +792,7 @@ impl Parser {
                             fptr_variadic,
                             fptr_has_prototype,
                             decayed_array,
+                            fptr_calling_convention,
                         ) = self.apply_kr_derivations(&type_spec, &pderived);
                         // Compute fptr_inner_ptr_depth for K&R function pointer params.
                         // Count Pointer entries AFTER FunctionPointer in derived list;
@@ -809,6 +823,7 @@ impl Parser {
                                 param.fptr_params = fptr_params.clone();
                                 param.fptr_variadic = fptr_variadic;
                                 param.fptr_has_prototype = fptr_has_prototype;
+                                param.fptr_calling_convention = fptr_calling_convention;
                                 param.fptr_inner_ptr_depth = inner_depth;
                                 param.decayed_array = decayed_array;
                                 break;
@@ -835,7 +850,14 @@ impl Parser {
         &self,
         type_spec: &TypeSpecifier,
         pderived: &[DerivedDeclarator],
-    ) -> (TypeSpecifier, Option<Vec<ParamDecl>>, bool, bool, bool) {
+    ) -> (
+        TypeSpecifier,
+        Option<Vec<ParamDecl>>,
+        bool,
+        bool,
+        bool,
+        crate::common::types::CallingConvention,
+    ) {
         let mut full_type = type_spec.clone();
 
         // Check if this is a function pointer parameter.
@@ -844,14 +866,14 @@ impl Parser {
         // We need to: (1) not apply the syntax-marker Pointer, (2) extract the
         // FunctionPointer params, and (3) apply one Pointer wrap for decay.
         let fptr_info = pderived.iter().find_map(|d| {
-            if let DerivedDeclarator::FunctionPointer(params, variadic, has_prototype) = d {
-                Some((params.clone(), *variadic, *has_prototype))
+            if let DerivedDeclarator::FunctionPointer(params, variadic, has_prototype, abi) = d {
+                Some((params.clone(), *variadic, *has_prototype, *abi))
             } else {
                 None
             }
         });
 
-        if let Some((fptr_params, variadic, has_prototype)) = fptr_info {
+        if let Some((fptr_params, variadic, has_prototype, abi)) = fptr_info {
             // Function pointer parameter in K&R style.
             // Count how many Pointer derivations exist. For `int (*fp)()`:
             //   pderived = [Pointer, FunctionPointer([], false)]
@@ -883,7 +905,14 @@ impl Parser {
             // wrapper: the syntax-marker star's own level, whose space is the
             // previous star's (see pointee_space_before).
             full_type = TypeSpecifier::Pointer(Box::new(full_type), pending);
-            return (full_type, Some(fptr_params), variadic, has_prototype, false);
+            return (
+                full_type,
+                Some(fptr_params),
+                variadic,
+                has_prototype,
+                false,
+                abi.unwrap_or_default(),
+            );
         }
 
         // Not a function pointer - apply all derivations normally.
@@ -920,7 +949,14 @@ impl Parser {
                 full_type = TypeSpecifier::Pointer(Box::new(full_type), AddressSpace::Default);
             }
         }
-        (full_type, None, false, false, decayed_array)
+        (
+            full_type,
+            None,
+            false,
+            false,
+            decayed_array,
+            Default::default(),
+        )
     }
 
     /// Finish the first declarator before parsing comma siblings. Values that
@@ -1138,6 +1174,7 @@ impl Parser {
             // Specifier attributes apply to every sibling; attributes attached
             // to one declarator must not leak to the next one.
             self.attrs.set_noinline(ctx.spec_noinline);
+            self.attrs.parsing_calling_convention = ctx.spec_calling_convention;
             let (dname, dderived) = self.parse_declarator();
             let d_object_space = self.attrs.declarator_object_space;
             let d_object_volatile = self.attrs.declarator_object_volatile;
@@ -1265,6 +1302,8 @@ impl Parser {
         // Register typedef names
         let is_typedef = self.attrs.parsing_typedef();
         let is_transparent_union = self.take_transparent_union();
+        let is_designated_init = self.attrs.parsing_designated_init();
+        self.attrs.set_designated_init(false);
         self.register_typedefs(&type_spec, &declarators, decl_addr_space);
 
         self.expect_after(&TokenKind::Semicolon, "after declaration");
@@ -1298,6 +1337,7 @@ impl Parser {
         d.set_common(ctx.is_common);
         d.set_thread_local(self.attrs.parsing_thread_local());
         d.set_transparent_union(is_transparent_union);
+        d.set_designated_init(is_designated_init);
         d.set_inline(self.attrs.parsing_inline());
         self.flush_declarator_verdicts(
             decl_loc,
@@ -1403,6 +1443,8 @@ impl Parser {
     ) -> Declaration {
         self.advance();
         let is_transparent_union = self.take_transparent_union();
+        let is_designated_init = self.attrs.parsing_designated_init();
+        self.attrs.set_designated_init(false);
         self.attrs.parsing_address_space = AddressSpace::Default;
         let mut d = Declaration::new(
             type_spec,
@@ -1426,6 +1468,7 @@ impl Parser {
         d.set_pointer_const(self.attrs.parsing_pointer_const());
         d.set_thread_local(self.attrs.parsing_thread_local());
         d.set_transparent_union(is_transparent_union);
+        d.set_designated_init(is_designated_init);
         d
     }
 
@@ -1713,6 +1756,8 @@ impl Parser {
         let alignas_type = self.attrs.parsed_alignas_type.take();
         let alignment_sizeof_type = self.attrs.parsed_alignment_sizeof_type.take();
         let is_transparent_union = self.take_transparent_union();
+        let is_designated_init = self.attrs.parsing_designated_init();
+        self.attrs.set_designated_init(false);
         // gcc applies the `cleanup` argument-shape checks only to an
         // automatic object: the one target C23 6.7.12.2 lets the attribute
         // serve. Everything else is warned about and ignored.
@@ -1751,6 +1796,7 @@ impl Parser {
         d.set_pointer_const(self.attrs.parsing_pointer_const());
         d.set_thread_local(self.attrs.parsing_thread_local());
         d.set_transparent_union(is_transparent_union);
+        d.set_designated_init(is_designated_init);
         // An attribute written after an initializer must not outlive this
         // declaration either (see the specifier snapshot above).
         self.attrs.parsing_visibility = None;
@@ -1780,6 +1826,7 @@ impl Parser {
             self.advance();
             let mut items = Vec::with_capacity(8);
             while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
+                let item_span = self.peek_span();
                 let mut designators = Vec::with_capacity(4);
                 // Parse designators: [idx] and .field
                 loop {
@@ -1823,7 +1870,11 @@ impl Parser {
                     self.advance();
                 }
                 let init = self.parse_initializer();
-                items.push(InitializerItem { designators, init });
+                items.push(InitializerItem {
+                    span: item_span,
+                    designators,
+                    init,
+                });
                 if !self.consume_if(&TokenKind::Comma) {
                     break;
                 }
@@ -1867,6 +1918,7 @@ impl Parser {
                             new_desigs[range_pos] =
                                 Designator::Index(Expr::IntLiteral(idx, Span::dummy()));
                             result.push(InitializerItem {
+                                span: item.span,
                                 designators: new_desigs,
                                 init: item.init.clone(),
                             });
@@ -2400,7 +2452,13 @@ mod seg_placement_tests {
     #[test]
     fn function_pointer_qualifies_return_pointer_not_itself() {
         // struct c __seg_gs *(*fp)(void)
-        let mut t = TypeSpecifier::FunctionPointer(Box::new(ptr(base())), Vec::new(), false, true);
+        let mut t = TypeSpecifier::FunctionPointer(
+            Box::new(ptr(base())),
+            Vec::new(),
+            false,
+            true,
+            crate::common::types::CallingConvention::Default,
+        );
         apply_decl_address_space_to_spec(&mut t, AddressSpace::SegGs);
         assert_eq!(innermost_space(&t), Some(AddressSpace::SegGs));
     }
@@ -2408,7 +2466,13 @@ mod seg_placement_tests {
     #[test]
     fn bare_function_qualifies_return_pointer() {
         // struct c __seg_gs *f(void)
-        let mut t = TypeSpecifier::BareFunction(Box::new(ptr(base())), Vec::new(), false, true);
+        let mut t = TypeSpecifier::BareFunction(
+            Box::new(ptr(base())),
+            Vec::new(),
+            false,
+            true,
+            crate::common::types::CallingConvention::Default,
+        );
         apply_decl_address_space_to_spec(&mut t, AddressSpace::SegGs);
         assert_eq!(innermost_space(&t), Some(AddressSpace::SegGs));
     }

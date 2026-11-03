@@ -1420,7 +1420,7 @@ fn ret_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, end: usize
         let t = infos[n].trimmed(store.get(n));
         if let Some(m) = t.strip_prefix("# LCCC_RET_XMM ") {
             if let Ok(mask) = m.trim().parse::<u128>() {
-                return mask & RET_READS;
+                return mask & 0xffff;
             }
         }
         if infos[n].kind == LineKind::Ret {

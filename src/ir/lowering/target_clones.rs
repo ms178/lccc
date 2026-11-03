@@ -428,6 +428,7 @@ impl Lowerer {
             has_inlined_calls: false,
             param_alloca_values: Vec::new(),
             uses_sret: false,
+            calling_convention: crate::common::types::CallingConvention::Default,
             is_fastcall: false,
             regparm: None,
             is_naked: false,

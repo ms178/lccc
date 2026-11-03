@@ -904,6 +904,7 @@ fn build_outlined_function(
         visibility: None,
         is_weak: false,
         is_used: false,
+        calling_convention: crate::common::types::CallingConvention::Default,
         is_fastcall: false,
         regparm: None,
         is_naked: false,
@@ -979,10 +980,16 @@ fn remap_instruction(
             volatile: *volatile,
             semantic_volatile: *semantic_volatile,
         },
-        Instruction::DynAlloca { dest, size, align } => Instruction::DynAlloca {
+        Instruction::DynAlloca {
+            dest,
+            size,
+            align,
+            vla_span,
+        } => Instruction::DynAlloca {
             dest: *dest,
             size: remap_op(size),
             align: *align,
+            vla_span: *vla_span,
         },
         Instruction::Store {
             val,
@@ -1330,6 +1337,7 @@ fn remap_call_info(info: &CallInfo, remap_op: &dyn Fn(&Operand) -> Operand) -> C
         // Preserve the _Float128 ABI markers (see inline.rs remap_call_info).
         struct_arg_is_f128_sse: info.struct_arg_is_f128_sse.clone(),
         is_sret: info.is_sret,
+        calling_convention: info.calling_convention,
         is_fastcall: info.is_fastcall,
         regparm: info.regparm,
         is_pure: info.is_pure,
@@ -1478,6 +1486,7 @@ fn replace_case_with_call(
                 struct_arg_riscv_float_classes: vec![None; num_args],
                 struct_arg_is_f128_sse: Vec::new(),
                 is_sret: false,
+                calling_convention: crate::common::types::CallingConvention::Default,
                 is_fastcall: false,
                 regparm: None,
                 is_pure: false,
@@ -1524,6 +1533,7 @@ fn replace_case_with_call(
                 struct_arg_riscv_float_classes: vec![None; num_args],
                 struct_arg_is_f128_sse: Vec::new(),
                 is_sret: false,
+                calling_convention: crate::common::types::CallingConvention::Default,
                 is_fastcall: false,
                 regparm: None,
                 is_pure: false,

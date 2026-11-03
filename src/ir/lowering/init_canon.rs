@@ -382,6 +382,7 @@ impl Lowerer {
                     let mut designators = item.designators.clone();
                     designators[pos] = Designator::Index(index_expr(k));
                     InitializerItem {
+                        span: crate::common::source::Span::dummy(),
                         designators,
                         init: item.init.clone(),
                     }
@@ -621,6 +622,7 @@ impl Lowerer {
                         Self::store(root, frames, Some(Node::Expr(e.clone())));
                     } else {
                         let string = InitializerItem {
+                            span: crate::common::source::Span::dummy(),
                             designators: Vec::new(),
                             init: item.init.clone(),
                         };
@@ -680,6 +682,7 @@ impl Lowerer {
                             .stored_units(geo.total * geo.elem_size())
                             .into_iter()
                             .map(|u| InitializerItem {
+                                span: crate::common::source::Span::dummy(),
                                 designators: Vec::new(),
                                 init: Initializer::Expr(Expr::IntLiteral(
                                     i64::from(u),
@@ -699,6 +702,7 @@ impl Lowerer {
             rel.to_vec()
         };
         list.push(InitializerItem {
+            span: crate::common::source::Span::dummy(),
             designators,
             init: item.init.clone(),
         });
@@ -757,6 +761,7 @@ impl Lowerer {
                         vec![Designator::Index(index_expr(i))]
                     };
                     out.push(InitializerItem {
+                        span: crate::common::source::Span::dummy(),
                         designators,
                         init: self.emit_node(node, elem)?,
                     });
@@ -804,6 +809,7 @@ impl Lowerer {
                 continue;
             }
             out.push(InitializerItem {
+                span: crate::common::source::Span::dummy(),
                 designators: vec![Designator::Field(field.name.clone())],
                 init: self.emit_node(node, &field.ty)?,
             });

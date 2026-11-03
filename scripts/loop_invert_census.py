@@ -56,6 +56,31 @@ NO_EXIT_TEST = re.compile(r"\[INV\] header (\d+) does not decide the exit")
 LICENCE_OFF = re.compile(r"\[INV\] header (\d+) walks memory, licence not taken")
 
 
+def target_flags_for(repo: Path, src: Path) -> list[str]:
+    """Keep each TU's registered ISA requirement, without changing optimisation.
+
+    The census is compile-only, so AVX need not be present on the runner CPU.
+    Do not enable AVX globally: generic TUs must keep their baseline target.
+    Multiple benchmark variants may share a source (different -D flags), but
+    disagreeing ISA requirements must be resolved explicitly, not unioned.
+    """
+    root = str(Path(__file__).resolve().parents[1])
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from tests.benchmark.run_benchmarks import BENCHMARKS
+
+    source = (repo / src).resolve()
+    requirements = {
+        tuple(flag for flag in benchmark.extra_flags if flag.startswith("-m"))
+        for benchmark in BENCHMARKS
+        if any(source == (repo / "tests/benchmark/programs" / candidate).resolve()
+               for candidate in benchmark.sources)
+    }
+    if len(requirements) > 1:
+        raise ValueError(f"census: conflicting registered ISA requirements for {src}")
+    return list(next(iter(requirements), ()))
+
+
 def default_corpus(repo: Path) -> list[Path]:
     files = sorted((repo / "tests/bench").glob("k_*.c"))
     files += sorted((repo / "tests/benchmark/programs").glob("*.c"))
@@ -183,7 +208,8 @@ def main() -> int:
               "refused_memory_licence_off": 0}
     failed = 0
     for src in srcs:
-        log = compile_one(lccc, repo, src, a.opt, [f for f in a.extra.split() if f])
+        log = compile_one(lccc, repo, src, a.opt,
+                          target_flags_for(repo, src) + [f for f in a.extra.split() if f])
         if log.startswith("!!"):
             failed += 1
             failures.append(f"{log}  {src}")

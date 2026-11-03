@@ -426,7 +426,10 @@ impl Lexer {
             // These are emitted by the preprocessor and must not be lexed as tokens.
             // A line marker is a '#' at the start of a line (after optional whitespace)
             // followed by a digit.
-            if self.at_line_start && self.input[self.pos] == b'#' && self.is_line_marker() {
+            if self.at_line_start
+                && self.input[self.pos] == b'#'
+                && (self.is_line_marker() || self.is_preserved_pragma())
+            {
                 // Skip the entire line
                 while self.pos < self.input.len() && self.input[self.pos] != b'\n' {
                     self.pos += 1;
@@ -493,6 +496,32 @@ impl Lexer {
             }
         }
         (val, overflow)
+    }
+
+    /// Diagnostic timelines and deferred message pragmas remain in -E text.
+    /// The preprocessor collected their diagnostics; neither is a C token.
+    fn is_preserved_pragma(&self) -> bool {
+        let bytes = &self.input[self.pos + 1..];
+        let end = bytes
+            .iter()
+            .position(|&b| b == b'\n')
+            .unwrap_or(bytes.len());
+        let text = std::str::from_utf8(&bytes[..end]).unwrap_or("");
+        text.trim_start()
+            .strip_prefix("pragma")
+            .filter(|s| s.starts_with(char::is_whitespace))
+            .is_some_and(|rest| {
+                crate::common::diagnostic_pragma::is_diagnostic_pragma(rest)
+                    || rest
+                        .trim_start()
+                        .strip_prefix("message")
+                        .is_some_and(|suffix| {
+                            suffix.is_empty()
+                                || suffix.starts_with(char::is_whitespace)
+                                || suffix.starts_with('(')
+                                || suffix.starts_with('"')
+                        })
+            })
     }
 
     fn is_line_marker(&self) -> bool {
@@ -3718,5 +3747,39 @@ mod escape_tests {
             Some(crate::common::error::WarningKind::Multichar)
         );
         assert_eq!(lexer.diagnostics[1].warning_kind, None);
+    }
+}
+
+#[cfg(test)]
+mod retained_message_tests {
+    use super::*;
+
+    #[test]
+    fn retained_messages_are_not_lexed_or_diagnosed_twice() {
+        for directive in [
+            "#pragma message \"é\"",
+            "#pragma message(1)",
+            "#pragma message",
+        ] {
+            let text = format!("{directive}\n42");
+            let mut lexer = Lexer::new(&text, 0);
+            let tokens = lexer.tokenize();
+            assert_eq!(tokens.len(), 2);
+            assert!(matches!(tokens[0].kind, TokenKind::IntLiteral(42)));
+            assert!(tokens[1].is_eof());
+            assert!(lexer.diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn message_prefix_does_not_hide_other_tokens() {
+        for directive in [
+            "#pragma messages",
+            "#pragma message_extra",
+            "#pragma messageé",
+        ] {
+            let mut lexer = Lexer::new(directive, 0);
+            assert!(matches!(lexer.tokenize()[0].kind, TokenKind::Hash));
+        }
     }
 }

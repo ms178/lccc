@@ -698,6 +698,7 @@ impl Preprocessor {
                     let display_path = format_path_for_line_directive(&resolved_path);
 
                     // Update __FILE__ (uses set_file to avoid full MacroDef allocation)
+                    let old_source_filename = self.macros.source_filename.clone();
                     let old_file = self.macros.get_file_body().map(|s| s.to_string());
                     self.macros.set_file(format!("\"{}\"", display_path));
                     self.macros.push_file_scope(&resolved_path);
@@ -778,6 +779,7 @@ impl Preprocessor {
                     if let Some(old) = old_file {
                         self.macros.set_file(old);
                     }
+                    self.macros.source_filename = old_source_filename;
 
                     // Register the include guard for future fast-path skipping.
                     // We do this after preprocessing so that the guard macro is
@@ -806,6 +808,7 @@ impl Preprocessor {
             // The include path token is at col (of '#') + len("include") + whitespace.
             let include_path_col = col + "include ".len();
             self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                kind: crate::common::error::WarningKind::Cpp,
                 file: self.current_file(),
                 line: line_num,
                 col: include_path_col,
@@ -901,6 +904,7 @@ impl Preprocessor {
                     // Format path for line directive (relative when under cwd, matching GCC)
                     let display_path = format_path_for_line_directive(&resolved_path);
 
+                    let old_source_filename = self.macros.source_filename.clone();
                     let old_file = self.macros.get_file_body().map(|s| s.to_string());
                     self.macros.set_file(format!("\"{}\"", display_path));
                     self.macros.push_file_scope(&resolved_path);
@@ -918,6 +922,7 @@ impl Preprocessor {
                     if let Some(old) = old_file {
                         self.macros.set_file(old);
                     }
+                    self.macros.source_filename = old_source_filename;
 
                     if let Some(guard) = detected_guard {
                         self.include_guard_macros.insert(resolved_path, guard);
@@ -932,6 +937,7 @@ impl Preprocessor {
             // Restarting can alternate between two GCC wrapper headers until
             // the recursion cap and silently omit the real libc header.
             self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                kind: crate::common::error::WarningKind::Cpp,
                 file: self.current_file(),
                 line: line_num,
                 col: col + "include_next ".len(),
@@ -1153,6 +1159,7 @@ impl Preprocessor {
             }
         };
         self.errors.push(super::pipeline::PreprocessorDiagnostic {
+            kind: crate::common::error::WarningKind::Cpp,
             file: self.current_file(),
             line: line_num,
             col,
@@ -1229,6 +1236,7 @@ impl Preprocessor {
     ) -> Option<Vec<u8>> {
         if filename.is_empty() {
             self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                kind: crate::common::error::WarningKind::Cpp,
                 file: self.current_file(),
                 line: line_num,
                 col,
@@ -1238,6 +1246,7 @@ impl Preprocessor {
         }
         let Some(resolved) = self.resolve_and_record_include_path(filename, is_system) else {
             self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                kind: crate::common::error::WarningKind::Cpp,
                 file: self.current_file(),
                 line: line_num,
                 col,
@@ -1254,6 +1263,7 @@ impl Preprocessor {
                     format!("unable to read embedded file '{}': {}", filename, error)
                 };
                 self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                    kind: crate::common::error::WarningKind::Cpp,
                     file: self.current_file(),
                     line: line_num,
                     col,
@@ -1319,6 +1329,7 @@ impl Preprocessor {
         }
         if filename.is_empty() {
             self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                kind: crate::common::error::WarningKind::Cpp,
                 file: self.current_file(),
                 line: diag_line,
                 col: 0,

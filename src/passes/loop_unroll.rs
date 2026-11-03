@@ -6931,6 +6931,7 @@ mod tests {
                 struct_arg_riscv_float_classes: vec![],
                 struct_arg_is_f128_sse: Vec::new(),
                 is_sret: false,
+                calling_convention: crate::common::types::CallingConvention::Default,
                 is_fastcall: false,
                 regparm: None,
                 is_pure: false,

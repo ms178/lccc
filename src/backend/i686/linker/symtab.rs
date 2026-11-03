@@ -63,10 +63,12 @@ pub(super) fn build(
                 s.binding == STB_LOCAL
                     && !s.name.is_empty()
                     && s.sym_type != STT_SECTION
-                    && s.sym_type != STT_FILE
-                    && !matches!(s.section_index, SHN_UNDEF | SHN_ABS | SHN_COMMON)
+                    && !matches!(s.section_index, SHN_UNDEF | SHN_COMMON)
             })
             .filter_map(|s| {
+                if s.section_index == SHN_ABS {
+                    return Some((s.value, s, SHN_ABS));
+                }
                 // Unmapped: a discarded COMDAT member, never laid out.
                 let &(out, offset) = section_map.get(&(obj_idx, usize::from(s.section_index)))?;
                 let &hdr = out_hdr.get(&out)?;

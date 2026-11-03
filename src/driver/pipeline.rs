@@ -65,6 +65,7 @@ pub struct Driver {
     /// Whether size optimization is requested (-Os or -Oz).
     /// Used to define __OPTIMIZE_SIZE__ predefined macro.
     pub(super) optimize_size: bool,
+    pub(super) optimize_debug: bool,
     /// `-falign-loops[=N[:M]]` / `-fno-align-loops` control of loop-header
     /// padding (Auto = follow the -O level policy).
     pub(super) align_loops: crate::passes::loop_align::AlignControl,
@@ -74,6 +75,8 @@ pub struct Driver {
     /// `-falign-functions[=N[:M]]` / `-fno-align-functions` control of
     /// function-entry alignment.
     pub(super) align_functions: crate::passes::loop_align::AlignControl,
+    /// Hard entry alignment floor, independent of size optimization and attributes.
+    pub(super) min_function_alignment: u32,
     /// Permit transformations that reassociate floating-point operations.
     /// False by default: ordinary -O levels preserve source evaluation order.
     /// Enabled explicitly by -ffast-math/-fassociative-math.
@@ -229,6 +232,7 @@ pub struct Driver {
     pub(super) cf_protection_value: Option<&'static str>,
     /// `-fstack-clash-protection`: probe 4096-byte pages of static/dynamic frames.
     pub(super) stack_clash_protection: bool,
+    pub(super) verbose_asm: bool,
     /// `-fstack-protector{,-strong,-all,-explicit}` mode.
     pub(super) stack_protector_mode: crate::backend::stack_protector::StackProtectorMode,
     /// `--param=ssp-buffer-size=N` threshold for `-fstack-protector` (default 8).
@@ -655,9 +659,11 @@ impl Driver {
             opt_level: 2,    // All levels run the same optimizations; default to max
             optimize: false, // Only set to true when user explicitly passes -O1 or higher
             optimize_size: false,
+            optimize_debug: false,
             align_loops: crate::passes::loop_align::AlignControl::Auto,
             align_jumps: crate::passes::loop_align::AlignControl::Auto,
             align_functions: crate::passes::loop_align::AlignControl::Auto,
+            min_function_alignment: 0,
             fp_reassoc: false,
             math_errno: true,
             // Contraction default for C: FAST, matching GCC's C default
@@ -731,6 +737,7 @@ impl Driver {
             cf_protection_branch: false,
             cf_protection_value: None,
             stack_clash_protection: false,
+            verbose_asm: false,
             stack_protector_mode: crate::backend::stack_protector::StackProtectorMode::None,
             ssp_buffer_size: 8,
             stack_protector_guard: crate::backend::stack_protector::StackProtectorGuard::default(),
@@ -1035,7 +1042,7 @@ impl Driver {
             if self.dep_only {
                 let source = Self::read_source(input_file)?;
                 let mut preprocessor = Preprocessor::new();
-                self.configure_preprocessor(&mut preprocessor);
+                self.configure_preprocessor(&mut preprocessor)?;
                 let filename = if input_file == "-" {
                     "<stdin>"
                 } else {
@@ -1106,7 +1113,7 @@ impl Driver {
             let source = Self::read_source(input_file)?;
 
             let mut preprocessor = Preprocessor::new();
-            self.configure_preprocessor(&mut preprocessor);
+            self.configure_preprocessor(&mut preprocessor)?;
             let filename = if input_file == "-" {
                 "<stdin>"
             } else {
@@ -1215,7 +1222,7 @@ impl Driver {
                 let pragma_warnings = preprocessor
                     .pragma_diagnostics()
                     .iter()
-                    .any(|d| d.severity != PragmaSeverity::Note);
+                    .any(|d| d.severity == PragmaSeverity::Warning);
                 if !preprocessor.warnings().is_empty() || pragma_warnings {
                     let mut source_manager = SourceManager::new();
                     source_manager.add_file(filename.to_string(), source.clone());
@@ -1224,8 +1231,7 @@ impl Driver {
                     diagnostics.set_warning_config(self.effective_warning_config());
                     diagnostics.set_color_mode(self.color_mode);
                     diagnostics.set_source_manager(source_manager);
-                    self.emit_preprocessor_warnings(&preprocessor, &mut diagnostics);
-                    Self::emit_pragma_diagnostics(&preprocessor, &mut diagnostics, false);
+                    self.emit_preprocessor_diagnostics(&preprocessor, &mut diagnostics, false);
                     if diagnostics.has_errors() {
                         return Err(format!(
                             "{} preprocessor warning(s) promoted by -Werror in {}",
@@ -1273,46 +1279,61 @@ impl Driver {
     /// so `printf '#include <stdio.h>\n' | lccc -x c - -fsyntax-only`
     /// compiled AND LINKED the stdin TU and failed on the missing `main`.
     /// Emit collected preprocessor diagnostics (`#warning` and friends)
-    /// through `diagnostics` with the [`crate::common::error::WarningKind::Cpp`]
-    /// kind, so `-Wcpp`/`-Wno-cpp`/`-Werror=cpp` control them exactly as
-    /// GCC does. Shared by every path that preprocesses without going
-    /// through `parse_and_analyze_c_tu`, which has the same drain inline.
-    pub(super) fn emit_preprocessor_warnings(
+    /// through `diagnostics` with their own warning categories, so leaf
+    /// suppression, promotion and blanket -Werror apply in every mode.
+    /// Shared by preprocessing, syntax-only and full compilation.
+    pub(super) fn emit_preprocessor_diagnostics(
         &self,
-        preprocessor: &Preprocessor,
-        diagnostics: &mut DiagnosticEngine,
-    ) {
-        for warn in preprocessor.warnings() {
-            let diag = crate::common::error::Diagnostic::warning_with_kind(
-                warn.message.clone(),
-                crate::common::error::WarningKind::Cpp,
-            )
-            .with_location(&warn.file, warn.line, warn.col);
-            diagnostics.emit(&diag);
-        }
-    }
-
-    /// Emit the message pragmas' diagnostics in source order:
-    /// `#pragma GCC warning` as a warning no `-W` option controls, a
-    /// malformed `#pragma message` under `-Wpragmas`, and -- on the paths
-    /// that go on to parse (`with_notes`) -- `#pragma message` notes.
-    pub(super) fn emit_pragma_diagnostics(
         preprocessor: &Preprocessor,
         diagnostics: &mut DiagnosticEngine,
         with_notes: bool,
     ) {
-        use crate::common::error::{Diagnostic, WarningKind};
-        for entry in preprocessor.pragma_diagnostics() {
-            let d = &entry.diagnostic;
-            let diag = match entry.severity {
-                PragmaSeverity::Warning => Diagnostic::warning(d.message.clone()),
-                PragmaSeverity::PragmasWarning => {
-                    Diagnostic::warning_with_kind(d.message.clone(), WarningKind::Pragmas)
+        use crate::frontend::preprocessor::pipeline::PreprocessorDiagnosticIndex;
+        for entry in preprocessor.diagnostic_order() {
+            match *entry {
+                PreprocessorDiagnosticIndex::Warning(index) => {
+                    let warn = &preprocessor.warnings()[index];
+                    let diag = crate::common::error::Diagnostic::warning_with_kind(
+                        warn.message.clone(),
+                        warn.kind,
+                    )
+                    .with_location(&warn.file, warn.line, warn.col);
+                    diagnostics
+                        .emit_with_warning_config(&diag, preprocessor.warning_config_at(index));
                 }
-                PragmaSeverity::Note if with_notes => Diagnostic::note(d.message.clone()),
-                PragmaSeverity::Note => continue,
-            };
-            diagnostics.emit(&diag.with_location(&d.file, d.line, d.col));
+                PreprocessorDiagnosticIndex::Pragma(index) => {
+                    Self::emit_pragma_diagnostic(
+                        &preprocessor.pragma_diagnostics()[index],
+                        diagnostics,
+                        with_notes,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Apply C-frontend phase filtering without changing execution order.
+    fn emit_pragma_diagnostic(
+        entry: &crate::frontend::preprocessor::pipeline::PragmaDiagnostic,
+        diagnostics: &mut DiagnosticEngine,
+        with_notes: bool,
+    ) {
+        use crate::common::error::{Diagnostic, WarningKind};
+        let d = &entry.diagnostic;
+        let diag = match entry.severity {
+            PragmaSeverity::Warning => Diagnostic::warning(d.message.clone()),
+            PragmaSeverity::PragmasWarning if with_notes => {
+                Diagnostic::warning_with_kind(d.message.clone(), WarningKind::Pragmas)
+            }
+            PragmaSeverity::PragmasWarning => return,
+            PragmaSeverity::Note if with_notes => Diagnostic::note(d.message.clone()),
+            PragmaSeverity::Note => return,
+        };
+        let diag = diag.with_location(&d.file, d.line, d.col);
+        if let Some(config) = entry.warning_config.as_deref() {
+            diagnostics.emit_with_warning_config(&diag, config);
+        } else {
+            diagnostics.emit(&diag);
         }
     }
 
@@ -1344,7 +1365,7 @@ impl Driver {
 
             let source = Self::read_source(input_file)?;
             let mut preprocessor = Preprocessor::new();
-            self.configure_preprocessor(&mut preprocessor);
+            self.configure_preprocessor(&mut preprocessor)?;
             preprocessor.set_filename(filename);
             self.process_force_includes(&mut preprocessor)?;
             let preprocessed = preprocessor.preprocess(&source);
@@ -1391,14 +1412,14 @@ impl Driver {
             diagnostics.set_warning_config(self.effective_warning_config());
             diagnostics.set_color_mode(self.color_mode);
             diagnostics.set_source_manager(source_manager);
-            // Drain preprocessor warnings through the engine with the Cpp
+            diagnostics.build_warning_scopes();
+            // Drain preprocessor warnings through the engine with their own
             // kind — the full compile path does this, and without it
             // `-fsyntax-only` dropped `#warning` entirely (measured against
             // gcc-16.2, which reports it in every mode, `-fsyntax-only`
             // included; `-Wcpp`/`-Wno-cpp`/`-Werror=cpp` control it here
             // for the same reason they do there).
-            self.emit_preprocessor_warnings(&preprocessor, &mut diagnostics);
-            Self::emit_pragma_diagnostics(&preprocessor, &mut diagnostics, true);
+            self.emit_preprocessor_diagnostics(&preprocessor, &mut diagnostics, true);
             self.emit_lexer_diagnostics(&mut lexer, &mut diagnostics);
             let mut parser = Parser::new(tokens);
             parser.set_diagnostics(diagnostics);
@@ -1418,6 +1439,7 @@ impl Driver {
 
             // Semantic analysis.
             let mut sema = SemanticAnalyzer::new();
+            sema.set_file_scope_unused_diagnostics(false);
             sema.set_builtin_policy(self.builtin_policy.clone());
             sema.set_pre_c99_dialect(self.pre_c99_dialect());
             sema.set_gnu89_inline(self.gnu89_inline);
@@ -1469,7 +1491,7 @@ impl Driver {
         {
             let source = Self::read_source(input_file)?;
             let mut preprocessor = Preprocessor::new();
-            self.configure_preprocessor(&mut preprocessor);
+            self.configure_preprocessor(&mut preprocessor)?;
             preprocessor.define_macro("__ASSEMBLER__", "1");
             preprocessor.define_macro("_CET_H_INCLUDED", "1");
             if self.target == crate::backend::Target::X86_64 {
@@ -1530,6 +1552,23 @@ impl Driver {
                     input_file,
                     &Self::dep_rule_object_target(input_file),
                 )?;
+            }
+            // Assembly-only preprocessing must report the same libcpp
+            // warnings as C -E. Emit after output, as GCC does even on errors.
+            let mut source_manager = SourceManager::new();
+            source_manager.add_file(input_file.to_string(), source);
+            source_manager.build_line_map();
+            let mut diagnostics = DiagnosticEngine::new();
+            diagnostics.set_warning_config(self.effective_warning_config());
+            diagnostics.set_color_mode(self.color_mode);
+            diagnostics.set_source_manager(source_manager);
+            self.emit_preprocessor_diagnostics(&preprocessor, &mut diagnostics, false);
+            if diagnostics.has_errors() {
+                return Err(format!(
+                    "{} preprocessor warning(s) promoted by -Werror in {}",
+                    diagnostics.error_count(),
+                    input_file
+                ));
             }
             Ok(())
         }
@@ -1936,7 +1975,11 @@ impl Driver {
     }
 
     /// Configure the preprocessor with CLI-defined macros and target.
-    pub(super) fn configure_preprocessor(&self, preprocessor: &mut Preprocessor) {
+    pub(super) fn configure_preprocessor(
+        &self,
+        preprocessor: &mut Preprocessor,
+    ) -> Result<(), String> {
+        preprocessor.set_warning_config(self.effective_warning_config());
         // Set target architecture macros
         match self.target {
             Target::Aarch64 => preprocessor.set_target("aarch64"),
@@ -2178,6 +2221,12 @@ impl Driver {
         // (infinite recursion or wrong control flow). Undefining _FORTIFY_SOURCE
         // prevents these wrappers from being emitted.
         preprocessor.undefine_macro("_FORTIFY_SOURCE");
+        self.configure_include_paths(preprocessor)
+    }
+
+    /// Install explicit search paths and report invocation-level path errors.
+    /// Kept separate from architecture predefined-macro configuration.
+    fn configure_include_paths(&self, preprocessor: &mut Preprocessor) -> Result<(), String> {
         // User/system include directories use the legacy LCCC_SYSROOT overlay:
         // prefixed paths are preferred when present, with a host fallback.
         // This differs from GNU --sysroot and is not an isolation boundary.
@@ -2195,18 +2244,57 @@ impl Driver {
                 path.to_string()
             }
         }
+        let mut include_diagnostics = DiagnosticEngine::new();
+        include_diagnostics.set_warning_config(self.effective_warning_config());
+        include_diagnostics.set_color_mode(self.color_mode);
+        let mut check_directory = |path: &str| {
+            // GCC suppresses search-path diagnostics for dependency-only and
+            // macro-dump preprocessing, even under explicit -Werror=.
+            if self.dep_only || self.dump_defines {
+                return;
+            }
+            let mut diag = match std::fs::metadata(path) {
+                Ok(meta) if meta.is_dir() => return,
+                Ok(_) => {
+                    crate::common::error::Diagnostic::warning(format!("{path}: not a directory"))
+                }
+                Err(error) => {
+                    // Match GCC's OS diagnostic without Rust's extra errno suffix.
+                    let text = error.to_string();
+                    let text = text.split(" (os error ").next().unwrap_or(&text);
+                    crate::common::error::Diagnostic::warning_with_kind(
+                        format!("{path}: {text}"),
+                        crate::common::error::WarningKind::MissingIncludeDirs,
+                    )
+                }
+            };
+            diag.explicit_location = Some("cc1:".to_string());
+            include_diagnostics.emit(&diag);
+        };
         for path in &self.include_paths {
-            preprocessor.add_include_path(&sysroot_include_path(path));
+            let path = sysroot_include_path(path);
+            check_directory(&path);
+            preprocessor.add_include_path(&path);
         }
         for path in &self.quote_include_paths {
-            preprocessor.add_quote_include_path(&sysroot_include_path(path));
+            let path = sysroot_include_path(path);
+            check_directory(&path);
+            preprocessor.add_quote_include_path(&path);
         }
         for path in &self.isystem_include_paths {
-            preprocessor.add_system_include_path(&sysroot_include_path(path));
+            let path = sysroot_include_path(path);
+            check_directory(&path);
+            preprocessor.add_system_include_path(&path);
         }
         for path in &self.after_include_paths {
-            preprocessor.add_after_include_path(&sysroot_include_path(path));
+            let path = sysroot_include_path(path);
+            check_directory(&path);
+            preprocessor.add_after_include_path(&path);
         }
+        if include_diagnostics.has_errors() {
+            return Err("include search path warning(s) promoted to errors".to_string());
+        }
+        Ok(())
     }
 
     /// Process force-included files (-include flag) through the preprocessor before
@@ -2326,7 +2414,7 @@ impl Driver {
         }
         self.compile_ir_module_to_assembly(
             module,
-            source_manager.as_deref(),
+            source_manager.as_ref(),
             input_file,
             fp_environment_observable,
             ra_config,
@@ -2381,7 +2469,7 @@ impl Driver {
 
         // Preprocess
         let mut preprocessor = Preprocessor::new();
-        self.configure_preprocessor(&mut preprocessor);
+        self.configure_preprocessor(&mut preprocessor)?;
         let filename = if input_file == "-" {
             "<stdin>"
         } else {
@@ -2402,18 +2490,9 @@ impl Driver {
         diagnostics.set_warning_config(self.effective_warning_config());
         diagnostics.set_color_mode(self.color_mode);
 
-        // Emit preprocessor warnings through diagnostic engine with Cpp kind
-        // so they can be controlled via -Wcpp / -Wno-cpp / -Werror=cpp.
-        // Preprocessor diagnostics carry file:line:col location info for GCC-compatible output.
-        for warn in preprocessor.warnings() {
-            let diag = crate::common::error::Diagnostic::warning_with_kind(
-                warn.message.clone(),
-                crate::common::error::WarningKind::Cpp,
-            )
-            .with_location(&warn.file, warn.line, warn.col);
-            diagnostics.emit(&diag);
-        }
-        Self::emit_pragma_diagnostics(&preprocessor, &mut diagnostics, true);
+        // Preserve the warning's category on every driver path, not just
+        // -E and syntax-only. A -Wundef must never become a -Wcpp here.
+        self.emit_preprocessor_diagnostics(&preprocessor, &mut diagnostics, true);
 
         // Check for #error directives and missing #include errors
         let pp_errors = preprocessor.errors();
@@ -2464,6 +2543,7 @@ impl Driver {
         // backward-compatible span_to_location() calls.
         let t2 = std::time::Instant::now();
         diagnostics.set_source_manager(source_manager);
+        diagnostics.build_warning_scopes();
         // Surface lexer diagnostics after the source manager is attached so
         // spans resolve to file:line:col.
         self.emit_lexer_diagnostics(&mut lexer, &mut diagnostics);
@@ -2730,7 +2810,7 @@ impl Driver {
     fn compile_ir_module_to_assembly(
         &self,
         module: crate::ir::module::IrModule,
-        source_manager: Option<&SourceManager>,
+        source_manager: Option<&std::rc::Rc<SourceManager>>,
         input_file: &str,
         fp_environment_observable: bool,
         ra_config: std::sync::Arc<crate::backend::regalloc::RaConfig>,
@@ -3930,7 +4010,7 @@ impl Driver {
     fn emit_target_assembly(
         &self,
         module: &crate::ir::module::IrModule,
-        source_manager: Option<&SourceManager>,
+        source_manager: Option<&std::rc::Rc<SourceManager>>,
         input_file: &str,
         fp_environment_observable: bool,
         ra_config: std::sync::Arc<crate::backend::regalloc::RaConfig>,
@@ -3966,7 +4046,37 @@ impl Driver {
             && !link_pie;
         let pic_codegen = self.pic || self.shared_lib;
         let pie_codegen = (self.pie && (!fixed_exec_link || self.pie_explicit)) || link_pie;
+        let mut frame_diagnostics = DiagnosticEngine::new();
+        frame_diagnostics.set_warning_config(self.effective_warning_config());
+        frame_diagnostics.set_color_mode(self.color_mode);
+        // Ordinary TUs without either warning (or a relevant pragma) must
+        // not pay for a second full pragma-scope scan after sema.
+        let size_analysis = frame_diagnostics
+            .warning_enabled(crate::common::error::WarningKind::FrameLargerThan)
+            || frame_diagnostics.warning_enabled(crate::common::error::WarningKind::VlaLargerThan)
+            || source_manager.is_some_and(|sm| {
+                let text = sm.get_content(0);
+                text.contains("-Wframe-larger-than") || text.contains("-Wvla-larger-than")
+            });
+        if size_analysis && let Some(sm) = source_manager {
+            frame_diagnostics.set_shared_source_manager(sm.clone());
+            frame_diagnostics.build_warning_scopes();
+        }
+        if self.opt_level > 0 && !self.optimize_debug {
+            super::vla_diagnostics::check(
+                module,
+                &mut frame_diagnostics,
+                (self.target.ptr_size() * 8) as u32,
+            );
+            if frame_diagnostics.has_errors() {
+                return Err("VLA size diagnostics failed".to_string());
+            }
+        }
+        let frame_report = frame_diagnostics
+            .warning_enabled(crate::common::error::WarningKind::FrameLargerThan)
+            .then(|| std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())));
         let opts = crate::backend::CodegenOptions {
+            frame_report: frame_report.clone(),
             ra_config,
             // At -O0 phi elimination leaves non-SSA multi-def webs. The linear
             // scan assumes one definition and miscompiled 125/200 CFG seeds;
@@ -3997,6 +4107,7 @@ impl Driver {
             // section alignment keeps following GNU as semantics.
             // `-falign-functions[=N]`/`-fno-align-functions` override: a
             // custom alignment must be a power of two (validated at parse).
+            min_function_alignment: self.min_function_alignment,
             function_alignment: match self.align_functions {
                 crate::passes::loop_align::AlignControl::Off => 0,
                 crate::passes::loop_align::AlignControl::Custom { align, .. } => align,
@@ -4053,10 +4164,37 @@ impl Driver {
             zero_call_used_regs: self.zero_call_used_regs,
             zero_call_used_regs_fp_simd: self.resolved_zero_call_used_regs_fp_simd(),
         };
-        let asm = self
-            .target
-            .generate_assembly_with_opts_and_debug(module, &opts, source_manager);
+        let asm = self.target.generate_assembly_with_opts_and_debug(
+            module,
+            &opts,
+            source_manager.map(|sm| &**sm),
+        );
+        if let Some(report) = frame_report {
+            let report = report
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for func in &module.functions {
+                if let Some(&(span, bytes)) = report.get(&func.name) {
+                    let limit = frame_diagnostics.frame_limit_at(span);
+                    if bytes > limit {
+                        frame_diagnostics.warning_with_kind(
+                            format!("the frame size of {bytes} bytes is larger than {limit} bytes in '{}'", func.name),
+                            span, crate::common::error::WarningKind::FrameLargerThan);
+                    }
+                }
+            }
+            if frame_diagnostics.has_errors() {
+                return Err("stack frame diagnostics failed".to_string());
+            }
+        }
         self.validate_target_assembly(module, &asm, input_file)?;
+        // Annotate AFTER optimization and target validation: presentation must
+        // not introduce peephole barriers or alter instruction selection.
+        let asm = if self.verbose_asm {
+            self.annotate_verbose_assembly(module, &asm, source_manager.map(|sm| &**sm))
+        } else {
+            asm
+        };
         if time_phases {
             eprintln!(
                 "[TIME] codegen: {:.3}s ({} bytes asm)",
@@ -4863,6 +5001,58 @@ impl Driver {
     /// follows it where the dialects differ.
     pub(crate) fn pre_c99_dialect(&self) -> bool {
         matches!(self.stdc_version, Some(None) | Some(Some("199409L")))
+    }
+
+    fn annotate_verbose_assembly(
+        &self,
+        module: &crate::ir::module::IrModule,
+        asm: &str,
+        source_manager: Option<&SourceManager>,
+    ) -> String {
+        let prefix = if self.target == Target::Aarch64 {
+            "//"
+        } else {
+            "#"
+        };
+        let functions: crate::common::fx_hash::FxHashMap<_, _> = module
+            .functions
+            .iter()
+            .filter(|function| !function.is_declaration)
+            .map(|function| (function.name.as_str(), function))
+            .collect();
+        let mut result = format!(
+            "{prefix} LCCC -fverbose-asm: target {:?}, optimization level {}\n",
+            self.target, self.opt_level
+        );
+        for line in asm.split_inclusive('\n') {
+            result.push_str(line);
+            let Some(name) = line.trim().strip_suffix(':') else {
+                continue;
+            };
+            let Some(function) = functions.get(name) else {
+                continue;
+            };
+            // Debug formatting escapes line breaks and other control bytes in
+            // user-provided names/paths, keeping commentary non-executable.
+            let instructions: usize = function
+                .blocks
+                .iter()
+                .map(|block| block.instructions.len())
+                .sum();
+            result.push_str(&format!(
+                "{prefix} Function {:?}: {} blocks, {instructions} IR instructions\n",
+                function.name,
+                function.blocks.len()
+            ));
+            if let Some(sm) = source_manager {
+                let location = sm.resolve_span(function.body_span);
+                result.push_str(&format!(
+                    "{prefix} Source {:?}:{}\n",
+                    location.file, location.line
+                ));
+            }
+        }
+        result
     }
 
     /// The warning config every diagnostic engine in this pipeline should

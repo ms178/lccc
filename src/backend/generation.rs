@@ -5266,6 +5266,9 @@ fn collect_symbol_sets(cg: &mut dyn ArchCodegen, module: &IrModule) {
         .noplt_symbols
         .extend(module.noplt_symbols.iter().cloned());
     for func in &module.functions {
+        if func.is_fastcall {
+            state.i686_fastcall_symbols.insert(func.name.clone());
+        }
         if !func.is_declaration {
             state.defined_symbols.insert(func.name.clone());
         }
@@ -6086,9 +6089,18 @@ pub(crate) fn x86_inline_memset_len(func: &str, info: &CallInfo) -> Option<usize
 /// `-fpatchable-function-entry` with and without a leading pad, and the
 /// non-function-section path -- goes through here.
 fn fn_entry_align_log2(cg: &dyn ArchCodegen, attr: Option<Option<u32>>) -> Option<u32> {
-    match attr {
+    let preferred = match attr {
         Some(fixed) => fixed,
         None => cg.function_alignment_log2(),
+    };
+    let minimum = cg.state_ref().min_function_alignment;
+    // GCC 16 rounds this option DOWN to a power of two (17 means 16),
+    // unlike the optimization hint's alignment grammar. An explicit aligned(1)
+    // suppresses the hint, but cannot suppress this unconditional floor.
+    if minimum > 1 {
+        preferred.max(Some(minimum.ilog2()))
+    } else {
+        preferred
     }
 }
 
@@ -6103,6 +6115,8 @@ fn generate_function(
     source_mgr: Option<&SourceManager>,
     file_table: &FxHashMap<String, u32>,
 ) {
+    let physical = cg.legalize_function_abi(func);
+    let func = physical.as_ref();
     cg.set_function_target_features(&func.target_features);
     let mark = cg.state_ref().out.buf.len();
     generate_function_body(cg, attr_align, func, source_mgr, file_table);
@@ -6111,6 +6125,15 @@ fn generate_function(
     // only the shipped emission may define a summary or a keep record.
     if !crate::backend::state::EXPLORATORY_EMISSION.with(std::cell::Cell::get) {
         cg.note_function_emitted(func, mark);
+        if let Some(report) = &cg.state_ref().frame_report {
+            report
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(
+                    func.name.clone(),
+                    (func.body_span, cg.state_ref().frame_size.max(0) as u64),
+                );
+        }
     }
 }
 
@@ -6456,7 +6479,8 @@ fn generate_function_body(
             })
             .fold(0usize, |acc, s| acc.saturating_add(s))
             > 12_288;
-    cg.state().omit_frame_pointer = cg.state().fpo_requested
+    cg.state().omit_frame_pointer = func.calling_convention == crate::common::types::CallingConvention::Default
+        && cg.state().fpo_requested
         && !has_dyn_alloca
         && !large_clash_frame
         && !has_inline_asm_fp
@@ -6881,17 +6905,23 @@ fn generate_function_body(
     // one would make `&&label` compare equal to the next label. CFG merge
     // already refuses to fuse these; the emitter must not undo that by
     // omitting the only instruction that separated the labels.
-    let mut observable_labels: FxHashSet<_> =
-        func.global_init_label_blocks.iter().copied().collect();
+    // One map, rather than two sets: true means an indirect-branch target;
+    // false means an asm-goto-only label whose address identity still matters.
+    let mut observable_labels: FxHashMap<_, bool> = func
+        .global_init_label_blocks
+        .iter()
+        .copied()
+        .map(|label| (label, true))
+        .collect();
     for b in &func.blocks {
         for inst in &b.instructions {
             match inst {
                 Instruction::LabelAddr { label, .. } => {
-                    observable_labels.insert(*label);
+                    observable_labels.insert(*label, true);
                 }
                 Instruction::InlineAsm { goto_labels, .. } => {
                     for (_, label) in goto_labels {
-                        observable_labels.insert(*label);
+                        observable_labels.entry(*label).or_insert(false);
                     }
                 }
                 _ => {}
@@ -6972,8 +7002,12 @@ fn generate_function_body(
             }
             cg.state().out.emit_block_label(block.label.0);
         }
+        let address_kind = observable_labels.get(&block.label).copied();
         cg.state()
-            .begin_block_address_identity(observable_labels.contains(&block.label));
+            .begin_block_address_identity(address_kind.is_some());
+        if address_kind == Some(true) && Some(block.label) != entry_label {
+            cg.emit_indirect_branch_landing_pad();
+        }
 
         let fuse_idx = detect_cmp_branch_fusion(
             block,
@@ -8432,7 +8466,12 @@ fn generate_instruction_body(
             );
             clobber_after_call_like(cg);
         }
-        Instruction::DynAlloca { dest, size, align } => {
+        Instruction::DynAlloca {
+            dest,
+            size,
+            align,
+            vla_span: _,
+        } => {
             cg.emit_dyn_alloca(dest, size, *align);
             cg.state().protected_slot_values.insert(dest.0);
             clobber_after_call_like(cg);
@@ -8504,6 +8543,7 @@ fn generate_instruction_body(
                 &info.struct_arg_riscv_float_classes,
                 &info.struct_arg_is_f128_sse,
                 info.is_sret,
+                info.calling_convention,
                 info.is_fastcall,
                 info.regparm,
                 &info.ret_eightbyte_classes,
@@ -8533,6 +8573,7 @@ fn generate_instruction_body(
                 &info.struct_arg_riscv_float_classes,
                 &info.struct_arg_is_f128_sse,
                 info.is_sret,
+                info.calling_convention,
                 info.is_fastcall,
                 info.regparm,
                 &info.ret_eightbyte_classes,

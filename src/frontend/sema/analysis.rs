@@ -42,6 +42,7 @@ use crate::frontend::sema::operand_constraints::{self, AssignmentCtx, MemberOper
 use crate::ir::reexports::IrConst;
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -140,6 +141,7 @@ pub type ExprTypeMap = FxHashMap<ExprId, CType>;
 /// Information about a function collected during semantic analysis.
 #[derive(Debug, Clone)]
 pub struct FunctionInfo {
+    pub calling_convention: crate::common::types::CallingConvention,
     pub return_type: CType,
     pub params: Vec<(CType, Option<String>)>,
     pub variadic: bool,
@@ -164,6 +166,7 @@ impl FunctionInfo {
     /// function-pointer inference. Lowering still reads `params` for the ABI.
     pub(super) fn call_type(&self) -> FunctionType {
         self.prototype.clone().unwrap_or_else(|| FunctionType {
+            calling_convention: self.calling_convention,
             return_type: self.return_type.clone(),
             params: Vec::new(),
             variadic: self.variadic,
@@ -245,6 +248,9 @@ pub struct SemanticAnalyzer {
     /// check. Uses RefCell for interior mutability since resolve_struct_or_union
     /// takes &self.
     defined_structs: RefCell<FxHashSet<String>>,
+    /// Type resolution can revisit a definition; report its layout once.
+    packed_alignment_checked: RefCell<FxHashSet<(u32, u32, u32)>>,
+    designated_init_seen: RefCell<FxHashSet<(CType, u32, u32, u32)>>,
     /// Occurrence spans whose `typeof(expr)` has already had the
     /// expression's constraint checks run (C11 6.7.3 walk; GCC reports per
     /// occurrence and `type_spec_to_ctype` resolves each occurrence
@@ -260,8 +266,13 @@ pub struct SemanticAnalyzer {
     /// block-scope declaration finds the nested entity it belongs to instead of
     /// writing through the shared basename.
     function_nesting_stack: Vec<String>,
+    /// Explicit file-scope function declarations: name -> has prototype.
+    /// Implicit library knowledge and declarations inside another function
+    /// must not silence missing-declaration warnings.
+    prior_file_function_decls: FxHashMap<String, bool>,
     /// Whether ordinary hosted-library builtin folds are disabled.
     no_builtins: bool,
+    file_scope_unused_diagnostics: bool,
     builtin_policy: crate::common::pass_policy::BuiltinFlags,
     /// The dialect predates C99 (`-std=c90`/`gnu89`/`iso9899:199409`): GCC
     /// then still treats an overflowing signed left shift as a constant.
@@ -285,6 +296,8 @@ pub struct SemanticAnalyzer {
     /// `void *` is silent) while the constraint errors still fire, so the
     /// warning sites consult this. Measured on gcc-16.2.
     unevaluated_depth: Cell<u32>,
+    discarded_expr: Cell<bool>,
+    statement_expr_value: Cell<Option<Span>>,
     /// Depth of operands whose evaluation is guaranteed not to happen:
     /// the right side of a `&&`/`||` whose left side is a constant that
     /// decides it, and the untaken arm of a `?:` with a constant
@@ -326,10 +339,14 @@ impl SemanticAnalyzer {
             result: SemaResult::default(),
             diagnostics: RefCell::new(DiagnosticEngine::new()),
             defined_structs: RefCell::new(FxHashSet::default()),
+            packed_alignment_checked: RefCell::new(FxHashSet::default()),
+            designated_init_seen: RefCell::new(FxHashSet::default()),
             typeof_seen: RefCell::new(FxHashSet::default()),
             current_return_type: None,
             function_nesting_stack: Vec::new(),
+            prior_file_function_decls: FxHashMap::default(),
             no_builtins: false,
+            file_scope_unused_diagnostics: true,
             builtin_policy: crate::common::pass_policy::BuiltinFlags::default(),
             pre_c99: false,
             gnu89_inline: false,
@@ -339,6 +356,8 @@ impl SemanticAnalyzer {
             active_break_targets: Vec::new(),
             active_continue_targets: Vec::new(),
             unevaluated_depth: Cell::new(0),
+            discarded_expr: Cell::new(false),
+            statement_expr_value: Cell::new(None),
             div_zero_quiet: Cell::new(0),
             address_of_operand: Cell::new(false),
             function_scope_floor: usize::MAX,
@@ -369,7 +388,9 @@ impl SemanticAnalyzer {
         }
         // File-scope internal-linkage objects participate in -Wunused-variable
         // too, and their uses can occur in declarations processed later.
-        self.warn_unused_scope();
+        if self.file_scope_unused_diagnostics {
+            self.warn_unused_scope();
+        }
         // Validate `__attribute__((ifunc("resolver")))` / `[[gnu::ifunc("resolver")]]`
         // resolver targets across the translation unit (GCC 16.2 parity).
         let has_toplevel_asm = tu
@@ -460,6 +481,10 @@ impl SemanticAnalyzer {
 
     /// Disable ordinary hosted-library builtin folds (`-fno-builtin`).
     /// Compiler-prefixed `__builtin_*` forms remain available.
+    pub fn set_file_scope_unused_diagnostics(&mut self, enabled: bool) {
+        self.file_scope_unused_diagnostics = enabled;
+    }
+
     pub fn set_no_builtins(&mut self, no_builtins: bool) {
         self.no_builtins = no_builtins;
     }
@@ -518,6 +543,7 @@ impl SemanticAnalyzer {
     /// the file-scope rule). A separate record keyed by the mangled
     /// `parent.nested` name is added for the lowerer.
     fn analyze_nested_function_def(&mut self, func: &FunctionDef) {
+        let calling_convention = self.function_definition_cc(func);
         let parent = self
             .function_nesting_stack
             .last()
@@ -536,6 +562,7 @@ impl SemanticAnalyzer {
 
         let prototype = if func.has_prototype {
             Some(FunctionType {
+                calling_convention,
                 return_type: return_type.clone(),
                 params: params.clone(),
                 variadic: func.variadic,
@@ -553,6 +580,7 @@ impl SemanticAnalyzer {
                 })
         };
         let mut func_info = FunctionInfo {
+            calling_convention,
             return_type: return_type.clone(),
             params: params.clone(),
             variadic: func.variadic,
@@ -668,7 +696,93 @@ impl SemanticAnalyzer {
         self.symbol_table.pop_scope();
     }
 
+    // An absent ABI inherits a prior declaration. Explicit sysv_abi is NOT
+    // absence: it must conflict with a visible Microsoft ABI declaration.
+    fn function_definition_cc(
+        &self,
+        func: &FunctionDef,
+    ) -> crate::common::types::CallingConvention {
+        let prior = self.symbol_table.lookup_current(&func.name).and_then(|s| {
+            if let CType::Function(ft) = &s.ty {
+                Some(ft.calling_convention)
+            } else {
+                None
+            }
+        });
+        if let (Some(written), Some(prior)) = (func.calling_convention, prior) {
+            if written != prior {
+                self.diagnostics.borrow_mut().error(
+                    format!("conflicting calling convention for '{}'", func.name),
+                    func.span,
+                );
+            }
+        }
+        func.calling_convention.or(prior).unwrap_or_default()
+    }
+
+    fn check_ms_scalar_signature(
+        &self,
+        cc: crate::common::types::CallingConvention,
+        ret: &CType,
+        params: &[(CType, Option<String>)],
+        _variadic_definition: bool,
+        span: Span,
+    ) {
+        if cc != crate::common::types::CallingConvention::MicrosoftX64 {
+            return;
+        }
+        let supported = |ct: &CType| {
+            matches!(
+                ct,
+                CType::Void | CType::Pointer(..) | CType::Float | CType::Double
+            ) || (ct.is_integer() && ct.size() <= 8)
+        };
+        let record_size =
+            |ct: &CType| ct.size_ctx(&*self.result.type_context.borrow_struct_layouts());
+        let supported_return = supported(ret)
+            || matches!(ret, CType::Int128 | CType::UInt128)
+            || (ret.is_struct_or_union() && record_size(ret) > 0);
+        let supported_parameter = |ct: &CType| {
+            supported(ct)
+                || matches!(ct, CType::Int128 | CType::UInt128)
+                || (ct.is_struct_or_union() && record_size(ct) > 0)
+        };
+        if !supported_return || params.iter().any(|(ct, _)| !supported_parameter(ct)) {
+            self.diagnostics.borrow_mut().error("Microsoft x64 wide-scalar lowering is not implemented yet; refusing an incorrect ABI".to_string(), span);
+        }
+    }
+
     fn analyze_function_def_inner(&mut self, func: &FunctionDef) {
+        use crate::common::error::WarningKind;
+        if !func.has_prototype {
+            self.diagnostics.borrow_mut().warning_with_kind(
+                "old-style function definition".to_string(),
+                func.span,
+                WarningKind::OldStyleDefinition,
+            );
+        }
+        let prior = self.prior_file_function_decls.get(&func.name).copied();
+        if func.name != "main" && !func.attrs.is_static() && !func.attrs.is_inline() {
+            let mut diagnostics = self.diagnostics.borrow_mut();
+            // GCC diagnoses only the more specific prototype condition when
+            // both leaves are enabled, including independent -Werror controls.
+            if !prior.unwrap_or(false)
+                && diagnostics.warning_enabled_at(WarningKind::MissingPrototypes, func.span)
+            {
+                diagnostics.warning_with_kind(
+                    format!("no previous prototype for '{}'", func.name),
+                    func.span,
+                    WarningKind::MissingPrototypes,
+                );
+            } else if prior.is_none() {
+                diagnostics.warning_with_kind(
+                    format!("no previous declaration for '{}'", func.name),
+                    func.span,
+                    WarningKind::MissingDeclarations,
+                );
+            }
+        }
+        let calling_convention = self.function_definition_cc(func);
         // C11 6.9p5: one external definition per identifier per translation
         // unit, and 6.9.1p2 says the same for internal linkage. Only a
         // *previous definition* can trip this -- `is_defined` is set by
@@ -716,6 +830,14 @@ impl SemanticAnalyzer {
             .map(|p| (self.param_decl_ctype(p), p.name.clone()))
             .collect();
 
+        self.check_ms_scalar_signature(
+            calling_convention,
+            &return_type,
+            &params,
+            func.variadic,
+            func.span,
+        );
+
         // Preserve noreturn from a prior declaration (e.g., the prototype may have
         // __attribute__((noreturn)) even if the definition doesn't repeat it).
         let (prior_noreturn, prior_base_const, prior_levels) = self
@@ -731,6 +853,7 @@ impl SemanticAnalyzer {
             });
         let prototype = if func.has_prototype {
             Some(FunctionType {
+                calling_convention,
                 return_type: return_type.clone(),
                 params: params.clone(),
                 variadic: func.variadic,
@@ -743,6 +866,7 @@ impl SemanticAnalyzer {
                 .and_then(|info| info.prototype.clone())
         };
         let func_info = FunctionInfo {
+            calling_convention,
             return_type: return_type.clone(),
             params: params.clone(),
             variadic: func.variadic,
@@ -995,8 +1119,8 @@ impl SemanticAnalyzer {
     /// The parameter lists inside a declarator's function derivations.
     fn check_void_derived_params(&self, derived: &[DerivedDeclarator], span: Span) {
         for d in derived {
-            if let DerivedDeclarator::Function(params, variadic, _)
-            | DerivedDeclarator::FunctionPointer(params, variadic, _) = d
+            if let DerivedDeclarator::Function(params, variadic, _, _)
+            | DerivedDeclarator::FunctionPointer(params, variadic, _, _) = d
             {
                 self.check_void_params(params, *variadic, span);
             }
@@ -1106,6 +1230,13 @@ impl SemanticAnalyzer {
         if decl.is_constexpr() {
             self.check_constexpr_declaration(decl);
         }
+        if decl.declarators.is_empty()
+            && let TypeSpecifier::Enum(Some(tag), None, _, Some(_), _) = &decl.type_spec
+        {
+            self.result
+                .type_context
+                .enum_identity(Some(tag), None, true);
+        }
         self.collect_enum_constants_from_type_spec(&decl.type_spec, decl.span);
 
         // C11 6.7.6.2p1/6.7.6.2p4: every array dimension of a file-scope object
@@ -1176,6 +1307,17 @@ impl SemanticAnalyzer {
         let base_volatile = decl.is_volatile() || self.scalar_typeof_is_volatile(&decl.type_spec);
         let base_pointer_quals = self.base_typedef_pointer_quals(&decl.type_spec, decl.is_const());
         let base_top_const = self.base_typedef_is_top_const(&decl.type_spec);
+        if decl.is_designated_init() {
+            if matches!(base_type, CType::Struct(_)) {
+                self.diagnostics.borrow_mut().warning_with_kind(
+                    "ignoring attributes applied to struct after definition".to_string(),
+                    decl.span,
+                    crate::common::error::WarningKind::Attributes,
+                );
+            } else {
+                self.mark_designated_init(&base_type, decl.span);
+            }
+        }
         if decl.is_transparent_union() {
             self.mark_transparent_union(&base_type, decl.span);
         }
@@ -1196,7 +1338,7 @@ impl SemanticAnalyzer {
                     // Function typedef like `typedef int func_t(int x);` or
                     // `typedef int (*fn_t(int))(char);`. The typedef's own
                     // parameter list is the LAST derived.
-                    if let Some(DerivedDeclarator::Function(params, variadic, has_prototype)) =
+                    if let Some(DerivedDeclarator::Function(params, variadic, has_prototype, abi)) =
                         declarator.derived.last()
                     {
                         let return_type = super::type_context::build_prefix_return_type_spec(
@@ -1207,6 +1349,7 @@ impl SemanticAnalyzer {
                         self.result.type_context.function_typedefs.insert(
                             declarator.name.clone(),
                             FunctionTypedefInfo {
+                                calling_convention: abi.unwrap_or_default(),
                                 return_type,
                                 params: params.clone(),
                                 variadic: *variadic,
@@ -1429,6 +1572,26 @@ impl SemanticAnalyzer {
                     &init_decl.derived,
                 )
             };
+            if let CType::Function(ft) = &mut full_type {
+                let prior = if init_decl.attrs.is_nested_fn() {
+                    self.symbol_table.lookup_current(&init_decl.name)
+                } else {
+                    self.symbol_table.lookup(&init_decl.name)
+                };
+                if let Some(CType::Function(previous)) = prior.map(|s| &s.ty) {
+                    if matches!(
+                        init_decl.derived.last(),
+                        Some(DerivedDeclarator::Function(_, _, _, None))
+                    ) {
+                        ft.calling_convention = previous.calling_convention;
+                    } else if ft.calling_convention != previous.calling_convention {
+                        self.diagnostics.borrow_mut().error(
+                            format!("conflicting calling convention for '{}'", init_decl.name),
+                            init_decl.span,
+                        );
+                    }
+                }
+            }
             // The declaration-level named address space (`struct c __seg_gs *p`,
             // `struct c __seg_gs *f(void)`) qualifies the pointer it sits on.
             // Lowering applies the same rule (stmt.rs / global_decl.rs); sema must
@@ -1485,6 +1648,13 @@ impl SemanticAnalyzer {
 
             // Check if this is a function declaration (prototype)
             if let CType::Function(ref ft) = full_type {
+                if is_global {
+                    let entry = self
+                        .prior_file_function_decls
+                        .entry(init_decl.name.clone())
+                        .or_default();
+                    *entry |= ft.has_prototype;
+                }
                 let is_noreturn = init_decl.attrs.is_noreturn();
                 let prototype = ft.has_prototype.then(|| ft.as_ref().clone());
                 // A declaration inside a function body describes that body's view of
@@ -1539,6 +1709,7 @@ impl SemanticAnalyzer {
                                 self.result.functions.insert(
                                     mangled,
                                     FunctionInfo {
+                                        calling_convention: ft.calling_convention,
                                         return_type: ft.return_type.clone(),
                                         params: ft.params.clone(),
                                         variadic: ft.variadic,
@@ -1616,6 +1787,7 @@ impl SemanticAnalyzer {
                     self.result.functions.insert(
                         init_decl.name.clone(),
                         FunctionInfo {
+                            calling_convention: ft.calling_convention,
                             return_type: ft.return_type.clone(),
                             params: ft.params.clone(),
                             variadic: ft.variadic,
@@ -2422,8 +2594,13 @@ impl SemanticAnalyzer {
         // Inside the body an enumerator has its provisional type -- with a
         // fixed type, the enumerated type, already complete -- and the enum's
         // completion below retypes all of them together.
+        let identity =
+            self.result
+                .type_context
+                .enum_identity(name.as_deref(), Some(variants), true);
         let fixed_enum = fixed.as_ref().map(|f| {
             CType::Enum(crate::common::types::EnumType {
+                identity,
                 name: name.clone(),
                 variants: Vec::new(),
                 is_packed,
@@ -2484,6 +2661,7 @@ impl SemanticAnalyzer {
                 Some(ty) => EnumConstant {
                     value,
                     ty: ty.clone(),
+                    origin: None,
                 },
                 None => EnumConstant::provisional(value),
             };
@@ -2510,6 +2688,7 @@ impl SemanticAnalyzer {
             };
         }
         let enum_type = crate::common::types::EnumType {
+            identity,
             name: name.clone(),
             variants: values,
             is_packed,
@@ -2630,6 +2809,10 @@ impl SemanticAnalyzer {
                     self.result.type_context.insert_enum_type_scoped(
                         tag.clone(),
                         crate::common::types::EnumType {
+                            identity: self
+                                .result
+                                .type_context
+                                .enum_identity(Some(tag), None, true),
                             name: Some(tag.clone()),
                             variants: Vec::new(),
                             is_packed: *is_packed,
@@ -2670,8 +2853,76 @@ impl SemanticAnalyzer {
 
     // === Statement analysis ===
 
+    /// GNU's packed warning concerns explicitly aligned RECORD types, not
+    /// ordinary scalar/vector alignment, nor aligned scalar typedefs.
+    fn warn_packed_record_alignment(
+        &self,
+        name: &Option<String>,
+        fields: &[StructFieldDecl],
+        layout: &StructLayout,
+    ) {
+        let Some(first) = fields.first() else { return };
+        if !self.packed_alignment_checked.borrow_mut().insert((
+            first.span.file_id,
+            first.span.start,
+            first.span.end,
+        )) {
+            return;
+        }
+        let layouts = self.result.type_context.borrow_struct_layouts();
+        let record = format!(
+            "{} {}",
+            if layout.is_union { "union" } else { "struct" },
+            name.as_deref().unwrap_or("<anonymous>")
+        );
+        for (index, field) in layout.fields.iter().enumerate() {
+            // GCC checks record-typed members, not arrays of records.
+            let (CType::Struct(key) | CType::Union(key)) = &field.ty else {
+                continue;
+            };
+            let Some(inner) = layouts.get(key.as_ref()) else {
+                continue;
+            };
+            if !inner.user_align {
+                continue;
+            }
+            let alignment = inner.align;
+            let span = fields.get(index).map_or(first.span, |field| field.span);
+            if layout.align < alignment {
+                self.diagnostics.borrow_mut().warning_with_kind(
+                    format!(
+                        "alignment {} of '{record}' is less than {alignment}",
+                        layout.align
+                    ),
+                    span,
+                    crate::common::error::WarningKind::PackedNotAligned,
+                );
+            }
+            if field.offset % alignment != 0 {
+                self.diagnostics.borrow_mut().warning_with_kind(
+                    format!(
+                        "'{}' offset {} in '{record}' isn't aligned to {alignment}",
+                        field.name, field.offset
+                    ),
+                    span,
+                    crate::common::error::WarningKind::PackedNotAligned,
+                );
+            }
+        }
+    }
+
     fn warn_unused_scope(&mut self) {
-        for (name, span) in self.symbol_table.unused_local_objects() {
+        for (name, span, level) in self.symbol_table.unused_local_objects() {
+            if let Some(level) = level {
+                self.diagnostics
+                    .borrow_mut()
+                    .unused_set_variable(&name, span, level);
+                continue;
+            }
+            if self.symbol_table.at_file_scope() && self.symbol_table.is_top_const(&name) {
+                self.diagnostics.borrow_mut().unused_file_const(&name, span);
+                continue;
+            }
             self.diagnostics.borrow_mut().warning_with_kind(
                 format!("unused variable '{name}'"),
                 span,
@@ -2789,7 +3040,11 @@ impl SemanticAnalyzer {
     fn analyze_stmt_in_scope(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Expr(Some(expr)) => {
-                self.analyze_expr(expr);
+                if self.statement_expr_value.get() == Some(expr.span()) {
+                    self.analyze_expr(expr);
+                } else {
+                    self.analyze_discarded_expr(expr);
+                }
             }
             Stmt::Expr(None) => {}
             Stmt::Return(Some(expr), span) => {
@@ -2897,7 +3152,7 @@ impl SemanticAnalyzer {
                             self.analyze_declaration(decl, false);
                         }
                         ForInit::Expr(expr) => {
-                            self.analyze_expr(expr);
+                            self.analyze_discarded_expr(expr);
                         }
                     }
                 }
@@ -2906,7 +3161,7 @@ impl SemanticAnalyzer {
                     self.check_scalar_condition(cond);
                 }
                 if let Some(inc) = inc {
-                    self.analyze_expr(inc);
+                    self.analyze_discarded_expr(inc);
                 }
                 self.analyze_substatement(body);
                 self.warn_unused_scope();
@@ -3493,7 +3748,33 @@ impl SemanticAnalyzer {
 
     // === Expression analysis ===
 
+    fn analyze_discarded_expr(&mut self, expr: &Expr) {
+        self.discarded_expr.set(true);
+        self.analyze_expr(expr);
+    }
+
+    fn write_only_root<'a>(&self, expr: &'a Expr) -> Option<&'a str> {
+        match expr {
+            Expr::Identifier(name, _) => Some(name),
+            Expr::MemberAccess(base, ..) => self.write_only_root(base),
+            Expr::ArraySubscript(base, ..)
+                if matches!(self.exact_operand_ctype(base), Some(CType::Array(..))) =>
+            {
+                self.write_only_root(base)
+            }
+            _ => None, // *p and p->member READ the pointer; they don't set p.
+        }
+    }
+
+    fn analyze_write_operand(&mut self, expr: &Expr, discarded: bool, level: u8) {
+        self.analyze_expr(expr);
+        if discarded && let Some(name) = self.write_only_root(expr) {
+            self.symbol_table.mark_write_only(name, level);
+        }
+    }
+
     fn analyze_expr(&mut self, expr: &Expr) {
+        let discarded = self.discarded_expr.replace(false);
         self.declare_type_name_tags(expr);
         match expr {
             Expr::Identifier(name, span) => {
@@ -3543,7 +3824,11 @@ impl SemanticAnalyzer {
                 self.check_binary_operands(*op, lhs, rhs, *span);
             }
             Expr::UnaryOp(op, operand, span) => {
-                self.analyze_expr(operand);
+                self.analyze_write_operand(
+                    operand,
+                    discarded && matches!(op, UnaryOp::PreInc | UnaryOp::PreDec),
+                    2,
+                );
                 if let Some(ty) = self.constraint_operand(operand) {
                     let message = match op {
                         UnaryOp::PreInc => operand_constraints::increment(true, &ty),
@@ -3571,7 +3856,7 @@ impl SemanticAnalyzer {
                 }
             }
             Expr::PostfixOp(op, operand, span) => {
-                self.analyze_expr(operand);
+                self.analyze_write_operand(operand, discarded, 2);
                 if let Some(ty) = self.constraint_operand(operand) {
                     let message = operand_constraints::increment(*op == PostfixOp::PostInc, &ty);
                     self.constraint_error(message, *span);
@@ -3590,7 +3875,7 @@ impl SemanticAnalyzer {
                 }
             }
             Expr::Assign(lhs, rhs, span) => {
-                self.analyze_expr(lhs);
+                self.analyze_write_operand(lhs, discarded, 1);
                 self.analyze_expr(rhs);
                 self.check_void_assignment_target(lhs, *span);
                 if !self.check_ext_vector_assignable(lhs, *span) {
@@ -3623,7 +3908,7 @@ impl SemanticAnalyzer {
                 }
             }
             Expr::CompoundAssign(op, lhs, rhs, span) => {
-                self.analyze_expr(lhs);
+                self.analyze_write_operand(lhs, discarded, 3);
                 self.analyze_expr(rhs);
                 // A `void` lvalue (`*p` on a `void *`) cannot be read and
                 // written back: GCC reports its "invalid use" form here, not
@@ -3715,6 +4000,16 @@ impl SemanticAnalyzer {
                 let checker = self.expr_type_checker();
                 if let Some(inner_ty) = checker.infer_expr_ctype(inner) {
                     let target_ty = self.type_spec_to_ctype(ts);
+                    if super::function_pointer_cast::incompatible(&inner_ty, &target_ty) {
+                        self.diagnostics.borrow_mut().warning_with_kind(
+                            format!(
+                                "cast between incompatible function types from '{}' to '{}'",
+                                inner_ty, target_ty
+                            ),
+                            *span,
+                            crate::common::error::WarningKind::CastFunctionType,
+                        );
+                    }
                     if Self::is_vector_scalar_size_mismatch(&inner_ty, &target_ty) {
                         // GCC's two messages: scalar -> vector is "cannot
                         // convert a value of type 'int' to vector type
@@ -3892,14 +4187,26 @@ impl SemanticAnalyzer {
                 self.check_indirection_operand(inner, *span, address_of);
             }
             Expr::Comma(lhs, rhs, _) => {
-                self.analyze_expr(lhs);
-                self.analyze_expr(rhs);
+                self.analyze_discarded_expr(lhs);
+                if discarded {
+                    self.analyze_discarded_expr(rhs);
+                } else {
+                    self.analyze_expr(rhs);
+                }
             }
             Expr::CompoundLiteral(ts, init, span, storage) => {
                 self.analyze_compound_literal_expr(expr, ts, init, *span, storage);
             }
             Expr::StmtExpr(compound, _) => {
+                // GCC treats the last operand as the statement-expression's
+                // value even when its enclosing expression is discarded.
+                let value = match compound.items.last() {
+                    Some(BlockItem::Statement(Stmt::Expr(Some(expr)))) => Some(expr.span()),
+                    _ => None,
+                };
+                let old = self.statement_expr_value.replace(value);
                 self.analyze_compound_stmt(compound);
+                self.statement_expr_value.set(old);
             }
             Expr::VaArg(ap_expr, ts, span) => {
                 self.check_void_type_name(ts, *span);
@@ -3985,6 +4292,7 @@ impl SemanticAnalyzer {
             }
             if builtins::is_builtin(name) {
                 self.check_builtin_vector_arguments(name, args);
+                self.check_ms_varargs_builtin(name, args, *callee_span);
                 // A builtin under its own name carries no prototype, so
                 // nothing below could check the call and lowering used
                 // to pass whatever the user wrote straight through to
@@ -4033,6 +4341,7 @@ impl SemanticAnalyzer {
                     crate::common::error::WarningKind::ImplicitFunctionDeclaration,
                 );
                 let func_info = FunctionInfo {
+                    calling_convention: Default::default(),
                     return_type: CType::Int, // implicit return int
                     params: Vec::new(),
                     variadic: true, // unknown params
@@ -4107,6 +4416,32 @@ impl SemanticAnalyzer {
         // An empty prototype (`f(void)` in every dialect, or `f()` in C23)
         // still constrains calls to zero arguments. An unprototyped function
         // retains the legacy default-argument-promotion behavior.
+        if let Some(ft) = &signature {
+            self.check_ms_scalar_signature(
+                ft.calling_convention,
+                &ft.return_type,
+                &ft.params,
+                false,
+                expr.span(),
+            );
+            if ft.calling_convention == crate::common::types::CallingConvention::MicrosoftX64 {
+                let actual: Vec<_> = args
+                    .iter()
+                    .filter_map(|a| {
+                        self.expr_type_checker()
+                            .infer_expr_ctype(a)
+                            .map(|ct| (ct.decayed_value_ctype(), None))
+                    })
+                    .collect();
+                self.check_ms_scalar_signature(
+                    ft.calling_convention,
+                    &ft.return_type,
+                    &actual,
+                    false,
+                    expr.span(),
+                );
+            }
+        }
         if let Some(ft) = signature.filter(|ft| ft.has_prototype) {
             let name = match callee {
                 Expr::Identifier(name, _) => name.as_str(),
@@ -4464,6 +4799,61 @@ impl SemanticAnalyzer {
     /// Keep native vector arguments out of scalar/address positions and require
     /// each vector source's own width (not the destination width for widening).
     /// This prevents malformed raw calls reaching pointer-backed SIMD emission.
+    /// Microsoft cursors are char pointers, not SysV array-of-record lists.
+    /// Check before lowering, including syntax-only compilations.
+    fn check_ms_varargs_builtin(&self, name: &str, args: &[Expr], span: Span) {
+        let ms_builtin = matches!(
+            name,
+            "__builtin_ms_va_start" | "__builtin_ms_va_end" | "__builtin_ms_va_copy"
+        );
+        if !ms_builtin && name != "__builtin_va_start" {
+            return;
+        }
+        let function_name = self.function_nesting_stack.join(".");
+        let current = self.result.functions.get(&function_name);
+        let microsoft = current.is_some_and(|f| {
+            f.calling_convention == crate::common::types::CallingConvention::MicrosoftX64
+        });
+        let message = if name == "__builtin_va_start" && microsoft {
+            Some("use __builtin_ms_va_start in a Microsoft variadic function")
+        } else if name == "__builtin_ms_va_start"
+            && (!microsoft || !current.is_some_and(|f| f.variadic))
+        {
+            Some("__builtin_ms_va_start requires a Microsoft variadic function")
+        } else {
+            None
+        };
+        if let Some(message) = message {
+            self.diagnostics
+                .borrow_mut()
+                .error(message.to_string(), span);
+        }
+        if !ms_builtin {
+            return;
+        }
+        let valid_count = match name {
+            "__builtin_ms_va_start" => (1..=2).contains(&args.len()),
+            "__builtin_ms_va_copy" => args.len() == 2,
+            _ => args.len() == 1,
+        };
+        if !valid_count {
+            self.diagnostics
+                .borrow_mut()
+                .error(format!("invalid argument count for '{name}'"), span);
+            return;
+        }
+        let cursor_args = if name == "__builtin_ms_va_copy" { 2 } else { 1 };
+        for arg in args.iter().take(cursor_args) {
+            let ty = self.expr_type_checker().infer_expr_ctype(arg);
+            if !matches!(ty, Some(CType::Pointer(ref inner, _)) if **inner == CType::plain_char()) {
+                self.diagnostics.borrow_mut().error(
+                    format!("'{name}' requires a Microsoft char-pointer va_list"),
+                    arg.span(),
+                );
+            }
+        }
+    }
+
     fn check_builtin_vector_arguments(&self, name: &str, args: &[Expr]) {
         let Some(widths) = crate::common::x86_builtin_types::argument_vector_widths(name) else {
             return;
@@ -5010,6 +5400,69 @@ impl SemanticAnalyzer {
             .is_some_and(|from_ty| self.rejects_address_space(&from_ty, to, from))
     }
 
+    fn enum_conversion_source(
+        &self,
+        expr: &Expr,
+    ) -> Option<Cow<'_, crate::common::types::EnumType>> {
+        match expr {
+            Expr::Identifier(name, _) => match self.symbol_table.lookup_ordinary(name) {
+                Some((symbol, false)) => match &symbol.ty {
+                    CType::Enum(ty) => Some(Cow::Borrowed(ty)),
+                    _ => None,
+                },
+                _ => self
+                    .result
+                    .type_context
+                    .enum_constants
+                    .get(name)
+                    .and_then(|c| c.origin.as_deref())
+                    .map(Cow::Borrowed),
+            },
+            Expr::Comma(_, rhs, _) => self.enum_conversion_source(rhs),
+            // Arithmetic and conditional operators erase enumerator provenance;
+            // explicit casts instead have their target C type. Only complex
+            // expressions need inferred ownership. Named objects/constants use
+            // borrowed metadata, avoiding a copy of every enumerator per use.
+            _ => match self.expr_type_checker().infer_expr_ctype(expr) {
+                Some(CType::Enum(ty)) => Some(Cow::Owned(ty)),
+                _ => None,
+            },
+        }
+    }
+
+    fn check_enum_conversion(&self, expr: &Expr, to: &CType, span: Span) {
+        // Non-enum destinations are the common case: do not even resolve the
+        // source-scoped warning policy for scalar/pointer conversions.
+        let CType::Enum(target) = to else {
+            return;
+        };
+        if !self
+            .diagnostics
+            .borrow()
+            .warning_enabled_at(crate::common::error::WarningKind::EnumConversion, span)
+        {
+            return;
+        }
+        let Some(source) = self.enum_conversion_source(expr) else {
+            return;
+        };
+        let same = match (source.identity, target.identity) {
+            (Some(a), Some(b)) => a == b,
+            _ => source.as_ref() == target,
+        };
+        if !same {
+            self.diagnostics.borrow_mut().warning_with_kind(
+                format!(
+                    "implicit conversion from 'enum {}' to '{}'",
+                    source.name.as_deref().unwrap_or("<anonymous>"),
+                    to
+                ),
+                span,
+                crate::common::error::WarningKind::EnumConversion,
+            );
+        }
+    }
+
     /// Simple assignment and the conversions "as if by assignment"
     /// (initialization, argument passing, `return`; C23 6.5.16.1p1) for a
     /// record, `void` or `nullptr_t` operand. Whether it reported an error.
@@ -5035,6 +5488,7 @@ impl SemanticAnalyzer {
             }
             IConvContext::Assignment => span,
         };
+        self.check_enum_conversion(from, to, span);
         // GCC 16.2: an integer that is not a null-pointer constant used
         // where a pointer is expected (initialization, assignment, argument
         // passing, `return`) is `-Wint-conversion`, a default error from
@@ -6200,6 +6654,24 @@ dereference it before applying '->' to it?"
         self.diagnostics.borrow_mut().error(message, span);
     }
 
+    fn mark_designated_init(&self, ty: &CType, span: Span) {
+        let CType::Struct(key) = ty else {
+            self.diagnostics.borrow_mut().error(
+                "'designated_init' attribute is only valid on 'struct' type".to_string(),
+                span,
+            );
+            return;
+        };
+        if let Some(layout) = self
+            .result
+            .type_context
+            .borrow_struct_layouts_mut()
+            .get_mut(&**key)
+        {
+            Rc::make_mut(layout).requires_designators = true;
+        }
+    }
+
     /// GCC `transparent_union`, on the union or on a typedef of it: mark the
     /// sema layout the call check reads, as lowering's own
     /// `mark_transparent_union` marks its layout. GCC drops the attribute
@@ -6432,6 +6904,9 @@ dereference it before applying '->' to it?"
         for item in items {
             if item.designators.is_empty() {
                 if let Some(slot) = self.take_initializer_slot(&mut stack) {
+                    if let Some(parent) = stack.last() {
+                        self.warn_positional_record(&parent.ty, item.span);
+                    }
                     self.check_slot_element_spaces(&mut stack, &slot, &item.init);
                 }
             } else if let Some((frames, leaf)) = self.designated_slot(target, &item.designators) {
@@ -6439,6 +6914,43 @@ dereference it before applying '->' to it?"
                 self.check_slot_element_spaces(&mut stack, &leaf, &item.init);
             }
         }
+    }
+
+    /// Shares the aggregate cursor with qualifier checking: a designator resets
+    /// that cursor, and brace elision must diagnose the actual containing record,
+    /// not whichever record happened to own the outermost braces.
+    fn warn_positional_record(&self, parent: &CType, span: Span) {
+        use crate::common::error::WarningKind;
+        if !self
+            .diagnostics
+            .borrow()
+            .warning_enabled(WarningKind::DesignatedInit)
+        {
+            return;
+        }
+        let CType::Struct(key) = parent else {
+            return;
+        };
+        let required = self
+            .result
+            .type_context
+            .borrow_struct_layouts()
+            .get(&**key)
+            .is_some_and(|layout| layout.requires_designators);
+        if !required {
+            return;
+        }
+        if !self.designated_init_seen.borrow_mut().insert((
+            parent.clone(),
+            span.file_id,
+            span.start,
+            span.end,
+        )) {
+            return;
+        }
+        self.diagnostics.borrow_mut().warning_with_kind(
+            "positional initialization of field in 'struct' declared with 'designated_init' attribute".to_string(),
+            span, WarningKind::DesignatedInit);
     }
 
     /// Cheap structural prefilter for the automatic-member walk: only direct
@@ -6576,6 +7088,7 @@ dereference it before applying '->' to it?"
                     next: 0,
                 });
                 if let Some(inner) = self.take_initializer_slot(stack) {
+                    self.warn_positional_record(slot, expr.span());
                     self.check_slot_element_spaces(stack, &inner, init);
                 }
             }
@@ -6716,6 +7229,7 @@ dereference it before applying '->' to it?"
     /// `check_initializer_element_spaces`). Only pointer targets have a
     /// named-space conversion to check.
     fn check_element_space(&self, target: &CType, expr: &Expr) {
+        self.check_enum_conversion(expr, target, expr.span());
         if !matches!(target, CType::Pointer(..)) {
             return;
         }
@@ -10205,6 +10719,7 @@ dereference it before applying '->' to it?"
         for (name, ret_type, variadic) in &implicit_funcs {
             let is_noreturn = matches!(*name, "exit" | "abort" | "_Exit" | "quick_exit");
             let func_info = FunctionInfo {
+                calling_convention: Default::default(),
                 return_type: ret_type.clone(),
                 params: Vec::new(),
                 variadic: *variadic,
@@ -10457,6 +10972,10 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
         }
     }
 
+    fn require_record_designators(&self, ty: &CType) {
+        self.mark_designated_init(ty, Span::dummy());
+    }
+
     fn resolve_struct_or_union(
         &self,
         name: &Option<String>,
@@ -10533,6 +11052,12 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
         } else {
             std::borrow::Cow::Borrowed(&base_key)
         };
+        let repeated_definition = fields.is_some()
+            && name.as_ref().is_some_and(|tag| {
+                self.result
+                    .type_context
+                    .tag_definition_seen_in_current_scope(tag, span)
+            });
         if fields.is_some()
             && let Some(tag) = name
             && self.result.type_context.record_tag_definition(tag, span)
@@ -10562,7 +11087,8 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
                         // correspond, so dropping the `!` inverts the whole
                         // mechanism (verified -- it silently restored the
                         // TAG-ID-1 miscompile and the gate went red).
-                        !prev.fields.is_empty()
+                        !repeated_definition
+                            && !prev.fields.is_empty()
                             && (!record_layouts_correspond(prev, new_layout, &layouts) || !self.c23)
                     })
                 };
@@ -10593,6 +11119,9 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
             }
         }
         if let Some(layout) = defined_layout {
+            if let Some(fields) = fields {
+                self.warn_packed_record_alignment(name, fields, &layout);
+            }
             self.result
                 .type_context
                 .insert_struct_layout_scoped_from_ref(&key, layout);
@@ -10611,6 +11140,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
                 align,
                 is_union,
                 is_transparent_union: false,
+                requires_designators: false,
                 reverse_sso: false,
                 user_align: struct_aligned.is_some(),
                 member_align: 1,
@@ -10644,14 +11174,15 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
             .and_then(|n| self.result.type_context.enum_types.get(n));
         // The fixed type of a definition (`enum E : T { ... }`) is attached
         // by `type_builder`; a body-less reference inherits the visible one.
-        CType::Enum(type_builder::enum_type_of(
-            name,
-            variants,
-            is_packed,
-            completed,
-            None,
-            |v| v.value.as_ref().and_then(|e| self.eval_const_expr(e)),
-        ))
+        let mut resolved =
+            type_builder::enum_type_of(name, variants, is_packed, completed, None, |v| {
+                v.value.as_ref().and_then(|e| self.eval_const_expr(e))
+            });
+        resolved.identity =
+            self.result
+                .type_context
+                .enum_identity(name.as_deref(), variants.as_deref(), false);
+        CType::Enum(resolved)
     }
 
     fn resolve_typeof_expr(&self, expr: &Expr) -> CType {
@@ -11069,6 +11600,7 @@ mod record_layouts_correspond_tests {
             align,
             is_union,
             is_transparent_union: false,
+            requires_designators: false,
             reverse_sso: false,
             user_align: false,
             member_align: align,
@@ -11302,6 +11834,7 @@ mod pointer_argument_compat_tests {
     /// ignores them: C23 6.7.6.3p15 keeps names out of the type.
     fn sig(ret: CType, params: Vec<CType>, named: bool) -> CType {
         CType::Function(Box::new(FunctionType {
+            calling_convention: crate::common::types::CallingConvention::Default,
             return_type: ret,
             params: params
                 .into_iter()
@@ -11587,6 +12120,7 @@ mod pointer_argument_compat_tests {
         // `unsigned int *` is expected, and GCC accepts that under
         // -Werror=incompatible-pointer-types.
         let pg_level_ty = EnumType {
+            identity: None,
             name: Some("pg_level".to_string()),
             variants: vec![
                 ("PG_LEVEL_NONE".to_string(), 0),
@@ -11618,6 +12152,7 @@ mod pointer_argument_compat_tests {
         // A negative enumerator makes the compatible type `int`, so the
         // unsigned form must NOT be accepted for that enum.
         let signed_enum = CType::Enum(EnumType {
+            identity: None,
             name: Some("signed_e".to_string()),
             variants: vec![("A".to_string(), -1), ("B".to_string(), 0)],
             is_packed: false,
@@ -12363,5 +12898,77 @@ mod builtin_return_flow_tests {
         ] {
             assert_eq!(warnings(body), 1, "{body}");
         }
+    }
+}
+
+#[cfg(test)]
+mod enum_conversion_metadata_tests {
+    use super::*;
+    use crate::common::types::EnumType;
+
+    fn large_enum(analyzer: &SemanticAnalyzer) -> EnumType {
+        EnumType {
+            identity: analyzer
+                .result
+                .type_context
+                .enum_identity(Some("E"), None, true),
+            name: Some("E".into()),
+            variants: (0..4096).map(|i| (format!("K{i}"), i)).collect(),
+            is_packed: false,
+            fixed: None,
+        }
+    }
+
+    fn symbol(name: &str, ty: CType) -> Symbol {
+        Symbol {
+            name: name.into(),
+            ty,
+            explicit_alignment: None,
+            type_align: None,
+            address_space: AddressSpace::Default,
+        }
+    }
+
+    #[test]
+    fn named_enum_source_borrows_instead_of_copying_the_variant_table() {
+        let mut analyzer = SemanticAnalyzer::new();
+        let ty = large_enum(&analyzer);
+        analyzer.symbol_table.declare(symbol("x", CType::Enum(ty)));
+        let expr = Expr::Identifier("x".into(), Span::dummy());
+        let Some(Cow::Borrowed(found)) = analyzer.enum_conversion_source(&expr) else {
+            panic!("an enum object must borrow its declaration metadata");
+        };
+        let CType::Enum(stored) = &analyzer.symbol_table.lookup("x").unwrap().ty else {
+            unreachable!();
+        };
+        assert!(std::ptr::eq(found, stored));
+        assert_eq!(found.variants.len(), 4096);
+    }
+
+    #[test]
+    fn enumerator_provenance_borrows_without_changing_its_language_type() {
+        let mut analyzer = SemanticAnalyzer::new();
+        let origin = Rc::new(large_enum(&analyzer));
+        analyzer.symbol_table.declare(symbol("K0", CType::Int));
+        analyzer.symbol_table.mark_enumerator("K0");
+        analyzer.result.type_context.insert_enum_scoped(
+            "K0".into(),
+            EnumConstant {
+                value: 0,
+                ty: CType::Int,
+                origin: Some(Rc::clone(&origin)),
+            },
+        );
+        let expr = Expr::Identifier("K0".into(), Span::dummy());
+        let Some(Cow::Borrowed(found)) = analyzer.enum_conversion_source(&expr) else {
+            panic!("enumerator provenance must borrow the completed enum");
+        };
+        assert!(std::ptr::eq(found, origin.as_ref()));
+        assert_eq!(analyzer.symbol_table.lookup("K0").unwrap().ty, CType::Int);
+        analyzer.symbol_table.push_scope();
+        analyzer.symbol_table.declare(symbol("K0", CType::Int));
+        assert!(analyzer.enum_conversion_source(&expr).is_none());
+        analyzer.symbol_table.pop_scope();
+        assert!(analyzer.enum_conversion_source(&expr).is_some());
     }
 }

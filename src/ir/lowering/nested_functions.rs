@@ -1134,6 +1134,12 @@ impl Lowerer {
             .unwrap_or(false);
         let blocks = std::mem::take(&mut self.func_mut().blocks);
         let next_label = self.next_label;
+        let calling_convention = nf.calling_convention.unwrap_or_else(|| {
+            self.sema_functions
+                .get(&nf.name)
+                .map(|f| f.calling_convention)
+                .unwrap_or_default()
+        });
         let ir_func = crate::ir::reexports::IrFunction {
             pass_policy: Default::default(),
             name: nf.name.clone(),
@@ -1156,7 +1162,9 @@ impl Lowerer {
             is_weak: false,
             is_used: true,
             has_inlined_calls: false,
-            is_fastcall: false,
+            calling_convention,
+            is_fastcall: nf.attrs.is_fastcall()
+                || calling_convention == crate::common::types::CallingConvention::I686Fastcall,
             regparm: None,
             is_naked: false,
             no_instrument: false,

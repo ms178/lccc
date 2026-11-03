@@ -162,10 +162,32 @@ fn normalize_internal_markers(s: &str, final_output: bool) -> std::borrow::Cow<'
     }
 }
 
+/// Expansion effects must replay in lexical order, including diagnostics
+/// between two _Pragma operators on the same source line.
+#[derive(Debug, Clone)]
+pub(super) enum ExpansionEffect {
+    Pragma(String, usize),
+    DateTime {
+        name: String,
+        file: String,
+        line: usize,
+    },
+}
+
+/// A pragma save preserves builtin ownership, not just a replacement list.
+#[derive(Debug, Clone)]
+pub(super) struct SavedMacroDefinition {
+    definition: Option<MacroDef>,
+    compiler_owned: bool,
+    user_owned: bool,
+    suppressed: bool,
+}
+
 /// Stores all macro definitions and handles expansion.
 #[derive(Debug, Clone)]
 pub struct MacroTable {
     macros: FxHashMap<String, MacroDef>,
+    pub(super) source_filename: String,
     /// Counter for the __COUNTER__ built-in macro. Increments on each expansion.
     counter: Cell<usize>,
     /// Per-line __LINE__ resolver: maps a byte offset within the line being
@@ -212,7 +234,7 @@ pub struct MacroTable {
     /// had appeared at that point, with diagnostics attributed to that
     /// line (corpus pins exact lines for `#pragma GCC dependency`
     /// reached via `_Pragma`).
-    pending_pragmas: std::cell::RefCell<Vec<(String, usize)>>,
+    pending_effects: std::cell::RefCell<Vec<ExpansionEffect>>,
     /// The chain of files being preprocessed, innermost last.
     ///
     /// This is the source of truth for two lazily expanded builtins:
@@ -363,6 +385,7 @@ impl MacroTable {
     pub fn new() -> Self {
         Self {
             macros: FxHashMap::default(),
+            source_filename: "\"<stdin>\"".to_string(),
             counter: Cell::new(0),
             line_resolver: std::cell::RefCell::new(super::text_processing::LineResolver::Flat(1)),
             line_offset_base: Cell::new(0),
@@ -372,7 +395,7 @@ impl MacroTable {
             expanded_macros: std::cell::RefCell::new(Vec::new()),
             track_expansions: Cell::new(false),
             asm_mode: false,
-            pending_pragmas: std::cell::RefCell::new(Vec::new()),
+            pending_effects: std::cell::RefCell::new(Vec::new()),
             suppressed: FxHashSet::default(),
             compiler_owned: Cell::new(0),
             user_owned: Cell::new(0),
@@ -386,8 +409,44 @@ impl MacroTable {
 
     /// Take the `_Pragma` string contents queued by the last expansion,
     /// each paired with the 1-based source line of its operator.
-    pub fn take_pending_pragmas(&self) -> Vec<(String, usize)> {
-        std::mem::take(&mut *self.pending_pragmas.borrow_mut())
+    pub(super) fn take_pending_effects(&self) -> Vec<ExpansionEffect> {
+        std::mem::take(&mut *self.pending_effects.borrow_mut())
+    }
+
+    pub(super) fn snapshot_definition(&self, name: &str) -> SavedMacroDefinition {
+        SavedMacroDefinition {
+            definition: self.macros.get(name).cloned(),
+            compiler_owned: self.builtin_is_compiler_owned(name),
+            user_owned: self.builtin_is_user_owned(name),
+            suppressed: self.builtin_suppressed(name),
+        }
+    }
+
+    pub(super) fn restore_definition(&mut self, name: &str, saved: SavedMacroDefinition) {
+        match saved.definition {
+            Some(mut definition) => {
+                // A compiler __FILE__ is a use-site builtin, not the path at push.
+                if name == "__FILE__" && saved.compiler_owned {
+                    definition.body.clone_from(&self.source_filename);
+                }
+                self.macros.insert(name.to_string(), definition);
+            }
+            None => {
+                self.macros.remove(name);
+            }
+        }
+        if let Some(bit) = builtin_bit(name) {
+            self.compiler_owned.set(
+                (self.compiler_owned.get() & !bit) | if saved.compiler_owned { bit } else { 0 },
+            );
+            self.user_owned
+                .set((self.user_owned.get() & !bit) | if saved.user_owned { bit } else { 0 });
+            if saved.suppressed {
+                self.suppressed.insert(name.to_string());
+            } else {
+                self.suppressed.remove(name);
+            }
+        }
     }
 
     /// Define a new macro.
@@ -563,6 +622,8 @@ impl MacroTable {
 
     /// `__FILE__`'s replacement list (a quoted string).
     pub fn set_file(&mut self, body: String) {
+        // Diagnostic provenance is not the user-overridable __FILE__ macro.
+        self.source_filename = body.clone();
         self.set_builtin_body("__FILE__", &body);
     }
 
@@ -780,7 +841,14 @@ impl MacroTable {
             }
             i = super::utils::push_char_at(&mut out, &text, i);
         }
-        out
+        // Rescanning a macro alias of `_Pragma` can itself introduce painted
+        // directive keywords. Strip that new metadata too, without expanding
+        // the operand again or touching control bytes inside literal tokens.
+        // The no-_Pragma fast path above avoids a second scan on normal lines.
+        match normalize_internal_markers(&out, true) {
+            std::borrow::Cow::Borrowed(_) => out,
+            std::borrow::Cow::Owned(cleaned) => cleaned,
+        }
     }
 
     /// Append `expanded` text to `result`, inserting token boundaries to prevent
@@ -1075,10 +1143,12 @@ impl MacroTable {
             // preprocessed, and it must be read at the *use site* (an alias macro
             // must report the expander's file, not the file that wrote the body).
             if ident == "__DATE__" && self.builtin_expands(ident) {
+                self.record_time_builtin_use(ident, start);
                 self.push_date_time(result, true);
                 return i;
             }
             if ident == "__TIME__" && self.builtin_expands(ident) {
+                self.record_time_builtin_use(ident, start);
                 self.push_date_time(result, false);
                 return i;
             }
@@ -1087,6 +1157,7 @@ impl MacroTable {
                 return i;
             }
             if ident == "__TIMESTAMP__" && self.builtin_expands(ident) {
+                self.record_time_builtin_use(ident, start);
                 self.push_timestamp(result);
                 return i;
             }
@@ -1321,8 +1392,50 @@ impl MacroTable {
         // this queued pragma point at the `_Pragma` site, not line 0.
         let op_start = i.saturating_sub(ident.len());
         let line = self.resolve_line(op_start);
-        self.pending_pragmas.borrow_mut().push((content, line));
+        if let Some(operand) = super::pragmas::strip_pragma_keyword(content.trim(), "message") {
+            let expanded = self.expand_text(operand, expanding);
+            if self.asm_mode {
+                return k + 1;
+            }
+            // A deferred C-frontend pragma must survive preprocessing, even
+            // mid-line in a macro. Preserve quoted whitespace and UTF-8.
+            result.push_str("\n#\x01pragma \x01message ");
+            result.push_str(&expanded);
+            result.push_str(&format!("\n# {line} {}\n", self.source_filename));
+            self.pending_effects
+                .borrow_mut()
+                .push(ExpansionEffect::Pragma(format!("message {expanded}"), line));
+            return k + 1;
+        }
+        if crate::common::diagnostic_pragma::is_diagnostic_pragma(content.trim()) {
+            // Blue-paint the directive keywords: the replacement is rescanned,
+            // but a user macro named GCC/diagnostic/push must not rewrite it.
+            result.push_str("\n#\x01pragma ");
+            for word in content.split_whitespace() {
+                if !word.starts_with('"') {
+                    result.push(BLUE_PAINT_MARKER as char);
+                }
+                result.push_str(word);
+                result.push(' ');
+            }
+            result.push_str(&format!("\n# {line} {}\n", self.source_filename));
+        }
+        self.pending_effects
+            .borrow_mut()
+            .push(ExpansionEffect::Pragma(content, line));
         k + 1
+    }
+
+    /// Queue diagnostics only for a builtin actually expanded, not a probe or
+    /// user replacement. Both lazy timestamps and stored date/time bodies use it.
+    fn record_time_builtin_use(&self, name: &str, offset: usize) {
+        self.pending_effects
+            .borrow_mut()
+            .push(ExpansionEffect::DateTime {
+                name: name.to_string(),
+                file: self.source_filename.trim_matches('"').to_string(),
+                line: self.resolve_line(offset),
+            });
     }
 
     /// Expand a macro invocation (function-like or object-like).
@@ -1798,38 +1911,18 @@ impl MacroTable {
         arg_starts: Option<&[usize]>,
         expanding: &mut FxHashSet<String>,
     ) -> (String, bool) {
-        // Step 1-2: Prescan - expand ALL arguments (C11 §6.10.3.1).
-        // Per the standard, arguments adjacent to # or ## use the RAW (unexpanded)
-        // form, but that is handled separately by handle_stringify_and_paste (Step 3)
-        // which receives the original raw `args`. The expanded_args are used only by
-        // substitute_params (Step 4) for non-## occurrences.
-        //
-        // A parameter can appear both with ## and without ## in the same body
-        // (e.g., `#define bitfs(bf, s) __bitf(bf, bf##_##s)`). In that case, the
-        // non-## occurrence needs the expanded argument so that commas from macro
-        // expansion create additional arguments during rescanning.
-        let expanded_args: Vec<String> = args
-            .iter()
-            .enumerate()
-            .map(
-                |(k, arg)| match arg_starts.and_then(|starts| starts.get(k)) {
-                    Some(&start) => self.expand_source_slice(arg, start, expanding),
-                    None => self.expand_text(arg, expanding),
-                },
-            )
+        let expanded_args: Vec<std::cell::OnceCell<String>> = (0..args.len())
+            .map(|_| std::cell::OnceCell::new())
             .collect();
-
-        // C2x __VA_OPT__: include its balanced token sequence iff the variadic
-        // argument is non-empty. This must happen before #/## processing so
-        // commas and paste operators inside the selected sequence participate
-        // in the normal replacement algorithm.
-        let va_body = self.expand_va_opt(
-            &mac.body,
-            &mac.params,
-            args,
-            mac.is_variadic,
-            mac.has_named_variadic,
-        );
+        let mut argument = |index: usize| {
+            expanded_args[index]
+                .get_or_init(|| match arg_starts.and_then(|starts| starts.get(index)) {
+                    Some(&start) => self.expand_source_slice(&args[index], start, expanding),
+                    None => self.expand_text(&args[index], expanding),
+                })
+                .as_str()
+        };
+        let va_body = self.expand_va_opt(&mac.body, mac, args, &mut argument);
 
         // Step 3: Handle stringification (#param) and token pasting (##).
         let body = self.handle_stringify_and_paste(
@@ -1840,13 +1933,18 @@ impl MacroTable {
             mac.has_named_variadic,
         );
 
-        // Step 4: Substitute parameters with expanded arguments
+        // Prescan only when an ordinary substituted occurrence needs the
+        // argument. Unused, stringified and paste-only arguments must not
+        // consume __COUNTER__, execute _Pragma or diagnose date builtins.
+        // Cache each expansion once; GCC evaluates these effects in first
+        // replacement-use order (REV(__COUNTER__, __COUNTER__) pins it).
         let body = self.substitute_params(
             &body,
             &mac.params,
-            &expanded_args,
+            args.len(),
             mac.is_variadic,
             mac.has_named_variadic,
+            &mut argument,
         );
 
         // Check if the substituted body (before rescan) ends with a function-like
@@ -2129,13 +2227,14 @@ impl MacroTable {
     }
 
     /// Substitute parameter names with argument values in macro body.
-    fn substitute_params(
+    fn substitute_params<'a>(
         &self,
         body: &str,
         params: &[String],
-        args: &[String],
+        arg_count: usize,
         is_variadic: bool,
         has_named_variadic: bool,
+        mut argument: impl FnMut(usize) -> &'a str,
     ) -> String {
         let mut result = String::with_capacity(body.len() + 32);
         let bytes = body.as_bytes();
@@ -2201,16 +2300,22 @@ impl MacroTable {
                 }
 
                 if ident == "__VA_ARGS__" && is_variadic {
-                    let va_args = self.get_va_args(params, args);
+                    let va_args = (params.len()..arg_count)
+                        .map(&mut argument)
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     let next = if i < len { Some(bytes[i]) } else { None };
                     Self::append_with_paste_guard(&mut result, &va_args, next);
                 } else if let Some(idx) = params.iter().position(|p| p == ident) {
                     if is_variadic && has_named_variadic && idx == params.len() - 1 {
-                        let va_args = self.get_named_va_args(idx, args);
+                        let va_args = (idx..arg_count)
+                            .map(&mut argument)
+                            .collect::<Vec<_>>()
+                            .join(", ");
                         let next = if i < len { Some(bytes[i]) } else { None };
                         Self::append_with_paste_guard(&mut result, &va_args, next);
                     } else {
-                        let arg = args.get(idx).map(|s| s.as_str()).unwrap_or("");
+                        let arg = if idx < arg_count { argument(idx) } else { "" };
                         let next = if i < len { Some(bytes[i]) } else { None };
                         Self::append_with_paste_guard(&mut result, arg, next);
                     }
@@ -2248,25 +2353,21 @@ impl MacroTable {
     }
 
     /// Expand balanced `__VA_OPT__(tokens)` groups for a variadic macro.
-    fn expand_va_opt(
+    fn expand_va_opt<'a>(
         &self,
         body: &str,
-        params: &[String],
+        mac: &MacroDef,
         args: &[String],
-        is_variadic: bool,
-        has_named_variadic: bool,
+        mut argument: impl FnMut(usize) -> &'a str,
     ) -> String {
-        if !is_variadic || !body.contains("__VA_OPT__") {
+        if !mac.is_variadic || !body.contains("__VA_OPT__") {
             return body.to_string();
         }
-        let first_va = if has_named_variadic {
-            params.len().saturating_sub(1)
+        let first_va = if mac.has_named_variadic {
+            mac.params.len().saturating_sub(1)
         } else {
-            params.len()
+            mac.params.len()
         };
-        let has_tokens = args
-            .get(first_va..)
-            .is_some_and(|tail| tail.iter().any(|arg| !arg.trim().is_empty()));
         let bytes = body.as_bytes();
         let mut out = String::with_capacity(body.len());
         let mut i = 0usize;
@@ -2297,6 +2398,30 @@ impl MacroTable {
                         j += 1;
                     }
                     if depth == 0 {
+                        // Preserve GCC's first-use expansion order: ordinary
+                        // parameters preceding this VA_OPT are prescanned first.
+                        // Raw paste/stringify operands stay protected.
+                        let prefix = self.handle_stringify_and_paste(
+                            &out,
+                            &mac.params,
+                            args,
+                            mac.is_variadic,
+                            mac.has_named_variadic,
+                        );
+                        self.substitute_params(
+                            &prefix,
+                            &mac.params,
+                            args.len(),
+                            mac.is_variadic,
+                            mac.has_named_variadic,
+                            &mut argument,
+                        );
+                        // Presence is based on EXPANDED tokens; multiple empty
+                        // variadic operands still contain separating commas.
+                        let mut has_tokens = args.len() > first_va + 1;
+                        for index in first_va..args.len() {
+                            has_tokens |= !argument(index).trim().is_empty();
+                        }
                         if has_tokens {
                             out.push_str(&body[inner..j - 1]);
                         }
@@ -2688,6 +2813,32 @@ mod token_boundary_tests {
             });
         }
         t
+    }
+
+    #[test]
+    fn macro_formed_pragmas_strip_new_metadata_without_reexpanding_operands() {
+        let mut t = table();
+        t.define(MacroDef {
+            name: "P".into(),
+            is_function_like: false,
+            params: Vec::new(),
+            is_variadic: false,
+            has_named_variadic: false,
+            body: "_Pragma".into(),
+        });
+        for operand in ["GCC diagnostic push", "GCC diagnostic pop"] {
+            let result = t.expand_line(&format!("P(\"{operand}\")"));
+            assert!(result.contains(&format!("#pragma {operand}")), "{result:?}");
+            assert!(!result.contains('\x01'), "{result:?}");
+        }
+        let result = t.expand_line("P(\"message(\\\"é  \x01\\\")\")");
+        assert!(
+            result.contains("#pragma message (\"é  \x01\")"),
+            "{result:?}"
+        );
+        let result = t.expand_line("P(\"message __COUNTER__\")");
+        assert!(result.contains("#pragma message 0"), "{result:?}");
+        assert_eq!(t.expand_line("__COUNTER__"), "1");
     }
 
     #[test]

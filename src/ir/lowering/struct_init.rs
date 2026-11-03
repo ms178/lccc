@@ -129,6 +129,7 @@ impl Lowerer {
                         synth_desigs.extend(item.designators[1..].iter().cloned());
                     }
                     let sub_item = InitializerItem {
+                        span: crate::common::source::Span::dummy(),
                         designators: synth_desigs,
                         init: item.init.clone(),
                     };
@@ -301,6 +302,7 @@ impl Lowerer {
                 item.designators[1..].to_vec()
             };
             let sub_item = InitializerItem {
+                span: crate::common::source::Span::dummy(),
                 designators: sub_designators,
                 init: item.init.clone(),
             };
@@ -417,6 +419,7 @@ impl Lowerer {
             if let Some(sub_layout) = sub_layout {
                 let sub_desigs: Vec<_> = after_first_idx.to_vec();
                 let sub_item = InitializerItem {
+                    span: crate::common::source::Span::dummy(),
                     designators: sub_desigs,
                     init: item.init.clone(),
                 };
@@ -560,6 +563,7 @@ impl Lowerer {
                         // for the first field of the sub-struct (C11 6.7.9p13).
                         if !item.designators.is_empty() {
                             let stripped = InitializerItem {
+                                span: crate::common::source::Span::dummy(),
                                 designators: vec![],
                                 init: item.init.clone(),
                             };

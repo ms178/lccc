@@ -11802,6 +11802,41 @@ impl X86Codegen {
         }
     }
 
+    /// Emit a register-only 256-bit operation when every value has a YMM home.
+    /// Pending memory folds must already have been consumed or materialized.
+    fn try_emit_avx_256_all_homed(
+        &mut self,
+        dest_ptr: &Value,
+        args: &[Operand],
+        avx_inst: &str,
+    ) -> bool {
+        if let (Operand::Value(a0), Operand::Value(a1)) = (&args[0], &args[1]) {
+            if let (Some(&r0), Some(&r1)) = (
+                self.reg_assignments.get(&a0.0),
+                self.reg_assignments.get(&a1.0),
+            ) {
+                if let Some(&rd) = self.reg_assignments.get(&dest_ptr.0) {
+                    if is_xmm_reg(r0) && is_xmm_reg(r1) && is_xmm_reg(rd) {
+                        let n0 = phys_reg_name_256(r0);
+                        let n1 = phys_reg_name_256(r1);
+                        let nd = phys_reg_name_256(rd);
+                        self.state
+                            .emit_fmt(format_args!("    {} %{}, %{}, %{}", avx_inst, n1, n0, nd));
+                        self.state.dirty_upper_ymm = true;
+                        self.state.vec_claim_live_reg(dest_ptr.0, nd);
+                        self.state.vec_last_store_val = Some(dest_ptr.0);
+                        self.state.vec_last_store_reg = true;
+                        self.state.vec_last_store_reg_name = Some(nd);
+                        self.state.reg_cache.invalidate_acc();
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
     fn emit_avx_binary_256_inner(
         &mut self,
         dest_ptr: &Value,
@@ -11958,32 +11993,9 @@ impl X86Codegen {
             }
         }
 
-        // All-homed fast path (OP-05a stencils): when BOTH operands and the
-        // destination carry XMM homes (defer-overflow promotion), the
-        // three-operand VEX form computes register-to-register with no
-        // `%ymm0/%ymm1` staging at all: `op %ymmS, %ymmR, %ymmD`.
-        if let (Operand::Value(a0), Operand::Value(a1)) = (&args[0], &args[1]) {
-            if let (Some(&r0), Some(&r1)) = (
-                self.reg_assignments.get(&a0.0),
-                self.reg_assignments.get(&a1.0),
-            ) {
-                if let Some(&rd) = self.reg_assignments.get(&dest_ptr.0) {
-                    if is_xmm_reg(r0) && is_xmm_reg(r1) && is_xmm_reg(rd) {
-                        let n0 = phys_reg_name_256(r0);
-                        let n1 = phys_reg_name_256(r1);
-                        let nd = phys_reg_name_256(rd);
-                        self.state
-                            .emit_fmt(format_args!("    {} %{}, %{}, %{}", avx_inst, n1, n0, nd));
-                        self.state.dirty_upper_ymm = true;
-                        self.state.vec_claim_live_reg(dest_ptr.0, nd);
-                        self.state.vec_last_store_val = Some(dest_ptr.0);
-                        self.state.vec_last_store_reg = true;
-                        self.state.vec_last_store_reg_name = Some(nd);
-                        self.state.reg_cache.invalidate_acc();
-                        return;
-                    }
-                }
-            }
+        // All three values have YMM homes: avoid scratch staging entirely.
+        if self.try_emit_avx_256_all_homed(dest_ptr, args, avx_inst) {
+            return;
         }
 
         // Map kernels keep loop-invariant broadcasts in assigned YMM families
@@ -13708,6 +13720,67 @@ mod truncated_splat_tests {
                     wide,
                 ));
                 assert!(cg.state.vec_const_pool.is_empty());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod avx_homed_fast_path_tests {
+    use super::*;
+
+    #[test]
+    fn register_only_path_preserves_source_order_and_aliases() {
+        for (left, right, dest) in [(24, 23, 25), (24, 24, 25), (24, 23, 24), (24, 23, 23)] {
+            let mut cg = X86Codegen::new();
+            for (value, reg) in [(0, left), (1, right), (2, dest)] {
+                cg.reg_assignments.insert(value, PhysReg(reg));
+            }
+            cg.state.vector_values.extend([0, 1, 2]);
+            assert!(cg.try_emit_avx_256_all_homed(
+                &Value(2),
+                &[Operand::Value(Value(0)), Operand::Value(Value(1))],
+                "vsubps",
+            ));
+            assert_eq!(
+                cg.state.out.buf.trim(),
+                format!(
+                    "vsubps %{}, %{}, %{}",
+                    phys_reg_name_256(PhysReg(right)),
+                    phys_reg_name_256(PhysReg(left)),
+                    phys_reg_name_256(PhysReg(dest)),
+                ),
+            );
+            assert!(cg.state.dirty_upper_ymm);
+            assert_eq!(cg.state.vec_last_store_val, Some(2));
+            assert!(cg.state.vec_last_store_reg);
+            assert_eq!(
+                cg.state.vec_last_store_reg_name,
+                Some(phys_reg_name_256(PhysReg(dest)))
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_or_gp_homes_leave_fallback_state_untouched() {
+        for missing in 0..3 {
+            for bad_home in [None, Some(PhysReg(0))] {
+                let mut cg = X86Codegen::new();
+                for (value, reg) in [(0, 24), (1, 23), (2, 25)] {
+                    if value != missing {
+                        cg.reg_assignments.insert(value, PhysReg(reg));
+                    } else if let Some(bad) = bad_home {
+                        cg.reg_assignments.insert(value, bad);
+                    }
+                }
+                assert!(!cg.try_emit_avx_256_all_homed(
+                    &Value(2),
+                    &[Operand::Value(Value(0)), Operand::Value(Value(1))],
+                    "vsubps",
+                ));
+                assert!(cg.state.out.buf.is_empty());
+                assert!(!cg.state.dirty_upper_ymm);
+                assert_eq!(cg.state.vec_last_store_val, None);
             }
         }
     }

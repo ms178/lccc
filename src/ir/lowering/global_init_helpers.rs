@@ -302,6 +302,7 @@ pub(super) fn resolve_anonymous_member(
     let mut synth_desigs = vec![Designator::Field(inner_name.to_string())];
     synth_desigs.extend(extra_designators.iter().cloned());
     let sub_item = InitializerItem {
+        span: crate::common::source::Span::dummy(),
         designators: synth_desigs,
         init: init.clone(),
     };

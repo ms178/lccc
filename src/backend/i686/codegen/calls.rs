@@ -21,6 +21,7 @@ fn push_arg_staging_disabled() -> bool {
 impl I686Codegen {
     pub(super) fn call_abi_config_impl(&self) -> call_abi::CallAbiConfig {
         call_abi::CallAbiConfig {
+            microsoft_x64: false,
             max_int_regs: self.regparm as usize,
             max_float_regs: 0,
             align_i128_pairs: false,
@@ -606,6 +607,7 @@ impl I686Codegen {
         if self.state.dirty_upper_ymm && !self.state.call_passes_wide_vector {
             self.state.emit("    vzeroupper");
         }
+        self.emit_pending_static_chain("ecx");
         if let Some(name) = direct_name {
             if self.state.needs_got_call(name) {
                 let n = name.split('@').next().unwrap_or(name);

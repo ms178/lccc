@@ -229,6 +229,12 @@ gate "driver-option-contract-core" fast \
 # Hosted CI runs the same scripts.
 gate "attribute-class-diagnostics" fast \
     env CCC="$LCCC" bash tests/regression/check_attribute_diagnostics.sh
+gate "microsoft-scalar-abi" fast \
+    env CCC="$LCCC" bash tests/regression/check_ms_abi.sh
+gate "microsoft-record-abi" fast \
+    env CCC="$LCCC" bash tests/regression/check_ms_abi_records.sh
+gate "microsoft-variadic-abi" fast \
+    env CCC="$LCCC" bash tests/regression/check_ms_abi_varargs.sh
 gate "lexer-extensions" fast \
     env CCC="$LCCC" bash tests/regression/check_lexer_extensions.sh
 gate "ucn-identifier-table" fast \
@@ -423,6 +429,9 @@ gate "ci-link-oracle-provisioning" fast \
 # --fatal-warnings and last-toggle-wins, and run before flat-binary conversion.
 gate "linker-rwx-segments" fast \
     python3 tests/linker/check_rwx_segments.py
+
+gate "kernel-codegen-contracts" fast \
+    python3 tests/regression/check_kernel_codegen_contracts.py
 
 # GAS `. =` / `.org` parity: macro vector layout, relaxation fixup, fill bytes,
 # numeric locals and fail-closed malformed expressions on ELF32/ELF64.
@@ -953,6 +962,23 @@ gate "warning-compatibility" fast \
 gate "warning-precedence" fast \
     python3 tests/regression/check_warning_precedence.py \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+# Dedicated hosted warning gates must remain directly executable locally;
+# transitive calls from another runner do not satisfy mirror coverage.
+gate "warning-designated-init" fast \
+    python3 tests/regression/check_designated_init_warnings.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+gate "warning-frame-size" fast \
+    python3 tests/regression/check_frame_size_warnings.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+gate "warning-vla-size" fast \
+    python3 tests/regression/check_vla_size_warnings.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+# The warning runner also invokes this ABI matrix, but hosted/local parity
+# audits executable entry points rather than Python's transitive import graph.
+# Keep a directly runnable mirror of the dedicated authenticated vendor gate;
+# all four LCCC targets must execute locally, never silently skip a runtime.
+gate "enum-forward-callback-abi" fast \
+    python3 tests/regression/check_enum_forward_abi.py --lccc "$LCCC" --require-cross
 gate "macro-parity" fast \
     python3 tests/regression/check_macro_parity.py \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"

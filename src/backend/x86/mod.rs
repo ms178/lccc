@@ -12,3 +12,5 @@ pub(crate) mod ret_dup;
 pub(crate) mod shift_count;
 
 pub(crate) use codegen::emit::X86Codegen;
+
+pub(crate) mod ms_wide_abi;

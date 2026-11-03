@@ -203,7 +203,7 @@ mod tests {
     }
 
     fn func() -> DerivedDeclarator {
-        DerivedDeclarator::Function(Vec::new(), false, true)
+        DerivedDeclarator::Function(Vec::new(), false, true, None)
     }
 
     const ALL_ROLES: [VoidRole; 10] = [
@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn pointers_and_functions_returning_void_are_fine() {
-        let fptr = DerivedDeclarator::FunctionPointer(Vec::new(), false, true);
+        let fptr = DerivedDeclarator::FunctionPointer(Vec::new(), false, true, None);
         for derived in [
             vec![ptr()],                      // void *a;
             vec![ptr(), arr()],               // void *a[3];

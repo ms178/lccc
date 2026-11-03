@@ -883,6 +883,8 @@ impl Parser {
         // (gcc.c-torture/execute pr82210.c: `aligned(16) struct T { short
         // c; } a[size];` made sizeof(struct T) = 16 instead of 2, so the
         // VLA member spanned 8x the bytes and every later offset was wrong).
+        let mut designated_init = self.attrs.parsing_designated_init();
+        self.attrs.set_designated_init(false);
         let saved_pending_alignas = self.attrs.parsed_alignas.take();
         let saved_pending_alignas_type = self.attrs.parsed_alignas_type.take();
         let fields = if matches!(self.peek(), TokenKind::LBrace) {
@@ -911,6 +913,14 @@ impl Parser {
         if sso3.is_some() {
             sso = sso3;
         }
+        designated_init |= self.attrs.parsing_designated_init();
+        self.attrs.set_designated_init(false);
+        if designated_init && !is_struct {
+            self.emit_error(
+                "'designated_init' attribute is only valid on 'struct' type".to_string(),
+                self.peek_span(),
+            );
+        }
         // Apply current #pragma pack alignment to struct definition
         let max_field_align = self.pragma_pack_align;
         // Both supported targets (x86-64, i686) are little-endian, so the
@@ -926,6 +936,7 @@ impl Parser {
                 max_field_align,
                 struct_aligned,
                 Some(reverse_sso),
+                designated_init,
                 tag_span,
             )
         } else {
@@ -1261,6 +1272,7 @@ impl Parser {
                         continue;
                     }
                     // Anonymous field (e.g., anonymous struct/union)
+                    self.check_field_designated_attribute(&type_spec, self.peek_span());
                     let alignment = self.attrs.parsed_alignas.take();
                     let alignas_type = self.attrs.parsed_alignas_type.take();
                     fields.push(StructFieldDecl {
@@ -1346,6 +1358,37 @@ impl Parser {
             None => format!("'{}' specified for structure field", offending),
         };
         self.emit_error(message, span);
+    }
+
+    /// Pending attributes on a member declaration must not become attributes
+    /// of its enclosing record. Record definitions consumed their own bit.
+    fn check_field_designated_attribute(&mut self, spec: &TypeSpecifier, span: Span) {
+        if !self.attrs.parsing_designated_init() {
+            return;
+        }
+        self.attrs.set_designated_init(false);
+        let mut resolved = spec;
+        for _ in 0..32 {
+            let TypeSpecifier::TypedefName(name) = resolved else {
+                break;
+            };
+            let Some(next) = self.typedef_type_specs.get(name) else {
+                return;
+            };
+            resolved = next;
+        }
+        if matches!(resolved, TypeSpecifier::Struct(..)) {
+            self.diagnostics.warning_with_kind(
+                "ignoring attributes applied to struct after definition".to_string(),
+                span,
+                crate::common::error::WarningKind::Attributes,
+            );
+        } else {
+            self.emit_error(
+                "'designated_init' attribute is only valid on 'struct' type",
+                span,
+            );
+        }
     }
 
     /// Parse one or more declarators for a struct field using the general
@@ -1481,6 +1524,7 @@ impl Parser {
             // type_spec. Only use the derived field for complex cases with function
             // pointers that require build_full_ctype().
             let (mut field_type, field_derived) = Self::fold_simple_derived(type_spec, &derived);
+            self.check_field_designated_attribute(&field_type, declarator_span);
             self.check_struct_field_space(
                 field_addr_space,
                 declarator_object_space,

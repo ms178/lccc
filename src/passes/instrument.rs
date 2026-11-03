@@ -144,6 +144,7 @@ fn hook_call(vfn: Value, vsite: Value) -> CallInfo {
         struct_arg_is_f128_sse: vec![false, false],
         ret_is_f128_sse: false,
         is_sret: false,
+        calling_convention: crate::common::types::CallingConvention::Default,
         is_fastcall: false,
         regparm: None,
         // The hooks observe and mutate profiler state: never pure, never

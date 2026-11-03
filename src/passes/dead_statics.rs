@@ -120,6 +120,7 @@ fn eliminate_dead_statics(module: &mut IrModule, preserve_retained: bool) {
 /// function so the orphaned stored-value and address chains (pure) disappear
 /// in the same pass — the pipeline runs no DCE after Phase 11.
 pub(crate) fn eliminate_dead_global_stores(module: &mut IrModule) {
+    let asm_context = module.asm_symbol_context();
     // Per-function use maps, built once and reused for every candidate
     // (collection is read-only; all deletions happen after).  Terminator
     // uses record `usize::MAX` so they always bail.
@@ -248,7 +249,7 @@ pub(crate) fn eliminate_dead_global_stores(module: &mut IrModule) {
             continue;
         }
         if !module.toplevel_asm.is_empty()
-            && toplevel_asm_mentions(&module.toplevel_asm, global.name.as_str())
+            && toplevel_asm_mentions(&asm_context, &module.toplevel_asm, global.name.as_str())
         {
             continue;
         }
@@ -259,7 +260,7 @@ pub(crate) fn eliminate_dead_global_stores(module: &mut IrModule) {
             continue;
         }
         if !inline_asm_templates.is_empty()
-            && toplevel_asm_mentions(&inline_asm_templates, global.name.as_str())
+            && toplevel_asm_mentions(&asm_context, &inline_asm_templates, global.name.as_str())
         {
             continue;
         }
@@ -536,32 +537,19 @@ fn ids_for_name<'a>(name_to_ids: &'a FxHashMap<&str, Vec<usize>>, name: &str) ->
     }
 }
 
-/// Extract the base symbol from an inline-asm operand (`foo+8`, `foo-4`,
-/// `foo@GOTPCREL`, `*foo`, `$foo`).
-fn asm_symbol_base(s: &str) -> &str {
-    let bytes = s.as_bytes();
-    let mut start = 0;
-    while start < bytes.len()
-        && !(bytes[start].is_ascii_alphabetic() || bytes[start] == b'_' || bytes[start] == b'.')
-    {
-        start += 1;
-    }
-    let mut end = start;
-    while end < bytes.len() && is_asm_ident_char(bytes[end]) {
-        end += 1;
-    }
-    if start < end { &s[start..end] } else { s }
-}
-
-use crate::common::asm_scan::is_asm_ident_char;
+use crate::common::asm_scan::asm_symbol_base;
 
 /// True iff any of `blobs` names `name` as a whole identifier.
 ///
-/// The scanner lives in `common::asm_scan` because the A13/A14 symbol
-/// inventory asks the same question about top-level assembly; one
-/// implementation means a miss cannot differ between the two callers.
-fn toplevel_asm_mentions<S: AsRef<str>>(blobs: &[S], name: &str) -> bool {
-    crate::common::asm_scan::any_blob_mentions(blobs, name)
+/// Shared whole-identifier boundaries agree with the A13/A14 opacity scan.
+/// Unlike opacity, reachability can discard proved standalone x86 opcodes;
+/// the context must cover ALL assembly blobs so cross-blob macros fail closed.
+fn toplevel_asm_mentions<S: AsRef<str>>(
+    context: &crate::common::asm_scan::AsmSymbolContext,
+    blobs: &[S],
+    name: &str,
+) -> bool {
+    context.any_blob_references(blobs, name)
 }
 
 /// Visit every symbol name an instruction can reference.
@@ -710,6 +698,7 @@ fn compute_reachability(
     address_taken: &[bool],
     options: ReachabilityOptions<'_>,
 ) -> Vec<bool> {
+    let asm_context = module.asm_symbol_context();
     let name_to_ids = options.name_to_ids;
     let mut reachable = vec![false; nsyms];
     let mut worklist = Vec::with_capacity(nsyms.min(64));
@@ -789,7 +778,7 @@ fn compute_reachability(
             if func.is_static
                 && !func.is_declaration
                 && !is_marked(&reachable, i)
-                && toplevel_asm_mentions(&module.toplevel_asm, func.name.as_str())
+                && toplevel_asm_mentions(&asm_context, &module.toplevel_asm, func.name.as_str())
             {
                 mark_reachable(i, &mut reachable, &mut worklist);
             }
@@ -799,7 +788,7 @@ fn compute_reachability(
             if global.is_static
                 && !global.is_extern
                 && !is_marked(&reachable, id)
-                && toplevel_asm_mentions(&module.toplevel_asm, global.name.as_str())
+                && toplevel_asm_mentions(&asm_context, &module.toplevel_asm, global.name.as_str())
             {
                 mark_reachable(id, &mut reachable, &mut worklist);
             }
@@ -831,7 +820,7 @@ fn compute_reachability(
                 if func.is_static
                     && !func.is_declaration
                     && !is_marked(&reachable, i)
-                    && toplevel_asm_mentions(&inline_templates, func.name.as_str())
+                    && toplevel_asm_mentions(&asm_context, &inline_templates, func.name.as_str())
                 {
                     mark_reachable(i, &mut reachable, &mut worklist);
                 }
@@ -841,7 +830,7 @@ fn compute_reachability(
                 if global.is_static
                     && !global.is_extern
                     && !is_marked(&reachable, id)
-                    && toplevel_asm_mentions(&inline_templates, global.name.as_str())
+                    && toplevel_asm_mentions(&asm_context, &inline_templates, global.name.as_str())
                 {
                     mark_reachable(id, &mut reachable, &mut worklist);
                 }
@@ -911,6 +900,7 @@ fn remove_unreachable(
 /// Weak-only directives (no visibility) are kept: they may apply to symbols
 /// defined in another TU and must remain weak-undefined rather than strong.
 fn filter_symbol_attrs(module: &mut IrModule) {
+    let asm_context = module.asm_symbol_context();
     // `GlobalInit::for_each_ref` only yields a callback-scoped `&str`, so
     // initializer names that we want in the long-lived set have to be owned.
     // Instruction / symbol names can be borrowed directly from the module.
@@ -987,10 +977,10 @@ fn filter_symbol_attrs(module: &mut IrModule) {
         if referenced.contains(n) {
             return true;
         }
-        if has_toplevel_asm && toplevel_asm_mentions(&module.toplevel_asm, n) {
+        if has_toplevel_asm && toplevel_asm_mentions(&asm_context, &module.toplevel_asm, n) {
             return true;
         }
-        !inline_templates.is_empty() && toplevel_asm_mentions(&inline_templates, n)
+        !inline_templates.is_empty() && toplevel_asm_mentions(&asm_context, &inline_templates, n)
     });
 }
 
@@ -1651,6 +1641,59 @@ mod tests {
         m.functions.push(f);
         eliminate_dead_global_stores(&mut m);
         assert_eq!(store_count(&m), 1, "$g immediate template must keep store");
+    }
+
+    fn mnemonic_collision_module(template: &str) -> IrModule {
+        let mut module = IrModule::new();
+        for name in ["stac", "clac"] {
+            let mut function = IrFunction::new(name.into(), IrType::Void, vec![], false);
+            function.is_static = true;
+            function.is_always_inline = true;
+            function.blocks = vec![gs_block(vec![], Terminator::Return(None))];
+            module.functions.push(function);
+        }
+        let mut entry = IrFunction::new("entry".into(), IrType::Void, vec![], false);
+        entry.blocks = vec![gs_block(
+            vec![Instruction::InlineAsm {
+                template: template.into(),
+                outputs: vec![],
+                inputs: vec![],
+                clobbers: vec!["memory".into()],
+                operand_types: vec![],
+                goto_labels: vec![],
+                input_symbols: vec![],
+                seg_overrides: vec![],
+            }],
+            Terminator::Return(None),
+        )];
+        module.functions.push(entry);
+        module
+    }
+
+    #[test]
+    fn mnemonic_collisions_do_not_root_dead_helpers() {
+        for at_o0 in [false, true] {
+            let mut module = mnemonic_collision_module("stac; clac");
+            eliminate_dead_statics(&mut module, at_o0);
+            assert_eq!(module.functions.len(), 1);
+            assert_eq!(module.functions[0].name, "entry");
+        }
+    }
+
+    #[test]
+    fn real_mnemonic_named_symbol_reference_survives() {
+        let mut module = mnemonic_collision_module("stac; .quad clac");
+        eliminate_dead_static_functions(&mut module);
+        assert!(module.functions.iter().any(|f| f.name == "clac"));
+        assert!(!module.functions.iter().any(|f| f.name == "stac"));
+    }
+
+    #[test]
+    fn top_level_include_makes_inline_opcode_context_opaque() {
+        let mut module = mnemonic_collision_module("stac; clac");
+        module.toplevel_asm.push(r#".include "opaque.inc""#.into());
+        eliminate_dead_static_functions(&mut module);
+        assert_eq!(module.functions.len(), 3);
     }
 
     #[test]

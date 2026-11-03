@@ -1066,14 +1066,18 @@ impl<'a> ExprTypeChecker<'a> {
                 // Every integer property of the result (size, signedness,
                 // rank, promotion, `_Generic` match) is that of its
                 // compatible type, so no width rule lives here.
-                CType::Enum(crate::common::type_builder::enum_type_of(
+                let mut resolved = crate::common::type_builder::enum_type_of(
                     name,
                     variants,
                     *is_packed,
                     name.as_ref().and_then(|n| self.types.enum_types.get(n)),
                     underlying.as_deref().map(|u| self.resolve_type_spec(u)),
                     |v| v.value.as_ref().and_then(|e| self.eval_const_expr(e)),
-                ))
+                );
+                resolved.identity =
+                    self.types
+                        .enum_identity(name.as_deref(), variants.as_deref(), false);
+                CType::Enum(resolved)
             }
             TypeSpecifier::Struct(
                 tag,
@@ -1082,6 +1086,7 @@ impl<'a> ExprTypeChecker<'a> {
                 pragma_pack,
                 struct_aligned,
                 reverse_sso,
+                _,
                 _,
             ) => {
                 if let Some(tag) = tag {
@@ -1148,7 +1153,7 @@ impl<'a> ExprTypeChecker<'a> {
                 // typeof(expr): try to infer the expression's type
                 self.infer_expr_ctype(expr).unwrap_or(CType::Int)
             }
-            TypeSpecifier::FunctionPointer(ret, params, variadic, has_prototype) => {
+            TypeSpecifier::FunctionPointer(ret, params, variadic, has_prototype, abi) => {
                 let ret_ct = self.resolve_type_spec(ret);
                 // Full per-parameter conversion (param_decl_to_ctype_with): a
                 // nested function-pointer parameter inside the type name
@@ -1177,6 +1182,7 @@ impl<'a> ExprTypeChecker<'a> {
                     .collect();
                 CType::Pointer(
                     Box::new(CType::Function(Box::new(FunctionType {
+                        calling_convention: *abi,
                         return_type: ret_ct,
                         params: param_cts,
                         variadic: *variadic,
@@ -1185,7 +1191,7 @@ impl<'a> ExprTypeChecker<'a> {
                     PtrQuals::of(AddressSpace::Default),
                 )
             }
-            TypeSpecifier::BareFunction(ret, params, variadic, has_prototype) => {
+            TypeSpecifier::BareFunction(ret, params, variadic, has_prototype, abi) => {
                 let ret_ct = self.resolve_type_spec(ret);
                 let param_cts: Vec<(CType, Option<String>)> = params
                     .iter()
@@ -1207,6 +1213,7 @@ impl<'a> ExprTypeChecker<'a> {
                     })
                     .collect();
                 CType::Function(Box::new(FunctionType {
+                    calling_convention: *abi,
                     return_type: ret_ct,
                     params: param_cts,
                     variadic: *variadic,
@@ -1680,7 +1687,10 @@ impl<'a> ExprTypeChecker<'a> {
             }
 
             // Void-returning builtins
-            "__builtin_va_start"
+            "__builtin_ms_va_start"
+            | "__builtin_ms_va_end"
+            | "__builtin_ms_va_copy"
+            | "__builtin_va_start"
             | "__builtin_va_end"
             | "__builtin_va_copy"
             | "__builtin_abort"

@@ -9,20 +9,6 @@ use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;
 use crate::ir::reexports::{CallInfo, Instruction, IrBinOp, IrConst, Operand, Value};
 
-/// How a resolved global call target must be emitted.
-pub(super) enum ResolvedIndirectCall {
-    /// func_ptr was `Load(ptr)` with ptr = GlobalAddr(sym)+off: the loaded
-    /// VALUE is the target, so fold load+call into the patchable
-    /// memory-indirect form `call *sym+off(%rip)` (ff 15).
-    MemorySlot(String, i64),
-    /// func_ptr's VALUE itself resolves to sym+off (a GlobalAddr chain with
-    /// no intervening Load): the value IS the target, so it must be a
-    /// DIRECT `call sym+off`. Emitting `call *sym(%rip)` here would read
-    /// sym's first 8 code/data bytes as the target (pic_extern_addr
-    /// SIGSEGV: `call *add7(%rip)` jumped into `movq %rdi+7, %rax`).
-    Direct(String, i64),
-}
-
 /// 32-bit name of a 64-bit general register (`rcx` -> `ecx`, `r8` -> `r8d`).
 fn dword_name(qword: &str) -> String {
     match qword.strip_prefix('r') {
@@ -149,9 +135,8 @@ impl X86Codegen {
 
     /// Resolve a Value chain that ends in GlobalAddr, accumulating GEP/Add/Sub/Cast offsets.
     /// Returns (symbol_name, total_offset) if the chain is GlobalAddr (+ GEPs/Copies/Adds/Subs/Casts).
-    /// This is the paravirt fast-path: `pv_ops` is a struct of function pointers, so
-    /// `Load(GEP(GlobalAddr pv_ops, off))` must become `call *pv_ops+off(%rip)` (ff 15)
-    /// for `apply_alternatives` to patch. The resolver is intentionally generous:
+    /// Only address arithmetic is followed, never a memory load. The resolver
+    /// follows the value's definition rather than re-reading its source cell:
     /// it follows Cast (bitcast/ptrtoint/inttoptr), Copy, Add (Value+Const), Sub (Value-Const),
     /// and GEP with const or Copy-of-const offsets, with checked arithmetic and 64-hop bound.
     /// The symbol name is returned VERBATIM (version suffix intact) — folding policy
@@ -216,64 +201,34 @@ impl X86Codegen {
         }
     }
 
-    /// Try to resolve an indirect call's func_ptr Operand to a global+offset.
-    /// The func_ptr is expected to be Value(Load(ptr)), where ptr is GEP chain
-    /// ending in GlobalAddr (e.g. pv_ops+72). Returns Some((sym, off)) if so.
-    /// Also handles the case where Load was folded or func_ptr itself is the GEP chain.
-    ///
-    /// Versioned symbols (`sym@VER`, bound by a top-level `.symver real, sym@VER`
-    /// directive) are rejected outright: the memory-indirect form
-    /// `call *sym@VER+off(%rip)` is rejected by GAS 2.47, the stripped base
-    /// name would silently re-bind the call to the DEFAULT version (a
-    /// .symver semantic change, not a fold), and the GOT/TLS/absolute guards
-    /// below are keyed by the full symbol name. The value-based fallback
-    /// (load the pointer, call through it) is correct for every binding, so
-    /// rejecting the fold is strictly safe — and versioned function-pointer
-    /// slots are glibc-internal compat shapes, so the cost is nil.
-    pub(super) fn try_resolve_indirect_call_global(
-        &self,
-        op: &Operand,
-    ) -> Option<ResolvedIndirectCall> {
-        let v = match op {
-            Operand::Value(v) => v,
-            _ => return None,
-        };
-        let inst = self.get_defining_instruction(v.0)?;
-        match inst {
-            Instruction::Load { ptr, .. } => {
-                // If the loaded pointer's defining chain is global+off, we can fold into
-                // the memory-indirect form. Guard against GOT/TLS/absolute symbols that
-                // need different addressing.
-                let (sym, off) = self.resolve_global_addr_chain(ptr.0, 0)?;
-                if sym.contains('@') {
-                    return None;
-                }
-                // Don't use RIP-relative call for symbols that need GOT or are TLS/absolute —
-                // those would need GOTPCREL or fs: addressing, not plain *sym(%rip).
-                if self.state.needs_got_for_addr(&sym)
-                    || self.state.tls_symbols.contains(&sym)
-                    || self.state.absolute_symbols.contains(&sym)
-                {
-                    return None;
-                }
-                Some(ResolvedIndirectCall::MemorySlot(sym, off))
-            }
-            // Defensive: func_ptr itself might be the GlobalAddr/GEP chain (if the
-            // Load was optimized away). The resolved symbol+offset is then the call
-            // target value itself, so only a DIRECT call is semantically correct.
-            _ => {
-                let (sym, off) = self.resolve_global_addr_chain(v.0, 0)?;
-                if sym.contains('@') {
-                    return None;
-                }
-                if self.state.needs_got_for_addr(&sym)
-                    || self.state.tls_symbols.contains(&sym)
-                    || self.state.absolute_symbols.contains(&sym)
-                {
-                    return None;
-                }
-                Some(ResolvedIndirectCall::Direct(sym, off))
-            }
+    /// Resolve a pointer VALUE that is itself a symbol address. Never look
+    /// through a Load: a callback cell can change after the value was captured,
+    /// and reloading it at the call is both a miscompilation and a retpoline
+    /// bypass. Explicit paravirt patch sites are inline assembly, not C loads.
+    pub(super) fn try_resolve_direct_call_global(&self, op: &Operand) -> Option<(String, i64)> {
+        let Operand::Value(v) = op else { return None };
+        let (sym, off) = self.resolve_global_addr_chain(v.0, 0)?;
+        if sym.contains('@')
+            || self.state.needs_got_for_addr(&sym)
+            || self.state.tls_symbols.contains(&sym)
+            || self.state.absolute_symbols.contains(&sym)
+        {
+            return None;
+        }
+        Some((sym, off))
+    }
+
+    /// A GOT-based call is indirect too. r11 is caller-saved and is neither
+    /// a C ABI argument register nor SysV's r10 static-chain register; using it
+    /// after argument setup preserves the variadic SSE count in al.
+    fn emit_got_call(&mut self, symbol: &str) {
+        if self.state.indirect_branch_thunk || self.state.indirect_branch_thunk_inline {
+            self.state
+                .emit_fmt(format_args!("    movq {}@GOTPCREL(%rip), %r11", symbol));
+            self.emit_retpoline_call("r11");
+        } else {
+            self.state
+                .emit_fmt(format_args!("    call *{}@GOTPCREL(%rip)", symbol));
         }
     }
 
@@ -763,10 +718,9 @@ impl X86Codegen {
     /// `emit_pre_call_save_caller_regs` before this hook runs.
     pub(super) fn emit_call_spill_fptr_impl(&mut self, func_ptr: &Operand) {
         self.indirect_fptr_on_stack = false;
-        // Statically resolved targets (a paravirt data cell, or a direct
-        // `&symbol` value) need no r10 spill: emit_call_instruction_impl
+        // Statically resolved direct `&symbol` values need no r10 spill: emit_call_instruction_impl
         // emits the resolved call form directly.
-        if self.try_resolve_indirect_call_global(func_ptr).is_some() {
+        if self.try_resolve_direct_call_global(func_ptr).is_some() {
             self.state.reg_cache.invalidate_all();
             self.flush_pending_vec_store_impl();
             self.state.invalidate_vec_peephole();
@@ -806,7 +760,7 @@ impl X86Codegen {
             self.emit_call_spill_fptr_impl(func_ptr);
             return;
         }
-        if self.try_resolve_indirect_call_global(func_ptr).is_some() {
+        if self.try_resolve_direct_call_global(func_ptr).is_some() {
             self.state.reg_cache.invalidate_all();
             self.flush_pending_vec_store_impl();
             self.state.invalidate_vec_peephole();
@@ -833,7 +787,8 @@ impl X86Codegen {
             // armed sibling call can never be dynamically realigned (its
             // zero-stack-argument guard rules the whole realignment arm out).
             debug_assert!(stack_arg_space > 0);
-            let area = (stack_arg_space + 15) & !15;
+            let area =
+                ((stack_arg_space + 15) & !15) + if self.state.call_shadow_active { 32 } else { 0 };
             self.state
                 .out
                 .emit_instr_mem_reg("    movq", area as i64, "rsp", "r10");
@@ -841,7 +796,9 @@ impl X86Codegen {
             return;
         }
         let need_align_pad = stack_arg_space % 16 != 0;
-        let pushed_bytes = stack_arg_space + if need_align_pad { 8 } else { 0 };
+        let pushed_bytes = stack_arg_space
+            + if need_align_pad { 8 } else { 0 }
+            + if self.state.call_shadow_active { 32 } else { 0 };
         if pushed_bytes == 0 {
             // No outgoing stack area (this includes every armed sibling call):
             // the parked slot is the top of %rsp, so reload and reclaim it
@@ -1580,6 +1537,24 @@ impl X86Codegen {
         // value-shape pass. Emitted right after the call text by
         // `emit_call_instruction_impl` (same discharge contract as
         // `call_gp_arg_count`).
+        // Microsoft FP register numbers follow argument positions, not a
+        // compact FP census. Preserve the whole live prefix through the
+        // highest occupied position in the count-based peephole contract.
+        if self.state.call_calling_convention
+            == crate::common::types::CallingConvention::MicrosoftX64
+        {
+            float_count = arg_classes
+                .iter()
+                .filter_map(|c| {
+                    if let CallArgClass::FloatReg { reg_idx } = c {
+                        Some(reg_idx + 1)
+                    } else {
+                        None
+                    }
+                })
+                .max()
+                .unwrap_or(0);
+        }
         self.state.call_fp_arg_count = Some(float_count.min(8));
         self.state.reg_cache.invalidate_all();
         self.flush_pending_vec_store_impl();
@@ -1590,6 +1565,19 @@ impl X86Codegen {
             self.state
                 .emit_fmt(format_args!("    addq ${}, %rsp", hazard_area));
             self.state.out.rsp_frame_size -= hazard_area as i64;
+        }
+        if self.state.call_calling_convention
+            == crate::common::types::CallingConvention::MicrosoftX64
+            && self.state.call_is_variadic
+        {
+            for class in arg_classes {
+                if let CallArgClass::FloatReg { reg_idx } = *class {
+                    const GP: [&str; 4] = ["rcx", "rdx", "r8", "r9"];
+                    self.state
+                        .emit_fmt(format_args!("    movq %xmm{}, %{}", reg_idx, GP[reg_idx]));
+                }
+            }
+            self.state.call_gp_arg_count = 6;
         }
         // Restore the original RSP frame size.
         self.state.out.rsp_frame_size -= total_sp_adjust;
@@ -1622,6 +1610,16 @@ impl X86Codegen {
         _indirect: bool,
         stack_arg_space: usize,
     ) {
+        if self.state.call_calling_convention
+            == crate::common::types::CallingConvention::MicrosoftX64
+        {
+            self.reload_spilled_indirect_fptr_to_r10(stack_arg_space);
+            self.state.emit("    subq $32, %rsp");
+            self.state.call_shadow_active = true;
+            if self.state.out.use_rsp_addressing {
+                self.state.out.rsp_frame_size += 32;
+            }
+        }
         // Lazy flush: the call clobbers all XMM registers — a pending
         // deferred vector-result store must hit its slot first.
         self.flush_pending_vec_store_impl();
@@ -1667,18 +1665,8 @@ impl X86Codegen {
                     SibcallTarget::Direct(name.to_string())
                 }
             } else if let Some(fp) = func_ptr {
-                match self.try_resolve_indirect_call_global(fp) {
-                    Some(ResolvedIndirectCall::MemorySlot(sym, off)) => {
-                        let sym_str = if off == 0 {
-                            sym.clone()
-                        } else if off > 0 {
-                            format!("{}+{}", sym, off)
-                        } else {
-                            format!("{}{}", sym, off)
-                        };
-                        SibcallTarget::RipSlot(sym_str)
-                    }
-                    Some(ResolvedIndirectCall::Direct(sym, off)) => {
+                match self.try_resolve_direct_call_global(fp) {
+                    Some((sym, off)) => {
                         if off == 0 && self.state.needs_got_call(&sym) {
                             SibcallTarget::RipSlot(format!("{}@GOTPCREL", sym))
                         } else if off == 0 && self.state.needs_plt(&sym) {
@@ -1729,8 +1717,7 @@ impl X86Codegen {
         } else if let Some(name) = direct_name {
             if self.state.needs_got_call(name) {
                 let n = name.split('@').next().unwrap_or(name);
-                self.state
-                    .emit_fmt(format_args!("    call *{}@GOTPCREL(%rip)", n));
+                self.emit_got_call(n);
             } else if self.state.needs_plt(name) {
                 // Versioned symbols (`printf@GLIBC_2.2.5`, bound by .symver)
                 // must use the base name in @PLT references — GAS 2.47 rejects
@@ -1741,52 +1728,20 @@ impl X86Codegen {
                 self.state.out.emit_call(name);
             }
         } else if let Some(fp) = func_ptr {
-            // Paravirt/global fast-path: if func_ptr resolves to a global+offset
-            // (e.g. pv_ops+72), emit `call *sym+off(%rip)` directly. This produces
-            // the `ff 15 disp32` encoding with R_X86_64_PC32 reloc that
-            // arch/x86/kernel/paravirt.c:apply_alternatives expects to patch.
-            // Without this, we would emit `mov $sym, %r15; call *off(%r15)`
-            // (41 ff 57) which is not patchable and breaks boot.
-            if let Some(target) = self.try_resolve_indirect_call_global(fp) {
-                // Construct `sym+off` string for GAS. Use `sym` alone when off==0.
-                let (sym, off) = match &target {
-                    ResolvedIndirectCall::MemorySlot(sym, off)
-                    | ResolvedIndirectCall::Direct(sym, off) => (sym.clone(), *off),
-                };
+            if let Some((sym, off)) = self.try_resolve_direct_call_global(fp) {
                 let sym_str = if off == 0 {
                     sym.clone()
                 } else if off > 0 {
                     format!("{}+{}", sym, off)
                 } else {
-                    format!("{}{}", sym, off) // off negative includes '-'
+                    format!("{}{}", sym, off)
                 };
-                match target {
-                    // Memory-indirect through the slot: GAS produces ff 15 with a
-                    // PC32 reloc (the paravirt patchable form). Raw emit avoids
-                    // any PLT/GOT logic.
-                    ResolvedIndirectCall::MemorySlot(..) => {
-                        self.state
-                            .emit_fmt(format_args!("    call *{}({})", sym_str, "%rip"));
-                    }
-                    // The resolved value IS the target: direct call, with the
-                    // same PLT handling as a syntactically direct call. An
-                    // offset into the callee (`&func + off`, computed-goto
-                    // style block addresses) is never interposed — the PLT
-                    // entry is only defined for offset 0 — so the offset is
-                    // preserved and @PLT is used only for it. (Versioned
-                    // symbols never reach this arm: they are rejected in
-                    // try_resolve_indirect_call_global and fall back to the
-                    // value-based call, which preserves the .symver binding.)
-                    ResolvedIndirectCall::Direct(..) => {
-                        if off == 0 && self.state.needs_got_call(&sym) {
-                            self.state
-                                .emit_fmt(format_args!("    call *{}@GOTPCREL(%rip)", sym));
-                        } else if off == 0 && self.state.needs_plt(&sym) {
-                            self.state.emit_fmt(format_args!("    call {}@PLT", sym));
-                        } else {
-                            self.state.out.emit_call(&sym_str);
-                        }
-                    }
+                if off == 0 && self.state.needs_got_call(&sym) {
+                    self.emit_got_call(&sym);
+                } else if off == 0 && self.state.needs_plt(&sym) {
+                    self.state.emit_fmt(format_args!("    call {}@PLT", sym));
+                } else {
+                    self.state.out.emit_call(&sym_str);
                 }
             } else {
                 // Indirect function pointers are preloaded into r10 by
@@ -1808,7 +1763,10 @@ impl X86Codegen {
         // marker lands immediately after the call text (before any
         // subsequent emission), and absent marker ⇒ non-variadic ⇒ %rax
         // unread.
-        if self.state.call_is_variadic {
+        if self.state.call_is_variadic
+            && self.state.call_calling_convention
+                == crate::common::types::CallingConvention::Default
+        {
             self.emit_call_marker("    # LCCC_VA_CALL".to_string());
         }
         // Call-argument count marker (the same authority contract as the
@@ -1888,6 +1846,13 @@ impl X86Codegen {
         _f128_temp_space: usize,
         _indirect: bool,
     ) {
+        if self.state.call_shadow_active {
+            self.state.emit("    addq $32, %rsp");
+            self.state.call_shadow_active = false;
+            if self.state.out.use_rsp_addressing {
+                self.state.out.rsp_frame_size -= 32;
+            }
+        }
         // Dynamically realigned outgoing area: after the call %rsp points at
         // the first stack argument (the anchor). Skip the statically-pushed
         // argument area (16-rounded) to the save slot written by
@@ -2083,6 +2048,13 @@ impl X86Codegen {
     /// call-alignment pad of a function whose every call converts) share it,
     /// so the two can never disagree.
     pub(super) fn sibcall_abi_admits(&self, info: &CallInfo) -> Option<bool> {
+        if info.calling_convention != crate::common::types::CallingConvention::Default
+            || self.state.func_calling_convention
+                != crate::common::types::CallingConvention::Default
+        {
+            return None;
+        }
+
         // i686: cdecl stages every argument through the outgoing stack area
         // (see the `%esp`-relative staging in the probe for PR #255), so the
         // zero-stack-argument premise of §5b never holds there. Refused

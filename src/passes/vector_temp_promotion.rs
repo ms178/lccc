@@ -430,6 +430,41 @@ fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<us
             return (index == 0).then_some(32);
         }
 
+        // Unary AVX FP forms, including those with an immediate at args[1].
+        // Immediate/scalar positions must never be treated as vector pointers.
+        O::SqrtPs256
+        | O::SqrtPd256
+        | O::RoundPs256
+        | O::RoundPd256
+        | O::VpermilPs256
+        | O::VpermilPd256 => {
+            return (index == 0).then_some(32);
+        }
+
+        // Binary AVX FP forms. Compare/shuffle/blend have an additional
+        // immediate at args[2], deliberately excluded by index < 2 below.
+        O::DivPs256
+        | O::MinPs256
+        | O::MaxPs256
+        | O::CmpPs256
+        | O::ShufPs256
+        | O::DivPd256
+        | O::MinPd256
+        | O::MaxPd256
+        | O::CmpPd256
+        | O::ShufPd256
+        | O::UnpcklPs256
+        | O::UnpckhPs256
+        | O::UnpcklPd256
+        | O::UnpckhPd256
+        | O::HaddPs256
+        | O::HsubPs256
+        | O::AddsubPs256
+        | O::VpermilvarPs256
+        | O::VpermilvarPd256
+        | O::BlendPs256
+        | O::BlendPd256 => 32,
+
         // Binary 256-bit vector operations.
         O::Paddb256
         | O::Paddw256
@@ -3386,6 +3421,89 @@ mod tests {
             )],
         );
         assert_eq!(fuse_in_function(&mut function), 0);
+    }
+
+    #[test]
+    fn raw_avx_fp_widths_and_pointer_positions_are_exact() {
+        use IntrinsicOp::*;
+        for (op, vectors) in [
+            (DivPs256, 2),
+            (MinPs256, 2),
+            (MaxPs256, 2),
+            (CmpPs256, 2),
+            (ShufPs256, 2),
+            (DivPd256, 2),
+            (MinPd256, 2),
+            (MaxPd256, 2),
+            (CmpPd256, 2),
+            (ShufPd256, 2),
+            (UnpcklPs256, 2),
+            (UnpckhPs256, 2),
+            (UnpcklPd256, 2),
+            (UnpckhPd256, 2),
+            (HaddPs256, 2),
+            (HsubPs256, 2),
+            (AddsubPs256, 2),
+            (VpermilvarPs256, 2),
+            (VpermilvarPd256, 2),
+            (BlendPs256, 2),
+            (BlendPd256, 2),
+            (SqrtPs256, 1),
+            (SqrtPd256, 1),
+            (RoundPs256, 1),
+            (RoundPd256, 1),
+            (VpermilPs256, 1),
+            (VpermilPd256, 1),
+        ] {
+            assert_eq!(op.vector_home_width(), Some(32), "{op:?}");
+            assert_eq!(op.vector_result_width(), Some(32), "{op:?}");
+            assert_eq!(intrinsic_dest_required_alignment(op, true, 32), Some(0));
+            for index in 0..4 {
+                assert_eq!(
+                    pointer_vector_arg_width(op, index),
+                    (index < vectors).then_some(32),
+                    "{op:?} arg {index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_avx_fp_private_homes_can_relax_alignment() {
+        for op in [
+            IntrinsicOp::MinPs256,
+            IntrinsicOp::MaxPs256,
+            IntrinsicOp::CmpPs256,
+            IntrinsicOp::MinPd256,
+            IntrinsicOp::MaxPd256,
+            IntrinsicOp::CmpPd256,
+        ] {
+            let mut f = function(
+                "raw_fp",
+                vec![block(
+                    0,
+                    vec![
+                        alloca(0, 32, 32),
+                        alloca(1, 32, 32),
+                        alloca(2, 32, 32),
+                        intrinsic(
+                            Some(3),
+                            op,
+                            Some(2),
+                            vec![
+                                Operand::Value(Value(0)),
+                                Operand::Value(Value(1)),
+                                Operand::Const(IrConst::I32(14)),
+                            ],
+                        ),
+                    ],
+                )],
+            );
+            assert_eq!(downgrade_in_function(&mut f), 3, "{op:?}");
+            for inst in &f.blocks[0].instructions[..3] {
+                assert!(matches!(inst, Instruction::Alloca { align: 0, .. }));
+            }
+        }
     }
 
     #[test]

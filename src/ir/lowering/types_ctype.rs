@@ -66,6 +66,8 @@ impl Lowerer {
                             fptr_params: None,
                             fptr_variadic: false,
                             fptr_has_prototype: false,
+                            fptr_calling_convention:
+                                crate::common::types::CallingConvention::Default,
                             is_const: false,
                             is_volatile: false,
                             is_restrict: false,
@@ -85,6 +87,7 @@ impl Lowerer {
                         param_decls,
                         ft.variadic,
                         ft.has_prototype,
+                        ft.calling_convention,
                     )
                 } else {
                     TypeSpecifier::Pointer(
@@ -114,6 +117,7 @@ impl Lowerer {
                         None,
                         None,
                         None,
+                        false,
                         Span::dummy(),
                     )
                 } else {
@@ -124,6 +128,7 @@ impl Lowerer {
                         None,
                         None,
                         None,
+                        false,
                         Span::dummy(),
                     )
                 }
@@ -179,6 +184,7 @@ impl Lowerer {
                         fptr_params: None,
                         fptr_variadic: false,
                         fptr_has_prototype: false,
+                        fptr_calling_convention: crate::common::types::CallingConvention::Default,
                         is_const: false,
                         is_volatile: false,
                         is_restrict: false,
@@ -198,6 +204,7 @@ impl Lowerer {
                     param_decls,
                     ft.variadic,
                     ft.has_prototype,
+                    ft.calling_convention,
                 )
             }
             // Every caller resolves `typeof`, `__auto_type` or a typedef, so
@@ -281,6 +288,7 @@ impl Lowerer {
                     })
                     .collect();
                 let func_type = CType::Function(Box::new(crate::common::types::FunctionType {
+                    calling_convention: fti.calling_convention,
                     return_type: return_ctype,
                     params: param_types,
                     variadic: fti.variadic,
@@ -349,6 +357,7 @@ impl Lowerer {
                 })
                 .collect();
             let func_type = CType::Function(Box::new(crate::common::types::FunctionType {
+                calling_convention: fti.calling_convention,
                 return_type: return_ctype,
                 params: param_types,
                 variadic: fti.variadic,
@@ -521,6 +530,7 @@ impl Lowerer {
                     align: 1,
                     is_union,
                     is_transparent_union: false,
+                    requires_designators: false,
                     reverse_sso,
                     user_align: false,
                     member_align: 1,
@@ -544,6 +554,7 @@ impl Lowerer {
                 align: 1,
                 is_union,
                 is_transparent_union: false,
+                requires_designators: false,
                 reverse_sso,
                 user_align: false,
                 member_align: 1,

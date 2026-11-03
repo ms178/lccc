@@ -573,7 +573,9 @@ fn default_argument_promotion(ty: &CType) -> CType {
 /// The `params` stored on an unprototyped K&R definition describe its body,
 /// not its visible function type, so they are intentionally ignored here.
 fn function_types_compatible(a: &FunctionType, b: &FunctionType) -> bool {
-    if !ctypes_compatible(&a.return_type, &b.return_type) {
+    if a.calling_convention != b.calling_convention
+        || !ctypes_compatible(&a.return_type, &b.return_type)
+    {
         return false;
     }
 
@@ -661,6 +663,7 @@ fn composite_function_type(a: &FunctionType, b: &FunctionType) -> Option<Functio
     };
 
     Some(FunctionType {
+        calling_convention: a.calling_convention,
         return_type,
         params,
         variadic,
@@ -983,8 +986,20 @@ impl ExtVectorLayout {
     }
 }
 
+/// Calling convention is part of the FUNCTION type, including through pointers,
+/// typedefs, composites and indirect calls. It is not a property of a name.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum CallingConvention {
+    #[default]
+    Default,
+    MicrosoftX64,
+    /// GNU i386 fastcall: ECX/EDX arguments and callee stack cleanup.
+    I686Fastcall,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FunctionType {
+    pub calling_convention: CallingConvention,
     pub return_type: CType,
     pub params: Vec<(CType, Option<String>)>,
     pub variadic: bool,
@@ -1052,6 +1067,10 @@ pub struct StructField {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EnumType {
+    /// Translation-unit-local nominal identity. Forward references and their
+    /// completed definition retain the same identity; lexical shadows do not.
+    /// None is reserved for synthetic types without a declaration context.
+    pub identity: Option<std::num::NonZeroU64>,
     pub name: Option<String>,
     pub variants: Vec<(String, i64)>,
     /// When true (__attribute__((packed))), the enum uses the smallest
@@ -1216,6 +1235,8 @@ pub struct StructLayout {
     /// Whether this union has `__attribute__((transparent_union))`.
     /// A transparent union parameter is passed using the ABI of its first member.
     pub is_transparent_union: bool,
+    /// GNU designated_init: positional member initialization is diagnosed.
+    pub requires_designators: bool,
     /// True when the record has `__attribute__((scalar_storage_order("big-endian")))`
     /// on a little-endian target (or the mirrored little-endian form on a
     /// big-endian one) — i.e. the storage order is REVERSED relative to the
@@ -1535,6 +1556,7 @@ impl StructLayoutBuilder {
             align: self.max_align,
             is_union: false,
             is_transparent_union: false,
+            requires_designators: false,
             reverse_sso: self.reverse_sso,
             user_align: self.user_align,
             member_align: self.max_align,
@@ -1574,6 +1596,7 @@ impl StructLayout {
             align: 1,
             is_union: false,
             is_transparent_union: false,
+            requires_designators: false,
             reverse_sso: false,
             user_align: false,
             member_align: 1,
@@ -1589,6 +1612,7 @@ impl StructLayout {
             align: 1,
             is_union: true,
             is_transparent_union: false,
+            requires_designators: false,
             reverse_sso: false,
             user_align: false,
             member_align: 1,
@@ -1865,6 +1889,7 @@ impl StructLayout {
             align: max_align,
             is_union: true,
             is_transparent_union: false,
+            requires_designators: false,
             reverse_sso,
             user_align,
             member_align: max_align,
@@ -4097,7 +4122,9 @@ impl CType {
                             })
                     }
                 };
-                params_compatible && a.return_type.generic_association_matches(&b.return_type)
+                a.calling_convention == b.calling_convention
+                    && params_compatible
+                    && a.return_type.generic_association_matches(&b.return_type)
             }
             _ => self == assoc,
         }
@@ -5190,6 +5217,7 @@ mod conditional_type_tests {
     #[test]
     fn function_pointer_composite_keeps_prototype_from_either_arm() {
         let unprototyped = CType::Function(Box::new(FunctionType {
+            calling_convention: crate::common::types::CallingConvention::Default,
             return_type: CType::Int,
             // Body parameters on an unprototyped K&R definition are not a
             // prototype and do not constrain calls through its function type.
@@ -5198,6 +5226,7 @@ mod conditional_type_tests {
             has_prototype: false,
         }));
         let prototype = CType::Function(Box::new(FunctionType {
+            calling_convention: crate::common::types::CallingConvention::Default,
             return_type: CType::Int,
             params: Vec::new(),
             variadic: false,
@@ -5474,6 +5503,7 @@ mod pointer_qualifier_contract_tests {
     fn function_qualification_is_significant_but_parameter_names_are_not() {
         let function = |param, name: &str, ret| {
             CType::Function(Box::new(FunctionType {
+                calling_convention: crate::common::types::CallingConvention::Default,
                 return_type: ret,
                 params: vec![(param, Some(name.into()))],
                 variadic: false,

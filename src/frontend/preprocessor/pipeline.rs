@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use super::builtin_macros::define_builtin_macros;
 use super::conditionals::{ConditionalStack, evaluate_condition};
-use super::macro_defs::{MacroDef, MacroTable, parse_define};
+use super::macro_defs::{MacroDef, MacroTable, SavedMacroDefinition, parse_define};
 use super::text_processing::{
     CommentSegments, LineResolver, LineResolverData, LineSegments, split_first_word,
     strip_line_comment,
@@ -48,6 +48,8 @@ const MAX_PENDING_NEWLINES: usize = 100_000;
 /// output for `#error`, `#warning`, and missing `#include` errors.
 #[derive(Debug, Clone)]
 pub struct PreprocessorDiagnostic {
+    /// Diagnostic category; warnings retain independent -W controls.
+    pub kind: crate::common::error::WarningKind,
     /// The source file where the diagnostic originated.
     pub file: String,
     /// The 1-based line number in the source file.
@@ -78,6 +80,17 @@ pub enum PragmaSeverity {
 pub struct PragmaDiagnostic {
     pub severity: PragmaSeverity,
     pub diagnostic: PreprocessorDiagnostic,
+    /// Only categorized pragma warnings need a scoped selection snapshot.
+    /// Notes and uncategorized GCC warnings retain no extra allocation.
+    pub warning_config: Option<Box<crate::common::error::WarningConfig>>,
+}
+
+/// Execution order across the independently stored warning and pragma payloads.
+/// File/line sorting is invalid across includes, repeated includes and #line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreprocessorDiagnosticIndex {
+    Warning(usize),
+    Pragma(usize),
 }
 
 pub struct Preprocessor {
@@ -88,6 +101,9 @@ pub struct Preprocessor {
     pub(super) errors: Vec<PreprocessorDiagnostic>,
     /// Collected preprocessor warnings (e.g., #warning directives).
     pub(super) warnings: Vec<PreprocessorDiagnostic>,
+    pub(super) diagnostic_pragmas: crate::common::diagnostic_pragma::DiagnosticPragmas,
+    warning_configs: Vec<crate::common::error::WarningConfig>,
+    diagnostic_order: Vec<PreprocessorDiagnosticIndex>,
     /// Diagnostics of the message pragmas (`#pragma GCC warning`,
     /// `#pragma message`), in source order; see [`PragmaDiagnostic`].
     pub(super) pragma_diagnostics: Vec<PragmaDiagnostic>,
@@ -118,8 +134,8 @@ pub struct Preprocessor {
     /// Declarations to inject into the output (from #include processing).
     pub(super) pending_injections: Vec<String>,
     /// Stack for #pragma push_macro / pop_macro.
-    /// Maps macro name -> stack of saved definitions (None = was undefined).
-    pub(super) macro_save_stack: FxHashMap<String, Vec<Option<MacroDef>>>,
+    /// Includes ownership/suppression of lazy builtins with no stored body.
+    pub(super) macro_save_stack: FxHashMap<String, Vec<SavedMacroDefinition>>,
     /// Line offset set by #line directive: effective_line = line_offset + (source_line - line_offset_base)
     /// When None, no #line has been issued and __LINE__ uses the source line directly.
     line_override: Option<(usize, usize)>, // (target_line, source_line_at_directive)
@@ -191,6 +207,11 @@ impl Preprocessor {
             filename: String::new(),
             errors: Vec::new(),
             warnings: Vec::new(),
+            diagnostic_pragmas: crate::common::diagnostic_pragma::DiagnosticPragmas::new(
+                crate::common::error::WarningConfig::new(),
+            ),
+            warning_configs: Vec::new(),
+            diagnostic_order: Vec::new(),
             pragma_diagnostics: Vec::new(),
             include_paths: Vec::new(),
             quote_include_paths: Vec::new(),
@@ -357,7 +378,7 @@ impl Preprocessor {
             // Execute `_Pragma` operators queued by the previous line's macro
             // expansion BEFORE processing this line, so their effects (C99
             // §6.10.9) apply in source order relative to directives.
-            self.drain_expansion_pragmas();
+            self.drain_expansion_effects();
             let trimmed = line.trim();
             // A directive is introduced by the `#` token, which the C95 digraph
             // `%:` also denotes (`%:include <stdio.h>`), so `hash_token_len`
@@ -514,7 +535,7 @@ impl Preprocessor {
                             0,
                         );
                         let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
-                        self.drain_expansion_pragmas();
+                        self.drain_expansion_effects();
                         pending_line.clear();
                         pending_line.push_str(&expanded);
                         // Already expanded: positions no longer matter.
@@ -534,7 +555,7 @@ impl Preprocessor {
                             0,
                         );
                         let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
-                        self.drain_expansion_pragmas();
+                        self.drain_expansion_effects();
                         let expanded =
                             self.resolve_has_macros_in_code(&expanded, source_line_num + 1);
                         Self::push_accumulated(&mut output, &expanded, pending_newlines);
@@ -678,7 +699,7 @@ impl Preprocessor {
         }
 
         // Pragmas queued by the final line's expansion.
-        self.drain_expansion_pragmas();
+        self.drain_expansion_effects();
 
         // Flush any remaining pending line
         if !pending_line.is_empty() {
@@ -688,7 +709,7 @@ impl Preprocessor {
                 0,
             );
             let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
-            self.drain_expansion_pragmas();
+            self.drain_expansion_effects();
             let expanded = self.resolve_has_macros_in_code(&expanded, last_source_line_num + 1);
             output.push_str(&expanded);
             output.push('\n');
@@ -732,12 +753,10 @@ impl Preprocessor {
         }
     }
 
-    /// The presumed file name as a line-marker operand: `__FILE__`'s
-    /// spelling, which `#line N "name"` sets and includes save and restore.
+    /// The presumed filename as a line-marker operand. Unlike __FILE__'s
+    /// macro body, provenance must survive a user #define/#undef of __FILE__.
     fn presumed_file_operand(&self) -> String {
-        self.macros
-            .get_file_body()
-            .map_or_else(|| format!("\"{}\"", self.filename), str::to_string)
+        self.macros.source_filename.clone()
     }
 
     /// The line marker a preceding `#line` made due, for the output line
@@ -1085,6 +1104,34 @@ impl Preprocessor {
         &self.errors
     }
 
+    pub fn set_warning_config(&mut self, config: crate::common::error::WarningConfig) {
+        self.diagnostic_pragmas = crate::common::diagnostic_pragma::DiagnosticPragmas::new(config);
+    }
+
+    pub fn warning_config_at(&self, index: usize) -> &crate::common::error::WarningConfig {
+        &self.warning_configs[index]
+    }
+
+    pub(super) fn push_warning(&mut self, warning: PreprocessorDiagnostic) {
+        self.warning_configs
+            .push(self.diagnostic_pragmas.current.clone());
+        self.diagnostic_order
+            .push(PreprocessorDiagnosticIndex::Warning(self.warnings.len()));
+        self.warnings.push(warning);
+    }
+
+    pub(super) fn push_pragma_diagnostic(&mut self, diagnostic: PragmaDiagnostic) {
+        self.diagnostic_order
+            .push(PreprocessorDiagnosticIndex::Pragma(
+                self.pragma_diagnostics.len(),
+            ));
+        self.pragma_diagnostics.push(diagnostic);
+    }
+
+    pub fn diagnostic_order(&self) -> &[PreprocessorDiagnosticIndex] {
+        &self.diagnostic_order
+    }
+
     /// Get preprocessing warnings.
     pub fn warnings(&self) -> &[PreprocessorDiagnostic] {
         &self.warnings
@@ -1268,6 +1315,7 @@ impl Preprocessor {
         self.include_origins.push(origin);
 
         // Save and set __FILE__ (uses set_file to avoid full MacroDef allocation)
+        let old_source_filename = self.macros.source_filename.clone();
         let old_file = self.macros.get_file_body().map(|s| s.to_string());
         self.macros.set_file(format!("\"{}\"", resolved.display()));
         self.macros.push_file_scope(&resolved);
@@ -1294,6 +1342,7 @@ impl Preprocessor {
         if let Some(old) = old_file {
             self.macros.set_file(old);
         }
+        self.macros.source_filename = old_source_filename;
     }
 
     /// Process a preprocessor directive line.
@@ -1304,16 +1353,24 @@ impl Preprocessor {
     /// (C99 §6.10.9: `_Pragma("foo")` behaves like `#pragma foo` at that
     /// point). Called after every expansion pass so pragma effects
     /// (push_macro/pop_macro, weak, visibility, ...) apply in source order.
-    fn drain_expansion_pragmas(&mut self) {
-        for (content, line) in self.macros.take_pending_pragmas() {
-            let content = content.trim().to_string();
-            if content.is_empty() {
-                continue;
+    pub(super) fn drain_expansion_effects(&mut self) {
+        for effect in self.macros.take_pending_effects() {
+            match effect {
+                super::macro_defs::ExpansionEffect::Pragma(content, line) => {
+                    if !content.trim().is_empty() {
+                        self.handle_pragma(content.trim(), line, 0);
+                    }
+                }
+                super::macro_defs::ExpansionEffect::DateTime { name, file, line } => {
+                    self.push_warning(PreprocessorDiagnostic {
+                        kind: crate::common::error::WarningKind::DateTime,
+                        file,
+                        line,
+                        col: 1,
+                        message: format!("macro '{name}' might prevent reproducible builds"),
+                    });
+                }
             }
-            // The line was resolved at enqueue time against the expansion
-            // site's own line resolver (C99 §6.10.9: the pragma behaves
-            // as if written where the `_Pragma` operator appears).
-            self.handle_pragma(&content, line, 0);
         }
     }
 
@@ -1404,6 +1461,7 @@ impl Preprocessor {
                 // C11 6.10.5p1 / C23 6.10.6p1: preprocessing tokens in #error
                 // are not subject to macro expansion.
                 self.errors.push(PreprocessorDiagnostic {
+                    kind: crate::common::error::WarningKind::Cpp,
                     file: self.current_file(),
                     line: line_num,
                     col,
@@ -1412,7 +1470,8 @@ impl Preprocessor {
             }
             "warning" => {
                 // GCC extension, collect warning for structured diagnostic output
-                self.warnings.push(PreprocessorDiagnostic {
+                self.push_warning(PreprocessorDiagnostic {
+                    kind: crate::common::error::WarningKind::Cpp,
                     file: self.current_file(),
                     line: line_num,
                     col,
@@ -1431,12 +1490,21 @@ impl Preprocessor {
                 if keyword.chars().next().is_some_and(|c| c.is_ascii_digit()) {
                     let line_rest = format!("{} {}", keyword, rest);
                     self.handle_line_directive(&line_rest, line_num);
+                } else if self.macros.asm_mode {
+                    // In assembler-with-cpp these are assembler hash comments,
+                    // not invalid C directives. GCC still expands their tokens
+                    // (including a macro-named first word), then preserves the
+                    // line for the assembler. Real #warning/#error above retain
+                    // their diagnostics and -Werror behavior.
+                    let expanded = self.macros.expand_line(line);
+                    return Some(format!("{expanded}\n"));
                 } else {
                     // Unknown directives are valid preprocessing diagnostics, not
                     // hard errors.  Warn so typos like `#defin` and `#inclde`
                     // are visible while preserving compatibility with projects
                     // that intentionally use vendor-specific directives.
-                    self.warnings.push(PreprocessorDiagnostic {
+                    self.push_warning(PreprocessorDiagnostic {
+                        kind: crate::common::error::WarningKind::Cpp,
                         file: self.current_file(),
                         line: line_num,
                         col,
@@ -1622,6 +1690,7 @@ impl Preprocessor {
                     || (def.is_variadic && operand == "__VA_ARGS__"));
             if !valid {
                 self.errors.push(PreprocessorDiagnostic {
+                    kind: crate::common::error::WarningKind::Cpp,
                     file: self.current_file(),
                     line: line_num,
                     col,
@@ -1647,6 +1716,20 @@ impl Preprocessor {
         self.conditionals.push_if(condition);
     }
 
+    fn evaluate_pp_condition(&mut self, expr: &str, line: usize) -> bool {
+        let (value, undefined) = evaluate_condition(expr, &self.macros);
+        for name in undefined {
+            self.push_warning(PreprocessorDiagnostic {
+                kind: crate::common::error::WarningKind::Undef,
+                file: self.current_file(),
+                line,
+                col: 1,
+                message: format!("\"{name}\" is not defined, evaluates to 0"),
+            });
+        }
+        value
+    }
+
     fn handle_if(&mut self, expr: &str, diag_line: usize) {
         // First resolve `defined(X)` and `__has_*()` before macro expansion
         let resolved = self.resolve_defined_in_expr(expr, diag_line);
@@ -1658,8 +1741,7 @@ impl Preprocessor {
         // __has_attribute(), __has_builtin(), __has_include(), etc.
         let expanded = self.resolve_defined_in_expr(&expanded, diag_line);
         // Replace any remaining identifiers with 0 (standard C behavior for #if)
-        let final_expr = self.replace_remaining_idents_with_zero(&expanded);
-        let condition = evaluate_condition(&final_expr, &self.macros);
+        let condition = self.evaluate_pp_condition(&expanded, diag_line);
         self.conditionals.push_if(condition);
     }
 
@@ -1673,14 +1755,17 @@ impl Preprocessor {
     }
 
     fn handle_elif(&mut self, expr: &str, diag_line: usize) {
+        if !self.conditionals.needs_elif_evaluation() {
+            self.conditionals.handle_elif(false);
+            return;
+        }
         let resolved = self.resolve_defined_in_expr(expr, diag_line);
         let expanded = self
             .macros
             .expand_line_reuse(&resolved, &mut self.directive_expanding);
         // Resolve again after macro expansion (same reason as handle_if)
         let expanded = self.resolve_defined_in_expr(&expanded, diag_line);
-        let final_expr = self.replace_remaining_idents_with_zero(&expanded);
-        let condition = evaluate_condition(&final_expr, &self.macros);
+        let condition = self.evaluate_pp_condition(&expanded, diag_line);
         self.conditionals.handle_elif(condition);
     }
 
@@ -1697,6 +1782,7 @@ impl Preprocessor {
             return;
         }
         self.errors.push(PreprocessorDiagnostic {
+            kind: crate::common::error::WarningKind::Cpp,
             file: self.current_file(),
             line: line.max(1),
             col: 1,
@@ -1875,5 +1961,64 @@ mod define_macro_tests {
         let _ = pp.preprocess("#define FOO expanded_wrongly\n#error FOO must stay literal\n");
         assert_eq!(pp.errors().len(), 1);
         assert_eq!(pp.errors()[0].message, "#error FOO must stay literal");
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_order_tests {
+    use super::{Preprocessor, PreprocessorDiagnosticIndex};
+
+    fn messages(pp: &Preprocessor) -> Vec<&str> {
+        let mut warnings = 0;
+        let mut pragmas = 0;
+        let result = pp
+            .diagnostic_order()
+            .iter()
+            .map(|entry| match *entry {
+                PreprocessorDiagnosticIndex::Warning(index) => {
+                    assert_eq!(index, warnings);
+                    warnings += 1;
+                    pp.warnings()[index].message.as_str()
+                }
+                PreprocessorDiagnosticIndex::Pragma(index) => {
+                    assert_eq!(index, pragmas);
+                    pragmas += 1;
+                    pp.pragma_diagnostics()[index].diagnostic.message.as_str()
+                }
+            })
+            .collect();
+        assert_eq!(warnings, pp.warnings().len());
+        assert_eq!(pragmas, pp.pragma_diagnostics().len());
+        result
+    }
+
+    #[test]
+    fn warnings_and_pragmas_share_execution_order() {
+        let mut pp = Preprocessor::new();
+        pp.preprocess("#warning first\n#pragma GCC warning \"second\"\n#warning third\n");
+        assert_eq!(
+            messages(&pp),
+            ["#warning first", "second", "#warning third"]
+        );
+    }
+
+    #[test]
+    fn message_operand_effects_precede_the_message() {
+        let mut pp = Preprocessor::new();
+        pp.preprocess("#pragma message __DATE__\n#warning last\n");
+        let observed = messages(&pp);
+        assert!(observed[0].contains("macro '__DATE__'"));
+        assert!(observed[1].starts_with("'#pragma message: "));
+        assert_eq!(observed[2], "#warning last");
+        let mut pp = Preprocessor::new();
+        pp.preprocess(
+            r#"#pragma message _Pragma("GCC warning \"inner\"") "outer"
+#warning last
+"#,
+        );
+        assert_eq!(
+            messages(&pp),
+            ["inner", "'#pragma message: outer'", "#warning last"]
+        );
     }
 }

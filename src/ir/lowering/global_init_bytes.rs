@@ -162,6 +162,7 @@ impl Lowerer {
                             item.clone()
                         } else {
                             InitializerItem {
+                                span: crate::common::source::Span::dummy(),
                                 designators: item.designators[1..].to_vec(),
                                 init: item.init.clone(),
                             }
@@ -662,6 +663,7 @@ impl Lowerer {
                 let sub_desigs: Vec<_> = after_first_idx.to_vec();
                 if let Some(sub_layout) = self.get_struct_layout_for_ctype(elem_ty) {
                     let sub_item = InitializerItem {
+                        span: crate::common::source::Span::dummy(),
                         designators: sub_desigs,
                         init: item.init.clone(),
                     };
@@ -669,6 +671,7 @@ impl Lowerer {
                 }
             } else if let Some(sub_layout) = self.get_struct_layout_for_ctype(elem_ty) {
                 let sub_item = InitializerItem {
+                    span: crate::common::source::Span::dummy(),
                     designators: remaining_field_desigs,
                     init: item.init.clone(),
                 };
@@ -703,6 +706,7 @@ impl Lowerer {
                             // Build sub-item with remaining indices as [Field("dummy"), Index(...)]
                             // Actually we can recursively call ourselves
                             let sub_item = InitializerItem {
+                                span: crate::common::source::Span::dummy(),
                                 designators: {
                                     let mut d = vec![Designator::Field(String::new())]; // dummy field
                                     d.extend(further_indices);
@@ -852,6 +856,7 @@ impl Lowerer {
                 // field of the sub-struct (C11 6.7.9p13).
                 if !items[0].designators.is_empty() {
                     let stripped = InitializerItem {
+                        span: crate::common::source::Span::dummy(),
                         designators: vec![],
                         init: items[0].init.clone(),
                     };
@@ -1655,6 +1660,7 @@ impl Lowerer {
                 // sibling fields of element `[i][j]`.
                 if !trailing_designators.is_empty() {
                     let sub_item = InitializerItem {
+                        span: crate::common::source::Span::dummy(),
                         designators: trailing_designators.to_vec(),
                         init: item.init.clone(),
                     };
@@ -1692,6 +1698,7 @@ impl Lowerer {
                     Initializer::Expr(expr) => {
                         if self.eval_const_expr(expr).is_some() {
                             let stripped = InitializerItem {
+                                span: crate::common::source::Span::dummy(),
                                 designators: vec![],
                                 init: item.init.clone(),
                             };
@@ -1739,6 +1746,7 @@ impl Lowerer {
             // initializes `.n` rather than replacing the entire element `[1]`.
             if !trailing_designators.is_empty() {
                 let sub_item = InitializerItem {
+                    span: crate::common::source::Span::dummy(),
                     designators: trailing_designators.to_vec(),
                     init: item.init.clone(),
                 };

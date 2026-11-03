@@ -274,6 +274,20 @@ if ! bash "$SCRIPT" scan "$tmp/zstd_dyn_ok.o" > "$tmp/scan_zstd_ok.log" 2>&1; th
     sed 's/^/  /' "$tmp/scan_zstd_ok.log" >&2
     fail=1
 fi
+if grep -qi 'warning:' "$tmp/scan_zstd_ok.log"; then
+    echo "FAIL: successful ISA scan produced a warning" >&2
+    cat "$tmp/scan_zstd_ok.log" >&2
+    exit 1
+fi
+# A non-dot suffix must never acquire the exemption. GNU awk -v used
+# to consume the regex's backslash, turning the literal dot into a wildcard.
+sed 's/FSE_readNCount_body_bmi2/FSE_readNCount_body_bmi2Xsuffix/g' \
+    "$tmp/zstd_dyn.c" > "$tmp/zstd_bad_suffix.c"
+"$CCC" -O2 -march=x86-64 -c "$tmp/zstd_bad_suffix.c" -o "$tmp/zstd_bad_suffix.o"
+if bash "$SCRIPT" scan "$tmp/zstd_bad_suffix.o" > /dev/null 2>&1; then
+    echo "FAIL: scan granted an ISA exemption to a non-dot clone suffix" >&2
+    exit 1
+fi
 cat > "$tmp/zstd_leak.c" <<'EOF'
 #include <stdint.h>
 __attribute__((__target__("lzcnt,bmi,bmi2")))

@@ -25,7 +25,7 @@
 use super::parse::Parser;
 use crate::common::source::Span;
 use crate::frontend::lexer::token::TokenKind;
-use crate::frontend::parser::ast::FunctionDef;
+use crate::frontend::parser::ast::{DerivedDeclarator, FunctionDef};
 
 impl Parser {
     /// Token-level probe: does the current position start an implicit-int
@@ -222,6 +222,7 @@ impl Parser {
                 p,
                 v,
                 has_prototype,
+                _,
             )) => (p.clone(), *v, *has_prototype),
             _ => unreachable!(),
         };
@@ -326,6 +327,10 @@ impl Parser {
         // and a nested function's emitted name is mangled (`parent.inner`), which is
         // only known once the lowering side has built the `IrFunction`.
         Some(FunctionDef {
+            calling_convention: match derived.last() {
+                Some(DerivedDeclarator::Function(_, _, _, abi)) => *abi,
+                _ => Default::default(),
+            },
             alignment: None,
             return_base_const,
             return_pointer_const_levels: crate::frontend::parser::ast::return_pointer_const_levels(

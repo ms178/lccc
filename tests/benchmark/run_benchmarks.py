@@ -72,6 +72,9 @@ class Benchmark:
 # Keep historical synthetic tests, then add workload-derived kernels.  Sources
 # may live in the legacy numbered directory until they are migrated.
 BENCHMARKS: tuple[Benchmark, ...] = (
+    Benchmark("avx_fp_private", "explicit AVX FP private-home and clamp traffic",
+              ("avx_fp_private.c",), ("synthetic", "simd", "fp", "map"),
+              extra_flags=("-mavx2",), ci_sharded=False),
     Benchmark("f32_sse1_map", "strict cache-resident F32 maps without SSE2",
               ("f32_sse1_map.c",), ("synthetic", "simd", "fp", "map", "sse1"),
               extra_flags=("-mno-sse2", "-msse", "-ffp-contract=off", "-DSSE1_MAP_REQUIRE_ONLY")),

@@ -1251,50 +1251,7 @@ pub(crate) fn validate_operands(mnemonic: &str, ops: &[Operand]) -> Result<(), S
     }
 
     // 8. Zero-operand instructions must not be given operands.
-    if matches!(
-        mnemonic,
-        "vzeroupper"
-            | "vzeroall"
-            | "cpuid"
-            | "leave"
-            | "leaveq"
-            | "hlt"
-            | "pause"
-            | "syscall"
-            | "sysret"
-            | "ud2"
-            | "cwtl"
-            | "cltq"
-            | "cqto"
-            | "cltd"
-            | "cwtd"
-            | "endbr64"
-            | "endbr32"
-            | "cbtw"
-            | "cbw"
-            | "cwde"
-            | "cdqe"
-            | "cwd"
-            | "lfence"
-            | "sfence"
-            | "mfence"
-            | "rdtsc"
-            | "rdtscp"
-            | "cdq"
-            | "cqo"
-            | "stac"
-            | "clac"
-            | "clui"
-            | "stui"
-            | "serialize"
-            | "rdpkru"
-            | "wrpkru"
-            | "wbnoinvd"
-            | "clzero"
-            | "rdpru"
-            | "mcommit"
-    ) && !ops.is_empty()
-    {
+    if crate::common::asm_scan::is_x86_zero_operand_mnemonic(mnemonic) && !ops.is_empty() {
         return Err(format!("`{}` takes no operands", mnemonic));
     }
 

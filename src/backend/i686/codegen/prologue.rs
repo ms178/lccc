@@ -639,6 +639,7 @@ impl I686Codegen {
                 .insert(param_idx, StackSlot(offset));
         }
         let mut space = space + conflict_params.len() as i64 * 4;
+        space = self.allocate_static_chain_homes(func, space);
         self.vector_ret_buffer_bytes = crate::backend::call_abi::hidden_vector_return_bytes(
             func.uses_sret,
             &func.ret_eightbyte_classes,
@@ -652,6 +653,34 @@ impl I686Codegen {
     }
 
     // ---- aligned_frame_size ----
+
+    /// Keep chain storage layout separate from general value-slot allocation.
+    fn allocate_static_chain_homes(&mut self, func: &IrFunction, mut space: i64) -> i64 {
+        self.incoming_chain_slot = None;
+        self.outgoing_chain_slot = None;
+        self.pending_static_chain = false;
+        for incoming in [true, false] {
+            let needed = func.blocks.iter().any(|block| {
+                block.instructions.iter().any(|inst| {
+                    if incoming {
+                        matches!(inst, Instruction::GetStaticChain { .. })
+                    } else {
+                        matches!(inst, Instruction::SetStaticChain { .. })
+                    }
+                })
+            });
+            if needed {
+                space += 4;
+                let slot = Some(StackSlot(-space));
+                if incoming {
+                    self.incoming_chain_slot = slot;
+                } else {
+                    self.outgoing_chain_slot = slot;
+                }
+            }
+        }
+        space
+    }
 
     /// Incoming register parameters (fastcall %ecx/%edx slots, or regparm
     /// %eax/%edx/%ecx classes) whose ParamRef destinations share one
@@ -730,6 +759,10 @@ impl I686Codegen {
     // ---- emit_prologue ----
 
     pub(super) fn emit_prologue_impl(&mut self, func: &IrFunction, frame_size: i64) {
+        if self.state.cf_protection_branch {
+            self.state.emit("    endbr32");
+        }
+
         // Single source of truth for materialisation widths (and for the
         // narrow-index extension in the SIB emitters) -- the same
         // `compute_value_type_map` the x86-64 backend seeds in its prologue.
@@ -787,6 +820,13 @@ impl I686Codegen {
             let callee_saved_bytes = self.used_callee_saved.len() as i64 * 4;
             self.frame_base_offset = callee_saved_bytes + frame_size;
             self.esp_adjust = 0;
+        }
+        // Save before parameter homes or instrumentation can use scratch
+        // registers. Stack allocation preserves EAX even during probing.
+        if let Some(slot) = self.incoming_chain_slot {
+            let reg = if self.is_fastcall { "eax" } else { "ecx" };
+            let home = self.slot_ref(slot);
+            emit!(self.state, "    movl %{}, {}", reg, home);
         }
     }
 
@@ -1945,15 +1985,54 @@ impl I686Codegen {
             self.state.emit("    vzeroupper");
         }
         self.emit_epilogue(frame_size);
-        if self.state.uses_sret && self.vector_ret_buffer_bytes == 0 && self.regparm == 0 {
+        let cleanup = if self.is_fastcall && !self.is_variadic {
+            // Fastcall owns the whole compacted argument area, including
+            // sret calls whose hidden pointer is in ECX, not on the stack.
+            self.fastcall_stack_cleanup
+        } else if self.state.uses_sret && self.vector_ret_buffer_bytes == 0 && self.regparm == 0 {
             // i386 SysV sret: callee pops the hidden pointer.
             // Under -mregparm>=1 the hidden pointer travels in %eax (GCC
             // function_value semantics) — nothing is on the stack to pop.
-            self.state.emit("    ret $4");
-        } else if self.is_fastcall && !self.is_variadic && self.fastcall_stack_cleanup > 0 {
-            // Variadic fastcall callees receive everything on the stack and
-            // pop nothing (plain `ret`); the caller owns the cleanup.
-            emit!(self.state, "    ret ${}", self.fastcall_stack_cleanup);
+            4
+        } else {
+            0
+        };
+        if self.state.function_return_thunk {
+            if cleanup == 0 {
+                self.state.emit("    jmp __x86_return_thunk");
+            } else if self.current_return_i686_ext_vector_gp3 {
+                // ECX is the third return lane, so it cannot carry the PC.
+                // Relocate the PC over the dead argument area while preserving
+                // every return register, then use the ordinary stack thunk.
+                self.state.emit("    pushl %eax");
+                if self.state.emit_cfi {
+                    self.state.emit("    .cfi_adjust_cfa_offset 4");
+                }
+                self.state.emit("    movl 4(%esp), %eax");
+                emit!(self.state, "    movl %eax, {}(%esp)", cleanup + 4);
+                self.state.emit("    popl %eax");
+                emit!(self.state, "    leal {}(%esp), %esp", cleanup);
+                if self.state.emit_cfi {
+                    emit!(self.state, "    .cfi_def_cfa_offset {}", 4 - cleanup as i64);
+                }
+                self.state.emit("    jmp __x86_return_thunk");
+            } else {
+                // GCC's external-thunk ABI for RET imm16: ECX carries the
+                // return PC, with the callee-cleaned arguments already gone.
+                // Preserve EAX:EDX (including aggregate/scalar return values).
+                self.state.emit("    popl %ecx");
+                if self.state.emit_cfi {
+                    self.state.emit("    .cfi_register 8, 1");
+                    self.state.emit("    .cfi_def_cfa_offset 0");
+                }
+                emit!(self.state, "    leal {}(%esp), %esp", cleanup);
+                if self.state.emit_cfi {
+                    emit!(self.state, "    .cfi_def_cfa_offset -{}", cleanup);
+                }
+                self.state.emit("    jmp __x86_return_thunk_ecx");
+            }
+        } else if cleanup != 0 {
+            emit!(self.state, "    ret ${}", cleanup);
         } else {
             self.state.emit("    ret");
         }

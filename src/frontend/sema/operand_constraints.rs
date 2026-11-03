@@ -837,6 +837,7 @@ mod tests {
         let p = ptr(CType::Int);
         let arr = CType::Array(Box::new(CType::Int), Some(3));
         let func = CType::Function(Box::new(crate::common::types::FunctionType {
+            calling_convention: crate::common::types::CallingConvention::Default,
             return_type: CType::Int,
             params: Vec::new(),
             variadic: false,
@@ -1000,6 +1001,7 @@ mod tests {
             "int (*)[3]"
         );
         let f = CType::Function(Box::new(crate::common::types::FunctionType {
+            calling_convention: crate::common::types::CallingConvention::Default,
             return_type: CType::Int,
             params: vec![(CType::Int, None)],
             variadic: false,
@@ -1010,6 +1012,7 @@ mod tests {
         assert_eq!(
             type_name(&CType::Function(Box::new(
                 crate::common::types::FunctionType {
+                    calling_convention: crate::common::types::CallingConvention::Default,
                     return_type: CType::Void,
                     params: Vec::new(),
                     variadic: true,
@@ -1026,6 +1029,7 @@ mod tests {
         // An enumeration quotes its compatible type once promoted, so the
         // enum spelling itself only matters for a bare `type_name` call.
         let e = CType::Enum(EnumType {
+            identity: None,
             name: Some("E".into()),
             variants: vec![("A".into(), 0)],
             is_packed: false,

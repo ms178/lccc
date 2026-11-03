@@ -202,6 +202,7 @@ fn propagate_invariant_fn_ptr_params(
     func_tables: &[(ValueDefTable, FxHashMap<Value, Value>)],
 ) -> FxHashMap<(String, usize), String> {
     let (value_referenced, asm_templates) = collect_value_referenced_functions(module);
+    let asm_context = module.asm_symbol_context();
     let mut eligible_callees: FxHashMap<String, Vec<bool>> = module
         .functions
         .iter()
@@ -211,7 +212,12 @@ fn propagate_invariant_fn_ptr_params(
                 && !f.is_weak
                 && !f.is_variadic
                 && !module.asm_labels.contains_key(&f.name)
-                && !function_referenced_as_value(&f.name, &value_referenced, &asm_templates)
+                && !function_referenced_as_value(
+                    &f.name,
+                    &value_referenced,
+                    &asm_templates,
+                    &asm_context,
+                )
         })
         .map(|f| {
             let scalar_params = f
@@ -325,6 +331,7 @@ pub(super) fn devirtualize_constant_indirect_calls(
     struct Target {
         params: Vec<IrType>,
         return_type: IrType,
+        calling_convention: crate::common::types::CallingConvention,
         is_fastcall: bool,
         regparm: Option<u8>,
     }
@@ -349,6 +356,7 @@ pub(super) fn devirtualize_constant_indirect_calls(
                 Target {
                     params: f.params.iter().map(|p| p.ty).collect(),
                     return_type: f.return_type,
+                    calling_convention: f.calling_convention,
                     is_fastcall: f.is_fastcall,
                     regparm: f.regparm,
                 },
@@ -411,6 +419,7 @@ pub(super) fn devirtualize_constant_indirect_calls(
                     && info.arg_types == target.params
                     && info.num_fixed_args == target.params.len()
                     && info.return_type == target.return_type
+                    && info.calling_convention == target.calling_convention
                     && info.is_fastcall == target.is_fastcall
                     && info.regparm == target.regparm;
                 if scalar_abi {
