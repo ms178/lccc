@@ -272,7 +272,7 @@ mod tests {
     fn fused_stack_division_matches_unfused_on_hardware() {
         use std::process::Command;
 
-        let body = "movq -8(%rsp), %rax\nxorq %rdx, %rdx\ndivq %rsi\nmovq %rdx, %r8\nmovq -8(%rsp), %rax\nxorq %rdx, %rdx\ndivq %rsi\nxorq %r8, %rax\nret\n";
+        let body = "movq -8(%rsp), %rax\nxorq %rdx, %rdx\ndivq %rsi\nmovq %rdx, %r8\nmovq %rax, -24(%rsp)\ncmpq %r8, %rdi\nmovq -8(%rsp), %rax\nxorq %rdx, %rdx\ndivq %rsi\nxorq %r8, %rax\nret\n";
         let (changed, fused) = apply(body);
         assert!(changed);
         assert_eq!(fused.matches("divq").count(), 1);
