@@ -38,12 +38,21 @@ MACROS = sorted({m for _, m in GEN.FEATURE_MACROS} | {m for _, m in GEN.EXTRA_MA
 OPTIONS = sorted({GEN.OPTION_NAMES[v] for v, _ in GEN.FEATURE_MACROS}
                  | {o for _, _, o, _ in GEN.PSEUDO} | set(GEN.EXTRA_OPTIONS)
                  | set(GEN.EXTRA_OPTION_NAMES.values()))
-# Deliberate divergences, each with its reason (flags -> macros lccc omits):
-# GCC keeps announcing AES, PCLMUL and GFNI with the SSE register file off
-# but rejects their intrinsics there (they need SSE2): lccc's macros only
-# promise intrinsics that compile.
-FORKS = {'__AES__', '__PCLMUL__', '__GFNI__'}
-SSE_OFF = ('-mno-sse', '-mno-sse2', '-mgeneral-regs-only')
+# Deliberate divergences, each with its reason. AES/PCLMUL/GFNI used to be one
+# (GCC announces them with the SSE register file off while rejecting their
+# intrinsics there); lccc now matches GCC's announcement and keeps the SSE2
+# requirement in the intrinsic gate instead, so that fork is gone and a
+# regression on it fails this script again.
+#
+# The one remaining row is an option-layer cascade, not a capability
+# difference: GCC's `-mno-xsave` clears MASK_AVX without cascading into the
+# dependent option bits, so `-march=clearwaterforest -mno-xsave` still
+# announces SHA512/SM3/SM4 while GCC rejects those intrinsics there (their
+# guards need `__AVX__`). lccc drops the announcement with the instruction
+# class it needs — stricter, never weaker.
+ROW_EXCLUSIONS = {
+    ('-march=clearwaterforest', '-mno-xsave'): {'__SHA512__', '__SM3__', '__SM4__'},
+}
 # Refused with a diagnostic, as documented: lccc has no AVX10 code generation.
 REFUSED = {'avx10.1', 'avx10.2'}
 ENV = dict(os.environ, LC_ALL='C')
@@ -119,8 +128,8 @@ def main():
         if got is None:
             refused = any(f.removeprefix('-m').removeprefix('no-') in unmodelled | REFUSED for f in flags[-2:])
             return flags, 'lccc-rejects', refused
-        if any(f in SSE_OFF for f in flags):
-            want, got = want - FORKS, got - FORKS
+        excluded = ROW_EXCLUSIONS.get(tuple(flags), set())
+        want, got = want - excluded, got - excluded
         return flags, (sorted(want - got), sorted(got - want)), want == got
 
     total = failed = 0

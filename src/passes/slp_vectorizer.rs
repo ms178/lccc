@@ -51,7 +51,7 @@ use crate::ir::ops::{IrBinOp, IrCmpOp, IrUnaryOp};
 use crate::ir::reexports::IrFunction;
 use crate::passes::CfgAnalysis;
 use crate::passes::vectorize::{
-    x86_avx2_available_pub, x86_simd_available_pub, x86_sse41_available_pub,
+    x86_avx2_available_pub, x86_prefer_wide_pub, x86_simd_available_pub, x86_sse41_available_pub,
 };
 
 /// Hashable lane encoding for pack dedup. Exact — no lossy constant
@@ -2061,7 +2061,10 @@ fn is_memory_access(inst: &Instruction) -> bool {
 /// consecutive offsets at the lane stride, longest first.
 fn collect_seed_candidates(ctx: &BlockCtx) -> Vec<SeedCandidate> {
     let block = ctx.block;
-    let avx2 = x86_avx2_available_pub();
+    // The SLP driver's width choice honours `-mprefer-vector-width=`. The
+    // shared `family_for`/`packed_*` helpers keep the raw hardware permission
+    // because the frontend's explicit `vector_size` lowering calls them too.
+    let avx2 = x86_avx2_available_pub() && x86_prefer_wide_pub();
     // (base, var, mult, ty) → Vec<(off, store_idx, val, ptr)>
     let mut streams: FxHashMap<(u32, Option<u32>, u64, IrType), Vec<(i64, usize, Operand, Value)>> =
         FxHashMap::default();

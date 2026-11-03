@@ -126,22 +126,49 @@ def main(argv):
     # macros are compared: the unmodeled list printed below is the documented
     # gap, and within the modeled set a macro must never disagree with GCC
     # about whether it is on.
+    # The POPCNT rows encode GCC's unwind rule: an `-mno-sse4.2` (or
+    # `-mno-sse4.1`, `-mno-sse2`, `-mno-sse`) denial withdraws the
+    # AVX-implied SSE4.2 level *and* the POPCNT that rides on it, while an
+    # explicit `-mpopcnt`/`-mabm` grant and a `-march=` row survive in either
+    # order. The ladder-independence rows pin the measured split between the
+    # announcement and the intrinsic gate: `-mno-sse`/`-mno-sse2`/
+    # `-mgeneral-regs-only` keep `__AES__`/`__PCLMUL__`/`__GFNI__` standing
+    # while the SSE macros go away, and the XSAVE rows pin its own bit
+    # (Goldmont/Tremont/Lujiazui/Bobcat carry it without AVX, and
+    # `-mno-xsave` takes AVX down with it in GCC).
     flag_rows = (
         '-msse4.2', '-msse4.2 -mno-sse4.2', '-mno-sse4.2 -msse4.2',
         '-mavx', '-mavx -mno-sse4.2', '-mno-sse4.2 -mavx', '-mavx2',
         '-mfma', '-mno-sse2 -mavx2', '-mavx512f', '-mavx512vl',
         '-mavx512f -mavx512vl', '-mavx512vl -mno-avx512vl',
         '-march=x86-64-v3 -mno-sse4.2', '-march=x86-64-v4 -mno-avx512vl',
+        '-mpopcnt -mavx -mno-sse4.2', '-mavx -mno-sse4.2 -mpopcnt',
+        '-msse4.2 -mno-popcnt', '-mno-popcnt -msse4.2',
+        '-mno-sse4.1 -msse4.2', '-msse4.2 -mno-sse4.1',
+        '-mabm -mno-sse4.2', '-march=amdfam10 -mno-sse4.2',
+        '-march=x86-64-v3 -mno-sse4.2', '-mno-sse4.2 -march=x86-64-v3',
+        '-mxsave', '-mno-xsave', '-mavx -mno-xsave', '-mno-xsave -mavx',
+        '-mno-xsave -mxsave', '-mxsave -mno-xsave',
+        '-mno-xsave -march=x86-64-v3', '-march=x86-64-v3 -mno-xsave -mavx',
+        '-march=goldmont -mno-xsave', '-mno-xsave -march=goldmont',
+        '-mno-sse -maes', '-mno-sse2 -mpclmul', '-mno-sse -mgfni',
+        '-march=skylake -mno-sse', '-mno-sse -march=skylake',
+        '-march=goldmont -mno-sse2', '-mno-sse2 -march=goldmont',
+        '-march=znver4 -mno-sse', '-mno-sse -march=znver4',
+        '-mgeneral-regs-only -march=haswell', '-mgeneral-regs-only -maes',
     )
-    # One documented row divergence, excluded rather than "fixed" into a false
-    # denial: `-mavx -mno-sse4.2` makes GCC reset the AVX-implied SSE4.2 level
-    # and, with it, `__POPCNT__` (`-mavx` defines it, the later `-mno-sse4.2`
-    # removes it; measured). lccc answers the capability question instead --
-    # POPCNT exists on every AVX CPU, its lowering is resolved-popcnt-gated,
-    # and `-mno-popcnt -mavx` turns it off in both compilers -- so lccc keeps
-    # the macro, which is true of the code it emits. Undefining it would claim
-    # the instruction is unavailable when the backend will happily emit it.
-    flag_row_divergences = {('-mavx -mno-sse4.2', '__POPCNT__')}
+    # One measured divergence, kept out of the comparison instead of being
+    # "fixed" into a false announcement. GCC's `-mno-xsave` clears MASK_AVX
+    # without cascading into the dependent option bits, so a `-march=` row that
+    # granted SHA512/SM3/SM4 keeps announcing them while GCC itself rejects
+    # every one of those intrinsics there (measured: `-march=clearwaterforest
+    # -mno-xsave` + `_mm256_sha512msg1_epi64` is an implicit-declaration error).
+    # lccc's extension model drops an announcement together with the
+    # instruction class it needs, which is the stricter and safer direction:
+    # no `#ifdef` can be told about an instruction this target cannot emit.
+    flag_row_exclusions = {
+        '-march=clearwaterforest -mno-xsave': {'__SHA512__', '__SM3__', '__SM4__'},
+    }
     flag_cases = 0
     for flags in flag_rows:
         args = flags.split()
@@ -152,9 +179,9 @@ def main(argv):
             print(f'FAIL {label}: {"gcc" if g is None else "lccc"} rejects it')
             fails += 1
             continue
-        waived = {m for row, m in flag_row_divergences if row == flags}
-        gs = {m for m in g if m in modeled} - waived
-        ls = {m for m in l if m in modeled} - waived
+        excluded = flag_row_exclusions.get(flags, set())
+        gs = {m for m in g if m in modeled} - excluded
+        ls = {m for m in l if m in modeled} - excluded
         if gs != ls:
             print(f'FAIL {label}: ISA lccc-only {sorted(ls - gs)} gcc-only {sorted(gs - ls)}')
             fails += 1

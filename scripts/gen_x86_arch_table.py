@@ -53,6 +53,7 @@ FEATURE_MACROS = [
     ('Sse42', '__SSE4_2__'),
     ('Popcnt', '__POPCNT__'),
     ('Cx16', '__GCC_HAVE_SYNC_COMPARE_AND_SWAP_16'),
+    ('Xsave', '__XSAVE__'),
     ('Avx', '__AVX__'),
     ('Avx2', '__AVX2__'),
     ('Fma', '__FMA__'),
@@ -90,6 +91,7 @@ FEATURE_MACROS = [
 OPTION_NAMES = {
     'Fxsr': 'fxsr', 'Mmx': 'mmx', 'Sse': 'sse', 'Sse2': 'sse2', 'Sse3': 'sse3',
     'Ssse3': 'ssse3', 'Sse41': 'sse4.1', 'Sse42': 'sse4.2', 'Popcnt': 'popcnt',
+    'Xsave': 'xsave',
     'Cx16': 'cx16', 'Avx': 'avx', 'Avx2': 'avx2', 'Fma': 'fma', 'F16c': 'f16c',
     'Bmi': 'bmi', 'Bmi2': 'bmi2', 'Lzcnt': 'lzcnt', 'Movbe': 'movbe', 'Aes': 'aes',
     'Pclmul': 'pclmul', 'Rdrnd': 'rdrnd', 'Vaes': 'vaes', 'Vpclmulqdq': 'vpclmulqdq',

@@ -897,6 +897,29 @@ impl Preprocessor {
         }
     }
 
+    /// Define `__XSAVE__` for the active x86 target.
+    ///
+    /// XSAVE is its own CPUID bit (leaf 1, ECX 26) with its own `-mxsave`
+    /// flag, and it is *not* implied by AVX: Goldmont, Goldmont Plus,
+    /// Tremont, Lujiazui and Bobcat (`btver1`) carry it without AVX, while
+    /// `-mavx -mno-xsave` keeps AVX and drops it — so deriving the macro from
+    /// the AVX level, as an earlier draft of this gate did, is wrong in both
+    /// directions (measured, gcc-16.2 `-dM -E`, six `(CPU, mode)` rows
+    /// diverged). The driver resolves the bit from the `-march=` row and the
+    /// `-mxsave`/`-mno-xsave` pair. No-op on non-x86 targets, like
+    /// [`Self::set_fxsr_macro`].
+    pub fn set_xsave_macro(&mut self, on: bool) {
+        let is_x86 = self.macros.is_defined("__x86_64__") || self.macros.is_defined("__i386__");
+        if !is_x86 {
+            return;
+        }
+        if on {
+            self.define_simple_macro("__XSAVE__", "1");
+        } else {
+            self.macros.undefine("__XSAVE__");
+        }
+    }
+
     /// Define extended SIMD feature macros (__SSE3__, __AVX__, __AVX2__, etc.)
     /// when the corresponding -msse3, -mavx, -mavx2 flags are passed.
     /// Projects like blosc use #ifdef __AVX2__ to select optimized code paths.
