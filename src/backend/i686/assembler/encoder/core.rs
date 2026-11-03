@@ -1000,8 +1000,13 @@ impl super::InstructionEncoder {
         let folded = fold_index_into_base(mem);
         let mem = folded.as_ref().unwrap_or(mem);
         let (displacement, relocation) = i686_memory_displacement(&mem.displacement);
+        // A base-less address has no register spelling to select its size.
+        // In .code32, an explicit addr16 therefore must select the disp16
+        // ModR/M form, not merely prepend 0x67 to a disp32 encoding.
+        let address16_default =
+            self.code16 || (self.explicit_addr16 && mem.base.is_none() && mem.index.is_none());
         let mut plan = i686_plan_memory_address(
-            self.code16,
+            address16_default,
             reg_field,
             mem.base.as_ref().map(|reg| reg.name.as_str()),
             mem.index.as_ref().map(|reg| reg.name.as_str()),

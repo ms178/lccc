@@ -70,3 +70,52 @@ jecxz far_bwd
 .text
 .globl ext
 .long 9f - ext
+
+;;; counter_width_code32
+.text
+jcxz 1f
+jecxz 1f
+nop
+1: jcxz 1b
+jecxz ext_counter32
+jcxz ext_counter16
+
+;;; counter_width_code16
+.text
+.code16
+jcxz 1f
+jecxz 1f
+loop 1f
+nop
+1: jcxz 1b
+jecxz ext_counter32
+jcxz ext_counter16
+loop ext_loop16
+
+;;; counter_width_code16gcc
+.text
+.code16gcc
+jcxz 1f
+jecxz 1f
+loop 1f
+nop
+1: jecxz 1b
+
+;;; counter_width_duplicate_prefix reject
+.text
+addr16 jcxz target
+target: nop
+
+;;; counter_width_mixed_case
+.text
+JcXz 1f
+JECXZ 1f
+LoOp 1f
+nop
+1: JcXz 1b
+.code16
+JcXz 2f
+JECXZ 2f
+LoOp 2f
+nop
+2: JECXZ 2b

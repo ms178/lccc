@@ -39,18 +39,18 @@ impl super::InstructionEncoder {
                 return self.encode_mov_cr(ops);
             }
             if is_segment_reg(&r1.name) || is_segment_reg(&r2.name) {
-                return self.encode_mov_seg(ops);
+                return self.encode_mov_seg(ops, size);
             }
         }
         // Check for segment register moves involving memory
         if let (Operand::Register(r), Operand::Memory(_)) = (&ops[0], &ops[1]) {
             if is_segment_reg(&r.name) {
-                return self.encode_mov_seg(ops);
+                return self.encode_mov_seg(ops, size);
             }
         }
         if let (Operand::Memory(_), Operand::Register(r)) = (&ops[0], &ops[1]) {
             if is_segment_reg(&r.name) {
-                return self.encode_mov_seg(ops);
+                return self.encode_mov_seg(ops, size);
             }
         }
 
@@ -235,6 +235,9 @@ impl super::InstructionEncoder {
         }
         // Infer size from register operands
         let size = match (&ops[0], &ops[1]) {
+            (Operand::Register(seg), Operand::Register(gp)) if is_segment_reg(&seg.name) => {
+                reg_size(&gp.name)
+            }
             (Operand::Register(r), _) => reg_size(&r.name),
             (_, Operand::Register(r)) => reg_size(&r.name),
             _ => 4, // default to 32-bit

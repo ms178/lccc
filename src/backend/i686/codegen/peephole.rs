@@ -14641,6 +14641,67 @@ fn else_hoist_diamonds(asm: String) -> String {
     lines.join("\n")
 }
 
+/// Materialize a terminal boolean directly in EAX without a dependent MOVZX.
+/// The compare is register/immediate only and must not read any EAX alias:
+/// zeroing EAX moves before it. ECX is caller-saved on i386; EDX (which can
+/// carry the high half of a return value) is deliberately never changed.
+/// Require literal adjacency so labels, asm, CFI and opaque bytes cannot be
+/// crossed or rearranged by this late pass.
+fn materialize_return_bool_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    for i in 0..infos.len().saturating_sub(3) {
+        if infos[i].kind != LineKind::Cmp
+            || infos[i + 1].kind != (LineKind::SetCC { reg: REG_ECX })
+            || !matches!(infos[i + 3].kind, LineKind::Ret | LineKind::RetN)
+        {
+            continue;
+        }
+        let cmp = trimmed(store, &infos[i], i);
+        let Some((op, args)) = cmp.split_once(' ') else {
+            continue;
+        };
+        if !matches!(op, "cmpb" | "cmpw" | "cmpl" | "testb" | "testw" | "testl") {
+            continue;
+        }
+        let Some((left, right)) = args.split_once(',') else {
+            continue;
+        };
+        let safe_operand = |operand: &str| {
+            let operand = operand.trim();
+            if operand.starts_with('%') {
+                let family = register_family(operand);
+                family != REG_NONE && family != REG_EAX
+            } else if let Some(imm) = operand.strip_prefix('$') {
+                imm.parse::<i32>().is_ok()
+            } else {
+                false
+            }
+        };
+        if !safe_operand(left) || !safe_operand(right) {
+            continue;
+        }
+        let set = trimmed(store, &infos[i + 1], i + 1);
+        let Some(cc) = parse_setcc(set) else { continue };
+        if set.split_once(' ').map(|(_, operand)| operand.trim()) != Some("%cl")
+            || trimmed(store, &infos[i + 2], i + 2) != "movzbl %cl, %eax"
+            || infos[i + 2].is_nop()
+            || infos[i + 2].kind == LineKind::InlineAsm
+        {
+            continue;
+        }
+        let cmp = format!("    {cmp}");
+        let set = format!("    set{cc} %al");
+        store.replace(i, "    xorl %eax, %eax".to_string());
+        store.replace(i + 1, cmp);
+        store.replace(i + 2, set);
+        for n in i..=i + 2 {
+            infos[n] = classify_line_ctx(store.get(n), infos[n].ebp_gpr);
+        }
+        changed = true;
+    }
+    changed
+}
+
 // ── Main entry point ─────────────────────────────────────────────────────────
 
 /// Run peephole optimization on i686 assembly text.
@@ -14958,6 +15019,8 @@ pub fn peephole_optimize(asm: String) -> String {
     let _ = fold_zext_pair_reg_compare(&mut store, &mut infos);
     let _ = fold_copy_subreg_extend(&mut store, &mut infos);
     let _ = narrow_dead_and_to_testb(&mut store, &mut infos);
+
+    let _ = materialize_return_bool_i686(&mut store, &mut infos);
 
     // Phase 6: select-diamond else-hoist runs on the FINAL text — earlier
     // passes shape the diamond (fusing the flag producer, folding prep)
@@ -16185,6 +16248,44 @@ mod tests {
         assert_eq!(invert_cc("nc"), Some("b"));
         assert_eq!(parse_setcc("setc %al"), Some("c"));
         assert_eq!(parse_setcc("setnc %al"), Some("nc"));
+    }
+
+    #[test]
+    fn terminal_boolean_materialization_is_guarded() {
+        fn run(body: &str) -> (bool, String) {
+            let mut store = LineStore::new(body.to_string());
+            let mut infos = classify_all(&store);
+            pin_inline_asm_regions(&store, &mut infos);
+            let changed = materialize_return_bool_i686(&mut store, &mut infos);
+            (changed, store.build_result(|i| infos[i].is_nop()))
+        }
+
+        for ret in ["ret", "ret $4"] {
+            let body = format!("cmpl $0, %edx\nsetne %cl\nmovzbl %cl, %eax\n{ret}\n");
+            let (changed, output) = run(&body);
+            assert!(changed, "{output}");
+            assert!(output.contains("xorl %eax, %eax\n    cmpl $0, %edx\n    setne %al"));
+            assert!(output.contains(ret));
+        }
+        // Deleted lines retain their original text in the store; never
+        // resurrect a previously removed extension based on that stale text.
+        let mut store =
+            LineStore::new("cmpl $0, %edx\nsetne %cl\nmovzbl %cl, %eax\nret\n".to_string());
+        let mut infos = classify_all(&store);
+        infos[2].kind = LineKind::Nop;
+        assert!(!materialize_return_bool_i686(&mut store, &mut infos));
+
+        for body in [
+            "cmpl %eax, %edx\nsetne %cl\nmovzbl %cl, %eax\nret\n",
+            "testb %ah, %ah\nsetne %cl\nmovzbl %cl, %eax\nret\n",
+            "cmpl (%ecx), %edx\nsetne %cl\nmovzbl %cl, %eax\nret\n",
+            "cmpl $0, %edx\nsetne %dl\nmovzbl %dl, %eax\nret\n",
+            "cmpl $0, %edx\nsetne %cl\nmovzbl %cl, %eax\n.Ltarget:\nret\n",
+            "#APP\ncmpl $0, %edx\nsetne %cl\nmovzbl %cl, %eax\nret\n#NO_APP\n",
+        ] {
+            let (changed, _) = run(body);
+            assert!(!changed, "unexpected fold: {body}");
+        }
     }
 
     #[test]

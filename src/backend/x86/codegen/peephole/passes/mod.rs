@@ -58,6 +58,7 @@ mod relay_and_lea;
 mod return_bool;
 mod return_home;
 mod self_zext;
+mod sext_test;
 mod sign_test;
 mod spill_deref;
 mod store_forwarding;
@@ -2384,6 +2385,10 @@ fn peephole_optimize_inner(
     // shortened text rather than a mask they would have to look through.
     if !sk("mask_test") {
         mask_test::fold_inplace_mask_test(&mut store, &mut infos);
+    }
+
+    if !sk("sext_test") {
+        sext_test::run(&mut store, &mut infos);
     }
 
     if !sk("return_bool") {

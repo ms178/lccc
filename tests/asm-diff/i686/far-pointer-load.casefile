@@ -1,0 +1,35 @@
+;;; far_pointer_32
+.text
+.code32
+les (%eax),%ax
+les (%eax),%eax
+ldsw 4(%ebx),%cx
+ldsl 4(%ebx),%ecx
+lfs (%esi),%edx
+lgsw (%edi),%dx
+lssl 8(%ebp),%ebx
+les symbol,%eax
+addr16 les symbol,%eax
+addr16 lfs 0x1234,%cx
+
+;;; far_pointer_16
+.text
+.code16
+les (%bx),%ax
+lesl (%bx),%eax
+ldsw 4(%bx,%si),%cx
+ldsl 4(%ebx),%ecx
+lfs (%si),%edx
+lgsw (%di),%dx
+lssl 8(%bp),%ebx
+les symbol,%eax
+
+;;; far_pointer_bad_register reject
+.text
+les (%eax),%al
+;;; far_pointer_bad_source reject
+.text
+les %eax,%eax
+;;; far_pointer_bad_suffix reject
+.text
+lesw (%eax),%eax
