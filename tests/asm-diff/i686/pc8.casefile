@@ -105,3 +105,17 @@ nop
 .text
 addr16 jcxz target
 target: nop
+
+;;; counter_width_mixed_case
+.text
+JcXz 1f
+JECXZ 1f
+LoOp 1f
+nop
+1: JcXz 1b
+.code16
+JcXz 2f
+JECXZ 2f
+LoOp 2f
+nop
+2: JECXZ 2b

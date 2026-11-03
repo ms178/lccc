@@ -416,9 +416,7 @@ impl super::InstructionEncoder {
             "eax" | "ecx" | "edx" | "ebx" | "esp" | "ebp" | "esi" | "edi" => 4,
             _ => return Err("invalid far pointer destination".to_string()),
         };
-        if (mnemonic.ends_with('w') && width != 2)
-            || (mnemonic.ends_with('l') && width != 4)
-        {
+        if (mnemonic.ends_with('w') && width != 2) || (mnemonic.ends_with('l') && width != 4) {
             return Err("far pointer destination width mismatch".to_string());
         }
         let mut normalized;

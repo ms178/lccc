@@ -34,7 +34,8 @@ impl X86Arch for I686Arch {
         let jump = {
             // `.s`-tolerant matching (see the x86-64 writer): `jmp.s`
             // relaxes exactly like `jmp`.
-            let mnem: &str = instr.mnemonic.strip_suffix(".s").unwrap_or(&instr.mnemonic);
+            let mnem_lower = instr.mnemonic.to_ascii_lowercase();
+            let mnem: &str = mnem_lower.strip_suffix(".s").unwrap_or(&mnem_lower);
             let is_jump =
                 mnem == "jmp" || mnem == "loop" || (mnem.starts_with('j') && mnem.len() >= 2);
             if is_jump && instr.operands.len() == 1 {
@@ -330,7 +331,8 @@ fn code16_encode_inner(
 
     let instr_len = encoder.bytes.len();
     let jump = {
-        let mnem: &str = instr.mnemonic.strip_suffix(".s").unwrap_or(&instr.mnemonic);
+        let mnem_lower = instr.mnemonic.to_ascii_lowercase();
+        let mnem: &str = mnem_lower.strip_suffix(".s").unwrap_or(&mnem_lower);
         let is_jump = mnem == "loop" || (mnem.starts_with('j') && mnem.len() >= 2);
         if is_jump && instr.operands.len() == 1 {
             if let Operand::Label(_) = &instr.operands[0] {
@@ -347,7 +349,7 @@ fn code16_encode_inner(
                         already_short: true,
                         prefix66: false,
                     })
-                } else if instr_len == expected_len {
+                } else if !is_short_only && instr_len == expected_len {
                     Some(JumpDetection {
                         is_conditional,
                         already_short: false,
