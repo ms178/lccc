@@ -270,6 +270,32 @@ impl Driver {
             self.process_force_includes(&mut preprocessor)
                 .map_err(|e| format!("Preprocessing {} failed: {}", input_file, e))?;
             let preprocessed = preprocessor.preprocess(&source);
+            // `#warning` and `#pragma GCC warning` are reported for a `.S`
+            // file exactly as for C (gcc-16.2 prints both; `-Wcpp`, `-w` and
+            // `-Werror` apply); `#pragma message` is not, because GCC
+            // evaluates it in the C front end, which never sees assembly.
+            let pragma_warnings = preprocessor
+                .pragma_diagnostics()
+                .iter()
+                .any(|d| d.severity != crate::frontend::preprocessor::PragmaSeverity::Note);
+            if !preprocessor.warnings().is_empty() || pragma_warnings {
+                let mut source_manager = crate::common::source::SourceManager::new();
+                source_manager.add_file(input_file.to_string(), source.clone());
+                source_manager.build_line_map();
+                let mut diagnostics = crate::common::error::DiagnosticEngine::new();
+                diagnostics.set_warning_config(self.effective_warning_config());
+                diagnostics.set_color_mode(self.color_mode);
+                diagnostics.set_source_manager(source_manager);
+                self.emit_preprocessor_warnings(&preprocessor, &mut diagnostics);
+                Self::emit_pragma_diagnostics(&preprocessor, &mut diagnostics, false);
+                if diagnostics.has_errors() {
+                    return Err(format!(
+                        "{} preprocessor warning(s) promoted by -Werror in {}",
+                        diagnostics.error_count(),
+                        input_file
+                    ));
+                }
+            }
             // A missing #include in a .S file is fatal — GCC aborts the
             // assembly with "No such file or directory".  Silently
             // continuing once let the kernel's header.S compile with an

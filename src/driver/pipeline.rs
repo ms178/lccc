@@ -14,7 +14,7 @@ use crate::common::error::{ColorMode, DiagnosticEngine, WarningConfig};
 use crate::common::source::SourceManager;
 use crate::frontend::lexer::Lexer;
 use crate::frontend::parser::Parser;
-use crate::frontend::preprocessor::Preprocessor;
+use crate::frontend::preprocessor::{PragmaSeverity, Preprocessor};
 use crate::frontend::sema::SemanticAnalyzer;
 use crate::ir::lowering::Lowerer;
 use crate::ir::mem2reg::{eliminate_phis, promote_allocas};
@@ -1178,7 +1178,14 @@ impl Driver {
                 // its preprocessed text still streams to stdout —
                 // measured). -Werror promotion fails the run just like a
                 // syntax check.
-                if !preprocessor.warnings().is_empty() {
+                // `#pragma GCC warning` is evaluated here too (libcpp runs it
+                // under `-E`); `#pragma message` notes are not (GCC's C front
+                // end evaluates that pragma, and `-E` never reaches it).
+                let pragma_warnings = preprocessor
+                    .pragma_diagnostics()
+                    .iter()
+                    .any(|d| d.severity != PragmaSeverity::Note);
+                if !preprocessor.warnings().is_empty() || pragma_warnings {
                     let mut source_manager = SourceManager::new();
                     source_manager.add_file(filename.to_string(), source.clone());
                     source_manager.build_line_map();
@@ -1187,6 +1194,7 @@ impl Driver {
                     diagnostics.set_color_mode(self.color_mode);
                     diagnostics.set_source_manager(source_manager);
                     self.emit_preprocessor_warnings(&preprocessor, &mut diagnostics);
+                    Self::emit_pragma_diagnostics(&preprocessor, &mut diagnostics, false);
                     if diagnostics.has_errors() {
                         return Err(format!(
                             "{} preprocessor warning(s) promoted by -Werror in {}",
@@ -1238,7 +1246,7 @@ impl Driver {
     /// kind, so `-Wcpp`/`-Wno-cpp`/`-Werror=cpp` control them exactly as
     /// GCC does. Shared by every path that preprocesses without going
     /// through `parse_and_analyze_c_tu`, which has the same drain inline.
-    fn emit_preprocessor_warnings(
+    pub(super) fn emit_preprocessor_warnings(
         &self,
         preprocessor: &Preprocessor,
         diagnostics: &mut DiagnosticEngine,
@@ -1250,6 +1258,30 @@ impl Driver {
             )
             .with_location(&warn.file, warn.line, warn.col);
             diagnostics.emit(&diag);
+        }
+    }
+
+    /// Emit the message pragmas' diagnostics in source order:
+    /// `#pragma GCC warning` as a warning no `-W` option controls, a
+    /// malformed `#pragma message` under `-Wpragmas`, and -- on the paths
+    /// that go on to parse (`with_notes`) -- `#pragma message` notes.
+    pub(super) fn emit_pragma_diagnostics(
+        preprocessor: &Preprocessor,
+        diagnostics: &mut DiagnosticEngine,
+        with_notes: bool,
+    ) {
+        use crate::common::error::{Diagnostic, WarningKind};
+        for entry in preprocessor.pragma_diagnostics() {
+            let d = &entry.diagnostic;
+            let diag = match entry.severity {
+                PragmaSeverity::Warning => Diagnostic::warning(d.message.clone()),
+                PragmaSeverity::PragmasWarning => {
+                    Diagnostic::warning_with_kind(d.message.clone(), WarningKind::Pragmas)
+                }
+                PragmaSeverity::Note if with_notes => Diagnostic::note(d.message.clone()),
+                PragmaSeverity::Note => continue,
+            };
+            diagnostics.emit(&diag.with_location(&d.file, d.line, d.col));
         }
     }
 
@@ -1335,6 +1367,7 @@ impl Driver {
             // included; `-Wcpp`/`-Wno-cpp`/`-Werror=cpp` control it here
             // for the same reason they do there).
             self.emit_preprocessor_warnings(&preprocessor, &mut diagnostics);
+            Self::emit_pragma_diagnostics(&preprocessor, &mut diagnostics, true);
             self.emit_lexer_diagnostics(&mut lexer, &mut diagnostics);
             let mut parser = Parser::new(tokens);
             parser.set_diagnostics(diagnostics);
@@ -2337,6 +2370,7 @@ impl Driver {
             .with_location(&warn.file, warn.line, warn.col);
             diagnostics.emit(&diag);
         }
+        Self::emit_pragma_diagnostics(&preprocessor, &mut diagnostics, true);
 
         // Check for #error directives and missing #include errors
         let pp_errors = preprocessor.errors();

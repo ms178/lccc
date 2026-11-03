@@ -33,6 +33,20 @@
 #     string as "Ã©" (strlen 4 instead of 2), because each UTF-8 byte was
 #     re-encoded as its own Latin-1 character; `#if defined(X) && 'é' == ...`
 #     had the same defect in the `defined` resolver.
+#  8. The `_Pragma` rescans copy non-ASCII text whole too: a line that formed
+#     `_Pragma` through a macro AND held the identifier `café` came out as
+#     `cafÃ©` ("stray '\302' in program"), and `_Pragma("message(\"é\")")`
+#     de-stringized its operand the same way.
+#  9. The message pragmas, as gcc-16.2 implements them (measured case by
+#     case): `#pragma GCC error "m"` is an error that fails the translation
+#     unit in every mode, `-E` included (it used to be ignored: the unit
+#     compiled); `#pragma GCC warning "m"` is a warning no `-W` option
+#     controls (`-Wno-cpp` keeps it); a non-literal operand is an error for
+#     both; `#pragma message` is macro-expanded, joins adjacent literals,
+#     prints the note `'#pragma message: m'` when parsing (never under `-E`),
+#     and a malformed one is a `-Wpragmas` warning.  A `.S` file reports
+#     `#warning` and `#pragma GCC warning` too (the builtin assembler path
+#     dropped every preprocessor warning) and no `#pragma message` note.
 #
 # Sections 5 and 6 also run the sibling compilers next to $CCC (lccc-i686,
 # lccc-arm, lccc-riscv; override with CCC_I686/CCC_ARM/CCC_RISCV) when present.
@@ -350,6 +364,109 @@ C
 "$CCC" "$tmp/utf8_line.c" -o "$tmp/utf8_line"
 got=$("$tmp/utf8_line")
 [ "$got" = "2 1 1" ] || fail "UTF-8 text on a rewritten line" "got: $got" "want: 2 1 1"
+
+# --- 8. _Pragma rescans keep UTF-8 intact ---------------------------------
+cat >"$tmp/utf8_pragma.c" <<'C'
+#define P _Pragma
+int café = 41; P("GCC diagnostic push") int get(void) { return café + 1; }
+P("GCC diagnostic pop")
+int main(void) { return get() == 42 ? 0 : 1; }
+C
+if out=$("$CCC" -w "$tmp/utf8_pragma.c" -o "$tmp/utf8_pragma" 2>&1); then
+    "$tmp/utf8_pragma" || fail "UTF-8 identifier beside a macro-formed _Pragma" "exit $?"
+else
+    fail "UTF-8 identifier beside a macro-formed _Pragma" "$out"
+fi
+
+# --- 9. the message pragmas -------------------------------------------------
+# Run `$CCC "$@"` with stderr captured into `diag` and its status in `rc`.
+run_diag() {
+    rc=0
+    diag=$("$CCC" "$@" 2>&1 >/dev/null) || rc=$?
+}
+# Assert that `diag` holds the fixed string $2 (label $1).
+want_diag() {
+    if ! grep -qF -- "$2" <<<"$diag"; then
+        fail "$1" "missing: $2" "stderr: $diag"
+    fi
+}
+# Assert that `diag` does not hold the fixed string $2 (label $1).
+deny_diag() {
+    if grep -qF -- "$2" <<<"$diag"; then
+        fail "$1" "unexpected: $2" "stderr: $diag"
+    fi
+}
+
+printf '#pragma GCC error "stop: unsupported configuration"\nint x;\n' >"$tmp/pgerr.c"
+for mode in -c -E -fsyntax-only; do
+    run_diag "$mode" "$tmp/pgerr.c" -o "$tmp/pgerr.out"
+    [ "$rc" -ne 0 ] || fail "#pragma GCC error fails the unit ($mode)" "exit 0"
+    want_diag "#pragma GCC error text ($mode)" "error: stop: unsupported configuration"
+done
+
+printf '#pragma GCC warning "regenerate \\"me\\""\nint x;\n' >"$tmp/pgwarn.c"
+for flags in "" "-Wno-cpp" "-Werror=cpp"; do
+    # shellcheck disable=SC2086 # $flags is one optional word
+    run_diag -c $flags "$tmp/pgwarn.c" -o "$tmp/pgwarn.o"
+    [ "$rc" -eq 0 ] || fail "#pragma GCC warning keeps the unit (${flags:-default})" "exit $rc" "$diag"
+    want_diag "#pragma GCC warning text (${flags:-default})" 'warning: regenerate "me"'
+done
+run_diag -c -Werror "$tmp/pgwarn.c" -o "$tmp/pgwarn.o"
+[ "$rc" -ne 0 ] || fail "-Werror promotes #pragma GCC warning" "exit 0"
+
+for operand in '' 'MSG' '("paren")' 'L"wide"'; do
+    printf '#define MSG "m"\n#pragma GCC warning %s\nint x;\n' "$operand" >"$tmp/pginv.c"
+    run_diag -c "$tmp/pginv.c" -o "$tmp/pginv.o"
+    [ "$rc" -ne 0 ] || fail "invalid #pragma GCC warning operand <$operand> is an error" "exit 0"
+    want_diag "invalid #pragma GCC warning operand <$operand>" "error: invalid '#pragma GCC warning' directive"
+done
+
+cat >"$tmp/pmsg.c" <<'C'
+#define WHO "wor" "ld"
+#pragma message "hello " WHO
+#pragma message ("tab\there\x21")
+_Pragma("message(\"\303\251 \303\274\")")
+#define P _Pragma
+P("message(\"through a macro: é\")")
+#pragma message ""
+int x;
+C
+run_diag -c "$tmp/pmsg.c" -o "$tmp/pmsg.o"
+[ "$rc" -eq 0 ] || fail "#pragma message keeps the unit" "exit $rc" "$diag"
+want_diag "#pragma message expands and joins" "note: '#pragma message: hello world'"
+want_diag "#pragma message decodes escapes" "note: '#pragma message: tab$(printf '\t')here!'"
+want_diag "_Pragma message keeps UTF-8" "note: '#pragma message: é ü'"
+want_diag "macro-formed _Pragma message keeps UTF-8" "note: '#pragma message: through a macro: é'"
+# Four notes: the empty message prints none.
+notes=$(grep -c "note: '#pragma message:" <<<"$diag" || true)
+[ "$notes" -eq 4 ] || fail "#pragma message note count" "got $notes, want 4" "$diag"
+run_diag -E "$tmp/pmsg.c" -o "$tmp/pmsg.i"
+deny_diag "-E prints no #pragma message note" "#pragma message:"
+
+printf '#pragma message\n#pragma message ("x" 1)\n#pragma message ("y") junk\nint x;\n' >"$tmp/pmbad.c"
+run_diag -c "$tmp/pmbad.c" -o "$tmp/pmbad.o"
+[ "$rc" -eq 0 ] || fail "malformed #pragma message only warns" "exit $rc" "$diag"
+want_diag "#pragma message without a string" "warning: expected a string after '#pragma message' [-Wpragmas]"
+want_diag "#pragma message unclosed" "warning: malformed '#pragma message', ignored [-Wpragmas]"
+want_diag "#pragma message junk" "warning: junk at end of '#pragma message' [-Wpragmas]"
+want_diag "#pragma message junk still prints" "note: '#pragma message: y'"
+run_diag -c -Wno-pragmas "$tmp/pmbad.c" -o "$tmp/pmbad.o"
+deny_diag "-Wno-pragmas silences malformed #pragma message" "[-Wpragmas]"
+run_diag -c -Werror=pragmas "$tmp/pmbad.c" -o "$tmp/pmbad.o"
+[ "$rc" -ne 0 ] || fail "-Werror=pragmas promotes a malformed #pragma message" "exit 0"
+want_diag "-Werror=pragmas label" "[-Werror=pragmas]"
+
+# A `.S` file reports `#warning` and `#pragma GCC warning` like C (both used
+# to be dropped by the builtin assembler path) and prints no
+# `#pragma message` note: that pragma belongs to the C front end.
+printf '#warning hi-S\n#pragma GCC warning "pw-S"\n#pragma message "pm-S"\n\tnop\n' >"$tmp/pwarn.S"
+run_diag -c "$tmp/pwarn.S" -o "$tmp/pwarn.o"
+[ "$rc" -eq 0 ] || fail ".S with warnings assembles" "exit $rc" "$diag"
+want_diag ".S #warning" "warning: #warning hi-S [-Wcpp]"
+want_diag ".S #pragma GCC warning" "warning: pw-S"
+deny_diag ".S #pragma message" "pm-S"
+run_diag -c -Werror "$tmp/pwarn.S" -o "$tmp/pwarn.o"
+[ "$rc" -ne 0 ] || fail "-Werror promotes a .S warning" "exit 0"
 
 [ "$status" -eq 0 ] && echo "frontend-preprocessor: ok"
 exit "$status"

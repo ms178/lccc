@@ -294,6 +294,41 @@ impl Lexer {
         (literal && lexer.pos == text.len()).then_some(token.kind)
     }
 
+    /// The bytes one narrow string literal spelled `text` (`"..."`, no
+    /// encoding prefix) denotes, escapes and universal character names
+    /// decoded exactly as in C, or `None` when `text` is not exactly one
+    /// such token.
+    ///
+    /// `#pragma GCC warning`, `#pragma GCC error` and `#pragma message` call
+    /// this so the message GCC prints from a string literal is the string's
+    /// value, decoded by the same code as the compiler proper (the
+    /// [`Self::character_constant`] rule, for strings). A narrow literal's
+    /// token text holds one `char` per byte, so every `char` is below 256.
+    pub fn narrow_string_literal(text: &str) -> Option<Vec<u8>> {
+        let mut lexer = Self {
+            input: text.as_bytes().to_vec(),
+            pos: 0,
+            file_id: 0,
+            gnu_extensions: true,
+            c23: false,
+            at_line_start: false,
+            wide_unit16: false,
+            ident_pool: std::collections::HashMap::new(),
+            diagnostics: Vec::new(),
+        };
+        let token = lexer.next_token();
+        let TokenKind::StringLiteral(value) = token.kind else {
+            return None;
+        };
+        if lexer.pos != text.len() {
+            return None;
+        }
+        value
+            .chars()
+            .map(|c| u8::try_from(u32::from(c)).ok())
+            .collect()
+    }
+
     pub fn tokenize(&mut self) -> Vec<Token> {
         // Estimate ~1 token per 5 bytes of source (typical for C code).
         let mut tokens = Vec::with_capacity(self.input.len() / 4 + 64);

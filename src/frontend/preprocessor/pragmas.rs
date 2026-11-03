@@ -1,11 +1,96 @@
 //! Pragma directive handling.
 //!
 //! Handles #pragma once, pack, push_macro/pop_macro, weak,
-//! redefine_extname, and GCC visibility directives.
+//! redefine_extname, GCC visibility and dependency directives, and the
+//! message pragmas (`GCC warning`, `GCC error`, `message`).
 
 use std::path::Path;
 
-use super::pipeline::Preprocessor;
+use super::pipeline::{PragmaDiagnostic, PragmaSeverity, Preprocessor, PreprocessorDiagnostic};
+use super::utils::is_ident_cont_byte;
+
+/// `text` after a leading `keyword` token, or `None` when `text` does not
+/// start with that whole token (`warning` must not match `warnings`).
+fn strip_pragma_keyword<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix(keyword)?;
+    if rest.bytes().next().is_some_and(is_ident_cont_byte) {
+        return None;
+    }
+    Some(rest.trim_start())
+}
+
+/// The byte length of the narrow string literal `"..."` that `text` starts
+/// with, closing quote included, or `None` when `text` does not start with a
+/// complete one (no opening quote, or a quote escaped up to the end).
+fn string_literal_len(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if bytes.first() != Some(&b'"') {
+        return None;
+    }
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(i + 1),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// The value of the string literal `text` starts with, and the text after it.
+fn leading_string_literal(text: &str) -> Option<(Vec<u8>, &str)> {
+    let len = string_literal_len(text)?;
+    let value = crate::frontend::lexer::Lexer::narrow_string_literal(&text[..len])?;
+    Some((value, &text[len..]))
+}
+
+/// Outcome of parsing a `#pragma message` operand (GCC 16.2's
+/// `handle_pragma_message`, measured case by case against `gcc-16`).
+#[derive(Debug, PartialEq, Eq)]
+enum MessageOperand {
+    /// The concatenated string, and whether tokens followed it.
+    Message { text: Vec<u8>, junk: bool },
+    /// No string where one is required: "expected a string after ...".
+    MissingString,
+    /// A parenthesised string not followed by `)`: "malformed ... ignored".
+    Malformed,
+}
+
+/// Parse the (already macro-expanded) operand of `#pragma message`: one or
+/// more adjacent narrow string literals, optionally inside one pair of
+/// parentheses.  Adjacent literals concatenate, as translation phase 6
+/// would join them.
+fn parse_message_operand(operand: &str) -> MessageOperand {
+    fn strings(mut rest: &str) -> Option<(Vec<u8>, &str)> {
+        let (mut text, after) = leading_string_literal(rest.trim_start())?;
+        rest = after;
+        while let Some((more, after)) = leading_string_literal(rest.trim_start()) {
+            text.extend_from_slice(&more);
+            rest = after;
+        }
+        Some((text, rest))
+    }
+    let operand = operand.trim_start();
+    let (text, rest) = if let Some(inner) = operand.strip_prefix('(') {
+        let Some((text, rest)) = strings(inner) else {
+            return MessageOperand::MissingString;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix(')') else {
+            return MessageOperand::Malformed;
+        };
+        (text, rest)
+    } else {
+        let Some(found) = strings(operand) else {
+            return MessageOperand::MissingString;
+        };
+        found
+    };
+    MessageOperand::Message {
+        text,
+        junk: !rest.trim().is_empty(),
+    }
+}
 
 impl Preprocessor {
     /// Record a file as protected by `#pragma once`.
@@ -103,6 +188,18 @@ impl Preprocessor {
                 self.handle_pragma_gcc_dependency(dep_content.trim(), line_num, col);
                 return None;
             }
+            for (keyword, is_error) in [("warning", false), ("error", true)] {
+                if let Some(operand) = strip_pragma_keyword(gcc_content, keyword) {
+                    self.handle_pragma_gcc_message(operand, keyword, is_error, line_num, col);
+                    return None;
+                }
+            }
+        }
+
+        // `#pragma message "..."` / `#pragma message ("...")`.
+        if let Some(operand) = strip_pragma_keyword(rest, "message") {
+            self.handle_pragma_message(operand, line_num, col);
+            return None;
         }
 
         // Other pragmas (GCC, diagnostic, etc.) are silently ignored
@@ -189,6 +286,88 @@ impl Preprocessor {
                 col,
                 message: text,
             });
+        }
+    }
+
+    /// `#pragma GCC warning "text"` / `#pragma GCC error "text"` (libcpp's
+    /// `do_pragma_warning_or_error`): the operand is ONE narrow string
+    /// literal, not macro-expanded and not parenthesised, and its value is
+    /// the whole message.  Anything else -- a macro name, `("text")`, no
+    /// operand, a prefixed literal -- is an ERROR for both spellings (GCC
+    /// 16.2: "invalid '#pragma GCC warning' directive").  Tokens after the
+    /// literal are ignored, as in GCC.  `GCC error` fails the translation
+    /// unit in every mode, `-E` included, exactly like `#error`.
+    fn handle_pragma_gcc_message(
+        &mut self,
+        operand: &str,
+        keyword: &str,
+        is_error: bool,
+        line_num: usize,
+        col: usize,
+    ) {
+        let (message, is_error) = match leading_string_literal(operand) {
+            Some((value, _)) => (String::from_utf8_lossy(&value).into_owned(), is_error),
+            None => (format!("invalid '#pragma GCC {keyword}' directive"), true),
+        };
+        let diagnostic = PreprocessorDiagnostic {
+            file: self.current_file(),
+            line: line_num,
+            col,
+            message,
+        };
+        if is_error {
+            self.errors.push(diagnostic);
+        } else {
+            self.pragma_diagnostics.push(PragmaDiagnostic {
+                severity: PragmaSeverity::Warning,
+                diagnostic,
+            });
+        }
+    }
+
+    /// `#pragma message` (GCC's C front-end handler): the operand IS
+    /// macro-expanded, may be parenthesised, and adjacent literals
+    /// concatenate.  A well-formed message is a note
+    /// `'#pragma message: TEXT'` (none for an empty string); the malformed
+    /// shapes are `-Wpragmas` warnings and print nothing else, except junk
+    /// after a complete operand, which warns and still prints the note.
+    fn handle_pragma_message(&mut self, operand: &str, line_num: usize, col: usize) {
+        let expanded = self.macros.expand_line(operand);
+        let file = self.current_file();
+        let mut push = |severity: PragmaSeverity, message: String| {
+            self.pragma_diagnostics.push(PragmaDiagnostic {
+                severity,
+                diagnostic: PreprocessorDiagnostic {
+                    file: file.clone(),
+                    line: line_num,
+                    col,
+                    message,
+                },
+            });
+        };
+        match parse_message_operand(&expanded) {
+            MessageOperand::Message { text, junk } => {
+                if junk {
+                    push(
+                        PragmaSeverity::PragmasWarning,
+                        "junk at end of '#pragma message'".to_string(),
+                    );
+                }
+                if !text.is_empty() {
+                    push(
+                        PragmaSeverity::Note,
+                        format!("'#pragma message: {}'", String::from_utf8_lossy(&text)),
+                    );
+                }
+            }
+            MessageOperand::MissingString => push(
+                PragmaSeverity::PragmasWarning,
+                "expected a string after '#pragma message'".to_string(),
+            ),
+            MessageOperand::Malformed => push(
+                PragmaSeverity::PragmasWarning,
+                "malformed '#pragma message', ignored".to_string(),
+            ),
         }
     }
 
@@ -398,6 +577,73 @@ pub(crate) fn render_pragma_markers(text: &str) -> std::borrow::Cow<'_, str> {
         out.push('\n');
     }
     std::borrow::Cow::Owned(out)
+}
+
+#[cfg(test)]
+mod message_pragma_tests {
+    use super::*;
+
+    #[test]
+    fn keywords_match_whole_tokens_only() {
+        assert_eq!(
+            strip_pragma_keyword("warning \"x\"", "warning"),
+            Some("\"x\"")
+        );
+        assert_eq!(
+            strip_pragma_keyword("warning\"x\"", "warning"),
+            Some("\"x\"")
+        );
+        assert_eq!(strip_pragma_keyword("warnings \"x\"", "warning"), None);
+        assert_eq!(strip_pragma_keyword("warning_x", "warning"), None);
+        assert_eq!(strip_pragma_keyword("error", "error"), Some(""));
+    }
+
+    #[test]
+    fn a_string_literal_ends_at_its_first_unescaped_quote() {
+        assert_eq!(string_literal_len("\"ab\" rest"), Some(4));
+        assert_eq!(string_literal_len("\"a\\\"b\""), Some(6));
+        assert_eq!(string_literal_len("\"a\\\\\""), Some(5));
+        // The only closing quote is escaped: unterminated.
+        assert_eq!(string_literal_len("\"abc\\\""), None);
+        assert_eq!(string_literal_len("\"abc"), None);
+        // A prefixed literal is not the narrow string GCC requires.
+        assert_eq!(string_literal_len("L\"x\""), None);
+        assert_eq!(string_literal_len(""), None);
+    }
+
+    #[test]
+    fn message_operands_parse_like_gcc() {
+        use MessageOperand::{Malformed, Message, MissingString};
+        let msg = |text: &str, junk| Message {
+            text: text.as_bytes().to_vec(),
+            junk,
+        };
+        assert_eq!(parse_message_operand("\"a\""), msg("a", false));
+        assert_eq!(parse_message_operand("(\"a\" \"b\")"), msg("ab", false));
+        assert_eq!(parse_message_operand(" ( \"a\" ) "), msg("a", false));
+        assert_eq!(parse_message_operand("\"a\" junk"), msg("a", true));
+        assert_eq!(parse_message_operand("(\"a\") junk"), msg("a", true));
+        assert_eq!(parse_message_operand("\"t\\x41\\n\""), msg("tA\n", false));
+        assert_eq!(parse_message_operand("\"\""), msg("", false));
+        assert_eq!(parse_message_operand(""), MissingString);
+        assert_eq!(parse_message_operand("(1)"), MissingString);
+        assert_eq!(parse_message_operand("x"), MissingString);
+        assert_eq!(parse_message_operand("(\"a\" 1)"), Malformed);
+        assert_eq!(parse_message_operand("(\"a\""), Malformed);
+    }
+
+    #[test]
+    fn literal_values_are_decoded_by_the_c_lexer() {
+        assert_eq!(
+            leading_string_literal("\"\\303\\251\" x"),
+            Some((vec![0xc3, 0xa9], " x"))
+        );
+        assert_eq!(
+            leading_string_literal("\"\\u00e9\""),
+            Some((vec![0xc3, 0xa9], ""))
+        );
+        assert_eq!(leading_string_literal("'x'"), None);
+    }
 }
 
 #[cfg(test)]

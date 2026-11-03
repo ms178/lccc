@@ -237,8 +237,10 @@ impl Preprocessor {
             }
             return "0".to_string();
         }
-        // Concatenated string literals, escape-aware.
-        let mut arg = String::new();
+        // Concatenated string literals, escape-aware.  The argument is
+        // collected as bytes: pushing each byte as a `char` would re-encode
+        // the bytes of a non-ASCII character one Latin-1 character apiece.
+        let mut arg_bytes: Vec<u8> = Vec::new();
         let mut terminated = true;
         while *i < len && bytes[*i] == b'"' {
             *i += 1;
@@ -246,8 +248,7 @@ impl Preprocessor {
             while *i < len {
                 let c = bytes[*i];
                 if c == b'\\' && *i + 1 < len {
-                    arg.push(c as char);
-                    arg.push(bytes[*i + 1] as char);
+                    arg_bytes.extend_from_slice(&bytes[*i..*i + 2]);
                     *i += 2;
                     continue;
                 }
@@ -256,7 +257,7 @@ impl Preprocessor {
                     *i += 1;
                     break;
                 }
-                arg.push(c as char);
+                arg_bytes.push(c);
                 *i += 1;
             }
             if !closed {
@@ -295,6 +296,7 @@ impl Preprocessor {
             // Malformed tail: treat as not-a-warning without advertising.
             return "0".to_string();
         }
+        let arg = String::from_utf8_lossy(&arg_bytes);
         if !arg.starts_with("-W") {
             warn!("__has_warning expected option name".to_string());
             return "0".to_string();

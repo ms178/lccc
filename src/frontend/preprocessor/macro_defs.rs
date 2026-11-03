@@ -778,8 +778,7 @@ impl MacroTable {
                 }
                 continue;
             }
-            out.push(c as char);
-            i += 1;
+            i = super::utils::push_char_at(&mut out, &text, i);
         }
         out
     }
@@ -1287,24 +1286,29 @@ impl MacroTable {
                     // De-stringize: only quote and backslash escapes alter the
                     // pragma text; unknown escapes keep the character as-is.
                     match eb[q + 1] {
-                        b'"' => content.push('"'),
-                        b'\\' => content.push('\\'),
-                        c => {
+                        b'"' => {
+                            content.push('"');
+                            q += 2;
+                        }
+                        b'\\' => {
                             content.push('\\');
-                            content.push(c as char);
+                            q += 2;
+                        }
+                        _ => {
+                            content.push('\\');
+                            q = super::utils::push_char_at(&mut content, et, q + 1);
                         }
                     }
-                    q += 2;
                 }
                 b'"' => {
                     closed = true;
                     break;
                 }
-                c => {
-                    // Preserve bytes verbatim (pragma text may be non-ASCII in
-                    // the source encoding).
-                    content.push(c as char);
-                    q += 1;
+                _ => {
+                    // Preserve characters verbatim (pragma text may be
+                    // non-ASCII): one whole character at a time, so a
+                    // multi-byte UTF-8 sequence is not re-encoded per byte.
+                    q = super::utils::push_char_at(&mut content, et, q);
                 }
             }
         }
