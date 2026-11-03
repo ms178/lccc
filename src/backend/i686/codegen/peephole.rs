@@ -16305,6 +16305,60 @@ mod tests {
         assert!(!apply(&stack));
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn i686_div_fusion_matches_unfused_on_hardware() {
+        use std::process::Command;
+
+        let body = "movl %esi, %eax\nxorl %edx, %edx\ndivl %ecx\nmovl %edx, %edi\nmovl %esi, %eax\nxorl %edx, %edx\ndivl %ecx\naddl %edi, %eax\nret\n";
+        let mut store = LineStore::new(body.to_string());
+        let mut infos = classify_all(&store);
+        assert!(fuse_div_rem_pairs(&mut store, &mut infos));
+        let fused = store.build_result(|i| infos[i].is_nop());
+        assert_eq!(fused.matches("divl").count(), 1);
+        let source = format!(
+            ".text\n.globl _start\n_start:\nmovl $100000, %ebx\n1:\nmovl %ebx, %esi\nmovl $17, %ecx\ncall original\nmovl %eax, %ebp\ncall fused\ncmpl %ebp, %eax\njne 2f\ndecl %ebx\njnz 1b\nxorl %ebx, %ebx\njmp 3f\n2: movl $1, %ebx\n3: movl $1, %eax\nint $0x80\noriginal:\n{body}\nfused:\n{fused}\n"
+        );
+        let dir = std::env::temp_dir().join(format!("lccc_i686_div_exec_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let asm = dir.join("test.s");
+        let obj = dir.join("test.o");
+        let exe = dir.join("test");
+        std::fs::write(&asm, source).unwrap();
+        let output = Command::new("as")
+            .arg("--32")
+            .arg(&asm)
+            .arg("-o")
+            .arg(&obj)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = Command::new("ld")
+            .args(["-m", "elf_i386"])
+            .arg(&obj)
+            .arg("-o")
+            .arg(&exe)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let status = Command::new(&exe)
+            .status()
+            .expect("i686 hardware regression must run");
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(
+            status.success(),
+            "i686 hardware regression returned {status}"
+        );
+    }
+
     /// `void b_shr(u32 x, u32 n) { if ((x >> n) & 1) hit(n); }` at -O1: the
     /// exact pre-peephole text of the miscompile.  With `jc` unclassified the
     /// block lost its taken edge, `movl %eax, %edi` looked dead (the only
