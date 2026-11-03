@@ -641,5 +641,138 @@ if [ "$have_gcc" -eq 1 ]; then
     done
 fi
 
+# --- 11. __BIGGEST_ALIGNMENT__ follows the ISA and IS the _Alignof cap ------
+# GCC defines `__BIGGEST_ALIGNMENT__` as its `BIGGEST_ALIGNMENT` macro -- the
+# *same* number `min_align_of_type` caps C11 `_Alignof` at -- so it is a
+# property of the translation unit's ISA, not a constant: 16 on the x86-64
+# baseline, 32 once `-mavx` is enabled, 64 under `-mavx512f`, and the same
+# numbers on the `-m32` rows (measured, GCC 16.2). lccc carried a literal 16 in
+# two predefined-macro tables while `_Alignof(v32)` in the very same
+# translation unit already answered 32 under `-mavx`: the macro reported a
+# biggest alignment smaller than a type the compiler itself accepts, so every
+# `char buf[__BIGGEST_ALIGNMENT__]` that AVX/AVX-512 code reinterprets as an
+# `__m256`/`__m512` was under-aligned. Clang 23.1.4 pins 16 and is
+# self-inconsistent in exactly that way (`_Alignof(v64)` is 64 there), so GCC
+# is the only coherent oracle and therefore the expectation.
+#
+# Each row is pinned three ways: the exact expected value (so the gate cannot
+# drift with lccc), agreement with gcc-16 when it is present (so the
+# expectation cannot drift with the author), and the internal invariant
+# `_Alignof(vN) == min(N, __BIGGEST_ALIGNMENT__)` compiled into the same TU (so
+# the macro and the cap can never diverge again, oracle or not).
+alg_rows=(
+    ":16"
+    "-march=x86-64:16"
+    "-march=x86-64-v2:16"
+    "-march=x86-64-v3:32"
+    "-march=x86-64-v4:64"
+    "-march=znver4:64"
+    "-march=nehalem:16"
+    "-msse4.2:16"
+    "-mavx:32"
+    "-mavx2:32"
+    "-mavx512f:64"
+    "-mno-sse2:16"
+    # The ISA request decides, not a denial of the narrower vector state: both
+    # oracles keep 32/64 under these (measured), and so must lccc.
+    "-mno-sse2 -mavx2:32"
+    "-mno-sse -mavx:32"
+    # Last flag wins, and an AVX-512 request implies AVX.
+    "-mavx512f -mno-avx512f:16"
+    "-mno-avx -mavx512f:64"
+    "-m32:16"
+    "-m32 -mavx2:32"
+    "-m32 -mavx512f:64"
+)
+cat >"$tmp/biggest.c" <<'C'
+typedef float v16 __attribute__((vector_size(16)));
+typedef float v32 __attribute__((vector_size(32)));
+typedef float v64 __attribute__((vector_size(64)));
+_Static_assert(__BIGGEST_ALIGNMENT__ >= 16, "the baseline is 16");
+_Static_assert(_Alignof(v16) == 16, "v16");
+_Static_assert(_Alignof(v32) == (32 < __BIGGEST_ALIGNMENT__ ? 32 : __BIGGEST_ALIGNMENT__),
+               "the cap and _Alignof(v32) disagree");
+_Static_assert(_Alignof(v64) == (64 < __BIGGEST_ALIGNMENT__ ? 64 : __BIGGEST_ALIGNMENT__),
+               "the cap and _Alignof(v64) disagree");
+/* an integer constant expression in every context a build uses it in */
+char big_buf[__BIGGEST_ALIGNMENT__];
+_Static_assert(sizeof big_buf == __BIGGEST_ALIGNMENT__, "not an ICE");
+#if __BIGGEST_ALIGNMENT__ >= 32
+int wide_ok = 1;
+#else
+int wide_ok = 0;
+#endif
+C
+for row in "${alg_rows[@]}"; do
+    flags=${row%:*}; want=${row##*:}
+    # shellcheck disable=SC2086  # the flag list is a word list on purpose
+    got=$("$CCC" $flags -dM -E -x c /dev/null 2>/dev/null \
+        | awk '/^#define __BIGGEST_ALIGNMENT__ /{print $3}')
+    [ "$got" = "$want" ] \
+        || fail "__BIGGEST_ALIGNMENT__ [$flags]: expected $want, got '${got:-<undefined>}'"
+    if [ "$have_gcc" -eq 1 ]; then
+        # shellcheck disable=SC2086
+        ref=$("$GCC" $flags -dM -E -x c /dev/null 2>/dev/null \
+            | awk '/^#define __BIGGEST_ALIGNMENT__ /{print $3}')
+        # An empty ref means gcc-16 rejected the row in this environment (no
+        # such row today, but a multilib-less gcc cannot answer -m32 probes);
+        # the exact expectation above already pins the value.
+        if [ -n "$ref" ] && [ "$ref" != "$got" ]; then
+            fail "__BIGGEST_ALIGNMENT__ [$flags]: gcc-16 says $ref, lccc says '${got:-<undefined>}'"
+        fi
+    fi
+    # shellcheck disable=SC2086
+    if ! "$CCC" $flags -c -o /dev/null "$tmp/biggest.c" 2>"$tmp/biggest.err"; then
+        fail "__BIGGEST_ALIGNMENT__ [$flags]: the macro is not the _Alignof cap of the same TU: $(cat "$tmp/biggest.err")"
+    fi
+done
+
+# --- 12. An ISA announcement implies the narrower ones GCC pairs it with ----
+# Two feature macros state the same ISA bit as a macro lccc already announced,
+# so a translation unit that probes the first one used to be told the compiler
+# has no such path at all:
+#
+#   * `__CRC32__` IS the SSE4.2 CRC32 instruction. GCC defines it in exactly
+#     the rows where it defines `__SSE4_2__` (all 102 `-march=` names, -m64 and
+#     -m32) and neither otherwise, so a `#ifdef __CRC32__` probe against lccc
+#     concluded "no CRC32 path" while the backend could emit the instruction.
+#   * `__EVEX256__` is the EVEX-encoded 256-bit form, which exists exactly when
+#     AVX-512VL does; `-mavx512f` alone has EVEX only at 512 bits, and GCC
+#     defines it without `-mavx512vl` in no row.
+#
+# `scripts/check_x86_march_macros.py` diffs these against the oracle on every
+# CPU row -- but only once they are "modeled", i.e. defined for at least one
+# CPU, so it cannot notice a future removal. These four rows are the pinned
+# half: the pairing must survive a refactor of the flag resolution.
+# expect <flags> <macro> <defined|absent>
+expect_macro() {
+    local flags=$1 macro=$2 want=$3 have
+    # shellcheck disable=SC2086  # the flag list is a word list on purpose
+    have=$("$CCC" $flags -dM -E -x c /dev/null 2>/dev/null \
+        | awk -v n="$macro" '$2==n{print "defined"}')
+    if [ "$want" = defined ] && [ "$have" != defined ]; then
+        fail "$macro [$flags]: must be defined"
+    elif [ "$want" = absent ] && [ "$have" = defined ]; then
+        fail "$macro [$flags]: must not be defined"
+    fi
+}
+expect_macro "-msse4.2" __CRC32__ defined
+expect_macro "-mavx" __CRC32__ defined
+expect_macro "-msse4.2 -mno-sse4.2" __CRC32__ absent
+expect_macro "-mavx512vl" __EVEX256__ defined
+expect_macro "-mavx512f" __EVEX256__ absent
+expect_macro "-mavx512vl -mno-avx512vl" __EVEX256__ absent
+if [ "$have_gcc" -eq 1 ]; then
+    for row in "-msse4.2:__CRC32__:defined" "-mavx512vl:__EVEX256__:defined" \
+               "-mavx512f:__EVEX256__:absent"; do
+        flags=${row%%:*}; rest=${row#*:}; macro=${rest%%:*}; want=${rest##*:}
+        # shellcheck disable=SC2086
+        have=$("$GCC" $flags -dM -E -x c /dev/null 2>/dev/null \
+            | awk -v n="$macro" '$2==n{print "defined"}')
+        [ "${have:-absent}" = "$want" ] \
+            || fail "$macro [$flags]: gcc-16 says '${have:-absent}', the rule this gate encodes says '$want'"
+    done
+fi
+
 [ "$status" -eq 0 ] && echo "preprocessor-builtin-scope: ok"
 exit "$status"

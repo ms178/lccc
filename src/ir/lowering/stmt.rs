@@ -2182,6 +2182,7 @@ impl Lowerer {
                 struct_aligned,
                 reverse_sso,
                 _,
+                _,
             ) => self.compute_vla_struct_sizeof(
                 fields,
                 false,
@@ -2197,6 +2198,7 @@ impl Lowerer {
                 pragma_pack,
                 struct_aligned,
                 reverse_sso,
+                _,
             ) => self.compute_vla_struct_sizeof(
                 fields,
                 true,

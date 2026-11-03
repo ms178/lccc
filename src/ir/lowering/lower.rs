@@ -3212,7 +3212,7 @@ impl Lowerer {
     /// Collect enum constants from a type specifier.
     fn collect_enum_constants_impl(&mut self, ts: &TypeSpecifier, scoped: bool) {
         match ts {
-            TypeSpecifier::Enum(name, Some(variants), is_packed, underlying) => {
+            TypeSpecifier::Enum(name, Some(variants), is_packed, underlying, _) => {
                 // Sema verified the fixed type and every value; this mirrors
                 // its registration (`process_enum_variants`).
                 let fixed = underlying.as_deref().and_then(|u| {
@@ -3272,7 +3272,7 @@ impl Lowerer {
                 }
             }
             // C23 `enum E : T;` declares the tag, complete with its fixed type.
-            TypeSpecifier::Enum(Some(tag), None, is_packed, Some(underlying)) => {
+            TypeSpecifier::Enum(Some(tag), None, is_packed, Some(underlying), _) => {
                 let fixed = crate::common::types::EnumType::fixed_underlying(
                     self.type_spec_to_ctype(underlying),
                 );
@@ -3290,7 +3290,7 @@ impl Lowerer {
                 }
             }
             TypeSpecifier::Struct(_, Some(fields), ..)
-            | TypeSpecifier::Union(_, Some(fields), ..) => {
+            | TypeSpecifier::Union(_, Some(fields), .., _) => {
                 for field in fields {
                     self.collect_enum_constants_impl(&field.type_spec, scoped);
                 }
@@ -4309,9 +4309,9 @@ impl Lowerer {
 fn stmt_defines_type_name_enum(stmt: &Stmt) -> bool {
     fn defines_enum(ts: &TypeSpecifier) -> bool {
         match ts {
-            TypeSpecifier::Enum(_, Some(_), ..) => true,
+            TypeSpecifier::Enum(_, Some(_), .., _) => true,
             TypeSpecifier::Struct(_, Some(fields), ..)
-            | TypeSpecifier::Union(_, Some(fields), ..) => {
+            | TypeSpecifier::Union(_, Some(fields), .., _) => {
                 fields.iter().any(|field| defines_enum(&field.type_spec))
             }
             TypeSpecifier::Array(inner, _) | TypeSpecifier::Pointer(inner, _) => {

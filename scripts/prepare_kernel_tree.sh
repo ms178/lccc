@@ -84,6 +84,12 @@ LCCC_LD=${LCCC_LD:-$REPO_ROOT/target/fastbuild/lccc-ld}
 LCCC_CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/lccc
 KERNEL_WORK=${KERNEL_WORK:-$LCCC_CACHE/kernel-work}
 HOSTCC=${HOSTCC:-gcc}
+# Match the full-build memory budget, rather than spawning one compiler per
+# reported host CPU (which may greatly exceed this sandbox's memory quota).
+JOBS=${LCCC_JOBS:-2}
+[[ $JOBS =~ ^[1-9][0-9]*$ ]] || {
+  echo 'LCCC_JOBS must be a positive integer' >&2; exit 2;
+}
 
 # The CachyMod patches and the package config live in a sibling repository,
 # which the persisted workspace does not keep: a fresh machine has the tarball
@@ -291,9 +297,6 @@ sha256_of() { # sha256_of <file> -> hex digest only
     shasum -a 256 -- "$1" | cut -d' ' -f1
   fi
 }
-jobs_count() {
-  getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 2
-}
 
 # Content identity of every input that determines patching/preparation. The
 # selected configuration is an INPUT here; later caller changes to .config are
@@ -388,7 +391,7 @@ lccc_make_prepare() {
   # (the kernel's cc-option visibility differs between gcc and lccc).
   # Use the same target assembler/linker as the full build, including Kconfig probes.
   make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" AS="$LCCC" HOSTCC="$HOSTCC" olddefconfig >/dev/null
-  make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" AS="$LCCC" HOSTCC="$HOSTCC" prepare -j"$(jobs_count)"
+  make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" AS="$LCCC" HOSTCC="$HOSTCC" prepare -j"$JOBS"
 }
 # Restore boot-only generated headers after preparation or compiler invalidation.
 # Never replace real Kbuild output that is already present.

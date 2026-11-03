@@ -41,8 +41,9 @@ of silently marking such a source as correct.
 For an end-to-end deterministic generation, parser, and checksum smoke test:
 
 ```sh
-python3 tests/ra/test_harness.py             # GCC O0/O2
-python3 tests/ra/test_harness.py --full      # GCC O0/O1/O2/O3
+python3 tests/ra/test_harness.py             # gcc-16 if available, else gcc; O0/O2
+python3 tests/ra/test_harness.py --gcc gcc-16 # pin the oracle explicitly
+python3 tests/ra/test_harness.py --full      # selected GCC O0/O1/O2/O3
 ```
 
 The fast CI lane runs the GCC harness smoke test and, after building LCCC,

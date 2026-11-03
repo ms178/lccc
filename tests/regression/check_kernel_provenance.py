@@ -190,6 +190,13 @@ def main() -> int:
             LCCC_KERNEL_SOURCE_MODE="tarball",
         )
 
+        # Reject malformed budgets before touching either checkout or make.
+        for invalid in ("0", "-1", "2x", "1 2", "1; exit 0"):
+            result = run(dict(env, LCCC_JOBS=invalid), kdir, expect=2)
+            assert "LCCC_JOBS must be a positive integer" in result.stderr
+            assert not (tmp / "make.log").exists()
+        env["LCCC_JOBS"] = "3"
+
         (kdir / ".lccc-prepared").write_text("legacy stamp\n")
         result = run(env, kdir, expect=3)
         assert "recipe mismatch/legacy stamp" in result.stderr, result.stderr
@@ -222,6 +229,8 @@ def main() -> int:
         log = (tmp / "make.log").read_text()
         assert "clean" in log and "olddefconfig" in log and "prepare" in log, log
         assert f"LD={cc} AS={cc}" in log, log
+        prepare_calls = [line for line in log.splitlines() if " prepare " in f" {line} "]
+        assert len(prepare_calls) == 1 and prepare_calls[0].endswith(" -j3"), log
         assert all((kdir / name).is_file() for name in CANARIES)
         assert "generated-cpustr" in (kdir / "arch/x86/boot/cpustr.h").read_text()
         compiler_hash = (kdir / ".lccc-compiler-stamp").read_text()

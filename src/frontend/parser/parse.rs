@@ -910,6 +910,22 @@ pub struct Parser {
     /// (especially important for packed structs where tag-only refs would
     /// otherwise incorrectly default to ptr_size).
     pub(super) struct_tag_alignments: FxHashMap<String, usize>,
+    /// Undo records for block/for-scope typedef declarations. Names and their
+    /// parser-side qualifiers are restored in reverse declaration order.
+    pub(super) typedef_scope_log: Vec<TypedefScopeUndo>,
+}
+
+/// Prior parser-visible state for one typedef name hidden/redeclared in a
+/// nested scope. Values are moved into the log and restored when that scope
+/// exits, so entering a block remains O(1) regardless of file-scope typedefs.
+#[derive(Debug)]
+pub(super) struct TypedefScopeUndo {
+    name: String,
+    was_typedef: bool,
+    type_spec: Option<TypeSpecifier>,
+    object_space: Option<AddressSpace>,
+    object_volatile: bool,
+    base_volatile: bool,
 }
 
 impl Parser {
@@ -939,6 +955,59 @@ impl Parser {
         }
     }
 
+    /// Start a parser typedef scope. Recording the current log length keeps
+    /// scope entry constant-time even when the file has many typedef names.
+    pub(super) fn typedef_scope_mark(&self) -> usize {
+        self.typedef_scope_log.len()
+    }
+
+    /// Save and remove a name's prior typedef metadata before a local typedef
+    /// shadows it. The just-parsed declaration will install the local state.
+    pub(super) fn record_typedef_scope_change(&mut self, name: &str) {
+        if self.block_depth == 0 {
+            return;
+        }
+        let undo = TypedefScopeUndo {
+            name: name.to_string(),
+            was_typedef: self.typedefs.remove(name),
+            type_spec: self.typedef_type_specs.remove(name),
+            object_space: self.typedef_object_spaces.remove(name),
+            object_volatile: self.typedef_object_volatile.remove(name),
+            base_volatile: self.typedef_base_volatile.remove(name),
+        };
+        self.typedef_scope_log.push(undo);
+    }
+
+    /// Undo local typedef declarations made since `mark`, restoring any outer
+    /// typedef with the same spelling and all of its use-site qualifiers.
+    pub(super) fn restore_typedef_scope(&mut self, mark: usize) {
+        while self.typedef_scope_log.len() > mark {
+            let Some(undo) = self.typedef_scope_log.pop() else {
+                break;
+            };
+            self.typedefs.remove(&undo.name);
+            self.typedef_type_specs.remove(&undo.name);
+            self.typedef_object_spaces.remove(&undo.name);
+            self.typedef_object_volatile.remove(&undo.name);
+            self.typedef_base_volatile.remove(&undo.name);
+            if undo.was_typedef {
+                self.typedefs.insert(undo.name.clone());
+            }
+            if let Some(type_spec) = undo.type_spec {
+                self.typedef_type_specs.insert(undo.name.clone(), type_spec);
+            }
+            if let Some(space) = undo.object_space {
+                self.typedef_object_spaces.insert(undo.name.clone(), space);
+            }
+            if undo.object_volatile {
+                self.typedef_object_volatile.insert(undo.name.clone());
+            }
+            if undo.base_volatile {
+                self.typedef_base_volatile.insert(undo.name);
+            }
+        }
+    }
+
     /// Whether `name` is currently an enumeration constant to the parser.
     pub(super) fn is_parser_enum_constant(&self, name: &str) -> bool {
         self.enum_constants.contains_key(name) || self.unevaluable_enum_constants.contains(name)
@@ -950,6 +1019,7 @@ impl Parser {
             pos: 0,
             c23: false,
             typedefs: Self::builtin_typedefs_cached(),
+            typedef_scope_log: Vec::new(),
             typedef_type_specs: FxHashMap::default(),
             typedef_object_spaces: FxHashMap::default(),
             typedef_object_volatile: FxHashSet::default(),
@@ -2551,7 +2621,7 @@ impl Parser {
             crate::frontend::parser::ast::DerivedDeclarator::declares_function(derived);
         let is_record = matches!(
             type_spec,
-            TypeSpecifier::Struct(..) | TypeSpecifier::Union(..)
+            TypeSpecifier::Struct(.., _) | TypeSpecifier::Union(..)
         );
         // A typedef's referent is not visible here: never claim a placement
         // violation for it (a false `attribute ignored` would be worse than
@@ -3949,8 +4019,17 @@ impl Parser {
                 }
             }
             TypeSpecifier::Array(elem, _) => return Self::alignof_type_spec(elem, tag_aligns),
-            TypeSpecifier::Struct(name, fields, is_packed, pragma_pack, struct_aligned, _, _)
-            | TypeSpecifier::Union(name, fields, is_packed, pragma_pack, struct_aligned, _) => {
+            TypeSpecifier::Struct(
+                name,
+                fields,
+                is_packed,
+                pragma_pack,
+                struct_aligned,
+                _,
+                _,
+                _,
+            )
+            | TypeSpecifier::Union(name, fields, is_packed, pragma_pack, struct_aligned, _, _) => {
                 // Cache hit for previously DEFINED named records: definitions
                 // insert their final alignment into struct_tag_alignments the
                 // moment their fields are parsed, so lookups bottom-up during

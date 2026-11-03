@@ -5,6 +5,7 @@
 //! the TypeConvertContext trait implementation.
 
 use super::lower::Lowerer;
+use crate::common::source::Span;
 use crate::common::type_builder;
 use crate::common::types::{
     AddressSpace, CType, PtrQuals, StructField, StructLayout, max_object_bytes,
@@ -117,6 +118,7 @@ impl Lowerer {
                         None,
                         None,
                         false,
+                        Span::dummy(),
                     )
                 } else {
                     TypeSpecifier::Struct(
@@ -127,6 +129,7 @@ impl Lowerer {
                         None,
                         None,
                         false,
+                        Span::dummy(),
                     )
                 }
             }
@@ -135,9 +138,25 @@ impl Lowerer {
                 // For anonymous unions (key like "__anon_struct_N"), use the
                 // full key as the tag so get_struct_layout_for_type can find it.
                 if let Some(tag) = key.strip_prefix("union.") {
-                    TypeSpecifier::Union(Some(tag.to_string()), None, false, None, None, None)
+                    TypeSpecifier::Union(
+                        Some(tag.to_string()),
+                        None,
+                        false,
+                        None,
+                        None,
+                        None,
+                        Span::dummy(),
+                    )
                 } else {
-                    TypeSpecifier::Union(Some(key.to_string()), None, false, None, None, None)
+                    TypeSpecifier::Union(
+                        Some(key.to_string()),
+                        None,
+                        false,
+                        None,
+                        None,
+                        None,
+                        Span::dummy(),
+                    )
                 }
             }
             CType::Enum(et) => TypeSpecifier::Enum(
@@ -147,6 +166,7 @@ impl Lowerer {
                 et.fixed
                     .as_deref()
                     .map(|t| Box::new(Self::ctype_to_type_spec(t))),
+                Span::dummy(),
             ),
             CType::Function(ft) => {
                 // Bare function type — NOT a pointer. Use BareFunction so that
@@ -593,6 +613,7 @@ impl type_builder::TypeConvertContext for Lowerer {
     fn resolve_struct_or_union(
         &self,
         name: &Option<String>,
+        _span: Span,
         fields: &Option<Vec<StructFieldDecl>>,
         is_union: bool,
         is_packed: bool,
@@ -614,6 +635,7 @@ impl type_builder::TypeConvertContext for Lowerer {
     fn resolve_enum(
         &self,
         name: &Option<String>,
+        _span: Span,
         variants: &Option<Vec<EnumVariant>>,
         is_packed: bool,
     ) -> CType {

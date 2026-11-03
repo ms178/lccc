@@ -1606,6 +1606,7 @@ impl<'a> SemaConstEval<'a> {
                 struct_aligned,
                 reverse_sso,
                 _,
+                _,
             ) => {
                 // Look up cached layout for tagged structs
                 if let Some(tag) = tag {
@@ -1642,6 +1643,7 @@ impl<'a> SemaConstEval<'a> {
                 pragma_pack,
                 struct_aligned,
                 reverse_sso,
+                _,
             ) => {
                 if let Some(tag) = tag {
                     let base = format!("union.{}", tag);
@@ -1666,7 +1668,7 @@ impl<'a> SemaConstEval<'a> {
                 }
                 Some(0)
             }
-            TypeSpecifier::Enum(name, variants, is_packed, underlying) => Some(
+            TypeSpecifier::Enum(name, variants, is_packed, underlying, _) => Some(
                 self.resolve_enum_type(name, variants, *is_packed, underlying.as_deref())
                     .packed_size(),
             ),
@@ -1843,6 +1845,7 @@ impl<'a> SemaConstEval<'a> {
                 struct_aligned,
                 reverse_sso,
                 _,
+                _,
             ) => {
                 if let Some(tag) = tag {
                     let base = format!("struct.{}", tag);
@@ -1875,6 +1878,7 @@ impl<'a> SemaConstEval<'a> {
                 pragma_pack,
                 struct_aligned,
                 reverse_sso,
+                _,
             ) => {
                 if let Some(tag) = tag {
                     let base = format!("union.{}", tag);
@@ -1899,7 +1903,7 @@ impl<'a> SemaConstEval<'a> {
                 }
                 struct_aligned.unwrap_or(1)
             }
-            TypeSpecifier::Enum(name, variants, is_packed, underlying) => {
+            TypeSpecifier::Enum(name, variants, is_packed, underlying, _) => {
                 let enum_type = CType::Enum(self.resolve_enum_type(
                     name,
                     variants,
@@ -1970,7 +1974,7 @@ impl<'a> SemaConstEval<'a> {
             }
             TypeSpecifier::TypeofType(inner, _) => self.preferred_alignof_type_spec(inner),
             // An 8-byte enum prefers 8 like `long long` (GCC `__alignof__`, -m32).
-            TypeSpecifier::Enum(name, variants, is_packed, underlying) => CType::Enum(
+            TypeSpecifier::Enum(name, variants, is_packed, underlying, _) => CType::Enum(
                 self.resolve_enum_type(name, variants, *is_packed, underlying.as_deref()),
             )
             .preferred_align_ctx(&*self.types.borrow_struct_layouts()),

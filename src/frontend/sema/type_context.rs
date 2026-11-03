@@ -14,6 +14,7 @@
 //! scope push/pop instead of O(total-map-size).
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::source::Span;
 use crate::common::types::{AddressSpace, CType, PtrQuals, RcLayout, StructLayout};
 use crate::frontend::parser::ast::{DerivedDeclarator, ParamDecl, TypeSpecifier};
 use std::cell::{Cell, RefCell};
@@ -181,6 +182,33 @@ impl EnumConstant {
     }
 }
 
+/// Distinct AST source sites defining one tag in a scope. The common case
+/// stores its first span inline; the set allocates only if redefinitions occur.
+#[derive(Debug)]
+pub struct TagDefinitionSites {
+    first: Span,
+    additional: Option<FxHashSet<Span>>,
+}
+
+impl TagDefinitionSites {
+    fn new(first: Span) -> Self {
+        Self {
+            first,
+            additional: None,
+        }
+    }
+
+    /// Returns true once for each new site after the first definition.
+    fn record(&mut self, span: Span) -> bool {
+        if span == self.first {
+            return false;
+        }
+        self.additional
+            .get_or_insert_with(FxHashSet::default)
+            .insert(span)
+    }
+}
+
 #[derive(Debug)]
 pub struct TypeScopeFrame {
     /// Every write to `enum_constants` in this scope, with the value it
@@ -196,6 +224,9 @@ pub struct TypeScopeFrame {
     pub enum_types_tracked: FxHashSet<String>,
     enum_ids_changed: Vec<(String, Option<NonZeroU64>)>,
     enum_ids_tracked: FxHashSet<String>,
+    /// Complete tag definitions seen in this lexical scope, keyed by tag name;
+    /// each distinct source site is retained so repeated resolution is idempotent.
+    pub tag_definitions: FxHashMap<String, TagDefinitionSites>,
     /// Keys newly inserted into `struct_layouts`.
     pub struct_layouts_added: Vec<String>,
     /// Keys that were overwritten in `struct_layouts`: (key, previous_value).
@@ -240,6 +271,7 @@ impl TypeScopeFrame {
             enum_types_tracked: FxHashSet::default(),
             enum_ids_changed: Vec::new(),
             enum_ids_tracked: FxHashSet::default(),
+            tag_definitions: FxHashMap::default(),
             struct_layouts_added: Vec::new(),
             struct_layouts_shadowed: Vec::new(),
             record_alias_added: Vec::new(),
@@ -335,6 +367,8 @@ pub struct TypeContext {
     /// Wrapped in RefCell for interior mutability: scoped insertion methods
     /// called from &self contexts need to record undo entries.
     pub scope_stack: RefCell<Vec<TypeScopeFrame>>,
+    /// Complete tag definitions at translation-unit scope (no disposable frame).
+    pub file_scope_tag_definitions: RefCell<FxHashMap<String, TagDefinitionSites>>,
     /// Counter for anonymous struct/union CType keys generated from &self contexts.
     /// Uses Cell for interior mutability since type_spec_to_ctype takes &self.
     anon_ctype_counter: std::cell::Cell<u32>,
@@ -380,6 +414,7 @@ impl TypeContext {
             // deliberately has no disposable frame; its canonical depth is 0,
             // and frame index N corresponds to lexical depth N + 1.
             scope_stack: RefCell::new(Vec::new()),
+            file_scope_tag_definitions: RefCell::new(FxHashMap::default()),
             anon_ctype_counter: std::cell::Cell::new(0),
             struct_variant_counter: std::cell::Cell::new(0),
             constexpr_compound_literals: FxHashMap::default(),
@@ -685,13 +720,11 @@ impl TypeContext {
         let mut stack = self.scope_stack.borrow_mut();
         if let Some(frame) = stack.last_mut() {
             // Record the state as it was BEFORE this frame touched it, at most
-            // once per base key. Two definitions of one tag in the same frame
-            // (a redefinition -- REDEF-1, which lccc does not yet diagnose but
-            // GCC does) would otherwise push two undo entries, and `pop_scope`
-            // removes the `added` entries first and then replays the `shadowed`
-            // ones, so the second entry would resurrect an alias belonging to a
-            // scope that no longer exists. One entry per key makes the undo
-            // idempotent instead of order-dependent.
+            // once per base key. Even when compatible C23 definitions reuse
+            // the visible alias, recording a single undo entry prevents
+            // `pop_scope` from resurrecting an alias belonging to a dead scope.
+            // The tag-definition table diagnoses incompatible or pre-C23
+            // redefinitions independently of this identity bookkeeping.
             let tracked = frame.record_alias_added.iter().any(|k| k == base)
                 || frame.record_alias_shadowed.iter().any(|(k, _)| k == base);
             if !tracked {
@@ -745,6 +778,33 @@ impl TypeContext {
             }
         }
         false
+    }
+
+    /// Record a complete tag definition in the active lexical scope.
+    /// Returns true once for each distinct redefinition site; repeated semantic
+    /// resolution of one AST node (same span) cannot duplicate its diagnostic.
+    pub fn record_tag_definition(&self, name: &str, span: Span) -> bool {
+        let mut scopes = self.scope_stack.borrow_mut();
+        if let Some(scope) = scopes.last_mut() {
+            return match scope.tag_definitions.get_mut(name) {
+                Some(sites) => sites.record(span),
+                None => {
+                    scope
+                        .tag_definitions
+                        .insert(name.to_string(), TagDefinitionSites::new(span));
+                    false
+                }
+            };
+        }
+        drop(scopes);
+        let mut file_scope = self.file_scope_tag_definitions.borrow_mut();
+        match file_scope.get_mut(name) {
+            Some(sites) => sites.record(span),
+            None => {
+                file_scope.insert(name.to_string(), TagDefinitionSites::new(span));
+                false
+            }
+        }
     }
 
     /// Push a new type-system scope frame.
@@ -1294,12 +1354,11 @@ mod record_alias_tests {
 
     #[test]
     fn two_definitions_in_one_frame_do_not_leak_an_alias_past_the_pop() {
-        // REDEF-1's structural half. A redefinition in the SAME frame used to
-        // push an `added` entry and then a `shadowed` one; pop_scope removes
-        // `added` first and then replays `shadowed`, so the alias came back
-        // pointing at a variant from a scope that no longer exists -- a
-        // dangling alias that would make every later `struct S` in the file
-        // resolve to the dead inner record.
+        // Repeated alias updates in the SAME frame used to push an `added`
+        // entry and then a `shadowed` one; pop_scope removes `added` first and
+        // then replays `shadowed`, so the alias came back pointing at a variant
+        // from a scope that no longer exists -- a dangling alias that would make
+        // every later `struct S` in the file resolve to the dead inner record.
         let mut ctx = TypeContext::new();
         ctx.push_scope();
         ctx.set_record_alias_from_ref("struct.S", "struct.S#1");
@@ -1579,5 +1638,34 @@ mod typedef_cvr_scope_tests {
         assert_eq!(types.typedef_top_cvr("T"), Some(0));
         types.pop_scope();
         assert_eq!(types.typedef_top_cvr("T"), Some(PtrQuals::CONST));
+    }
+}
+
+#[cfg(test)]
+mod tag_definition_scope_tests {
+    use super::TypeContext;
+    use crate::common::source::Span;
+
+    #[test]
+    fn duplicate_site_is_reported_once_and_scopes_are_isolated() {
+        let mut types = TypeContext::new();
+        let first = Span::new(1, 2, 0);
+        let second = Span::new(3, 4, 0);
+
+        assert!(!types.record_tag_definition("S", first));
+        assert!(!types.record_tag_definition("S", first));
+        assert!(types.record_tag_definition("S", second));
+        assert!(!types.record_tag_definition("S", second));
+
+        types.push_scope();
+        assert!(!types.record_tag_definition("S", first));
+        assert!(!types.record_tag_definition("S", first));
+        assert!(types.record_tag_definition("S", second));
+        assert!(!types.record_tag_definition("S", second));
+        types.pop_scope();
+
+        let third = Span::new(5, 6, 0);
+        assert!(types.record_tag_definition("S", third));
+        assert!(!types.record_tag_definition("S", third));
     }
 }

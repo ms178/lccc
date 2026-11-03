@@ -1060,7 +1060,7 @@ impl<'a> ExprTypeChecker<'a> {
                     CType::Int // fallback for unknown typedef
                 }
             }
-            TypeSpecifier::Enum(name, variants, is_packed, underlying) => {
+            TypeSpecifier::Enum(name, variants, is_packed, underlying, _) => {
                 // The same enum the analyzer resolves (`resolve_enum`): the
                 // completed definition visible here, or this body's values.
                 // Every integer property of the result (size, signedness,
@@ -1086,6 +1086,7 @@ impl<'a> ExprTypeChecker<'a> {
                 pragma_pack,
                 struct_aligned,
                 reverse_sso,
+                _,
                 _,
             ) => {
                 if let Some(tag) = tag {
@@ -1119,6 +1120,7 @@ impl<'a> ExprTypeChecker<'a> {
                 pragma_pack,
                 struct_aligned,
                 reverse_sso,
+                _,
             ) => {
                 if let Some(tag) = tag {
                     CType::Union(

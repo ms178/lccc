@@ -346,10 +346,27 @@ pub struct Driver {
     /// the Athlons): GCC 16.2 keeps `__MMX__` there, `-mno-sse` included.
     /// Meaningful only with `march_pre_sse`; set with it per `-march=`.
     pub(super) march_pre_sse_mmx: bool,
+    /// Whether the final `-march=` CPU carries POPCNT as a feature bit of its
+    /// own (`F::Popcnt` in the generated ISA table).
+    ///
+    /// GCC records the features a `-march=` profile grants in
+    /// `ix86_isa_flags_explicit`, so a POPCNT that came from the CPU row is
+    /// not withdrawn by a later denial of the SSE4.2 *level*, while one that
+    /// came from the `-mavx` implication is: `-march=x86-64-v3 -mno-sse4.2`
+    /// keeps `__POPCNT__`, `-mavx -mno-sse4.2` drops it (measured,
+    /// gcc-16.2). See `Driver::apply_x86_feature_dependencies`.
+    pub(super) arch_grants_popcnt: bool,
     /// Set by `-mno-movbe`: MOVBE forbidden.
     pub(super) movbe_explicitly_disabled: bool,
     /// Set by `-mno-cx16`: CMPXCHG16B forbidden.
     pub(super) cx16_explicitly_disabled: bool,
+    /// XSAVE/XRSTOR availability (`-mxsave`, a `-march=` row that carries the
+    /// bit, under the sticky `-mno-xsave` veto).  Its own CPUID bit, not an
+    /// AVX implication: five GCC CPU rows have XSAVE and no AVX, and
+    /// `-mavx -mno-xsave` keeps AVX while dropping it (measured, gcc-16.2).
+    pub(super) enable_xsave: bool,
+    /// Set by `-mno-xsave`: XSAVE and everything that needs it is forbidden.
+    pub(super) xsave_explicitly_disabled: bool,
     /// Explicit x86 ISA `-m`/`-mno-` flags in command-line order, for the
     /// `-march=` replace-and-replay contract (GCC-exact, measured on the
     /// host oracle, gcc 14.2 `-dM -E`):
@@ -445,6 +462,15 @@ pub struct Driver {
     pub(super) enable_amx_int8: bool,
     pub(super) enable_amx_bf16: bool,
     pub(super) enable_cmpccxadd: bool,
+    /// The extensions granted by their own `-m` option (as opposed to a
+    /// `-march=` row): those keep their grant when the only missing
+    /// prerequisite is XSAVE itself, exactly like GCC's option bits.
+    pub(super) x86_extras_explicit: u32,
+    /// `-mprefer-vector-width=` (or the `-mprefer-avx128` alias), in bits.
+    /// `None` keeps the resolved value: the tuning row's SIMD datapath,
+    /// floored at 256 because every 256-bit emitter here runs at full rate up
+    /// to that width and the pass world has no AVX-512 class.
+    pub(super) x86_prefer_vector_bits: Option<u16>,
     /// Accepted x86 scheduling tune name from -mtune=. LCCC does not yet have
     /// a machine scheduler, so this is deliberately diagnostic-only; ISA
     /// selection belongs to -march= and is never silently conflated with tune.
@@ -736,10 +762,13 @@ impl Driver {
             enable_sse2: false,
             march_pre_sse: false,
             march_pre_sse_mmx: false,
+            arch_grants_popcnt: false,
             march_fxsr: true,
             fxsr_override: None,
             movbe_explicitly_disabled: false,
             cx16_explicitly_disabled: false,
+            enable_xsave: false,
+            xsave_explicitly_disabled: false,
             x86_explicit_isa_args: Vec::new(),
             skip_rax_setup: false,
             no_x87: false,
@@ -801,6 +830,8 @@ impl Driver {
             enable_amx_bf16: false,
             enable_cmpccxadd: false,
             x86_tune: None,
+            x86_extras_explicit: 0,
+            x86_prefer_vector_bits: None,
             x86_march: None,
             general_regs_only: false,
             code_model_kernel: false,
@@ -1412,6 +1443,7 @@ impl Driver {
             sema.set_builtin_policy(self.builtin_policy.clone());
             sema.set_pre_c99_dialect(self.pre_c99_dialect());
             sema.set_gnu89_inline(self.gnu89_inline);
+            sema.set_c23_dialect(self.c23_dialect());
             sema.set_weak_pragma_names(
                 preprocessor
                     .weak_pragmas
@@ -2048,6 +2080,10 @@ impl Driver {
             .fxsr_override
             .unwrap_or(self.target == Target::X86_64 || self.march_fxsr);
         preprocessor.set_fxsr_macro(fxsr_on);
+        // `__XSAVE__`: the CPU row's own bit or `-mxsave`, under `-mno-xsave`.
+        // Independent of the SSE/AVX ladder on purpose — see
+        // `Preprocessor::set_xsave_macro`.
+        preprocessor.set_xsave_macro(self.resolved_xsave());
 
         // Define extended feature macros (__SSE3__, __AVX__, __BMI__, ...).
         // The SIMD half is gated on the xmm file being open and its SSE2
@@ -2062,9 +2098,16 @@ impl Driver {
         // made the preprocessor lie about the codegen contract (an
         // #ifdef __BMI__ fallback path would disagree with the emitted
         // `andnq`).
-        // GFNI keeps the SSE-only gate (its intrinsics need SSE2, see the
-        // AES note in `docs/x86-isa-permissions-and-simd-abi.md` §1.6);
-        // SSE3+ and the AVX-dependent families require the second predicate.
+        // AES-NI, PCLMUL and GFNI are the exception on both halves: GCC 16.2
+        // announces them from the option bits alone, so an explicit
+        // `-mno-sse`/`-mno-sse2`/`-mgeneral-regs-only` denial leaves
+        // `__AES__`/`__PCLMUL__`/`__GFNI__` standing while the SSE macros go
+        // away (measured `-dM`: `-march=skylake -mno-sse`,
+        // `-march=goldmont -mno-sse2`, `-march=znver4 -mno-sse`, and the
+        // `-mgeneral-regs-only -march=haswell` row). Their *intrinsics* stay
+        // refused because that gate separately requires SSE2
+        // (`features_permit`), which is exactly GCC's split. SSE3+ and the
+        // AVX-dependent families still require `simd_macros_enabled`.
         let xmm_macros_enabled = !self.no_sse;
         let simd_macros_enabled = xmm_macros_enabled && !self.no_sse2;
         preprocessor.set_extended_simd_macros(
@@ -2074,8 +2117,8 @@ impl Driver {
             simd_macros_enabled && self.enable_sse4_2,
             simd_macros_enabled && self.enable_avx,
             simd_macros_enabled && self.enable_avx2,
-            simd_macros_enabled && self.enable_aes,
-            simd_macros_enabled && self.enable_pclmul,
+            self.enable_aes,
+            self.enable_pclmul,
             simd_macros_enabled && self.enable_f16c,
             simd_macros_enabled && self.enable_fma,
             // INTEGER-ISA macros follow the RESOLVED codegen permission
@@ -2116,7 +2159,7 @@ impl Driver {
             simd_macros_enabled && self.enable_avxneconvert,
             simd_macros_enabled && self.enable_avx10_1,
             simd_macros_enabled && self.enable_avx10_2,
-            xmm_macros_enabled && self.enable_gfni,
+            self.enable_gfni,
             simd_macros_enabled && self.enable_vaes,
             simd_macros_enabled && self.enable_vpclmulqdq,
             simd_macros_enabled && self.enable_avxvnniint8,
@@ -2538,6 +2581,7 @@ impl Driver {
         sema.set_builtin_policy(self.builtin_policy.clone());
         sema.set_pre_c99_dialect(self.pre_c99_dialect());
         sema.set_gnu89_inline(self.gnu89_inline);
+        sema.set_c23_dialect(self.c23_dialect());
         sema.set_weak_pragma_names(
             preprocessor
                 .weak_pragmas
@@ -2636,6 +2680,11 @@ impl Driver {
                 0
             };
             crate::common::types::set_target_vector_lowering_bytes(bytes);
+            // Preferred width first: `set_x86_simd_isa` folds it into the
+            // 256-bit permission it publishes (see that function).
+            crate::passes::vectorize::set_x86_prefer_vector_bits(
+                self.resolved_prefer_vector_bits(),
+            );
             crate::passes::vectorize::set_x86_simd_isa(
                 isa.simd,
                 isa.ymm,
@@ -4318,6 +4367,37 @@ impl Driver {
         }
     }
 
+    /// XSAVE/XRSTOR permission (`__XSAVE__`): the `-march=` row's bit or
+    /// `-mxsave`, under the `-mno-xsave` veto.  Deliberately independent of
+    /// the SSE/AVX ladder — that independence is the whole point of the
+    /// feature (Goldmont-class parts have XSAVE and no AVX).
+    pub(super) fn resolved_xsave(&self) -> bool {
+        matches!(self.target, Target::X86_64 | Target::I686)
+            && self.enable_xsave
+            && !self.xsave_explicitly_disabled
+    }
+
+    /// Resolved `-mprefer-vector-width=` for the pass world.
+    ///
+    /// Explicit request first (`-mprefer-vector-width=` or `-mprefer-avx128`);
+    /// otherwise the `-mtune=` row's SIMD datapath. The default is floored at
+    /// 256 bits: a part whose datapath is 128 bits wide executes a 256-bit
+    /// op as two 128-bit ops without extra *latency* for the element-wise
+    /// shapes these passes emit, so narrowing every such build would trade a
+    /// halved loop step for nothing — GCC keeps 256-bit code for
+    /// `-march=skylake` for the same reason. `-mprefer-vector-width=128` is
+    /// the way to ask for the narrow shapes, and it is honoured exactly.
+    pub(super) fn resolved_prefer_vector_bits(&self) -> u16 {
+        match self.x86_prefer_vector_bits {
+            Some(bits) => bits,
+            // The active row is the one `-mtune=`/`-march=` resolved (the
+            // session publishes it before any pass runs).
+            None => crate::backend::x86::cpu_model::active()
+                .prefer_vector_bits()
+                .max(256),
+        }
+    }
+
     /// PREFETCHW (`0F 0D /1`) permission: explicit `-mprfchw` or a
     /// PRFCHW-implying `-march=`, under the sticky `-mno-prfchw` veto. Never
     /// a default grant: the absent-march x86-64-v3 baseline does not include
@@ -4615,6 +4695,11 @@ impl Driver {
         set.insert_if(self.resolved_popcnt(), F::Popcnt);
         // CMPXCHG16B: granted only by `-mcx16` or a v2+ `-march` profile.
         set.insert_if(self.resolved_cx16(), F::Cx16);
+        // XSAVE/XRSTOR: its own CPUID bit and its own `-mxsave`, granted by the
+        // `-march=` row or the explicit flag under the `-mno-xsave` veto.  Off
+        // the SSE/AVX ladder on purpose (Goldmont/Tremont/Lujiazui/Bobcat),
+        // so it is published from its resolved predicate, never from `simd`.
+        set.insert_if(self.resolved_xsave(), F::Xsave);
 
         // SIMD classes straight from the codegen ceiling.
         let isa = self.x86_isa();
@@ -4642,9 +4727,17 @@ impl Driver {
         // and nothing in the backend emits them without `-maes`/`-mpclmul`
         // (or an `-march=<cpu>` profile), which is what makes the claim true.
         // Both have legacy (non-VEX) encodings, so `-mno-avx` does not
-        // remove them.
-        set.insert_if(simd && self.enable_aes, F::Aes);
-        set.insert_if(simd && self.enable_pclmul, F::Pclmul);
+        // remove them, and neither does an SSE-ladder denial: GCC 16.2 keeps
+        // announcing them under `-mno-sse`, `-mno-sse2` and
+        // `-mgeneral-regs-only` (measured `-dM`: `-march=skylake -mno-sse`
+        // still defines `__AES__`/`__PCLMUL__`, `-march=goldmont -mno-sse2`
+        // both, while `__SSE__`/`__SSE2__` are gone). The *intrinsic* gate is
+        // a separate, stricter decision that still demands SSE2
+        // ([`crate::backend::x86::isa::features_permit`]) -- which is exactly
+        // GCC's shape: it defines the macro and still rejects the call.  So
+        // the announcement follows the option alone, never `simd`.
+        set.insert_if(self.enable_aes, F::Aes);
+        set.insert_if(self.enable_pclmul, F::Pclmul);
         // VAES / VPCLMULQDQ: the EVEX 256-bit forms of `aesenc` and
         // `pclmulqdq`.  Two conditions, both measured against GCC 12.2:
         //   * the 256-bit vector class must be permitted (`isa.ymm`, the
@@ -4720,7 +4813,11 @@ impl Driver {
         // this row lccc emitted `gf2p8mulb %xmm1, %xmm0` for `-march=x86-64`:
         // the same SIGILL class as the VNNI case, on an instruction whose
         // *legacy* encoding makes `-mno-avx` useless as a defence.
-        set.insert_if(simd && self.enable_gfni, F::Gfni);
+        // The same ladder-independence holds for GFNI (measured:
+        // `-march=znver4 -mno-sse` defines `__GFNI__` alongside `__AES__`
+        // and `__PCLMUL__`); `features_permit` keeps the SSE2 requirement for
+        // the three intrinsics.
+        set.insert_if(self.enable_gfni, F::Gfni);
 
         // AVX-512 helpers are instruction-level capabilities, not a blanket
         // consequence of the 512-bit result carrier. Publish only explicitly

@@ -33,22 +33,10 @@
 # image is a gate that silently changes strength between runs, so the oracle is
 # now selected by capability and named in the output.
 #
-# KNOWN DIVERGENCE (asserted, not hidden)
-# ---------------------------------------
-# Two rows are recorded as known divergences and verified to be *exactly* that,
-# so they cannot silently widen:
-#
-#   pos_n3037       @ -std=c17 : GCC rejects, lccc accepts.
-#   pos_anon_member @ -std=c17 : GCC rejects, lccc accepts.
-#
-# C 6.7.2.3 makes an inner-scope definition a new type incompatible with the
-# outer one, so GCC is right. lccc gives two definitions with *corresponding*
-# members the same key, which is what C23 (N3037) requires; pre-C23 it is too
-# permissive. It cannot miscompile -- corresponding members means identical
-# layouts, so the values are interchangeable in memory -- and closing it needs
-# the C standard threaded into sema (which currently has no notion of -std)
-# plus a mode-gated N3037 compatibility relation. Making keys always distinct
-# without that relation would reject valid C23, which is worse.
+# C23 N3037 compatibility is dialect-gated: corresponding members are
+# compatible in C23, while pre-C23 inner-scope tag definitions denote a new,
+# incompatible type even when their layouts happen to match. Both rows below
+# are checked in both modes against an oracle; no known divergence is waived.
 
 set -uo pipefail
 
@@ -410,8 +398,8 @@ for case in pos_tagonly_assign pos_sizeof_inner pos_alignof_inner pos_transparen
 done
 ROWS+=("verdict|pos_n3037|c23|-|-")
 ROWS+=("verdict|pos_anon_member|c23|-|-")
-ROWS+=("divergence|pos_n3037|c17|REJECT|accept|C23 N3037 correspondence is unconditional; diagnostics only, layouts identical")
-ROWS+=("divergence|pos_anon_member|c17|REJECT|accept|same class as pos_n3037")
+ROWS+=("verdict|pos_n3037|c17|$REC_GCC|$REC_LCCC")
+ROWS+=("verdict|pos_anon_member|c17|$REC_GCC|$REC_LCCC")
 for std in c17 c23; do
     ROWS+=("verdict|neg_alignof_outer|$std|static assertion failed|static assertion failed")
 done

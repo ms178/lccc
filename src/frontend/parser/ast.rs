@@ -1643,6 +1643,7 @@ pub enum TypeSpecifier {
         Option<usize>,
         Option<bool>,
         bool, // GNU designated_init, diagnostic-only
+        Span,
     ),
     /// Union: (name, fields, is_packed, max_field_align from #pragma pack, struct-level aligned attribute,
     /// scalar_storage_order: Some(true) = big-endian, Some(false) = little-endian, None = default/native)
@@ -1653,6 +1654,7 @@ pub enum TypeSpecifier {
         Option<usize>,
         Option<usize>,
         Option<bool>,
+        Span,
     ),
     /// Enum: (name, variants, is_packed, C23 fixed underlying type `: T`)
     Enum(
@@ -1660,6 +1662,7 @@ pub enum TypeSpecifier {
         Option<Vec<EnumVariant>>,
         bool,
         Option<Box<TypeSpecifier>>,
+        Span,
     ),
     TypedefName(String),
     Pointer(Box<TypeSpecifier>, AddressSpace),
@@ -2375,10 +2378,10 @@ impl TypeSpecifier {
             | TypeSpecifier::NullPtrT
             | TypeSpecifier::Struct(_, None, ..)
             | TypeSpecifier::Union(_, None, ..)
-            | TypeSpecifier::Enum(_, None, _, None) => {}
-            TypeSpecifier::Enum(_, None, _, Some(underlying)) => underlying.for_each_expr(f),
+            | TypeSpecifier::Enum(_, None, _, None, _) => {}
+            TypeSpecifier::Enum(_, None, _, Some(underlying), _) => underlying.for_each_expr(f),
             TypeSpecifier::Struct(_, Some(fields), ..)
-            | TypeSpecifier::Union(_, Some(fields), ..) => {
+            | TypeSpecifier::Union(_, Some(fields), .., _) => {
                 for field in fields {
                     field.type_spec.for_each_expr(f);
                     for derived in &field.derived {
@@ -2389,7 +2392,7 @@ impl TypeSpecifier {
                     }
                 }
             }
-            TypeSpecifier::Enum(_, Some(variants), _, underlying) => {
+            TypeSpecifier::Enum(_, Some(variants), _, underlying, _) => {
                 if let Some(underlying) = underlying {
                     underlying.for_each_expr(f);
                 }

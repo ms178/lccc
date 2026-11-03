@@ -114,6 +114,13 @@ pub enum X86Feature {
     Sse42,
     Popcnt,
     Cx16,
+    /// XSAVE/XRSTOR and the extended state-component instructions.  Its own
+    /// CPUID bit (leaf 1, ECX bit 26) and its own `-mxsave` flag, and NOT
+    /// implied by AVX: Goldmont, Goldmont Plus, Tremont, Lujiazui and Bobcat
+    /// (`btver1`) have it without AVX, and `-mavx -mno-xsave` keeps AVX while
+    /// dropping it (measured on gcc-16.2, both directions).  It is what
+    /// `__XSAVE__` announces.
+    Xsave,
     Avx,
     Avx2,
     Fma,
@@ -181,7 +188,7 @@ pub enum X86Feature {
 
 impl X86Feature {
     /// Every tracked feature, for table-driven tests.
-    pub const ALL: [X86Feature; 45] = [
+    pub const ALL: [X86Feature; 46] = [
         X86Feature::Cmov,
         X86Feature::Fxsr,
         X86Feature::Mmx,
@@ -193,6 +200,7 @@ impl X86Feature {
         X86Feature::Sse42,
         X86Feature::Popcnt,
         X86Feature::Cx16,
+        X86Feature::Xsave,
         X86Feature::Avx,
         X86Feature::Avx2,
         X86Feature::Fma,
@@ -243,6 +251,7 @@ impl X86Feature {
             X86Feature::Sse42 => "sse4.2",
             X86Feature::Popcnt => "popcnt",
             X86Feature::Cx16 => "cx16",
+            X86Feature::Xsave => "xsave",
             X86Feature::Avx => "avx",
             X86Feature::Avx2 => "avx2",
             X86Feature::Fma => "fma",
@@ -300,6 +309,7 @@ impl X86Feature {
             "sse4.2" | "sse4_2" => X86Feature::Sse42,
             "popcnt" => X86Feature::Popcnt,
             "cx16" => X86Feature::Cx16,
+            "xsave" => X86Feature::Xsave,
             "avx" => X86Feature::Avx,
             "avx2" => X86Feature::Avx2,
             "fma" | "fma3" => X86Feature::Fma,
@@ -468,7 +478,6 @@ mod tests {
             "adx",
             "rdseed",
             "fsgsbase",
-            "xsave",
             "xsaveopt",
             "avx512gfni",
             "amx_tile",

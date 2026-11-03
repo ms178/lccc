@@ -849,3 +849,16 @@ mod has_attribute_tests {
         assert!(!Preprocessor::is_supported_attribute("no_such_attribute"));
     }
 }
+
+#[cfg(test)]
+mod has_macro_utf8_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_has_macro_expansion_preserves_utf8_literals() {
+        let mut pp = Preprocessor::new();
+        let source = "const char *s = \"é\"; int c = '__has_feature'; int f = __has_feature(x);";
+        let expected = "const char *s = \"é\"; int c = '__has_feature'; int f = 0;";
+        assert_eq!(pp.resolve_has_macros_in_code(source, 1), expected);
+    }
+}

@@ -42,6 +42,8 @@ CASES = {
     'ignored-record-member': 'struct D {int x;};struct O {struct D d __attribute__((designated_init));};struct D d={1};',
     'invalid-union': 'union __attribute__((designated_init)) U {int x;};',
     'invalid-scalar': 'int x __attribute__((designated_init));',
+    'shadow-restore': RECORD + 'struct D a={1,2};int f(void){{struct D {int x;};struct D b={3};if(b.x!=3)return 1;}struct D c={4,5};return c.x;}',
+    'nested-enum-shadow': 'struct __attribute__((designated_init)) D {enum E {A,B} x;int y;};int f(void){{enum E {C,D};}struct D d={A,2};return d.x;}',
 }
 FLAGS = [[], ['-Wno-designated-init'], ['-Werror=designated-init'],
          ['-Werror=designated-init', '-Wno-error=designated-init'],

@@ -902,8 +902,10 @@ impl X86Codegen {
     /// pointer, or any frame past 2 GiB in `-fomit-frame-pointer` mode -- the
     /// address has to be formed first:
     ///
-    ///     movq $D, %rcx           # D = the slot's displacement from the base
-    ///     leaq (%rsp,%rcx), %rcx
+    /// ```text
+    /// movq $D, %rcx           # D = the slot's displacement from the base
+    /// leaq (%rsp,%rcx), %rcx
+    /// ```
     ///
     /// `%rcx` is this backend's secondary scratch register, and `reg_cache` is
     /// invalidated so no later path reuses a value it believed was live there.

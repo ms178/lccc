@@ -256,6 +256,7 @@ impl Lowerer {
                 struct_aligned,
                 reverse_sso,
                 _,
+                _,
             ) => {
                 // Recursively register nested struct/union types in fields
                 self.register_nested_struct_types(fields);
@@ -303,6 +304,7 @@ impl Lowerer {
                 pragma_pack,
                 struct_aligned,
                 reverse_sso,
+                _,
             ) => {
                 // Recursively register nested struct/union types in fields
                 self.register_nested_struct_types(fields);
@@ -378,7 +380,7 @@ impl Lowerer {
     ) {
         match ts {
             TypeSpecifier::Struct(_, Some(fields), ..)
-            | TypeSpecifier::Union(_, Some(fields), ..) => {
+            | TypeSpecifier::Union(_, Some(fields), .., _) => {
                 out.push(ts);
                 for f in fields {
                     Self::collect_struct_union_type_specs(&f.type_spec, out);
@@ -401,6 +403,7 @@ impl Lowerer {
                 struct_aligned,
                 reverse_sso,
                 _,
+                _,
             ) => (
                 tag,
                 fields,
@@ -417,6 +420,7 @@ impl Lowerer {
                 pragma_pack,
                 struct_aligned,
                 reverse_sso,
+                _,
             ) => (
                 tag,
                 fields,
@@ -501,11 +505,11 @@ impl Lowerer {
     /// Walk a TypeSpecifier and register any struct/union definitions found within it.
     fn register_nested_in_type_spec(&mut self, ts: &TypeSpecifier) {
         match ts {
-            TypeSpecifier::Struct(_tag, Some(_fields), ..) => {
+            TypeSpecifier::Struct(_tag, Some(_fields), .., _) => {
                 // This is a struct definition inside a field (named or anonymous) - register it
                 self.register_struct_type(ts);
             }
-            TypeSpecifier::Union(_tag, Some(_fields), ..) => {
+            TypeSpecifier::Union(_tag, Some(_fields), .., _) => {
                 // This is a union definition inside a field (named or anonymous) - register it
                 self.register_struct_type(ts);
             }
@@ -536,7 +540,7 @@ impl Lowerer {
     /// Returns the layout map key if the type is a union (directly or via typedef).
     pub(super) fn union_layout_key(&self, ts: &TypeSpecifier) -> Option<String> {
         match ts {
-            TypeSpecifier::Union(tag, ..) => {
+            TypeSpecifier::Union(tag, .., _) => {
                 let prefix = "union.";
                 tag.as_ref().map(|name| format!("{}{}", prefix, name))
             }
@@ -596,7 +600,16 @@ impl Lowerer {
         }
         let ts = self.resolve_type_spec(ts);
         match ts {
-            TypeSpecifier::Struct(tag, Some(fields), is_packed, pragma_pack, _, reverse_sso, _) => {
+            TypeSpecifier::Struct(
+                tag,
+                Some(fields),
+                is_packed,
+                pragma_pack,
+                _,
+                reverse_sso,
+                _,
+                _,
+            ) => {
                 if let Some(tag) = tag {
                     let layouts = self.types.borrow_struct_layouts();
                     if let Some(layout) = layouts
@@ -614,7 +627,7 @@ impl Lowerer {
                     reverse_sso.is_some_and(|v| v),
                 )))
             }
-            TypeSpecifier::Struct(Some(tag), None, ..) => {
+            TypeSpecifier::Struct(Some(tag), None, .., _) => {
                 let layouts = self.types.borrow_struct_layouts();
                 layouts
                     .get(&format!("struct.{}", tag))
@@ -625,7 +638,7 @@ impl Lowerer {
                         layouts.get(tag.as_str()).cloned()
                     })
             }
-            TypeSpecifier::Union(tag, Some(fields), is_packed, pragma_pack, _, reverse_sso) => {
+            TypeSpecifier::Union(tag, Some(fields), is_packed, pragma_pack, _, reverse_sso, _) => {
                 if let Some(tag) = tag {
                     let layouts = self.types.borrow_struct_layouts();
                     if let Some(layout) = layouts
@@ -643,7 +656,7 @@ impl Lowerer {
                     reverse_sso.is_some_and(|v| v),
                 )))
             }
-            TypeSpecifier::Union(Some(tag), None, ..) => {
+            TypeSpecifier::Union(Some(tag), None, .., _) => {
                 let layouts = self.types.borrow_struct_layouts();
                 layouts.get(&format!("union.{}", tag)).cloned().or_else(|| {
                     // Anonymous unions from typeof/ctype_to_type_spec use the
@@ -2065,7 +2078,7 @@ impl Lowerer {
                 }
                 false
             }
-            TypeSpecifier::Struct(Some(tag), ..) | TypeSpecifier::Union(Some(tag), ..) => {
+            TypeSpecifier::Struct(Some(tag), .., _) | TypeSpecifier::Union(Some(tag), .., _) => {
                 let key = if matches!(type_spec, TypeSpecifier::Union(..)) {
                     format!("union.{}", tag)
                 } else {
@@ -2076,7 +2089,7 @@ impl Lowerer {
                     .is_some_and(|fs| fs.vla_typedef_sizes.contains_key(&key))
             }
             TypeSpecifier::Struct(_, Some(fields), ..)
-            | TypeSpecifier::Union(_, Some(fields), ..) => fields.iter().any(|f| {
+            | TypeSpecifier::Union(_, Some(fields), .., _) => fields.iter().any(|f| {
                 if f.bit_width.is_some() {
                     return false;
                 }

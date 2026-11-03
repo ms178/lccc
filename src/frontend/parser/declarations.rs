@@ -1481,6 +1481,11 @@ impl Parser {
     ) -> bool {
         let is_typedef = self.attrs.parsing_typedef();
         if is_typedef {
+            for decl in declarators {
+                if !decl.name.is_empty() {
+                    self.record_typedef_scope_change(&decl.name);
+                }
+            }
             self.record_typedef_object_spaces(declarators, decl_addr_space);
             for decl in declarators {
                 if !decl.name.is_empty() {

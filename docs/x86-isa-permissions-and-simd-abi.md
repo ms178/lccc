@@ -196,12 +196,49 @@ permission (§1). GCC also names the CPU:
 
 `gen_x86_arch_table.py --check` verifies the two defaulting rules against
 GCC for every CPU. `-mno-mmx` withdraws `__MMX__`, as GCC does, while the
-MMX intrinsics stay (lccc emulates them without the MMX registers). One
-deliberate difference: with the SSE register file off (`-mno-sse`,
-`-mno-sse2`, `-mgeneral-regs-only`) GCC still defines `__AES__`,
-`__PCLMUL__` and `__GFNI__` but rejects their intrinsics; lccc's macros
-only announce intrinsics that compile. On i686, lccc keeps upstream's unconditional
-`__i686`/`__i686__` (the `i686-linux-gnu-gcc` spelling).
+MMX intrinsics stay (lccc emulates them without the MMX registers).
+`-mgeneral-regs-only` is a sticky `-mno-mmx` on top of its SSE denial: the
+SSE levels come back with a later `-maes`/`-msse`, `__MMX__` only with
+`-mmmx` (measured, both orders, `-m64` and `-m32`). On i686, lccc keeps
+upstream's unconditional `__i686`/`__i686__` (the `i686-linux-gnu-gcc`
+spelling).
+
+Two announcement rules are deliberately *not* on the SSE ladder, because GCC
+keeps them there:
+
+* **`__AES__`, `__PCLMUL__`, `__GFNI__`** follow the option bits alone. With
+  the SSE register file off (`-mno-sse`, `-mno-sse2`,
+  `-mgeneral-regs-only`) GCC still defines them and still rejects their
+  intrinsics; lccc now does the same, because the intrinsic gate is the
+  stricter, separate decision in §1.3 (`features_permit` requires SSE2 for
+  exactly these three). So `-march=znver4 -mno-sse` announces `__AES__`,
+  `__PCLMUL__` and `__GFNI__` and refuses `_mm_aesenc_si128`, byte for byte
+  like the oracle. Before the fix a `-march=` row's AES/PCLMUL/GFNI grant was
+  dropped by the denial (`-march=haswell -mno-sse`, `-march=goldmont
+  -mno-sse2`, `-march=znver4 -mno-sse`: 16 measured rows), while explicit
+  grants happened to survive.
+* **`__XSAVE__`** is CPUID leaf 1 ECX bit 26 with its own `-mxsave`, granted
+  by a `-march=` row that carries it or by the flag, under a sticky
+  `-mno-xsave` veto. It is *not* an AVX implication in either direction:
+  `btver1`, `goldmont`, `goldmont-plus`, `lujiazui` and `tremont` carry it
+  without AVX, and `-mno-xsave` takes `__AVX__` down with it (`-mavx
+  -mno-xsave` leaves neither macro) because the `ymm` state lives in an XSAVE
+  component — a later `-mavx`/`-mavx2`/`-mfma` reopens both.
+
+  The veto has one second-order consequence the oracle gets wrong, and lccc
+  deliberately does not copy it: GCC's `-mno-xsave` clears `MASK_AVX` without
+  cascading into the dependent option bits, so `-msha512 -mno-xsave` — and
+  `-march=clearwaterforest -mno-xsave`, with `__SM3__`/`__SM4__` — still
+  *announces* those macros while the same command line rejects
+  `_mm256_sha512msg1_epi64`, `_mm_sm3msg1_epi32` and `_mm_sm4key4_epi32` from
+  `sha512intrin.h`/`sm3intrin.h`. lccc drops the announcement with the state
+  component it needs, which is the stricter reading and never weaker: a
+  `#ifdef __SHA512__` probe can no longer select a path the intrinsic gate
+  refuses. `scripts/check_x86_mflag_macros.py` pins this from both sides —
+  the three macros are masked out of the *missing* direction only, and must be
+  absent from lccc whenever `-mno-xsave` is the last decision — across the 24
+  ordered `CASCADES` that run on every `-march=` base, so neither the
+  announcement nor the drop can drift silently.
 
 `__SSE_MATH__`/`__SSE2_MATH__` state which scalar float math the code
 generator does in SSE; the ISA level alone doesn't determine it. x86-64
@@ -212,6 +249,35 @@ to `double` in memory, so `__FLT_EVAL_METHOD__` stays 0). So on i686,
 are the macros GCC 16.2 gives its own F32-in-SSE, F64-on-x87 mode
 (`-m32 -msse -mno-sse2 -mfpmath=sse`). The previous Clang-style pair told
 code keyed on `__SSE2_MATH__` that doubles never touch x87.
+
+### 1.7 Vector width: `-mprefer-vector-width=`
+
+A cost-model request, never an ISA grant. GCC 16.2 accepts `128`, `256`,
+`512` and `none` (plus the deprecated `-mprefer-avx128` alias for `128`) and
+rejects anything else with `unrecognized argument in option
+'-mprefer-vector-width=N'`; lccc takes the same vocabulary, the same
+last-wins order and the same wording.
+
+Resolution: an explicit flag first, otherwise the active `-mtune=` row's SIMD
+datapath (`X86Tune::prefer_vector_bits`) floored at 256. A 128-bit datapath
+executes a 256-bit element-wise op as two 128-bit ops without extra latency,
+so narrowing every such build would halve the loop step for nothing; GCC
+likewise keeps 256-bit code for `-march=skylake`.
+
+Effect: two separate cells, deliberately. `set_x86_simd_isa` publishes the
+*hardware* 256-bit permission, and `set_x86_prefer_vector_bits` publishes the
+width the cost model should aim for; every auto-vectorization width decision
+(loop, map, stencil, generator, byte-count, SLP and strided-reduction
+vectorizers) reads the conjunction (`x86_avx2_width_wanted`), so the
+preference cannot be half applied. The hardware permission stays whole
+because an explicit `vector_size(32)` type is a promise about the type, not a
+hint: GCC keeps one `vpaddd %ymm` for it under `-mprefer-vector-width=128`
+(measured), and `slp_vectorizer::family_for`, which the frontend's packed
+lowering shares, therefore keeps reading the raw permission.
+`-mprefer-vector-width=128` emits `xmm` loop code on an `-mavx2` target
+exactly as GCC does, `256`/`none`/`512` keep the widest implemented class
+(lccc has no AVX-512 emitter, so `512` means "widest available"), and the
+flag moves no predefined macro — GCC defines none for it either.
 
 ## 2. SIMD calling convention
 
@@ -256,7 +322,9 @@ instructions.
 | `abm_flags_match_gcc`, `isa_flags_follow_gccs_option_masks` (unit) | `-m` option order, cancellation and implications, measured cases |
 | `x86_cpu_name_macros_match_gcc` (unit) | CPU-name and tuning macros, measured cases |
 | `scripts/check_x86_march_macros.py LCCC` | Every CPU, `-m64` and `-m32`: ISA, CPU-name and `-mtune=` macros against GCC |
-| `scripts/check_x86_mflag_macros.py LCCC [--pairs]` | Every `-m` ISA option, alone and in ordered pairs, on five bases: macros against GCC |
+| `scripts/check_x86_mflag_macros.py LCCC [--pairs]` | Every `-m` ISA option, alone on six bases, plus the 24 ordered XSAVE/SSE-denial `CASCADES` that decide the option-layer mixes (`--pairs` widens it to every ordering): macros against GCC |
+| `scripts/check_x86_prefer_vector_width.py LCCC` | `-mprefer-vector-width=` codegen class per row against GCC, macro neutrality, rejection wording |
+| `x86_macro_gate_tests` (unit) | XSAVE precedence, the AES/PCLMUL/GFNI announcement split, the POPCNT unwind matrix, sticky `-mno-mmx`, `-mprefer-vector-width=` parsing |
 | `check_intrinsic_feature_gate.sh` | Intrinsic verdicts under `target()` option order, compared with GCC |
 | `check_target_attribute_isa.sh` | `target()` scoping, ordering, errors and intrinsic verdicts, re-measured on GCC |
 | `check_x86_scalar_intrinsics.sh` | Portable scalar intrinsics: semantics and instruction contract |
