@@ -51,7 +51,10 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         if lines[6] >= infos.len() || !all_editable(infos, &lines) {
             continue;
         }
-        if lines.iter().any(|&i| infos[i].volatile_access || infos[i].is_nop()) {
+        if lines
+            .iter()
+            .any(|&i| infos[i].volatile_access || infos[i].is_nop())
+        {
             continue;
         }
         let setup = infos[lines[1]].trimmed(store.get(lines[1]));
@@ -77,7 +80,8 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             continue;
         }
         let result_copy = infos[lines[3]].trimmed(store.get(lines[3]));
-        let Some(copy_args) = result_copy.strip_prefix(if width == 1 { "movl " } else { "movq " }) else {
+        let Some(copy_args) = result_copy.strip_prefix(if width == 1 { "movl " } else { "movq " })
+        else {
             continue;
         };
         let Some((copy_source, copy_dest)) = copy_args.split_once(',') else {
@@ -126,14 +130,22 @@ mod tests {
     #[test]
     fn fuses_identical_signed_and_unsigned_divisions() {
         for (stage, setup, div, copy) in [
-            ("movl %edi, %eax", "xorl %edx, %edx", "divl %esi", "movl %edx, %r8d"),
+            (
+                "movl %edi, %eax",
+                "xorl %edx, %edx",
+                "divl %esi",
+                "movl %edx, %r8d",
+            ),
             ("movl %edi, %eax", "cltd", "idivl %esi", "movl %eax, %r8d"),
-            ("movq %rdi, %rax", "xorq %rdx, %rdx", "divq %rsi", "movq %rdx, %r8"),
+            (
+                "movq %rdi, %rax",
+                "xorq %rdx, %rdx",
+                "divq %rsi",
+                "movq %rdx, %r8",
+            ),
             ("movq %rdi, %rax", "cqto", "idivq %rsi", "movq %rax, %r8"),
         ] {
-            let body = format!(
-                "{stage}\n{setup}\n{div}\n{copy}\n{stage}\n{setup}\n{div}\nret\n"
-            );
+            let body = format!("{stage}\n{setup}\n{div}\n{copy}\n{stage}\n{setup}\n{div}\nret\n");
             let (changed, output) = apply(&body);
             assert!(changed, "{output}");
             assert_eq!(output.matches(div).count(), 1, "{output}");
