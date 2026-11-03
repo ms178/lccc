@@ -423,6 +423,11 @@ pub enum UnicodeCharKind {
     Utf16,
     /// `U'x'`: `char32_t` = unsigned int.
     Utf32,
+    /// `L'x'`: `wchar_t`, whose type is the target's and the flags' (`int`
+    /// on x86 and RISC-V, `unsigned int` on AArch64, `unsigned short` under
+    /// `-fshort-wchar`; see `common::types::wchar_ctype`). Its code unit is
+    /// UTF-32, or UTF-16 under `-fshort-wchar`.
+    Wide,
 }
 
 impl TokenKind {

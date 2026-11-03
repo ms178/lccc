@@ -22,6 +22,7 @@ use super::types::*;
 use crate::backend::regalloc::RaConfig;
 
 // Submodule pass implementations
+mod abs_cmov;
 mod bmi2_mask;
 mod callee_saves;
 mod compare_branch;
@@ -57,6 +58,7 @@ mod relay_and_lea;
 mod return_bool;
 mod return_home;
 mod self_zext;
+mod sext_test;
 mod sign_test;
 mod spill_deref;
 mod store_forwarding;
@@ -1815,7 +1817,8 @@ fn peephole_optimize_inner(
         // substitutions, spill-deref folds); Phase 1's copy before the LEA
         // window fold is the primary site, this is the mop-up. Idempotent.
         if !sk("dead_inplace_ext") {
-            global_changed |= narrow_copy_fold::eliminate_dead_inplace_ext(&mut store, &mut infos);
+            global_changed |=
+                narrow_copy_fold::eliminate_dead_inplace_extensions(&mut store, &mut infos);
         }
         if !sk("dead_regs") {
             global_changed |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
@@ -2216,8 +2219,15 @@ fn peephole_optimize_inner(
     if !sk("ebb_reuse") && ebb_reuse::reuse_ebb_copies_and_flags(&mut store, &mut infos) {
         retire_dead_pure_writes(&store, &mut infos, !sk("dead_flag_writes"));
     }
-    if !sk("copy_sink") {
-        ebb_reuse::sink_copies_into_fallthrough(&mut store, &mut infos);
+    // A sunk copy opens the fall-through arm, and its reader may sit past the
+    // arm's unmentioned label (`je .LBB3; movq %rcx, %r8; .LBB1: testl %r8d,
+    // %r8d`, sqlite3VdbeUsesBtree): copy propagation reads the source through
+    // such a label, and the retirement drops the copy once nothing reads it.
+    if !sk("copy_sink") && ebb_reuse::sink_copies_into_fallthrough(&mut store, &mut infos) {
+        if !sk("copy_prop") {
+            copy_propagation::propagate_register_copies(&mut store, &mut infos);
+        }
+        retire_dead_pure_writes(&store, &mut infos, !sk("dead_flag_writes"));
     }
 
     // Phase 5: Tail call optimization.
@@ -2353,6 +2363,15 @@ fn peephole_optimize_inner(
         pow2_cmov::run(&mut store, &mut infos);
     }
 
+    // Phase 8d'': the sign-magnitude identity (`mov; sar $31; xor; sub`, from
+    // `abs` and `x < 0 ? -x : x`) into GCC's and Clang's `mov; neg; cmovs` --
+    // one instruction (two when the result is then copied out) and one cycle
+    // of latency shorter.  After `return_home` for the same reason as
+    // `pow2_cmov`.  `CCC_PEEPHOLE_SKIP=abs_cmov` disables it for bisection.
+    if !sk("abs_cmov") {
+        abs_cmov::run(&mut store, &mut infos);
+    }
+
     // Phase 8d-1: an in-place byte mask whose only consumer is a condition —
     // `andl $255, %r10; testq %r10, %r10; je` becomes `testb %r10b, %r10b; je`,
     // and a mask whose value is wanted but whose flags are dead becomes the
@@ -2366,6 +2385,10 @@ fn peephole_optimize_inner(
     // shortened text rather than a mask they would have to look through.
     if !sk("mask_test") {
         mask_test::fold_inplace_mask_test(&mut store, &mut infos);
+    }
+
+    if !sk("sext_test") {
+        sext_test::run(&mut store, &mut infos);
     }
 
     if !sk("return_bool") {

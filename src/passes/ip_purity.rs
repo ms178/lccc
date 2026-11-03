@@ -775,7 +775,6 @@ fn analyze_out_param_summary(
                 | Instruction::VaCopy { .. }
                 | Instruction::VaArg { .. }
                 | Instruction::VaArgStruct { .. }
-                | Instruction::VaArgVector { .. }
                 | Instruction::PgoCounterInc { .. }
                 | Instruction::Fence { .. }
                 | Instruction::InitTrampoline { .. }
@@ -983,7 +982,6 @@ fn analyze_function_purity_with_summaries(
                 | Instruction::VaCopy { .. }
                 | Instruction::VaArg { .. }
                 | Instruction::VaArgStruct { .. }
-                | Instruction::VaArgVector { .. }
                 | Instruction::PgoCounterInc { .. }
                 | Instruction::Fence { .. }
                 | Instruction::InitTrampoline { .. }

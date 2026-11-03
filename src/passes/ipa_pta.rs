@@ -913,11 +913,6 @@ fn compute_effects(solver: &Solver, module: &IrModule) -> Vec<ModRef> {
                         dest_ptr,
                         va_list_ptr,
                         ..
-                    }
-                    | Instruction::VaArgVector {
-                        dest_ptr,
-                        va_list_ptr,
-                        ..
                     } => {
                         if let Some(node) = node(solver, *dest_ptr) {
                             local_mods[fi].union_with(&pointer_effects(solver, node));

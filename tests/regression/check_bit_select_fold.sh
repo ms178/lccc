@@ -24,9 +24,9 @@
 #   2. the controls keep their exact counts in both builds: a two-bit mask
 #      (`3u << n`, under both `|` and `^`), a mask compared against a
 #      non-zero constant, and a shift whose result is used twice,
-#   3. the equality direction, `(x & 1 << n) == 0`, keeps its count: `BitTest`
-#      is a 0/1 value, so the negated form needs a second instruction and the
-#      fold would not save the compare,
+#   3. the equality direction, `(x & 1 << n) == 0`, selects `bt; setnc`: the
+#      carry flag IS the bit, so its complement is one `setnc` and the fold
+#      saves the shift, the mask and the compare exactly as for `!= 0`,
 #   4. `CCC_NO_BIT_SELECT=1` brings every folded shape back to its pinned
 #      count and removes every bit mnemonic, which is what proves the
 #      assertions above belong to this fold and not to some other rule,
@@ -35,7 +35,17 @@
 #      must stay the same length or shrink -- and the native mnemonics appear
 #      where the ISA has them (`btsl`/`btrl` on i686, `bic` on AArch64),
 #   6. -O0, -O1, -O2, -O3, -Os, the kill switch and GCC agree bit for bit on a
-#      checksum over every width, both edges and 64-bit operands.
+#      checksum over every width, both edges and 64-bit operands,
+#   7. the Chromium/Firefox-derived consumers of the test fold to the shapes
+#      Clang 23.1.4 / GCC 16.2 emit or better: test-and-modify of one word
+#      (`bt` + `btr`/`bts`, one load and one store), the branch forms
+#      (`bt; jnc`, the negated `bt; jc`, the conditional sibling call
+#      `bt; jb hit@PLT`), the guarded set and the conditional clear (one
+#      `bts`/`btr`: the guard is implied), the MSB-first byte map, and the
+#      carry consumers (`bt; adc $0` / `bt; sbb $0` instead of a shift, a
+#      mask and an add -- `CCC_NO_BT_ADC_FUSION=1` restores the long form),
+#      while a sign-extended mask (`long & (1 << d)`, where bit 31 is not a
+#      one-bit test) keeps its shape.
 set -euo pipefail
 CCC=${LCCC_BIN:-${CCC:-target/fastbuild/lccc}}
 bindir=$(CDPATH= cd -- "$(dirname -- "$CCC")" && pwd)
@@ -136,7 +146,9 @@ refuse() { # $1 = build, $2 = label, $3 = pattern, $4 = message
 # ── 1. The folded shapes select the bit instruction, nothing else ──────────
 expect bset32 3 on.s
 expect bset64 3 on.s
-expect bset_masked 4 on.s
+# `bts` reduces the index modulo the operand width, so `n & 31` is free.
+expect bset_masked 3 on.s
+refuse on.s bset_masked 'and[lq][[:space:]]' "the index mask must be dead"
 expect bclr32 3 on.s
 expect bclr64 3 on.s
 expect btest32 4 on.s
@@ -168,7 +180,9 @@ refuse on.s btog32 'xor[lq][[:space:]]' "the XOR must be the bit instruction"
 want on.s shared_four 'bts[lq][[:space:]]'
 want on.s shared_four 'btr[lq][[:space:]]'
 want on.s shared_four 'btc[lq][[:space:]]'
-want on.s shared_four 'bt[lq][[:space:]]'
+# The test needs no `bt` of its own: the toggle's `btc` leaves the old bit in
+# CF, which the `setc` reads (`bt_modify_pairs`).
+want on.s shared_four 'setc[[:space:]]'
 refuse on.s shared_four 'sh[lq][[:space:]]' "the shared mask producer must be dead"
 refuse on.s shared_four 'not[lq][[:space:]]' "the shared complement must be dead"
 want on.s shared64 'btsq[[:space:]]'
@@ -186,8 +200,9 @@ for build in on.s off.s; do
     expect keep_eq4 8 "$build"
 done
 
-# ── 3. The equality direction is not folded ────────────────────────────────
-expect btest32z 7 on.s
+# ── 3. The equality direction folds to the complemented carry ──────────────
+expect btest32z 4 on.s
+want on.s btest32z 'setnc[[:space:]]'
 expect btest32z 7 off.s
 
 # ── 4. The kill switch restores the shift spelling, shape for shape ────────
@@ -204,6 +219,72 @@ for label in bset32 bset64 bclr32 bclr64 btest32 btest64 btog32 btog64 shared_se
     refuse off.s "$label" '(^|[[:space:]])bt[s]?[lq]?[[:space:]]' \
         "CCC_NO_BIT_SELECT must remove the bit instruction"
 done
+
+# ── 7. Browser-derived consumers of the bit test ──────────────────────────
+cat > "$tmp/rows.c" <<'C'
+typedef unsigned u32;
+void hit(u32);
+/* Firefox xpcom nsTArray / dav1d style test-and-modify of one word. */
+int test_clear(u32 *w, u32 n) { u32 m = 1u << n; int was = (*w & m) != 0; *w &= ~m; return was; }
+int test_set(u32 *w, u32 n) { int was = (*w >> n) & 1; *w |= 1u << n; return was; }
+void branch_clear(u32 *w, u32 n) { if (*w & (1u << n)) { *w &= ~(1u << n); hit(n); } }
+void branch_eq(u32 x, u32 n) { if (!(x & (1u << n))) hit(n); }
+void branch_not(u32 x, u32 n) { if (~x & (1u << n)) hit(n); }
+/* dav1d decode.c:1639 `if (wedge_allowed_mask & (1 << bs))` -> sibling call. */
+void cond_tail(int bs) { if (0x3BB80 & (1 << bs)) hit((u32)bs); }
+u32 guarded_set(u32 m, u32 i) { if (!(m & (1u << i))) m |= 1u << i; return m; }
+u32 select_clear(u32 x, u32 n) { return (x & (1u << n)) ? x & ~(1u << n) : x; }
+/* FreeType ttcmap.c:1868 MSB-first byte map. */
+int msb_test(const unsigned char *p, u32 i) { return (p[i >> 3] & (0x80 >> (i & 7))) != 0; }
+u32 count_bit(u32 acc, u32 x, u32 n) { return acc + ((x >> n) & 1); }
+u32 sub_bit(u32 acc, u32 x, u32 n) { return acc - ((x >> n) & 1); }
+int not_test(u32 x, u32 n) { return (~x & (1u << n)) != 0; }
+/* Control (libxml valid.c:309): `1 << d` is an int sign-extended into the
+   long, so bit 31 selects 33 bits -- not a one-bit test. */
+long keep_sext_mask(long occurs, unsigned char d) { return (occurs & (1 << d)) == 0; }
+/* LZMA 7zArcIn.c:280 CountDefinedBits shape. */
+u32 loop_count(const unsigned char *b, u32 n) { u32 s = 0; for (u32 i = 0; i < n; i++) s += (b[i >> 3] >> (i & 7)) & 1; return s; }
+C
+"$CCC" -O2 -S "$tmp/rows.c" -o "$tmp/rows-on.s"
+CCC_NO_BIT_SELECT=1 "$CCC" -O2 -S "$tmp/rows.c" -o "$tmp/rows-off.s"
+CCC_NO_BT_ADC_FUSION=1 "$CCC" -O2 -S "$tmp/rows.c" -o "$tmp/rows-noadc.s"
+# label on off: the folded count and the kill-switch count.
+while read -r label on off; do
+    expect "$label" "$on" rows-on.s
+    expect "$label" "$off" rows-off.s
+done <<'ROWS'
+test_clear 6 13
+test_set 6 10
+branch_clear 7 15
+branch_eq 5 8
+branch_not 5 9
+cond_tail 4 6
+guarded_set 3 11
+select_clear 3 12
+msb_test 9 11
+not_test 4 8
+keep_sext_mask 8 8
+ROWS
+want rows-on.s test_clear 'btr[lq][[:space:]]'
+want rows-on.s test_set 'bts[lq][[:space:]]'
+want rows-on.s branch_eq 'bt[lq][[:space:]]'
+want rows-on.s cond_tail 'j(b|c|nae)[[:space:]]+hit'
+refuse rows-on.s cond_tail 'movl[[:space:]]+%edi, %edi' \
+    "an int passed as unsigned needs no zero-extension"
+want rows-on.s guarded_set 'bts[lq][[:space:]]'
+want rows-on.s select_clear 'btr[lq][[:space:]]'
+refuse rows-on.s keep_sext_mask '(^|[[:space:]])bt[lq]?[[:space:]]' \
+    "a sign-extended mask is not a one-bit test"
+# The carry consumers: one `adc`/`sbb`, and the knob restores the long form.
+expect count_bit 4 rows-on.s
+expect sub_bit 4 rows-on.s
+want rows-on.s count_bit 'adc[lq][[:space:]]'
+want rows-on.s sub_bit 'sbb[lq][[:space:]]'
+expect count_bit 5 rows-noadc.s
+expect sub_bit 6 rows-noadc.s
+refuse rows-noadc.s count_bit 'adc[lq][[:space:]]' "CCC_NO_BT_ADC_FUSION must remove the adc"
+expect loop_count 17 rows-on.s
+expect loop_count 19 rows-noadc.s
 
 # ── 5. The other backends never get longer ────────────────────────────────
 # Every function of the corpus, compiled by both builds of each cross target:
@@ -277,6 +358,15 @@ static u64 shared64(u64 x, u64 n, u64 *o) {
     o[0] = x | m; o[1] = x & ~m;
     return (x ^ m) + ((x & m) != 0);
 }
+static int test_clear(u32 *w, u32 n) { u32 m = 1u << n; int was = (*w & m) != 0; *w &= ~m; return was; }
+static int test_set(u32 *w, u32 n) { int was = (*w >> n) & 1; *w |= 1u << n; return was; }
+static u32 guarded_set(u32 m, u32 i) { if (!(m & (1u << i))) m |= 1u << i; return m; }
+static u32 select_clear(u32 x, u32 n) { return (x & (1u << n)) ? x & ~(1u << n) : x; }
+static int msb_test(const unsigned char *p, u32 i) { return (p[i >> 3] & (0x80 >> (i & 7))) != 0; }
+static u32 count_bit(u32 acc, u32 x, u32 n) { return acc + ((x >> n) & 1); }
+static u32 sub_bit(u32 acc, u32 x, u32 n) { return acc - ((x >> n) & 1); }
+static int not_test(u32 x, u32 n) { return (~x & (1u << n)) != 0; }
+static long keep_sext_mask(long occurs, unsigned char d) { return (occurs & (1 << d)) == 0; }
 
 static unsigned h = 2166136261u;
 static void mix(uint64_t v) {
@@ -296,6 +386,14 @@ int main(void) {
             mix((unsigned)keep_eq4(x, n));
             { u32 o[3]; mix(shared_four(x, n, o)); mix(o[0]); mix(o[1]); mix(o[2]);
               mix(shared_escape(x, n, o)); mix(o[0]); }
+            { u32 w = x; mix((unsigned)test_clear(&w, n)); mix(w);
+              w = x; mix((unsigned)test_set(&w, n)); mix(w); }
+            mix(guarded_set(x, n)); mix(select_clear(x, n));
+            mix(count_bit(p * 7u, x, n)); mix(sub_bit(p * 7u, x, n));
+            mix((unsigned)not_test(x, n));
+            mix((uint64_t)keep_sext_mask((long)(int)x, (unsigned char)n));
+            { const unsigned char *b = (const unsigned char *)pat;
+              mix((unsigned)msb_test(b, p * 32u + n)); }
         }
     }
     for (unsigned p = 0; p < 5; p++) {

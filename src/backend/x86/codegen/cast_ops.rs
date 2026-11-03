@@ -1277,6 +1277,17 @@ impl X86Codegen {
         to_ty: IrType,
         dest_phys: crate::backend::regalloc::PhysReg,
     ) -> bool {
+        // An in-place `int -> unsigned` cast read only as narrow call
+        // arguments: the low 32 bits already are the value and no reader sees
+        // bits 32..63, so the zero-extending `movl %r, %r` is dead weight.
+        if from_ty == IrType::I32
+            && to_ty == IrType::U32
+            && self.narrow_call_arg_sign_casts.contains(&dest.0)
+            && self.operand_reg(src) == Some(dest_phys)
+        {
+            self.note_inplace_compute(dest_phys, dest.0);
+            return true;
+        }
         let widen_to_32 = self.sext_widen_writes_32(from_ty, to_ty, dest.0);
         if !self.try_emit_cast_reg_direct_inner(src, from_ty, to_ty, dest_phys, widen_to_32) {
             return false;

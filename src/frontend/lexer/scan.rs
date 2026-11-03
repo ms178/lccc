@@ -12,6 +12,10 @@ pub struct Lexer {
     /// C23 dialect: C23 keywords and digit separators (`1'000`).
     c23: bool,
     at_line_start: bool,
+    /// `L'x'` decodes in 16-bit units (`-fshort-wchar`) instead of 32-bit
+    /// ones. Read once, when the lexer is built, so one lexer never mixes two
+    /// `wchar_t` widths.
+    wide_unit16: bool,
     ident_pool: std::collections::HashMap<Vec<u8>, String>,
     /// Every diagnostic the lexer produced, errors and warnings alike, in the
     /// order the scanner met them.
@@ -157,6 +161,7 @@ impl Lexer {
             gnu_extensions: true,
             c23: false,
             at_line_start: true,
+            wide_unit16: crate::common::types::short_wchar(),
             ident_pool: std::collections::HashMap::with_capacity(512),
             diagnostics: Vec::new(),
         }
@@ -254,6 +259,74 @@ impl Lexer {
     /// GCC wording quotes it.
     fn escape_text(&self, span: Span) -> String {
         String::from_utf8_lossy(&self.input[span.start as usize..span.end as usize]).into_owned()
+    }
+
+    /// The token one character constant spelled `text` (encoding prefix
+    /// included) lexes to, or `None` when `text` is not exactly one token.
+    /// `wide_unit16` selects `-fshort-wchar`'s 16-bit `L'x'` unit.
+    ///
+    /// `#if` evaluation calls this so the preprocessor and the compiler proper
+    /// decode every escape, universal character name, multi-character
+    /// accumulation and code-unit width identically: GCC evaluates a
+    /// character constant in `#if` to the value it has in C (only the
+    /// operand's signedness rule is the preprocessor's own). Diagnostics are
+    /// dropped: no character constant in a directive reaches the compiler
+    /// proper, and the directive's own evaluation does not report them.
+    pub fn character_constant(text: &str, wide_unit16: bool) -> Option<TokenKind> {
+        let mut lexer = Self {
+            input: text.as_bytes().to_vec(),
+            pos: 0,
+            file_id: 0,
+            gnu_extensions: true,
+            c23: false,
+            at_line_start: false,
+            wide_unit16,
+            ident_pool: std::collections::HashMap::new(),
+            diagnostics: Vec::new(),
+        };
+        let token = lexer.next_token();
+        let literal = matches!(
+            token.kind,
+            TokenKind::CharLiteral(_)
+                | TokenKind::IntLiteral(_)
+                | TokenKind::UnicodeCharLiteral(..)
+        );
+        (literal && lexer.pos == text.len()).then_some(token.kind)
+    }
+
+    /// The bytes one narrow string literal spelled `text` (`"..."`, no
+    /// encoding prefix) denotes, escapes and universal character names
+    /// decoded exactly as in C, or `None` when `text` is not exactly one
+    /// such token.
+    ///
+    /// `#pragma GCC warning`, `#pragma GCC error` and `#pragma message` call
+    /// this so the message GCC prints from a string literal is the string's
+    /// value, decoded by the same code as the compiler proper (the
+    /// [`Self::character_constant`] rule, for strings). A narrow literal's
+    /// token text holds one `char` per byte, so every `char` is below 256.
+    pub fn narrow_string_literal(text: &str) -> Option<Vec<u8>> {
+        let mut lexer = Self {
+            input: text.as_bytes().to_vec(),
+            pos: 0,
+            file_id: 0,
+            gnu_extensions: true,
+            c23: false,
+            at_line_start: false,
+            wide_unit16: false,
+            ident_pool: std::collections::HashMap::new(),
+            diagnostics: Vec::new(),
+        };
+        let token = lexer.next_token();
+        let TokenKind::StringLiteral(value) = token.kind else {
+            return None;
+        };
+        if lexer.pos != text.len() {
+            return None;
+        }
+        value
+            .chars()
+            .map(|c| u8::try_from(u32::from(c)).ok())
+            .collect()
     }
 
     pub fn tokenize(&mut self) -> Vec<Token> {
@@ -355,7 +428,7 @@ impl Lexer {
             // followed by a digit.
             if self.at_line_start
                 && self.input[self.pos] == b'#'
-                && (self.is_line_marker() || self.is_diagnostic_pragma())
+                && (self.is_line_marker() || self.is_preserved_pragma())
             {
                 // Skip the entire line
                 while self.pos < self.input.len() && self.input[self.pos] != b'\n' {
@@ -425,9 +498,9 @@ impl Lexer {
         (val, overflow)
     }
 
-    /// Diagnostic pragmas remain in preprocessed text for the diagnostic
-    /// engine's byte-offset timeline, but are not C tokens.
-    fn is_diagnostic_pragma(&self) -> bool {
+    /// Diagnostic timelines and deferred message pragmas remain in -E text.
+    /// The preprocessor collected their diagnostics; neither is a C token.
+    fn is_preserved_pragma(&self) -> bool {
         let bytes = &self.input[self.pos + 1..];
         let end = bytes
             .iter()
@@ -437,7 +510,18 @@ impl Lexer {
         text.trim_start()
             .strip_prefix("pragma")
             .filter(|s| s.starts_with(char::is_whitespace))
-            .is_some_and(crate::common::diagnostic_pragma::is_diagnostic_pragma)
+            .is_some_and(|rest| {
+                crate::common::diagnostic_pragma::is_diagnostic_pragma(rest)
+                    || rest
+                        .trim_start()
+                        .strip_prefix("message")
+                        .is_some_and(|suffix| {
+                            suffix.is_empty()
+                                || suffix.starts_with(char::is_whitespace)
+                                || suffix.starts_with('(')
+                                || suffix.starts_with('"')
+                        })
+            })
     }
 
     fn is_line_marker(&self) -> bool {
@@ -1475,22 +1559,31 @@ impl Lexer {
     ///   0x100 and clean, `u'\x10000'` is 0 with the warning, `'\x100'` is 0
     ///   with the warning);
     /// * `''` is `empty character constant`, an error in every form.
-    fn lex_wide_char(&mut self, start: usize, kind: Option<UnicodeCharKind>) -> Token {
+    ///
+    /// `L'x'` decodes in `wchar_t`'s code unit: UTF-16 under `-fshort-wchar`
+    /// (exactly `u'x'`), UTF-32 otherwise (exactly `U'x'`). The token keeps
+    /// the `Wide` kind, so the parser gives the constant `wchar_t`'s type.
+    fn lex_wide_char(&mut self, start: usize, kind: UnicodeCharKind) -> Token {
         self.pos += 1; // skip opening '
         let diagnostics_before = self.diagnostics.len();
+        let unit = match kind {
+            UnicodeCharKind::Wide if self.wide_unit16 => UnicodeCharKind::Utf16,
+            UnicodeCharKind::Wide => UnicodeCharKind::Utf32,
+            other => other,
+        };
         // Width of one code unit of this literal: the clamp for byte escapes.
-        let max_unit: u32 = match kind {
-            Some(UnicodeCharKind::Utf8) => 0xFF,
-            Some(UnicodeCharKind::Utf16) => 0xFFFF,
-            _ => u32::MAX,
+        let max_unit: u32 = match unit {
+            UnicodeCharKind::Utf8 => 0xFF,
+            UnicodeCharKind::Utf16 => 0xFFFF,
+            UnicodeCharKind::Utf32 | UnicodeCharKind::Wide => u32::MAX,
         };
         // Whether a character needs more than one code unit of this literal.
         // `u8` counts UTF-8 bytes, so every character above 0x7F needs two.
         let unit_overflow = |value: u32| -> bool {
-            match kind {
-                Some(UnicodeCharKind::Utf8) => value > 0x7F,
-                Some(UnicodeCharKind::Utf16) => value > 0xFFFF,
-                _ => false,
+            match unit {
+                UnicodeCharKind::Utf8 => value > 0x7F,
+                UnicodeCharKind::Utf16 => value > 0xFFFF,
+                UnicodeCharKind::Utf32 | UnicodeCharKind::Wide => false,
             }
         };
         let mut value: u32 = 0;
@@ -1503,10 +1596,7 @@ impl Lexer {
             if self.input[self.pos] == b'\\' {
                 self.pos += 1;
                 let escape = self.lex_escape_raw();
-                if escape.is_character()
-                    && escape.out_of_ucs
-                    && matches!(kind, Some(UnicodeCharKind::Utf16))
-                {
+                if escape.is_character() && escape.out_of_ucs && unit == UnicodeCharKind::Utf16 {
                     // A code point above U+10FFFF has no UTF-16 unit at all.
                     // GCC reports the conversion failure where it meets the
                     // escape — once per offending escape, in scan order — and
@@ -1577,17 +1667,11 @@ impl Lexer {
             if !self.saw_error_since(diagnostics_before) {
                 self.emit_lex_diag("empty character constant", start, self.pos);
             }
-            return Token::new(
-                match kind {
-                    Some(unit_kind) => TokenKind::UnicodeCharLiteral(0, unit_kind),
-                    None => TokenKind::IntLiteral(0),
-                },
-                span,
-            );
+            return Token::new(TokenKind::UnicodeCharLiteral(0, kind), span);
         }
         let multi = characters > 1;
-        match kind {
-            Some(unit_kind @ UnicodeCharKind::Utf8) => {
+        match unit {
+            UnicodeCharKind::Utf8 => {
                 if multi {
                     self.emit_lex_diag(
                         "multi-character literal cannot have an encoding prefix",
@@ -1601,9 +1685,9 @@ impl Lexer {
                         self.pos,
                     );
                 }
-                Token::new(TokenKind::UnicodeCharLiteral(value, unit_kind), span)
+                Token::new(TokenKind::UnicodeCharLiteral(value, kind), span)
             }
-            Some(unit_kind @ UnicodeCharKind::Utf16) => {
+            UnicodeCharKind::Utf16 => {
                 let mut unit_value = value;
                 if multi {
                     self.warn(
@@ -1621,26 +1705,16 @@ impl Lexer {
                     }
                     unit_value = Self::low_surrogate(value);
                 }
-                Token::new(TokenKind::UnicodeCharLiteral(unit_value, unit_kind), span)
+                Token::new(TokenKind::UnicodeCharLiteral(unit_value, kind), span)
             }
-            Some(unit_kind @ UnicodeCharKind::Utf32) => {
+            UnicodeCharKind::Utf32 | UnicodeCharKind::Wide => {
                 if multi {
                     self.warn(
                         "multi-character literal cannot have an encoding prefix",
                         span,
                     );
                 }
-                Token::new(TokenKind::UnicodeCharLiteral(value, unit_kind), span)
-            }
-            // `L'x'` has type wchar_t, which is int on every target here.
-            None => {
-                if multi {
-                    self.warn(
-                        "multi-character literal cannot have an encoding prefix",
-                        span,
-                    );
-                }
-                Token::new(TokenKind::IntLiteral(value as i64), span)
+                Token::new(TokenKind::UnicodeCharLiteral(value, kind), span)
             }
         }
     }
@@ -2432,10 +2506,10 @@ impl Lexer {
                     if next == b'\'' {
                         // Wide/unicode char literal: value is the Unicode code point
                         let kind = match prefix {
-                            b"u8" => Some(UnicodeCharKind::Utf8),
-                            b"u" => Some(UnicodeCharKind::Utf16),
-                            b"U" => Some(UnicodeCharKind::Utf32),
-                            _ => None, // L'x': wchar_t, which is int on every target here
+                            b"u8" => UnicodeCharKind::Utf8,
+                            b"u" => UnicodeCharKind::Utf16,
+                            b"U" => UnicodeCharKind::Utf32,
+                            _ => UnicodeCharKind::Wide,
                         };
                         return self.lex_wide_char(start, kind);
                     } else {
@@ -3133,9 +3207,12 @@ mod escape_tests {
         let mut lexer = Lexer::new(r#"L"\u00e9" L'\u00e9'"#, 0);
         let tokens = lexer.tokenize();
         assert!(matches!(&tokens[0].kind, TokenKind::WideStringLiteral(s) if s == "\u{e9}"));
-        // `wchar_t` is int here, so a wide character constant is an int
-        // holding the code point (0xE9), not the UTF-8 encoding.
-        assert!(matches!(tokens[1].kind, TokenKind::IntLiteral(0xE9)));
+        // A wide character constant holds the code point (0xE9), not the
+        // UTF-8 encoding; the parser gives it `wchar_t`'s type.
+        assert!(matches!(
+            tokens[1].kind,
+            TokenKind::UnicodeCharLiteral(0xE9, UnicodeCharKind::Wide)
+        ));
     }
 
     /// `\N{NAME}` (C++23, accepted in C by GCC/Clang/lccc) is a universal
@@ -3627,5 +3704,39 @@ mod escape_tests {
             Some(crate::common::error::WarningKind::Multichar)
         );
         assert_eq!(lexer.diagnostics[1].warning_kind, None);
+    }
+}
+
+#[cfg(test)]
+mod retained_message_tests {
+    use super::*;
+
+    #[test]
+    fn retained_messages_are_not_lexed_or_diagnosed_twice() {
+        for directive in [
+            "#pragma message \"é\"",
+            "#pragma message(1)",
+            "#pragma message",
+        ] {
+            let text = format!("{directive}\n42");
+            let mut lexer = Lexer::new(&text, 0);
+            let tokens = lexer.tokenize();
+            assert_eq!(tokens.len(), 2);
+            assert!(matches!(tokens[0].kind, TokenKind::IntLiteral(42)));
+            assert!(tokens[1].is_eof());
+            assert!(lexer.diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn message_prefix_does_not_hide_other_tokens() {
+        for directive in [
+            "#pragma messages",
+            "#pragma message_extra",
+            "#pragma messageé",
+        ] {
+            let mut lexer = Lexer::new(directive, 0);
+            assert!(matches!(lexer.tokenize()[0].kind, TokenKind::Hash));
+        }
     }
 }

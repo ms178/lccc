@@ -1418,6 +1418,13 @@ impl Driver {
             self.target,
             Target::Aarch64 | Target::Riscv64
         ));
+        // `wchar_t` is the psABI's too: `unsigned int` on AArch64 (AAPCS64),
+        // a signed 32-bit type on x86 and RISC-V. `-fshort-wchar` overrides
+        // both in the argument loop, so its default is re-recorded here as
+        // well: every parse starts from the target's answers, and a parse
+        // that saw `-fshort-wchar` cannot leak it into the next one.
+        crate::common::types::set_wchar_unsigned(matches!(self.target, Target::Aarch64));
+        crate::common::types::set_short_wchar(false);
 
         // Expand before the early query path as well: otherwise a sysroot
         // hidden in a response file could yield a misleading host library path.

@@ -37,7 +37,7 @@ use super::helpers::{
 use super::liveness::FileLiveness;
 use super::relay_and_lea::{
     dead_in_block_after, family_private_to, function_range, line_refs_family, plain_gp_operand,
-    provably_dead, rbp_is_gpr_in_function, split_two_operands,
+    provably_dead, rbp_is_gpr_in_function, split_two_operands, upper32_zero_at,
 };
 
 /// What a line does to EFLAGS.
@@ -480,13 +480,6 @@ fn fp_data_op(base: &str) -> bool {
     FP_NEUTRAL.iter().any(|p| base.starts_with(p))
 }
 
-/// True when the flags written at `from - 1` are dead: scanning forward inside
-/// the block, a flags WRITER is reached before any flags READER.  The single
-/// oracle every flag-discarding transform must consult — a one-instruction
-/// peek lets an intervening flag-NEUTRAL instruction (`mov`, `lea`, `andn`,
-/// `blsi`, ...) hide a later `jcc`/`setcc`/`adc` that still reads the value
-/// (the `addq $imm` → `leaq` rewrite in local_patterns miscompiled exactly
-/// this shape).
 /// A whole-line comment (`#` first, GAS x86 syntax): it emits no bytes, so it
 /// can neither read nor write EFLAGS.  `classify_line` keeps such lines whole
 /// (the `# LCCC_*` markers are read from their text), so they reach the
@@ -496,9 +489,127 @@ pub(super) fn is_byteless_comment(t: &str) -> bool {
     t.starts_with('#') && t != "#APP" && t != "#NO_APP"
 }
 
+/// True when the flags written at `from - 1` are dead: scanning forward, every path
+/// reaches a writer of each flag before any reader of it (see
+/// [`flags_dead_from`] for the branches the scan follows).  The single
+/// oracle every flag-discarding transform must consult — a one-instruction
+/// peek lets an intervening flag-NEUTRAL instruction (`mov`, `lea`, `andn`,
+/// `blsi`, ...) hide a later `jcc`/`setcc`/`adc` that still reads the value
+/// (the `addq $imm` → `leaq` rewrite in local_patterns miscompiled exactly
+/// this shape).
 pub(super) fn flags_dead_after(store: &LineStore, infos: &[LineInfo], from: usize) -> bool {
+    let mut scan = FlagScan {
+        edges: FLAG_SCAN_EDGES,
+        proven: Vec::new(),
+    };
+    flags_dead_from(store, infos, from, F_ALL, &mut scan)
+}
+
+/// Per-query state of [`flags_dead_after`]'s branch walk.
+struct FlagScan {
+    /// Branch edges the query may still follow.
+    edges: u32,
+    /// `(label line, live)` pairs already proved dead: the flags in `live`
+    /// are dead from that label on.  A diamond's join is then walked once,
+    /// not once per path into it.
+    proven: Vec<(usize, u8)>,
+}
+
+impl FlagScan {
+    fn is_proven(&self, label: usize, live: u8) -> bool {
+        self.proven
+            .iter()
+            .any(|&(at, dead)| at == label && live & !dead == 0)
+    }
+
+    /// Whether the flags in `live` are dead from the label on line `target`,
+    /// following that edge if the budget allows and the answer is not known.
+    fn dead_at_label(
+        &mut self,
+        store: &LineStore,
+        infos: &[LineInfo],
+        target: usize,
+        live: u8,
+    ) -> bool {
+        if self.is_proven(target, live) {
+            return true;
+        }
+        if self.edges == 0 {
+            return false;
+        }
+        self.edges -= 1;
+        let dead = flags_dead_from(store, infos, target + 1, live, self);
+        if dead {
+            self.proven.push((target, live));
+        }
+        dead
+    }
+}
+
+/// Branch edges one [`flags_dead_after`] query may follow before it answers
+/// "live".  Every followed edge points strictly forward, so the walk is a DAG
+/// walk and terminates even without the budget; the budget caps the cost of
+/// long branch ladders (joins are memoised in [`FlagScan::proven`]).
+const FLAG_SCAN_EDGES: u32 = 8;
+
+/// How many lines past a branch its target label may sit for the flag scan
+/// to follow the edge.  A label further away (or behind the branch) ends the
+/// query with "live", which is always the safe answer.
+const FLAG_SCAN_TARGET_WINDOW: usize = 256;
+
+/// The flags a condition code reads (`e` -> ZF, `be` -> CF|ZF, `l` -> SF|OF,
+/// ...), or `None` for a spelling that is not a condition code.
+fn cc_read_mask(cc: &str) -> Option<u8> {
+    Some(match canonical_cc(cc)? {
+        "e" | "ne" => F_ZF,
+        "b" | "ae" => F_CF,
+        "be" | "a" => F_CF | F_ZF,
+        "l" | "ge" => F_SF | F_OF,
+        "le" | "g" => F_ZF | F_SF | F_OF,
+        "s" | "ns" => F_SF,
+        "p" | "np" => F_PF,
+        "o" | "no" => F_OF,
+        _ => return None,
+    })
+}
+
+/// Line index of the label a `jmp`/`jcc` on line `n` targets, when that label
+/// sits after the branch and within [`FLAG_SCAN_TARGET_WINDOW`] lines.  Labels
+/// are unique per translation unit, so the first match is the target.
+fn forward_jump_target(store: &LineStore, infos: &[LineInfo], n: usize, t: &str) -> Option<usize> {
+    let target = super::helpers::extract_jump_target(t)?;
+    let end = (n + 1 + FLAG_SCAN_TARGET_WINDOW).min(store.len());
+    (n + 1..end).find(|&k| {
+        infos[k].kind == LineKind::Label
+            && infos[k]
+                .trimmed(store.get(k))
+                .strip_suffix(':')
+                .map(str::trim)
+                == Some(target)
+    })
+}
+
+/// [`flags_dead_after`] for the flags in `live`, written before line `from`.
+///
+/// A branch is followed instead of ending the scan when that is provable:
+/// * a `jcc` whose condition reads none of the `live` flags passes them on to
+///   BOTH successors, so the scan checks the taken edge (forward targets only)
+///   and then continues down the fall-through.  This is the shape a partial
+///   writer creates: in `subl $1,%r; btl %r,%x; jnc .L` the `btl` redefines
+///   every flag but ZF, the `jnc` reads only CF, and the `subl`'s ZF is dead
+///   on both edges, so the `subl` may become a flag-free `leal`;
+/// * a `jmp` to a forward label continues there;
+/// * a codegen-marked sibling call (`# LCCC_TAIL_CALL`) leaves the function
+///   like `call` does: EFLAGS are no argument (SysV leaves them undefined at
+///   entry), so that edge ends with the flags dead.
+fn flags_dead_from(
+    store: &LineStore,
+    infos: &[LineInfo],
+    from: usize,
+    mut live: u8,
+    scan: &mut FlagScan,
+) -> bool {
     let mut n = from;
-    let mut live = F_ALL;
     while n < store.len() {
         if infos[n].is_nop() {
             n += 1;
@@ -523,6 +634,9 @@ pub(super) fn flags_dead_after(store: &LineStore, infos: &[LineInfo], from: usiz
         // one label past the shift. This check precedes the classifier, which
         // answers `Reads` for unrecognised text such as a label line.
         if infos[n].kind == LineKind::Label {
+            if scan.is_proven(n, live) {
+                return true;
+            }
             n += 1;
             continue;
         }
@@ -532,8 +646,44 @@ pub(super) fn flags_dead_after(store: &LineStore, infos: &[LineInfo], from: usiz
             return true;
         }
         let t = infos[n].trimmed(store.get(n));
+        match infos[n].kind {
+            LineKind::CondJmp => {
+                let reads = condition_code_of(t).and_then(cc_read_mask).unwrap_or(F_ALL);
+                if reads & live != 0 {
+                    return false;
+                }
+                let taken_dead = match forward_jump_target(store, infos, n, t) {
+                    Some(target) => scan.dead_at_label(store, infos, target, live),
+                    None => super::liveness::tail_call_marked(store, infos, n),
+                };
+                if !taken_dead {
+                    return false;
+                }
+                n += 1;
+                continue;
+            }
+            LineKind::Jmp => {
+                return match forward_jump_target(store, infos, n, t) {
+                    Some(target) => scan.dead_at_label(store, infos, target, live),
+                    None => super::liveness::tail_call_marked(store, infos, n),
+                };
+            }
+            _ => {}
+        }
         match flags_effect(t) {
-            FlagsEffect::Reads => return false,
+            FlagsEffect::Reads => {
+                // A reader with an architecturally fixed read set (`setc`,
+                // `cmovne`, `adc`, ...) that observes none of the live flags is
+                // no use of them: `subl $1,%r; btl %r,%x; setc %al` reads the
+                // `btl`'s CF, never the `subl`'s.
+                if flags_read_mask(t) & live != 0 {
+                    return false;
+                }
+                live &= !reader_redefines_mask(t);
+                if live == 0 {
+                    return true;
+                }
+            }
             FlagsEffect::Writes => {
                 live &= !flags_written_mask(t);
                 if live == 0 {
@@ -554,6 +704,39 @@ pub(super) fn flags_dead_after(store: &LineStore, infos: &[LineInfo], from: usiz
         n += 1;
     }
     false
+}
+
+/// The flags a flag READER observes, for the readers whose read set the
+/// architecture fixes (`setCC`/`cmovCC`/`jCC` by condition code; `adc`, `sbb`,
+/// `rcl`, `rcr`, `cmc` and `salc` read CF alone).  `F_ALL` for everything
+/// else -- `pushf`, `lahf`, inline-asm text -- which is the safe answer.
+fn flags_read_mask(t: &str) -> u8 {
+    if let Some(cc) = condition_code_of(t) {
+        return cc_read_mask(cc).unwrap_or(F_ALL);
+    }
+    let mnem = t.split_whitespace().next().unwrap_or(t);
+    if ["adc", "sbb", "rcl", "rcr"]
+        .iter()
+        .any(|p| mnem.starts_with(p))
+        || matches!(mnem, "cmc" | "salc")
+    {
+        return F_CF;
+    }
+    F_ALL
+}
+
+/// The flags a flag reader also redefines unconditionally: `adc`/`sbb` write
+/// all six, ADX `adcx` and `cmc` write CF alone.  Rotate-through-carry is
+/// deliberately absent: a zero count leaves every flag untouched.
+fn reader_redefines_mask(t: &str) -> u8 {
+    let mnem = t.split_whitespace().next().unwrap_or(t);
+    if mnem.starts_with("adcx") || mnem == "cmc" {
+        F_CF
+    } else if mnem.starts_with("adc") || mnem.starts_with("sbb") {
+        F_ALL
+    } else {
+        0
+    }
 }
 
 /// Index of the next line after `i` that is neither a NOP nor a
@@ -677,10 +860,13 @@ pub(super) fn fold_copy_add_into_lea(store: &mut LineStore, infos: &mut [LineInf
             continue;
         };
         // The copy may be WIDER than the arithmetic (`movq %r9, %rax` +
-        // `addl $1, %eax` = zero-extended 32-bit add), never narrower: a
-        // `movl` copy zero-extends, so a following `addq` would read bits the
-        // 64-bit LEA source still has.
-        if !wide && add_wide {
+        // `addl $1, %eax` = zero-extended 32-bit add). A narrower one is a
+        // `movl` copy, which zero-extends: the following `addq` reads
+        // zext(A32), which the 64-bit LEA source `%A` equals only when A's
+        // upper half is provably zero at the copy (`movl (%rdi), %r8d; movl
+        // %r8d, %r9d; addq $128, %r9` -> `leaq 128(%r8), %r9`, the libsrtp
+        // replay-window bound, rdb.c:80).
+        if !wide && add_wide && !upper32_zero_at(store, infos, i, src_fam) {
             i += 1;
             continue;
         }
@@ -1158,8 +1344,9 @@ pub(super) fn fold_copy_shift_into_lea(store: &mut LineStore, infos: &mut [LineI
 
 // ── 2. setcc / movzbl / test / cmov → cmov on the original comparison ────────
 
-/// Negate a condition-code suffix (`e` ↔ `ne`, `l` ↔ `ge`, ...).
-fn negate_cc(cc: &str) -> Option<&'static str> {
+/// Negate a condition-code suffix (`e` ↔ `ne`, `l` ↔ `ge`, ...); `None` for a
+/// spelling that is not a condition code.
+pub(super) fn negate_cc(cc: &str) -> Option<&'static str> {
     Some(match cc {
         "e" | "z" => "ne",
         "ne" | "nz" => "e",
@@ -3445,6 +3632,108 @@ mod tests {
                 .collect();
             assert!(super::flags_dead_after(&store, &infos, 0), "{tail}");
         }
+    }
+
+    /// `flags_dead_after(store, infos, 1)` for `subl $1, %r11d` on line 0
+    /// followed by `body`.
+    fn sub_flags_dead_before(body: &str) -> bool {
+        let text = format!("    subl $1, %r11d\n{body}");
+        let store = LineStore::new(text);
+        let infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        super::flags_dead_after(&store, &infos, 1)
+    }
+
+    /// The SQLite/libxml `x & (1 << (i - 1))` branch: the `btl` redefines every
+    /// flag but ZF and the `jnc` reads only CF, so the `subl`'s surviving ZF
+    /// must be proved dead on BOTH edges -- the taken edge returns and the
+    /// fall-through leaves through a marked sibling call.
+    #[test]
+    fn a_jcc_that_reads_none_of_the_live_flags_is_followed_on_both_edges() {
+        let tail = "    btl %r11d, %edi\n    jnc .LBB2\n.LBB1:\n    movl %esi, %edi\n    jmp hit@PLT\n    # LCCC_TAIL_CALL\n.LBB2:\n    ret\n";
+        assert!(sub_flags_dead_before(tail));
+        // An unconditional forward `jmp` is followed to its label.
+        assert!(sub_flags_dead_before(
+            "    btl %r11d, %edi\n    jnc .LBB2\n    jmp .LBB3\n.LBB2:\n    ret\n.LBB3:\n    xorl %eax, %eax\n    ret\n"
+        ));
+        // A conditional sibling call ends its taken edge like `call` does.
+        assert!(sub_flags_dead_before(
+            "    btl %r11d, %edi\n    jc hit@PLT\n    # LCCC_TAIL_CALL\n    ret\n"
+        ));
+    }
+
+    #[test]
+    fn a_followed_edge_that_reaches_a_reader_of_a_live_flag_keeps_the_flags_live() {
+        for tail in [
+            // ZF survives `btl` and reaches the taken edge's `sete`.
+            "    btl %r11d, %edi\n    jnc .LBB2\n    ret\n.LBB2:\n    sete %al\n    ret\n",
+            // ...or the fall-through's `jne`.
+            "    btl %r11d, %edi\n    jnc .LBB2\n    jne .LBB2\n    ret\n.LBB2:\n    ret\n",
+            // ...or the code behind a followed `jmp`.
+            "    btl %r11d, %edi\n    jmp .LBB2\n    ret\n.LBB2:\n    cmovel %esi, %eax\n    ret\n",
+            // The `jnc` itself reads the `subl`'s CF.
+            "    jnc .LBB2\n    ret\n.LBB2:\n    ret\n",
+            // `ja` reads CF and ZF; ZF is still the `subl`'s.
+            "    btl %r11d, %edi\n    ja .LBB2\n    ret\n.LBB2:\n    ret\n",
+            // A backward target is never followed: the answer is "live".
+            ".LBB0:\n    btl %r11d, %edi\n    jnc .LBB0\n    ret\n",
+            // An unknown target (no label, no sibling-call marker) is "live".
+            "    btl %r11d, %edi\n    jnc .LBB9\n    ret\n",
+            "    btl %r11d, %edi\n    jmp elsewhere\n",
+        ] {
+            assert!(!sub_flags_dead_before(tail), "{tail}");
+        }
+    }
+
+    /// Readers with a fixed read set that observe none of the live flags are
+    /// stepped over; the ones that also redefine flags end the lifetime.
+    #[test]
+    fn fixed_set_readers_of_other_flags_do_not_keep_the_flags_live() {
+        for tail in [
+            // `setc`/`cmovc`/`adc`/`sbb` read the `btl`'s CF only.
+            "    btl %r11d, %edi\n    setc %al\n    ret\n",
+            "    btl %r11d, %edi\n    cmovcl %esi, %eax\n    ret\n",
+            // `adc` reads CF and redefines all six flags.
+            "    btl %r11d, %edi\n    adcl $0, %eax\n    sete %al\n    ret\n",
+            "    btl %r11d, %edi\n    sbbl %eax, %eax\n    jne .LBB1\n.LBB1:\n    ret\n",
+        ] {
+            assert!(sub_flags_dead_before(tail), "{tail}");
+        }
+        for tail in [
+            // `setbe`/`cmova` read ZF, which `btl` leaves to the `subl`.
+            "    btl %r11d, %edi\n    setbe %al\n    ret\n",
+            "    btl %r11d, %edi\n    cmoval %esi, %eax\n    ret\n",
+            // `adcx` redefines CF alone: the `subl`'s ZF reaches the `sete`.
+            "    btl %r11d, %edi\n    adcxl %esi, %eax\n    sete %al\n    ret\n",
+            // Rotate-through-carry with a zero count changes no flag.
+            "    btl %r11d, %edi\n    rcll %cl, %eax\n    sete %al\n    ret\n",
+            // Readers without a fixed read set observe everything.
+            "    btl %r11d, %edi\n    pushfq\n    ret\n",
+            "    btl %r11d, %edi\n    lahf\n    ret\n",
+            // No partial writer in between: `setc` reads the `subl`'s CF.
+            "    setc %al\n    ret\n",
+        ] {
+            assert!(!sub_flags_dead_before(tail), "{tail}");
+        }
+    }
+
+    /// A ladder longer than the edge budget answers "live" instead of walking
+    /// on: the budget, not the text length, bounds every query.
+    #[test]
+    fn the_branch_walk_is_bounded_by_its_edge_budget() {
+        let mut ladder = String::from("    btl %r11d, %edi\n");
+        for k in 0..super::FLAG_SCAN_EDGES + 1 {
+            ladder.push_str(&format!("    jnc .LBB{k}\n.LBB{k}:\n"));
+        }
+        ladder.push_str("    ret\n");
+        assert!(!sub_flags_dead_before(&ladder));
+        let mut short = String::from("    btl %r11d, %edi\n");
+        for k in 0..super::FLAG_SCAN_EDGES {
+            short.push_str(&format!("    jnc .LBB{k}\n.LBB{k}:\n"));
+        }
+        short.push_str("    ret\n");
+        assert!(sub_flags_dead_before(&short));
     }
 
     #[test]
@@ -5836,6 +6125,43 @@ mod conditional_increment_tests {
             // order they appear in, and the framed one keeps its `addq`.
             assert_eq!(out.matches("leaq 8(%r14), %rbp").count(), 1, "{out}");
             assert!(out.contains("addq $8, %rbp"), "{out}");
+        }
+    }
+
+    /// A `movl` copy feeding an `addq` folds into `leaq` exactly when the
+    /// source's upper half is provably zero at the copy (a zero-extending
+    /// load here); a parameter's upper half is garbage per SysV, and a
+    /// `movq`-wide source write proves nothing, so both keep the pair.
+    #[test]
+    fn fold_copy_add_into_lea_widens_a_movl_copy_over_a_zero_upper_source() {
+        let build = |asm: &str| {
+            let store = LineStore::new(asm.to_string());
+            let infos: Vec<LineInfo> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            (store, infos)
+        };
+        let body = |def: &str, add: &str| {
+            format!(
+                "f:\n.cfi_startproc\n{def}    movl %r8d, %r9d\n    {add}\n    cmpq %r9, %rdx\n    \
+                 jb .LBB57\n    xorl %eax, %eax\n    ret\n.LBB57:\n    movl $10, %eax\n    ret\n\
+                 .cfi_endproc\n"
+            )
+        };
+        for (add, lea) in [
+            ("addq $128, %r9", "leaq 128(%r8), %r9"),
+            ("subq $16, %r9", "leaq -16(%r8), %r9"),
+            ("addq %rsi, %r9", "leaq (%r8, %rsi), %r9"),
+        ] {
+            let (mut store, mut infos) = build(&body("    movl (%rdi), %r8d\n", add));
+            assert!(fold_copy_add_into_lea(&mut store, &mut infos), "{add}");
+            let out = store.build_result(|i| infos[i].is_nop());
+            assert!(out.contains(lea), "{out}");
+            assert!(!out.contains("movl %r8d, %r9d"), "{out}");
+        }
+        for def in ["", "    movq (%rdi), %r8\n", "    addq $1, %r8\n"] {
+            let (mut store, mut infos) = build(&body(def, "addq $128, %r9"));
+            assert!(!fold_copy_add_into_lea(&mut store, &mut infos), "{def:?}");
         }
     }
 

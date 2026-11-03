@@ -620,6 +620,10 @@ fn label_name(line: &str) -> Option<&str> {
 
 // ── Main entry point ─────────────────────────────────────────────────────────
 
+/// Stand-in text for a protected line while the passes run: it names no
+/// register and matches no pattern.  Never emitted.
+const OPAQUE_LINE: &str = "# lccc_a64_inline_asm_opaque";
+
 /// Run peephole optimization on AArch64 assembly text.
 /// Returns the optimized assembly string.
 pub fn peephole_optimize(asm: String) -> String {
@@ -633,11 +637,39 @@ pub fn peephole_optimize(asm: String) -> String {
     if n == 0 {
         return asm;
     }
+    // Functions holding inline assembly stay byte-for-byte as emitted (see
+    // `peephole_common::inline_asm_protected_ranges`); labels and CFI bounds
+    // stay visible as the boundaries the passes segment by.  The originals go
+    // back in order at the end: passes may insert lines (`n` is re-read
+    // below), so the placeholders, not their indices, are the bookmarks.
+    // Either marker: a stray `#NO_APP` is malformed input, not plain text.
+    let protected_ranges = if asm.contains("#APP") || asm.contains("#NO_APP") {
+        match inline_asm_protected_ranges(&lines) {
+            Some(ranges) => ranges,
+            None => return asm,
+        }
+    } else {
+        Vec::new()
+    };
+    let has_opaque = !protected_ranges.is_empty();
+    let mut protected: Vec<String> = Vec::new();
+    for range in protected_ranges {
+        for i in range {
+            let t = lines[i].trim();
+            if kinds[i] == LineKind::Label || t == ".cfi_startproc" || t == ".cfi_endproc" {
+                continue;
+            }
+            protected.push(std::mem::replace(&mut lines[i], OPAQUE_LINE.to_string()));
+            kinds[i] = LineKind::Other;
+        }
+    }
     crate::backend::peephole_common::hide_debug_rows(&lines, &mut kinds, LineKind::Nop);
 
     // Phase 1: Iterative local passes (up to 8 rounds)
     let rotate = std::env::var("CCC_NO_LOOP_ROTATE").is_err();
-    let merge_blocks = std::env::var("CCC_NO_IDENTICAL_BLOCK_MERGE").is_err();
+    // Block merging is off beside an opaque function: branches inside it are
+    // hidden, so its labels look unreferenced to the merge's CFG.
+    let merge_blocks = !has_opaque && std::env::var("CCC_NO_IDENTICAL_BLOCK_MERGE").is_err();
     let coalesce_entry = std::env::var("CCC_NO_ENTRY_COPY_COALESCE").is_err();
     let mut changed = true;
     let mut rounds = 0;
@@ -650,6 +682,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
         changed |= eliminate_redundant_zext_and(&mut lines, &mut kinds, n);
         changed |= fuse_and_cmp_zero(&mut lines, &mut kinds, n);
+        changed |= fold_sign_mask_abs_to_cneg(&mut lines, &mut kinds, n);
         changed |= eliminate_dead_pre_ret_moves(&mut lines, &mut kinds, n);
         changed |= eliminate_move_chains(&mut lines, &mut kinds, n);
         changed |= fold_zext_move_chains(&mut lines, &mut kinds, n);
@@ -710,6 +743,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
             changed2 |= eliminate_redundant_zext_and(&mut lines, &mut kinds, n);
             changed2 |= fuse_and_cmp_zero(&mut lines, &mut kinds, n);
+            changed2 |= fold_sign_mask_abs_to_cneg(&mut lines, &mut kinds, n);
             changed2 |= eliminate_dead_pre_ret_moves(&mut lines, &mut kinds, n);
             changed2 |= eliminate_move_chains(&mut lines, &mut kinds, n);
             changed2 |= fold_zext_move_chains(&mut lines, &mut kinds, n);
@@ -733,6 +767,26 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_overwritten_moves(&lines, &mut kinds, n);
             changed2 |= eliminate_overwritten_stores(&lines, &mut kinds, n);
             rounds2 += 1;
+        }
+    }
+
+    // Put the protected lines back, in order, and keep every one of them: no
+    // pass may delete or duplicate opaque code.  A placeholder count that no
+    // longer matches means a pass did exactly that, and the only safe answer
+    // is the unoptimized text.
+    if !protected.is_empty() {
+        let mut originals = protected.into_iter();
+        for i in 0..lines.len() {
+            if lines[i] == OPAQUE_LINE {
+                let Some(original) = originals.next() else {
+                    return asm;
+                };
+                lines[i] = original;
+                kinds[i] = LineKind::Other;
+            }
+        }
+        if originals.next().is_some() {
+            return asm;
         }
     }
 
@@ -4029,6 +4083,437 @@ fn fuse_and_cmp_zero(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> 
     changed
 }
 
+// ── Sign-mask absolute value as compare + conditional negate ─────────────────
+//
+// `sign_magnitude` lowers `x < 0 ? -x : x` (and abs/labs/llabs, which the
+// frontend expands to that select) to the branch-free identity
+// `(x ^ (x >> 31)) - (x >> 31)`, emitted here as
+//     asr  wS, wX, #31          ; S = x < 0 ? -1 : 0
+//     eor  wT, wX', wS          ; T = x ^ S   (operands in either order)
+//     sub  wR, wT, wS           ; R = T - S = |x|
+// GCC 16.2 and Clang 23.1.4 emit the conditional negate instead:
+//     cmp  wX', #0
+//     cneg wR, wX', lt          ; GCC spells it `csneg wR, wX', wX', ge`
+// Two instructions instead of three, and a two-step dependency chain instead
+// of three.  The values agree for every x: `cmp x, #0` sets N to the sign
+// and clears V (subtracting zero cannot overflow), so `lt` is exactly
+// `x < 0`; the minimum negates to itself, as the identity's wrap-around
+// does.  The 64-bit form (`asr xS, xX, #63`) is the same with x registers.
+//
+// `X'` is `X` itself or a register the same straight-line run copied from or
+// to `X` (`mov x19, x0; asr x4, x0, #63; eor x5, x19, x4`: the allocator's
+// parameter home beside the incoming register); either holds x at both
+// rewritten lines.  When the result is then copied out (`mov xD, xR`, R dead
+// after the copy), the conditional negate writes D directly.
+//
+// Legality: the three lines are consecutive live instructions of one width;
+// S differs from X and X'; S, and T unless it is R, are dead after the
+// window; and the flags are dead after it -- the rewrite defines NZCV where
+// the identity left it alone.  Both deadness scans run forward in the block
+// and fail closed at labels, branches and unmodelled instructions; a `ret`
+// reads the return and callee-saved registers but no flag, and a call
+// clobbers NZCV (AAPCS64 does not preserve it).  The new `cneg` keeps the
+// `Other` kind `classify_line` gives it, so no later pass mistakes it for a
+// flag-blind ALU line.
+fn reads_flags_a64(mnemonic: &str) -> bool {
+    const READERS: &[&str] = &[
+        "csel", "csinc", "csinv", "csneg", "cset", "csetm", "cinc", "cinv", "cneg", "ccmp", "ccmn",
+        "adc", "adcs", "sbc", "sbcs", "ngc", "ngcs", "fcsel", "fccmp", "fccmpe", "mrs",
+    ];
+    mnemonic.starts_with("b.") || mnemonic.starts_with("bc.") || READERS.contains(&mnemonic)
+}
+
+fn writes_flags_a64(mnemonic: &str) -> bool {
+    matches!(
+        mnemonic,
+        "cmp" | "cmn" | "tst" | "adds" | "subs" | "ands" | "bics" | "negs" | "fcmp" | "fcmpe"
+    )
+}
+
+/// A directive the deadness scans may step over: unwind and alignment rows
+/// emit no instruction.  Anything else in the text section (`.inst`, data
+/// words) may encode an instruction the scans cannot see, so it stops them.
+fn inert_directive(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with(".cfi_") || t.starts_with(".loc") || t.starts_with(".p2align")
+}
+
+/// Whether NZCV is dead after line `from - 1`: the forward scan meets a flag
+/// writer, a call or a `ret` before any reader, label or branch.
+fn flags_dead_from(lines: &[String], kinds: &[LineKind], from: usize, n: usize) -> bool {
+    for k in from..n {
+        match kinds[k] {
+            LineKind::Nop => continue,
+            LineKind::Directive if inert_directive(&lines[k]) => continue,
+            LineKind::Directive => return false,
+            LineKind::Ret | LineKind::Call => return true,
+            LineKind::Label | LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch => {
+                return false;
+            }
+            _ => {}
+        }
+        let t = lines[k].trim();
+        let mnemonic = t.split_whitespace().next().unwrap_or("");
+        if t.starts_with('#') || reads_flags_a64(mnemonic) {
+            return false;
+        }
+        if writes_flags_a64(mnemonic) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether general register `reg` is dead after line `from - 1`: the forward
+/// scan meets a definition of it before any read, label or branch, or
+/// reaches a `ret` that does not read it.  A `ret` reads the AAPCS64 result
+/// registers x0/x1 (a composite above 16 bytes returns through memory),
+/// hands x19-x28 back to the caller, and needs x29/x30.  A line the
+/// classifier does not model counts every register it names, and every
+/// implicit operand `classify_implicit_operands_a64` knows, as read, and
+/// defines nothing -- so it can only keep the register live.
+fn gp_dead_from(lines: &[String], kinds: &[LineKind], from: usize, n: usize, reg: u8) -> bool {
+    let bit = 1u64 << reg;
+    for k in from..n {
+        match kinds[k] {
+            LineKind::Nop => continue,
+            LineKind::Directive if inert_directive(&lines[k]) => continue,
+            LineKind::Ret => return !matches!(reg, 0 | 1 | 19..=30),
+            LineKind::Directive
+            | LineKind::Label
+            | LineKind::Branch
+            | LineKind::CondBranch
+            | LineKind::CmpBranch => return false,
+            _ => {}
+        }
+        let (uses, defs) = gp_operands(&lines[k], kinds[k], false);
+        if uses & bit != 0 {
+            return false;
+        }
+        if defs & bit != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// `op d, a, b` split into its three operand texts.
+fn three_operands<'a>(line: &'a str, op: &str) -> Option<(&'a str, &'a str, &'a str)> {
+    let rest = line.trim().strip_prefix(op)?.strip_prefix(' ')?;
+    let mut parts = rest.split(',').map(str::trim);
+    let (d, a, b) = (parts.next()?, parts.next()?, parts.next()?);
+    parts.next().is_none().then_some((d, a, b))
+}
+
+/// The register id of a plain `wN` (32-bit) or `xN` (64-bit) operand of the
+/// requested width, never sp/xzr.
+fn plain_reg_of_width(op: &str, wide: bool) -> Option<u8> {
+    let prefix = if wide { 'x' } else { 'w' };
+    let n: u8 = op.strip_prefix(prefix)?.parse().ok()?;
+    (n <= 30).then_some(n)
+}
+
+/// Whether `a` and `b` hold the same value at line `at`: the same register,
+/// or one copied from the other by an earlier 64-bit `mov` of the same
+/// straight-line run with neither written since.
+fn same_value_at(lines: &[String], kinds: &[LineKind], at: usize, a: u8, b: u8) -> bool {
+    if a == b {
+        return true;
+    }
+    let mask = (1u64 << a) | (1u64 << b);
+    for k in (0..at).rev() {
+        match kinds[k] {
+            LineKind::Nop => continue,
+            LineKind::Directive if inert_directive(&lines[k]) => continue,
+            LineKind::Move {
+                dst,
+                src,
+                is_32bit: false,
+            } if (dst == a && src == b) || (dst == b && src == a) => return true,
+            LineKind::Directive
+            | LineKind::Label
+            | LineKind::Branch
+            | LineKind::CondBranch
+            | LineKind::CmpBranch
+            | LineKind::Call
+            | LineKind::Ret
+            | LineKind::Other
+            | LineKind::MemOther => return false,
+            _ => {}
+        }
+        if gp_operands(&lines[k], kinds[k], false).1 & mask != 0 {
+            return false;
+        }
+    }
+    false
+}
+
+fn fold_sign_mask_abs_to_cneg(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n {
+        if kinds[i] != LineKind::Alu {
+            continue;
+        }
+        let Some((s_op, x_op, amount)) = three_operands(&lines[i], "asr") else {
+            continue;
+        };
+        let wide = match amount {
+            "#31" => false,
+            "#63" => true,
+            _ => continue,
+        };
+        let (Some(s), Some(x)) = (
+            plain_reg_of_width(s_op, wide),
+            plain_reg_of_width(x_op, wide),
+        ) else {
+            continue;
+        };
+        if s == x {
+            continue;
+        }
+        let Some(j) = next_live(kinds, i + 1, n) else {
+            continue;
+        };
+        let Some(k) = next_live(kinds, j + 1, n) else {
+            continue;
+        };
+        if kinds[j] != LineKind::Alu || kinds[k] != LineKind::Alu {
+            continue;
+        }
+        let Some((t_op, e1, e2)) = three_operands(&lines[j], "eor") else {
+            continue;
+        };
+        let reg = |op: &str| plain_reg_of_width(op, wide);
+        let (Some(t), Some(e1), Some(e2)) = (reg(t_op), reg(e1), reg(e2)) else {
+            continue;
+        };
+        let source = if e2 == s && e1 != s {
+            e1
+        } else if e1 == s && e2 != s {
+            e2
+        } else {
+            continue;
+        };
+        if t == s || !same_value_at(lines, kinds, i, x, source) {
+            continue;
+        }
+        let Some((r_op, m_op, s2_op)) = three_operands(&lines[k], "sub") else {
+            continue;
+        };
+        let (Some(mut r), Some(m), Some(s2)) = (reg(r_op), reg(m_op), reg(s2_op)) else {
+            continue;
+        };
+        if m != t || s2 != s {
+            continue;
+        }
+        // An immediate copy-out of the result: write its destination instead.
+        let mut copy_out = None;
+        if let Some(c) = next_live(kinds, k + 1, n) {
+            if let LineKind::Move {
+                dst,
+                src,
+                is_32bit: false,
+            } = kinds[c]
+            {
+                if src == r && dst <= 30 && gp_dead_from(lines, kinds, c + 1, n, r) {
+                    copy_out = Some(c);
+                    r = dst;
+                }
+            }
+        }
+        let after = copy_out.unwrap_or(k) + 1;
+        let mask_dead = s == r || gp_dead_from(lines, kinds, after, n, s);
+        let temp_dead = t == r || gp_dead_from(lines, kinds, after, n, t);
+        if !mask_dead || !temp_dead || !flags_dead_from(lines, kinds, after, n) {
+            continue;
+        }
+        let name = |id: u8| if wide { xreg_name(id) } else { wreg_name(id) };
+        lines[i] = format!("    cmp {}, #0", name(source));
+        kinds[i] = classify_line(&lines[i]);
+        lines[j] = format!("    cneg {}, {}, lt", name(r), name(source));
+        kinds[j] = classify_line(&lines[j]);
+        lines[k] = String::new();
+        kinds[k] = LineKind::Nop;
+        if let Some(c) = copy_out {
+            lines[c] = String::new();
+            kinds[c] = LineKind::Nop;
+        }
+        changed = true;
+    }
+    changed
+}
+
+#[cfg(test)]
+mod abs_cneg_tests {
+    use super::*;
+
+    fn leaf(name: &str, body: &str) -> String {
+        format!(
+            ".text\n.globl {name}\n.type {name}, %function\n{name}:\n.cfi_startproc\n{body}.cfi_endproc\n.size {name}, .-{name}\n"
+        )
+    }
+
+    fn instructions(out: &str) -> Vec<String> {
+        out.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('.') && !l.ends_with(':'))
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn the_narrow_identity_becomes_compare_and_conditional_negate() {
+        // `int abs16i(short)` as the backend emits it today.
+        let body = concat!(
+            "    sxth x4, w0\n",
+            "    asr w5, w4, #31\n",
+            "    eor w4, w4, w5\n",
+            "    sub w4, w4, w5\n",
+            "    mov x0, x4\n",
+            "    ret\n"
+        );
+        let out = peephole_optimize(leaf("abs16i", body));
+        assert_eq!(
+            instructions(&out),
+            ["sxth x4, w0", "cmp w4, #0", "cneg w0, w4, lt", "ret"],
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_wide_identity_reads_the_parameter_home_through_its_copy() {
+        // `labs`: the shift reads the incoming x0, the XOR its x19 home.
+        let body = concat!(
+            "    mov x19, x0\n",
+            "    asr x4, x0, #63\n",
+            "    eor x5, x19, x4\n",
+            "    sub x5, x5, x4\n",
+            "    mov x0, x5\n",
+            "    ret\n"
+        );
+        let out = peephole_optimize(leaf("labs_", body));
+        let insts = instructions(&out);
+        assert!(insts.iter().any(|l| l == "cmp x19, #0"), "{out}");
+        assert!(insts.iter().any(|l| l == "cneg x0, x19, lt"), "{out}");
+        assert!(
+            !insts
+                .iter()
+                .any(|l| l.starts_with("asr") || l.starts_with("eor")),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn live_flags_a_live_mask_or_a_foreign_shape_keep_the_identity() {
+        let cases = [
+            // A flag reader after the window: the rewrite would feed it.
+            "    asr w5, w4, #31\n    eor w4, w4, w5\n    sub w4, w4, w5\n    cset w0, lt\n    ret\n",
+            // The mask is read after the window.
+            "    asr w5, w4, #31\n    eor w4, w4, w5\n    sub w4, w4, w5\n    add w0, w4, w5\n    ret\n",
+            // The shift overwrites its own source: not the identity.
+            "    asr w4, w4, #31\n    eor w6, w4, w4\n    sub w6, w6, w4\n    mov x0, x6\n    ret\n",
+            // Not the sign bit.
+            "    asr w5, w4, #30\n    eor w4, w4, w5\n    sub w4, w4, w5\n    mov x0, x4\n    ret\n",
+            // Mixed widths.
+            "    asr w5, w4, #31\n    eor x4, x4, x5\n    sub x4, x4, x5\n    mov x0, x4\n    ret\n",
+            // The XOR reads a different value than the shift.
+            "    asr w5, w4, #31\n    eor w6, w7, w5\n    sub w6, w6, w5\n    mov x0, x6\n    ret\n",
+            // A label inside the window.
+            "    asr w5, w4, #31\n.Lmid:\n    eor w4, w4, w5\n    sub w4, w4, w5\n    mov x0, x4\n    ret\n",
+            // Flags meet a branch target before any writer: unknown reader.
+            "    asr w5, w4, #31\n    eor w4, w4, w5\n    sub w4, w4, w5\n    b .Lnext\n.Lnext:\n    cset w0, ge\n    ret\n",
+        ];
+        for body in cases {
+            let out = peephole_optimize(leaf("keep", body));
+            assert!(!out.contains("cneg"), "rewrote:\n{body}\n=>\n{out}");
+        }
+    }
+
+    #[test]
+    fn an_unmodelled_line_after_the_copy_only_keeps_what_it_names() {
+        // `short abs16(short)`: the return conversion `sxth x0, w0` names
+        // only x0, so the mask and the old result register stay dead.
+        let body = concat!(
+            "    sxth x4, w19\n",
+            "    asr w5, w4, #31\n",
+            "    eor w4, w4, w5\n",
+            "    sub w4, w4, w5\n",
+            "    mov x0, x4\n",
+            "    sxth x0, w0\n",
+            "    ret\n"
+        );
+        let out = peephole_optimize(leaf("abs16", body));
+        assert_eq!(
+            instructions(&out),
+            [
+                "sxth x4, w19",
+                "cmp w4, #0",
+                "cneg w0, w4, lt",
+                "sxth x0, w0",
+                "ret"
+            ],
+            "{out}"
+        );
+        // A raw encoding may read anything: it stops the scan.
+        let opaque = body.replace("    sxth x0, w0\n", "    .inst 0xd503201f\n");
+        let out = peephole_optimize(leaf("abs16_inst", &opaque));
+        assert!(!out.contains("cneg"), "{out}");
+    }
+
+    #[test]
+    fn a_result_register_read_after_the_copy_is_not_retargeted() {
+        // x4 stays live after the copy: the negate must still land in x4.
+        let body = concat!(
+            "    asr w5, w4, #31\n",
+            "    eor w4, w4, w5\n",
+            "    sub w4, w4, w5\n",
+            "    mov x0, x4\n",
+            "    add w0, w0, w4\n",
+            "    ret\n"
+        );
+        let out = peephole_optimize(leaf("keep_copy", body));
+        let insts = instructions(&out);
+        assert!(insts.iter().any(|l| l == "cneg w4, w4, lt"), "{out}");
+        assert!(insts.iter().any(|l| l == "mov x0, x4"), "{out}");
+    }
+
+    #[test]
+    fn compare_and_negate_equal_the_identity_on_every_boundary() {
+        // The two spellings in the ring: `cmp x, #0` sets N to the sign and
+        // clears V, so `lt` is `x < 0`; the minimum negates to itself.
+        let identity32 = |x: i32| (x ^ (x >> 31)).wrapping_sub(x >> 31);
+        let cneg32 = |x: i32| if x < 0 { x.wrapping_neg() } else { x };
+        for x in [
+            i32::MIN,
+            i32::MIN + 1,
+            -2,
+            -1,
+            0,
+            1,
+            2,
+            i32::MAX - 1,
+            i32::MAX,
+        ] {
+            assert_eq!(identity32(x), cneg32(x), "{x}");
+        }
+        let identity64 = |x: i64| (x ^ (x >> 63)).wrapping_sub(x >> 63);
+        let cneg64 = |x: i64| if x < 0 { x.wrapping_neg() } else { x };
+        for x in [
+            i64::MIN,
+            i64::MIN + 1,
+            -2,
+            -1,
+            0,
+            1,
+            2,
+            i64::MAX - 1,
+            i64::MAX,
+        ] {
+            assert_eq!(identity64(x), cneg64(x), "{x}");
+        }
+    }
+}
+
 // ── Dead move before return ──────────────────────────────────────────────────
 //
 // Return staging can leave `mov xD, xS` writes whose destination is the
@@ -4804,7 +5289,8 @@ fn propagate_register_copies(lines: &mut [String], kinds: &mut [LineKind], n: us
 
 // Shared peephole string utilities -- see backend/peephole_common.rs
 use crate::backend::peephole_common::{
-    rename_register_operand, replace_source_reg_in_instruction, replace_whole_word,
+    inline_asm_protected_ranges, rename_register_operand, replace_source_reg_in_instruction,
+    replace_whole_word,
 };
 
 // ── Global dead store elimination ────────────────────────────────────────────
@@ -6809,6 +7295,91 @@ fn hoist_loop_invariant_remats(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two system calls with register-variable operands, as nolibc and the
+    /// kernel spell them: `svc 0` reads x8 and x0-x2 although no line after
+    /// the staging names them before the next call overwrites x8 and x2.
+    fn two_syscalls(name: &str) -> String {
+        format!(
+            concat!(
+                ".text\n.globl {n}\n.type {n}, %function\n{n}:\n.cfi_startproc\n",
+                "    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n",
+                "    add x0, sp, #16\n    str x0, [sp, #24]\n",
+                "    movz x0, #1\n    movz x8, #64\n    ldr x1, [sp, #24]\n    movz x2, #17\n",
+                "#APP\n    svc 0\n#NO_APP\n",
+                "    str x0, [sp, #32]\n",
+                "    mov x0, #0\n    movz x8, #93\n    mov x1, #0\n    mov x2, #0\n",
+                "#APP\n    svc 0\n#NO_APP\n",
+                "    ldp x29, x30, [sp], #48\n    ret\n",
+                ".cfi_endproc\n.size {n}, .-{n}\n"
+            ),
+            n = name
+        )
+    }
+
+    #[test]
+    fn inline_asm_inputs_survive_a_later_overwrite() {
+        let asm = two_syscalls("entry");
+        let out = peephole_optimize(asm.clone());
+        assert_eq!(
+            out.trim_end(),
+            asm.trim_end(),
+            "a function with asm is left as emitted"
+        );
+        assert!(
+            out.contains("movz x8, #64") && out.contains("movz x2, #17"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_quarantine_is_per_function() {
+        // The neighbour without asm keeps its optimizations: the dead
+        // `mov x0, #0` (overwritten before any read) still goes.
+        let plain = concat!(
+            ".globl g\n.type g, %function\ng:\n.cfi_startproc\n",
+            "    mov x0, #0\n    mov x0, #7\n    ret\n",
+            ".cfi_endproc\n.size g, .-g\n"
+        );
+        let asm = format!("{}{plain}", two_syscalls("entry"));
+        let out = peephole_optimize(asm);
+        assert!(
+            out.contains("movz x8, #64") && out.contains("movz x2, #17"),
+            "{out}"
+        );
+        let g = &out[out.find("g:").unwrap()..];
+        assert!(
+            !g.contains("mov x0, #0"),
+            "the plain function is still optimized:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_function_without_unwind_tables_is_bounded_by_type_and_size() {
+        // -fno-asynchronous-unwind-tables: no CFI, `.type`/`.size` only.
+        let asm = two_syscalls("entry")
+            .replace(".cfi_startproc\n", "")
+            .replace(".cfi_endproc\n", "");
+        let out = peephole_optimize(asm.clone());
+        assert_eq!(out.trim_end(), asm.trim_end());
+    }
+
+    #[test]
+    fn top_level_asm_is_left_alone() {
+        let asm = concat!(
+            "#APP\n#APP\n.globl _start\n_start:\n    mov x29, #0\n    mov x1, x1\n",
+            "    bl entry\n1:\n    b 1b\n#NO_APP\n#NO_APP\n"
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert_eq!(out.trim_end(), asm.trim_end());
+    }
+
+    #[test]
+    fn unbalanced_inline_asm_markers_leave_the_unit_unchanged() {
+        let asm = two_syscalls("entry").replacen("#NO_APP\n", "", 1);
+        let out = peephole_optimize(asm.clone());
+        assert_eq!(out, asm);
+    }
 
     /// `-g` rows are hidden from every pass: a row between a dead `mov` and
     /// its overwrite must not keep it (k_hashmix.c kept `mov x0, #0` at -O0).

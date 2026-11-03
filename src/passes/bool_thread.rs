@@ -633,7 +633,7 @@ fn thread_round(func: &mut IrFunction) -> usize {
                             let fresh = fresh_value(func);
                             let (op_e, lhs_e, rhs_e) = match (&arm, rhs) {
                                 (Operand::Const(_), Operand::Value(_)) => {
-                                    (mirror_cmp_op(*op), rhs.clone(), arm.clone())
+                                    (op.swapped(), rhs.clone(), arm.clone())
                                 }
                                 _ => (*op, arm.clone(), rhs.clone()),
                             };
@@ -866,24 +866,6 @@ fn def_block_of(func: &IrFunction, v: Value) -> Option<usize> {
         }
     }
     None
-}
-
-/// Swap-operand mirror of a comparison: `a op b == b mirror(op) a`.
-/// Used to normalize re-materialized compares back to the canonical
-/// (value LHS, const RHS) operand form the original merge compare had.
-fn mirror_cmp_op(op: IrCmpOp) -> IrCmpOp {
-    match op {
-        IrCmpOp::Eq => IrCmpOp::Eq,
-        IrCmpOp::Ne => IrCmpOp::Ne,
-        IrCmpOp::Slt => IrCmpOp::Sgt,
-        IrCmpOp::Sle => IrCmpOp::Sge,
-        IrCmpOp::Sgt => IrCmpOp::Slt,
-        IrCmpOp::Sge => IrCmpOp::Sle,
-        IrCmpOp::Ult => IrCmpOp::Ugt,
-        IrCmpOp::Ule => IrCmpOp::Uge,
-        IrCmpOp::Ugt => IrCmpOp::Ult,
-        IrCmpOp::Uge => IrCmpOp::Ule,
-    }
 }
 
 /// Mint a fresh Value id (defensive against a stale `next_value_id` cache:

@@ -58,6 +58,68 @@ def run(env: dict[str, str], kdir: pathlib.Path,
     return result
 
 
+def check_boot_generators() -> None:
+    """Exercise the real shell helper with mocked Linux/HOSTCC generators."""
+    with tempfile.TemporaryDirectory(prefix="lccc-boot-generators-") as td:
+        root = pathlib.Path(td)
+        paths = ["arch/x86/kernel/cpu/mkcapflags.sh",
+                 "arch/x86/include/asm/cpufeatures.h",
+                 "arch/x86/include/asm/vmxfeatures.h", "arch/x86/boot/mkcpustr.c"]
+        for name in paths:
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fixture\n")
+        generator = root / paths[0]
+        generator.write_text('#!/bin/sh\nif [ "${FAIL_CAP:-0}" != 0 ]; then echo partial > "$1"; exit 7; fi\n'
+                             'echo capflags > "$1"\necho cap >> calls\n')
+        hostcc = root / "hostcc"
+        hostcc.write_text('#!/bin/sh\n[ "${FAIL_CC:-0}" = 0 ] || exit 8\nfor output; do :; done\ncat > "$output" <<\'HOST\'\n#!/bin/sh\nif [ "${FAIL_RUN:-0}" != 0 ]; then echo partial; exit 9; fi\necho cpustr\nHOST\nchmod +x "$output"\necho cc >> calls\n')
+        hostcc.chmod(0o755)
+        out = root / "out"
+        out.mkdir()
+        helper = ROOT / "scripts/boot_cpustr.sh"
+        command = ["bash", "-ec", 'source "$1"; lccc_boot_generate_cpustr "$2" "$3"',
+                   "boot-generator-test", str(helper), str(out), str(hostcc)]
+        def invoke(extra=None, code=0):
+            proc = subprocess.run(command, cwd=root, env=dict(os.environ, **(extra or {})),
+                                  capture_output=True, text=True)
+            assert proc.returncode == code, proc.stderr
+        invoke()
+        cap = root / "arch/x86/kernel/cpu/capflags.c"
+        cpu = root / "arch/x86/boot/cpustr.h"
+        assert cap.read_text() == "capflags\n" and cpu.read_text() == "cpustr\n"
+        calls = root / "calls"
+        before = calls.read_text()
+        invoke()
+        assert calls.read_text() == before, "unchanged inputs reran host generators"
+        # Isolate each freshness dependency with deterministic past timestamps.
+        for name in paths:
+            for other in paths:
+                os.utime(root / other, ns=(1_000_000_000, 1_000_000_000))
+            os.utime(cap, ns=(2_000_000_000, 2_000_000_000))
+            os.utime(cpu, ns=(2_000_000_000, 2_000_000_000))
+            os.utime(root / name, ns=(3_000_000_000, 3_000_000_000))
+            before = calls.read_text()
+            invoke()
+            delta = calls.read_text()[len(before):]
+            assert delta == ("cc\n" if name.endswith("mkcpustr.c") else "cap\ncc\n"), (name, delta)
+            before = calls.read_text()
+            invoke()
+            assert calls.read_text() == before, "refreshed data remained stale"
+        for flag, code in [("FAIL_CAP", 7), ("FAIL_CC", 8), ("FAIL_RUN", 9)]:
+            cap.write_text("old cap\n")
+            cpu.write_text("old cpu\n")
+            os.utime(cap, ns=(1, 1))
+            os.utime(cpu, ns=(1, 1))
+            invoke({flag: "1"}, code)
+            assert cpu.read_text() == "old cpu\n", "failed generation published partial data"
+            if flag == "FAIL_CAP":
+                assert cap.read_text() == "old cap\n"
+        assert not list(root.rglob("*.lccc.*")), "failed generator leaked its temporary header"
+        assert not (root / "arch/x86/boot/zoffset.h").exists()
+        assert not (root / "arch/x86/boot/voffset.h").exists()
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="lccc-provenance-") as td:
         tmp = pathlib.Path(td)
@@ -205,6 +267,7 @@ def main() -> int:
                      kdir, expect=1)
         assert "LCCC_REPREPARE=1 replaces owned tree" in result.stderr, result.stderr
 
+    check_boot_generators()
     print("PASS kernel provenance: mismatch refusal, no-op, config identity, "
           "compiler invalidation, metadata preservation, failure atomicity, damaged-tree guard, "
           "explicit reprepare")

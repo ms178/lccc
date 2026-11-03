@@ -95,7 +95,7 @@ impl RiscvCodegen {
         &mut self,
         args: &[Operand],
         arg_classes: &[CallArgClass],
-        _arg_types: &[IrType],
+        arg_types: &[IrType],
         stack_arg_space: usize,
         _fptr_spill: usize,
         _f128_temp_space: usize,
@@ -240,7 +240,17 @@ impl RiscvCodegen {
                     }
                     CallArgClass::Stack => {
                         self.operand_to_t0(arg);
-                        self.emit_store_to_sp("t0", offset as i64, "sd");
+                        if arg_types.get(arg_i) == Some(&IrType::U32) {
+                            // The psABI extends a stack-passed narrow integer
+                            // exactly like a register one: the slot of an
+                            // `unsigned int` holds its sign extension, and a
+                            // conforming callee may load it with `ld`.  t1
+                            // carries it so t0 keeps the internal form.
+                            self.state.emit("    sext.w t1, t0");
+                            self.emit_store_to_sp("t1", offset as i64, "sd");
+                        } else {
+                            self.emit_store_to_sp("t0", offset as i64, "sd");
+                        }
                         offset += 8;
                     }
                     _ => {}
@@ -277,14 +287,33 @@ impl RiscvCodegen {
         let mut staged_gp: Vec<(usize, &str)> = Vec::new(); // (target_reg_idx, temp_reg)
         let mut deferred_gp: Vec<(usize, usize)> = Vec::new(); // (target_reg_idx, arg_index)
         let mut temp_i = 0usize;
+        // The RISC-V psABI widens an integer argument narrower than XLEN by
+        // its type's signedness to 32 bits and then SIGN-extends it to 64:
+        // an `unsigned int` travels sign-extended.  This backend keeps a U32
+        // value zero-extended internally (its entry `slli; srli` restores
+        // that from any caller), so the copy into the argument register
+        // re-extends it; a conforming callee may compare the register with
+        // a W-instruction result as is (`addw a1, a1, a0; sltu a0, a0, a1`
+        // returned the wrong order for 0x80000001 + 0xffffffff).  t0 itself
+        // keeps the internal form, so the accumulator cache stays valid.
+        let copy_op = |i: usize| {
+            if arg_types.get(i) == Some(&IrType::U32) {
+                "sext.w"
+            } else {
+                "mv"
+            }
+        };
         for (i, arg) in args.iter().enumerate() {
             match arg_classes[i] {
                 CallArgClass::IntReg { reg_idx } => {
                     if temp_i < temp_regs.len() {
                         // Stage into t3/t4/t5
                         self.operand_to_t0(arg);
-                        self.state
-                            .emit_fmt(format_args!("    mv {}, t0", temp_regs[temp_i]));
+                        self.state.emit_fmt(format_args!(
+                            "    {} {}, t0",
+                            copy_op(i),
+                            temp_regs[temp_i]
+                        ));
                         staged_gp.push((reg_idx, temp_regs[temp_i]));
                         temp_i += 1;
                     } else {
@@ -338,8 +367,11 @@ impl RiscvCodegen {
         }
         for &(target_idx, arg_idx) in &deferred_gp {
             self.operand_to_t0(&args[arg_idx]);
-            self.state
-                .emit_fmt(format_args!("    mv {}, t0", RISCV_ARG_REGS[target_idx]));
+            self.state.emit_fmt(format_args!(
+                "    {} {}, t0",
+                copy_op(arg_idx),
+                RISCV_ARG_REGS[target_idx]
+            ));
         }
 
         // Load F128 register pair args

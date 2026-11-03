@@ -108,7 +108,7 @@ fn canonicalize(op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) -> Option
     // constant was on the LHS.
     let (value, bound, op) = match (lhs, rhs) {
         (Operand::Value(v), Operand::Const(c)) => (*v, c.to_i64()?, op),
-        (Operand::Const(c), Operand::Value(v)) => (*v, c.to_i64()?, swap(op)),
+        (Operand::Const(c), Operand::Value(v)) => (*v, c.to_i64()?, op.swapped()),
         _ => return None,
     };
     let kind = match op {
@@ -125,20 +125,6 @@ fn canonicalize(op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) -> Option
         kind,
         signed,
     })
-}
-
-fn swap(op: IrCmpOp) -> IrCmpOp {
-    match op {
-        IrCmpOp::Slt => IrCmpOp::Sgt,
-        IrCmpOp::Sle => IrCmpOp::Sge,
-        IrCmpOp::Sgt => IrCmpOp::Slt,
-        IrCmpOp::Sge => IrCmpOp::Sle,
-        IrCmpOp::Ult => IrCmpOp::Ugt,
-        IrCmpOp::Ule => IrCmpOp::Uge,
-        IrCmpOp::Ugt => IrCmpOp::Ult,
-        IrCmpOp::Uge => IrCmpOp::Ule,
-        other => other,
-    }
 }
 
 /// The comparison domain of an integer type: `(bit width, signedness)`.
@@ -1040,22 +1026,7 @@ fn fold_phi_diamonds(
                 } else {
                     !merge_on_true
                 };
-                let c1_op = if negate {
-                    match c1.0 {
-                        IrCmpOp::Slt => IrCmpOp::Sge,
-                        IrCmpOp::Sle => IrCmpOp::Sgt,
-                        IrCmpOp::Sgt => IrCmpOp::Sle,
-                        IrCmpOp::Sge => IrCmpOp::Slt,
-                        IrCmpOp::Ult => IrCmpOp::Uge,
-                        IrCmpOp::Ule => IrCmpOp::Ugt,
-                        IrCmpOp::Ugt => IrCmpOp::Ule,
-                        IrCmpOp::Uge => IrCmpOp::Ult,
-                        IrCmpOp::Eq => IrCmpOp::Ne,
-                        IrCmpOp::Ne => IrCmpOp::Eq,
-                    }
-                } else {
-                    c1.0
-                };
+                let c1_op = if negate { c1.0.inverse() } else { c1.0 };
                 let val_id = match val_arm.0 {
                     Operand::Value(v) => v.0,
                     _ => continue,

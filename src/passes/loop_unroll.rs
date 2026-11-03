@@ -1044,38 +1044,6 @@ fn cmp_is_unsigned(op: IrCmpOp) -> bool {
     )
 }
 
-/// `a OP b`  ⇔  `b MIRROR(OP) a`.
-fn mirror_cmp(op: IrCmpOp) -> IrCmpOp {
-    match op {
-        IrCmpOp::Slt => IrCmpOp::Sgt,
-        IrCmpOp::Sgt => IrCmpOp::Slt,
-        IrCmpOp::Sle => IrCmpOp::Sge,
-        IrCmpOp::Sge => IrCmpOp::Sle,
-        IrCmpOp::Ult => IrCmpOp::Ugt,
-        IrCmpOp::Ugt => IrCmpOp::Ult,
-        IrCmpOp::Ule => IrCmpOp::Uge,
-        IrCmpOp::Uge => IrCmpOp::Ule,
-        IrCmpOp::Eq => IrCmpOp::Eq,
-        IrCmpOp::Ne => IrCmpOp::Ne,
-    }
-}
-
-/// `!(a OP b)`  ⇔  `a NEGATE(OP) b`  (total order on integers).
-fn negate_cmp(op: IrCmpOp) -> IrCmpOp {
-    match op {
-        IrCmpOp::Slt => IrCmpOp::Sge,
-        IrCmpOp::Sge => IrCmpOp::Slt,
-        IrCmpOp::Sle => IrCmpOp::Sgt,
-        IrCmpOp::Sgt => IrCmpOp::Sle,
-        IrCmpOp::Ult => IrCmpOp::Uge,
-        IrCmpOp::Uge => IrCmpOp::Ult,
-        IrCmpOp::Ule => IrCmpOp::Ugt,
-        IrCmpOp::Ugt => IrCmpOp::Ule,
-        IrCmpOp::Eq => IrCmpOp::Ne,
-        IrCmpOp::Ne => IrCmpOp::Eq,
-    }
-}
-
 /// Rewrite the header's exit compare into the canonical "continue while
 /// `iv OP limit`" form that the trip-count arithmetic assumes.
 ///
@@ -1086,12 +1054,8 @@ fn negate_cmp(op: IrCmpOp) -> IrCmpOp {
 /// trip count of a different loop.  Both call sites of
 /// [`complete_unroll_trip`] go through this normalisation.
 fn canonical_continue_cmp(op: IrCmpOp, iv_is_lhs: bool, exit_cond_positive: bool) -> IrCmpOp {
-    let op = if iv_is_lhs { op } else { mirror_cmp(op) };
-    if exit_cond_positive {
-        negate_cmp(op)
-    } else {
-        op
-    }
+    let op = if iv_is_lhs { op } else { op.swapped() };
+    if exit_cond_positive { op.inverse() } else { op }
 }
 
 /// Exact static trip count of a constant-stride counted loop
@@ -4864,7 +4828,6 @@ pub(crate) fn rename_inst_dest(inst: &mut Instruction, map: &FxHashMap<u32, u32>
         Instruction::Store { .. }
         | Instruction::Memcpy { .. }
         | Instruction::VaArgStruct { .. }
-        | Instruction::VaArgVector { .. }
         | Instruction::VaStart { .. }
         | Instruction::VaEnd { .. }
         | Instruction::VaCopy { .. }

@@ -67,7 +67,14 @@ impl Facts<'_> {
                 to_ty,
                 ..
             } => {
-                let source = get(*src, budget).or_else(|| domain(*from_ty));
+                // A typed consumer may reinterpret/truncate its producer's
+                // bits. Validate the source interval against from_ty before
+                // treating this as a numeric widening conversion.
+                let from = domain(*from_ty);
+                let source = match (get(*src, budget), from) {
+                    (Some(a), Some(b)) if a.0 >= b.0 && a.1 <= b.1 => Some(a),
+                    _ => from,
+                };
                 let target = domain(*to_ty);
                 match (source, target) {
                     (Some(a), Some(b)) if a.0 >= b.0 && a.1 <= b.1 => Some(a),
@@ -216,10 +223,14 @@ impl Facts<'_> {
                 from_ty,
                 to_ty,
                 ..
-            }) if from_ty.size() <= to_ty.size() => match (domain(*from_ty), domain(*to_ty)) {
-                (Some(a), Some(b)) if r.0 >= a.0.max(b.0) && r.1 <= a.1.min(b.1) => Some((*v, r)),
-                _ => None,
-            },
+            }) if from_ty.size() <= to_ty.size() && self.value_type(*v) == Some(*from_ty) => {
+                match (domain(*from_ty), domain(*to_ty)) {
+                    (Some(a), Some(b)) if r.0 >= a.0.max(b.0) && r.1 <= a.1.min(b.1) => {
+                        Some((*v, r))
+                    }
+                    _ => None,
+                }
+            }
             Some(Instruction::BinOp {
                 op,
                 lhs: Operand::Value(v),
@@ -229,7 +240,9 @@ impl Facts<'_> {
             }) if matches!(op, IrBinOp::Add | IrBinOp::Sub)
                 && self
                     .value_type(*v)
-                    .is_some_and(|t| t.is_integer() && t.size() <= ty.size()) =>
+                    .and_then(domain)
+                    .zip(domain(*ty))
+                    .is_some_and(|(a, b)| a.0 >= b.0 && a.1 <= b.1) =>
             {
                 c.to_i128().and_then(|k| {
                     let offset = if *op == IrBinOp::Sub {
@@ -476,6 +489,69 @@ mod tests {
             assert!(f.range(Operand::Value(Value(1)), 0, &mut 256).is_none());
             assert!(f.range(Operand::Value(Value(1)), 16, &mut 0).is_none());
         }
+    }
+    #[test]
+    fn cast_consumer_width_and_signedness_do_not_bound_original_bits() {
+        for (producer, from) in [(IrType::U64, IrType::U8), (IrType::U8, IrType::I8)] {
+            let instructions = [
+                parameter(producer),
+                Instruction::Cast {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                    from_ty: from,
+                    to_ty: IrType::I64,
+                },
+            ];
+            let mut f = facts(&instructions);
+            f.constrain(Value(1), IrCmpOp::Sge, -50, IrType::I64);
+            f.constrain(Value(1), IrCmpOp::Sle, 100, IrType::I64);
+            let d = domain(producer).unwrap();
+            assert_eq!(bounds(&f, 0), (d.0, d.1));
+        }
+    }
+    #[test]
+    fn cast_reinterpreting_source_cannot_keep_out_of_domain_numeric_bounds() {
+        let instructions = [
+            parameter(IrType::U32),
+            Instruction::Cast {
+                dest: Value(1),
+                src: Operand::Value(Value(0)),
+                from_ty: IrType::I8,
+                to_ty: IrType::I64,
+            },
+        ];
+        let mut f = facts(&instructions);
+        f.guards.insert(0, Bounds(200, 200));
+        assert_eq!(bounds(&f, 1), (-128, 127));
+        // Exhaust every byte pattern rather than sampling positive values.
+        for n in 0..=255 {
+            f.guards.insert(0, Bounds(n, n));
+            let (lo, hi) = bounds(&f, 1);
+            let actual = i128::from(n as u8 as i8);
+            assert!(
+                lo <= actual && actual <= hi,
+                "n={n}: {lo}..{hi} excludes {actual}"
+            );
+        }
+    }
+    #[test]
+    fn affine_inverse_requires_numeric_embedding_not_just_equal_width() {
+        let instructions = [parameter(IrType::U8), binary(IrBinOp::Add, IrType::I8, 10)];
+        let mut f = facts(&instructions);
+        f.constrain(Value(1), IrCmpOp::Sge, -50, IrType::I8);
+        f.constrain(Value(1), IrCmpOp::Sle, 100, IrType::I8);
+        assert_eq!(bounds(&f, 0), (0, 255));
+        let (lo, hi) = bounds(&f, 0);
+        for n in 0..=255u8 {
+            let actual = i128::from(n.wrapping_add(10) as i8);
+            if (-50..=100).contains(&actual) {
+                assert!(lo <= i128::from(n) && i128::from(n) <= hi);
+            }
+        }
+        let widened = [parameter(IrType::U32), binary(IrBinOp::Add, IrType::I64, 1)];
+        let mut f = facts(&widened);
+        f.constrain(Value(1), IrCmpOp::Sle, 16, IrType::I64);
+        assert_eq!(bounds(&f, 0), (0, 15));
     }
     #[test]
     fn comparisons_invert_and_swap_involutively() {

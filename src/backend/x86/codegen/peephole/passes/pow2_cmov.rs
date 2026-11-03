@@ -320,7 +320,11 @@ fn plain_sar(store: &LineStore, infos: &[LineInfo], i: usize) -> Option<Sar> {
     })
 }
 
-fn plain_text<'a>(store: &'a LineStore, infos: &[LineInfo], i: usize) -> Option<&'a str> {
+pub(super) fn plain_text<'a>(
+    store: &'a LineStore,
+    infos: &[LineInfo],
+    i: usize,
+) -> Option<&'a str> {
     if infos[i].is_nop() {
         return None;
     }
@@ -331,12 +335,12 @@ fn plain_text<'a>(store: &'a LineStore, infos: &[LineInfo], i: usize) -> Option<
     Some(infos[i].trimmed(raw))
 }
 
-fn split_head(text: &str) -> Option<(String, &str)> {
+pub(super) fn split_head(text: &str) -> Option<(String, &str)> {
     text.split_once(char::is_whitespace)
         .map(|(m, r)| (m.to_string(), r))
 }
 
-fn imm_value(src: &str) -> Option<u32> {
+pub(super) fn imm_value(src: &str) -> Option<u32> {
     let rest = src.strip_prefix('$')?;
     rest.parse::<i64>().ok().and_then(|v| u32::try_from(v).ok())
 }
@@ -354,7 +358,7 @@ fn sib_pair(mem: &str) -> Option<(&str, &str)> {
     Some((base.trim(), index.trim()))
 }
 
-fn width_letter(store: &LineStore, infos: &[LineInfo], i: usize) -> Option<char> {
+pub(super) fn width_letter(store: &LineStore, infos: &[LineInfo], i: usize) -> Option<char> {
     let raw = store.get(i);
     let text = infos[i].trimmed(raw);
     let (mnem, _) = split_head(text)?;
@@ -363,7 +367,7 @@ fn width_letter(store: &LineStore, infos: &[LineInfo], i: usize) -> Option<char>
 
 /// First non-silence line strictly before `i` (nop/inert/blank/comment and
 /// `#`-carriers are silence).
-fn prev_non_silence(store: &LineStore, infos: &[LineInfo], i: usize) -> Option<usize> {
+pub(super) fn prev_non_silence(store: &LineStore, infos: &[LineInfo], i: usize) -> Option<usize> {
     let mut c = i;
     loop {
         if c == 0 {
@@ -401,7 +405,12 @@ pub(super) fn definitely_kills_any_flags_text(text: &str) -> bool {
 /// registers `%rax`/`%rdx` and the `%rsp` consumed by `ret` are live at that
 /// boundary, and an opaque control-flow edge or pinned region prevents a linear
 /// liveness claim.
-fn scratch_live_after(store: &LineStore, infos: &[LineInfo], from: usize, s: RegId) -> bool {
+pub(super) fn scratch_live_after(
+    store: &LineStore,
+    infos: &[LineInfo],
+    from: usize,
+    s: RegId,
+) -> bool {
     let mask = 1u16 << s;
     for j in (from + 1)..infos.len() {
         if infos[j].is_nop() {

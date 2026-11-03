@@ -222,6 +222,13 @@ pub enum WarningKind {
     /// (`multi-character literal with N characters exceeds 'int' size of 4
     /// bytes`, which `-Wno-multichar` does NOT silence — both measured).
     Multichar,
+    /// A malformed pragma the compiler recognises (`#pragma message` with no
+    /// string, an unclosed parenthesis, junk after the operand).
+    ///
+    /// GCC flag: -Wpragmas, on by default and in no group (GCC 16.2,
+    /// measured: `-Wno-pragmas` silences it, `-Werror=pragmas` promotes it,
+    /// `-Wall`/`-Wextra` do not re-enable it after `-Wno-pragmas`).
+    Pragmas,
 }
 
 /// Supported warning groups. `-Wall` and `-Wextra` are broad groups;
@@ -581,6 +588,14 @@ pub const WARNING_REGISTRY: &[WarningDescriptor] = &[
         [],
         false,
         "multi-character character constant"
+    ),
+    warning!(
+        Pragmas,
+        "pragmas",
+        true,
+        [],
+        false,
+        "malformed recognised pragma"
     ),
 ];
 
@@ -2191,6 +2206,7 @@ mod dialect_severity_redteam_tests {
             WarningKind::Vla,
             WarningKind::Multichar,
             WarningKind::ReturnLocalAddr,
+            WarningKind::Pragmas,
         ];
         let expected: HashSet<_> = kinds.into_iter().collect();
         assert_eq!(
@@ -2303,6 +2319,9 @@ mod dialect_severity_redteam_tests {
             // `-Wmultichar` is on by default in GCC 16.2: `'ab'` warns with no
             // flag at all, `-Wno-multichar` silences it (measured).
             "multichar",
+            // `-Wpragmas` likewise: a malformed `#pragma message` warns with
+            // no flag, `-Wno-pragmas` silences it (measured).
+            "pragmas",
             "undeclared",
         ];
         expected_defaults.sort_unstable();

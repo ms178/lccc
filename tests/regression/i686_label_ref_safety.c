@@ -141,6 +141,11 @@ int main(void) {
         return 25;
     if (jcxz_fwd(4) != 2)
         return 26;
+    /* CX is zero while ECX is not: distinguishes jcxz from jecxz. */
+    if (jcxz_fwd(0x10000) != 1)
+        return 30;
+    if (jecxz_fwd(0x10000) != 2)
+        return 31;
     /* loop decrements ecx, then jumps if the result is nonzero.
      * ecx==1 falls through (2); any other entry count takes the relay (1). */
     if (loop_fwd(1) != 2)

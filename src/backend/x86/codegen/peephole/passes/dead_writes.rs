@@ -65,11 +65,13 @@ fn droppable_source(op: &str, src: &str) -> bool {
 /// on every program): bitops -100,000,000 Ir (-3.39%, five dead instructions
 /// per iteration), zstd_count -1.86%, linux_find_bit -0.14%, nothing slower.
 ///
-/// Coverage is bounded by `flags_dead_after`, whose scan stops at a label: in
-/// ring_fifo the dead `movl %r10d, %r13d; shlq $2, %r13` pair sits directly
-/// before `.LBB5`, the flags therefore cannot be proven dead, and the pair
-/// survives (Callgrind confirms ring_fifo is unchanged).  Recovering it needs
-/// a CFG-based flag liveness; the linear scan is sound, merely imprecise.
+/// Coverage is bounded by `flags_dead_after`: its walk runs through labels
+/// (the fall-through path), follows forward branches whose condition reads
+/// none of the live flags, and ends with the flags dead at `ret` and at a
+/// codegen-marked sibling call.  A backward branch, or an edge beyond the
+/// walk's window or budget, answers "live", which only costs a deletion.
+/// At a sibling call the destination's own liveness still comes from the
+/// call's argument markers, so a staged argument register is never dead.
 const FLAG_WRITING_PURE_ARITH: &[&str] = &[
     "shl", "shr", "sar", "sal", "rol", "ror", "shld", "shrd", "add", "sub", "and", "or", "xor",
     "inc", "dec", "neg", "not", "imul", "bt", "bts", "btr", "btc", "bsf", "bsr", "popcnt", "lzcnt",
@@ -1808,6 +1810,42 @@ mod tests {
                 "{d:?}: bookkeeping blocked guard 4:\n{out}"
             );
         }
+    }
+
+    /// gcc.c-torture 981130-1: `if (a == b) exit (0); else abort ();`. The
+    /// `xorl` stages exit's argument, and the flags it writes really are
+    /// dead at the sibling call, so only the register guard protects it;
+    /// that guard once read `jmp abort@PLT`'s zero-argument marker (past
+    /// `.LBB2:`) as exit's and the program exited with status 1.
+    #[test]
+    fn argument_staging_before_a_sibling_call_survives() {
+        let asm = concat!(
+            "check:\n",
+            ".cfi_startproc\n",
+            "    cmpl %esi, %edi\n",
+            "    jne .LBB2\n",
+            ".LBB1:\n",
+            "    xorl %edi, %edi\n",
+            "    # LCCC_CALL_ARGS 1\n",
+            "    # LCCC_CALL_FP 0\n",
+            "    jmp exit@PLT\n",
+            "    # LCCC_TAIL_CALL\n",
+            "    # LCCC_CALL_ARGS 1\n",
+            "    # LCCC_CALL_FP 0\n",
+            ".LBB2:\n",
+            "    # LCCC_CALL_ARGS 0\n",
+            "    # LCCC_CALL_FP 0\n",
+            "    jmp abort@PLT\n",
+            "    # LCCC_TAIL_CALL\n",
+            "    # LCCC_CALL_ARGS 0\n",
+            "    # LCCC_CALL_FP 0\n",
+            ".cfi_endproc\n",
+        );
+        let out = run_dead_write_fixpoint(asm);
+        assert!(out.contains("xorl %edi, %edi"), "{out}");
+        // The same staging for a callee that takes no argument is dead.
+        let out = run_dead_write_fixpoint(&asm.replace("CALL_ARGS 1", "CALL_ARGS 0"));
+        assert!(!out.contains("xorl %edi, %edi"), "{out}");
     }
 
     #[test]

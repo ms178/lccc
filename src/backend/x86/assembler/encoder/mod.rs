@@ -3924,8 +3924,12 @@ impl InstructionEncoder {
             "ret" | "retq" => {
                 if ops.is_empty() {
                     self.bytes.push(0xC3);
-                } else if let Some(Operand::Immediate(ImmediateValue::Integer(val))) = ops.first() {
-                    // ret $imm16 - pop return address and deallocate imm16 bytes
+                } else if let [Operand::Immediate(ImmediateValue::Integer(val))] = ops.as_slice() {
+                    // GAS accepts the union of signed and unsigned 16-bit
+                    // values; truncating anything else changes stack cleanup.
+                    if !(-32768..=65535).contains(val) {
+                        return Err("ret immediate out of range".to_string());
+                    }
                     self.bytes.push(0xC2);
                     self.bytes.extend_from_slice(&(*val as u16).to_le_bytes());
                 } else {

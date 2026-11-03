@@ -194,7 +194,13 @@ fn a_64_bit_copy_folds_into_several_uses_at_once() {
         "    ret"
     )));
     assert_eq!(count(&out, "movq %rdi, %r11"), 0, "{}", out);
-    assert!(out.contains("addq %rdi, %rcx"), "{}", out);
+    // Both uses read %rdi.  The add may additionally be re-issued as a LEA
+    // straight into the return copy's destination (`chain_retarget`).
+    assert!(
+        out.contains("addq %rdi, %rcx") || out.contains("leaq (%rcx, %rdi), %rax"),
+        "{}",
+        out
+    );
     assert!(out.contains("xorq %rdi, %rdx"), "{}", out);
 }
 
@@ -1393,4 +1399,50 @@ fn loop_latch_data_in_the_loop_keeps_the_extension() {
         "",
     ));
     assert!(out.contains("movslq %r10d, %r10"), "{out}");
+}
+
+// ── dead in-place zero-extension ────────────────────────────────────────────
+
+/// FreeType `ps_mask_set_bit` after its base copy is coalesced: the byte
+/// store reads only `%r11b`, which `movzbl %r11b, %r11d` leaves unchanged.
+#[test]
+fn an_inplace_zext_read_only_through_its_narrow_spelling_is_deleted() {
+    let out = run(&f(concat!(
+        "    movzbl (%rdi, %rdx), %r11d\n",
+        "    btsl %esi, %r11d\n",
+        "    movzbl %r11b, %r11d\n",
+        "    movb %r11b, (%rdi, %rdx)\n",
+        "    ret"
+    )));
+    assert_eq!(count(&out, "movzbl %r11b, %r11d"), 0, "{}", out);
+    assert!(out.contains("movb %r11b, (%rdi, %rdx)"), "{}", out);
+    // The 16-bit form, ending at a full rewrite that does not read it.
+    let out = run(&f(concat!(
+        "    movzwl %r9w, %r9d\n",
+        "    movw %r9w, (%rdi)\n",
+        "    movl $3, %r9d\n",
+        "    movl %r9d, (%rsi)\n",
+        "    ret"
+    )));
+    assert_eq!(count(&out, "movzwl %r9w, %r9d"), 0, "{}", out);
+}
+
+#[test]
+fn an_inplace_zext_whose_cleared_bits_are_read_stays() {
+    for body in [
+        // A 32-bit read observes bits 8..31.
+        "    movzbl %r11b, %r11d\n    movl %r11d, (%rdi)\n    ret",
+        // The high byte is bits 8..15 of the family.
+        "    movzbl %al, %eax\n    movb %ah, (%rdi)\n    movb %al, (%rsi)\n    ret",
+        // A partial write keeps the extended upper bits observable later.
+        "    movzbl %r11b, %r11d\n    movb %r11b, (%rdi)\n    movb $1, %r11b\n    movl %r11d, (%rsi)\n    ret",
+        // A read-modify-write reads the full register.
+        "    movzbl %r11b, %r11d\n    addl $1, %r11d\n    movl %r11d, (%rsi)\n    ret",
+        // Still live past the narrow read.
+        "    movzbl %r11b, %r11d\n    movb %r11b, (%rdi)\n    jmp .LBB1\n.LBB1:\n    movl %r11d, %eax\n    ret",
+    ] {
+        let out = run(&f(body));
+        let ext = body.lines().next().unwrap().trim();
+        assert_eq!(count(&out, ext), 1, "{body}:\n{out}");
+    }
 }

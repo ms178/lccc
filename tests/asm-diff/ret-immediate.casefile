@@ -1,0 +1,16 @@
+;;; ret_immediate_valid
+.text
+ret $0
+ret $65535
+ret $-32768
+retq $4
+
+;;; ret_immediate_overflow reject
+.text
+ret $65536
+;;; ret_immediate_underflow reject
+.text
+ret $-32769
+;;; ret_immediate_extra_operand reject
+.text
+ret $1, $2

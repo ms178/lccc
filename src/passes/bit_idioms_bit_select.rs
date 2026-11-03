@@ -32,6 +32,7 @@
 //!   for `BitSet`/`BitClear`.
 
 use super::*;
+use crate::ir::reexports::Terminator;
 
 /// The width an IR bit operation may be created at.  The 128-bit pair type has
 /// no lowering, and on a 32-bit target neither does a 64-bit operation (its
@@ -50,81 +51,467 @@ fn native_bit_width(ty: IrType) -> bool {
         && (ty.size() <= 4 || !crate::common::types::target_is_32bit())
 }
 
-/// `1 << n` as an operand: the shift both the bit-set and the bit-test idioms
-/// read their index from.  Returns the index operand and the shift's width.
-fn shift_of_one(op: Operand, defs: &[Option<Instruction>]) -> Option<(Operand, IrType)> {
-    let Operand::Value(v) = peel_copies(op, defs) else {
-        return None;
-    };
-    let Some(Instruction::BinOp {
-        op: IrBinOp::Shl,
-        lhs,
-        rhs,
-        ty,
-        ..
-    }) = defs.get(v.0 as usize).and_then(Option::as_ref)
-    else {
-        return None;
-    };
-    if !ty.is_integer() || ty.size() == 0 || ty.size() > 8 {
-        return None;
-    }
-    let bits = ty.size() * 8;
-    if const_in_ring(*lhs, bits) != Some(1) {
-        return None;
-    }
-    // The count is read through integer casts, because `index mod W` survives
-    // any of them: a narrowing cast drops bits that are multiples of 2^8 and a
-    // sign-extending one adds 2^(8k-1), and every W these operations are
-    // created at (8, 16, 32, 64) divides those.  The cast is usually the C
-    // frontend's count-to-int conversion on a `1ul << n`, and reading through
-    // it lets the widened copy the backend would otherwise materialize die
-    // with the shift (`movslq %esi, %rdx` on every 64-bit bit-set).
-    Some((peel(*rhs, defs), *ty))
+/// Whether `ty` is an ordinary 8..64-bit integer type a cast can be read
+/// through: the 128-bit pair types and pointers are never part of a mask.
+fn plain_int(ty: IrType) -> bool {
+    ty.is_integer() && !ty.is_128bit()
 }
 
-/// `~(1 << n)` as an operand, plus the shift operand underneath it so the
-/// caller can require that the shift dies with the complement.  Both spellings
-/// of the complement are accepted: `UnaryOp::Not` (what the frontend emits for
-/// `~`) and `Xor` with an all-ones constant (what reassociation can leave).
-fn not_of_shift_of_one(
-    op: Operand,
-    defs: &[Option<Instruction>],
-) -> Option<(Operand, Operand, IrType)> {
-    let Operand::Value(v) = peel_copies(op, defs) else {
-        return None;
+/// The index operand of a bit operation, read through copies and integer
+/// casts: `index mod W` (W <= 64) only reads the index's low six bits, which
+/// every integer cast preserves, so `BitTest(x, (int)n)` and `BitClear(x, n)`
+/// name the same bit -- and only identical operands let the x86 backend fuse
+/// the pair into one `btr`.  On a 32-bit target the walk stops before a
+/// 64-bit producer: that value is a register pair, which no backend's bit
+/// operation reads as an index.
+pub(super) fn peel_index(op: Operand, defs: &[Option<Instruction>]) -> Operand {
+    let widest = if crate::common::types::target_is_32bit() {
+        4
+    } else {
+        8
     };
-    let shifted = match defs.get(v.0 as usize).and_then(Option::as_ref)? {
-        Instruction::UnaryOp {
-            op: IrUnaryOp::Not,
+    let mut op = op;
+    for _ in 0..32 {
+        let Operand::Value(v) = op else {
+            break;
+        };
+        match defs.get(v.0 as usize).and_then(Option::as_ref) {
+            Some(Instruction::Copy { src, .. }) => op = *src,
+            Some(Instruction::Cast {
+                src,
+                from_ty,
+                to_ty,
+                ..
+            }) if plain_int(*from_ty) && plain_int(*to_ty) && from_ty.size() <= widest => {
+                op = *src;
+            }
+            _ => break,
+        }
+    }
+    op
+}
+
+/// A proven upper bound on an index operand, read from its producer: a
+/// non-negative constant, `i & M`, or `i >> s` (logical).  Copies and integer
+/// casts are crossed.
+///
+/// Every bound returned is below `2^(w-1)` for the producer's width `w`, i.e.
+/// the value is provably non-negative there, so a sign-extending cast keeps it
+/// exactly as a zero-extending one does; a narrowing cast keeps it only when
+/// it still fits non-negatively in the destination width.  `None` means
+/// "unknown", never "unbounded but valid".
+pub(super) fn index_upper_bound(op: Operand, defs: &[Option<Instruction>]) -> Option<u64> {
+    index_upper_bound_depth(op, defs, 0)
+}
+
+fn index_upper_bound_depth(op: Operand, defs: &[Option<Instruction>], depth: u32) -> Option<u64> {
+    if depth > 16 {
+        return None;
+    }
+    let v = match op {
+        Operand::Const(c) => {
+            let n = c.to_i64()?;
+            return (0..=i64::from(i32::MAX)).contains(&n).then_some(n as u64);
+        }
+        Operand::Value(v) => v,
+    };
+    match defs.get(v.0 as usize).and_then(Option::as_ref)? {
+        Instruction::Copy { src, .. } => index_upper_bound_depth(*src, defs, depth + 1),
+        Instruction::Cast {
             src,
-            ty,
+            from_ty,
+            to_ty,
             ..
-        } if ty.is_integer() => (*src, *ty),
+        } if plain_int(*from_ty) && plain_int(*to_ty) => {
+            let bound = index_upper_bound_depth(*src, defs, depth + 1)?;
+            let to_bits = to_ty.size() * 8;
+            (bound < 1u64 << (to_bits - 1)).then_some(bound)
+        }
         Instruction::BinOp {
-            op: IrBinOp::Xor,
+            op: IrBinOp::And,
             lhs,
             rhs,
             ty,
             ..
-        } if ty.is_integer() && ty.size() > 0 && ty.size() <= 8 => {
+        } if plain_int(*ty) => {
             let bits = ty.size() * 8;
-            let all_ones = u64::MAX >> (64 - bits);
-            if const_in_ring(*rhs, bits) == Some(all_ones) {
-                (*lhs, *ty)
-            } else if const_in_ring(*lhs, bits) == Some(all_ones) {
-                (*rhs, *ty)
-            } else {
-                return None;
-            }
+            let mask = const_in_ring(*rhs, bits).or_else(|| const_in_ring(*lhs, bits))?;
+            (mask < 1u64 << (bits - 1)).then_some(mask)
         }
+        Instruction::BinOp {
+            op: IrBinOp::LShr,
+            rhs,
+            ty,
+            ..
+        } if plain_int(*ty) => {
+            let bits = ty.size() * 8;
+            let shift = const_in_ring(*rhs, bits)?;
+            (1..bits as u64)
+                .contains(&shift)
+                .then(|| (1u64 << (bits as u64 - shift)) - 1)
+        }
+        _ => None,
+    }
+}
+
+/// `op` read as a one-hot mask `1 << n` at `bits` width.  Returns the index
+/// operand `n` (the shift count, read through integer casts because `index mod
+/// W` survives all of them -- see below) and records every value on the path in
+/// `chain`, so the caller can require each one to die with its consumer.
+///
+/// The path may cross copies and integer casts between the consumer and the
+/// shift:
+///
+/// * a same-width cast (`I32 <-> U32`, the C frontend's `(unsigned)(1 << n)`)
+///   reinterprets the same bit pattern and is always transparent;
+/// * a widening cast keeps the single bit at the same position only when the
+///   bit is below the source width -- and, for a sign extension, below the
+///   source's sign bit, which would otherwise smear into every new bit (the
+///   `unsigned long x | (1 << n)` control with an `int` shift must keep its
+///   `cltq`);
+/// * a narrowing cast keeps it only when the bit is below the destination
+///   width (`(u8)(1 << (i & 7))`).
+///
+/// Each width-changing cast therefore demands a proof that the count is below
+/// a limit; [`index_upper_bound`] supplies it or the match fails.  With a
+/// proven count below every crossed width, `n mod W` is `n` at the shift's
+/// width and at the consumer's, so the bit operation's own `index mod W`
+/// contract reads the same bit.
+pub(super) fn one_hot_at(
+    op: Operand,
+    bits: usize,
+    defs: &[Option<Instruction>],
+    chain: &mut Vec<u32>,
+) -> Option<Operand> {
+    let mut op = op;
+    let mut bits = bits;
+    // Exclusive upper bound the count must provably satisfy, set by the
+    // tightest width-changing cast crossed so far.
+    let mut limit: Option<u64> = None;
+    for _ in 0..16 {
+        let Operand::Value(v) = op else {
+            return None;
+        };
+        chain.push(v.0);
+        match defs.get(v.0 as usize).and_then(Option::as_ref)? {
+            Instruction::Copy { src, .. } => op = *src,
+            Instruction::Cast {
+                src,
+                from_ty,
+                to_ty,
+                ..
+            } if plain_int(*from_ty) && plain_int(*to_ty) => {
+                let from_bits = from_ty.size() * 8;
+                if to_ty.size() * 8 != bits {
+                    return None;
+                }
+                let need = if from_bits < bits {
+                    // A sign extension copies bit `from_bits - 1` upwards.
+                    Some(from_bits - usize::from(from_ty.is_signed()))
+                } else if from_bits > bits {
+                    Some(bits)
+                } else {
+                    None
+                };
+                if let Some(need) = need {
+                    let need = need as u64;
+                    limit = Some(limit.map_or(need, |l| l.min(need)));
+                }
+                bits = from_bits;
+                op = *src;
+            }
+            Instruction::BinOp {
+                op: IrBinOp::Shl,
+                lhs,
+                rhs,
+                ty,
+                ..
+            } if plain_int(*ty) && ty.size() * 8 == bits => {
+                if const_in_ring(*lhs, bits) != Some(1) {
+                    return None;
+                }
+                if let Some(limit) = limit {
+                    if index_upper_bound(*rhs, defs)? >= limit {
+                        return None;
+                    }
+                }
+                return Some(peel_index(*rhs, defs));
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// `~(1 << n)` at `bits` width, as [`one_hot_at`] reads the mask underneath.
+/// Both spellings of the complement are accepted: `UnaryOp::Not` (what the
+/// frontend emits for `~`) and `Xor` with an all-ones constant (what
+/// reassociation can leave).  Copies and same-width casts above the complement
+/// are crossed too (`(unsigned)~(1 << n)`).
+pub(super) fn complement_of_one_hot(
+    op: Operand,
+    bits: usize,
+    defs: &[Option<Instruction>],
+    chain: &mut Vec<u32>,
+) -> Option<Operand> {
+    let mut op = op;
+    for _ in 0..16 {
+        let Operand::Value(v) = op else {
+            return None;
+        };
+        chain.push(v.0);
+        match defs.get(v.0 as usize).and_then(Option::as_ref)? {
+            Instruction::Copy { src, .. } => op = *src,
+            Instruction::Cast {
+                src,
+                from_ty,
+                to_ty,
+                ..
+            } if plain_int(*from_ty)
+                && plain_int(*to_ty)
+                && from_ty.size() == to_ty.size()
+                && to_ty.size() * 8 == bits =>
+            {
+                op = *src;
+            }
+            Instruction::UnaryOp {
+                op: IrUnaryOp::Not,
+                src,
+                ty,
+                ..
+            } if plain_int(*ty) && ty.size() * 8 == bits => {
+                return one_hot_at(*src, bits, defs, chain);
+            }
+            Instruction::BinOp {
+                op: IrBinOp::Xor,
+                lhs,
+                rhs,
+                ty,
+                ..
+            } if plain_int(*ty) && ty.size() * 8 == bits => {
+                let all_ones = u64::MAX >> (64 - bits);
+                let inner = if const_in_ring(*rhs, bits) == Some(all_ones) {
+                    *lhs
+                } else if const_in_ring(*lhs, bits) == Some(all_ones) {
+                    *rhs
+                } else {
+                    return None;
+                };
+                return one_hot_at(inner, bits, defs, chain);
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Every value on a matched path is used exactly once, i.e. the whole path
+/// dies when the consumer stops reading it.  `uses` holds the running counts
+/// of the scan, so a use by an instruction already rewritten is gone.
+fn chain_dies(chain: &[u32], uses: &[u32]) -> bool {
+    !chain.is_empty() && chain.iter().all(|id| uses.get(*id as usize) == Some(&1))
+}
+
+/// Pick the one-hot side of a two-operand instruction at `bits` width,
+/// returning the other operand (`base`) and the index.  Both operand orders
+/// are accepted; a shape where *both* sides are one-hot is left alone, because
+/// either rewrite would then have to duplicate the other shift.  The whole mask
+/// path must die with the consumer.
+fn split_one_hot(
+    lhs: Operand,
+    rhs: Operand,
+    bits: usize,
+    defs: &[Option<Instruction>],
+    uses: &[u32],
+) -> Option<(Operand, Operand)> {
+    let mut lhs_chain = Vec::new();
+    let mut rhs_chain = Vec::new();
+    let (base, index, chain) = match (
+        one_hot_at(lhs, bits, defs, &mut lhs_chain),
+        one_hot_at(rhs, bits, defs, &mut rhs_chain),
+    ) {
+        (Some(index), None) => (rhs, index, lhs_chain),
+        (None, Some(index)) => (lhs, index, rhs_chain),
         _ => return None,
     };
-    let (index, shift_ty) = shift_of_one(shifted.0, defs)?;
-    if shift_ty != shifted.1 {
-        return None;
+    chain_dies(&chain, uses).then_some((base, index))
+}
+
+/// The complement twin of [`split_one_hot`]: `x & ~(1 << n)` in either order.
+fn split_complement(
+    lhs: Operand,
+    rhs: Operand,
+    bits: usize,
+    defs: &[Option<Instruction>],
+    uses: &[u32],
+) -> Option<(Operand, Operand)> {
+    let mut lhs_chain = Vec::new();
+    let mut rhs_chain = Vec::new();
+    let (base, index, chain) = match (
+        complement_of_one_hot(lhs, bits, defs, &mut lhs_chain),
+        complement_of_one_hot(rhs, bits, defs, &mut rhs_chain),
+    ) {
+        (Some(index), None) => (rhs, index, lhs_chain),
+        (None, Some(index)) => (lhs, index, rhs_chain),
+        _ => return None,
+    };
+    chain_dies(&chain, uses).then_some((base, index))
+}
+
+/// Drop a redundant `& M` from a bit operation's index.  The four operations
+/// read `index mod W`, which only depends on the low `log2(W)` bits, so an
+/// index of `i & M` with `M` covering `W - 1` reads the same bit as `i` itself
+/// (brotli's `1u << (i & 31)`, libsrtp's `(bit) & 31`, `bitNum % 64`).  Copies
+/// and integer casts between the mask and the operation are crossed for the
+/// same reason the count casts are: none of them changes the low six bits.
+///
+/// Only a mask that dies here is dropped -- a mask with other readers stays
+/// live anyway, and reading its input instead would just lengthen that input's
+/// live range for nothing.
+pub(super) fn strip_index_mask(
+    index: Operand,
+    bits: usize,
+    defs: &[Option<Instruction>],
+    uses: &[u32],
+) -> Operand {
+    let low = (bits - 1) as u64;
+    let mut op = index;
+    for _ in 0..8 {
+        let Operand::Value(v) = op else {
+            return index;
+        };
+        if uses.get(v.0 as usize) != Some(&1) {
+            return index;
+        }
+        match defs.get(v.0 as usize).and_then(Option::as_ref) {
+            Some(Instruction::Copy { src, .. }) => op = *src,
+            Some(Instruction::Cast {
+                src,
+                from_ty,
+                to_ty,
+                ..
+            }) if plain_int(*from_ty) && plain_int(*to_ty) => op = *src,
+            Some(Instruction::BinOp {
+                op: IrBinOp::And,
+                lhs,
+                rhs,
+                ty,
+                ..
+            }) if plain_int(*ty) => {
+                let width = ty.size() * 8;
+                let (other, mask) = match (const_in_ring(*rhs, width), const_in_ring(*lhs, width)) {
+                    (Some(mask), _) => (*lhs, mask),
+                    (None, Some(mask)) => (*rhs, mask),
+                    _ => return index,
+                };
+                // The mask must keep every index bit the operation reads.  Its
+                // own width never matters: the narrowest integer has eight
+                // bits, which already holds the six an index can need.
+                return if mask & low == low {
+                    peel_index(other, defs)
+                } else {
+                    index
+                };
+            }
+            _ => return index,
+        }
     }
-    Some((index, shifted.0, shift_ty))
+    index
+}
+
+/// Whether every bit `op` can have at `bits` width lies inside `mask`: a
+/// zero-extension from a narrower unsigned type, an `& C'` with `C'` inside
+/// `mask`, or such a constant, read through copies and same-width casts.
+fn bits_within(op: Operand, mask: u64, bits: usize, defs: &[Option<Instruction>]) -> bool {
+    let mut op = op;
+    for _ in 0..16 {
+        match op {
+            Operand::Const(_) => {
+                return const_in_ring(op, bits).is_some_and(|c| c & !mask == 0);
+            }
+            Operand::Value(v) => match defs.get(v.0 as usize).and_then(Option::as_ref) {
+                Some(Instruction::Copy { src, .. }) => op = *src,
+                Some(Instruction::Cast {
+                    src,
+                    from_ty,
+                    to_ty,
+                    ..
+                }) if plain_int(*from_ty) && plain_int(*to_ty) && to_ty.size() * 8 == bits => {
+                    let from_bits = from_ty.size() * 8;
+                    if from_bits == bits {
+                        op = *src;
+                    } else if from_bits < bits && from_ty.is_unsigned() {
+                        let possible = u64::MAX >> (64 - from_bits);
+                        return possible & !mask == 0;
+                    } else {
+                        return false;
+                    }
+                }
+                Some(Instruction::BinOp {
+                    op: IrBinOp::And,
+                    lhs,
+                    rhs,
+                    ty,
+                    ..
+                }) if plain_int(*ty) && ty.size() * 8 == bits => {
+                    return const_in_ring(*rhs, bits)
+                        .or_else(|| const_in_ring(*lhs, bits))
+                        .is_some_and(|c| c & !mask == 0);
+                }
+                _ => return false,
+            },
+        }
+    }
+    false
+}
+
+/// `x & BitClear(C, k)` -> `BitClear(x, k)` when every bit `x` can have is
+/// already inside `C`: then `x & C` is `x`, and clearing bit `k` of the mask
+/// clears it in the result.  usrsctp's `arry[gap >> 3] &= (~(1 << (gap & 7)))
+/// & 0xff` reaches the IR as `zext(byte) & BitClear(255, k)` once the inner
+/// clear has folded, which materialized `255`, cleared a bit in it and ANDed
+/// -- three instructions for one `btr`.
+fn fold_and_of_constant_clear(
+    dest: Value,
+    lhs: Operand,
+    rhs: Operand,
+    ty: IrType,
+    defs: &[Option<Instruction>],
+    uses: &[u32],
+) -> Option<Instruction> {
+    let bits = ty.size() * 8;
+    for (clear, other) in [(lhs, rhs), (rhs, lhs)] {
+        let Operand::Value(cv) = clear else {
+            continue;
+        };
+        let Some(Instruction::BinOp {
+            op: IrBinOp::BitClear,
+            lhs: constant,
+            rhs: index,
+            ty: clear_ty,
+            ..
+        }) = defs.get(cv.0 as usize).and_then(Option::as_ref)
+        else {
+            continue;
+        };
+        if clear_ty.size() != ty.size() || uses.get(cv.0 as usize) != Some(&1) {
+            continue;
+        }
+        let Some(constant) = const_in_ring(*constant, bits) else {
+            continue;
+        };
+        if matches!(other, Operand::Const(_)) || !bits_within(other, constant, bits, defs) {
+            continue;
+        }
+        return Some(Instruction::BinOp {
+            dest,
+            op: IrBinOp::BitClear,
+            lhs: other,
+            rhs: *index,
+            ty,
+        });
+    }
+    None
 }
 
 /// The inner base of `(x ^ m) ^ m`, i.e. `x` when `base` is a `BitToggle` (or
@@ -152,26 +539,13 @@ fn toggle_involution(
     (peel_copies(inner_index, defs) == peel_copies(index, defs)).then_some(inner_base)
 }
 
-/// Whether an operand's producer is used exactly once, i.e. dies when the
-/// matched instruction stops reading it.  `uses` is the running count at this
-/// point of the scan, so a use by an *earlier* instruction is already gone.
-fn single_use(op: Operand, defs: &[Option<Instruction>], uses: &[u32]) -> bool {
-    matches!(peel_copies(op, defs), Operand::Value(v) if uses.get(v.0 as usize) == Some(&1))
-}
-
-/// Pick the shifted side of a two-operand instruction, returning the value
-/// operand (`base`) and the shift's index.  Both operand orders are accepted;
-/// a shape where *both* sides are `1 << n` is left alone, because either
-/// rewrite would then have to duplicate the other shift.
-fn split_shift(
-    lhs: Operand,
-    rhs: Operand,
-    defs: &[Option<Instruction>],
-) -> Option<(Operand, Operand, Operand, IrType)> {
-    match (shift_of_one(lhs, defs), shift_of_one(rhs, defs)) {
-        (Some((index, ty)), None) => Some((lhs, rhs, index, ty)),
-        (None, Some((index, ty))) => Some((rhs, lhs, index, ty)),
-        _ => None,
+fn bit_op(dest: Value, op: IrBinOp, lhs: Operand, rhs: Operand, ty: IrType) -> Instruction {
+    Instruction::BinOp {
+        dest,
+        op,
+        lhs,
+        rhs,
+        ty,
     }
 }
 
@@ -189,19 +563,13 @@ pub(super) fn fold_bit_select(
             rhs,
             ty,
         } if native_bit_width(*ty) => {
-            let (shifted, base, index, shift_ty) = split_shift(*lhs, *rhs, defs)?;
-            if shift_ty != *ty || !single_use(shifted, defs, uses) {
-                return None;
-            }
-            Some(Instruction::BinOp {
-                dest: *dest,
-                op: IrBinOp::BitSet,
-                lhs: base,
-                rhs: index,
-                ty: *ty,
-            })
+            let bits = ty.size() * 8;
+            let (base, index) = split_one_hot(*lhs, *rhs, bits, defs, uses)?;
+            let index = strip_index_mask(index, bits, defs, uses);
+            Some(bit_op(*dest, IrBinOp::BitSet, base, index, *ty))
         }
-        // `x & ~(1 << n)` -> `BitClear(x, n)`
+        // `x & ~(1 << n)` -> `BitClear(x, n)`, and `x & BitClear(C, k)` ->
+        // `BitClear(x, k)` when `x` has no bit outside `C`.
         Instruction::BinOp {
             dest,
             op: IrBinOp::And,
@@ -209,28 +577,12 @@ pub(super) fn fold_bit_select(
             rhs,
             ty,
         } if native_bit_width(*ty) => {
-            let (complement, base) = match (
-                not_of_shift_of_one(*lhs, defs),
-                not_of_shift_of_one(*rhs, defs),
-            ) {
-                (Some(_), None) => (*lhs, *rhs),
-                (None, Some(_)) => (*rhs, *lhs),
-                _ => return None,
-            };
-            let (index, shifted, complement_ty) = not_of_shift_of_one(complement, defs)?;
-            if complement_ty != *ty
-                || !single_use(complement, defs, uses)
-                || !single_use(shifted, defs, uses)
-            {
-                return None;
+            let bits = ty.size() * 8;
+            if let Some((base, index)) = split_complement(*lhs, *rhs, bits, defs, uses) {
+                let index = strip_index_mask(index, bits, defs, uses);
+                return Some(bit_op(*dest, IrBinOp::BitClear, base, index, *ty));
             }
-            Some(Instruction::BinOp {
-                dest: *dest,
-                op: IrBinOp::BitClear,
-                lhs: base,
-                rhs: index,
-                ty: *ty,
-            })
+            fold_and_of_constant_clear(*dest, *lhs, *rhs, *ty, defs, uses)
         }
         // `x ^ (1 << n)` -> `BitToggle(x, n)`
         //
@@ -244,10 +596,8 @@ pub(super) fn fold_bit_select(
             rhs,
             ty,
         } if native_bit_width(*ty) => {
-            let (shifted, base, index, shift_ty) = split_shift(*lhs, *rhs, defs)?;
-            if shift_ty != *ty || !single_use(shifted, defs, uses) {
-                return None;
-            }
+            let bits = ty.size() * 8;
+            let (base, index) = split_one_hot(*lhs, *rhs, bits, defs, uses)?;
             // `(x ^ m) ^ m` is `x`, and the toggle is its own inverse.  The
             // earlier XOR of that pair has usually been folded to a `BitToggle`
             // by the time this one is reached, and the pass that would cancel
@@ -262,18 +612,16 @@ pub(super) fn fold_bit_select(
                     src: inner_base,
                 });
             }
-            Some(Instruction::BinOp {
-                dest: *dest,
-                op: IrBinOp::BitToggle,
-                lhs: base,
-                rhs: index,
-                ty: *ty,
-            })
+            let index = strip_index_mask(index, bits, defs, uses);
+            Some(bit_op(*dest, IrBinOp::BitToggle, base, index, *ty))
         }
         // `(x & (1 << n)) != 0` -> `BitTest(x, n)`
         //
         // The whole comparison is replaced: `BitTest`'s value is the 0/1 the
         // comparison computes, so nothing downstream changes type or carrier.
+        // (`fold_bit_tests` rewrites the AND itself whenever every reader is a
+        // zero test; this arm keeps covering a comparison some other rewrite of
+        // this same scan exposes.)
         Instruction::Cmp {
             dest,
             op: IrCmpOp::Ne,
@@ -289,9 +637,8 @@ pub(super) fn fold_bit_select(
             } else {
                 return None;
             };
-            let Operand::Value(v) = peel_copies(tested, defs) else {
-                return None;
-            };
+            let mut and_chain = Vec::new();
+            let v = peel_copies_recording(tested, defs, &mut and_chain)?;
             let Some(Instruction::BinOp {
                 op: IrBinOp::And,
                 lhs: and_lhs,
@@ -302,23 +649,49 @@ pub(super) fn fold_bit_select(
             else {
                 return None;
             };
-            if *and_ty != *ty || !single_use(tested, defs, uses) {
+            if and_ty.size() != ty.size() || !chain_dies(&and_chain, uses) {
                 return None;
             }
-            let (shifted, base, index, shift_ty) = split_shift(*and_lhs, *and_rhs, defs)?;
-            if shift_ty != *ty || !single_use(shifted, defs, uses) {
-                return None;
-            }
-            Some(Instruction::BinOp {
-                dest: *dest,
-                op: IrBinOp::BitTest,
-                lhs: base,
-                rhs: index,
-                ty: *ty,
-            })
+            let (base, index) = split_one_hot(*and_lhs, *and_rhs, bits, defs, uses)?;
+            let index = strip_index_mask(index, bits, defs, uses);
+            Some(bit_op(*dest, IrBinOp::BitTest, base, index, *ty))
+        }
+        // An existing bit operation (built by this fold earlier, by the
+        // shared-mask pass, or by `simplify`'s `(x >> i) & 1`) whose index
+        // still carries a redundant `& (W - 1)`.
+        Instruction::BinOp {
+            dest,
+            op: op @ (IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle | IrBinOp::BitTest),
+            lhs,
+            rhs,
+            ty,
+        } if native_bit_width(*ty) => {
+            let index = peel_index(strip_index_mask(*rhs, ty.size() * 8, defs, uses), defs);
+            (index != *rhs).then(|| bit_op(*dest, *op, *lhs, index, *ty))
         }
         _ => None,
     }
+}
+
+/// `peel_copies`, recording every value it visits (the operand's own value
+/// included) so the caller can require the whole copy path to die.
+pub(super) fn peel_copies_recording(
+    op: Operand,
+    defs: &[Option<Instruction>],
+    chain: &mut Vec<u32>,
+) -> Option<Value> {
+    let mut op = op;
+    for _ in 0..32 {
+        let Operand::Value(v) = op else {
+            return None;
+        };
+        chain.push(v.0);
+        match defs.get(v.0 as usize).and_then(Option::as_ref) {
+            Some(Instruction::Copy { src, .. }) => op = *src,
+            _ => return Some(v),
+        }
+    }
+    None
 }
 
 /// Target-aware shared-mask selection.
@@ -420,10 +793,12 @@ pub(super) fn fold_shared_bit_select(func: &mut IrFunction) -> usize {
     changes
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct SharedLoc {
-    block: usize,
-    inst: Option<usize>,
+/// Where a value is read: an instruction of a block, or (`inst == None`) the
+/// block's terminator.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(super) struct SharedLoc {
+    pub(super) block: usize,
+    pub(super) inst: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -437,14 +812,20 @@ struct SharedCandidate {
 enum SharedKind {
     Mask,
     Complement,
-    TestAnd,
 }
 
+/// [`peel_index`] over the group pass's location tables (the same walk and
+/// the same 32-bit-target stop before a 64-bit pair producer).
 fn forward_shared_index(
     mut op: Operand,
     func: &IrFunction,
     def_loc: &[Option<SharedLoc>],
 ) -> Operand {
+    let widest = if crate::common::types::target_is_32bit() {
+        4
+    } else {
+        8
+    };
     for _ in 0..32 {
         let Operand::Value(v) = op else { break };
         let next = def_loc.get(v.0 as usize).and_then(|o| *o).and_then(|l| {
@@ -455,7 +836,9 @@ fn forward_shared_index(
                     from_ty,
                     to_ty,
                     ..
-                } if from_ty.is_integer() && to_ty.is_integer() => Some(*src),
+                } if plain_int(*from_ty) && plain_int(*to_ty) && from_ty.size() <= widest => {
+                    Some(*src)
+                }
                 Instruction::Copy { src, .. } => Some(*src),
                 _ => None,
             }
@@ -475,9 +858,89 @@ fn shared_group_operand(op: Operand, kind: &[Option<SharedKind>]) -> bool {
     }
 }
 
+fn names(op: &Operand, v: u32) -> bool {
+    matches!(op, Operand::Value(x) if x.0 == v)
+}
+
+/// Whether every reader of `v` -- through copies -- only asks whether it is
+/// zero: `Cmp Eq/Ne` against a zero constant at `v`'s own width, a
+/// `CondBranch` on it, or a `Select` that branches on it without also
+/// returning it.  Each of those readers gets the same answer from ANY value
+/// that is zero exactly when `v` is, which is what lets `x & (1 << n)` become
+/// `BitTest(x, n)` in place without touching one reader.
+///
+/// A compare at another width is refused: a narrower one reads only the low
+/// part of `v`, where a high one-hot bit is invisible but the 0/1 `BitTest`
+/// is not.
+pub(super) fn only_zero_tested(
+    v: u32,
+    bits: usize,
+    func: &IrFunction,
+    uses: &[Vec<SharedLoc>],
+) -> bool {
+    let mut stack = vec![v];
+    let mut seen = 0usize;
+    while let Some(cur) = stack.pop() {
+        seen += 1;
+        if seen > 64 {
+            return false;
+        }
+        let Some(readers) = uses.get(cur as usize) else {
+            return false;
+        };
+        for loc in readers {
+            let Some(block) = func.blocks.get(loc.block) else {
+                return false;
+            };
+            let Some(ii) = loc.inst else {
+                match &block.terminator {
+                    Terminator::CondBranch { cond, .. } if names(cond, cur) => continue,
+                    _ => return false,
+                }
+            };
+            match &block.instructions[ii] {
+                Instruction::Copy { dest, src } if names(src, cur) => stack.push(dest.0),
+                Instruction::Cmp {
+                    op: IrCmpOp::Eq | IrCmpOp::Ne,
+                    lhs,
+                    rhs,
+                    ty,
+                    ..
+                } if plain_int(*ty) && ty.size() * 8 == bits => {
+                    let zero_other = if names(lhs, cur) && !names(rhs, cur) {
+                        const_in_ring(*rhs, bits) == Some(0)
+                    } else if names(rhs, cur) && !names(lhs, cur) {
+                        const_in_ring(*lhs, bits) == Some(0)
+                    } else {
+                        false
+                    };
+                    if !zero_other {
+                        return false;
+                    }
+                }
+                Instruction::Select {
+                    cond,
+                    true_val,
+                    false_val,
+                    ..
+                } if names(cond, cur) && !names(true_val, cur) && !names(false_val, cur) => {}
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
 /// Prove that every reader of `cand` is a bit-family consumer, and return the
-/// consumer rewrites.  Internal copies/complements/test-ands are closed over;
-/// any escaping or non-bit reader returns `None` for the whole group.
+/// consumer rewrites.  Internal copies, same-width casts and complements are
+/// closed over; any escaping or non-bit reader returns `None` for the whole
+/// group.
+///
+/// A test-and (`x & mask`) whose readers only compare it with zero is
+/// rewritten IN PLACE to `BitTest(x, n)`: it is zero exactly when the bit is
+/// clear, so its `!= 0` / `== 0` / branch / select readers stay valid as they
+/// are (`simplify` then retires the `!= 0`, and the backend fuses `bt` into
+/// the branch, `setnc` or `cmov`).
 fn analyze_shared_candidate(
     func: &IrFunction,
     uses: &[Vec<SharedLoc>],
@@ -487,10 +950,10 @@ fn analyze_shared_candidate(
     use crate::common::fx_hash::FxHashMap;
 
     let len = ambiguous.len();
-    let bits = cand.ty.size() * 8;
+    let width = cand.ty.size();
+    let bits = width * 8;
     let all_ones = u64::MAX >> (64 - bits);
     let mut kind = vec![None; len];
-    let mut testand_base = vec![None; len];
     let mut queue = vec![cand.value];
     kind[cand.value as usize] = Some(SharedKind::Mask);
     let mut rewrites: FxHashMap<SharedLoc, Instruction> = FxHashMap::default();
@@ -504,10 +967,9 @@ fn analyze_shared_candidate(
                 return None;
             }
             macro_rules! enqueue {
-                ($dest:expr, $new_kind:expr, $base:expr) => {{
+                ($dest:expr, $new_kind:expr) => {{
                     let dest: Value = $dest;
                     let new_kind: SharedKind = $new_kind;
-                    let base: Option<Operand> = $base;
                     let id = dest.0 as usize;
                     if ambiguous[id] {
                         return None;
@@ -517,27 +979,39 @@ fn analyze_shared_candidate(
                         Some(_) => {}
                         None => {
                             kind[id] = Some(new_kind);
-                            if new_kind == SharedKind::TestAnd {
-                                testand_base[id] = base;
-                            }
                             queue.push(dest.0);
                         }
                     }
                 }};
             }
+            // The other operand of a two-operand reader of `v`; a reader that
+            // names `v` twice (`m | m`) is not a bit-family consumer.
+            let other_of = |lhs: &Operand, rhs: &Operand| -> Option<Operand> {
+                match (names(lhs, v), names(rhs, v)) {
+                    (true, false) => Some(*rhs),
+                    (false, true) => Some(*lhs),
+                    _ => None,
+                }
+            };
             match (k, inst) {
-                (SharedKind::Mask, Instruction::Copy { dest, src }) if matches!(src, Operand::Value(x) if x.0 == v) =>
+                (_, Instruction::Copy { dest, src }) if names(src, v) => enqueue!(*dest, k),
+                // `(unsigned)(1 << n)`: the same bit pattern under another
+                // signedness is the same mask (or complement).
+                (
+                    _,
+                    Instruction::Cast {
+                        dest,
+                        src,
+                        from_ty,
+                        to_ty,
+                    },
+                ) if names(src, v)
+                    && plain_int(*from_ty)
+                    && plain_int(*to_ty)
+                    && from_ty.size() == width
+                    && to_ty.size() == width =>
                 {
-                    enqueue!(*dest, SharedKind::Mask, None);
-                }
-                (SharedKind::Complement, Instruction::Copy { dest, src }) if matches!(src, Operand::Value(x) if x.0 == v) =>
-                {
-                    enqueue!(*dest, SharedKind::Complement, None);
-                }
-                (SharedKind::TestAnd, Instruction::Copy { dest, src }) if matches!(src, Operand::Value(x) if x.0 == v) =>
-                {
-                    let base = testand_base[v as usize];
-                    enqueue!(*dest, SharedKind::TestAnd, base);
+                    enqueue!(*dest, k)
                 }
                 (
                     SharedKind::Mask,
@@ -547,8 +1021,8 @@ fn analyze_shared_candidate(
                         src,
                         ty,
                     },
-                ) if *ty == cand.ty && matches!(src, Operand::Value(x) if x.0 == v) => {
-                    enqueue!(*dest, SharedKind::Complement, None);
+                ) if plain_int(*ty) && ty.size() == width && names(src, v) => {
+                    enqueue!(*dest, SharedKind::Complement);
                 }
                 (
                     SharedKind::Mask,
@@ -559,26 +1033,14 @@ fn analyze_shared_candidate(
                         rhs,
                         ty,
                     },
-                ) if *ty == cand.ty => {
-                    let other = if matches!(lhs, Operand::Value(x) if x.0 == v) {
-                        rhs
-                    } else if matches!(rhs, Operand::Value(x) if x.0 == v) {
-                        lhs
-                    } else {
-                        return None;
-                    };
-                    if const_in_ring(*other, bits) == Some(all_ones) {
-                        enqueue!(*dest, SharedKind::Complement, None);
-                    } else if !shared_group_operand(*other, &kind) {
+                ) if plain_int(*ty) && ty.size() == width => {
+                    let other = other_of(lhs, rhs)?;
+                    if const_in_ring(other, bits) == Some(all_ones) {
+                        enqueue!(*dest, SharedKind::Complement);
+                    } else if !shared_group_operand(other, &kind) {
                         rewrites.insert(
                             loc,
-                            Instruction::BinOp {
-                                dest: *dest,
-                                op: IrBinOp::BitToggle,
-                                lhs: *other,
-                                rhs: cand.index,
-                                ty: cand.ty,
-                            },
+                            bit_op(*dest, IrBinOp::BitToggle, other, cand.index, *ty),
                         );
                     } else {
                         return None;
@@ -593,18 +1055,14 @@ fn analyze_shared_candidate(
                         rhs,
                         ty,
                     },
-                ) if *ty == cand.ty => {
-                    let other = if matches!(lhs, Operand::Value(x) if x.0 == v) {
-                        rhs
-                    } else if matches!(rhs, Operand::Value(x) if x.0 == v) {
-                        lhs
-                    } else {
-                        return None;
-                    };
-                    if shared_group_operand(*other, &kind) {
+                ) if plain_int(*ty) && ty.size() == width => {
+                    let other = other_of(lhs, rhs)?;
+                    if shared_group_operand(other, &kind)
+                        || !only_zero_tested(dest.0, bits, func, uses)
+                    {
                         return None;
                     }
-                    enqueue!(*dest, SharedKind::TestAnd, Some(*other));
+                    rewrites.insert(loc, bit_op(*dest, IrBinOp::BitTest, other, cand.index, *ty));
                 }
                 (
                     SharedKind::Mask,
@@ -615,27 +1073,12 @@ fn analyze_shared_candidate(
                         rhs,
                         ty,
                     },
-                ) if *ty == cand.ty => {
-                    let other = if matches!(lhs, Operand::Value(x) if x.0 == v) {
-                        rhs
-                    } else if matches!(rhs, Operand::Value(x) if x.0 == v) {
-                        lhs
-                    } else {
-                        return None;
-                    };
-                    if shared_group_operand(*other, &kind) {
+                ) if plain_int(*ty) && ty.size() == width => {
+                    let other = other_of(lhs, rhs)?;
+                    if shared_group_operand(other, &kind) {
                         return None;
                     }
-                    rewrites.insert(
-                        loc,
-                        Instruction::BinOp {
-                            dest: *dest,
-                            op: IrBinOp::BitSet,
-                            lhs: *other,
-                            rhs: cand.index,
-                            ty: cand.ty,
-                        },
-                    );
+                    rewrites.insert(loc, bit_op(*dest, IrBinOp::BitSet, other, cand.index, *ty));
                 }
                 (
                     SharedKind::Complement,
@@ -646,58 +1089,14 @@ fn analyze_shared_candidate(
                         rhs,
                         ty,
                     },
-                ) if *ty == cand.ty => {
-                    let other = if matches!(lhs, Operand::Value(x) if x.0 == v) {
-                        rhs
-                    } else if matches!(rhs, Operand::Value(x) if x.0 == v) {
-                        lhs
-                    } else {
-                        return None;
-                    };
-                    if shared_group_operand(*other, &kind) {
+                ) if plain_int(*ty) && ty.size() == width => {
+                    let other = other_of(lhs, rhs)?;
+                    if shared_group_operand(other, &kind) {
                         return None;
                     }
                     rewrites.insert(
                         loc,
-                        Instruction::BinOp {
-                            dest: *dest,
-                            op: IrBinOp::BitClear,
-                            lhs: *other,
-                            rhs: cand.index,
-                            ty: cand.ty,
-                        },
-                    );
-                }
-                (
-                    SharedKind::TestAnd,
-                    Instruction::Cmp {
-                        dest,
-                        op: IrCmpOp::Ne,
-                        lhs,
-                        rhs,
-                        ty,
-                    },
-                ) if *ty == cand.ty => {
-                    let other = if matches!(lhs, Operand::Value(x) if x.0 == v) {
-                        rhs
-                    } else if matches!(rhs, Operand::Value(x) if x.0 == v) {
-                        lhs
-                    } else {
-                        return None;
-                    };
-                    if const_in_ring(*other, bits) != Some(0) {
-                        return None;
-                    }
-                    let base = testand_base[v as usize]?;
-                    rewrites.insert(
-                        loc,
-                        Instruction::BinOp {
-                            dest: *dest,
-                            op: IrBinOp::BitTest,
-                            lhs: base,
-                            rhs: cand.index,
-                            ty: cand.ty,
-                        },
+                        bit_op(*dest, IrBinOp::BitClear, other, cand.index, *ty),
                     );
                 }
                 _ => return None,

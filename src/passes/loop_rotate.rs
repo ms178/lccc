@@ -1874,15 +1874,8 @@ fn loop_exit_threshold(
         // `N <op> iv + C`: mirror so the affine side is on the left.
         (Operand::Const(bc), r) if iv_side(r).is_some() => {
             let mirrored = match op {
-                IrCmpOp::Slt => IrCmpOp::Sgt,
-                IrCmpOp::Sle => IrCmpOp::Sge,
-                IrCmpOp::Sgt => IrCmpOp::Slt,
-                IrCmpOp::Sge => IrCmpOp::Sle,
-                IrCmpOp::Ult => IrCmpOp::Ugt,
-                IrCmpOp::Ule => IrCmpOp::Uge,
-                IrCmpOp::Ugt => IrCmpOp::Ult,
-                IrCmpOp::Uge => IrCmpOp::Ule,
-                _ => return None,
+                IrCmpOp::Eq | IrCmpOp::Ne => return None,
+                _ => op.swapped(),
             };
             (integer_constant(*bc, iv_ty)?, iv_side(r)?, mirrored)
         }
@@ -2471,15 +2464,8 @@ fn guard_fact(
         (Operand::Const(k), Operand::Value(v)) if v == nv => (k_lhs(k)?, op),
         (Operand::Value(v), Operand::Const(k)) if v == nv => {
             let mirrored = match op {
-                IrCmpOp::Slt => IrCmpOp::Sgt,
-                IrCmpOp::Sle => IrCmpOp::Sge,
-                IrCmpOp::Sgt => IrCmpOp::Slt,
-                IrCmpOp::Sge => IrCmpOp::Sle,
-                IrCmpOp::Ult => IrCmpOp::Ugt,
-                IrCmpOp::Ule => IrCmpOp::Uge,
-                IrCmpOp::Ugt => IrCmpOp::Ult,
-                IrCmpOp::Uge => IrCmpOp::Ule,
-                _ => return None,
+                IrCmpOp::Eq | IrCmpOp::Ne => return None,
+                _ => op.swapped(),
             };
             (k_lhs(k)?, mirrored)
         }
@@ -2491,15 +2477,8 @@ fn guard_fact(
         op
     } else {
         match op {
-            IrCmpOp::Slt => IrCmpOp::Sge,
-            IrCmpOp::Sle => IrCmpOp::Sgt,
-            IrCmpOp::Sgt => IrCmpOp::Sle,
-            IrCmpOp::Sge => IrCmpOp::Slt,
-            IrCmpOp::Ult => IrCmpOp::Uge,
-            IrCmpOp::Ule => IrCmpOp::Ugt,
-            IrCmpOp::Ugt => IrCmpOp::Ule,
-            IrCmpOp::Uge => IrCmpOp::Ult,
-            _ => return None,
+            IrCmpOp::Eq | IrCmpOp::Ne => return None,
+            _ => op.inverse(),
         }
     };
     // Keep only lower bounds on `n`, in the matching domain.

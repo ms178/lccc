@@ -106,22 +106,6 @@ fn integer_carrier(v: Value, defs: &[Option<Instruction>]) -> Option<IrType> {
     ty.is_integer().then_some(ty)
 }
 
-/// Invert a comparison predicate.
-fn invert(op: IrCmpOp) -> IrCmpOp {
-    match op {
-        IrCmpOp::Eq => IrCmpOp::Ne,
-        IrCmpOp::Ne => IrCmpOp::Eq,
-        IrCmpOp::Slt => IrCmpOp::Sge,
-        IrCmpOp::Sle => IrCmpOp::Sgt,
-        IrCmpOp::Sgt => IrCmpOp::Sle,
-        IrCmpOp::Sge => IrCmpOp::Slt,
-        IrCmpOp::Ult => IrCmpOp::Uge,
-        IrCmpOp::Ule => IrCmpOp::Ugt,
-        IrCmpOp::Ugt => IrCmpOp::Ule,
-        IrCmpOp::Uge => IrCmpOp::Ult,
-    }
-}
-
 /// `select(c, 1, 0)` -> `c != 0`, `select(c, 0, 1)` -> `c == 0`.
 ///
 /// `use_counts` guards the one rewrite that would otherwise clone a
@@ -197,7 +181,7 @@ pub(crate) fn fold_predicate_select(
         // select, so the inverted predicate replaces both.
         return Some(Instruction::Cmp {
             dest: *dest,
-            op: invert(cmp_op),
+            op: cmp_op.inverse(),
             lhs: cmp_lhs,
             rhs: cmp_rhs,
             ty: *ty,

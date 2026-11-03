@@ -693,7 +693,18 @@ mod shared_mask_tests {
         assert_eq!(n, 3);
         assert_eq!(op_at(&f, 1), IrBinOp::BitSet);
         assert_eq!(op_at(&f, 2), IrBinOp::BitToggle);
-        assert_eq!(op_at(&f, 4), IrBinOp::BitTest);
+        // The test-and becomes `BitTest` IN PLACE: it is zero exactly when
+        // the bit is clear, so its `!= 0` reader stays valid untouched (and
+        // `simplify` retires it later).
+        assert_eq!(op_at(&f, 3), IrBinOp::BitTest);
+        assert!(
+            matches!(
+                &f.blocks[0].instructions[4],
+                Instruction::Cmp { op: IrCmpOp::Ne, lhs, .. } if *lhs == v(6)
+            ),
+            "{:?}",
+            f.blocks[0].instructions[4]
+        );
     }
 
     #[test]

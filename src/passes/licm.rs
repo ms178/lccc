@@ -269,11 +269,6 @@ fn for_each_operand_value(inst: &Instruction, mut f: impl FnMut(u32)) {
             dest_ptr,
             va_list_ptr,
             ..
-        }
-        | Instruction::VaArgVector {
-            dest_ptr,
-            va_list_ptr,
-            ..
         } => {
             f(dest_ptr.0);
             f(va_list_ptr.0);
@@ -768,11 +763,6 @@ fn analyze_loop_memory(
                 // va_arg for structs writes dest_ptr (an alloca) and
                 // advances the va_list state (also an alloca).
                 Instruction::VaArgStruct {
-                    dest_ptr,
-                    va_list_ptr,
-                    ..
-                }
-                | Instruction::VaArgVector {
                     dest_ptr,
                     va_list_ptr,
                     ..

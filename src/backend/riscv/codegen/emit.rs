@@ -808,8 +808,27 @@ impl RiscvCodegen {
 }
 
 impl ArchCodegen for RiscvCodegen {
+    /// Provenance markers for user inline-asm bodies: `#APP`/`#NO_APP`, as
+    /// GCC emits them.  `#` starts a comment in RISC-V GAS syntax (and in
+    /// the built-in assembler), so the markers are invisible to assemblers
+    /// and objdump; the text peephole leaves every function holding one
+    /// exactly as emitted (`peephole_common::inline_asm_protected_ranges`).
+    fn asm_block_markers(&self) -> Option<(&'static str, &'static str)> {
+        Some(("#APP", "#NO_APP"))
+    }
+
     fn is_value_reg_assigned(&self, vid: u32) -> bool {
         self.reg_assignments.contains_key(&vid)
+    }
+
+    /// Top-level `asm("...")` is user text as well: bracket it so the text
+    /// peephole leaves it alone.  The region is always terminated, so no
+    /// later compiler instruction inherits the exemption.
+    fn emit_toplevel_asm(&mut self, template: &str) {
+        let (open, close) = ("#APP", "#NO_APP");
+        self.state.emit(open);
+        self.state.emit(template);
+        self.state.emit(close);
     }
 
     fn emit_acc_save(&mut self) -> i64 {

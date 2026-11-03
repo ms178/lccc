@@ -4185,8 +4185,8 @@ impl SemanticAnalyzer {
                 self.check_void_type_name(ts, *span);
                 self.analyze_expr(ap_expr);
             }
-            Expr::ConvertVector(src_expr, _, _) => {
-                self.analyze_expr(src_expr);
+            Expr::ConvertVector(src_expr, dst_ts, span) => {
+                self.analyze_convert_vector_expr(src_expr, dst_ts, *span);
             }
             Expr::BitCast(dst_ts, src_expr, span) => {
                 self.analyze_bit_cast_expr(dst_ts, src_expr, *span);
@@ -10071,6 +10071,49 @@ dereference it before applying '->' to it?"
                 format!(
                     "'__builtin_bit_cast' source size ({src_sz}) does not match destination size ({dst_sz})"
                 ),
+                span,
+            );
+        }
+    }
+
+    /// `__builtin_convertvector(src, T)`: Clang's three diagnostics, in its
+    /// order (the source must be a vector, `T` must be a vector type, both
+    /// must have the same number of lanes), and a refusal of `_Bool` lanes.
+    /// GCC cannot declare a vector of `_Bool` at all, and Clang's
+    /// `ext_vector_type(N)` of `bool` is a packed bit vector whose layout
+    /// LCCC does not model; converting one lane as a byte would be a silent
+    /// miscompile.
+    fn analyze_convert_vector_expr(&mut self, src_expr: &Expr, dst_ts: &TypeSpecifier, span: Span) {
+        self.analyze_expr(src_expr);
+        let Some(src_ct) = self.expr_type_checker().infer_expr_ctype(src_expr) else {
+            return;
+        };
+        let Some((src_elem, src_lanes)) = src_ct.vector_info() else {
+            self.diagnostics.borrow_mut().error(
+                "first argument to __builtin_convertvector must be a vector".to_string(),
+                src_expr.span(),
+            );
+            return;
+        };
+        let dst_ct = self.type_spec_to_ctype(dst_ts);
+        let Some((dst_elem, dst_lanes)) = dst_ct.vector_info() else {
+            self.diagnostics.borrow_mut().error(
+                "second argument to __builtin_convertvector must be of vector type".to_string(),
+                span,
+            );
+            return;
+        };
+        if src_lanes != dst_lanes {
+            self.diagnostics.borrow_mut().error(
+                "first two arguments to __builtin_convertvector must have the same number of elements"
+                    .to_string(),
+                span,
+            );
+            return;
+        }
+        if matches!(src_elem, CType::Bool) || matches!(dst_elem, CType::Bool) {
+            self.diagnostics.borrow_mut().error(
+                "__builtin_convertvector of '_Bool' lanes is not supported".to_string(),
                 span,
             );
         }

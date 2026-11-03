@@ -471,8 +471,7 @@ fn strip_inline_comments<'a>(
             // Line comment - ignore rest of line
             break;
         } else {
-            result.push(bytes[i] as char);
-            i += 1;
+            i = super::utils::push_char_at(&mut result, line, i);
         }
     }
     std::borrow::Cow::Owned(result)

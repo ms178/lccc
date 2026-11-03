@@ -47,9 +47,20 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         let Some((op, args)) = cmp.split_once(char::is_whitespace) else {
             continue;
         };
+        // `bt` only reads its operands and writes CF, exactly like a
+        // compare: the same terminal boolean shape follows it.
         if !matches!(
             op,
-            "cmpb" | "cmpw" | "cmpl" | "cmpq" | "testb" | "testw" | "testl" | "testq"
+            "cmpb"
+                | "cmpw"
+                | "cmpl"
+                | "cmpq"
+                | "testb"
+                | "testw"
+                | "testl"
+                | "testq"
+                | "btl"
+                | "btq"
         ) || args.contains(['(', ')', '\n', '#'])
         {
             continue;
@@ -104,7 +115,159 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         replace_line(store, &mut infos[c], c, set);
         changed = true;
     }
-    fold_negated_copy(store, infos) | fold_return_select(store, infos) | changed
+    fold_negated_copy(store, infos)
+        | fold_return_select(store, infos)
+        | retarget_zeroed_setcc(store, infos)
+        | changed
+}
+
+/// Lines a retargeting window may cross: straight-line instructions only.
+fn straight_line(info: &LineInfo) -> bool {
+    !matches!(
+        info.kind,
+        LineKind::Label
+            | LineKind::Jmp
+            | LineKind::JmpIndirect
+            | LineKind::CondJmp
+            | LineKind::Call
+            | LineKind::Ret
+    ) && !info.pinned
+}
+
+/// Retarget a zero-idiom boolean into the register it is finally copied to:
+///
+/// ```text
+///   xorl %R, %R          ->   xorl %D, %D
+///   <...>                     <...>          (the flag producer)
+///   setCC %R8            ->   setCC %D8
+///   <...>                     <...>
+///   movl %R, %D          ->   (deleted)
+/// ```
+///
+/// The emitters zero a boolean's register before its flag producer (`xor;
+/// bt; setc` -- the form GCC 16.2 and Clang 23.1.4 emit), but when the value
+/// is then copied (into `%eax` for a return, or a phi home) the copy costs the
+/// instruction the zero idiom saved over `setc; movzbl`, which the copy
+/// coalescer could fold into the extension.  This rewrite is that fold for
+/// the zero-idiom form.
+///
+/// Sound when, strictly between the `xor` and the `mov`, no line references
+/// `D` (any alias) and only the `setCC` references `R`; the window is
+/// straight-line; `R` is dead after the `mov`; and `R != D`.  `D` is then
+/// written earlier than before, but nothing reads or writes it in between;
+/// the `xor` still clobbers the flags at the same point; `D` ends with the
+/// same zero-extended byte; `R` keeps its old value, which nothing reads.
+fn retarget_zeroed_setcc(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    const WINDOW: usize = 24;
+    let mut lv = FileLiveness::new(store, infos);
+    let mut changed = false;
+    for a in 0..infos.len() {
+        if infos[a].is_nop() || infos[a].pinned {
+            continue;
+        }
+        let Some(ops) = infos[a].trimmed(store.get(a)).strip_prefix("xorl ") else {
+            continue;
+        };
+        let Some((x, y)) = ops.split_once(',') else {
+            continue;
+        };
+        let (x, y) = (x.trim(), y.trim());
+        if x != y {
+            continue;
+        }
+        let Some(r) = REG_NAMES[1].iter().position(|n| *n == x) else {
+            continue;
+        };
+        if matches!(r, 4 | 5) {
+            continue;
+        }
+        let r_bit = 1u16 << r;
+        // The setcc of R8: R untouched before it.
+        let mut c = a;
+        let mut setcc = None;
+        for _ in 0..WINDOW {
+            c = next_non_debug(store, infos, c + 1, infos.len());
+            if c >= infos.len() || !straight_line(&infos[c]) {
+                break;
+            }
+            let line = infos[c].trimmed(store.get(c));
+            if let Some(cc) = parse_setcc(line) {
+                let target = line.split_once(char::is_whitespace).map(|(_, t)| t.trim());
+                if target == Some(REG_NAMES[3][r]) {
+                    setcc = Some((c, cc.to_string()));
+                    break;
+                }
+            }
+            if infos[c].reg_refs & r_bit != 0 {
+                break;
+            }
+        }
+        let Some((c, cc)) = setcc else {
+            continue;
+        };
+        // The copy of R into D: R untouched between.
+        let mut d = c;
+        let mut copy = None;
+        for _ in 0..WINDOW {
+            d = next_non_debug(store, infos, d + 1, infos.len());
+            if d >= infos.len() || !straight_line(&infos[d]) {
+                break;
+            }
+            let line = infos[d].trimmed(store.get(d));
+            let parsed = line
+                .strip_prefix("movl ")
+                .map(|o| (1usize, o))
+                .or_else(|| line.strip_prefix("movq ").map(|o| (0usize, o)));
+            if let Some((width, o)) = parsed {
+                if let Some((src, dst)) = o.split_once(',') {
+                    if src.trim() == REG_NAMES[width][r] {
+                        copy = REG_NAMES[width]
+                            .iter()
+                            .position(|n| *n == dst.trim())
+                            .map(|dfam| (d, dfam));
+                        break;
+                    }
+                }
+            }
+            if infos[d].reg_refs & r_bit != 0 {
+                break;
+            }
+        }
+        let Some((d, dfam)) = copy else {
+            continue;
+        };
+        if dfam == r || matches!(dfam, 4 | 5) || !all_editable(infos, &[a, c, d]) {
+            continue;
+        }
+        let d_bit = 1u16 << dfam;
+        let mut clean = true;
+        let mut i = a;
+        loop {
+            i = next_non_debug(store, infos, i + 1, infos.len());
+            if i >= d {
+                break;
+            }
+            if infos[i].reg_refs & d_bit != 0 || (i != c && infos[i].reg_refs & r_bit != 0) {
+                clean = false;
+                break;
+            }
+        }
+        if !clean || lv.live_after(d, r as RegId) != Some(false) {
+            continue;
+        }
+        let d32 = REG_NAMES[1][dfam];
+        replace_line(store, &mut infos[a], a, format!("    xorl {d32}, {d32}"));
+        replace_line(
+            store,
+            &mut infos[c],
+            c,
+            format!("    set{cc} {}", REG_NAMES[3][dfam]),
+        );
+        mark_nop(&mut infos[d]);
+        lv.refresh_span(store, infos, a, d);
+        changed = true;
+    }
+    changed
 }
 
 /// Coalesce the short-lived negated arm with its result home. All work

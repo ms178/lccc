@@ -9,7 +9,7 @@ pub(crate) mod predefined_macros;
 mod text_processing;
 pub(crate) mod utils;
 
-pub(crate) use pipeline::Preprocessor;
+pub(crate) use pipeline::{PragmaSeverity, Preprocessor};
 
 #[cfg(test)]
 mod physical_line_tests;

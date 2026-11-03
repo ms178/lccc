@@ -210,7 +210,6 @@ impl ArmCodegen {
                 I::AtomicRmw { .. } | I::AtomicCmpxchg { .. } => atomics = true,
                 I::VaArg { .. }
                 | I::VaArgStruct { .. }
-                | I::VaArgVector { .. }
                 | I::VaStart { .. }
                 | I::VaCopy { .. } => varargs = true,
                 I::Memcpy { .. } => memcpy = true,

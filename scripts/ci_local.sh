@@ -962,6 +962,17 @@ gate "warning-compatibility" fast \
 gate "warning-precedence" fast \
     python3 tests/regression/check_warning_precedence.py \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+# Dedicated hosted warning gates must remain directly executable locally;
+# transitive calls from another runner do not satisfy mirror coverage.
+gate "warning-designated-init" fast \
+    python3 tests/regression/check_designated_init_warnings.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+gate "warning-frame-size" fast \
+    python3 tests/regression/check_frame_size_warnings.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+gate "warning-vla-size" fast \
+    python3 tests/regression/check_vla_size_warnings.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
 # The warning runner also invokes this ABI matrix, but hosted/local parity
 # audits executable entry points rather than Python's transitive import graph.
 # Keep a directly runnable mirror of the dedicated authenticated vendor gate;
@@ -1955,6 +1966,20 @@ gate "narrow-negate-fold" fast \
 # ownership, the two non-dominant controls and -O0..-O3 agreement against GCC.
 gate "compare-dominance-fold" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_compare_dominance_fold.sh
+
+# Constant-operand ALU forms and sign-magnitude selects, executed on x86-64,
+# i686, RISC-V and AArch64 (qemu-user) from one freestanding source that must
+# print GCC's digest; pins RISC-V I-type selection, the sign-magnitude identity
+# on every target, x86-64 `mov; neg; cmovs` and the AArch64 inline-asm
+# quarantine.
+gate "cross-alu-abs-runtime" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_cross_alu_abs_runtime.sh
+
+# RISC-V psABI narrow integers: an `unsigned int` argument (register or stack
+# slot) and result travel sign-extended, every other narrow type both ways,
+# executed under qemu-riscv64 against a conforming RISC-V compiler.
+gate "riscv-psabi-narrow-args" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_riscv_psabi_narrow_args.sh
 
 # Single-bit selection: `x | 1 << n` is `bts`, `x & ~(1 << n)` is `btr` and
 # `(x & 1 << n) != 0` is `bt` (6/8/7 -> 3/3/4 instructions), selected by the

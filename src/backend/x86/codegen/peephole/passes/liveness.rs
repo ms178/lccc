@@ -137,8 +137,15 @@ pub(crate) fn call_markers(store: &LineStore, infos: &[LineInfo], n: usize) -> C
             continue;
         }
         let mk = infos[k].trimmed(store.get(k));
-        if !(mk.starts_with('#') || mk.starts_with('.')) {
-            break; // a real instruction ends the marker block
+        // A real instruction ends the marker block, and so does a label: it
+        // opens another block, whose first transfer may publish its own
+        // markers right there (a sibling call's `jmp` repeats the suppressed
+        // call's `# LCCC_CALL_ARGS` ahead of the jump). Reading past `.LBB2:`
+        // once attributed `jmp abort@PLT`'s zero-argument marker to the
+        // `jmp exit@PLT` above it, and the `xorl %edi, %edi` staging exit's
+        // argument was deleted as dead (gcc.c-torture 981130-1, 980526-2).
+        if infos[k].kind == LineKind::Label || !(mk.starts_with('#') || mk.starts_with('.')) {
+            break;
         }
         if mk.starts_with("# LCCC_VA_CALL") {
             m.variadic = true;
@@ -3419,6 +3426,62 @@ mod tests {
             m.variadic && m.chain && m.gp_args == 0 && m.ipa_keep == 0,
             "{m:?}"
         );
+    }
+
+    /// The marker block of a transfer ends at a label. A sibling call that
+    /// opens the next block publishes its suppressed call's markers right
+    /// after that label, ahead of its own `jmp`; reading past `.LBB2:` made
+    /// `jmp exit@PLT` (one argument) inherit `jmp abort@PLT`'s
+    /// `# LCCC_CALL_ARGS 0`, and the staging of exit's argument died
+    /// (gcc.c-torture 981130-1 and 980526-2 exited with the wrong status).
+    #[test]
+    fn marker_block_ends_at_a_label() {
+        let asm = concat!(
+            "check:\n",
+            ".cfi_startproc\n",
+            "    cmpl %esi, %edi\n",
+            "    jne .LBB2\n",
+            ".LBB1:\n",
+            "    xorl %edi, %edi\n",
+            "    # LCCC_CALL_ARGS 1\n",
+            "    # LCCC_CALL_FP 0\n",
+            "    jmp exit@PLT\n",
+            "    # LCCC_TAIL_CALL\n",
+            "    # LCCC_CALL_ARGS 1\n",
+            "    # LCCC_CALL_FP 0\n",
+            ".LBB2:\n",
+            "    # LCCC_CALL_ARGS 0\n",
+            "    # LCCC_CALL_FP 0\n",
+            "    jmp abort@PLT\n",
+            "    # LCCC_TAIL_CALL\n",
+            "    # LCCC_CALL_ARGS 0\n",
+            "    # LCCC_CALL_FP 0\n",
+            ".cfi_endproc\n",
+        );
+        let (store, infos, lv) = build(asm);
+        let jmp = line_of(&store, "jmp exit@PLT");
+        assert_eq!(call_markers(&store, &infos, jmp).gp_args, 1);
+        let xor = line_of(&store, "xorl %edi, %edi");
+        assert_eq!(lv.live_after(xor, 7), Some(true), "exit reads %rdi");
+        // A plain call ending its block is bounded the same way: with no
+        // marker of its own before the label it keeps the fail-closed six.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movl $3, %esi\n",
+            "    call g\n",
+            ".LBB1:\n",
+            "    # LCCC_CALL_ARGS 0\n",
+            "    jmp h@PLT\n",
+            "    # LCCC_TAIL_CALL\n",
+            "    # LCCC_CALL_ARGS 0\n",
+            ".cfi_endproc\n",
+        );
+        let (store, infos, lv) = build(asm);
+        let call = line_of(&store, "call g");
+        assert_eq!(call_markers(&store, &infos, call).gp_args, 6);
+        let mov = line_of(&store, "movl $3, %esi");
+        assert_eq!(lv.live_after(mov, 6), Some(true), "g may read %rsi");
     }
 
     /// `# LCCC_IPA_KEEP`: a caller-saved family the caller keeps live across

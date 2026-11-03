@@ -839,10 +839,16 @@ impl MacroTable {
                 }
                 continue;
             }
-            out.push(c as char);
-            i += 1;
+            i = super::utils::push_char_at(&mut out, &text, i);
         }
-        out
+        // Rescanning a macro alias of `_Pragma` can itself introduce painted
+        // directive keywords. Strip that new metadata too, without expanding
+        // the operand again or touching control bytes inside literal tokens.
+        // The no-_Pragma fast path above avoids a second scan on normal lines.
+        match normalize_internal_markers(&out, true) {
+            std::borrow::Cow::Borrowed(_) => out,
+            std::borrow::Cow::Owned(cleaned) => cleaned,
+        }
     }
 
     /// Append `expanded` text to `result`, inserting token boundaries to prevent
@@ -1351,24 +1357,29 @@ impl MacroTable {
                     // De-stringize: only quote and backslash escapes alter the
                     // pragma text; unknown escapes keep the character as-is.
                     match eb[q + 1] {
-                        b'"' => content.push('"'),
-                        b'\\' => content.push('\\'),
-                        c => {
+                        b'"' => {
+                            content.push('"');
+                            q += 2;
+                        }
+                        b'\\' => {
                             content.push('\\');
-                            content.push(c as char);
+                            q += 2;
+                        }
+                        _ => {
+                            content.push('\\');
+                            q = super::utils::push_char_at(&mut content, et, q + 1);
                         }
                     }
-                    q += 2;
                 }
                 b'"' => {
                     closed = true;
                     break;
                 }
-                c => {
-                    // Preserve bytes verbatim (pragma text may be non-ASCII in
-                    // the source encoding).
-                    content.push(c as char);
-                    q += 1;
+                _ => {
+                    // Preserve characters verbatim (pragma text may be
+                    // non-ASCII): one whole character at a time, so a
+                    // multi-byte UTF-8 sequence is not re-encoded per byte.
+                    q = super::utils::push_char_at(&mut content, et, q);
                 }
             }
         }
@@ -1381,6 +1392,21 @@ impl MacroTable {
         // this queued pragma point at the `_Pragma` site, not line 0.
         let op_start = i.saturating_sub(ident.len());
         let line = self.resolve_line(op_start);
+        if let Some(operand) = super::pragmas::strip_pragma_keyword(content.trim(), "message") {
+            let expanded = self.expand_text(operand, expanding);
+            if self.asm_mode {
+                return k + 1;
+            }
+            // A deferred C-frontend pragma must survive preprocessing, even
+            // mid-line in a macro. Preserve quoted whitespace and UTF-8.
+            result.push_str("\n#\x01pragma \x01message ");
+            result.push_str(&expanded);
+            result.push_str(&format!("\n# {line} {}\n", self.source_filename));
+            self.pending_effects
+                .borrow_mut()
+                .push(ExpansionEffect::Pragma(format!("message {expanded}"), line));
+            return k + 1;
+        }
         if crate::common::diagnostic_pragma::is_diagnostic_pragma(content.trim()) {
             // Blue-paint the directive keywords: the replacement is rescanned,
             // but a user macro named GCC/diagnostic/push must not rewrite it.
@@ -2136,8 +2162,7 @@ impl MacroTable {
                         result.push(PASTE_PROTECT_END as char);
                     }
                 } else if i < len {
-                    result.push(bytes[i] as char);
-                    i += 1;
+                    i = super::utils::push_char_at(&mut result, body, i);
                 }
                 continue;
             }
@@ -2788,6 +2813,32 @@ mod token_boundary_tests {
             });
         }
         t
+    }
+
+    #[test]
+    fn macro_formed_pragmas_strip_new_metadata_without_reexpanding_operands() {
+        let mut t = table();
+        t.define(MacroDef {
+            name: "P".into(),
+            is_function_like: false,
+            params: Vec::new(),
+            is_variadic: false,
+            has_named_variadic: false,
+            body: "_Pragma".into(),
+        });
+        for operand in ["GCC diagnostic push", "GCC diagnostic pop"] {
+            let result = t.expand_line(&format!("P(\"{operand}\")"));
+            assert!(result.contains(&format!("#pragma {operand}")), "{result:?}");
+            assert!(!result.contains('\x01'), "{result:?}");
+        }
+        let result = t.expand_line("P(\"message(\\\"é  \x01\\\")\")");
+        assert!(
+            result.contains("#pragma message (\"é  \x01\")"),
+            "{result:?}"
+        );
+        let result = t.expand_line("P(\"message __COUNTER__\")");
+        assert!(result.contains("#pragma message 0"), "{result:?}");
+        assert_eq!(t.expand_line("__COUNTER__"), "1");
     }
 
     #[test]

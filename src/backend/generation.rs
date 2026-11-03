@@ -21,8 +21,8 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::{SourceManager, Span};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::reexports::{
-    BasicBlock, CallInfo, GlobalInit, Instruction, IrBinOp, IrConst, IrFunction, IrModule, Operand,
-    Terminator, Value,
+    BasicBlock, CallInfo, GlobalInit, Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, IrModule,
+    Operand, Terminator, Value,
 };
 use std::collections::hash_map::Entry;
 use std::sync::OnceLock;
@@ -501,7 +501,6 @@ pub(crate) fn instruction_may_clobber_vector_scratch(inst: &Instruction) -> bool
         | Instruction::Memcpy { .. }
         | Instruction::VaArg { .. }
         | Instruction::VaArgStruct { .. }
-        | Instruction::VaArgVector { .. }
         | Instruction::VaStart { .. }
         | Instruction::VaEnd { .. }
         | Instruction::VaCopy { .. }
@@ -3460,6 +3459,505 @@ pub(crate) fn count_value_uses(func: &IrFunction) -> Vec<u32> {
 pub(crate) enum FusedBranchKind {
     Cmp,
     BitTest,
+    /// `[t = BitTest(x, n); y = BitSet|BitClear|BitToggle(x, n)]` ending the
+    /// block, branch on `t`: one modify whose carry is the old bit.  The
+    /// modify's destination and opcode ride along, so emission never has to
+    /// re-find (and re-validate) the partner instruction.
+    BitTestModify {
+        modify_dest: Value,
+        modify_op: IrBinOp,
+    },
+}
+
+/// Whether `inst` is a `BitSet`/`BitClear`/`BitToggle` reading exactly
+/// `base` and `index` at `width` bytes: the partner of a `BitTest(base,
+/// index)` whose answer the modify's carry reproduces.
+pub(crate) fn bit_modify_partner_of(
+    inst: &Instruction,
+    base: &Operand,
+    index: &Operand,
+    width: usize,
+) -> bool {
+    matches!(
+        inst,
+        Instruction::BinOp {
+            op: IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle,
+            lhs,
+            rhs,
+            ty,
+            ..
+        } if lhs == base && rhs == index && ty.size() == width && ty.is_integer()
+    )
+}
+
+/// The widths a fused test + modify is formed at: 32-bit everywhere, 64-bit
+/// only on a 64-bit target (the 32-bit targets keep 64-bit values in pairs).
+fn bit_test_modify_width(ty: IrType) -> bool {
+    matches!(ty, IrType::I32 | IrType::U32)
+        || (matches!(ty, IrType::I64 | IrType::U64) && !crate::common::types::target_is_32bit())
+}
+
+/// `[t = BitTest(x, n); y = op(x, n)]` as the last two instructions of a
+/// block whose `CondBranch` reads `t` and nothing else does: the branch form
+/// of the test + modify fusion.  Returns (test index, modify index).
+fn detect_bit_test_modify_branch(
+    block: &BasicBlock,
+    use_counts: &[u32],
+) -> Option<(usize, usize, FusedBranchKind)> {
+    let Terminator::CondBranch {
+        cond: Operand::Value(cond),
+        ..
+    } = &block.terminator
+    else {
+        return None;
+    };
+    let n = block.instructions.len();
+    if n < 2 {
+        return None;
+    }
+    let Instruction::BinOp {
+        dest,
+        op: IrBinOp::BitTest,
+        lhs,
+        rhs,
+        ty,
+    } = &block.instructions[n - 2]
+    else {
+        return None;
+    };
+    if dest != cond
+        || use_counts.get(dest.0 as usize).copied() != Some(1)
+        || !bit_test_modify_width(*ty)
+        || lhs == rhs
+        || matches!(lhs, Operand::Const(_))
+        || !bit_modify_partner_of(&block.instructions[n - 1], lhs, rhs, ty.size())
+    {
+        return None;
+    }
+    let Instruction::BinOp {
+        dest: modify_dest,
+        op: modify_op,
+        ..
+    } = block.instructions[n - 1]
+    else {
+        return None;
+    };
+    Some((
+        n - 2,
+        n - 1,
+        FusedBranchKind::BitTestModify {
+            modify_dest,
+            modify_op,
+        },
+    ))
+}
+
+/// Value form of the test + modify fusion: every adjacent `[t = BitTest(x,
+/// n); y = op(x, n)]` pair outside the branch anchor.  The backend's static
+/// admission check runs at emission time, before either instruction is
+/// emitted, so a refused pair simply emits both normally.
+fn detect_bit_test_modify_pairs(block: &BasicBlock, branch_anchor: Option<usize>) -> Vec<usize> {
+    let mut tests = Vec::new();
+    for (idx, pair) in block.instructions.windows(2).enumerate() {
+        if Some(idx) == branch_anchor {
+            continue;
+        }
+        if let Instruction::BinOp {
+            op: IrBinOp::BitTest,
+            lhs,
+            rhs,
+            ty,
+            ..
+        } = &pair[0]
+        {
+            if bit_test_modify_width(*ty)
+                && lhs != rhs
+                && !matches!(lhs, Operand::Const(_))
+                && bit_modify_partner_of(&pair[1], lhs, rhs, ty.size())
+            {
+                tests.push(idx);
+            }
+        }
+    }
+    tests
+}
+
+/// `[t = BitTest(x, n); c = Cmp Eq|Ne (t, 0)]` with `t` read only by the
+/// compare: the compare can be answered from the test's flags directly
+/// (`bt; setnc`).  Returns (test index, compare is `== 0`) pairs; compares
+/// already claimed by another fusion are excluded by the caller.
+fn detect_bit_test_cmp_pairs(block: &BasicBlock, use_counts: &[u32]) -> Vec<(usize, bool)> {
+    let mut out = Vec::new();
+    for (idx, pair) in block.instructions.windows(2).enumerate() {
+        let Instruction::BinOp {
+            dest,
+            op: IrBinOp::BitTest,
+            ..
+        } = &pair[0]
+        else {
+            continue;
+        };
+        if use_counts.get(dest.0 as usize).copied() != Some(1) {
+            continue;
+        }
+        let Instruction::Cmp {
+            op: op @ (IrCmpOp::Eq | IrCmpOp::Ne),
+            lhs,
+            rhs,
+            ty,
+            ..
+        } = &pair[1]
+        else {
+            continue;
+        };
+        if !ty.is_integer() || is_wide_int_type(*ty) {
+            continue;
+        }
+        let reads_test = |o: &Operand| matches!(o, Operand::Value(v) if v == dest);
+        let zero = |o: &Operand| cmp_rhs_is_zero(o) || matches!(o, Operand::Const(IrConst::I64(0)));
+        if (reads_test(lhs) && zero(rhs)) || (reads_test(rhs) && zero(lhs)) {
+            out.push((idx, *op == IrCmpOp::Eq));
+        }
+    }
+    out
+}
+
+/// A `[t = BitTest(x, n); (c = Cast t;) s = a + t | t + a | a - t]` run:
+/// the tested bit can be folded into the sum from the test's flags (`bt; adc
+/// $0` / `bt; sbb $0`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BitTestAdd {
+    /// Index of the `BitTest`.
+    pub(crate) test: usize,
+    /// Index of the add (`test + 1`, or `test + 2` through the cast).
+    pub(crate) add: usize,
+    /// The addend is the add's lhs (else its rhs).
+    pub(crate) addend_is_lhs: bool,
+    /// `a - t` (`sbb`) rather than an add.
+    pub(crate) sub: bool,
+    /// `test - 1` when the addend is itself a single-use `p + q` right before
+    /// the test: the carry form then takes `q` as `adc`'s register operand
+    /// (`mov p, d; bt; adc q, d`), one add fewer -- Clang 23.1.4's
+    /// `leal (%rsi,%rdi),%eax; ...; btl; adcl %edx,%eax` in `shared_four`.
+    pub(crate) inner: Option<usize>,
+}
+
+impl BitTestAdd {
+    /// The first instruction the fused form covers.
+    pub(crate) fn start(&self) -> usize {
+        self.inner.unwrap_or(self.test)
+    }
+}
+
+/// Every `BitTestAdd` run in `block`.  The test (and the cast, when present)
+/// must be read only by the next instruction; the cast must be a same-width
+/// integer cast -- a sign reinterpretation of the 0/1 value, which C's
+/// promotions put between an `int` test and an `unsigned` sum
+/// (`s += (byte >> (i & 7)) & 1`).  `t + t` and `t - a` have no carry form.
+/// Adds another fusion claims are excluded by the caller.
+pub(crate) fn detect_bit_test_add_pairs(block: &BasicBlock, use_counts: &[u32]) -> Vec<BitTestAdd> {
+    let single_use = |v: &Value| use_counts.get(v.0 as usize).copied() == Some(1);
+    let mut out = Vec::new();
+    for (idx, inst) in block.instructions.iter().enumerate() {
+        let Instruction::BinOp {
+            dest,
+            op: IrBinOp::BitTest,
+            ty: bt_ty,
+            ..
+        } = inst
+        else {
+            continue;
+        };
+        if !single_use(dest) {
+            continue;
+        }
+        let mut read = *dest;
+        let mut add = idx + 1;
+        if let Some(Instruction::Cast {
+            dest: cast_dest,
+            src: Operand::Value(src),
+            from_ty,
+            to_ty,
+        }) = block.instructions.get(add)
+        {
+            if src != dest
+                || !single_use(cast_dest)
+                || !from_ty.is_integer()
+                || !to_ty.is_integer()
+                || from_ty.size() != to_ty.size()
+            {
+                continue;
+            }
+            read = *cast_dest;
+            add += 1;
+        }
+        let Some(Instruction::BinOp {
+            op: op @ (IrBinOp::Add | IrBinOp::Sub),
+            lhs,
+            rhs,
+            ty,
+            ..
+        }) = block.instructions.get(add)
+        else {
+            continue;
+        };
+        if !ty.is_integer() || is_wide_int_type(*ty) || ty.size() != bt_ty.size() {
+            continue;
+        }
+        let reads_test = |o: &Operand| matches!(o, Operand::Value(v) if *v == read);
+        let addend_is_lhs = match (reads_test(lhs), reads_test(rhs)) {
+            (false, true) => true,
+            (true, false) if *op == IrBinOp::Add => false,
+            _ => continue,
+        };
+        let sub = *op == IrBinOp::Sub;
+        let addend = if addend_is_lhs { lhs } else { rhs };
+        let inner = match (
+            sub,
+            addend,
+            idx.checked_sub(1).map(|i| &block.instructions[i]),
+        ) {
+            (
+                false,
+                Operand::Value(a),
+                Some(Instruction::BinOp {
+                    dest: inner_dest,
+                    op: IrBinOp::Add,
+                    ty: inner_ty,
+                    ..
+                }),
+            ) if inner_dest == a && single_use(a) && inner_ty.size() == ty.size() => Some(idx - 1),
+            _ => None,
+        };
+        out.push(BitTestAdd {
+            test: idx,
+            add,
+            addend_is_lhs,
+            sub,
+            inner,
+        });
+    }
+    out
+}
+
+/// The instructions a block's other fusions already claim.  A bit-test
+/// fusion never takes one of them: the claiming fusion reads the test's
+/// materialized value (or owns the add) and is emitted on its own terms.
+struct OtherFusionClaims<'a> {
+    /// The branch anchor's range (`[anchor, chain end]`).
+    branch_range: Option<(usize, usize)>,
+    conditional_increment_cmps: &'a FxHashSet<usize>,
+    conditional_increment_adds: &'a FxHashSet<usize>,
+    cmp_select_fusions: &'a [(usize, usize, Option<usize>)],
+    gap_add_fusions: &'a FxHashMap<usize, (usize, IrBinOp)>,
+    mul_add_fusions: &'a FxHashMap<usize, MulAddFusion>,
+}
+
+impl OtherFusionClaims<'_> {
+    fn by_branch(&self, i: usize) -> bool {
+        self.branch_range
+            .is_some_and(|(a, end)| (a..=end).contains(&i))
+    }
+
+    /// An add some other fusion emits (multiply-add, gap-fma, conditional
+    /// increment) or the branch anchor covers.
+    fn add(&self, i: usize) -> bool {
+        self.by_branch(i)
+            || self.conditional_increment_adds.contains(&i)
+            || self.gap_add_fusions.contains_key(&i)
+            || self.mul_add_fusions.values().any(|m| m.partner_idx == i)
+    }
+
+    /// A compare the branch anchor, a conditional increment or a
+    /// compare-select (directly or through its copy) consumes.
+    fn cmp(&self, i: usize) -> bool {
+        self.by_branch(i)
+            || self.conditional_increment_cmps.contains(&i)
+            || self
+                .cmp_select_fusions
+                .iter()
+                .any(|&(_, ci, copy_i)| ci == i || copy_i == Some(i))
+    }
+}
+
+/// The block's bit-test fusions outside the branch anchor, planned once per
+/// block and emitted as the instruction walk reaches each anchor:
+///
+/// * `[t = BitTest(x, n); y = op(x, n)]` value pairs: one `bts`/`btr`/`btc`
+///   whose carry is `t`;
+/// * `[t = BitTest(x, n); c = Cmp Eq|Ne (t, 0)]`: `bt; setnc` / `bt; setc`;
+/// * `[(i = p + q;) t = BitTest(x, n); (Cast;) s = a + t]`: `bt; adc`.
+///
+/// Every fused form is a backend opt-in (`supports_*` / `*_fusable`), and a
+/// refusal at emission time simply emits the instructions normally.
+struct BitTestFusionPlan {
+    modify_tests: Vec<usize>,
+    cmp_pairs: Vec<(usize, bool)>,
+    add_runs: Vec<BitTestAdd>,
+    /// Tests whose three-instruction form was refused at the inner add: the
+    /// plain two-instruction form is still tried at the test.
+    add_retry: Vec<usize>,
+    /// Instructions a fusion emitted at an earlier index already covers.
+    covered: usize,
+}
+
+impl BitTestFusionPlan {
+    fn new(
+        cg: &dyn ArchCodegen,
+        block: &BasicBlock,
+        use_counts: &[u32],
+        branch_anchor: Option<usize>,
+        claims: &OtherFusionClaims<'_>,
+    ) -> Self {
+        let modify_tests: Vec<usize> = detect_bit_test_modify_pairs(block, branch_anchor)
+            .into_iter()
+            .filter(|&i| !claims.by_branch(i) && !claims.by_branch(i + 1))
+            .collect();
+        let cmp_pairs: Vec<(usize, bool)> = if cg.supports_fused_bit_test_cmp() {
+            detect_bit_test_cmp_pairs(block, use_counts)
+                .into_iter()
+                .filter(|&(i, _)| {
+                    !claims.by_branch(i) && !claims.cmp(i + 1) && !modify_tests.contains(&i)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let add_runs: Vec<BitTestAdd> = if cg.supports_fused_bit_test_add() {
+            detect_bit_test_add_pairs(block, use_counts)
+                .into_iter()
+                .map(|mut f| {
+                    // The inner add joins only when no other fusion wants it.
+                    if f.inner.is_some_and(|i| {
+                        claims.add(i)
+                            || modify_tests.contains(&i)
+                            || cmp_pairs.iter().any(|&(c, _)| c == i || c + 1 == i)
+                    }) {
+                        f.inner = None;
+                    }
+                    f
+                })
+                .filter(|f| {
+                    (f.test..f.add).all(|i| !claims.by_branch(i))
+                        && !claims.add(f.add)
+                        && !modify_tests.contains(&f.test)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Self {
+            modify_tests,
+            cmp_pairs,
+            add_runs,
+            add_retry: Vec::new(),
+            covered: 0,
+        }
+    }
+
+    /// Whether the current instruction was already emitted by a fusion
+    /// anchored earlier (consumes it).
+    fn take_covered(&mut self) -> bool {
+        let covered = self.covered > 0;
+        self.covered = self.covered.saturating_sub(1);
+        covered
+    }
+
+    /// Emit the fusion anchored at `idx`, if any; true when it consumed the
+    /// instruction (the covered tail is skipped by [`Self::take_covered`]).
+    fn try_emit(&mut self, cg: &mut dyn ArchCodegen, block: &BasicBlock, idx: usize) -> bool {
+        let insts = &block.instructions;
+        let (Some(inst), next) = (insts.get(idx), insts.get(idx + 1)) else {
+            return false;
+        };
+        if self.modify_tests.contains(&idx) {
+            if let (
+                Instruction::BinOp {
+                    dest: test_dest,
+                    lhs,
+                    rhs,
+                    ty,
+                    ..
+                },
+                Some(Instruction::BinOp {
+                    dest: modify_dest,
+                    op: modify_op,
+                    ..
+                }),
+            ) = (inst, next)
+            {
+                if cg.bit_test_modify_fusable(Some(test_dest), modify_dest, lhs, rhs, *ty) {
+                    cg.flush_machinst();
+                    cg.emit_fused_bit_test_modify(
+                        test_dest,
+                        modify_dest,
+                        *modify_op,
+                        lhs,
+                        rhs,
+                        *ty,
+                    );
+                    self.covered = 1;
+                    return true;
+                }
+            }
+        }
+        if let Some(&(_, bit_clear)) = self.cmp_pairs.iter().find(|(i, _)| *i == idx) {
+            if let (
+                Instruction::BinOp { lhs, rhs, ty, .. },
+                Some(Instruction::Cmp { dest: cmp_dest, .. }),
+            ) = (inst, next)
+            {
+                cg.flush_machinst();
+                if cg.emit_fused_bit_test_cmp(cmp_dest, lhs, rhs, *ty, bit_clear) {
+                    self.covered = 1;
+                    return true;
+                }
+            }
+        }
+        self.try_emit_add(cg, block, idx)
+    }
+
+    fn try_emit_add(&mut self, cg: &mut dyn ArchCodegen, block: &BasicBlock, idx: usize) -> bool {
+        let retry = self.add_retry.contains(&idx);
+        let Some(&fusion) = self
+            .add_runs
+            .iter()
+            .find(|f| f.start() == idx || (retry && f.test == idx))
+        else {
+            return false;
+        };
+        let insts = &block.instructions;
+        let (
+            Some(Instruction::BinOp { lhs, rhs, ty, .. }),
+            Some(Instruction::BinOp {
+                dest: add_dest,
+                lhs: add_lhs,
+                rhs: add_rhs,
+                ty: add_ty,
+                ..
+            }),
+        ) = (insts.get(fusion.test), insts.get(fusion.add))
+        else {
+            return false;
+        };
+        let triple = fusion.inner == Some(idx);
+        let (addend, addend2) = match (triple, insts.get(idx)) {
+            (true, Some(Instruction::BinOp { lhs: p, rhs: q, .. })) => (p, Some(q)),
+            _ if fusion.addend_is_lhs => (add_lhs, None),
+            _ => (add_rhs, None),
+        };
+        cg.flush_machinst();
+        if cg.emit_fused_bit_test_add(
+            add_dest, lhs, rhs, *ty, addend, addend2, fusion.sub, *add_ty,
+        ) {
+            self.covered = fusion.add - idx;
+            return true;
+        }
+        if triple {
+            self.add_retry.push(fusion.test);
+        }
+        false
+    }
 }
 
 /// Cmp or BitTest (optionally through Copy / integer Cast) used only by
@@ -3475,6 +3973,11 @@ fn detect_cmp_branch_fusion(
         Terminator::CondBranch { cond, .. } => cond,
         _ => return None,
     };
+    if fuse_bt {
+        if let Some((test, modify, kind)) = detect_bit_test_modify_branch(block, use_counts) {
+            return Some((test, Some(modify), kind));
+        }
+    }
     let cond_val = match cond {
         Operand::Value(v) => v,
         _ => return None,
@@ -3618,7 +4121,6 @@ fn detect_load_cmp_mem_fold(
     block: &BasicBlock,
     use_counts: &[u32],
 ) -> FxHashMap<u32, (u32, IrType, i64)> {
-    use crate::ir::reexports::IrCmpOp;
     let mut out = FxHashMap::default();
     let n = block.instructions.len();
     for i in 0..n.saturating_sub(1) {
@@ -6499,7 +7001,19 @@ fn generate_function_body(
             &value_use_counts,
             cg.supports_fused_fp_cmp_branch(),
             cg.supports_fused_bit_test_branch(),
-        );
+        )
+        .filter(|&(test_idx, _, kind)| {
+            // The test + modify branch also needs the backend's register
+            // admission; refused, both instructions emit normally and the
+            // branch tests the materialized answer.
+            let FusedBranchKind::BitTestModify { modify_dest, .. } = kind else {
+                return true;
+            };
+            let Instruction::BinOp { lhs, rhs, ty, .. } = &block.instructions[test_idx] else {
+                return false;
+            };
+            cg.bit_test_modify_fusable(None, &modify_dest, lhs, rhs, *ty)
+        });
         let mul_add_fusions = detect_mul_add_fusions(
             block,
             &value_use_counts,
@@ -6595,6 +7109,20 @@ fn generate_function_body(
             .iter()
             .filter_map(|fusion| fusion.cmp_idx)
             .collect();
+        let mut bit_test_fusions = BitTestFusionPlan::new(
+            &*cg,
+            block,
+            &value_use_counts,
+            fuse_idx.map(|f| f.0),
+            &OtherFusionClaims {
+                branch_range: fuse_idx.map(|(a, end, _)| (a, end.unwrap_or(a))),
+                conditional_increment_cmps: &conditional_increment_cmps,
+                conditional_increment_adds: &conditional_increment_adds,
+                cmp_select_fusions: &cmp_select_fusions,
+                gap_add_fusions: &gap_add_fusions,
+                mul_add_fusions: &mul_add_fusions,
+            },
+        );
         let shifted_logical_fusions = if cg.supports_shifted_logical() {
             detect_shifted_logical_fusions(block, &value_use_counts)
         } else {
@@ -6734,6 +7262,10 @@ fn generate_function_body(
             }
             if skip_f128_copy_store {
                 skip_f128_copy_store = false;
+                cg.state().current_program_point += 1;
+                continue;
+            }
+            if bit_test_fusions.take_covered() {
                 cg.state().current_program_point += 1;
                 continue;
             }
@@ -7075,6 +7607,12 @@ fn generate_function_body(
                 }
             }
 
+            // Bit test + modify / zero compare / add (`BitTestFusionPlan`).
+            if bit_test_fusions.try_emit(cg, block, idx) {
+                cg.state().current_program_point += 1;
+                continue;
+            }
+
             if let Some(fusion) = conditional_increment_fusions
                 .iter()
                 .find(|fusion| fusion.select_idx == idx)
@@ -7267,6 +7805,30 @@ fn generate_function_body(
                     }
                     (FusedBranchKind::BitTest, Instruction::BinOp { lhs, rhs, ty, .. }) => {
                         cg.emit_fused_bit_test_branch_blocks(
+                            lhs,
+                            rhs,
+                            *ty,
+                            *true_label,
+                            *false_label,
+                        );
+                    }
+                    (
+                        FusedBranchKind::BitTestModify {
+                            modify_dest,
+                            modify_op,
+                        },
+                        Instruction::BinOp {
+                            dest: test_dest,
+                            lhs,
+                            rhs,
+                            ty,
+                            ..
+                        },
+                    ) => {
+                        cg.emit_fused_bit_test_modify_branch(
+                            test_dest,
+                            &modify_dest,
+                            modify_op,
                             lhs,
                             rhs,
                             *ty,
@@ -7996,16 +8558,6 @@ fn generate_instruction_body(
             eightbyte_classes,
         } => {
             cg.emit_va_arg_struct_ex(dest_ptr, va_list_ptr, *size, *align, eightbyte_classes);
-            clobber_after_call_like(cg);
-        }
-        Instruction::VaArgVector {
-            dest_ptr,
-            va_list_ptr,
-            size,
-            align,
-            eightbyte_classes,
-        } => {
-            cg.emit_va_arg_vector(dest_ptr, va_list_ptr, *size, *align, eightbyte_classes);
             clobber_after_call_like(cg);
         }
         Instruction::AtomicRmw {

@@ -266,10 +266,7 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                             ty: *ty,
                         },
                     );
-                    let id = dest.0 as usize;
-                    if id < is_boolean.len() {
-                        is_boolean[id] = true;
-                    }
+                    mark_boolean(&mut is_boolean, *dest);
                 }
                 Instruction::BinOp {
                     dest,
@@ -292,6 +289,11 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                             ty: *ty,
                         },
                     );
+                    // `BitTest` is `(x >> n) & 1`: exactly 0 or 1, like a Cmp,
+                    // so `bt == 1` / `bt != 0` are the test itself.
+                    if *op == IrBinOp::BitTest {
+                        mark_boolean(&mut is_boolean, *dest);
+                    }
                 }
                 Instruction::UnaryOp { dest, op, src, ty } => match op {
                     IrUnaryOp::Not => {
@@ -444,10 +446,7 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                     && operand_is_boolean(lhs, &is_boolean)
                     && operand_is_boolean(rhs, &is_boolean)
                 {
-                    let id = dest.0 as usize;
-                    if id < is_boolean.len() {
-                        is_boolean[id] = true;
-                    }
+                    mark_boolean(&mut is_boolean, *dest);
                 }
             }
         }
@@ -597,6 +596,28 @@ fn set_def<T>(defs: &mut [Option<T>], id: u32, val: T) {
     let idx = id as usize;
     if idx < defs.len() {
         defs[idx] = Some(val);
+    }
+}
+
+/// `!b` for a boolean `b` defined by `inner`: the inverted comparison.
+/// `None` when `b` is not a Cmp, or is an ORDERED float compare -- there
+/// inversion is wrong for NaN (`!(NaN <= x)` is true, `NaN > x` false); only
+/// Eq <-> Ne treat NaN consistently.
+fn invert_boolean_cmp(dest: Value, inner: Option<&CmpDef>) -> Option<Instruction> {
+    let ic = inner?;
+    Some(Instruction::Cmp {
+        dest,
+        op: ic.op.inverse_for(ic.ty)?,
+        lhs: ic.lhs,
+        rhs: ic.rhs,
+        ty: ic.ty,
+    })
+}
+
+/// Record that `dest` is known to be boolean (exactly 0 or 1).
+fn mark_boolean(is_boolean: &mut [bool], dest: Value) {
+    if let Some(slot) = is_boolean.get_mut(dest.0 as usize) {
+        *slot = true;
     }
 }
 
@@ -1228,12 +1249,9 @@ fn fold_bool_select_arms(
         None
     } else {
         let ic = (*cmp_defs.get(idx)?)?;
-        if ic.ty.is_float() && !matches!(ic.op, IrCmpOp::Eq | IrCmpOp::Ne) {
-            return None;
-        }
         Some(Instruction::Cmp {
             dest,
-            op: invert_cmp_op(ic.op),
+            op: ic.op.inverse_for(ic.ty)?,
             lhs: ic.lhs,
             rhs: ic.rhs,
             ty: ic.ty,
@@ -1282,7 +1300,7 @@ fn normalize_cmp_value_const(
 ) -> Option<(Value, IrConst, IrCmpOp)> {
     match (lhs, rhs) {
         (Operand::Value(v), Operand::Const(c)) => Some((*v, *c, op)),
-        (Operand::Const(c), Operand::Value(v)) => Some((*v, *c, swap_cmp_op(op))),
+        (Operand::Const(c), Operand::Value(v)) => Some((*v, *c, op.swapped())),
         (Operand::Value(v), Operand::Value(cv)) => {
             if let Some(c) =
                 resolve_select_const(Operand::Value(*cv), const_defs, cast_defs, def_counts)
@@ -1290,7 +1308,7 @@ fn normalize_cmp_value_const(
                 Some((*v, c, op))
             } else {
                 resolve_select_const(Operand::Value(*v), const_defs, cast_defs, def_counts)
-                    .map(|c| (*cv, c, swap_cmp_op(op)))
+                    .map(|c| (*cv, c, op.swapped()))
             }
         }
         _ => None,
@@ -1436,7 +1454,7 @@ fn fold_cmp_of_select(
     let op2_norm = if same_operand(&ic1.lhs, &ic2.lhs) && same_operand(&ic1.rhs, &ic2.rhs) {
         ic2.op
     } else if same_operand(&ic1.lhs, &ic2.rhs) && same_operand(&ic1.rhs, &ic2.lhs) {
-        swap_cmp_op(ic2.op)
+        ic2.op.swapped()
     } else {
         return None;
     };
@@ -1629,7 +1647,7 @@ fn fold_cmp_of_boolean_indicators(
     // `0 <op> diff` is `diff <swap(op)> 0`.
     let (value, op) = match (lhs, rhs) {
         (Operand::Value(v), zero) if is_zero(&zero) => (v, op),
-        (zero, Operand::Value(v)) if is_zero(&zero) => (v, swap_cmp_op(op)),
+        (zero, Operand::Value(v)) if is_zero(&zero) => (v, op.swapped()),
         _ => return None,
     };
     let sub = (*binop_defs.get(value.0 as usize)?)?;
@@ -1826,7 +1844,7 @@ fn orient(first: CmpDef, second: CmpDef, forward: bool) -> (CmpDef, CmpDef) {
         (
             first,
             CmpDef {
-                op: swap_cmp_op(second.op),
+                op: second.op.swapped(),
                 ..second
             },
         )
@@ -2127,7 +2145,7 @@ fn rewrite_iabs_range_cmps(func: &mut IrFunction) -> usize {
                 }
                 let (val, cval, effective_op) = match (lhs, rhs) {
                     (Operand::Value(v), Operand::Const(c)) => (v, c, op),
-                    (Operand::Const(c), Operand::Value(v)) => (v, c, swap_cmp_op(op)),
+                    (Operand::Const(c), Operand::Value(v)) => (v, c, op.swapped()),
                     _ => return None,
                 };
                 let k = signed_cmp_const_value(cval, ty)?;
@@ -3808,36 +3826,6 @@ fn int_const_of_type(ty: IrType, v: i64) -> Option<IrConst> {
     }
 }
 
-fn invert_cmp_op(op: IrCmpOp) -> IrCmpOp {
-    match op {
-        IrCmpOp::Eq => IrCmpOp::Ne,
-        IrCmpOp::Ne => IrCmpOp::Eq,
-        IrCmpOp::Slt => IrCmpOp::Sge,
-        IrCmpOp::Sle => IrCmpOp::Sgt,
-        IrCmpOp::Sgt => IrCmpOp::Sle,
-        IrCmpOp::Sge => IrCmpOp::Slt,
-        IrCmpOp::Ult => IrCmpOp::Uge,
-        IrCmpOp::Ule => IrCmpOp::Ugt,
-        IrCmpOp::Ugt => IrCmpOp::Ule,
-        IrCmpOp::Uge => IrCmpOp::Ult,
-    }
-}
-
-/// Swap a comparison operator (reverse operand order).
-fn swap_cmp_op(op: IrCmpOp) -> IrCmpOp {
-    match op {
-        IrCmpOp::Eq | IrCmpOp::Ne => op,
-        IrCmpOp::Slt => IrCmpOp::Sgt,
-        IrCmpOp::Sle => IrCmpOp::Sge,
-        IrCmpOp::Sgt => IrCmpOp::Slt,
-        IrCmpOp::Sge => IrCmpOp::Sle,
-        IrCmpOp::Ult => IrCmpOp::Ugt,
-        IrCmpOp::Ule => IrCmpOp::Uge,
-        IrCmpOp::Ugt => IrCmpOp::Ult,
-        IrCmpOp::Uge => IrCmpOp::Ule,
-    }
-}
-
 /// Return the narrow source for a condition that only observes whether a
 /// widened integer result is zero.  See the caller in `simplify_function` for
 /// the zero-ness proof and why truncating/non-integer casts are refused.
@@ -3880,7 +3868,7 @@ fn cmp_against_const(
 ) -> Option<(Value, IrConst, IrCmpOp)> {
     match (lhs, rhs) {
         (Operand::Value(v), Operand::Const(c)) => Some((*v, *c, op)),
-        (Operand::Const(c), Operand::Value(v)) => Some((*v, *c, swap_cmp_op(op))),
+        (Operand::Const(c), Operand::Value(v)) => Some((*v, *c, op.swapped())),
         _ => None,
     }
 }
@@ -4495,7 +4483,7 @@ fn simplify_cmp(
     // This eliminates the need for separate swapped/non-swapped handling below.
     let (val, cval, effective_op) = match (lhs, rhs) {
         (Operand::Value(v), Operand::Const(c)) => (v, c, op),
-        (Operand::Const(c), Operand::Value(v)) => (v, c, swap_cmp_op(op)),
+        (Operand::Const(c), Operand::Value(v)) => (v, c, op.swapped()),
         _ => return None,
     };
 
@@ -4577,40 +4565,18 @@ fn simplify_cmp(
     let val_is_boolean = idx < is_boolean.len() && is_boolean[idx];
 
     // If the value is from a Cmp, we can do precise inversion
-    let inner_cmp = if let Some(Some(cdef)) = cmp_defs.get(idx) {
-        Some(cdef)
-    } else {
-        None
-    };
+    let inner_cmp = cmp_defs.get(idx).and_then(Option::as_ref);
 
     if val_is_boolean {
         match effective_op {
             IrCmpOp::Eq => {
+                // Cmp(Eq, boolean_val, 0) => logical NOT of boolean_val. A
+                // non-Cmp boolean keeps this form: `b == 0` IS the canonical
+                // negation (see the Ne/1 arm).
                 if is_zero_const {
-                    // Cmp(Eq, boolean_val, 0) => logical NOT of boolean_val
-                    // If from a Cmp, we can invert the comparison directly
-                    if let Some(ic) = inner_cmp {
-                        // For float ordered comparisons (Slt, Sle, Sgt, Sge),
-                        // inversion is NOT valid because of NaN: !(a <= b) is
-                        // NOT the same as (a > b) when either operand is NaN.
-                        // !(NaN <= x) should be true (since NaN <= x is false),
-                        // but (NaN > x) is also false. Only Eq<->Ne inversion
-                        // is safe for floats since both handle NaN consistently.
-                        let is_float_ordered =
-                            ic.ty.is_float() && !matches!(ic.op, IrCmpOp::Eq | IrCmpOp::Ne);
-                        if !is_float_ordered {
-                            return Some(Instruction::Cmp {
-                                dest,
-                                op: invert_cmp_op(ic.op),
-                                lhs: ic.lhs,
-                                rhs: ic.rhs,
-                                ty: ic.ty,
-                            });
-                        }
+                    if let Some(inverted) = invert_boolean_cmp(dest, inner_cmp) {
+                        return Some(inverted);
                     }
-                    // For non-Cmp boolean values (e.g., And/Or of booleans),
-                    // Cmp(Eq, val, 0) = Xor(val, 1) - but we can't easily
-                    // express this without creating new instructions, so skip.
                 }
                 if is_one_const {
                     // Cmp(Eq, boolean_val, 1) => Copy(boolean_val)
@@ -4631,21 +4597,26 @@ fn simplify_cmp(
                     });
                 }
                 if is_one_const {
-                    // Cmp(Ne, boolean_val, 1) => logical NOT
-                    if let Some(ic) = inner_cmp {
-                        // Skip inversion for float ordered comparisons (NaN safety).
-                        // See the Eq/is_zero_const case above for the full explanation.
-                        let is_float_ordered =
-                            ic.ty.is_float() && !matches!(ic.op, IrCmpOp::Eq | IrCmpOp::Ne);
-                        if !is_float_ordered {
+                    // Cmp(Ne, boolean_val, 1) => logical NOT: the inverted
+                    // Cmp, or -- for any other integer 0/1 value -- `b == 0`,
+                    // the one canonical negation every backend fuses with
+                    // its producer (`bt; setnc`, `tst; cset eq`).
+                    match inner_cmp {
+                        Some(_) => {
+                            if let Some(inverted) = invert_boolean_cmp(dest, inner_cmp) {
+                                return Some(inverted);
+                            }
+                        }
+                        None if ty.is_integer() => {
                             return Some(Instruction::Cmp {
                                 dest,
-                                op: invert_cmp_op(ic.op),
-                                lhs: ic.lhs,
-                                rhs: ic.rhs,
-                                ty: ic.ty,
+                                op: IrCmpOp::Eq,
+                                lhs: Operand::Value(*val),
+                                rhs: Operand::Const(IrConst::zero(ty)),
+                                ty,
                             });
                         }
+                        None => {}
                     }
                 }
             }
@@ -4740,7 +4711,7 @@ fn simplify_cmp(
     // `test %reg, %reg` for zero) instead of loading the constant into a register.
     // Only rewrite when the instruction actually has the constant on the LHS.
     if matches!(lhs, Operand::Const(_)) && matches!(rhs, Operand::Value(_)) {
-        let swapped_op = swap_cmp_op(op);
+        let swapped_op = op.swapped();
         return Some(Instruction::Cmp {
             dest,
             op: swapped_op,
@@ -4772,7 +4743,7 @@ fn fold_fabs_lt_zero(
     }
     let (val, cval, effective_op) = match (lhs, rhs) {
         (Operand::Value(v), Operand::Const(c)) => (v, c, op),
-        (Operand::Const(c), Operand::Value(v)) => (v, c, swap_cmp_op(op)),
+        (Operand::Const(c), Operand::Value(v)) => (v, c, op.swapped()),
         _ => return None,
     };
     if !cval.is_zero() {

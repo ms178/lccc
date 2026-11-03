@@ -1807,11 +1807,11 @@ pub(super) fn is_conditional_jump(s: &str) -> bool {
         // analysis saw no incoming edge, and the pass merged live blocks
         // away (kernel/events/core.c is_sb_event lost its return-false block,
         // dangling `jnc` relocation -> sym index 0 -> link failure).
-        b'c' => b[2] == b' ' || (b.len() >= 4 && b[2] == b'n' && b[3] == b' '), // jc, jnc
-        b's' => b[2] == b' ',                                                   // js
-        b'o' => b[2] == b' ',                                                   // jo
-        b'p' => b[2] == b' ',                                                   // jp
-        b'z' => b[2] == b' ',                                                   // jz
+        b'c' => b[2] == b' ', // jc (`jnc` starts with `n`: the arm below)
+        b's' => b[2] == b' ', // js
+        b'o' => b[2] == b' ', // jo
+        b'p' => b[2] == b' ', // jp
+        b'z' => b[2] == b' ', // jz
         b'n' => {
             // jne, jns, jno, jnp, jnz, jnc (jnc = jae alias; must live here —
             // the `n` arm runs before the `c` arm in this dispatch)

@@ -184,6 +184,10 @@ KIND_FIXTURES = {
         "int *probe_rla(void) { int probe_local = 0; return &probe_local; }",
         "function returns address of local variable",
     ),
+    "pragmas": (
+        "#pragma message\nint probe_pragmas(void) { return 0; }",
+        "expected a string after '#pragma message'",
+    ),
 }
 
 # Measured membership/severity cells, stated INDEPENDENTLY of the LCCC
@@ -209,6 +213,7 @@ DEFAULT_ON = {
     "discarded-qualifiers",
     "discarded-array-qualifiers",
     "return-local-addr",
+    "pragmas",
 }
 IN_WALL = {"return-type", "unused-variable", "format"}
 IN_WEXTRA = {"sign-compare"}
@@ -620,7 +625,7 @@ def main() -> int:
         assert FORMAT_SECURITY_ERROR_FLAGS == ("-Wformat", "-Werror=format-security")
         # Registry manifest: one fixture per kind, the measured cells stay
         # self-consistent, and no fixture is missing a pin.
-        assert len(KIND_FIXTURES) == 20
+        assert len(KIND_FIXTURES) == 21
         assert C99_DEFAULT_ERROR <= DEFAULT_ON
         assert DEFAULT_ON == set(KIND_FIXTURES) - {
             "return-type",

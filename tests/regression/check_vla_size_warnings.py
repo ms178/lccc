@@ -12,6 +12,8 @@ CASES = {
     'unbounded': 'void f(unsigned n){volatile char a[n];a[0]=0;}',
     'signed': 'void f(int n){volatile char a[n];a[0]=0;}',
     'guarded': 'void f(unsigned n){if(n>16)return;volatile char a[n];a[0]=0;}',
+    'unsigned-view-positive-guard': 'void f(int n){if((unsigned)n>16)return;volatile char a[n];a[0]=0;}',
+    'byte-sign-reinterpret': 'void f(unsigned char n){if((signed char)n < -50 || (signed char)n > 100)return;volatile char a[n];a[0]=0;}',
     'signed-positive-guard': 'void f(int n){if(n<1 || n>16)return;volatile char a[n];a[0]=0;}',
     'join-not-guard': 'extern void g(void);void f(unsigned n){if(n<16)g();volatile char a[n];a[0]=0;}',
     'mask': 'void f(unsigned n){volatile char a[n&15];a[0]=0;}',
@@ -33,7 +35,7 @@ CASES = {
     # Distinct volatile effects prevent GCC IPA-ICF from deleting g's VLA.
     'pragma-pop': '#pragma GCC diagnostic push\n#pragma GCC diagnostic ignored "-Wvla-larger-than="\nvoid f(unsigned n){volatile char a[n];a[0]=0;}\n#pragma GCC diagnostic pop\nvoid g(unsigned n){volatile char a[n];a[0]=1;}',
 }
-FLAGS = [[], ['-Wvla-larger-than=1'], ['-Wvla-larger-than=2048'], ['-Wvla-larger-than=1MiB'],
+FLAGS = [[], ['-Wvla-larger-than=1'], ['-Wvla-larger-than=2048'], ['-Wvla-larger-than=128'], ['-Wvla-larger-than=1MiB'],
          ['-Werror=vla-larger-than=2048'],
          ['-Werror=vla-larger-than=2048', '-Wno-error=vla-larger-than=2048'],
          ['-Wvla-larger-than=1', '-Wno-vla-larger-than'], ['-w', '-Werror=vla-larger-than=1'],

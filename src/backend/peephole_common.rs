@@ -1123,6 +1123,83 @@ pub(crate) fn inert_directive(text: &str) -> bool {
     false
 }
 
+/// The line ranges a text peephole must leave exactly as emitted because they
+/// contain inline assembly: every function (`.type NAME, %function` or
+/// `@function` through `.size NAME, .-NAME`) with an `#APP` region in its
+/// body, and every top-level `#APP` ... `#NO_APP` region outside a function.
+///
+/// Why whole functions: an asm statement's operands are bound to registers
+/// by constraints the text does not show -- AArch64 `register long x8
+/// asm("x8")` feeding `svc 0` is read by the `svc`, yet no later line names
+/// `x8` until the next `movz x8, #93`, so a textual "first later mention
+/// overwrites it" scan deleted the system-call number (`write` became
+/// `semget` under qemu-aarch64); RISC-V's dead-move scan deleted a naked
+/// function's `mv t0, a0`.  The staging moves, the outputs' stores and every
+/// fact cached across the statement live in the surrounding code, so the
+/// unit of opacity is the function, as for RISC-V's volatile-access
+/// quarantine.  Shared by the AArch64 and RISC-V peepholes.
+///
+/// `None` when the structure is not the code generator's own (unbalanced
+/// markers, a `.type`/`.size` pair that does not match): the caller then
+/// leaves the whole translation unit unchanged.
+pub(crate) fn inline_asm_protected_ranges(lines: &[String]) -> Option<Vec<std::ops::Range<usize>>> {
+    let mut ranges = Vec::new();
+    let mut function: Option<(&str, usize, bool)> = None; // (name, start, has asm)
+    let mut depth = 0usize;
+    let mut region_start: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t == "#APP" {
+            match function.as_mut() {
+                Some((_, _, has_asm)) => *has_asm = true,
+                None if depth == 0 => region_start = Some(i),
+                None => {}
+            }
+            depth = depth.checked_add(1)?;
+            continue;
+        }
+        if t == "#NO_APP" {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 && function.is_none() {
+                ranges.push(region_start.take()?..i + 1);
+            }
+            continue;
+        }
+        if depth > 0 {
+            continue; // the statement's own text: whatever the user wrote
+        }
+        if let Some(rest) = t.strip_prefix(".type ") {
+            let Some((name, kind)) = rest.split_once(',') else {
+                continue;
+            };
+            if matches!(kind.trim(), "%function" | "@function") {
+                if function.is_some() {
+                    return None;
+                }
+                function = Some((name.trim(), i, false));
+            }
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix(".size ")
+            && let Some((name, expr)) = rest.split_once(',')
+            && let Some((open, start, has_asm)) = function
+            && name.trim() == open
+        {
+            if expr.trim().strip_prefix(".-") != Some(open) {
+                return None;
+            }
+            if has_asm {
+                ranges.push(start..i + 1);
+            }
+            function = None;
+        }
+    }
+    if function.is_some() || depth != 0 {
+        return None;
+    }
+    Some(ranges)
+}
+
 #[cfg(test)]
 mod inert_directive_tests {
     use super::*;

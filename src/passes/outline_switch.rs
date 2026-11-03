@@ -405,11 +405,6 @@ fn visit_instruction_uses(inst: &Instruction, mut f: impl FnMut(Value, IrType)) 
             va_list_ptr,
             dest_ptr,
             ..
-        }
-        | Instruction::VaArgVector {
-            va_list_ptr,
-            dest_ptr,
-            ..
         } => {
             f(*va_list_ptr, IrType::Ptr);
             f(*dest_ptr, IrType::Ptr);
@@ -1133,19 +1128,6 @@ fn remap_instruction(
             align,
             eightbyte_classes,
         } => Instruction::VaArgStruct {
-            dest_ptr: remap_val(*dest_ptr),
-            va_list_ptr: remap_val(*va_list_ptr),
-            size: *size,
-            align: *align,
-            eightbyte_classes: eightbyte_classes.clone(),
-        },
-        Instruction::VaArgVector {
-            dest_ptr,
-            va_list_ptr,
-            size,
-            align,
-            eightbyte_classes,
-        } => Instruction::VaArgVector {
             dest_ptr: remap_val(*dest_ptr),
             va_list_ptr: remap_val(*va_list_ptr),
             size: *size,

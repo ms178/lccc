@@ -11,8 +11,12 @@
 
 use super::macro_defs::MacroTable;
 use super::utils::{
-    bytes_to_str, is_digit_separator, is_ident_cont_byte, is_ident_start_byte, ppnumber_end,
+    bytes_to_str, is_digit_separator, is_ident_cont_byte, is_ident_start_byte, is_literal_prefix,
+    ppnumber_end, skip_literal_bytes,
 };
+use crate::common::types::CType;
+use crate::frontend::lexer::Lexer;
+use crate::frontend::lexer::token::{TokenKind, UnicodeCharKind};
 
 /// State of a single conditional (#if/#ifdef/#ifndef block).
 #[derive(Debug, Clone, Copy)]
@@ -107,7 +111,7 @@ pub fn evaluate_condition(expr: &str, macros: &MacroTable) -> (bool, Vec<String>
     // First expand macros in the expression (except inside defined())
     let expanded = expand_condition_macros(expr, macros);
     // Then evaluate the constant expression
-    let tokens = tokenize_expr(&expanded);
+    let tokens = tokenize_expr(&expanded, CharModel::current());
     let mut parser = ExprParser::new(&tokens);
     let result = parser.parse_ternary().0 != 0;
     (result, parser.undefined)
@@ -225,6 +229,13 @@ fn expand_condition_macros(expr: &str, macros: &MacroTable) -> String {
             }
             let ident = bytes_to_str(bytes, start, i);
 
+            // An encoding prefix is part of the literal after it, never a
+            // macro: `#define L 0` leaves `L'a'` alone.
+            if is_literal_prefix(ident, bytes.get(i).copied()) {
+                result.push_str(ident);
+                continue;
+            }
+
             // Check if this identifier is a pp-number suffix (e.g., 1u, 0xFFULL, 1.0f).
             // If the previous character in result is a digit, this is part of a number
             // token and should NOT be expanded as a macro.
@@ -251,8 +262,12 @@ fn expand_condition_macros(expr: &str, macros: &MacroTable) -> String {
             continue;
         }
 
-        result.push(b as char);
-        i += 1;
+        // Any other character, copied whole: `i` is always on a character
+        // boundary, and a non-ASCII character is several bytes (pushing
+        // `b as char` would turn each byte into its own Latin-1 character).
+        let ch = expr[i..].chars().next().unwrap_or(b as char);
+        result.push(ch);
+        i += ch.len_utf8();
     }
 
     result
@@ -264,12 +279,18 @@ fn expand_condition_macros(expr: &str, macros: &MacroTable) -> String {
 /// Per C99 6.10.1, preprocessor integer expressions use intmax_t (signed) or uintmax_t (unsigned)
 /// depending on whether any operand has a 'u'/'U' suffix.
 pub fn eval_const_expr(expr: &str) -> bool {
+    eval_const_expr_with(expr, CharModel::current())
+}
+
+/// `eval_const_expr` for an explicit character-type model (the unit tests
+/// cover every target's model without touching the process-wide settings).
+fn eval_const_expr_with(expr: &str, model: CharModel) -> bool {
     let expr = expr.trim();
     if expr.is_empty() {
         return false;
     }
 
-    let tokens = tokenize_expr(expr);
+    let tokens = tokenize_expr(expr, model);
     let mut parser = ExprParser::new(&tokens);
     let (result, _is_unsigned) = parser.parse_comma();
     result != 0
@@ -331,124 +352,104 @@ fn scan_pp_number_token(bytes: &[u8], start: usize) -> (ExprToken, usize) {
     (ExprToken::Num(raw_val as i64, is_unsigned), end)
 }
 
-/// Scan a character constant in `#if` / `#elif` and return `(token, next_index)`.
-fn scan_pp_char_token(bytes: &[u8], start: usize, wide: bool) -> (ExprToken, usize) {
-    let len = bytes.len();
-    let mut i = start + 1;
-    let val = if i < len && bytes[i] == b'\\' {
-        i += 1;
-        if i < len {
-            let esc = bytes[i];
-            i += 1;
-            match esc {
-                b'n' => b'\n' as i64,
-                b't' => b'\t' as i64,
-                b'r' => b'\r' as i64,
-                b'\\' => b'\\' as i64,
-                b'\'' => b'\'' as i64,
-                b'"' => b'"' as i64,
-                b'a' => 0x07,
-                b'b' => 0x08,
-                b'e' | b'E' => 0x1B,
-                b'f' => 0x0C,
-                b'v' => 0x0B,
-                b'o' if i < len && bytes[i] == b'{' => {
-                    i += 1;
-                    let mut v = 0i64;
-                    while i < len && bytes[i] != b'}' {
-                        if (b'0'..=b'7').contains(&bytes[i]) {
-                            v = v * 8 + (bytes[i] - b'0') as i64;
-                        }
-                        i += 1;
-                    }
-                    if i < len && bytes[i] == b'}' {
-                        i += 1;
-                    }
-                    if wide { v } else { v & 0xFF }
-                }
-                b'x' => {
-                    let mut v = 0i64;
-                    if i < len && bytes[i] == b'{' {
-                        i += 1;
-                        while i < len && bytes[i] != b'}' {
-                            if let Some(d) = (bytes[i] as char).to_digit(16) {
-                                v = v * 16 + d as i64;
-                            }
-                            i += 1;
-                        }
-                        if i < len && bytes[i] == b'}' {
-                            i += 1;
-                        }
-                    } else {
-                        while i < len && bytes[i].is_ascii_hexdigit() {
-                            if let Some(d) = (bytes[i] as char).to_digit(16) {
-                                v = v * 16 + d as i64;
-                            }
-                            i += 1;
-                        }
-                    }
-                    if wide { v } else { v & 0xFF }
-                }
-                b'u' | b'U' => {
-                    let mut v = 0i64;
-                    if esc == b'u' && i < len && bytes[i] == b'{' {
-                        i += 1;
-                        while i < len && bytes[i] != b'}' {
-                            if let Some(d) = (bytes[i] as char).to_digit(16) {
-                                v = v * 16 + d as i64;
-                            }
-                            i += 1;
-                        }
-                        if i < len && bytes[i] == b'}' {
-                            i += 1;
-                        }
-                    } else {
-                        let count = if esc == b'u' { 4 } else { 8 };
-                        for _ in 0..count {
-                            if i < len && bytes[i].is_ascii_hexdigit() {
-                                if let Some(d) = (bytes[i] as char).to_digit(16) {
-                                    v = v * 16 + d as i64;
-                                }
-                                i += 1;
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                    v
-                }
-                b'0'..=b'7' => {
-                    let mut v = (esc - b'0') as i64;
-                    for _ in 0..2 {
-                        if i < len && (b'0'..=b'7').contains(&bytes[i]) {
-                            v = v * 8 + (bytes[i] - b'0') as i64;
-                            i += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    if wide { v } else { v & 0xFF }
-                }
-                other => other as i64,
-            }
-        } else {
-            0
+/// The three `wchar_t` types the supported targets and flags produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wchar {
+    /// `int`: x86-64, i686, RISC-V.
+    Int,
+    /// `unsigned int`: AArch64.
+    UInt,
+    /// `unsigned short`: `-fshort-wchar`.
+    UShort,
+}
+
+/// How the target types the character constants `#if` can meet.
+#[derive(Debug, Clone, Copy)]
+struct CharModel {
+    /// Plain `char` is unsigned (AArch64, RISC-V, `-funsigned-char`).
+    char_unsigned: bool,
+    wchar: Wchar,
+}
+
+impl CharModel {
+    fn current() -> Self {
+        Self {
+            char_unsigned: crate::common::types::char_is_unsigned(),
+            wchar: match crate::common::types::wchar_ctype() {
+                CType::UShort => Wchar::UShort,
+                CType::UInt => Wchar::UInt,
+                _ => Wchar::Int,
+            },
         }
-    } else if i < len {
-        let c = bytes[i] as i64;
-        i += 1;
-        c
-    } else {
-        0
-    };
-    if i < len && bytes[i] == b'\'' {
-        i += 1;
     }
-    (ExprToken::Num(val, false), i)
+}
+
+/// The `#if` operand a character-constant token denotes, as GCC's
+/// `cpp_interpret_charconst` and `eval_token` compute it (measured on
+/// gcc-16.2, x86-64 and `-m32`, with and without `-funsigned-char` and
+/// `-fshort-wchar`):
+///
+/// * the VALUE is the constant's value in C: a single narrow character is a
+///   `char` widened to `int` (`'\377'` is -1 where `char` is signed, 255
+///   where it is not), a multi-character constant is an `int` (`'\377\377\377\377'`
+///   is -1 everywhere), and a prefixed constant is its code unit in its own
+///   type (`L'\xffffffff'` is the `int` -1 on x86, the `unsigned int`
+///   0xffffffff on AArch64);
+/// * the operand is UNSIGNED (so it drags the comparison to `uintmax_t`) when
+///   that type is unsigned: `u'x'`, `U'x'`, `u8'x'` always, `L'x'` where
+///   `wchar_t` is, and a single narrow character where plain `char` is —
+///   `'a' > -1` is false under `-funsigned-char` in GCC and Clang alike. A
+///   multi-character constant stays signed (GCC; Clang makes it unsigned
+///   with `char`, which C11 6.4.4.4p10's `int` does not support).
+fn char_constant_operand(kind: &TokenKind, model: CharModel) -> Option<PpVal> {
+    Some(match *kind {
+        TokenKind::CharLiteral(c) => {
+            let byte = c as u32 as u8;
+            if model.char_unsigned {
+                (i64::from(byte), true)
+            } else {
+                (i64::from(byte as i8), false)
+            }
+        }
+        TokenKind::IntLiteral(value) => (i64::from(value as i32), false),
+        TokenKind::UnicodeCharLiteral(value, unit) => match unit {
+            UnicodeCharKind::Utf8 => (i64::from(value & 0xFF), true),
+            UnicodeCharKind::Utf16 => (i64::from(value & 0xFFFF), true),
+            UnicodeCharKind::Utf32 => (i64::from(value), true),
+            UnicodeCharKind::Wide => match model.wchar {
+                Wchar::Int => (i64::from(value as i32), false),
+                Wchar::UInt => (i64::from(value), true),
+                Wchar::UShort => (i64::from(value & 0xFFFF), true),
+            },
+        },
+        _ => return None,
+    })
+}
+
+/// Scan a character constant (encoding prefix included) in `#if` / `#elif`
+/// and return `(token, next_index)`.
+///
+/// The C lexer decodes the spelling, so escapes, universal character names,
+/// UTF-8 source characters, multi-character accumulation and code-unit
+/// widths are exactly the compiler's; only the operand's signedness is the
+/// preprocessor's own (see `char_constant_operand`). A spelling that is not
+/// one character constant evaluates to 0, as before.
+fn scan_pp_char_token(bytes: &[u8], start: usize, model: CharModel) -> (ExprToken, usize) {
+    let quote = start
+        + bytes[start..]
+            .iter()
+            .position(|&b| b == b'\'')
+            .unwrap_or(bytes.len() - start);
+    let end = skip_literal_bytes(bytes, quote, b'\'').min(bytes.len());
+    let wide_unit16 = model.wchar == Wchar::UShort;
+    let value = Lexer::character_constant(bytes_to_str(bytes, start, end), wide_unit16)
+        .and_then(|kind| char_constant_operand(&kind, model))
+        .unwrap_or((0, false));
+    (ExprToken::Num(value.0, value.1), end)
 }
 
 /// Avoids allocating Vec<char>; numbers are parsed directly from byte spans.
-fn tokenize_expr(expr: &str) -> Vec<ExprToken> {
+fn tokenize_expr(expr: &str, model: CharModel) -> Vec<ExprToken> {
     let mut tokens = Vec::with_capacity(16);
     let bytes = expr.as_bytes();
     let len = bytes.len();
@@ -472,17 +473,9 @@ fn tokenize_expr(expr: &str) -> Vec<ExprToken> {
             continue;
         }
 
-        // An encoding prefix is part of a character token, not an undefined
-        // identifier. Keep its full escaped value for wide character literals.
-        let prefix = if matches!(b, b'L' | b'u' | b'U') && bytes.get(i + 1) == Some(&b'\'') {
-            1
-        } else if bytes[i..].starts_with(b"u8'") {
-            2
-        } else {
-            0
-        };
-        if (b == b'\'' && !is_digit_separator(bytes, i)) || prefix != 0 {
-            let (tok, next) = scan_pp_char_token(bytes, i + prefix, prefix == 1);
+        // Character literal
+        if b == b'\'' && !is_digit_separator(bytes, i) {
+            let (tok, next) = scan_pp_char_token(bytes, i, model);
             i = next;
             tokens.push(tok);
             continue;
@@ -496,6 +489,12 @@ fn tokenize_expr(expr: &str) -> Vec<ExprToken> {
                 i += 1;
             }
             let ident = bytes_to_str(bytes, start, i);
+            if bytes.get(i) == Some(&b'\'') && is_literal_prefix(ident, Some(b'\'')) {
+                let (tok, next) = scan_pp_char_token(bytes, start, model);
+                i = next;
+                tokens.push(tok);
+                continue;
+            }
             if ident == "defined" {
                 tokens.push(ExprToken::Defined);
             } else {
@@ -1037,5 +1036,117 @@ mod comma_operator_tests {
     fn nested_parentheses_keep_their_own_comma() {
         assert!(eval_const_expr("((1, 2), 3)"));
         assert!(!eval_const_expr("((1, 2), 0)"));
+    }
+}
+
+#[cfg(test)]
+mod char_constant_tests {
+    use super::{CharModel, Wchar, eval_const_expr_with};
+
+    /// x86-64 and i686: signed `char`, signed 32-bit `wchar_t`.
+    const X86: CharModel = CharModel {
+        char_unsigned: false,
+        wchar: Wchar::Int,
+    };
+    /// RISC-V, or x86 under `-funsigned-char`: unsigned `char`, signed `wchar_t`.
+    const UCHAR: CharModel = CharModel {
+        char_unsigned: true,
+        wchar: Wchar::Int,
+    };
+    /// x86 under `-fshort-wchar`: signed `char`, 16-bit unsigned `wchar_t`.
+    const SHORT: CharModel = CharModel {
+        char_unsigned: false,
+        wchar: Wchar::UShort,
+    };
+    /// AArch64: unsigned `char`, unsigned 32-bit `wchar_t`.
+    const AARCH64: CharModel = CharModel {
+        char_unsigned: true,
+        wchar: Wchar::UInt,
+    };
+
+    /// Every row is `(expression, [X86, UCHAR, SHORT, AARCH64])`. The first
+    /// three columns are gcc-16.2's answers (`-E` on x86-64, then with
+    /// `-funsigned-char`, then with `-fshort-wchar`; `-m32` equals x86-64);
+    /// the AArch64 column applies the same GCC rules to that ABI (Clang 23
+    /// agrees except on the two rules GCC and Clang disagree about, the sign
+    /// of a multi-character constant and which character of `L'ab'` counts).
+    const MATRIX: &[(&str, [bool; 4])] = &[
+        (r"L'\400'", [true, true, true, true]),
+        (r"L'\400' == 256", [true, true, true, true]),
+        (r"L'\xffffffff' < 0", [true, true, false, false]),
+        (r"L'\xffffffff' > -1", [false, false, false, false]),
+        (r"u'\xffff' == 65535", [true, true, true, true]),
+        (r"u'a' > -1", [false, false, false, false]),
+        (r"U'\xffffffff' > 0", [true, true, true, true]),
+        (r"U'a' > -1", [false, false, false, false]),
+        (r"'\377' < 0", [true, false, true, false]),
+        (r"'a' > -1", [true, false, true, false]),
+        (r"'\377' > -1", [false, false, false, false]),
+        (r"'ab' == 24930", [true, true, true, true]),
+        (r"'\377\377\377\377' == -1", [true, true, true, true]),
+        (r"'ab' > -1", [true, true, true, true]),
+        (r"L'ab' == 'b'", [true, true, true, true]),
+        (r"L'a' > -1", [true, true, false, false]),
+        (
+            r"'\x41' == 65 && '\101' == 65 && '\n' == 10 && '\\' == 92 && '\'' == 39",
+            [true; 4],
+        ),
+        (
+            r"L'\x10FFFF' == 0x10FFFF && U'\U0010FFFF' == 0x10FFFF && u'\u00e9' == 0xe9",
+            [true, true, false, true],
+        ),
+        (r"'\x80' == -128", [true, false, true, false]),
+        (r"L'\u00e9' == 233", [true, true, true, true]),
+        (r"'abcd' == 0x61626364", [true, true, true, true]),
+        (r"'\0' == 0 && !'\0'", [true, true, true, true]),
+        (r"(L'\xffffffff' >> 31) == -1", [true, true, false, false]),
+        (
+            r"L'\x80000000' == -2147483647 - 1",
+            [true, true, false, false],
+        ),
+        // `u8` is `unsigned char` in C23: unsigned on every target.
+        (r"u8'a' == 97 && u8'a' > -1", [false, false, false, false]),
+        (r"u8'a' == 97", [true, true, true, true]),
+        // A character beyond the BMP keeps its low surrogate in a 16-bit
+        // `wchar_t`, exactly as `u'\U0001F600'` does.
+        (r"L'\U0001F600' == 0xDE00", [false, false, true, false]),
+        (r"L'\U0001F600' == 0x1F600", [true, true, false, true]),
+        // A UTF-8 source character is one wide character but two narrow bytes.
+        (
+            "'\u{e9}' == 0xC3A9 && L'\u{e9}' == 0xE9",
+            [true, true, true, true],
+        ),
+    ];
+
+    #[test]
+    fn character_constants_evaluate_like_gcc_on_every_target() {
+        for (expr, expected) in MATRIX {
+            for (model, want) in [X86, UCHAR, SHORT, AARCH64].into_iter().zip(expected) {
+                assert_eq!(
+                    eval_const_expr_with(expr, model),
+                    *want,
+                    "#if {expr} under {model:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_wide_constant_is_one_operand_not_an_identifier_and_a_char() {
+        // torture/execute/widechar-1.c: `L'\400'` is 256, so `#if L'\400'`
+        // is taken. The prefix used to be read as the identifier `L` (0)
+        // followed by the narrow `'\400'` (0, truncated).
+        assert!(eval_const_expr_with(r"L'\400' - 255 == 1", X86));
+        assert!(eval_const_expr_with(r"(L'\400') == 256 ? 1 : 0", X86));
+        assert!(eval_const_expr_with(r"u8'\x7f' + U'\x1' == 128", X86));
+    }
+
+    #[test]
+    fn a_malformed_constant_still_evaluates_to_zero() {
+        // An unterminated or empty constant is an error in the compiler
+        // proper; here it must neither panic nor swallow the operator after it.
+        assert!(!eval_const_expr_with("'", X86));
+        assert!(!eval_const_expr_with("L'", X86));
+        assert!(eval_const_expr_with("'' == 0", X86));
     }
 }

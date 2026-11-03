@@ -2934,7 +2934,7 @@ pub(crate) fn recognize_function(
 ) -> usize {
     let pre_changes = canonicalize_narrow_crc_casts(func);
     let shared_bit_changes = if !facts::bit_select_disabled() {
-        bit_select::fold_shared_bit_select(func)
+        bit_test::fold_shared_masks_then_tests(func)
     } else {
         0
     };
@@ -6594,6 +6594,14 @@ mod predicate;
 #[cfg(test)]
 #[path = "bit_idioms_predicate_tests.rs"]
 mod predicate_tests;
+
+#[path = "bit_idioms_bit_test.rs"]
+mod bit_test;
+pub(crate) use bit_test::schedule_bit_test_modify_pairs;
+
+#[cfg(test)]
+#[path = "bit_idioms_bit_test_tests.rs"]
+mod bit_test_tests;
 
 #[path = "bit_idioms_observe.rs"]
 mod observe;

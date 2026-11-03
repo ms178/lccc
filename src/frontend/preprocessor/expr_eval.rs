@@ -8,7 +8,10 @@
 //! All scanning operates on byte slices for performance (no `Vec<char>` allocation).
 
 use super::pipeline::Preprocessor;
-use super::utils::{bytes_to_str, is_digit_separator, is_ident_cont_byte, is_ident_start_byte};
+use super::utils::{
+    bytes_to_str, is_digit_separator, is_ident_cont_byte, is_ident_start_byte, push_char_at,
+    skip_literal_bytes,
+};
 
 impl Preprocessor {
     /// Replace `defined(X)`, `defined X`, `__has_builtin(X)`, `__has_attribute(X)`,
@@ -41,21 +44,9 @@ impl Preprocessor {
             // Skip string and char literals verbatim: `"__has_attribute"` in
             // a string must not be rewritten.
             if bytes[i] == b'"' || (bytes[i] == b'\'' && !is_digit_separator(bytes, i)) {
-                let quote = bytes[i];
-                result.push(bytes[i] as char);
-                i += 1;
-                while i < len && bytes[i] != quote {
-                    if bytes[i] == b'\\' && i + 1 < len {
-                        result.push(bytes[i] as char);
-                        i += 1;
-                    }
-                    result.push(bytes[i] as char);
-                    i += 1;
-                }
-                if i < len {
-                    result.push(bytes[i] as char);
-                    i += 1;
-                }
+                let end = skip_literal_bytes(bytes, i, bytes[i]).min(len);
+                result.push_str(&line[i..end]);
+                i = end;
                 continue;
             }
             if is_ident_start_byte(bytes[i]) {
@@ -90,8 +81,7 @@ impl Preprocessor {
                 }
                 continue;
             }
-            result.push(bytes[i] as char);
-            i += 1;
+            i = push_char_at(&mut result, line, i);
         }
         result
     }
@@ -180,8 +170,10 @@ impl Preprocessor {
             }
             return "0".to_string();
         }
-        // Concatenated string literals, escape-aware.
-        let mut arg = String::new();
+        // Concatenated string literals, escape-aware.  The argument is
+        // collected as bytes: pushing each byte as a `char` would re-encode
+        // the bytes of a non-ASCII character one Latin-1 character apiece.
+        let mut arg_bytes: Vec<u8> = Vec::new();
         let mut terminated = true;
         while *i < len && bytes[*i] == b'"' {
             *i += 1;
@@ -189,8 +181,7 @@ impl Preprocessor {
             while *i < len {
                 let c = bytes[*i];
                 if c == b'\\' && *i + 1 < len {
-                    arg.push(c as char);
-                    arg.push(bytes[*i + 1] as char);
+                    arg_bytes.extend_from_slice(&bytes[*i..*i + 2]);
                     *i += 2;
                     continue;
                 }
@@ -199,7 +190,7 @@ impl Preprocessor {
                     *i += 1;
                     break;
                 }
-                arg.push(c as char);
+                arg_bytes.push(c);
                 *i += 1;
             }
             if !closed {
@@ -238,6 +229,7 @@ impl Preprocessor {
             // Malformed tail: treat as not-a-warning without advertising.
             return "0".to_string();
         }
+        let arg = String::from_utf8_lossy(&arg_bytes);
         if !arg.starts_with("-W") {
             warn!("__has_warning expected option name".to_string());
             return "0".to_string();
@@ -325,8 +317,7 @@ impl Preprocessor {
                 continue;
             }
 
-            result.push(bytes[i] as char);
-            i += 1;
+            i = push_char_at(&mut result, expr, i);
         }
 
         result
