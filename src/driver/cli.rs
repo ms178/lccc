@@ -648,6 +648,7 @@ impl Driver {
             || self.apply_x86_sse_level_mflag(arg)
             || self.apply_x86_avx512_mno_mflag(arg)
             || self.apply_x86_isa_toggle(arg)
+            || self.apply_x86_state_save_mflag(arg)
         {
             return true;
         }
@@ -790,31 +791,6 @@ impl Driver {
                 self.abm_explicitly_disabled = false;
                 self.enable_popcnt = true;
                 self.popcnt_explicitly_disabled = false;
-            }
-            "-mxsave" => {
-                // XSAVE is its own CPUID bit (leaf 1, ECX 26) and its own
-                // option, NOT an implication of AVX: Goldmont/Tremont/
-                // Lujiazui/Bobcat have it without AVX (measured, gcc-16.2
-                // `-dM`: those rows define `__XSAVE__` and no `__AVX__`).
-                // Last explicit decision wins, exactly like every other
-                // `-m`/`-mno-` pair.
-                self.enable_xsave = true;
-                self.xsave_explicitly_disabled = false;
-            }
-            "-mno-xsave" => {
-                self.enable_xsave = false;
-                self.xsave_explicitly_disabled = true;
-                // GCC's `-mno-xsave` also clears the extensions whose state
-                // lives in an XSAVE component (measured: `-mamx-tile
-                // -mno-xsave` leaves neither `__XSAVE__` nor `__AMX_TILE__`).
-                self.withhold_xsave_dependent_extras();
-            }
-            "-mfxsr" => {
-                // Measured last-wins pair; the flag overrides the -march row.
-                self.fxsr_override = Some(true);
-            }
-            "-mno-fxsr" => {
-                self.fxsr_override = Some(false);
             }
             "-mcx16" => {
                 self.enable_cx16 = true;
@@ -1094,6 +1070,38 @@ impl Driver {
         // `-mavx -march=x86-64` defines `__POPCNT__`).
         self.enable_popcnt = true;
         self.grant_xsave_from_avx();
+    }
+
+    /// The extended-state save/restore options: `FXSAVE`/`FXRSTOR` (an `x87`
+    /// + SSE image) and `XSAVE`/`XRSTOR` (a CPUID-enumerated component
+    /// envelope).  They share a group because they are the same decision at two
+    /// generations — which architectural state the compiler may assume is
+    /// saved — and because both are last-explicit-wins pairs that override the
+    /// `-march=` row.
+    ///
+    /// `XSAVE` is its own CPUID bit (leaf 1, ECX 26) with its own option and
+    /// is NOT an implication of AVX: Goldmont, Goldmont Plus, Tremont,
+    /// Lujiazui and Bobcat have it without AVX (measured, gcc-16.2 `-dM`:
+    /// those rows define `__XSAVE__` and no `__AVX__`).  `-mno-xsave`
+    /// therefore also clears the extensions whose state lives in an XSAVE
+    /// component (measured: `-mamx-tile -mno-xsave` leaves neither
+    /// `__XSAVE__` nor `__AMX_TILE__`).
+    fn apply_x86_state_save_mflag(&mut self, arg: &str) -> bool {
+        match arg {
+            "-mxsave" => {
+                self.enable_xsave = true;
+                self.xsave_explicitly_disabled = false;
+            }
+            "-mno-xsave" => {
+                self.enable_xsave = false;
+                self.xsave_explicitly_disabled = true;
+                self.withhold_xsave_dependent_extras();
+            }
+            "-mfxsr" => self.fxsr_override = Some(true),
+            "-mno-fxsr" => self.fxsr_override = Some(false),
+            _ => return false,
+        }
+        true
     }
 
     /// AVX implies XSAVE: the `ymm` state is only reachable through
