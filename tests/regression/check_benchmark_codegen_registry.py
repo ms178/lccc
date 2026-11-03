@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextlib
+import base64
+import hashlib
 import io
 import json
 import os
@@ -127,22 +129,61 @@ class RegistryTests(unittest.TestCase):
         data = {"benchmarks": rows, "settings": {"skip_perf": True},
                 "metadata": {"compiler_versions": {"gcc": "GCC 16.2.0", "lccc": "LCCC"},
                              "git": {"revision": "b" * 40}, "meminfo": "huge" * 10000}}
-        with tempfile.TemporaryDirectory() as name:
-            (Path(name) / "debian-results.json").write_text(json.dumps(data))
-            result = subprocess.run([sys.executable, "-c", code], cwd=name,
-                                    env={**os.environ, "PYTHONPATH": str(ROOT)},
-                                    capture_output=True, text=True, timeout=15)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        notices = result.stdout.splitlines()
-        self.assertLessEqual(len(notices), 10)
-        decoded = []
-        for line in notices:
-            payload = line.split("::", 2)[2].replace("%0D", "\r").replace("%0A", "\n").replace("%25", "%")
-            self.assertLessEqual(len(payload.encode()), 3900)
-            decoded.append(json.loads(payload))
-        self.assertEqual(decoded[0]["workloads"], len(rows))
-        published = [row["name"] for group in decoded[1:] for row in group]
-        self.assertCountEqual(published, [row["name"] for row in rows])
+        # Exercise both complete publishing paths, including worst-case 64-bit
+        # simulated counters and negative verdicts (which must not be hidden).
+        rows[0]["correctness"]["lccc"]["matches_baseline"] = False
+        rows[0]["compile"]["gcc"]["ok"] = False
+        for with_screen in (False, True):
+            with self.subTest(callgrind=with_screen), tempfile.TemporaryDirectory() as name:
+                directory = Path(name)
+                (directory / "debian-results.json").write_text(json.dumps(data))
+                if with_screen:
+                    screen = {"complete": True, "failures": [], "results": {
+                        row["name"]: {"metrics": {
+                            "ir_mine": 2**64 - 1, "ir_ref": 2**64 - 1,
+                            "d1_misses": [2**64 - 1] * 2, "ll_misses": [2**64 - 1] * 2,
+                        }} for row in rows}}
+                    (directory / "debian-callgrind").mkdir()
+                    (directory / "debian-callgrind/index.json").write_text(json.dumps(screen))
+                result = subprocess.run([sys.executable, "-c", code], cwd=name,
+                                        env={**os.environ, "PYTHONPATH": str(ROOT)},
+                                        capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                notices = result.stdout.splitlines()
+                self.assertLessEqual(len(notices), 10)
+                decoded = []
+                for line in notices:
+                    payload = line.split("::", 2)[2].replace("%0D", "\r").replace("%0A", "\n").replace("%25", "%")
+                    self.assertLessEqual(len(payload.encode()), 3900)
+                    decoded.append(json.loads(payload))
+                identity = decoded[0]
+                self.assertEqual(identity["workloads"], len(rows))
+                self.assertEqual(identity["compilers"], ["gcc", "lccc"])
+                self.assertEqual(identity["workload_hash_encoding"], "sha256-base64url-no-padding")
+                published = [dict(zip(identity["workload_columns"], row, strict=True))
+                             for group in decoded[1:] if isinstance(group, list) for row in group]
+                self.assertCountEqual([row["name"] for row in published], [row["name"] for row in rows])
+                originals = {row["name"]: row for row in rows}
+                for row in published:
+                    original = originals[row["name"]]
+                    def unhash(value):
+                        raw = base64.urlsafe_b64decode(value + "=")
+                        self.assertEqual(len(raw), 32)
+                        return raw
+                    self.assertEqual(unhash(row["source_sha256"]), bytes.fromhex("a" * 64))
+                    self.assertEqual(row["matches"], original["correctness"]["lccc"]["matches_baseline"])
+                    self.assertEqual(row["compile_ok"], [original["compile"][key]["ok"] for key in identity["compilers"]])
+                    for field, section, value in (("output_sha256", "correctness", "output"),
+                                                  ("command_sha256", "compile", "command")):
+                        self.assertEqual([unhash(h) for h in row[field]], [
+                            hashlib.sha256(json.dumps(original[section][key][value], sort_keys=True).encode()).digest()
+                            for key in identity["compilers"]])
+                counters = [group for group in decoded[1:] if isinstance(group, dict)]
+                self.assertEqual(len(counters), 3 if with_screen else 0)
+                if with_screen:
+                    flat = [row for group in counters for row in group["rows"]]
+                    self.assertCountEqual([row[0] for row in flat], [row["name"] for row in rows])
+                    self.assertTrue(all(row[1:] == [2**64 - 1] * 6 for row in flat))
 
     def test_profile_failure_cannot_launch_or_certify_the_survey(self):
         profile = {"complete": False, "target": "Haswell", "compilers": {
