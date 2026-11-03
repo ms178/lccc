@@ -8619,19 +8619,33 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 }
                 LineKind::LoadEbp { reg, offset, size } => {
                     read_slots.push((*offset, size_bytes(*size)));
+                    if text.contains("(%esp)") {
+                        read_regs.push(REG_ESP);
+                    } else if text.contains("(%ebp)") {
+                        read_regs.push(REG_EBP);
+                    } else {
+                        return None;
+                    }
                     *reg
                 }
                 LineKind::Other { dest_reg } => {
-                    // `movl %src, %dst` style: recover the source register.
-                    let rest = text.strip_prefix("movl ").map(|r| r.trim()).unwrap_or("");
-                    if let Some(comma) = rest.find(',') {
-                        let src_name = rest[..comma].trim();
-                        if src_name.starts_with('%') && !src_name.contains('(') {
-                            let src = register_family(src_name);
-                            if src <= REG_GP_MAX {
-                                read_regs.push(src);
-                            }
+                    // Only a literal immediate or a plain register is a
+                    // known source. An indirect load can alias any store.
+                    let Some(rest) = text.strip_prefix("movl ") else {
+                        return Some((staging, read_regs, read_slots));
+                    };
+                    let Some((source, _)) = rest.split_once(',') else {
+                        return Some((staging, read_regs, read_slots));
+                    };
+                    let source = source.trim();
+                    if source.starts_with('%') {
+                        let reg = register_family(source);
+                        if reg > REG_GP_MAX {
+                            return None;
                         }
+                        read_regs.push(reg);
+                    } else if !source.strip_prefix('$').is_some_and(|v| v.parse::<i32>().is_ok()) {
+                        return None;
                     }
                     *dest_reg
                 }
@@ -8691,6 +8705,11 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             LineKind::LoadEbp { reg, .. } => Some(*reg),
             LineKind::SetCC { reg } => Some(*reg),
             LineKind::StoreEbp { offset, size, .. } => {
+                // The classifier combines ESP and EBP slots; without a
+                // proven relation between the bases, any store may alias.
+                if !read_slots.is_empty() {
+                    return false;
+                }
                 // Stack write: check range overlap with staging slot reads.
                 let w_lo = *offset as i64;
                 let w_hi = w_lo + size_bytes(*size) as i64;
@@ -8704,7 +8723,10 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 None
             }
             LineKind::Other { dest_reg } => {
-                if *dest_reg == REG_NONE {
+                // Unknown opcodes can have implicit outputs that the single
+                // destination field cannot describe. Only MOV has one known
+                // explicit register destination in this path.
+                if !text.starts_with("movl ") || *dest_reg == REG_NONE {
                     // Unparsed destination (includes indirect memory
                     // operands): conservative abort.
                     return false;
@@ -8748,7 +8770,7 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     {
         let mut i = 0;
         while i < len {
-            if infos[i].is_nop() {
+            if infos[i].is_nop() || infos[i].kind == LineKind::InlineAsm {
                 i += 1;
                 continue;
             }
@@ -8763,6 +8785,10 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 i += 1;
                 continue;
             }
+            if infos[div_idx].kind == LineKind::InlineAsm {
+                i = div_idx + 1;
+                continue;
+            }
             let div_text = trimmed(store, &infos[div_idx], div_idx).to_string();
             let Some(divisor) = div_reg(&div_text) else {
                 i = div_idx + 1;
@@ -8770,6 +8796,23 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             };
             match collect_staging(store, infos, i, divisor) {
                 Some((staging, read_regs, read_slots)) => {
+                    // DIV overwrites EAX/EDX, and the staging itself may
+                    // overwrite its divisor. Those values cannot be inputs
+                    // to a repeated staging block without a separate proof.
+                    let stages_divisor = staging.iter().any(|(idx, _)| match infos[*idx].kind {
+                        LineKind::Move { dst, .. } => dst == divisor,
+                        LineKind::LoadEbp { reg, .. } => reg == divisor,
+                        LineKind::Other { dest_reg } => dest_reg == divisor,
+                        _ => false,
+                    });
+                    if matches!(divisor, REG_EAX | REG_EDX | REG_ESP)
+                        || read_regs.contains(&REG_EAX)
+                        || read_regs.contains(&REG_EDX)
+                        || (stages_divisor && read_regs.contains(&divisor))
+                    {
+                        i = div_idx + 1;
+                        continue;
+                    }
                     let staging_first = staging.last().map(|(p, _)| *p).unwrap_or(i);
                     sites.push(Site {
                         marker: i,
@@ -8817,13 +8860,18 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 break;
             }
             let same = site_a.div_text == site_b.div_text
+                && trimmed(store, &infos[site_a.marker], site_a.marker)
+                    == trimmed(store, &infos[site_b.marker], site_b.marker)
                 && site_a.staging.len() == site_b.staging.len()
                 && site_a
                     .staging
                     .iter()
                     .zip(site_b.staging.iter())
                     .all(|(x, y)| x.1 == y.1);
-            if !same || site_b.staging.is_empty() {
+            if !same
+                || site_b.staging.is_empty()
+                || !flags_definitely_dead_after(store, infos, site_b.div)
+            {
                 break;
             }
             // Verify the window strictly between A's div and B's staging
@@ -16206,6 +16254,25 @@ fn hide_debug_rows(store: &LineStore, infos: &mut [LineInfo]) -> Vec<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn div_fusion_checks_setup_inputs_and_flag_liveness() {
+        fn apply(body: &str) -> bool {
+            let mut store = LineStore::new(body.to_string());
+            let mut infos = classify_all(&store);
+            fuse_div_rem_pairs(&mut store, &mut infos)
+        }
+        let valid = "movl %esi, %eax\nxorl %edx, %edx\ndivl %ecx\nmovl %edx, %edi\nmovl %esi, %eax\nxorl %edx, %edx\ndivl %ecx\nret\n";
+        assert!(apply(valid));
+        assert!(!apply(&valid.replacen("xorl %edx, %edx", "cltd", 1)));
+        assert!(!apply(&valid.replace("movl %esi, %eax", "movl %edx, %eax")));
+        assert!(!apply(&valid.replace("divl %ecx", "divl %eax")));
+        assert!(!apply(&valid.replace("movl %esi, %eax", "movl (%ebx), %eax")));
+        assert!(!apply(&valid.replace("ret\n", "setne %bl\nret\n")));
+        let stack = valid.replace("movl %esi, %eax", "movl 4(%esp), %eax")
+            .replace("movl %edx, %edi", "movl %edx, %edi\nmovl %ebx, 4(%ebp)");
+        assert!(!apply(&stack));
+    }
 
     /// `void b_shr(u32 x, u32 n) { if ((x >> n) & 1) hit(n); }` at -O1: the
     /// exact pre-peephole text of the miscompile.  With `jc` unclassified the
