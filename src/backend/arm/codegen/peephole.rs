@@ -620,82 +620,6 @@ fn label_name(line: &str) -> Option<&str> {
 
 // ── Main entry point ─────────────────────────────────────────────────────────
 
-/// The line ranges the peephole must leave exactly as emitted because they
-/// contain inline assembly: every function (`.type NAME, %function` through
-/// `.size NAME, .-NAME`) with an `#APP` region in its body, and every
-/// top-level `#APP` ... `#NO_APP` region outside a function.
-///
-/// Why whole functions: an asm statement's operands are bound to registers
-/// by constraints the text does not show -- `register long x8 asm("x8")`
-/// feeding `svc 0` is read by the `svc`, yet no later line names `x8` until
-/// the next `movz x8, #93`, so a textual "first later mention overwrites
-/// it" scan (`eliminate_overwritten_moves`) deleted the system-call number
-/// and the length (`write` became `semget` under qemu-aarch64).  The staging
-/// moves, the outputs' stores and every fact cached across the statement
-/// live in the surrounding code, so the unit of opacity is the function,
-/// exactly as for RISC-V's volatile-access quarantine.
-///
-/// `None` when the structure is not the code generator's own (unbalanced
-/// markers, a `.type`/`.size` pair that does not match): the caller then
-/// leaves the whole translation unit unchanged.
-fn inline_asm_protected_ranges(lines: &[String]) -> Option<Vec<std::ops::Range<usize>>> {
-    let mut ranges = Vec::new();
-    let mut function: Option<(&str, usize, bool)> = None; // (name, start, has asm)
-    let mut depth = 0usize;
-    let mut region_start: Option<usize> = None;
-    for (i, line) in lines.iter().enumerate() {
-        let t = line.trim();
-        if t == "#APP" {
-            match function.as_mut() {
-                Some((_, _, has_asm)) => *has_asm = true,
-                None if depth == 0 => region_start = Some(i),
-                None => {}
-            }
-            depth = depth.checked_add(1)?;
-            continue;
-        }
-        if t == "#NO_APP" {
-            depth = depth.checked_sub(1)?;
-            if depth == 0 && function.is_none() {
-                ranges.push(region_start.take()?..i + 1);
-            }
-            continue;
-        }
-        if depth > 0 {
-            continue; // the statement's own text: whatever the user wrote
-        }
-        if let Some(rest) = t.strip_prefix(".type ") {
-            let Some((name, kind)) = rest.split_once(',') else {
-                continue;
-            };
-            if matches!(kind.trim(), "%function" | "@function") {
-                if function.is_some() {
-                    return None;
-                }
-                function = Some((name.trim(), i, false));
-            }
-            continue;
-        }
-        if let Some(rest) = t.strip_prefix(".size ")
-            && let Some((name, expr)) = rest.split_once(',')
-            && let Some((open, start, has_asm)) = function
-            && name.trim() == open
-        {
-            if expr.trim().strip_prefix(".-") != Some(open) {
-                return None;
-            }
-            if has_asm {
-                ranges.push(start..i + 1);
-            }
-            function = None;
-        }
-    }
-    if function.is_some() || depth != 0 {
-        return None;
-    }
-    Some(ranges)
-}
-
 /// Stand-in text for a protected line while the passes run: it names no
 /// register and matches no pattern.  Never emitted.
 const OPAQUE_LINE: &str = "# lccc_a64_inline_asm_opaque";
@@ -714,11 +638,12 @@ pub fn peephole_optimize(asm: String) -> String {
         return asm;
     }
     // Functions holding inline assembly stay byte-for-byte as emitted (see
-    // `inline_asm_protected_ranges`); labels and CFI bounds stay visible as
-    // the boundaries the passes segment by.  The originals go back in order
-    // at the end: passes may insert lines (`n` is re-read below), so the
-    // placeholders, not their indices, are the bookmarks.
-    let protected_ranges = if asm.contains("#APP") {
+    // `peephole_common::inline_asm_protected_ranges`); labels and CFI bounds
+    // stay visible as the boundaries the passes segment by.  The originals go
+    // back in order at the end: passes may insert lines (`n` is re-read
+    // below), so the placeholders, not their indices, are the bookmarks.
+    // Either marker: a stray `#NO_APP` is malformed input, not plain text.
+    let protected_ranges = if asm.contains("#APP") || asm.contains("#NO_APP") {
         match inline_asm_protected_ranges(&lines) {
             Some(ranges) => ranges,
             None => return asm,
@@ -5364,7 +5289,8 @@ fn propagate_register_copies(lines: &mut [String], kinds: &mut [LineKind], n: us
 
 // Shared peephole string utilities -- see backend/peephole_common.rs
 use crate::backend::peephole_common::{
-    rename_register_operand, replace_source_reg_in_instruction, replace_whole_word,
+    inline_asm_protected_ranges, rename_register_operand, replace_source_reg_in_instruction,
+    replace_whole_word,
 };
 
 // ── Global dead store elimination ────────────────────────────────────────────

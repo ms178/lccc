@@ -2952,6 +2952,12 @@ jobs:
         # inline-asm quarantine (it deleted the operands of an `svc 0`).
         # Mirrored in scripts/ci_local.sh (parity-checked).
         bash tests/regression/check_cross_alu_abs_runtime.sh
+        # RISC-V psABI narrow integers: an `unsigned int` argument (register
+        # or stack slot) and result travel SIGN-extended, every other narrow
+        # type both ways, executed under qemu-riscv64 at -O0/-O1/-O2/-Os
+        # against riscv64-linux-gnu-gcc callers and callees.  Mirrored in
+        # scripts/ci_local.sh (parity-checked).
+        bash tests/regression/check_riscv_psabi_narrow_args.sh
         # Predicate materialization: `c ? 1 : 0` is `c != 0` and `c ? 0 : 1`
         # is `c == 0` (5 -> 4), and `(a != 0) | (b != 0)` is `(a | b) != 0`
         # (9 -> 4).  Pins the folded shapes and their missing `cmov`, the

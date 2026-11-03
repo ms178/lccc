@@ -2060,11 +2060,12 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
     ///
     /// The body is the user's own text, so it gets the same `#APP`/`#NO_APP`
     /// provenance brackets as operand-bearing inline asm on targets that
-    /// mark their blocks (x86/i686/AArch64): a naked function's SIMD
+    /// mark their blocks (x86/i686/AArch64/RISC-V): a naked function's SIMD
     /// instructions must not trip the driver's `-mgeneral-regs-only`
-    /// scanner, and (x86) the text peephole must not "optimize" a naked
-    /// template line.  There is no operand setup or output store to keep
-    /// outside the brackets — the whole body IS user text.
+    /// scanner, and the text peepholes must not "optimize" a naked template
+    /// line (RISC-V deleted a naked `mv t0, a0` before `ret`).  There is no
+    /// operand setup or output store to keep outside the brackets — the
+    /// whole body IS user text.
     fn emit_raw_inline_asm(&mut self, template: &str) {
         let markers = self.asm_block_markers();
         let lines: Vec<&str> = template.lines().collect();

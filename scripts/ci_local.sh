@@ -1949,6 +1949,12 @@ gate "compare-dominance-fold" fast \
 gate "cross-alu-abs-runtime" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_cross_alu_abs_runtime.sh
 
+# RISC-V psABI narrow integers: an `unsigned int` argument (register or stack
+# slot) and result travel sign-extended, every other narrow type both ways,
+# executed under qemu-riscv64 against a conforming RISC-V compiler.
+gate "riscv-psabi-narrow-args" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_riscv_psabi_narrow_args.sh
+
 # Single-bit selection: `x | 1 << n` is `bts`, `x & ~(1 << n)` is `btr` and
 # `(x & 1 << n) != 0` is `bt` (6/8/7 -> 3/3/4 instructions), selected by the
 # new `BitSet`/`BitClear` IR operations.  Pins the shapes and the dead
