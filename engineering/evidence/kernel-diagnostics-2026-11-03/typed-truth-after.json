@@ -1,0 +1,3484 @@
+[
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "narrow_if",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "narrow_if",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "narrow_if",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "narrow_while",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "narrow_while",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "narrow_while",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "narrow_for",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "narrow_for",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "narrow_for",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "narrow_do",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "narrow_do",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "narrow_do",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "nested_cast",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "nested_cast",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "nested_cast",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "negated_cast",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "negated_cast",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "negated_cast",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "nonzero_if",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "nonzero_if",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "nonzero_if",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "nonzero_while",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "nonzero_while",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "nonzero_while",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "boolean_cast",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "boolean_cast",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "boolean_cast",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "wide_integer",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "wide_integer",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "wide_integer",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "zero",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "zero",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "zero",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "enum_true",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "enum_true",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "enum_true",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "shadowed_enum",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "shadowed_enum",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "shadowed_enum",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "shadowed_global_enum",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "shadowed_global_enum",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "shadowed_global_enum",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "local_typedef_zero",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "local_typedef_zero",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "local_typedef_zero",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "local_typedef_true",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "local_typedef_true",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "local_typedef_true",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "gnu_nested",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "gnu_nested",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "narrow_if",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "narrow_if",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "narrow_if",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "narrow_while",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "narrow_while",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "narrow_while",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "narrow_for",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "narrow_for",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "narrow_for",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "narrow_do",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "narrow_do",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "narrow_do",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "nested_cast",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "nested_cast",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "nested_cast",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "negated_cast",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "negated_cast",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "negated_cast",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "nonzero_if",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "nonzero_if",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "nonzero_if",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "nonzero_while",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "nonzero_while",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "nonzero_while",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "boolean_cast",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "boolean_cast",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "boolean_cast",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "wide_integer",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "wide_integer",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "wide_integer",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "zero",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "zero",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "zero",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "enum_true",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "enum_true",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "enum_true",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "shadowed_enum",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "shadowed_enum",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "shadowed_enum",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "shadowed_global_enum",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "shadowed_global_enum",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "shadowed_global_enum",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "local_typedef_zero",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "local_typedef_zero",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "local_typedef_zero",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "local_typedef_true",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "local_typedef_true",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "local_typedef_true",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "gnu_nested",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "gnu_nested",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "narrow_if",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "narrow_if",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "narrow_if",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "narrow_while",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "narrow_while",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "narrow_while",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "narrow_for",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "narrow_for",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "narrow_for",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "narrow_do",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "narrow_do",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "narrow_do",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "nested_cast",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "nested_cast",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "nested_cast",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "negated_cast",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "negated_cast",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "negated_cast",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "nonzero_if",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "nonzero_if",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "nonzero_if",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "nonzero_while",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "nonzero_while",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "nonzero_while",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "boolean_cast",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "boolean_cast",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "boolean_cast",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "wide_integer",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "wide_integer",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "wide_integer",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "zero",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "zero",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "zero",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "enum_true",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "enum_true",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "enum_true",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "shadowed_enum",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "shadowed_enum",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "shadowed_enum",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "shadowed_global_enum",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "shadowed_global_enum",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "shadowed_global_enum",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "local_typedef_zero",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "local_typedef_zero",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "local_typedef_zero",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "local_typedef_true",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "local_typedef_true",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "local_typedef_true",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "gnu_nested",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O0",
+    "case": "gnu_nested",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "narrow_if",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "narrow_if",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "narrow_if",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "narrow_while",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "narrow_while",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "narrow_while",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "narrow_for",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "narrow_for",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "narrow_for",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "narrow_do",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "narrow_do",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "narrow_do",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "nested_cast",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "nested_cast",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "nested_cast",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "negated_cast",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "negated_cast",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "negated_cast",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "nonzero_if",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "nonzero_if",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "nonzero_if",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "nonzero_while",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "nonzero_while",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "nonzero_while",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "boolean_cast",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "boolean_cast",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "boolean_cast",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "wide_integer",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "wide_integer",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "wide_integer",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "zero",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "zero",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "zero",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "enum_true",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "enum_true",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "enum_true",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "shadowed_enum",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "shadowed_enum",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "shadowed_enum",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "shadowed_global_enum",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "shadowed_global_enum",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "shadowed_global_enum",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "local_typedef_zero",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "local_typedef_zero",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "local_typedef_zero",
+    "compiler": "gcc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "local_typedef_true",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "local_typedef_true",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "local_typedef_true",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "gnu_nested",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "i686",
+    "opt": "-O2",
+    "case": "gnu_nested",
+    "compiler": "gcc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "narrow_if",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "narrow_if",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "narrow_while",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "narrow_while",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "narrow_for",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "narrow_for",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "narrow_do",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "narrow_do",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "nested_cast",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "nested_cast",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "negated_cast",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "negated_cast",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "nonzero_if",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "nonzero_if",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "nonzero_while",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "nonzero_while",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "boolean_cast",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "boolean_cast",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "wide_integer",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "wide_integer",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "zero",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "zero",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "enum_true",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "enum_true",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "shadowed_enum",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "shadowed_enum",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "shadowed_global_enum",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "shadowed_global_enum",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "local_typedef_zero",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "local_typedef_zero",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "local_typedef_true",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "local_typedef_true",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O0",
+    "case": "gnu_nested",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "narrow_if",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "narrow_if",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "narrow_while",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "narrow_while",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "narrow_for",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "narrow_for",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "narrow_do",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "narrow_do",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "nested_cast",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "nested_cast",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "negated_cast",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "negated_cast",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "nonzero_if",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "nonzero_if",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "nonzero_while",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "nonzero_while",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "boolean_cast",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "boolean_cast",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "wide_integer",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "wide_integer",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "zero",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "zero",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "enum_true",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "enum_true",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "shadowed_enum",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "shadowed_enum",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "shadowed_global_enum",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "shadowed_global_enum",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "local_typedef_zero",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "local_typedef_zero",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "local_typedef_true",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "local_typedef_true",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "aarch64",
+    "opt": "-O2",
+    "case": "gnu_nested",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "narrow_if",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "narrow_if",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "narrow_while",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "narrow_while",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "narrow_for",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "narrow_for",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "narrow_do",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "narrow_do",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "nested_cast",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "nested_cast",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "negated_cast",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "negated_cast",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "nonzero_if",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "nonzero_if",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "nonzero_while",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "nonzero_while",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "boolean_cast",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "boolean_cast",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "wide_integer",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "wide_integer",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "zero",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "zero",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "enum_true",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "enum_true",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "shadowed_enum",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "shadowed_enum",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "shadowed_global_enum",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "shadowed_global_enum",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "local_typedef_zero",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "local_typedef_zero",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "local_typedef_true",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "local_typedef_true",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O0",
+    "case": "gnu_nested",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "narrow_if",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "narrow_if",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "narrow_while",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "narrow_while",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "narrow_for",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "narrow_for",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "narrow_do",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "narrow_do",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "nested_cast",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "nested_cast",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "negated_cast",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "negated_cast",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "nonzero_if",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "nonzero_if",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "nonzero_while",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "nonzero_while",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "boolean_cast",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "boolean_cast",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "wide_integer",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "wide_integer",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "zero",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "zero",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "enum_true",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "enum_true",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "shadowed_enum",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "shadowed_enum",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "shadowed_global_enum",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "shadowed_global_enum",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "local_typedef_zero",
+    "compiler": "lccc",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "local_typedef_zero",
+    "compiler": "clang",
+    "expected": 1,
+    "actual": 1,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "local_typedef_true",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "local_typedef_true",
+    "compiler": "clang",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "riscv64",
+    "opt": "-O2",
+    "case": "gnu_nested",
+    "compiler": "lccc",
+    "expected": 0,
+    "actual": 0,
+    "rc": 0,
+    "passed": true
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "if ((unsigned char)256) __builtin_unreachable();",
+    "compiler": "lccc",
+    "passed": true,
+    "build_rc": 0,
+    "run_rc": 0
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "if ((unsigned char)256) __builtin_unreachable();",
+    "compiler": "gcc",
+    "passed": true,
+    "build_rc": 0,
+    "run_rc": 0
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "if ((unsigned char)256) __builtin_unreachable();",
+    "compiler": "clang",
+    "passed": true,
+    "build_rc": 0,
+    "run_rc": 0
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "if ((unsigned char)256) __builtin_unreachable();",
+    "compiler": "lccc",
+    "passed": true,
+    "build_rc": 0,
+    "run_rc": 0
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "if ((unsigned char)256) __builtin_unreachable();",
+    "compiler": "gcc",
+    "passed": true,
+    "build_rc": 0,
+    "run_rc": 0
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "if ((unsigned char)256) __builtin_unreachable();",
+    "compiler": "clang",
+    "passed": true,
+    "build_rc": 0,
+    "run_rc": 0
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "while ((unsigned char)256) {}",
+    "compiler": "lccc",
+    "passed": true,
+    "build_rc": 0,
+    "run_rc": 0
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "while ((unsigned char)256) {}",
+    "compiler": "gcc",
+    "passed": true,
+    "build_rc": 0,
+    "run_rc": 0
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "while ((unsigned char)256) {}",
+    "compiler": "clang",
+    "passed": true,
+    "build_rc": 0,
+    "run_rc": 0
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "while ((unsigned char)256) {}",
+    "compiler": "lccc",
+    "passed": true,
+    "build_rc": 0,
+    "run_rc": 0
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "while ((unsigned char)256) {}",
+    "compiler": "gcc",
+    "passed": true,
+    "build_rc": 0,
+    "run_rc": 0
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "while ((unsigned char)256) {}",
+    "compiler": "clang",
+    "passed": true,
+    "build_rc": 0,
+    "run_rc": 0
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "for (; (unsigned int)4294967296ULL;) {}",
+    "compiler": "lccc",
+    "passed": true,
+    "build_rc": 0,
+    "run_rc": 0
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "for (; (unsigned int)4294967296ULL;) {}",
+    "compiler": "gcc",
+    "passed": true,
+    "build_rc": 0,
+    "run_rc": 0
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O0",
+    "case": "for (; (unsigned int)4294967296ULL;) {}",
+    "compiler": "clang",
+    "passed": true,
+    "build_rc": 0,
+    "run_rc": 0
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "for (; (unsigned int)4294967296ULL;) {}",
+    "compiler": "lccc",
+    "passed": true,
+    "build_rc": 0,
+    "run_rc": 0
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "for (; (unsigned int)4294967296ULL;) {}",
+    "compiler": "gcc",
+    "passed": true,
+    "build_rc": 0,
+    "run_rc": 0
+  },
+  {
+    "target": "x86_64",
+    "opt": "-O2",
+    "case": "for (; (unsigned int)4294967296ULL;) {}",
+    "compiler": "clang",
+    "passed": true,
+    "build_rc": 0,
+    "run_rc": 0
+  }
+]

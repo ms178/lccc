@@ -258,6 +258,10 @@ pub struct SemanticAnalyzer {
     typeof_seen: RefCell<FxHashSet<(u32, u32, u32)>>,
     /// Return type of the function body currently being checked.
     current_return_type: Option<CType>,
+    /// Typed ICE truth captured while a condition's lexical scope is live.
+    /// `None` is recorded too: an unknown local must not later resolve to an
+    /// outer enumerator after its scope has been unwound.
+    condition_truth: FxHashMap<ExprId, Option<bool>>,
     /// Stack of enclosing function definition names for nested functions.
     /// Entry i is the name of the function containing the body currently
     /// being analyzed; the LAST entry is the innermost (possibly nested)
@@ -343,6 +347,7 @@ impl SemanticAnalyzer {
             designated_init_seen: RefCell::new(FxHashSet::default()),
             typeof_seen: RefCell::new(FxHashSet::default()),
             current_return_type: None,
+            condition_truth: FxHashMap::default(),
             function_nesting_stack: Vec::new(),
             prior_file_function_decls: FxHashMap::default(),
             no_builtins: false,
@@ -532,6 +537,10 @@ impl SemanticAnalyzer {
         self.function_nesting_stack.push(func.name.clone());
         self.analyze_function_def_inner(func);
         self.function_nesting_stack.pop();
+        // Nested bodies are analyzed by analyze_nested_function_def and share
+        // the parent's fact lifetime. Reuse capacity at the file-scope boundary
+        // instead of retaining every condition in the translation unit.
+        self.condition_truth.clear();
     }
 
     /// Analyze a GNU C nested function definition (block scope).
@@ -3716,34 +3725,11 @@ impl SemanticAnalyzer {
     /// Used to detect infinite loops like `while(1)` and `for(;1;)`, and for
     /// `if(1)` patterns like `if(!(0)) noreturn_call()` in BUILD_BUG macros.
     fn is_constant_true_expr(&self, expr: &Expr) -> bool {
-        self.try_eval_constant_bool(expr).unwrap_or_default()
-    }
-
-    /// Try to evaluate an expression as a compile-time boolean (true=non-zero, false=zero).
-    /// Returns None if the expression is not a compile-time constant.
-    fn try_eval_constant_bool(&self, expr: &Expr) -> Option<bool> {
-        match expr {
-            Expr::IntLiteral(val, _) => Some(*val != 0),
-            Expr::UIntLiteral(val, _) => Some(*val != 0),
-            Expr::LongLiteral(val, _) => Some(*val != 0),
-            Expr::ULongLiteral(val, _) => Some(*val != 0),
-            Expr::LongLongLiteral(val, _) => Some(*val != 0),
-            Expr::ULongLongLiteral(val, _) => Some(*val != 0),
-            // !expr: invert the constant
-            Expr::UnaryOp(crate::frontend::parser::ast::UnaryOp::LogicalNot, inner, _) => {
-                self.try_eval_constant_bool(inner).map(|v| !v)
-            }
-            // Cast to another type preserves truthiness
-            Expr::Cast(_, inner, _, _) => self.try_eval_constant_bool(inner),
-            // Enum constants (e.g., kernel's `true` defined as `enum { false = 0, true = 1 }`)
-            Expr::Identifier(name, _) => self
-                .result
-                .type_context
-                .enum_constants
-                .get(name)
-                .map(|constant| constant.value != 0),
-            _ => None,
-        }
+        self.condition_truth
+            .get(&expr.id())
+            .copied()
+            .unwrap_or_else(|| self.constant_truth_value(expr))
+            .unwrap_or(false)
     }
 
     // === Expression analysis ===
@@ -5122,7 +5108,9 @@ impl SemanticAnalyzer {
 
     /// Controlling expressions and the first operand of `?:` (C23 6.5.15p2,
     /// 6.8.4.1p1, 6.8.5p2) must have scalar type.
-    fn check_scalar_condition(&self, cond: &Expr) {
+    fn check_scalar_condition(&mut self, cond: &Expr) {
+        let truth = self.constant_truth_value(cond);
+        self.condition_truth.insert(cond.id(), truth);
         if let Some(ty) = self.constraint_operand(cond) {
             // GCC carets the whole operand: `if (g())`, `for (; g(); )`,
             // `if (s)` all point at the first token of the condition.

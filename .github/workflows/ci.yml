@@ -3562,6 +3562,12 @@ jobs:
         set -euo pipefail
         CCC=target/fastbuild/lccc ICX="$LCCC_ICX_BIN" FP_MINMAX_ICX_ONLY=1 \
           bash tests/regression/check_fp_select_minmax.sh
+    - name: Typed constant-truth diagnostic and value matrix
+      run: |
+        set -euo pipefail
+        python3 tests/regression/check_constant_truth_diagnostics.py \
+          --gcc "$GCC16" --clang "$CLANG" --icx "$LCCC_ICX_BIN" \
+          --json intel-evidence/constant-truth.json
     - name: Volatile reduction O3 contracts and ICX matrix
       run: |
         set -euo pipefail
