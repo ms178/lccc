@@ -2908,6 +2908,12 @@ jobs:
         # shapes -- are certified on the non-host backends: the same freestanding
         # checksum runs natively and under QEMU at every optimization level.
         python3 tests/regression/check_narrow_count_runtime.py --run
+        # Count builtins (clz/ctz, 32- and 64-bit, `l`/`ll`) have no
+        # single-instruction lowering on any shipped backend; the values are
+        # certified against in-image loop references natively and under QEMU at
+        # every optimization level, so a scan-based fallback cannot silently
+        # disagree about zero or about a single-bit operand.
+        python3 tests/regression/check_count_builtins_runtime.py --run
         # ZERO-REM-1: the map vectorizer's scalar remainder mirror must be
         # omitted (not merely unreachable) when a constant trip count makes
         # it dead, on every shape where that is provable and on none where
@@ -2940,6 +2946,13 @@ jobs:
         # -O3 agreement over every boundary value.  Mirrored in
         # scripts/ci_local.sh (parity-checked).
         bash tests/regression/check_lowest_set_bit_fold.sh
+        # The guarded-clz fold: `x ? clz(x) : 32` must collapse onto the
+        # defined-zero intrinsic (no dead select tail) and the speculated
+        # ClzNonZero arm must never reach the select — executed on x86-64 in
+        # both pipeline topologies, and pinned as an assembly contract on i686,
+        # which cannot collapse the diamond and has no multilib here.  Mirrored
+        # in scripts/ci_local.sh (parity-checked).
+        bash tests/regression/check_clz_zero_guard_fold.sh
         # Comparison dominance: a `&`/`|` of two comparisons of ONE value is
         # its stronger (conjunction) or weaker (disjunction) operand, so
         # `(x != 0) & (x > 4)` is `x > 4` (9 -> 4 instructions).  Pins the

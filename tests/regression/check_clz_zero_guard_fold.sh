@@ -133,9 +133,23 @@ CCC_DISABLE_PASSES=vectorize "$CCC" -O2 "$td/branchy.c" -o "$td/branchy_nc" \
 "$td/branchy_nc" || { echo "FAIL: branchy form miscompiles (no pre-conversion)" >&2; exit 1; }
 
 # Topology 3: i686 — always takes the no-pre-conversion path, and cannot be
-# executed in every environment (multilib). Pin the ASSEMBLY contract
-# instead: a bare bsr/bsf with no zero handling is the miscompile shape; a
-# correct lowering must also test the operand (branchy select or cmov).
+# executed in every environment (multilib), so the ASSEMBLY contract is pinned
+# instead: a bare bsr/bsf with no zero handling is the miscompile shape.  There
+# are two correct answers and the gate must accept both, because they are two
+# different lowerings of the same select:
+#
+#   * a surviving select — a `test` of the operand plus a branchy arm or a cmov
+#     (whatever a backend that cannot collapse the diamond emits), and
+#   * the intrinsic's own defined-zero fix-up — the sentinel preload
+#     (`movl $63, %eax` for 32-bit, `$127` for 64-bit) followed by the scan and
+#     the `xor`, which answers the width for a zero operand without a branch.
+#     i686 emits this one: `movl $63, %eax; bsrl %ecx, %eax; xorl $31, %eax`
+#     is 32 for x == 0, which is exactly the `else` arm's value.
+#
+# What is NOT acceptable under either answer is the bare scan whose destination
+# is architecturally undefined at zero (the speculated ClzNonZero arm), and that
+# is what this topology rejects.  The sentinel itself is certified by
+# check_clz_zero_sentinel.sh on both x86 targets.
 CCC686=${CCC686:-./target/fastbuild/lccc-i686}
 if [ -x "$CCC686" ]; then
     cat >"$td/i686.c" <<'EOF'
@@ -149,10 +163,21 @@ EOF
         || { echo "FAIL: i686 compile" >&2; exit 1; }
     ibody=$(sed -n '/^clz_if:/,/ret/p' "$td/i686.s")
     if grep -qE '\bbsrl\b' <<<"$ibody" && ! grep -qE '\btest[blqw]?\b' <<<"$ibody"; then
-        echo "FAIL: i686 clz_if is a bare bsr with no zero test (returns" \
-             "the undefined BSR destination for x==0):" >&2
-        echo "$ibody" >&2
-        exit 1
+        # No select survived.  The other correct answer is the defined-zero
+        # fix-up: the scan's destination carries the sentinel before the scan
+        # and the `xor` turns it into the width, so a zero operand never reads
+        # an undefined destination.
+        bdst=$(grep -oE '\bbsrl[[:space:]]+%[A-Za-z0-9]+, %[A-Za-z0-9]+' <<<"$ibody" |
+               tail -n 1 | sed 's/.*,[[:space:]]*//')
+        if [ -z "$bdst" ] ||
+           ! grep -qE "movl[[:space:]]+[$](63|127),[[:space:]]*$bdst" <<<"$ibody" ||
+           ! grep -qE '\bxorl[[:space:]]+\$(31|63),' <<<"$ibody"; then
+            echo "FAIL: i686 clz_if is a bare bsr with no zero handling (returns" \
+                 "the undefined BSR destination for x==0, or a sentinel the" \
+                 "xor never turns into the width):" >&2
+            echo "$ibody" >&2
+            exit 1
+        fi
     fi
 fi
 echo "OK clz_zero_guard_fold"

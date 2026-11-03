@@ -1936,6 +1936,13 @@ gate "iabs-cmp-fold" fast \
 gate "lowest-set-bit-fold" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_lowest_set_bit_fold.sh
 
+# The guarded-clz fold: the dead select tail must stay gone on x86-64 (both
+# pipeline topologies, executed) and the speculated ClzNonZero arm must never
+# survive as a bare scan on i686 (assembly contract -- i686's defined-zero
+# fix-up is the sentinel preload, which is a correct answer too).
+gate "clz-zero-guard-fold" fast \
+    bash tests/regression/check_clz_zero_guard_fold.sh
+
 # The narrow negate: the C integer promotions wrap every narrow negation in a
 # widen/negate/narrow round trip; `negcast` relocates the negate to the width
 # the result is observed at and `zeroneg` spells `0 - x` as the `Neg` every
@@ -3069,6 +3076,13 @@ gate "bit-width-runtime" fast \
 # certified on the emulated backends, not just the instruction shapes above.
 gate "narrow-count-runtime" fast \
     python3 tests/regression/check_narrow_count_runtime.py
+
+# The count builtins' values, on all four backends: freestanding clz/ctz
+# kernels against in-image loop references, exhaustive over the low half-word
+# plus single-bit and randomized sweeps. The hosted shard runs it with --run;
+# this mirror executes when QEMU is present and compiles otherwise.
+gate "count-builtins-runtime" fast \
+    python3 tests/regression/check_count_builtins_runtime.py
 
 gate "popcount-loop-contract" fast \
     python3 tests/regression/check_popcount_loop_contract.py

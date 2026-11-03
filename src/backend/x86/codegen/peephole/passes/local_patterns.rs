@@ -583,8 +583,30 @@ pub(super) fn cancel_highbit_double_xors(store: &LineStore, infos: &mut [LineInf
 /// only paired with `subl`, whose result has those bits zero anyway.
 ///
 /// `D` must be dead after the `sub` and the flags too (`bsr` defines only
-/// ZF); `S` must be a register distinct from both `D` and `R`, since the new
-/// preload writes `R` before the scan reads `S`.
+/// ZF). When `S` is a register distinct from `D` and `R`, the preload moves
+/// into `R` and the scan reads `S`: three instructions (two when the addend
+/// vanishes).
+///
+/// The emitter sometimes hands the subtraction the register the scan reads --
+/// `1u << (32 - __builtin_clz(x - 1))` is `leal -1(%rdi), %ecx; bsr %ecx, ...`
+/// with the shift count already destined for `%cl`, so `R == S`.  Writing the
+/// preload there would destroy the operand, so the scan stays in `D` (dead
+/// anyway) and the result leaves through one instruction that also carries the
+/// addend:
+///
+/// ```text
+///     mov  $-1, %D            (scan width)
+///     bsr  %S, %D             D == b, or -1 for a zero source
+///     lea  $addend(%D), %R    R = D + addend     (addend != 0)
+///     mov  %D, %R             R = D              (addend == 0)
+/// ```
+///
+/// which is four instructions instead of five, or three when the addend
+/// vanishes.  `lea` and `mov` define no flags, so the flags must still be dead
+/// after the window for the same reason as above.  The preload takes the scan
+/// width: a zero-source `bsrq` leaves the whole destination, so a `movl $-1`
+/// would leave `0xffffffff` rather than -1 there and the `lea` would add from
+/// the wrong base.
 pub(super) fn fold_highbit_subs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut dead = LazyDeadness::new();
@@ -617,8 +639,8 @@ pub(super) fn fold_highbit_subs(store: &mut LineStore, infos: &mut [LineInfo]) -
         replace_line(store, &mut infos[lines[0]], lines[0], rewrite.preload);
         replace_line(store, &mut infos[lines[1]], lines[1], rewrite.scan);
         let mut first_nop = 2;
-        if let Some(add) = rewrite.add {
-            replace_line(store, &mut infos[lines[2]], lines[2], add);
+        if let Some(tail) = rewrite.tail {
+            replace_line(store, &mut infos[lines[2]], lines[2], tail);
             first_nop = 3;
         }
         for &k in &lines[first_nop..] {
@@ -941,8 +963,10 @@ struct HighbitSubRewrite {
     d_fam: RegId,
     preload: String,
     scan: String,
-    /// `add $(K - mask), R` when the minuend is not the mask itself.
-    add: Option<String>,
+    /// The line that produces the result when the preload did not go to `R`:
+    /// `add $(K - mask), R` in the unaliased form (absent when the addend
+    /// vanishes), `lea $(K - mask)(D), R` or `mov D, R` in the aliased one.
+    tail: Option<String>,
 }
 
 /// Pure matcher for [`fold_highbit_subs`]; see there for the contract.
@@ -983,12 +1007,16 @@ fn match_highbit_sub(t: &[String; 5]) -> Option<HighbitSubRewrite> {
     let r_fam = register_family(r)?;
     if r_fam > REG_GP_MAX
         || r_fam == d_fam
-        || r_fam == s_fam
         || REG_NAMES[sub_size][r_fam as usize] != r
         || sub_src != REG_NAMES[sub_size][d_fam as usize]
     {
         return None;
     }
+    // `R == S`: the emitter reused the register the scan reads for the
+    // subtraction's destination (a shift count, `%cl`).  The preload cannot go
+    // there without destroying the operand, so the whole computation stays in
+    // the dead `D` and leaves through one `lea`/`mov`.
+    let aliased = r_fam == s_fam;
     let r32 = REG_NAMES[1][r_fam as usize];
     let r64 = REG_NAMES[0][r_fam as usize];
     // The minuend K, as the value R holds before the `sub` at its width.
@@ -1022,28 +1050,60 @@ fn match_highbit_sub(t: &[String; 5]) -> Option<HighbitSubRewrite> {
     if sub_q && i32::try_from(addend).is_err() {
         return None;
     }
-    let preload = if sub_q {
-        format!("    movq $-1, {r64}")
-    } else {
-        format!("    movl $-1, {r32}")
-    };
-    let scan = format!(
-        "    bsr{} {s}, {}",
-        if scan_q { 'q' } else { 'l' },
-        REG_NAMES[size][r_fam as usize]
-    );
-    let add = (addend != 0).then(|| {
-        if sub_q {
-            format!("    addq ${addend}, {r64}")
+    let (preload, scan, tail) = if aliased {
+        // The preload and the scan both live in `D`, so its width is the
+        // scan's: `movl $-1` would leave `0xffffffff` in a 64-bit `D` where a
+        // zero-source `bsrq` keeps it, and the `lea` below would add from
+        // that instead of from -1.
+        let d64 = REG_NAMES[0][d_fam as usize];
+        let (preload, scan) = if scan_q {
+            (
+                format!("    movq $-1, {d64}"),
+                format!("    bsrq {s}, {d64}"),
+            )
         } else {
-            format!("    addl ${addend}, {r32}")
-        }
-    });
+            (
+                format!("    movl $-1, {d}"),
+                format!("    bsrl {s}, {d}"),
+            )
+        };
+        // One instruction carries both the addend and the move out of `D`;
+        // with no addend that degrades to a plain move.
+        let tail = if addend == 0 {
+            format!("    mov{} {d}, {r}", if sub_q { 'q' } else { 'l' })
+        } else if sub_q {
+            format!("    leaq ${addend}({d64}), {r64}")
+        } else {
+            // An address-size 64 base is always encodable, and `leal` reads
+            // only the low half of it.
+            format!("    leal ${addend}({d64}), {r32}")
+        };
+        (preload, scan, Some(tail))
+    } else {
+        let preload = if sub_q {
+            format!("    movq $-1, {r64}")
+        } else {
+            format!("    movl $-1, {r32}")
+        };
+        let scan = format!(
+            "    bsr{} {s}, {}",
+            if scan_q { 'q' } else { 'l' },
+            REG_NAMES[size][r_fam as usize]
+        );
+        let add = (addend != 0).then(|| {
+            if sub_q {
+                format!("    addq ${addend}, {r64}")
+            } else {
+                format!("    addl ${addend}, {r32}")
+            }
+        });
+        (preload, scan, add)
+    };
     Some(HighbitSubRewrite {
         d_fam,
         preload,
         scan,
-        add,
+        tail,
     })
 }
 
@@ -1164,7 +1224,9 @@ mod highbit_sub_tests {
                 .iter()
                 .any(|l| l == "subl %esi, %eax")
         );
-        // The scan source is the result register.
+        // The scan source is the result register: not a refusal any more, and
+        // covered by `folds_an_aliased_highbit_through_the_dead_count`, but it
+        // must still not produce a preload into the source.
         let alias = [
             "movl $63, %esi",
             "bsrl %eax, %esi",
@@ -1172,7 +1234,16 @@ mod highbit_sub_tests {
             "movl $31, %eax",
             "subl %esi, %eax",
         ];
-        assert!(run(&body(&alias)).iter().any(|l| l == "subl %esi, %eax"));
+        let out = run(&body(&alias));
+        assert!(
+            !out.iter().any(|l| l == "movl $-1, %eax"),
+            "the aliased form must not preload the scan source: {out:?}"
+        );
+        // A dead count register that the subtraction does not clean through is
+        // still refused (the preload would have to reach R before the scan).
+        let mut wrong_src = HB32;
+        wrong_src[4] = "subl %esi, %edx";
+        assert!(run(&body(&wrong_src)).iter().any(|l| l == "subl %esi, %edx"));
         // A preload other than 2W-1 is not the zero-defined count.
         let mut wrong = HB32;
         wrong[0] = "movl $32, %esi";
@@ -1214,6 +1285,121 @@ mod highbit_sub_tests {
                 .any(|w| w == ["movq $-1, %rax", "bsrq %rdi, %rax", "addq $1, %rax"]),
             "{out:?}"
         );
+    }
+
+    /// The np2 body: `1u << (32 - __builtin_clz(x - 1))` as the emitter
+    /// writes it.  The shift count ends in `%ecx`, so the subtraction's
+    /// destination is the register the scan reads, and `%eax` is the count's
+    /// own accumulator, redefined by the shift's constant right after the
+    /// window -- which is what makes it dead there.
+    const NP2_32: [&str; 8] = [
+        "leal -1(%rdi), %ecx",
+        "movl $63, %eax",
+        "bsrl %ecx, %eax",
+        "xorl $31, %eax",
+        "movl $32, %ecx",
+        "subl %eax, %ecx",
+        "movl $1, %eax",
+        "shll %cl, %eax",
+    ];
+
+    #[test]
+    fn folds_an_aliased_highbit_through_the_dead_count() {
+        // Five instructions become three: the preload stays in the dead count
+        // register, and one `lea` carries both the addend and the move out.
+        let out = run(&body(&NP2_32));
+        assert_eq!(
+            out[2..out.len() - 3],
+            [
+                "leal -1(%rdi), %ecx",
+                "movl $-1, %eax",
+                "bsrl %ecx, %eax",
+                "leal $1(%rax), %ecx",
+                "movl $1, %eax",
+            ],
+            "{out:?}"
+        );
+        // The same at 64 bits, where the preload must be the whole register: a
+        // zero-source `bsrq` keeps all 64 bits of it, so `movl $-1` would add
+        // from 0xffff_ffff instead of from -1.
+        let out = run(&body(&[
+            "movl $127, %eax",
+            "bsrq %rcx, %rax",
+            "xorq $63, %rax",
+            "movq $64, %rcx",
+            "subq %rax, %rcx",
+            "movl $1, %eax",
+            "shlq %cl, %rax",
+        ]));
+        assert_eq!(
+            out[2..out.len() - 3],
+            [
+                "movq $-1, %rax",
+                "bsrq %rcx, %rax",
+                "leaq $1(%rax), %rcx",
+                "movl $1, %eax",
+            ],
+            "{out:?}"
+        );
+        // No addend: the plain highest-set-bit index, aliased, is one move.
+        let out = run(&body(&[
+            "movl $63, %eax",
+            "bsrl %ecx, %eax",
+            "xorl $31, %eax",
+            "movl $31, %ecx",
+            "subl %eax, %ecx",
+            "movl $1, %eax",
+            "shll %cl, %eax",
+        ]));
+        assert_eq!(
+            out[2..out.len() - 3],
+            [
+                "movl $-1, %eax",
+                "bsrl %ecx, %eax",
+                "movl %eax, %ecx",
+                "movl $1, %eax",
+            ],
+            "{out:?}"
+        );
+        // A negative addend (K = 0, `0 - clz`) is still one `lea`.
+        let out = run(&body(&[
+            "movl $63, %eax",
+            "bsrl %ecx, %eax",
+            "xorl $31, %eax",
+            "movl $0, %ecx",
+            "subl %eax, %ecx",
+            "movl $1, %eax",
+            "shll %cl, %eax",
+        ]));
+        assert!(out.iter().any(|l| l == "leal $-31(%rax), %ecx"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_an_aliased_highbit_with_live_flags_or_a_live_count() {
+        // `lea` defines no flags, so a consumer of the subtraction's flags
+        // keeps the original five-instruction window.
+        let out = run(&body(&[
+            "movl $63, %eax",
+            "bsrl %ecx, %eax",
+            "xorl $31, %eax",
+            "movl $32, %ecx",
+            "subl %eax, %ecx",
+            "sete %dl",
+            "movl $1, %eax",
+        ]));
+        assert!(out.iter().any(|l| l == "subl %eax, %ecx"), "{out:?}");
+        // A count read after the window keeps its producer.
+        let out = run(&body(&[
+            "movl $63, %eax",
+            "bsrl %ecx, %eax",
+            "xorl $31, %eax",
+            "movl $32, %ecx",
+            "subl %eax, %ecx",
+            "addl %eax, %edx",
+        ]));
+        // ... and the live-flags refusal above is the one that must hold even
+        // with a dead count, since the replacement's `lea` defines no flags.
+        assert!(out.iter().any(|l| l == "subl %eax, %ecx"), "{out:?}");
     }
 
     fn run_guarded(asm: &str) -> Vec<String> {

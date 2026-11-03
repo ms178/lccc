@@ -344,7 +344,7 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 526.54,
+      "predicted_gate_seconds": 531.04,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
@@ -501,6 +501,10 @@
           "name": "python3 tests/regression/check_narrow_count_runtime.py --run"
         },
         {
+          "measured_s": 4.2,
+          "name": "python3 tests/regression/check_count_builtins_runtime.py --run"
+        },
+        {
           "measured_s": 4.93,
           "name": "bash tests/regression/check_vec_dead_remainder.sh"
         },
@@ -531,6 +535,10 @@
         {
           "measured_s": 0.65,
           "name": "bash tests/regression/check_lowest_set_bit_fold.sh"
+        },
+        {
+          "measured_s": 0.3,
+          "name": "bash tests/regression/check_clz_zero_guard_fold.sh"
         },
         {
           "measured_s": 0.89,
