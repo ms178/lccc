@@ -8658,7 +8658,7 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         return None;
                     }
                 }
-                _ => unreachable!(),
+                _ => return None,
             }
             // Partial-width writes leave old register bits in place. They
             // cannot establish the complete repeated dividend or divisor.
