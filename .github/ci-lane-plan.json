@@ -3,7 +3,7 @@
     "backend-contracts-a": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 520.93,
+      "predicted_gate_seconds": 521.69,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard a of 2)",
       "steps": [
@@ -230,6 +230,10 @@
         {
           "measured_s": 2.03,
           "name": "python3 tests/regression/check_bit_width_runtime.py --run"
+        },
+        {
+          "measured_s": 0.76,
+          "name": "python3 tests/regression/check_narrow_count_runtime.py --run"
         },
         {
           "measured_s": 0.25,

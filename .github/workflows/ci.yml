@@ -2610,6 +2610,8 @@ jobs:
         # not merely assemble: freestanding AArch64/RISC-V checksums under QEMU,
         # with the fold enabled and disabled at every optimization level.
         python3 tests/regression/check_bit_width_runtime.py --run
+        # Preserve main's executed narrow-register count certification.
+        python3 tests/regression/check_narrow_count_runtime.py --run
         bash tests/regression/check_i686_got32x_relax.sh
         # `_mm_max_sd` / `_mm_min_sd` must be the single hardware `maxsd` /
         # `minsd` with Intel's second-operand-wins tie/NaN semantics bit-exact
