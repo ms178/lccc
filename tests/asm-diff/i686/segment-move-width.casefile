@@ -1,0 +1,39 @@
+;;; segment_moves_code32
+.text
+.code32
+mov %ds,%ax
+mov %ds,%eax
+movw %fs,%bx
+movl %gs,%ebx
+mov %ax,%ds
+mov %eax,%ds
+mov %ds,(%eax)
+mov (%eax),%ds
+
+;;; segment_moves_code16
+.text
+.code16
+mov %ds,%ax
+mov %ds,%eax
+movw %fs,%bx
+movl %gs,%ebx
+mov %ax,%ds
+mov %eax,%ds
+mov %ds,(%bx)
+mov (%bx),%ds
+
+;;; segment_bad_byte reject
+.text
+movb %ds,%al
+;;; segment_bad_vector reject
+.text
+mov %ds,%xmm0
+;;; segment_bad_width reject
+.text
+movw %ds,%eax
+;;; segment_bad_store_width reject
+.text
+movl %ds,(%eax)
+;;; segment_bad_load_width reject
+.text
+movl (%eax),%ds

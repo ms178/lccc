@@ -330,16 +330,24 @@ fn code16_encode_inner(
 
     let instr_len = encoder.bytes.len();
     let jump = {
-        let mnem = &instr.mnemonic;
-        let is_jump = mnem.starts_with('j') && mnem.len() >= 2;
+        let mnem: &str = instr.mnemonic.strip_suffix(".s").unwrap_or(&instr.mnemonic);
+        let is_jump = mnem == "loop" || (mnem.starts_with('j') && mnem.len() >= 2);
         if is_jump && instr.operands.len() == 1 {
             if let Operand::Label(_) = &instr.operands[0] {
                 let is_conditional = mnem != "jmp";
+                let is_short_only = matches!(mnem, "jecxz" | "jcxz" | "loop");
+                let has_67_head = instr_len == 3 && encoder.bytes[0] == 0x67;
                 // In 16-bit mode a near jump carries a 16-bit
                 // displacement, so the long forms are one byte shorter
                 // than in 32-bit mode.
                 let expected_len = if is_conditional { 4 } else { 3 };
-                if instr_len == expected_len {
+                if is_short_only && (instr_len == 2 || has_67_head) {
+                    Some(JumpDetection {
+                        is_conditional,
+                        already_short: true,
+                        prefix66: false,
+                    })
+                } else if instr_len == expected_len {
                     Some(JumpDetection {
                         is_conditional,
                         already_short: false,

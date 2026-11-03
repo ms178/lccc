@@ -402,8 +402,54 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// Load an offset and segment selector from a far pointer in memory.
+    pub(super) fn encode_load_far_pointer(
+        &mut self,
+        ops: &[Operand],
+        mnemonic: &str,
+    ) -> Result<(), String> {
+        let [source, Operand::Register(dst)] = ops else {
+            return Err("far pointer load requires memory and a register".to_string());
+        };
+        let width = match dst.name.as_str() {
+            "ax" | "cx" | "dx" | "bx" | "sp" | "bp" | "si" | "di" => 2,
+            "eax" | "ecx" | "edx" | "ebx" | "esp" | "ebp" | "esi" | "edi" => 4,
+            _ => return Err("invalid far pointer destination".to_string()),
+        };
+        if (mnemonic.ends_with('w') && width != 2)
+            || (mnemonic.ends_with('l') && width != 4)
+        {
+            return Err("far pointer destination width mismatch".to_string());
+        }
+        let mut normalized;
+        let source = if matches!(source, Operand::Label(_)) {
+            normalized = source.clone();
+            normalize_bare_label(&mut normalized);
+            &normalized
+        } else {
+            source
+        };
+        let Operand::Memory(mem) = source else {
+            return Err("far pointer load requires memory".to_string());
+        };
+        let dst_num = reg_num(&dst.name).ok_or("invalid far pointer destination")?;
+        self.sized_op = true;
+        if width == 2 {
+            self.bytes.push(0x66);
+        }
+        match &mnemonic[..3] {
+            "les" => self.bytes.push(0xC4),
+            "lds" => self.bytes.push(0xC5),
+            "lss" => self.bytes.extend_from_slice(&[0x0F, 0xB2]),
+            "lfs" => self.bytes.extend_from_slice(&[0x0F, 0xB4]),
+            "lgs" => self.bytes.extend_from_slice(&[0x0F, 0xB5]),
+            _ => return Err("unknown far pointer load".to_string()),
+        }
+        self.encode_modrm_mem(dst_num, mem)
+    }
+
     /// Encode MOV to/from segment register
-    pub(super) fn encode_mov_seg(&mut self, ops: &[Operand]) -> Result<(), String> {
+    pub(super) fn encode_mov_seg(&mut self, ops: &[Operand], size: u8) -> Result<(), String> {
         if ops.len() != 2 {
             return Err("mov seg requires 2 operands".to_string());
         }
@@ -420,18 +466,34 @@ impl super::InstructionEncoder {
             }
         };
 
+        let gp_num = |name: &str| -> Result<u8, String> {
+            if !matches!(
+                name,
+                "ax" | "cx" | "dx" | "bx" | "sp" | "bp" | "si" | "di"
+                    | "eax" | "ecx" | "edx" | "ebx" | "esp" | "ebp" | "esi" | "edi"
+            ) || reg_size(name) != size
+            {
+                return Err("invalid general register for segment move".to_string());
+            }
+            reg_num(name).ok_or_else(|| "invalid general register for segment move".to_string())
+        };
+
         match (&ops[0], &ops[1]) {
             // mov %sreg, %reg32
             (Operand::Register(src), Operand::Register(dst)) if is_segment_reg(&src.name) => {
                 let sr = seg_num(&src.name).ok_or("bad segment register")?;
-                let gp = reg_num(&dst.name).ok_or("bad register")?;
+                let gp = gp_num(&dst.name)?;
+                self.sized_op = true;
+                if size == 2 {
+                    self.bytes.push(0x66);
+                }
                 self.bytes.push(0x8C);
                 self.bytes.push(self.modrm(3, sr, gp));
                 Ok(())
             }
             // mov %reg32, %sreg
             (Operand::Register(src), Operand::Register(dst)) if is_segment_reg(&dst.name) => {
-                let gp = reg_num(&src.name).ok_or("bad register")?;
+                let gp = gp_num(&src.name)?;
                 let sr = seg_num(&dst.name).ok_or("bad segment register")?;
                 self.bytes.push(0x8E);
                 self.bytes.push(self.modrm(3, sr, gp));
@@ -439,12 +501,18 @@ impl super::InstructionEncoder {
             }
             // mov %sreg, mem
             (Operand::Register(src), Operand::Memory(mem)) if is_segment_reg(&src.name) => {
+                if size != 2 {
+                    return Err("segment memory move requires word size".to_string());
+                }
                 let sr = seg_num(&src.name).ok_or("bad segment register")?;
                 self.bytes.push(0x8C);
                 self.encode_modrm_mem(sr, mem)
             }
             // mov mem, %sreg
             (Operand::Memory(mem), Operand::Register(dst)) if is_segment_reg(&dst.name) => {
+                if size != 2 {
+                    return Err("segment memory move requires word size".to_string());
+                }
                 let sr = seg_num(&dst.name).ok_or("bad segment register")?;
                 self.bytes.push(0x8E);
                 self.encode_modrm_mem(sr, mem)

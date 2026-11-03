@@ -1509,6 +1509,13 @@ impl InstructionEncoder {
             "movsb" if !ops.is_empty() => self.encode_movsx_infer_dst(ops, 1),
             "movsw" if !ops.is_empty() => self.encode_movsx_infer_dst(ops, 2),
 
+            // Far-pointer loads select the offset width from the destination;
+            // the segment selector is always the following 16-bit field.
+            "les" | "lesw" | "lesl" | "lds" | "ldsw" | "ldsl" | "lfs" | "lfsw"
+            | "lfsl" | "lgs" | "lgsw" | "lgsl" | "lss" | "lssw" | "lssl" => {
+                self.encode_load_far_pointer(ops, mnemonic)
+            }
+
             // LEA. The operand-size override participates in the .code16
             // inversion like any size choice: `leal` is 32-bit (66 8d, with
             // 67 when the address needs 32 bits — GAS: `67 66 8d`), `leaw`
@@ -1707,11 +1714,14 @@ impl InstructionEncoder {
                 }
                 match &ops[0] {
                     Operand::Label(_) => {
-                        // E3 cb - Jump short if ECX register is 0. The
-                        // target is resolved by the short-jump patch pass
-                        // (real R_386_PC8 for undefined targets, folded
-                        // displacement for locals); a leading 0x67 from
-                        // the `addr16` word is accounted by the detector.
+                        // The short-jump patch pass resolves the target
+                        // (R_386_PC8 for undefined targets, a folded
+                        // displacement for locals), including the prefix.
+                        // E3 selects CX or ECX through the address-size
+                        // attribute, not the operand-size attribute.
+                        if (mnemonic == "jcxz") != self.code16 {
+                            self.bytes.push(0x67);
+                        }
                         self.bytes.extend_from_slice(&[0xE3, 0x00]);
                         Ok(())
                     }
@@ -1774,8 +1784,12 @@ impl InstructionEncoder {
                 }
                 if ops.is_empty() {
                     self.bytes.push(0xC3);
-                } else if let Some(Operand::Immediate(ImmediateValue::Integer(val))) = ops.first() {
-                    // ret $imm16 - pop return address and deallocate imm16 bytes
+                } else if let [Operand::Immediate(ImmediateValue::Integer(val))] = ops.as_slice() {
+                    // GAS accepts the union of signed and unsigned 16-bit
+                    // values; truncating anything else changes stack cleanup.
+                    if !(-32768..=65535).contains(val) {
+                        return Err("ret immediate out of range".to_string());
+                    }
                     self.bytes.push(0xC2);
                     self.bytes.extend_from_slice(&(*val as u16).to_le_bytes());
                 } else {
