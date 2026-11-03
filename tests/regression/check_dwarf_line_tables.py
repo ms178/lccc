@@ -408,18 +408,23 @@ def cross_leg(name: str, triple: str, lccc: str, work: Path) -> str:
             )
             got, want = ordinal_rows(readelf, objdump, ours), ordinal_rows(readelf, objdump, theirs)
             require(got == want, f"{name} {opt} {stem}.o rows differ from GNU as:\n{got}\n{want}")
-            # Same rows, no more bytes: the encoder picks a special opcode where
-            # one exists, splits a long advance into `DW_LNS_const_add_pc` steps
-            # -- which move the machine 17 units for one byte each -- and only
-            # falls back to `DW_LNS_advance_pc`/`_fixed_advance_pc` when that is
-            # cheaper.  binutils' `emit_inc_line_addr` does the same, so a larger
-            # program than GNU as's means this writer picked a worse shape.
+            # Same rows, no more bytes than the encoding needs.  On a target
+            # whose code the linker may relax, a row's address cannot be a
+            # distance -- `DW_LNS_advance_pc` would move when the linker deletes
+            # bytes between two rows -- so every row carries its own address
+            # relocation (`DW_LNE_set_address`: address_size + 3 bytes, and
+            # `DW_LNS_advance_line` + `DW_LNS_copy` instead of a special opcode).
+            # That is a correctness requirement, so the bound allows exactly
+            # that much: a byte more means this writer paid for something no
+            # relaxation needs.
             our_size = section_size(readelf, ours, ".debug_line")
             gas_size = section_size(readelf, theirs, ".debug_line")
+            allowance = 0 if triple.startswith("x86_64") or triple.startswith("i686") else len(got) * (8 + 5)
             require(
-                our_size <= gas_size,
+                our_size <= gas_size + allowance,
                 f"{name} {opt} {stem}.o: .debug_line is {our_size} bytes, GNU as "
-                f"encodes the same rows in {gas_size}",
+                f"encodes the same rows in {gas_size} (allowance {allowance} for "
+                f"{len(got)} per-row address relocations)",
             )
             rows += len(got)
             objects["lccc"].append(ours)

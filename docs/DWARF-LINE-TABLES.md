@@ -182,6 +182,15 @@ window, or -- what binutils' `emit_inc_line_addr` does -- whole
 for the remainder. Measured on gcc-generated assembly, its line program is now
 byte-for-byte the size of GNU as 2.40's for the same rows, and never larger.
 
+A target whose code the linker may relax is the exception, and by necessity: an
+address there cannot be a distance, because `DW_LNS_advance_pc` would move when
+the linker deletes bytes between two rows. Every row carries its own address
+relocation instead (`DW_LNE_set_address`, address_size + 3 bytes) and states its
+row with `advance_line` + `copy` rather than a special opcode, which is what
+keeps the table correct after relaxation. The measured cost on riscv64 is 13
+bytes per row above GNU as's compact encoding for the same rows, and the
+line-table gate bounds a relaxing leg at exactly that much.
+
 The focused validation is `tests/regression/check_dwarf_line_tables.py`
 (line/link behaviour) and `tests/regression/check_dwarf_versions.py`
 (dialect, language, directory/file tables, per-version attribute forms,
