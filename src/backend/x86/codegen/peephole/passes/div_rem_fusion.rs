@@ -231,14 +231,21 @@ mod tests {
         let (changed, fused) = apply(body);
         assert!(changed);
         assert_eq!(fused.matches("divq").count(), 1);
+        let signed_body = body
+            .replace("xorq %rdx, %rdx", "cqto")
+            .replace("divq", "idivq");
+        let (signed_changed, signed_fused) = apply(&signed_body);
+        assert!(signed_changed);
+        assert_eq!(signed_fused.matches("idivq").count(), 1);
         let dir = std::env::temp_dir().join(format!("lccc_div_fusion_exec_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let asm = format!(
-            ".text\n.globl original\noriginal:\nmovq %rdi, -8(%rsp)\n{body}\n.globl fused\nfused:\nmovq %rdi, -8(%rsp)\n{fused}\n.section .note.GNU-stack,\"\",@progbits\n"
+            ".text\n.globl original\noriginal:\nmovq %rdi, -8(%rsp)\n{body}\n.globl fused\nfused:\nmovq %rdi, -8(%rsp)\n{fused}\n.globl original_signed\noriginal_signed:\nmovq %rdi, -8(%rsp)\n{signed_body}\n.globl fused_signed\nfused_signed:\nmovq %rdi, -8(%rsp)\n{signed_fused}\n.section .note.GNU-stack,\"\",@progbits\n"
         );
         let driver = r#"
 #include <stdint.h>
 uint64_t original(uint64_t, uint64_t), fused(uint64_t, uint64_t);
+uint64_t original_signed(int64_t, int64_t), fused_signed(int64_t, int64_t);
 int main(void) {
     uint64_t x = 0x123456789abcdef0ULL;
     for (int i = 0; i < 100000; ++i) {
@@ -246,6 +253,13 @@ int main(void) {
         uint64_t d = (x >> 32) | 1;
         uint64_t expected = (x / d) ^ (x % d);
         if (original(x, d) != expected || fused(x, d) != expected) return 1;
+        int64_t numerator = (int64_t)x;
+        int64_t divisor = (int64_t)d;
+        if (x & 2) divisor = -divisor;
+        if (divisor == -1) divisor = -3;
+        uint64_t signed_expected = (uint64_t)(numerator / divisor) ^ (uint64_t)(numerator % divisor);
+        if (original_signed(numerator, divisor) != signed_expected ||
+            fused_signed(numerator, divisor) != signed_expected) return 2;
     }
     return 0;
 }
