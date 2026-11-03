@@ -17,6 +17,9 @@
 #     a select formed by cfg_simplify at the end of an iteration now wakes
 #     the select-shape passes in the next one -- and x86-64 then turns the
 #     identity into GCC's and Clang's `mov; neg; cmovs` (`abs_cmov`).
+#   * AArch64 spells the identity as GCC's and Clang's `cmp; cneg ..., lt`
+#     (two instructions, written straight into the copy-out register) when
+#     the mask, the XOR temporary and the flags are dead after it.
 #   * AArch64 leaves every function holding inline assembly as emitted: its
 #     peephole deleted the `movz x8, #64` and `movz x2, #17` feeding an
 #     `svc 0` because no later line named x8/x2 before the next system call
@@ -37,7 +40,7 @@ bindir=$(CDPATH= cd -- "$(dirname -- "$CCC")" && pwd)
 tmp=${TMPDIR:-/tmp}/lccc-cross-alu-abs.$$
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp"
-want=432d112575bf3b5f
+want=eb454492e94d5b45
 fail=0
 note() { printf '%s\n' "$*"; }
 bad() { printf 'FAIL: %s\n' "$*" >&2; fail=1; }
@@ -152,6 +155,11 @@ NI i32 abs_ge(i32 x) { return x >= 0 ? x : -x; }
 NI i64 abs64(i64 x) { return x < 0 ? -x : x; }
 NI i32 abs_plus(i32 x) { return (x < 0 ? -x : x) + x; }
 NI i32 absdiff(i32 a, i32 b) { return a > b ? a - b : b - a; }
+/* Narrow operands: compared at their own width, negated promoted. */
+NI i32 abs_s16(short x) { return x < 0 ? -x : x; }
+NI short abs_s16r(short x) { return x < 0 ? -x : x; }
+NI i32 abs_s8(signed char x) { return x < 0 ? -x : x; }
+NI i32 absdiff16(short a, short b) { return a > b ? a - b : b - a; }
 /* One step away: not a magnitude. */
 NI i32 not_abs(i32 x) { return x < 1 ? x : -x; }
 NI i32 neg_abs(i32 x) { return x < 0 ? x : -x; }
@@ -189,6 +197,9 @@ static void run(u64 v) {
     if (y != (i64)0x8000000000000000ull)
         mix((u64)abs64(y));
     mix((u64)absdiff(x / 4, (i32)(v >> 40) / 4));
+    /* Every narrow input is defined: the negation runs on the promoted int. */
+    mix((u64)abs_s16((short)v)); mix((u64)abs_s16r((short)v));
+    mix((u64)abs_s8((signed char)v)); mix((u64)absdiff16((short)v, (short)(v >> 24)));
 }
 
 static void put_hex(u64 v) {
@@ -303,6 +314,12 @@ for opt in -O2 -Os; do
     # One step away from a magnitude: no identity, no neg/cmovs pair.
     lacks "$tmp/x$opt.s" not_abs 'sarl'
     lacks "$tmp/x$opt.s" neg_abs 'sarl'
+    # Narrow operands: the promoted value's `neg; cmovs`, no compare left.
+    for f in abs_s16 abs_s16r abs_s8 absdiff16; do
+        has "$tmp/x$opt.s" "$f" '^cmovs '
+        lacks "$tmp/x$opt.s" "$f" '^(test|cmp)[bwlq]? '
+    done
+    expect_body "$tmp/x$opt.s" abs_s16 'movswl %di, %esi;movl %esi, %eax;negl %eax;cmovs %esi, %eax;ret'
 done
 CCC_PEEPHOLE_SKIP=abs_cmov "$CCC" -O2 -S "$tmp/t.c" -o "$tmp/x-noabs.s"
 has "$tmp/x-noabs.s" abs_lt 'sarl \$31'
@@ -330,8 +347,10 @@ if [ -x "$bindir/lccc-riscv" ]; then
     # `(int)(x >> 3)`: the short `srai` is no sext32 producer.
     has "$rv" trunc_sra '^sext\.w '
     # The identity reaches RISC-V: no branch, a sign mask.
-    has "$rv" abs_lt '^sraiw [a-z0-9]+, [a-z0-9]+, 31$'
-    lacks "$rv" abs_lt '^(beqz|bnez|beq|bne|blt|bge|j) '
+    for f in abs_lt abs_s16 abs_s8; do
+        has "$rv" "$f" '^sraiw [a-z0-9]+, [a-z0-9]+, 31$'
+        lacks "$rv" "$f" '^(beqz|bnez|beq|bne|blt|bge|j) '
+    done
 fi
 if [ -x "$bindir/lccc-arm" ]; then
     a64="$tmp/a64.s"
@@ -340,8 +359,13 @@ if [ -x "$bindir/lccc-arm" ]; then
     sed -n '/^entry:/,/^\.size entry/p' "$a64" > "$tmp/entry.s"
     grep -q 'movz x8, #64' "$tmp/entry.s" || bad "AArch64 entry lost the write number (x8 = 64)"
     grep -q 'movz x8, #93' "$tmp/entry.s" || bad "AArch64 entry lost the exit number (x8 = 93)"
-    has "$a64" abs_lt '^asr '
-    lacks "$a64" abs_lt '^(csel|cset|cneg) '
+    # The identity becomes GCC's and Clang's compare + conditional negate,
+    # written straight into the result register (no shift mask, no XOR).
+    for f in abs_lt abs_le abs_gt abs_ge abs_s16 abs_s8; do
+        has "$a64" "$f" '^cneg w0, w[0-9]+, lt$'
+        lacks "$a64" "$f" '^(asr|eor) '
+    done
+    has "$a64" abs64 '^cneg x0, x[0-9]+, lt$'
 fi
 if [ -x "$bindir/lccc-i686" ]; then
     i686="$tmp/i686.s"
@@ -351,4 +375,4 @@ if [ -x "$bindir/lccc-i686" ]; then
 fi
 
 [ "$fail" -eq 0 ] || exit 1
-echo "check_cross_alu_abs_runtime: PASS (one digest on x86-64, i686, RISC-V and AArch64; I-type selection, sext32 producers, sign-magnitude on every target, abs_cmov, AArch64 inline-asm quarantine)"
+echo "check_cross_alu_abs_runtime: PASS (one digest on x86-64, i686, RISC-V and AArch64; I-type selection, sext32 producers, sign-magnitude on every target, abs_cmov, AArch64 cneg, AArch64 inline-asm quarantine)"
