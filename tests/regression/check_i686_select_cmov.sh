@@ -16,7 +16,14 @@ set -uo pipefail
 CCC=${CCC:-./target/fastbuild/lccc}
 GCC=${GCC:-gcc-16}
 command -v "$GCC" >/dev/null 2>&1 || GCC=gcc
-SRC="$(dirname "$0")/i686_select_cmov_diff.c"
+# The corpus fixture lives in a subdirectory on purpose: it is a freestanding
+# `_start` program (no 32-bit libc here), and both regression corpus runners
+# glob tests/regression/*.c non-recursively and compile each file as a hosted
+# program. A root-level `_start` TU collides with crt1.o's `_start` at link
+# time ("multiple definition of `_start`"), so the non-recursive glob must not
+# see it — this gate script is its only consumer. See run_regression.py's
+# corpus_contract_hint / discover().
+SRC="$(dirname "$0")/i686_select_cmov/i686_select_cmov_diff.c"
 TMP=${TMPDIR:-/tmp}/lccc-selcmov.$$
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP"
