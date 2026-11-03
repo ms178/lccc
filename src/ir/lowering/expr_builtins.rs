@@ -1381,6 +1381,7 @@ impl Lowerer {
             BuiltinIntrinsic::StackSave => self.lower_builtin_stack_save(args),
             BuiltinIntrinsic::StackRestore => self.lower_builtin_stack_restore(args),
             BuiltinIntrinsic::Cexpi => self.lower_builtin_cexpi(args),
+            BuiltinIntrinsic::Cpow => self.lower_builtin_cpow(args),
             BuiltinIntrinsic::Gcc16GenericBit => self.lower_gcc16_generic_bit_builtin(name, args),
             BuiltinIntrinsic::Gcc16Carry => self.lower_gcc16_carry_builtin(name, args),
             BuiltinIntrinsic::Gcc16BswapBitrev => self.lower_gcc16_bswap_bitrev_builtin(name, args),

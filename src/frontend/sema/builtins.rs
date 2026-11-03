@@ -4,6 +4,7 @@
 //! We map these to their standard library equivalents so the linker can resolve them.
 
 use crate::common::fx_hash::FxHashMap;
+use crate::common::types::{CType, PtrQuals};
 use std::sync::LazyLock;
 
 /// Static mapping of __builtin_* names to their libc equivalents.
@@ -59,6 +60,7 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         ("__builtin_ilogb", "ilogb"),
         ("__builtin_modf", "modf"),
         ("__builtin_modff", "modff"),
+        ("__builtin_strncasecmp", "strncasecmp"),
     ] {
         m.insert(builtin, BuiltinInfo::simple(libc_name));
     }
@@ -80,6 +82,10 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert(
         "__builtin_cexpi",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::Cexpi),
+    );
+    m.insert(
+        "__builtin_cpow",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::Cpow),
     );
 
     // Math functions
@@ -3698,6 +3704,12 @@ pub enum BuiltinIntrinsic {
     /// sin/cos calls, and constructed in LCCC's pointer-backed complex form so
     /// no target's complex-return ABI is involved.
     Cexpi,
+    /// GCC `__builtin_cpow(x, y)` -> `_Complex double` via libm `cpow`.
+    /// Complex values are pointer-backed in LCCC while libm uses the target's
+    /// complex ABI, so this intrinsic decomposes both operands into F64
+    /// scalars and handles x86-64's xmm0/xmm1 return and i686's hidden sret
+    /// separately.
+    Cpow,
     /// GCC 16.2 type-generic bit builtins (`__builtin_{clzg,ctzg,popcountg,parityg,ffsg,clrsbg}`)
     Gcc16GenericBit,
     /// GCC / Clang unsigned carry/borrow chain builtins (`__builtin_{addc,subc}{b,s,,l,ll}`)
@@ -4340,13 +4352,14 @@ pub fn gcc_compat_builtin_ctype(name: &str) -> Option<CType> {
     let void_ptr = || CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC);
     let char_ptr = || CType::Pointer(Box::new(CType::Char), PtrQuals::GENERIC);
     match name {
-        "bcmp" | "__builtin_bcmp" | "__builtin_memcmp_eq" | "__builtin_ilogb" => Some(CType::Int),
+        "bcmp" | "__builtin_bcmp" | "__builtin_memcmp_eq" | "__builtin_ilogb"
+        | "__builtin_strncasecmp" => Some(CType::Int),
         "__builtin_bzero" | "__builtin_stack_restore" => Some(CType::Void),
         "strdup" | "strndup" | "__builtin_strdup" | "__builtin_strndup" => Some(char_ptr()),
         "__builtin_stack_save" => Some(void_ptr()),
         "__builtin_modff" => Some(CType::Float),
         "__builtin_modf" => Some(CType::Double),
-        "__builtin_cexpi" => Some(CType::ComplexDouble),
+        "__builtin_cexpi" | "__builtin_cpow" => Some(CType::ComplexDouble),
         _ => None,
     }
 }
@@ -4509,6 +4522,8 @@ mod gcc17_torture_builtin_tests {
             "__builtin_stack_save",
             "__builtin_stack_restore",
             "__builtin_cexpi",
+            "__builtin_cpow",
+            "__builtin_strncasecmp",
         ] {
             assert!(is_builtin(name), "{name} is not registered");
             assert!(resolve_builtin(name).is_some(), "{name} has no info");
@@ -4526,13 +4541,19 @@ mod gcc17_torture_builtin_tests {
             "__builtin_stack_save",
             "__builtin_stack_restore",
             "__builtin_cexpi",
+            "__builtin_cpow",
         ] {
             assert!(matches!(
                 resolve_builtin(name).map(|b| &b.kind),
                 Some(BuiltinKind::Intrinsic(_))
             ), "{name} must not forward to a libc symbol");
         }
-        for name in ["__builtin_bcmp", "__builtin_bzero", "__builtin_modff"] {
+        for name in [
+            "__builtin_bcmp",
+            "__builtin_bzero",
+            "__builtin_modff",
+            "__builtin_strncasecmp",
+        ] {
             assert!(matches!(
                 resolve_builtin(name).map(|b| &b.kind),
                 Some(BuiltinKind::LibcAlias(_))
