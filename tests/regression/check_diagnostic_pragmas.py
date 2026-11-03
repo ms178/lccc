@@ -130,6 +130,43 @@ int f(void) { return 0; }
     return checks
 
 
+def check_diagnostic_execution_order(root: Path, lccc: list[str], gcc: list[str]) -> int:
+    # Never sort these records. Includes/#line can revisit the same location;
+    # payload collection order, not filename/line sorting, determines emission.
+    (root / 'ordered.h').write_text('#line 40 "virtual.h"\n#warning ORDER_B\n')
+    cases = {
+        'mixed': '#warning ORDER_A\n#pragma GCC warning "ORDER_B"\n#warning ORDER_C\n',
+        'notes': '#pragma message "ORDER_A"\n#warning ORDER_B\n#pragma message "ORDER_C"\n',
+        'includes': '#warning ORDER_A\n#include "ordered.h"\n#pragma GCC warning "ORDER_C"\n#include "ordered.h"\n',
+        'date': '#pragma message ("ORDER_A " __DATE__)\n#warning ORDER_B\n',
+        'nested': '#pragma message _Pragma("GCC warning \\"ORDER_A\\"") "ORDER_B"\n#warning ORDER_C\n',
+    }
+    def records(proc):
+        found = []
+        for level, text in re.findall(r'^(?:.*?:\d+:(?:\d+:)?|cc1:)\s*(warning|error|note):([^\n]*)', proc.stderr, re.M):
+            marker = next((m for m in ('ORDER_A', 'ORDER_B', 'ORDER_C', "macro '__DATE__'") if m in text), None)
+            if marker:
+                found.append((level, marker))
+        return proc.returncode != 0, found
+    checks = 0
+    for name, text in cases.items():
+        source = root / f'ordered-{name}.c'
+        source.write_text(text + 'int ordered_value;\n')
+        for mode in ('-E', '-fsyntax-only', '-c'):
+            for flags in ([], ['-Werror'], ['-w']):
+                args = ['-Wdate-time', *flags, mode, str(source), '-o', str(root / 'ordered-out')]
+                reference = subprocess.run(gcc + args, capture_output=True, text=True, timeout=30)
+                expected = records(reference)
+                for suffix in ('', '-i686', '-arm', '-riscv'):
+                    command = [lccc[0] + suffix, *lccc[1:]]
+                    proc = subprocess.run(command + args, capture_output=True, text=True, timeout=30)
+                    if records(proc) != expected:
+                        raise RuntimeError(f'diagnostic order {name}/{mode}/{flags}/{suffix}: '
+                                           f'{records(proc)} != {expected}\nGCC:\n{reference.stderr}\nLCCC:\n{proc.stderr}')
+                    checks += 1
+    return checks
+
+
 def check_message_preprocess_roundtrip(root: Path, lccc: list[str], gcc: list[str]) -> int:
     source = root / 'message-roundtrip.c'
     source.write_text('''#define S_(x) #x
@@ -246,6 +283,7 @@ def run(lccc: list[str], gcc: list[str]) -> None:
             print(f'PASS diagnostic pragma {name}')
         checks += check_message_scope_composition(root, lccc, gcc)
         checks += check_message_preprocess_roundtrip(root, lccc, gcc)
+        checks += check_diagnostic_execution_order(root, lccc, gcc)
     print(f'diagnostic pragmas: PASS ({checks} four-target mode checks against GCC {version})')
 
 

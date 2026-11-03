@@ -93,3 +93,28 @@ and generator/compiler/executable failure paths. Failed generation cannot
 publish a partial header; temporary headers live beside their destination so
 publication uses a same-filesystem rename even if OUT is elsewhere. These
 mocked shell tests complement, rather than replace, the actual boot build.
+
+## Ordered warning/pragma stream follow-up
+
+The ordering defect described above is now repaired. A compact execution-order
+index stream refers to existing warning/pragma payloads and warning snapshots;
+it does not duplicate messages or sort filenames/locations. Message operand
+effects are drained before recording that message, preserving date-time and
+nested-pragma order. All five driver paths use the same dispatcher and retain
+C-frontend phase filtering. This addresses warnings/pragmas, not the separate
+hard preprocessing-error paths.
+
+Validation: 594 four-target mode checks against GCC16.2, frontend-preprocessor
+rules, 7,803 library tests (zero failures, ten existing ignores), all-target
+warnings-denied Clippy and unchanged audit census. The old executable fails
+the new order regression first/third/second versus GCC first/second/third.
+The 180 new checks preserve ordering under promotion/suppression, notes,
+repeated includes and #line, date-time operands and nested _Pragma operands.
+The nested GCC note can have a `cc1:` prefix without a location; the comparison
+includes it rather than silently dropping that record.
+
+Hosted 7d78b07a7 passed all listed checks except the kernel check. Its real
+failure is now confirmed: assembly hash comments such as `#Setup` were
+incorrectly reported as unknown CPP directives and promoted by Kbuild's
+-Werror after assembly warning reporting was enabled. That classification
+needs its own repair; the unsupported warning/options diagnostics also remain.

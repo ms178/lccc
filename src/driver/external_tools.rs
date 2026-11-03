@@ -286,8 +286,7 @@ impl Driver {
                 diagnostics.set_warning_config(self.effective_warning_config());
                 diagnostics.set_color_mode(self.color_mode);
                 diagnostics.set_source_manager(source_manager);
-                self.emit_preprocessor_warnings(&preprocessor, &mut diagnostics);
-                Self::emit_pragma_diagnostics(&preprocessor, &mut diagnostics, false);
+                self.emit_preprocessor_diagnostics(&preprocessor, &mut diagnostics, false);
                 if diagnostics.has_errors() {
                     return Err(format!(
                         "{} preprocessor warning(s) promoted by -Werror in {}",

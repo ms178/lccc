@@ -1200,8 +1200,7 @@ impl Driver {
                     diagnostics.set_warning_config(self.effective_warning_config());
                     diagnostics.set_color_mode(self.color_mode);
                     diagnostics.set_source_manager(source_manager);
-                    self.emit_preprocessor_warnings(&preprocessor, &mut diagnostics);
-                    Self::emit_pragma_diagnostics(&preprocessor, &mut diagnostics, false);
+                    self.emit_preprocessor_diagnostics(&preprocessor, &mut diagnostics, false);
                     if diagnostics.has_errors() {
                         return Err(format!(
                             "{} preprocessor warning(s) promoted by -Werror in {}",
@@ -1252,49 +1251,58 @@ impl Driver {
     /// through `diagnostics` with their own warning categories, so leaf
     /// suppression, promotion and blanket -Werror apply in every mode.
     /// Shared by preprocessing, syntax-only and full compilation.
-    pub(super) fn emit_preprocessor_warnings(
+    pub(super) fn emit_preprocessor_diagnostics(
         &self,
-        preprocessor: &Preprocessor,
-        diagnostics: &mut DiagnosticEngine,
-    ) {
-        for (index, warn) in preprocessor.warnings().iter().enumerate() {
-            let diag = crate::common::error::Diagnostic::warning_with_kind(
-                warn.message.clone(),
-                warn.kind,
-            )
-            .with_location(&warn.file, warn.line, warn.col);
-            diagnostics.emit_with_warning_config(&diag, preprocessor.warning_config_at(index));
-        }
-    }
-
-    /// Emit the message pragmas' diagnostics in source order:
-    /// `#pragma GCC warning` as a warning no `-W` option controls, a
-    /// and, only on paths that parse C (`with_notes`), malformed messages
-    /// under `-Wpragmas` and well-formed `#pragma message` notes.
-    /// Both message classifications belong to GCC's C front end, not -E.
-    pub(super) fn emit_pragma_diagnostics(
         preprocessor: &Preprocessor,
         diagnostics: &mut DiagnosticEngine,
         with_notes: bool,
     ) {
-        use crate::common::error::{Diagnostic, WarningKind};
-        for entry in preprocessor.pragma_diagnostics() {
-            let d = &entry.diagnostic;
-            let diag = match entry.severity {
-                PragmaSeverity::Warning => Diagnostic::warning(d.message.clone()),
-                PragmaSeverity::PragmasWarning if with_notes => {
-                    Diagnostic::warning_with_kind(d.message.clone(), WarningKind::Pragmas)
+        use crate::frontend::preprocessor::pipeline::PreprocessorDiagnosticIndex;
+        for entry in preprocessor.diagnostic_order() {
+            match *entry {
+                PreprocessorDiagnosticIndex::Warning(index) => {
+                    let warn = &preprocessor.warnings()[index];
+                    let diag = crate::common::error::Diagnostic::warning_with_kind(
+                        warn.message.clone(),
+                        warn.kind,
+                    )
+                    .with_location(&warn.file, warn.line, warn.col);
+                    diagnostics
+                        .emit_with_warning_config(&diag, preprocessor.warning_config_at(index));
                 }
-                PragmaSeverity::PragmasWarning => continue,
-                PragmaSeverity::Note if with_notes => Diagnostic::note(d.message.clone()),
-                PragmaSeverity::Note => continue,
-            };
-            let diag = diag.with_location(&d.file, d.line, d.col);
-            if let Some(config) = entry.warning_config.as_deref() {
-                diagnostics.emit_with_warning_config(&diag, config);
-            } else {
-                diagnostics.emit(&diag);
+                PreprocessorDiagnosticIndex::Pragma(index) => {
+                    Self::emit_pragma_diagnostic(
+                        &preprocessor.pragma_diagnostics()[index],
+                        diagnostics,
+                        with_notes,
+                    );
+                }
             }
+        }
+    }
+
+    /// Apply C-frontend phase filtering without changing execution order.
+    fn emit_pragma_diagnostic(
+        entry: &crate::frontend::preprocessor::pipeline::PragmaDiagnostic,
+        diagnostics: &mut DiagnosticEngine,
+        with_notes: bool,
+    ) {
+        use crate::common::error::{Diagnostic, WarningKind};
+        let d = &entry.diagnostic;
+        let diag = match entry.severity {
+            PragmaSeverity::Warning => Diagnostic::warning(d.message.clone()),
+            PragmaSeverity::PragmasWarning if with_notes => {
+                Diagnostic::warning_with_kind(d.message.clone(), WarningKind::Pragmas)
+            }
+            PragmaSeverity::PragmasWarning => return,
+            PragmaSeverity::Note if with_notes => Diagnostic::note(d.message.clone()),
+            PragmaSeverity::Note => return,
+        };
+        let diag = diag.with_location(&d.file, d.line, d.col);
+        if let Some(config) = entry.warning_config.as_deref() {
+            diagnostics.emit_with_warning_config(&diag, config);
+        } else {
+            diagnostics.emit(&diag);
         }
     }
 
@@ -1380,8 +1388,7 @@ impl Driver {
             // gcc-16.2, which reports it in every mode, `-fsyntax-only`
             // included; `-Wcpp`/`-Wno-cpp`/`-Werror=cpp` control it here
             // for the same reason they do there).
-            self.emit_preprocessor_warnings(&preprocessor, &mut diagnostics);
-            Self::emit_pragma_diagnostics(&preprocessor, &mut diagnostics, true);
+            self.emit_preprocessor_diagnostics(&preprocessor, &mut diagnostics, true);
             self.emit_lexer_diagnostics(&mut lexer, &mut diagnostics);
             let mut parser = Parser::new(tokens);
             parser.set_diagnostics(diagnostics);
@@ -1523,8 +1530,7 @@ impl Driver {
             diagnostics.set_warning_config(self.effective_warning_config());
             diagnostics.set_color_mode(self.color_mode);
             diagnostics.set_source_manager(source_manager);
-            self.emit_preprocessor_warnings(&preprocessor, &mut diagnostics);
-            Self::emit_pragma_diagnostics(&preprocessor, &mut diagnostics, false);
+            self.emit_preprocessor_diagnostics(&preprocessor, &mut diagnostics, false);
             if diagnostics.has_errors() {
                 return Err(format!(
                     "{} preprocessor warning(s) promoted by -Werror in {}",
@@ -2443,8 +2449,7 @@ impl Driver {
 
         // Preserve the warning's category on every driver path, not just
         // -E and syntax-only. A -Wundef must never become a -Wcpp here.
-        self.emit_preprocessor_warnings(&preprocessor, &mut diagnostics);
-        Self::emit_pragma_diagnostics(&preprocessor, &mut diagnostics, true);
+        self.emit_preprocessor_diagnostics(&preprocessor, &mut diagnostics, true);
 
         // Check for #error directives and missing #include errors
         let pp_errors = preprocessor.errors();

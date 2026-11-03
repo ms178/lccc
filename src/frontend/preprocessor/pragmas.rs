@@ -214,6 +214,9 @@ impl Preprocessor {
         // `#pragma message "..."` / `#pragma message ("...")`.
         if let Some(operand) = strip_pragma_keyword(rest, "message") {
             let expanded = self.macros.expand_line(operand);
+            // Operand effects (e.g. -Wdate-time or a nested _Pragma) precede
+            // this message, including on assembly paths that discard it.
+            self.drain_expansion_effects();
             // Assembly mode expands the operand, but neither handles the
             // C-frontend message nor preserves its directive (GCC 16.2).
             if self.macros.asm_mode {
@@ -347,7 +350,7 @@ impl Preprocessor {
         if is_error {
             self.errors.push(diagnostic);
         } else {
-            self.pragma_diagnostics.push(PragmaDiagnostic {
+            self.push_pragma_diagnostic(PragmaDiagnostic {
                 severity: PragmaSeverity::Warning,
                 diagnostic,
                 warning_config: None,
@@ -364,7 +367,7 @@ impl Preprocessor {
     fn handle_pragma_message(&mut self, operand: &str, line_num: usize, col: usize) {
         let file = self.current_file();
         let mut push = |severity: PragmaSeverity, message: String| {
-            self.pragma_diagnostics.push(PragmaDiagnostic {
+            self.push_pragma_diagnostic(PragmaDiagnostic {
                 severity,
                 warning_config: matches!(severity, PragmaSeverity::PragmasWarning)
                     .then(|| Box::new(self.diagnostic_pragmas.current.clone())),

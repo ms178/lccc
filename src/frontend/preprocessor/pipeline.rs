@@ -85,6 +85,14 @@ pub struct PragmaDiagnostic {
     pub warning_config: Option<Box<crate::common::error::WarningConfig>>,
 }
 
+/// Execution order across the independently stored warning and pragma payloads.
+/// File/line sorting is invalid across includes, repeated includes and #line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreprocessorDiagnosticIndex {
+    Warning(usize),
+    Pragma(usize),
+}
+
 pub struct Preprocessor {
     pub(super) macros: MacroTable,
     conditionals: ConditionalStack,
@@ -95,6 +103,7 @@ pub struct Preprocessor {
     pub(super) warnings: Vec<PreprocessorDiagnostic>,
     pub(super) diagnostic_pragmas: crate::common::diagnostic_pragma::DiagnosticPragmas,
     warning_configs: Vec<crate::common::error::WarningConfig>,
+    diagnostic_order: Vec<PreprocessorDiagnosticIndex>,
     /// Diagnostics of the message pragmas (`#pragma GCC warning`,
     /// `#pragma message`), in source order; see [`PragmaDiagnostic`].
     pub(super) pragma_diagnostics: Vec<PragmaDiagnostic>,
@@ -202,6 +211,7 @@ impl Preprocessor {
                 crate::common::error::WarningConfig::new(),
             ),
             warning_configs: Vec::new(),
+            diagnostic_order: Vec::new(),
             pragma_diagnostics: Vec::new(),
             include_paths: Vec::new(),
             quote_include_paths: Vec::new(),
@@ -1105,7 +1115,21 @@ impl Preprocessor {
     pub(super) fn push_warning(&mut self, warning: PreprocessorDiagnostic) {
         self.warning_configs
             .push(self.diagnostic_pragmas.current.clone());
+        self.diagnostic_order
+            .push(PreprocessorDiagnosticIndex::Warning(self.warnings.len()));
         self.warnings.push(warning);
+    }
+
+    pub(super) fn push_pragma_diagnostic(&mut self, diagnostic: PragmaDiagnostic) {
+        self.diagnostic_order
+            .push(PreprocessorDiagnosticIndex::Pragma(
+                self.pragma_diagnostics.len(),
+            ));
+        self.pragma_diagnostics.push(diagnostic);
+    }
+
+    pub fn diagnostic_order(&self) -> &[PreprocessorDiagnosticIndex] {
+        &self.diagnostic_order
     }
 
     /// Get preprocessing warnings.
@@ -1329,7 +1353,7 @@ impl Preprocessor {
     /// (C99 §6.10.9: `_Pragma("foo")` behaves like `#pragma foo` at that
     /// point). Called after every expansion pass so pragma effects
     /// (push_macro/pop_macro, weak, visibility, ...) apply in source order.
-    fn drain_expansion_effects(&mut self) {
+    pub(super) fn drain_expansion_effects(&mut self) {
         for effect in self.macros.take_pending_effects() {
             match effect {
                 super::macro_defs::ExpansionEffect::Pragma(content, line) => {
@@ -1929,5 +1953,64 @@ mod define_macro_tests {
         let _ = pp.preprocess("#define FOO expanded_wrongly\n#error FOO must stay literal\n");
         assert_eq!(pp.errors().len(), 1);
         assert_eq!(pp.errors()[0].message, "#error FOO must stay literal");
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_order_tests {
+    use super::{Preprocessor, PreprocessorDiagnosticIndex};
+
+    fn messages(pp: &Preprocessor) -> Vec<&str> {
+        let mut warnings = 0;
+        let mut pragmas = 0;
+        let result = pp
+            .diagnostic_order()
+            .iter()
+            .map(|entry| match *entry {
+                PreprocessorDiagnosticIndex::Warning(index) => {
+                    assert_eq!(index, warnings);
+                    warnings += 1;
+                    pp.warnings()[index].message.as_str()
+                }
+                PreprocessorDiagnosticIndex::Pragma(index) => {
+                    assert_eq!(index, pragmas);
+                    pragmas += 1;
+                    pp.pragma_diagnostics()[index].diagnostic.message.as_str()
+                }
+            })
+            .collect();
+        assert_eq!(warnings, pp.warnings().len());
+        assert_eq!(pragmas, pp.pragma_diagnostics().len());
+        result
+    }
+
+    #[test]
+    fn warnings_and_pragmas_share_execution_order() {
+        let mut pp = Preprocessor::new();
+        pp.preprocess("#warning first\n#pragma GCC warning \"second\"\n#warning third\n");
+        assert_eq!(
+            messages(&pp),
+            ["#warning first", "second", "#warning third"]
+        );
+    }
+
+    #[test]
+    fn message_operand_effects_precede_the_message() {
+        let mut pp = Preprocessor::new();
+        pp.preprocess("#pragma message __DATE__\n#warning last\n");
+        let observed = messages(&pp);
+        assert!(observed[0].contains("macro '__DATE__'"));
+        assert!(observed[1].starts_with("'#pragma message: "));
+        assert_eq!(observed[2], "#warning last");
+        let mut pp = Preprocessor::new();
+        pp.preprocess(
+            r#"#pragma message _Pragma("GCC warning \"inner\"") "outer"
+#warning last
+"#,
+        );
+        assert_eq!(
+            messages(&pp),
+            ["inner", "'#pragma message: outer'", "#warning last"]
+        );
     }
 }
