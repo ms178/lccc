@@ -118,3 +118,37 @@ failure is now confirmed: assembly hash comments such as `#Setup` were
 incorrectly reported as unknown CPP directives and promoted by Kbuild's
 -Werror after assembly warning reporting was enabled. That classification
 needs its own repair; the unsupported warning/options diagnostics also remain.
+
+## Kernel assembler hash-comment regression repair
+
+Assembler-with-cpp now expands and preserves unknown hash-prefixed lines as
+assembler comments, matching measured GCC16.2 behavior (including a macro in
+the first word). It does not categorize them as C unknown-directive warnings.
+Actual #warning/#error processing remains active, including unconditional
+#error under -w. C's existing unknown-directive policy is unchanged.
+
+Validation passed: 602 four-target/mode GCC checks, frontend-preprocessor
+rules, 7,804 library tests/zero failures/ten existing ignores, all-target
+warnings-denied Clippy and unchanged audit census. The pre-fix executable
+fails the non-kernel hash-comment witness under -Werror. The real Linux
+6.18.58 canonical `arch/x86/realmode/` target now compiles, links and emits
+realmode.bin/relocations using LCCC/lccc-ld for target code; only host tools
+use GCC16.2. The boot-only gate remains 31,024 bytes with 24 ISA-clean objects
+and GNU-linker byte equality. No current whole-kernel boot or size gain is
+inferred from that result.
+
+A first targeted invocation was invalid: verify_cpu.S is an include fragment,
+not a standalone TU, and directly requesting a realmode child object bypassed
+the parent build context. The corrected canonical directory target, not those
+invalid invocations, is the integration receipt.
+
+System-QEMU prerequisites are now available from the authenticated hosted
+Debian bookworm bundle, transported as six Git blobs. All part hashes, archive
+hash and package hashes verified before extraction without installation hooks.
+QEMU 7.2.22 (Debian security build 1:7.2+dfsg-7+deb12u18+b3) passed actual
+PC/TCG firmware initialization, QMP version query and clean shutdown. This is
+host-VM readiness, not a kernel boot. The separate custom GLib attempt built
+successfully but had 300 passing/four environmental test failures (missing MIME
+database/update-desktop-database); it is not claimed green and is not used by
+this packaged QEMU. Source compiler readiness still requires the remaining
+warning/options work and a fresh complete hosted kernel/QEMU result.

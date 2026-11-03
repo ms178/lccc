@@ -221,7 +221,7 @@ int count_value[__COUNTER__ == 1 ? 1 : -1];
     # Assembly -E has no C frontend: libcpp warnings still report, but
     # message operands expand once and their frontend directives are dropped.
     assembly = root / 'message-roundtrip.S'
-    assembly.write_text('#warning cpp-asm-merge\n#pragma GCC warning "pragma-asm-merge"\n#pragma message __COUNTER__\n.long __COUNTER__\nnop\n')
+    assembly.write_text('#define Setup REWRITTEN\n#define VALUE 9\n#Setup VALUE\n# only a comment VALUE\n#if 0\n#Skipped VALUE\n#endif\n#warning cpp-asm-merge\n#pragma GCC warning "pragma-asm-merge"\n#pragma message __COUNTER__\n.long __COUNTER__\nnop\n')
     for flags, expected in [([], ['warning', 'warning']),
                             (['-Wno-cpp'], ['warning']),
                             (['-Werror'], ['error', 'error']),
@@ -233,9 +233,23 @@ int count_value[__COUNTER__ == 1 ? 1 : -1];
                                 proc.stderr, re.M)
             if levels != expected or bool(proc.returncode) != ('error' in expected):
                 raise RuntimeError(f'assembly -E diagnostics {compiler} {flags}: {levels} != {expected}\n{proc.stderr}')
+            if (not re.search(r'^\s*#REWRITTEN\s+9\s*$', proc.stdout, re.M)
+                    or not re.search(r'^\s*#\s+only a comment\s+9\s*$', proc.stdout, re.M)
+                    or 'Skipped' in proc.stdout or 'unknown preprocessing directive' in proc.stderr):
+                raise RuntimeError(f'assembly hash comment misclassified: {compiler}\n{proc.stdout}\n{proc.stderr}')
             if ('#pragma message' in proc.stdout or 'expected a string' in proc.stderr
                     or not re.search(r'^\.long\s+1\s*$', proc.stdout, re.M)):
                 raise RuntimeError(f'assembly -E handled a C-frontend pragma: {compiler}\n{proc.stdout}\n{proc.stderr}')
+        checks += 4
+    # Correct assembler-comment classification must not hide genuine errors,
+    # even with blanket warning suppression.
+    assembly.write_text('#error asm-hard-error\n.long 0\n')
+    for flags in ([], ['-w']):
+        for compiler in compilers:
+            proc = subprocess.run(compiler + ['-E', *flags, str(assembly)],
+                                  capture_output=True, text=True, timeout=30)
+            if not proc.returncode or not re.search(r'error:[^\n]*asm-hard-error', proc.stderr):
+                raise RuntimeError(f'assembly #error suppressed: {compiler} {flags}\n{proc.stderr}')
         checks += 4
     return checks
 

@@ -1490,6 +1490,14 @@ impl Preprocessor {
                 if keyword.chars().next().is_some_and(|c| c.is_ascii_digit()) {
                     let line_rest = format!("{} {}", keyword, rest);
                     self.handle_line_directive(&line_rest, line_num);
+                } else if self.macros.asm_mode {
+                    // In assembler-with-cpp these are assembler hash comments,
+                    // not invalid C directives. GCC still expands their tokens
+                    // (including a macro-named first word), then preserves the
+                    // line for the assembler. Real #warning/#error above retain
+                    // their diagnostics and -Werror behavior.
+                    let expanded = self.macros.expand_line(line);
+                    return Some(format!("{expanded}\n"));
                 } else {
                     // Unknown directives are valid preprocessing diagnostics, not
                     // hard errors.  Warn so typos like `#defin` and `#inclde`

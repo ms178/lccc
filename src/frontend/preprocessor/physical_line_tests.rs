@@ -564,3 +564,24 @@ fn comment_bridge_from_an_ordinary_line_resyncs_positions() {
     );
     assert_positions(src, 2);
 }
+
+#[test]
+fn assembly_hash_comments_expand_without_becoming_cpp_warnings() {
+    let source = "#define Setup REWRITTEN\n#define VALUE 9\n#Setup VALUE\n# only a comment VALUE\n#if 0\n#Skipped VALUE\n#endif\n.long VALUE\n";
+    let (pp, output) = preprocess_asm(source);
+    assert!(pp.errors().is_empty());
+    assert!(pp.warnings().is_empty());
+    assert!(output.contains("#REWRITTEN 9"), "{output}");
+    assert!(output.contains("# only a comment 9"), "{output}");
+    assert!(!output.contains("Skipped"), "{output}");
+    assert!(output.contains(".long 9"), "{output}");
+    let (pp, _) = preprocess_asm("#warning real-warning\n#error real-error\n");
+    assert_eq!(pp.warnings().len(), 1);
+    assert_eq!(pp.errors().len(), 1);
+    let (pp, _) = preprocess("#Setup VALUE\n");
+    assert_eq!(
+        pp.warnings().len(),
+        1,
+        "C diagnostic policy must not change"
+    );
+}
