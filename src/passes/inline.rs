@@ -1893,6 +1893,7 @@ fn inline_run_with(
                                             is_gnu_inline_def: false,
                                             loop_promoted_f64_values: Vec::new(),
                                             ssp: Default::default(),
+                                            decl_span: crate::common::source::Span::dummy(),
                                             body_span: crate::common::source::Span::dummy(),
                                             terminator_spans: Default::default(),
                                         };
@@ -2231,6 +2232,7 @@ fn inline_run_with(
                                             is_gnu_inline_def: false,
                                             loop_promoted_f64_values: Vec::new(),
                                             ssp: Default::default(),
+                                            decl_span: crate::common::source::Span::dummy(),
                                             body_span: crate::common::source::Span::dummy(),
                                             terminator_spans: Default::default(),
                                         };
@@ -7856,6 +7858,7 @@ mod value_reference_tests {
             is_gnu_inline_def: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: Default::default(),
+            decl_span: crate::common::source::Span::dummy(),
             body_span: crate::common::source::Span::dummy(),
             terminator_spans: Default::default(),
         }
@@ -8355,6 +8358,7 @@ mod const_trip_tests {
             is_gnu_inline_def: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: Default::default(),
+            decl_span: crate::common::source::Span::dummy(),
             body_span: crate::common::source::Span::dummy(),
             terminator_spans: Default::default(),
         }

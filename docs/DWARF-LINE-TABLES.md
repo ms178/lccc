@@ -149,6 +149,39 @@ offset (RISC-V linker relaxation deletes bytes after assembly).
   link paths; this is not a claim of complete GNU ld compatibility.
 - `--strip-all` continues to omit debug sections on the executable paths.
 
+## What a row says, and what it costs
+
+A subprogram is described twice, and both descriptions have to be right:
+
+* `DW_AT_decl_line`/`DW_AT_decl_column` name the **declarator** -- the line and
+  column the function's name is written on. Codegen hands that position to the
+  assembler as a non-statement row (`is_stmt 0`) at the function's first
+  address, followed by the body row with `is_stmt 1` restored (`is_stmt` is
+  sticky). An address-to-line lookup therefore still lands on the opening brace
+  -- what gcc and clang's tables read -- while the writer takes the first row
+  for the declaration position. Units assembled from `.loc` rows alone declare
+  no `DW_AT_decl_column`: a statement's column is not the declarator's.
+* The first row after the prologue carries `prologue_end` and the row at the
+  first epilogue instruction `epilogue_begin`. Those are version 3 opcodes, so
+  the line program is version 3 or newer **whatever the unit dialect is** --
+  gcc writes a version 3 line table even under `-gdwarf-2` (measured on 12.2 and
+  16.2; it has done so since 2011) and no version 2 reader rejects it, so a
+  `-gdwarf-2` build gets the same markers as the newer ones. A `.loc` whose
+  instruction the peephole removes is dropped with it, so the marker is
+  re-attached to the first row the function kept -- still after the prologue.
+
+Row density is per **statement**, not per source line: two statements on one
+line are two rows at their own columns, which is what makes `next` stop between
+them.
+
+The encoder picks the cheapest opcode shape for each row: a special opcode when
+the address advance fits (16 or 17 units, depending on the line delta), a
+`DW_LNS_advance_pc` ULEB, `DW_LNS_fixed_advance_pc` for a delta past the ULEB
+window, or -- what binutils' `emit_inc_line_addr` does -- whole
+`DW_LNS_const_add_pc` steps (17 units per byte) plus one final special opcode
+for the remainder. Measured on gcc-generated assembly, its line program is now
+byte-for-byte the size of GNU as 2.40's for the same rows, and never larger.
+
 The focused validation is `tests/regression/check_dwarf_line_tables.py`
 (line/link behaviour) and `tests/regression/check_dwarf_versions.py`
 (dialect, language, directory/file tables, per-version attribute forms,
@@ -158,3 +191,10 @@ with `readelf --debug-dump=decodedline` and requires the decoded `(file, line)`
 set to be exactly the set the source asked for, on every target and dialect
 (x86-64 also at `-O2`, where the peephole retires rows): a wrong operand width,
 a dropped row or a mis-signed advance cannot pass that.
+`tests/regression/check_dwarf_decl_positions.py` covers the declaration half:
+the expected position of every function is recomputed from the fixture's own
+text (return type on its own line, brace two lines down, four statements on one
+line), and the object must state it, start its table at the brace, mark
+`prologue_end`/`epilogue_begin` exactly once inside each function's range, and
+give each statement on the shared line a row of its own -- on x86-64, i686,
+aarch64 and riscv64 in versions 2 through 5.

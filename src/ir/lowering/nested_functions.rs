@@ -1174,6 +1174,9 @@ impl Lowerer {
                 max_char_array_bytes: self.func().ssp_max_char_array_bytes,
                 stack_guard_alloca: None,
             },
+            decl_span: nf
+                .name_span
+                .unwrap_or_else(crate::common::source::Span::dummy),
             body_span: nf.body_span,
             terminator_spans: std::mem::take(&mut self.func_mut().term_spans),
         };

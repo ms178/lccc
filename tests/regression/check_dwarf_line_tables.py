@@ -241,7 +241,13 @@ def require_compressed_inputs_link_identically(
             not any(name.startswith(".zdebug") for name in sections),
             f"{tag} {form}: a legacy .zdebug name reached the output",
         )
-        if form == "zlib-gabi":
+        if form == "zlib-gabi" and not elf64_sections(compressed[0])[".debug_info"][0] & 0x800:
+            # `objcopy` compresses only when the stream would be smaller, so a
+            # small unit keeps a plain section and there is no stream to append
+            # to.  Say so rather than asserting a rejection the premise no
+            # longer supports.
+            print(f"SKIP {tag}: objcopy left .debug_info uncompressed, no stream to test")
+        elif form == "zlib-gabi":
             # The section payload is exactly one stream, not a stream plus
             # arbitrary padding. BFD 2.47 rejects an appended NUL; make sure
             # the decoder's bit lookahead cannot silently accept it again.
@@ -367,6 +373,17 @@ def ordinal_rows(readelf: str, objdump: str, path: Path) -> list[tuple[str, str,
     return rows
 
 
+def section_size(readelf: str, path: Path, section: str) -> int:
+    """`sh_size` of `section` in `path`, whatever its ELF class."""
+    for raw in run([readelf, "-SW", str(path)]).splitlines():
+        fields = raw.split()
+        if section in fields:
+            index = fields.index(section)
+            # Name Type Address Off Size ES Flg Lk Inf Al
+            return int(fields[index + 4], 16)
+    raise GateFailure(f"{path} has no {section} section")
+
+
 def cross_leg(name: str, triple: str, lccc: str, work: Path) -> str:
     tools = {tool: shutil.which(f"{triple}-{tool}") for tool in ("gcc", "ld", "readelf", "objdump")}
     missing = [f"{triple}-{tool}" for tool, path in tools.items() if path is None]
@@ -391,6 +408,19 @@ def cross_leg(name: str, triple: str, lccc: str, work: Path) -> str:
             )
             got, want = ordinal_rows(readelf, objdump, ours), ordinal_rows(readelf, objdump, theirs)
             require(got == want, f"{name} {opt} {stem}.o rows differ from GNU as:\n{got}\n{want}")
+            # Same rows, no more bytes: the encoder picks a special opcode where
+            # one exists, splits a long advance into `DW_LNS_const_add_pc` steps
+            # -- which move the machine 17 units for one byte each -- and only
+            # falls back to `DW_LNS_advance_pc`/`_fixed_advance_pc` when that is
+            # cheaper.  binutils' `emit_inc_line_addr` does the same, so a larger
+            # program than GNU as's means this writer picked a worse shape.
+            our_size = section_size(readelf, ours, ".debug_line")
+            gas_size = section_size(readelf, theirs, ".debug_line")
+            require(
+                our_size <= gas_size,
+                f"{name} {opt} {stem}.o: .debug_line is {our_size} bytes, GNU as "
+                f"encodes the same rows in {gas_size}",
+            )
             rows += len(got)
             objects["lccc"].append(ours)
             objects["gas"].append(theirs)

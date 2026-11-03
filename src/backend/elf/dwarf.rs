@@ -296,6 +296,119 @@ pub(crate) struct DwarfLineLocation {
     pub sequence: u64,
 }
 
+/// One line-program row as the unit builder reads it: the position a function's
+/// first address carries, with `is_stmt` already resolved.
+#[derive(Debug, Clone, Copy)]
+struct SourceRow {
+    offset: u64,
+    file_number: u32,
+    line: u32,
+    column: u32,
+    is_stmt: bool,
+}
+
+/// A unit's line-program rows, grouped by the code section they describe, with
+/// `is_stmt` resolved -- the view `DW_TAG_subprogram` needs.
+struct SourceRows {
+    by_section: Vec<Vec<SourceRow>>,
+    /// True when some row states a declaration position (see
+    /// [`Self::declaration`]).
+    has_declarator_rows: bool,
+}
+
+impl SourceRows {
+    /// Group `locations` by section and sort them into assembly order.
+    fn new(locations: &[DwarfLineLocation], section_count: usize) -> Self {
+        let mut by_section: Vec<Vec<SourceRow>> = vec![Vec::new(); section_count];
+        let mut source_is_stmt = true;
+        // `is_stmt` is sticky across `.loc`s (a directive that omits it keeps
+        // the previous value), so it is resolved once here rather than re-read
+        // per function.
+        for row in locations {
+            if let Some(value) = row.options.is_stmt {
+                source_is_stmt = value;
+            }
+            if let Some(slot) = by_section.get_mut(row.section_index) {
+                slot.push(SourceRow {
+                    offset: row.offset,
+                    file_number: row.file_number,
+                    line: row.line,
+                    column: row.column,
+                    is_stmt: source_is_stmt,
+                });
+            }
+        }
+        for rows in &mut by_section {
+            // Stable: two rows can share an address (the declarator row and the
+            // body's opening brace both sit at a function's first byte), and the
+            // declarator row is the one written first.
+            rows.sort_by_key(|row| row.offset);
+        }
+        // A unit with at least one non-statement row is compiler output: that
+        // row states a declaration position, which is what
+        // `DW_AT_decl_line`/`DW_AT_decl_column` name.  Otherwise the first row
+        // of a function is its body, and the column of the first *statement* is
+        // not the declarator's -- a wrong column is worse than none, so the
+        // attribute is declared only where a declarator row can supply it.
+        let has_declarator_rows = locations
+            .iter()
+            .any(|row| row.options.is_stmt == Some(false));
+        Self {
+            by_section,
+            has_declarator_rows,
+        }
+    }
+
+    /// Where the subprogram at `offset..offset + size` is declared: its first
+    /// row, at the one file numbering the unit's dialect uses.
+    ///
+    /// The column is stated only when that first row is a declarator row; a
+    /// statement's column would be a different position altogether.
+    fn declaration(
+        &self,
+        file_table: &[(u32, &str)],
+        version: u8,
+        section_index: usize,
+        offset: u64,
+        size: u64,
+    ) -> Option<SourcePosition> {
+        let rows = self.by_section.get(section_index)?;
+        let end = offset.checked_add(size)?;
+        let first = rows.partition_point(|row| row.offset < offset);
+        let row = *rows.get(first)?;
+        // The row must belong to this function: the first row at or after its
+        // end describes the next one, and claiming it would attribute a
+        // function to its neighbour's source line.
+        if row.offset >= end || row.line == 0 || row.file_number == 0 {
+            return None;
+        }
+        // The same numbering the line program uses (see `file_index`): the
+        // number itself for version 5, the 1-based slot before it.
+        let position = file_table.iter().position(|(n, _)| *n == row.file_number)?;
+        let file = if version >= 5 {
+            u64::from(row.file_number)
+        } else {
+            position as u64 + 1
+        };
+        Some(SourcePosition {
+            file,
+            line: u64::from(row.line),
+            column: if row.is_stmt { 0 } else { row.column },
+        })
+    }
+}
+
+/// Where a subprogram is declared, as its `DW_TAG_subprogram` states it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourcePosition {
+    /// The unit's file number for the declaration's file.
+    file: u64,
+    line: u64,
+    /// `DW_AT_decl_column`; 0 when the row is a statement and so cannot state
+    /// the declarator's column.
+    column: u32,
+}
+
 /// A sized function symbol, for its `DW_TAG_subprogram`.
 pub(crate) struct DwarfFunction<'a> {
     pub name: &'a str,
@@ -814,50 +927,26 @@ fn append_line_prologue_tables(
 /// spells directory 0 out as the first entry; versions 2..4 carry the names
 /// inline and leave directory 0 implicit, as their prologues require.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_dwarf_line_section(
-    files: &[(u32, String)],
-    locations: &[DwarfLineLocation],
+/// Group the `.loc` records by the code section each one describes, with the
+/// `is_stmt` and ISA state resolved.
+///
+/// GAS carries both of those across section switches: a `.loc` that omits them
+/// keeps the value of the previous row, and the state is per *program*, not per
+/// section.  Resolving it in source order here -- before the rows are split
+/// into one line program per section, each of which starts from the DWARF
+/// defaults -- keeps every program's rows self-consistent.
+///
+/// A record is dropped when it names a section this object has no executable
+/// body for, when it points past the section's end, or when the line program's
+/// file table cannot name its file: the first two are input that describes code
+/// the object does not contain, and the third would need a file index that does
+/// not exist.  A record naming a section that is not in the object at all is a
+/// bug in the caller, not in the input.
+fn group_rows_by_section<'a>(
+    locations: &'a [DwarfLineLocation],
     sections: &[DwarfSectionInfo<'_>],
-    address_size: usize,
-    absolute_relocation: u32,
-    abs32: u32,
-    comp_dir: &str,
-    config: DwarfConfig,
-    line_strings: &mut DwarfStrings,
-    mut symbol_at: SymbolAt<'_, '_>,
-) -> Result<Option<DwarfLineBuild>, String> {
-    if !matches!(address_size, 4 | 8) {
-        return Err(format!(
-            "DWARF line table address size must be 4 or 8, got {address_size}"
-        ));
-    }
-    if files.is_empty() || locations.is_empty() {
-        return Ok(None);
-    }
-
-    let file_table = debug_file_table(files)?;
-    // Version 5 addresses its file table by number: slot 0 is the primary file,
-    // slot *i* is `.file i`.  Versions 2..4 number their entries from 1, so the
-    // register is the entry's position in that table -- which the contiguity
-    // rule in [`debug_file_table`] makes equal to the number as well.
-    let five = config.version >= 5;
-    let file_index = |number: u32| -> Option<u64> {
-        if five && number == 0 {
-            return Some(0); // the primary file, always slot 0
-        }
-        let position = file_table
-            .iter()
-            .position(|(candidate, _)| *candidate == number)?;
-        Some(if five {
-            u64::from(number)
-        } else {
-            position as u64 + 1
-        })
-    };
-
-    // GAS carries is_stmt and ISA across section switches. Resolve those
-    // persistent states in source order before sorting rows into per-section
-    // line programs; each program itself starts with DWARF defaults.
+    file_index: &dyn Fn(u32) -> Option<u64>,
+) -> Result<Vec<Vec<(&'a DwarfLineLocation, bool, u64)>>, String> {
     let mut rows_by_section: Vec<Vec<(&DwarfLineLocation, bool, u64)>> =
         (0..sections.len()).map(|_| Vec::new()).collect();
     let mut source_is_stmt = true;
@@ -882,6 +971,63 @@ pub(crate) fn build_dwarf_line_section(
             rows_by_section[location.section_index].push((location, source_is_stmt, source_isa));
         }
     }
+    Ok(rows_by_section)
+}
+
+pub(crate) fn build_dwarf_line_section(
+    files: &[(u32, String)],
+    locations: &[DwarfLineLocation],
+    sections: &[DwarfSectionInfo<'_>],
+    address_size: usize,
+    absolute_relocation: u32,
+    abs32: u32,
+    comp_dir: &str,
+    config: DwarfConfig,
+    line_strings: &mut DwarfStrings,
+    mut symbol_at: SymbolAt<'_, '_>,
+) -> Result<Option<DwarfLineBuild>, String> {
+    if !matches!(address_size, 4 | 8) {
+        return Err(format!(
+            "DWARF line table address size must be 4 or 8, got {address_size}"
+        ));
+    }
+    if files.is_empty() || locations.is_empty() {
+        return Ok(None);
+    }
+
+    // The line program's own dialect.  GNU tools write a version 3 line table
+    // even for `-gdwarf-2` (measured: gcc 12.2 and 16.2 both do), because the
+    // newer header is what carries `prologue_end` and `epilogue_begin`, and no
+    // version 2 reader rejects it; gcc has emitted it since 2011.  The unit
+    // keeps the version the command line asked for -- only the line table's
+    // floor moves, which is what gives a `-gdwarf-2` build the same row markers
+    // as the newer dialects.
+    let config = DwarfConfig {
+        version: config.version.max(3),
+        ..config
+    };
+
+    let file_table = debug_file_table(files)?;
+    // Version 5 addresses its file table by number: slot 0 is the primary file,
+    // slot *i* is `.file i`.  Versions 2..4 number their entries from 1, so the
+    // register is the entry's position in that table -- which the contiguity
+    // rule in [`debug_file_table`] makes equal to the number as well.
+    let five = config.version >= 5;
+    let file_index = |number: u32| -> Option<u64> {
+        if five && number == 0 {
+            return Some(0); // the primary file, always slot 0
+        }
+        let position = file_table
+            .iter()
+            .position(|(candidate, _)| *candidate == number)?;
+        Some(if five {
+            u64::from(number)
+        } else {
+            position as u64 + 1
+        })
+    };
+
+    let mut rows_by_section = group_rows_by_section(locations, sections, &file_index)?;
 
     let tables = line_tables(&file_table, comp_dir);
 
@@ -977,29 +1123,42 @@ pub(crate) fn build_dwarf_line_section(
             let advance = row.offset - address;
             let next_line = row.line as i64;
             let line_delta = next_line - current_line;
-            // Special opcodes both advance the machine and emit the row in
-            // one byte. Relocatable per-row addresses (used for linker
-            // relaxation) must keep their set_address relocations instead.
-            let special = if symbol_at.is_none() {
-                line_special_opcode(advance, line_delta, u64::from(opcode_base))
-            } else {
+            // Relocatable per-row addresses (a relaxing target) cannot ride in a
+            // special opcode: each row names its own symbol, so it keeps a
+            // `DW_LNE_set_address`.
+            let plan = if symbol_at.is_some() {
                 None
+            } else {
+                Some(RowMotion::plan(advance, line_delta, u64::from(opcode_base)))
             };
-            if advance != 0 && special.is_none() {
-                if let Some(symbol_at) = symbol_at.as_deref_mut() {
-                    let symbol_name = symbol_at(section_index, row.offset);
-                    push_set_address(
-                        &mut unit,
-                        &mut relocs,
-                        0,
-                        address_size,
-                        absolute_relocation,
-                        symbol_name,
-                        0,
-                    );
-                } else {
-                    unit.push(2); // DW_LNS_advance_pc
-                    write_uleb128(advance, &mut unit);
+            match plan {
+                Some(motion) => {
+                    if let Some(delta) = motion.line_advance {
+                        unit.push(3); // DW_LNS_advance_line
+                        write_sleb128(delta, &mut unit);
+                    }
+                    motion.address.push(&mut unit);
+                }
+                None => {
+                    if let Some(symbol_at) = symbol_at.as_deref_mut() {
+                        let symbol_name = symbol_at(section_index, row.offset);
+                        push_set_address(
+                            &mut unit,
+                            &mut relocs,
+                            0,
+                            address_size,
+                            absolute_relocation,
+                            symbol_name,
+                            0,
+                        );
+                    } else {
+                        unit.push(2); // DW_LNS_advance_pc
+                        write_uleb128(advance, &mut unit);
+                    }
+                    if line_delta != 0 {
+                        unit.push(3); // DW_LNS_advance_line
+                        write_sleb128(line_delta, &mut unit);
+                    }
                 }
             }
             address = row.offset;
@@ -1012,10 +1171,6 @@ pub(crate) fn build_dwarf_line_section(
                 unit.push(5); // DW_LNS_set_column
                 write_uleb128(row.column as u64, &mut unit);
                 current_column = row.column;
-            }
-            if line_delta != 0 && special.is_none() {
-                unit.push(3); // DW_LNS_advance_line
-                write_sleb128(line_delta, &mut unit);
             }
             current_line = next_line;
             if is_stmt != current_is_stmt {
@@ -1060,7 +1215,7 @@ pub(crate) fn build_dwarf_line_section(
                 write_uleb128(discriminator, &mut unit);
             }
             // A special opcode emits the row; otherwise copy does so.
-            unit.push(special.unwrap_or(1));
+            unit.push(plan.map_or(1, |motion| motion.row));
         }
 
         let end_offset = code_section.size;
@@ -1131,10 +1286,12 @@ pub(crate) struct DwarfInfoBuild {
 ///   `DW_FORM_strp` offsets into `.debug_str` from version 5, and inline
 ///   `DW_FORM_string` before it, which is the smallest encoding for a unit that
 ///   has no other string section;
-/// * `DW_AT_high_pc` is an address through version 3 and a `DW_FORM_data8`
+/// * `DW_AT_high_pc` is an address through version 3 and a `DW_FORM_udata`
 ///   constant offset from `low_pc` from version 4 on.  A version 2 or 3 consumer
-///   reads the constant as an address, which after linking names unrelated code,
-///   and `data4` would cap a unit's code at 4 GiB;
+///   reads a constant as an address, which after linking names unrelated code,
+///   so those versions keep the relocated address; from version 4 the offset is
+///   a ULEB -- one byte for a function under 128 bytes, seven fewer than the
+///   `data8` this writer used to spend on every subprogram of every object;
 /// * `DW_FORM_sec_offset` and `DW_FORM_flag_present` arrived with version 4: the
 ///   same four bytes are a `DW_FORM_data4` before it, and the only flag form a
 ///   version 2 or 3 consumer has is `DW_FORM_flag`, whose value byte says whether
@@ -1171,10 +1328,16 @@ impl UnitForms {
                 DW_FORM_STRING
             },
             string: if five { DW_FORM_STRP } else { DW_FORM_STRING },
+            // `DW_AT_high_pc` is an address in DWARF 2 and 3; from 4 on a
+            // constant form means "offset from `low_pc`".  A ULEB is the
+            // shortest form that holds a function's size (one byte below 128
+            // against `DW_FORM_data8`'s eight) and is what GNU as 2.40 emits on
+            // its own -- `DW_FORM_data8` here was costing seven bytes per
+            // subprogram on every optimised object.
             high_pc: if labels || !four {
                 DW_FORM_ADDR
             } else {
-                DW_FORM_DATA8
+                DW_FORM_UDATA
             },
             stmt_list: if four {
                 DW_FORM_SEC_OFFSET
@@ -1212,6 +1375,7 @@ fn declare_unit_abbrevs(
     config: DwarfConfig,
     forms: UnitForms,
     range_list: bool,
+    declarator_rows: bool,
 ) -> [[u64; 2]; 2] {
     let mut cu_attrs = vec![
         (DW_AT_NAME, forms.unit_path),
@@ -1253,9 +1417,15 @@ fn declare_unit_abbrevs(
             // file index or line number.
             attrs.push((DW_AT_DECL_FILE, DW_FORM_UDATA));
             attrs.push((DW_AT_DECL_LINE, DW_FORM_UDATA));
+            if declarator_rows {
+                // Only where a declarator row can supply it: `udata` 0 is the
+                // standard spelling of "column unknown", and units assembled
+                // from `.loc` rows alone have nothing better to say.
+                attrs.push((DW_AT_DECL_COLUMN, DW_FORM_UDATA));
+            }
         }
         attrs.extend_from_slice(&[
-            (DW_AT_TYPE, DW_FORM_REF4),
+            (DW_AT_TYPE, DW_FORM_REF_UDATA),
             (DW_AT_LOW_PC, DW_FORM_ADDR),
             (DW_AT_HIGH_PC, forms.high_pc),
         ]);
@@ -1350,7 +1520,7 @@ fn covered_code_sections<'a, 's>(
 /// the form GCC 16.2 was measured to emit for the same dialect:
 /// `DW_AT_stmt_list` is a `DW_FORM_sec_offset` only from version 4 on
 /// (`DW_FORM_data4` before), `DW_AT_high_pc` is an address through version 3
-/// and a `DW_FORM_data8` `low_pc`-relative constant from version 4 on,
+/// and a `DW_FORM_udata` `low_pc`-relative constant from version 4 on,
 /// `DW_AT_external` becomes a zero-byte `DW_FORM_flag_present` from version 4
 /// on (which is why the abbreviation set has one shape per externality), and
 /// `DW_AT_language` takes the smallest constant form that holds its code.
@@ -1394,41 +1564,10 @@ pub(crate) fn build_dwarf_info_sections(
     // line program already had to sort these, but it consumes them per section
     // and in address order of its own, so keep a per-section copy here.
     let file_table = debug_file_table(files)?;
-    let mut rows_by_section: Vec<Vec<(u64, u32, u32, u32)>> = vec![Vec::new(); sections.len()];
-    for row in locations {
-        if let Some(slot) = rows_by_section.get_mut(row.section_index) {
-            slot.push((row.offset, row.file_number, row.line, row.column));
-        }
-    }
-    for rows in &mut rows_by_section {
-        rows.sort_unstable_by_key(|row| row.0);
-    }
-    // The assembler is told where code is, not where a declarator is, so the
-    // declaration it can state honestly is the function's *first* source row:
-    // for a definition that is the line the function is declared on, which is
-    // what a debugger lists.  `DW_AT_decl_column` is deliberately omitted --
-    // the first instruction's column is not the declarator's, and a wrong
-    // column is worse than none.
+    let source_rows = SourceRows::new(locations, sections.len());
+    let has_declarator_rows = source_rows.has_declarator_rows;
     let declaration = |section_index: usize, offset: u64, size: u64| {
-        let rows = rows_by_section.get(section_index)?;
-        let end = offset.checked_add(size)?;
-        let first = rows.partition_point(|row| row.0 < offset);
-        let (row_offset, file_number, line, _column) = *rows.get(first)?;
-        // The row must belong to this function: the first row at or after its
-        // end describes the next one, and claiming it would attribute a
-        // function to its neighbour's source line.
-        if row_offset >= end || line == 0 || file_number == 0 {
-            return None;
-        }
-        // The same numbering the line program uses (see `file_index`): the
-        // number itself for version 5, the 1-based slot before it.
-        let position = file_table.iter().position(|(n, _)| *n == file_number)?;
-        let file = if config.version >= 5 {
-            u64::from(file_number)
-        } else {
-            position as u64 + 1
-        };
-        Some((file, u64::from(line)))
+        source_rows.declaration(&file_table, config.version, section_index, offset, size)
     };
 
     let (covered, code) = covered_code_sections(sections, code_sections, functions)?;
@@ -1440,7 +1579,8 @@ pub(crate) fn build_dwarf_info_sections(
     let range_list = code.len() > 1;
 
     let mut abbrev = Vec::new();
-    let subprogram_code = declare_unit_abbrevs(&mut abbrev, config, forms, range_list);
+    let subprogram_code =
+        declare_unit_abbrevs(&mut abbrev, config, forms, range_list, has_declarator_rows);
 
     let mut info = Vec::new();
     let mut relocs = Vec::new();
@@ -1530,7 +1670,7 @@ pub(crate) fn build_dwarf_info_sections(
                 )?;
             }
         } else {
-            info.extend_from_slice(&first.size.to_le_bytes());
+            push_high_pc(&mut info, forms.high_pc, first.size);
         }
     }
     // The object has one line program; `stmt_list` is where it starts, which is
@@ -1580,11 +1720,16 @@ pub(crate) fn build_dwarf_info_sections(
             // `flag_present` and only exists on external functions.
             info.push(u8::from(function.external));
         }
-        if let Some((file, line)) = known {
-            write_uleb128(file, &mut info);
-            write_uleb128(line, &mut info);
+        if let Some(position) = known {
+            write_uleb128(position.file, &mut info);
+            write_uleb128(position.line, &mut info);
+            if has_declarator_rows {
+                write_uleb128(u64::from(position.column), &mut info);
+            }
         }
-        info.extend_from_slice(&void_die.to_le_bytes());
+        // The `DW_TAG_unspecified_type` the unit opened with: a debugger then
+        // never assumes `int` for an unknown return type.
+        write_uleb128(u64::from(void_die), &mut info);
         if let Some(symbol_at) = symbol_at.as_deref_mut() {
             let start_at = symbol_at(function.section_index, function.offset);
             let end_at = symbol_at(function.section_index, function.offset + function.size);
@@ -1613,7 +1758,7 @@ pub(crate) fn build_dwarf_info_sections(
                     end,
                 )?;
             } else {
-                info.extend_from_slice(&function.size.to_le_bytes());
+                push_high_pc(&mut info, forms.high_pc, function.size);
             }
         }
     }
@@ -1939,6 +2084,7 @@ const DW_AT_TYPE: u64 = 0x49;
 /// `DW_AT_decl_file` and `DW_AT_decl_line`.
 const DW_AT_DECL_FILE: u64 = 0x3a;
 const DW_AT_DECL_LINE: u64 = 0x3b;
+const DW_AT_DECL_COLUMN: u64 = 0x39;
 /// `DW_AT_language_name` and `DW_AT_language_version`: the DWARF 6 attributes
 /// GCC 14 and newer emit so a unit can say "C, 202311" where no language code
 /// exists yet.
@@ -1953,6 +2099,10 @@ const DW_FORM_STRING: u64 = 0x08;
 const DW_FORM_FLAG: u64 = 0x0c;
 const DW_FORM_UDATA: u64 = 0x0f;
 const DW_FORM_REF4: u64 = 0x13;
+/// `DW_FORM_ref_udata`: a ULEB offset from the unit's start -- the shortest
+/// spelling of a reference to a DIE whose offset is only known once the unit is
+/// laid out.
+const DW_FORM_REF_UDATA: u64 = 0x15;
 const DW_FORM_SEC_OFFSET: u64 = 0x17;
 const DW_FORM_STRP: u64 = 0x0e;
 /// `DW_FORM_line_strp`: an offset into `.debug_line_str`, the table a version-5
@@ -1968,6 +2118,16 @@ const DW_LNCT_DIRECTORY_INDEX: u64 = 0x02;
 /// kinds a unit with several code sections needs.
 const DW_RLE_START_LENGTH: u8 = 0x07;
 const DW_RLE_END_OF_LIST: u8 = 0x00;
+/// Write a `DW_AT_high_pc` constant in the form the unit declared for it.
+fn push_high_pc(info: &mut Vec<u8>, form: u64, size: u64) {
+    match form {
+        DW_FORM_UDATA => write_uleb128(size, info),
+        // `DW_FORM_addr` reaches here only with a relocation; the constant
+        // shapes left are the fixed-width ones.
+        _ => info.extend_from_slice(&size.to_le_bytes()),
+    }
+}
+
 /// `DW_LANG_C89`, `DW_LANG_C99`, `DW_LANG_C11`.
 const DW_LANG_C89: u16 = 0x0001;
 const DW_LANG_C99: u16 = 0x000c;
@@ -1980,11 +2140,249 @@ const DW_LNAME_C: u16 = 0x0003;
 /// `DW_LANG_Mips_Assembler`, what GAS records for assembly sources.
 const DW_LANG_MIPS_ASSEMBLER: u16 = 0x8001;
 
+/// `DW_LNS_copy`, `DW_LNS_advance_pc`, `DW_LNS_advance_line`,
+/// `DW_LNS_const_add_pc` and `DW_LNS_fixed_advance_pc`.
+const DW_LNS_COPY: u8 = 1;
+const DW_LNS_ADVANCE_PC: u8 = 2;
+const DW_LNS_ADVANCE_LINE: u8 = 3;
+const DW_LNS_CONST_ADD_PC: u8 = 8;
+const DW_LNS_FIXED_ADVANCE_PC: u8 = 9;
+/// The header this writer emits: `minimum_instruction_length` 1, `line_base`
+/// -5, `line_range` 14 (see [`write_line_prologue_header`]).
+const LINE_BASE: i64 = -5;
+const LINE_RANGE: u64 = 14;
+
+/// How one row's motion -- `advance` address units and `line_delta` lines -- is
+/// encoded, and how the row itself is emitted.
+///
+/// A special opcode does both jobs in one byte, but only while the address
+/// advance is small: `advance * line_range + (line_delta - line_base) +
+/// opcode_base` must fit in a byte, which caps the advance at 16 or 17 units.
+/// Real functions move further than that between statements, and then the choice
+/// is not obvious: `DW_LNS_advance_pc` costs 2-4 bytes for the whole advance,
+/// while `n` copies of `DW_LNS_const_add_pc` cost `n` bytes and move the machine
+/// by `n * (255 - opcode_base) / line_range` (17 units) each, leaving a remainder
+/// small enough for a final special opcode.  Measured against GNU as 2.40 on
+/// gcc-generated assembly, the greedy "subtract 17 at a time" split -- what
+/// binutils' `emit_inc_line_addr` does -- is 1 to 2 bytes per row smaller than
+/// advancing the whole delta explicitly; this planner picks the cheapest of
+/// every shape that exists, including that split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowMotion {
+    /// A `DW_LNS_advance_line` the row needs first, when the final opcode cannot
+    /// carry the line delta itself (it is outside `line_base..line_base +
+    /// line_range`).
+    line_advance: Option<i64>,
+    /// The opcode that moves the machine to the row's address, if any.
+    address: AddressMotion,
+    /// The one-byte opcode that emits the row.
+    row: u8,
+}
+
+/// The address half of a [`RowMotion`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddressMotion {
+    /// A special opcode moves the machine and emits the row.
+    Special,
+    /// Nothing to move.
+    None,
+    /// `DW_LNS_advance_pc` by `delta`.
+    AdvancePc(u64),
+    /// `DW_LNS_const_add_pc` `count` times, then a special opcode for the
+    /// remainder.
+    ConstAddPc(u32),
+    /// `DW_LNS_fixed_advance_pc` by `delta` (3 bytes for any 16-bit delta).
+    FixedAdvancePc(u64),
+}
+
+impl AddressMotion {
+    fn push(self, out: &mut Vec<u8>) {
+        match self {
+            Self::Special | Self::None => {}
+            Self::AdvancePc(delta) => {
+                out.push(DW_LNS_ADVANCE_PC);
+                write_uleb128(delta, out);
+            }
+            Self::FixedAdvancePc(delta) => {
+                out.push(DW_LNS_FIXED_ADVANCE_PC);
+                out.extend_from_slice(&(delta as u16).to_le_bytes());
+            }
+            Self::ConstAddPc(count) => {
+                for _ in 0..count {
+                    out.push(DW_LNS_CONST_ADD_PC);
+                }
+            }
+        }
+    }
+
+    fn cost(self) -> usize {
+        match self {
+            Self::Special | Self::None => 0,
+            Self::AdvancePc(delta) => 1 + uleb128_len(delta),
+            Self::FixedAdvancePc(_) => 3,
+            Self::ConstAddPc(count) => count as usize,
+        }
+    }
+}
+
+/// Bytes `value` occupies as ULEB128.
+fn uleb128_len(mut value: u64) -> usize {
+    let mut len = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        len += 1;
+    }
+    len
+}
+
+/// Bytes `value` occupies as SLEB128.
+fn sleb128_len(mut value: i64) -> usize {
+    let mut len = 1;
+    loop {
+        let byte = (value as u8) & 0x7f;
+        value >>= 7;
+        let sign_bit = byte & 0x40 != 0;
+        if (value == 0 && !sign_bit) || (value == -1 && sign_bit) {
+            return len;
+        }
+        len += 1;
+    }
+}
+
+/// Address units one `DW_LNS_const_add_pc` moves the machine by.
+fn const_add_pc_step(opcode_base: u64) -> u64 {
+    (255 - opcode_base) / LINE_RANGE
+}
+
+impl RowMotion {
+    /// The cheapest encoding of a row at `advance` address units and
+    /// `line_delta` lines from the current position.
+    fn plan(advance: u64, line_delta: i64, opcode_base: u64) -> Self {
+        // The shape that can state any position: `DW_LNS_advance_pc`, plus
+        // `DW_LNS_advance_line` when the line moves, plus `DW_LNS_copy`.  It is
+        // the starting bid, so the planner always has an answer without an
+        // unreachable branch.
+        let fallback = Self {
+            line_advance: (line_delta != 0).then_some(line_delta),
+            address: if advance == 0 {
+                AddressMotion::None
+            } else {
+                AddressMotion::AdvancePc(advance)
+            },
+            row: DW_LNS_COPY,
+        };
+        let mut best = (Self::cost_of(&fallback), fallback);
+        let mut consider = |cost: usize, motion: Self| {
+            if cost < best.0 {
+                best = (cost, motion);
+            }
+        };
+        // 1. One opcode for both: the special opcode.  2. One opcode for the
+        //    line and a special for the address, when the line does not fit.
+        if let Some(op) = line_special_opcode(advance, line_delta, opcode_base) {
+            consider(
+                1,
+                Self {
+                    line_advance: None,
+                    address: AddressMotion::Special,
+                    row: op,
+                },
+            );
+        }
+        // 3. Address by `DW_LNS_const_add_pc` steps plus a special opcode.
+        for (line_advance, delta) in [(None, line_delta), (Some(line_delta), 0)] {
+            if line_advance.is_some() && line_delta == 0 {
+                continue;
+            }
+            let line_cost = line_advance.map_or(0, |delta| 1 + sleb128_len(delta));
+            // Every remainder the split can leave behind, cheapest count first.
+            let step = const_add_pc_step(opcode_base);
+            if step > 0 {
+                // `k` steps leave `advance - k * step`; the remainder has to fit
+                // a special opcode, and a smaller `k` is only worth it when the
+                // remainder still fits.
+                let max_tail = (0..=step)
+                    .rev()
+                    .find(|tail| line_special_opcode(*tail, delta, opcode_base).is_some());
+                if let Some(max_tail) = max_tail {
+                    let count = advance.saturating_sub(max_tail).div_ceil(step);
+                    let tail = advance - count * step;
+                    if count <= u32::MAX as u64
+                        && advance >= count * step
+                        && let Some(op) = line_special_opcode(tail, delta, opcode_base)
+                    {
+                        consider(
+                            line_cost + count as usize + 1,
+                            Self {
+                                line_advance,
+                                address: AddressMotion::ConstAddPc(count as u32),
+                                row: op,
+                            },
+                        );
+                    }
+                }
+            }
+            // 4. Address by one explicit opcode, row by a special or a copy.
+            let address_ops = [
+                AddressMotion::AdvancePc(advance),
+                AddressMotion::FixedAdvancePc(advance),
+            ];
+            for address in address_ops {
+                if let AddressMotion::FixedAdvancePc(delta) = address
+                    && delta > u64::from(u16::MAX)
+                {
+                    continue;
+                }
+                // The special opcode still carries the line when the address is
+                // moved explicitly; otherwise the line was advanced above.
+                let row_and_line = line_special_opcode(0, delta, opcode_base);
+                if let Some(op) = row_and_line {
+                    consider(
+                        line_cost + address.cost() + 1,
+                        Self {
+                            line_advance,
+                            address,
+                            row: op,
+                        },
+                    );
+                }
+                if delta == 0 {
+                    consider(
+                        line_cost + address.cost() + 1,
+                        Self {
+                            line_advance,
+                            address,
+                            row: DW_LNS_COPY,
+                        },
+                    );
+                }
+            }
+        }
+        // 5. Nothing to move at all: `DW_LNS_copy` states the row.
+        if advance == 0 && line_delta == 0 {
+            consider(
+                1,
+                Self {
+                    line_advance: None,
+                    address: AddressMotion::None,
+                    row: DW_LNS_COPY,
+                },
+            );
+        }
+        best.1
+    }
+
+    /// Bytes `self` occupies, one byte for the row opcode plus its motion.
+    fn cost_of(motion: &Self) -> usize {
+        1 + motion.line_advance.map_or(0, |d| 1 + sleb128_len(d)) + motion.address.cost()
+    }
+}
+
 /// Encode a special opcode for the header this writer emits: minimum
 /// instruction length 1, line base -5, line range 14, and `opcode_base`
 /// (13 since DWARF 3, 10 in DWARF 2). Return None when the pair does not fit.
 fn line_special_opcode(address_delta: u64, line_delta: i64, opcode_base: u64) -> Option<u8> {
-    if !(-5..=8).contains(&line_delta) {
+    if !(LINE_BASE..LINE_BASE + LINE_RANGE as i64).contains(&line_delta) {
         return None;
     }
     address_delta
@@ -2205,7 +2603,7 @@ mod tests {
                 *at += 1;
                 (value, None)
             }
-            DW_FORM_UDATA => (read_uleb(data, at), None),
+            DW_FORM_UDATA | DW_FORM_REF_UDATA => (read_uleb(data, at), None),
             DW_FORM_DATA2 => (u64::from(read_u16(data, at)), None),
             DW_FORM_DATA4 | DW_FORM_SEC_OFFSET | DW_FORM_REF4 => {
                 (u64::from(read_u32(data, at)), None)
@@ -2325,6 +2723,72 @@ mod tests {
             }
         }
         (cu, subprograms)
+    }
+
+    /// The row planner states each position with as few bytes as the dialect
+    /// allows, and the bytes it plans are the bytes it writes.  Every shape a
+    /// line program can hold is walked, and each plan is replayed against the
+    /// header's own constants: it must land exactly on the requested position,
+    /// cost exactly what it claims, and never lose to the three-opcode fallback
+    /// (`DW_LNS_advance_pc`, `DW_LNS_advance_line`, `DW_LNS_copy`) that can state
+    /// anything.
+    #[test]
+    fn row_motion_round_trips_and_never_loses_to_advance_pc() {
+        for opcode_base in [10u64, 13] {
+            for advance in [0u64, 1, 16, 17, 18, 33, 100, 255, 1000, 70_000] {
+                for line_delta in [-7i64, -5, -1, 0, 1, 8, 9, 100, -100] {
+                    let plan = RowMotion::plan(advance, line_delta, opcode_base);
+                    let mut bytes = Vec::new();
+                    if let Some(delta) = plan.line_advance {
+                        bytes.push(DW_LNS_ADVANCE_LINE);
+                        write_sleb128(delta, &mut bytes);
+                    }
+                    plan.address.push(&mut bytes);
+                    bytes.push(plan.row);
+                    let planned: usize = 1
+                        + plan.line_advance.map_or(0, |d| 1 + sleb128_len(d))
+                        + plan.address.cost();
+                    assert_eq!(bytes.len(), planned, "{advance} {line_delta}: {plan:?}");
+                    let mut address = 0u64;
+                    let mut line = 0i64;
+                    if let Some(delta) = plan.line_advance {
+                        line += delta;
+                    }
+                    match plan.address {
+                        AddressMotion::AdvancePc(delta) | AddressMotion::FixedAdvancePc(delta) => {
+                            address += delta;
+                        }
+                        AddressMotion::ConstAddPc(count) => {
+                            address += u64::from(count) * const_add_pc_step(opcode_base);
+                        }
+                        AddressMotion::Special | AddressMotion::None => {}
+                    }
+                    if plan.row != DW_LNS_COPY {
+                        let adjusted = u64::from(plan.row) - opcode_base;
+                        address += adjusted / LINE_RANGE;
+                        line += LINE_BASE + (adjusted % LINE_RANGE) as i64;
+                    }
+                    assert_eq!(
+                        (address, line),
+                        (advance, line_delta),
+                        "{advance} {line_delta} {opcode_base}: {plan:?}"
+                    );
+                    let naive: usize = 1
+                        + uleb128_len(advance)
+                        + if line_delta != 0 {
+                            1 + sleb128_len(line_delta)
+                        } else {
+                            0
+                        }
+                        + 1;
+                    assert!(
+                        bytes.len() <= naive,
+                        "{advance} {line_delta}: {} bytes loses to the naive {naive}: {plan:?}",
+                        bytes.len()
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2617,7 +3081,7 @@ mod tests {
         assert_eq!(form_of(DW_AT_COMP_DIR), Some(DW_FORM_LINE_STRP));
         assert_eq!(form_of(DW_AT_PRODUCER), Some(DW_FORM_STRP));
         assert_eq!(form_of(DW_AT_LANGUAGE), Some(DW_FORM_DATA1));
-        assert_eq!(form_of(DW_AT_HIGH_PC), Some(DW_FORM_DATA8));
+        assert_eq!(form_of(DW_AT_HIGH_PC), Some(DW_FORM_UDATA));
     }
 
     /// Versions 2..5 differ exactly where their specifications say: the unit
@@ -3486,7 +3950,10 @@ mod tests {
 
     /// The directory and file tables of a version 2..4 prologue, read the way
     /// a consumer reads them: NUL-terminated names and LEB128 indices.
-    fn inline_tables(data: &[u8], version: u16) -> (Vec<String>, Vec<(u64, String)>) {
+    fn inline_tables(data: &[u8], unit_version: u16) -> (Vec<String>, Vec<(u64, String)>) {
+        // The line program's dialect has a floor of 3 even under `-gdwarf-2`
+        // (see `build_dwarf_line_section`); the unit version decides the rest.
+        let version = unit_version.max(3);
         let mut at = 4;
         assert_eq!(read_u16(data, &mut at), version, "line program version");
         let header_length = read_u32(data, &mut at) as usize;

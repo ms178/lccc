@@ -449,6 +449,17 @@ CU_KEYS = (
 # `DW_FORM_string` up to version 4, which costs their bytes once and keeps a
 # unit with no function names out of `.debug_str` entirely, while GCC already
 # has a string table for the names it emits and points at it).
+# Constant-class forms a `DW_AT_high_pc` offset may use from version 4 on.
+CONSTANT_CLASS_FORMS = frozenset(
+    {
+        "DW_FORM_udata",
+        "DW_FORM_sdata",
+        "DW_FORM_data1",
+        "DW_FORM_data2",
+        "DW_FORM_data4",
+        "DW_FORM_data8",
+    }
+)
 CU_FORM_PARITY = {
     2: ("low_pc", "high_pc", "stmt_list", "language"),
     3: ("low_pc", "high_pc", "stmt_list", "language"),
@@ -549,6 +560,25 @@ def check_version_and_dialect(
             attribute in reference_forms,
             f"{label}: GCC 16.2 declares no DW_AT_{attribute} for the unit",
         )
+        if attribute == "high_pc" and version >= 4:
+            # DWARF 4 redefined this attribute: up to version 3 the form is of
+            # address class and the value is the end address, from version 4 a
+            # form of *constant* class holds the function's length instead --
+            # an offset from `low_pc`.  The width is then a size choice, not a
+            # dialect rule, and LCCC makes the better one: the narrowest
+            # ULEB128 that holds the offset (one byte for anything under 128)
+            # where GCC pads every unit to `DW_FORM_data8`.  Every consumer
+            # reads a constant-class form (readelf, `addr2line` and gdb were
+            # checked), so the class is pinned here and the width is not; the
+            # offset itself is pinned by `check_dwarf_decl_positions.py`, which
+            # recomputes every subprogram's range from the object.
+            require(
+                ours_forms.get(attribute) in CONSTANT_CLASS_FORMS,
+                f"{label}: DW_AT_{attribute} is {ours_forms.get(attribute)}, "
+                f"not a constant-class form (GCC 16.2 encodes it as "
+                f"{reference_forms.get(attribute)})",
+            )
+            continue
         require(
             ours_forms.get(attribute) == reference_forms.get(attribute),
             f"{label}: DW_AT_{attribute} is {ours_forms.get(attribute)}, "
