@@ -141,3 +141,69 @@ Unsupported optimization/security/debug options also remain visible. These
 warnings must not be hidden by deleting flags or relabeling no-ops as support.
 Final full-kernel link/boot, warning-free acceptance and measured runtime and
 code-size improvements remain outstanding.
+
+### Follow-up: designated initializers and stack-size diagnostics (in progress)
+
+The current working implementation replaces tolerance for `designated_init`,
+`-Wframe-larger-than=N`, and `-Wvla-larger-than=N` with diagnostics. This is
+not completion of the warning/optimization inventory or the full-kernel gate.
+
+Engineering choices:
+
+- Record definitions own the designated-initializer requirement. A forward or
+  reference-only attribute does not retroactively mark a later/existing
+  definition (GCC 16.2 non-kernel oracle). Invalid scalar-member attributes are
+  rejected and cannot leak into the enclosing record. Initializer source spans
+  allow pragma state to be applied at the initializer, not its type definition.
+- Fixed-frame measurements come from each backend's actual frame reservation,
+  rather than a frontend sum of local C objects. Consequently exact sizes are
+  backend-specific; differential fixtures compare separated small/large cases,
+  while backend probes independently check the reported reservation.
+- Dynamic allocations retain VLA source provenance through IR transformations;
+  plain `__builtin_alloca` is not mislabeled a VLA. Optimized SSA range reasoning
+  uses only dominating single-predecessor edges. A dominating join alone cannot
+  establish which branch was taken. Typed arithmetic, checked inverses and
+  bounded shift reasoning must not infer a small bound from wrapping or
+  narrowing operations. Analysis limits (16 recursive levels, 256 work units per
+  range query, 128 ancestor steps, 8 inverse steps) give conservative warnings
+  rather than unbounded diagnostic work. More complex joins/loops can therefore
+  still produce conservative false positives.
+- GCC's numeric thresholds saturate on decimal/unit overflow. `warning`/`error`
+  pragmas require a valid number; `ignored` pragmas intentionally accept an
+  empty or invalid suffix. Scoped suppression applies to both frame and VLA
+  families. `-Og` retains a distinct diagnostic policy: GCC suppresses VLA range
+  warnings there, unlike `-O1`. A syntactic VLA with an optimized constant
+  extent still warns at the analyzed optimization levels; it must not be
+  confused with a source-level fixed array.
+- Ordinary compilations without these warnings or their pragma names avoid
+  building a second diagnostic scope table. No runtime or compiler-speed gain
+  has been benchmarked from this change, and none is claimed.
+
+The validated checkpoint passed 696 designated-init, 1,747 frame-size and
+6,336 VLA-size checks across all four backends against non-kernel GCC 16.2.
+The VLA gate covers six optimization modes and last-option-wins transitions
+between `-Og` and `-O1`, wrapping/narrowing guards, constant bounds, numeric
+thresholds, scoped promotion/demotion, and suppression. Its pragma/pop functions
+have distinct volatile effects so GCC IPA-ICF cannot delete the allocation
+whose reporting state is being tested; a separate `-fno-ipa-icf` non-kernel
+probe confirmed the original oracle artifact before correcting the fixture.
+
+Fastbuild library tests passed **7,696 with zero failures**; the existing ten
+ignored tests remain unmeasured. All-target Clippy passed with warnings denied.
+Attribute, qualifier, diagnostic-precedence/pragma, date/time, layout, enum,
+forward-enum ABI and verbose-assembly gates also passed. The audit census did
+not increase. The warning-compatibility precision sweep still reports two
+compile-divergence skips and seven GCC-only known-gap lines; these are not
+counted as newly validated support. The three new CI gates have separate named steps and measured
+costs (4.77/18.56/78.16 seconds locally); the existing lane-split tool repartitions
+all 156 frontend steps without dropping coverage. Predicted frontend lane costs
+are 352.4/352.3/352.3 seconds using the retained old costs plus these three new
+measurements; this is not a new measurement of hosted wall-clock balance.
+
+The LCCC-only Linux 6.18.58 boot rebuild passed at **31,024 bytes**, with 1,744
+bytes of headroom, 24 ISA-clean objects and GNU-linker flat-image equality. GCC
+compiled no kernel target code. The size is unchanged from the prior 31,024-byte
+boot checkpoint: no code-size or runtime improvement is claimed. Full kernel
+link, objtool and QEMU boot are still not established for this working tree.
+The six remaining warning families and outstanding optimization options remain
+acceptance requirements; this checkpoint is not task completion.

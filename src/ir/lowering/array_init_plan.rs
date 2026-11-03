@@ -288,6 +288,7 @@ impl Lowerer {
         geo: &ArrayGeometry,
     ) -> usize {
         let head = [InitializerItem {
+            span: crate::common::source::Span::dummy(),
             designators: rel.to_vec(),
             init: first.clone(),
         }];
@@ -537,6 +538,7 @@ impl Lowerer {
         let n = self.elided_run_len(rel, &first.init, &items[1..], geo);
         let mut run = Vec::with_capacity(n);
         run.push(InitializerItem {
+            span: crate::common::source::Span::dummy(),
             designators: rel.to_vec(),
             init: first.init.clone(),
         });

@@ -1082,6 +1082,7 @@ impl<'a> ExprTypeChecker<'a> {
                 pragma_pack,
                 struct_aligned,
                 reverse_sso,
+                _,
             ) => {
                 if let Some(tag) = tag {
                     CType::Struct(

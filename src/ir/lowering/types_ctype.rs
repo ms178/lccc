@@ -109,9 +109,25 @@ impl Lowerer {
                 // For anonymous structs (key like "__anon_struct_N"), use the
                 // full key as the tag so get_struct_layout_for_type can find it.
                 if let Some(tag) = key.strip_prefix("struct.") {
-                    TypeSpecifier::Struct(Some(tag.to_string()), None, false, None, None, None)
+                    TypeSpecifier::Struct(
+                        Some(tag.to_string()),
+                        None,
+                        false,
+                        None,
+                        None,
+                        None,
+                        false,
+                    )
                 } else {
-                    TypeSpecifier::Struct(Some(key.to_string()), None, false, None, None, None)
+                    TypeSpecifier::Struct(
+                        Some(key.to_string()),
+                        None,
+                        false,
+                        None,
+                        None,
+                        None,
+                        false,
+                    )
                 }
             }
             CType::Union(key) => {
@@ -494,6 +510,7 @@ impl Lowerer {
                     align: 1,
                     is_union,
                     is_transparent_union: false,
+                    requires_designators: false,
                     reverse_sso,
                     user_align: false,
                 };
@@ -516,6 +533,7 @@ impl Lowerer {
                 align: 1,
                 is_union,
                 is_transparent_union: false,
+                requires_designators: false,
                 reverse_sso,
                 user_align: false,
             };

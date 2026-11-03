@@ -984,10 +984,16 @@ fn remap_instruction(
             volatile: *volatile,
             semantic_volatile: *semantic_volatile,
         },
-        Instruction::DynAlloca { dest, size, align } => Instruction::DynAlloca {
+        Instruction::DynAlloca {
+            dest,
+            size,
+            align,
+            vla_span,
+        } => Instruction::DynAlloca {
             dest: *dest,
             size: remap_op(size),
             align: *align,
+            vla_span: *vla_span,
         },
         Instruction::Store {
             val,

@@ -201,6 +201,7 @@ const IMPLEMENTED: &[&str] = &[
     "constructor",
     "counted_by",
     "destructor",
+    "designated_init",
     "diagnose_as",
     "diagnose_as_builtin",
     "error",

@@ -6874,10 +6874,16 @@ fn remap_instruction(inst: &Instruction, vo: u32, labels: &mut LabelMap) -> Inst
             volatile: *volatile,
             semantic_volatile: *semantic_volatile,
         },
-        Instruction::DynAlloca { dest, size, align } => Instruction::DynAlloca {
+        Instruction::DynAlloca {
+            dest,
+            size,
+            align,
+            vla_span,
+        } => Instruction::DynAlloca {
             dest: remap_value(*dest, vo),
             size: remap_operand(size, vo),
             align: *align,
+            vla_span: *vla_span,
         },
         Instruction::Store {
             val,

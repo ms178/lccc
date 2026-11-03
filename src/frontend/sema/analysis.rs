@@ -250,6 +250,7 @@ pub struct SemanticAnalyzer {
     defined_structs: RefCell<FxHashSet<String>>,
     /// Type resolution can revisit a definition; report its layout once.
     packed_alignment_checked: RefCell<FxHashSet<(u32, u32, u32)>>,
+    designated_init_seen: RefCell<FxHashSet<(CType, u32, u32, u32)>>,
     /// Occurrence spans whose `typeof(expr)` has already had the
     /// expression's constraint checks run (C11 6.7.3 walk; GCC reports per
     /// occurrence and `type_spec_to_ctype` resolves each occurrence
@@ -336,6 +337,7 @@ impl SemanticAnalyzer {
             diagnostics: RefCell::new(DiagnosticEngine::new()),
             defined_structs: RefCell::new(FxHashSet::default()),
             packed_alignment_checked: RefCell::new(FxHashSet::default()),
+            designated_init_seen: RefCell::new(FxHashSet::default()),
             typeof_seen: RefCell::new(FxHashSet::default()),
             current_return_type: None,
             function_nesting_stack: Vec::new(),
@@ -1296,6 +1298,17 @@ impl SemanticAnalyzer {
         let base_volatile = decl.is_volatile() || self.scalar_typeof_is_volatile(&decl.type_spec);
         let base_pointer_quals = self.base_typedef_pointer_quals(&decl.type_spec, decl.is_const());
         let base_top_const = self.base_typedef_is_top_const(&decl.type_spec);
+        if decl.is_designated_init() {
+            if matches!(base_type, CType::Struct(_)) {
+                self.diagnostics.borrow_mut().warning_with_kind(
+                    "ignoring attributes applied to struct after definition".to_string(),
+                    decl.span,
+                    crate::common::error::WarningKind::Attributes,
+                );
+            } else {
+                self.mark_designated_init(&base_type, decl.span);
+            }
+        }
         if decl.is_transparent_union() {
             self.mark_transparent_union(&base_type, decl.span);
         }
@@ -6614,6 +6627,24 @@ dereference it before applying '->' to it?"
         self.diagnostics.borrow_mut().error(message, span);
     }
 
+    fn mark_designated_init(&self, ty: &CType, span: Span) {
+        let CType::Struct(key) = ty else {
+            self.diagnostics.borrow_mut().error(
+                "'designated_init' attribute is only valid on 'struct' type".to_string(),
+                span,
+            );
+            return;
+        };
+        if let Some(layout) = self
+            .result
+            .type_context
+            .borrow_struct_layouts_mut()
+            .get_mut(&**key)
+        {
+            Rc::make_mut(layout).requires_designators = true;
+        }
+    }
+
     /// GCC `transparent_union`, on the union or on a typedef of it: mark the
     /// sema layout the call check reads, as lowering's own
     /// `mark_transparent_union` marks its layout. GCC drops the attribute
@@ -6846,6 +6877,9 @@ dereference it before applying '->' to it?"
         for item in items {
             if item.designators.is_empty() {
                 if let Some(slot) = self.take_initializer_slot(&mut stack) {
+                    if let Some(parent) = stack.last() {
+                        self.warn_positional_record(&parent.ty, item.span);
+                    }
                     self.check_slot_element_spaces(&mut stack, &slot, &item.init);
                 }
             } else if let Some((frames, leaf)) = self.designated_slot(target, &item.designators) {
@@ -6853,6 +6887,43 @@ dereference it before applying '->' to it?"
                 self.check_slot_element_spaces(&mut stack, &leaf, &item.init);
             }
         }
+    }
+
+    /// Shares the aggregate cursor with qualifier checking: a designator resets
+    /// that cursor, and brace elision must diagnose the actual containing record,
+    /// not whichever record happened to own the outermost braces.
+    fn warn_positional_record(&self, parent: &CType, span: Span) {
+        use crate::common::error::WarningKind;
+        if !self
+            .diagnostics
+            .borrow()
+            .warning_enabled(WarningKind::DesignatedInit)
+        {
+            return;
+        }
+        let CType::Struct(key) = parent else {
+            return;
+        };
+        let required = self
+            .result
+            .type_context
+            .borrow_struct_layouts()
+            .get(&**key)
+            .is_some_and(|layout| layout.requires_designators);
+        if !required {
+            return;
+        }
+        if !self.designated_init_seen.borrow_mut().insert((
+            parent.clone(),
+            span.file_id,
+            span.start,
+            span.end,
+        )) {
+            return;
+        }
+        self.diagnostics.borrow_mut().warning_with_kind(
+            "positional initialization of field in 'struct' declared with 'designated_init' attribute".to_string(),
+            span, WarningKind::DesignatedInit);
     }
 
     /// Cheap structural prefilter for the automatic-member walk: only direct
@@ -6990,6 +7061,7 @@ dereference it before applying '->' to it?"
                     next: 0,
                 });
                 if let Some(inner) = self.take_initializer_slot(stack) {
+                    self.warn_positional_record(slot, expr.span());
                     self.check_slot_element_spaces(stack, &inner, init);
                 }
             }
@@ -10830,6 +10902,10 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
         }
     }
 
+    fn require_record_designators(&self, ty: &CType) {
+        self.mark_designated_init(ty, Span::dummy());
+    }
+
     fn resolve_struct_or_union(
         &self,
         name: &Option<String>,
@@ -10969,6 +11045,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
                 align,
                 is_union,
                 is_transparent_union: false,
+                requires_designators: false,
                 reverse_sso: false,
                 user_align: struct_aligned.is_some(),
             };
@@ -11426,6 +11503,7 @@ mod record_layouts_correspond_tests {
             align,
             is_union,
             is_transparent_union: false,
+            requires_designators: false,
             reverse_sso: false,
             user_align: false,
         }

@@ -1605,6 +1605,7 @@ impl<'a> SemaConstEval<'a> {
                 pragma_pack,
                 struct_aligned,
                 reverse_sso,
+                _,
             ) => {
                 // Look up cached layout for tagged structs
                 if let Some(tag) = tag {
@@ -1841,6 +1842,7 @@ impl<'a> SemaConstEval<'a> {
                 pragma_pack,
                 struct_aligned,
                 reverse_sso,
+                _,
             ) => {
                 if let Some(tag) = tag {
                     let base = format!("struct.{}", tag);

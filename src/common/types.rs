@@ -1235,6 +1235,8 @@ pub struct StructLayout {
     /// Whether this union has `__attribute__((transparent_union))`.
     /// A transparent union parameter is passed using the ABI of its first member.
     pub is_transparent_union: bool,
+    /// GNU designated_init: positional member initialization is diagnosed.
+    pub requires_designators: bool,
     /// True when the record has `__attribute__((scalar_storage_order("big-endian")))`
     /// on a little-endian target (or the mirrored little-endian form on a
     /// big-endian one) — i.e. the storage order is REVERSED relative to the
@@ -1545,6 +1547,7 @@ impl StructLayoutBuilder {
             align: self.max_align,
             is_union: false,
             is_transparent_union: false,
+            requires_designators: false,
             reverse_sso: self.reverse_sso,
             user_align: self.user_align,
         }
@@ -1583,6 +1586,7 @@ impl StructLayout {
             align: 1,
             is_union: false,
             is_transparent_union: false,
+            requires_designators: false,
             reverse_sso: false,
             user_align: false,
         }
@@ -1597,6 +1601,7 @@ impl StructLayout {
             align: 1,
             is_union: true,
             is_transparent_union: false,
+            requires_designators: false,
             reverse_sso: false,
             user_align: false,
         }
@@ -1872,6 +1877,7 @@ impl StructLayout {
             align: max_align,
             is_union: true,
             is_transparent_union: false,
+            requires_designators: false,
             reverse_sso,
             user_align,
         }

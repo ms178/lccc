@@ -2068,54 +2068,63 @@ impl Driver {
                 // Optimization levels.  Numeric values are interpreted by
                 // passes::run_passes(): 0=-O0, 1=-O1, 2=-O2, 3=-O3, 4=-Os, 5=-Oz.
                 "-O0" => {
+                    self.optimize_debug = false;
                     self.opt_level = 0;
                     self.optimize = false;
                     self.optimize_size = false;
                     self.omit_frame_pointer = false;
                 }
                 "-O" | "-O1" => {
+                    self.optimize_debug = false;
                     self.opt_level = 1;
                     self.optimize = true;
                     self.optimize_size = false;
                     self.omit_frame_pointer = true;
                 }
                 "-O2" => {
+                    self.optimize_debug = false;
                     self.opt_level = 2;
                     self.optimize = true;
                     self.optimize_size = false;
                     self.omit_frame_pointer = true;
                 }
                 "-O3" => {
+                    self.optimize_debug = false;
                     self.opt_level = 3;
                     self.optimize = true;
                     self.optimize_size = false;
                     self.omit_frame_pointer = true;
                 }
                 "-Os" => {
+                    self.optimize_debug = false;
                     self.opt_level = 4;
                     self.optimize = true;
                     self.optimize_size = true;
                     self.omit_frame_pointer = true;
                 }
                 "-Oz" => {
+                    self.optimize_debug = false;
                     self.opt_level = 5;
                     self.optimize = true;
                     self.optimize_size = true;
                     self.omit_frame_pointer = true;
                 }
-                // Measured on GCC 16.2 (probe set, 2026-10-28): `-Og`
-                // compiles byte-identically to its `-O1` and `-Ofast` to
-                // its `-O3`. LCCC implements -O1/-O3 and fast-math already,
+                // Scalar probes matched -O1/-O3 code for -Og/-Ofast.
+                // This is not universal equivalence: GCC skips VLA range
+                // diagnostics at -Og, so retain its distinct debug policy.
+                // LCCC implements -O1/-O3 and fast-math already,
                 // so both requests become real pipeline settings instead of
                 // tolerated no-ops (GP-22 option-effect ledger: an accepted
                 // spelling must change an artifact).
                 "-Og" => {
+                    self.optimize_debug = true;
                     self.opt_level = 1;
                     self.optimize = true;
                     self.optimize_size = false;
                     self.omit_frame_pointer = true;
                 }
                 "-Ofast" => {
+                    self.optimize_debug = false;
                     self.opt_level = 3;
                     self.optimize = true;
                     self.optimize_size = false;
@@ -2365,6 +2374,24 @@ impl Driver {
 
                 arg if arg.starts_with("-W") => {
                     let flag = &arg[2..];
+                    let size_flag = flag
+                        .strip_prefix("error=")
+                        .or_else(|| flag.strip_prefix("no-error="))
+                        .unwrap_or(flag);
+                    for family in ["frame-larger-than", "vla-larger-than"] {
+                        if size_flag == family
+                            || size_flag
+                                .strip_prefix(family)
+                                .and_then(|v| v.strip_prefix('='))
+                                .is_some_and(|v| {
+                                    !(v.is_empty() && flag.starts_with("no-error="))
+                                        && crate::common::error::WarningConfig::byte_threshold(v)
+                                            .is_none()
+                                })
+                        {
+                            return Err(format!("invalid byte threshold in '{arg}'"));
+                        }
+                    }
                     if crate::common::error::WarningConfig::rejects_negative_level(flag) {
                         return Err(format!("unrecognized command-line option '{arg}'"));
                     }

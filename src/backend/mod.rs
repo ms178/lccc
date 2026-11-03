@@ -79,9 +79,16 @@ pub(crate) struct McountInstrumentation {
     pub nop: bool,
 }
 
+/// Invocation-local observations: later shipped IPA retries replace earlier
+/// observations; exploratory layout emissions never enter this report.
+pub(crate) type FrameReport = std::sync::Arc<
+    std::sync::Mutex<std::collections::BTreeMap<String, (crate::common::source::Span, u64)>>,
+>;
+
 /// Options that control code generation, parsed from CLI flags.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CodegenOptions {
+    pub(crate) frame_report: Option<FrameReport>,
     /// Invocation-owned RA/codegen policy, parsed once by the driver before
     /// any per-function backend work starts.
     pub(crate) ra_config: std::sync::Arc<regalloc::RaConfig>,

@@ -43,6 +43,17 @@ impl Preprocessor {
         col: usize,
     ) -> Option<String> {
         let rest = rest.trim();
+        if let Some(message) = crate::common::diagnostic_pragma::threshold_error(rest) {
+            self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                kind: crate::common::error::WarningKind::Cpp,
+                file: self.current_file(),
+                line: line_num,
+                col,
+                message,
+            });
+            return None;
+        }
+
         if self.diagnostic_pragmas.apply(rest) {
             // Keep the directive at its exact output position for parser/sema.
             return Some(format!("#pragma {rest}\n"));

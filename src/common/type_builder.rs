@@ -39,6 +39,9 @@ pub trait TypeConvertContext {
         reverse_sso: bool,
     ) -> CType;
 
+    /// Diagnostic-only record metadata; lowering need not act on it.
+    fn require_record_designators(&self, _ty: &CType) {}
+
     /// Resolve an enum type to its CType.
     /// Sema: returns CType::Enum with name info.
     /// Lowering: returns CType::Int (enums are ints at IR level).
@@ -277,15 +280,22 @@ pub trait TypeConvertContext {
                 pragma_pack,
                 struct_aligned,
                 reverse_sso,
-            ) => self.resolve_struct_or_union(
-                name,
-                fields,
-                false,
-                *is_packed,
-                *pragma_pack,
-                *struct_aligned,
-                reverse_sso.is_some_and(|v| v),
-            ),
+                designated_init,
+            ) => {
+                let ty = self.resolve_struct_or_union(
+                    name,
+                    fields,
+                    false,
+                    *is_packed,
+                    *pragma_pack,
+                    *struct_aligned,
+                    reverse_sso.is_some_and(|v| v),
+                );
+                if *designated_init && fields.is_some() {
+                    self.require_record_designators(&ty);
+                }
+                ty
+            }
             TypeSpecifier::Union(
                 name,
                 fields,

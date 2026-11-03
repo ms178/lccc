@@ -3,5 +3,6 @@ mod external_tools;
 mod file_types;
 mod option_table;
 pub(crate) mod pipeline;
+mod vla_diagnostics;
 
 pub use pipeline::{CompileMode, Driver};

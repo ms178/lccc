@@ -355,7 +355,7 @@ impl Lowerer {
     /// Returns an Rc<StructLayout> for cheap cloning.
     fn struct_union_layout(&self, ts: &TypeSpecifier) -> Option<RcLayout> {
         match ts {
-            TypeSpecifier::Struct(tag, Some(fields), is_packed, pragma_pack, _, reverse_sso) => {
+            TypeSpecifier::Struct(tag, Some(fields), is_packed, pragma_pack, _, reverse_sso, _) => {
                 // Use cached layout for tagged structs
                 if let Some(tag) = tag {
                     if let Some(layout) = self

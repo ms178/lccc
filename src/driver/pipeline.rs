@@ -65,6 +65,7 @@ pub struct Driver {
     /// Whether size optimization is requested (-Os or -Oz).
     /// Used to define __OPTIMIZE_SIZE__ predefined macro.
     pub(super) optimize_size: bool,
+    pub(super) optimize_debug: bool,
     /// `-falign-loops[=N[:M]]` / `-fno-align-loops` control of loop-header
     /// padding (Auto = follow the -O level policy).
     pub(super) align_loops: crate::passes::loop_align::AlignControl,
@@ -632,6 +633,7 @@ impl Driver {
             opt_level: 2,    // All levels run the same optimizations; default to max
             optimize: false, // Only set to true when user explicitly passes -O1 or higher
             optimize_size: false,
+            optimize_debug: false,
             align_loops: crate::passes::loop_align::AlignControl::Auto,
             align_jumps: crate::passes::loop_align::AlignControl::Auto,
             align_functions: crate::passes::loop_align::AlignControl::Auto,
@@ -2305,7 +2307,7 @@ impl Driver {
         }
         self.compile_ir_module_to_assembly(
             module,
-            source_manager.as_deref(),
+            source_manager.as_ref(),
             input_file,
             fp_environment_observable,
             ra_config,
@@ -2695,7 +2697,7 @@ impl Driver {
     fn compile_ir_module_to_assembly(
         &self,
         module: crate::ir::module::IrModule,
-        source_manager: Option<&SourceManager>,
+        source_manager: Option<&std::rc::Rc<SourceManager>>,
         input_file: &str,
         fp_environment_observable: bool,
         ra_config: std::sync::Arc<crate::backend::regalloc::RaConfig>,
@@ -3873,7 +3875,7 @@ impl Driver {
     fn emit_target_assembly(
         &self,
         module: &crate::ir::module::IrModule,
-        source_manager: Option<&SourceManager>,
+        source_manager: Option<&std::rc::Rc<SourceManager>>,
         input_file: &str,
         fp_environment_observable: bool,
         ra_config: std::sync::Arc<crate::backend::regalloc::RaConfig>,
@@ -3909,7 +3911,37 @@ impl Driver {
             && !link_pie;
         let pic_codegen = self.pic || self.shared_lib;
         let pie_codegen = (self.pie && (!fixed_exec_link || self.pie_explicit)) || link_pie;
+        let mut frame_diagnostics = DiagnosticEngine::new();
+        frame_diagnostics.set_warning_config(self.effective_warning_config());
+        frame_diagnostics.set_color_mode(self.color_mode);
+        // Ordinary TUs without either warning (or a relevant pragma) must
+        // not pay for a second full pragma-scope scan after sema.
+        let size_analysis = frame_diagnostics
+            .warning_enabled(crate::common::error::WarningKind::FrameLargerThan)
+            || frame_diagnostics.warning_enabled(crate::common::error::WarningKind::VlaLargerThan)
+            || source_manager.is_some_and(|sm| {
+                let text = sm.get_content(0);
+                text.contains("-Wframe-larger-than") || text.contains("-Wvla-larger-than")
+            });
+        if size_analysis && let Some(sm) = source_manager {
+            frame_diagnostics.set_shared_source_manager(sm.clone());
+            frame_diagnostics.build_warning_scopes();
+        }
+        if self.opt_level > 0 && !self.optimize_debug {
+            super::vla_diagnostics::check(
+                module,
+                &mut frame_diagnostics,
+                (self.target.ptr_size() * 8) as u32,
+            );
+            if frame_diagnostics.has_errors() {
+                return Err("VLA size diagnostics failed".to_string());
+            }
+        }
+        let frame_report = frame_diagnostics
+            .warning_enabled(crate::common::error::WarningKind::FrameLargerThan)
+            .then(|| std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())));
         let opts = crate::backend::CodegenOptions {
+            frame_report: frame_report.clone(),
             ra_config,
             // At -O0 phi elimination leaves non-SSA multi-def webs. The linear
             // scan assumes one definition and miscompiled 125/200 CFG seeds;
@@ -3997,14 +4029,34 @@ impl Driver {
             zero_call_used_regs: self.zero_call_used_regs,
             zero_call_used_regs_fp_simd: self.resolved_zero_call_used_regs_fp_simd(),
         };
-        let asm = self
-            .target
-            .generate_assembly_with_opts_and_debug(module, &opts, source_manager);
+        let asm = self.target.generate_assembly_with_opts_and_debug(
+            module,
+            &opts,
+            source_manager.map(|sm| &**sm),
+        );
+        if let Some(report) = frame_report {
+            let report = report
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for func in &module.functions {
+                if let Some(&(span, bytes)) = report.get(&func.name) {
+                    let limit = frame_diagnostics.frame_limit_at(span);
+                    if bytes > limit {
+                        frame_diagnostics.warning_with_kind(
+                            format!("the frame size of {bytes} bytes is larger than {limit} bytes in '{}'", func.name),
+                            span, crate::common::error::WarningKind::FrameLargerThan);
+                    }
+                }
+            }
+            if frame_diagnostics.has_errors() {
+                return Err("stack frame diagnostics failed".to_string());
+            }
+        }
         self.validate_target_assembly(module, &asm, input_file)?;
         // Annotate AFTER optimization and target validation: presentation must
         // not introduce peephole barriers or alter instruction selection.
         let asm = if self.verbose_asm {
-            self.annotate_verbose_assembly(module, &asm, source_manager)
+            self.annotate_verbose_assembly(module, &asm, source_manager.map(|sm| &**sm))
         } else {
             asm
         };

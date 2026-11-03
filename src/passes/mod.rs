@@ -4832,6 +4832,7 @@ mod ssa_validator_tests {
                     dest: Value(0),
                     size: Operand::Const(IrConst::I64(16)),
                     align: 16,
+                    vla_span: None,
                 },
             ])],
             1,

@@ -361,6 +361,8 @@ pub enum Instruction {
         dest: Value,
         size: Operand,
         align: usize,
+        /// Written VLA origin; None for alloca and compiler-private dynamic areas.
+        vla_span: Option<Span>,
     },
 
     /// Store to memory: store val, ptr (type indicates size of store)

@@ -94,6 +94,8 @@ impl Parser {
     fn parse_external_bare_type(&mut self, type_spec: TypeSpecifier, start: Span) -> ExternalDecl {
         self.consume_if(&TokenKind::Semicolon);
         let is_transparent_union = self.take_transparent_union();
+        let is_designated_init = self.attrs.parsing_designated_init();
+        self.attrs.set_designated_init(false);
         let mut d = Declaration::new(
             type_spec,
             Vec::new(),
@@ -116,6 +118,7 @@ impl Parser {
         d.set_pointer_const(self.attrs.parsing_pointer_const());
         d.set_thread_local(self.attrs.parsing_thread_local());
         d.set_transparent_union(is_transparent_union);
+        d.set_designated_init(is_designated_init);
         ExternalDecl::Declaration(d)
     }
 
@@ -1298,6 +1301,8 @@ impl Parser {
         // Register typedef names
         let is_typedef = self.attrs.parsing_typedef();
         let is_transparent_union = self.take_transparent_union();
+        let is_designated_init = self.attrs.parsing_designated_init();
+        self.attrs.set_designated_init(false);
         self.register_typedefs(&type_spec, &declarators, decl_addr_space);
 
         self.expect_after(&TokenKind::Semicolon, "after declaration");
@@ -1331,6 +1336,7 @@ impl Parser {
         d.set_common(ctx.is_common);
         d.set_thread_local(self.attrs.parsing_thread_local());
         d.set_transparent_union(is_transparent_union);
+        d.set_designated_init(is_designated_init);
         d.set_inline(self.attrs.parsing_inline());
         self.flush_declarator_verdicts(
             decl_loc,
@@ -1436,6 +1442,8 @@ impl Parser {
     ) -> Declaration {
         self.advance();
         let is_transparent_union = self.take_transparent_union();
+        let is_designated_init = self.attrs.parsing_designated_init();
+        self.attrs.set_designated_init(false);
         self.attrs.parsing_address_space = AddressSpace::Default;
         let mut d = Declaration::new(
             type_spec,
@@ -1459,6 +1467,7 @@ impl Parser {
         d.set_pointer_const(self.attrs.parsing_pointer_const());
         d.set_thread_local(self.attrs.parsing_thread_local());
         d.set_transparent_union(is_transparent_union);
+        d.set_designated_init(is_designated_init);
         d
     }
 
@@ -1741,6 +1750,8 @@ impl Parser {
         let alignas_type = self.attrs.parsed_alignas_type.take();
         let alignment_sizeof_type = self.attrs.parsed_alignment_sizeof_type.take();
         let is_transparent_union = self.take_transparent_union();
+        let is_designated_init = self.attrs.parsing_designated_init();
+        self.attrs.set_designated_init(false);
         // gcc applies the `cleanup` argument-shape checks only to an
         // automatic object: the one target C23 6.7.12.2 lets the attribute
         // serve. Everything else is warned about and ignored.
@@ -1779,6 +1790,7 @@ impl Parser {
         d.set_pointer_const(self.attrs.parsing_pointer_const());
         d.set_thread_local(self.attrs.parsing_thread_local());
         d.set_transparent_union(is_transparent_union);
+        d.set_designated_init(is_designated_init);
         // An attribute written after an initializer must not outlive this
         // declaration either (see the specifier snapshot above).
         self.attrs.parsing_visibility = None;
@@ -1808,6 +1820,7 @@ impl Parser {
             self.advance();
             let mut items = Vec::with_capacity(8);
             while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
+                let item_span = self.peek_span();
                 let mut designators = Vec::with_capacity(4);
                 // Parse designators: [idx] and .field
                 loop {
@@ -1851,7 +1864,11 @@ impl Parser {
                     self.advance();
                 }
                 let init = self.parse_initializer();
-                items.push(InitializerItem { designators, init });
+                items.push(InitializerItem {
+                    span: item_span,
+                    designators,
+                    init,
+                });
                 if !self.consume_if(&TokenKind::Comma) {
                     break;
                 }
@@ -1895,6 +1912,7 @@ impl Parser {
                             new_desigs[range_pos] =
                                 Designator::Index(Expr::IntLiteral(idx, Span::dummy()));
                             result.push(InitializerItem {
+                                span: item.span,
                                 designators: new_desigs,
                                 init: item.init.clone(),
                             });

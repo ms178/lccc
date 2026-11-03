@@ -68,6 +68,7 @@ impl Lowerer {
                         synth_desigs.extend(item.designators[1..].iter().cloned());
                     }
                     let synth_item = InitializerItem {
+                        span: crate::common::source::Span::dummy(),
                         designators: synth_desigs,
                         init: item.init.clone(),
                     };
@@ -917,6 +918,7 @@ impl Lowerer {
 
             if is_anon {
                 let sub_item = InitializerItem {
+                    span: crate::common::source::Span::dummy(),
                     designators: item.designators.clone(),
                     init: item.init.clone(),
                 };
@@ -973,6 +975,7 @@ impl Lowerer {
                 let sub_items: Vec<InitializerItem> = inits
                     .iter()
                     .map(|item| InitializerItem {
+                        span: crate::common::source::Span::dummy(),
                         designators: item.designators[1..].to_vec(),
                         init: item.init.clone(),
                     })
@@ -985,6 +988,7 @@ impl Lowerer {
                 let sub_items: Vec<InitializerItem> = inits
                     .iter()
                     .map(|item| InitializerItem {
+                        span: crate::common::source::Span::dummy(),
                         designators: item.designators.clone(),
                         init: item.init.clone(),
                     })
@@ -1000,6 +1004,7 @@ impl Lowerer {
                 let sub_items: Vec<InitializerItem> = inits
                     .iter()
                     .map(|item| InitializerItem {
+                        span: crate::common::source::Span::dummy(),
                         designators: vec![],
                         init: item.init.clone(),
                     })

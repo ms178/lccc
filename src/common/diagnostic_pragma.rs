@@ -35,6 +35,25 @@ fn parse(text: &str) -> Option<Action<'_>> {
     }
 }
 
+/// Threshold-setting pragmas need an argument just like their CLI spelling.
+/// Ignoring the family does not inspect/change the numeric threshold.
+pub(crate) fn threshold_error(text: &str) -> Option<String> {
+    let Action::Set { level, name } = parse(text)? else {
+        return None;
+    };
+    if level == "ignored" {
+        return None;
+    }
+    for family in ["frame-larger-than", "vla-larger-than"] {
+        if let Some(value) = name.strip_prefix(family).and_then(|s| s.strip_prefix('='))
+            && WarningConfig::byte_threshold(value).is_none()
+        {
+            return Some(format!("invalid or missing argument to '-W{family}='"));
+        }
+    }
+    None
+}
+
 pub(crate) fn is_diagnostic_pragma(text: &str) -> bool {
     parse(text).is_some()
 }
@@ -71,9 +90,18 @@ impl DiagnosticPragmas {
                 level: "ignored",
                 name,
             } => {
+                let name = match name.split_once('=') {
+                    Some((base @ ("frame-larger-than" | "vla-larger-than"), _)) => base,
+                    _ => name,
+                };
                 self.current.process_flag(&format!("no-{name}"));
             }
             Action::Set { level, name } => {
+                let name = if name == "frame-larger-than=" {
+                    "frame-larger-than"
+                } else {
+                    name
+                };
                 self.analysis.process_flag(name);
                 if level == "warning" {
                     self.current.process_flag(name);
@@ -84,5 +112,57 @@ impl DiagnosticPragmas {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod threshold_tests {
+    use super::*;
+    use crate::common::error::WarningKind;
+
+    #[test]
+    fn ignored_thresholds_accept_empty_and_invalid_numbers_and_pop_restores() {
+        for (family, kind) in [
+            ("frame-larger-than", WarningKind::FrameLargerThan),
+            ("vla-larger-than", WarningKind::VlaLargerThan),
+        ] {
+            let mut config = WarningConfig::default();
+            assert!(config.process_flag(&format!("{family}=2048")));
+            let mut pragmas = DiagnosticPragmas::new(config);
+            for value in ["", "nonsense", "999999999999999999999999999"] {
+                pragmas.apply("GCC diagnostic push");
+                let text = format!("GCC diagnostic ignored \"-W{family}={value}\"");
+                assert!(threshold_error(&text).is_none());
+                assert!(pragmas.apply(&text));
+                assert!(!pragmas.current.is_enabled(kind));
+                pragmas.apply("GCC diagnostic pop");
+                assert!(pragmas.current.is_enabled(kind));
+            }
+        }
+    }
+    #[test]
+    fn positive_thresholds_validate_and_saturate() {
+        for family in ["frame-larger-than", "vla-larger-than"] {
+            for level in ["warning", "error"] {
+                for bad in ["", "+1", "1ZB", " 1"] {
+                    assert!(
+                        threshold_error(&format!("GCC diagnostic {level} \"-W{family}={bad}\""))
+                            .is_some()
+                    );
+                }
+                assert!(
+                    threshold_error(&format!(
+                        "GCC diagnostic {level} \"-W{family}=999999999999999999999999999\""
+                    ))
+                    .is_none()
+                );
+            }
+        }
+        assert_eq!(
+            WarningConfig::byte_threshold("999999999999999999999999999"),
+            Some(u64::MAX)
+        );
+        assert_eq!(WarningConfig::byte_threshold("99999EiB"), Some(u64::MAX));
+        assert_eq!(WarningConfig::byte_threshold("2KiB"), Some(2048));
     }
 }

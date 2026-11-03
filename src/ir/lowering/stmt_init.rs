@@ -911,6 +911,7 @@ impl Lowerer {
             // braced lists, compound literals (`memcpy`), and nested designators.
             if !trailing_designators.is_empty() {
                 let sub_item = InitializerItem {
+                    span: crate::common::source::Span::dummy(),
                     designators: trailing_designators.to_vec(),
                     init: item.init.clone(),
                 };

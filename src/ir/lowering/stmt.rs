@@ -195,7 +195,7 @@ impl Lowerer {
             };
 
             let alloca = if let Some(vla_size_val) = vla_size {
-                self.emit_vla_alloca(vla_size_val, alloca_align)
+                self.emit_vla_alloca(vla_size_val, alloca_align, declarator.span)
             } else {
                 self.emit_entry_alloca(
                     if da.is_array || da.is_struct || is_complex {
@@ -444,7 +444,12 @@ impl Lowerer {
     }
 
     /// Emit VLA dynamic alloca with stack save at function and scope level.
-    pub(super) fn emit_vla_alloca(&mut self, vla_size_val: Value, explicit_align: usize) -> Value {
+    pub(super) fn emit_vla_alloca(
+        &mut self,
+        vla_size_val: Value,
+        explicit_align: usize,
+        span: crate::common::source::Span,
+    ) -> Value {
         let alloca = self.fresh_value();
         if !self.func().has_vla {
             self.func_mut().has_vla = true;
@@ -468,6 +473,7 @@ impl Lowerer {
             dest: alloca,
             size: Operand::Value(vla_size_val),
             align: vla_align,
+            vla_span: Some(span),
         });
         alloca
     }
@@ -2175,6 +2181,7 @@ impl Lowerer {
                 pragma_pack,
                 struct_aligned,
                 reverse_sso,
+                _,
             ) => self.compute_vla_struct_sizeof(
                 fields,
                 false,

@@ -192,6 +192,7 @@ pub(super) mod parsed_attr_flag {
     /// honours it for functions not defined in the same translation unit
     /// (measured 2026-10-30: a same-TU definition still gets `R_X86_64_PLT32`).
     pub const NOPLT: u64 = 1 << 37;
+    pub const DESIGNATED_INIT: u64 = 1 << 38;
     /// The storage-class specifiers a declaration carries (C11 6.7.1; GNU
     /// `auto` is NESTED_FN). `register` is not tracked.
     pub const STORAGE_CLASSES: u64 =
@@ -533,6 +534,10 @@ impl ParsedDeclAttrs {
         self.flags & parsed_attr_flag::ERROR_ATTR != 0
     }
     #[inline]
+    pub fn parsing_designated_init(&self) -> bool {
+        self.flags & parsed_attr_flag::DESIGNATED_INIT != 0
+    }
+    #[inline]
     pub fn parsing_transparent_union(&self) -> bool {
         self.flags & parsed_attr_flag::TRANSPARENT_UNION != 0
     }
@@ -650,6 +655,10 @@ impl ParsedDeclAttrs {
     #[inline]
     pub fn set_error_attr(&mut self, v: bool) {
         self.set_flag(parsed_attr_flag::ERROR_ATTR, v)
+    }
+    #[inline]
+    pub fn set_designated_init(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::DESIGNATED_INIT, v)
     }
     #[inline]
     pub fn set_transparent_union(&mut self, v: bool) {
@@ -2717,6 +2726,10 @@ impl Parser {
                 *is_common = true;
                 self.advance();
             }
+            "designated_init" | "__designated_init__" => {
+                self.attrs.set_designated_init(true);
+                self.advance();
+            }
             "transparent_union" | "__transparent_union__" => {
                 self.attrs.set_transparent_union(true);
                 self.advance();
@@ -3936,7 +3949,7 @@ impl Parser {
                 }
             }
             TypeSpecifier::Array(elem, _) => return Self::alignof_type_spec(elem, tag_aligns),
-            TypeSpecifier::Struct(name, fields, is_packed, pragma_pack, struct_aligned, _)
+            TypeSpecifier::Struct(name, fields, is_packed, pragma_pack, struct_aligned, _, _)
             | TypeSpecifier::Union(name, fields, is_packed, pragma_pack, struct_aligned, _) => {
                 // Cache hit for previously DEFINED named records: definitions
                 // insert their final alignment into struct_tag_alignments the

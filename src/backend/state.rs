@@ -279,6 +279,7 @@ pub struct PendingVecMemfold {
 }
 
 pub struct CodegenState {
+    pub(crate) frame_report: Option<crate::backend::FrameReport>,
     pub out: AsmOutput,
     /// Set from CodegenOptions for -O0 non-SSA correctness.
     pub disable_regalloc: bool,
@@ -925,6 +926,7 @@ impl CodegenState {
 
     pub fn new_with_ra_config(ra_config: Arc<crate::backend::regalloc::RaConfig>) -> Self {
         Self {
+            frame_report: None,
             out: AsmOutput::new(),
             disable_regalloc: false,
             ra_config,
@@ -1596,6 +1598,7 @@ impl CodegenState {
     /// Set the compilation-wide TLS inputs from the codegen options (shared by
     /// every backend's `apply_options`).
     pub fn apply_tls_options(&mut self, opts: &crate::backend::CodegenOptions) {
+        self.frame_report = opts.frame_report.clone();
         self.shared_lib = opts.shared_lib;
         self.stack_clash_protection = opts.stack_clash_protection;
         self.stack_protector_guard = opts.stack_protector_guard.clone();

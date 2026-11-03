@@ -426,6 +426,7 @@ impl Lowerer {
                         dest,
                         size: size_operand,
                         align,
+                        vla_span: None,
                     });
                     return Some(Operand::Value(dest));
                 }
@@ -1922,6 +1923,7 @@ impl Lowerer {
                     dest: area,
                     size: Operand::Value(size_val),
                     align: 16,
+                    vla_span: None,
                 });
                 self.emit(Instruction::Intrinsic {
                     dest: None,
@@ -1961,6 +1963,7 @@ impl Lowerer {
                     dest: result,
                     size: Operand::Const(IrConst::I64(32)),
                     align: 16,
+                    vla_span: None,
                 });
                 self.emit(Instruction::Intrinsic {
                     dest: None,

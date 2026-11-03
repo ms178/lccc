@@ -116,6 +116,12 @@ pub enum WarningKind {
     PackedNotAligned,
     /// Implicit conversion between distinct enumeration types.
     EnumConversion,
+    /// Positional initialization of a record requiring named members.
+    DesignatedInit,
+    /// Fixed backend frame reservation exceeds an explicit byte threshold.
+    FrameLargerThan,
+    /// Optimized VLA bounds may exceed the requested byte limit.
+    VlaLargerThan,
     /// An unreferenced file-scope const object with internal linkage.
     UnusedConstVariable,
     /// A local variable is written but its value is not used.
@@ -279,6 +285,30 @@ macro_rules! warning {
 /// `Undeclared` is a compatibility-only switch; the corresponding condition is
 /// a hard error, not an emitted warning. Pedantic has no implemented members.
 pub const WARNING_REGISTRY: &[WarningDescriptor] = &[
+    warning!(
+        VlaLargerThan,
+        "vla-larger-than",
+        false,
+        [],
+        false,
+        "VLA bound may exceed the selected byte threshold"
+    ),
+    warning!(
+        FrameLargerThan,
+        "frame-larger-than",
+        false,
+        [],
+        false,
+        "fixed stack frame exceeds the selected byte threshold"
+    ),
+    warning!(
+        DesignatedInit,
+        "designated-init",
+        true,
+        [],
+        false,
+        "positional initialization of a designated-init record"
+    ),
     warning!(
         EnumConversion,
         "enum-conversion",
@@ -575,6 +605,8 @@ impl WarningKind {
     pub fn flag_suffix(self) -> &'static str {
         match self {
             WarningKind::Format => "format=",
+            WarningKind::FrameLargerThan => "frame-larger-than=",
+            WarningKind::VlaLargerThan => "vla-larger-than=",
             WarningKind::UnusedConstVariable => "unused-const-variable=",
             WarningKind::UnusedButSetVariable => "unused-but-set-variable=",
             other => other.flag_name(),
@@ -614,6 +646,8 @@ pub struct WarningConfig {
     bare_return_enabled: bool,
     pub werror_all: bool,
     inhibit_all: bool,
+    frame_limit: u64,
+    vla_limit: u64,
     unused_const_level: u8,
     unused_but_set_level: u8,
 }
@@ -638,6 +672,8 @@ impl WarningConfig {
             bare_return_enabled: true,
             werror_all: false,
             inhibit_all: false,
+            frame_limit: u64::MAX,
+            vla_limit: u64::MAX,
             unused_const_level: 2,
             unused_but_set_level: 3,
         }
@@ -863,6 +899,11 @@ impl WarningConfig {
             }
             _ if flag.starts_with("no-error=") => {
                 let name = &flag[9..];
+                let name = match name {
+                    "frame-larger-than=" => "frame-larger-than",
+                    "vla-larger-than=" => "vla-larger-than",
+                    other => other,
+                };
                 if let Some(kind) = WarningKind::from_flag_name(name) {
                     self.clear_werror(kind);
                     true
@@ -905,7 +946,7 @@ impl WarningConfig {
                 } else if let Some((base, level)) = flag.split_once('=') {
                     // Only implemented leveled families accept numeric
                     // arguments; do not advertise option tolerance as support.
-                    if !level.is_empty() && level.bytes().all(|b| b.is_ascii_digit()) {
+                    if !level.is_empty() {
                         self.apply_level(base, level, false)
                     } else {
                         false
@@ -926,8 +967,40 @@ impl WarningConfig {
             .is_some_and(|kind| Self::valid_warning_level(kind, "0"))
     }
 
+    pub fn byte_threshold(text: &str) -> Option<u64> {
+        let end = text.bytes().take_while(u8::is_ascii_digit).count();
+        if end == 0 {
+            return None;
+        }
+        // GCC saturates decimal and unit multiplication at ULLONG_MAX.
+        let n = text[..end].bytes().fold(0u64, |n, b| {
+            n.saturating_mul(10).saturating_add(u64::from(b - b'0'))
+        });
+        let suffix = text[end..].to_ascii_lowercase();
+        let (base, power): (u64, u32) = match suffix.as_str() {
+            "" => (1, 0),
+            "kb" => (1000, 1),
+            "kib" => (1024, 1),
+            "mb" => (1000, 2),
+            "mib" => (1024, 2),
+            "gb" => (1000, 3),
+            "gib" => (1024, 3),
+            "tb" => (1000, 4),
+            "tib" => (1024, 4),
+            "pb" => (1000, 5),
+            "pib" => (1024, 5),
+            "eb" => (1000, 6),
+            "eib" => (1024, 6),
+            _ => return None,
+        };
+        Some(n.saturating_mul(base.checked_pow(power)?))
+    }
+
     fn valid_warning_level(kind: WarningKind, level: &str) -> bool {
         match kind {
+            WarningKind::FrameLargerThan | WarningKind::VlaLargerThan => {
+                Self::byte_threshold(level).is_some()
+            }
             WarningKind::UnusedButSetVariable => matches!(level, "0" | "1" | "2" | "3"),
             WarningKind::Format | WarningKind::UnusedConstVariable => {
                 matches!(level, "0" | "1" | "2")
@@ -946,6 +1019,24 @@ impl WarningConfig {
             return false;
         };
         if !Self::valid_warning_level(kind, level) {
+            return false;
+        }
+        if matches!(
+            kind,
+            WarningKind::FrameLargerThan | WarningKind::VlaLargerThan
+        ) {
+            if let Some(limit) = Self::byte_threshold(level) {
+                if kind == WarningKind::FrameLargerThan {
+                    self.frame_limit = limit;
+                } else {
+                    self.vla_limit = limit;
+                }
+                self.enable(kind);
+                if promote {
+                    self.set_werror(kind);
+                }
+                return true;
+            }
             return false;
         }
         match level {
@@ -1381,6 +1472,18 @@ impl DiagnosticEngine {
     /// Take ownership of the source manager (for passing to codegen for debug info).
     pub fn take_source_manager(&mut self) -> Option<std::rc::Rc<SourceManager>> {
         self.source_manager.take()
+    }
+
+    pub fn set_shared_source_manager(&mut self, sm: std::rc::Rc<SourceManager>) {
+        self.source_manager = Some(sm);
+    }
+
+    pub fn vla_limit_at(&self, span: Span) -> u64 {
+        self.warning_config_at(span).vla_limit
+    }
+
+    pub fn frame_limit_at(&self, span: Span) -> u64 {
+        self.warning_config_at(span).frame_limit
     }
 
     /// Set the color mode for diagnostic output.
@@ -2067,6 +2170,9 @@ mod dialect_severity_redteam_tests {
             WarningKind::MissingIncludeDirs,
             WarningKind::PackedNotAligned,
             WarningKind::EnumConversion,
+            WarningKind::DesignatedInit,
+            WarningKind::FrameLargerThan,
+            WarningKind::VlaLargerThan,
             WarningKind::UnusedConstVariable,
             WarningKind::UnusedButSetVariable,
             WarningKind::DivByZero,
@@ -2177,6 +2283,9 @@ mod dialect_severity_redteam_tests {
             .collect();
         default_on.sort_unstable();
         let mut expected_defaults = [
+            // GCC 16.2 warns on positional initializers of annotated records
+            // even without -Wdesignated-init (the live four-target gate checks it).
+            "designated-init",
             "implicit-function-declaration",
             "cpp",
             "incompatible-pointer-types",
@@ -2254,6 +2363,8 @@ mod dialect_severity_redteam_tests {
                 suffix,
                 match entry.kind {
                     WarningKind::Format => "format=",
+                    WarningKind::FrameLargerThan => "frame-larger-than=",
+                    WarningKind::VlaLargerThan => "vla-larger-than=",
                     WarningKind::UnusedConstVariable => "unused-const-variable=",
                     WarningKind::UnusedButSetVariable => "unused-but-set-variable=",
                     _ => entry.name,

@@ -5623,6 +5623,15 @@ fn generate_function(
     // only the shipped emission may define a summary or a keep record.
     if !crate::backend::state::EXPLORATORY_EMISSION.with(std::cell::Cell::get) {
         cg.note_function_emitted(func, mark);
+        if let Some(report) = &cg.state_ref().frame_report {
+            report
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(
+                    func.name.clone(),
+                    (func.body_span, cg.state_ref().frame_size.max(0) as u64),
+                );
+        }
     }
 }
 
@@ -7833,7 +7842,12 @@ fn generate_instruction_body(
             );
             clobber_after_call_like(cg);
         }
-        Instruction::DynAlloca { dest, size, align } => {
+        Instruction::DynAlloca {
+            dest,
+            size,
+            align,
+            vla_span: _,
+        } => {
             cg.emit_dyn_alloca(dest, size, *align);
             cg.state().protected_slot_values.insert(dest.0);
             clobber_after_call_like(cg);

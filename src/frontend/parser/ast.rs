@@ -541,6 +541,7 @@ pub mod decl_flag {
     pub const CONSTEXPR: u16 = 1 << 10;
     /// `constexpr` came after `_Thread_local` or `auto` (diagnostic order).
     pub const CONSTEXPR_LAST: u16 = 1 << 11;
+    pub const DESIGNATED_INIT: u16 = 1 << 12;
 }
 
 /// A variable/type declaration.
@@ -633,6 +634,10 @@ impl Declaration {
         self.flags & decl_flag::THREAD_LOCAL != 0
     }
     #[inline]
+    pub fn is_designated_init(&self) -> bool {
+        self.flags & decl_flag::DESIGNATED_INIT != 0
+    }
+    #[inline]
     pub fn is_transparent_union(&self) -> bool {
         self.flags & decl_flag::TRANSPARENT_UNION != 0
     }
@@ -702,6 +707,10 @@ impl Declaration {
     #[inline]
     pub fn set_thread_local(&mut self, v: bool) {
         self.set_flag(decl_flag::THREAD_LOCAL, v)
+    }
+    #[inline]
+    pub fn set_designated_init(&mut self, v: bool) {
+        self.set_flag(decl_flag::DESIGNATED_INIT, v)
     }
     #[inline]
     pub fn set_transparent_union(&mut self, v: bool) {
@@ -1566,6 +1575,8 @@ pub enum Initializer {
 /// An item in an initializer list.
 #[derive(Debug, Clone)]
 pub struct InitializerItem {
+    /// Written item origin, including an otherwise spanless empty braced list.
+    pub span: Span,
     pub designators: Vec<Designator>,
     pub init: Initializer,
 }
@@ -1631,6 +1642,7 @@ pub enum TypeSpecifier {
         Option<usize>,
         Option<usize>,
         Option<bool>,
+        bool, // GNU designated_init, diagnostic-only
     ),
     /// Union: (name, fields, is_packed, max_field_align from #pragma pack, struct-level aligned attribute,
     /// scalar_storage_order: Some(true) = big-endian, Some(false) = little-endian, None = default/native)
