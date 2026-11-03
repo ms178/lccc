@@ -1,15 +1,16 @@
-//! Reuse both outputs of identical register-only divisions.
+//! Reuse both outputs of identical divisions with proven stable inputs.
 //!
 //! The accepted window is deliberately small: each division has the same
-//! register dividend, the same register divisor and the same signed/unsigned
-//! high-half setup. Between them are only explicit register moves, whose
-//! destinations cannot clobber an input or either result. There are no
-//! memory loads or stores to alias and no instructions are reordered.
+//! register or direct stack-slot dividend, the same register divisor and the
+//! same signed/unsigned high-half setup. Between them are only explicit
+//! register moves, whose destinations cannot clobber an input or either result.
+//! No intervening instruction writes memory, and nothing is reordered.
 //! A successful first division proves that the repeated division with the
 //! same inputs cannot fault. DIV's undefined flags are not relied upon: the
 //! second division is removed only when the existing flag oracle proves that
 //! all of its flags are dead on every reachable path.
 use super::super::types::*;
+use super::direct_stack_slot;
 use super::flag_peepholes::flags_dead_after;
 
 fn register_at_width(text: &str, width: usize) -> Option<usize> {
@@ -34,10 +35,12 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         let Some((source, destination)) = operands.split_once(',') else {
             continue;
         };
-        let Some(source_reg) = register_at_width(source.trim(), width) else {
-            continue;
-        };
-        if destination.trim() != REG_NAMES[width][0] || matches!(source_reg, 0 | 2 | 4) {
+        let source_reg = register_at_width(source.trim(), width);
+        let stack_base = direct_stack_slot(source.trim()).map(|(base, _)| usize::from(base));
+        if destination.trim() != REG_NAMES[width][0]
+            || source_reg.is_none() && stack_base.is_none()
+            || source_reg.is_some_and(|reg| matches!(reg, 0 | 2 | 4))
+        {
             continue;
         }
         let setup_idx = next_non_debug(store, infos, first + 1, infos.len());
@@ -104,7 +107,11 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             let Some(dest) = register_at_width(dst.trim(), width) else {
                 break;
             };
-            if matches!(dest, 0 | 2 | 4) || dest == source_reg || dest == divisor_reg {
+            if matches!(dest, 0 | 2 | 4)
+                || Some(dest) == source_reg
+                || Some(dest) == stack_base
+                || dest == divisor_reg
+            {
                 break;
             }
             copies += 1;
@@ -183,6 +190,36 @@ mod tests {
         assert!(changed, "{output}");
         assert_eq!(output.matches("idivq").count(), 1);
         assert!(!apply(&body.replace("movq %rdx, %r9", "movq %rdx, %rdi")).0);
+    }
+
+    #[test]
+    fn stack_dividend_requires_stable_address_and_no_stores() {
+        for (stage, setup, division, save) in [
+            (
+                "movl 8(%rsp), %eax",
+                "xorl %edx, %edx",
+                "divl %esi",
+                "movl %edx, %r8d",
+            ),
+            (
+                "movq -16(%rbp), %rax",
+                "cqto",
+                "idivq %rsi",
+                "movq %rdx, %r8",
+            ),
+        ] {
+            let body = format!(
+                "{stage}\n{setup}\n{division}\n{save}\n{stage}\n{setup}\n{division}\nret\n"
+            );
+            let (changed, output) = apply(&body);
+            assert!(changed, "{output}");
+            assert_eq!(output.matches(division).count(), 1);
+            assert!(!apply(&body.replace(save, &format!("{save}\nmovl %ecx, 8(%rsp)"))).0);
+            assert!(
+                !apply(&body.replace(save, &format!("{save}\nmovq %rcx, %rbp"))).0
+                    || stage.contains("%rsp")
+            );
+        }
     }
 
     #[test]
