@@ -1905,11 +1905,13 @@ impl X86Codegen {
         };
         match op {
             DivPs256 => binary(self, "vdivps", false),
-            MinPs256 => binary(self, "vminps", true),
-            MaxPs256 => binary(self, "vmaxps", true),
+            // MIN/MAX select the second operand for NaNs and equal zeros.
+            // Memory folding must not commute their operands.
+            MinPs256 => binary(self, "vminps", false),
+            MaxPs256 => binary(self, "vmaxps", false),
             DivPd256 => binary(self, "vdivpd", false),
-            MinPd256 => binary(self, "vminpd", true),
-            MaxPd256 => binary(self, "vmaxpd", true),
+            MinPd256 => binary(self, "vminpd", false),
+            MaxPd256 => binary(self, "vmaxpd", false),
             SqrtPs256 => unary(self, "vsqrtps"),
             SqrtPd256 => unary(self, "vsqrtpd"),
             HaddPs256 => binary(self, "vhaddps", false),
@@ -2066,6 +2068,57 @@ impl X86Codegen {
                 self.avx_store_dest(dest_ptr);
             }
             _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod avx_fp_order_tests {
+    use super::*;
+    use crate::backend::regalloc::PhysReg;
+    use crate::backend::state::PendingVecMemfold;
+
+    #[test]
+    fn avx_minmax_never_commute_left_memory_but_keep_right_memory_folding() {
+        for (op, mnemonic) in [
+            (IntrinsicOp::MinPs256, "vminps"),
+            (IntrinsicOp::MaxPs256, "vmaxps"),
+            (IntrinsicOp::MinPd256, "vminpd"),
+            (IntrinsicOp::MaxPd256, "vmaxpd"),
+        ] {
+            for folded in [0, 1] {
+                let mut cg = X86Codegen::new();
+                cg.reg_assignments.insert(0, PhysReg(24)); // ymm6
+                cg.reg_assignments.insert(1, PhysReg(23)); // ymm5
+                cg.reg_assignments.insert(2, PhysReg(25)); // ymm7
+                cg.state.vector_values.extend([0, 1, 2]);
+                cg.state.pending_vec_memfold = Some(PendingVecMemfold {
+                    val: folded,
+                    mem: "(%rdi)".to_string(),
+                    mnemonic: "vmovdqu",
+                    width: 32,
+                });
+                cg.emit_avx_fp_256_op(
+                    &Value(2),
+                    &op,
+                    &[Operand::Value(Value(0)), Operand::Value(Value(1))],
+                );
+                let out = &cg.state.out.buf;
+                assert!(out.contains(mnemonic), "{op:?}: {out}");
+                if folded == 0 {
+                    assert!(
+                        !out.contains(&format!("{mnemonic} (%rdi), %ymm5")),
+                        "NaN/signed-zero operand order was reversed: {out}"
+                    );
+                    assert!(out.contains("vmovdqu (%rdi)"), "{out}");
+                } else {
+                    assert!(
+                        out.contains(&format!("{mnemonic} (%rdi), %ymm6")),
+                        "safe right-operand memory fold was lost: {out}"
+                    );
+                }
+                assert!(cg.state.pending_vec_memfold.is_none(), "{out}");
+            }
         }
     }
 }

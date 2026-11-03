@@ -1,4 +1,5 @@
 {
+  "avx_fp_private": "-DITERATIONS=20000",
   "f32_sse1_map": "-DSSE1_MAP_PASSES=128",
   "fp32_product_map": "-DFP_MAP_PASSES=128",
   "fp64_product_map": "-DFP_MAP_PASSES=128",

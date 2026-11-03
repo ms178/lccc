@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -81,6 +82,10 @@ def main():
         if got != (False, ['warning']):
             raise AssertionError(f'zero threshold did not warn: {got}\n{err}')
         checks += 1
+    # Keep the real cause of the kernel frame regression in the existing CI
+    # frame gate: diagnostics must stay strict while private AVX homes shrink.
+    subprocess.run([sys.executable, str(Path(__file__).with_name('check_avx256_fp_contracts.py')),
+                    '--lccc', args.lccc, '--gcc', args.gcc], check=True)
     print(f'frame-size diagnostics: PASS ({checks} checks; four backend-owned frame reservations)')
     print(f'Gate elapsed: {time.monotonic() - started:.2f}s')
 

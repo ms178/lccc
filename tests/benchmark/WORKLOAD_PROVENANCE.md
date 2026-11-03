@@ -254,3 +254,13 @@ loop (ten loads / ten stores) and assembles eight-byte words with separate
 byte loads/shifts/ORs where the GCC oracle uses a word load. Adjacent-byte load
 combining and conservative aggregate promotion are research candidates, not
 implemented optimizations or promised wins.
+
+## `avx_fp_private` (original synthetic fixture)
+
+Original non-kernel compiler stress workload, added 2026-11-03. Eight
+independent AVX FP clamps expose private-home traffic; a per-iteration input
+change and integer checksum keep all invocations observable. This is not a
+Linux kernel extraction or a whole-application benchmark. The paired runner
+verifies exit status and checksum against GCC16.2/Clang23.1.4; instrumentation
+uses the bounded `ITERATIONS=20000` override. Runtime and bit-pattern correctness
+fixtures also live under `tests/regression/avx256_fp_*`.
