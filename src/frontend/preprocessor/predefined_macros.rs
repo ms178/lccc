@@ -75,7 +75,8 @@ const PREDEFINED_OBJECT_MACROS: &[(&str, &str)] = &[
     // --- GCC 16.2 predefined environment (measured 2026-10-27) -------
     // Spellings and values are byte-identical to `gcc-16 -dM -E` on
     // x86-64 so the macro-parity gate diffs to zero on these rows.
-    ("__BIGGEST_ALIGNMENT__", "16"),
+    // `__BIGGEST_ALIGNMENT__` is NOT here: it is target-dependent, see
+    // `define_predefined_macros`.
     ("__CHAR8_TYPE__", "unsigned char"),
     ("__FINITE_MATH_ONLY__", "0"),
     ("__FLOAT_WORD_ORDER__", "__ORDER_LITTLE_ENDIAN__"),
@@ -562,6 +563,33 @@ impl Preprocessor {
             self.define_simple_macro("__WCHAR_WIDTH__", "16");
             self.define_simple_macro("__WCHAR_TYPE__", "short unsigned int");
         }
+
+        // GCC's `__BIGGEST_ALIGNMENT__` is `BIGGEST_ALIGNMENT` — the *same*
+        // number that caps C11 `_Alignof` for non-user-aligned types
+        // (`min_align_of_type`). It therefore has to come from the target
+        // model at run time, not from the table above: on x86 GCC widens it
+        // with the requested ISA (16 baseline, 32 under `-mavx`, 64 under
+        // `-mavx512f`, -m32 included), exactly the value `Driver::run`
+        // publishes to `set_target_biggest_alignment` before the
+        // preprocessor is built. A pinned 16 — which this file and
+        // `builtin_macros::EXTRA_GCC_PREDEFINES` both carried — under-aligns
+        // every `__BIGGEST_ALIGNMENT__`-sized buffer as soon as a 32/64-byte
+        // object exists (an `__m256`/`__m512` spill, a `vector_size(32|64)`
+        // local), while `_Alignof` in the same TU already reports 32/64:
+        // a self-inconsistent translation unit. Measured GCC 16.2: 16/32/64
+        // for default/`-mavx`/`-mavx512f`; 32 under `-mno-sse2 -mavx2` and
+        // `-mno-sse -mavx` (the ISA request decides, not the SSE denials);
+        // back to 16 after `-mno-avx512f`. Clang 23.1.4 pins 16 and is
+        // internally inconsistent (`_Alignof(v64)` is 64 there), so GCC is
+        // the only coherent oracle.
+        // `to_string()` is the right spelling by construction: GCC's macro is
+        // a plain decimal integer object-like macro, with no suffix and no
+        // parentheses, and `set_target_biggest_alignment` has already
+        // asserted the value is a power of two. One small allocation per
+        // translation unit, against the per-token traffic of a preprocessor
+        // run.
+        let biggest_alignment = crate::common::types::target_biggest_alignment();
+        self.define_simple_macro("__BIGGEST_ALIGNMENT__", &biggest_alignment.to_string());
 
         // `__DATE__` and `__TIME__` are *not* materialised here. They are the
         // only predefined macros whose value can be a diagnostic (a malformed

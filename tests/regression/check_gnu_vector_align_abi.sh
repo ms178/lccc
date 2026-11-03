@@ -21,7 +21,10 @@
 #
 # Part 1  layout/alignof probes: `-S` both compilers over the flag matrix and
 #         compare the emitted constants verbatim (compile-only, so -mavx512f
-#         needs no AVX-512 host).
+#         needs no AVX-512 host). The probe also prints `__BIGGEST_ALIGNMENT__`
+#         itself: it IS the cap GCC applies in `min_align_of_type`, so a
+#         frozen 16 would show up here as a mismatch on every AVX row while
+#         `_Alignof` in the same array already reported 32/64.
 # Part 2  x86-64 runtime matrix: 32- and 64-byte vectors as variadic, as a
 #         named argument after six GP arguments (24/56 bytes of slot padding)
 #         and as the first stack argument, at -O0 and -O2, in all four
@@ -77,6 +80,7 @@ int r[] = {
     sizeof(struct C), __builtin_offsetof(struct C, v), _Alignof(struct C),
     sizeof(struct D), __builtin_offsetof(struct D, d), _Alignof(struct D), _Alignof(D4), __alignof__(D4),
     _Alignof(gd), _Alignof(gv),
+    __BIGGEST_ALIGNMENT__,
 };
 EOF
 constants() {  # constants <compiler> <flags...>: the `.long` data of `r` in probe.c

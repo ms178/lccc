@@ -153,7 +153,11 @@ fn define_type_traits_macros(macros: &mut MacroTable) {
 /// `tests/regression/check_macro_parity.py`.
 const EXTRA_GCC_PREDEFINES: &[(&str, &str)] = &[
     ("_STDC_PREDEF_H", "1"),
-    ("__BIGGEST_ALIGNMENT__", "16"),
+    // `__BIGGEST_ALIGNMENT__` is target- and ISA-dependent (16/32/64 on x86)
+    // and is defined from `target_biggest_alignment()` in
+    // `predefined_macros::define_predefined_macros`; a constant here would
+    // overwrite it with the baseline 16 (this table is installed after that
+    // one) and under-align every AVX/AVX-512 object.
     ("__BITINT_MAXWIDTH__", "65535"),
     ("__CHAR8_TYPE__", "unsigned char"),
     ("__DBL_IS_IEC_60559__", "1"),
