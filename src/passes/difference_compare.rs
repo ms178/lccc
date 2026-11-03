@@ -34,22 +34,6 @@ use crate::common::fx_hash::FxHashMap;
 use crate::common::types::IrType;
 use crate::ir::reexports::{Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Value};
 
-/// Mirror a comparison so `0 <op> x` can be read as `x <op'> 0`.
-fn mirror(op: IrCmpOp) -> IrCmpOp {
-    match op {
-        IrCmpOp::Eq => IrCmpOp::Eq,
-        IrCmpOp::Ne => IrCmpOp::Ne,
-        IrCmpOp::Slt => IrCmpOp::Sgt,
-        IrCmpOp::Sle => IrCmpOp::Sge,
-        IrCmpOp::Sgt => IrCmpOp::Slt,
-        IrCmpOp::Sge => IrCmpOp::Sle,
-        IrCmpOp::Ult => IrCmpOp::Ugt,
-        IrCmpOp::Ule => IrCmpOp::Uge,
-        IrCmpOp::Ugt => IrCmpOp::Ult,
-        IrCmpOp::Uge => IrCmpOp::Ule,
-    }
-}
-
 fn is_zero(operand: &Operand) -> bool {
     matches!(operand, Operand::Const(c) if c.to_i64() == Some(0))
 }
@@ -104,8 +88,8 @@ fn replacement(
     let (value, op) = if is_zero(rhs) {
         (*lhs, *op)
     } else if is_zero(lhs) {
-        // `0 <op> (a - b)` is `(a - b) mirror(op) 0`.
-        (*rhs, mirror(*op))
+        // `0 <op> (a - b)` is `(a - b) <op.swapped()> 0`.
+        (*rhs, op.swapped())
     } else {
         return None;
     };

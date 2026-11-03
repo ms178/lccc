@@ -8558,7 +8558,7 @@ fn rewrite_conditional_store(
                         tree
                     } else {
                         // Storeward was the FALSE edge: negate the tree
-                        // (DeMorgan + the total compare flip table).
+                        // (DeMorgan + `IrCmpOp::inverse_for`).
                         let Some(negated) = negate_cond_mask(tree) else {
                             return false;
                         };
@@ -8585,9 +8585,9 @@ fn rewrite_conditional_store(
                     let (effective_op, reuse) = if polarity {
                         (*op, is_first)
                     } else {
-                        match cond_store_cmp_flip(op) {
+                        match op.inverse_for(*ty) {
                             Some(f) => (f, false),
-                            None => return false, // compare op outside the flip table
+                            None => return false, // an ordered float compare
                         }
                     };
                     CondMaskNode::Cmp {
@@ -8888,24 +8888,6 @@ fn rewrite_conditional_store(
     true
 }
 
-/// Total flip table for the conditional-store condition negation: every
-/// `IrCmpOp` variant maps to its negation, so a future enum extension is a
-/// compile error here rather than a silent rewrite decline at run time.
-fn cond_store_cmp_flip(op: &IrCmpOp) -> Option<IrCmpOp> {
-    Some(match op {
-        IrCmpOp::Slt => IrCmpOp::Sge,
-        IrCmpOp::Sge => IrCmpOp::Slt,
-        IrCmpOp::Sle => IrCmpOp::Sgt,
-        IrCmpOp::Sgt => IrCmpOp::Sle,
-        IrCmpOp::Ult => IrCmpOp::Uge,
-        IrCmpOp::Uge => IrCmpOp::Ult,
-        IrCmpOp::Ule => IrCmpOp::Ugt,
-        IrCmpOp::Ugt => IrCmpOp::Ule,
-        IrCmpOp::Eq => IrCmpOp::Ne,
-        IrCmpOp::Ne => IrCmpOp::Eq,
-    })
-}
-
 /// GEP definition lookup for the conditional-store same-address proof:
 /// the (base, offset) pair of the GEP defining `v`, if any.
 fn cond_store_gep_pair(func: &IrFunction, v: Value) -> Option<(Value, Operand)> {
@@ -9069,9 +9051,10 @@ fn parse_cond_mask(header: &[Instruction], v: &Value, depth: usize) -> Option<Co
 }
 
 /// DeMorgan negation of a guard tree (the store sits on the branch's
-/// FALSE edge): `!and(a,b) == or(!a,!b)`, compares via the total flip
-/// table.  Returns `None` only if a compare lacks a flip (impossible
-/// today; the match is total).
+/// FALSE edge): `!and(a,b) == or(!a,!b)`, compares via
+/// [`IrCmpOp::inverse_for`].  Returns `None` only for an ordered float
+/// compare, which has no negated predicate (the guard scans admit integer
+/// compares only, so this is the fail-closed backstop).
 fn negate_cond_mask(node: CondMaskNode) -> Option<CondMaskNode> {
     match node {
         CondMaskNode::Cmp {
@@ -9082,7 +9065,7 @@ fn negate_cond_mask(node: CondMaskNode) -> Option<CondMaskNode> {
             ty,
         } => Some(CondMaskNode::Cmp {
             src: None,
-            op: cond_store_cmp_flip(&op)?,
+            op: op.inverse_for(ty)?,
             lhs,
             rhs,
             ty,
@@ -9372,7 +9355,7 @@ fn rewrite_folded_cond_store(
         mask_tree
     } else {
         // The store runs when the guard is FALSE: negate the tree
-        // (DeMorgan + the total compare flip table).
+        // (DeMorgan + `IrCmpOp::inverse_for`).
         let Some(negated) = negate_cond_mask(mask_tree) else {
             return false;
         };

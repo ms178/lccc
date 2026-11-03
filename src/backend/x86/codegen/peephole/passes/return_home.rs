@@ -933,8 +933,11 @@ mod tests {
             ".cfi_endproc\n",
         );
         // Pin THIS pass alone: `pow2_cmov` legitimately rewrites the lea
-        // form the enabled run produces, so keep it out of the evidence.
-        let _late = skip_passes(&["pow2_cmov"]);
+        // form the enabled run produces, and the windowed chain rename
+        // (`chain_retarget`, which also re-issues an `add` root as a LEA
+        // into the copy's destination) would retire the copy first, so keep
+        // both out of the evidence.
+        let _late = skip_passes(&["pow2_cmov", "chain_retarget"]);
         {
             let _guard = skip_passes(&["return_home"]);
             let out = peephole_optimize(body.to_string());

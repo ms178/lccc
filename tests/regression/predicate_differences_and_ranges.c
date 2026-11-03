@@ -45,13 +45,23 @@ __attribute__((noinline)) static int range_crossing_bitand(int x) { return (x > 
 __attribute__((noinline)) static int range_union(int x) { return (x > 3) | (x > 10); }
 __attribute__((noinline)) static int member_gap(unsigned x) { return (x == 0u) | (x == 2u); }
 __attribute__((noinline)) static int two_values(int a, int b) { return (a > 3) & (b < 10); }
-/* Not a window: the two halves exclude each other instead of intersecting. */
+/* Not a window: the two halves cover every int, so the join is the constant 1
+   (GCC 16.2 and Clang 23.1.4 return it, and so does LCCC's comparison-dominance
+   fold); the run-time check below keeps the answer honest at every level. */
 __attribute__((noinline)) static int range_crossing_control(int x) { return (x > -8) | (x < 8); }
 
 /* ---- sign magnitude ----------------------------------------------------- */
 __attribute__((noinline)) static int abs_select(int x) { return x < 0 ? -x : x; }
 __attribute__((noinline)) static long long abs_select64(long long x) { return x < 0 ? -x : x; }
 __attribute__((noinline)) static int absdiff_select(int a, int b) { return a > b ? a - b : b - a; }
+/* Narrow operands: C compares a `short`/`signed char` at its own width and
+   negates the promoted `int`; the sign extension between the two preserves
+   order, so these are the same identity on the promoted value. */
+__attribute__((noinline)) static int abs_short(short x) { return x < 0 ? -x : x; }
+__attribute__((noinline)) static short abs_short_ret(short x) { return x < 0 ? -x : x; }
+__attribute__((noinline)) static int abs_schar(signed char x) { return x < 0 ? -x : x; }
+__attribute__((noinline)) static long long abs_int_wide(int x) { return x < 0 ? -(long long)x : x; }
+__attribute__((noinline)) static int absdiff_short(short a, short b) { return a > b ? a - b : b - a; }
 /* Not a sign-magnitude select: the arms do not agree on one value. */
 __attribute__((noinline)) static int abs_control(int x, int y) { return x < 0 ? -y : x; }
 
@@ -117,6 +127,34 @@ int main(void) {
         if (member_short(vu) != (x == 0u || x == 1u)) bad++;
         if (member_bitand(vu) != ((x != 0u) & (x != 1u))) bad++;
         if (member_gap(vu) != ((x == 0u) | (x == 2u))) bad++;
+    }
+
+    /* Every 16-bit and 8-bit value through the narrow magnitudes, the
+     * extrema included: the promoted negation never overflows, and
+     * `(short)32768` wraps to -32768 exactly as the select's own return
+     * conversion does. */
+    for (int x = -32768; x <= 32767; x++) {
+        volatile short vs = (short)x;
+        if (abs_short(vs) != (x < 0 ? -x : x)) bad++;
+        if (abs_short_ret(vs) != (short)(x < 0 ? -x : x)) bad++;
+        if (x >= -128 && x <= 127) {
+            volatile signed char vc = (signed char)x;
+            if (abs_schar(vc) != (x < 0 ? -x : x)) bad++;
+        }
+    }
+    static const short sprobes[] = {-32768, -32767, -300, -2, -1, 0, 1, 2, 300, 32766, 32767};
+    for (unsigned i = 0; i < sizeof sprobes / sizeof *sprobes; i++) {
+        for (unsigned j = 0; j < sizeof sprobes / sizeof *sprobes; j++) {
+            volatile short sa = sprobes[i], sb = sprobes[j];
+            int a = sprobes[i], b = sprobes[j];
+            if (absdiff_short(sa, sb) != (a > b ? a - b : b - a)) bad++;
+        }
+    }
+    static const int wprobes[] = {-2147483647 - 1, -2147483647, -5, -1, 0, 1, 5, 2147483647};
+    for (unsigned i = 0; i < sizeof wprobes / sizeof *wprobes; i++) {
+        volatile int w = wprobes[i];
+        long long x = wprobes[i];
+        if (abs_int_wide(w) != (x < 0 ? -x : x)) bad++;
     }
 
     /* Deterministic 200k-value sweep through every folded function. */

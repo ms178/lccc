@@ -144,7 +144,14 @@ top of the web-wide in-loop-use supply, so it must not become default),
 `CCC_NO_MACHINST`, `CCC_RA_EXPLAIN`, `CCC_NO_SEGMENT_FILL`,
 `CCC_NO_GLOBAL_ADDR_REMAT`, `CCC_NO_DSE`, `CCC_NO_STENCIL_VEC`,
 `CCC_NO_MAP_VEC`, `CCC_NO_MAP_VECREG`, `CCC_NO_DEFER_OVERFLOW_VECREG`,
-`CCC_NO_BT_BRANCH_FUSION`, `CCC_NO_EMPTY_LOCAL_FRAME_ELISION`,
+`CCC_NO_BT_BRANCH_FUSION`, `CCC_NO_BT_FLAG_FUSION` (x86-64/AArch64: a bit
+test feeding a zero compare, select or branch materializes its boolean),
+`CCC_NO_BT_MODIFY_FUSION` (x86-64: no shared `bts`/`btr`/`btc` + `setc`/`jc`
+for a test of the bit the next instruction modifies), `CCC_NO_BT_ADC_FUSION`
+(x86-64: no `bt; adc`/`sbb` for a tested bit added to or subtracted from a
+sum), `CCC_NO_BOOL_RETURN` (every target: a branch into two blocks returning
+the constants 1 and 0 stays a branch instead of returning its condition),
+`CCC_NO_EMPTY_LOCAL_FRAME_ELISION`,
 `CCC_NO_PF06_ADD_PEEL`, `CCC_LOOP_ROTATE` / `CCC_NO_LOOP_ROTATE` /
 `CCC_DEBUG_LOOP_ROTATE`, `CCC_BEPRE_FP`, `CCC_VERIFY_REGALLOC`,
 `CCC_TRACE_ALLOCSTATS[=filter]`, `CCC_RA_EXPLAIN`, `LCCC_DEBUG_VECTORIZE`,

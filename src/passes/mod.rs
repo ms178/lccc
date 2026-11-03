@@ -2402,7 +2402,10 @@ pub(crate) fn run_passes(
 
         // Phase 2: Copy propagation
         // Upstream: cfg_simplify (simpler CFG), gvn (eliminated exprs), licm (hoisted code), if_convert
-        if !dis.copyprop && should_run!(1, 0, 5, 6, 7) {
+        // cfg_simplify2 (10) is cfg_simplify1 (0) run late: whatever reacts to
+        // a CFG change made by the one reacts to the same change made by the
+        // other, so every consumer of 0 below also lists 10.
+        if !dis.copyprop && should_run!(1, 0, 5, 6, 7, 10) {
             let n = timed_pass!(
                 "copy_prop1",
                 run_on_visited(module, &dirty, &mut changed, copy_prop::propagate_copies)
@@ -3093,8 +3096,28 @@ pub(crate) fn run_passes(
 
         // Phase 3: Algebraic simplification
         // Upstream: copy_prop1/copy_prop2 (propagated values from GVN/constfold/if_convert),
-        //           narrow (smaller types), constfold (folded constant operands)
-        if !dis.simplify && should_run!(3, 1, 2, 4, 8) {
+        //           narrow (smaller types), constfold (folded constant operands),
+        //           and the three passes that turn a diamond into a `Select`:
+        //           cfg_simplify1/cfg_simplify2 and if_convert.  The select
+        //           shapes are this phase's own inputs (`signmag`'s
+        //           `x < 0 ? -x : x`, simplify's select folds, bit_idioms):
+        //           a select that cfg_simplify2 forms at the end of an
+        //           iteration must be visited in the next one even when no
+        //           copy or constant moved.  Without 0/7/10 the phase saw such
+        //           a select only on x86-64 at -O2/-O3, where the vectorizer's
+        //           if-conversion forms it earlier in the same iteration --
+        //           AArch64, RISC-V, i686 and x86-64 -Os kept the branchy
+        //           select (`abs_select`: 18 RISC-V instructions with a branch
+        //           instead of `sraiw; xor; subw`).
+        //           GVN (5) is an upstream for the same reason: merging two
+        //           equal values is what makes this phase's operand-identity
+        //           patterns visible.  `short x; x < 0 ? -x : x` reaches
+        //           `signmag` as `neg(sext x)` against a second, equal
+        //           `sext x`; GVN unifies them later in the iteration, and
+        //           without this wake-up the select was never revisited
+        //           (x86-64: 7 instructions where `movswl; mov; neg; cmovs`
+        //           does it in 4).
+        if !dis.simplify && should_run!(3, 0, 1, 2, 4, 5, 7, 8, 10) {
             let n = timed_pass!(
                 "simplify",
                 run_on_visited(module, &dirty, &mut changed, |func| {
@@ -3227,7 +3250,10 @@ pub(crate) fn run_passes(
         // Upstream: same producers as constfold — inlining and copy_prop turn
         //           arguments into constants, if_convert creates Selects, and
         //           cfg_simplify exposes newly single-predecessor joins.
-        if opt_level >= 2 && !pass_disabled(&disabled, "sccp") && should_run!(4, 0, 1, 2, 3, 7, 8) {
+        if opt_level >= 2
+            && !pass_disabled(&disabled, "sccp")
+            && should_run!(4, 0, 1, 2, 3, 7, 8, 10)
+        {
             let n = timed_pass!(
                 "sccp",
                 run_on_visited(module, &dirty, &mut changed, sccp::run_function)
@@ -3313,9 +3339,10 @@ pub(crate) fn run_passes(
         {
             // GVN is enabled; CCC_DISABLE_PASSES=gvn is the diagnostic kill switch.
             let gvn_enabled = true;
-            let run_gvn =
-                gvn_enabled && !dis.gvn && (should_run!(5, 0, 1, 3, 6) || prev_purity_changes > 0);
-            let run_licm = !dis.licm && (should_run!(6, 0, 1, 5) || prev_purity_changes > 0);
+            let run_gvn = gvn_enabled
+                && !dis.gvn
+                && (should_run!(5, 0, 1, 3, 6, 10) || prev_purity_changes > 0);
+            let run_licm = !dis.licm && (should_run!(6, 0, 1, 5, 10) || prev_purity_changes > 0);
             let run_ivsr = iter == 0
                 && std::env::var("CCC_NO_IVSR").is_err()
                 && !pass_disabled(&disabled, "ivsr");
@@ -3400,7 +3427,7 @@ pub(crate) fn run_passes(
         // select lowering produces two arms full of slot round-trips, which
         // is strictly bigger than the setcc/cmov form. GCC if-converts at
         // -Os for the same reason.
-        if !dis.ifconv && should_run!(7, 0, 4) {
+        if !dis.ifconv && should_run!(7, 0, 4, 10) {
             // Forward redundant reloads first: removing a load from a
             // conditional arm makes the arm side-effect-free so
             // if-conversion can fire.

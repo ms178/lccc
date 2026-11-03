@@ -33,37 +33,14 @@ fn relation(a: Operand, b: Operand, cx: &Context<'_>) -> Option<bool> {
     let y = if al == bl && ar == br {
         *y
     } else if al == br && ar == bl {
-        match y {
-            IrCmpOp::Eq => IrCmpOp::Eq,
-            IrCmpOp::Ne => IrCmpOp::Ne,
-            IrCmpOp::Ult => IrCmpOp::Ugt,
-            IrCmpOp::Ule => IrCmpOp::Uge,
-            IrCmpOp::Ugt => IrCmpOp::Ult,
-            IrCmpOp::Uge => IrCmpOp::Ule,
-            IrCmpOp::Slt => IrCmpOp::Sgt,
-            IrCmpOp::Sle => IrCmpOp::Sge,
-            IrCmpOp::Sgt => IrCmpOp::Slt,
-            IrCmpOp::Sge => IrCmpOp::Sle,
-        }
+        y.swapped()
     } else {
         return None;
     };
     if *x == y {
         return Some(true);
     }
-    let inverse = match x {
-        IrCmpOp::Eq => IrCmpOp::Ne,
-        IrCmpOp::Ne => IrCmpOp::Eq,
-        IrCmpOp::Ult => IrCmpOp::Uge,
-        IrCmpOp::Ule => IrCmpOp::Ugt,
-        IrCmpOp::Ugt => IrCmpOp::Ule,
-        IrCmpOp::Uge => IrCmpOp::Ult,
-        IrCmpOp::Slt => IrCmpOp::Sge,
-        IrCmpOp::Sle => IrCmpOp::Sgt,
-        IrCmpOp::Sgt => IrCmpOp::Sle,
-        IrCmpOp::Sge => IrCmpOp::Slt,
-    };
-    (inverse == y).then_some(false)
+    (x.inverse() == y).then_some(false)
 }
 fn arm(
     op: Operand,

@@ -117,7 +117,12 @@ MARKER='FIX''ME'
 #        pass pays one read per process.  Raised to the measurement, exactly:
 #        the count below is what `grep -rn 'env::var' src/passes` reports with
 #        src/passes/mod.rs excluded.
-ENV_READ_BUDGET=147
+#   148  2026-11-02: the boolean-return kill switch (CCC_NO_BOOL_RETURN, which
+#        keeps `if (c) return 1; return 0;` as a branch), resolved once in a
+#        `LazyLock` in src/passes/cfg_simplify.rs next to the fold it gates,
+#        so the fold pays one read per process.  Raised to the measurement,
+#        exactly.
+ENV_READ_BUDGET=148
 
 fail=0
 report() { # report <label> <offending lines>

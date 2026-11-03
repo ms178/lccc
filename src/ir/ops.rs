@@ -3,6 +3,8 @@
 //! Each enum carries its own evaluation methods (eval_i64, eval_i128, eval_f64)
 //! for use by constant folding and simplification passes.
 
+use crate::common::types::IrType;
+
 /// Atomic read-modify-write operations.
 #[derive(Debug, Clone, Copy)]
 pub enum AtomicRmwOp {
@@ -488,6 +490,52 @@ pub enum IrCmpOp {
 }
 
 impl IrCmpOp {
+    /// The predicate that holds exactly when `self` does not on integer
+    /// operands: `!(a OP b)` is `a OP.inverse() b`. Integers are totally
+    /// ordered, so this is exact for every predicate; for floats use
+    /// [`Self::inverse_for`].
+    pub fn inverse(self) -> IrCmpOp {
+        match self {
+            IrCmpOp::Eq => IrCmpOp::Ne,
+            IrCmpOp::Ne => IrCmpOp::Eq,
+            IrCmpOp::Slt => IrCmpOp::Sge,
+            IrCmpOp::Sle => IrCmpOp::Sgt,
+            IrCmpOp::Sgt => IrCmpOp::Sle,
+            IrCmpOp::Sge => IrCmpOp::Slt,
+            IrCmpOp::Ult => IrCmpOp::Uge,
+            IrCmpOp::Ule => IrCmpOp::Ugt,
+            IrCmpOp::Ugt => IrCmpOp::Ule,
+            IrCmpOp::Uge => IrCmpOp::Ult,
+        }
+    }
+
+    /// [`Self::inverse`] for operands of type `ty`, or `None` when no
+    /// predicate is the exact negation: an ordered float predicate is false
+    /// on unordered (NaN) operands and so is its swapped-direction
+    /// counterpart (`!(a < b)` holds for NaN, `a >= b` does not). The float
+    /// equality pair inverts exactly, `Ne` being true on unordered operands
+    /// (see [`Self::eval_f64`]).
+    pub fn inverse_for(self, ty: IrType) -> Option<IrCmpOp> {
+        (!ty.is_float() || matches!(self, IrCmpOp::Eq | IrCmpOp::Ne)).then(|| self.inverse())
+    }
+
+    /// The predicate with the operands exchanged: `a OP b` is
+    /// `b OP.swapped() a`, exact for every operand type (NaN included).
+    pub fn swapped(self) -> IrCmpOp {
+        match self {
+            IrCmpOp::Eq => IrCmpOp::Eq,
+            IrCmpOp::Ne => IrCmpOp::Ne,
+            IrCmpOp::Slt => IrCmpOp::Sgt,
+            IrCmpOp::Sle => IrCmpOp::Sge,
+            IrCmpOp::Sgt => IrCmpOp::Slt,
+            IrCmpOp::Sge => IrCmpOp::Sle,
+            IrCmpOp::Ult => IrCmpOp::Ugt,
+            IrCmpOp::Ule => IrCmpOp::Uge,
+            IrCmpOp::Ugt => IrCmpOp::Ult,
+            IrCmpOp::Uge => IrCmpOp::Ule,
+        }
+    }
+
     /// Evaluate this comparison on two i64 operands.
     ///
     /// Signed comparisons use Rust's native i64 ordering.
@@ -539,6 +587,88 @@ impl IrCmpOp {
             IrCmpOp::Sle | IrCmpOp::Ule => lhs <= rhs,
             IrCmpOp::Sgt | IrCmpOp::Ugt => lhs > rhs,
             IrCmpOp::Sge | IrCmpOp::Uge => lhs >= rhs,
+        }
+    }
+}
+
+#[cfg(test)]
+mod cmp_op_tests {
+    use super::*;
+
+    const OPS: [IrCmpOp; 10] = [
+        IrCmpOp::Eq,
+        IrCmpOp::Ne,
+        IrCmpOp::Slt,
+        IrCmpOp::Sle,
+        IrCmpOp::Sgt,
+        IrCmpOp::Sge,
+        IrCmpOp::Ult,
+        IrCmpOp::Ule,
+        IrCmpOp::Ugt,
+        IrCmpOp::Uge,
+    ];
+    const INTS: [i64; 9] = [
+        i64::MIN,
+        i64::MIN + 1,
+        -2,
+        -1,
+        0,
+        1,
+        2,
+        i64::MAX - 1,
+        i64::MAX,
+    ];
+
+    #[test]
+    fn inverse_negates_and_swapped_exchanges_on_every_integer_pair() {
+        for op in OPS {
+            assert_eq!(op.inverse().inverse(), op);
+            assert_eq!(op.swapped().swapped(), op);
+            for a in INTS {
+                for b in INTS {
+                    let holds = op.eval_i64(a, b);
+                    assert_eq!(op.inverse().eval_i64(a, b), !holds, "{op:?} {a} {b}");
+                    assert_eq!(op.swapped().eval_i64(b, a), holds, "{op:?} {a} {b}");
+                    let (wa, wb) = (i128::from(a) << 64, i128::from(b) << 64);
+                    let wide = op.eval_i128(wa, wb);
+                    assert_eq!(op.inverse().eval_i128(wa, wb), !wide, "{op:?} {a} {b}");
+                    assert_eq!(op.swapped().eval_i128(wb, wa), wide, "{op:?} {a} {b}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn floats_invert_only_the_equality_pair_and_swap_everything() {
+        let floats = [
+            f64::NEG_INFINITY,
+            -1.0,
+            -0.0,
+            0.0,
+            1.0,
+            f64::INFINITY,
+            f64::NAN,
+        ];
+        for op in OPS {
+            for ty in [IrType::F32, IrType::F64, IrType::F128] {
+                let inverse = op.inverse_for(ty);
+                assert_eq!(inverse.is_some(), matches!(op, IrCmpOp::Eq | IrCmpOp::Ne));
+                for a in floats {
+                    for b in floats {
+                        let holds = op.eval_f64(a, b);
+                        assert_eq!(op.swapped().eval_f64(b, a), holds, "{op:?} {a} {b}");
+                        if let Some(inv) = inverse {
+                            assert_eq!(inv.eval_f64(a, b), !holds, "{op:?} {a} {b}");
+                        }
+                    }
+                }
+            }
+            // An ordered predicate's "inverse" really is wrong on NaN.
+            if !matches!(op, IrCmpOp::Eq | IrCmpOp::Ne) {
+                assert!(!op.eval_f64(f64::NAN, 0.0) && !op.inverse().eval_f64(f64::NAN, 0.0));
+            }
+            assert_eq!(op.inverse_for(IrType::I32), Some(op.inverse()));
+            assert_eq!(op.inverse_for(IrType::U128), Some(op.inverse()));
         }
     }
 }

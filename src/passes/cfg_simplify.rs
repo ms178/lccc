@@ -9,14 +9,18 @@
 //! 5. Removing dead (unreachable) blocks that have no predecessors
 //! 6. Simplifying trivial phi nodes (single-entry or all-same-value) to Copy
 //! 7. Merging single-predecessor blocks into their predecessor
+//! 8. Returning the condition of a branch into two blocks that return the
+//!    constants 1 and 0 (`if (c) return 1; return 0;` -> `return c != 0;`)
 //!
 //! This pass runs to a fixpoint, since one simplification can enable others.
 //! Phi nodes in successor blocks are updated when edges are redirected.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::source::Span;
 use crate::common::types::IrType;
 use crate::ir::reexports::{
-    BasicBlock, BlockId, Instruction, IrCmpOp, IrConst, IrFunction, Operand, Terminator, Value,
+    BasicBlock, BlockId, Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Terminator,
+    Value,
 };
 
 /// Maximum depth for walking single-predecessor chains when resolving
@@ -65,6 +69,7 @@ pub(crate) fn simplify_cfg(func: &mut IrFunction) -> usize {
         changed += fold_constant_cond_branches(func, &label_to_idx);
         changed += fold_constant_switches(func, &label_to_idx);
         changed += simplify_redundant_cond_branches(func);
+        changed += fold_boolean_return_branches(func, &label_to_idx);
         changed += thread_jump_chains(func, &label_to_idx);
         changed += eliminate_unreachable_blocks(func);
         changed += simplify_trivial_phis(func);
@@ -666,6 +671,229 @@ fn fold_constant_terminators(func: &mut IrFunction) -> usize {
         }
     }
     folded
+}
+
+/// `CCC_NO_BOOL_RETURN`: keep every boolean-return branch (A/B measurement and
+/// bisection). Presence is the answer, read once per process.
+fn bool_return_disabled() -> bool {
+    static DISABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_NO_BOOL_RETURN").is_some());
+    *DISABLED
+}
+
+/// Whether `block` ends in the shape the backend fuses with an asm-goto's own
+/// flags (`collect_asm_goto_cc_branch_values`): `asm goto(... : "=@cc<cc>"(obj)
+/// ...)`, then `cond = load obj`, then the branch on `cond`. The branch costs
+/// no `setcc` and no memory round trip there; turning it into a returned value
+/// would force the flag through the output object (`sete` to the stack, a
+/// reload, a compare and a second `setcc`), so the boolean-return fold leaves
+/// it alone.
+fn branches_on_asm_goto_flag_output(block: &BasicBlock, cond: Value) -> bool {
+    let n = block.instructions.len();
+    let (
+        Some(Instruction::InlineAsm {
+            outputs,
+            goto_labels,
+            ..
+        }),
+        Some(Instruction::Load { dest, ptr, .. }),
+    ) = (
+        n.checked_sub(2).and_then(|i| block.instructions.get(i)),
+        block.instructions.last(),
+    )
+    else {
+        return false;
+    };
+    *dest == cond
+        && !goto_labels.is_empty()
+        && outputs.len() == 1
+        && outputs[0].1 == *ptr
+        && outputs[0]
+            .0
+            .trim_start_matches(['=', '+', '&', '%'])
+            .starts_with("@cc")
+}
+
+/// `CondBranch(c, T, F)` where `T` and `F` are distinct, instruction-free
+/// blocks returning the integer constants 1 and 0 (in either order) returns
+/// the condition itself:
+///
+/// ```text
+///   if (a < b) return 1; return 0;           ->  return a < b;
+///   if ((m >> i) & 1) return 0; return 1;    ->  return !((m >> i) & 1);
+/// ```
+///
+/// GCC 16.2 (phiopt) and Clang 23.1.4 (SimplifyCFG) return the flag; LCCC
+/// kept a data-dependent branch into two return blocks (`cmpl; jge; movl $1,
+/// %eax; ret; xorl %eax, %eax; ret` for `xorl; cmpl; setl; ret`), which costs
+/// a misprediction per unpredictable bit test (sqlite3's `MASKBIT` guard,
+/// `if (iCol >= 64 || (mask & MASKBIT(iCol)) == 0) return 0; return 1;`).
+///
+/// How the condition becomes the returned boolean, which is exactly 0 or 1
+/// like the constants it replaces:
+/// * a `Cmp` already is one (the frontend types its result `I32`): returned
+///   as is, or recomputed with the inverted predicate -- integer predicates,
+///   and float `==`/`!=`, whose inversion is exact under NaN; an ordered
+///   float predicate is refused (`!(a < b)` is not `a >= b`);
+/// * a `BitTest` is one in its own type: cast, or compared `== 0`;
+/// * any other integer value is compared `!= 0` / `== 0`, the test
+///   `CondBranch` itself performs.
+///
+/// The boolean is cast to the return type unless it already has it. `T` and
+/// `F` keep their other predecessors and are swept with their last one. A
+/// branch on an asm-goto `@cc` flag output is left to the backend's flag
+/// fusion (`branches_on_asm_goto_flag_output`), and `CCC_NO_BOOL_RETURN`
+/// keeps every such branch (bisection). The compare and cast that replace the
+/// branch read only values the branch read
+/// (or that dominate the compare it read), so the rewrite is sound on every
+/// path, at every width, for every target.
+fn fold_boolean_return_branches(
+    func: &mut IrFunction,
+    label_to_idx: &FxHashMap<BlockId, usize>,
+) -> usize {
+    let ret_ty = func.return_type;
+    if !ret_ty.is_integer() || ret_ty.is_128bit() {
+        return 0;
+    }
+    let returned_bit = |idx: usize| -> Option<bool> {
+        let block = &func.blocks[idx];
+        let Terminator::Return(Some(Operand::Const(c))) = &block.terminator else {
+            return None;
+        };
+        if !block.instructions.is_empty() {
+            return None;
+        }
+        match const_as_u128_masked(c, ret_ty)? {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    };
+    // (branching block, condition, whether the branch returns the condition
+    // itself rather than its complement)
+    let mut plans: Vec<(usize, Value, bool)> = Vec::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        let Terminator::CondBranch {
+            cond: Operand::Value(cond),
+            true_label,
+            false_label,
+        } = &block.terminator
+        else {
+            continue;
+        };
+        if true_label == false_label {
+            continue;
+        }
+        let (Some(&t), Some(&f)) = (label_to_idx.get(true_label), label_to_idx.get(false_label))
+        else {
+            continue;
+        };
+        if let (Some(on_true), Some(on_false)) = (returned_bit(t), returned_bit(f))
+            && on_true != on_false
+            && !branches_on_asm_goto_flag_output(block, *cond)
+        {
+            plans.push((bi, *cond, on_true));
+        }
+    }
+    // The kill switch is consulted only once a candidate exists: the scan above
+    // is the common, allocation-free path.
+    if plans.is_empty() || bool_return_disabled() {
+        return 0;
+    }
+    let wanted: FxHashSet<Value> = plans.iter().map(|&(_, cond, _)| cond).collect();
+    let defs: FxHashMap<Value, Instruction> = func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .filter_map(|inst| {
+            let dest = inst.dest()?;
+            wanted.contains(&dest).then(|| (dest, inst.clone()))
+        })
+        .collect();
+    let mut next_id = func.sound_next_value_id();
+    let mut folded = 0;
+    for (bi, cond, keep) in plans {
+        let Some(def) = defs.get(&cond) else {
+            continue;
+        };
+        let Some((mut insts, value, ty)) = boolean_of_condition(def, cond, keep, &mut next_id)
+        else {
+            continue;
+        };
+        let value = if ty == ret_ty {
+            value
+        } else {
+            let dest = Value(next_id);
+            next_id += 1;
+            insts.push(Instruction::Cast {
+                dest,
+                src: Operand::Value(value),
+                from_ty: ty,
+                to_ty: ret_ty,
+            });
+            dest
+        };
+        let block = &mut func.blocks[bi];
+        block.extend_insts(insts, Span::dummy());
+        block.terminator = Terminator::Return(Some(Operand::Value(value)));
+        folded += 1;
+    }
+    func.next_value_id = next_id;
+    folded
+}
+
+/// The instructions computing `cond != 0` (`keep`) or `cond == 0`, exactly 0
+/// or 1, given `cond`'s definition; returns them, the boolean's value and its
+/// type. `None` when the condition's type is unknown, not an integer, or
+/// 128-bit, or when only an inexact inversion exists.
+fn boolean_of_condition(
+    def: &Instruction,
+    cond: Value,
+    keep: bool,
+    next_id: &mut u32,
+) -> Option<(Vec<Instruction>, Value, IrType)> {
+    let mut fresh = || {
+        let v = Value(*next_id);
+        *next_id += 1;
+        v
+    };
+    let test_zero = |dest: Value, ty: IrType| Instruction::Cmp {
+        dest,
+        op: if keep { IrCmpOp::Ne } else { IrCmpOp::Eq },
+        lhs: Operand::Value(cond),
+        rhs: Operand::Const(IrConst::zero(ty)),
+        ty,
+    };
+    match def {
+        Instruction::Cmp { .. } if keep => Some((Vec::new(), cond, IrType::I32)),
+        Instruction::Cmp {
+            op, lhs, rhs, ty, ..
+        } => {
+            let op = op.inverse_for(*ty)?;
+            let dest = fresh();
+            let inverted = Instruction::Cmp {
+                dest,
+                op,
+                lhs: *lhs,
+                rhs: *rhs,
+                ty: *ty,
+            };
+            Some((vec![inverted], dest, IrType::I32))
+        }
+        Instruction::BinOp {
+            op: IrBinOp::BitTest,
+            ty,
+            ..
+        } if keep && ty.is_integer() && !ty.is_128bit() => Some((Vec::new(), cond, *ty)),
+        _ => {
+            let ty = def.result_type()?;
+            if !ty.is_integer() || ty.is_128bit() {
+                return None;
+            }
+            let dest = fresh();
+            Some((vec![test_zero(dest, ty)], dest, IrType::I32))
+        }
+    }
 }
 
 /// Integer constant as u128 two's-complement bit pattern. `None` for float
@@ -2297,3 +2525,7 @@ mod tests {
 #[cfg(test)]
 #[path = "cfg_thread_tests.rs"]
 mod thread_tests;
+
+#[cfg(test)]
+#[path = "cfg_simplify_bool_return_tests.rs"]
+mod bool_return_tests;

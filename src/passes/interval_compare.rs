@@ -129,7 +129,7 @@ fn predicate(operand: Operand, defs: &[Option<Instruction>]) -> Option<Predicate
     }
     let (op, value, constant) = match (lhs, rhs) {
         (value, Operand::Const(c)) => (*op, *value, ring(c.to_i64()?, *ty)),
-        (Operand::Const(c), value) => (mirror(*op), *value, ring(c.to_i64()?, *ty)),
+        (Operand::Const(c), value) => (op.swapped(), *value, ring(c.to_i64()?, *ty)),
         _ => return None,
     };
     Some(Predicate {
@@ -138,21 +138,6 @@ fn predicate(operand: Operand, defs: &[Option<Instruction>]) -> Option<Predicate
         constant,
         ty: *ty,
     })
-}
-
-fn mirror(op: IrCmpOp) -> IrCmpOp {
-    match op {
-        IrCmpOp::Eq => IrCmpOp::Eq,
-        IrCmpOp::Ne => IrCmpOp::Ne,
-        IrCmpOp::Slt => IrCmpOp::Sgt,
-        IrCmpOp::Sle => IrCmpOp::Sge,
-        IrCmpOp::Sgt => IrCmpOp::Slt,
-        IrCmpOp::Sge => IrCmpOp::Sle,
-        IrCmpOp::Ult => IrCmpOp::Ugt,
-        IrCmpOp::Ule => IrCmpOp::Uge,
-        IrCmpOp::Ugt => IrCmpOp::Ult,
-        IrCmpOp::Uge => IrCmpOp::Ule,
-    }
 }
 
 fn same_value(a: &Operand, b: &Operand) -> bool {

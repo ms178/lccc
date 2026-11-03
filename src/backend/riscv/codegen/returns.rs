@@ -60,7 +60,15 @@ impl RiscvCodegen {
     }
 
     pub(super) fn emit_return_int_to_reg_impl(&mut self) {
-        self.state.emit("    mv a0, t0");
+        // A return value is passed like a named argument (RISC-V psABI): an
+        // `unsigned int` result is sign-extended to 64 bits.  The internal
+        // U32 form is zero-extended (see `emit_call_reg_args_impl`), and a
+        // conforming caller compares the returned register as is.
+        if self.current_return_type == IrType::U32 {
+            self.state.emit("    sext.w a0, t0");
+        } else {
+            self.state.emit("    mv a0, t0");
+        }
     }
 
     pub(super) fn emit_get_return_f64_second_impl(&mut self, dest: &Value) {

@@ -293,9 +293,13 @@ impl<'a> ExprTypeChecker<'a> {
                 Box::new(CType::plain_char()),
                 PtrQuals::of(AddressSpace::Default),
             )),
-            Expr::WideStringLiteral(_, _) => {
-                Some(CType::Pointer(Box::new(CType::Int), PtrQuals::GENERIC))
-            }
+            // `L"..."` decays to `wchar_t *` (`int *` on x86 and RISC-V,
+            // `unsigned int *` on AArch64; `-fshort-wchar` rewrote the node to
+            // a `u"..."` literal in the parser).
+            Expr::WideStringLiteral(_, _) => Some(CType::Pointer(
+                Box::new(crate::common::types::wchar_ctype()),
+                PtrQuals::GENERIC,
+            )),
             Expr::Char16StringLiteral(_, _) => Some(CType::Pointer(
                 Box::new(CType::UShort),
                 PtrQuals::of(AddressSpace::Default),

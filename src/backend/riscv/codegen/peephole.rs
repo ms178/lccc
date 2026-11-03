@@ -623,6 +623,8 @@ pub fn peephole_optimize(asm: String) -> String {
         return crate::backend::peephole_common::strip_volatile_markers(asm);
     }
     let has_markers = asm.contains("# LCCC_VOLATILE_");
+    // Either marker: a stray `#NO_APP` is malformed input, not plain text.
+    let has_inline_asm = asm.contains("#APP") || asm.contains("#NO_APP");
     let mut lines: Vec<String> = asm.lines().map(String::from).collect();
     let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
     let n = lines.len();
@@ -630,7 +632,7 @@ pub fn peephole_optimize(asm: String) -> String {
     if n == 0 {
         return asm;
     }
-    let ranges = if has_markers {
+    let mut ranges = if has_markers {
         match volatile_function_ranges(&lines) {
             Some(ranges) => ranges,
             None => return crate::backend::peephole_common::strip_volatile_markers(asm),
@@ -638,16 +640,28 @@ pub fn peephole_optimize(asm: String) -> String {
     } else {
         Vec::new()
     };
+    // Functions holding inline assembly are opaque for the same reason: the
+    // statement's operands are bound by constraints the text does not show.
+    if has_inline_asm {
+        match crate::backend::peephole_common::inline_asm_protected_ranges(&lines) {
+            Some(asm_ranges) => ranges.extend(asm_ranges),
+            None => return crate::backend::peephole_common::strip_volatile_markers(asm),
+        }
+    }
     let has_opaque_functions = !ranges.is_empty();
     let mut protected = Vec::new();
+    // A function with both a volatile access and inline asm is listed twice;
+    // each line is hidden (and later restored) exactly once.
+    let mut hidden = vec![false; n];
     for range in ranges {
         for i in range {
-            if kinds[i] == LineKind::Label {
+            if kinds[i] == LineKind::Label || hidden[i] {
                 // Preserve labels as control-flow boundaries. Block merging is
                 // disabled below because references inside opaque functions
                 // are deliberately invisible to the optimizer's CFG.
                 continue;
             }
+            hidden[i] = true;
             // A whole volatile function is opaque, not only the access: a
             // prior store or register definition may feed it. Other clears
             // register/slot facts and cannot match a textual peephole pattern.
@@ -675,6 +689,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= fuse_branch_over_jump(&mut lines, &mut kinds, n);
         changed |= thread_trampolines(&mut lines, &mut kinds, n);
         changed |= eliminate_redundant_sext_w(&lines, &mut kinds, n);
+        changed |= fold_zext32_into_sext_w(&lines, &mut kinds, n);
         changed |= eliminate_redundant_zext_byte(&mut lines, &mut kinds, n);
         changed |= eliminate_self_moves(&mut kinds, n);
         changed |= eliminate_redundant_mv_chain(&mut lines, &mut kinds, n);
@@ -712,6 +727,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= rewrite_far_jumps_to_near(&mut lines, &mut kinds, n);
             changed2 |= fuse_branch_over_jump(&mut lines, &mut kinds, n);
             changed2 |= eliminate_redundant_sext_w(&lines, &mut kinds, n);
+            changed2 |= fold_zext32_into_sext_w(&lines, &mut kinds, n);
             changed2 |= eliminate_redundant_zext_byte(&mut lines, &mut kinds, n);
             changed2 |= eliminate_self_moves(&mut kinds, n);
             changed2 |= eliminate_redundant_mv_chain(&mut lines, &mut kinds, n);
@@ -1137,12 +1153,23 @@ fn sext_producing_def(line: &str, kind: LineKind) -> Option<(u8, bool)> {
                 return None;
             }
             // Sext-wide producers: only instructions whose RV64 semantics
-            // GUARANTEE sext32 canonical results — the *w family, addiw,
-            // srai (sign-shifting keeps the sign-extension), and lui
-            // (sign-extended imm20).  slli/srli are 64-bit shifts: their
-            // results are NOT sext32 in general (e.g. `slli rX,rX,32`
-            // of a negative sext32 value zero-fills the top half), so a
-            // following `sext.w rX,rX` is real code, never a no-op.
+            // GUARANTEE sext32 canonical results whatever their input — the
+            // *w family (register and immediate forms), lui (sign-extended
+            // imm20), and `srai` by 32 or more, which leaves at least 33
+            // copies of bit 63 on top.  A shorter `srai` keeps sext32 only
+            // of a sext32 input, which this def-local view cannot see:
+            // `srai rX,rX,3` of 0x10_0000_0000 is 0x2_0000_0000, so a
+            // following `sext.w` (a `long` -> `int` truncation) is real
+            // code.  slli/srli are 64-bit shifts: their results are NOT
+            // sext32 in general (e.g. `slli rX,rX,32` of a negative sext32
+            // value zero-fills the top half), so a following
+            // `sext.w rX,rX` is real code, never a no-op.
+            let long_srai = mnem == "srai"
+                && rest
+                    .rsplit(',')
+                    .next()
+                    .and_then(|imm| parse_asm_i64(imm.trim()))
+                    .is_some_and(|k| (32..64).contains(&k));
             let wide = matches!(
                 mnem,
                 "addw"
@@ -1156,8 +1183,11 @@ fn sext_producing_def(line: &str, kind: LineKind) -> Option<(u8, bool)> {
                     | "srlw"
                     | "sraw"
                     | "addiw"
-                    | "srai"
-            ) || mnem == "lui";
+                    | "slliw"
+                    | "srliw"
+                    | "sraiw"
+            ) || mnem == "lui"
+                || long_srai;
             Some((dst, wide))
         }
         _ => None,
@@ -1243,6 +1273,64 @@ fn eliminate_redundant_sext_w(lines: &[String], kinds: &mut [LineKind], n: usize
         i += 1;
     }
     changed
+}
+
+// ── Zero extension consumed only by a sign extension ─────────────────────────
+//
+// `slli rX, rX, 32; srli rX, rX, 32; sext.w rX, rX` is `sext.w rX, rX`: the
+// sign extension reads only the low word, which the zero extension leaves
+// unchanged, and it overwrites rX, so nothing observes the pair.  This is an
+// `unsigned int` parameter handed back as is: the entry normalises it to
+// LCCC's internal zero-extended form and the psABI return sign-extends it
+// again (`unsigned f(unsigned x) { return x; }`: 5 -> 2 instructions with the
+// dead-temporary rule in `eliminate_dead_reg_moves`; GCC: `ret`).  The three
+// lines must be adjacent apart from deleted ones: a label between them is a
+// join whose other predecessors this local view cannot see.
+fn fold_zext32_into_sext_w(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for k in 0..n {
+        let LineKind::SextW { dst, src } = kinds[k] else {
+            continue;
+        };
+        if dst != src || dst == REG_NONE {
+            continue;
+        }
+        let Some(j) = previous_live_line(kinds, k) else {
+            continue;
+        };
+        let Some(i) = previous_live_line(kinds, j) else {
+            continue;
+        };
+        if is_self_shift_by_32(&lines[j], "srli", dst)
+            && is_self_shift_by_32(&lines[i], "slli", dst)
+        {
+            kinds[i] = LineKind::Nop;
+            kinds[j] = LineKind::Nop;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// The nearest line before `k` that has not been deleted.
+fn previous_live_line(kinds: &[LineKind], k: usize) -> Option<usize> {
+    (0..k).rev().find(|&i| kinds[i] != LineKind::Nop)
+}
+
+/// `MNEM rX, rX, 32` where rX is the tracked register `reg`.
+fn is_self_shift_by_32(line: &str, mnem: &str, reg: u8) -> bool {
+    let Some((m, rest)) = line.trim().split_once(' ') else {
+        return false;
+    };
+    if m != mnem {
+        return false;
+    }
+    let mut ops = rest.split(',').map(str::trim);
+    matches!(
+        (ops.next(), ops.next(), ops.next(), ops.next()),
+        (Some(d), Some(s), Some(amount), None)
+            if parse_reg(d) == reg && parse_reg(s) == reg && parse_asm_i64(amount) == Some(32)
+    )
 }
 
 // ── Narrow-value lattice and redundant zero-extension elimination ────────────
@@ -2465,9 +2553,14 @@ fn eliminate_dead_reg_moves(lines: &[String], kinds: &mut [LineKind], n: usize) 
             _ => continue,
         };
 
-        // Only eliminate moves to temp registers (t0-t6).
-        // Callee-saved registers might be live across basic blocks.
-        if dst > REG_T6 {
+        // Temporaries (t0-t6) and argument registers (a0-a7) only: the scan
+        // below proves deadness by a straight-line overwrite, which holds for
+        // any register, but its read model does not see the `s0` base of a
+        // frame access, and `sp`/`ra`/callee-saved registers are never worth
+        // the risk.  At `ret` only the temporaries are dead: a0/a1 carry the
+        // return value.
+        let is_temp = dst <= REG_T6;
+        if !is_temp && !(REG_A0..=REG_A7).contains(&dst) {
             continue;
         }
 
@@ -2486,10 +2579,18 @@ fn eliminate_dead_reg_moves(lines: &[String], kinds: &mut [LineKind], n: usize) 
 
             // Stop at control flow boundaries and any unclassified instruction
             match kinds[j] {
+                LineKind::Ret => {
+                    // `ret` leaves only the return registers (a0/a1, fa0/fa1)
+                    // and the callee-saved ones live; a temporary not read
+                    // on the way is dead.  User asm (a naked function's
+                    // custom convention) never reaches here: functions
+                    // holding it are opaque.
+                    is_dead = is_temp;
+                    break;
+                }
                 LineKind::Label
                 | LineKind::Jump
                 | LineKind::Branch
-                | LineKind::Ret
                 | LineKind::Call
                 | LineKind::Directive => break,
                 LineKind::Other => {
@@ -3053,15 +3154,17 @@ mod tests {
 
     #[test]
     fn test_gsf_different_reg_forwarding() {
-        // Store t0 then load t1 from same slot — replace load with mv
+        // Store t0 then load a0 from same slot — replace load with mv.  The
+        // destination is the return register: a temporary loaded and never
+        // read before `ret` would be deleted outright as a dead move.
         let input = "\
     sd t0, -24(s0)\n\
     addi t2, t2, 4\n\
-    ld t1, -24(s0)\n\
+    ld a0, -24(s0)\n\
     ret\n";
         let result = peephole_optimize(input.to_string());
-        assert!(!result.contains("ld t1, -24(s0)"));
-        assert!(result.contains("mv t1, t0"));
+        assert!(!result.contains("ld a0, -24(s0)"));
+        assert!(result.contains("mv a0, t0"));
     }
 
     #[test]
@@ -3180,25 +3283,26 @@ mod tests {
 
     #[test]
     fn test_full_bb_copy_prop() {
-        // mv t0, s1 ; mv t1, t0 ; add t2, t1, t0
+        // mv t0, s1 ; mv t1, t0 ; add a0, t1, t0
         // Copy propagation is single-step lookahead:
         // 1. mv t0, s1 → propagates into next: mv t1, t0 → mv t1, s1
-        // 2. mv t1, s1 → propagates into next: add t2, t1, t0 → add t2, s1, t0
-        // t0 is not further propagated since mv t0, s1 is no longer adjacent to the add.
+        // 2. mv t1, s1 → propagates into next: add a0, t1, t0 → add a0, s1, t0
+        // after which `mv t1, s1` has no reader before `ret` and is deleted
+        // (t0 is still read by the add, so its copy stays).
         let input = "\
     mv t0, s1\n\
     mv t1, t0\n\
-    add t2, t1, t0\n\
+    add a0, t1, t0\n\
     ret\n";
         let result = peephole_optimize(input.to_string());
         assert!(
-            result.contains("mv t1, s1"),
-            "Expected t1 = s1 via chain, got:\n{}",
+            result.contains("add a0, s1,"),
+            "Expected t1 = s1 propagated through the chain into the add, got:\n{}",
             result
         );
         assert!(
-            result.contains("add t2, s1,"),
-            "Expected t1 propagated in add, got:\n{}",
+            !result.contains("mv t1,"),
+            "Expected the propagated copy to be dead at ret, got:\n{}",
             result
         );
     }
@@ -3413,6 +3517,37 @@ mod jump_near_tests {
     }
 
     #[test]
+    fn a_short_srai_is_not_a_sext32_producer() {
+        // `(int)(x >> 3)` for a `long x`: srai by 3 of 0x10_0000_0000 is
+        // 0x2_0000_0000, whose `sext.w` is 0 -- the truncation is real code.
+        for k in [1, 3, 31] {
+            let input = format!(
+                "f:\n    ld t0, 0(s0)\n    srai t0, t0, {k}\n    sext.w t0, t0\n    mv t1, t0\n    ret\n"
+            );
+            let out = peephole_optimize(input.clone());
+            assert!(out.contains("sext.w t0, t0"), "k={k}\n{out}");
+        }
+    }
+
+    #[test]
+    fn a_long_srai_and_the_w_immediates_are_sext32_producers() {
+        for producer in [
+            "srai t0, t0, 32",
+            "srai t0, t0, 63",
+            "slliw t0, t0, 3",
+            "srliw t0, t0, 1",
+            "sraiw t0, t0, 31",
+            "addiw t0, t0, -1",
+        ] {
+            let input = format!(
+                "f:\n    ld t0, 0(s0)\n    {producer}\n    sext.w t0, t0\n    mv t1, t0\n    ret\n"
+            );
+            let out = peephole_optimize(input.clone());
+            assert!(!out.contains("sext.w t0, t0"), "{producer}\n{out}");
+        }
+    }
+
+    #[test]
     fn sext_cross_register_form_never_deleted() {
         // Even a value no-op must survive: the instruction DEFINES t2, and
         // `bne t2, t1` below reads it (cfg_phi_web miscompile class).
@@ -3544,5 +3679,198 @@ mod jump_near_tests {
         let n = lines.len();
         assert!(!thread_trampolines(&mut lines, &mut kinds, n));
         assert_eq!(lines, original);
+    }
+}
+
+#[cfg(test)]
+mod inline_asm_and_return_tests {
+    use super::*;
+
+    fn opt(asm: &str) -> String {
+        peephole_optimize(asm.to_string())
+    }
+
+    /// The instruction lines of `out`, trimmed (labels and directives kept).
+    fn rows(out: &str) -> Vec<String> {
+        out.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn a_naked_function_body_is_left_as_written() {
+        // A custom convention may hand t0 back to an asm caller: the user's
+        // `mv t0, a0` before `ret` is not a dead temporary.
+        let asm = concat!(
+            ".type f, @function\n",
+            "f:\n",
+            ".cfi_startproc\n",
+            "#APP\n",
+            "    mv t0, a0\n",
+            "    ret\n",
+            "#NO_APP\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+            ".type g, @function\n",
+            "g:\n",
+            ".cfi_startproc\n",
+            "    mv t0, a0\n",
+            "    sext.w a0, a0\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size g, .-g\n",
+        );
+        let out = opt(asm);
+        let r = rows(&out);
+        let f = r.iter().position(|l| l == "f:").unwrap();
+        assert_eq!(
+            r[f + 1..f + 6],
+            [".cfi_startproc", "#APP", "mv t0, a0", "ret", "#NO_APP"],
+            "{out}"
+        );
+        let g = r.iter().position(|l| l == "g:").unwrap();
+        assert_eq!(
+            r[g + 1..g + 4],
+            [".cfi_startproc", "sext.w a0, a0", "ret"],
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn inline_asm_operands_staged_outside_the_region_survive() {
+        // `li a7, 64` is read by the `ecall` the text does not connect to it,
+        // and the later `li a7, 93` would otherwise look like its overwrite.
+        let asm = concat!(
+            ".type s, @function\n",
+            "s:\n",
+            ".cfi_startproc\n",
+            "    li a7, 64\n",
+            "    mv t1, a0\n",
+            "    mv t1, a1\n",
+            "#APP\n",
+            "    ecall\n",
+            "#NO_APP\n",
+            "    li a7, 93\n",
+            "    mv a0, a0\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size s, .-s\n",
+        );
+        assert_eq!(opt(asm), asm, "a function holding inline asm changed");
+    }
+
+    #[test]
+    fn a_function_with_both_volatile_access_and_asm_is_restored_once() {
+        let asm = concat!(
+            ".type v, @function\n",
+            "v:\n",
+            ".cfi_startproc\n",
+            "    # LCCC_VOLATILE_BEGIN\n",
+            "    lw t0, -24(s0)\n",
+            "    # LCCC_VOLATILE_END\n",
+            "#APP\n",
+            "    mv t2, t2\n",
+            "#NO_APP\n",
+            "    mv t0, t0\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size v, .-v\n",
+        );
+        let expected = crate::backend::peephole_common::strip_volatile_markers(asm.into());
+        assert_eq!(opt(asm), expected);
+    }
+
+    #[test]
+    fn top_level_asm_is_left_alone_and_neighbours_still_optimize() {
+        let asm = concat!(
+            "#APP\n",
+            ".globl _start\n",
+            "_start:\n",
+            "    mv a0, a0\n",
+            "    mv t0, a1\n",
+            "    ret\n",
+            "#NO_APP\n",
+            ".type h, @function\n",
+            "h:\n",
+            ".cfi_startproc\n",
+            "    mv t3, t3\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size h, .-h\n",
+        );
+        let out = opt(asm);
+        assert!(
+            out.starts_with(
+                "#APP\n.globl _start\n_start:\n    mv a0, a0\n    mv t0, a1\n    ret\n#NO_APP\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            !out.contains("mv t3, t3"),
+            "the next function lost its peephole: {out}"
+        );
+    }
+
+    #[test]
+    fn unbalanced_asm_markers_leave_the_unit_unchanged() {
+        let asm = ".type f, @function\nf:\n#APP\n    mv t0, t0\n    ret\n.size f, .-f\n";
+        assert_eq!(opt(asm), asm);
+        let asm = "#NO_APP\nf:\n    mv t0, t0\n    ret\n";
+        assert_eq!(opt(asm), asm);
+    }
+
+    #[test]
+    fn a_temporary_written_on_the_way_to_ret_is_dead() {
+        let out = opt("f:\n    mv t0, a0\n    sext.w a0, a0\n    ret\n");
+        assert_eq!(rows(&out), ["f:", "sext.w a0, a0", "ret"], "{out}");
+        // Return registers, callee-saved registers, reads on the way and
+        // other exits keep the move.
+        for (keep, mv) in [
+            ("f:\n    mv a1, a2\n    ret\n", "mv a1, a2"),
+            ("f:\n    call g\n    mv s1, a0\n    ret\n", "mv s1, a0"),
+            (
+                "f:\n    mv t0, a0\n    li a0, 1\n    addw a0, t0, a0\n    ret\n",
+                "mv t0, a0",
+            ),
+            ("f:\n    mv t0, a0\n    jr t0\n", "mv t0, a0"),
+            (
+                "f:\n    mv t0, a0\n    beqz a1, .L1\n    ret\n.L1:\n    mv a0, t0\n    ret\n",
+                "mv t0, a0",
+            ),
+        ] {
+            let out = opt(keep);
+            assert!(rows(&out).iter().any(|l| l == mv), "{keep} -> {out}");
+        }
+    }
+
+    #[test]
+    fn a_zero_extension_read_only_by_sext_w_folds_away() {
+        let out = opt("f:\n    slli a0, a0, 32\n    srli a0, a0, 32\n    sext.w a0, a0\n    ret\n");
+        assert_eq!(rows(&out), ["f:", "sext.w a0, a0", "ret"], "{out}");
+        // The returned-parameter shape the code generator emits.
+        let out = opt(
+            "f:\n    slli a0, a0, 32\n    srli a0, a0, 32\n    mv t0, a0\n    sext.w a0, t0\n    ret\n",
+        );
+        assert_eq!(rows(&out), ["f:", "sext.w a0, a0", "ret"], "{out}");
+        for keep in [
+            // A join between the pair and its reader.
+            "f:\n    slli a0, a0, 32\n    srli a0, a0, 32\n.L1:\n    sext.w a0, a0\n    ret\n",
+            // The zero-extended value lives on in a0.
+            "f:\n    slli a0, a0, 32\n    srli a0, a0, 32\n    sext.w a1, a0\n    ret\n",
+            // Not a word zero extension.
+            "f:\n    slli a0, a0, 31\n    srli a0, a0, 31\n    sext.w a0, a0\n    ret\n",
+            "f:\n    slli a0, a1, 32\n    srli a0, a0, 32\n    sext.w a0, a0\n    ret\n",
+            "f:\n    slli a0, a0, 32\n    srai a0, a0, 32\n    sext.w a0, a0\n    ret\n",
+        ] {
+            let out = opt(keep);
+            assert!(
+                rows(&out)
+                    .iter()
+                    .any(|l| l.starts_with("srli") || l.starts_with("srai")),
+                "{keep} -> {out}"
+            );
+        }
     }
 }

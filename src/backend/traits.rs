@@ -1944,26 +1944,6 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
         self.emit_va_arg_struct(dest_ptr, va_list_ptr, size, align);
     }
 
-    /// Emit `va_arg` of a vector-shaped type on x86-64.
-    ///
-    /// A vector vararg occupies ONE SSE register (its two eightbytes share
-    /// the single XMM slot at reg_save_area + fp_offset) or one 16-aligned
-    /// overflow slot; fp_offset always advances by exactly 16. This is
-    /// observably different from `emit_va_arg_struct_ex` with per-eightbyte
-    /// classes, which fetches one slot PER SSE eightbyte. Default
-    /// implementation falls back to the struct fetch (sound for targets
-    /// where the lowering never produces this instruction).
-    fn emit_va_arg_vector(
-        &mut self,
-        dest_ptr: &Value,
-        va_list_ptr: &Value,
-        size: usize,
-        align: usize,
-        _eightbyte_classes: &[crate::common::types::EightbyteClass],
-    ) {
-        self.emit_va_arg_struct(dest_ptr, va_list_ptr, size, align);
-    }
-
     /// Emit an atomic read-modify-write operation.
     fn emit_atomic_rmw(
         &mut self,
@@ -2080,11 +2060,12 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
     ///
     /// The body is the user's own text, so it gets the same `#APP`/`#NO_APP`
     /// provenance brackets as operand-bearing inline asm on targets that
-    /// mark their blocks (x86/i686/AArch64): a naked function's SIMD
+    /// mark their blocks (x86/i686/AArch64/RISC-V): a naked function's SIMD
     /// instructions must not trip the driver's `-mgeneral-regs-only`
-    /// scanner, and (x86) the text peephole must not "optimize" a naked
-    /// template line.  There is no operand setup or output store to keep
-    /// outside the brackets — the whole body IS user text.
+    /// scanner, and the text peepholes must not "optimize" a naked template
+    /// line (RISC-V deleted a naked `mv t0, a0` before `ret`).  There is no
+    /// operand setup or output store to keep outside the brackets — the
+    /// whole body IS user text.
     fn emit_raw_inline_asm(&mut self, template: &str) {
         let markers = self.asm_block_markers();
         let lines: Vec<&str> = template.lines().collect();
@@ -2670,6 +2651,124 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
         _false_block: BlockId,
     ) {
         unreachable!("backend advertised fused bit-test branches but did not implement the hook");
+    }
+
+    /// Whether `BitTest(x, n)` immediately followed by `BitSet`/`BitClear`/
+    /// `BitToggle(x, n)` (same operands, same width) may be emitted as ONE
+    /// flag-producing modify whose carry is the test's answer (x86 `bts`/
+    /// `btr`/`btc` leave the old bit in CF).  `test_dest` is `None` for the
+    /// branch form, where the test only feeds the block's `CondBranch`.
+    ///
+    /// This is a static check over register assignments, made before either
+    /// instruction is skipped: when it holds, the matching `emit_*` hook
+    /// below must succeed for every operand location it can be handed.
+    fn bit_test_modify_fusable(
+        &self,
+        _test_dest: Option<&Value>,
+        _modify_dest: &Value,
+        _base: &Operand,
+        _index: &Operand,
+        _ty: IrType,
+    ) -> bool {
+        false
+    }
+
+    /// Value form: `test_dest = BitTest(base, index)` and `modify_dest =
+    /// op(base, index)` with one modify.  Only called after
+    /// [`Self::bit_test_modify_fusable`] accepted the same operands.
+    ///
+    /// The default is the unfused pair in IR order -- exactly what the
+    /// emitter produces when the fusion is refused -- so a backend that
+    /// admits the fusion without overriding this stays correct.
+    fn emit_fused_bit_test_modify(
+        &mut self,
+        test_dest: &Value,
+        modify_dest: &Value,
+        op: IrBinOp,
+        base: &Operand,
+        index: &Operand,
+        ty: IrType,
+    ) {
+        self.emit_binop(test_dest, IrBinOp::BitTest, base, index, ty);
+        self.emit_binop(modify_dest, op, base, index, ty);
+    }
+
+    /// Branch form: `modify_dest = op(base, index)`, then branch to
+    /// `true_block` when the bit was set before the modify.  `test_dest` is
+    /// the test the fusion absorbs (the block's branch condition).  Only
+    /// called after [`Self::bit_test_modify_fusable`] accepted the same
+    /// operands with `test_dest == None`.
+    ///
+    /// The default is the unfused sequence: the test, the modify, then a
+    /// branch on the materialized answer.  The test's value is an ordinary
+    /// SSA value with an allocated home (no allocator treats fused branch
+    /// conditions specially), so this is correct for every backend.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_fused_bit_test_modify_branch(
+        &mut self,
+        test_dest: &Value,
+        modify_dest: &Value,
+        op: IrBinOp,
+        base: &Operand,
+        index: &Operand,
+        ty: IrType,
+        true_block: BlockId,
+        false_block: BlockId,
+    ) {
+        self.emit_binop(test_dest, IrBinOp::BitTest, base, index, ty);
+        self.emit_binop(modify_dest, op, base, index, ty);
+        self.emit_cond_branch_blocks(&Operand::Value(*test_dest), true_block, false_block);
+    }
+
+    /// Whether `dest = Cmp Eq|Ne (BitTest(base, index), 0)` with a single-use
+    /// test may be emitted as one test plus a direct flag materialization
+    /// (x86 `bt; setnc` / `bt; setc`).
+    fn supports_fused_bit_test_cmp(&self) -> bool {
+        false
+    }
+
+    /// `dest = (bit index of base) == 0` when `bit_clear` holds, else `!= 0`.
+    /// Only called when [`Self::supports_fused_bit_test_cmp`] returned true;
+    /// returns false when this operand shape has no fused lowering (the
+    /// caller then emits the two instructions normally).
+    fn emit_fused_bit_test_cmp(
+        &mut self,
+        _dest: &Value,
+        _base: &Operand,
+        _index: &Operand,
+        _ty: IrType,
+        _bit_clear: bool,
+    ) -> bool {
+        false
+    }
+
+    /// Whether `dest = a + BitTest(base, index)` (or `a - BitTest(...)`) with
+    /// a single-use test may fold the tested bit straight into the sum (x86:
+    /// `bt` leaves it in CF, `adc $0` / `sbb $0` add or subtract it).
+    fn supports_fused_bit_test_add(&self) -> bool {
+        false
+    }
+
+    /// `dest = addend (+ addend2) + bit` (`addend - bit` when `sub`), where
+    /// `bit` is bit `index` of `base` at `bt_ty` and `ty` is the add's type.
+    /// `addend2` is the second operand of an inner add the fusion absorbs
+    /// (never combined with `sub`).  Only called when
+    /// [`Self::supports_fused_bit_test_add`] returned true; returns false when
+    /// this operand shape has no fused lowering (the caller then emits the
+    /// instructions normally).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_fused_bit_test_add(
+        &mut self,
+        _dest: &Value,
+        _base: &Operand,
+        _index: &Operand,
+        _bt_ty: IrType,
+        _addend: &Operand,
+        _addend2: Option<&Operand>,
+        _sub: bool,
+        _ty: IrType,
+    ) -> bool {
+        false
     }
 
     /// Opt in only after the switch emitter consumes width-qualified facts.

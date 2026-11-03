@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Require GCC-compatible raw bit-count and mode rejections, without ICEs."""
+"""Require GCC-compatible raw builtin rejections (bit counts, modes, vector\noperands), without ICEs."""
 import argparse
 from pathlib import Path
 import subprocess
@@ -41,6 +41,21 @@ def main():
                   'typedef float F __attribute__((vector_size(16)));\n'
                   f'void f(void) {{ __builtin_ia32_{name}({operands}); }}\n')
         cases.append(('-m32', name, source))
+    # __builtin_convertvector: both operands must be vectors with the same
+    # number of lanes (once an internal error on the first mismatch).
+    vectors = ('typedef double D4 __attribute__((vector_size(32)));\n'
+               'typedef float F8 __attribute__((vector_size(32)));\n'
+               'typedef int I4 __attribute__((vector_size(16)));\n'
+               'typedef short S8 __attribute__((vector_size(16)));\n')
+    for mode in ('-m32', '-m64'):
+        for name, body in (
+            ('convertvector_lane_count', 'F8 f(D4 x) { return __builtin_convertvector(x, F8); }'),
+            ('convertvector_lane_count_16', 'S8 f(I4 x) { return __builtin_convertvector(x, S8); }'),
+            ('convertvector_scalar_type', 'float f(D4 x) { return __builtin_convertvector(x, float); }'),
+            ('convertvector_scalar_operand', 'F8 f(double x) { return __builtin_convertvector(x, F8); }'),
+            ('convertvector_scalars', 'float f(float x) { return __builtin_convertvector(x, float); }'),
+        ):
+            cases.append((mode, name, vectors + body + '\n'))
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         for mode, name, source in cases:

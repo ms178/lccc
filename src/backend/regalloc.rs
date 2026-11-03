@@ -12271,7 +12271,8 @@ fn instruction_clobbers_caller_saved(inst: &Instruction) -> bool {
         | Instruction::VaArg { .. }
         | Instruction::VaStart { .. }
         | Instruction::VaCopy { .. }
-        | Instruction::VaArgStruct { .. } => true,
+        | Instruction::VaArgStruct { .. }
+        | Instruction::InitTrampoline { .. } => true,
         Instruction::AtomicLoad { ty, .. }
         | Instruction::AtomicStore { ty, .. }
         | Instruction::AtomicRmw { ty, .. }

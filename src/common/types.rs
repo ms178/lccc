@@ -2742,44 +2742,63 @@ pub fn short_wchar() -> bool {
     SHORT_WCHAR.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The C type of `wchar_t` for the current options.
+/// Whether the target's 32-bit `wchar_t` is `unsigned int` rather than `int`.
 ///
-/// GCC's `__WCHAR_TYPE__` is `int` by default and `short unsigned int` under
-/// `-fshort-wchar` (its `__WCHAR_MIN__`/`__WCHAR_MAX__` follow: 0/0xffff).
-/// Every place that needs to name `wchar_t` goes through here so the two can
-/// never disagree.
+/// The psABIs disagree: AAPCS64 makes `wchar_t` `unsigned int` (GCC and Clang
+/// on aarch64-linux-gnu predefine `__WCHAR_TYPE__ unsigned int`), while the
+/// x86-64, i386 and RISC-V Linux ABIs make it a signed 32-bit type. The
+/// driver records the target's answer before any input is read, exactly like
+/// plain-char signedness; `-fshort-wchar` overrides both.
+static WCHAR_UNSIGNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record the target's `wchar_t` signedness. Called by the driver before any
+/// parsing/sema/lowering runs.
+pub fn set_wchar_unsigned(unsigned: bool) {
+    WCHAR_UNSIGNED.store(unsigned, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The C type of `wchar_t` for the current target and options.
+///
+/// `int` on x86 and RISC-V, `unsigned int` on AArch64, and `short unsigned
+/// int` under `-fshort-wchar` on every target (GCC's `__WCHAR_TYPE__`).
+/// Every place that needs to name `wchar_t` goes through here, and the
+/// `__WCHAR_*__` macros below are derived from the same two settings, so the
+/// type, the macros and the value of `L'x'` can never disagree.
 pub fn wchar_ctype() -> CType {
     if short_wchar() {
         CType::UShort
+    } else if WCHAR_UNSIGNED.load(std::sync::atomic::Ordering::Relaxed) {
+        CType::UInt
     } else {
         CType::Int
     }
 }
 
-/// Spelling of `wchar_t` for `__WCHAR_TYPE__` (GCC: `int` / `short unsigned int`).
+/// Spelling of `wchar_t` for `__WCHAR_TYPE__` (GCC: `int`, `unsigned int`,
+/// `short unsigned int`).
 pub fn wchar_type_spelling() -> &'static str {
-    if short_wchar() {
-        "short unsigned int"
-    } else {
-        "int"
+    match wchar_ctype() {
+        CType::UShort => "short unsigned int",
+        CType::UInt => "unsigned int",
+        _ => "int",
     }
 }
 
-/// `__WCHAR_MAX__` (GCC: 0xffff / 0x7fffffff).
+/// `__WCHAR_MAX__` (GCC: 0xffff / 0xffffffffU / 0x7fffffff).
 pub fn wchar_max() -> &'static str {
-    if short_wchar() {
-        "0xffff"
-    } else {
-        "2147483647"
+    match wchar_ctype() {
+        CType::UShort => "0xffff",
+        CType::UInt => "0xffffffffU",
+        _ => "2147483647",
     }
 }
 
-/// `__WCHAR_MIN__` (GCC writes the width-dependent spelling shown).
+/// `__WCHAR_MIN__` (GCC writes the width-dependent spellings shown).
 pub fn wchar_min() -> &'static str {
-    if short_wchar() {
-        "0"
-    } else {
-        "(-__WCHAR_MAX__ - 1)"
+    match wchar_ctype() {
+        CType::UShort => "0",
+        CType::UInt => "0U",
+        _ => "(-__WCHAR_MAX__ - 1)",
     }
 }
 

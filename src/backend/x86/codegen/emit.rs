@@ -1163,6 +1163,11 @@ pub struct X86Codegen {
     /// Values whose GPR home was written by a 32-bit zero-extending indexed load
     /// (`movzbl`, `movzwl`, `movl`), leaving bits 8..63 / 16..63 / 32..63 zeroed.
     pub(super) zext_loaded_values: FxHashSet<u32>,
+    /// `Cast I32 -> U32` destinations read ONLY as 32-bit integer call
+    /// arguments (see [`super::prologue::sign_casts_read_only_as_call_args`]).
+    /// Nothing observes bits 32..63 of such a value, so an in-place cast
+    /// emits no zero-extending `movl %r, %r`.
+    pub(super) narrow_call_arg_sign_casts: FxHashSet<u32>,
     /// Cmp destinations whose result is consumed ONLY by the immediately
     /// following Select/CondBranch (same block, possibly after a flag-neutral
     /// Copy chain): maps the Cmp dest to the chain-end value the consumer
@@ -1717,6 +1722,7 @@ impl X86Codegen {
             bitop_nonneg_values: FxHashSet::default(),
             rorx_masked_shifts: FxHashSet::default(),
             zext_loaded_values: FxHashSet::default(),
+            narrow_call_arg_sign_casts: FxHashSet::default(),
             fused_cmp_dests: FxHashMap::default(),
             fused_forward_dests: FxHashSet::default(),
             cmp_replay: FxHashMap::default(),
@@ -8579,6 +8585,25 @@ impl ArchCodegen for X86Codegen {
         std::env::var_os("CCC_NO_BT_BRANCH_FUSION").is_none()
     }
 
+    fn bit_test_modify_fusable(
+        &self,
+        test_dest: Option<&Value>,
+        modify_dest: &Value,
+        base: &Operand,
+        index: &Operand,
+        ty: IrType,
+    ) -> bool {
+        self.bit_test_modify_fusable_impl(test_dest, modify_dest, base, index, ty)
+    }
+
+    fn supports_fused_bit_test_cmp(&self) -> bool {
+        super::comparison::bit_test_flag_fusion_enabled()
+    }
+
+    fn supports_fused_bit_test_add(&self) -> bool {
+        super::comparison::bit_test_adc_fusion_enabled()
+    }
+
     fn emit_and_not(
         &mut self,
         _not_dest: &Value,
@@ -8620,27 +8645,28 @@ impl ArchCodegen for X86Codegen {
         // comparisons from the recorded operands, and the And/Or emits
         // nothing at all. Claiming them here would materialize booleans the
         // split was built to kill (and strand the skip-set: the text-path
-        // gates below would see an already-lowered instruction).
-        if let crate::ir::reexports::Instruction::BinOp { dest, .. } = inst {
-            if self.demorgan_skip.contains(&dest.0) {
-                return false;
-            }
-        }
-        if let crate::ir::reexports::Instruction::Cmp { dest, .. } = inst {
-            if self.demorgan_skip.contains(&dest.0) {
-                return false;
-            }
-        }
-        // Same for the Copy/Cast passthru (`bool c = a&&b; if (c)`): it is
-        // skipped by the text-path gates below, never MachInst-claimed.
-        if let crate::ir::reexports::Instruction::Copy { dest, .. } = inst {
-            if self.demorgan_skip.contains(&dest.0) {
-                return false;
-            }
-        }
-        if let crate::ir::reexports::Instruction::Cast { dest, .. } = inst {
-            if self.demorgan_skip.contains(&dest.0) {
-                return false;
+        // gates below would see an already-lowered instruction).  Same for
+        // the Copy/Cast passthru (`bool c = a&&b; if (c)`): it is skipped by
+        // the text-path gates below, never MachInst-claimed.  An `int ->
+        // unsigned` cast read only as narrow call arguments takes the text
+        // path too: its register-direct emitter knows the zero-extension is
+        // unobservable (`narrow_call_arg_sign_casts`), while the MachInst
+        // lowering must extend for unseen wide readers.
+        {
+            use crate::ir::reexports::Instruction as I;
+            match inst {
+                I::BinOp { dest, .. } | I::Cmp { dest, .. } | I::Copy { dest, .. }
+                    if self.demorgan_skip.contains(&dest.0) =>
+                {
+                    return false;
+                }
+                I::Cast { dest, .. }
+                    if self.demorgan_skip.contains(&dest.0)
+                        || self.narrow_call_arg_sign_casts.contains(&dest.0) =>
+                {
+                    return false;
+                }
+                _ => {}
             }
         }
         // A Copy whose SOURCE is a skipped producer (rematerializable
@@ -10920,6 +10946,10 @@ impl ArchCodegen for X86Codegen {
         fn emit_fused_cmp_branch(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType, true_label: &str, false_label: &str) => emit_fused_cmp_branch_impl;
         fn emit_fused_cmp_branch_blocks(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType, true_block: BlockId, false_block: BlockId) => emit_fused_cmp_branch_blocks_impl;
         fn emit_fused_bit_test_branch_blocks(&mut self, base: &Operand, index: &Operand, ty: IrType, true_block: BlockId, false_block: BlockId) => emit_fused_bit_test_branch_blocks_impl;
+        fn emit_fused_bit_test_modify(&mut self, test_dest: &Value, modify_dest: &Value, op: IrBinOp, base: &Operand, index: &Operand, ty: IrType) => emit_fused_bit_test_modify_impl;
+        fn emit_fused_bit_test_modify_branch(&mut self, test_dest: &Value, modify_dest: &Value, op: IrBinOp, base: &Operand, index: &Operand, ty: IrType, true_block: BlockId, false_block: BlockId) => emit_fused_bit_test_modify_branch_impl;
+        fn emit_fused_bit_test_cmp(&mut self, dest: &Value, base: &Operand, index: &Operand, ty: IrType, bit_clear: bool) -> bool => emit_fused_bit_test_cmp_impl;
+        fn emit_fused_bit_test_add(&mut self, dest: &Value, base: &Operand, index: &Operand, bt_ty: IrType, addend: &Operand, addend2: Option<&Operand>, sub: bool, ty: IrType) -> bool => emit_fused_bit_test_add_impl;
         fn emit_cond_branch_blocks(&mut self, cond: &Operand, true_block: BlockId, false_block: BlockId) => emit_cond_branch_blocks_impl;
         fn begin_home_write_block(&mut self, label: BlockId) => begin_home_write_block_impl;
         fn begin_ir_point(&mut self) => settle_transient_home_evictions;
@@ -10958,7 +10988,6 @@ impl ArchCodegen for X86Codegen {
         fn emit_va_arg(&mut self, dest: &Value, va_list_ptr: &Value, result_ty: IrType) => emit_va_arg_impl;
         fn emit_va_arg_struct(&mut self, dest_ptr: &Value, va_list_ptr: &Value, size: usize, align: usize) => emit_va_arg_struct_impl;
         fn emit_va_arg_struct_ex(&mut self, dest_ptr: &Value, va_list_ptr: &Value, size: usize, align: usize, eightbyte_classes: &[crate::common::types::EightbyteClass]) => emit_va_arg_struct_ex_impl;
-        fn emit_va_arg_vector(&mut self, dest_ptr: &Value, va_list_ptr: &Value, size: usize, align: usize, eightbyte_classes: &[crate::common::types::EightbyteClass]) => emit_va_arg_vector_impl;
         fn emit_va_start(&mut self, va_list_ptr: &Value) => emit_va_start_impl;
         fn emit_va_copy(&mut self, dest_ptr: &Value, src_ptr: &Value) => emit_va_copy_impl;
         // returns

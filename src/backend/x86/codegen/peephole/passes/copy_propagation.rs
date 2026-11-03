@@ -17,6 +17,7 @@
 //! The dead movq instructions are cleaned up by subsequent passes.
 
 use super::super::types::*;
+use super::dead_writes::LazyLabelRefs;
 use super::helpers::*;
 use super::relay_and_lea::{plain_gp_operand, split_two_operands};
 
@@ -250,6 +251,9 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
     // only the zero-upper pass may DELETE a movl (a movl self-copy
     // zeroes the upper 32 bits).
     let mut copy_src32: [RegId; 16] = [REG_NONE; 16];
+    // Built on the first label the scan meets; this pass rewrites operands and
+    // never adds a label reference, so the counts can only err high (refuse).
+    let mut label_refs = LazyLabelRefs::default();
 
     let mut i = 0;
     while i < len {
@@ -258,7 +262,20 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
         // target is reached via a separate edge whose copy state may differ,
         // and when that path falls back into this basic block's successor the
         // propagated source is stale. Conservative and correct: clear at every
-        // barrier (jump, conditional jump, call, label, ret, directive).
+        // barrier (jump, conditional jump, call, label, ret, directive) --
+        // except a label no other line names: only fallthrough enters it, so
+        // it is no join and the state flowing in is the state after the line
+        // above (`je .LBB45; movq %rcx, %r8; .LBB43: testl %r8d, %r8d` reads
+        // %ecx, sqlite3VdbeUsesBtree). After a `jmp`/`ret` that state is
+        // already empty, and a jump table, computed goto or comment naming
+        // the label makes it a join.
+        if infos[i].kind == LineKind::Label
+            && !infos[i].pinned
+            && label_refs.is_fallthrough_only(store, infos, i)
+        {
+            i += 1;
+            continue;
+        }
         if infos[i].is_barrier() {
             copy_src = [REG_NONE; 16];
             copy_src32 = [REG_NONE; 16];
@@ -650,6 +667,60 @@ mod tests {
     // NOTE on the choice of copy sources in these tests: the reg-reg copy
     // parsers reject the frame families (%rsp/%rbp) by design, so every
     // fixture uses %ebx/%edx-class sources.
+
+    /// sqlite3VdbeUsesBtree: the allocator's copy of a parameter into its home
+    /// sits on the fallthrough edge into a block nothing jumps to; the test
+    /// reads the parameter register directly (and the copy dies).
+    #[test]
+    fn a_fallthrough_only_label_keeps_the_copy_facts() {
+        let out = propagate(concat!(
+            "f:\n",
+            "    cmpl $1, %edx\n",
+            "    je .LBB45\n",
+            "    movq %rcx, %r8\n",
+            ".LBB43:\n",
+            "    testl %r8d, %r8d\n",
+            "    je .LBB45\n",
+            ".LBB45:\n",
+            "    ret\n",
+        ));
+        assert!(out.contains("testl %ecx, %ecx"), "{out}");
+    }
+
+    /// Every way a label can be entered other than by fallthrough clears the
+    /// facts: a jump naming it, a second definition, a jump-table entry, a
+    /// comment mentioning it (over-approximated), and an unconditional
+    /// transfer right before it.
+    #[test]
+    fn any_other_entry_into_the_label_clears_the_copy_facts() {
+        let body = |pre: &str, post: &str| {
+            format!("f:\n    movq %rcx, %r8\n{pre}.LBB43:\n    testl %r8d, %r8d\n    ret\n{post}")
+        };
+        for (pre, post) in [
+            ("", ".LBB50:\n    jne .LBB43\n"),
+            ("", ".LBB43:\n    ret\n"),
+            ("", ".section .rodata\n    .quad .LBB43\n.text\n"),
+            ("", "    # retarget .LBB43\n"),
+            ("    jmp .LBB60\n", ".LBB60:\n    ret\n"),
+            ("    ret\n", ""),
+        ] {
+            let out = propagate(&body(pre, post));
+            assert!(out.contains("testl %r8d, %r8d"), "{pre:?} {post:?}\n{out}");
+        }
+    }
+
+    /// A pinned label stays opaque.
+    #[test]
+    fn a_pinned_label_clears_the_copy_facts() {
+        let (mut store, mut infos) =
+            build_pinned("f:\n    movq %rcx, %r8\n.LBB43:\n    testl %r8d, %r8d\n    ret\n");
+        let label = (0..store.len())
+            .find(|&i| store.get(i).trim() == ".LBB43:")
+            .expect("label line");
+        infos[label].pinned = true;
+        propagate_register_copies(&mut store, &mut infos);
+        assert!(store.get(label + 1).contains("testl %r8d, %r8d"));
+    }
 
     #[test]
     fn narrow_consumer_is_retargeted_to_the_movl_origin() {

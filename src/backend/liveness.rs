@@ -1029,6 +1029,19 @@ pub(crate) fn instruction_is_call_point(inst: &Instruction) -> bool {
         | Instruction::VaStart { .. }
         | Instruction::VaCopy { .. }
         | Instruction::VaArgStruct { .. } => true,
+        // Writing a trampoline stages the buffer address, the static chain
+        // and the target in argument registers on every backend (x86-64:
+        // %rdi/%rsi/%rcx; AArch64: x0-x3; RISC-V: t0/t1/t3/t4; i386: the
+        // emitter's scratch set), exactly like the inline `Memcpy`
+        // expansion. Without the call point a value living across the
+        // initialisation may be homed in one of them: in
+        // gcc.c-torture/execute/nestfunc-3.c, `long nested_1(long a, long b)
+        // { return use(nested_0, b, a) + sum; }` kept `b` in its incoming
+        // %rsi, the trampoline for `nested_0` overwrote %rsi with the static
+        // chain, and `use` received a stack address instead of `b` at -O1
+        // and above. Trampolines are rare (an address-taken nested
+        // function), so the conservative homes cost nothing measurable.
+        Instruction::InitTrampoline { .. } => true,
         Instruction::BinOp { op, ty, .. }
             if matches!(
                 op,
@@ -2442,7 +2455,6 @@ pub(crate) fn for_each_operand_in_instruction(inst: &Instruction, mut f: impl Fn
         Instruction::VaEnd { .. } => {}
         Instruction::VaCopy { .. } => {}
         Instruction::VaArgStruct { .. } => {}
-        Instruction::VaArgVector { .. } => {}
         Instruction::AtomicRmw { ptr, val, .. } => {
             f(ptr);
             f(val);

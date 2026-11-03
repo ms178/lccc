@@ -933,7 +933,7 @@ jobs:
       run: python3 tests/linker/check_riscv_shared_binding.py --lccc target/fastbuild/lccc-riscv
     - name: Vector arguments and returns at the compiler boundary
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_vector_abi_boundary.sh
-    - name: Preprocessor rescanning, conditional comma and pragma rendering
+    - name: Preprocessor rescanning, conditional comma, character constants, wchar_t and pragma rendering
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_frontend_preprocessor_rules.sh
     - name: RISC-V shared-binding mutation controls
       run: python3 tests/linker/test_riscv_shared_binding.py
@@ -2944,6 +2944,20 @@ jobs:
         # agreement against GCC.  Mirrored in scripts/ci_local.sh
         # (parity-checked).
         bash tests/regression/check_compare_dominance_fold.sh
+        # Constant-operand ALU forms and sign-magnitude selects, executed on
+        # x86-64, i686, RISC-V and AArch64 (qemu-user) from one freestanding
+        # source that must print GCC's digest: RISC-V I-type selection and
+        # its sext32-producer table, the sign-magnitude identity on every
+        # target, x86-64 `mov; neg; cmovs`, and the AArch64 peephole's
+        # inline-asm quarantine (it deleted the operands of an `svc 0`).
+        # Mirrored in scripts/ci_local.sh (parity-checked).
+        bash tests/regression/check_cross_alu_abs_runtime.sh
+        # RISC-V psABI narrow integers: an `unsigned int` argument (register
+        # or stack slot) and result travel SIGN-extended, every other narrow
+        # type both ways, executed under qemu-riscv64 at -O0/-O1/-O2/-Os
+        # against riscv64-linux-gnu-gcc callers and callees.  Mirrored in
+        # scripts/ci_local.sh (parity-checked).
+        bash tests/regression/check_riscv_psabi_narrow_args.sh
         # Predicate materialization: `c ? 1 : 0` is `c != 0` and `c ? 0 : 1`
         # is `c == 0` (5 -> 4), and `(a != 0) | (b != 0)` is `(a | b) != 0`
         # (9 -> 4).  Pins the folded shapes and their missing `cmov`, the
@@ -3553,6 +3567,22 @@ jobs:
               done
             done
           done
+        done
+    - name: Bit-test fusion counts and browser checksum against ICX
+      run: |
+        mkdir -p intel-evidence
+        python3 engineering/evidence/2026-11-02-bit-test-fusion/measure.py \
+          --icx "$LCCC_ICX_BIN" --target x86-64 --notice \
+          --json intel-evidence/bit-test-fusion-counts.json
+        fixtures=tests/regression/fixtures/bit_width
+        printf '%s\n' '#include <stdio.h>' \
+          'unsigned long long browser_bits_checksum(void);' \
+          'int main(void) { unsigned long long v = browser_bits_checksum(); printf("%llu\n", v); return v != 2932816357278149644ull; }' \
+          > intel-evidence/browser-main.c
+        for level in -O0 -O2 -O3; do
+          "$LCCC_ICX_BIN" "$level" "$fixtures/browser_bits.c" "$fixtures/browser_driver.c" \
+            intel-evidence/browser-main.c -o intel-evidence/browser-icx
+          intel-evidence/browser-icx
         done
     - name: Retain authenticated package, probe and binary identities
       if: always()

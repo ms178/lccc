@@ -167,7 +167,6 @@ const PREDEFINED_OBJECT_MACROS: &[(&str, &str)] = &[
     ("__SIZEOF_DOUBLE__", "8"),
     ("__SIZEOF_SIZE_T__", "8"),
     ("__SIZEOF_PTRDIFF_T__", "8"),
-    ("__SIZEOF_WCHAR_T__", "4"),
     ("__SIZEOF_INT128__", "16"),
     ("__SIZEOF_WINT_T__", "4"),
     // Byte order
@@ -183,8 +182,6 @@ const PREDEFINED_OBJECT_MACROS: &[(&str, &str)] = &[
     ("__SHRT_MAX__", "32767"),
     ("__SIZE_MAX__", "18446744073709551615UL"),
     ("__PTRDIFF_MAX__", "9223372036854775807L"),
-    ("__WCHAR_MAX__", "2147483647"),
-    ("__WCHAR_MIN__", "(-2147483647-1)"),
     ("__WINT_MAX__", "4294967295U"),
     ("__WINT_MIN__", "0U"),
     ("__SIG_ATOMIC_MAX__", "2147483647"),
@@ -192,7 +189,6 @@ const PREDEFINED_OBJECT_MACROS: &[(&str, &str)] = &[
     // Type names
     ("__SIZE_TYPE__", "long unsigned int"),
     ("__PTRDIFF_TYPE__", "long int"),
-    ("__WCHAR_TYPE__", "int"),
     ("__WINT_TYPE__", "unsigned int"),
     ("__CHAR16_TYPE__", "short unsigned int"),
     ("__CHAR32_TYPE__", "unsigned int"),
@@ -550,17 +546,23 @@ impl Preprocessor {
             self.define_simple_macro(name, body);
         }
 
-        // `-fshort-wchar` rewrites exactly the five `wchar_t` macros below and
-        // nothing else (`__WINT_*` stay 32-bit, verified against GCC 14.2's
-        // `-dM -E` output for both flag settings). The table above holds the
-        // default spellings; re-defining here keeps the flag override in one
-        // place instead of threading a runtime value through a `const` table.
-        if crate::common::types::short_wchar() {
-            self.define_simple_macro("__SIZEOF_WCHAR_T__", "2");
-            self.define_simple_macro("__WCHAR_MAX__", "0xffff");
-            self.define_simple_macro("__WCHAR_MIN__", "0");
-            self.define_simple_macro("__WCHAR_WIDTH__", "16");
-            self.define_simple_macro("__WCHAR_TYPE__", "short unsigned int");
+        // `wchar_t`'s five macros depend on the target (signed on x86 and
+        // RISC-V, unsigned on AArch64) and on `-fshort-wchar`, which rewrites
+        // exactly these five and nothing else (`__WINT_*` stay 32-bit,
+        // verified against GCC's `-dM -E` output for both flag settings). They
+        // come from the functions behind `wchar_ctype()`, so the macros, the
+        // type and the value of `L'x'` give one answer.
+        {
+            use crate::common::types as ty;
+            for (name, body) in [
+                ("__SIZEOF_WCHAR_T__", ty::wchar_sizeof()),
+                ("__WCHAR_MAX__", ty::wchar_max()),
+                ("__WCHAR_MIN__", ty::wchar_min()),
+                ("__WCHAR_WIDTH__", ty::wchar_width()),
+                ("__WCHAR_TYPE__", ty::wchar_type_spelling()),
+            ] {
+                self.define_simple_macro(name, body);
+            }
         }
 
         // `__DATE__` and `__TIME__` are *not* materialised here. They are the
@@ -1134,7 +1136,10 @@ impl Preprocessor {
                 // ABI
                 self.define_simple_macro("__ARM_PCS_AAPCS64", "1");
                 self.define_simple_macro("__ARM_SIZEOF_MINIMAL_ENUM", "4");
-                self.define_simple_macro("__ARM_SIZEOF_WCHAR_T", "4");
+                self.define_simple_macro(
+                    "__ARM_SIZEOF_WCHAR_T",
+                    crate::common::types::wchar_sizeof(),
+                );
                 // Features
                 self.define_simple_macro("__ARM_FEATURE_CLZ", "1");
                 self.define_simple_macro("__ARM_FEATURE_FMA", "1");

@@ -270,6 +270,95 @@ fn signed_i32_home_requirements(
     (needs_sext_set, implicit_sext_set, signed_i32_defs)
 }
 
+/// `Cast I32 -> U32` destinations whose every use is a call argument passed
+/// as a 32-bit (or narrower) integer.
+///
+/// The cast reinterprets the low 32 bits; its only machine effect is the
+/// zero-extending `movl` that makes bits 32..63 canonical for a WIDE reader.
+/// A call argument has no wide reader: the SysV x86-64 ABI leaves bits 32..63
+/// of a 32-bit INTEGER argument unspecified, and every callee — lccc's own
+/// (`unsigned long f(unsigned x)` is `movl %edi, %eax`), GCC's and Clang's —
+/// extends on its side.  `hit((u32)bs)` with `bs` already in `%edi` therefore
+/// needs no `movl %edi, %edi`, which also leaves the sibling-call block a bare
+/// `jmp` that the conditional-tail-call fold can absorb.
+///
+/// Any other use (a 64-bit consumer, a phi, a terminator, an argument of
+/// another type) keeps the extension: membership demands that EVERY use be a
+/// qualifying argument slot.
+pub(super) fn sign_casts_read_only_as_call_args(func: &IrFunction) -> FxHashSet<u32> {
+    let mut casts: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Cast {
+                dest,
+                from_ty: IrType::I32,
+                to_ty: IrType::U32,
+                ..
+            } = inst
+            {
+                casts.insert(dest.0);
+            }
+        }
+    }
+    if casts.is_empty() {
+        return casts;
+    }
+    // uses[v] = (every use, uses that are qualifying argument slots).
+    let mut uses: FxHashMap<u32, (u32, u32)> = FxHashMap::default();
+    let narrow_int = |t: &IrType| {
+        matches!(
+            t,
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
+        )
+    };
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            inst.for_each_used_value(|v| {
+                if casts.contains(&v) {
+                    uses.entry(v).or_default().0 += 1;
+                }
+            });
+            if let Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } = inst {
+                for (arg, ty) in info.args.iter().zip(info.arg_types.iter()) {
+                    if let Operand::Value(v) = arg {
+                        if casts.contains(&v.0) && narrow_int(ty) {
+                            uses.entry(v.0).or_default().1 += 1;
+                        }
+                    }
+                }
+            }
+        }
+        block.terminator.for_each_used_value(|v| {
+            if casts.contains(&v) {
+                uses.entry(v).or_default().0 += 1;
+            }
+        });
+    }
+    casts.retain(|v| {
+        uses.get(v)
+            .is_some_and(|&(all, args)| all > 0 && all == args)
+    });
+    casts
+}
+
+/// A single-instruction flag producer the Cmp -> consumer flag fusion can
+/// forward: a `Cmp` (its own predicate), or -- when `bit_test_flags` -- a
+/// 32/64-bit `BitTest`, whose `bt` puts the bit in CF; the consumer reads it
+/// as the `b` condition, so it is recorded as `Ult` (and, having no FP or
+/// wide form, passes every filter that predicate faces).
+fn flag_producer(inst: &Instruction, bit_test_flags: bool) -> Option<(&Value, &IrType, IrCmpOp)> {
+    match inst {
+        Instruction::Cmp { dest, ty, op, .. } => Some((dest, ty, *op)),
+        Instruction::BinOp {
+            dest,
+            op: IrBinOp::BitTest,
+            ty: ty @ (IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64),
+            ..
+        } if bit_test_flags => Some((dest, ty, IrCmpOp::Ult)),
+        _ => None,
+    }
+}
+
 /// Def-chain stability classification for a va_list root (see the analysis
 /// in `calculate_stack_space_impl`): `true` only when the chain bottoms out
 /// in an Alloca, ParamRef, Call result, or a constant — i.e. an id that can
@@ -647,10 +736,6 @@ impl X86Codegen {
                                 }
                             }
                         }
-                        // Vector va_arg always fetches its ONE XMM slot from
-                        // the save area when %al says one was passed; a vector
-                        // never travels in a GP register on x86-64.
-                        Instruction::VaArgVector { .. } => needs_fp = true,
                         _ => {}
                     }
                 }
@@ -1036,6 +1121,7 @@ impl X86Codegen {
         // unsigned (movl) path (see collect_bitop_nonneg_values).
         self.bitop_nonneg_values = crate::backend::generation::collect_bitop_nonneg_values(func);
         self.zext_loaded_values.clear();
+        self.narrow_call_arg_sign_casts = sign_casts_read_only_as_call_args(func);
 
         // ── Value type map, use counts and Cmp→consumer flag fusion ──────
         //
@@ -1179,10 +1265,11 @@ impl X86Codegen {
             // fused_forward_dests on the emitter state).
             let mut fused_forward: crate::common::fx_hash::FxHashSet<u32> =
                 crate::common::fx_hash::FxHashSet::default();
+            let bit_test_flags = super::comparison::bit_test_flag_fusion_enabled();
             for block in &func.blocks {
                 let insts = &block.instructions;
                 for (ii, inst) in insts.iter().enumerate() {
-                    if let Instruction::Cmp { dest, ty, op, .. } = inst {
+                    if let Some((dest, ty, op)) = flag_producer(inst, bit_test_flags) {
                         if use_counts.get(&dest.0).copied().unwrap_or(0) != 1 {
                             continue;
                         }
@@ -5454,4 +5541,90 @@ fn collect_zero_splats(func: &IrFunction, guards: &FxHashSet<u32>) -> FxHashSet<
             _ => None,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod narrow_call_arg_sign_cast_tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, CallInfo, Terminator};
+
+    /// `void f(int x) { hit((unsigned)x); <extra> }` with the cast in Value(2).
+    fn func(arg_ty: IrType, extra: Vec<Instruction>, term: Terminator) -> IrFunction {
+        let mut f = IrFunction::new("f".into(), IrType::Void, vec![], false);
+        let mut instructions = vec![
+            Instruction::ParamRef {
+                dest: Value(1),
+                param_idx: 0,
+                ty: IrType::I32,
+            },
+            Instruction::Cast {
+                dest: Value(2),
+                src: Operand::Value(Value(1)),
+                from_ty: IrType::I32,
+                to_ty: IrType::U32,
+            },
+            Instruction::Call {
+                func: "hit".into(),
+                info: CallInfo {
+                    args: vec![Operand::Value(Value(2))],
+                    arg_types: vec![arg_ty],
+                    return_type: IrType::Void,
+                    num_fixed_args: 1,
+                    ..Default::default()
+                },
+            },
+        ];
+        instructions.extend(extra);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            source_spans: vec![],
+            instructions,
+            terminator: term,
+        });
+        f
+    }
+
+    #[test]
+    fn a_cast_read_only_as_a_narrow_argument_needs_no_extension() {
+        for ty in [IrType::U32, IrType::I32, IrType::U16, IrType::I8] {
+            let f = func(ty, vec![], Terminator::Return(None));
+            assert!(sign_casts_read_only_as_call_args(&f).contains(&2), "{ty:?}");
+        }
+    }
+
+    #[test]
+    fn any_other_reader_keeps_the_extension() {
+        // A 64-bit argument slot reads bits 32..63.
+        let f = func(IrType::U64, vec![], Terminator::Return(None));
+        assert!(!sign_casts_read_only_as_call_args(&f).contains(&2));
+        // A second, non-argument use: a 64-bit GEP index.
+        let gep = Instruction::GetElementPtr {
+            dest: Value(3),
+            base: Value(1),
+            offset: Operand::Value(Value(2)),
+            ty: IrType::I32,
+        };
+        let f = func(IrType::U32, vec![gep], Terminator::Return(None));
+        assert!(!sign_casts_read_only_as_call_args(&f).contains(&2));
+        // A terminator use (the returned value).
+        let f = func(
+            IrType::U32,
+            vec![],
+            Terminator::Return(Some(Operand::Value(Value(2)))),
+        );
+        assert!(!sign_casts_read_only_as_call_args(&f).contains(&2));
+        // A call that reads the value twice, once through a 64-bit slot.
+        let call = Instruction::Call {
+            func: "wide".into(),
+            info: CallInfo {
+                args: vec![Operand::Value(Value(2)), Operand::Value(Value(2))],
+                arg_types: vec![IrType::U32, IrType::U64],
+                return_type: IrType::Void,
+                num_fixed_args: 2,
+                ..Default::default()
+            },
+        };
+        let f = func(IrType::U32, vec![call], Terminator::Return(None));
+        assert!(!sign_casts_read_only_as_call_args(&f).contains(&2));
+    }
 }

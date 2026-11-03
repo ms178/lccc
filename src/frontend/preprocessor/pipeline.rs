@@ -58,6 +58,28 @@ pub struct PreprocessorDiagnostic {
     pub message: String,
 }
 
+/// How a message pragma's diagnostic is reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PragmaSeverity {
+    /// `#pragma GCC warning "..."`: a warning no `-W` option controls (GCC
+    /// 16.2 reports it under `-Wno-cpp` and does not promote it with
+    /// `-Werror=cpp`; plain `-Werror` promotes it like any warning).
+    Warning,
+    /// A malformed `#pragma message`: `-Wpragmas`, as in GCC.
+    PragmasWarning,
+    /// `#pragma message "..."`: a note.  GCC evaluates this pragma in the C
+    /// front end, after preprocessing, so `-E` prints nothing for it.
+    Note,
+}
+
+/// One diagnostic of a message pragma.  `#pragma GCC error` needs no entry
+/// here: it is an ordinary preprocessor error.
+#[derive(Debug, Clone)]
+pub struct PragmaDiagnostic {
+    pub severity: PragmaSeverity,
+    pub diagnostic: PreprocessorDiagnostic,
+}
+
 pub struct Preprocessor {
     pub(super) macros: MacroTable,
     conditionals: ConditionalStack,
@@ -66,6 +88,9 @@ pub struct Preprocessor {
     pub(super) errors: Vec<PreprocessorDiagnostic>,
     /// Collected preprocessor warnings (e.g., #warning directives).
     pub(super) warnings: Vec<PreprocessorDiagnostic>,
+    /// Diagnostics of the message pragmas (`#pragma GCC warning`,
+    /// `#pragma message`), in source order; see [`PragmaDiagnostic`].
+    pub(super) pragma_diagnostics: Vec<PragmaDiagnostic>,
     /// Include search paths (from -I flags)
     pub(super) include_paths: Vec<PathBuf>,
     /// Quote include paths (from -iquote flags), searched only for #include "..."
@@ -166,6 +191,7 @@ impl Preprocessor {
             filename: String::new(),
             errors: Vec::new(),
             warnings: Vec::new(),
+            pragma_diagnostics: Vec::new(),
             include_paths: Vec::new(),
             quote_include_paths: Vec::new(),
             isystem_include_paths: Vec::new(),
@@ -1062,6 +1088,11 @@ impl Preprocessor {
     /// Get preprocessing warnings.
     pub fn warnings(&self) -> &[PreprocessorDiagnostic] {
         &self.warnings
+    }
+
+    /// Diagnostics of the message pragmas, in source order.
+    pub fn pragma_diagnostics(&self) -> &[PragmaDiagnostic] {
+        &self.pragma_diagnostics
     }
 
     /// Get the current source file name for diagnostic purposes.
