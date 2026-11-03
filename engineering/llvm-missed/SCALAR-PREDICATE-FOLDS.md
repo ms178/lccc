@@ -1042,8 +1042,10 @@ and at that width the parity is one `xorb %ah, %al` (8 → 5), while a byte's
 ```
 
 (17 → 8 on x86-64, 19 → 11 on i686; exact for all 256 inputs, checked
-exhaustively.  On RISC-V and AArch64 there is no gain: a byte's count there is
-already the same three-step SWAR over a zero-extended byte.)
+exhaustively.  AArch64 counts a zero-extended byte with the byte lanes of `cnt`
+already.  RISC-V had no narrow form when this rule landed and gained one in the
+follow-up below: a byte's SWAR masks (0x55, 0x33, 0x0f) all fit `andi`, so the
+lane scan needs neither a constant load nor a scratch register.)
 
 So `count_width` folds both shapes, and only both: each rewrite keeps the value
 bit for bit, replaces one scan with a cheaper one, and emits at most one new
@@ -1065,34 +1067,65 @@ to the consumer's type.  The properties it needs, and refuses without:
   `fold_popcount_mask_to_parity` owns it.  One instruction, one owner; the gate
   below pins both halves through `CCC_SIMPLIFY_SKIP=parity`.
 
-Narrowing is also a cost decision, and the cost is not the same everywhere.  On
-x86 the value already sits in a 32-bit register, so the extension back to the
-consumer's width is free; on AArch64 and RISC-V the emitters mask and copy
-(`mov`/`and`/`mov` on AArch64), and their narrow count paths still run the
-full-width sequence — narrowing there pays for the extension and buys nothing.
-So the rule is gated exactly where it was measured to win, the way
-`fold_shared_bit_select` is gated to the targets that rebuild one-hot masks, and
-a unit test pins that a non-x86 target keeps the promoted form.  Within x86 the
-widths are filtered once more: a parity is shorter at any narrower width, a
-popcount only where the *algorithm* changes (a byte's multiplier form, or 32
-bits instead of 64) — a 16-bit count over an already-promoted value would still
-run the 32-bit scan, so it is left alone.
+The second half of the round is the extension back to the consumer's width, and
+the first version of it was wrong about what that costs.  A count of an n-bit
+operand cannot exceed n, so the value already fits the narrow type: the step
+back to `int` is not an extension, it is a *copy*.  It was emitted as a `Cast`,
+which asks every backend to re-normalise a value that was already clean —
+`and w4, w19, #0xff` plus a prologue spill on AArch64, a chain of `mv`s on
+RISC-V — so the rule had to be gated to x86, the one target where the extension
+happened to be free.  Spelling it as `Copy` states the property instead of
+working around it, and the widened type map (`Copy` propagates in both
+directions) makes the narrow count's result `int`-typed with no instruction on
+any target.  A unit test pins both halves: the second instruction is a `Copy`,
+and it is the same on x86-64 and AArch64.
+
+That removed the gate, so the two backends that had been keeping the promoted
+form needed narrow sequences of their own, and both emitters had a latent bug
+the gate had been hiding: they read *whole registers*.  `cnt v0.8b` counts eight
+byte lanes and the RISC-V lane scan runs over the full word, so a narrow operand
+must first be masked to its type — not a formality, because a signed narrow
+value arrives sign-extended, and the promoted form used to guarantee the
+cleanliness that the narrow form now has to establish itself.  Each narrow
+emitter therefore masks first (one `and` on AArch64, one `andi` or a
+`slli`/`srli` pair on RISC-V) and then runs a sequence that reads only the lanes
+of its own width:
+
+| shape | AArch64 | RISC-V |
+| --- | --- | --- |
+| `__builtin_parity(u8)` | mask + `cnt`/`uaddlv` + `and #1` | `andi` + three folds + `and 1` (12) |
+| `__builtin_popcount(u8)` | mask + `fmov s0`/`cnt`/`uaddlv`/`fmov` | byte lane scan with `andi` masks (15) |
+| `__builtin_popcount(u16)` | mask + the same | halfword lane scan, `0x5555`/`0x3333` (22) |
+
+Within x86 the widths are still filtered: a parity is shorter at any narrower
+width, a popcount only where the *algorithm* changes (a byte's multiplier form,
+or 32 bits instead of 64) — a 16-bit count over an already-promoted value would
+still run the 32-bit scan, so it is left alone, and that is now a statement
+about the emitters rather than about a target.
 
 `-O2`, instructions inside the function body including `ret`, `ccc` before this
 round (`origin/main`, `d2e6814`) against after:
 
 | shape | x86-64 | i686 | AArch64 | RISC-V | GCC 16.2 | Clang 23.1.4 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `popcountll(x) & 1` | 22 → **11** | 27 → **16** | 15 → **14** | 29 → **18** | 10 | 10 |
-| `__builtin_parity(u8)` | 8 → **5** | 10 → **6** | 14 = 14 | 16 = 16 | 4 | 4 |
-| `__builtin_parity(u16)` | 8 → **5** | 10 → **7** | 14 = 14 | 18 = 18 | 5 | 5 |
-| `__builtin_popcount(u8)` | 17 → **8** | 19 → **11** | 13 = 13 | 24 = 24 | 5* | 6 |
-| `__builtin_popcount(u16)` | 17 = 17 | 19 = 19 | 13 = 13 | 26 = 26 | 5* | 18 |
+| `popcountll(x) & 1` | 22 → **11** | 27 → **16** | 15 → 14 | 29 → **18** | 10 | 10 |
+| `__builtin_parity(u8)` | 8 → **5** | 10 → **6** | 14 → **13** | 16 → **12** | 4 | 4 |
+| `__builtin_parity(u16)` | 8 → **5** | 10 → **7** | 14 → **13** | 18 → **16** | 5 | 5 |
+| `__builtin_popcount(u8)` | 17 → **7** | 19 → **9** | 13 → **12** | 24 → **15** | 5* | 6 |
+| `__builtin_popcount(u16)` | 17 = 17 | 19 = 19 | 13 → **12** | 26 → **22** | 5* | 18 |
 | `__builtin_popcount(x) & 1` (all 32-bit) | 8 = 8 | 13 = 13 | 13 = 13 | 16 = 16 | 7 | 7 |
 | `1u << (32 - __builtin_clz(x-1))` | 9 = 9 | 17 = 17 | 16 = 16 | 31 = 31 | 6 | 7 |
 
-\* GCC calls libgcc's `__popcountdi2` for the width-promoted cases, which is the
-linking decision §18 already documents; LCCC keeps the count inline.
+\* GCC's five instructions are `subq $8,%rsp` / `movl %edi,%edi` /
+`call __popcountdi2` / `addq $8,%rsp` / `ret`: a libgcc call, which §18 already
+documents as a linking decision, and its count is an instruction count for a
+call that LCCC keeps inline.  Clang is the honest inline oracle for these rows,
+and against it the remaining x86-64 deficits are one instruction for the byte
+count and one for a 32- or 64-bit count (LCCC stages its scratch register with
+`push %rcx`/`pop %rcx` where Clang uses an argument register the value has
+already left).  The same applies to the last row, where Clang's seven
+instructions include a `negb %cl` fold of `32 - clz` that LCCC does not yet
+have — see "What is not done".
 
 The first row is now the same body as `__builtin_parityll` (11 = 11), which is
 the point: `popcount(x) & 1` and `parity(x)` are one question, and the two
@@ -1109,11 +1142,23 @@ count, mask ≠ 1, same width) and the fresh-id contract (one temporary, in the
 six parts to eight: the byte count must be the two-multiplier form with no
 `push`/`pop` and no `0x55555555`, the cross-width shape must land on the 64-bit
 parity body, `CCC_SIMPLIFY_SKIP=parity` must still fold it (proving which rule
-owns it), AArch64's and RISC-V's narrow shapes must equal their pre-round pins
-(no silent regression from the gate), and
+owns it), RISC-V's narrow shapes must be the lane scan and the fold (no nibble
+table, no halfword-width fail), and
 `tests/regression/parity_and_popcount.c` still prints
 `failures=0 hash=09dc4aea9979cf33` at `-O0`/`-O1`/`-O2`/`-O3`/`-Os` and
 against GCC 16.2.
+
+The narrow emitters read whole registers, so their shapes are not enough: the
+values have to be executed.  `check_narrow_count_runtime.py` links a
+freestanding checksum (`tests/regression/fixtures/count_narrow/`, 256 byte
+values plus a strided halfword sweep plus every single bit and its complement,
+each through all four count questions at both signednesses) against LCCC's own
+start stub and runs it on AArch64 and RISC-V under QEMU and natively on x86-64 at
+five optimization levels — ten cross-target executions — against the value GCC
+16.2 and Clang 23.1.4 measure on the same source
+(`4177401467814966825`).  That gate is what caught the halfword parity mask
+being written as a byte mask: the sign-extension cases pass only when the mask
+is the type's own width, and no instruction-count pin can see the difference.
 
 ## What the LLVM tracker already knows about these shapes
 
@@ -1392,17 +1437,27 @@ sweep can check whether it disappears when narrow `Neg` selection improves.
   cannot assume, so the baseline stays inline. Parity is the same story from the
   other side: it used to be 18 instructions (the count plus `andl $1`) and is
   now 8 (§18) — what remains here is the linking decision for the count.
-* **Narrow counts on AArch64 and RISC-V** — `count_width` (§20) narrows a count
-  only where the extension back to the consumer's width is free, which today is
-  x86-64 and i686.  The AArch64 and RISC-V emitters mask and copy for a
-  zero-extension (`mov`/`and`/`mov`) and their narrow `Popcount`/`Parity` paths
-  still run the full-width sequence, so `__builtin_popcount(u8)` there is 13 and
-  24 versus the 8 and 11 the x86 back ends now reach.  Two changes lift the
-  gate: a narrow-aware parity/popcount fold (a byte's parity is three `eor`s on
-  AArch64, and there is a three-step byte SWAR for both), and a cast emitter
-  that knows the value's high bits are already clean — which is what
-  `bitop_nonneg_values` already proves for the `sxtw` case on AArch64, so it is
-  a widening of an existing fact, not a new mechanism.
+* **The `32 - clz` shift-amount fold** — `1u << (32 - __builtin_clz(x - 1))`
+  (§20's last table row) is 9 instructions on x86-64 where Clang spends 7:
+  `decl %edi; bsrl %edi, %ecx; xorl $31, %ecx; negb %cl; movl $1, %eax;
+  shll %cl, %eax; ret`.  Two defects, both in instruction selection rather than
+  in a rewrite: a `movl $63, %eax` seed before the `bsrl` that exists only to
+  make `clz(0)` come out as 32 (the zero arm is unreachable here, and the seed
+  only works because `bsr` leaves its destination alone on zero, which the ISA
+  does not promise), and the `32 - (31 - bsr)` reduction, which is a `+1` —
+  LCCC already finds it when the clamped operand is a bare parameter
+  (`np2b` is 6, equal to GCC's 5 plus its own seed) and loses it when the
+  operand is `x - 1`.  Clang's `negb %cl` is not portable: AArch64's `lsl` masks
+  the shift amount to eight bits and RISC-V's `sll` to six, so only x86 can
+  read `32 - n` as `-n`; the fold that generalises is `bsr` + 1.
+* **AArch64 and RISC-V copy overhead around a count** — the narrow sequences
+  are now in place (12/15/22 on RISC-V, 12/13/12/13 on AArch64), but both are
+  still 4-6 instructions above Clang's body because of what surrounds them, not
+  because of the count: an accumulator copy into the argument register and back
+  (`mv a1, t0` / `mv a0, t0`), and on AArch64 a home slot for a parameter that
+  is only read once (`str x19` / `ldr x19` plus `mov x19, x0`).  `f(void) { return
+  1; }` pays the same frame, so this is a home-register and copy-coalescing
+  question that a count-shaped fold cannot reach.
 * **`1u << __builtin_ctz(y)` (no complement)** — refused on purpose: with the
   exact `Ctz(0) == width` arm it is no shorter than the count path (5/6 vs 8/8
   with the arm), and Clang's four-instruction form depends on `ctz(0)` being

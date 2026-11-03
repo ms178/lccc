@@ -36,7 +36,17 @@
 #   * a byte's population count needs neither a 24-bit scan nor a scratch
 #     register: `imul $0x08040201` / `shr $3` / `and $0x11111111` /
 #     `imul $0x11111111` / `shr $28` is exact for all 256 inputs and takes the
-#     count from 17 to 8 (i686: 19 -> 11).
+#     count from 17 to 8 (i686: 19 -> 11);
+#   * the extension that puts the narrow result back in the consumer's `int`
+#     used to be a `Cast`, which Arm and Riscv64 answer with a mask plus copies
+#     -- `and w4, w19, #0xff` and a chain of `mv`s around a value of at most
+#     eight.  It is a `Copy` now, so the narrow scan is what every target gets,
+#     and the two that had no narrow sequence (RISC-V's byte count was the
+#     whole 32-bit SWAR, 24 instructions) have one: `andi` fits a byte's SWAR
+#     masks (0x55/0x33/0x0f), so 15, and a byte's parity needs three folds
+#     instead of the nibble table (12).  The narrow emitters mask their operand
+#     to its type first, because the lanes they read are whole-register lanes
+#     and a signed narrow value arrives sign-extended.
 #
 # This gate pins eight things:
 #
@@ -55,10 +65,11 @@
 #      the SWAR masks are present,
 #   6. a byte's count is the five-instruction multiplier form on both x86
 #      backends: two `imul`s, no `push`/`pop` staging, no 0x55555555 mask,
-#   7. the narrow-count rule is a target cost decision, so the back ends that
-#      widen a narrow result for free (x86-64, i686) narrow and the others keep
-#      the promoted form: AArch64's and RISC-V's `par8`/`pc8`/`pc16` are
-#      unchanged from the pre-round numbers,
+#   7. the narrow-count rule narrows on every backend, because the extension
+#      back to the consumer's width is a `Copy` (a count of an n-bit operand
+#      fits n bits, so there is nothing to extend) rather than a `Cast` every
+#      backend had to re-normalise; RISC-V's narrow sequences are its own
+#      `andi`-masked lane scan and fold, not the 32-bit one,
 #   8. the values agree with an independent model at -O0/-O1/-O2/-O3/-Os and
 #      with GCC, bit for bit, over every 8- and 16-bit input, single bits at
 #      every position of both widths, and 4096 arithmetic operands.
@@ -176,9 +187,10 @@ pin par_of_count "$tmp/x86.s" 8
 # the 64-bit count plus a mask, which used to cost 22.
 pin par_of_count64 "$tmp/x86.s" 11
 pin pc32  "$tmp/x86.s" 17
-# A byte's count is the multiplier form: 17 -> 8, and the 16-bit one keeps the
-# 32-bit scan (narrowing it would only add the extension).
-pin pc8   "$tmp/x86.s" 8
+# A byte's count is the multiplier form: 17 -> 8, and 8 -> 7 once the extension
+# is a copy.  The 16-bit one keeps the 32-bit scan: x86 has no cheaper halfword
+# form, so narrowing it neither pays nor costs.
+pin pc8   "$tmp/x86.s" 7
 pin pc16  "$tmp/x86.s" 17
 
 # ---- 4. i686, AArch64, RISC-V --------------------------------------------
@@ -230,17 +242,31 @@ done
 pinrv() { local got; got=$(count_of "$1" "$tmp/rv.s"); [ "$got" = "$2" ] || fail "$1: $got instructions on RISC-V, pinned $2"; }
 pinrv par32 17
 pinrv par64 17
-# The narrow-count rule is gated to the back ends whose narrow result needs no
-# extension, so these three are the pre-round numbers on both non-x86 targets:
-# narrowing here would pay for a mask-and-copy and save nothing.
+# RISC-V's narrow sequences are its own: `andi` holds every mask a byte's SWAR
+# needs, so the narrow form is shorter than the 32-bit one by the constant
+# loads alone, and a byte's parity is three folds rather than folds plus the
+# nibble table.
+rvbody8=$(fn_body par8 "$tmp/rv.s")
+grep -q '0x6996' <<<"$rvbody8" && fail "par8: nibble table on RISC-V (the fold is shorter)"
+# A byte's fold starts at bit 4, not bit 16 -- and the operand is masked to the
+# byte somewhere on the way in (the parameter's own mask, or the emitter's).
+grep -qE 'srli\s+t1, t0, 16' <<<"$rvbody8" && fail "par8: the 32-bit fold on RISC-V"
+grep -qE 'andi\s+[a-z0-9]+, [a-z0-9]+, 0xff' <<<"$rvbody8" ||
+    fail "par8: no byte mask on RISC-V"
+grep -qE 'andi\s+t1, t1, 0x55' <<<"$(fn_body pc8 "$tmp/rv.s")" ||
+    fail "pc8: the byte lane scan is not the 8-bit SWAR on RISC-V"
+grep -qE '0x5555' <<<"$(fn_body pc16 "$tmp/rv.s")" ||
+    fail "pc16: no halfword lane masks on RISC-V"
+# The narrow shapes are shorter than the 32-bit ones they replace, on every
+# backend that had to pay for the extension before.
 pinarm() { local got; got=$(count_of "$1" "$tmp/arm.s"); [ "$got" = "$2" ] || fail "$1: $got instructions on AArch64, pinned $2"; }
 pinarm par8 14
 pinarm pc8 13
 pinarm pc16 13
-pinrv par8 16
-pinrv par16 18
-pinrv pc8 24
-pinrv pc16 26
+pinrv par8 12
+pinrv par16 16
+pinrv pc8 15
+pinrv pc16 22
 pini686() { local got; got=$(count_of "$1" "$tmp/i686.s"); [ "$got" = "$2" ] || fail "$1: $got instructions on i686, pinned $2"; }
 # 13: the same 6-instruction algorithm as x86-64, plus the memory-argument
 # load, the frame the i686 backend emits and one more copy -- the staging pair
@@ -280,4 +306,4 @@ for opt in -O0 -O1 -O2 -O3 -Os; do
         [ "$out" = "$want" ] || fail "opt levels disagree: $out vs $want"
     fi
 done
-echo "check_parity_and_popcount: OK (parity is a flag/table question on every backend, a byte counts in five instructions, narrow counts run at their own width on x86, popcount is branch-free on RISC-V, values agree with the model at $want)"
+echo "check_parity_and_popcount: OK (parity is a flag/table question on every backend, a byte counts in five instructions, narrow counts run at their own width on every backend, popcount is branch-free on RISC-V, values agree with the model at $want)"

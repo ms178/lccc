@@ -444,6 +444,49 @@ impl RiscvCodegen {
     /// remaining stages are plain shift/add pairs with no masks -- no `mul`, and
     /// therefore no dependence on the M extension either.
     pub(super) fn emit_popcount(&mut self, ty: IrType) {
+        // A byte or a halfword counts inside its own lanes, so every mask below
+        // fits the 12-bit immediate field of `andi`: three instructions fewer
+        // than the 32-bit form even before the constant loads, and no scratch
+        // register for the masks.  The operand is masked to its type first --
+        // the lanes are read out of the whole register, so a sign extension or a
+        // stale high half must not reach the count.
+        match ty {
+            IrType::I8 | IrType::U8 => {
+                self.state.emit("    andi t0, t0, 0xff");
+                self.state.emit("    srli t1, t0, 1");
+                self.state.emit("    andi t1, t1, 0x55");
+                self.state.emit("    sub t1, t0, t1"); // pair counts
+                self.state.emit("    srli t3, t1, 2");
+                self.state.emit("    andi t3, t3, 0x33");
+                self.state.emit("    andi t2, t1, 0x33");
+                self.state.emit("    add t1, t2, t3"); // nibble counts
+                self.state.emit("    srli t3, t1, 4");
+                self.state.emit("    add t1, t1, t3");
+                self.state.emit("    andi t0, t1, 0x0f"); // byte count
+                return;
+            }
+            IrType::I16 | IrType::U16 => {
+                self.state.emit("    slli t0, t0, 48");
+                self.state.emit("    srli t0, t0, 48"); // zero the halfword
+                self.state.emit("    srli t1, t0, 1");
+                self.state.emit("    li t2, 0x5555");
+                self.state.emit("    and t1, t1, t2");
+                self.state.emit("    sub t1, t0, t1");
+                self.state.emit("    li t2, 0x3333");
+                self.state.emit("    srli t3, t1, 2");
+                self.state.emit("    and t3, t3, t2");
+                self.state.emit("    and t1, t1, t2");
+                self.state.emit("    add t1, t1, t3"); // nibble counts
+                self.state.emit("    srli t3, t1, 4");
+                self.state.emit("    add t1, t1, t3"); // byte counts in bytes 0 and 1
+                self.state.emit("    andi t3, t1, 0x0f");
+                self.state.emit("    srli t1, t1, 8");
+                self.state.emit("    andi t1, t1, 0x0f");
+                self.state.emit("    add t0, t3, t1");
+                return;
+            }
+            _ => {}
+        }
         let wide = ty == IrType::I64 || ty == IrType::U64;
         let (pairs, nibbles, bytes) = if wide {
             (
@@ -489,6 +532,38 @@ impl RiscvCodegen {
     /// instructions on 32 bits where the `popcount & 1` form was twenty-three
     /// (and, before the count was made branch-free, up to sixty-four trips).
     pub(super) fn emit_parity(&mut self, ty: IrType) {
+        // A byte or halfword needs one fold stage per width it has: shift by
+        // half the type, then 4, 2 and 1, and the low bit is the parity.  The
+        // nibble table below is a win only when the operand is wider, because
+        // it exists to skip the tail of a 32- or 64-bit reduction.
+        let narrow = match ty {
+            IrType::I8 | IrType::U8 => Some(4),
+            IrType::I16 | IrType::U16 => Some(8),
+            _ => None,
+        };
+        if let Some(first) = narrow {
+            // Mask to the type first: a halfword operand must not fold bits of
+            // the word above it into the answer.
+            match ty {
+                IrType::I8 | IrType::U8 => self.state.emit("    andi t0, t0, 0xff"),
+                _ => {
+                    self.state.emit("    slli t0, t0, 48");
+                    self.state.emit("    srli t0, t0, 48");
+                }
+            }
+            self.state
+                .emit_fmt(format_args!("    srli t1, t0, {first}"));
+            self.state.emit("    xor t1, t0, t1");
+            // The first fold covered `first` bits; the rest halve what is left.
+            let rest: &[u32] = if first == 8 { &[4, 2, 1] } else { &[2, 1] };
+            for &shift in rest {
+                self.state
+                    .emit_fmt(format_args!("    srli t2, t1, {shift}"));
+                self.state.emit("    xor t1, t1, t2");
+            }
+            self.state.emit("    andi t0, t1, 1");
+            return;
+        }
         let wide = ty == IrType::I64 || ty == IrType::U64;
         if wide {
             self.state.emit("    srli t1, t0, 32");
