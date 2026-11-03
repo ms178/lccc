@@ -222,6 +222,58 @@ mod tests {
         }
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn fused_stack_division_matches_unfused_on_hardware() {
+        use std::process::Command;
+
+        let body = "movq -8(%rsp), %rax\nxorq %rdx, %rdx\ndivq %rsi\nmovq %rdx, %r8\nmovq -8(%rsp), %rax\nxorq %rdx, %rdx\ndivq %rsi\nxorq %r8, %rax\nret\n";
+        let (changed, fused) = apply(body);
+        assert!(changed);
+        assert_eq!(fused.matches("divq").count(), 1);
+        let dir = std::env::temp_dir().join(format!("lccc_div_fusion_exec_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let asm = format!(
+            ".text\n.globl original\noriginal:\nmovq %rdi, -8(%rsp)\n{body}\n.globl fused\nfused:\nmovq %rdi, -8(%rsp)\n{fused}\n.section .note.GNU-stack,\"\",@progbits\n"
+        );
+        let driver = r#"
+#include <stdint.h>
+uint64_t original(uint64_t, uint64_t), fused(uint64_t, uint64_t);
+int main(void) {
+    uint64_t x = 0x123456789abcdef0ULL;
+    for (int i = 0; i < 100000; ++i) {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        uint64_t d = (x >> 32) | 1;
+        uint64_t expected = (x / d) ^ (x % d);
+        if (original(x, d) != expected || fused(x, d) != expected) return 1;
+    }
+    return 0;
+}
+"#;
+        let asm_path = dir.join("test.s");
+        let driver_path = dir.join("driver.c");
+        let exe = dir.join("test");
+        std::fs::write(&asm_path, asm).unwrap();
+        std::fs::write(&driver_path, driver).unwrap();
+        let compile = Command::new("gcc")
+            .arg(&asm_path)
+            .arg(&driver_path)
+            .arg("-o")
+            .arg(&exe)
+            .output()
+            .expect("gcc is required for the hardware regression");
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let status = Command::new(&exe)
+            .status()
+            .expect("hardware regression must run");
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(status.success(), "hardware regression returned {status}");
+    }
+
     #[test]
     fn every_register_alias_is_checked() {
         for width in 0..=1 {
