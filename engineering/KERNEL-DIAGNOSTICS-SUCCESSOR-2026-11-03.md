@@ -77,8 +77,9 @@ CC=gcc-16 CCC=target/fastbuild/lccc bash tests/regression/check_scoped_noreturn_
 No unsupported option is relabeled as implemented by this change.
 
 1. **Control flow:** audit loops with reachable break/continue before using the
-   return-path machinery for implicit-fallthrough. The current constant-loop
-   predicate still overlooks escaping breaks (e.g. `while (1) { break; }`).
+   return-path machinery for implicit-fallthrough. Statement transfer targets
+   are now modeled by the continuation graph described below; remaining
+   expression-level transfer coverage must still be audited.
    Preserve explicit fallthrough attributes rather than discard them; implement
    numeric warning levels and source/pragma scope semantics with oracle cases.
 2. **Format metadata:** preserve format contracts through declarations, typedefs,
@@ -131,3 +132,73 @@ skips**. The no-negative-glob contract was added after that process loaded its
 suite; the expanded six-test filter suite was run separately and passed. CI
 will discover the full expanded suite from the committed files. No combined
 count is fabricated by summing overlapping runs.
+
+## Successor checkpoint: continuation graph and main integration
+
+Integrated main `9bed91bec6c044d8a7fadfc7e062fc62b4e57a31` (including its
+count-builtin/backend fixes). Replaced the independent loop/switch return
+heuristics with `analysis/flow.rs`. The previous implementation treated every
+break/continue/goto as divergence and ignored the destination. For example,
+`while (1) { break; }` reaches the function end, whereas an inner loop's break
+must not escape the outer loop. A goto can re-enter code after an otherwise
+terminating statement.
+
+Decision: construct statement continuations once, with target-identity stacks,
+then resolve labels and run a visited-node worklist. Switch cases dispatch to
+actual nested case entries; statements before the first case are not the
+switch entry. Named targets survive synthetic C2y initializer scopes. Asm goto
+retains both normal fallthrough and listed label edges. Direct computed label
+addresses retain their exact destination; unknown computed destinations use a
+conservative shared dispatch hub. That hub requires G+L edges for G unknown
+computed gotos and L labels, rather than cloning G*L label edges. Worklist
+traversal is O(nodes+edges); named-target lookup still depends on nesting depth.
+This is diagnostic analysis, not an optimizer proof or measured runtime gain.
+
+Direct statement expressions share the graph, including declaration/for
+initializers, conditions, increments and return expressions. Cast/comma,
+conditional and short-circuit transfers are represented. Logical left-operand
+truth is captured before lexical scope disappears, just like scalar conditions.
+**Remaining expression scope:** this is not a complete expression CFG. Transfers
+buried in other operands (e.g. call arguments, assignments), VLA/type-name
+operations and selector-value-sensitive switch dispatch still need audit and
+implementation. Unknown computed destinations may overapproximate reachable
+labels. These are tracked limitations, not a claim of fully repaired flow.
+
+Evidence (non-kernel fixtures, exact GCC16.2.0/Clang23.1.4):
+
+- Frozen pre-fix compiler SHA256
+  `a535a0d2afa0ea39b228bd92b333d7d7e1a8397daa4148b1bb113fb0253a6c50`:
+  **1346 checks, 216 LCCC failures**, no reference failures.
+- Repaired compiler SHA256
+  `ed3cd070addead6f42f0f5c1c8f921233811d482a54321dc04107c2e0a480e69`:
+  **1346 checks, zero failures**, four targets at O0/O2. Includes **54 native
+  execution checks**, validating build status, exit status and empty output.
+- Actual source mutation `Stmt::Break(..) => DIVERGES`, built with the same
+  fastbuild script: **64 LCCC failures**; no reference failures. Correct source
+  restored and rebuilt, then the entire matrix passed again. Raw before,
+  repaired and mutant rows are committed beside the earlier truth evidence.
+- **7866 library tests passed, 10 ignored**; all-target Clippy `-D warnings`,
+  formatting, diff checks and the unchanged audit ratchet passed. Added unit
+  coverage for named transfers and expression/initializer control transfers.
+- GCC emits an additional `-Wswitch-unreachable` in four rows. The test requires
+  that exact diagnostic as well as the return warning; no warning is disabled,
+  and arbitrary extra warnings still fail.
+- Six separate C2y native probes: LCCC agrees with GCC on every return count.
+  Clang misses three named-loop exit warnings, crashes (signal 11) generating a
+  named-switch break, and rejects the switch-initializer probe. Raw observations
+  are in `named-flow.json`. These vendor defects are **not** used to weaken
+  LCCC expectations; permanent LCCC unit checks follow the GCC/language result.
+  These six probes are not claimed as an all-target three-oracle pass.
+
+The previous hosted fast-shard failure was CI/local gate parity: the hosted
+constant-truth matrix had no local mirror. Added `typed-constant-truth` to the
+fast local gates, without allowlisting the omission. Parity now passes **529
+commands / 27 contracts**; lane plan passes at **2928 estimated seconds**.
+The old-head authenticated ICX2026.2 lane passed the earlier 350-check matrix;
+new-head hosted ICX and full CI are still owed. The previous kernel job was
+cancelled during full bzImage compilation after boot-first gates passed; QEMU
+was skipped. The API did not identify who or what cancelled it.
+
+All-13 completion, final-head local full kernel/real objtool/QEMU, zero kernel
+warnings, measured host-runtime/code-size gains and final green hosted CI remain
+**open acceptance gates**. This checkpoint must remain a draft.

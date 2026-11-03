@@ -19,7 +19,6 @@ tests/regression/check_bit_test_canonical.sh  # passes locally; not yet wired in
 tests/regression/check_bitop_nonneg_zext.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_cfg_leaf_param_homes.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_clz_ctz_target_isa.sh  # passes locally; not yet wired into ci_local.sh / a workflow
-tests/regression/check_clz_zero_guard_fold.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_cmp_cast_branch_fusion.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_code16_string_ops.sh  # codegen contract divergence vs GNU as (.code16) — needs triage
 tests/regression/check_copy64_ymm.sh  # empty output — needs triage

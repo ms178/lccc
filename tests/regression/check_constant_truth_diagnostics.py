@@ -33,6 +33,62 @@ CASES = {
     "gnu_nested": ("enum { FOREVER=1 }; if (FOREVER) { "
                    "int inner(void) { return 1; } return inner(); }", 0),
 }
+# Structured and unstructured statement transfers share the same semantic
+# predicate. Each count is a language-level expectation, not just parity.
+CASES.update({
+    "while_break": ("while (1) { break; }", 1),
+    "for_break": ("for (;;) { break; }", 1),
+    "do_break": ("do { break; } while (1);", 1),
+    "do_continue": ("do { continue; } while (0);", 1),
+    "while_continue": ("while (1) { continue; }", 0),
+    "for_continue": ("for (;;) { continue; }", 0),
+    "do_continue_forever": ("do { continue; } while (1);", 0),
+    "conditional_break": ("extern int unknown; while (1) { if (unknown) break; }", 1),
+    "dead_break": ("while (1) { return 1; break; }", 0),
+    "false_break": ("while (1) { if (0) break; }", 0),
+    "dead_after_continue": ("while (1) { continue; break; }", 0),
+    "inner_break": ("while (1) { while (1) { break; } }", 0),
+    "inner_then_outer_break": ("while (1) { while (1) { break; } break; }", 1),
+    "unreachable_outer_break": ("while (1) { while (1) {} break; }", 0),
+    "switch_break_only": ("while (1) { switch (0) { default: break; } }", 0),
+    "switch_continue": ("do { switch (0) { default: continue; } } while (0);", 1),
+    "switch_break_then_outer_break": ("while (1) { switch (0) { default: break; } break; }", 1),
+    "loop_in_switch": ("switch (0) { default: while (1) { break; } }", 1),
+    "false_then_returns": ("if (0) {} else return 7;", 0),
+    "true_then_returns": ("if (1) return 7; else {}", 0),
+    "goto_out": ("while (1) { goto out; } return 1; out:;", 1),
+    "goto_return": ("goto done; return 1; done: return 7;", 0),
+    "goto_cycle": ("again: goto again;", 0),
+    "goto_dead_break": ("while (1) { goto again; break; again:; }", 0),
+    "goto_live_break": ("while (1) { goto done; continue; done: break; }", 1),
+    "unreachable_label": ("return 7; dead:;", 0),
+    "case_entry_after_return": ("switch (0) { return 1; default:; }", 1),
+    "gnu_stmt_goto": ("({ goto out; }); return 1; out:;", 1),
+    "gnu_return_expr_goto": ("return ({ goto out; 1; }); out:;", 1),
+    "computed_goto_out": ("goto *&&out; return 7; out:;", 1),
+    "computed_goto_cycle": ("again: goto *&&again; dead:;", 0),
+    "condition_trap": ("if (({ __builtin_trap(); 1; })) {}", 0),
+    "while_condition_trap": ("while (({ __builtin_trap(); 1; })) {}", 0),
+    "do_condition_trap": ("do { continue; } while (({ __builtin_trap(); 1; }));", 0),
+    "for_init_trap": ("for (({ __builtin_trap(); 0; }); 0;) {}", 0),
+    "for_decl_trap": ("for (int i=({ __builtin_trap(); 0; }); 0;) {}", 0),
+    "for_increment_trap": ("for (;; ({ __builtin_trap(); 0; })) { continue; }", 0),
+    "switch_condition_trap": ("switch (({ __builtin_trap(); 0; })) { default: break; }", 0),
+    "decl_trap": ("int i=({ __builtin_trap(); 0; });", 0),
+    "and_trap": ("(void)(1 && ({ __builtin_trap(); 0; }));", 0),
+    "and_short_circuit": ("(void)(0 && ({ __builtin_trap(); 0; }));", 1),
+    "or_trap": ("(void)(0 || ({ __builtin_trap(); 0; }));", 0),
+    "or_short_circuit": ("(void)(1 || ({ __builtin_trap(); 0; }));", 1),
+    "conditional_trap": ("(void)(1 ? ({ __builtin_trap(); 0; }) : 0);", 0),
+    "conditional_notrap": ("(void)(0 ? ({ __builtin_trap(); 0; }) : 0);", 1),
+    "gnu_conditional_trap": ("(void)(0 ?: ({ __builtin_trap(); 0; }));", 0),
+    "gnu_conditional_notrap": ("(void)(1 ?: ({ __builtin_trap(); 0; }));", 1),
+    "asm_goto_exit": ('asm goto ("" : : : : out); return 1; out:;', 1),
+})
+# GCC also diagnoses the unreachable statement before the first case label.
+# Require that exact extra diagnostic rather than disabling it or accepting
+# arbitrary warnings. The semantic return-warning expectation stays unchanged.
+ORACLE_AUXILIARY = {("gcc", "case_entry_after_return"): ["-Wswitch-unreachable"]}
 TARGETS = {
     "x86_64": ("lccc", [], ["--target=x86_64-linux-gnu"]),
     "i686": ("lccc-i686", ["-m32"], ["--target=i686-linux-gnu"]),
@@ -82,10 +138,16 @@ def main():
                         result = run([compiler, *flags, opt, "-std=gnu11", "-Wreturn-type",
                                       "-S", str(source), "-o", os.devnull])
                         count = len(re.findall(r"\[-Wreturn-type\]", result.stderr))
-                        passed = (result.returncode == 0 and count == expected
-                                  and len(re.findall(r"\bwarning:", result.stderr)) == count)
+                        auxiliary = ORACLE_AUXILIARY.get((family, name), [])
+                        diagnostics = re.findall(r"\[(-W[^]\s]+)\]", result.stderr)
+                        expected_diagnostics = ["-Wreturn-type"] * expected + auxiliary
+                        passed = (result.returncode == 0
+                                  and sorted(diagnostics) == sorted(expected_diagnostics)
+                                  and len(re.findall(r"\bwarning:", result.stderr))
+                                  == len(expected_diagnostics))
                         records.append(dict(target=target, opt=opt, case=name, compiler=family,
-                                            expected=expected, actual=count, rc=result.returncode,
+                                            expected=expected, expected_auxiliary=auxiliary,
+                                            actual=count, diagnostics=diagnostics, rc=result.returncode,
                                             passed=passed))
                         if not passed:
                             print(f"FAIL {family}/{target}/{opt}/{name}: rc={result.returncode}, "
@@ -97,7 +159,13 @@ def main():
             runtime_compilers.append(("icx", args.icx))
         for control in ("if ((unsigned char)256) __builtin_unreachable();",
                         "while ((unsigned char)256) {}",
-                        "for (; (unsigned int)4294967296ULL;) {}"):
+                        "for (; (unsigned int)4294967296ULL;) {}",
+                        "while (1) { break; }",
+                        "for (;;) { break; }",
+                        "do { continue; } while (0);",
+                        "while (1) { switch (0) { default: break; } break; }",
+                        "goto value; value:;",
+                        "do { switch (0) { default: continue; } } while (0);"):
             source.write_text("int subject(void) { return ({ " + control +
                               " 7; }); } int main(void) { return subject() != 7; }\n")
             for opt in ("-O0", "-O2"):
@@ -117,7 +185,9 @@ def main():
     if args.json:
         args.json.write_text(json.dumps(records, indent=2) + "\n")
     failures = sum(not record["passed"] for record in records)
-    print(f"typed constant truth: {len(records)} checks, {failures} failures")
+    auxiliary = sum(len(record.get("expected_auxiliary", [])) for record in records)
+    print(f"typed constant truth: {len(records)} checks, {failures} failures, "
+          f"{auxiliary} exact oracle-specific auxiliary diagnostics")
     return bool(failures)
 
 

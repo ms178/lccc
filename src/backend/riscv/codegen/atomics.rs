@@ -4,9 +4,9 @@
 //! RISC-V only provides word (32-bit) and doubleword (64-bit) atomic instructions
 //! (AMO and LR/SC). For sub-word types (I8/U8/I16/U16), this module implements
 //! atomic RMW and CAS operations using word-aligned LR.W/SC.W loops with bit
-//! masking. It also provides software loop-based implementations of count leading
-//! zeros, count trailing zeros, byte swap, and population count for targets that
-//! lack the Zbb extension.
+//! masking. It also provides software, branch-free implementations of count
+//! leading zeros, count trailing zeros, byte swap, and population count for
+//! targets that lack the Zbb extension.
 
 use super::emit::RiscvCodegen;
 use crate::backend::state::CodegenState;
@@ -308,67 +308,53 @@ impl RiscvCodegen {
     }
 
     /// Software CLZ (count leading zeros). Input in t0, result in t0.
-    /// For 32-bit types, counts leading zeros in the lower 32 bits.
+    ///
+    /// Branch-free: `clz` is `bits - bitlen`, and `bitlen` is the population
+    /// count of the operand *smeared* downward (`x |= x >> 1`, `x >> 2`, ...),
+    /// which turns on every bit below the highest set bit.  `x == 0` smears to
+    /// zero, so a zero operand falls out of the count as `bits` with no
+    /// special case -- the same "returns the width for zero" contract the scan
+    /// had.  Two instructions per smearing stage, `log2(bits)` stages, then the
+    /// branch-free population count; the per-bit scan this replaces ran up to
+    /// `bits` trips through two unpredictable branches, so the new form is
+    /// constant-cost *and* constant-time.
     pub(super) fn emit_clz(&mut self, ty: IrType) {
         let bits: u64 = match ty {
             IrType::I32 | IrType::U32 => 32,
             _ => 64,
         };
-        let loop_label = self.state.fresh_label("clz_loop");
-        let done_label = self.state.fresh_label("clz_done");
-        let zero_label = self.state.fresh_label("clz_zero");
-
         if bits == 32 {
-            // Mask to 32 bits to avoid counting upper bits
+            // Zero-extend first: a sign-extended operand would smear its sign
+            // bits down into the count and report zero leading zeros.
             self.state.emit("    slli t0, t0, 32");
             self.state.emit("    srli t0, t0, 32");
         }
-
-        // Handle zero case: clz(0) = bits
-        self.state
-            .emit_fmt(format_args!("    beqz t0, {}", zero_label));
-        // t1 = count = 0, scan from MSB
-        self.state.emit("    li t1, 0");
-        // t2 = mask = 1 << (bits-1)
-        self.state.emit("    li t2, 1");
-        self.state
-            .emit_fmt(format_args!("    slli t2, t2, {}", bits - 1));
-        self.state.emit_fmt(format_args!("{}:", loop_label));
-        self.state.emit("    and t3, t0, t2");
-        self.state
-            .emit_fmt(format_args!("    bnez t3, {}", done_label));
-        self.state.emit("    srli t2, t2, 1"); // shift mask right
-        self.state.emit("    addi t1, t1, 1");
-        self.state.emit_fmt(format_args!("    j {}", loop_label));
-        self.state.emit_fmt(format_args!("{}:", zero_label));
-        self.state.emit_fmt(format_args!("    li t1, {}", bits));
-        self.state.emit_fmt(format_args!("{}:", done_label));
-        self.state.emit("    mv t0, t1");
+        let mut shift = 1;
+        while shift < bits {
+            self.state
+                .emit_fmt(format_args!("    srli t1, t0, {shift}"));
+            self.state.emit("    or t0, t0, t1");
+            shift *= 2;
+        }
+        // The complement of the smear has exactly `clz` low ones.  The
+        // population count masks the operand to the type, which drops the 64
+        // ones the complement left above a 32-bit operand.
+        self.state.emit("    not t0, t0");
+        self.emit_popcount(ty);
     }
 
     /// Software CTZ (count trailing zeros). Input in t0, result in t0.
+    ///
+    /// Branch-free: `(x - 1) & ~x` keeps exactly the bits below the lowest set
+    /// bit, so its population count is the trailing-zero count; for `x == 0`
+    /// both halves are all ones and the count is the full width, which is the
+    /// contract the scan had.  Three instructions plus the count instead of up
+    /// to `bits` trips through two unpredictable branches.
     pub(super) fn emit_ctz(&mut self, ty: IrType) {
-        let bits = match ty {
-            IrType::I32 | IrType::U32 => 32u64,
-            _ => 64u64,
-        };
-        let loop_label = self.state.fresh_label("ctz_loop");
-        let done_label = self.state.fresh_label("ctz_done");
-
-        // t1 = count, starts at 0
-        self.state.emit("    li t1, 0");
-        self.state.emit_fmt(format_args!("{}:", loop_label));
-        self.state.emit_fmt(format_args!("    li t2, {}", bits));
-        self.state
-            .emit_fmt(format_args!("    beq t1, t2, {}", done_label)); // if counted all bits, done
-        self.state.emit("    andi t3, t0, 1");
-        self.state
-            .emit_fmt(format_args!("    bnez t3, {}", done_label)); // found a 1 bit
-        self.state.emit("    srli t0, t0, 1");
-        self.state.emit("    addi t1, t1, 1");
-        self.state.emit_fmt(format_args!("    j {}", loop_label));
-        self.state.emit_fmt(format_args!("{}:", done_label));
-        self.state.emit("    mv t0, t1");
+        self.state.emit("    addi t1, t0, -1");
+        self.state.emit("    not t2, t0");
+        self.state.emit("    and t0, t1, t2");
+        self.emit_popcount(ty);
     }
 
     /// Software BSWAP (byte swap). Input in t0, result in t0.

@@ -1409,6 +1409,12 @@ gate "repro-replay" fast \
 gate "scoped-noreturn-diagnostics" fast \
     bash tests/regression/check_scoped_noreturn_diagnostics.sh
 
+# The same typed-condition matrix runs in the authenticated vendor CI lane.
+# The script checks exact oracle versions and uses ICX when explicitly supplied.
+gate "typed-constant-truth" fast \
+    python3 tests/regression/check_constant_truth_diagnostics.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" --clang "${CLANG23:-clang-23}"
+
 # `lccc -S -o - x.c` used to create a file literally named `-`, silently
 # dropping the assembly from any pipeline's point of view.  GCC 14.2 pins the
 # contract cell by cell (the table lives in the gate): -S/-E stream to stdout
@@ -1961,6 +1967,13 @@ gate "iabs-cmp-fold" fast \
 # the ownership of both kill switches and bit-exact -O0/-O2/-O3 agreement.
 gate "lowest-set-bit-fold" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_lowest_set_bit_fold.sh
+
+# The guarded-clz fold: the dead select tail must stay gone on x86-64 (both
+# pipeline topologies, executed) and the speculated ClzNonZero arm must never
+# survive as a bare scan on i686 (assembly contract -- i686's defined-zero
+# fix-up is the sentinel preload, which is a correct answer too).
+gate "clz-zero-guard-fold" fast \
+    bash tests/regression/check_clz_zero_guard_fold.sh
 
 # The narrow negate: the C integer promotions wrap every narrow negation in a
 # widen/negate/narrow round trip; `negcast` relocates the negate to the width
@@ -3095,6 +3108,13 @@ gate "bit-width-runtime" fast \
 # certified on the emulated backends, not just the instruction shapes above.
 gate "narrow-count-runtime" fast \
     python3 tests/regression/check_narrow_count_runtime.py
+
+# The count builtins' values, on all four backends: freestanding clz/ctz
+# kernels against in-image loop references, exhaustive over the low half-word
+# plus single-bit and randomized sweeps. The hosted shard runs it with --run;
+# this mirror executes when QEMU is present and compiles otherwise.
+gate "count-builtins-runtime" fast \
+    python3 tests/regression/check_count_builtins_runtime.py
 
 gate "popcount-loop-contract" fast \
     python3 tests/regression/check_popcount_loop_contract.py
