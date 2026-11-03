@@ -154,6 +154,37 @@ mod tests {
     }
 
     #[test]
+    fn every_register_alias_is_checked() {
+        for width in 0..=1 {
+            let names = &REG_NAMES[width];
+            let (mov, setup, div) = if width == 0 {
+                ("movq", "xorq %rdx, %rdx", "divq")
+            } else {
+                ("movl", "xorl %edx, %edx", "divl")
+            };
+            for source in 0..16 {
+                for divisor in 0..16 {
+                    for copy in 0..16 {
+                        let stage = format!("{mov} {}, {}", names[source], names[0]);
+                        let division = format!("{div} {}", names[divisor]);
+                        let save = format!("{mov} {}, {}", names[2], names[copy]);
+                        let body = format!(
+                            "{stage}\n{setup}\n{division}\n{save}\n{stage}\n{setup}\n{division}\nret\n"
+                        );
+                        let expected = !matches!(source, 0 | 2 | 4)
+                            && !matches!(divisor, 0 | 2 | 4)
+                            && !matches!(copy, 0 | 2 | 4)
+                            && copy != source
+                            && copy != divisor;
+                        let (changed, output) = apply(&body);
+                        assert_eq!(changed, expected, "{body} => {output}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn refuses_changed_inputs_flags_and_opaque_code() {
         for body in [
             "movl %edi, %eax\nxorl %edx, %edx\ndivl %esi\nmovl %edx, %edi\nmovl %edi, %eax\nxorl %edx, %edx\ndivl %esi\nret\n",
