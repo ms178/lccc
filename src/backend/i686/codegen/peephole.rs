@@ -9464,6 +9464,22 @@ fn fold_load_copy_relay_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> b
             continue;
         };
 
+        // Defer to fold_reg_copy_idioms Pattern 7 (`movl %T,%D; subl $a,%D;
+        // cmpl $b,%D; jCC` -> `cmpl $(a+b),%T`). That fusion retires the copy,
+        // the subtract and the compare in one step, after which the memory
+        // fold folds the slot load into the surviving compare — a single
+        // instruction. This relay would instead strand `subl $a,%D`: an
+        // immediate ALU op cannot absorb a memory operand, so the load, sub
+        // and cmp all survive (three instructions). Removing the copy here
+        // starves Pattern 7, so refuse whenever the copy feeds a `subl $imm`.
+        let after = next_sig(infos, cj + 1, len);
+        if after < len
+            && parse_subl_imm_reg(trimmed(store, &infos[after], after), reg32_name(d)).is_some()
+        {
+            i += 1;
+            continue;
+        }
+
         // %D must be untouched between the load and the copy.
         let mut d_ok = true;
         for k in (i + 1)..cj {
@@ -14997,18 +15013,22 @@ fn mentions_label(text: &str, label: &str) -> bool {
     false
 }
 
-/// True when `label` is referenced anywhere in `fstart..fend` other than the
-/// jCC at `jcc_idx` and the defining label at `def_idx`.
+/// True when `label` is referenced anywhere in the MODULE other than the jCC
+/// at `jcc_idx` and the defining label at `def_idx`. The census is module-wide
+/// because GNU as `.L` labels are file-scoped: a select's true label is unique
+/// across the module (a single `next_label_id` counter), and the fold DELETES
+/// that label, so any reference to it — a cross-function branch or an
+/// address-taken `.long .Lsel_true_N` in a jump table — must veto the fold even
+/// when it lies outside the defining function's extent. A function-bounded
+/// census would miss such a reference and silently drop a live label.
 fn label_has_other_ref(
     store: &LineStore,
     infos: &[LineInfo],
-    fstart: usize,
-    fend: usize,
     label: &str,
     jcc_idx: usize,
     def_idx: usize,
 ) -> bool {
-    for n in fstart..fend {
+    for n in 0..infos.len() {
         if n == jcc_idx || n == def_idx || infos[n].is_nop() {
             continue;
         }
@@ -15131,8 +15151,8 @@ fn try_fold_select_diamond(
         return false;
     }
 
-    // The true label must have exactly one reference (this jCC).
-    if label_has_other_ref(store, infos, fstart, fend, &true_label, a, d) {
+    // The true label must have exactly one reference (this jCC), module-wide.
+    if label_has_other_ref(store, infos, &true_label, a, d) {
         return false;
     }
 
@@ -15166,8 +15186,8 @@ fn try_fold_select_diamond(
 }
 
 /// Fold register-arm select diamonds into `cmovcc` (see the module comment
-/// above for the soundness argument). Runs per function so the reference
-/// census is bounded by the function extent.
+/// above for the soundness argument). Shape matching runs per function; the
+/// true-label reference census is module-wide (see `label_has_other_ref`).
 fn fold_select_diamond_cmov(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     if std::env::var_os("CCC_NO_I686_SELECT_CMOV").is_some() {
         return false;
@@ -17091,6 +17111,59 @@ mod tests {
         assert!(!out.contains("cmov"), "{out}");
     }
 
+    #[test]
+    fn select_diamond_alias_conditions_fold() {
+        // The codegen's int_jcc emits canonical conditions, but a select may
+        // also reach this pass with a GAS alias (hand-written asm, a future
+        // producer). The fold preserves the jCC's condition verbatim, so the
+        // emitted cmov must carry the same alias — which the encoder now
+        // accepts at GAS parity (see cmov_condition_alias_tests).
+        for (jcc, cmov) in [
+            ("jpe", "cmovpel"),
+            ("jpo", "cmovpol"),
+            ("jnae", "cmovnael"),
+            ("jng", "cmovngl"),
+            ("jnl", "cmovnll"),
+            ("jnbe", "cmovnbel"),
+        ] {
+            let asm = format!(
+                "f:\n    cmpl %esi, %ebx\n    {jcc} .Lt\n    movl %esi, %eax\n    jmp .Le\n.Lt:\n    movl %ebx, %eax\n.Le:\n    ret\n"
+            );
+            let out = run_cmov_fold(&asm);
+            assert!(out.contains(&format!("{cmov} %ebx, %eax")), "{jcc}: {out}");
+            assert!(!out.contains(&format!("{jcc} .Lt")), "{jcc}: {out}");
+        }
+    }
+
+    #[test]
+    fn select_diamond_alias_fold_assembles() {
+        // End to end: an alias-condition diamond folds to an alias cmov that
+        // the integrated i686 assembler must encode (the pre-fix dispatch
+        // rejected `cmovpel` with "unhandled i686 instruction").
+        let asm = "f:\n    testl %edx, %edx\n    jpe .Lt\n    movl %esi, %eax\n    jmp .Le\n.Lt:\n    movl %ebx, %eax\n.Le:\n    ret\n";
+        let out = run_cmov_fold(asm);
+        assert!(out.contains("cmovpel %ebx, %eax"), "{out}");
+        let dir = std::env::temp_dir().join(format!("lccc-selcmov-alias-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let obj = dir.join("t.o");
+        crate::backend::i686::assembler::assemble(&out, obj.to_str().unwrap(), None)
+            .unwrap_or_else(|e| panic!("alias cmov failed to assemble: {e}\n{out}"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn select_diamond_cross_function_label_ref_is_refused() {
+        // Another function branches into the true arm. `.L` labels are
+        // file-scoped, so the module-wide census must see this cross-function
+        // reference and refuse — a function-bounded census would delete a live
+        // label and redirect g's jump into the fallthrough.
+        let asm = "f:\n    cmpl %esi, %ebx\n    jg .Lt\n    movl %esi, %eax\n    jmp .Le\n.Lt:\n    movl %ebx, %eax\n.Le:\n    ret\n.size f, .-f\ng:\n    jmp .Lt\n.size g, .-g\n";
+        let out = run_cmov_fold(asm);
+        assert!(!out.contains("cmov"), "{out}");
+        assert!(out.contains(".Lt:"), "{out}");
+        assert!(out.contains("jmp .Lt"), "{out}");
+    }
+
     // ── load→copy relay (cross-pollination from x86-64) ───────────────────
 
     fn run_relay(asm: &str) -> String {
@@ -17138,6 +17211,41 @@ mod tests {
             "f:\n    movl 16(%esp), %ebx\n    addl %ebx, %esi\n    movl %ebx, %eax\n    ret\n";
         let out = run_relay(asm);
         assert!(out.contains("movl 16(%esp), %ebx"), "{out}");
+    }
+
+    #[test]
+    fn load_copy_relay_implicit_scratch_clobber_between_is_refused() {
+        // `cltd` sign-extends %eax into %edx: it WRITES %edx implicitly without
+        // naming it. The relay's window oracle (classify_implicit_operands)
+        // must account for that and break, or retargeting the load would feed
+        // the copy the sign-extension result instead of the loaded value.
+        let asm = "f:\n    movl 16(%esp), %edx\n    cltd\n    movl %edx, %eax\n    ret\n";
+        let out = run_relay(asm);
+        assert!(out.contains("movl 16(%esp), %edx"), "{out}");
+        assert!(out.contains("movl %edx, %eax"), "{out}");
+    }
+
+    #[test]
+    fn load_copy_relay_implicit_string_op_between_is_refused() {
+        // `movsl` implicitly reads and advances %esi (and %edi). With %esi as
+        // the scratch, the window must break on the implicit %esi touch.
+        let asm = "f:\n    movl 16(%esp), %esi\n    movsl\n    movl %esi, %eax\n    ret\n";
+        let out = run_relay(asm);
+        assert!(out.contains("movl 16(%esp), %esi"), "{out}");
+        assert!(out.contains("movl %esi, %eax"), "{out}");
+    }
+
+    #[test]
+    fn load_copy_relay_defers_to_sub_cmp_idiom() {
+        // The copy feeds `subl $48,%eax; cmpl $9,%eax` — fold_reg_copy_idioms
+        // Pattern 7 fuses that whole chain into one `cmpl $57,%esi` (then the
+        // memory fold retires the load). The relay must NOT remove the copy
+        // first, or it strands the immediate subtract (3 insns instead of 1).
+        let asm = "f:\n    movl 16(%esp), %esi\n    movl %esi, %eax\n    subl $48, %eax\n    cmpl $9, %eax\n    je .L1\n    movl $1, %eax\n    ret\n.L1:\n    movl $2, %eax\n    ret\n";
+        let out = run_relay(asm);
+        assert!(out.contains("movl 16(%esp), %esi"), "{out}");
+        assert!(out.contains("movl %esi, %eax"), "{out}");
+        assert!(!out.contains("movl 16(%esp), %eax"), "{out}");
     }
 
     #[test]

@@ -1677,16 +1677,21 @@ impl InstructionEncoder {
             | "setc" | "setbe" | "seta" | "setae" | "setnc" | "setnp" | "setp" | "sets"
             | "setns" | "seto" | "setno" => self.encode_setcc(ops, mnemonic),
 
-            // Conditional move
-            "cmovel" | "cmovnel" | "cmovll" | "cmovlel" | "cmovgl" | "cmovgel" | "cmovbl"
-            | "cmovbel" | "cmoval" | "cmovael" | "cmovsl" | "cmovnsl" | "cmovzl" | "cmovnzl"
-            | "cmovpl" | "cmovnpl" | "cmovol" | "cmovnol" | "cmovcl" | "cmovncl" | "cmovew"
-            | "cmovnew" | "cmovlw" | "cmovlew" | "cmovgw" | "cmovgew" | "cmovbw" | "cmovbew"
-            | "cmovaw" | "cmovaew" | "cmovsw" | "cmovnsw" | "cmovzw" | "cmovnzw" | "cmovpw"
-            | "cmovnpw" | "cmovow" | "cmovnow" | "cmovcw" | "cmovncw" | "cmove" | "cmovne"
-            | "cmovl" | "cmovle" | "cmovg" | "cmovge" | "cmovb" | "cmovbe" | "cmova" | "cmovae"
-            | "cmovs" | "cmovns" | "cmovz" | "cmovnz" | "cmovp" | "cmovnp" | "cmovo" | "cmovno"
-            | "cmovc" | "cmovnc" => self.encode_cmovcc(ops, mnemonic),
+            // Conditional move. Route every `cmov*` spelling to encode_cmovcc,
+            // which validates the condition through cc_from_mnemonic (the single
+            // source of truth shared with jCC/setCC) and strips/infers the width
+            // suffix. GAS accepts all 30 condition aliases with any suffix
+            // (cmovpel, cmovnael, cmovngl, ...) plus the bare ambiguous cmovl
+            // (less) and cmovnl (not-less). The old explicit dispatch list omitted
+            // the aliases and cmovnl, so they failed to assemble even though the
+            // x86-64 backend and cc_from_mnemonic accept them; the i686 select-
+            // diamond cmov fold can emit any condition the codegen's jCC uses.
+            // encode_cmovcc's suffix guard only strips a trailing w/l when the
+            // remaining stem is a valid condition, so cmovl/cmovnl keep their `l`
+            // as the condition and infer width from the destination. A prefix
+            // guard keeps i686 at GAS parity and still fails closed on a typo
+            // (cc_from_mnemonic returns Err for an unknown condition).
+            m if m.starts_with("cmov") => self.encode_cmovcc(ops, m),
 
             // Jumps
             // `jmpl` is the explicit 32-bit-operand spelling; in 32-bit
@@ -4562,5 +4567,131 @@ mod sse34_completeness_tests {
                 "{source}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod cmov_condition_alias_tests {
+    use super::*;
+
+    /// Encode one instruction to lowercase hex (no separators), mirroring GAS.
+    fn enc(line: &str) -> Result<String, String> {
+        let mut e = InstructionEncoder::new();
+        for item in parse_asm(line)? {
+            if let AsmItem::Instruction(i) = item {
+                e.encode(&i)?;
+            }
+        }
+        Ok(e.bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>())
+    }
+
+    /// Every GAS condition-code alias must encode with an explicit `l` suffix.
+    /// Reference bytes: GNU as --32 + objdump (`cmov{cc}l %ebx,%eax` =
+    /// `0f (40+cc) c3`). The i686 dispatch historically listed only the canonical
+    /// spellings, so aliases like `cmovpel`/`cmovnael`/`cmovngel` failed to
+    /// assemble even though `cc_from_mnemonic` and the x86-64 backend accept
+    /// them. This pins GAS parity for all 30 spellings.
+    #[test]
+    fn cmov_l_aliases_match_gas() {
+        for (line, expected) in [
+            ("cmovol %ebx,%eax", "0f40c3"),
+            ("cmovnol %ebx,%eax", "0f41c3"),
+            ("cmovbl %ebx,%eax", "0f42c3"),
+            ("cmovcl %ebx,%eax", "0f42c3"),
+            ("cmovnael %ebx,%eax", "0f42c3"),
+            ("cmovael %ebx,%eax", "0f43c3"),
+            ("cmovnbl %ebx,%eax", "0f43c3"),
+            ("cmovncl %ebx,%eax", "0f43c3"),
+            ("cmovel %ebx,%eax", "0f44c3"),
+            ("cmovzl %ebx,%eax", "0f44c3"),
+            ("cmovnel %ebx,%eax", "0f45c3"),
+            ("cmovnzl %ebx,%eax", "0f45c3"),
+            ("cmovbel %ebx,%eax", "0f46c3"),
+            ("cmovnal %ebx,%eax", "0f46c3"),
+            ("cmoval %ebx,%eax", "0f47c3"),
+            ("cmovnbel %ebx,%eax", "0f47c3"),
+            ("cmovsl %ebx,%eax", "0f48c3"),
+            ("cmovnsl %ebx,%eax", "0f49c3"),
+            ("cmovpl %ebx,%eax", "0f4ac3"),
+            ("cmovpel %ebx,%eax", "0f4ac3"),
+            ("cmovnpl %ebx,%eax", "0f4bc3"),
+            ("cmovpol %ebx,%eax", "0f4bc3"),
+            ("cmovll %ebx,%eax", "0f4cc3"),
+            ("cmovngel %ebx,%eax", "0f4cc3"),
+            ("cmovgel %ebx,%eax", "0f4dc3"),
+            ("cmovnll %ebx,%eax", "0f4dc3"),
+            ("cmovlel %ebx,%eax", "0f4ec3"),
+            ("cmovngl %ebx,%eax", "0f4ec3"),
+            ("cmovgl %ebx,%eax", "0f4fc3"),
+            ("cmovnlel %ebx,%eax", "0f4fc3"),
+        ] {
+            assert_eq!(enc(line).unwrap(), expected, "{line}");
+        }
+    }
+
+    /// Same parity for the 16-bit `w` suffix (`66 0f (40+cc) c3`).
+    #[test]
+    fn cmov_w_aliases_match_gas() {
+        for (line, expected) in [
+            ("cmovow %bx,%ax", "660f40c3"),
+            ("cmovnow %bx,%ax", "660f41c3"),
+            ("cmovbw %bx,%ax", "660f42c3"),
+            ("cmovcw %bx,%ax", "660f42c3"),
+            ("cmovnaew %bx,%ax", "660f42c3"),
+            ("cmovaew %bx,%ax", "660f43c3"),
+            ("cmovnbw %bx,%ax", "660f43c3"),
+            ("cmovncw %bx,%ax", "660f43c3"),
+            ("cmovew %bx,%ax", "660f44c3"),
+            ("cmovzw %bx,%ax", "660f44c3"),
+            ("cmovnew %bx,%ax", "660f45c3"),
+            ("cmovnzw %bx,%ax", "660f45c3"),
+            ("cmovbew %bx,%ax", "660f46c3"),
+            ("cmovnaw %bx,%ax", "660f46c3"),
+            ("cmovaw %bx,%ax", "660f47c3"),
+            ("cmovnbew %bx,%ax", "660f47c3"),
+            ("cmovsw %bx,%ax", "660f48c3"),
+            ("cmovnsw %bx,%ax", "660f49c3"),
+            ("cmovpw %bx,%ax", "660f4ac3"),
+            ("cmovpew %bx,%ax", "660f4ac3"),
+            ("cmovnpw %bx,%ax", "660f4bc3"),
+            ("cmovpow %bx,%ax", "660f4bc3"),
+            ("cmovlw %bx,%ax", "660f4cc3"),
+            ("cmovngew %bx,%ax", "660f4cc3"),
+            ("cmovgew %bx,%ax", "660f4dc3"),
+            ("cmovnlw %bx,%ax", "660f4dc3"),
+            ("cmovlew %bx,%ax", "660f4ec3"),
+            ("cmovngw %bx,%ax", "660f4ec3"),
+            ("cmovgw %bx,%ax", "660f4fc3"),
+            ("cmovnlew %bx,%ax", "660f4fc3"),
+        ] {
+            assert_eq!(enc(line).unwrap(), expected, "{line}");
+        }
+    }
+
+    /// The bare spellings `cmovl` (less) and `cmovnl` (not-less = ge) are
+    /// ambiguous: the trailing `l` is the condition, not a width suffix. The
+    /// encoder must infer width from the destination and NOT strip the `l`.
+    #[test]
+    fn cmov_suffixless_l_and_nl_infer_width() {
+        // 32-bit destinations: no 66 prefix.
+        assert_eq!(enc("cmovl %ebx,%eax").unwrap(), "0f4cc3");
+        assert_eq!(enc("cmovnl %ebx,%eax").unwrap(), "0f4dc3");
+        // 16-bit destinations: 66 prefix, same condition opcodes.
+        assert_eq!(enc("cmovl %bx,%ax").unwrap(), "660f4cc3");
+        assert_eq!(enc("cmovnl %bx,%ax").unwrap(), "660f4dc3");
+        // Explicit width suffix on the same conditions still works.
+        assert_eq!(enc("cmovll %ebx,%eax").unwrap(), "0f4cc3");
+        assert_eq!(enc("cmovnll %ebx,%eax").unwrap(), "0f4dc3");
+    }
+
+    /// An unknown condition must still be a hard error (fail-closed), so the
+    /// generic dispatch cannot silently accept a typo.
+    #[test]
+    fn cmov_rejects_unknown_condition() {
+        assert!(enc("cmovfool %ebx,%eax").is_err());
+        assert!(enc("cmovq %ebx,%eax").is_err());
     }
 }
