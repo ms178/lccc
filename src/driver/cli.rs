@@ -1454,7 +1454,10 @@ impl Driver {
     /// is what GCC 16.2 does, while the same feature reached only through
     /// `-march=` still needs every prerequisite
     /// ([`Self::drop_x86_extras_without_requirements`]).
-    fn grant_x86_extra_explicitly(&mut self, extra: crate::backend::x86::arch_table::X86ExtraFeature) {
+    fn grant_x86_extra_explicitly(
+        &mut self,
+        extra: crate::backend::x86::arch_table::X86ExtraFeature,
+    ) {
         *self.x86_extra_slot(extra) = true;
         self.x86_extras_explicit |= 1 << extra as u8;
         let contained = extra.requires_extras();
@@ -7603,13 +7606,7 @@ mod x86_macro_gate_tests {
     /// state lives in an XSAVE component.
     #[test]
     fn xsave_is_its_own_bit_not_an_avx_implication() {
-        for cpu in [
-            "btver1",
-            "goldmont",
-            "goldmont-plus",
-            "lujiazui",
-            "tremont",
-        ] {
+        for cpu in ["btver1", "goldmont", "goldmont-plus", "lujiazui", "tremont"] {
             let flag = format!("-march={cpu}");
             let d = parse(&[flag.as_str()]);
             assert!(d.resolved_xsave(), "{cpu}");
@@ -7621,7 +7618,10 @@ mod x86_macro_gate_tests {
         for cpu in ["haswell", "znver4", "x86-64-v3", "icelake-server"] {
             let flag = format!("-march={cpu}");
             let d = parse(&[flag.as_str()]);
-            assert!(d.resolved_xsave() && d.effective_x86_features().contains(F::Avx), "{cpu}");
+            assert!(
+                d.resolved_xsave() && d.effective_x86_features().contains(F::Avx),
+                "{cpu}"
+            );
         }
         // The v1 baseline has neither.
         assert!(!parse(&["-march=x86-64"]).resolved_xsave());
@@ -7706,12 +7706,24 @@ mod x86_macro_gate_tests {
     fn a_ladder_denial_keeps_the_ladder_independent_extensions() {
         use crate::backend::x86::isa::features_permit;
         for (flags, want_aes, want_pclmul, want_gfni, want_sse2) in [
-            (&["-march=skylake", "-mno-sse"][..], true, true, false, false),
+            (
+                &["-march=skylake", "-mno-sse"][..],
+                true,
+                true,
+                false,
+                false,
+            ),
             (&["-mno-sse", "-march=goldmont"], true, true, false, false),
             (&["-march=goldmont", "-mno-sse2"], true, true, false, false),
             (&["-march=znver4", "-mno-sse"], true, true, true, false),
             (&["-mno-sse2", "-march=tremont"], true, true, true, false),
-            (&["-mgeneral-regs-only", "-march=haswell"], false, true, false, false),
+            (
+                &["-mgeneral-regs-only", "-march=haswell"],
+                false,
+                true,
+                false,
+                false,
+            ),
             // `-maes`/`-mpclmul` reopen the SSE2 class (GCC: `__SSE2__` is
             // predefined under `-mno-sse -maes`), `-mgfni` does not.
             (&["-mno-sse", "-maes"], true, false, false, true),
@@ -7791,12 +7803,27 @@ mod x86_macro_gate_tests {
     #[test]
     fn prefer_vector_width_is_parsed_and_resolved() {
         assert_eq!(parse(&[]).x86_prefer_vector_bits, None);
-        assert_eq!(parse(&["-mprefer-vector-width=128"]).x86_prefer_vector_bits, Some(128));
-        assert_eq!(parse(&["-mprefer-vector-width=256"]).x86_prefer_vector_bits, Some(256));
-        assert_eq!(parse(&["-mprefer-vector-width=512"]).x86_prefer_vector_bits, Some(512));
-        assert_eq!(parse(&["-mprefer-vector-width=none"]).x86_prefer_vector_bits, None);
+        assert_eq!(
+            parse(&["-mprefer-vector-width=128"]).x86_prefer_vector_bits,
+            Some(128)
+        );
+        assert_eq!(
+            parse(&["-mprefer-vector-width=256"]).x86_prefer_vector_bits,
+            Some(256)
+        );
+        assert_eq!(
+            parse(&["-mprefer-vector-width=512"]).x86_prefer_vector_bits,
+            Some(512)
+        );
+        assert_eq!(
+            parse(&["-mprefer-vector-width=none"]).x86_prefer_vector_bits,
+            None
+        );
         // The deprecated alias GCC still accepts.
-        assert_eq!(parse(&["-mprefer-avx128"]).x86_prefer_vector_bits, Some(128));
+        assert_eq!(
+            parse(&["-mprefer-avx128"]).x86_prefer_vector_bits,
+            Some(128)
+        );
         // Last one wins, `none` included.
         assert_eq!(
             parse(&["-mprefer-vector-width=128", "-mprefer-vector-width=256"])

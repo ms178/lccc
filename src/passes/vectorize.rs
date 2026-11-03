@@ -1285,7 +1285,8 @@ fn vectorize_with_analysis_mode(
                         analyze_stencil_pattern(func, loop_info, symbol_facts)
                     {
                         if !neon {
-                            let avx2 = !force_two_wide && !map_sse_forced() && x86_avx2_width_wanted();
+                            let avx2 =
+                                !force_two_wide && !map_sse_forced() && x86_avx2_width_wanted();
                             if debug {
                                 eprintln!(
                                     "[VEC] Stencil pattern matched! taps={} {:?} ({}-bit)",
@@ -38670,8 +38671,14 @@ mod prefer_vector_width_tests {
         // image), the auto-vectorizers stop *choosing* 256-bit shapes.
         set_x86_prefer_vector_bits(128);
         set_x86_simd_isa(true, true, true, true);
-        assert!(x86_avx2_available_pub(), "the hardware permission is unchanged");
-        assert!(!x86_avx2_width_wanted(), "a 128-bit preference withholds ymm shapes");
+        assert!(
+            x86_avx2_available_pub(),
+            "the hardware permission is unchanged"
+        );
+        assert!(
+            !x86_avx2_width_wanted(),
+            "a 128-bit preference withholds ymm shapes"
+        );
         assert!(x86_sse41_available_pub(), "the register class stays legal");
         assert!(x86_simd_available_pub());
 
