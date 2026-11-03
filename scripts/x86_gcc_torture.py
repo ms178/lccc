@@ -25,8 +25,9 @@ Features:
   - Reference multilib preflight; missing tools/timeouts cannot become skips.
 
 This is a native differential subset, NOT a full DejaGnu implementation.
-Only unconditional dg-options and the documented expensive/timeout directives
-are interpreted. Reference skips retain diagnostics and are not passes. The
+Only unconditional dg-options (both the quoted and the Tcl brace-list
+spellings) and the documented expensive/timeout directives are interpreted.
+Reference skips retain diagnostics and are not passes. The
 default five -O levels are not GCC's full LTO/loop-flag torture option matrix.
   - Failure-focused re-runs: --from-list FILE restricts the corpus to the
     test names listed in a previous report (one JSON `test` value per line).
@@ -64,7 +65,7 @@ from typing import Sequence
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
-from tools.corpus import process, publication, evidence
+from tools.corpus import process, publication, evidence, dejagnu
 
 DEFAULT_LCCC_X86_64 = REPO / "target" / "fastbuild" / "lccc"
 DEFAULT_LCCC_I686 = REPO / "target" / "fastbuild" / "lccc-i686"
@@ -93,7 +94,6 @@ def _default_suite() -> Path:
 
 DEFAULT_SUITE = _default_suite()
 DEFAULT_FLAGS = ("-O0", "-O1", "-O2", "-O3", "-Os")
-_DIRECTIVE = re.compile(r"\{\s*dg-(?:additional-)?options\s+\"([^\"]*)\"([^}]*)\}")
 # DejaGnu `{ dg-timeout-factor N }`: gcc's harness scales every timeout of
 # the test by N (the memcpy-ax/memclr expansions ask for 4-8x).
 _TIMEOUT_FACTOR = re.compile(r"\{\s*dg-timeout-factor\s+([0-9.]+)\s*\}")
@@ -175,14 +175,15 @@ def detail_of(proc: subprocess.CompletedProcess[bytes], limit: int = 6000) -> st
 
 
 def native_directive_flags(source: Path) -> tuple[str, ...]:
-    text = source.read_text(errors="replace")[:8192]
-    result: list[str] = []
-    for match in _DIRECTIVE.finditer(text):
-        trailer = match.group(2)
-        if "target" in trailer:
-            continue
-        result.extend(shlex.split(match.group(1)))
-    return tuple(result)
+    """Unconditional dg-options flags, quoted OR Tcl brace-list form.
+
+    The shared parser (``tools/corpus/dejagnu.py``) is the one place that
+    decides which DejaGnu spellings this native runner honours.  Keeping a
+    private quote-only regex here is what made ``930529-1.c``'s ``-fwrapv``
+    disappear and turned the reference binary's SIGILL into a reported LCCC
+    failure on both x86 targets.
+    """
+    return dejagnu.extract_option_flags(source.read_text(errors="replace")[:8192])
 
 
 def directive_timeout_factor(source: Path) -> float:
