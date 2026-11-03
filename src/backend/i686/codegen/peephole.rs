@@ -14674,6 +14674,7 @@ fn materialize_return_bool_i686(store: &mut LineStore, infos: &mut [LineInfo]) -
         let Some(cc) = parse_setcc(set) else { continue };
         if set.split_once(' ').map(|(_, operand)| operand.trim()) != Some("%cl")
             || trimmed(store, &infos[i + 2], i + 2) != "movzbl %cl, %eax"
+            || infos[i + 2].is_nop()
             || infos[i + 2].kind == LineKind::InlineAsm
         {
             continue;
@@ -16213,6 +16214,15 @@ mod tests {
             assert!(output.contains("xorl %eax, %eax\n    cmpl $0, %edx\n    setne %al"));
             assert!(output.contains(ret));
         }
+        // Deleted lines retain their original text in the store; never
+        // resurrect a previously removed extension based on that stale text.
+        let mut store = LineStore::new(
+            "cmpl $0, %edx\nsetne %cl\nmovzbl %cl, %eax\nret\n".to_string(),
+        );
+        let mut infos = classify_all(&store);
+        infos[2].kind = LineKind::Nop;
+        assert!(!materialize_return_bool_i686(&mut store, &mut infos));
+
         for body in [
             "cmpl %eax, %edx\nsetne %cl\nmovzbl %cl, %eax\nret\n",
             "testb %ah, %ah\nsetne %cl\nmovzbl %cl, %eax\nret\n",
