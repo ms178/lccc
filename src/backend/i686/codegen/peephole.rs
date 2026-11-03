@@ -9351,6 +9351,161 @@ fn try_fold_memory_operand(
     None
 }
 
+// ── Cross-pollination: load→copy relay (donor: x86-64 fold_load_relay) ────────
+//
+// The i686 allocator homes a stack-passed parameter in a callee-saved register
+// and then copies it to the register the body actually uses:
+//
+//     movl 16(%esp), %ebx     ; load a into its home
+//     movl 20(%esp), %esi     ; (another parameter's load)
+//     movl %ebx, %eax         ; copy a to the working register
+//     addl %esi, %eax
+//
+// x86-64's `fold_load_relay` retargets a slot load into the copy's destination
+// when the scratch dies with the copy; it is restricted to %rax there because
+// SysV passes parameters in registers and the shape is rare. On i686 every
+// parameter arrives on the stack, so the shape is pervasive and the scratch is
+// any GP home. This pass generalizes the relay to any GP scratch:
+//
+//     movl 16(%esp), %eax     ; load directly into the working register
+//     movl 20(%esp), %esi
+//     addl %esi, %eax         ; (fold_memory_operands then folds this to mem)
+//
+// The freed home (%ebx) lets `eliminate_unused_callee_saves` drop its
+// push/pop and `eliminate_dead_frame_allocation` drop the frame, recovering
+// GCC's `movl 4(%esp),%eax; addl 8(%esp),%eax; ret` for `add`.
+//
+// # Soundness
+//
+// The load stays at its original line and address; only its destination
+// changes from %T to %D, and the copy is deleted. For that to be invisible:
+//
+// * %T is not referenced between the load and the copy (the scan breaks on any
+//   mention), so no other reader loses the loaded value and no writer clobbers
+//   it before the copy.
+// * %D is not referenced between the load and the copy: the load now defines
+//   %D earlier (at the load instead of the copy), so an intervening read would
+//   see the loaded value too soon and an intervening write would clobber it.
+// * %T is dead after the copy (exact CFG `GprLiveness`): the copy was the last
+//   use of the loaded value, so deleting the load's write to %T orphans nothing.
+// * Only full-width `movl` loads and `movl %T,%D` copies participate; %T/%D are
+//   GP registers other than %esp/%ebp.
+// * The window is bounded and fences at every barrier / inline-asm line.
+//
+// Kill switch: CCC_NO_I686_LOAD_COPY_RELAY.
+fn fold_load_copy_relay_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    if std::env::var_os("CCC_NO_I686_LOAD_COPY_RELAY").is_some() {
+        return false;
+    }
+    let len = infos.len();
+    let mut changed = false;
+    let mut liveness_cache: Option<GprLiveness> = None;
+    const WINDOW: usize = 24;
+
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+        let LineKind::LoadEbp {
+            reg: t,
+            offset: _,
+            size: MoveSize::L,
+        } = infos[i].kind
+        else {
+            i += 1;
+            continue;
+        };
+        if t > REG_GP_MAX || t == REG_ESP || t == REG_EBP {
+            i += 1;
+            continue;
+        }
+        if !is_full_width_load(trimmed(store, &infos[i], i)) {
+            i += 1;
+            continue;
+        }
+
+        // Scan forward for the copy `movl %T, %D`, breaking on any mention of
+        // %T (the value must reach the copy untouched) or any barrier.
+        let mut j = i + 1;
+        let mut count = 0;
+        let mut found: Option<(usize, RegId)> = None;
+        while j < len && count < WINDOW {
+            if infos[j].is_nop() || is_debug_location(store, infos, j) {
+                j += 1;
+                continue;
+            }
+            if infos[j].is_barrier() || infos[j].kind == LineKind::InlineAsm {
+                break;
+            }
+            if let LineKind::Move { dst: d, src } = infos[j].kind {
+                if src == t
+                    && d != t
+                    && d <= REG_GP_MAX
+                    && d != REG_ESP
+                    && d != REG_EBP
+                    && trimmed(store, &infos[j], j)
+                        == format!("movl {}, {}", reg32_name(t), reg32_name(d))
+                {
+                    found = Some((j, d));
+                }
+                break;
+            }
+            let jt = trimmed(store, &infos[j], j);
+            if line_references_reg(jt, t) || line_writes_reg_implicitly(jt, t) {
+                break;
+            }
+            j += 1;
+            count += 1;
+        }
+        let Some((cj, d)) = found else {
+            i += 1;
+            continue;
+        };
+
+        // %D must be untouched between the load and the copy.
+        let mut d_ok = true;
+        for k in (i + 1)..cj {
+            if infos[k].is_nop() || is_debug_location(store, infos, k) {
+                continue;
+            }
+            let kt = trimmed(store, &infos[k], k);
+            if line_references_reg(kt, d) || line_writes_reg_implicitly(kt, d) {
+                d_ok = false;
+                break;
+            }
+        }
+        if !d_ok {
+            i += 1;
+            continue;
+        }
+
+        // %T must be dead after the copy (exact CFG dataflow).
+        let liveness = liveness_cache.get_or_insert_with(|| GprLiveness::compute(store, infos));
+        if !liveness.dead_after(cj, t) {
+            i += 1;
+            continue;
+        }
+
+        // Retarget the load's destination to %D and delete the copy.
+        let load_text = trimmed(store, &infos[i], i).to_string();
+        let Some(comma) =
+            crate::backend::peephole_common::last_top_level_comma(load_text.as_bytes())
+        else {
+            i += 1;
+            continue;
+        };
+        let new_load = format!("    {}, {}", &load_text[..comma], reg32_name(d));
+        store.replace(i, new_load);
+        infos[i] = classify_line_ctx(store.get(i), infos[i].ebp_gpr);
+        infos[cj].kind = LineKind::Nop;
+        changed = true;
+        i += 1;
+    }
+    changed
+}
+
 // ── Pass: fold a narrow slot load into the immediate compare/test that reads it ──
 //
 // The i686 lowering materialises every sub-int comparison operand through a
@@ -14712,6 +14867,331 @@ fn else_hoist_diamonds(asm: String) -> String {
     lines.join("\n")
 }
 
+// ── Cross-pollination: select-diamond → cmov (donor: x86-64 cmov select) ──────
+//
+// The x86-64 back end lowers an integer `Select` to a single `cmovcc`
+// (`cmp; mov false,%d; cmovcc true,%d`); the i686 back end lowers the same IR
+// to a branch diamond:
+//
+//     <cmp/test>            ; flags
+//     jCC  .Lsel_true_N
+//     mov{l,w} FALSE, %D    ; false arm
+//     jmp  .Lsel_end_N
+//   .Lsel_true_N:
+//     mov{l,w} TRUE, %D     ; true arm
+//   .Lsel_end_N:
+//
+// On an out-of-order core the diamond pays a data-dependent branch (mispredict
+// on a random condition) plus two taken edges; the cmov is one predictable
+// instruction with no control dependence. GCC and Clang both emit the cmov
+// form for exactly these shapes on i686 (`maxval`, `clamp`, `absval`). This
+// pass folds the diamond into it.
+//
+// # Soundness
+//
+// The rewrite keeps the flag producer in place, always executes the false-arm
+// move, and replaces the branch with `cmovCC TRUE,%D`:
+//
+//     <cmp/test>
+//     mov{l,w} FALSE, %D    ; dropped when FALSE == %D (self-move)
+//     cmovCC{l,w} TRUE, %D
+//   .Lsel_end_N:
+//
+// * The false move is flag-neutral (`mov`), so the producer's EFLAGS reach the
+//   cmov unchanged — the same condition the jCC tested.
+// * Both arms are single register→register moves of the SAME width into the
+//   SAME destination %D, so the only effect of either arm is `%D := src`.
+//   Replacing "branch to one of two writes" with "write false, conditionally
+//   overwrite with true" is exactly the select's semantics.
+// * Sources are restricted to GP *registers* (not memory, not immediates):
+//   - A memory source would be read unconditionally by the always-executed
+//     false move / the cmov, where the original read it only on the taken
+//     path — a guarded dereference (`p ? *p : 0`) would fault. Registers
+//     cannot fault, so reading them on both paths is unobservable.
+//   - cmov has no immediate form, and materializing one would need a scratch
+//     register this text pass cannot prove free.
+// * `TRUE != %D`: after the false move writes %D, a `cmovCC %D,%D` would read
+//   the false value, not the original %D. (FALSE == %D is fine: the false move
+//   is a self-move and is dropped, leaving %D's incoming value as the false
+//   result.)
+// * %D is never %esp (a conditional stack-pointer write is not emitted). %ebp
+//   is allowed: the allocator uses it as a callee-saved GPR when no frame
+//   pointer is live, and the diamond's own `movl X,%ebp` proves it is a GPR.
+// * Byte selects are refused: cmov has no 8-bit form.
+// * `.Lsel_true_N` must have EXACTLY ONE reference (the jCC being removed):
+//   another predecessor could enter the true arm with different live state,
+//   and deleting the arm would remove its write from that path. The join
+//   label `.Lsel_end_N` is kept, so any other predecessor of the join still
+//   lands after the cmov with %D holding the select result.
+// * The whole window must be free of inline-asm / volatile lines (opaque).
+//
+// Kill switch: CCC_NO_I686_SELECT_CMOV.
+
+/// Parse a select-arm move `mov{l,w} %src, %dst` into (src family, dst family,
+/// width). Refuses memory operands, immediates, byte width, and any spelling
+/// whose width does not match the mnemonic.
+fn parse_select_arm_mov(text: &str) -> Option<(RegId, RegId, MoveSize)> {
+    let (mn, rest) = text.split_once(' ')?;
+    let size = match mn {
+        "movl" => MoveSize::L,
+        "movw" => MoveSize::W,
+        _ => return None,
+    };
+    let (src, dst) = rest.split_once(',')?;
+    let src = src.trim();
+    let dst = dst.trim();
+    if !src.starts_with('%') || !dst.starts_with('%') || src.contains('(') || dst.contains('(') {
+        return None;
+    }
+    let sf = register_family(src);
+    let df = register_family(dst);
+    if sf == REG_NONE || df == REG_NONE || sf > REG_GP_MAX || df > REG_GP_MAX {
+        return None;
+    }
+    let spelling_ok = match size {
+        MoveSize::L => src == reg32_name(sf) && dst == reg32_name(df),
+        MoveSize::W => {
+            narrow_reg_name(sf, MoveSize::W) == Some(src)
+                && narrow_reg_name(df, MoveSize::W) == Some(dst)
+        }
+        MoveSize::B => false,
+    };
+    if !spelling_ok {
+        return None;
+    }
+    Some((sf, df, size))
+}
+
+/// Next significant (non-steppable, non-empty) line at or after `i`, bounded by
+/// `limit`. Labels are NOT steppable, so the walk stops at the next label —
+/// exactly the diamond's structural boundaries.
+fn next_sig(infos: &[LineInfo], mut i: usize, limit: usize) -> usize {
+    while i < limit && (infos[i].is_steppable() || infos[i].kind == LineKind::Empty) {
+        i += 1;
+    }
+    i
+}
+
+/// Whether `text` mentions `label` as a whole token (bounded by characters that
+/// cannot appear in an assembler label). Conservative: any mention — branch
+/// target, jump-table entry, address-taken constant — counts.
+fn mentions_label(text: &str, label: &str) -> bool {
+    let bytes = text.as_bytes();
+    let lb = label.as_bytes();
+    if lb.is_empty() {
+        return false;
+    }
+    let is_label_char =
+        |c: u8| c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'$';
+    let mut i = 0;
+    while i + lb.len() <= bytes.len() {
+        if &bytes[i..i + lb.len()] == lb {
+            let before_ok = i == 0 || !is_label_char(bytes[i - 1]);
+            let after = i + lb.len();
+            let after_ok = after == bytes.len() || !is_label_char(bytes[after]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// True when `label` is referenced anywhere in `fstart..fend` other than the
+/// jCC at `jcc_idx` and the defining label at `def_idx`.
+fn label_has_other_ref(
+    store: &LineStore,
+    infos: &[LineInfo],
+    fstart: usize,
+    fend: usize,
+    label: &str,
+    jcc_idx: usize,
+    def_idx: usize,
+) -> bool {
+    for n in fstart..fend {
+        if n == jcc_idx || n == def_idx || infos[n].is_nop() {
+            continue;
+        }
+        if mentions_label(trimmed(store, &infos[n], n), label) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Attempt to fold the select diamond whose conditional jump is at `a`.
+/// Returns true when the diamond was rewritten into a cmov.
+fn try_fold_select_diamond(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    a: usize,
+    fstart: usize,
+    fend: usize,
+) -> bool {
+    if infos[a].kind != LineKind::CondJmp {
+        return false;
+    }
+    let jcc = trimmed(store, &infos[a], a).to_string();
+    let Some((cc, true_label)) = parse_condjmp(&jcc) else {
+        return false;
+    };
+    if !FLAG_CONDS.contains(&cc) {
+        return false;
+    }
+    let true_label = true_label.to_string();
+
+    // Producer: the previous significant line must be a pure flag-writing
+    // compare/test. These write no GP register, so the false move's sources
+    // are exactly what the original false path would have read.
+    let mut p = a;
+    while p > fstart {
+        p -= 1;
+        if !infos[p].is_steppable() && infos[p].kind != LineKind::Empty {
+            break;
+        }
+    }
+    if p == a || infos[p].is_steppable() || infos[p].kind == LineKind::Empty {
+        return false;
+    }
+    if infos[p].kind == LineKind::InlineAsm {
+        return false;
+    }
+    let prod_mn = trimmed(store, &infos[p], p)
+        .split_ascii_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string();
+    if !matches!(
+        prod_mn.as_str(),
+        "cmpl" | "cmpw" | "cmpb" | "testl" | "testw" | "testb"
+    ) {
+        return false;
+    }
+
+    // b: false arm — mov{l,w} FALSE, %D.
+    let b = next_sig(infos, a + 1, fend);
+    if b >= fend || infos[b].kind == LineKind::InlineAsm {
+        return false;
+    }
+    let false_text = trimmed(store, &infos[b], b).to_string();
+    let Some((fs, fd, size)) = parse_select_arm_mov(&false_text) else {
+        return false;
+    };
+    // %esp is never a select destination (a conditional stack-pointer write is
+    // not something the codegen emits). %ebp IS allowed: the i686 allocator
+    // uses it as a callee-saved GPR when no frame pointer is established, and
+    // the original diamond's `movl X,%ebp` already proves it is a GPR here —
+    // the codegen never homes a select in a live frame pointer.
+    if fd == REG_ESP {
+        return false;
+    }
+
+    // c: jmp .Lend.
+    let c = next_sig(infos, b + 1, fend);
+    if c >= fend || infos[c].kind != LineKind::Jmp {
+        return false;
+    }
+    let jmp_text = trimmed(store, &infos[c], c).to_string();
+    let Some(end_label) = parse_jmp_target(&jmp_text) else {
+        return false;
+    };
+    let end_label = end_label.trim().to_string();
+    if end_label == true_label {
+        return false;
+    }
+
+    // d: .Ltrue label.
+    let d = next_sig(infos, c + 1, fend);
+    if d >= fend || infos[d].kind != LineKind::Label {
+        return false;
+    }
+    if trimmed(store, &infos[d], d) != format!("{true_label}:") {
+        return false;
+    }
+
+    // e: true arm — mov{l,w} TRUE, %D (same dest, same width).
+    let e = next_sig(infos, d + 1, fend);
+    if e >= fend || infos[e].kind == LineKind::InlineAsm {
+        return false;
+    }
+    let true_text = trimmed(store, &infos[e], e).to_string();
+    let Some((ts, td, tsize)) = parse_select_arm_mov(&true_text) else {
+        return false;
+    };
+    if td != fd || tsize != size || ts == fd {
+        return false;
+    }
+
+    // f: .Lend label.
+    let f = next_sig(infos, e + 1, fend);
+    if f >= fend || infos[f].kind != LineKind::Label {
+        return false;
+    }
+    if trimmed(store, &infos[f], f) != format!("{end_label}:") {
+        return false;
+    }
+
+    // The true label must have exactly one reference (this jCC).
+    if label_has_other_ref(store, infos, fstart, fend, &true_label, a, d) {
+        return false;
+    }
+
+    // All guards passed. Build the cmov at the width of the arms.
+    let (src_name, dst_name, suffix) = match size {
+        MoveSize::L => (reg32_name(ts), reg32_name(fd), "l"),
+        MoveSize::W => {
+            let (Some(sn), Some(dn)) =
+                (narrow_reg_name(ts, MoveSize::W), narrow_reg_name(fd, MoveSize::W))
+            else {
+                return false;
+            };
+            (sn, dn, "w")
+        }
+        MoveSize::B => return false,
+    };
+    let cmov = format!("    cmov{cc}{suffix} {src_name}, {dst_name}");
+
+    // Rewrite: drop the jCC, keep (or drop a self-move) false arm, turn the
+    // jmp into the cmov, drop the true label and true arm, keep the join.
+    infos[a].kind = LineKind::Nop;
+    if fs == fd {
+        infos[b].kind = LineKind::Nop;
+    }
+    store.replace(c, cmov);
+    infos[c] = classify_line_ctx(store.get(c), infos[c].ebp_gpr);
+    infos[d].kind = LineKind::Nop;
+    infos[e].kind = LineKind::Nop;
+    true
+}
+
+/// Fold register-arm select diamonds into `cmovcc` (see the module comment
+/// above for the soundness argument). Runs per function so the reference
+/// census is bounded by the function extent.
+fn fold_select_diamond_cmov(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    if std::env::var_os("CCC_NO_I686_SELECT_CMOV").is_some() {
+        return false;
+    }
+    let mut changed = false;
+    let extents = function_extents(store, infos);
+    let ranges: Vec<(usize, usize)> = if extents.is_empty() {
+        vec![(0, infos.len())]
+    } else {
+        extents
+    };
+    for (fstart, fend) in ranges {
+        let mut i = fstart;
+        while i < fend {
+            if infos[i].kind == LineKind::CondJmp && try_fold_select_diamond(store, infos, i, fstart, fend)
+            {
+                changed = true;
+            }
+            i += 1;
+        }
+    }
+    changed
+}
+
 /// Materialize a terminal boolean directly in EAX without a dependent MOVZX.
 /// The compare is register/immediate only and must not read any EAX alias:
 /// zeroing EAX moves before it. ECX is caller-saved on i386; EDX (which can
@@ -14884,6 +15364,15 @@ pub fn peephole_optimize(asm: String) -> String {
     let global_changed = global_changed | eliminate_dead_stores(&store, &mut infos);
     let global_changed = global_changed | fuse_compare_and_branch(&mut store, &mut infos);
     let global_changed = global_changed | fuse_setcc_branch(&mut store, &mut infos);
+    // Select-diamond → cmov (cross-pollinated from x86-64's cmov select
+    // lowering). Runs after the compare/branch fusions so the flag producer
+    // is already in its final cmp/test form; the dead-move cleanup below then
+    // reclaims any boolean staging the folded branch no longer needs.
+    let global_changed = global_changed | fold_select_diamond_cmov(&mut store, &mut infos);
+    // Load→copy relay before the memory-operand fold: retargeting a slot load
+    // into the copy's destination exposes the adjacent load→ALU shape that
+    // fold_memory_operands then folds into a memory operand.
+    let global_changed = global_changed | fold_load_copy_relay_i686(&mut store, &mut infos);
     let global_changed = global_changed | fold_memory_operands(&mut store, &mut infos);
     // Narrow compare folds run right after the full-width memory-operand
     // fold: they transform the CONSUMER's width (cmpl->cmpb/cmpw) instead of
@@ -14917,6 +15406,8 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_dead_reg_moves(&store, &mut infos);
             changed2 |= eliminate_dead_stores(&store, &mut infos);
             changed2 |= fuse_setcc_branch(&mut store, &mut infos);
+            changed2 |= fold_select_diamond_cmov(&mut store, &mut infos);
+            changed2 |= fold_load_copy_relay_i686(&mut store, &mut infos);
             changed2 |= fold_memory_operands(&mut store, &mut infos);
             changed2 |= fold_narrow_load_imm_compare(&mut store, &mut infos);
             changed2 |= fold_zext_pair_reg_compare(&mut store, &mut infos);
@@ -16455,6 +16946,206 @@ mod tests {
         assert!(result.contains("movl $2, 4(%esp)"), "{result}");
         assert_eq!(result.matches("movl 4(%esp), %eax").count(), 2, "{result}");
         assert!(!result.contains("LCCC_VOLATILE_"), "{result}");
+    }
+
+    // ── select-diamond → cmov (cross-pollination from x86-64) ──────────────
+
+    /// Run ONLY the cmov diamond fold on a fragment, so a negative test pins
+    /// this pass's refusal rather than some other pass's rewrite.
+    fn run_cmov_fold(asm: &str) -> String {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos = classify_all(&store);
+        pin_inline_asm_regions(&store, &mut infos);
+        fold_select_diamond_cmov(&mut store, &mut infos);
+        store.build_result(|i| infos[i].is_nop())
+    }
+
+    const MAXVAL_DIAMOND: &str = "maxval:\n.cfi_startproc\n    cmpl %esi, %ebx\n    jg .Lsel_true_2\n    movl %esi, %eax\n    jmp .Lsel_end_2\n.Lsel_true_2:\n    movl %ebx, %eax\n.Lsel_end_2:\n    ret\n.cfi_endproc\n.size maxval, .-maxval\n";
+
+    #[test]
+    fn select_diamond_folds_to_cmov() {
+        let out = run_cmov_fold(MAXVAL_DIAMOND);
+        assert!(out.contains("cmovgl %ebx, %eax"), "{out}");
+        assert!(out.contains("movl %esi, %eax"), "{out}");
+        assert!(!out.contains("jg .Lsel_true_2"), "{out}");
+        assert!(!out.contains("jmp .Lsel_end_2"), "{out}");
+        assert!(!out.contains("movl %ebx, %eax\n.Lsel_end"), "{out}");
+        // The join label survives (other paths may target it).
+        assert!(out.contains(".Lsel_end_2:"), "{out}");
+    }
+
+    #[test]
+    fn select_diamond_full_pipeline_matches_gcc_shape() {
+        // Through the whole pipeline the cmov must survive and the branch
+        // diamond must be gone — this is the regression guard for pass
+        // ordering (a later pass must not re-introduce the branch).
+        let out = peephole_optimize(MAXVAL_DIAMOND.to_string());
+        assert!(out.contains("cmovgl %ebx, %eax"), "{out}");
+        assert!(!out.contains(".Lsel_true_2"), "{out}");
+    }
+
+    #[test]
+    fn select_diamond_word_width_uses_cmovw() {
+        let asm = "f:\n    cmpw %si, %bx\n    jg .Lt\n    movw %si, %ax\n    jmp .Le\n.Lt:\n    movw %bx, %ax\n.Le:\n    ret\n";
+        let out = run_cmov_fold(asm);
+        assert!(out.contains("cmovgw %bx, %ax"), "{out}");
+        assert!(out.contains("movw %si, %ax"), "{out}");
+    }
+
+    #[test]
+    fn select_diamond_ebp_gpr_destination_folds() {
+        // %ebp used as a callee-saved GPR (no frame pointer): the clamp inner
+        // select homes its result there. cmov into %ebp is exactly the write
+        // the diamond's true arm already performed.
+        let asm = "f:\n    cmpl %edi, %ebx\n    jg .Lt\n    movl %ebx, %ebp\n    jmp .Le\n.Lt:\n    movl %edi, %ebp\n.Le:\n    ret\n";
+        let out = run_cmov_fold(asm);
+        assert!(out.contains("cmovgl %edi, %ebp"), "{out}");
+        assert!(out.contains("movl %ebx, %ebp"), "{out}");
+    }
+
+    #[test]
+    fn select_diamond_false_self_move_is_dropped() {
+        // FALSE == %D: the false arm is a self-move; the cmov alone selects.
+        let asm = "f:\n    cmpl %esi, %ebx\n    jg .Lt\n    movl %eax, %eax\n    jmp .Le\n.Lt:\n    movl %ebx, %eax\n.Le:\n    ret\n";
+        let out = run_cmov_fold(asm);
+        assert!(out.contains("cmovgl %ebx, %eax"), "{out}");
+        assert!(!out.contains("movl %eax, %eax"), "{out}");
+    }
+
+    #[test]
+    fn select_diamond_true_equals_dest_is_refused() {
+        // TRUE == %D: after the false move writes %D, cmov %D,%D would read
+        // the false value. Must NOT fold.
+        let asm = "f:\n    cmpl %esi, %ebx\n    jg .Lt\n    movl %esi, %eax\n    jmp .Le\n.Lt:\n    movl %eax, %eax\n.Le:\n    ret\n";
+        let out = run_cmov_fold(asm);
+        assert!(!out.contains("cmov"), "{out}");
+        assert!(out.contains("jg .Lt"), "{out}");
+    }
+
+    #[test]
+    fn select_diamond_memory_arm_is_refused() {
+        // A memory source would be read unconditionally — a guarded deref
+        // would fault. Refuse.
+        let asm = "f:\n    cmpl %esi, %ebx\n    jg .Lt\n    movl (%esi), %eax\n    jmp .Le\n.Lt:\n    movl %ebx, %eax\n.Le:\n    ret\n";
+        let out = run_cmov_fold(asm);
+        assert!(!out.contains("cmov"), "{out}");
+    }
+
+    #[test]
+    fn select_diamond_byte_width_is_refused() {
+        // cmov has no 8-bit form.
+        let asm = "f:\n    cmpb %sil, %bl\n    jg .Lt\n    movb %sil, %al\n    jmp .Le\n.Lt:\n    movb %bl, %al\n.Le:\n    ret\n";
+        let out = run_cmov_fold(asm);
+        assert!(!out.contains("cmov"), "{out}");
+    }
+
+    #[test]
+    fn select_diamond_mismatched_arm_width_is_refused() {
+        let asm = "f:\n    cmpl %esi, %ebx\n    jg .Lt\n    movl %esi, %eax\n    jmp .Le\n.Lt:\n    movw %bx, %ax\n.Le:\n    ret\n";
+        let out = run_cmov_fold(asm);
+        assert!(!out.contains("cmov"), "{out}");
+    }
+
+    #[test]
+    fn select_diamond_second_predecessor_of_true_is_refused() {
+        // Another branch targets the true label: deleting the true arm would
+        // remove its write from that path. Refuse.
+        let asm = "f:\n    cmpl %esi, %ebx\n    jg .Lt\n    movl %esi, %eax\n    jmp .Le\n.Lt:\n    movl %ebx, %eax\n.Le:\n    cmpl %edi, %ebx\n    je .Lt\n    ret\n";
+        let out = run_cmov_fold(asm);
+        assert!(!out.contains("cmov"), "{out}");
+    }
+
+    #[test]
+    fn select_diamond_join_with_other_predecessor_keeps_join() {
+        // The join label has another predecessor; the fold must keep it.
+        let asm = "f:\n    cmpl %esi, %ebx\n    jg .Lt\n    movl %esi, %eax\n    jmp .Le\n.Lt:\n    movl %ebx, %eax\n.Le:\n    cmpl %edi, %ebx\n    je .Le\n    ret\n";
+        let out = run_cmov_fold(asm);
+        assert!(out.contains("cmovgl %ebx, %eax"), "{out}");
+        assert!(out.contains(".Le:"), "{out}");
+        assert!(out.contains("je .Le"), "{out}");
+    }
+
+    #[test]
+    fn select_diamond_bool_test_condition_folds() {
+        // The non-fused select tests a materialized boolean: testl/jne.
+        let asm = "f:\n    testl %edx, %edx\n    jne .Lt\n    movl %ebp, %eax\n    jmp .Le\n.Lt:\n    movl %esi, %eax\n.Le:\n    ret\n";
+        let out = run_cmov_fold(asm);
+        assert!(out.contains("cmovnel %esi, %eax"), "{out}");
+        assert!(out.contains("movl %ebp, %eax"), "{out}");
+    }
+
+    #[test]
+    fn select_diamond_volatile_arm_is_refused() {
+        let asm = "f:\n    cmpl %esi, %ebx\n    jg .Lt\n# LCCC_VOLATILE_BEGIN\n    movl %esi, %eax\n# LCCC_VOLATILE_END\n    jmp .Le\n.Lt:\n    movl %ebx, %eax\n.Le:\n    ret\n";
+        let out = run_cmov_fold(asm);
+        assert!(!out.contains("cmov"), "{out}");
+    }
+
+    #[test]
+    fn select_diamond_non_cmp_producer_is_refused() {
+        // The flag producer is an arithmetic op, not a cmp/test: this pass
+        // conservatively refuses (a later extension may admit it).
+        let asm = "f:\n    subl %esi, %ebx\n    jg .Lt\n    movl %esi, %eax\n    jmp .Le\n.Lt:\n    movl %ebx, %eax\n.Le:\n    ret\n";
+        let out = run_cmov_fold(asm);
+        assert!(!out.contains("cmov"), "{out}");
+    }
+
+    // ── load→copy relay (cross-pollination from x86-64) ───────────────────
+
+    fn run_relay(asm: &str) -> String {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos = classify_all(&store);
+        pin_inline_asm_regions(&store, &mut infos);
+        fold_load_copy_relay_i686(&mut store, &mut infos);
+        store.build_result(|i| infos[i].is_nop())
+    }
+
+    #[test]
+    fn load_copy_relay_retargets_load_into_copy_dest() {
+        // The `add` parameter shuffle: load a into %ebx, copy to %eax; %ebx
+        // dies with the copy, so the load goes straight to %eax.
+        let asm = "add:\n    movl 16(%esp), %ebx\n    movl 20(%esp), %esi\n    movl %ebx, %eax\n    addl %esi, %eax\n    ret\n";
+        let out = run_relay(asm);
+        assert!(out.contains("movl 16(%esp), %eax"), "{out}");
+        assert!(!out.contains("movl %ebx, %eax"), "{out}");
+        assert!(!out.contains("movl 16(%esp), %ebx"), "{out}");
+    }
+
+    #[test]
+    fn load_copy_relay_scratch_live_after_copy_is_refused() {
+        // %ebx is read after the copy: the load must keep defining %ebx.
+        let asm = "f:\n    movl 16(%esp), %ebx\n    movl %ebx, %eax\n    addl %ebx, %eax\n    ret\n";
+        let out = run_relay(asm);
+        assert!(out.contains("movl 16(%esp), %ebx"), "{out}");
+        assert!(out.contains("movl %ebx, %eax"), "{out}");
+    }
+
+    #[test]
+    fn load_copy_relay_dest_written_between_is_refused() {
+        // %eax is written between load and copy: retargeting would be clobbered.
+        let asm = "f:\n    movl 16(%esp), %ebx\n    xorl %eax, %eax\n    movl %ebx, %eax\n    ret\n";
+        let out = run_relay(asm);
+        assert!(out.contains("movl 16(%esp), %ebx"), "{out}");
+    }
+
+    #[test]
+    fn load_copy_relay_scratch_read_between_is_refused() {
+        // %ebx is read between load and copy: the value must stay in %ebx.
+        let asm = "f:\n    movl 16(%esp), %ebx\n    addl %ebx, %esi\n    movl %ebx, %eax\n    ret\n";
+        let out = run_relay(asm);
+        assert!(out.contains("movl 16(%esp), %ebx"), "{out}");
+    }
+
+    #[test]
+    fn load_copy_relay_full_pipeline_add_matches_gcc() {
+        // Through the whole pipeline the relay + memory fold + callee-save and
+        // frame elision recover GCC's three-instruction `add`.
+        let asm = "add:\n.cfi_startproc\n    pushl %ebx\n    pushl %esi\n    subl $4, %esp\n    movl 16(%esp), %ebx\n    movl 20(%esp), %esi\n    movl %ebx, %eax\n    addl %esi, %eax\n    addl $4, %esp\n    popl %esi\n    popl %ebx\n    ret\n.cfi_endproc\n.size add, .-add\n";
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("movl 16(%esp), %eax"), "{out}");
+        assert!(out.contains("addl 20(%esp), %eax"), "{out}");
+        assert!(!out.contains("pushl %ebx"), "{out}");
+        assert!(!out.contains("subl $4, %esp"), "{out}");
     }
 
     #[test]
