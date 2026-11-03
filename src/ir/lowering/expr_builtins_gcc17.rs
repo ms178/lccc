@@ -28,9 +28,7 @@ use super::lower::Lowerer;
 use crate::backend::Target;
 use crate::common::types::{AddressSpace, CType, IrType, target_is_32bit};
 use crate::frontend::parser::ast::Expr;
-use crate::ir::reexports::{
-    CallInfo, Instruction, IrCmpOp, IrConst, Operand, Value,
-};
+use crate::ir::reexports::{CallInfo, Instruction, IrCmpOp, IrConst, Operand, Value};
 
 impl Lowerer {
     /// `int __builtin_memcmp_eq(const void *p, const void *q, size_t n)`

@@ -4353,7 +4353,10 @@ pub fn gcc_compat_builtin_ctype(name: &str) -> Option<CType> {
     let void_ptr = || CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC);
     let char_ptr = || CType::Pointer(Box::new(CType::Char), PtrQuals::GENERIC);
     match name {
-        "bcmp" | "__builtin_bcmp" | "__builtin_memcmp_eq" | "__builtin_ilogb"
+        "bcmp"
+        | "__builtin_bcmp"
+        | "__builtin_memcmp_eq"
+        | "__builtin_ilogb"
         | "__builtin_strncasecmp" => Some(CType::Int),
         "__builtin_bzero" | "__builtin_bcopy" | "__builtin_stack_restore" => Some(CType::Void),
         "strdup" | "strndup" | "__builtin_strdup" | "__builtin_strndup" => Some(char_ptr()),
@@ -4505,7 +4508,7 @@ mod libc_alias_param_type_tests {
 
 #[cfg(test)]
 mod gcc17_torture_builtin_tests {
-    use super::{gcc_compat_builtin_ctype, is_builtin, resolve_builtin, BuiltinKind};
+    use super::{BuiltinKind, gcc_compat_builtin_ctype, is_builtin, resolve_builtin};
     use crate::common::types::CType;
 
     /// Every GNU builtin spelled by the GCC 17-git C-torture compile leg must
@@ -4547,10 +4550,13 @@ mod gcc17_torture_builtin_tests {
             "__builtin_cexpi",
             "__builtin_cpow",
         ] {
-            assert!(matches!(
-                resolve_builtin(name).map(|b| &b.kind),
-                Some(BuiltinKind::Intrinsic(_))
-            ), "{name} must not forward to a libc symbol");
+            assert!(
+                matches!(
+                    resolve_builtin(name).map(|b| &b.kind),
+                    Some(BuiltinKind::Intrinsic(_))
+                ),
+                "{name} must not forward to a libc symbol"
+            );
         }
         for name in [
             "__builtin_bcmp",
@@ -4559,24 +4565,42 @@ mod gcc17_torture_builtin_tests {
             "__builtin_strncasecmp",
             "__builtin_bcopy",
         ] {
-            assert!(matches!(
-                resolve_builtin(name).map(|b| &b.kind),
-                Some(BuiltinKind::LibcAlias(_))
-            ), "{name} must forward to libc");
+            assert!(
+                matches!(
+                    resolve_builtin(name).map(|b| &b.kind),
+                    Some(BuiltinKind::LibcAlias(_))
+                ),
+                "{name} must forward to libc"
+            );
         }
     }
 
     #[test]
     fn return_types_match_gcc_16_2() {
-        assert_eq!(gcc_compat_builtin_ctype("__builtin_memcmp_eq"), Some(CType::Int));
-        assert_eq!(gcc_compat_builtin_ctype("__builtin_ilogb"), Some(CType::Int));
-        assert_eq!(gcc_compat_builtin_ctype("__builtin_modff"), Some(CType::Float));
-        assert_eq!(gcc_compat_builtin_ctype("__builtin_modf"), Some(CType::Double));
+        assert_eq!(
+            gcc_compat_builtin_ctype("__builtin_memcmp_eq"),
+            Some(CType::Int)
+        );
+        assert_eq!(
+            gcc_compat_builtin_ctype("__builtin_ilogb"),
+            Some(CType::Int)
+        );
+        assert_eq!(
+            gcc_compat_builtin_ctype("__builtin_modff"),
+            Some(CType::Float)
+        );
+        assert_eq!(
+            gcc_compat_builtin_ctype("__builtin_modf"),
+            Some(CType::Double)
+        );
         assert_eq!(
             gcc_compat_builtin_ctype("__builtin_cexpi"),
             Some(CType::ComplexDouble)
         );
-        assert_eq!(gcc_compat_builtin_ctype("__builtin_bzero"), Some(CType::Void));
+        assert_eq!(
+            gcc_compat_builtin_ctype("__builtin_bzero"),
+            Some(CType::Void)
+        );
         assert_eq!(gcc_compat_builtin_ctype("strlen"), None);
     }
 
@@ -4584,9 +4608,16 @@ mod gcc17_torture_builtin_tests {
     fn wide_parameters_are_converted() {
         use super::libc_alias_param_types;
         use crate::common::types::{IrType, target_ptr_size};
-        let st = if target_ptr_size() == 8 { IrType::U64 } else { IrType::U32 };
+        let st = if target_ptr_size() == 8 {
+            IrType::U64
+        } else {
+            IrType::U32
+        };
         assert_eq!(libc_alias_param_types("bzero"), Some(vec![IrType::Ptr, st]));
-        assert_eq!(libc_alias_param_types("strndup"), Some(vec![IrType::Ptr, st]));
+        assert_eq!(
+            libc_alias_param_types("strndup"),
+            Some(vec![IrType::Ptr, st])
+        );
         assert_eq!(
             libc_alias_param_types("bcopy"),
             Some(vec![IrType::Ptr, IrType::Ptr, st])
