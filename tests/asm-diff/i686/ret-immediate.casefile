@@ -3,6 +3,8 @@
 ret $0
 ret $65535
 ret $-32768
+ret $0xffffffff
+ret $0xffff8000
 retw $4
 .code16
 ret $7
@@ -18,3 +20,7 @@ ret $-32769
 ;;; ret_immediate_extra_operand reject
 .text
 ret $1, $2
+
+;;; ret_immediate_bad_sign_extension reject
+.text
+ret $0xffff7fff

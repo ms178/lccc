@@ -1787,7 +1787,10 @@ impl InstructionEncoder {
                 } else if let [Operand::Immediate(ImmediateValue::Integer(val))] = ops.as_slice() {
                     // GAS accepts the union of signed and unsigned 16-bit
                     // values; truncating anything else changes stack cleanup.
-                    if !(-32768..=65535).contains(val) {
+                    // In 32-bit GAS, hexadecimal 32-bit sign extensions
+                    // such as 0xffffffff are also accepted as signed imm16.
+                    let signed_32_alias = (0xffff_8000..=0xffff_ffff).contains(val);
+                    if !(-32768..=65535).contains(val) && !signed_32_alias {
                         return Err("ret immediate out of range".to_string());
                     }
                     self.bytes.push(0xC2);
