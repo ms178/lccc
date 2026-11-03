@@ -1381,14 +1381,14 @@ impl Driver {
         self.enable_abm = after & ABM != 0;
     }
 
-    /// Disable every macro-only extension a required feature has left
-    /// ([`crate::backend::x86::arch_table::X86ExtraFeature::requires`]):
-    /// GCC's `-mno-avx2` removes AVXIFMA and keeps SHA512, `-mno-avx`
-    /// removes both, `-mno-sse` keeps CMPCCXADD (measured).
-    /// ... and every extension whose required extension has left (AMX-INT8
-    /// with AMX-TILE), to a fixed point.
     /// Clear every extension whose state is an XSAVE component, and forget
     /// the explicit grants (a later `-mxsave`/`-mamx-tile` re-grants).
+    ///
+    /// GCC does the same in its option layer: `-mamx-tile -mno-xsave` leaves
+    /// neither `__XSAVE__` nor `__AMX_TILE__`, and `-mavxifma -mno-xsave`
+    /// loses `__AVXIFMA__` with the AVX it implies (measured, gcc-16.2).
+    /// Dropping the `-m`-granted record as well is what lets the later
+    /// `-mxsave`/`-mamx-tile` re-grant stand unopposed.
     fn withhold_xsave_dependent_extras(&mut self) {
         use crate::backend::x86::arch_table::X86ExtraFeature as E;
         let xsave_bit = 1u64 << crate::common::x86_features::X86Feature::Xsave as u8;
@@ -1400,6 +1400,12 @@ impl Driver {
         }
     }
 
+    /// Disable every macro-only extension a required feature has left
+    /// ([`crate::backend::x86::arch_table::X86ExtraFeature::requires`]):
+    /// GCC's `-mno-avx2` removes AVXIFMA and keeps SHA512, `-mno-avx`
+    /// removes both, `-mno-sse` keeps CMPCCXADD (measured).
+    /// ... and every extension whose required extension has left (AMX-INT8
+    /// with AMX-TILE), to a fixed point.
     fn drop_x86_extras_without_requirements(&mut self) {
         use crate::backend::x86::arch_table::X86ExtraFeature as E;
         let bits = self.x86_driver_feature_bits();
