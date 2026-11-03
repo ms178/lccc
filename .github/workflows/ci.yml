@@ -596,6 +596,8 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_sse2_widening_4lane_sum.sh
     - name: x86 execute regression fixes on both ABIs
       run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 bash tests/regression/check_x86_torture_execute_fixes.sh
+    - name: GCC 17 C-torture builtin semantics on both ABIs
+      run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 GCC=gcc-16 bash tests/regression/check_gcc17_builtin_semantics.sh
     - name: Store-forwarding DWORD self-reload contracts
       run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 bash tests/regression/check_store_forwarding_dword_reload.sh
     - name: Conditional value carriers for decimal, _Float16 and complex arms
