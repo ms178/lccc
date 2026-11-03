@@ -183,6 +183,9 @@ def main() -> int:
             PATH=f"{bindir}:{os.environ['PATH']}",
             PKGDIR=str(pkg),
             KERNEL_WORK=str(tmp),
+            # This fixture pins 6.18, independently of a real-kernel session's
+            # exported KVER (for example 6.18.58).
+            KVER="6.18",
             LCCC=str(cc),
             LCCC_LD=str(cc),
             HOSTCC=str(hostcc),

@@ -42,6 +42,55 @@ class TransportTests(unittest.TestCase):
         self.assertNotIn('sig=secret', message)
         self.assertNotIn('storage.invalid', message)
 
+    def test_transient_reads_and_blob_creation_retry_identically(self):
+        for status in (429, 500, 502, 503, 504):
+            for payload, path in ((None, 'repos/a/b/actions/jobs/7/logs'),
+                                  (b'blob-payload', 'repos/a/b/git/blobs')):
+                error = subprocess.CalledProcessError(1, ['gh'],
+                            stderr=f'gh: Server Error (HTTP {status})'.encode())
+                success = subprocess.CompletedProcess([], 0, stdout=b'raw\x00\xff')
+                with self.subTest(status=status, payload=payload), \
+                        patch.object(transport.subprocess, 'run', side_effect=[error, success]) as call, \
+                        patch.object(transport.time, 'sleep') as sleep:
+                    self.assertEqual(transport.gh(path, payload, allow_binary=True), b'raw\x00\xff')
+                    self.assertEqual(call.call_count, 2)
+                    self.assertEqual(call.call_args_list[0], call.call_args_list[1])
+                    sleep.assert_called_once_with(1)
+
+    def test_timeout_retries_but_auth_and_other_posts_do_not(self):
+        error = subprocess.TimeoutExpired(['gh'], 180)
+        success = subprocess.CompletedProcess([], 0, stdout=b'done')
+        with patch.object(transport.subprocess, 'run', side_effect=[error, success]) as call, \
+                patch.object(transport.time, 'sleep') as sleep:
+            self.assertEqual(transport.gh('repos/a/b/actions/runs'), b'done')
+            self.assertEqual(call.call_count, 2)
+            sleep.assert_called_once_with(1)
+        for status, payload, path in [(401, None, 'read'), (403, None, 'read'),
+                                      (404, None, 'read'), (422, None, 'read'),
+                                      (502, b'payload', 'repos/a/b/issues')]:
+            error = subprocess.CalledProcessError(1, ['gh'], stderr=f'HTTP {status}'.encode())
+            with self.subTest(status=status, path=path), \
+                    patch.object(transport.subprocess, 'run', side_effect=error) as call, \
+                    patch.object(transport.time, 'sleep') as sleep:
+                with self.assertRaises(RuntimeError):
+                    transport.gh(path, payload)
+                self.assertEqual(call.call_count, 1)
+                sleep.assert_not_called()
+
+    def test_exhausted_retries_still_fail_and_redact_secrets(self):
+        error = subprocess.CalledProcessError(1, ['gh'], stderr=
+            b'HTTP 502 token-secret https://storage.invalid/log?sig=secret')
+        with patch.dict(transport.os.environ, {'GITHUB_TOKEN': 'token-secret'}), \
+                patch.object(transport.subprocess, 'run', side_effect=error) as call, \
+                patch.object(transport.time, 'sleep') as sleep:
+            with self.assertRaises(RuntimeError) as caught:
+                transport.gh('repos/a/b/actions/runs')
+        self.assertEqual(call.call_count, 4)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [1, 2, 4])
+        self.assertIn('HTTP 502', str(caught.exception))
+        for secret in ('token-secret', 'sig=secret', 'storage.invalid'):
+            self.assertNotIn(secret, str(caught.exception))
+
     def test_cli_failure_is_annotated_and_still_fails(self):
         output = io.StringIO()
         with patch.object(transport, 'main', side_effect=RuntimeError('bad%\nline\r')), \

@@ -12,9 +12,11 @@ import json
 import os
 import re
 import subprocess
+import time
 from urllib.parse import quote
 
 PART_BYTES = 8 * 1024 * 1024
+MAX_API_ATTEMPTS = 4
 
 
 def parse_run_ids(text):
@@ -36,19 +38,29 @@ def gh(path, payload=None, *, allow_binary=False):
         args.append('--allow-escape-sequences')
     if payload is not None:
         args += ['--method', 'POST', '--input', '-']
-    try:
-        return subprocess.run(args, input=payload, capture_output=True, check=True,
-                              timeout=180).stdout
-    except subprocess.CalledProcessError as error:
-        # capture_output must not hide the actual API failure. Never publish
-        # signed storage URLs or the token when surfacing it through Checks.
-        detail = error.stderr.decode('utf-8', errors='replace')
-        detail = re.sub(r'https?://\S+', '<URL redacted>', detail)
-        for name in ('GH_TOKEN', 'GITHUB_TOKEN'):
-            token = os.environ.get(name)
-            if token:
-                detail = detail.replace(token, '<token redacted>')
-        raise RuntimeError(f'GitHub API request failed ({error.returncode}): {detail[:1500]}') from error
+    # Reads and content-addressed blob creation are safe to replay after a
+    # lost response. Never extend this retry policy to arbitrary mutating POSTs.
+    replay_safe = payload is None or path.endswith('/git/blobs')
+    for attempt in range(MAX_API_ATTEMPTS):
+        try:
+            return subprocess.run(args, input=payload, capture_output=True, check=True,
+                                  timeout=180).stdout
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            timed_out = isinstance(error, subprocess.TimeoutExpired)
+            detail = (error.stderr or b'').decode('utf-8', errors='replace')
+            transient = timed_out or re.search(r'HTTP (?:429|500|502|503|504)\b', detail)
+            if replay_safe and transient and attempt + 1 < MAX_API_ATTEMPTS:
+                time.sleep(2 ** attempt)
+                continue
+            # Preserve final failure and redact signed URLs / credentials.
+            detail = re.sub(r'https?://\S+', '<URL redacted>', detail)
+            for name in ('GH_TOKEN', 'GITHUB_TOKEN'):
+                token = os.environ.get(name)
+                if token:
+                    detail = detail.replace(token, '<token redacted>')
+            reason = 'timed out' if timed_out else f'failed ({error.returncode})'
+            raise RuntimeError(f'GitHub API request {reason}: {detail[:1500]}') from error
+
 
 
 def export_file(repo, name, data):
