@@ -14981,8 +14981,7 @@ fn mentions_label(text: &str, label: &str) -> bool {
     if lb.is_empty() {
         return false;
     }
-    let is_label_char =
-        |c: u8| c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'$';
+    let is_label_char = |c: u8| c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'$';
     let mut i = 0;
     while i + lb.len() <= bytes.len() {
         if &bytes[i..i + lb.len()] == lb {
@@ -15141,9 +15140,10 @@ fn try_fold_select_diamond(
     let (src_name, dst_name, suffix) = match size {
         MoveSize::L => (reg32_name(ts), reg32_name(fd), "l"),
         MoveSize::W => {
-            let (Some(sn), Some(dn)) =
-                (narrow_reg_name(ts, MoveSize::W), narrow_reg_name(fd, MoveSize::W))
-            else {
+            let (Some(sn), Some(dn)) = (
+                narrow_reg_name(ts, MoveSize::W),
+                narrow_reg_name(fd, MoveSize::W),
+            ) else {
                 return false;
             };
             (sn, dn, "w")
@@ -15182,7 +15182,8 @@ fn fold_select_diamond_cmov(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
     for (fstart, fend) in ranges {
         let mut i = fstart;
         while i < fend {
-            if infos[i].kind == LineKind::CondJmp && try_fold_select_diamond(store, infos, i, fstart, fend)
+            if infos[i].kind == LineKind::CondJmp
+                && try_fold_select_diamond(store, infos, i, fstart, fend)
             {
                 changed = true;
             }
@@ -17114,7 +17115,8 @@ mod tests {
     #[test]
     fn load_copy_relay_scratch_live_after_copy_is_refused() {
         // %ebx is read after the copy: the load must keep defining %ebx.
-        let asm = "f:\n    movl 16(%esp), %ebx\n    movl %ebx, %eax\n    addl %ebx, %eax\n    ret\n";
+        let asm =
+            "f:\n    movl 16(%esp), %ebx\n    movl %ebx, %eax\n    addl %ebx, %eax\n    ret\n";
         let out = run_relay(asm);
         assert!(out.contains("movl 16(%esp), %ebx"), "{out}");
         assert!(out.contains("movl %ebx, %eax"), "{out}");
@@ -17123,7 +17125,8 @@ mod tests {
     #[test]
     fn load_copy_relay_dest_written_between_is_refused() {
         // %eax is written between load and copy: retargeting would be clobbered.
-        let asm = "f:\n    movl 16(%esp), %ebx\n    xorl %eax, %eax\n    movl %ebx, %eax\n    ret\n";
+        let asm =
+            "f:\n    movl 16(%esp), %ebx\n    xorl %eax, %eax\n    movl %ebx, %eax\n    ret\n";
         let out = run_relay(asm);
         assert!(out.contains("movl 16(%esp), %ebx"), "{out}");
     }
@@ -17131,7 +17134,8 @@ mod tests {
     #[test]
     fn load_copy_relay_scratch_read_between_is_refused() {
         // %ebx is read between load and copy: the value must stay in %ebx.
-        let asm = "f:\n    movl 16(%esp), %ebx\n    addl %ebx, %esi\n    movl %ebx, %eax\n    ret\n";
+        let asm =
+            "f:\n    movl 16(%esp), %ebx\n    addl %ebx, %esi\n    movl %ebx, %eax\n    ret\n";
         let out = run_relay(asm);
         assert!(out.contains("movl 16(%esp), %ebx"), "{out}");
     }
