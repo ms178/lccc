@@ -439,7 +439,7 @@ static table of `(name, body)` pairs. Categories include:
 | **Byte order** | `__BYTE_ORDER__` (`__ORDER_LITTLE_ENDIAN__`) |
 | **Atomics** | `__GCC_ATOMIC_INT_LOCK_FREE` (2), etc. |
 | **SIMD** | `__SSE__`, `__SSE2__`, `__MMX__` (x86_64 only) |
-| **Date/Time** | `__DATE__`, `__TIME__` (static values) |
+| **Date/Time** | `__DATE__`, `__TIME__` (current UTC time, or reproducible values from `SOURCE_DATE_EPOCH`) |
 
 ### Special Built-in Macros
 
@@ -606,15 +606,8 @@ i686, and i386.
 
 ## Known Limitations
 
-- **`__DATE__` and `__TIME__` are static** -- they expand to compile-time
-  constants rather than the actual build timestamp.
-- **`_Float128` is aliased to `long double`** -- on x86-64, this loses the
-  difference between 80-bit extended precision and IEEE binary128.
 - **`__has_feature` and `__has_extension` always return `0`** -- no Clang
   feature set is modeled.
-- **`_Pragma("...")` is skipped** -- the C99 `_Pragma` operator is consumed
-  and discarded during macro expansion rather than being executed.
-- **No `#embed` support** -- the C23 `#embed` directive is not implemented.
 - **No trigraph processing** -- trigraphs (`??=`, `??/`, etc.) are not
   translated. Digraph tokens, directive introducers and macro `#`/`##`
   spellings are recognized while retaining their spelling for stringification;

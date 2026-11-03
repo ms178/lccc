@@ -163,8 +163,9 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert("__builtin_y0l", BuiltinInfo::simple("y0l"));
     m.insert("__builtin_y1l", BuiltinInfo::simple("y1l"));
     m.insert("__builtin_ynl", BuiltinInfo::simple("ynl"));
-    // TODO: __builtin_nan(s) ignores the string payload argument (NaN payload).
-    // For common usage with "" this is correct; full payload support needs custom lowering.
+    // These descriptors identify the builtin and its fallback value. The shared
+    // constant evaluator parses NaN string payloads and constructs the target
+    // bit pattern for both static initialization and expression lowering.
     m.insert("__builtin_nan", BuiltinInfo::constant_f64(f64::NAN));
     m.insert("__builtin_nanf", BuiltinInfo::constant_f64(f64::NAN));
     // Signaling NaNs: the bits (and payload) come from the shared folder.

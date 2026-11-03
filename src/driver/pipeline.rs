@@ -1421,6 +1421,7 @@ impl Driver {
             sema.set_builtin_policy(self.builtin_policy.clone());
             sema.set_pre_c99_dialect(self.pre_c99_dialect());
             sema.set_gnu89_inline(self.gnu89_inline);
+            sema.set_c23_dialect(self.c23_dialect());
             sema.set_weak_pragma_names(
                 preprocessor
                     .weak_pragmas
@@ -2500,6 +2501,7 @@ impl Driver {
         sema.set_builtin_policy(self.builtin_policy.clone());
         sema.set_pre_c99_dialect(self.pre_c99_dialect());
         sema.set_gnu89_inline(self.gnu89_inline);
+        sema.set_c23_dialect(self.c23_dialect());
         sema.set_weak_pragma_names(
             preprocessor
                 .weak_pragmas

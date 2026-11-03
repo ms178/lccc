@@ -833,14 +833,14 @@ impl Parser {
     /// from the completed definition).
     pub(super) fn type_spec_has_enum_tag(ts: &TypeSpecifier) -> bool {
         match ts {
-            TypeSpecifier::Enum(..) => true,
+            TypeSpecifier::Enum(.., _) => true,
             TypeSpecifier::Pointer(inner, _) => Self::type_spec_has_enum_tag(inner),
             TypeSpecifier::Array(inner, _) => Self::type_spec_has_enum_tag(inner),
             TypeSpecifier::TypeofType(inner, _) => Self::type_spec_has_enum_tag(inner),
             // A record with an enum field inherits the range-dependence: the
             // field's alignment is the completed enum's alignment.
             TypeSpecifier::Struct(_, Some(fields), ..)
-            | TypeSpecifier::Union(_, Some(fields), ..) => fields
+            | TypeSpecifier::Union(_, Some(fields), .., _) => fields
                 .iter()
                 .any(|f| Self::type_spec_has_enum_tag(&f.type_spec)),
             _ => false,
@@ -856,6 +856,7 @@ impl Parser {
         if !self.enter_record_frame(self.peek_span()) {
             return TypeSpecifier::Int;
         }
+        let tag_span = self.peek_span();
         let (mut is_packed, mut struct_aligned, _, _, mut sso) = self.parse_record_attributes();
         let name = if let TokenKind::Identifier(n) = self.peek() {
             let n = n.clone();
@@ -925,6 +926,7 @@ impl Parser {
                 max_field_align,
                 struct_aligned,
                 Some(reverse_sso),
+                tag_span,
             )
         } else {
             TypeSpecifier::Union(
@@ -934,6 +936,7 @@ impl Parser {
                 max_field_align,
                 struct_aligned,
                 Some(reverse_sso),
+                tag_span,
             )
         };
         // Record alignment for named struct/union definitions so that later
@@ -971,6 +974,7 @@ impl Parser {
 
     /// Parse an enum definition/reference.
     fn parse_enum_specifier(&mut self) -> TypeSpecifier {
+        let tag_span = self.peek_span();
         let (mut is_packed, _, _, _, _) = self.parse_gcc_attributes();
         let name = if let TokenKind::Identifier(n) = self.peek() {
             let n = n.clone();
@@ -993,7 +997,7 @@ impl Parser {
         };
         let (packed3, _, _, _, _) = self.parse_gcc_attributes();
         is_packed = is_packed || packed3;
-        TypeSpecifier::Enum(name, variants, is_packed, underlying)
+        TypeSpecifier::Enum(name, variants, is_packed, underlying, tag_span)
     }
 
     /// C23 6.7.2.2: the optional `: specifier-qualifier-list` naming an

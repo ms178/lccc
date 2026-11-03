@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 import shutil
 import signal
 import subprocess
@@ -26,9 +27,15 @@ def load_module(name: str, path: Path):
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--full", action="store_true", help="check GCC O0/O1/O2/O3 (slower)")
+    parser.add_argument(
+        "--gcc",
+        default=os.environ.get("GCC") or shutil.which("gcc-16") or "gcc",
+        help="GCC oracle executable (default: GCC env, gcc-16 if available, else gcc)",
+    )
     args = parser.parse_args()
-    if not shutil.which("gcc"):
-        print("ERROR: gcc is required for the RA harness checksum gate", file=sys.stderr)
+    gcc = shutil.which(args.gcc)
+    if not gcc:
+        print(f"ERROR: GCC oracle not found: {args.gcc}", file=sys.stderr)
         return 2
 
     with tempfile.TemporaryDirectory(prefix="lccc-ra-harness-test-") as td:
@@ -131,7 +138,7 @@ g:
             bad = root / f"intentional_{name}.c"
             bad.write_text(f"int main(void) {{ {body} }}\n")
             try:
-                scorer.check_correctness("gcc", bad, "2", sanitizer_flags)
+                scorer.check_correctness(gcc, bad, "2", sanitizer_flags)
             except RuntimeError as error:
                 assert "program failed" in str(error), str(error)
                 assert f"exit={-signal.SIGILL}" in str(error), str(error)
@@ -140,11 +147,11 @@ g:
 
         levels = ("0", "1", "2", "3") if args.full else ("0", "2")
         for src in files_a:
-            reference = scorer.check_correctness("gcc", src, "0", [])
+            reference = scorer.check_correctness(gcc, src, "0", [])
             for opt in levels:
-                result = scorer.check_correctness("gcc", src, opt, [], reference)
+                result = scorer.check_correctness(gcc, src, opt, [], reference)
                 assert result == reference
-            scorer.check_correctness("gcc", src, "2", sanitizer_flags, reference)
+            scorer.check_correctness(gcc, src, "2", sanitizer_flags, reference)
     print(f"PASS: deterministic 20-kernel corpus, assembly counters, GCC checksum matrix {levels}, UBSan trap O2 (two intentional-UB controls)")
     return 0
 

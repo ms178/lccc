@@ -350,12 +350,17 @@ fn detect_include_guard(source: &str) -> Option<String> {
                 after_hash
             };
 
-            if after_hash.starts_with("ifndef") && !found_ifndef && if_depth == 0 {
-                // First directive must be #ifndef
+            if !found_ifndef && if_depth == 0 {
+                // First directive must be exactly `#ifndef`, not a longer
+                // identifier such as `#ifndefGUARD`. Prefix matching here can
+                // mistake an invalid directive for an include guard and then
+                // suppress diagnostics on later inclusions.
                 if has_content_before_guard {
                     return None;
                 }
-                let rest = after_hash["ifndef".len()..].trim();
+                let Some(rest) = directive_remainder(after_hash, "ifndef") else {
+                    return None;
+                };
                 let macro_name = extract_identifier(rest)?;
                 if macro_name.is_empty() {
                     return None;
@@ -366,33 +371,35 @@ fn detect_include_guard(source: &str) -> Option<String> {
             } else if !found_ifndef {
                 // First directive is not #ifndef -> no guard
                 return None;
-            } else if !found_define && found_ifndef && if_depth == 1 {
-                // Second directive should be #define with the same macro
-                if after_hash.starts_with("define") {
-                    let rest = after_hash.strip_prefix("define").unwrap().trim();
-                    let macro_name = extract_identifier(rest)?;
-                    if let Some(ref guard) = guard_macro {
-                        if macro_name == *guard {
-                            found_define = true;
-                        } else {
-                            return None; // #define of a different macro
-                        }
+            } else if !found_define && if_depth == 1 {
+                // Second directive should be exactly #define with the same macro
+                let Some(rest) = directive_remainder(after_hash, "define") else {
+                    return None;
+                };
+                let macro_name = extract_identifier(rest)?;
+                if let Some(ref guard) = guard_macro {
+                    if macro_name == *guard {
+                        found_define = true;
+                    } else {
+                        return None; // #define of a different macro
                     }
-                } else {
-                    return None; // Second directive is not #define
                 }
             } else {
-                // Inside the guard body - track nesting depth
-                if after_hash.starts_with("if") {
-                    // Covers #if, #ifdef, #ifndef
+                // Inside the guard body - track complete directive identifiers,
+                // so e.g. `#ifnot` cannot make a later `#endif` appear nested.
+                if ["if", "ifdef", "ifndef"]
+                    .iter()
+                    .any(|word| directive_remainder(after_hash, word).is_some())
+                {
                     if_depth += 1;
-                } else if after_hash.starts_with("endif") {
+                } else if directive_remainder(after_hash, "endif").is_some() {
                     if_depth -= 1;
                     if if_depth == 0 {
                         // This #endif closes the guard
                         found_endif = true;
                     }
-                } else if (after_hash.starts_with("else") || after_hash.starts_with("elif"))
+                } else if (directive_remainder(after_hash, "else").is_some()
+                    || directive_remainder(after_hash, "elif").is_some())
                     && if_depth == 1
                 {
                     // An #else/#elif at the outermost guard level means the
@@ -421,6 +428,21 @@ fn detect_include_guard(source: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Return the text after a complete preprocessing directive keyword.
+///
+/// A preprocessing directive name is an identifier token, so `#ifndefX` is
+/// not `#ifndef X`. Include-guard detection is an optimization and must decline
+/// unfamiliar spellings rather than letting a prefix match suppress work or
+/// diagnostics on later includes. Comments are replaced with whitespace by
+/// `strip_inline_comments` before this helper is called.
+fn directive_remainder<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix(keyword)?;
+    if !rest.is_empty() && !rest.as_bytes()[0].is_ascii_whitespace() {
+        return None;
+    }
+    Some(rest.trim_start())
 }
 
 /// Extract a C identifier from the beginning of a string.
@@ -465,6 +487,10 @@ fn strip_inline_comments<'a>(
                 i += 1;
             }
         } else if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            // C translation phase 3 replaces each comment with one space.
+            // Keep that token boundary (`#ifndef/**/GUARD` is `#ifndef GUARD`)
+            // rather than accidentally concatenating the surrounding text.
+            result.push(' ');
             *in_block_comment = true;
             i += 2;
         } else if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
@@ -1805,6 +1831,65 @@ impl Preprocessor {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod include_guard_detection_tests {
+    use super::detect_include_guard;
+
+    #[test]
+    fn recognizes_exact_guard_keywords_and_comment_separators() {
+        assert_eq!(
+            detect_include_guard(
+                "#ifndef/**/HEADER_GUARD\n#define/**/HEADER_GUARD\nint value;\n#endif\n"
+            ),
+            Some("HEADER_GUARD".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_directive_name_prefixes_as_guard_syntax() {
+        for source in [
+            "#ifndefHEADER_GUARD\n#define HEADER_GUARD\n#error first\n#endif\n",
+            "#ifndef HEADER_GUARD\n#defineHEADER_GUARD\n#error first\n#endif\n",
+            "#ifndef HEADER_GUARD\n#define HEADER_GUARD\n#ifnot 1\n#endif\n#endif\n",
+        ] {
+            assert_eq!(detect_include_guard(source), None, "source: {source:?}");
+        }
+    }
+
+    #[test]
+    fn prefix_directives_do_not_hide_diagnostics_on_repeated_includes() {
+        use super::Preprocessor;
+
+        let dir = std::env::temp_dir().join(format!(
+            "lccc_include_guard_prefix_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock before epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp include directory");
+        let header = dir.join("prefix.h");
+        std::fs::write(
+            &header,
+            "#ifndefHEADER_GUARD\n#defineHEADER_GUARD\n#error repeated\n#endif\n",
+        )
+        .expect("write malformed guard fixture");
+
+        let mut preprocessor = Preprocessor::new();
+        preprocessor.add_include_path(dir.to_str().expect("UTF-8 temp path"));
+        preprocessor.set_filename(dir.join("main.c").to_str().expect("UTF-8 main path"));
+        preprocessor
+            .preprocess("#define HEADER_GUARD 1\n#include \"prefix.h\"\n#include \"prefix.h\"\n");
+        assert_eq!(
+            preprocessor.errors().len(),
+            2,
+            "a malformed directive prefix must not be cached as an include guard"
+        );
+        std::fs::remove_dir_all(dir).expect("remove temp include directory");
     }
 }
 

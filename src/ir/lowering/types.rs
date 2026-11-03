@@ -47,7 +47,7 @@ impl Lowerer {
 
     /// Check if a TypeSpecifier resolves to a struct or union type (through typedefs).
     pub(super) fn is_type_struct_or_union(&self, ts: &TypeSpecifier) -> bool {
-        matches!(ts, TypeSpecifier::Struct(..) | TypeSpecifier::Union(..))
+        matches!(ts, TypeSpecifier::Struct(.., _) | TypeSpecifier::Union(..))
             || self
                 .resolve_typedef_ctype(ts)
                 .is_some_and(|ct| ct.is_struct_or_union())
@@ -56,7 +56,7 @@ impl Lowerer {
     /// Check if a TypeSpecifier is a transparent union (passed as first member for ABI).
     pub(super) fn is_transparent_union(&self, ts: &TypeSpecifier) -> bool {
         let key = match ts {
-            TypeSpecifier::Union(tag, ..) => tag
+            TypeSpecifier::Union(tag, .., _) => tag
                 .as_ref()
                 .map(|t| -> Rc<str> { format!("union.{}", t).into() }),
             TypeSpecifier::TypedefName(name) => {
@@ -231,11 +231,11 @@ impl Lowerer {
             | TypeSpecifier::ComplexLongDouble => IrType::Ptr,
             TypeSpecifier::Pointer(_, _) => IrType::Ptr,
             TypeSpecifier::Array(_, _) => IrType::Ptr,
-            TypeSpecifier::Struct(..) | TypeSpecifier::Union(..) => IrType::Ptr,
+            TypeSpecifier::Struct(.., _) | TypeSpecifier::Union(.., _) => IrType::Ptr,
             // Size and signedness come from the enum's compatible type: its
             // values (`1U << 31` is unsigned 32-bit), packing, or C23 fixed
             // underlying type.
-            TypeSpecifier::Enum(..) => IrType::from_ctype(&self.type_spec_to_ctype(ts)),
+            TypeSpecifier::Enum(.., _) => IrType::from_ctype(&self.type_spec_to_ctype(ts)),
             TypeSpecifier::TypedefName(name) => {
                 // Resolve typedef through CType
                 if let Some(ctype) = self.types.typedefs.get(name) {
@@ -355,7 +355,7 @@ impl Lowerer {
     /// Returns an Rc<StructLayout> for cheap cloning.
     fn struct_union_layout(&self, ts: &TypeSpecifier) -> Option<RcLayout> {
         match ts {
-            TypeSpecifier::Struct(tag, Some(fields), is_packed, pragma_pack, _, reverse_sso) => {
+            TypeSpecifier::Struct(tag, Some(fields), is_packed, pragma_pack, _, reverse_sso, _) => {
                 // Use cached layout for tagged structs
                 if let Some(tag) = tag {
                     if let Some(layout) = self
@@ -374,7 +374,7 @@ impl Lowerer {
                     reverse_sso.is_some_and(|v| v),
                 )))
             }
-            TypeSpecifier::Union(tag, Some(fields), is_packed, pragma_pack, _, reverse_sso) => {
+            TypeSpecifier::Union(tag, Some(fields), is_packed, pragma_pack, _, reverse_sso, _) => {
                 // Use cached layout for tagged unions
                 if let Some(tag) = tag {
                     if let Some(layout) = self
@@ -393,10 +393,10 @@ impl Lowerer {
                     reverse_sso.is_some_and(|v| v),
                 )))
             }
-            TypeSpecifier::Struct(Some(tag), None, ..) => {
+            TypeSpecifier::Struct(Some(tag), None, .., _) => {
                 self.get_struct_union_layout_by_tag("struct", tag)
             }
-            TypeSpecifier::Union(Some(tag), None, ..) => {
+            TypeSpecifier::Union(Some(tag), None, .., _) => {
                 self.get_struct_union_layout_by_tag("union", tag)
             }
             _ => None,

@@ -713,10 +713,27 @@ impl Lexer {
             }
         }
         let number_end = self.pos;
-        let (float_kind, _is_imaginary) = self.parse_float_suffix();
+        let (float_kind, is_imaginary) = self.parse_float_suffix();
         let hex_text = std::str::from_utf8(&self.input[start..number_end]).unwrap_or("0x0p0");
         let value = crate::common::hex_float::parse_f64(hex_text, float_kind == 1);
         let span = Span::new(start as u32, self.pos as u32, self.file_id);
+        if is_imaginary {
+            return match float_kind {
+                1 => Token::new(TokenKind::ImaginaryLiteralF32(value), span),
+                2 => {
+                    let f128_bytes = crate::common::hex_float::parse_long_double(
+                        hex_text,
+                        crate::common::types::target_long_double_is_f128(),
+                    );
+                    let value = crate::common::long_double::f128_bytes_to_f64(&f128_bytes);
+                    Token::new(
+                        TokenKind::ImaginaryLiteralLongDouble(value, f128_bytes),
+                        span,
+                    )
+                }
+                _ => Token::new(TokenKind::ImaginaryLiteral(value), span),
+            };
+        }
         match float_kind {
             1 => Token::new(TokenKind::FloatLiteralF32(value), span),
             2 => {
@@ -2879,6 +2896,32 @@ mod recovery_tests {
         assert!(
             matches!(tokens[2].kind, TokenKind::FloatLiteralF128(_, bytes) if u128::from_le_bytes(bytes) == 2)
         );
+    }
+
+    #[test]
+    fn hexadecimal_imaginary_literals_keep_their_type_and_value() {
+        let mut lexer = Lexer::new(
+            "0x1.8p+1i 0x1.8p+1j 0x1.8p+1fi 0x1.8p+1if 0x1.8p+1Li 0x1.8p+1il",
+            0,
+        );
+        let tokens = lexer.tokenize();
+        assert!(lexer.diagnostics.is_empty());
+        assert!(matches!(tokens[0].kind, TokenKind::ImaginaryLiteral(v) if v == 3.0));
+        assert!(matches!(tokens[1].kind, TokenKind::ImaginaryLiteral(v) if v == 3.0));
+        assert!(matches!(tokens[2].kind, TokenKind::ImaginaryLiteralF32(v) if v == 3.0));
+        assert!(matches!(tokens[3].kind, TokenKind::ImaginaryLiteralF32(v) if v == 3.0));
+        let expected = crate::common::hex_float::parse_long_double(
+            "0x1.8p+1",
+            crate::common::types::target_long_double_is_f128(),
+        );
+        let expected_value = crate::common::long_double::f128_bytes_to_f64(&expected);
+        for token in &tokens[4..6] {
+            assert!(matches!(
+                &token.kind,
+                TokenKind::ImaginaryLiteralLongDouble(value, bytes)
+                    if *value == expected_value && *bytes == expected
+            ));
+        }
     }
 
     #[test]

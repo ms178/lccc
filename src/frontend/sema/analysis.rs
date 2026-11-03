@@ -273,6 +273,9 @@ pub struct SemanticAnalyzer {
     gnu89_inline: bool,
     /// Names whose only definition so far was a GNU89 `extern inline` husk.
     inline_husk_definitions: FxHashSet<String>,
+    /// C23 changed compatible tagged-type redefinitions from a constraint
+    /// violation into a permitted redeclaration.
+    c23: bool,
     pending_loop_labels: Vec<String>,
     active_break_targets: Vec<Vec<String>>,
     active_continue_targets: Vec<Vec<String>>,
@@ -331,6 +334,7 @@ impl SemanticAnalyzer {
             pre_c99: false,
             gnu89_inline: false,
             inline_husk_definitions: FxHashSet::default(),
+            c23: true,
             pending_loop_labels: Vec::new(),
             active_break_targets: Vec::new(),
             active_continue_targets: Vec::new(),
@@ -485,6 +489,11 @@ impl SemanticAnalyzer {
     /// mode, sema would reject a translation unit GCC accepts.
     pub fn set_gnu89_inline(&mut self, gnu89_inline: bool) {
         self.gnu89_inline = gnu89_inline;
+    }
+
+    /// Select C23 tagged-type compatibility rules.
+    pub fn set_c23_dialect(&mut self, c23: bool) {
+        self.c23 = c23;
     }
 
     /// Take the diagnostic engine back from the analyzer.
@@ -1029,7 +1038,7 @@ impl SemanticAnalyzer {
     fn check_void_members(&self, ts: &TypeSpecifier, span: Span) {
         match ts {
             TypeSpecifier::Struct(_, Some(fields), ..)
-            | TypeSpecifier::Union(_, Some(fields), ..) => {
+            | TypeSpecifier::Union(_, Some(fields), .., _) => {
                 let is_union = matches!(ts, TypeSpecifier::Union(..));
                 self.check_counted_by_members(fields, is_union, span);
                 for f in fields {
@@ -2570,10 +2579,28 @@ impl SemanticAnalyzer {
     /// constants registered in the enclosing scope, matching GCC/Clang behavior.
     fn collect_enum_constants_from_type_spec(&mut self, ts: &TypeSpecifier, span: Span) {
         match ts {
-            TypeSpecifier::Enum(name, Some(variants), is_packed, underlying) => {
+            TypeSpecifier::Enum(name, Some(variants), is_packed, underlying, definition_span) => {
                 let fixed =
                     self.enum_fixed_type(name.as_deref(), underlying.as_deref(), true, span);
                 let enum_type = self.process_enum_variants(name, variants, *is_packed, fixed);
+                if let Some(tag) = name
+                    && self
+                        .result
+                        .type_context
+                        .record_tag_definition(tag, *definition_span)
+                {
+                    let compatible = self.c23
+                        && self
+                            .result
+                            .type_context
+                            .enum_type_in_current_scope(tag)
+                            .is_some_and(|previous| previous == &enum_type);
+                    if !compatible {
+                        self.diagnostics
+                            .borrow_mut()
+                            .error(format!("redefinition of 'enum {tag}'"), *definition_span);
+                    }
+                }
                 // Register EVERY completed named body -- packed or not -- for
                 // all subsequent body-less references: a reference resolves
                 // through `TypeContext::enum_types`, so it gets the same values
@@ -2591,7 +2618,7 @@ impl SemanticAnalyzer {
                 }
             }
             // C23 `enum E : T;` declares the tag, complete with its fixed type.
-            TypeSpecifier::Enum(Some(tag), None, is_packed, Some(underlying)) => {
+            TypeSpecifier::Enum(Some(tag), None, is_packed, Some(underlying), _) => {
                 let fixed = self.enum_fixed_type(Some(tag), Some(underlying), false, span);
                 if fixed.is_some()
                     && self
@@ -2612,7 +2639,7 @@ impl SemanticAnalyzer {
                 }
             }
             TypeSpecifier::Struct(_, Some(fields), ..)
-            | TypeSpecifier::Union(_, Some(fields), ..) => {
+            | TypeSpecifier::Union(_, Some(fields), .., _) => {
                 for field in fields {
                     self.collect_enum_constants_from_type_spec(&field.type_spec, span);
                 }
@@ -7429,7 +7456,7 @@ dereference it before applying '->' to it?"
     /// (or `'__alignof__'`), caretted at the type's first token.
     fn check_sizeof_incomplete_type(&self, ts: &TypeSpecifier, span: Span, operator: &str) {
         match ts {
-            TypeSpecifier::Struct(Some(tag), None, ..) => {
+            TypeSpecifier::Struct(Some(tag), None, .., _) => {
                 // Reference to a named struct with no inline body.
                 // Check if it was previously defined (key format: "struct.tag").
                 // Deliberately the BASE key, not resolve_record_key: this asks
@@ -7448,7 +7475,7 @@ dereference it before applying '->' to it?"
                     );
                 }
             }
-            TypeSpecifier::Union(Some(tag), None, ..) => {
+            TypeSpecifier::Union(Some(tag), None, .., _) => {
                 // Base key on purpose; see the struct arm above.
                 let key = format!("union.{}", tag);
                 if !self.defined_structs.borrow().contains(key.as_str()) {
@@ -7461,7 +7488,7 @@ dereference it before applying '->' to it?"
                     );
                 }
             }
-            TypeSpecifier::Enum(Some(tag), None, _, None) => {
+            TypeSpecifier::Enum(Some(tag), None, _, None, _) => {
                 if !self
                     .result
                     .type_context
@@ -10433,6 +10460,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
     fn resolve_struct_or_union(
         &self,
         name: &Option<String>,
+        span: Span,
         fields: &Option<Vec<StructFieldDecl>>,
         is_union: bool,
         is_packed: bool,
@@ -10482,10 +10510,10 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
         // could ever fire, and passing one where the other was expected was
         // silent: `f(s)` returned 44 for `s.c == 300` (tests/bugs/
         // nested_tag_struct_identity.c) where GCC 16.2 rejects the program.
-        // A shadowing definition therefore gets its own key. Members that
-        // correspond (the N3037 / C23 6.2.9 case) keep the shared key so valid
-        // C23 still compiles, and two layout-identical definitions cannot
-        // miscompile whichever way they are keyed.
+        // A shadowing definition therefore gets its own key before C23. In
+        // C23, corresponding members (N3037 / C23 6.2.9) make the types
+        // compatible and keep the shared key; merely equal layouts are not
+        // enough in earlier dialects.
         // `struct S` may already denote a variant in this scope: an inner
         // definition rebinds the tag to its own key through record_alias.
         // Resolve that BEFORE anything else, so the shadow comparison and every
@@ -10505,6 +10533,23 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
         } else {
             std::borrow::Cow::Borrowed(&base_key)
         };
+        if fields.is_some()
+            && let Some(tag) = name
+            && self.result.type_context.record_tag_definition(tag, span)
+        {
+            let compatible = self.c23
+                && defined_layout.as_ref().is_some_and(|new_layout| {
+                    let layouts = self.result.type_context.borrow_struct_layouts();
+                    layouts.get(visible.as_ref()).is_some_and(|previous| {
+                        record_layouts_correspond(previous, new_layout, &layouts)
+                    })
+                });
+            if !compatible {
+                self.diagnostics
+                    .borrow_mut()
+                    .error(format!("redefinition of '{prefix} {tag}'"), span);
+            }
+        }
         let key: String = match (&defined_layout, name) {
             (Some(new_layout), Some(_)) => {
                 // Scoped so the Ref is dropped before the alias is mutated.
@@ -10518,7 +10563,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
                         // mechanism (verified -- it silently restored the
                         // TAG-ID-1 miscompile and the gate went red).
                         !prev.fields.is_empty()
-                            && !record_layouts_correspond(prev, new_layout, &layouts)
+                            && (!record_layouts_correspond(prev, new_layout, &layouts) || !self.c23)
                     })
                 };
                 if shadows_different {
@@ -10583,6 +10628,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
     fn resolve_enum(
         &self,
         name: &Option<String>,
+        _span: Span,
         variants: &Option<Vec<EnumVariant>>,
         is_packed: bool,
     ) -> CType {
@@ -11771,11 +11817,19 @@ mod kr_prototype_tests {
     }
 
     fn analyze(source: &str) -> (SemanticAnalyzer, Result<(), usize>) {
-        let tokens = Lexer::new(source, 0).tokenize();
+        analyze_with_c23(source, false)
+    }
+
+    fn analyze_with_c23(source: &str, c23: bool) -> (SemanticAnalyzer, Result<(), usize>) {
+        let mut lexer = Lexer::new(source, 0);
+        lexer.set_c23(c23);
+        let tokens = lexer.tokenize();
         let mut parser = Parser::new(tokens);
+        parser.set_c23(c23);
         let tu = parser.parse();
         assert_eq!(parser.error_count, 0, "fixture must parse");
         let mut sema = SemanticAnalyzer::new();
+        sema.set_c23_dialect(c23);
         // Mirror the driver's GCC 16.2 dialect-default severity policy
         // (`-Wint-conversion`, `-Wincompatible-pointer-types` and friends
         // are errors from C99 on), so fixture verdicts equal what the
@@ -11786,6 +11840,68 @@ mod kr_prototype_tests {
         sema.diagnostics.borrow_mut().set_warning_config(config);
         let result = sema.analyze(&tu);
         (sema, result)
+    }
+
+    #[test]
+    fn duplicate_complete_tags_in_one_scope_are_rejected() {
+        for source in [
+            "struct S { int first; }; struct S { int second; };",
+            "int f(void) { struct S { int first; }; struct S { int second; }; return 0; }",
+            "struct S { int first; }; union S { int second; };",
+            "enum E { FIRST }; enum E { SECOND };",
+        ] {
+            let (sema, result) = analyze(source);
+            assert!(
+                result.is_err(),
+                "same-scope complete tag redefinition should fail: {source}"
+            );
+            assert_eq!(
+                sema.diagnostics.borrow().error_count(),
+                1,
+                "one redefinition AST site should produce one diagnostic: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn c23_allows_only_compatible_same_scope_tag_redefinitions() {
+        for source in [
+            "struct S { int x; }; struct S { int x; };",
+            "int f(void) { struct S { int x; }; struct S { int x; }; return sizeof(struct S); }",
+            "enum E { A }; enum E { A };",
+        ] {
+            assert!(
+                analyze_with_c23(source, true).1.is_ok(),
+                "C23 permits compatible same-scope tag redefinitions: {source}"
+            );
+        }
+
+        for source in [
+            "struct S { int x; }; struct S { long x; };",
+            "int f(void) { struct S { int x; }; struct S { long x; }; return sizeof(struct S); }",
+            "enum E { A }; enum E { B };",
+            "struct X { int x; }; union X { int x; };",
+        ] {
+            assert!(
+                analyze_with_c23(source, true).1.is_err(),
+                "C23 must reject incompatible tag redefinitions: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn forward_tag_completion_and_inner_scope_shadowing_remain_valid() {
+        for source in [
+            "struct S; struct S { int value; }; int main(void) { struct S x = {1}; return x.value != 1; }",
+            "int main(void) { struct S { int value; } outer = {1}; { struct S { char value; } inner = {2}; if (inner.value != 2) return 1; } return outer.value != 1; }",
+            "struct S { int value; } object; int use(void) { return sizeof(object) == sizeof(struct S); }",
+            "int f(void) { { struct S { int x; }; } { struct S { long y; }; } return 0; }",
+        ] {
+            assert!(
+                analyze(source).1.is_ok(),
+                "valid tag declaration/completion/shadowing should pass: {source}"
+            );
+        }
     }
 
     #[test]

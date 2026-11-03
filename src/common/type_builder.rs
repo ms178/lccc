@@ -9,6 +9,7 @@
 //! (typedef names, struct/union, enum, typeof), so implementors provide just those
 //! via required trait methods. This ensures primitive type mapping can never diverge.
 
+use crate::common::source::Span;
 use crate::common::types::{AddressSpace, CType, ExtVectorLayout, FunctionType, PtrQuals};
 use crate::frontend::parser::ast::{
     DerivedDeclarator, EnumVariant, Expr, ParamDecl, StructFieldDecl, TypeSpecifier,
@@ -31,6 +32,7 @@ pub trait TypeConvertContext {
     fn resolve_struct_or_union(
         &self,
         name: &Option<String>,
+        span: Span,
         fields: &Option<Vec<StructFieldDecl>>,
         is_union: bool,
         is_packed: bool,
@@ -45,6 +47,7 @@ pub trait TypeConvertContext {
     fn resolve_enum(
         &self,
         name: &Option<String>,
+        span: Span,
         variants: &Option<Vec<EnumVariant>>,
         is_packed: bool,
     ) -> CType;
@@ -275,8 +278,10 @@ pub trait TypeConvertContext {
                 pragma_pack,
                 struct_aligned,
                 reverse_sso,
+                span,
             ) => self.resolve_struct_or_union(
                 name,
+                *span,
                 fields,
                 false,
                 *is_packed,
@@ -291,8 +296,10 @@ pub trait TypeConvertContext {
                 pragma_pack,
                 struct_aligned,
                 reverse_sso,
+                span,
             ) => self.resolve_struct_or_union(
                 name,
+                *span,
                 fields,
                 true,
                 *is_packed,
@@ -300,8 +307,8 @@ pub trait TypeConvertContext {
                 *struct_aligned,
                 reverse_sso.is_some_and(|v| v),
             ),
-            TypeSpecifier::Enum(name, variants, is_packed, underlying) => {
-                let resolved = self.resolve_enum(name, variants, *is_packed);
+            TypeSpecifier::Enum(name, variants, is_packed, underlying, span) => {
+                let resolved = self.resolve_enum(name, *span, variants, *is_packed);
                 let fixed = underlying.as_deref().and_then(|u| {
                     crate::common::types::EnumType::fixed_underlying(
                         self.resolve_type_spec_to_ctype(u),
