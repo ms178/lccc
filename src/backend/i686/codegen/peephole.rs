@@ -8657,6 +8657,11 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             if dest == REG_NONE || (dest != REG_EAX && dest != divisor) {
                 return Some((staging, read_regs, read_slots));
             }
+            // Partial-width writes leave old register bits in place. They
+            // cannot establish the complete repeated dividend or divisor.
+            if !text.starts_with("movl ") {
+                return None;
+            }
             staging.push((p, text.to_string()));
             if staging.len() > MAX_SETUP {
                 return None;
@@ -8798,7 +8803,7 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 continue;
             };
             match collect_staging(store, infos, i, divisor) {
-                Some((staging, read_regs, read_slots)) => {
+                Some((staging, mut read_regs, read_slots)) => {
                     // DIV overwrites EAX/EDX, and the staging itself may
                     // overwrite its divisor. Those values cannot be inputs
                     // to a repeated staging block without a separate proof.
@@ -8808,7 +8813,14 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         LineKind::Other { dest_reg } => dest_reg == divisor,
                         _ => false,
                     });
-                    if matches!(divisor, REG_EAX | REG_EDX | REG_ESP)
+                    let reloads_eax = staging.iter().any(|(idx, _)| match infos[*idx].kind {
+                        LineKind::Move { dst, .. } => dst == REG_EAX,
+                        LineKind::LoadEbp { reg, .. } => reg == REG_EAX,
+                        LineKind::Other { dest_reg } => dest_reg == REG_EAX,
+                        _ => false,
+                    });
+                    if !reloads_eax
+                        || matches!(divisor, REG_EAX | REG_EDX | REG_ESP)
                         || read_regs.contains(&REG_EAX)
                         || read_regs.contains(&REG_EDX)
                         || (stages_divisor && read_regs.contains(&divisor))
@@ -8816,6 +8828,9 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         i = div_idx + 1;
                         continue;
                     }
+                    // The divisor is read by DIV even when no staging move
+                    // mentions it; it must survive the intervening window.
+                    read_regs.push(divisor);
                     let staging_first = staging.last().map(|(p, _)| *p).unwrap_or(i);
                     sites.push(Site {
                         marker: i,
@@ -16274,6 +16289,12 @@ mod tests {
             &valid.replace("movl %esi, %eax", "movl (%ebx), %eax")
         ));
         assert!(!apply(&valid.replace("ret\n", "setne %bl\nret\n")));
+        assert!(!apply(&valid.replace(
+            "movl %edx, %edi",
+            "movl %edx, %edi\nmovl %ebx, %ecx"
+        )));
+        assert!(!apply(&valid.replace("movl %esi, %eax", "movl %esi, %ecx")));
+        assert!(!apply(&valid.replace("movl %esi, %eax", "movw 4(%esp), %ax")));
         let stack = valid
             .replace("movl %esi, %eax", "movl 4(%esp), %eax")
             .replace("movl %edx, %edi", "movl %edx, %edi\nmovl %ebx, 4(%ebp)");
