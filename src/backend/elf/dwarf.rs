@@ -3016,7 +3016,11 @@ mod tests {
             .collect();
         assert_eq!(
             string_relocs,
-            [(21, 0), (53, 10)],
+            [(21, 0), (46, 10)],
+            // `helper` returns nothing, so its `DW_AT_type` is a ULEB128
+            // reference to the unit's one-byte `void` DIE instead of a
+            // relocation-sized address: the name that follows sits seven bytes
+            // earlier than it would otherwise.
             "producer then function name: {relocs:?}"
         );
 
@@ -3136,34 +3140,30 @@ mod tests {
                 at += 2;
             }
             let header_length = read_u32(data, &mut at) as usize;
-            let expected = match version {
-                2..=4 => fixed[version as usize - 2].1 + tables[version as usize - 2].1,
-                _ => fixed[3].1 + v5_tables,
+            // The line program's dialect has a floor of 3 (`-gdwarf-2` units get
+            // a version 3 table, as gcc's do), so a version 2 unit's prologue is
+            // byte for byte a version 3 unit's.
+            let line_version = std::cmp::max(version, 3);
+            let expected = match line_version {
+                4 => fixed[2].1 + tables[2].1,
+                5 => fixed[3].1 + v5_tables,
+                _ => fixed[1].1 + tables[1].1,
             };
             assert_eq!(header_length, expected, "version {version} prologue");
             // After `minimum_instruction_length` come `default_is_stmt`,
             // `line_base`, `line_range` and `opcode_base`; DWARF 4 inserted
             // `maximum_operations_per_instruction` before `default_is_stmt`.
             assert_eq!(data[at], 1, "minimum_instruction_length");
-            let extra = usize::from(version >= 4);
+            let extra = usize::from(line_version >= 4);
             assert_eq!(data[at + 1 + extra], 1, "default_is_stmt");
             let table = at + 5 + extra;
-            if version >= 3 {
-                assert_eq!(data[table - 1], 13, "opcode_base");
-                assert_eq!(
-                    &data[table..table + 12],
-                    &STANDARD_OPCODE_LENGTHS,
-                    "version {version} standard opcode table"
-                );
-            } else {
-                assert_eq!(data[table - 1], 10, "version 2 opcode_base");
-                assert_eq!(
-                    &data[table..table + 9],
-                    &STANDARD_OPCODE_LENGTHS[..9],
-                    "DWARF 2 has nine standard opcodes"
-                );
-            }
-            if version >= 4 {
+            assert_eq!(data[table - 1], 13, "opcode_base");
+            assert_eq!(
+                &data[table..table + 12],
+                &STANDARD_OPCODE_LENGTHS,
+                "version {line_version} standard opcode table"
+            );
+            if line_version >= 4 {
                 assert_eq!(data[at + 1], 1, "maximum_operations_per_instruction");
                 assert_eq!(data[at + 2], 1, "default_is_stmt");
             } else {
