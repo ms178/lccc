@@ -207,3 +207,11 @@ boot checkpoint: no code-size or runtime improvement is claimed. Full kernel
 link, objtool and QEMU boot are still not established for this working tree.
 The six remaining warning families and outstanding optimization options remain
 acceptance requirements; this checkpoint is not task completion.
+
+Latest-main integration: main `68bc225c0` is incorporated. The merged tree
+repassed the 7,696 library tests, warning-denied all-target Clippy, all three
+new differential gates, and the unchanged 31,024-byte boot gate. Main's narrow
+count runtime gate is preserved and passed ten AArch64/RISC-V QEMU-user
+executions; its independent non-kernel checksum also passed with Clang 23.1.4.
+These QEMU-user executions are not a kernel/QEMU-system boot. A fresh full
+LCCC kernel build has been started; its result is pending.
