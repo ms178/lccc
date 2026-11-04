@@ -602,6 +602,8 @@ jobs:
       run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 GCC=gcc-16 bash tests/regression/check_computed_goto_labels.sh
     - name: Type-attribute scope and static-init address constants on both ABIs
       run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 GCC=gcc-16 bash tests/regression/check_type_attr_and_static_init.sh
+    - name: GCC 16.2 inline-asm constraint grammar on both ABIs
+      run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 GCC=gcc-16 bash tests/regression/check_gcc_asm_constraints.sh
     - name: Store-forwarding DWORD self-reload contracts
       run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 bash tests/regression/check_store_forwarding_dword_reload.sh
     - name: Conditional value carriers for decimal, _Float16 and complex arms

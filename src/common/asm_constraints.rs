@@ -59,6 +59,11 @@ pub fn named_matching_names(constraint: &str) -> Result<Option<Vec<&str>>, Named
 /// Named operand references like "[name]" are not immediate constraints.
 pub fn constraint_is_immediate_only(constraint: &str) -> bool {
     let stripped = constraint.trim_start_matches(['=', '+', '&', '%']);
+    // Everything after GCC's `#` marker is a constraint comment: it is ignored
+    // for choosing an alternative, so its letters must not reclassify the
+    // operand (`"i#*X"` stays an immediate-only operand, `"r#m"` stays a
+    // register operand).
+    let stripped = stripped.split('#').next().unwrap_or(stripped);
     if stripped.is_empty() {
         return false;
     }
@@ -72,7 +77,7 @@ pub fn constraint_is_immediate_only(constraint: &str) -> bool {
     let has_imm = stripped.chars().any(|c| {
         matches!(
             c,
-            'i' | 'I' | 'n' | 'N' | 'e' | 'E' | 'K' | 'M' | 'G' | 'H' | 'J' | 'L' | 'O'
+            'i' | 'I' | 'n' | 'N' | 'e' | 'E' | 'K' | 'M' | 'G' | 'H' | 'J' | 'L' | 'O' | 's'
         )
     });
     if !has_imm {
