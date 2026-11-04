@@ -1,0 +1,35 @@
+{
+  "run": 41812128042,
+  "job": 126515336537,
+  "artifact": 13313650379,
+  "blob": "507ba1c65c4a379ffdb83a8bec5887cbea761fdb",
+  "zip_sha256": "270be67b3d04981fa0a0aaee38126ace424b50b3c06c458503c7a69554bc2326",
+  "matrix_rows": 1860,
+  "failed_records": [
+    {
+      "target": "x86_64",
+      "opt": "-O0",
+      "case": "(void)__builtin_constant_p(({ return 99; 0; }));",
+      "compiler": "icx",
+      "passed": false,
+      "build_rc": 0,
+      "semantic_run_rc": 0,
+      "reference_run_rc": 0,
+      "reference_disagreement": false,
+      "run_rc": 1
+    },
+    {
+      "target": "x86_64",
+      "opt": "-O2",
+      "case": "(void)__builtin_constant_p(({ return 99; 0; }));",
+      "compiler": "icx",
+      "passed": false,
+      "build_rc": 0,
+      "semantic_run_rc": 0,
+      "reference_run_rc": 0,
+      "reference_disagreement": false,
+      "run_rc": 1
+    }
+  ],
+  "interpretation": "Measured predicate exit=1; no inference of subject return value or unrecorded stdout/stderr."
+}

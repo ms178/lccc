@@ -1,0 +1,110 @@
+[
+  {
+    "case": "outer_break",
+    "compiler": "lccc",
+    "rc": 0,
+    "stderr": "/tmp/tmp5omwfhmn/p.c:1:1: warning: control reaches end of non-void function [-Wreturn-type]\n int subject(void){outer: while(1) { while(1) { break outer; } }}\n ^~~\n"
+  },
+  {
+    "case": "outer_break",
+    "compiler": "gcc",
+    "rc": 0,
+    "stderr": "/tmp/tmp5omwfhmn/p.c: In function 'subject':\n/tmp/tmp5omwfhmn/p.c:1:64: warning: control reaches end of non-void function [-Wreturn-type]\n    1 | int subject(void){outer: while(1) { while(1) { break outer; } }}\n      |                                                                ^\n"
+  },
+  {
+    "case": "outer_break",
+    "compiler": "clang",
+    "rc": 0,
+    "stderr": ""
+  },
+  {
+    "case": "outer_continue",
+    "compiler": "lccc",
+    "rc": 0,
+    "stderr": "/tmp/tmp5omwfhmn/p.c:1:1: warning: control reaches end of non-void function [-Wreturn-type]\n int subject(void){outer: do { while(1) { continue outer; } } while(0);}\n ^~~\n"
+  },
+  {
+    "case": "outer_continue",
+    "compiler": "gcc",
+    "rc": 0,
+    "stderr": "/tmp/tmp5omwfhmn/p.c: In function 'subject':\n/tmp/tmp5omwfhmn/p.c:1:71: warning: control reaches end of non-void function [-Wreturn-type]\n    1 | int subject(void){outer: do { while(1) { continue outer; } } while(0);}\n      |                                                                       ^\n"
+  },
+  {
+    "case": "outer_continue",
+    "compiler": "clang",
+    "rc": 0,
+    "stderr": ""
+  },
+  {
+    "case": "named_inner_break",
+    "compiler": "lccc",
+    "rc": 0,
+    "stderr": ""
+  },
+  {
+    "case": "named_inner_break",
+    "compiler": "gcc",
+    "rc": 0,
+    "stderr": ""
+  },
+  {
+    "case": "named_inner_break",
+    "compiler": "clang",
+    "rc": 0,
+    "stderr": ""
+  },
+  {
+    "case": "named_for_break",
+    "compiler": "lccc",
+    "rc": 0,
+    "stderr": "/tmp/tmp5omwfhmn/p.c:1:1: warning: control reaches end of non-void function [-Wreturn-type]\n int subject(void){outer: for(;;) { while(1) { break outer; } }}\n ^~~\n"
+  },
+  {
+    "case": "named_for_break",
+    "compiler": "gcc",
+    "rc": 0,
+    "stderr": "/tmp/tmp5omwfhmn/p.c: In function 'subject':\n/tmp/tmp5omwfhmn/p.c:1:63: warning: control reaches end of non-void function [-Wreturn-type]\n    1 | int subject(void){outer: for(;;) { while(1) { break outer; } }}\n      |                                                               ^\n"
+  },
+  {
+    "case": "named_for_break",
+    "compiler": "clang",
+    "rc": 0,
+    "stderr": ""
+  },
+  {
+    "case": "named_switch_break",
+    "compiler": "lccc",
+    "rc": 0,
+    "stderr": "/tmp/tmp5omwfhmn/p.c:1:1: warning: control reaches end of non-void function [-Wreturn-type]\n int subject(void){outer: switch(0) { default: while(1) { break outer; } }}\n ^~~\n"
+  },
+  {
+    "case": "named_switch_break",
+    "compiler": "gcc",
+    "rc": 0,
+    "stderr": "/tmp/tmp5omwfhmn/p.c: In function 'subject':\n/tmp/tmp5omwfhmn/p.c:1:74: warning: control reaches end of non-void function [-Wreturn-type]\n    1 | int subject(void){outer: switch(0) { default: while(1) { break outer; } }}\n      |                                                                          ^\n"
+  },
+  {
+    "case": "named_switch_break",
+    "compiler": "clang",
+    "rc": -11,
+    "stderr": "/tmp/tmp5omwfhmn/p.c:1:74: warning: non-void function does not return a value [-Wreturn-type]\n    1 | int subject(void){outer: switch(0) { default: while(1) { break outer; } }}\n      |                                                                          ^\nPLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace and dumped files.\nStack dump:\n0.\tProgram arguments: /home/user/.cache/lccc/toolchains/clang-23.1.4/bin/clang-23 -std=gnu2y -O0 -Wreturn-type -S /tmp/tmp5omwfhmn/p.c -o /dev/null\n1.\t<eof> parser at end of file\n2.\t/tmp/tmp5omwfhmn/p.c:1:5: LLVM IR generation of declaration 'subject'\n3.\t/tmp/tmp5omwfhmn/p.c:1:5: Generating code for declaration 'subject'\n4.\t/tmp/tmp5omwfhmn/p.c:1:56: LLVM IR generation of compound statement ('{}')\nStack dump without symbol names (ensure you have llvm-symbolizer in your PATH or set the environment var `LLVM_SYMBOLIZER_PATH` to point to it):\n0  clang-23  0x000055e88a8251ba llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) + 42\n1  clang-23  0x000055e88a824f85 llvm::sys::CleanupOnSignal(unsigned long) + 197\n2  clang-23  0x000055e88a7d3a5e\n3  clang-23  0x000055e88a7d3c3e\n4  libc.so.6 0x00007f284e25a050\n5  clang-23  0x000055e88eaeab8d\n6  clang-23  0x000055e88db707a1 clang::CodeGen::CodeGenFunction::EmitStmt(clang::Stmt const*, llvm::ArrayRef<clang::Attr const*>) + 907\n7  clang-23  0x000055e88db68f4d clang::CodeGen::CodeGenFunction::EmitWhileStmt(clang::WhileStmt const&, llvm::ArrayRef<clang::Attr const*>) + 1533\n8  clang-23  0x000055e88edff0c2\n9  clang-23  0x000055e88d4bcf8f clang::CodeGen::CodeGenFunction::GenerateCode(clang::GlobalDecl, llvm::Function*, clang::CodeGen::CGFunctionInfo const&) + 3959\n10 clang-23  0x000055e88d4ac1d2 clang::CodeGen::CodeGenModule::EmitGlobalFunctionDefinition(clang::GlobalDecl, llvm::GlobalValue*) + 466\n11 clang-23  0x000055e88d4ab563 clang::CodeGen::CodeGenModule::EmitGlobalDefinition(clang::GlobalDecl, llvm::GlobalValue*) + 3937\n12 clang-23  0x000055e88d3580c0 clang::CodeGen::CodeGenModule::EmitTopLevelDecl(clang::Decl*) + 16738\n13 clang-23  0x000055e88d353e38\n14 clang-23  0x000055e88d353d74 clang::BackendConsumer::HandleTopLevelDecl(clang::DeclGroupRef) + 180\n15 clang-23  0x000055e88d5a0844 clang::ParseAST(clang::Sema&, bool, bool) + 900\n16 clang-23  0x000055e88e1e821d clang::FrontendAction::Execute() + 29\n17 clang-23  0x000055e88dee9a64 clang::CompilerInstance::ExecuteAction(clang::FrontendAction&) + 356\n18 clang-23  0x000055e88dee9845 clang::ExecuteCompilerInvocation(clang::CompilerInstance*) + 197\n19 clang-23  0x000055e88deeb6a0 cc1_main(llvm::ArrayRef<char const*>, char const*, void*) + 2504\n20 clang-23  0x000055e88def044c\n21 clang-23  0x000055e88def0326\n22 clang-23  0x000055e88def02d9\n23 clang-23  0x000055e88def0294 llvm::CrashRecoveryContext::RunSafely(llvm::function_ref<void ()>) + 122\n24 clang-23  0x000055e88def015f clang::driver::CC1Command::Execute(llvm::ArrayRef<std::optional<llvm::StringRef>>, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>*, bool*) const + 287\n25 clang-23  0x000055e88deeff72 clang::driver::Compilation::ExecuteCommand(clang::driver::Command const&, clang::driver::Command const*&, bool) const + 154\n26 clang-23  0x000055e88deefdf9 clang::driver::Compilation::ExecuteJobs(clang::driver::JobList const&, llvm::SmallVectorImpl<std::pair<int, clang::driver::Command const*>>&, bool) const + 289\n27 clang-23  0x000055e88deef9a9 clang::driver::Driver::ExecuteCompilation(clang::driver::Compilation&, llvm::SmallVectorImpl<std::pair<int, clang::driver::Command const*>>&) + 169\n28 clang-23  0x000055e88deedb51 clang_main(int, char**, llvm::ToolContext const&) + 2897\n29 clang-23  0x000055e88deecfd8 main + 88\n30 libc.so.6 0x00007f284e24524a\n31 libc.so.6 0x00007f284e245305 __libc_start_main + 133\n32 clang-23  0x000055e88dca50f3 _start + 37\nclang-23: error: clang frontend command failed due to signal (use -v to see invocation)\nclang version 23.1.4 (https://github.com/llvm/llvm-project 7a941dfb2877a0b8cf30323fefa85ad019e0b0f5)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /home/user/.cache/lccc/toolchains/clang-23.1.4/bin\nclang-23: note: diagnostic msg: \n********************\n\nPLEASE ATTACH THE FOLLOWING CRASH REPRODUCER FILES TO THE BUG REPORT:\nclang-23: note: diagnostic msg: /tmp/p-e58b57.c\nclang-23: note: diagnostic msg: /tmp/p-e58b57.sh\nclang-23: note: diagnostic msg: \n\n********************\n"
+  },
+  {
+    "case": "init_switch_break",
+    "compiler": "lccc",
+    "rc": 0,
+    "stderr": "/tmp/tmp5omwfhmn/p.c:1:1: warning: control reaches end of non-void function [-Wreturn-type]\n int subject(void){outer: switch(int i=0; i) { default: while(1) { break outer; } }}\n ^~~\n"
+  },
+  {
+    "case": "init_switch_break",
+    "compiler": "gcc",
+    "rc": 0,
+    "stderr": "/tmp/tmp5omwfhmn/p.c: In function 'subject':\n/tmp/tmp5omwfhmn/p.c:1:83: warning: control reaches end of non-void function [-Wreturn-type]\n    1 | int subject(void){outer: switch(int i=0; i) { default: while(1) { break outer; } }}\n      |                                                                                   ^\n"
+  },
+  {
+    "case": "init_switch_break",
+    "compiler": "clang",
+    "rc": 1,
+    "stderr": "/tmp/tmp5omwfhmn/p.c:1:33: error: expected expression\n    1 | int subject(void){outer: switch(int i=0; i) { default: while(1) { break outer; } }}\n      |                                 ^\n/tmp/tmp5omwfhmn/p.c:1:42: error: use of undeclared identifier 'i'\n    1 | int subject(void){outer: switch(int i=0; i) { default: while(1) { break outer; } }}\n      |                                          ^\n2 errors generated.\n"
+  }
+]

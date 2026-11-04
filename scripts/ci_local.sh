@@ -1409,6 +1409,12 @@ gate "repro-replay" fast \
 gate "scoped-noreturn-diagnostics" fast \
     bash tests/regression/check_scoped_noreturn_diagnostics.sh
 
+# The same typed-condition matrix runs in the authenticated vendor CI lane.
+# The script checks exact oracle versions and uses ICX when explicitly supplied.
+gate "typed-constant-truth" fast \
+    python3 tests/regression/check_constant_truth_diagnostics.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" --clang "${CLANG23:-clang-23}"
+
 # `lccc -S -o - x.c` used to create a file literally named `-`, silently
 # dropping the assembly from any pipeline's point of view.  GCC 14.2 pins the
 # contract cell by cell (the table lives in the gate): -S/-E stream to stdout
