@@ -361,3 +361,35 @@ applies to the unchanged compiler source; the transport's nine tests and matrix
 contract's ten tests pass with Python warnings treated as errors. The API-order
 mutation is killed too. Main 5a3b2087c remains an ancestor. No production-readiness,
 measured performance or all-warning-family completion claim follows from this.
+
+## Confirmed shadowed-record selection defect fixed
+
+Further audit found a genuine LCCC defect beyond the CI reference discrepancies:
+`_Generic` association resolution was repeated after an inner struct/union tag
+scope disappeared. The controlling expression retained its inner CType while
+the association name resolved to the outer tag. Three selected-arm cases warned
+spuriously; the reverse case missed a required warning. Pointer-to-record
+associations were affected too. GCC16.2 and Clang23.1.4 agree on all four cases.
+
+Before: expanded **1770 observations / 32 LCCC semantic failures** over four
+LCCC targets at O0/O2. After: **1770 / zero LCCC failures**, zero unexpected
+observations; the existing 18 reference semantic failures remain explicitly
+reported. Two native shadowed-tag controls retain the enclosing value 7; these
+already passed before, so no native miscompile fix is claimed.
+
+Choice: cache the type checker's selected index while its lexical scope is live,
+not a second tag-name resolver or a retained scope environment. Explicit None
+is kept distinct from a cache miss. The index lookup reuses the current AST
+ExprId invariant; facts survive nested-function analysis and are cleared with
+capacity retained at the file-scope function boundary. Storage is bounded by the
+largest function tree's selections, not accumulated over the translation unit.
+This is a diagnostic correctness fix, not an instruction-selection speedup.
+
+Seven new library assertions cover struct, union, pointer-to-record, inverse
+selection, local-only controls and a nested-function arm. **7898 library tests
+passed / 10 ignored**, all-target Clippy -D warnings, fastbuild, formatting,
+31 scoped-noreturn checks, parity and the unchanged audit ratchet passed. The
+expanded matrix includes 78 native compile/execute checks. Raw before/after
+reports and baseline compiler identities are retained. A subsequent audit also
+reproduced missed warnings for function-pointer objects named abort/exit; that
+separate binding defect still needs its own repair before final validation.

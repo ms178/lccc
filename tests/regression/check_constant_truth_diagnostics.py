@@ -100,6 +100,22 @@ CASES.update({
         "extern int unknown; extern void consume(int); "
         "consume(({ if (unknown) return 7; 0; }));", 1
     ),
+    "generic_shadowed_struct_selected": (
+        "struct S {int x;}; {struct S {long x;}; struct S s; "
+        "(void)_Generic(s, struct S: ({return 7; 0;}), default:1);}", 0
+    ),
+    "generic_shadowed_struct_pointer_selected": (
+        "struct S {int x;}; {struct S {long x;}; struct S *s=0; "
+        "(void)_Generic(s, struct S*: ({return 7; 0;}), default:1);}", 0
+    ),
+    "generic_shadowed_struct_unselected": (
+        "struct S {int x;}; {struct S {long x;}; struct S s; "
+        "(void)_Generic(s, struct S:1, default:({return 7; 0;}));}", 1
+    ),
+    "generic_shadowed_union_selected": (
+        "union S {int x;}; {union S {long x;}; union S s; "
+        "(void)_Generic(s, union S: ({return 7; 0;}), default:1);}", 0
+    ),
     "generic_scoped_typedef_selected": (
         "{ typedef long Local; extern long value; "
         "(void)_Generic(value, Local: ({ return 7; 0; }), default: 1); }", 0
@@ -278,7 +294,11 @@ def main():
                         "goto value; value:;",
                         "do { switch (0) { default: continue; } } while (0);",
                         "(void)__builtin_constant_p(({ return 99; 0; }));",
-                        "(void)__builtin_classify_type(({ return 99; 0; }));"):
+                        "(void)__builtin_classify_type(({ return 99; 0; }));",
+                        "struct S {int x;}; {struct S {long x;}; struct S s; "
+                        "(void)_Generic(s, struct S:1, default:({return 99;0;}));}",
+                        "union S {int x;}; {union S {long x;}; union S s; "
+                        "(void)_Generic(s, union S:1, default:({return 99;0;}));}"):
             source.write_text("int subject(void) { return ({ " + control +
                               " 7; }); } int main(void) { return subject() != 7; }\n")
             for opt in ("-O0", "-O2"):

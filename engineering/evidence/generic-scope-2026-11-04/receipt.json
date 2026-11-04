@@ -1,0 +1,1630 @@
+{
+  "schema": 1,
+  "scope": "Diagnostic correctness, not a claimed native miscompile or performance fix",
+  "reports": {
+    "before": {
+      "workspace_report": "/home/user/generic-scope-before.json",
+      "sha256": "cef04645e700158069e8412b57aaf8902889b873e5c264c7288a51c9ecedec79",
+      "observations": 1770,
+      "semantic_failures": {
+        "lccc": 32,
+        "references": 18
+      },
+      "unexpected_observations": 32,
+      "new_case_observations": [
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "x86_64",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "x86_64",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "x86_64",
+          "opt": "-O0",
+          "compiler": "gcc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "x86_64",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "x86_64",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "x86_64",
+          "opt": "-O0",
+          "compiler": "gcc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "x86_64",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 1,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "x86_64",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "x86_64",
+          "opt": "-O0",
+          "compiler": "gcc",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "x86_64",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "x86_64",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "x86_64",
+          "opt": "-O0",
+          "compiler": "gcc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "x86_64",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "x86_64",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "x86_64",
+          "opt": "-O2",
+          "compiler": "gcc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "x86_64",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "x86_64",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "x86_64",
+          "opt": "-O2",
+          "compiler": "gcc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "x86_64",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 1,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "x86_64",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "x86_64",
+          "opt": "-O2",
+          "compiler": "gcc",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "x86_64",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "x86_64",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "x86_64",
+          "opt": "-O2",
+          "compiler": "gcc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "i686",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "i686",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "i686",
+          "opt": "-O0",
+          "compiler": "gcc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "i686",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "i686",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "i686",
+          "opt": "-O0",
+          "compiler": "gcc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "i686",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 1,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "i686",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "i686",
+          "opt": "-O0",
+          "compiler": "gcc",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "i686",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "i686",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "i686",
+          "opt": "-O0",
+          "compiler": "gcc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "i686",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "i686",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "i686",
+          "opt": "-O2",
+          "compiler": "gcc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "i686",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "i686",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "i686",
+          "opt": "-O2",
+          "compiler": "gcc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "i686",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 1,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "i686",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "i686",
+          "opt": "-O2",
+          "compiler": "gcc",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "i686",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "i686",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "i686",
+          "opt": "-O2",
+          "compiler": "gcc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "aarch64",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "aarch64",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "aarch64",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "aarch64",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "aarch64",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 1,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "aarch64",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "aarch64",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "aarch64",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "aarch64",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "aarch64",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "aarch64",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "aarch64",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "aarch64",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 1,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "aarch64",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "aarch64",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "aarch64",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "riscv64",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "riscv64",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "riscv64",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "riscv64",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "riscv64",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 1,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "riscv64",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "riscv64",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "riscv64",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "riscv64",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "riscv64",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "riscv64",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "riscv64",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "riscv64",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 1,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "riscv64",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "riscv64",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": false
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "riscv64",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        }
+      ]
+    },
+    "after": {
+      "workspace_report": "/home/user/generic-scope-after.json",
+      "sha256": "5d1eba4b2d1b7fcc7f1bd29a6c8248293cfde23cb02c096e75ff50aaf97c5e79",
+      "observations": 1770,
+      "semantic_failures": {
+        "lccc": 0,
+        "references": 18
+      },
+      "unexpected_observations": 0,
+      "new_case_observations": [
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "x86_64",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "x86_64",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "x86_64",
+          "opt": "-O0",
+          "compiler": "gcc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "x86_64",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "x86_64",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "x86_64",
+          "opt": "-O0",
+          "compiler": "gcc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "x86_64",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "x86_64",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "x86_64",
+          "opt": "-O0",
+          "compiler": "gcc",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "x86_64",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "x86_64",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "x86_64",
+          "opt": "-O0",
+          "compiler": "gcc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "x86_64",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "x86_64",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "x86_64",
+          "opt": "-O2",
+          "compiler": "gcc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "x86_64",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "x86_64",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "x86_64",
+          "opt": "-O2",
+          "compiler": "gcc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "x86_64",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "x86_64",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "x86_64",
+          "opt": "-O2",
+          "compiler": "gcc",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "x86_64",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "x86_64",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "x86_64",
+          "opt": "-O2",
+          "compiler": "gcc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "i686",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "i686",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "i686",
+          "opt": "-O0",
+          "compiler": "gcc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "i686",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "i686",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "i686",
+          "opt": "-O0",
+          "compiler": "gcc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "i686",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "i686",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "i686",
+          "opt": "-O0",
+          "compiler": "gcc",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "i686",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "i686",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "i686",
+          "opt": "-O0",
+          "compiler": "gcc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "i686",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "i686",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "i686",
+          "opt": "-O2",
+          "compiler": "gcc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "i686",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "i686",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "i686",
+          "opt": "-O2",
+          "compiler": "gcc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "i686",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "i686",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "i686",
+          "opt": "-O2",
+          "compiler": "gcc",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "i686",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "i686",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "i686",
+          "opt": "-O2",
+          "compiler": "gcc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "aarch64",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "aarch64",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "aarch64",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "aarch64",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "aarch64",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "aarch64",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "aarch64",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "aarch64",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "aarch64",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "aarch64",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "aarch64",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "aarch64",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "aarch64",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "aarch64",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "aarch64",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "aarch64",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "riscv64",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "riscv64",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "riscv64",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "riscv64",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "riscv64",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "riscv64",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "riscv64",
+          "opt": "-O0",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "riscv64",
+          "opt": "-O0",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "riscv64",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_selected",
+          "target": "riscv64",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "riscv64",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_pointer_selected",
+          "target": "riscv64",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "riscv64",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_struct_unselected",
+          "target": "riscv64",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 1,
+          "actual": 1,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "riscv64",
+          "opt": "-O2",
+          "compiler": "lccc",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        },
+        {
+          "case": "generic_shadowed_union_selected",
+          "target": "riscv64",
+          "opt": "-O2",
+          "compiler": "clang",
+          "expected": 0,
+          "actual": 0,
+          "rc": 0,
+          "semantic_passed": true
+        }
+      ]
+    }
+  }
+}

@@ -291,9 +291,17 @@ impl<'a, 's> Graph<'a, 's> {
                 // The controlling expression is unevaluated; only the
                 // association selected by the same type checker used by sema
                 // contributes run-time control flow. Never visit all arms.
+                // Association type names can refer to an inner record tag
+                // that has already been popped at whole-body flow time.
                 self.sema
-                    .expr_type_checker()
-                    .generic_selection_index(controlling, associations)
+                    .generic_selections
+                    .get(&expr.id())
+                    .copied()
+                    .unwrap_or_else(|| {
+                        self.sema
+                            .expr_type_checker()
+                            .generic_selection_index(controlling, associations)
+                    })
                     .and_then(|index| associations.get(index))
                     .map_or(next, |association| self.expr(&association.expr, next))
             }

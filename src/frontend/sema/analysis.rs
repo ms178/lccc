@@ -252,6 +252,9 @@ pub struct SemanticAnalyzer {
     /// `None` is recorded too: an unknown local must not later resolve to an
     /// outer enumerator after its scope has been unwound.
     condition_truth: FxHashMap<ExprId, Option<bool>>,
+    /// Association indices resolved before a _Generic's tag/typedef scope
+    /// disappears. None records an unresolved selection, not a cache miss.
+    generic_selections: FxHashMap<ExprId, Option<usize>>,
     /// Stack of enclosing function definition names for nested functions.
     /// Entry i is the name of the function containing the body currently
     /// being analyzed; the LAST entry is the innermost (possibly nested)
@@ -338,6 +341,7 @@ impl SemanticAnalyzer {
             typeof_seen: RefCell::new(FxHashSet::default()),
             current_return_type: None,
             condition_truth: FxHashMap::default(),
+            generic_selections: FxHashMap::default(),
             function_nesting_stack: Vec::new(),
             prior_file_function_decls: FxHashMap::default(),
             no_builtins: false,
@@ -531,6 +535,7 @@ impl SemanticAnalyzer {
         // the parent's fact lifetime. Reuse capacity at the file-scope boundary
         // instead of retaining every condition in the translation unit.
         self.condition_truth.clear();
+        self.generic_selections.clear();
     }
 
     /// Analyze a GNU C nested function definition (block scope).
@@ -3859,6 +3864,10 @@ impl SemanticAnalyzer {
                     self.analyze_expr(&assoc.expr);
                 }
                 self.check_generic_selection(controlling, associations);
+                let selected = self
+                    .expr_type_checker()
+                    .generic_selection_index(controlling, associations);
+                self.generic_selections.insert(expr.id(), selected);
             }
             // Literals don't need analysis
             Expr::IntLiteral(_, _)
@@ -12529,6 +12538,42 @@ mod builtin_return_flow_tests {
             "(void)__builtin_longjmp(block, 1);",
         ] {
             assert_eq!(warnings(body), 0, "{body}");
+        }
+    }
+
+    #[test]
+    fn generic_selection_retains_shadowed_record_identity() {
+        for (body, expected) in [
+            (
+                "struct S {int x;}; {struct S {long x;}; struct S s; (void)_Generic(s, struct S: ({return 7;0;}), default:1);}",
+                0,
+            ),
+            (
+                "struct S {int x;}; {struct S {long x;}; struct S *s=0; (void)_Generic(s, struct S*: ({return 7;0;}), default:1);}",
+                0,
+            ),
+            (
+                "struct S {int x;}; {struct S {long x;}; struct S s; (void)_Generic(s, struct S:1, default:({return 7;0;}));}",
+                1,
+            ),
+            (
+                "union S {int x;}; {union S {long x;}; union S s; (void)_Generic(s, union S: ({return 7;0;}), default:1);}",
+                0,
+            ),
+            (
+                "{struct S {long x;}; struct S s; (void)_Generic(s, struct S: ({return 7;0;}), default:1);}",
+                0,
+            ),
+            (
+                "{struct S {long x;}; struct S s; (void)_Generic(s, struct S:1, default:({return 7;0;}));}",
+                1,
+            ),
+            (
+                "struct S {int x;}; {struct S {long x;}; struct S s; (void)_Generic(s, struct S: ({int nested(void){return 7;} return nested(); 0;}), default:1);}",
+                0,
+            ),
+        ] {
+            assert_eq!(warnings(body), expected, "{body}");
         }
     }
 
