@@ -1060,6 +1060,9 @@ gate "dwarf-line-tables" fast \
     python3 tests/regression/check_dwarf_line_tables.py \
         --lccc "$LCCC" --lccc-i686 target/fastbuild/lccc-i686 \
         --gcc "${GCC16:-gcc-16}"
+gate "dwarf-die-census" fast \
+    python3 tests/regression/check_dwarf_die_census.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
 gate "dwarf-decl-positions" fast \
     python3 tests/regression/check_dwarf_decl_positions.py \
         --lccc "$LCCC" --lccc-i686 target/fastbuild/lccc-i686 \

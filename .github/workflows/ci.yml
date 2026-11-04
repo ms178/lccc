@@ -3166,6 +3166,10 @@ jobs:
         # statement on a shared source line, and the prologue_end /
         # epilogue_begin markers -- on all four targets and all four versions.
         python3 tests/regression/check_dwarf_decl_positions.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv
+        # The DIE vocabulary: what a unit and its subprograms state, and every
+        # tag and attribute the reference compilers state that LCCC does not --
+        # each of which must be declared below with the reason it is absent.
+        python3 tests/regression/check_dwarf_die_census.py --lccc target/fastbuild/lccc --gcc gcc-16
         python3 tests/regression/check_dwarf_versions.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv --gcc gcc-16
         bash tests/regression/check_pointer_ring_indexing.sh
         bash tests/regression/check_copy_alias_sizes.sh

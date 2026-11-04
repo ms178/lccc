@@ -139,12 +139,30 @@ offset (RISC-V linker relaxation deletes bytes after assembly).
 ## Scope and limits
 
 - LCCC emits line tables, compile and subprogram units with their declaration
-  locations, and the address map (`.debug_aranges`). It does not yet emit variable DIEs, type DIEs (`DW_TAG_base_type`,
-  composite types, `DW_AT_data_member_location`) or inline-call DIEs, so a
-  debugger can break at `file:line` and name a frame, but cannot print a local's
-  type. Type information lives in the frontend, and the DWARF writer is fed by
-  assembler records: closing this gap needs a `.debug` record vocabulary in the
-  lowering, not a wider assembler emitter.
+  locations, ranges, return type and frame base, and the address map
+  (`.debug_aranges`). It does not yet emit variable DIEs, type DIEs
+  (`DW_TAG_base_type`, composite types, `DW_AT_data_member_location`) or
+  inline-call DIEs, so a debugger can break at `file:line`, name a frame and
+  unwind it, but cannot print a local's type. Type information lives in the
+  frontend, and the DWARF writer is fed by assembler records: closing this gap
+  needs a `.debug` record vocabulary in the lowering, not a wider assembler
+  emitter.
+- The frame base a subprogram states is `DW_OP_call_frame_cfa`, one byte of
+  expression: the `.eh_frame` FDE the assembler already synthesizes defines the
+  CFA at every address, so the answer stays true where the frame pointer is
+  omitted. It is a version 3 opcode, and a version 2 unit states no frame base
+  rather than describing its prologue with an opcode it never defined (gcc 16.2
+  pays a `.debug_loc` list for the same information there, clang 23 writes a
+  bare `DW_OP_reg6` that stops being the frame base as soon as `rbp` is reused).
+  Measured on the same source at `-gdwarf-5`: gcc 16.2 writes
+  `DW_AT_frame_base : 1 byte block: 9c`, and so does LCCC.
+- `tests/regression/check_dwarf_die_census.py` measures the vocabulary both
+  ways: what a unit and its subprograms state (a ratchet -- losing any of it
+  fails), and every tag and attribute gcc 16.2 or clang 23.1.4 states that LCCC
+  does not, each of which must be listed there with the reason it is absent. A
+  new oracle-only tag or attribute fails the gate until it is implemented or
+  recorded, so the feature gap cannot grow silently and cannot be closed by
+  accident either.
 - Existing DWARF sections from GCC inputs are preserved and relocated on the
   link paths; this is not a claim of complete GNU ld compatibility.
 - `--strip-all` continues to omit debug sections on the executable paths.
