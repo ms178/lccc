@@ -202,3 +202,23 @@ was skipped. The API did not identify who or what cancelled it.
 All-13 completion, final-head local full kernel/real objtool/QEMU, zero kernel
 warnings, measured host-runtime/code-size gains and final green hosted CI remain
 **open acceptance gates**. This checkpoint must remain a draft.
+
+## Hosted kernel / QEMU validation update — 2026-11-04
+
+At PR head `8e881bb9e39c9e6fa62c6e58feb66b6f3dc3794e`, GitHub Actions
+run **41735943201** (kernel workflow run #45) completed successfully. The
+hosted job enabled the 4 GiB swap, built the fastbuild compiler and linker,
+prepared the pinned patched Linux 6.18.58 tree with LCCC, selected x86-64
+`defconfig`, passed the boot-first / 32 KiB gate, linked the complete
+`defconfig` `bzImage`, and completed the QEMU smoke test
+(`DEFCFG QEMU SMOKE PASS`). The workflow uploaded the kernel log, QEMU
+artifacts, setup ELF, `.config`, and preparation/build provenance.
+
+**Scope of this result:** full hosted kernel link and QEMU boot are now
+established for this exact PR head. This does **not** establish zero production
+diagnostics or completion of the remaining warning families/options. The
+compiler log still reports that `-Wimplicit-fallthrough=5` is tolerated but
+not implemented; this remains an option-semantics gap. The workflow's separate
+diagnostic-surfacing step was skipped, so no zero-warning claim is inferred
+from the green job. Local swap remains unavailable in the restricted sandbox;
+this was hosted-runner evidence, not a local reproduction.
