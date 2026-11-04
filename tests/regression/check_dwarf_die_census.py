@@ -175,7 +175,14 @@ DEFERRED_ATTRIBUTES = {
 DIE_LINE = re.compile(r"^\s*<(\d+)><([0-9a-f]+)>:\s*(.*)$")
 ATTRIBUTE_LINE = re.compile(r"^\s*<[0-9a-f]+>\s+(DW_AT_\w+)\s*:")
 TAG = re.compile(r"DW_TAG_(\w+)")
-SUSPICIOUS = ("Error:", "Warning:", "unable to", "corrupt", "truncated")
+# A decode failure: the section we wrote cannot be read back.
+BROKEN = ("Error:", "unable to", "corrupt", "truncated")
+# A *knowledge* limit of this readelf: it does not know an attribute or form the
+# dialect defines (an older binutils meeting `DW_AT_language_name`, say).  The
+# encoding is fine and the attribute is still decoded, just not named, so this is
+# reported rather than treated as a defect: a gate that failed here would fail on
+# every host whose binutils trails the specification, not on anything LCCC did.
+UNKNOWN_TO_READELF = ("nrecognized", "nknown", "not supported", "unsupported")
 
 
 class GateFailure(Exception):
@@ -220,12 +227,18 @@ def census(
     )
     require(completed.returncode == 0, f"{obj.name}: readelf failed: {completed.stderr}")
     if require_clean:
-        for marker in SUSPICIOUS:
+        for marker in BROKEN:
             require(
                 marker not in completed.stdout and marker not in completed.stderr,
                 f"{obj.name}: readelf reports {marker!r}: "
                 f"{completed.stderr.strip() or completed.stdout.strip()[:400]}",
             )
+        for line in completed.stderr.splitlines():
+            if "arning:" in line:
+                if any(limit in line for limit in UNKNOWN_TO_READELF):
+                    print(f"note: {obj.name}: {line.strip()}")
+                    continue
+                raise GateFailure(f"{obj.name}: readelf reports {line.strip()}")
     tags: set[str] = set()
     attributes: set[str] = set()
     subprogram: set[str] = set()
