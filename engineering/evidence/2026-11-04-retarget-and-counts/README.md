@@ -140,10 +140,44 @@ documentation-only; the numbers above were measured at `5117774`.
      ret
    ```
 
-   The frame exists only because of that copy, so a correct x0..x3 hint removes 7
-   of those 9 instructions across the whole AArch64 corpus (185 → ~90 on this
-   probe). It needs the 58 hard-coded `x0` uses in `arm/codegen` audited first:
-   each one is an implicit assumption that x0 is free.
+   The frame exists only because of that copy: if the parameter were homed in
+   `x0` the whole prologue, the `str`/`ldr` pair and both moves disappear
+   (9 → 2 instructions), which is where the 185 → ~90 estimate comes from.
+
+   **Scoped after the merge — the fix is emitter-side, not a hint row.** Adding
+   `Some(PhysReg(0..3))` to `collect_abi_reg_hints` cannot work on its own,
+   because AArch64 `x0` is *both* the first argument register and the emitter's
+   accumulator: `alu.rs` computes every unary result in place
+   (`clz w0, w0`, `mvn x0, x0`, `rev x0, x0`), `cast_ops.rs` sign/zero-extends
+   into `x0`, `comparison.rs` does `cset x0, <cond>`, `globals.rs` materialises
+   addresses in `x0`, and a fixup copies `x0` to the value's assigned home. Every
+   one of those sites assumes `x0` is free, so a value homed in `x0` would be
+   clobbered by the next such instruction (≈380 destination-first uses across
+   `alu.rs`, `emit.rs`, `cast_ops.rs`, `i128_ops.rs`, `variadic.rs`, `memory.rs`,
+   `globals.rs`, `intrinsics.rs`, `atomics.rs`, `f128.rs`, `nested_fn.rs`,
+   `calls.rs`, `comparison.rs`, `returns.rs`, `float_ops.rs`).
+
+   The RISC-V backend does not have this problem because its accumulator (`t0`)
+   is a scratch that is *never* an allocator home, while parameters are homed in
+   `a0`..`a7` — two disjoint register sets. AArch64 has one register doing both
+   jobs. The two options, in order of cost:
+
+   1. *Destination-aware emitters* (the real fix): make each `emit_int_*_impl`
+      take the destination register instead of naming `x0`, so a value homed in
+      `x0`..`x3` is computed in place and the fixup move disappears. This is the
+      same shape as the RISC-V retarget pass, moved from the peephole into the
+      emitter where the destination is actually known. It is a large, mechanical
+      but wide refactor and wants its own PR with the corpus as the oracle.
+   2. *Per-function scratch audit* (partial): `arm_pool_scratch` in
+      `prologue.rs` already returns the pool registers an emitter uses as
+      unmodelled scratch, with an allowlist of audited instruction kinds and
+      fail-closed behaviour for everything else. Extending that audit to
+      `x0`..`x3` would let a *narrow* class of functions (call-free, no
+      intrinsics, no atomics/varargs/i128/f128) admit `x0` as a home. Checks the
+      estimate before paying for (1), but only for that class.
+
+   Either way the 185 → ~90 figure is a property of the *emitters*, not of the
+   hint table; the earlier "58 hard-coded uses to audit" framing understated it.
 2. **i686 64-bit parameter/result staging** (`np2ll` 45 vs gcc 17, `shl64v` 25 vs
    10, `clz64` 22 vs 6): wide values are staged through frame slots even when the
    input pair arrives in `%eax:%edx` and leaves in `%eax`.
