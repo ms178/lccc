@@ -445,9 +445,6 @@ impl Lowerer {
         if crate::common::avx_widen::AvxWiden::raw_builtin(name).is_some() {
             return Some(IrType::Ptr);
         }
-        if let Some(ct) = crate::frontend::sema::builtins::gcc_compat_builtin_ctype(name) {
-            return Some(IrType::from_ctype(&ct));
-        }
         match name {
             // x86 vector scalar extractions with 64-bit results (long long /
             // unsigned long long). Without these the call was typed with the
@@ -737,7 +734,8 @@ impl Lowerer {
             | "__builtin_va_arg_pack"
             | "__builtin_va_arg_pack_len" => Some(IrType::I32),
             "__builtin_thread_pointer" => Some(IrType::Ptr),
-            _ => None,
+            _ => crate::frontend::sema::builtins::gcc_compat_builtin_ctype(name)
+                .map(|ct| IrType::from_ctype(&ct)),
         }
     }
 
