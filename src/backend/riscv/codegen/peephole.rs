@@ -3548,8 +3548,10 @@ mod tests {
     #[test]
     fn retarget_refuses_a_live_scratch() {
         // `t0` is read again, so the copy is the only definition of `a0`.
+        // The reader has to name `t0` in an operand slot: `addw t0, t6, t6`
+        // only overwrites it and therefore leaves it dead.
         let out =
-            run_retarget("f:\n    addw t0, t1, a1\n    mv a0, t0\n    addw t0, t6, t6\n    ret\n");
+            run_retarget("f:\n    addw t0, t1, a1\n    mv a0, t0\n    addw t6, t0, t0\n    ret\n");
         assert!(out.contains("mv a0, t0"), "{out}");
         assert!(out.contains("addw t0, t1, a1"), "{out}");
     }
@@ -3897,12 +3899,26 @@ mod jump_near_tests {
         assert!(!out.contains("sext.w t0, t0"), "\n{}", out);
     }
 
+    /// A `sext.w <dst>, <src>` line survives and still reads `src`.
+    ///
+    /// The accumulator retarget may move the destination of the sext into the
+    /// home it is copied to (`sext.w t0, t0` + `mv t1, t0` becomes
+    /// `sext.w t1, t0`), so these tests assert that the sext is still there and
+    /// still consumes the loaded value, not that its destination is `t0`.
+    fn sext_from(out: &str, src: &str) -> bool {
+        out.lines()
+            .any(|line| match line.trim().strip_prefix("sext.w ") {
+                Some(rest) => rest.split_once(", ").is_some_and(|(_dst, s)| s == src),
+                None => false,
+            })
+    }
+
     #[test]
     fn sext_self_form_kept_when_not_sext_wide() {
         // ld does NOT produce a sext-wide value; the sext.w must survive.
         let input = "f:\n    ld t0, 0(s0)\n    sext.w t0, t0\n    mv t1, t0\n    ret\n";
         let out = peephole_optimize(input.to_string());
-        assert!(out.contains("sext.w t0, t0"), "\n{}", out);
+        assert!(sext_from(&out, "t0"), "\n{}", out);
     }
 
     #[test]
@@ -3914,7 +3930,7 @@ mod jump_near_tests {
                 "f:\n    ld t0, 0(s0)\n    srai t0, t0, {k}\n    sext.w t0, t0\n    mv t1, t0\n    ret\n"
             );
             let out = peephole_optimize(input.clone());
-            assert!(out.contains("sext.w t0, t0"), "k={k}\n{out}");
+            assert!(sext_from(&out, "t0"), "k={k}\n{out}");
         }
     }
 

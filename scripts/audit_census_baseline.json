@@ -3,7 +3,7 @@
   "fns_over_300": 232,
   "fns_over_500": 97,
   "ignored_tests": 10,
-  "knob_literals": 560,
+  "knob_literals": 561,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -344,6 +344,7 @@
     "CCC_NO_RING_IDENTITIES",
     "CCC_NO_RISCV_CALLER_POOL",
     "CCC_NO_RORX",
+    "CCC_NO_RV_ACCUMULATOR_RETARGET",
     "CCC_NO_SAME_DST_RELOAD",
     "CCC_NO_SAVE_SET_COMPACT",
     "CCC_NO_SEGMENT_FILL",
