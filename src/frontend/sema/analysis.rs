@@ -10640,16 +10640,25 @@ dereference it before applying '->' to it?"
         // Resolved vector sizes are already `TypeSpecifier::Vector` nodes
         // (see Parser::apply_pending_vector_attr). A size that needed sema's
         // layout engine is resolved here and inserted at the same position.
-        let spec = match f
+        // Only the rare DEFERRED attribute needs an owned specifier. Every
+        // other field borrows `f.type_spec` directly: cloning it would
+        // deep-copy nested record definitions for every member of every
+        // struct on every compilation (a measurable host-CPU cost for
+        // kernel-sized headers), with no semantic benefit.
+        let deferred_bytes = f
             .vector_size_expr
             .as_deref()
             .and_then(|e| self.eval_const_expr(e))
-            .and_then(|v| usize::try_from(v).ok())
-        {
-            Some(bytes) => Self::wrap_field_spec_base(&f.type_spec, bytes),
-            None => f.type_spec.clone(),
+            .and_then(|v| usize::try_from(v).ok());
+        let owned_spec;
+        let spec: &TypeSpecifier = match deferred_bytes {
+            Some(bytes) => {
+                owned_spec = Self::wrap_field_spec_base(&f.type_spec, bytes);
+                &owned_spec
+            }
+            None => &f.type_spec,
         };
-        let mut ty = type_builder::build_qualified_ctype(self, &spec, written, &f.derived);
+        let mut ty = type_builder::build_qualified_ctype(self, spec, written, &f.derived);
         if f.derived.is_empty() {
             // A simple declarator was folded into the specifier (see
             // `record_folded_spec_quals`); its base is the folded leaf.
