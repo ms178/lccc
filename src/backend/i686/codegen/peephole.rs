@@ -9512,7 +9512,9 @@ fn fold_load_copy_relay_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> b
             liveness_cache = Some(GprLiveness::compute(store, infos));
             stale_liveness_regs = 0;
         }
-        let liveness = liveness_cache.as_ref().expect("liveness cache just initialized");
+        let liveness = liveness_cache
+            .as_ref()
+            .expect("liveness cache just initialized");
         if !liveness.dead_after(cj, t) {
             i += 1;
             continue;
