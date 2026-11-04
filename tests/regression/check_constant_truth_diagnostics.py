@@ -100,6 +100,26 @@ CASES.update({
         "extern int unknown; extern void consume(int); "
         "consume(({ if (unknown) return 7; 0; }));", 1
     ),
+    # Callable objects must not inherit a standard-name or hidden declaration's
+    # noreturn contract. The declaring scope is gone at whole-body flow time.
+    "shadowed_abort_pointer": (
+        "extern void ordinary(void); {void (*abort)(void)=ordinary; abort();}", 1
+    ),
+    "shadowed_exit_pointer": (
+        "extern void ordinary(int); {void (*exit)(int)=ordinary; exit(0);}", 1
+    ),
+    "shadowed_quick_exit_pointer": (
+        "extern void ordinary(int); {void (*quick_exit)(int)=ordinary; quick_exit(0);}", 1
+    ),
+    "shadowed_noreturn_pointer": (
+        "extern void ordinary(void); extern void die(void) __attribute__((noreturn)); "
+        "{void (*die)(void)=ordinary; die();}", 1
+    ),
+    "standard_abort_terminates": ("extern void abort(void); abort();", 0),
+    "attributed_die_terminates": (
+        "extern void die(void) __attribute__((noreturn)); die();", 0
+    ),
+    "ordinary_call_returns": ("extern void ordinary(void); ordinary();", 1),
     "generic_shadowed_struct_selected": (
         "struct S {int x;}; {struct S {long x;}; struct S s; "
         "(void)_Generic(s, struct S: ({return 7; 0;}), default:1);}", 0
@@ -284,7 +304,11 @@ def main():
         runtime_compilers = [("lccc", str(args.lccc)), ("gcc", args.gcc), ("clang", args.clang)]
         if args.icx:
             runtime_compilers.append(("icx", args.icx))
-        for control in ("if ((unsigned char)256) __builtin_unreachable();",
+        for control in ("extern int abs(int); {int (*abort)(int)=abs; "
+                        "if (abort(-7)!=7) return 99;}",
+                        "extern int abs(int); {int (*exit)(int)=abs; "
+                        "if (exit(-7)!=7) return 99;}",
+                        "if ((unsigned char)256) __builtin_unreachable();",
                         "while ((unsigned char)256) {}",
                         "for (; (unsigned int)4294967296ULL;) {}",
                         "while (1) { break; }",

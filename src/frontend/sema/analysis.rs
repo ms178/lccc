@@ -255,6 +255,9 @@ pub struct SemanticAnalyzer {
     /// Association indices resolved before a _Generic's tag/typedef scope
     /// disappears. None records an unresolved selection, not a cache miss.
     generic_selections: FxHashMap<ExprId, Option<usize>>,
+    /// Identifier callees bound to objects, not same-named noreturn functions.
+    /// Retain the binding kind after its block scope disappears.
+    object_call_bindings: FxHashSet<ExprId>,
     /// Stack of enclosing function definition names for nested functions.
     /// Entry i is the name of the function containing the body currently
     /// being analyzed; the LAST entry is the innermost (possibly nested)
@@ -342,6 +345,7 @@ impl SemanticAnalyzer {
             current_return_type: None,
             condition_truth: FxHashMap::default(),
             generic_selections: FxHashMap::default(),
+            object_call_bindings: FxHashSet::default(),
             function_nesting_stack: Vec::new(),
             prior_file_function_decls: FxHashMap::default(),
             no_builtins: false,
@@ -536,6 +540,7 @@ impl SemanticAnalyzer {
         // instead of retaining every condition in the translation unit.
         self.condition_truth.clear();
         self.generic_selections.clear();
+        self.object_call_bindings.clear();
     }
 
     /// Analyze a GNU C nested function definition (block scope).
@@ -3324,6 +3329,25 @@ impl SemanticAnalyzer {
         match expr {
             Expr::FunctionCall(callee, _, _) => {
                 if let Expr::Identifier(name, _) = callee.as_ref() {
+                    // Captured bindings outrank both the current (possibly
+                    // unwound) scope and special treatment of library names.
+                    if self.object_call_bindings.contains(&expr.id()) {
+                        return false;
+                    }
+                    if let Some(key) = self.result.call_entities.get(&expr.id()) {
+                        return self
+                            .result
+                            .functions
+                            .get(key)
+                            .is_some_and(|info| info.is_noreturn);
+                    }
+                    if self
+                        .symbol_table
+                        .lookup(name)
+                        .is_some_and(|symbol| !matches!(symbol.ty, CType::Function(_)))
+                    {
+                        return false;
+                    }
                     // Check built-in noreturn functions
                     if matches!(
                         name.as_str(),
@@ -3353,16 +3377,8 @@ impl SemanticAnalyzer {
                     // then treated the code after the call as dead (and silenced
                     // the missing-return diagnostic). The converse hid a real
                     // noreturn nested call.
-                    match self.result.call_entities.get(&ExprId::of(expr)) {
-                        Some(key) => self
-                            .result
-                            .functions
-                            .get(key)
-                            .map_or(false, |func_info| func_info.is_noreturn),
-                        None => self
-                            .visible_function_info(name)
-                            .map_or(false, |func_info| func_info.is_noreturn),
-                    }
+                    self.visible_function_info(name)
+                        .is_some_and(|func_info| func_info.is_noreturn)
                 } else {
                     false
                 }
@@ -3856,18 +3872,7 @@ impl SemanticAnalyzer {
                 self.analyze_bit_cast_expr(dst_ts, src_expr, *span);
             }
             Expr::GenericSelection(controlling, associations, _) => {
-                // A `_Generic` selector only names a type, and GCC does not
-                // warn about a GNU extension there (measured: `_Generic(p[0],
-                // int: 1)` on a `void *` is the selector error alone).
-                self.analyze_unevaluated(controlling);
-                for assoc in associations {
-                    self.analyze_expr(&assoc.expr);
-                }
-                self.check_generic_selection(controlling, associations);
-                let selected = self
-                    .expr_type_checker()
-                    .generic_selection_index(controlling, associations);
-                self.generic_selections.insert(expr.id(), selected);
+                self.analyze_generic_selection(expr, controlling, associations);
             }
             // Literals don't need analysis
             Expr::IntLiteral(_, _)
@@ -3908,6 +3913,28 @@ impl SemanticAnalyzer {
         // The lowerer will consult the const_values map as an O(1) fast path
         // before doing its own eval_const_expr.
         self.annotate_const_value(expr);
+    }
+
+    /// Check every arm, but capture the selected index before type-name scopes
+    /// disappear. Runtime flow consumes only that arm, not all checked arms.
+    fn analyze_generic_selection(
+        &mut self,
+        expr: &Expr,
+        controlling: &Expr,
+        associations: &[GenericAssociation],
+    ) {
+        // A `_Generic` selector only names a type, and GCC does not
+        // warn about a GNU extension there (measured: `_Generic(p[0],
+        // int: 1)` on a `void *` is the selector error alone).
+        self.analyze_unevaluated(controlling);
+        for assoc in associations {
+            self.analyze_expr(&assoc.expr);
+        }
+        self.check_generic_selection(controlling, associations);
+        let selected = self
+            .expr_type_checker()
+            .generic_selection_index(controlling, associations);
+        self.generic_selections.insert(expr.id(), selected);
     }
 
     /// A call: builtin argument rules, implicit declarations, noreturn
@@ -4006,7 +4033,13 @@ impl SemanticAnalyzer {
         // the whole-body query read the file-scope record and stayed silent
         // where GCC warns.
         if let Expr::Identifier(name, _) = callee {
-            if let Some(key) = self.scoped_call_entity(name) {
+            if self
+                .symbol_table
+                .lookup(name)
+                .is_some_and(|symbol| !matches!(symbol.ty, CType::Function(_)))
+            {
+                self.object_call_bindings.insert(expr.id());
+            } else if let Some(key) = self.scoped_call_entity(name) {
                 self.result.call_entities.insert(ExprId::of(expr), key);
             }
         }
@@ -12510,18 +12543,21 @@ mod builtin_return_flow_tests {
     use crate::frontend::parser::Parser;
 
     fn warnings(body: &str) -> usize {
-        let source = format!("int f(void *block) {{ {body} }}");
-        let tokens = Lexer::new(&source, 0).tokenize();
+        warnings_source(&format!("int f(void *block) {{ {body} }}"))
+    }
+
+    fn warnings_source(source: &str) -> usize {
+        let tokens = Lexer::new(source, 0).tokenize();
         let mut parser = Parser::new(tokens);
         let tu = parser.parse();
-        assert_eq!(parser.error_count, 0, "{body}");
+        assert_eq!(parser.error_count, 0, "{source}");
         let mut analyzer = SemanticAnalyzer::new();
         // GCC enables -Wreturn-type under -Wall, not by default. Test the
         // fallthrough analysis with that diagnostic explicitly requested.
         let mut config = WarningConfig::new();
         config.enable(WarningKind::ReturnType);
         analyzer.diagnostics.borrow_mut().set_warning_config(config);
-        assert!(analyzer.analyze(&tu).is_ok(), "{body}");
+        assert!(analyzer.analyze(&tu).is_ok(), "{source}");
         analyzer.diagnostics.borrow().warning_count()
     }
 
@@ -12538,6 +12574,50 @@ mod builtin_return_flow_tests {
             "(void)__builtin_longjmp(block, 1);",
         ] {
             assert_eq!(warnings(body), 0, "{body}");
+        }
+    }
+
+    #[test]
+    fn noreturn_calls_retain_object_and_nested_function_bindings() {
+        for (source, expected) in [
+            ("int f(void (*abort)(void)) { abort(); }", 1),
+            ("int f(void (*exit)(int)) { exit(0); }", 1),
+            (
+                "void die(void) __attribute__((noreturn)); int f(void (*die)(void)) { die(); }",
+                1,
+            ),
+            ("int f(void (*abort)(void)) { abort(); return 7; }", 0),
+            (
+                "int f(void) { extern void ordinary(void); {void (*abort)(void)=ordinary; abort();} }",
+                1,
+            ),
+            (
+                "void die(void) __attribute__((noreturn)); int f(void) { extern void ordinary(void); {void (*die)(void)=ordinary; die();} }",
+                1,
+            ),
+            ("int f(void) { extern void abort(void); abort(); }", 0),
+            (
+                "void die(void) __attribute__((noreturn)); int f(void) { die(); }",
+                0,
+            ),
+            ("int f(void) { extern void ordinary(void); ordinary(); }", 1),
+            // A captured nested function binding must also outrank a standard
+            // basename, and must not be replaced by the outer parameter after
+            // its block has popped. Preserve outer facts across nested walks.
+            (
+                "int f(void) { {auto void abort(void) {return;} abort();} }",
+                1,
+            ),
+            (
+                "int f(void (*abort)(void)) { {auto void abort(void) __attribute__((noreturn)); auto void abort(void) {for (;;) {}} abort();} }",
+                0,
+            ),
+            (
+                "int f(void) { extern void ordinary(void); {void (*abort)(void)=ordinary; abort(); int nested(void) {return 7;} (void)nested();} }",
+                1,
+            ),
+        ] {
+            assert_eq!(warnings_source(source), expected, "{source}");
         }
     }
 

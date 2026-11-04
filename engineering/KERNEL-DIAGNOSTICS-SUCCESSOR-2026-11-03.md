@@ -388,8 +388,75 @@ This is a diagnostic correctness fix, not an instruction-selection speedup.
 Seven new library assertions cover struct, union, pointer-to-record, inverse
 selection, local-only controls and a nested-function arm. **7898 library tests
 passed / 10 ignored**, all-target Clippy -D warnings, fastbuild, formatting,
-31 scoped-noreturn checks, parity and the unchanged audit ratchet passed. The
-expanded matrix includes 78 native compile/execute checks. Raw before/after
-reports and baseline compiler identities are retained. A subsequent audit also
-reproduced missed warnings for function-pointer objects named abort/exit; that
-separate binding defect still needs its own repair before final validation.
+31 scoped-noreturn checks and parity passed. The first census invocation only
+recorded the inventory: a subsequent strict `--check` found that `analyze_expr`
+had grown to 502 lines, crossing the existing >500-line limit. Extracting its
+Generic-selection arm into a focused helper restored the count to **97/97**
+without changing the baseline or relaxing the validator. The expanded matrix
+includes 78 native compile/execute checks. Raw reports remain at
+`/home/user/generic-scope-{before,after}.json`; the compact checked-in receipt
+records their SHA256s, counts and all observations for the four new cases.
+Baseline compiler identities are retained alongside it.
+
+## Confirmed callable-object / standard-name binding defect
+
+Three independent non-kernel probes reproduced missed `-Wreturn-type` warnings:
+function-pointer parameters named `abort` and `exit`, and a block-local pointer
+named `abort`. GCC16.2 and Clang23.1.4 both warn. A native callback probe returned
+its correct result on all three compilers before the fix: again, this is not
+claimed as a demonstrated native miscompile.
+
+Four permanent diagnostic cases cover abort, exit, quick_exit and a pointer
+hiding an explicitly attributed user function. Baseline with the Generic fix:
+**1922 observations / 32 LCCC semantic failures** over four targets at O0/O2;
+the same **18 reference semantic failures** remain reported. Three positive and
+negative controls require real standard/attributed noreturn calls to terminate
+flow, and an ordinary call to retain the warning. Two added native controls
+call the returning libc abs function through locally shadowing pointer names
+and retain value 7. Both already passed the baseline.
+
+Choice: retain only the **object-binding kind** in a private ExprId set while
+scope is live, rather than allocate a frozen boolean/string record for every
+call or retain whole lexical environments. Captured object and nested-function
+bindings outrank bare-name library knowledge. The set shares the existing
+function-tree lifetime; nested walks do not clear their parent's facts. No
+reference override or diagnostic expectation was relaxed. Twelve library
+assertions exercise parameter/block binding, standard and user declarations,
+returning and noreturn nested functions, and parent-fact survival. In particular,
+a captured nested function must outrank an outer pointer parameter after the
+nested function's declaring block has popped. Strict final-source validation
+and mutation-control results are recorded after completion, not inferred from
+the earlier successful source build.
+
+The original red CI condition is now actually green on head `6bc405e61`:
+CI run **41814938313 completed/success**, including the authenticated ICX2026.2
+job **126525143400 completed/success**. This is evidence for that exact head,
+not for these later source changes; they require another final-head run.
+Latest fetched main remains `5a3b2087c`, already an ancestor of this branch.
+
+### Final local validation for both scope fixes
+
+Both deliberately broken variants were killed by assertion failures in their
+specific library tests (not compile errors): disabling captured Generic indices,
+and disabling captured object-binding lookup. Sources were restored in `finally`
+blocks before rebuilding every compiler binary and rerunning validation.
+
+Final source: **7899 Rust library tests passed / 10 ignored**, Clippy all-targets
+with `-D warnings` clean, **1922 matrix observations / zero unexpected and zero
+LCCC semantic failures**; 18 reference semantic failures remain explicit. All
+90 native compile/execute checks passed their measured reference profiles, not
+all language semantics (the two Clang constant_p executions remain failures of
+the latter). The 31 scoped-noreturn checks, including three emitted-flow and
+12 GCC differential checks, passed. Strict audit `--check`: >500-line count
+**97/97**, all metrics held; no baseline update. Parity: **530 commands / 27
+contracts**. Formatting and diff checks passed. Strict Python-Werror corpus:
+**1170 tests / 120.675 s / PASS, 5 skipped**. Compact differential receipts,
+compiler identities and mutation-log hashes accompany these results; full raw
+reports/logs remain outside Git in `/home/user`.
+
+Neither fix substantiates measured throughput/code-size gains, hardware-specific
+readiness, all remaining warning/option families, or the final-head local full
+kernel/real-objtool/QEMU gate. Kernel host prerequisite recovery has verified the
+original Git-blob, part, archive and all 93 Debian package digests; those are host
+tools only, never GCC-compiled kernel objects. Final-head hosted checks are still
+required after pushing these fixes.
