@@ -1089,6 +1089,7 @@ impl Lowerer {
             }
             self.terminate(Terminator::Return(ret_op));
         }
+        self.materialize_undefined_user_labels(return_type);
 
         // Splice deferred entry instructions (frame/chain/GEPs) into the
         // entry block, right after the leading alloca run.

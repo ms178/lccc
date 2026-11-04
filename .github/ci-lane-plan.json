@@ -1145,7 +1145,7 @@
     "frontend-a": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 352.38,
+      "predicted_gate_seconds": 356.96,
       "shards": 3,
       "steps": [
         {
@@ -1355,6 +1355,18 @@
         {
           "measured_s": 20.0,
           "name": "Check baseline-SSE2 packed multiply-add codegen"
+        },
+        {
+          "measured_s": 0.45,
+          "name": "GCC 17 C-torture builtin semantics on both ABIs"
+        },
+        {
+          "measured_s": 0.56,
+          "name": "Computed-goto label identity and diagnostics on both ABIs"
+        },
+        {
+          "measured_s": 3.57,
+          "name": "Type-attribute scope and static-init address constants on both ABIs"
         }
       ]
     },

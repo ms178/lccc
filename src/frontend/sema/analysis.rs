@@ -991,6 +991,13 @@ impl SemanticAnalyzer {
                 address_space: AddressSpace::Default,
             });
         }
+        // C23/GNU label namespace contract: every goto/&&label/asm-goto label
+        // must be defined exactly once in its function. One zero-copy AST walk
+        // before the body is analysed, so an undefined label can never reach
+        // lowering (where it used to become a dangling .LBBn or a duplicate
+        // BlockId and an internal error). Nested function bodies are covered
+        // by the same walk, with their own namespace.
+        crate::frontend::sema::label_check::check_function_labels(&self.diagnostics, func);
         // Analyze function body with explicit return-type context.
         let previous_return_type = self.current_return_type.replace(return_type.clone());
         self.analyze_compound_stmt(&func.body);
@@ -7943,6 +7950,14 @@ dereference it before applying '->' to it?"
     }
 
     fn check_c2y_builtin_call(&mut self, name: &str, args: &[Expr], span: Span) {
+        // These GCC 17 compatibility intrinsics have no ordinary
+        // declaration in the translation unit. Validate their implicit
+        // prototypes here, before lowering can index or convert unchecked
+        // operands. Keep the prototype table in one place so O0 and O2
+        // reject exactly the same ill-typed calls.
+        if self.check_gcc17_builtin_call(name, args, span) {
+            return;
+        }
         use crate::frontend::sema::stdbit;
         if let Some(expected) = stdbit::stdc_bit_arity(name) {
             if args.len() != expected {
@@ -8059,10 +8074,18 @@ dereference it before applying '->' to it?"
                                 );
                             } else {
                                 let incomplete = match pointee.as_ref() {
-                                    CType::Void | CType::Array(_, None) => true,
+                                    CType::Void => true,
                                     CType::Struct(k) | CType::Union(k) => {
                                         !self.defined_structs.borrow().contains(&**k)
                                     }
+                                    // GNU zero-length and variable-length arrays
+                                    // are COMPLETE types even though their size
+                                    // is 0 or not a compile-time constant.
+                                    // gcc-16.2 accepts them (gcc.c-torture/
+                                    // compile/pr98087.c); the lowering already
+                                    // treats `size == 0` as a no-op, so no
+                                    // bytes are ever written here.
+                                    CType::Array(..) => false,
                                     _ => false,
                                 };
                                 if incomplete {
@@ -8088,6 +8111,74 @@ dereference it before applying '->' to it?"
                 self.check_gcc16_builtin_call(name, args, span);
             }
         }
+    }
+
+    /// Validate the implicit C prototypes of the GCC 17 torture builtins.
+    ///
+    /// They are intercepted by lowering and therefore have no symbol-table
+    /// declaration to feed the normal call checker. Reuse that checker rather
+    /// than duplicating arity, pointer, record, and conversion rules here.
+    /// Returning true means the name was handled, including an arity error.
+    fn check_gcc17_builtin_call(&self, name: &str, args: &[Expr], span: Span) -> bool {
+        let void_ptr = || CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC);
+        let const_void_ptr = || {
+            CType::Pointer(
+                Box::new(CType::Void),
+                PtrQuals::recorded(AddressSpace::Default, PtrQuals::CONST),
+            )
+        };
+        let const_char_ptr = || {
+            CType::Pointer(
+                Box::new(CType::Char),
+                PtrQuals::recorded(AddressSpace::Default, PtrQuals::CONST),
+            )
+        };
+        let double_ptr = || CType::Pointer(Box::new(CType::Double), PtrQuals::GENERIC);
+        let float_ptr = || CType::Pointer(Box::new(CType::Float), PtrQuals::GENERIC);
+        let param = |ty| (ty, None);
+        let size_t = if crate::common::types::target_is_32bit() {
+            CType::UInt
+        } else {
+            CType::ULong
+        };
+        let const_void_param = param(const_void_ptr());
+        let const_char_param = param(const_char_ptr());
+        let size_param = param(size_t);
+        let params = match name {
+            // GCC's GNU aliases have no ordinary declaration to validate the
+            // call against. Their libc signatures still matter: a wrong
+            // pointer or width here is a silent ABI miscompile, not merely a
+            // missing diagnostic.
+            "__builtin_bcmp" => {
+                vec![
+                    const_void_param.clone(),
+                    const_void_param.clone(),
+                    size_param,
+                ]
+            }
+            "__builtin_bzero" => vec![param(void_ptr()), size_param],
+            "__builtin_bcopy" => {
+                vec![const_void_param, param(void_ptr()), size_param]
+            }
+            "__builtin_strdup" => vec![const_char_param],
+            "__builtin_strndup" => vec![const_char_param, size_param],
+            "__builtin_ilogb" => vec![param(CType::Double)],
+            "__builtin_modf" => vec![param(CType::Double), param(double_ptr())],
+            "__builtin_modff" => vec![param(CType::Float), param(float_ptr())],
+            "__builtin_strncasecmp" => {
+                vec![const_char_param.clone(), const_char_param, size_param]
+            }
+            "__builtin_memcmp_eq" => {
+                vec![const_void_param.clone(), const_void_param, size_param]
+            }
+            "__builtin_stack_save" => Vec::new(),
+            "__builtin_stack_restore" => vec![param(void_ptr())],
+            "__builtin_cexpi" => vec![param(CType::Double)],
+            "__builtin_cpow" => vec![param(CType::ComplexDouble), param(CType::ComplexDouble)],
+            _ => return false,
+        };
+        self.check_call_arguments(name, args, &params, false, span);
+        true
     }
 
     fn check_gcc16_builtin_call(&mut self, name: &str, args: &[Expr], span: Span) {
@@ -10214,9 +10305,47 @@ dereference it before applying '->' to it?"
 
     /// The type of struct field `f` with a declarator, its pointer levels'
     /// qualifiers recorded (see `type_builder::build_qualified_ctype`).
+    /// Insert a `TypeSpecifier::Vector` at the BASE of a member's specifier
+    /// tree. `fold_simple_derived` folds simple pointer/array layers into the
+    /// specifier, so a deferred `vector_size(EXPR)` must be applied below
+    /// them, never around the finished pointer type.
+    fn wrap_field_spec_base(spec: &TypeSpecifier, bytes: usize) -> TypeSpecifier {
+        match spec {
+            TypeSpecifier::Pointer(inner, space) => {
+                TypeSpecifier::Pointer(Box::new(Self::wrap_field_spec_base(inner, bytes)), *space)
+            }
+            TypeSpecifier::Array(inner, n) => TypeSpecifier::Array(
+                Box::new(Self::wrap_field_spec_base(inner, bytes)),
+                n.clone(),
+            ),
+            _ => TypeSpecifier::Vector(Box::new(spec.clone()), bytes),
+        }
+    }
+
     fn field_ctype(&self, f: &StructFieldDecl) -> CType {
         let written = written_cvr(f.base_const, f.base_volatile, f.base_restrict);
-        let mut ty = type_builder::build_qualified_ctype(self, &f.type_spec, written, &f.derived);
+        // Resolved vector sizes are already `TypeSpecifier::Vector` nodes
+        // (see Parser::apply_pending_vector_attr). A size that needed sema's
+        // layout engine is resolved here and inserted at the same position.
+        // Only the rare DEFERRED attribute needs an owned specifier. Every
+        // other field borrows `f.type_spec` directly: cloning it would
+        // deep-copy nested record definitions for every member of every
+        // struct on every compilation (a measurable host-CPU cost for
+        // kernel-sized headers), with no semantic benefit.
+        let deferred_bytes = f
+            .vector_size_expr
+            .as_deref()
+            .and_then(|e| self.eval_const_expr(e))
+            .and_then(|v| usize::try_from(v).ok());
+        let owned_spec;
+        let spec: &TypeSpecifier = match deferred_bytes {
+            Some(bytes) => {
+                owned_spec = Self::wrap_field_spec_base(&f.type_spec, bytes);
+                &owned_spec
+            }
+            None => &f.type_spec,
+        };
+        let mut ty = type_builder::build_qualified_ctype(self, spec, written, &f.derived);
         if f.derived.is_empty() {
             // A simple declarator was folded into the specifier (see
             // `record_folded_spec_quals`); its base is the folded leaf.

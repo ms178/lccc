@@ -4,6 +4,7 @@
 //! We map these to their standard library equivalents so the linker can resolve them.
 
 use crate::common::fx_hash::FxHashMap;
+use crate::common::types::{CType, PtrQuals};
 use std::sync::LazyLock;
 
 /// Static mapping of __builtin_* names to their libc equivalents.
@@ -45,6 +46,49 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert("__builtin_strcspn", BuiltinInfo::simple("strcspn"));
     m.insert("__builtin_strpbrk", BuiltinInfo::simple("strpbrk"));
     m.insert("__builtin_stpncpy", BuiltinInfo::simple("stpncpy"));
+
+    // GCC 17-git C-torture (c94b688a) compile-leg builtins.  Each alias names
+    // a real glibc/libm symbol with the identical prototype, so the lowering's
+    // `assume_library` contract holds and the linker resolves the symbol even
+    // when the translation unit never declared the libc function.  Verified
+    // against gcc-16.2 -O2 on the 8 torture sources that use them.
+    for &(builtin, libc_name) in &[
+        ("__builtin_bcmp", "bcmp"),
+        ("__builtin_bzero", "bzero"),
+        ("__builtin_strdup", "strdup"),
+        ("__builtin_strndup", "strndup"),
+        ("__builtin_ilogb", "ilogb"),
+        ("__builtin_modf", "modf"),
+        ("__builtin_modff", "modff"),
+        ("__builtin_strncasecmp", "strncasecmp"),
+        ("__builtin_bcopy", "bcopy"),
+    ] {
+        m.insert(builtin, BuiltinInfo::simple(libc_name));
+    }
+    // Five builtins are NOT libc aliases: their semantics or ABI do not
+    // match a direct call (memcmp_eq normalises the result; stack_save/restore
+    // are IR stack intrinsics; cexpi has no libc symbol; cpow bridges the
+    // target complex ABI and LCCC's pointer-backed complex representation).
+    m.insert(
+        "__builtin_memcmp_eq",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::MemcmpEq),
+    );
+    m.insert(
+        "__builtin_stack_save",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::StackSave),
+    );
+    m.insert(
+        "__builtin_stack_restore",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::StackRestore),
+    );
+    m.insert(
+        "__builtin_cexpi",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::Cexpi),
+    );
+    m.insert(
+        "__builtin_cpow",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::Cpow),
+    );
 
     // Math functions
     m.insert("__builtin_abs", BuiltinInfo::simple("abs"));
@@ -3649,6 +3693,25 @@ pub enum BuiltinIntrinsic {
     AssocBarrier,
     /// C23 / GCC `__builtin_clear_padding(ptr)`
     ClearPadding,
+    /// GCC `__builtin_memcmp_eq(p, q, n)` -> 0 if equal, **1** otherwise.
+    /// Unlike `__builtin_memcmp` it must not return memcmp's signed byte
+    /// difference; GCC 16.2 emits `test eax,eax; setne al` after the call.
+    MemcmpEq,
+    /// GCC `__builtin_stack_save()` -> opaque `void *` stack watermark.
+    StackSave,
+    /// GCC `__builtin_stack_restore(p)` -> void, resets SP to a watermark.
+    StackRestore,
+    /// GCC `__builtin_cexpi(x)` -> `_Complex double` = cos(x) + i*sin(x).
+    /// Lowered through glibc `sincos` (ONE libcall) rather than two separate
+    /// sin/cos calls, and constructed in LCCC's pointer-backed complex form so
+    /// no target's complex-return ABI is involved.
+    Cexpi,
+    /// GCC `__builtin_cpow(x, y)` -> `_Complex double` via libm `cpow`.
+    /// Complex values are pointer-backed in LCCC while libm uses the target's
+    /// complex ABI, so this intrinsic decomposes both operands into F64
+    /// scalars and handles x86-64's xmm0/xmm1 return and i686's hidden sret
+    /// separately.
+    Cpow,
     /// GCC 16.2 type-generic bit builtins (`__builtin_{clzg,ctzg,popcountg,parityg,ffsg,clrsbg}`)
     Gcc16GenericBit,
     /// GCC / Clang unsigned carry/borrow chain builtins (`__builtin_{addc,subc}{b,s,,l,ll}`)
@@ -4280,6 +4343,32 @@ pub fn normalize_atomic_size_suffix(name: &str) -> Option<&'static str> {
     }
 }
 
+/// Return types of the GCC compatibility builtins added for the GCC 17-git
+/// C-torture compile leg.  Both `ExprTypeChecker::builtin_return_ctype` and
+/// the IR lowerer's `get_c2y_builtin_ctype` call this function, so the C-level
+/// type and the IR-level type can never drift apart (a drift here would make
+/// `sizeof(__builtin_memcmp_eq(...))` disagree with the emitted register
+/// width, i.e. a silent miscompile).
+pub fn gcc_compat_builtin_ctype(name: &str) -> Option<CType> {
+    use crate::common::types::{CType, PtrQuals};
+    let void_ptr = || CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC);
+    let char_ptr = || CType::Pointer(Box::new(CType::Char), PtrQuals::GENERIC);
+    match name {
+        "bcmp"
+        | "__builtin_bcmp"
+        | "__builtin_memcmp_eq"
+        | "__builtin_ilogb"
+        | "__builtin_strncasecmp" => Some(CType::Int),
+        "__builtin_bzero" | "__builtin_bcopy" | "__builtin_stack_restore" => Some(CType::Void),
+        "strdup" | "strndup" | "__builtin_strdup" | "__builtin_strndup" => Some(char_ptr()),
+        "__builtin_stack_save" => Some(void_ptr()),
+        "__builtin_modff" => Some(CType::Float),
+        "__builtin_modf" => Some(CType::Double),
+        "__builtin_cexpi" | "__builtin_cpow" => Some(CType::ComplexDouble),
+        _ => None,
+    }
+}
+
 /// Parameter types of the libc functions that `BuiltinKind::LibcAlias` maps to,
 /// for the families whose signature contains a **`size_t`** (or another
 /// parameter wider than `int`).
@@ -4325,6 +4414,14 @@ pub fn libc_alias_param_types(libc_name: &str) -> Option<Vec<crate::common::type
         "memset" => vec![p, i32t, size_t],
         // int memcmp(const void *, const void *, size_t)
         "memcmp" | "bcmp" => vec![p, p, size_t],
+        // void bzero(void *, size_t); char *strndup(const char *, size_t).
+        // `bzero(a, 65536 * 4)` and `strndup(s, (size_t)-1)` both pass an
+        // int/long in a size_t slot: without this conversion the upper half of
+        // %rdx is garbage on LP64 (the pr59229.c defect class).
+        "bzero" => vec![p, size_t],
+        // void bcopy(const void *, void *, size_t)
+        "bcopy" => vec![p, p, size_t],
+        "strndup" => vec![p, size_t],
         // void *memchr(const void *, int, size_t)
         "memchr" | "rawmemchr" | "memrchr" => vec![p, i32t, size_t],
         // char *strncpy/strncat(char *, const char *, size_t)
@@ -4407,5 +4504,128 @@ mod libc_alias_param_type_tests {
         ] {
             assert_eq!(libc_alias_param_types(n), None, "{n} must not be listed");
         }
+    }
+}
+
+#[cfg(test)]
+mod gcc17_torture_builtin_tests {
+    use super::{BuiltinKind, gcc_compat_builtin_ctype, is_builtin, resolve_builtin};
+    use crate::common::types::CType;
+
+    /// Every GNU builtin spelled by the GCC 17-git C-torture compile leg must
+    /// be registered (otherwise sema emits "implicit declaration" and the
+    /// linker sees a literal __builtin_* symbol) and must have a CType.
+    #[test]
+    fn torture_builtins_are_registered_and_typed() {
+        for name in [
+            "__builtin_bcmp",
+            "__builtin_bzero",
+            "__builtin_strdup",
+            "__builtin_strndup",
+            "__builtin_ilogb",
+            "__builtin_modf",
+            "__builtin_modff",
+            "__builtin_memcmp_eq",
+            "__builtin_stack_save",
+            "__builtin_stack_restore",
+            "__builtin_cexpi",
+            "__builtin_cpow",
+            "__builtin_strncasecmp",
+            "__builtin_bcopy",
+        ] {
+            assert!(is_builtin(name), "{name} is not registered");
+            assert!(resolve_builtin(name).is_some(), "{name} has no info");
+            assert!(
+                gcc_compat_builtin_ctype(name).is_some(),
+                "{name} has no shared return CType"
+            );
+        }
+    }
+
+    #[test]
+    fn four_builtins_are_intrinsics_not_libc_aliases() {
+        for name in [
+            "__builtin_memcmp_eq",
+            "__builtin_stack_save",
+            "__builtin_stack_restore",
+            "__builtin_cexpi",
+            "__builtin_cpow",
+        ] {
+            assert!(
+                matches!(
+                    resolve_builtin(name).map(|b| &b.kind),
+                    Some(BuiltinKind::Intrinsic(_))
+                ),
+                "{name} must not forward to a libc symbol"
+            );
+        }
+        for name in [
+            "__builtin_bcmp",
+            "__builtin_bzero",
+            "__builtin_modff",
+            "__builtin_strncasecmp",
+            "__builtin_bcopy",
+        ] {
+            assert!(
+                matches!(
+                    resolve_builtin(name).map(|b| &b.kind),
+                    Some(BuiltinKind::LibcAlias(_))
+                ),
+                "{name} must forward to libc"
+            );
+        }
+    }
+
+    #[test]
+    fn return_types_match_gcc_16_2() {
+        assert_eq!(
+            gcc_compat_builtin_ctype("__builtin_memcmp_eq"),
+            Some(CType::Int)
+        );
+        assert_eq!(
+            gcc_compat_builtin_ctype("__builtin_ilogb"),
+            Some(CType::Int)
+        );
+        assert_eq!(
+            gcc_compat_builtin_ctype("__builtin_modff"),
+            Some(CType::Float)
+        );
+        assert_eq!(
+            gcc_compat_builtin_ctype("__builtin_modf"),
+            Some(CType::Double)
+        );
+        assert_eq!(
+            gcc_compat_builtin_ctype("__builtin_cexpi"),
+            Some(CType::ComplexDouble)
+        );
+        assert_eq!(
+            gcc_compat_builtin_ctype("__builtin_bzero"),
+            Some(CType::Void)
+        );
+        assert_eq!(gcc_compat_builtin_ctype("strlen"), None);
+    }
+
+    #[test]
+    fn wide_parameters_are_converted() {
+        use super::libc_alias_param_types;
+        use crate::common::types::{IrType, target_ptr_size};
+        let st = if target_ptr_size() == 8 {
+            IrType::U64
+        } else {
+            IrType::U32
+        };
+        assert_eq!(libc_alias_param_types("bzero"), Some(vec![IrType::Ptr, st]));
+        assert_eq!(
+            libc_alias_param_types("strndup"),
+            Some(vec![IrType::Ptr, st])
+        );
+        assert_eq!(
+            libc_alias_param_types("bcopy"),
+            Some(vec![IrType::Ptr, IrType::Ptr, st])
+        );
+        assert_eq!(
+            libc_alias_param_types("bcmp"),
+            Some(vec![IrType::Ptr, IrType::Ptr, st])
+        );
     }
 }

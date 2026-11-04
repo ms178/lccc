@@ -155,6 +155,24 @@ impl Lowerer {
             }
         }
 
+        // GNU labels-as-values: a BARE `&&label` initializing a scalar static
+        // object is an address constant. Compound/array elements already go
+        // through `collect_compound_init_element`, but the scalar path fell
+        // through to `diagnose_non_constant` ("initializer element is not
+        // constant") even though GCC 16.2, Clang and ICX accept
+        // `static void *p = &&a;`. Register the label as an address-taken CFG
+        // root exactly like the compound path: without it, cfg_simplify and
+        // the identical-block peephole are entitled to delete the label and
+        // the emitted `.quad`/`.long` would dangle. Cast-wrapped spellings
+        // (`(void *)&&a`) take the same route.
+        if let Expr::LabelAddr(label_name, _) = Self::strip_casts(expr) {
+            let scoped_label = self.get_or_create_user_label(label_name);
+            if let Some(ref mut fs) = self.func_state {
+                fs.global_init_label_blocks.push(scoped_label);
+            }
+            return GlobalInit::GlobalAddr(scoped_label.as_label());
+        }
+
         // Complex types: handle before scalar evaluation to prevent misinterpretation
         // of scalar values (e.g., `_Complex float g = 1.0f;`).
         //
@@ -330,6 +348,18 @@ impl Lowerer {
                     return GlobalInit::Array(vals);
                 }
             }
+        }
+
+        // Difference of two pointers into the SAME narrow string literal.
+        // Must run before eval_string_literal_addr_expr, which would read a
+        // top-level `Sub` as `"str" - N`; here both operands are addresses.
+        if let Some(diff) = self.eval_string_literal_pointer_diff(expr) {
+            return GlobalInit::Scalar(self.coerce_scalar_const(
+                IrConst::I64(diff),
+                expr,
+                base_ty,
+                Some(elem_ct),
+            ));
         }
 
         // String literal with offset: "str" + N or "str" - N
@@ -1816,7 +1846,119 @@ impl Lowerer {
         }
     }
 
-    /// Extract a string literal from an expression, possibly through casts.
+    /// Resolve an address expression into `(literal text, byte offset, element
+    /// size)` for the string-literal object it points into.
+    ///
+    /// This is ONE arithmetic model, used for every spelling GCC 16.2 folds:
+    /// `&"s"[K]`, `"s"`, `"s" + K`, `K + "s"`, `"s" - K` and arbitrary
+    /// chains of those. Offsets are BYTES (`K * element_size`), so wide and
+    /// char16 literals are handled by the same code as narrow ones and a
+    /// subsequent pointer-difference division cannot use a wrong scale.
+    /// `wchar_ctype().size()` honours `-fshort-wchar` (2) vs the ABI default
+    /// (4). Every arithmetic step is checked, so a hostile constant cannot
+    /// wrap an i64 into a plausible-looking fold.
+    ///
+    /// Casts are deliberately NOT followed here: they belong to the outer
+    /// difference operand and are resolved by
+    /// `string_literal_pointer_offset_scaled`, which decides the division.
+    fn string_literal_pointer_offset<'a>(&self, expr: &'a Expr) -> Option<(&'a str, i64, i64)> {
+        let wide = i64::try_from(crate::common::types::wchar_ctype().size()).ok()?;
+        let subscript = |base: &'a Expr, index: &Expr| -> Option<(&'a str, i64, i64)> {
+            let (text, off, es) = self.string_literal_pointer_offset(base)?;
+            let k = self.eval_const_expr(index)?.to_i64()?;
+            let bytes = off.checked_add(k.checked_mul(es)?)?;
+            Some((text, bytes, es))
+        };
+        match expr {
+            Expr::StringLiteral(text, _) => Some((text.as_str(), 0, 1)),
+            Expr::WideStringLiteral(text, _) => Some((text.as_str(), 0, wide)),
+            Expr::Char16StringLiteral(text, _) => Some((text.as_str(), 0, 2)),
+            Expr::AddressOf(inner, _) => match inner.as_ref() {
+                Expr::ArraySubscript(base, index, _) => subscript(base, index),
+                _ => None,
+            },
+            Expr::ArraySubscript(base, index, _) => subscript(base, index),
+            Expr::BinaryOp(op @ (BinOp::Add | BinOp::Sub), lhs, rhs, _) => {
+                if let Some((text, off, es)) = self.string_literal_pointer_offset(lhs) {
+                    let k = self.eval_const_expr(rhs)?.to_i64()?;
+                    let delta = k.checked_mul(es)?;
+                    let bytes = if *op == BinOp::Add {
+                        off.checked_add(delta)?
+                    } else {
+                        off.checked_sub(delta)?
+                    };
+                    return Some((text, bytes, es));
+                }
+                // Addition is commutative; subtraction is not. GCC accepts
+                // `1 + "Foobar" - "Foobar"` and folds it to 1.
+                if *op == BinOp::Add {
+                    let (text, off, es) = self.string_literal_pointer_offset(rhs)?;
+                    let k = self.eval_const_expr(lhs)?.to_i64()?;
+                    let bytes = off.checked_add(k.checked_mul(es)?)?;
+                    return Some((text, bytes, es));
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// A difference operand's DIVISOR. Uncast, a C pointer difference is in
+    /// elements (`&L"s"[1] - &L"s"[0]` is 1 even though the byte distance is
+    /// 4). A cast to a pointer changes the pointee size
+    /// (`(int *)&L"s"[4] - (int *)&L"s"[0]` is 4), while a cast to a
+    /// pointer-width integer keeps the byte distance (`(long)&s[1] -
+    /// (long)&s[0]` is 1). Narrower integers and floating conversions are
+    /// not address constants (`static_init.rs::address_cast_is_constant`),
+    /// so they decline rather than produce a silently wrong value.
+    fn string_literal_pointer_offset_scaled<'a>(
+        &self,
+        expr: &'a Expr,
+    ) -> Option<(&'a str, i64, i64, i64)> {
+        if let Expr::Cast(ts, inner, _, _) = expr {
+            let target = self.type_spec_to_ctype(ts);
+            let scale = match target {
+                CType::Pointer(pointee, _) => i64::try_from(pointee.size()).ok()?,
+                // target_ptr_size(), not size_of::<usize>(): the HOST running
+                // the compiler is LP64 while an -m32 build has 32-bit
+                // pointers, where `(long)&s[1] - (long)&s[0]` is still a
+                // pointer-width integer constant.
+                ref t if t.is_integer() && t.size() == crate::common::types::target_ptr_size() => 1,
+                _ => return None,
+            };
+            if scale == 0 {
+                return None;
+            }
+            let (text, off, es) = self.string_literal_pointer_offset(inner)?;
+            return Some((text, off, es, scale));
+        }
+        let (text, off, es) = self.string_literal_pointer_offset(expr)?;
+        Some((text, off, es, es))
+    }
+
+    /// GCC 16.2 folds the difference of two addresses into the SAME string
+    /// literal to a compile-time constant, and rejects different literals
+    /// ("not computable at load time": identical text may denote one merged
+    /// object, distinct text cannot). Clang 23.1.4 rejects even the
+    /// same-text form; the GCC-compatible subset is measured in
+    /// static_init.rs, which accepts exactly the forms folded here.
+    fn eval_string_literal_pointer_diff<'a>(&self, expr: &'a Expr) -> Option<i64> {
+        let Expr::BinaryOp(BinOp::Sub, lhs, rhs, _) = expr else {
+            return None;
+        };
+        let (lt, lo, les, ls) = self.string_literal_pointer_offset_scaled(lhs)?;
+        let (rt, ro, res, rs) = self.string_literal_pointer_offset_scaled(rhs)?;
+        // The ELEMENT SIZE is part of the object identity: `"Foobar"` and
+        // `L"Foobar"` share text but are different literal objects.
+        if lt != rt || les != res || ls != rs || ls == 0 {
+            return None;
+        }
+        let bytes = lo.checked_sub(ro)?;
+        // A C pointer difference is only defined for elements of one array
+        // object; a non-multiple would be a mis-scaled address.
+        (bytes % ls == 0).then_some(bytes / ls)
+    }
+
     fn extract_string_literal(&self, expr: &Expr) -> Option<(String, StringLitKind)> {
         match expr {
             Expr::StringLiteral(s, _) => Some((s.clone(), StringLitKind::Narrow)),

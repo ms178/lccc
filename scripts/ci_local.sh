@@ -257,6 +257,18 @@ gate "asm-operand-diagnostics" fast \
 # anchor legality, extent) and a seeded expression fuzzer covers what a fixed
 # corpus cannot. One gate, because six separate gate spawns would cost more
 # than the checks.
+gate "gcc17-builtin-semantics" fast \
+    env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
+    GCC="${GCC16:-gcc-16}" \
+    bash tests/regression/check_gcc17_builtin_semantics.sh
+gate "computed-goto-labels" fast \
+    env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
+    GCC="${GCC16:-gcc-16}" \
+    bash tests/regression/check_computed_goto_labels.sh
+gate "type-attr-static-init" fast \
+    env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
+    GCC="${GCC16:-gcc-16}" \
+    bash tests/regression/check_type_attr_and_static_init.sh
 gate "frontend-ternary-common-type" fast \
     env CCC="$LCCC" bash tests/regression/check_frontend_ternary_common_type.sh
 gate "frontend-preprocessor-rules" fast \

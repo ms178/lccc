@@ -3407,6 +3407,63 @@ impl Lowerer {
         }
     }
 
+    /// Materialise every user label that was referenced but never defined.
+    ///
+    /// `get_or_create_user_label` allocates a `BlockId` on FIRST reference:
+    /// `&&label` (`Expr::LabelAddr`), a forward `goto`, or a static local
+    /// initializer. `lower_label_stmt` later calls `start_block(label)`,
+    /// which is what actually creates the basic block. A label inside an
+    /// arm the constant-condition fold of `?:` proved dead gets no
+    /// `start_block` at all -- yet its address was still taken, so the IR
+    /// holds `Instruction::LabelAddr { label }` naming a nonexistent block.
+    /// The emitter then writes `leaq .LBBn(%rip), %reg` against an
+    /// undefined local symbol: the integrated assembler rejects it
+    /// ("`.LBBn` is referenced ... but has no symbol-table entry"), and an
+    /// external assembler would bind it to absolute 0, turning the
+    /// computed goto into a jump to address zero. Reproducers:
+    /// gcc.c-torture/compile/pr17913.c and pr84136.c.
+    ///
+    /// GNU C defines a label's address as the address of the labelled
+    /// statement; when constant folding removes the enclosing expression,
+    /// GCC 16.2 still emits the label, at the function's tail. Emulate that
+    /// exactly: append a zero-instruction landing block terminated by the
+    /// very same fall-off-the-end `Return` the finalizer emits, so entering
+    /// it leaves the function normally. One central backfill covers every
+    /// producer of an un-started label ID, including nested functions.
+    ///
+    /// Only genuinely missing IDs get a block: defined labels are never
+    /// duplicated, no `BlockId` is reallocated (emitted `.LBBn` numbers
+    /// stay stable), and sorted insertion keeps IR output deterministic.
+    pub(super) fn materialize_undefined_user_labels(&mut self, return_type: IrType) {
+        let state = self.func_mut();
+        let present: FxHashSet<BlockId> = state.blocks.iter().map(|b| b.label).collect();
+        let mut missing: Vec<BlockId> = state
+            .user_labels
+            .values()
+            .copied()
+            .chain(state.global_init_label_blocks.iter().copied())
+            .filter(|label| !present.contains(label))
+            .collect();
+        missing.sort_by_key(|b| b.0);
+        missing.dedup();
+        if missing.is_empty() {
+            return;
+        }
+        let ret_op = if return_type == IrType::Void {
+            None
+        } else {
+            Some(Operand::Const(IrConst::I32(0)))
+        };
+        for label in missing {
+            state.blocks.push(BasicBlock {
+                label,
+                instructions: Vec::new(),
+                source_spans: Vec::new(),
+                terminator: Terminator::Return(ret_op.clone()),
+            });
+        }
+    }
+
     /// Resolve a label name through the local label scope stack.
     /// Returns a scope-qualified name if the label is declared via __label__,
     /// or the original name if not.

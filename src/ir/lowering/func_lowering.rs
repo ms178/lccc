@@ -1213,6 +1213,7 @@ impl Lowerer {
             }
             self.terminate(Terminator::Return(ret_op));
         }
+        self.materialize_undefined_user_labels(return_type);
 
         // Merge deferred entry-block allocas into blocks[0], right after
         // the existing parameter allocas. mem2reg skips the first N allocas

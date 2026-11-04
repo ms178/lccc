@@ -1765,6 +1765,13 @@ pub struct StructFieldDecl {
     /// GCC 15/16 `__attribute__((counted_by(member)))` / `[[gnu::counted_by(member)]]`:
     /// names the sibling integer field storing this flexible array's element count.
     pub counted_by: Option<String>,
+    /// A deferred `__attribute__((vector_size(EXPR)))` on the member's
+    /// declaration specifiers: EXPR was not parse-time evaluable (typically
+    /// `sizeof` of a struct typedef). A resolved size is applied directly by
+    /// the parser as a `TypeSpecifier::Vector`, but this one needs sema's
+    /// layout engine. A member declaration has its own specifier list, so
+    /// the attribute must NOT leak to the next member or out of the record.
+    pub vector_size_expr: Option<Box<Expr>>,
 }
 
 /// An enum variant.

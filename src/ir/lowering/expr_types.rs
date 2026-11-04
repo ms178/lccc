@@ -734,7 +734,8 @@ impl Lowerer {
             | "__builtin_va_arg_pack"
             | "__builtin_va_arg_pack_len" => Some(IrType::I32),
             "__builtin_thread_pointer" => Some(IrType::Ptr),
-            _ => None,
+            _ => crate::frontend::sema::builtins::gcc_compat_builtin_ctype(name)
+                .map(|ct| IrType::from_ctype(&ct)),
         }
     }
 
@@ -2416,6 +2417,9 @@ impl Lowerer {
     }
 
     pub(super) fn get_c2y_builtin_ctype(&self, name: &str, args: &[Expr]) -> Option<CType> {
+        if let Some(ct) = crate::frontend::sema::builtins::gcc_compat_builtin_ctype(name) {
+            return Some(ct);
+        }
         use crate::frontend::sema::{gcc16_builtins, stdbit};
         if stdbit::is_stdc_bit_builtin(name) {
             let arg0_ct = args

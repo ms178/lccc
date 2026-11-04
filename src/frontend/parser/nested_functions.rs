@@ -320,7 +320,17 @@ impl Parser {
         } else {
             type_spec
         };
-        let return_type = self.build_return_type(type_spec, &derived);
+        let mut return_type = self.build_return_type(type_spec, &derived);
+        // Same contract as parse_function_def: the pending vector attribute
+        // belongs to this nested function's return type. parse_compound_stmt
+        // saved and restored it around the body, so it is available here.
+        return_type = self.apply_pending_vector_attr(return_type);
+        if self.attrs.parsing_vector_size_expr.take().is_some() {
+            self.emit_error(
+                "vector_size on a function definition must be a constant expression",
+                start,
+            );
+        }
         // Asm-register attributes have no meaning on a function definition and are
         // dropped.  Alignment does have one, and is carried on the `FunctionDef`
         // rather than applied here: the key codegen looks up is the EMITTED name,

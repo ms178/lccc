@@ -26,7 +26,9 @@ import tempfile
 import time
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parent))
+sys.path.insert(0,str(Path(__file__).resolve().parent.parent))
 from corpus_selection import source_paths
+from tools.corpus import dejagnu
 from typing import Sequence
 
 
@@ -101,12 +103,10 @@ def dejagnu_flags(source: Path) -> tuple[str, ...]:
     default. The common unconditional language/overflow flags are sufficient
     to avoid false oracle disagreements in gcc.c-torture.
     """
-    contents = source.read_text(errors="replace")
-    flags: list[str] = []
-    pattern = re.compile(r"\{\s*dg-(?:additional-)?options\s+\"([^\"]*)\"\s*\}")
-    for match in pattern.finditer(contents):
-        flags.extend(shlex.split(match.group(1)))
-    return tuple(flags)
+    # Share the x86 runner's directive grammar: DejaGnu also spells the option
+    # list as a Tcl brace group, and a quote-only regex silently drops those
+    # flags (gcc.c-torture/execute/930529-1.c's -fwrapv is the witness).
+    return dejagnu.extract_option_flags(source.read_text(errors="replace"))
 
 
 def compile_reference(

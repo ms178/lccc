@@ -136,7 +136,23 @@ impl<'s> StaticInitChecker<'s> {
             CType::Array(..),
         ) = (init, target)
         {
-            if (self.ctype)(expr).is_some_and(|t| t == *target) {
+            // An UNSIZED target array takes its bound from the initializer
+            // (C11 6.7.9p22), so the literal's own bound is the answer, not
+            // a type mismatch: `static const unsigned short a[] =
+            // (const unsigned short[]){ 0x0D2B };` is GCC 16.2's pr48517.
+            // A sized target still has to match exactly -- a shorter or
+            // longer literal is a different object, not a braced list.
+            let is_payload = (self.ctype)(expr).is_some_and(|t| {
+                t == *target
+                    || matches!(
+                        (&t, target),
+                        (
+                            CType::Array(le, Some(_)),
+                            CType::Array(te, None),
+                        ) if le == te
+                    )
+            });
+            if is_payload {
                 let mut out = Vec::new();
                 self.collect_bad(payload, &mut out);
                 return out;
@@ -598,6 +614,23 @@ impl<'s> StaticInitChecker<'s> {
                 // The difference of two label addresses is an assembler-time
                 // constant (GCC accepts `static int o[] = {&&a - &&b}`).
                 _ if is_label_address(lhs) && is_label_address(rhs) => Kind::Value,
+                // GNU extension, measured against GCC 16.2: two pointers
+                // into the SAME string literal differ by a compile-time
+                // constant (`int z = &"Foobar"[1] - &"Foobar"[0];`). GCC
+                // rejects different literals with "initializer element is
+                // not computable at load time" because they may be distinct
+                // objects; Clang 23.1.4 rejects even the same-text form.
+                // Match GCC's rule by comparing the literal TEXT, not just
+                // `Address(None)` (which also covers &&label, functions and
+                // file-scope compound literals).
+                (Kind::Address(None), Kind::Address(None))
+                    if matches!(
+                        (string_literal_address_root(lhs), string_literal_address_root(rhs)),
+                        (Some(a), Some(b)) if a == b
+                    ) =>
+                {
+                    Kind::Value
+                }
                 _ => Kind::Bad,
             },
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
@@ -620,6 +653,40 @@ impl<'s> StaticInitChecker<'s> {
                 }
             }
         }
+    }
+}
+
+/// The `(text, element size)` of the string-literal object an address
+/// expression is rooted in, if any. `&"abc"[1]`, `"abc" + 1`, `1 + "abc"`,
+/// `(char *)&"abc"[0]` and pointer-arithmetic chains all root in the same
+/// literal; `&&label`, function designators and compound literals do not.
+/// The element size is part of the identity: `"abc"` and `L"abc"` share
+/// text but are distinct objects with different pointer-difference scales.
+/// `wchar_ctype().size()` honours `-fshort-wchar`. Constant-ness of the
+/// offsets is already established by `value()`/`address()` before the
+/// address-difference rule is consulted, so no evaluator is needed here.
+fn string_literal_address_root(e: &Expr) -> Option<(&str, usize)> {
+    let wide = crate::common::types::wchar_ctype().size();
+    match e {
+        Expr::StringLiteral(text, _) => Some((text.as_str(), 1)),
+        Expr::WideStringLiteral(text, _) => Some((text.as_str(), wide)),
+        Expr::Char16StringLiteral(text, _) => Some((text.as_str(), 2)),
+        Expr::AddressOf(inner, _) | Expr::Cast(_, inner, _, _) => {
+            string_literal_address_root(inner)
+        }
+        Expr::ArraySubscript(base, _, _) => string_literal_address_root(base),
+        Expr::BinaryOp(op, lhs, rhs, _) if matches!(op, BinOp::Add | BinOp::Sub) => {
+            // For Add either operand may carry the literal (`1 + "abc"`).
+            // For Sub only the left operand can (`"abc" - 1`).
+            string_literal_address_root(lhs).or_else(|| {
+                if matches!(op, BinOp::Add) {
+                    string_literal_address_root(rhs)
+                } else {
+                    None
+                }
+            })
+        }
+        _ => None,
     }
 }
 
