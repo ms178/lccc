@@ -460,3 +460,43 @@ kernel/real-objtool/QEMU gate. Kernel host prerequisite recovery has verified th
 original Git-blob, part, archive and all 93 Debian package digests; those are host
 tools only, never GCC-compiled kernel objects. Final-head hosted checks are still
 required after pushing these fixes.
+
+## Actual local package preparation and stronger configuration refusal
+
+Restored the complete Linux tree using the existing preparation script and
+verified tag v6.18.58 / commit `2926d88b`, archpkgbuilds `df9c9172`, recipe
+`b3fe4c7c4a8f82c7692d4077e99876693fcbcb82cef493018b43e68282d1bcaa`.
+Tag identity was verified, not its GPG signature. Target preparation used LCCC;
+GCC16.2 was HOSTCC only. All 93 recovered Debian host-package SHA256s passed.
+The package-derived configuration still produces the previously disclosed
+unsupported-option warnings: this is **not zero-warning kernel evidence**.
+
+At compiler head `747fc3c2a`, local standalone boot gate: **31088 bytes / limit
+32768 / headroom 1680**, `ld.bfd` flat-image byte identity PASS, **24 objects /
+zero forbidden ISA instructions**. No controlled comparison with older setup
+headers is available; do not interpret the difference from historical 31024 as
+a measured code-size regression or gain.
+
+An actual `LCCC_RECONFIG=1` full-package attempt correctly refused a dropped
+sched-ext feature. Audit then found that the drift list omitted LTO, BTF and
+other important compiler/config-dependent features. A new adversarial harness
+case deliberately dropped only CONFIG_LTO: the old harness incorrectly
+**succeeded with exit 0**. This is a confirmed validator gap, not a theory.
+
+The list now preserves the enabled LTO modes, BTF and module BTF, Clang CFI,
+and x86 kernel IBT. Nine negative tests use the **real** drift checker (not
+its older injected TEST_DRIFT stub), with nine unchanged-feature positive
+controls. Individually removing each new guard entry kills its corresponding
+test; **all nine mutants were killed**, without changing production sources.
+The harness remains a mocked Kbuild contract test, not kernel-build evidence.
+
+The strengthened real package attempt refuses **CONFIG_LTO, CONFIG_LTO_CLANG,
+CONFIG_LTO_CLANG_FULL, CONFIG_DEBUG_INFO_BTF, CONFIG_DEBUG_INFO_BTF_MODULES and
+CONFIG_SCHED_CLASS_EXT** being absent. `LCCC_ALLOW_CONFIG_DRIFT` was never set.
+No substitute defconfig, removed validator or disabled security feature is
+counted as satisfying the original package configuration. The absence of these
+features is measured; their individual implementation/provisioning root causes
+have not all been investigated. The full package kernel, local QEMU, all
+remaining options/warning families and hardware readiness remain unfulfilled.
+A separately labelled defconfig integration build can find further compiler
+failures, but cannot waive this package-config blocker.

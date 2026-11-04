@@ -1,0 +1,100 @@
+{
+  "schema": 1,
+  "compiler_source_head": "747fc3c2af6fe44b833beda73d1f6e2ccb36662f",
+  "compiler_sha256": "f4a9dc8da9899c2a6e1f3216856bc0d196530e557c1c9aa1d7f700c8b7a4dfee",
+  "boot": {
+    "end_bytes": 31088,
+    "limit_bytes": 32768,
+    "headroom_bytes": 1680,
+    "isa_objects": 24,
+    "forbidden_instructions": 0,
+    "setup_bin_sha256": "6ba6222256ad697dfc6015618afe4fe0d2dadc567b49b56d026aeeb26f4886f7",
+    "ld_bfd_flat_image_identical": true
+  },
+  "package_config_result": "REFUSED; not package-kernel success; no drift override used",
+  "dropped_package_symbols": [
+    "CONFIG_LTO",
+    "CONFIG_LTO_CLANG",
+    "CONFIG_LTO_CLANG_FULL",
+    "CONFIG_DEBUG_INFO_BTF",
+    "CONFIG_DEBUG_INFO_BTF_MODULES",
+    "CONFIG_SCHED_CLASS_EXT"
+  ],
+  "mutation_controls": [
+    {
+      "removed_symbol": "CONFIG_LTO",
+      "killed": true,
+      "log_sha256": "10148ac469c9f360454725579ff3f515a1711284c9896ff2966d18d81d8ea497"
+    },
+    {
+      "removed_symbol": "CONFIG_LTO_CLANG",
+      "killed": true,
+      "log_sha256": "aa8338fbd5cd44d50334a045054c10cb7bbc4b29675c681864bf556f9eeac0c4"
+    },
+    {
+      "removed_symbol": "CONFIG_LTO_CLANG_FULL",
+      "killed": true,
+      "log_sha256": "09ee8438e6d4773f553a1eb1e0c9ee96badea37cb4e4159bd173934df4de96d0"
+    },
+    {
+      "removed_symbol": "CONFIG_LTO_CLANG_THIN",
+      "killed": true,
+      "log_sha256": "bec20964a6e0409eded06463aa678d4efa8f0869eaf4554bef68d0beb1f1c2f9"
+    },
+    {
+      "removed_symbol": "CONFIG_LTO_CLANG_THIN_DIST",
+      "killed": true,
+      "log_sha256": "81be0e79c01c0a6e801da58e10ab9e1d8881239fc63ba42d87127b5f80029c39"
+    },
+    {
+      "removed_symbol": "CONFIG_DEBUG_INFO_BTF",
+      "killed": true,
+      "log_sha256": "330e336df0813806d7682f51ac37be6a1c38f03a2fb8003715cb084060f52c86"
+    },
+    {
+      "removed_symbol": "CONFIG_DEBUG_INFO_BTF_MODULES",
+      "killed": true,
+      "log_sha256": "c3aee7cfb4c95f18ed0c7e3f379509a18bd75451feb76343dd46cc3624247efe"
+    },
+    {
+      "removed_symbol": "CONFIG_CFI_CLANG",
+      "killed": true,
+      "log_sha256": "5091e0460c57ea209e17c6e95b45f39e45b8d8e98765ba8a4e8d00e7a1deaf4d"
+    },
+    {
+      "removed_symbol": "CONFIG_X86_KERNEL_IBT",
+      "killed": true,
+      "log_sha256": "cb4eb56fb076e44929f040a4ffc97b1c335809b849d277ceea029315c0217eb6"
+    }
+  ],
+  "logs": {
+    "guard_before": {
+      "workspace_path": "/home/user/kernel-config-guard-before.log",
+      "sha256": "5972357ec73d089f9a776f654049b9be479c41d707d210a6a72bd6e61bff52f8"
+    },
+    "guard_after": {
+      "workspace_path": "/home/user/kernel-config-guard-after.log",
+      "sha256": "75163edc73c82375d81ba04030c80764a3b431d6e45c1a3649bd6573f65e0eb4"
+    },
+    "kconfig_query": {
+      "workspace_path": "/home/user/kernel-kconfig-query.log",
+      "sha256": "dea6b8276bc668396d50bfeb1b55ad599523820a460312075c7ecc119a4e9736"
+    },
+    "package_before_strengthening": {
+      "workspace_path": "/home/user/final-local-package-full.log",
+      "sha256": "12445cf1f4085e9b3024f160f52f96d281cfe76f44ccf55949ca2f6a23b600b2"
+    },
+    "package_strict": {
+      "workspace_path": "/home/user/final-local-package-strict.log",
+      "sha256": "09de94d714f90e2e34190347bb18e97ae36a6857d28d2f0e47029c6a1ef5254a"
+    },
+    "boot": {
+      "workspace_path": "/home/user/final-local-boot.log",
+      "sha256": "06b71631a50da9a65dc59406db95aea45a5adfcfc8f1b5bc86c6e6f0b239bb04"
+    },
+    "prepare": {
+      "workspace_path": "/home/user/final-local-kernel-prepare.log",
+      "sha256": "32f5fe9e204d3ce6711c4a1f2c3cb1b583d3bf31d6b0ede7c1f9b08d5c977da0"
+    }
+  }
+}
