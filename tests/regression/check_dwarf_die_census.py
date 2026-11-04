@@ -205,18 +205,27 @@ def run(command: list[str], cwd: Path) -> None:
         )
 
 
-def census(readelf: str, obj: Path) -> dict[str, frozenset[str]]:
-    """The tags and attributes `obj` carries, and the ones on its subprograms."""
+def census(
+    readelf: str, obj: Path, *, require_clean: bool = True
+) -> dict[str, frozenset[str]]:
+    """The tags and attributes `obj` carries, and the ones on its subprograms.
+
+    ``require_clean`` is set for LCCC's own objects -- a diagnostic about a
+    section we wrote is a defect -- and cleared for a reference object, where a
+    diagnostic means only that this ``readelf`` cannot decode another producer's
+    encoding; the vocabulary it did decode is still worth comparing.
+    """
     completed = subprocess.run(
         [readelf, "--debug-dump=info", str(obj)], capture_output=True, text=True
     )
     require(completed.returncode == 0, f"{obj.name}: readelf failed: {completed.stderr}")
-    for marker in SUSPICIOUS:
-        require(
-            marker not in completed.stdout and marker not in completed.stderr,
-            f"{obj.name}: readelf reports {marker!r}: "
-            f"{completed.stderr.strip() or completed.stdout.strip()[:400]}",
-        )
+    if require_clean:
+        for marker in SUSPICIOUS:
+            require(
+                marker not in completed.stdout and marker not in completed.stderr,
+                f"{obj.name}: readelf reports {marker!r}: "
+                f"{completed.stderr.strip() or completed.stdout.strip()[:400]}",
+            )
     tags: set[str] = set()
     attributes: set[str] = set()
     subprogram: set[str] = set()
@@ -266,8 +275,8 @@ def describe(missing: set[str]) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lccc", default=os.environ.get("CCC", "target/fastbuild/lccc"))
-    parser.add_argument("--gcc", default=os.environ.get("GCC16", "gcc"))
-    parser.add_argument("--clang", default=os.environ.get("CLANG", "clang"))
+    parser.add_argument("--gcc", default=os.environ.get("GCC16", "gcc-16"))
+    parser.add_argument("--clang", default=os.environ.get("CLANG23", "clang-23"))
     parser.add_argument("--readelf", default=os.environ.get("READELF", "readelf"))
     parser.add_argument(
         "--versions", default="2,3,4,5", help="comma-separated dialects to compare"
@@ -330,7 +339,13 @@ def main() -> int:
                 if not compile_fixture(compiler, version, source, reference, work):
                     print(f"SKIP {name} {label}: the oracle rejected the dialect")
                     continue
-                compared = census(readelf, reference)
+                compared = census(readelf, reference, require_clean=False)
+                if not compared["tags"]:
+                    print(
+                        f"SKIP {name} {label}: this readelf decoded no DIE from the "
+                        f"reference object, so it cannot be compared"
+                    )
+                    continue
                 oracle_tags[name] |= compared["tags"]
                 oracle_attributes[name] |= compared["attributes"]
             print(
@@ -372,9 +387,11 @@ def main() -> int:
             f"{len(oracle_attributes[name] - ours_attributes)} attributes"
         )
 
+    version = subprocess.run([readelf, "--version"], capture_output=True, text=True)
     print(
         f"DWARF DIE census: PASS ({len(ours_tags)} tags, "
-        f"{len(ours_attributes)} attributes; every oracle-only one is declared)"
+        f"{len(ours_attributes)} attributes; every oracle-only one is declared; "
+        f"{version.stdout.splitlines()[0] if version.stdout else readelf})"
     )
     return 0
 
@@ -382,6 +399,11 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except GateFailure as failure:
-        print(f"FAIL: {failure}")
+    except (GateFailure, OSError, subprocess.SubprocessError) as failure:
+        print(f"FAIL: {failure}", file=sys.stderr)
+        # A workflow's log is not always readable from where a failure is
+        # triaged; an annotation carries the message to the pull request itself.
+        # Only Actions reads this syntax, so nothing changes locally.
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            print(f"::error title=dwarf DIE census::{failure}")
         sys.exit(1)
