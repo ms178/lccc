@@ -17271,7 +17271,14 @@ mod tests {
         // That register's use/def equation changed when the first copy was
         // removed, so the second deadness proof must be based on the updated
         // line store rather than the first candidate's cached CFG solution.
-        let asm = "f:\\n    movl 16(%esp), %ebx\\n    movl %ebx, %eax\\n    movl 20(%esp), %eax\\n    movl %eax, %ecx\\n    addl %ecx, %edx\\n    ret\\n";
+        let asm = r#"f:
+    movl 16(%esp), %ebx
+    movl %ebx, %eax
+    movl 20(%esp), %eax
+    movl %eax, %ecx
+    addl %ecx, %edx
+    ret
+"#;
         let out = run_relay(asm);
         assert!(out.contains("movl 16(%esp), %eax"), "{out}");
         assert!(out.contains("movl 20(%esp), %ecx"), "{out}");
