@@ -8442,10 +8442,7 @@ dereference it before applying '->' to it?"
             "__builtin_stack_save" => Vec::new(),
             "__builtin_stack_restore" => vec![param(void_ptr())],
             "__builtin_cexpi" => vec![param(CType::Double)],
-            "__builtin_cpow" => vec![
-                param(CType::ComplexDouble),
-                param(CType::ComplexDouble),
-            ],
+            "__builtin_cpow" => vec![param(CType::ComplexDouble), param(CType::ComplexDouble)],
             _ => return false,
         };
         self.check_call_arguments(name, args, &params, false, span);
