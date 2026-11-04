@@ -324,3 +324,40 @@ run ID before applying the per-workflow cap. Two new tests cover that observed
 ordering and timestamp precedence. All nine transport tests pass with warnings
 as errors. The first transport-only run completed successfully without starting
 or replacing any kernel job; exact ICX artifact retrieval continues.
+
+## Exact ICX runtime cause and non-waivable candidate contract
+
+Dedicated export run 41814140259 recovered Intel artifact 13313650379 from
+failed CI run 41812128042, job 126515336537. Its archive SHA256 is
+`270be67b3d04981fa0a0aaee38126ace424b50b3c06c458503c7a69554bc2326`.
+The verified `constant-truth.json` has 1860 records and exactly **two** failed
+records: ICX's native constant_p predicate, build status 0 / executable status 1
+at O0 and O2. All other observations in that artifact match their contracts.
+A compact receipt retains the failed records and content-addressed transport
+identity. The predicate only proves the subject was not 7; no exact subject
+return value or unrecorded output is inferred for ICX.
+
+The reference runtime profile now pins that measured predicate status. LCCC and
+GCC still must exit zero with empty output; unknown statuses, signals, output,
+compilation failures or unlisted reference discrepancies fail. Reference profile
+drift also fails. A hard guard prevents reference-profile entries from overriding
+LCCC, even if such an entry were accidentally inserted. Ten new contract tests
+cover those cases, exact extra warnings and disabled/duplicate-warning controls.
+Two mutants (leaking a reference override into LCCC, and labeling a matched
+reference failure as semantic success) are killed by the tests.
+
+JSON now records `semantic_passed` independently of matching the pinned reference
+observation, plus native build stderr and executable stdout/stderr. The console
+prints LCCC semantic failures and actual reference semantic failures separately.
+Local matrix: **1678 observations, zero unexpected; LCCC semantic failures=0,
+reference semantic failures=18**. A hosted three-oracle run is expected to record
+24 reference semantic failures (the prior 18 plus six measured ICX discrepancies),
+NOT zero compiler issues or universal semantic agreement. The new hosted result
+must still be observed; replaying the receipt is not a fresh ICX execution.
+
+No Rust/backend instructions or kernel warning options were changed by these CI
+contract/infrastructure fixes. The existing 7897-test Rust/Clippy validation
+applies to the unchanged compiler source; the transport's nine tests and matrix
+contract's ten tests pass with Python warnings treated as errors. The API-order
+mutation is killed too. Main 5a3b2087c remains an ancestor. No production-readiness,
+measured performance or all-warning-family completion claim follows from this.

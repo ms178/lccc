@@ -162,8 +162,11 @@ REFERENCE_RETURN_COUNTS = {
     ("icx", "constant_p_stmt_expr_is_unevaluated"): 0,
     ("icx", "classify_type_stmt_expr_is_unevaluated"): 0,
 }
-REFERENCE_RUNTIME_COUNTS = {
+REFERENCE_RUNTIME_EXIT_CODES = {
     ("clang", "(void)__builtin_constant_p(({ return 99; 0; }));"): 1,
+    # Verified matrix JSON from authenticated job 126515336537: build=0,
+    # predicate exit=1 at both O0/O2. Do not infer the subject's exact value.
+    ("icx", "(void)__builtin_constant_p(({ return 99; 0; }));"): 1,
 }
 TARGETS = {
     "x86_64": ("lccc", [], ["--target=x86_64-linux-gnu"]),
@@ -175,6 +178,46 @@ TARGETS = {
 
 def run(command):
     return subprocess.run(command, text=True, capture_output=True, timeout=30)
+
+
+def reference_expectation(profile, family, case, semantic):
+    # A reference profile can never waive the compiler under test, even if
+    # somebody accidentally adds an LCCC entry to a profile in the future.
+    return semantic if family == "lccc" else profile.get((family, case), semantic)
+
+
+def diagnostic_outcome(result, family, case, expected):
+    auxiliary = ORACLE_AUXILIARY.get((family, case), [])
+    diagnostics = re.findall(r"\[(-W[^]\s]+)\]", result.stderr)
+    warning_count = len(re.findall(r"\bwarning:", result.stderr))
+    reference = reference_expectation(REFERENCE_RETURN_COUNTS, family, case, expected)
+
+    def matches(count):
+        wanted = ["-Wreturn-type"] * count + auxiliary
+        return (result.returncode == 0 and sorted(diagnostics) == sorted(wanted)
+                and warning_count == len(wanted))
+
+    return dict(expected=expected, reference_expected=reference,
+                reference_disagreement=reference != expected,
+                expected_auxiliary=auxiliary, actual=diagnostics.count("-Wreturn-type"),
+                diagnostics=diagnostics, rc=result.returncode,
+                passed=matches(reference), semantic_passed=matches(expected))
+
+
+def runtime_outcome(built, executed, family, case):
+    reference = reference_expectation(REFERENCE_RUNTIME_EXIT_CODES, family, case, 0)
+
+    def matches(code):
+        return (built.returncode == 0 and executed is not None
+                and executed.returncode == code and not executed.stdout and not executed.stderr)
+
+    return dict(passed=matches(reference), semantic_passed=matches(0),
+                build_rc=built.returncode, build_stderr=built.stderr,
+                semantic_run_rc=0, reference_run_rc=reference,
+                reference_disagreement=reference != 0,
+                run_rc=executed.returncode if executed is not None else None,
+                run_stdout=executed.stdout if executed is not None else None,
+                run_stderr=executed.stderr if executed is not None else None)
 
 
 def main():
@@ -213,25 +256,13 @@ def main():
                             continue
                         result = run([compiler, *flags, opt, "-std=gnu11", "-Wreturn-type",
                                       "-S", str(source), "-o", os.devnull])
-                        count = len(re.findall(r"\[-Wreturn-type\]", result.stderr))
-                        auxiliary = ORACLE_AUXILIARY.get((family, name), [])
-                        diagnostics = re.findall(r"\[(-W[^]\s]+)\]", result.stderr)
-                        reference_expected = REFERENCE_RETURN_COUNTS.get((family, name), expected)
-                        expected_diagnostics = ["-Wreturn-type"] * reference_expected + auxiliary
-                        passed = (result.returncode == 0
-                                  and sorted(diagnostics) == sorted(expected_diagnostics)
-                                  and len(re.findall(r"\bwarning:", result.stderr))
-                                  == len(expected_diagnostics))
+                        outcome = diagnostic_outcome(result, family, name, expected)
                         records.append(dict(target=target, opt=opt, case=name, compiler=family,
-                                            expected=expected, reference_expected=reference_expected,
-                                            reference_disagreement=reference_expected != expected,
-                                            expected_auxiliary=auxiliary,
-                                            actual=count, diagnostics=diagnostics, rc=result.returncode,
-                                            passed=passed))
-                        if not passed:
+                                            **outcome))
+                        if not outcome["passed"]:
                             print(f"FAIL {family}/{target}/{opt}/{name}: rc={result.returncode}, "
-                                  f"warnings={count}, semantic_expected={expected}, "
-                                  f"reference_expected={reference_expected}\n{result.stderr}")
+                                  f"warnings={outcome['actual']}, semantic_expected={expected}, "
+                                  f"reference_expected={outcome['reference_expected']}\n{result.stderr}")
         # These statement expressions must retain their reachable final value.
         # A false proof of divergence can affect typing as well as warnings.
         runtime_compilers = [("lccc", str(args.lccc)), ("gcc", args.gcc), ("clang", args.clang)]
@@ -256,26 +287,25 @@ def main():
                     built = run([compiler, opt, "-Werror", "-Wreturn-type", str(source),
                                  "-o", str(binary)])
                     executed = run([str(binary)]) if built.returncode == 0 else None
-                    reference_rc = REFERENCE_RUNTIME_COUNTS.get((family, control), 0)
-                    passed = (executed is not None and executed.returncode == reference_rc
-                              and not executed.stdout and not executed.stderr)
+                    outcome = runtime_outcome(built, executed, family, control)
                     records.append(dict(target="x86_64", opt=opt, case=control,
-                                        compiler=family, passed=passed,
-                                        build_rc=built.returncode, semantic_run_rc=0,
-                                        reference_run_rc=reference_rc,
-                                        reference_disagreement=reference_rc != 0,
-                                        run_rc=executed.returncode if executed else None))
-                    if not passed:
+                                        compiler=family, **outcome))
+                    if not outcome["passed"]:
                         print(f"FAIL runtime {family}/{opt}/{control}: build_rc={built.returncode}, "
-                              f"run_rc={executed.returncode if executed else None}, "
-                              f"semantic_expected=0, reference_expected={reference_rc}: {built.stderr}")
+                              f"run_rc={outcome['run_rc']}, semantic_expected=0, "
+                              f"reference_expected={outcome['reference_run_rc']}: {built.stderr}")
     if args.json:
         args.json.write_text(json.dumps(records, indent=2) + "\n")
     failures = sum(not record["passed"] for record in records)
     auxiliary = sum(len(record.get("expected_auxiliary", [])) for record in records)
     disagreements = sum(record.get("reference_disagreement", False) for record in records)
     print(f"reference semantic disagreements (never LCCC waivers): {disagreements}")
-    print(f"typed constant truth: {len(records)} checks, {failures} failures, "
+    candidate_failures = sum(record["compiler"] == "lccc" and not record["semantic_passed"]
+                             for record in records)
+    reference_failures = sum(record["compiler"] != "lccc" and not record["semantic_passed"]
+                             for record in records)
+    print(f"semantic failures: LCCC={candidate_failures}, references={reference_failures}")
+    print(f"typed constant truth: {len(records)} checks, {failures} unexpected observations, "
           f"{auxiliary} exact oracle-specific auxiliary diagnostics")
     return bool(failures)
 
