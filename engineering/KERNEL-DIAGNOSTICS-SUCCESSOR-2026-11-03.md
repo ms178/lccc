@@ -294,3 +294,25 @@ assumption. LCCC/GCC normative expectations remain unchanged. A compact log
 excerpt and transport identity are committed. ICX behavior on the newly added
 constant_p native return-99 witness is still unverified and is NOT assigned a
 speculative expected result. New-head full CI remains pending.
+
+## CI evidence retrieval repair — 2026-11-04
+
+Current-head ICX still fails the value matrix. Exact exit-code evidence is
+required before changing a runtime reference contract. The diagnostic exporter
+now includes the SHA-named Intel provenance artifact (matrix JSON), not merely
+its log, and can select a completed cancelled workflow containing an already-
+failed job. It still refuses in-progress/foreign-repository runs, cross-repo PRs,
+expired artifacts and unrelated artifact names. It creates content-addressed
+blobs only, never updates refs/check outcomes or runs kernel/compiler builds.
+
+A separate label-only `CI diagnostic evidence` workflow avoids coupling a log
+request to host-package downloads or a restart of the kernel job. It neither
+skips nor replaces the kernel's validation check. Existing kernel build events
+and security gates are unchanged. The request label is `ci-diagnostic-transport`.
+The tests also exposed an unclosed event JSON file; it now uses a context manager.
+
+Validation: seven new transport tests pass with Python warnings treated as
+errors; separate failure-only-selection and omitted-Intel-artifact mutants both
+fail the intended test. CI/local gate parity passes unchanged at 530 commands /
+27 contracts. This is an observability/infrastructure repair, NOT resolution of
+the outstanding ICX value discrepancy or a green-CI/production-readiness claim.
