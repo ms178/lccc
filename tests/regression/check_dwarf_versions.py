@@ -600,10 +600,17 @@ def check_version_and_dialect(
     if version == 2:
         # A version 2 line program has nine standard opcodes, so its opcode base
         # is 10.  gcc 12.2 padded a `-gdwarf-2` program with the version 3 table
-        # (opcode base 13) instead; gcc 16.2 writes the version 2 shape, which
-        # is what the dialect says and what LCCC writes, so the oracle is asked
-        # for everything except the field its own age decides.
-        keys = tuple(key for key in LINE_KEYS if key not in ("opcode_base", "opcode_args"))
+        # (opcode base 13, header numbered 3) instead; gcc 16.2 writes the
+        # version 2 shape, which is what the dialect says and what LCCC writes,
+        # so the oracle is asked for everything except the fields its own age
+        # decides -- its header number and the opcode table that follows it.
+        # The unit's version is asserted above, and the section-size benchmark
+        # below is where an older oracle still pins the encoding.
+        keys = tuple(
+            key
+            for key in LINE_KEYS
+            if key not in ("version", "opcode_base", "opcode_args")
+        )
         require(
             ours_line["opcode_base"] == 10,
             f"{label}: a version 2 line program has nine standard opcodes, so "
