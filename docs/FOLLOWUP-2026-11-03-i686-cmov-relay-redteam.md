@@ -161,6 +161,16 @@ pre-win shape or its CI wiring. Each was reconciled, not weakened:
   1.07 s; shard a 525.59 → 526.69 s, still within the 5 % balance tolerance of
   shard b's 531.04 s, `predicted_gate_seconds` updated to match). Both
   `check_ci_gate_parity.py` and `check_ci_lane_plan.py` now PASS locally.
+- **audit-census knob ratchet.** With the orphan fixed, shard b ran to its
+  later gates and `python3 scripts/audit_census.py --check` failed:
+  `knob_literals 558 → 560 (+2)` for the two new kill switches
+  `CCC_NO_I686_SELECT_CMOV` / `CCC_NO_I686_LOAD_COPY_RELAY`. The ratchet's own
+  remedy is "justify and re-baseline in the commit that adds them"; both knobs
+  are documented (this note), so `knobs_undocumented` held at 262. The baseline
+  was re-baselined *surgically* — `knob_literals` 558 → 560 and the two names
+  inserted in sorted order in `knob_names`, every other ratcheted metric left
+  at its prior baseline (panic sites etc. are already below theirs).
+  `audit_census.py --check` now PASSes ("no metric grew").
 
 ---
 
