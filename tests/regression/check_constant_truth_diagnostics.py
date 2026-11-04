@@ -108,6 +108,18 @@ CASES.update({
         "extern int value; (void)_Generic(value, int: 1, "
         "default: ({ return 7; 0; }));", 1
     ),
+    "choose_selected_stmt_expr_return": (
+        "(void)__builtin_choose_expr(1, ({ return 7; 0; }), 1);", 0
+    ),
+    "choose_unselected_stmt_expr_return": (
+        "(void)__builtin_choose_expr(1, 1, ({ return 7; 0; }));", 1
+    ),
+    "constant_p_stmt_expr_is_unevaluated": (
+        "(void)__builtin_constant_p(({ return 7; 0; }));", 1
+    ),
+    "classify_type_stmt_expr_is_unevaluated": (
+        "(void)__builtin_classify_type(({ return 7; 0; }));", 1
+    ),
 })
 # GCC also diagnoses the unreachable statement before the first case label.
 # Require that exact extra diagnostic rather than disabling it or accepting

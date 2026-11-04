@@ -297,6 +297,38 @@ impl<'a, 's> Graph<'a, 's> {
                     .and_then(|index| associations.get(index))
                     .map_or(next, |association| self.expr(&association.expr, next))
             }
+            Expr::FunctionCall(callee, args, _)
+                if matches!(callee.as_ref(), Expr::Identifier(name, _)
+                    if name == "__builtin_choose_expr"
+                        && self.sema.symbol_table.lookup(name).is_none()
+                        && !self.sema.result.functions.contains_key(name))
+                    && args.len() == 3 =>
+            {
+                // Like _Generic, choose_expr evaluates only its selected
+                // operand. The controlling integer constant expression is
+                // not a run-time expression and the other arm is not run.
+                match self.sema.constant_truth_value(&args[0]) {
+                    Some(true) => self.expr(&args[1], next),
+                    Some(false) => self.expr(&args[2], next),
+                    None => {
+                        // An invalid non-ICE condition is already diagnosed
+                        // by sema. Keep both arms as a conservative recovery.
+                        let yes = self.expr(&args[1], next);
+                        let no = self.expr(&args[2], next);
+                        self.node(Node::Dispatch(vec![yes, no]))
+                    }
+                }
+            }
+            Expr::FunctionCall(callee, _, _)
+                if matches!(callee.as_ref(), Expr::Identifier(name, _)
+                    if matches!(name.as_str(), "__builtin_constant_p" | "__builtin_classify_type")
+                        && self.sema.symbol_table.lookup(name).is_none()
+                        && !self.sema.result.functions.contains_key(name)) =>
+            {
+                // Both builtins inspect an expression's constantness/type;
+                // neither evaluates its argument at run time.
+                next
+            }
             // These operands are unevaluated. VLA bounds written in the
             // corresponding type names are a separate, still-conservative
             // limitation (see the follow-up audit note).
