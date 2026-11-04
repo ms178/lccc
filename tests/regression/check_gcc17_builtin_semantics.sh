@@ -119,6 +119,26 @@ void clear_pad(int n)
 }
 C
 
+cat >"$tmp/illtyped.c" <<'C'
+void ill_typed_gcc17_builtins(int x, int *ip, double *dp, float *fp)
+{
+    (void)__builtin_bcmp(x, x, x);
+    __builtin_bzero(x, x);
+    __builtin_bcopy(x, x, x);
+    (void)__builtin_strdup(x);
+    (void)__builtin_strndup(x, x);
+    (void)__builtin_ilogb(ip);
+    (void)__builtin_modf(1.0, fp);
+    (void)__builtin_modff(1.0f, dp);
+    (void)__builtin_strncasecmp(x, x, x);
+    (void)__builtin_memcmp_eq(x, x, x);
+    (void)__builtin_stack_save(x);
+    __builtin_stack_restore(x);
+    (void)__builtin_cexpi(ip);
+    (void)__builtin_cpow(ip, ip);
+}
+C
+
 run_target() {
     local label=$1 compiler=$2 mflag=$3
     echo "== $label =="
@@ -130,6 +150,32 @@ run_target() {
     echo "$label runtime: $out"
     "$compiler" $mflag -O2 -c "$tmp/compile.c" -o "$tmp/compile.o"
     echo "$label clear_padding compile: PASS"
+
+    # The intercepted aliases and intrinsics have no source-level declaration
+    # for the ordinary call checker to inspect. Their implicit prototypes must
+    # still reject bad pointer classes, arities, and complex/real conversions.
+    local badlog="$tmp/illtyped-$label.log"
+    if "$compiler" $mflag -O2 -Werror -S "$tmp/illtyped.c" -o /dev/null 2>"$badlog"; then
+        echo "$label ill-typed GCC17 builtin calls were silently accepted"
+        cat "$badlog"
+        return 1
+    fi
+    if grep -Eqi 'internal error|panicked at' "$badlog"; then
+        echo "$label ill-typed GCC17 builtin call triggered an internal error"
+        cat "$badlog"
+        return 1
+    fi
+    for name in __builtin_bcmp __builtin_bzero __builtin_bcopy __builtin_strdup \
+        __builtin_strndup __builtin_ilogb __builtin_modf __builtin_modff \
+        __builtin_strncasecmp __builtin_memcmp_eq __builtin_stack_save \
+        __builtin_stack_restore __builtin_cexpi __builtin_cpow; do
+        if ! grep -Fq "$name" "$badlog"; then
+            echo "$label missing argument diagnostic for $name"
+            cat "$badlog"
+            return 1
+        fi
+    done
+    echo "$label ill-typed GCC17 builtin prototypes: PASS"
 }
 
 run_target x86_64 "$CCC" ""
