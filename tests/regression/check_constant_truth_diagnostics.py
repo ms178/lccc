@@ -157,6 +157,10 @@ ORACLE_AUXILIARY = {("gcc", "case_entry_after_return"): ["-Wswitch-unreachable"]
 REFERENCE_RETURN_COUNTS = {
     ("clang", "constant_p_stmt_expr_is_unevaluated"): 0,
     ("clang", "classify_type_stmt_expr_is_unevaluated"): 0,
+    # Authenticated hosted ICX2026.2 job 126327106993, O0 and O2.
+    # These are observed diagnostic defects, not inferred from Clang.
+    ("icx", "constant_p_stmt_expr_is_unevaluated"): 0,
+    ("icx", "classify_type_stmt_expr_is_unevaluated"): 0,
 }
 REFERENCE_RUNTIME_COUNTS = {
     ("clang", "(void)__builtin_constant_p(({ return 99; 0; }));"): 1,
@@ -226,7 +230,8 @@ def main():
                                             passed=passed))
                         if not passed:
                             print(f"FAIL {family}/{target}/{opt}/{name}: rc={result.returncode}, "
-                                  f"warnings={count}, expected={expected}\n{result.stderr}")
+                                  f"warnings={count}, semantic_expected={expected}, "
+                                  f"reference_expected={reference_expected}\n{result.stderr}")
         # These statement expressions must retain their reachable final value.
         # A false proof of divergence can affect typing as well as warnings.
         runtime_compilers = [("lccc", str(args.lccc)), ("gcc", args.gcc), ("clang", args.clang)]
@@ -261,7 +266,9 @@ def main():
                                         reference_disagreement=reference_rc != 0,
                                         run_rc=executed.returncode if executed else None))
                     if not passed:
-                        print(f"FAIL runtime {family}/{opt}/{control}: {built.stderr}")
+                        print(f"FAIL runtime {family}/{opt}/{control}: build_rc={built.returncode}, "
+                              f"run_rc={executed.returncode if executed else None}, "
+                              f"semantic_expected=0, reference_expected={reference_rc}: {built.stderr}")
     if args.json:
         args.json.write_text(json.dumps(records, indent=2) + "\n")
     failures = sum(not record["passed"] for record in records)

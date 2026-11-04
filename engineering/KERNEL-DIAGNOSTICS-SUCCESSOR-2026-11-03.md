@@ -283,3 +283,14 @@ user's 14700KF; no NIC/GPU/board performance measurement is available.
 Remaining warning families/options, vendor-reference discrepancies, local final-
 head full kernel/QEMU, measured performance gains and green final-head CI remain
 OPEN. This is a validated recovery/fix checkpoint, not production readiness.
+
+
+The diagnostic transport subsequently completed successfully at the new head.
+Its SHA256-verified blob exposed the original authenticated ICX2026.2 failure:
+**four missing return warnings** for unevaluated constant_p/classify_type operands
+(two cases at O0/O2), matching the observed Clang diagnostic discrepancy. Those
+four reference expectations are now pinned from actual ICX evidence, not an
+assumption. LCCC/GCC normative expectations remain unchanged. A compact log
+excerpt and transport identity are committed. ICX behavior on the newly added
+constant_p native return-99 witness is still unverified and is NOT assigned a
+speculative expected result. New-head full CI remains pending.
