@@ -8443,7 +8443,7 @@ dereference it before applying '->' to it?"
         let params = match name {
             "__builtin_memcmp_eq" => {
                 vec![const_void_param.clone(), const_void_param, param(size_t)]
-            },
+            }
             "__builtin_stack_save" => Vec::new(),
             "__builtin_stack_restore" => vec![param(void_ptr())],
             "__builtin_cexpi" => vec![param(CType::Double)],
