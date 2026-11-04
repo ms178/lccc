@@ -155,6 +155,24 @@ impl Lowerer {
             }
         }
 
+        // GNU labels-as-values: a BARE `&&label` initializing a scalar static
+        // object is an address constant. Compound/array elements already go
+        // through `collect_compound_init_element`, but the scalar path fell
+        // through to `diagnose_non_constant` ("initializer element is not
+        // constant") even though GCC 16.2, Clang and ICX accept
+        // `static void *p = &&a;`. Register the label as an address-taken CFG
+        // root exactly like the compound path: without it, cfg_simplify and
+        // the identical-block peephole are entitled to delete the label and
+        // the emitted `.quad`/`.long` would dangle. Cast-wrapped spellings
+        // (`(void *)&&a`) take the same route.
+        if let Expr::LabelAddr(label_name, _) = Self::strip_casts(expr) {
+            let scoped_label = self.get_or_create_user_label(label_name);
+            if let Some(ref mut fs) = self.func_state {
+                fs.global_init_label_blocks.push(scoped_label);
+            }
+            return GlobalInit::GlobalAddr(scoped_label.as_label());
+        }
+
         // Complex types: handle before scalar evaluation to prevent misinterpretation
         // of scalar values (e.g., `_Complex float g = 1.0f;`).
         //
