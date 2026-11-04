@@ -9400,12 +9400,6 @@ fn fold_load_copy_relay_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> b
     let len = infos.len();
     let mut changed = false;
     let mut liveness_cache: Option<GprLiveness> = None;
-    // A relay changes the use/def transfer functions only for its old
-    // scratch and new destination. Liveness is solved independently per GPR,
-    // so cached live-out bits for every other register remain exact. Rebuild
-    // only when a later candidate asks about a register dirtied by a prior
-    // rewrite; this avoids both stale proofs and an O(rewrites × CFG) rebuild.
-    let mut stale_liveness_regs: u16 = 0;
     const WINDOW: usize = 24;
 
     let mut i = 0;
@@ -9503,18 +9497,12 @@ fn fold_load_copy_relay_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> b
             continue;
         }
 
-        // %T must be dead after the copy (exact CFG dataflow). A prior
-        // relay may have changed this register's transfer function; refresh
-        // before consulting its live-out bit. Unaffected register facts remain
-        // reusable because per-register liveness has no cross-register terms.
-        let t_bit = 1u16 << t;
-        if liveness_cache.is_none() || stale_liveness_regs & t_bit != 0 {
-            liveness_cache = Some(GprLiveness::compute(store, infos));
-            stale_liveness_regs = 0;
-        }
-        let liveness = liveness_cache
-            .as_ref()
-            .expect("liveness cache just initialized");
+        // %T must be dead after the copy (exact CFG dataflow). The relay
+        // removes the use of a value already proven dead and moves %D's
+        // definition to the load; %D is untouched between load and copy.
+        // Thus the original live-out solution remains exact at later candidate
+        // copies, and GprLiveness's one-computation-per-sweep contract holds.
+        let liveness = liveness_cache.get_or_insert_with(|| GprLiveness::compute(store, infos));
         if !liveness.dead_after(cj, t) {
             i += 1;
             continue;
@@ -9532,9 +9520,6 @@ fn fold_load_copy_relay_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> b
         store.replace(i, new_load);
         infos[i] = classify_line_ctx(store.get(i), infos[i].ebp_gpr);
         infos[cj].kind = LineKind::Nop;
-        // The new load defines D instead of T, and the deleted copy no longer
-        // reads T or defines D. Only those two GPR equations have changed.
-        stale_liveness_regs |= (1u16 << t) | (1u16 << d);
         changed = true;
         i += 1;
     }
@@ -17268,11 +17253,10 @@ mod tests {
     }
 
     #[test]
-    fn load_copy_relay_revalidates_liveness_for_prior_destination_register() {
-        // The second relay uses the first relay's destination as its scratch.
-        // That register's use/def equation changed when the first copy was
-        // removed, so the second deadness proof must be based on the updated
-        // line store rather than the first candidate's cached CFG solution.
+    fn load_copy_relay_composes_multiple_slot_copies_in_one_sweep() {
+        // The second relay reuses the first relay's destination register.
+        // Both loads and copies are independently valid in the same sweep;
+        // one exact CFG liveness solution is reused for both candidates.
         let asm = r#"f:
     movl 16(%esp), %ebx
     movl %ebx, %eax
