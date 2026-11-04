@@ -674,6 +674,7 @@ pub fn peephole_optimize(asm: String) -> String {
     let merge_blocks =
         !has_opaque_functions && std::env::var("CCC_NO_IDENTICAL_BLOCK_MERGE").is_err();
     let coalesce_entry = std::env::var("CCC_NO_ENTRY_COPY_COALESCE").is_err();
+    let retarget_accum = std::env::var("CCC_NO_RV_ACCUMULATOR_RETARGET").is_err();
 
     // Phase 1: Iterative local passes (up to 8 rounds)
     let mut changed = true;
@@ -699,7 +700,9 @@ pub fn peephole_optimize(asm: String) -> String {
         if coalesce_entry {
             changed |= coalesce_entry_copies(&mut lines, &mut kinds, n);
         }
-        changed |= retarget_dying_accumulator_moves(&mut lines, &mut kinds, n);
+        if retarget_accum {
+            changed |= retarget_dying_accumulator_moves(&mut lines, &mut kinds, n);
+        }
         changed |= eliminate_li_mv_chain(&mut lines, &mut kinds, n);
         rounds += 1;
     }
@@ -738,7 +741,9 @@ pub fn peephole_optimize(asm: String) -> String {
             if coalesce_entry {
                 changed2 |= coalesce_entry_copies(&mut lines, &mut kinds, n);
             }
-            changed2 |= retarget_dying_accumulator_moves(&mut lines, &mut kinds, n);
+            if retarget_accum {
+                changed2 |= retarget_dying_accumulator_moves(&mut lines, &mut kinds, n);
+            }
             changed2 |= eliminate_li_mv_chain(&mut lines, &mut kinds, n);
             changed2 |= eliminate_dead_reg_moves(&lines, &mut kinds, n);
             rounds2 += 1;
@@ -2321,6 +2326,11 @@ fn retarget_li(line: &str, new_dst: u8) -> Option<String> {
 //
 // A retargeted producer that becomes a self-move (`mv t0, a0` + `mv a0, t0`)
 // takes the consumer with it: the destination already holds the value.
+//
+// `CCC_NO_RV_ACCUMULATOR_RETARGET=1` disables the pass, which is how a
+// differential gate can hold it constant while measuring another rule (a
+// length comparison between two builds of the same function must vary one
+// knob at a time).
 
 /// Token-exact test for a register name inside a line.
 fn mentions_reg(line: &str, reg: u8) -> bool {
@@ -2333,12 +2343,18 @@ fn mentions_reg(line: &str, reg: u8) -> bool {
 
 /// True when `line` merely overwrites `reg`: the register is its destination
 /// and appears nowhere else in the instruction.
+///
+/// A register-to-register form with the operand in the destination slot reads
+/// the register as well (`sext.w t0, t0` consumes t0's value), so it is a read
+/// and not an overwrite.  Treating it as an overwrite is a miscompile, not a
+/// missed optimisation: the value the reader consumes is the one the retarget
+/// removed, so `srli t0, t0, 3; mv a0, t0; sext.w t0, t0` would keep the
+/// pre-shift value in t0 and sign-extend that instead of the shift result.
+/// Only definitions that read nothing are pure overwrites.
 fn dest_only_write(line: &str, kind: LineKind, reg: u8) -> bool {
     match kind {
-        LineKind::Move { dst, .. }
-        | LineKind::LoadImm { dst }
-        | LineKind::SextW { dst, .. }
-        | LineKind::LoadS0 { reg: dst, .. } => dst == reg,
+        LineKind::LoadImm { dst } | LineKind::LoadS0 { reg: dst, .. } => dst == reg,
+        LineKind::Move { dst, src } | LineKind::SextW { dst, src } => dst == reg && src != reg,
         LineKind::Alu => {
             if parse_alu_dest(line) != Some(reg) {
                 return false;
@@ -3544,6 +3560,18 @@ mod tests {
             "f:\n    addw t0, t1, a1\n    mv a0, t0\n.LBB9:\n    addw t0, t6, t6\n    ret\n",
         );
         assert!(out.contains("mv a0, t0"), "{out}");
+    }
+
+    #[test]
+    fn retarget_refuses_when_the_scratch_is_read_again() {
+        // `sext.w t0, t0` reads t0: the retarget would leave the pre-shift
+        // value in t0 and sign-extend that instead of the shift result
+        // (check_cross_alu_abs_runtime caught exactly this).
+        let out = run_retarget(
+            "f:\n    srli t0, t0, 3\n    mv a0, t0\n    sext.w t0, t0\n    mv a1, t0\n    ret\n",
+        );
+        assert!(out.contains("mv a0, t0"), "{out}");
+        assert!(out.contains("srli t0, t0, 3"), "{out}");
     }
 
     #[test]
