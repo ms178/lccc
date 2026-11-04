@@ -335,7 +335,7 @@ environment artifact and is excluded — lccc ships its own header and passes it
 | Dimension | GCC 16.2 | lccc | Parity |
 |---|---|---|---|
 | Language / dialect (113 executed probes) | — | — | **105 / 113 (93 %)**, 15 of the 113 are environment artifacts |
-| C23 coverage (`docs/C23-COMPATIBILITY-INVENTORY.md`, 24 probes) | 24 | 23 | 96 % (`_BitInt` absent) |
+| C17/C23 dialect boundary (`docs/C23-COMPATIBILITY-INVENTORY.md`, 43 probes × 4 dialects) | 172 verdicts | 170 | all four dialects match GCC except the one declared `_BitInt` pair; messages and severities pinned by `check_c_std_diagnostics.py` |
 | Predefined macros (empty TU) | 408 | 464 | 155 GCC macros absent, **211 libc macros wrongly predefined**, 34 value spellings differ, `__GNUC__` = 14 |
 | Attributes | 142 | ~76 recognized | **62 attributes silently accepted and ignored**; `-Wattributes` never fires |
 | Builtins (default x86-64 ISA) | 1 696 | 607 | **478 shared**, 1 218 GCC-only, **129 over-claimed** |

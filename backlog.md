@@ -680,19 +680,22 @@ prototype in both. Conditional function-pointer composites retain a compatible
 prototype from either arm. The external GCC compatibility macros/version banner remain
 at 14.2.0: this dialect change is not a full-parity claim.
 
-The refreshed GCC 16.2 matrix has 24 probes and one C23 difference:
-`_BitInt(17)` (GCC accepts; LCCC rejects). This is an explicit, deferred feature
-gap, not a false expected result or a syntax-only acceptance target. The current
-fixed-width `CType` model cannot carry `_BitInt` precision and signedness through
-integer conversions, constants, layout, ABI lowering, codegen and debug metadata.
-The inventory documents the measured rejection and the end-to-end acceptance
+The refreshed GCC 16.2 matrix has one C23 difference: `_BitInt(17)` (GCC
+accepts; LCCC rejects). This is an explicit, deferred feature gap, not a false
+expected result or a syntax-only acceptance target. The current fixed-width
+`CType` model cannot carry `_BitInt` precision and signedness through integer
+conversions, constants, layout, ABI lowering, codegen and debug metadata. The
+inventory documents the measured rejection and the end-to-end acceptance
 criteria; until that work lands, keep the row visible and do not publish a C23
-coverage percentage. The 2026-10-27 report is saved at
-`/home/user/lccc-c23-inventory-2026-10-27.{json,md}`; the same run records six
-C17-mode differences where LCCC accepts extensions that GCC 16.2 rejects:
-`alignof-keyword`, `auto-type-inference`, `elifdef`, `elifndef`,
-`one-argument-va-start`, and `static-assert-keyword`. See
-`docs/C23-COMPATIBILITY-INVENTORY.md` for the dated method and classifications.
+coverage percentage. The 2026-11-04 run of
+`tests/regression/check_c23_inventory.py` measures 43 probes in `c17`, `gnu17`,
+`c23` and `gnu23` and finds no difference from GCC 16.2 except that declared
+deviation; the six C17-mode over-acceptances it used to record
+(`alignof-keyword`, `auto-type-inference`, `elifdef`, `elifndef`,
+`one-argument-va-start`, `static-assert-keyword`) are fixed, together with the
+implicit-int, `u8'x'` and macro-arity gaps found alongside them. See
+`docs/C23-COMPATIBILITY-INVENTORY.md` for the dated method and classifications,
+which also lists the four `-std=c89` deviations that remain (item 3 below).
 
 The historical per-function AVX2 vectorization candidate was remeasured with
 `tests/regression/per_function_target_avx2_reduction/reduction.c`: at `-O2`
@@ -718,8 +721,20 @@ Remaining work:
 2. **Exhaustive half-format proof.** The existing targeted `_Float16`/`__bf16`
    regressions do not cover all 2^16 encodings across rounding modes. Add that
    proof before making exhaustive conversion claims.
+3. **`-std=c89` revision keywords** (found by the 2026-11-04 matrix, outside the
+   C17/C23 scope of that change). LCCC accepts four C99/C11 forms that GCC 16.2
+   rejects in `-std=c89`: the `u8"..."` string prefix (C11), `restrict` (C99),
+   `inline` (C99) and `//` comments (C99). The dialect capability layer
+   (`src/common/dialect.rs`) decides these today from a single `c23` bit, which
+   cannot express "C99 or later"; carrying the standard revision into the lexer
+   and preprocessor as a number closes all four in the same place the C23
+   keywords are decided. `c17`, `gnu17`, `c23` and `gnu23` have no deviations,
+   so this item does not block them.
 
-**Gates.** Keep the 24-probe GCC 16.2 accept/reject matrix, default/gnu17
+**Gates.** Keep the 43-probe × 4-dialect GCC 16.2 accept/reject matrix
+(`tests/regression/check_c23_inventory.py`, which fails on any undeclared
+difference), the diagnostic-text/severity and DWARF dialect-identity gate
+(`tests/regression/check_c_std_diagnostics.py`), the default/gnu17
 prototype differential, and the per-function AVX2 ISA-boundary/runtime test;
 new `_BitInt` support must add compiler-oracle differential and ABI/layout
 coverage rather than weakening the existing known-gap row. **Effort** M–L ·

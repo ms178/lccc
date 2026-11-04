@@ -2198,6 +2198,7 @@ impl Driver {
         // Dialect-selected `__STDC_VERSION__`, applied BEFORE the user's
         // `-D`s so an explicit `-D__STDC_VERSION__=...` still wins.
         preprocessor.set_c23(self.c23_dialect());
+        preprocessor.set_gnu_extensions(self.gnu_extensions);
         if let Some(v) = self.stdc_version {
             match v {
                 Some(val) => preprocessor.define_macro("__STDC_VERSION__", val),

@@ -194,6 +194,7 @@ pub fn copy_literal_bytes_to_string(
 
 thread_local! {
     static C23_DIALECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static GNU_DIALECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Select (or clear) the C23 preprocessing dialect for this thread.
@@ -204,6 +205,21 @@ pub(super) fn set_c23_dialect(on: bool) {
 /// Whether this thread preprocesses C23.
 pub(super) fn c23_dialect() -> bool {
     C23_DIALECT.with(std::cell::Cell::get)
+}
+
+/// Select (or clear) GNU extensions for this thread's preprocessing dialect.
+///
+/// The preprocessor needs it for the directives that GCC enables as extensions
+/// (`#elifdef`, `#elifndef`), which are errors in a strict pre-C23 dialect.  It
+/// travels next to the revision because a directive decision must never be made
+/// from one switch alone.
+pub(super) fn set_gnu_dialect(on: bool) {
+    GNU_DIALECT.with(|c| c.set(on));
+}
+
+/// Whether this thread preprocesses a GNU dialect.
+pub(super) fn gnu_dialect() -> bool {
+    GNU_DIALECT.with(std::cell::Cell::get)
 }
 
 /// End of the pp-number starting at `bytes[i]` (a digit, or `.` followed by

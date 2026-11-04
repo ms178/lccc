@@ -442,7 +442,11 @@ fn scan_pp_char_token(bytes: &[u8], start: usize, model: CharModel) -> (ExprToke
             .unwrap_or(bytes.len() - start);
     let end = skip_literal_bytes(bytes, quote, b'\'').min(bytes.len());
     let wide_unit16 = model.wchar == Wchar::UShort;
-    let value = Lexer::character_constant(bytes_to_str(bytes, start, end), wide_unit16)
+    let dialect = crate::common::dialect::Dialect::new(
+        super::utils::c23_dialect(),
+        super::utils::gnu_dialect(),
+    );
+    let value = Lexer::character_constant(bytes_to_str(bytes, start, end), wide_unit16, dialect)
         .and_then(|kind| char_constant_operand(&kind, model))
         .unwrap_or((0, false));
     (ExprToken::Num(value.0, value.1), end)
@@ -1118,17 +1122,40 @@ mod char_constant_tests {
         ),
     ];
 
+    /// Evaluate under the C23 preprocessing dialect.
+    ///
+    /// The matrix pins C23 readings -- `u8'a'` is a character constant from C23
+    /// on, and an identifier followed by a narrow constant before it
+    /// (`Dialect::u8_char_literal`) -- so the evaluator runs where a `-std=c23`
+    /// build runs.  `eval_const_expr_with` reads the dialect from the same
+    /// thread-local the preprocessor sets, which starts out non-C23.
+    fn eval_c23(expr: &str, model: CharModel) -> bool {
+        crate::frontend::preprocessor::utils::set_c23_dialect(true);
+        let result = eval_const_expr_with(expr, model);
+        crate::frontend::preprocessor::utils::set_c23_dialect(false);
+        result
+    }
+
     #[test]
     fn character_constants_evaluate_like_gcc_on_every_target() {
         for (expr, expected) in MATRIX {
             for (model, want) in [X86, UCHAR, SHORT, AARCH64].into_iter().zip(expected) {
-                assert_eq!(
-                    eval_const_expr_with(expr, model),
-                    *want,
-                    "#if {expr} under {model:?}"
-                );
+                assert_eq!(eval_c23(expr, model), *want, "#if {expr} under {model:?}");
             }
         }
+    }
+
+    /// `u8'a'` is a C23 character constant and nothing else: before C23 the
+    /// spelling is the identifier `u8` followed by the constant `'a'`, which is
+    /// not an integer constant expression at all.  GCC 16.2 rejects it in
+    /// `-std=c17` and accepts it in `-std=c23`; so does this evaluator, and the
+    /// two halves are asserted separately so that neither can drift.
+    #[test]
+    fn u8_constants_need_the_c23_dialect() {
+        crate::frontend::preprocessor::utils::set_c23_dialect(true);
+        assert!(eval_const_expr_with("u8'a' == 97", X86));
+        crate::frontend::preprocessor::utils::set_c23_dialect(false);
+        assert!(!eval_const_expr_with("u8'a' == 97", X86));
     }
 
     #[test]
@@ -1138,7 +1165,7 @@ mod char_constant_tests {
         // followed by the narrow `'\400'` (0, truncated).
         assert!(eval_const_expr_with(r"L'\400' - 255 == 1", X86));
         assert!(eval_const_expr_with(r"(L'\400') == 256 ? 1 : 0", X86));
-        assert!(eval_const_expr_with(r"u8'\x7f' + U'\x1' == 128", X86));
+        assert!(eval_c23(r"u8'\x7f' + U'\x1' == 128", X86));
     }
 
     #[test]
