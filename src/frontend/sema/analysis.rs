@@ -8457,7 +8457,11 @@ dereference it before applying '->' to it?"
             // pointer or width here is a silent ABI miscompile, not merely a
             // missing diagnostic.
             "__builtin_bcmp" => {
-                vec![const_void_param.clone(), const_void_param.clone(), size_param]
+                vec![
+                    const_void_param.clone(),
+                    const_void_param.clone(),
+                    size_param,
+                ]
             }
             "__builtin_bzero" => vec![param(void_ptr()), size_param],
             "__builtin_bcopy" => {
