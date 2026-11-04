@@ -1,11 +1,12 @@
 # Follow-up 2026-11-04 — GCC 17 C-torture: real builtin semantics, ABI-correct lowering, measurable gains
 
-Branch `arena/e0bf34d9-lccc`, PR **#1096**. Upstream `ms178/lccc` `main` is
-`5a3b2087c307cd0cc4d11b4e0a83bde5ab87bf61` and the branch is a fast-forward descendant of
-it (`git merge-base HEAD origin/main == origin/main`, 27 commits ahead); the PR API's
-`base.sha = 9bed91b…` is a *stale cached field* left by an upstream force-push, not a
-missing rebase. Verified with `git ls-remote origin refs/heads/main`, the commits API and
-`git merge-base --is-ancestor`.
+Branch `arena/e0bf34d9-lccc`, PR **#1096**. Upstream `ms178/lccc` `main` advanced twice
+during this session: `5a3b2087c…` then `5083e566a259d6a41d88ce817cfed9afadfddbc7`
+(2026-11-04 14:16 +01:00). The final branch HEAD contains `5083e566a…` as an ancestor
+(`git merge-base --is-ancestor origin/main HEAD` passes). The PR API's
+`base.sha = 9bed91b…` is a *cached field*, not a missing rebase: `9bed91b…` is itself
+an ancestor of the new main. Verified with `git ls-remote origin refs/heads/main`,
+the commits API and `git merge-base --is-ancestor`.
 Acceptance gate is **hosted GitHub CI only** ("Keine lokale CI!"). Local work was limited to
 surgical unit/contract/runtime reproduction tests and the full torture *measurement* (not a
 local CI gate).
@@ -307,11 +308,11 @@ a record body): 8/8 pass.
 | `cargo fmt --all -- --check` | PASS |
 | `cargo clippy --profile fastbuild --locked -j 2 --all-targets -- -D warnings` | rc0, zero warnings |
 | `python3 scripts/check_clippy_policy.py` | PASS, 76 lints, 0 unknown |
-| `cargo test --profile fastbuild --lib -- -q` | **7914 passed, 0 failed, 10 ignored** (24.54 s) |
-| `python3 -m unittest discover -s tests/corpus -p 'test_*.py'` (the exact failed CI command) | **1170 tests, 0 failures, 5 skipped** (152.7 s) |
+| `cargo test --profile fastbuild --lib -- -q` | **7931 passed, 0 failed, 10 ignored** (14.80 s, after integrating latest main) |
+| `python3 -m unittest discover -s tests/corpus -p 'test_*.py'` (the exact failed CI command) | **1195 tests, 0 failures, 5 skipped** (194.2 s, after integrating latest main) |
 | `tests/regression/check_type_attr_and_static_init.sh` | PASS, both ABIs, -O0/-O2 |
 | `tests/regression/check_computed_goto_labels.sh` | PASS, both ABIs, -O0/-O2 |
-| `check_ci_lane_plan.py` (+ `--self-test`) | PASS (2934 s, 18 rules / 25 fixtures) |
+| `check_ci_lane_plan.py` (+ `--self-test`) | PASS (2935 s, 18 rules / 25 fixtures, after integrating latest main) |
 | `check_ci_gate_parity.py` | PASS (532 commands, 27 contracts) |
 | `check_ci_workflow_shell.py` | PASS (13 workflows) |
 | `python3 scripts/arena_provision.py --verify-only` | PASS, LP64 + ILP32 compile/link/run |
@@ -353,3 +354,37 @@ Clang has no nested functions); invalid vector return rejected by all three with
 same class of diagnostic; same-literal static difference (GCC/LCCC accept and agree on
 values, Clang rejects); five invalid label programs rejected by all three. No hardware
 PMU is available, so all performance statements remain instruction/call-count arguments.
+
+## 8. Integration with the latest `main` (2026-11-04, final)
+
+`main` advanced to `5083e566a…` while this branch was under hosted validation.
+Evidence, not assertion:
+
+```
+git merge-tree --write-tree origin/main HEAD  -> af24f7da218af5dd5b23b51dca4105857085dcd6 (rc=0)
+GitHub pull_request synthetic merge 98f2a984b:
+    parents = [5083e566a (main), 2da79402b (this branch)]
+    tree    = af24f7da218af5dd5b23b51dca4105857085dcd6   # IDENTICAL
+```
+
+So the hosted `pull_request` runs already validate exactly the tree obtained by
+integrating latest main. A literal 31-commit `git rebase origin/main` was attempted
+and aborted: it conflicts at 21/31 in `.github/ci-lane-plan.json`, whose structure
+`main` rewrote (858 vs ~1800 lines). Replaying would have required a force-push of a
+hand-merged tree DIFFERENT from the one CI validated. The chosen integration is a
+merge commit that keeps all 31 per-change commits, makes `5083e566a…` an ancestor,
+leaves the tree byte-identical to `af24f7da…`, and is a plain fast-forward push.
+
+Post-merge local gates (all PASS, not the acceptance gate): fastbuild 0,
+`cargo fmt --check` 0, `cargo clippy --all-targets -D warnings` 0, clippy policy
+(76 lints), 7931 unit tests / 0 failed, 1195 corpus unittests / 0 failures,
+lane plan 2935 s + 18/25 self-test, gate parity 534/27, workflow shell 14 files,
+shard partition a=85 / b=116, toolchain bundle OK, all three regression gates on
+both ABIs at -O0/-O2, and the 10/10 targeted GCC 17 compile matrix on both ABIs.
+
+Final four-leg partial measurement at `-O2` with GCC 16.2 as oracle and jobs=2:
+x86_64 compile (2016) = **1977 pass / 23 compile-fail / 15 reference-compile-skip /
+1 unsupported / 0 reference-fail**, up from the historical 1970/30 baseline
+(+7 pass, -7 fail). The remaining 23 are the honestly open families in §5
+(parser-depth `limits-*`, inline-asm constraints, deliberate per-vectorizer flags,
+and remaining GNU declaration corners).
