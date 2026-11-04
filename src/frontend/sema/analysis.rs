@@ -8433,6 +8433,15 @@ dereference it before applying '->' to it?"
                 PtrQuals::recorded(AddressSpace::Default, PtrQuals::CONST),
             )
         };
+        let const_char_ptr = || {
+            CType::Pointer(
+                Box::new(CType::Char),
+                PtrQuals::recorded(AddressSpace::Default, PtrQuals::CONST),
+            )
+        };
+        let char_ptr = || CType::Pointer(Box::new(CType::Char), PtrQuals::GENERIC);
+        let double_ptr = || CType::Pointer(Box::new(CType::Double), PtrQuals::GENERIC);
+        let float_ptr = || CType::Pointer(Box::new(CType::Float), PtrQuals::GENERIC);
         let param = |ty| (ty, None);
         let size_t = if crate::common::types::target_is_32bit() {
             CType::UInt
@@ -8440,9 +8449,30 @@ dereference it before applying '->' to it?"
             CType::ULong
         };
         let const_void_param = param(const_void_ptr());
+        let const_char_param = param(const_char_ptr());
+        let size_param = param(size_t);
         let params = match name {
+            // GCC's GNU aliases have no ordinary declaration to validate the
+            // call against. Their libc signatures still matter: a wrong
+            // pointer or width here is a silent ABI miscompile, not merely a
+            // missing diagnostic.
+            "__builtin_bcmp" => {
+                vec![const_void_param.clone(), const_void_param.clone(), size_param]
+            }
+            "__builtin_bzero" => vec![param(void_ptr()), size_param],
+            "__builtin_bcopy" => {
+                vec![const_void_param, param(void_ptr()), size_param]
+            }
+            "__builtin_strdup" => vec![const_char_param],
+            "__builtin_strndup" => vec![const_char_param, size_param],
+            "__builtin_ilogb" => vec![param(CType::Double)],
+            "__builtin_modf" => vec![param(CType::Double), param(double_ptr())],
+            "__builtin_modff" => vec![param(CType::Float), param(float_ptr())],
+            "__builtin_strncasecmp" => {
+                vec![const_char_param.clone(), const_char_param, size_param]
+            }
             "__builtin_memcmp_eq" => {
-                vec![const_void_param.clone(), const_void_param, param(size_t)]
+                vec![const_void_param.clone(), const_void_param, size_param]
             }
             "__builtin_stack_save" => Vec::new(),
             "__builtin_stack_restore" => vec![param(void_ptr())],
