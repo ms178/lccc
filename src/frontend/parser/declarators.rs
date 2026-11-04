@@ -993,24 +993,9 @@ impl Parser {
             self.attrs.parsing_address_space = AddressSpace::Default;
             self.attrs.take_storage_classes();
             if let Some(mut type_spec) = self.parse_type_specifier() {
-                // A direct `__attribute__((vector_size(N)))` in a PARAMETER's
-                // declaration specifiers forms a VECTOR PARAMETER, exactly
-                // as it does for a cast or compound literal. param_decl has
-                // no vector_size field, so leaving the attribute pending in
-                // parser state dropped it -- the parameter stayed `int` and
-                // the attribute was then taken by the first local declaration
-                // of the function body (gcc.c-torture/compile/vector-1.c:
-                // `(vector float)t` reported "a value of type 'int'").
-                // Wrap the base spec here, BEFORE pointer/array declarator
-                // layers are applied below.
-                let param_spec_span = self.peek_span();
-                type_spec = self.apply_pending_vector_attr(type_spec);
-                if self.attrs.parsing_vector_size_expr.take().is_some() {
-                    self.emit_error(
-                        "vector_size on a parameter must be a constant expression",
-                        param_spec_span,
-                    );
-                }
+                // Wrap the parameter's OWN vector attribute into its base
+                // spec, before any pointer/array declarator layers (vector-1.c).
+                type_spec = self.apply_param_vector_attr(type_spec);
                 // Snapshot the declaration-level named address space NOW, before
                 // the declarator parser runs (the same rule struct fields follow
                 // in parse_struct_fields). `struct c __seg_gs *p` records
@@ -1052,18 +1037,7 @@ impl Parser {
                         && ptr_to_array_dims.is_empty()
                         && !is_func_ptr,
                 );
-                // Post-name GCC attributes: `int x __attribute__((aligned(32)))`.
-                // The parameter declarator parser does not consume them; parse
-                // them here and merge `aligned` with any pre-name/_Alignas
-                // alignment already captured.
-                let (_, post_align, _, _, _) = self.parse_gcc_attributes();
-                if let Some(a) = post_align {
-                    self.attrs.parsed_alignas = Some(
-                        self.attrs
-                            .parsed_alignas
-                            .map_or(a, |prev: usize| prev.max(a)),
-                    );
-                }
+                self.merge_param_post_align();
                 // Direct `__attribute__((aligned(N)))` / `_Alignas(...)`
                 // spellings on the parameter: captured during declarator
                 // parsing. `take()` also prevents leakage into the NEXT
@@ -1219,6 +1193,42 @@ impl Parser {
 
         self.expect_closing(&TokenKind::RParen, open);
         (params, variadic, true)
+    }
+
+    /// A direct `__attribute__((vector_size(N)))` in a PARAMETER's declaration
+    /// specifiers forms a VECTOR PARAMETER, exactly as it does for a cast or
+    /// compound literal. `ParamDecl` has no `vector_size` field, so leaving the
+    /// attribute pending in parser state dropped it: the parameter stayed
+    /// `int` and the first local declaration of the function body took the
+    /// attribute instead (gcc.c-torture/compile/vector-1.c reported a "value
+    /// of type 'int'" for `(vector float)t`). Wrap the BASE spec here, before
+    /// pointer/array declarator layers are applied. A deferred
+    /// `vector_size(EXPR)` cannot be represented on a ParamDecl, so reject it
+    /// explicitly rather than leaking it into the next declaration.
+    fn apply_param_vector_attr(&mut self, type_spec: TypeSpecifier) -> TypeSpecifier {
+        let span = self.peek_span();
+        let spec = self.apply_pending_vector_attr(type_spec);
+        if self.attrs.parsing_vector_size_expr.take().is_some() {
+            self.emit_error(
+                "vector_size on a parameter must be a constant expression",
+                span,
+            );
+        }
+        spec
+    }
+
+    /// Post-name GCC attributes (`int x __attribute__((aligned(32)))`) are not
+    /// consumed by the parameter declarator parser. Merge their `aligned`
+    /// value with any pre-name or `_Alignas` alignment already captured.
+    fn merge_param_post_align(&mut self) {
+        let (_, post_align, _, _, _) = self.parse_gcc_attributes();
+        if let Some(a) = post_align {
+            self.attrs.parsed_alignas = Some(
+                self.attrs
+                    .parsed_alignas
+                    .map_or(a, |prev: usize| prev.max(a)),
+            );
+        }
     }
 
     /// A parameter's storage constraints are independent of declarator
