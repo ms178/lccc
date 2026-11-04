@@ -674,6 +674,7 @@ pub fn peephole_optimize(asm: String) -> String {
     let merge_blocks =
         !has_opaque_functions && std::env::var("CCC_NO_IDENTICAL_BLOCK_MERGE").is_err();
     let coalesce_entry = std::env::var("CCC_NO_ENTRY_COPY_COALESCE").is_err();
+    let retarget_accum = std::env::var("CCC_NO_RV_ACCUMULATOR_RETARGET").is_err();
 
     // Phase 1: Iterative local passes (up to 8 rounds)
     let mut changed = true;
@@ -698,6 +699,9 @@ pub fn peephole_optimize(asm: String) -> String {
         }
         if coalesce_entry {
             changed |= coalesce_entry_copies(&mut lines, &mut kinds, n);
+        }
+        if retarget_accum {
+            changed |= retarget_dying_accumulator_moves(&mut lines, &mut kinds, n);
         }
         changed |= eliminate_li_mv_chain(&mut lines, &mut kinds, n);
         rounds += 1;
@@ -736,6 +740,9 @@ pub fn peephole_optimize(asm: String) -> String {
             }
             if coalesce_entry {
                 changed2 |= coalesce_entry_copies(&mut lines, &mut kinds, n);
+            }
+            if retarget_accum {
+                changed2 |= retarget_dying_accumulator_moves(&mut lines, &mut kinds, n);
             }
             changed2 |= eliminate_li_mv_chain(&mut lines, &mut kinds, n);
             changed2 |= eliminate_dead_reg_moves(&lines, &mut kinds, n);
@@ -2296,6 +2303,211 @@ fn retarget_li(line: &str, new_dst: u8) -> Option<String> {
     None
 }
 
+// ── Dying-accumulator producer retarget ─────────────────────────────────────
+//
+// The emitter computes every result in the accumulator (`t0`) and then copies
+// it to the value's home (`emit_store_result` -> `store_t0_to`).  For a value
+// whose home is not the accumulator that copy is a full instruction per
+// operation, and it is pure overhead: `t0`..`t6` are scratches -- no value is
+// ever homed there, and no ABI contract names them -- so a producer may write
+// the destination directly:
+//
+//     addw t0, t1, a1   ->   addw a0, t1, a1
+//     mv   a0, t0            (deleted)
+//
+// Each of the following is checked rather than assumed:
+//
+//   * the producer names exactly one destination, its shape is one this pass
+//     can rewrite (`mv`, `li`, `sext.w`, a frame load, or a plain ALU line),
+//     and that destination is an accumulator;
+//   * the consumer is the next live line of the same symbol-delimited window
+//     and is `mv D, tK` with `D != tK`;
+//   * `tK` is dead after the consumer -- see [`scratch_dead_after`].
+//
+// A retargeted producer that becomes a self-move (`mv t0, a0` + `mv a0, t0`)
+// takes the consumer with it: the destination already holds the value.
+//
+// `CCC_NO_RV_ACCUMULATOR_RETARGET=1` disables the pass, which is how a
+// differential gate can hold it constant while measuring another rule (a
+// length comparison between two builds of the same function must vary one
+// knob at a time).
+
+/// Token-exact test for a register name inside a line.
+fn mentions_reg(line: &str, reg: u8) -> bool {
+    let name = reg_name(reg);
+    !name.is_empty()
+        && line
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|tok| tok == name)
+}
+
+/// True when `line` merely overwrites `reg`: the register is its destination
+/// and appears nowhere else in the instruction.
+///
+/// A register-to-register form with the operand in the destination slot reads
+/// the register as well (`sext.w t0, t0` consumes t0's value), so it is a read
+/// and not an overwrite.  Treating it as an overwrite is a miscompile, not a
+/// missed optimisation: the value the reader consumes is the one the retarget
+/// removed, so `srli t0, t0, 3; mv a0, t0; sext.w t0, t0` would keep the
+/// pre-shift value in t0 and sign-extend that instead of the shift result.
+/// Only definitions that read nothing are pure overwrites.
+fn dest_only_write(line: &str, kind: LineKind, reg: u8) -> bool {
+    match kind {
+        LineKind::LoadImm { dst } | LineKind::LoadS0 { reg: dst, .. } => dst == reg,
+        LineKind::Move { dst, src } | LineKind::SextW { dst, src } => dst == reg && src != reg,
+        LineKind::Alu => {
+            if parse_alu_dest(line) != Some(reg) {
+                return false;
+            }
+            // The destination is the first operand, so only a later mention
+            // would be a read (`add t0, t0, t1`).
+            match line.trim().split_once(char::is_whitespace) {
+                Some((_, rest)) => match rest.trim_start().split_once(',') {
+                    Some((_, tail)) => !mentions_reg(tail, reg),
+                    None => true,
+                },
+                None => true,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// True when `reg` cannot be read again inside the window: the next thing that
+/// happens to it is an overwrite, or the function returns.  A scratch register
+/// is never a return register, so `ret` ends the search successfully.
+///
+/// Labels, branches, jumps and calls end it with a refusal: the first three
+/// leave the straight-line run, and a callee is entitled to clobber a scratch
+/// under the ABI while this pass is not entitled to assume the emitter relies
+/// on it.
+fn scratch_dead_after(
+    lines: &[String],
+    kinds: &[LineKind],
+    start: usize,
+    reg: u8,
+    fend: usize,
+) -> bool {
+    let mask = 1u64 << reg;
+    for k in start..fend {
+        match kinds[k] {
+            LineKind::Nop | LineKind::Directive => continue,
+            LineKind::Ret => return true,
+            LineKind::Label | LineKind::Branch | LineKind::Jump | LineKind::Call => return false,
+            _ => {}
+        }
+        if has_unmodelled_effects(&lines[k]) {
+            return false;
+        }
+        let (ireads, iwrites) = classify_implicit_operands_rv(&lines[k]);
+        if ireads & mask != 0 {
+            return false;
+        }
+        if iwrites & mask != 0 {
+            return true;
+        }
+        if !mentions_reg(&lines[k], reg) {
+            continue;
+        }
+        return dest_only_write(&lines[k], kinds[k], reg);
+    }
+    true
+}
+
+/// Replace the first operand of a `mnemonic rd, ...` line with `new_dst`.
+fn retarget_first_operand(line: &str, new_dst: u8) -> Option<String> {
+    let trimmed = line.trim();
+    let space = trimmed.find(char::is_whitespace)?;
+    let (mnem, rest) = trimmed.split_at(space);
+    let (_, tail) = rest.trim_start().split_once(',')?;
+    let indent = &line[..line.len() - line.trim_start().len()];
+    Some(format!("{indent}{mnem} {},{}", reg_name(new_dst), tail))
+}
+
+fn retarget_dying_accumulator_moves(
+    lines: &mut [String],
+    kinds: &mut [LineKind],
+    n: usize,
+) -> bool {
+    /// The destination this pass may rewrite: a single-destination producer of
+    /// a shape it understands, writing an accumulator.
+    fn producible_dest(line: &str, kind: LineKind) -> Option<u8> {
+        let dst = match kind {
+            LineKind::Move { dst, .. }
+            | LineKind::LoadImm { dst }
+            | LineKind::SextW { dst, .. }
+            | LineKind::LoadS0 { reg: dst, .. } => dst,
+            LineKind::Alu => parse_alu_dest(line)?,
+            _ => return None,
+        };
+        (dst <= REG_T6).then_some(dst)
+    }
+    if n == 0 {
+        return false;
+    }
+    let mut starts: Vec<usize> = (0..n)
+        .filter(|&i| {
+            lines[i].ends_with(':')
+                && !lines[i].starts_with('.')
+                && !lines[i].starts_with(char::is_whitespace)
+        })
+        .collect();
+    if starts.is_empty() {
+        return false;
+    }
+    starts.push(n);
+    let mut changed = false;
+    for w in 0..starts.len() - 1 {
+        let (fstart, fend) = (starts[w], starts[w + 1]);
+        // An opaque body hides the register uses this pass reasons about.
+        if lines[fstart..fend].iter().any(|line| line == OPAQUE_LINE) {
+            continue;
+        }
+        let mut i = fstart + 1;
+        while i + 1 < fend {
+            let Some(tmp) = producible_dest(&lines[i], kinds[i]) else {
+                i += 1;
+                continue;
+            };
+            let mut j = i + 1;
+            while j < fend && kinds[j] == LineKind::Nop {
+                j += 1;
+            }
+            let Some(LineKind::Move { dst, src }) = kinds.get(j).copied() else {
+                i += 1;
+                continue;
+            };
+            // A value home is never a scratch, and `s0`, `sp` and `ra` carry
+            // meaning of their own: leave those consumers alone.
+            if src != tmp
+                || dst == tmp
+                || dst == REG_S0
+                || dst == REG_SP
+                || dst == REG_RA
+                || !scratch_dead_after(lines, kinds, j + 1, tmp, fend)
+            {
+                i += 1;
+                continue;
+            }
+            let self_move = matches!(kinds[i], LineKind::Move { src, .. } if src == dst);
+            if self_move {
+                kinds[i] = LineKind::Nop;
+            } else {
+                let Some(new_line) = retarget_first_operand(&lines[i], dst) else {
+                    i += 1;
+                    continue;
+                };
+                lines[i] = new_line;
+                kinds[i] = classify_line(&lines[i]);
+            }
+            kinds[j] = LineKind::Nop;
+            changed = true;
+            i += 1;
+        }
+    }
+    changed
+}
+
 // ── Global store forwarding ──────────────────────────────────────────────────
 //
 // Tracks slot→register mappings as we scan forward within each basic block.
@@ -3284,6 +3496,118 @@ mod tests {
         assert!(result.contains("sd t0, -24(s0)"));
     }
 
+    // ── Dying-accumulator producer retarget ─────────────────────────────────
+    //
+    // These drive the pass directly instead of the whole peephole pipeline:
+    // the guards are what this pass owns, and no other pass may decide whether
+    // they hold.
+
+    /// Run only the retarget pass over `input` and render the surviving lines.
+    fn run_retarget(input: &str) -> String {
+        let mut lines: Vec<String> = input.lines().map(str::to_string).collect();
+        let n = lines.len();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let _ = retarget_dying_accumulator_moves(&mut lines, &mut kinds, n);
+        lines
+            .iter()
+            .zip(kinds.iter())
+            .filter(|(_, k)| **k != LineKind::Nop)
+            .map(|(l, _)| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn retarget_alu_producer_writes_the_home() {
+        let out = run_retarget("f:\n    addw t0, t1, a1\n    mv a0, t0\n    ret\n");
+        assert!(out.contains("addw a0, t1, a1"), "{out}");
+        assert!(!out.contains("mv a0, t0"), "{out}");
+    }
+
+    #[test]
+    fn retarget_immediate_producer_writes_the_home() {
+        let out = run_retarget("f:\n    li t0, 42\n    mv a0, t0\n    ret\n");
+        assert!(out.contains("li a0, 42"), "{out}");
+        assert!(!out.contains("li t0, 42"), "{out}");
+    }
+
+    #[test]
+    fn retarget_frame_load_producer_writes_the_home() {
+        let out = run_retarget("f:\n    lw t0, 8(s0)\n    mv a1, t0\n    ret\n");
+        assert!(out.contains("lw a1, 8(s0)"), "{out}");
+    }
+
+    #[test]
+    fn retarget_self_move_drops_both_lines() {
+        let out = run_retarget("f:\n    sext.w a0, a0\n    mv t0, a0\n    mv a0, t0\n    ret\n");
+        assert!(!out.contains("mv a0, t0"), "{out}");
+        assert!(!out.contains("mv t0, a0"), "{out}");
+        assert!(out.contains("sext.w a0, a0"), "{out}");
+    }
+
+    #[test]
+    fn retarget_refuses_a_live_scratch() {
+        // `t0` is read again, so the copy is the only definition of `a0`.
+        // The reader has to name `t0` in an operand slot: `addw t0, t6, t6`
+        // only overwrites it and therefore leaves it dead.
+        let out =
+            run_retarget("f:\n    addw t0, t1, a1\n    mv a0, t0\n    addw t6, t0, t0\n    ret\n");
+        assert!(out.contains("mv a0, t0"), "{out}");
+        assert!(out.contains("addw t0, t1, a1"), "{out}");
+    }
+
+    #[test]
+    fn retarget_refuses_across_a_label() {
+        let out = run_retarget(
+            "f:\n    addw t0, t1, a1\n    mv a0, t0\n.LBB9:\n    addw t0, t6, t6\n    ret\n",
+        );
+        assert!(out.contains("mv a0, t0"), "{out}");
+    }
+
+    #[test]
+    fn retarget_refuses_when_the_scratch_is_read_again() {
+        // `sext.w t0, t0` reads t0: the retarget would leave the pre-shift
+        // value in t0 and sign-extend that instead of the shift result
+        // (check_cross_alu_abs_runtime caught exactly this).
+        let out = run_retarget(
+            "f:\n    srli t0, t0, 3\n    mv a0, t0\n    sext.w t0, t0\n    mv a1, t0\n    ret\n",
+        );
+        assert!(out.contains("mv a0, t0"), "{out}");
+        assert!(out.contains("srli t0, t0, 3"), "{out}");
+    }
+
+    #[test]
+    fn retarget_refuses_through_a_store() {
+        // A store reads its source; `t0` is live at the next line.
+        let out =
+            run_retarget("f:\n    addw t0, t1, a1\n    mv a0, t0\n    sw t0, 8(s0)\n    ret\n");
+        assert!(out.contains("mv a0, t0"), "{out}");
+    }
+
+    #[test]
+    fn retarget_leaves_value_registers_alone() {
+        // `s1` is a value home, not an accumulator: nothing to retarget.
+        let out = run_retarget("f:\n    lw s1, 8(s0)\n    mv a0, s1\n    ret\n");
+        assert!(out.contains("mv a0, s1"), "{out}");
+        assert!(out.contains("lw s1, 8(s0)"), "{out}");
+    }
+
+    #[test]
+    fn retarget_refuses_a_frame_pointer_home() {
+        let out = run_retarget("f:\n    addw t0, t1, a1\n    mv sp, t0\n    ret\n");
+        assert!(out.contains("mv sp, t0"), "{out}");
+    }
+
+    #[test]
+    fn retarget_tracks_a_dead_scratch_past_the_return() {
+        // `ret` ends the search successfully: no scratch is a return register.
+        let out = run_retarget(
+            "f:\n    addw t0, t1, a1\n    mv a0, t0\n    ld ra, 8(s0)\n    addi sp, sp, 16\n    ret\n",
+        );
+        assert!(out.contains("addw a0, t1, a1"), "{out}");
+        assert!(!out.contains("mv a0, t0"), "{out}");
+    }
+
     #[test]
     fn test_copy_prop_word_boundary() {
         assert_eq!(replace_whole_word("t10, t1", "t1", "s1"), "t10, s1");
@@ -3575,12 +3899,26 @@ mod jump_near_tests {
         assert!(!out.contains("sext.w t0, t0"), "\n{}", out);
     }
 
+    /// A `sext.w <dst>, <src>` line survives and still reads `src`.
+    ///
+    /// The accumulator retarget may move the destination of the sext into the
+    /// home it is copied to (`sext.w t0, t0` + `mv t1, t0` becomes
+    /// `sext.w t1, t0`), so these tests assert that the sext is still there and
+    /// still consumes the loaded value, not that its destination is `t0`.
+    fn sext_from(out: &str, src: &str) -> bool {
+        out.lines()
+            .any(|line| match line.trim().strip_prefix("sext.w ") {
+                Some(rest) => rest.split_once(", ").is_some_and(|(_dst, s)| s == src),
+                None => false,
+            })
+    }
+
     #[test]
     fn sext_self_form_kept_when_not_sext_wide() {
         // ld does NOT produce a sext-wide value; the sext.w must survive.
         let input = "f:\n    ld t0, 0(s0)\n    sext.w t0, t0\n    mv t1, t0\n    ret\n";
         let out = peephole_optimize(input.to_string());
-        assert!(out.contains("sext.w t0, t0"), "\n{}", out);
+        assert!(sext_from(&out, "t0"), "\n{}", out);
     }
 
     #[test]
@@ -3592,7 +3930,7 @@ mod jump_near_tests {
                 "f:\n    ld t0, 0(s0)\n    srai t0, t0, {k}\n    sext.w t0, t0\n    mv t1, t0\n    ret\n"
             );
             let out = peephole_optimize(input.clone());
-            assert!(out.contains("sext.w t0, t0"), "k={k}\n{out}");
+            assert!(sext_from(&out, "t0"), "k={k}\n{out}");
         }
     }
 

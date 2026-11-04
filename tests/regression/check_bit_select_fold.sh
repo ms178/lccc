@@ -307,9 +307,16 @@ cross_length_check() { # $1 = binary, $2 = target name
     # are i686-only and ignored by the arm/riscv builds. (The btl ON build's
     # callee-saved frame is a separate quality opportunity -- see the backend
     # follow-up note on btl base memory-folding.)
+    # The RISC-V accumulator-retarget pass is held constant for the same
+    # reason: it collapses `op t0, ..; mv home, t0` pairs, and the unfolded
+    # fallback has more of those pairs than the folded shape, so the OFF build
+    # could otherwise end up shorter than the ON build -- that is the relay's
+    # win, measured by its own gate, not a bit-select pessimisation.
     CCC_NO_BIT_SELECT=1 CCC_NO_I686_SELECT_CMOV=1 CCC_NO_I686_LOAD_COPY_RELAY=1 \
+        CCC_NO_RV_ACCUMULATOR_RETARGET=1 \
         "$bin" -O2 -S "$tmp/shapes.c" -o "$before"
     CCC_NO_I686_SELECT_CMOV=1 CCC_NO_I686_LOAD_COPY_RELAY=1 \
+        CCC_NO_RV_ACCUMULATOR_RETARGET=1 \
         "$bin" -O2 -S "$tmp/shapes.c" -o "$after"
     labels=$(grep -oE '^[a-z_][a-zA-Z0-9_]*:$' "$before" | tr -d ':')
     for label in $labels; do

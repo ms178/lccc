@@ -44,6 +44,7 @@ typedef unsigned u32;
 typedef unsigned long long u64;
 int clz32(u32 x) { return __builtin_clz(x); }
 int clz64(u64 x) { return __builtin_clzll(x); }
+int ctz32(u32 x) { return __builtin_ctz(x); }
 C
 
 body() { awk -v F="^$1:" '$0 ~ F {p=1; next} p && /^[[:space:]]*\.size/ {exit} p' "$2" |
@@ -64,6 +65,7 @@ grep -qE 'movl \$63, %e?ax' <<<"$(body clz32 "$tmp/x86.s")" ||
 grep -qE 'movl \$127, %e?ax' <<<"$(body clz64 "$tmp/x86.s")" ||
     fail "clz64: no 127 sentinel (127 ^ 63 == 64)"
 grep -qE 'xor[lq] \$31' <<<"$(body clz32 "$tmp/x86.s")" || fail "clz32: no xor 31"
+
 grep -qE 'xor[lq] \$63' <<<"$(body clz64 "$tmp/x86.s")" || fail "clz64: no xor 63"
 
 # ---- 4. i686 emits the same shape -----------------------------------------
@@ -72,8 +74,34 @@ i686=$bindir/lccc-i686
 "$i686" -O2 -mno-lzcnt -S "$tmp/c.c" -o "$tmp/i686.s"
 b=$(body clz32 "$tmp/i686.s")
 grep -qE '^\.Lclz_' <<<"$b" && fail "clz32: diamond on i686"
+grep -qE '\b(j[a-z]+|call)\b' <<<"$b" && fail "clz32: not straight-line on i686"
 grep -q 'movl \$63, %eax' <<<"$b" || fail "clz32: no sentinel on i686"
-grep -qE '\bbsrl %ecx, %eax|\bbsrl %eax, %eax' <<<"$b" || fail "clz32: no bsr on i686"
+# The scanned register is the allocator's choice -- the count may fold onto
+# the operand's own home (`bsrl %ebx, %eax`) once the peephole sees that the
+# staging register is dead -- so the gate pins `bsr` into %eax, not the name.
+grep -qE '\bbsrl %[a-z0-9]+, %eax' <<<"$b" || fail "clz32: no bsr on i686"
+grep -qE '\bbsf' <<<"$b" && fail "clz32: bsf in a leading-zero count on i686"
+# No save/restore bracket: a gpr32 count is an `UnaryOp` scratch hazard point
+# (collect_i686_scratch_hazard_points marks it (true, true)), so the staging
+# register is provably dead and `pushl`/`popl` would be pure overhead.
+grep -qE '\b(pushl %ecx|popl %ecx)' <<<"$b" && fail "clz32: stack bracket on i686"
+
+# ---- 4b. the same sentinel contract for the trailing count -----------------
+# `ctz32` answers 32 at zero because `bsf` leaves its destination untouched
+# and the destination is preloaded with 32 -- the x86-64 pair
+# (`movl $32; bsfl`) and, on i686, the same pair with the operand scanned
+# where it lives.  A diamond here is the defect this gate exists for.
+for tgt in x86 i686; do
+    bin=$x86
+    [ "$tgt" = i686 ] && bin=$i686
+    "$bin" -O2 -S "$tmp/c.c" -o "$tmp/$tgt-ctz.s"
+    b=$(body ctz32 "$tmp/$tgt-ctz.s")
+    [ -n "$b" ] || fail "ctz32: empty body on $tgt"
+    grep -qE '^\.Lctz_' <<<"$b" && fail "ctz32: defined-zero diamond on $tgt"
+    grep -qE '\b(j[a-z]+|call)\b' <<<"$b" && fail "ctz32: not straight-line on $tgt"
+    grep -qE 'movl \$32, %eax' <<<"$b" || fail "ctz32: no 32 sentinel on $tgt"
+    grep -qE '\bbsfl %[a-z0-9]+, %eax' <<<"$b" || fail "ctz32: no bsf on $tgt"
+done
 
 # ---- 5. values -------------------------------------------------------------
 cat > "$tmp/v.c" <<'C'
