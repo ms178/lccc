@@ -42,9 +42,20 @@ pub(super) const CONTRACTS: &[Contract] = &[
     },
     Contract {
         spelling: "-fopenmp",
-        class: Class::Refused,
-        rationale: "OpenMP lowering and runtime linkage are not implemented.",
-        probe_id: None,
+        class: Class::Implemented,
+        // LCCC implements OpenMP's SINGLE-THREAD SERIAL execution model:
+        // every `#pragma omp` directive is a no-op, which is a conforming
+        // OpenMP execution (one thread, one team).  Measured gcc-16 16.2.0
+        // emits no GOMP_* call at all for the gcc.c-torture/compile/pr89235.c
+        // `declare simd` shape that this option gate used to reject.  Directives
+        // that need a device or a runtime entry point (target/offload,
+        // omp_get_*) are NOT silently parallelised: the generated program is
+        // the serial program, and any runtime symbol is resolved by the
+        // linker exactly as for any other external function.  This is a real
+        // observable effect (`_OPENMP 202111`, measured against gcc 16.2),
+        // not an inert compatibility no-op.
+        rationale: "Serial OpenMP execution model: _OPENMP=202111 and directives lower to their single-thread equivalents; no GOMP runtime linkage.",
+        probe_id: Some("probe-fopenmp-serial"),
     },
     Contract {
         spelling: "-fanalyzer",

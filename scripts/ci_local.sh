@@ -273,6 +273,10 @@ gate "gcc-asm-constraints" fast \
     env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
     GCC="${GCC16:-gcc-16}" \
     bash tests/regression/check_gcc_asm_constraints.sh
+gate "vectorizer-openmp-policy" fast \
+    env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
+    GCC="${GCC16:-gcc-16}" \
+    bash tests/regression/check_vectorizer_openmp_policy.sh
 gate "frontend-ternary-common-type" fast \
     env CCC="$LCCC" bash tests/regression/check_frontend_ternary_common_type.sh
 gate "frontend-preprocessor-rules" fast \

@@ -3388,16 +3388,22 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                 "-fno-ipa-pta" => self.ipa_pta = false,
                 "-flive-range-shrinkage" => self.live_range_shrinkage = true,
                 "-fno-live-range-shrinkage" => self.live_range_shrinkage = false,
-                arg if matches!(
-                    arg,
-                    "-fno-tree-loop-vectorize"
-                        | "-fno-tree-slp-vectorize"
-                        | "-ftree-loop-vectorize"
-                        | "-ftree-slp-vectorize"
-                ) =>
-                {
-                    return Err(format!("per-vectorizer control is unsupported: {}", arg));
-                }
+                // GCC 16.2 exposes the loop and SLP vectorizers as separate
+                // switches; an explicit per-family switch overrides the
+                // master `-f[no-]tree-vectorize` in EITHER order, and the
+                // last spelling within a family wins.  The tri-state policy
+                // in `passes::VectorizePolicy` implements exactly that
+                // (measured with -fopt-info-vec-optimized).  Rejecting these
+                // flags made four valid gcc.c-torture/compile cases fail.
+                // `-fopenmp` selects OpenMP's single-thread serial execution
+                // model; see `option_table::CONTRACTS` for the measured
+                // contract.  Last spelling wins, as with GCC.
+                "-fopenmp" => self.openmp = true,
+                "-fno-openmp" => self.openmp = false,
+                "-ftree-loop-vectorize" => self.loop_vectorize = Some(true),
+                "-fno-tree-loop-vectorize" => self.loop_vectorize = Some(false),
+                "-ftree-slp-vectorize" => self.slp_vectorize = Some(true),
+                "-fno-tree-slp-vectorize" => self.slp_vectorize = Some(false),
                 "-ffunction-sections" => self.function_sections = true,
                 "-fno-function-sections" => self.function_sections = false,
                 "-fdata-sections" => self.data_sections = true,
@@ -4866,6 +4872,26 @@ mod cli_tests {
         d.parse_cli_args(&["ccc".into(), "-ftree-vectorize".into(), "x.c".into()])
             .unwrap();
         assert!(!d.disable_tree_vectorize);
+
+        d.parse_cli_args(&[
+            "ccc".into(),
+            "-fno-tree-vectorize".into(),
+            "-ftree-loop-vectorize".into(),
+            "-fno-tree-slp-vectorize".into(),
+            "x.c".into(),
+        ])
+        .unwrap();
+        assert!(d.disable_tree_vectorize);
+        assert_eq!(d.loop_vectorize, Some(true));
+        assert_eq!(d.slp_vectorize, Some(false));
+        // Last spelling within a family wins.
+        d.parse_cli_args(&[
+            "ccc".into(),
+            "-fno-tree-loop-vectorize".into(),
+            "x.c".into(),
+        ])
+        .unwrap();
+        assert_eq!(d.loop_vectorize, Some(false));
     }
 
     /// `-mno-<feature>` must be ACCEPTED for any ISA extension LCCC never
