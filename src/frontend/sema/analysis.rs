@@ -8256,6 +8256,14 @@ dereference it before applying '->' to it?"
     }
 
     fn check_c2y_builtin_call(&mut self, name: &str, args: &[Expr], span: Span) {
+        // These GCC 17 compatibility intrinsics have no ordinary
+        // declaration in the translation unit. Validate their implicit
+        // prototypes here, before lowering can index or convert unchecked
+        // operands. Keep the prototype table in one place so O0 and O2
+        // reject exactly the same ill-typed calls.
+        if self.check_gcc17_builtin_call(name, args, span) {
+            return;
+        }
         use crate::frontend::sema::stdbit;
         if let Some(expected) = stdbit::stdc_bit_arity(name) {
             if args.len() != expected {
@@ -8409,6 +8417,39 @@ dereference it before applying '->' to it?"
                 self.check_gcc16_builtin_call(name, args, span);
             }
         }
+    }
+
+    /// Validate the implicit C prototypes of the GCC 17 torture builtins.
+    ///
+    /// They are intercepted by lowering and therefore have no symbol-table
+    /// declaration to feed the normal call checker. Reuse that checker rather
+    /// than duplicating arity, pointer, record, and conversion rules here.
+    /// Returning true means the name was handled, including an arity error.
+    fn check_gcc17_builtin_call(&self, name: &str, args: &[Expr], span: Span) -> bool {
+        let void_ptr = || CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC);
+        let param = |ty| (ty, None);
+        let size_t = if crate::common::types::target_is_32bit() {
+            CType::UInt
+        } else {
+            CType::ULong
+        };
+        let params = match name {
+            "__builtin_memcmp_eq" => vec![
+                param(void_ptr()),
+                param(void_ptr()),
+                param(size_t),
+            ],
+            "__builtin_stack_save" => Vec::new(),
+            "__builtin_stack_restore" => vec![param(void_ptr())],
+            "__builtin_cexpi" => vec![param(CType::Double)],
+            "__builtin_cpow" => vec![
+                param(CType::ComplexDouble),
+                param(CType::ComplexDouble),
+            ],
+            _ => return false,
+        };
+        self.check_call_arguments(name, args, &params, false, span);
+        true
     }
 
     fn check_gcc16_builtin_call(&mut self, name: &str, args: &[Expr], span: Span) {

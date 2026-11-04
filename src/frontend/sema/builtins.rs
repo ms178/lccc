@@ -65,7 +65,7 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     ] {
         m.insert(builtin, BuiltinInfo::simple(libc_name));
     }
-    // Four builtins are NOT libc aliases: their GCC semantics differ from any
+    // Five builtins are NOT libc aliases: their GCC semantics differ from any
     // single libc call (memcmp_eq normalises the sign; stack_save/restore are
     // IR stack intrinsics; cexpi has no libc symbol).
     m.insert(
