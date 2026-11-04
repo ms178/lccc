@@ -24,6 +24,16 @@ class DiagnosticSelection(unittest.TestCase):
         self.assertEqual(export.automatic_run_ids(
             [run(9), run(8), run(7, 2), run(6, 3)], 1094), [9, 7])
 
+    def test_api_order_does_not_choose_old_cancelled_retry(self):
+        self.assertEqual(export.automatic_run_ids([
+            run(208, conclusion='cancelled'), run(285, 2, conclusion='cancelled'),
+            run(842), run(838, 2, conclusion='success')], 1094), [842, 285])
+
+    def test_creation_time_precedes_id_tie_break(self):
+        newer = dict(run(10), created_at='2026-11-04T11:00:00Z')
+        older = dict(run(20), created_at='2026-11-04T10:00:00Z')
+        self.assertEqual(export.automatic_run_ids([older, newer], 1094), [10])
+
     def test_never_selects_green_in_progress_or_other_pr(self):
         self.assertEqual(export.automatic_run_ids([
             run(9, conclusion='success'), run(8, status='in_progress'),

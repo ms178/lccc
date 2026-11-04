@@ -32,12 +32,13 @@ def parse_run_ids(text):
 def automatic_run_ids(runs, pr_number):
     """Pick at most two latest terminal non-green workflows for this PR.
 
-    GitHub returns runs newest first. A cancelled workflow can contain a
-    completed failed job; restricting the query to failure lost that evidence
-    whenever a later push cancelled the remaining jobs.
+    A cancelled workflow can contain a completed failed job; restricting the
+    query to failure lost that evidence whenever a later push cancelled the
+    remaining jobs. API page order can put an older cancelled retry first,
+    so order explicitly by creation time with the numeric run ID as a tie-break.
     """
     selected = {}
-    for run in runs:
+    for run in sorted(runs, key=lambda row: (row.get('created_at', ''), row['id']), reverse=True):
         if (run.get('status') != 'completed'
                 or run.get('conclusion') not in ('failure', 'cancelled', 'timed_out')
                 or not any(pr.get('number') == pr_number for pr in run.get('pull_requests', []))):

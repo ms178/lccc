@@ -316,3 +316,11 @@ errors; separate failure-only-selection and omitted-Intel-artifact mutants both
 fail the intended test. CI/local gate parity passes unchanged at 530 commands /
 27 contracts. This is an observability/infrastructure repair, NOT resolution of
 the outstanding ICX value discrepancy or a green-CI/production-readiness claim.
+
+The first dedicated export also exposed an API-order assumption: the completed-
+run response placed an older cancelled retry before a newer failed run sharing
+its creation second. Selection now explicitly sorts by creation time and numeric
+run ID before applying the per-workflow cap. Two new tests cover that observed
+ordering and timestamp precedence. All nine transport tests pass with warnings
+as errors. The first transport-only run completed successfully without starting
+or replacing any kernel job; exact ICX artifact retrieval continues.
