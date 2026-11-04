@@ -548,6 +548,20 @@ impl Parser {
         // qualifies the return type's innermost pointer, as it does for
         // prototypes (sema applies it to CType::Function's return type).
         apply_decl_address_space_to_spec(&mut return_type, self.attrs.decl_address_space);
+        // `__attribute__((vector_size(N))) float g(void)` forms a VECTOR
+        // RETURN TYPE. Consume the pending attribute here (the same helper
+        // casts/compound literals use) instead of leaving it in parser state
+        // for the first declaration inside the body. A deferred, non-constant
+        // vector_size expression cannot be attached to a FunctionDef without
+        // a sema resolution slot; diagnose it rather than silently retyping
+        // either the return or a local.
+        return_type = self.apply_pending_vector_attr(return_type);
+        if self.attrs.parsing_vector_size_expr.take().is_some() {
+            self.emit_error(
+                "vector_size on a function definition must be a constant expression",
+                start,
+            );
+        }
 
         // Shadow typedef names used as parameter names, and hide enumerators
         // of the same name until the body ends.
@@ -2553,5 +2567,187 @@ mod noinline_declaration_tests {
             assert_eq!(actual, expected, "{source}");
             assert!(!parser.func_decl_noinline.contains("p"));
         }
+    }
+}
+
+#[cfg(test)]
+mod vector_attr_scope_tests {
+    //! AST-level proof that a pending `__attribute__((vector_size(N)))`
+    //! belongs to exactly ONE declaration.
+    //!
+    //! `ParsedDeclAttrs::save_flags()` packs booleans only, so the three
+    //! `Option`-typed vector attributes used to leak across every nested
+    //! parse (compound statements, parameter lists, subsequent globals).
+    //! The shell gate `tests/regression/check_type_attr_and_static_init.sh`
+    //! proves the observable behaviour through both ABIs; these tests pin
+    //! the parser state machine itself, so a future refactor cannot silently
+    //! reintroduce the leak behind a still-green codegen path.
+    use super::*;
+    use crate::frontend::lexer::Lexer;
+
+    fn parse(source: &str) -> (TranslationUnit, Parser) {
+        let mut parser = Parser::new(Lexer::new(source, 0).tokenize());
+        let unit = parser.parse();
+        (unit, parser)
+    }
+
+    fn is_vector(ts: &TypeSpecifier) -> bool {
+        matches!(ts, TypeSpecifier::Vector(..) | TypeSpecifier::ExtVector(..))
+    }
+
+    fn function(unit: &TranslationUnit) -> &FunctionDef {
+        unit.decls
+            .iter()
+            .find_map(|d| match d {
+                ExternalDecl::FunctionDef(f) => Some(f),
+                _ => None,
+            })
+            .expect("expected a function definition")
+    }
+
+    fn no_pending_attrs(p: &Parser) {
+        assert!(p.attrs.parsing_vector_size.is_none(), "vector_size leaked");
+        assert!(
+            p.attrs.parsing_vector_size_expr.is_none(),
+            "deferred vector_size expression leaked"
+        );
+        assert!(
+            p.attrs.parsing_ext_vector_nelem.is_none(),
+            "ext_vector_type leaked"
+        );
+    }
+
+    #[test]
+    fn return_attribute_is_applied_to_the_function_not_the_first_local() {
+        let (unit, p) = parse(
+            "__attribute__((vector_size(16))) float g(void) { float t = 1.0f; return (float)t; }",
+        );
+        let f = function(&unit);
+        assert!(
+            is_vector(&f.return_type),
+            "return type lost its vector attribute"
+        );
+        let local = f
+            .body
+            .items
+            .iter()
+            .find_map(|item| match item {
+                BlockItem::Declaration(d) => Some(d),
+                _ => None,
+            })
+            .expect("expected a local declaration");
+        assert!(
+            !is_vector(&local.type_spec),
+            "local inherited the return attribute"
+        );
+        assert_eq!(local.vector_size, None);
+        no_pending_attrs(&p);
+    }
+
+    #[test]
+    fn parameter_list_does_not_steal_the_return_attribute() {
+        let source = "__attribute__((vector_size(16))) int f(\
+                      __attribute__((vector_size(16))) int x) { return x; }";
+        let (unit, p) = parse(source);
+        let f = function(&unit);
+        assert!(
+            is_vector(&f.return_type),
+            "return type was consumed by the parameter list"
+        );
+        assert_eq!(f.params.len(), 1);
+        assert!(
+            is_vector(&f.params[0].type_spec),
+            "parameter lost its own attribute"
+        );
+        no_pending_attrs(&p);
+    }
+
+    #[test]
+    fn plain_parameter_does_not_inherit_the_return_attribute() {
+        let (unit, p) = parse("__attribute__((vector_size(16))) int f(int x) { return x; }");
+        let f = function(&unit);
+        assert!(is_vector(&f.return_type));
+        assert!(
+            !is_vector(&f.params[0].type_spec),
+            "a plain parameter inherited the return attribute"
+        );
+        no_pending_attrs(&p);
+    }
+
+    #[test]
+    fn vector_global_does_not_leak_into_the_next_declaration() {
+        let (unit, p) = parse("float a; __attribute__((vector_size(16))) float b; float c;");
+        let decls: Vec<&Declaration> = unit
+            .decls
+            .iter()
+            .filter_map(|d| match d {
+                ExternalDecl::Declaration(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(decls.len(), 3);
+        assert_eq!(decls[0].vector_size, None);
+        assert_eq!(decls[1].vector_size, Some(16));
+        assert_eq!(
+            decls[2].vector_size, None,
+            "attribute leaked into the next global"
+        );
+        no_pending_attrs(&p);
+    }
+
+    #[test]
+    fn compound_statement_does_not_inherit_or_drop_pending_attributes() {
+        let (unit, p) = parse(
+            "__attribute__((vector_size(16))) float g(void) { { float inner = 1.0f; } \
+             return (float)0; }",
+        );
+        let f = function(&unit);
+        assert!(is_vector(&f.return_type));
+        let outer = f
+            .body
+            .items
+            .iter()
+            .find_map(|item| match item {
+                BlockItem::Statement(Stmt::Compound(c)) => Some(c),
+                _ => None,
+            })
+            .expect("expected a nested compound statement");
+        let inner = outer
+            .items
+            .iter()
+            .find_map(|item| match item {
+                BlockItem::Declaration(d) => Some(d),
+                _ => None,
+            })
+            .expect("expected an inner local");
+        assert!(!is_vector(&inner.type_spec));
+        assert_eq!(inner.vector_size, None);
+        no_pending_attrs(&p);
+    }
+
+    #[test]
+    fn nested_function_return_type_is_built_after_its_body() {
+        // nested_functions.rs builds the return type AFTER parsing the body,
+        // so parse_compound_stmt must restore the pending attribute rather
+        // than drop it at the closing brace.
+        let (unit, p) = parse(
+            "int outer(void) { __attribute__((vector_size(16))) int inner(void) { \
+             return (__attribute__((vector_size(16))) int){1,2,3,4}; } return 0; }",
+        );
+        let outer = function(&unit);
+        let inner = outer
+            .body
+            .items
+            .iter()
+            .find_map(|item| match item {
+                BlockItem::NestedFunction(f) => Some(f),
+                _ => None,
+            })
+            .expect("expected a nested function");
+        assert!(
+            is_vector(&inner.return_type),
+            "nested return lost the attribute"
+        );
+        no_pending_attrs(&p);
     }
 }

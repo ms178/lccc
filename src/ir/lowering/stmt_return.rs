@@ -107,6 +107,38 @@ impl Lowerer {
         let ret_ty = self.func_mut().return_type;
         let expr_ty = self.value_ir_type(e);
         let expr_ct = self.expr_ctype(e);
+        // A 16-byte VECTOR return can reach this default scalar path with
+        // the expression lowered to the ADDRESS of a temporary: GNU nested
+        // functions take a defensive copy of a vector parameter, and
+        // `lower_expr` then hands back the copy's alloca (IrType::Ptr).
+        // `Cast { Ptr -> I128 }` is wrong twice over -- it returns the
+        // address bits instead of the vector, and on i686 it reaches the
+        // scalar cast emitter with an integer-pair destination and panics
+        // ("wide i686 cast reached the scalar cast emitter"). The already
+        // correct top-level lowering emits `Load { ty: I128 }` from the
+        // object; do exactly that here so x86_64 and i686, plain and
+        // nested functions, share one ABI-correct representation.
+        // `return_ctype` is NOT populated for GNU nested functions, so the
+        // expression's vector CType plus the I128 return carrier is the only
+        // reliable predicate. A vector expression never legitimately casts
+        // its ADDRESS to an integer: `expr_ty == Ptr` here always means the
+        // object address, and loading it is the sole correct semantics.
+        if matches!(ret_ty, IrType::I128 | IrType::U128)
+            && expr_ty == IrType::Ptr
+            && expr_ct.is_vector()
+        {
+            let addr = self.operand_to_value(val);
+            let seg = self.aggregate_lvalue_space(e);
+            let dest = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest,
+                ptr: addr,
+                ty: ret_ty,
+                seg_override: seg,
+            });
+            return Operand::Value(dest);
+        }
         if self.func_mut().return_is_bool {
             // For _Bool return, normalize at the source type before any truncation.
             self.emit_expr_bool_conversion(val, expr_ty, e)

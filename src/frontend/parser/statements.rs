@@ -50,6 +50,21 @@ impl Parser {
         //   typeof(({ extern void f(void); 42; })) x = 10;
         // Without this, the `extern` from `f` leaks and makes `x` extern.
         let saved_attr_flags = self.attrs.save_flags();
+        // save_flags() packs BOOLEAN attributes only. The three pending
+        // type-forming attributes are Options and therefore survived into
+        // the first local declaration of a function body:
+        //   __attribute__((vector_size(16))) float g(void) { float t = 1.0f; ... }
+        // made `t` a 16-byte vector while g's return type silently lost the
+        // attribute (gcc.c-torture/compile/vector-3.c). A pending attribute
+        // belongs to the declaration that parsed it; take it out of parser
+        // state for the duration of the block and restore it afterwards, so
+        // neither direction can leak. Order matters: parse_function_def
+        // applies it to the return type BEFORE calling this method, and
+        // nested_functions.rs applies it AFTER (the restore makes it
+        // available again there).
+        let saved_vector_size = self.attrs.parsing_vector_size.take();
+        let saved_vector_size_expr = self.attrs.parsing_vector_size_expr.take();
+        let saved_ext_vector_nelem = self.attrs.parsing_ext_vector_nelem.take();
 
         // Parse GNU __label__ declarations at the start of the block.
         // These must appear before any statements or declarations.
@@ -168,6 +183,9 @@ impl Parser {
         self.block_depth -= 1;
         self.restore_enum_scope(enum_mark);
         self.attrs.restore_flags(saved_attr_flags);
+        self.attrs.parsing_vector_size = saved_vector_size;
+        self.attrs.parsing_vector_size_expr = saved_vector_size_expr;
+        self.attrs.parsing_ext_vector_nelem = saved_ext_vector_nelem;
         self.exit_parser_frame();
         CompoundStmt {
             items,

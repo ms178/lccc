@@ -598,6 +598,23 @@ impl<'s> StaticInitChecker<'s> {
                 // The difference of two label addresses is an assembler-time
                 // constant (GCC accepts `static int o[] = {&&a - &&b}`).
                 _ if is_label_address(lhs) && is_label_address(rhs) => Kind::Value,
+                // GNU extension, measured against GCC 16.2: two pointers
+                // into the SAME string literal differ by a compile-time
+                // constant (`int z = &"Foobar"[1] - &"Foobar"[0];`). GCC
+                // rejects different literals with "initializer element is
+                // not computable at load time" because they may be distinct
+                // objects; Clang 23.1.4 rejects even the same-text form.
+                // Match GCC's rule by comparing the literal TEXT, not just
+                // `Address(None)` (which also covers &&label, functions and
+                // file-scope compound literals).
+                (Kind::Address(None), Kind::Address(None))
+                    if matches!(
+                        (string_literal_address_root(lhs), string_literal_address_root(rhs)),
+                        (Some(a), Some(b)) if a == b
+                    ) =>
+                {
+                    Kind::Value
+                }
                 _ => Kind::Bad,
             },
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
@@ -620,6 +637,22 @@ impl<'s> StaticInitChecker<'s> {
                 }
             }
         }
+    }
+}
+
+/// The text of the string literal an address expression is rooted in, if
+/// any. `&"abc"[1]`, `"abc" + 1` and `(char *)&"abc"[0]` all root in
+/// `"abc"`; `&&label`, a function designator and a compound literal do not.
+fn string_literal_address_root(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::StringLiteral(text, _) => Some(text.as_str()),
+        Expr::AddressOf(inner, _)
+        | Expr::Cast(_, inner, _, _)
+        | Expr::ArraySubscript(inner, _, _) => string_literal_address_root(inner),
+        Expr::BinaryOp(BinOp::Add, lhs, rhs, _) => {
+            string_literal_address_root(lhs).or_else(|| string_literal_address_root(rhs))
+        }
+        _ => None,
     }
 }
 

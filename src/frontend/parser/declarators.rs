@@ -879,6 +879,19 @@ impl Parser {
         let decl_typedef_use = self.attrs.parsing_typedef_use();
         let decl_typedef_object = self.attrs.parsing_typedef_object_volatile();
         let decl_storage = self.attrs.take_storage_classes();
+        // A pending vector_size/ext_vector_type from the ENCLOSING
+        // declaration is the FUNCTION RETURN TYPE's attribute:
+        //   __attribute__((vector_size(16))) int f(v4si x) { return x; }
+        // Declarators (and hence parameter lists) are parsed BEFORE
+        // parse_function_def builds the return type, so a parameter list
+        // must not see or consume the return type's attribute. Each
+        // parameter consumes only its OWN pending attribute via
+        // apply_pending_vector_attr; hold the enclosing one aside for the
+        // whole list and restore it at the single exit point, just like
+        // parsed_alignas above.
+        let decl_vector_size = self.attrs.parsing_vector_size.take();
+        let decl_vector_size_expr = self.attrs.parsing_vector_size_expr.take();
+        let decl_ext_vector_nelem = self.attrs.parsing_ext_vector_nelem.take();
         let result = self.parse_param_list_inner();
         // Single restore point, deliberately: every exit from the list --
         // including the K&R identifier-list path -- goes through here, so no
@@ -890,6 +903,9 @@ impl Parser {
         self.attrs.set_typedef_use(decl_typedef_use);
         self.attrs.set_typedef_object_volatile(decl_typedef_object);
         self.attrs.restore_storage_classes(decl_storage);
+        self.attrs.parsing_vector_size = decl_vector_size;
+        self.attrs.parsing_vector_size_expr = decl_vector_size_expr;
+        self.attrs.parsing_ext_vector_nelem = decl_ext_vector_nelem;
         result
     }
 
@@ -977,6 +993,24 @@ impl Parser {
             self.attrs.parsing_address_space = AddressSpace::Default;
             self.attrs.take_storage_classes();
             if let Some(mut type_spec) = self.parse_type_specifier() {
+                // A direct `__attribute__((vector_size(N)))` in a PARAMETER's
+                // declaration specifiers forms a VECTOR PARAMETER, exactly
+                // as it does for a cast or compound literal. param_decl has
+                // no vector_size field, so leaving the attribute pending in
+                // parser state dropped it -- the parameter stayed `int` and
+                // the attribute was then taken by the first local declaration
+                // of the function body (gcc.c-torture/compile/vector-1.c:
+                // `(vector float)t` reported "a value of type 'int'").
+                // Wrap the base spec here, BEFORE pointer/array declarator
+                // layers are applied below.
+                let param_spec_span = self.peek_span();
+                type_spec = self.apply_pending_vector_attr(type_spec);
+                if self.attrs.parsing_vector_size_expr.take().is_some() {
+                    self.emit_error(
+                        "vector_size on a parameter must be a constant expression",
+                        param_spec_span,
+                    );
+                }
                 // Snapshot the declaration-level named address space NOW, before
                 // the declarator parser runs (the same rule struct fields follow
                 // in parse_struct_fields). `struct c __seg_gs *p` records

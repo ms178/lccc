@@ -350,6 +350,18 @@ impl Lowerer {
             }
         }
 
+        // Difference of two pointers into the SAME narrow string literal.
+        // Must run before eval_string_literal_addr_expr, which would read a
+        // top-level `Sub` as `"str" - N`; here both operands are addresses.
+        if let Some(diff) = self.eval_string_literal_pointer_diff(expr) {
+            return GlobalInit::Scalar(self.coerce_scalar_const(
+                IrConst::I64(diff),
+                expr,
+                base_ty,
+                Some(elem_ct),
+            ));
+        }
+
         // String literal with offset: "str" + N or "str" - N
         if let Some(addr_init) = self.eval_string_literal_addr_expr(expr) {
             return addr_init;
@@ -1835,6 +1847,89 @@ impl Lowerer {
     }
 
     /// Extract a string literal from an expression, possibly through casts.
+    /// The byte offset of an address expression into a NARROW string
+    /// literal, together with the literal text. Offsets are in bytes because
+    /// a narrow literal's element type is `char` (size 1). Only forms whose
+    /// scale is unambiguous are accepted: `&"s"[K]`, `"s"`, `"s" + K`, and
+    /// `"s" - K`, optionally under casts to a pointer to a 1-byte type.
+    /// Widened literals and casts to wider pointee types decline, so a
+    /// pointer difference is never scaled with a wrong element size.
+    fn string_literal_pointer_offset<'a>(&self, expr: &'a Expr) -> Option<(&'a str, i64)> {
+        match expr {
+            Expr::StringLiteral(text, _) => Some((text.as_str(), 0)),
+            Expr::AddressOf(inner, _) => match inner.as_ref() {
+                Expr::ArraySubscript(base, index, _) => {
+                    let (text, off) = self.string_literal_pointer_offset(base)?;
+                    let k = self.eval_const_expr(index)?.to_i64()?;
+                    Some((text, off.checked_add(k)?))
+                }
+                _ => None,
+            },
+            Expr::BinaryOp(op @ (BinOp::Add | BinOp::Sub), lhs, rhs, _) => {
+                let (text, off) = self.string_literal_pointer_offset(lhs)?;
+                let k = self.eval_const_expr(rhs)?.to_i64()?;
+                let delta = if *op == BinOp::Add { k } else { -k };
+                Some((text, off.checked_add(delta)?))
+            }
+            _ => None,
+        }
+    }
+
+    /// GCC 16.2 folds `&"Foobar"[1] - &"Foobar"[0]` to 1 in a static
+    /// initializer, but rejects a difference between two DIFFERENT literals
+    /// ("not computable at load time": identical text may still denote one
+    /// merged object, distinct text cannot). Clang 23.1.4 rejects both; the
+    /// GCC-compatible subset is measured in static_init.rs, which accepts
+    /// exactly the forms this function can lower.
+    /// A difference operand may be cast to a wider pointee: GCC 16.2 folds
+    /// `(int *)&"Foobar"[4] - (int *)&"Foobar"[0]` to 1 (byte difference 4
+    /// divided by sizeof(int)). Return the pointee's size as the scale, or 1
+    /// for the uncast `char *` form.
+    fn string_literal_pointer_offset_scaled<'a>(
+        &self,
+        expr: &'a Expr,
+    ) -> Option<(&'a str, i64, i64)> {
+        if let Expr::Cast(ts, inner, _, _) = expr {
+            // A cast to a pointer scales the difference by the pointee size;
+            // a cast to a pointer-width integer keeps the BYTE difference
+            // (`(long)&"s"[1] - (long)&"s"[0]` is 1 in GCC 16.2). Narrower
+            // integers and floating conversions are not address constants
+            // (static_init.rs::address_cast_is_constant), so decline here.
+            let target = self.type_spec_to_ctype(ts);
+            let scale = match target {
+                CType::Pointer(pointee, _) => i64::try_from(pointee.size()).ok()?,
+                // target_ptr_size(), not size_of::<usize>(): the HOST that
+                // runs the compiler is LP64 while an -m32 build has 32-bit
+                // pointers, where `(long)&s[1] - (long)&s[0]` is still a
+                // pointer-width integer constant.
+                ref t if t.is_integer() && t.size() == crate::common::types::target_ptr_size() => 1,
+                _ => return None,
+            };
+            if scale == 0 {
+                return None;
+            }
+            let (text, off) = self.string_literal_pointer_offset(inner)?;
+            return Some((text, off, scale));
+        }
+        let (text, off) = self.string_literal_pointer_offset(expr)?;
+        Some((text, off, 1))
+    }
+
+    fn eval_string_literal_pointer_diff<'a>(&self, expr: &'a Expr) -> Option<i64> {
+        let Expr::BinaryOp(BinOp::Sub, lhs, rhs, _) = expr else {
+            return None;
+        };
+        let (lt, lo, ls) = self.string_literal_pointer_offset_scaled(lhs)?;
+        let (rt, ro, rs) = self.string_literal_pointer_offset_scaled(rhs)?;
+        if lt != rt || ls != rs {
+            return None;
+        }
+        let bytes = lo - ro;
+        // A C pointer difference is only defined for elements of the same
+        // array object; a non-multiple would be a mis-scaled address.
+        (bytes % ls == 0).then_some(bytes / ls)
+    }
+
     fn extract_string_literal(&self, expr: &Expr) -> Option<(String, StringLitKind)> {
         match expr {
             Expr::StringLiteral(s, _) => Some((s.clone(), StringLitKind::Narrow)),
