@@ -51,6 +51,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -135,16 +136,37 @@ def run(argv: list[str], **kwargs) -> str:
                                    timeout=kwargs.pop("timeout", 600), **kwargs).strip()
 
 
-def safe_extract(source: tarfile.TarFile, destination: Path) -> None:
-    """Extract a pinned archive with Py3.12's data_filter where available.
+def extractall_takes_filter() -> bool:
+    """Probe the stdlib capability actually used, not a Python version.
+
+    ``hasattr(tarfile, "data_filter")`` is the WRONG question: the
+    ``filter=`` keyword lives on ``TarFile.extractall``, and the two
+    capabilities were introduced in the same backport but are different
+    objects. Signature inspection is what the repository's other guarded
+    extractors use (``restore_toolchain_cache``), so both now answer the
+    same question. A third-party ``backports.tarfile`` monkeypatch is
+    likewise detected without hardcoding a version tuple.
+    """
+    try:
+        return "filter" in inspect.signature(tarfile.TarFile.extractall).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def extract_untrusted(source: tarfile.TarFile, destination: Path) -> None:
+    """Validate EVERY member, then extract a pinned archive.
 
     The three bundles this script installs are our OWN pinned payloads, but
-    "trusted" is not a reason to accept a traversal, an absolute symlink or a
-    device node. Python 3.11 (the Arena host) has no tarfile.data_filter, so
-    the same invariants are enforced explicitly here; on 3.12+ the stdlib
-    filter is applied as a second, independent layer. Symlink targets are
-    resolved relative to the LINK's directory, hardlink targets relative to
-    the archive root, matching tar semantics.
+    "trusted" is not a reason to accept a traversal, an absolute symlink or
+    a device node. Validation is unconditional and independent of the
+    stdlib filter: on Python 3.11 (the Arena host) it is the ONLY defence,
+    on 3.12+ the native ``data`` filter is a second, independent layer.
+    Symlink targets are resolved relative to the LINK's directory, hardlink
+    targets relative to the archive root, matching tar semantics.
+
+    This is the repository's guarded-extractor name (see
+    ``restore_agent_toolchain_cache.extract_untrusted``); the corpus safety
+    contract permits ``filter=`` only inside such a guarded helper.
     """
     dest = destination.resolve()
     for member in source.getmembers():
@@ -160,7 +182,7 @@ def safe_extract(source: tarfile.TarFile, destination: Path) -> None:
                 raise RuntimeError(f"escaping link target: {member.name}")
         elif not (member.isfile() or member.isdir()):
             raise RuntimeError(f"unsupported archive member type: {member.name}")
-    if hasattr(tarfile, "data_filter"):
+    if extractall_takes_filter():
         source.extractall(destination, filter="data")
     else:
         source.extractall(destination)
@@ -203,7 +225,7 @@ def install_rust(prefix: Path) -> Path:
         os.replace(tmp, archive)
     with tempfile.TemporaryDirectory(prefix="lccc-rust-", dir=prefix) as td:
         with tarfile.open(archive, "r:xz") as source:
-            safe_extract(source, Path(td))
+            extract_untrusted(source, Path(td))
         unpacked = Path(td) / f"rust-{RUST_VERSION}-x86_64-unknown-linux-gnu"
         if not (unpacked / "install.sh").is_file():
             raise RuntimeError("Rust archive lacks install.sh")
@@ -236,7 +258,7 @@ def install_gcc(prefix: Path) -> Path:
         raise RuntimeError("GCC 16.2 archive SHA-256 mismatch")
     root.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive, "r:xz") as source:
-        safe_extract(source, root)
+        extract_untrusted(source, root)
     version = run([str(gcc), "-dumpfullversion"])
     if not version.startswith("16.2"):
         raise RuntimeError(f"unexpected GCC identity: {version}")
@@ -257,7 +279,7 @@ def install_multilib(prefix: Path) -> None:
         raise RuntimeError("bookworm multilib archive SHA-256 mismatch")
     with tempfile.TemporaryDirectory(prefix="lccc-debs-", dir=prefix) as td:
         with tarfile.open(archive, "r:xz") as source:
-            safe_extract(source, Path(td))
+            extract_untrusted(source, Path(td))
         debs = sorted((Path(td) / "debs").glob("*.deb"))
         if not debs:
             raise RuntimeError("multilib bundle contains no .deb payloads")
@@ -294,7 +316,7 @@ def install_clang(prefix: Path) -> Path:
     # CACHE.json declares the archive's root as `clang-23.1.4/`, so extract
     # into the prefix (like install_gcc) rather than into an extra nested dir.
     with tarfile.open(archive, "r:xz") as source:
-        safe_extract(source, prefix)
+        extract_untrusted(source, prefix)
     if not clang.is_file():
         raise RuntimeError("Clang archive lacks bin/clang")
     version = run([str(clang), "--version"])
