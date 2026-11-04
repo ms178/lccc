@@ -17263,6 +17263,7 @@ mod tests {
     movl 20(%esp), %eax
     movl %eax, %ecx
     addl %ecx, %edx
+    movl %edx, %eax
     ret
 "#;
         let out = run_relay(asm);
