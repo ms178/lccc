@@ -401,8 +401,8 @@ compile matrix in `/home/user/.cache/lccc-torture/baseline/`.
 
 | leg | baseline | PR #1101 | delta |
 |---|---|---|---|
-| x86_64 `-O2` compile | 1977 pass / 23 fail / 15 ref-skip / 1 unsupported | **1993 pass / 7 fail** / 15 ref-skip / 1 unsupported | **+16 pass, −16 fail** |
-| i686 `-O2` compile | 1968 pass / 25 fail / 22 ref-skip / 1 unsupported | **1984 pass / 9 fail** / 22 ref-skip / 1 unsupported | **+16 pass, −16 fail** |
+| x86_64 `-O2` compile | 1977 pass / 23 fail / 15 ref-skip / 1 unsupported | **1993 pass / 7 fail** / 15 ref-skip / 1 unsupported (S07) | **+16 pass, −16 fail** |
+| i686 `-O2` compile | 1968 pass / 25 fail / 22 ref-skip / 1 unsupported | **1986 pass / 7 fail** / 22 ref-skip / 1 unsupported (S07) | **+18 pass, −18 fail** |
 
 Two further i686-only defects were found and fixed after the S03 measurement
 (`20041119-1.c`, `20111209-1.c`). The next full matrix (S04, after both fixes)
@@ -592,10 +592,22 @@ Re-run with the pinned GCC 16.2 oracle, an unchanged fastbuild binary for the
 whole run, and no concurrent cargo work. Filled in below from the JSON
 `tools`/`complete`/`fatal` fields; a run with `fatal` set is NEVER quoted.
 
-| leg | S04 (pre-red-team) | S07 (final) |
+| leg | S04 (pre-red-team) | S07 (final, `1facb4979`) |
 |---|---|---|
-| x86_64 `-O2` compile | 1993 pass / 7 fail / 15 ref-skip / 1 unsupported | _S07 RESULT_ |
-| i686 `-O2` compile | 1986 pass / 7 fail / 22 ref-skip / 1 unsupported | _S07 RESULT_ |
+| x86_64 `-O2` compile | 1993 pass / 7 fail / 15 ref-skip / 1 unsupported | **1993 pass / 7 fail / 15 ref-skip / 1 unsupported** |
+| i686 `-O2` compile | 1986 pass / 7 fail / 22 ref-skip / 1 unsupported | **1986 pass / 7 fail / 22 ref-skip / 1 unsupported** |
+
+Both S07 JSONs report `complete=True`, `fatal=None`, the pinned
+`/home/user/.cache/lccc-toolchains/gcc-16.2/gcc-16/bin/gcc-16` oracle and an
+unchanged `tools` digest; `lccc_head` equals the pushed commit. The
+**S04 -> S07 per-case diff is EMPTY on both legs** (0 changed statuses), so
+none of the §9.2 red-team fixes regressed a single corpus case. Both legs now
+have the *same* seven compile-fails, all itemised in §9.4:
+`991213-2.c`, `limits-caselabels.c`, `limits-exprparen.c`,
+`limits-structnest.c`, `pr115143-2.c`, `pr115143-3.c`, `pr67106.c`.
+The matrix runner's own exit 1 is the candidate-failure INVENTORY, not an
+evidence failure; `scripts/ci_gcc17_torture.sh` treats 1 as advisory and only
+2 as invalid.
 
 ### 9.6 Local CI contract: three REAL contract defects found and fixed
 
