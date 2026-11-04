@@ -65,9 +65,10 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     ] {
         m.insert(builtin, BuiltinInfo::simple(libc_name));
     }
-    // Five builtins are NOT libc aliases: their GCC semantics differ from any
-    // single libc call (memcmp_eq normalises the sign; stack_save/restore are
-    // IR stack intrinsics; cexpi has no libc symbol).
+    // Five builtins are NOT libc aliases: their semantics or ABI do not
+    // match a direct call (memcmp_eq normalises the result; stack_save/restore
+    // are IR stack intrinsics; cexpi has no libc symbol; cpow bridges the
+    // target complex ABI and LCCC's pointer-backed complex representation).
     m.insert(
         "__builtin_memcmp_eq",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::MemcmpEq),

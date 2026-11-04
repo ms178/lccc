@@ -8427,6 +8427,12 @@ dereference it before applying '->' to it?"
     /// Returning true means the name was handled, including an arity error.
     fn check_gcc17_builtin_call(&self, name: &str, args: &[Expr], span: Span) -> bool {
         let void_ptr = || CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC);
+        let const_void_ptr = || {
+            CType::Pointer(
+                Box::new(CType::Void),
+                PtrQuals::recorded(AddressSpace::Default, PtrQuals::CONST),
+            )
+        };
         let param = |ty| (ty, None);
         let size_t = if crate::common::types::target_is_32bit() {
             CType::UInt
