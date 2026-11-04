@@ -1416,6 +1416,12 @@ fn declare_unit_abbrevs(
             (DW_AT_LOW_PC, DW_FORM_ADDR),
             (DW_AT_HIGH_PC, forms.high_pc),
         ]);
+        if config.version >= 3 {
+            // Every subprogram this writer describes has code (the walk below
+            // skips functions whose size is zero), and the assembler gives all
+            // of it an FDE, so the CFA expression is always evaluable.
+            attrs.push((DW_AT_FRAME_BASE, DW_FORM_EXPRLOC));
+        }
         if config.version >= 4 {
             let mut external_attrs = attrs.clone();
             external_attrs.insert(1, (DW_AT_EXTERNAL, forms.external));
@@ -1748,6 +1754,11 @@ pub(crate) fn build_dwarf_info_sections(
                 push_high_pc(&mut info, forms.high_pc, function.size);
             }
         }
+        if config.version >= 3 {
+            // A one-byte expression block: `uleb` length, then the opcode.
+            info.push(1);
+            info.push(DW_OP_CALL_FRAME_CFA);
+        }
     }
     info.push(0); // end of the unit's children
 
@@ -2067,6 +2078,7 @@ const DW_AT_LANGUAGE: u64 = 0x13;
 const DW_AT_COMP_DIR: u64 = 0x1b;
 const DW_AT_PRODUCER: u64 = 0x25;
 const DW_AT_EXTERNAL: u64 = 0x3f;
+const DW_AT_FRAME_BASE: u64 = 0x40;
 const DW_AT_TYPE: u64 = 0x49;
 /// `DW_AT_decl_file` and `DW_AT_decl_line`.
 const DW_AT_DECL_FILE: u64 = 0x3a;
@@ -2097,6 +2109,17 @@ const DW_FORM_STRP: u64 = 0x0e;
 const DW_FORM_LINE_STRP: u64 = 0x1f;
 /// `DW_FORM_flag_present`: the attribute is true by its mere presence (DWARF 4).
 const DW_FORM_FLAG_PRESENT: u64 = 0x19;
+const DW_FORM_EXPRLOC: u64 = 0x18;
+/// `DW_OP_call_frame_cfa`: "the frame base is the canonical frame address".
+///
+/// The assembler already synthesizes the `.eh_frame` FDE that defines the CFA
+/// at every address of the function, so the expression costs one byte and stays
+/// true wherever the frame pointer is omitted -- unlike the `DW_OP_reg6` clang
+/// writes for `-O0`, which describes a register the optimized code may not
+/// keep.  The opcode is DWARF 3, so a version 2 unit states no frame base at
+/// all rather than describing its own prologue with an opcode it never defined;
+/// gcc 16.2 pays a `.debug_loc` list for the same information there.
+const DW_OP_CALL_FRAME_CFA: u8 = 0x9c;
 /// `DW_LNCT_path` and `DW_LNCT_directory_index`: the content types of the
 /// version-5 directory and file name tables.
 const DW_LNCT_PATH: u64 = 0x01;
@@ -2591,6 +2614,18 @@ mod tests {
                 (value, None)
             }
             DW_FORM_UDATA | DW_FORM_REF_UDATA => (read_uleb(data, at), None),
+            // A block is a length and that many bytes; the writer emits exactly
+            // one (`DW_OP_call_frame_cfa`), and the reader hands back the
+            // expression so a test can assert on it.
+            DW_FORM_EXPRLOC => {
+                let length = read_uleb(data, at) as usize;
+                let expression = data[*at..].get(..length).unwrap_or_default();
+                let value = expression
+                    .iter()
+                    .fold(0u64, |value, &byte| (value << 8) | u64::from(byte));
+                *at += length;
+                (value, None)
+            }
             DW_FORM_DATA2 => (u64::from(read_u16(data, at)), None),
             DW_FORM_DATA4 | DW_FORM_SEC_OFFSET | DW_FORM_REF4 => {
                 (u64::from(read_u32(data, at)), None)
@@ -3196,6 +3231,96 @@ mod tests {
             } else {
                 assert_eq!(read_u32(d, &mut at), 0, "abbrev offset relocation");
                 assert_eq!(d[at], 8, "address size after the unit header");
+            }
+        }
+    }
+
+    /// A subprogram states the frame base its own CFI already defines: one byte
+    /// of `DW_OP_call_frame_cfa` from version 3 on.  A version 2 unit cannot
+    /// decode that opcode, so it states nothing rather than describing its
+    /// prologue with an opcode it never defined -- gcc 16.2 pays a `.debug_loc`
+    /// list for the same information there (measured), and clang 23 writes a
+    /// bare `DW_OP_reg6`, which stops being the frame base as soon as the frame
+    /// pointer is omitted.
+    #[test]
+    fn a_subprogram_states_a_frame_base_where_the_dialect_allows_one() {
+        let files = [(1, "b.c".to_string())];
+        let rows = [row(0, 1, 2)];
+        let functions = [DwarfFunction {
+            name: "f",
+            section_index: 0,
+            offset: 0,
+            size: 0x40,
+            external: true,
+        }];
+        for version in 2..=5 {
+            let config = DwarfConfig::for_c(version, None);
+            let mut strings = DwarfStrings::new();
+            let mut line_strings = DwarfStrings::new();
+            let line = build_dwarf_line_section(
+                &files,
+                &rows,
+                &text_section(),
+                8,
+                ABS64,
+                ABS32,
+                "/src",
+                config,
+                &mut line_strings,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            let info = build_dwarf_info_sections(
+                &line.code_sections,
+                0,
+                &files,
+                &rows,
+                &text_section(),
+                &functions,
+                "b.c",
+                "/src",
+                "p",
+                8,
+                ABS32,
+                ABS64,
+                config,
+                &mut strings,
+                &mut line_strings,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            let declared: Vec<u64> = abbreviation_table(&info.abbrev.data)
+                .into_iter()
+                .filter(|(_, tag, _)| *tag == DW_TAG_SUBPROGRAM)
+                .flat_map(|(_, _, attributes)| attributes)
+                .filter(|(at, _)| *at == DW_AT_FRAME_BASE)
+                .map(|(_, form)| form)
+                .collect();
+            // The unit's last child is the only subprogram; the expression is
+            // its last attribute, followed by the unit terminator.
+            let expression = [1, DW_OP_CALL_FRAME_CFA, 0];
+            if version >= 3 {
+                assert!(
+                    !declared.is_empty() && declared.iter().all(|&form| form == DW_FORM_EXPRLOC),
+                    "version {version}: DW_AT_FRAME_BASE is declared as {declared:?}"
+                );
+                assert!(
+                    info.info.data.ends_with(&expression),
+                    "version {version}: the subprogram does not end in a one-byte \
+                     DW_OP_call_frame_cfa block: {:?}",
+                    &info.info.data[info.info.data.len().saturating_sub(8)..]
+                );
+            } else {
+                assert!(
+                    declared.is_empty(),
+                    "version {version}: a version 2 unit states no frame base"
+                );
+                assert!(
+                    !info.info.data.ends_with(&expression),
+                    "version {version}: the opcode leaked into a version 2 unit"
+                );
             }
         }
     }

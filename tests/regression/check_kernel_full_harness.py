@@ -76,6 +76,10 @@ printf '%s\n' "$*" >> "$TEST_MAKE_LOG"
 case " $* " in
   *" defconfig "*)
     printf 'CONFIG_TEST=y\nCONFIG_OBJTOOL=y\nCONFIG_HZ=800\n' > .config ;;
+  *" olddefconfig "*)
+    if [ -n "${TEST_DROP_SYMBOL:-}" ]; then
+      sed -i "/^${TEST_DROP_SYMBOL}=/d" .config
+    fi ;;
   *" tools/objtool "*)
     mkdir -p tools/objtool
     printf '\177ELF' > tools/objtool/objtool
@@ -169,6 +173,24 @@ exit 0
         (tmp / "helper.log").write_text("")
         run(env)
         assert "prepare" in (tmp / "helper.log").read_text()
+
+        # 8. Exercise the REAL drift checker, not TEST_DRIFT's stub, against
+        # individual dropped code-generation, debug-metadata and hardening
+        # features. A missing entry in the harness symbol list must fail.
+        shutil.copy2(ROOT / "scripts/kconfig_query.sh", scripts / "kconfig_query.sh")
+        for symbol in (
+            "CONFIG_LTO", "CONFIG_LTO_CLANG", "CONFIG_LTO_CLANG_FULL",
+            "CONFIG_LTO_CLANG_THIN", "CONFIG_LTO_CLANG_THIN_DIST",
+            "CONFIG_DEBUG_INFO_BTF", "CONFIG_DEBUG_INFO_BTF_MODULES",
+            "CONFIG_CFI_CLANG", "CONFIG_X86_KERNEL_IBT",
+        ):
+            (pkg / "config").write_text(original_config + f"{symbol}=y\n")
+            (tmp / "make.log").write_text("")
+            result = run(dict(env, LCCC_RECONFIG="1", TEST_DROP_SYMBOL=symbol), expect=1)
+            assert f"{symbol} package=y result=absent" in result.stderr, result.stderr
+            assert "bzImage" not in (tmp / "make.log").read_text()
+            # An unchanged feature must still pass: no blanket build rejection.
+            run(dict(env, LCCC_RECONFIG="1"))
 
     print("PASS kernel full harness: config preservation/reconfig, provenance, "
           "real objtool, shim/job rejection, drift refusal, post-build identity")

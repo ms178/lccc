@@ -3,6 +3,24 @@ name: CachyMod 6.18.58 LCCC kernel
 on:
   pull_request:
     paths:
+      # Kernel validation must follow the compiler being changed, not only
+      # edits to the kernel harness. Otherwise a source-only PR skips this job.
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+      - 'engineering/toolchains/**'
+      - 'scripts/build_lccc_fast.sh'
+      - 'scripts/rust_toolchain.sh'
+      - 'scripts/ensure_swap.sh'
+      - 'scripts/ci_provision_toolchain.sh'
+      - 'scripts/boot_flags.sh'
+      - 'scripts/boot_offsets.sh'
+      - 'scripts/kernel_version.sh'
+      - 'scripts/kernel_tool_identity.sh'
+      - 'scripts/kconfig_query.sh'
+      - 'tests/corpus/test_kernel_workflow_paths.py'
       - '.github/workflows/kernel-61858.yml'
       - 'scripts/build_kernel_boot.sh'
       - 'scripts/build_kernel_full.sh'

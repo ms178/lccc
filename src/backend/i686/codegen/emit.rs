@@ -2371,7 +2371,16 @@ impl I686Codegen {
         // destination preloaded with 63 answers 32 for a zero operand after the
         // shared `xor $31`, and no branch is needed.  When source and
         // destination are the same register the operand has to be staged,
-        // because the sentinel must be in place before `bsr` reads it.
+        // because the sentinel must be in place before `bsr` reads it.  The
+        // bracketing save/restore is what the i686 dead-scratch peephole
+        // removes when %ecx is provably dead, and leaving the pair in the
+        // emitted text is deliberate: rewriting it into a bare `%ecx` stage
+        // here was measured and lost.  With the relay peephole (which folds a
+        // frame load into a callee-saved home) in the pipeline, the two-line
+        // stage blocks the relay from pulling the load into %eax and the
+        // function ends up paying `pushl %ebx`/`popl %ebx` plus a frame slot:
+        // `clz32` 8 instructions with the bracket, 9 without
+        // (`check_clz_zero_sentinel` pins the resulting straight-line shape).
         if src == dst {
             emit!(self.state, "    pushl %ecx");
             emit!(self.state, "    movl %{s}, %ecx", s = src);
@@ -2388,16 +2397,28 @@ impl I686Codegen {
 
     /// ctz32 on a 32-bit register without TZCNT: BSF(src) into dst, with
     /// the zero fixup so Ctz(0) == 32 holds.
-    pub(super) fn emit_ctz32_baseline(&mut self, src: &str, dst: &str) {
-        let nz = self.state.fresh_label("ctz_nz");
-        let done = self.state.fresh_label("ctz_done");
-        emit!(self.state, "    testl %{s}, %{s}", s = src);
-        emit!(self.state, "    jnz {}", nz);
-        emit!(self.state, "    movl $32, %{d}", d = dst);
-        emit!(self.state, "    jmp {}", done);
-        emit!(self.state, "{}:", nz);
-        emit!(self.state, "    bsfl %{s}, %{d}", s = src, d = dst);
-        emit!(self.state, "{}:", done);
+    pub(super) fn emit_ctz32_baseline(&mut self, src: &str, dst: &str, scratch: Option<&str>) {
+        // `bsf` leaves its destination untouched when its source is zero, so a
+        // destination preloaded with 32 answers the IR's defined Ctz(0) == 32
+        // without a branch -- the pair x86-64 emits, and the pair that makes
+        // `check_clz_zero_sentinel.sh` certifiable on both backends.  When
+        // source and destination are one register the operand has to step
+        // aside first; `scratch` names the register that carries it (dead at
+        // every call site, see below).
+        if src == dst {
+            let t = scratch.expect("ctz32 staging requires a dead scratch register");
+            // The scratch carries the operand, so it must not be the operand.
+            debug_assert_ne!(
+                t, src,
+                "ctz32 staging needs a register other than the operand"
+            );
+            emit!(self.state, "    movl %{s}, %{t}", s = src, t = t);
+            emit!(self.state, "    movl $32, %{d}", d = dst);
+            emit!(self.state, "    bsfl %{t}, %{d}", t = t, d = dst);
+        } else {
+            emit!(self.state, "    movl $32, %{d}", d = dst);
+            emit!(self.state, "    bsfl %{s}, %{d}", s = src, d = dst);
+        }
     }
 
     /// clzll(x): Count leading zeros of 64-bit value in eax:edx.
@@ -2442,7 +2463,10 @@ impl I686Codegen {
         if self.bmi1_enabled {
             self.state.emit("    tzcntl %eax, %eax");
         } else {
-            self.emit_ctz32_baseline("eax", "eax");
+            // The result is ctz(low); the high half in %edx is
+            // consumed by the other branch and zeroed below, so it can
+            // carry the operand while the sentinel lands in %eax.
+            self.emit_ctz32_baseline("eax", "eax", Some("edx"));
         }
         self.state.emit("    xorl %edx, %edx");
         emit!(self.state, "    jmp {}", done);
@@ -2451,7 +2475,7 @@ impl I686Codegen {
         if self.bmi1_enabled {
             self.state.emit("    tzcntl %edx, %eax");
         } else {
-            self.emit_ctz32_baseline("edx", "eax");
+            self.emit_ctz32_baseline("edx", "eax", None);
         }
         self.state.emit("    addl $32, %eax");
         self.state.emit("    xorl %edx, %edx");

@@ -29,6 +29,32 @@ def parse_run_ids(text):
     return ids
 
 
+def automatic_run_ids(runs, pr_number):
+    """Pick at most two latest terminal non-green workflows for this PR.
+
+    A cancelled workflow can contain a completed failed job; restricting the
+    query to failure lost that evidence whenever a later push cancelled the
+    remaining jobs. API page order can put an older cancelled retry first,
+    so order explicitly by creation time with the numeric run ID as a tie-break.
+    """
+    selected = {}
+    for run in sorted(runs, key=lambda row: (row.get('created_at', ''), row['id']), reverse=True):
+        if (run.get('status') != 'completed'
+                or run.get('conclusion') not in ('failure', 'cancelled', 'timed_out')
+                or not any(pr.get('number') == pr_number for pr in run.get('pull_requests', []))):
+            continue
+        selected.setdefault(run['workflow_id'], run['id'])
+        if len(selected) == 2:
+            break
+    return list(selected.values())
+
+
+def retained_artifact(artifact):
+    """Only the exact kernel/Intel evidence names, never arbitrary artifacts."""
+    return (not artifact['expired'] and re.fullmatch(
+        r'(?:kernel-61858|intel-icx-provenance)-[0-9a-f]{40}', artifact['name']) is not None)
+
+
 def gh(path, payload=None, *, allow_binary=False):
     args = ['gh', 'api', path]
     if allow_binary:
@@ -85,19 +111,14 @@ def main():
     if requested:
         run_ids = parse_run_ids(requested)
     else:
-        event = json.loads(open(os.environ['GITHUB_EVENT_PATH']).read())
+        with open(os.environ['GITHUB_EVENT_PATH'], encoding='utf-8') as stream:
+            event = json.load(stream)
         pr = event['pull_request']
         if pr['head']['repo']['full_name'] != repo:
             raise ValueError('automatic export requires a same-repository PR')
         branch = quote(pr['head']['ref'], safe='')
-        candidates = json.loads(gh(f'repos/{repo}/actions/runs?branch={branch}&status=failure&per_page=100'))
-        selected = {}
-        for run in candidates['workflow_runs']:
-            if any(p['number'] == event['number'] for p in run['pull_requests']):
-                selected.setdefault(run['workflow_id'], run['id'])
-            if len(selected) == 2:
-                break
-        run_ids = list(selected.values())
+        candidates = json.loads(gh(f'repos/{repo}/actions/runs?branch={branch}&status=completed&per_page=100'))
+        run_ids = automatic_run_ids(candidates['workflow_runs'], event['number'])
         if not run_ids:
             print('No previous failed PR runs to export')
             return
@@ -122,7 +143,7 @@ def main():
             manifest += export_file(repo, f'run{run_id}-job{job["id"]}.log.gz',
                                     gzip.compress(data, mtime=0))
         for artifact in pages('artifacts', 'artifacts'):
-            if artifact['expired'] or not artifact['name'].startswith('kernel-61858-'):
+            if not retained_artifact(artifact):
                 continue
             data = gh(f'repos/{repo}/actions/artifacts/{int(artifact["id"])}/zip', allow_binary=True)
             manifest += export_file(repo, f'run{run_id}-artifact{artifact["id"]}.zip', data)

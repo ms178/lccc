@@ -1072,6 +1072,9 @@ gate "dwarf-line-tables" fast \
     python3 tests/regression/check_dwarf_line_tables.py \
         --lccc "$LCCC" --lccc-i686 target/fastbuild/lccc-i686 \
         --gcc "${GCC16:-gcc-16}"
+gate "dwarf-die-census" fast \
+    python3 tests/regression/check_dwarf_die_census.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" --clang "${CLANG:-clang-23}"
 gate "dwarf-decl-positions" fast \
     python3 tests/regression/check_dwarf_decl_positions.py \
         --lccc "$LCCC" --lccc-i686 target/fastbuild/lccc-i686 \
@@ -1420,6 +1423,12 @@ gate "repro-replay" fast \
 # against gcc, and `--self-test` proves the checks with canned transcripts.
 gate "scoped-noreturn-diagnostics" fast \
     bash tests/regression/check_scoped_noreturn_diagnostics.sh
+
+# The same typed-condition matrix runs in the authenticated vendor CI lane.
+# The script checks exact oracle versions and uses ICX when explicitly supplied.
+gate "typed-constant-truth" fast \
+    python3 tests/regression/check_constant_truth_diagnostics.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" --clang "${CLANG23:-clang-23}"
 
 # `lccc -S -o - x.c` used to create a file literally named `-`, silently
 # dropping the assembly from any pipeline's point of view.  GCC 14.2 pins the

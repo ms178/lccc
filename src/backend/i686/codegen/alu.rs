@@ -154,7 +154,7 @@ impl I686Codegen {
                 self.state.emit(tz);
             }
             _ if self.bmi1_enabled => self.state.emit(tz),
-            _ => self.emit_ctz32_baseline("eax", "eax"),
+            _ => self.emit_ctz32_baseline("eax", "eax", Some("ecx")),
         }
     }
 
