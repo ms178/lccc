@@ -236,17 +236,8 @@ impl F128SoftFloat for ArmCodegen {
         self.emit_load_from_sp("x17", slot.0, "ldr");
     }
 
-    fn f128_load_from_addr_reg_to_acc(&mut self, dest: &Value) {
-        // Load 16 bytes from x17 into q0, convert to f64, store to dest
-        self.state.emit("    ldr q0, [x17]");
-        self.state.emit("    bl __trunctfdf2");
-        self.state.emit("    fmov x0, d0");
-        self.state.reg_cache.invalidate_all();
-        self.store_x0_to(dest);
-    }
-
-    fn f128_load_from_direct_slot_to_acc(&mut self, slot: StackSlot) {
-        self.emit_load_from_sp("q0", slot.0, "ldr");
+    fn f128_has_reg(&self, val_id: u32) -> bool {
+        self.reg_assignments.contains_key(&val_id)
     }
 
     fn f128_store_result_and_truncate(&mut self, dest: &Value) {

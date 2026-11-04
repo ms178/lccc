@@ -417,7 +417,7 @@ impl ArmCodegen {
     }
 
     /// Load the va_list pointer into the specified register.
-    fn load_va_list_ptr(&mut self, va_list_ptr: &Value, dest_reg: &str) {
+    pub(super) fn load_va_list_ptr(&mut self, va_list_ptr: &Value, dest_reg: &str) {
         if self.state.is_alloca(va_list_ptr.0) {
             if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
                 self.emit_add_fp_offset(dest_reg, slot.0);
@@ -432,10 +432,19 @@ impl ArmCodegen {
     }
 
     /// Load the destination pointer into the specified register.
-    fn load_dest_ptr(&mut self, dest_ptr: &Value, dest_reg: &str) {
+    ///
+    /// An over-aligned (> 16) alloca's object starts at the aligned address
+    /// inside its padded slot, where every other access finds it: the
+    /// `aligned(32)` HFA a `va_arg` copies (gcc.c-torture pr92904) was
+    /// written at the slot base and read back from the aligned address.
+    pub(super) fn load_dest_ptr(&mut self, dest_ptr: &Value, dest_reg: &str) {
         if self.state.is_alloca(dest_ptr.0) {
             if let Some(slot) = self.state.get_slot(dest_ptr.0) {
-                self.emit_add_fp_offset(dest_reg, slot.0);
+                if self.state.alloca_over_align(dest_ptr.0).is_some() {
+                    self.emit_alloca_addr(dest_reg, dest_ptr.0, slot.0);
+                } else {
+                    self.emit_add_fp_offset(dest_reg, slot.0);
+                }
             }
         } else if let Some(&reg) = self.reg_assignments.get(&dest_ptr.0) {
             let reg_name = callee_saved_name(reg);
@@ -447,7 +456,7 @@ impl ArmCodegen {
     }
 
     /// Emit byte-by-byte copy for a partial struct slot (last slot with < 8 bytes).
-    fn emit_partial_struct_copy(
+    pub(super) fn emit_partial_struct_copy(
         &mut self,
         base_offset: i64,
         remaining: usize,

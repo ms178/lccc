@@ -210,6 +210,10 @@ pub struct RiscvCodegen {
     /// A hidden TLS resolver call needs `ra` saved, but when there are no
     /// stack slots or callee-saved value homes it does not need an s0 frame.
     pub(super) ra_only_frame: bool,
+    /// The current function returns a flattened float struct in fa0/fa1/a0
+    /// (`call_abi::hidden_fp_agg_return`): the s0-relative offset of the
+    /// private buffer its hidden return pointer is homed as, and the class.
+    pub(super) fp_ret_buffer: Option<(i64, crate::common::types::FpAggClass)>,
 }
 
 impl RiscvCodegen {
@@ -238,6 +242,7 @@ impl RiscvCodegen {
             frameless_leaf: false,
             tls_resolver_only: false,
             ra_only_frame: false,
+            fp_ret_buffer: None,
         }
     }
 
@@ -1267,10 +1272,11 @@ impl ArchCodegen for RiscvCodegen {
         fn emit_call_compute_stack_space(&self, arg_classes: &[CallArgClass], arg_types: &[IrType], struct_arg_aligns: &[Option<usize>], _struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>], struct_arg_is_f128_sse: &[bool]) -> usize => emit_call_compute_stack_space_impl;
         fn emit_call_f128_pre_convert(&mut self, args: &[Operand], arg_classes: &[CallArgClass], arg_types: &[IrType], stack_arg_space: usize) -> usize => emit_call_f128_pre_convert_impl;
         fn emit_call_stack_args(&mut self, args: &[Operand], arg_classes: &[CallArgClass], arg_types: &[IrType], stack_arg_space: usize, fptr_spill: usize, f128_temp_space: usize, struct_arg_aligns: &[Option<usize>], _struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>], _struct_arg_is_f128_sse: &[bool]) -> i64 => emit_call_stack_args_impl;
-        fn emit_call_reg_args(&mut self, args: &[Operand], arg_classes: &[CallArgClass], arg_types: &[IrType], total_sp_adjust: i64, f128_temp_space: usize, stack_arg_space: usize, struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>]) => emit_call_reg_args_impl;
+        fn emit_call_reg_args(&mut self, args: &[Operand], arg_classes: &[CallArgClass], arg_types: &[IrType], total_sp_adjust: i64, f128_temp_space: usize, stack_arg_space: usize, struct_arg_fp_agg_classes: &[Option<crate::common::types::FpAggClass>]) => emit_call_reg_args_impl;
         fn emit_call_instruction(&mut self, direct_name: Option<&str>, func_ptr: Option<&Operand>, indirect: bool, stack_arg_space: usize) => emit_call_instruction_impl;
         fn emit_call_cleanup(&mut self, stack_arg_space: usize, f128_temp_space: usize, indirect: bool) => emit_call_cleanup_impl;
         fn emit_call_store_result(&mut self, dest: &Value, return_type: IrType) => emit_call_store_result_impl;
+        fn emit_call_store_fp_agg_return(&mut self, buffer: &Operand, class: crate::common::types::FpAggClass, dest: Option<&Value>) => emit_call_store_fp_agg_return_impl;
         // globals
         fn emit_global_addr(&mut self, dest: &Value, name: &str) => emit_global_addr_impl;
         fn emit_label_addr(&mut self, dest: &Value, label: &str) => emit_label_addr_impl;

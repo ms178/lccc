@@ -9418,9 +9418,7 @@ fn x86_64_sysv_call_classes(
         info.struct_arg_sizes.get(skip..).unwrap_or(&[]),
         info.struct_arg_aligns.get(skip..).unwrap_or(&[]),
         info.struct_arg_classes.get(skip..).unwrap_or(&[]),
-        info.struct_arg_riscv_float_classes
-            .get(skip..)
-            .unwrap_or(&[]),
+        info.struct_arg_fp_agg_classes.get(skip..).unwrap_or(&[]),
         info.struct_arg_is_f128_sse.get(skip..).unwrap_or(&[]),
         info.is_variadic
             .then(|| info.num_fixed_args.saturating_sub(skip)),
@@ -18224,7 +18222,7 @@ mod allocation_kernel_tests {
                             struct_arg_sizes: vec![],
                             struct_arg_aligns: vec![],
                             struct_arg_classes: vec![],
-                            struct_arg_riscv_float_classes: vec![],
+                            struct_arg_fp_agg_classes: vec![],
                             struct_arg_is_f128_sse: vec![],
                             ret_is_f128_sse: false,
                             is_sret: false,
@@ -20593,7 +20591,7 @@ mod fold_defer_tests {
                 param_align: None,
                 struct_eightbyte_classes: Vec::new(),
                 is_f128_sse: false,
-                riscv_float_class: None,
+                fp_agg_class: None,
             }],
             false,
         );

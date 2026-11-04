@@ -409,6 +409,10 @@ pub(super) struct FuncSig {
     pub ret_eightbyte_classes: Vec<crate::common::types::EightbyteClass>,
     /// True if the return value is _Float128 (ONE 16-byte XMM return).
     pub ret_is_f128_sse: bool,
+    /// The aggregate result comes back in the FP registers of this class
+    /// through the hidden buffer (`sret_size` is set); see
+    /// `AggregateReturn::fp_agg`.
+    pub ret_fp_agg_class: Option<crate::common::types::FpAggClass>,
     /// x86-64 X87-class aggregate return (`struct { long double }`): the IR
     /// return value is the `long double` in %st(0); callers store it into a
     /// temporary of the aggregate type and `return` loads it from the object.
@@ -425,9 +429,10 @@ pub(super) struct FuncSig {
     /// Per-parameter SysV ABI eightbyte classification for struct params.
     /// Each entry is the classification for that parameter (empty vec for non-struct params).
     pub param_struct_classes: Vec<Vec<crate::common::types::EightbyteClass>>,
-    /// Per-parameter RISC-V LP64D float field classification for struct params.
+    /// Per-parameter FP-register class of by-value aggregates (RISC-V LP64D
+    /// flattening or an AAPCS64 HFA/HVA; see `FpAggClass`).
     /// Each entry is Some(..) for struct params that qualify for FP register passing.
-    pub param_riscv_float_classes: Vec<Option<crate::common::types::RiscvFloatClass>>,
+    pub param_fp_agg_classes: Vec<Option<crate::common::types::FpAggClass>>,
 }
 
 impl FuncSig {
@@ -445,12 +450,13 @@ impl FuncSig {
             two_reg_ret_size: None,
             ret_eightbyte_classes: Vec::new(),
             ret_is_f128_sse: false,
+            ret_fp_agg_class: None,
             ret_x87_aggregate: false,
             ret_x87_pair: false,
             param_is_f128_sse: Vec::new(),
             param_struct_sizes: Vec::new(),
             param_struct_classes: Vec::new(),
-            param_riscv_float_classes: Vec::new(),
+            param_fp_agg_classes: Vec::new(),
         }
     }
 }
@@ -540,10 +546,8 @@ pub(super) struct FunctionMeta {
 pub(super) enum ParamKind {
     /// Normal parameter: 1 IR param at the given index
     Normal(usize),
-    /// Struct/union or non-decomposed complex parameter passed by value
+    /// Struct/union, vector or complex parameter passed by value
     Struct(usize),
-    /// Complex parameter passed as two decomposed FP params (real_ir_idx, imag_ir_idx)
-    ComplexDecomposed(usize, usize),
     /// Complex float packed into single F64 (x86-64 only)
     ComplexFloatPacked(usize),
     /// i686 Clang ExtVector parameter scalarized into one IR scalar per lane.

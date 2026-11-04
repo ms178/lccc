@@ -58,7 +58,7 @@ impl P {
             param_align: None,
             struct_eightbyte_classes: vec![],
             is_f128_sse: false,
-            riscv_float_class: None,
+            fp_agg_class: None,
         };
         let mut f = IrFunction::new("demand".into(), self.ty, vec![param(), param()], false);
         f.next_value_id = self.next;

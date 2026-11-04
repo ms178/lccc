@@ -294,8 +294,12 @@ pub struct CallInfo {
     /// A singleton `[NoClass]` with no `struct_arg_sizes` entry marks an i686
     /// ExtVector lane that must stay on the stack under regparm/fastcall.
     pub struct_arg_classes: Vec<Vec<EightbyteClass>>,
-    /// RISC-V LP64D float field classification for struct args.
-    pub struct_arg_riscv_float_classes: Vec<Option<crate::common::types::RiscvFloatClass>>,
+    /// FP-register class of each by-value aggregate argument (RISC-V LP64D
+    /// flattening or an AAPCS64 HFA/HVA; see `FpAggClass`).  On the hidden
+    /// return pointer (argument 0 of an `is_sret` call) it is the class of
+    /// the RESULT when the callee returns it in FP registers (see
+    /// `backend::call_abi::hidden_fp_agg_return`).
+    pub struct_arg_fp_agg_classes: Vec<Option<crate::common::types::FpAggClass>>,
     /// True for args that are _Float128: ONE 16-byte XMM register (SysV psABI).
     pub struct_arg_is_f128_sse: Vec<bool>,
     /// True if the return value is _Float128 (ONE 16-byte XMM register).
@@ -481,12 +485,17 @@ pub enum Instruction {
     /// `align` is the struct's alignment in bytes. When the struct is fetched
     /// from the overflow area and `align > 8`, the overflow pointer must be
     /// aligned up to a multiple of 16 first (psABI §3.5.7).
+    ///
+    /// `fp_agg_class` is the AAPCS64 homogeneous-aggregate class
+    /// (`FpAggClass::Hfa`) of an HFA/HVA/short vector, whose members are read
+    /// from the SIMD register save area; `None` everywhere else.
     VaArgStruct {
         dest_ptr: Value,
         va_list_ptr: Value,
         size: usize,
         align: usize,
         eightbyte_classes: Vec<crate::common::types::EightbyteClass>,
+        fp_agg_class: Option<crate::common::types::FpAggClass>,
     },
 
     /// va_start: initialize a va_list. last_named_param is the pointer to the last named parameter.

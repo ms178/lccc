@@ -974,7 +974,7 @@ mod switch_eval_tests {
             param_align: None,
             struct_eightbyte_classes: vec![],
             is_f128_sse: false,
-            riscv_float_class: None,
+            fp_agg_class: None,
         };
         let mut f = IrFunction::new("f".into(), IrType::I32, vec![param], false);
         f.is_static = true;

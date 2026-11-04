@@ -247,6 +247,11 @@ pub struct ArmCodegen {
     /// Total bytes of named (non-variadic) params passed on the stack.
     /// This includes all stack-passed scalars, F128, I128, and structs with alignment.
     pub(super) va_named_stack_bytes: usize,
+    /// The current function returns an aggregate in SIMD registers (an
+    /// AAPCS64 HFA/HVA/short vector, `call_abi::hidden_fp_agg_return`):
+    /// the sp-relative offset of the private buffer its hidden return
+    /// pointer is homed as, and the result's class.
+    pub(super) fp_ret_buffer: Option<(i64, crate::common::types::FpAggClass)>,
     /// Dest value-ids of Clz/Ctz/Popcount results on ≤32-bit integer types:
     /// provably in [0, 32] (bit 31 clear), and the emitters write them with
     /// W-register instructions (which zero the upper 32 bits of the X
@@ -312,6 +317,7 @@ impl ArmCodegen {
             va_named_gp_count: 0,
             va_named_fp_count: 0,
             va_named_stack_bytes: 0,
+            fp_ret_buffer: None,
             bitop_nonneg_values: FxHashSet::default(),
             divrem_tail_dests: FxHashSet::default(),
             divrem_head_partners: FxHashMap::default(),
@@ -1046,6 +1052,10 @@ impl ArmCodegen {
             "str" | "ldr" => {
                 if reg.starts_with('w') || reg.starts_with('s') {
                     4
+                } else if reg.starts_with('h') {
+                    2
+                } else if reg.starts_with('b') {
+                    1
                 } else if reg.starts_with('q') {
                     16
                 } else {
@@ -2363,7 +2373,7 @@ impl ArmCodegen {
     /// reports whether x11 currently holds that effective base (computed
     /// once per parameter in the capture loops); `instr` is the store
     /// mnemonic (str/strb/strh, or str qN for the 16-byte F128 form).
-    fn emit_param_home_store_impl(
+    pub(super) fn emit_param_home_store_impl(
         &mut self,
         over_aligned: bool,
         instr: &str,
@@ -2389,7 +2399,7 @@ impl ArmCodegen {
         }
     }
 
-    fn resolve_param_slot(
+    pub(super) fn resolve_param_slot(
         &self,
         func: &IrFunction,
         i: usize,
@@ -2527,30 +2537,21 @@ impl ArmCodegen {
     }
 
     /// Phase 2: Store FP register params to alloca slots.
+    /// Store the FP-register params (`FloatReg`, and `F128FpReg` long
+    /// doubles) into their homes.
+    ///
+    /// Uses x9/w9 as scratch instead of x0/w0 to avoid clobbering GP argument
+    /// registers (x0-x7) that may not have been spilled yet (e.g. when mem2reg
+    /// promoted their allocas and emit_param_ref will read them later).  A
+    /// long double goes from its q-register to its 16-byte home, which is its
+    /// full-precision source (`track_f128_self`); nothing reads an f64
+    /// approximation of it, so no `__trunctfdf2` call (and no save area to
+    /// protect v0-v7 from that call) is needed.
     pub(super) fn emit_store_fp_params(&mut self, func: &IrFunction, param_classes: &[ParamClass]) {
-        let has_f128_fp_params = param_classes.iter().enumerate().any(|(i, c)| {
-            matches!(c, ParamClass::F128FpReg { .. }) && find_param_alloca(func, i).is_some()
-        });
-
-        if has_f128_fp_params {
-            self.emit_store_fp_params_with_f128(func, param_classes);
-        } else {
-            self.emit_store_fp_params_simple(func, param_classes);
-        }
-    }
-
-    /// Store FP params when F128 params are present (save/restore q0-q7).
-    fn emit_store_fp_params_with_f128(&mut self, func: &IrFunction, param_classes: &[ParamClass]) {
-        self.emit_sub_sp(128);
-        for i in 0..8usize {
-            self.state
-                .emit_fmt(format_args!("    str q{}, [sp, #{}]", i, i * 16));
-        }
-
-        // Process non-F128 float params first (from saved Q area).
         for (i, _) in func.params.iter().enumerate() {
-            let reg_idx = match param_classes[i] {
-                ParamClass::FloatReg { reg_idx } => reg_idx,
+            let (reg_idx, is_f128) = match param_classes[i] {
+                ParamClass::FloatReg { reg_idx } => (reg_idx, false),
+                ParamClass::F128FpReg { reg_idx } => (reg_idx, true),
                 _ => continue,
             };
             let (slot, ty, dest_val) = match self.resolve_param_slot(func, i) {
@@ -2565,75 +2566,11 @@ impl ArmCodegen {
             if over_aligned {
                 self.emit_alloca_addr("x11", dest_val.0, slot.0);
             }
-            let fp_reg_off = (reg_idx * 16) as i64;
-            if ty == IrType::U16 {
-                self.state
-                    .emit_fmt(format_args!("    ldr s0, [sp, #{}]", fp_reg_off));
-                self.state.emit("    fmov w9, s0");
-                self.state.emit("    and w9, w9, #0xffff");
-            } else if ty == IrType::F32 {
-                self.state
-                    .emit_fmt(format_args!("    ldr s0, [sp, #{}]", fp_reg_off));
-                self.state.emit("    fmov w9, s0");
-            } else {
-                self.state
-                    .emit_fmt(format_args!("    ldr d0, [sp, #{}]", fp_reg_off));
-                self.state.emit("    fmov x9, d0");
-            }
-            self.emit_param_home_store_impl(over_aligned, "str", "x9", slot, 128);
-        }
-
-        // Process F128 FP reg params: store full 16-byte f128, then f64 approx.
-        for (i, _) in func.params.iter().enumerate() {
-            let reg_idx = match param_classes[i] {
-                ParamClass::F128FpReg { reg_idx } => reg_idx,
-                _ => continue,
-            };
-            let (slot, _, dest_val) = match self.resolve_param_slot(func, i) {
-                Some(v) => v,
-                None => continue,
-            };
-            let over_aligned = self
-                .state
-                .alloca_over_align(dest_val.0)
-                .filter(|&a| a > 16)
-                .is_some();
-            if over_aligned {
-                self.emit_alloca_addr("x11", dest_val.0, slot.0);
-            }
-            let fp_reg_off = (reg_idx * 16) as i64;
-            self.state
-                .emit_fmt(format_args!("    ldr q0, [sp, #{}]", fp_reg_off));
-            self.emit_param_home_store_impl(over_aligned, "str", "q0", slot, 128);
-            self.state.track_f128_self(dest_val.0);
-            self.state.emit("    bl __trunctfdf2");
-            self.state.emit("    fmov x0, d0");
-        }
-
-        self.emit_add_sp(128);
-    }
-
-    /// Store FP params when no F128 params are present (simple path).
-    fn emit_store_fp_params_simple(&mut self, func: &IrFunction, param_classes: &[ParamClass]) {
-        // Use x9/w9 as scratch instead of x0/w0 to avoid clobbering GP argument
-        // registers (x0-x7) that may not have been spilled yet (e.g. when mem2reg
-        // promoted their allocas and emit_param_ref will read them later).
-        for (i, _) in func.params.iter().enumerate() {
-            let reg_idx = match param_classes[i] {
-                ParamClass::FloatReg { reg_idx } => reg_idx,
-                _ => continue,
-            };
-            let (slot, ty, dest_val) = match self.resolve_param_slot(func, i) {
-                Some(v) => v,
-                None => continue,
-            };
-            let over_aligned = self
-                .state
-                .alloca_over_align(dest_val.0)
-                .filter(|&a| a > 16)
-                .is_some();
-            if over_aligned {
-                self.emit_alloca_addr("x11", dest_val.0, slot.0);
+            if is_f128 {
+                let q = format!("q{}", reg_idx);
+                self.emit_param_home_store_impl(over_aligned, "str", &q, slot, 0);
+                self.state.track_f128_self(dest_val.0);
+                continue;
             }
             if ty == IrType::U16 {
                 self.state
@@ -3603,12 +3540,13 @@ impl ArchCodegen for ArmCodegen {
         fn emit_call_compute_stack_space(&self, arg_classes: &[CallArgClass], arg_types: &[IrType], struct_arg_aligns: &[Option<usize>], _struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>], struct_arg_is_f128_sse: &[bool]) -> usize => emit_call_compute_stack_space_impl;
         fn emit_call_f128_pre_convert(&mut self, args: &[Operand], arg_classes: &[CallArgClass], arg_types: &[IrType], stack_arg_space: usize) -> usize => emit_call_f128_pre_convert_impl;
         fn emit_call_stack_args(&mut self, args: &[Operand], arg_classes: &[CallArgClass], arg_types: &[IrType], stack_arg_space: usize, fptr_spill: usize, f128_temp_space: usize, struct_arg_aligns: &[Option<usize>], _struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>], _struct_arg_is_f128_sse: &[bool]) -> i64 => emit_call_stack_args_impl;
-        fn emit_call_reg_args(&mut self, args: &[Operand], arg_classes: &[CallArgClass], arg_types: &[IrType], total_sp_adjust: i64, f128_temp_space: usize, stack_arg_space: usize, struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>]) => emit_call_reg_args_impl;
+        fn emit_call_reg_args(&mut self, args: &[Operand], arg_classes: &[CallArgClass], arg_types: &[IrType], total_sp_adjust: i64, f128_temp_space: usize, stack_arg_space: usize, struct_arg_fp_agg_classes: &[Option<crate::common::types::FpAggClass>]) => emit_call_reg_args_impl;
         fn emit_call_instruction(&mut self, direct_name: Option<&str>, func_ptr: Option<&Operand>, indirect: bool, stack_arg_space: usize) => emit_call_instruction_impl;
         fn emit_call_cleanup(&mut self, stack_arg_space: usize, f128_temp_space: usize, indirect: bool) => emit_call_cleanup_impl;
         fn emit_call_store_i128_result(&mut self, dest: &Value) => emit_call_store_i128_result_impl;
         fn emit_call_store_f128_result(&mut self, dest: &Value) => emit_call_store_f128_result_impl;
         fn emit_call_store_result(&mut self, dest: &Value, return_type: IrType) => emit_call_store_result_impl;
+        fn emit_call_store_fp_agg_return(&mut self, buffer: &Operand, class: crate::common::types::FpAggClass, dest: Option<&Value>) => emit_call_store_fp_agg_return_impl;
         fn set_call_ret_is_f128_sse(&mut self, is_f128: bool) => set_call_ret_is_f128_sse_impl;
         // globals
         fn emit_global_addr(&mut self, dest: &Value, name: &str) => emit_global_addr_impl;
@@ -3622,6 +3560,7 @@ impl ArchCodegen for ArmCodegen {
         fn emit_va_start(&mut self, va_list_ptr: &Value) => emit_va_start_impl;
         fn emit_va_copy(&mut self, dest_ptr: &Value, src_ptr: &Value) => emit_va_copy_impl;
         fn emit_va_arg_struct(&mut self, dest_ptr: &Value, va_list_ptr: &Value, size: usize, align: usize) => emit_va_arg_struct_impl;
+        fn emit_va_arg_hfa(&mut self, dest_ptr: &Value, va_list_ptr: &Value, size: usize, align: usize, member_size: usize, count: usize) => emit_va_arg_hfa_impl;
         // returns
         fn current_return_type(&self) -> IrType => current_return_type_impl;
         fn emit_return_i128_to_regs(&mut self) => emit_return_i128_to_regs_impl;

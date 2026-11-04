@@ -120,6 +120,14 @@ pub enum CallArgClass {
         int_reg_idx: usize,
         size: usize,
     },
+    /// AAPCS64 HFA/HVA or short vector (`FpAggClass::Hfa`): member `i`
+    /// (`member_size` bytes at offset `i * member_size`) in v[`fp_idx + i`]
+    /// for `i < count`.  The operand is the aggregate's ADDRESS.
+    StructHfaReg {
+        fp_idx: usize,
+        count: usize,
+        member_size: usize,
+    },
     /// Small struct (<=16 bytes) that overflows to the stack.
     StructByValStack { size: usize },
     /// Small struct split across the last GP register and the stack.
@@ -213,12 +221,20 @@ pub enum ParamClass {
     /// one class serves them all.
     F128SseReg { reg_idx: usize, size: usize },
     /// The hidden return pointer of a function whose aggregate result the
-    /// psABI returns in ONE `%ymm0` / `%zmm0` (see
-    /// [`hidden_vector_return_bytes`]). It arrives in no register: the
-    /// callee homes it as the address of a private `bytes`-byte frame
-    /// buffer, and the return sequence loads that buffer into the vector
-    /// register.
-    VectorReturnBuffer { bytes: usize },
+    /// psABI returns in registers: ONE `%ymm0` / `%zmm0` (x86-64, see
+    /// [`hidden_vector_return_bytes`]) or the FP registers of an
+    /// [`hidden_fp_agg_return`] class (AAPCS64 HFA, RISC-V float struct).
+    /// It arrives in no register: the callee homes it as the address of a
+    /// private `bytes`-byte frame buffer, and the return sequence loads that
+    /// buffer into the return registers.
+    RegReturnBuffer { bytes: usize },
+    /// AAPCS64 HFA/HVA or short vector parameter: member `i` arrives in
+    /// v[`fp_idx + i`] (see `CallArgClass::StructHfaReg`).
+    StructHfaReg {
+        fp_idx: usize,
+        count: usize,
+        member_size: usize,
+    },
     /// Small struct: first eightbyte INTEGER, second SSE.
     /// (`size` mirrors `CallArgClass`/`CoreArgClass` for structural consistency.)
     StructMixedIntSseReg {
@@ -362,7 +378,8 @@ impl ParamClass {
         match self {
             ParamClass::FloatReg { .. } => 1,
             ParamClass::F128SseReg { .. } => 1,
-            ParamClass::VectorReturnBuffer { .. } => 0,
+            ParamClass::RegReturnBuffer { .. } => 0,
+            ParamClass::StructHfaReg { count, .. } => *count,
             ParamClass::F128FpReg { .. } => 1,
             ParamClass::StructSseReg { hi_fp_idx, .. } => 1 + usize::from(hi_fp_idx.is_some()),
             ParamClass::StructMixedIntSseReg { .. } | ParamClass::StructMixedSseIntReg { .. } => 1,
@@ -383,7 +400,7 @@ impl ParamClass {
 /// no classes; a register-returned aggregate of ≤16 bytes is not sret). The
 /// backend applies the register convention at the boundary: the hidden
 /// pointer consumes no argument register (`CallArgClass::ZeroSizeSkip` /
-/// `ParamClass::VectorReturnBuffer`), the callee's return loads the buffer
+/// `ParamClass::RegReturnBuffer`), the callee's return loads the buffer
 /// into the register, and the caller stores the register through its
 /// buffer after the call. A 16-byte one-`%xmm` return is not this case: it
 /// travels as a 16-byte IR value (`ret_is_f128_sse`).
@@ -395,6 +412,40 @@ pub fn hidden_vector_return_bytes(
         return None;
     }
     crate::common::sysv_classify::vector_reg_bytes_of(ret_classes).filter(|b| *b > 16)
+}
+
+/// `Some(class)` when a call or function with the hidden-pointer return
+/// shape (`is_sret`) returns its aggregate in the FP registers of `class`:
+/// an AAPCS64 HFA/HVA/short vector (v0..v3, at any size up to 64 bytes) or
+/// a RISC-V LP64D flattened float struct (fa0/fa1, or one FPR and a0).
+///
+/// Like [`hidden_vector_return_bytes`], the IR keeps the sret shape --
+/// caller-allocated buffer, its address as argument 0, the callee writes the
+/// result through it -- and the class rides on that hidden pointer
+/// (`CallInfo::struct_arg_fp_agg_classes[0]`, `IrParam::fp_agg_class` of
+/// parameter 0), where no other convention puts one: the pointer is not a
+/// by-value aggregate.  The backend applies the register convention at the
+/// boundary: the pointer consumes no argument register (not x8, not a0),
+/// the callee homes it as a private frame buffer and loads the registers
+/// from it on return, and the caller stores the registers through its own
+/// buffer after the call.  Keeping the buffer shape costs one store/load
+/// pair per member that store-to-load forwarding absorbs, and lets every
+/// size (an HFA of four quads is 64 bytes) share one path.
+pub fn hidden_fp_agg_return(
+    is_sret: bool,
+    hidden_ptr_class: Option<crate::common::types::FpAggClass>,
+) -> Option<crate::common::types::FpAggClass> {
+    hidden_ptr_class.filter(|_| is_sret)
+}
+
+/// Bytes of the private frame buffer that homes the hidden return pointer
+/// of an [`hidden_fp_agg_return`] function.  An HFA is exactly its members
+/// (no padding by definition); a RISC-V flattened struct is at most
+/// 2 × XLEN = 16 bytes, the size the body may copy into the buffer.
+pub fn fp_agg_return_buffer_bytes(class: crate::common::types::FpAggClass) -> usize {
+    class
+        .hfa()
+        .map_or(16, |(member_size, count)| member_size * count)
 }
 
 // ---------------------------------------------------------------------------
@@ -427,9 +478,14 @@ pub struct CallAbiConfig {
     /// When true, small structs with float/double fields are passed in FP registers
     /// per the RISC-V psABI.
     pub use_riscv_float_struct_classification: bool,
-    /// Whether 2-register structs can be split across the last GP register and the stack.
-    /// RISC-V psABI: if a 2×XLEN struct has only 1 GP register left, the first XLEN bytes
-    /// go in that register and the rest go on the stack. ARM AAPCS64 does NOT split.
+    /// Whether a 2×XLEN argument -- an aggregate in the integer convention,
+    /// or a scalar (`__int128`, `long double`, `_Float128`) -- that finds
+    /// exactly one GP register left is split across it and the stack.
+    /// RISC-V psABI: the first XLEN bits go in that register, the rest on
+    /// the stack (`f(long x0, ..., long x6, long double y)` passes y's low
+    /// half in a7 and its high half at 0(sp); GCC and Clang alike).  Only a
+    /// NAMED scalar can meet a lone a7: a variadic one starts at an even
+    /// register (`even_pairs_for_unnamed_only`).  ARM AAPCS64 never splits.
     pub allow_struct_split_reg_stack: bool,
     /// Whether 2-register structs with >XLEN alignment must start at an even register.
     /// RISC-V psABI: true (2×XLEN-aligned composites require even-aligned register pairs).
@@ -510,6 +566,14 @@ pub struct CallAbiConfig {
     /// honoring the tag there pushed the pointer to the stack while the
     /// callee's `va_arg` read `%rsi` (gcc.c-torture 20020412-1.c aborts).
     pub i386_ext_vector_lanes: bool,
+    /// Whether AAPCS64 homogeneous aggregates (`FpAggClass::Hfa`: HFAs, HVAs
+    /// and short vectors) travel in SIMD registers: one v-register per
+    /// member when enough are free (C.2), otherwise the whole aggregate goes
+    /// to the stack BY VALUE at any size -- B.2 exempts it from the
+    /// over-16-bytes by-reference rule -- and no later argument takes a
+    /// v-register (C.3: NSRN = 8).  Named and variadic arguments alike.
+    /// AArch64 only.
+    pub homogeneous_fp_aggregates: bool,
 }
 
 /// Natural stack alignment for an i386 GNU vector MEMORY argument.
@@ -589,6 +653,7 @@ impl CallAbiConfig {
             stack_arg_align_cap: 16,
             vector_xmm_regs: 0,
             i386_ext_vector_lanes: false,
+            homogeneous_fp_aggregates: false,
         }
     }
 
@@ -622,6 +687,7 @@ impl CallAbiConfig {
             stack_arg_align_cap: 16,
             vector_xmm_regs: 0,
             i386_ext_vector_lanes: false,
+            homogeneous_fp_aggregates: true,
         }
     }
 
@@ -660,6 +726,7 @@ impl CallAbiConfig {
             stack_arg_align_cap: usize::MAX,
             vector_xmm_regs: 0,
             i386_ext_vector_lanes: false,
+            homogeneous_fp_aggregates: false,
         }
     }
 }
@@ -763,8 +830,9 @@ pub(crate) struct ArgInfo<'a> {
     /// regparm GP registers; it is honored only under
     /// `CallAbiConfig::i386_ext_vector_lanes`.
     pub(crate) eightbyte_classes: &'a [crate::common::types::EightbyteClass],
-    /// RISC-V LP64D float struct classification. None if not applicable.
-    pub(crate) riscv_float_class: Option<crate::common::types::RiscvFloatClass>,
+    /// FP-register aggregate class (RISC-V LP64D flattening, AAPCS64 HFA).
+    /// None if not applicable.
+    pub(crate) fp_agg_class: Option<crate::common::types::FpAggClass>,
 }
 
 // ---------------------------------------------------------------------------
@@ -824,6 +892,11 @@ enum CoreArgClass {
         int_reg_idx: usize,
         size: usize,
     },
+    StructHfaReg {
+        fp_idx: usize,
+        count: usize,
+        member_size: usize,
+    },
     StructByValStack {
         size: usize,
     },
@@ -851,6 +924,28 @@ struct CoreClassification {
     classes: Vec<CoreArgClass>,
     /// Final GP register index after classifying all arguments (capped at max_int_regs).
     int_reg_idx: usize,
+}
+
+/// Class of a 2×XLEN `long double` / `_Float128` carried in a GP register
+/// pair (`f128_in_gp_pairs`), allocated at `*int_idx`: the pair when two
+/// registers remain, the split across the last register and the stack when
+/// exactly one does and the target splits (`allow_struct_split_reg_stack`;
+/// the backend moves the scalar's 16 bytes as it moves a 16-byte
+/// aggregate's), else the stack -- which closes the GP file.
+fn f128_gp_pair_class(int_idx: &mut usize, config: &CallAbiConfig) -> CoreArgClass {
+    let reg_idx = *int_idx;
+    if reg_idx + 1 < config.max_int_regs {
+        *int_idx += 2;
+        return CoreArgClass::F128GpPair {
+            base_reg_idx: reg_idx,
+        };
+    }
+    *int_idx = config.max_int_regs;
+    if reg_idx + 1 == config.max_int_regs && config.allow_struct_split_reg_stack {
+        CoreArgClass::StructSplitRegStack { reg_idx, size: 16 }
+    } else {
+        CoreArgClass::F128Stack
+    }
 }
 
 /// Microsoft x64 classification using shared positional GP/FP argument slots.
@@ -1072,6 +1167,33 @@ fn classify_args_core(
                 continue;
             }
 
+            // AAPCS64 homogeneous aggregate (HFA/HVA/short vector): C.2
+            // gives it `count` consecutive v-registers when that many are
+            // free; otherwise C.3 closes the SIMD file (NSRN = 8) and the
+            // whole aggregate is copied to the stack -- by value at any
+            // size, B.2 exempts it from the >16-byte by-reference rule.  The
+            // GP sequence is untouched either way.
+            if config.homogeneous_fp_aggregates {
+                if let Some((member_size, count)) = info.fp_agg_class.and_then(|c| c.hfa()) {
+                    if float_idx + count <= config.max_float_regs {
+                        result.push(CoreArgClass::StructHfaReg {
+                            fp_idx: float_idx,
+                            count,
+                            member_size,
+                        });
+                        float_idx += count;
+                    } else {
+                        float_idx = config.max_float_regs;
+                        result.push(if size <= 16 {
+                            CoreArgClass::StructByValStack { size }
+                        } else {
+                            CoreArgClass::LargeStructStack { size }
+                        });
+                    }
+                    continue;
+                }
+            }
+
             // AAPCS64 (ARM): a _Float128 carrier (scalar or 16-byte
             // aggregate flagged is_f128_sse by the lowering) goes in a Q
             // register exactly like long double — the "SSE" naming of the
@@ -1096,15 +1218,7 @@ fn classify_args_core(
                 if config.align_i128_pairs && even_pairs && int_idx % 2 != 0 {
                     int_idx += 1;
                 }
-                if int_idx + 1 < config.max_int_regs {
-                    result.push(CoreArgClass::F128GpPair {
-                        base_reg_idx: int_idx,
-                    });
-                    int_idx += 2;
-                } else {
-                    result.push(CoreArgClass::F128Stack);
-                    int_idx = config.max_int_regs;
-                }
+                result.push(f128_gp_pair_class(&mut int_idx, config));
                 continue;
             }
 
@@ -1198,15 +1312,15 @@ fn classify_args_core(
             } else if size <= 16 {
                 // Non-SysV path (ARM, RISC-V)
                 let rv_class = if config.use_riscv_float_struct_classification {
-                    info.riscv_float_class
+                    info.fp_agg_class
                 } else {
                     None
                 };
                 let mut classified = false;
                 if let Some(rv_fc) = rv_class {
-                    use crate::common::types::RiscvFloatClass;
+                    use crate::common::types::FpAggClass;
                     match rv_fc {
-                        RiscvFloatClass::OneFloat { .. } => {
+                        FpAggClass::OneFloat { .. } => {
                             if float_idx < config.max_float_regs {
                                 result.push(CoreArgClass::StructSseReg {
                                     lo_fp_idx: float_idx,
@@ -1217,7 +1331,7 @@ fn classify_args_core(
                                 classified = true;
                             }
                         }
-                        RiscvFloatClass::TwoFloats { .. } => {
+                        FpAggClass::TwoFloats { .. } => {
                             if float_idx + 1 < config.max_float_regs {
                                 result.push(CoreArgClass::StructSseReg {
                                     lo_fp_idx: float_idx,
@@ -1228,7 +1342,7 @@ fn classify_args_core(
                                 classified = true;
                             }
                         }
-                        RiscvFloatClass::FloatAndInt { .. } => {
+                        FpAggClass::FloatAndInt { .. } => {
                             if float_idx < config.max_float_regs && int_idx < config.max_int_regs {
                                 result.push(CoreArgClass::StructMixedSseIntReg {
                                     fp_reg_idx: float_idx,
@@ -1240,7 +1354,7 @@ fn classify_args_core(
                                 classified = true;
                             }
                         }
-                        RiscvFloatClass::IntAndFloat { .. } => {
+                        FpAggClass::IntAndFloat { .. } => {
                             if int_idx < config.max_int_regs && float_idx < config.max_float_regs {
                                 result.push(CoreArgClass::StructMixedIntSseReg {
                                     int_reg_idx: int_idx,
@@ -1252,6 +1366,9 @@ fn classify_args_core(
                                 classified = true;
                             }
                         }
+                        // Homogeneous aggregates took the AAPCS64 branch
+                        // above; RISC-V never produces one.
+                        FpAggClass::Hfa { .. } => {}
                     }
                 }
                 if !classified {
@@ -1321,6 +1438,12 @@ fn classify_args_core(
                     base_reg_idx: int_idx,
                 });
                 int_idx += 2;
+            } else if int_idx + 1 == config.max_int_regs && config.allow_struct_split_reg_stack {
+                result.push(CoreArgClass::StructSplitRegStack {
+                    reg_idx: int_idx,
+                    size: 16,
+                });
+                int_idx = config.max_int_regs;
             } else {
                 result.push(CoreArgClass::I128Stack);
                 // AAPCS64 (C.9/C.11) and the i686 regparm model close the GP
@@ -1349,15 +1472,7 @@ fn classify_args_core(
                 if config.align_i128_pairs && even_pairs && int_idx % 2 != 0 {
                     int_idx += 1;
                 }
-                if int_idx + 1 < config.max_int_regs {
-                    result.push(CoreArgClass::F128GpPair {
-                        base_reg_idx: int_idx,
-                    });
-                    int_idx += 2;
-                } else {
-                    result.push(CoreArgClass::F128Stack);
-                    int_idx = config.max_int_regs;
-                }
+                result.push(f128_gp_pair_class(&mut int_idx, config));
             } else {
                 result.push(CoreArgClass::F128Stack);
             }
@@ -1392,7 +1507,7 @@ fn classify_args_core(
 /// `struct_arg_sizes`: Some(size) for struct/union by-value args, None otherwise.
 /// `struct_arg_aligns`: struct alignment (for RISC-V even-register alignment).
 /// `struct_arg_classes`: per-eightbyte SysV ABI classification (x86-64 only).
-/// `struct_arg_riscv_float_classes`: RISC-V LP64D float field classification.
+/// `struct_arg_fp_agg_classes`: RISC-V LP64D float field classification.
 /// `variadic`: `Some(n)` for a call to a variadic prototype whose arguments
 /// from index `n` on are unnamed (`n` indexes `args`); `None` otherwise.
 pub fn classify_call_args(
@@ -1401,7 +1516,7 @@ pub fn classify_call_args(
     struct_arg_sizes: &[Option<usize>],
     struct_arg_aligns: &[Option<usize>],
     struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
-    struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
+    struct_arg_fp_agg_classes: &[Option<crate::common::types::FpAggClass>],
     struct_arg_is_f128_sse: &[bool],
     variadic: Option<usize>,
     config: &CallAbiConfig,
@@ -1433,7 +1548,7 @@ pub fn classify_call_args(
                     .get(i)
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]),
-                riscv_float_class: struct_arg_riscv_float_classes.get(i).copied().flatten(),
+                fp_agg_class: struct_arg_fp_agg_classes.get(i).copied().flatten(),
                 is_f128_sse: !is_half_fp && raw_f128_sse,
                 is_i64_pair: arg_ty
                     .map(|t| matches!(t, IrType::I64 | IrType::U64))
@@ -1495,6 +1610,15 @@ pub fn classify_call_args(
                 int_reg_idx,
                 size,
             },
+            CoreArgClass::StructHfaReg {
+                fp_idx,
+                count,
+                member_size,
+            } => CallArgClass::StructHfaReg {
+                fp_idx,
+                count,
+                member_size,
+            },
             CoreArgClass::StructByValStack { size } => CallArgClass::StructByValStack { size },
             CoreArgClass::StructSplitRegStack { reg_idx, size } => {
                 CallArgClass::StructSplitRegStack { reg_idx, size }
@@ -1539,7 +1663,17 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
     // the IR (parameter 0) but the pointer arrives in no register: classify
     // the real parameters from index 1 and give parameter 0 its frame
     // buffer class. (x86-64 only; every other target answers `None`.)
-    if let Some(bytes) = hidden_vector_return_bytes(func.uses_sret, &func.ret_eightbyte_classes) {
+    // An FP-register result (AAPCS64 HFA, RISC-V float struct) has the same
+    // shape: the hidden pointer is homed in a private buffer, never x8/a0.
+    let hidden_buffer_bytes =
+        hidden_vector_return_bytes(func.uses_sret, &func.ret_eightbyte_classes).or_else(|| {
+            hidden_fp_agg_return(
+                func.uses_sret,
+                func.params.first().and_then(|p| p.fp_agg_class),
+            )
+            .map(fp_agg_return_buffer_bytes)
+        });
+    if let Some(bytes) = hidden_buffer_bytes {
         if !func.params.is_empty() {
             let mut classification = classify_param_slice(
                 &func.name,
@@ -1550,7 +1684,7 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
             );
             classification
                 .classes
-                .insert(0, ParamClass::VectorReturnBuffer { bytes });
+                .insert(0, ParamClass::RegReturnBuffer { bytes });
             return classification;
         }
     }
@@ -1572,7 +1706,7 @@ fn param_to_arg_info(param: &crate::ir::module::IrParam) -> ArgInfo<'_> {
         struct_size: param.struct_size,
         struct_align: param.struct_align,
         eightbyte_classes: &param.struct_eightbyte_classes,
-        riscv_float_class: param.riscv_float_class,
+        fp_agg_class: param.fp_agg_class,
         is_f128_sse: !is_half_fp && param.is_f128_sse,
         is_i64_pair: matches!(param.ty, IrType::I64 | IrType::U64),
     }
@@ -1672,6 +1806,15 @@ fn classify_param_slice(
                 fp_reg_idx,
                 int_reg_idx,
                 size,
+            },
+            CoreArgClass::StructHfaReg {
+                fp_idx,
+                count,
+                member_size,
+            } => ParamClass::StructHfaReg {
+                fp_idx,
+                count,
+                member_size,
             },
             CoreArgClass::F128FpReg { reg_idx } => ParamClass::F128FpReg { reg_idx },
             CoreArgClass::F128GpPair { base_reg_idx } => ParamClass::F128GpPair {
@@ -2064,6 +2207,7 @@ mod tests {
             stack_arg_align_cap: 4,
             vector_xmm_regs: 3,
             i386_ext_vector_lanes: true,
+            homogeneous_fp_aggregates: false,
         }
     }
 
@@ -2077,7 +2221,7 @@ mod tests {
             struct_size: None,
             struct_align: None,
             eightbyte_classes: classes,
-            riscv_float_class: None,
+            fp_agg_class: None,
         }
     }
 
@@ -2243,7 +2387,7 @@ mod tests {
             param_align: None,
             struct_eightbyte_classes: classes,
             is_f128_sse: false,
-            riscv_float_class: None,
+            fp_agg_class: None,
         };
         let params = vec![
             param(None, None, Vec::new()),
@@ -2427,6 +2571,49 @@ mod tests {
             CoreArgClass::StructByValStack { size: 16 }
         ));
         assert_eq!(unnamed.int_reg_idx, 8);
+    }
+
+    /// RV64 2×XLEN scalars at the last argument register (Clang 23.1.4 /
+    /// GCC 16.2; psABI "Integer Calling Convention"): a named `__int128` or
+    /// `long double` that finds only a7 free passes its low half in a7 and
+    /// its high half at 0(sp) -- the class a named 16-byte aggregate takes
+    /// there, whose 16 raw bytes the callee stores the same way -- and the
+    /// next argument follows on the stack.  An unnamed one starts at an even
+    /// register, so it skips a7 for the stack whole.  AAPCS64 never splits.
+    #[test]
+    fn rv64_named_wide_scalars_split_at_a7_and_unnamed_ones_skip_it() {
+        let config = CallAbiConfig::riscv_lp64d();
+        for wide in [i128_arg(), long_double_arg()] {
+            let mut args: Vec<ArgInfo<'_>> = (0..7).map(|_| int_arg()).collect();
+            args.push(wide);
+            args.push(int_arg());
+            let named = classify_args_core(&args, args.len(), false, &config);
+            assert!(matches!(
+                named.classes[7],
+                CoreArgClass::StructSplitRegStack {
+                    reg_idx: 7,
+                    size: 16
+                }
+            ));
+            assert!(matches!(named.classes[8], CoreArgClass::Stack));
+            assert_eq!(named.int_reg_idx, 8);
+
+            let unnamed = classify_args_core(&args, 7, true, &config);
+            assert!(matches!(
+                unnamed.classes[7],
+                CoreArgClass::I128Stack | CoreArgClass::F128Stack
+            ));
+            assert!(matches!(unnamed.classes[8], CoreArgClass::Stack));
+
+            // With a6 free as well, the pair is whole in a6/a7.
+            let pair = classify_args_core(&args[1..], args.len() - 1, false, &config);
+            assert_eq!(gp_bases(&pair)[6], Some(6));
+            assert!(matches!(pair.classes[7], CoreArgClass::Stack));
+        }
+        let mut args: Vec<ArgInfo<'_>> = (0..7).map(|_| int_arg()).collect();
+        args.push(i128_arg());
+        let arm = classify_args_core(&args, args.len(), false, &CallAbiConfig::aapcs64());
+        assert!(matches!(arm.classes[7], CoreArgClass::I128Stack));
     }
 
     /// RISC-V: a variadic function's *named* floats use FP registers; only

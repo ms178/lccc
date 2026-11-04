@@ -140,7 +140,7 @@ fn hook_call(vfn: Value, vsite: Value) -> CallInfo {
         struct_arg_sizes: vec![None, None],
         struct_arg_aligns: vec![None, None],
         struct_arg_classes: vec![vec![], vec![]],
-        struct_arg_riscv_float_classes: vec![None],
+        struct_arg_fp_agg_classes: vec![None],
         struct_arg_is_f128_sse: vec![false, false],
         ret_is_f128_sse: false,
         is_sret: false,

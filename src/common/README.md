@@ -84,7 +84,7 @@ Arrows point from consumer to provider.
   Optimization Passes --->|  types (IrType), fx_hash, long_double,           |
                           |  asm_constraints                                 |
                           |                                                  |
-  Backend  -------------->|  types (IrType, EightbyteClass, RiscvFloatClass, |
+  Backend  -------------->|  types (IrType, EightbyteClass, FpAggClass, |
                           |        AddressSpace), source, fx_hash,           |
                           |  asm_constraints, temp_files                     |
                           |                                                  |
@@ -268,7 +268,7 @@ StructLayout public methods:
   eightbyte classification for register passing. Returns a vector of
   `EightbyteClass` values (one per eightbyte).
   `classify_riscv_float_fields(ctx)` -- RISC-V LP64D floating-point calling
-  convention classification. Returns `Option<RiscvFloatClass>`.
+  convention classification. Returns `Option<FpAggClass>`.
 - Field resolution: `resolve_init_field(designator, idx, ctx)` and
   `resolve_init_field_idx(...)` -- resolve designated initializer field names,
   including drill-down into anonymous struct/union members. Returns
@@ -295,7 +295,7 @@ variadic flag.
 - `EightbyteClass` -- System V AMD64 ABI classification (NoClass, Sse, Integer)
   with a `merge()` method implementing the standard merging rules: NoClass
   yields to anything, Integer dominates, and Sse merges with itself.
-- `RiscvFloatClass` -- RISC-V LP64D hardware floating-point calling convention
+- `FpAggClass` -- RISC-V LP64D hardware floating-point calling convention
   classification. Variants:
   - `OneFloat { is_double }` -- a single float or double field.
   - `TwoFloats { lo_is_double, hi_is_double }` -- two float/double fields

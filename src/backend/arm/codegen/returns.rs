@@ -9,6 +9,13 @@ use crate::ir::reexports::{Operand, Value};
 impl ArmCodegen {
     pub(super) fn emit_return_impl(&mut self, val: Option<&Operand>, frame_size: i64) {
         if let Some(val) = val {
+            // HFA/HVA/short-vector result: the IR returns the hidden buffer
+            // pointer; AAPCS64 wants the members in v0..v3.
+            if let Some((_, class)) = self.fp_ret_buffer {
+                self.emit_return_fp_agg(val, class);
+                self.emit_epilogue_and_ret_impl(frame_size);
+                return;
+            }
             let ret_ty = self.current_return_type;
             if ret_ty.is_long_double() {
                 self.emit_f128_operand_to_q0_full(val);

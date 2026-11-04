@@ -202,13 +202,9 @@ pub trait F128SoftFloat {
     /// loads the pointer value, never computes an alloca address.
     fn f128_load_indirect_ptr_to_addr_reg(&mut self, slot: StackSlot, val_id: u32);
 
-    /// Load f128 from addr_reg, convert to f64 approx, store to dest.
-    /// This is the "load through pointer" path: load 16 bytes from the address
-    /// register, call __trunctfdf2, move result to accumulator, store to dest.
-    fn f128_load_from_addr_reg_to_acc(&mut self, dest: &Value);
-
-    /// Load f128 from a direct alloca slot, convert to f64 approx, store to accumulator.
-    fn f128_load_from_direct_slot_to_acc(&mut self, slot: StackSlot);
+    /// Whether the value has a register assignment (an F128 value's register
+    /// can only hold its f64 approximation).
+    fn f128_has_reg(&self, val_id: u32) -> bool;
 
     /// Store arg1 (f128 result) to dest slot and produce f64 approximation.
     /// This is the common epilogue for cast/binop results: store full f128 to
@@ -514,50 +510,37 @@ pub fn f128_emit_store<T: F128SoftFloat + ?Sized>(cg: &mut T, val: &Operand, ptr
     }
 }
 
-/// F128 load dispatch: resolve the pointer's SlotAddr, load 16 bytes,
-/// convert to f64 approximation, and store to dest.
+/// Publish an F128 value just loaded into arg1 as `dest`.
 ///
-/// Also tracks the f128 source for full-precision reloads.
-pub fn f128_emit_load<T: F128SoftFloat + ?Sized>(cg: &mut T, dest: &Value, ptr: &Value) {
-    cg.state().track_f128_load(dest.0, ptr.0, 0);
-    let is_indirect = !cg.f128_is_alloca(ptr.0);
-
-    // Check if the pointer lives in a callee-saved register.
-    if cg.f128_move_callee_reg_to_addr_reg(ptr.0) {
-        cg.f128_load_from_addr_reg_to_acc(dest);
-        return;
-    }
-
-    let addr = cg.f128_resolve_slot_addr(ptr.0);
-    if let Some(addr) = addr {
-        match addr {
-            SlotAddr::Direct(slot) if !is_indirect => {
-                cg.f128_load_from_direct_slot_to_acc(slot);
-            }
-            SlotAddr::Direct(slot) | SlotAddr::Indirect(slot) => {
-                cg.f128_load_indirect_ptr_to_addr_reg(slot, ptr.0);
-                cg.f128_load_from_addr_reg_to_acc(dest);
-                return;
-            }
-            SlotAddr::OverAligned(slot, id) => {
-                cg.f128_alloca_aligned_addr(slot, id);
-                cg.f128_move_aligned_to_addr_reg();
-                cg.f128_load_from_addr_reg_to_acc(dest);
-                return;
-            }
-            SlotAddr::Reg(reg) => {
-                cg.f128_move_phys_to_addr_reg(reg);
-                cg.f128_load_from_addr_reg_to_acc(dest);
-                return;
-            }
+/// The 16 bytes go to `dest`'s own (16-byte) slot, which `track_f128_self`
+/// makes the source every F128 consumer reads (`f128_operand_to_arg1`), so a
+/// load is a snapshot at full precision.  It used to stay a reference to the
+/// pointer: a register-allocated pointer has no slot to reload through, so
+/// those consumers fell back to the f64 approximation and passed, stored or
+/// computed with `extend(trunc(x))` -- double precision.  No approximation
+/// is computed for a slot destination (each one cost a `__trunctfdf2` call):
+/// tracked values never read it, as with call and va_arg results.  A
+/// destination without a slot, or with a register, keeps the approximation,
+/// the only form its consumers can read.
+fn f128_publish_load<T: F128SoftFloat + ?Sized>(cg: &mut T, dest: &Value) {
+    match cg.f128_get_slot(dest.0) {
+        Some(slot) if !cg.f128_has_reg(dest.0) => {
+            cg.f128_store_arg1_to_slot(slot);
+            cg.f128_track_self(dest.0);
         }
-    } else {
-        return;
+        _ => {
+            cg.f128_truncate_result_to_acc();
+            cg.state().reg_cache.invalidate_all();
+            cg.f128_store_acc_to_dest(dest);
+        }
     }
-    // Convert f128 to f64, store to dest.
-    cg.f128_truncate_result_to_acc();
     cg.state().reg_cache.invalidate_all();
-    cg.f128_store_acc_to_dest(dest);
+}
+
+/// F128 load dispatch: resolve the pointer's SlotAddr, load 16 bytes and
+/// publish them as `dest` (`f128_publish_load`).
+pub fn f128_emit_load<T: F128SoftFloat + ?Sized>(cg: &mut T, dest: &Value, ptr: &Value) {
+    f128_emit_load_with_offset(cg, dest, ptr, 0);
 }
 
 /// F128 store with constant offset dispatch.
@@ -615,68 +598,45 @@ pub fn f128_emit_store_with_offset<T: F128SoftFloat + ?Sized>(
 
 /// F128 load with constant offset dispatch.
 ///
-/// Resolves the base pointer's SlotAddr, loads 16 bytes at base + offset,
-/// converts to f64 approximation, and stores to dest.
+/// Resolves the base pointer's SlotAddr, loads 16 bytes at base + offset and
+/// publishes them as `dest` (`f128_publish_load`).
 pub fn f128_emit_load_with_offset<T: F128SoftFloat + ?Sized>(
     cg: &mut T,
     dest: &Value,
     base: &Value,
     offset: i64,
 ) {
+    // The fallback for a destination without a slot: reload through the
+    // base pointer.
     cg.state().track_f128_load(dest.0, base.0, offset);
     let is_indirect = !cg.f128_is_alloca(base.0);
 
-    // Check if the base pointer lives in a callee-saved register.
-    let loaded = if cg.f128_move_callee_reg_to_addr_reg(base.0) {
-        if offset != 0 {
-            cg.f128_add_offset_to_addr_reg(offset);
-        }
-        cg.f128_load_from_addr_reg_to_acc(dest);
-        return; // load_from_addr_reg_to_acc handles truncation + store
+    // Point the address register at the data, or load a direct slot.
+    if cg.f128_move_callee_reg_to_addr_reg(base.0) {
+        // The base pointer lives in a callee-saved register.
     } else {
-        let addr = cg.f128_resolve_slot_addr(base.0);
-        if let Some(addr) = addr {
-            match addr {
-                SlotAddr::Direct(slot) if !is_indirect => {
-                    let folded_slot = StackSlot(slot.0 + offset);
-                    cg.f128_load_from_direct_slot_to_acc(folded_slot);
-                }
-                SlotAddr::Direct(slot) | SlotAddr::Indirect(slot) => {
-                    cg.f128_load_indirect_ptr_to_addr_reg(slot, base.0);
-                    if offset != 0 {
-                        cg.f128_add_offset_to_addr_reg(offset);
-                    }
-                    cg.f128_load_from_addr_reg_to_acc(dest);
-                    return;
-                }
-                SlotAddr::OverAligned(slot, id) => {
-                    cg.f128_alloca_aligned_addr(slot, id);
-                    cg.f128_move_aligned_to_addr_reg();
-                    if offset != 0 {
-                        cg.f128_add_offset_to_addr_reg(offset);
-                    }
-                    cg.f128_load_from_addr_reg_to_acc(dest);
-                    return;
-                }
-                SlotAddr::Reg(reg) => {
-                    cg.f128_move_phys_to_addr_reg(reg);
-                    if offset != 0 {
-                        cg.f128_add_offset_to_addr_reg(offset);
-                    }
-                    cg.f128_load_from_addr_reg_to_acc(dest);
-                    return;
-                }
+        match cg.f128_resolve_slot_addr(base.0) {
+            Some(SlotAddr::Direct(slot)) if !is_indirect => {
+                cg.f128_load_from_frame_offset_to_arg1(slot.0 + offset);
+                f128_publish_load(cg, dest);
+                return;
             }
-            true
-        } else {
-            false
+            Some(SlotAddr::Direct(slot) | SlotAddr::Indirect(slot)) => {
+                cg.f128_load_indirect_ptr_to_addr_reg(slot, base.0);
+            }
+            Some(SlotAddr::OverAligned(slot, id)) => {
+                cg.f128_alloca_aligned_addr(slot, id);
+                cg.f128_move_aligned_to_addr_reg();
+            }
+            Some(SlotAddr::Reg(reg)) => cg.f128_move_phys_to_addr_reg(reg),
+            None => return,
         }
-    };
-    if loaded {
-        cg.f128_truncate_result_to_acc();
-        cg.state().reg_cache.invalidate_all();
-        cg.f128_store_acc_to_dest(dest);
     }
+    if offset != 0 {
+        cg.f128_add_offset_to_addr_reg(offset);
+    }
+    cg.f128_load_16b_from_addr_reg_to_arg1();
+    f128_publish_load(cg, dest);
 }
 
 // =============================================================================

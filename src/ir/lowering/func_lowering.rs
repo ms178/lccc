@@ -228,7 +228,9 @@ impl Lowerer {
                     struct_align: None,
                     param_align: None,
                     struct_eightbyte_classes: Vec::new(),
-                    riscv_float_class: None,
+                    // An FP-register result (AAPCS64 HFA, RISC-V float
+                    // struct) tags the hidden pointer with its class.
+                    fp_agg_class: sig.ret_fp_agg_class,
                     is_f128_sse: false,
                 });
                 uses_sret = true;
@@ -275,7 +277,7 @@ impl Lowerer {
                             crate::common::types::EightbyteClass::Sse,
                             crate::common::types::EightbyteClass::SseUp,
                         ],
-                        riscv_float_class: None,
+                        fp_agg_class: None,
                         // On i686 this only selects the 16-byte stack slot
                         // alignment shared with the `__float128` carrier.
                         is_f128_sse: true,
@@ -307,7 +309,7 @@ impl Lowerer {
                         struct_eightbyte_classes: vec![
                             crate::common::types::EightbyteClass::NoClass,
                         ],
-                        riscv_float_class: None,
+                        fp_agg_class: None,
                         is_f128_sse: false,
                     });
                     lane_indices.push(ir_idx);
@@ -316,16 +318,15 @@ impl Lowerer {
                 continue;
             }
 
-            // Struct/union/vector parameter (pass by value), including ComplexLongDouble
-            // on x86-64/RISC-V where it's not decomposed, and ComplexDouble/ComplexFloat
-            // on i686 where they are passed as structs on the stack.
+            // Struct/union/vector parameter (pass by value), including every
+            // complex parameter that is not one packed scalar -- a complex
+            // is a two-member aggregate in each psABI
+            // (`complex_arg_is_aggregate`; `try_push_complex_param_ir`
+            // took the packed ones above).
             // Transparent unions are passed as their first member (a pointer),
             // not as a by-value aggregate, so struct_size is None for them.
             // vector_size keeps its historical aggregate-by-value ABI.
-            let is_complex_as_struct = matches!(param_ctype, CType::ComplexLongDouble)
-                || (matches!(param_ctype, CType::ComplexDouble)
-                    && !self.decomposes_complex_double())
-                || (matches!(param_ctype, CType::ComplexFloat) && !self.decomposes_complex_float());
+            let is_complex_as_struct = self.complex_arg_is_aggregate(&param_ctype, false);
             if self.is_type_struct_or_union(&param.type_spec)
                 || is_complex_as_struct
                 || param_ctype.is_vector()
@@ -337,50 +338,49 @@ impl Lowerer {
                     Some(self.sizeof_type(&param.type_spec))
                 };
                 // Compute struct alignment, per-eightbyte SysV ABI classification,
-                // and RISC-V LP64D float field classification
+                // and the FP-register class (RISC-V LP64D flattening, AAPCS64
+                // HFA/HVA/short vector).
                 // x86-64: the psABI classes of the struct, union or vector
                 // (`[Memory]`, `[Sse, SseUp]` = ONE %xmm, ...).
                 let sysv_abi = self.sysv_arg_abi(&param_ctype);
-                let (struct_align, struct_eightbyte_classes, riscv_float_class) =
-                    if struct_size.is_some() {
-                        if let Some(layout) = self.get_struct_layout_for_type(&param.type_spec) {
-                            let ctx = &*self.types.borrow_struct_layouts();
-                            let classes = if let Some(classes) =
-                                self.i386_gnu_vector_memory_classes(&param_ctype)
-                            {
-                                classes
-                            } else {
-                                match &sysv_abi {
-                                    Some((classes, _)) => classes.clone(),
-                                    None => layout.classify_sysv_eightbytes(ctx),
-                                }
-                            };
-                            let rv_class = layout.classify_riscv_float_fields(ctx);
-                            (Some(self.record_arg_align(&layout)), classes, rv_class)
-                        } else if let Some((classes, _)) = sysv_abi.clone() {
-                            // A vector: no record layout.
-                            (Some(self.ctype_align(&param_ctype)), classes, None)
-                        } else if self.target == crate::backend::Target::I686
-                            && matches!(&param_ctype, CType::Vector(..))
+                let fp_agg_class = struct_size.and(self.fp_agg_class(&param_ctype, false));
+                let (struct_align, struct_eightbyte_classes) = if struct_size.is_some() {
+                    if let Some(layout) = self.get_struct_layout_for_type(&param.type_spec) {
+                        let ctx = &*self.types.borrow_struct_layouts();
+                        let classes = if let Some(classes) =
+                            self.i386_gnu_vector_memory_classes(&param_ctype)
                         {
-                            // Memory-passed i386 GNU vectors use their natural
-                            // stack alignment, unlike over-aligned records.
-                            // `[Memory, NoClass]` is an internal target-local
-                            // marker (the AMD64 classifier is not involved).
-                            (
-                                Some(self.ctype_align(&param_ctype)),
-                                vec![
-                                    crate::common::types::EightbyteClass::Memory,
-                                    crate::common::types::EightbyteClass::NoClass,
-                                ],
-                                None,
-                            )
+                            classes
                         } else {
-                            (None, Vec::new(), None)
-                        }
+                            match &sysv_abi {
+                                Some((classes, _)) => classes.clone(),
+                                None => layout.classify_sysv_eightbytes(ctx),
+                            }
+                        };
+                        (Some(self.record_arg_align(&layout)), classes)
+                    } else if let Some((classes, _)) = sysv_abi.clone() {
+                        // A vector: no record layout.
+                        (Some(self.ctype_align(&param_ctype)), classes)
+                    } else if self.target == crate::backend::Target::I686
+                        && matches!(&param_ctype, CType::Vector(..))
+                    {
+                        // Memory-passed i386 GNU vectors use their natural
+                        // stack alignment, unlike over-aligned records.
+                        // `[Memory, NoClass]` is an internal target-local
+                        // marker (the AMD64 classifier is not involved).
+                        (
+                            Some(self.ctype_align(&param_ctype)),
+                            vec![
+                                crate::common::types::EightbyteClass::Memory,
+                                crate::common::types::EightbyteClass::NoClass,
+                            ],
+                        )
                     } else {
-                        (None, Vec::new(), None)
-                    };
+                        (None, Vec::new())
+                    }
+                } else {
+                    (None, Vec::new())
+                };
                 // ABI alignment belongs to the underlying aggregate/vector
                 // type. A typedef or parameter-declaration alignment can raise
                 // the LOCAL parameter object's alignment without changing its
@@ -400,7 +400,7 @@ impl Lowerer {
                     struct_align,
                     param_align,
                     struct_eightbyte_classes,
-                    riscv_float_class,
+                    fp_agg_class,
                     // "ONE 16-byte %xmm" -- the same carrier _Float128 uses.
                     // A one-XMM aggregate is identified by its `[Sse, SseUp]`
                     // classes; the flag is reserved for `_Float128` values.
@@ -453,7 +453,7 @@ impl Lowerer {
                         crate::common::types::EightbyteClass::Sse,
                         crate::common::types::EightbyteClass::Sse,
                     ],
-                    riscv_float_class: None,
+                    fp_agg_class: None,
                     is_f128_sse: true,
                 });
                 param_kinds.push(ParamKind::Normal(ir_idx));
@@ -498,7 +498,7 @@ impl Lowerer {
                 struct_align: None,
                 param_align,
                 struct_eightbyte_classes: Vec::new(),
-                riscv_float_class: None,
+                fp_agg_class: None,
                 is_f128_sse: param_ctype.is_half_float(),
             });
             param_kinds.push(ParamKind::Normal(ir_idx));
@@ -511,83 +511,36 @@ impl Lowerer {
         }
     }
 
-    /// Allocate function parameters as local variables (3-phase process).
-
-    /// Push the IR params for a `_Complex` parameter when this target
-    /// decomposes complex parameters into float registers; return whether
-    /// the parameter was consumed (the caller must not run its struct or
-    /// scalar arms).
-    ///
-    /// Per-target policy, mirrored from the platform ABIs: _Complex long
-    /// double decomposes only on ARM64 (HFA in Q regs) — on x86-64/RISC-V it
-    /// is passed as an aggregate; _Complex double/float decompose unless the
-    /// i686 struct-on-stack policy applies; x86-64 additionally packs
-    /// `_Complex float` into a single F64.
+    /// Push the IR param for a `_Complex` parameter that packs into ONE
+    /// scalar -- the x86-64 `_Complex float`, both halves in one %xmm
+    /// (`complex_arg_is_packed`) -- and return whether the parameter was
+    /// consumed.  Every other complex parameter is a by-value aggregate
+    /// (`complex_arg_is_aggregate`) and takes the struct arm.
     fn try_push_complex_param_ir(
         &self,
         param_ctype: &CType,
         params: &mut Vec<IrParam>,
         param_kinds: &mut Vec<ParamKind>,
     ) -> bool {
-        // ComplexLongDouble: only decompose on ARM64 (HFA in Q regs);
-        // on x86-64/RISC-V it's passed as a struct (on stack / by reference).
-        if matches!(param_ctype, CType::ComplexLongDouble) && !self.decomposes_complex_long_double()
-        {
-            // Fall through to struct handling in the caller.
+        if !self.complex_arg_is_packed(param_ctype, false) {
             return false;
         }
-        if matches!(param_ctype, CType::ComplexDouble) && !self.decomposes_complex_double() {
-            // i686: _Complex double (16 bytes) is passed as a struct on the stack.
-            return false;
-        }
-        if matches!(param_ctype, CType::ComplexFloat) && !self.decomposes_complex_float() {
-            // i686: _Complex float (8 bytes) is passed as a struct on the stack.
-            return false;
-        }
-        if matches!(param_ctype, CType::ComplexFloat) && self.uses_packed_complex_float() {
-            // x86-64: _Complex float packed into single F64
-            let ir_idx = params.len();
-            params.push(IrParam {
-                ty: IrType::F64,
-                noalias: false,
-                struct_size: None,
-                struct_align: None,
-                param_align: None,
-                struct_eightbyte_classes: Vec::new(),
-                riscv_float_class: None,
-                is_f128_sse: false,
-            });
-            param_kinds.push(ParamKind::ComplexFloatPacked(ir_idx));
-            return true;
-        }
-        // Decompose into two FP params (ComplexFloat/ComplexDouble on 64-bit,
-        // ComplexLongDouble on ARM64 only)
-        let comp_ty = Self::complex_component_ir_type(param_ctype);
-        let real_idx = params.len();
+        let ir_idx = params.len();
         params.push(IrParam {
-            ty: comp_ty,
+            ty: IrType::F64,
             noalias: false,
             struct_size: None,
             struct_align: None,
             param_align: None,
             struct_eightbyte_classes: Vec::new(),
-            riscv_float_class: None,
+            fp_agg_class: None,
             is_f128_sse: false,
         });
-        let imag_idx = params.len();
-        params.push(IrParam {
-            ty: comp_ty,
-            noalias: false,
-            struct_size: None,
-            struct_align: None,
-            param_align: None,
-            struct_eightbyte_classes: Vec::new(),
-            riscv_float_class: None,
-            is_f128_sse: false,
-        });
-        param_kinds.push(ParamKind::ComplexDecomposed(real_idx, imag_idx));
+        param_kinds.push(ParamKind::ComplexFloatPacked(ir_idx));
         true
     }
+
+    /// Allocate function parameters as local variables (3-phase process).
     pub(super) fn allocate_function_params(
         &mut self,
         func: &FunctionDef,
@@ -692,13 +645,6 @@ impl Lowerer {
                 }
                 ParamKind::ComplexFloatPacked(ir_idx) => {
                     self.register_packed_complex_float_param(orig_param, ir_allocas[*ir_idx]);
-                }
-                ParamKind::ComplexDecomposed(real_ir_idx, imag_ir_idx) => {
-                    self.reconstruct_decomposed_complex_param(
-                        orig_param,
-                        ir_allocas[*real_ir_idx],
-                        ir_allocas[*imag_ir_idx],
-                    );
                 }
                 ParamKind::ExtVectorDecomposed(lane_ir_idxs) => {
                     self.reconstruct_decomposed_ext_vector_param(
@@ -979,110 +925,6 @@ impl Lowerer {
                 },
                 alloca,
                 alloc_size: 8,
-                is_bool: false,
-                static_global_name: None,
-                vla_strides: vec![],
-                vla_size: None,
-                asm_register: None,
-                asm_register_has_init: false,
-                cleanup_fn: None,
-                base_type_volatile: base_volatile,
-                // Parameter declarators do not record the object qualifier yet.
-                object_volatile: false,
-                fptr_sig: None,
-            },
-        );
-    }
-
-    /// Reconstruct a decomposed complex parameter from its real/imag Phase 1 allocas.
-    fn reconstruct_decomposed_complex_param(
-        &mut self,
-        orig_param: &ParamDecl,
-        real_alloca: Value,
-        imag_alloca: Value,
-    ) {
-        let ct = self.type_spec_to_ctype(&orig_param.type_spec);
-        let comp_ty = Self::complex_component_ir_type(&ct);
-        let comp_size = Self::complex_component_size(&ct);
-        let complex_size = ct.size();
-
-        let complex_alloca = self.fresh_value();
-        self.emit(Instruction::Alloca {
-            dest: complex_alloca,
-            ty: IrType::Ptr,
-            size: complex_size,
-            align: 0,
-            volatile: false,
-            semantic_volatile: false,
-        });
-
-        let real_val = self.fresh_value();
-        self.emit(Instruction::Load {
-            volatile: false,
-            dest: real_val,
-            ptr: real_alloca,
-            ty: comp_ty,
-            seg_override: AddressSpace::Default,
-        });
-        self.emit(Instruction::Store {
-            volatile: false,
-            val: Operand::Value(real_val),
-            ptr: complex_alloca,
-            ty: comp_ty,
-            seg_override: AddressSpace::Default,
-        });
-
-        let imag_val = self.fresh_value();
-        self.emit(Instruction::Load {
-            volatile: false,
-            dest: imag_val,
-            ptr: imag_alloca,
-            ty: comp_ty,
-            seg_override: AddressSpace::Default,
-        });
-        let imag_ptr = self.fresh_value();
-        self.emit(Instruction::GetElementPtr {
-            dest: imag_ptr,
-            base: complex_alloca,
-            offset: Operand::Const(IrConst::I64(comp_size as i64)),
-            ty: IrType::I8,
-        });
-        self.emit(Instruction::Store {
-            volatile: false,
-            val: Operand::Value(imag_val),
-            ptr: imag_ptr,
-            ty: comp_ty,
-            seg_override: AddressSpace::Default,
-        });
-
-        let name = orig_param.name.clone().unwrap_or_default();
-        let base_const = crate::common::qualifiers::type_name_const_base(
-            &orig_param.type_spec,
-            orig_param.is_const,
-            self,
-        );
-        let base_volatile =
-            orig_param.is_volatile || self.scalar_typeof_is_volatile(&orig_param.type_spec);
-        self.func_mut().locals.insert(
-            name,
-            LocalInfo {
-                var: VarInfo {
-                    ty: IrType::Ptr,
-                    elem_size: 0,
-                    is_array: false,
-                    pointee_type: None,
-                    struct_layout: None,
-                    is_struct: true,
-                    array_dim_strides: vec![],
-                    c_type: Some(ct),
-                    is_ptr_to_func_ptr: false,
-                    address_space: AddressSpace::Default,
-                    explicit_alignment: None,
-                    type_align: None,
-                    base_const,
-                },
-                alloca: complex_alloca,
-                alloc_size: complex_size,
                 is_bool: false,
                 static_global_name: None,
                 vla_strides: vec![],

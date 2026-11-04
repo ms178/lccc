@@ -1124,7 +1124,7 @@ mod memory_read_tests {
                         param_align: None,
                         struct_eightbyte_classes: vec![],
                         is_f128_sse: false,
-                        riscv_float_class: None,
+                        fp_agg_class: None,
                     })
                     .collect();
                 let mut f = IrFunction::new("legacy_store".into(), IrType::Void, params, false);
@@ -1201,7 +1201,7 @@ mod memory_read_tests {
                     param_align: None,
                     struct_eightbyte_classes: vec![],
                     is_f128_sse: false,
-                    riscv_float_class: None,
+                    fp_agg_class: None,
                 }],
                 false,
             );
@@ -1249,7 +1249,7 @@ mod memory_read_tests {
             param_align: None,
             struct_eightbyte_classes: vec![],
             is_f128_sse: false,
-            riscv_float_class: None,
+            fp_agg_class: None,
         };
         // Helper `parse_cell(buf, out_cell)` stores `buf` into `*out_cell`.
         let mut helper = IrFunction::new(

@@ -171,8 +171,9 @@ Iterates over all `ExternalDecl` entries and lowers them:
   never by bare name.
 
 - **`ParamKind`** (`definitions.rs`) -- Classifies how each C parameter maps to IR
-  params after ABI decomposition: `Normal`, `Struct`, `ComplexDecomposed`,
-  `ComplexFloatPacked`.
+  params after ABI decomposition: `Normal`, `Struct` (records, vectors and
+  every complex that does not pack into one scalar), `ComplexFloatPacked`,
+  and the i686 ext-vector `ExtVectorDecomposed` / `ExtVectorXmm` carriers.
 
 - **`IrParamBuildResult`** (`definitions.rs`) -- Result of `build_ir_params`: the IR
   param list, per-original-parameter `ParamKind` mapping, and sret flag.

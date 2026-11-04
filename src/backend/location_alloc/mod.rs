@@ -972,7 +972,7 @@ mod tests {
                 struct_arg_sizes: Vec::new(),
                 struct_arg_aligns: Vec::new(),
                 struct_arg_classes: Vec::new(),
-                struct_arg_riscv_float_classes: Vec::new(),
+                struct_arg_fp_agg_classes: Vec::new(),
                 struct_arg_is_f128_sse: Vec::new(),
                 ret_is_f128_sse: false,
                 is_sret: false,

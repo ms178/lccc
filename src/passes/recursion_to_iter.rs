@@ -534,7 +534,7 @@ mod tests {
             struct_align: None,
             param_align: None,
             struct_eightbyte_classes: Vec::new(),
-            riscv_float_class: None,
+            fp_agg_class: None,
             is_f128_sse: false,
         }];
         let mut func = IrFunction::new("fib".to_string(), IrType::I64, params, false);
@@ -621,7 +621,7 @@ mod tests {
                         struct_arg_sizes: vec![],
                         struct_arg_aligns: vec![],
                         struct_arg_classes: Vec::new(),
-                        struct_arg_riscv_float_classes: Vec::new(),
+                        struct_arg_fp_agg_classes: Vec::new(),
                         struct_arg_is_f128_sse: Vec::new(),
                         is_sret: false,
                         calling_convention: crate::common::types::CallingConvention::Default,
@@ -660,7 +660,7 @@ mod tests {
                         struct_arg_sizes: vec![],
                         struct_arg_aligns: vec![],
                         struct_arg_classes: Vec::new(),
-                        struct_arg_riscv_float_classes: Vec::new(),
+                        struct_arg_fp_agg_classes: Vec::new(),
                         struct_arg_is_f128_sse: Vec::new(),
                         is_sret: false,
                         calling_convention: crate::common::types::CallingConvention::Default,
@@ -763,7 +763,7 @@ mod tests {
             struct_align: None,
             param_align: None,
             struct_eightbyte_classes: Vec::new(),
-            riscv_float_class: None,
+            fp_agg_class: None,
             is_f128_sse: false,
         }];
         let mut func = IrFunction::new("factorial".to_string(), IrType::I64, params, false);
@@ -814,7 +814,7 @@ mod tests {
                     struct_arg_sizes: vec![],
                     struct_arg_aligns: vec![],
                     struct_arg_classes: Vec::new(),
-                    struct_arg_riscv_float_classes: Vec::new(),
+                    struct_arg_fp_agg_classes: Vec::new(),
                     struct_arg_is_f128_sse: Vec::new(),
                     is_sret: false,
                     calling_convention: crate::common::types::CallingConvention::Default,
@@ -848,7 +848,7 @@ mod tests {
             struct_align: None,
             param_align: None,
             struct_eightbyte_classes: Vec::new(),
-            riscv_float_class: None,
+            fp_agg_class: None,
             is_f128_sse: false,
         }];
         let mut func = IrFunction::new("fib".to_string(), IrType::I64, params, true); // variadic
@@ -873,7 +873,7 @@ mod tests {
                 struct_align: None,
                 param_align: None,
                 struct_eightbyte_classes: Vec::new(),
-                riscv_float_class: None,
+                fp_agg_class: None,
                 is_f128_sse: false,
             },
             IrParam {
@@ -883,7 +883,7 @@ mod tests {
                 struct_align: None,
                 param_align: None,
                 struct_eightbyte_classes: Vec::new(),
-                riscv_float_class: None,
+                fp_agg_class: None,
                 is_f128_sse: false,
             },
         ];
@@ -912,7 +912,7 @@ mod tests {
             struct_align: None,
             param_align: None,
             struct_eightbyte_classes: Vec::new(),
-            riscv_float_class: None,
+            fp_agg_class: None,
             is_f128_sse: false,
         }];
         let mut func = IrFunction::new("fib".to_string(), IrType::I64, params, false);

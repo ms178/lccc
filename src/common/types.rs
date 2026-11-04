@@ -306,12 +306,16 @@ pub enum EightbyteClass {
     Memory,
 }
 
-/// Classification of a struct for RISC-V LP64D hardware floating-point calling convention.
-///
-/// The psABI specifies that small structs with specific field patterns should be
-/// passed in FP registers rather than GP registers.
+/// How a by-value aggregate crosses a call boundary in floating-point/SIMD
+/// registers under the target's hardware-FP calling convention: the RISC-V
+/// LP64D flattening rule (`OneFloat` .. `IntAndFloat`, small structs only)
+/// or an AAPCS64 homogeneous aggregate (`Hfa`).  The lowering computes it
+/// per argument, parameter and hidden return pointer (see
+/// `Lowerer::fp_agg_class`); `None` means the aggregate follows the
+/// target's integer/memory convention.  x86 aggregates are described by
+/// their SysV eightbyte classes instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RiscvFloatClass {
+pub enum FpAggClass {
     /// Struct with exactly one float/double/_Float16/__bf16 member, no other data members.
     /// Passed in a single FP register (fa0-fa7). `size` is 2, 4, or 8 bytes.
     OneFloat { size: u8 },
@@ -338,6 +342,151 @@ pub enum RiscvFloatClass {
         int_size: usize,
         float_offset: usize,
     },
+    /// AAPCS64 homogeneous floating-point or short-vector aggregate (HFA /
+    /// HVA, including a bare 8- or 16-byte GNU vector): `count` (1..=4)
+    /// members of `member_size` bytes (2 = half, 4 = single, 8 = double or
+    /// 64-bit vector, 16 = quad or 128-bit vector), laid out contiguously
+    /// without padding, one SIMD register each.  Passed in `count`
+    /// consecutive v-registers when that many are free, otherwise entirely
+    /// on the stack with no later argument taking a v-register (AAPCS64
+    /// rules C.2/C.3); returned in v0..v(count-1).  Variadic arguments are
+    /// passed the same way (Linux AAPCS64).
+    Hfa { member_size: u8, count: u8 },
+}
+
+/// The base type of an AAPCS64 homogeneous aggregate.  Two members share a
+/// base only when their kinds match exactly: `float` and `_Decimal32` do not,
+/// while short vectors are opaque by size (GCC `aapcs_vfp_sub_candidate`
+/// uses V2SI/V4SI as the representative of every 64/128-bit vector).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HfaBase {
+    Half,
+    Single,
+    Double,
+    Quad,
+    Dec32,
+    Dec64,
+    Dec128,
+    Vec64,
+    Vec128,
+}
+
+impl HfaBase {
+    fn size(self) -> usize {
+        match self {
+            HfaBase::Half => 2,
+            HfaBase::Single | HfaBase::Dec32 => 4,
+            HfaBase::Double | HfaBase::Dec64 | HfaBase::Vec64 => 8,
+            HfaBase::Quad | HfaBase::Dec128 | HfaBase::Vec128 => 16,
+        }
+    }
+}
+
+/// `Hfa` for `count` members of `base`, when the count is in 1..=4
+/// (`HA_MAX_NUM_FLDS`).
+fn hfa_class(base: HfaBase, count: usize) -> Option<FpAggClass> {
+    (1..=4).contains(&count).then(|| FpAggClass::Hfa {
+        member_size: base.size() as u8,
+        count: count as u8,
+    })
+}
+
+/// Unify `kind` with the aggregate's base so far: the first member fixes
+/// it, every later one must match.
+fn hfa_unify(base: &mut Option<HfaBase>, kind: HfaBase) -> bool {
+    *base.get_or_insert(kind) == kind
+}
+
+/// Number of base members of `ty` inside a candidate homogeneous aggregate,
+/// `None` when `ty` disqualifies it -- GCC `aapcs_vfp_sub_candidate`
+/// (gcc/config/aarch64/aarch64.cc), which Clang's `isHomogeneousAggregate`
+/// agrees with on every C type except `__bf16` (GCC: no HFA base, so
+/// `struct { __bf16 a, b; }` uses x0 -- followed here).  AArch64 `long
+/// double` and `_Float128` are both quad precision.
+fn aapcs64_hfa_members(
+    ty: &CType,
+    base: &mut Option<HfaBase>,
+    ctx: &dyn StructLayoutProvider,
+) -> Option<usize> {
+    let scalar = |base: &mut Option<HfaBase>, kind, n| hfa_unify(base, kind).then_some(n);
+    match ty {
+        CType::Float16 => scalar(base, HfaBase::Half, 1),
+        CType::Float => scalar(base, HfaBase::Single, 1),
+        CType::Double => scalar(base, HfaBase::Double, 1),
+        CType::LongDouble | CType::Float128 => scalar(base, HfaBase::Quad, 1),
+        CType::Decimal32 => scalar(base, HfaBase::Dec32, 1),
+        CType::Decimal64 => scalar(base, HfaBase::Dec64, 1),
+        CType::Decimal128 => scalar(base, HfaBase::Dec128, 1),
+        CType::ComplexFloat => scalar(base, HfaBase::Single, 2),
+        CType::ComplexDouble => scalar(base, HfaBase::Double, 2),
+        CType::ComplexLongDouble => scalar(base, HfaBase::Quad, 2),
+        CType::Vector(_, 8) => scalar(base, HfaBase::Vec64, 1),
+        CType::Vector(_, 16) => scalar(base, HfaBase::Vec128, 1),
+        // Clang `ext_vector_type`: a 64/128-bit storage image is a short
+        // vector whatever its lane count (Clang coerces an odd-lane one to
+        // `<2 x i32>` / `<4 x i32>`, still one v-register).
+        CType::ExtVector(_, l) if !l.bitpacked_bool && l.storage_size == 8 => {
+            scalar(base, HfaBase::Vec64, 1)
+        }
+        CType::ExtVector(_, l) if !l.bitpacked_bool && l.storage_size == 16 => {
+            scalar(base, HfaBase::Vec128, 1)
+        }
+        // A zero-length array (domain [0, -1]) and a flexible array member
+        // (incomplete) disqualify the aggregate in GCC and Clang alike.
+        CType::Array(elem, Some(n)) if *n > 0 => {
+            let per = aapcs64_hfa_members(elem, base, ctx)?;
+            let count = per.checked_mul(*n)?;
+            (ty.size_ctx(ctx) == count * (*base)?.size()).then_some(count)
+        }
+        CType::Struct(key) | CType::Union(key) => {
+            aapcs64_layout_members(ctx.get_struct_layout(key)?, base, ctx)
+        }
+        _ => None,
+    }
+}
+
+/// `aapcs64_hfa_members` of a record: the member counts summed (a struct) or
+/// maximised (a union), then the no-padding rule -- the size must be exactly
+/// `count` base members.  A zero-width bit-field adds no member (GCC 12+);
+/// any other bit-field has an integer type and disqualifies.  An empty
+/// record counts zero members, so `struct { struct {} e; double x; }` is
+/// still a one-member HFA.
+fn aapcs64_layout_members(
+    layout: &StructLayout,
+    base: &mut Option<HfaBase>,
+    ctx: &dyn StructLayoutProvider,
+) -> Option<usize> {
+    if !layout.is_complete {
+        return None;
+    }
+    let mut count = 0usize;
+    for field in &layout.fields {
+        match field.bit_width {
+            Some(0) => continue,
+            Some(_) => return None,
+            None => {}
+        }
+        let n = aapcs64_hfa_members(&field.ty, base, ctx)?;
+        count = if layout.is_union {
+            count.max(n)
+        } else {
+            count.checked_add(n)?
+        };
+    }
+    let member_bytes = base.map_or(0, HfaBase::size);
+    (layout.size == count * member_bytes).then_some(count)
+}
+
+impl FpAggClass {
+    /// The `(member_size, count)` of an AAPCS64 homogeneous aggregate.
+    pub fn hfa(self) -> Option<(usize, usize)> {
+        match self {
+            FpAggClass::Hfa { member_size, count } => {
+                Some((usize::from(member_size), usize::from(count)))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Address space for pointer types (GCC named address space extension).
@@ -1960,11 +2109,11 @@ impl StructLayout {
     /// - All other structs: use integer calling convention (GP registers)
     ///
     /// Returns `None` if the struct does not qualify for FP register passing.
-    /// Returns `Some(RiscvFloatClass)` describing the FP register assignment.
+    /// Returns `Some(FpAggClass)` describing the FP register assignment.
     pub fn classify_riscv_float_fields(
         &self,
         ctx: &dyn StructLayoutProvider,
-    ) -> Option<RiscvFloatClass> {
+    ) -> Option<FpAggClass> {
         // Only for small structs (≤ 16 bytes on RV64, ≤ 8 bytes on RV32)
         let xlen = target_ptr_size();
         if self.size > 2 * xlen || self.size == 0 {
@@ -1986,11 +2135,11 @@ impl StructLayout {
         // Apply RISC-V psABI rules:
         match (float_fields.len(), int_fields.len()) {
             // 1 float, no int: pass float in 1 FP reg
-            (1, 0) => Some(RiscvFloatClass::OneFloat {
+            (1, 0) => Some(FpAggClass::OneFloat {
                 size: float_fields[0].1 as u8,
             }),
             // 2 floats, no int: pass both in FP regs
-            (2, 0) => Some(RiscvFloatClass::TwoFloats {
+            (2, 0) => Some(FpAggClass::TwoFloats {
                 lo_size: float_fields[0].1 as u8,
                 hi_size: float_fields[1].1 as u8,
                 hi_offset: float_fields[1].0,
@@ -2005,14 +2154,14 @@ impl StructLayout {
                 }
                 // Determine which comes first in memory layout
                 if float_fields[0].0 < int_fields[0].0 {
-                    Some(RiscvFloatClass::FloatAndInt {
+                    Some(FpAggClass::FloatAndInt {
                         float_size,
                         float_offset: float_fields[0].0,
                         int_offset: int_fields[0].0,
                         int_size,
                     })
                 } else {
-                    Some(RiscvFloatClass::IntAndFloat {
+                    Some(FpAggClass::IntAndFloat {
                         float_size,
                         int_offset: int_fields[0].0,
                         int_size,
@@ -2024,9 +2173,27 @@ impl StructLayout {
         }
     }
 
-    /// Recursively collect scalar float and int fields from a struct.
-    /// Returns false if the struct contains unsupported field types (e.g., bitfields,
-    /// empty arrays, complex types) that prevent FP classification.
+    /// Flatten `fields` (laid out from `base_offset`) for the RISC-V
+    /// hardware floating-point calling convention, appending each scalar
+    /// member as `(offset, size)` to `float_fields` or `int_fields` -- GCC
+    /// `riscv_flatten_aggregate_field` (the GCC 10+ ABI), the psABI's
+    /// "struct with its hierarchy flattened".  Returns false as soon as the
+    /// record cannot travel in FP registers.
+    ///
+    /// - Zero-length bit-fields are ignored (psABI, GCC 10+; Clang 23 still
+    ///   treats one between two members as disqualifying -- see the interop
+    ///   fixture `psabi_hfa_interop.h`).
+    /// - Any other bit-field is an integer member of the narrowest mode
+    ///   holding its width (GCC's C front end retypes it with
+    ///   `c_build_bitfield_integer_type`), at the byte holding its first
+    ///   bit: `struct { float f; int b : 3; }` is fa0 + a0 (Clang agrees).
+    /// - Pointers, vectors, unions and over-wide scalars (`long double`,
+    ///   `__int128`, 64-bit-plus complex halves) disqualify the record:
+    ///   neither GCC (`INTEGRAL_TYPE_P` excludes pointers) nor Clang
+    ///   (`isIntegralOrEnumerationType`) flattens them, so `struct { double
+    ///   d; void *p; }` uses a0/a1.
+    /// - A `_Complex float/double` member is two FP members; with the
+    ///   two-member limit it must be the only member, as in GCC.
     fn collect_riscv_fields(
         fields: &[StructFieldLayout],
         base_offset: usize,
@@ -2035,103 +2202,101 @@ impl StructLayout {
         ctx: &dyn StructLayoutProvider,
     ) -> bool {
         for field in fields {
-            // Skip zero-width bitfields (padding only)
-            if field.bit_width == Some(0) {
-                continue;
-            }
-            // Any bitfield prevents FP classification
-            if field.bit_width.is_some() {
+            let offset = base_offset + field.offset;
+            let flattened = match field.bit_width {
+                Some(0) => continue,
+                Some(width) => {
+                    // A bit-field can only have an integer (or enum/_Bool)
+                    // type, at most XLEN bits wide.
+                    let bytes = (width as usize).div_ceil(8).next_power_of_two();
+                    let first_byte = offset + field.bit_offset.unwrap_or(0) as usize / 8;
+                    if field.ty.is_integer() && bytes <= target_ptr_size() {
+                        int_fields.push((first_byte, bytes));
+                        true
+                    } else {
+                        false
+                    }
+                }
+                None => {
+                    Self::flatten_riscv_member(&field.ty, offset, float_fields, int_fields, ctx)
+                }
+            };
+            // At most two members, of which at most one integer.
+            if !flattened || float_fields.len() + int_fields.len() > 2 || int_fields.len() > 1 {
                 return false;
             }
-            let offset = base_offset + field.offset;
-            match &field.ty {
-                CType::Float16 | CType::BFloat16 => {
-                    float_fields.push((offset, 2));
+        }
+        true
+    }
+
+    /// `collect_riscv_fields` for one non-bit-field member of type `ty` at
+    /// byte `offset`.
+    fn flatten_riscv_member(
+        ty: &CType,
+        offset: usize,
+        float_fields: &mut Vec<(usize, usize)>,
+        int_fields: &mut Vec<(usize, usize)>,
+        ctx: &dyn StructLayoutProvider,
+    ) -> bool {
+        match ty {
+            CType::Float16 | CType::BFloat16 => float_fields.push((offset, 2)),
+            CType::Float => float_fields.push((offset, 4)),
+            CType::Double => float_fields.push((offset, 8)),
+            CType::ComplexFloat | CType::ComplexDouble => {
+                let half = ty.size() / 2;
+                float_fields.push((offset, half));
+                float_fields.push((offset + half, half));
+            }
+            CType::Struct(key) => {
+                let Some(layout) = ctx.get_struct_layout(key) else {
+                    return false;
+                };
+                // A union is never flattened (psABI); an empty record adds
+                // no member.
+                if layout.is_union {
+                    return false;
                 }
-                CType::Float => {
-                    float_fields.push((offset, 4));
+                return Self::collect_riscv_fields(
+                    &layout.fields,
+                    offset,
+                    float_fields,
+                    int_fields,
+                    ctx,
+                );
+            }
+            CType::Union(_) => return false,
+            // Each element in turn.  Zero-length arrays, flexible array
+            // members and arrays of empty records are ignored (psABI).  The
+            // record is at most 2 x XLEN bytes, so a non-empty element type
+            // bounds the walk; a third member ends it early anyway.
+            CType::Array(elem, Some(count)) => {
+                let elem_size = elem.size_ctx(ctx);
+                if elem_size == 0 {
+                    return true;
                 }
-                CType::Double => {
-                    float_fields.push((offset, 8));
-                }
-                // Nested struct: recurse
-                CType::Struct(key) | CType::Union(key) => {
-                    if let Some(layout) = ctx.get_struct_layout(key) {
-                        if layout.is_union {
-                            // Unions break FP classification
-                            return false;
-                        }
-                        if !Self::collect_riscv_fields(
-                            &layout.fields,
-                            offset,
-                            float_fields,
-                            int_fields,
-                            ctx,
-                        ) {
-                            return false;
-                        }
-                    } else {
+                for i in 0..*count {
+                    if !Self::flatten_riscv_member(
+                        elem,
+                        offset + i * elem_size,
+                        float_fields,
+                        int_fields,
+                        ctx,
+                    ) || float_fields.len() + int_fields.len() > 2
+                    {
                         return false;
                     }
                 }
-                // Array: unroll elements
-                CType::Array(elem_ty, Some(count)) => {
-                    let elem_size = elem_ty.size();
-                    if elem_size == 0 {
-                        continue; // zero-size arrays (FAMs) are ignored
-                    }
-                    for i in 0..*count {
-                        let elem_offset = offset + i * elem_size;
-                        match elem_ty.as_ref() {
-                            CType::Float16 | CType::BFloat16 => float_fields.push((elem_offset, 2)),
-                            CType::Float => float_fields.push((elem_offset, 4)),
-                            CType::Double => float_fields.push((elem_offset, 8)),
-                            CType::Struct(key) | CType::Union(key) => {
-                                if let Some(layout) = ctx.get_struct_layout(key) {
-                                    if layout.is_union {
-                                        return false;
-                                    }
-                                    if !Self::collect_riscv_fields(
-                                        &layout.fields,
-                                        elem_offset,
-                                        float_fields,
-                                        int_fields,
-                                        ctx,
-                                    ) {
-                                        return false;
-                                    }
-                                } else {
-                                    return false;
-                                }
-                            }
-                            _ => {
-                                let size = elem_ty.size();
-                                if size > 0 {
-                                    int_fields.push((elem_offset, size));
-                                }
-                            }
-                        }
-                    }
+            }
+            CType::Array(_, None) => {}
+            // `_Decimal32/64` travel as integers on this target.
+            ty if ty.is_integer() || matches!(ty, CType::Decimal32 | CType::Decimal64) => {
+                let size = ty.size_ctx(ctx);
+                if size == 0 || size > target_ptr_size() {
+                    return false;
                 }
-                // Zero-size arrays or VLAs don't contribute
-                CType::Array(_, None) => {}
-                // All other scalar types: integer-class
-                _ => {
-                    let size = field.ty.size();
-                    if size > 0 {
-                        int_fields.push((offset, size));
-                    }
-                }
+                int_fields.push((offset, size));
             }
-
-            // If we already have more than 2 fields total, can't classify as FP
-            if float_fields.len() + int_fields.len() > 2 {
-                return false;
-            }
-            // If we have more than 1 int field, can't classify as FP
-            if int_fields.len() > 1 {
-                return false;
-            }
+            _ => return false,
         }
         true
     }
@@ -3352,6 +3517,32 @@ impl CType {
 
     pub fn is_vector(&self) -> bool {
         matches!(self, CType::Vector(_, _) | CType::ExtVector(_, _))
+    }
+
+    /// AAPCS64 FP/SIMD-register class of a by-value argument or result of
+    /// this type: an HFA/HVA struct or union of 1..=4 members, a complex
+    /// scalar (two members), or a bare 8- or 16-byte short vector (one
+    /// register, rule C.1).  `None` for every other type, which follows the
+    /// integer/memory convention.
+    pub fn aapcs64_fp_agg_class(&self, ctx: &dyn StructLayoutProvider) -> Option<FpAggClass> {
+        let mut base = None;
+        match self {
+            CType::Struct(_) | CType::Union(_) => {
+                let count = aapcs64_hfa_members(self, &mut base, ctx)?;
+                hfa_class(base?, count)
+            }
+            CType::Vector(..) | CType::ExtVector(..) => {
+                aapcs64_hfa_members(self, &mut base, ctx)?;
+                hfa_class(base?, 1)
+            }
+            // A complex value is a two-member HFA of its component type
+            // (GCC `aapcs_vfp_sub_candidate`: COMPLEX_TYPE counts 2).
+            CType::ComplexFloat | CType::ComplexDouble | CType::ComplexLongDouble => {
+                let count = aapcs64_hfa_members(self, &mut base, ctx)?;
+                hfa_class(base?, count)
+            }
+            _ => None,
+        }
     }
 
     /// Whether this vector's sole element lane is a floating-point scalar
@@ -5633,5 +5824,147 @@ mod ternary_common_type_tests {
             CType::ternary_value_as_i64(&CType::Double, &CType::Int, -1),
             -1
         );
+    }
+}
+
+/// RISC-V LP64D flattening (`StructLayout::classify_riscv_float_fields`) and
+/// the AAPCS64 complex HFA, against GCC 16.2 / Clang 23.1.4 on the shapes
+/// the interop fixture `psabi_wide_interop` runs end to end.
+#[cfg(test)]
+mod fp_aggregate_abi_tests {
+    use super::{CType, FpAggClass, RcLayout, StructField, StructLayout};
+
+    fn field(ty: CType, bit_width: Option<u32>) -> StructField {
+        StructField {
+            own_cvr: None,
+            name: String::new(),
+            ty,
+            bit_width,
+            alignment: None,
+            type_align: None,
+            is_packed: false,
+            base_volatile: false,
+            base_const: false,
+            object_volatile: false,
+            object_const: false,
+            counted_by: None,
+            pointer_quals: Vec::new(),
+            written_typedef: None,
+        }
+    }
+
+    fn riscv(fields: &[StructField]) -> Option<FpAggClass> {
+        let ctx: super::FxHashMap<String, RcLayout> = Default::default();
+        StructLayout::for_struct_with_packing(fields, None, &ctx, false)
+            .classify_riscv_float_fields(&ctx)
+    }
+
+    fn pointer() -> CType {
+        CType::Pointer(Box::new(CType::Void), super::PtrQuals::default())
+    }
+
+    #[test]
+    fn riscv_flattening_matches_gcc_and_clang() {
+        // struct { double d; void *p; }: a pointer is no flattenable member.
+        assert_eq!(
+            riscv(&[field(CType::Double, None), field(pointer(), None)]),
+            None
+        );
+        // struct { float f; int b : 3; }: the bit-field is an integer member.
+        assert_eq!(
+            riscv(&[field(CType::Float, None), field(CType::Int, Some(3))]),
+            Some(FpAggClass::FloatAndInt {
+                float_size: 4,
+                float_offset: 0,
+                int_offset: 4,
+                int_size: 1,
+            })
+        );
+        // struct { _Complex float z; } and struct { _Complex double z; }.
+        assert_eq!(
+            riscv(&[field(CType::ComplexFloat, None)]),
+            Some(FpAggClass::TwoFloats {
+                lo_size: 4,
+                hi_size: 4,
+                hi_offset: 4,
+            })
+        );
+        assert_eq!(
+            riscv(&[field(CType::ComplexDouble, None)]),
+            Some(FpAggClass::TwoFloats {
+                lo_size: 8,
+                hi_size: 8,
+                hi_offset: 8,
+            })
+        );
+        // struct { float a; _Complex float z; }: three FP members.
+        assert_eq!(
+            riscv(&[field(CType::Float, None), field(CType::ComplexFloat, None)]),
+            None
+        );
+        // struct { float a; int : 0; float b; }: zero-width bit-fields are
+        // ignored (psABI, GCC 10+).
+        assert_eq!(
+            riscv(&[
+                field(CType::Float, None),
+                field(CType::Int, Some(0)),
+                field(CType::Float, None),
+            ]),
+            Some(FpAggClass::TwoFloats {
+                lo_size: 4,
+                hi_size: 4,
+                hi_offset: 4,
+            })
+        );
+        // struct { float a[2]; } and struct { float a; float b[0]; }.
+        assert_eq!(
+            riscv(&[field(CType::Array(Box::new(CType::Float), Some(2)), None)]),
+            Some(FpAggClass::TwoFloats {
+                lo_size: 4,
+                hi_size: 4,
+                hi_offset: 4,
+            })
+        );
+        assert_eq!(
+            riscv(&[
+                field(CType::Float, None),
+                field(CType::Array(Box::new(CType::Float), Some(0)), None),
+            ]),
+            Some(FpAggClass::OneFloat { size: 4 })
+        );
+        // struct { long a; double d; }: integer first.
+        assert_eq!(
+            riscv(&[field(CType::Long, None), field(CType::Double, None)]),
+            Some(FpAggClass::IntAndFloat {
+                float_size: 8,
+                int_offset: 0,
+                int_size: 8,
+                float_offset: 8,
+            })
+        );
+        // Two integers use the integer convention.
+        assert_eq!(
+            riscv(&[field(CType::Int, None), field(CType::Int, None)]),
+            None
+        );
+    }
+
+    #[test]
+    fn aapcs64_complex_is_a_two_member_hfa() {
+        let ctx: super::FxHashMap<String, RcLayout> = Default::default();
+        for (ty, member_size) in [
+            (CType::ComplexFloat, 4),
+            (CType::ComplexDouble, 8),
+            (CType::ComplexLongDouble, 16),
+        ] {
+            assert_eq!(
+                ty.aapcs64_fp_agg_class(&ctx),
+                Some(FpAggClass::Hfa {
+                    member_size,
+                    count: 2,
+                })
+            );
+        }
+        assert_eq!(CType::Double.aapcs64_fp_agg_class(&ctx), None);
     }
 }

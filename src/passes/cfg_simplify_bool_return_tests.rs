@@ -14,7 +14,7 @@ fn param(ty: IrType) -> IrParam {
         param_align: None,
         struct_eightbyte_classes: vec![],
         is_f128_sse: false,
-        riscv_float_class: None,
+        fp_agg_class: None,
     }
 }
 

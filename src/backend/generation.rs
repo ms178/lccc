@@ -6395,7 +6395,15 @@ fn generate_function_body(
         })
     });
     cg.state().has_dyn_alloca = has_dyn_alloca;
-    cg.state().uses_sret = func.uses_sret;
+    // An FP-register aggregate result keeps the sret shape in the IR, but
+    // its hidden pointer arrives in no register (x8/a0 stay free): the
+    // backend homes it as a private buffer (`hidden_fp_agg_return`).
+    cg.state().uses_sret = func.uses_sret
+        && crate::backend::call_abi::hidden_fp_agg_return(
+            func.uses_sret,
+            func.params.first().and_then(|p| p.fp_agg_class),
+        )
+        .is_none();
 
     let has_inline_asm_fp = func.blocks.iter().any(|block| {
         block.instructions.iter().any(|inst| {
@@ -8540,7 +8548,7 @@ fn generate_instruction_body(
                 &info.struct_arg_sizes,
                 &info.struct_arg_aligns,
                 &info.struct_arg_classes,
-                &info.struct_arg_riscv_float_classes,
+                &info.struct_arg_fp_agg_classes,
                 &info.struct_arg_is_f128_sse,
                 info.is_sret,
                 info.calling_convention,
@@ -8570,7 +8578,7 @@ fn generate_instruction_body(
                 &info.struct_arg_sizes,
                 &info.struct_arg_aligns,
                 &info.struct_arg_classes,
-                &info.struct_arg_riscv_float_classes,
+                &info.struct_arg_fp_agg_classes,
                 &info.struct_arg_is_f128_sse,
                 info.is_sret,
                 info.calling_convention,
@@ -8618,8 +8626,20 @@ fn generate_instruction_body(
             size,
             align,
             eightbyte_classes,
+            fp_agg_class,
         } => {
-            cg.emit_va_arg_struct_ex(dest_ptr, va_list_ptr, *size, *align, eightbyte_classes);
+            match fp_agg_class.and_then(|class| class.hfa()) {
+                Some((member_size, count)) => {
+                    cg.emit_va_arg_hfa(dest_ptr, va_list_ptr, *size, *align, member_size, count)
+                }
+                None => cg.emit_va_arg_struct_ex(
+                    dest_ptr,
+                    va_list_ptr,
+                    *size,
+                    *align,
+                    eightbyte_classes,
+                ),
+            }
             clobber_after_call_like(cg);
         }
         Instruction::AtomicRmw {
@@ -9604,7 +9624,7 @@ mod indexed_gep_machinst_gate_tests {
             param_align: None,
             struct_eightbyte_classes: Vec::new(),
             is_f128_sse: false,
-            riscv_float_class: None,
+            fp_agg_class: None,
         }
     }
 

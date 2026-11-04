@@ -7,6 +7,13 @@ use crate::ir::reexports::{IrConst, Operand, Value};
 impl RiscvCodegen {
     pub(super) fn emit_return_impl(&mut self, val: Option<&Operand>, frame_size: i64) {
         if let Some(val) = val {
+            // Flattened float struct: the IR returns the hidden buffer
+            // pointer; the psABI wants the members in fa0/fa1/a0.
+            if let Some((_, class)) = self.fp_ret_buffer {
+                self.emit_return_fp_agg(val, class);
+                self.emit_epilogue_and_ret_impl(frame_size);
+                return;
+            }
             let ret_ty = self.current_return_type;
             if ret_ty == IrType::U16 && self.func_ret_is_f128_sse {
                 self.operand_to_t0(val);

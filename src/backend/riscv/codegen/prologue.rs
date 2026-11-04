@@ -373,6 +373,21 @@ impl RiscvCodegen {
             cached_liveness,
         );
 
+        // A flattened float struct result: the body writes it through the
+        // hidden return pointer, which is homed as the address of this
+        // private buffer (below the slots, above the callee saves); the
+        // return loads fa0/fa1/a0 from it.
+        let mut space = space;
+        self.fp_ret_buffer = crate::backend::call_abi::hidden_fp_agg_return(
+            func.uses_sret,
+            func.params.first().and_then(|p| p.fp_agg_class),
+        )
+        .map(|class| {
+            let bytes = crate::backend::call_abi::fp_agg_return_buffer_bytes(class) as i64;
+            space = (space + bytes + 15) & !15;
+            (-space, class)
+        });
+
         // Add space for saving callee-saved registers.
         // Each callee-saved register needs 8 bytes on the stack.
         let callee_save_space = (self.used_callee_saved.len() as i64) * 8;
@@ -877,10 +892,19 @@ impl RiscvCodegen {
                         );
                     }
                 }
-                // F128 in FP reg doesn't happen on RISC-V.
+                // The hidden return pointer of a flattened float struct
+                // result is the address of the private return buffer.
+                ParamClass::RegReturnBuffer { .. } => {
+                    if let Some((offset, _)) = self.fp_ret_buffer {
+                        self.emit_addi_s0("t0", offset);
+                        self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
+                    }
+                }
+                // F128 in FP reg doesn't happen on RISC-V, nor do the
+                // AAPCS64 homogeneous aggregates.
                 ParamClass::F128FpReg { .. }
                 | ParamClass::F128SseReg { .. }
-                | ParamClass::VectorReturnBuffer { .. }
+                | ParamClass::StructHfaReg { .. }
                 | ParamClass::ZeroSizeSkip => {}
 
                 // RISC-V LP64D: struct with float/double fields passed in FP registers.
@@ -891,12 +915,10 @@ impl RiscvCodegen {
                 } => {
                     let float_arg_regs_inner =
                         ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
-                    let rv_class = func.params[i].riscv_float_class;
+                    let rv_class = func.params[i].fp_agg_class;
                     let (lo_sz, hi_sz, hi_offset) = match rv_class {
-                        Some(crate::common::types::RiscvFloatClass::OneFloat { size }) => {
-                            (size, 4, 0)
-                        }
-                        Some(crate::common::types::RiscvFloatClass::TwoFloats {
+                        Some(crate::common::types::FpAggClass::OneFloat { size }) => (size, 4, 0),
+                        Some(crate::common::types::FpAggClass::TwoFloats {
                             lo_size,
                             hi_size,
                             hi_offset,
@@ -931,9 +953,9 @@ impl RiscvCodegen {
                 } => {
                     let float_arg_regs_inner =
                         ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
-                    let rv_class = func.params[i].riscv_float_class;
+                    let rv_class = func.params[i].fp_agg_class;
                     let (float_sz, int_size, float_offset) = match rv_class {
-                        Some(crate::common::types::RiscvFloatClass::IntAndFloat {
+                        Some(crate::common::types::FpAggClass::IntAndFloat {
                             float_size,
                             int_size,
                             float_offset,
@@ -941,10 +963,9 @@ impl RiscvCodegen {
                         }) => (float_size, int_size, float_offset),
                         _ => (8, 8, 8),
                     };
-                    let int_store = if int_size <= 4 { "sw" } else { "sd" };
                     self.emit_param_home_store_impl(
                         over_aligned,
-                        int_store,
+                        super::fp_agg::int_member_store(int_size),
                         RISCV_ARG_REGS[int_reg_idx],
                         slot,
                         0,
@@ -964,9 +985,9 @@ impl RiscvCodegen {
                 } => {
                     let float_arg_regs_inner =
                         ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
-                    let rv_class = func.params[i].riscv_float_class;
+                    let rv_class = func.params[i].fp_agg_class;
                     let (float_sz, int_offset, int_size) = match rv_class {
-                        Some(crate::common::types::RiscvFloatClass::FloatAndInt {
+                        Some(crate::common::types::FpAggClass::FloatAndInt {
                             float_size,
                             int_offset,
                             int_size,
@@ -982,10 +1003,9 @@ impl RiscvCodegen {
                         float_sz,
                     );
                     // Store integer part at its offset
-                    let int_store = if int_size <= 4 { "sw" } else { "sd" };
                     self.emit_param_home_store_impl(
                         over_aligned,
-                        int_store,
+                        super::fp_agg::int_member_store(int_size),
                         RISCV_ARG_REGS[int_reg_idx],
                         slot,
                         int_offset as i64,
@@ -1161,6 +1181,12 @@ impl RiscvCodegen {
                 let load_instr = Self::load_for_type(ty);
                 self.emit_load_from_s0("t0", src, load_instr);
                 self.store_t0_to(dest);
+            }
+            ParamClass::RegReturnBuffer { .. } => {
+                if let Some((offset, _)) = self.fp_ret_buffer {
+                    self.emit_addi_s0("t0", offset);
+                    self.store_t0_to(dest);
+                }
             }
             // Struct/i128/F128 params remain in allocas
             _ => {}

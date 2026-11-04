@@ -1876,6 +1876,7 @@ impl Lowerer {
                     size,
                     align,
                     eightbyte_classes,
+                    fp_agg_class: None,
                 });
                 Operand::Value(dest_ptr)
             }
@@ -1948,6 +1949,45 @@ impl Lowerer {
         let struct_size = self.sizeof_type(type_spec);
         let struct_align = self.alignof_type(type_spec);
 
+        // AAPCS64 homogeneous aggregate (HFA / HVA / short vector): passed
+        // one member per v-register even through `...` (Linux AAPCS64), so
+        // it is read from the SIMD save area -- or from the stack, laid out
+        // as in memory -- and never by reference, whatever its size (B.2,
+        // C.2/C.3).  The stack cursor moves at the natural alignment capped
+        // at 16 (C.4), like the caller placed it: for a record that is its
+        // members' alignment, which a record-level `aligned(N)` does not
+        // raise (`record_arg_align`; gcc.c-torture pr92904's
+        // `struct __attribute__((aligned(32))) V { double a, b, c, d; }`
+        // after nine doubles sits at 8 mod 16).
+        if self.target == Target::Aarch64 {
+            if let Some(class) = self
+                .fp_agg_class(ctype, true)
+                .filter(|class| class.hfa().is_some())
+            {
+                let ap_val = self.lower_va_list_pointer(ap_expr);
+                let va_list_ptr = self.operand_to_value(ap_val);
+                let alloca = self.emit_entry_alloca(
+                    IrType::Ptr,
+                    struct_size.div_ceil(8).max(1) * 8,
+                    struct_align,
+                    false,
+                );
+                let natural_align = match self.get_struct_layout_for_ctype(ctype) {
+                    Some(layout) => self.record_arg_align(&layout),
+                    None => struct_align,
+                };
+                self.emit(Instruction::VaArgStruct {
+                    dest_ptr: alloca,
+                    va_list_ptr,
+                    size: struct_size,
+                    align: natural_align.min(16),
+                    eightbyte_classes: Vec::new(),
+                    fp_agg_class: Some(class),
+                });
+                return Operand::Value(alloca);
+            }
+        }
+
         // On ARM64 and RISC-V, structs > 16 bytes are passed by reference:
         // a pointer to the struct is placed in the va_list. Read the pointer
         // and return it directly (the pointer IS the struct address).
@@ -2013,6 +2053,7 @@ impl Lowerer {
                 size: struct_size,
                 align: cursor_align,
                 eightbyte_classes,
+                fp_agg_class: None,
             });
             return Operand::Value(alloca);
         }
@@ -2059,6 +2100,7 @@ impl Lowerer {
                 size: struct_size,
                 align: struct_align,
                 eightbyte_classes: Vec::new(),
+                fp_agg_class: None,
             });
             return Operand::Value(alloca);
         }
@@ -2147,18 +2189,18 @@ impl Lowerer {
         Operand::Value(alloca)
     }
 
-    /// Lower va_arg for complex types by decomposing into component va_arg calls.
+    /// Lower `va_arg` of a complex type: an aggregate of two reals in every
+    /// psABI, read where the caller's `lower_complex_call_args` put it.
     ///
-    /// Complex float (_Complex float) is special: on x86-64 and RISC-V it's passed
-    /// as two F32 values packed into a single 8-byte slot (one XMM register on x86,
-    /// one integer register on RISC-V). We read one F64/I64 and bitcast-unpack it.
-    /// On ARM64, float _Complex occupies two separate register slots per AAPCS64.
-    ///
-    /// Complex double (_Complex double) is passed as two F64 values on all platforms.
-    ///
-    /// Complex long double on x86-64: passed on stack (MEMORY class), reading as
-    /// two F128 values from the FP area.
-    /// TODO: handle _Complex long double specially on x86-64 if needed.
+    /// - `_Complex float` on x86-64 / RV64: one 8-byte carrier (an %xmm,
+    ///   resp. an integer slot), read as F64 / I64 and unpacked.
+    /// - x86-64 `_Complex double`: `[SSE, SSE]`, both halves from the FP
+    ///   save area or both from the overflow area (`VaArgStruct`); `_Complex
+    ///   long double` is MEMORY, two 16-byte F128 reads from the overflow
+    ///   area.
+    /// - AArch64: a two-member HFA (`VaArgStruct` with its FP class).
+    /// - RV64 `_Complex long double`: by reference; `_Complex double` and
+    ///   every i686 complex: two component reads from consecutive slots.
     fn lower_va_arg_complex(&mut self, ap_expr: &Expr, ctype: &CType) -> Operand {
         use crate::backend::Target;
 
@@ -2264,10 +2306,50 @@ impl Lowerer {
                     crate::common::types::EightbyteClass::Sse,
                     crate::common::types::EightbyteClass::Sse,
                 ],
+                fp_agg_class: None,
             });
             return Operand::Value(alloca);
         }
 
+        // AArch64: a complex is a two-member HFA (`complex_arg_is_aggregate`)
+        // -- both members from consecutive slots of the SIMD register save
+        // area, or the whole value from the stack once fewer than two slots
+        // remain (C.3).  Two independent reads took the real part from the
+        // last slot and the imaginary part from the stack.
+        if self.target == Target::Aarch64 {
+            let alloca = self.alloca_complex(ctype);
+            self.emit(Instruction::VaArgStruct {
+                dest_ptr: alloca,
+                va_list_ptr,
+                size: ctype.size(),
+                align: self.ctype_align(ctype),
+                eightbyte_classes: Vec::new(),
+                fp_agg_class: self.fp_agg_class(ctype, true),
+            });
+            return Operand::Value(alloca);
+        }
+
+        // RV64: through `...` a complex is a struct of two reals in the
+        // integer convention.  Over 2 x XLEN (`_Complex long double`, 32
+        // bytes) that means by reference: the slot holds a pointer to the
+        // caller's copy, which serves as the value's storage, like a large
+        // struct's (`lower_va_arg_struct`).  Two F128 reads took 32 bytes of
+        // argument slots instead.
+        if self.target == Target::Riscv64 && ctype.size() > 16 {
+            let dest = self.fresh_value();
+            self.emit(Instruction::VaArg {
+                dest,
+                va_list_ptr,
+                result_ty: IrType::Ptr,
+            });
+            return Operand::Value(dest);
+        }
+
+        // RV64 `_Complex double` and every i686 complex: the aggregate's
+        // halves sit back to back in consecutive integer slots (RV64: a GP
+        // pair or 2 x 8 stack bytes, never even-aligned at 8-byte
+        // alignment) or stack bytes (i686, 4-byte granular), exactly where
+        // two component reads find them.
         // Retrieve real part via va_arg
         let real_dest = self.fresh_value();
         self.emit(Instruction::VaArg {

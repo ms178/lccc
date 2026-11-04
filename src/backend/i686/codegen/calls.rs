@@ -47,6 +47,7 @@ impl I686Codegen {
             // The lowering decomposes Clang-convention ext vectors into
             // `[NoClass]`-tagged lanes only for this target.
             i386_ext_vector_lanes: true,
+            homogeneous_fp_aggregates: false,
         }
     }
 
@@ -388,7 +389,7 @@ impl I686Codegen {
         _total_sp_adjust: i64,
         _f128_temp_space: usize,
         _stack_arg_space: usize,
-        _struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
+        _struct_arg_fp_agg_classes: &[Option<crate::common::types::FpAggClass>],
     ) {
         // i386 vector pieces: the operand is the address of the piece's 16
         // bytes. They load first, through %eax, because the regparm moves

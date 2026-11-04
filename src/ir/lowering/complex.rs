@@ -1058,175 +1058,81 @@ impl Lowerer {
         }
     }
 
-    /// Decompose complex arguments at a call site for ABI compliance.
-    /// Replaces complex double/float pointer arguments with (real, imag) pairs.
-    /// ABI conventions:
-    /// - _Complex float on x86-64: pack two F32 into one F64 (one XMM register)
-    /// - _Complex float on RISC-V variadic: pack two F32 into one I64 (one GP register)
-    /// - _Complex float on ARM: decompose to 2 separate F32 values
-    /// - _Complex float on RISC-V non-variadic: decompose to 2 separate F32 values
-    /// - _Complex double: decompose to 2 F64 values (all platforms)
-    /// - _Complex long double: keep as pointer (passed on stack)
-    pub(super) fn decompose_complex_call_args(
+    /// Settle the ABI shape of every `_Complex` argument at a call site
+    /// (`complex_arg_is_aggregate`): a by-value aggregate -- the complex
+    /// object's address, with its size, alignment, SysV eightbyte classes
+    /// (`[SSE, SSE]` for an x86-64 `_Complex double`) and FP-register class
+    /// (AAPCS64 two-member HFA, RV64 named `TwoFloats`) -- or, for
+    /// `_Complex float` on x86-64 and an unnamed one on RV64, one 8-byte
+    /// scalar packing both halves.  The per-argument tables arrive with no
+    /// entry for complex arguments (`lower_call_arguments`) and stay
+    /// parallel to the arguments: this pass replaces entries, never adds or
+    /// removes any.
+    pub(super) fn lower_complex_call_args(
         &mut self,
-        arg_vals: &mut Vec<Operand>,
-        arg_types: &mut Vec<IrType>,
-        struct_arg_sizes: &mut Vec<Option<usize>>,
-        struct_arg_aligns: &mut Vec<Option<usize>>,
-        struct_arg_classes: &mut Vec<Vec<crate::common::types::EightbyteClass>>,
+        arg_vals: &mut [Operand],
+        arg_types: &mut [IrType],
+        struct_arg_sizes: &mut [Option<usize>],
+        struct_arg_aligns: &mut [Option<usize>],
+        struct_arg_classes: &mut [Vec<crate::common::types::EightbyteClass>],
+        struct_arg_fp_agg_classes: &mut [Option<crate::common::types::FpAggClass>],
         param_ctypes: &Option<Vec<CType>>,
         args: &[Expr],
         is_variadic_call: bool,
     ) {
-        let pctypes = match param_ctypes {
-            Some(ct) => ct.clone(),
-            None => {
-                // No param type info available - try to infer from expressions
-                args.iter().map(|a| self.expr_ctype(a)).collect()
-            }
-        };
-        let n_fixed_params = param_ctypes.as_ref().map_or(0, |v| v.len());
-
-        let uses_packed_cf = self.uses_packed_complex_float();
-        let packs_cf_variadic = self.packs_complex_float_variadic();
-        let mut new_vals = Vec::with_capacity(arg_vals.len() * 2);
-        let mut new_types = Vec::with_capacity(arg_types.len() * 2);
-        let mut new_struct_sizes = Vec::with_capacity(struct_arg_sizes.len() * 2);
-        let mut new_struct_aligns = Vec::with_capacity(struct_arg_aligns.len() * 2);
-        let mut new_struct_classes: Vec<Vec<crate::common::types::EightbyteClass>> =
-            Vec::with_capacity(struct_arg_classes.len() * 2);
-
-        for (i, (val, ty)) in arg_vals.iter().zip(arg_types.iter()).enumerate() {
-            let ctype = pctypes.get(i);
-            // Is this arg beyond the fixed params (i.e., a variadic argument)?
-            let is_variadic_arg = is_variadic_call && i >= n_fixed_params;
-
-            let is_complex_float = match ctype {
-                Some(CType::ComplexFloat) => true,
-                None => {
-                    *ty == IrType::Ptr
-                        && i < args.len()
-                        && matches!(self.expr_ctype(&args[i]), CType::ComplexFloat)
-                }
-                _ => false,
+        let n_fixed_params = param_ctypes.as_ref().map_or(0, Vec::len);
+        for i in 0..arg_vals.len() {
+            // The declared parameter type decides a named argument (the
+            // argument was converted to it); the expression's own type an
+            // unnamed or unprototyped one.
+            let ctype = match param_ctypes.as_ref().and_then(|p| p.get(i)) {
+                Some(ct) => ct.clone(),
+                None if arg_types[i] == IrType::Ptr && i < args.len() => self.expr_ctype(&args[i]),
+                None => continue,
             };
-
-            // Check for ComplexFloat with packed convention:
-            // - x86-64: always pack (2xF32 into 1xF64 in XMM register)
-            // - RISC-V variadic: pack (2xF32 into 1xI64 in GP register)
-            let should_pack =
-                is_complex_float && (uses_packed_cf || (packs_cf_variadic && is_variadic_arg));
-
-            if should_pack {
-                let ptr = self.operand_to_value(*val);
+            if !ctype.is_complex() {
+                continue;
+            }
+            let unnamed = is_variadic_call && i >= n_fixed_params;
+            if self.complex_arg_is_packed(&ctype, unnamed) {
+                // Both F32 halves in one 8-byte carrier: an F64 bound for
+                // one %xmm (x86-64), an I64 bound for one GP register (an
+                // RV64 variadic argument, integer convention).
+                let carrier = if self.uses_packed_complex_float() {
+                    IrType::F64
+                } else {
+                    IrType::I64
+                };
+                let ptr = self.operand_to_value(arg_vals[i]);
                 let packed = self.fresh_value();
-                if packs_cf_variadic && is_variadic_arg && !uses_packed_cf {
-                    // RISC-V variadic: load as I64 (two packed F32s in one GP register)
-                    self.emit(Instruction::Load {
-                        volatile: false,
-                        dest: packed,
-                        ptr,
-                        ty: IrType::I64,
-                        seg_override: AddressSpace::Default,
-                    });
-                    new_vals.push(Operand::Value(packed));
-                    new_types.push(IrType::I64);
-                } else {
-                    // x86-64: load as F64 (two packed F32s in one XMM register)
-                    self.emit(Instruction::Load {
-                        volatile: false,
-                        dest: packed,
-                        ptr,
-                        ty: IrType::F64,
-                        seg_override: AddressSpace::Default,
-                    });
-                    new_vals.push(Operand::Value(packed));
-                    new_types.push(IrType::F64);
-                }
-                new_struct_sizes.push(None); // packed scalar, not a struct
-                new_struct_aligns.push(None);
-                new_struct_classes.push(Vec::new());
+                self.emit(Instruction::Load {
+                    volatile: false,
+                    dest: packed,
+                    ptr,
+                    ty: carrier,
+                    seg_override: AddressSpace::Default,
+                });
+                arg_vals[i] = Operand::Value(packed);
+                arg_types[i] = carrier;
+                struct_arg_sizes[i] = None;
+                struct_arg_aligns[i] = None;
+                struct_arg_classes[i] = Vec::new();
+                struct_arg_fp_agg_classes[i] = None;
                 continue;
             }
-
-            // On 64-bit targets, complex types are decomposed into (real, imag) scalar pairs:
-            // - ComplexFloat: decomposed on ARM/RISC-V (not x86-64 where it's packed)
-            // - ComplexDouble: decomposed on ARM/RISC-V (not x86-64, see below)
-            // - ComplexLongDouble: only decomposed on ARM64 (HFA in Q regs)
-            // On i686, no complex types are decomposed (all passed as structs on the stack).
-            //
-            // On x86-64, _Complex double is NOT decomposed into two F64 args because the
-            // SysV ABI treats it as a [Sse, Sse] two-eightbyte argument that must be passed
-            // entirely in registers or entirely on the stack. Decomposing would break the
-            // atomic register allocation check. Instead, it's passed as a 16-byte struct-like
-            // argument, which classify_sysv_struct handles correctly.
-            let decomposes_cld = self.decomposes_complex_long_double();
-            let decomposes_cd = self.decomposes_complex_double();
-            let decomposes_cf = self.decomposes_complex_float();
-            let is_x86_64 = self.target == crate::backend::Target::X86_64;
-
-            let resolved_ctype = ctype.cloned().unwrap_or_else(|| {
-                if *ty == IrType::Ptr && i < args.len() {
-                    self.expr_ctype(&args[i])
-                } else {
-                    CType::Int
-                }
-            });
-
-            // On x86-64, don't decompose _Complex double - pass as 16-byte struct [Sse, Sse]
-            let is_complex_double = matches!(resolved_ctype, CType::ComplexDouble);
-            if is_x86_64 && is_complex_double {
-                // Pass as a struct-like 16-byte [Sse, Sse] argument
-                new_vals.push(*val);
-                new_types.push(*ty);
-                new_struct_sizes.push(Some(16));
-                new_struct_aligns.push(Some(8));
-                new_struct_classes.push(vec![
-                    crate::common::types::EightbyteClass::Sse,
-                    crate::common::types::EightbyteClass::Sse,
-                ]);
-                continue;
-            }
-
-            let should_decompose = match &resolved_ctype {
-                CType::ComplexFloat => decomposes_cf && !uses_packed_cf,
-                CType::ComplexDouble => decomposes_cd,
-                CType::ComplexLongDouble => decomposes_cld,
-                _ => false,
-            };
-
-            if should_decompose {
-                let comp_ty = Self::complex_component_ir_type(&resolved_ctype);
-                let ptr = self.operand_to_value(*val);
-
-                // Load real part
-                let real = self.load_complex_real(ptr, &resolved_ctype);
-                // Load imag part
-                let imag = self.load_complex_imag(ptr, &resolved_ctype);
-
-                new_vals.push(real);
-                new_types.push(comp_ty);
-                new_struct_sizes.push(None); // decomposed scalar
-                new_struct_aligns.push(None);
-                new_struct_classes.push(Vec::new());
-                new_vals.push(imag);
-                new_types.push(comp_ty);
-                new_struct_sizes.push(None); // decomposed scalar
-                new_struct_aligns.push(None);
-                new_struct_classes.push(Vec::new());
-            } else {
-                new_vals.push(*val);
-                new_types.push(*ty);
-                new_struct_sizes.push(struct_arg_sizes.get(i).copied().flatten());
-                new_struct_aligns.push(struct_arg_aligns.get(i).copied().flatten());
-                new_struct_classes.push(struct_arg_classes.get(i).cloned().unwrap_or_default());
-            }
+            // The aggregate: arg_vals[i] already holds the complex object's
+            // address.  i686 keeps its 4-byte cdecl slot granularity (no
+            // alignment entry); elsewhere the natural alignment places the
+            // value (AAPCS64 C.4: 16 for `_Complex long double`).
+            debug_assert!(self.complex_arg_is_aggregate(&ctype, unnamed));
+            struct_arg_sizes[i] = Some(ctype.size());
+            struct_arg_aligns[i] =
+                (self.target != crate::backend::Target::I686).then(|| self.ctype_align(&ctype));
+            struct_arg_classes[i] = self
+                .sysv_arg_abi(&ctype)
+                .map(|(classes, _)| classes)
+                .unwrap_or_default();
+            struct_arg_fp_agg_classes[i] = self.fp_agg_class(&ctype, unnamed);
         }
-
-        *arg_vals = new_vals;
-        *arg_types = new_types;
-        *struct_arg_sizes = new_struct_sizes;
-        *struct_arg_aligns = new_struct_aligns;
-        *struct_arg_classes = new_struct_classes;
     }
 }

@@ -53,7 +53,7 @@ LEVELS = {
 # `<name>_caller.c`, linked LCCC-with-LCCC and LCCC-with-Clang in both
 # directions.  A caller and a callee that merely agree with each other pass
 # the single-unit fixtures above while disagreeing with every other compiler.
-INTEROP = ("psabi_pair_interop", "psabi_float_interop")
+INTEROP = ("psabi_pair_interop", "psabi_float_interop", "psabi_hfa_interop", "psabi_wide_interop")
 INTEROP_LEVELS = ("-O0", "-O2")
 CLANG_FREESTANDING = ("-O2", "-ffreestanding", "-fno-builtin", "-fno-pic", "-fno-pie",
                       "-fno-stack-protector", "-nostdlibinc")
@@ -127,7 +127,30 @@ def main():
     parser.add_argument("--clang", default=os.environ.get("CLANG", "clang-23"))
     parser.add_argument("--ld", help="optional GNU/LLD linker supporting both target emulations")
     parser.add_argument("--qemu-dir", type=Path, default=Path("/usr/bin"))
+    parser.add_argument("--only", action="append", metavar="FIXTURE",
+                        help="run only this fixture (repeatable; single-unit or interop name)")
+    parser.add_argument("--keep-going", action="store_true",
+                        help="run every contract and report each failure instead of stopping at the first")
     args = parser.parse_args()
+    known = set(FIXTURES) | set(INTEROP)
+    if args.only and (unknown := sorted(set(args.only) - known)):
+        parser.error(f"unknown fixture(s): {', '.join(unknown)}")
+    selected = set(args.only or known)
+    failures = []
+
+    def attempt(label, steps, env=None):
+        """Run each argv in `steps` in order; the first nonzero exit fails the contract."""
+        for step in steps:
+            status = subprocess.run(step, env=env, timeout=30).returncode
+            if status:
+                failures.append(f"{label}: {Path(step[0]).name} exited {status}")
+                print(f"FAIL {label} ({failures[-1].split(': ', 1)[1]})", flush=True)
+                if not args.keep_going:
+                    raise SystemExit(1)
+                return False
+        print(f"PASS {label}", flush=True)
+        return True
+
     version = subprocess.check_output([args.clang, "-dumpversion"], text=True).strip()
     if version != "23.1.5":
         parser.error(f"Clang 23.1.5 required, found {version}")
@@ -145,7 +168,7 @@ def main():
             start.write_text(START[arch])
             startup = start.with_suffix(".o")
             subprocess.run([args.clang, target, "-c", str(start), "-o", str(startup)], check=True, timeout=30)
-            for fixture in FIXTURES:
+            for fixture in (f for f in FIXTURES if f in selected):
                 pass_name = CONTROL_PASSES.get(fixture, "switch_lut")
                 if fixture in LEVELS:
                     variants = [(level, None, level) for level in LEVELS[fixture]]
@@ -165,44 +188,47 @@ def main():
                     if fixture in LEVELS:
                         # LCCC's own assembler and ELF writer, as `-c` uses
                         # them by default: it once refused `and w2, w2, #-16`.
-                        subprocess.run([str(args.lccc_dir / driver), level, *include, "-c", source,
-                                        "-o", str(obj)], env=env, check=True, timeout=30)
+                        steps = [[str(args.lccc_dir / driver), level, *include, "-c", source,
+                                  "-o", str(obj)]]
                     else:
-                        subprocess.run([str(args.lccc_dir / driver), level, *include, "-S", source,
-                                        "-o", str(asm)], env=env, check=True, timeout=30)
-                        subprocess.run([args.clang, target, "-c", str(asm), "-o", str(obj)],
-                                       check=True, timeout=30)
-                    subprocess.run([*linker, "-m", emulation, "-static", "-e", "_start",
-                                    str(startup), str(obj), "-o", str(exe)], check=True, timeout=30)
-                    subprocess.run([str(args.qemu_dir / f"qemu-{arch}"), str(exe)],
-                                   check=True, timeout=30)
-                    count += 1
-                    print(f"PASS {arch} {fixture} {label}", flush=True)
+                        steps = [[str(args.lccc_dir / driver), level, *include, "-S", source,
+                                  "-o", str(asm)],
+                                 [args.clang, target, "-c", str(asm), "-o", str(obj)]]
+                    steps += [[*linker, "-m", emulation, "-static", "-e", "_start",
+                               str(startup), str(obj), "-o", str(exe)],
+                              [str(args.qemu_dir / f"qemu-{arch}"), str(exe)]]
+                    count += attempt(f"{arch} {fixture} {label}", steps, env)
             include = ["-isystem", str(Path(resource) / "include")]
             clang_flags = [target, *CLANG_FREESTANDING, *CLANG_TARGET_FLAGS[arch], *include]
-            for fixture in INTEROP:
+            for fixture in (f for f in INTEROP if f in selected):
                 base = ROOT / "tests/regression/interop" / fixture
                 units = {}
                 for unit in ("callee", "caller"):
                     source = str(base) + f"_{unit}.c"
                     units[unit, "clang"] = work / f"{unit}-clang.o"
+                    # Validates the fixture itself: Clang must accept it.
                     subprocess.run([args.clang, *clang_flags, "-c", source, "-o", str(units[unit, "clang"])],
                                    check=True, timeout=30)
                     for level in INTEROP_LEVELS:
                         units[unit, level] = work / f"{unit}-lccc{level}.o"
+                        units[unit, level].unlink(missing_ok=True)
                         subprocess.run([str(args.lccc_dir / driver), level, *include, "-c", source,
-                                        "-o", str(units[unit, level])], check=True, timeout=30)
+                                        "-o", str(units[unit, level])], timeout=30)
                 for level in INTEROP_LEVELS:
                     for callee, caller in (((level), (level)), ((level), "clang"), ("clang", (level))):
                         exe = work / "interop"
-                        subprocess.run([*linker, "-m", emulation, "-static", "-e", "_start", str(startup),
-                                        str(units["callee", callee]), str(units["caller", caller]),
-                                        "-o", str(exe)], check=True, timeout=30)
-                        subprocess.run([str(args.qemu_dir / f"qemu-{arch}"), str(exe)], check=True, timeout=30)
-                        count += 1
                         label = f"callee={'clang' if callee == 'clang' else 'lccc' + callee} " \
                                 f"caller={'clang' if caller == 'clang' else 'lccc' + caller}"
-                        print(f"PASS {arch} {fixture} {label}", flush=True)
+                        steps = [[*linker, "-m", emulation, "-static", "-e", "_start", str(startup),
+                                  str(units["callee", callee]), str(units["caller", caller]),
+                                  "-o", str(exe)],
+                                 [str(args.qemu_dir / f"qemu-{arch}"), str(exe)]]
+                        count += attempt(f"{arch} {fixture} {label}", steps)
+    if failures:
+        print(f"{len(failures)} cross-target execution contract(s) FAILED, {count} passed:")
+        for failure in failures:
+            print(f"  {failure}")
+        return 1
     print(f"{count} cross-target execution contracts passed")
     return 0
 

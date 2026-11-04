@@ -2627,7 +2627,7 @@ mod tests {
             struct_align: None,
             param_align: None,
             struct_eightbyte_classes: Vec::new(),
-            riscv_float_class: None,
+            fp_agg_class: None,
             is_f128_sse: false,
         };
         let mut f = IrFunction::new(

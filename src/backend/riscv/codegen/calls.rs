@@ -29,9 +29,17 @@ impl RiscvCodegen {
         arg_types: &[IrType],
         _stack_arg_space: usize,
     ) -> usize {
+        // A `long double` split across a7 and the stack is staged like the
+        // register pairs: its 16 bytes may need a conversion call, which
+        // must run before any argument register is written.  The split
+        // takes the last GP register, so its temp follows every pair's.
+        let staged = |i: usize| {
+            matches!(arg_classes[i], CallArgClass::F128Reg { .. })
+                || Self::is_split_f128_arg(arg_classes, arg_types, i)
+        };
         let mut f128_temp_space: i64 = 0;
         for (i, arg) in args.iter().enumerate() {
-            if matches!(arg_classes[i], CallArgClass::F128Reg { .. }) {
+            if staged(i) {
                 if let Operand::Value(_) = arg {
                     f128_temp_space += 16;
                 }
@@ -41,7 +49,7 @@ impl RiscvCodegen {
             self.emit_addi_sp(-f128_temp_space);
             let mut temp_offset: i64 = 0;
             for (i, arg) in args.iter().enumerate() {
-                if !matches!(arg_classes[i], CallArgClass::F128Reg { .. }) {
+                if !staged(i) {
                     continue;
                 }
                 if let Operand::Value(v) = arg {
@@ -69,6 +77,78 @@ impl RiscvCodegen {
             }
         }
         f128_temp_space as usize
+    }
+
+    /// Whether argument `i` is a 2×XLEN scalar -- `__int128`, `long
+    /// double`, or the `_Float128` U128 carrier -- rather than an aggregate
+    /// address: the operand a `StructSplitRegStack` class moves by value.
+    fn is_wide_scalar_arg(arg_types: &[IrType], i: usize) -> bool {
+        matches!(
+            arg_types.get(i),
+            Some(IrType::I128 | IrType::U128 | IrType::F128)
+        )
+    }
+
+    /// Whether argument `i` is a `long double` split across a7 and the
+    /// stack (its bytes are staged by emit_call_f128_pre_convert_impl).
+    fn is_split_f128_arg(arg_classes: &[CallArgClass], arg_types: &[IrType], i: usize) -> bool {
+        matches!(arg_classes[i], CallArgClass::StructSplitRegStack { .. })
+            && arg_types.get(i) == Some(&IrType::F128)
+    }
+
+    /// Load the XLEN bits at byte `half` (0: low, 8: high) of the 2×XLEN
+    /// scalar argument `arg` (index `i`) into `dest`.  A `long double`
+    /// value reads its staged copy: the temps sit above the
+    /// `stack_arg_space` outgoing bytes, one 16-byte temp per staged
+    /// argument in argument order, and a split argument is the last one.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_wide_scalar_half(
+        &mut self,
+        dest: &str,
+        arg: &Operand,
+        args: &[Operand],
+        arg_classes: &[CallArgClass],
+        arg_types: &[IrType],
+        i: usize,
+        half: i64,
+        stack_arg_space: i64,
+    ) {
+        let bytes: Option<[u8; 16]> = match arg {
+            Operand::Const(IrConst::LongDouble(_, f128_bytes)) => Some(*f128_bytes),
+            Operand::Const(c) if arg_types[i] == IrType::F128 => Some(
+                crate::ir::reexports::f64_to_f128_bytes(c.to_f64().unwrap_or(0.0)),
+            ),
+            Operand::Const(c) => Some(c.to_i128().unwrap_or(0).to_le_bytes()),
+            Operand::Value(_) => None,
+        };
+        if let Some(bytes) = bytes {
+            let at = half as usize;
+            let mut word = [0u8; 8];
+            word.copy_from_slice(&bytes[at..at + 8]);
+            self.state.emit_fmt(format_args!(
+                "    li {}, {}",
+                dest,
+                i64::from_le_bytes(word)
+            ));
+            return;
+        }
+        let Operand::Value(v) = arg else {
+            return;
+        };
+        if arg_types[i] == IrType::F128 {
+            let staged_before = (0..i)
+                .filter(|&j| {
+                    matches!(arg_classes[j], CallArgClass::F128Reg { .. })
+                        && matches!(args[j], Operand::Value(_))
+                })
+                .count() as i64;
+            self.emit_load_from_sp(dest, stack_arg_space + staged_before * 16 + half, "ld");
+        } else if let Some(slot) = self.state.get_slot(v.0) {
+            // A 128-bit integer value lives in its 16-byte slot.
+            self.emit_load_from_s0(dest, slot.0 + half, "ld");
+        } else {
+            self.state.emit_fmt(format_args!("    li {}, 0", dest));
+        }
     }
 
     pub(super) fn emit_call_stack_args_impl(
@@ -190,6 +270,24 @@ impl RiscvCodegen {
                         }
                         offset += 16;
                     }
+                    CallArgClass::StructSplitRegStack { .. }
+                        if Self::is_wide_scalar_arg(arg_types, arg_i) =>
+                    {
+                        // The high XLEN bits of a 2×XLEN scalar; the low
+                        // ones go in a7 (emit_call_reg_args_impl).
+                        self.emit_wide_scalar_half(
+                            "t0",
+                            arg,
+                            args,
+                            arg_classes,
+                            arg_types,
+                            arg_i,
+                            8,
+                            stack_arg_space as i64,
+                        );
+                        self.emit_store_to_sp("t0", offset as i64, "sd");
+                        offset += 8;
+                    }
                     CallArgClass::StructSplitRegStack { size, .. } => {
                         match arg {
                             Operand::Value(v) => {
@@ -248,7 +346,7 @@ impl RiscvCodegen {
         _total_sp_adjust: i64,
         _f128_temp_space: usize,
         stack_arg_space: usize,
-        struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
+        struct_arg_fp_agg_classes: &[Option<crate::common::types::FpAggClass>],
     ) {
         let float_arg_regs = ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
 
@@ -481,6 +579,21 @@ impl RiscvCodegen {
         // Load split struct register args
         for (i, arg) in args.iter().enumerate() {
             if let CallArgClass::StructSplitRegStack { reg_idx, .. } = arg_classes[i] {
+                if Self::is_wide_scalar_arg(arg_types, i) {
+                    // The low XLEN bits of a 2×XLEN scalar (the high ones
+                    // went to the stack in emit_call_stack_args_impl).
+                    self.emit_wide_scalar_half(
+                        RISCV_ARG_REGS[reg_idx],
+                        arg,
+                        args,
+                        arg_classes,
+                        arg_types,
+                        i,
+                        0,
+                        stack_arg_space as i64,
+                    );
+                    continue;
+                }
                 match arg {
                     Operand::Value(v) => {
                         if let Some(&reg) = self.reg_assignments.get(&v.0) {
@@ -517,7 +630,7 @@ impl RiscvCodegen {
                 continue;
             }
 
-            let rv_class = struct_arg_riscv_float_classes.get(i).copied().flatten();
+            let rv_class = struct_arg_fp_agg_classes.get(i).copied().flatten();
 
             match arg {
                 Operand::Value(v) => {
@@ -546,10 +659,8 @@ impl RiscvCodegen {
                     size,
                 } => {
                     let (lo_sz, hi_sz, hi_offset) = match rv_class {
-                        Some(crate::common::types::RiscvFloatClass::OneFloat { size }) => {
-                            (size, 4, 0)
-                        }
-                        Some(crate::common::types::RiscvFloatClass::TwoFloats {
+                        Some(crate::common::types::FpAggClass::OneFloat { size }) => (size, 4, 0),
+                        Some(crate::common::types::FpAggClass::TwoFloats {
                             lo_size,
                             hi_size,
                             hi_offset,
@@ -571,7 +682,7 @@ impl RiscvCodegen {
                     size: _,
                 } => {
                     let (float_sz, int_size, float_offset) = match rv_class {
-                        Some(crate::common::types::RiscvFloatClass::IntAndFloat {
+                        Some(crate::common::types::FpAggClass::IntAndFloat {
                             float_size,
                             int_size,
                             float_offset,
@@ -579,10 +690,10 @@ impl RiscvCodegen {
                         }) => (float_size, int_size, float_offset),
                         _ => (8, 8, 8),
                     };
-                    let int_load = if int_size <= 4 { "lw" } else { "ld" };
                     self.state.emit_fmt(format_args!(
                         "    {} {}, 0(t0)",
-                        int_load, RISCV_ARG_REGS[int_reg_idx]
+                        super::fp_agg::int_member_load(int_size),
+                        RISCV_ARG_REGS[int_reg_idx]
                     ));
                     self.emit_load_riscv_fp_field(
                         float_arg_regs[fp_reg_idx],
@@ -596,7 +707,7 @@ impl RiscvCodegen {
                     size: _,
                 } => {
                     let (float_sz, int_offset, int_size) = match rv_class {
-                        Some(crate::common::types::RiscvFloatClass::FloatAndInt {
+                        Some(crate::common::types::FpAggClass::FloatAndInt {
                             float_size,
                             int_offset,
                             int_size,
@@ -605,10 +716,11 @@ impl RiscvCodegen {
                         _ => (8, 8, 8),
                     };
                     self.emit_load_riscv_fp_field(float_arg_regs[fp_reg_idx], 0, float_sz);
-                    let int_load = if int_size <= 4 { "lw" } else { "ld" };
                     self.state.emit_fmt(format_args!(
                         "    {} {}, {}(t0)",
-                        int_load, RISCV_ARG_REGS[int_reg_idx], int_offset
+                        super::fp_agg::int_member_load(int_size),
+                        RISCV_ARG_REGS[int_reg_idx],
+                        int_offset
                     ));
                 }
                 _ => {}

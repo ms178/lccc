@@ -263,7 +263,7 @@ impl ArmCodegen {
         total_sp_adjust: i64,
         _f128_temp_space: usize,
         _stack_arg_space: usize,
-        _struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
+        _struct_arg_fp_agg_classes: &[Option<crate::common::types::FpAggClass>],
     ) {
         let slot_adjust = if self.state.has_dyn_alloca {
             0
@@ -283,6 +283,7 @@ impl ArmCodegen {
         self.emit_call_move_temps_to_arg_regs(args, arg_classes);
         self.emit_call_i128_reg_args(args, arg_classes, slot_adjust, needs_adjusted_load);
         self.emit_call_struct_byval_reg_args(args, arg_classes, slot_adjust, needs_adjusted_load);
+        self.emit_call_hfa_reg_args(args, arg_classes, slot_adjust, needs_adjusted_load);
     }
 
     pub(super) fn emit_call_instruction_impl(

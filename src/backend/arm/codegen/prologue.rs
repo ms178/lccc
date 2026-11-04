@@ -466,19 +466,49 @@ impl ArmCodegen {
                     continue;
                 }
                 named_gp += class.gp_reg_count();
-                if matches!(
-                    class,
+                // Every class that occupies v-registers: scalars, long
+                // double, and each member of a named HFA.  A named HFA that
+                // missed the registers closed the SIMD file (C.3); the
+                // `min(8)` below then gives `__vr_offs` = 0, as GCC's
+                // va_start computes from the same NSRN.
+                named_fp += match class {
                     crate::backend::call_abi::ParamClass::FloatReg { .. }
-                        | crate::backend::call_abi::ParamClass::F128FpReg { .. }
-                ) {
-                    named_fp += 1;
-                }
+                    | crate::backend::call_abi::ParamClass::F128FpReg { .. } => 1,
+                    crate::backend::call_abi::ParamClass::StructHfaReg { count, .. } => *count,
+                    crate::backend::call_abi::ParamClass::StructStack { .. }
+                    | crate::backend::call_abi::ParamClass::LargeStructStack { .. }
+                        if func
+                            .params
+                            .get(i)
+                            .and_then(|p| p.fp_agg_class)
+                            .and_then(|c| c.hfa())
+                            .is_some() =>
+                    {
+                        8
+                    }
+                    _ => 0,
+                };
             }
             self.va_named_gp_count = named_gp.min(8);
             self.va_named_fp_count = named_fp.min(8);
             self.va_named_stack_bytes =
                 crate::backend::call_abi::named_params_stack_bytes(&param_classes);
         }
+
+        // An HFA/HVA/short-vector result: the body writes it through the
+        // hidden return pointer, which is homed as the address of this
+        // private buffer; the return loads v0..v3 from it.
+        self.fp_ret_buffer = crate::backend::call_abi::hidden_fp_agg_return(
+            func.uses_sret,
+            func.params.first().and_then(|p| p.fp_agg_class),
+        )
+        .map(|class| {
+            space = (space + 15) & !15;
+            let offset = space;
+            space += crate::backend::call_abi::fp_agg_return_buffer_bytes(class)
+                .next_multiple_of(16) as i64;
+            (offset, class)
+        });
 
         let save_count = self.used_callee_saved.len() as i64;
         if save_count > 0 {
@@ -688,6 +718,7 @@ impl ArmCodegen {
         }
 
         self.emit_store_gp_params(func, &param_classes);
+        self.emit_store_hfa_params(func, &param_classes);
         self.emit_store_fp_params(func, &param_classes);
         self.emit_store_stack_params(func, &param_classes);
     }
@@ -733,6 +764,14 @@ impl ArmCodegen {
         let sret_shift = if self.state.uses_sret { 1usize } else { 0 };
 
         match class {
+            // The hidden return pointer of an FP-register result is the
+            // address of the private return buffer.
+            ParamClass::RegReturnBuffer { .. } => {
+                if let Some((offset, _)) = self.fp_ret_buffer {
+                    self.emit_add_sp_offset("x0", offset);
+                    self.store_x0_to(dest);
+                }
+            }
             ParamClass::IntReg { reg_idx } => {
                 let actual_reg = if sret_shift > 0 && reg_idx == 0 && param_idx == 0 {
                     Self::reg_for_type("x8", ty)
@@ -814,7 +853,9 @@ impl ArmCodegen {
         >,
     ) {
         use crate::backend::regalloc::PhysReg;
-        if func.uses_sret || func.is_variadic {
+        // `state.uses_sret`, not the IR flag: an HFA result keeps the sret
+        // shape but leaves x8 free.
+        if self.state.uses_sret || func.is_variadic {
             return;
         }
         let x8 = PhysReg(8);

@@ -3020,7 +3020,7 @@ mod tests {
             param_align: None,
             struct_eightbyte_classes: Vec::new(),
             is_f128_sse: false,
-            riscv_float_class: None,
+            fp_agg_class: None,
         };
         let mut function =
             IrFunction::new("const_src_param".into(), IrType::I32, vec![param], false);
@@ -3800,7 +3800,7 @@ mod tests {
             param_align: None,
             struct_eightbyte_classes: Vec::new(),
             is_f128_sse: false,
-            riscv_float_class: None,
+            fp_agg_class: None,
         };
         let mut function = IrFunction::new("pointer_add".into(), IrType::I32, vec![param], false);
         function.blocks.push(block(

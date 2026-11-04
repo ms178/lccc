@@ -3577,7 +3577,7 @@ impl ArchCodegen for I686Codegen {
         struct_arg_sizes: &[Option<usize>],
         struct_arg_aligns: &[Option<usize>],
         struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
-        struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
+        struct_arg_fp_agg_classes: &[Option<crate::common::types::FpAggClass>],
         struct_arg_is_f128_sse: &[bool],
         is_sret: bool,
         _calling_convention: crate::common::types::CallingConvention,
@@ -3660,7 +3660,7 @@ impl ArchCodegen for I686Codegen {
             struct_arg_sizes.get(skip..).unwrap_or(&[]),
             struct_arg_aligns.get(skip..).unwrap_or(&[]),
             struct_arg_classes.get(skip..).unwrap_or(&[]),
-            struct_arg_riscv_float_classes.get(skip..).unwrap_or(&[]),
+            struct_arg_fp_agg_classes.get(skip..).unwrap_or(&[]),
             struct_arg_is_f128_sse.get(skip..).unwrap_or(&[]),
             is_variadic.then(|| num_fixed_args.saturating_sub(skip)),
             &config,
@@ -4561,7 +4561,7 @@ impl ArchCodegen for I686Codegen {
         fn emit_call_f128_pre_convert(&mut self, args: &[Operand], arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], stack_arg_space: usize) -> usize => emit_call_f128_pre_convert_impl;
         fn emit_call_compute_stack_space(&self, arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], struct_arg_aligns: &[Option<usize>], struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>], struct_arg_is_f128_sse: &[bool]) -> usize => emit_call_compute_stack_space_impl;
         fn emit_call_stack_args(&mut self, args: &[Operand], arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], stack_arg_space: usize, fptr_spill: usize, f128_temp_space: usize, struct_arg_aligns: &[Option<usize>], struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>], struct_arg_is_f128_sse: &[bool]) -> i64 => emit_call_stack_args_impl;
-        fn emit_call_reg_args(&mut self, args: &[Operand], arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], total_sp_adjust: i64, f128_temp_space: usize, stack_arg_space: usize, struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>]) => emit_call_reg_args_impl;
+        fn emit_call_reg_args(&mut self, args: &[Operand], arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], total_sp_adjust: i64, f128_temp_space: usize, stack_arg_space: usize, struct_arg_fp_agg_classes: &[Option<crate::common::types::FpAggClass>]) => emit_call_reg_args_impl;
         fn emit_call_instruction(&mut self, direct_name: Option<&str>, func_ptr: Option<&Operand>, indirect: bool, stack_arg_space: usize) => emit_call_instruction_impl;
         fn emit_call_cleanup(&mut self, stack_arg_space: usize, f128_temp_space: usize, indirect: bool) => emit_call_cleanup_impl;
         fn emit_call_store_result(&mut self, dest: &Value, return_type: IrType) => emit_call_store_result_impl;

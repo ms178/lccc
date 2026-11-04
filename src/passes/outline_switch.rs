@@ -867,7 +867,7 @@ fn build_outlined_function(
             struct_align: None,
             param_align: None,
             struct_eightbyte_classes: Vec::new(),
-            riscv_float_class: None,
+            fp_agg_class: None,
             is_f128_sse: false,
         })
         .collect();
@@ -1128,12 +1128,14 @@ fn remap_instruction(
             size,
             align,
             eightbyte_classes,
+            fp_agg_class,
         } => Instruction::VaArgStruct {
             dest_ptr: remap_val(*dest_ptr),
             va_list_ptr: remap_val(*va_list_ptr),
             size: *size,
             align: *align,
             eightbyte_classes: eightbyte_classes.clone(),
+            fp_agg_class: *fp_agg_class,
         },
         Instruction::VaStart { va_list_ptr } => Instruction::VaStart {
             va_list_ptr: remap_val(*va_list_ptr),
@@ -1333,7 +1335,7 @@ fn remap_call_info(info: &CallInfo, remap_op: &dyn Fn(&Operand) -> Operand) -> C
         struct_arg_sizes: info.struct_arg_sizes.clone(),
         struct_arg_aligns: info.struct_arg_aligns.clone(),
         struct_arg_classes: info.struct_arg_classes.clone(),
-        struct_arg_riscv_float_classes: info.struct_arg_riscv_float_classes.clone(),
+        struct_arg_fp_agg_classes: info.struct_arg_fp_agg_classes.clone(),
         // Preserve the _Float128 ABI markers (see inline.rs remap_call_info).
         struct_arg_is_f128_sse: info.struct_arg_is_f128_sse.clone(),
         is_sret: info.is_sret,
@@ -1483,7 +1485,7 @@ fn replace_case_with_call(
                 struct_arg_sizes: vec![None; num_args],
                 struct_arg_aligns: vec![None; num_args],
                 struct_arg_classes: vec![Vec::new(); num_args],
-                struct_arg_riscv_float_classes: vec![None; num_args],
+                struct_arg_fp_agg_classes: vec![None; num_args],
                 struct_arg_is_f128_sse: Vec::new(),
                 is_sret: false,
                 calling_convention: crate::common::types::CallingConvention::Default,
@@ -1530,7 +1532,7 @@ fn replace_case_with_call(
                 struct_arg_sizes: vec![None; num_args],
                 struct_arg_aligns: vec![None; num_args],
                 struct_arg_classes: vec![Vec::new(); num_args],
-                struct_arg_riscv_float_classes: vec![None; num_args],
+                struct_arg_fp_agg_classes: vec![None; num_args],
                 struct_arg_is_f128_sse: Vec::new(),
                 is_sret: false,
                 calling_convention: crate::common::types::CallingConvention::Default,
