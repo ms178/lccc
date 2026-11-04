@@ -83,6 +83,25 @@ fn line_is_identity_transparent(store: &LineStore, infos: &[LineInfo], j: usize)
     infos[j].kind == LineKind::Directive && is_alignment_directive(infos[j].trimmed(store.get(j)))
 }
 
+/// Collect every `.LBB...` label token mentioned in an arbitrary assembler
+/// line. Used for BOTH jump-table entries and address-taken label references
+/// (`leaq .LBB2(%rip), %rdi`): a single extractor, so the two soundness
+/// checks can never drift apart in what they consider a label token.
+fn collect_lbb_tokens(line: &str, out: &mut FxHashSet<String>) {
+    let mut rest = line;
+    while let Some(pos) = rest.find(".LBB") {
+        let name_start = pos + ".LBB".len();
+        let mut j = name_start;
+        while j < rest.len()
+            && (rest.as_bytes()[j].is_ascii_alphanumeric() || rest.as_bytes()[j] == b'_')
+        {
+            j += 1;
+        }
+        out.insert(rest[pos..j].to_string());
+        rest = &rest[j..];
+    }
+}
+
 /// Does this instruction consume (read) the EFLAGS?
 ///
 /// Shared with `return_home`: a rewrite that replaces a flag-writing root
@@ -458,22 +477,40 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
         }
         let line = infos[i].trimmed(store.get(i));
         if line.starts_with(".long ") || line.starts_with(".quad ") {
-            // Extract every `.LBB...` label mentioned in the entry.
-            // The token is ".LBB" followed by the name characters; start scanning
-            // the name AFTER the ".LBB" prefix so `j` always advances past pos.
-            let mut rest = &line[..];
-            while let Some(pos) = rest.find(".LBB") {
-                let name_start = pos + ".LBB".len();
-                let mut j = name_start;
-                while j < rest.len()
-                    && (rest.as_bytes()[j].is_ascii_alphanumeric() || rest.as_bytes()[j] == b'_')
-                {
-                    j += 1;
-                }
-                let tok = rest[pos..j].to_string();
-                jump_table_targets.insert(tok);
-                rest = &rest[j..];
-            }
+            collect_lbb_tokens(line, &mut jump_table_targets);
+        }
+    }
+
+    // SOUNDNESS: a block label whose ADDRESS is taken is a DATA reference,
+    // not a control-flow edge. `&&label` (GNU computed goto) emits
+    // `leaq .LBBn(%rip), %reg`; jump tables emit `.quad .LBBn`; a
+    // static initializer can emit `.long .LBBn - .LBBm`. The pass can
+    // rewrite BRANCHES to a canonical block, but it cannot rewrite those
+    // symbol operands. Deleting the duplicate label therefore leaves an
+    // undefined local symbol -- the integrated assembler then fails with
+    // "`.LBBn` is referenced ... but has no symbol-table entry", or an
+    // external assembler silently binds it to absolute 0 and the computed
+    // goto jumps to address 0. Reproducer: gcc.c-torture/compile/pr84136.c
+    // and pr17913.c, whose `leaq .LBB2(%rip), %rdi` referenced a label the
+    // identical-block merge had removed. Protect every such label by
+    // excluding its block from merging entirely (canonical AND duplicate):
+    // computed-goto code is rare, so the foregone merge is free in practice.
+    let mut address_taken_labels: FxHashSet<String> = FxHashSet::default();
+    for i in 0..len {
+        if infos[i].is_nop() {
+            continue;
+        }
+        // A label DEFINITION or a branch TARGET is control flow: the pass
+        // already models those edges and may legitimately rewrite them.
+        if matches!(
+            infos[i].kind,
+            LineKind::Label | LineKind::Jmp | LineKind::CondJmp | LineKind::JmpIndirect
+        ) {
+            continue;
+        }
+        let line = infos[i].trimmed(store.get(i));
+        if line.contains(".LBB") {
+            collect_lbb_tokens(line, &mut address_taken_labels);
         }
     }
 
@@ -562,6 +599,7 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
             || !clean[canonical_idx]
             || !preds_clean[canonical_idx]
             || jump_table_targets.contains(&canonical_label)
+            || address_taken_labels.contains(&canonical_label)
         {
             continue;
         }
@@ -594,7 +632,9 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
             // SOUNDNESS: never merge/eliminate a jump-table target, a
             // flag-dependent block, a non-clean block, or one with a non-clean
             // predecessor.
-            if jump_table_targets.contains(other_label) {
+            if jump_table_targets.contains(other_label)
+                || address_taken_labels.contains(other_label)
+            {
                 continue;
             }
             if flag_dep[other_idx] || !clean[other_idx] || !preds_clean[other_idx] {
@@ -842,6 +882,38 @@ mod tests {
     /// return __x64_sys_ni_syscall(regs);` blocks are byte-identical; merging
     /// them (with only `.long` tables protected) left 98 dangling `.quad`
     /// entries and broke the vmlinux link.
+    /// GNU computed goto (`&&label`) makes a block label a DATA operand:
+    /// `leaq .LBB2(%rip), %rdi`. Two byte-identical `ret` blocks used to be
+    /// merged, deleting `.LBB2:` while the `leaq` still named it. The
+    /// integrated assembler then reported "`.LBB2` is referenced ... but has
+    /// no symbol-table entry" (gcc.c-torture/compile/pr84136.c, pr17913.c).
+    /// Both labels must survive with their blocks intact.
+    #[test]
+    fn computed_goto_label_addresses_are_not_merged() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    leaq .LBB2(%rip), %rdi\n",
+            "    movq %rdi, a(%rip)\n",
+            "    testq %rdi, %rdi\n",
+            "    je .LBB2\n",
+            ".LBB1:\n",
+            "    ret\n",
+            ".LBB2:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains(".LBB1:\n"), "canonical label vanished:\n{out}");
+        assert!(
+            out.contains(".LBB2:\n"),
+            "address-taken label was merged away:\n{out}"
+        );
+        assert!(
+            out.contains("leaq .LBB2(%rip)"),
+            "reference vanished:\n{out}"
+        );
+    }
+
     #[test]
     fn quad_jump_table_targets_are_not_merged() {
         let out = run(concat!(
