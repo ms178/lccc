@@ -36,6 +36,8 @@ static int fails;
 volatile char A[4] = { 'a', 'b', 'c', 0 };
 volatile char B[4] = { 'a', 'b', 'd', 0 };
 volatile char C[4] = { 'a', 'b', 'c', 0 };
+static const unsigned char K[4] = { 1, 2, 3, 4 };
+static const unsigned char L[4] = { 1, 2, 3, 4 };
 
 static void bar(void *p, int n) { (void)p; (void)n; }
 
@@ -55,6 +57,9 @@ int main(void)
     /* GCC 16.2 at -O2 and -O0: "1 0 -1" -- memcmp_eq is a BOOLEAN. */
     CHECK(__builtin_memcmp_eq((void *)A, (void *)B, 4) == 1);
     CHECK(__builtin_memcmp_eq((void *)A, (void *)C, 4) == 0);
+    /* The builtin's prototype is const void *, not void *. This must be
+       accepted under -Werror=discarded-qualifiers on both target widths. */
+    CHECK(__builtin_memcmp_eq(K, L, sizeof K) == 0);
     CHECK(__builtin_memcmp((void *)A, (void *)B, 4) != 0);
     CHECK(__builtin_bcmp((void *)A, (void *)C, 4) == 0);
     CHECK(__builtin_bcmp((void *)A, (void *)B, 4) != 0);
@@ -117,7 +122,7 @@ C
 run_target() {
     local label=$1 compiler=$2 mflag=$3
     echo "== $label =="
-    "$compiler" $mflag -O2 -c "$tmp/runtime.c" -o "$tmp/runtime.o"
+    "$compiler" $mflag -O2 -Werror=discarded-qualifiers -c "$tmp/runtime.c" -o "$tmp/runtime.o"
     "$GCC" $mflag "$tmp/runtime.o" -lm -o "$tmp/runtime"
     local out rc=0
     out=$("$tmp/runtime") || rc=$?
