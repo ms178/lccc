@@ -97,6 +97,29 @@ the allowed egress list), so it is absent rather than guessed.
    32-bit glibc headers). Verified to fail identically against the `main` binaries,
    so they are environment-limited (no i686 multilib sysroot here) and not a
    property of this patch.
+5. **Three unit tests failed in CI, all test-side (fixed in `c9cf579`).** The
+   3.9 GB sandbox cannot build the lib test target (rustc peaks at 3.7 GB), so
+   `cargo test` is not runnable here and CI was the first oracle for them.
+   `sext_self_form_kept_when_not_sext_wide` and
+   `a_short_srai_is_not_a_sext32_producer` asserted the literal text
+   `sext.w t0, t0`; the retarget legitimately rewrites that pair into the home it
+   is copied to (`sext.w t1, t0`, with the trailing `mv` deleted), so they now
+   assert that a `sext.w <dst>, t0` line survives — the idiom they mean, not a
+   register spelling (the same over-fitting as item 3). My own
+   `retarget_refuses_a_live_scratch` used `addw t0, t6, t6` as its "live read",
+   which only *writes* `t0`; the reader must name it in an operand slot
+   (`addw t6, t0, t0`) for the refusal to be the behaviour under test.
+6. **`CCC_NO_RV_ACCUMULATOR_RETARGET` tripped the census ratchet (re-baselined).**
+   `scripts/audit_census.py --check` counts distinct knob literals; the new kill
+   switch is now documented in `scripts/README.md` (so the undocumented count
+   stays at 262) and `knob_literals` is re-baselined 560 → 561 in the same commit
+   that adds it. `panic_sites`/`panic_sites_hot` were deliberately left at their
+   old baseline instead of being tightened opportunistically.
+
+**CI status:** run 41827411507 at `c9cf579` — 23/23 checks green, including
+`Authenticated Intel ICX 2026.2 integration`, both unit-test lanes, both
+clippy/MSRV lanes and every contract shard. This README edit is
+documentation-only; the numbers above were measured at `5117774`.
 
 ## Ranked backlog, with the measurement that motivates each item
 
