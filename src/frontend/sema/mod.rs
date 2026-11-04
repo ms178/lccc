@@ -5,6 +5,7 @@ pub(crate) mod gcc16_builtins;
 pub(crate) mod ice;
 mod init_cursor;
 pub(crate) mod intrinsic_arity;
+pub(crate) mod label_check;
 mod operand_constraints;
 pub(crate) mod static_init;
 pub(crate) mod stdbit;

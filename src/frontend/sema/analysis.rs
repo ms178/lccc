@@ -982,6 +982,13 @@ impl SemanticAnalyzer {
                 address_space: AddressSpace::Default,
             });
         }
+        // C23/GNU label namespace contract: every goto/&&label/asm-goto label
+        // must be defined exactly once in its function. One zero-copy AST walk
+        // before the body is analysed, so an undefined label can never reach
+        // lowering (where it used to become a dangling .LBBn or a duplicate
+        // BlockId and an internal error). Nested function bodies are covered
+        // by the same walk, with their own namespace.
+        crate::frontend::sema::label_check::check_function_labels(&self.diagnostics, func);
         // Analyze function body with explicit return-type context.
         let previous_return_type = self.current_return_type.replace(return_type.clone());
         self.analyze_compound_stmt(&func.body);
