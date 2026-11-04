@@ -295,8 +295,22 @@ cross_length_check() { # $1 = binary, $2 = target name
     local bin=$1 name=$2 after before labels label a b
     before="$tmp/$name-off.s"
     after="$tmp/$name-on.s"
-    CCC_NO_BIT_SELECT=1 "$bin" -O2 -S "$tmp/shapes.c" -o "$before"
-    "$bin" -O2 -S "$tmp/shapes.c" -o "$after"
+    # Hold the i686 select-cmov / load->copy relay peepholes constant (off) on
+    # both sides so this row measures the BIT-SELECT fold alone. Those passes
+    # improve the *unselected* shift/and fallback independently of bit
+    # selection: on btest32 the relay retargets the staging copies (`movl
+    # %ebx,%eax`, `movl %esi,%ecx`), the callee-saves then die and the frame
+    # shrinks, so the OFF build gets shorter than the `btl` ON build -- which
+    # has no copies to relay and keeps its callee-saved frame. That is the
+    # relay's win, not a bit-select pessimisation, and the relay has its own
+    # differential gate (check_i686_select_cmov.sh). The CCC_NO_I686_* switches
+    # are i686-only and ignored by the arm/riscv builds. (The btl ON build's
+    # callee-saved frame is a separate quality opportunity -- see the backend
+    # follow-up note on btl base memory-folding.)
+    CCC_NO_BIT_SELECT=1 CCC_NO_I686_SELECT_CMOV=1 CCC_NO_I686_LOAD_COPY_RELAY=1 \
+        "$bin" -O2 -S "$tmp/shapes.c" -o "$before"
+    CCC_NO_I686_SELECT_CMOV=1 CCC_NO_I686_LOAD_COPY_RELAY=1 \
+        "$bin" -O2 -S "$tmp/shapes.c" -o "$after"
     labels=$(grep -oE '^[a-z_][a-zA-Z0-9_]*:$' "$before" | tr -d ':')
     for label in $labels; do
         a=$(count "$after" "$label")
