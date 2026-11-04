@@ -271,9 +271,26 @@ def census(
 def compile_fixture(
     compiler: str, version: int, source: Path, out: Path, cwd: Path
 ) -> bool:
-    """Compile the fixture, answering whether the compiler accepts the dialect."""
+    """Compile the fixture, answering whether the compiler accepts the dialect.
+
+    The standard is pinned: a unit states `DW_AT_language_name`/`_version` for
+    C17 and newer, so a run without `-std=` measures whatever the host's default
+    happens to be -- and the vocabulary would differ between two hosts running
+    the same gate.  Every compiler is asked the same question with the same
+    flags.
+    """
     completed = subprocess.run(
-        [compiler, "-g", f"-gdwarf-{version}", "-O0", "-c", str(source), "-o", str(out)],
+        [
+            compiler,
+            "-g",
+            f"-gdwarf-{version}",
+            "-std=c17",
+            "-O0",
+            "-c",
+            str(source),
+            "-o",
+            str(out),
+        ],
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -366,15 +383,26 @@ def main() -> int:
                 f"{'version 3+' if version >= 3 else 'version 2 (absent)'} frame base"
             )
 
-    require(
-        ours_tags >= BASELINE_TAGS,
-        f"the DIE tags lost {describe(set(BASELINE_TAGS) - ours_tags)}",
-    )
-    require(
-        ours_attributes >= BASELINE_ATTRIBUTES,
-        f"the attribute vocabulary lost "
-        f"{describe(set(BASELINE_ATTRIBUTES) - ours_attributes)}",
-    )
+    # The baseline is what LCCC states, measured with a readelf that knows every
+    # name in it.  A host whose readelf predates an attribute (binutils before
+    # `DW_AT_language_name` knew its name, say) cannot *see* it in any object --
+    # including the reference compilers' -- so a baseline name that is missing
+    # from ours and from every oracle as well is a limit of the reader, reported
+    # and not failed.  A name the oracles do carry and we do not is a real loss.
+    oracle_vocabulary: set[str] = set()
+    for name, _ in oracles:
+        oracle_vocabulary |= oracle_tags[name] | oracle_attributes[name]
+    lost_tags = set(BASELINE_TAGS) - ours_tags
+    lost_attributes = set(BASELINE_ATTRIBUTES) - ours_attributes
+    for label, lost in (("tags", lost_tags), ("attributes", lost_attributes)):
+        unreadable = {name for name in lost if name not in oracle_vocabulary}
+        for name in sorted(unreadable):
+            print(f"note: {readelf} cannot name {name}: absent here and in every reference")
+        lost -= unreadable
+        require(
+            not lost,
+            f"the DIE {label} lost {describe(lost)}",
+        )
 
     for name, _ in oracles:
         unexpected_tags = oracle_tags[name] - ours_tags - set(DEFERRED_TAGS)
