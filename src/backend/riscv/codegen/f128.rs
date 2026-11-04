@@ -248,7 +248,7 @@ impl F128SoftFloat for RiscvCodegen {
         self.reg_assignments.contains_key(&val_id)
     }
 
-    fn f128_store_result_and_truncate(&mut self, dest: &Value) {
+    fn f128_publish_approximation(&mut self, dest: &Value) {
         // Store full f128 from arg1 (a0:a1) to dest slot
         if let Some(slot) = self.state.get_slot(dest.0) {
             self.emit_store_to_s0("a0", slot.0, "sd");

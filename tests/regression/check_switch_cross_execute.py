@@ -3,6 +3,9 @@
 
 Requires LCCC target drivers, Clang's integrated assembler, a GNU target linker or LLD (including Rust's bundled LLD), and QEMU user emulators. printf/puts are intentionally
 no-ops: every selected fixture checks its own result through main's exit code.
+The startup stub also supplies byte-loop memcpy/memset, which a freestanding
+compiler may call for aggregate copies and initializers (GCC, Clang and LCCC
+all do).
 No output comparison or target-performance claim is made by this smoke gate.
 
 Fixtures in LEVELS pin backend lowering, assembler and peephole contracts whose
@@ -53,7 +56,8 @@ LEVELS = {
 # `<name>_caller.c`, linked LCCC-with-LCCC and LCCC-with-Clang in both
 # directions.  A caller and a callee that merely agree with each other pass
 # the single-unit fixtures above while disagreeing with every other compiler.
-INTEROP = ("psabi_pair_interop", "psabi_float_interop", "psabi_hfa_interop", "psabi_wide_interop")
+INTEROP = ("psabi_pair_interop", "psabi_float_interop", "psabi_hfa_interop", "psabi_wide_interop",
+           "psabi_byref_interop")
 INTEROP_LEVELS = ("-O0", "-O2")
 CLANG_FREESTANDING = ("-O2", "-ffreestanding", "-fno-builtin", "-fno-pic", "-fno-pie",
                       "-fno-stack-protector", "-nostdlibinc")
@@ -81,6 +85,23 @@ printf:
 puts:
  mov w0, #0
  ret
+.globl memcpy
+memcpy:
+ mov x3, x0
+1: cbz x2, 2f
+ ldrb w4, [x1], #1
+ strb w4, [x3], #1
+ sub x2, x2, #1
+ b 1b
+2: ret
+.globl memset
+memset:
+ mov x3, x0
+1: cbz x2, 2f
+ strb w1, [x3], #1
+ sub x2, x2, #1
+ b 1b
+2: ret
 """,
     "riscv64": """.text
 .globl _start
@@ -97,6 +118,26 @@ printf:
 puts:
  li a0, 0
  ret
+.globl memcpy
+memcpy:
+ mv t0, a0
+1: beqz a2, 2f
+ lbu t1, 0(a1)
+ sb t1, 0(t0)
+ addi a1, a1, 1
+ addi t0, t0, 1
+ addi a2, a2, -1
+ j 1b
+2: ret
+.globl memset
+memset:
+ mv t0, a0
+1: beqz a2, 2f
+ sb a1, 0(t0)
+ addi t0, t0, 1
+ addi a2, a2, -1
+ j 1b
+2: ret
 """,
 }
 

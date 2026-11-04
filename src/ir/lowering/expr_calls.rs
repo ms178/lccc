@@ -1990,24 +1990,52 @@ impl Lowerer {
         Vec::new()
     }
 
-    fn copy_ms_record_arguments(
+    /// Pass each aggregate argument that the ABI passes by reference
+    /// (`aggregate_arg_by_reference`: AAPCS64 and RISC-V composites over 16
+    /// bytes, Microsoft x64 records not of size 1, 2, 4 or 8) as the address
+    /// of a fresh copy.  The callee owns that memory and may write to it --
+    /// GCC and Clang callees modify such parameters in place -- so handing
+    /// over the argument object itself let a foreign callee change the
+    /// caller's variable, and two arguments naming one object alias each
+    /// other.  The copy is aligned to at least 16 bytes and to the type's
+    /// own alignment, which the callee may rely on.
+    fn copy_by_reference_arguments(
         &mut self,
         arg_vals: &mut [Operand],
         struct_arg_sizes: &[Option<usize>],
+        struct_arg_aligns: &[Option<usize>],
+        struct_arg_fp_agg_classes: &[Option<crate::common::types::FpAggClass>],
+        calling_convention: crate::common::types::CallingConvention,
     ) {
         for (index, size) in struct_arg_sizes.iter().enumerate() {
-            if let Some(size) = *size {
-                if !matches!(size, 1 | 2 | 4 | 8) {
-                    let copy = self.emit_entry_alloca(IrType::Ptr, size.max(1), 16, false);
-                    let source = self.operand_to_value(arg_vals[index].clone());
-                    self.emit(Instruction::Memcpy {
-                        dest: copy,
-                        src: source,
-                        size,
-                    });
-                    arg_vals[index] = Operand::Value(copy);
-                }
+            let Some(size) = *size else {
+                continue;
+            };
+            let fp_agg_class = struct_arg_fp_agg_classes
+                .get(index)
+                .and_then(Option::as_ref);
+            if !crate::backend::call_abi::aggregate_arg_by_reference(
+                self.target,
+                calling_convention,
+                size,
+                fp_agg_class,
+            ) {
+                continue;
             }
+            let align = struct_arg_aligns
+                .get(index)
+                .copied()
+                .flatten()
+                .unwrap_or(1)
+                .max(16);
+            let copy = self.emit_entry_alloca(IrType::Ptr, size.max(1), align, false);
+            let source = self.operand_to_value(arg_vals[index].clone());
+            self.emit(Instruction::Memcpy {
+                dest: copy,
+                src: source,
+                size,
+            });
+            arg_vals[index] = Operand::Value(copy);
         }
     }
 
@@ -2042,9 +2070,13 @@ impl Lowerer {
         let calling_convention = self.callee_calling_convention(func);
         let typed_fastcall =
             calling_convention == crate::common::types::CallingConvention::I686Fastcall;
-        if calling_convention == crate::common::types::CallingConvention::MicrosoftX64 {
-            self.copy_ms_record_arguments(&mut arg_vals, &struct_arg_sizes);
-        }
+        self.copy_by_reference_arguments(
+            &mut arg_vals,
+            &struct_arg_sizes,
+            &struct_arg_aligns,
+            &struct_arg_fp_agg_classes,
+            calling_convention,
+        );
         let indirect_ret_ty = self.indirect_call_return_type(func, ret_abi);
 
         match func {

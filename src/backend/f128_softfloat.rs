@@ -206,11 +206,32 @@ pub trait F128SoftFloat {
     /// can only hold its f64 approximation).
     fn f128_has_reg(&self, val_id: u32) -> bool;
 
-    /// Store arg1 (f128 result) to dest slot and produce f64 approximation.
-    /// This is the common epilogue for cast/binop results: store full f128 to
-    /// dest slot, track self, call __trunctfdf2, update cache. Does NOT store
-    /// f64 back to the slot (that would overwrite the full-precision f128).
-    fn f128_store_result_and_truncate(&mut self, dest: &Value);
+    /// Publish the binary128 value in arg1 (a libcall's result, a sign
+    /// flip) as `dest`, the common epilogue of every F128-producing
+    /// operation: the 16 bytes go to dest's own slot, which `track_f128_self`
+    /// makes the source every F128 consumer reads (`f128_operand_to_arg1`).
+    /// No f64 approximation is computed for such a destination -- it cost a
+    /// `__trunctfdf2` call per add, multiply, conversion or negation, and
+    /// tracked values never read it (as with loads, `f128_publish_load`).  A
+    /// destination without a slot, or with a register, gets the
+    /// approximation, the only form its consumers can read.
+    fn f128_publish_result(&mut self, dest: &Value) {
+        match self.f128_get_slot(dest.0) {
+            Some(slot) if !self.f128_has_reg(dest.0) => {
+                self.f128_store_arg1_to_slot(slot);
+                self.f128_track_self(dest.0);
+                self.state().reg_cache.invalidate_all();
+            }
+            _ => self.f128_publish_approximation(dest),
+        }
+    }
+
+    /// [`Self::f128_publish_result`] for a destination without a slot (or
+    /// with a register): store the full value to the slot if there is one,
+    /// then compute the f64 approximation (`__trunctfdf2`) into the
+    /// accumulator and the register, and arm the cache.  Never stores the
+    /// f64 to the slot (that would overwrite the full-precision value).
+    fn f128_publish_approximation(&mut self, dest: &Value);
 
     /// Load the accumulator value and move it to the first integer argument register.
     /// (ARM: already in x0; RISC-V: `mv a0, t0`)
@@ -408,22 +429,14 @@ pub fn f128_store_to_addr_reg<T: F128SoftFloat + ?Sized>(cg: &mut T, val: &Opera
 ///
 /// 1. Load full f128 into arg1.
 /// 2. XOR the sign bit (bit 127).
-/// 3. Store full f128 result to dest slot.
-/// 4. Convert to f64 approximation for register-based data flow.
+/// 3. Publish the result (`f128_publish_result`).
 pub fn f128_neg<T: F128SoftFloat + ?Sized>(cg: &mut T, dest: &Value, src: &Operand) {
     // Step 1: Load full-precision f128 into arg1.
     f128_operand_to_arg1(cg, src);
     // Step 2: Flip the sign bit.
     cg.f128_flip_sign_bit();
-    // Step 3: Store full f128 result to dest slot.
-    if let Some(dest_slot) = cg.f128_get_slot(dest.0) {
-        cg.f128_store_arg1_to_slot(dest_slot);
-        cg.f128_track_self(dest.0);
-    }
-    // Step 4: Convert to f64 approximation in accumulator.
-    cg.f128_truncate_result_to_acc();
-    cg.state().reg_cache.invalidate_all();
-    cg.f128_set_acc_cache(dest.0);
+    // Step 3: Publish the full-precision result.
+    cg.f128_publish_result(dest);
 }
 
 /// F128 comparison via soft-float libcalls with full precision.
@@ -669,7 +682,7 @@ pub fn f128_emit_cast<T: F128SoftFloat + ?Sized>(
             cg.f128_call("__floatunditf");
         }
         cg.state().reg_cache.invalidate_all();
-        cg.f128_store_result_and_truncate(dest);
+        cg.f128_publish_result(dest);
         return true;
     }
 
@@ -695,7 +708,7 @@ pub fn f128_emit_cast<T: F128SoftFloat + ?Sized>(
         cg.f128_load_operand_to_acc(src);
         cg.f128_extend_float_to_f128(from_ty);
         cg.state().reg_cache.invalidate_all();
-        cg.f128_store_result_and_truncate(dest);
+        cg.f128_publish_result(dest);
         return true;
     }
 
@@ -723,7 +736,7 @@ pub fn f128_emit_cast<T: F128SoftFloat + ?Sized>(
 /// 4. Reload LHS from temp into arg1.
 /// 5. Call arithmetic libcall.
 /// 6. Free temp.
-/// 7. Store full f128 result to dest slot, produce f64 approximation.
+/// 7. Publish the full f128 result as dest (`f128_publish_result`).
 pub fn f128_emit_binop<T: F128SoftFloat + ?Sized>(
     cg: &mut T,
     dest: &Value,
@@ -762,6 +775,6 @@ pub fn f128_emit_binop<T: F128SoftFloat + ?Sized>(
     // Step 6: Call the arithmetic libcall.
     cg.f128_call(libcall);
 
-    // Step 7: Store full f128 result and produce f64 approximation.
-    cg.f128_store_result_and_truncate(dest);
+    // Step 7: Publish the full-precision result.
+    cg.f128_publish_result(dest);
 }

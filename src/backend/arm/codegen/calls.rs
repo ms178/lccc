@@ -369,8 +369,10 @@ impl ArmCodegen {
         // code: q1 is caller-clobbered by the call (it held the second
         // argument, not the result), so it truncated garbage, and x0 was
         // overwritten before any consumer could read the "approximation".
-        // One libcall + two memory round-trips saved per f128 call.
+        // One libcall + two memory round-trips saved per f128 call.  x0
+        // holds whatever the callee left there, so the accumulator cache
+        // must not claim it holds `dest`: every consumer reads the 16-byte
+        // home.
         self.state.reg_cache.invalidate_all();
-        self.state.reg_cache.set_acc(dest.0, false);
     }
 }

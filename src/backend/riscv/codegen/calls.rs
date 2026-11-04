@@ -797,18 +797,10 @@ impl RiscvCodegen {
                 self.emit_store_to_s0("a1", slot.0 + 8, "sd");
             }
         } else if return_type.is_long_double() {
-            if let Some(slot) = self.state.get_slot(dest.0) {
-                self.emit_store_to_s0("a0", slot.0, "sd");
-                self.emit_store_to_s0("a1", slot.0 + 8, "sd");
-            }
-            self.state.emit("    call __trunctfdf2");
-            self.state.emit("    fmv.x.d t0, fa0");
-            self.state.reg_cache.invalidate_all();
-            self.state.track_f128_self(dest.0);
-            if let Some(&reg) = self.reg_assignments.get(&dest.0) {
-                let reg_name = callee_saved_name(reg);
-                self.state.emit_fmt(format_args!("    mv {}, t0", reg_name));
-            }
+            // binary128 comes back in a0:a1, the soft-float arg1 pair: the
+            // value is published like any F128 libcall result -- into its
+            // slot, with no `__trunctfdf2` approximation beside it.
+            crate::backend::f128_softfloat::F128SoftFloat::f128_publish_result(self, dest);
         } else if return_type == IrType::F32 {
             if let Some(slot) = self.state.get_slot(dest.0) {
                 self.state.emit("    fmv.x.w t0, fa0");

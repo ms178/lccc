@@ -448,6 +448,42 @@ pub fn fp_agg_return_buffer_bytes(class: crate::common::types::FpAggClass) -> us
         .map_or(16, |(member_size, count)| member_size * count)
 }
 
+/// Whether an aggregate argument of `size` bytes is passed as the address of
+/// a copy that the CALLER makes and the callee owns -- and may modify in
+/// place, as GCC and Clang callees do:
+///
+/// - AAPCS64 (B.4): a composite larger than 16 bytes, unless it is an HFA or
+///   HVA, which is never passed by reference (B.2): it goes to the stack
+///   whole once the SIMD registers run out.
+/// - RISC-V: larger than 2 × XLEN.  A named record that flattens to FP
+///   registers travels in them at any size while enough remain (GCC
+///   `riscv_pass_by_reference`), and by reference once they are exhausted;
+///   only the backend's register walk knows which, so such a record is
+///   copied either way -- an exotic shape (it needs an over-aligned member)
+///   for which the copy is merely redundant when registers carry it.
+/// - Microsoft x64: any size other than 1, 2, 4 or 8 bytes.
+///
+/// SysV x86-64 and i386 pass every aggregate by value: the call sequence
+/// itself copies a MEMORY-class record into the argument area.
+pub fn aggregate_arg_by_reference(
+    target: super::Target,
+    convention: crate::common::types::CallingConvention,
+    size: usize,
+    fp_agg_class: Option<&crate::common::types::FpAggClass>,
+) -> bool {
+    use crate::common::types::{CallingConvention, FpAggClass};
+    if convention == CallingConvention::MicrosoftX64 {
+        return !matches!(size, 1 | 2 | 4 | 8);
+    }
+    match target {
+        super::Target::Aarch64 => {
+            size > 16 && !matches!(fp_agg_class, Some(FpAggClass::Hfa { .. }))
+        }
+        super::Target::Riscv64 => size > 16,
+        super::Target::X86_64 | super::Target::I686 => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ABI configuration and SysV struct classification (unchanged)
 // ---------------------------------------------------------------------------
@@ -2656,6 +2692,76 @@ mod tests {
         full.extend((0..9).map(|_| double_arg()));
         let rv = classify_args_core(&full, full.len(), false, &CallAbiConfig::riscv_lp64d());
         assert!(matches!(rv.classes[16], CoreArgClass::Stack));
+    }
+
+    /// `aggregate_arg_by_reference` -- which decides where lowering makes
+    /// the caller's copy -- agrees with the register walk on every target:
+    /// AAPCS64 and RISC-V records over 16 bytes travel by reference, an HFA
+    /// never does (not even on the stack, after v0-v7 are taken), and SysV
+    /// x86-64 copies MEMORY records into the argument area instead.
+    #[test]
+    fn by_reference_predicate_matches_the_register_walk() {
+        use super::super::Target;
+        use crate::common::types::{CallingConvention, FpAggClass};
+        let record = |size: usize, fp_agg_class: Option<FpAggClass>| ArgInfo {
+            struct_size: Some(size),
+            struct_align: Some(8),
+            fp_agg_class,
+            ..scalar(&[])
+        };
+        let by_ref = |class: &CoreArgClass| {
+            matches!(
+                class,
+                CoreArgClass::LargeStructByRefReg { .. }
+                    | CoreArgClass::LargeStructByRefStack { .. }
+            )
+        };
+        let hfa = FpAggClass::Hfa {
+            member_size: 8,
+            count: 4,
+        };
+        for (target, config) in [
+            (Target::Aarch64, CallAbiConfig::aapcs64()),
+            (Target::Riscv64, CallAbiConfig::riscv_lp64d()),
+            (Target::X86_64, sysv_x86_64()),
+        ] {
+            for size in [8, 16, 24, 40, 4096] {
+                let core = classify_args_core(&[record(size, None)], 1, false, &config);
+                assert_eq!(
+                    by_ref(&core.classes[0]),
+                    aggregate_arg_by_reference(target, CallingConvention::Default, size, None),
+                    "{target:?}, {size}-byte record"
+                );
+            }
+        }
+        // An HFA of four doubles, in v0-v3 or (after eight doubles) on the
+        // stack, is never a reference.
+        let config = CallAbiConfig::aapcs64();
+        let mut args: Vec<ArgInfo<'_>> = vec![record(32, Some(hfa))];
+        let core = classify_args_core(&args, 1, false, &config);
+        assert!(matches!(core.classes[0], CoreArgClass::StructHfaReg { .. }));
+        args = (0..8).map(|_| double_arg()).collect();
+        args.push(record(32, Some(hfa)));
+        let core = classify_args_core(&args, args.len(), false, &config);
+        assert!(!by_ref(&core.classes[8]));
+        assert!(!aggregate_arg_by_reference(
+            Target::Aarch64,
+            CallingConvention::Default,
+            32,
+            Some(&hfa)
+        ));
+        // Microsoft x64: every size but 1, 2, 4 and 8.
+        for size in [1usize, 2, 3, 4, 8, 12, 16, 32] {
+            assert_eq!(
+                aggregate_arg_by_reference(
+                    Target::X86_64,
+                    CallingConvention::MicrosoftX64,
+                    size,
+                    None
+                ),
+                !matches!(size, 1 | 2 | 4 | 8)
+            );
+        }
     }
 
     /// AAPCS64 C.8 rounds the NGRN for every argument of natural alignment

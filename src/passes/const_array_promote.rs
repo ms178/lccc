@@ -40,7 +40,13 @@
 //!    dominates every block containing an address use — a conditionally
 //!    initialized array is not a constant. (A store whose value is only
 //!    conditionally *computed* is fine: SCCP has already folded it, or the
-//!    value is not a `Const` and the candidate dies on that store.)
+//!    value is not a `Const` and the candidate dies on that store.) Inside
+//!    that block every read must follow the last initialization store: an
+//!    earlier read sees the object's previous contents, which for a
+//!    by-value parameter's home are the argument -- stored by the
+//!    prologue, invisible in the IR. `long f(struct S s) { long h =
+//!    hash(&s); s = (struct S){-1, ...}; return h + hash(&s); }` once read
+//!    the constant image in both hashes.
 //! 3. **Read-only address discipline, by provenance.** The address may
 //!    reach a `Load` pointer or a direct-call argument through ANY chain
 //!    of address dataflow — constant- or variable-offset GEPs, pointer
@@ -581,7 +587,11 @@ fn audit_candidates(
 
     // ---- per-candidate audit ----------------------------------------------
     let mut stores: FxHashMap<u32, Vec<ByteStore>> = FxHashMap::default();
-    let mut store_blocks: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
+    // `(block, instruction index)` of every initialization store and of
+    // every read (load or read-only call argument): the dominance gate
+    // orders the reads of the store block after its last store.
+    let mut store_sites: FxHashMap<u32, Vec<(usize, usize)>> = FxHashMap::default();
+    let mut read_sites: FxHashMap<u32, Vec<(usize, usize)>> = FxHashMap::default();
     let mut use_blocks: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
     // Candidates that survive with at least one real READ (a load, or an
     // argument to a proven read-only callee). Initialization GEPs do NOT
@@ -592,7 +602,7 @@ fn audit_candidates(
     let mut bad: FxHashSet<u32> = FxHashSet::default();
 
     for (bi, block) in func.blocks.iter().enumerate() {
-        for inst in &block.instructions {
+        for (ii, inst) in block.instructions.iter().enumerate() {
             // Classification. Every arm FALLS THROUGH to the catch-all
             // below — an early `continue` here is exactly how the escape
             // store (`keep = a`, whose pointer targets a global) skipped
@@ -625,7 +635,7 @@ fn audit_candidates(
                                                 width,
                                                 value: c.clone(),
                                             });
-                                            store_blocks.entry(a).or_default().push(bi);
+                                            store_sites.entry(a).or_default().push((bi, ii));
                                         }
                                         // A constant value stored through a
                                         // pointer whose offset is not
@@ -659,6 +669,7 @@ fn audit_candidates(
                                 bad.insert(a);
                             } else {
                                 use_blocks.entry(a).or_default().push(bi);
+                                read_sites.entry(a).or_default().push((bi, ii));
                                 read_uses.insert(a);
                             }
                         }
@@ -680,6 +691,7 @@ fn audit_candidates(
                                         bad.insert(a);
                                     } else {
                                         use_blocks.entry(a).or_default().push(bi);
+                                        read_sites.entry(a).or_default().push((bi, ii));
                                         read_uses.insert(a);
                                     }
                                 }
@@ -833,14 +845,24 @@ fn audit_candidates(
         if !tiled || covered.iter().any(|c| !*c) {
             continue;
         }
-        // Dominance: all stores in one block that dominates every use block.
-        let mut site_blocks = store_blocks.get(&a).cloned().unwrap_or_default();
-        site_blocks.sort_unstable();
-        site_blocks.dedup();
-        if site_blocks.len() != 1 {
+        // Dominance: all stores in one block that dominates every use block,
+        // and no read of that block ahead of its last store.
+        let sites = store_sites.get(&a).map(Vec::as_slice).unwrap_or_default();
+        let Some(&(store_block, _)) = sites.first() else {
+            continue;
+        };
+        if sites.iter().any(|&(b, _)| b != store_block) {
             continue;
         }
-        let store_block = site_blocks[0];
+        let last_store = sites.iter().map(|&(_, i)| i).max().unwrap_or(0);
+        let read_before_init = read_sites.get(&a).is_some_and(|reads| {
+            reads
+                .iter()
+                .any(|&(b, i)| b == store_block && i < last_store)
+        });
+        if read_before_init {
+            continue;
+        }
         let dom = dom.get_or_insert_with(|| dominators(func));
         let mut dominated = true;
         for &ub in use_blocks.get(&a).cloned().unwrap_or_default().as_slice() {
@@ -1582,6 +1604,72 @@ mod tests {
         let n = run(&mut m);
         assert_eq!(n, 0, "write-only object stays an alloca");
         assert!(m.globals.is_empty(), "no .rodata materialized");
+    }
+
+    /// An array whose constant tiling fully overwrites it, read both
+    /// before and after: `[load a][store 0..16][load a]`.
+    fn overwritten_after_read(read_first: bool) -> IrFunction {
+        let mut f = IrFunction::new("overwrite".to_string(), IrType::I64, vec![], false);
+        let load = |dest: u32| Instruction::Load {
+            dest: Value(dest),
+            ptr: Value(1),
+            ty: IrType::I64,
+            volatile: false,
+            seg_override: crate::common::types::AddressSpace::Default,
+        };
+        let mut insts = vec![Instruction::Alloca {
+            dest: Value(1),
+            size: 16,
+            align: 8,
+            ty: IrType::U8,
+            volatile: false,
+            semantic_volatile: false,
+        }];
+        if read_first {
+            insts.push(load(2));
+        }
+        for i in 0..2u32 {
+            insts.push(Instruction::GetElementPtr {
+                dest: Value(10 + i),
+                base: Value(1),
+                offset: Operand::Const(IrConst::I64(i64::from(i) * 8)),
+                ty: IrType::U8,
+            });
+            insts.push(Instruction::Store {
+                val: Operand::Const(IrConst::I64(-1)),
+                ptr: Value(10 + i),
+                ty: IrType::I64,
+                volatile: false,
+                seg_override: crate::common::types::AddressSpace::Default,
+            });
+        }
+        insts.push(load(3));
+        f.blocks = vec![block(
+            0,
+            insts,
+            Terminator::Return(Some(Operand::Value(Value(3)))),
+        )];
+        f.next_value_id = 12;
+        f
+    }
+
+    /// A read ahead of the initialization in the store block sees the
+    /// object's previous contents -- for a by-value parameter's home, the
+    /// argument the prologue stored, which no IR store shows.  It must keep
+    /// the alloca; the same object read only after its tiling promotes.
+    #[test]
+    fn read_before_initialization_rejects() {
+        let mut m = mk_module(vec![overwritten_after_read(true)], vec![]);
+        assert_eq!(
+            run(&mut m),
+            0,
+            "a read before the tiling must not see the image"
+        );
+        assert!(m.globals.is_empty());
+
+        let mut m = mk_module(vec![overwritten_after_read(false)], vec![]);
+        assert_eq!(run(&mut m), 1, "reads after the tiling are constant loads");
+        assert_verified(&m, "constarr read-after-init control");
     }
 
     /// Sparse pre-existing `.LCA_` names cannot collide with generated ones:

@@ -573,24 +573,10 @@ impl RiscvCodegen {
         // For variadic: register save area occupies s0+0..s0+56, stack params at s0+64+.
         let stack_base: i64 = if func.is_variadic { 64 } else { 0 };
 
-        // Check if any F128 params exist (need to save all regs before __trunctfdf2).
-        let has_f128_reg_params = param_classes
-            .iter()
-            .any(|c| matches!(c, ParamClass::F128GpPair { .. }));
-        let f128_save_offset: i64 = if has_f128_reg_params && !func.is_variadic {
-            self.state.emit("    addi sp, sp, -128");
-            for i in 0..8usize {
-                self.state
-                    .emit_fmt(format_args!("    sd {}, {}(sp)", RISCV_ARG_REGS[i], i * 8));
-            }
-            for i in 0..8usize {
-                self.state
-                    .emit_fmt(format_args!("    fsd fa{}, {}(sp)", i, 64 + i * 8));
-            }
-            0i64
-        } else {
-            0
-        };
+        // Nothing below calls a function or writes an argument register, so
+        // every parameter is read straight from its register.  (A long
+        // double parameter once paid a __trunctfdf2 call here, behind a
+        // 128-byte save area of all sixteen argument registers.)
 
         for (i, _param) in func.params.iter().enumerate() {
             let class = param_classes[i];
@@ -627,13 +613,7 @@ impl RiscvCodegen {
                     // 64 bits and store with sd so the entire 8-byte slot is
                     // valid for subsequent ld loads (e.g. from Copy values
                     // sharing the slot via slot coalescing).
-                    if has_f128_reg_params && !func.is_variadic {
-                        let off = f128_save_offset + (reg_idx as i64) * 8;
-                        let load_instr = Self::load_for_type(ty);
-                        self.state
-                            .emit_fmt(format_args!("    {} t0, {}(sp)", load_instr, off));
-                        self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
-                    } else if func.is_variadic {
+                    if func.is_variadic {
                         // For variadic, load from save area with extending load.
                         let save_off = (reg_idx as i64) * 8;
                         let load_instr = Self::load_for_type(ty);
@@ -645,25 +625,7 @@ impl RiscvCodegen {
                     }
                 }
                 ParamClass::FloatReg { reg_idx } => {
-                    if has_f128_reg_params && !func.is_variadic {
-                        // FP regs were saved to stack; load from save area.
-                        let fp_off = f128_save_offset + 64 + (reg_idx as i64) * 8;
-                        if ty == IrType::U16 {
-                            self.state
-                                .emit_fmt(format_args!("    flw ft0, {}(sp)", fp_off));
-                            self.state.emit("    fmv.x.w t0, ft0");
-                            self.state.emit("    slli t0, t0, 48");
-                            self.state.emit("    srli t0, t0, 48");
-                        } else if ty == IrType::F32 {
-                            self.state
-                                .emit_fmt(format_args!("    flw ft0, {}(sp)", fp_off));
-                            self.state.emit("    fmv.x.w t0, ft0");
-                        } else {
-                            self.state
-                                .emit_fmt(format_args!("    fld ft0, {}(sp)", fp_off));
-                            self.state.emit("    fmv.x.d t0, ft0");
-                        }
-                    } else if ty == IrType::U16 {
+                    if ty == IrType::U16 {
                         self.state
                             .emit_fmt(format_args!("    fmv.x.w t0, {}", float_arg_regs[reg_idx]));
                         self.state.emit("    slli t0, t0, 48");
@@ -685,15 +647,6 @@ impl RiscvCodegen {
                         self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
                         self.emit_load_from_s0("t0", hi_off, "ld");
                         self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 8);
-                    } else if has_f128_reg_params {
-                        let lo_off = f128_save_offset + (base_reg_idx as i64) * 8;
-                        let hi_off = f128_save_offset + ((base_reg_idx + 1) as i64) * 8;
-                        self.state
-                            .emit_fmt(format_args!("    ld t0, {}(sp)", lo_off));
-                        self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
-                        self.state
-                            .emit_fmt(format_args!("    ld t0, {}(sp)", hi_off));
-                        self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 8);
                     } else {
                         self.emit_param_home_store_impl(
                             over_aligned,
@@ -712,18 +665,7 @@ impl RiscvCodegen {
                     }
                 }
                 ParamClass::StructByValReg { base_reg_idx, size } => {
-                    if has_f128_reg_params && !func.is_variadic {
-                        let lo_off = f128_save_offset + (base_reg_idx as i64) * 8;
-                        self.state
-                            .emit_fmt(format_args!("    ld t0, {}(sp)", lo_off));
-                        self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
-                        if size > 8 {
-                            let hi_off = f128_save_offset + ((base_reg_idx + 1) as i64) * 8;
-                            self.state
-                                .emit_fmt(format_args!("    ld t0, {}(sp)", hi_off));
-                            self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 8);
-                        }
-                    } else if func.is_variadic {
+                    if func.is_variadic {
                         let lo_off = (base_reg_idx as i64) * 8;
                         self.emit_load_from_s0("t0", lo_off, "ld");
                         self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
@@ -741,10 +683,12 @@ impl RiscvCodegen {
                             0,
                         );
                         if size > 8 {
-                            self.emit_store_to_s0(
-                                RISCV_ARG_REGS[base_reg_idx + 1],
-                                slot.0 + 8,
+                            self.emit_param_home_store_impl(
+                                over_aligned,
                                 "sd",
+                                RISCV_ARG_REGS[base_reg_idx + 1],
+                                slot,
+                                8,
                             );
                         }
                     }
@@ -763,15 +707,20 @@ impl RiscvCodegen {
                         self.emit_load_from_s0("t0", hi_off, "ld");
                         self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 8);
                     } else {
-                        // Load from F128 save area.
-                        let lo_off = f128_save_offset + (lo_reg_idx as i64) * 8;
-                        let hi_off = f128_save_offset + (hi_reg_idx as i64) * 8;
-                        self.state
-                            .emit_fmt(format_args!("    ld t0, {}(sp)", lo_off));
-                        self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
-                        self.state
-                            .emit_fmt(format_args!("    ld t0, {}(sp)", hi_off));
-                        self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 8);
+                        self.emit_param_home_store_impl(
+                            over_aligned,
+                            "sd",
+                            RISCV_ARG_REGS[lo_reg_idx],
+                            slot,
+                            0,
+                        );
+                        self.emit_param_home_store_impl(
+                            over_aligned,
+                            "sd",
+                            RISCV_ARG_REGS[hi_reg_idx],
+                            slot,
+                            8,
+                        );
                     }
                 }
                 ParamClass::F128Stack { offset } | ParamClass::F128AlwaysStack { offset } => {
@@ -816,11 +765,7 @@ impl RiscvCodegen {
                 ParamClass::LargeStructByRefReg { reg_idx, size } => {
                     // RISC-V LP64: register holds a pointer to the struct data.
                     // Copy size bytes from the pointer into the local alloca.
-                    let src_reg = if has_f128_reg_params && !func.is_variadic {
-                        let off = f128_save_offset + (reg_idx as i64) * 8;
-                        self.state.emit_fmt(format_args!("    ld t0, {}(sp)", off));
-                        "t0"
-                    } else if func.is_variadic {
+                    let src_reg = if func.is_variadic {
                         let off = (reg_idx as i64) * 8;
                         self.emit_load_from_s0("t0", off, "ld");
                         "t0"
@@ -862,10 +807,6 @@ impl RiscvCodegen {
                         // Variadic: load first half from register save area
                         let off = (reg_idx as i64) * 8;
                         self.emit_load_from_s0("t0", off, "ld");
-                        self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
-                    } else if has_f128_reg_params {
-                        let off = f128_save_offset + (reg_idx as i64) * 8;
-                        self.state.emit_fmt(format_args!("    ld t0, {}(sp)", off));
                         self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
                     } else {
                         self.emit_param_home_store_impl(
@@ -1012,11 +953,6 @@ impl RiscvCodegen {
                     );
                 }
             }
-        }
-
-        // Clean up the F128 save area.
-        if has_f128_reg_params && !func.is_variadic {
-            self.state.emit("    addi sp, sp, 128");
         }
     }
 
