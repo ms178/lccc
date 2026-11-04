@@ -80,6 +80,14 @@ RUST_VERSION = "1.99.1"
 GCC_BLOB = "0612f4c9bb3e5cfdf0d5326529caa183132b71a4"
 GCC_SHA256 = "4fa6af4f6b29991e31631af18d83964a69caa9daf3f78546d4dc30f39880cd8a"
 DEBS_BLOB = "06185dd859247494e5c489656e0488a7f3edaf70"
+# harness-cache-7 MANIFEST.sha256: the debs bundle was previously the ONLY
+# payload fetched without a content pin. A tampered/corrupt bundle of the
+# right byte size would have been unpacked and `dpkg --unpack`ed.
+DEBS_SHA256 = "24a4be08d5c6a28aed78f424ebdc9596f85cc2e8ebd0ba230f99a2bf9cdfb20d"
+CLANG_BLOB = "83ddbd38300d497e362bf873c7291e3e24cb63aa"
+CLANG_SHA256 = "373e20c398712e21bbfdbb401176f5057b0adc6ae28816cd11da049fc111ecf0"
+CLANG_SIZE = 67_322_400
+CLANG_VERSION = "23.1.4"
 GCC_REPO = "ms178/lccc"
 GCC_TAG = "harness-cache-1"
 
@@ -127,9 +135,54 @@ def run(argv: list[str], **kwargs) -> str:
                                    timeout=kwargs.pop("timeout", 600), **kwargs).strip()
 
 
+def safe_extract(source: tarfile.TarFile, destination: Path) -> None:
+    """Extract a pinned archive with Py3.12's data_filter where available.
+
+    The three bundles this script installs are our OWN pinned payloads, but
+    "trusted" is not a reason to accept a traversal, an absolute symlink or a
+    device node. Python 3.11 (the Arena host) has no tarfile.data_filter, so
+    the same invariants are enforced explicitly here; on 3.12+ the stdlib
+    filter is applied as a second, independent layer. Symlink targets are
+    resolved relative to the LINK's directory, hardlink targets relative to
+    the archive root, matching tar semantics.
+    """
+    dest = destination.resolve()
+    for member in source.getmembers():
+        name = Path(member.name)
+        if name.is_absolute() or ".." in name.parts:
+            raise RuntimeError(f"unsafe archive member: {member.name}")
+        if member.issym() or member.islnk():
+            if Path(member.linkname).is_absolute():
+                raise RuntimeError(f"absolute link target: {member.name}")
+            base = dest / name.parent if member.issym() else dest
+            target = (base / member.linkname).resolve()
+            if not target.is_relative_to(dest):
+                raise RuntimeError(f"escaping link target: {member.name}")
+        elif not (member.isfile() or member.isdir()):
+            raise RuntimeError(f"unsupported archive member type: {member.name}")
+    if hasattr(tarfile, "data_filter"):
+        source.extractall(destination, filter="data")
+    else:
+        source.extractall(destination)
+
+
+def marker_ok(marker: Path, expected: str, probes: tuple[Path, ...]) -> bool:
+    """A `.verified` stamp is only as good as the files it claims to cover.
+
+    A harness wipe can leave a directory with a stamp but no binaries (or a
+    stamp from a different bundle version). Reusing it silently produced a
+    "provisioned" toolchain whose compiler could not start.
+    """
+    return (marker.is_file()
+            and marker.read_text(encoding="utf-8").strip() == expected
+            and all(probe.is_file() for probe in probes))
+
+
 def install_rust(prefix: Path) -> Path:
     root = prefix / f"rust-{RUST_VERSION}"
-    if (root / ".verified").exists():
+    if marker_ok(root / ".verified", RUST_SHA256,
+                 tuple(root / "bin" / tool for tool in
+                       ("rustc", "cargo", "rustfmt", "cargo-clippy"))):
         return root
     downloads = prefix / "dl"
     downloads.mkdir(parents=True, exist_ok=True)
@@ -150,14 +203,7 @@ def install_rust(prefix: Path) -> Path:
         os.replace(tmp, archive)
     with tempfile.TemporaryDirectory(prefix="lccc-rust-", dir=prefix) as td:
         with tarfile.open(archive, "r:xz") as source:
-            # data_filter (3.12+) refuses traversal/absolute links; on 3.11 the
-            # archive is our own pinned content, but reject unsafe members
-            # explicitly rather than relying on the default extract behaviour.
-            for member in source.getmembers():
-                if member.name.startswith("/") or ".." in Path(member.name).parts \
-                        or (member.issym() and member.linkname.startswith("/")):
-                    raise RuntimeError(f"unsafe archive member: {member.name}")
-            source.extractall(td)
+            safe_extract(source, Path(td))
         unpacked = Path(td) / f"rust-{RUST_VERSION}-x86_64-unknown-linux-gnu"
         if not (unpacked / "install.sh").is_file():
             raise RuntimeError("Rust archive lacks install.sh")
@@ -179,8 +225,9 @@ def install_rust(prefix: Path) -> Path:
 def install_gcc(prefix: Path) -> Path:
     root = prefix / "gcc-16.2"
     marker = root / ".verified"
-    if marker.exists():
-        return root / "gcc-16/bin/gcc-16"
+    gcc = root / "gcc-16/bin/gcc-16"
+    if marker_ok(marker, GCC_SHA256, (gcc,)):
+        return gcc
     downloads = prefix / "dl"
     downloads.mkdir(parents=True, exist_ok=True)
     archive = downloads / "gcc-16-bookworm-x86_64.tar.xz"
@@ -189,11 +236,7 @@ def install_gcc(prefix: Path) -> Path:
         raise RuntimeError("GCC 16.2 archive SHA-256 mismatch")
     root.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive, "r:xz") as source:
-        for member in source.getmembers():
-            if member.name.startswith("/") or ".." in Path(member.name).parts:
-                raise RuntimeError(f"unsafe archive member: {member.name}")
-        source.extractall(root)
-    gcc = root / "gcc-16/bin/gcc-16"
+        safe_extract(source, root)
     version = run([str(gcc), "-dumpfullversion"])
     if not version.startswith("16.2"):
         raise RuntimeError(f"unexpected GCC identity: {version}")
@@ -205,17 +248,16 @@ def install_gcc(prefix: Path) -> Path:
 def install_multilib(prefix: Path) -> None:
     """Install the pinned bookworm i686 CRT/dev packages, once per sandbox."""
     marker = prefix / ".multilib-verified"
-    if marker.exists():
+    if marker_ok(marker, DEBS_SHA256, ()):
         return
     downloads = prefix / "dl"
     archive = downloads / "debs-bookworm.tar.xz"
     blob(GCC_REPO, DEBS_BLOB, 32_787_168, archive)
+    if sha256(archive) != DEBS_SHA256:
+        raise RuntimeError("bookworm multilib archive SHA-256 mismatch")
     with tempfile.TemporaryDirectory(prefix="lccc-debs-", dir=prefix) as td:
         with tarfile.open(archive, "r:xz") as source:
-            for member in source.getmembers():
-                if member.name.startswith("/") or ".." in Path(member.name).parts:
-                    raise RuntimeError(f"unsafe archive member: {member.name}")
-            source.extractall(td)
+            safe_extract(source, Path(td))
         debs = sorted((Path(td) / "debs").glob("*.deb"))
         if not debs:
             raise RuntimeError("multilib bundle contains no .deb payloads")
@@ -227,8 +269,40 @@ def install_multilib(prefix: Path) -> None:
         # The contract we actually care about -- compile, link and RUN a
         # 32-bit program -- is asserted by verify() after provisioning.
         run([*sudo, "dpkg", "--unpack", *map(str, debs)], timeout=900)
-    marker.write_text("bookworm-multilib\n")
+    marker.write_text(DEBS_SHA256 + "\n")
     print(f"[arena] installed {len(debs)} bookworm multilib packages")
+
+
+def install_clang(prefix: Path) -> Path:
+    """Provision Clang 23.1.4 from the pinned harness-cache-7 git blob.
+
+    The `harness-cache-4` RELEASE asset for the same archive is served by
+    `release-assets.githubusercontent.com`, which the sandbox allowlist does
+    not reach; harness-cache-7 stores the identical 67,322,400-byte file as a
+    single git blob, so the Git Blobs API is the reachable, verifiable path.
+    """
+    root = prefix / f"clang-{CLANG_VERSION}"
+    clang = root / "bin/clang"
+    marker = root / ".verified"
+    if marker_ok(marker, CLANG_SHA256, (clang,)):
+        return clang
+    downloads = prefix / "dl"
+    archive = downloads / f"clang-{CLANG_VERSION}-linux-x64.tar.xz"
+    blob(GCC_REPO, CLANG_BLOB, CLANG_SIZE, archive)
+    if sha256(archive) != CLANG_SHA256:
+        raise RuntimeError("Clang 23.1.4 archive SHA-256 mismatch")
+    # CACHE.json declares the archive's root as `clang-23.1.4/`, so extract
+    # into the prefix (like install_gcc) rather than into an extra nested dir.
+    with tarfile.open(archive, "r:xz") as source:
+        safe_extract(source, prefix)
+    if not clang.is_file():
+        raise RuntimeError("Clang archive lacks bin/clang")
+    version = run([str(clang), "--version"])
+    if CLANG_VERSION not in version:
+        raise RuntimeError(f"unexpected Clang identity: {version}")
+    marker.write_text(CLANG_SHA256 + "\n")
+    print(f"[arena] clang: {version.splitlines()[0]}")
+    return clang
 
 
 def verify(gcc: Path, rust: Path) -> None:
@@ -261,18 +335,21 @@ def main(argv: list[str] | None = None) -> int:
     prefix = args.prefix.resolve()
     gcc = prefix / "gcc-16.2/gcc-16/bin/gcc-16"
     rust = prefix / f"rust-{RUST_VERSION}"
+    clang = prefix / f"clang-{CLANG_VERSION}/bin/clang"
     if args.verify_only:
-        if not gcc.is_file() or not (rust / "bin/rustc").is_file():
+        if not gcc.is_file() or not (rust / "bin/rustc").is_file() or not clang.is_file():
             print("[arena] toolchain prefix is incomplete", file=sys.stderr)
             return 1
         print(run([str(rust / "bin/rustc"), "--version"]))
         print(run([str(gcc), "-dumpfullversion"]))
+        print(run([str(clang), "--version"]).splitlines()[0])
         verify(gcc, rust)
         return 0
     prefix.mkdir(parents=True, exist_ok=True)
     install_gcc(prefix)
     install_rust(prefix)
     install_multilib(prefix)
+    install_clang(prefix)
     verify(gcc, rust)
     if not args.skip_corpus:
         provision_corpus()
