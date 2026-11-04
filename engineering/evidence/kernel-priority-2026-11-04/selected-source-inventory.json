@@ -1,0 +1,260 @@
+{
+  "scope": "four explicitly selected Linux v6.18.58 files; NOT a full kernel inventory",
+  "records": [
+    {
+      "path": "drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c",
+      "bytes": 23333,
+      "sha256": "260d41650709cd10000a9c99ff7d329819c12384b786a238819aaf7227a9db60",
+      "physical_lines": 868,
+      "lexically_screened": true,
+      "patterns": {
+        "loops": {
+          "count": 6,
+          "sample_lines": [
+            162,
+            473,
+            519,
+            533,
+            564,
+            830
+          ]
+        },
+        "bulk_memory": {
+          "count": 1,
+          "sample_lines": [
+            721
+          ]
+        },
+        "atomics": {
+          "count": 1,
+          "sample_lines": [
+            480
+          ]
+        },
+        "barriers": {
+          "count": 1,
+          "sample_lines": [
+            190
+          ]
+        },
+        "locking": {
+          "count": 4,
+          "sample_lines": [
+            468,
+            471,
+            513,
+            586
+          ]
+        }
+      }
+    },
+    {
+      "path": "drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c",
+      "bytes": 85765,
+      "sha256": "ac7d9330911968125d2f4d9247ae29336de4a8c55a1b010678a6650bfa0f596f",
+      "physical_lines": 3219,
+      "lexically_screened": true,
+      "patterns": {
+        "loops": {
+          "count": 21,
+          "sample_lines": [
+            336,
+            485,
+            608,
+            628,
+            714,
+            928
+          ]
+        },
+        "bulk_memory": {
+          "count": 3,
+          "sample_lines": [
+            997,
+            1151,
+            1256
+          ]
+        },
+        "overflow_checks": {
+          "count": 2,
+          "sample_lines": [
+            1822,
+            1823
+          ]
+        },
+        "atomics": {
+          "count": 9,
+          "sample_lines": [
+            559,
+            871,
+            1021,
+            1047,
+            1429,
+            1444
+          ]
+        },
+        "locking": {
+          "count": 71,
+          "sample_lines": [
+            156,
+            161,
+            174,
+            176,
+            190,
+            192
+          ]
+        },
+        "branch_hints": {
+          "count": 1,
+          "sample_lines": [
+            492
+          ]
+        }
+      }
+    },
+    {
+      "path": "drivers/net/ethernet/intel/ixgbe/ixgbe_main.c",
+      "bytes": 349014,
+      "sha256": "18a3c25be395aceb6293209d11bc11e9407301ab5dc8ad741e3a9ab73b220b00",
+      "physical_lines": 12436,
+      "lexically_screened": true,
+      "patterns": {
+        "loops": {
+          "count": 175,
+          "sample_lines": [
+            322,
+            361,
+            492,
+            496,
+            500,
+            504
+          ]
+        },
+        "bulk_memory": {
+          "count": 15,
+          "sample_lines": [
+            2345,
+            3974,
+            4328,
+            4581,
+            5248,
+            6846
+          ]
+        },
+        "string_operations": {
+          "count": 1,
+          "sample_lines": [
+            11948
+          ]
+        },
+        "bit_operations": {
+          "count": 2,
+          "sample_lines": [
+            9844,
+            10749
+          ]
+        },
+        "single_access": {
+          "count": 12,
+          "sample_lines": [
+            314,
+            351,
+            2410,
+            7213,
+            7389,
+            7695
+          ]
+        },
+        "atomics": {
+          "count": 1,
+          "sample_lines": [
+            10928
+          ]
+        },
+        "barriers": {
+          "count": 6,
+          "sample_lines": [
+            1375,
+            1847,
+            5822,
+            9056,
+            9351,
+            10991
+          ]
+        },
+        "locking": {
+          "count": 25,
+          "sample_lines": [
+            2427,
+            2430,
+            5697,
+            5734,
+            6686,
+            6695
+          ]
+        },
+        "branch_hints": {
+          "count": 52,
+          "sample_lines": [
+            356,
+            363,
+            378,
+            1410,
+            1430,
+            1441
+          ]
+        }
+      }
+    },
+    {
+      "path": "lib/bitmap.c",
+      "bytes": 27259,
+      "sha256": "c616e82207126892621e6285f1d29690b1da0c8f167cab3b9ec898b559942806",
+      "physical_lines": 882,
+      "lexically_screened": true,
+      "patterns": {
+        "loops": {
+          "count": 21,
+          "sample_lines": [
+            41,
+            61,
+            76,
+            98,
+            143,
+            213
+          ]
+        },
+        "bulk_memory": {
+          "count": 3,
+          "sample_lines": [
+            120,
+            158,
+            211
+          ]
+        },
+        "bit_operations": {
+          "count": 6,
+          "sample_lines": [
+            330,
+            333,
+            422,
+            430,
+            514,
+            553
+          ]
+        }
+      }
+    }
+  ],
+  "totals": {
+    "loops": 223,
+    "bulk_memory": 22,
+    "atomics": 11,
+    "barriers": 7,
+    "locking": 100,
+    "overflow_checks": 2,
+    "branch_hints": 53,
+    "string_operations": 1,
+    "bit_operations": 8,
+    "single_access": 12
+  }
+}

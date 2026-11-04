@@ -307,7 +307,13 @@ impl<'a, 's> Graph<'a, 's> {
                 // Like _Generic, choose_expr evaluates only its selected
                 // operand. The controlling integer constant expression is
                 // not a run-time expression and the other arm is not run.
-                match self.sema.constant_truth_value(&args[0]) {
+                let truth = self
+                    .sema
+                    .condition_truth
+                    .get(&args[0].id())
+                    .copied()
+                    .unwrap_or_else(|| self.sema.constant_truth_value(&args[0]));
+                match truth {
                     Some(true) => self.expr(&args[1], next),
                     Some(false) => self.expr(&args[2], next),
                     None => {

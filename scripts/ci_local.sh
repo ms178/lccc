@@ -2497,6 +2497,12 @@ gate "seg-prefix-full-matrix" fast \
 gate "i686-atomics" fast \
     bash tests/regression/check_i686_atomics.sh
 
+# i686 select-diamond -> cmov fold and load->copy relay: 17 select shapes,
+# freestanding -m32, lccc == gcc-16 == folds-disabled at -O0/-O1/-O2/-Os,
+# plus a fold-fires witness (cmov present with the pass on, absent off).
+gate "i686-select-cmov" fast \
+    env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_i686_select_cmov.sh
+
 gate "i686-integer-isa-parity" fast \
     bash tests/regression/check_i686_integer_isa_parity.sh
 

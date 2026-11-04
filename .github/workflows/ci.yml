@@ -2679,6 +2679,10 @@ jobs:
         # assertions plus encodability teeth (no bare mov past imm16).
         bash tests/regression/check_decimal32_indexed_fold_arm.sh
         bash tests/regression/check_i686_atomics.sh
+        # i686 select-diamond -> cmov fold + load->copy relay: 17 select
+        # shapes, freestanding -m32, lccc == gcc-16 == folds-disabled at
+        # -O0/-O1/-O2/-Os, plus a fold-fires witness (cmov on=4, off=0).
+        env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_i686_select_cmov.sh
         # A comment opened on a #define line and still open at its end spans
         # that line's unspliced newline, merging the next physical line into
         # the same directive (C11 5.1.1.2): no keep-break elision may insert a

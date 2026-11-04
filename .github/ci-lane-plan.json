@@ -3,7 +3,7 @@
     "backend-contracts-a": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 525.59,
+      "predicted_gate_seconds": 526.69,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard a of 2)",
       "steps": [
@@ -334,6 +334,10 @@
         {
           "measured_s": 0.25,
           "name": "bash tests/regression/check_i686_atomics.sh"
+        },
+        {
+          "measured_s": 1.1,
+          "name": "env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_i686_select_cmov.sh"
         },
         {
           "measured_s": 1.7,

@@ -100,6 +100,30 @@ CASES.update({
         "extern int unknown; extern void consume(int); "
         "consume(({ if (unknown) return 7; 0; }));", 1
     ),
+    "generic_scoped_typedef_selected": (
+        "{ typedef long Local; extern long value; "
+        "(void)_Generic(value, Local: ({ return 7; 0; }), default: 1); }", 0
+    ),
+    "generic_scoped_typedef_unselected": (
+        "{ typedef long Local; extern long value; "
+        "(void)_Generic(value, Local: 1, default: ({ return 7; 0; })); }", 1
+    ),
+    "generic_shadowed_typedef_selected": (
+        "typedef int Local; { typedef long Local; extern long value; "
+        "(void)_Generic(value, Local: ({ return 7; 0; }), default: 1); }", 0
+    ),
+    "generic_shadowed_typedef_unselected": (
+        "typedef int Local; { typedef long Local; extern long value; "
+        "(void)_Generic(value, Local: 1, default: ({ return 7; 0; })); }", 1
+    ),
+    "choose_scoped_enum_selected": (
+        "{ enum { SELECTED=1 }; "
+        "(void)__builtin_choose_expr(SELECTED, ({ return 7; 0; }), 1); }", 0
+    ),
+    "choose_scoped_enum_false": (
+        "{ enum { SELECTED=0 }; "
+        "(void)__builtin_choose_expr(SELECTED, 1, ({ return 7; 0; })); }", 0
+    ),
     "generic_selected_stmt_expr_return": (
         "extern int value; (void)_Generic(value, int: ({ return 7; 0; }), "
         "default: 1);", 0
@@ -125,6 +149,18 @@ CASES.update({
 # Require that exact extra diagnostic rather than disabling it or accepting
 # arbitrary warnings. The semantic return-warning expectation stays unchanged.
 ORACLE_AUXILIARY = {("gcc", "case_entry_after_return"): ["-Wswitch-unreachable"]}
+# Clang 23.1.4's return-warning CFG visits statement-expression returns
+# inside these unevaluated builtin operands. For constant_p, Clang also
+# executes the nested return 99 in the native witness (GCC and LCCC return 7).
+# Pin these reference-only defects explicitly. LCCC and GCC still must
+# emit the language-level warning; this table cannot waive an LCCC result.
+REFERENCE_RETURN_COUNTS = {
+    ("clang", "constant_p_stmt_expr_is_unevaluated"): 0,
+    ("clang", "classify_type_stmt_expr_is_unevaluated"): 0,
+}
+REFERENCE_RUNTIME_COUNTS = {
+    ("clang", "(void)__builtin_constant_p(({ return 99; 0; }));"): 1,
+}
 TARGETS = {
     "x86_64": ("lccc", [], ["--target=x86_64-linux-gnu"]),
     "i686": ("lccc-i686", ["-m32"], ["--target=i686-linux-gnu"]),
@@ -176,13 +212,16 @@ def main():
                         count = len(re.findall(r"\[-Wreturn-type\]", result.stderr))
                         auxiliary = ORACLE_AUXILIARY.get((family, name), [])
                         diagnostics = re.findall(r"\[(-W[^]\s]+)\]", result.stderr)
-                        expected_diagnostics = ["-Wreturn-type"] * expected + auxiliary
+                        reference_expected = REFERENCE_RETURN_COUNTS.get((family, name), expected)
+                        expected_diagnostics = ["-Wreturn-type"] * reference_expected + auxiliary
                         passed = (result.returncode == 0
                                   and sorted(diagnostics) == sorted(expected_diagnostics)
                                   and len(re.findall(r"\bwarning:", result.stderr))
                                   == len(expected_diagnostics))
                         records.append(dict(target=target, opt=opt, case=name, compiler=family,
-                                            expected=expected, expected_auxiliary=auxiliary,
+                                            expected=expected, reference_expected=reference_expected,
+                                            reference_disagreement=reference_expected != expected,
+                                            expected_auxiliary=auxiliary,
                                             actual=count, diagnostics=diagnostics, rc=result.returncode,
                                             passed=passed))
                         if not passed:
@@ -201,7 +240,9 @@ def main():
                         "do { continue; } while (0);",
                         "while (1) { switch (0) { default: break; } break; }",
                         "goto value; value:;",
-                        "do { switch (0) { default: continue; } } while (0);"):
+                        "do { switch (0) { default: continue; } } while (0);",
+                        "(void)__builtin_constant_p(({ return 99; 0; }));",
+                        "(void)__builtin_classify_type(({ return 99; 0; }));"):
             source.write_text("int subject(void) { return ({ " + control +
                               " 7; }); } int main(void) { return subject() != 7; }\n")
             for opt in ("-O0", "-O2"):
@@ -210,11 +251,14 @@ def main():
                     built = run([compiler, opt, "-Werror", "-Wreturn-type", str(source),
                                  "-o", str(binary)])
                     executed = run([str(binary)]) if built.returncode == 0 else None
-                    passed = (executed is not None and executed.returncode == 0
+                    reference_rc = REFERENCE_RUNTIME_COUNTS.get((family, control), 0)
+                    passed = (executed is not None and executed.returncode == reference_rc
                               and not executed.stdout and not executed.stderr)
                     records.append(dict(target="x86_64", opt=opt, case=control,
                                         compiler=family, passed=passed,
-                                        build_rc=built.returncode,
+                                        build_rc=built.returncode, semantic_run_rc=0,
+                                        reference_run_rc=reference_rc,
+                                        reference_disagreement=reference_rc != 0,
                                         run_rc=executed.returncode if executed else None))
                     if not passed:
                         print(f"FAIL runtime {family}/{opt}/{control}: {built.stderr}")
@@ -222,6 +266,8 @@ def main():
         args.json.write_text(json.dumps(records, indent=2) + "\n")
     failures = sum(not record["passed"] for record in records)
     auxiliary = sum(len(record.get("expected_auxiliary", [])) for record in records)
+    disagreements = sum(record.get("reference_disagreement", False) for record in records)
+    print(f"reference semantic disagreements (never LCCC waivers): {disagreements}")
     print(f"typed constant truth: {len(records)} checks, {failures} failures, "
           f"{auxiliary} exact oracle-specific auxiliary diagnostics")
     return bool(failures)

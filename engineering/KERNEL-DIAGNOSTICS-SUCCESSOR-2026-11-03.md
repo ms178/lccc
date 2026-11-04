@@ -222,3 +222,64 @@ not implemented; this remains an option-semantics gap. The workflow's separate
 diagnostic-surfacing step was skipped, so no zero-warning claim is inferred
 from the green job. Local swap remains unavailable in the restricted sandbox;
 this was hosted-runner evidence, not a local reproduction.
+
+## Restored-state audit and scoped choose_expr repair — 2026-11-04
+
+Recovery found HEAD at the old base, with recovered source files. All remote
+tracked files were content-compared before reconciliation. Three older recovered
+files were separately backed up; the remote PR's newer fbb4043f4 source was then
+restored without discarding unexamined changes. Main 5a3b2087c was merged without
+conflicts after deepening the shallow history. The compiler/linker toolchains
+were fetched from the reviewed harness-cache-7 lock; GCC16.2.0, Clang23.1.4,
+Rust1.99.1, fastbuild and an active **4 GiB** swap were used.
+
+Confirmed new defect: return-flow `__builtin_choose_expr` re-evaluated its ICE
+condition after a declaring inner block disappeared. Both true and false scoped
+enumerators caused spurious return warnings. Six new fixtures also check local
+and shadowed `_Generic` typedef selections; those four controls already passed
+and are not claimed as defects fixed. Before: **174 checks, 16 LCCC failures**,
+no GCC/Clang failures in that scoped-selection subset.
+
+Decision: reuse the existing scope-live `condition_truth` map rather than add
+another cache, retain entire scope environments or duplicate the ICE evaluator.
+Capture the typed truth (including unknown) after argument analysis, and consult
+it at the graph query. Clear it at the existing file-scope function boundary;
+nested-function analysis keeps the parent's facts. Four new library assertions
+cover true/false selections and normal/diverging selected arms. No optimization,
+ABI, target instruction selection or hardware-speedup claim is made.
+
+Full validation: **7897 library tests passed, 10 ignored**; all-target Clippy
+`-D warnings`, fmt/diff checks, 31 scoped-noreturn checks, i686 select-cmov
+runtime/reference/folds-disabled checks at O0/O1/O2/Os passed. Parity passes
+530 commands/27 contracts and the unchanged lane plan passes at 2929 estimated
+seconds. The expanded matrix records **1678 passing expected observations**.
+This is NOT 1678 semantic agreements: it explicitly reports **18 reference
+semantic disagreements**, all in Clang23.1.4, never a waiver for LCCC.
+
+Reference red-team findings: GCC and LCCC warn for returns buried in unevaluated
+constant_p/classify_type operands; Clang misses those warnings (16 rows). New
+native controls also show Clang executing the nested `return 99` inside
+`__builtin_constant_p` at O0/O2, while GCC and LCCC retain the enclosing value 7
+(two rows). `classify_type`'s native control passes. The test records normative
+and pinned reference-observation outcomes separately and will flag observation
+drift. These vendor defects are NOT fixed by this PR, not hidden by warning
+flags, and not evidence of universally correct references. Raw uncalibrated
+observations are retained alongside the before/after reports.
+
+Authenticated ICX2026.2 provisioning was attempted locally again but Intel TLS
+closed under the sandbox allowlist. Old-head hosted ICX is red in this matrix;
+its signed log storage is inaccessible locally. Workflow dispatch returned 403;
+the existing diagnostic-export PR label was added for the next push so the
+hosted transport can expose the actual failure through GitHub blobs. No ICX
+expectation was guessed from Clang, and no three-oracle pass is claimed.
+
+A four-file kernel-priority source audit is retained separately under
+`engineering/evidence/kernel-priority-2026-11-04`. It identifies AMDGPU ring
+fills, ixgbe descriptor cleanup/wrap, VM address arithmetic and bitmap reductions
+with mandatory synchronization/feature guards. It is a partial lexical census,
+not workload profiling or a measured optimization. The host is a Xeon, not the
+user's 14700KF; no NIC/GPU/board performance measurement is available.
+
+Remaining warning families/options, vendor-reference discrepancies, local final-
+head full kernel/QEMU, measured performance gains and green final-head CI remain
+OPEN. This is a validated recovery/fix checkpoint, not production readiness.

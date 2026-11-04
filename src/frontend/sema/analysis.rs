@@ -4006,6 +4006,17 @@ impl SemanticAnalyzer {
             self.analyze_expr(arg);
         }
         if let Expr::Identifier(name, _) = callee {
+            if name == "__builtin_choose_expr"
+                && args.len() == 3
+                && self.symbol_table.lookup(name).is_none()
+                && !self.result.functions.contains_key(name)
+            {
+                // The whole-body flow query runs after inner scopes have
+                // unwound. Preserve this ICE's typed truth now, including
+                // unknown, rather than re-resolving a vanished enumerator.
+                let truth = self.constant_truth_value(&args[0]);
+                self.condition_truth.insert(args[0].id(), truth);
+            }
             self.check_printf_format(name, args, expr.span());
         }
         // Resolve the callable through lexical scope, not through
@@ -12518,6 +12529,30 @@ mod builtin_return_flow_tests {
             "(void)__builtin_longjmp(block, 1);",
         ] {
             assert_eq!(warnings(body), 0, "{body}");
+        }
+    }
+
+    #[test]
+    fn choose_expr_retains_scoped_enumerator_selection() {
+        for (body, expected) in [
+            (
+                "{ enum { SELECTED=1 }; (void)__builtin_choose_expr(SELECTED, ({ return 7; 0; }), 1); }",
+                0,
+            ),
+            (
+                "{ enum { SELECTED=0 }; (void)__builtin_choose_expr(SELECTED, 1, ({ return 7; 0; })); }",
+                0,
+            ),
+            (
+                "{ enum { SELECTED=1 }; (void)__builtin_choose_expr(SELECTED, 1, ({ return 7; 0; })); }",
+                1,
+            ),
+            (
+                "{ enum { SELECTED=0 }; (void)__builtin_choose_expr(SELECTED, ({ return 7; 0; }), 1); }",
+                1,
+            ),
+        ] {
+            assert_eq!(warnings(body), expected, "{body}");
         }
     }
 

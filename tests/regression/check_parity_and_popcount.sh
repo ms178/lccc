@@ -298,10 +298,14 @@ pinrv par16 16
 pinrv pc8 15
 pinrv pc16 22
 pini686() { local got; got=$(count_of "$1" "$tmp/i686.s"); [ "$got" = "$2" ] || fail "$1: $got instructions on i686, pinned $2"; }
-# 13: the same 6-instruction algorithm as x86-64, plus the memory-argument
-# load, the frame the i686 backend emits and one more copy -- the staging pair
-# (`pushl %ecx`/`popl %ecx`) is elided by the scratch-save peephole.
-pini686 par32 13
+# 10: the same 6-instruction algorithm as x86-64, plus the memory-argument
+# load and the two-instruction `subl $12/addl $12` frame. The select-diamond
+# cmov fold and the load->copy relay retired the callee-saved staging copy the
+# old shape carried (`pushl %ecx`/`popl %ecx` around a `movl %eax,%ecx` home):
+# the surviving `movl %eax,%ecx` feeds a caller-saved scratch that dies in the
+# XOR, so no callee-save pair remains. 13 -> 10 is the relay's win, pinned here
+# so a future pass cannot silently re-introduce the staging pair.
+pini686 par32 10
 # The narrow shapes on i686: the same rules, the same wins (8 -> 6, 10 -> 7,
 # 19 -> 11) plus the two-instruction frame difference the memory-argument
 # calling convention adds.
