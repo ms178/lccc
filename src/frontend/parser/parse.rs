@@ -31,6 +31,28 @@ pub(super) enum ModeKind {
 }
 
 impl ModeKind {
+    /// GCC spelling, for the `invalid pointer mode 'SI'` diagnostic.
+    pub(super) fn spelling(self) -> &'static str {
+        match self {
+            ModeKind::QI => "QI",
+            ModeKind::HI => "HI",
+            ModeKind::SI => "SI",
+            ModeKind::DI => "DI",
+            ModeKind::TI => "TI",
+        }
+    }
+
+    /// Whether this mode names the TARGET's pointer machine mode.  Measured
+    /// against gcc-16 16.2.0: `typedef char *P __attribute__((mode(SI)))`
+    /// compiles unchanged on `-m32` (SI = 32-bit pointer) and is rejected on
+    /// x86-64 with `invalid pointer mode 'SI'`; `mode(DI)` is the x86-64
+    /// spelling that compiles.  Clang 23.1.4 rejects pointer modes outright,
+    /// so GCC is the oracle for this GNU extension.
+    pub(super) fn is_target_pointer_mode(self) -> bool {
+        let bits = crate::common::types::target_ptr_size() * 8;
+        matches!((self, bits), (ModeKind::SI, 32) | (ModeKind::DI, 64))
+    }
+
     /// Apply mode to a type specifier, preserving signedness.
     pub(super) fn apply(self, ts: TypeSpecifier) -> TypeSpecifier {
         let is_unsigned = matches!(
@@ -929,6 +951,52 @@ pub(super) struct TypedefScopeUndo {
 }
 
 impl Parser {
+    /// ONE implementation of `__attribute__((mode(M)))` for every declaration
+    /// path (file-scope, block-scope and nested functions). Keeping three
+    /// copies previously let `nested_functions.rs` diverge.
+    ///
+    /// Measured against gcc 16.2 (red-team, 12 attribute/declarator shapes):
+    ///  * FUNCTION or ARRAY declarator -> `mode 'M' applied to inappropriate
+    ///    type` (`int f(void) __attribute__((mode(SI)))`, `int x[3] ...`);
+    ///  * POINTER declarator -> validate M against the TARGET pointer mode
+    ///    and LEAVE THE POINTEE ALONE. Rewriting `char *` to `int *` broke
+    ///    gcc.c-torture/compile/20111209-1.c on i686;
+    ///  * scalar declarator -> apply M to the base integer type as before.
+    /// A function POINTER (`int (*fp)(void)`) has `Pointer` as its outermost
+    /// derivation, so it correctly takes the pointer path.
+    pub(super) fn apply_mode_attribute(
+        &mut self,
+        mode_kind: Option<ModeKind>,
+        type_spec: TypeSpecifier,
+        derived: &[DerivedDeclarator],
+        start: Span,
+    ) -> TypeSpecifier {
+        let Some(mk) = mode_kind else {
+            return type_spec;
+        };
+        if matches!(
+            derived.last(),
+            Some(DerivedDeclarator::Function(..) | DerivedDeclarator::Array(..))
+        ) {
+            self.diagnostics.error(
+                format!("mode '{}' applied to inappropriate type", mk.spelling()),
+                start,
+            );
+            return type_spec;
+        }
+        if derived
+            .iter()
+            .any(|d| matches!(d, DerivedDeclarator::Pointer(..)))
+        {
+            if !mk.is_target_pointer_mode() {
+                self.diagnostics
+                    .error(format!("invalid pointer mode '{}'", mk.spelling()), start);
+            }
+            return type_spec;
+        }
+        mk.apply(type_spec)
+    }
+
     /// Remove `name` from the enumeration-constant tables until the current
     /// scope ends (see `enum_scope_log`), recording its prior state.
     pub(super) fn hide_enum_constant(&mut self, name: &str) {
@@ -1149,12 +1217,25 @@ impl Parser {
     /// inside `CType::clone`, on a file GCC 16.2 accepts. The declaration
     /// alone is enough; no call site is involved.
     ///
-    /// 4096 is >1000x the deepest declarator in real code (kernel, glibc and
-    /// sqlite all stay at four levels or fewer) while keeping a 4096-deep
-    /// clone/drop comfortably inside even an 8 MB stack, so the bound holds
-    /// regardless of which thread the type is destroyed on and regardless of
-    /// build profile.
-    pub(super) const POINTER_DEPTH_BUDGET: u32 = 4_096;
+    /// 4096 was calibrated for a hypothetical 8 MB stack and rejected
+    /// gcc.c-torture/compile/limits-pointer.c, whose PTR4 macro expands to
+    /// 10,000 `*`.  The compiler actually runs on a 64 MB thread.  Re-measured
+    /// on the -O2 fastbuild with the bound at 65,536:
+    ///
+    /// | stars | rc | wall |
+    /// |-------|----|------|
+    /// | 10,000 (the corpus case) | 0 | 0.010 s |
+    /// | 20,000 | 0 | 0.014 s |
+    /// | 32,768 | 0 | 0.023 s |
+    /// | 65,536 | 0 | 0.039 s |
+    /// | 80,000 | 1, single clean budget diagnostic | 0.008 s |
+    ///
+    /// The original clone/drop stack-overflow crash was measured at ~400,000
+    /// stars, so 65,536 keeps a >6x margin below it while being >16,000x the
+    /// deepest declarator in the kernel, glibc and sqlite (four levels).
+    /// `tests/regression/check_parser_depth_limits.sh` pins both ends of this
+    /// table so the bound cannot drift without a new measurement.
+    pub(super) const POINTER_DEPTH_BUDGET: u32 = 65_536;
 
     /// One pointer-indirection level of a declarator. Unlike the recursion
     /// budgets this is a plain depth cap rather than a frame registration: the

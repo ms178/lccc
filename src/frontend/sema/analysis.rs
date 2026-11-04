@@ -238,6 +238,14 @@ pub struct SemanticAnalyzer {
     /// check. Uses RefCell for interior mutability since resolve_struct_or_union
     /// takes &self.
     defined_structs: RefCell<FxHashSet<String>>,
+    /// File-scope objects whose record type was incomplete AT THEIR
+    /// DECLARATION.  C11 6.9.2p2: a tentative definition with external
+    /// linkage may be completed by a later tag definition in the same
+    /// translation unit, so the "storage size isn't known" verdict belongs at
+    /// the END of the TU, not at the declaration.  gcc 16.2 accepts
+    /// `struct c d; struct c { int e; };` (gcc.c-torture/compile/pr85401.c,
+    /// pr96998.c, 930525-1.c); lccc diagnosed it eagerly and rejected valid C.
+    deferred_incomplete_objects: RefCell<Vec<(String, CType, crate::common::source::Span)>>,
     /// Type resolution can revisit a definition; report its layout once.
     packed_alignment_checked: RefCell<FxHashSet<(u32, u32, u32)>>,
     designated_init_seen: RefCell<FxHashSet<(CType, u32, u32, u32)>>,
@@ -339,6 +347,7 @@ impl SemanticAnalyzer {
             result: SemaResult::default(),
             diagnostics: RefCell::new(DiagnosticEngine::new()),
             defined_structs: RefCell::new(FxHashSet::default()),
+            deferred_incomplete_objects: RefCell::new(Vec::new()),
             packed_alignment_checked: RefCell::new(FxHashSet::default()),
             designated_init_seen: RefCell::new(FxHashSet::default()),
             typeof_seen: RefCell::new(FxHashSet::default()),
@@ -459,6 +468,20 @@ impl SemanticAnalyzer {
                         }
                     }
                 }
+            }
+        }
+
+        // C11 6.9.2p2 / gcc 16.2: resolve tentative definitions of record
+        // types only AFTER the whole TU is known.  A tag defined later in the
+        // same TU completes them; only the ones still incomplete are errors.
+        // Cloning the deferred list keeps the RefCell borrow disjoint from the
+        // diagnostic engine borrows inside `incomplete_record_name`.
+        let deferred = self.deferred_incomplete_objects.take();
+        for (name, ty, span) in deferred {
+            if self.incomplete_record_name(&ty).is_some() {
+                self.diagnostics
+                    .borrow_mut()
+                    .error(format!("storage size of '{name}' isn't known"), span);
             }
         }
 
@@ -1831,7 +1854,7 @@ impl SemanticAnalyzer {
             // not for extern declarations (which don't allocate storage).
             // Also catches arrays of incomplete element types.
             // GCC error: "storage size of 'x' isn't known"
-            if !decl.is_extern() && !matches!(full_type, CType::Function(_)) {
+            if !matches!(full_type, CType::Function(_)) {
                 // Extract the innermost element type (unwrap arrays)
                 let mut elem_type = &full_type;
                 while let CType::Array(inner, _) = elem_type {
@@ -1839,10 +1862,40 @@ impl SemanticAnalyzer {
                 }
                 let is_incomplete = self.incomplete_record_name(elem_type).is_some();
                 if is_incomplete {
-                    self.diagnostics.borrow_mut().error(
-                        format!("storage size of '{}' isn't known", init_decl.name),
-                        init_decl.span,
-                    );
+                    if init_decl.init.is_some() {
+                        // C11 6.9.2p2: a declaration WITH AN INITIALIZER is a
+                        // DEFINITION, not a tentative definition.  Its type
+                        // must be complete AT THE DECLARATION: a later tag
+                        // definition cannot rescue it.  Measured on gcc 16.2:
+                        // `struct c x = {0}; struct c { int e; };` is
+                        // "variable 'x' has initializer but incomplete type",
+                        // at file scope, block scope and with `extern`.
+                        // Deferring these (the first version of this fix) was
+                        // a real semantic hole found by red-teaming.
+                        self.diagnostics.borrow_mut().error(
+                            format!(
+                                "variable '{}' has initializer but incomplete type",
+                                init_decl.name
+                            ),
+                            init_decl.span,
+                        );
+                    } else if decl.is_extern() {
+                        // `extern struct c x;` allocates no storage: legal.
+                    } else if is_global {
+                        // TENTATIVE definition: C11 6.9.2p2 permits a later
+                        // `struct c { ... };` in this TU to complete it, so
+                        // re-check once every declaration has been analysed.
+                        self.deferred_incomplete_objects.borrow_mut().push((
+                            init_decl.name.clone(),
+                            elem_type.clone(),
+                            init_decl.span,
+                        ));
+                    } else {
+                        self.diagnostics.borrow_mut().error(
+                            format!("storage size of '{}' isn't known", init_decl.name),
+                            init_decl.span,
+                        );
+                    }
                 }
             }
 

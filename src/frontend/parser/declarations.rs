@@ -88,6 +88,30 @@ impl Parser {
         TypeSpecifier::Int
     }
 
+    /// A file-scope declaration that omitted its type specifier entirely
+    /// (`a, b, c;`, `two52 = 4.5e15;`, `e() {...}`).  GCC 16.2 in its default
+    /// gnu23 dialect rejects these as `-Wimplicit-int` errors, but
+    /// `-fpermissive` downgrades them to warnings and compiles the program;
+    /// three gcc.c-torture/compile cases (20101216-1.c, pr72802.c,
+    /// pr90275.c) carry exactly that dg-option.  The diagnostic engine owns
+    /// the dialect-dependent promotion (WARNING_REGISTRY marks ImplicitInt
+    /// `c99_default_error`), so the parser only has to produce the AST and
+    /// ONE correctly classified warning -- no separate permissive flag, no
+    /// dialect state duplicated in the parser.
+    ///
+    /// The lookahead guard is deliberately narrow: an identifier followed by
+    /// `,`, `;`, `=`, `[` or `(` is unambiguously a declarator, not an
+    /// expression statement (those are illegal at file scope anyway).
+    /// Anything else still falls through to a clean parse error.
+    fn implicit_int_declaration(&mut self, span: Span, name: &str) -> TypeSpecifier {
+        self.diagnostics.warning_with_kind(
+            format!("type defaults to 'int' in declaration of '{name}'"),
+            span,
+            crate::common::error::WarningKind::ImplicitInt,
+        );
+        TypeSpecifier::Int
+    }
+
     /// Finish a file-level bare type declaration such as `struct S { ... };`.
     /// The transparent-union attribute belongs to this declaration alone and
     /// must not leak into the next one.
@@ -160,20 +184,9 @@ impl Parser {
         }
 
         let start = self.peek_span();
-        let type_spec = self.parse_type_specifier().or_else(|| {
-            // C89 implicit int: if no type specifier is found, check if this looks like
-            // a function definition with implicit int return type (e.g., "main() { ... }"
-            // or K&R-style "Proc_1(x) int x; { ... }").
-            // The pattern is: identifier followed by '('.
-            if let TokenKind::Identifier(_) = self.peek() {
-                if self.pos + 1 < self.tokens.len()
-                    && matches!(self.tokens[self.pos + 1].kind, TokenKind::LParen)
-                {
-                    return Some(self.implicit_function_return_type(start));
-                }
-            }
-            None
-        })?;
+        let type_spec = self
+            .parse_type_specifier()
+            .or_else(|| self.implicit_int_type_specifier(start))?;
         // Capture the declaration's named address space before any declarator
         // (parameter lists in particular) is parsed; see ParsedDeclAttrs.
         self.attrs.decl_address_space = std::mem::take(&mut self.attrs.parsing_address_space);
@@ -357,12 +370,14 @@ impl Parser {
         decl_attrs.zero_call_used_regs = zero_call_used_regs;
         decl_attrs.no_sanitize = no_sanitize;
 
-        // Apply __attribute__((mode(...))): transform type to specified bit-width
-        let type_spec = if let Some(mk) = mode_kind {
-            mk.apply(type_spec)
-        } else {
-            type_spec
-        };
+        // Apply __attribute__((mode(...))): transform type to specified
+        // bit-width.  A POINTER declarator is different (measured gcc 16.2):
+        // `mode(M)` validates M against the target's pointer machine mode and
+        // leaves the pointee ALONE.  Rewriting `char *` into `int *` (what the
+        // old unconditional `mk.apply` did) broke
+        // gcc.c-torture/compile/20111209-1.c on i686 with a bogus
+        // incompatible-pointer-types error.
+        let type_spec = self.apply_mode_attribute(mode_kind, type_spec, &derived, start);
 
         // Determine if this is a function definition
         let is_funcdef = !derived.is_empty()
@@ -413,6 +428,58 @@ impl Parser {
             };
             self.parse_declaration_rest(type_spec, name, derived, start, ctx)
         }
+    }
+
+    /// C89 implicit-int fallback when `parse_type_specifier()` found nothing.
+    ///
+    /// Two GNU shapes are measured against gcc 16.2:
+    ///  * `main() { ... }` / K&R `Proc_1(x) int x; { ... }` -- an identifier
+    ///    followed by `(` is an implicit-`int` FUNCTION return type;
+    ///  * `*t29;` (pr72802.c) -- a bare implicit-int POINTER declaration.
+    ///    GCC emits the same -Wimplicit-int warning minus the pointer stars,
+    ///    so look ahead a BOUNDED eight tokens for the name rather than
+    ///    scanning to EOF.  `self.tokens[self.pos + 1]` is only read when the
+    ///    bounds check in `next_is_declarator` succeeded.
+    ///
+    /// Extracted from `parse_external_decl` so that function stays under the
+    /// 300-line AUD-RATCHET-1 ceiling; the two shapes are now independently
+    /// nameable and the fallback has one owner instead of an inline closure.
+    fn implicit_int_type_specifier(&mut self, start: Span) -> Option<TypeSpecifier> {
+        if matches!(self.peek(), TokenKind::Star) {
+            let name = self.tokens[self.pos..]
+                .iter()
+                .take(8)
+                .find_map(|tok| match &tok.kind {
+                    TokenKind::Identifier(n) => Some(n.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if !name.is_empty() {
+                return Some(self.implicit_int_declaration(start, &name));
+            }
+        }
+        if let TokenKind::Identifier(name) = self.peek() {
+            let next_is_declarator = self.pos + 1 < self.tokens.len()
+                && matches!(
+                    self.tokens[self.pos + 1].kind,
+                    TokenKind::LParen
+                        | TokenKind::LBracket
+                        | TokenKind::Comma
+                        | TokenKind::Semicolon
+                        | TokenKind::Assign
+                );
+            if next_is_declarator {
+                let name = name.clone();
+                return Some(
+                    if matches!(self.tokens[self.pos + 1].kind, TokenKind::LParen) {
+                        self.implicit_function_return_type(start)
+                    } else {
+                        self.implicit_int_declaration(start, &name)
+                    },
+                );
+            }
+        }
+        None
     }
 
     /// `asm("...")` / `asm volatile ("...")` / `asm("...");` at file scope.
@@ -1734,12 +1801,13 @@ impl Parser {
             }
         }
 
-        // Apply __attribute__((mode(...))): transform type to specified bit-width
-        let type_spec = if let Some(mk) = mode_kind {
-            mk.apply(type_spec)
-        } else {
-            type_spec
-        };
+        // Pointer-mode rule as above, applied to every declarator of this
+        // block-scope declaration (the attribute sits on the declaration).
+        let mode_derived: Vec<DerivedDeclarator> = declarators
+            .iter()
+            .flat_map(|d| d.derived.iter().cloned())
+            .collect();
+        let type_spec = self.apply_mode_attribute(mode_kind, type_spec, &mode_derived, start);
 
         // A block-scope declaration hides an enumerator of the same name.
         if self.block_depth > 0 {

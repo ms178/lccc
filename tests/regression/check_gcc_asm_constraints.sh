@@ -48,7 +48,7 @@ report() { # report <label> <rc>
 compile_ok() { # compile_ok <label> <compiler> <opt> <file>
     local label=$1 cc=$2 opt=$3 file=$4 out rc
     out=$("$cc" "$opt" -c "$file" -o "$tmp/out.o" 2>&1) && rc=0 || rc=$?
-    if [ "$rc" -ne 0 ] || printf '%s' "$out" | grep -q 'error:'; then
+    if [ "$rc" -ne 0 ] || grep -q 'error:' <<<"$out"; then
         printf 'FAIL: %s rc=%s: %s\n' "$label" "$rc" "$out"
         return 1
     fi
@@ -57,7 +57,7 @@ compile_ok() { # compile_ok <label> <compiler> <opt> <file>
 expect_error() { # expect_error <label> <compiler> <file> <needle>
     local label=$1 cc=$2 file=$3 needle=$4 out rc
     out=$("$cc" -O2 -c "$file" -o "$tmp/out.o" 2>&1) && rc=0 || rc=$?
-    if [ "$rc" -eq 0 ] || ! printf '%s' "$out" | grep -qF "$needle"; then
+    if [ "$rc" -eq 0 ] || ! grep -qF "$needle" <<<"$out"; then
         printf 'FAIL: %s rc=%s, expected "%s": %s\n' "$label" "$rc" "$needle" "$out"
         return 1
     fi
@@ -197,6 +197,24 @@ for cc in "$CCC" "$CCC_I686"; do
     fi
 done
 
+# ── Explicit register constraints are REGISTER classes, not immediates ─────
+# `{esi}` contains e/s/i, all letters the immediate classifier knows.  A
+# global register variable used to be misclassified as "immediate-only" and
+# rejected after optimisation (gcc.c-torture/compile/20041119-1.c on i686).
+cat >"$tmp/explicit_reg.c" <<'C'
+register unsigned int reg __asm("esi");
+unsigned int f(void) { return reg + 1; }
+C
+if [ -x "$CCC_I686" ]; then
+    out=$("$CCC_I686" -O2 -c "$tmp/explicit_reg.c" -o "$tmp/out.o" 2>&1) && rc=0 || rc=$?
+    if [ "$rc" -eq 0 ] && ! grep -q 'error:' <<<"$out"; then
+        report 'i686 explicit register constraint {esi}' 0
+    else
+        printf 'FAIL: i686 {esi} rc=%s: %s\n' "$rc" "$out"
+        report 'i686 explicit register constraint {esi}' 1
+    fi
+fi
+
 # ── Runtime: a two-alternative asm must still execute the instruction ──────
 cat >"$tmp/runtime.c" <<'C'
 #include <stdio.h>
@@ -222,6 +240,40 @@ else
     printf 'FAIL: runtime two-alternative addl: %s\n' "$(cat "$tmp/runtime.err" 2>/dev/null)"
     report 'runtime two-alternative addl' 1
 fi
+
+# ── RED-TEAM: 64-spelling accept/reject DIFFERENTIAL against gcc 16.2 ─────
+# Each source is compiled by BOTH compilers at -O0 (deferral off, so the
+# front-end grammar is what decides).  This is the ratchet for the holes the
+# red-team differential found: unmodelled letters are IMPOSSIBLE ALTERNATIVES
+# (but do NOT poison an alternative that also has a class letter -- `rz`,
+# `zr`, `zri`, `rzi`, `Yzz` must compile), bare `Y`/`C` prefixes are
+# impossible, a `#`-only constraint is "inconsistent operand constraints",
+# `%` needs a following operand, and matching digits are range-checked
+# anywhere in an alternative (`Yz0`).  Verbatim diagnostics are pinned in
+# the Rust unit tests; this gate pins the VERDICT across the whole shape set.
+diff_spellings=(
+  '' '#foo' 'r,m' 'r,' 'i#' 'i#*X' 'i#@' '%0,0' '0' '[sum]' '{rax}' 'Yz' 'C'
+  'Y' 'r?m' '!r,m' '?' 'i#*r' 'r,m,r,m,r,m' '=r,r' '+r,m' 'n,i' 's,r' 'z,r'
+  'r,z' 'z' 'Yz0' '%' '%r' 'rz' 'zr' 'zri' 'rzi' 'Yzz' 'Yzr' 'zz' 'zz,r'
+  'r,zr' 'rz,r' 'mx' 'xm' 'gZ' 'Zg' 'r#@' 'r#zzz' 'I,r' 'r,I' 'v,r' 'x,r'
+  'mX' 'Xm' 'Yz1' 'r10' '?r' '^r' '$r' '*r' '!r' '#' '##' 'r##' 'i#'
+  'r#' 'i##zzz'
+)
+diff_bad=0
+for c in "${diff_spellings[@]}"; do
+    printf 'void f(int x){ asm volatile("" :: "%s"(x)); }\n' "$c" >"$tmp/diff.c"
+    "$GCC" -O0 -c "$tmp/diff.c" -o "$tmp/diff_gcc.o" >"$tmp/gcc.log" 2>&1 && grc=0 || grc=$?
+    "$CCC" -O0 -c "$tmp/diff.c" -o "$tmp/diff_lccc.o" >"$tmp/lccc.log" 2>&1 && lrc=0 || lrc=$?
+    gerr=0; lerr=0
+    if grep -q 'error:' "$tmp/gcc.log"; then gerr=1; fi
+    if grep -q 'error:' "$tmp/lccc.log"; then lerr=1; fi
+    if [ "$gerr" -ne "$lerr" ] || { [ "$gerr" -eq 0 ] && [ "$grc" -ne "$lrc" ]; }; then
+        printf 'FAIL: differential %q gcc(rc=%s err=%s) lccc(rc=%s err=%s)\n' \
+            "$c" "$grc" "$gerr" "$lrc" "$lerr"
+        diff_bad=$((diff_bad + 1))
+    fi
+done
+report "gcc 16.2 accept/reject differential (${#diff_spellings[@]} spellings)" "$diff_bad"
 
 printf 'check_gcc_asm_constraints: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -69,7 +69,11 @@ for a in packed aligned section used weak noinline noreturn const pure \
         alias_ifunc) src='void f(void); void g(void) __attribute__((alias("f")));' ;;
         noclone_but_unknown) src='__attribute__((noclone)) void f(void);' ;;
         vector_size) src='typedef int v __attribute__((vector_size(16)));' ;;
-        mode) src='int f(void) __attribute__((mode(DI)));' ;;
+        # gcc 16.2 is SILENT on `mode` applied to a scalar object, and
+        # REFUSES it on a function declarator with
+        # "mode 'DI' applied to inappropriate type". The old fixture used
+        # the function spelling and pinned silence on an invalid program.
+        mode) src='int x __attribute__((mode(DI)));' ;;
         cleanup) src='void h(int *p); void f(void){ int v __attribute__((cleanup(h))); (void)v; }' ;;
         visibility) src='int x __attribute__((visibility("hidden")));' ;;
         *) src="int x __attribute__(($a));" ;;
@@ -85,6 +89,14 @@ for a in packed noinline noreturn const pure always_inline; do
     expect "misapplied:$a" "'$a' attribute ignored" \
         "int x __attribute__(($a));" -Wattributes
 done
+
+# `mode` on a FUNCTION declarator is class 1b, not class 1: measured
+# gcc-16.2 -fsyntax-only on `int f(void) __attribute__((mode(DI)));` is
+# `error: mode 'DI' applied to inappropriate type`. LCCC's central
+# Parser::apply_mode_attribute now gives the same verdict and wording; pin it
+# so the empty-silence fixture above can never hide a misapplied attribute.
+expect "misapplied:mode" "mode 'DI' applied to inappropriate type" \
+    'int f(void) __attribute__((mode(DI)));'
 
 # --- class 2: benign (diagnostics/optimisation only) -> silent ---------------
 for a in format nonnull warn_unused_result deprecated sentinel \

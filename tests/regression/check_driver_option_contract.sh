@@ -23,7 +23,7 @@ for flag in \
     -flto -flto=auto \
     -fsanitize=address -fsanitize=undefined \
     -fvisibility=bogus -ftrivial-auto-var-init=bogus -fzero-call-used-regs=bogus \
-    -fopenmp -freg-struct-return \
+    -freg-struct-return \
     -fno-profile-arcs -fno-test-coverage -fno-branch-probabilities -fno-auto-profile \
     -ftest-coverage -fprofile-arcs \
     -finstrument-functions-exclude-file-list=generated.c \
@@ -42,6 +42,33 @@ for flag in \
         grep -Fq -- "$flag" "$td/err" || { cat "$td/err" >&2; exit 1; }
     done
 done
+# -fopenmp is IMPLEMENTED (serial OpenMP execution model).  The GCC 16.2
+# oracle emits zero GOMP_* calls for pr89235.c's `declare simd` shape, so the
+# serial contract is correct, and silently accepting an unimplemented flag
+# would still be a defect.  Accepting it is only honest if the observable
+# effect is there: `_OPENMP 202111` (measured gcc-16.2 -fopenmp -dM -E), and
+# -fno-openmp must withdraw it.  check_vectorizer_openmp_policy.sh pins the
+# full 31-case policy; this gate pins that the driver no longer REFUSES the
+# flag and that acceptance is not an inert no-op.
+"$CCC" -fopenmp -dM -E "$td/plain.c" >"$td/openmp.macros" 2>"$td/openmp.err" || {
+    echo "FAIL: -fopenmp is implemented but was refused" >&2
+    cat "$td/openmp.err" >&2
+    exit 1
+}
+grep -Fxq '#define _OPENMP 202111' "$td/openmp.macros" || {
+    echo "FAIL: -fopenmp was accepted without defining _OPENMP 202111" >&2
+    exit 1
+}
+"$CCC" -fno-openmp -dM -E "$td/plain.c" >"$td/no_openmp.macros" 2>"$td/no_openmp.err" || {
+    echo "FAIL: -fno-openmp was refused" >&2
+    cat "$td/no_openmp.err" >&2
+    exit 1
+}
+if grep -q '_OPENMP' "$td/no_openmp.macros"; then
+    echo "FAIL: -fno-openmp still defines _OPENMP" >&2
+    exit 1
+fi
+
 # A table miss (a spelling newer than this tree) is DIAGNOSED but tolerated:
 # the build continues (a probe must not be lied into "supported", but a newer
 # GNU's inert preference must not break a real build either); strict mode is

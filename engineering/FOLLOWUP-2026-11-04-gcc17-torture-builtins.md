@@ -388,3 +388,276 @@ x86_64 compile (2016) = **1977 pass / 23 compile-fail / 15 reference-compile-ski
 (+7 pass, -7 fail). The remaining 23 are the honestly open families in §5
 (parser-depth `limits-*`, inline-asm constraints, deliberate per-vectorizer flags,
 and remaining GNU declaration corners).
+
+## 9. Follow-up PR #1101 (branch `arena/1a41faea-lccc`, 2026-11-04)
+
+New PR from merged `main` `49489a5d51d2dca602c171f686cb358058965a45`. Every
+number below is a fresh measurement on this branch with the fastbuild preset,
+a 4 GiB swap file, `gcc-16 (GCC) 16.2.0` as oracle and Clang 23.1.4 /
+hosted ICX 2026.2 as cross-checks. Baseline is the fresh merged-main
+compile matrix in `/home/user/.cache/lccc-torture/baseline/`.
+
+### 9.1 Measured compile-leg movement
+
+| leg | baseline | PR #1101 | delta |
+|---|---|---|---|
+| x86_64 `-O2` compile | 1977 pass / 23 fail / 15 ref-skip / 1 unsupported | **1993 pass / 7 fail** / 15 ref-skip / 1 unsupported | **+16 pass, −16 fail** |
+| i686 `-O2` compile | 1968 pass / 25 fail / 22 ref-skip / 1 unsupported | **1984 pass / 9 fail** / 22 ref-skip / 1 unsupported | **+16 pass, −16 fail** |
+
+Two further i686-only defects were found and fixed after the S03 measurement
+(`20041119-1.c`, `20111209-1.c`). The next full matrix (S04, after both fixes)
+is **x86_64 1993 pass / 7 compile-fail / 15 ref-skip / 1 unsupported** and
+**i686 1986 pass / 7 compile-fail / 22 ref-skip / 1 unsupported** — both legs
+now have the *same* seven remaining non-passes, listed with their root causes
+in §9.4. **Matrix hygiene (red-team of the evidence itself):** S05 was
+discarded because its harness silently fell back to `/usr/bin/gcc` (Debian
+12.2.0) instead of the pinned GCC 16.2 oracle — 12 reference ICEs and one
+60 s timeout were compiler bugs of the WRONG oracle, not LCCC regressions.
+S06 was deliberately invalidated by the harness itself
+(`run inputs changed mid-flight: tools`) because a fastbuild relink happened
+while the matrix was running. The clean, unmodified-binary final matrix is
+S07 (§9.5). Both discarded runs are kept as evidence that no number here is
+accepted without checking the oracle identity and the run's `tools` digest.
+
+### 9.2 Fixed families (change-by-change)
+
+1. **Inline-asm constraints (4 cases).** `asm_validate::check_constraint`
+   modelled a constraint as a comma-free set of letters. It now implements the
+   measured GCC 16.2 grammar: comma-separated ALTERNATIVES (accept if ANY is
+   satisfiable), cost/selection modifiers `? ! ^ $ *`, `#` comment tails with
+   punctuation validation, operand-count consistency, matching-digit range
+   checks, and a shared grammar in `common::asm_constraints` plus both x86 and
+   i686 `classify_constraint`. `s`/`n`/string-literal constness rules were
+   measured, not guessed. An old test encoding a **gcc 14.2** measurement
+   (`"n"(symbol)` accepted) was corrected against 16.2.
+2. **Per-vectorizer flags (4 cases) + `-fopenmp` (1 case).** GCC has three
+   independent tri-state switches; explicit per-family flags override the
+   master in either order and last-wins within a family (measured with
+   `-fopt-info-vec-optimized`). `passes::VectorizePolicy` carries them from
+   CLI through `Driver` to `run_passes`. `-fopenmp` selects OpenMP's
+   single-thread SERIAL execution model (all `#pragma omp` directives are
+   no-ops, which is a conforming OpenMP execution); gcc 16.2 emits ZERO
+   `GOMP_*` calls for `pr89235.c`'s `declare simd` shape. The observable
+   effect is `_OPENMP 202111` (measured `gcc-16 -fopenmp -dM -E`); it is
+   `Class::Implemented` in the GP-22 option-effect ledger, not an inert noop.
+   Runtime entry points are resolved by the linker, never fabricated.
+3. **GNU declaration corners (6 cases, two root causes).** (a) Implicit-int
+   file-scope declarations under `-fpermissive` now emit ONE correctly
+   classified `WarningKind::ImplicitInt` warning and yield `int`; the
+   diagnostic engine owns the C23 default-error promotion, so default-mode
+   parity with GCC is preserved (measured: both reject with 3 errors).
+   `struct S { int x };` is a GCC pedwarn, not a parse error. (b) C11 6.9.2p2
+   tentative definitions of a record completed LATER in the TU are now
+   resolved at the END of the TU in `sema::analysis`; a still-incomplete
+   object at end of TU remains an error (measured against GCC).
+4. **`limits-pointer.c`.** `POINTER_DEPTH_BUDGET` was 4096, calibrated for a
+   hypothetical 8 MB stack, while the compiler thread actually has 64 MB.
+   Re-measured at 10k/20k/32k/65k stars (0.010/0.014/0.023/0.039 s, all rc0)
+   and raised to 65,536, still >6x below the ~400k-star clone/drop stack
+   overflow point. 80k stars produce exactly one clean budget diagnostic.
+5. **Two pre-existing i686 defects.** `{esi}` explicit-register constraints
+   were misclassified as "immediate-only" (letters e/s/i) by
+   `constraint_is_immediate_only`; and `__attribute__((mode(SI)))` on a
+   POINTER typedef rewrote `char *` into `int *`. GCC 16.2 accepts `mode(SI)`
+   on `-m32` (SI is the pointer mode) and rejects it on x86-64 with
+   `invalid pointer mode 'SI'`; `mode(DI)` is the 64-bit spelling. LCCC now
+   matches both directions.
+6. **Red-team: the deferred-incomplete fix had a semantic hole.** The first
+   version deferred *every* file-scope incomplete object, so
+   `struct c x = {0}; struct c { int e; };` was silently ACCEPTED, while gcc
+   16.2 refuses (`variable 'x' has initializer but incomplete type`). C11
+   6.9.2p2: an INITIALIZED declaration is a definition, not a tentative
+   definition; only the latter may be completed later. `sema::analysis` now
+   distinguishes the three cases (initializer / `extern` / tentative) and
+   uses gcc's exact wording. Eight shapes (file scope, block scope, `extern`,
+   still-incomplete) are pinned in the gate; all eight match gcc 16.2's
+   verdict AND diagnostic.
+7. **Red-team: four more inline-asm grammar holes.** A 64-spelling
+   accept/reject differential against gcc 16.2 found and fixed: (a) an
+   unmodelled letter is an *impossible ALTERNATIVE*, not a validity error
+   (`"z,r"` / `"r,z"` compile, `"z"` alone does not); (b) a bare `Y`/`C`
+   class prefix without its following letter is impossible, and a `#`-only
+   constraint is `inconsistent operand constraints in an 'asm'`; (c) `%` on
+   the LAST operand is `'%' constraint used with last operand`; (d) a
+   matching digit after a class pair (`"Yz0"`) must be range-checked too.
+   Red-teaming the fix itself then caught an OVER-rejection: the first
+   implementation aborted an alternative on the first unmodelled letter,
+   wrongly refusing `rz`, `zr`, `zri`, `rzi`, `Yzz`. gcc 16.2 accepts all
+   five because a class letter is still present in the SAME alternative;
+   the loop now keeps scanning. All **64 spellings** agree with gcc 16.2 on
+   accept/reject (0 divergences); verbatim diagnostics are pinned in 42
+   Rust unit tests.
+8. **Red-team: `mode(M)` was implemented three times, divergently.**
+   `declarations.rs` (file + block scope) and `nested_functions.rs` each had
+   their own rule; the nested-function path still did an unconditional
+   `mk.apply(type_spec)`. One `Parser::apply_mode_attribute` now serves all
+   three, with the measured gcc 16.2 rule: FUNCTION/ARRAY declarator →
+   `mode 'M' applied to inappropriate type`; POINTER → target-mode validation
+   with the pointee untouched; scalar → base-type transform. A 10-shape
+   differential on BOTH ABIs is pinned in the gate (§9.4 lists the
+   specifier-position shapes that remain open).
+
+### 9.3 New regression coverage (all wired into BOTH CI mirrors)
+
+`check_gcc_asm_constraints.sh` (21 checks, incl. the 64-spelling gcc 16.2
+accept/reject differential), `check_vectorizer_openmp_policy.sh` (31),
+`check_gnu_declaration_corners.sh` (22, incl. 8 C11 6.9.2p2 shapes and the
+2×10-shape two-ABI `mode(M)` differential), `check_parser_depth_limits.sh`
+(4). They cover both ABIs, exact GCC diagnostics, end-to-end runtime
+execution, artifact-level policy effects and the still-correct refusals.
+CI/local gate parity PASS, workflow shell audit PASS, lane plan PASS
+(frontend-a 360.43 s / 59 steps after re-measuring worst-of-3 gate costs),
+option-effect ledger PASS, pipefail/SIGPIPE detector PASS. The swallowed
+`|| true` in the GNU gate was removed; the gcc oracle's exit status is now
+asserted.
+
+### 9.4 Honest remaining gaps (NOT claimed fixed)
+
+| case | root cause | measured oracle |
+|---|---|---|
+| `limits-caselabels.c` | 100,000 `case` labels are parsed/lowered as a 100k-deep RECURSIVE chain; `SwitchFrame::overlaps` is also O(n²) | gcc 16.2 0.331 s, clang 0.225 s, lccc clean budget error in 0.101 s |
+| `limits-exprparen.c` | 10,000 nested parentheses need ~65k expression frames (budget 32768); the 64 MB thread stack is too small for the recursive descent | gcc 16.2 0.026 s; clang 23.1.4 **segfaults** (rc −11) |
+| `limits-structnest.c` | 10,000 nested anonymous record definitions; quadratic `TypeSpecifier`/`Vec<StructFieldDecl>` clone cascades (callgrind: 812,222,167 Ir at depth 1000, dominated by malloc/free/clone) | gcc 16.2 1.874 s; clang 23.1.4 **segfaults** (rc −11) |
+| `991213-2.c` | K&R function definition whose parameter list contains a complex function-pointer declarator `void (* const (funcp)(time_t))` | gcc 16.2 accepts with `-std=gnu89` |
+| `pr115143-2.c`, `pr115143-3.c` | `-fgimple` / `__GIMPLE` — GCC's internal GIMPLE front end, not ISO/GNU C | gcc 16.2 accepts; deliberately out of scope |
+| `pr67106.c` | `-fpack-struct` data-model request | **deliberate, correct** rejection: ignoring it would silently change object layout (see `src/driver`) |
+
+**`ovf.c` diagnostic parity:** no exact `ovf.c` exists in this repository, in
+the pinned GCC 17 testsuite, or in the GCC mirror (checked with `find`,
+`gh api contents`, `gh api search/code`). The only matches are fuzzy:
+`gcc.dg/tree-ssa/minus-ovf.c` (an optimisation dump test that all three
+compilers compile with ZERO diagnostics) and `aarch64/fmovf.c` /
+`vect-fmovf.c`. The repo's one documented *overflow diagnostic* gap is
+`engineering/FOLLOWUP-2026-09-27-S11-decimal-f33-redteam.md` §Open: "lccc
+`-Woverflow` diagnostic parity (GCC warns on peUnder/peOver-style folds;
+lccc is silent)" for decimal-float constant folding. That is a separate
+item and is NOT claimed fixed here — the exact file the requester meant must
+be identified before any claim of parity can be made.
+
+**Parser-depth red-team result (measured, not guessed):** simply raising all
+budgets and the stack is NOT a valid fix. With `PARSER_FRAME_BUDGET=262144`,
+`BLOCK_FRAME_BUDGET=262144`, `TYPE_FRAME_BUDGET=65536` and
+`POINTER_DEPTH_BUDGET=65536`: `limits-caselabels.c` aborted (rc −6) at
+64/128/256 MB and timed out >120 s at 512/1024 MB; `limits-exprparen.c`
+needed ≥256 MB; `limits-structnest.c` stayed 24.6–25.4 s at every stack
+size. Deep-anonymous-struct generator at 1 GB: depth 500/1000/2000/4000/
+8000/10000 → 0.034/0.103/0.473/3.148/15.705/25.598 s (quadratic). The
+correct fix is iterative/non-recursive parsing and lowering plus indexed
+duplicate detection and elimination of the type-field clone cascades — a
+substantially larger change than a budget bump, and it is left OPEN with
+evidence rather than papered over.
+
+**Remaining `mode(M)` gaps (measured, pre-existing, NOT claimed fixed):**
+`__attribute__((mode(M)))` in SPECIFIER position is applied to the base type
+specifier in `parser::types::parse_type_specifier` before the declarator is
+known. gcc 16.2 instead applies it to the completed declaration, so
+`__attribute__((mode(SI))) int f(void)` (function),
+`__attribute__((mode(SI))) int x[3]` (array) and
+`__attribute__((mode(SI))) int *p` / `void f(char *p __attribute__((mode(DI))))`
+(pointer mode on a parameter or struct field) still diverge on x86-64 / i686
+respectively. Both other spellings (declarator- and post-declarator-position)
+are covered by the central rule. Fixing this requires deferring the
+specifier-level mode until the declarator is parsed across typedefs, fields,
+parameters and casts — a parser-wide refactor with regression risk, deliberately
+left OPEN with the 4 x86-64 / 5 i686 measured divergences recorded rather than
+papering over them. No GCC 17 torture case uses these shapes.
+
+**Hosted CI red → repaired (data-driven):** run `41882988078` on the S02
+revision had exactly two failures: "Pipefail/SIGPIPE detector" (job
+`126762142450`) and "Verify toolchain bundle and shard-partition contracts
+(mock only)" (job `126762142144`). The first was caused by seven
+`printf ... | grep -q` producer/SIGPIPE sites in the two new shell gates;
+all were rewritten to `grep -q ... <<<"$var"`. The second was caused by four
+new CI steps missing from `.github/ci-lane-plan.json`; the lane plan now lists
+all four with measured costs. `check_pipefail_sigpipe.py` passes across 344
+CI-run scripts and `check_ci_lane_plan.py` passes. `cargo fmt --all` is clean
+(the earlier "FMT_CHECK_RC=0" was a `| head` pipeline artifact masking two
+real diffs).
+
+**Diagnostic-parity gaps for INVALID programs (tracked):** GCC 16.2 rejects
+`"m"(5)`, `"s"(x_param)`, `"i"(x_param)` and `"n"(symbol)` in dead /
+empty-template asm at `-O2`; lccc's deferred immediate validation currently
+accepts them because the post-optimisation check only sees SURVIVING
+`InlineAsm` instructions. No VALID program is miscompiled by this.
+
+**Toolchain honesty:** GCC 16.2.0 and Clang 23.1.4 ran locally on every
+measurement; hosted CI's "Authenticated Intel ICX 2026.2 integration" job is
+green on this branch and is the third oracle. No PMU/`perf` is available on
+this host, so NO cycle claims are made; performance evidence is wall-clock,
+callgrind instruction counts and artifact comparisons.
+
+### 9.5 Final clean matrix (S07)
+
+Re-run with the pinned GCC 16.2 oracle, an unchanged fastbuild binary for the
+whole run, and no concurrent cargo work. Filled in below from the JSON
+`tools`/`complete`/`fatal` fields; a run with `fatal` set is NEVER quoted.
+
+| leg | S04 (pre-red-team) | S07 (final) |
+|---|---|---|
+| x86_64 `-O2` compile | 1993 pass / 7 fail / 15 ref-skip / 1 unsupported | _S07 RESULT_ |
+| i686 `-O2` compile | 1986 pass / 7 fail / 22 ref-skip / 1 unsupported | _S07 RESULT_ |
+
+### 9.6 Local CI contract: three REAL contract defects found and fixed
+
+Running `scripts/ci_local.sh --fast` on the S02 revision (which had never been
+done) exposed three defects that the earlier targeted checks had missed. All
+three are fixed here with measured evidence, not by relaxing a gate:
+
+| gate | defect | fix |
+|---|---|---|
+| `driver-option-contract-core` | the gate still demanded `-fopenmp` be REFUSED; S02 implemented it (`_OPENMP 202111`) | removed the flag from the refusal list and added a POSITIVE contract: `-fopenmp -dM -E` must define `#define _OPENMP 202111`, `-fno-openmp` must not. The 31-case `check_vectorizer_openmp_policy.sh` remains the full policy gate. |
+| `attribute-class-diagnostics` | the `mode` fixture used `int f(void) __attribute__((mode(DI)));` and expected SILENCE, but gcc 16.2 refuses that spelling with `mode 'DI' applied to inappropriate type` | moved the fixture to the position gcc actually accepts silently (`int x __attribute__((mode(DI)));`) and added a class-1b assertion pinning the refusal AND wording on the function declarator. |
+| `audit-census-ratchet` | `parse_external_decl` grew from 298 to 324 lines, so `fns_over_300` went 232 -> 233 | extracted the C89 implicit-int fallback into `Parser::implicit_int_type_specifier`. Census is back at the 232 baseline; NO re-baseline was used. |
+
+**Full local verification after those fixes** (fastbuild, 4 GiB swap,
+gcc-16.2 + clang-23.1.4 + rust-1.99.1 all on `PATH`):
+
+* `cargo fmt --all --check` PASS; `check_clippy_policy.py` PASS (76 lints, 0
+  unknown, 0 warnings); `cargo test --profile fastbuild --all-targets` PASS
+  (**7941 passed / 0 failed / 10 ignored**, zero compiler warnings/errors);
+* `audit_census.py --check` PASS (all nine metrics held);
+* `check_ci_gate_parity.py` PASS (538 commands / 27 contracts),
+  `check_ci_workflow_shell.py` PASS (14 workflows / 2 rules),
+  `check_ci_lane_plan.py` PASS (frontend-a 360.43 s / 59 steps),
+  `check_ci_shard_partition.py` PASS (85 / 116 disjoint gates),
+  `check_pipefail_sigpipe.py` PASS (344 scripts),
+  `check_errexit_negation.py` PASS (540 scripts),
+  `check_option_effect_ledger.py` PASS (10 / 10, GCC 16.2.0),
+  `check_doc_links.py` PASS, `check_pr_claim_fidelity.py` PASS;
+* the four new gates: asm constraints **21/21**, GNU declaration corners
+  **22/22**, parser depth **4/4**, vectorizer/OpenMP policy **31/31**;
+* inline-asm `validate()` unit tests **42 / 42**, and a 64-spelling
+  accept/reject differential against gcc 16.2 with **0 divergences**.
+
+**Host-prerequisite classification (data-driven, not handwaving).** The first
+`--fast` run used only gcc-16.2 on `PATH` and reported 39 red gates. Re-running
+all 39 individually with the Clang 23.1.4 bin directory on `PATH` turned **22
+of them green** (`oracle-toolchain`, all seven `ext-vector-*`,
+`microsoft-scalar-abi`, `warning-precedence`, `warning-frame-size`,
+`attribute-diagnostics`, `typed-constant-truth`, `count-observations`,
+`narrow-int-codegen`, `arithmetic-test-sign-cmov`, `fma-contract-gating`,
+`sse34-clang-encoding`, `incoming-byval-homes-clang`, …). The remaining 17 are
+**only** missing external tools that hosted CI provisions and this sandbox's
+network policy blocks, each identified by the failing command:
+
+| missing tool | gates | provenance attempted |
+|---|---|---|
+| `qemu-i386` / `qemu-aarch64` / `qemu-riscv64` | `kernel-codegen-contracts`, `enum-forward-callback-abi`, `pr824-boundaries`, `linker-suite` | `apt-get` has no package lists and no reachable mirror; not in the `harness-cache-4` release assets |
+| `mold` | `gnu-retain-sections` | same |
+| GNU as/objdump 2.47 | `asm-diff-oracle-gas-2.47`, `i686-gnu-vector-abi`, `a64-gas-provision`, `encdiff-*`, `asmdiff-*`, `x86-asm-diff`, `i686-asm-diff` | `ensure_gas_247.sh` tries `mirrors.kernel.org` / `mirror.csclub.uwaterloo.ca`; both TLS-reset in this sandbox. A GitHub source tarball would NOT hash to the pinned immutable GNU release bytes, so it was deliberately not substituted |
+| ARM A64 ISA XML 2026-09 | `arm-a64-xml-provision`, `aarch64-arm-doccheck` | `developer.arm.com` TLS-reset |
+| Linux `relocs` tool | `kernel-relocs-tool`, `linker-suite` | `git.kernel.org` TLS-reset |
+| rustc 1.97.0 via rustup | `msrv-check` | not installed; hosted MSRV job is green |
+
+None of these is a compiler defect, and NO gate was weakened to hide them:
+hosted CI runs exactly the same `--fast` gates with these tools provisioned.
+The local evidence is therefore "every gate whose prerequisites exist PASSES",
+and hosted CI is the authority for the rest. `linker-suite` itself reports
+**335 pass / 0 fail / 6 SKIP** even locally; its exit 1 comes from the
+`--require` host-tool check, not a linker regression.
+
+**ICX honesty:** `kernel-codegen-contracts` and `enum-forward-callback-abi`
+print `UNMEASURED: ICX oracle (not installed)`. The hosted
+"Authenticated Intel ICX 2026.2 integration" job is green on this branch and
+is the third oracle; no local ICX 2026.2 binary exists in this sandbox, so no
+ICX-witnessed numerical claim is made here.

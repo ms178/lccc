@@ -608,7 +608,25 @@ fn check_constraint(
             return;
         }
     }
+    // Measured gcc 16.2 semantics of an IMPOSSIBLE alternative (red-team
+    // differential over 23 shapes): an unmodelled letter (`z`), a bare class
+    // prefix (`Y`, `C`) and an empty alternative are all UNSATISFIABLE, not a
+    // validity error -- `"z,r"` and `"r,z"` compile, `"z"` alone does not.
+    // Silently reclassifying an unknown letter as GpReg would still be a
+    // miscompile; this just moves the refusal to "no alternative works".
+    // A completely empty constraint (`""`) is the one exception: gcc accepts
+    // it as "no constraint at all".
+    let choosing = body.split('#').next().unwrap_or(body);
+    if choosing.is_empty() && !body.is_empty() {
+        problems.push(Diagnostic::error(
+            "inconsistent operand constraints in an 'asm'",
+            Some(index),
+        ));
+        return;
+    }
+    let empty_constraint = body.is_empty();
     let mut any_satisfiable = false;
+    let mut saw_unmodelled = false;
     for alt in &alts {
         let mut has_class = false;
         let mut immediate_only: Option<char> = None;
@@ -621,10 +639,16 @@ fn check_constraint(
                 continue;
             }
             // `Yz` / `Yk` / `Ym` and `C`-prefixed pairs refine a class; the
-            // letter after the prefix is not a class of its own.
+            // letter after the prefix is not a class of its own. A prefix
+            // WITHOUT that letter is impossible (`"Y"` and `"C"` are refused
+            // by gcc, `"Yz"` and `"Ci"` compile).
             if letter == 'Y' || letter == 'C' {
-                letters.next();
-                has_class = true;
+                if letters.next().is_some() {
+                    has_class = true;
+                } else {
+                    // A bare prefix names no class at all.
+                    saw_unmodelled = true;
+                }
                 continue;
             }
             if X86_CLASSES.contains(letter) {
@@ -632,14 +656,13 @@ fn check_constraint(
             } else if X86_IMMEDIATES.contains(letter) {
                 immediate_only.get_or_insert(letter);
             } else {
-                // An unmodelled letter is a VALIDITY error in every
-                // alternative, exactly as before: silently reclassifying it
-                // as GpReg is a miscompile, not a rejected program.
-                problems.push(Diagnostic::error(
-                    "impossible constraint in 'asm'",
-                    Some(index),
-                ));
-                return;
+                // UNMODELLED does NOT poison the whole alternative: gcc 16.2
+                // accepts `rz`, `zr`, `zri`, `rzi` and `Yzz` because a class
+                // letter is still present, and refuses only `z`/`zz` alone.
+                // Keep scanning so a class letter later in the SAME
+                // alternative can satisfy it.  A first draft that broke here
+                // over-rejected all five shapes (red-team differential).
+                saw_unmodelled = true;
             }
         }
         if has_class {
@@ -647,9 +670,14 @@ fn check_constraint(
             break;
         }
         let Some(letter) = immediate_only else {
-            // An empty alternative (a bare `""` constraint) accepts anything.
-            any_satisfiable = true;
-            break;
+            // An empty alternative is unsatisfiable on its own, but harmless
+            // when another alternative works (`"r,"` compiles in gcc). The
+            // whole-empty constraint is the measured exception above.
+            if empty_constraint {
+                any_satisfiable = true;
+                break;
+            }
+            continue;
         };
         if immediate_satisfiable(letter, operand.constant) {
             any_satisfiable = true;
@@ -657,11 +685,16 @@ fn check_constraint(
         }
     }
     if !any_satisfiable {
-        // GCC emits both, in this order, on one operand.
-        problems.push(Diagnostic::warning(
-            format!("'asm' operand {index} probably does not match constraints"),
-            Some(index),
-        ));
+        // gcc emits the "probably does not match constraints" warning for a
+        // const/range/lone-modifier failure, but NOT when an unmodelled
+        // letter is among the alternatives (`"z"`, `"z,i"`, `"C"`, `"Y"` all
+        // produce just the single error).
+        if !saw_unmodelled {
+            problems.push(Diagnostic::warning(
+                format!("'asm' operand {index} probably does not match constraints"),
+                Some(index),
+            ));
+        }
         problems.push(Diagnostic::error(
             "impossible constraint in 'asm'",
             Some(index),
@@ -841,23 +874,48 @@ pub fn validate(
     // rejects a reference to an output that does not exist with
     // `matching constraint references invalid operand number`; the old
     // digit-start early return accepted `"0"(x)` with no outputs silently.
+    let total_operands = outputs.len() + inputs.len();
     for (i, op) in inputs.iter().enumerate() {
+        // `%` declares this operand commutative with the FOLLOWING operand;
+        // gcc 16.2 refuses it on the last one with
+        // "'%' constraint used with last operand". Measured with `"%"`,
+        // `"%r"` and `"%0,0"` as the only input; pr35318.c's `%0,0` has a
+        // following `"m,r"` operand and stays legal.
+        if op.constraint.starts_with('%') && outputs.len() + i + 1 == total_operands {
+            problems.push(Diagnostic::error(
+                "'%' constraint used with last operand",
+                Some(outputs.len() + i),
+            ));
+            continue;
+        }
         let body = op
             .constraint
             .trim_start_matches(|c| MODIFIERS.contains(c) || CONSTRAINT_SKIP.contains(c));
         let choosing = body.split('#').next().unwrap_or(body);
-        for alt in choosing.split(',') {
-            let digits: String = alt.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if digits.is_empty() {
-                continue;
-            }
-            let number = digits.parse::<usize>().unwrap_or(usize::MAX);
-            if number >= outputs.len() {
-                problems.push(Diagnostic::error(
-                    "matching constraint references invalid operand number",
-                    Some(outputs.len() + i),
-                ));
-                break;
+        'alternatives: for alt in choosing.split(',') {
+            // A matching digit can appear AFTER a class pair too: gcc 16.2
+            // reads `"Yz0"` as `Yz` + a tie to output 0 and rejects it when
+            // that output does not exist (red-team differential). Scan EVERY
+            // digit run, not just a leading one. The trailing sentinel flushes
+            // the last run without a second code path.
+            let mut digits = String::new();
+            for ch in alt.chars().chain(std::iter::once(' ')) {
+                if ch.is_ascii_digit() {
+                    digits.push(ch);
+                    continue;
+                }
+                if digits.is_empty() {
+                    continue;
+                }
+                let number = digits.parse::<usize>().unwrap_or(usize::MAX);
+                if number >= outputs.len() {
+                    problems.push(Diagnostic::error(
+                        "matching constraint references invalid operand number",
+                        Some(outputs.len() + i),
+                    ));
+                    break 'alternatives;
+                }
+                digits.clear();
             }
         }
     }
@@ -1830,6 +1888,90 @@ mod tests {
                 op("=r,r", Constness::Unknown),
                 op("=r,r", Constness::Unknown),
             ],
+            &[
+                op("%0,0", Constness::Unknown),
+                op("m,r", Constness::Unknown),
+            ],
+            0,
+            AsmTarget::X86,
+        );
+        assert!(p.is_empty(), "{p:?}");
+    }
+
+    #[test]
+    fn redteam_impossible_alternatives_are_not_validity_errors() {
+        // Measured gcc 16.2 (red-team differential over 23 spellings):
+        // an unmodelled letter or a bare `Y`/`C` prefix makes ONE ALTERNATIVE
+        // impossible, not the whole constraint invalid. `"z,r"` / `"r,z"`
+        // compile; `"z"`, `"C"`, `"Y"`, `"z,i"` refuse with the SINGLE
+        // "impossible constraint" diagnostic (no "probably does not match"
+        // warning when an unmodelled alternative is present).
+        for c in [
+            "z,r", "r,z", "r,", "r,?", "Yz", "Cc", "", "rz", "zr", "zri", "rzi", "Yzz", "Yzr",
+            "zz,r", "r,zr", "rz,r",
+        ] {
+            let p = validate("", &[op(c, Constness::Unknown)], &[], 0, AsmTarget::X86);
+            assert!(p.is_empty(), "\"{c}\": {p:?}");
+        }
+        for c in ["z", "C", "Y"] {
+            let p = validate("", &[op(c, Constness::Unknown)], &[], 0, AsmTarget::X86);
+            assert_eq!(messages(&p), ["impossible constraint in 'asm'"], "\"{c}\"");
+        }
+        // With a DYNAMIC operand the immediate alternative is impossible too,
+        // so the whole set fails. gcc emits just the single error because an
+        // unmodelled alternative is present (no "probably does not match").
+        for c in ["z,i", "i,z", "I,z"] {
+            let p = validate("", &[op(c, Constness::NonConstant)], &[], 0, AsmTarget::X86);
+            assert_eq!(messages(&p), ["impossible constraint in 'asm'"], "\"{c}\"");
+        }
+        // A constraint whose only content is a `#` comment has no alternative
+        // at all: gcc's distinct diagnostic.
+        assert_eq!(
+            messages(&validate(
+                "",
+                &[op("#foo", Constness::Unknown)],
+                &[],
+                0,
+                AsmTarget::X86,
+            )),
+            ["inconsistent operand constraints in an 'asm'"]
+        );
+        // A lone cost modifier with no class/immediate alternative: gcc emits
+        // the warning AND the error.
+        assert_eq!(
+            messages(&validate(
+                "",
+                &[op("?", Constness::Unknown)],
+                &[],
+                0,
+                AsmTarget::X86,
+            )),
+            [
+                "'asm' operand 0 probably does not match constraints",
+                "impossible constraint in 'asm'"
+            ]
+        );
+    }
+
+    #[test]
+    fn redteam_commutative_modifier_needs_a_following_operand() {
+        for c in ["%", "%r", "%0,0"] {
+            assert_eq!(
+                messages(&validate(
+                    "",
+                    &[],
+                    &[op(c, Constness::Unknown)],
+                    0,
+                    AsmTarget::X86,
+                )),
+                ["'%' constraint used with last operand"],
+                "\"{c}\""
+            );
+        }
+        // With a following operand the `%` tie is legal (pr35318.c shape).
+        let p = validate(
+            "",
+            &[op("=r,r", Constness::Unknown)],
             &[
                 op("%0,0", Constness::Unknown),
                 op("m,r", Constness::Unknown),
