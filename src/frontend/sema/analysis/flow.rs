@@ -287,9 +287,46 @@ impl<'a, 's> Graph<'a, 's> {
                 let right = self.expr(rhs, next);
                 self.expr(lhs, right)
             }
-            _ if self.sema.is_noreturn_call(expr) => DIVERGES,
-            _ => next,
+            Expr::GenericSelection(controlling, associations, _) => {
+                // The controlling expression is unevaluated; only the
+                // association selected by the same type checker used by sema
+                // contributes run-time control flow. Never visit all arms.
+                self.sema
+                    .expr_type_checker()
+                    .generic_selection_index(controlling, associations)
+                    .and_then(|index| associations.get(index))
+                    .map_or(next, |association| self.expr(&association.expr, next))
+            }
+            // These operands are unevaluated. VLA bounds written in the
+            // corresponding type names are a separate, still-conservative
+            // limitation (see the follow-up audit note).
+            Expr::Sizeof(..)
+            | Expr::Countof(..)
+            | Expr::Alignof(..)
+            | Expr::GnuAlignof(..)
+            | Expr::AlignofExpr(..)
+            | Expr::GnuAlignofExpr(..)
+            | Expr::TypeOperand(..)
+            | Expr::BuiltinTypesCompatibleP(..)
+            | Expr::LabelAddr(..) => next,
+            _ if self.sema.is_noreturn_call(expr) => self.expr_children(expr, DIVERGES),
+            _ => self.expr_children(expr, next),
         }
+    }
+
+    /// Traverse evaluated subexpressions in AST source order. Their C
+    /// evaluation order is often unspecified, but every operand must be
+    /// evaluated on a path that reaches the enclosing expression's
+    /// continuation. Statement expressions nested in calls, assignments,
+    /// subscripts, compound-literal initializers, and other ordinary operands
+    /// therefore share the enclosing transfer targets and label namespace.
+    fn expr_children(&mut self, expr: &'a Expr, mut next: NodeId) -> NodeId {
+        let mut children = Vec::new();
+        expr.for_each_child(&mut |child| children.push(child));
+        for child in children.into_iter().rev() {
+            next = self.expr(child, next);
+        }
+        next
     }
 
     fn reaches_end(mut self, entry: NodeId) -> bool {

@@ -84,6 +84,30 @@ CASES.update({
     "gnu_conditional_trap": ("(void)(0 ?: ({ __builtin_trap(); 0; }));", 0),
     "gnu_conditional_notrap": ("(void)(1 ?: ({ __builtin_trap(); 0; }));", 1),
     "asm_goto_exit": ('asm goto ("" : : : : out); return 1; out:;', 1),
+    # Statement expressions nested in ordinary evaluated operands must retain
+    # the enclosing return/goto context. _Generic evaluates only its selected
+    # association, while sizeof and _Alignof operands remain unevaluated.
+    "nested_call_argument_return": (
+        "extern void consume(int); consume(({ return 7; 0; }));", 0
+    ),
+    "nested_subscript_index_return": (
+        "int a[1]; (void)a[({ return 7; 0; })];", 0
+    ),
+    "nested_assignment_rhs_return": (
+        "int x=0; x = ({ return 7; 0; });", 0
+    ),
+    "nested_call_argument_conditional_return": (
+        "extern int unknown; extern void consume(int); "
+        "consume(({ if (unknown) return 7; 0; }));", 1
+    ),
+    "generic_selected_stmt_expr_return": (
+        "extern int value; (void)_Generic(value, int: ({ return 7; 0; }), "
+        "default: 1);", 0
+    ),
+    "generic_unselected_stmt_expr_return": (
+        "extern int value; (void)_Generic(value, int: 1, "
+        "default: ({ return 7; 0; }));", 1
+    ),
 })
 # GCC also diagnoses the unreachable statement before the first case label.
 # Require that exact extra diagnostic rather than disabling it or accepting
