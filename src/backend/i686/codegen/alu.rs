@@ -90,18 +90,18 @@ impl I686Codegen {
         match ty {
             IrType::I8 | IrType::U8 => {
                 self.state.emit("    andl $0xff, %eax");
-                self.emit_clz32_baseline("eax", "eax", Some("ecx"));
+                self.emit_clz32_baseline("eax", "eax");
                 self.state.emit("    subl $24, %eax");
             }
             IrType::I16 | IrType::U16 => {
                 // clz16(x) = clz32(zext16(x)) - 16 == 15 - msb16(x);
                 // clz32(zext(0)) - 16 = 32 - 16 = 16 == lzcntw(0) ✓
                 self.state.emit("    movzwl %ax, %eax");
-                self.emit_clz32_baseline("eax", "eax", Some("ecx"));
+                self.emit_clz32_baseline("eax", "eax");
                 self.state.emit("    subl $16, %eax");
             }
             _ => {
-                self.emit_clz32_baseline("eax", "eax", Some("ecx"));
+                self.emit_clz32_baseline("eax", "eax");
             }
         }
     }
