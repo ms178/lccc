@@ -8439,7 +8439,6 @@ dereference it before applying '->' to it?"
                 PtrQuals::recorded(AddressSpace::Default, PtrQuals::CONST),
             )
         };
-        let char_ptr = || CType::Pointer(Box::new(CType::Char), PtrQuals::GENERIC);
         let double_ptr = || CType::Pointer(Box::new(CType::Double), PtrQuals::GENERIC);
         let float_ptr = || CType::Pointer(Box::new(CType::Float), PtrQuals::GENERIC);
         let param = |ty| (ty, None);
