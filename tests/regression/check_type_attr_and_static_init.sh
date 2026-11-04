@@ -77,6 +77,13 @@ int diff_a = &"Foobar"[1] - &"Foobar"[0];
 int diff_d = &"Foobar"[3] - &"Foobar"[1];
 int diff_scaled = (int *)&"Foobar"[4] - (int *)&"Foobar"[0];
 long diff_long = (long)&"Foobar"[1] - (long)&"Foobar"[0];
+/* Commutative and chained pointer arithmetic (GCC 16.2 folds all of them). */
+int diff_commutative = 1 + "Foobar" - "Foobar";
+int diff_chain = ("Foobar" + 3 - 1) - ("Foobar" + 1);
+/* Wide literals: pointer difference is in ELEMENTS, a cast changes the scale. */
+int diff_wide = &L"Foobar"[1] - &L"Foobar"[0];
+int diff_wide2 = &L"Foobar"[3] - &L"Foobar"[1];
+int diff_wide_cast = (int *)&L"Foobar"[4] - (int *)&L"Foobar"[0];
 
 int main(void)
 {
@@ -97,6 +104,11 @@ int main(void)
     CHECK(diff_d == 2);
     CHECK(diff_scaled == 1);
     CHECK(diff_long == 1);
+    CHECK(diff_commutative == 1);
+    CHECK(diff_chain == 1);
+    CHECK(diff_wide == 1);
+    CHECK(diff_wide2 == 2);
+    CHECK(diff_wide_cast == 4);
 
     /* The same fold in a block-scope `static` (a different sema path). */
     static int block_static = &"Foobar"[2] - &"Foobar"[0];
@@ -156,6 +168,52 @@ C
 cat >"$tmp/bad_diff.c" <<'C'
 int b = &"Foobar"[1] - &"Baz"[0];
 int c = &"Foobar"[1] - &"Fooba"[0];
+C
+cat >"$tmp/bad_kind.c" <<'C'
+int a = &"Foobar"[1] - &L"Foobar"[0];
+C
+
+# ── Runtime program: GCC 17 torture compile legs fixed in the same audit ───
+# vector-2.c (vector STRUCT MEMBER), 20010113-1.c / 20050516-1.c (address of
+# a member through a nested/absolute pointer chain) and pr48517.c (an
+# UNSIZED static array initialized from a whole-array compound literal).
+# Every value is additionally checked against the GCC 16.2 oracle.
+cat >"$tmp/runtime2.c" <<'C'
+#include <stdio.h>
+#define vector __attribute__((vector_size(16)))
+struct ss { vector float mVec; };
+vector float getCapsule(vector int t)
+{
+  vector float t1 = (vector float)t;
+  struct ss y = {t1};
+  *((float*)&y.mVec) = 1.0;
+  float local = 2.0f;          /* must NOT inherit the member's attribute */
+  (void)local;
+  return y.mVec;              /* must be a vector, not a plain float */
+}
+
+struct { struct { int x; int y; } p; } v;
+int *z = &((&(v.p))->y);
+struct S { char s; int pad; };
+struct T { struct S t; };
+struct S *const p = &((struct T * const)(0x4000))->t;
+
+static void arr(void)
+{
+  static const unsigned short a[] = (const unsigned short []) { 0x0D2B, 0x1234 };
+  printf("%zu %u %u\n", sizeof(a), a[0], a[1]);
+}
+
+int main(void)
+{
+  vector int t = {1,2,3,4};
+  vector float r = getCapsule(t);
+  float *f = (float *)&r;
+  printf("%zu %g %d %p\n", sizeof(r), (double)f[0],
+         (int)((char *)z - (char *)&v), (void *)p);
+  arr();
+  return 0;
+}
 C
 
 expect_error() {
@@ -217,6 +275,9 @@ run_target() {
     echo "$label/bad_return.c: GCC 16.2 rejects it too"
 
     expect_error bad_diff.c "initializer element is not constant"
+    # Identical TEXT but different literal kinds are different objects and
+    # incompatible pointer types; GCC 16.2 and LCCC both reject this.
+    expect_error bad_kind.c "invalid operands to binary -"
 
     local f
     for f in scope_typedef.c scope_struct.c scope_globals.c scope_param.c \
@@ -244,6 +305,26 @@ run_target() {
         [ "$g_rc" -eq "$nrc" ] || {
             echo "$label $opt nested vector return: GCC16.2 rc=$g_rc vs LCCC rc=$nrc"; return 1; }
         echo "$label $opt nested vector return: rc=0 (GCC16.2 parity)"
+    done
+
+    # The four additional GCC 17 compile-leg families, at -O0 and -O2, with
+    # GCC 16.2 compiling the SAME source as the value oracle. This proves
+    # sizeof(a) is not left at the incomplete-array placeholder, that the
+    # struct member stayed a vector, and that every member offset is right
+    # on BOTH pointer widths.
+    for opt in -O0 -O2; do
+        "$compiler" ${mflag:-} "$opt" -msse "$tmp/runtime2.c" -o "$tmp/r2_lccc" || {
+            echo "$label $opt: GCC17 fixed-family program failed to link"; return 1; }
+        "$GCC" ${mflag:-} "$opt" -msse "$tmp/runtime2.c" -o "$tmp/r2_gcc" || {
+            echo "$label $opt: GCC16.2 oracle failed to link"; return 1; }
+        local lout gout lrc=0 grc=0
+        lout=$("$tmp/r2_lccc") || lrc=$?
+        gout=$("$tmp/r2_gcc") || grc=$?
+        [ "$lrc" -eq 0 ] || { echo "$label $opt runtime2: rc=$lrc"; return 1; }
+        [ "$grc" -eq 0 ] || { echo "$label $opt runtime2: GCC rc=$grc"; return 1; }
+        [ "$lout" = "$gout" ] || {
+            echo "$label $opt runtime2: LCCC='$lout' GCC16.2='$gout'"; return 1; }
+        echo "$label $opt GCC17 fixed-family runtime: PASS ($lout)"
     done
 }
 

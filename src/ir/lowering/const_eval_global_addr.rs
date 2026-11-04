@@ -993,27 +993,68 @@ impl Lowerer {
     /// Resolve &(base->field) where base is a constant pointer expression
     /// involving a global array (e.g., &((Upgrade_items + 1)->uaattrid)).
     /// The base must resolve to a global address (possibly with offset).
-    fn resolve_pointer_member_access_addr(&self, base: &Expr, field: &str) -> Option<GlobalInit> {
-        // The base expression should be a pointer to a global (array element).
-        // Try to evaluate it as a global address expression.
-        let base_init = self.eval_global_addr_expr(base)?;
-        let (global_name, base_offset) = match &base_init {
-            GlobalInit::GlobalAddr(name) => (name.clone(), 0i64),
-            GlobalInit::GlobalAddrOffset(name, off) => (name.clone(), *off),
+    /// Byte offset of `field` in the struct/union the pointer expression
+    /// `base` points to. The GLOBAL's own layout is NOT the right layout:
+    /// `&((&(v.p))->y)` addresses `y` inside the nested `p` record, while
+    /// `globals["v"].struct_layout` describes `v` (whose only field is `p`).
+    /// Deriving it from the base expression's own CType also covers absolute
+    /// addresses (`(struct T *)0x4000`), which have no global at all.
+    fn pointer_member_field_offset(&self, base: &Expr, field: &str) -> Option<i64> {
+        let pointee = match self.get_expr_ctype(base)? {
+            CType::Pointer(inner, _) | CType::Array(inner, _) => *inner,
             _ => return None,
         };
-        // Get the struct layout for the element type.
-        // The global should be an array of structs.
-        let ginfo = self.globals.get(&global_name)?;
-        let layout = ginfo.struct_layout.clone()?;
-        let (field_offset, _field_ty) =
-            layout.field_offset(field, &*self.types.borrow_struct_layouts())?;
-        let total_offset = base_offset + field_offset as i64;
-        if total_offset == 0 {
-            Some(GlobalInit::GlobalAddr(global_name))
-        } else {
-            Some(GlobalInit::GlobalAddrOffset(global_name, total_offset))
+        let (CType::Struct(key) | CType::Union(key)) = pointee else {
+            return None;
+        };
+        let layouts = self.types.borrow_struct_layouts();
+        let (offset, _) = layouts.get(&*key)?.field_offset(field, &*layouts)?;
+        i64::try_from(offset).ok()
+    }
+
+    fn resolve_pointer_member_access_addr(&self, base: &Expr, field: &str) -> Option<GlobalInit> {
+        // Field offset from the POINTEE type, with the historical
+        // global-layout path as a fallback for layouts the expression type
+        // query cannot recover.
+        let field_offset = self.pointer_member_field_offset(base, field);
+
+        if let Some(base_init) = self.eval_global_addr_expr(base) {
+            let (global_name, base_offset) = match &base_init {
+                GlobalInit::GlobalAddr(name) => (name.clone(), 0i64),
+                GlobalInit::GlobalAddrOffset(name, off) => (name.clone(), *off),
+                _ => return None,
+            };
+            let off = field_offset.or_else(|| {
+                // Legacy path: an array of structs where the global's own
+                // layout IS the pointee layout.
+                let ginfo = self.globals.get(&global_name)?;
+                let layout = ginfo.struct_layout.clone()?;
+                let (o, _) = layout.field_offset(field, &*self.types.borrow_struct_layouts())?;
+                i64::try_from(o).ok()
+            })?;
+            let total_offset = base_offset.checked_add(off)?;
+            return Some(if total_offset == 0 {
+                GlobalInit::GlobalAddr(global_name)
+            } else {
+                GlobalInit::GlobalAddrOffset(global_name, total_offset)
+            });
         }
+
+        // No symbolic global: an ABSOLUTE address cast to a pointer, e.g.
+        // `&((struct T * const) 0x4000)->t`. GCC 16.2 folds this to the
+        // integer `0x4000 + offsetof(struct T, t)` in a static initializer.
+        // It is a scalar, not a relocation, and must be emitted at the
+        // TARGET pointer width (4 bytes under -m32, 8 otherwise).
+        let addr = self.const_to_i64(&self.eval_const_expr(base)?)?;
+        let off = field_offset?;
+        let total = addr.checked_add(off)?;
+        Some(GlobalInit::Scalar(
+            if crate::common::types::target_ptr_size() == 4 {
+                IrConst::I32(total as i32)
+            } else {
+                IrConst::I64(total)
+            },
+        ))
     }
 
     /// Evaluate a comparison condition that involves a global address (function

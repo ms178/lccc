@@ -1180,7 +1180,22 @@ impl Lowerer {
                 _ => None,
             };
             if let Some(elem) = &elem_ct {
-                if let Some(count) = self.unsized_array_len(initializer, elem) {
+                // `T a[] = (T[N]){ ... }` names an array OBJECT whose own
+                // braced payload supplies the bound (C11 6.5.2.5p5, 6.7.9p22).
+                // `lower_global_init` synthesizes that same list, so the
+                // bound must be computed from it here or `sizeof(a)` would
+                // keep the incomplete-array placeholder (256 elements).
+                let bound_owner = match initializer {
+                    Initializer::Expr(Expr::CompoundLiteral(_, payload, _, _)) => {
+                        match payload.as_ref() {
+                            Initializer::List(items) => Some(Initializer::List(items.clone())),
+                            Initializer::Expr(_) => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let bound_init = bound_owner.as_ref().unwrap_or(initializer);
+                if let Some(count) = self.unsized_array_len(bound_init, elem) {
                     da.alloc_size = count * self.resolve_ctype_size(elem);
                     da.actual_alloc_size = da.alloc_size;
                     if da.array_dim_strides.len() <= 1 {

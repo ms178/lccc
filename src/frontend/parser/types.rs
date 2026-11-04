@@ -1206,6 +1206,16 @@ impl Parser {
         let outer_const = self.attrs.parsing_const();
         let outer_pointer_const = self.attrs.parsing_pointer_const();
         let outer_counted_by = self.attrs.parsing_counted_by.take();
+        // A record body is a declaration-specifier scope of its own. A
+        // `__attribute__((vector_size(N)))` pending for the ENCLOSING
+        // declaration must not be consumed by the first member, and one
+        // parsed on a member must not leak to the next member or out of the
+        // body. `save_flags()` packs booleans only, so the three Options are
+        // taken and restored explicitly (the same invariant as a compound
+        // statement, proven by vector_attr_scope_tests).
+        let outer_vector_size = self.attrs.parsing_vector_size.take();
+        let outer_vector_size_expr = self.attrs.parsing_vector_size_expr.take();
+        let outer_ext_vector_nelem = self.attrs.parsing_ext_vector_nelem.take();
         self.expect_context(&TokenKind::LBrace, "for struct/union body");
         while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
             // Budget termination guarantee: once the nesting budget is
@@ -1217,6 +1227,9 @@ impl Parser {
             }
             let pos_before = self.pos;
             self.attrs.parsing_counted_by = None;
+            self.attrs.parsing_vector_size = None;
+            self.attrs.parsing_vector_size_expr = None;
+            self.attrs.parsing_ext_vector_nelem = None;
             let (pre_spec_packed, pre_spec_align, _, _, _) = self.parse_gcc_attributes_spec();
             if let Some(a) = pre_spec_align {
                 self.attrs.parsed_alignas =
@@ -1256,6 +1269,14 @@ impl Parser {
                 continue;
             }
             if let Some(type_spec) = self.parse_type_specifier() {
+                // `vector_size(N)` / `ext_vector_type(N)` is a SPECIFIER
+                // attribute. Unlike a variable Declaration, StructFieldDecl
+                // has no size slot, so wrap the member's BASE spec here,
+                // before `fold_simple_derived` adds pointer/array layers.
+                // A deferred vector_size(EXPR) is carried on the field for
+                // sema (it needs the layout engine for `sizeof(struct T)`).
+                let field_vector_size_expr = self.attrs.parsing_vector_size_expr.take();
+                let type_spec = self.apply_pending_vector_attr(type_spec);
                 if matches!(self.peek(), TokenKind::Semicolon) {
                     // A tag reference without a declarator is not an anonymous
                     // member (C11 6.7.2.1p13). Treating `struct S;` inside S
@@ -1290,9 +1311,15 @@ impl Parser {
                         object_volatile: false,
                         object_const: self.attrs.parsing_const(),
                         counted_by: None,
+                        vector_size_expr: field_vector_size_expr.clone(),
                     });
                 } else {
-                    self.parse_struct_field_declarators(&type_spec, &mut fields, pre_spec_packed);
+                    self.parse_struct_field_declarators(
+                        &type_spec,
+                        &mut fields,
+                        pre_spec_packed,
+                        &field_vector_size_expr,
+                    );
                 }
                 self.skip_gcc_extensions();
                 self.expect_after(&TokenKind::Semicolon, "after struct field declaration");
@@ -1311,6 +1338,9 @@ impl Parser {
         self.attrs.set_const(outer_const);
         self.attrs.set_pointer_const(outer_pointer_const);
         self.attrs.parsing_counted_by = outer_counted_by;
+        self.attrs.parsing_vector_size = outer_vector_size;
+        self.attrs.parsing_vector_size_expr = outer_vector_size_expr;
+        self.attrs.parsing_ext_vector_nelem = outer_ext_vector_nelem;
         fields
     }
 
@@ -1400,6 +1430,7 @@ impl Parser {
         type_spec: &TypeSpecifier,
         fields: &mut Vec<StructFieldDecl>,
         pre_spec_packed: bool,
+        vector_size_expr: &Option<Box<Expr>>,
     ) {
         let field_spec_const = self.attrs.parsing_const();
         // Capture _Alignas value that was parsed during type specifier parsing
@@ -1465,6 +1496,7 @@ impl Parser {
                     object_volatile: false,
                     object_const: false,
                     counted_by: None,
+                    vector_size_expr: vector_size_expr.clone(),
                 });
                 if !self.consume_if(&TokenKind::Comma) {
                     break;
@@ -1560,6 +1592,7 @@ impl Parser {
                 object_volatile: decl_object_volatile,
                 object_const: field_object_const,
                 counted_by,
+                vector_size_expr: vector_size_expr.clone(),
             });
 
             if !self.consume_if(&TokenKind::Comma) {

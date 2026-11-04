@@ -2750,4 +2750,73 @@ mod vector_attr_scope_tests {
         );
         no_pending_attrs(&p);
     }
+
+    fn struct_fields(unit: &TranslationUnit) -> &[StructFieldDecl] {
+        unit.decls
+            .iter()
+            .find_map(|d| match d {
+                ExternalDecl::Declaration(decl) => match &decl.type_spec {
+                    TypeSpecifier::Struct(_, Some(fields), ..) => Some(fields.as_slice()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("expected a struct definition with fields")
+    }
+
+    #[test]
+    fn struct_member_vector_attribute_is_applied_to_that_member_only() {
+        // vector-2.c: `struct ss { vector float mVec; };` used to leave
+        // `mVec` a plain float (StructFieldDecl has no vector_size slot),
+        // while the pending Option leaked into the next member. The parser
+        // now wraps the member's BASE spec before any declarator layers.
+        let (unit, p) = parse(
+            "struct ss { __attribute__((vector_size(16))) float mVec; int plain; }; \
+             int after;",
+        );
+        let fields = struct_fields(&unit);
+        assert_eq!(fields.len(), 2);
+        assert!(
+            is_vector(&fields[0].type_spec),
+            "struct member lost the vector attribute"
+        );
+        assert!(
+            !is_vector(&fields[1].type_spec),
+            "vector attribute leaked into the next member"
+        );
+        assert!(
+            fields[0].vector_size_expr.is_none(),
+            "resolved size must not be deferred"
+        );
+        no_pending_attrs(&p);
+    }
+
+    #[test]
+    fn struct_member_vector_attribute_does_not_leak_out_of_the_record() {
+        // The enclosing declaration's own pending attribute must survive a
+        // nested record body, and a record-body attribute must not escape.
+        let (unit, p) = parse(
+            "struct ss { __attribute__((vector_size(16))) float mVec; }; \
+             __attribute__((vector_size(16))) int v; int plain;",
+        );
+        let decls: Vec<_> = unit
+            .decls
+            .iter()
+            .filter_map(|d| match d {
+                ExternalDecl::Declaration(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(decls.len(), 3, "expected the struct and two globals");
+        assert_eq!(
+            decls[1].vector_size,
+            Some(16),
+            "vector global lost its size"
+        );
+        assert_eq!(
+            decls[2].vector_size, None,
+            "attribute leaked into the next declaration"
+        );
+        no_pending_attrs(&p);
+    }
 }

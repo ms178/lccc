@@ -186,6 +186,11 @@ These are **not** hidden and **not** claimed fixed:
    (static array from a compound literal), plus asm constraints, parser-depth `limits-*`
    and deliberate per-vectorizer flags. `941014-4.c` is already fixed by the DejaGnu
    `dg-options "-std=gnu89"` plumbing (`extract_option_flags` returns `('-std=gnu89',)`).
+   **All four are now RESOLVED** (see §7.4): `vector-2.c` (vector struct
+   member), `20010113-1.c` and `20050516-1.c` (address of a member through
+   nested/absolute pointer chains), `pr48517.c` (unsized static array from a
+   whole-array compound literal). Only the parser-depth `limits-*`, inline-asm
+   constraints and deliberately unsupported per-vectorizer flags remain.
 3. **4 inline-asm "impossible constraint"** (`20000922-1.c`, `asmgoto-2.c`,
    `pr27528.c`, `pr35318.c`): constraint alphabet coverage.
 4. **RESOLVED: 2 internal assembler errors** (`.LBB1`/`.LBB2` in `pr17913.c`,
@@ -271,8 +276,9 @@ register pair, which the scalar emitter correctly refuses with an assert. Fixed 
 
 ### 7.1 New regression gates and measured results
 
-`tests/regression/check_type_attr_and_static_init.sh` (measured 0.914 s / 0.896 s /
-0.917 s; recorded as `0.92` in the lane plan) runs on x86_64 and i686 at -O0 and -O2:
+`tests/regression/check_type_attr_and_static_init.sh` (final measured 3.569 s /
+2.101 s / 3.405 s; worst kept as `3.57` in the lane plan) runs on x86_64 and
+i686 at -O0 and -O2:
 
 * runtime vector ABI (`v4si` add, direct vector-size parameter and return, sizeof 16),
   with GCC 16.2 compiling the SAME source as the value oracle: `PASS 0` in all 8 runs;
@@ -283,12 +289,16 @@ register pair, which the scalar emitter correctly refuses with an assert. Fixed 
   `float t`) plus GCC 16.2 rejection; a different-literal difference must be rejected;
 * 6 positive attribute-scope shapes including prototypes and GNU nested functions;
 * a **runtime** nested-vector-return differential at -O0/-O2 against GCC 16.2 on both
-  ABIs. Final: `type-attribute scope and static-init address-constant contract: PASS`.
+  ABIs;
+* `runtime2.c`, a GCC 16.2 value-oracle runtime proof of the four §7.4 families
+  at -O0/-O2 on both ABIs. Final line:
+  `type-attribute scope and static-init address-constant contract: PASS`.
 
-Six new Rust AST unit tests in `src/frontend/parser/declarations.rs` pin the parser state
+Eight Rust AST unit tests in `src/frontend/parser/declarations.rs` pin the parser state
 machine itself (return type vs first local, parameter list not stealing the return
 attribute, plain parameter, no leak into the next global, nested compound statement,
-nested function): 6/6 pass.
+nested function, vector struct member applied to that member only, no leak out of
+a record body): 8/8 pass.
 
 ### 7.2 Full local validation after the fixes (not the acceptance gate)
 
@@ -297,11 +307,11 @@ nested function): 6/6 pass.
 | `cargo fmt --all -- --check` | PASS |
 | `cargo clippy --profile fastbuild --locked -j 2 --all-targets -- -D warnings` | rc0, zero warnings |
 | `python3 scripts/check_clippy_policy.py` | PASS, 76 lints, 0 unknown |
-| `cargo test --profile fastbuild --lib -- -q` | **7912 passed, 0 failed, 10 ignored** (14.56 s) |
-| `python3 -m unittest discover -s tests/corpus -p 'test_*.py'` (the exact failed CI command) | **1170 tests, 0 failures, 5 skipped** (125.0 s) |
+| `cargo test --profile fastbuild --lib -- -q` | **7914 passed, 0 failed, 10 ignored** (24.54 s) |
+| `python3 -m unittest discover -s tests/corpus -p 'test_*.py'` (the exact failed CI command) | **1170 tests, 0 failures, 5 skipped** (152.7 s) |
 | `tests/regression/check_type_attr_and_static_init.sh` | PASS, both ABIs, -O0/-O2 |
 | `tests/regression/check_computed_goto_labels.sh` | PASS, both ABIs, -O0/-O2 |
-| `check_ci_lane_plan.py` (+ `--self-test`) | PASS (2931 s, 18 rules / 25 fixtures) |
+| `check_ci_lane_plan.py` (+ `--self-test`) | PASS (2934 s, 18 rules / 25 fixtures) |
 | `check_ci_gate_parity.py` | PASS (532 commands, 27 contracts) |
 | `check_ci_workflow_shell.py` | PASS (13 workflows) |
 | `python3 scripts/arena_provision.py --verify-only` | PASS, LP64 + ILP32 compile/link/run |
@@ -310,6 +320,27 @@ The two local-only failures seen before the environment was restored were NOT co
 defects: `backports.tarfile` missing after the wipe (installed from PyPI) and
 `gcc-16` absent from `PATH` so `test_nostdinc_contract` fell back to Debian GCC 12.2.
 Hosted CI provisions both.
+
+### 7.4 Four more GCC 17 compile-leg families, found by running the REAL corpus
+
+The 10-file targeted compile matrix (`--filter '^(vector-[123]|20001116-1|
+pr17913|pr84136|20010113-1|20050516-1|pr48517|941014-4)\.c$'`, both ABIs)
+went 6/10 -> 7/10 -> **10/10 pass**. A simplified hand-written probe had hidden
+one defect, which is why the real corpus is authoritative:
+
+| Family | Root cause | Fix |
+|---|---|---|
+| `vector-2.c` | `StructFieldDecl` has no `vector_size` slot, so a `__attribute__((vector_size(16))) float mVec;` MEMBER silently became a plain `float` and the pending `Option` leaked to the next member. `vector-1.c` only takes `&y.mVec` and so never type-checked the member. | `parse_struct_fields` now saves/restores the three vector `Option`s around the record body, clears them per member, and applies `apply_pending_vector_attr` to the member's BASE spec before `fold_simple_derived` adds pointer/array layers. A deferred `vector_size(EXPR)` is carried on a new `StructFieldDecl::vector_size_expr` and resolved in sema's `field_ctype` with `wrap_field_spec_base`, so it cannot leak or wrap a folded pointer type. 2 new AST unit tests pin it. |
+| `20010113-1.c`, `20050516-1.c` | `resolve_pointer_member_access_addr` took the field offset from `globals[name].struct_layout` -- the layout of the *whole global*, not of the pointer's pointee. `&((&(v.p))->y)` addresses `y` inside the nested `p`; `&((struct T *)0x4000)->t` has no global at all. | The field offset now comes from `get_expr_ctype(base)`'s pointee layout (legacy global-layout path kept as fallback). An absolute integer address cast to a pointer is emitted as a width-correct `GlobalInit::Scalar` (`.long 16384` on i686, `.quad 16384` on x86_64), never a fake relocation. Runtime values `4` and `0x4000` match GCC 16.2 on both ABIs. |
+| `pr48517.c` | `static const unsigned short a[] = (const unsigned short[]){...}`: sema's `non_constant_leaves_for` required the literal's type to EQUAL the unsized target; lowering's `array_initializer_payload` required a sized target; `fixup_unsized_array` could not read a bound from an expression initializer, so `sizeof(a)` stayed at the 256-element incomplete-array placeholder (512 bytes instead of 4). | Accept a literal whose bound supplies an unsized target's bound; allow `CType::Array(..)` in `array_initializer_payload` (`expr_initializes_array` already compares element types and known bounds); compute `unsized_array_len` from the literal's braced payload. `sizeof(a)` and every element value now match GCC 16.2 on x86_64 and i686 at -O0/-O2. |
+
+All four are pinned by `runtime2.c` inside
+`tests/regression/check_type_attr_and_static_init.sh`, which compiles the SAME
+source with GCC 16.2 as a value oracle on both ABIs at both optimization levels.
+The gate grew from 0.92 s to 3.57 s (3 timings 3.569/2.101/3.405 s, worst kept);
+`.github/ci-lane-plan.json` frontend-a is now `measured_s 3.57`,
+`predicted_gate_seconds 356.96`, and `check_ci_lane_plan.py` PASS (2934 s of
+gate cost).
 
 ### 7.3 Three-compiler comparison
 

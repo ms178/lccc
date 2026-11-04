@@ -10618,9 +10618,38 @@ dereference it before applying '->' to it?"
 
     /// The type of struct field `f` with a declarator, its pointer levels'
     /// qualifiers recorded (see `type_builder::build_qualified_ctype`).
+    /// Insert a `TypeSpecifier::Vector` at the BASE of a member's specifier
+    /// tree. `fold_simple_derived` folds simple pointer/array layers into the
+    /// specifier, so a deferred `vector_size(EXPR)` must be applied below
+    /// them, never around the finished pointer type.
+    fn wrap_field_spec_base(spec: &TypeSpecifier, bytes: usize) -> TypeSpecifier {
+        match spec {
+            TypeSpecifier::Pointer(inner, space) => {
+                TypeSpecifier::Pointer(Box::new(Self::wrap_field_spec_base(inner, bytes)), *space)
+            }
+            TypeSpecifier::Array(inner, n) => TypeSpecifier::Array(
+                Box::new(Self::wrap_field_spec_base(inner, bytes)),
+                n.clone(),
+            ),
+            _ => TypeSpecifier::Vector(Box::new(spec.clone()), bytes),
+        }
+    }
+
     fn field_ctype(&self, f: &StructFieldDecl) -> CType {
         let written = written_cvr(f.base_const, f.base_volatile, f.base_restrict);
-        let mut ty = type_builder::build_qualified_ctype(self, &f.type_spec, written, &f.derived);
+        // Resolved vector sizes are already `TypeSpecifier::Vector` nodes
+        // (see Parser::apply_pending_vector_attr). A size that needed sema's
+        // layout engine is resolved here and inserted at the same position.
+        let spec = match f
+            .vector_size_expr
+            .as_deref()
+            .and_then(|e| self.eval_const_expr(e))
+            .and_then(|v| usize::try_from(v).ok())
+        {
+            Some(bytes) => Self::wrap_field_spec_base(&f.type_spec, bytes),
+            None => f.type_spec.clone(),
+        };
+        let mut ty = type_builder::build_qualified_ctype(self, &spec, written, &f.derived);
         if f.derived.is_empty() {
             // A simple declarator was folded into the specifier (see
             // `record_folded_spec_quals`); its base is the folded leaf.

@@ -479,7 +479,11 @@ impl Lowerer {
         let Initializer::Expr(expr) = init else {
             return None;
         };
-        if !matches!(ty, CType::Array(_, Some(_))) || !self.expr_initializes_array(expr, ty) {
+        // An unsized array object (`T a[] = (T[N]){...}`) must be allowed
+        // too: `expr_initializes_array` already compares the element type
+        // and, when both bounds are known, the bound; an unknown target
+        // bound is exactly the case where the literal supplies it.
+        if !matches!(ty, CType::Array(..)) || !self.expr_initializes_array(expr, ty) {
             return None;
         }
         self.compound_literal_items(init)

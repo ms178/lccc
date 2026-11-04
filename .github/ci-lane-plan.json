@@ -1141,7 +1141,7 @@
     "frontend-a": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 354.31,
+      "predicted_gate_seconds": 356.96,
       "shards": 3,
       "steps": [
         {
@@ -1361,7 +1361,7 @@
           "name": "Computed-goto label identity and diagnostics on both ABIs"
         },
         {
-          "measured_s": 0.92,
+          "measured_s": 3.57,
           "name": "Type-attribute scope and static-init address constants on both ABIs"
         }
       ]
