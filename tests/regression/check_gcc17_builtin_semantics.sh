@@ -63,11 +63,16 @@ int main(void)
     CHECK(__builtin_memcmp((void *)A, (void *)B, 4) != 0);
     CHECK(__builtin_bcmp((void *)A, (void *)C, 4) == 0);
     CHECK(__builtin_bcmp((void *)A, (void *)B, 4) != 0);
+    CHECK(__builtin_bcmp(K, L, sizeof K) == 0);
 
     char z[8];
     memset(z, 0x5a, sizeof z);
     __builtin_bzero(z, sizeof z);
     CHECK(z[0] == 0 && z[7] == 0);
+
+    char copied[8] = {0};
+    __builtin_bcopy("copy", copied, 5);
+    CHECK(strcmp(copied, "copy") == 0);
 
     char *d = __builtin_strdup("hello");
     CHECK(d && strcmp(d, "hello") == 0);
