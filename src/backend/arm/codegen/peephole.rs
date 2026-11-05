@@ -687,7 +687,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= eliminate_move_chains(&mut lines, &mut kinds, n);
         changed |= fold_zext_move_chains(&mut lines, &mut kinds, n);
         changed |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
-        changed |= propagate_address_aliases(&mut lines, &mut kinds, n);
+        changed |= per_function(&mut lines, &mut kinds, n, propagate_address_aliases);
         if merge_blocks {
             changed |= merge_identical_blocks(&mut lines, &mut kinds, n);
         }
@@ -706,7 +706,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= eliminate_overwritten_moves(&lines, &mut kinds, n);
         changed |= eliminate_overwritten_stores(&lines, &mut kinds, n);
         if rotate {
-            changed |= rotate_simple_loops(&mut lines, &mut kinds, n);
+            changed |= per_function(&mut lines, &mut kinds, n, rotate_simple_loops);
         }
         rounds += 1;
     }
@@ -748,7 +748,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_move_chains(&mut lines, &mut kinds, n);
             changed2 |= fold_zext_move_chains(&mut lines, &mut kinds, n);
             changed2 |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
-            changed2 |= propagate_address_aliases(&mut lines, &mut kinds, n);
+            changed2 |= per_function(&mut lines, &mut kinds, n, propagate_address_aliases);
             if merge_blocks {
                 changed2 |= merge_identical_blocks(&mut lines, &mut kinds, n);
             }
@@ -831,22 +831,18 @@ fn is_function_boundary(line: &str) -> bool {
 /// in the loop body and dominates all readers) and is rejected everywhere it is
 /// not (a reader on a path that never ran the redefinition).
 struct Cfg {
+    /// Block of every line.
     block_of: Vec<usize>,
-    /// First line index of every block.
-    starts: Vec<usize>,
-    /// Label introducing a block; empty when the block starts without one.
-    labels: Vec<String>,
     succs: Vec<Vec<usize>>,
-    /// Dominator bitsets: `dom[b]` has bit `d` set iff `d` dominates `b`.
-    dom: Vec<Vec<u64>>,
-    words: usize,
 }
 
 impl Cfg {
-    /// Build the CFG and its dominator sets.  `None` when the function contains
-    /// control flow that cannot be resolved statically (an indirect `br xN`, or
-    /// a branch whose label is not in this function): callers must then fall
-    /// back to the conservative answer.
+    /// Build the CFG.  `None` when the function contains control flow that
+    /// cannot be resolved statically (an indirect `br xN`, or a branch whose
+    /// label is not in this function): callers must then fall back to the
+    /// conservative answer.  The query walks successors only; the dominator
+    /// bitsets once computed here had no reader, and cost O(blocks^2) time and
+    /// memory per build.
     fn build(lines: &[String], kinds: &[LineKind], n: usize) -> Option<Cfg> {
         if n == 0 {
             return None;
@@ -870,13 +866,11 @@ impl Cfg {
             block_of[i] = starts.len() - 1;
         }
         let nb = starts.len();
-        let mut labels: Vec<String> = vec![String::new(); nb];
         let mut label_block: FxHashMap<&str, usize> = FxHashMap::default();
         for i in 0..n {
             if kinds[i] == LineKind::Label {
                 let name = lines[i].trim().trim_end_matches(':');
                 label_block.insert(name, block_of[i]);
-                labels[block_of[i]] = (*name).to_string();
             }
         }
         let end = |b: usize| -> usize { if b + 1 < nb { starts[b + 1] } else { n } };
@@ -928,78 +922,7 @@ impl Cfg {
                 }
             }
         }
-        // Reachability from the entry block.
-        let mut reachable = vec![false; nb];
-        reachable[0] = true;
-        let mut stack = vec![0usize];
-        while let Some(b) = stack.pop() {
-            for &s in &succs[b] {
-                if !reachable[s] {
-                    reachable[s] = true;
-                    stack.push(s);
-                }
-            }
-        }
-        // Iterative dominators over reachable blocks (bitsets).
-        let words = (nb + 63) / 64;
-        let mut dom: Vec<Vec<u64>> = vec![vec![!0u64; words]; nb];
-        dom[0].iter_mut().for_each(|w| *w = 0);
-        if words > 0 {
-            dom[0][0] = 1; // block 0 dominates itself
-        }
-        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb];
-        for b in 0..nb {
-            if !reachable[b] {
-                continue;
-            }
-            for &s in &succs[b] {
-                if reachable[s] {
-                    preds[s].push(b);
-                }
-            }
-        }
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for b in 0..nb {
-                if b == 0 || !reachable[b] {
-                    continue;
-                }
-                let mut newd = vec![!0u64; words];
-                let mut first = true;
-                for &p in &preds[b] {
-                    if first {
-                        newd.copy_from_slice(&dom[p]);
-                        first = false;
-                    } else {
-                        for w in 0..words {
-                            newd[w] &= dom[p][w];
-                        }
-                    }
-                }
-                newd[b / 64] |= 1u64 << (b % 64);
-                if newd != dom[b] {
-                    dom[b] = newd;
-                    changed = true;
-                }
-            }
-        }
-        Some(Cfg {
-            block_of,
-            starts: starts.clone(),
-            labels,
-            succs,
-            dom,
-            words,
-        })
-    }
-
-    /// `true` when `def` dominates `blk` (unreachable blocks dominate nothing).
-    fn dominates(&self, def: usize, blk: usize) -> bool {
-        if def >= self.succs.len() || blk >= self.succs.len() || self.words == 0 {
-            return false;
-        }
-        self.dom[blk][def / 64] & (1u64 << (def % 64)) != 0
+        Some(Cfg { block_of, succs })
     }
 
     /// True when the instruction at `redef` — a pure overwrite of `reg` — runs
@@ -1319,21 +1242,21 @@ impl Liveness {
             }
             succs.push(s);
         }
-        let mut live_out = vec![0u64; nb];
         let mut live_in = vec![0u64; nb];
         let mut live_before = vec![0u64; end];
-        for _ in 0..64 {
+        // Iterate to the fixed point, and judge it by the live-in sets: the
+        // first sweep moves every block's live-in off zero without changing
+        // any live-out a later block already read, so watching live-outs
+        // alone could stop after one sweep with a loop-carried read still
+        // missing from the latch (a function with no `ret` to seed a
+        // change).  The sets only grow, so the loop terminates.
+        loop {
             let mut changed = false;
             for b in (0..nb).rev() {
-                let mut out = 0u64;
+                let mut live = 0u64;
                 for &sc in &succs[b] {
-                    out |= live_in[sc];
+                    live |= live_in[sc];
                 }
-                if out != live_out[b] {
-                    live_out[b] = out;
-                    changed = true;
-                }
-                let mut live = live_out[b];
                 for k in (starts[b]..bend(b)).rev() {
                     if matches!(
                         kinds[k],
@@ -1346,7 +1269,10 @@ impl Liveness {
                     live = (live & !d) | u;
                     live_before[k] = live;
                 }
-                live_in[b] = live;
+                if live != live_in[b] {
+                    live_in[b] = live;
+                    changed = true;
+                }
             }
             if !changed {
                 break;
@@ -4939,27 +4865,75 @@ fn retarget_move_imm(line: &str, new_dst: u8) -> Option<String> {
 // All four heads reach ±1 MB, the same window as `b.cond`, so the same
 // instruction-census range guard applies to each of them.
 
-/// Estimate the distance (in instructions) from position `from` to the label
-/// `target` in the assembly. Returns `None` if the label is not found.
-fn estimate_branch_distance(
-    lines: &[String],
-    kinds: &[LineKind],
-    from: usize,
-    target: &str,
-) -> Option<usize> {
-    // Search both forward and backward for the target label
-    let target_with_colon = format!("{}:", target);
-    for idx in 0..lines.len() {
-        if kinds[idx] == LineKind::Label && lines[idx].trim() == target_with_colon {
-            // Count non-Nop lines between from and idx (each is one 4-byte instruction)
-            let (lo, hi) = if from < idx { (from, idx) } else { (idx, from) };
-            let count = (lo..hi)
-                .filter(|&p| kinds[p] != LineKind::Nop && kinds[p] != LineKind::Label)
-                .count();
-            return Some(count);
+/// Where every label of the text is defined, and an upper bound on how many
+/// 4-byte instructions precede each line (every line that is neither `Nop`
+/// nor a label counts one, alignment padding its maximum): one O(n) census
+/// per pass turns every branch-distance query into two lookups.  The old
+/// per-query scan of the whole module for the target label made
+/// `fuse_branch_over_branch` quadratic in the module.  Lines a pass deletes
+/// after the census only shorten real distances, so a census distance never
+/// understates one.
+struct BranchCensus {
+    labels: FxHashMap<String, usize>,
+    insns_before: Vec<usize>,
+}
+
+impl BranchCensus {
+    fn new(lines: &[String], kinds: &[LineKind]) -> Self {
+        let mut labels = FxHashMap::default();
+        let mut insns_before = Vec::with_capacity(lines.len() + 1);
+        let mut count = 0usize;
+        for (idx, line) in lines.iter().enumerate() {
+            insns_before.push(count);
+            match kinds[idx] {
+                LineKind::Label => {
+                    // The first definition wins, as in a forward search.
+                    if let Some(name) = line.trim().strip_suffix(':') {
+                        labels.entry(name.to_string()).or_insert(idx);
+                    }
+                }
+                LineKind::Nop => {}
+                LineKind::Directive => count += directive_insn_bound(line),
+                _ => count += 1,
+            }
+        }
+        insns_before.push(count);
+        BranchCensus {
+            labels,
+            insns_before,
         }
     }
-    None
+
+    /// Instructions between line `from` and the definition of `target`
+    /// (either direction), or None when the label is not in the text.
+    fn distance(&self, from: usize, target: &str) -> Option<usize> {
+        let idx = *self.labels.get(target)?;
+        let (lo, hi) = if from < idx { (from, idx) } else { (idx, from) };
+        Some(self.insns_before[hi] - self.insns_before[lo])
+    }
+}
+
+/// Upper bound, in 4-byte instructions, on what a directive emits: 2^k bytes
+/// for an alignment to 2^k (`.p2align 4` pads at most 12 bytes after an
+/// instruction; it is charged four slots), one slot for anything else --
+/// the count every directive had before, which over-counts the ones that
+/// emit nothing.
+fn directive_insn_bound(line: &str) -> usize {
+    let t = line.trim();
+    let arg = |p: &str| -> Option<u32> {
+        let rest = t.strip_prefix(p)?;
+        if !rest.starts_with(|c: char| c.is_ascii_whitespace()) {
+            return None;
+        }
+        rest.split(',').next()?.trim().parse().ok()
+    };
+    if let Some(k) = arg(".p2align").or_else(|| arg(".align")) {
+        return ((1usize << k.min(16)) / 4).max(1);
+    }
+    if let Some(b) = arg(".balign") {
+        return (b as usize / 4).max(1);
+    }
+    1
 }
 
 /// Maximum number of instructions a `b.cond` (or `cbz`/`cbnz`/`tbz`/`tbnz`)
@@ -5012,6 +4986,7 @@ fn fused_branch_head(
     kinds: &[LineKind],
     n: usize,
     i: usize,
+    census: &BranchCensus,
 ) -> Option<(usize, String)> {
     let head_kind = kinds[i];
     if !is_range_limited_branch(head_kind) {
@@ -5028,7 +5003,7 @@ fn fused_branch_head(
         return None;
     }
     let real_target = branch_target(&lines[j])?;
-    let in_range = match estimate_branch_distance(lines, kinds, i, real_target) {
+    let in_range = match census.distance(i, real_target) {
         Some(distance) => distance < COND_BRANCH_SAFE_DISTANCE,
         // `b.cc` head: keep the historical assumption that an unmeasurable
         // target is reachable, since the unconditional branch already reached
@@ -5047,9 +5022,15 @@ fn fused_branch_head(
 
 fn fuse_branch_over_branch(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
+    let mut census: Option<BranchCensus> = None;
     let mut i = 0;
     while i + 2 < n {
-        if let Some((removed, rewritten)) = fused_branch_head(lines, kinds, n, i) {
+        if !is_range_limited_branch(kinds[i]) {
+            i += 1;
+            continue;
+        }
+        let census = census.get_or_insert_with(|| BranchCensus::new(lines, kinds));
+        if let Some((removed, rewritten)) = fused_branch_head(lines, kinds, n, i, census) {
             // Retarget the head, then drop the unconditional branch. The skip
             // label stays: other predecessors may still branch to it.
             lines[i] = rewritten;
@@ -6989,22 +6970,31 @@ fn cse_adrp_remat_pairs(lines: &mut [String], kinds: &mut [LineKind], n: usize) 
 // twin.
 //
 // Operative rule for a def-sequence D at position p (loop [T..L], backedge
-// at L, loop top label at T):
+// at L, loop top label at T), destination xD:
 //   * D is pure: `movz xD,#imm` (+ contiguous movk chain on xD),
-//     `adrp xD,sym` [+ `add xD,xD,:lo12:sym`], or `ldr xD,[sp,#off]`;
-//   * the loop is call-free (a caller-saved dest would die at the call —
-//     the original re-def at p is what saved it) and has a single backedge
-//     (no other branch targets .Ltop);
-//   * p is at the TOP of the header block: no mention of xD between the
-//     label and p, and every mention of xD after p WITHIN the header block
-//     is use-first (a reader of D's value);
-//   * every OTHER def of xD in the loop is a textually identical sequence
-//     (so xD carries the same value at every in-loop point both before and
-//     after the transform); sp-slot loads additionally require no store in
-//     the loop overlapping [off-7, off+7];
-//   * transform: copy D above the loop-top label, delete the header copy.
-//     Cross-block, same-value co-defs stay (they rewrite xD with the same
-//     constant — harmless), and post-loop readers still see the constant.
+//     `adrp xD,sym` [+ `add xD,xD,:lo12:sym`], or `ldr xD,[sp,#off]`, and
+//     xD is neither x29 nor x30;
+//   * the loop is call-free, every branch in it is direct, and control
+//     enters it only at T -- by falling in or by a branch from above, both
+//     of which receive a copy of D.  A label inside the loop named by a
+//     branch from outside it or by anything but a branch (a jump table, an
+//     `adr`) is an entry that would bypass the copies;
+//   * nothing else in the loop defines xD, no line between T and p names
+//     it, and every mention after p is use-first;
+//   * every reader of xD in the loop runs after D: it sits in a block T
+//     cannot reach without passing D's block (a reader after `if (c) x = K;`
+//     saw the pre-loop value on the trips that skipped D);
+//   * xD is dead wherever the transform changes it outside the loop: on
+//     every exit from a block T reaches without passing D's block, and on
+//     the fall-through path of a conditional entry branch.  Liveness models
+//     the AAPCS64 implicit reads exactly (a call or `svc` reads x0-x8, a
+//     `ret` x0, x1 and x19-x29, a tail call both); a function whose control
+//     flow it cannot resolve (a jump table) only admits a scratch xD that
+//     no line outside the loop names;
+//   * sp-slot loads: nothing in the loop moves sp or may write the slot --
+//     an overlapping sp-relative store, or any store whose base can hold a
+//     frame address (always the case once one escapes into a register);
+//   * transform: copy D before every entry branch and above T, delete D.
 //
 // Kill switch: CCC_NO_INVAR_HOIST.
 
@@ -7079,15 +7069,623 @@ fn branch_targets(line: &str, kind: LineKind, label: &str) -> bool {
     }
 }
 
+/// `[start, end)` of every function delimited by `.cfi_startproc` and
+/// `.cfi_endproc` (inclusive) in `lines[..n]`, in order; the whole text as
+/// one range when the module carries no CFI delimiters
+/// (`-fno-asynchronous-unwind-tables`).
+fn function_body_ranges(lines: &[String], n: usize) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start = None;
+    for (i, line) in lines.iter().enumerate().take(n) {
+        match line.trim() {
+            ".cfi_startproc" => start = Some(i),
+            ".cfi_endproc" => {
+                if let Some(s) = start.take() {
+                    ranges.push((s, i + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        ranges.push((s, n));
+    }
+    if ranges.is_empty() {
+        ranges.push((0, n));
+    }
+    ranges
+}
+
+/// Run `pass` -- one that rewrites lines in place, never inserting or
+/// removing any -- on each function's own lines.  For a pass whose
+/// reasoning is function-local (loops, a function's CFG), a module-wide
+/// run only made each query pay for the whole text: `rotate_simple_loops`
+/// searched the module for every header label and counted backedges across
+/// it, and `propagate_address_aliases` built its "one function" CFG -- with
+/// dominator bitsets quadratic in the block count -- over every function
+/// at once and scanned every line of the module per query (memclr.c at
+/// -O2: 47 of 54 seconds of AArch64 codegen).
+fn per_function(
+    lines: &mut [String],
+    kinds: &mut [LineKind],
+    n: usize,
+    pass: fn(&mut [String], &mut [LineKind], usize) -> bool,
+) -> bool {
+    let mut changed = false;
+    for (start, end) in function_body_ranges(lines, n) {
+        changed |= pass(&mut lines[start..end], &mut kinds[start..end], end - start);
+    }
+    changed
+}
+
+/// Hoist loop-invariant rematerializations (see the rule above), one
+/// function at a time.  A loop never spans functions, so every scan of the
+/// walk -- the last backedge to a header, the entries above it, the readers
+/// after the loop -- is bounded by the function's own lines.  Over the
+/// whole module those scans, and the restart from line 0 after each hoist,
+/// made the pass quadratic in the number of functions (memclr.c, 2049
+/// functions: 400 of the 406 seconds of an AArch64 -O0 compile), and a
+/// mention of the register in a LATER function counted as a reader after
+/// the loop.
 fn hoist_loop_invariant_remats(
     lines: &mut Vec<String>,
     kinds: &mut Vec<LineKind>,
-    mut n: usize,
+    n: usize,
 ) -> bool {
     if std::env::var("CCC_NO_INVAR_HOIST").is_ok() {
         return false;
     }
+    let ranges = function_body_ranges(lines, n);
+    let has_backedge_candidate = |k: &[LineKind]| {
+        k.iter().any(|kind| {
+            matches!(
+                kind,
+                LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch
+            )
+        })
+    };
     let mut changed = false;
+    let mut old_lines = std::mem::take(lines).into_iter();
+    let mut old_kinds = std::mem::take(kinds).into_iter();
+    let mut pos = 0;
+    for (start, end) in ranges {
+        lines.extend(old_lines.by_ref().take(start - pos));
+        kinds.extend(old_kinds.by_ref().take(start - pos));
+        let mut fn_lines: Vec<String> = old_lines.by_ref().take(end - start).collect();
+        let mut fn_kinds: Vec<LineKind> = old_kinds.by_ref().take(end - start).collect();
+        if has_backedge_candidate(&fn_kinds) {
+            changed |= hoist_loop_invariant_remats_in(&mut fn_lines, &mut fn_kinds);
+        }
+        lines.extend(fn_lines);
+        kinds.extend(fn_kinds);
+        pos = end;
+    }
+    lines.extend(old_lines);
+    kinds.extend(old_kinds);
+    changed
+}
+
+/// AAPCS64 registers a control transfer reads without naming them.  A call
+/// (`bl`, `blr`) or a system call reads the argument registers x0-x7 and the
+/// indirect-result register x8.
+const A64_ARG_GP: u64 = 0x1ff;
+/// A return hands the result registers (x0, x1: a GP result never needs
+/// more -- a larger one goes to memory through x8) and the callee-saved
+/// x19-x29 back to the caller.  The link register x30 is modeled by
+/// `classify_implicit_operands_a64`.
+const A64_RET_GP: u64 = 0x3 | 0x3ff8_0000;
+const A64_ALL_GP: u64 = (1u64 << 31) - 1;
+
+/// Backward liveness of the GP registers over one function with every
+/// implicit read of the AAPCS64 modeled exactly: `live_before[i]` is the set
+/// live immediately before line `i`.
+///
+/// `Liveness` answers a different question (it is shared with the copy
+/// coalescer, which deliberately leaves a call's arguments out and charges
+/// a `ret` with x0-x7): a transformation that CHANGES a register's value on
+/// some path must see every reader, so here a call and `svc` read
+/// `A64_ARG_GP`, a `ret` reads `A64_RET_GP`, and a direct branch out of the
+/// function (a tail call) reads both and the link register.  `None` when the
+/// control flow cannot be resolved: an indirect `br xN` (a jump table) or a
+/// conditional branch to a label this function does not define.
+fn abi_liveness(lines: &[String], kinds: &[LineKind], n: usize) -> Option<Vec<u64>> {
+    if n == 0 {
+        return None;
+    }
+    let is_transfer = |k: LineKind| {
+        matches!(
+            k,
+            LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch | LineKind::Ret
+        )
+    };
+    let mut starts = vec![0usize];
+    for m in 1..n {
+        if kinds[m] == LineKind::Label || is_transfer(kinds[m - 1]) {
+            starts.push(m);
+        }
+    }
+    let nb = starts.len();
+    let bend = |b: usize| if b + 1 < nb { starts[b + 1] } else { n };
+    let mut label_block: FxHashMap<&str, usize> = FxHashMap::default();
+    for (b, &s) in starts.iter().enumerate() {
+        if kinds[s] == LineKind::Label {
+            label_block.insert(lines[s].trim().trim_end_matches(':'), b);
+        }
+    }
+    // Successors; a block that runs off the end of the text keeps every
+    // register live (nothing says what follows it).
+    let mut succs: Vec<Vec<usize>> = Vec::with_capacity(nb);
+    let mut open_end = vec![false; nb];
+    for b in 0..nb {
+        let mut t = bend(b);
+        while t > starts[b] && matches!(kinds[t - 1], LineKind::Nop | LineKind::Directive) {
+            t -= 1;
+        }
+        let fall = |s: &mut Vec<usize>, open: &mut bool| {
+            if b + 1 < nb {
+                s.push(b + 1);
+            } else {
+                *open = true;
+            }
+        };
+        let mut s = Vec::new();
+        let last = if t > starts[b] { Some(t - 1) } else { None };
+        match last.map(|l| kinds[l]) {
+            Some(LineKind::Ret) => {}
+            Some(LineKind::Branch) => {
+                let text = lines[t - 1].trim();
+                if text.starts_with("br ") {
+                    return None;
+                }
+                let tgt = text.split_whitespace().next_back();
+                if let Some(&tb) = tgt.and_then(|l| label_block.get(l)) {
+                    s.push(tb);
+                }
+                // Otherwise a tail call: an exit whose reads the transfer
+                // function below adds.
+            }
+            Some(LineKind::CondBranch | LineKind::CmpBranch) => {
+                let tgt = lines[t - 1].trim().split_whitespace().next_back();
+                s.push(*tgt.and_then(|l| label_block.get(l))?);
+                fall(&mut s, &mut open_end[b]);
+            }
+            _ => fall(&mut s, &mut open_end[b]),
+        }
+        succs.push(s);
+    }
+    let transfer = |k: usize| -> (u64, u64) {
+        let (mut u, d) = gp_operands(&lines[k], kinds[k], false);
+        let text = lines[k].trim();
+        match kinds[k] {
+            LineKind::Call => u |= A64_ARG_GP,
+            LineKind::Ret => u |= A64_RET_GP,
+            LineKind::Branch => {
+                let tgt = text.split_whitespace().next_back();
+                if !tgt.is_some_and(|l| label_block.contains_key(l)) {
+                    u |= A64_ARG_GP | A64_RET_GP | (1u64 << 30);
+                }
+            }
+            _ => {
+                if text == "svc" || text.starts_with("svc ") {
+                    u |= A64_ARG_GP;
+                }
+            }
+        }
+        (u, d)
+    };
+    let mut live_in = vec![0u64; nb];
+    let mut live_before = vec![0u64; n];
+    // Iterate to the fixed point: the sets only grow, so this terminates,
+    // and stopping any earlier could report a live register as dead.
+    loop {
+        let mut changed = false;
+        for b in (0..nb).rev() {
+            let mut live = if open_end[b] { A64_ALL_GP } else { 0 };
+            for &sc in &succs[b] {
+                live |= live_in[sc];
+            }
+            for k in (starts[b]..bend(b)).rev() {
+                if !matches!(
+                    kinds[k],
+                    LineKind::Nop | LineKind::Directive | LineKind::Label
+                ) {
+                    let (u, d) = transfer(k);
+                    live = (live & !d) | u;
+                }
+                live_before[k] = live;
+            }
+            if live != live_in[b] {
+                live_in[b] = live;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Some(live_before)
+}
+
+/// May `line` write memory?  Every store (`st*`, including the pair, release
+/// and exclusive forms), every LSE atomic, the memory-setting/copying MOPS
+/// instructions, `dc` and `svc`.  Over-approximate on purpose.
+fn a64_may_write_memory(line: &str) -> bool {
+    const ATOMICS: [&str; 10] = [
+        "ldadd", "ldclr", "ldeor", "ldset", "ldsmax", "ldsmin", "ldumax", "ldumin", "swp", "cas",
+    ];
+    let m = line.split_whitespace().next().unwrap_or("");
+    m.starts_with("st")
+        || ATOMICS.iter().any(|p| m.starts_with(p))
+        || m.starts_with("cpy")
+        || m.starts_with("set")
+        || m == "dc"
+        || m == "svc"
+}
+
+/// The base register token of `line`'s first memory operand (`sp` in
+/// `str x0, [sp, #8]`), if it has one.
+fn a64_mem_base(line: &str) -> Option<&str> {
+    let open = line.find('[')?;
+    let inner = &line[open + 1..];
+    let base = inner.split([',', ']']).next()?.trim();
+    (!base.is_empty()).then_some(base)
+}
+
+/// The bytes `[lo, hi)` (sp-relative) that a store through `[sp]` or
+/// `[sp, #imm]` without writeback writes.  `None` for any other address or an
+/// access size this does not know.
+fn a64_sp_store_range(line: &str) -> Option<(i64, i64)> {
+    let (m, ops) = line.trim().split_once(char::is_whitespace)?;
+    let ops = ops.trim();
+    let open = ops.find('[')?;
+    let close = open + ops[open..].find(']')?;
+    if !ops[close + 1..].trim().is_empty() {
+        return None; // `]!` pre-index or `], #imm` post-index
+    }
+    let inner = ops[open + 1..close].trim();
+    let off: i64 = if inner == "sp" {
+        0
+    } else {
+        inner
+            .strip_prefix("sp,")?
+            .trim()
+            .strip_prefix('#')?
+            .parse()
+            .ok()?
+    };
+    let first = ops[..open].split(',').next()?.trim();
+    let reg_bytes = |r: &str| -> Option<i64> {
+        match r.chars().next()? {
+            'x' | 'd' => Some(8),
+            'w' | 's' => Some(4),
+            'h' => Some(2),
+            'b' => Some(1),
+            'q' => Some(16),
+            _ => None,
+        }
+    };
+    let size = match m {
+        "strb" | "sturb" => 1,
+        "strh" | "sturh" => 2,
+        "str" | "stur" => reg_bytes(first)?,
+        "stp" | "stnp" => 2 * reg_bytes(first)?,
+        _ => return None,
+    };
+    Some((off, off + size))
+}
+
+/// Does `line` change sp?  A pre/post-indexed access through sp, or an
+/// instruction naming sp as its destination (`sub sp, sp, #16`,
+/// `mov sp, x29`).
+fn a64_writes_sp(line: &str) -> bool {
+    let Some((m, ops)) = line.trim().split_once(char::is_whitespace) else {
+        return false;
+    };
+    let ops = ops.trim();
+    if writeback_base(ops) == Some(31) {
+        return true;
+    }
+    if m.starts_with("st") || m.starts_with("ld") || m.starts_with("prf") {
+        return false;
+    }
+    ops.split(',').next().map(str::trim) == Some("sp")
+}
+
+/// Can a register other than sp or the frame pointer hold an address in this
+/// function's frame?  True when any instruction computes one from sp or x29
+/// (`add x0, sp, #32` for an address-taken local, `add x1, x29, #16` for a
+/// va_list, `mov x0, x29` for `__builtin_frame_address`) or stores x29 (once
+/// it holds this frame) anywhere but the prologue's push.  When false, a
+/// store through any other base register cannot write a stack slot.
+fn a64_frame_address_escapes(lines: &[String], kinds: &[LineKind], n: usize) -> bool {
+    let frame_tok = |t: &str| t == "sp" || t == "x29" || t == "w29";
+    (0..n).any(|m| {
+        if matches!(
+            kinds[m],
+            LineKind::Nop | LineKind::Directive | LineKind::Label
+        ) {
+            return false;
+        }
+        let Some((mn, ops)) = lines[m].trim().split_once(char::is_whitespace) else {
+            return false;
+        };
+        let ops = ops.trim();
+        // Operands outside the memory operand; the base inside it is an
+        // access, not a computed address.
+        let regs_text = match ops.find('[') {
+            Some(open) => &ops[..open],
+            None => ops,
+        };
+        let mut regs = regs_text
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
+        if mn.starts_with("st") {
+            // Every register named before the address is a stored value; the
+            // prologue's `stp x29, x30, [sp, #-N]!` stores the CALLER's x29.
+            let push = writeback_base(ops) == Some(31) && ops.contains("]!");
+            return !push && regs.any(frame_tok);
+        }
+        if mn.starts_with("ld") || mn.starts_with("prf") {
+            return false; // registers before the address are written
+        }
+        if matches!(mn, "cmp" | "cmn" | "tst" | "ccmp" | "ccmn") {
+            return regs.any(frame_tok);
+        }
+        // Data processing: the first operand is the destination, and sp or
+        // x29 as the destination sets up or restores the frame
+        // (`mov x29, sp`, `sub sp, sp, #16`, `mov sp, x29`).
+        if regs.next().is_some_and(frame_tok) {
+            return false;
+        }
+        regs.any(frame_tok)
+    })
+}
+
+/// Can the loop `[top, end]` write the `[lo, hi)` sp-relative bytes a hoisted
+/// slot load reads, or move sp under it?
+fn loop_may_write_slot(
+    lines: &[String],
+    kinds: &[LineKind],
+    top: usize,
+    end: usize,
+    (lo, hi): (i64, i64),
+    frame_escapes: bool,
+) -> bool {
+    (top..=end).any(|m| {
+        if matches!(
+            kinds[m],
+            LineKind::Nop | LineKind::Directive | LineKind::Label
+        ) {
+            return false;
+        }
+        let line = lines[m].as_str();
+        if a64_writes_sp(line) {
+            return true;
+        }
+        if !a64_may_write_memory(line) {
+            return false;
+        }
+        if let Some((slo, shi)) = a64_sp_store_range(line) {
+            return slo < hi && lo < shi;
+        }
+        let m0 = line.split_whitespace().next().unwrap_or("");
+        if m0 == "svc" || m0 == "dc" || frame_escapes {
+            return true;
+        }
+        // A store whose base is sp (register offset) or the frame pointer
+        // addresses the frame; any other base cannot, the frame not escaping.
+        matches!(a64_mem_base(line), Some("sp" | "x29") | None)
+    })
+}
+
+/// Facts about one function that every loop of the hoist walk shares; rebuilt
+/// after each transform, which restarts the walk.
+struct HoistFacts {
+    /// Line of every label the function defines.
+    label_line: FxHashMap<String, usize>,
+    /// Lines (other than the definition) naming each label.
+    label_refs: FxHashMap<String, Vec<usize>>,
+    frame_escapes: bool,
+    /// `abi_liveness`, computed on first use.
+    live: Option<Option<Vec<u64>>>,
+}
+
+impl HoistFacts {
+    fn build(lines: &[String], kinds: &[LineKind], n: usize) -> Self {
+        let mut label_line: FxHashMap<String, usize> = FxHashMap::default();
+        for m in 0..n {
+            if kinds[m] == LineKind::Label {
+                label_line.insert(lines[m].trim().trim_end_matches(':').to_string(), m);
+            }
+        }
+        // Deleted lines keep their text with a `Nop` kind (a removed branch
+        // to the next line still reads `b.lt .L3`): they reference nothing.
+        let mut label_refs: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        for m in 0..n {
+            if matches!(kinds[m], LineKind::Label | LineKind::Nop) {
+                continue;
+            }
+            let toks = lines[m]
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '$'));
+            for tok in toks {
+                if label_line.contains_key(tok) {
+                    label_refs.entry(tok.to_string()).or_default().push(m);
+                }
+            }
+        }
+        HoistFacts {
+            label_line,
+            label_refs,
+            frame_escapes: a64_frame_address_escapes(lines, kinds, n),
+            live: None,
+        }
+    }
+
+    fn live(&mut self, lines: &[String], kinds: &[LineKind], n: usize) -> Option<&[u64]> {
+        self.live
+            .get_or_insert_with(|| abi_liveness(lines, kinds, n))
+            .as_deref()
+    }
+}
+
+/// Where control goes when it leaves a loop: the line whose live-in set
+/// must not contain the hoisted register (a label outside the loop, the line
+/// after the backedge, or a `ret`/tail call inside it, whose own reads are in
+/// its live-in set), or somewhere unknown.
+#[derive(Clone, Copy)]
+enum LoopExit {
+    At(usize),
+    Unknown,
+}
+
+/// The control flow inside one loop `[top, end]` (`end` is the backedge).
+struct LoopShape {
+    top: usize,
+    block_of: Vec<usize>,
+    succs: Vec<Vec<usize>>,
+    /// Every way out of the loop, with the block it leaves from.
+    exits: Vec<(usize, LoopExit)>,
+}
+
+impl LoopShape {
+    /// `None` unless control enters the loop only at its top -- by falling
+    /// into it or by a branch from above, both of which receive a copy of a
+    /// hoisted sequence -- and every branch inside it is direct.  A label in
+    /// the loop named by a branch from outside it (a side entry), by a
+    /// branch below it, or by anything that is not a branch (a jump table's
+    /// `.word`, an `adr`) is an entry that would bypass the copies.
+    fn build(
+        lines: &[String],
+        kinds: &[LineKind],
+        n: usize,
+        top: usize,
+        end: usize,
+        facts: &HoistFacts,
+    ) -> Option<LoopShape> {
+        let is_transfer = |k: LineKind| {
+            matches!(
+                k,
+                LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch | LineKind::Ret
+            )
+        };
+        let is_branch = |k: LineKind| {
+            matches!(
+                k,
+                LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch
+            )
+        };
+        let mut block_of = vec![0usize; end - top + 1];
+        let mut starts = vec![top];
+        let mut region_labels: FxHashMap<&str, usize> = FxHashMap::default();
+        for m in top..=end {
+            if m > top && (kinds[m] == LineKind::Label || is_transfer(kinds[m - 1])) {
+                starts.push(m);
+            }
+            block_of[m - top] = starts.len() - 1;
+            if kinds[m] == LineKind::Label {
+                region_labels.insert(lines[m].trim().trim_end_matches(':'), starts.len() - 1);
+            }
+            if kinds[m] == LineKind::Branch && lines[m].trim_start().starts_with("br ") {
+                return None;
+            }
+        }
+        let top_label = lines[top].trim().trim_end_matches(':');
+        for &label in region_labels.keys() {
+            for &q in facts.label_refs.get(label).map_or(&[][..], |v| &v[..]) {
+                let inside = (top..=end).contains(&q);
+                let entry = q < top && label == top_label;
+                if !(is_branch(kinds[q]) && (inside || entry)) {
+                    return None;
+                }
+            }
+        }
+        let nb = starts.len();
+        let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nb];
+        let mut exits = Vec::new();
+        let leave = |line: usize| {
+            if line < n {
+                LoopExit::At(line)
+            } else {
+                LoopExit::Unknown
+            }
+        };
+        for b in 0..nb {
+            let be = if b + 1 < nb { starts[b + 1] } else { end + 1 };
+            let mut t = be;
+            while t > starts[b] && matches!(kinds[t - 1], LineKind::Nop | LineKind::Directive) {
+                t -= 1;
+            }
+            let last = if t > starts[b] { Some(t - 1) } else { None };
+            let target = |l: usize| lines[l].trim().split_whitespace().next_back();
+            let mut falls = true;
+            match last.map(|l| kinds[l]) {
+                Some(LineKind::Ret) => {
+                    exits.push((b, LoopExit::At(t - 1)));
+                    falls = false;
+                }
+                Some(k @ (LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch)) => {
+                    let l = t - 1;
+                    match target(l) {
+                        Some(name) if region_labels.contains_key(name) => {
+                            succs[b].push(region_labels[name]);
+                        }
+                        Some(name) if facts.label_line.contains_key(name) => {
+                            exits.push((b, LoopExit::At(facts.label_line[name])));
+                        }
+                        // A tail call reads what it reads at the branch.
+                        _ if k == LineKind::Branch => exits.push((b, LoopExit::At(l))),
+                        _ => exits.push((b, LoopExit::Unknown)),
+                    }
+                    falls = k != LineKind::Branch;
+                }
+                _ => {}
+            }
+            if falls {
+                if b + 1 < nb {
+                    succs[b].push(b + 1);
+                } else {
+                    exits.push((b, leave(end + 1)));
+                }
+            }
+        }
+        Some(LoopShape {
+            top,
+            block_of,
+            succs,
+            exits,
+        })
+    }
+
+    fn block(&self, line: usize) -> usize {
+        self.block_of[line - self.top]
+    }
+
+    /// Blocks reachable from the loop top without passing through `barrier`.
+    fn reachable_avoiding(&self, barrier: usize) -> Vec<bool> {
+        let mut seen = vec![false; self.succs.len()];
+        if barrier == 0 {
+            return seen;
+        }
+        seen[0] = true;
+        let mut stack = vec![0usize];
+        while let Some(b) = stack.pop() {
+            for &s in &self.succs[b] {
+                if s != barrier && !seen[s] {
+                    seen[s] = true;
+                    stack.push(s);
+                }
+            }
+        }
+        seen
+    }
+}
+
+/// The hoisting walk over one function's `lines`.
+fn hoist_loop_invariant_remats_in(lines: &mut Vec<String>, kinds: &mut Vec<LineKind>) -> bool {
+    let mut n = lines.len();
+    let mut changed = false;
+    let mut facts: Option<HoistFacts> = None;
     // Collect backward branches first (indices stable this pass: no inserts
     // happen until a transform commits, and after a commit we restart).
     let mut i = 0;
@@ -7147,24 +7745,18 @@ fn hoist_loop_invariant_remats(
             continue;
         }
 
-        // ── loop validity ──
-        // Entry edges into the loop top are the fallthrough and branches
-        // from ABOVE the top (handled by inserting copies at each such
-        // branch below). Branches from INSIDE the loop region to the top
-        // are additional backedges — sound without copies, because nothing
-        // in the loop defines dest after the transform (the value persists
-        // across them).
-        // Call-free loop.
+        // Call-free loop: a call clobbers the caller-saved registers, and a
+        // callee could write a slot through an escaped frame address.
         if (top..=i).any(|k| kinds[k] == LineKind::Call) {
             i += 1;
             continue;
         }
+        let fx = facts.get_or_insert_with(|| HoistFacts::build(lines, kinds, n));
+        let Some(shape) = LoopShape::build(lines, kinds, n, top, i, fx) else {
+            i += 1;
+            continue;
+        };
         // Candidate scan: every position in the loop, starting at the top.
-        // The dest must be SELF-CONTAINED: defined exactly once (here), not
-        // mentioned before, and only read afterwards — then hoisting the
-        // pure sequence above the loop top preserves every value (the def
-        // executes once instead of once per trip; every reader sees the same
-        // constant/address either way).
         let mut transformed = false;
         let mut k = top;
         while k <= i {
@@ -7176,8 +7768,15 @@ fn hoist_loop_invariant_remats(
                 k += 1;
                 continue;
             };
+            // x29 (the frame pointer) and x30 (the link register) are not
+            // values a loop recomputes.
+            if dest > 28 {
+                k += 1;
+                continue;
+            }
             let seq_end = k + seq_len;
-            // No other def of dest anywhere in the loop.
+            // No other def of dest anywhere in the loop: once the sequence has
+            // run, dest holds its value until the loop is left.
             let mut other_def = false;
             let mut m = top;
             while m <= i {
@@ -7220,51 +7819,33 @@ fn hoist_loop_invariant_remats(
                 k += 1;
                 continue;
             }
-            // sp-slot loads: no overlapping store anywhere in the loop.
-            if lines[k].trim_start().starts_with("ldr ") {
-                let off = match kinds[k] {
-                    LineKind::LoadSp { offset, .. } => offset,
-                    _ => unreachable!(),
-                };
-                let mut bad = false;
-                let mut m = top;
-                while m <= i {
-                    if let LineKind::StoreSp { offset: so, .. } = kinds[m] {
-                        if (so - off).abs() < 8 {
-                            bad = true;
-                            break;
-                        }
-                    } else if matches!(kinds[m], LineKind::MemOther | LineKind::Other) {
-                        let t = lines[m].trim_start();
-                        if t.starts_with("str ") || t.starts_with("stur ") || t.starts_with("stp ")
-                        {
-                            for o in sp_offsets_in_line(t) {
-                                if (o - off).abs() < 8 {
-                                    bad = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if bad {
-                        break;
-                    }
-                    m += 1;
-                }
-                if bad {
+            // Every reader in the loop runs after the sequence: a reader in a
+            // block the loop top reaches without passing the sequence's
+            // block (a merge after `if (c) x = K;`) saw the value from before
+            // the loop on the trips that skipped the definition, and would
+            // see K after the hoist.
+            let free = shape.reachable_avoiding(shape.block(k));
+            if (top..=i).any(|m| {
+                (m < k || m >= seq_end)
+                    && free[shape.block(m)]
+                    && kinds[m] != LineKind::Nop
+                    && line_mentions_reg(&lines[m], dest)
+            }) {
+                k += 1;
+                continue;
+            }
+            // sp-slot loads: nothing in the loop may write the slot or move
+            // sp under it.
+            if let LineKind::LoadSp {
+                offset, is_word, ..
+            } = kinds[k]
+            {
+                let bytes = (offset as i64, offset as i64 + if is_word { 4 } else { 8 });
+                if loop_may_write_slot(lines, kinds, top, i, bytes, fx.frame_escapes) {
                     k += 1;
                     continue;
                 }
             }
-
-            // Dest must be dead after the loop: on paths whose seq block did
-            // not run, the register held an older value — post-loop readers
-            // must not observe the change.
-            if ((i + 1)..n).any(|m| line_mentions_reg(&lines[m], dest)) {
-                k += 1;
-                continue;
-            }
-
             // Entry edges: fallthrough (handled by inserting before the
             // label) plus every branch from ABOVE the loop that targets the
             // top. Entry branches must not read dest (the copy would change
@@ -7286,13 +7867,56 @@ fn hoist_loop_invariant_remats(
                 k += 1;
                 continue;
             }
+            // Where the transform changes dest outside the loop, nothing may
+            // read it: on an exit from a block the top reaches without
+            // passing the sequence (a trip that left before the sequence ever
+            // ran held the older value; an exit after it holds the same value
+            // either way), and on the fall-through path of a CONDITIONAL entry
+            // branch, where the copy placed before the branch also runs.  The
+            // exact liveness lets a later redefinition through; without it (a
+            // jump table) dest must be a scratch register no line outside the
+            // loop names.
+            let bit = 1u64 << dest;
+            let early_exits: Vec<LoopExit> = shape
+                .exits
+                .iter()
+                .filter(|&&(b, _)| free[b])
+                .map(|&(_, e)| e)
+                .collect();
+            let cond_entries: Vec<usize> = entry_branches
+                .iter()
+                .copied()
+                .filter(|&m| kinds[m] != LineKind::Branch)
+                .collect();
+            if !early_exits.is_empty() || !cond_entries.is_empty() {
+                let dead_outside = match fx.live(lines, kinds, n) {
+                    Some(lb) => {
+                        early_exits.iter().all(|e| match *e {
+                            LoopExit::At(t) => lb[t] & bit == 0,
+                            LoopExit::Unknown => false,
+                        }) && cond_entries
+                            .iter()
+                            .all(|&m| m + 1 < n && lb[m + 1] & bit == 0)
+                    }
+                    None => {
+                        (9..=18).contains(&dest)
+                            && !(0..top).chain(i + 1..n).any(|m| {
+                                kinds[m] != LineKind::Nop && line_mentions_reg(&lines[m], dest)
+                            })
+                    }
+                };
+                if !dead_outside {
+                    k += 1;
+                    continue;
+                }
+            }
 
             // ── transform: delete the in-loop sequence first (indices are
             //    still valid), then insert copies before every entry branch
             //    (descending order keeps earlier indices valid), then insert
             //    the fallthrough copy right before the (relocated) label. ──
             let seq_lines: Vec<String> = (k..seq_end).map(|q| lines[q].clone()).collect();
-            let seq_kinds: Vec<LineKind> = (k..seq_end).map(|q| kinds[q].clone()).collect();
+            let seq_kinds: Vec<LineKind> = (k..seq_end).map(|q| kinds[q]).collect();
             for _ in 0..seq_len {
                 lines.remove(k);
                 kinds.remove(k);
@@ -7300,7 +7924,7 @@ fn hoist_loop_invariant_remats(
             for &b in entry_branches.iter().rev() {
                 for (off, l) in seq_lines.iter().enumerate() {
                     lines.insert(b + off, l.clone());
-                    kinds.insert(b + off, seq_kinds[off].clone());
+                    kinds.insert(b + off, seq_kinds[off]);
                 }
             }
             let label_idx = (0..lines.len())
@@ -7310,7 +7934,7 @@ fn hoist_loop_invariant_remats(
                 .unwrap_or(top);
             for (off, l) in seq_lines.iter().enumerate() {
                 lines.insert(label_idx + off, l.clone());
-                kinds.insert(label_idx + off, seq_kinds[off].clone());
+                kinds.insert(label_idx + off, seq_kinds[off]);
             }
             transformed = true;
             break;
@@ -7318,11 +7942,11 @@ fn hoist_loop_invariant_remats(
         if transformed {
             changed = true;
             n = lines.len();
+            facts = None; // stale: lines moved
             i = 0; // loop shape changed: rescan
             continue;
         }
         i += 1;
-        continue;
     }
     changed
 }
@@ -7924,6 +8548,46 @@ mod tests {
         );
     }
 
+    /// The hoist walks one CFI-delimited function at a time: a later
+    /// function's mention of the register is not a reader after the loop
+    /// (it blocked the hoist when the scan ran to the end of the module),
+    /// and a hoist in the first function -- which inserts lines -- leaves
+    /// the second function's own hoist intact.
+    #[test]
+    fn test_invar_hoist_is_function_local() {
+        let looped = |name: &str| {
+            format!(
+                concat!(
+                    "{n}:\n.cfi_startproc\n",
+                    "    mov w0, #7\n",
+                    "    str w0, [sp, #40]\n",
+                    "    b.lt .L{n}\n",
+                    ".L{n}:\n",
+                    "    ldr w2, [sp, #40]\n",
+                    "    add w3, w2, #1\n",
+                    "    add w20, w20, #1\n",
+                    "    cmp w20, #100\n",
+                    "    b.lt .L{n}\n",
+                    "    ret\n",
+                    ".cfi_endproc\n",
+                ),
+                n = name
+            )
+        };
+        let reader = "other:\n.cfi_startproc\n    str w2, [x0]\n    ret\n.cfi_endproc\n";
+        let input = format!("{}{}{}", looped("first"), reader, looped("second"));
+        let result = peephole_optimize(input);
+        for name in ["first", "second"] {
+            let body = result.split(&format!(".L{name}:")).nth(1).unwrap_or("");
+            let loop_body = &body[..body.find("    ret").unwrap_or(body.len())];
+            assert!(
+                !loop_body.contains("[sp, #40]"),
+                "{name}: load not hoisted from the loop:\n{result}"
+            );
+        }
+        assert!(result.contains("other:\n.cfi_startproc\n    str w2, [x0]\n    ret\n"));
+    }
+
     #[test]
     fn test_invar_hoist_waits_for_last_backedge() {
         let input = concat!(
@@ -7978,32 +8642,356 @@ mod tests {
 
     #[test]
     fn test_invar_hoist_blocked_by_post_loop_reader() {
-        // x1 is read after the loop: paths that skip the original def block
-        // would observe a changed value.
+        // w2 is read after the loop, and the load sits in a block the loop
+        // top can skip: a run whose every trip skipped it leaves the loop
+        // with the older w2, which the hoist would replace.
         let input = concat!(
             "main:\n",
             "    mov w0, #7\n",
             "    str w0, [sp, #40]\n",
             "    b.lt .LBB10\n",
             ".LBB10:\n",
+            "    cbz w21, .LBB11\n",
             "    ldr w2, [sp, #40]\n",
+            "    str w2, [x22]\n",
+            ".LBB11:\n",
             "    add w20, w20, #1\n",
             "    cmp w20, #100\n",
             "    b.lt .LBB10\n",
             "    add w5, w2, #9\n",
             "    ret\n",
         );
-        let result = peephole_optimize(input.to_string());
-        let after = result
-            .split(".LBB10:")
-            .nth(1)
-            .unwrap_or("")
-            .trim_start_matches('\n');
-        assert!(
-            after.starts_with("    ldr w2, [sp, #40]"),
-            "hoisted despite post-loop reader:\n{}",
-            result
+        let result = hoist_only(input);
+        assert_eq!(result, input, "hoisted despite post-loop reader");
+    }
+
+    /// Run the hoist alone over `asm`.
+    fn hoist_only(asm: &str) -> String {
+        let mut lines: Vec<String> = asm.lines().map(str::to_string).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        hoist_loop_invariant_remats(&mut lines, &mut kinds, n);
+        let mut out = lines.join("\n");
+        out.push('\n');
+        out
+    }
+
+    /// The text between `label:` and the last branch back to it.
+    fn loop_text<'a>(asm: &'a str, label: &str) -> &'a str {
+        let start = asm.find(&format!("{label}:\n")).expect("loop label");
+        let tail = &asm[start..];
+        let end = tail.rfind(&format!(" {label}\n")).expect("backedge");
+        &tail[..end]
+    }
+
+    /// A definition in the loop's first block runs on every trip before
+    /// anything else, so every exit sees its value whether or not it was
+    /// hoisted: a reader after the loop does not block the hoist.
+    #[test]
+    fn test_invar_hoist_header_def_ignores_post_loop_reader() {
+        let input = concat!(
+            "f:\n.cfi_startproc\n",
+            "    mov w0, #7\n",
+            "    str w0, [sp, #40]\n",
+            ".LBB10:\n",
+            "    ldr w2, [sp, #40]\n",
+            "    add w20, w20, w2\n",
+            "    cmp w20, #100\n",
+            "    b.lt .LBB10\n",
+            "    add w0, w2, #9\n",
+            "    ret\n",
+            ".cfi_endproc\n",
         );
+        let result = hoist_only(input);
+        assert!(!loop_text(&result, ".LBB10").contains("ldr w2"), "{result}");
+        assert!(
+            result.contains("    ldr w2, [sp, #40]\n.LBB10:\n"),
+            "{result}"
+        );
+    }
+
+    /// `if (c) x = K;` inside the loop, `x` read after the merge: the trips
+    /// that skip the definition read the value from before the loop.
+    #[test]
+    fn test_invar_hoist_needs_the_def_to_dominate_its_readers() {
+        let looped = |guard: &str| {
+            format!(
+                concat!(
+                    "f:\n.cfi_startproc\n",
+                    "    mov x9, x2\n",
+                    "    mov x6, #0\n",
+                    ".LBB2:\n",
+                    "    ldr x0, [x20]\n",
+                    "{}",
+                    "    movz x9, #26505\n",
+                    "    movk x9, #9029, lsl #16\n",
+                    ".LBB4:\n",
+                    "    add x6, x6, x9\n",
+                    "    add x20, x20, #8\n",
+                    "    cmp x20, x21\n",
+                    "    b.lt .LBB2\n",
+                    "    mov x0, x6\n",
+                    "    ret\n",
+                    ".cfi_endproc\n",
+                ),
+                guard
+            )
+        };
+        let conditional = looped("    cbz x0, .LBB4\n");
+        assert_eq!(hoist_only(&conditional), conditional);
+        // The same definition on every trip moves.
+        let straight = looped("    str x0, [x22]\n");
+        let result = hoist_only(&straight);
+        assert!(!loop_text(&result, ".LBB2").contains("movz"), "{result}");
+        assert!(
+            result.contains("    movk x9, #9029, lsl #16\n.LBB2:\n"),
+            "{result}"
+        );
+    }
+
+    /// The inner loop defines x9 only on some trips and the outer loop reads
+    /// it at its top -- textually BEFORE the inner loop, where a scan of the
+    /// lines after the loop never looked.
+    #[test]
+    fn test_invar_hoist_sees_readers_above_the_loop() {
+        let input = concat!(
+            "f:\n.cfi_startproc\n",
+            "    mov x9, #7\n",
+            "    mov x6, #0\n",
+            ".LBB13:\n",
+            "    add x6, x6, x9\n",
+            "    mov x23, #0\n",
+            ".LBB16:\n",
+            "    ldr x0, [x24]\n",
+            "    cbz x0, .LBB18\n",
+            "    movz x9, #9029\n",
+            "    movk x9, #1, lsl #16\n",
+            "    str x23, [x20]\n",
+            ".LBB18:\n",
+            "    add x23, x23, #1\n",
+            "    cmp x23, x19\n",
+            "    b.lt .LBB16\n",
+            "    add x22, x22, #1\n",
+            "    cmp x22, x25\n",
+            "    b.lt .LBB13\n",
+            "    mov x0, x6\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        assert_eq!(hoist_only(input), input);
+    }
+
+    /// A later redefinition is not a reader: exact liveness lets the hoist
+    /// through where a textual "no mention after the loop" refused it.
+    #[test]
+    fn test_invar_hoist_ignores_a_later_redefinition() {
+        let input = concat!(
+            "f:\n.cfi_startproc\n",
+            "    mov x6, #0\n",
+            ".Ltop:\n",
+            "    cbz x4, .Lskip\n",
+            "    adrp x9, tbl\n",
+            "    add x9, x9, :lo12:tbl\n",
+            "    str x6, [x9]\n",
+            ".Lskip:\n",
+            "    subs x3, x3, #1\n",
+            "    b.ne .Ltop\n",
+            "    mov x9, x6\n",
+            "    add x0, x9, #1\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let result = hoist_only(input);
+        assert!(!loop_text(&result, ".Ltop").contains("adrp"), "{result}");
+        assert!(
+            result.contains("    add x9, x9, :lo12:tbl\n.Ltop:\n"),
+            "{result}"
+        );
+    }
+
+    /// A branch from above into the middle of the loop enters it without
+    /// passing the copies placed at its top.
+    #[test]
+    fn test_invar_hoist_refuses_side_entries() {
+        let input = concat!(
+            "f:\n.cfi_startproc\n",
+            "    mov x9, #5\n",
+            "    mov x6, #0\n",
+            "    cbz x3, .Lmid\n",
+            ".Ltop:\n",
+            "    movz x9, #77\n",
+            "    add x6, x6, x9\n",
+            ".Lmid:\n",
+            "    add x6, x6, x9\n",
+            "    subs x4, x4, #1\n",
+            "    b.ne .Ltop\n",
+            "    mov x0, x6\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        assert_eq!(hoist_only(input), input);
+        // An address-taken label inside the loop is an entry too.
+        let taken = input.replace("    cbz x3, .Lmid\n", "    adr x12, .Lmid\n");
+        assert_eq!(hoist_only(&taken), taken);
+    }
+
+    /// The copy placed before a conditional entry branch also runs on its
+    /// fall-through path, which here returns the older x9.
+    #[test]
+    fn test_invar_hoist_respects_a_conditional_entry_fallthrough() {
+        let input = concat!(
+            "f:\n.cfi_startproc\n",
+            "    mov x9, #3\n",
+            "    cmp x3, #0\n",
+            "    b.gt .Ltop\n",
+            "    add x0, x9, #1\n",
+            "    ret\n",
+            ".Ltop:\n",
+            "    movz x9, #500\n",
+            "    add x6, x6, x9\n",
+            "    subs x3, x3, #1\n",
+            "    b.ne .Ltop\n",
+            "    mov x0, x6\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        assert_eq!(hoist_only(input), input);
+        // With the fall-through path redefining x9 first, the copy is dead
+        // there and the hoist goes ahead.
+        let dead = input.replace(
+            "    add x0, x9, #1\n",
+            "    mov x9, #1\n    add x0, x9, #1\n",
+        );
+        let result = hoist_only(&dead);
+        assert!(!loop_text(&result, ".Ltop").contains("movz"), "{result}");
+        assert!(
+            result.contains("    movz x9, #500\n    b.gt .Ltop\n"),
+            "{result}"
+        );
+    }
+
+    /// Implicit readers after the loop: a tail call reads its arguments and
+    /// a `ret` reads x0 although neither names the register.
+    #[test]
+    fn test_invar_hoist_sees_implicit_abi_readers() {
+        let looped = |reg: &str, tail: &str| {
+            format!(
+                concat!(
+                    "f:\n.cfi_startproc\n",
+                    "    mov x6, #0\n",
+                    ".Ltop:\n",
+                    "    cbz x4, .Lskip\n",
+                    "    movz {r}, #1234\n",
+                    "    str {r}, [x5]\n",
+                    ".Lskip:\n",
+                    "    subs x3, x3, #1\n",
+                    "    b.ne .Ltop\n",
+                    "{t}",
+                    ".cfi_endproc\n",
+                ),
+                r = reg,
+                t = tail
+            )
+        };
+        for (reg, tail) in [
+            ("x1", "    mov x0, x6\n    b callee\n"),
+            ("x0", "    ret\n"),
+            ("x8", "    bl other\n    ret\n"),
+        ] {
+            let input = looped(reg, tail);
+            assert_eq!(hoist_only(&input), input, "{reg} read by `{tail}`");
+        }
+        // x10 is read by none of them.
+        let input = looped("x10", "    mov x0, x6\n    b callee\n");
+        let result = hoist_only(&input);
+        assert!(!loop_text(&result, ".Ltop").contains("movz"), "{result}");
+    }
+
+    /// A slot load stays while the loop can write the slot: through a
+    /// pointer once the frame address escapes, with a store pair or a byte
+    /// store that overlaps it, or with sp moving under it.
+    #[test]
+    fn test_invar_hoist_slot_load_needs_an_unwritten_slot() {
+        let looped = |pre: &str, store: &str| {
+            format!(
+                concat!(
+                    "f:\n.cfi_startproc\n",
+                    "{p}",
+                    "    mov x11, #0\n",
+                    ".Ltop:\n",
+                    "    ldr x9, [sp, #24]\n",
+                    "    add x11, x11, x9\n",
+                    "{s}",
+                    "    subs x3, x3, #1\n",
+                    "    b.ne .Ltop\n",
+                    "    mov x0, x11\n",
+                    "    ret\n",
+                    ".cfi_endproc\n",
+                ),
+                p = pre,
+                s = store
+            )
+        };
+        for (pre, store) in [
+            ("    add x10, sp, #24\n", "    str x11, [x10]\n"),
+            ("    add x10, x29, #8\n", "    str x11, [x10]\n"),
+            ("", "    str x11, [x29, #24]\n"),
+            ("", "    stp x11, x12, [sp, #16]\n"),
+            ("", "    strb w11, [sp, #31]\n"),
+            ("", "    str q0, [sp, #16]\n"),
+            ("", "    str x11, [sp, #-16]!\n    ldr x11, [sp], #16\n"),
+            ("", "    sub sp, sp, #16\n    add sp, sp, #16\n"),
+            ("", "    ldadd x11, x12, [x10]\n    add x10, sp, #0\n"),
+        ] {
+            let input = looped(pre, store);
+            assert_eq!(hoist_only(&input), input, "pre `{pre}` store `{store}`");
+        }
+        // Stores that cannot reach the slot: a disjoint sp slot, and a
+        // pointer while no frame address escapes.
+        for store in ["    str x11, [sp, #32]\n", "    str x11, [x10]\n"] {
+            let input = looped("", store);
+            let result = hoist_only(&input);
+            assert!(
+                !loop_text(&result, ".Ltop").contains("[sp, #24]"),
+                "`{store}`: {result}"
+            );
+        }
+    }
+
+    /// A function whose only loop sits at its very start and that never
+    /// returns: the first sweep of the dataflow moves the header's live-in
+    /// without changing any live-out a block already read, and must not stop
+    /// there with the loop-carried read missing from the latch.
+    #[test]
+    fn branch_census_charges_alignment_padding() {
+        assert_eq!(directive_insn_bound("    .p2align 4,,10"), 4);
+        assert_eq!(directive_insn_bound(".p2align 3"), 2);
+        assert_eq!(directive_insn_bound(".align 2"), 1);
+        assert_eq!(directive_insn_bound(".balign 64"), 16);
+        assert_eq!(directive_insn_bound(".cfi_startproc"), 1);
+        assert_eq!(directive_insn_bound(".p2alignx 4"), 1);
+        let lines: Vec<String> = ["    b.eq .L1", ".p2align 5", "    nop", ".L1:"]
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let census = BranchCensus::new(&lines, &kinds);
+        assert_eq!(census.distance(0, ".L1"), Some(1 + 8 + 1));
+        assert_eq!(census.distance(0, ".L2"), None);
+    }
+
+    #[test]
+    fn liveness_reaches_the_fixed_point_without_a_ret() {
+        let lines: Vec<String> = [".Ltop:", "    add x10, x10, x9", ".Lmid:", "    b .Ltop"]
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let lv = Liveness::build(&lines, &kinds, 0, lines.len(), false).expect("resolvable");
+        assert_eq!(lv.live_after(1, 9), Some(true));
+        assert_eq!(lv.live_after(1, 10), Some(true));
+        let abi = abi_liveness(&lines, &kinds, lines.len()).expect("resolvable");
+        assert_ne!(abi[3] & (1 << 9), 0);
     }
 
     #[test]

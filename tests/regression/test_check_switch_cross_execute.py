@@ -20,7 +20,8 @@ class LinkerDiscoveryTests(unittest.TestCase):
         for fixture in ['switch_i128_high_half', 'switch_i128_wide_cases',
                         'complex_float_return_cross', 'divrem_pair_cross',
                         'urem_by_one_cross', 'va_arg_align16_cross',
-                        'overaligned_aggregate_arg_cross']:
+                        'overaligned_aggregate_arg_cross',
+                        'callee_saved_return_paths_cross']:
             self.assertIn(fixture, FIXTURES)
             self.assertEqual(LEVELS[fixture], ('-O0', '-O1', '-O2', '-Os'))
         self.assertLessEqual(set(LEVELS), set(FIXTURES))

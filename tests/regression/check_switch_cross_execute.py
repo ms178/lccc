@@ -31,6 +31,7 @@ FIXTURES = (
     "switch_i128_high_half", "switch_i128_wide_cases", "complex_float_return_cross",
     "divrem_pair_cross", "urem_by_one_cross", "va_arg_align16_cross",
     "overaligned_aggregate_arg_cross", "indirect_variadic_call_cross",
+    "callee_saved_return_paths_cross",
 )
 ALL_LEVELS = ("-O0", "-O1", "-O2", "-Os")
 LEVELS = {
@@ -51,6 +52,9 @@ LEVELS = {
     # Member/element/cast callees of variadic type classified as fixed calls
     # (RV64: unnamed doubles in FP registers that va_arg never reads).
     "indirect_variadic_call_cross": ALL_LEVELS,
+    # AArch64 -O1/-O2: an epilogue's callee-saved restore hoisted out of a
+    # "loop" whose backedge was a second path to the epilogue.
+    "callee_saved_return_paths_cross": ALL_LEVELS,
 }
 # Two-unit psABI fixtures under interop/: `<name>_callee.c` and
 # `<name>_caller.c`, linked LCCC-with-LCCC and LCCC-with-Clang in both
