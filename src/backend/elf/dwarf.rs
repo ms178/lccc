@@ -90,7 +90,9 @@
 //! computed before the linker deletes bytes, and a map that is slightly too long
 //! would claim code belonging to the next unit -- a scan is better than a lie.
 //!
-use super::dwarf_spec::{BaseKind, DwarfType, DwarfUnitSpec, DwarfVariable, RecordKind, TypeQual};
+use super::dwarf_spec::{
+    BaseKind, DwarfMember, DwarfType, DwarfUnitSpec, DwarfVariable, RecordKind, TypeQual,
+};
 use super::{ObjReloc, ObjSection, SHF_MERGE, SHF_STRINGS, SHT_PROGBITS, parse_string_literal};
 use crate::common::fx_hash::FxHashMap;
 
@@ -1799,8 +1801,119 @@ pub(crate) fn build_dwarf_info_sections(
     let void_die = length32((info.len() - start) as u64, "unit")?;
     if has_code {
         write_uleb128(2, &mut info);
+        emit_subprograms(
+            SubprogramSink {
+                info: &mut info,
+                relocs: &mut relocs,
+                dies: &mut dies,
+                strings: &mut *strings,
+                line_strings: &mut *line_strings,
+                symbol_at,
+                config,
+                forms,
+                abs32,
+                abs_addr,
+                address_size,
+                has_declarator_rows,
+            },
+            functions,
+            sections,
+            &covered,
+            unit,
+            &abbrevs,
+            &declaration,
+            void_die,
+        )?;
     }
+    if !unit.types.is_empty() || !unit.variables.is_empty() {
+        let mut ctx = DieContext {
+            info: &mut info,
+            relocs: &mut relocs,
+            strings,
+            line_strings,
+            config,
+            forms,
+            abs32,
+            abs_addr,
+            address_size,
+            unit_start: start,
+            writer: &mut dies,
+        };
+        emit_types(&mut ctx, unit)?;
+        emit_variables(&mut ctx, &unit.variables, files, defined_objects)?;
+        ctx.patch_type_refs()?;
+    }
+    dies.abbrev.push(0); // end of the abbreviation table
+    info.push(0); // end of the unit's children
 
+    let unit_length = length32((info.len() - start - 4) as u64, "unit")?;
+    info[start..start + 4].copy_from_slice(&unit_length.to_le_bytes());
+    Ok(Some(DwarfInfoBuild {
+        info: debug_section(".debug_info", info, relocs),
+        abbrev: debug_section(".debug_abbrev", dies.abbrev, Vec::new()),
+        aranges: build_debug_aranges(start as u64, &code, address_size, abs32, abs_addr, labels)?,
+        ranges: build_debug_ranges(config, &code, address_size, abs_addr)?,
+    }))
+}
+
+/// The three outputs a subprogram DIE appends to, and the dialect it must be
+/// spelled in.
+///
+/// Passing this as one value is what keeps [`emit_subprograms`] readable: the
+/// alternative is fifteen arguments, four of them mutable, in every recursive
+/// helper.  `symbol_at` is moved in because the caller has no further use for
+/// it — the unit's `low_pc` was already relocated against a label.
+struct SubprogramSink<'a, 's, 'f> {
+    info: &'a mut Vec<u8>,
+    relocs: &'a mut Vec<ObjReloc>,
+    dies: &'a mut DieWriter,
+    strings: &'a mut DwarfStrings,
+    line_strings: &'a mut DwarfStrings,
+    symbol_at: SymbolAt<'s, 'f>,
+    config: DwarfConfig,
+    forms: UnitForms,
+    abs32: u32,
+    abs_addr: u32,
+    address_size: usize,
+    has_declarator_rows: bool,
+}
+
+/// Every function of the unit, as `DW_TAG_subprogram` DIEs in address order.
+///
+/// The sort key is `(section, offset, name)` rather than the input order because
+/// a consumer binary-searches ranges; `name` only breaks ties between two
+/// functions that start at the same address, which keeps the output
+/// byte-reproducible when two sections alias.
+///
+/// A function is described when it has a size and lies inside a section the
+/// unit covers: a zero-size symbol is an alias or an assembler label, and
+/// describing it would produce a DIE whose `low_pc`/`high_pc` range is empty.
+fn emit_subprograms(
+    sink: SubprogramSink<'_, '_, '_>,
+    functions: &[DwarfFunction<'_>],
+    sections: &[DwarfSectionInfo<'_>],
+    covered: &[bool],
+    unit: &DwarfUnitSpec,
+    abbrevs: &UnitAbbrevs,
+    declaration: &dyn Fn(usize, u64, u64) -> Option<SourcePosition>,
+    void_die: u32,
+) -> Result<(), String> {
+    // Destructured into plain locals, so the emission below reads exactly as it
+    // did when it lived inline in the section builder.
+    let SubprogramSink {
+        info,
+        relocs,
+        dies,
+        strings,
+        line_strings,
+        mut symbol_at,
+        config,
+        forms,
+        abs32,
+        abs_addr,
+        address_size,
+        has_declarator_rows,
+    } = sink;
     let mut members: Vec<&DwarfFunction<'_>> = functions
         .iter()
         .filter(|f| f.size != 0 && covered[f.section_index])
@@ -1832,12 +1945,12 @@ pub(crate) fn build_dwarf_info_sections(
             &abbrevs.subprogram
         };
         let abbrev_code = shape[usize::from(known.is_none())][usize::from(function.external)];
-        write_uleb128(abbrev_code, &mut info);
+        write_uleb128(abbrev_code, info);
         write_string_attribute(
             function.name,
             forms.string,
-            &mut info,
-            &mut relocs,
+            info,
+            relocs,
             abs32,
             strings,
             line_strings,
@@ -1849,10 +1962,10 @@ pub(crate) fn build_dwarf_info_sections(
             info.push(u8::from(function.external));
         }
         if let Some(position) = known {
-            write_uleb128(position.file, &mut info);
-            write_uleb128(position.line, &mut info);
+            write_uleb128(position.file, info);
+            write_uleb128(position.line, info);
             if has_declarator_rows {
-                write_uleb128(u64::from(position.column), &mut info);
+                write_uleb128(u64::from(position.column), info);
             }
         }
         // The return type, when the compiler knows it.  `DW_AT_type` is a
@@ -1873,13 +1986,13 @@ pub(crate) fn build_dwarf_info_sections(
         if let Some(symbol_at) = symbol_at.as_deref_mut() {
             let start_at = symbol_at(function.section_index, function.offset);
             let end_at = symbol_at(function.section_index, function.offset + function.size);
-            push_reloc(&mut info, &mut relocs, abs_addr, address_size, &start_at, 0)?;
-            push_reloc(&mut info, &mut relocs, abs_addr, address_size, &end_at, 0)?;
+            push_reloc(info, relocs, abs_addr, address_size, &start_at, 0)?;
+            push_reloc(info, relocs, abs_addr, address_size, &end_at, 0)?;
         } else {
             let section = &sections[function.section_index];
             push_reloc(
-                &mut info,
-                &mut relocs,
+                info,
+                relocs,
                 abs_addr,
                 address_size,
                 section.name,
@@ -1889,16 +2002,9 @@ pub(crate) fn build_dwarf_info_sections(
                 let end = function.offset.checked_add(function.size).ok_or_else(|| {
                     "internal: DWARF function range overflows the code section".to_string()
                 })?;
-                push_reloc(
-                    &mut info,
-                    &mut relocs,
-                    abs_addr,
-                    address_size,
-                    section.name,
-                    end,
-                )?;
+                push_reloc(info, relocs, abs_addr, address_size, section.name, end)?;
             } else {
-                push_high_pc(&mut info, forms.high_pc, function.size);
+                push_high_pc(info, forms.high_pc, function.size);
             }
         }
         if config.version >= 3 {
@@ -1917,7 +2023,7 @@ pub(crate) fn build_dwarf_info_sections(
                 } else {
                     abbrevs.formal_parameter_unnamed
                 };
-                write_uleb128(code, &mut info);
+                write_uleb128(code, info);
                 if let Some(name) = parameter.name.as_deref() {
                     if name.as_bytes().contains(&0) {
                         return Err(format!(
@@ -1927,8 +2033,8 @@ pub(crate) fn build_dwarf_info_sections(
                     write_string_attribute(
                         name,
                         forms.string,
-                        &mut info,
-                        &mut relocs,
+                        info,
+                        relocs,
                         abs32,
                         strings,
                         line_strings,
@@ -1939,40 +2045,12 @@ pub(crate) fn build_dwarf_info_sections(
                 info.extend_from_slice(&[0; 4]);
             }
             if list.variadic {
-                write_uleb128(abbrevs.unspecified_parameters, &mut info);
+                write_uleb128(abbrevs.unspecified_parameters, info);
             }
             info.push(0); // end of this subprogram's children
         }
     }
-    if !unit.types.is_empty() || !unit.variables.is_empty() {
-        let mut ctx = DieContext {
-            info: &mut info,
-            relocs: &mut relocs,
-            strings,
-            line_strings,
-            config,
-            forms,
-            abs32,
-            abs_addr,
-            address_size,
-            unit_start: start,
-            writer: &mut dies,
-        };
-        emit_types(&mut ctx, unit)?;
-        emit_variables(&mut ctx, &unit.variables, files, defined_objects)?;
-        ctx.patch_type_refs()?;
-    }
-    dies.abbrev.push(0); // end of the abbreviation table
-    info.push(0); // end of the unit's children
-
-    let unit_length = length32((info.len() - start - 4) as u64, "unit")?;
-    info[start..start + 4].copy_from_slice(&unit_length.to_le_bytes());
-    Ok(Some(DwarfInfoBuild {
-        info: debug_section(".debug_info", info, relocs),
-        abbrev: debug_section(".debug_abbrev", dies.abbrev, Vec::new()),
-        aranges: build_debug_aranges(start as u64, &code, address_size, abs32, abs_addr, labels)?,
-        ranges: build_debug_ranges(config, &code, address_size, abs_addr)?,
-    }))
+    Ok(())
 }
 
 /// Move a built line program to where it starts inside the section it belongs
@@ -2460,104 +2538,16 @@ fn emit_type(
             size,
             complete,
             members,
-        } => {
-            let tag = match kind {
-                RecordKind::Struct => DW_TAG_STRUCTURE_TYPE,
-                RecordKind::Union => DW_TAG_UNION_TYPE,
-            };
-            let mut attrs = Vec::new();
-            if let Some(name) = name {
-                attrs.push(Attr {
-                    at: DW_AT_NAME,
-                    value: AttrValue::Text(name.clone()),
-                });
-            }
-            attrs.push(Attr {
-                at: DW_AT_BYTE_SIZE,
-                value: AttrValue::Udata(*size),
-            });
-            if !*complete {
-                // A declaration is not an empty struct: without this flag a
-                // consumer would report every member as missing instead of
-                // "incomplete type".
-                attrs.push(Attr {
-                    at: DW_AT_DECLARATION,
-                    value: AttrValue::FlagPresent,
-                });
-            }
-            ctx.write(tag, true, &attrs)?;
-            for member in members {
-                let mut member_attrs = Vec::new();
-                if let Some(name) = &member.name {
-                    member_attrs.push(Attr {
-                        at: DW_AT_NAME,
-                        value: AttrValue::Text(name.clone()),
-                    });
-                }
-                member_attrs.push(Attr {
-                    at: DW_AT_TYPE,
-                    value: AttrValue::TypeRef(member.ty),
-                });
-                match member.bit {
-                    None => {
-                        if matches!(kind, RecordKind::Struct) {
-                            member_attrs.push(Attr {
-                                at: DW_AT_DATA_MEMBER_LOCATION,
-                                value: AttrValue::MemberLocation(member.offset),
-                            });
-                        }
-                    }
-                    Some((width, bit_offset)) => {
-                        if five {
-                            // Version 5 counts from the least significant bit of
-                            // the object, which is the layout's own numbering.
-                            let bit = member.offset * 8 + u64::from(bit_offset);
-                            member_attrs.push(Attr {
-                                at: DW_AT_BIT_SIZE,
-                                value: AttrValue::Udata(u64::from(width)),
-                            });
-                            member_attrs.push(Attr {
-                                at: DW_AT_DATA_BIT_OFFSET,
-                                value: AttrValue::Udata(bit),
-                            });
-                        } else {
-                            // Versions 2 and 3 count from the most significant bit
-                            // of the *storage unit*, so the width of that unit is
-                            // needed: `sizeof(field.ty) * 8 - bit_offset - width`.
-                            let unit_bits = spec_type_size(spec, member.ty)
-                                .and_then(|bytes| bytes.checked_mul(8))
-                                .ok_or_else(|| {
-                                    "DWARF bit-field storage unit overflows".to_string()
-                                })?;
-                            let offset = unit_bits
-                                .checked_sub(u64::from(bit_offset) + u64::from(width))
-                                .ok_or_else(|| {
-                                    "DWARF bit-field offset underflows its storage unit".to_string()
-                                })?;
-                            member_attrs.push(Attr {
-                                at: DW_AT_BYTE_SIZE,
-                                value: AttrValue::Udata(unit_bits / 8),
-                            });
-                            member_attrs.push(Attr {
-                                at: DW_AT_BIT_SIZE,
-                                value: AttrValue::Udata(u64::from(width)),
-                            });
-                            member_attrs.push(Attr {
-                                at: DW_AT_BIT_OFFSET,
-                                value: AttrValue::Udata(offset),
-                            });
-                            member_attrs.push(Attr {
-                                at: DW_AT_DATA_MEMBER_LOCATION,
-                                value: AttrValue::MemberLocation(member.offset),
-                            });
-                        }
-                    }
-                }
-                ctx.write(DW_TAG_MEMBER, false, &member_attrs)?;
-            }
-            ctx.info.push(0);
-            Ok(())
-        }
+        } => emit_record(
+            ctx,
+            spec,
+            name.as_deref(),
+            *kind,
+            *size,
+            *complete,
+            members,
+            five,
+        ),
         DwarfType::Enum {
             name,
             size,
@@ -2668,6 +2658,134 @@ fn emit_type(
 /// because this object emits no storage for it.  Inventing a location for such
 /// an object would make a debugger read address zero and print confident
 /// nonsense.
+/// One `DW_TAG_structure_type`/`union_type` DIE and its members.
+///
+/// The member loop is the reason this is a function rather than three lines
+/// inside the dispatch: the bit-field attributes differ between DWARF 5
+/// (`data_bit_offset`, counted from the least significant bit of the object) and
+/// 2–4 (`bit_offset`, counted from the most significant bit of the *storage
+/// unit*, which is why the unit's width has to be looked up), and both encodings
+/// belong next to the record they annotate rather than in the middle of a
+/// nine-way match.
+fn emit_record(
+    ctx: &mut DieContext<'_, '_>,
+    spec: &DwarfUnitSpec,
+    name: Option<&str>,
+    kind: RecordKind,
+    size: u64,
+    complete: bool,
+    members: &[DwarfMember],
+    five: bool,
+) -> Result<(), String> {
+    let tag = match kind {
+        RecordKind::Struct => DW_TAG_STRUCTURE_TYPE,
+        RecordKind::Union => DW_TAG_UNION_TYPE,
+    };
+    let mut attrs = Vec::new();
+    if let Some(name) = name {
+        attrs.push(Attr {
+            at: DW_AT_NAME,
+            value: AttrValue::Text(name.to_string()),
+        });
+    }
+    attrs.push(Attr {
+        at: DW_AT_BYTE_SIZE,
+        value: AttrValue::Udata(size),
+    });
+    if !complete {
+        // A declaration is not an empty struct: without this flag a consumer
+        // would report every member as missing instead of "incomplete type".
+        attrs.push(Attr {
+            at: DW_AT_DECLARATION,
+            value: AttrValue::FlagPresent,
+        });
+    }
+    ctx.write(tag, true, &attrs)?;
+    for member in members {
+        emit_member(ctx, spec, kind, member, five)?;
+    }
+    ctx.info.push(0);
+    Ok(())
+}
+
+/// One `DW_TAG_member`, in the encoding its dialect uses.
+fn emit_member(
+    ctx: &mut DieContext<'_, '_>,
+    spec: &DwarfUnitSpec,
+    kind: RecordKind,
+    member: &DwarfMember,
+    five: bool,
+) -> Result<(), String> {
+    let mut attrs = Vec::new();
+    if let Some(name) = &member.name {
+        attrs.push(Attr {
+            at: DW_AT_NAME,
+            value: AttrValue::Text(name.clone()),
+        });
+    }
+    attrs.push(Attr {
+        at: DW_AT_TYPE,
+        value: AttrValue::TypeRef(member.ty),
+    });
+    match member.bit {
+        None => {
+            // A union member sits at offset zero by definition, so the attribute
+            // is not written at all -- GCC 16.2 does the same (measured).
+            if matches!(kind, RecordKind::Struct) {
+                attrs.push(Attr {
+                    at: DW_AT_DATA_MEMBER_LOCATION,
+                    value: AttrValue::MemberLocation(member.offset),
+                });
+            }
+        }
+        Some((width, bit_offset)) => {
+            if five {
+                // Version 5 counts from the least significant bit of the
+                // object, which is the layout's own numbering.
+                let bit = member.offset * 8 + u64::from(bit_offset);
+                attrs.push(Attr {
+                    at: DW_AT_BIT_SIZE,
+                    value: AttrValue::Udata(u64::from(width)),
+                });
+                attrs.push(Attr {
+                    at: DW_AT_DATA_BIT_OFFSET,
+                    value: AttrValue::Udata(bit),
+                });
+            } else {
+                // Versions 2 and 3 count from the most significant bit of the
+                // *storage unit*, so the width of that unit is needed:
+                // `sizeof(field.ty) * 8 - bit_offset - width`.
+                let unit_bits = spec_type_size(spec, member.ty)
+                    .and_then(|bytes| bytes.checked_mul(8))
+                    .ok_or_else(|| "DWARF bit-field storage unit overflows".to_string())?;
+                let offset = unit_bits
+                    .checked_sub(u64::from(bit_offset) + u64::from(width))
+                    .ok_or_else(|| {
+                        "DWARF bit-field offset underflows its storage unit".to_string()
+                    })?;
+                attrs.push(Attr {
+                    at: DW_AT_BYTE_SIZE,
+                    value: AttrValue::Udata(unit_bits / 8),
+                });
+                attrs.push(Attr {
+                    at: DW_AT_BIT_SIZE,
+                    value: AttrValue::Udata(u64::from(width)),
+                });
+                attrs.push(Attr {
+                    at: DW_AT_BIT_OFFSET,
+                    value: AttrValue::Udata(offset),
+                });
+                attrs.push(Attr {
+                    at: DW_AT_DATA_MEMBER_LOCATION,
+                    value: AttrValue::MemberLocation(member.offset),
+                });
+            }
+        }
+    }
+    ctx.write(DW_TAG_MEMBER, false, &attrs)?;
+    Ok(())
+}
+
 fn emit_variables(
     ctx: &mut DieContext<'_, '_>,
     variables: &[DwarfVariable],
