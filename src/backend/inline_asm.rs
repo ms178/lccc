@@ -858,8 +858,23 @@ pub fn emit_inline_asm_common_impl(
     let expanded = expand_dialect_alternatives(template);
     let lines: Vec<&str> = expanded.split('\n').collect();
     let body_nonempty = !lines.iter().all(|l| l.trim().is_empty());
+    // An empty template gets here only with a register operand staged: the
+    // register-inert forms returned above.  With outputs, the write-back
+    // consumes what was staged.  Without them no line reads the staged
+    // registers, and the text peepholes deleted the staging -- and with it
+    // the computation of the operand.  `asm volatile("" :: "r"(v))` is how
+    // benchmark harnesses force a value to be computed (Google Benchmark's
+    // `DoNotOptimize(const T&)` is `"" : : "r,m"(value) : "memory"`, Folly's
+    // `doNotOptimizeAway` alike) and the kernel's `barrier_data()` hands a
+    // pointer to "unknown code"; GCC and Clang never look inside a template
+    // and always materialise it.  The provenance markers make the empty
+    // region what any other asm is to the peepholes: an opaque reader of
+    // every register.  Register outputs keep the unmarked form: the
+    // kernel's `RELOC_HIDE`/`OPTIMIZER_HIDE_VAR` sit in per-CPU accessors,
+    // and their staging moves coalesce away.
+    let marks_region = body_nonempty || (outputs.is_empty() && !inputs.is_empty());
     if let Some((open, _)) = markers {
-        if body_nonempty {
+        if marks_region {
             emitter.asm_state().emit_fmt(format_args!("{}", open));
         }
     }
@@ -914,7 +929,7 @@ pub fn emit_inline_asm_common_impl(
             .emit_fmt(format_args!("    {}", final_line));
     }
     if let Some((_, close)) = markers {
-        if body_nonempty {
+        if marks_region {
             emitter.asm_state().emit_fmt(format_args!("{}", close));
         }
     }
