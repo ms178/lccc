@@ -7136,6 +7136,7 @@ fn hoist_loop_invariant_remats(
         return false;
     }
     let ranges = function_body_ranges(lines, n);
+    let outside = names_outside_functions(lines, kinds, n, &ranges);
     let has_backedge_candidate = |k: &[LineKind]| {
         k.iter().any(|kind| {
             matches!(
@@ -7154,7 +7155,7 @@ fn hoist_loop_invariant_remats(
         let mut fn_lines: Vec<String> = old_lines.by_ref().take(end - start).collect();
         let mut fn_kinds: Vec<LineKind> = old_kinds.by_ref().take(end - start).collect();
         if has_backedge_candidate(&fn_kinds) {
-            changed |= hoist_loop_invariant_remats_in(&mut fn_lines, &mut fn_kinds);
+            changed |= hoist_loop_invariant_remats_in(&mut fn_lines, &mut fn_kinds, &outside);
         }
         lines.extend(fn_lines);
         kinds.extend(fn_kinds);
@@ -7163,6 +7164,42 @@ fn hoist_loop_invariant_remats(
     lines.extend(old_lines);
     kinds.extend(old_kinds);
     changed
+}
+
+/// Every symbol-like token named on a line outside all function ranges.  A
+/// table of label addresses (`static void *t[] = { &&l, ... }`) is emitted in
+/// a data section between functions, so the labels it names are entries --
+/// targets of the function's indirect branches -- that a scan of the
+/// function's own lines never sees.
+fn names_outside_functions(
+    lines: &[String],
+    kinds: &[LineKind],
+    n: usize,
+    ranges: &[(usize, usize)],
+) -> FxHashSet<String> {
+    let mut names = FxHashSet::default();
+    let mut pos = 0;
+    // The ranges are ordered and disjoint; the empty one at `n` closes the
+    // text after the last function.
+    for &(start, end) in ranges.iter().chain(std::iter::once(&(n, n))) {
+        for m in pos..start {
+            if matches!(kinds[m], LineKind::Label | LineKind::Nop) {
+                continue;
+            }
+            for tok in lines[m].split(|c: char| !is_symbol_char(c)) {
+                if tok.starts_with(|c: char| c == '.' || c == '_' || c.is_ascii_alphabetic()) {
+                    names.insert(tok.to_string());
+                }
+            }
+        }
+        pos = end;
+    }
+    names
+}
+
+/// Characters of an assembler symbol as the hoist's label scans split them.
+fn is_symbol_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '$'
 }
 
 /// AAPCS64 registers a control transfer reads without naming them.  A call
@@ -7486,13 +7523,16 @@ struct HoistFacts {
     label_line: FxHashMap<String, usize>,
     /// Lines (other than the definition) naming each label.
     label_refs: FxHashMap<String, Vec<usize>>,
+    /// Labels of this function named outside every function (a data table
+    /// of label addresses): entries from an indirect branch.
+    escaped: FxHashSet<String>,
     frame_escapes: bool,
     /// `abi_liveness`, computed on first use.
     live: Option<Option<Vec<u64>>>,
 }
 
 impl HoistFacts {
-    fn build(lines: &[String], kinds: &[LineKind], n: usize) -> Self {
+    fn build(lines: &[String], kinds: &[LineKind], n: usize, outside: &FxHashSet<String>) -> Self {
         let mut label_line: FxHashMap<String, usize> = FxHashMap::default();
         for m in 0..n {
             if kinds[m] == LineKind::Label {
@@ -7506,17 +7546,21 @@ impl HoistFacts {
             if matches!(kinds[m], LineKind::Label | LineKind::Nop) {
                 continue;
             }
-            let toks = lines[m]
-                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '$'));
-            for tok in toks {
+            for tok in lines[m].split(|c: char| !is_symbol_char(c)) {
                 if label_line.contains_key(tok) {
                     label_refs.entry(tok.to_string()).or_default().push(m);
                 }
             }
         }
+        let escaped = label_line
+            .keys()
+            .filter(|name| outside.contains(name.as_str()))
+            .cloned()
+            .collect();
         HoistFacts {
             label_line,
             label_refs,
+            escaped,
             frame_escapes: a64_frame_address_escapes(lines, kinds, n),
             live: None,
         }
@@ -7554,7 +7598,8 @@ impl LoopShape {
     /// hoisted sequence -- and every branch inside it is direct.  A label in
     /// the loop named by a branch from outside it (a side entry), by a
     /// branch below it, or by anything that is not a branch (a jump table's
-    /// `.word`, an `adr`) is an entry that would bypass the copies.
+    /// `.word`, an `adr`, a label-address table in a data section outside
+    /// the function) is an entry that would bypass the copies.
     fn build(
         lines: &[String],
         kinds: &[LineKind],
@@ -7592,6 +7637,9 @@ impl LoopShape {
         }
         let top_label = lines[top].trim().trim_end_matches(':');
         for &label in region_labels.keys() {
+            if facts.escaped.contains(label) {
+                return None;
+            }
             for &q in facts.label_refs.get(label).map_or(&[][..], |v| &v[..]) {
                 let inside = (top..=end).contains(&q);
                 let entry = q < top && label == top_label;
@@ -7682,7 +7730,11 @@ impl LoopShape {
 }
 
 /// The hoisting walk over one function's `lines`.
-fn hoist_loop_invariant_remats_in(lines: &mut Vec<String>, kinds: &mut Vec<LineKind>) -> bool {
+fn hoist_loop_invariant_remats_in(
+    lines: &mut Vec<String>,
+    kinds: &mut Vec<LineKind>,
+    outside: &FxHashSet<String>,
+) -> bool {
     let mut n = lines.len();
     let mut changed = false;
     let mut facts: Option<HoistFacts> = None;
@@ -7751,7 +7803,7 @@ fn hoist_loop_invariant_remats_in(lines: &mut Vec<String>, kinds: &mut Vec<LineK
             i += 1;
             continue;
         }
-        let fx = facts.get_or_insert_with(|| HoistFacts::build(lines, kinds, n));
+        let fx = facts.get_or_insert_with(|| HoistFacts::build(lines, kinds, n, outside));
         let Some(shape) = LoopShape::build(lines, kinds, n, top, i, fx) else {
             i += 1;
             continue;
@@ -8833,6 +8885,43 @@ mod tests {
         // An address-taken label inside the loop is an entry too.
         let taken = input.replace("    cbz x3, .Lmid\n", "    adr x12, .Lmid\n");
         assert_eq!(hoist_only(&taken), taken);
+    }
+
+    /// A label-address table (`static void *t[] = { &&mid }`) is emitted in
+    /// a data section outside the function: the label it names is an entry
+    /// for the function's indirect branch that its own lines never name.
+    #[test]
+    fn test_invar_hoist_sees_label_tables_outside_the_function() {
+        let func = concat!(
+            "f:\n.cfi_startproc\n",
+            "    mov x9, #5\n",
+            "    mov x6, #0\n",
+            "    ldr x12, [x13]\n",
+            "    cbz x3, .Lgo\n",
+            ".Ltop:\n",
+            "    movz x9, #77\n",
+            "    add x6, x6, x9\n",
+            ".Lmid:\n",
+            "    add x6, x6, x9\n",
+            "    subs x4, x4, #1\n",
+            "    b.ne .Ltop\n",
+            "    mov x0, x6\n",
+            "    ret\n",
+            ".Lgo:\n",
+            "    br x12\n",
+            ".cfi_endproc\n",
+        );
+        // Nothing names .Lmid: the hoist goes ahead.
+        let result = hoist_only(func);
+        assert!(!loop_text(&result, ".Ltop").contains("movz"), "{result}");
+        for label in [".Lmid", ".Ltop"] {
+            for table in [
+                format!(".section .data\nt:\n    .xword {label}\n.text\n{func}"),
+                format!("{func}.section .data\nt:\n    .xword {label}\n"),
+            ] {
+                assert_eq!(hoist_only(&table), table);
+            }
+        }
     }
 
     /// The copy placed before a conditional entry branch also runs on its
