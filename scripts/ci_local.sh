@@ -269,6 +269,21 @@ gate "type-attr-static-init" fast \
     env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
     GCC="${GCC16:-gcc-16}" \
     bash tests/regression/check_type_attr_and_static_init.sh
+gate "gcc-asm-constraints" fast \
+    env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
+    GCC="${GCC16:-gcc-16}" \
+    bash tests/regression/check_gcc_asm_constraints.sh
+gate "vectorizer-openmp-policy" fast \
+    env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
+    GCC="${GCC16:-gcc-16}" \
+    bash tests/regression/check_vectorizer_openmp_policy.sh
+gate "gnu-declaration-corners" fast \
+    env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
+    GCC="${GCC16:-gcc-16}" \
+    bash tests/regression/check_gnu_declaration_corners.sh
+gate "parser-depth-limits" fast \
+    env CCC="$LCCC" \
+    bash tests/regression/check_parser_depth_limits.sh
 gate "frontend-ternary-common-type" fast \
     env CCC="$LCCC" bash tests/regression/check_frontend_ternary_common_type.sh
 gate "frontend-preprocessor-rules" fast \

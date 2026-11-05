@@ -314,12 +314,11 @@ impl Parser {
             def_attrs.is_no_instrument(),
         );
 
-        // __attribute__((mode(...))) applies to the return type.
-        let type_spec = if let Some(mk) = mode_kind {
-            mk.apply(type_spec)
-        } else {
-            type_spec
-        };
+        // __attribute__((mode(...))): same GCC-16.2 rule as every other
+        // declaration path (see Parser::apply_mode_attribute). The old
+        // unconditional `mk.apply` silently accepted mode on a function
+        // declarator and rewrote pointer return types.
+        let type_spec = self.apply_mode_attribute(mode_kind, type_spec, &derived, open);
         let mut return_type = self.build_return_type(type_spec, &derived);
         // Same contract as parse_function_def: the pending vector attribute
         // belongs to this nested function's return type. parse_compound_stmt

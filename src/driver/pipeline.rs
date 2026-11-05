@@ -596,8 +596,17 @@ pub struct Driver {
     /// `Some(Some(v))` defines it as `v`.
     pub(super) stdc_version: Option<Option<&'static str>>,
     /// `-fno-tree-vectorize` disables automatic vectorizer passes while
-    /// retaining explicit vector types and intrinsics.
+    /// retaining explicit vector types and intrinsics. This is the MASTER
+    /// default; the two per-family switches below override it independently
+    /// (measured gcc 16.2, see `passes::VectorizePolicy`).
     pub(super) disable_tree_vectorize: bool,
+    /// `-f[no-]tree-loop-vectorize`: `None` means "not specified".
+    pub(super) loop_vectorize: Option<bool>,
+    /// `-f[no-]tree-slp-vectorize`: `None` means "not specified".
+    pub(super) slp_vectorize: Option<bool>,
+    /// `-fopenmp`: select OpenMP's single-thread serial execution model and
+    /// predefine `_OPENMP` (202111, measured gcc-16 16.2.0).
+    pub(super) openmp: bool,
     /// Opt in to the module-wide Andersen-style points-to and mod/ref pass.
     /// Like GCC, this is deliberately independent of the -O level.
     pub(super) ipa_pta: bool,
@@ -860,6 +869,9 @@ impl Driver {
             gnu89_inline_explicit: None,
             stdc_version: Some(Some("202311L")), // GCC 16.2 default: -std=gnu23
             disable_tree_vectorize: false,
+            loop_vectorize: None,
+            slp_vectorize: None,
+            openmp: false,
             ipa_pta: false,
             live_range_shrinkage: false,
             exceptions: false,
@@ -2035,6 +2047,12 @@ impl Driver {
         preprocessor.set_cet(self.cf_protection_value);
         preprocessor.set_ssp(self.stack_protector_mode.predefined_macro());
         preprocessor.set_pie(self.pie && !self.pic && !self.shared_lib);
+        // `-fopenmp` predefines `_OPENMP`; `-fno-openmp` removes it. GCC 16.2
+        // measures as 202111 (Clang 23.1.4 reports 202011; GCC is the oracle
+        // for the gcc.c-torture corpus). `_OPENMP` is observable in `-dM -E`
+        // and in conditional compilation, so this is an IMPLEMENTED option,
+        // not an inert compatibility no-op.
+        preprocessor.set_openmp(self.openmp);
         // Set SSE/SSE2/MMX predefined macros for x86 targets.
         // GCC/Clang always define __SSE__, __SSE2__, __MMX__ for x86_64 (baseline ISA).
 
@@ -3043,7 +3061,11 @@ impl Driver {
                 && self.enable_avx512f
                 && self.enable_avx512vl
                 && !self.no_sse,
-            self.disable_tree_vectorize,
+            crate::passes::VectorizePolicy::from_bools(
+                self.disable_tree_vectorize,
+                self.loop_vectorize,
+                self.slp_vectorize,
+            ),
             ra_config,
             // `-fPIC`/`-shared` units keep calls to their own external
             // definitions (semantic interposition, GCC -fPIC default).

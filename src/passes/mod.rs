@@ -1283,28 +1283,107 @@ mod inert_asm_tests {
     }
 }
 
-/// Apply the driver-level `-fno-tree-vectorize` policy to every automatic
-/// vectorizer entry in the pass pipeline. Explicit vector types and intrinsics
-/// are unaffected; the disable list gates only automatic transformations.
-fn apply_tree_vectorize_policy(disabled: &mut String, disable: bool) {
-    if !disable || pass_disabled(disabled.as_str(), "all") {
+/// GCC 16.2 has THREE independent vectorizer switches, not one:
+/// `-f[no-]tree-vectorize` is the master default, while
+/// `-f[no-]tree-loop-vectorize` and `-f[no-]tree-slp-vectorize` control the
+/// loop and basic-block vectorizers separately.  Measured with
+/// `gcc-16 (GCC) 16.2.0 -fopt-info-vec-optimized` on a loop + straight-line
+/// SLP shape:
+///
+/// | flags | loop | slp |
+/// |---|---|---|
+/// | `-O2` | on | on |
+/// | `-O2 -fno-tree-vectorize` | off | off |
+/// | `-O2 -fno-tree-vectorize -ftree-loop-vectorize` | ON | off |
+/// | `-O2 -ftree-loop-vectorize -fno-tree-vectorize` | ON | off |
+/// | `-O2 -fno-tree-loop-vectorize -ftree-vectorize` | off | on |
+/// | `-O2 -fno-tree-loop-vectorize -ftree-loop-vectorize` | on | on |
+///
+/// i.e. an explicit per-family switch ALWAYS wins over the master switch, and
+/// the last spelling of a family wins within that family.  A single `bool`
+/// cannot express this: GCC's own `-fno-tree-vectorize` does not switch off a
+/// loop vectorizer the user explicitly turned on.  Reducing the four flags to
+/// a hard CLI error (`per-vectorizer control is unsupported`) rejected four
+/// valid gcc.c-torture/compile cases.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VectorizeSwitch {
+    #[default]
+    Default,
+    On,
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VectorizePolicy {
+    /// `-f[no-]tree-vectorize`: DEFAULT for both families.
+    pub all: VectorizeSwitch,
+    /// `-f[no-]tree-loop-vectorize`.
+    pub loop_vec: VectorizeSwitch,
+    /// `-f[no-]tree-slp-vectorize`.
+    pub slp: VectorizeSwitch,
+}
+
+impl VectorizePolicy {
+    fn enabled(self, explicit: VectorizeSwitch) -> bool {
+        match explicit {
+            VectorizeSwitch::On => true,
+            VectorizeSwitch::Off => false,
+            VectorizeSwitch::Default => self.all != VectorizeSwitch::Off,
+        }
+    }
+    pub fn loop_enabled(self) -> bool {
+        self.enabled(self.loop_vec)
+    }
+    pub fn slp_enabled(self) -> bool {
+        self.enabled(self.slp)
+    }
+    pub fn from_bools(
+        disable_all: bool,
+        loop_vec: Option<bool>,
+        slp: Option<bool>,
+    ) -> VectorizePolicy {
+        let switch = |v: Option<bool>| match v {
+            Some(true) => VectorizeSwitch::On,
+            Some(false) => VectorizeSwitch::Off,
+            None => VectorizeSwitch::Default,
+        };
+        VectorizePolicy {
+            all: if disable_all {
+                VectorizeSwitch::Off
+            } else {
+                VectorizeSwitch::Default
+            },
+            loop_vec: switch(loop_vec),
+            slp: switch(slp),
+        }
+    }
+}
+
+/// Apply the driver-level vectorizer policy to every automatic vectorizer
+/// entry in the pass pipeline. Explicit vector types and intrinsics are
+/// unaffected; the disable list gates only automatic transformations.  The
+/// optimisation-level gate (-O2/-O3) stays where each pass already has it, so
+/// this function never changes the pass set at -O0/-O1 by itself.
+fn apply_tree_vectorize_policy(disabled: &mut String, policy: VectorizePolicy) {
+    if pass_disabled(disabled.as_str(), "all") {
         return;
     }
-
-    for pass in [
-        "vectorize",
-        "slp",
-        "vec_arx",
-        "arx_vectorize",
-        "vec_interleave",
-    ] {
+    let disable_pass = |disabled: &mut String, pass: &str| {
         if pass_disabled(disabled.as_str(), pass) {
-            continue;
+            return;
         }
         if !disabled.is_empty() && !disabled.ends_with(',') {
             disabled.push(',');
         }
         disabled.push_str(pass);
+    };
+    if !policy.loop_enabled() {
+        for pass in ["vectorize", "vec_arx", "arx_vectorize", "vec_interleave"] {
+            disable_pass(disabled, pass);
+        }
+    }
+    if !policy.slp_enabled() {
+        disable_pass(disabled, "slp");
     }
 }
 
@@ -1316,12 +1395,12 @@ fn preinline_memory_enabled(requested: bool, disabled: &str) -> bool {
 
 #[cfg(test)]
 mod tree_vectorize_policy_tests {
-    use super::{apply_tree_vectorize_policy, pass_disabled};
+    use super::{VectorizePolicy, apply_tree_vectorize_policy, pass_disabled};
 
     #[test]
     fn no_tree_vectorize_disables_every_automatic_vectorizer_only() {
         let mut disabled = "licm,vec_arx".to_string();
-        apply_tree_vectorize_policy(&mut disabled, true);
+        apply_tree_vectorize_policy(&mut disabled, VectorizePolicy::from_bools(true, None, None));
 
         for pass in [
             "vectorize",
@@ -1339,12 +1418,36 @@ mod tree_vectorize_policy_tests {
     #[test]
     fn enabled_or_globally_disabled_policy_does_not_mutate_list() {
         let mut enabled = "licm".to_string();
-        apply_tree_vectorize_policy(&mut enabled, false);
+        apply_tree_vectorize_policy(&mut enabled, VectorizePolicy::default());
         assert_eq!(enabled, "licm");
 
         let mut all = "all".to_string();
-        apply_tree_vectorize_policy(&mut all, true);
+        apply_tree_vectorize_policy(&mut all, VectorizePolicy::from_bools(true, None, None));
         assert_eq!(all, "all");
+    }
+
+    #[test]
+    fn gcc16_per_family_switch_overrides_the_master_in_both_orders() {
+        // `-fno-tree-vectorize -ftree-loop-vectorize` and the reverse both
+        // leave the LOOP vectorizer on (measured gcc 16.2).
+        for (disable_all, loop_on) in [(true, Some(true)), (false, None)] {
+            let policy = VectorizePolicy::from_bools(disable_all, loop_on, None);
+            assert!(policy.loop_enabled());
+            assert_eq!(policy.slp_enabled(), !disable_all);
+            let mut disabled = String::new();
+            apply_tree_vectorize_policy(&mut disabled, policy);
+            assert!(!pass_disabled(&disabled, "vectorize"));
+            assert_eq!(pass_disabled(&disabled, "slp"), disable_all);
+        }
+        // An explicit per-family OFF wins over an enabled master.
+        let policy = VectorizePolicy::from_bools(false, Some(false), None);
+        assert!(!policy.loop_enabled());
+        assert!(policy.slp_enabled());
+        let mut disabled = String::new();
+        apply_tree_vectorize_policy(&mut disabled, policy);
+        assert!(pass_disabled(&disabled, "vectorize"));
+        assert!(pass_disabled(&disabled, "vec_arx"));
+        assert!(!pass_disabled(&disabled, "slp"));
     }
 }
 
@@ -1604,7 +1707,7 @@ pub(crate) fn run_passes(
     x86_fma: bool,
     x86_bmi1: bool,
     x86_avx512vl: bool,
-    disable_tree_vectorize: bool,
+    vectorize: VectorizePolicy,
     ra_config: &crate::backend::regalloc::RaConfig,
     // pic: `-fPIC`/`-shared` semantic interposition — external definitions
     // in this unit are interposable, so the inliner keeps calls to them
@@ -1762,7 +1865,7 @@ pub(crate) fn run_passes(
         _ => false,
     });
     let mut disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
-    apply_tree_vectorize_policy(&mut disabled, disable_tree_vectorize);
+    apply_tree_vectorize_policy(&mut disabled, vectorize);
     iv_strength_reduce::set_compare_recurrence_enabled(
         target == crate::backend::Target::X86_64 && !pass_disabled(&disabled, "scalar_compare_iv"),
     );
@@ -4087,7 +4190,7 @@ pub(crate) fn run_passes(
     // -fno-tree-vectorize and stays off at -O1/-Os/-Oz like GCC's.
     if target == crate::backend::Target::X86_64
         && matches!(opt_level, 2 | 3)
-        && !disable_tree_vectorize
+        && vectorize.loop_enabled()
         && !pass_disabled(&disabled, "vector_fill")
     {
         for function in &mut module.functions {
@@ -5130,7 +5233,7 @@ mod signed_wrap_policy_tests {
             false,
             false,
             false,
-            false,
+            VectorizePolicy::default(),
             &crate::backend::regalloc::RaConfig::default(),
             false,
             None,

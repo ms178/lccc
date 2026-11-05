@@ -207,9 +207,47 @@ impl Diagnostic {
 /// and symbolic classes on the left, immediate-only classes on the right.
 /// Anything else used to fall through `match { _ => {} }` into `GpReg`.
 const X86_CLASSES: &str = "abcdfglmopqrvxyUADQRSVYX";
-const X86_IMMEDIATES: &str = "eEIJKLMNOGHinZ";
-/// Modifier characters, legal in any constraint.
+// `s` is GCC's "symbolic/string-literal immediate" class: it is an immediate
+// class for choosing an alternative, but unlike `i`/`n` it refuses a folded
+// integer (`"s"(5)` is `impossible constraint`, measured gcc 16.2).  It is
+// listed here so the alternative scanner sees it as an immediate letter and
+// `constraint_is_immediate_only` treats the operand as an immediate.
+const X86_IMMEDIATES: &str = "eEIJKLMNOGHinZs";
+/// Modifier characters, legal in any constraint. `%` is GCC's commutative
+/// modifier; the cost/selection modifiers are handled by CONSTRAINT_SKIP.
 const MODIFIERS: &str = "=+&%";
+/// GCC constraint characters that carry no register/memory class of their own:
+/// cost modifiers (`? ! ^ $`), the "ignore next letter" marker (`*`), the
+/// "rest is a comment" marker (`#`), and the output/early-clobber modifiers.
+/// They are skipped while scanning an alternative, never second-guessed as an
+/// unmodelled target class.
+const CONSTRAINT_SKIP: &str = "=+&%?!^$*";
+
+/// Split a constraint into GCC alternatives.
+///
+/// GCC separates alternatives with `,` and requires every operand of one `asm`
+/// to declare the same number of them. Everything after the first `#` is a
+/// constraint comment: ignored for choosing an alternative, but still checked
+/// for stray punctuation (`"i#@@@"` is rejected by gcc 16.2, `"i#zzz"` is not).
+/// The leading modifiers are stripped before splitting so `"%0,0"` yields the
+/// two alternatives `0` and `0`, and `"=r,r"` yields `r` and `r`.
+fn constraint_alternatives(constraint: &str) -> Vec<&str> {
+    let body =
+        constraint.trim_start_matches(|c| CONSTRAINT_SKIP.contains(c) || MODIFIERS.contains(c));
+    let choosing = body.split('#').next().unwrap_or(body);
+    choosing.split(',').collect()
+}
+
+/// Is `ch` legal in the ignored tail of a `#` constraint comment?
+/// gcc still diagnoses stray punctuation there, so accepting `i#@@@` silently
+/// would be a diagnostic-parity hole.
+fn constraint_comment_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric()
+        || matches!(
+            ch,
+            ',' | '=' | '+' | '&' | '%' | '?' | '!' | '^' | '$' | '*' | '#' | '[' | ']' | '{' | '}'
+        )
+}
 
 /// Measured value ranges of the integer immediate classes. Only the letters
 /// whose boundary was probed against gcc 16.2 appear here; a letter absent from
@@ -367,6 +405,13 @@ fn is_symbolic(expr: &Expr, ctx: &SymbolContext<'_>) -> bool {
         // A call result is a value, not a function designator; non-folded calls
         // are classified as `NonConstant` by `is_nonconstant` below.
         Expr::FunctionCall(..) => false,
+        // A string literal is a link-time constant object (a `.rodata` symbol):
+        // gcc 16.2 accepts `"i"("x")`, `"s"("x")` and rejects `"n"("x")`.
+        // Classifying it as `Symbolic` rather than `Unknown` is what gives `n`
+        // its measured refusal while `i`/`s` keep their acceptance.
+        Expr::StringLiteral(..) | Expr::WideStringLiteral(..) | Expr::Char16StringLiteral(..) => {
+            true
+        }
         // `array[...]`: the base must be a declared object name, not a typedef
         // name and not an enumeration constant.  The element offset is folded
         // by the IR symbol resolver.
@@ -544,65 +589,152 @@ fn check_constraint(
         // letters are not measured here and must not be second-guessed.
         return;
     }
-    // Alternatives: a constraint string is a comma-free list of alternatives
-    // (`"Ir"` = "any register or an immediate"). GCC only rejects the operand
-    // when *every* alternative is impossible, so an immediate-only letter is
-    // judged only when the string offers nothing else.
-    let mut has_class = false;
-    let mut immediate_only: Option<char> = None;
-    let mut letters = body.chars().peekable();
-    while let Some(letter) = letters.next() {
-        if letter.is_ascii_digit() || MODIFIERS.contains(letter) {
-            continue;
-        }
-        // `Yz` / `Yk` / `Ym`: the letter after `Y` refines the register class
-        // instead of naming a class of its own. `C`-prefixed constraints are
-        // the same shape (measured: gcc 16.2 accepts `"Ci"(7)` and rejects
-        // `"Ci"(x)` / `"Cj"(7)`, so the pair is a class, not a letter).
-        if letter == 'Y' || letter == 'C' {
-            letters.next();
-            has_class = true;
-            continue;
-        }
-        if X86_CLASSES.contains(letter) {
-            has_class = true;
-        } else if X86_IMMEDIATES.contains(letter) {
-            immediate_only.get_or_insert(letter);
-        } else {
+    // GCC separates alternative constraint sets with COMMAS, and an operand is
+    // accepted when at least ONE alternative is satisfiable.  Measured against
+    // gcc 16.2: `"r,m"`, `"m,r"`, `"=r,r"`, `"i,r"` all compile; the old scan
+    // treated `,` as an unmodelled letter and rejected them with
+    // `impossible constraint in 'asm'` -- four gcc.c-torture/compile cases
+    // (20000922-1.c, asmgoto-2.c, pr27528.c, pr35318.c) failed on this alone.
+    let alts = constraint_alternatives(body);
+    // Everything after `#` is a constraint comment for choosing an
+    // alternative, but gcc still rejects stray punctuation there
+    // (`"i#@@@"` is an error; `"i#zzz"` / `"i#*X"` are not).
+    if let Some((_, comment)) = body.split_once('#') {
+        if let Some(ch) = comment.chars().find(|c| !constraint_comment_char(*c)) {
             problems.push(Diagnostic::error(
-                "impossible constraint in 'asm'",
+                format!("invalid punctuation '{ch}' in constraint"),
                 Some(index),
             ));
             return;
         }
     }
-    if has_class {
-        return;
-    }
-    let Some(letter) = immediate_only else {
-        return;
-    };
-    let unsatisfiable = match operand.constant {
-        Constness::NonConstant => true,
-        Constness::Value(value) => {
-            immediate_range(letter).is_some_and(|(lo, hi)| !(lo..=hi).contains(&value))
-        }
-        // A symbol is not a bit field: every range-measured letter encodes a
-        // fixed-width immediate, so gcc rejects a relocated operand for all of
-        // them (measured: `"I"(g_arr)`, `"I"((void *)&obj)`, `"n"(g_arr)`).
-        Constness::Symbolic => immediate_range(letter).is_some(),
-        Constness::Unknown => false,
-    };
-    if unsatisfiable {
-        // GCC emits both, in this order, on one operand.
-        problems.push(Diagnostic::warning(
-            format!("'asm' operand {index} probably does not match constraints"),
+    // Measured gcc 16.2 semantics of an IMPOSSIBLE alternative (red-team
+    // differential over 23 shapes): an unmodelled letter (`z`), a bare class
+    // prefix (`Y`, `C`) and an empty alternative are all UNSATISFIABLE, not a
+    // validity error -- `"z,r"` and `"r,z"` compile, `"z"` alone does not.
+    // Silently reclassifying an unknown letter as GpReg would still be a
+    // miscompile; this just moves the refusal to "no alternative works".
+    // A completely empty constraint (`""`) is the one exception: gcc accepts
+    // it as "no constraint at all".
+    let choosing = body.split('#').next().unwrap_or(body);
+    if choosing.is_empty() && !body.is_empty() {
+        problems.push(Diagnostic::error(
+            "inconsistent operand constraints in an 'asm'",
             Some(index),
         ));
+        return;
+    }
+    let empty_constraint = body.is_empty();
+    let mut any_satisfiable = false;
+    let mut saw_unmodelled = false;
+    for alt in &alts {
+        let mut has_class = false;
+        let mut immediate_only: Option<char> = None;
+        let mut letters = alt.chars().peekable();
+        while let Some(letter) = letters.next() {
+            if letter.is_ascii_digit()
+                || CONSTRAINT_SKIP.contains(letter)
+                || MODIFIERS.contains(letter)
+            {
+                continue;
+            }
+            // `Yz` / `Yk` / `Ym` and `C`-prefixed pairs refine a class; the
+            // letter after the prefix is not a class of its own. A prefix
+            // WITHOUT that letter is impossible (`"Y"` and `"C"` are refused
+            // by gcc, `"Yz"` and `"Ci"` compile).
+            if letter == 'Y' || letter == 'C' {
+                if letters.next().is_some() {
+                    has_class = true;
+                } else {
+                    // A bare prefix names no class at all.
+                    saw_unmodelled = true;
+                }
+                continue;
+            }
+            if X86_CLASSES.contains(letter) {
+                has_class = true;
+            } else if X86_IMMEDIATES.contains(letter) {
+                immediate_only.get_or_insert(letter);
+            } else {
+                // UNMODELLED does NOT poison the whole alternative: gcc 16.2
+                // accepts `rz`, `zr`, `zri`, `rzi` and `Yzz` because a class
+                // letter is still present, and refuses only `z`/`zz` alone.
+                // Keep scanning so a class letter later in the SAME
+                // alternative can satisfy it.  A first draft that broke here
+                // over-rejected all five shapes (red-team differential).
+                saw_unmodelled = true;
+            }
+        }
+        if has_class {
+            any_satisfiable = true;
+            break;
+        }
+        let Some(letter) = immediate_only else {
+            // An empty alternative is unsatisfiable on its own, but harmless
+            // when another alternative works (`"r,"` compiles in gcc). The
+            // whole-empty constraint is the measured exception above.
+            if empty_constraint {
+                any_satisfiable = true;
+                break;
+            }
+            continue;
+        };
+        if immediate_satisfiable(letter, operand.constant) {
+            any_satisfiable = true;
+            break;
+        }
+    }
+    if !any_satisfiable {
+        // gcc emits the "probably does not match constraints" warning for a
+        // const/range/lone-modifier failure, but NOT when an unmodelled
+        // letter is among the alternatives (`"z"`, `"z,i"`, `"C"`, `"Y"` all
+        // produce just the single error).
+        if !saw_unmodelled {
+            problems.push(Diagnostic::warning(
+                format!("'asm' operand {index} probably does not match constraints"),
+                Some(index),
+            ));
+        }
         problems.push(Diagnostic::error(
             "impossible constraint in 'asm'",
             Some(index),
         ));
+    }
+}
+
+/// Whether an immediate-only alternative of class `letter` can carry this
+/// operand.  The rules are measured against gcc 16.2, not guessed:
+///
+/// | letter | `Value` | `Symbolic` (function / array / string) | `NonConstant` |
+/// |--------|---------|----------------------------------------|---------------|
+/// | `s`    | REJECT  | accept                                 | REJECT        |
+/// | `n`    | accept  | REJECT                                 | REJECT        |
+/// | `i`    | accept  | accept                                 | REJECT        |
+/// | `I..O` | in range only                                 | REJECT | REJECT |
+///
+/// `Unknown` is the deferred-instantiation verdict: gcc judges an unbounded
+/// immediate when the statement is emitted, so parse time must not refuse it.
+fn immediate_satisfiable(letter: char, constant: Constness) -> bool {
+    match letter {
+        // `s` is a SYMBOL or a string literal, never a folded integer:
+        // `"s"(5)` is `impossible constraint in 'asm'`.
+        's' => !matches!(constant, Constness::Value(_) | Constness::NonConstant),
+        // `n` requires a numeric constant known at assembly time; a symbol or
+        // a string is a relocation, not an integer (`"n"(g_arr)`, `"n"("x")`).
+        'n' => !matches!(constant, Constness::Symbolic | Constness::NonConstant),
+        // The range-measured bit-field classes: a relocation is not a fixed
+        // width bit field, and a folded value must fit the measured range.
+        l if immediate_range(l).is_some() => match constant {
+            Constness::Value(value) => {
+                immediate_range(l).is_some_and(|(lo, hi)| (lo..=hi).contains(&value))
+            }
+            Constness::Unknown => true,
+            Constness::NonConstant | Constness::Symbolic => false,
+        },
+        // `i`, `e`, `E`, `Z`, `G`, `H`, `L`: unbounded immediates that gcc
+        // checks at instantiation. Only a provably dynamic operand is
+        // impossible at parse time.
+        _ => !matches!(constant, Constness::NonConstant),
     }
 }
 
@@ -721,6 +853,72 @@ pub fn validate(
     target: AsmTarget,
 ) -> Vec<Diagnostic> {
     let mut problems = Vec::new();
+    // GCC requires every operand of ONE `asm` to declare the same number of
+    // comma-separated alternatives; a single operand may have any number.
+    // Measured gcc 16.2 error text: `operand constraints for 'asm' differ in
+    // number of alternatives`. Without this, an output `"=r,r"` next to a
+    // plain `"r"` input was accepted here and then emitted with the wrong
+    // alternative selected by the back end.
+    let alt_counts: Vec<usize> = outputs
+        .iter()
+        .chain(inputs.iter())
+        .map(|op| constraint_alternatives(op.constraint).len())
+        .collect();
+    if alt_counts.len() > 1 && alt_counts.iter().any(|&n| n != alt_counts[0]) {
+        problems.push(Diagnostic::error(
+            "operand constraints for 'asm' differ in number of alternatives",
+            None,
+        ));
+    }
+    // A digit constraint ties an INPUT to an output operand by number. GCC
+    // rejects a reference to an output that does not exist with
+    // `matching constraint references invalid operand number`; the old
+    // digit-start early return accepted `"0"(x)` with no outputs silently.
+    let total_operands = outputs.len() + inputs.len();
+    for (i, op) in inputs.iter().enumerate() {
+        // `%` declares this operand commutative with the FOLLOWING operand;
+        // gcc 16.2 refuses it on the last one with
+        // "'%' constraint used with last operand". Measured with `"%"`,
+        // `"%r"` and `"%0,0"` as the only input; pr35318.c's `%0,0` has a
+        // following `"m,r"` operand and stays legal.
+        if op.constraint.starts_with('%') && outputs.len() + i + 1 == total_operands {
+            problems.push(Diagnostic::error(
+                "'%' constraint used with last operand",
+                Some(outputs.len() + i),
+            ));
+            continue;
+        }
+        let body = op
+            .constraint
+            .trim_start_matches(|c| MODIFIERS.contains(c) || CONSTRAINT_SKIP.contains(c));
+        let choosing = body.split('#').next().unwrap_or(body);
+        'alternatives: for alt in choosing.split(',') {
+            // A matching digit can appear AFTER a class pair too: gcc 16.2
+            // reads `"Yz0"` as `Yz` + a tie to output 0 and rejects it when
+            // that output does not exist (red-team differential). Scan EVERY
+            // digit run, not just a leading one. The trailing sentinel flushes
+            // the last run without a second code path.
+            let mut digits = String::new();
+            for ch in alt.chars().chain(std::iter::once(' ')) {
+                if ch.is_ascii_digit() {
+                    digits.push(ch);
+                    continue;
+                }
+                if digits.is_empty() {
+                    continue;
+                }
+                let number = digits.parse::<usize>().unwrap_or(usize::MAX);
+                if number >= outputs.len() {
+                    problems.push(Diagnostic::error(
+                        "matching constraint references invalid operand number",
+                        Some(outputs.len() + i),
+                    ));
+                    break 'alternatives;
+                }
+                digits.clear();
+            }
+        }
+    }
     // `: [sum] "=r"(v) : "[sum]"(x)` ties by name.  A tie naming an operand
     // that no OUTPUT declares is GCC's `undefined named operand`.  Every
     // referenced name is checked, including suffix/repeated spellings such as
@@ -958,17 +1156,24 @@ mod tests {
 
     #[test]
     fn symbolic_operands_satisfy_link_time_immediates() {
-        // The Linux kernel's `static_branch_*()` shape: a symbolic operand is a
-        // link-time constant, so `i`/`n`/`Ir` accept it and emit no diagnostic.
+        // The Linux kernel's `static_branch_*()` shape: a symbolic operand is
+        // a link-time constant, so `i` and `Ir` accept it silently.
         //
-        // `s` is absent on purpose: measured on gcc 14.2 (this host) and
-        // required by the kernel, `asm(""::"s"(obj))` is
-        // `impossible constraint`, while `"s"(array)` is accepted.  `s` means
-        // "an operand whose address the assembler may not need" and an object
-        // *value* has no such address, so the class cannot accept `Symbolic`
-        // wholesale.  The array shape is covered by
-        // `symbolic_operands_do_not_satisfy_bit_field_immediates`' neighbours.
-        for c in ["i", "n", "Ir"] {
+        // `n` is deliberately NOT in this list any more.  The old version of
+        // this test asserted `"n"(symbol)` was accepted, based on a gcc 14.2
+        // measurement.  Re-measured on the oracle this module documents
+        // (gcc-16 (GCC) 16.2.0, `-O2`, both an array designator and a function
+        // designator):
+        //
+        //   asm volatile("" :: "n"(g));   -> impossible constraint in 'asm'
+        //   asm volatile("" :: "n"(fn)); -> impossible constraint in 'asm'
+        //   asm volatile("" :: "i"(g));  -> accepted
+        //   asm volatile("" :: "i"(fn)); -> accepted
+        //
+        // `n` is a numeric immediate with a value known at assembly time; a
+        // relocation is not such a value.  Asserting the 14.2 behaviour would
+        // have kept a silent diagnostic-parity hole in the 16.2 oracle.
+        for c in ["i", "Ir"] {
             let p = validate(
                 "",
                 &[op("=r", Constness::Unknown)],
@@ -981,6 +1186,20 @@ mod tests {
                 "\"{c}\" must accept a symbolic operand: {p:?}"
             );
         }
+        assert_eq!(
+            messages(&validate(
+                "",
+                &[op("=r", Constness::Unknown)],
+                &[op("n", Constness::Symbolic)],
+                0,
+                AsmTarget::X86,
+            )),
+            [
+                "'asm' operand 1 probably does not match constraints",
+                "impossible constraint in 'asm'"
+            ],
+            "\"n\" must refuse a symbolic operand like gcc 16.2"
+        );
     }
 
     #[test]
@@ -1504,6 +1723,296 @@ mod tests {
                 "'asm' operand 0 probably does not match constraints",
                 "impossible constraint in 'asm'"
             ]
+        );
+    }
+    // ---------------------------------------------------------------------
+    // GCC 16.2 multi-alternative / modifier grammar (gcc.c-torture/compile
+    // 20000922-1.c, asmgoto-2.c, pr27528.c, pr35318.c).
+    //
+    // Every expectation below was measured with
+    // `gcc-16 (GCC) 16.2.0 -O2 -c` on x86-64; Clang 23.1.4 agrees on the
+    // standard spellings.  The four torture files are the acceptance gate.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn comma_separated_alternatives_accept_any_satisfiable_one() {
+        // A single operand may declare any number of alternatives; the
+        // alternative-count consistency rule only applies between operands.
+        for c in [
+            "r,m", "m,r", "r,m,r", "ri,m", "i,r", "n,i", "s,r", "rm,r", "=r,m", "=m,r", "=r,r",
+            "=r,r,r", "+r,m",
+        ] {
+            let p = validate("", &[op(c, Constness::Unknown)], &[], 0, AsmTarget::X86);
+            assert!(p.is_empty(), "\"{c}\": {p:?}");
+        }
+    }
+
+    #[test]
+    fn only_an_all_impossible_alternative_set_is_refused() {
+        // `I` (0..31) and `J` (0..63) both reject 100; adding a register
+        // alternative makes the operand satisfiable exactly as gcc does.
+        let p = validate(
+            "",
+            &[op("I,J", Constness::Value(100))],
+            &[],
+            0,
+            AsmTarget::X86,
+        );
+        assert_eq!(
+            messages(&p),
+            [
+                "'asm' operand 0 probably does not match constraints",
+                "impossible constraint in 'asm'"
+            ]
+        );
+        assert!(
+            validate(
+                "",
+                &[op("I,r", Constness::Value(100))],
+                &[],
+                0,
+                AsmTarget::X86,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn gcc_cost_and_selection_modifiers_are_not_constraint_letters() {
+        for c in [
+            "r?", "!r", "^r", "$r", "r?m", "!r,m", "i#*X", "i#*r", "n#*X", "i#zzz",
+        ] {
+            let p = validate("", &[op(c, Constness::Unknown)], &[], 0, AsmTarget::X86);
+            assert!(p.is_empty(), "\"{c}\": {p:?}");
+        }
+        // gcc still rejects stray punctuation in a `#` comment tail.
+        for c in ["i#@@@", "i#*@"] {
+            assert_eq!(
+                messages(&validate(
+                    "",
+                    &[op(c, Constness::Unknown)],
+                    &[],
+                    0,
+                    AsmTarget::X86,
+                )),
+                ["invalid punctuation '@' in constraint"],
+                "\"{c}\""
+            );
+        }
+    }
+
+    #[test]
+    fn symbolic_immediate_class_parity_with_gcc_16_2() {
+        // `"s"(5)` and `"s"(x)` (a runtime parameter) are impossible;
+        // `"s"(g_arr)`, `"s"(fn)` and `"s"("string")` are accepted.
+        for c in [Constness::Value(5), Constness::NonConstant] {
+            assert_eq!(
+                messages(&validate("", &[op("s", c)], &[], 0, AsmTarget::X86,)),
+                [
+                    "'asm' operand 0 probably does not match constraints",
+                    "impossible constraint in 'asm'"
+                ],
+                "{c:?}"
+            );
+        }
+        for c in [Constness::Symbolic, Constness::Unknown] {
+            assert!(
+                validate("", &[op("s", c)], &[], 0, AsmTarget::X86).is_empty(),
+                "{c:?}"
+            );
+        }
+        // `"n"` is the mirror image: a symbol/string is refused, an integer
+        // constant or a deferred operand is accepted.
+        assert_eq!(
+            messages(&validate(
+                "",
+                &[op("n", Constness::Symbolic)],
+                &[],
+                0,
+                AsmTarget::X86,
+            )),
+            [
+                "'asm' operand 0 probably does not match constraints",
+                "impossible constraint in 'asm'"
+            ]
+        );
+        assert!(
+            validate(
+                "",
+                &[op("n", Constness::Value(400))],
+                &[],
+                0,
+                AsmTarget::X86,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn string_literals_are_link_time_symbolic_constants() {
+        let span = crate::common::source::Span::dummy();
+        let expr = Expr::StringLiteral("hello".into(), span);
+        let ctx = SymbolContext {
+            typedefs: &FxHashSet::default(),
+            enums: &FxHashMap::default(),
+            functions: &FxHashSet::default(),
+        };
+        assert_eq!(constness(&expr, &ctx, false), Constness::Symbolic);
+        // `"i"("hi")` and `"s"("hi")` are accepted, `"n"("hi")` is not.
+        for c in ["i", "s"] {
+            assert!(
+                validate("", &[op(c, Constness::Symbolic)], &[], 0, AsmTarget::X86,).is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn operands_must_agree_on_alternative_count() {
+        // gcc 16.2: `operand constraints for 'asm' differ in number of
+        // alternatives`.
+        let p = validate(
+            "",
+            &[op("=r", Constness::Unknown)],
+            &[op("r,m", Constness::Unknown)],
+            0,
+            AsmTarget::X86,
+        );
+        assert_eq!(
+            messages(&p),
+            ["operand constraints for 'asm' differ in number of alternatives"]
+        );
+        // Consistent two-alternative forms (pr35318.c) validate clean.
+        let p = validate(
+            "",
+            &[
+                op("=r,r", Constness::Unknown),
+                op("=r,r", Constness::Unknown),
+            ],
+            &[
+                op("%0,0", Constness::Unknown),
+                op("m,r", Constness::Unknown),
+            ],
+            0,
+            AsmTarget::X86,
+        );
+        assert!(p.is_empty(), "{p:?}");
+    }
+
+    #[test]
+    fn redteam_impossible_alternatives_are_not_validity_errors() {
+        // Measured gcc 16.2 (red-team differential over 23 spellings):
+        // an unmodelled letter or a bare `Y`/`C` prefix makes ONE ALTERNATIVE
+        // impossible, not the whole constraint invalid. `"z,r"` / `"r,z"`
+        // compile; `"z"`, `"C"`, `"Y"`, `"z,i"` refuse with the SINGLE
+        // "impossible constraint" diagnostic (no "probably does not match"
+        // warning when an unmodelled alternative is present).
+        for c in [
+            "z,r", "r,z", "r,", "r,?", "Yz", "Cc", "", "rz", "zr", "zri", "rzi", "Yzz", "Yzr",
+            "zz,r", "r,zr", "rz,r",
+        ] {
+            let p = validate("", &[op(c, Constness::Unknown)], &[], 0, AsmTarget::X86);
+            assert!(p.is_empty(), "\"{c}\": {p:?}");
+        }
+        for c in ["z", "C", "Y"] {
+            let p = validate("", &[op(c, Constness::Unknown)], &[], 0, AsmTarget::X86);
+            assert_eq!(messages(&p), ["impossible constraint in 'asm'"], "\"{c}\"");
+        }
+        // With a DYNAMIC operand the immediate alternative is impossible too,
+        // so the whole set fails. gcc emits just the single error because an
+        // unmodelled alternative is present (no "probably does not match").
+        for c in ["z,i", "i,z", "I,z"] {
+            let p = validate("", &[op(c, Constness::NonConstant)], &[], 0, AsmTarget::X86);
+            assert_eq!(messages(&p), ["impossible constraint in 'asm'"], "\"{c}\"");
+        }
+        // A constraint whose only content is a `#` comment has no alternative
+        // at all: gcc's distinct diagnostic.
+        assert_eq!(
+            messages(&validate(
+                "",
+                &[op("#foo", Constness::Unknown)],
+                &[],
+                0,
+                AsmTarget::X86,
+            )),
+            ["inconsistent operand constraints in an 'asm'"]
+        );
+        // A lone cost modifier with no class/immediate alternative: gcc emits
+        // the warning AND the error.
+        assert_eq!(
+            messages(&validate(
+                "",
+                &[op("?", Constness::Unknown)],
+                &[],
+                0,
+                AsmTarget::X86,
+            )),
+            [
+                "'asm' operand 0 probably does not match constraints",
+                "impossible constraint in 'asm'"
+            ]
+        );
+    }
+
+    #[test]
+    fn redteam_commutative_modifier_needs_a_following_operand() {
+        for c in ["%", "%r", "%0,0"] {
+            assert_eq!(
+                messages(&validate(
+                    "",
+                    &[],
+                    &[op(c, Constness::Unknown)],
+                    0,
+                    AsmTarget::X86,
+                )),
+                ["'%' constraint used with last operand"],
+                "\"{c}\""
+            );
+        }
+        // With a following operand the `%` tie is legal (pr35318.c shape).
+        let p = validate(
+            "",
+            &[op("=r,r", Constness::Unknown)],
+            &[
+                op("%0,0", Constness::Unknown),
+                op("m,r", Constness::Unknown),
+            ],
+            0,
+            AsmTarget::X86,
+        );
+        assert!(p.is_empty(), "{p:?}");
+    }
+
+    #[test]
+    fn matching_digit_constraints_must_reference_an_existing_output() {
+        assert_eq!(
+            messages(&validate(
+                "",
+                &[],
+                &[op("0", Constness::Unknown)],
+                0,
+                AsmTarget::X86,
+            )),
+            ["matching constraint references invalid operand number"]
+        );
+        assert!(
+            validate(
+                "",
+                &[op("=r", Constness::Unknown)],
+                &[op("0", Constness::Unknown)],
+                0,
+                AsmTarget::X86,
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            messages(&validate(
+                "",
+                &[op("=r", Constness::Unknown)],
+                &[op("1", Constness::Unknown)],
+                0,
+                AsmTarget::X86,
+            )),
+            ["matching constraint references invalid operand number"]
         );
     }
 }

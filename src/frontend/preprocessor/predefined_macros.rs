@@ -615,6 +615,22 @@ impl Preprocessor {
         }
     }
 
+    /// `-fopenmp` / `-fno-openmp`: define or remove `_OPENMP`.
+    ///
+    /// The value 202111 is measured from `gcc-16 (GCC) 16.2.0 -fopenmp -dM -E`
+    /// on this host.  LCCC implements the SINGLE-THREAD SERIAL OpenMP
+    /// execution model: all `#pragma omp` directives are no-ops, which is a
+    /// conforming OpenMP execution (one team of one thread).  Programs that
+    /// actually call `omp_get_*` or `GOMP_*` fail at link time rather than
+    /// silently receiving a fabricated runtime answer.
+    pub fn set_openmp(&mut self, enabled: bool) {
+        if enabled {
+            self.define_simple_macro("_OPENMP", "202111");
+        } else {
+            self.macros.undefine("_OPENMP");
+        }
+    }
+
     /// Helper to define a simple object-like macro.
     pub(super) fn define_simple_macro(&mut self, name: &str, body: &str) {
         self.macros.define(MacroDef {

@@ -59,6 +59,11 @@ pub fn named_matching_names(constraint: &str) -> Result<Option<Vec<&str>>, Named
 /// Named operand references like "[name]" are not immediate constraints.
 pub fn constraint_is_immediate_only(constraint: &str) -> bool {
     let stripped = constraint.trim_start_matches(['=', '+', '&', '%']);
+    // Everything after GCC's `#` marker is a constraint comment: it is ignored
+    // for choosing an alternative, so its letters must not reclassify the
+    // operand (`"i#*X"` stays an immediate-only operand, `"r#m"` stays a
+    // register operand).
+    let stripped = stripped.split('#').next().unwrap_or(stripped);
     if stripped.is_empty() {
         return false;
     }
@@ -68,11 +73,20 @@ pub fn constraint_is_immediate_only(constraint: &str) -> bool {
     if stripped.starts_with('[') {
         return false;
     }
+    // An explicit register constraint `{esi}` / `{r14}` is a REGISTER class,
+    // not an immediate: its letters (`e`, `s`, `i`, ...) are part of a register
+    // NAME, not a constraint alphabet.  Scanning them made the post-optimisation
+    // immediate validator reject a global register variable with
+    // "non-constant operand for immediate-only inline asm constraint `{esi}`"
+    // (gcc.c-torture/compile/20041119-1.c on i686).  GCC accepts it.
+    if stripped.starts_with('{') || stripped.starts_with("@cc") {
+        return false;
+    }
     // Must have at least one immediate letter
     let has_imm = stripped.chars().any(|c| {
         matches!(
             c,
-            'i' | 'I' | 'n' | 'N' | 'e' | 'E' | 'K' | 'M' | 'G' | 'H' | 'J' | 'L' | 'O'
+            'i' | 'I' | 'n' | 'N' | 'e' | 'E' | 'K' | 'M' | 'G' | 'H' | 'J' | 'L' | 'O' | 's'
         )
     });
     if !has_imm {
@@ -319,5 +333,11 @@ mod tests {
         }
         assert!(constraint_is_immediate_only("i"));
         assert!(!constraint_is_immediate_only("Ir"));
+        // Explicit register names are register classes, not immediate letters.
+        // `{esi}` contains e/s/i, all of which the letter scan would call
+        // immediates, and `{r14}` contains r/1/4.
+        for c in ["{esi}", "{r14}", "{rax}", "={rax}", "@cce", "@cci"] {
+            assert!(!constraint_is_immediate_only(c), "{c}");
+        }
     }
 }

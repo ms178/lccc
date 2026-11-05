@@ -1338,7 +1338,21 @@ impl Parser {
                     );
                 }
                 self.skip_gcc_extensions();
-                self.expect_after(&TokenKind::Semicolon, "after struct field declaration");
+                if matches!(self.peek(), TokenKind::Semicolon) {
+                    self.advance();
+                } else if matches!(self.peek(), TokenKind::RBrace) {
+                    // gcc 16.2 (default gnu23, no -fpermissive needed):
+                    // `struct S { int x };` is a PEDWARN, not a hard error --
+                    // "no semicolon at end of struct or union".  This is the
+                    // last field of `struct S0` in gcc.c-torture/compile/
+                    // pr72802.c (`signed f5` followed directly by `};`).
+                    self.diagnostics.warning(
+                        "no semicolon at end of struct or union".to_owned(),
+                        self.peek_span(),
+                    );
+                } else {
+                    self.expect_after(&TokenKind::Semicolon, "after struct field declaration");
+                }
             } else {
                 self.advance(); // skip unknown
             }

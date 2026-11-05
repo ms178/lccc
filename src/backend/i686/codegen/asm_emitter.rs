@@ -40,6 +40,11 @@ impl InlineAsmEmitter for I686Codegen {
 
     fn classify_constraint(&self, constraint: &str) -> AsmOperandKind {
         let c = constraint.trim_start_matches(['=', '+', '&', '%']);
+        // A `#` starts a GCC constraint comment: its letters are ignored when
+        // choosing an alternative, so they must not leak a register/memory
+        // class into this classification (`"i#*X"` is an immediate operand,
+        // not a general-register operand).
+        let c = c.split('#').next().unwrap_or(c);
         // Explicit register constraint: {regname}
         if c.starts_with('{') && c.ends_with('}') {
             let reg_name = &c[1..c.len() - 1];
@@ -89,9 +94,8 @@ impl InlineAsmEmitter for I686Codegen {
                 }
                 'x' | 'v' | 'Y' => has_fp = true,
                 'm' | 'o' | 'V' | 'p' => has_mem = true,
-                'i' | 'I' | 'n' | 'N' | 'e' | 'E' | 'K' | 'M' | 'G' | 'H' | 'J' | 'L' | 'O' => {
-                    has_imm = true
-                }
+                'i' | 'I' | 'n' | 'N' | 'e' | 'E' | 'K' | 'M' | 'G' | 'H' | 'J' | 'L' | 'O'
+                | 's' => has_imm = true,
                 'a' if specific.is_none() => specific = Some("eax".to_string()),
                 'b' if specific.is_none() => specific = Some("ebx".to_string()),
                 'c' if specific.is_none() => specific = Some("ecx".to_string()),
