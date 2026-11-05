@@ -138,6 +138,32 @@ static int check_flatten(void)
     return 0;
 }
 
+static int check_overaligned(void)
+{
+    double f = zero;
+    struct WD wd = {1.5 + f, 2.5};
+    CHECK(60, sum_wd(wd) == 6.5);
+    struct WO wo = {1.5 + f};
+    CHECK(61, sum_wo(wo) == 4.5);
+    struct WM wm = {0.5f + (float)f, -3};
+    CHECK(62, sum_wm(wm) == -5.5);
+    struct WI wi = {-3, 1.25 + f};
+    CHECK(63, sum_wi(wi) == -0.5);
+    CHECK(64, wd_after7(1, 2, 3, 4, 5, 6, 7 + f, wd, 0.5) == 28 + 15 + 250 + 500);
+    CHECK(65, wm_after8(1, 2, 3, 4, 5, 6, 7, 8, wm, 0.25 + f) == 36 + 5 - 300 + 250);
+    CHECK(66, scribble_wd(wd) == 4.0 && wd.a == 1.5 && wd.b == 2.5);
+
+    struct WD rwd = ret_wd(1.5 + f, 2.5);
+    CHECK(70, rwd.a == 1.5 && rwd.b == 2.5);
+    struct WO rwo = ret_wo(-1.5 + f);
+    CHECK(71, rwo.d == -1.5);
+    struct WM rwm = ret_wm(0.5f + (float)f, -7);
+    CHECK(72, rwm.f == 0.5f && rwm.x == -7);
+    struct WI rwi = ret_wi(-9, 2.25 + f);
+    CHECK(73, rwi.x == -9 && rwi.d == 2.25);
+    return 0;
+}
+
 int main(void)
 {
     int r = check_complex();
@@ -145,5 +171,7 @@ int main(void)
         r = check_wide();
     if (!r)
         r = check_flatten();
+    if (!r)
+        r = check_overaligned();
     return r;
 }

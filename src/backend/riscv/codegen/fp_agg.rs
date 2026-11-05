@@ -33,7 +33,7 @@ pub(super) enum FpAggPiece {
 /// has none here (only the AArch64 lowering produces one).
 pub(super) fn fp_agg_return_pieces(class: FpAggClass) -> [Option<FpAggPiece>; 2] {
     match class {
-        FpAggClass::OneFloat { size } => [
+        FpAggClass::OneFloat { size, .. } => [
             Some(FpAggPiece::Fp {
                 reg: "fa0",
                 offset: 0,
@@ -45,6 +45,7 @@ pub(super) fn fp_agg_return_pieces(class: FpAggClass) -> [Option<FpAggPiece>; 2]
             lo_size,
             hi_size,
             hi_offset,
+            ..
         } => [
             Some(FpAggPiece::Fp {
                 reg: "fa0",
@@ -62,6 +63,7 @@ pub(super) fn fp_agg_return_pieces(class: FpAggClass) -> [Option<FpAggPiece>; 2]
             float_offset,
             int_offset,
             int_size,
+            ..
         } => [
             Some(FpAggPiece::Fp {
                 reg: "fa0",
@@ -79,6 +81,7 @@ pub(super) fn fp_agg_return_pieces(class: FpAggClass) -> [Option<FpAggPiece>; 2]
             int_offset,
             int_size,
             float_offset,
+            ..
         } => [
             Some(FpAggPiece::Int {
                 reg: "a0",

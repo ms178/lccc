@@ -118,6 +118,7 @@ impl Lowerer {
                         lo_size: half as u8,
                         hi_size: half as u8,
                         hi_offset: half,
+                        record_size: ct.size(),
                     })
                 }
                 _ => None,

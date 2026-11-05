@@ -308,8 +308,11 @@ pub enum EightbyteClass {
 
 /// How a by-value aggregate crosses a call boundary in floating-point/SIMD
 /// registers under the target's hardware-FP calling convention: the RISC-V
-/// LP64D flattening rule (`OneFloat` .. `IntAndFloat`, small structs only)
-/// or an AAPCS64 homogeneous aggregate (`Hfa`).  The lowering computes it
+/// LP64D flattening rule (`OneFloat` .. `IntAndFloat`, a record of any size
+/// whose hierarchy flattens to at most two members) or an AAPCS64
+/// homogeneous aggregate (`Hfa`).  The RISC-V variants carry the record's
+/// `record_size`: over-aligned members make a flattened record larger than
+/// the 2 x XLEN its members occupy, and a callee homes the whole record.  The lowering computes it
 /// per argument, parameter and hidden return pointer (see
 /// `Lowerer::fp_agg_class`); `None` means the aggregate follows the
 /// target's integer/memory convention.  x86 aggregates are described by
@@ -318,13 +321,14 @@ pub enum EightbyteClass {
 pub enum FpAggClass {
     /// Struct with exactly one float/double/_Float16/__bf16 member, no other data members.
     /// Passed in a single FP register (fa0-fa7). `size` is 2, 4, or 8 bytes.
-    OneFloat { size: u8 },
+    OneFloat { size: u8, record_size: usize },
     /// Struct with exactly two FP members, no other data members.
     /// Passed in two FP registers (fa0-fa7).
     TwoFloats {
         lo_size: u8,
         hi_size: u8,
         hi_offset: usize,
+        record_size: usize,
     },
     /// Struct with one FP member + one integer, FP comes first in memory.
     /// FP in FP register, integer in GP register.
@@ -333,6 +337,7 @@ pub enum FpAggClass {
         float_offset: usize,
         int_offset: usize,
         int_size: usize,
+        record_size: usize,
     },
     /// Struct with one integer + one FP member, integer comes first in memory.
     /// Integer in GP register, FP in FP register.
@@ -341,6 +346,7 @@ pub enum FpAggClass {
         int_offset: usize,
         int_size: usize,
         float_offset: usize,
+        record_size: usize,
     },
     /// AAPCS64 homogeneous floating-point or short-vector aggregate (HFA /
     /// HVA, including a bare 8- or 16-byte GNU vector): `count` (1..=4)
@@ -485,6 +491,19 @@ impl FpAggClass {
                 Some((usize::from(member_size), usize::from(count)))
             }
             _ => None,
+        }
+    }
+
+    /// Size in bytes of the record the class describes: an HFA is exactly
+    /// its members (no padding by definition); a RISC-V flattened record
+    /// carries its size, which over-aligned members can take past 16.
+    pub fn record_bytes(self) -> usize {
+        match self {
+            FpAggClass::Hfa { member_size, count } => usize::from(member_size) * usize::from(count),
+            FpAggClass::OneFloat { record_size, .. }
+            | FpAggClass::TwoFloats { record_size, .. }
+            | FpAggClass::FloatAndInt { record_size, .. }
+            | FpAggClass::IntAndFloat { record_size, .. } => record_size,
         }
     }
 }
@@ -2101,12 +2120,18 @@ impl StructLayout {
 
     /// Classify this struct for the RISC-V LP64D hardware floating-point calling convention.
     ///
-    /// The RISC-V psABI specifies that small structs (≤ 2×XLEN = 16 bytes on RV64)
-    /// with floating-point members should be passed in FP registers:
+    /// The RISC-V psABI passes a struct whose hierarchy flattens to FP
+    /// members in FP registers:
     /// - Struct with exactly 1 float/double member (no other data): 1 FP register
     /// - Struct with exactly 2 float/double members (no other data): 2 FP registers
     /// - Struct with 1 float/double + 1 integer (≤ XLEN): FP reg + GP reg (or GP + FP)
     /// - All other structs: use integer calling convention (GP registers)
+    ///
+    /// The record size does not matter: over-aligned members can make such
+    /// a record larger than 2 × XLEN, and it still travels in registers
+    /// while enough remain -- by reference only once they run out (GCC
+    /// `riscv_get_arg_info` / `riscv_pass_by_reference`, Clang
+    /// `detectFPCCEligibleStruct`; both return it in fa0/fa1 as well).
     ///
     /// Returns `None` if the struct does not qualify for FP register passing.
     /// Returns `Some(FpAggClass)` describing the FP register assignment.
@@ -2114,9 +2139,9 @@ impl StructLayout {
         &self,
         ctx: &dyn StructLayoutProvider,
     ) -> Option<FpAggClass> {
-        // Only for small structs (≤ 16 bytes on RV64, ≤ 8 bytes on RV32)
         let xlen = target_ptr_size();
-        if self.size > 2 * xlen || self.size == 0 {
+        let record_size = self.size;
+        if record_size == 0 {
             return None;
         }
 
@@ -2137,12 +2162,14 @@ impl StructLayout {
             // 1 float, no int: pass float in 1 FP reg
             (1, 0) => Some(FpAggClass::OneFloat {
                 size: float_fields[0].1 as u8,
+                record_size,
             }),
             // 2 floats, no int: pass both in FP regs
             (2, 0) => Some(FpAggClass::TwoFloats {
                 lo_size: float_fields[0].1 as u8,
                 hi_size: float_fields[1].1 as u8,
                 hi_offset: float_fields[1].0,
+                record_size,
             }),
             // 1 float + 1 int: pass float in FP reg, int in GP reg
             (1, 1) => {
@@ -2159,6 +2186,7 @@ impl StructLayout {
                         float_offset: float_fields[0].0,
                         int_offset: int_fields[0].0,
                         int_size,
+                        record_size,
                     })
                 } else {
                     Some(FpAggClass::IntAndFloat {
@@ -2166,6 +2194,7 @@ impl StructLayout {
                         int_offset: int_fields[0].0,
                         int_size,
                         float_offset: float_fields[0].0,
+                        record_size,
                     })
                 }
             }
@@ -5878,6 +5907,7 @@ mod fp_aggregate_abi_tests {
                 float_offset: 0,
                 int_offset: 4,
                 int_size: 1,
+                record_size: 8,
             })
         );
         // struct { _Complex float z; } and struct { _Complex double z; }.
@@ -5887,6 +5917,7 @@ mod fp_aggregate_abi_tests {
                 lo_size: 4,
                 hi_size: 4,
                 hi_offset: 4,
+                record_size: 8,
             })
         );
         assert_eq!(
@@ -5895,6 +5926,7 @@ mod fp_aggregate_abi_tests {
                 lo_size: 8,
                 hi_size: 8,
                 hi_offset: 8,
+                record_size: 16,
             })
         );
         // struct { float a; _Complex float z; }: three FP members.
@@ -5914,6 +5946,7 @@ mod fp_aggregate_abi_tests {
                 lo_size: 4,
                 hi_size: 4,
                 hi_offset: 4,
+                record_size: 8,
             })
         );
         // struct { float a[2]; } and struct { float a; float b[0]; }.
@@ -5923,6 +5956,7 @@ mod fp_aggregate_abi_tests {
                 lo_size: 4,
                 hi_size: 4,
                 hi_offset: 4,
+                record_size: 8,
             })
         );
         assert_eq!(
@@ -5930,7 +5964,10 @@ mod fp_aggregate_abi_tests {
                 field(CType::Float, None),
                 field(CType::Array(Box::new(CType::Float), Some(0)), None),
             ]),
-            Some(FpAggClass::OneFloat { size: 4 })
+            Some(FpAggClass::OneFloat {
+                size: 4,
+                record_size: 4,
+            })
         );
         // struct { long a; double d; }: integer first.
         assert_eq!(
@@ -5940,11 +5977,64 @@ mod fp_aggregate_abi_tests {
                 int_offset: 0,
                 int_size: 8,
                 float_offset: 8,
+                record_size: 16,
             })
         );
         // Two integers use the integer convention.
         assert_eq!(
             riscv(&[field(CType::Int, None), field(CType::Int, None)]),
+            None
+        );
+    }
+
+    /// Over-aligned members take a flattened record past 2 x XLEN; GCC 16.2
+    /// and Clang 23.1.4 still pass and return it in FP registers (fa0/fa1,
+    /// or fa0 and a0), with every member at its own offset.
+    #[test]
+    fn riscv_flattening_ignores_the_record_size() {
+        let aligned = |ty: CType, align: usize| StructField {
+            alignment: Some(align),
+            ..field(ty, None)
+        };
+        // struct { double a; double b __attribute__((aligned(16))); }
+        assert_eq!(
+            riscv(&[field(CType::Double, None), aligned(CType::Double, 16)]),
+            Some(FpAggClass::TwoFloats {
+                lo_size: 8,
+                hi_size: 8,
+                hi_offset: 16,
+                record_size: 32,
+            })
+        );
+        // struct { double d __attribute__((aligned(32))); }
+        let one = riscv(&[aligned(CType::Double, 32)]);
+        assert_eq!(
+            one,
+            Some(FpAggClass::OneFloat {
+                size: 8,
+                record_size: 32,
+            })
+        );
+        assert_eq!(one.map(FpAggClass::record_bytes), Some(32));
+        // struct { float f; long x __attribute__((aligned(32))); }
+        assert_eq!(
+            riscv(&[field(CType::Float, None), aligned(CType::Long, 32)]),
+            Some(FpAggClass::FloatAndInt {
+                float_size: 4,
+                float_offset: 0,
+                int_offset: 32,
+                int_size: 8,
+                record_size: 64,
+            })
+        );
+        // Still at most two members: struct { double a, b, c; } is 24 bytes
+        // of integer convention (by reference).
+        assert_eq!(
+            riscv(&[
+                field(CType::Double, None),
+                field(CType::Double, None),
+                field(CType::Double, None),
+            ]),
             None
         );
     }

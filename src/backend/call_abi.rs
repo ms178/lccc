@@ -439,13 +439,12 @@ pub fn hidden_fp_agg_return(
 }
 
 /// Bytes of the private frame buffer that homes the hidden return pointer
-/// of an [`hidden_fp_agg_return`] function.  An HFA is exactly its members
-/// (no padding by definition); a RISC-V flattened struct is at most
-/// 2 × XLEN = 16 bytes, the size the body may copy into the buffer.
+/// of an [`hidden_fp_agg_return`] function: the whole record, which the
+/// body may copy into the buffer.  An HFA is exactly its members (no
+/// padding by definition); a RISC-V flattened record carries its size,
+/// which over-aligned members take past 2 × XLEN.
 pub fn fp_agg_return_buffer_bytes(class: crate::common::types::FpAggClass) -> usize {
-    class
-        .hfa()
-        .map_or(16, |(member_size, count)| member_size * count)
+    class.record_bytes()
 }
 
 /// Whether an aggregate argument of `size` bytes is passed as the address of
@@ -458,9 +457,10 @@ pub fn fp_agg_return_buffer_bytes(class: crate::common::types::FpAggClass) -> us
 /// - RISC-V: larger than 2 × XLEN.  A named record that flattens to FP
 ///   registers travels in them at any size while enough remain (GCC
 ///   `riscv_pass_by_reference`), and by reference once they are exhausted;
-///   only the backend's register walk knows which, so such a record is
-///   copied either way -- an exotic shape (it needs an over-aligned member)
-///   for which the copy is merely redundant when registers carry it.
+///   only the backend's register walk (`riscv_fp_agg_arg_class`) knows
+///   which, so such a record is copied either way -- an exotic shape (it
+///   needs an over-aligned member) for which the copy is merely redundant
+///   when registers carry it.
 /// - Microsoft x64: any size other than 1, 2, 4 or 8 bytes.
 ///
 /// SysV x86-64 and i386 pass every aggregate by value: the call sequence
@@ -1230,6 +1230,25 @@ fn classify_args_core(
                 }
             }
 
+            // RISC-V LP64D flattened record: FP registers -- and one GP
+            // register for a mixed record -- while enough remain, at ANY
+            // size (GCC `riscv_get_arg_info`, `riscv_pass_by_reference`;
+            // Clang agrees): over-aligned members take such a record past
+            // 2 x XLEN.  Otherwise the integer convention below applies: by
+            // value in GP registers or on the stack up to 2 x XLEN, by
+            // reference beyond.
+            if config.use_riscv_float_struct_classification {
+                if let Some((class, fp_used, gp_used)) = info
+                    .fp_agg_class
+                    .and_then(|c| riscv_fp_agg_arg_class(c, size, float_idx, int_idx, config))
+                {
+                    result.push(class);
+                    float_idx += fp_used;
+                    int_idx += gp_used;
+                    continue;
+                }
+            }
+
             // AAPCS64 (ARM): a _Float128 carrier (scalar or 16-byte
             // aggregate flagged is_f128_sse by the lowering) goes in a Q
             // register exactly like long double — the "SSE" naming of the
@@ -1346,110 +1365,49 @@ fn classify_args_core(
                 int_idx += gp_used;
                 float_idx += fp_used;
             } else if size <= 16 {
-                // Non-SysV path (ARM, RISC-V)
-                let rv_class = if config.use_riscv_float_struct_classification {
-                    info.fp_agg_class
+                // Non-SysV path (ARM, RISC-V); a RISC-V record that went to
+                // FP registers took the branch above.
+                let regs_needed = if size <= slot_size {
+                    1
                 } else {
-                    None
+                    size.div_ceil(slot_size)
                 };
-                let mut classified = false;
-                if let Some(rv_fc) = rv_class {
-                    use crate::common::types::FpAggClass;
-                    match rv_fc {
-                        FpAggClass::OneFloat { .. } => {
-                            if float_idx < config.max_float_regs {
-                                result.push(CoreArgClass::StructSseReg {
-                                    lo_fp_idx: float_idx,
-                                    hi_fp_idx: None,
-                                    size,
-                                });
-                                float_idx += 1;
-                                classified = true;
-                            }
-                        }
-                        FpAggClass::TwoFloats { .. } => {
-                            if float_idx + 1 < config.max_float_regs {
-                                result.push(CoreArgClass::StructSseReg {
-                                    lo_fp_idx: float_idx,
-                                    hi_fp_idx: Some(float_idx + 1),
-                                    size,
-                                });
-                                float_idx += 2;
-                                classified = true;
-                            }
-                        }
-                        FpAggClass::FloatAndInt { .. } => {
-                            if float_idx < config.max_float_regs && int_idx < config.max_int_regs {
-                                result.push(CoreArgClass::StructMixedSseIntReg {
-                                    fp_reg_idx: float_idx,
-                                    int_reg_idx: int_idx,
-                                    size,
-                                });
-                                float_idx += 1;
-                                int_idx += 1;
-                                classified = true;
-                            }
-                        }
-                        FpAggClass::IntAndFloat { .. } => {
-                            if int_idx < config.max_int_regs && float_idx < config.max_float_regs {
-                                result.push(CoreArgClass::StructMixedIntSseReg {
-                                    int_reg_idx: int_idx,
-                                    fp_reg_idx: float_idx,
-                                    size,
-                                });
-                                int_idx += 1;
-                                float_idx += 1;
-                                classified = true;
-                            }
-                        }
-                        // Homogeneous aggregates took the AAPCS64 branch
-                        // above; RISC-V never produces one.
-                        FpAggClass::Hfa { .. } => {}
+                // Composites whose natural alignment exceeds XLEN are
+                // allocated at an even-aligned register (pair) — the
+                // RISC-V psABI requires it for 2×XLEN-aligned structs,
+                // and AAPCS64 does the same for ANY 16-byte-aligned
+                // composite, including single-register struct{int}
+                // align(16) (GCC oracle: w0/w2/w4/w6 with odd registers
+                // skipped). The rounding also applies on the va_arg side
+                // (emit_va_arg_struct rounds __gr_offs the same way), so
+                // caller and callee agree.
+                let mut align_applied = false;
+                if config.align_struct_pairs && even_pairs {
+                    let struct_align = info.struct_align.unwrap_or(slot_size);
+                    if struct_align > slot_size && int_idx % 2 != 0 {
+                        int_idx += 1; // skip to even register
+                        align_applied = true;
                     }
                 }
-                if !classified {
-                    let regs_needed = if size <= slot_size {
-                        1
-                    } else {
-                        size.div_ceil(slot_size)
-                    };
-                    // Composites whose natural alignment exceeds XLEN are
-                    // allocated at an even-aligned register (pair) — the
-                    // RISC-V psABI requires it for 2×XLEN-aligned structs,
-                    // and AAPCS64 does the same for ANY 16-byte-aligned
-                    // composite, including single-register struct{int}
-                    // align(16) (GCC oracle: w0/w2/w4/w6 with odd registers
-                    // skipped). The rounding also applies on the va_arg side
-                    // (emit_va_arg_struct rounds __gr_offs the same way), so
-                    // caller and callee agree.
-                    let mut align_applied = false;
-                    if config.align_struct_pairs && even_pairs {
-                        let struct_align = info.struct_align.unwrap_or(slot_size);
-                        if struct_align > slot_size && int_idx % 2 != 0 {
-                            int_idx += 1; // skip to even register
-                            align_applied = true;
-                        }
-                    }
-                    if int_idx + regs_needed <= config.max_int_regs {
-                        result.push(CoreArgClass::StructByValReg {
-                            base_reg_idx: int_idx,
-                            size,
-                        });
-                        int_idx += regs_needed;
-                    } else if !align_applied
-                        && regs_needed == 2
-                        && int_idx < config.max_int_regs
-                        && config.allow_struct_split_reg_stack
-                    {
-                        result.push(CoreArgClass::StructSplitRegStack {
-                            reg_idx: int_idx,
-                            size,
-                        });
-                        int_idx = config.max_int_regs;
-                    } else {
-                        result.push(CoreArgClass::StructByValStack { size });
-                        int_idx = config.max_int_regs;
-                    }
+                if int_idx + regs_needed <= config.max_int_regs {
+                    result.push(CoreArgClass::StructByValReg {
+                        base_reg_idx: int_idx,
+                        size,
+                    });
+                    int_idx += regs_needed;
+                } else if !align_applied
+                    && regs_needed == 2
+                    && int_idx < config.max_int_regs
+                    && config.allow_struct_split_reg_stack
+                {
+                    result.push(CoreArgClass::StructSplitRegStack {
+                        reg_idx: int_idx,
+                        size,
+                    });
+                    int_idx = config.max_int_regs;
+                } else {
+                    result.push(CoreArgClass::StructByValStack { size });
+                    int_idx = config.max_int_regs;
                 }
             } else if config.large_struct_by_ref {
                 // AAPCS64 / RISC-V: large composites passed by reference.
@@ -1528,6 +1486,61 @@ fn classify_args_core(
     CoreClassification {
         classes: result,
         int_reg_idx: int_idx,
+    }
+}
+
+/// RISC-V LP64D: the class of a flattened record (`FpAggClass` other than
+/// `Hfa`) of `size` bytes, with the FP and GP registers it uses, when the
+/// registers it needs are free.  `None` sends the record to the integer
+/// convention.
+fn riscv_fp_agg_arg_class(
+    class: crate::common::types::FpAggClass,
+    size: usize,
+    float_idx: usize,
+    int_idx: usize,
+    config: &CallAbiConfig,
+) -> Option<(CoreArgClass, usize, usize)> {
+    use crate::common::types::FpAggClass;
+    let fp_free = config.max_float_regs.saturating_sub(float_idx);
+    let gp_free = config.max_int_regs.saturating_sub(int_idx);
+    match class {
+        FpAggClass::OneFloat { .. } if fp_free >= 1 => Some((
+            CoreArgClass::StructSseReg {
+                lo_fp_idx: float_idx,
+                hi_fp_idx: None,
+                size,
+            },
+            1,
+            0,
+        )),
+        FpAggClass::TwoFloats { .. } if fp_free >= 2 => Some((
+            CoreArgClass::StructSseReg {
+                lo_fp_idx: float_idx,
+                hi_fp_idx: Some(float_idx + 1),
+                size,
+            },
+            2,
+            0,
+        )),
+        FpAggClass::FloatAndInt { .. } if fp_free >= 1 && gp_free >= 1 => Some((
+            CoreArgClass::StructMixedSseIntReg {
+                fp_reg_idx: float_idx,
+                int_reg_idx: int_idx,
+                size,
+            },
+            1,
+            1,
+        )),
+        FpAggClass::IntAndFloat { .. } if fp_free >= 1 && gp_free >= 1 => Some((
+            CoreArgClass::StructMixedIntSseReg {
+                int_reg_idx: int_idx,
+                fp_reg_idx: float_idx,
+                size,
+            },
+            1,
+            1,
+        )),
+        _ => None,
     }
 }
 
@@ -2692,6 +2705,82 @@ mod tests {
         full.extend((0..9).map(|_| double_arg()));
         let rv = classify_args_core(&full, full.len(), false, &CallAbiConfig::riscv_lp64d());
         assert!(matches!(rv.classes[16], CoreArgClass::Stack));
+    }
+
+    /// RISC-V: a flattened record travels in FP registers (and one GP
+    /// register when mixed) at any size while they last -- GCC 16.2 and
+    /// Clang 23.1.4 pass `struct { double a; double b aligned(16); }` (32
+    /// bytes) in fa0/fa1 -- and by reference once they run out, leaving
+    /// the remaining FP registers to later scalars.
+    #[test]
+    fn riscv_flattened_records_use_fp_registers_at_any_size() {
+        use crate::common::types::FpAggClass;
+        let config = CallAbiConfig::riscv_lp64d();
+        let record = |size: usize, class: FpAggClass| ArgInfo {
+            struct_size: Some(size),
+            struct_align: Some(16),
+            fp_agg_class: Some(class),
+            ..scalar(&[])
+        };
+        let two = FpAggClass::TwoFloats {
+            lo_size: 8,
+            hi_size: 8,
+            hi_offset: 16,
+            record_size: 32,
+        };
+        let mixed = FpAggClass::FloatAndInt {
+            float_size: 4,
+            float_offset: 0,
+            int_offset: 32,
+            int_size: 8,
+            record_size: 64,
+        };
+        let core = classify_args_core(&[record(32, two)], 1, false, &config);
+        assert!(matches!(
+            core.classes[0],
+            CoreArgClass::StructSseReg {
+                lo_fp_idx: 0,
+                hi_fp_idx: Some(1),
+                size: 32
+            }
+        ));
+        let core = classify_args_core(&[record(64, mixed)], 1, false, &config);
+        assert!(matches!(
+            core.classes[0],
+            CoreArgClass::StructMixedSseIntReg {
+                fp_reg_idx: 0,
+                int_reg_idx: 0,
+                size: 64
+            }
+        ));
+        // Seven doubles leave one FP register: the pair goes by reference
+        // in a0, and the last double still takes fa7.
+        let mut args: Vec<ArgInfo<'_>> = (0..7).map(|_| double_arg()).collect();
+        args.push(record(32, two));
+        args.push(double_arg());
+        let core = classify_args_core(&args, args.len(), false, &config);
+        assert!(matches!(
+            core.classes[7],
+            CoreArgClass::LargeStructByRefReg {
+                reg_idx: 0,
+                size: 32
+            }
+        ));
+        assert!(matches!(
+            core.classes[8],
+            CoreArgClass::FloatReg { reg_idx: 7 }
+        ));
+        // No GP register left for the integer member: by reference, on the
+        // stack.
+        let mut args: Vec<ArgInfo<'_>> = (0..8).map(|_| int_arg()).collect();
+        args.push(record(64, mixed));
+        let core = classify_args_core(&args, args.len(), false, &config);
+        assert!(matches!(
+            core.classes[8],
+            CoreArgClass::LargeStructByRefStack { size: 64 }
+        ));
+        assert_eq!(fp_agg_return_buffer_bytes(two), 32);
+        assert_eq!(fp_agg_return_buffer_bytes(mixed), 64);
     }
 
     /// `aggregate_arg_by_reference` -- which decides where lowering makes

@@ -858,11 +858,14 @@ impl RiscvCodegen {
                         ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
                     let rv_class = func.params[i].fp_agg_class;
                     let (lo_sz, hi_sz, hi_offset) = match rv_class {
-                        Some(crate::common::types::FpAggClass::OneFloat { size }) => (size, 4, 0),
+                        Some(crate::common::types::FpAggClass::OneFloat { size, .. }) => {
+                            (size, 4, 0)
+                        }
                         Some(crate::common::types::FpAggClass::TwoFloats {
                             lo_size,
                             hi_size,
                             hi_offset,
+                            ..
                         }) => (lo_size, hi_size, hi_offset),
                         _ => (
                             if size > 4 { 8 } else { 4 },

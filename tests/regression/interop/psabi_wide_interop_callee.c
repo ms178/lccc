@@ -179,3 +179,69 @@ struct FZ ret_fz(float a, float re, float im)
     __imag__ r.z = im;
     return r;
 }
+
+double sum_wd(struct WD s) { return s.a + 2 * s.b; }
+double sum_wo(struct WO s) { return 3 * s.d; }
+double sum_wm(struct WM s) { return s.f + 2 * (double)s.x; }
+double sum_wi(struct WI s) { return (double)s.x + 2 * s.d; }
+
+double wd_after7(double x0, double x1, double x2, double x3, double x4, double x5, double x6,
+                 struct WD s, double tail)
+{
+    return x0 + x1 + x2 + x3 + x4 + x5 + x6 + 10 * s.a + 100 * s.b + 1000 * tail;
+}
+
+double wm_after8(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7,
+                 struct WM s, double tail)
+{
+    return (double)(a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7) + 10 * s.f + 100 * (double)s.x +
+           1000 * tail;
+}
+
+/* The parameter is the callee's own object: writing it must not reach the
+ * caller's argument. */
+double scribble_wd(struct WD s)
+{
+    double r = s.a + s.b;
+    s.a = -1;
+    s.b = -2;
+    return r + 0 * (s.a + s.b);
+}
+
+/* Whole-record copies into the result: a callee that homed only 16 bytes of
+ * a 32- or 64-byte result would overwrite its own frame. */
+static struct WD wd_template = {7, 8};
+static struct WO wo_template = {9};
+static struct WM wm_template = {1, 2};
+static struct WI wi_template = {3, 4};
+
+struct WD ret_wd(double a, double b)
+{
+    struct WD r = wd_template;
+    r.a = a;
+    r.b = b;
+    return r;
+}
+
+struct WO ret_wo(double d)
+{
+    struct WO r = wo_template;
+    r.d = d;
+    return r;
+}
+
+struct WM ret_wm(float f, long x)
+{
+    struct WM r = wm_template;
+    r.f = f;
+    r.x = x;
+    return r;
+}
+
+struct WI ret_wi(long x, double d)
+{
+    struct WI r = wi_template;
+    r.x = x;
+    r.d = d;
+    return r;
+}

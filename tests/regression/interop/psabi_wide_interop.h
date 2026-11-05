@@ -23,6 +23,14 @@
  * members (`struct CZ` is fa0/fa1); a complex after another member
  * disqualifies (`struct FZ` uses a0/a1).
  *
+ * The record size does not matter to flattening: over-aligned members take
+ * `struct WD`, `WO`, `WM` and `WI` past 2×XLEN, and RV64 still passes and
+ * returns them in fa0/fa1 or fa0 + a0 while the registers last, by reference
+ * once they run out (`wd_after7`: one FP register left; `wm_after8`: no GP
+ * register for the integer member) -- with the trailing double still in an
+ * FP register.  AArch64 passes all four by reference (none is an HFA: the
+ * size is not the members' sum) and x86-64 in memory.
+ *
  * long double values are only moved and compared bit-for-bit (arithmetic on
  * them needs libgcc), and __int128 only through shifts, xor and add. */
 #ifndef PSABI_WIDE_INTEROP_H
@@ -68,5 +76,24 @@ struct FB ret_fb(float f, int b);
 struct CZ ret_cz(float re, float im);
 struct CD ret_cdm(double re, double im);
 struct FZ ret_fz(float a, float re, float im);
+
+struct WD { double a; double b __attribute__((aligned(16))); };
+struct WO { double d __attribute__((aligned(32))); };
+struct WM { float f; long x __attribute__((aligned(32))); };
+struct WI { long x; double d __attribute__((aligned(32))); };
+
+double sum_wd(struct WD s);
+double sum_wo(struct WO s);
+double sum_wm(struct WM s);
+double sum_wi(struct WI s);
+double wd_after7(double x0, double x1, double x2, double x3, double x4, double x5, double x6,
+                 struct WD s, double tail);
+double wm_after8(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7,
+                 struct WM s, double tail);
+double scribble_wd(struct WD s);
+struct WD ret_wd(double a, double b);
+struct WO ret_wo(double d);
+struct WM ret_wm(float f, long x);
+struct WI ret_wi(long x, double d);
 
 #endif

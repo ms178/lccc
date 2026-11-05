@@ -639,7 +639,10 @@ impl RiscvCodegen {
                         self.state.emit_fmt(format_args!("    mv t0, {}", reg_name));
                     } else if let Some(slot) = self.state.get_slot(v.0) {
                         if self.state.is_alloca(v.0) {
-                            self.emit_addi_s0("t0", slot.0);
+                            // An over-aligned record (a member aligned past
+                            // 16 bytes, which a flattened record of any size
+                            // may have) lives at a realigned address.
+                            self.emit_alloca_addr("t0", v.0, slot.0);
                         } else {
                             self.emit_load_from_s0("t0", slot.0, "ld");
                         }
@@ -659,11 +662,14 @@ impl RiscvCodegen {
                     size,
                 } => {
                     let (lo_sz, hi_sz, hi_offset) = match rv_class {
-                        Some(crate::common::types::FpAggClass::OneFloat { size }) => (size, 4, 0),
+                        Some(crate::common::types::FpAggClass::OneFloat { size, .. }) => {
+                            (size, 4, 0)
+                        }
                         Some(crate::common::types::FpAggClass::TwoFloats {
                             lo_size,
                             hi_size,
                             hi_offset,
+                            ..
                         }) => (lo_size, hi_size, hi_offset),
                         _ => (
                             if size > 4 { 8 } else { 4 },
