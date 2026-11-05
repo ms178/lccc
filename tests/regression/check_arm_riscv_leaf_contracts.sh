@@ -12,8 +12,14 @@
 #    with a 32-bit move, and an 8-bit one is extended before it is tested.
 #  - The in-place zero-extension of a 32-bit argument kept in its arrival
 #    register is dropped when no path reads bits 63:32.
-#  - Selects with FP operands are `fcsel`.
+#  - Selects with FP operands are `fcsel`, and a select of zero reads the
+#    zero register (`csel w0, w1, wzr, ne`).
 #  - Callee-saved registers get their `.cfi_offset` rows.
+#  - Contracted packed multiply-adds are `fmla` (main executed the `brk #0`
+#    of an unhandled operation), and multiplications by constants of the
+#    forms (2^k +- 1) << m are shift-adds.
+#  - The emitter's call annotation (`// lccc-call-reads`) never reaches the
+#    output.
 # RISC-V:
 #  - `x | 1u << n` is `sllw` + `or` + one `sext.w`, a returned `unsigned`
 #    parameter is a bare `ret` (it arrives sign-extended), a variadic
@@ -71,6 +77,22 @@ int ret_branch(void)
     return 2;
 }
 int bool_sel(_Bool f, int x) { return f ? x : -x; }
+int sel0(int k, int a) { return k ? a : 0; }
+long mul5(long x) { return x * 5; }
+long mul_m3(long x) { return x * -3; }
+int mul24(int x) { return x * 24; }
+extern int h1(int);
+int call_one(int a, int b) { return h1(a) + b; }
+void axpy_d(double *restrict y, const double *restrict x, double a, int n)
+{
+    for (int i = 0; i < n; i++)
+        y[i] = a * x[i] + y[i];
+}
+void axpy_f(float *restrict y, const float *restrict x, float a, int n)
+{
+    for (int i = 0; i < n; i++)
+        y[i] = a * x[i] + y[i];
+}
 EOF
 
 if [ -x "$ARM" ]; then
@@ -101,6 +123,18 @@ if [ -x "$ARM" ]; then
     if has "$a" bool_sel '^cmp x'; then bad "AArch64 bool_sel: _Bool tested in its X view"; fi
     grep -Eq '^[[:space:]]*\.cfi_offset x(19|2[0-8]), -[0-9]+' "$a" ||
         bad "AArch64 live_k: no .cfi_offset row for a saved callee-saved register"
+    has "$a" sel0 '^csel w0, w1, wzr, ne$' || bad "AArch64 sel0: zero not read from wzr"
+    for f in mul5 mul_m3 mul24; do
+        if has "$a" "$f" '^(mul|madd|mov [wx][0-9]+, #)'; then bad "AArch64 $f: multiplication by a constant not strength-reduced"; fi
+    done
+    [ "$(count "$a" mul5)" -le 2 ] || bad "AArch64 mul5: add x0, x0, x0, lsl #2 + ret expected"
+    for f in axpy_d axpy_f; do
+        if has "$a" "$f" '^brk '; then bad "AArch64 $f: packed FMA reached an unhandled-operation trap"; fi
+    done
+    has "$a" axpy_d '^fmla v[0-9]+\.2d, ' || bad "AArch64 axpy_d: no packed fmla"
+    has "$a" axpy_f '^fmla v[0-9]+\.4s, ' || bad "AArch64 axpy_f: no packed fmla"
+    has "$a" call_one '^bl h1$' || bad "AArch64 call_one: the call is not a bare bl"
+    if grep -q 'lccc-call-reads' "$a"; then bad "AArch64: call annotation leaked into the output"; fi
 else
     echo "note: $ARM is absent; AArch64 leg skipped"
 fi

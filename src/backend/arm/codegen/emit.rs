@@ -254,6 +254,14 @@ pub struct ArmCodegen {
     /// from the CallInfo). The result arrives in Q0; the result store must
     /// take the 16-byte path instead of the x0:x1 pair.
     pub(super) call_ret_is_f128_sse: bool,
+    /// The GP argument registers (bit N = xN, N <= 8) the call being emitted
+    /// passes values in, armed by `emit_call_reg_args_impl` from the
+    /// authoritative `CallArgClass` list, widened by the x8 setup of a
+    /// memory-returned result, and published on the call line as the
+    /// peephole's `CALL_READS_TAG` annotation.  `None`: not armed (an
+    /// unmodeled class), so the call is published unannotated and the
+    /// peephole assumes it reads all of x0-x8.
+    pub(super) call_gp_reads: Option<u16>,
     /// For variadic functions: offset from SP where the GP register save area starts (x0-x7).
     pub(super) va_gp_save_offset: i64,
     /// For variadic functions: offset from SP where the FP register save area starts (q0-q7).
@@ -341,6 +349,7 @@ impl ArmCodegen {
             current_return_type: IrType::I64,
             func_ret_is_f128_sse: false,
             call_ret_is_f128_sse: false,
+            call_gp_reads: None,
             va_gp_save_offset: 0,
             va_fp_save_offset: 0,
             va_named_gp_count: 0,
@@ -3483,6 +3492,10 @@ impl ArchCodegen for ArmCodegen {
         };
         let needs_adjusted = total_sp_adjust > 0;
         self.emit_load_arg_to_reg(sret_operand, "x8", slot_adjust, 0, needs_adjusted);
+        // The callee stores its result through x8.
+        if let Some(reads) = self.call_gp_reads.as_mut() {
+            *reads |= 1 << 8;
+        }
     }
 
     // ---- Inline asm / intrinsics (kept inline - has extra logic) ----

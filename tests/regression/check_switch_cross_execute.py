@@ -34,7 +34,7 @@ FIXTURES = (
     "callee_saved_return_paths_cross", "entry_copy_abi_reads_cross",
     "asm_scalar_operand_classes_cross", "alias_copy_after_join_cross",
     "predicate_inverted_signed_cmp_cross", "word_reload_sign_extension_cross",
-    "leaf_params_fp_domain_cross",
+    "leaf_params_fp_domain_cross", "vector_fma_families_cross", "call_args_and_pool_regs_cross",
 )
 ALL_LEVELS = ("-O0", "-O1", "-O2", "-Os")
 LEVELS = {
@@ -81,6 +81,18 @@ LEVELS = {
     # conversions.  RISC-V: narrow parameters in their psABI register form,
     # the published argument extensions and the upper-word demand pass.
     "leaf_params_fp_domain_cross": ALL_LEVELS,
+    # AArch64 -O2/-O3: the packed FMA family (`a*b + c`, `c - a*b`, `a*b -
+    # c`, `-(a*b) - c`, 2 x F64 and 4 x F32, loops and BB-SLP groups) had
+    # no lowering and executed `brk #0`; the zero checks pin the sign the
+    # `a*b - c` forms must keep.
+    "vector_fma_families_cross": ALL_LEVELS + ("-O3",),
+    # AArch64 -O1 and up: an entry copy into an argument register was
+    # coalesced although a later call reads that register (va-arg-6 and
+    # nine more torture tests), and a loop-carried value in x9 -- an
+    # ordinary register in a pure scalar-ALU function -- lost its
+    # definition to a pass that assumed x9 held a block-local address
+    # (pr42833).
+    "call_args_and_pool_regs_cross": ALL_LEVELS + ("-O3",),
 }
 # Two-unit psABI fixtures under interop/: `<name>_callee.c` and
 # `<name>_caller.c`, linked LCCC-with-LCCC and LCCC-with-Clang in both

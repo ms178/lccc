@@ -47,6 +47,83 @@ impl ArmCodegen {
         }
     }
 
+    /// The register an accumulating NEON instruction (`fmla`, `smlal`,
+    /// `sadalp`: Vd is read and written) computes in for `dest`: the
+    /// destination's own register, unless staging the accumulator there
+    /// would clobber one of the instruction's other inputs `others` before
+    /// it reads them.  The allocator may give a destination the home of an
+    /// operand that dies at this instruction, so `mov dest, acc` (or the
+    /// `fneg` of a negated accumulator) is only safe when the destination
+    /// holds none of them -- or when there is no staging write at all
+    /// (`dest` already holds the accumulator, not negated).  `None`: compute
+    /// in the v0 scratch, which no allocated value and no other operand of
+    /// these instructions occupies (operands load into v1/v2).
+    fn neon_accumulator_home(
+        &self,
+        dest: &Value,
+        acc: &str,
+        others: &[&str],
+        negate_acc: bool,
+    ) -> Option<String> {
+        let name = self.assigned_vector_reg(dest.0)?;
+        let staging_is_noop = name == acc && !negate_acc;
+        (staging_is_noop || !others.contains(&name.as_str())).then_some(name)
+    }
+
+    /// Emit an accumulating NEON instruction for `dest`: stage the
+    /// accumulator `acc` in the home `neon_accumulator_home` picks (a copy,
+    /// or `fneg` with arrangement `negate_acc` when the operation subtracts
+    /// it), emit `insn(home)`, and move the result to `dest` when the home
+    /// is the scratch.
+    fn emit_neon_accumulate(
+        &mut self,
+        dest: &Value,
+        acc: &str,
+        others: &[&str],
+        negate_acc: Option<&str>,
+        insn: impl FnOnce(&str) -> String,
+    ) {
+        let home = self.neon_accumulator_home(dest, acc, others, negate_acc.is_some());
+        let reg = home.clone().unwrap_or_else(|| "v0".to_string());
+        match negate_acc {
+            Some(arr) => self
+                .state
+                .emit_fmt(format_args!("    fneg {reg}.{arr}, {acc}.{arr}")),
+            None if reg != acc => self
+                .state
+                .emit_fmt(format_args!("    mov {reg}.16b, {acc}.16b")),
+            None => {}
+        }
+        let text = insn(&reg);
+        self.state.emit(&text);
+        if home.is_some() {
+            self.state.vector_values.insert(dest.0);
+        } else {
+            self.store_vector_value_128(dest, "q0");
+        }
+    }
+
+    /// Lower the packed fused multiply-add family, args = [a, b, acc].
+    fn emit_neon_fused_multiply_add(&mut self, dest: &Value, op: &IntrinsicOp, args: &[Operand]) {
+        let (arr, subtract_product, negate_acc) = match op {
+            IntrinsicOp::VecFmaF64x2 => ("2d", false, false),
+            IntrinsicOp::VecFnmaF64x2 => ("2d", true, false),
+            IntrinsicOp::VecFmsF64x2 => ("2d", false, true),
+            IntrinsicOp::VecFnmsF64x2 => ("2d", true, true),
+            IntrinsicOp::VecFmaF32x4 => ("4s", false, false),
+            IntrinsicOp::VecFnmaF32x4 => ("4s", true, false),
+            IntrinsicOp::VecFmsF32x4 => ("4s", false, true),
+            _ => ("4s", true, true),
+        };
+        let a = self.load_vector_value_128(&args[0], "q1");
+        let b = self.load_vector_value_128(&args[1], "q2");
+        let acc = self.load_vector_value_128(&args[2], "q0");
+        let mnemonic = if subtract_product { "fmls" } else { "fmla" };
+        self.emit_neon_accumulate(dest, &acc, &[&a, &b], negate_acc.then_some(arr), |home| {
+            format!("    {mnemonic} {home}.{arr}, {a}.{arr}, {b}.{arr}")
+        });
+    }
+
     pub(super) fn emit_neon_binary_128(
         &mut self,
         dest_ptr: &Value,
@@ -849,23 +926,9 @@ impl ArmCodegen {
                 if let Some(d) = dest {
                     let acc = self.load_vector_value_128(&args[0], "q0");
                     let src = self.load_vector_value_128(&args[1], "q1");
-                    if let Some(name) = self.assigned_vector_reg(d.0) {
-                        self.state.vector_values.insert(d.0);
-                        if name != acc {
-                            self.state
-                                .emit_fmt(format_args!("    mov {}.16b, {}.16b", name, acc));
-                        }
-                        self.state
-                            .emit_fmt(format_args!("    sadalp {}.2d, {}.4s", name, src));
-                    } else {
-                        if acc != "v0" {
-                            self.state
-                                .emit_fmt(format_args!("    mov v0.16b, {}.16b", acc));
-                        }
-                        self.state
-                            .emit_fmt(format_args!("    sadalp v0.2d, {}.4s", src));
-                        self.store_vector_value_128(d, "q0");
-                    }
+                    self.emit_neon_accumulate(d, &acc, &[&src], None, |home| {
+                        format!("    sadalp {home}.2d, {src}.4s")
+                    });
                 }
             }
 
@@ -881,27 +944,9 @@ impl ArmCodegen {
                     } else {
                         ("smlal2", "4s")
                     };
-                    if let Some(name) = self.assigned_vector_reg(d.0) {
-                        self.state.vector_values.insert(d.0);
-                        if name != acc {
-                            self.state
-                                .emit_fmt(format_args!("    mov {}.16b, {}.16b", name, acc));
-                        }
-                        self.state.emit_fmt(format_args!(
-                            "    {} {}.2d, {}.{}, {}.{}",
-                            mnemonic, name, a, suffix, b, suffix
-                        ));
-                    } else {
-                        if acc != "v0" {
-                            self.state
-                                .emit_fmt(format_args!("    mov v0.16b, {}.16b", acc));
-                        }
-                        self.state.emit_fmt(format_args!(
-                            "    {} v0.2d, {}.{}, {}.{}",
-                            mnemonic, a, suffix, b, suffix
-                        ));
-                        self.store_vector_value_128(d, "q0");
-                    }
+                    self.emit_neon_accumulate(d, &acc, &[&a, &b], None, |home| {
+                        format!("    {mnemonic} {home}.2d, {a}.{suffix}, {b}.{suffix}")
+                    });
                 }
             }
 
@@ -985,6 +1030,26 @@ impl ArmCodegen {
                         ));
                         self.store_vector_value_128(d, "q0");
                     }
+                }
+            }
+
+            // Packed fused multiply-add, args = [a, b, acc] (see
+            // `IntrinsicOp::VecFmaF64x2`): NEON's accumulating `fmla`/`fmls`
+            // (Vd +/-= Vn*Vm, one rounding) for the `acc +/- a*b` forms; the
+            // `a*b - acc` and `-a*b - acc` forms negate the accumulator
+            // first, which is exact, so they keep the single rounding and
+            // the sign of a zero result (negating the fused result instead
+            // would turn `0*x - 0 = +0` into -0).
+            IntrinsicOp::VecFmaF64x2
+            | IntrinsicOp::VecFnmaF64x2
+            | IntrinsicOp::VecFmsF64x2
+            | IntrinsicOp::VecFnmsF64x2
+            | IntrinsicOp::VecFmaF32x4
+            | IntrinsicOp::VecFnmaF32x4
+            | IntrinsicOp::VecFmsF32x4
+            | IntrinsicOp::VecFnmsF32x4 => {
+                if let Some(d) = dest {
+                    self.emit_neon_fused_multiply_add(d, op, args);
                 }
             }
 
@@ -1451,6 +1516,176 @@ mod intrinsic_destination_contract_tests {
             cg.state.out.buf.contains("brk"),
             "unhandled computation silently no-op'd again: {}",
             cg.state.out.buf
+        );
+    }
+}
+
+/// The packed fused multiply-add family (`[a, b, acc]`, see
+/// `IntrinsicOp::VecFmaF64x2`) used to fall through to the `brk #0` of an
+/// unhandled operation while `has_fma3()` admitted the contraction on
+/// AArch64.  Every form must now lower to one accumulating instruction, with
+/// the exact accumulator negation for the `a*b - acc` forms, and no staging
+/// write may clobber an input that shares the destination's register.
+#[cfg(test)]
+mod neon_fused_multiply_add_tests {
+    use super::*;
+    use crate::backend::regalloc::PhysReg;
+    use crate::backend::state::StackSlot;
+
+    /// Emit `op` with operands v0 = a, v1 = b, v2 = acc and destination v3.
+    /// `homes[i]` is the allocator register of value `i` (`None`: a stack
+    /// slot).
+    fn emit(op: IntrinsicOp, homes: [Option<u8>; 4]) -> String {
+        let mut cg = ArmCodegen::new();
+        for (id, home) in homes.iter().enumerate() {
+            let id = id as u32;
+            match home {
+                Some(p) => {
+                    cg.reg_assignments.insert(id, PhysReg(*p));
+                }
+                None => {
+                    cg.state
+                        .value_locations
+                        .insert(id, StackSlot(-16 * (i64::from(id) + 1)));
+                    cg.state.vector_values.insert(id);
+                }
+            }
+        }
+        cg.emit_intrinsic_arm(
+            &Some(Value(3)),
+            &op,
+            &None,
+            &[
+                Operand::Value(Value(0)),
+                Operand::Value(Value(1)),
+                Operand::Value(Value(2)),
+            ],
+        );
+        cg.state.out.buf.clone()
+    }
+
+    fn insns(text: &str) -> Vec<String> {
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn every_form_lowers_to_one_fused_instruction() {
+        // (op, arrangement, accumulating mnemonic, accumulator negated)
+        let forms = [
+            (IntrinsicOp::VecFmaF64x2, "2d", "fmla", false),
+            (IntrinsicOp::VecFnmaF64x2, "2d", "fmls", false),
+            (IntrinsicOp::VecFmsF64x2, "2d", "fmla", true),
+            (IntrinsicOp::VecFnmsF64x2, "2d", "fmls", true),
+            (IntrinsicOp::VecFmaF32x4, "4s", "fmla", false),
+            (IntrinsicOp::VecFnmaF32x4, "4s", "fmls", false),
+            (IntrinsicOp::VecFmsF32x4, "4s", "fmla", true),
+            (IntrinsicOp::VecFnmsF32x4, "4s", "fmls", true),
+        ];
+        for (op, arr, mnemonic, negated) in forms {
+            // Register homes: a = v16, b = v17, acc = v18, dest = v19.
+            let text = emit(op, [Some(40), Some(41), Some(42), Some(43)]);
+            let got = insns(&text);
+            let stage = if negated {
+                format!("fneg v19.{arr}, v18.{arr}")
+            } else {
+                "mov v19.16b, v18.16b".to_string()
+            };
+            let fused = format!("{mnemonic} v19.{arr}, v16.{arr}, v17.{arr}");
+            assert_eq!(got, vec![stage, fused], "{op:?}");
+            // Stack homes: the fused instruction runs in the v0 scratch the
+            // accumulator loads into, and the result is stored back.
+            let text = emit(op, [None, None, None, None]);
+            assert!(!text.contains("brk"), "{op:?} traps: {text}");
+            let fused = format!("{mnemonic} v0.{arr}, v1.{arr}, v2.{arr}");
+            assert!(text.contains(&fused), "{op:?}: {text}");
+            assert_eq!(
+                text.contains(&format!("fneg v0.{arr}, v0.{arr}")),
+                negated,
+                "{op:?}: {text}"
+            );
+            assert!(text.contains("str q0"), "{op:?} result not stored: {text}");
+        }
+    }
+
+    #[test]
+    fn destination_holding_the_accumulator_accumulates_in_place() {
+        // dest shares acc's register (the accumulator dies here): no copy.
+        let text = emit(
+            IntrinsicOp::VecFmaF64x2,
+            [Some(40), Some(41), Some(42), Some(42)],
+        );
+        assert_eq!(insns(&text), vec!["fmla v18.2d, v16.2d, v17.2d"]);
+        // A negated accumulator is negated in place.
+        let text = emit(
+            IntrinsicOp::VecFnmsF32x4,
+            [Some(40), Some(41), Some(42), Some(42)],
+        );
+        assert_eq!(
+            insns(&text),
+            vec!["fneg v18.4s, v18.4s", "fmls v18.4s, v16.4s, v17.4s"]
+        );
+    }
+
+    #[test]
+    fn staging_never_clobbers_an_input_sharing_the_destination() {
+        // dest shares a's register (a dies here): `mov v16, acc` before the
+        // fmla would destroy a, so the work happens in the v0 scratch.
+        let text = emit(
+            IntrinsicOp::VecFmaF64x2,
+            [Some(40), Some(41), Some(42), Some(40)],
+        );
+        assert_eq!(
+            insns(&text),
+            vec![
+                "mov v0.16b, v18.16b",
+                "fmla v0.2d, v16.2d, v17.2d",
+                "mov v16.16b, v0.16b",
+            ]
+        );
+        // Same for b.
+        let text = emit(
+            IntrinsicOp::VecFnmaF32x4,
+            [Some(40), Some(41), Some(42), Some(41)],
+        );
+        assert_eq!(
+            insns(&text),
+            vec![
+                "mov v0.16b, v18.16b",
+                "fmls v0.4s, v16.4s, v17.4s",
+                "mov v17.16b, v0.16b",
+            ]
+        );
+        // `x*y - x` with dest, acc and a in one register: negating the
+        // accumulator in place would negate the multiplicand too.
+        let text = emit(
+            IntrinsicOp::VecFmsF64x2,
+            [Some(40), Some(41), Some(40), Some(40)],
+        );
+        assert_eq!(
+            insns(&text),
+            vec![
+                "fneg v0.2d, v16.2d",
+                "fmla v0.2d, v16.2d, v17.2d",
+                "mov v16.16b, v0.16b",
+            ]
+        );
+        // The integer accumulators share the helper: smlal/sadalp with the
+        // destination in a multiplicand's register.
+        let text = emit(
+            IntrinsicOp::VecSmlalLoI32x4,
+            [Some(40), Some(41), Some(42), Some(41)],
+        );
+        assert_eq!(
+            insns(&text),
+            vec![
+                "mov v0.16b, v16.16b",
+                "smlal v0.2d, v17.2s, v18.2s",
+                "mov v17.16b, v0.16b",
+            ]
         );
     }
 }

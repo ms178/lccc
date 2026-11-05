@@ -6,7 +6,7 @@ use super::emit::{
 };
 use crate::backend::regalloc::PhysReg;
 use crate::common::types::IrType;
-use crate::ir::reexports::{IrCmpOp, Operand, Value};
+use crate::ir::reexports::{IrCmpOp, IrConst, Operand, Value};
 
 impl ArmCodegen {
     pub(super) fn emit_float_cmp_impl(
@@ -514,8 +514,21 @@ impl ArmCodegen {
     }
 
     /// Resolve a Select arm to a register name: its assigned phys reg when
-    /// available, otherwise loaded into the given scratch register.
+    /// available, the zero register for an integer zero, otherwise loaded
+    /// into the given scratch register.
+    ///
+    /// Every caller reads the name as a `csel`/`csinc` source, where
+    /// register 31 encodes WZR/XZR (never sp), so a zero arm costs nothing:
+    /// staging it was `mov x0, #0; mov x1, x0`.  Integer constants only --
+    /// a zero is the same bits in every width and extension, while a float
+    /// constant compares equal to zero for -0.0 too.
     fn select_arm_reg(&mut self, op: &Operand, scratch_x: &str, use_32bit: bool) -> String {
+        if let Operand::Const(
+            IrConst::I8(0) | IrConst::I16(0) | IrConst::I32(0) | IrConst::I64(0) | IrConst::Zero,
+        ) = op
+        {
+            return (if use_32bit { "wzr" } else { "xzr" }).to_string();
+        }
         if let Operand::Value(v) = op {
             if let Some(phys) = self.reg_assignments.get(&v.0).copied() {
                 if !is_arm_fp_phys(phys) {
