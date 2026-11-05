@@ -84,7 +84,7 @@ pub(super) fn callee_saved_name(reg: PhysReg) -> &'static str {
         26 => "x26",
         27 => "x27",
         28 => "x28",
-        _ => unreachable!("invalid ARM register index"),
+        _ => unreachable!("invalid ARM register index {}", reg.0),
     }
 }
 
@@ -118,7 +118,7 @@ pub(super) fn callee_saved_name_32(reg: PhysReg) -> &'static str {
         26 => "w26",
         27 => "w27",
         28 => "w28",
-        _ => unreachable!("invalid ARM register index"),
+        _ => unreachable!("invalid ARM register index {}", reg.0),
     }
 }
 

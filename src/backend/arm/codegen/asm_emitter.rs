@@ -191,10 +191,20 @@ impl InlineAsmEmitter for ArmCodegen {
                     return Some(tmp_reg);
                 } else if let Some(&phys) = self.reg_assignments.get(&v.0) {
                     let tmp_reg = alloc_gp_tmp(self);
-                    let src = super::emit::callee_saved_name(phys);
-                    if src != tmp_reg {
+                    // A value may live in an FP/SIMD home (allocator ids
+                    // 32..=55). callee_saved_name only names GP registers and
+                    // used to panic here; AArch64 cannot `mov` between the two
+                    // register files either. `fmov` copies the bit pattern.
+                    if super::emit::is_arm_fp_phys(phys) {
+                        let fp = super::emit::arm_fp_name(phys, IrType::F64);
                         self.state
-                            .emit_fmt(format_args!("    mov {}, {}", tmp_reg, src));
+                            .emit_fmt(format_args!("    fmov {}, {}", tmp_reg, fp));
+                    } else {
+                        let src = super::emit::callee_saved_name(phys);
+                        if src != tmp_reg {
+                            self.state
+                                .emit_fmt(format_args!("    mov {}, {}", tmp_reg, src));
+                        }
                     }
                     op.mem_addr = format!("[{}]", tmp_reg);
                     return Some(tmp_reg);
@@ -442,8 +452,13 @@ impl InlineAsmEmitter for ArmCodegen {
                     } else if is_sp {
                         // sp cannot be an ldr/mov destination from an
                         // arbitrary home in all states; stage via x9.
-                        let src = super::emit::callee_saved_name(phys);
-                        self.state.emit_fmt(format_args!("    mov x9, {}", src));
+                        if super::emit::is_arm_fp_phys(phys) {
+                            let fp = super::emit::arm_fp_name(phys, IrType::F64);
+                            self.state.emit_fmt(format_args!("    fmov x9, {}", fp));
+                        } else {
+                            let src = super::emit::callee_saved_name(phys);
+                            self.state.emit_fmt(format_args!("    mov x9, {}", src));
+                        }
                         self.state.emit("    mov sp, x9");
                     } else if super::emit::is_arm_fp_phys(phys) {
                         // A floating-point value bound to a general register
@@ -468,9 +483,27 @@ impl InlineAsmEmitter for ArmCodegen {
                                 .emit_fmt(format_args!("    fmov {}, {}", dst, src));
                         }
                     } else {
-                        let src = super::emit::callee_saved_name(phys);
-                        self.state
-                            .emit_fmt(format_args!("    mov {}, {}", reg, src));
+                        // gcc.c-torture/compile/pr30311.c uses the x87-only
+                        // "=t" constraint. On AArch64 the FP source home
+                        // reaches a GP asm operand; `fmov` with the lane width
+                        // matching `reg` is the only encodable copy. Before
+                        // this guard, callee_saved_name(FP phys) hit
+                        // unreachable!("invalid ARM register index") -- an ICE
+                        // instead of a compilable object.
+                        if super::emit::is_arm_fp_phys(phys) {
+                            let ty = if reg.starts_with('w') {
+                                IrType::F32
+                            } else {
+                                IrType::F64
+                            };
+                            let fp = super::emit::arm_fp_name(phys, ty);
+                            self.state
+                                .emit_fmt(format_args!("    fmov {}, {}", reg, fp));
+                        } else {
+                            let src = super::emit::callee_saved_name(phys);
+                            self.state
+                                .emit_fmt(format_args!("    mov {}, {}", reg, src));
+                        }
                     }
                 } else {
                     // Neither slot nor register: fail loudly instead of

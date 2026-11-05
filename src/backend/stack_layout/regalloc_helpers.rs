@@ -686,11 +686,26 @@ pub fn find_param_alloca(func: &IrFunction, param_idx: usize) -> Option<(Value, 
     // parameter (gcc.c-torture/execute/20180112-1.c).  Look up the indexed
     // parameter-home value and verify that its Alloca still exists.
     let want = *func.param_alloca_values.get(param_idx)?;
-    func.blocks.first().and_then(|block| {
-        block.instructions.iter().find_map(|inst| match inst {
-            Instruction::Alloca { dest, ty, .. } if *dest == want => Some((*dest, *ty)),
-            _ => None,
-        })
+    let block = func.blocks.first()?;
+    // O(1) fast path. Lowering emits the parameter homes as the first N
+    // Alloca instructions of the entry block, in parameter order, so slot
+    // `param_idx` is exactly the home we want. Probing it first avoids the
+    // O(params x instructions) full scan that dominated codegen for
+    // gcc.c-torture/compile/limits-fndefn.c (100,000 formal parameters):
+    // Callgrind attributed 18.6% inclusive / 6.8% self to this function at
+    // 10,000 parameters. The probe verifies `dest == want`, so it can only
+    // return what the authoritative scan below would return (SSA dests are
+    // unique). When mem2reg removed a home, inlining inserted a prefix, or
+    // anything else shifted the layout, the probe misses and the original
+    // exact scan still decides -- no behavioural change is possible.
+    if let Some(Instruction::Alloca { dest, ty, .. }) = block.instructions.get(param_idx) {
+        if *dest == want {
+            return Some((*dest, *ty));
+        }
+    }
+    block.instructions.iter().find_map(|inst| match inst {
+        Instruction::Alloca { dest, ty, .. } if *dest == want => Some((*dest, *ty)),
+        _ => None,
     })
 }
 
@@ -1196,5 +1211,78 @@ mod vector_location_contract_tests {
         for op in horizontal {
             assert!(has_vector_location_contract(&op), "lost {op:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod param_alloca_fast_path_tests {
+    use super::find_param_alloca;
+    use crate::common::types::IrType;
+    use crate::ir::instruction::{BasicBlock, Instruction, Terminator};
+    use crate::ir::reexports::{BlockId, IrFunction, Value};
+
+    fn alloca(dest: u32, ty: IrType) -> Instruction {
+        Instruction::Alloca {
+            dest: Value(dest),
+            ty,
+            size: ty.size() as usize,
+            align: 4,
+            volatile: false,
+            semantic_volatile: false,
+        }
+    }
+
+    fn function(instructions: Vec<Instruction>, homes: Vec<u32>) -> IrFunction {
+        let mut f = IrFunction::new("t".to_string(), IrType::Void, Vec::new(), false);
+        f.blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        }];
+        f.param_alloca_values = homes.into_iter().map(Value).collect();
+        f
+    }
+
+    /// The O(1) probe must return byte-for-byte what the former full scan
+    /// returned: the same dest AND the same type (a wrong type would change
+    /// the emitted parameter store width).
+    #[test]
+    fn aligned_homes_hit_the_fast_path_with_the_same_answer() {
+        let f = function(
+            vec![
+                alloca(10, IrType::I32),
+                alloca(11, IrType::I64),
+                alloca(12, IrType::F64),
+            ],
+            vec![10, 11, 12],
+        );
+        assert_eq!(find_param_alloca(&f, 0), Some((Value(10), IrType::I32)));
+        assert_eq!(find_param_alloca(&f, 1), Some((Value(11), IrType::I64)));
+        assert_eq!(find_param_alloca(&f, 2), Some((Value(12), IrType::F64)));
+        assert_eq!(find_param_alloca(&f, 3), None);
+    }
+
+    /// A prefix instruction or a removed parameter home shifts the layout;
+    /// the probe must miss and the authoritative scan must still find the
+    /// home (this is the 20180112-1.c mem2reg class).
+    #[test]
+    fn shifted_layout_falls_back_to_the_exact_scan() {
+        let f = function(
+            vec![
+                alloca(99, IrType::I32), // unrelated local first
+                alloca(10, IrType::I32),
+                alloca(11, IrType::I64),
+            ],
+            vec![10, 11],
+        );
+        assert_eq!(find_param_alloca(&f, 0), Some((Value(10), IrType::I32)));
+        assert_eq!(find_param_alloca(&f, 1), Some((Value(11), IrType::I64)));
+    }
+
+    #[test]
+    fn a_home_removed_by_mem2reg_is_not_replaced_by_a_later_alloca() {
+        let f = function(vec![alloca(99, IrType::I32)], vec![10]);
+        assert_eq!(find_param_alloca(&f, 0), None);
     }
 }

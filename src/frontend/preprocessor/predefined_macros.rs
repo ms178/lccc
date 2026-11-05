@@ -1231,9 +1231,20 @@ impl Preprocessor {
                 self.define_simple_macro("__AARCH64EL__", "1");
                 self.define_simple_macro("__AARCH64_CMODEL_SMALL__", "1");
                 // Replace x86 include paths with aarch64 paths
+                // Keep GCC's private include/ directory when no target
+                // sysroot is installed: stdbool.h, stdarg.h, stddef.h and
+                // iso646.h are target-neutral, and dropping every x86_64 path
+                // (as this branch used to do) made a cross compile without a
+                // cross sysroot unable to preprocess even the simplest
+                // translation unit (gcc.c-torture/compile/20010114-2.c,
+                // pr38123.c, ...). The i686 branch has always kept it.
+                // Target-specific sysroots are inserted BEFORE it by
+                // insert_arch_paths_after_bundled, so they take precedence;
+                // x86_64 *glibc* multiarch headers are still removed because
+                // bits/wordsize.h there encodes __WORDSIZE for __x86_64__.
                 self.system_include_paths.retain(|p| {
                     let s = p.to_string_lossy();
-                    !s.contains("x86_64")
+                    s.contains("/usr/lib/gcc/x86_64-") || !s.contains("x86_64")
                 });
                 let aarch64_paths = [
                     "/usr/lib/gcc/aarch64-linux-gnu/16/include",
@@ -1302,9 +1313,20 @@ impl Preprocessor {
                 self.define_simple_macro("__riscv_arch_test", "1");
                 self.define_simple_macro("__riscv_cmodel_medany", "1");
                 // Replace x86 include paths with riscv64 paths
+                // Keep GCC's private include/ directory when no target
+                // sysroot is installed: stdbool.h, stdarg.h, stddef.h and
+                // iso646.h are target-neutral, and dropping every x86_64 path
+                // (as this branch used to do) made a cross compile without a
+                // cross sysroot unable to preprocess even the simplest
+                // translation unit (gcc.c-torture/compile/20010114-2.c,
+                // pr38123.c, ...). The i686 branch has always kept it.
+                // Target-specific sysroots are inserted BEFORE it by
+                // insert_arch_paths_after_bundled, so they take precedence;
+                // x86_64 *glibc* multiarch headers are still removed because
+                // bits/wordsize.h there encodes __WORDSIZE for __x86_64__.
                 self.system_include_paths.retain(|p| {
                     let s = p.to_string_lossy();
-                    !s.contains("x86_64")
+                    s.contains("/usr/lib/gcc/x86_64-") || !s.contains("x86_64")
                 });
                 let riscv_paths = [
                     "/usr/lib/gcc/riscv64-linux-gnu/16/include",
