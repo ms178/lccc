@@ -374,6 +374,8 @@ mod tests {
                     reg_prefs: FxHashMap::default(),
                     ra_config: Arc::new(RaConfig::default()),
                     leaf_caller_saved_homes: false,
+                    param_volatile_pool: Vec::new(),
+                    param_arrival_regs: Vec::new(),
                 },
                 assignments: FxHashMap::default(),
                 pairs: vec![],

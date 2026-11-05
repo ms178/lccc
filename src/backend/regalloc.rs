@@ -1578,6 +1578,18 @@ pub struct RegAllocConfig {
     /// i.e. the prologue saves exactly the registers the loop actually
     /// needs. Kill switch: `CCC_NO_LEAF_CALLER_HOME`.
     pub leaf_caller_saved_homes: bool,
+    /// Caller-saved registers a parameter web may be homed in by the
+    /// overflow wave that runs after the general Phase-2 waves (AArch64; see
+    /// `aarch64_param_volatile_pool`). Parameters are otherwise kept out of
+    /// Phase 2 entirely (`param_restricted`) and every one that needs a home
+    /// lands in a callee-saved register. Empty: no such wave.
+    pub param_volatile_pool: Vec<PhysReg>,
+    /// Parameters that may stay in the pool register they arrive in, as
+    /// (`ParamRef` destination, register) pairs (AArch64 x4-x7; see
+    /// `aarch64_param_arrival_regs`). Phase 2p homes such a parameter there
+    /// when no earlier home occupies the register during its range; the
+    /// general waves try every other pool register before these.
+    pub param_arrival_regs: Vec<(u32, PhysReg)>,
 }
 
 /// Conservative envelope for every value.
@@ -5635,11 +5647,38 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .collect();
                 if !w4.is_empty() {
                     let ranges = build_gpr_ranges(&w4);
-                    let mut alloc = LinearScanAllocator::new_with_config(
-                        ranges,
-                        config.caller_saved_regs.clone(),
-                        &config.ra_config,
-                    );
+                    // A parameter arriving in a pool register (x4-x7) can
+                    // stay there (Phase 2p), so the temporaries try every
+                    // other register first: `six(a..f)` homed `a + b*c` in
+                    // x5 and copied `f` out of it first (`mov w9, w5`).
+                    // Under pressure they still take it (the allocator only
+                    // reorders its choices).
+                    let w4_pool: Vec<PhysReg> = if config.param_arrival_regs.is_empty() {
+                        config.caller_saved_regs.clone()
+                    } else {
+                        let arrival =
+                            |r: &PhysReg| config.param_arrival_regs.iter().any(|(_, a)| a == r);
+                        let (late, mut pool): (Vec<PhysReg>, Vec<PhysReg>) =
+                            config.caller_saved_regs.iter().copied().partition(arrival);
+                        pool.extend(late);
+                        pool
+                    };
+                    let mut alloc =
+                        LinearScanAllocator::new_with_config(ranges, w4_pool, &config.ra_config);
+                    // Parameter webs wait for Phase 2p, which can only use a
+                    // register no temporary occupies during the parameter's
+                    // (usually whole-function) range. Rotation spreads short
+                    // temporaries over every register of the pool and leaves
+                    // none of them free (`sum(a, n)`: 20 temporaries over
+                    // all seven, both parameters to x19/x20 and a frame);
+                    // reusing a touched register first packs them and leaves
+                    // the rest whole. Renaming makes rotation's
+                    // false-dependency argument moot, as in Phase 1.
+                    alloc.prefer_touched = !config.param_volatile_pool.is_empty()
+                        && scan_ivs.iter().any(|iv| {
+                            param_restricted.contains(&iv.value_id)
+                                && !assignments.contains_key(&iv.value_id)
+                        });
                     alloc.run_with_seed(&seeded);
                     for (vid, reg) in alloc.assignments {
                         assignments.insert(vid, reg);
@@ -5839,6 +5878,112 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             for (vid, r) in alloc.assignments {
                 assignments.insert(vid, r);
                 caller_used_regs_set.insert(r.0);
+            }
+        }
+    }
+
+    // Phase 2p (AArch64): parameter webs in the volatile pool, overflow only.
+    // `param_restricted` keeps every ParamRef web out of the general waves
+    // (a whole-function parameter range would evict the hot loop's
+    // temporaries), so each parameter that needed a home reached Phase 2c and
+    // took x19+: `int f(int x) { return x + 1; }` paid a frame record plus a
+    // save/restore of x19 for a value the emitter copies out of w0 in its
+    // first instruction. This wave runs after the general ones -- it only
+    // takes what they left -- with the general candidacy (no home yet, not
+    // call-spanning, kept off the argument registers its call staging
+    // overwrites first), over `param_volatile_pool`: the caller-saved
+    // registers no parameter arrives in. Every existing home in those
+    // registers is seeded (half-open, see the Wave 1 note), so a parameter
+    // only fills the holes the earlier waves left.
+    if !config.param_volatile_pool.is_empty() && !ordered_param_homes {
+        let pool = &config.param_volatile_pool;
+        let intervals: Vec<LiveInterval> = scan_ivs
+            .iter()
+            .copied()
+            .filter(|iv| {
+                param_restricted.contains(&iv.value_id)
+                    && !assignments.contains_key(&iv.value_id)
+                    && !call_spanning.contains(&iv.value_id)
+                    && !riscv_entry_guard.contains(&iv.value_id)
+                    && !pool.iter().any(|&r| {
+                        arg_reg_hazard(&later_arg_values, iv.value_id, r, &config.call_arg_regs)
+                    })
+            })
+            .collect();
+        if config.ra_config.debug_ra_intervals {
+            let cands: Vec<u32> = intervals.iter().map(|iv| iv.value_id).collect();
+            eprintln!(
+                "[RA-P2P] fn={} pool={:?} candidates={:?}",
+                func.name,
+                pool.iter().map(|r| r.0).collect::<Vec<_>>(),
+                cands
+            );
+        }
+        // A parameter whose argument register is a pool register stays
+        // there when no earlier home occupies it during the parameter's
+        // range (seed spans are half-open, see the Wave 1 note): its
+        // ParamRef then emits at most the in-place extension of a narrow
+        // argument (AArch64 `canonical_gp_param_move`), which the peephole
+        // drops wherever the upper bits are unobservable.
+        let mut intervals = intervals;
+        if !config.param_arrival_regs.is_empty() {
+            intervals.retain(|iv| {
+                let Some(&(_, reg)) = config.param_arrival_regs.iter().find(|(vid, _)| {
+                    *vid == iv.value_id || coalesce_member_of.get(vid) == Some(&iv.value_id)
+                }) else {
+                    return true;
+                };
+                if arg_reg_hazard(&later_arg_values, iv.value_id, reg, &config.call_arg_regs) {
+                    return true;
+                }
+                let (start, end) = allocation_owner_bounds(iv.value_id, &merged_of, &iv_map)
+                    .unwrap_or((iv.start, iv.end));
+                let free = !assignments.iter().any(|(vid, r)| {
+                    *r == reg
+                        && allocation_owner_bounds(*vid, &merged_of, &iv_map)
+                            .is_some_and(|(s, e)| s <= end && start <= e)
+                });
+                if free {
+                    assignments.insert(iv.value_id, reg);
+                    caller_used_regs_set.insert(reg.0);
+                }
+                !free
+            });
+            if config.ra_config.debug_ra_intervals {
+                let homes: Vec<(u32, PhysReg)> = config
+                    .param_arrival_regs
+                    .iter()
+                    .filter_map(|(vid, _)| {
+                        let leader = coalesce_member_of.get(vid).copied().unwrap_or(*vid);
+                        assignments.get(&leader).map(|r| (leader, *r))
+                    })
+                    .collect();
+                eprintln!("[RA-P2P] fn={} arrival homes={:?}", func.name, homes);
+            }
+        }
+        if !intervals.is_empty() {
+            let mut seeded: FxHashMap<PhysReg, Vec<(u32, u32)>> = FxHashMap::default();
+            for (vid, reg) in &assignments {
+                if !pool.contains(reg) {
+                    continue;
+                }
+                if let Some((start, end)) = allocation_owner_bounds(*vid, &merged_of, &iv_map) {
+                    seeded
+                        .entry(*reg)
+                        .or_default()
+                        .push((start, end.saturating_add(1)));
+                }
+            }
+            let ranges = build_gpr_ranges(&intervals);
+            let mut alloc =
+                LinearScanAllocator::new_with_config(ranges, pool.clone(), &config.ra_config);
+            alloc.run_with_seed(&seeded);
+            if config.ra_config.debug_ra_intervals {
+                eprintln!("[RA-P2P] fn={} homes={:?}", func.name, alloc.assignments);
+            }
+            for (vid, reg) in alloc.assignments {
+                assignments.insert(vid, reg);
+                caller_used_regs_set.insert(reg.0);
             }
         }
     }
@@ -16688,6 +16833,8 @@ mod phi_coalesce_tests {
             indirect_target_regs: vec![PhysReg(11)],
             allow_inline_asm_regalloc: false,
             leaf_caller_saved_homes: false,
+            param_volatile_pool: Vec::new(),
+            param_arrival_regs: Vec::new(),
             xmm_regs: Vec::new(),
             never_materialized: FxHashSet::default(),
             folded_index_uses: folded,
@@ -16799,6 +16946,8 @@ mod phi_coalesce_tests {
             indirect_target_regs: vec![PhysReg(11)],
             allow_inline_asm_regalloc: false,
             leaf_caller_saved_homes: false,
+            param_volatile_pool: Vec::new(),
+            param_arrival_regs: Vec::new(),
             xmm_regs: Vec::new(),
             never_materialized: FxHashSet::default(),
             folded_index_uses: FxHashMap::default(),
@@ -17703,6 +17852,8 @@ mod allocation_kernel_tests {
             indirect_target_regs: vec![],
             allow_inline_asm_regalloc: false,
             leaf_caller_saved_homes: false,
+            param_volatile_pool: Vec::new(),
+            param_arrival_regs: Vec::new(),
             xmm_regs: Vec::new(),
             never_materialized: FxHashSet::default(),
             folded_index_uses: FxHashMap::default(),
@@ -20456,6 +20607,8 @@ mod call_sequence_policy_tests {
             indirect_target_regs: vec![],
             allow_inline_asm_regalloc: false,
             leaf_caller_saved_homes: false,
+            param_volatile_pool: Vec::new(),
+            param_arrival_regs: Vec::new(),
             xmm_regs: Vec::new(),
             never_materialized: FxHashSet::default(),
             folded_index_uses: FxHashMap::default(),
@@ -20635,6 +20788,8 @@ mod fold_defer_tests {
             indirect_target_regs: vec![],
             allow_inline_asm_regalloc: false,
             leaf_caller_saved_homes: false,
+            param_volatile_pool: Vec::new(),
+            param_arrival_regs: Vec::new(),
             xmm_regs: Vec::new(),
             never_materialized: FxHashSet::default(),
             folded_index_uses: FxHashMap::default(),
