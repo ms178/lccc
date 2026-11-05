@@ -33,6 +33,7 @@ FIXTURES = (
     "overaligned_aggregate_arg_cross", "indirect_variadic_call_cross",
     "callee_saved_return_paths_cross", "entry_copy_abi_reads_cross",
     "asm_scalar_operand_classes_cross", "alias_copy_after_join_cross",
+    "predicate_inverted_signed_cmp_cross",
 )
 ALL_LEVELS = ("-O0", "-O1", "-O2", "-Os")
 LEVELS = {
@@ -66,6 +67,9 @@ LEVELS = {
     # AArch64 -O2/-Os: an address-alias rename carried `mov x8, x13` past a
     # join that other paths reach with x8 holding another pointer.
     "alias_copy_after_join_cross": ALL_LEVELS,
+    # RISC-V -O1+: `x < 0 ? 0u : 1u` materialized as an unsigned-typed signed
+    # compare: the operands were zero-extended, so negative x answered 1.
+    "predicate_inverted_signed_cmp_cross": ALL_LEVELS,
 }
 # Two-unit psABI fixtures under interop/: `<name>_callee.c` and
 # `<name>_caller.c`, linked LCCC-with-LCCC and LCCC-with-Clang in both
