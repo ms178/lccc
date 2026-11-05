@@ -959,6 +959,13 @@ gate "c23-compatibility-inventory" fast \
     python3 tests/regression/check_c23_inventory.py \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" \
         --json target/c23-inventory.json --markdown target/c23-inventory.md
+# The dialect boundary's diagnostics: which revision rejects what, with which
+# message and severity, and the dialect identity an object carries for a
+# debugger.
+gate "c17-c23-diagnostics" fast \
+    python3 tests/regression/check_c_std_diagnostics.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" \
+        --json target/c-std-diagnostics.json --markdown target/c-std-diagnostics.md
 # Digraph spelling is observable in macro stringification; this also exercises
 # directives, token boundaries, maximal munch and native/i686 execution.
 gate "c-digraphs" fast \

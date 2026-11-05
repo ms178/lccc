@@ -272,13 +272,22 @@ impl Lexer {
     /// operand's signedness rule is the preprocessor's own). Diagnostics are
     /// dropped: no character constant in a directive reaches the compiler
     /// proper, and the directive's own evaluation does not report them.
-    pub fn character_constant(text: &str, wide_unit16: bool) -> Option<TokenKind> {
+    ///
+    /// `dialect` decides whether an encoding prefix is part of the constant
+    /// (`u8'x'` is one constant in C23 and an identifier plus a separate narrow
+    /// constant before it), so the evaluator sees the same tokens the compiler
+    /// proper would in that dialect.
+    pub fn character_constant(
+        text: &str,
+        wide_unit16: bool,
+        dialect: crate::common::dialect::Dialect,
+    ) -> Option<TokenKind> {
         let mut lexer = Self {
             input: text.as_bytes().to_vec(),
             pos: 0,
             file_id: 0,
-            gnu_extensions: true,
-            c23: false,
+            gnu_extensions: dialect.gnu,
+            c23: dialect.c23,
             at_line_start: false,
             wide_unit16,
             ident_pool: std::collections::HashMap::new(),
@@ -2516,7 +2525,19 @@ impl Lexer {
                 let prefix = &self.input[start..self.pos];
                 let is_wide_prefix = match text_len {
                     1 => prefix[0] == b'L' || prefix[0] == b'u' || prefix[0] == b'U',
-                    2 => prefix == b"u8",
+                    // `u8"..."` is a C11 string prefix, but `u8'x'` is a C23
+                    // character constant (6.4.4.4) -- see
+                    // `Dialect::u8_char_literal`, which also records how gcc 16.2
+                    // and clang 23 report the pre-C23 spelling.
+                    2 => {
+                        prefix == b"u8"
+                            && (next == b'"'
+                                || crate::common::dialect::Dialect::new(
+                                    self.c23,
+                                    self.gnu_extensions,
+                                )
+                                .u8_char_literal())
+                    }
                     _ => false,
                 };
                 if is_wide_prefix {
@@ -3192,10 +3213,42 @@ mod escape_tests {
         }
     }
 
+    /// A lexer for the C23 dialect.
+    ///
+    /// This module pins the C23 reading of prefixed constants -- `u8'x'` is a
+    /// character constant there and an identifier followed by a narrow constant
+    /// before it (`Dialect::u8_char_literal`) -- so the literals under test are
+    /// lexed the way a `-std=c23` build lexes them. `Lexer::new` starts in the
+    /// non-C23 dialect because most callers of the scanner have already chosen
+    /// one from the driver's flags.
+    fn c23_lexer(source: &str) -> Lexer {
+        let mut lexer = Lexer::new(source, 0);
+        lexer.set_c23(true);
+        lexer
+    }
+
     fn narrow_char(source: &str) -> TokenKind {
         let (kind, messages) = narrow_char_with_diagnostics(source);
         assert!(messages.is_empty(), "{source}: {messages:?}");
         kind
+    }
+
+    /// `narrow_char` for a literal that needs the C23 dialect (`u8'x'`).
+    fn c23_char(source: &str) -> TokenKind {
+        let (kind, messages) = c23_char_with_diagnostics(source);
+        assert!(messages.is_empty(), "{source}: {messages:?}");
+        kind
+    }
+
+    fn c23_char_with_diagnostics(source: &str) -> (TokenKind, Vec<String>) {
+        let mut lexer = c23_lexer(source);
+        let tokens = lexer.tokenize();
+        let messages = lexer
+            .diagnostics
+            .iter()
+            .map(|diag| diag.message.clone())
+            .collect();
+        (tokens[0].kind.clone(), messages)
     }
 
     /// The token plus every diagnostic, for the literals GCC *does* warn about
@@ -3570,9 +3623,10 @@ mod escape_tests {
         );
     }
 
-    /// Every diagnostic message of a wide character constant, in order.
+    /// Diagnostics for a prefixed constant, lexed in C23 so that `u8'x'` is one
+    /// character constant rather than an identifier and a narrow constant.
     fn narrow_wide_messages(source: &str) -> Vec<String> {
-        let mut lexer = Lexer::new(source, 0);
+        let mut lexer = c23_lexer(source);
         lexer.tokenize();
         lexer
             .diagnostics
@@ -3642,7 +3696,7 @@ mod escape_tests {
     #[test]
     fn utf8_constants_reject_characters_that_need_two_code_units() {
         // `u8'\u00e9'` is an error; the byte escape `u8'\xe9'` is not.
-        let mut lexer = Lexer::new(r"u8'\u00e9'", 0);
+        let mut lexer = c23_lexer(r"u8'\u00e9'");
         let tokens = lexer.tokenize();
         assert!(matches!(
             tokens[0].kind,
@@ -3658,7 +3712,7 @@ mod escape_tests {
         );
         // The byte escape stays a byte: no diagnostic at all.
         assert!(matches!(
-            narrow_char("u8'\\xe9'"),
+            c23_char("u8'\\xe9'"),
             TokenKind::UnicodeCharLiteral(0xE9, UnicodeCharKind::Utf8)
         ));
     }
@@ -3693,7 +3747,7 @@ mod escape_tests {
             );
         }
         // `u8` refuses the literal outright.
-        let mut lexer = Lexer::new("u8'ab'", 0);
+        let mut lexer = c23_lexer("u8'ab'");
         lexer.tokenize();
         assert_eq!(
             lexer.diagnostics[0].message,
@@ -3720,7 +3774,7 @@ mod escape_tests {
             (r"u'\400'", None),
         ];
         for (source, expected) in cases {
-            let mut lexer = Lexer::new(source, 0);
+            let mut lexer = c23_lexer(source);
             lexer.tokenize();
             let warnings: Vec<_> = lexer
                 .diagnostics

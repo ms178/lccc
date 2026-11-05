@@ -198,8 +198,10 @@ pub struct Preprocessor {
 impl Preprocessor {
     pub fn new() -> Self {
         // A fresh preprocessor starts in the GCC 16.2 default dialect
-        // (gnu23); an explicit older `-std=` switches it via `set_c23`.
+        // (gnu23); an explicit older `-std=` switches both halves of it via
+        // `set_c23` / `set_gnu_extensions`.
         super::utils::set_c23_dialect(true);
+        super::utils::set_gnu_dialect(true);
         let mut pp = Self {
             macros: MacroTable::new(),
             conditionals: ConditionalStack::new(),
@@ -1080,6 +1082,13 @@ impl Preprocessor {
         super::utils::set_c23_dialect(c23);
     }
 
+    /// Select GNU extensions for preprocessing: `#elifdef`/`#elifndef` are
+    /// directives in a GNU dialect and in C23, and an error before C23, which is
+    /// what GCC 16.2 does in `-std=c17`.
+    pub fn set_gnu_extensions(&mut self, gnu: bool) {
+        super::utils::set_gnu_dialect(gnu);
+    }
+
     /// Set the filename for __FILE__ and __BASE_FILE__ macros and set as the base include directory.
     pub fn set_filename(&mut self, filename: &str) {
         self.filename = filename.to_string();
@@ -1361,6 +1370,19 @@ impl Preprocessor {
                         self.handle_pragma(content.trim(), line, 0);
                     }
                 }
+                super::macro_defs::ExpansionEffect::Arity {
+                    file,
+                    line,
+                    message,
+                } => {
+                    self.errors.push(PreprocessorDiagnostic {
+                        kind: crate::common::error::WarningKind::Cpp,
+                        file,
+                        line,
+                        col: 1,
+                        message,
+                    });
+                }
                 super::macro_defs::ExpansionEffect::DateTime { name, file, line } => {
                     self.push_warning(PreprocessorDiagnostic {
                         kind: crate::common::error::WarningKind::DateTime,
@@ -1408,9 +1430,36 @@ impl Preprocessor {
                 self.handle_elif(rest, line_num);
                 return None;
             }
-            // C23 6.10.2; GCC accepts both in every dialect.
+            // C23 6.10.2.  In a strict pre-C23 dialect GCC has no such
+            // directive, and what it does with the spelling is exactly the
+            // treatment of any *unknown* directive: in a group it is compiling
+            // it reports "invalid preprocessing directive #elifdef", and in a
+            // group it is skipping it says nothing and does not re-open the
+            // conditional.  Both halves matter -- a compiler that took the
+            // `#elifdef` branch in `-std=c17` would compile a different branch
+            // than GCC does for the same source, and one that errored while
+            // skipping would reject a translation unit GCC accepts.  So the
+            // spelling is a real directive in `gnu*` and in C23, and an unknown
+            // directive before C23.
             "elifdef" | "elifndef" => {
-                self.handle_elifdef(rest, keyword == "elifndef");
+                if crate::common::dialect::Dialect::new(
+                    super::utils::c23_dialect(),
+                    super::utils::gnu_dialect(),
+                )
+                .pp_elifdef()
+                {
+                    self.handle_elifdef(rest, keyword == "elifndef");
+                    return None;
+                }
+                if self.conditionals.is_active() {
+                    self.errors.push(PreprocessorDiagnostic {
+                        kind: crate::common::error::WarningKind::Cpp,
+                        file: self.current_file(),
+                        line: line_num.max(1),
+                        col: 1,
+                        message: format!("invalid preprocessing directive #{keyword}"),
+                    });
+                }
                 return None;
             }
             "else" => {

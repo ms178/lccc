@@ -988,6 +988,12 @@ jobs:
         --lccc target/fastbuild/lccc --gcc gcc-16 \
         --json "$RUNNER_TEMP/c23-inventory.json" \
         --markdown "$RUNNER_TEMP/c23-inventory.md"
+        # Diagnostic text and severity at the C17/C23 boundary, plus the
+        # DW_AT_language/language_version each dialect must put in an object.
+        run_gate c_std_diagnostics python3 tests/regression/check_c_std_diagnostics.py \
+        --lccc target/fastbuild/lccc --gcc gcc-16 \
+        --json "$RUNNER_TEMP/c-std-diagnostics.json" \
+        --markdown "$RUNNER_TEMP/c-std-diagnostics.md"
         run_gate warning_compat python3 tests/regression/check_warning_compat.py \
         --lccc target/fastbuild/lccc --gcc gcc-16
         run_gate warning_precedence python3 tests/regression/check_warning_precedence.py \

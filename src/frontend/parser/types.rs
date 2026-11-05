@@ -49,6 +49,9 @@ impl Parser {
     /// typeof expressions, and _Complex types.
     pub(super) fn parse_type_specifier(&mut self) -> Option<TypeSpecifier> {
         self.skip_gcc_extensions();
+        // Where this specifier list starts, for the implicit-int diagnostic
+        // below: the declaration it belongs to is what needs the position.
+        let specifier_start = self.peek_span();
 
         let mut flags = TypeSpecFlags::default();
         let mut mode_kind: Option<ModeKind> = None;
@@ -457,6 +460,19 @@ impl Parser {
                 return Some(TypeSpecifier::AutoType);
             }
             if any_storage_class {
+                // A declaration that names a storage class and no type is the
+                // C89 "implicit int" shape (`static x = 5;`, `register y;`,
+                // and `auto x = 3;` before C23 gave that spelling a meaning of
+                // its own).  Whether the dialect still allows it is the
+                // diagnostic engine's decision -- `-Wimplicit-int` is an error
+                // from C99 on and a warning under `-std=c89`, which is exactly
+                // what gcc 16.2 and clang 23 do -- so the parser states the
+                // fact and lets that policy apply.
+                self.diagnostics.warning_with_kind(
+                    "type defaults to 'int'",
+                    specifier_start,
+                    crate::common::error::WarningKind::ImplicitInt,
+                );
                 return Some(TypeSpecifier::Int);
             }
             return None;

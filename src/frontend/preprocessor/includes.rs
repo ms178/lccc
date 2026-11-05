@@ -715,14 +715,7 @@ impl Preprocessor {
                     // `va_start(v,l)` unconditionally and GCC 12's stddef.h predates
                     // C23 `nullptr_t` and `unreachable()`).
                     if include_path == "stdarg.h" {
-                        self.macros.define(MacroDef {
-                            name: "va_start".to_string(),
-                            is_function_like: true,
-                            params: vec!["ap".to_string()],
-                            is_variadic: true,
-                            has_named_variadic: false,
-                            body: "__builtin_va_start(ap)".to_string(),
-                        });
+                        self.define_va_start();
                         if super::utils::c23_dialect()
                             && !self.macros.is_defined("__STDC_VERSION_STDARG_H__")
                         {
@@ -1626,6 +1619,42 @@ impl Preprocessor {
         None
     }
 
+    /// Define `va_start` the way the dialect spells it.
+    ///
+    /// C23 (N2975) made the second parameter optional, and a variadic function
+    /// may now have no named parameter at all (`void f(...)`), so `va_start(ap)`
+    /// has to work there.  Up to C17 the macro has exactly two parameters and
+    /// GCC's `<stdarg.h>` rejects the one-argument form in `gnu17` as well as
+    /// `c17` ("macro \"va_start\" requires 2 arguments, but only 1 given"), so a
+    /// one-argument call in a pre-C23 dialect is a portability bug that this
+    /// compiler must report rather than quietly accept.
+    ///
+    /// The second argument is not evaluated in any dialect and
+    /// `__builtin_va_start`'s lowering reads only `args.first()`, so the two
+    /// forms differ in what they accept, never in what they generate.
+    fn define_va_start(&mut self) {
+        let one_argument = crate::common::dialect::Dialect::new(
+            super::utils::c23_dialect(),
+            super::utils::gnu_dialect(),
+        )
+        .va_start_one_argument();
+        let (params, is_variadic) = if one_argument {
+            (vec!["ap".to_string()], true)
+        } else {
+            (vec!["ap".to_string(), "last".to_string()], false)
+        };
+        self.macros.define(MacroDef {
+            name: "va_start".to_string(),
+            is_function_like: true,
+            params,
+            is_variadic,
+            has_named_variadic: false,
+            // `last` is intentionally unread: the ABI derives the argument area
+            // from the named parameters, and `__builtin_va_start` ignores it.
+            body: "__builtin_va_start(ap)".to_string(),
+        });
+    }
+
     /// Inject compiler-builtin macros for well-known standard headers.
     /// These are always injected regardless of whether the real header is found,
     /// because they expand to compiler builtins (`__builtin_*`) that only our
@@ -1660,21 +1689,7 @@ impl Preprocessor {
                 // typedef text via pending_injections would break if stdarg.h is included
                 // from within a nested header, since the injected text gets emitted at
                 // the include boundary -- potentially in the middle of an initializer.
-                // C23 (N2975) made the second parameter optional, and a
-                // variadic function may now have NO named parameter at all
-                // (`void f(...)`), so `va_start(ap)` must work. The second
-                // argument is not evaluated in any C dialect, and
-                // `__builtin_va_start`'s lowering reads only `args.first()`,
-                // so one variadic macro serves every dialect: `va_start(ap)`
-                // and `va_start(ap, last)` both lower identically.
-                self.macros.define(MacroDef {
-                    name: "va_start".to_string(),
-                    is_function_like: true,
-                    params: vec!["ap".to_string()],
-                    is_variadic: true,
-                    has_named_variadic: false,
-                    body: "__builtin_va_start(ap)".to_string(),
-                });
+                self.define_va_start();
                 self.macros.define(MacroDef {
                     name: "va_end".to_string(),
                     is_function_like: true,

@@ -3923,6 +3923,26 @@ mod tests {
         assert_eq!(DwarfConfig::for_c(u8::MAX, None).version, DWARF_MAX_VERSION);
     }
 
+    /// The attribute *numbers* are the contract with a debugger, so they are
+    /// pinned to the ones GCC 16.2 writes.
+    ///
+    /// Measured on GCC 16.2.0 for `-std=c17 -g -gdwarf-5`: the compile unit's
+    /// abbreviation table declares `DW_AT_language` 0x13, then 0x90 and 0x91
+    /// for the name/version pair -- DWARF 6's numbers, which binutils calls
+    /// `Unknown AT value` and GDB decodes.  Asserting the constants against
+    /// themselves would pass with any number, so the numbers are spelled out.
+    #[test]
+    fn dialect_attribute_numbers_match_gcc() {
+        assert_eq!(DW_AT_LANGUAGE, 0x13);
+        assert_eq!(DW_AT_LANGUAGE_NAME, 0x90);
+        assert_eq!(DW_AT_LANGUAGE_VERSION, 0x91);
+        assert_eq!(DW_AT_PRODUCER, 0x25);
+        assert_eq!(DW_LANG_C89, 0x0001);
+        assert_eq!(DW_LANG_C99, 0x000c);
+        assert_eq!(DW_LANG_C11, 0x001d);
+        assert_eq!(DW_LNAME_C, 0x0003);
+    }
+
     /// A version-5 line prologue names its directory and file table through
     /// `DW_LNCT_*` entry formats, and every path is one interned `.debug_str`
     /// entry no matter how many rows or files repeat it.

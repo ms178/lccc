@@ -30,11 +30,30 @@ from pathlib import Path
 from typing import Iterable
 
 ROOT = Path(__file__).resolve().parents[2]
-INVENTORY_DATE = "2026-10-27"
+INVENTORY_DATE = "2026-11-04"
 MODES: dict[str, tuple[str, ...]] = {
     "c23": ("-std=c23",),
+    "gnu23": ("-std=gnu23",),
     "c17": ("-std=c17",),
+    "gnu17": ("-std=gnu17",),
     "default": (),
+}
+
+# The strict dialect a GNU one extends.  A probe that declares no expectation
+# for `gnu17` is expected to behave as it does in `c17`: the GNU dialects add
+# extensions, they do not change what the standard dialect rejects unless the
+# probe says so.
+STRICT_BASE = {"gnu17": "c17", "gnu23": "c23"}
+
+# Probes whose LCCC verdict differs from GCC's on purpose, with the reason.  A
+# difference that is not listed here fails the gate; the list is the only place
+# a known gap may live, and every entry is printed on every run.
+KNOWN_DEVIATIONS: dict[str, str] = {
+    "bitint-17": (
+        "C23 `_BitInt(N)` needs arbitrary precision through conversions, layout, "
+        "ABI classification and debug info; the fixed-width type model cannot "
+        "carry it, so LCCC rejects it in every mode (backlog: the `_BitInt` item)"
+    ),
 }
 
 
@@ -45,7 +64,7 @@ class Probe:
     description: str
     source: str
     expected: dict[str, str] = field(default_factory=lambda: {"c23": "accept"})
-    modes: tuple[str, ...] = ("c23", "c17")
+    modes: tuple[str, ...] = ("c23", "gnu23", "c17", "gnu17")
     resources: dict[str, bytes] = field(default_factory=dict)
 
 
@@ -220,6 +239,9 @@ PROBES: tuple[Probe, ...] = (
         #error elifdef failed
         #endif
         """,
+        # GCC enables the directive as an extension in its GNU dialects and
+        # errors on it in every strict dialect before C23.
+        expected={"c23": "accept", "gnu23": "accept", "c17": "reject", "gnu17": "accept"},
     ),
     Probe(
         "elifndef",
@@ -233,6 +255,7 @@ PROBES: tuple[Probe, ...] = (
         #error elifndef failed
         #endif
         """,
+        expected={"c23": "accept", "gnu23": "accept", "c17": "reject", "gnu17": "accept"},
     ),
     Probe(
         "embed-bytes",
@@ -320,7 +343,305 @@ PROBES: tuple[Probe, ...] = (
         int caller(void) { return f(); }
         """,
     ),
+    # --- the C17 side of the same boundary ---------------------------------
+    # C23 made `static_assert`, `alignof`, `alignas` and the `u8` character
+    # constant into features of the *language*.  In C17 the first three are
+    # ordinary identifiers that <assert.h>/<stdalign.h> turn into macros, and
+    # `u8` is just a name, so a C17 compiler must both reject the C23 spelling
+    # and keep accepting the identifiers.  gcc 16.2 and clang 23 agree on every
+    # one of these, in `gnu17` as well as `c17`.
+    Probe(
+        "implicit-int-storage-class",
+        "dialect boundary",
+        "a declaration with a storage class and no type is implicit int (C89 only)",
+        """
+        static counter = 5;
+        int f(void) { register local = 1; return local + counter; }
+        """,
+        expected={"c23": "reject", "c17": "reject"},
+    ),
+    Probe(
+        "implicit-int-auto-c17",
+        "dialect boundary",
+        "`auto x = 3;` is C23 inference, and implicit int before it",
+        """
+        int f(void) { auto count = 42; return count; }
+        """,
+        expected={"c23": "accept", "c17": "reject"},
+    ),
+    Probe(
+        "static-assert-identifier-c17",
+        "dialect boundary",
+        "`static_assert` is an ordinary identifier outside C23",
+        """
+        void static_assert(void);
+        int f(void) { static_assert(); return 0; }
+        """,
+        expected={"c23": "reject", "c17": "accept"},
+    ),
+    Probe(
+        "alignof-identifier-c17",
+        "dialect boundary",
+        "`alignof` is an ordinary identifier outside C23",
+        """
+        int alignof = 3;
+        int f(void) { return alignof; }
+        """,
+        expected={"c23": "reject", "c17": "accept"},
+    ),
+    Probe(
+        "alignas-identifier-c17",
+        "dialect boundary",
+        "`alignas` is an ordinary identifier outside C23",
+        """
+        int alignas = 4;
+        int f(void) { return alignas; }
+        """,
+        expected={"c23": "reject", "c17": "accept"},
+    ),
+    Probe(
+        "u8-identifier",
+        "dialect boundary",
+        "`u8` stays an ordinary identifier in every dialect: it is only a prefix "
+        "when a string or character constant follows",
+        """
+        int u8 = 5;
+        int f(void) { return u8; }
+        """,
+        expected={"c23": "accept", "c17": "accept"},
+    ),
+    Probe(
+        "u8-char-literal",
+        "character constants",
+        "`u8'x'` is a C23 character constant, not an identifier before it",
+        """
+        int f(void) { return u8'a'; }
+        """,
+        expected={"c23": "accept", "c17": "reject"},
+    ),
+    Probe(
+        "stdc-version-c17",
+        "dialect control",
+        "the C17 dialects define __STDC_VERSION__ 201710L and nothing newer",
+        """
+        #if !defined(__STDC_VERSION__) || __STDC_VERSION__ != 201710L
+        #error not C17
+        #endif
+        int f(void) { return 0; }
+        """,
+        expected={"c23": "reject", "c17": "accept"},
+    ),
+    Probe(
+        "stdc-version-c23",
+        "dialect control",
+        "the C23 dialects define __STDC_VERSION__ 202311L",
+        """
+        #if !defined(__STDC_VERSION__) || __STDC_VERSION__ != 202311L
+        #error not C23
+        #endif
+        int f(void) { return 0; }
+        """,
+        expected={"c23": "accept", "c17": "reject"},
+    ),
+    Probe(
+        "strict-ansi-in-iso-modes",
+        "dialect control",
+        "`-std=c17`/`-std=c23` define __STRICT_ANSI__, and a GNU dialect does not",
+        """
+        #ifdef __STRICT_ANSI__
+        int strict;
+        #else
+        #error this dialect is not strict
+        #endif
+        int f(void) { return 0; }
+        """,
+        expected={"c23": "accept", "c17": "accept", "gnu23": "reject", "gnu17": "reject"},
+    ),
+    Probe(
+        "gnu-dialect-rejects-strict-control",
+        "dialect control",
+        "`-std=gnu17`/`-std=gnu23` leave __STRICT_ANSI__ undefined",
+        """
+        #ifdef __STRICT_ANSI__
+        #error this dialect is strict
+        #endif
+        int f(void) { return 0; }
+        """,
+        expected={"c23": "reject", "c17": "reject", "gnu23": "accept", "gnu17": "accept"},
+    ),
+    Probe(
+        "typeof-unqual-needs-c23",
+        "dialect boundary",
+        "bare `typeof_unqual` is C23 only; `__typeof_unqual__` is reserved everywhere",
+        """
+        int f(void) {
+            const int source = 3;
+            __typeof_unqual__(source) reserved = source;
+            return reserved;
+        }
+        """,
+        expected={"c23": "accept", "c17": "accept"},
+    ),
+    Probe(
+        "typeof-unqual-bare-in-gnu17",
+        "dialect boundary",
+        "bare `typeof_unqual` is not a GNU extension: gcc 16.2 rejects it in gnu17",
+        """
+        int f(void) {
+            const int source = 3;
+            typeof_unqual(source) unqualified = source;
+            return unqualified;
+        }
+        """,
+        expected={"c23": "accept", "c17": "reject", "gnu17": "reject", "gnu23": "accept"},
+    ),
+    Probe(
+        "macro-arity-too-few",
+        "preprocessor constraints",
+        "a short invocation is a constraint violation (6.10.3p4)",
+        """
+        #define ARITY_PAIR(a, b) ((a) + (b))
+        int f(void) { return ARITY_PAIR(1); }
+        """,
+        expected={"c23": "reject", "c17": "reject"},
+    ),
+    Probe(
+        "macro-arity-too-many",
+        "preprocessor constraints",
+        "a long invocation is a constraint violation (6.10.3p4)",
+        """
+        #define ARITY_ONE(a) (a)
+        int f(void) { return ARITY_ONE(1, 2); }
+        """,
+        expected={"c23": "reject", "c17": "reject"},
+    ),
+    Probe(
+        "macro-empty-argument-is-one-argument",
+        "preprocessor constraints",
+        "`ONE()` is a valid one-argument invocation of a one-parameter macro",
+        """
+        #define ARITY_ONE(a) 0
+        int f(void) { return ARITY_ONE(); }
+        """,
+        expected={"c23": "accept", "c17": "accept"},
+    ),
+    Probe(
+        "macro-variadic-omitted-tail",
+        "preprocessor constraints",
+        "the variadic part of a macro argument list may be empty",
+        """
+        #define ARITY_TAIL(a, ...) (a)
+        int f(void) { return ARITY_TAIL(1) + ARITY_TAIL(1, 2, 3); }
+        """,
+        expected={"c23": "accept", "c17": "accept"},
+    ),
+    Probe(
+        "elifdef-in-skipped-group",
+        "dialect boundary",
+        "before C23 a skipped #elifdef is an unknown directive: the group keeps skipping, "
+        "so the #else runs instead of the #elifdef branch",
+        """
+        #define SKIPPED_SET 1
+        #if 0
+        #elifdef SKIPPED_SET
+        #error the skipped group must not be re-opened
+        #else
+        int skipped_group_else_branch;
+        #endif
+        int f(void) { return 0; }
+        """,
+        # In a GNU dialect the directive is recognised, so the branch is taken
+        # and the `#error` inside it fires; only the strict pre-C23 dialects
+        # treat the spelling as an unknown directive and keep skipping.
+        expected={"c23": "reject", "gnu23": "reject", "c17": "accept", "gnu17": "reject"},
+    ),
+    # `-std=c17` does not switch gcc's extensions *off*; it only stops the
+    # dialect from *defining* them.  `({...})`, `__attribute__`, `[0]` arrays,
+    # case ranges and the omitted `?:` operand are all accepted in strict ISO
+    # mode by gcc 16.2 and clang 23 until `-pedantic-errors` is added, so a
+    # compiler that rejected them in `-std=c17` would be *less* compatible, not
+    # more.  Pinning that keeps a future "strict mode" cleanup from silently
+    # breaking real-world code.
+    Probe(
+        "gnu-extension-accepted-without-pedantic",
+        "dialect boundary",
+        "GNU extensions stay accepted in strict ISO modes unless -pedantic-errors",
+        """
+        int f(void) { return ({ int t = 2; t + 1; }); }
+        """,
+        expected={"c23": "accept", "c17": "accept", "gnu23": "accept", "gnu17": "accept"},
+    ),
 )
+
+
+# GCC 16.2's measured verdict for every probe under `-std=c17`.  The matrix is
+# measured in C17 as much as in C23 -- a C23 feature that leaks into an older
+# dialect is exactly the defect class this gate exists for -- so the expected
+# C17 outcome is pinned for every probe instead of being merely observed, and a
+# probe that does not state its own C17 expectation inherits this one.  The
+# table is complete by construction: `self_test` refuses to run if a probe is
+# missing, so adding a probe without deciding what GCC does in C17 fails fast.
+C17_VERDICTS: dict[str, str] = {
+    "default-gnu23-version": "reject",
+    "bool-true-false": "reject",
+    "nullptr": "reject",
+    "constexpr-named-constant": "reject",
+    "auto-type-inference": "reject",
+    "typeof-and-typeof-unqual": "reject",
+    "fixed-enum-underlying-type": "accept",
+    "digit-separator": "reject",
+    "empty-initializer": "accept",
+    "static-assert-keyword": "reject",
+    "alignof-keyword": "reject",
+    "standard-maybe-unused-attribute": "accept",
+    "unnamed-variadic-function": "accept",
+    "one-argument-va-start": "reject",
+    "elifdef": "reject",
+    "elifndef": "reject",
+    "embed-bytes": "accept",
+    "has-embed-operator": "accept",
+    "va-opt": "accept",
+    "bitint-17": "reject",
+    "float16-gcc-extension": "accept",
+    "nullptr-arithmetic-rejected": "reject",
+    "empty-list-prototype-arity": "accept",
+    "empty-list-prototype-valid-call": "accept",
+    "implicit-int-storage-class": "reject",
+    "implicit-int-auto-c17": "reject",
+    "static-assert-identifier-c17": "accept",
+    "alignof-identifier-c17": "accept",
+    "alignas-identifier-c17": "accept",
+    "u8-identifier": "accept",
+    "u8-char-literal": "reject",
+    "stdc-version-c17": "accept",
+    "stdc-version-c23": "reject",
+    "strict-ansi-in-iso-modes": "accept",
+    "gnu-dialect-rejects-strict-control": "reject",
+    "gnu-extension-accepted-without-pedantic": "accept",
+    "typeof-unqual-needs-c23": "accept",
+    "typeof-unqual-bare-in-gnu17": "reject",
+    "macro-arity-too-few": "reject",
+    "macro-arity-too-many": "reject",
+    "macro-empty-argument-is-one-argument": "accept",
+    "macro-variadic-omitted-tail": "accept",
+    "elifdef-in-skipped-group": "accept",
+    # `#embed`, `__has_embed`, `__VA_OPT__` and the C23 attribute spelling are
+    # preprocessor additions in GCC and stay enabled in every dialect; only
+    # `-pedantic-errors` turns them into diagnostics.  Measured, not assumed.
+}
+
+
+def expected_verdict(probe: Probe, mode: str) -> str | None:
+    """The GCC verdict a probe must produce in `mode`, or None if unconstrained."""
+    declared = probe.expected.get(mode)
+    if declared:
+        return declared
+    base = STRICT_BASE.get(mode)
+    if base and probe.expected.get(base):
+        return probe.expected[base]
+    if mode in ("c17", "gnu17"):
+        return C17_VERDICTS.get(probe.name)
+    return None
 
 
 def compiler_version(command: list[str]) -> str:
@@ -391,8 +712,8 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, object], int]:
 
     results: list[dict[str, object]] = []
     gcc_expectation_failures: list[str] = []
-    c23_differences: list[str] = []
-    c17_differences: list[str] = []
+    differences: dict[str, list[str]] = {mode: [] for mode in MODES}
+    allowed_differences: list[str] = []
     source_hashes: dict[str, str] = {}
 
     with tempfile.TemporaryDirectory(prefix="lccc-c23-inventory-") as temp:
@@ -420,15 +741,19 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                 flags = MODES[mode]
                 gcc_result = run_compiler(gcc_command, flags, source_path, case_dir)
                 lccc_result = run_compiler(lccc_command, flags, source_path, case_dir)
-                expected = probe.expected.get(mode)
+                expected = expected_verdict(probe, mode)
                 if expected and gcc_result["verdict"] != expected:
                     gcc_expectation_failures.append(
                         f"{probe.name}/{mode}: expected GCC {expected}, got {gcc_result['verdict']}"
                     )
-                if mode == "c23" and gcc_result["verdict"] != lccc_result["verdict"]:
-                    c23_differences.append(probe.name)
-                if mode == "c17" and gcc_result["verdict"] != lccc_result["verdict"]:
-                    c17_differences.append(probe.name)
+                if gcc_result["verdict"] != lccc_result["verdict"]:
+                    label = f"{probe.name}/{mode}"
+                    if probe.name in KNOWN_DEVIATIONS:
+                        allowed_differences.append(
+                            f"{label}: GCC {gcc_result['verdict']}, LCCC {lccc_result['verdict']}"
+                        )
+                    else:
+                        differences[mode].append(label)
                 mode_results[mode] = {
                     "expected": expected,
                     "gcc": gcc_result,
@@ -453,8 +778,11 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, object], int]:
         "probe_count": len(PROBES),
         "results": results,
         "gcc_expectation_failures": gcc_expectation_failures,
-        "lccc_gcc_c23_differences": sorted(set(c23_differences)),
-        "lccc_gcc_c17_differences": sorted(set(c17_differences)),
+        "lccc_gcc_differences": {mode: sorted(set(names)) for mode, names in differences.items()},
+        "known_deviations": {
+            name: reason for name, reason in sorted(KNOWN_DEVIATIONS.items())
+        },
+        "allowed_differences": sorted(allowed_differences),
     }
     return report, len(gcc_expectation_failures)
 
@@ -468,74 +796,69 @@ def short_verdict(result: object) -> str:
     )
 
 
+def _pair(entry: dict[str, object], mode: str) -> str:
+    modes = entry.get("results") or {}
+    cell = modes.get(mode) if isinstance(modes, dict) else None
+    if not cell:
+        return "—"
+    gcc = short_verdict(cell.get("gcc"))  # type: ignore[union-attr]
+    lccc = short_verdict(cell.get("lccc"))  # type: ignore[union-attr]
+    return f"{gcc}/{lccc}"
+
+
 def markdown(report: dict[str, object]) -> str:
     gcc = report["gcc"]
     lccc = report["lccc"]
     assert isinstance(gcc, dict) and isinstance(lccc, dict)
     lines = [
-        "# C23 accept/reject inventory vs GCC 16.2",
+        "# C17/C23 dialect inventory vs GCC 16.2",
         "",
         f"Measured: {report['inventory_date']}<br>",
         f"Oracle: GCC {gcc['version']} (`{gcc['command']}`)<br>",
         f"Compiler: `{lccc['command']}`<br>",
         f"Probes: {report['probe_count']} translation units. This is not an overall C23 coverage percentage.",
         "",
-        "Every probe is compiled with `-fsyntax-only` in the listed mode. C17 outcomes are measured and recorded; a C17 acceptance may be a GNU extension, so it is not inferred from the standard.",
+        "Each probe is compiled with `-fsyntax-only` in every dialect below; a cell reads "
+        "`GCC/LCCC` and a pair that disagrees is a failure unless the probe is a declared "
+        "deviation. Probes that do not name an expectation for a GNU dialect inherit the "
+        "expectation of the strict dialect it extends.",
         "",
-        "| Feature / probe | GCC C23 | LCCC C23 | GCC C17 | LCCC C17 | Expected GCC C23 |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| Feature / probe | C23 | GNU23 | C17 | GNU17 |",
+        "|---|---:|---:|---:|---:|",
     ]
     for entry in report["results"]:  # type: ignore[index]
-        modes = entry["results"]  # type: ignore[index]
-        c23 = modes.get("c23", {})
-        c17 = modes.get("c17", {})
-        default = modes.get("default", {})
-        expected = (c23.get("expected") or "accept") if c23 else "—"
         label = f"**{entry['name']}** — {entry['description']}"  # type: ignore[index]
         lines.append(
-            "| {} | {} | {} | {} | {} | {} |".format(
+            "| {} | {} | {} | {} | {} |".format(
                 label,
-                short_verdict(c23.get("gcc")),
-                short_verdict(c23.get("lccc")),
-                short_verdict(c17.get("gcc")),
-                short_verdict(c17.get("lccc")),
-                expected.upper(),
+                _pair(entry, "c23"),
+                _pair(entry, "gnu23"),
+                _pair(entry, "c17"),
+                _pair(entry, "gnu17"),
             )
         )
-        if default:
-            lines.append(
-                f"| ↳ default-mode control | {short_verdict(default.get('gcc'))} | {short_verdict(default.get('lccc'))} | — | — | ACCEPT |"
-            )
-    diffs = report.get("lccc_gcc_c23_differences", [])
-    lines.extend(
-        [
-            "",
-            "## Measured C23 differences",
-            "",
-        ]
-    )
-    if diffs:
-        lines.extend(f"- `{name}`" for name in diffs)  # type: ignore[union-attr]
+    differences = report.get("lccc_gcc_differences") or {}
+    lines.extend(["", "## Differences from GCC", ""])
+    if isinstance(differences, dict) and any(differences.values()):
+        for mode in MODES:
+            for name in differences.get(mode, []):
+                lines.append(f"- `{name}`")
     else:
-        lines.append("- None in this probe set.")
-    c17_diffs = report.get("lccc_gcc_c17_differences", [])
-    lines.extend(["", "## Measured C17 mode differences", ""])
-    if c17_diffs:
-        lines.extend(f"- `{name}`" for name in c17_diffs)  # type: ignore[union-attr]
-    else:
-        lines.append("- None in this probe set.")
-    failures = report.get("gcc_expectation_failures", [])
+        lines.append("- None: LCCC matches GCC in every probe in every dialect.")
+    allowed = report.get("allowed_differences") or []
+    known = report.get("known_deviations") or {}
+    lines.extend(["", "## Known deviations", ""])
+    if isinstance(known, dict):
+        for name, reason in known.items():
+            lines.append(f"- `{name}` — {reason}")
+    if allowed:
+        lines.extend(["", "Measured known deviations on this host:", ""])
+        lines.extend(f"- `{entry}`" for entry in allowed)  # type: ignore[union-attr]
+    failures = report.get("gcc_expectation_failures") or []
     if failures:
         lines.extend(["", "## GCC expectation failures", ""])
         lines.extend(f"- {failure}" for failure in failures)  # type: ignore[union-attr]
-    lines.extend(
-        [
-            "",
-            "Source hashes, complete diagnostics, and argv are preserved when the same run is requested with `--json`.",
-            "",
-        ]
-    )
-    return "\n".join(lines)
+    return "\n".join(lines) + "\n"
 
 
 def self_test() -> int:
@@ -550,6 +873,34 @@ def self_test() -> int:
     assert any("__STDC_VERSION__" in p.source and "202311L" in p.source for p in PROBES)
     assert any("#embed" in p.source and p.resources for p in PROBES)
     assert any(p.expected.get("c23") == "reject" for p in PROBES)
+    # Every probe must state what GCC is expected to do in at least one strict
+    # dialect, so a silent GCC change cannot slip through as "no expectation",
+    # and every measured mode must resolve to an expectation directly or by
+    # inheriting from the strict dialect it extends.
+    assert all(
+        probe.expected.get("c23") or probe.expected.get("c17") for probe in PROBES
+    ), "every probe needs an expectation for c23 or c17"
+    unresolved = [
+        f"{probe.name}/{mode}"
+        for probe in PROBES
+        for mode in probe.modes
+        if not expected_verdict(probe, mode)
+    ]
+    assert not unresolved, f"modes without an expectation: {unresolved}"
+    assert set(C17_VERDICTS) == set(names), (
+        "C17_VERDICTS must cover exactly the probe set: "
+        f"missing={sorted(set(names) - set(C17_VERDICTS))} "
+        f"stale={sorted(set(C17_VERDICTS) - set(names))}"
+    )
+    # The ledger may only name probes that exist, and every listed probe must be
+    # measured in a mode where GCC and LCCC can differ.
+    assert set(KNOWN_DEVIATIONS) <= set(names), "known deviation names unknown probe"
+    # A deviation without a reason is a silent allow-list entry; require enough
+    # text that the reason explains the gap rather than naming it again.
+    assert all(len(reason) >= 80 for reason in KNOWN_DEVIATIONS.values()), (
+        "every known deviation needs a reason that explains it"
+    )
+    assert set(STRICT_BASE.values()) <= set(MODES)
     print(f"C23 inventory manifest self-test: PASS ({len(PROBES)} probes)")
     return 0
 
@@ -563,7 +914,13 @@ def main() -> int:
     parser.add_argument(
         "--fail-on-diff",
         action="store_true",
-        help="fail if any measured C23 verdict differs between LCCC and GCC",
+        help="accepted for compatibility; differing verdicts fail the gate anyway",
+    )
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help="print the matrix and exit 0 even when LCCC and GCC disagree "
+        "(use only when regenerating docs; CI runs the gate in its default mode)",
     )
     parser.add_argument("--self-test", action="store_true", help="check the probe manifest only")
     args = parser.parse_args()
@@ -585,10 +942,16 @@ def main() -> int:
         args.markdown.parent.mkdir(parents=True, exist_ok=True)
         args.markdown.write_text(rendered, encoding="utf-8")
 
-    diffs = report["lccc_gcc_c23_differences"]
+    diffs = report["lccc_gcc_differences"]
+    unexpected = sum(len(names) for names in diffs.values()) if isinstance(diffs, dict) else 0
     if gcc_failures:
         return 2
-    if args.fail_on_diff and diffs:
+    if unexpected and not args.report_only:
+        print(
+            f"C23 inventory: FAIL: {unexpected} verdict(s) differ from GCC 16.2 "
+            "and are not declared in KNOWN_DEVIATIONS",
+            file=sys.stderr,
+        )
         return 1
     return 0
 

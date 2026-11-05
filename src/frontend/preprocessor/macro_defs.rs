@@ -172,6 +172,16 @@ pub(super) enum ExpansionEffect {
         file: String,
         line: usize,
     },
+    /// A macro invocation whose argument count does not match the definition
+    /// (`C11 6.10.3p4`: "the number of arguments shall agree with the number of
+    /// parameters", a constraint).  Queued like the other effects so the
+    /// pipeline reports it at the invocation's own file and line, with GCC's
+    /// wording and severity.
+    Arity {
+        file: String,
+        line: usize,
+        message: String,
+    },
 }
 
 /// A pragma save preserves builtin ownership, not just a replacement list.
@@ -907,6 +917,11 @@ impl MacroTable {
                                     self.parse_macro_args(bytes, k);
                                 i = trail_end;
                                 let trail_mac_clone = trail_mac.clone();
+                                if source_level
+                                    && Self::arity_mismatch(&trail_mac_clone, trail_args.len())
+                                {
+                                    self.report_macro_arity(&trail_mac_clone, trail_args.len(), k);
+                                }
                                 let trimmed_len = expanded.trim_end().len();
                                 let prefix_len = trimmed_len - trail_ident.len();
                                 expanded.truncate(prefix_len);
@@ -965,6 +980,9 @@ impl MacroTable {
         }
         let (args, starts, end_pos) = self.parse_macro_args(bytes, j);
         let target_mac_clone = target_mac.clone();
+        if source_level && Self::arity_mismatch(&target_mac_clone, args.len()) {
+            self.report_macro_arity(&target_mac_clone, args.len(), j);
+        }
         let (func_expanded, _) = self.expand_function_macro(
             &target_mac_clone,
             &args,
@@ -1438,6 +1456,93 @@ impl MacroTable {
             });
     }
 
+    /// Report an invocation whose argument count cannot match `mac`'s
+    /// parameters, with GCC 16.2's wording.
+    ///
+    /// Before this existed, a short invocation silently substituted an empty
+    /// token sequence for the missing parameter (`TWO(1)` became `((1) + ())`,
+    /// so the error surfaced later as a baffling "expected expression" inside
+    /// what the user wrote as a two-argument call) and a long one silently
+    /// dropped the extra arguments (`ZERO(1, 2)` compiled). Both hid real bugs,
+    /// and the short case is what made a pre-C23 `va_start(ap)` look supported:
+    /// the empty second argument happened to produce the right code.
+    ///
+    /// `()` on a macro that declares parameters supplies one empty argument
+    /// (6.10.3p4 and GCC agree), which is why `ONE()` is a *valid* one-argument
+    /// invocation of `#define ONE(a)` and only shows up as an expression error
+    /// where `a` is used. `parse_macro_args` collapses that to an empty vector,
+    /// so the count is restored here.
+    /// Whether `args_given` cannot match `mac`'s declared parameters.
+    ///
+    /// This is the half of the arity check that runs on every source-level
+    /// invocation, so it is a comparison against the common case -- an exact
+    /// match -- before anything else. `()` on a macro that declares parameters
+    /// supplies one empty argument (6.10.3p4 and GCC agree), which is why
+    /// `ONE()` is a valid one-argument invocation of `#define ONE(a)`; that is
+    /// the only case where the parsed count is not the supplied count.
+    #[inline]
+    fn arity_mismatch(mac: &MacroDef, args_given: usize) -> bool {
+        let declared = mac.params.len();
+        if args_given == declared {
+            return false;
+        }
+        // A named variadic parameter (`x...`) may be omitted entirely; an
+        // anonymous `...` may not consume a required slot.
+        let required = if mac.is_variadic && mac.has_named_variadic {
+            declared.saturating_sub(1)
+        } else {
+            declared
+        };
+        let supplied = if args_given == 0 && declared > 0 {
+            1
+        } else {
+            args_given
+        };
+        supplied < required || (!mac.is_variadic && supplied > declared)
+    }
+
+    /// Report an invocation `arity_mismatch` rejected, with GCC 16.2's wording.
+    ///
+    /// Cold by construction: it allocates the message and resolves the line,
+    /// which is wasted work on every invocation that is well formed.
+    fn report_macro_arity(&self, mac: &MacroDef, args_given: usize, offset: usize) {
+        let declared = mac.params.len();
+        let required = if mac.is_variadic && mac.has_named_variadic {
+            declared.saturating_sub(1)
+        } else {
+            declared
+        };
+        let supplied = if args_given == 0 && declared > 0 {
+            1
+        } else {
+            args_given
+        };
+        let message = if supplied < required {
+            format!(
+                "macro '{}' requires {} argument{}, but only {} given",
+                mac.name,
+                required,
+                if required == 1 { "" } else { "s" },
+                supplied
+            )
+        } else {
+            format!(
+                "macro '{}' passed {} argument{}, but takes just {}",
+                mac.name,
+                supplied,
+                if supplied == 1 { "" } else { "s" },
+                declared
+            )
+        };
+        self.pending_effects
+            .borrow_mut()
+            .push(ExpansionEffect::Arity {
+                file: self.source_filename.trim_matches('"').to_string(),
+                line: self.resolve_line(offset),
+                message,
+            });
+    }
+
     /// Expand a macro invocation (function-like or object-like).
     fn expand_macro_invocation(
         &self,
@@ -1491,6 +1596,9 @@ impl MacroTable {
                 let outermost = !self.in_invocation.replace(true);
                 let _guard = InvocationGuard(&self.in_invocation, outermost);
                 let (args, starts, end_pos) = self.parse_macro_args(bytes, j);
+                if source_level && Self::arity_mismatch(mac, args.len()) {
+                    self.report_macro_arity(mac, args.len(), ident_start);
+                }
                 let mut i = end_pos;
                 let (expanded, body_ended_with_func_ident) = self.expand_function_macro(
                     mac,

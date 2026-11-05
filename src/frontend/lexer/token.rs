@@ -447,6 +447,9 @@ impl TokenKind {
     /// without entering the match statement.
     #[inline]
     pub fn from_keyword(s: &str, gnu_extensions: bool, c23: bool) -> Option<TokenKind> {
+        // Every dialect-sensitive entry below asks the capability layer rather
+        // than testing the two switches itself; see `common::dialect`.
+        let dialect = crate::common::dialect::Dialect::new(c23, gnu_extensions);
         // Fast reject by length: C/GCC keywords have lengths 2-17 or 28.
         let len = s.len();
         if len < 2 || (len > 17 && len != 28) {
@@ -515,17 +518,25 @@ impl TokenKind {
             "__restrict" | "__restrict__" => Some(TokenKind::Restrict),
             "__signed__" => Some(TokenKind::Signed),
             "while" => Some(TokenKind::While),
-            "_Alignas" | "alignas" => Some(TokenKind::Alignas),
-            "_Alignof" | "alignof" => Some(TokenKind::Alignof),
+            // `alignas`/`alignof`/`static_assert` became keywords in C23
+            // (6.4.1).  Before that they are ordinary identifiers that
+            // <stdalign.h> and <assert.h> define as macros over the underscored
+            // spellings; see `Dialect::keyword_alignas` for why the boundary is
+            // the revision and not the GNU switch.
+            "_Alignas" => Some(TokenKind::Alignas),
+            "alignas" if dialect.keyword_alignas() => Some(TokenKind::Alignas),
+            "_Alignof" => Some(TokenKind::Alignof),
+            "alignof" if dialect.keyword_alignof() => Some(TokenKind::Alignof),
             "_Atomic" => Some(TokenKind::Atomic),
             "_Bool" => Some(TokenKind::Bool),
             "_Complex" | "__complex__" | "__complex" => Some(TokenKind::Complex),
             "_Generic" => Some(TokenKind::Generic),
             "_Imaginary" => Some(TokenKind::Imaginary),
             "_Noreturn" | "__noreturn__" => Some(TokenKind::Noreturn),
-            "_Static_assert" | "static_assert" => Some(TokenKind::StaticAssert),
+            "_Static_assert" => Some(TokenKind::StaticAssert),
+            "static_assert" if dialect.keyword_static_assert() => Some(TokenKind::StaticAssert),
             "_Thread_local" | "__thread" => Some(TokenKind::ThreadLocal),
-            "typeof" if gnu_extensions || c23 => Some(TokenKind::Typeof),
+            "typeof" if dialect.keyword_typeof() => Some(TokenKind::Typeof),
             "__typeof__" | "__typeof" => Some(TokenKind::Typeof),
             // C23 typeof_unqual: like typeof but with top-level qualifiers
             // (const/volatile/_Atomic) removed. LCCC's `typeof` already yields
@@ -533,15 +544,15 @@ impl TokenKind {
             // Required by the kernel: arch/x86/include/asm/percpu.h uses
             // TYPEOF_UNQUAL() in every per-CPU accessor, so without it nothing
             // including <asm/current.h> or <asm/preempt.h> parses.
-            "typeof_unqual" if gnu_extensions || c23 => Some(TokenKind::TypeofUnqual),
-            "bool" if c23 => Some(TokenKind::Bool),
-            "true" if c23 => Some(TokenKind::True),
-            "false" if c23 => Some(TokenKind::False),
-            "thread_local" if c23 => Some(TokenKind::ThreadLocal),
-            "constexpr" if c23 => Some(TokenKind::Constexpr),
-            "nullptr" if c23 => Some(TokenKind::Nullptr),
+            "typeof_unqual" if dialect.keyword_typeof_unqual() => Some(TokenKind::TypeofUnqual),
+            "bool" if dialect.keyword_bool() => Some(TokenKind::Bool),
+            "true" if dialect.keyword_bool() => Some(TokenKind::True),
+            "false" if dialect.keyword_bool() => Some(TokenKind::False),
+            "thread_local" if dialect.keyword_c23_objects() => Some(TokenKind::ThreadLocal),
+            "constexpr" if dialect.keyword_c23_objects() => Some(TokenKind::Constexpr),
+            "nullptr" if dialect.keyword_c23_objects() => Some(TokenKind::Nullptr),
             "__typeof_unqual__" | "__typeof_unqual" => Some(TokenKind::TypeofUnqual),
-            "asm" if gnu_extensions => Some(TokenKind::Asm),
+            "asm" if dialect.keyword_asm() => Some(TokenKind::Asm),
             "__asm__" | "__asm" => Some(TokenKind::Asm),
             "__attribute__" | "__attribute" => Some(TokenKind::Attribute),
             "__extension__" => Some(TokenKind::Extension),
