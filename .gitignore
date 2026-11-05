@@ -137,3 +137,7 @@ work/
 /.base_ref
 target-dbg/
 .arena-tmp/
+
+# Cumulative patch snapshots for harness-wipe survival: generated workspace
+# artifacts, deliberately not part of the source tree.
+/artifacts/snapshots/

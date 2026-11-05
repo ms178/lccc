@@ -41,13 +41,12 @@ two days stale. The pin lives in exactly one place:
 | `scripts/ci_install_clang_oracle.sh` | `VERSION=23.1.5` and `SHA256=c3107384835f788768f614db610e87fba7077f125ca950eb02a78bab0a308065` for `LLVM-23.1.5-Linux-X64.tar.zst` |
 
 Everything else either names that version or resolves the oracle through that
-installer. Scope of the delivered patch: **120 files — 118 existing files
-modified plus two new ones** (`scripts/ci_install_gdb_oracle.sh` and this
-document); the exact `+/-` line counts are recorded per snapshot in
-`artifacts/SNAPSHOT_LEDGER.md` (S03: +1624/−353), and a `git diff --stat`
-against the base reports one file fewer because this document is untracked
-until the snapshot commits it. The 118 modifications break down as a
-pin/expectation sweep over 110 files (installer, provisioner,
+installer. Scope of the delivered patch, measured with `git diff --stat`
+against its base: **129 files — 127 modified plus two new ones**
+(`scripts/ci_install_gdb_oracle.sh` and this document), **+2000 / −533**.
+Per-snapshot line counts are recorded alongside the cumulative
+patch snapshots in the workspace.
+The modifications are a pin/expectation sweep over the installer, provisioner,
 publishers, `ci_verify_oracles.sh`, `ci_local.sh`, the three workflows,
 `ci-lane-plan.json`, `tests/regression/lib/clang_oracle.sh`, the gates that
 check `clang -dumpversion`, and their mock fixtures), a second sweep over
@@ -468,52 +467,50 @@ exits 127 (`cargo is not on PATH`). The MSRV removal is therefore verified
 
 ## 7. To-do for the next session (prioritised)
 
-1. **Build lccc** (`fastbuild` preset, `-O1`, `-j2`, swap active) and record a
-   `ci_local.sh --fast` pass, then re-snapshot so the deliverable stops being
-   `ci_gate=UNGATED`.
-2. **Re-derive the two generated Clang artifacts against 23.1.5** and drop
-   their 23.1.4 provenance headers: `tests/regression/sse2_codegen_matrix.json`
-   (SIMD matrix run) and `tests/regression/ext_vector_abi/grid_expectations.txt`
-   (two hosted `ext_vector_type` ABI runs). Until then those two files still
-   document a 23.1.4 measurement, and the ABI gates run against 23.1.5 — a
-   point release should not move an ABI, but the expectation files should say
-   which oracle produced them.
-3. **Make the DWARF gates fail instead of skip** when the pinned gdb is absent
-   (they are the reason gdb is pinned): add a `tests/regression/lib/gdb_oracle.sh`
-   in the shape of `clang_oracle.sh` (`$GDB` → `gdb` on PATH, exact 18.1, no
-   silent substitute) and switch the two real consumers —
-   `check_dwarf_line_tables.py` (both `shutil.which` sites) and
-   `check_incoming_byval_homes.sh` — to it. Keep a
-   `--allow-missing-debugger` escape for hosts that genuinely have none, so the
-   skip stays *explicit* rather than default.
-4. **Run the hosted publishers** (`refresh_toolchain_cache`,
-   `Publish GitHub-only agent toolchain cache`), then retire the
-   `clang-cache-asset`/`clang-agent-payload` exceptions exactly as §1.1 lists.
-5. **Consider a prebuilt gdb in the agent cache** (`harness-cache-7`): it would
-   save a multi-minute source build per sandbox. Recipe: build with
-   `ci_install_gdb_oracle.sh` inside the bookworm container the publisher
-   already uses (needs `libgmp-dev libmpfr-dev libreadline-dev zlib1g-dev`),
-   pack `gdb-18.1-linux-x64.tar.xz`, add it to `CACHE.json`'s tools/priority
-   and to `agent-cache-lock.json`. Deliberately **not** written this session:
-   the publisher needs `gh`+docker+push, so it could not be validated, and an
-   untested 40-line docker build in a hosted publisher is a worse trade than a
-   verified 10-minute local build.
-6. ~~Fix the qemu/kernel staleness~~ — **done in round 2** (§6.1–§6.3).
-   What remains is the *publishing* half: run the agent-cache publisher so
-   `harness-cache-7` actually carries QEMU 11.1.3 and relocs v7.3.1, then
-   delete the `qemu-agent-payload` / `kernel-relocs-agent-payload` assertions
-   (they will fail the moment the lock is updated, which is the intent).
-8. **First Rust build after the MSRV removal** (§6.4): `cargo check --locked`
-   on 1.99.1, plus `clippy` and `rustfmt`, to confirm the floor was not
-   load-bearing for anything the tree still compiles. Nothing in this sandbox
-   has a Rust toolchain, so that is untested here.
-9. **Now that the floor is gone, new language features are fair game** — but
-   each one needs a lane that fails if it regresses. `cargo check --locked` on
-   the pinned toolchain is that lane; do not add features that require a newer
-   compiler than the one `ci_local.sh` pins without moving the pin there.
+1. **Build lccc** — **DONE in the follow-up session.** Rust 1.99.1 was restored
+   from the repository's own Git-blob cache (SHA-256 verified), a 4 GiB swap
+   file was activated, and `cargo build --profile fastbuild --locked` with
+   `RUSTFLAGS=-D warnings` finished in 4m00s with exit 0 and **zero warnings**.
+   `cargo clippy --profile fastbuild --locked -- -D warnings` and
+   `cargo fmt --all -- --check` also exit 0. A real `-O0`/`-O2` compile-and-run
+   smoke test of the built compiler passed. A whole `ci_local.sh --fast` pass is
+   still a hosted action: it needs the pinned GCC 16.2, Clang 23.1.5, valgrind
+   and GDB 18.1 oracles, none of which exist in this sandbox.
+2. **Re-derive the two generated Clang artifacts against 23.1.5** — **debt made
+   explicit and half closed.** `grid_expectations.txt` now records that its
+   failure set was re-validated against 23.1.5 by the two hosted ABI grid lanes
+   on 2026-11-05 (both green); the class description names the live oracle and
+   the historical tracking ids are called out as stable names. The SIMD baseline
+   now carries a machine-readable `provenance.recorded_with` block that names the
+   oracles that actually measured it, and `--update-baseline` regenerates that
+   block instead of dropping it. A genuine re-measurement of the SIMD matrix
+   still needs a host carrying Clang 23.1.5; the file says so instead of
+   pretending. The enforced instruction-count ratchet is host-independent.
+3. **Make the DWARF gates fail instead of skip** — **DONE.** A shared policy
+   resolves `$GDB` or `gdb` on PATH to GNU gdb (GDB) 18.1 exactly, refuses any
+   unpinned substitute, fails closed when the oracle is absent, and offers only
+   an explicit `--allow-missing-debugger` skip (status 3, announced on stderr).
+   An explicitly selected debugger can never be downgraded to that skip. Both
+   consumers use the policy, the hosted/local invocations opt into the skip
+   explicitly, and 28 regression tests cover every branch plus the wiring.
+4. **Run the hosted publishers**, then retire the two superseded Clang payload
+   assertions — **still open**; publishing release assets cannot be done from
+   this sandbox and the assertions are deliberately fail-loud until it happens.
+5. **Prebuilt gdb in the agent cache** — **still open**, unchanged trade-off:
+   an unvalidated publisher change is worse than a verified local build. The new
+   fail-closed gates make this the highest-value remaining item, because a
+   pinned debugger could then be provisioned in hosted lanes too.
+6. ~~Fix the qemu/kernel staleness~~ — **done in round 2** (§6.1–§6.3). The
+   publishing half remains: re-issue `harness-cache-7`, then delete the two
+   superseded-payload assertions (they fail the moment the lock is updated).
 7. **Compiler Explorer lag:** CE's newest Clang is 23.1.0 while the repository
-   pin is 23.1.5. Any "we match Clang" table should record which of the two
-   produced it; `godbolt.py` now says so at the alias table.
+   pin is 23.1.5. Any "we match Clang" table must record which produced it;
+   the alias table already says so.
+8. **First Rust build after the MSRV removal** — **DONE** (item 1). The floor
+   was not load-bearing: build, clippy and rustfmt are clean on 1.99.1.
+9. **New language features are fair game** — advisory, unchanged: any feature
+   needs a lane that fails if it regresses, and must not require a compiler
+   newer than the pin in `ci_local.sh`.
 
 ---
 
@@ -529,3 +526,59 @@ exits 127 (`cargo is not on PATH`). The MSRV removal is therefore verified
   ~10 k files, which is at the harness snapshot cap; it lives in `/var/tmp/lccc`
   and only the patch, ledger and small artifacts are published to `/home/user`
   (`workspace: 8 files, 269 KB` at S01).
+
+* **These are the ORIGINAL session's measurements, not the follow-up host's.**
+  The red-team session ran with 3.8 GiB RAM + a 4 GiB swap file and a
+  disk-backed `/tmp`; `/tmp` being a 992 MiB tmpfs is specific to the earlier
+  harness. Verify the environment instead of inheriting these numbers.
+
+---
+
+## 9. Follow-up red-team audit (2026-11-05)
+
+**Trigger:** hosted CI reported exactly two red checks for the toolchain
+refresh — "Fast local contracts (shard a)" and the aggregate "Test Suite".
+Check-run annotations identified the single root cause: `check_doc_links.py`
+exited 1 on two citations in this document that named files which did not
+exist. "Test Suite" is a downstream aggregate job; it had no independent
+defect. All other ~30 lanes were green, including the Clang 23.1.5 ABI grid,
+the ICX 2026.2 integration and the assembler/linker contracts.
+
+**Fixes, each tied to evidence:**
+
+* Both citations now resolve honestly: the GDB policy library was implemented
+  (item 3), and the stale scope paragraph was replaced with measured
+  `git diff --stat` numbers (129 files, +2000/−533) instead of a claim about
+  120 files and an absent snapshot ledger. `check_doc_links.py` exits 0.
+* The GDB fail-open path was closed with one shared policy used by both shell
+  and Python consumers, plus 28 deterministic regression tests.
+* Generated-artifact provenance is now machine-readable and the SIMD baseline
+  generator preserves it; the ABI expectation header records CI's 23.1.5
+  re-validation. Five provenance guards enforce the wiring.
+* A pre-existing, unrelated test failure was attributed by reproducing it on a
+  pristine `main` worktree with identical binaries: host GCC 12.2 hard-errors
+  on `__has_include` under `-nostdinc` with no search directory, while the
+  pinned GCC 16.2 answers 0. The test now supplies an empty directory only for
+  older GCCs; a negative control proves a leaked include path is still caught.
+
+**Verification in this sandbox** (no compile suites beyond the requested
+fastbuild, no claims about unavailable oracles):
+
+| Check | Result |
+|---|---|
+| `cargo build --profile fastbuild --locked`, warnings denied | exit 0, 4m00s, zero warnings |
+| `cargo clippy --profile fastbuild --locked -- -D warnings` | exit 0 |
+| `cargo fmt --all -- --check` | exit 0 |
+| `unittest discover -s tests/corpus -p 'test_*.py'` | 1236 tests, 0 failures, 0 errors |
+| `check_ci_gate_parity.py` / `test_ci_gate_parity.py` | PASS (542 commands / 84 tests) |
+| `check_ci_lane_plan.py` / `check_ci_shard_partition.py` | PASS |
+| `check_doc_links.py` | PASS |
+| `check_toolchain_cache_freshness.py --offline` | 13/13 live pins CURRENT, exit 0 |
+| `ci_install_gdb_oracle.sh --self-test` | 8/8 cases PASS |
+| lccc `-O0` / `-O2` compile + run smoke | exit 0 both |
+
+**Not claimed:** GCC 16.2, Clang 23.1.5, ICX 2026.2 and GDB 18.1 oracles are
+not installable here (the release-asset CDN and toolchain hosts are outside
+this sandbox's allowlist), so no three-way oracle comparison, no SIMD matrix
+re-derivation and no hosted publish were performed. Those remain the honest
+scope boundary of this audit; hosted CI supplies them.
