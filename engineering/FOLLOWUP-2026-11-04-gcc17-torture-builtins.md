@@ -1003,3 +1003,69 @@ auditing against. The gap is therefore recorded as a MEASURED, OPEN item with
 a reproducing benchmark and a root-cause disassembly, NOT hidden behind an
 averaged number or a claim that lccc beats every C compiler. Beating GCC,
 Clang and ICX on generated-code runtime is a separate optimisation program.
+
+### 9.10 Five-level torture campaign: measured fixes and measured open gaps
+
+PR #1105 was merged on green CI (24 checks pass, 2 skipping, 0 fail). A
+**longer campaign** was then run on the merged tree before it became this
+branch's base: the full 2016-case `compile` corpus at ALL five DEFAULT_FLAGS
+levels `-O0,-O1,-O2,-O3,-Os` on x86_64 (10,080 case-runs) and i686, plus the
+1700-case `execute` corpus on both ABIs. The x86_64 compile leg completed with
+`complete=True`, `fatal=None`, **9962 pass / 37 compile-fail /
+76 reference-compile-skip / 5 unsupported**. Thirty of the 37 failures are the
+six known pre-existing cases (§9.4) repeated at five levels; the campaign
+therefore uncovered **SEVEN NEW failures** that the single-level `-O2` matrix
+could not see. Binary hashes were logged unchanged before and after the leg,
+and the oracle is the pinned GCC 16.2 sha `67ed99639f746b8e…c2`.
+
+| new failure | measured cause | disposition |
+|---|---|---|
+| `pr38789.c` at `-O0` only | Two coupled causes, found by re-testing the FIRST fix instead of trusting it: (1) at `-O0` `run_passes` returns before `resolve_remaining_is_constant`, so a deferred `IsConstant` node survived and the condition was a Value, not a constant; (2) `lower_if_stmt` lowers both arms and the pipeline's immediate-only asm validation walked EVERY block, including the arm a constant condition can never reach. GCC 16.2 and Clang 23.1.4 accept at every level; measured GCC answers at `-O0` are `0` for a local `int n = sizeof(int)`, `1` for a literal, `0` for a parameter, and `1` for the local at `-O1+`. The decisive measurement: lccc `if (0) asm("# DEAD") else asm("# LIVE")` at `-O0 -S` emits ONLY `LIVE`, so the dead arm is real IR that is never emitted. | **FIXED with two changes.** `lower_constant_p` resolves unproven queries to `0` at `-O0` only (semantic parity, not an optimization; optimizing tiers keep the deferral kernel patterns need). The pipeline validator now walks CFG reachability from the entry, pruning `CondBranch` on a constant condition to its single live successor and skipping unreachable blocks. A dynamic condition still validates BOTH arms, so no real dynamic immediate operand can hide. `tests/regression/check_gcc_asm_constraints.sh` pins verdict parity at five levels on two ABIs, which asm arm is emitted, and a literal `if (0)` dead-arm control. |
+| `limits-externdecl.c` at `-O2`, `-O3`, `-Os` (3) | All three hit `HARNESS timeout (timeout=240s)`, `returncode 124`; `-O0`/`-O1` passed. Callgrind on a scaled 10,000-declaration input found TWO superlinear scans: `find_symbol_index_shared` linearly scanned the whole symtab for EVERY relocation (~11% of all instructions including its Option/slice/memcmp work), and `purge_ptr_ranges_in` called `Vec::retain` over a growing relocation list 10,001 times (~19%). | **FIXED.** One prebuilt `FxHashMap` of name-offset to symtab index makes relocation lookup O(1); `ptr_ranges` is now kept sorted by offset so the purge is `partition_point` + `drain`, O(log N + K). Both are proven byte-identical in behaviour by deterministic unit tests that compare against the ORIGINAL linear/reference predicates over 1000 randomized windows and every symbol class. |
+| `pr46534.c` at `-O1`, `-O2`, `-O3` (3) | `returncode -9` (SIGKILL) during a concurrently memory-pressured run. This case is a 20,000,000-character string literal. In isolation the `-O2` compile succeeds (`rc=0`) but took ~45 s while the campaign was competing for the same two cores; scaled inputs measured 0.028/0.040/0.097/0.465 s for 200/2000/20000/200000 characters. Callgrind on 20,000 characters shows repeated `core::str::from_utf8` (14.25%) and assembly-line trimming/comment scanning across the giant data line. | **OPEN, measured.** No quiet-host re-measurement and no safe targeted fix were completed. Changing the `from_utf8(&bytes[i..])` char-advance idiom in the assembler preprocessors without proving every input is valid UTF-8 would be a correctness regression, so it was NOT changed on guesswork. |
+| `20001226-1.c` i686 `-O0` | Observed live at 1.3 GiB RSS and >13 min (the case carries `dg-timeout-factor 4.0`, so 960 s is allowed). Scaled branch counts measured on the i686 binary at `-O0`: 512 branches `6.05 s / 44.8 MiB`, 2048 branches `93.76 s / 136.4 MiB`; the x86_64 binary needed `1.44 s / 47.8 MiB` and `7.66 s / 145.2 MiB` for the same inputs -- roughly 12x slower and clearly superlinear on i686 only. | **OPEN, measured.** The hotspot is in i686 branch relaxation / peephole interaction; a safe fix needs its own profile and regression corpus. Recording the numbers is required before claiming anything about this case. |
+
+**Oracle discipline.** Clang **23.1.5** exists upstream (`llvmorg-23.1.5`, published
+2026-11-03) but its release asset redirects to `release-assets.githubusercontent.com`
+and `objects.githubusercontent.com`, both blocked in this sandbox; the verified
+`harness-cache-7` tag contains Clang **23.1.4** only. The Intel PPA returns HTTP
+`000`. No Clang 23.1.5-witnessed or locally ICX 2026.2-witnessed numeric claim
+is made. Hosted CI's "Authenticated Intel ICX 2026.2 integration" job is hosted
+evidence, not a local measurement.
+
+**What this section does NOT claim.** Neither open item is hidden behind an
+averaged number, and no "beats all C compilers" claim is made. The remaining
+generated-code host-runtime gap from §9.9 is unchanged. The three fixes are
+algorithm-level (quadratic to linear/logarithmic) and are validated by the
+deterministic equivalence tests described above plus the full hosted CI matrix,
+not by a wall-clock threshold that CI noise could make flaky.
+
+**Post-fix measurements (quiet host, final fastbuild binaries).** The same
+100,000-declaration shape that produced three `HARNESS timeout (240s)`
+failures now compiles in **5.00 s** at `-O2` — a **>=48x lower-bound**
+improvement, using the timeout as a bound rather than a measured pre-fix
+wall time. Scaling is now LINEAR, which is the actual proof that both
+quadratic scans are gone (median of 2, `-O2 -c`):
+
+| declarations | 100 | 1,000 | 10,000 | 100,000 |
+|---|---|---|---|---|
+| after this patch | 0.0089 s | 0.0370 s | 0.3732 s | 5.0039 s |
+
+Before the patch the same generated inputs measured 0.010 / 0.048 / 0.942 s
+for 100 / 1,000 / 10,000 declarations under campaign contention — the
+10,000 -> 100,000 step is where the quadratic term dominated. These are
+throughput, not cycle/PMU, measurements: no PMU or `perf` is installed.
+
+**Verification run on this branch:** `cargo fmt --all -- --check` PASS;
+`cargo clippy --all-targets -- -D warnings` PASS with **0 warnings**;
+full lib unit binary **7973 passed / 0 failed / 10 ignored**; the five new
+deterministic equivalence tests PASS (4 `ptr_range_tests`, 1
+`symbol_index_tests`); `audit_census.py --check` PASS (no metric grew, no
+re-baseline); `check_pipefail_sigpipe.py` PASS; `check_doc_links.py` PASS;
+`tests/regression/check_gcc_asm_constraints.sh` **23 passed / 0 failed**
+(including 11 tier/ABI verdict checks for `__builtin_constant_p`, the emitted
+arm, and the literal `if (0)` dead-arm control);
+`tests/regression/check_gnu_declaration_corners.sh` **39 passed / 0 failed**.
+A 500-declaration functional smoke compiles at `-O2` on x86_64 (31,696 B)
+and i686 (17,612 B) with `rc=0`; GCC 16.2's reference object is 31,880 B.
+Hosted CI runs the remaining full matrix.

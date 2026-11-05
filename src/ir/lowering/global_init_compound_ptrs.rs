@@ -17,21 +17,54 @@ use crate::frontend::parser::ast::{Designator, Expr, Initializer, InitializerIte
 use crate::ir::reexports::GlobalInit;
 
 impl Lowerer {
+    /// Record a pointer/address relocation, keeping `ptr_ranges` ordered by
+    /// byte offset. Inserting AFTER existing equal offsets preserves C11
+    /// 6.7.9p19 last-designator-wins: `build_compound_from_bytes_and_ptrs`
+    /// uses a stable sort by offset, so the last of a run of equal offsets
+    /// wins. The common case (initializers emitted in increasing offset order)
+    /// appends at the tail, O(1) amortised. Every insertion in the lowering
+    /// goes through this helper; that invariant is what makes the purge below
+    /// logarithmic instead of quadratic.
+    pub(super) fn insert_ptr_range(
+        ptr_ranges: &mut Vec<(usize, GlobalInit)>,
+        offset: usize,
+        init: GlobalInit,
+    ) {
+        let pos = ptr_ranges.partition_point(|&(off, _)| off <= offset);
+        ptr_ranges.insert(pos, (offset, init));
+    }
+
     /// Remove any recorded pointer/address relocations overlapping `[start, start + size)`.
     /// Required by C11 6.7.9p19 when a later initializer overrides a subobject
     /// that previously held a relocation with zeros, a null pointer constant,
     /// an integer, or a different relocation.
+    ///
+    /// `ptr_ranges` is sorted by offset (see `insert_ptr_range`), so the
+    /// entries to remove form ONE contiguous window: the first entry whose
+    /// `[off, off + ptr_sz)` reaches past `start`, through the last entry with
+    /// `off < end`. `partition_point` + `drain` is O(log N + K) instead of
+    /// the old O(N) full `retain` per cleared range. Callgrind attributed
+    /// ~19% of all instructions in limits-externdecl.c (10,000 decls) to
+    /// 10,001 such `retain` calls. The predicate is exactly
+    /// `!(off < end && start < off + ptr_sz)` from the original.
     pub(super) fn purge_ptr_ranges_in(
         ptr_ranges: &mut Vec<(usize, GlobalInit)>,
         start: usize,
         size: usize,
     ) {
-        if size == 0 {
+        if size == 0 || ptr_ranges.is_empty() {
             return;
         }
         let end = start.saturating_add(size);
         let ptr_sz = crate::common::types::target_ptr_size();
-        ptr_ranges.retain(|(off, _)| !(*off < end && start < off.saturating_add(ptr_sz)));
+        let first = ptr_ranges.partition_point(|&(off, _)| off.saturating_add(ptr_sz) <= start);
+        let mut last = first;
+        while last < ptr_ranges.len() && ptr_ranges[last].0 < end {
+            last += 1;
+        }
+        if first < last {
+            ptr_ranges.drain(first..last);
+        }
     }
 
     /// Zero `[start, start + size)` in `bytes` and purge any overlapping `ptr_ranges`.
@@ -1194,7 +1227,7 @@ impl Lowerer {
         if is_ptr {
             if let Some(addr_init) = self.resolve_ptr_field_init(expr) {
                 Self::clear_bytes_and_ptrs(bytes, ptr_ranges, offset, ptr_sz);
-                ptr_ranges.push((offset, addr_init));
+                Self::insert_ptr_range(ptr_ranges, offset, addr_init);
             } else if let Some(val) = self.eval_const_expr(expr) {
                 let ir_ty = IrType::from_ctype(ty);
                 let val = self.coerce_init_const(val, expr, ir_ty, Some(ty));
@@ -1248,7 +1281,7 @@ impl Lowerer {
             match self.resolve_ptr_field_init(expr) {
                 Some(addr_init) => {
                     Self::clear_bytes_and_ptrs(bytes, ptr_ranges, offset, ptr_sz);
-                    ptr_ranges.push((offset, addr_init));
+                    Self::insert_ptr_range(ptr_ranges, offset, addr_init);
                 }
                 None => self.diagnose_non_constant(expr),
             }
@@ -1777,5 +1810,99 @@ impl Lowerer {
             }
         }
         item_idx
+    }
+}
+
+#[cfg(test)]
+mod ptr_range_tests {
+    use super::*;
+
+    fn offsets(v: &[(usize, GlobalInit)]) -> Vec<usize> {
+        v.iter().map(|(off, _)| *off).collect()
+    }
+
+    fn insert(v: &mut Vec<(usize, GlobalInit)>, off: usize) {
+        Lowerer::insert_ptr_range(v, off, GlobalInit::Zero);
+    }
+
+    /// Deterministic xorshift: no rand dependency, reproducible in CI.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 32) as usize
+        }
+    }
+
+    #[test]
+    fn insert_keeps_offsets_sorted_with_equal_offsets_in_insertion_order() {
+        let mut v = Vec::new();
+        for off in [40, 8, 24, 8, 0, 16, 8] {
+            insert(&mut v, off);
+        }
+        assert_eq!(offsets(&v), vec![0, 8, 8, 8, 16, 24, 40]);
+        assert!(v.windows(2).all(|w| w[0].0 <= w[1].0));
+    }
+
+    /// The binary-search purge must remove EXACTLY the entries the original
+    /// `retain` predicate removed, for every window and every sorted layout.
+    #[test]
+    fn purge_matches_the_original_retain_predicate() {
+        let ptr_sz = crate::common::types::target_ptr_size();
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for trial in 0..1000 {
+            let n = rng.next() % 48;
+            let mut v = Vec::new();
+            for _ in 0..n {
+                insert(&mut v, rng.next() % 256);
+            }
+            let start = rng.next() % 256;
+            let size = rng.next() % 32;
+            let end = start.saturating_add(size);
+            let before = offsets(&v);
+            // The original routine early-returns for size == 0, so that
+            // case is a no-op by contract even though the interval predicate
+            // alone would remove entries ending exactly at `start`.
+            let expected: Vec<usize> = if size == 0 {
+                before.clone()
+            } else {
+                before
+                    .iter()
+                    .copied()
+                    .filter(|&off| !(off < end && start < off.saturating_add(ptr_sz)))
+                    .collect()
+            };
+            Lowerer::purge_ptr_ranges_in(&mut v, start, size);
+            assert_eq!(
+                offsets(&v),
+                expected,
+                "trial {trial}: start={start} size={size} before={before:?}"
+            );
+        }
+    }
+
+    /// Boundary semantics: `off + ptr_sz == start` does NOT overlap, and
+    /// `off == end` does NOT overlap. Both are easy to get wrong with a
+    /// partition_point + drain window.
+    #[test]
+    fn purge_boundaries_are_exclusive_on_both_ends() {
+        let psz = crate::common::types::target_ptr_size();
+        let mut v = Vec::new();
+        insert(&mut v, 100 - psz); // ends exactly at start: keep
+        insert(&mut v, 100); // inside the window: remove
+        insert(&mut v, 100 + 8); // off == end: keep
+        Lowerer::purge_ptr_ranges_in(&mut v, 100, 8);
+        assert_eq!(offsets(&v), vec![100 - psz, 108]);
+    }
+
+    #[test]
+    fn purge_empty_and_zero_size_are_noops() {
+        let mut v = Vec::new();
+        Lowerer::purge_ptr_ranges_in(&mut v, 0, 16);
+        insert(&mut v, 8);
+        Lowerer::purge_ptr_ranges_in(&mut v, 8, 0);
+        assert_eq!(offsets(&v), vec![8]);
     }
 }

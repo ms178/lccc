@@ -275,5 +275,73 @@ for c in "${diff_spellings[@]}"; do
 done
 report "gcc 16.2 accept/reject differential (${#diff_spellings[@]} spellings)" "$diff_bad"
 
+
+# ── __builtin_constant_p at -O0 (gcc.c-torture pr38789.c) ─────────────────
+# A deferred IsConstant query cannot be resolved by the -O0 tier, which
+# returns before `resolve_remaining_is_constant`. Both arms of the conditional
+# stayed live, so the untaken arm's `"i"` operand tripped the pipeline's final
+# immediate-only validation. GCC 16.2 and Clang 23.1.4 accept this at EVERY
+# -O level; the reference values measured at -O0 are 0 (local), 1 (literal),
+# 0 (parameter), and at -O1+ the local becomes 1. Pin verdict parity across
+# all tiers and both ABIs, plus which arm the -O0 lowering actually emits.
+cat >"$tmp/bcp.c" <<'EOF'
+void baz(int v)
+{
+  unsigned a = (v == 1) ? 1 : 2;
+  if (__builtin_constant_p(a))
+    asm volatile ("# constant %0" :: "i" (a));
+  else
+    asm volatile ("# register %0" :: "r" (a));
+  a = 6;
+  if (__builtin_constant_p(a))
+    asm volatile ("# constant %0" :: "i" (a));
+  else
+    asm volatile ("# register %0" :: "r" (a));
+}
+EOF
+bcp_bad=0
+bcp_checks=0
+for abi in x86_64 i686; do
+    if [ "$abi" = i686 ]; then cc="$CCC_I686"; gf=(-m32); lf=(-m32); else cc="$CCC"; gf=(); lf=(); fi
+    if [ ! -x "$cc" ]; then continue; fi
+    for opt in -O0 -O1 -O2 -O3 -Os; do
+        bcp_checks=$((bcp_checks + 1))
+        "$GCC" "${gf[@]}" "$opt" -c "$tmp/bcp.c" -o "$tmp/bcp_g.o" >"$tmp/bcp_g.log" 2>&1 && grc=0 || grc=$?
+        "$cc" "${lf[@]}" "$opt" -c "$tmp/bcp.c" -o "$tmp/bcp_l.o" >"$tmp/bcp_l.log" 2>&1 && lrc=0 || lrc=$?
+        if [ "$grc" -ne "$lrc" ]; then
+            printf 'FAIL: builtin_constant_p %s %s gcc=%s lccc=%s: %s\n' \
+                "$abi" "$opt" "$grc" "$lrc" "$(cat "$tmp/bcp_l.log")"
+            bcp_bad=$((bcp_bad + 1))
+        fi
+    done
+done
+# The -O0 lowering must choose the same arm as GCC: only the register form.
+"$CCC" -O0 -S "$tmp/bcp.c" -o "$tmp/bcp_l.s" >"$tmp/bcp_s.log" 2>&1 && src=0 || src=$?
+if [ "$src" -ne 0 ] || ! grep -qF '# register' "$tmp/bcp_l.s" || grep -qF '# constant' "$tmp/bcp_l.s"; then
+    printf 'FAIL: builtin_constant_p -O0 emitted the wrong asm arm (rc=%s)\n' "$src"
+    bcp_bad=$((bcp_bad + 1))
+fi
+# Literal if(0) is the control for the reachability-aware validator: the
+# untaken arm keeps an immediate-only asm that must NOT be diagnosed because
+# it is never emitted. A dynamic condition must still be diagnosed if such
+# an operand reaches it, which the existing spellings above already pin.
+cat >"$tmp/dead_arm.c" <<'EOF'
+void f(int v){ if (0) __asm__ volatile("# DEAD_ARM" :: "i"(v)); else __asm__ volatile("# LIVE_ARM" :: "r"(v)); }
+EOF
+dead_bad=0
+for abi in x86_64 i686; do
+    if [ "$abi" = i686 ]; then cc="$CCC_I686"; af=(-m32); else cc="$CCC"; af=(); fi
+    if [ ! -x "$cc" ]; then continue; fi
+    "$cc" "${af[@]}" -O0 -S "$tmp/dead_arm.c" -o "$tmp/dead_arm.s" >"$tmp/dead_arm.log" 2>&1 && drc=0 || drc=$?
+    if [ "$drc" -ne 0 ] || ! grep -qF '# LIVE_ARM' "$tmp/dead_arm.s" || grep -qF '# DEAD_ARM' "$tmp/dead_arm.s"; then
+        printf 'FAIL: literal if(0) %s rc=%s: %s\n' "$abi" "$drc" "$(cat "$tmp/dead_arm.log")"
+        dead_bad=$((dead_bad + 1))
+    fi
+done
+report "immediate-only asm in a provably dead if(0) arm is not diagnosed (2 ABIs)" "$dead_bad"
+
+bcp_checks=$((bcp_checks + 1))
+report "__builtin_constant_p -O0..-Os verdict + arm parity ($bcp_checks checks, 2 ABIs)" "$bcp_bad"
+
 printf 'check_gcc_asm_constraints: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
