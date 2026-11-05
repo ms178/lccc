@@ -101,7 +101,21 @@ without a test that fails when it regresses.
    omit locations (measured, documented) or emit one GDB resolves to the true
    value; any half-correct implementation fails. The census docstring now
    records the GDB observation explicitly.
-7. **Host-CPU runtime behaviour was checked with a real debugger, not just
+7. **The deferral list was still only statically checked.**  An import-time
+   assertion compares two hard-coded tables; a new LCCC capability added
+   without updating `BASELINE_TAGS` would still be masked by an old deferral.
+   The gate now also requires the *measured* `ours_tags`/`ours_attributes` to
+   be disjoint from the deferral lists, and a negative control removes a
+   baseline entry, re-adds the stale deferral and requires the runtime
+   diagnostic. Both layers are now ratcheted.
+8. **The executable ledger only ever ran against one architecture.**  The
+   driver option table is architecture-independent, but a target-specific
+   `cli.rs` arm could diverge while the fast lane stayed green. All four
+   fastbuild drivers were measured: `lccc`, `lccc-i686`, `lccc-arm` and
+   `lccc-riscv` each report 17 rows and zero problems. The same probes now
+   exercise four back ends in a pinned corpus sweep, so a fifth target cannot
+   be added without deliberately extending the coverage.
+9. **Host-CPU runtime behaviour was checked with a real debugger, not just
    assembly hashes.**  A four-frame `noinline` fixture compiled by LCCC,
    GCC 16.2 and Clang 23.1.5 at `-O2`, `-Ofast` and `-Og` produces identical
    results for inputs 5, -3, 0 and 12345 (`6n+16`). GDB's backtrace at `leaf`
@@ -132,6 +146,7 @@ in a per-compilation loop. Measured on the 2-vCPU host (minimum of 3 runs):
 | `check_backlog_roi.Context.load` | O(sum of 17 file sizes), read once | 0.081 s for all 20 checks + 21 negative controls | One read per input; checks share a frozen context instead of re-reading the tree 41 times. |
 | `check_backlog_roi.run_all` | O(20) | included above | Each check returns named problems, so `--json` can attribute a failure to one item. |
 | `check_dwarf_die_census.census` | O(DIE lines), streaming | 0.364 s for 4 dialects × 3 compilers | Line-by-line state machine; no DOM, no retained DIE tree, so memory is O(tags + attributes). |
+| `option_effect_ledger` × 4 arch drivers | O(4 × rows × probes) | 1.675 s for all 18 option-ledger tests | The same 17 rows are probed against four host executables that emit four targets' assembly; reuses parsed rows instead of re-reading the source four times. |
 | `check_sse2_codegen_matrix` `--check` | O(122 rows × 3 compilers) | 6.230 s | Dominated by 366 real compilations; the checker itself is linear. |
 
 No function allocates proportional to an untrusted input size beyond the file
@@ -168,9 +183,10 @@ GCC 16.2.0 / Clang 23.1.5 / GDB 18.1 / Rust 1.99.1 oracles.
 | `check_sse2_codegen_matrix.py --check / --self-test / --update-baseline` | **all PASS** (122 rows; re-derived against the live oracles) |
 | `check_dwarf_die_census.py` (4 dialects × 3 compilers) | **PASS** with the tightened 12-tag / 20-attribute baseline |
 | `check_backlog_roi.py --self-test --json` | **20/20 PASS, 0 negative-control failures** |
-| `tests.corpus.test_dwarf_die_census_ratchet` | **7 tests OK**, incl. the end-to-end lost-tag negative control |
+| `tests.corpus.test_dwarf_die_census_ratchet` | **8 tests OK**, incl. end-to-end lost-tag and stale-deferral negative controls |
+| `tests.corpus.test_option_effect_ledger` | **18 tests OK**, incl. the 4-architecture dynamic sweep |
 | `tests.corpus.test_gdb_option_runtime` | **7 tests OK** with pinned GDB 18.1 |
-| `unittest discover -s tests/corpus -p 'test_*.py'` | **1293 tests, 0 failures, 5 skips** |
+| `unittest discover -s tests/corpus -p 'test_*.py'` | **1296 tests, 0 failures, 5 skips** |
 | `check_doc_links.py`, `check_script_imports.py`, `check_no_conflict_markers.py`, `check_ci_workflow_shell.py` | **all PASS** |
 | Hosted CI on `fd3d490` | **22 pass / 3 skipping / 0 failures**, including the authenticated ICX 2026.2 integration lane |
 
