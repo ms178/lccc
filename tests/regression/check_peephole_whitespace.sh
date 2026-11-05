@@ -33,6 +33,10 @@
 #   PROFILE / JOBS  cargo profile and -j (default fastbuild / 2)
 #   CORPUS_EVERY=15 sample the first-party C selection after corpus exclusion
 #   --list [root]  print that exact sample without running compilers
+#   --selftest     compiler-free proof of the phase selector, the build-vs-
+#                  property classifier and the non-vacuous pass check
+# A `cargo test` build error is labelled as such (never as a property
+# regression), and `0 passed` is a failure, not a pass.
 set -uo pipefail
 
 repo_root=$(CDPATH= cd -P -- "$(dirname -- "$(readlink -f -- "$0")")/../.." && pwd -P)
@@ -96,6 +100,24 @@ parse_phase_args() { # parse_phase_args "$@" -> sets ONLY_PHASE; rc 0 ok, 2 usag
     esac
 }
 
+# A cargo BUILD failure is not a property failure.  An E0308 in the lib-test
+# target once made all three `cargo_test` phases below print "the pipeline
+# panics on some operand spelling" / "whitespace invariance FAILS", blaming
+# the peephole pipeline for a test target that never compiled.  Classify the
+# output before labelling it so the annotation names the real failing layer.
+# Pure string classification: no cargo, no compiler, no corpus needed.
+cargo_build_failed() { # cargo_build_failed <output> -> 0 iff cargo never ran the test
+    grep -qE '^error\[[A-Z][A-Z0-9]*\]: |^error: (could not compile|linking with |aborting due to |failed to run custom build command)' <<<"$1"
+}
+
+# `test result: ok. 0 passed` is a VACUOUS pass: a filter that matches no test
+# (or a stale test name) used to satisfy `grep -q "test result: ok"` in every
+# phase.  Demand at least one executed test and zero failures, mirroring the
+# gate's own "refuse to pass over nothing" rule for the phase-3 corpus.
+tests_passed() { # tests_passed <output> -> 0 iff >=1 test ran and all passed
+    grep -qE 'test result: ok\. [1-9][0-9]* passed; 0 failed' <<<"$1"
+}
+
 # Compiler-free enumeration is the EXACT phase-3 selection, not a test-only
 # replica. It runs before toolchain discovery and before any cargo command.
 if [[ ${1:-} == --list ]]; then
@@ -144,11 +166,54 @@ if [[ ${1:-} == --selftest ]]; then
     st_case 2 '' --phase=1 --phase=2
     st_case 2 '' --phase --phase
     st_case 2 '' --phase=1 stray
+
+    echo "== build-vs-property classifier self-test =="
+    st_class() { # st_class <want:build|property> <label> <output>
+        local want=$1 label=$2 text=$3 got
+        if cargo_build_failed "$text"; then got=build; else got=property; fi
+        if [[ "$got" != "$want" ]]; then
+            printf 'FAIL  classifier [%s] got=%s want=%s\n' "$label" "$got" "$want"
+            st_fail=1
+        else
+            printf 'ok    classifier [%s] -> %s\n' "$label" "$got"
+        fi
+    }
+    st_class build 'rustc type error' \
+        $'error[E0308]: mismatched types\n   --> src/foo.rs:1:1\nerror: could not compile `lccc` (lib test) due to 1 previous error'
+    st_class build 'linker failure' \
+        $'error: linking with `cc` failed: exit status: 1\nerror: could not compile `lccc` (lib test)'
+    st_class property 'genuine test failure' \
+        $'here: PANIC on input: movq $3, %xmm0\ntest result: FAILED. 0 passed; 1 failed\nerror: test failed, to rerun pass `--lib`'
+    st_class property 'clean output' \
+        'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured'
+
+    echo "== non-vacuous pass-check self-test =="
+    st_pass() { # st_pass <want:pass|fail> <label> <output>
+        local want=$1 label=$2 text=$3 got
+        if tests_passed "$text"; then got=pass; else got=fail; fi
+        if [[ "$got" != "$want" ]]; then
+            printf 'FAIL  pass-check [%s] got=%s want=%s\n' "$label" "$got" "$want"
+            st_fail=1
+        else
+            printf 'ok    pass-check [%s] -> %s\n' "$label" "$got"
+        fi
+    }
+    st_pass pass 'one real test passed' \
+        'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured'
+    st_pass pass 'many tests passed' \
+        'test result: ok. 12 passed; 0 failed; 3 ignored; 0 measured'
+    st_pass fail 'vacuous zero-test ok' \
+        'test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured'
+    st_pass fail 'a test failed' \
+        'test result: FAILED. 0 passed; 1 failed; 0 ignored'
+    st_pass fail 'no result line' \
+        'error: could not compile `lccc` (lib test) due to 1 previous error'
+
     if [ "$st_fail" -ne 0 ]; then
-        echo "check_peephole_whitespace: parser self-test FAILED" >&2
+        echo "check_peephole_whitespace: self-test FAILED" >&2
         exit 1
     fi
-    echo "check_peephole_whitespace: parser self-test PASS (19 cases)"
+    echo "check_peephole_whitespace: self-test PASS (19 parser, 4 classifier, 5 pass-check = 28 cases)"
     exit 0
 fi
 
@@ -177,6 +242,19 @@ declare -a RESULTS=()
 note() { printf '%s\n' "$*"; }
 ok()   { printf 'ok   %s\n' "$*"; RESULTS+=("ok   $*"); }
 bad()  { printf 'FAIL %s\n' "$*" >&2; RESULTS+=("FAIL $*"); fail=1; }
+# Label a non-passing `cargo_test` by the layer that actually failed and print
+# that layer's own diagnostics.  A build error must never be reported as a
+# peephole/property regression, and a property failure must never be hidden
+# behind a generic "build failed" label.
+report_cargo_failure() { # report_cargo_failure <property-message> <output>
+    if cargo_build_failed "$2"; then
+        bad "cargo test BUILD failed (property was NOT evaluated): $1"
+        grep -E '^error(\[[A-Z][A-Z0-9]*\])?: |^ *--> ' <<<"$2" | sed -n '1,25p' >&2
+    else
+        bad "$1"
+        grep -E "every failure:|^  [a-z]|PANIC|panicked|first difference|on input:" <<<"$2" | sed -n '1,30p' >&2
+    fi
+}
 # A phase runs unless --phase N selected a different one.  `$1` is the phase
 # number; the second argument is always `$ONLY_PHASE` at the call site, which is
 # empty when every phase was requested.
@@ -218,12 +296,11 @@ cargo_test() { # cargo_test <filter> [extra cargo-test args...]
 if want_phase 1 "$ONLY_PHASE"; then
     note "== phase 1: in-tree corpus, seven paddings"
     out=$(cargo_test peephole_output_is_invariant_to_trailing_whitespace 2>&1)
-    if grep -q "test result: ok" <<<"$out"; then
+    if tests_passed "$out"; then
         runs=$(grep -oE "[0-9]+ passed" <<<"$out" | sed -n '1,1p')
         ok "peephole output is invariant to trailing whitespace ($runs)"
     else
-        bad "peephole output is NOT whitespace-invariant"
-        grep -E "every failure:|^  [a-z]|PANIC|first difference" <<<"$out" | sed -n '1,30p' >&2
+        report_cargo_failure "peephole output is NOT whitespace-invariant" "$out"
     fi
 fi
 
@@ -236,11 +313,10 @@ fi
 if want_phase 2 "$ONLY_PHASE"; then
     note "== phase 2: exhaustive operand matrix (ignored in the default suite)"
     out=$(cargo_test the_pipeline_never_panics_on_the_full_operand_matrix --ignored --nocapture 2>&1)
-    if grep -q "test result: ok" <<<"$out"; then
+    if tests_passed "$out"; then
         ok "the pipeline never panics on any operand spelling (exhaustive matrix)"
     else
-        bad "the pipeline panics on some operand spelling"
-        grep -E "PANIC|on input:|panicked" <<<"$out" | sed -n '1,20p' >&2
+        report_cargo_failure "the pipeline panics on some operand spelling" "$out"
     fi
 fi
 
@@ -292,11 +368,10 @@ if want_phase 3 "$ONLY_PHASE"; then
             bad "generated corpus holds only $generated files; refusing to pass over a corpus that small"
         else
             out=$(LCCC_ASM_CORPUS="$corpus_dir" cargo_test peephole_output_is_invariant_to_trailing_whitespace 2>&1)
-            if grep -q "test result: ok" <<<"$out"; then
+            if tests_passed "$out"; then
                 ok "whitespace invariance holds over $generated freshly generated assembly files"
             else
-                bad "whitespace invariance FAILS on freshly generated assembly"
-                grep -E "every failure:|^  [a-z]|PANIC|first difference" <<<"$out" | sed -n '1,30p' >&2
+                report_cargo_failure "whitespace invariance FAILS on freshly generated assembly" "$out"
             fi
         fi
     fi

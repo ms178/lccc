@@ -9,15 +9,18 @@ use crate::common::asm_constraints::aarch64_flag_condition;
 use crate::common::types::IrType;
 use crate::ir::reexports::{BlockId, IrConst, Operand, Value};
 
-/// Copy the bits held in `phys` into general-purpose register `dst`.
+/// Copy the bits held in allocator register `phys` into GP register `dst`.
 ///
-/// `callee_saved_name` names only x0..x28. An FP/SIMD home (allocator ids
-/// 32..=55) used to reach its `unreachable!` and abort the whole compile;
-/// AArch64 also cannot `mov` between the integer and FP register files, so
-/// FP homes must be transferred with `fmov`. The `fmov` lane width has to
-/// match the destination: `fmov w0, d0` and `fmov x0, s0` are not encodable,
-/// hence the `wN` -> `xN` promotion for a 64-bit FP source. `dst` is a GP
-/// scratch (`xN`/`wN`) or `x9`; `sp` is staged by the caller.
+/// AArch64 cannot `mov` across the integer/FP register files: an FP/SIMD home
+/// (allocator ids 32..=38 and 40..=55) must be transferred with `fmov`, and
+/// passing such an id to the GP-only `callee_saved_name` used to hit its
+/// `unreachable!` and abort the whole compile (gcc.c-torture/compile/
+/// pr30311.c on AArch64). `fmov` additionally requires the lane width to
+/// match the destination: `fmov w0, d0` and `fmov x0, s0` are unencodable,
+/// so a `wN` destination reads the `sN` view of the FP register and an `xN`
+/// destination its `dN` view. GP ids are named by `callee_saved_name{,_32}`
+/// (total over x0..x30); a GP self-copy is dead work and is elided. `dst` is
+/// a GP scratch (`xN`/`wN`) or `x9`; `sp` is staged by the caller.
 fn emit_gpr_copy_from_phys(state: &mut CodegenState, dst: &str, phys: PhysReg) {
     let w_view = dst.starts_with('w');
     if super::emit::is_arm_fp_phys(phys) {
@@ -949,16 +952,32 @@ mod gpr_copy_from_phys_tests {
         // x0..x30 is the whole real GP file; 32..=38 and 40..=55 are the
         // FP/SIMD homes (`is_arm_fp_phys`). 31 (xzr/sp), 39 and 56+ are not
         // writable homes and must fail loudly -- see the next test.
-        let mut ids: Vec<u32> = (0..=30).collect();
-        ids.extend(32..=38);
-        ids.extend(40..=55);
-        for id in ids {
+        // Exact-oracle form: `contains("mov")` also matches "fmov" and would
+        // accept a wrong-width or wrong-direction instruction. Derive the one
+        // legal emission for every id from the documented ABI instead.
+        let gp: Vec<u8> = (0..=30).collect();
+        let mut fp: Vec<u8> = (32..=38).collect();
+        fp.extend(40..=55);
+        for id in &gp {
             for dst in ["x9", "w9"] {
-                let buf = emitted(dst, PhysReg(id));
-                assert!(
-                    buf.contains("fmov") || buf.contains("mov"),
-                    "{id} -> {buf:?}"
-                );
+                let src = format!("{}{}", &dst[..1], id);
+                let expected = if src == dst {
+                    // A self-copy is dead work (x9<-x9, w9<-w9).
+                    String::new()
+                } else {
+                    format!("    mov {dst}, {src}\n")
+                };
+                assert_eq!(emitted(dst, PhysReg(*id)), expected, "GP id {id} -> {dst}");
+            }
+        }
+        for id in &fp {
+            // Allocator id n denotes FP register n-24 (32..38 -> d8..d14,
+            // 40..55 -> d16..d31). The lane MUST match dst: `fmov w9, dN`
+            // and `fmov x9, sN` are unencodable.
+            let number = *id - 24;
+            for (dst, view) in [("x9", "d"), ("w9", "s")] {
+                let expected = format!("    fmov {dst}, {view}{number}\n");
+                assert_eq!(emitted(dst, PhysReg(*id)), expected, "FP id {id} -> {dst}");
             }
         }
     }
