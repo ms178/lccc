@@ -64,7 +64,7 @@ class PublisherContract(unittest.TestCase):
     def test_gdb_is_registered_in_the_cache_manifest(self) -> None:
         text = publisher_text()
         self.assertIn("('gdb',gdb_version,f'gdb-{gdb_version}-linux-x64.tar.xz')", text)
-        self.assertIn("'gdb',f'GNU GDB", text)
+        self.assertIn("'gdb':f'GNU GDB", text)
         self.assertIn("'gdb','binutils'", text)  # priority list
 
     def test_obsolete_payload_guard_is_present_and_complete(self) -> None:

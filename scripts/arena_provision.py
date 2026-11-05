@@ -81,17 +81,14 @@ RUST_VERSION = "1.99.1"
 GCC_BLOB = "0612f4c9bb3e5cfdf0d5326529caa183132b71a4"
 GCC_SHA256 = "4fa6af4f6b29991e31631af18d83964a69caa9daf3f78546d4dc30f39880cd8a"
 DEBS_BLOB = "06185dd859247494e5c489656e0488a7f3edaf70"
-# harness-cache-7 MANIFEST.sha256: the debs bundle was previously the ONLY
+# reviewed MANIFEST.sha256: the debs bundle was previously the ONLY
 # payload fetched without a content pin. A tampered/corrupt bundle of the
 # right byte size would have been unpacked and `dpkg --unpack`ed.
 DEBS_SHA256 = "24a4be08d5c6a28aed78f424ebdc9596f85cc2e8ebd0ba230f99a2bf9cdfb20d"
-# Clang is NOT restored from a git blob any more. The harness-cache-7 payload
-# (blob 83ddbd38..., 67,322,400 bytes) is a repacked 23.1.4, and a main-branch
-# patch cannot re-issue a tag blob -- so a bumped version here would have named
-# bytes that do not exist. The oracle now comes from the same digest-pinned
-# upstream installer CI uses (scripts/ci_install_clang_oracle.sh), which pins
-# the official LLVM 23.1.5 asset by the SHA-256 GitHub publishes for it and
-# proves the identity with `clang -dumpversion` before exiting 0.
+# Clang is NOT restored from a git blob. The retired harness-cache-7 payload
+# (a repacked 23.1.4) was deleted; harness-cache-8 is published from this same
+# digest-pinned upstream installer, so the tag and the sandbox resolve one
+# oracle through one code path, one digest and one identity probe.
 CLANG_VERSION = "23.1.5"
 GDB_VERSION = "18.1"
 GCC_REPO = "ms178/lccc"
@@ -303,14 +300,12 @@ def install_multilib(prefix: Path) -> None:
 def install_clang(prefix: Path) -> Path:
     """Provision the pinned Clang oracle via its digest-pinned installer.
 
-    The sandbox used to restore a repacked Clang from the `harness-cache-7`
-    git blob because the release-asset CDN was believed unreachable from an
-    agent sandbox. That was re-tested on 2026-11-05: a ranged GET of
-    `github.com/llvm/llvm-project/releases/download/llvmorg-23.1.5/...`
-    returns 206 from here, so the official asset IS reachable and the blob
-    detour now costs more than it saves -- it can only ever serve the last
-    published payload (23.1.4), which is exactly the "silently stale oracle"
-    failure the pin exists to prevent.
+    The sandbox used to restore a repacked Clang from a `harness-cache-7` git
+    blob because the release-asset CDN was believed unreachable. A ranged GET
+    of `github.com/llvm/llvm-project/releases/download/llvmorg-23.1.5/...`
+    returns 206 here, so the official asset IS reachable; more importantly the
+    refreshed cache tag is now built from that same installer, so no transport
+    can serve a payload older than the live pin.
 
     Delegating to scripts/ci_install_clang_oracle.sh means the sandbox and
     hosted CI resolve one oracle through one code path, one digest and one

@@ -21,29 +21,21 @@ GDB_VERSION = re.search(r'(?m)^GDB_VERSION=([0-9.]+)$',
 
 class ToolchainCache(unittest.TestCase):
     def test_reviewed_lock_covers_every_restorable_tool(self):
-        """Every tool this module restores is in the lock, and every lock
-        entry it does NOT restore is a documented superseded payload.
-
-        Clang left the lock: its pin moved to the digest-pinned upstream
-        installer (23.1.5) and a patch cannot re-issue the 23.1.4 asset this
-        lock describes. Asserting the exact non-restorable set (rather than
-        just "VERSIONS is a subset") is what makes the exception visible: the
-        day publish_toolchain_cache.py re-issues the asset and clang rejoins
-        VERSIONS, this test fails and the stale note gets removed with it.
+        """Every tool this module restores is in the lock, and the lock has no
+        surplus entries. Clang is installed from the digest-verified upstream
+        LLVM asset, not from a release asset, so its obsolete 23.1.4 asset and
+        lock entry are gone -- not merely marked non-restorable.
         """
         lock = json.loads(cache.LOCK.read_text())
         self.assertTrue(set(cache.VERSIONS) <= set(lock['tools']))
-        self.assertEqual(set(lock['tools']) - set(cache.VERSIONS), {'clang'})
-        self.assertEqual(lock['tools']['clang']['version'], '23.1.4')
+        self.assertEqual(set(lock['tools']) - set(cache.VERSIONS), set())
+        self.assertNotIn('clang', lock['tools'])
+        self.assertNotIn('23.1.4', json.dumps(lock['tools']))
         for tool in cache.VERSIONS:
             self.assertEqual(lock['tools'][tool]['version'], cache.VERSIONS[tool])
             # A restorable entry must still satisfy the full triple
             # (version, digest shape, content-addressed origin).
             cache.validate(lock['tools'][tool], tool)
-        # ...and the superseded one must NOT be restorable: validate() keys
-        # off VERSIONS, so this raises rather than silently trusting it.
-        with self.assertRaises(KeyError):
-            cache.validate(lock['tools']['clang'], 'clang')
 
     def entry(self):
         sha = 'a' * 64
@@ -252,10 +244,9 @@ class GdbOraclePin(unittest.TestCase):
         self.assertIn('all cases passed', result.stdout)
 
 
-class SupersededClangPayloads(unittest.TestCase):
-    """The live Clang pin moved to 23.1.5 while two PUBLISHED payloads stay
-    23.1.4 (a patch cannot re-issue them). These tests pin that state so it
-    cannot rot silently in either direction."""
+class CurrentCachePayloads(unittest.TestCase):
+    """The refreshed cache carries ONLY current tools. Any superseded payload
+    in a lock or in the pin table is a defect, not a documented exception."""
 
     def freshness(self):
         from scripts import check_toolchain_cache_freshness as fresh
@@ -273,42 +264,31 @@ class SupersededClangPayloads(unittest.TestCase):
         self.assertRegex(installer, r'(?m)^VERSION=23\.1\.5$')
         self.assertRegex(installer, r'(?m)^SHA256=[0-9a-f]{64}$')
 
-    def test_the_superseded_versions_are_asserted_not_just_noted(self):
-        """When the hosted publisher re-issues the payloads at 23.1.5 these
-        assertions fail, forcing the exception to be retired."""
+    def test_no_superseded_pins_or_info_rows_remain(self):
+        """The five exception pins, and the info rows that excused them,
+        must be gone; every lock entry is checked against its live pin."""
         fresh = self.freshness()
         pins = fresh.read_pins()
-        self.assertEqual(pins['clang-cache-asset'], '23.1.4')
-        self.assertEqual(pins['clang-agent-payload'], '23.1.4')
-        self.assertEqual({name for name, _ in fresh.INFO_ROWS} &
-                         {'clang-cache-asset', 'clang-agent-payload', 'clang-tag-tree'},
-                         {'clang-cache-asset', 'clang-agent-payload', 'clang-tag-tree'})
+        for retired in ('clang-cache-asset', 'clang-agent-payload',
+                        'clang-tag-tree', 'qemu-agent-payload',
+                        'kernel-relocs-agent-payload'):
+            self.assertNotIn(retired, pins)
+        self.assertEqual(fresh.INFO_ROWS, ())
         self.assertEqual(fresh.offline_problems(pins), [])
 
-    def test_a_republished_asset_forces_the_exception_to_retire(self):
+    def test_an_obsolete_payload_in_a_lock_is_detected(self):
+        """Point the offline check at a lock naming a retired QEMU payload and
+        prove it fails closed rather than blessing it as a known exception."""
         fresh = self.freshness()
         pins = fresh.read_pins()
-        real_read = fresh._read
-
-        def republished(rel):
-            text = real_read(rel)
-            # The release-asset lock only. `agent-cache-lock.json` also ends
-            # with 'cache-lock.json', and the offline check reads it too (the
-            # retired-MSRV scan does); rewriting it here would KeyError on its
-            # clang entry, which carries no url because the publisher derives
-            # its payload instead of downloading one.
-            if rel.endswith('/cache-lock.json'):
-                lock = json.loads(text)
-                lock['tools']['clang']['version'] = pins['clang']
-                lock['tools']['clang']['url'] = lock['tools']['clang']['url'].replace(
-                    'clang-23.1.4-', f"clang-{pins['clang']}-")
-                return json.dumps(lock)
-            return text
-
-        with patch.object(fresh, '_read', republished):
-            problems = fresh.offline_problems(pins)
-        self.assertTrue(any('cache-lock.json' in problem for problem in problems), problems)
-
+        lock = json.loads(fresh.AGENT_LOCK.read_text())
+        lock['tools']['qemu']['file'] = 'qemu-user-11.1.2-x86_64.tar.xz'
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'agent-cache-lock.json'
+            path.write_text(json.dumps(lock))
+            with patch.object(fresh, 'AGENT_LOCK', path):
+                problems = fresh.offline_problems(pins)
+        self.assertTrue(any('obsolete payload' in problem for problem in problems), problems)
 
 
 class ToolchainCacheFreshness(unittest.TestCase):
@@ -389,20 +369,16 @@ class ToolchainCacheFreshness(unittest.TestCase):
         fresh = self.freshness()
         pins = fresh.read_pins()
         lock = json.loads(fresh.AGENT_LOCK.read_text())
-        self.assertEqual(lock['tag'], 'harness-cache-7')
-        for package in ('gcc', 'binutils', 'rust', 'mold', 'arm-a64-xml'):
+        self.assertEqual(lock['tag'], 'harness-cache-8')
+        # Every published payload -- including Clang 23.1.5, GDB 18.1, QEMU
+        # 11.1.3 and relocs 7.3.1 -- must equal its own live enforcing pin.
+        for package in ('gcc', 'binutils', 'rust', 'mold', 'arm-a64-xml',
+                        'clang', 'qemu', 'kernel-relocs', 'gdb'):
             self.assertEqual(lock['tools'][package]['version'], pins[package])
             self.assertRegex(lock['tools'][package]['sha256'], r'^[0-9a-f]{64}$')
-        # Three agent payloads are PUBLISHED bytes that a main-branch patch
-        # cannot re-issue, so each is asserted against its recorded superseded
-        # fact rather than the live pin -- and each fact is asserted to differ
-        # from the live pin, so the exception cannot silently outlive the
-        # staleness it documents.
-        for package, fact in (('clang', 'clang-agent-payload'),
-                              ('qemu', 'qemu-agent-payload'),
-                              ('kernel-relocs', 'kernel-relocs-agent-payload')):
-            self.assertEqual(lock['tools'][package]['version'], pins[fact])
-            self.assertNotEqual(pins[fact], pins[package])
+        for name, spec in lock['tools'].items():
+            for token in ('1.97.0', '23.1.4', '11.1.2', 'v7.3-x86_64'):
+                self.assertNotIn(token, spec['file'], f'{name} carries {token}')
         # The 1.97.0 MSRV floor is retired: no lock entry, no rust-version key.
         self.assertNotIn('rust-msrv', lock['tools'])
         self.assertNotIn('rust-msrv', lock['priority'])

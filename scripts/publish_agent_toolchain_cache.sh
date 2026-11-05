@@ -135,7 +135,10 @@ chmod +x "$WORK/build-gdb.sh"
 docker run --rm -v "$WORK:/work" -w /work debian:bookworm bash /work/build-gdb.sh
 sudo chown -R "$(id -u):$(id -g)" "$WORK/gdb-prefix"
 [ -x "$WORK/gdb-prefix/bin/gdb" ] || die "GDB installer produced no debugger"
-gdb_banner=$("$WORK/gdb-prefix/bin/gdb" --version | head -n 1)
+# Capture the whole banner: `... | head -1` under pipefail lets the writer die
+# of SIGPIPE on line two, which reads as a flaky publisher failure.
+gdb_output=$("$WORK/gdb-prefix/bin/gdb" --version)
+gdb_banner=${gdb_output%%$'\n'*}
 [ "$gdb_banner" = "GNU gdb (GDB) $GDB_VERSION" ] || \
     die "staged GDB reports '$gdb_banner', expected 'GNU gdb (GDB) $GDB_VERSION'"
 grep -qx 'march=haswell' "$WORK/gdb-prefix/.lccc-build" || \
@@ -278,7 +281,8 @@ GDB_BIN=$(find "$EXTRACT/tools" -type f -name gdb -perm -111 | head -1)
 "$CLANG_BIN" --version | head -1
 "$RUSTC_BIN" --version
 "$MOLD_BIN" --version
-"$GDB_BIN" --version | head -1 | grep -Fx "GNU gdb (GDB) $GDB_VERSION" >/dev/null \
+gdb_output=$("$GDB_BIN" --version)
+[ "${gdb_output%%$'\n'*}" = "GNU gdb (GDB) $GDB_VERSION" ] \
     || die "cached GDB is not the pinned $GDB_VERSION oracle"
 BI="$EXTRACT/tools/$BINUTILS_ROOT"
 ALL_LIBS=$(find "$EXTRACT/tools" -type d \( -name lib -o -name lib64 -o -path '*/usr/lib/x86_64-linux-gnu' \) -print | paste -sd: -)

@@ -34,25 +34,15 @@ Online (default):
     digest pinned in the installer, so a re-issued asset is caught
     even when the version string does not move.
 
-Intentional exceptions are reported as INFO, never silently skipped:
-    * the published `harness-cache-7` tag still packs QEMU user 11.1.2 and
-      the v7.3 kernel relocs tool, while the tree re-pinned 11.1.3 and
-      v7.3.1 on 2026-11-05 (scripts/ensure_qemu_user.sh and
-      tests/linker/setup_kernel_tools.sh). Both recorded versions are
-      ASSERTED for the same self-retiring reason as the Clang payloads
-      below: republishing the cache breaks the assertion and forces the
-      exception to be removed.
-    * the `harness-cache-4` git tree's Clang 23.1.3 is a historical
-      transport payload; nothing may restore from it (guarded below).
-    * the `harness-cache-4` release ASSET and the `harness-cache-7` tag
-      payload both still carry a repacked Clang 23.1.4. A main-branch patch
-      cannot re-issue a published asset or a tag blob, so the live pin moved
-      to 23.1.5 (scripts/ci_install_clang_oracle.sh, the official LLVM asset
-      pinned by GitHub's own digest) and those two payloads are recorded as
-      superseded. Their recorded version is ASSERTED, not merely noted: when
-      the hosted publishers re-issue them at 23.1.5 the assertion stops
-      matching and forces the exception to be retired, so the note cannot
-      outlive the staleness it describes.
+There are NO intentional version exceptions. The refreshed
+`harness-cache-8` tag is published from the current installers, so every lock
+entry -- including Clang 23.1.5, GDB 18.1, QEMU 11.1.3 and relocs 7.3.1 -- is
+compared against the pin its own enforcing file states. The retired Rust 1.97.0
+MSRV payload, Clang 23.1.4, QEMU 11.1.2 and relocs v7.3 blobs were deleted
+along with the obsolete `harness-cache-7` tag and the superseded release asset;
+the offline half additionally refuses any lock entry whose filename names one
+of those retired versions, so an exception cannot creep back in silently.
+The only informational row left is a compatibility snapshot:
     * `debs-bookworm.tar.xz` is a compatibility snapshot of Debian
       bookworm for the bookworm-built GCC prefix; "latest" for it
       means the latest bookworm point versions (checked against
@@ -117,23 +107,9 @@ def read_pins():
                          r"^version=([0-9.]+)$", "valgrind version"),
         "gdb": _one("scripts/ci_install_gdb_oracle.sh",
                     r"^GDB_VERSION=([0-9.]+)$", "GDB_VERSION"),
-        # Tag-tree facts (payloads live in the transport tags, digests in
-        # each tag's MANIFEST.sha256; last verified 2026-10-27):
-        "clang-tag-tree": "23.1.3",     # harness-cache-4 tree (historical)
-        # Superseded Clang transport payloads: PUBLISHED BYTES, which a
-        # main-branch patch cannot re-issue. The live pin is 23.1.5; these two
-        # stay 23.1.4 until the hosted cache job runs again. Asserting the
-        # value (rather than skipping the files) is what makes the exception
-        # retire itself the moment the payloads are re-published.
-        "clang-cache-asset": "23.1.4",    # harness-cache-4 release asset
-        "clang-agent-payload": "23.1.4",  # harness-cache-7 tag payload
-        # Same supersession, recorded 2026-11-05 when the tree re-pinned QEMU
-        # 11.1.2 -> 11.1.3 (scripts/ensure_qemu_user.sh) and the kernel relocs
-        # sources v7.3 -> v7.3.1 (tests/linker/setup_kernel_tools.sh, whose six
-        # digests are byte-identical across the two tags). The published
-        # harness-cache-7 tag still packs the older pair.
-        "qemu-agent-payload": "11.1.2",           # harness-cache-7 tag payload
-        "kernel-relocs-agent-payload": "7.3",     # harness-cache-7 tag payload
+        # The refreshed agent cache carries ONLY current payloads, so no
+        # superseded-transport exceptions remain. Every lock entry is
+        # compared against the live pin in offline_problems() instead.
         "debs-bookworm-libc": "2.36-9+deb12u14",
         "debs-bookworm-gcc12": "12.2.0-14+deb12u1",
     }
@@ -171,13 +147,13 @@ def offline_problems(pins):
             expect(tool, version, "restore_toolchain_cache.py VERSIONS")
 
     lock = json.loads(_read("engineering/toolchains/cache-lock.json"))
-    # One lock entry is deliberately NOT the canonical pin: clang. Its pin
-    # moved to the digest-pinned upstream installer, and this asset cannot be
-    # re-issued from a patch, so it is checked against the superseded-payload
-    # fact instead -- a re-published 23.1.5 asset then fails here on purpose.
-    lock_pin = {"clang": "clang-cache-asset"}
+    # Clang is NOT in this lock: it is installed from the digest-verified
+    # upstream asset, and the obsolete 23.1.4 release asset was deleted. Only
+    # Rust 1.99.1 remains here, from harness-cache-4's content-addressed asset.
+    if "clang" in lock["tools"]:
+        problems.append("cache-lock.json still describes an obsolete Clang asset")
     for tool, entry in lock["tools"].items():
-        expect(lock_pin.get(tool, tool), entry["version"], "cache-lock.json")
+        expect(tool, entry["version"], "cache-lock.json")
         asset = lock["tools"][tool]["url"].rsplit("/", 1)[-1]
         want = f"{tool}-{entry['version']}-{entry['sha256']}.tar.xz"
         if asset != want:
@@ -206,33 +182,31 @@ def offline_problems(pins):
         problems.append('agent-cache-lock.json is missing')
     else:
         agent = json.loads(AGENT_LOCK.read_text())
-        if agent.get('tag') != 'harness-cache-7':
-            problems.append(f"agent-cache-lock.json names tag {agent.get('tag')!r}, expected 'harness-cache-7'")
+        if agent.get('tag') != 'harness-cache-8':
+            problems.append(f"agent-cache-lock.json names tag {agent.get('tag')!r}, "
+                            "expected 'harness-cache-8'")
         tools = agent.get('tools', {})
-        for package in ('gcc', 'binutils', 'rust', 'mold', 'arm-a64-xml'):
+        # Every published payload must match the pin its own enforcing file
+        # states. There are no superseded exceptions: the refreshed cache was
+        # published from the current installers, including Clang 23.1.5 and
+        # GDB 18.1.
+        for package in ('gcc', 'binutils', 'rust', 'mold', 'arm-a64-xml',
+                        'clang', 'qemu', 'kernel-relocs', 'gdb'):
             entry = tools.get(package)
             if not entry:
                 problems.append(f'agent-cache-lock.json has no {package} entry')
                 continue
             expect(package, entry.get('version', ''), 'agent-cache-lock.json')
-        # Three agent payloads describe what the PUBLISHED harness-cache-7 tag
-        # contains rather than what the tree currently pins, so each is checked
-        # against an asserted superseded value instead of the live pin. A patch
-        # cannot re-issue a published tag; the assertion makes that gap visible
-        # and retires itself the moment the cache is republished.
-        #   clang         superseded 23.1.4 payload (live pin 23.1.5)
-        #   qemu          superseded 11.1.2 payload (live pin 11.1.3,
-        #                 re-pinned 2026-11-05)
-        #   kernel-relocs superseded v7.3 payload (live pin v7.3.1,
-        #                 re-pinned 2026-11-05)
-        for package, fact in (('clang', 'clang-agent-payload'),
-                              ('qemu', 'qemu-agent-payload'),
-                              ('kernel-relocs', 'kernel-relocs-agent-payload')):
-            entry = tools.get(package)
-            if not entry:
-                problems.append(f'agent-cache-lock.json has no {package} entry')
-            else:
-                expect(fact, entry.get('version', ''), 'agent-cache-lock.json')
+        # A cache is an input contract: refuse retired bytes by name and by
+        # version, so a future publisher cannot silently reintroduce them.
+        obsolete = ('1.97.0', '23.1.4', '11.1.2', 'v7.3-x86_64', '2.42.1')
+        for name, spec in tools.items():
+            if any(token in spec.get('file', '') for token in obsolete):
+                problems.append(f'agent-cache-lock.json: {name} names an obsolete payload '
+                                f'{spec.get("file")!r}')
+        for retired in ('rust-msrv', 'clang-tag-tree'):
+            if retired in tools or retired in agent.get('priority', []):
+                problems.append(f'agent-cache-lock.json still lists retired tool {retired!r}')
         for field in ('tag_sha', 'commit_sha', 'tree_sha', 'cache_json_sha256'):
             if not agent.get(field):
                 problems.append(f'agent-cache-lock.json has no {field}')
@@ -508,18 +482,9 @@ def upstream_latest(pins):
     return rows
 
 
-INFO_ROWS = (
-    ("qemu-agent-payload", "superseded qemu 11.1.2 in the published harness-cache-7 tag; "
-                           "scripts/ensure_qemu_user.sh pins 11.1.3 (re-pinned 2026-11-05)"),
-    ("kernel-relocs-agent-payload", "superseded v7.3 relocs in the published tag; "
-                                    "tests/linker/setup_kernel_tools.sh pins v7.3.1"),
-    ("clang-tag-tree", "historical harness-cache-4 git-tree payload; nothing restores from it"),
-    ("clang-cache-asset", "superseded harness-cache-4 release asset (a patch cannot re-issue a "
-                          "published asset); the live Clang pin is the digest-pinned upstream "
-                          "installer, and publish_toolchain_cache.py re-issues this asset"),
-    ("clang-agent-payload", "superseded harness-cache-7 tag payload for the same reason; "
-                            "publish_agent_toolchain_cache.sh re-issues it"),
-)
+# No superseded transport payloads are published any more, so there are
+# no informational exceptions to report.
+INFO_ROWS = ()
 
 
 def main(argv=None):

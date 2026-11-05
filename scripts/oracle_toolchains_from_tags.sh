@@ -26,11 +26,9 @@
 #     installed by scripts/ci_install_mold_oracle.sh;
 #   * Clang 23.1.5 (2026-11-03) is installed by
 #     scripts/ci_install_clang_oracle.sh from the official LLVM asset, pinned
-#     by the SHA-256 GitHub publishes for it. The harness-cache-4 git tree
-#     (23.1.3), its release asset and the harness-cache-7 agent payload
-#     (both 23.1.4) are superseded transport copies; nothing restores Clang
-#     from them any more (guarded in
-#     scripts/check_toolchain_cache_freshness.py).
+#     by the SHA-256 GitHub publishes for it. The obsolete 23.1.3/23.1.4
+#     transport copies were deleted; harness-cache-8 carries a payload staged
+#     from that installer, so the cache and CI resolve one Clang oracle.
 # gdb 18.1 is built from its pinned GNU source tarball by
 # scripts/ci_install_gdb_oracle.sh with -march=haswell, the ISA level the
 # project's own Raptor Lake host and its packages are built for.

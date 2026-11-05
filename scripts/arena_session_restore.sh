@@ -62,7 +62,7 @@ fi
 cache_env=${LCCC_AGENT_CACHE_PREFIX:-$HOME/.cache/lccc/agent-toolchains}/env.sh
 if [[ ! -r $cache_env ]]; then
     log "FATAL: pinned toolchain cache missing: $cache_env"
-    log 'Run: python3 scripts/restore_agent_toolchain_cache.py --tag harness-cache-7 --only rust,gcc,clang,binutils'
+    log 'Run: python3 scripts/restore_agent_toolchain_cache.py --tag harness-cache-8 --only rust,gcc,clang,binutils'
     exit 1
 fi
 # shellcheck disable=SC1090

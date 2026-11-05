@@ -37,7 +37,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_LOCK = ROOT / 'engineering/toolchains/agent-cache-lock.json'
-DEFAULT_TAG = 'harness-cache-7'
+DEFAULT_TAG = 'harness-cache-8'
 STAMP_NAME = '.lccc-agent-cache'
 INSTALLED_NAME = '.lccc-agent-installed.json'
 # Bumped whenever the manifest's shape changes: an unfamiliar manifest is
@@ -498,9 +498,14 @@ def env_body(prefix: Path, cache: dict, lib_dirs: list[str], shim_dir: Path) -> 
         f'export PATH="{shim_dir}:$PATH"',
         f'export LD_LIBRARY_PATH="{lib_path}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"',
     ]
+    # GDB is exported explicitly: the DWARF gates fail closed on a debugger
+    # that is merely present on PATH, so the restored cache must point at the
+    # exact pinned binary. The qemu fallback matches the refreshed tag too.
+    gdb = shim_dir / 'gdb' if (shim_dir / 'gdb').exists() else ''
     for var, val in (('CC', cc), ('CXX', cxx), ('CLANG', clang), ('RUSTC', rustc),
+                     ('GDB', gdb),
                      ('CARGO', shim_dir / 'cargo' if (shim_dir / 'cargo').exists() else ''),
-                     ('MOLD', mold), ('LCCC_QEMU_PREFIX', prefix / tools.get('qemu', {}).get('root', 'qemu-user-11.1.2-x86_64'))):
+                     ('MOLD', mold), ('LCCC_QEMU_PREFIX', prefix / tools.get('qemu', {}).get('root', 'qemu-user-11.1.3-x86_64'))):
         if val:
             lines.append(f'export {var}="{val}"')
     return '\n'.join(lines) + '\n'
