@@ -1145,7 +1145,7 @@
     "frontend-a": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 360.43,
+      "predicted_gate_seconds": 365.57,
       "shards": 3,
       "steps": [
         {
@@ -1371,6 +1371,14 @@
         {
           "measured_s": 1.65,
           "name": "GCC 16.2 inline-asm constraint grammar on both ABIs"
+        },
+        {
+          "measured_s": 0.7,
+          "name": "Byte-exact .ascii string literals on both ABIs"
+        },
+        {
+          "measured_s": 4.44,
+          "name": "O(n) i686 dead-move census differential equivalence"
         },
         {
           "measured_s": 0.93,
