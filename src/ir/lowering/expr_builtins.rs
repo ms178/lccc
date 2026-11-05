@@ -2384,13 +2384,28 @@ impl Lowerer {
         if !self.constant_query_can_lower(arg) {
             return Some(Operand::Const(IrConst::I32(0)));
         }
-        // Defer in every function, not only inline candidates. Ordinary local
-        // propagation is enough to make a value constant (`int n=sizeof(int)`),
-        // and GCC reports that at -O1+ even in `main`. Eagerly returning zero
-        // for non-inline functions permanently hid those opportunities.
-        // The lowered value is used only as a constness query; later folding
-        // resolves it to one after mem2reg/constant propagation, or the final
-        // resolver turns it into zero.
+        // At -O0 `run_passes` returns before `resolve_remaining_is_constant`,
+        // so a deferred query would reach the backend as an `IsConstant` node
+        // that the backend calls unreachable, and BOTH arms of a
+        // `__builtin_constant_p` conditional stay live -- an immediate-only
+        // asm operand in the untaken arm then trips the final pipeline
+        // validation (gcc.c-torture pr38789.c at -O0, measured: gcc 16.2 and
+        // clang 23.1.4 accept it at every -O level, lccc rejected it only at
+        // -O0). GCC 16.2 answers 0 at -O0 for anything not already a literal
+        // (measured: a local `int n = sizeof(int)` is 0 at -O0 and 1 at
+        // -O1+), so resolving here is SEMANTIC PARITY, not an optimization:
+        // the untaken arm is never lowered and the -O0 "no optimizer"
+        // contract stays intact.
+        if self.optimization_level == 0 {
+            return Some(Operand::Const(IrConst::I32(0)));
+        }
+        // Defer in every optimizing tier, not only inline candidates. Ordinary
+        // local propagation is enough to make a value constant
+        // (`int n=sizeof(int)`), and GCC reports that at -O1+ even in `main`.
+        // Eagerly returning zero for non-inline functions permanently hid
+        // those opportunities. The lowered value is used only as a constness
+        // query; later folding resolves it to one after mem2reg/constant
+        // propagation, or the final resolver turns it into zero.
         let src = self.lower_expr(arg);
         let src_ty = self.get_expr_type(arg);
         let dest = self.fresh_value();

@@ -693,11 +693,15 @@ impl Lowerer {
                         Some(GlobalInit::Scalar(c)) => Some(c.coerce_to(geo.base_ty)),
                         Some(GlobalInit::Zero) | None => None,
                         Some(GlobalInit::GlobalLabelDiff(a, b, _)) => {
-                            ptr_ranges.push((at, GlobalInit::GlobalLabelDiff(a, b, esz)));
+                            Self::insert_ptr_range(
+                                ptr_ranges,
+                                at,
+                                GlobalInit::GlobalLabelDiff(a, b, esz),
+                            );
                             None
                         }
                         Some(reloc) => {
-                            ptr_ranges.push((at, reloc));
+                            Self::insert_ptr_range(ptr_ranges, at, reloc);
                             None
                         }
                     }

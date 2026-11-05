@@ -1341,13 +1341,14 @@ impl Lowerer {
                     bytes[byte_offset..byte_offset + len].copy_from_slice(&val_bytes[..len]);
                 }
                 GlobalInit::GlobalAddr(_) | GlobalInit::GlobalAddrOffset(_, _) => {
-                    ptr_ranges.push((byte_offset, elem));
+                    Self::insert_ptr_range(&mut ptr_ranges, byte_offset, elem);
                 }
                 GlobalInit::GlobalLabelDiff(lab1, lab2, _) => {
-                    ptr_ranges.push((
+                    Self::insert_ptr_range(
+                        &mut ptr_ranges,
                         byte_offset,
                         GlobalInit::GlobalLabelDiff(lab1, lab2, ptr_size),
-                    ));
+                    );
                 }
                 _ => {}
             }

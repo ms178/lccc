@@ -2856,10 +2856,79 @@ impl Driver {
         // therefore be checked; an always_inline flag is not proof that the
         // body is unemittable.
         for func in &module.functions {
-            if func.is_declaration {
+            if func.is_declaration || func.blocks.is_empty() {
                 continue;
             }
+            // Only blocks the backend can actually EMIT may be validated. A
+            // constant condition (`if (0)`, or `if (__builtin_constant_p(x))`
+            // after the -O0 lowering resolves it to 0) becomes an unconditional
+            // branch; its untaken arm is still present in `func.blocks` at
+            // -O0 (that tier runs no cfg_simplify) but is never emitted.
+            // Checking an immediate-only asm operand in such a dead arm
+            // produced a FALSE error at -O0 (gcc.c-torture pr38789.c, which
+            // gcc 16.2 and clang 23.1.4 accept at every -O level). Measured
+            // proof: `if (0) asm("# DEAD") else asm("# LIVE")` at -O0 emits
+            // only LIVE in lccc -S output. Graph reachability with constant
+            // CondBranch pruning mirrors that emission exactly; a dynamic
+            // condition still keeps BOTH arms reachable and validated.
+            let mut by_label: crate::common::fx_hash::FxHashMap<
+                crate::ir::reexports::BlockId,
+                usize,
+            > = crate::common::fx_hash::FxHashMap::default();
+            for (idx, block) in func.blocks.iter().enumerate() {
+                by_label.insert(block.label, idx);
+            }
+            let mut reachable: crate::common::fx_hash::FxHashSet<crate::ir::reexports::BlockId> =
+                crate::common::fx_hash::FxHashSet::default();
+            let mut worklist = vec![func.blocks[0].label];
+            while let Some(id) = worklist.pop() {
+                if !reachable.insert(id) {
+                    continue;
+                }
+                let Some(&idx) = by_label.get(&id) else {
+                    continue;
+                };
+                use crate::ir::reexports::Terminator;
+                match &func.blocks[idx].terminator {
+                    Terminator::Branch(target) => worklist.push(*target),
+                    Terminator::CondBranch {
+                        cond,
+                        true_label,
+                        false_label,
+                    } => {
+                        // A constant condition has exactly one live successor.
+                        // Anything else (a Value, or a float constant we do
+                        // not want to reason about here) keeps both: being
+                        // conservative can only over-validate, never hide a
+                        // real dynamic immediate operand.
+                        if let crate::ir::reexports::Operand::Const(c) = cond {
+                            let taken = if c.is_nonzero() {
+                                *true_label
+                            } else {
+                                *false_label
+                            };
+                            worklist.push(taken);
+                        } else {
+                            worklist.push(*true_label);
+                            worklist.push(*false_label);
+                        }
+                    }
+                    Terminator::IndirectBranch {
+                        possible_targets, ..
+                    } => {
+                        worklist.extend(possible_targets.iter().copied());
+                    }
+                    Terminator::Switch { cases, default, .. } => {
+                        worklist.push(*default);
+                        worklist.extend(cases.iter().map(|(_, target)| *target));
+                    }
+                    Terminator::Return(_) | Terminator::Unreachable => {}
+                }
+            }
             for block in &func.blocks {
+                if !reachable.contains(&block.label) {
+                    continue;
+                }
                 for (inst_idx, inst) in block.instructions.iter().enumerate() {
                     if let crate::ir::reexports::Instruction::InlineAsm {
                         inputs,

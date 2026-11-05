@@ -282,6 +282,22 @@ pub fn write_relocatable_object(
         });
     }
 
+    // The symbol table is immutable from here until the object is written.
+    // Index name offsets ONCE: every relocation and group signature used to
+    // linearly scan every symtab entry. With 100,000 extern declarations and
+    // 100,000 relocations that is O(N^2) -- callgrind on gcc.c-torture
+    // limits-externdecl.c at 10,000 decls attributed 10.8% of all
+    // instructions to `find_symbol_index_shared` plus the string/Option work
+    // it drags in. `or_insert` keeps the FIRST non-section entry for a name,
+    // exactly what the linear scan returned.
+    let mut sym_by_name_offset: FxHashMap<u32, u32> = FxHashMap::default();
+    sym_by_name_offset.reserve(sym_entries.len());
+    for (i, entry) in sym_entries.iter().enumerate().skip(1) {
+        if entry.st_info & 0xF != STT_SECTION {
+            sym_by_name_offset.entry(entry.st_name).or_insert(i as u32);
+        }
+    }
+
     // ── Build COMDAT group section data ──
     // Each group section contains: GRP_COMDAT flag (u32) + member section indices (u32 each)
     let mut group_section_data: Vec<Vec<u8>> = Vec::new();
@@ -496,7 +512,7 @@ pub fn write_relocatable_object(
                 for reloc in &section.relocs {
                     let sym_idx = find_symbol_index_shared(
                         &reloc.symbol_name,
-                        &sym_entries,
+                        &sym_by_name_offset,
                         &strtab,
                         content_sections,
                     )?;
@@ -586,8 +602,12 @@ pub fn write_relocatable_object(
         for (gi, (group_name, _members)) in comdat_groups.iter().enumerate() {
             let sh_name = shstrtab.offset_of(".group");
             // sh_link = symtab index, sh_info = symbol index of group signature
-            let sig_sym_idx =
-                find_symbol_index_shared(group_name, &sym_entries, &strtab, content_sections)?;
+            let sig_sym_idx = find_symbol_index_shared(
+                group_name,
+                &sym_by_name_offset,
+                &strtab,
+                content_sections,
+            )?;
             write_shdr32(
                 &mut elf,
                 sh_name,
@@ -708,8 +728,12 @@ pub fn write_relocatable_object(
         // Group sections (COMDAT)
         for (gi, (group_name, _members)) in comdat_groups.iter().enumerate() {
             let sh_name = shstrtab.offset_of(".group");
-            let sig_sym_idx =
-                find_symbol_index_shared(group_name, &sym_entries, &strtab, content_sections)?;
+            let sig_sym_idx = find_symbol_index_shared(
+                group_name,
+                &sym_by_name_offset,
+                &strtab,
+                content_sections,
+            )?;
             write_shdr64(
                 &mut elf,
                 sh_name,
@@ -852,29 +876,110 @@ fn section_entsize(section: &ObjSection) -> u64 {
 
 fn find_symbol_index_shared(
     name: &str,
-    sym_entries: &[SymEntry],
+    sym_by_name_offset: &FxHashMap<u32, u32>,
     strtab: &StringTable,
     content_sections: &[String],
 ) -> Result<u32, String> {
     if name.is_empty() {
         return Ok(0);
     }
-    // Check if it's a section symbol
+    // Section symbols still win over named symbols, exactly as before. There
+    // are only a handful of content sections, so this stays a linear scan.
     for (i, sec_name) in content_sections.iter().enumerate() {
         if sec_name == name {
             return Ok((i + 1) as u32); // +1 for NULL entry
         }
     }
-    // Search named symbols (index 0 is the NULL symbol, never a match).
+    // O(1): the linear symtab scan is replaced by the index built once above.
     if let Some(name_offset) = strtab.get(name) {
-        for (i, entry) in sym_entries.iter().enumerate().skip(1) {
-            if entry.st_name == name_offset && entry.st_info & 0xF != STT_SECTION {
-                return Ok(i as u32);
-            }
+        if let Some(&idx) = sym_by_name_offset.get(&name_offset) {
+            return Ok(idx);
         }
     }
     Err(format!(
         "internal assembler error: `{name}` is referenced (relocation or group \
          signature) but has no symbol-table entry and is not a section"
     ))
+}
+
+#[cfg(test)]
+mod symbol_index_tests {
+    use super::*;
+
+    fn mk(st_name: u32, sym_type: u8) -> SymEntry {
+        SymEntry {
+            st_name,
+            st_info: (1 << 4) | sym_type,
+            st_other: 0,
+            st_shndx: 1,
+            st_value: 0,
+            st_size: 0,
+        }
+    }
+
+    /// The prebuilt index must return exactly what the old linear scan
+    /// returned: section names win, first non-STT_SECTION entry wins, and an
+    /// unknown name is an error.
+    #[test]
+    fn indexed_lookup_matches_the_linear_scan() {
+        let mut strtab = StringTable::new();
+        let sections: Vec<String> = vec![".text".into(), ".data".into(), ".rodata".into()];
+        let mut sym_entries = vec![SymEntry {
+            st_name: 0,
+            st_info: 0,
+            st_other: 0,
+            st_shndx: 0,
+            st_value: 0,
+            st_size: 0,
+        }];
+        for _ in &sections {
+            sym_entries.push(SymEntry {
+                st_name: 0,
+                st_info: STT_SECTION,
+                ..mk(0, 0)
+            });
+        }
+        let names = ["foo", "bar", "baz", "dup", "foo2"];
+        let offsets: Vec<u32> = names.iter().map(|n| strtab.add(n)).collect();
+        sym_entries.push(mk(offsets[0], 0)); // foo
+        sym_entries.push(mk(offsets[1], 0)); // bar
+        sym_entries.push(mk(offsets[3], 0)); // dup, first
+        sym_entries.push(mk(offsets[3], 0)); // dup again: first must still win
+        sym_entries.push(SymEntry {
+            st_name: offsets[2],
+            st_info: STT_SECTION,
+            ..mk(offsets[2], 0)
+        }); // baz: section-typed, must be skipped
+        let mut index: FxHashMap<u32, u32> = FxHashMap::default();
+        for (i, entry) in sym_entries.iter().enumerate().skip(1) {
+            if entry.st_info & 0xF != STT_SECTION {
+                index.entry(entry.st_name).or_insert(i as u32);
+            }
+        }
+        let linear = |name: &str| -> Option<u32> {
+            if name.is_empty() {
+                return Some(0); // NULL symbol, same contract as the real helper
+            }
+            for (i, sec) in sections.iter().enumerate() {
+                if sec == name {
+                    return Some((i + 1) as u32);
+                }
+            }
+            let off = strtab.get(name)?;
+            sym_entries.iter().enumerate().skip(1).find_map(|(i, e)| {
+                (e.st_name == off && e.st_info & 0xF != STT_SECTION).then_some(i as u32)
+            })
+        };
+        for name in [
+            "", ".text", ".data", ".rodata", "foo", "bar", "baz", "dup", "foo2", "unknown", ".bss",
+        ] {
+            let got = find_symbol_index_shared(name, &index, &strtab, &sections).ok();
+            let want = linear(name);
+            assert_eq!(got, want, "name={name:?}");
+        }
+        assert_eq!(
+            find_symbol_index_shared("", &index, &strtab, &sections),
+            Ok(0)
+        );
+    }
 }
