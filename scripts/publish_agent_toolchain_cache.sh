@@ -6,7 +6,7 @@
 # job); all bytes are verified before they enter the tag.
 set -Eeuo pipefail
 
-TAG=${TAG:-harness-cache-7}
+TAG=${TAG:-harness-cache-8}
 REMOTE=${REMOTE:-origin}
 WORK=${WORK:-${RUNNER_TEMP:-/tmp}/agent-toolchain-cache}
 REPO=${GITHUB_REPOSITORY:-ms178/lccc}
@@ -28,7 +28,18 @@ log() { printf '[agent-cache] %s\n' "$*" >&2; }
 die() { printf '[agent-cache] FATAL: %s\n' "$*" >&2; exit 1; }
 need() { for t in "$@"; do command -v "$t" >/dev/null 2>&1 || die "missing tool: $t"; done; }
 
-need git curl tar xz sha256sum split dpkg-deb python3 gh gcc cc make docker
+# A raw job log is not always reachable from the check-run API, which is what a
+# reviewer of a red publisher run actually sees. Report the failing command and
+# line as an annotation so the next failure is diagnosable without the log.
+on_error() {
+    local rc=$? line=${BASH_LINENO[0]:-?} cmd=${BASH_COMMAND:-?}
+    printf '::error title=agent-cache publisher::line %s: %s (exit %s)\n' \
+        "$line" "$cmd" "$rc" >&2
+    exit "$rc"
+}
+trap on_error ERR
+
+need git curl tar xz zstd sha256sum split dpkg-deb python3 gh gcc cc make docker
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$ROOT"
 
@@ -76,6 +87,66 @@ MOLD_SHA=$(sed -n 's/^SHA256=\([0-9a-f]\{64\}\)$/\1/p' scripts/ci_install_mold_o
 fetch "$SRC/mold-3.0.0-x86_64-linux.tar.gz" https://github.com/rui314/mold/releases/download/v3.0.0/mold-3.0.0-x86_64-linux.tar.gz
 verify "$SRC/mold-3.0.0-x86_64-linux.tar.gz" "$MOLD_SHA"
 cp "$SRC/mold-3.0.0-x86_64-linux.tar.gz" "$FILES/mold-3.0.0-x86_64-linux.tar.gz"
+
+# -- Clang: the LIVE pin, staged from the digest-verified official asset -------
+# Deriving the version from the single enforcing file (rather than repeating a
+# release here) is what stops a published tag from silently carrying a
+# superseded oracle. The installer verifies the SHA-256 GitHub publishes for
+# that exact asset, so the bytes entering the tag are the bytes CI installs.
+CLANG_VERSION=$(sed -n 's/^VERSION=\([0-9.]*\)$/\1/p' scripts/ci_install_clang_oracle.sh)
+[ -n "$CLANG_VERSION" ] || die "cannot read the Clang pin from scripts/ci_install_clang_oracle.sh"
+CLANG_ROOT="clang-$CLANG_VERSION"
+log "installing the pinned Clang $CLANG_VERSION oracle from the official LLVM asset"
+rm -rf "$WORK/clang-prefix" "$STAGE/$CLANG_ROOT"
+bash scripts/ci_install_clang_oracle.sh --prefix "$WORK/clang-prefix"
+[ -x "$WORK/clang-prefix/bin/clang" ] || die "Clang installer produced no driver"
+staged_clang=$("$WORK/clang-prefix/bin/clang" -dumpversion)
+[ "$staged_clang" = "$CLANG_VERSION" ] || \
+    die "staged Clang reports $staged_clang, expected $CLANG_VERSION"
+mkdir -p "$STAGE/$CLANG_ROOT"
+cp -a "$WORK/clang-prefix/." "$STAGE/$CLANG_ROOT/"
+printf 'Clang %s - official LLVM asset, verified by scripts/ci_install_clang_oracle.sh\n' \
+    "$CLANG_VERSION" > "$STAGE/$CLANG_ROOT/PIN"
+tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -I 'xz -T2 -6' \
+    -cf "$FILES/clang-$CLANG_VERSION-linux-x64.tar.xz" -C "$STAGE" "$CLANG_ROOT"
+
+# -- GDB: pinned source build with -march=haswell ----------------------------
+# The DWARF gates fail closed on a debugger that is absent or unpinned, so the
+# cache must carry an exact GDB 18.1 built for the ISA contract LCCC ships.
+# Reuse the very installer that enforces the pin (digest, march, ISA census,
+# line-table probe) inside the same bookworm container as binutils: one build
+# recipe, broad glibc compatibility, no duplicated configure flags.
+GDB_VERSION=$(sed -n 's/^GDB_VERSION=\([0-9.]*\)$/\1/p' scripts/ci_install_gdb_oracle.sh)
+[ -n "$GDB_VERSION" ] || die "cannot read the GDB pin from scripts/ci_install_gdb_oracle.sh"
+GDB_ROOT="gdb-$GDB_VERSION"
+log "building pinned GDB $GDB_VERSION (-march=haswell) in a bookworm container"
+cp scripts/ci_install_gdb_oracle.sh "$WORK/gdb-installer.sh"
+cat > "$WORK/build-gdb.sh" <<'EOS'
+#!/bin/bash
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y --no-install-recommends build-essential curl ca-certificates \
+    xz-utils make gcc g++ python3 binutils libgmp-dev libmpfr-dev \
+    libreadline-dev zlib1g-dev libexpat1-dev >/dev/null
+bash /work/gdb-installer.sh --prefix /work/gdb-prefix
+EOS
+chmod +x "$WORK/build-gdb.sh"
+docker run --rm -v "$WORK:/work" -w /work debian:bookworm bash /work/build-gdb.sh
+sudo chown -R "$(id -u):$(id -g)" "$WORK/gdb-prefix"
+[ -x "$WORK/gdb-prefix/bin/gdb" ] || die "GDB installer produced no debugger"
+# Capture the whole banner: `... | head -1` under pipefail lets the writer die
+# of SIGPIPE on line two, which reads as a flaky publisher failure.
+gdb_output=$("$WORK/gdb-prefix/bin/gdb" --version)
+gdb_banner=${gdb_output%%$'\n'*}
+[ "$gdb_banner" = "GNU gdb (GDB) $GDB_VERSION" ] || \
+    die "staged GDB reports '$gdb_banner', expected 'GNU gdb (GDB) $GDB_VERSION'"
+grep -qx 'march=haswell' "$WORK/gdb-prefix/.lccc-build" || \
+    die "staged GDB was not built with -march=haswell"
+rm -rf "$STAGE/$GDB_ROOT"; mkdir -p "$STAGE/$GDB_ROOT"
+cp -a "$WORK/gdb-prefix/." "$STAGE/$GDB_ROOT/"
+tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -I 'xz -T2 -6' \
+    -cf "$FILES/gdb-$GDB_VERSION-linux-x64.tar.xz" -C "$STAGE" "$GDB_ROOT"
 
 log "building bookworm-compatible binutils 2.47 binaries in a Debian bookworm container"
 BINUTILS_ROOT=binutils-2.47-x86_64-linux
@@ -192,10 +263,11 @@ printf '%s sha256:digested-by-tag-manifest\n' "$KVER" > "$STAGE/$KREL_ROOT/STAMP
 tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -I 'xz -T2 -6' \
     -cf "$FILES/$KREL_ROOT.tar.xz" -C "$STAGE" "$KREL_ROOT"
 
-log "functional smoke test: GCC 16.2 + Debian binutils 2.47 + mold 3.0.0 + Clang $CLANG_VERSION + QEMU i386"
+log "functional smoke test: GCC 16.2 + Debian binutils 2.47 + mold 3.0.0 + Clang $CLANG_VERSION + GDB $GDB_VERSION + QEMU i386"
 mkdir -p "$EXTRACT/tools"
 tar -xf "$FILES/gcc-16.2.0-bookworm-x86_64.tar.xz" -C "$EXTRACT/tools"
 tar -xf "$FILES/clang-$CLANG_VERSION-linux-x64.tar.xz" -C "$EXTRACT/tools"
+tar -xf "$FILES/gdb-$GDB_VERSION-linux-x64.tar.xz" -C "$EXTRACT/tools"
 tar -xf "$FILES/rust-1.99.1-x86_64-unknown-linux-gnu.tar.xz" -C "$EXTRACT/tools"
 tar -xf "$FILES/mold-3.0.0-x86_64-linux.tar.gz" -C "$EXTRACT/tools"
 tar -xf "$FILES/binutils-2.47-x86_64-linux.tar.xz" -C "$EXTRACT/tools"
@@ -203,11 +275,15 @@ GCC_BIN=$(find "$EXTRACT/tools" -type f -name gcc-16 -perm -111 | head -1)
 CLANG_BIN=$(find "$EXTRACT/tools" -type f \( -name 'clang-23*' -o -name 'clang' \) -perm -111 | head -1)
 RUSTC_BIN=$(find "$EXTRACT/tools" -type f -name rustc -perm -111 | head -1)
 MOLD_BIN=$(find "$EXTRACT/tools" -type f -name mold -perm -111 | head -1)
-[ -n "$GCC_BIN" ] && [ -n "$CLANG_BIN" ] && [ -n "$RUSTC_BIN" ] && [ -n "$MOLD_BIN" ] || die "tool binaries missing from archives"
+GDB_BIN=$(find "$EXTRACT/tools" -type f -name gdb -perm -111 | head -1)
+[ -n "$GCC_BIN" ] && [ -n "$CLANG_BIN" ] && [ -n "$RUSTC_BIN" ] && [ -n "$MOLD_BIN" ] && [ -n "$GDB_BIN" ] || die "tool binaries missing from archives"
 "$GCC_BIN" --version | head -1
 "$CLANG_BIN" --version | head -1
 "$RUSTC_BIN" --version
 "$MOLD_BIN" --version
+gdb_output=$("$GDB_BIN" --version)
+[ "${gdb_output%%$'\n'*}" = "GNU gdb (GDB) $GDB_VERSION" ] \
+    || die "cached GDB is not the pinned $GDB_VERSION oracle"
 BI="$EXTRACT/tools/$BINUTILS_ROOT"
 ALL_LIBS=$(find "$EXTRACT/tools" -type d \( -name lib -o -name lib64 -o -path '*/usr/lib/x86_64-linux-gnu' \) -print | paste -sd: -)
 export LD_LIBRARY_PATH="$ALL_LIBS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -232,11 +308,12 @@ C
 "$STAGE/$QEMU_ROOT/bin/qemu-i386" "$TEST/probe32" || [ $? = 42 ] || die "qemu-i386 did not run the 32-bit probe"
 
 log "writing metadata"
-python3 - "$FILES" "$TAG" "$STAGE/$KREL_ROOT" "$CLANG_VERSION" "$QEMU_VERSION" "$KVER" <<'PY'
+python3 - "$FILES" "$TAG" "$STAGE/$KREL_ROOT" "$CLANG_VERSION" "$QEMU_VERSION" "$KVER" "$GDB_VERSION" <<'PY'
 import hashlib, json, os, sys
 from pathlib import Path
 files=Path(sys.argv[1]); tag=sys.argv[2]; clang_version=sys.argv[4]
 qemu_version=sys.argv[5]; kver=sys.argv[6].removeprefix('v')
+gdb_version=sys.argv[7]
 def digest(p):
     with open(p,'rb') as f: return hashlib.file_digest(f,'sha256').hexdigest()
 tools={}
@@ -253,6 +330,7 @@ for name,ver,fn in [
  ('binutils-source','2.47','binutils-2.47-source.tar.xz'),
  ('arm-a64-xml','2026-09','ISA_A64_xml_A_profile-2026-09_md.tar.gz'),
  ('clang',clang_version,f'clang-{clang_version}-linux-x64.tar.xz'),
+ ('gdb',gdb_version,f'gdb-{gdb_version}-linux-x64.tar.xz'),
  ('rust','1.99.1','rust-1.99.1-x86_64-unknown-linux-gnu.tar.xz'),
  ('mold','3.0.0','mold-3.0.0-x86_64-linux.tar.gz'),
  ('binutils','2.47','binutils-2.47-x86_64-linux.tar.xz'),
@@ -260,11 +338,31 @@ for name,ver,fn in [
  ('kernel-relocs',kver,f'kernel-relocs-v{kver}-x86_64.tar.xz')]:
     add(name,ver,fn,top(fn),'tar.gz' if fn.endswith('.gz') else 'tar.xz')
 cache={'schema':1,'repository':'ms178/lccc','tag':tag,'part_size':90*1024*1024,
-       'tools':tools,'priority':['rust','clang','gcc','binutils','mold','qemu','kernel-relocs','arm-a64-xml','debs-bookworm','binutils-source'],
-       'provenance':{'debian_sid_packages':'debian-debs.sha256 (QEMU user)','binutils':'one-time build from pinned 2.47 source in Debian bookworm container','kernel':f'v{kver} stable kernel.org tree (sources pinned by tests/linker/setup_kernel_tools.sh)','mold':'rui314/mold v3.0.0 release','clang':f'official LLVM {clang_version} asset, staged by scripts/ci_install_clang_oracle.sh','rust':'harness-cache-4 release asset'}}
+       'tools':tools,'priority':['rust','clang','gcc','gdb','binutils','mold','qemu','kernel-relocs','arm-a64-xml','debs-bookworm','binutils-source'],
+       'provenance':{'debian_sid_packages':'debian-debs.sha256 (QEMU user)','binutils':'one-time build from pinned 2.47 source in Debian bookworm container','kernel':f'v{kver} stable kernel.org tree (sources pinned by tests/linker/setup_kernel_tools.sh)','mold':'rui314/mold v3.0.0 release','clang':f'official LLVM {clang_version} asset, staged by scripts/ci_install_clang_oracle.sh','gdb':f'GNU GDB {gdb_version} built with -march=haswell by scripts/ci_install_gdb_oracle.sh','rust':'harness-cache-4 release asset'}}
 (files/'CACHE.json').write_text(json.dumps(cache,indent=2,sort_keys=True)+'\n')
 (files/'MANIFEST.sha256').write_text(''.join(f"{v['sha256']}  {v['file']}\n" for _,v in sorted(tools.items())) + f"{digest(files/'CACHE.json')}  CACHE.json\n")
 (files/'README.md').write_text(f'''# {tag}\n\nGitHub-only toolchain cache for network-constrained agents.\n\n```\ngit fetch origin tag {tag}\npython3 scripts/restore_agent_toolchain_cache.py --tag {tag} --prefix /path/to/toolchains\n. /path/to/toolchains/env.sh\n```\n\nEvery file is split into <90 MiB parts and verified against MANIFEST.sha256.\nCACHE.json records the tool versions, roots, sizes and digests.\n''')
+PY
+
+# A cache is an input contract, not a scrapheap. Refuse to publish any
+# retired toolchain: the MSRV floor, the superseded Clang/QEMU/relocs payloads.
+python3 - "$FILES/CACHE.json" "$FILES" <<'PY'
+import json, sys
+from pathlib import Path
+cache=json.loads(Path(sys.argv[1]).read_text()); files=Path(sys.argv[2])
+banned_names={'rust-msrv','clang-tag-tree'}
+bad=[n for n in list(cache['tools'])+cache.get('priority',[]) if n in banned_names]
+obsolete=('1.97.0','23.1.4','11.1.2','v7.3-x86_64','2.42.1')
+for name,spec in cache['tools'].items():
+    if any(s in spec['file'] for s in obsolete):
+        bad.append(f"{name}={spec['file']}")
+for path in files.iterdir():
+    if path.is_file() and any(s in path.name for s in obsolete):
+        bad.append(path.name)
+if bad:
+    sys.exit('refusing to publish obsolete cache payloads: '+', '.join(sorted(bad)))
+print('cache content guard: current tools only, no obsolete payloads')
 PY
 
 log "splitting payloads into <90 MiB parts"

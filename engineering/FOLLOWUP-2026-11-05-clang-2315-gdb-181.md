@@ -582,3 +582,56 @@ not installable here (the release-asset CDN and toolchain hosts are outside
 this sandbox's allowlist), so no three-way oracle comparison, no SIMD matrix
 re-derivation and no hosted publish were performed. Those remain the honest
 scope boundary of this audit; hosted CI supplies them.
+
+---
+
+## 10. Post-merge cache refresh (supersedes §1.1, §7 items 4–6 and §9 above)
+
+The "**Not claimed**" paragraph above and the §1/§7 statements about
+superseded published payloads describe the state of that audit, not of the
+tree after the merge. They are superseded by this section.
+
+The merged tree could not refresh the cache at all:
+`scripts/publish_agent_toolchain_cache.sh` referenced an undefined
+`$CLANG_VERSION` and a Clang archive no step ever staged, so a dispatched
+publisher run failed at step 3 under `set -Eeuo pipefail`. The surviving
+`harness-cache-7` tag still carried `rust-1.97.0-msrv.tar.xz.part00/part01`,
+`clang-23.1.4-linux-x64.tar.xz.part00`, `qemu-user-11.1.2-x86_64.tar.xz.part00`
+and `kernel-relocs-v7.3-x86_64.tar.xz.part00`, and had no GDB payload — so the
+DWARF gates could only skip their debugger cross-check.
+
+Alternatives considered:
+
+| Option | Pros | Cons | Verdict |
+|---|---|---|---|
+| Keep `harness-cache-7`, document the stale blobs | zero work | installs old tools; gates still skip; does not satisfy the requirement | rejected |
+| Force-update `harness-cache-7` to a new tree | no reference churn | silently moves an "immutable" tag other consumers may have verified; supply-chain hazard | rejected |
+| Publish `harness-cache-8`, repoint every reference, delete the obsolete tag/asset | preserves immutability, provable provenance, actual deletion | requires a coordinated lock/freshness/test/docs update | **chosen** |
+
+Implementation:
+
+* `CLANG_VERSION` is derived from `scripts/ci_install_clang_oracle.sh` (the
+  single enforcing pin) and the installer's digest-verified 23.1.5 prefix is
+  staged into the tag; `-dumpversion` identity is re-checked before packaging.
+* GDB 18.1 is built by `scripts/ci_install_gdb_oracle.sh` inside the same
+  bookworm container as binutils. Reusing that installer keeps one digest, one
+  `-march=haswell` contract, one ISA census and one line-table probe; the
+  stamp's `march=haswell` line is asserted before packaging.
+* A content guard refuses to publish any payload named for a retired version
+  (1.97.0 / 23.1.4 / 11.1.2 / v7.3-x86_64 / 2.42.1) and rejects retired tool
+  names. `tests/corpus/test_agent_cache_publisher.py` executes that guard
+  against clean and obsolete fixtures.
+* An ERR trap emits a GitHub annotation with the failing line and command,
+  because raw job logs are unreachable from the check-run API.
+* `agent-cache-lock.json`, the restorer's default tag, the workflow input, the
+  freshness checker and the docs switch to `harness-cache-8`. The five
+  superseded pin facts and their `INFO_ROWS` exceptions are deleted; the
+  offline check now compares **every** lock entry (including clang, qemu,
+  kernel-relocs and gdb) against its live enforcing pin.
+* `cache-lock.json` loses its obsolete 23.1.4 Clang asset entry; the release
+  asset itself and the old `harness-cache-7` / `rust-cache-1.97.0` tags are
+  deleted, so no transport can serve retired bytes.
+
+Result: the cache carries only current tools, GDB is present and pinned, and
+`env.sh` exports `GDB` at the exact restored binary — the DWARF gates no longer
+have to skip.

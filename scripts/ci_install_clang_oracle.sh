@@ -17,13 +17,11 @@
 # GitHub Actions the script also exports CLANG=<that binary> through
 # $GITHUB_ENV so every later step's gate resolves the oracle via $CLANG.
 #
-# This installer is the single live Clang pin of the repository. The
-# `harness-cache-4` release asset and the `harness-cache-7` tag payload still
-# carry a repacked 23.1.4 (a main-branch patch cannot re-issue release assets);
-# both are recorded as superseded transport payloads in
-# scripts/check_toolchain_cache_freshness.py and are re-issued as 23.1.5 by
-# scripts/publish_toolchain_cache.py / publish_agent_toolchain_cache.sh on
-# their next hosted run.
+# This installer is the single live Clang pin of the repository and the single
+# source of the cache payload: publish_agent_toolchain_cache.sh derives the
+# version from here, stages this installer's verified prefix into the tag, and
+# refuses to publish a retired version. The obsolete 23.1.4 release asset and
+# tag payload were deleted, so no transport can serve a stale oracle.
 set -Eeuo pipefail
 
 VERSION=23.1.5
