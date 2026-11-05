@@ -826,9 +826,18 @@ pub fn peephole_optimize(asm: String) -> String {
 
 // ── Pass 1: Adjacent store/load elimination ──────────────────────────────────
 //
-// Pattern: sd/sw tX, off(s0)  ;  ld/lw tX, off(s0)  (same reg, same offset)
+// Pattern: sd tX, off(s0)  ;  ld tX, off(s0)  (same reg, same offset)
 // The load is redundant because the value is already in the register.
 // Also handles: sd rX, off(s0)  ;  ld rY, off(s0)  → mv rY, rX
+//
+// A word pair is NOT an identity: `sw` stores the low 32 bits, and `lw`
+// returns them SIGN-EXTENDED, whatever the register's upper half held.  LCCC
+// keeps an `unsigned int` zero-extended, so `(int)u` through a frame slot is
+// `sw t0; lw t0` with a real sign extension in the load (0x8000_0000 must
+// come back as 0xffff_ffff_8000_0000).  The word form therefore becomes
+// `sext.w rY, rX` -- one ALU op instead of a load, the same rule as AArch64's
+// `str wN; ldrsw xM` -> `sxtw xM, wN` -- and `eliminate_redundant_sext_w`
+// deletes it when rX is provably sign-extended already.
 
 fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
@@ -853,20 +862,8 @@ fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n
                 } = kinds[j]
                 {
                     if store_off == load_off && store_word == load_word {
-                        if store_reg == load_reg {
-                            // Same register: eliminate the load
-                            kinds[j] = LineKind::Nop;
-                            changed = true;
-                        } else {
-                            // Different register: replace load with mv
-                            lines[j] =
-                                format!("    mv {}, {}", reg_name(load_reg), reg_name(store_reg));
-                            kinds[j] = LineKind::Move {
-                                dst: load_reg,
-                                src: store_reg,
-                            };
-                            changed = true;
-                        }
+                        forward_stored_value(lines, kinds, j, load_reg, store_reg, store_word);
+                        changed = true;
                     }
                 }
             }
@@ -874,6 +871,34 @@ fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n
         i += 1;
     }
     changed
+}
+
+/// Replace the frame load at `j` with the value a same-sized store left in
+/// `stored`: a doubleword reload is a copy (or nothing), a word reload is the
+/// sign extension `lw` performs (see the pass header).
+fn forward_stored_value(
+    lines: &mut [String],
+    kinds: &mut [LineKind],
+    j: usize,
+    load_reg: u8,
+    stored: u8,
+    is_word: bool,
+) {
+    if is_word {
+        lines[j] = format!("    sext.w {}, {}", reg_name(load_reg), reg_name(stored));
+        kinds[j] = LineKind::SextW {
+            dst: load_reg,
+            src: stored,
+        };
+    } else if load_reg == stored {
+        kinds[j] = LineKind::Nop;
+    } else {
+        lines[j] = format!("    mv {}, {}", reg_name(load_reg), reg_name(stored));
+        kinds[j] = LineKind::Move {
+            dst: load_reg,
+            src: stored,
+        };
+    }
 }
 
 // ── Pass 6: far-jump → near-jump rewrite (auipc;jr → jal) ───────────────────
@@ -1414,7 +1439,10 @@ fn eliminate_redundant_sext_w(lines: &[String], kinds: &mut [LineKind], n: usize
                 i += 1;
                 continue;
             }
-            LineKind::Nop | LineKind::Directive => {
+            // A frame store defines no register: every fact survives it, so
+            // the `sext.w` a forwarded word reload became (see
+            // `forward_stored_value`) still meets the producer's proof.
+            LineKind::Nop | LineKind::Directive | LineKind::StoreS0 { .. } => {
                 i += 1;
                 continue;
             }
@@ -1435,6 +1463,12 @@ fn eliminate_redundant_sext_w(lines: &[String], kinds: &mut [LineKind], n: usize
                 continue;
             }
             wide |= 1u64 << dst; // sext.w always produces a sext-wide dest
+            i += 1;
+            continue;
+        }
+        // Any other store defines no GP register either (RISC-V has no
+        // writeback addressing): keep every fact across it.
+        if rv_is_store(lines[i].trim()) {
             i += 1;
             continue;
         }
@@ -2864,20 +2898,9 @@ fn global_store_forwarding(lines: &mut [String], kinds: &mut [LineKind], n: usiz
                     .map(|(_, m)| *m);
 
                 if let Some(mapping) = mapping {
-                    if load_reg == mapping.reg {
-                        // Same register: eliminate the redundant load
-                        kinds[i] = LineKind::Nop;
-                        changed = true;
-                    } else {
-                        // Different register: replace load with mv
-                        lines[i] =
-                            format!("    mv {}, {}", reg_name(load_reg), reg_name(mapping.reg));
-                        kinds[i] = LineKind::Move {
-                            dst: load_reg,
-                            src: mapping.reg,
-                        };
-                        changed = true;
-                    }
+                    // A word reload sign-extends: `sext.w`, never a plain copy.
+                    forward_stored_value(lines, kinds, i, load_reg, mapping.reg, mapping.is_word);
+                    changed = true;
                 }
                 // The load overwrites load_reg, invalidate any slot backed by it
                 if (load_reg as usize) < NUM_REGS {
@@ -6032,5 +6055,89 @@ mod frame_store_census_tests {
         let out = code_lines(&peephole_optimize(asm.to_string()));
         assert!(!out.iter().any(|l| l == "sd t0, -24(s0)"), "{out:?}");
         assert!(out.iter().any(|l| l == "flw fa0, -40(s0)"), "{out:?}");
+    }
+}
+
+#[cfg(test)]
+mod word_reload_tests {
+    use super::peephole_optimize;
+
+    fn code_lines(asm: &str) -> Vec<String> {
+        asm.lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    fn opt(asm: &str) -> Vec<String> {
+        code_lines(&peephole_optimize(asm.to_string()))
+    }
+
+    /// `sw` keeps the low word and `lw` returns it sign-extended, so a reload
+    /// forwarded from a word store is a sign extension, never a plain copy.
+    /// The boundary witness `integer_pointer_width.c` caught the copy form:
+    /// `(void *)(int32_t)u` at -O0 returned 0x8000_0000 for 0x8000_0000.
+    #[test]
+    fn an_adjacent_word_reload_is_a_sign_extension() {
+        let out = opt("f:\n    sw t0, -24(s0)\n    lw t0, -24(s0)\n    mv a0, t0\n    ret\n");
+        assert!(
+            out.iter()
+                .any(|l| l == "sext.w a0, t0" || l == "sext.w t0, t0"),
+            "{out:?}"
+        );
+        assert!(!out.iter().any(|l| l.starts_with("lw ")), "{out:?}");
+        let out = opt("f:\n    sw t0, -24(s0)\n    lw a0, -24(s0)\n    ret\n");
+        assert!(out.iter().any(|l| l == "sext.w a0, t0"), "{out:?}");
+        assert!(!out.iter().any(|l| l == "mv a0, t0"), "{out:?}");
+    }
+
+    /// The same rule across unrelated code (`global_store_forwarding`).
+    #[test]
+    fn a_forwarded_word_reload_is_a_sign_extension() {
+        let out = opt(
+            "f:\n    sw t0, -24(s0)\n    addi t2, t3, 1\n    lw t1, -24(s0)\n    \
+             add a0, t1, t2\n    ret\n",
+        );
+        assert!(
+            out.iter()
+                .any(|l| l.starts_with("sext.w ") && l.ends_with(", t0")),
+            "{out:?}"
+        );
+        assert!(!out.iter().any(|l| l == "mv t1, t0"), "{out:?}");
+    }
+
+    /// A doubleword reload is still a copy, and a word whose producer already
+    /// sign-extends (`addw`) needs no extension at all: the store in between
+    /// defines no register, so the producer's proof survives it.
+    #[test]
+    fn sign_extended_words_and_doublewords_forward_for_free() {
+        let out = opt(
+            "f:\n    addw t0, a0, a1\n    sw t0, -24(s0)\n    lw t0, -24(s0)\n    \
+             mv a0, t0\n    ret\n",
+        );
+        assert!(!out.iter().any(|l| l.starts_with("sext.w")), "{out:?}");
+        assert!(!out.iter().any(|l| l.starts_with("lw ")), "{out:?}");
+        let out = opt("f:\n    sd t0, -24(s0)\n    ld a0, -24(s0)\n    ret\n");
+        assert!(out.iter().any(|l| l == "mv a0, t0"), "{out:?}");
+    }
+
+    /// The -O0 shape of `(int32_t)u` end to end: the zero-extended unsigned
+    /// value is staged, reloaded unsigned and sign-extended; folding the
+    /// `lwu; sext.w` pair into `lw` must not let the word store swallow it.
+    #[test]
+    fn an_unsigned_to_int_cast_through_the_frame_keeps_its_extension() {
+        let out = opt(
+            "s32:\n    slli t0, a0, 32\n    srli t0, t0, 32\n    sd t0, -24(s0)\n    \
+             lwu t0, -24(s0)\n    sd t0, -24(s0)\n    ld t0, -24(s0)\n    sw t0, -24(s0)\n    \
+             lwu t0, -24(s0)\n    sd t0, -32(s0)\n    sext.w t0, t0\n    sd t0, -40(s0)\n    \
+             sext.w t0, t0\n    sd t0, -48(s0)\n    mv a0, t0\n    ret\n",
+        );
+        let ret = out.iter().position(|l| l == "ret").expect("ret");
+        assert!(
+            out[..ret]
+                .iter()
+                .any(|l| l.starts_with("sext.w") || l.starts_with("lw ")),
+            "{out:?}"
+        );
     }
 }
