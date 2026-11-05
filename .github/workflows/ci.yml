@@ -604,6 +604,10 @@ jobs:
       run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 GCC=gcc-16 bash tests/regression/check_type_attr_and_static_init.sh
     - name: GCC 16.2 inline-asm constraint grammar on both ABIs
       run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 GCC=gcc-16 bash tests/regression/check_gcc_asm_constraints.sh
+    - name: Byte-exact .ascii string literals on both ABIs
+      run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 bash tests/regression/check_string_literal_emission.sh
+    - name: O(n) i686 dead-move census differential equivalence
+      run: env CCC_I686=target/fastbuild/lccc-i686 bash tests/regression/check_i686_dead_move_census.sh
     - name: GCC 16.2 per-vectorizer tri-state and serial OpenMP policy
       run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 GCC=gcc-16 bash tests/regression/check_vectorizer_openmp_policy.sh
     - name: GNU declaration corners and tentative definitions on both ABIs

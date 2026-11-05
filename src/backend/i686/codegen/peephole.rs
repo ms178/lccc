@@ -7129,10 +7129,85 @@ fn is_callee_saved_reg(reg: RegId) -> bool {
     matches!(reg, REG_EBX | REG_ESI | REG_EDI | REG_EBP)
 }
 
+/// Per-function read census for the dead-move fallback.
+///
+/// The fallback used to call `census_reg_reads` once per candidate move, and
+/// that helper walks the WHOLE function. On a single large function (the
+/// GCC torture case `20001226-1.c` expands to ~87k assembly lines) that is
+/// O(lines^2): 25.5 s of a 27 s peephole run at 2048 branches. The census is
+/// a pure count, so it can be computed once per function and maintained
+/// incrementally: this pass only ever NOPS a line, which can remove reads but
+/// never adds one. Every retirement subtracts that line's exact read mask,
+/// keeping the answer bit-for-bit identical to the old per-candidate scan.
+#[derive(Clone, Copy, Default)]
+struct FunctionReadCensus {
+    has_ret: bool,
+    ret_uses_ecx: bool,
+    /// Read counts for GP registers `REG_EAX..=REG_GP_MAX`.
+    reads: [u32; 8],
+}
+
+/// Bit `r` is set iff `census_reg_reads(..., r)` would count line `k` as a
+/// read of GP register `r`. This is the exact per-line predicate of that
+/// helper, factored out so one pass over the function serves every register.
+#[inline]
+fn line_gpr_read_mask(store: &LineStore, infos: &[LineInfo], k: usize) -> u8 {
+    if infos[k].is_nop() || is_debug_location(store, infos, k) {
+        return 0;
+    }
+    match infos[k].kind {
+        LineKind::InlineAsm | LineKind::JmpIndirect => return 0xff,
+        LineKind::Call => return (1u8 << REG_EAX) | (1u8 << REG_ECX) | (1u8 << REG_EDX),
+        _ => {}
+    }
+    let line = trimmed(store, &infos[k], k);
+    let mut mask = 0u8;
+    for reg in REG_EAX..=REG_GP_MAX {
+        let explicitly = line_references_reg_explicit(line, reg);
+        if (explicitly || line_implicitly_reads(line, reg)) && !line_writes_reg_purely(line, reg) {
+            mask |= 1u8 << reg;
+        }
+    }
+    mask
+}
+
+/// NOP line `i` and subtract its reads from the owning function's census.
+/// Must be used for EVERY retirement inside `eliminate_dead_reg_moves`; a
+/// stale (over-counted) census is conservative, but would change the emitted
+/// assembly relative to the exact per-candidate scan this replaces.
+#[inline]
+fn retire_line_for_census(
+    i: usize,
+    infos: &mut [LineInfo],
+    masks: &mut [u8],
+    func_of: &[usize],
+    censuses: &mut [FunctionReadCensus],
+) {
+    let mask = masks[i];
+    if mask != 0 {
+        let f = func_of[i];
+        if f != usize::MAX {
+            let reads = &mut censuses[f].reads;
+            for (r, n) in reads.iter_mut().enumerate() {
+                if mask & (1u8 << r) != 0 {
+                    debug_assert!(*n > 0, "census underflow at line {i}");
+                    *n -= 1;
+                }
+            }
+        }
+        masks[i] = 0;
+    }
+    infos[i].kind = LineKind::Nop;
+}
+
 fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
     let len = infos.len();
     let mut changed = false;
     const WINDOW: usize = 16;
+    // Differential oracle: recompute the census per candidate with the old
+    // whole-function scan. Off by default; the regression gate compiles the
+    // same inputs with and without it and requires byte-identical objects.
+    let slow_census = std::env::var_os("CCC_SLOW_DEAD_MOVE_CENSUS").is_some();
 
     // Detect a real frame pointer: `movl %esp, %ebp` in the prologue, or any
     // %ebp-relative addressing. Either means %ebp is load-bearing and must not
@@ -7164,6 +7239,32 @@ fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
                 s = idx;
             }
         }
+    }
+
+    // One O(lines) census instead of one O(function-size) scan per candidate.
+    // `bounds` is contiguous and covers [0, len) because the loop above
+    // always closes with (s, len); `func_of` therefore maps every line.
+    let mut func_of = vec![usize::MAX; len];
+    let mut masks = vec![0u8; len];
+    let mut censuses: Vec<FunctionReadCensus> = Vec::with_capacity(bounds.len());
+    for (f, &(s, e)) in bounds.iter().enumerate() {
+        let mut census = FunctionReadCensus::default();
+        if s <= e && e <= len {
+            func_of[s..e].fill(f);
+        }
+        census.has_ret = (s..e)
+            .any(|k| !infos[k].is_nop() && matches!(infos[k].kind, LineKind::Ret | LineKind::RetN));
+        census.ret_uses_ecx = return_use_markers(store, infos, s, e).1;
+        for k in s..e {
+            let mask = line_gpr_read_mask(store, infos, k);
+            masks[k] = mask;
+            for (r, n) in census.reads.iter_mut().enumerate() {
+                if mask & (1u8 << r) != 0 {
+                    *n += 1;
+                }
+            }
+        }
+        censuses.push(census);
     }
 
     for i in 0..len {
@@ -7208,7 +7309,7 @@ fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
             // below, which sees the register being redefined.
             if matches!(infos[j].kind, LineKind::Ret | LineKind::RetN) {
                 if is_callee_saved_reg(dst_reg) {
-                    infos[i].kind = LineKind::Nop;
+                    retire_line_for_census(i, infos, &mut masks, &func_of, &mut censuses);
                     changed = true;
                 }
                 break;
@@ -7245,7 +7346,7 @@ fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
                 && imp_reads & dst_bit == 0
                 && !line_references_reg_explicit(s, dst_reg)
             {
-                infos[i].kind = LineKind::Nop;
+                retire_line_for_census(i, infos, &mut masks, &func_of, &mut censuses);
                 changed = true;
                 break;
             }
@@ -7263,7 +7364,7 @@ fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
                 // `popl %ebp`.
                 LineKind::Pop { reg } => {
                     if reg == dst_reg {
-                        infos[i].kind = LineKind::Nop;
+                        retire_line_for_census(i, infos, &mut masks, &func_of, &mut censuses);
                         changed = true;
                         break;
                     }
@@ -7283,7 +7384,7 @@ fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
                     }
                     if dst == dst_reg {
                         // dst is overwritten - this move is dead
-                        infos[i].kind = LineKind::Nop;
+                        retire_line_for_census(i, infos, &mut masks, &func_of, &mut censuses);
                         changed = true;
                         break;
                     }
@@ -7297,7 +7398,7 @@ fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
                         // For "addl $5, %eax", dest is eax and it reads eax
                         // parse_dest_reg returns the last operand. If the instruction writes
                         // to dst_reg but the source doesn't reference it, then this move is dead.
-                        infos[i].kind = LineKind::Nop;
+                        retire_line_for_census(i, infos, &mut masks, &func_of, &mut censuses);
                         changed = true;
                         break;
                     }
@@ -7323,20 +7424,49 @@ fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
         // makes the deletion CFG-independent: if NO line anywhere reads the
         // destination, the move is dead no matter how control flows.
         if !saw_alive && infos[i].kind != LineKind::Nop {
-            if let Some(&(fs, fe)) = bounds.iter().find(|&&(s, e)| i >= s && i < e) {
+            let f = func_of[i];
+            if f != usize::MAX {
                 // %eax/%edx carry scalar-wide returns, and %ecx carries the
                 // third word when the private marker is present. The caller's
                 // observation is outside this function, so the census cannot
                 // see it; refuse fallback deletion of those return values.
-                let has_ret = (fs..fe).any(|k| {
-                    matches!(infos[k].kind, LineKind::Ret | LineKind::RetN) && !infos[k].is_nop()
-                });
-                let (_, ret_uses_ecx) = return_use_markers(store, infos, fs, fe);
+                // `has_ret` and the markers are computed once above: this pass
+                // only NOPS `Move` lines, and neither a `ret` nor a marker can
+                // be one, so the original per-candidate recomputation was
+                // answering the same question every time.
+                let c = &censuses[f];
+                let (has_ret, ret_uses_ecx) = if slow_census {
+                    let (fs, fe) = bounds[f];
+                    let hr = (fs..fe).any(|k| {
+                        matches!(infos[k].kind, LineKind::Ret | LineKind::RetN)
+                            && !infos[k].is_nop()
+                    });
+                    (hr, return_use_markers(store, infos, fs, fe).1)
+                } else {
+                    (c.has_ret, c.ret_uses_ecx)
+                };
                 let ret_observes = has_ret
                     && (matches!(dst_reg, REG_EAX | REG_EDX)
                         || (dst_reg == REG_ECX && ret_uses_ecx));
-                if !ret_observes && census_reg_reads(store, &infos, fs, fe, dst_reg, &[i]) == 0 {
-                    infos[i].kind = LineKind::Nop;
+                // `reads[r]` includes line `i` itself; the old helper excluded
+                // it via `&[i]`. Subtracting its own bit is the same answer in
+                // O(1), and every earlier retirement already subtracted its
+                // contribution, so the count reflects the current `infos`.
+                let reads_elsewhere = if slow_census {
+                    let (fs, fe) = bounds[f];
+                    census_reg_reads(store, &infos, fs, fe, dst_reg, &[i]) as u32
+                } else if dst_reg <= REG_GP_MAX {
+                    let own = u32::from((masks[i] >> dst_reg) & 1);
+                    c.reads[dst_reg as usize] - own
+                } else {
+                    // A non-GP destination cannot happen for a parsed
+                    // reg-reg move, but keep the exact slow answer rather than
+                    // widening the census to registers it does not model.
+                    let (fs, fe) = bounds[f];
+                    census_reg_reads(store, &infos, fs, fe, dst_reg, &[i]) as u32
+                };
+                if !ret_observes && reads_elsewhere == 0 {
+                    retire_line_for_census(i, infos, &mut masks, &func_of, &mut censuses);
                     changed = true;
                 }
             }
@@ -15339,6 +15469,37 @@ pub fn lower_tls_call_markers(asm: String) -> String {
         .collect()
 }
 
+/// Opt-in wall-clock phase report for the i686 peephole pipeline.
+///
+/// `CCC_TIME_PEEPHOLE=1` prints the elapsed wall time of every structured
+/// phase and every fixpoint iteration. This is a diagnostic instrument, not a
+/// benchmark: it measures host wall time only (no PMU, no cycles), and costs
+/// one `Instant::now` per mark when enabled and nothing measurable when not.
+struct PeepClock {
+    enabled: bool,
+    last: std::time::Instant,
+}
+
+impl PeepClock {
+    fn new(lines: usize) -> Self {
+        let enabled = std::env::var_os("CCC_TIME_PEEPHOLE").is_some();
+        if enabled {
+            eprintln!("[PEEP] lines={lines}");
+        }
+        Self {
+            enabled,
+            last: std::time::Instant::now(),
+        }
+    }
+    #[inline]
+    fn mark(&mut self, label: &str) {
+        if self.enabled {
+            eprintln!("[PEEP] {label}: {:.3}s", self.last.elapsed().as_secs_f64());
+            self.last = std::time::Instant::now();
+        }
+    }
+}
+
 pub fn peephole_optimize(asm: String) -> String {
     if let Ok(path) = std::env::var("LCCC_DEBUG_PEEPHOLE_IN") {
         let _ = std::fs::write(path, &asm);
@@ -15347,15 +15508,20 @@ pub fn peephole_optimize(asm: String) -> String {
         return crate::backend::peephole_common::strip_volatile_markers(asm);
     }
     let mut store = LineStore::new(asm);
+    let mut clock = PeepClock::new(store.len());
     let mut infos = classify_all(&store);
+    clock.mark("p00");
     let debug_rows = hide_debug_rows(&store, &mut infos);
+    clock.mark("p01");
     pin_inline_asm_regions(&store, &mut infos);
 
     // Phase 1: Iterative local passes
+    clock.mark("p02");
     let mut changed = true;
     let mut pass_count = 0;
     while changed && pass_count < MAX_LOCAL_PASS_ITERATIONS {
         changed = false;
+        clock.mark("loop1-iter");
         changed |= combined_local_pass(&mut store, &mut infos);
         pass_count += 1;
     }
@@ -15363,12 +15529,14 @@ pub fn peephole_optimize(asm: String) -> String {
     // Establish CFG liveness before the linear global passes.  Besides
     // deleting globally dead moves, this retargets accumulator update/copy-back
     // chains while all three instructions are still present.
+    clock.mark("p03");
     optimize_cfg_register_liveness(&mut store, &mut infos, false);
 
     // Phase 2: Global passes (run once)
     // Copy propagation first: it turns chained moves into dead moves, which
     // the very next pass then removes. Slot-load forwarding runs right after,
     // so freshly exposed store/load pairs are folded in the same phase.
+    clock.mark("p04");
     let global_changed = propagate_reg_copies(&mut store, &mut infos);
     let global_changed = global_changed | forward_slot_loads(&mut store, &mut infos);
     let global_changed = global_changed | forward_immediate_slot_loads(&mut store, &mut infos);
@@ -15385,8 +15553,10 @@ pub fn peephole_optimize(asm: String) -> String {
     // reclaimed in the same phase. Separate kill switch, so each half can be
     // attributed on its own: CCC_NO_X87_PAIR_UNSTAGE.
     let global_changed = global_changed | fold_x87_gp_pair_unstaging(&mut store, &mut infos);
+    clock.mark("p05");
     let global_changed = global_changed | eliminate_dead_reg_moves(&store, &mut infos);
     let global_changed = global_changed | eliminate_dead_stores(&store, &mut infos);
+    clock.mark("p06");
     let global_changed = global_changed | fuse_compare_and_branch(&mut store, &mut infos);
     let global_changed = global_changed | fuse_setcc_branch(&mut store, &mut infos);
     // Select-diamond → cmov (cross-pollinated from x86-64's cmov select
@@ -15398,6 +15568,7 @@ pub fn peephole_optimize(asm: String) -> String {
     // into the copy's destination exposes the adjacent load→ALU shape that
     // fold_memory_operands then folds into a memory operand.
     let global_changed = global_changed | fold_load_copy_relay_i686(&mut store, &mut infos);
+    clock.mark("p07");
     let global_changed = global_changed | fold_memory_operands(&mut store, &mut infos);
     // Narrow compare folds run right after the full-width memory-operand
     // fold: they transform the CONSUMER's width (cmpl->cmpb/cmpw) instead of
@@ -15405,6 +15576,7 @@ pub fn peephole_optimize(asm: String) -> String {
     // (is_full_width_load) is untouched — this is the width-correct twin.
     let global_changed = global_changed | fold_narrow_load_imm_compare(&mut store, &mut infos);
     let global_changed = global_changed | fold_zext_pair_reg_compare(&mut store, &mut infos);
+    clock.mark("p08");
     let global_changed = global_changed | fold_logical_zero_test(&mut store, &mut infos);
     let global_changed = global_changed | fold_copy_subreg_extend(&mut store, &mut infos);
     let global_changed = global_changed | narrow_dead_and_to_testb(&mut store, &mut infos);
@@ -15416,9 +15588,11 @@ pub fn peephole_optimize(asm: String) -> String {
     let global_changed =
         global_changed | fold_arithmetic_test_sign_jcc_i686(&mut store, &mut infos);
     let global_changed = global_changed | fuse_sext_testb(&mut store, &mut infos);
+    clock.mark("p09");
     let global_changed = global_changed | collapse_slot_rmw_i686(&mut store, &mut infos);
 
     // Phase 3: Local cleanup after global passes
+    clock.mark("p10");
     if global_changed {
         let mut changed2 = true;
         let mut pass_count2 = 0;
@@ -15443,6 +15617,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_redundant_test_i686(&mut store, &mut infos);
             changed2 |= fold_arithmetic_test_sign_jcc_i686(&mut store, &mut infos);
             changed2 |= fuse_sext_testb(&mut store, &mut infos);
+            clock.mark("loop2-iter");
             pass_count2 += 1;
         }
     }
@@ -15450,6 +15625,7 @@ pub fn peephole_optimize(asm: String) -> String {
     // Phase 3.5: redundant zero-extension elimination (may expose dead
     // stores and moves by shortening def-use chains, so it runs before DSE
     // and the liveness cleanup).
+    clock.mark("p11");
     let pair_changed = fold_sext_zext_pairs(&mut store, &mut infos);
     // Fold `movl %S,%D` + `movX{l,w}l %D<narrow>,%D` into one extension of
     // %S.  Runs BEFORE the redundant-extension state machine: the fused
@@ -15476,6 +15652,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed3 |= combined_local_pass(&mut store, &mut infos);
             changed3 |= eliminate_dead_reg_moves(&store, &mut infos);
             changed3 |= eliminate_dead_stores(&store, &mut infos);
+            clock.mark("loop3-iter");
             pass_count3 += 1;
         }
     }
@@ -15484,6 +15661,7 @@ pub fn peephole_optimize(asm: String) -> String {
     // the URem result extraction (`movl %edx,%eax` + store → direct store),
     // which otherwise writes %eax between the two divisions and blocks the
     // window proof.  May expose dead staging moves for the next phases.
+    clock.mark("p12");
     let div_fused = fuse_div_rem_pairs(&mut store, &mut infos);
     if div_fused {
         let mut changed3b = true;
@@ -15504,6 +15682,7 @@ pub fn peephole_optimize(asm: String) -> String {
     // pointers (`movl SYM,%r; movl %r,N(%esp); call *N(%esp)` ->
     // `call *SYM`). Runs before phase 4 so the vacated slot can turn other
     // stores dead and unused callee-saves can drop.
+    clock.mark("p13");
     fold_global_fnptr_calls(&mut store, &mut infos);
 
     // Phase 3.8: staging-copy idiom folds (test/zero/immediate/mask through
@@ -15516,6 +15695,7 @@ pub fn peephole_optimize(asm: String) -> String {
     // the orphans, and the wider cleanup can in turn drop unused callee-save
     // pairs — so iterate to a bounded fixpoint.
     {
+        clock.mark("p14");
         let mut changed8 = fold_reg_copy_idioms(&mut store, &mut infos)
             | thread_trivial_blocks(&mut store, &mut infos)
             | delete_redundant_cond_jumps(&mut store, &mut infos);
@@ -15539,6 +15719,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed8 |= fold_zext_pair_reg_compare(&mut store, &mut infos);
             changed8 |= fold_copy_subreg_extend(&mut store, &mut infos);
             changed8 |= narrow_dead_and_to_testb(&mut store, &mut infos);
+            clock.mark("loop8-iter");
             pass_count8 += 1;
         }
         // The loop above only runs when its entry gate (the copy-crossing
@@ -15565,8 +15746,11 @@ pub fn peephole_optimize(asm: String) -> String {
     // fixpoint means the folds pick first and this takes what is left -- and it
     // still runs before eliminate_never_read_stores, which is what reclaims the
     // stores its forwards orphan. Kill switch: CCC_NO_GLOBAL_SLOT_FWD.
+    clock.mark("p15");
     forward_slot_loads_cfg(&mut store, &mut infos);
+    clock.mark("p16");
     eliminate_never_read_stores(&store, &mut infos);
+    clock.mark("p17");
     optimize_cfg_register_liveness(&mut store, &mut infos, true);
     // Scratch-save pair elimination, now that the dead-move and dead-store
     // sweeps have made spans short enough to prove things about.  It runs on
@@ -15574,6 +15758,7 @@ pub fn peephole_optimize(asm: String) -> String {
     // establishes the CFG solution and before the callee-save elimination that
     // reclaims whatever the prologue/epilogue pair left behind.
     // Kill switch: CCC_NO_I686_PUSH_POP.
+    clock.mark("p18");
     let push_pop_removed = eliminate_push_pop_pairs(&store, &mut infos);
     if push_pop_removed {
         // The pairs are gone; let the dead-move machinery reclaim the staging
@@ -15589,10 +15774,12 @@ pub fn peephole_optimize(asm: String) -> String {
             pass_count_pp += 1;
         }
     }
+    clock.mark("p19");
     eliminate_unused_callee_saves(&mut store, &mut infos);
     eliminate_dead_frame_allocation(&mut store, &mut infos);
 
     // Phase 5: tail-call conversion (after all epilogue-shape rewrites).
+    clock.mark("p20");
     optimize_tail_calls_i686(&mut store, &mut infos);
 
     // Terminal direct-window sweep: every structural pass has had its
@@ -15612,6 +15799,7 @@ pub fn peephole_optimize(asm: String) -> String {
     // Phase 6: select-diamond else-hoist runs on the FINAL text — earlier
     // passes shape the diamond (fusing the flag producer, folding prep)
     // that this pass needs to see.
+    clock.mark("p21");
     let hoisted =
         else_hoist_diamonds(store.build_result_with_debug_rows(|i| infos[i].is_nop(), &debug_rows));
 
@@ -15620,6 +15808,7 @@ pub fn peephole_optimize(asm: String) -> String {
     // image measured ≈625 bytes of them across 24 functions.  Runs last so no
     // structured pass ever sees a planted `label + instruction` replacement.
     // Kill switch: CCC_NO_I686_EPILOGUE_MERGE.
+    clock.mark("p22");
     let optimized = merge_duplicate_epilogues_terminal(hoisted);
     crate::backend::peephole_common::strip_volatile_markers(optimized)
 }

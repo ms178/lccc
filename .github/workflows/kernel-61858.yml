@@ -1,7 +1,18 @@
 name: CachyMod 6.18.58 LCCC kernel
 
 on:
+  # The 240-minute full kernel build/boot gate is NOT a per-PR gate by default.
+  # It runs once a week (Monday 03:17 UTC), on an explicit manual dispatch, or
+  # when a PR is labelled `kernel-full`. A normal compiler PR still triggers
+  # this workflow (the path filter and the two diagnostic jobs are unchanged),
+  # but the `kernel` job is reported as SKIPPED: the omission is visible on the
+  # PR checks page, never silent, and never blocks the fast compiler matrix.
+  schedule:
+    - cron: '17 3 * * 1'
   pull_request:
+    # `labeled` makes adding the opt-in label re-evaluate this workflow without
+    # requiring a new commit; the other types keep the visible skipped status.
+    types: [opened, synchronize, reopened, labeled]
     paths:
       # Kernel validation must follow the compiler being changed, not only
       # edits to the kernel harness. Otherwise a source-only PR skips this job.
@@ -30,6 +41,10 @@ on:
       - 'tests/regression/check_qemu_defconfig_smoke.sh'
   workflow_dispatch:
     inputs:
+      run_kernel:
+        description: 'Run the full CachyMod kernel build/boot gate on demand'
+        type: boolean
+        default: true
       source_run_ids:
         description: 'Optional completed run IDs to export as diagnostic Git blobs (comma separated)'
         type: string
@@ -112,6 +127,12 @@ jobs:
               print(f'::notice title=Kernel host prerequisite manifest::{message}')
           PY
   kernel:
+    # Default-off on pull requests. Three opt-in paths only: weekly schedule,
+    # manual dispatch with run_kernel, or the `kernel-full` PR label.
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.run_kernel) ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'kernel-full'))
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     env:

@@ -130,10 +130,7 @@ pub fn strip_comment<'a>(line: &'a str, style: &CommentStyle) -> &'a str {
             if bytes[i] == b'\\' {
                 i += 1;
                 if i < bytes.len() {
-                    i += std::str::from_utf8(&bytes[i..])
-                        .ok()
-                        .and_then(|rest| rest.chars().next())
-                        .map_or(1, char::len_utf8);
+                    i += crate::backend::asm_expr::utf8_char_step(bytes, i);
                 }
                 continue;
             }
@@ -208,10 +205,7 @@ pub fn split_on_semicolons(line: &str) -> Vec<&str> {
             if bytes[i] == b'\\' {
                 i += 1;
                 if i < bytes.len() {
-                    i += std::str::from_utf8(&bytes[i..])
-                        .ok()
-                        .and_then(|rest| rest.chars().next())
-                        .map_or(1, char::len_utf8);
+                    i += crate::backend::asm_expr::utf8_char_step(bytes, i);
                 }
                 continue;
             }
@@ -836,10 +830,7 @@ fn strip_arg_quotes(s: &str) -> &str {
             if bytes[i] == b'\\' {
                 i += 1;
                 if i + 1 < bytes.len() {
-                    i += std::str::from_utf8(&bytes[i..])
-                        .ok()
-                        .and_then(|rest| rest.chars().next())
-                        .map_or(1, char::len_utf8);
+                    i += crate::backend::asm_expr::utf8_char_step(bytes, i);
                 } else {
                     // Trailing backslash escapes the closing quote (`"foo\"`): not balanced.
                     return s;
@@ -873,10 +864,7 @@ fn find_toplevel_eq(s: &str) -> Option<usize> {
             if b[i] == b'\\' {
                 i += 1;
                 if i < b.len() {
-                    i += std::str::from_utf8(&s.as_bytes()[i..])
-                        .ok()
-                        .and_then(|rest| rest.chars().next())
-                        .map_or(1, char::len_utf8);
+                    i += crate::backend::asm_expr::utf8_char_step(b, i);
                 }
                 continue;
             }
@@ -1398,10 +1386,7 @@ fn split_statements<'l>(lines: &[&'l str], style: &CommentStyle) -> Vec<std::bor
                 if bytes[i] == b'\\' {
                     i += 1;
                     if i < bytes.len() {
-                        i += std::str::from_utf8(&bytes[i..])
-                            .ok()
-                            .and_then(|rest| rest.chars().next())
-                            .map_or(1, char::len_utf8);
+                        i += crate::backend::asm_expr::utf8_char_step(bytes, i);
                     }
                     continue;
                 }

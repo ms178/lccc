@@ -1022,8 +1022,8 @@ and the oracle is the pinned GCC 16.2 sha `67ed99639f746b8e…c2`.
 |---|---|---|
 | `pr38789.c` at `-O0` only | Two coupled causes, found by re-testing the FIRST fix instead of trusting it: (1) at `-O0` `run_passes` returns before `resolve_remaining_is_constant`, so a deferred `IsConstant` node survived and the condition was a Value, not a constant; (2) `lower_if_stmt` lowers both arms and the pipeline's immediate-only asm validation walked EVERY block, including the arm a constant condition can never reach. GCC 16.2 and Clang 23.1.4 accept at every level; measured GCC answers at `-O0` are `0` for a local `int n = sizeof(int)`, `1` for a literal, `0` for a parameter, and `1` for the local at `-O1+`. The decisive measurement: lccc `if (0) asm("# DEAD") else asm("# LIVE")` at `-O0 -S` emits ONLY `LIVE`, so the dead arm is real IR that is never emitted. | **FIXED with two changes.** `lower_constant_p` resolves unproven queries to `0` at `-O0` only (semantic parity, not an optimization; optimizing tiers keep the deferral kernel patterns need). The pipeline validator now walks CFG reachability from the entry, pruning `CondBranch` on a constant condition to its single live successor and skipping unreachable blocks. A dynamic condition still validates BOTH arms, so no real dynamic immediate operand can hide. `tests/regression/check_gcc_asm_constraints.sh` pins verdict parity at five levels on two ABIs, which asm arm is emitted, and a literal `if (0)` dead-arm control. |
 | `limits-externdecl.c` at `-O2`, `-O3`, `-Os` (3) | All three hit `HARNESS timeout (timeout=240s)`, `returncode 124`; `-O0`/`-O1` passed. Callgrind on a scaled 10,000-declaration input found TWO superlinear scans: `find_symbol_index_shared` linearly scanned the whole symtab for EVERY relocation (~11% of all instructions including its Option/slice/memcmp work), and `purge_ptr_ranges_in` called `Vec::retain` over a growing relocation list 10,001 times (~19%). | **FIXED.** One prebuilt `FxHashMap` of name-offset to symtab index makes relocation lookup O(1); `ptr_ranges` is now kept sorted by offset so the purge is `partition_point` + `drain`, O(log N + K). Both are proven byte-identical in behaviour by deterministic unit tests that compare against the ORIGINAL linear/reference predicates over 1000 randomized windows and every symbol class. |
-| `pr46534.c` at `-O1`, `-O2`, `-O3` (3) | `returncode -9` (SIGKILL) during a concurrently memory-pressured run. This case is a 20,000,000-character string literal. In isolation the `-O2` compile succeeds (`rc=0`) but took ~45 s while the campaign was competing for the same two cores; scaled inputs measured 0.028/0.040/0.097/0.465 s for 200/2000/20000/200000 characters. Callgrind on 20,000 characters shows repeated `core::str::from_utf8` (14.25%) and assembly-line trimming/comment scanning across the giant data line. | **OPEN, measured.** No quiet-host re-measurement and no safe targeted fix were completed. Changing the `from_utf8(&bytes[i..])` char-advance idiom in the assembler preprocessors without proving every input is valid UTF-8 would be a correctness regression, so it was NOT changed on guesswork. |
-| `20001226-1.c` i686 `-O0` | Observed live at 1.3 GiB RSS and >13 min (the case carries `dg-timeout-factor 4.0`, so 960 s is allowed). Scaled branch counts measured on the i686 binary at `-O0`: 512 branches `6.05 s / 44.8 MiB`, 2048 branches `93.76 s / 136.4 MiB`; the x86_64 binary needed `1.44 s / 47.8 MiB` and `7.66 s / 145.2 MiB` for the same inputs -- roughly 12x slower and clearly superlinear on i686 only. | **OPEN, measured.** The hotspot is in i686 branch relaxation / peephole interaction; a safe fix needs its own profile and regression corpus. Recording the numbers is required before claiming anything about this case. |
+| `pr46534.c` at `-O1`, `-O2`, `-O3` (3) | `returncode -9` (SIGKILL) during a concurrently memory-pressured run. This case is a 20,000,000-character string literal. In isolation the `-O2` compile succeeds (`rc=0`) but took 47.34 s on a quiet host and **3713 MiB peak RSS**; `CCC_TIME_PHASES=1` showed only 2.39 s inside `compile_ir_module_to_assembly`, so the time and memory were in the integrated assembler, not codegen. Root cause (measured, not guessed): `emit_string_bytes` emitted one `.byte` line per 32 literal bytes -> 1,250,028 lines / 171,250,454 bytes of assembly at `-O2`; every operand became a `DataValue` enum (64 B of heap per byte). A second, independent O(line^2) term: eleven assembler scanners called `str::from_utf8(&bytes[i..])` on EVERY byte, validating the whole remaining suffix. | **FIXED, two algorithm-level changes.** (1) `asm_expr::utf8_char_step` replaces the suffix-validation idiom at all 11 sites. For an ASCII or continuation byte the answer is 1 whether the suffix is valid or not, so no scan is needed; a multi-byte leading byte keeps the ORIGINAL `from_utf8` suffix check. Three exhaustive unit tests prove equality with the old idiom for every byte value, every offset of valid UTF-8 (including 4-byte chars), all 256 prefixes of the byte alphabet and 200 deterministic pseudo-random invalid slices. (2) `emit_string_bytes` now emits bounded `.ascii` lines (65,536 bytes per line), escaping every byte outside `[A-Za-z0-9 space]` as exactly three octal digits. All four assemblers share `elf::parse_string_literal`, so one `Vec<u8>` per line replaces 20 M `DataValue`s. `CCC_LEGACY_BYTE_STRINGS=1` keeps the old emitter as a differential oracle; `tests/regression/check_string_literal_emission.sh` requires byte-identical objects on x86_64 AND i686 at `-O0/-O2/-Os`, plus a host runtime `memcmp` oracle over all 256 byte values and literal lengths straddling the chunk boundary. **Measured after:** `-O2` 3.21 s / **351 MiB** peak RSS (vs 47.34 s / 3713 MiB), assembly 40,009,006 bytes / **638 lines** (vs 171,250,454 / 1,250,028), object size unchanged at 40,001,352 bytes. |
+| `20001226-1.c` i686 `-O0` | Observed live at 1.3 GiB RSS and >13 min (the case carries `dg-timeout-factor 4.0`, so 960 s is allowed). Scaled branch counts measured on the i686 binary at `-O0`: 512 branches `6.05 s / 44.8 MiB`, 2048 branches `93.76 s / 136.4 MiB`; the x86_64 binary needed `1.44 s / 47.8 MiB` and `7.66 s / 145.2 MiB` for the same inputs -- roughly 12x slower and clearly superlinear on i686 only. | **FIXED, root cause found by opt-in phase instrumentation.** `CCC_NO_I686_PEEPHOLE=1` isolated the peephole (2.96 s -> 0.24 s at 512 branches). `CCC_TIME_PEEPHOLE=1` then showed 1.304 s / 25.453 s of the peephole in ONE phase at 512/2048 branches: `eliminate_dead_reg_moves` called `census_reg_reads` once per candidate move, and that helper walks the WHOLE function -> O(lines^2). Replaced with `FunctionReadCensus`: read counts are computed once per function in O(lines) and each NOP subtracts that line's exact read mask, so every answer is bit-for-bit the old one. `has_ret` / return markers are static because this pass only NOPs `Move` lines. `CCC_SLOW_DEAD_MOVE_CENSUS=1` re-enables the original per-candidate scan; `tests/regression/check_i686_dead_move_census.sh` requires byte-identical objects at all five optimization levels over callee-saved regs, calls, inline asm, computed gotos, label-crossing dead moves and a 512-branch function. **Measured after (i686 `-O0`, quiet host):** 512 branches 3.012 -> **0.376 s**, 2048 branches 51.653 -> **1.857 s**, the real 8192-branch case (previously extrapolated ~25 min) now **10.761 s**; scaling is linear-ish instead of quadratic, and the full five-level campaign no longer needs a hidden timeout. |
 
 **Oracle discipline.** Clang **23.1.5** exists upstream (`llvmorg-23.1.5`, published
 2026-11-03) but its release asset redirects to `release-assets.githubusercontent.com`
@@ -1069,3 +1069,68 @@ arm, and the literal `if (0)` dead-arm control);
 A 500-declaration functional smoke compiles at `-O2` on x86_64 (31,696 B)
 and i686 (17,612 B) with `rc=0`; GCC 16.2's reference object is 31,880 B.
 Hosted CI runs the remaining full matrix.
+
+### 9.11 Kernel gate policy and the full five-level/feature campaign
+
+**Kernel gate is no longer a default PR gate.** `.github/workflows/kernel-61858.yml`
+still declares the same `pull_request` path filter (so a compiler-only PR shows
+the skip instead of silently omitting it), but `jobs.kernel.if` now requires one
+of three explicit opt-ins: a weekly `schedule` (`17 3 * * 1`, Monday 03:17 UTC),
+a `workflow_dispatch` with `run_kernel: true` (default), or a PR carrying the
+`kernel-full` label. `pull_request.types` includes `labeled` so adding the label
+re-evaluates the workflow without a new commit. Five new
+`tests/corpus/test_kernel_workflow_paths.py` tests pin the cron, the dispatch
+input, the label gate, the `labeled` trigger and the intact path filter. The
+240-minute full kernel build is NOT deleted and NOT rerun by default; it is now
+on-demand/weekly, exactly as requested. `check_ci_gate_parity.py` and
+`check_ci_workflow_shell.py` both pass with the new triggers.
+
+**Full campaign.** `scripts/x86_gcc_torture.py` is run over EVERY `compile/`
+source (2016) and EVERY `execute/` source (1700) at EVERY optimization level
+`-O0,-O1,-O2,-O3,-Os` on BOTH `x86_64` and `i686`, plus the whole corpus under
+six appended compiler-feature flag sets (`-fPIC`, `-fno-builtin`, `-fwrapv`,
+`-funsigned-char`, `-fno-omit-frame-pointer`, `-fno-common`) at `-O2` on both
+ABIs, plus the whole corpus at the three additional accepted levels
+`-Ofast`, `-Og`, `-Oz` on both ABIs. The runner applies every DejaGnu
+`dg-options` / `dg-add-options` directive flag per case itself, so the feature
+dimension is covered; `--expensive` runs `run_expensive_tests` cases instead of
+reporting them `unsupported`; timeouts are 300 s compile / 120 s run scaled by
+each `dg-timeout-factor`, so no case is silently dropped. Every leg writes a
+complete per-case JSON inventory, an identity record with binary hashes captured
+BEFORE the leg, and a failure log under
+`/home/user/artifacts/campaign-20261105/`. The final verdicts and counts are
+recorded in `SUMMARY.md` / `SUMMARY.json` there and transcribed here after the
+campaign completes; a `complete=False` or `fatal!=None` leg is a campaign
+failure, not a pass.
+
+**Red-team of the new logic.** The three changes were reviewed for UB, overflow,
+aliasing and context safety by construction:
+* `utf8_char_step` never indexes out of bounds (`bytes.get(i)`), shifts only
+  `u8` values by 6/3, and keeps the exact original `from_utf8` call on the only
+  branch whose answer depends on suffix validity. It is exact for ARBITRARY
+  (possibly invalid UTF-8) byte slices, not just `&str` inputs — proven by the
+  256x5 exhaustive slice test plus 200 deterministic random slices.
+* `FunctionReadCensus` uses `u32` counts (a 20 M-line function cannot reach
+  2^32 reads), guards every decrement with `debug_assert!(*n > 0)`, never
+  indexes `func_of` with the `usize::MAX` sentinel, and keeps a slow exact
+  fallback for non-GP destinations. It is single-threaded, so there is no
+  mutex/spinlock or race surface. The A/B gate proves emitted objects are
+  byte-identical at five optimization levels.
+* `emit_string_bytes_ascii` emits only `[A-Za-z0-9 space]` and three-digit
+  octal escapes. No quote, backslash, comment marker, semicolon, comma,
+  parenthesis or GAS character literal can appear in the payload; every scanner
+  that walks raw assembly text tracks double-quoted strings. Octal is always
+  three digits so GAS's `\N`/`\NN`/`\NNN` grammar cannot swallow the next byte.
+  Bytes >= 0x80 are escaped because `parse_string_literal` re-encodes raw chars
+  as UTF-8. All four assemblers (x86-64, i686, AArch64, RISC-V) share that one
+  parser, so the representation is target-independent. The NUL terminator obeys
+  the same chunk-boundary rule as any data byte.
+
+**Evidence discipline.** All times are host wall-clock or `CCC_TIME_PHASES`
+phase timers; RSS is `getrusage(RUSAGE_CHILDREN).ru_maxrss`. No PMU, cycles,
+`perf`, local Clang 23.1.5 or local ICX 2026.2 claim is made: the
+`harness-cache-7` tag carries Clang 23.1.4, the LLVM 23.1.5 release asset
+redirects to blocked hosts and the Intel PPA is unreachable from this sandbox.
+GCC 16.2.0 (pinned toolchain) is the oracle; `/usr/bin/gcc` 12.2.0 is never
+used. The generated-code host-runtime gap in §9.9 is unchanged and is NOT
+claimed fixed, and no "beats GCC/Clang/ICX" claim is made.
