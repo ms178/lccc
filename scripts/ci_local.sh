@@ -269,6 +269,10 @@ gate "string-literal-emission" fast \
 gate "i686-dead-move-census" fast \
     env CCC_I686=target/fastbuild/lccc-i686 \
     bash tests/regression/check_i686_dead_move_census.sh
+gate "param-home-contracts" fast \
+    env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
+    CCC_ARM=target/fastbuild/lccc-arm CCC_RISCV=target/fastbuild/lccc-riscv \
+    python3 tests/regression/check_param_home_contracts.py
 gate "vectorizer-openmp-policy" fast \
     env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
     GCC="${GCC16:-gcc-16}" \

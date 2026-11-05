@@ -2288,6 +2288,8 @@ jobs:
           --gas-x64 "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
         python3 scripts/directive_legality_matrix.py \
           --check-lccc target/fastbuild/lccc
+    - name: O(n) parameter homing, cross-ISA headers and AArch64 FP homes
+      run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 CCC_ARM=target/fastbuild/lccc-arm CCC_RISCV=target/fastbuild/lccc-riscv python3 tests/regression/check_param_home_contracts.py
     - name: ARM codegen assembler-parity
       run: |
         set -euo pipefail
