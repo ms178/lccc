@@ -2531,14 +2531,6 @@ impl Driver {
         // the graph borrows one consistent view of them.
         let layouts = types.borrow_struct_layouts();
         let mut graph = crate::backend::elf::TypeGraph::new(&*layouts, &types.typedefs);
-        // The index type of an array's subrange, which GCC 16.2 states and a
-        // consumer uses to print an index: an unsigned type of the target's
-        // address size.
-        graph.intern_ctype(if crate::common::types::target_ptr_size() == 8 {
-            &crate::common::types::CType::ULong
-        } else {
-            &crate::common::types::CType::UInt
-        });
 
         let mut variables = Vec::with_capacity(order.len());
         for name in order {
