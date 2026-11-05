@@ -74,6 +74,7 @@ GATE_DATE = "2026-11-05"
 DW_TAG_ARRAY_TYPE = 0x01
 DW_TAG_ENUMERATION_TYPE = 0x04
 DW_TAG_FORMAL_PARAMETER = 0x05
+DW_TAG_UNSPECIFIED_PARAMETERS = 0x18
 DW_TAG_LEXICAL_BLOCK = 0x0B
 DW_TAG_MEMBER = 0x0D
 DW_TAG_POINTER_TYPE = 0x0F
@@ -108,6 +109,23 @@ DW_AT_DECL_LINE = 0x3B
 DW_AT_EXTERNAL = 0x3F
 DW_AT_FRAME_BASE = 0x40
 DW_AT_TYPE = 0x49
+DW_AT_BYTE_SIZE = 0x0B
+DW_AT_ENCODING = 0x3E
+DW_AT_DATA_MEMBER_LOCATION = 0x38
+DW_AT_BIT_SIZE = 0x0D
+DW_AT_BIT_OFFSET = 0x0C
+DW_AT_DATA_BIT_OFFSET = 0x6B
+DW_AT_UPPER_BOUND = 0x2F
+DW_AT_COUNT = 0x37
+DW_AT_PROTOTYPED = 0x27
+DW_AT_DECLARATION = 0x3C
+DW_AT_CONST_VALUE = 0x1C
+DW_AT_GNU_VECTOR = 0x2107
+
+
+#: `DW_OP_addr`: the only location expression this writer emits for an object at
+#: a fixed address.
+DW_OP_ADDR = 0x03
 
 DW_FORM_STRING = 0x08
 DW_FORM_ADDR = 0x01
@@ -126,28 +144,14 @@ SHN_UNDEF = 0
 #: value says what a debugger cannot do yet and where the work item lives. A gap
 #: that stops reproducing is reported (once) and the entry should be deleted.
 KNOWN_GAPS: dict[str, str] = {
-    "variables": (
-        "no DW_TAG_variable: a debugger cannot read a global, a static or a local "
-        "by name (docs/DWARF-CAMPAIGN.md, work item D1)"
-    ),
-    "parameters": (
-        "no DW_TAG_formal_parameter: no argument can be read by name (D1)"
-    ),
-    "types": (
-        "no type DIEs (base/pointer/typedef/structure/enum): a consumer cannot "
-        "print a value or walk a struct (D2)"
-    ),
-    "locations": (
-        "no DW_AT_location: nothing to evaluate, so a variable would have no "
-        "address even if it had a DIE (D3)"
-    ),
-    "data_only_unit": (
-        "a unit with no functions emits no .debug_info at all, so a TU that is "
-        "only data is invisible to a debugger (D4)"
-    ),
     "inlining": (
         "no DW_TAG_inlined_subroutine: an optimized frame shows the caller with "
         "the callee's line, so a debugger cannot report the inline stack (D6)"
+    ),
+    "parameter_locations": (
+        "a parameter DIE states its name and type but not where the value lives, "
+        "so a debugger lists the argument and cannot print it; the location needs "
+        "the frame layout the code generator owns (D1b)"
     ),
 }
 
@@ -1155,6 +1159,9 @@ PROBES: dict[str, str] = {
     # `pq_never_defined` into the link. A compiler that keeps it fails this
     # build, which is exactly what a regression here looks like.
     "probe": """\
+/* No headers: the -m32 lane has no 32-bit C library, and the probe needs
+   nothing from one beyond printf. */
+int printf(const char *format, ...);
 int pq_leaf(int x) { return x + 1; }
 static int pq_unused_static(int x) { return x * 2; }
 static int pq_used_static(int x) { return x - 1; }
@@ -1165,7 +1172,24 @@ static int pq_unused_var = 5;
 int pq_global = 3;
 struct pq_point { int x; int y; };
 typedef struct pq_point pq_point_t;
-enum pq_colour { PQ_RED, PQ_GREEN };
+enum pq_colour { PQ_RED, PQ_GREEN, PQ_BLUE = 300 };
+union pq_word { int i; float f; };
+struct pq_bits { unsigned int low : 3; unsigned int high : 5; };
+int pq_matrix[2][3];
+const char *pq_message = "dump";
+int (*pq_handler)(int);
+/* One object per type, so each type DIE is reachable the way a debugger needs
+   it: through an object the program can actually print. */
+struct pq_point pq_point_global;
+pq_point_t pq_typedef_global;
+enum pq_colour pq_colour_global = PQ_BLUE;
+union pq_word pq_word_global;
+struct pq_bits pq_bits_global;
+/* External on purpose: whether an optimizing tier drops an unreachable *static*
+   function is a code-generation policy, and this probe asks about DWARF. */
+int pq_sum(int count, ...) {
+    return count;
+}
 int pq_frame(int n) {
     int total = pq_global;
     for (int i = 0; i < n; i++) {
@@ -1173,7 +1197,30 @@ int pq_frame(int n) {
     }
     return pq_used_static(total);
 }
-int main(void) { return pq_frame(4) - 10 + (int)sizeof(pq_only_sizeof()) - 4; }
+/* The program's own answers: the checks below compare the DWARF with what this
+   code computes, not with a second compiler's opinion about it. */
+int main(void) {
+    struct pq_point probe_point;
+    unsigned long offset_x = (unsigned long)((char *)&probe_point.x - (char *)&probe_point);
+    unsigned long offset_y = (unsigned long)((char *)&probe_point.y - (char *)&probe_point);
+    printf("sizeof_point %lu\\n", (unsigned long)sizeof(struct pq_point));
+    printf("sizeof_int %lu\\n", (unsigned long)sizeof(int));
+    printf("sizeof_matrix %lu\\n", (unsigned long)sizeof pq_matrix);
+    printf("sizeof_bits %lu\\n", (unsigned long)sizeof(struct pq_bits));
+    printf("sizeof_word %lu\\n", (unsigned long)sizeof(union pq_word));
+    printf("offsetof_x %lu\\n", offset_x);
+    printf("offsetof_y %lu\\n", offset_y);
+    printf("addr_global %p\\n", (void *)&pq_global);
+    printf("addr_frame %p\\n", (void *)pq_frame);
+    printf("value_sum %d\\n", pq_sum(1, 2) + 2);
+    printf("value_red %d\\n", PQ_RED);
+    printf("value_green %d\\n", PQ_GREEN);
+    printf("value_blue %d\\n", PQ_BLUE);
+    /* `sizeof` of an inline function keeps its DIE reachable without calling it,
+       and the exit status stays zero so the gate can run this binary. */
+    (void)sizeof(pq_only_sizeof());
+    return pq_frame(4) - 12;
+}
 """,
     # Two units, so `.debug_aranges` must be per unit and each set must name its
     # own `.debug_info` offset.
@@ -1188,9 +1235,21 @@ int main(void) { return pq_a_work(3) - 9; }
     "probe_b": """\
 int pq_b_caller(void) { return 1; }
 """,
+    # A declaration is described only when the unit's code refers to it, and a
+    # type reachable only from an unreferenced declaration is not described at
+    # all. Compiled with `-c` (one of the two names has no definition anywhere),
+    # which is why the reference sits in a function.
+    "probe_decl": """\
+extern int pq_decl_used;
+extern int pq_decl_unused;
+struct pq_decl_rec { int a; int b; };
+extern struct pq_decl_rec pq_decl_rec_unused;
+int pq_decl_touch(void) { return pq_decl_used; }
+""",
     # A unit with no code at all: GCC still emits a unit and a variable DIE.
     "probe_data": """\
 int pq_only_data = 42;
+static const char pq_only_text[] = "only data";
 """,
 }
 
@@ -1697,8 +1756,6 @@ def check_debug_payload(report: Report, elf: Elf, label: str, optimizing: bool) 
             tags[die.tag] = tags.get(die.tag, 0) + 1
     if not tags.get(DW_TAG_VARIABLE):
         report.gap("variables", f"{label}: 0 DW_TAG_variable DIEs")
-    if not tags.get(DW_TAG_FORMAL_PARAMETER):
-        report.gap("parameters", f"{label}: 0 DW_TAG_formal_parameter DIEs")
     type_tags = (
         DW_TAG_BASE_TYPE,
         DW_TAG_POINTER_TYPE,
@@ -1738,16 +1795,642 @@ def check_debug_payload(report: Report, elf: Elf, label: str, optimizing: bool) 
         f"{tag:#04x}": count for tag, count in sorted(tags.items())
     }
 
+# --- types, locations and the program's own answers --------------------------
+#
+# The checks below do not ask "is this byte the same as GCC's". They ask whether
+# the DWARF is *true*: whether a struct DIE says the size the running program
+# says, whether a member sits at the offset `offsetof` reports, whether an
+# enumerator has the value the compiler folded into the instruction stream, and
+# whether the address in a variable's `DW_AT_location` is the address the program
+# prints for that object. A wrong size is a wrong `sizeof` in the debugger and a
+# wrong member offset is a debugger reading the neighbouring field; a gate that
+# only compares shapes against a second compiler notices neither.
+
+DW_ATE_SIGNED = 0x05
+DW_ATE_SIGNED_CHAR = 0x06
+DW_ATE_UNSIGNED = 0x07
+DW_ATE_UNSIGNED_CHAR = 0x08
+
+UNSIGNED_ENCODINGS = (DW_ATE_UNSIGNED, DW_ATE_UNSIGNED_CHAR)
+
+
+def program_facts(report: Report, path: Path, label: str) -> dict[str, int] | None:
+    """`key value` lines the probe prints about itself, or `None` if it did not run.
+
+    The probe prints addresses, `sizeof`s, `offsetof`s and enumerator values from
+    its own compiled code, so every DWARF claim below is checked against the
+    program rather than against a second opinion about the program.
+    """
+    try:
+        proc = subprocess.run(
+            [str(path)], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            check=False, timeout=120,
+        )
+    except OSError as error:
+        report.fail("program_facts", f"{label}: cannot run the probe: {error}")
+        return None
+    if proc.returncode != 0:
+        report.fail(
+            "program_facts",
+            f"{label}: the probe exits {proc.returncode}: {proc.stderr.strip()[:200]}",
+        )
+        return None
+    facts: dict[str, int] = {}
+    for line in proc.stdout.splitlines():
+        key, _, value = line.partition(" ")
+        try:
+            facts[key] = int(value, 0)
+        except ValueError:
+            report.fail("program_facts", f"{label}: unreadable probe line {line!r}")
+            return None
+    return facts
+
+
+def reference_target(die: Die, unit: Unit, attribute: int) -> Die | None:
+    """The DIE an attribute refers to, whichever reference form it used."""
+    value = die.attrs.get(attribute)
+    if not isinstance(value, int):
+        return None
+    form = die.forms.get(attribute)
+    if form == DW_FORM_REF_ADDR:
+        return unit.die_at(value)
+    if form in DW_FORM_UNIT_REFS:
+        return unit.die_at(unit.offset + value)
+    return None
+
+
+def children(unit: Unit, parent: Die) -> list[Die]:
+    """The DIEs directly below `parent` in the flattened tree."""
+    out: list[Die] = []
+    for die in unit.dies:
+        if die.depth <= parent.depth:
+            if die.offset > parent.offset and out:
+                break
+            continue
+        if die.depth == parent.depth + 1 and die.offset > parent.offset:
+            out.append(die)
+    return out
+
+
+def resolved_type(die: Die, unit: Unit) -> Die | None:
+    """The type a DIE names, following `DW_AT_abstract_origin` first.
+
+    An optimizing compiler moves a parameter's type onto the abstract DIE and
+    leaves the concrete one with nothing but a reference, so reading only the
+    concrete DIE would report a type-less parameter that a consumer resolves.
+    """
+    for candidate in origin_chain(die, unit):
+        if DW_AT_TYPE in candidate.attrs:
+            return reference_target(candidate, unit, DW_AT_TYPE)
+    return None
+
+
+def die_by_tag_name(unit: Unit, tag: int, name: str) -> Die | None:
+    for die in unit.by_tag(tag):
+        if die.name() == name:
+            return die
+    return None
+
+
+def type_of(die: Die, unit: Unit) -> Die | None:
+    return reference_target(die, unit, DW_AT_TYPE)
+
+
+def type_size(die: Die, unit: Unit, depth: int = 0) -> int | None:
+    """`DW_AT_byte_size` of a DIE or of the type it names, when stated."""
+    if depth > 8:
+        return None
+    size = die.attrs.get(DW_AT_BYTE_SIZE)
+    if isinstance(size, int):
+        return size
+    target = type_of(die, unit)
+    return type_size(target, unit, depth + 1) if target is not None else None
+
+
+def peel_types(die: Die | None, unit: Unit, limit: int = 12) -> list[Die]:
+    """`die` and every type reached from it through `DW_AT_type`."""
+    chain: list[Die] = []
+    while die is not None and len(chain) < limit and die not in chain:
+        chain.append(die)
+        die = type_of(die, unit)
+    return chain
+
+
+#: `DW_OP_plus_uconst`: how DWARF 2 and 3 spell a constant member offset, and
+#: what both compilers actually emit there. A block is the only form those
+#: versions allow for a member of a non-contiguous (bit-field) structure.
+DW_OP_PLUS_UCONST = 0x23
+
+DW_FORM_BLOCKS = (0x09, 0x0A, 0x03, 0x04)  # block, block1, block2, block4
+
+
+def member_offset(member: Die) -> int | None:
+    """`DW_AT_data_member_location` as a byte offset, in either encoding.
+
+    DWARF 2 and 3 encode it as a location expression (`DW_OP_plus_uconst`);
+    DWARF 4 and 5 allow the constant itself. Both spellings are in the wild --
+    GCC 16.2 picks the block for 2 and 3 and the constant from 4 on -- and a
+    consumer accepts either, so the gate reads either.
+    """
+    value = member.attrs.get(DW_AT_DATA_MEMBER_LOCATION)
+    if isinstance(value, int):
+        return value
+    if not isinstance(value, bytes) or not value or value[0] != DW_OP_PLUS_UCONST:
+        return None
+    offset = 0
+    shift = 0
+    for byte in value[1:]:
+        offset |= (byte & 0x7F) << shift
+        shift += 7
+        if not byte & 0x80:
+            break
+    return offset
+
+
+def member_bit_placement(member: Die, version: int) -> tuple[int, int] | None:
+    """`(least significant bit, bit size)` of a member, in any encoding.
+
+    DWARF 5 states one absolute `DW_AT_data_bit_offset`, counted from the least
+    significant bit of the containing structure. DWARF 4 allows the same
+    attribute, or `DW_AT_data_member_location` plus `DW_AT_bit_offset`; 2 and 3
+    only the latter, and there `DW_AT_bit_offset` counts from the *most*
+    significant bit of the byte_size-wide storage unit. All three are reduced to
+    the LSB-relative placement the program's own layout implies.
+    """
+    size = member.attrs.get(DW_AT_BIT_SIZE)
+    if not isinstance(size, int):
+        return None
+    absolute = member.attrs.get(DW_AT_DATA_BIT_OFFSET)
+    if version >= 4 and isinstance(absolute, int):
+        return absolute, size
+    offset = member.attrs.get(DW_AT_BIT_OFFSET)
+    if not isinstance(offset, int):
+        return None
+    unit = member.attrs.get(DW_AT_BYTE_SIZE)
+    if not isinstance(unit, int):
+        return None
+    container = member_offset(member) or 0
+    return container * 8 + unit * 8 - offset - size, size
+
+
+def check_type_dies(
+    report: Report, elf: Elf, parsed: list[Unit], label: str, facts: dict[str, int]
+) -> None:
+    """Every type a debugger needs must agree with what the program computed."""
+    units_with_types = 0
+    dangling = 0
+    for unit in parsed:
+        for die in unit.dies:
+            if DW_AT_TYPE not in die.attrs:
+                continue
+            units_with_types += 1
+            if reference_target(die, unit, DW_AT_TYPE) is None:
+                dangling += 1
+    if units_with_types == 0:
+        report.fail("types", f"{label}: no DIE carries DW_AT_type")
+    if dangling:
+        report.fail(
+            "types",
+            f"{label}: {dangling} of {units_with_types} DW_AT_type references point at no DIE",
+        )
+
+    unit = parsed[0]
+    int_type = die_by_tag_name(unit, DW_TAG_BASE_TYPE, "int")
+    if int_type is None:
+        report.fail("types", f"{label}: no DW_TAG_base_type for int")
+    else:
+        size = int_type.attrs.get(DW_AT_BYTE_SIZE)
+        encoding = int_type.attrs.get(DW_AT_ENCODING)
+        if size != facts["sizeof_int"]:
+            report.fail(
+                "types",
+                f"{label}: int is {size} bytes in DWARF and {facts['sizeof_int']} in the program",
+            )
+        if encoding not in (DW_ATE_SIGNED, DW_ATE_SIGNED_CHAR):
+            report.fail(
+                "types", f"{label}: int has encoding {encoding!r}, which is not signed"
+            )
+
+    def object_type(name: str) -> Die | None:
+        """The type DIE of the file-scope object called `name`."""
+        variable = unit_root_variable(unit, name)
+        if variable is None:
+            report.fail("types", f"{label}: no DW_TAG_variable for {name}")
+            return None
+        target = type_of(variable, unit)
+        if target is None:
+            report.fail("types", f"{label}: {name} names no type")
+        return target
+
+    point = object_type("pq_point_global")
+    if point is None:
+        pass
+    elif point.tag != DW_TAG_STRUCTURE_TYPE or point.name() != "pq_point":
+        report.fail(
+            "types",
+            f"{label}: pq_point_global is typed {point.name()!r} (tag {point.tag:#04x}), not "
+            "the pq_point structure",
+        )
+    else:
+        if type_size(point, unit) != facts["sizeof_point"]:
+            report.fail(
+                "types",
+                f"{label}: struct pq_point is {type_size(point, unit)} bytes in DWARF and "
+                f"{facts['sizeof_point']} in the program",
+            )
+        members = {member.name(): member for member in children(unit, point)
+                   if member.tag == DW_TAG_MEMBER}
+        for name, key in (("x", "offsetof_x"), ("y", "offsetof_y")):
+            member = members.get(name)
+            if member is None:
+                report.fail("types", f"{label}: pq_point has no member DIE for {name}")
+                continue
+            offset = member_offset(member)
+            if offset != facts[key]:
+                report.fail(
+                    "types",
+                    f"{label}: pq_point.{name} is at {offset!r} in DWARF and {facts[key]} "
+                    "in the program",
+                )
+            chain = peel_types(type_of(member, unit), unit)
+            if not chain or chain[-1].attrs.get(DW_AT_BYTE_SIZE) != facts["sizeof_int"]:
+                report.fail(
+                    "types", f"{label}: pq_point.{name} does not resolve to a {facts['sizeof_int']}-byte type"
+                )
+
+    typedef = object_type("pq_typedef_global")
+    if typedef is not None:
+        if typedef.tag != DW_TAG_TYPEDEF or typedef.name() != "pq_point_t":
+            report.fail(
+                "types",
+                f"{label}: pq_typedef_global is typed {typedef.name()!r} (tag "
+                f"{typedef.tag:#04x}), so the typedef spelling is lost",
+            )
+        else:
+            target = type_of(typedef, unit)
+            if target is None or target.tag != DW_TAG_STRUCTURE_TYPE \
+                    or target.name() != "pq_point":
+                report.fail(
+                    "types",
+                    f"{label}: pq_point_t does not refer to the pq_point structure DIE",
+                )
+            if type_size(typedef, unit) != facts["sizeof_point"]:
+                report.fail(
+                    "types",
+                    f"{label}: pq_point_t is {type_size(typedef, unit)} bytes in DWARF and "
+                    f"{facts['sizeof_point']} in the program",
+                )
+
+    matrix = object_type("pq_matrix")
+    chain = peel_types(matrix, unit) if matrix is not None else []
+    # A multi-dimensional array has two encodings in the wild and both are
+    # correct: one array type whose children are all the dimensions (GCC 16.2),
+    # or one array type per dimension (Clang, and this writer). The gate reads
+    # the dimensions in order and does not care which shape carries them.
+    bounds = []
+    for die in chain:
+        if die.tag != DW_TAG_ARRAY_TYPE:
+            continue
+        for child in children(unit, die):
+            if child.tag != DW_TAG_SUBRANGE_TYPE:
+                continue
+            bound = child.attrs.get(DW_AT_COUNT, child.attrs.get(DW_AT_UPPER_BOUND))
+            bounds.append(bound + 1 if isinstance(bound, int) else None)
+    if bounds != [2, 3]:
+        report.fail(
+            "types",
+            f"{label}: pq_matrix[2][3] is described with dimensions {bounds}; the outermost "
+            "dimension must come first",
+        )
+    if chain and chain[-1].tag != DW_TAG_BASE_TYPE:
+        report.fail(
+            "types", f"{label}: pq_matrix does not resolve to an element base type"
+        )
+    element = chain[-1].attrs.get(DW_AT_BYTE_SIZE) if chain else None
+    if element != facts["sizeof_int"]:
+        report.fail("types", f"{label}: pq_matrix elements are {element!r} bytes, not int")
+    elif bounds == [2, 3] and element * 2 * 3 != facts["sizeof_matrix"]:
+        report.fail(
+            "types",
+            f"{label}: the described pq_matrix is {element * 6} bytes and the program's is "
+            f"{facts['sizeof_matrix']}",
+        )
+
+    bits = object_type("pq_bits_global")
+    if bits is not None:
+        if bits.tag != DW_TAG_STRUCTURE_TYPE:
+            report.fail("types", f"{label}: pq_bits_global is not a structure type")
+        else:
+            if type_size(bits, unit) != facts["sizeof_bits"]:
+                report.fail(
+                    "types",
+                    f"{label}: struct pq_bits is {type_size(bits, unit)} bytes in DWARF and "
+                    f"{facts['sizeof_bits']} in the program",
+                )
+            placements = {}
+            for member in children(unit, bits):
+                if member.tag == DW_TAG_MEMBER:
+                    placements[member.name()] = member_bit_placement(member, unit.version)
+            expected = {"low": (0, 3), "high": (3, 5)}
+            for name, placement in expected.items():
+                if placements.get(name) != placement:
+                    report.fail(
+                        "types",
+                        f"{label}: bit-field pq_bits.{name} is placed at "
+                        f"{placements.get(name)!r}, expected {placement!r}",
+                    )
+
+    word = object_type("pq_word_global")
+    if word is not None:
+        if word.tag != DW_TAG_UNION_TYPE:
+            report.fail("types", f"{label}: pq_word_global is not a union type")
+        else:
+            if type_size(word, unit) != facts["sizeof_word"]:
+                report.fail(
+                    "types",
+                    f"{label}: union pq_word is {type_size(word, unit)} bytes in DWARF and "
+                    f"{facts['sizeof_word']} in the program",
+                )
+            for member in children(unit, word):
+                if member.tag == DW_TAG_MEMBER and DW_AT_DATA_MEMBER_LOCATION in member.attrs \
+                        and member.attrs[DW_AT_DATA_MEMBER_LOCATION] != 0:
+                    report.fail(
+                        "types",
+                        f"{label}: union member {member.name()} carries a member location, so "
+                        "a consumer would look for it outside the union",
+                    )
+
+    colour = object_type("pq_colour_global")
+    if colour is not None:
+        if colour.tag != DW_TAG_ENUMERATION_TYPE:
+            report.fail("types", f"{label}: pq_colour_global is not an enumeration type")
+        else:
+            values = {
+                die.name(): die.attrs.get(DW_AT_CONST_VALUE)
+                for die in children(unit, colour)
+                if die.tag == DW_TAG_ENUMERATOR
+            }
+            for name, key in (("PQ_RED", "value_red"), ("PQ_GREEN", "value_green"),
+                              ("PQ_BLUE", "value_blue")):
+                if values.get(name) != facts[key]:
+                    report.fail(
+                        "types",
+                        f"{label}: enumerator {name} is {values.get(name)!r} in DWARF and "
+                        f"{facts[key]} in the program",
+                    )
+            underlying = type_of(colour, unit)
+            if underlying is None or underlying.tag != DW_TAG_BASE_TYPE:
+                report.fail(
+                    "types", f"{label}: pq_colour does not name an underlying integer type"
+                )
+
+
+def unit_root_variable(unit: Unit, name: str) -> Die | None:
+    """The file-scope variable DIE called `name`, preferring the outermost one."""
+    best = None
+    for die in unit.by_tag(DW_TAG_VARIABLE):
+        if die_name(die, unit) == name and (best is None or die.depth < best.depth):
+            best = die
+    return best
+
+
+def location_address(die: Die, elf: Elf) -> int | None:
+    """The address a `DW_OP_addr` location expression names, when that is all it is.
+
+    A file-scope object has a fixed address, so `DW_OP_addr` is the whole
+    expression. Anything else -- a register, a frame-relative location -- is a
+    local the gate does not have a program-side address for, and is skipped.
+    """
+    form = die.forms.get(DW_AT_LOCATION)
+    expression = die.attrs.get(DW_AT_LOCATION)
+    if form != 0x18 and form not in DW_FORM_BLOCKS:
+        return None
+    if not isinstance(expression, bytes):
+        return None
+    if len(expression) != 1 + elf.address_size or expression[0] != DW_OP_ADDR:
+        return None
+    return int.from_bytes(expression[1:], elf.order)
+
+
+def check_parameters(report: Report, elf: Elf, parsed: list[Unit], label: str) -> None:
+    """Every parameter of a function this unit defines needs its own DIE.
+
+    A `DW_TAG_formal_parameter` inside a `subroutine_type` describes a *type* --
+    it is anonymous and says nothing about a live call. What a debugger needs to
+    print `n` while stopped in `pq_frame` is a named child of the subprogram DIE,
+    which is a different part of the graph and is what this check requires.
+    """
+    unit = parsed[0]
+    required = {"pq_frame": ("n",), "pq_leaf": ("x",)}
+    described = 0
+    # A function that takes `...` must say so: a consumer otherwise reads a
+    # complete argument list and reports the extra ones as garbage.
+    emitted = {symbol.name for symbol in elf.functions()}
+    variadic = next(
+        (die for die in unit.by_tag(DW_TAG_SUBPROGRAM)
+         if die_name(die, unit) == "pq_sum" and DW_AT_LOW_PC in die.attrs),
+        None,
+    )
+    if variadic is None:
+        # An optimizing tier may fold the callee into its caller; a function with
+        # no symbol of its own has no DIE to describe, which is the same policy
+        # the function check below applies.
+        if "pq_sum" in emitted:
+            report.fail(
+                "parameters", f"{label}: pq_sum is defined in .symtab but has no subprogram DIE"
+            )
+    else:
+        markers = [die for die in children(unit, variadic)
+                   if die.tag == DW_TAG_UNSPECIFIED_PARAMETERS]
+        if len(markers) != 1:
+            report.fail(
+                "parameters",
+                f"{label}: pq_sum takes `...` but its subprogram has {len(markers)} "
+                "DW_TAG_unspecified_parameters children",
+            )
+        if not [die for die in children(unit, variadic)
+                if die.tag == DW_TAG_FORMAL_PARAMETER]:
+            report.fail(
+                "parameters",
+                f"{label}: pq_sum's first parameter is missing, so the DIE describes a "
+                "function whose arguments cannot be listed at all",
+            )
+    for name, parameters in required.items():
+        subprogram = next(
+            (die for die in unit.by_tag(DW_TAG_SUBPROGRAM)
+             if die_name(die, unit) == name and DW_AT_LOW_PC in die.attrs),
+            None,
+        )
+        if subprogram is None:
+            if name in emitted:
+                report.fail(
+                    "parameters", f"{label}: {name} is defined in .symtab but has no subprogram DIE"
+                )
+            continue
+        named = {
+            die_name(die, unit): die
+            for die in children(unit, subprogram)
+            if die.tag == DW_TAG_FORMAL_PARAMETER
+        }
+        for parameter in parameters:
+            die = named.get(parameter)
+            if die is None:
+                report.gap(
+                    "parameters",
+                    f"{label}: {name} has no DW_TAG_formal_parameter DIE for {parameter} "
+                    f"(children: {sorted(named) or 'none'})",
+                )
+                continue
+            described += 1
+            if DW_AT_LOCATION not in die.attrs:
+                report.gap(
+                    "parameter_locations",
+                    f"{label}: parameter {name}.{parameter} has no DW_AT_location",
+                )
+            target = resolved_type(die, unit)
+            if target is None:
+                report.fail(
+                    "parameters", f"{label}: parameter {name}.{parameter} names no type"
+                )
+            elif type_size(target, unit) is None:
+                report.fail(
+                    "parameters",
+                    f"{label}: parameter {name}.{parameter} has a type with no byte size",
+                )
+    if described:
+        report.measurements.setdefault("parameters", {})[label] = described
+
+
+def check_declaration_policy(report: Report, path: Path, label: str) -> None:
+    """Describe the declarations the code refers to, and only those.
+
+    `<stdio.h>` declares `stdin`, `stdout` and `stderr`, each naming the whole
+    `_IO_FILE` structure; describing them all costs a debug payload the program
+    never asks for (measured on `fib.c`: `.debug_info` 578 bytes against GCC
+    16.2's 249). GCC 16.2's rule, measured on a pair of `extern` declarations
+    where only one is used, is that a declaration gets a DIE exactly when the
+    unit's code refers to it -- and a record that only an unreferenced
+    declaration names is not described at all.
+    """
+    try:
+        elf = read_elf(path)
+    except ValueError as error:
+        report.fail("declarations", f"{label}: {error}")
+        return
+    try:
+        parsed = units(elf)
+    except ValueError as error:
+        report.fail("declarations", f"{label}: {error}")
+        return
+    if not parsed:
+        report.fail("declarations", f"{label}: no compile unit")
+        return
+    unit = parsed[0]
+    variables = {die_name(die, unit): die for die in unit.by_tag(DW_TAG_VARIABLE)
+                 if die_name(die, unit)}
+    used = variables.get("pq_decl_used")
+    if used is None:
+        report.fail(
+            "declarations",
+            f"{label}: pq_decl_used is referred to by the code but has no DIE, so a "
+            "debugger cannot print it",
+        )
+    elif DW_AT_DECLARATION not in used.attrs:
+        report.fail(
+            "declarations",
+            f"{label}: pq_decl_used is only declared here, but its DIE does not say so",
+        )
+    if "pq_decl_unused" in variables:
+        report.fail(
+            "declarations",
+            f"{label}: pq_decl_unused is declared and never referred to, so its DIE "
+            f"costs {len(unit.dies)}-DIE worth of a payload nothing asked for",
+        )
+    name_only = [die for die in unit.by_tag(DW_TAG_STRUCTURE_TYPE)
+                 if die.name() == "pq_decl_rec"]
+    if name_only:
+        report.fail(
+            "declarations",
+            f"{label}: the record pq_decl_rec is reachable only from an unreferenced "
+            "declaration but is still described, with its members",
+        )
+    report.measurements.setdefault("declarations", {})[label] = len(unit.dies)
+
+
+def check_object_locations(
+    report: Report, elf: Elf, parsed: list[Unit], label: str, facts: dict[str, int]
+) -> None:
+    """A variable's location must be its address -- and only where it has one.
+
+    Two defects hide here and neither is visible in a shape comparison. A missing
+    `DW_AT_location` makes a debugger print `<optimized out>` for an object the
+    program can see; a location naming a symbol the optimizer deleted makes the
+    link fail outright, because the relocation has no target. So the rule the
+    gate enforces is the one GCC 16.2 follows: the attribute is present exactly
+    when `.symtab` defines the object.
+    """
+    symbols = {symbol.name: symbol for symbol in elf.objects("")}
+    described = 0
+    for unit in parsed:
+        for die in unit.by_tag(DW_TAG_VARIABLE):
+            name = die_name(die, unit)
+            if not name:
+                continue
+            described += 1
+            address = location_address(die, elf)
+            symbol = symbols.get(name)
+            declaration = DW_AT_DECLARATION in die.attrs
+            if address is None:
+                if symbol is not None and not declaration:
+                    report.fail(
+                        "locations",
+                        f"{label}: {name} is defined in .symtab at {symbol.value:#x} but its "
+                        "DIE carries no DW_AT_location, so a debugger cannot read it",
+                    )
+                continue
+            if symbol is None:
+                report.fail(
+                    "locations",
+                    f"{label}: {name} has a DW_AT_location but .symtab does not define it, "
+                    f"so the {address:#x} address is a relocation with no target",
+                )
+            elif address != symbol.value:
+                report.fail(
+                    "locations",
+                    f"{label}: {name} is at {symbol.value:#x} but its DW_AT_location says "
+                    f"{address:#x}",
+                )
+    if described == 0:
+        report.fail("locations", f"{label}: no variable DIE at all")
+    global_die = unit_root_variable(parsed[0], "pq_global")
+    if global_die is None:
+        report.fail("locations", f"{label}: no DIE for pq_global")
+    else:
+        address = location_address(global_die, elf)
+        if address != facts["addr_global"]:
+            report.fail(
+                "locations",
+                f"{label}: pq_global is at {facts['addr_global']:#x} in the program and "
+                f"{address if address is None else hex(address)} in DWARF",
+            )
+
 
 def check_data_only_unit(report: Report, path: Path, label: str) -> None:
-    """A unit with no code still needs a unit, or a data TU is invisible."""
+    """A unit with no code still needs a unit, a line program and real locations.
+
+    GCC 16.2 emits the same shape for a translation unit that defines only data:
+    a compile unit with `DW_AT_stmt_list` and no `DW_AT_low_pc`, a `.debug_line`
+    program whose header carries the file table (the file table is what
+    `DW_AT_decl_file` indexes, so it is needed even with no statements at all),
+    and one `DW_TAG_variable` per defined object.
+    """
     try:
         elf = read_elf(path)
     except ValueError as error:
         report.fail("data_only_unit", f"{label}: {error}")
         return
     if not elf.sections.get(".debug_info"):
-        report.gap("data_only_unit", f"{label}: no .debug_info section at all")
+        report.fail("data_only_unit", f"{label}: no .debug_info section at all")
         return
     try:
         parsed = units(elf)
@@ -1755,16 +2438,72 @@ def check_data_only_unit(report: Report, path: Path, label: str) -> None:
         report.fail("data_only_unit", f"{label}: {error}")
         return
     if not parsed:
-        report.gap("data_only_unit", f"{label}: .debug_info exists but holds no unit")
+        report.fail("data_only_unit", f"{label}: .debug_info exists but holds no unit")
         return
-    named = [
-        die_name(die, unit) for unit in parsed for die in unit.by_tag(DW_TAG_VARIABLE)
-    ]
-    if "pq_only_data" not in named:
-        report.gap(
+    unit = parsed[0]
+    root = unit.root()
+    if root is None:
+        report.fail("data_only_unit", f"{label}: the unit has no root DIE")
+        return
+    if DW_AT_LOW_PC in root.attrs:
+        report.fail(
             "data_only_unit",
-            f"{label}: the unit names variables {named or 'none'}, not pq_only_data",
+            f"{label}: a unit with no code states DW_AT_low_pc {root.attrs[DW_AT_LOW_PC]:#x}",
         )
+    if DW_AT_STMT_LIST not in root.attrs:
+        report.fail(
+            "data_only_unit",
+            f"{label}: the unit has no DW_AT_stmt_list, so its DW_AT_decl_files name no "
+            "file table",
+        )
+    line = elf.sections.get(".debug_line")
+    files: list[str] = []
+    if not line:
+        report.fail("data_only_unit", f"{label}: no .debug_line section")
+    else:
+        try:
+            files = line_table(elf, root.attrs.get(DW_AT_STMT_LIST, 0)).files
+        except (ValueError, IndexError) as error:
+            report.fail("data_only_unit", f"{label}: .debug_line does not parse: {error}")
+        else:
+            if not files:
+                report.fail("data_only_unit", f"{label}: the line program has no file table")
+            elif not any(entry.endswith("probe_data.c") for entry in files):
+                report.fail(
+                    "data_only_unit",
+                    f"{label}: the line program lists {files}, not the source file",
+                )
+    named = {}
+    for die in unit.by_tag(DW_TAG_VARIABLE):
+        name = die_name(die, unit)
+        if name:
+            named[name] = die
+    for name in ("pq_only_data", "pq_only_text"):
+        if name not in named:
+            report.fail(
+                "data_only_unit",
+                f"{label}: the unit names variables {sorted(named) or 'none'}, not {name}",
+            )
+    # An unlinked object carries `.rela.debug_info`, not addresses; the location's
+    # *existence* is what this check can see, and the linked programs above prove
+    # what it points at.
+    if "pq_only_data" in named and DW_AT_LOCATION not in named["pq_only_data"].attrs:
+        report.fail(
+            "data_only_unit", f"{label}: pq_only_data has no DW_AT_location to relocate"
+        )
+    report.measurements.setdefault("data_unit", {})[label] = {
+        "unit_length": unit_length(elf, unit),
+        "files": len(files),
+    }
+
+
+def unit_length(elf: Elf, unit: Unit) -> int:
+    """The `.debug_info` contribution length of `unit`."""
+    info = elf.sections.get(".debug_info", b"")
+    if unit.offset + 4 > len(info):
+        return 0
+    return elf.u32(unit.offset, info)
+
 
 
 def run_gate(lccc: list[str], gcc: list[str] | None, workdir: Path) -> Report:
@@ -1795,6 +2534,11 @@ def run_gate(lccc: list[str], gcc: list[str] | None, workdir: Path) -> Report:
         check_eh_frame(report, elf, ranges, label)
         check_static_policy(report, elf, label, optimization.lstrip("-"))
         check_debug_payload(report, elf, label, optimizing=optimization != "-O0")
+        check_parameters(report, elf, parsed, label)
+        facts = program_facts(report, output, label)
+        if facts is not None:
+            check_type_dies(report, elf, parsed, label, facts)
+            check_object_locations(report, elf, parsed, label, facts)
 
     # Two units in one program: every set must name exactly one unit.
     output = workdir / "multi.elf"
@@ -1820,6 +2564,15 @@ def run_gate(lccc: list[str], gcc: list[str] | None, workdir: Path) -> Report:
                 )
         except ValueError as error:
             report.fail("multi_unit", f"multi: {error}")
+
+    # The declaration policy, on an object that does not need to link (one of the
+    # two declared names has no definition anywhere in the harness).
+    output = workdir / "decl.o"
+    if build(
+        report, lccc, ["-g", "-gdwarf-5", "-O0"], [probes["probe_decl"]], output, workdir,
+        link=False,
+    ):
+        check_declaration_policy(report, output, "decl")
 
     # A unit that is all data.
     output = workdir / "data.o"
