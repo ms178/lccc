@@ -76,6 +76,40 @@ without a test that fails when it regresses.
    4-byte pointer, unblocking the `zlib-compare256-correctness` gate and the
    195 previously-unmeasured i686 aggregate-ABI configurations.  This is
    recorded as an environment action, not claimed as a code fix.
+5. **A second silent-ratchet defect in the DWARF DIE census.**  GDB 18.1
+   showed LCCC reporting every parameter as `<optimized out>` at every
+   optimisation level, while GCC 16.2 and Clang 23.1.5 resolve `a=5, b=7`.
+   Tracing that into `readelf --debug-dump=info` exposed a worse problem than
+   the gap itself: `check_dwarf_die_census.py` pinned only **3 of the 12 tags**
+   LCCC actually emits and pre-declared **15 tags and 5 attributes** as
+   "deferred" that the compiler already implements. Both halves of the gate
+   ignored those names, so losing the entire C type graph, every variable DIE
+   or every `DW_TAG_formal_parameter` would have produced a green check.
+   Measured union (across `-gdwarf-2..5`, readelf 2.47): LCCC 12 tags /
+   20 attributes, GCC 14 / 27, Clang 14 / 21; real gap = 3 tags
+   (`enumeration_type`, `enumerator`, `lexical_block`) and 10 attributes.
+   Fixed by pinning the full measured baseline, reducing the deferral list to
+   the measured difference, adding an import-time disjointness assertion, and
+   adding 7 corpus tests (including an end-to-end negative control that runs a
+   gate copy with `DW_TAG_variable` removed and requires a non-zero exit).
+6. **The gap itself is honest, so it is documented rather than faked.**
+   Emitting a bare `DW_OP_regN` as a parameter location would claim the value
+   stays in that register for the whole function, which is false as soon as
+   the register allocator reuses it. GCC/Clang use entry-value expressions and
+   location lists. A wrong location is worse than `<optimized out>`. The
+   `parameter_location_is_never_wrong` test is a forward ratchet: LCCC may
+   omit locations (measured, documented) or emit one GDB resolves to the true
+   value; any half-correct implementation fails. The census docstring now
+   records the GDB observation explicitly.
+7. **Host-CPU runtime behaviour was checked with a real debugger, not just
+   assembly hashes.**  A four-frame `noinline` fixture compiled by LCCC,
+   GCC 16.2 and Clang 23.1.5 at `-O2`, `-Ofast` and `-Og` produces identical
+   results for inputs 5, -3, 0 and 12345 (`6n+16`). GDB's backtrace at `leaf`
+   is `leaf -> middle -> top -> main` for all nine compiler/level pairs, line
+   breakpoints resolve for all three, and `-fno-omit-frame-pointer` produces a
+   saved `rbp` chain where default `-O2` reports only `rip`. These are the
+   two optimisation levels reclassified in item 1, so their "implemented"
+   classification is now backed by runtime evidence, not only a macro delta.
 
 ## Alternatives weighed
 
@@ -86,16 +120,65 @@ without a test that fails when it regresses.
 | **Probe each candidate, fix provable defects, ratchet already-closed ones, measure the open ones** | evidence for every claim; zero miscompile risk; regression coverage per item | requires a triage document | **chosen** |
 | Add the 20 checks to `ci_local.sh` | direct gate | would require editing `ci.yml` + `ci-lane-plan.json` + parity registries, widening the CI-failure surface | rejected; `unittest discover -s tests/corpus` already runs in both `ci_local.sh:2477` and `ci.yml:3223`, so `tests/corpus/test_backlog_roi.py` executes locally **and** hosted with no wiring change |
 
+## Function-level efficiency audit of the new code
+
+Every new hot path is static analysis or a single compiler invocation; none is
+in a per-compilation loop. Measured on the 2-vCPU host (minimum of 3 runs):
+
+| Function / gate | Complexity | Measured | Why this shape |
+|---|---|---|---|
+| `option_effect_ledger.parse_rows` | O(source bytes), one regex pass | — | Block parser with one `finditer`; no backtracking-prone nested quantifiers. Comments are handled by field regexes rather than a pre-pass that would copy the file. |
+| `option_effect_ledger.dynamic_problems` | O(rows × probes), 17 rows / 11 probes | 0.472 s total for `--lccc --self-test` | Two compiler invocations per row (`-S`, `-dM -E`) are the irreducible cost of an *executable* contract; results are hashed, never diffed, so memory is O(1) per row. |
+| `check_backlog_roi.Context.load` | O(sum of 17 file sizes), read once | 0.081 s for all 20 checks + 21 negative controls | One read per input; checks share a frozen context instead of re-reading the tree 41 times. |
+| `check_backlog_roi.run_all` | O(20) | included above | Each check returns named problems, so `--json` can attribute a failure to one item. |
+| `check_dwarf_die_census.census` | O(DIE lines), streaming | 0.364 s for 4 dialects × 3 compilers | Line-by-line state machine; no DOM, no retained DIE tree, so memory is O(tags + attributes). |
+| `check_sse2_codegen_matrix` `--check` | O(122 rows × 3 compilers) | 6.230 s | Dominated by 366 real compilations; the checker itself is linear. |
+
+No function allocates proportional to an untrusted input size beyond the file
+it was written to read; no quadratic string concatenation; no shell
+interpolation of paths in the Python gates (all `subprocess.run` with list
+argv); no `eval`/`exec` on repository content in the production path. The
+`test_dwarf_die_census_ratchet` negative control deliberately `exec`s a
+mutated *copy* of the gate inside a temporary directory — that is test-only
+and never reaches a compiler.
+
+Design alternatives weighed for the ledger: (a) reuse the shell gate's
+existing per-option `if` chain — rejected, it cannot enumerate the table and
+would duplicate the source of truth; (b) parse `option_table.rs` with a Rust
+build step — rejected, a Python gate can run in both the shell and corpus
+lanes without a Cargo build; (c) emit a JSON contract from Rust and diff it —
+rejected, that verifies *declarations*, not behaviour. The chosen design is
+the only one that fails when the compiler's behaviour changes while the table
+stays still.
+
 ## Verification
 
-* `scripts/check_backlog_roi.py --self-test --json`: **20/20 PASS, 0 negative-control failures**.
-* `scripts/option_effect_ledger.py --lccc target/fastbuild/lccc --self-test --json`: 17 rows, 11 probes, 7 priority options, **0 problems**.
-* `env CCC=… bash tests/regression/check_driver_option_contract.sh --skip-trapv-matrix`: **exit 0**, including the executable ledger.
-* `check_sse2_codegen_matrix.py --check` / `--self-test` / `--update-baseline`: **exit 0** on all three.
-* `unittest discover -s tests/corpus -p 'test_*.py'`: **1268 tests, 0 failures, 6 skips**.
-* `cargo build --profile fastbuild --locked` with `RUSTFLAGS=-D warnings`: **exit 0, zero warnings**.
-* `cargo clippy --profile fastbuild --locked -- -D warnings`: **exit 0**.
-* Hosted CI is the authoritative gate; see the PR check rollup.
+All results below are from the rebased tree (`origin/main` = `fe8d911`, which
+merged 146 unrelated files), rebuilt with the fastbuild preset and the pinned
+GCC 16.2.0 / Clang 23.1.5 / GDB 18.1 / Rust 1.99.1 oracles.
+
+| Check | Result |
+|---|---|
+| `cargo build --profile fastbuild --locked`, `RUSTFLAGS=-D warnings` | **exit 0, zero warnings** (0 `warning` lines in the build log) |
+| `cargo fmt --check` | **exit 0** |
+| `cargo clippy --profile fastbuild --locked -- -D warnings` | **exit 0** (hosted Clippy lane passes too) |
+| `cargo test --profile fastbuild --locked driver_option_contract_table` | **1 passed, 0 failed**, 8083 filtered |
+| `option_effect_ledger.py --lccc … --self-test --json` | 17 rows, 11 probes, 7 priority options, **0 problems** |
+| `check_driver_option_contract.sh --skip-trapv-matrix` | **exit 0**, including the executable ledger |
+| `check_sse2_codegen_matrix.py --check / --self-test / --update-baseline` | **all PASS** (122 rows; re-derived against the live oracles) |
+| `check_dwarf_die_census.py` (4 dialects × 3 compilers) | **PASS** with the tightened 12-tag / 20-attribute baseline |
+| `check_backlog_roi.py --self-test --json` | **20/20 PASS, 0 negative-control failures** |
+| `tests.corpus.test_dwarf_die_census_ratchet` | **7 tests OK**, incl. the end-to-end lost-tag negative control |
+| `tests.corpus.test_gdb_option_runtime` | **7 tests OK** with pinned GDB 18.1 |
+| `unittest discover -s tests/corpus -p 'test_*.py'` | **1293 tests, 0 failures, 5 skips** |
+| `check_doc_links.py`, `check_script_imports.py`, `check_no_conflict_markers.py`, `check_ci_workflow_shell.py` | **all PASS** |
+| Hosted CI on `fd3d490` | **22 pass / 3 skipping / 0 failures**, including the authenticated ICX 2026.2 integration lane |
+
+Previously-failing local gates were traced to a missing pinned environment:
+with `env.sh` sourced, `oracle-toolchain`, `zlib-compare256-correctness`,
+`trapv-boundary-matrix-m32`, `gcc17-builtin-semantics`,
+`public-native-simd-abi` and `memory-value-contracts` all pass. Hosted CI is
+the authoritative gate.
 
 ### §10 audit of the merged cache refresh
 

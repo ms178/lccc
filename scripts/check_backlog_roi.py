@@ -182,10 +182,14 @@ def gp05_gnuc_major(c: Context) -> list[str]:
     """GP-05's worst drift was `__GNUC__ 14` while the oracle is GCC 16.2.
     Pin the major in the preprocessor source to the same value the parity
     gate measures."""
-    if "__GNUC__" not in c.predefines:
-        return ["GP-05: __GNUC__ is not defined in the preprocessor at all"]
-    if not re.search(r'__GNUC__[^\n]{0,80}16\b', c.predefines):
-        return ["GP-05: __GNUC__ is not pinned to the GCC 16 major measured by the oracle gate"]
+    # Match the table entry itself, not a loose `__GNUC__` substring: the
+    # first attempt could be satisfied by `__GNUC_MINOR__` on a nearby line,
+    # or by any `16` within 80 characters. A wrong major must be named.
+    match = re.search(r'\("__GNUC__",\s*"(\d+)"\)', c.predefines)
+    if match is None:
+        return ["GP-05: __GNUC__ is not defined in the preprocessor's macro table"]
+    if match.group(1) != "16":
+        return [f"GP-05: __GNUC__ is {match.group(1)}, not the GCC 16 major the oracle gate measures"]
     return []
 
 
@@ -348,7 +352,9 @@ def negative_controls(ctx: Context) -> list[str]:
     mutate("hosted gate removed", "GP-22/6", ci_workflow="")
     mutate("macro budgets deleted", "GP-23/1", macro_py="")
     mutate("BUFSIZ control removed", "GP-23/2", macro_sh="FORBIDDEN_LIST=()")
-    mutate("__GNUC__ drift", "GP-05", predefines='#define __GNUC__ 14\n')
+    mutate("__GNUC__ drift", "GP-05",
+           predefines=ctx.predefines.replace('("__GNUC__", "16")', '("__GNUC__", "14")'))
+    mutate("__GNUC__ removed", "GP-05", predefines="")
     mutate("no-plt probe removed", "MB-01/1", driver_gate=ctx.driver_gate.replace("GOTPCREL", ""))
     mutate("visibility probe removed", "MB-01/2",
            driver_gate=ctx.driver_gate.replace(".hidden", ""))
@@ -378,8 +384,10 @@ def negative_controls(ctx: Context) -> list[str]:
         problems = by_name[check](mutated)
         if not problems:
             failures.append(f"negative control {name!r} did not make {check} fail")
-    if len(mutations) != 20:
-        failures.append(f"only {len(mutations)} of 20 checks have a negative control")
+    controls = {check for _, check, _ in mutations}
+    missing = [name for name, _ in CHECKS if name not in controls]
+    if missing:
+        failures.append(f"checks without a negative control: {', '.join(missing)}")
     return failures
 
 
