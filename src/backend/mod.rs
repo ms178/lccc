@@ -932,7 +932,7 @@ impl Target {
         asm_text: &str,
         output_path: &str,
         extra_args: &[String],
-        debug: Option<elf::DwarfConfig>,
+        debug: Option<elf::DwarfDebug>,
     ) -> Result<(), String> {
         // When gcc_assembler feature is enabled, GCC assembles the text and
         // produces its own debug sections; tell it which dialect to write and
@@ -941,7 +941,10 @@ impl Target {
         {
             let mut args = extra_args.to_vec();
             if let Some(debug) = debug {
-                args.push(format!("-gdwarf-{}", debug.version));
+                // GCC assembles the text itself, so it builds the DWARF from the
+                // `.loc` rows and knows nothing of the analysed types: the
+                // dialect is all that can be delegated.
+                args.push(format!("-gdwarf-{}", debug.config.version));
             }
             common::assemble_with_extra(&self.assembler_config(), asm_text, output_path, &args)
         }

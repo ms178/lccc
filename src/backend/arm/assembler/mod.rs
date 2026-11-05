@@ -24,12 +24,16 @@ use parser::{AsmDirective, AsmStatement, DataValue, Operand, parse_asm};
 pub fn assemble(
     asm_text: &str,
     output_path: &str,
-    debug: Option<crate::backend::elf::DwarfConfig>,
+    debug: Option<crate::backend::elf::DwarfDebug>,
 ) -> Result<(), String> {
     let statements = prepare_statements(asm_text)?;
     let mut writer = ElfWriter::new();
     if let Some(debug) = debug {
-        writer.base.set_debug_config(debug);
+        let crate::backend::elf::DwarfDebug { config, unit } = debug;
+        writer.base.set_debug_config(config);
+        if let Some(unit) = unit {
+            writer.base.set_debug_unit(unit);
+        }
     }
     writer.process_statements(&statements)?;
     writer.write_elf(output_path)?;

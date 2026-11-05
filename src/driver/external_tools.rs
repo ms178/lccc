@@ -352,8 +352,13 @@ impl Driver {
         }
 
         let extra = self.build_asm_extra_args();
-        self.target
-            .assemble_with_extra(&asm_text, output_path, &extra, self.dwarf_config(true))
+        self.target.assemble_with_extra(
+            &asm_text,
+            output_path,
+            &extra,
+            self.dwarf_config(true)
+                .map(crate::backend::elf::DwarfDebug::dialect),
+        )
     }
 
     /// Build extra assembler arguments for RISC-V ABI/arch overrides.

@@ -471,6 +471,11 @@ pub struct ElfWriterBase {
     /// `.loc` rows as (label at the row's address, file, line, column): a
     /// label, so subsection merging moves the row with its code.
     debug_rows: Vec<(String, u32, u32, u32, super::dwarf::DwarfLocOptions)>,
+    /// The types and file-scope objects the compiler wants described: the half
+    /// of `.debug_info` an assembler cannot infer from the text it was given.
+    /// `None` for input that carries only `.loc` rows (a hand-written `.s`, or
+    /// `gcc -S -g` output).
+    debug_unit: Option<std::sync::Arc<super::dwarf_spec::DwarfUnitSpec>>,
 }
 
 impl ElfWriterBase {
@@ -530,6 +535,7 @@ impl ElfWriterBase {
             debug_config: super::dwarf::DwarfConfig::assembler(super::dwarf::DWARF_DEFAULT_VERSION),
             debug_files: Vec::new(),
             debug_rows: Vec::new(),
+            debug_unit: None,
         }
     }
 
@@ -537,6 +543,13 @@ impl ElfWriterBase {
     /// (`-gdwarf-<N>` and the language `-std=` implies).
     pub fn set_debug_config(&mut self, config: super::dwarf::DwarfConfig) {
         self.debug_config = config;
+    }
+
+    /// Attach the types and objects a compiler analysed, so this object's
+    /// `.debug_info` names them (see `dwarf_spec`).  Assembling text without
+    /// this describes the code alone, which is all an assembler can know.
+    pub fn set_debug_unit(&mut self, unit: std::sync::Arc<super::dwarf_spec::DwarfUnitSpec>) {
+        self.debug_unit = Some(unit);
     }
 
     /// Ensure a section exists. If it doesn't, create it with the given properties.
@@ -605,6 +618,18 @@ impl ElfWriterBase {
     /// every code address is relocated against a label at it, which the linker
     /// moves when it deletes bytes.  Call after the last section change and
     /// before [`Self::write_elf`].
+    /// Every symbol name this object relocates against, which is exactly the set
+    /// of declarations its code and data refer to.
+    pub fn referenced_symbols(&self) -> FxHashMap<String, ()> {
+        let mut referenced: FxHashMap<String, ()> = FxHashMap::default();
+        for section in self.sections.values() {
+            for reloc in &section.relocs {
+                referenced.insert(reloc.symbol_name.clone(), ());
+            }
+        }
+        referenced
+    }
+
     pub fn finish_debug_sections(
         &mut self,
         address_size: usize,
@@ -616,9 +641,20 @@ impl ElfWriterBase {
             DwarfFunction, DwarfLineLocation, DwarfSectionInfo, DwarfStrings,
             build_dwarf_info_sections, build_dwarf_line_section,
         };
-        if self.debug_rows.is_empty() {
+        // Rows alone describe an assembler input; a compiler also brings the
+        // types and objects it analysed.  Only an object with neither has no
+        // debug information to write.
+        let has_unit = self
+            .debug_unit
+            .as_ref()
+            .is_some_and(|unit| !unit.is_empty());
+        if self.debug_rows.is_empty() && !has_unit && !self.sections.contains_key(".debug_line") {
             return Ok(());
         }
+        // An empty unit is the honest answer for text with no analysed types:
+        // the writer emits nothing for it.
+        let empty_unit = std::sync::Arc::new(super::dwarf_spec::DwarfUnitSpec::default());
+        let unit = self.debug_unit.as_ref().unwrap_or(&empty_unit);
         let index_of: FxHashMap<&str, usize> = self
             .section_order
             .iter()
@@ -730,7 +766,10 @@ impl ElfWriterBase {
                 .get(".debug_info")
                 .and_then(|section| super::dwarf::unit_version(&section.data)),
         );
-        if let Some(mut line) = build_dwarf_line_section(
+        // The line program may be header-only (a data-only unit still needs its
+        // file table, which `DW_AT_decl_file` indexes), and it may be absent
+        // altogether when there is neither code nor a file to name.
+        let mut line = build_dwarf_line_section(
             &self.debug_files,
             &locations,
             &section_info,
@@ -741,34 +780,61 @@ impl ElfWriterBase {
             config,
             &mut line_strings,
             labelled.as_deref_mut(),
-        )? {
-            let stmt_list = super::dwarf::place_line_build(&mut line, &line_prefix)?;
-            if !self.sections.contains_key(".debug_info")
-                && !self.sections.contains_key(".debug_abbrev")
-            {
-                if let Some(info) = build_dwarf_info_sections(
-                    &line.code_sections,
-                    stmt_list,
-                    &self.debug_files,
-                    &locations,
-                    &section_info,
-                    &functions,
-                    primary_file,
-                    &comp_dir,
-                    concat!("LCCC ", env!("CARGO_PKG_VERSION")),
-                    address_size,
-                    abs32,
-                    abs_addr,
-                    config,
-                    &mut strings,
-                    &mut line_strings,
-                    labelled,
-                )? {
-                    built.extend([info.info, info.abbrev]);
-                    built.extend(info.aranges);
-                    built.extend(info.ranges);
-                }
+        )?;
+        let stmt_list = match line.as_mut() {
+            Some(build) => Some(super::dwarf::place_line_build(build, &line_prefix)?),
+            None => None,
+        };
+        let code_sections: Vec<usize> = line
+            .as_ref()
+            .map(|build| build.code_sections.clone())
+            .unwrap_or_default();
+        // The names this file's code and data reference. A declaration DIE costs
+        // the whole `_IO_FILE` layout when a header declares `stdout`, so the unit
+        // describes only the declarations the object actually relocates against --
+        // GCC 16.2's measured rule.
+        let referenced = self.referenced_symbols();
+        let unit = unit.with_referenced(&referenced);
+        let unit = &unit;
+        // The objects this file defines: a variable DIE may only state an address
+        // for one of them.
+        let defined_objects: crate::common::fx_hash::FxHashMap<String, ()> = self
+            .symbol_types
+            .iter()
+            .filter(|&(name, &sym_type)| {
+                matches!(sym_type, STT_OBJECT | STT_TLS) && self.labels.contains_key(name)
+            })
+            .map(|(name, _)| (name.clone(), ()))
+            .collect();
+        if !self.sections.contains_key(".debug_info")
+            && !self.sections.contains_key(".debug_abbrev")
+        {
+            if let Some(info) = build_dwarf_info_sections(
+                &code_sections,
+                stmt_list,
+                &self.debug_files,
+                &locations,
+                &section_info,
+                &functions,
+                primary_file,
+                &comp_dir,
+                concat!("LCCC ", env!("CARGO_PKG_VERSION")),
+                address_size,
+                abs32,
+                abs_addr,
+                config,
+                &mut strings,
+                &mut line_strings,
+                unit,
+                &defined_objects,
+                labelled,
+            )? {
+                built.extend([info.info, info.abbrev]);
+                built.extend(info.aranges);
+                built.extend(info.ranges);
             }
+        }
+        if let Some(line) = line {
             built.push(line.line);
         }
         built.extend(strings.into_section(".debug_str"));

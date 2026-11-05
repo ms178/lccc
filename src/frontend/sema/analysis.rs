@@ -165,6 +165,30 @@ impl FunctionInfo {
     }
 }
 
+/// A file-scope object this translation unit declares or defines.
+///
+/// Debug information names objects, not just functions, so the analysis has to
+/// keep what the symbol table cannot: a declaration can be superseded by a later
+/// one, an `extern int x;` declares no storage while `int x = 1;` does, and the
+/// *type spelling* (`myint x;`) is what a debugger prints.  Recorded here rather
+/// than reconstructed later because the resolved `CType` exists only during
+/// analysis, and re-resolving a declarator outside sema is how two answers to
+/// "what type is this" come to disagree.
+#[derive(Debug, Clone)]
+pub struct FileScopeObject {
+    pub name: String,
+    pub ty: CType,
+    /// The typedef name the declaration spelled, when it spelled one.
+    pub typedef_name: Option<String>,
+    pub is_static: bool,
+    /// `extern`: the declaration names storage this unit does not define.
+    pub is_extern: bool,
+    /// The declaration has an initializer, which makes it a definition even if
+    /// it also says `extern`.
+    pub has_initializer: bool,
+    pub span: crate::common::source::Span,
+}
+
 /// Results of semantic analysis, used by the lowering phase.
 #[derive(Debug)]
 pub struct SemaResult {
@@ -201,6 +225,9 @@ pub struct SemaResult {
     /// and returns a null pointer instead (GCC 16.2's code generation at
     /// every level; see `analysis::return_local_addr`).
     pub local_address_returns: FxHashSet<ExprId>,
+    /// Every object declared at file scope, in declaration order, for the debug
+    /// information's `DW_TAG_variable` set (see [`FileScopeObject`]).
+    pub file_scope_objects: Vec<FileScopeObject>,
 }
 
 impl Default for SemaResult {
@@ -213,6 +240,7 @@ impl Default for SemaResult {
             const_values: ConstMap::default(),
             enumerator_refs: FxHashMap::default(),
             local_address_returns: FxHashSet::default(),
+            file_scope_objects: Vec::new(),
         }
     }
 }
@@ -2005,6 +2033,25 @@ impl SemanticAnalyzer {
                     ),
                 )
             });
+            if is_global && is_object {
+                // The debug information names this object.  A `typedef`-declared
+                // one keeps the alias, and a header's `extern` declaration is
+                // recorded too: a consumer that can see the type but no storage
+                // still prints the type, and the writer decides from `is_extern`
+                // whether there is an address to point at.
+                self.result.file_scope_objects.push(FileScopeObject {
+                    name: init_decl.name.clone(),
+                    ty: full_type.clone(),
+                    typedef_name: match crate::common::qualifiers::base_specifier(&decl.type_spec) {
+                        TypeSpecifier::TypedefName(alias) => Some(alias.clone()),
+                        _ => None,
+                    },
+                    is_static: decl.is_static(),
+                    is_extern: decl.is_extern() && init_decl.init.is_none(),
+                    has_initializer: init_decl.init.is_some(),
+                    span: init_decl.span,
+                });
+            }
             self.symbol_table.declare(Symbol {
                 name: init_decl.name.clone(),
                 ty: full_type,
