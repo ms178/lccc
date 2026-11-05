@@ -4,11 +4,19 @@
 #include "psabi_hfa_interop.h"
 
 /* Bit patterns of long double / _Float16 values without arithmetic. */
+/* The value bytes of a long double: x87 extended precision pads its 10
+ * bytes to 16, and a copy through the FPU stack need not keep the padding. */
+#if __LDBL_MANT_DIG__ == 64
+#define LD_DATA 10
+#else
+#define LD_DATA ((int)sizeof(long double))
+#endif
+
 static unsigned long long ld_bits(const long double *p)
 {
     const unsigned char *b = (const unsigned char *)p;
     unsigned long long h = 0;
-    for (int i = 0; i < 16; i++)
+    for (int i = 0; i < LD_DATA; i++)
         h = h * 31 + b[i];
     return h;
 }

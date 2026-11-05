@@ -1796,6 +1796,12 @@ gate "tls-model-selection" fast \
 gate "switch-cross-execute" slow \
     python3 tests/regression/check_switch_cross_execute.py
 
+# The same two-unit psABI fixtures natively (x86-64, and i386 where the host
+# runs 32-bit programs), in both directions against GCC 16.
+gate "psabi-interop-native" fast \
+    env CCC=target/fastbuild/lccc GCC="${GCC16:-gcc-16}" \
+    bash tests/regression/check_psabi_interop_native.sh
+
 gate "tls-cross-models" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_tls_cross_models.sh
 

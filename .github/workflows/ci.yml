@@ -1930,6 +1930,11 @@ jobs:
       run: python3 tests/regression/check_riscv_relax_bfd.py --require
     - name: Execute switch and memory contracts on AArch64 and RISC-V
       run: python3 tests/regression/check_switch_cross_execute.py
+    # The same two-unit psABI fixtures on the host targets, against GCC.
+    - name: psABI interop fixtures against GCC 16 on x86-64 and i386
+      run: >-
+        env LCCC_REQUIRE_I686=1 CCC=target/fastbuild/lccc GCC=gcc-16
+        bash tests/regression/check_psabi_interop_native.sh
     - name: Run destructive-path guard regression
       run: bash tests/regression/check_destructive_guards.sh
     - name: Verify basic-block SLP soundness contracts
