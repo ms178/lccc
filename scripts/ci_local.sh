@@ -275,6 +275,7 @@ gate "gcc-asm-constraints" fast \
     bash tests/regression/check_gcc_asm_constraints.sh
 gate "string-literal-emission" fast \
     env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
+    GCC="${GCC16:-gcc-16}" \
     bash tests/regression/check_string_literal_emission.sh
 gate "i686-dead-move-census" fast \
     env CCC_I686=target/fastbuild/lccc-i686 \
