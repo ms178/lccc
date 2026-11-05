@@ -7,12 +7,16 @@ could not be measured in this harness it is marked **S** (read from source,
 runtime consequence not demonstrated) instead of being stated as fact.
 
 The campaign's single sentence: lccc already ships **correct line tables and
-correct unwinding** for every architecture it supports, and ships **no DIE tree
-beyond functions**. A debugger can therefore stop at the right source line and
-unwind the stack, but it cannot print a variable, an argument, or a type. The
-work items in [§4](#4-work-items) are ordered so that each one turns one more
-debugger command from "cannot" into "works", and each one lands with a gate that
-fails when it regresses.
+correct unwinding** for every architecture it supports, and now ships a **DIE
+tree with types, file-scope objects, function parameters and their addresses**.
+A debugger can stop at the right source line, unwind the stack, print a global
+or a static, list a function's parameters with their types, `ptype` any type
+those objects name, and read an object's address. What it still cannot do is
+print a *local* variable or a parameter's *value*, or report the inline stack --
+see [§3.5](#35-what-the-campaign-has-landed-measured) for the measured state and
+D1b/D6 in [§4](#4-work-items) for the two remaining items. The work items are
+ordered so that each one turns one more debugger command from "cannot" into
+"works", and each one lands with a gate that fails when it regresses.
 
 ---
 
@@ -101,6 +105,25 @@ benchmark programs) × 4 configurations (`lccc -O0 -gdwarf-5`, `lccc -O2 -gdwarf
   cannot desynchronize it; AArch64/RISC-V lower it from directives. `.eh_frame`
   and `.eh_frame_hdr` are present, and the gate asserts every function's range is
   covered by an FDE.
+* **`-Wl,--gc-sections` links** (the kernel's and Debian's configuration). The
+  linker drops whole function sections but rewrites neither `.debug_info` nor
+  `.debug_line`, so the DIEs and rows that described them survive with addresses
+  resolved to zero — in **both** compilers: measured, lccc keeps one dropped DIE
+  (`[0, 0x28)`), one stale range-list entry and four stale rows, GCC keeps one
+  (`[0, 0xe)`) and its own stale rows. The gate recognises exactly that residue
+  (a zero address whose name is no longer a symbol) and still fails when a *live*
+  function's address is zero, so the exemption cannot hide a defect. Verified
+  green for both compilers.
+* **Range lists** (the `-ffunction-sections` path, which is the kernel's and
+  Debian's packaging). A unit whose code sits in several sections names a range
+  list instead of a low/high pair, and the gate decodes both encodings:
+  `.debug_rnglists` for version 5 (header, offset table, `DW_RLE_start_length`
+  entries, `DW_RLE_end_of_list`) and `.debug_ranges` for versions 2–4 (`(0, 0)`
+  terminator, `(-1, base)` rebasing). Measured against GCC 16.2 on the same
+  source: identical table shape and length (27 bytes, three
+  `DW_RLE_start_length` entries, terminator), identical ordering, and the CU's
+  `DW_AT_low_pc` base is either 0 (GCC) or the first range's start (lccc) — both
+  legal, and the gate accepts exactly those two.
 * **Address map.** One `.debug_aranges` set per unit, each bound to its own
   `.debug_info` offset by a relocation, one tuple per code section — measured
   identical in *shape* to GCC 16.2 for single- and multi-section units, including
@@ -132,49 +155,104 @@ here so no agent spends a day re-deriving them:
   verified with `readelf --debug-dump=aranges` on a linked two-TU program (sets at
   offset `0` and `0x56`) and on a `-ffunction-sections` object (three tuples).
 
-### 3.3 Measured missing: the tag census
+### 3.3 The tag census, before and after
 
-Aggregate over 49 benchmark programs, `-O0 -g -gdwarf-5`, **lccc / GCC 16.2**:
+Aggregate over the first 49 benchmark programs, `-O0 -g -gdwarf-5 -c`, lccc
+before this series / lccc now / GCC 16.2 (the same reader counted all three, and
+the first column is the state the campaign started from):
 
-| Tag | lccc | GCC | Consequence for a debugger |
+| Tag | before | now | GCC 16.2 |
 |---|---|---|---|
-| `base_type` | 0 | 480 | `ptype int` has nothing to point at |
-| `formal_parameter` | 0 | 485 | `info args` cannot list or read an argument |
-| `variable` | 0 | 417 | `print x`, `info locals` cannot find anything |
-| `pointer_type` | 0 | 122 | no indirection, no `print *p` |
-| `typedef` | 0 | 103 | source-level names are gone |
-| `const_type` / `volatile_type` / `restrict_type` | 0 | 98 / 8 / 10 | qualifiers are gone |
-| `subrange_type` | 0 | 78 | array bounds and `print a[3]` are gone |
-| `array_type` | 0 | 74 | arrays have no type at all |
-| `member` | 0 | 59 | `print s.field` is impossible |
-| `lexical_block` | 0 | 127 | block-scoped shadowing is unrepresentable |
-| `structure_type` / `union_type` / `enumeration_type` / `enumerator` | 0 | 14 / 2 / 6 / 26 | no aggregate types, no enumerators |
-| `subroutine_type` | 0 | 2 | function pointers cannot be described |
-| `unspecified_parameters` | 0 | 47 | `int f()` versus `int f(void)` is unstated |
-| `subprogram` | 283 | 338 | **was** the 55 unreferenced statics, now fixed |
-| `unspecified_type` | 49 | 0 | lccc's placeholder for "a type I do not model" |
+| `variable` | 0 | 208 → 68 | 695 |
+| `formal_parameter` | 0 | 422 | 485 |
+| `base_type` | 0 | 332 → 147 | 480 |
+| `subprogram` | 283 | 283 | 338 |
+| `pointer_type` | 0 | 323 → 67 | 122 |
+| `typedef` | 0 | 2 → 61 | 103 |
+| `const_type` | 0 | 30 | 98 |
+| `array_type` / `subrange_type` | 0 | 137 → 48 | 74 / 78 |
+| `member` | 0 | 1 330 → 54 | 63 |
+| `structure_type` | 0 | 188 → 12 | 14 |
+| `union_type` / `enumeration_type` / `enumerator` | 0 | 0 | 2 / 6 / 26 |
+| `subroutine_type` | 0 | 1 | 2 |
+| `lexical_block` | 0 | 0 | 207 |
+| `unspecified_parameters` | 0 | 0 | 47 |
+| `unspecified_type` | 49 | 54 | 0 |
 
-This is the quantified centre of the campaign: **18 tag kinds at zero, 1 752 DIEs**
-that a debugger needs and lccc does not emit — plus 49 `unspecified_type`
-placeholders that GCC does not emit at all.
+The second number in a "now" cell is the state after the declaration policy of
+[§3.5](#35-what-the-campaign-has-landed-measured) landed: 188 structures and
+1 330 members were the whole of `_IO_FILE` and its friends, described because
+`<stdio.h>` declares `stdin`/`stdout`/`stderr` whether or not the program names
+them.
+
+Three columns still differ from GCC, and each is a *different* item:
+
+* `variable`/`lexical_block`: GCC describes **locals**, lccc describes
+  file-scope objects and parameters. D14.
+* `typedef`: this one was **wrong as written, and is now closed**. The premise --
+  that GCC emits a DIE for every typedef it sees -- is false: on
+  `typedef int A; typedef struct { int a; double b; } B; typedef int (*C)(int);`
+  with only an `A` object, GCC 16.2 emits one typedef DIE and so did lccc. The
+  real gap was the other use sites: a *parameter*, a *pointer to a typedef* and a
+  *return type* were described structurally, so `int f(pair_t *p, size_t n)` and
+  `size_t f(void)` printed `struct pair *` and `long unsigned int`. All three now
+  keep the written spelling (`TypeGraph::intern_written`), which took the corpus
+  count from 2 to 56 against GCC's 103, and the rest of GCC's column is typedefs
+  named only by *locals* -- D14.
+* `enumeration_type`/`enumerator`/`unspecified_parameters`: none of the corpus
+  programs has a file-scope object of enum type, and lccc emits
+  `DW_TAG_unspecified_parameters` only on a *defined* variadic function (the
+  corpus has none). Both are gated on the quality gate's probe, which has one of
+  each.
 
 ### 3.4 Measured missing: everything else
 
 | Fact | Measurement |
 |---|---|
-| No `DW_AT_location` anywhere | 0 variable DIEs, so nothing carries one; 0 `DW_AT_frame_base`-relative expressions beyond the subprogram's own `DW_OP_call_frame_cfa` |
-| A TU that is only data emits no debug info | `int pq_only_data = 42;` compiled with `-g -gdwarf-5 -O0`: no `.debug_info`, no `.debug_line`, no CU at all (GCC: a unit with a `DW_TAG_variable`) |
+| *Closed:* no `DW_AT_location` anywhere | every file-scope object this object file defines now carries a 9-byte `DW_OP_addr` whose address equals the address the program prints for it (gated); a parameter carries **no** location yet — D1b |
+| *Closed:* typedef spellings lost outside object declarations | `pair_t *p`, `size_t n` and `size_t f(void)` now point at a `DW_TAG_typedef`, not at the record or the base type, so `ptype p` prints what the source wrote; GCC 16.2 measured to do exactly the same. Costs 2.77 % of the debug payload over the corpus (86 objects, 100 491 → 103 271 bytes, ~50 bytes per alias) — the price of 59 names a debugger can now resolve |
+| *Closed:* an empty unit carried one unattached base type | the writer interns an array's subrange index type itself, so the copy interned up front by `build_dwarf_unit` was never referenced by any DIE — and for `extern int ext(int);` it was the *only* content of the type table, which made a declaration-only unit emit a `.debug_info` holding one `long unsigned int` where GCC 16.2 emits none. Removing it restores the repository's contract (`check_debug_info_flags.sh`, pin 3) and drops one base type from every unit that interned one: 147 over the census, from 150 |
+| *Deliberate:* a TU that is only `typedef`s emits no unit | `typedef int T; typedef struct S S_t;` makes GCC 16.2 write a `.debug_info` whose whole content is a `DW_TAG_compile_unit` and one attached-to-nothing `int` base type — nothing a consumer can use — where lccc writes only the line tables. The repository's contract (`check_debug_info_flags.sh`, pin 3: “silence is only honest where there is nothing to describe”) pins the smaller answer, and the file name still reaches a debugger through `.debug_line`'s table. It is also part of why GCC's `base_type` census is larger than ours by more than the types we describe |
+| *Closed:* a TU that is only data emits no debug info | `int pq_only_data = 42;` now gets a unit, `DW_AT_stmt_list`, a header-only line program (file table, no statements) and a `variable` DIE, byte-shape for byte-shape what GCC 16.2 writes |
 | No `DW_TAG_inlined_subroutine` | at `-O2`, the row inside `main` that came from the inlined `pq_frame` claims `pq_frame`'s line, and a consumer cannot recover the inline stack |
-| One line sequence for the whole unit | 5 functions, 1 sequence at `-O0` (GCC: 5 sequences). Legal DWARF; a consumer decodes every row to find one function's |
+| One line sequence for the whole unit | **matches GCC, re-measured**: five functions, `readelf --debug-dump=rawline \| grep -c 'Line Number Statements'` gives 1 for lccc *and* GCC 16.2 under `-g`, `-O0`, `-O2`, `-g3` and `-ffunction-sections` at every dialect; `-ffunction-sections` puts five sequences in that one program on both. Withdrawn as a gap — see D5 |
 | `-S -g` carries no DIE tree | lccc emits 12 `.loc` and no `.debug_info`; GCC emits 10 `.loc` **and** its whole `.debug_info`/`.debug_abbrev`/`.debug_aranges` as data (70 lines). Assembling lccc's `-S` output with GAS therefore loses the subprogram DIEs GCC keeps |
 | `-g3` has no `.debug_macro` | macro definitions are not recorded; `info macro` cannot work |
 | `-gz` and `-gsplit-dwarf` warn "not supported" and emit plain debug info | honest, but a build that asks for compression gets a larger object: GCC's `-gz` marks `.debug_info` `SHF_COMPRESSED` (measured: 114 bytes on disk, 173 expanded) and lccc's 106 bytes are uncompressed |
 | `-g3` emits no `.debug_macro` | GCC's `-g3` object carries the section; lccc's does not (measured on both) |
 | DWARF 5 file table duplicates the primary file | entries 0 and 1 are both `fs.c`; harmless, 2 bytes of section, but it hides a real intent |
 
+### 3.5 What the campaign has landed, measured
+
+Each row is a capability, the section bytes it costs, and the gate assertion that
+fails if it regresses. Sizes are `.debug_info` + `.debug_abbrev` + `.debug_str` +
+`.debug_line_str` on `tests/benchmark/programs/fib.c` at `-g -gdwarf-5 -O0`:
+
+| Capability | Evidence |
+|---|---|
+| Types: base, pointer, const/volatile/restrict, typedef, struct/union/enum, array/subrange, subroutine | The gate compares each `DW_AT_byte_size`, member offset, bit-field placement and enumerator value against what the **program itself prints** (`sizeof`, `offsetof`, the folded enum constants), not against a second compiler |
+| File-scope objects, defined and declared | `DW_AT_location` present exactly when `.symtab` defines the object, and equal to the symbol's address (gated); a removed static keeps its DIE and loses the location, which is GCC 16.2's rule and also what stops a `DW_AT_location` relocation against a dropped symbol from breaking the link |
+| Declarations only for referenced names | measured `extern int q_used` / `extern int q_missing`: GCC describes the first and not the second, and lccc now does the same; the `_IO_FILE` structure and its thirty members left the payload with it |
+| Function parameters | a `DW_TAG_formal_parameter` child per parameter of every defined function, with `DW_AT_name` and a `DW_AT_type` that resolves; `DW_TAG_unspecified_parameters` on a variadic definition |
+| Debug information changes nothing at run time | with and without `-g -gdwarf-5`, every one of the 86 compilable benchmark objects has byte-identical `.text*` at `-O2`, and the gate re-asserts that identity in every configuration it builds (`code_unchanged`), so a change that leaks from DWARF into code selection fails the gate |
+| The spelling a declaration wrote | a typedef keeps its name as a `DW_TAG_typedef` for objects, parameters, pointer layers above the alias, return types and record members; `ptype` prints `pair_t *` and `size_t n`, not `struct pair *` and `long unsigned int n`. Gated on all five shapes and against GCC 16.2 as the subject |
+| A data-only translation unit | a unit with `DW_AT_stmt_list` and no `DW_AT_low_pc`, a line program whose header carries the file table, and one `variable` DIE per object |
+| Bit-field layout in every dialect | `DW_AT_data_bit_offset` at version 5, `DW_AT_bit_offset` + `DW_AT_data_member_location` at 2–4 — GCC 16.2's own split, measured |
+
+The cost, before and after the series (fib.c, same flags): `.debug_info`
+578 → 118 bytes, `.debug_str` 482 → 35, `.debug_abbrev` 295 → 215, whole debug
+payload 1 705 → 718 bytes. GCC 16.2: 1 021 bytes; Clang 23: 759. The payload got
+*smaller* while gaining seven sections' worth of meaning, because the declaration
+policy removed more than the new DIEs cost.
+
 ---
 
 ## 4. Work items
+
+Ordered by value: D1–D4 and D13 are **landed** (see
+[§3.5](#35-what-the-campaign-has-landed-measured)), and what remains is D1b
+(parameter locations), D6 (inline instances), D14 (locals and lexical blocks),
+then the `-S`/`.debug_macro`/compression items.
 
 Format: **ID · class · evidence** — Why, Where, Plan (each step landable alone),
 Gate (what the regression gate must assert; every gate is mutation-verified by
@@ -203,6 +281,8 @@ prescribes the first:
   divergence a per-site decision instead of a per-writer one.
 
 ### D1 · P0 · M/L — variables, formal parameters and lexical blocks
+
+**Status: landed for file-scope objects and for parameters (names, types, and a resolving `DW_AT_type`); locals and lexical blocks are **D14**, parameter locations are **D1b**.**
 
 **Why.** This is the item that turns `print x` from an error into an answer, and
 it is the prerequisite for D2 (types) and D3 (locations): a variable DIE needs a
@@ -260,6 +340,8 @@ which a consumer renders as `<optimized out>`.
 
 ### D2 · P0 · M — type DIEs
 
+**Status: landed, and gated against the program's own `sizeof`/`offsetof`/enum values rather than against a second compiler.**
+
 **Why.** Without a type a consumer can find a name but not read it, and cannot
 print a struct, follow a pointer, or show a typedef. The census's zero columns for
 `base_type`, `pointer_type`, `typedef`, `structure_type`, `array_type` and
@@ -312,6 +394,8 @@ cross-version matrix (`-gdwarf-2..5`) is the defence.
 
 ### D3 · P0 · M then L — `DW_AT_location`
 
+**Status: landed for every object the object file defines (`DW_OP_addr`, equal to the symbol's address), and for nothing else. A parameter's location is **D1b**.**
+
 **Why.** A variable with a type but no location is a name a debugger cannot read.
 At `-O0` the answer is simple (frame offsets for locals/parameters, absolute
 addresses for statics); with optimization it needs register live ranges.
@@ -352,6 +436,8 @@ mismatch here produces off-by-8 reads that look plausible.
 
 ### D4 · P0 · S — a unit with no code still needs a unit
 
+**Status: landed: unit, `DW_AT_stmt_list`, header-only line program with its file table, and a `variable` DIE per object, matching GCC 16.2's shape.**
+
 **Why.** A translation unit that is only data currently emits no `.debug_info` at
 all, because `build_dwarf_info_sections` returns `None` when there is no code
 section. A debugger attached to a program containing only such units reports "no
@@ -372,26 +458,168 @@ delete the `data_only_unit` gap.
 **Accept.** `print pq_only_data` works from a program whose only debug source is a
 data TU.
 
-### D5 · P1 · S — one line sequence per function
+### D1b · P1 · M — a parameter's location
 
-**Why.** lccc emits one sequence covering the unit's whole text; GCC emits one per
+**Why.** A parameter DIE without `DW_AT_location` lets a debugger list `n` and
+its type but not print `n = 4`; GCC 16.2 at `-O0` emits
+`DW_AT_location : 2 byte block: 91 f4 (DW_OP_fbreg: -12)` for it. This is the last
+piece of `info args` and the reason the quality gate carries a
+`parameter_locations` known gap.
+
+**Where.** The frame layout is the code generator's: `emit_store_params`
+(`src/backend/generation.rs`) is where a parameter's home slot is chosen, and
+`State::data_home_slot` (`src/backend/state.rs`) is the accessor. The writer
+(`src/backend/elf/dwarf.rs`) has `DW_AT_frame_base = DW_OP_call_frame_cfa`, so a
+location is `DW_OP_fbreg <slot - cfa_offset>`.
+
+**Plan.** Carry the offsets from the instruction selector to the writer the way
+line rows already travel: a `.dwarf_param <index> <cfa_offset>` directive in the
+prologue, parsed by the assembler into a per-function table, consumed by the
+parameter DIE writer. The directive form is what keeps `-S -g` honest as well —
+the alternative (a side table passed to the in-process assembler only) silently
+loses the information the moment a user assembles the text with `gas`.
+
+**Gate.** The quality gate's `parameter_locations` gap is deleted in the same
+commit; the probe runs, and every parameter's `DW_OP_fbreg` is checked against
+the *program's* value by reading the byte at `CFA + offset` from the stopped
+frame (`ptrace`-free: the probe prints `n` and the gate checks the location
+expression resolves to the same slot the callee wrote).
+
+**Risks.** An offset that is wrong by one register saves a wrong value into a
+debugger's answer, which is the worst failure mode DWARF has. The gate must
+compare values, not just decode the expression.
+
+**Effort** M. **ROI** 4.
+
+### D13 · **landed** — the type spelling a declaration wrote
+
+**Why.** The item originally asked for "a typedef DIE for every typedef the unit
+declares", on the strength of a census column (GCC 103, lccc 2). The premise is
+false and the census was measuring the symptom, not the cause. Measured on
+`typedef int A; typedef struct { int a; double b; } B; typedef int (*C)(int);`
+with one `A` object, GCC 16.2 emits exactly **one** `DW_TAG_typedef` (`A`);
+`B` and `C` get none, because nothing in the unit names them. Row count is not
+the rule -- **use** is.
+
+The real defect was on the *other* use sites. Object declarations kept their
+alias, but a parameter, a pointer above the alias, and a return type did not:
+
+```
+typedef struct pair { int a, b; } pair_t;
+typedef unsigned long size_t;
+pair_t *pick(pair_t *p, const pair_t *q);   /* was: struct pair * */
+size_t  count(size_t n);                    /* was: long unsigned int */
+```
+
+**Where.** `TypeGraph::intern_written` (`src/backend/elf/dwarf_spec.rs`) rebuilds
+the alias as a `DW_TAG_typedef` node and reapplies the layers the declaration had
+above it (pointer, array), so `const pair_t *` becomes pointer → `const` →
+`pair_t` → `struct pair`, and an alias that *is* a pointer
+(`typedef int (*fn_t)(int); fn_t h;`) is recognised before anything is peeled --
+peeling first would find the signature and describe the wrong depth. The spelling
+is captured where the declaration is still in hand, by one rule
+(`common::qualifiers::written_typedef`, built on `base_specifier`):
+
+* objects: `FileScopeObject::typedef_name`;
+* parameters and return types: `FunctionInfo::param_typedefs` /
+  `FunctionInfo::return_typedef`;
+* record members: `StructField::written_typedef`, copied into
+  `StructFieldLayout` so it survives the layout the writer reads, from all four
+  places that build a field (sema layout, const evaluation, type checking, IR
+  lowering) rather than from whichever one happens to be on the path today.
+
+**What is collapsed.** `typedef struct S T; typedef T U; U x;` describes `x`
+through `U` straight to `struct S`; GCC nests `U -> T -> struct S`. `ptype x`
+prints `U` either way, and reaching `T` needs a declaration that spells `T`, at
+which point `T` gets its own DIE. Chasing the chain would mean keeping the
+*specifier* of every typedef rather than its resolved `CType`, which is a change
+to the type context for no observable gain in the common case; recorded here so
+the difference is a decision, not an oversight.
+
+**Why the alias is conditional.** One unit may write `typedef int myint;` and
+later `typedef double myint;`. The table holds the last one, so an `int` object
+declared through the first would be described as a `myint` whose target is
+`double` -- a confident lie. The writer keeps the alias only when it still names
+the type the declaration had, and otherwise falls back to the structural DIE,
+which is correct and merely less legible.
+
+**Gate.** The probe asserts every shape: `pq_mark(pq_point_t *point,
+pq_index_t index)` (a pointer to a typedef resolves to the typedef and through it
+to the structure, and a parameter's type is the typedef), `pq_next(pq_index_t)`
+(a return type is the typedef whose `DW_AT_byte_size` equals the program's
+`sizeof(pq_index_t)`), `pq_typedef_handler` (`pq_fn_t`, an alias that names a
+pointer), `pq_point_pair` (an array whose element is the alias) and
+`pq_holder_global` (a record whose members `count`/`point` are declared through
+aliases). Mutation-verified twice: disabling the spelling fails the gate on every
+shape, and disabling only the member plumbing fails it on `pq_holder` alone.
+
+**Cost.** 2.77 % of the debug payload over the corpus, measured by building all 86
+compilable benchmark objects with and without the pass: 100 491 → 103 271 bytes,
+about 50 bytes per alias, and 59 typedefs that a debugger can now name. That is
+the trade the campaign makes deliberately: bytes for capability, and the
+declaration policy of §3.5 more than paid for it.
+
+**Effort** S. **ROI** 4.
+
+### D14 · P1 · L — local variables and lexical blocks
+
+**Why.** GCC describes 207 lexical blocks and 695 variables over the corpus where
+lccc describes file-scope objects and parameters only: `info locals`, `print x`
+inside a function, and block-scoped shadowing are the remaining capability. This
+is the largest item left, and it needs the same channel as D1b (a local's location
+is a frame slot or a register) plus a location list for a value that moves.
+
+**Where.** The IR carries named values and their declaration spans; the backend
+knows each value's home slot (`State::data_home_slot`).
+
+**Gate** The probe gains a function with a local of each storage class the gate
+can execute; every local's value is compared against what the program prints.
+
+**Risks.** A local that is folded away must not be described (a location that
+does not exist is worse than none) — the same policy the removed-static case
+already applies to file-scope objects.
+
+**Effort** L. **ROI** 4.
+
+### D5 · withdrawn 2026-11-05, re-measured — "one line sequence per function"
+
+**Withdrawal, with the recipe.** The premise is false: GCC 16.2 does not emit one
+sequence per function. On a five-function file,
+`readelf --debug-dump=rawline obj \| grep -c 'Line Number Statements'` returns
+**1** for GCC 16.2 and **1** for lccc under `-g`, `-g -O0`, `-O2`, `-g3`,
+`-gdwarf-2/4/5` and `-ffunction-sections` — one line *program* in every case, and
+with `-ffunction-sections` five *sequences* inside it on both compilers. A
+consumer loses nothing, so there is no gap to close. The item re-surfaced once in
+another pass of this document and is withdrawn again on the same evidence; the
+gate records the ratio for both compilers rather than asserting a shape neither
+writes.
+
+The original argument, kept for the record:
+
+**Why (as then believed).** lccc emits one sequence covering the unit's whole text; GCC emits one per
 function. Both are legal, but a consumer that wants one function's rows must
 decode every row first, and a `DW_LNE_end_sequence` is exactly the marker that
 lets it stop. Measured: 5 functions → 1 sequence at every version.
 
-**Where.** `build_dwarf_line_section` (`src/backend/elf/dwarf.rs`): the row
-generator that ends a sequence only when the section changes.
+* GCC 16.2 emits **one sequence for the whole unit** as well. Measured on the
+  gate's five-function probe at `-gdwarf-2/3/4/5 -O0`: lccc `[1 sequence, 5
+  functions]`, GCC `[1, 5]`. At `-O2` GCC reports `[2, 3]` because it splits one
+  function's cold part into another section — a *section* boundary, not a
+  function boundary.
+* With `-ffunction-sections` — one section per function — lccc emits **one
+  sequence per function, exactly like GCC** (measured `[5 sequences, 5 functions]`
+  for both). The rule is "end a sequence where the section changes", which is what
+  both compilers implement; a single `.text` therefore yields a single sequence in
+  both. lccc was never wrong here, and there is nothing to fix.
+* With an address inside the alignment padding between two functions,
+  `addr2line` answers identically for both compilers (`pad.c:1` for an address
+  between `pq_first` and an aligned `pq_second`), because a consumer resolves a
+  gap to the preceding row either way.
 
-**Plan.** End the sequence at each function's end (the writer already knows the
-`DwarfFunction` list and its `offset`/`size`), starting a new one with
-`DW_LNE_set_address`. Keep rows sorted; a sequence must not straddle a gap.
-
-**Gate.** `sequences_vs_functions` in the gate's measurements becomes an
-assertion: `sequences >= functions with code`.
-
-**Risks.** A row emitted exactly at a function's end belongs to that function's
-sequence; ending the sequence after it (not before) keeps `addr2line` answers
-unchanged. Re-run the corpus audit after the change.
+An item that asks for work the other compiler does not do is worse than no item:
+it would rewrite a correct line program for no behavioural gain. The gate records
+the sequence/function ratio for both compilers and would flag a real divergence;
+it does not require a per-function split.
 
 ### D6 · P1 · L — `DW_TAG_inlined_subroutine`
 
@@ -573,6 +801,12 @@ contract:
 * **Mutation-verify**: break the compiler (or point the gate at a wrapper script
   that rewrites the flag), watch the gate fail, then fix. This is how the `-O0`
   static rule was verified in both directions.
+* **Measure a gap against the oracle before writing it down.** D5 was withdrawn
+  because the shape it objected to is GCC's own shape; running the gate with
+  `--lccc "$(which gcc-16)"` takes ten seconds and is the cheapest defence
+  against writing a wish list instead of a campaign. The same run keeps the gap
+  list honest in the other direction: it reports zero gaps for GCC, so every
+  remaining entry is a statement about lccc.
 
 Two properties make the instrument trustworthy, and both were learned by point
 it at **GCC 16.2 instead of lccc**:

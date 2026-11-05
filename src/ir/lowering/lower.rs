@@ -261,6 +261,15 @@ pub struct Lowerer {
 pub(crate) const ZERO_INIT_STORE_LADDER_MAX: usize = 128;
 
 impl Lowerer {
+    /// The type system sema produced, after lowering.
+    ///
+    /// The debug-information phase reads record layouts and typedefs from it:
+    /// they are the only place the compiler keeps what a consumer needs to print
+    /// a struct, and they stop existing when the lowerer does.
+    pub fn type_context(&self) -> &TypeContext {
+        &self.types
+    }
+
     pub(crate) fn with_pass_policy(
         mut self,
         policy: crate::common::pass_policy::PassPolicy,

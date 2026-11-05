@@ -658,6 +658,16 @@ pub struct Driver {
     pub(super) pgo_update: Option<String>,
 }
 
+/// One translation unit compiled to assembly, with the debug-information model
+/// that describes its data.
+///
+/// They travel together because the writer needs both at once: the text gives it
+/// the code, the model gives it the types and objects the text cannot spell.
+struct CompiledUnit {
+    asm: String,
+    debug_unit: Option<crate::backend::elf::DwarfUnitSpec>,
+}
+
 impl Driver {
     pub fn new() -> Self {
         Self {
@@ -1697,7 +1707,7 @@ impl Driver {
                 continue;
             }
             // Default path: compile with internal codegen (handles .code16gcc prepend)
-            let asm = self.compile_to_assembly(input_file)?;
+            let asm = self.compile_to_assembly(input_file)?.asm;
             if self.output_path_set {
                 // `-o -` streams the assembly (write_text_output is the single
                 // place that knows the convention); a real path is written
@@ -1737,6 +1747,20 @@ impl Driver {
         })
     }
 
+    /// The debug information to hand the writer: the dialect `-g` selected, plus
+    /// the analysed unit when there is one.
+    fn debug_request(
+        &self,
+        unit: Option<crate::backend::elf::DwarfUnitSpec>,
+    ) -> Option<crate::backend::elf::DwarfDebug> {
+        use crate::backend::elf::DwarfDebug;
+        let config = self.dwarf_config(false)?;
+        Some(match unit {
+            Some(unit) => DwarfDebug::with_unit(config, unit),
+            None => DwarfDebug::dialect(config),
+        })
+    }
+
     fn run_object_only(&self) -> Result<(), String> {
         for input_file in &self.input_files {
             let out_path = self.output_for_input(input_file);
@@ -1756,13 +1780,13 @@ impl Driver {
                     continue;
                 }
                 // Default path: compile with internal codegen
-                let asm = self.compile_to_assembly(input_file)?;
+                let compiled = self.compile_to_assembly(input_file)?;
                 let extra = self.build_asm_extra_args();
                 self.target.assemble_with_extra(
-                    &asm,
+                    &compiled.asm,
                     &out_path,
                     &extra,
-                    self.dwarf_config(false),
+                    self.debug_request(compiled.debug_unit),
                 )?;
             }
             self.write_dep_file_gcc_semantics(input_file, &out_path)?;
@@ -1827,16 +1851,16 @@ impl Driver {
                     continue;
                 }
                 // Compile .c files to .o (handles .code16gcc prepend via internal codegen)
-                let asm = self.compile_to_assembly(input_file)?;
+                let compiled = self.compile_to_assembly(input_file)?;
 
                 let tmp = TempFile::try_new("ccc", Self::input_stem(input_file), "o")
                     .map_err(|error| error.to_string())?;
                 let extra = self.build_asm_extra_args();
                 self.target.assemble_with_extra(
-                    &asm,
+                    &compiled.asm,
                     tmp.to_str().map_err(|error| error.to_string())?,
                     &extra,
-                    self.dwarf_config(false),
+                    self.debug_request(compiled.debug_unit),
                 )?;
                 // Write dependency file for this source file. When compiling and
                 // linking in one step, GCC's -Wp,-MMD uses the .o name as the
@@ -1848,22 +1872,28 @@ impl Driver {
         }
 
         if !whole_program_c_files.is_empty() {
-            let asm = if whole_program_c_files.len() == 1 {
+            // The merge path is `-g`-free by construction
+            // (`can_merge_whole_program`), so only the single-file case can carry
+            // a unit description.
+            let compiled = if whole_program_c_files.len() == 1 {
                 let single = whole_program_c_files[0];
-                let asm = self.compile_to_assembly(single)?;
+                let compiled = self.compile_to_assembly(single)?;
                 self.write_dep_file(single, &self.output_path, &self.output_path)?;
-                asm
+                compiled
             } else {
-                self.compile_whole_program_c_files(&whole_program_c_files)?
+                CompiledUnit {
+                    asm: self.compile_whole_program_c_files(&whole_program_c_files)?,
+                    debug_unit: None,
+                }
             };
             let stem = Self::input_stem(whole_program_c_files[0]);
             let tmp = TempFile::try_new("ccc", stem, "o").map_err(|error| error.to_string())?;
             let extra = self.build_asm_extra_args();
             self.target.assemble_with_extra(
-                &asm,
+                &compiled.asm,
                 tmp.to_str().map_err(|error| error.to_string())?,
                 &extra,
-                self.dwarf_config(false),
+                self.debug_request(compiled.debug_unit),
             )?;
             temp_guards.push(tmp);
         }
@@ -2423,15 +2453,15 @@ impl Driver {
         (ra_config, tune, time_phases)
     }
 
-    fn compile_to_assembly(&self, input_file: &str) -> Result<String, String> {
+    fn compile_to_assembly(&self, input_file: &str) -> Result<CompiledUnit, String> {
         let (ra_config, tune, time_phases) = self.init_compilation_session();
         let t0 = std::time::Instant::now();
-        let (mut module, source_manager, fp_environment_observable) =
+        let (mut module, source_manager, fp_environment_observable, debug_unit) =
             self.lower_c_tu_to_ir(input_file, time_phases)?;
         if self.whole_program && !self.relocatable {
             crate::ir::whole_program::internalize_module(&mut module, false);
         }
-        self.compile_ir_module_to_assembly(
+        let asm = self.compile_ir_module_to_assembly(
             module,
             source_manager.as_ref(),
             input_file,
@@ -2440,7 +2470,153 @@ impl Driver {
             tune,
             time_phases,
             t0,
-        )
+        )?;
+        Ok(CompiledUnit { asm, debug_unit })
+    }
+
+    /// Describe this unit's types and file-scope objects for the debug
+    /// information (see `backend::elf::dwarf_spec`).
+    ///
+    /// Two decisions are made here, and both need the analysis that produced
+    /// them rather than a re-derivation:
+    ///
+    /// * **Which declaration of a name wins.**  A file-scope object can be
+    ///   declared any number of times (`extern int x;` in a header, `int x = 1;`
+    ///   in the source), and only one of them owns the storage.  The definition
+    ///   wins; with no definition the last declaration stands, and it carries
+    ///   `DW_AT_declaration` because this object has no address to point at.
+    /// * **The spelling a consumer prints.**  `typedef unsigned int myuint;` is
+    ///   erased by the time a `CType` exists, so the alias is taken from the
+    ///   declaration's own type specifier, for objects, parameters and return
+    ///   types alike.  `TypeGraph::intern_written` applies it, and it keeps the
+    ///   alias only when the typedef still resolves to what the declaration
+    ///   named, so a later `typedef` of the same name cannot leave the DIE
+    ///   describing a different type.
+    fn build_dwarf_unit(
+        objects: &[crate::frontend::sema::analysis::FileScopeObject],
+        types: &crate::frontend::sema::type_context::TypeContext,
+        sources: Option<&SourceManager>,
+        functions: &crate::common::fx_hash::FxHashMap<
+            String,
+            crate::frontend::sema::analysis::FunctionInfo,
+        >,
+    ) -> crate::backend::elf::DwarfUnitSpec {
+        use crate::backend::elf::DwarfUnitSpec;
+
+        // The definition beats a declaration; a later declaration beats an
+        // earlier one.  `order` keeps declaration order, which is the order a
+        // debugger lists them in.
+        let mut order: Vec<&str> = Vec::new();
+        let mut chosen: crate::common::fx_hash::FxHashMap<
+            &str,
+            &crate::frontend::sema::analysis::FileScopeObject,
+        > = crate::common::fx_hash::FxHashMap::default();
+        for object in objects {
+            match chosen.get(object.name.as_str()) {
+                Some(existing) if !existing.has_initializer && object.has_initializer => {
+                    chosen.insert(object.name.as_str(), object);
+                }
+                Some(existing) if existing.has_initializer && !object.has_initializer => {}
+                Some(_) => {
+                    chosen.insert(object.name.as_str(), object);
+                }
+                None => {
+                    order.push(object.name.as_str());
+                    chosen.insert(object.name.as_str(), object);
+                }
+            }
+        }
+
+        // The layouts live behind a `RefCell`; the guard outlives the graph, so
+        // the graph borrows one consistent view of them.
+        let layouts = types.borrow_struct_layouts();
+        let mut graph = crate::backend::elf::TypeGraph::new(&*layouts, &types.typedefs);
+
+        let mut variables = Vec::with_capacity(order.len());
+        for name in order {
+            let object = chosen[name];
+            let ty = graph.intern_written(&object.ty, object.typedef_name.as_deref());
+            // The declaration's file and line are exact.  Its *column* is not:
+            // the analyser keeps the span of the whole declaration (`int x;`
+            // starts at the `int`), while `DW_AT_decl_column` names the
+            // declarator, and stating the declaration's start instead would be a
+            // confident lie -- a consumer that picks among several declarators on
+            // one line would pick the wrong one.  An absent column is what DWARF
+            // means by "unknown".
+            let (file, line) = match sources {
+                Some(sources) => {
+                    let location = sources.resolve_span(object.span);
+                    (Some(location.file), Some(location.line))
+                }
+                None => (None, None),
+            };
+            variables.push(crate::backend::elf::DwarfVariable {
+                name: object.name.clone(),
+                ty,
+                external: !object.is_static,
+                declaration: object.is_extern,
+                decl_file: file,
+                decl_line: line,
+                decl_column: None,
+                file_scope: true,
+            });
+        }
+
+        // One pass over the unit's functions describes all of them.  A `void`
+        // return is *no* type in DWARF, so it is skipped and the subprogram then
+        // carries none; a nested function's record is keyed by its mangled name
+        // and has no symbol of its own in the object, so it is not described.
+        let mut return_types = crate::common::fx_hash::FxHashMap::default();
+
+        // A parameter's type is what a debugger prints for it, and an unnamed
+        // parameter is a prototype's -- the attribute is simply absent, which is
+        // what GCC 16.2 does.  `void` in a parameter list (`int f(void)`) is not
+        // a parameter at all: `params` is empty for it, and a stray entry would
+        // describe a value nobody can pass.
+        let mut function_parameters = crate::common::fx_hash::FxHashMap::default();
+        for (name, info) in functions {
+            if name.contains('.') || !info.is_defined {
+                continue;
+            }
+            if !matches!(info.return_type, crate::common::types::CType::Void) {
+                return_types.insert(
+                    name.clone(),
+                    graph.intern_written(&info.return_type, info.return_typedef.as_deref()),
+                );
+            }
+            let mut described = Vec::with_capacity(info.params.len());
+            for (index, (ty, parameter_name)) in info.params.iter().enumerate() {
+                if matches!(ty, crate::common::types::CType::Void) {
+                    continue;
+                }
+                // `param_typedefs` is parallel to `params`; reading it by index
+                // rather than zipping keeps a short list from silently dropping
+                // the parameters past its end, and borrowing the alias avoids an
+                // allocation per spelled parameter on the compiler's hot path.
+                let alias = info.param_typedefs.get(index).and_then(Option::as_deref);
+                described.push(crate::backend::elf::DwarfParameter {
+                    name: parameter_name.clone(),
+                    ty: graph.intern_written(ty, alias),
+                });
+            }
+            if described.is_empty() && !info.variadic {
+                continue;
+            }
+            function_parameters.insert(
+                name.clone(),
+                crate::backend::elf::DwarfFunctionParameters {
+                    parameters: described,
+                    variadic: info.variadic,
+                },
+            );
+        }
+
+        DwarfUnitSpec {
+            types: graph.into_types(),
+            variables,
+            return_types,
+            parameters: function_parameters,
+        }
     }
 
     fn compile_whole_program_c_files(&self, input_files: &[&str]) -> Result<String, String> {
@@ -2449,7 +2625,7 @@ impl Driver {
         let mut modules = Vec::with_capacity(input_files.len());
         let mut any_fp_observable = false;
         for &input_file in input_files {
-            let (module, _sm, fp_obs) = self.lower_c_tu_to_ir(input_file, time_phases)?;
+            let (module, _sm, fp_obs, _unit) = self.lower_c_tu_to_ir(input_file, time_phases)?;
             any_fp_observable |= fp_obs;
             self.write_dep_file(input_file, &self.output_path, &self.output_path)?;
             modules.push(module);
@@ -2652,6 +2828,7 @@ impl Driver {
             crate::ir::module::IrModule,
             Option<std::rc::Rc<SourceManager>>,
             bool,
+            Option<crate::backend::elf::DwarfUnitSpec>,
         ),
         String,
     > {
@@ -2717,6 +2894,23 @@ impl Driver {
         crate::passes::vectorize::set_x86_sse1_available(
             self.target == Target::X86_64 && !self.no_sse && !self.general_regs_only,
         );
+        // The debug information names this unit's types and objects, so it is
+        // built while the analysis that produced them is still readable: the
+        // lowerer takes the type system and the function records by value, and
+        // the syntax tree does not outlive lowering.  Only a `-g` compile pays for
+        // it, and the source manager is shared rather than taken, so lowering
+        // keeps its `file:line:col` diagnostics.
+        let debug_unit = if self.debug_info {
+            let sources = diagnostics.share_source_manager();
+            Some(Self::build_dwarf_unit(
+                &sema_result.file_scope_objects,
+                &sema_result.type_context,
+                sources.as_deref(),
+                &sema_result.functions,
+            ))
+        } else {
+            None
+        };
         let lowerer = Lowerer::with_type_context(
             self.target,
             sema_result.type_context,
@@ -2823,7 +3017,12 @@ impl Driver {
             eprintln!("Lowered to {} IR functions", module.functions.len());
         }
 
-        Ok((module, source_manager, fp_environment_observable))
+        Ok((
+            module,
+            source_manager,
+            fp_environment_observable,
+            debug_unit,
+        ))
     }
 
     #[expect(clippy::too_many_arguments)]

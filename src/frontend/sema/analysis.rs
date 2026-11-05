@@ -149,6 +149,18 @@ pub struct FunctionInfo {
     /// qualifiers, so `*g() = 0` for `int *const *g(void)` is only
     /// diagnosable if the record keeps the middle level's `const`.
     pub return_pointer_const_levels: u32,
+    /// The typedef each parameter's declaration spelled its type with,
+    /// parallel to `params`.
+    ///
+    /// `CType` erases the alias -- `typedef unsigned long size_t; void f(size_t n)`
+    /// and `void f(unsigned long n)` are the same type -- but a debugger prints
+    /// what the source said, so the spelling has to be captured where the
+    /// declaration is still in hand.  `None` means the declaration named no
+    /// typedef, which is the common case.
+    pub param_typedefs: Vec<Option<String>>,
+    /// The typedef the return type was declared with (`size_t f(void)`), or
+    /// `None` when the definition spelled a type of its own.
+    pub return_typedef: Option<String>,
 }
 
 impl FunctionInfo {
@@ -163,6 +175,30 @@ impl FunctionInfo {
             has_prototype: false,
         })
     }
+}
+
+/// A file-scope object this translation unit declares or defines.
+///
+/// Debug information names objects, not just functions, so the analysis has to
+/// keep what the symbol table cannot: a declaration can be superseded by a later
+/// one, an `extern int x;` declares no storage while `int x = 1;` does, and the
+/// *type spelling* (`myint x;`) is what a debugger prints.  Recorded here rather
+/// than reconstructed later because the resolved `CType` exists only during
+/// analysis, and re-resolving a declarator outside sema is how two answers to
+/// "what type is this" come to disagree.
+#[derive(Debug, Clone)]
+pub struct FileScopeObject {
+    pub name: String,
+    pub ty: CType,
+    /// The typedef name the declaration spelled, when it spelled one.
+    pub typedef_name: Option<String>,
+    pub is_static: bool,
+    /// `extern`: the declaration names storage this unit does not define.
+    pub is_extern: bool,
+    /// The declaration has an initializer, which makes it a definition even if
+    /// it also says `extern`.
+    pub has_initializer: bool,
+    pub span: crate::common::source::Span,
 }
 
 /// Results of semantic analysis, used by the lowering phase.
@@ -201,6 +237,9 @@ pub struct SemaResult {
     /// and returns a null pointer instead (GCC 16.2's code generation at
     /// every level; see `analysis::return_local_addr`).
     pub local_address_returns: FxHashSet<ExprId>,
+    /// Every object declared at file scope, in declaration order, for the debug
+    /// information's `DW_TAG_variable` set (see [`FileScopeObject`]).
+    pub file_scope_objects: Vec<FileScopeObject>,
 }
 
 impl Default for SemaResult {
@@ -213,6 +252,7 @@ impl Default for SemaResult {
             const_values: ConstMap::default(),
             enumerator_refs: FxHashMap::default(),
             local_address_returns: FxHashSet::default(),
+            file_scope_objects: Vec::new(),
         }
     }
 }
@@ -662,6 +702,12 @@ impl SemanticAnalyzer {
                 func.return_base_const,
                 func.return_pointer_const_levels,
             ),
+            param_typedefs: func
+                .params
+                .iter()
+                .map(|p| crate::common::qualifiers::written_typedef(&p.type_spec))
+                .collect(),
+            return_typedef: crate::common::qualifiers::written_typedef(&func.return_type),
         };
         // A block-scope prototype may precede the definition and carry facts the
         // definition does not repeat; `noreturn` is one of them. The file-scope
@@ -943,6 +989,12 @@ impl SemanticAnalyzer {
                 func.return_base_const,
                 func.return_pointer_const_levels,
             ) | prior_levels,
+            param_typedefs: func
+                .params
+                .iter()
+                .map(|p| crate::common::qualifiers::written_typedef(&p.type_spec))
+                .collect(),
+            return_typedef: crate::common::qualifiers::written_typedef(&func.return_type),
         };
         let func_ctype = CType::Function(Box::new(func_info.call_type()));
 
@@ -1792,6 +1844,11 @@ impl SemanticAnalyzer {
                                                     &ft.return_type,
                                                 ),
                                             ),
+                                        // A prototype describes no storage, so the
+                                        // debug information never asks it for a
+                                        // spelling.
+                                        param_typedefs: Vec::new(),
+                                        return_typedef: None,
                                     },
                                 );
                             }
@@ -1859,6 +1916,8 @@ impl SemanticAnalyzer {
                             is_noreturn,
                             return_base_const,
                             return_pointer_const_levels: return_levels,
+                            param_typedefs: Vec::new(),
+                            return_typedef: None,
                         },
                     );
                 }
@@ -2005,6 +2064,25 @@ impl SemanticAnalyzer {
                     ),
                 )
             });
+            if is_global && is_object {
+                // The debug information names this object.  A `typedef`-declared
+                // one keeps the alias, and a header's `extern` declaration is
+                // recorded too: a consumer that can see the type but no storage
+                // still prints the type, and the writer decides from `is_extern`
+                // whether there is an address to point at.
+                self.result.file_scope_objects.push(FileScopeObject {
+                    name: init_decl.name.clone(),
+                    ty: full_type.clone(),
+                    typedef_name: match crate::common::qualifiers::base_specifier(&decl.type_spec) {
+                        TypeSpecifier::TypedefName(alias) => Some(alias.clone()),
+                        _ => None,
+                    },
+                    is_static: decl.is_static(),
+                    is_extern: decl.is_extern() && init_decl.init.is_none(),
+                    has_initializer: init_decl.init.is_some(),
+                    span: init_decl.span,
+                });
+            }
             self.symbol_table.declare(Symbol {
                 name: init_decl.name.clone(),
                 ty: full_type,
@@ -4102,6 +4180,8 @@ impl SemanticAnalyzer {
                     is_noreturn: false,
                     return_base_const: false,
                     return_pointer_const_levels: 0,
+                    param_typedefs: Vec::new(),
+                    return_typedef: None,
                 };
                 self.result.functions.insert(name.clone(), func_info);
             }
@@ -7966,6 +8046,7 @@ dereference it before applying '->' to it?"
                     return None;
                 }
                 Some(crate::common::types::StructField {
+                    written_typedef: crate::common::qualifiers::written_typedef(&f.type_spec),
                     name,
                     ty,
                     bit_width,
@@ -10637,6 +10718,8 @@ dereference it before applying '->' to it?"
                 is_noreturn,
                 return_base_const: false,
                 return_pointer_const_levels: 0,
+                param_typedefs: Vec::new(),
+                return_typedef: None,
             };
             self.result.functions.insert(name.to_string(), func_info);
         }
@@ -11519,6 +11602,7 @@ mod record_layouts_correspond_tests {
     fn field(name: &str, ty: CType, offset: usize) -> StructFieldLayout {
         StructFieldLayout {
             own_cvr: None,
+            written_typedef: None,
             name: name.to_string(),
             ty,
             offset,

@@ -18,6 +18,7 @@
 mod archive;
 mod constants;
 mod dwarf;
+pub(crate) mod dwarf_spec;
 mod io;
 mod linker_symbols;
 mod numeric_labels;
@@ -73,6 +74,13 @@ pub(crate) use dwarf::{
     DwarfInfoBuild, DwarfLineBuild, DwarfLineLocation, DwarfLocOptions, DwarfSectionInfo,
     DwarfStrings, build_dwarf_info_sections, build_dwarf_line_section, parse_file_directive,
     parse_loc_directive, place_line_build, unit_version,
+};
+
+// The model a compiler hands the writer: types and file-scope objects.
+#[expect(unused_imports)]
+pub(crate) use dwarf_spec::{
+    DwarfDebug, DwarfFunctionParameters, DwarfParameter, DwarfType, DwarfUnitSpec, DwarfVariable,
+    TypeGraph,
 };
 
 // numeric_labels

@@ -453,6 +453,7 @@ impl Lowerer {
                     let type_align = self.typedef_alignment_for_type_spec(&f.type_spec).copied();
                     Some(StructField {
                         own_cvr: None,
+                        written_typedef: crate::common::qualifiers::written_typedef(&f.type_spec),
                         name: f.name.clone().unwrap_or_default(),
                         ty,
                         bit_width,

@@ -1350,6 +1350,9 @@ pub struct ElfWriterCore<A: X86Arch> {
     /// The DWARF dialect the `.loc` rows are written in, and the language the
     /// compile units declare (`-gdwarf-<N>`, `-std=`).
     debug_config: elf_mod::DwarfConfig,
+    /// The types and file-scope objects the compiler analysed, for `.debug_info`
+    /// (see `elf::dwarf_spec`).  `None` for text that carries only `.loc` rows.
+    debug_unit: Option<std::sync::Arc<elf_mod::DwarfUnitSpec>>,
     /// Source files and `.loc` rows for the generated DWARF line table.
     debug_files: Vec<(u32, String)>,
     debug_line_locations: Vec<elf_mod::DwarfLineLocation>,
@@ -1411,6 +1414,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             symver_refs: FxHashMap::default(),
             symver_flags: FxHashMap::default(),
             debug_config: elf_mod::DwarfConfig::assembler(elf_mod::DWARF_DEFAULT_VERSION),
+            debug_unit: None,
             debug_files: Vec::new(),
             debug_line_locations: Vec::new(),
             section_stack: Vec::new(),
@@ -1432,6 +1436,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
     /// (`-gdwarf-<N>` and the language `-std=` implies).
     pub fn set_debug_config(&mut self, config: elf_mod::DwarfConfig) {
         self.debug_config = config;
+    }
+
+    /// Attach the types and objects a compiler analysed (see `elf::dwarf_spec`),
+    /// so this object's `.debug_info` names them.
+    pub fn set_debug_unit(&mut self, unit: std::sync::Arc<elf_mod::DwarfUnitSpec>) {
+        self.debug_unit = Some(unit);
     }
 
     /// Build the ELF object file from parsed assembly items.
@@ -4365,7 +4375,13 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // GAS `dwarf2_finish` parity: a synthesized line table without a
         // source-provided `.debug_info` gets compile units, or no debugger
         // ever reads it (see `elf::dwarf`).
-        if !debug_line_units.is_empty()
+        // A compiler's unit may hold only data, in which case there are no code
+        // sections but the objects still need a unit to live in.
+        let unit_present = self
+            .debug_unit
+            .as_ref()
+            .is_some_and(|unit| !unit.is_empty());
+        if (!debug_line_units.is_empty() || unit_present)
             && !shared_sections.contains_key(".debug_info")
             && !shared_sections.contains_key(".debug_abbrev")
         {
@@ -4406,9 +4422,39 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 .map(|dir| dir.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let address_size = if A::elf_class() == ELFCLASS32 { 4 } else { 8 };
+            // An empty unit is the honest answer for text with no analysed
+            // types: the writer emits nothing for it.
+            let empty_unit = std::sync::Arc::new(elf_mod::DwarfUnitSpec::default());
+            let unit = self.debug_unit.as_ref().unwrap_or(&empty_unit);
+            // The objects this file defines: a variable DIE may only state an
+            // address for one of them (an object the optimizer removed has no
+            // symbol, and a relocation against it would fail to link).
+            // A declaration DIE is worth its bytes only when this object's code
+            // or data names the symbol; see `DwarfUnitSpec::with_referenced`.
+            let mut referenced: crate::common::fx_hash::FxHashMap<String, ()> =
+                crate::common::fx_hash::FxHashMap::default();
+            for section in &self.sections {
+                for reloc in &section.relocations {
+                    referenced.insert(reloc.symbol.clone(), ());
+                    if let Some(diff) = &reloc.diff_symbol {
+                        referenced.insert(diff.clone(), ());
+                    }
+                }
+            }
+            let unit_spec = unit.with_referenced(&referenced);
+            let unit_spec = &unit_spec;
+            let defined_objects: crate::common::fx_hash::FxHashMap<String, ()> = self
+                .pending_types
+                .iter()
+                .filter(|(name, kind)| {
+                    matches!(kind, SymbolKind::Object | SymbolKind::TlsObject)
+                        && self.label_positions.contains_key(name.as_str())
+                })
+                .map(|(name, _)| (name.clone(), ()))
+                .collect();
             let built = elf_mod::build_dwarf_info_sections(
                 &debug_line_units,
-                stmt_list,
+                Some(stmt_list),
                 &self.debug_files,
                 &self.debug_line_locations,
                 &section_info,
@@ -4422,6 +4468,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 config,
                 &mut debug_strings,
                 &mut debug_line_strings,
+                unit_spec,
+                &defined_objects,
                 None,
             )?;
             let mut sections = Vec::new();

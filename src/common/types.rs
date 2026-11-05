@@ -1024,7 +1024,12 @@ pub fn strictest_alignment(sources: impl IntoIterator<Item = Option<usize>>) -> 
     sources.into_iter().flatten().max()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Deliberately not `PartialEq`/`Hash`: a field's *spelling* (`size_t n` versus
+/// `unsigned long n`) is not part of its identity -- C compatibility, layout and
+/// code generation all treat the two as one member -- so comparing two fields
+/// whole would answer a question nobody should ask.  The layout a field
+/// produces is the artifact that gets compared.
+#[derive(Debug, Clone)]
 pub struct StructField {
     pub name: String,
     pub ty: CType,
@@ -1063,6 +1068,11 @@ pub struct StructField {
     /// rule as a variable's object record). `None` is "unknown", never "none":
     /// `&s.m` and the decay of an array member then stay unrecorded.
     pub own_cvr: Option<u8>,
+    /// The typedef the member's declaration spelled its type with, if any:
+    /// `size_t n;` in a record body names the alias, and a debugger prints it.
+    /// `CType` erases aliases, so this is the only record of the spelling, and
+    /// it is `None` for the overwhelming majority of members.
+    pub written_typedef: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1378,6 +1388,7 @@ impl StructLayoutBuilder {
             counted_by: field.counted_by.clone(),
             pointer_quals: field.pointer_quals.clone(),
             own_cvr: field.own_cvr,
+            written_typedef: field.written_typedef.clone(),
             offset: storage_offset,
             ty: storage_ty,
             bit_offset: Some(bit_offset_in_storage),
@@ -1474,6 +1485,7 @@ impl StructLayoutBuilder {
             counted_by: field.counted_by.clone(),
             pointer_quals: field.pointer_quals.clone(),
             own_cvr: field.own_cvr,
+            written_typedef: field.written_typedef.clone(),
             offset: field_storage_offset,
             ty: field.ty.clone(),
             bit_offset: Some(field_bit_in_storage),
@@ -1527,6 +1539,7 @@ impl StructLayoutBuilder {
             counted_by: field.counted_by.clone(),
             pointer_quals: field.pointer_quals.clone(),
             own_cvr: field.own_cvr,
+            written_typedef: field.written_typedef.clone(),
             offset: self.offset,
             ty: field.ty.clone(),
             bit_offset: None,
@@ -1716,6 +1729,9 @@ pub struct StructFieldLayout {
     pub pointer_quals: Vec<u8>,
     /// See [`StructField::own_cvr`].
     pub own_cvr: Option<u8>,
+    /// See [`StructField::written_typedef`]: the alias the member declared its
+    /// type with, which debug information prints instead of the underlying type.
+    pub written_typedef: Option<String>,
 }
 
 impl StructLayout {
@@ -1871,6 +1887,7 @@ impl StructLayout {
                 counted_by: field.counted_by.clone(),
                 pointer_quals: field.pointer_quals.clone(),
                 own_cvr: field.own_cvr,
+                written_typedef: field.written_typedef.clone(),
                 offset: 0, // All union fields start at offset 0
                 ty: field.ty.clone(),
                 bit_offset: bf_offset,
@@ -5306,6 +5323,7 @@ mod conditional_type_tests {
         let fields = vec![
             super::StructField {
                 own_cvr: None,
+                written_typedef: None,
                 name: "c".into(),
                 ty: CType::Char,
                 bit_width: None,
@@ -5321,6 +5339,7 @@ mod conditional_type_tests {
             },
             super::StructField {
                 own_cvr: None,
+                written_typedef: None,
                 name: "d".into(),
                 ty: CType::Double,
                 bit_width: None,
@@ -5347,6 +5366,7 @@ mod conditional_type_tests {
         let ctx: super::FxHashMap<String, super::RcLayout> = Default::default();
         let packed_bf = vec![super::StructField {
             own_cvr: None,
+            written_typedef: None,
             name: "a".into(),
             ty: CType::UInt,
             bit_width: Some(4),
@@ -5366,6 +5386,7 @@ mod conditional_type_tests {
 
         let pack2_bf = vec![super::StructField {
             own_cvr: None,
+            written_typedef: None,
             name: "a".into(),
             ty: CType::UInt,
             bit_width: Some(4),
@@ -5394,6 +5415,7 @@ mod conditional_type_tests {
         let ctx: super::FxHashMap<String, super::RcLayout> = Default::default();
         let field = |name: &str, ty: CType, alignment: Option<usize>| super::StructField {
             own_cvr: None,
+            written_typedef: None,
             name: name.into(),
             ty,
             bit_width: None,

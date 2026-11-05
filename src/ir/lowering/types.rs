@@ -450,6 +450,7 @@ impl Lowerer {
                 }
                 Some(StructField {
                     own_cvr: None,
+                    written_typedef: crate::common::qualifiers::written_typedef(&f.type_spec),
                     name: f.name.clone().unwrap_or_default(),
                     ty,
                     bit_width,

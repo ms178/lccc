@@ -122,6 +122,21 @@ pub fn base_specifier(mut ts: &TypeSpecifier) -> &TypeSpecifier {
     }
 }
 
+/// The typedef a declaration's type specifier names, if it names one.
+///
+/// `CType` erases typedefs, so this is the only record of how a declaration
+/// spelled its type, and it is what a debugger prints: `size_t n` and
+/// `unsigned long n` have one `CType` between them.  A pointer, array or
+/// function-pointer layer is peeled first (`pair_t *p`, `size_t n[4]`,
+/// `int (*fn_t)(int) x`), because the alias names the base type and the derived
+/// layers are rebuilt from the `CType` at the point that describes it.
+pub fn written_typedef(spec: &TypeSpecifier) -> Option<String> {
+    match base_specifier(spec) {
+        TypeSpecifier::TypedefName(alias) => Some(alias.clone()),
+        _ => None,
+    }
+}
+
 /// Base constness of the type of `expr`, before lvalue conversion. What no
 /// declaration records (struct members, function results) reads as not
 /// const.

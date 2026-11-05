@@ -24,7 +24,7 @@ use elf_writer::ElfWriter;
 pub fn assemble(
     asm_text: &str,
     output_path: &str,
-    debug: Option<crate::backend::elf::DwarfConfig>,
+    debug: Option<crate::backend::elf::DwarfDebug>,
 ) -> Result<(), String> {
     let items = parse_asm(asm_text)?;
     let items = crate::backend::x86::assembler::cfi::lower_cfi(
@@ -33,7 +33,11 @@ pub fn assemble(
     )?;
     let mut obj = ElfWriter::new();
     if let Some(debug) = debug {
-        obj.set_debug_config(debug);
+        let crate::backend::elf::DwarfDebug { config, unit } = debug;
+        obj.set_debug_config(config);
+        if let Some(unit) = unit {
+            obj.set_debug_unit(unit);
+        }
     }
     let elf_bytes = obj.build(&items)?;
     std::fs::write(output_path, &elf_bytes)

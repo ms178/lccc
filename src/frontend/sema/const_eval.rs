@@ -2042,6 +2042,7 @@ impl<'a> SemaConstEval<'a> {
                 }
                 Some(crate::common::types::StructField {
                     own_cvr: None,
+                    written_typedef: crate::common::qualifiers::written_typedef(&f.type_spec),
                     name,
                     ty,
                     bit_width,

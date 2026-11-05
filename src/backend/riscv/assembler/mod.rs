@@ -31,12 +31,16 @@ pub fn assemble_with_args(
     asm_text: &str,
     output_path: &str,
     extra_args: &[String],
-    debug: Option<crate::backend::elf::DwarfConfig>,
+    debug: Option<crate::backend::elf::DwarfDebug>,
 ) -> Result<(), String> {
     let statements = parse_asm(asm_text)?;
     let mut writer = ElfWriter::new();
     if let Some(debug) = debug {
-        writer.base.set_debug_config(debug);
+        let crate::backend::elf::DwarfDebug { config, unit } = debug;
+        writer.base.set_debug_config(config);
+        if let Some(unit) = unit {
+            writer.base.set_debug_unit(unit);
+        }
     }
 
     // Collect ABI and arch info from extra args (last value wins, matching GCC behavior)

@@ -2992,8 +2992,20 @@ gate reports unimplemented DIE kinds as **named known gaps**, so the list below
 cannot rot: a gap that stops reproducing is reported and its entry must be
 deleted in the same commit that closes the item.
 
-Measured baseline (18 DIE kinds at zero, 1 752 DIEs; 49 benchmark programs,
-`-O0 -g -gdwarf-5`, lccc / GCC 16.2):
+**Landed** (D1 file-scope objects and parameters, D2 types, D3 object locations,
+D4 data-only units, D13 written typedef spellings on every use site, plus the
+declaration policy and the DWARF 4 bit-field encoding). The census over the same 49 programs, `-O0 -g -gdwarf-5`, lccc /
+GCC 16.2, is now: `variable` 68/695 (GCC describes locals too — D14),
+`formal_parameter` 422/485, `base_type` 147/480, `pointer_type` 67/122,
+`typedef` 61/103 (the rest are aliases only *locals* name — D14),
+`enumerator` 0/26 (idem: the corpus's enums are named only by locals), `const_type` 30/98, `subrange_type` 48/78, `array_type`
+48/74, `member` 54/63, `lexical_block` 0/207 (D14), `structure_type` 12/14,
+`subprogram` 283/338, `unspecified_type` 54/0. The debug payload on
+`fib.c -g -gdwarf-5 -O0` fell from 1 705 to 718 bytes (GCC 1 021, Clang 759) while
+gaining the DIE tree, because a declaration now costs bytes only when the code
+names it.
+
+Baseline before the series (18 DIE kinds at zero, 1 752 DIEs):
 `variable` 0/417, `formal_parameter` 0/485, `base_type` 0/480, `pointer_type`
 0/122, `typedef` 0/103, `const_type` 0/98, `subrange_type` 0/78, `array_type`
 0/74, `member` 0/59, `lexical_block` 0/127, `structure_type` 0/14, `subprogram`
@@ -3005,11 +3017,13 @@ per-unit `.debug_aranges` sets, post-peephole synthesized CFI, dialect identity.
 
 | ID | P | Effort | Item | Gate added |
 |---|---|---|---|---|
-| D1 | P0 | M/L | variables, formal parameters, lexical blocks, external declarations | a `DW_TAG_variable`/`formal_parameter` per source name, with resolvable `DW_AT_type` and `decl_line` in span |
-| D2 | P0 | M | type DIEs: base, derived, aggregate, enum, array, subroutine | DIE byte sizes and member offsets equal the program's own `sizeof`/`offsetof` |
-| D3 | P0 | M→L | `DW_AT_location`: `DW_OP_addr` for statics, `DW_OP_fbreg` at `-O0`, location lists for optimized code | the DIE's location evaluates (CFA walk) to the address the program printed |
-| D4 | P0 | S | a unit with no code still gets a unit | a data-only TU names its variable |
-| D5 | P1 | S | one line sequence per function (GCC's shape; measured 1 for 5 functions today) | `sequences >= functions with code` |
+| D1 | **landed** | — | file-scope variables, parameters, external declarations (locals/lexical blocks: D14) | a `DW_TAG_variable`/`formal_parameter` per source name, with resolvable `DW_AT_type` and `decl_line` in span |
+| D1b | P1 | M | a parameter's `DW_AT_location` (needs the frame layout as a `.dwarf_param` directive) | every parameter's `DW_OP_fbreg` reads the value the program prints |
+| D2 | **landed** | — | type DIEs: base, derived, aggregate, enum, array, subroutine | DIE byte sizes and member offsets equal the program's own `sizeof`/`offsetof` |
+| D3 | **landed** (objects) | — | `DW_AT_location`: `DW_OP_addr` for every object this object file defines | the DIE's location equals the address the program printed |
+| D3b | P1 | M | parameter and local locations (`DW_OP_fbreg` at `-O0`, location lists when optimized) | the location evaluates (CFA walk) to the value the program printed |
+| D4 | **landed** | — | a unit with no code still gets a unit, with a line program and its file table | a data-only TU names its variables and its source file |
+| ~~D5~~ | — | — | **withdrawn**: one sequence per function is GCC 16.2's shape too (measured `[1, 5]` on both compilers) | the gate records the ratio for both and flags a real divergence |
 | D6 | P1 | L | `DW_TAG_inlined_subroutine` with `call_file`/`call_line` | two inlining instances, ranges inside the caller, abstract origin declared |
 | D7 | P1 | M | `-S -g` carries the DIE tree (GCC puts the sections in the `.s`; lccc puts `.loc` only) | `-S`+`as` object's tree equals the `-c` object's |
 | D8 | P2 | M | `-g3`: `.debug_macro` | two macros with line and replacement text; nothing at `-g` |
@@ -3017,9 +3031,12 @@ per-unit `.debug_aranges` sets, post-peephole synthesized CFI, dialect identity.
 | D10 | P2 | S | `-fdebug-prefix-map`/`-ffile-prefix-map` on `DW_AT_name`/`comp_dir`/`decl_file` | two builds in different directories are byte-identical |
 | D11 | P3 | L | `-gsplit-dwarf`: skeleton unit + `.dwo` | skeleton names the `.dwo`; the tree resolves `pq_global` |
 | D12 | P3 | M | `.debug_names` for DWARF 5 | every subprogram/variable indexed once; lookup equals a full walk |
+| D13 | **landed** | — | the spelling a declaration wrote: a typedef keeps its name on objects, parameters, pointer layers, return types and record members (`intern_written`); the "one DIE per declared typedef" framing was measured false — GCC emits a typedef DIE only where something names it | a pointer to a typedef, a typedef parameter and a typedef return type all resolve through `DW_TAG_typedef`, and the type's size equals the program's `sizeof` |
+| D14 | P1 | L | local variables and `DW_TAG_lexical_block` (GCC 695 variables, 207 blocks; lccc 68, 0) | every executable local's value equals what the program prints |
+| D15 | P2 | S | an unreferenced declaration costs nothing (`with_referenced` prunes the DIE *and* the types only it reached) | **landed with its gate** |
 
-Ordering is ROI: D4 and D5 are a day each and remove whole classes of
-"no debug info" answers; D1+D2+D3 are the centre (they are what "godlike
+Ordering is ROI: D4 is a day's work and removes a whole class of "no debug info"
+answers; D1+D2+D3 are the centre (they are what "godlike
 debugging" means) and land as a series, each with executable assertions; D6–D12
 are the polish that makes the artifact GCC-shaped rather than merely valid.
 
