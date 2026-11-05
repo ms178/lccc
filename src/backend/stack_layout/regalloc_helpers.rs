@@ -557,14 +557,23 @@ pub fn run_regalloc_and_merge_clobbers_ipa(
             return_consumes_accumulator: crate::common::types::target_is_32bit(),
         }
     };
-    // x86-64 is the only backend that publishes an indirect-call target
-    // register (`%r10` = PhysReg(11)); it is also the backend whose
-    // caller-saved pool (r11/r10/r8/r9/rdi/rsi) is wide enough for a leaf's
-    // loop state. i686 (3 scratch registers, %eax/%ecx/%edx hazards) keeps
-    // the Phase-1 hot-loop promotion.
+    // A leaf's loop state belongs in the volatile pool first, as GCC, Clang
+    // and ICX allocate it: every callee-saved home costs a save/restore pair
+    // per call.  x86-64 (the backend that publishes an indirect-call target,
+    // `%r10` = PhysReg(11)) has r11/r10/r8/r9/rdi/rsi; AArch64 x4-x8/x13/x14
+    // (plus x9-x12/x15 in pure-ALU bodies); RISC-V a0-a7 whenever its
+    // caller pool is open at all.  The pools hold values only where the
+    // emitters' scratch use leaves them alone, which is a property of the
+    // register, not of the value, so loop values are as safe there as the
+    // temporaries already homed in them.  i686 (3 scratch registers,
+    // %eax/%ecx/%edx hazards) keeps the Phase-1 hot-loop promotion.
+    // Measured on AArch64 -O2 `sum`/`count_if`/`max` style leaves: the
+    // x19-x22 pairs (4 stp/ldp + frame) disappear with the loop bodies
+    // unchanged.
     let leaf_caller_saved_homes = !crate::common::types::target_is_32bit()
-        && indirect_target_regs.iter().any(|r| r.0 == 11)
-        && caller_saved_regs.len() >= 4;
+        && caller_saved_regs.len() >= 4
+        && (indirect_target_regs.iter().any(|r| r.0 == 11)
+            || matches!(crate::common::types::target_elf_machine(), 183 | 243));
     let mut config = super::super::regalloc::RegAllocConfig {
         ipa_regs,
         available_regs,
