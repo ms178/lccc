@@ -639,6 +639,9 @@ impl TypeContext {
             .into_iter()
             .map(
                 |(name, offset, ty)| crate::common::types::StructFieldLayout {
+                    // A compiler builtin: no source declared this record, so it
+                    // has no spelling to preserve.
+                    written_typedef: None,
                     name: name.to_string(),
                     offset,
                     ty,

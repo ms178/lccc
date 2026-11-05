@@ -165,10 +165,10 @@ the first column is the state the campaign started from):
 |---|---|---|---|
 | `variable` | 0 | 208 → 68 | 695 |
 | `formal_parameter` | 0 | 422 | 485 |
-| `base_type` | 0 | 332 → 150 | 480 |
+| `base_type` | 0 | 332 → 147 | 480 |
 | `subprogram` | 283 | 283 | 338 |
-| `pointer_type` | 0 | 323 → 63 | 122 |
-| `typedef` | 0 | 2 | 103 |
+| `pointer_type` | 0 | 323 → 67 | 122 |
+| `typedef` | 0 | 2 → 61 | 103 |
 | `const_type` | 0 | 30 | 98 |
 | `array_type` / `subrange_type` | 0 | 137 → 48 | 74 / 78 |
 | `member` | 0 | 1 330 → 54 | 63 |
@@ -189,9 +189,16 @@ Three columns still differ from GCC, and each is a *different* item:
 
 * `variable`/`lexical_block`: GCC describes **locals**, lccc describes
   file-scope objects and parameters. D14.
-* `typedef`: GCC emits a DIE for every typedef it sees, lccc only for an object
-  declared through one. A debugger prints the same types either way; the
-  remaining difference is spelling of types nothing uses.
+* `typedef`: this one was **wrong as written, and is now closed**. The premise --
+  that GCC emits a DIE for every typedef it sees -- is false: on
+  `typedef int A; typedef struct { int a; double b; } B; typedef int (*C)(int);`
+  with only an `A` object, GCC 16.2 emits one typedef DIE and so did lccc. The
+  real gap was the other use sites: a *parameter*, a *pointer to a typedef* and a
+  *return type* were described structurally, so `int f(pair_t *p, size_t n)` and
+  `size_t f(void)` printed `struct pair *` and `long unsigned int`. All three now
+  keep the written spelling (`TypeGraph::intern_written`), which took the corpus
+  count from 2 to 56 against GCC's 103, and the rest of GCC's column is typedefs
+  named only by *locals* -- D14.
 * `enumeration_type`/`enumerator`/`unspecified_parameters`: none of the corpus
   programs has a file-scope object of enum type, and lccc emits
   `DW_TAG_unspecified_parameters` only on a *defined* variadic function (the
@@ -203,6 +210,8 @@ Three columns still differ from GCC, and each is a *different* item:
 | Fact | Measurement |
 |---|---|
 | *Closed:* no `DW_AT_location` anywhere | every file-scope object this object file defines now carries a 9-byte `DW_OP_addr` whose address equals the address the program prints for it (gated); a parameter carries **no** location yet — D1b |
+| *Closed:* typedef spellings lost on parameters and returns | `pair_t *p`, `size_t n` and `size_t f(void)` now point at a `DW_TAG_typedef`, not at the record or the base type, so `ptype p` prints what the source wrote; GCC 16.2 measured to do exactly the same. Costs 2.77 % of the debug payload over the corpus (86 objects, 100 491 → 103 271 bytes, ~50 bytes per alias) — the price of 59 names a debugger can now resolve |
+| *Closed:* an empty unit carried one unattached base type | the writer interns an array's subrange index type itself, so the copy interned up front by `build_dwarf_unit` was never referenced by any DIE — and for `extern int ext(int);` it was the *only* content of the type table, which made a declaration-only unit emit a `.debug_info` holding one `long unsigned int` where GCC 16.2 emits none. Removing it restores the repository's contract (`check_debug_info_flags.sh`, pin 3) and drops one base type from every unit that interned one: 147 over the census, from 150 |
 | *Closed:* a TU that is only data emits no debug info | `int pq_only_data = 42;` now gets a unit, `DW_AT_stmt_list`, a header-only line program (file table, no statements) and a `variable` DIE, byte-shape for byte-shape what GCC 16.2 writes |
 | No `DW_TAG_inlined_subroutine` | at `-O2`, the row inside `main` that came from the inlined `pq_frame` claims `pq_frame`'s line, and a consumer cannot recover the inline stack |
 | One line sequence for the whole unit | **matches GCC, re-measured**: five functions, `readelf --debug-dump=rawline \| grep -c 'Line Number Statements'` gives 1 for lccc *and* GCC 16.2 under `-g`, `-O0`, `-O2`, `-g3` and `-ffunction-sections` at every dialect; `-ffunction-sections` puts five sequences in that one program on both. Withdrawn as a gap — see D5 |
@@ -224,6 +233,7 @@ fails if it regresses. Sizes are `.debug_info` + `.debug_abbrev` + `.debug_str` 
 | File-scope objects, defined and declared | `DW_AT_location` present exactly when `.symtab` defines the object, and equal to the symbol's address (gated); a removed static keeps its DIE and loses the location, which is GCC 16.2's rule and also what stops a `DW_AT_location` relocation against a dropped symbol from breaking the link |
 | Declarations only for referenced names | measured `extern int q_used` / `extern int q_missing`: GCC describes the first and not the second, and lccc now does the same; the `_IO_FILE` structure and its thirty members left the payload with it |
 | Function parameters | a `DW_TAG_formal_parameter` child per parameter of every defined function, with `DW_AT_name` and a `DW_AT_type` that resolves; `DW_TAG_unspecified_parameters` on a variadic definition |
+| The spelling a declaration wrote | a typedef keeps its name as a `DW_TAG_typedef` for objects, parameters, pointer layers above the alias, return types and record members; `ptype` prints `pair_t *` and `size_t n`, not `struct pair *` and `long unsigned int n`. Gated on all five shapes and against GCC 16.2 as the subject |
 | A data-only translation unit | a unit with `DW_AT_stmt_list` and no `DW_AT_low_pc`, a line program whose header carries the file table, and one `variable` DIE per object |
 | Bit-field layout in every dialect | `DW_AT_data_bit_offset` at version 5, `DW_AT_bit_offset` + `DW_AT_data_member_location` at 2–4 — GCC 16.2's own split, measured |
 
@@ -237,7 +247,7 @@ policy removed more than the new DIEs cost.
 
 ## 4. Work items
 
-Ordered by value: D1–D4 are **landed** (see
+Ordered by value: D1–D4 and D13 are **landed** (see
 [§3.5](#35-what-the-campaign-has-landed-measured)), and what remains is D1b
 (parameter locations), D6 (inline instances), D14 (locals and lexical blocks),
 then the `-S`/`.debug_macro`/compression items.
@@ -479,20 +489,67 @@ compare values, not just decode the expression.
 
 **Effort** M. **ROI** 4.
 
-### D13 · P2 · S — a typedef DIE for every typedef the unit declares
+### D13 · **landed** — the type spelling a declaration wrote
 
-**Why.** GCC 16.2 describes 103 typedefs over the corpus, lccc 2 (the ones an
-object was declared through). A consumer printing a type name whose spelling
-comes from an unused typedef (`iovec`, `ssize_t`) sees the underlying type
-instead. Legal either way; a completeness gap, not a correctness one.
+**Why.** The item originally asked for "a typedef DIE for every typedef the unit
+declares", on the strength of a census column (GCC 103, lccc 2). The premise is
+false and the census was measuring the symptom, not the cause. Measured on
+`typedef int A; typedef struct { int a; double b; } B; typedef int (*C)(int);`
+with one `A` object, GCC 16.2 emits exactly **one** `DW_TAG_typedef` (`A`);
+`B` and `C` get none, because nothing in the unit names them. Row count is not
+the rule -- **use** is.
 
-**Where.** `TypeGraph::intern_typedef` — the driver would intern each name in
-`TypeContext::typedefs` that the unit's own source declared.
+The real defect was on the *other* use sites. Object declarations kept their
+alias, but a parameter, a pointer above the alias, and a return type did not:
 
-**Gate** A typedef-only probe: `typedef unsigned long pq_size;` with no object of
-that type, asserted to produce a `DW_TAG_typedef` naming `pq_size`.
+```
+typedef struct pair { int a, b; } pair_t;
+typedef unsigned long size_t;
+pair_t *pick(pair_t *p, const pair_t *q);   /* was: struct pair * */
+size_t  count(size_t n);                    /* was: long unsigned int */
+```
 
-**Effort** S. **ROI** 2.
+**Where.** `TypeGraph::intern_written` (`src/backend/elf/dwarf_spec.rs`) rebuilds
+the alias as a `DW_TAG_typedef` node and reapplies the layers the declaration had
+above it (pointer, array), so `const pair_t *` becomes pointer → `const` →
+`pair_t` → `struct pair`, and an alias that *is* a pointer
+(`typedef int (*fn_t)(int); fn_t h;`) is recognised before anything is peeled --
+peeling first would find the signature and describe the wrong depth. The spelling
+is captured where the declaration is still in hand, by one rule
+(`common::qualifiers::written_typedef`, built on `base_specifier`):
+
+* objects: `FileScopeObject::typedef_name`;
+* parameters and return types: `FunctionInfo::param_typedefs` /
+  `FunctionInfo::return_typedef`;
+* record members: `StructField::written_typedef`, copied into
+  `StructFieldLayout` so it survives the layout the writer reads, from all four
+  places that build a field (sema layout, const evaluation, type checking, IR
+  lowering) rather than from whichever one happens to be on the path today.
+
+**Why the alias is conditional.** One unit may write `typedef int myint;` and
+later `typedef double myint;`. The table holds the last one, so an `int` object
+declared through the first would be described as a `myint` whose target is
+`double` -- a confident lie. The writer keeps the alias only when it still names
+the type the declaration had, and otherwise falls back to the structural DIE,
+which is correct and merely less legible.
+
+**Gate.** The probe asserts every shape: `pq_mark(pq_point_t *point,
+pq_index_t index)` (a pointer to a typedef resolves to the typedef and through it
+to the structure, and a parameter's type is the typedef), `pq_next(pq_index_t)`
+(a return type is the typedef whose `DW_AT_byte_size` equals the program's
+`sizeof(pq_index_t)`), `pq_typedef_handler` (`pq_fn_t`, an alias that names a
+pointer), `pq_point_pair` (an array whose element is the alias) and
+`pq_holder_global` (a record whose members `count`/`point` are declared through
+aliases). Mutation-verified twice: disabling the spelling fails the gate on every
+shape, and disabling only the member plumbing fails it on `pq_holder` alone.
+
+**Cost.** 2.77 % of the debug payload over the corpus, measured by building all 86
+compilable benchmark objects with and without the pass: 100 491 → 103 271 bytes,
+about 50 bytes per alias, and 59 typedefs that a debugger can now name. That is
+the trade the campaign makes deliberately: bytes for capability, and the
+declaration policy of §3.5 more than paid for it.
+
+**Effort** S. **ROI** 4.
 
 ### D14 · P1 · L — local variables and lexical blocks
 

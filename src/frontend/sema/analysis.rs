@@ -149,6 +149,18 @@ pub struct FunctionInfo {
     /// qualifiers, so `*g() = 0` for `int *const *g(void)` is only
     /// diagnosable if the record keeps the middle level's `const`.
     pub return_pointer_const_levels: u32,
+    /// The typedef each parameter's declaration spelled its type with,
+    /// parallel to `params`.
+    ///
+    /// `CType` erases the alias -- `typedef unsigned long size_t; void f(size_t n)`
+    /// and `void f(unsigned long n)` are the same type -- but a debugger prints
+    /// what the source said, so the spelling has to be captured where the
+    /// declaration is still in hand.  `None` means the declaration named no
+    /// typedef, which is the common case.
+    pub param_typedefs: Vec<Option<String>>,
+    /// The typedef the return type was declared with (`size_t f(void)`), or
+    /// `None` when the definition spelled a type of its own.
+    pub return_typedef: Option<String>,
 }
 
 impl FunctionInfo {
@@ -690,6 +702,12 @@ impl SemanticAnalyzer {
                 func.return_base_const,
                 func.return_pointer_const_levels,
             ),
+            param_typedefs: func
+                .params
+                .iter()
+                .map(|p| crate::common::qualifiers::written_typedef(&p.type_spec))
+                .collect(),
+            return_typedef: crate::common::qualifiers::written_typedef(&func.return_type),
         };
         // A block-scope prototype may precede the definition and carry facts the
         // definition does not repeat; `noreturn` is one of them. The file-scope
@@ -971,6 +989,12 @@ impl SemanticAnalyzer {
                 func.return_base_const,
                 func.return_pointer_const_levels,
             ) | prior_levels,
+            param_typedefs: func
+                .params
+                .iter()
+                .map(|p| crate::common::qualifiers::written_typedef(&p.type_spec))
+                .collect(),
+            return_typedef: crate::common::qualifiers::written_typedef(&func.return_type),
         };
         let func_ctype = CType::Function(Box::new(func_info.call_type()));
 
@@ -1820,6 +1844,11 @@ impl SemanticAnalyzer {
                                                     &ft.return_type,
                                                 ),
                                             ),
+                                        // A prototype describes no storage, so the
+                                        // debug information never asks it for a
+                                        // spelling.
+                                        param_typedefs: Vec::new(),
+                                        return_typedef: None,
                                     },
                                 );
                             }
@@ -1887,6 +1916,8 @@ impl SemanticAnalyzer {
                             is_noreturn,
                             return_base_const,
                             return_pointer_const_levels: return_levels,
+                            param_typedefs: Vec::new(),
+                            return_typedef: None,
                         },
                     );
                 }
@@ -4149,6 +4180,8 @@ impl SemanticAnalyzer {
                     is_noreturn: false,
                     return_base_const: false,
                     return_pointer_const_levels: 0,
+                    param_typedefs: Vec::new(),
+                    return_typedef: None,
                 };
                 self.result.functions.insert(name.clone(), func_info);
             }
@@ -8013,6 +8046,7 @@ dereference it before applying '->' to it?"
                     return None;
                 }
                 Some(crate::common::types::StructField {
+                    written_typedef: crate::common::qualifiers::written_typedef(&f.type_spec),
                     name,
                     ty,
                     bit_width,
@@ -10684,6 +10718,8 @@ dereference it before applying '->' to it?"
                 is_noreturn,
                 return_base_const: false,
                 return_pointer_const_levels: 0,
+                param_typedefs: Vec::new(),
+                return_typedef: None,
             };
             self.result.functions.insert(name.to_string(), func_info);
         }
@@ -11566,6 +11602,7 @@ mod record_layouts_correspond_tests {
     fn field(name: &str, ty: CType, offset: usize) -> StructFieldLayout {
         StructFieldLayout {
             own_cvr: None,
+            written_typedef: None,
             name: name.to_string(),
             ty,
             offset,

@@ -673,6 +673,93 @@ impl<'a> TypeGraph<'a> {
         }
     }
 
+    /// The DIE for a declared type, spelled with the typedef its declaration
+    /// wrote.
+    ///
+    /// `CType` erases the alias: `typedef unsigned long size_t; void f(size_t)`
+    /// and `void f(unsigned long)` are one type, and the analyser hands the
+    /// writer that type plus, separately, the name the declaration spelled.
+    /// This puts the name back on the DIE -- `size_t` rather than
+    /// `long unsigned int` -- and reapplies the derived layers the declaration
+    /// had above it, so `pair_t *p` describes a pointer to `pair_t` and not a
+    /// flattened `struct pair *`.
+    ///
+    /// The alias is used only when it still names the type the declaration had:
+    /// one unit may spell `typedef int myint;` and later
+    /// `typedef double myint;`, and describing the second one's objects as
+    /// `myint` while the field says `double` would be a confident lie.  In that
+    /// case the structural description wins, which is still correct, just less
+    /// legible -- the same rule the object path always used, now expressed once.
+    pub(crate) fn intern_written(&mut self, ty: &CType, alias: Option<&str>) -> u32 {
+        let Some(alias) = alias else {
+            return self.intern_ctype(ty);
+        };
+        // The alias the declaration wrote has to still name what the declaration
+        // had: one unit may write `typedef int myint;` and later
+        // `typedef double myint;`, and the table holds only the second.  A DIE
+        // that says `myint` over a `DW_AT_type` of `double`, attached to an `int`
+        // object, is worse than a structural description -- it is wrong.
+        let Some(named) = self.typedefs.get(alias).cloned() else {
+            return self.intern_ctype(ty);
+        };
+        // The declaration's type, exactly.  Checked before anything is peeled:
+        // an alias can name a pointer itself (`typedef int (*fn_t)(int)`), and
+        // looking inside it would find the signature rather than the alias.
+        if *ty == named {
+            let target = self.intern_ctype(&named);
+            return self.intern_typedef(alias, target);
+        }
+        // Otherwise the declaration added layers of its own above the name.  Only
+        // pointer and array layers are transparent here, and both are rebuilt
+        // around the alias below, innermost first, so `const pair_t *` describes a
+        // pointer to a `const pair_t` and not a `pair_t` to a `const struct`.
+        enum Layer {
+            Pointer(PtrQuals),
+            Array(Option<usize>),
+        }
+        let mut layers: Vec<Layer> = Vec::new();
+        let mut core: &CType = ty;
+        loop {
+            match core {
+                CType::Pointer(inner, quals) => {
+                    layers.push(Layer::Pointer(*quals));
+                    core = inner;
+                }
+                CType::Array(inner, count) => {
+                    layers.push(Layer::Array(*count));
+                    core = inner;
+                }
+                _ => break,
+            }
+        }
+        if *core != named {
+            // The declaration named a type the alias does not describe -- a
+            // conversion through a different derived form.  The structural DIE is
+            // correct, so it wins.
+            return self.intern_ctype(ty);
+        }
+        let target = self.intern_ctype(&named);
+        let mut index = self.intern_typedef(alias, target);
+        for layer in layers.iter().rev() {
+            index = match layer {
+                Layer::Pointer(quals) => {
+                    let sized = self.inner(index);
+                    let target = self.wrap_quals(sized, *quals);
+                    self.intern(DwarfType::Pointer {
+                        pointee: Some(target),
+                        size: self.pointer_size,
+                    })
+                }
+                Layer::Array(count) => self.intern(DwarfType::Array {
+                    element: index,
+                    bounds: vec![count.map(|count| (count as u64).saturating_sub(1))],
+                    vector: false,
+                }),
+            };
+        }
+        index
+    }
+
     /// A `typedef` visible to this unit: a `DW_TAG_typedef` over `target`, so
     /// a debugger prints the alias the source used.
     pub(crate) fn intern_typedef(&mut self, name: &str, target: u32) -> u32 {
@@ -771,7 +858,7 @@ impl<'a> TypeGraph<'a> {
         };
         let mut members = Vec::with_capacity(layout.fields.len());
         for field in &layout.fields {
-            let ty = self.intern_ctype(&field.ty);
+            let ty = self.intern_written(&field.ty, field.written_typedef.as_deref());
             members.push(DwarfMember {
                 name: (!field.name.is_empty()).then(|| field.name.clone()),
                 ty,
@@ -900,6 +987,7 @@ mod tests {
             Rc::new(StructLayout {
                 is_complete: true,
                 fields: vec![StructFieldLayout {
+                    written_typedef: None,
                     name: "next".to_string(),
                     offset: 0,
                     ty: CType::Pointer(Box::new(CType::Struct("Node".into())), PtrQuals::GENERIC),
@@ -974,6 +1062,174 @@ mod tests {
     }
 
     #[test]
+    fn a_written_typedef_becomes_a_typedef_die() {
+        let layouts = empty_layouts();
+        let mut typedefs = FxHashMap::default();
+        typedefs.insert("size_t".to_string(), CType::ULong);
+        let mut types = graph(&layouts, &typedefs);
+        let written = types.intern_written(&CType::ULong, Some("size_t"));
+        let plain = types.intern_ctype(&CType::ULong);
+        let built = types.into_types();
+        let (written, plain) = (&built[written as usize], &built[plain as usize]);
+        assert_ne!(
+            written, plain,
+            "a `size_t` parameter must not collapse into `long unsigned int`"
+        );
+        assert!(
+            matches!(written, DwarfType::Typedef { name, .. } if name == "size_t"),
+            "{written:?}"
+        );
+        assert!(
+            matches!(plain, DwarfType::Base { .. }),
+            "the structural type is still a base type"
+        );
+    }
+
+    #[test]
+    fn a_written_typedef_keeps_the_pointer_above_it() {
+        let layouts = empty_layouts();
+        let mut typedefs = FxHashMap::default();
+        typedefs.insert("myint".to_string(), CType::Int);
+        let mut types = graph(&layouts, &typedefs);
+        let pointer = CType::Pointer(Box::new(CType::Int), PtrQuals::GENERIC);
+        let index = types.intern_written(&pointer, Some("myint"));
+        let built = types.into_types();
+        let DwarfType::Pointer { pointee, .. } = &built[index as usize] else {
+            panic!(
+                "`myint *` is a pointer, not a typedef: {:?}",
+                &built[index as usize]
+            );
+        };
+        let pointee = &built[pointee.expect("a pointer DIE names what it points at") as usize];
+        assert!(
+            matches!(pointee, DwarfType::Typedef { name, .. } if name == "myint"),
+            "the alias belongs under the pointer, not around it: {pointee:?}"
+        );
+    }
+
+    #[test]
+    fn a_written_typedef_keeps_the_pointee_qualifier_outside_it() {
+        let layouts = empty_layouts();
+        let mut typedefs = FxHashMap::default();
+        typedefs.insert("myint".to_string(), CType::Int);
+        let mut types = graph(&layouts, &typedefs);
+        let pointer = CType::Pointer(
+            Box::new(CType::Int),
+            PtrQuals::recorded(AddressSpace::Default, PtrQuals::CONST),
+        );
+        let index = types.intern_written(&pointer, Some("myint"));
+        let built = types.into_types();
+        let DwarfType::Pointer { pointee, .. } = &built[index as usize] else {
+            panic!("`const myint *` is a pointer");
+        };
+        let qualified = &built[pointee.unwrap() as usize];
+        let DwarfType::Qualified { target, .. } = qualified else {
+            panic!("`const` belongs on the pointee: {qualified:?}");
+        };
+        assert!(
+            matches!(&built[*target as usize], DwarfType::Typedef { name, .. } if name == "myint"),
+            "`const myint` is a qualified typedef, not a qualified int"
+        );
+    }
+
+    #[test]
+    fn a_typedef_that_stopped_naming_the_declared_type_is_not_used() {
+        let layouts = empty_layouts();
+        let mut typedefs = FxHashMap::default();
+        // `typedef int myint;` came first, and a later `typedef double myint;`
+        // won the table: describing an `int` object as `myint` would now lie.
+        typedefs.insert("myint".to_string(), CType::Double);
+        let mut types = graph(&layouts, &typedefs);
+        let written = types.intern_written(&CType::Int, Some("myint"));
+        let plain = types.intern_ctype(&CType::Int);
+        let built = types.into_types();
+        assert_eq!(
+            written, plain,
+            "a stale alias describes a different type, so the structural DIE wins"
+        );
+        assert!(
+            !built
+                .iter()
+                .any(|node| matches!(node, DwarfType::Typedef { name, .. } if name == "myint")),
+            "no typedef DIE may claim an alias that names something else"
+        );
+    }
+
+    #[test]
+    fn a_written_typedef_of_an_array_keeps_the_array() {
+        let layouts = empty_layouts();
+        let mut typedefs = FxHashMap::default();
+        typedefs.insert("myint".to_string(), CType::Int);
+        let mut types = graph(&layouts, &typedefs);
+        let array = CType::Array(Box::new(CType::Int), Some(4));
+        let index = types.intern_written(&array, Some("myint"));
+        let built = types.into_types();
+        let DwarfType::Array {
+            element, bounds, ..
+        } = &built[index as usize]
+        else {
+            panic!("`myint[4]` is an array");
+        };
+        assert_eq!(bounds, &vec![Some(3)]);
+        assert!(
+            matches!(&built[*element as usize], DwarfType::Typedef { name, .. } if name == "myint"),
+            "the element keeps the alias the declaration wrote"
+        );
+    }
+
+    #[test]
+    fn a_member_keeps_the_typedef_its_declaration_named() {
+        // `struct holder { size_t count; };` -- the layout carries the spelling
+        // the field declaration wrote, and the member DIE must point at the
+        // typedef rather than at `long unsigned int`.
+        let mut layouts = empty_layouts();
+        layouts.insert(
+            "holder".to_string(),
+            Rc::new(StructLayout {
+                is_complete: true,
+                fields: vec![StructFieldLayout {
+                    written_typedef: Some("size_t".to_string()),
+                    name: "count".to_string(),
+                    offset: 0,
+                    ty: CType::ULong,
+                    bit_offset: None,
+                    bit_width: None,
+                    sso: SsoMode::None,
+                    sso_storage_ty: None,
+                    base_volatile: false,
+                    base_const: false,
+                    object_volatile: false,
+                    object_const: false,
+                    counted_by: None,
+                    pointer_quals: Vec::new(),
+                    own_cvr: None,
+                }],
+                size: 8,
+                align: 8,
+                is_union: false,
+                is_transparent_union: false,
+                requires_designators: false,
+                reverse_sso: false,
+                user_align: false,
+                member_align: 8,
+            }),
+        );
+        let mut typedefs = FxHashMap::default();
+        typedefs.insert("size_t".to_string(), CType::ULong);
+        let mut types = graph(&layouts, &typedefs);
+        let record = types.intern_ctype(&CType::Struct("holder".into()));
+        let built = types.into_types();
+        let DwarfType::Record { members, .. } = &built[record as usize] else {
+            panic!("a struct is a record DIE");
+        };
+        let member = &built[members[0].ty as usize];
+        assert!(
+            matches!(member, DwarfType::Typedef { name, .. } if name == "size_t"),
+            "the member's `size_t` spelling is lost: {member:?}"
+        );
+    }
+
+    #[test]
     fn multidimension_arrays_keep_declaration_order() {
         let layouts = empty_layouts();
         let typedefs = FxHashMap::default();
@@ -1019,6 +1275,7 @@ mod tests {
             Rc::new(StructLayout {
                 is_complete: true,
                 fields: vec![StructFieldLayout {
+                    written_typedef: None,
                     name: "flag".to_string(),
                     offset: 4,
                     ty: CType::UInt,

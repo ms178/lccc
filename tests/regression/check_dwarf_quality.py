@@ -1224,25 +1224,62 @@ class FunctionSpan:
     last_line: int
 
 
+def strip_attributes(text: str) -> str:
+    """`text` without any `__attribute__((...))` groups.
+
+    An attribute may sit before the return type
+    (`__attribute__((noinline)) int f(void) { ... }`) or between the return type
+    and the declarator (`int __attribute__((noinline)) f(void) { ... }`), and in
+    neither place is it part of the function's name.  The parentheses are counted
+    rather than searched, because an unknown attribute's argument list is
+    parenthesised too, and an unbalanced group leaves the line untouched rather
+    than guessing.
+    """
+    while (at := text.find("__attribute__")) != -1:
+        open_at = text.find("(", at)
+        if open_at == -1:
+            return text
+        depth = 0
+        for position in range(open_at, len(text)):
+            if text[position] == "(":
+                depth += 1
+            elif text[position] == ")":
+                depth -= 1
+                if depth == 0:
+                    text = f"{text[:at]} {text[position + 1:]}"
+                    break
+        else:
+            return text
+    return text
+
+
 def function_spans(source: str) -> list[FunctionSpan]:
     """Definitions in a probe: `name` at its declaration line, up to its brace.
 
     The probes keep every definition at column 0 and every closing brace at
-    column 0, which is what makes this three-line scanner enough; it is a
-    property of the fixtures this gate wrote, not a C parser.
+    column 0, which is what makes this scanner enough; it is a property of the
+    fixtures this gate wrote, not a C parser.  A definition is a column-0 line
+    that spells a name, an argument list and no terminating `;` once any
+    leading attribute group is gone -- which covers a typedef'd or attribute-
+    bearing return type without listing every type the probes use.
     """
     lines = source.splitlines()
     spans: list[FunctionSpan] = []
     index = 0
     while index < len(lines):
-        text = lines[index]
+        line = lines[index]
+        # Only column-0 lines are definitions (the fixtures' property): an
+        # indented `if (x) {` inside a body is never examined, because a
+        # definition's body is skipped whole below, but a scanner that reads
+        # indentation as a definition would attribute rows to a function named
+        # `if`.
+        text = strip_attributes(line) if not line[:1].isspace() else ""
         candidate = None
-        for prefix in ("int ", "static int ", "static inline int ", "unsigned "):
-            if text.startswith(prefix):
-                rest = text[len(prefix) :]
-                if "(" in rest and not rest.startswith("*"):
-                    candidate = rest.split("(")[0].strip()
-                break
+        if "(" in text and not text.rstrip().endswith(";") \
+                and not text.startswith(("/*", "*", "#", "}")):
+            head = text.split("(")[0].split()
+            if head and head[-1].isidentifier():
+                candidate = head[-1]
         if candidate is None or text.rstrip().endswith(";"):
             # A prototype has no body: scanning forward for its closing brace
             # would swallow the next definition and mis-attribute its rows.
@@ -1300,6 +1337,24 @@ struct pq_bits pq_bits_global;
 int pq_sum(int count, ...) {
     return count;
 }
+/* The declaration's own spelling: `pq_index_t` and `pq_point_t *` must survive
+   into the parameter DIEs, or `ptype` prints a type the source never wrote.
+   `noinline` because this asks about spelling at every tier, not about which
+   calls a given tier folds away. */
+typedef unsigned long pq_index_t;
+typedef int (*pq_fn_t)(int);
+pq_fn_t pq_typedef_handler;
+pq_point_t pq_point_pair[2];
+/* A member's declaration spells its own type too, and a record full of
+   `size_t`-style aliases is what a debugger spends its time printing. */
+struct pq_holder { pq_index_t count; pq_point_t point; };
+struct pq_holder pq_holder_global;
+__attribute__((noinline)) int pq_mark(pq_point_t *point, pq_index_t index) {
+    return point->x + (int)index;
+}
+__attribute__((noinline)) pq_index_t pq_next(pq_index_t index) {
+    return index + 1;
+}
 int pq_frame(int n) {
     int total = pq_global;
     for (int i = 0; i < n; i++) {
@@ -1323,6 +1378,9 @@ int main(void) {
     printf("addr_global %p\\n", (void *)&pq_global);
     printf("addr_frame %p\\n", (void *)pq_frame);
     printf("value_sum %d\\n", pq_sum(1, 2) + 2);
+    printf("sizeof_index %lu\\n", (unsigned long)sizeof(pq_index_t));
+    printf("value_next %d\\n", (int)pq_next(2));
+    printf("value_mark %d\\n", pq_mark(&pq_point_global, 1));
     printf("value_red %d\\n", PQ_RED);
     printf("value_green %d\\n", PQ_GREEN);
     printf("value_blue %d\\n", PQ_BLUE);
@@ -2288,6 +2346,148 @@ def check_type_dies(
                     f"{facts['sizeof_point']} in the program",
                 )
 
+    # A parameter and a return type carry the spelling their declaration wrote.
+    # `CType` erases typedefs, so this is the assertion that the alias survived
+    # the trip from the front end to the writer: without it both DIEs are
+    # structurally correct and still print `long unsigned int`.
+    index_size = facts.get("sizeof_index")
+    mark = die_by_tag_name(unit, DW_TAG_SUBPROGRAM, "pq_mark")
+    if mark is None:
+        report.fail(
+            "types",
+            f"{label}: no DW_TAG_subprogram for pq_mark, so no parameter spelling can be read",
+        )
+    else:
+        described = {child.name(): child for child in children(unit, mark)
+                     if child.tag == DW_TAG_FORMAL_PARAMETER}
+        point = described.get("point")
+        index = described.get("index")
+        if point is None or index is None:
+            report.fail(
+                "types",
+                f"{label}: pq_mark's parameters are {sorted(described)}, not {{'index', 'point'}}",
+            )
+        else:
+            pointer = resolved_type(point, unit)
+            if pointer is None or pointer.tag != DW_TAG_POINTER_TYPE:
+                report.fail(
+                    "types",
+                    f"{label}: pq_mark's `point` is not a pointer DIE, so `pq_point_t *` "
+                    "was collapsed",
+                )
+            else:
+                alias = type_of(pointer, unit)
+                if alias is None or alias.tag != DW_TAG_TYPEDEF or alias.name() != "pq_point_t":
+                    report.fail(
+                        "types",
+                        f"{label}: pq_mark's `point` points at "
+                        f"{alias.name() if alias is not None else None!r}, not at the "
+                        "pq_point_t typedef",
+                    )
+                elif (target := type_of(alias, unit)) is None or target.tag != DW_TAG_STRUCTURE_TYPE:
+                    report.fail(
+                        "types", f"{label}: pq_point_t is not a typedef over the pq_point structure"
+                    )
+            alias = resolved_type(index, unit)
+            if alias is None or alias.tag != DW_TAG_TYPEDEF or alias.name() != "pq_index_t":
+                report.fail(
+                    "types",
+                    f"{label}: pq_mark's `index` is typed "
+                    f"{alias.name() if alias is not None else None!r}, not the pq_index_t typedef",
+                )
+            elif index_size is not None and type_size(alias, unit) != index_size:
+                report.fail(
+                    "types",
+                    f"{label}: pq_index_t is {type_size(alias, unit)} bytes in DWARF and "
+                    f"{index_size} in the program",
+                )
+    next_fn = die_by_tag_name(unit, DW_TAG_SUBPROGRAM, "pq_next")
+    if next_fn is None:
+        report.fail("types", f"{label}: no DW_TAG_subprogram for pq_next")
+    else:
+        returned = type_of(next_fn, unit)
+        if returned is None or returned.tag != DW_TAG_TYPEDEF or returned.name() != "pq_index_t":
+            report.fail(
+                "types",
+                f"{label}: pq_next returns "
+                f"{returned.name() if returned is not None else None!r}, not the pq_index_t typedef",
+            )
+
+    # An alias can name a pointer itself, and an array can be declared through
+    # one: `typedef int (*pq_fn_t)(int); pq_fn_t h;` and `pq_point_t a[2]` must
+    # keep the alias at the right depth, which is where a naive "peel every
+    # layer, then match" walk puts it at the wrong one.
+    handler = object_type("pq_typedef_handler")
+    if handler is not None:
+        if handler.tag != DW_TAG_TYPEDEF or handler.name() != "pq_fn_t":
+            report.fail(
+                "types",
+                f"{label}: pq_typedef_handler is typed {handler.name()!r} "
+                f"(tag {handler.tag:#04x}), so the alias that names a pointer was lost",
+            )
+        else:
+            pointed = type_of(handler, unit)
+            if pointed is None or pointed.tag != DW_TAG_POINTER_TYPE:
+                report.fail(
+                    "types",
+                    f"{label}: pq_fn_t is not a typedef over a pointer type",
+                )
+            elif (signature := type_of(pointed, unit)) is None \
+                    or signature.tag != DW_TAG_SUBROUTINE_TYPE:
+                report.fail(
+                    "types",
+                    f"{label}: pq_fn_t's pointer does not name a subroutine type",
+                )
+    pair = object_type("pq_point_pair")
+    if pair is not None:
+        if pair.tag != DW_TAG_ARRAY_TYPE:
+            report.fail(
+                "types",
+                f"{label}: pq_point_pair is typed {pair.name()!r} (tag {pair.tag:#04x}), "
+                "not an array",
+            )
+        else:
+            element = type_of(pair, unit)
+            if element is None or element.tag != DW_TAG_TYPEDEF \
+                    or element.name() != "pq_point_t":
+                report.fail(
+                    "types",
+                    f"{label}: pq_point_pair's element is "
+                    f"{element.name() if element is not None else None!r}, not the "
+                    "pq_point_t typedef",
+                )
+            elif type_size(element, unit) != facts["sizeof_point"]:
+                report.fail(
+                    "types",
+                    f"{label}: pq_point_pair's element is {type_size(element, unit)} bytes "
+                    f"in DWARF and {facts['sizeof_point']} in the program",
+                )
+
+    holder = object_type("pq_holder_global")
+    if holder is not None:
+        if holder.tag != DW_TAG_STRUCTURE_TYPE or holder.name() != "pq_holder":
+            report.fail(
+                "types",
+                f"{label}: pq_holder_global is typed {holder.name()!r} "
+                f"(tag {holder.tag:#04x}), not the pq_holder structure",
+            )
+        else:
+            members = {member.name(): member for member in children(unit, holder)
+                       if member.tag == DW_TAG_MEMBER}
+            for name, alias in (("count", "pq_index_t"), ("point", "pq_point_t")):
+                member = members.get(name)
+                if member is None:
+                    report.fail("types", f"{label}: pq_holder has no member DIE for {name}")
+                    continue
+                typed = type_of(member, unit)
+                if typed is None or typed.tag != DW_TAG_TYPEDEF or typed.name() != alias:
+                    report.fail(
+                        "types",
+                        f"{label}: pq_holder.{name} is typed "
+                        f"{typed.name() if typed is not None else None!r}, not the {alias} "
+                        "typedef the member declaration wrote",
+                    )
+
     matrix = object_type("pq_matrix")
     chain = peel_types(matrix, unit) if matrix is not None else []
     # A multi-dimensional array has two encodings in the wild and both are
@@ -3129,11 +3329,28 @@ def self_test() -> int:
     expect(resolved_value == 8, f"self-test relocation produced {resolved_value}")
 
     # The source scanner the attribution check rests on.
-    spans = function_spans("int a(void) {\n    return 1;\n}\nstatic int b(void) {\n    return 2;\n}\n")
+    def span_names(source: str) -> list[tuple[str, int, int]]:
+        return [(span.name, span.first_line, span.last_line) for span in function_spans(source)]
+
+    basic = span_names("int a(void) {\n    return 1;\n}\nstatic int b(void) {\n    return 2;\n}\n")
+    expect(basic == [("a", 1, 3), ("b", 4, 6)], f"self-test spans {basic}")
+    # Attributes before and after the return type are not part of the name, and
+    # an indented line is never a definition; a prototype is not one either.
     expect(
-        [(span.name, span.first_line, span.last_line) for span in spans]
-        == [("a", 1, 3), ("b", 4, 6)],
-        f"self-test spans {[(span.name, span.first_line, span.last_line) for span in spans]}",
+        span_names(
+            "__attribute__((noinline)) int a(void) {\n"
+            "    return 1;\n"
+            "}\n"
+            "int __attribute__((noinline)) b(void) {\n"
+            "    if (1) {\n"
+            "        return 2;\n"
+            "    }\n"
+            "    return 3;\n"
+            "}\n"
+            "int c(void);\n"
+        )
+        == [("a", 1, 3), ("b", 4, 9)],
+        "self-test spans with attributes",
     )
 
     if failures:

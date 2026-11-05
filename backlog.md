@@ -2993,11 +2993,12 @@ cannot rot: a gap that stops reproducing is reported and its entry must be
 deleted in the same commit that closes the item.
 
 **Landed** (D1 file-scope objects and parameters, D2 types, D3 object locations,
-D4 data-only units, plus the declaration policy and the DWARF 4 bit-field
-encoding). The census over the same 49 programs, `-O0 -g -gdwarf-5`, lccc /
+D4 data-only units, D13 written typedef spellings on every use site, plus the
+declaration policy and the DWARF 4 bit-field encoding). The census over the same 49 programs, `-O0 -g -gdwarf-5`, lccc /
 GCC 16.2, is now: `variable` 68/695 (GCC describes locals too — D14),
-`formal_parameter` 422/485, `base_type` 150/480, `pointer_type` 63/122,
-`typedef` 2/103 (D13), `const_type` 30/98, `subrange_type` 48/78, `array_type`
+`formal_parameter` 422/485, `base_type` 147/480, `pointer_type` 67/122,
+`typedef` 61/103 (the rest are aliases only *locals* name — D14),
+`enumerator` 0/26 (idem: the corpus's enums are named only by locals), `const_type` 30/98, `subrange_type` 48/78, `array_type`
 48/74, `member` 54/63, `lexical_block` 0/207 (D14), `structure_type` 12/14,
 `subprogram` 283/338, `unspecified_type` 54/0. The debug payload on
 `fib.c -g -gdwarf-5 -O0` fell from 1 705 to 718 bytes (GCC 1 021, Clang 759) while
@@ -3030,7 +3031,7 @@ per-unit `.debug_aranges` sets, post-peephole synthesized CFI, dialect identity.
 | D10 | P2 | S | `-fdebug-prefix-map`/`-ffile-prefix-map` on `DW_AT_name`/`comp_dir`/`decl_file` | two builds in different directories are byte-identical |
 | D11 | P3 | L | `-gsplit-dwarf`: skeleton unit + `.dwo` | skeleton names the `.dwo`; the tree resolves `pq_global` |
 | D12 | P3 | M | `.debug_names` for DWARF 5 | every subprogram/variable indexed once; lookup equals a full walk |
-| D13 | P2 | S | a `DW_TAG_typedef` for every typedef the unit declares (GCC 103, lccc 2) | a typedef-only probe produces its DIE |
+| D13 | **landed** | — | the spelling a declaration wrote: a typedef keeps its name on objects, parameters, pointer layers, return types and record members (`intern_written`); the "one DIE per declared typedef" framing was measured false — GCC emits a typedef DIE only where something names it | a pointer to a typedef, a typedef parameter and a typedef return type all resolve through `DW_TAG_typedef`, and the type's size equals the program's `sizeof` |
 | D14 | P1 | L | local variables and `DW_TAG_lexical_block` (GCC 695 variables, 207 blocks; lccc 68, 0) | every executable local's value equals what the program prints |
 | D15 | P2 | S | an unreferenced declaration costs nothing (`with_referenced` prunes the DIE *and* the types only it reached) | **landed with its gate** |
 

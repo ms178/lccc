@@ -2487,19 +2487,19 @@ impl Driver {
     ///   `DW_AT_declaration` because this object has no address to point at.
     /// * **The spelling a consumer prints.**  `typedef unsigned int myuint;` is
     ///   erased by the time a `CType` exists, so the alias is taken from the
-    ///   declaration's own type specifier -- and only when the typedef still
-    ///   resolves to the declared type, so a later `typedef` of the same name
-    ///   cannot leave the DIE describing a different type.
+    ///   declaration's own type specifier, for objects, parameters and return
+    ///   types alike.  `TypeGraph::intern_written` applies it, and it keeps the
+    ///   alias only when the typedef still resolves to what the declaration
+    ///   named, so a later `typedef` of the same name cannot leave the DIE
+    ///   describing a different type.
     fn build_dwarf_unit(
         objects: &[crate::frontend::sema::analysis::FileScopeObject],
         types: &crate::frontend::sema::type_context::TypeContext,
         sources: Option<&SourceManager>,
-        returns: &crate::common::fx_hash::FxHashMap<String, crate::common::types::CType>,
-        parameters: &crate::common::fx_hash::FxHashMap<
+        functions: &crate::common::fx_hash::FxHashMap<
             String,
-            Vec<(crate::common::types::CType, Option<String>)>,
+            crate::frontend::sema::analysis::FunctionInfo,
         >,
-        variadic: &crate::common::fx_hash::FxHashMap<String, bool>,
     ) -> crate::backend::elf::DwarfUnitSpec {
         use crate::backend::elf::DwarfUnitSpec;
 
@@ -2535,15 +2535,7 @@ impl Driver {
         let mut variables = Vec::with_capacity(order.len());
         for name in order {
             let object = chosen[name];
-            let mut ty = graph.intern_ctype(&object.ty);
-            if let Some(alias) = &object.typedef_name
-                && types
-                    .typedefs
-                    .get(alias)
-                    .is_some_and(|named| *named == object.ty)
-            {
-                ty = graph.intern_typedef(alias, ty);
-            }
+            let ty = graph.intern_written(&object.ty, object.typedef_name.as_deref());
             // The declaration's file and line are exact.  Its *column* is not:
             // the analyser keeps the span of the whole declaration (`int x;`
             // starts at the `int`), while `DW_AT_decl_column` names the
@@ -2570,17 +2562,11 @@ impl Driver {
             });
         }
 
-        // The return type of every function this unit defines, so the subprogram
-        // DIE states a real type instead of "unspecified" and `ptype f` answers.
-        // A `void` return is *no* type in DWARF, which is why it is skipped here
-        // and the subprogram then carries none.
+        // One pass over the unit's functions describes all of them.  A `void`
+        // return is *no* type in DWARF, so it is skipped and the subprogram then
+        // carries none; a nested function's record is keyed by its mangled name
+        // and has no symbol of its own in the object, so it is not described.
         let mut return_types = crate::common::fx_hash::FxHashMap::default();
-        for (name, ty) in returns {
-            if matches!(ty, crate::common::types::CType::Void) {
-                continue;
-            }
-            return_types.insert(name.clone(), graph.intern_ctype(ty));
-        }
 
         // A parameter's type is what a debugger prints for it, and an unnamed
         // parameter is a prototype's -- the attribute is simply absent, which is
@@ -2588,26 +2574,38 @@ impl Driver {
         // a parameter at all: `params` is empty for it, and a stray entry would
         // describe a value nobody can pass.
         let mut function_parameters = crate::common::fx_hash::FxHashMap::default();
-        for (name, list) in parameters {
-            let mut described = Vec::with_capacity(list.len());
-            for (ty, parameter_name) in list {
+        for (name, info) in functions {
+            if name.contains('.') || !info.is_defined {
+                continue;
+            }
+            if !matches!(info.return_type, crate::common::types::CType::Void) {
+                return_types.insert(
+                    name.clone(),
+                    graph.intern_written(&info.return_type, info.return_typedef.as_deref()),
+                );
+            }
+            let mut described = Vec::with_capacity(info.params.len());
+            for (index, (ty, parameter_name)) in info.params.iter().enumerate() {
                 if matches!(ty, crate::common::types::CType::Void) {
                     continue;
                 }
+                // `param_typedefs` is parallel to `params`; reading it by index
+                // rather than zipping keeps a short list from silently dropping
+                // the parameters past its end.
+                let alias = info.param_typedefs.get(index).cloned().flatten();
                 described.push(crate::backend::elf::DwarfParameter {
                     name: parameter_name.clone(),
-                    ty: graph.intern_ctype(ty),
+                    ty: graph.intern_written(ty, alias.as_deref()),
                 });
             }
-            let is_variadic = variadic.get(name).copied().unwrap_or(false);
-            if described.is_empty() && !is_variadic {
+            if described.is_empty() && !info.variadic {
                 continue;
             }
             function_parameters.insert(
                 name.clone(),
                 crate::backend::elf::DwarfFunctionParameters {
                     parameters: described,
-                    variadic: is_variadic,
+                    variadic: info.variadic,
                 },
             );
         }
@@ -2902,44 +2900,12 @@ impl Driver {
         // it, and the source manager is shared rather than taken, so lowering
         // keeps its `file:line:col` diagnostics.
         let debug_unit = if self.debug_info {
-            let returns: crate::common::fx_hash::FxHashMap<String, crate::common::types::CType> =
-                sema_result
-                    .functions
-                    .iter()
-                    .filter(|(name, info)| {
-                        // A nested function's record is keyed by a mangled name and has
-                        // no symbol of its own in the object.
-                        !name.contains('.') && info.is_defined
-                    })
-                    .map(|(name, info)| (name.clone(), info.return_type.clone()))
-                    .collect();
-            // The parameter list of every function this unit defines.  Taken from
-            // the definition (not `prototype`), so a K&R definition describes the
-            // parameters its body can actually read, which is the list the ABI
-            // used to lay out the frame.
-            let parameters: crate::common::fx_hash::FxHashMap<
-                String,
-                Vec<(crate::common::types::CType, Option<String>)>,
-            > = sema_result
-                .functions
-                .iter()
-                .filter(|(name, info)| !name.contains('.') && info.is_defined)
-                .map(|(name, info)| (name.clone(), info.params.clone()))
-                .collect();
-            let variadic: crate::common::fx_hash::FxHashMap<String, bool> = sema_result
-                .functions
-                .iter()
-                .filter(|(name, info)| !name.contains('.') && info.is_defined)
-                .map(|(name, info)| (name.clone(), info.variadic))
-                .collect();
             let sources = diagnostics.share_source_manager();
             Some(Self::build_dwarf_unit(
                 &sema_result.file_scope_objects,
                 &sema_result.type_context,
                 sources.as_deref(),
-                &returns,
-                &parameters,
-                &variadic,
+                &sema_result.functions,
             ))
         } else {
             None
