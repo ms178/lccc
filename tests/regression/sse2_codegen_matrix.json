@@ -2507,6 +2507,14 @@
    ]
   }
  },
+ "provenance": {
+  "note": "Measured with Clang 23.1.4. Re-derive against the live 23.1.5 pin with --update-baseline on a host carrying that oracle. The enforced lccc instruction-count ratchet is host-independent.",
+  "recorded_with": {
+   "clang": "clang version 23.1.4 (https://github.com/llvm/llvm-project 0d261d1ca552c95a8f007e061c787ac7132fbcbc)",
+   "gcc": "gcc-16 (GCC) 16.2.0",
+   "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+  }
+ },
  "toolchains": {
   "clang": "clang version 23.1.4 (https://github.com/llvm/llvm-project 0d261d1ca552c95a8f007e061c787ac7132fbcbc)",
   "gcc": "gcc-16 (GCC) 16.2.0",

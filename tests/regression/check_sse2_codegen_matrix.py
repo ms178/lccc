@@ -920,6 +920,12 @@ def print_report(result, rows, configs, names):
 def build_baseline(result, rows, configs, names):
     base = {"toolchains": result["toolchains"], "configs": configs, "verdicts": {},
             "debt": {}, "mnemonics": {}, "counts": {}}
+    # A regenerated baseline must state which oracles produced it: otherwise a
+    # version bump silently re-labels a 23.1.4 measurement as current. The
+    # enforced count ratchet is host-independent, but the verdict/debt columns
+    # are comparisons against whatever oracle was installed, so provenance is
+    # part of the data, not a comment that --update-baseline can drop.
+    base["provenance"] = {"recorded_with": dict(result["toolchains"])}
     for r in rows:
         e = result["rows"][r.mnemonic]
         for cfg in configs:
