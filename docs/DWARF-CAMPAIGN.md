@@ -212,6 +212,7 @@ Three columns still differ from GCC, and each is a *different* item:
 | *Closed:* no `DW_AT_location` anywhere | every file-scope object this object file defines now carries a 9-byte `DW_OP_addr` whose address equals the address the program prints for it (gated); a parameter carries **no** location yet — D1b |
 | *Closed:* typedef spellings lost on parameters and returns | `pair_t *p`, `size_t n` and `size_t f(void)` now point at a `DW_TAG_typedef`, not at the record or the base type, so `ptype p` prints what the source wrote; GCC 16.2 measured to do exactly the same. Costs 2.77 % of the debug payload over the corpus (86 objects, 100 491 → 103 271 bytes, ~50 bytes per alias) — the price of 59 names a debugger can now resolve |
 | *Closed:* an empty unit carried one unattached base type | the writer interns an array's subrange index type itself, so the copy interned up front by `build_dwarf_unit` was never referenced by any DIE — and for `extern int ext(int);` it was the *only* content of the type table, which made a declaration-only unit emit a `.debug_info` holding one `long unsigned int` where GCC 16.2 emits none. Removing it restores the repository's contract (`check_debug_info_flags.sh`, pin 3) and drops one base type from every unit that interned one: 147 over the census, from 150 |
+| *Deliberate:* a TU that is only `typedef`s emits no unit | `typedef int T; typedef struct S S_t;` makes GCC 16.2 write `.debug_info` whose only content is a `DW_TAG_compile_unit` and one attached-to-nothing `int` base type -- nothing a consumer can use -- where lccc writes only the line tables. The repository's contract (`check_debug_info_flags.sh`, pin 3: "silence is only honest where there is nothing to describe") pins the smaller answer; the file name still reaches a debugger through `.debug_line`'s table. This is also why GCC's `base_type` census is larger than ours by more than the types we describe |
 | *Closed:* a TU that is only data emits no debug info | `int pq_only_data = 42;` now gets a unit, `DW_AT_stmt_list`, a header-only line program (file table, no statements) and a `variable` DIE, byte-shape for byte-shape what GCC 16.2 writes |
 | No `DW_TAG_inlined_subroutine` | at `-O2`, the row inside `main` that came from the inlined `pq_frame` claims `pq_frame`'s line, and a consumer cannot recover the inline stack |
 | One line sequence for the whole unit | **matches GCC, re-measured**: five functions, `readelf --debug-dump=rawline \| grep -c 'Line Number Statements'` gives 1 for lccc *and* GCC 16.2 under `-g`, `-O0`, `-O2`, `-g3` and `-ffunction-sections` at every dialect; `-ffunction-sections` puts five sequences in that one program on both. Withdrawn as a gap — see D5 |
@@ -233,6 +234,7 @@ fails if it regresses. Sizes are `.debug_info` + `.debug_abbrev` + `.debug_str` 
 | File-scope objects, defined and declared | `DW_AT_location` present exactly when `.symtab` defines the object, and equal to the symbol's address (gated); a removed static keeps its DIE and loses the location, which is GCC 16.2's rule and also what stops a `DW_AT_location` relocation against a dropped symbol from breaking the link |
 | Declarations only for referenced names | measured `extern int q_used` / `extern int q_missing`: GCC describes the first and not the second, and lccc now does the same; the `_IO_FILE` structure and its thirty members left the payload with it |
 | Function parameters | a `DW_TAG_formal_parameter` child per parameter of every defined function, with `DW_AT_name` and a `DW_AT_type` that resolves; `DW_TAG_unspecified_parameters` on a variadic definition |
+| Debug information changes nothing at run time | with and without `-g -gdwarf-5`, every one of the 86 compilable benchmark objects has byte-identical `.text*` at `-O2`, and the gate re-asserts that identity in every configuration it builds (`code_unchanged`), so a change that leaks from DWARF into code selection fails the gate |
 | The spelling a declaration wrote | a typedef keeps its name as a `DW_TAG_typedef` for objects, parameters, pointer layers above the alias, return types and record members; `ptype` prints `pair_t *` and `size_t n`, not `struct pair *` and `long unsigned int n`. Gated on all five shapes and against GCC 16.2 as the subject |
 | A data-only translation unit | a unit with `DW_AT_stmt_list` and no `DW_AT_low_pc`, a line program whose header carries the file table, and one `variable` DIE per object |
 | Bit-field layout in every dialect | `DW_AT_data_bit_offset` at version 5, `DW_AT_bit_offset` + `DW_AT_data_member_location` at 2–4 — GCC 16.2's own split, measured |
@@ -525,6 +527,14 @@ is captured where the declaration is still in hand, by one rule
   `StructFieldLayout` so it survives the layout the writer reads, from all four
   places that build a field (sema layout, const evaluation, type checking, IR
   lowering) rather than from whichever one happens to be on the path today.
+
+**What is collapsed.** `typedef struct S T; typedef T U; U x;` describes `x`
+through `U` straight to `struct S`; GCC nests `U -> T -> struct S`. `ptype x`
+prints `U` either way, and reaching `T` needs a declaration that spells `T`, at
+which point `T` gets its own DIE. Chasing the chain would mean keeping the
+*specifier* of every typedef rather than its resolved `CType`, which is a change
+to the type context for no observable gain in the common case; recorded here so
+the difference is a decision, not an oversight.
 
 **Why the alias is conditional.** One unit may write `typedef int myint;` and
 later `typedef double myint;`. The table holds the last one, so an `int` object

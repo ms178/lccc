@@ -1024,7 +1024,12 @@ pub fn strictest_alignment(sources: impl IntoIterator<Item = Option<usize>>) -> 
     sources.into_iter().flatten().max()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Deliberately not `PartialEq`/`Hash`: a field's *spelling* (`size_t n` versus
+/// `unsigned long n`) is not part of its identity -- C compatibility, layout and
+/// code generation all treat the two as one member -- so comparing two fields
+/// whole would answer a question nobody should ask.  The layout a field
+/// produces is the artifact that gets compared.
+#[derive(Debug, Clone)]
 pub struct StructField {
     pub name: String,
     pub ty: CType,

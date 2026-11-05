@@ -2904,6 +2904,52 @@ def check_data_only_unit(report: Report, path: Path, label: str) -> None:
     }
 
 
+def code_sections(elf: Elf) -> bytes:
+    """Every instruction byte of an object: `.text` and its per-function pieces."""
+    return b"".join(
+        blob for name, blob in sorted(elf.sections.items())
+        if name == ".text" or name.startswith(".text.")
+    )
+
+
+def check_code_unchanged(
+    report: Report,
+    lccc: list[str],
+    flags: list[str],
+    probe: Path,
+    label: str,
+    workdir: Path,
+) -> None:
+    """`-g` must describe the program, not change it.
+
+    The strongest statement this gate can make about cost is that the debug
+    information is *free at run time*: the same translation unit compiled with
+    and without the debug flags must contain the same instruction bytes.  A
+    change that leaked into code selection would show up here as a difference,
+    and the assertion costs two small compiles per configuration.
+    """
+    plain = [flag for flag in flags if not flag.startswith("-g")]
+    built = {}
+    for suffix, twin_flags in (("debug", flags), ("plain", plain)):
+        output = workdir / f"{label}-{suffix}.o"
+        if not build(report, lccc, twin_flags, [probe], output, workdir, link=False):
+            return
+        try:
+            built[suffix] = code_sections(read_elf(output))
+        except ValueError as error:
+            report.fail("code_unchanged", f"{label}: {error}")
+            return
+    if not built["debug"]:
+        report.fail("code_unchanged", f"{label}: the probe produced no instruction bytes to compare")
+        return
+    if built["debug"] != built["plain"]:
+        report.fail(
+            "code_unchanged",
+            f"{label}: {len(built['debug'])} bytes of code with -g against "
+            f"{len(built['plain'])} without — debug information must not change the program",
+        )
+
+
 def unit_length(elf: Elf, unit: Unit) -> int:
     """The `.debug_info` contribution length of `unit`."""
     info = elf.sections.get(".debug_info", b"")
@@ -2922,6 +2968,7 @@ def run_gate(lccc: list[str], gcc: list[str] | None, workdir: Path) -> Report:
         label = f"dwarf{version}-{optimization}"
         output = workdir / f"{label}.elf"
         flags = ["-g", f"-gdwarf-{version}", optimization, "-no-pie"]
+        check_code_unchanged(report, lccc, flags, probes["probe"], label, workdir)
         if not build(report, lccc, flags, [probes["probe"]], output, workdir):
             continue
         try:
