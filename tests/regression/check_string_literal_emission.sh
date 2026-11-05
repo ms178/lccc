@@ -147,5 +147,63 @@ assert checked >= 2, 'at least the two primary ABIs must be checked'
 PY
 [ "$?" -eq 0 ] || fail=1
 
+# 5. End-to-end: the fortify_fold printf("...\n") -> puts("...") transform
+#    interns a SECOND, newline-stripped literal through the same emitter.
+#    Compare the RUNNING program's bytes against GCC 16.2 at -O0 (no fold)
+#    and -O2 (fold), so a wrong escape in either the original or the stripped
+#    literal shows up as a runtime difference, not just an object diff.
+cat >"$tmp/fold.c" <<'C'
+#include <stdio.h>
+int main(void) {
+    /* Single-backslash OCTAL escapes: the payload really contains 0x21,
+       0x22, 0x23, 0x5c, 0x60, 0x80, 0xff, 0xfe and a real trailing \n.
+       A doubled backslash here would make this a literal-text string and
+       NEITHER compiler would fold printf -> puts, making the test vacuous. */
+    printf("fold:\041\042\043\134\140\200\377\376tail\n");
+    return 0;
+}
+C
+GCC_BIN=${GCC:-gcc-16}
+if command -v "$GCC_BIN" >/dev/null 2>&1; then
+    fold_fail=0
+    for opt in -O0 -O2; do
+        for cc_tag in lccc gcc; do
+            cc="$CCC"; [ "$cc_tag" = gcc ] && cc="$GCC_BIN"
+            exe="$tmp/fold-$cc_tag$opt"
+            if ! "$cc" -w "$opt" "$tmp/fold.c" -o "$exe" 2>"$tmp/fold-$cc_tag$opt.err"; then
+                echo "FAIL: fold compile ($cc_tag $opt): $(head -2 "$tmp/fold-$cc_tag$opt.err")"
+                fold_fail=1
+                continue
+            fi
+            "$exe" >"$tmp/fold-$cc_tag$opt.out" || { echo "FAIL: fold run ($cc_tag $opt)"; fold_fail=1; }
+        done
+        if ! cmp -s "$tmp/fold-lccc$opt.out" "$tmp/fold-gcc$opt.out"; then
+            echo "FAIL: fold runtime bytes differ at $opt"
+            fold_fail=1
+        else
+            echo "PASS: printf/puts fold runtime bytes equal GCC 16.2 ($opt, $(wc -c <"$tmp/fold-lccc$opt.out") B)"
+        fi
+    done
+    # NON-VACUITY: at -O2 BOTH compilers must really fold printf -> puts.
+    # Without this assert a future change to the C fixture (or a fold that
+    # stops firing) would silently reduce this to a plain-emitter test.
+    if "$CCC" -w -O2 -S "$tmp/fold.c" -o "$tmp/fold-lccc.s" &&
+       "$GCC_BIN" -w -O2 -S "$tmp/fold.c" -o "$tmp/fold-gcc.s"; then
+        for s in "$tmp/fold-lccc.s" "$tmp/fold-gcc.s"; do
+            if ! grep -q 'puts' "$s"; then
+                echo "FAIL: printf -> puts fold did not fire in $(basename "$s")"
+                fold_fail=1
+            fi
+        done
+        [ "$fold_fail" -eq 0 ] && echo "PASS: printf -> puts fold fires on both compilers (-O2)"
+    else
+        echo "FAIL: fold -S emission failed"
+        fold_fail=1
+    fi
+    [ "$fold_fail" -eq 0 ] || fail=1
+else
+    echo "SKIP: GCC 16.2 oracle ($GCC_BIN) not on PATH; fold runtime not compared"
+fi
+
 [ "$fail" -eq 0 ] || exit 1
 echo "PASS: check_string_literal_emission"

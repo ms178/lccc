@@ -1134,3 +1134,94 @@ redirects to blocked hosts and the Intel PPA is unreachable from this sandbox.
 GCC 16.2.0 (pinned toolchain) is the oracle; `/usr/bin/gcc` 12.2.0 is never
 used. The generated-code host-runtime gap in §9.9 is unchanged and is NOT
 claimed fixed, and no "beats GCC/Clang/ICX" claim is made.
+
+### 9.12 Red-team findings recorded during this campaign (measured, NOT claimed fixed)
+
+Two PRE-EXISTING problems were found by the new three-way host benchmark and
+by the full five-level i686 campaign. Neither is a regression of this patch:
+the `pr46534.c` object sizes were `20,001,376 B` at `-O0` and `40,001,352 B`
+at `-O1+` BEFORE and AFTER the `.ascii` change, and `limits-fndefn.c` is a
+frontend/i686-backend shape this patch does not touch. Both are left OPEN with
+a reproducing measurement and an exact root cause, for the same reason §9.4
+and §9.9 leave their gaps open: papering over them here would (a) overlap the
+files owned by the two other PRs in flight (#1102 edits
+`src/passes/fortify_fold.rs`, `src/ir/module.rs`, `src/backend/common.rs`,
+`src/backend/generation.rs` and `src/backend/i686/codegen/*`; #1104 edits
+`src/frontend/sema/*` and the four assembler `mod.rs`), (b) change the
+compiler binaries while the complete 34-leg torture campaign is running on a
+SHA-256-pinned binary set, and (c) require a separate parser/IR refactor with
+its own full-corpus evidence. Recording the numbers is the honest boundary.
+
+| finding | measured | root cause | disposition |
+|---|---|---|---|
+| `pr46534.c` `-O1+` emits **40,001,352 B** of object vs GCC 16.2 `20,001,464 B` and Clang 23.1.4 `20,001,280 B`; `-O0` is `20,001,376 B` | Two 20 MB `.ascii` literals at `-O2`: `.Lstr0` (20,000,001 spaces + `\n`) and `.Lchkfold1` (the same text with the newline stripped). `-O0` emits only `.Lstr0` (306 `.ascii` lines, 1 label); `-O1/-O2/-O3/-Os` emit 612 lines and 2 labels. Only `.Lchkfold1` is referenced. | `src/passes/fortify_fold.rs:691` interns a fresh `.LchkfoldN` literal when it rewrites `printf("...\n")` to `puts("...")`; `src/backend/common.rs:3015` (`emit_data_sections`) emits **every** `module.string_literals` entry, and there is no dead-string-literal GC in the IR (`dead_statics` roots static definitions, not interned literal labels). GCC/Clang keep exactly one. | **OPEN.** A correct fix is a conservative IR-level literal GC (roots: `GlobalAddr` operands, global initialisers, aliases, ctors/dtors, top-level and inline asm, debug references) placed after all optimisation passes, or in-place rewriting of a singly-used literal. Not attempted here for the three reasons above. A new non-vacuous gate in `check_string_literal_emission.sh` pins the fold's RUNTIME byte parity with GCC 16.2 at `-O0` and `-O2` and asserts the fold really fires on both compilers, so a future fix cannot silently change the emitted bytes. |
+| `limits-fndefn.c` i686 `-O0` took **1022.18 s** (17 min) and PASSED; GCC 16.2 `-m32 -O0` needs **0.349 s**; x86_64 `-O0` needs 182.19 s and `-O1+` cases are all < 10 s | The case declares `void func1(LIM5(int p) int t)` = 100,000 formal parameters. `CCC_NO_I686_PEEPHOLE=1` and `CCC_TIME_PEEPHOLE=1` both still exceed 100 s with NO `[PEEP]` mark, so the cost is BEFORE the peephole (frontend/sema/stack-layout), not in anything this patch changed. | Only the `-O0` shape materialises all 100k parameters; optimising tiers DCE them before codegen. The i686-specific superlinear term is in parameter/stack-layout handling. | **OPEN.** The campaign gives it `dg-timeout-factor 4.0` -> a 1200 s budget, so it completes (PASS), is inventoried with its exact 1022.18 s, and is NOT a hidden timeout or skip. Fixing it is a separate frontend/i686-backend optimisation program. |
+
+**Measurement discipline for §9.12.** The first three-way benchmark reported an
+identical 161 MiB RSS for all three compilers. That was a MEASUREMENT BUG, not
+a result: `os.wait4().ru_maxrss` is a high-water mark a forked child inherits
+from its parent, and the measuring Python process held the 8 MB generated
+source, so every child reported the PYTHON process's HWM. Re-measured through
+a fresh small-RSS helper process per compile, the 2 MB case is GCC 52,992 KiB
+/ Clang 63,168 KiB / lccc 58,916 KiB and the real 20 MB case is GCC 305,432 /
+Clang 133,008 / lccc 359,568 KiB. The wrong numbers were discarded, not
+averaged away.
+
+### 9.13 Three-way host-CPU comparison (measured, no beat-all claim)
+
+`/home/user/artifacts/bench-20261105/SUMMARY.json` holds the full record.
+Source: a 2,000,000-byte narrow literal built from unambiguous 3-digit OCTAL
+escapes so all 256 byte values occur (embedded NUL, quote, backslash, high
+bytes), scanned at runtime by FNV-1a. `-O2`, 5 compiles and 9 runs per
+compiler, median reported, host = 2-core sandbox with the full GCC-17 campaign
+running concurrently, so absolute times carry contention noise while ratios
+inside the window remain comparable.
+
+| compiler | compile 2 MB (median 5) | peak child RSS | object | runtime (median 9) | FNV-1a |
+|---|---|---|---|---|---|
+| GCC 16.2.0 | 0.144 s | 52,992 KiB | 2,001,776 B | 0.005440 s | `1731a13cbb5d7183` |
+| Clang 23.1.4 | 0.0714 s | 63,168 KiB | 2,001,552 B | 0.005711 s | `1731a13cbb5d7183` |
+| lccc (this patch) | 0.4557 s | 58,916 KiB | 2,001,536 B | 0.005389 s | `1731a13cbb5d7183` |
+
+The 20,000,000-byte `pr46534.c` case compiles in GCC 0.851 s / 305,432 KiB,
+Clang 0.321 s / 133,008 KiB, lccc **3.07 s / 359,568 KiB** (before this patch
+it was 47.34 s / ~3,713 MiB, i.e. a >=15x wall and >=10x memory improvement
+on this exact input). **lccc is still slower than both oracles at compiling
+giant literals**, and the generated-code runtime numbers above are within
+measurement noise of each other, so NO "beats GCC/Clang/ICX" claim is made.
+The correctness and stability proof is: the identical 64-bit FNV-1a checksum
+from all three compilers, 20/20 varied literals compiling with 20 distinct
+objects, and 10 repeated compiles of one input producing ONE object digest
+(deterministic emission).
+
+**Oracle availability, measured 2026-11-05.** Clang 23.1.5 IS published
+(`llvmorg-23.1.5`, 57 assets, `LLVM-23.1.5-Linux-X64.tar.xz` = 2,014,093,084 B),
+but its `browser_download_url` 302-redirects to
+`objects.githubusercontent.com`, which fails here with
+`OpenSSL SSL_connect: SSL_ERROR_SYSCALL`; the sandbox also has only 3.5 GiB
+free. Intel's `apt.repos.intel.com` fails the same way. Local Clang 23.1.5 and
+ICX 2026.2 are therefore NOT available, and no local numeric claim uses them.
+The Clang 23.1.5 oracle provisioning in hosted CI is **PR #1102's work** and
+is deliberately NOT duplicated here; PR #1107's hosted
+"Authenticated Intel ICX 2026.2 integration" job passed, which is hosted
+evidence, not a local measurement.
+
+**Compatibility with the other in-flight PRs.** `git merge-tree --write-tree`
+against #1102 (`a144b30e2c`) and #1104 (`41962d94b4`) both return rc=0 with
+zero conflicts, and `check_ci_lane_plan.py`,
+`check_ci_shard_partition.py`, `check_ci_gate_parity.py` and
+`tests/corpus/test_kernel_workflow_paths.py` all PASS on BOTH merged trees.
+None of this patch's topics (string-literal emission, UTF-8 stepping, i686
+dead-move census, kernel gate policy) duplicates either PR's topic.
+
+**Hosted CI repair (data-driven).** PR #1107's first run had exactly one red
+check, "Frontend and ABI contracts (shard c of 3)" / step
+"Verify toolchain bundle and shard-partition contracts (mock only)":
+`check_ci_lane_plan.py` rejected the two new CI steps because a hand-added
+gate bypasses the balance and review record. Both steps are now registered in
+`.github/ci-lane-plan.json` under `frontend-a` with MEDIAN-OF-3 measured costs
+(0.70 s and 4.44 s), `predicted_gate_seconds` recomputed from the sum
+(360.43 -> 365.57), and the frontend group remains balanced at
+365.57 / 352.29 / 352.27 (3.7% spread vs the 5% tolerance). All seven mock
+gates, the lane-plan self-test (18 rules / 25 fixtures) and CI/local gate
+parity pass locally before the fix was pushed.
