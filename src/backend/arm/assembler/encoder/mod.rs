@@ -1256,6 +1256,7 @@ pub fn encode_instruction(
         "fmsub" => encode_fmadd_fmsub(operands, true),
         "fnmadd" => encode_fnmadd_fnmsub(operands, false),
         "fnmsub" => encode_fnmadd_fnmsub(operands, true),
+        "fcsel" => encode_fcsel(operands),
         "fcmp" => encode_fcmp(operands, raw_operands, false),
         "fcmpe" => encode_fcmp(operands, raw_operands, true),
         "fcvtzs" => {
@@ -2422,6 +2423,30 @@ mod gas247_golden_word_tests {
 
     fn le(bytes: [u8; 4]) -> u32 {
         u32::from_le_bytes(bytes)
+    }
+
+    /// FCSEL in all three scalar widths (the FP-domain Select the code
+    /// generator emits); words cross-checked with GNU as 2.47 and LLVM's
+    /// integrated assembler, which agree.
+    #[test]
+    fn fcsel_encodes_every_scalar_width_and_condition() {
+        for (text, want) in [
+            ("fcsel d0, d1, d2, ne", 0x1e621c20u32),
+            ("fcsel s5, s6, s7, ge", 0x1e27acc5),
+            ("fcsel d18, d16, d17, ne", 0x1e711e12),
+            ("fcsel s31, s0, s30, lt", 0x1e3ebc1f),
+            ("fcsel h1, h2, h3, eq", 0x1ee30c41),
+        ] {
+            assert_eq!(encode1(text), want, "{text}");
+        }
+        for bad in [
+            "fcsel d0, s1, d2, ne",
+            "fcsel d0, d1, d2",
+            "fcsel v0, d1, d2, ne",
+            "fcsel d0, d1, d2, xx",
+        ] {
+            assert!(!encode1_err(bad).is_empty(), "{bad}");
+        }
     }
 
     #[test]

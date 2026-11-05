@@ -294,7 +294,18 @@ pub struct ArmCodegen {
     /// Exact AAPCS64 fixed-register conditional-increment leaf: no stack frame,
     /// no callee saves, parameters stay in x0..x7, result stays in x0.
     pub(super) conditional_increment_leaf: bool,
-    pub(super) conditional_increment_leaf_condition_32: bool,
+    /// Byte width of the fixed leaf plan's condition (see
+    /// `conditional_increment_leaf_plan`): a parameter condition stays in
+    /// its ABI register, so its test must read exactly that many bytes.
+    pub(super) conditional_increment_leaf_condition_bytes: usize,
+    /// Call-free leaf with nothing to keep in memory: no frame record, no
+    /// callee saves, x30 holds the return address up to the `ret` and the
+    /// CFA stays `sp + 0` (see `frameless_leaf_ok`).
+    pub(super) frameless_leaf: bool,
+    /// Index of the parameter that arrives in x0 and is captured only by
+    /// its own ParamRef, while that ParamRef has not been emitted yet (see
+    /// `emit_param_ref_impl`).
+    pub(super) x0_param_pending: Option<usize>,
 }
 
 impl ArmCodegen {
@@ -332,7 +343,9 @@ impl ArmCodegen {
             frame_base_offset: None,
             general_regs_only: false,
             conditional_increment_leaf: false,
-            conditional_increment_leaf_condition_32: false,
+            conditional_increment_leaf_condition_bytes: 8,
+            frameless_leaf: false,
+            x0_param_pending: None,
         }
     }
 
@@ -370,6 +383,26 @@ impl ArmCodegen {
         match op {
             Operand::Value(v) => self.reg_assignments.get(&v.0).copied(),
             _ => None,
+        }
+    }
+
+    /// Whether a nonzero test of `cond` must read only the W view: its value
+    /// is 32 bits wide or narrower. AAPCS64 leaves the bits of x[n] above an
+    /// argument's or a result's width unspecified (C.16 and the result
+    /// rules) -- `int f(int a, int b, long k) { return g(a, b, k); }` is a
+    /// bare `b g` from GCC and Clang, so g's third argument carries k's upper
+    /// half, and an `int` result may return one -- so the X view of such a
+    /// value is not its value. Narrower values are canonical in their W view
+    /// (the parameter, cast and load producers extend them), so `cbnz wN` /
+    /// `cmp wN, #0` is exact and costs what the X form did. A constant is
+    /// materialized exactly, and a value of unknown type keeps the X test.
+    pub(super) fn cond_is_w_view(&self, cond: &Operand) -> bool {
+        match cond {
+            Operand::Value(v) => self
+                .value_types
+                .get(&v.0)
+                .is_some_and(|ty| ty.is_integer() && ty.size() <= 4),
+            Operand::Const(_) => false,
         }
     }
 
@@ -2596,7 +2629,7 @@ impl ArmCodegen {
         func: &IrFunction,
         param_classes: &[ParamClass],
     ) {
-        let frame_size = self.current_frame_size;
+        let frame_size = self.incoming_stack_base();
         for (i, _) in func.params.iter().enumerate() {
             let class = param_classes[i];
             if !class.is_stack() {
@@ -2697,11 +2730,20 @@ impl ArchCodegen for ArmCodegen {
         // alloca) or the x19 frame base are unaffected by a push, exactly as
         // the x86 RBP-frame case is.
         self.state.emit("    str x0, [sp, #-16]!");
+        // Without a frame record the CFA is sp-relative, so the push moves
+        // it; with one it is x29-relative and the push is invisible to the
+        // unwinder.
+        if self.frameless_leaf && self.state.emit_cfi {
+            self.state.emit("    .cfi_adjust_cfa_offset 16");
+        }
         16
     }
 
     fn emit_acc_restore(&mut self) {
         self.state.emit("    ldr x0, [sp], #16");
+        if self.frameless_leaf && self.state.emit_cfi {
+            self.state.emit("    .cfi_adjust_cfa_offset -16");
+        }
     }
 
     fn fp_contract(&self) -> crate::common::fp_contract::FpContract {
@@ -2795,23 +2837,33 @@ impl ArchCodegen for ArmCodegen {
     fn supports_fused_bit_test_cmp(&self) -> bool {
         std::env::var_os("CCC_NO_BT_FLAG_FUSION").is_none()
     }
-    /// A condition already in its GP home is tested in place: `cbnz xN`
-    /// reads exactly the 64 bits `mov x0, xN; cbnz x0` read, one move less.
+    /// A condition already in its GP home is tested in place, one move less
+    /// than `mov x0, xN; cbnz x0`. A 32-bit-or-narrower condition is tested
+    /// through its W view (`cond_is_w_view`): an `int` result or argument
+    /// may carry an unspecified upper half.
     fn emit_cond_branch_blocks(
         &mut self,
         cond: &Operand,
         true_block: BlockId,
         false_block: BlockId,
     ) {
+        let w_view = self.cond_is_w_view(cond);
         if let Some(reg) = self.operand_reg(cond).filter(|r| !is_arm_fp_phys(*r)) {
-            self.state.emit_fmt(format_args!(
-                "    cbnz {}, {}",
-                callee_saved_name(reg),
-                true_block.as_label()
-            ));
+            let name = if w_view {
+                callee_saved_name_32(reg)
+            } else {
+                callee_saved_name(reg)
+            };
+            self.state
+                .emit_fmt(format_args!("    cbnz {}, {}", name, true_block.as_label()));
         } else {
             self.emit_load_operand(cond);
-            self.emit_branch_nonzero(&true_block.as_label());
+            if w_view {
+                self.state
+                    .emit_fmt(format_args!("    cbnz w0, {}", true_block.as_label()));
+            } else {
+                self.emit_branch_nonzero(&true_block.as_label());
+            }
         }
         self.emit_branch_to_block(false_block);
     }
@@ -4106,5 +4158,69 @@ mod integer_compare_register_class_tests {
             IrType::I64,
         );
         assert_eq!(cg.state.out.buf.trim(), "cmp x19, #0");
+    }
+}
+
+#[cfg(test)]
+mod condition_width_tests {
+    use super::*;
+    use crate::ir::reexports::BlockId;
+
+    fn cg_with(ty: IrType, home: PhysReg) -> ArmCodegen {
+        let mut cg = ArmCodegen::new();
+        cg.reg_assignments.insert(5, home);
+        cg.value_types.insert(5, ty);
+        cg
+    }
+
+    /// AAPCS64 leaves the bits above a 32-bit argument or result
+    /// unspecified, so a branch on an `int` (or narrower, canonical) value
+    /// tests the W view; a 64-bit value keeps the X view.
+    #[test]
+    fn branch_on_a_narrow_condition_reads_the_w_view() {
+        for (ty, want) in [
+            (IrType::I32, "cbnz w19, .LBB1"),
+            (IrType::U32, "cbnz w19, .LBB1"),
+            (IrType::U8, "cbnz w19, .LBB1"),
+            (IrType::I16, "cbnz w19, .LBB1"),
+            (IrType::I64, "cbnz x19, .LBB1"),
+            (IrType::Ptr, "cbnz x19, .LBB1"),
+        ] {
+            let mut cg = cg_with(ty, PhysReg(19));
+            cg.emit_cond_branch_blocks(&Operand::Value(Value(5)), BlockId(1), BlockId(2));
+            assert!(
+                cg.state.out.buf.contains(want),
+                "{ty:?}: {}",
+                cg.state.out.buf
+            );
+        }
+    }
+
+    /// The select's zero test reads exactly the condition's width.
+    #[test]
+    fn select_zero_test_reads_the_condition_width() {
+        for (ty, want) in [
+            (IrType::I32, "cmp w19, #0"),
+            (IrType::U8, "cmp w19, #0"),
+            (IrType::U64, "cmp x19, #0"),
+        ] {
+            let mut cg = cg_with(ty, PhysReg(19));
+            cg.emit_select_cond_cmp_for_test(&Operand::Value(Value(5)));
+            assert_eq!(cg.state.out.buf.trim(), want, "{ty:?}");
+        }
+        // The fixed conditional-increment leaf reads a parameter condition
+        // in its ABI register, where nothing canonicalized it.
+        for (bytes, want) in [
+            (1, "tst w2, #0xff"),
+            (2, "tst w2, #0xffff"),
+            (4, "cmp w2, #0"),
+            (8, "cmp x2, #0"),
+        ] {
+            let mut cg = cg_with(IrType::U8, PhysReg(2));
+            cg.conditional_increment_leaf = true;
+            cg.conditional_increment_leaf_condition_bytes = bytes;
+            cg.emit_select_cond_cmp_for_test(&Operand::Value(Value(5)));
+            assert_eq!(cg.state.out.buf.trim(), want, "{bytes} bytes");
+        }
     }
 }

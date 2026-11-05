@@ -2,6 +2,7 @@
 
 use super::emit::{
     ARM_ARG_REGS, ARM_CALLEE_SAVED, ARM_CALLER_SAVED, ArmCodegen, callee_saved_name,
+    callee_saved_name_32, is_arm_fp_phys,
 };
 use crate::backend::call_abi::{ParamClass, classify_params};
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
@@ -20,7 +21,7 @@ fn conditional_increment_leaf_plan(
     func: &IrFunction,
 ) -> Option<(
     crate::common::fx_hash::FxHashMap<u32, crate::backend::regalloc::PhysReg>,
-    bool,
+    usize,
 )> {
     use crate::backend::regalloc::PhysReg;
     use crate::common::fx_hash::FxHashMap;
@@ -132,13 +133,16 @@ fn conditional_increment_leaf_plan(
         return None;
     }
 
-    let condition_is_32 = match condition {
+    // A parameter condition is tested in its ABI register, where AAPCS64
+    // leaves every bit above its width unspecified: the test reads exactly
+    // `size` bytes. A Cmp result is a 0/1 `cset`.
+    let condition_bytes = match condition {
         Operand::Value(value) if param_values.contains_key(&value.0) => {
             if compare.is_some() || add_index + 1 != select_index {
                 return None;
             }
             let param_index = *param_values.get(&value.0)?;
-            func.params[param_index].ty.size() <= 4
+            func.params[param_index].ty.size()
         }
         Operand::Value(value) => {
             let (compare_index, compare_dest) = compare?;
@@ -148,7 +152,7 @@ fn conditional_increment_leaf_plan(
             {
                 return None;
             }
-            true
+            4
         }
         Operand::Const(_) => return None,
     };
@@ -160,7 +164,37 @@ fn conditional_increment_leaf_plan(
         assignments.insert(compare_dest.0, PhysReg(8));
     }
     assignments.insert(select_dest.0, PhysReg(0));
-    Some((assignments, condition_is_32))
+    Some((assignments, condition_bytes))
+}
+
+/// The instruction that writes the integer argument arriving in X register
+/// `arg` into X register `dst` as a canonical `ty` value, or `None` when
+/// `dst` already holds it.
+///
+/// AAPCS64 C.16 copies an integral argument narrower than 64 bits "to the
+/// least significant bits" of x[n] and leaves the other bits unspecified:
+/// GCC and Clang callers tail-call with whatever upper half the caller's own
+/// value had. The callee therefore extends -- a 32-bit value is
+/// zero-extended (`mov wD, wA`, also when D == A: what every 32-bit producer
+/// leaves, and what `eliminate_self_moves` drops once bits 63:32 are proven
+/// unobservable), an 8- or 16-bit value by its signedness exactly as the
+/// IntNarrow cast extends it, so that every W-view consumer (`cbnz wN`,
+/// `cmp wN, #0`, the 32-bit ALU forms) reads the value. A 64-bit value
+/// moves unchanged; any other type keeps the plain width-of-type move.
+pub(super) fn canonical_gp_param_move(dst: &str, arg: &str, ty: IrType) -> Option<String> {
+    let w = |x: &str| format!("w{}", x.strip_prefix('x').unwrap_or(x));
+    match ty {
+        IrType::I8 => Some(format!("    sxtb {}, {}", dst, w(arg))),
+        IrType::I16 => Some(format!("    sxth {}, {}", dst, w(arg))),
+        IrType::U8 => Some(format!("    and {}, {}, #0xff", w(dst), w(arg))),
+        IrType::U16 => Some(format!("    and {}, {}, #0xffff", w(dst), w(arg))),
+        IrType::I32 | IrType::U32 => Some(format!("    mov {}, {}", w(dst), w(arg))),
+        _ if dst == arg => None,
+        _ if ArmCodegen::reg_for_type("x0", ty) == "w0" => {
+            Some(format!("    mov {}, {}", w(dst), w(arg)))
+        }
+        _ => Some(format!("    mov {}, {}", dst, arg)),
+    }
 }
 
 impl ArmCodegen {
@@ -226,6 +260,25 @@ impl ArmCodegen {
         }
     }
 
+    /// Whether `func` computes on `long double` (F128) or `__int128` values:
+    /// their helper calls and register pairs run through the emitter's
+    /// caller-saved scratch, so such a function gets no caller-saved pool.
+    fn uses_f128_or_i128(func: &IrFunction) -> bool {
+        let wide = |ty: &IrType| matches!(ty, IrType::F128 | IrType::I128 | IrType::U128);
+        func.blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .any(|inst| match inst {
+                Instruction::BinOp { ty, .. }
+                | Instruction::UnaryOp { ty, .. }
+                | Instruction::Cmp { ty, .. }
+                | Instruction::Load { ty, .. }
+                | Instruction::Store { ty, .. } => wide(ty),
+                Instruction::Cast { from_ty, to_ty, .. } => wide(from_ty) || wide(to_ty),
+                _ => false,
+            })
+    }
+
     pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
         use crate::backend::regalloc::PhysReg;
         use crate::ir::reexports::Instruction;
@@ -233,7 +286,8 @@ impl ArmCodegen {
         self.value_types = crate::backend::common::compute_value_type_map(func);
         self.loop_promoted_f64_values = func.loop_promoted_f64_values.clone();
         self.conditional_increment_leaf = false;
-        self.conditional_increment_leaf_condition_32 = false;
+        self.conditional_increment_leaf_condition_bytes = 8;
+        self.frameless_leaf = false;
 
         // Non-negative ≤32-bit bitop/masked results have bit 31 provably zero,
         // and W-register instructions zero the upper half of the X register.
@@ -271,46 +325,7 @@ impl ArmCodegen {
         } else {
             ARM_CALLER_SAVED.to_vec()
         };
-        let mut has_f128_ops = false;
-        let mut has_i128_ops = false;
-        for block in &func.blocks {
-            for inst in &block.instructions {
-                match inst {
-                    Instruction::BinOp { ty, .. }
-                    | Instruction::UnaryOp { ty, .. }
-                    | Instruction::Cmp { ty, .. }
-                    | Instruction::Load { ty, .. }
-                    | Instruction::Store { ty, .. }
-                        if *ty == IrType::F128 =>
-                    {
-                        has_f128_ops = true;
-                    }
-                    Instruction::Cast { to_ty, .. } if *to_ty == IrType::F128 => {
-                        has_f128_ops = true;
-                    }
-                    Instruction::Cast { from_ty, .. } if *from_ty == IrType::F128 => {
-                        has_f128_ops = true;
-                    }
-                    Instruction::BinOp { ty, .. }
-                    | Instruction::UnaryOp { ty, .. }
-                    | Instruction::Cmp { ty, .. }
-                    | Instruction::Load { ty, .. }
-                    | Instruction::Store { ty, .. }
-                        if matches!(ty, IrType::I128 | IrType::U128) =>
-                    {
-                        has_i128_ops = true
-                    }
-                    Instruction::Cast { from_ty, to_ty, .. }
-                        if matches!(from_ty, IrType::I128 | IrType::U128)
-                            || matches!(to_ty, IrType::I128 | IrType::U128) =>
-                    {
-                        has_i128_ops = true
-                    }
-                    _ => {}
-                }
-            }
-        }
-        if has_f128_ops || has_i128_ops {
+        if Self::uses_f128_or_i128(func) {
             caller_saved_regs.clear();
         } else {
             // Emitter scratch the pool must never hold a value across.
@@ -401,9 +416,9 @@ impl ArmCodegen {
         );
 
         if std::env::var_os("CCC_NO_CSINC_FOLD").is_none() {
-            if let Some((plan, condition_is_32)) = conditional_increment_leaf_plan(func) {
+            if let Some((plan, condition_bytes)) = conditional_increment_leaf_plan(func) {
                 self.conditional_increment_leaf = true;
-                self.conditional_increment_leaf_condition_32 = condition_is_32;
+                self.conditional_increment_leaf_condition_bytes = condition_bytes;
                 self.reg_assignments = plan;
                 reg_assigned = self.reg_assignments.clone();
                 self.used_callee_saved.clear();
@@ -540,11 +555,20 @@ impl ArmCodegen {
         self.func_ret_is_f128_sse = func.ret_is_f128_sse;
         self.current_frame_size = frame_size;
         self.frame_base_offset = None;
-        if self.conditional_increment_leaf {
+        self.frameless_leaf =
+            !self.conditional_increment_leaf && self.frameless_leaf_ok(func, frame_size);
+        if self.conditional_increment_leaf || self.frameless_leaf {
             return;
         }
         self.emit_prologue_arm(frame_size);
 
+        // Every save gets its CFA-relative row. After `emit_prologue_arm` the
+        // CFA is `x29 + frame_size` with x29 == sp in all three frame shapes,
+        // so the slot at `[sp, #offset]` sits at `CFA + offset - frame_size`.
+        // Without the rows an unwinder (C++ exceptions through C frames,
+        // `_Unwind_ForcedUnwind` for thread cancellation, a debugger's
+        // `finish`) resumes the caller with this function's values in
+        // x19-x28 / d8-d15.
         let used_regs = self.used_callee_saved.clone();
         let base = self.callee_save_offset;
         let n = used_regs.len();
@@ -554,12 +578,15 @@ impl ArmCodegen {
             let r2 = callee_saved_name(used_regs[i + 1]);
             let offset = base + (i as i64) * 8;
             self.emit_stp_to_sp(r1, r2, offset);
+            self.emit_callee_save_cfi(r1, offset, frame_size);
+            self.emit_callee_save_cfi(r2, offset + 8, frame_size);
             i += 2;
         }
         if i < n {
             let r = callee_saved_name(used_regs[i]);
             let offset = base + (i as i64) * 8;
             self.emit_store_to_sp(r, offset, "str");
+            self.emit_callee_save_cfi(r, offset, frame_size);
         }
 
         // Save callee-saved FP registers (d8-d14) used by the FP allocator.
@@ -572,19 +599,181 @@ impl ArmCodegen {
             let r2 = format!("d{}", used_fp[j + 1].0 - 24);
             let offset = fp_base + (j as i64) * 8;
             self.emit_stp_to_sp(&r1, &r2, offset);
+            self.emit_callee_save_cfi(&r1, offset, frame_size);
+            self.emit_callee_save_cfi(&r2, offset + 8, frame_size);
             j += 2;
         }
         if j < m {
             let r = format!("d{}", used_fp[j].0 - 24);
             let offset = fp_base + (j as i64) * 8;
             self.emit_store_to_sp(&r, offset, "str");
+            self.emit_callee_save_cfi(&r, offset, frame_size);
         }
+    }
+
+    /// Distance from sp to the caller's outgoing-argument area -- where the
+    /// stack-passed parameters start (AAPCS64: the entry sp): the frame
+    /// size, or 0 in a frameless leaf, whose sp never moves.
+    pub(super) fn incoming_stack_base(&self) -> i64 {
+        if self.frameless_leaf {
+            0
+        } else {
+            self.current_frame_size
+        }
+    }
+
+    /// `.cfi_offset` row for a callee-saved register stored at
+    /// `[sp, #offset]` of a `frame_size`-byte frame (see `emit_prologue_impl`).
+    fn emit_callee_save_cfi(&mut self, reg: &str, offset: i64, frame_size: i64) {
+        if self.state.emit_cfi {
+            self.state.emit_fmt(format_args!(
+                "    .cfi_offset {}, {}",
+                reg,
+                offset - frame_size
+            ));
+        }
+    }
+
+    /// The frameless-leaf form: no `stp x29, x30` / `mov x29, sp` / `ldp`,
+    /// the return address stays in x30 and the CFA stays `sp + 0` (the CIE's
+    /// initial rule), which is what GCC (`-momit-leaf-frame-pointer`, the
+    /// AArch64 default) and Clang emit for a leaf with no frame content:
+    /// `int f(int x) { return x + 1; }` is `add w0, w0, #1; ret`.
+    ///
+    /// Requirements, each load-bearing:
+    /// * `frame_size == 16`: the frame holds the frame record only -- no
+    ///   value slot, alloca, callee save, varargs area or return buffer.
+    /// * no callee-saved GP/FP register in use (nothing to save).
+    /// * frame-pointer omission requested (`-O1`+, not `-fno-omit-frame-
+    ///   pointer`, no `__builtin_frame_address`, no dynamic alloca: the
+    ///   shared `omit_frame_pointer` decision).
+    /// * every parameter arrives in a register or as a stack scalar (read
+    ///   from `[sp, #offset]` through [`Self::incoming_stack_base`]); an
+    ///   aggregate, `__int128` or `_Float128` on the stack is copied into a
+    ///   slot, which a 16-byte frame does not have.
+    /// * a scalar (or void) result, so no `_Float128` widening call in the
+    ///   return sequence.
+    /// * [`Self::arm_frameless_leaf_ir`]: nothing in the body calls (x30
+    ///   must survive to the `ret`) or addresses the frame through x29.
+    fn frameless_leaf_ok(&self, func: &IrFunction, frame_size: i64) -> bool {
+        let scalar_or_void = |ty: IrType| {
+            matches!(
+                ty,
+                IrType::Void
+                    | IrType::I8
+                    | IrType::I16
+                    | IrType::I32
+                    | IrType::I64
+                    | IrType::U8
+                    | IrType::U16
+                    | IrType::U32
+                    | IrType::U64
+                    | IrType::F32
+                    | IrType::F64
+                    | IrType::Ptr
+            )
+        };
+        frame_size == 16
+            && self.used_callee_saved.is_empty()
+            && self.used_fp_callee_saved.is_empty()
+            && self.state.omit_frame_pointer
+            && !self.state.has_dyn_alloca
+            && !func.is_variadic
+            && !func.uses_sret
+            && !self.state.uses_sret
+            && self.fp_ret_buffer.is_none()
+            && !func.ret_is_f128_sse
+            && scalar_or_void(func.return_type)
+            && {
+                let config = self.call_abi_config_impl();
+                classify_params(func, &config).iter().all(|c| {
+                    matches!(
+                        c,
+                        ParamClass::IntReg { .. }
+                            | ParamClass::FloatReg { .. }
+                            | ParamClass::StackScalar { .. }
+                    )
+                })
+            }
+            && self.arm_frameless_leaf_ir(func)
+    }
+
+    /// Instructions whose AArch64 emitters never call (no `bl`/`blr`: the
+    /// F128 and i128 helpers, the TLS descriptor of a dynamic-TLS address,
+    /// libcalls, inline asm and intrinsics are all outside the list), never
+    /// address the frame through x29 and need no slot of their own. An
+    /// allowlist on purpose: an IR variant not proven call-free here keeps
+    /// the frame, so a future lowering that emits a libcall closes the form
+    /// instead of returning through a clobbered x30.
+    fn arm_frameless_leaf_ir(&self, func: &IrFunction) -> bool {
+        use crate::common::tls::TlsModel;
+        use crate::ir::reexports::IrConst;
+        let scalar = |ty: &IrType| {
+            matches!(
+                ty,
+                IrType::I8
+                    | IrType::I16
+                    | IrType::I32
+                    | IrType::I64
+                    | IrType::U8
+                    | IrType::U16
+                    | IrType::U32
+                    | IrType::U64
+                    | IrType::F32
+                    | IrType::F64
+                    | IrType::Ptr
+            )
+        };
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::BinOp { ty, .. }
+                    | Instruction::UnaryOp { ty, .. }
+                    | Instruction::Cmp { ty, .. }
+                    | Instruction::Load { ty, .. }
+                    | Instruction::Store { ty, .. }
+                    | Instruction::Select { ty, .. }
+                    | Instruction::ParamRef { ty, .. }
+                    | Instruction::Alloca { ty, .. } => {
+                        if !scalar(ty) {
+                            return false;
+                        }
+                    }
+                    Instruction::Cast { from_ty, to_ty, .. } => {
+                        if !scalar(from_ty) || !scalar(to_ty) {
+                            return false;
+                        }
+                    }
+                    Instruction::Copy { src, .. } => {
+                        if matches!(
+                            src,
+                            Operand::Const(IrConst::LongDouble(..) | IrConst::I128(..))
+                        ) {
+                            return false;
+                        }
+                    }
+                    Instruction::GetElementPtr { .. } | Instruction::LabelAddr { .. } => {}
+                    Instruction::GlobalAddr { name, .. } => {
+                        if self.state.tls_symbols.contains(name)
+                            && matches!(
+                                self.state.tls_model(name),
+                                TlsModel::GlobalDynamic | TlsModel::LocalDynamic
+                            )
+                        {
+                            return false;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+        }
+        true
     }
 
     // ---- emit_epilogue ----
 
     pub(super) fn emit_epilogue_impl(&mut self, frame_size: i64) {
-        if self.conditional_increment_leaf {
+        if self.conditional_increment_leaf || self.frameless_leaf {
             return;
         }
         self.emit_restore_callee_saved();
@@ -707,9 +896,14 @@ impl ArmCodegen {
                             } else {
                                 reg_idx
                             };
+                            // Canonical, like every ParamRef: a 32-bit
+                            // argument's upper half is unspecified.
                             let src_reg = ARM_ARG_REGS[actual_idx];
-                            self.state
-                                .emit_fmt(format_args!("    mov {}, {}", dest_reg, src_reg));
+                            if let Some(line) =
+                                canonical_gp_param_move(dest_reg, src_reg, func.params[i].ty)
+                            {
+                                self.state.emit(&line);
+                            }
                             self.state.param_pre_stored.insert(i);
                         }
                     }
@@ -721,6 +915,23 @@ impl ArmCodegen {
         self.emit_store_hfa_params(func, &param_classes);
         self.emit_store_fp_params(func, &param_classes);
         self.emit_store_stack_params(func, &param_classes);
+
+        // The parameter that arrives in x0 and is read only at its own
+        // ParamRef (no pre-store, no alloca capture): until that ParamRef
+        // runs, no other ParamRef may bounce through x0.
+        self.x0_param_pending = param_classes.iter().enumerate().find_map(|(i, class)| {
+            let ParamClass::IntReg { reg_idx } = *class else {
+                return None;
+            };
+            let in_x0 = reg_idx == sret_shift && !(sret_shift > 0 && i == 0);
+            let captured = self.state.param_pre_stored.contains(&i)
+                || self
+                    .state
+                    .param_alloca_slots
+                    .get(i)
+                    .is_some_and(|slot| slot.is_some());
+            (in_x0 && !captured).then_some(i)
+        });
     }
 
     // ---- emit_param_ref ----
@@ -730,6 +941,21 @@ impl ArmCodegen {
             return;
         }
 
+        // x0 is the ParamRef bounce register, and it is also where the first
+        // integer parameter arrives. A ParamRef of any OTHER parameter that
+        // runs while that one is still unread must not bounce through x0:
+        // `double f(double d, int k)` with `k` homed in a slot (or in a
+        // shared callee-saved register, which is not pre-stored) emitted
+        // `fmov x0, d0` for `d` and then stored that as `k`. Those ParamRefs
+        // bounce through x16 instead (IP0: never an argument register, never
+        // an allocation home, and free at entry -- the large-offset paths use
+        // x17). A destination with neither a register nor a slot lives in x0
+        // alone, so it keeps x0.
+        let x0_busy = self.x0_param_pending.is_some_and(|j| j != param_idx);
+        if self.x0_param_pending == Some(param_idx) {
+            self.x0_param_pending = None;
+        }
+
         // If this param was pre-stored directly to its register-allocated
         // destination during emit_store_params, the value is already in place.
         // No code needs to be emitted — the register already holds the value.
@@ -737,10 +963,18 @@ impl ArmCodegen {
             return;
         }
 
+        let homed =
+            self.reg_assignments.contains_key(&dest.0) || self.state.get_slot(dest.0).is_some();
+        let (sx, sw) = if x0_busy && homed {
+            ("x16", "w16")
+        } else {
+            ("x0", "w0")
+        };
+
         if param_idx < self.state.param_alloca_slots.len() {
             if let Some((slot, alloca_ty, alloca_id)) = self.state.param_alloca_slots[param_idx] {
                 let ldr_instr = self.load_instr_for_type_impl(alloca_ty);
-                let (actual_instr, reg) = Self::arm_parse_load(ldr_instr);
+                let (actual_instr, reg) = Self::arm_parse_load_to_reg(ldr_instr, sx, sw);
                 if self.state.alloca_over_align(alloca_id).is_some() {
                     // Over-aligned (>16) param alloca: the capture wrote the
                     // EFFECTIVE align_up'd address (x9 convention of
@@ -752,13 +986,12 @@ impl ArmCodegen {
                 } else {
                     self.emit_load_from_sp(reg, slot.0, actual_instr);
                 }
-                self.store_x0_to(dest);
+                self.store_param_bounce_to(dest, sx);
                 return;
             }
         }
 
         let class = self.state.param_classes[param_idx];
-        let frame_size = self.current_frame_size;
 
         // AArch64 ABI: sret shifts GP register indices
         let sret_shift = if self.state.uses_sret { 1usize } else { 0 };
@@ -768,50 +1001,107 @@ impl ArmCodegen {
             // address of the private return buffer.
             ParamClass::RegReturnBuffer { .. } => {
                 if let Some((offset, _)) = self.fp_ret_buffer {
-                    self.emit_add_sp_offset("x0", offset);
-                    self.store_x0_to(dest);
+                    self.emit_add_sp_offset(sx, offset);
+                    self.store_param_bounce_to(dest, sx);
                 }
             }
             ParamClass::IntReg { reg_idx } => {
-                let actual_reg = if sret_shift > 0 && reg_idx == 0 && param_idx == 0 {
-                    Self::reg_for_type("x8", ty)
+                let arg = if sret_shift > 0 && reg_idx == 0 && param_idx == 0 {
+                    "x8"
                 } else {
                     let actual_idx = if reg_idx >= sret_shift {
                         reg_idx - sret_shift
                     } else {
                         reg_idx
                     };
-                    Self::reg_for_type(ARM_ARG_REGS[actual_idx], ty)
+                    ARM_ARG_REGS[actual_idx]
                 };
-                let dst = Self::reg_for_type("x0", ty);
-                if actual_reg != dst {
-                    self.state
-                        .emit_fmt(format_args!("    mov {}, {}", dst, actual_reg));
+                // A caller-saved home (Phase 2p, `param_volatile_pool`) is
+                // written straight from the argument register -- in place
+                // for an arrival home -- with the bits the bounce produced
+                // (`canonical_gp_param_move`), one move less. The pool never
+                // holds another argument register, so the write cannot
+                // overwrite a parameter that is still unread.
+                if let Some(&home) = self.reg_assignments.get(&dest.0) {
+                    if !is_arm_fp_phys(home) && !(19..=28).contains(&home.0) {
+                        if let Some(line) =
+                            canonical_gp_param_move(callee_saved_name(home), arg, ty)
+                        {
+                            self.state.emit(&line);
+                        }
+                        return;
+                    }
                 }
-                self.store_x0_to(dest);
+                if let Some(line) = canonical_gp_param_move(sx, arg, ty) {
+                    self.state.emit(&line);
+                }
+                self.store_param_bounce_to(dest, sx);
             }
             ParamClass::FloatReg { reg_idx } => {
+                // An FP home takes the argument register directly: `fmov s, s`
+                // / `fmov d, d` leave the bits the GP bounce produced (the
+                // value in the low lane, every other bit zero) without
+                // touching x0 at all.
+                if let Some(&home) = self.reg_assignments.get(&dest.0) {
+                    if is_arm_fp_phys(home) && matches!(ty, IrType::F32 | IrType::F64) {
+                        let lane = if ty == IrType::F32 { 's' } else { 'd' };
+                        self.state.emit_fmt(format_args!(
+                            "    fmov {}{}, {}{}",
+                            lane,
+                            home.0 - 24,
+                            lane,
+                            reg_idx
+                        ));
+                        return;
+                    }
+                }
                 if ty == IrType::U16 {
                     self.state
-                        .emit_fmt(format_args!("    fmov w0, s{}", reg_idx));
-                    self.state.emit("    and w0, w0, #0xffff");
+                        .emit_fmt(format_args!("    fmov {}, s{}", sw, reg_idx));
+                    self.state
+                        .emit_fmt(format_args!("    and {}, {}, #0xffff", sw, sw));
                 } else if ty == IrType::F32 {
                     self.state
-                        .emit_fmt(format_args!("    fmov w0, s{}", reg_idx));
+                        .emit_fmt(format_args!("    fmov {}, s{}", sw, reg_idx));
                 } else {
                     self.state
-                        .emit_fmt(format_args!("    fmov x0, d{}", reg_idx));
+                        .emit_fmt(format_args!("    fmov {}, d{}", sx, reg_idx));
                 }
-                self.store_x0_to(dest);
+                self.store_param_bounce_to(dest, sx);
             }
             ParamClass::StackScalar { offset } => {
-                let src = frame_size + offset;
+                let src = self.incoming_stack_base() + offset;
                 let ldr_instr = self.load_instr_for_type_impl(ty);
-                let (actual_instr, reg) = Self::arm_parse_load(ldr_instr);
+                let (actual_instr, reg) = Self::arm_parse_load_to_reg(ldr_instr, sx, sw);
                 self.emit_load_from_sp(reg, src, actual_instr);
-                self.store_x0_to(dest);
+                self.store_param_bounce_to(dest, sx);
             }
             _ => {}
+        }
+    }
+
+    /// Store a ParamRef's bounce register (`x0` or `x16`, see
+    /// `emit_param_ref_impl`) to the destination's home. Only x0 carries the
+    /// accumulator bookkeeping; an x16 bounce leaves x0 -- and the parameter
+    /// still waiting in it -- untouched.
+    fn store_param_bounce_to(&mut self, dest: &Value, bounce: &str) {
+        if bounce == "x0" {
+            self.store_x0_to(dest);
+            return;
+        }
+        if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+            if is_arm_fp_phys(reg) {
+                self.state
+                    .emit_fmt(format_args!("    fmov d{}, {}", reg.0 - 24, bounce));
+            } else {
+                self.state.emit_fmt(format_args!(
+                    "    mov {}, {}",
+                    callee_saved_name(reg),
+                    bounce
+                ));
+            }
+        } else if let Some(slot) = self.state.get_slot(dest.0) {
+            self.emit_store_to_sp(bounce, slot.0, "str");
         }
     }
 
@@ -819,7 +1109,7 @@ impl ArmCodegen {
 
     pub(super) fn emit_epilogue_and_ret_impl(&mut self, frame_size: i64) {
         self.state.flush_epilogue_loc();
-        if !self.conditional_increment_leaf {
+        if !self.conditional_increment_leaf && !self.frameless_leaf {
             self.emit_restore_callee_saved();
             self.emit_epilogue_arm(frame_size);
         }
@@ -900,6 +1190,39 @@ impl ArmCodegen {
                     break;
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod canonical_param_move_tests {
+    use super::*;
+
+    /// AAPCS64 C.16 leaves the bits above a narrow argument unspecified:
+    /// every register home receives the canonical value -- zero-extended
+    /// for 32 bits (also in place), extended by signedness below that.
+    #[test]
+    fn narrow_arguments_are_extended_into_every_home() {
+        let cases: [(&str, &str, IrType, Option<&str>); 11] = [
+            ("x9", "x4", IrType::I32, Some("mov w9, w4")),
+            ("x4", "x4", IrType::I32, Some("mov w4, w4")),
+            ("x4", "x4", IrType::U32, Some("mov w4, w4")),
+            ("x0", "x2", IrType::I8, Some("sxtb x0, w2")),
+            ("x19", "x4", IrType::U8, Some("and w19, w4, #0xff")),
+            ("x9", "x4", IrType::I16, Some("sxth x9, w4")),
+            ("x4", "x4", IrType::U16, Some("and w4, w4, #0xffff")),
+            ("x9", "x4", IrType::I64, Some("mov x9, x4")),
+            ("x4", "x4", IrType::Ptr, None),
+            ("x16", "x8", IrType::Ptr, Some("mov x16, x8")),
+            ("x9", "x4", IrType::F32, Some("mov w9, w4")),
+        ];
+        for (dst, arg, ty, want) in cases {
+            let got = canonical_gp_param_move(dst, arg, ty);
+            assert_eq!(
+                got.as_deref().map(str::trim),
+                want,
+                "{dst} <- {arg} as {ty:?}"
+            );
         }
     }
 }

@@ -129,6 +129,87 @@ impl ArmCodegen {
         }
     }
 
+    /// Conversions with an operand in an FP register, register to register.
+    /// The accumulator convention moves the value through x0 and d0 on both
+    /// sides -- `(double)f` with both in FP homes was `fmov x0, d16; fmov s0,
+    /// w0; fcvt d0, s0; fmov x0, d0; fmov d18, x0` for one `fcvt d18, s16`,
+    /// and `(int)d` was `fmov x0, d16; fmov d0, x0; fcvtzs x0, d0` for one
+    /// `fcvtzs x0, d16`. Integer results keep the accumulator's 64-bit
+    /// conversion and narrowing (`emit_cast_instrs_impl`) bit for bit.
+    fn emit_fp_register_cast(
+        &mut self,
+        dest: &Value,
+        src: &Operand,
+        from_ty: IrType,
+        to_ty: IrType,
+    ) -> bool {
+        // binary128 and 128-bit integers convert through libcalls.
+        let scalar = |ty: IrType| {
+            matches!(
+                ty,
+                IrType::F32
+                    | IrType::F64
+                    | IrType::I8
+                    | IrType::I16
+                    | IrType::I32
+                    | IrType::I64
+                    | IrType::U8
+                    | IrType::U16
+                    | IrType::U32
+                    | IrType::U64
+                    | IrType::Ptr
+            )
+        };
+        if !scalar(from_ty) || !scalar(to_ty) {
+            return false;
+        }
+        let src_fp = self.operand_reg(src).filter(|r| is_arm_fp_phys(*r));
+        let dest_fp = self
+            .get_phys_reg_for_value(dest.0)
+            .filter(|r| is_arm_fp_phys(*r));
+        match classify_cast(from_ty, to_ty) {
+            CastKind::FloatToFloat { widen } if src_fp.is_some() || dest_fp.is_some() => {
+                let scratch = if widen { "s0" } else { "d0" };
+                let source = self.float_operand_reg(src, from_ty, scratch);
+                let target = match dest_fp {
+                    Some(phys) => arm_fp_name(phys, to_ty),
+                    None if widen => "d0".to_string(),
+                    None => "s0".to_string(),
+                };
+                self.state
+                    .emit_fmt(format_args!("    fcvt {}, {}", target, source));
+                self.store_float_reg(dest, to_ty, &target);
+                true
+            }
+            CastKind::FloatToSigned { .. } | CastKind::FloatToUnsigned { .. } => {
+                let Some(phys) = src_fp else {
+                    return false;
+                };
+                let signed = matches!(
+                    classify_cast(from_ty, to_ty),
+                    CastKind::FloatToSigned { .. }
+                );
+                self.state.emit_fmt(format_args!(
+                    "    {} x0, {}",
+                    if signed { "fcvtzs" } else { "fcvtzu" },
+                    arm_fp_name(phys, from_ty)
+                ));
+                match to_ty {
+                    IrType::I8 => self.state.emit("    sxtb x0, w0"),
+                    IrType::I16 => self.state.emit("    sxth x0, w0"),
+                    IrType::I32 => self.state.emit("    sxtw x0, w0"),
+                    IrType::U8 => self.state.emit("    and x0, x0, #0xff"),
+                    IrType::U16 => self.state.emit("    and x0, x0, #0xffff"),
+                    IrType::U32 => self.state.emit("    mov w0, w0"),
+                    _ => {}
+                }
+                self.store_x0_to(dest);
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub(super) fn emit_cast_impl(
         &mut self,
         dest: &Value,
@@ -269,6 +350,9 @@ impl ArmCodegen {
                     return;
                 }
             }
+        }
+        if self.emit_fp_register_cast(dest, src, from_ty, to_ty) {
+            return;
         }
         // Relay fallback for bitop sources: an I32→I64 signed widen of a
         // Clz/Ctz/Popcount result needs no `sxtw` — the W-register load of

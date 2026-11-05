@@ -677,7 +677,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed = false;
         changed |= eliminate_adjacent_store_load(&mut lines, &mut kinds, n);
         changed |= eliminate_redundant_branches(&lines, &mut kinds, n);
-        changed |= eliminate_self_moves(&mut kinds, n);
+        changed |= eliminate_self_moves(&lines, &mut kinds, n);
         changed |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
         changed |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
         changed |= eliminate_redundant_zext_and(&mut lines, &mut kinds, n);
@@ -742,7 +742,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 = false;
             changed2 |= eliminate_adjacent_store_load(&mut lines, &mut kinds, n);
             changed2 |= eliminate_redundant_branches(&lines, &mut kinds, n);
-            changed2 |= eliminate_self_moves(&mut kinds, n);
+            changed2 |= eliminate_self_moves(&lines, &mut kinds, n);
             changed2 |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
             changed2 |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
             changed2 |= eliminate_redundant_zext_and(&mut lines, &mut kinds, n);
@@ -776,6 +776,8 @@ pub fn peephole_optimize(asm: String) -> String {
         }
     }
 
+    drop_orphaned_save_rows(&lines, &mut kinds, n);
+
     // Put the protected lines back, in order, and keep every one of them: no
     // pass may delete or duplicate opaque code.  A placeholder count that no
     // longer matches means a pass did exactly that, and the only safe answer
@@ -799,6 +801,55 @@ pub fn peephole_optimize(asm: String) -> String {
     // Build result: kept lines, with the hidden `-g` rows put back.
     debug_assert_eq!(lines.len(), kinds.len());
     crate::backend::peephole_common::join_with_debug_rows(&lines, |i| kinds[i] != LineKind::Nop)
+}
+
+/// Drop each callee-saved `.cfi_offset` row whose save the passes deleted.
+///
+/// `emit_prologue_impl` emits `.cfi_offset REG, OFF` right after the store
+/// that saves REG. A pass that proves such a save dead (its restore renamed
+/// into a dead load by the entry coalescer and deleted, then the slot store
+/// removed) must take the row along: REG then keeps the caller's value for
+/// the whole function, the right unwind rule is "same value", and a stale row
+/// would make the unwinder load REG from a slot nothing wrote. A row survives
+/// exactly when the nearest preceding live instruction is a store naming REG.
+fn drop_orphaned_save_rows(lines: &[String], kinds: &mut [LineKind], n: usize) {
+    fn callee_saved(reg: &str) -> bool {
+        let num = |p: char| {
+            reg.strip_prefix(p)
+                .and_then(|d| d.parse::<u8>().ok().filter(|v| v.to_string() == d))
+        };
+        num('x').is_some_and(|r| (19..=28).contains(&r))
+            || num('d').is_some_and(|r| (8..=15).contains(&r))
+    }
+    let mut last: Option<usize> = None;
+    for i in 0..n {
+        match kinds[i] {
+            LineKind::Nop => {}
+            LineKind::Directive => {
+                let Some(rest) = lines[i].trim().strip_prefix(".cfi_offset") else {
+                    continue;
+                };
+                let reg = rest.split(',').next().unwrap_or("").trim();
+                if !callee_saved(reg) {
+                    continue;
+                }
+                let saved = last.is_some_and(|j| {
+                    let t = lines[j].trim();
+                    matches!(t.split_whitespace().next(), Some("str" | "stp" | "stur"))
+                        && t.split('[')
+                            .next()
+                            .unwrap_or("")
+                            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                            .any(|tok| tok == reg)
+                });
+                if !saved {
+                    kinds[i] = LineKind::Nop;
+                }
+            }
+            LineKind::Label => last = None,
+            _ => last = Some(i),
+        }
+    }
 }
 
 /// Propagate a register copy used only as a memory-address alias within one
@@ -1148,9 +1199,10 @@ fn gp_operands(line: &str, kind: LineKind, ret_value: bool) -> (u64, u64) {
     // A return also hands x19-x28 back to the caller (AAPCS64): the caller
     // reads them after the `ret` as surely as it reads the result, so a
     // rename that would leave a callee-saved register holding anything but
-    // the caller's value must see that read too.
+    // the caller's value must see that read too. The result itself is x0/x1
+    // (`A64_RET_GP`, the model `abi_liveness` uses as well).
     if ret_value && line.trim().starts_with("ret") {
-        uses |= 0xff | A64_CALLEE_SAVED_GP; // x0-x7, x19-x28
+        uses |= A64_RET_GP;
     }
     (uses, defs)
 }
@@ -1179,6 +1231,20 @@ impl Liveness {
         start: usize,
         end: usize,
         ret_value: bool,
+    ) -> Option<Self> {
+        Self::build_with(lines, kinds, start, end, |k| {
+            gp_operands(&lines[k], kinds[k], ret_value)
+        })
+    }
+
+    /// `build` over the (uses, defs) model `operands(k)` of line `k`: the
+    /// liveness of whatever property of a register those sets track.
+    fn build_with(
+        lines: &[String],
+        kinds: &[LineKind],
+        start: usize,
+        end: usize,
+        operands: impl Fn(usize) -> (u64, u64),
     ) -> Option<Self> {
         if start >= end {
             return None;
@@ -1271,7 +1337,7 @@ impl Liveness {
                         live_before[k] = live;
                         continue;
                     }
-                    let (u, d) = gp_operands(&lines[k], kinds[k], ret_value);
+                    let (u, d) = operands(k);
                     live = (live & !d) | u;
                     live_before[k] = live;
                 }
@@ -1386,10 +1452,6 @@ fn may_write_gp(line: &str) -> u64 {
 }
 
 fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
-    fn mentions(line: &str, reg: u8) -> bool {
-        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .any(|tok| tok == xreg_name(reg) || tok == wreg_name(reg))
-    }
     if n == 0 {
         return false;
     }
@@ -1403,6 +1465,25 @@ fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize)
     let mut changed = false;
     for w in 0..starts.len() - 1 {
         let (fstart, fend) = (starts[w], starts[w + 1]);
+        // One rename per scan (it changes the liveness every later candidate
+        // is judged by), repeated until the entry run has nothing left: an
+        // entry with six parameter copies used to keep two of them because
+        // the phase-3 driver runs this pass at most four times.
+        while coalesce_one_entry_copy(lines, kinds, fstart, fend) {
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// One `coalesce_entry_copies` rename in the function `[fstart, fend)`.
+fn coalesce_one_entry_copy(
+    lines: &mut [String],
+    kinds: &mut [LineKind],
+    fstart: usize,
+    fend: usize,
+) -> bool {
+    {
         let mut eend = fend;
         for k in fstart + 1..fend {
             if matches!(
@@ -1426,18 +1507,33 @@ fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize)
         let mut i = fstart + 1;
         while i < eend {
             i += 1;
-            let LineKind::Move {
-                dst,
-                src,
-                is_32bit: false,
-            } = kinds[i - 1]
-            else {
+            let LineKind::Move { dst, src, is_32bit } = kinds[i - 1] else {
                 continue;
             };
             if dst == src || dst >= 29 || src >= 29 {
                 continue;
             }
             let i = i - 1;
+            // A 32-bit copy (`mov w5, w0`, the entry copy of an `int`
+            // parameter) leaves dst = zext(src<31:0>), while src keeps
+            // whatever upper half the caller left (AAPCS64 leaves it
+            // unspecified). The two agree on every 32-bit view, so the rename
+            // is exact only when no later line reads or writes the 64-bit view
+            // of dst.
+            if is_32bit {
+                let dx = xreg_name(dst);
+                let x_view_later = (i + 1..fend).any(|k| {
+                    !matches!(
+                        kinds[k],
+                        LineKind::Nop | LineKind::Directive | LineKind::Label
+                    ) && lines[k]
+                        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .any(|tok| tok == dx)
+                });
+                if x_view_later {
+                    continue;
+                }
+            }
             // Rule 1 (ported from x86): the source must be DEAD immediately
             // after the copy. The old test -- "`src` is mentioned nowhere else
             // in the function" -- is syntactic and says nothing about paths
@@ -1474,16 +1570,29 @@ fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize)
                         LineKind::Nop | LineKind::Directive | LineKind::Label => continue,
                         // `MemOther` names every register it touches (a
                         // pre/post-indexed base is written explicitly), so the
-                        // rename covers it. `Other` is an unrecognised
-                        // mnemonic the oracle cannot vouch for.
+                        // rename covers it. So does an `Other` line -- a
+                        // `csel`, `cset`, `ucvtf s16, w4`, `fmov d0, x5`:
+                        // AArch64 hides only the link register, a `ret`'s
+                        // target and a writeback base, which
+                        // `classify_implicit_operands_a64` reports below,
+                        // and `may_write_gp` answers rules 2 and 3 for any
+                        // mnemonic. The exceptions read registers they do not
+                        // name: an opaque inline-asm body and a supervisor
+                        // call (x0-x8). Refusing every `Other` line kept the
+                        // entry copies of any function with a select or an
+                        // FP conversion: `mov w4, w0; ucvtf s16, w4`.
                         LineKind::Other => {
-                            ok = false;
-                            break;
+                            let t = lines[k].trim();
+                            if t == OPAQUE_LINE || a64_traps_to_handler(t) {
+                                ok = false;
+                                break;
+                            }
                         }
-                        // x0-x7 carry the return value: an implicit read the
+                        // x0/x1 carry the result (a GP result never needs
+                        // more, see `A64_RET_GP`): an implicit read the
                         // rename cannot reach.
                         LineKind::Ret => {
-                            if dst < 8 {
+                            if A64_RET_GP & (1u64 << dst) != 0 {
                                 ok = false;
                                 break;
                             }
@@ -1604,11 +1713,10 @@ fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize)
                 }
             }
             kinds[i] = LineKind::Nop;
-            changed = true;
-            break; // renaming changes the picture: re-scan this function
+            return true;
         }
     }
-    changed
+    false
 }
 
 /// Merge identical basic blocks.
@@ -3399,20 +3507,167 @@ fn eliminate_redundant_branches(lines: &[String], kinds: &mut [LineKind], n: usi
 //
 // Pattern: mov xN, xN — no-op
 
-fn eliminate_self_moves(kinds: &mut [LineKind], n: usize) -> bool {
+fn eliminate_self_moves(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
+    // Function starts, and the X-view liveness of the function holding the
+    // current candidate: built at most once per function and pass, because
+    // deleting an unobservable `mov wN, wN` changes no register's X-view
+    // liveness (the line killed N, and N was not X-live after it).
+    let mut starts: Option<Vec<usize>> = None;
+    let mut x_view: Option<(usize, Option<Liveness>)> = None;
     for i in 0..n {
-        if let LineKind::Move { dst, src, is_32bit } = kinds[i] {
-            if dst == src && !is_32bit {
-                // Only eliminate 64-bit self-moves (mov xN, xN).
-                // On AArch64, `mov wN, wN` zeros the upper 32 bits of xN,
-                // so it is NOT a true no-op and must be preserved.
-                kinds[i] = LineKind::Nop;
-                changed = true;
+        let LineKind::Move { dst, src, is_32bit } = kinds[i] else {
+            continue;
+        };
+        if dst != src {
+            continue;
+        }
+        // `mov xN, xN` is a no-op. `mov wN, wN` clears bits 63:32 of xN, so
+        // it stays unless that is unobservable. The straight-line proof
+        // (`zext_self_move_unobservable`) is cheap: N is read, if at all,
+        // only through its W view until a W write of N zeroes the upper half
+        // again -- `mov w0, w0; and w0, w0, #0xff`, left behind when a
+        // parameter's entry copy folds into the narrow-count mask -- or
+        // until a `ret` that does not read N. Otherwise the CFG-wide one:
+        // N is not X-view live after the line on any path
+        // (`x_view_operands`) -- `mov w4, w4; cbz w4, .L1` for a 32-bit
+        // argument zero-extended in place and tested before two returns.
+        let removable = !is_32bit || zext_self_move_unobservable(lines, kinds, i, n, dst) || {
+            let starts = starts.get_or_insert_with(|| {
+                (0..n)
+                    .filter(|&k| is_function_boundary(&lines[k]))
+                    .collect()
+            });
+            let f = starts.partition_point(|&s| s <= i);
+            let fstart = f.checked_sub(1).map_or(0, |p| starts[p]);
+            let fend = starts.get(f).copied().unwrap_or(n);
+            if x_view.as_ref().is_none_or(|(s, _)| *s != fstart) {
+                let lv = Liveness::build_with(lines, kinds, fstart, fend, |k| {
+                    x_view_operands(&lines[k], kinds[k])
+                });
+                x_view = Some((fstart, lv));
             }
+            x_view
+                .as_ref()
+                .and_then(|(_, lv)| lv.as_ref())
+                .is_some_and(|lv| lv.live_after(i, dst) == Some(false))
+        };
+        if removable {
+            kinds[i] = LineKind::Nop;
+            changed = true;
         }
     }
     changed
+}
+
+/// The (uses, defs) of `line` for "can bits 63:32 of xN be observed?" (see
+/// `Liveness::build_with`). A use reads the X view: an explicit one
+/// (`explicit_x_view_reads`) or an implicit one -- a call's argument
+/// registers x0-x7, a return's result and callee-saved registers
+/// (`A64_RET_GP`) and link register, and everything for an opaque
+/// inline-asm body or a supervisor call (`svc` reads x0-x8 unnamed). A
+/// W-view read is no use. The defs are `gp_operands`' must-defs: a W write
+/// zeroes bits 63:32 again, an X write replaces them.
+fn x_view_operands(line: &str, kind: LineKind) -> (u64, u64) {
+    let t = line.trim();
+    if t == OPAQUE_LINE || a64_traps_to_handler(t) {
+        return (u64::MAX, 0);
+    }
+    let mut uses = explicit_x_view_reads(t, kind);
+    match kind {
+        LineKind::Call => uses |= 0xff,
+        LineKind::Ret => uses |= A64_RET_GP | 1 << 30,
+        _ => {}
+    }
+    (uses, gp_operands(line, kind, false).1)
+}
+
+/// The registers whose X view `line` names other than as its written
+/// destination: every `xN` token, except the destination of a
+/// single-destination producer that names it nowhere else -- `sxtw x0, w0`
+/// reads w0 and redefines all of x0, `add x0, x0, #1` reads x0.
+fn explicit_x_view_reads(line: &str, kind: LineKind) -> u64 {
+    let mut named = 0u64;
+    let mut twice = 0u64;
+    for r in line
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter_map(|tok| tok.strip_prefix('x')?.parse::<u8>().ok())
+        .filter(|&r| r <= 30)
+    {
+        twice |= named & 1u64 << r;
+        named |= 1u64 << r;
+    }
+    let dest = written_gp_register(line, kind).filter(|&r| {
+        r <= 30
+            && twice & 1u64 << r == 0
+            && line
+                .trim()
+                .split_once(|c: char| c.is_ascii_whitespace())
+                .and_then(|(_, ops)| ops.split(',').next())
+                .is_some_and(|first| first.trim() == xreg_name(r))
+    });
+    match dest {
+        Some(r) => named & !(1u64 << r),
+        None => named,
+    }
+}
+
+/// After line `i` (`mov wN, wN`), the straight-line code redefines N, or
+/// returns with N dead, before anything can see bits 63:32 of xN: every line
+/// up to that point reads N, if at all, only through its W view
+/// (`explicit_x_view_reads`), and the redefinition is a single-destination
+/// write of N (see `eliminate_self_moves`). `mov w0, w0; fmov s0, w0; cnt
+/// v0.8b, v0.8b; uaddlv h0, v0.8b; fmov w0, s0` qualifies, and so do `mov w0,
+/// w0; sxtw x0, w0` and `mov w4, w4; madd w0, w4, w5, w7; ret`.
+fn zext_self_move_unobservable(
+    lines: &[String],
+    kinds: &[LineKind],
+    i: usize,
+    n: usize,
+    reg: u8,
+) -> bool {
+    let (xn, wn) = (xreg_name(reg), wreg_name(reg));
+    for j in i + 1..n {
+        match kinds[j] {
+            LineKind::Nop => continue,
+            LineKind::Directive if inert_directive(&lines[j]) => continue,
+            // `ret` reads x0/x1 (the GP result registers) and needs every
+            // callee-saved register intact; any other caller-saved register
+            // is dead there, so its upper half is unobservable -- the
+            // in-place zero-extension of a 32-bit argument kept in its
+            // arrival register (`mov w4, w4`) before a straight-line return.
+            LineKind::Ret => return (2..=17).contains(&reg),
+            // Control flow ends the straight line; a raw `.inst`/`.word` is
+            // anything. An unclassified (`Other`) mnemonic is fine: only a
+            // call, a return or a trap reads a GP register it does not name,
+            // and naming wN reads the W view by definition.
+            LineKind::Label
+            | LineKind::Branch
+            | LineKind::CondBranch
+            | LineKind::CmpBranch
+            | LineKind::Call
+            | LineKind::Directive => return false,
+            _ => {}
+        }
+        let line = lines[j].trim();
+        if line == OPAQUE_LINE
+            || a64_traps_to_handler(line)
+            || explicit_x_view_reads(line, kinds[j]) & (1u64 << reg) != 0
+        {
+            return false;
+        }
+        let writes_n = may_write_gp(line) & (1u64 << reg) != 0;
+        if !writes_n {
+            // Reads wN at most: the upper half is invisible to it.
+            continue;
+        }
+        let first = line
+            .split_once(|c: char| c.is_ascii_whitespace())
+            .map(|(_, ops)| ops.split(',').next().unwrap_or("").trim());
+        return written_gp_register(&lines[j], kinds[j]) == Some(reg)
+            && (first == Some(wn) || first == Some(xn));
+    }
+    false
 }
 
 // ── Pass 3b: Redundant sign-extension elimination ───────────────────────────
@@ -4738,6 +4993,10 @@ fn eliminate_overwritten_moves(lines: &[String], kinds: &mut [LineKind], n: usiz
                 _ => {}
             }
             let t = &lines[j];
+            // A supervisor call reads x0-x7 (and x8) without naming them.
+            if a64_traps_to_handler(t) {
+                break;
+            }
             let mentions = t
                 .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
                 .any(|tok| tok == xn || tok == wn);
@@ -4785,6 +5044,11 @@ fn eliminate_overwritten_moves(lines: &[String], kinds: &mut [LineKind], n: usiz
 // idiom (the 32-bit self-move clears the top half; it is NOT a no-op, so
 // eliminate_self_moves correctly keeps it). The chain computes xD = zext32(wS),
 // exactly `mov wD, wS`. Sound only if A is not read later in the block.
+//
+// When A stays live (or no third move follows), the first two lines alone are
+// `mov wA, wS`: xA = zext32(wS) either way and S is untouched, so that fold
+// needs no condition at all -- `mov x0, x4; mov w0, w0`, a switch index
+// zero-extended on its way into the dispatch register.
 fn fold_zext_move_chains(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
     for i in 0..n {
@@ -4799,9 +5063,6 @@ fn fold_zext_move_chains(lines: &mut [String], kinds: &mut [LineKind], n: usize)
         let Some(m1) = next_live(kinds, i + 1, n) else {
             continue;
         };
-        let Some(m2) = next_live(kinds, m1 + 1, n) else {
-            continue;
-        };
         let LineKind::Move {
             dst: a2,
             src: s2,
@@ -4810,89 +5071,107 @@ fn fold_zext_move_chains(lines: &mut [String], kinds: &mut [LineKind], n: usize)
         else {
             continue;
         };
-        if a2 != a || s2 != a {
-            continue; // middle must be mov wA, wA
+        if a2 != a || s2 != a || s == a || a > 30 || s == 31 {
+            continue; // middle must be mov wA, wA; sp has no plain W move
         }
-        let LineKind::Move {
-            dst: d,
-            src: s3,
-            is_32bit: false,
-        } = kinds[m2]
-        else {
-            continue;
-        };
-        if s3 != a || d == a || s == a {
-            continue;
-        }
-        // A must be dead after the chain: no later READ before a boundary.
-        // A write-only line (e.g. `mov x0, #15`) ends the old value's life.
-        let (xa, wa) = (xreg_name(a), wreg_name(a));
-        let mut a_live = false;
-        for j in (m2 + 1)..n {
-            match kinds[j] {
-                // Control-flow boundaries are NOT "value is dead" proofs.
-                // levkropp's break-as-dead default folded d2hi()'s return-
-                // value chain (`mov x0,x22; mov w0,w0; mov x23,x0` right
-                // before the epilogue) into a dead callee-saved register and
-                // returned garbage: aarch64_fuzz seeds 0/2/5 at -O1, 40/100
-                // mismatches. ABI-precise handling instead:
-                // - ret implicitly reads the return-value registers x0/x1
-                //   (and x8 for sret); other registers are dead there.
-                LineKind::Ret => {
-                    a_live = a == 0 || a == 1 || a == 8;
-                    break;
-                }
-                // - calls read argument registers x0-x8; caller-saved temps
-                //   x9-x18 are clobbered unread (dead); callee-saved x19+
-                //   survive the call, so the scan must CONTINUE looking for
-                //   readers after the call rather than assume death.
-                LineKind::Call => {
-                    if a <= 8 {
-                        a_live = true;
-                        break;
-                    }
-                    if a >= 19 {
-                        continue;
-                    }
-                    break; // x9-x18: clobbered by the call without a read
-                }
-                // - labels and branches: the value may be read in the
-                //   target/fall-through block; this single-block scan cannot
-                //   see it, so it must be treated as live.
-                LineKind::Label | LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch => {
-                    a_live = true;
-                    break;
-                }
-                LineKind::Nop => continue,
-                _ => {}
+        match zext_chain_target(lines, kinds, n, a, s, m1) {
+            Some((d, m2)) => {
+                lines[i] = format!("    mov {}, {}", wreg_name(d), wreg_name(s));
+                kinds[i] = LineKind::Move {
+                    dst: d,
+                    src: s,
+                    is_32bit: true,
+                };
+                kinds[m2] = LineKind::Nop;
             }
-            let mentions = lines[j]
-                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .filter(|tok| *tok == xa || *tok == wa)
-                .count();
-            if mentions == 0 {
-                continue;
+            None => {
+                lines[i] = format!("    mov {}, {}", wreg_name(a), wreg_name(s));
+                kinds[i] = LineKind::Move {
+                    dst: a,
+                    src: s,
+                    is_32bit: true,
+                };
             }
-            if gp_reg_write_only(&lines[j], a) {
-                break; // write-only: the chain's value in A is dead here
-            }
-            a_live = true;
-            break;
         }
-        if a_live {
-            continue;
-        }
-        lines[i] = format!("    mov {}, {}", wreg_name(d), wreg_name(s));
-        kinds[i] = LineKind::Move {
-            dst: d,
-            src: s,
-            is_32bit: true,
-        };
         kinds[m1] = LineKind::Nop;
-        kinds[m2] = LineKind::Nop;
         changed = true;
     }
     changed
+}
+
+/// The `mov xD, xA` (destination and line) that completes the chain
+/// `mov xA, xS; mov wA, wA` ending at line `m1`, when A is dead after it.
+fn zext_chain_target(
+    lines: &[String],
+    kinds: &[LineKind],
+    n: usize,
+    a: u8,
+    s: u8,
+    m1: usize,
+) -> Option<(u8, usize)> {
+    let m2 = next_live(kinds, m1 + 1, n)?;
+    let LineKind::Move {
+        dst: d,
+        src: s3,
+        is_32bit: false,
+    } = kinds[m2]
+    else {
+        return None;
+    };
+    if s3 != a || d == a || s == a {
+        return None;
+    }
+    // A must be dead after the chain: no later READ before a boundary.
+    // A write-only line (e.g. `mov x0, #15`) ends the old value's life.
+    let (xa, wa) = (xreg_name(a), wreg_name(a));
+    for j in (m2 + 1)..n {
+        match kinds[j] {
+            // Control-flow boundaries are NOT "value is dead" proofs.
+            // levkropp's break-as-dead default folded d2hi()'s return-
+            // value chain (`mov x0,x22; mov w0,w0; mov x23,x0` right
+            // before the epilogue) into a dead callee-saved register and
+            // returned garbage: aarch64_fuzz seeds 0/2/5 at -O1, 40/100
+            // mismatches. ABI-precise handling instead:
+            // - ret implicitly reads the return-value registers x0/x1
+            //   (and x8 for sret); other registers are dead there.
+            LineKind::Ret => {
+                return (!(a == 0 || a == 1 || a == 8)).then_some((d, m2));
+            }
+            // - calls read argument registers x0-x8; caller-saved temps
+            //   x9-x18 are clobbered unread (dead); callee-saved x19+
+            //   survive the call, so the scan must CONTINUE looking for
+            //   readers after the call rather than assume death.
+            LineKind::Call => {
+                if a <= 8 {
+                    return None;
+                }
+                if a >= 19 {
+                    continue;
+                }
+                return Some((d, m2)); // x9-x18: clobbered by the call without a read
+            }
+            // - labels and branches: the value may be read in the
+            //   target/fall-through block; this single-block scan cannot
+            //   see it, so it must be treated as live.
+            LineKind::Label | LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch => {
+                return None;
+            }
+            LineKind::Nop => continue,
+            _ => {}
+        }
+        let mentions = lines[j]
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|tok| *tok == xa || *tok == wa)
+            .count();
+        if mentions == 0 {
+            continue;
+        }
+        if gp_reg_write_only(&lines[j], a) {
+            return Some((d, m2)); // write-only: the chain's value in A is dead here
+        }
+        return None;
+    }
+    Some((d, m2))
 }
 
 /// Retarget a move-immediate instruction to a different destination register.
@@ -8800,6 +9079,237 @@ mod tests {
         assert_eq!(callee_saved_contract(&out), Ok(()), "{}", out.join("\n"));
     }
 
+    /// The entry copies of `int` parameters are 32-bit: they fold into the
+    /// argument register when only W views of the home follow, all of them
+    /// in one pass (six copies used to leave two behind), and the copy whose
+    /// source the body overwrites while the home is live stays.
+    #[test]
+    fn entry_coalescing_folds_32_bit_parameter_copies() {
+        let asm = "six:\n    mov w7, w0\n    mov w8, w1\n    mov w13, w2\n    mov w14, w3\n    mov w9, w4\n    mov w10, w5\n    madd w5, w8, w13, w7\n    sub w5, w5, w14\n    madd w0, w9, w10, w5\n    ret\n";
+        let out = coalesce_to_fixpoint(asm);
+        assert_eq!(
+            out,
+            [
+                "six:",
+                "    mov w10, w5",
+                "    madd w5, w1, w2, w0",
+                "    sub w5, w5, w3",
+                "    madd w0, w4, w10, w5",
+                "    ret",
+            ],
+            "{}",
+            out.join("\n")
+        );
+        let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        assert!(coalesce_entry_copies(&mut lines, &mut kinds, n));
+        assert!(
+            !coalesce_entry_copies(&mut lines, &mut kinds, n),
+            "one call must reach the fixpoint"
+        );
+    }
+
+    /// `mov w5, w0` leaves x5 = zext(w0) while x0 keeps the caller's upper
+    /// half: a later 64-bit read of x5 forbids the fold.
+    #[test]
+    fn entry_coalescing_keeps_a_32_bit_copy_read_as_64_bits() {
+        for asm in [
+            "f:\n    mov w5, w0\n    add x0, x5, #1\n    ret\n",
+            "f:\n    mov w5, w0\n    ldr w0, [x1, x5, lsl #2]\n    ret\n",
+        ] {
+            let out = coalesce_to_fixpoint(asm);
+            assert!(
+                out.iter().any(|l| l.trim() == "mov w5, w0"),
+                "{}",
+                out.join("\n")
+            );
+        }
+    }
+
+    /// x0/x1 carry the result to the caller: a copy INTO one of them is never
+    /// renamed away, but x2-x7 are no result registers (`A64_RET_GP`).
+    #[test]
+    fn entry_coalescing_respects_only_the_result_registers_at_ret() {
+        let keep = coalesce_to_fixpoint("f:\n    mov x1, x5\n    add x0, x1, #1\n    ret\n");
+        assert!(
+            keep.iter().any(|l| l.trim() == "mov x1, x5"),
+            "{}",
+            keep.join("\n")
+        );
+        let fold = coalesce_to_fixpoint("f:\n    mov x5, x2\n    add x0, x5, #1\n    ret\n");
+        assert_eq!(
+            fold,
+            ["f:", "    add x0, x2, #1", "    ret"],
+            "{}",
+            fold.join("\n")
+        );
+    }
+
+    /// `mov wN, wN` clears bits 63:32 of xN: unobservable before a W write of
+    /// N that reads N only through its W view, observable otherwise.
+    #[test]
+    fn zext_self_move_goes_only_before_a_32_bit_overwrite() {
+        let gone = peephole_optimize(
+            "f:\n    mov w0, w0\n    and w0, w0, #0xff\n    fmov s0, w0\n    ret\n".to_string(),
+        );
+        assert!(!gone.contains("mov w0, w0"), "{gone}");
+        assert!(gone.contains("and w0, w0, #0xff"), "{gone}");
+        // W-view readers in between (the 32-bit count) do not see it either.
+        let count = peephole_optimize(
+            "f:\n    mov w0, w0\n    fmov s0, w0\n    cnt v0.8b, v0.8b\n    uaddlv h0, v0.8b\n    fmov w0, s0\n    ret\n"
+                .to_string(),
+        );
+        assert!(!count.contains("mov w0, w0"), "{count}");
+        assert!(count.contains("fmov s0, w0"), "{count}");
+        for (body, why) in [
+            ("    mov w0, w0\n    add x0, x0, #1\n", "64-bit read"),
+            (
+                "    mov w0, w0\n    add w1, w0, #1\n    mov x2, x0\n",
+                "no overwrite",
+            ),
+            ("    mov w0, w0\n    str x0, [x1]\n", "64-bit store"),
+            (
+                "    mov w0, w0\n    fmov s0, w0\n    fmov d1, x0\n    mov w0, #1\n",
+                "64-bit read after a W read",
+            ),
+            (
+                "    mov w0, w0\n    svc #0\n    mov w0, #1\n",
+                "the kernel reads x0",
+            ),
+        ] {
+            let out = peephole_optimize(format!("f:\n{body}    ret\n"));
+            assert!(out.contains("mov w0, w0"), "{why}: {out}");
+        }
+    }
+
+    /// The in-place zero-extension of a 32-bit argument kept in its arrival
+    /// register goes when no path reads bits 63:32 before N is redefined: a
+    /// `ret` that does not return N, both arms of a W-view test, a loop that
+    /// reads only the W view. Any X-view read on any path keeps it, and so
+    /// does control flow the analysis cannot follow.
+    #[test]
+    fn zext_self_move_goes_when_no_path_reads_the_x_view() {
+        let gone = [
+            "f:\n    mov w4, w4\n    madd w0, w4, w5, w0\n    ret\n",
+            "f:\n    mov w4, w4\n    cbz w4, .L1\n    sub w0, w0, w2\n    ret\n.L1:\n    mul w0, w1, w3\n    ret\n",
+            "f:\n    mov w4, w4\n.L1:\n    add w0, w0, w4\n    subs w1, w1, #1\n    b.ne .L1\n    ret\n",
+            // An X write that reads only the W view redefines all of x4.
+            "f:\n    mov w4, w4\n    sxtw x4, w4\n    bl g\n    ret\n",
+        ];
+        for asm in gone {
+            let out = peephole_optimize(asm.to_string());
+            assert!(!out.contains("mov w4, w4"), "{asm}=>{out}");
+        }
+        let kept = [
+            // x0 is the result register.
+            "f:\n    mov w0, w0\n    ret\n",
+            // One arm reads the X view.
+            "f:\n    mov w4, w4\n    cbz w4, .L1\n    ret\n.L1:\n    mov x0, x4\n    ret\n",
+            // A loop-carried X-view read.
+            "f:\n    mov w4, w4\n.L1:\n    add x0, x0, x4\n    subs w1, w1, #1\n    b.ne .L1\n    ret\n",
+            // A call may read its argument registers as 64-bit values.
+            "f:\n    mov w5, w5\n    bl g\n    ret\n",
+            // An indirect branch: no exact successor set.
+            "f:\n    mov w4, w4\n    adr x17, .L1\n    br x17\n.L1:\n    ret\n",
+        ];
+        for asm in kept {
+            let out = peephole_optimize(asm.to_string());
+            let zext = asm.lines().nth(1).unwrap_or_default().trim().to_string();
+            assert!(out.contains(&zext), "{asm}=>{out}");
+        }
+    }
+
+    /// `mov xA, xS; mov wA, wA` is `mov wA, wS` whatever follows: xA ends as
+    /// zext32(wS) either way and S is not touched.
+    #[test]
+    fn copy_then_zext_merges_into_one_32_bit_copy() {
+        let out = peephole_optimize(
+            "f:\n    mov x0, x4\n    mov w0, w0\n    cmp w0, #8\n    b.hs .L1\n    add x0, x0, #1\n.L1:\n    ret\n"
+                .to_string(),
+        );
+        assert!(out.contains("mov w0, w4"), "{out}");
+        assert!(
+            !out.contains("mov x0, x4") && !out.contains("mov w0, w0"),
+            "{out}"
+        );
+        // sp has no plain 32-bit move.
+        let sp = peephole_optimize(
+            "f:\n    mov x0, sp\n    mov w0, w0\n    str x0, [x1]\n    ret\n".to_string(),
+        );
+        assert!(
+            sp.contains("mov x0, sp") && sp.contains("mov w0, w0"),
+            "{sp}"
+        );
+    }
+
+    /// An entry copy coalesces across unclassified mnemonics that name every
+    /// register they touch (`ucvtf`, `csel`, `fmov`), never across a
+    /// supervisor call, which reads x0-x8 unnamed.
+    #[test]
+    fn entry_copy_coalesces_across_named_operand_mnemonics() {
+        let out = coalesce_to_fixpoint(
+            "f:\n    mov w4, w0\n    ucvtf s16, w4\n    fmov s0, s16\n    ret\n",
+        );
+        assert_eq!(
+            out,
+            ["f:", "    ucvtf s16, w0", "    fmov s0, s16", "    ret"],
+            "{}",
+            out.join("\n")
+        );
+        let sel = coalesce_to_fixpoint(
+            "f:\n    mov w8, w0\n    mov w9, w1\n    cmp w2, #0\n    csel w0, w8, w9, ne\n    ret\n",
+        );
+        assert_eq!(
+            sel,
+            ["f:", "    cmp w2, #0", "    csel w0, w0, w1, ne", "    ret"],
+            "{}",
+            sel.join("\n")
+        );
+        let svc = coalesce_to_fixpoint("f:\n    mov x8, x0\n    svc #0\n    mov x0, x8\n    ret\n");
+        assert!(
+            svc.iter().any(|l| l.trim() == "mov x8, x0"),
+            "{}",
+            svc.join("\n")
+        );
+    }
+
+    /// A callee-saved row lives exactly as long as its save: deleting the
+    /// save (or the half of a pair that named the register) drops the row,
+    /// a surviving save keeps it, and the frame-record rows are not touched.
+    #[test]
+    fn orphaned_callee_save_rows_follow_their_saves() {
+        let asm = "f:\n.cfi_startproc\n    stp x29, x30, [sp, #-48]!\n    .cfi_def_cfa_offset 48\n    .cfi_offset x29, -48\n    .cfi_offset x30, -40\n    mov x29, sp\n    .cfi_def_cfa_register x29\n    stp x19, x20, [sp, #16]\n    .cfi_offset x19, -32\n    .cfi_offset x20, -24\n    str d8, [sp, #32]\n    .cfi_offset d8, -16\n    mov x19, x0\n    ret\n.cfi_endproc\n";
+        let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        let live = |kinds: &[LineKind], lines: &[String]| -> Vec<String> {
+            lines
+                .iter()
+                .zip(kinds)
+                .filter(|(_, k)| **k != LineKind::Nop)
+                .map(|(l, _)| l.trim().to_owned())
+                .collect()
+        };
+        drop_orphaned_save_rows(&lines, &mut kinds, n);
+        assert_eq!(
+            live(&kinds, &lines).len(),
+            n,
+            "every save survives: no row goes"
+        );
+        // The d8 save is deleted; the pair is split down to x20.
+        kinds[11] = LineKind::Nop;
+        lines[8] = "    str x20, [sp, #24]".to_owned();
+        kinds[8] = classify_line(&lines[8]);
+        drop_orphaned_save_rows(&lines, &mut kinds, n);
+        let out = live(&kinds, &lines);
+        assert!(!out.iter().any(|l| l == ".cfi_offset d8, -16"), "{out:#?}");
+        assert!(!out.iter().any(|l| l == ".cfi_offset x19, -32"), "{out:#?}");
+        assert!(out.iter().any(|l| l == ".cfi_offset x20, -24"), "{out:#?}");
+        assert!(out.iter().any(|l| l == ".cfi_offset x29, -48"), "{out:#?}");
+        assert!(out.iter().any(|l| l == ".cfi_offset x30, -40"), "{out:#?}");
+    }
+
     /// Coalescing an argument copy into a caller-saved home stays available.
     #[test]
     fn entry_coalescing_still_folds_a_plain_argument_copy() {
@@ -10584,10 +11094,12 @@ f:
     mov x23, x0
     ret
 ";
+        // The copy and the zero-extension may only merge into the 32-bit
+        // copy that leaves the same x0.
         let result = peephole_optimize(input.to_string());
         assert!(
-            result.contains("mov w0, w0"),
-            "zext chain into x0 before ret must not fold:\n{}",
+            result.contains("mov w0, w22") && !result.contains("mov x0, x22"),
+            "zext chain into x0 before ret must not fold away x0:\n{}",
             result
         );
     }
@@ -10603,10 +11115,11 @@ f:
     add w5, w0, #1
     ret
 ";
-        // x0 is read after the chain: folding would lose the zext value.
+        // x0 is read after the chain: folding into x26 alone would lose
+        // the zext value, which only the 32-bit copy may produce now.
         let result = peephole_optimize(input.to_string());
         assert!(
-            result.contains("mov w0, w0"),
+            result.contains("mov w0, w24") && result.contains("add w5, w0, #1"),
             "live accumulator blocks fold:\n{}",
             result
         );
@@ -10757,13 +11270,15 @@ f:
 
     #[test]
     fn test_dead_pre_ret_w0_zext_semantics_kept() {
-        // `mov w0, w0` is a 32-bit write that zero-extends x0's low half —
-        // observable through the caller's view of x0. Never delete.
+        // `mov w0, w0` is a 32-bit write that zero-extends x0's low half --
+        // observable through the caller's view of x0. Never drop it; the
+        // copy and the zero-extension may only merge into the one 32-bit
+        // copy that computes the same x0.
         let input = "f:\n    mov x0, x22\n    mov w0, w0\n    ret\n";
         let result = peephole_optimize(input.to_string());
         assert!(
-            result.contains("mov w0, w0"),
-            "zext-into-x0 deleted:\n{}",
+            result.contains("mov w0, w22") && !result.contains("mov x0, x22"),
+            "zext-into-x0 lost or not merged:\n{}",
             result
         );
     }
@@ -10771,16 +11286,18 @@ f:
     #[test]
     fn test_dead_pre_ret_read_blocks_removal() {
         // The move's destination is read by a store through an argument
-        // pointer (which DSE cannot prove dead): the move is live and the
-        // whole sequence must survive verbatim.
+        // pointer (which DSE cannot prove dead): the move is live, so the
+        // pre-`ret` cleanup must not drop it. The entry-copy coalescer may
+        // still fold it into its source (x5 is no result register), which
+        // stores the very same value.
         let input = "f:\n    mov x5, x0\n    str x5, [x19]\n    ret\n";
         let result = peephole_optimize(input.to_string());
         assert!(
-            result.contains("mov x5, x0"),
-            "live move deleted:\n{}",
+            (result.contains("mov x5, x0") && result.contains("str x5, [x19]"))
+                || (!result.contains("x5") && result.contains("str x0, [x19]")),
+            "live move or its store lost:\n{}",
             result
         );
-        assert!(result.contains("str x5, [x19]"), "store lost:\n{}", result);
     }
 
     // ── fuse_and_cmp_zero ─────────────────────────────────────────────────
@@ -10840,11 +11357,12 @@ f:
 
     #[test]
     fn test_zext_and_unknown_source_kept() {
-        // w6's high bits are unknown: the mask is semantically required.
+        // w6's high bits are unknown: the mask is semantically required. (The
+        // 32-bit entry copy itself may fold into w6: only W views follow.)
         let input = "f:\n    mov w4, w6\n    and w5, w4, #0xff\n    add x9, x5, #1\n    ret\n";
         let result = peephole_optimize(input.to_string());
         assert!(
-            result.contains("and w5, w4, #0xff"),
+            result.contains("and w5, w4, #0xff") || result.contains("and w5, w6, #0xff"),
             "needed mask removed:\n{}",
             result
         );

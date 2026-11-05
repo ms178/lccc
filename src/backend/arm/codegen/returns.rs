@@ -39,6 +39,21 @@ impl ArmCodegen {
                 self.emit_epilogue_and_ret_impl(frame_size);
                 return;
             }
+            // A float or double already in an FP register goes straight to
+            // v0: through the accumulator it crossed the register files
+            // twice (`fmov x0, d16; fmov d0, x0`).
+            if matches!(ret_ty, IrType::F32 | IrType::F64)
+                && let Operand::Value(v) = val
+                && let Some(&reg) = self.reg_assignments.get(&v.0)
+                && super::emit::is_arm_fp_phys(reg)
+            {
+                let src = super::emit::arm_fp_name(reg, ret_ty);
+                let dst = if ret_ty == IrType::F32 { "s0" } else { "d0" };
+                self.state
+                    .emit_fmt(format_args!("    fmov {}, {}", dst, src));
+                self.emit_epilogue_and_ret_impl(frame_size);
+                return;
+            }
         }
         crate::backend::traits::emit_return_default(self, val, frame_size);
     }
