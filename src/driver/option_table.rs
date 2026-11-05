@@ -128,13 +128,13 @@ pub(super) const CONTRACTS: &[Contract] = &[
     Contract {
         spelling: "-Ofast",
         class: Class::Implemented,
-        rationale: "Enables fast-math: __FAST_MATH__=1 and __OPTIMIZE__=1, changing codegen.",
+        rationale: "-O3 with the full -ffast-math umbrella: __FAST_MATH__=1, FP reassociation, fast contraction; a packed reduction vectorizes.",
         probe_id: Some("probe-Ofast-fast-math"),
     },
     Contract {
         spelling: "-Og",
         class: Class::Implemented,
-        rationale: "Debug-aware optimisation mode: __OPTIMIZE__=1 and a distinct instruction schedule.",
+        rationale: "-O1 codegen with optimize_debug=true and frame-pointer omission: __OPTIMIZE__=1; distinct from -O2 on the probe.",
         probe_id: Some("probe-Og-debug-opt"),
     },
     Contract {

@@ -222,6 +222,42 @@ pub const GCC_COMPAT_PATCHLEVEL: &str = "0";
 pub const GCC_COMPAT_FULL_VERSION: &str = "16.2.0";
 
 impl Driver {
+    /// Apply or withdraw GCC's `-ffast-math` umbrella.
+    ///
+    /// `-Ofast` is specified as `-O3 -ffast-math`, so both spellings must set
+    /// exactly the same driver state. The assignments used to be spelled
+    /// twice: `-Ofast` set only `fast_math`, which defines `__FAST_MATH__`
+    /// but left reassociation, contraction, trapping/rounding and errno at
+    /// their strict defaults. A scalar fixture cannot see that difference --
+    /// both gates passed -- but a vectorizable FP reduction showed
+    /// `-Ofast` == `-O3` (11 instructions) while `-O3 -ffast-math` emitted a
+    /// packed reduction (63 instructions). One helper makes that drift
+    /// impossible to reintroduce.
+    fn set_fast_math(&mut self, enabled: bool) {
+        if enabled {
+            self.fp_trapping_math = false;
+            self.fp_rounding_math = false;
+            self.fast_math = true;
+            self.fp_reassoc = true;
+            self.math_errno = false;
+            // GCC: fast-math implies contract=fast only when no explicit
+            // -ffp-contract was given (opts_set semantics).
+            if !self.fp_contract_explicit {
+                self.fp_contract = FpContract::Fast;
+            }
+        } else {
+            self.fast_math = false;
+            self.fp_reassoc = false;
+            self.math_errno = true;
+            // Restore the language default. In GCC, -ffp-contract is
+            // orthogonal to -fno-fast-math: the C default (fast) stands.
+            // Explicit -ffp-contract={on,off,fast} wins in either order.
+            if !self.fp_contract_explicit {
+                self.fp_contract = FpContract::c_language_default();
+            }
+        }
+    }
+
     /// Parse the value of `-falign-*=N[:M]`: a power-of-two byte alignment
     /// with an optional max-skip (`.p2align` third operand). Returns `None`
     /// for anything GCC would reject at option processing.
@@ -2315,7 +2351,8 @@ impl Driver {
                     self.optimize = true;
                     self.optimize_size = false;
                     self.omit_frame_pointer = true;
-                    self.fast_math = true;
+                    // -Ofast IS -O3 -ffast-math, not merely a macro define.
+                    self.set_fast_math(true);
                 }
 
                 // Debug info — GCC flag semantics, honored exactly:
@@ -3573,29 +3610,8 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                     self.builtin_policy
                         .withdraw_name(&arg["-fno-builtin-".len()..]);
                 }
-                "-ffast-math" => {
-                    self.fp_trapping_math = false;
-                    self.fp_rounding_math = false;
-                    self.fast_math = true;
-                    self.fp_reassoc = true;
-                    self.math_errno = false;
-                    // GCC: fast-math implies contract=fast only when no
-                    // explicit -ffp-contract was given (opts_set semantics).
-                    if !self.fp_contract_explicit {
-                        self.fp_contract = FpContract::Fast;
-                    }
-                }
-                "-fno-fast-math" => {
-                    self.fast_math = false;
-                    self.fp_reassoc = false;
-                    self.math_errno = true;
-                    // Restore the language default. In GCC, -ffp-contract is
-                    // orthogonal to -fno-fast-math: the C default (fast)
-                    // stands. Explicit -ffp-contract={on,off,fast} wins.
-                    if !self.fp_contract_explicit {
-                        self.fp_contract = FpContract::c_language_default();
-                    }
-                }
+                "-ffast-math" => self.set_fast_math(true),
+                "-fno-fast-math" => self.set_fast_math(false),
                 "-fmath-errno" => self.math_errno = true,
                 "-fno-math-errno" => self.math_errno = false,
                 "-funsafe-math-optimizations" | "-fassociative-math" => {
@@ -5496,6 +5512,60 @@ mod cli_tests {
             driver.parse_cli_args(&args).unwrap();
             assert_eq!(driver.math_errno, expected, "{flags:?}");
         }
+    }
+
+    /// `-Ofast` is GCC's `-O3 -ffast-math`, not an `-O3` alias that happens
+    /// to define `__FAST_MATH__`. Every field owned by the umbrella flag must
+    /// agree, and the explicit-option overrides must still win.
+    #[test]
+    fn ofast_is_exactly_o3_plus_ffast_math() {
+        let parse = |flags: &[&str]| {
+            let mut driver = Driver::new();
+            let mut args = vec!["lccc".to_string()];
+            args.extend(flags.iter().map(|f| (*f).to_string()));
+            args.push("x.c".to_string());
+            driver.parse_cli_args(&args).unwrap();
+            driver
+        };
+        let ofast = parse(&["-Ofast"]);
+        let composed = parse(&["-O3", "-ffast-math"]);
+        assert_eq!(ofast.opt_level, composed.opt_level, "opt level");
+        assert_eq!(ofast.fast_math, composed.fast_math, "__FAST_MATH__");
+        assert_eq!(ofast.fp_reassoc, composed.fp_reassoc, "FP reassociation");
+        assert_eq!(ofast.fp_contract, composed.fp_contract, "FP contraction");
+        assert_eq!(ofast.math_errno, composed.math_errno, "math errno");
+        assert_eq!(
+            ofast.fp_trapping_math, composed.fp_trapping_math,
+            "trapping math"
+        );
+        assert_eq!(
+            ofast.fp_rounding_math, composed.fp_rounding_math,
+            "rounding math"
+        );
+        assert!(
+            ofast.fast_math && ofast.fp_reassoc,
+            "-Ofast must actually enable the fast-math pipeline"
+        );
+
+        let disabled = parse(&["-Ofast", "-fno-fast-math"]);
+        assert!(
+            !disabled.fast_math && !disabled.fp_reassoc,
+            "-fno-fast-math must still win after -Ofast"
+        );
+        assert_eq!(disabled.opt_level, 3, "withdrawing fast-math keeps -O3");
+
+        let explicit = parse(&["-Ofast", "-ffp-contract=off"]);
+        assert_eq!(
+            explicit.fp_contract,
+            FpContract::Off,
+            "an explicit -ffp-contract must win over -Ofast"
+        );
+        let reversed = parse(&["-ffp-contract=off", "-Ofast"]);
+        assert_eq!(
+            reversed.fp_contract,
+            FpContract::Off,
+            "explicit -ffp-contract is sticky in both orders"
+        );
     }
 
     #[test]

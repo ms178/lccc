@@ -33,7 +33,7 @@ without a test that fails when it regresses.
 
 | # | ID | Backlog source | Measured state before | Decision & change | Regression |
 |---|---|---|---|---|---|
-| 1 | GP-22/1 | `backlog.md` §12 | 17 ledger rows, 5 contradicted the binary | Reclassified 3 `Inert`→`Refused` (`-fprofile-arcs`, `-ftest-coverage`, `-static-pie`) and 2 `Inert`→`Implemented` (`-Ofast`, `-Og`), each verified by macro/assembly deltas | `option_effect_ledger.py` + `test_option_effect_ledger.py` |
+| 1 | GP-22/1 | `backlog.md` §12 | 17 ledger rows, 5 contradicted the binary | Reclassified 3 `Inert`→`Refused` and 2 `Inert`→`Implemented` by measurement; tracing `-Ofast` further exposed a macro-only implementation, fixed with a shared fast-math umbrella (finding 10) | `option_effect_ledger.py`, Rust unit test, non-vacuous composition gate, `test_ofast_composition.py` |
 | 2 | GP-22/2 | §12 | 17 `probe_id`s, **zero consumers** | New probe registry; every accepted row must resolve to an implemented probe | `static_problems` + 16 tests |
 | 3 | GP-22/3 | §12 | registry could gain orphans silently | Exact set equality between ledger probes and registry; duplicates rejected | check 3 + negative control |
 | 4 | GP-22/4 | §12 | priority set asserted only in prose | 7 priority spellings must all be ledgered | check 4 + Rust unit test |
@@ -126,7 +126,30 @@ without a test that fails when it regresses.
    before every compile, and exact-duplicate suppression in the problem list.
    Seven new tests cover all three plus a non-executable file and a positive
    control proving a fresh compile is still hashed correctly.
-10. **Host-CPU runtime behaviour was checked with a real debugger, not just
+10. **`-Ofast` was a macro-only lie: a real missed optimization and GCC
+    incompatibility.**  Tracing the reclassified rows into `cli.rs` showed
+    `-ffast-math` sets six driver fields (`fp_trapping_math`,
+    `fp_rounding_math`, `fast_math`, `fp_reassoc`, `math_errno`,
+    `fp_contract`) while `-Ofast` set only `fast_math` — enough to define
+    `__FAST_MATH__`, not enough to enable the fast-math pipeline. Measured on
+    a packed FP reduction (x86-64): LCCC `-O3` and `-Ofast` were both an
+    11-instruction scalar loop, while `-O3 -ffast-math` emitted a 63-instruction
+    vectorized loop with 8 packed adds. GCC 16.2.0 and Clang 23.1.5 both emit
+    byte-identical assembly for `-Ofast` and `-O3 -ffast-math`, distinct from
+    `-O3`. The pre-existing GP-22 composition gate asserted that equality but
+    on a scalar probe with no reduction, where all three variants are identical
+    — a vacuous check that stayed green for the whole defect.
+    Fix: one `Driver::set_fast_math(enabled)` helper used by `-ffast-math`,
+    `-fno-fast-math` and `-Ofast`, so the two spellings cannot drift again.
+    A Rust unit test pins all six fields, `-O3 -ffast-math` equivalence,
+    `-fno-fast-math` last-wins, and explicit `-ffp-contract` precedence in both
+    orders. The regression gate now checks a reduction fixture with explicit
+    non-vacuity controls for LCCC and GCC; a corpus module checks LCCC, GCC and
+    Clang plus a wrapper compiler that reproduces the old behaviour (which the
+    check rejects with two distinct diagnostics). This is the only change in the
+    PR that alters compiler output, and it removes a genuine "cycles left
+    behind" defect rather than adding an unmeasured optimization.
+11. **Host-CPU runtime behaviour was checked with a real debugger, not just
    assembly hashes.**  A four-frame `noinline` fixture compiled by LCCC,
    GCC 16.2 and Clang 23.1.5 at `-O2`, `-Ofast` and `-Og` produces identical
    results for inputs 5, -3, 0 and 12345 (`6n+16`). GDB's backtrace at `leaf`
@@ -157,6 +180,7 @@ in a per-compilation loop. Measured on the 2-vCPU host (minimum of 3 runs):
 | `check_backlog_roi.Context.load` | O(sum of 17 file sizes), read once | 0.081 s for all 20 checks + 21 negative controls | One read per input; checks share a frozen context instead of re-reading the tree 41 times. |
 | `check_backlog_roi.run_all` | O(20) | included above | Each check returns named problems, so `--json` can attribute a failure to one item. |
 | `check_dwarf_die_census.census` | O(DIE lines), streaming | 0.364 s for 4 dialects × 3 compilers | Line-by-line state machine; no DOM, no retained DIE tree, so memory is O(tags + attributes). |
+| `Driver::set_fast_math` | O(1), six field writes | n/a (per-process option parse) | One shared helper replaced two duplicated assignment blocks; zero allocations, zero branches beyond the `enabled` flag and the sticky explicit-contract check. The removed defect cost an entire vectorized FP reduction at `-Ofast`. |
 | `option_effect_ledger` × 4 arch drivers | O(4 × rows × probes) | 1.675 s for all 18 option-ledger tests | The same 17 rows are probed against four host executables that emit four targets' assembly; reuses parsed rows instead of re-reading the source four times. |
 | `check_sse2_codegen_matrix` `--check` | O(122 rows × 3 compilers) | 6.230 s | Dominated by 366 real compilations; the checker itself is linear. |
 
@@ -188,16 +212,21 @@ GCC 16.2.0 / Clang 23.1.5 / GDB 18.1 / Rust 1.99.1 oracles.
 | `cargo build --profile fastbuild --locked`, `RUSTFLAGS=-D warnings` | **exit 0, zero warnings** (0 `warning` lines in the build log) |
 | `cargo fmt --check` | **exit 0** |
 | `cargo clippy --profile fastbuild --locked -- -D warnings` | **exit 0** (hosted Clippy lane passes too) |
-| `cargo test --profile fastbuild --locked driver_option_contract_table` | **1 passed, 0 failed**, 8083 filtered |
+| `cargo test --profile fastbuild --locked` (full Rust suite, `RUSTFLAGS=-D warnings`) | **8075 passed, 0 failed, 10 ignored**, zero compiler warnings |
+| `cargo test --profile fastbuild --locked driver_option_contract_table` | **1 passed, 0 failed**, 8084 filtered |
+| `cargo test … ofast_is_exactly_o3_plus_ffast_math` | **1 passed** (six driver fields, last-wins, explicit-contract precedence) |
 | `option_effect_ledger.py --lccc … --self-test --json` | 17 rows, 11 probes, 7 priority options, **0 problems** |
 | `check_driver_option_contract.sh --skip-trapv-matrix` | **exit 0**, including the executable ledger |
 | `check_sse2_codegen_matrix.py --check / --self-test / --update-baseline` | **all PASS** (122 rows; re-derived against the live oracles) |
 | `check_dwarf_die_census.py` (4 dialects × 3 compilers) | **PASS** with the tightened 12-tag / 20-attribute baseline |
 | `check_backlog_roi.py --self-test --json` | **20/20 PASS, 0 negative-control failures** |
+| `tests/regression/check_option_effect_ledger.py` (rebuilt binary, GCC 16.2.0) | **PASS**, now with non-vacuous `-Ofast` composition rows; a simulated macro-only compiler makes it exit 1 with two diagnostics |
+| `tests.corpus.test_ofast_composition` | **4 tests OK** (LCCC/GCC/Clang agreement, non-vacuity, wrapper negative control, shared-helper source pin) |
 | `tests.corpus.test_dwarf_die_census_ratchet` | **8 tests OK**, incl. end-to-end lost-tag and stale-deferral negative controls |
 | `tests.corpus.test_option_effect_ledger` | **24 tests OK**, incl. the 4-architecture dynamic sweep and 7 gate-robustness controls |
+| new/changed corpus modules together | **60 tests OK** |
 | `tests.corpus.test_gdb_option_runtime` | **7 tests OK** with pinned GDB 18.1 |
-| `unittest discover -s tests/corpus -p 'test_*.py'` | **1302 tests, 0 failures, 5 skips** |
+| `unittest discover -s tests/corpus -p 'test_*.py'` | **1306 tests, 0 failures, 5 skips** |
 | `check_doc_links.py`, `check_script_imports.py`, `check_no_conflict_markers.py`, `check_ci_workflow_shell.py` | **all PASS** |
 | Hosted CI on `fd3d490` | **22 pass / 3 skipping / 0 failures**, including the authenticated ICX 2026.2 integration lane |
 

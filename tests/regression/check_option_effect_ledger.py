@@ -61,6 +61,17 @@ FIXTURES = {
         "int proto_def() { return 0; }\n"
         "void proto_nested(int (*cb)());\n"
     ),
+    # A packed FP reduction: reassociation is observable here. The scalar
+    # probe below has no reduction, so -O3/-Ofast/-O3 -ffast-math all emit
+    # identical bytes on it and a composition check that uses ONLY that probe
+    # is vacuous. Measured on x86-64 with GCC 16.2.0 and LCCC 16.2.0.
+    "fastmath.c": (
+        "double fp_reduce(const double *p, int n) {\n"
+        "    double s = 0.0;\n"
+        "    for (int i = 0; i < n; i++) s += p[i];\n"
+        "    return s;\n"
+        "}\n"
+    ),
     "noplt.c": (
         "extern void nf(void) __attribute__((noplt));\n"
         "extern void pf(void);\n"
@@ -142,6 +153,7 @@ def main() -> int:
         div_quiet_c = base / "divquiet.c"
         proto_c = base / "proto.c"
         noplt_c = base / "noplt.c"
+        fast_c = base / "fastmath.c"
 
         # --- effect: -fwhole-program internalises (GP-16's verified row) ---
         need("-fwhole-program")
@@ -181,15 +193,33 @@ def main() -> int:
             print("ledger -Og: PASS (LCCC == -O1 everywhere; GCC scalar probe agrees)")
 
         # --- composition: -Ofast == -O3 + fast-math, both compilers -------
+        # `opt.c` cannot discriminate: with no reduction to reassociate,
+        # -O3, -Ofast and -O3 -ffast-math emit identical bytes. Checking only
+        # that probe once let -Ofast set the __FAST_MATH__ macro without
+        # setting fp_reassoc, so the fast-math pipeline stayed off. The
+        # inequality rows below are non-vacuity controls: if either compiler
+        # stops showing a fast-math delta on `fastmath.c`, the equality rows
+        # are meaningless and the gate must fail.
         need("-Ofast")
-        if asm(lccc, opt, "-Ofast") != asm(lccc, opt, "-O3", "-ffast-math"):
-            failures.append("-Ofast: LCCC -Ofast != -O3 -ffast-math")
-        if asm(gcc, opt, "-Ofast") != asm(gcc, opt, "-O3"):
-            failures.append("-Ofast: GCC -Ofast != -O3 on the probe (oracle drift)")
+        for fixture in (opt, fast_c):
+            composed = asm(lccc, fixture, "-O3", "-ffast-math")
+            if asm(lccc, fixture, "-Ofast") != composed:
+                failures.append(
+                    f"-Ofast: LCCC -Ofast != -O3 -ffast-math on {fixture.name}")
+            if asm(gcc, fixture, "-Ofast") != asm(gcc, fixture, "-O3", "-ffast-math"):
+                failures.append(
+                    f"-Ofast: GCC -Ofast != -O3 -ffast-math on {fixture.name} (oracle drift)")
+        if asm(lccc, fast_c, "-O3") == asm(lccc, fast_c, "-Ofast"):
+            failures.append(
+                "-Ofast: LCCC composition check is vacuous (no fast-math codegen delta)")
+        if asm(gcc, fast_c, "-O3") == asm(gcc, fast_c, "-Ofast"):
+            failures.append(
+                "-Ofast: GCC composition check is vacuous (oracle drift)")
         if asm(lccc, opt, "-Ofast") == asm(lccc, opt):
             failures.append("-Ofast: LCCC artifact unchanged from default")
         if not any(f.startswith("-Ofast") for f in failures):
-            print("ledger -Ofast: PASS (== -O3 -ffast-math; differs from default)")
+            print("ledger -Ofast: PASS (== -O3 -ffast-math on scalar and packed "
+                  "reduction; non-vacuous)")
 
         # --- refusal: coverage flags (GP-13's honest refusal) ---------------
         # GCC's side is recorded as the divergence: -ftest-coverage writes a
