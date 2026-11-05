@@ -1225,3 +1225,39 @@ gate bypasses the balance and review record. Both steps are now registered in
 365.57 / 352.29 / 352.27 (3.7% spread vs the 5% tolerance). All seven mock
 gates, the lane-plan self-test (18 rules / 25 fixtures) and CI/local gate
 parity pass locally before the fix was pushed.
+
+### 9.14 Audit-census ratchet: the one intentional re-baseline
+
+`scripts/audit_census.py --check` is a hosted gate (`.github/workflows/ci.yml`
+`backend-contracts-b`, `scripts/ci_local.sh` `audit-census-ratchet`) and it
+went red on this patch: `fns_over_300: 232 -> 233 (+1)` and
+`knob_literals: 561 -> 563 (+2) [CCC_LEGACY_BYTE_STRINGS,
+CCC_SLOW_DEAD_MOVE_CENSUS]`. The tool explicitly permits "justify and
+re-baseline in the commit that adds them", so the baseline was raised
+SURGICALLY (only those two numbers plus the two new names in `knob_names`,
+keeping `len(knob_names) == knob_literals`), NOT via `--update`: `--update`
+would also have ratcheted DOWN `panic_sites 877 -> 867`,
+`panic_sites_hot 99 -> 95` and `knobs_undocumented 262 -> 261`, tightening
+three unrelated ratchets for the two in-flight PRs. Neither #1102 nor #1104
+edits `scripts/audit_census_baseline.json`, so there is no merge conflict.
+
+Both deltas are 100% attributable to this patch and were identified by name,
+not guessed:
+
+* `fns_over_300 +1`: `peephole_optimize` in
+  `src/backend/i686/codegen/peephole.rs` went from 296 to **312 lines** solely
+  because of the 23 `clock.mark(...)` lines of the opt-in `CCC_TIME_PEEPHOLE`
+  phase instrument. All seven other >300-line functions in that file are
+  byte-for-byte the same lengths as on the base commit (verified by running
+  `audit_census.scan_functions(strip_tests(...))` over both trees). It was
+  NOT refactored: any Rust source edit would change the SHA-256-pinned
+  compiler binaries while the 34-leg torture campaign is running, and the
+  instrument is a diagnostic, not a code-size regression in generated code.
+* `knob_literals +2`: the two A/B differential oracles. Both are documented
+  in §9.11/§9.12, both have dedicated regression gates, and
+  `CCC_TIME_PEEPHOLE` was ALREADY in the baseline's `knob_names`, so it is not
+  a third new literal.
+
+After the edit: `audit_census.py --check` PASS ("no metric grew"),
+`audit_census.py --selftest` PASS, and `knobs_undocumented` IMPROVED from 262
+to 261 because the two new knobs are documented.
