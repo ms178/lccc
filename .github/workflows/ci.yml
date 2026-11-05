@@ -1002,6 +1002,17 @@ jobs:
         --lccc target/fastbuild/lccc --gcc gcc-16 \
         --json "$RUNNER_TEMP/c-std-diagnostics.json" \
         --markdown "$RUNNER_TEMP/c-std-diagnostics.md"
+        # Debugging quality: the line program, subprogram DIEs, `.debug_aranges`
+        # and `.eh_frame` are decoded by the gate's own reader and checked on
+        # programs whose source it wrote, so a row, a function and a source line
+        # can be compared without a third-party tool. The four `-gdwarf-N`
+        # matrices and the `-O0`/`-O1`/`-O2` tiers pin the internal-definition
+        # policy GCC 16.2 measured: `-O0` keeps every internal definition, the
+        # optimizing tiers drop the unreachable ones.
+        run_gate dwarf_quality python3 tests/regression/check_dwarf_quality.py \
+        --lccc target/fastbuild/lccc --gcc gcc-16 \
+        --json "$RUNNER_TEMP/dwarf-quality.json" \
+        --markdown "$RUNNER_TEMP/dwarf-quality.md"
         run_gate warning_compat python3 tests/regression/check_warning_compat.py \
         --lccc target/fastbuild/lccc --gcc gcc-16
         run_gate warning_precedence python3 tests/regression/check_warning_precedence.py \

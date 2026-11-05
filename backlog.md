@@ -600,8 +600,19 @@ refuse — never ignore. **Effort** M (a–e together L) · **ROI** 3.2.
 
 ### MB-10 · P1 · R — DWARF line tables landed; DIEs and gdb remain
 
-**Status (re-audited 2026-10-27).** The old "no `.debug_*` sections" claim is
-stale for line tables. `tests/regression/check_dwarf_line_tables.py` passes with
+**Status (re-audited 2026-11-05).** The campaign plan that replaces the plan
+below is [`docs/DWARF-CAMPAIGN.md`](docs/DWARF-CAMPAIGN.md): it carries the
+measured tag census (19 DIE kinds at zero against GCC 16.2), twelve work items
+with file anchors and gate assertions, and the two "defects" that a careful audit
+*withdrew*. Two facts from it matter for this entry: the **`-O0` internal
+definition rule is now GCC 16.2's** (an unreferenced `static` function or object
+is emitted at `-O0`, dropped at `-O1`+; measured in both directions, gated by
+`tests/regression/check_dwarf_quality.py`, and it fixed a real link failure where
+`asm("call helper")` named a static function no C expression references), and
+every claim below about line tables, `.debug_aranges` and `.eh_frame` is now
+checked by that gate's own decoder rather than by `readelf`.
+
+The old "no `.debug_*` sections" claim is stale for line tables. `tests/regression/check_dwarf_line_tables.py` passes with
 GCC 16.2 and LCCC on x86-64, plus LCCC i686: it checks `.debug_line` rows,
 `.rela.debug_line` / `.rel.debug_line`, multi-object address relocation,
 non-allocated debug sections, `--strip-all`, and preservation/relocation of
@@ -2968,3 +2979,50 @@ runtime output; every lccc-only diagnostic is triaged into an item of this regis
 
 Nothing in §4–§11 loses priority status by appearing here; the register exists so
 that "GCC 16.2 compatible" is a measurable statement rather than an adjective.
+
+---
+
+## 13. DWARF campaign (measured 2026-11-05)
+
+Full analysis, design and per-item file anchors:
+[`docs/DWARF-CAMPAIGN.md`](docs/DWARF-CAMPAIGN.md). Instrument and gate:
+`tests/regression/check_dwarf_quality.py` (`--self-test` validates its decoders;
+`--lccc`, `--gcc`, `--json`, `--markdown` mirror the other gates' contract). The
+gate reports unimplemented DIE kinds as **named known gaps**, so the list below
+cannot rot: a gap that stops reproducing is reported and its entry must be
+deleted in the same commit that closes the item.
+
+Measured baseline (18 DIE kinds at zero, 1 752 DIEs; 49 benchmark programs,
+`-O0 -g -gdwarf-5`, lccc / GCC 16.2):
+`variable` 0/417, `formal_parameter` 0/485, `base_type` 0/480, `pointer_type`
+0/122, `typedef` 0/103, `const_type` 0/98, `subrange_type` 0/78, `array_type`
+0/74, `member` 0/59, `lexical_block` 0/127, `structure_type` 0/14, `subprogram`
+283/338 (the deficit was the `-O0` statics, **closed**), `unspecified_type` 49/0.
+Structural audit (line program, address map, `.eh_frame`) over 65 files × 4
+configurations: **0 failures**. Correct and gated already: DWARF 2–5 line tables
+with version-gated `prologue_end`/`epilogue_begin`/`discriminator`/`isa`,
+per-unit `.debug_aranges` sets, post-peephole synthesized CFI, dialect identity.
+
+| ID | P | Effort | Item | Gate added |
+|---|---|---|---|---|
+| D1 | P0 | M/L | variables, formal parameters, lexical blocks, external declarations | a `DW_TAG_variable`/`formal_parameter` per source name, with resolvable `DW_AT_type` and `decl_line` in span |
+| D2 | P0 | M | type DIEs: base, derived, aggregate, enum, array, subroutine | DIE byte sizes and member offsets equal the program's own `sizeof`/`offsetof` |
+| D3 | P0 | M→L | `DW_AT_location`: `DW_OP_addr` for statics, `DW_OP_fbreg` at `-O0`, location lists for optimized code | the DIE's location evaluates (CFA walk) to the address the program printed |
+| D4 | P0 | S | a unit with no code still gets a unit | a data-only TU names its variable |
+| D5 | P1 | S | one line sequence per function (GCC's shape; measured 1 for 5 functions today) | `sequences >= functions with code` |
+| D6 | P1 | L | `DW_TAG_inlined_subroutine` with `call_file`/`call_line` | two inlining instances, ranges inside the caller, abstract origin declared |
+| D7 | P1 | M | `-S -g` carries the DIE tree (GCC puts the sections in the `.s`; lccc puts `.loc` only) | `-S`+`as` object's tree equals the `-c` object's |
+| D8 | P2 | M | `-g3`: `.debug_macro` | two macros with line and replacement text; nothing at `-g` |
+| D9 | P2 | S | `-gz` compresses (today: warned as unsupported, emitted plain) | every `.debug_*` carries `SHF_COMPRESSED` and decodes |
+| D10 | P2 | S | `-fdebug-prefix-map`/`-ffile-prefix-map` on `DW_AT_name`/`comp_dir`/`decl_file` | two builds in different directories are byte-identical |
+| D11 | P3 | L | `-gsplit-dwarf`: skeleton unit + `.dwo` | skeleton names the `.dwo`; the tree resolves `pq_global` |
+| D12 | P3 | M | `.debug_names` for DWARF 5 | every subprogram/variable indexed once; lookup equals a full walk |
+
+Ordering is ROI: D4 and D5 are a day each and remove whole classes of
+"no debug info" answers; D1+D2+D3 are the centre (they are what "godlike
+debugging" means) and land as a series, each with executable assertions; D6–D12
+are the polish that makes the artifact GCC-shaped rather than merely valid.
+
+Standing constraints from §1's item format apply unchanged: `fastbuild`, `-j2`,
+`scripts/ci_local.sh --fast` before declaring done, mutation-verified gates
+(revert the fix, watch the gate fail), no reproducer removed to close an item.

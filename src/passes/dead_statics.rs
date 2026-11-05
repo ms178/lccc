@@ -2,8 +2,14 @@
 //!
 //! After optimization passes eliminate dead code paths, some static inline
 //! functions and static const globals from headers may no longer be referenced.
-//! Keeping them wastes code size and may cause linker errors if they reference
-//! symbols that don't exist in this translation unit.
+//! At `-O1` and above, keeping them wastes code size and may cause linker
+//! errors if they reference symbols that don't exist in this translation unit,
+//! so [`DeadStaticsTier::Optimizing`] removes them.  `-O0` is different, and the
+//! difference is measured rather than stylistic: GCC 16.2 keeps an unreferenced
+//! `static` function or object there and drops the same definition at `-O1`, so
+//! [`DeadStaticsTier::Debug`] roots every internal definition.  Instrumented or
+//! asm-level references (`asm("call helper")`) are invisible to the reference
+//! graph, and a debugger must find what the user wrote.
 //!
 //! Algorithm: assign a dense ID to every function and global (not to names),
 //! build the intra-module reference graph, then run worklist reachability from
@@ -20,18 +26,40 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::reexports::{Instruction, IrModule, Operand, Value};
 
+/// Which unreachable internal definitions a tier keeps, measured against GCC
+/// 16.2.0.
+///
+/// `-O1` and above eliminate everything the reference graph cannot reach: an
+/// unused `static` function or object is gone from the object file, and so is
+/// the `retain`d one.  `-O0` keeps every internal definition the source has --
+/// it compiles what it is given and leaves the pruning to the optimizing tiers,
+/// which is why GCC's `-O0` objects carry unused statics and `-O1` objects do
+/// not (measured for `-O0 -O1 -O2 -Os -Og`) -- with one measured exception: an
+/// unused `static inline` function is gone at `-O0` too.
+///
+/// The `-O0` rule is also a correctness boundary rather than a preference: an
+/// inline-asm `call helper` names a static function no C expression mentions, so
+/// the reference graph cannot see the use, and dropping the body turns a program
+/// GCC links into an undefined-symbol link error (measured both ways).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeadStaticsTier {
+    /// `-O1` and above: keep only what the reference graph reaches.
+    Optimizing,
+    /// `-O0`: every internal definition survives, reachable or not.
+    Debug,
+}
+
 /// Remove internal-linkage (static) functions and globals that are unreachable.
 pub(crate) fn eliminate_dead_static_functions(module: &mut IrModule) {
-    eliminate_dead_statics(module, false);
+    eliminate_dead_statics(module, DeadStaticsTier::Optimizing);
 }
 
-/// GCC emits an otherwise-unused `retain` definition at -O0, but may omit it
-/// at optimized levels. Preserve its whole reference graph only in that tier.
+/// `-O0`: GCC emits every internal definition here, reachable or not.
 pub(crate) fn eliminate_dead_statics_at_o0(module: &mut IrModule) {
-    eliminate_dead_statics(module, true);
+    eliminate_dead_statics(module, DeadStaticsTier::Debug);
 }
 
-fn eliminate_dead_statics(module: &mut IrModule, preserve_retained: bool) {
+fn eliminate_dead_statics(module: &mut IrModule, tier: DeadStaticsTier) {
     let n_funcs = module.functions.len();
 
     // Phases 1–4 borrow module strings; the block ends that borrow before we
@@ -50,7 +78,7 @@ fn eliminate_dead_statics(module: &mut IrModule, preserve_retained: bool) {
             &address_taken,
             ReachabilityOptions {
                 name_to_ids: &name_to_ids,
-                preserve_retained,
+                tier,
             },
         );
         (reachable, address_taken)
@@ -686,7 +714,7 @@ fn mark_named(
 /// equivalent to BFS; each ID is enqueued at most once.
 struct ReachabilityOptions<'a> {
     name_to_ids: &'a FxHashMap<&'a str, Vec<usize>>,
-    preserve_retained: bool,
+    tier: DeadStaticsTier,
 }
 
 fn compute_reachability(
@@ -703,13 +731,28 @@ fn compute_reachability(
     let mut reachable = vec![false; nsyms];
     let mut worklist = Vec::with_capacity(nsyms.min(64));
 
+    // The `-O0` tier keeps every internal definition that GCC keeps (see
+    // [`DeadStaticsTier`]): the reference graph stays a superset of the users,
+    // because inline asm and a debugger read symbols no IR instruction names.
+    //
+    // `inline` is the exception, and it is measured rather than inferred: GCC
+    // drops an unused `static inline` function even at `-O0`
+    // (`-fkeep-inline-functions` is what keeps it), so a body the frontend
+    // lowered only because an unevaluated `sizeof`/`typeof` operand mentioned it
+    // must still be removable. Without this, a `static inline` helper whose only
+    // mention is `sizeof(helper())` would drag a call to a symbol that exists
+    // nowhere into the link, which GCC never does (`check_intrinsic_feature_gate`
+    // and the `static_function_refs_vm_contexts` regression pin both halves).
+    let keep_every_internal = options.tier == DeadStaticsTier::Debug;
     for (i, func) in module.functions.iter().enumerate() {
         if func.is_declaration {
             continue;
         }
-        if !func.is_static
+        if (keep_every_internal && !func.is_inline)
+            || !func.is_static
             || func.is_used
-            || (options.preserve_retained && module.retained_functions.contains(&func.name))
+            || (options.tier == DeadStaticsTier::Debug
+                && module.retained_functions.contains(&func.name))
         {
             mark_reachable(i, &mut reachable, &mut worklist);
         }
@@ -719,10 +762,11 @@ fn compute_reachability(
         if global.is_extern {
             continue;
         }
-        if !global.is_static
+        if keep_every_internal
+            || !global.is_static
             || global.is_common
             || global.is_used
-            || (options.preserve_retained && global.is_retain)
+            || (options.tier == DeadStaticsTier::Debug && global.is_retain)
         {
             mark_reachable(n_funcs + j, &mut reachable, &mut worklist);
         }
@@ -1643,6 +1687,30 @@ mod tests {
         assert_eq!(store_count(&m), 1, "$g immediate template must keep store");
     }
 
+    /// A four-byte internal or external object with no initializer: enough for
+    /// the reachability walk, which only reads the linkage flags.
+    fn test_global(name: &str, is_static: bool) -> crate::ir::reexports::IrGlobal {
+        crate::ir::reexports::IrGlobal {
+            name: name.into(),
+            ty: IrType::I32,
+            size: 4,
+            align: 4,
+            init: crate::ir::reexports::GlobalInit::Zero,
+            is_static,
+            is_extern: false,
+            is_common: false,
+            section: None,
+            is_weak: false,
+            visibility: None,
+            has_explicit_align: false,
+            is_const: false,
+            is_used: false,
+            is_retain: false,
+            is_nocommon: false,
+            is_thread_local: false,
+        }
+    }
+
     fn mnemonic_collision_module(template: &str) -> IrModule {
         let mut module = IrModule::new();
         for name in ["stac", "clac"] {
@@ -1672,12 +1740,90 @@ mod tests {
 
     #[test]
     fn mnemonic_collisions_do_not_root_dead_helpers() {
-        for at_o0 in [false, true] {
-            let mut module = mnemonic_collision_module("stac; clac");
-            eliminate_dead_statics(&mut module, at_o0);
-            assert_eq!(module.functions.len(), 1);
-            assert_eq!(module.functions[0].name, "entry");
-        }
+        // The asm token scanner must not read a mnemonic that happens to spell a
+        // symbol as a reference to it. That is observable only where the tier
+        // prunes at all: the `-O0` tier keeps every internal definition by
+        // design (GCC parity, see `o0_keeps_every_internal_definition`).
+        let mut module = mnemonic_collision_module("stac; clac");
+        eliminate_dead_statics(&mut module, DeadStaticsTier::Optimizing);
+        assert_eq!(module.functions.len(), 1);
+        assert_eq!(module.functions[0].name, "entry");
+    }
+
+    /// `-O0` keeps what the source has, time. Measured on GCC 16.2.0: an
+    /// unreferenced `static` function and an unreferenced `static` object are
+    /// both in the `-O0` object and both gone at `-O1`. A debugger needs them,
+    /// and an inline-asm `call` cannot be seen by the reference graph at all.
+    #[test]
+    fn o0_keeps_every_internal_definition() {
+        let mut module = mnemonic_collision_module("stac; clac");
+        eliminate_dead_statics(&mut module, DeadStaticsTier::Debug);
+        assert_eq!(
+            module
+                .functions
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            ["stac", "clac", "entry"],
+            "every internal body survives at -O0"
+        );
+        // The optimizing tier is what GC the source asked for, and it drops the
+        // same two bodies when nothing references them.
+        let mut optimizing = mnemonic_collision_module("stac; clac");
+        eliminate_dead_statics(&mut optimizing, DeadStaticsTier::Optimizing);
+        assert_eq!(optimizing.functions.len(), 1);
+    }
+
+    /// `inline` is the measured exception: GCC drops an unused `static inline`
+    /// function at `-O0` as well, so a body the frontend lowered because an
+    /// unevaluated operand named it can still go.
+    #[test]
+    fn o0_drops_unused_declared_inline_bodies() {
+        let mut module = IrModule::new();
+        let mut inline_body = IrFunction::new("s_inline".into(), IrType::Void, vec![], false);
+        inline_body.is_static = true;
+        inline_body.is_inline = true;
+        inline_body.blocks = vec![gs_block(vec![], Terminator::Return(None))];
+        module.functions.push(inline_body);
+        let mut plain = IrFunction::new("s_plain".into(), IrType::Void, vec![], false);
+        plain.is_static = true;
+        plain.blocks = vec![gs_block(vec![], Terminator::Return(None))];
+        module.functions.push(plain);
+        let mut entry = IrFunction::new("entry".into(), IrType::Void, vec![], false);
+        entry.blocks = vec![gs_block(vec![], Terminator::Return(None))];
+        module.functions.push(entry);
+
+        eliminate_dead_statics(&mut module, DeadStaticsTier::Debug);
+        let names: Vec<&str> = module.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["s_plain", "entry"]);
+    }
+
+    /// A declaration is not a definition at either tier, and an external object
+    /// stays: only *internal* definitions are this pass's business.
+    #[test]
+    fn o0_keeps_internal_objects_and_drops_nothing_external() {
+        let mut module = IrModule::new();
+        module.globals.push(test_global("s_internal", true));
+        module.globals.push(test_global("s_live", true));
+        module.globals.push(test_global("g_external", false));
+        let mut entry = IrFunction::new("entry".into(), IrType::Void, vec![], false);
+        entry.blocks = vec![gs_block(
+            vec![Instruction::GlobalAddr {
+                name: "s_live".into(),
+                dest: Value(0),
+            }],
+            Terminator::Return(None),
+        )];
+        entry.next_value_id = 1;
+        module.functions.push(entry);
+
+        eliminate_dead_statics(&mut module, DeadStaticsTier::Debug);
+        let names: Vec<&str> = module.globals.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["s_internal", "s_live", "g_external"]);
+
+        eliminate_dead_statics(&mut module, DeadStaticsTier::Optimizing);
+        let names: Vec<&str> = module.globals.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["s_live", "g_external"]);
     }
 
     #[test]

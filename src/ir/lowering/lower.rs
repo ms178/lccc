@@ -101,6 +101,18 @@ pub struct Lowerer {
     pub pure_functions: FxHashSet<String>,
     /// Set of function names declared with __attribute__((const)).
     pub const_functions: FxHashSet<String>,
+    /// The `-O` level this unit is compiled at, from the driver.
+    ///
+    /// Exactly one decision reads it, and GCC's behaviour is why: at `-O0` GCC
+    /// 16.2 emits *every* internal definition the source has, referenced or not
+    /// (`static int f(void){...}` nobody calls is still in the object), and from
+    /// `-O1` on it drops the unreachable ones (measured on 16.2.0 for
+    /// `-O0 -O1 -O2 -Os -Og`).  That is not only parity: inline asm may `call` a
+    /// static function no C expression mentions, and a debugger must find a
+    /// function the user wrote.  Defaults to 2 so a directly built [`Lowerer`]
+    /// (unit tests) keeps the optimizing tier's behaviour; the driver always
+    /// sets the real level with [`Self::with_optimization_level`].
+    pub(super) optimization_level: u32,
     /// Set while lowering a top-level expression whose result is discarded
     /// (expression statement, for-increment), so a discarded post-inc/dec can
     /// skip its volatile old-value spill.
@@ -279,6 +291,13 @@ impl Lowerer {
         self
     }
 
+    /// Tell lowering which `-O` level the unit is compiled at (see
+    /// [`Self::optimization_level`]).
+    pub(crate) fn with_optimization_level(mut self, level: u32) -> Self {
+        self.optimization_level = level;
+        self
+    }
+
     pub(crate) fn with_trapv(mut self, trapv: bool) -> Self {
         self.trapv = trapv;
         self
@@ -390,6 +409,7 @@ impl Lowerer {
             regparm_functions: FxHashMap::default(),
             pure_functions: FxHashSet::default(),
             const_functions: FxHashSet::default(),
+            optimization_level: 2,
             discard_expr_result: false,
             lvalue_for_mutation: false,
             discard_assign_result: false,
@@ -814,6 +834,17 @@ impl Lowerer {
             && !self.has_non_inline_decl.contains(&func.name);
         let can_skip = is_c99_inline_only || func.attrs.is_static() || is_gnu_inline_no_extern_def;
         if !can_skip {
+            return false;
+        }
+        // A plain `static` body is not skippable at `-O0`.  GCC 16.2 emits an
+        // unreferenced `static` function there and drops it only from `-O1` on
+        // (measured), and the reference that keeps such a body alive can be
+        // invisible to this pass: `static int h(void){...}` named only by an
+        // inline-asm `call h` links and runs under GCC at -O0, and a compiler
+        // that never lowered the body fails the link instead (measured, both
+        // ways).  `static inline` stays skippable at -O0 because GCC drops an
+        // unused one there too (`-fkeep-inline-functions` is what keeps it).
+        if self.optimization_level == 0 && func.attrs.is_static() && !func.attrs.is_inline() {
             return false;
         }
         // A static or C99-inline-only body of a synthesized-libcall name is

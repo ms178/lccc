@@ -1,0 +1,2189 @@
+#!/usr/bin/env python3
+"""DWARF quality gate: does an object say enough to debug the program?
+
+A debugger answers four questions per address and per name, and each one has a
+section behind it:
+
+* *which line is this instruction?* -- `.debug_line`, indexed by the unit's
+  `DW_AT_stmt_list`;
+* *which function is this, and where does it start?* -- `DW_TAG_subprogram` in
+  `.debug_info`;
+* *which unit owns this address?* -- `.debug_aranges`, read before the units so
+  that the answer costs one binary search;
+* *how do I unwind out of it?* -- `.eh_frame`, read before any `.debug_*`.
+
+This gate decodes those four sections with its own reader and checks the
+properties a consumer depends on, on programs whose source it wrote itself, so
+that a row, a function and a source line can be compared without trusting a
+third-party tool. `readelf` is not consulted: it is advisory at best (it prints
+`Unknown AT value` for attributes newer than the binutils it came from) and
+absent in some environments.
+
+Every check states a measurement, not a preference, and the measurements come
+from GCC 16.2.0 which this gate can use as an oracle when it is installed:
+
+* `-O0` objects carry *every* internal definition the source has -- an
+  unreferenced `static` function or object is a symbol and a DIE -- while `-O1`
+  and above carry only what the reference graph reaches. A compiler that prunes
+  at `-O0` turns `asm("call helper")` into an undefined-symbol link error that
+  GCC does not have, and hides a function the user wrote from the debugger
+  (`--gcc` cross-checks this, and the rule is asserted against lccc alone so the
+  gate also runs where no GCC 16 exists).
+* an unused `static inline` function is absent at `-O0`, because GCC drops it
+  there too (`-fkeep-inline-functions` is what keeps it).
+
+Gaps that are known and not yet closed are listed in `KNOWN_GAPS`: they are
+reported in the markdown and the JSON, and they do not fail the gate. A gap that
+disappears is reported as such, so the entry can be deleted rather than rotting.
+
+Usage:
+    python3 tests/regression/check_dwarf_quality.py --lccc target/fastbuild/lccc
+    python3 tests/regression/check_dwarf_quality.py --lccc ... --gcc gcc-16 \\
+        --json out.json --markdown out.md
+    python3 tests/regression/check_dwarf_quality.py --self-test
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+
+# The ELF section reader, LEB128 decoders and the DWARF form decoder already
+# live in the dialect gate's own reader. Importing them keeps one decoder in the
+# tree instead of two that drift; the pieces used here are the pure ones that
+# take bytes, so nothing of that script's policy leaks in.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from check_c_std_diagnostics import (  # noqa: E402
+    _byte_string,
+    _decompress,
+    _form_value,
+    _sleb,
+    _uleb,
+)
+
+GATE_DATE = "2026-11-05"
+
+# --- DWARF tags and attributes used below ------------------------------------
+DW_TAG_ARRAY_TYPE = 0x01
+DW_TAG_ENUMERATION_TYPE = 0x04
+DW_TAG_FORMAL_PARAMETER = 0x05
+DW_TAG_LEXICAL_BLOCK = 0x0B
+DW_TAG_MEMBER = 0x0D
+DW_TAG_POINTER_TYPE = 0x0F
+DW_TAG_COMPILE_UNIT = 0x11
+DW_TAG_STRUCTURE_TYPE = 0x13
+DW_TAG_SUBROUTINE_TYPE = 0x15
+DW_TAG_TYPEDEF = 0x16
+DW_TAG_UNION_TYPE = 0x17
+DW_TAG_INLINED_SUBROUTINE = 0x1D
+DW_TAG_SUBRANGE_TYPE = 0x21
+DW_TAG_BASE_TYPE = 0x24
+DW_TAG_CONST_TYPE = 0x26
+DW_TAG_ENUMERATOR = 0x28
+DW_TAG_SUBPROGRAM = 0x2E
+DW_TAG_VARIABLE = 0x34
+DW_TAG_VOLATILE_TYPE = 0x35
+DW_TAG_RESTRICT_TYPE = 0x37
+
+DW_AT_LOCATION = 0x02
+DW_AT_NAME = 0x03
+DW_AT_ABSTRACT_ORIGIN = 0x31
+DW_AT_SPECIFICATION = 0x47
+DW_AT_STMT_LIST = 0x10
+DW_AT_LOW_PC = 0x11
+DW_AT_HIGH_PC = 0x12
+DW_AT_LANGUAGE = 0x13
+DW_AT_COMP_DIR = 0x1B
+DW_AT_PRODUCER = 0x25
+DW_AT_DECL_COLUMN = 0x39
+DW_AT_DECL_FILE = 0x3A
+DW_AT_DECL_LINE = 0x3B
+DW_AT_EXTERNAL = 0x3F
+DW_AT_FRAME_BASE = 0x40
+DW_AT_TYPE = 0x49
+
+DW_FORM_STRING = 0x08
+DW_FORM_ADDR = 0x01
+#: Reference forms that are relative to the start of the unit's header, and the
+#: one form that is relative to `.debug_info`.
+DW_FORM_UNIT_REFS = (0x11, 0x12, 0x13, 0x14)  # ref1, ref2, ref4, ref8
+DW_FORM_REF_ADDR = 0x17
+
+#: `.symtab` symbol types and bindings this gate reads.
+STT_FUNC = 2
+STT_OBJECT = 1
+STB_LOCAL = 0
+SHN_UNDEF = 0
+
+#: Known, documented gaps. The key is the check id a failure would carry; the
+#: value says what a debugger cannot do yet and where the work item lives. A gap
+#: that stops reproducing is reported (once) and the entry should be deleted.
+KNOWN_GAPS: dict[str, str] = {
+    "variables": (
+        "no DW_TAG_variable: a debugger cannot read a global, a static or a local "
+        "by name (docs/DWARF-CAMPAIGN.md, work item D1)"
+    ),
+    "parameters": (
+        "no DW_TAG_formal_parameter: no argument can be read by name (D1)"
+    ),
+    "types": (
+        "no type DIEs (base/pointer/typedef/structure/enum): a consumer cannot "
+        "print a value or walk a struct (D2)"
+    ),
+    "locations": (
+        "no DW_AT_location: nothing to evaluate, so a variable would have no "
+        "address even if it had a DIE (D3)"
+    ),
+    "data_only_unit": (
+        "a unit with no functions emits no .debug_info at all, so a TU that is "
+        "only data is invisible to a debugger (D4)"
+    ),
+    "inlining": (
+        "no DW_TAG_inlined_subroutine: an optimized frame shows the caller with "
+        "the callee's line, so a debugger cannot report the inline stack (D6)"
+    ),
+}
+
+#: Hard limits that make a malformed section a failure rather than a traceback.
+MAX_UNITS = 4096
+MAX_DIES = 1 << 20
+MAX_LINE_ROWS = 1 << 21
+
+
+# --- ELF ----------------------------------------------------------------------
+
+
+@dataclass
+class Symbol:
+    name: str
+    value: int
+    size: int
+    info: int
+    shndx: int
+
+    @property
+    def binding(self) -> int:
+        return self.info >> 4
+
+    @property
+    def symbol_type(self) -> int:
+        return self.info & 0xF
+
+    @property
+    def defined(self) -> bool:
+        return self.shndx != SHN_UNDEF
+
+
+@dataclass
+class Elf:
+    """Sections with their addresses, symbols, and the byte order.
+
+    `sections` and `order` are what `check_c_std_diagnostics._form_value` needs,
+    which is why this class carries them under exactly those names.
+    """
+
+    sections: dict[str, bytes] = field(default_factory=dict)
+    addresses: dict[str, int] = field(default_factory=dict)
+    symbols: list[Symbol] = field(default_factory=list)
+    order: str = "little"
+    address_size: int = 8
+
+    def u32(self, offset: int, data: bytes) -> int:
+        return int.from_bytes(data[offset : offset + 4], self.order)
+
+    def u64(self, offset: int, data: bytes) -> int:
+        return int.from_bytes(data[offset : offset + 8], self.order)
+
+    def functions(self, prefix: str = "") -> list[Symbol]:
+        return [
+            symbol
+            for symbol in self.symbols
+            if symbol.symbol_type == STT_FUNC
+            and symbol.defined
+            and symbol.size > 0
+            and symbol.name.startswith(prefix)
+        ]
+
+    def objects(self, prefix: str = "") -> list[Symbol]:
+        return [
+            symbol
+            for symbol in self.symbols
+            if symbol.symbol_type == STT_OBJECT
+            and symbol.defined
+            and symbol.name.startswith(prefix)
+        ]
+
+
+def read_elf(path: Path) -> Elf:
+    blob = path.read_bytes()
+    if blob[:4] != b"\x7fELF":
+        raise ValueError(f"{path} is not an ELF object")
+    elf_class, encoding = blob[4], blob[5]
+    if encoding not in (1, 2):
+        raise ValueError(f"unknown ELF encoding {encoding}")
+    order = "little" if encoding == 1 else "big"
+    elf = Elf(order=order, address_size=8 if elf_class == 2 else 4)
+    if elf_class == 2:
+        table = int.from_bytes(blob[0x28:0x30], order)
+        entry_size = int.from_bytes(blob[0x3A:0x3C], order)
+        count = int.from_bytes(blob[0x3C:0x3E], order)
+        names_index = int.from_bytes(blob[0x3E:0x40], order)
+        header = struct.Struct(("<>" if order == "big" else "<") + "IIQQQQIIQQ")
+    elif elf_class == 1:
+        table = int.from_bytes(blob[0x20:0x24], order)
+        entry_size = int.from_bytes(blob[0x2E:0x30], order)
+        count = int.from_bytes(blob[0x30:0x32], order)
+        names_index = int.from_bytes(blob[0x32:0x34], order)
+        header = struct.Struct(("<>" if order == "big" else "<") + "IIIIIIIIII")
+    else:
+        raise ValueError(f"unknown ELF class {elf_class}")
+    if entry_size < header.size:
+        raise ValueError("section header table entry is too small")
+
+    def section(index: int) -> tuple[int, ...]:
+        return header.unpack_from(blob, table + index * entry_size)
+
+    if count == 0:
+        count = section(0)[5]
+    if names_index == 0xFFFF:
+        names_index = section(0)[6]
+    names_start, names_size = section(names_index)[4], section(names_index)[5]
+    names = blob[names_start : names_start + names_size]
+    for index in range(count):
+        fields = section(index)
+        name_start = fields[0]
+        name_end = names.find(b"\x00", name_start)
+        name = names[name_start : name_end if name_end >= 0 else len(names)]
+        start, size, flags, address = fields[4], fields[5], fields[2], fields[3]
+        payload = blob[start : start + size]
+        if flags & 0x800 and size:  # SHF_COMPRESSED
+            payload = _decompress(payload, elf_class, order, name.decode("ascii", "replace"))
+        key = name.decode("ascii", "replace")
+        elf.sections[key] = payload
+        elf.addresses[key] = address
+    _read_symbols(blob, elf, header, entry_size, count, order)
+    _apply_relocations(elf, elf_class, order)
+    return elf
+
+
+#: Relocation types this reader applies: the ones that place an absolute value
+#: (a section offset or an address) into a debug section. Every DWARF reference in
+#: an object file is one of these, and in an object the value on disk is zero
+#: until the linker applies it -- which is why a reader that ignores relocations
+#: sees every string offset as 0.
+_ABSOLUTE_RELOCATIONS = frozenset(
+    {
+        1,  # R_X86_64_64, R_386_32, R_ARM_ABS32, R_RISCV_32
+        10,  # R_X86_64_32
+        11,  # R_X86_64_32S
+        257,  # R_AARCH64_ABS64
+        258,  # R_AARCH64_ABS32
+    }
+)
+
+
+def _apply_relocations(elf: "Elf", elf_class: int, order: str) -> None:
+    """Patch debug sections with their relocations, as a linker would.
+
+    Without this an *object* file's `.debug_str` offsets all read as zero (the
+    value lives in the addend), and every name a DIE states resolves to whatever
+    string sits at offset zero. A gate must read an object the way a consumer
+    does -- after relocation -- or it will bless a file no debugger can read.
+    """
+    for name in [section for section in elf.sections if ".rel" in section]:
+        if not (name.startswith(".rela") or name.startswith(".rel")):
+            continue
+        payload = elf.sections[name]
+        target_name = name[5:] if name.startswith(".rela.") else name[4:]
+        target = elf.sections.get(target_name)
+        if target is None or not payload:
+            continue
+        has_addend = name.startswith(".rela")
+        if elf_class == 2:
+            stride = 24 if has_addend else 16
+            layout = struct.Struct(("<>" if order == "big" else "<") + ("QQq" if has_addend else "QQ"))
+        else:
+            stride = 12 if has_addend else 8
+            layout = struct.Struct(("<>" if order == "big" else "<") + ("IIi" if has_addend else "II"))
+        patched = bytearray(target)
+        for offset in range(0, len(payload) - stride + 1, stride):
+            fields = layout.unpack_from(payload, offset)
+            where, info = fields[0], fields[1]
+            addend = fields[2] if has_addend else None
+            symbol_index = info >> 32 if elf_class == 2 else info >> 8
+            kind = info & 0xFFFFFFFF if elf_class == 2 else info & 0xFF
+            if kind not in _ABSOLUTE_RELOCATIONS:
+                continue
+            width = {1: 8, 10: 4, 11: 4, 257: 8, 258: 4}[kind]
+            if where + width > len(patched):
+                continue
+            if addend is None:
+                addend = int.from_bytes(patched[where : where + width], order)
+            value = addend
+            if symbol_index < len(elf.symbols):
+                value += elf.symbols[symbol_index].value
+            patched[where : where + width] = (value & ((1 << (width * 8)) - 1)).to_bytes(
+                width, order
+            )
+        elf.sections[target_name] = bytes(patched)
+
+
+def _read_symbols(blob: bytes, elf: Elf, header, entry_size: int, count: int, order: str) -> None:
+    """Fill `elf.symbols` from `.symtab`, the table a debugger looks names up in."""
+    strings = elf.sections.get(".strtab")
+    payload = elf.sections.get(".symtab")
+    if strings is None or payload is None:
+        return
+    mark = "<" if order == "little" else ">"
+    if elf.address_size == 8:
+        stride, layout = 24, struct.Struct(mark + "IBBHQQ")
+    else:
+        stride, layout = 16, struct.Struct(mark + "IIIBBH")
+    for offset in range(0, len(payload) - stride + 1, stride):
+        fields = layout.unpack_from(payload, offset)
+        if elf.address_size == 8:
+            name, info, _other, shndx, value, size = fields
+        else:
+            name, value, size, info, _other, shndx = fields
+        if name >= len(strings):
+            continue
+        elf.symbols.append(
+            Symbol(
+                name=_byte_string(strings, name),
+                value=value,
+                size=size,
+                info=info,
+                shndx=shndx,
+            )
+        )
+
+
+# --- .debug_info --------------------------------------------------------------
+
+
+@dataclass
+class Die:
+    offset: int
+    tag: int
+    attrs: dict[int, object]
+    depth: int
+    #: Form each attribute was encoded with. `DW_AT_high_pc` needs it: an
+    #: address is a form of its own, a constant is an offset from `low_pc`.
+    forms: dict[int, int] = field(default_factory=dict)
+
+    def name(self) -> str:
+        value = self.attrs.get(DW_AT_NAME, "")
+        return value if isinstance(value, str) else ""
+
+
+def origin_chain(die: Die, unit: "Unit") -> list[Die]:
+    """`die`, then every DIE it names through `DW_AT_abstract_origin`.
+
+    An optimizing compiler moves a function's description onto the abstract DIE
+    and leaves the concrete one with a range and a reference: `decl_file`,
+    `decl_line`, `type` and the parameter list all live on the origin. A consumer
+    follows the chain, so the gate does too.
+    """
+    chain = [die]
+    seen = {die.offset}
+    current = die
+    while True:
+        reference = current.attrs.get(DW_AT_ABSTRACT_ORIGIN)
+        if reference is None:
+            reference = current.attrs.get(DW_AT_SPECIFICATION)
+        if not isinstance(reference, int):
+            return chain
+        target = _die_offset(current, reference, unit)
+        if target is None or target in seen:
+            return chain
+        following = unit.die_at(target)
+        if following is None:
+            return chain
+        chain.append(following)
+        seen.add(target)
+        current = following
+
+
+def resolved(die: Die, unit: "Unit", attribute: int) -> object | None:
+    """The first value of `attribute` along the origin chain."""
+    for candidate in origin_chain(die, unit):
+        if attribute in candidate.attrs:
+            return candidate.attrs[attribute]
+    return None
+
+
+def die_name(die: Die, unit: "Unit") -> str:
+    """The source name of a DIE, following `DW_AT_abstract_origin`.
+
+    An optimizing compiler factors a function's description into an *abstract*
+    DIE (name, type, parameters) and concrete DIEs that carry only a range and a
+    reference to it -- that is the shape GCC 16.2 emits for an out-of-line copy of
+    an inlined function, and the shape D6 of the campaign will introduce here.
+    A consumer resolves the reference, so a gate that only reads `DW_AT_name`
+    sees an unnamed DIE and reports a function nobody describes.
+    """
+    name = resolved(die, unit, DW_AT_NAME)
+    return name if isinstance(name, str) else ""
+
+
+def _die_offset(die: Die, reference: int, unit: "Unit") -> int | None:
+    """Turn a reference attribute into an offset inside `.debug_info`."""
+    form = die.forms.get(DW_AT_ABSTRACT_ORIGIN)
+    if DW_AT_SPECIFICATION in die.forms and die.forms.get(DW_AT_SPECIFICATION) == DW_FORM_REF_ADDR:
+        form = DW_FORM_REF_ADDR
+    if form == DW_FORM_REF_ADDR:
+        return reference
+    if form in DW_FORM_UNIT_REFS:
+        return unit.offset + reference
+    return None
+
+
+@dataclass
+class Unit:
+    offset: int
+    version: int
+    address_size: int
+    offset_size: int
+    dies: list[Die] = field(default_factory=list)
+
+    def root(self) -> Die | None:
+        return self.dies[0] if self.dies else None
+
+    def by_tag(self, tag: int) -> list[Die]:
+        return [die for die in self.dies if die.tag == tag]
+
+    def die_at(self, offset: int) -> Die | None:
+        """The DIE starting at `offset`, or `None` when no DIE starts there."""
+        for die in self.dies:
+            if die.offset == offset:
+                return die
+        return None
+
+
+@dataclass
+class Abbrev:
+    tag: int
+    children: bool
+    attributes: list[tuple[int, int, int | None]]
+
+
+def _abbrevs(abbrev: bytes, offset: int) -> dict[int, Abbrev]:
+    """Abbreviation declarations with the tag the shared reader discards."""
+    table: dict[int, Abbrev] = {}
+    while True:
+        code, offset = _uleb(abbrev, offset)
+        if code == 0:
+            return table
+        tag, offset = _uleb(abbrev, offset)
+        children = abbrev[offset] != 0
+        offset += 1
+        attributes: list[tuple[int, int, int | None]] = []
+        while True:
+            attribute, offset = _uleb(abbrev, offset)
+            form, offset = _uleb(abbrev, offset)
+            if attribute == 0 and form == 0:
+                break
+            implicit = None
+            if form == 0x21:  # DW_FORM_implicit_const
+                implicit, offset = _sleb(abbrev, offset)
+            attributes.append((attribute, form, implicit))
+        table[code] = Abbrev(tag=tag, children=children, attributes=attributes)
+
+
+def units(elf: Elf) -> list[Unit]:
+    """Every compile unit in `.debug_info`, with its DIE tree flattened."""
+    info = elf.sections.get(".debug_info")
+    abbrev = elf.sections.get(".debug_abbrev")
+    if info is None:
+        return []
+    if abbrev is None:
+        raise ValueError(".debug_info without .debug_abbrev")
+    out: list[Unit] = []
+    offset = 0
+    while offset + 4 <= len(info) and len(out) < MAX_UNITS:
+        start = offset
+        length = int.from_bytes(info[offset : offset + 4], elf.order)
+        offset += 4
+        offset_size = 4
+        if length == 0xFFFFFFFF:
+            offset_size = 8
+            length = int.from_bytes(info[offset : offset + 8], elf.order)
+            offset += 8
+        if length == 0:
+            break
+        end = offset + length
+        if end > len(info):
+            raise ValueError(f"unit at {start:#x} runs past .debug_info")
+        version = int.from_bytes(info[offset : offset + 2], elf.order)
+        offset += 2
+        address_size = 0
+        if version >= 5:
+            # DW_UT_* then address size; only DW_UT_compile/skeleton occur here.
+            offset += 1
+            address_size = info[offset]
+            offset += 1
+        abbrev_offset = int.from_bytes(info[offset : offset + offset_size], elf.order)
+        offset += offset_size
+        if version < 5:
+            address_size = info[offset]
+            offset += 1
+        table = _abbrevs(abbrev, abbrev_offset)
+        unit = Unit(offset=start, version=version, address_size=address_size, offset_size=offset_size)
+        depth = 0
+        while offset < end:
+            die_offset = offset
+            code, offset = _uleb(info, offset)
+            if code == 0:
+                depth = max(depth - 1, 0)
+                continue
+            if code not in table:
+                raise ValueError(f"unit at {start:#x}: undeclared abbreviation {code}")
+            declaration = table[code]
+            attrs: dict[int, object] = {}
+            forms: dict[int, int] = {}
+            for attribute, form, implicit in declaration.attributes:
+                value, offset = _form_value(
+                    form, info, offset, elf, address_size, offset_size, implicit
+                )
+                attrs[attribute] = value
+                forms[attribute] = form
+            if len(unit.dies) < MAX_DIES:
+                unit.dies.append(
+                    Die(
+                        offset=die_offset,
+                        tag=declaration.tag,
+                        attrs=attrs,
+                        depth=depth,
+                        forms=forms,
+                    )
+                )
+            if declaration.children:
+                depth += 1
+        out.append(unit)
+        offset = end
+    return out
+
+
+def subprogram_ranges(elf: Elf, unit: Unit, version: int) -> list[tuple[str, int, int, Die]]:
+    """`(name, low, high, die)` for every subprogram DIE that states a range.
+
+    A subprogram with no `DW_AT_low_pc` is a declaration -- a function this unit
+    calls but does not define -- and is deliberately not returned.
+    """
+    out = []
+    for die in unit.by_tag(DW_TAG_SUBPROGRAM):
+        low = die.attrs.get(DW_AT_LOW_PC)
+        high = die.attrs.get(DW_AT_HIGH_PC)
+        if not isinstance(low, int) or not isinstance(high, int):
+            continue
+        # DWARF 4 introduced the size form: `high_pc` is an address only when it
+        # is encoded as one, otherwise it is a byte count from `low_pc`.
+        if die.forms.get(DW_AT_HIGH_PC, DW_FORM_ADDR) != DW_FORM_ADDR:
+            high = low + high
+        out.append((die_name(die, unit), low, high, die))
+    return out
+
+
+# --- .debug_line --------------------------------------------------------------
+
+
+@dataclass
+class LineRow:
+    address: int
+    file: int
+    line: int
+    column: int
+    is_stmt: bool
+    end_sequence: bool
+    prologue_end: bool
+    epilogue_begin: bool
+    discriminator: int
+    isa: int
+
+    @property
+    def zero_width(self) -> bool:
+        return False  # filled in by `line_table`: see `LineTable.spans`
+
+
+@dataclass
+class LineTable:
+    offset: int
+    version: int
+    address_size: int
+    rows: list[LineRow]
+    files: list[str]
+    directories: list[str]
+
+    def spans(self) -> list[tuple[LineRow, int]]:
+        """Rows paired with their byte width (0 for the last row of a sequence).
+
+        A zero-width row sits on the boundary between two ranges: a consumer
+        looking up that exact address lands on the next row, so the row is not
+        "outside" anything and must not be read as if it covered code.
+        """
+        out: list[tuple[LineRow, int]] = []
+        for index, row in enumerate(self.rows):
+            if row.end_sequence:
+                out.append((row, 0))
+                continue
+            following = self.rows[index + 1] if index + 1 < len(self.rows) else None
+            width = 0 if following is None or following.address < row.address else (
+                following.address - row.address
+            )
+            out.append((row, width))
+        return out
+
+
+def _line_header(elf: Elf, offset: int) -> tuple[dict[str, object], int]:
+    """Parse a line program header; returns its fields and where the program starts."""
+    line = elf.sections.get(".debug_line")
+    if line is None:
+        raise ValueError("no .debug_line section")
+    start = offset
+    length = int.from_bytes(line[offset : offset + 4], elf.order)
+    offset += 4
+    offset_size = 4
+    if length == 0xFFFFFFFF:
+        offset_size = 8
+        length = int.from_bytes(line[offset : offset + 8], elf.order)
+        offset += 8
+    end = offset + length
+    version = int.from_bytes(line[offset : offset + 2], elf.order)
+    offset += 2
+    header: dict[str, object] = {"version": version, "end": end, "offset_size": offset_size}
+    if version >= 5:
+        address_size = line[offset]
+        header["address_size"] = address_size
+        offset += 2  # address size, segment selector size
+    else:
+        header["address_size"] = elf.address_size
+    header_length = int.from_bytes(line[offset : offset + offset_size], elf.order)
+    offset += offset_size
+    program_start = offset + header_length
+    minimum = line[offset]
+    offset += 1
+    max_ops = line[offset] if version >= 4 else 1
+    offset += 1 if version >= 4 else 0
+    default_is_stmt = line[offset] != 0
+    offset += 1
+    line_base = struct.unpack("b", line[offset : offset + 1])[0]
+    offset += 1
+    line_range = line[offset]
+    offset += 1
+    opcode_base = line[offset]
+    offset += 1
+    standard_lengths = list(line[offset : offset + opcode_base - 1])
+    offset += opcode_base - 1
+    header.update(
+        minimum=minimum,
+        max_ops=max_ops,
+        default_is_stmt=default_is_stmt,
+        line_base=line_base,
+        line_range=line_range,
+        opcode_base=opcode_base,
+        standard_lengths=standard_lengths,
+        program_start=program_start,
+    )
+    directories: list[str] = []
+    files: list[str] = []
+    address_size = int(header["address_size"])
+    if version >= 5:
+        directory_formats, offset = _line_formats(line, offset)
+        count, offset = _uleb(line, offset)
+        for _ in range(count):
+            entry, offset = _line_entry(line, offset, elf, address_size, offset_size, directory_formats)
+            directories.append(entry.get(1, ""))  # DW_LNCT_path
+        file_formats, offset = _line_formats(line, offset)
+        count, offset = _uleb(line, offset)
+        for _ in range(count):
+            entry, offset = _line_entry(line, offset, elf, address_size, offset_size, file_formats)
+            files.append(entry.get(1, ""))
+    else:
+        while offset < program_start:
+            name = _byte_string(line, offset)
+            offset += len(name) + 1
+            if not name:
+                break
+            directories.append(name)
+        while offset < program_start:
+            name = _byte_string(line, offset)
+            offset += len(name.encode()) + 1
+            if not name:
+                break
+            _directory_index, offset = _uleb(line, offset)
+            _timestamp, offset = _uleb(line, offset)
+            _size, offset = _uleb(line, offset)
+            files.append(name)
+    header["directories"] = directories
+    header["files"] = files
+    if program_start < start:
+        raise ValueError(f"line header at {start:#x} points backwards")
+    return header, program_start
+
+
+def _line_formats(line: bytes, offset: int) -> tuple[list[tuple[int, int]], int]:
+    count = line[offset]
+    offset += 1
+    formats = []
+    for _ in range(count):
+        content_type, offset = _uleb(line, offset)
+        form, offset = _uleb(line, offset)
+        formats.append((content_type, form))
+    return formats, offset
+
+
+def _line_entry(
+    line: bytes,
+    offset: int,
+    elf: Elf,
+    address_size: int,
+    offset_size: int,
+    formats: list[tuple[int, int]],
+) -> tuple[dict[int, str], int]:
+    entry: dict[int, str] = {}
+    for content_type, form in formats:
+        value, offset = _form_value(form, line, offset, elf, address_size, offset_size, None)
+        entry[content_type] = value if isinstance(value, str) else str(value)
+    return entry, offset
+
+
+def line_table(elf: Elf, offset: int) -> LineTable:
+    """Decode the line program at `offset` (the unit's `DW_AT_stmt_list`)."""
+    line = elf.sections.get(".debug_line")
+    if line is None:
+        raise ValueError("no .debug_line section")
+    header, offset = _line_header(elf, offset)
+    version = int(header["version"])
+    minimum = int(header["minimum"])
+    max_ops = int(header["max_ops"])
+    line_base = int(header["line_base"])
+    line_range = int(header["line_range"])
+    opcode_base = int(header["opcode_base"])
+    standard_lengths = list(header["standard_lengths"])
+    address_size = int(header["address_size"])
+    files = list(header["files"])
+    end = int(header["end"])
+    rows: list[LineRow] = []
+
+    address = 0
+    op_index = 0
+    file_index = 1
+    source_line = 1
+    column = 0
+    is_stmt = bool(header["default_is_stmt"])
+    basic_block = False
+    prologue_end = False
+    epilogue_begin = False
+    discriminator = 0
+    isa = 0
+
+    def reset() -> None:
+        nonlocal address, op_index, file_index, source_line, column, is_stmt
+        nonlocal basic_block, prologue_end, epilogue_begin, discriminator, isa
+        address = 0
+        op_index = 0
+        file_index = 1
+        source_line = 1
+        column = 0
+        is_stmt = bool(header["default_is_stmt"])
+        basic_block = False
+        prologue_end = False
+        epilogue_begin = False
+        discriminator = 0
+        isa = 0
+
+    def emit() -> None:
+        nonlocal basic_block, prologue_end, epilogue_begin, discriminator
+        if len(rows) >= MAX_LINE_ROWS:
+            raise ValueError("line program exceeds the row limit")
+        rows.append(
+            LineRow(
+                address=address,
+                file=file_index,
+                line=source_line,
+                column=column,
+                is_stmt=is_stmt,
+                end_sequence=False,
+                prologue_end=prologue_end,
+                epilogue_begin=epilogue_begin,
+                discriminator=discriminator,
+                isa=isa,
+            )
+        )
+        basic_block = False
+        prologue_end = False
+        epilogue_begin = False
+        discriminator = 0
+
+    def advance(operation_advance: int) -> None:
+        nonlocal address, op_index
+        if max_ops == 0:
+            raise ValueError("maximum_operations_per_instruction is zero")
+        total = op_index + operation_advance
+        address += minimum * (total // max_ops)
+        op_index = total % max_ops
+
+    while offset < end:
+        opcode = line[offset]
+        offset += 1
+        if opcode == 0:
+            payload_length, offset = _uleb(line, offset)
+            payload_end = offset + payload_length
+            if payload_end > end:
+                raise ValueError("extended opcode runs past the program")
+            sub = line[offset]
+            offset += 1
+            if sub == 1:  # DW_LNE_end_sequence
+                rows.append(
+                    LineRow(
+                        address=address,
+                        file=file_index,
+                        line=source_line,
+                        column=column,
+                        is_stmt=is_stmt,
+                        end_sequence=True,
+                        prologue_end=prologue_end,
+                        epilogue_begin=epilogue_begin,
+                        discriminator=discriminator,
+                        isa=isa,
+                    )
+                )
+                reset()
+            elif sub == 2:  # DW_LNE_set_address
+                address = int.from_bytes(line[offset : offset + address_size], elf.order)
+                op_index = 0
+            elif sub == 3:  # DW_LNE_define_file (DWARF 2..4)
+                name = _byte_string(line, offset)
+                offset += len(name.encode()) + 1
+                files.append(name)
+            elif sub == 4:  # DW_LNE_set_discriminator
+                discriminator, offset = _uleb(line, offset)
+            offset = payload_end
+            continue
+        if opcode < opcode_base:
+            if opcode == 1:  # DW_LNS_copy
+                emit()
+            elif opcode == 2:  # DW_LNS_advance_pc
+                delta, offset = _uleb(line, offset)
+                advance(delta)
+            elif opcode == 3:  # DW_LNS_advance_line
+                delta, offset = _sleb(line, offset)
+                source_line += delta
+            elif opcode == 4:  # DW_LNS_set_file
+                file_index, offset = _uleb(line, offset)
+            elif opcode == 5:  # DW_LNS_set_column
+                column, offset = _uleb(line, offset)
+            elif opcode == 6:  # DW_LNS_negate_stmt
+                is_stmt = not is_stmt
+            elif opcode == 7:  # DW_LNS_set_basic_block
+                basic_block = True
+            elif opcode == 8:  # DW_LNS_const_add_pc
+                advance((255 - opcode_base) // line_range)
+            elif opcode == 9:  # DW_LNS_fixed_advance_pc
+                address += int.from_bytes(line[offset : offset + 2], elf.order)
+                offset += 2
+                op_index = 0
+            elif opcode == 10:  # DW_LNS_set_prologue_end
+                prologue_end = True
+            elif opcode == 11:  # DW_LNS_set_epilogue_begin
+                epilogue_begin = True
+            elif opcode == 12:  # DW_LNS_set_isa
+                isa, offset = _uleb(line, offset)
+            else:  # an opcode this gate does not know: skip its arguments
+                for _ in range(standard_lengths[opcode - 1]):
+                    _value, offset = _uleb(line, offset)
+            continue
+        adjusted = opcode - opcode_base
+        advance(adjusted // line_range)
+        source_line += line_base + adjusted % line_range
+        emit()
+    return LineTable(
+        offset=offset,
+        version=version,
+        address_size=address_size,
+        rows=rows,
+        files=files,
+        directories=list(header["directories"]),
+    )
+
+
+# --- .debug_aranges -----------------------------------------------------------
+
+
+@dataclass
+class ArangeSet:
+    info_offset: int
+    address_size: int
+    tuples: list[tuple[int, int]]
+
+
+def arange_sets(elf: Elf) -> list[ArangeSet]:
+    """Every address-range set in `.debug_aranges`."""
+    data = elf.sections.get(".debug_aranges")
+    if data is None:
+        return []
+    out: list[ArangeSet] = []
+    offset = 0
+    while offset + 4 <= len(data):
+        length = int.from_bytes(data[offset : offset + 4], elf.order)
+        offset += 4
+        if length == 0:
+            break
+        end = offset + length
+        if end > len(data):
+            raise ValueError("address range set runs past .debug_aranges")
+        version = int.from_bytes(data[offset : offset + 2], elf.order)
+        if version != 2:
+            raise ValueError(f"address range set version {version}, expected 2")
+        offset += 2
+        info_offset = int.from_bytes(data[offset : offset + 4], elf.order)
+        offset += 4
+        address_size = data[offset]
+        offset += 2  # address size, segment selector size
+        tuple_size = 2 * address_size
+        # The first tuple starts at a multiple of the tuple size *counted from
+        # the set's own initial length field*, which is four bytes before the
+        # body this loop is inside.
+        set_start = end - length - 4
+        padding = (tuple_size - (offset - set_start) % tuple_size) % tuple_size
+        offset += padding
+        tuples: list[tuple[int, int]] = []
+        while offset + tuple_size <= end:
+            address = int.from_bytes(data[offset : offset + address_size], elf.order)
+            size = int.from_bytes(
+                data[offset + address_size : offset + tuple_size], elf.order
+            )
+            offset += tuple_size
+            if address == 0 and size == 0:
+                break
+            tuples.append((address, size))
+        out.append(ArangeSet(info_offset=info_offset, address_size=address_size, tuples=tuples))
+        offset = end
+        if len(out) > MAX_UNITS:
+            raise ValueError("too many address range sets")
+    return out
+
+
+# --- .eh_frame ----------------------------------------------------------------
+
+
+@dataclass
+class Fde:
+    begin: int
+    end: int
+
+    @property
+    def size(self) -> int:
+        return self.end - self.begin
+
+
+@dataclass
+class Cie:
+    code_alignment: int
+    data_alignment: int
+    fde_encoding: int
+    has_augmentation_length: bool
+
+
+def _encoded(
+    value_encoding: int, data: bytes, offset: int, section_address: int, address_size: int, order: str
+) -> tuple[int, int]:
+    """Read one DW_EH_PE-encoded value, applying the pcrel base when present."""
+    if value_encoding == 0xFF:
+        raise ValueError("DW_EH_PE_omit value was parsed")
+    if value_encoding & 0x80:  # DW_EH_PE_indirect: the field holds a pointer
+        raise ValueError("indirect pointer encodings are not emitted by lccc")
+    field_address = section_address + offset
+    format_code = value_encoding & 0x0F
+    if format_code == 0x00:  # absptr
+        value = int.from_bytes(data[offset : offset + address_size], order)
+        offset += address_size
+    elif format_code == 0x01:  # uleb128
+        value, offset = _uleb(data, offset)
+    elif format_code == 0x09:  # sleb128
+        value, offset = _sleb(data, offset)
+    elif format_code in (0x02, 0x03, 0x04, 0x0A, 0x0B, 0x0C):
+        width = {0x02: 2, 0x03: 4, 0x04: 8, 0x0A: 2, 0x0B: 4, 0x0C: 8}[format_code]
+        signed = format_code >= 0x0A
+        value = int.from_bytes(data[offset : offset + width], order, signed=signed)
+        offset += width
+    else:
+        raise ValueError(f"unsupported DW_EH_PE format {format_code:#x}")
+    if value_encoding & 0x10:  # DW_EH_PE_pcrel
+        value += field_address
+    return value, offset
+
+
+def fdes(elf: Elf) -> list[Fde]:
+    """Every FDE in `.eh_frame`, with absolute addresses and no external help."""
+    data = elf.sections.get(".eh_frame")
+    if data is None:
+        return []
+    section_address = elf.addresses.get(".eh_frame", 0)
+    cies: dict[int, Cie] = {}
+    out: list[Fde] = []
+    offset = 0
+    while offset + 4 <= len(data):
+        entry_start = offset
+        length = int.from_bytes(data[offset : offset + 4], elf.order)
+        offset += 4
+        if length == 0:
+            break
+        if length == 0xFFFFFFFF:
+            raise ValueError("64-bit .eh_frame entries are not emitted by lccc")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(".eh_frame entry runs past the section")
+        identity = int.from_bytes(data[offset : offset + 4], elf.order)
+        offset += 4
+        if identity == 0:  # a CIE
+            version = data[offset]
+            offset += 1
+            augmentation_start = offset
+            while data[offset] != 0:
+                offset += 1
+            augmentation = data[augmentation_start:offset].decode("ascii", "replace")
+            offset += 1
+            code_alignment, offset = _uleb(data, offset)
+            data_alignment, offset = _sleb(data, offset)
+            if version == 1:
+                offset += 1  # return address register is a single byte
+            else:
+                _return_register, offset = _uleb(data, offset)
+            has_length = augmentation.startswith("z")
+            fde_encoding = 0x00
+            if has_length:
+                augmentation_length, offset = _uleb(data, offset)
+                augmentation_end = offset + augmentation_length
+                for letter in augmentation[1:]:
+                    if letter == "R":
+                        fde_encoding = data[offset]
+                        offset += 1
+                    elif letter == "L":
+                        offset += 1
+                    elif letter == "P":
+                        _personality, offset = _encoded(
+                            data[offset], data, offset + 1, section_address, elf.address_size, elf.order
+                        )
+                    elif letter == "S":
+                        continue
+                    else:
+                        raise ValueError(f"unknown CIE augmentation {letter!r}")
+                offset = augmentation_end
+            cies[entry_start] = Cie(
+                code_alignment=code_alignment,
+                data_alignment=data_alignment,
+                fde_encoding=fde_encoding,
+                has_augmentation_length=has_length,
+            )
+            offset = end
+            continue
+        cie_pointer = entry_start + 4 - identity
+        cie = cies.get(cie_pointer)
+        if cie is None:
+            raise ValueError(f"FDE at {entry_start:#x} refers to unknown CIE {cie_pointer:#x}")
+        begin, offset = _encoded(
+            cie.fde_encoding, data, offset, section_address, elf.address_size, elf.order
+        )
+        size, offset = _encoded(
+            cie.fde_encoding & 0x0F, data, offset, section_address, elf.address_size, elf.order
+        )
+        out.append(Fde(begin=begin, end=begin + size))
+        offset = end
+    return out
+
+
+# --- source model -------------------------------------------------------------
+
+
+@dataclass
+class FunctionSpan:
+    name: str
+    first_line: int
+    last_line: int
+
+
+def function_spans(source: str) -> list[FunctionSpan]:
+    """Definitions in a probe: `name` at its declaration line, up to its brace.
+
+    The probes keep every definition at column 0 and every closing brace at
+    column 0, which is what makes this three-line scanner enough; it is a
+    property of the fixtures this gate wrote, not a C parser.
+    """
+    lines = source.splitlines()
+    spans: list[FunctionSpan] = []
+    index = 0
+    while index < len(lines):
+        text = lines[index]
+        candidate = None
+        for prefix in ("int ", "static int ", "static inline int ", "unsigned "):
+            if text.startswith(prefix):
+                rest = text[len(prefix) :]
+                if "(" in rest and not rest.startswith("*"):
+                    candidate = rest.split("(")[0].strip()
+                break
+        if candidate is None or text.rstrip().endswith(";"):
+            # A prototype has no body: scanning forward for its closing brace
+            # would swallow the next definition and mis-attribute its rows.
+            index += 1
+            continue
+        last = index
+        while last < len(lines) and lines[last].rstrip() not in ("}", "};"):
+            last += 1
+        spans.append(FunctionSpan(name=candidate, first_line=index + 1, last_line=last + 1))
+        index = last + 1
+    return spans
+
+
+# --- probes -------------------------------------------------------------------
+
+PROBES: dict[str, str] = {
+    # Two functions with frames, a call between them, a loop (so several
+    # statements share a function), and the internal definitions whose survival
+    # differs by optimization tier.
+    #
+    # `pq_only_sizeof` is the measured exception, and its assertion is that the
+    # probe *links*: GCC drops an unused `static inline` function at `-O0`, so a
+    # body named only by an unevaluated `sizeof` operand must not drag its call to
+    # `pq_never_defined` into the link. A compiler that keeps it fails this
+    # build, which is exactly what a regression here looks like.
+    "probe": """\
+int pq_leaf(int x) { return x + 1; }
+static int pq_unused_static(int x) { return x * 2; }
+static int pq_used_static(int x) { return x - 1; }
+static inline int pq_unused_inline(int x) { return x / 2; }
+extern int pq_never_defined(void);
+static inline int pq_only_sizeof(void) { return pq_never_defined(); }
+static int pq_unused_var = 5;
+int pq_global = 3;
+struct pq_point { int x; int y; };
+typedef struct pq_point pq_point_t;
+enum pq_colour { PQ_RED, PQ_GREEN };
+int pq_frame(int n) {
+    int total = pq_global;
+    for (int i = 0; i < n; i++) {
+        total += pq_leaf(i);
+    }
+    return pq_used_static(total);
+}
+int main(void) { return pq_frame(4) - 10 + (int)sizeof(pq_only_sizeof()) - 4; }
+""",
+    # Two units, so `.debug_aranges` must be per unit and each set must name its
+    # own `.debug_info` offset.
+    "probe_a": """\
+int pq_b_caller(void);
+int pq_a_work(int x) {
+    int doubled = x * 2;
+    return doubled + pq_b_caller();
+}
+int main(void) { return pq_a_work(3) - 9; }
+""",
+    "probe_b": """\
+int pq_b_caller(void) { return 1; }
+""",
+    # A unit with no code at all: GCC still emits a unit and a variable DIE.
+    "probe_data": """\
+int pq_only_data = 42;
+""",
+}
+
+
+def write_probes(directory: Path) -> dict[str, Path]:
+    out = {}
+    for name, text in PROBES.items():
+        path = directory / f"{name}.c"
+        path.write_text(text)
+        out[name] = path
+    return out
+
+
+# --- gate ---------------------------------------------------------------------
+
+
+@dataclass
+class Failure:
+    check: str
+    detail: str
+
+    def __str__(self) -> str:
+        return f"[{self.check}] {self.detail}"
+
+
+@dataclass
+class Report:
+    failures: list[Failure] = field(default_factory=list)
+    known: dict[str, str] = field(default_factory=dict)
+    healed: list[str] = field(default_factory=list)
+    measurements: dict[str, object] = field(default_factory=dict)
+    objects: int = 0
+
+    def fail(self, check: str, detail: str) -> None:
+        self.failures.append(Failure(check=check, detail=detail))
+
+    def gap(self, key: str, detail: str) -> None:
+        """Record a known gap; never a failure, but reported with its reason."""
+        if key in self.known:
+            return
+        reason = KNOWN_GAPS.get(key, "")
+        self.known[key] = f"{detail} -- {reason}" if reason else detail
+
+
+def build(report: Report, command: list[str], flags: list[str], probe: list[Path], output: Path,
+          cwd: Path, link: bool = True) -> bool:
+    """Compile (and by default link) one probe; a failure here is a gate failure."""
+    argv = [*command, *flags, "-o", str(output), *[str(path) for path in probe]]
+    if not link:
+        argv.insert(len(command), "-c")
+    proc = subprocess.run(
+        argv, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        timeout=180,
+    )
+    report.objects += 1
+    if proc.returncode != 0:
+        report.fail(
+            "build",
+            f"{' '.join(flags)} on {[path.name for path in probe]} exited "
+            f"{proc.returncode}: {proc.stderr.strip()[:400]}",
+        )
+        return False
+    return True
+
+
+def check_unit_structure(report: Report, elf: Elf, version: int, label: str) -> list[Unit]:
+    """Headers parse, the version is the one that was asked for, names are real."""
+    try:
+        parsed = units(elf)
+    except ValueError as error:
+        report.fail("unit_header", f"{label}: {error}")
+        return []
+    if not parsed:
+        report.fail("unit_header", f"{label}: no compile unit in .debug_info")
+        return []
+    for unit in parsed:
+        root = unit.root()
+        if root is None or root.tag != DW_TAG_COMPILE_UNIT:
+            report.fail("unit_header", f"{label}: unit at {unit.offset:#x} has no CU DIE")
+            continue
+        if unit.version != version:
+            report.fail(
+                "unit_version",
+                f"{label}: unit at {unit.offset:#x} says version {unit.version}, "
+                f"object was asked for {version}",
+            )
+        for attribute, named in (
+            (DW_AT_NAME, "DW_AT_name"),
+            (DW_AT_COMP_DIR, "DW_AT_comp_dir"),
+            (DW_AT_PRODUCER, "DW_AT_producer"),
+        ):
+            if not root.attrs.get(attribute):
+                report.fail("unit_attribute", f"{label}: CU at {unit.offset:#x} has no {named}")
+        comp_dir = root.attrs.get(DW_AT_COMP_DIR)
+        if isinstance(comp_dir, str) and comp_dir and not comp_dir.startswith("/"):
+            report.fail(
+                "unit_attribute",
+                f"{label}: DW_AT_comp_dir {comp_dir!r} is not absolute, so a consumer "
+                "cannot resolve a relative file name",
+            )
+        if elf.functions() and DW_AT_STMT_LIST not in root.attrs:
+            report.fail(
+                "unit_attribute",
+                f"{label}: CU at {unit.offset:#x} has functions but no DW_AT_stmt_list, "
+                "so no line table can be found",
+            )
+    return parsed
+
+
+def check_subprograms(
+    report: Report, elf: Elf, parsed: list[Unit], label: str, spans: list[FunctionSpan],
+    prefix: str = "pq_"
+) -> dict[str, tuple[int, int]]:
+    """Every defined function is a DIE whose range is inside a code section."""
+    text = {
+        name: payload
+        for name, payload in elf.sections.items()
+        if name == ".text" or name.startswith(".text.")
+    }
+    ranges: dict[str, tuple[int, int]] = {}
+    for unit in parsed:
+        for name, low, high, die in subprogram_ranges(elf, unit, unit.version):
+            # Every DIE range is recorded, because the line-table checks need to
+            # know which function a row belongs to -- including `main` and any
+            # function the probe did not name with the prefix.  The *assertions*
+            # below are scoped to the probe's own names.
+            probe_owned = name.startswith(prefix)
+            if name in ranges:
+                report.fail("subprogram_duplicate", f"{label}: {name} has two subprogram DIEs")
+                continue
+            if high <= low:
+                if probe_owned:
+                    report.fail(
+                        "subprogram_range",
+                        f"{label}: {name} states [{low:#x}, {high:#x}), which covers nothing",
+                    )
+                continue
+            inside = any(
+                elf.addresses.get(section, 0) <= low
+                and high <= elf.addresses.get(section, 0) + len(payload)
+                for section, payload in text.items()
+            )
+            if not inside and probe_owned:
+                report.fail(
+                    "subprogram_range",
+                    f"{label}: {name} states [{low:#x}, {high:#x}), which is outside every "
+                    "code section",
+                )
+            for attribute, named in ((DW_AT_DECL_FILE, "decl_file"), (DW_AT_DECL_LINE, "decl_line")):
+                if resolved(die, unit, attribute) is None and probe_owned:
+                    report.fail(
+                        "subprogram_attribute",
+                        f"{label}: {name} has no DW_AT_{named}, here or on its abstract origin",
+                    )
+            if resolved(die, unit, DW_AT_FRAME_BASE) is None and unit.version >= 3 and probe_owned:
+                report.fail(
+                    "subprogram_attribute",
+                    f"{label}: {name} has no DW_AT_frame_base, so a consumer cannot compute a "
+                    "local's address from the frame",
+                )
+            ranges[name] = (low, high)
+    symbols = {symbol.name: symbol for symbol in elf.functions()}
+    for name, symbol in symbols.items():
+        if name not in ranges and not name.startswith(prefix):
+            continue  # a CRT or library function this probe did not write
+        if name not in ranges:
+            report.fail(
+                "subprogram_missing",
+                f"{label}: {name} is a defined function in .symtab but has no subprogram DIE",
+            )
+            continue
+        low, high = ranges[name]
+        if high - low != symbol.size:
+            report.fail(
+                "subprogram_range",
+                f"{label}: {name} states {high - low} bytes of code, the symbol says "
+                f"{symbol.size}",
+            )
+    expected = {span.name for span in spans if span.name.startswith(prefix)}
+    for name in sorted(expected - set(ranges)):
+        report.fail(
+            "subprogram_missing", f"{label}: the source defines {name} but no DIE describes it"
+        )
+    report.measurements.setdefault("functions", {})[label] = len(ranges)
+    return ranges
+
+
+def check_lines(
+    report: Report, elf: Elf, parsed: list[Unit], ranges: dict[str, tuple[int, int]],
+    label: str, spans: list[FunctionSpan], inlining: bool = False
+) -> None:
+    """Line rows are ordered, attributed to the right function, and resolvable.
+
+    With `inlining` set -- the optimizing tiers, where a callee is folded into
+    its caller -- a row inside function F may legitimately come from any source
+    function, because that is what a line program says about inlined code: the
+    caller's range, the callee's line.  A consumer recovers the mapping from
+    `DW_TAG_inlined_subroutine`, which this gate lists as a known gap, so the
+    weaker assertion here is "the line belongs to some function of the probe"
+    rather than "it belongs to the owner of the address".
+    """
+    by_line = {span.name: span for span in spans}
+    every_span = [(span.first_line, span.last_line) for span in spans]
+    for unit in parsed:
+        offset = unit.root().attrs.get(DW_AT_STMT_LIST) if unit.root() else None
+        if not isinstance(offset, int):
+            continue
+        try:
+            table = line_table(elf, offset)
+        except ValueError as error:
+            report.fail("line_program", f"{label}: {error}")
+            continue
+        if not table.rows:
+            report.fail("line_program", f"{label}: the line program at {offset:#x} has no rows")
+            continue
+        if table.version != unit.version and not (table.version == 2 and unit.version >= 2):
+            report.fail(
+                "line_version",
+                f"{label}: unit version {unit.version} references a version {table.version} "
+                "line program; a consumer keys the opcode table on the unit's version",
+            )
+        if not table.files:
+            report.fail("line_program", f"{label}: the line program has no file table")
+        sequences = 0
+        previous = None
+        listed = 0
+        for row, width in table.spans():
+            if row.end_sequence:
+                sequences += 1
+                previous = None
+                continue
+            if previous is not None and row.address < previous:
+                report.fail(
+                    "line_order",
+                    f"{label}: a row at {row.address:#x} follows {previous:#x}; a consumer "
+                    "treats rows as ascending",
+                )
+            previous = row.address
+            listed += 1
+            # DWARF 2..4 index the file table from 1 (0 means "no file"), DWARF
+            # 5 from 0; a consumer keys that on the unit's version, so a row the
+            # one convention calls valid and the other does not is a real defect.
+            if table.version >= 5:
+                in_range = 0 <= row.file < len(table.files)
+            else:
+                in_range = 1 <= row.file <= len(table.files)
+            if not in_range:
+                report.fail(
+                    "line_file",
+                    f"{label}: row at {row.address:#x} names file {row.file}, the version "
+                    f"{table.version} table has {len(table.files)} entries",
+                )
+            if row.line <= 0:
+                report.fail("line_number", f"{label}: row at {row.address:#x} has line {row.line}")
+            # A row may sit exactly on a function's exclusive end: that is the
+            # last row of the function it closes, not a row outside everything.
+            owner = next(
+                (name for name, (low, high) in ranges.items() if low <= row.address < high),
+                None,
+            ) or next(
+                (name for name, (low, high) in ranges.items() if row.address == high),
+                None,
+            )
+            if owner is None:
+                if width > 0:
+                    report.fail(
+                        "line_outside_function",
+                        f"{label}: a {width}-byte row at {row.address:#x} is inside no "
+                        "subprogram's range",
+                    )
+                continue
+            if inlining:
+                if not any(first <= row.line <= last for first, last in every_span):
+                    report.fail(
+                        "line_attribution",
+                        f"{label}: the row at {row.address:#x} claims line {row.line}, which is "
+                        "outside every function of the probe",
+                    )
+                continue
+            span = by_line.get(owner)
+            if span is not None and not (span.first_line <= row.line <= span.last_line):
+                report.fail(
+                    "line_attribution",
+                    f"{label}: {owner} (source lines {span.first_line}..{span.last_line}) "
+                    f"claims line {row.line} at {row.address:#x}",
+                )
+        if sequences == 0:
+            report.fail(
+                "line_program", f"{label}: {listed} rows and no DW_LNE_end_sequence"
+            )
+        # One sequence for the whole unit is legal DWARF: a consumer slices by
+        # address, not by sequence.  GCC emits one per function, which lets a
+        # consumer stop decoding early, so the ratio is recorded as a measurement
+        # (docs/DWARF-CAMPAIGN.md, work item D5) rather than failing the gate.
+        report.measurements.setdefault("sequences_vs_functions", {})[label] = [
+            sequences,
+            len(ranges),
+        ]
+        statement_rows = sum(1 for row in table.rows if row.is_stmt and not row.end_sequence)
+        if statement_rows == 0:
+            report.fail(
+                "line_is_stmt",
+                f"{label}: no row carries is_stmt, so a debugger cannot step by statement",
+            )
+        report.measurements.setdefault("line_rows", {})[label] = listed
+        report.measurements.setdefault("line_sequences", {})[label] = sequences
+
+
+def check_aranges(report: Report, elf: Elf, parsed: list[Unit], ranges: dict[str, tuple[int, int]],
+                  label: str) -> None:
+    """One set per unit, naming that unit, and between them covering the code."""
+    if not parsed:
+        return
+    try:
+        sets = arange_sets(elf)
+    except ValueError as error:
+        report.fail("aranges", f"{label}: {error}")
+        return
+    if not sets:
+        report.fail(
+            "aranges",
+            f"{label}: no .debug_aranges, so mapping an address costs a walk over every unit",
+        )
+        return
+    for unit in parsed:
+        if not any(entry.info_offset == unit.offset for entry in sets):
+            report.fail(
+                "aranges",
+                f"{label}: no set names the unit at {unit.offset:#x}; a consumer that trusts "
+                "the table misses the unit entirely",
+            )
+    covered: dict[int, int] = {}
+    for entry in sets:
+        if not entry.tuples:
+            report.fail(
+                "aranges", f"{label}: the set for unit {entry.info_offset:#x} lists no range"
+            )
+        for address, size in entry.tuples:
+            if size == 0:
+                report.fail(
+                    "aranges",
+                    f"{label}: the set for unit {entry.info_offset:#x} lists an empty range at "
+                    f"{address:#x}",
+                )
+            for existing in range(address, address + max(size, 1), max(size, 1)):
+                if existing in covered and covered[existing] != entry.info_offset:
+                    report.fail(
+                        "aranges_overlap",
+                        f"{label}: {existing:#x} is claimed by both unit "
+                        f"{covered[existing]:#x} and unit {entry.info_offset:#x}",
+                    )
+                covered[existing] = entry.info_offset
+    for name, (low, high) in ranges.items():
+        if not any(
+            address <= low and high <= address + size
+            for entry in sets
+            for address, size in entry.tuples
+        ):
+            report.fail(
+                "aranges",
+                f"{label}: no set covers {name} at [{low:#x}, {high:#x})",
+            )
+
+
+def check_eh_frame(report: Report, elf: Elf, ranges: dict[str, tuple[int, int]], label: str) -> None:
+    """Every function with code has an FDE, so a consumer can unwind out of it."""
+    try:
+        entries = fdes(elf)
+    except ValueError as error:
+        report.fail("eh_frame", f"{label}: {error}")
+        return
+    if not entries:
+        report.fail("eh_frame", f"{label}: no FDE covers any function")
+        return
+    for name, (low, high) in sorted(ranges.items()):
+        if not any(entry.begin <= low and high <= entry.end for entry in entries):
+            report.fail(
+                "eh_frame",
+                f"{label}: no FDE covers {name} at [{low:#x}, {high:#x}); unwinding out of it "
+                "would rely on the frame pointer alone",
+            )
+    for entry in entries:
+        if entry.size <= 0:
+            report.fail("eh_frame", f"{label}: an FDE covers {entry.size} bytes at {entry.begin:#x}")
+    report.measurements.setdefault("fdes", {})[label] = len(entries)
+
+
+def check_object_unit(report: Report, elf: Elf, version: int, label: str, prefix: str = "pq_") -> None:
+    """The address-free half of the checks, for an object that cannot be linked.
+
+    A 32-bit target on a host without multilib still compiles to an object, and
+    an object is enough to check what a consumer reads *by name*: unit headers,
+    subprogram DIEs against the symbol table, declaration attributes. The
+    address-based checks (line rows, address map, unwind tables) need linked
+    addresses and are covered by the 64-bit matrices.
+    """
+    try:
+        parsed = units(elf)
+    except ValueError as error:
+        report.fail("unit_header", f"{label}: {error}")
+        return
+    if not parsed:
+        report.fail("unit_header", f"{label}: no compile unit in .debug_info")
+        return
+    for unit in parsed:
+        root = unit.root()
+        if root is None or root.tag != DW_TAG_COMPILE_UNIT:
+            report.fail("unit_header", f"{label}: unit at {unit.offset:#x} has no CU DIE")
+            continue
+        if unit.version != version:
+            report.fail(
+                "unit_version",
+                f"{label}: unit at {unit.offset:#x} says version {unit.version}, "
+                f"object was asked for {version}",
+            )
+        if not root.attrs.get(DW_AT_PRODUCER):
+            report.fail("unit_attribute", f"{label}: CU at {unit.offset:#x} has no DW_AT_producer")
+    described: dict[str, Die] = {}
+    for unit in parsed:
+        for die in unit.by_tag(DW_TAG_SUBPROGRAM):
+            name = die_name(die, unit)
+            if name.startswith(prefix):
+                described.setdefault(name, die)
+                for attribute, named in (
+                    (DW_AT_DECL_FILE, "decl_file"),
+                    (DW_AT_DECL_LINE, "decl_line"),
+                ):
+                    if resolved(die, unit, attribute) is None:
+                        report.fail(
+                            "subprogram_attribute", f"{label}: {name} has no DW_AT_{named}"
+                        )
+    for symbol in elf.functions(prefix):
+        if symbol.name not in described:
+            report.fail(
+                "subprogram_missing",
+                f"{label}: {symbol.name} is a defined function in .symtab but has no "
+                "subprogram DIE",
+            )
+
+
+def check_static_policy(report: Report, elf: Elf, label: str, tier: str) -> None:
+    """`-O0` keeps internal definitions, `-O1` and above drop the unreachable ones.
+
+    `-O0` is a correctness boundary, not a size preference: an inline-asm `call`
+    names a static function no C expression references, so a compiler that
+    pruned here would fail a link GCC completes (measured on 16.2.0).
+    """
+    symbols = {symbol.name for symbol in elf.symbols if symbol.defined}
+    dies = set()
+    try:
+        for unit in units(elf):
+            dies.update(die_name(die, unit) for die in unit.by_tag(DW_TAG_SUBPROGRAM))
+            dies.update(die_name(die, unit) for die in unit.by_tag(DW_TAG_VARIABLE))
+    except ValueError as error:
+        report.fail("static_policy", f"{label}: {error}")
+        return
+    if tier == "O0":
+        for name in ("pq_unused_static", "pq_used_static"):
+            if name not in symbols:
+                report.fail(
+                    "static_policy",
+                    f"{label}: {name} is defined in the source but absent from .symtab; GCC "
+                    "16.2 keeps an unreferenced static function at -O0 and drops it at -O1",
+                )
+            if name not in dies:
+                report.fail(
+                    "static_policy",
+                    f"{label}: {name} has no subprogram DIE at -O0, so a debugger cannot "
+                    "set a breakpoint in a function the user wrote",
+                )
+        if "pq_unused_var" not in symbols:
+            report.fail(
+                "static_policy",
+                f"{label}: the unreferenced static object pq_unused_var is absent at -O0; "
+                "GCC 16.2 emits it there",
+            )
+        if "pq_unused_inline" in symbols:
+            report.fail(
+                "static_policy",
+                f"{label}: pq_unused_inline is an unused static inline function and GCC 16.2 "
+                "drops it at -O0; only -fkeep-inline-functions keeps it",
+            )
+    else:
+        for name in ("pq_unused_static", "pq_unused_var", "pq_unused_inline"):
+            if name in symbols:
+                report.fail(
+                    "static_policy",
+                    f"{label}: {name} is unreachable and internal but present at -{tier}; GCC "
+                    "16.2 keeps it only at -O0",
+                )
+
+
+def check_debug_payload(report: Report, elf: Elf, label: str, optimizing: bool) -> None:
+    """The DIEs a debugger needs to name a value; absent ones are known gaps."""
+    _ = optimizing  # inlining is only meaningful where a tier inlines; see below
+    try:
+        parsed = units(elf)
+    except ValueError as error:
+        report.fail("debug_payload", f"{label}: {error}")
+        return
+    tags: dict[int, int] = {}
+    for unit in parsed:
+        for die in unit.dies:
+            tags[die.tag] = tags.get(die.tag, 0) + 1
+    if not tags.get(DW_TAG_VARIABLE):
+        report.gap("variables", f"{label}: 0 DW_TAG_variable DIEs")
+    if not tags.get(DW_TAG_FORMAL_PARAMETER):
+        report.gap("parameters", f"{label}: 0 DW_TAG_formal_parameter DIEs")
+    type_tags = (
+        DW_TAG_BASE_TYPE,
+        DW_TAG_POINTER_TYPE,
+        DW_TAG_CONST_TYPE,
+        DW_TAG_VOLATILE_TYPE,
+        DW_TAG_RESTRICT_TYPE,
+        DW_TAG_TYPEDEF,
+        DW_TAG_STRUCTURE_TYPE,
+        DW_TAG_UNION_TYPE,
+        DW_TAG_ENUMERATION_TYPE,
+        DW_TAG_ENUMERATOR,
+        DW_TAG_ARRAY_TYPE,
+        DW_TAG_SUBRANGE_TYPE,
+        DW_TAG_SUBROUTINE_TYPE,
+        DW_TAG_MEMBER,
+    )
+    present = [f"0x{tag:02x}={tags[tag]}" for tag in type_tags if tags.get(tag)]
+    if not present:
+        report.gap("types", f"{label}: no type DIEs")
+    # Only a tier that inlines has something to describe: at `-O0` GCC emits no
+    # inlined-subroutine DIE either, so the absence is not a gap there.
+    if optimizing and not tags.get(DW_TAG_INLINED_SUBROUTINE):
+        report.gap(
+            "inlining",
+            f"{label}: no DW_TAG_inlined_subroutine DIEs although this tier folds callees "
+            "into callers, so a frame cannot say which function a line came from",
+        )
+    located = sum(
+        1
+        for unit in parsed
+        for die in unit.dies
+        if die.tag == DW_TAG_VARIABLE and DW_AT_LOCATION in die.attrs
+    )
+    if not located:
+        report.gap("locations", f"{label}: no variable DIE carries DW_AT_location")
+    report.measurements.setdefault("tag_counts", {})[label] = {
+        f"{tag:#04x}": count for tag, count in sorted(tags.items())
+    }
+
+
+def check_data_only_unit(report: Report, path: Path, label: str) -> None:
+    """A unit with no code still needs a unit, or a data TU is invisible."""
+    try:
+        elf = read_elf(path)
+    except ValueError as error:
+        report.fail("data_only_unit", f"{label}: {error}")
+        return
+    if not elf.sections.get(".debug_info"):
+        report.gap("data_only_unit", f"{label}: no .debug_info section at all")
+        return
+    try:
+        parsed = units(elf)
+    except ValueError as error:
+        report.fail("data_only_unit", f"{label}: {error}")
+        return
+    if not parsed:
+        report.gap("data_only_unit", f"{label}: .debug_info exists but holds no unit")
+        return
+    named = [
+        die_name(die, unit) for unit in parsed for die in unit.by_tag(DW_TAG_VARIABLE)
+    ]
+    if "pq_only_data" not in named:
+        report.gap(
+            "data_only_unit",
+            f"{label}: the unit names variables {named or 'none'}, not pq_only_data",
+        )
+
+
+def run_gate(lccc: list[str], gcc: list[str] | None, workdir: Path) -> Report:
+    report = Report()
+    probes = write_probes(workdir)
+    spans = {name: function_spans(PROBES[name]) for name in PROBES}
+    matrices = (("2", "-O0"), ("3", "-O0"), ("4", "-O0"), ("5", "-O0"), ("5", "-O1"), ("5", "-O2"))
+    for version, optimization in matrices:
+        label = f"dwarf{version}-{optimization}"
+        output = workdir / f"{label}.elf"
+        flags = ["-g", f"-gdwarf-{version}", optimization, "-no-pie"]
+        if not build(report, lccc, flags, [probes["probe"]], output, workdir):
+            continue
+        try:
+            elf = read_elf(output)
+        except ValueError as error:
+            report.fail("elf", f"{label}: {error}")
+            continue
+        parsed = check_unit_structure(report, elf, int(version), label)
+        if not parsed:
+            continue
+        ranges = check_subprograms(report, elf, parsed, label, spans["probe"])
+        check_lines(
+            report, elf, parsed, ranges, label, spans["probe"],
+            inlining=optimization != "-O0",
+        )
+        check_aranges(report, elf, parsed, ranges, label)
+        check_eh_frame(report, elf, ranges, label)
+        check_static_policy(report, elf, label, optimization.lstrip("-"))
+        check_debug_payload(report, elf, label, optimizing=optimization != "-O0")
+
+    # Two units in one program: every set must name exactly one unit.
+    output = workdir / "multi.elf"
+    if build(
+        report, lccc, ["-g", "-gdwarf-5", "-O0", "-no-pie"],
+        [probes["probe_a"], probes["probe_b"]], output, workdir
+    ):
+        try:
+            elf = read_elf(output)
+            parsed = check_unit_structure(report, elf, 5, "multi")
+            if len(parsed) == 2:
+                ranges = check_subprograms(
+                    report, elf, parsed, "multi", spans["probe_a"] + spans["probe_b"]
+                )
+                check_lines(
+                    report, elf, parsed, ranges, "multi", spans["probe_a"] + spans["probe_b"]
+                )
+                check_aranges(report, elf, parsed, ranges, "multi")
+                check_eh_frame(report, elf, ranges, "multi")
+            else:
+                report.fail(
+                    "multi_unit", f"multi: {len(parsed)} compile units for two source files"
+                )
+        except ValueError as error:
+            report.fail("multi_unit", f"multi: {error}")
+
+    # A unit that is all data.
+    output = workdir / "data.o"
+    if build(
+        report, lccc, ["-g", "-gdwarf-5", "-O0"], [probes["probe_data"]], output, workdir,
+        link=False,
+    ):
+        check_data_only_unit(report, output, "data")
+
+    if gcc is not None:
+        oracle_comparison(report, lccc, gcc, probes, workdir)
+    return report
+
+
+def run_32_bit(report: Report, lccc: list[str], probes: dict[str, Path], workdir: Path) -> None:
+    """The same object-level contract on a 32-bit target, where the host allows it.
+
+    Three of the campaign's rules live in the target-independent half of the
+    compiler (lowering, the IR reachability pass, the DIE writer), so a defect
+    there would show on every architecture; checking a second target is what
+    turns "should be identical" into evidence. The address-based checks are not
+    repeated: a host without 32-bit runtime libraries cannot link a *-m32*
+    program, and inventing addresses from an unlinked object would test the
+    reader, not the compiler.
+    """
+    capability = workdir / "capability.c"
+    capability.write_text("int pq_probe(void) { return 0; }\n")
+    probe_output = workdir / "capability.o"
+    attempt = subprocess.run(
+        [*lccc, "-m32", "-c", "-o", str(probe_output), str(capability)],
+        cwd=workdir, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        timeout=120,
+    )
+    if attempt.returncode != 0:
+        print(
+            "note: -m32 is not usable on this host, skipping the 32-bit matrix",
+            file=sys.stderr,
+        )
+        return
+    for tier in ("-O0", "-O1"):
+        label = f"m32-dwarf5-{tier}"
+        output = workdir / f"{label}.o"
+        if not build(
+            report, lccc, ["-m32", "-g", "-gdwarf-5", tier], [probes["probe"]], output, workdir,
+            link=False,
+        ):
+            continue
+        try:
+            elf = read_elf(output)
+        except ValueError as error:
+            report.fail("elf", f"{label}: {error}")
+            continue
+        check_object_unit(report, elf, 5, label)
+        check_static_policy(report, elf, label, tier.lstrip("-"))
+
+
+def oracle_comparison(
+    report: Report, lccc: list[str], gcc: list[str], probes: dict[str, Path], workdir: Path
+) -> None:
+    """Where GCC 16 is installed, compare the tier rule and the DIE shape to it.
+
+    Only structural facts are compared (a symbol's presence, a DIE's presence),
+    never text or sizes: two compilers legitimately disagree about those.
+    """
+    rows: dict[str, object] = {}
+    for tier in ("-O0", "-O1"):
+        for name, command in (("lccc", lccc), ("gcc", gcc)):
+            output = workdir / f"oracle-{name}-{tier.lstrip('-')}.elf"
+            if not build(report, command, ["-g", "-gdwarf-5", tier, "-no-pie"], [probes["probe"]],
+                         output, workdir):
+                continue
+            try:
+                elf = read_elf(output)
+            except ValueError as error:
+                report.fail("oracle", f"{name} {tier}: {error}")
+                continue
+            rows[f"{name}{tier}"] = sorted(
+                symbol.name
+                for symbol in elf.symbols
+                if symbol.defined and symbol.name.startswith("pq_")
+                and symbol.symbol_type in (STT_FUNC, STT_OBJECT)
+            )
+    for tier in ("-O0", "-O1"):
+        mine = rows.get(f"lccc{tier}")
+        theirs = rows.get(f"gcc{tier}")
+        if mine is None or theirs is None:
+            continue
+        if mine != theirs:
+            report.fail(
+                "oracle_symbols",
+                f"{tier}: lccc emits {mine}, GCC 16.2 emits {theirs}; the internal-definition "
+                "policy is a GCC behaviour, not a choice",
+            )
+    report.measurements["oracle_symbols"] = rows
+
+
+def self_test() -> int:
+    """Prove the decoders on hand-built bytes, so the gate can be trusted."""
+    failures: list[str] = []
+
+    def expect(condition: bool, message: str) -> None:
+        if not condition:
+            failures.append(message)
+
+    # LEB128 round trip, including the width boundaries.
+    for value in (0, 1, 63, 64, 127, 128, 300, 624485, 2**32 - 1):
+        encoded = bytearray()
+        rest = value
+        while True:
+            byte = rest & 0x7F
+            rest >>= 7
+            if rest:
+                encoded.append(byte | 0x80)
+            else:
+                encoded.append(byte)
+                break
+        decoded, after = _uleb(bytes(encoded), 0)
+        expect(decoded == value, f"uleb128 {value} decoded as {decoded}")
+        expect(after == len(encoded), f"uleb128 {value} consumed {after} bytes")
+    negative, _ = _sleb(b"\x7f", 0)
+    expect(negative == -1, f"sleb128 0x7f decoded as {negative}")
+
+    # A line program with one sequence, one special opcode and an end_sequence.
+    header = bytearray()
+    header += b"\x00\x00\x00\x00"  # unit_length, patched below
+    header += (5).to_bytes(2, "little")
+    header += bytes([8, 0])  # address size, segment selector size
+    header += b"\x00\x00\x00\x00"  # header_length, patched below
+    header += bytes([1, 1, 1])  # minimum, max_ops, default_is_stmt
+    header += bytes([0xFB, 14])  # line_base = -5, line_range = 14
+    header += bytes([13])  # opcode_base
+    header += bytes([0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1])  # standard lengths
+    header += bytes([1, 1, 8])  # one directory format pair: path, DW_FORM_string
+    header += bytes([1]) + b"src\x00"
+    header += bytes([1, 1, 8])  # one file format pair: path, DW_FORM_string
+    header += bytes([1]) + b"unit.c\x00"
+    program = bytearray()
+    program += bytes([0, 9, 2]) + (0x401000).to_bytes(8, "little")  # set_address
+    program += bytes([0x02]) + b"\x02"  # advance_pc 2
+    program += bytes([13 + (1 - (-5)) % 14])  # special: advance 1 op, line +1
+    program += bytes([0, 1, 1])  # end_sequence
+    head_length = len(header) - 12
+    header[8:12] = head_length.to_bytes(4, "little")
+    body = header + program
+    body[0:4] = (len(body) - 4).to_bytes(4, "little")
+    elf = Elf(sections={".debug_line": bytes(body)}, addresses={".debug_line": 0}, order="little")
+    try:
+        table = line_table(elf, 0)
+        expect(table.version == 5, f"self-test line version {table.version}")
+        expect(table.files == ["unit.c"], f"self-test file table {table.files}")
+        expect(len(table.rows) == 2, f"self-test rows {len(table.rows)}")
+        expect(table.rows[0].address == 0x401002, f"self-test row address {table.rows[0].address:#x}")
+        expect(table.rows[0].line == 2, f"self-test row line {table.rows[0].line}")
+        expect(table.rows[1].end_sequence, "self-test last row must end the sequence")
+        spans = table.spans()
+        expect(spans[0][1] == 0, f"self-test first row width {spans[0][1]}")
+    except (ValueError, IndexError, struct.error) as error:
+        failures.append(f"self-test line program: {error}")
+
+    # An address-range set with one tuple and a terminator.
+    arange = bytearray()
+    arange += b"\x00\x00\x00\x00"
+    arange += (2).to_bytes(2, "little")
+    arange += (0x10).to_bytes(4, "little")  # debug_info offset
+    arange += bytes([8, 0])
+    arange += b"\x00\x00\x00\x00"  # padding to the tuple size
+    arange += (0x401000).to_bytes(8, "little") + (0x20).to_bytes(8, "little")
+    arange += bytes(16)
+    arange[0:4] = (len(arange) - 4).to_bytes(4, "little")
+    elf = Elf(sections={".debug_aranges": bytes(arange)}, addresses={}, order="little")
+    try:
+        sets = arange_sets(elf)
+        expect(len(sets) == 1, f"self-test arange sets {len(sets)}")
+        expect(sets[0].info_offset == 0x10, "self-test arange unit offset")
+        expect(sets[0].tuples == [(0x401000, 0x20)], f"self-test arange tuples {sets[0].tuples}")
+    except (ValueError, IndexError) as error:
+        failures.append(f"self-test aranges: {error}")
+
+    # One CIE and one FDE, absolute encoding.
+    eh = bytearray()
+    cie = bytearray()
+    cie += b"\x00\x00\x00\x00"  # CIE_id
+    cie += bytes([1]) + b"zR\x00"  # version, augmentation "zR"
+    cie += b"\x01" + b"\x78"  # code alignment 1, data alignment -8
+    cie += b"\x10"  # return address register
+    cie += b"\x01" + b"\x1b"  # augmentation length 1, encoding pcrel|sdata4
+    cie += b"\x0c\x1f\x04\x00"  # DW_CFA_def_cfa rsp, 8 etc. (skipped by the reader)
+    eh += (len(cie)).to_bytes(4, "little") + cie
+    cie_start = 0
+    fde_start = 4 + len(cie)
+    identity_address = fde_start + 4
+    fde = bytearray()
+    fde += (identity_address - cie_start).to_bytes(4, "little")  # back-pointer to the CIE
+    begin_field = len(fde)  # relative to the FDE's own identity field
+    fde += bytes(4)  # pc_begin, patched below
+    fde += (0x20).to_bytes(4, "little")  # pc_range, sdata4
+    fde += b"\x00"  # augmentation length
+    eh += (len(fde)).to_bytes(4, "little") + fde
+    # pc_begin is pcrel: what is stored is target minus the field's own address
+    # inside the section, which is where the reader starts counting.
+    target = 0x401000
+    absolute_field = identity_address + begin_field
+    eh[absolute_field : absolute_field + 4] = (target - absolute_field).to_bytes(
+        4, "little", signed=True
+    )
+    elf = Elf(
+        sections={".eh_frame": bytes(eh)},
+        addresses={".eh_frame": 0},
+        order="little",
+        address_size=8,
+    )
+    try:
+        entries = fdes(elf)
+        expect(len(entries) == 1, f"self-test FDE count {len(entries)}")
+        expect(entries[0].begin == target, f"self-test FDE begin {entries[0].begin:#x}")
+        expect(entries[0].end == target + 0x20, f"self-test FDE end {entries[0].end:#x}")
+    except (ValueError, IndexError) as error:
+        failures.append(f"self-test eh_frame: {error}")
+
+    # Relocation application: a `.debug_str` reference on disk is zero plus an
+    # addend, exactly like a real object.
+    target = bytearray(b"\x00" * 12)
+    rela = bytearray()
+    rela += (4).to_bytes(8, "little")  # r_offset
+    rela += ((0 << 32) | 10).to_bytes(8, "little")  # symbol 0, R_X86_64_32
+    rela += (8).to_bytes(8, "little", signed=True)  # addend: the real offset
+    elf = Elf(
+        sections={".debug_str": bytes(target), ".rela.debug_str": bytes(rela)},
+        addresses={},
+        symbols=[Symbol(name=".debug_str", value=0, size=0, info=0, shndx=1)],
+        order="little",
+    )
+    _apply_relocations(elf, 2, "little")
+    resolved_value = int.from_bytes(elf.sections[".debug_str"][4:8], "little")
+    expect(resolved_value == 8, f"self-test relocation produced {resolved_value}")
+
+    # The source scanner the attribution check rests on.
+    spans = function_spans("int a(void) {\n    return 1;\n}\nstatic int b(void) {\n    return 2;\n}\n")
+    expect(
+        [(span.name, span.first_line, span.last_line) for span in spans]
+        == [("a", 1, 3), ("b", 4, 6)],
+        f"self-test spans {[(span.name, span.first_line, span.last_line) for span in spans]}",
+    )
+
+    if failures:
+        for failure in failures:
+            print(f"SELF-TEST FAILURE: {failure}", file=sys.stderr)
+        return 1
+    print("self-test: decoder, line program, aranges, eh_frame and source scanner agree")
+    return 0
+
+
+def markdown(report: Report, lccc_version: str, gcc_version: str | None) -> str:
+    lines = [
+        "# DWARF quality gate",
+        "",
+        f"- lccc: `{lccc_version}`",
+        f"- oracle: {'`' + gcc_version + '`' if gcc_version else 'none (structural checks only)'}",
+        f"- objects built: {report.objects}",
+        f"- failures: {len(report.failures)}",
+        f"- known gaps reproduced: {len(report.known)}",
+        "",
+    ]
+    if report.failures:
+        lines.append("## Failures")
+        lines.append("")
+        lines += [f"- {failure}" for failure in report.failures]
+        lines.append("")
+    else:
+        lines += ["## Failures", "", "None.", ""]
+    lines += ["## Known gaps", ""]
+    if report.known:
+        lines += [f"- **{key}**: {detail}" for key, detail in sorted(report.known.items())]
+    else:
+        lines.append("None: every gap in `KNOWN_GAPS` is closed, delete the entries.")
+    lines.append("")
+    if report.healed:
+        lines += ["## Gaps that stopped reproducing", ""]
+        lines += [f"- {key}" for key in report.healed]
+        lines.append("")
+    lines += ["## Measurements", "", "```json", json.dumps(report.measurements, indent=2), "```", ""]
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--lccc", default="target/fastbuild/lccc", help="lccc binary to test")
+    parser.add_argument("--gcc", default=None, help="GCC 16 to compare tier policy against")
+    parser.add_argument("--json", default=None, help="write the report as JSON here")
+    parser.add_argument("--markdown", default=None, help="write the report as markdown here")
+    parser.add_argument("--self-test", action="store_true", help="test the decoders, not a compiler")
+    parser.add_argument("--keep", action="store_true", help="keep the temporary directory")
+    arguments = parser.parse_args()
+    if arguments.self_test:
+        return self_test()
+
+    lccc = [str(Path(arguments.lccc).resolve())]
+    if not Path(lccc[0]).exists():
+        print(f"error: {lccc[0]} does not exist", file=sys.stderr)
+        return 2
+    gcc = None
+    if arguments.gcc:
+        resolved = shutil.which(arguments.gcc)
+        if resolved:
+            gcc = [resolved]
+        else:
+            print(f"note: {arguments.gcc} not found, structural checks only", file=sys.stderr)
+
+    workdir = Path(tempfile.mkdtemp(prefix="dwarf-quality-"))
+    (workdir / "m32").mkdir()
+    try:
+        report = run_gate(lccc, gcc, workdir)
+        run_32_bit(report, lccc, write_probes(workdir / "m32"), workdir / "m32")
+        versions = {}
+        for name, command in (("lccc", lccc), ("gcc", gcc)):
+            if command:
+                proc = subprocess.run(
+                    [*command, "--version"], text=True, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, check=False, timeout=60,
+                )
+                first = (proc.stdout or proc.stderr).strip().splitlines()
+                versions[name] = first[0] if first else "unknown"
+        document = markdown(report, versions.get("lccc", "unknown"), versions.get("gcc"))
+        if arguments.markdown:
+            Path(arguments.markdown).write_text(document)
+        if arguments.json:
+            Path(arguments.json).write_text(
+                json.dumps(
+                    {
+                        "gate_date": GATE_DATE,
+                        "lccc": versions.get("lccc"),
+                        "gcc": versions.get("gcc"),
+                        "objects": report.objects,
+                        "failures": [
+                            {"check": failure.check, "detail": failure.detail}
+                            for failure in report.failures
+                        ],
+                        "known_gaps": report.known,
+                        "healed_gaps": report.healed,
+                        "measurements": report.measurements,
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+        if report.failures:
+            for failure in report.failures:
+                print(f"FAIL {failure}", file=sys.stderr)
+            print(
+                f"{len(report.failures)} DWARF quality failure(s) across {report.objects} objects",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"DWARF quality gate: {report.objects} objects, 0 failures, "
+            f"{len(report.known)} known gap(s)"
+        )
+        for key, detail in sorted(report.known.items()):
+            print(f"  known gap [{key}]: {detail}")
+        return 0
+    finally:
+        if not arguments.keep:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
