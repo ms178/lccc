@@ -110,7 +110,7 @@ if not any(re.fullmatch(rf"movl {MEM}, %\w+", l) for l in lines):
     failures.append(f"inc_and_return: the load is gone -- a live value was fused away: {lines}")
 
 # Contract 4: narrow immediates within the operand width.
-# `C[i] -= 200` on a byte is `C[i] += 56`: GCC 16.2 and Clang 23.1.4 both emit
+# `C[i] -= 200` on a byte is `C[i] += 56`: GCC 16.2 and Clang 23.1.5 both emit
 # `addb $56`, and so does LCCC once the staged `subl $200` has become
 # `leal -200(%rax)`; `subb $200` is the same instruction cost and the same
 # value, so either spelling of the narrowed immediate is accepted.

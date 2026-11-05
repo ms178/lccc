@@ -185,7 +185,7 @@ CASES.update({
 # Require that exact extra diagnostic rather than disabling it or accepting
 # arbitrary warnings. The semantic return-warning expectation stays unchanged.
 ORACLE_AUXILIARY = {("gcc", "case_entry_after_return"): ["-Wswitch-unreachable"]}
-# Clang 23.1.4's return-warning CFG visits statement-expression returns
+# Clang 23.1.5's return-warning CFG visits statement-expression returns
 # inside these unevaluated builtin operands. For constant_p, Clang also
 # executes the nested return 99 in the native witness (GCC and LCCC return 7).
 # Pin these reference-only defects explicitly. LCCC and GCC still must
@@ -264,7 +264,7 @@ def main():
     parser.add_argument("--icx", default=os.environ.get("ICX"))
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
-    for compiler, pattern in [(args.gcc, r"16\.2\."), (args.clang, r"23\.1\.4\b")]:
+    for compiler, pattern in [(args.gcc, r"16\.2\."), (args.clang, r"23\.1\.5\b")]:
         version = run([compiler, "--version"])
         if version.returncode or not re.search(pattern, version.stdout.splitlines()[0]):
             parser.error(f"wrong or unavailable oracle: {compiler}: {version.stdout} {version.stderr}")

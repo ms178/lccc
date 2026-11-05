@@ -22,7 +22,7 @@ on:
   workflow_dispatch:
     inputs:
       refresh_toolchain_cache:
-        description: Also publish Rust 1.99.1 and Clang 23.1.4 hash-cache assets
+        description: Also publish Rust 1.99.1 and Clang 23.1.5 hash-cache assets
         type: boolean
         default: false
       patched_llvm_slp:
@@ -77,12 +77,12 @@ jobs:
           components: rustfmt, clippy
       - name: Install exact Clang release from its pinned upstream digest
         env:
-          LCCC_CLANG_ORACLE_PREFIX: ${{ runner.temp }}/clang-23.1.4
+          LCCC_CLANG_ORACLE_PREFIX: ${{ runner.temp }}/clang-23.1.5
         run: bash scripts/ci_install_clang_oracle.sh
       - name: Publish immutable assets without changing transport tags
         env:
           GH_TOKEN: ${{ github.token }}
-          LCCC_CLANG_ORACLE_PREFIX: ${{ runner.temp }}/clang-23.1.4
+          LCCC_CLANG_ORACLE_PREFIX: ${{ runner.temp }}/clang-23.1.5
         run: python3 scripts/publish_toolchain_cache.py "$RUNNER_TEMP/toolchain-cache"
       - uses: actions/upload-artifact@v6
         with:
@@ -600,12 +600,12 @@ jobs:
         with:
           path: |
             ~/.cache/lccc/gcc-oracle/16.2
-            ~/.cache/lccc/clang-oracle/23.1.4
+            ~/.cache/lccc/clang-oracle/23.1.5
           key: llvm-slp-companions-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc_oracle.sh', 'scripts/ci_install_clang_oracle.sh') }}
       - name: Install exact GCC 16.2
         run: bash scripts/ci_install_gcc_oracle.sh --version 16.2
-      - name: Install exact Clang 23.1.4
-        run: bash scripts/ci_install_clang_oracle.sh --version 23.1.4
+      - name: Install exact Clang 23.1.5
+        run: bash scripts/ci_install_clang_oracle.sh --version 23.1.5
       - name: Select modern unversioned C and C++ commands
         run: |
           mkdir -p "$RUNNER_TEMP/modern-oracles"
@@ -615,7 +615,7 @@ jobs:
           ln -s "${CLANG%/clang}/clang++" "$RUNNER_TEMP/modern-oracles/clang++"
           echo "$RUNNER_TEMP/modern-oracles" >> "$GITHUB_PATH"
       - name: Verify the lane's oracle toolchain
-        run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.4
+        run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5
       - uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/llvm-slp-oracles

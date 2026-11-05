@@ -17,7 +17,7 @@
  * around an expression statement carries that expression's value, which is the
  * one shape where GCC and Clang agree.
  *
- * Clang 23.1.4 answers `void` for every transparent item, so this file pins the
+ * Clang 23.1.5 answers `void` for every transparent item, so this file pins the
  * GCC reading deliberately: GCC is this project's reference compiler and the
  * kernel compiles only because of it. check_stmt_expr_tail_parity.sh re-derives
  * every expectation below from the oracle and adds the value and diagnostic

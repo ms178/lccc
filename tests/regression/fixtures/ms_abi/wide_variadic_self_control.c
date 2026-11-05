@@ -1,5 +1,5 @@
 /* Non-kernel oracle suitability control, NOT an LCCC verdict.
- * GCC 16.2.0: exit 1; Clang 23.1.4: exit 0 on x86-64 Linux.
+ * GCC 16.2.0: exit 1; Clang 23.1.5: exit 0 on x86-64 Linux.
  * The GCC caller supplies indirect integer128 images but its va_arg consumes
  * aligned inline bytes. Use a self-checked Clang receiver in check_ms_abi.sh.
  * Reproduce: gcc-16 -O2 this-file.c -o control && ./control

@@ -36,7 +36,7 @@ instead of the object reports "absent" for both compilers and then compares two
 absences.  `readelf` is kept as a second opinion that has to agree.
 
 Nothing here is guessed: every expectation was recorded on x86-64 Linux from
-GCC 16.2.0, which the gate re-measures on every run, with Clang 23.1.4
+GCC 16.2.0, which the gate re-measures on every run, with Clang 23.1.5
 consulted as a second opinion where it implements the C23 spelling (it does not
 implement `u8'x'`, so it cannot be the oracle for the whole boundary).
 """

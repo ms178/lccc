@@ -20,7 +20,7 @@
 #  2. STATIC ADDRESS-CONSTANT DIFFERENCES. GCC 16.2 folds
 #       int z = &"Foobar"[1] - &"Foobar"[0];
 #     to 1, but rejects a difference between DIFFERENT literals with
-#     "initializer element is not computable at load time". Clang 23.1.4
+#     "initializer element is not computable at load time". Clang 23.1.5
 #     rejects even the same-text form; LCCC deliberately follows GCC's
 #     documented GNU behaviour, which the kernel and gcc.c-torture rely on.
 #     The lowering must fold the value, not merely stop rejecting it: reading
@@ -28,7 +28,7 @@
 #     the BYTE difference and pointer casts scale by the pointee size; on i686
 #     the pointer width is 4, not the host's 8, so both ABIs are exercised.
 #
-# Every expectation was measured against GCC 16.2 and Clang 23.1.4 where
+# Every expectation was measured against GCC 16.2 and Clang 23.1.5 where
 # those compilers implement the construct (Clang has no nested functions and
 # rejects same-literal differences).
 set -euo pipefail
@@ -268,7 +268,7 @@ run_target() {
         *) echo "$label/bad_return.c: wrong diagnostic: $bout"; return 1 ;;
     esac
     echo "$label/bad_return.c: exactly one diagnostic at the return"
-    # GCC 16.2 must reject the same program (Clang 23.1.4 does too).
+    # GCC 16.2 must reject the same program (Clang 23.1.5 does too).
     if "$GCC" ${mflag:-} -O2 -c "$tmp/bad_return.c" -o "$tmp/bad_gcc.o" >/dev/null 2>&1; then
         echo "$label/bad_return.c: GCC 16.2 unexpectedly accepted it"; return 1
     fi

@@ -9,7 +9,7 @@
 # produced (I32 for a D32/D64/U16 carrier):
 #
 #   * `_Decimal32`/`_Decimal64` -- GNU decimal floating point, supported by
-#     GCC 16.2 and therefore measurable. Clang 23.1.4 rejects the types outright,
+#     GCC 16.2 and therefore measurable. Clang 23.1.5 rejects the types outright,
 #     so GCC is the only oracle here and the gate says so.
 #   * `_Float16` -- a 16-bit carrier that is neither an integer nor one of the
 #     binary FP types the IR rank ladder knows.

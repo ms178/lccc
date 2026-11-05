@@ -9,7 +9,7 @@
  * sign-extended before the count sees it, which is the case that a mask-only
  * lowering gets wrong.
  *
- * The checksum was measured with GCC 16.2 and Clang 23.1.4 on this source (all
+ * The checksum was measured with GCC 16.2 and Clang 23.1.5 on this source (all
  * three optimization levels of the hosted compilers agree); `check.c` pins it.
  * `-ffreestanding` and no library calls: the object is linked with LCCC's own
  * start stub and executed under QEMU for the non-host backends.

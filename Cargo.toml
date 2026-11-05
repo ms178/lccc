@@ -1,20 +1,20 @@
 [package]
 name = "lccc"
 version = "0.1.0"
-# Minimum supported Rust version.
+# No `rust-version` floor.
 #
-# AUD-TOOLCHAIN-1: this said 1.98.1, a version no host in this project ever
-# built the tree with — an *assertion*, not a measurement, and one that made
-# `cargo build` refuse to start on the 1.97.0 toolchain the research sandbox
-# provisions (and on every host that has not caught up with `stable`). The
-# floor is now the version the tree is verified against:
-#   * verified locally: `cargo build --profile fastbuild --locked`
-#     with rustc 1.97.0 (2d8144b78), warnings denied (-D warnings) — clean.
-# The GitHub workflow's `msrv` job re-runs `cargo check --locked` on
-# exactly this toolchain (mirrored locally by ci_local.sh's `msrv-check`
-# gate), so the number stays a measurement. Raise the floor only together
-# with the job that tests the new floor.
-rust-version = "1.97.0"
+# The workspace used to pin rust-version = "1.97.0" (an AUD-TOOLCHAIN-1
+# measurement from 2026-10-27) and CI ran an `msrv` job that re-checked the
+# tree on exactly that toolchain. Both were retired on 2026-11-05: this
+# project tracks current Rust so new language features are usable as soon as
+# they land, and a floor that CI polices is a standing promise to keep old
+# syntax compiling -- the opposite of that intent.
+#
+# What replaces the guarantee is not "untested": the pinned toolchain is still
+# stated once, in scripts/ci_local.sh (1.99.1), and the hosted `build`,
+# `debug`, `clippy` and `rustfmt` lanes all run `--locked` against it, so a
+# Cargo.lock that does not resolve on current Rust still fails loudly.
+# scripts/check_toolchain_cache_freshness.py fails if this key comes back.
 edition = "2024"
 description = "LCCC (Lev's C Compiler) — a high-performance C compiler fork targeting x86-64, i686, ARM64, and RISC-V"
 

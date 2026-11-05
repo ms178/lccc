@@ -1,10 +1,10 @@
 /* Freestanding checksum over the __builtin_convertvector kernels
  * (convertvector.c).
  *
- * PIN is the value GCC 16.2 and Clang 23.1.4 both compute at -O0, -O1,
+ * PIN is the value GCC 16.2 and Clang 23.1.5 both compute at -O0, -O1,
  * -O2, -O3 and -Os (hosted x86-64 build of both files), that a
  * -fsanitize=undefined trap build of both compilers reproduces without
- * trapping, and that GCC 16.2 -m32 and Clang 23.1.4 for AArch64 and
+ * trapping, and that GCC 16.2 -m32 and Clang 23.1.5 for AArch64 and
  * RISC-V reproduce under QEMU.  Every input stays inside its conversion's
  * defined range (no float -> integer overflow, no negative float ->
  * unsigned, no double -> float beyond FLT_MAX, no NaN, whose payload

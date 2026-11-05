@@ -19,7 +19,7 @@ What this pins, and how:
   disagreeing on the value) are one token away from a folded shape and must
   keep their original shape.  `range_crossing_control`, `(x > -8) | (x < 8)`,
   was listed with them as "an outside test", but its two halves cover every
-  int: it is the constant 1, which GCC 16.2 and Clang 23.1.4 return and the
+  int: it is the constant 1, which GCC 16.2 and Clang 23.1.5 return and the
   comparison-dominance fold now returns too.  It must therefore contain no
   comparison (or be gone, once interprocedural propagation has used the
   constant), and `CCC_NO_COMPARE_DOMINANCE=1` must bring both comparisons back.

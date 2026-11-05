@@ -2,13 +2,13 @@
 # ensure_qemu_user.sh — (re)provision the pinned QEMU user-mode emulators
 # (qemu-aarch64, qemu-arm, qemu-i386, qemu-riscv64) after a harness wipe.
 #
-# Why this exists, and why the pin is 11.1.2
+# Why this exists, and why the pin is 11.1.3
 # ------------------------------------------
 # The cross/i686 execution gates run foreign binaries through
 # `qemu-<arch>` resolved BY NAME.  The repository's offline transport
 # for them was the `harness-cache-3` tag: four binaries extracted from
 # Ubuntu's qemu-user-static 1:8.2.2+ds-0ubuntu1.18 — a 2024 build, two
-# QEMU major releases behind the latest public QEMU release (11.1.2,
+# QEMU major releases behind the latest public QEMU release (11.1.3,
 # download.qemu.org).  A gateway emulator that old misjudges modern
 # guest code and silently turns "the emulator is stale" into compiler
 # verdicts, which is exactly the failure the oracle pins elsewhere in
@@ -19,7 +19,8 @@
 # QEMU upstream ships source, not static user-mode binaries.  Debian's
 # `qemu-user` package is "QEMU user mode emulation (static binaries)"
 # (it replaced `qemu-user-static` in Debian's 1:9.1.0 packaging) and
-# Debian sid carries the exact latest upstream version, 11.1.2+ds-3.
+# Debian sid carries the exact latest upstream version, 11.1.3+ds-1
+# (Built-Using: gcc-16 16.2.0-4, glibc 2.43-7).
 # This script pins that `.deb` BY CONTENT:
 #
 #   * SHA-256 as published in Debian sid's signed Packages index
@@ -32,27 +33,35 @@
 #
 # Only the four emulators the gates name are installed out of the
 # ~73 MB package.  A pre-existing install is reused ONLY when every
-# binary's `--version` reports 11.1.2 — an 8.2.2-era install in the
+# binary's `--version` reports 11.1.3 — an 8.2.2-era install in the
 # same prefix is replaced, never vouched for by its directory name,
 # so "update the old ones correctly" is the fast path's job too.
 #
 # Usage: scripts/ensure_qemu_user.sh [install-prefix] [--print-bin]
-#   install-prefix defaults to ${LCCC_QEMU_PREFIX:-$HOME/.cache/lccc/qemu-user-11.1.2};
+#   install-prefix defaults to ${LCCC_QEMU_PREFIX:-$HOME/.cache/lccc/qemu-user-11.1.3};
 #   binaries land at <prefix>/bin/qemu-<arch>.  The download cache is
 #   ${QEMU_DL_DIR:-$HOME/.cache/dl}, the same channel ensure_gas_247.sh
 #   and ensure_arm_a64_xml.sh use: a pre-placed .deb there must hash to
 #   the same pin before it is adopted.
 #
 # scripts/ensure_qemu_user.sh --self-test
-#   exercises the version probe against fake emulators (11.1.2 accepted,
-#   8.2.2 / lookalikes / missing arch rejected) with no network.
+#   exercises the version probe against fake emulators (11.1.3 accepted;
+#   8.2.2, the superseded 11.1.2 pin, lookalikes and a missing arch are all
+#   rejected) with no network.
+#
+# Re-verified 2026-11-05 against the live sid index AND by downloading the
+# 72,595,524-byte .deb and checking it against the pinned SHA-256.
 set -euo pipefail
 
-QEMU_VERSION=11.1.2
-DEB_VERSION=11.1.2+ds-3
+QEMU_VERSION=11.1.3
+DEB_VERSION=11.1.3+ds-1
 DEB_NAME="qemu-user_${DEB_VERSION}_amd64.deb"
-DEB_SHA256=4bacc2bf647f1756c5f08e7f146161d3eeef9d9f53e5d6412d1b3daca0c93655
-DEB_SHA1=6067b061f3dd361d94e6c48a1044f79860c56c51
+# Debian sid Packages index (dists/sid/main/binary-amd64/Packages.xz),
+# `qemu-user` stanza, 2026-11-05; the .deb was then downloaded in full and
+# checked against this digest.  DEB_SHA1 is the same file's SHA-1, used only
+# as the snapshot.debian.org content-addressed key.
+DEB_SHA256=5fa915e759f314400cf7d64a2745747e6baa50a180c938b3e8d281ce57ede452
+DEB_SHA1=df5ab4a6de0ab31b9a5215eb03929285dcbe4d7e
 DEB_URLS=(
     "https://deb.debian.org/debian/pool/main/q/qemu/$DEB_NAME"
     "https://snapshot.debian.org/file/$DEB_SHA1"
@@ -117,11 +126,12 @@ run_self_test() {
     _mk "$td/old" "8.2.2"
     _mk "$td/lookalike" "11.1.20"
     _mk "$td/missing" "$QEMU_VERSION"; rm "$td/missing/qemu-arm"
-    _version_ok "$td/good"      || { echo "self-test FAIL: 11.1.2 set rejected"; exit 1; }
+    _version_ok "$td/good"      || { echo "self-test FAIL: $QEMU_VERSION set rejected"; exit 1; }
     ! _version_ok "$td/old"      || { echo "self-test FAIL: 8.2.2 set accepted"; exit 1; }
     ! _version_ok "$td/lookalike" || { echo "self-test FAIL: 11.1.20 lookalike accepted"; exit 1; }
+    ! _version_ok "$td/superseded" || { echo "self-test FAIL: superseded 11.1.2 set accepted"; exit 1; }
     ! _version_ok "$td/missing"  || { echo "self-test FAIL: incomplete set accepted"; exit 1; }
-    echo "ensure_qemu_user self-test: PASS (accept $QEMU_VERSION; reject 8.2.2, 11.1.20, incomplete)"
+    echo "ensure_qemu_user self-test: PASS (accept $QEMU_VERSION; reject 8.2.2, superseded 11.1.2, 11.1.20, incomplete)"
 }
 
 if [ "$self_test" = 1 ]; then

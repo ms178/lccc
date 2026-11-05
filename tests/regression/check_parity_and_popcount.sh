@@ -17,7 +17,7 @@
 #
 # `__builtin_parity` used to lower as `Popcount(x) & 1`, so every backend paid
 # for the full count and then masked it.  Measured on x86-64 at -O2: 17
-# instructions against GCC 16.2's 6 and Clang 23.1.4's 6.  The same round made
+# instructions against GCC 16.2's 6 and Clang 23.1.5's 6.  The same round made
 # RISC-V's own `Popcount` branch-free (Kernighan's loop was five instructions
 # per set bit behind a data-dependent branch), which is why the loop idiom may
 # now fold to `Popcount` on RISC-V (`resolved_fast_popcount`).

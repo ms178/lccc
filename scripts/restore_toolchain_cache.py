@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""Restore the reviewed Rust/Clang cache lock, never a remote self-signed hash."""
+"""Restore the reviewed Rust cache lock, never a remote self-signed hash.
+
+Clang is deliberately NOT in VERSIONS. The lock still describes a repacked
+Clang 23.1.4 asset on the `harness-cache-4` release, but the live oracle pin
+is 23.1.5 and comes from scripts/ci_install_clang_oracle.sh, which verifies
+the official LLVM asset against the SHA-256 GitHub publishes for it. A
+main-branch patch cannot re-issue a release asset, so restoring clang from
+this lock would install a superseded oracle -- and a gate that compares
+against the wrong compiler is worse than one that fails to provision.
+scripts/publish_toolchain_cache.py re-adds the entry, with a real
+content-addressed digest, the next time the hosted cache job runs; until then
+scripts/check_toolchain_cache_freshness.py asserts that nothing restores it.
+"""
 import argparse
 import hashlib
 import inspect
@@ -19,7 +31,7 @@ if not hasattr(tarfile, 'data_filter'):
 import tempfile
 
 LOCK = Path(__file__).resolve().parent.parent / 'engineering/toolchains/cache-lock.json'
-VERSIONS = {'rust': '1.99.1', 'clang': '23.1.4'}
+VERSIONS = {'rust': '1.99.1'}
 
 
 def validate(entry, name):

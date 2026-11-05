@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Differential C-feature probe: lccc versus GCC 16.2 and Clang 23.1.4.
+"""Differential C-feature probe: lccc versus GCC 16.2 and Clang 23.1.5.
 
 Every case is one self-contained C program with a defined exit status. The
 probe compiles it with each compiler, runs the binary, and reports the matrix

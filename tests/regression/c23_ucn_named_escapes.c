@@ -1,6 +1,6 @@
 // Named universal character escapes: `\N{NAME}` must denote the character with
 // that Unicode name, and a narrow literal must encode it as UTF-8 exactly as
-// `\uXXXX` does. The spelling is C++23's; GCC 16.2, Clang 23.1.4 and lccc all
+// `\uXXXX` does. The spelling is C++23's; GCC 16.2, Clang 23.1.5 and lccc all
 // accept it in C (GCC says so under -pedantic).
 //
 // Every name below is spelled out twice -- once as the escape, once as the

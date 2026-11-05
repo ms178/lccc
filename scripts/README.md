@@ -486,7 +486,7 @@ element and cast callees) at -O0, -O1, -O2 and -Os, assembled by LCCC's own
 assembler (`-c`); and 2 two-unit psABI fixtures under `interop/` (register
 pairs and alignment; floating-point arguments) linked LCCC-with-LCCC and
 LCCC-with-Clang in both directions at -O0 and -O2.
-It requires the fastbuild target drivers, Clang 23.1.4, GNU target linkers or LLD,
+It requires the fastbuild target drivers, Clang 23.1.5, GNU target linkers or LLD,
 QEMU user emulators, and host C declaration headers. The executable uses a
 minimal syscall startup and no cross libc; printf/puts are no-ops, so acceptance
 is based on each fixture's exit-code oracle, not its printed output. `--clang`,

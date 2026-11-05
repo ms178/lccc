@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Differential fuzz of the preprocessor against GCC 16.2 and Clang 23.1.4.
+"""Differential fuzz of the preprocessor against GCC 16.2 and Clang 23.1.5.
 
 Why a token comparison rather than a text one: `-E -P` output differs between
 compilers in whitespace and line breaks all the time (that is formatting), and

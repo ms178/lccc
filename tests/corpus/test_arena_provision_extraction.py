@@ -73,7 +73,15 @@ def archive(entries: list[tuple[tarfile.TarInfo, bytes | None]]) -> tarfile.TarF
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as out:
         for info, body in entries:
-            out.addfile(info, io.BytesIO(body) if body is not None else None)
+            # A member that DECLARES a size needs a fileobj on every supported
+            # Python: 3.13's tarfile.addfile raises ValueError("fileobj not
+            # provided for non zero-size regular file") where earlier versions
+            # wrote a short member silently, so passing None made this whole
+            # module error out on 3.13 before any policy was exercised. The
+            # unsafe-member cases only exercise the NAME/TYPE policy, so pad
+            # the content with NULs instead of omitting it.
+            stream = io.BytesIO(body if body is not None else b"\0" * info.size)
+            out.addfile(info, stream)
     buf.seek(0)
     return tarfile.open(fileobj=buf, mode="r")
 
@@ -168,13 +176,13 @@ class ExtractionPolicyTests(unittest.TestCase):
 
     def test_legacy_python_still_extracts_a_valid_archive(self):
         src = archive([
-            (member("clang-23.1.4", kind="dir"), None),
-            (member("clang-23.1.4/bin/clang", data=b"#!/bin/sh\n"), b"#!/bin/sh\n"),
+            (member("clang-23.1.5", kind="dir"), None),
+            (member("clang-23.1.5/bin/clang", data=b"#!/bin/sh\n"), b"#!/bin/sh\n"),
         ])
         with tempfile.TemporaryDirectory() as td, \
                 mock.patch.object(prov, "extractall_takes_filter", return_value=False):
             prov.extract_untrusted(src, Path(td))
-            self.assertEqual((Path(td) / "clang-23.1.4/bin/clang").read_bytes(),
+            self.assertEqual((Path(td) / "clang-23.1.5/bin/clang").read_bytes(),
                              b"#!/bin/sh\n")
 
     def test_unsafe_members_are_refused_before_any_write(self):
@@ -189,7 +197,7 @@ class ExtractionPolicyTests(unittest.TestCase):
         ]
         for label, bad in cases:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as td:
-                good = member("clang-23.1.4/bin/clang", data=b"ok")
+                good = member("clang-23.1.5/bin/clang", data=b"ok")
                 src = archive([(good, b"ok"), (bad, None)])
                 with mock.patch.object(prov, "extractall_takes_filter",
                                        return_value=False), \

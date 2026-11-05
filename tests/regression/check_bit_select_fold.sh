@@ -37,7 +37,7 @@
 #   6. -O0, -O1, -O2, -O3, -Os, the kill switch and GCC agree bit for bit on a
 #      checksum over every width, both edges and 64-bit operands,
 #   7. the Chromium/Firefox-derived consumers of the test fold to the shapes
-#      Clang 23.1.4 / GCC 16.2 emit or better: test-and-modify of one word
+#      Clang 23.1.5 / GCC 16.2 emit or better: test-and-modify of one word
 #      (`bt` + `btr`/`bts`, one load and one store), the branch forms
 #      (`bt; jnc`, the negated `bt; jc`, the conditional sibling call
 #      `bt; jb hit@PLT`), the guarded set and the conditional clear (one

@@ -42,7 +42,7 @@
 # ============================================================================
 set -euo pipefail
 
-PINNED_KVER=v7.3
+PINNED_KVER=v7.3.1
 KVER=${KVER:-$PINNED_KVER}
 PREFIX=${LCCC_ORACLE_PREFIX:-$HOME/tools}
 VERIFY=1
@@ -61,8 +61,12 @@ if [[ $VERIFY == 1 && $KVER != "$PINNED_KVER" ]]; then
   exit 1
 fi
 
-# The v7.3 contents (cross-checked between the torvalds and stable
-# kernel.org trees at the v7.3 tag, 2026-10-27).  One definition feeds
+# The v7.3.1 contents.  These six digests are BYTE-IDENTICAL to the v7.3
+# pins: nothing under arch/x86/tools/ changed in the 7.3.1 point release, so
+# the bump moves the label (and the tree the sources come from), not the
+# bytes.  Cross-checked 2026-11-05 across two independent transports of the
+# v7.3.1 tag -- kernel.org's stable cgit and the gregkh/linux GitHub mirror --
+# and all six agreed.  One definition feeds
 # both the `sha256sum -c` gate and the build stamp, so the two can
 # never disagree about what "the pinned sources" means.
 PINS='acbeca7b2fb6f84502c96385edf117f5170756d743373a7a581b5b46427803f7  relocs.c
@@ -98,7 +102,12 @@ if [[ -x "$BIN/relocs" ]]; then
   echo "relocs present but stamp/sources do not prove $KVER; rebuilding"
 fi
 
-BASE="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/plain"
+# The STABLE tree, not torvalds': v7.3.1 is a stable-only tag and does not
+# exist in Linus' tree at all (measured 2026-11-05: the same cgit `plain`
+# fetch answers 404 for ?h=v7.3.1 on torvalds/linux.git and 200 on
+# stable/linux.git).  The stable tree carries mainline tags too, so it serves
+# every --kver this script can be asked for.
+BASE="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain"
 
 fetch_sources() {
   echo "fetching arch/x86/tools/relocs sources at $KVER"

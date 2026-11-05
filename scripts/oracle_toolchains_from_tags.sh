@@ -7,7 +7,7 @@
 # WHY THIS EXISTS
 # ---------------
 # Every gate in this repository that says "compare against GCC 16.2 / Clang
-# 23.1.4" resolves its oracle by NAME on PATH (`gcc-16`, `clang-23`), and CI
+# 23.1.5" resolves its oracle by NAME on PATH (`gcc-16`, `clang-23`), and CI
 # provisions those names from a distribution repository or a vendor PPA. A
 # developer (or an agent) working on a host whose distribution does not carry
 # GCC 16 has exactly two options today: skip every gate that needs the oracle
@@ -16,14 +16,26 @@
 # to be run.
 #
 # `harness-cache-1` carries GCC/binutils, verified against its manifest.
-# The historical harness-cache-4 source tree contains Clang 23.1.3, not 23.1.4.
-# Rust 1.99.1 and Clang 23.1.4 use engineering/toolchains/cache-lock.json,
-# whose reviewed hashes describe content-addressed release assets. No source
-# tag is relabelled. mold 3.0.0 (2026-10-05) superseded the tag's 2.42.1
-# binary; it is installed by scripts/ci_install_mold_oracle.sh from the
-# digest-pinned upstream release instead of the stale tag payload. Online
-# restoration needs GitHub's asset CDN; explicit offline verification never
-# invokes a transport or writes the prefix.
+# Rust 1.99.1 uses engineering/toolchains/cache-lock.json, whose reviewed
+# hashes describe content-addressed release assets. No source tag is
+# relabelled. Two packages moved OFF tag/lock transport onto digest-pinned
+# upstream installers, because a main-branch patch cannot re-issue a release
+# asset or a tag blob, so a version bump there would otherwise point at bytes
+# that do not exist:
+#   * mold 3.0.0 (2026-10-05) superseded the tag's 2.42.1 binary and is
+#     installed by scripts/ci_install_mold_oracle.sh;
+#   * Clang 23.1.5 (2026-11-03) is installed by
+#     scripts/ci_install_clang_oracle.sh from the official LLVM asset, pinned
+#     by the SHA-256 GitHub publishes for it. The harness-cache-4 git tree
+#     (23.1.3), its release asset and the harness-cache-7 agent payload
+#     (both 23.1.4) are superseded transport copies; nothing restores Clang
+#     from them any more (guarded in
+#     scripts/check_toolchain_cache_freshness.py).
+# gdb 18.1 is built from its pinned GNU source tarball by
+# scripts/ci_install_gdb_oracle.sh with -march=haswell, the ISA level the
+# project's own Raptor Lake host and its packages are built for.
+# Online restoration needs GitHub's asset CDN; explicit offline verification
+# never invokes a transport or writes the prefix.
 #
 # WHAT IT DOES NOT DO
 # -------------------
@@ -78,10 +90,11 @@ OFFLINE=0
 # The pins. These are the versions the gates name; a tag that carries a
 # different version is a provisioning error, not a new default.
 GCC_VERSION=16.2.0
-CLANG_VERSION=23.1.4
+CLANG_VERSION=23.1.5
 RUST_VERSION=1.99.1
 MOLD_VERSION=3.0.0
 BINUTILS_VERSION=2.47
+GDB_VERSION=18.1
 
 while [ $# -gt 0 ]; do
     case $1 in
@@ -185,7 +198,8 @@ if [ "$OFFLINE" = 1 ] || [ "$VERIFY_ONLY" = 1 ]; then
     probe_version "$clang_bin" "version $CLANG_VERSION " "clang-23" >/dev/null
     probe_version "$RUST_ROOT/bin/rustc" "rustc $RUST_VERSION " "rustc" >/dev/null
     probe_version "$PREFIX/bin/mold" "$MOLD_VERSION" "mold" >/dev/null
-    log "offline verification: gcc-16 $GCC_VERSION, clang-23 $CLANG_VERSION, Rust $RUST_VERSION, mold $MOLD_VERSION all present"
+    probe_version "$PREFIX/gdb-$GDB_VERSION/bin/gdb" "GNU gdb (GDB) $GDB_VERSION" "gdb" >/dev/null
+    log "offline verification: gcc-16 $GCC_VERSION, clang-23 $CLANG_VERSION, Rust $RUST_VERSION, mold $MOLD_VERSION, gdb $GDB_VERSION all present"
     exit 0
 fi
 
@@ -221,8 +235,25 @@ restore_toolchain() {  # restore_toolchain <tag> <member> <sha> <root> <label>
 }
 
 restore_toolchain "$TAG_GCC" "$GCC_MEMBER" "$GCC_SHA" "$GCC_ROOT" "gcc-$GCC_VERSION"
-# Restore only the published exact-version payloads after hash verification.
-python3 "$REPO/scripts/restore_toolchain_cache.py" --prefix "$PREFIX"
+# Rust is the only tool left on the content-addressed cache lock; Clang moved
+# to its own digest-pinned installer (header), so the two cannot drift apart.
+python3 "$REPO/scripts/restore_toolchain_cache.py" --tool rust --prefix "$PREFIX"
+
+# Clang: the official release asset, verified by the installer's own SHA-256
+# gate, whose exit status already requires `clang -dumpversion` == $CLANG_VERSION.
+if [ -x "$clang_bin" ] && [ "$("$clang_bin" -dumpversion 2>/dev/null)" = "$CLANG_VERSION" ]; then
+    log "clang-$CLANG_VERSION already installed in $CLANG_ROOT (reused)"
+else
+    log "installing Clang $CLANG_VERSION from the digest-pinned upstream release"
+    bash "$REPO/scripts/ci_install_clang_oracle.sh" --prefix "$CLANG_ROOT" \
+        || die "Clang $CLANG_VERSION provisioning failed"
+fi
+
+# gdb: the debugger the DWARF line-table gates need. Without a pinned one they
+# silently skip their debugger cross-check, which is the failure mode this
+# provisioning script exists to prevent.
+bash "$REPO/scripts/ci_install_gdb_oracle.sh" --prefix "$PREFIX/gdb-$GDB_VERSION" \
+    || die "gdb $GDB_VERSION provisioning failed"
 
 # mold 3.0.0 no longer comes from the tag (the tag binary is 2.42.1):
 # the dedicated installer verifies the upstream release digest, refuses
@@ -288,6 +319,7 @@ if [ "$WITH_SHIMS" = 1 ]; then
     done
     install_shim mold "$PREFIX/bin/mold"
     install_shim ld.mold "$PREFIX/bin/mold"
+    install_shim gdb "$PREFIX/gdb-$GDB_VERSION/bin/gdb"
     if [ "$WITH_BINUTILS" = 1 ] && [ -x "$PREFIX/binutils-$BINUTILS_VERSION/bin/as" ]; then
         install_shim gas-2.47 "$PREFIX/binutils-$BINUTILS_VERSION/bin/as"
         install_shim ld.bfd-2.47 "$PREFIX/binutils-$BINUTILS_VERSION/bin/ld"
@@ -301,9 +333,11 @@ fi
 gcc_line=$(probe_version "$gcc_bin" "GCC) $GCC_VERSION" "gcc-16")
 clang_line=$(probe_version "$clang_bin" "version $CLANG_VERSION" "clang-23")
 mold_line=$(probe_version "$PREFIX/bin/mold" "$MOLD_VERSION" "mold")
+gdb_line=$(probe_version "$PREFIX/gdb-$GDB_VERSION/bin/gdb" "GNU gdb (GDB) $GDB_VERSION" "gdb")
 log "$gcc_line"
 log "$clang_line"
 log "$mold_line"
+log "$gdb_line"
 
 # The linker the oracles use is the distribution's by default; mold is the
 # research preference. Proving the driver can actually LINK (not just print a
@@ -327,6 +361,7 @@ envfile=$PREFIX/env.sh
     printf 'export CXX=%q\n' "$GCC_ROOT/bin/g++-16"
     printf 'export CLANG=%q\n' "$clang_bin"
     printf 'export MOLD=%q\n' "$PREFIX/bin/mold"
+    printf 'export GDB=%q\n' "$PREFIX/gdb-$GDB_VERSION/bin/gdb"
     printf 'export RUSTC=%q\n' "$RUST_ROOT/bin/rustc"
     printf 'export CARGO=%q\n' "$RUST_ROOT/bin/cargo"
     printf 'export PATH=%q:%q:%q:%q:%q:"$PATH"\n' "$RUST_ROOT/bin" "$CLANG_ROOT/bin" "$GCC_ROOT/bin" "$PREFIX/bin" "$BIN_DIR"

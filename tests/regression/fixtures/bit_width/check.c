@@ -1,6 +1,6 @@
 /* Freestanding differential checksum for single-bit selection.
  *
- * The expected value was measured with GCC 16.2 and Clang 23.1.4 on the same
+ * The expected value was measured with GCC 16.2 and Clang 23.1.5 on the same
  * source (both produced 3862114428453411727 for set/clear/test and
  * 2052003996353657299 for the toggle checksum, and 15164872185446587354 for the shared-mask checksum).  Every shift index is below the
  * operand width, so the C is defined; the IR's modulo-W behaviour for larger

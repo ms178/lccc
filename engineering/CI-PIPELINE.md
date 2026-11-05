@@ -21,6 +21,14 @@ Baseline for every number below: run **39686387347** (2026-10-21,
 | SSA regression corpus | 289 s | 107 s | 137 s (corpus) |
 | Clippy / MSRV / ICX / Test Suite | 70 / 38 / 31 / 4 s | 0 s | — |
 
+The MSRV lane in that last row no longer exists: the 1.97.0 `rust-version`
+floor and its hosted `msrv` job were retired on 2026-11-05 (see
+engineering/FOLLOWUP-2026-11-05-clang-2315-gdb-181.md), so the pipeline is
+one lane lighter than the table shows. The 38 s stays printed because every
+number in this table is a measurement of run 39686387347, and rewriting a
+measured duration to match the present would destroy the evidence that makes
+the rest of the table trustworthy.
+
 ## The three costs that were paid, and what replaced them
 
 ### 1. The same apt transaction, seven times (`937 s` of runner time)

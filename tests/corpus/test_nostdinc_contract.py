@@ -20,6 +20,18 @@ class NoStandardIncludes(unittest.TestCase):
         self.src = self.root / 'main.c'
         self.custom = self.root / 'custom'
         self.custom.mkdir()
+        # `-nostdinc` leaves GCC 12 with *no* angle search directory at all;
+        # it then hard-errors on `__has_include(<h>)` ("no include path in
+        # which to search") instead of answering 0, which is what the pinned
+        # GCC 16.2 oracle does. Record the major version so the one affected
+        # case can supply an empty directory without weakening the contract.
+        self.gcc_major = 0
+        try:
+            done = subprocess.run([str(GCC), '-dumpversion'], text=True,
+                                  capture_output=True, timeout=30, env=self.env)
+            self.gcc_major = int(done.stdout.strip().split('.')[0])
+        except (ValueError, AttributeError, OSError, subprocess.SubprocessError):
+            pass
         (self.custom / 'private.h').write_text('#define VALUE 47\n')
         (self.root / 'sibling.h').write_text('#define SIBLING 83\n')
         self.env = dict(os.environ)
@@ -68,6 +80,8 @@ class NoStandardIncludes(unittest.TestCase):
             self.assertNotEqual(run.returncode, 0, run.stdout)
 
     def test_has_include_uses_the_same_suppressed_search(self):
+        empty = self.root / 'empty'
+        empty.mkdir(exist_ok=True)
         source = '''#if __has_include(<stdio.h>)
 #error default search leaked
 #endif
@@ -78,7 +92,13 @@ int x = 1;
 '''
         for cc in (GCC, LCCC):
             with self.subTest(cc=cc):
-                run = self.run_cc(cc, source, '-nostdinc', '-E', '-P')
+                # Older GCCs need one (empty) angle directory for the predicate
+                # to be answerable. This does NOT weaken the check: a leaked
+                # default directory still makes `__has_include(<stdio.h>)` true
+                # and triggers `#error default search leaked`. LCCC and the
+                # pinned oracle keep the stricter no-directory form.
+                extra = ('-I', str(empty)) if cc == GCC and self.gcc_major < 16 else ()
+                run = self.run_cc(cc, source, '-nostdinc', *extra, '-E', '-P')
                 self.assertEqual(run.returncode, 0, run.stderr)
                 probe = '#if !__has_include(<private.h>)\n#error missing quote fallback\n#endif\n'
                 run = self.run_cc(cc, probe, '-nostdinc', '-iquote', str(self.custom), '-E', '-P')

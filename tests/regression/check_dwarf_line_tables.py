@@ -30,6 +30,7 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+GDB_ORACLE_LIB = ROOT / "tests/regression/lib/gdb_oracle.sh"
 
 
 class GateFailure(RuntimeError):
@@ -46,6 +47,36 @@ def resolve_command(command: str) -> str:
     if resolved is None:
         raise GateFailure(f"required tool not found on PATH: {command}")
     return resolved
+
+
+def resolve_gdb_oracle(*, allow_missing: bool) -> str | None:
+    """Resolve the pinned GNU gdb 18.1 oracle exactly once, fail closed.
+
+    The policy lives in `tests/regression/lib/gdb_oracle.sh` so the shell and
+    Python consumers cannot drift apart. Status 3 is the *explicit* skip that
+    --allow-missing-debugger buys; every other non-zero status is a hard
+    failure. A resolver that prints an unusable path is also a failure: a
+    checker that cannot fail is decoration.
+    """
+    argv = [str(GDB_ORACLE_LIB), "--print", "--gate", "check_dwarf_line_tables"]
+    if allow_missing:
+        argv.append("--allow-missing-debugger")
+    completed = subprocess.run(
+        argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
+    )
+    if completed.returncode == 3:
+        print(completed.stderr.strip(), file=sys.stderr)
+        return None
+    if completed.returncode != 0:
+        raise GateFailure(
+            f"pinned GDB 18.1 oracle unavailable:\n{completed.stderr.strip()}"
+        )
+    path = completed.stdout.strip()
+    require(
+        bool(path) and Path(path).is_absolute() and os.access(path, os.X_OK),
+        f"gdb oracle resolver returned an unusable path: {path!r}",
+    )
+    return path
 
 
 def run(argv: list[str], *, cwd: Path | None = None) -> str:
@@ -297,10 +328,10 @@ def require_no_debug_keeps_symtab(readelf: str, path: Path) -> None:
     require(".symtab" in sections, f"-S dropped .symtab from {path}")
 
 
-def require_debugger_breaks_function(path: Path, function: str, filename: str, line: int) -> bool:
+def require_debugger_breaks_function(gdb: str | None, path: Path, function: str,
+                                     filename: str, line: int) -> bool:
     """`break FUNCTION` skips the prologue to the body's first statement:
     gdb needs the entry row to skip *from*."""
-    gdb = shutil.which("gdb")
     if gdb is None:
         return False
     out = run([gdb, "-q", "-batch", "-nx", "-ex", f"break {function}", str(path)])
@@ -312,9 +343,8 @@ def require_debugger_breaks_function(path: Path, function: str, filename: str, l
     return True
 
 
-def require_debugger_resolves(path: Path, filename: str, line: int) -> bool:
-    """gdb resolves `file:line` through the line table; False when absent."""
-    gdb = shutil.which("gdb")
+def require_debugger_resolves(gdb: str | None, path: Path, filename: str, line: int) -> bool:
+    """gdb resolves `file:line` through the line table; False on explicit skip."""
     if gdb is None:
         return False
     out = run([gdb, "-q", "-batch", "-nx", "-ex", f"break {filename}:{line}", str(path)])
@@ -457,9 +487,15 @@ def main() -> int:
     parser.add_argument("--gcc", default=os.environ.get("GCC", "gcc-16"))
     parser.add_argument("--readelf", default=os.environ.get("READELF", "readelf"))
     parser.add_argument("--objcopy", default=os.environ.get("OBJCOPY", "objcopy"))
+    parser.add_argument(
+        "--allow-missing-debugger",
+        action="store_true",
+        help="Explicitly skip the pinned GDB 18.1 cross-check when the oracle is unavailable",
+    )
     args = parser.parse_args()
 
     try:
+        gdb = resolve_gdb_oracle(allow_missing=args.allow_missing_debugger)
         lccc = resolve_command(args.lccc)
         lccc_i686 = resolve_command(args.lccc_i686)
         lccc_arm = resolve_command(args.lccc_arm)
@@ -565,8 +601,8 @@ def main() -> int:
             require_line_address(readelf, lccc_exec, "unit_b.c", "dwarf_entry")
             require_unit_covers(readelf, lccc_exec, "dwarf_helper")
             require_unit_covers(readelf, lccc_exec, "dwarf_entry")
-            debugger = require_debugger_resolves(lccc_exec, "unit_a.c", 2)
-            require_debugger_breaks_function(lccc_exec, "dwarf_helper", "unit_a.c", 2)
+            debugger = require_debugger_resolves(gdb, lccc_exec, "unit_a.c", 2)
+            require_debugger_breaks_function(gdb, lccc_exec, "dwarf_helper", "unit_a.c", 2)
 
             # i686 images: LCCC's own objects, GCC 16.2's (zlib-compressed by
             # default) objects, and a GCC -fPIC shared object -- the i386
@@ -597,9 +633,9 @@ def main() -> int:
                 require_unit_covers(readelf, image, "dwarf_helper")
                 require_unit_covers(readelf, image, "dwarf_entry")
                 i686_images.append(image)
-            require_debugger_resolves(i686_images[0], "unit_a.c", 2)
-            require_debugger_resolves(i686_images[1], "unit_b.c", 3)
-            require_debugger_breaks_function(i686_images[0], "dwarf_helper", "unit_a.c", 2)
+            require_debugger_resolves(gdb, i686_images[0], "unit_a.c", 2)
+            require_debugger_resolves(gdb, i686_images[1], "unit_b.c", 3)
+            require_debugger_breaks_function(gdb, i686_images[0], "dwarf_helper", "unit_a.c", 2)
 
             # -S/--strip-debug drops the debug sections but keeps .symtab.
             for driver, inputs in ((lccc, lccc_objects), (lccc_i686, i686_objects)):
@@ -698,7 +734,8 @@ def main() -> int:
             "strip-debug, executable and shared links (x86-64 and i686), "
             f"compressed debug input ({', '.join(forms)}); "
             f"built-in assemblers: {', '.join(cross)}"
-            + ("; gdb resolves file:line" if debugger else "; gdb not installed, debugger check skipped")
+            + ("; pinned GDB 18.1 resolves file:line" if debugger else
+               "; pinned GDB 18.1 unavailable, debugger cross-check explicitly skipped")
         )
         return 0
     except (GateFailure, OSError, subprocess.SubprocessError) as error:

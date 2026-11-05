@@ -7,7 +7,7 @@
 #     `x - K` as `addi[w] -K`): one instruction where the backend used to
 #     stage K through two `li`s and a copy into an R-type form (`x >> 3` was
 #     `li t0, 3; li t2, 3; sra t0, t1, t2`, now `srai t0, a0, 3` as in GCC
-#     16.2 and Clang 23.1.4).  The RV64 peephole's sext32-producer table
+#     16.2 and Clang 23.1.5).  The RV64 peephole's sext32-producer table
 #     learned the `w` immediates and stopped treating a short `srai` as one:
 #     `(int)(x >> 3)` keeps its `sext.w`.
 #   * `x < 0 ? -x : x` (and `abs`, `labs`, `llabs`, and the zero-inclusive

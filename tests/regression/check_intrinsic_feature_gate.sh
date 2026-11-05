@@ -579,7 +579,7 @@ for mode in -m64 -m32; do
 done
 
 # The same discipline before an ordinary (non-tail) call, as GCC 16.2 and
-# Clang 23.1.4 do: a legacy-SSE callee must not inherit dirty upper halves.
+# Clang 23.1.5 do: a legacy-SSE callee must not inherit dirty upper halves.
 # A YMM argument is the exception -- vzeroupper there would destroy the
 # argument itself. 256-bit PTEST is used because i686 emits it natively
 # (GNU vector arithmetic is still per-lane there).

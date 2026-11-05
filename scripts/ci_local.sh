@@ -35,10 +35,6 @@
 #                                      # it to mode=full: fast + slow on one tree
 #                                      # is every gate GitHub runs.
 #   ./scripts/ci_local.sh --only NAME  # a single gate, substring match
-#   ./scripts/ci_local.sh --fast --skip-msrv
-#       Modern-toolchain-only local validation. Omits the compatibility-floor
-#       compiler, NOT any compiler correctness gate; never writes a pass stamp.
-#       Default local and hosted compatibility coverage is unchanged.
 #
 # A --fast pass is NOT CI-equivalent: GitHub runs all seven slow gates on every
 # PR.  PR #638 went red on check_peephole_whitespace.sh after a green
@@ -78,13 +74,11 @@ export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-1}"
 
 FAST=0
 SLOW_ONLY=0
-SKIP_MSRV=0
 ONLY=""
 for arg in "$@"; do
     case "$arg" in
         --fast) FAST=1 ;;
         --slow) SLOW_ONLY=1 ;;
-        --skip-msrv) SKIP_MSRV=1 ;;
         --only) ONLY="__NEXT__" ;;
         *) if [ "$ONLY" = "__NEXT__" ]; then ONLY="$arg"; else
                echo "unknown argument: $arg" >&2; exit 2
@@ -135,11 +129,6 @@ gate() {
     fi
     if [ "$FAST" = "1" ] && [ "$slow" = "slow" ]; then
         echo "SKIP  $name (--fast)"
-        SKIPPED=$((SKIPPED + 1))
-        return 0
-    fi
-    if [ "$SKIP_MSRV" = 1 ] && [ "$name" = msrv-check ]; then
-        echo "SKIP  $name (--skip-msrv: modern toolchains only; no pass stamp)"
         SKIPPED=$((SKIPPED + 1))
         return 0
     fi
@@ -707,7 +696,7 @@ gate "oracle-toolchain-self-test" fast \
 gate "gcc-oracle-installer-self-test" fast \
     bash scripts/ci_install_gcc_oracle.sh --self-test
 gate "oracle-toolchain" fast \
-    bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.4
+    bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5
 
 gate "rust-toolchain-selector" fast \
     bash tests/regression/check_rust_toolchain_selector.sh
@@ -736,7 +725,7 @@ gate "ext-vector-rvalue-subscript" fast \
 
 # The by-value ext-vector ABI grid: every shape (lane type x lane count) on
 # -m64 and -m32 at -O0/-O2, built as provider and caller by lccc and by the
-# pinned Clang 23.1.4 oracle and linked in all four combinations; shapes
+# pinned Clang 23.1.5 oracle and linked in all four combinations; shapes
 # Clang returns in register sequences lccc has no carrier for must be
 # rejected with the by-value diagnostic. Needs the exact oracle:
 # scripts/ci_install_clang_oracle.sh installs it (CLANG=... selects it).
@@ -752,7 +741,7 @@ gate "ext-vector-varargs-abi" fast \
 # The layout matrix is the other half of the ext-vector contract: the ABI grid
 # above pins how shapes cross a call boundary, this pins what sizeof/_Alignof
 # say and how lanes address inside an object, over 120 shapes x 2 targets at
-# -O0 and -O2, against the pinned Clang 23.1.4 oracle.  It needs no i686
+# -O0 and -O2, against the pinned Clang 23.1.5 oracle.  It needs no i686
 # headers (freestanding fixture) but does need the host driver to link -m32.
 gate "ext-vector-layout-matrix" fast \
     env CCC="$LCCC" bash tests/regression/check_ext_vector_layout_matrix.sh
@@ -1107,7 +1096,7 @@ gate "qualifier-composition" fast \
 gate "dwarf-line-tables" fast \
     python3 tests/regression/check_dwarf_line_tables.py \
         --lccc "$LCCC" --lccc-i686 target/fastbuild/lccc-i686 \
-        --gcc "${GCC16:-gcc-16}"
+        --gcc "${GCC16:-gcc-16}" --allow-missing-debugger
 gate "dwarf-die-census" fast \
     python3 tests/regression/check_dwarf_die_census.py \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" --clang "${CLANG:-clang-23}"
@@ -1180,7 +1169,7 @@ gate "gcc162-diagnostic-severity" fast \
 gate "operand-diagnostics" fast \
     env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_operand_diagnostics.sh
 
-# Clang ext_vector_type component access against the Clang 23.1.4 oracle:
+# Clang ext_vector_type component access against the Clang 23.1.5 oracle:
 # LCCC's diagnostics for ext_vector_select/errors.c equal Clang's (line,
 # column, message), LCCC accepts exactly the forms Clang accepts and puts the
 # first error at Clang's position, and select.c prints what Clang -O0 prints
@@ -2605,7 +2594,7 @@ gate "asm-diff-oracle-gas-2.47" fast \
 # and no-SSE boundaries, with typed shuffles across every compiler pairing.
 # Mirrors the hosted ipa-lrs.yml step: GNU as 2.47 from the pin the gate
 # above provisioned (the script refuses any other `as`), and the exact
-# GCC 16.2 / Clang 23.1.4 oracles.
+# GCC 16.2 / Clang 23.1.5 oracles.
 gate "i686-gnu-vector-abi" fast \
     env PATH="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH" CCC="$LCCC" \
         bash tests/regression/check_i686_gnu_vector_abi.sh
@@ -3520,46 +3509,6 @@ gate "codegen-quality-gate" fast \
 # the two multi-minute oracles `--fast` exists to skip.
 gate "rustfmt" fast cargo fmt --all -- --check
 
-# The declared rust-version floor (Cargo.toml, 1.97.0) is a measurement only
-# if something rebuilds the tree on that toolchain: the hosted `msrv` job
-# does, and this gate is its local mirror (check_ci_gate_parity.py requires
-# the pair). Needs the 1.97.0 toolchain: through rustup where available,
-# otherwise directly when the active rustc already IS the declared floor
-# (restored sandboxes install a plain dist toolchain without rustup), or from a
-# pinned dist toolchain unpacked outside rustup -- LCCC_MSRV_TOOLCHAIN, else the
-# tag-cache prefix the restored sandboxes build at $HOME/.cache/lccc/msrv-1.97.0.
-# rustup stays canonical and is tried first, so hosted runs are unchanged; the
-# pinned prefix is verified against the declared floor before it is trusted, so
-# a stale or wrong directory cannot turn this gate green: it stays fail-closed.
-msrv_check_gate() {
-    if command -v rustup >/dev/null 2>&1; then
-        cargo +1.97.0 check --locked
-        return
-    fi
-    if rustc --version | grep -q '^rustc 1\.97\.0'; then
-        cargo check --locked
-        return
-    fi
-    local prefix="${LCCC_MSRV_TOOLCHAIN:-$HOME/.cache/lccc/msrv-1.97.0}"
-    local pinned=""
-    if [ -x "$prefix/bin/rustc" ]; then
-        pinned="$("$prefix/bin/rustc" --version 2>/dev/null)"
-    fi
-    case "$pinned" in
-    rustc\ 1.97.0*)
-        PATH="$prefix/bin:$PATH" CARGO_TARGET_DIR="${MSRV_TARGET_DIR:-target/msrv-cargo}" \
-            cargo check --locked
-        return
-        ;;
-    esac
-    if [ -n "$pinned" ]; then
-        echo "msrv-check: $prefix is not the declared floor ($pinned)" >&2
-        return 1
-    fi
-    echo "msrv-check: need rustc 1.97.0 (rustup missing, active $(rustc --version))" >&2
-    return 1
-}
-gate "msrv-check" fast msrv_check_gate
 
 # Test and Clippy gates use the same resource policy, independently in
 # subshells. CI_LOCAL_JOBS / CARGO_BUILD_JOBS override automatic parallelism;
@@ -3573,7 +3522,8 @@ clippy_gate() (
     #
     # The wrapper (not bare `cargo clippy`) is load-bearing: the crate root
     # carries `#![allow(unknown_lints)]` so that a Clippy newer than the
-    # declared MSRV cannot break `-D warnings` on a lint name that does not
+    # toolchain a developer happens to have cannot break `-D warnings` on a
+    # lint name that does not
     # exist yet, and the wrapper re-probes every name in the policy list under
     # `#![deny(unknown_lints)]` to keep typos from hiding behind that allow.
     cargo clippy --version || return
@@ -3605,7 +3555,7 @@ if [ ${#FAILED[@]} -gt 0 ]; then
     exit 1
 fi
 echo "ALL GATES GREEN"
-if [ -n "$ONLY" ] || [ "$SKIP_MSRV" = 1 ]; then
+if [ -n "$ONLY" ]; then
     echo "(explicit gate selection: partial run, no pass stamp)"
 else
     TREE_END=$(bash scripts/worktree_tree.sh 2>/dev/null || true)

@@ -108,18 +108,22 @@ exit "$rc"
             self.assertEqual(rc, 2)
             self.assertEqual(runs, [])
 
-    def test_modern_selection_never_runs_the_floor_or_issues_a_full_stamp(self):
+    def test_the_retired_msrv_lane_cannot_come_back(self):
+        """The 1.97.0 floor and its --skip-msrv escape hatch were retired.
+
+        Retired 2026-11-05: the project tracks current Rust so new language
+        features are usable as they land. This asserts the removal is complete
+        and coherent -- no gate, no flag, no help text, and the pass-stamp
+        guard no longer keyed on a variable that does not exist (a dangling
+        `[ "$SKIP_MSRV" = 1 ]` under `set -u` would abort every full run).
+        """
+        for needle in ('msrv-check', 'msrv_check_gate', 'SKIP_MSRV',
+                       '--skip-msrv', '1.97.0'):
+            self.assertNotIn(needle, SOURCE)
+        self.assertIn('if [ -n "$ONLY" ]; then', SOURCE)
+        # the gate registry still parses and still contains its neighbours
         gate = re.search(r"^gate\(\) \{\n.*?^\}", SOURCE, re.M | re.S).group()
-        for skip in (0, 1):
-            script = (f'SKIP_MSRV={skip}; ONLY=""; FAST=0; SLOW_ONLY=0; SKIPPED=0; FAILED=()\n'
-                      'ci_gate_submit() { echo "RUN:$1"; }\n' + gate +
-                      '\ngate msrv-check fast true; gate compiler-contract fast true; echo SKIPPED:$SKIPPED')
-            result = subprocess.run(['bash', '-eu', '-c', script], capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual('RUN:msrv-check' in result.stdout, not skip)
-            self.assertIn('RUN:compiler-contract', result.stdout)
-            self.assertIn(f'SKIPPED:{skip}', result.stdout)
-        self.assertIn('if [ -n "$ONLY" ] || [ "$SKIP_MSRV" = 1 ]; then', SOURCE)
+        self.assertIn('SKIPPED=$((SKIPPED + 1))', gate)
 
     def test_repeats_and_empty_caller_values(self):
         rc, runs = self.run_gates("cargo_test_repeated", overrides={"LCCC_TEST_REPEATS": "3", "CARGO_PROFILE_FASTBUILD_DEBUG": "", "CARGO_INCREMENTAL": ""})

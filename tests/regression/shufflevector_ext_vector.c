@@ -2,7 +2,7 @@
  * ext_vector_type). As in Clang, any index count is valid there, so three
  * indices on a float4 give a float3, and padded 3-lane operands (16-byte
  * storage) are indexed by lane, not by storage slot. The expected values are
- * Clang 23.1.4's output for this program. */
+ * Clang 23.1.5's output for this program. */
 #include <stdio.h>
 #include <stdlib.h>
 

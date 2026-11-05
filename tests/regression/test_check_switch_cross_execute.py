@@ -28,15 +28,15 @@ class LinkerDiscoveryTests(unittest.TestCase):
 
     @patch('check_switch_cross_execute.subprocess.check_output', side_effect=RuntimeError('probe'))
     @patch('sys.argv', ['check_switch_cross_execute.py'])
-    @patch.dict('os.environ', {'CLANG': '/cached/clang-23.1.4'}, clear=True)
+    @patch.dict('os.environ', {'CLANG': '/cached/clang-23.1.5'}, clear=True)
     def test_honors_provisioned_clang_environment(self, output):
         with self.assertRaisesRegex(RuntimeError, 'probe'):
             main()
-        output.assert_called_once_with(['/cached/clang-23.1.4', '-dumpversion'], text=True)
+        output.assert_called_once_with(['/cached/clang-23.1.5', '-dumpversion'], text=True)
 
     @patch('check_switch_cross_execute.subprocess.check_output', side_effect=RuntimeError('probe'))
     @patch('sys.argv', ['check_switch_cross_execute.py', '--clang', '/explicit/clang'])
-    @patch.dict('os.environ', {'CLANG': '/cached/clang-23.1.4'}, clear=True)
+    @patch.dict('os.environ', {'CLANG': '/cached/clang-23.1.5'}, clear=True)
     def test_explicit_clang_overrides_environment(self, output):
         with self.assertRaisesRegex(RuntimeError, 'probe'):
             main()
