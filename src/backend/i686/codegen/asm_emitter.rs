@@ -781,7 +781,7 @@ impl InlineAsmEmitter for I686Codegen {
         &mut self,
         op: &AsmOperand,
         ptr: &Value,
-        constraint: &str,
+        _constraint: &str,
         all_output_regs: &[&str],
     ) {
         if matches!(op.kind, AsmOperandKind::Memory) {
@@ -902,7 +902,7 @@ impl InlineAsmEmitter for I686Codegen {
                     .emit_fmt(format_args!("    movd %{}, %{}", reg, gp.reg));
                 let mut taken: Vec<&str> = all_output_regs.to_vec();
                 taken.push(gp.reg.as_str());
-                self.store_output_from_reg(&gp, ptr, constraint, &taken);
+                self.store_output_from_reg(&gp, ptr, _constraint, &taken);
                 if preserve {
                     self.state.emit_fmt(format_args!("    popl %{}", gp.reg));
                     self.esp_adjust -= 4;

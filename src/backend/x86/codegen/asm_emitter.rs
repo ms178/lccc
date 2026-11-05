@@ -820,7 +820,7 @@ impl InlineAsmEmitter for X86Codegen {
         &mut self,
         op: &AsmOperand,
         ptr: &Value,
-        constraint: &str,
+        _constraint: &str,
         all_output_regs: &[&str],
     ) {
         if matches!(op.kind, AsmOperandKind::Memory) {
@@ -923,7 +923,7 @@ impl InlineAsmEmitter for X86Codegen {
             gp.kind = AsmOperandKind::GpReg;
             let mut taken: Vec<&str> = all_output_regs.to_vec();
             taken.push(scratch.as_str());
-            self.store_output_from_reg(&gp, ptr, constraint, &taken);
+            self.store_output_from_reg(&gp, ptr, _constraint, &taken);
             if preserve {
                 self.state.out.emit_instr_reg("    popq", &scratch);
             }
