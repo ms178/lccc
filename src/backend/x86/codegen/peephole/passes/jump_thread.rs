@@ -282,13 +282,32 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     changed
 }
 
+// Test-only whole-TU scan counter. THREAD-LOCAL, not a global atomic: the
+// Rust test harness runs cases on independent threads, so a process-wide
+// counter is incremented by unrelated tests and the scan-budget assertions
+// become flaky (a red-team finding against the first version of this test).
+// Zero cost outside unit-test builds.
+#[cfg(test)]
+std::thread_local! {
+    static MENTION_SCAN_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `.LBBn` mention counts plus the set of multiply-defined labels.
+type LabelCounts = (FxHashMap<u32, u32>, FxHashSet<u32>);
+
 /// Every `.LBBn` mention count (definitions excluded), plus labels defined
-/// more than once.  [`label_uses`] answers "mentioned at all"; a conditional
+/// more than once. [`label_uses`] answers "mentioned at all"; a conditional
 /// tail call deletes the relay, so it needs "mentioned exactly once".
-pub(super) fn label_mention_counts(
-    store: &LineStore,
-    infos: &[LineInfo],
-) -> (FxHashMap<u32, u32>, FxHashSet<u32>) {
+/// Test builds count real (as opposed to cache-verification) scans.
+pub(super) fn label_mention_counts(store: &LineStore, infos: &[LineInfo]) -> LabelCounts {
+    #[cfg(test)]
+    MENTION_SCAN_CALLS.with(|c| c.set(c.get() + 1));
+    scan_label_mentions(store, infos)
+}
+
+/// The pure scan. Test builds also call it directly to VERIFY a cache hit
+/// without perturbing the tracked scan budget.
+fn scan_label_mentions(store: &LineStore, infos: &[LineInfo]) -> LabelCounts {
     let mut count: FxHashMap<u32, u32> = FxHashMap::default();
     let mut defined = FxHashSet::default();
     let mut duplicate = FxHashSet::default();
@@ -317,6 +336,32 @@ pub(super) fn label_mention_counts(
     (count, duplicate)
 }
 
+/// Hand out the counts for the CURRENT assembly text. A cache hit is sound
+/// only because no rewrite happened since the counts were computed; in test
+/// builds EVERY reuse is PROVEN by recomputing and comparing, so no unit test
+/// can pass with a stale cache. The verification scan is untracked, keeping
+/// the budget assertions a measurement of real work. In release builds this
+/// compiles to one `Option::take` plus the scan on a miss -- nothing else.
+#[inline]
+fn current_counts(
+    store: &LineStore,
+    infos: &[LineInfo],
+    cache: &mut Option<LabelCounts>,
+) -> LabelCounts {
+    match cache.take() {
+        Some(hit) => {
+            #[cfg(test)]
+            {
+                let fresh = scan_label_mentions(store, infos);
+                assert_eq!(hit.0, fresh.0, "stale .LBB mention counts reused");
+                assert_eq!(hit.1, fresh.1, "stale duplicate-label set reused");
+            }
+            hit
+        }
+        None => label_mention_counts(store, infos),
+    }
+}
+
 /// Lines that emit no bytes and carry no CFG or unwind meaning: deleted lines,
 /// blank lines, every `#` comment (compiler markers included -- the caller
 /// moves the tail call's own marker block explicitly) and inert debug
@@ -329,6 +374,29 @@ fn byteless(store: &LineStore, infos: &[LineInfo], k: usize) -> bool {
         || info.kind == LineKind::Empty
         || (s.starts_with('#') && s != "#APP" && s != "#NO_APP")
         || (info.kind == LineKind::Directive && info.is_steppable() && is_debug_marker_directive(s))
+}
+
+/// Phase 8e entry point. Both passes share ONE whole-TU label analysis:
+/// `hoist_common_arm_heads_cached` exits its fixpoint loop only on a FAILED
+/// attempt, which stores counts for the FINAL text, so the fold can reuse
+/// them without a second full scan. Every successful rewrite empties the
+/// cache, so no pass ever sees stale counts. Test builds additionally assert
+/// cache coherence on every reuse (see `current_counts`).
+pub(super) fn run_phase8e(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    do_hoist: bool,
+    do_fold: bool,
+) -> bool {
+    let mut cache: Option<LabelCounts> = None;
+    let mut changed = false;
+    if do_hoist {
+        changed |= hoist_common_arm_heads_cached(store, infos, &mut cache);
+    }
+    if do_fold {
+        changed |= fold_conditional_tail_calls_cached(store, infos, &mut cache);
+    }
+    changed
 }
 
 /// Hoist the identical first instruction of both arms of a `jcc` above it:
@@ -362,8 +430,30 @@ fn byteless(store: &LineStore, infos: &[LineInfo], k: usize) -> bool {
 /// target arm's copy is deleted, which needs its label mentioned by this
 /// `jcc` alone and not entered by fall-through.
 pub(super) fn hoist_common_arm_heads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut cache = None;
+    hoist_common_arm_heads_cached(store, infos, &mut cache)
+}
+
+/// Shared-cache implementation, used by `run_phase8e` so the following
+/// conditional-tail-call pass can reuse the same whole-TU analysis.
+fn hoist_common_arm_heads_cached(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    cache: &mut Option<LabelCounts>,
+) -> bool {
     let mut changed = false;
     let mut start = None;
+    // `label_mention_counts` scans the WHOLE translation unit. Calling it
+    // once per candidate attempt made this pass O(F^2) in the number of
+    // functions (measured: 4,394,006 `find(".LBB")` calls for only 250
+    // straight-line functions). The assembly text changes ONLY when a
+    // rewrite succeeds, and `hoist_one_arm_head` is side-effect free on
+    // every `continue` path, so a count computed for one state stays exact
+    // for every subsequent failed attempt -- including the next function.
+    // Cache it across failures and invalidate on the first success; the
+    // values seen by each attempt are byte-for-byte what the old code
+    // computed, so the emitted assembly cannot change.
+    // `cache` is owned by the caller so both phase-8e passes share it.
     for i in 0..store.len() {
         if !infos[i].pinned && infos[i].kind == LineKind::Directive {
             let s = infos[i].trimmed(store.get(i));
@@ -372,8 +462,15 @@ pub(super) fn hoist_common_arm_heads(store: &mut LineStore, infos: &mut [LineInf
             } else if s == ".cfi_endproc"
                 && let Some(lo) = start.take()
             {
-                while hoist_one_arm_head(store, infos, lo, i) {
+                loop {
+                    let (count, duplicate) = current_counts(store, infos, cache);
+                    if !hoist_one_arm_head(store, infos, lo, i, &count, &duplicate) {
+                        *cache = Some((count, duplicate));
+                        break;
+                    }
                     changed = true;
+                    // Text changed: the cache stays empty, so the next
+                    // iteration recomputes against the new state.
                 }
             }
         }
@@ -381,8 +478,14 @@ pub(super) fn hoist_common_arm_heads(store: &mut LineStore, infos: &mut [LineInf
     changed
 }
 
-fn hoist_one_arm_head(store: &mut LineStore, infos: &mut [LineInfo], lo: usize, hi: usize) -> bool {
-    let (count, duplicate) = label_mention_counts(store, infos);
+fn hoist_one_arm_head(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    lo: usize,
+    hi: usize,
+    count: &FxHashMap<u32, u32>,
+    duplicate: &FxHashSet<u32>,
+) -> bool {
     let mentions = |k: usize| {
         local_label(label_text(infos[k].trimmed(store.get(k))))
             .filter(|l| !duplicate.contains(l))
@@ -510,8 +613,20 @@ fn hoistable(info: &LineInfo, t: &str) -> bool {
 /// `CondJmp` arms).  Code size never grows: the relay's 5-byte `jmp` goes and
 /// the `jcc` widens by at most 4 bytes (rel8 -> rel32).
 pub(super) fn fold_conditional_tail_calls(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut cache = None;
+    fold_conditional_tail_calls_cached(store, infos, &mut cache)
+}
+
+fn fold_conditional_tail_calls_cached(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    cache: &mut Option<LabelCounts>,
+) -> bool {
     let mut changed = false;
     let mut start = None;
+    // Same whole-TU scan cache as `hoist_common_arm_heads`: the text only
+    // changes on a successful fold, so counts stay exact across the many
+    // functions that have no eligible conditional tail call.
     let len = store.len();
     let mut i = 0;
     while i < len {
@@ -522,7 +637,7 @@ pub(super) fn fold_conditional_tail_calls(store: &mut LineStore, infos: &mut [Li
             } else if s == ".cfi_endproc"
                 && let Some(lo) = start.take()
             {
-                changed |= conditional_tail_calls_in(store, infos, lo, i);
+                changed |= conditional_tail_calls_in(store, infos, lo, i, cache);
             }
         }
         i += 1;
@@ -535,12 +650,16 @@ fn conditional_tail_calls_in(
     infos: &mut [LineInfo],
     lo: usize,
     hi: usize,
+    cache: &mut Option<LabelCounts>,
 ) -> bool {
     let mut changed = false;
-    // Recomputed after every rewrite: a fold removes one mention and one
-    // definition, which can only shrink other labels' eligibility.
+    // Recomputed ONLY after a rewrite (a fold removes one mention and one
+    // definition, which can only shrink other labels' eligibility). All
+    // read-only attempts -- including whole functions with no candidate --
+    // reuse the counts for the current assembly state, which are identical
+    // to a fresh scan because no line changed.
     loop {
-        let (count, duplicate) = label_mention_counts(store, infos);
+        let (count, duplicate) = current_counts(store, infos, cache);
         let mut defs: FxHashMap<u32, usize> = FxHashMap::default();
         for k in lo..hi {
             if infos[k].kind == LineKind::Label && !infos[k].is_nop() && !infos[k].pinned {
@@ -580,6 +699,7 @@ fn conditional_tail_calls_in(
             }
         }
         let Some((i, mnemonic, d, (q, end))) = hit else {
+            *cache = Some((count, duplicate));
             return changed;
         };
         let target = infos[q]
@@ -774,6 +894,137 @@ mod tests {
             .join("\n");
         assert!(!run(&mut store, &mut infos), "must reach a fixpoint");
         (changed, text)
+    }
+
+    /// Build a translation unit with `fns` straight-line procedures. None
+    /// contains a conditional jump, so neither pass can rewrite anything and
+    /// the assembly state is constant for the whole pass.
+    fn straight_line_tu(fns: usize) -> (LineStore, Vec<LineInfo>) {
+        let mut text = String::new();
+        for f in 0..fns {
+            text.push_str(&format!(
+                "f{f}:\n.cfi_startproc\nmovl $0, %eax\nret\n.cfi_endproc\n"
+            ));
+        }
+        let store = LineStore::new(text);
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        super::super::pin_inline_asm_regions(&store, &mut infos);
+        (store, infos)
+    }
+
+    #[test]
+    fn hoist_heads_does_not_rescan_per_function() {
+        let (mut store, mut infos) = straight_line_tu(64);
+        MENTION_SCAN_CALLS.with(|c| c.set(0));
+        assert!(!hoist_common_arm_heads(&mut store, &mut infos));
+        let scans = MENTION_SCAN_CALLS.with(|c| c.get());
+        // Before the cache this was exactly 64 whole-TU scans (one per
+        // function) and grew quadratically in the line count. The text never
+        // changed, so one scan is the only correct-value computation needed.
+        // Exact equality, not `<= 1`: a second scan is a real regression.
+        assert_eq!(scans, 1, "whole-TU scans for 64 unchanged functions");
+    }
+
+    #[test]
+    fn conditional_tail_calls_do_not_rescan_per_function() {
+        let (mut store, mut infos) = straight_line_tu(64);
+        MENTION_SCAN_CALLS.with(|c| c.set(0));
+        assert!(!fold_conditional_tail_calls(&mut store, &mut infos));
+        let scans = MENTION_SCAN_CALLS.with(|c| c.get());
+        assert_eq!(scans, 1, "whole-TU scans for 64 unchanged functions");
+    }
+
+    /// Regression for the red-team finding that a process-wide AtomicUsize
+    /// makes these budgets flaky: `cargo test` runs cases on independent
+    /// threads, so an unrelated test calling `label_mention_counts` used to
+    /// increment THIS test's counter. A thread-local counter cannot.
+    #[test]
+    fn scan_counter_is_thread_scoped() {
+        MENTION_SCAN_CALLS.with(|c| c.set(0));
+        let handle = std::thread::spawn(|| {
+            let (store, infos) = straight_line_tu(2);
+            for _ in 0..8 {
+                let _ = label_mention_counts(&store, &infos);
+            }
+        });
+        handle.join().expect("scan thread panicked");
+        assert_eq!(
+            MENTION_SCAN_CALLS.with(|c| c.get()),
+            0,
+            "an unrelated test thread perturbed this thread's scan budget"
+        );
+    }
+
+    /// The two phase-8e passes now share ONE analysis. On an unchanged TU
+    /// the old code scanned the whole translation unit twice; one scan is
+    /// now sufficient and sufficient is provably exact (`current_counts`
+    /// re-verifies every reuse in test builds).
+    #[test]
+    fn phase8e_shares_one_whole_tu_scan() {
+        let (mut store, mut infos) = straight_line_tu(64);
+        MENTION_SCAN_CALLS.with(|c| c.set(0));
+        assert!(!run_phase8e(&mut store, &mut infos, true, true));
+        assert_eq!(
+            MENTION_SCAN_CALLS.with(|c| c.get()),
+            1,
+            "both passes together must scan the TU exactly once"
+        );
+        // Disabling either pass must not silently enable the other or scan.
+        MENTION_SCAN_CALLS.with(|c| c.set(0));
+        assert!(!run_phase8e(&mut store, &mut infos, false, false));
+        assert_eq!(MENTION_SCAN_CALLS.with(|c| c.get()), 0);
+    }
+
+    /// A successful rewrite MUST invalidate the cache. Build a TU whose
+    /// middle function has identical conditional arm heads; the other
+    /// functions are straight-line and exercise cache reuse across
+    /// function boundaries before and after the rewrite.
+    #[test]
+    fn a_successful_rewrite_invalidates_the_cache() {
+        let mut text = String::new();
+        for f in 0..4 {
+            text.push_str(&format!(
+                "f{f}:\n.cfi_startproc\nmovl $0, %eax\nret\n.cfi_endproc\n"
+            ));
+            if f == 1 {
+                text.push_str(
+                    "g:\n.cfi_startproc\n    testl %edi, %edi\n    je .LBB5\n\
+                     .LBB4:\n    movq %rsi, %rdi\n    jmp g1@PLT\n.LBB5:\n\
+                     movq %rsi, %rdi\n    jmp g2@PLT\n.cfi_endproc\n",
+                );
+            }
+        }
+        let store = LineStore::new(text);
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        super::super::pin_inline_asm_regions(&store, &mut infos);
+        let mut store = store;
+        MENTION_SCAN_CALLS.with(|c| c.set(0));
+        assert!(hoist_common_arm_heads(&mut store, &mut infos));
+        let scans = MENTION_SCAN_CALLS.with(|c| c.get());
+        assert!(
+            scans >= 2,
+            "a rewrite must force a recomputation against the new text: {scans}"
+        );
+        // Every reuse on the surrounding functions was verified by
+        // `current_counts`; a stale cache would have panicked above.
+    }
+
+    #[test]
+    fn cached_scans_still_reach_a_fixpoint() {
+        // `apply` asserts a second `run` is a no-op. A stale cache would keep
+        // rewriting (or stop too early) and break that invariant on any of
+        // these golden bodies; guard it explicitly with a rewrite-heavy one.
+        let body = "jne .LBB1 # edge\nret\n.LBB1:\n# harmless\n.LBB2: # alias\njmp .LBB3\n.LBB3:\njmp .LBB4\n.LBB4:\nadcq $0, %rax\nret";
+        let (changed, out) = apply(body, None);
+        assert!(changed, "expected a rewrite: {out}");
+        assert!(
+            !out.contains(".LBB1\n"),
+            "stale cache left an orphan: {out}"
+        );
     }
 
     #[test]
