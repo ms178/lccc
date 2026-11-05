@@ -5,7 +5,8 @@
 #   x86 / i686   fold the operand to a byte with XOR (`x ^ x>>16` then
 #                `xor %ah, %al`) and read PF, the parity flag of that byte:
 #                `setnp` inverts it to the builtin's 1-for-odd.
-#   AArch64      with SIMD, `cnt`/`uaddlv` and `and #1` (five instructions);
+#   AArch64      with SIMD, `cnt`/`uaddlv` and `and #1` (five instructions;
+#                a byte needs no `uaddlv`);
 #                without, `eor w, w, w, lsr` folded all the way down to bit 0
 #                (one instruction per fold -- the ISA has a shifted operand)
 #                and masked.  The nibble table (0x6996) costs one more there,
@@ -280,10 +281,17 @@ done
 # propagation fold the parameter's staging copy into its first reader, and the
 # 64-bit form no longer copies the operand before the fold; every narrow pin
 # below dropped by the same copies (par8 12 -> 9, par16 16 -> 14, pc8 15 -> 12,
-# pc16 22 -> 20).  Values are unchanged: parity_and_popcount.c agrees at every
-# level on RV64 and AArch64 under qemu.
+# pc16 22 -> 20).  14 -> 11 for par32 and 9/14/12/20 -> 8/10/11/16 for the
+# narrow ones: a narrow argument arrives in its register form (the psABI
+# widening), so the entry no longer re-extends it; the prologue publishes the
+# argument extensions (`# lccc-arg-ext`), so the peephole drops the operand's
+# re-normalisation (a halfword shift pair, a `sext.w` that is a copy); and the
+# upper-word demand pass deletes an `unsigned` entry zero extension nothing
+# observes.  Clang 23.1.4 -O2 -march=rv64gc measures par8/par16/par32/par64
+# 8/10/14/14 and pc8/pc16/pc32/pc64 11/18/21/29.  Values are unchanged:
+# parity_and_popcount.c agrees at every level on RV64 and AArch64 under qemu.
 pinrv() { local got; got=$(count_of "$1" "$tmp/rv.s"); [ "$got" = "$2" ] || fail "$1: $got instructions on RISC-V, pinned $2"; }
-pinrv par32 14
+pinrv par32 11
 pinrv par64 13
 # RISC-V's narrow sequences are its own: `andi` holds every mask a byte's SWAR
 # needs, so the narrow form is shorter than the 32-bit one by the constant
@@ -291,11 +299,12 @@ pinrv par64 13
 # nibble table.
 rvbody8=$(fn_body par8 "$tmp/rv.s")
 grep -q '0x6996' <<<"$rvbody8" && fail "par8: nibble table on RISC-V (the fold is shorter)"
-# A byte's fold starts at bit 4, not bit 16 -- and the operand is masked to the
-# byte somewhere on the way in (the parameter's own mask, or the emitter's).
-grep -qE 'srli\s+t1, t0, 16' <<<"$rvbody8" && fail "par8: the 32-bit fold on RISC-V"
-grep -qE 'andi\s+[a-z0-9]+, [a-z0-9]+, 0xff' <<<"$rvbody8" ||
-    fail "par8: no byte mask on RISC-V"
+# A byte's fold starts at bit 4, not bit 16 -- and the operand needs no mask
+# on the way in: an `unsigned char` argument arrives zero-extended (the psABI
+# widening), which the prologue's `# lccc-arg-ext a0/z8` hands the peephole.
+grep -qE 'srli\s+[a-z0-9]+, [a-z0-9]+, 16' <<<"$rvbody8" && fail "par8: the 32-bit fold on RISC-V"
+grep -qE 'andi\s+[a-z0-9]+, [a-z0-9]+, 0xff' <<<"$rvbody8" &&
+    fail "par8: the zero-extended argument is masked again on RISC-V"
 grep -qE 'andi\s+t1, t1, 0x55' <<<"$(fn_body pc8 "$tmp/rv.s")" ||
     fail "pc8: the byte lane scan is not the 8-bit SWAR on RISC-V"
 grep -qE '0x5555' <<<"$(fn_body pc16 "$tmp/rv.s")" ||
@@ -304,15 +313,20 @@ grep -qE '0x5555' <<<"$(fn_body pc16 "$tmp/rv.s")" ||
 # backend that had to pay for the extension before.  AArch64 14/13/13 ->
 # 12/11/11: the parameter's staging copy and the mask that read it became
 # one `and` once the definition retarget computes the masked value straight
-# into w0.
+# into w0.  12/11/11 -> 6/5/6: the parameter takes a volatile home instead of
+# x19 (Phase 2p), the 32-bit entry copy folds into w0, the call-free leaf
+# drops its frame record, and a masked byte's count needs no `uaddlv` (`cnt`
+# leaves it in lane 0 alone) -- `and; fmov; cnt; fmov; [and #1;] ret`.  Clang
+# 23.1.4 at -O2 measures 6/5/6 on the same three (its byte parity is the
+# `eor`-shift fold, same length).
 pinarm() { local got; got=$(count_of "$1" "$tmp/arm.s"); [ "$got" = "$2" ] || fail "$1: $got instructions on AArch64, pinned $2"; }
-pinarm par8 12
-pinarm pc8 11
-pinarm pc16 11
-pinrv par8 9
-pinrv par16 14
-pinrv pc8 12
-pinrv pc16 20
+pinarm par8 6
+pinarm pc8 5
+pinarm pc16 6
+pinrv par8 8
+pinrv par16 10
+pinrv pc8 11
+pinrv pc16 16
 pini686() { local got; got=$(count_of "$1" "$tmp/i686.s"); [ "$got" = "$2" ] || fail "$1: $got instructions on i686, pinned $2"; }
 # 10: the same 6-instruction algorithm as x86-64, plus the memory-argument
 # load and the two-instruction `subl $12/addl $12` frame. The select-diamond

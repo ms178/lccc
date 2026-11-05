@@ -244,13 +244,22 @@ for opt in -O0 -O1 -O2 -Os; do
 done
 
 # The shape that carries the fix: the U32 argument register is written by a
-# sign extension, and `return x;` of a U32 sign-extends into a0.
+# sign extension, and `return x;` of a U32 hands back the psABI form.  The
+# incoming register already holds it -- a conforming caller sign-extended it,
+# which the runtime legs above prove in both directions -- so the body is
+# `ret` alone (what GCC 16.2 and Clang 23.1.4 emit) or a sign extension into
+# a0, and never a zero extension.
 "$RV" -O2 -S "$tmp/lccc.c" -o "$tmp/l.s"
 body() {
     sed -n "/^$2:/,/^\\.size $2,/p" "$1" | sed -e 's/^[[:space:]]*//' | grep -v -E '^(\.|#|$)' || true
 }
 text=$(body "$tmp/l.s" lccc_pass)
-grep -q -E '^sext\.w a0, ' <<<"$text" || bad "lccc_pass does not sign-extend its U32 result into a0: $(paste -sd ';' - <<<"$text")"
+if [ "$(grep -v -E ':$' <<<"$text" || true)" != "ret" ]; then
+    grep -q -E '^sext\.w a0, ' <<<"$text" ||
+        bad "lccc_pass neither returns its incoming U32 nor sign-extends it into a0: $(paste -sd ';' - <<<"$text")"
+fi
+grep -q -E '^srli a0, a0, 32' <<<"$text" &&
+    bad "lccc_pass zero-extends its U32 result: $(paste -sd ';' - <<<"$text")"
 text=$(body "$tmp/l.s" _start)
 grep -q -E '^sext\.w (a[0-7]|t[3-5]), ' <<<"$text" || bad "_start stages no U32 argument through sext.w: $(paste -sd ';' - <<<"$text")"
 

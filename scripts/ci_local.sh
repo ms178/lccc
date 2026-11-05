@@ -2051,6 +2051,12 @@ gate "cross-alu-abs-runtime" fast \
 gate "riscv-psabi-narrow-args" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_riscv_psabi_narrow_args.sh
 
+# AArch64/RISC-V leaf, parameter and unwind shapes: arrival homes, frameless
+# leaves, W-view zero tests of narrow arguments and results, fcsel, the RISC-V
+# `sllw` bit set and unsigned pass-through, callee-saved/variadic CFI rows.
+gate "arm-riscv-leaf-contracts" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_arm_riscv_leaf_contracts.sh
+
 # Single-bit selection: `x | 1 << n` is `bts`, `x & ~(1 << n)` is `btr` and
 # `(x & 1 << n) != 0` is `bt` (6/8/7 -> 3/3/4 instructions), selected by the
 # new `BitSet`/`BitClear` IR operations.  Pins the shapes and the dead

@@ -3145,6 +3145,13 @@ jobs:
         # against riscv64-linux-gnu-gcc callers and callees.  Mirrored in
         # scripts/ci_local.sh (parity-checked).
         bash tests/regression/check_riscv_psabi_narrow_args.sh
+        # AArch64/RISC-V leaf, parameter and unwind shapes: x4-x7 arrival
+        # homes, frameless leaves, W-view zero tests of narrow arguments and
+        # results (AAPCS64 leaves the upper bits unspecified), fcsel, the
+        # RISC-V `sllw` bit set and sign-extended unsigned pass-through, and
+        # the callee-saved/variadic CFI rows.  Mirrored in
+        # scripts/ci_local.sh (parity-checked).
+        bash tests/regression/check_arm_riscv_leaf_contracts.sh
         python3 tests/regression/check_llvm_integer_observations.py
         # asm-goto output operands: label-edge materialization, @cc suffix
         # contract, multi-digit %l<N> numbering and the x86-64 flag-output

@@ -328,4 +328,3 @@ __attribute__((noinline)) char **split_words(char *s)
     words[n] = 0;
     return words;
 }
-

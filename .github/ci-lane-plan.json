@@ -368,7 +368,7 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 529.36,
+      "predicted_gate_seconds": 529.61,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
@@ -695,6 +695,10 @@
         {
           "measured_s": 1.5,
           "name": "bash tests/regression/check_riscv_psabi_narrow_args.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_arm_riscv_leaf_contracts.sh"
         },
         {
           "measured_s": 3.52,

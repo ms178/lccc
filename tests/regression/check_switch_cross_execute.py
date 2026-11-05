@@ -34,6 +34,7 @@ FIXTURES = (
     "callee_saved_return_paths_cross", "entry_copy_abi_reads_cross",
     "asm_scalar_operand_classes_cross", "alias_copy_after_join_cross",
     "predicate_inverted_signed_cmp_cross", "word_reload_sign_extension_cross",
+    "leaf_params_fp_domain_cross",
 )
 ALL_LEVELS = ("-O0", "-O1", "-O2", "-Os")
 LEVELS = {
@@ -74,13 +75,19 @@ LEVELS = {
     # folded to `lw` -- a word reload sign-extends, so (int)0x8000_0000 came
     # back zero-extended.
     "word_reload_sign_extension_cross": ALL_LEVELS,
+    # AArch64: frameless leaves reading stack parameters at [sp], arrival
+    # homes for x4-x7 parameters, the x0 bounce that destroyed `k` in
+    # `double f(double d, int k)`, `fcsel` and register-to-register FP
+    # conversions.  RISC-V: narrow parameters in their psABI register form,
+    # the published argument extensions and the upper-word demand pass.
+    "leaf_params_fp_domain_cross": ALL_LEVELS,
 }
 # Two-unit psABI fixtures under interop/: `<name>_callee.c` and
 # `<name>_caller.c`, linked LCCC-with-LCCC and LCCC-with-Clang in both
 # directions.  A caller and a callee that merely agree with each other pass
 # the single-unit fixtures above while disagreeing with every other compiler.
 INTEROP = ("psabi_pair_interop", "psabi_float_interop", "psabi_hfa_interop", "psabi_wide_interop",
-           "psabi_byref_interop")
+           "psabi_byref_interop", "abi_dirty_upper_interop")
 INTEROP_LEVELS = ("-O0", "-O2")
 CLANG_FREESTANDING = ("-O2", "-ffreestanding", "-fno-builtin", "-fno-pic", "-fno-pie",
                       "-fno-stack-protector", "-nostdlibinc")
