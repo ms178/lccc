@@ -4,6 +4,17 @@
 set -euo pipefail
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 ccc=${CCC:-$root/target/fastbuild/lccc}
+# The debugger is used only for failure forensics: a host without the pinned
+# oracle must never turn a real failure into a different failure, and a
+# distribution gdb must never be used as a silent oracle substitute. The
+# --allow-missing-debugger opt-in makes the degraded case explicit (status 3).
+# shellcheck source=tests/regression/lib/gdb_oracle.sh
+. "$root/tests/regression/lib/gdb_oracle.sh"
+gdb_rc=0
+require_gdb_oracle check_incoming_byval_homes --allow-missing-debugger || gdb_rc=$?
+if (( gdb_rc != 0 && gdb_rc != 3 )); then
+    exit "$gdb_rc"
+fi
 if [[ -n ${ORACLE_CC:-} ]]; then
     oracle=$ORACLE_CC
 else
@@ -25,8 +36,10 @@ cleanup() {
             sed -n '/^tail_big:/,/\.size tail_big/p;/^aligned_f128:/,/\.size aligned_f128/p' \
                 "$tmp/failure.s" >&2
         fi
-        if [[ -x $tmp/run ]] && command -v gdb >/dev/null; then
-            gdb -q -batch -ex run -ex 'bt 12' --args "$tmp/run" >&2 || true
+        if [[ -x $tmp/run && -n ${GDB_ORACLE_BIN:-} ]]; then
+            "$GDB_ORACLE_BIN" -q -batch -ex run -ex 'bt 12' --args "$tmp/run" >&2 || true
+        elif [[ -x $tmp/run ]]; then
+            echo "incoming-byval: no pinned GDB 18.1 oracle; backtrace omitted (explicit skip)" >&2
         fi
         if [[ -x $tmp/run ]] && command -v objdump >/dev/null; then
             objdump -d --no-show-raw-insn "$tmp/run" >"$tmp/failure.dis"

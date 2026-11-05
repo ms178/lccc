@@ -3203,7 +3203,7 @@ jobs:
         env LCCC_TEST_ASSEMBLER="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" bash tests/regression/check_i686_gnu_vector_abi.sh
         # Compile and link LCCC line tables, then verify GCC 16.2 DWARF sections
         # survive executable and shared links with relocated code addresses.
-        python3 tests/regression/check_dwarf_line_tables.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --gcc gcc-16
+        python3 tests/regression/check_dwarf_line_tables.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --gcc gcc-16 --allow-missing-debugger
         # The DIE vocabulary: what a unit and its subprograms state, and every
         # tag and attribute the reference compilers state that LCCC does not --
         # each of which must be declared below with the reason it is absent.

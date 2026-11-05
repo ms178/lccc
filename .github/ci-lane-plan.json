@@ -766,7 +766,7 @@
         },
         {
           "measured_s": 1.21,
-          "name": "python3 tests/regression/check_dwarf_line_tables.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --gcc gcc-16"
+          "name": "python3 tests/regression/check_dwarf_line_tables.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --gcc gcc-16 --allow-missing-debugger"
         },
         {
           "measured_s": 0.81,
