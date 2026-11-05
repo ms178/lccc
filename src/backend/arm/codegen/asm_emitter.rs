@@ -9,6 +9,37 @@ use crate::common::asm_constraints::aarch64_flag_condition;
 use crate::common::types::IrType;
 use crate::ir::reexports::{BlockId, IrConst, Operand, Value};
 
+/// Copy the bits held in `phys` into general-purpose register `dst`.
+///
+/// `callee_saved_name` names only x0..x28. An FP/SIMD home (allocator ids
+/// 32..=55) used to reach its `unreachable!` and abort the whole compile;
+/// AArch64 also cannot `mov` between the integer and FP register files, so
+/// FP homes must be transferred with `fmov`. The `fmov` lane width has to
+/// match the destination: `fmov w0, d0` and `fmov x0, s0` are not encodable,
+/// hence the `wN` -> `xN` promotion for a 64-bit FP source. `dst` is a GP
+/// scratch (`xN`/`wN`) or `x9`; `sp` is staged by the caller.
+fn emit_gpr_copy_from_phys(state: &mut CodegenState, dst: &str, phys: PhysReg) {
+    let w_view = dst.starts_with('w');
+    if super::emit::is_arm_fp_phys(phys) {
+        let ty = if w_view { IrType::F32 } else { IrType::F64 };
+        let src = super::emit::arm_fp_name(phys, ty);
+        state.emit_fmt(format_args!("    fmov {}, {}", dst, src));
+    } else {
+        let src = if w_view {
+            super::emit::callee_saved_name_32(phys)
+        } else {
+            super::emit::callee_saved_name(phys)
+        };
+        // A self-move is dead work and, more importantly, it used to be the
+        // only thing standing between the call site and an FP `phys`. Keep
+        // the decision INSIDE the helper so no caller can evaluate a
+        // GP-only name function on an FP phys (that is the ICE we are fixing).
+        if src != dst {
+            state.emit_fmt(format_args!("    mov {}, {}", dst, src));
+        }
+    }
+}
+
 /// AArch64 GP scratch registers for inline asm:
 /// - 17 caller-saved registers first (`x9..x15`, `x0..x8`, `x16`; `x17` stays reserved
 ///   for 128-bit vector pointer staging, and `x18` [platform register], `x29` [FP],
@@ -195,17 +226,7 @@ impl InlineAsmEmitter for ArmCodegen {
                     // 32..=55). callee_saved_name only names GP registers and
                     // used to panic here; AArch64 cannot `mov` between the two
                     // register files either. `fmov` copies the bit pattern.
-                    if super::emit::is_arm_fp_phys(phys) {
-                        let fp = super::emit::arm_fp_name(phys, IrType::F64);
-                        self.state
-                            .emit_fmt(format_args!("    fmov {}, {}", tmp_reg, fp));
-                    } else {
-                        let src = super::emit::callee_saved_name(phys);
-                        if src != tmp_reg {
-                            self.state
-                                .emit_fmt(format_args!("    mov {}, {}", tmp_reg, src));
-                        }
-                    }
+                    emit_gpr_copy_from_phys(&mut self.state, &tmp_reg, phys);
                     op.mem_addr = format!("[{}]", tmp_reg);
                     return Some(tmp_reg);
                 } else if self.state.reg_cache.acc_has(v.0, false) {
@@ -452,16 +473,12 @@ impl InlineAsmEmitter for ArmCodegen {
                     } else if is_sp {
                         // sp cannot be an ldr/mov destination from an
                         // arbitrary home in all states; stage via x9.
-                        if super::emit::is_arm_fp_phys(phys) {
-                            let fp = super::emit::arm_fp_name(phys, IrType::F64);
-                            self.state.emit_fmt(format_args!("    fmov x9, {}", fp));
-                        } else {
-                            let src = super::emit::callee_saved_name(phys);
-                            self.state.emit_fmt(format_args!("    mov x9, {}", src));
-                        }
+                        emit_gpr_copy_from_phys(&mut self.state, "x9", phys);
                         self.state.emit("    mov sp, x9");
                     } else if super::emit::is_arm_fp_phys(phys) {
                         // A floating-point value bound to a general register
+                        // (gcc.c-torture/compile/pr30311.c's x87-only "=t"
+                        // constraint also lands here on AArch64).
                         // (`"r"(double)`, DoNotOptimize on a double): its
                         // home is an FP register, so the bits move across
                         // with fmov.  callee_saved_name knows only general
@@ -483,27 +500,9 @@ impl InlineAsmEmitter for ArmCodegen {
                                 .emit_fmt(format_args!("    fmov {}, {}", dst, src));
                         }
                     } else {
-                        // gcc.c-torture/compile/pr30311.c uses the x87-only
-                        // "=t" constraint. On AArch64 the FP source home
-                        // reaches a GP asm operand; `fmov` with the lane width
-                        // matching `reg` is the only encodable copy. Before
-                        // this guard, callee_saved_name(FP phys) hit
-                        // unreachable!("invalid ARM register index") -- an ICE
-                        // instead of a compilable object.
-                        if super::emit::is_arm_fp_phys(phys) {
-                            let ty = if reg.starts_with('w') {
-                                IrType::F32
-                            } else {
-                                IrType::F64
-                            };
-                            let fp = super::emit::arm_fp_name(phys, ty);
-                            self.state
-                                .emit_fmt(format_args!("    fmov {}, {}", reg, fp));
-                        } else {
-                            let src = super::emit::callee_saved_name(phys);
-                            self.state
-                                .emit_fmt(format_args!("    mov {}, {}", reg, src));
-                        }
+                        let src = super::emit::callee_saved_name(phys);
+                        self.state
+                            .emit_fmt(format_args!("    mov {}, {}", reg, src));
                     }
                 } else {
                     // Neither slot nor register: fail loudly instead of
@@ -927,5 +926,66 @@ mod flag_output_tests {
         ] {
             assert_eq!(ArmCodegen::to_w_reg(from), want, "{from}");
         }
+    }
+}
+
+#[cfg(test)]
+mod gpr_copy_from_phys_tests {
+    use super::emit_gpr_copy_from_phys;
+    use crate::backend::regalloc::PhysReg;
+    use crate::backend::state::CodegenState;
+
+    fn emitted(dst: &str, phys: PhysReg) -> String {
+        let mut state = CodegenState::new();
+        emit_gpr_copy_from_phys(&mut state, dst, phys);
+        state.out.buf.clone()
+    }
+
+    /// Every allocator id must be handled without reaching the old
+    /// `unreachable!("invalid ARM register index")` ICE. This is the exact
+    /// regression behind gcc.c-torture/compile/pr30311.c on AArch64.
+    #[test]
+    fn every_allocatable_physreg_id_is_total() {
+        // x0..x30 is the whole real GP file; 32..=38 and 40..=55 are the
+        // FP/SIMD homes (`is_arm_fp_phys`). 31 (xzr/sp), 39 and 56+ are not
+        // writable homes and must fail loudly -- see the next test.
+        let mut ids: Vec<u32> = (0..=30).collect();
+        ids.extend(32..=38);
+        ids.extend(40..=55);
+        for id in ids {
+            for dst in ["x9", "w9"] {
+                let buf = emitted(dst, PhysReg(id));
+                assert!(
+                    buf.contains("fmov") || buf.contains("mov"),
+                    "{id} -> {buf:?}"
+                );
+            }
+        }
+    }
+
+    /// An id outside the register file is an invariant violation, not a
+    /// silently miscompiled operand. The improved ICE message names it.
+    #[test]
+    #[should_panic(expected = "invalid ARM register index 31")]
+    fn an_invalid_physreg_fails_loudly() {
+        let _ = emitted("x9", PhysReg(31));
+    }
+
+    #[test]
+    fn integer_homes_use_mov_and_a_self_move_is_dead_work() {
+        assert_eq!(emitted("x10", PhysReg(9)), "    mov x10, x9\n");
+        assert_eq!(emitted("x10", PhysReg(10)), "");
+        assert_eq!(emitted("w10", PhysReg(9)), "    mov w10, w9\n");
+    }
+
+    /// `fmov` lane width must match the destination: `fmov w0, d0` and
+    /// `fmov x0, s0` are both unencodable on AArch64.
+    #[test]
+    fn fp_homes_use_width_matched_fmov() {
+        // 40..55 map to v16..v31; 32..38 map to d8..d14.
+        assert_eq!(emitted("x9", PhysReg(40)), "    fmov x9, d16\n");
+        assert_eq!(emitted("x9", PhysReg(32)), "    fmov x9, d8\n");
+        assert_eq!(emitted("w9", PhysReg(40)), "    fmov w9, s16\n");
+        assert_eq!(emitted("x19", PhysReg(55)), "    fmov x19, d31\n");
     }
 }
