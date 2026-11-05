@@ -6928,7 +6928,7 @@ mod tests {
                 struct_arg_sizes: vec![],
                 struct_arg_aligns: vec![],
                 struct_arg_classes: vec![],
-                struct_arg_riscv_float_classes: vec![],
+                struct_arg_fp_agg_classes: vec![],
                 struct_arg_is_f128_sse: Vec::new(),
                 is_sret: false,
                 calling_convention: crate::common::types::CallingConvention::Default,
@@ -8365,6 +8365,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 eightbyte_classes: vec![],
+                fp_agg_class: None,
             },
             Instruction::VaCopy {
                 dest_ptr: Value(8),

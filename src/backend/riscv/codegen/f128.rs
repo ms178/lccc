@@ -244,22 +244,11 @@ impl F128SoftFloat for RiscvCodegen {
         self.emit_load_ptr_from_slot(slot, val_id);
     }
 
-    fn f128_load_from_addr_reg_to_acc(&mut self, dest: &Value) {
-        // Load 16 bytes from t5, convert to f64 via __trunctfdf2, store to dest
-        self.state.emit("    ld a0, 0(t5)");
-        self.state.emit("    ld a1, 8(t5)");
-        self.state.emit("    call __trunctfdf2");
-        self.state.emit("    fmv.x.d t0, fa0");
-        self.state.reg_cache.invalidate_all();
-        self.store_t0_to(dest);
+    fn f128_has_reg(&self, val_id: u32) -> bool {
+        self.reg_assignments.contains_key(&val_id)
     }
 
-    fn f128_load_from_direct_slot_to_acc(&mut self, slot: StackSlot) {
-        self.emit_load_from_s0("a0", slot.0, "ld");
-        self.emit_load_from_s0("a1", slot.0 + 8, "ld");
-    }
-
-    fn f128_store_result_and_truncate(&mut self, dest: &Value) {
+    fn f128_publish_approximation(&mut self, dest: &Value) {
         // Store full f128 from arg1 (a0:a1) to dest slot
         if let Some(slot) = self.state.get_slot(dest.0) {
             self.emit_store_to_s0("a0", slot.0, "sd");

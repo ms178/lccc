@@ -8,7 +8,7 @@
 
 use super::lower::Lowerer;
 use crate::common::sysv_classify::SysvPassing;
-use crate::common::types::{CType, CallingConvention, EightbyteClass};
+use crate::common::types::{CType, CallingConvention, EightbyteClass, FpAggClass};
 use crate::frontend::parser::ast::Expr;
 
 /// Return convention of a function returning an aggregate by value.
@@ -27,6 +27,13 @@ pub(super) struct AggregateReturn {
     /// Two `long double` lanes come back in `%st(0)` and `%st(1)` (the
     /// `_Complex long double` register pair); see `SysvPassing::X87Pair`.
     pub x87_pair: bool,
+    /// The aggregate comes back in FP (and possibly integer) registers
+    /// described by this class: an AAPCS64 HFA/HVA/short vector (v0..v3)
+    /// or a RISC-V LP64D flattened struct (fa0/fa1/a0).  The IR keeps the
+    /// hidden-pointer shape (`sret_size` is set) and the backend moves the
+    /// registers through the buffer at the call boundary; see
+    /// `backend::call_abi::hidden_fp_agg_return`.
+    pub fp_agg: Option<FpAggClass>,
 }
 
 impl Lowerer {
@@ -86,6 +93,41 @@ impl Lowerer {
         Some((passing.arg_classes(), one_xmm))
     }
 
+    /// FP-register class of a by-value aggregate of type `ct` passed as an
+    /// argument (`unnamed`: through a variadic `...`), received as a
+    /// parameter, or returned.  RISC-V LP64D flattens small NAMED structs
+    /// (unnamed ones use the integer convention, psABI); AAPCS64 passes
+    /// HFAs, HVAs and short vectors in v-registers whether named or not
+    /// (Linux AAPCS64 treats variadic arguments like named ones).  `None`
+    /// on x86, whose aggregates carry SysV eightbyte classes instead.
+    pub(super) fn fp_agg_class(&self, ct: &CType, unnamed: bool) -> Option<FpAggClass> {
+        use crate::common::types::StructLayoutProvider;
+        let ctx = &*self.types.borrow_struct_layouts();
+        match self.target {
+            crate::backend::Target::Riscv64 if !unnamed => match ct {
+                CType::Struct(key) | CType::Union(key) => {
+                    ctx.get_struct_layout(key)?.classify_riscv_float_fields(ctx)
+                }
+                // "A complex floating-point number ... is passed as though
+                // it were a struct containing two floating-point reals"
+                // (`complex_arg_is_aggregate`); `_Complex long double`
+                // halves exceed ABI_FLEN and use the integer convention.
+                CType::ComplexFloat | CType::ComplexDouble => {
+                    let half = ct.size() / 2;
+                    Some(FpAggClass::TwoFloats {
+                        lo_size: half as u8,
+                        hi_size: half as u8,
+                        hi_offset: half,
+                        record_size: ct.size(),
+                    })
+                }
+                _ => None,
+            },
+            crate::backend::Target::Aarch64 => ct.aapcs64_fp_agg_class(ctx),
+            _ => None,
+        }
+    }
+
     /// Target-local i386 MEMORY marker for a naturally aligned GNU vector or
     /// a record that contains one. GCC passes these at their natural stack
     /// alignment (16/32/64), while ordinary and explicitly `aligned(N)`
@@ -143,6 +185,14 @@ impl Lowerer {
             two_reg_size,
             ..AggregateReturn::default()
         };
+        // AArch64 HFA/HVA/short vector, RISC-V flattened float struct: the
+        // result travels in FP registers through the hidden buffer.
+        if let Some(class) = self.fp_agg_class(ret_ct, false) {
+            r.sret_size = Some(size);
+            r.two_reg_size = None;
+            r.fp_agg = Some(class);
+            return r;
+        }
         match self.sysv_return_passing(ret_ct) {
             None => {}
             Some(SysvPassing::Memory) => {
@@ -232,6 +282,7 @@ impl Lowerer {
                     one_xmm: s.ret_is_f128_sse,
                     x87: s.ret_x87_aggregate,
                     x87_pair: s.ret_x87_pair,
+                    fp_agg: s.ret_fp_agg_class,
                 })
                 .unwrap_or_default(),
             _ => match self.call_return_ctype(callee) {

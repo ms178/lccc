@@ -287,7 +287,7 @@ impl Lowerer {
             mut struct_arg_sizes,
             mut struct_arg_aligns,
             mut struct_arg_classes,
-            mut struct_arg_riscv_float_classes,
+            mut struct_arg_fp_agg_classes,
         ) = self.lower_call_arguments(effective_func, args);
 
         // Detect variadic status early (needed for complex arg decomposition)
@@ -314,7 +314,7 @@ impl Lowerer {
             self.callee_type_is_variadic(stripped_func)
         };
 
-        // Decompose complex double/float arguments into (real, imag) pairs for ABI compliance
+        // Settle each complex argument as one aggregate or one packed scalar.
         let param_ctypes_from_sig = if let Expr::Identifier(name, _) = stripped_func {
             let sig_for_decompose = if self.is_func_ptr_variable(name) {
                 self.fptr_variable_sig(name)
@@ -342,12 +342,13 @@ impl Lowerer {
             &param_ctypes_for_decompose,
             args,
         );
-        self.decompose_complex_call_args(
+        self.lower_complex_call_args(
             &mut arg_vals,
             &mut arg_types,
             &mut struct_arg_sizes,
             &mut struct_arg_aligns,
             &mut struct_arg_classes,
+            &mut struct_arg_fp_agg_classes,
             &param_ctypes_for_decompose,
             args,
             call_is_variadic,
@@ -358,7 +359,7 @@ impl Lowerer {
             &mut struct_arg_sizes,
             &mut struct_arg_aligns,
             &mut struct_arg_classes,
-            &mut struct_arg_riscv_float_classes,
+            &mut struct_arg_fp_agg_classes,
             &param_ctypes_for_decompose,
             args,
             call_is_variadic,
@@ -408,7 +409,10 @@ impl Lowerer {
             struct_arg_sizes.insert(0, None); // sret pointer is not a struct arg
             struct_arg_aligns.insert(0, None);
             struct_arg_classes.insert(0, Vec::new()); // sret pointer has no eightbyte classes
-            struct_arg_riscv_float_classes.insert(0, None); // sret pointer has no riscv float class
+            // The hidden pointer carries the class of an FP-register result
+            // (AAPCS64 HFA, RISC-V float struct): the backend then passes it
+            // in no register and moves the result through the buffer.
+            struct_arg_fp_agg_classes.insert(0, ret_abi.fp_agg);
             Some(alloca)
         } else {
             None
@@ -478,27 +482,17 @@ impl Lowerer {
                 .filter(|ctypes| !ctypes.is_empty())
                 .or(param_ctypes_for_decompose.as_ref());
             if let Some(param_ctypes) = fixed_param_ctypes {
-                let decomposes_cld = self.decomposes_complex_long_double();
-                let decomposes_cd = self.decomposes_complex_double();
-                let decomposes_cf = self.decomposes_complex_float();
+                // One IR argument per named parameter -- a named complex is
+                // one aggregate or one packed scalar
+                // (`complex_arg_is_aggregate`) -- except i386 ext-vector
+                // lanes.
                 param_ctypes
                     .iter()
-                    .map(|ct| {
-                        match ct {
-                            CType::ComplexDouble if decomposes_cd => 2,
-                            // Fixed ComplexFloat params are decomposed into 2 FP regs
-                            // on 64-bit targets (not x86-64 packed, not i686 struct)
-                            CType::ComplexFloat
-                                if decomposes_cf && !self.uses_packed_complex_float() =>
-                            {
-                                2
-                            }
-                            CType::ComplexLongDouble if decomposes_cld => 2,
-                            CType::ExtVector(..) if crate::common::types::target_is_32bit() => {
-                                ct.i386_ext_vector_ir_args()
-                            }
-                            _ => 1,
+                    .map(|ct| match ct {
+                        CType::ExtVector(..) if crate::common::types::target_is_32bit() => {
+                            ct.i386_ext_vector_ir_args()
                         }
+                        _ => 1,
                     })
                     .sum::<usize>()
                     + sret_slots
@@ -518,7 +512,7 @@ impl Lowerer {
             struct_arg_sizes,
             struct_arg_aligns,
             struct_arg_classes,
-            struct_arg_riscv_float_classes,
+            struct_arg_fp_agg_classes,
             struct_arg_is_f128_sse,
             call_variadic,
             num_fixed_args,
@@ -1215,7 +1209,7 @@ impl Lowerer {
         struct_arg_sizes: &mut Vec<Option<usize>>,
         struct_arg_aligns: &mut Vec<Option<usize>>,
         struct_arg_classes: &mut Vec<Vec<crate::common::types::EightbyteClass>>,
-        struct_arg_riscv_float_classes: &mut Vec<Option<crate::common::types::RiscvFloatClass>>,
+        struct_arg_fp_agg_classes: &mut Vec<Option<crate::common::types::FpAggClass>>,
         param_ctypes: &Option<Vec<CType>>,
         args: &[Expr],
         call_is_variadic: bool,
@@ -1234,7 +1228,7 @@ impl Lowerer {
         let old_sizes = std::mem::take(struct_arg_sizes);
         let old_aligns = std::mem::take(struct_arg_aligns);
         let old_classes = std::mem::take(struct_arg_classes);
-        let old_riscv_classes = std::mem::take(struct_arg_riscv_float_classes);
+        let old_riscv_classes = std::mem::take(struct_arg_fp_agg_classes);
         let mut new_vals = Vec::with_capacity(old_vals.len());
         let mut new_types = Vec::with_capacity(old_types.len());
         let mut new_sizes = Vec::with_capacity(old_sizes.len());
@@ -1366,7 +1360,7 @@ impl Lowerer {
         *struct_arg_sizes = new_sizes;
         *struct_arg_aligns = new_aligns;
         *struct_arg_classes = new_classes;
-        *struct_arg_riscv_float_classes = new_riscv_classes;
+        *struct_arg_fp_agg_classes = new_riscv_classes;
         expansions
     }
 
@@ -1385,7 +1379,7 @@ impl Lowerer {
         Vec<Option<usize>>,
         Vec<Option<usize>>,
         Vec<Vec<crate::common::types::EightbyteClass>>,
-        Vec<Option<crate::common::types::RiscvFloatClass>>,
+        Vec<Option<crate::common::types::FpAggClass>>,
     ) {
         // Extract function name from direct calls, or the underlying variable name
         // from indirect calls through function pointers (e.g., (*afp)(args) -> "afp").
@@ -1759,11 +1753,10 @@ impl Lowerer {
                     .map(|s| s.param_struct_sizes.clone())
             }) {
             // Use pre-registered struct sizes from function metadata.
-            // For variadic _Complex long double args beyond fixed params, infer size
-            // (param_struct_sizes only covers declared parameters).
-            // Also override None entries for vector types, since the first-pass
+            // Arguments beyond the declared parameters (variadic) infer their
+            // size, as do None entries for vector types, since the first-pass
             // registration may not have resolved vector typedefs yet.
-            let decomposes_cld = self.decomposes_complex_long_double();
+            // Complex arguments are settled by `decompose_complex_call_args`.
             args.iter()
                 .enumerate()
                 .map(|(i, a)| {
@@ -1773,8 +1766,6 @@ impl Lowerer {
                     }
                     // Fall back to expression-based inference for unregistered types
                     let ctype = arg_abi_ctypes[i].clone();
-                    let decomposes_cd = self.decomposes_complex_double();
-                    let decomposes_cf = self.decomposes_complex_float();
                     match ctype {
                         Some(CType::Struct(_)) | Some(CType::Union(_)) => {
                             if pre_call_variadic && self.dynamic_struct_value_size(a).is_some() {
@@ -1791,17 +1782,6 @@ impl Lowerer {
                         // GNU and ext vectors alike are passed by value
                         // (an ext vector's object includes its padding).
                         Some(ref ct) if ct.is_vector() => Some(ct.size()),
-                        Some(CType::ComplexLongDouble) if !decomposes_cld => {
-                            Some(CType::ComplexLongDouble.size())
-                        }
-                        // i686: ComplexDouble (16 bytes) and ComplexFloat (8 bytes) are
-                        // passed as structs on the stack when not decomposed.
-                        Some(CType::ComplexDouble) if !decomposes_cd => {
-                            Some(CType::ComplexDouble.size())
-                        }
-                        Some(CType::ComplexFloat) if !decomposes_cf => {
-                            Some(CType::ComplexFloat.size())
-                        }
                         // _Float128/_Decimal128: 16-byte TFmode carriers (the
                         // i686 stack layout aligns them; x86-64 puts them in
                         // an XMM register via the is_f128_sse class).
@@ -1811,10 +1791,7 @@ impl Lowerer {
                 })
                 .collect()
         } else {
-            // Infer from argument expressions
-            let decomposes_cld = self.decomposes_complex_long_double();
-            let decomposes_cd = self.decomposes_complex_double();
-            let decomposes_cf = self.decomposes_complex_float();
+            // Infer from argument expressions (complex arguments: see above)
             args.iter()
                 .enumerate()
                 .map(|(i, a)| {
@@ -1835,16 +1812,6 @@ impl Lowerer {
                         // GNU and ext vectors alike are passed by value
                         // (an ext vector's object includes its padding).
                         Some(ref ct) if ct.is_vector() => Some(ct.size()),
-                        Some(CType::ComplexLongDouble) if !decomposes_cld => {
-                            Some(CType::ComplexLongDouble.size())
-                        }
-                        // i686: ComplexDouble and ComplexFloat passed as structs on stack
-                        Some(CType::ComplexDouble) if !decomposes_cd => {
-                            Some(CType::ComplexDouble.size())
-                        }
-                        Some(CType::ComplexFloat) if !decomposes_cf => {
-                            Some(CType::ComplexFloat.size())
-                        }
                         Some(CType::Float128) | Some(CType::Decimal128) => Some(16),
                         _ => None,
                     }
@@ -1891,7 +1858,7 @@ impl Lowerer {
             })
             .collect();
 
-        let (struct_arg_classes, struct_arg_riscv_float_classes) =
+        let (struct_arg_classes, struct_arg_fp_agg_classes) =
             self.call_arg_abi_classes(func, func_name, args, &struct_arg_sizes);
 
         (
@@ -1900,7 +1867,7 @@ impl Lowerer {
             struct_arg_sizes,
             struct_arg_aligns,
             struct_arg_classes,
-            struct_arg_riscv_float_classes,
+            struct_arg_fp_agg_classes,
         )
     }
 
@@ -1917,7 +1884,7 @@ impl Lowerer {
         struct_arg_sizes: &[Option<usize>],
     ) -> (
         Vec<Vec<crate::common::types::EightbyteClass>>,
-        Vec<Option<crate::common::types::RiscvFloatClass>>,
+        Vec<Option<crate::common::types::FpAggClass>>,
     ) {
         // Build struct_arg_classes: propagate per-eightbyte SysV ABI classification from FuncSig.
         // For variadic args beyond fixed params, infer classification from expression CType
@@ -1953,16 +1920,17 @@ impl Lowerer {
             })
             .collect();
 
-        // Build struct_arg_riscv_float_classes: the RISC-V LP64D float
-        // classification of each *named* by-value aggregate.  Unnamed
-        // (variadic) arguments get None -- they use the integer convention.
+        // Build struct_arg_fp_agg_classes: the FP-register class of each
+        // by-value aggregate (`Lowerer::fp_agg_class`).  On RISC-V unnamed
+        // (variadic) arguments get None -- they use the integer convention;
+        // AAPCS64 classes them like named ones.
         // The named prefix comes from the callee's signature (a function, or
         // a local or global function-pointer variable), else from the callee
         // expression's function type; an unprototyped callee takes every
         // argument as named (GCC/Clang).  A class the signature did not
         // record -- function-pointer signatures carry none, and member,
         // element or cast callees have no signature at all -- is derived from
-        // the argument's own layout: leaving a named `struct { double x, y; }`
+        // the argument's own type: leaving a named `struct { double x, y; }`
         // in GP registers there disagreed with every callee, LCCC's own
         // included (fa0/fa1).
         let sig = func_name.and_then(|n| self.fptr_variable_sig(n));
@@ -1979,25 +1947,23 @@ impl Lowerer {
                 None => 0,
             },
         };
-        let struct_arg_riscv_float_classes: Vec<Option<crate::common::types::RiscvFloatClass>> =
-            args.iter()
-                .enumerate()
-                .map(|(i, a)| {
-                    if i >= named || struct_arg_sizes.get(i).copied().flatten().is_none() {
-                        return None;
-                    }
-                    if let Some(registered) = sig.and_then(|s| s.param_riscv_float_classes.get(i)) {
-                        return *registered;
-                    }
-                    self.get_expr_ctype(a)
-                        .and_then(|ct| self.get_struct_layout_for_ctype(&ct))
-                        .and_then(|layout| {
-                            layout.classify_riscv_float_fields(&*self.types.borrow_struct_layouts())
-                        })
-                })
-                .collect();
+        let struct_arg_fp_agg_classes: Vec<Option<crate::common::types::FpAggClass>> = args
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                struct_arg_sizes.get(i).copied().flatten()?;
+                let unnamed = i >= named;
+                if let Some(registered) = sig
+                    .filter(|_| !unnamed)
+                    .and_then(|s| s.param_fp_agg_classes.get(i))
+                {
+                    return *registered;
+                }
+                self.fp_agg_class(&self.get_expr_ctype(a)?, unnamed)
+            })
+            .collect();
 
-        (struct_arg_classes, struct_arg_riscv_float_classes)
+        (struct_arg_classes, struct_arg_fp_agg_classes)
     }
 
     /// Infer SysV ABI eightbyte classification for a struct argument expression.
@@ -2024,24 +1990,52 @@ impl Lowerer {
         Vec::new()
     }
 
-    fn copy_ms_record_arguments(
+    /// Pass each aggregate argument that the ABI passes by reference
+    /// (`aggregate_arg_by_reference`: AAPCS64 and RISC-V composites over 16
+    /// bytes, Microsoft x64 records not of size 1, 2, 4 or 8) as the address
+    /// of a fresh copy.  The callee owns that memory and may write to it --
+    /// GCC and Clang callees modify such parameters in place -- so handing
+    /// over the argument object itself let a foreign callee change the
+    /// caller's variable, and two arguments naming one object alias each
+    /// other.  The copy is aligned to at least 16 bytes and to the type's
+    /// own alignment, which the callee may rely on.
+    fn copy_by_reference_arguments(
         &mut self,
         arg_vals: &mut [Operand],
         struct_arg_sizes: &[Option<usize>],
+        struct_arg_aligns: &[Option<usize>],
+        struct_arg_fp_agg_classes: &[Option<crate::common::types::FpAggClass>],
+        calling_convention: crate::common::types::CallingConvention,
     ) {
         for (index, size) in struct_arg_sizes.iter().enumerate() {
-            if let Some(size) = *size {
-                if !matches!(size, 1 | 2 | 4 | 8) {
-                    let copy = self.emit_entry_alloca(IrType::Ptr, size.max(1), 16, false);
-                    let source = self.operand_to_value(arg_vals[index].clone());
-                    self.emit(Instruction::Memcpy {
-                        dest: copy,
-                        src: source,
-                        size,
-                    });
-                    arg_vals[index] = Operand::Value(copy);
-                }
+            let Some(size) = *size else {
+                continue;
+            };
+            let fp_agg_class = struct_arg_fp_agg_classes
+                .get(index)
+                .and_then(Option::as_ref);
+            if !crate::backend::call_abi::aggregate_arg_by_reference(
+                self.target,
+                calling_convention,
+                size,
+                fp_agg_class,
+            ) {
+                continue;
             }
+            let align = struct_arg_aligns
+                .get(index)
+                .copied()
+                .flatten()
+                .unwrap_or(1)
+                .max(16);
+            let copy = self.emit_entry_alloca(IrType::Ptr, size.max(1), align, false);
+            let source = self.operand_to_value(arg_vals[index].clone());
+            self.emit(Instruction::Memcpy {
+                dest: copy,
+                src: source,
+                size,
+            });
+            arg_vals[index] = Operand::Value(copy);
         }
     }
 
@@ -2067,7 +2061,7 @@ impl Lowerer {
         struct_arg_sizes: Vec<Option<usize>>,
         struct_arg_aligns: Vec<Option<usize>>,
         struct_arg_classes: Vec<Vec<crate::common::types::EightbyteClass>>,
-        struct_arg_riscv_float_classes: Vec<Option<crate::common::types::RiscvFloatClass>>,
+        struct_arg_fp_agg_classes: Vec<Option<crate::common::types::FpAggClass>>,
         struct_arg_is_f128_sse: Vec<bool>,
         is_variadic: bool,
         num_fixed_args: usize,
@@ -2076,9 +2070,13 @@ impl Lowerer {
         let calling_convention = self.callee_calling_convention(func);
         let typed_fastcall =
             calling_convention == crate::common::types::CallingConvention::I686Fastcall;
-        if calling_convention == crate::common::types::CallingConvention::MicrosoftX64 {
-            self.copy_ms_record_arguments(&mut arg_vals, &struct_arg_sizes);
-        }
+        self.copy_by_reference_arguments(
+            &mut arg_vals,
+            &struct_arg_sizes,
+            &struct_arg_aligns,
+            &struct_arg_fp_agg_classes,
+            calling_convention,
+        );
         let indirect_ret_ty = self.indirect_call_return_type(func, ret_abi);
 
         match func {
@@ -2098,7 +2096,7 @@ impl Lowerer {
                             struct_arg_sizes,
                             struct_arg_aligns,
                             struct_arg_classes,
-                            struct_arg_riscv_float_classes,
+                            struct_arg_fp_agg_classes,
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: ret_abi.sret_size.is_some(),
                             calling_convention,
@@ -2158,7 +2156,7 @@ impl Lowerer {
                             struct_arg_sizes,
                             struct_arg_aligns,
                             struct_arg_classes,
-                            struct_arg_riscv_float_classes,
+                            struct_arg_fp_agg_classes,
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: ret_abi.sret_size.is_some(),
                             calling_convention,
@@ -2191,7 +2189,7 @@ impl Lowerer {
                 let sas = struct_arg_sizes;
                 let saa = struct_arg_aligns;
                 let sac = struct_arg_classes;
-                let sarfc = struct_arg_riscv_float_classes;
+                let sarfc = struct_arg_fp_agg_classes;
                 let func_ptr = if is_noop_deref {
                     // No-op dereference: (*fp)() == fp()
                     self.lower_expr(inner)
@@ -2211,7 +2209,7 @@ impl Lowerer {
                         struct_arg_sizes: sas,
                         struct_arg_aligns: saa,
                         struct_arg_classes: sac,
-                        struct_arg_riscv_float_classes: sarfc,
+                        struct_arg_fp_agg_classes: sarfc,
                         struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                         is_sret: ret_abi.sret_size.is_some(),
                         calling_convention,
@@ -2232,7 +2230,7 @@ impl Lowerer {
                 let sas = struct_arg_sizes;
                 let saa = struct_arg_aligns;
                 let sac = struct_arg_classes;
-                let sarfc = struct_arg_riscv_float_classes;
+                let sarfc = struct_arg_fp_agg_classes;
                 let func_ptr = self.lower_expr(func);
 
                 // Check if the lowered expression is a GlobalAddr of a known function.
@@ -2301,7 +2299,7 @@ impl Lowerer {
                             struct_arg_sizes: sas,
                             struct_arg_aligns: saa,
                             struct_arg_classes: sac,
-                            struct_arg_riscv_float_classes: sarfc,
+                            struct_arg_fp_agg_classes: sarfc,
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: ret_abi.sret_size.is_some(),
                             calling_convention,
@@ -2329,7 +2327,7 @@ impl Lowerer {
                             struct_arg_sizes: sas,
                             struct_arg_aligns: saa,
                             struct_arg_classes: sac,
-                            struct_arg_riscv_float_classes: sarfc,
+                            struct_arg_fp_agg_classes: sarfc,
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: ret_abi.sret_size.is_some(),
                             calling_convention,

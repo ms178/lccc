@@ -207,7 +207,7 @@ Each function parameter carries ABI metadata beyond its type:
 | `struct_size` | `Option<usize>` | Byte size if struct/union passed by value; `None` for non-struct params |
 | `struct_align` | `Option<usize>` | Struct alignment in bytes; used on RISC-V for even-aligning register pairs for 2xXLEN-aligned structs |
 | `struct_eightbyte_classes` | `Vec<EightbyteClass>` | Per-eightbyte SysV ABI classification (x86-64 only); empty for non-struct params |
-| `riscv_float_class` | `Option<RiscvFloatClass>` | RISC-V LP64D float field classification for FP register passing |
+| `fp_agg_class` | `Option<FpAggClass>` | RISC-V LP64D float field classification for FP register passing |
 
 ### max_value_id()
 
@@ -284,7 +284,7 @@ categories.
 | `struct_arg_sizes` | `Vec<Option<usize>>` | `Some(size)` for struct args passed by value |
 | `struct_arg_aligns` | `Vec<Option<usize>>` | `Some(align)` for struct args (RISC-V register pair alignment) |
 | `struct_arg_classes` | `Vec<Vec<EightbyteClass>>` | Per-eightbyte SysV ABI classification for struct args |
-| `struct_arg_riscv_float_classes` | `Vec<Option<RiscvFloatClass>>` | RISC-V LP64D float classification for struct args |
+| `struct_arg_fp_agg_classes` | `Vec<Option<FpAggClass>>` | RISC-V LP64D float classification for struct args |
 | `is_sret` | `bool` | Hidden pointer argument for struct returns (i386 SysV ABI) |
 | `is_fastcall` | `bool` | Callee uses fastcall calling convention |
 | `ret_eightbyte_classes` | `Vec<EightbyteClass>` | SysV ABI eightbyte classification for two-register struct return |

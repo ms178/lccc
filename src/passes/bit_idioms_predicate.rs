@@ -173,18 +173,24 @@ pub(crate) fn fold_predicate_select(
             }
         });
     }
-    if let (false, true, Some((cmp_dest, cmp_op, cmp_lhs, cmp_rhs, _))) =
+    if let (false, true, Some((cmp_dest, cmp_op, cmp_lhs, cmp_rhs, cmp_ty))) =
         (positive, same_size, comparison)
         && use_counts.get(cmp_dest.0 as usize).copied() == Some(1)
     {
         // `c ? 0 : 1` is `!c`, and the only reader of the comparison is this
-        // select, so the inverted predicate replaces both.
+        // select, so the inverted predicate replaces both.  A `Cmp`'s type is
+        // its OPERANDS' type -- the backends extend the operands by it -- so
+        // it stays the comparison's: restating it as the select's carrier
+        // turned `x < 0 ? 0u : 1u` into `Sge x, 0` at U32, which RISC-V
+        // lowered as a zero-extension followed by a signed compare, so every
+        // negative x answered 1 (-O2).  The `0`/`1` result is the same value
+        // in either carrier.
         return Some(Instruction::Cmp {
             dest: *dest,
             op: cmp_op.inverse(),
             lhs: cmp_lhs,
             rhs: cmp_rhs,
-            ty: *ty,
+            ty: cmp_ty,
         });
     }
     if boolean {
@@ -205,12 +211,13 @@ pub(crate) fn fold_predicate_select(
     if cond_ty.size() != ty.size() {
         return None;
     }
+    // The zero test compares the condition, so it is typed by the condition.
     Some(Instruction::Cmp {
         dest: *dest,
         op: if positive { IrCmpOp::Ne } else { IrCmpOp::Eq },
         lhs: *cond,
-        rhs: Operand::Const(IrConst::from_i64(0, *ty)),
-        ty: *ty,
+        rhs: Operand::Const(IrConst::from_i64(0, cond_ty)),
+        ty: cond_ty,
     })
 }
 

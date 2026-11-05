@@ -145,8 +145,12 @@ fn wide_shape_ok(classes: &[Class]) -> bool {
 
 /// Classify `ty` for by-value passing. `None` for types that are not
 /// aggregates (scalars have their own conventions) and for incomplete types.
+/// A complex type is the aggregate of its two parts (psABI 3.2.3: "a
+/// complex T is a struct { T real, imag; }"): `_Complex double` is
+/// `[SSE, SSE]` -- two %xmm registers, or memory as a whole -- and
+/// `_Complex long double` (COMPLEX_X87) is MEMORY as an argument.
 pub fn classify(ty: &CType, ctx: &dyn StructLayoutProvider) -> Option<SysvPassing> {
-    if !matches!(ty, CType::Struct(_) | CType::Union(_)) && !ty.is_vector() {
+    if !matches!(ty, CType::Struct(_) | CType::Union(_)) && !ty.is_vector() && !ty.is_complex() {
         return None;
     }
     // GCC 16.2.0 (measured, harness-cache-1 oracle): a one-lane FP
@@ -479,5 +483,37 @@ mod long_double_vector_tests {
 
         assert_eq!(classify(&ld_vec(3), &ctx), Some(SysvPassing::Memory));
         assert_eq!(classify_return(&ld_vec(3), &ctx), Some(SysvPassing::Memory));
+    }
+}
+
+#[cfg(test)]
+mod complex_tests {
+    use super::*;
+    use crate::common::fx_hash::FxHashMap;
+    use crate::common::types::RcLayout;
+
+    /// A complex argument is the record of its two parts (GCC 16.2 / Clang
+    /// 23.1.4): `_Complex double` takes two %xmm registers -- or the stack
+    /// as a whole when only one is left -- and `_Complex long double` is
+    /// MEMORY.  `_Complex float` packs into one SSE eightbyte.
+    #[test]
+    fn complex_arguments_classify_as_their_records() {
+        let ctx: FxHashMap<String, RcLayout> = FxHashMap::default();
+        assert_eq!(
+            classify(&CType::ComplexDouble, &ctx),
+            Some(SysvPassing::Regs(vec![
+                EightbyteClass::Sse,
+                EightbyteClass::Sse
+            ]))
+        );
+        assert_eq!(
+            classify(&CType::ComplexFloat, &ctx),
+            Some(SysvPassing::Regs(vec![EightbyteClass::Sse]))
+        );
+        assert_eq!(
+            classify(&CType::ComplexLongDouble, &ctx),
+            Some(SysvPassing::Memory)
+        );
+        assert_eq!(classify(&CType::Double, &ctx), None);
     }
 }

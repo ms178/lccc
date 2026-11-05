@@ -263,7 +263,7 @@ impl ArmCodegen {
         total_sp_adjust: i64,
         _f128_temp_space: usize,
         _stack_arg_space: usize,
-        _struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
+        _struct_arg_fp_agg_classes: &[Option<crate::common::types::FpAggClass>],
     ) {
         let slot_adjust = if self.state.has_dyn_alloca {
             0
@@ -283,6 +283,7 @@ impl ArmCodegen {
         self.emit_call_move_temps_to_arg_regs(args, arg_classes);
         self.emit_call_i128_reg_args(args, arg_classes, slot_adjust, needs_adjusted_load);
         self.emit_call_struct_byval_reg_args(args, arg_classes, slot_adjust, needs_adjusted_load);
+        self.emit_call_hfa_reg_args(args, arg_classes, slot_adjust, needs_adjusted_load);
     }
 
     pub(super) fn emit_call_instruction_impl(
@@ -368,8 +369,10 @@ impl ArmCodegen {
         // code: q1 is caller-clobbered by the call (it held the second
         // argument, not the result), so it truncated garbage, and x0 was
         // overwritten before any consumer could read the "approximation".
-        // One libcall + two memory round-trips saved per f128 call.
+        // One libcall + two memory round-trips saved per f128 call.  x0
+        // holds whatever the callee left there, so the accumulator cache
+        // must not claim it holds `dest`: every consumer reads the 16-byte
+        // home.
         self.state.reg_cache.invalidate_all();
-        self.state.reg_cache.set_acc(dest.0, false);
     }
 }

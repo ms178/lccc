@@ -1722,7 +1722,7 @@ fn ci(d: Option<Value>, a: Vec<Operand>, t: Vec<IrType>, r: IrType, var: bool) -
         struct_arg_sizes: vec![None; n],
         struct_arg_aligns: vec![None; n],
         struct_arg_classes: vec![Vec::new(); n],
-        struct_arg_riscv_float_classes: vec![None; n],
+        struct_arg_fp_agg_classes: vec![None; n],
         struct_arg_is_f128_sse: Vec::new(),
         is_sret: false,
         calling_convention: crate::common::types::CallingConvention::Default,
@@ -1774,7 +1774,7 @@ fn push_helper_fn(
             param_align: None,
             struct_eightbyte_classes: vec![],
             is_f128_sse: false,
-            riscv_float_class: None,
+            fp_agg_class: None,
         })
         .collect();
     // Frontend param lowering: allocas + ParamRef + Store in the entry block.

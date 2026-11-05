@@ -888,14 +888,15 @@ impl ArmCodegen {
         self.state.reg_cache.invalidate_acc();
     }
 
-    pub(super) fn emit_memcpy_impl_impl(&mut self, size: usize) {
+    pub(super) fn emit_memcpy_impl_impl(&mut self, mut size: usize) {
         // Struct assignments are overwhelmingly small fixed-size copies.  A
         // byte-at-a-time runtime loop is especially costly when the copy sits
-        // in a hot loop, so use AArch64 pair transfers for sizes that can be
-        // unrolled without excessive code growth.  x9 is the destination and
-        // x10 the source; x12/x13 are reserved codegen scratch registers.
+        // in a hot loop, so use AArch64 pair transfers: unrolled up to 256
+        // bytes, a post-indexed pair loop beyond (AArch64 normal memory takes
+        // unaligned accesses).  x9 is the destination and x10 the source;
+        // x11 counts, x12/x13 are reserved codegen scratch registers.
+        let mut offset = 0usize;
         if size <= 256 {
-            let mut offset = 0usize;
             while offset + 16 <= size {
                 self.state
                     .emit_fmt(format_args!("    ldp x12, x13, [x10, #{}]", offset));
@@ -903,47 +904,31 @@ impl ArmCodegen {
                     .emit_fmt(format_args!("    stp x12, x13, [x9, #{}]", offset));
                 offset += 16;
             }
-            if offset + 8 <= size {
-                self.state
-                    .emit_fmt(format_args!("    ldr x12, [x10, #{}]", offset));
-                self.state
-                    .emit_fmt(format_args!("    str x12, [x9, #{}]", offset));
-                offset += 8;
-            }
-            if offset + 4 <= size {
-                self.state
-                    .emit_fmt(format_args!("    ldr w12, [x10, #{}]", offset));
-                self.state
-                    .emit_fmt(format_args!("    str w12, [x9, #{}]", offset));
-                offset += 4;
-            }
-            if offset + 2 <= size {
-                self.state
-                    .emit_fmt(format_args!("    ldrh w12, [x10, #{}]", offset));
-                self.state
-                    .emit_fmt(format_args!("    strh w12, [x9, #{}]", offset));
-                offset += 2;
-            }
-            if offset < size {
-                self.state
-                    .emit_fmt(format_args!("    ldrb w12, [x10, #{}]", offset));
-                self.state
-                    .emit_fmt(format_args!("    strb w12, [x9, #{}]", offset));
-            }
-            return;
+        } else {
+            // The loop advances x9/x10, so the tail addresses from offset 0.
+            let label_id = self.state.next_label_id();
+            let loop_label = format!(".Lmemcpy_loop_{}", label_id);
+            self.load_large_imm("x11", (size / 16) as i64);
+            self.state.emit_fmt(format_args!("{}:", loop_label));
+            self.state.emit("    ldp x12, x13, [x10], #16");
+            self.state.emit("    stp x12, x13, [x9], #16");
+            self.state.emit("    subs x11, x11, #1");
+            self.state.emit_fmt(format_args!("    b.ne {}", loop_label));
+            size %= 16;
         }
-
-        let label_id = self.state.next_label_id();
-        let loop_label = format!(".Lmemcpy_loop_{}", label_id);
-        let done_label = format!(".Lmemcpy_done_{}", label_id);
-        self.load_large_imm("x11", size as i64);
-        self.state.emit_fmt(format_args!("{}:", loop_label));
-        self.state
-            .emit_fmt(format_args!("    cbz x11, {}", done_label));
-        self.state.emit("    ldrb w12, [x10], #1");
-        self.state.emit("    strb w12, [x9], #1");
-        self.state.emit("    sub x11, x11, #1");
-        self.state.emit_fmt(format_args!("    b {}", loop_label));
-        self.state.emit_fmt(format_args!("{}:", done_label));
+        for (width, load, store, reg) in [
+            (8, "ldr", "str", "x12"),
+            (4, "ldr", "str", "w12"),
+            (2, "ldrh", "strh", "w12"),
+            (1, "ldrb", "strb", "w12"),
+        ] {
+            if offset + width <= size {
+                self.state
+                    .emit_fmt(format_args!("    {} {}, [x10, #{}]", load, reg, offset));
+                self.state
+                    .emit_fmt(format_args!("    {} {}, [x9, #{}]", store, reg, offset));
+                offset += width;
+            }
+        }
     }
 }

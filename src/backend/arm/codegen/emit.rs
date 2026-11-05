@@ -247,6 +247,11 @@ pub struct ArmCodegen {
     /// Total bytes of named (non-variadic) params passed on the stack.
     /// This includes all stack-passed scalars, F128, I128, and structs with alignment.
     pub(super) va_named_stack_bytes: usize,
+    /// The current function returns an aggregate in SIMD registers (an
+    /// AAPCS64 HFA/HVA/short vector, `call_abi::hidden_fp_agg_return`):
+    /// the sp-relative offset of the private buffer its hidden return
+    /// pointer is homed as, and the result's class.
+    pub(super) fp_ret_buffer: Option<(i64, crate::common::types::FpAggClass)>,
     /// Dest value-ids of Clz/Ctz/Popcount results on ≤32-bit integer types:
     /// provably in [0, 32] (bit 31 clear), and the emitters write them with
     /// W-register instructions (which zero the upper 32 bits of the X
@@ -289,7 +294,18 @@ pub struct ArmCodegen {
     /// Exact AAPCS64 fixed-register conditional-increment leaf: no stack frame,
     /// no callee saves, parameters stay in x0..x7, result stays in x0.
     pub(super) conditional_increment_leaf: bool,
-    pub(super) conditional_increment_leaf_condition_32: bool,
+    /// Byte width of the fixed leaf plan's condition (see
+    /// `conditional_increment_leaf_plan`): a parameter condition stays in
+    /// its ABI register, so its test must read exactly that many bytes.
+    pub(super) conditional_increment_leaf_condition_bytes: usize,
+    /// Call-free leaf with nothing to keep in memory: no frame record, no
+    /// callee saves, x30 holds the return address up to the `ret` and the
+    /// CFA stays `sp + 0` (see `frameless_leaf_ok`).
+    pub(super) frameless_leaf: bool,
+    /// Index of the parameter that arrives in x0 and is captured only by
+    /// its own ParamRef, while that ParamRef has not been emitted yet (see
+    /// `emit_param_ref_impl`).
+    pub(super) x0_param_pending: Option<usize>,
 }
 
 impl ArmCodegen {
@@ -312,6 +328,7 @@ impl ArmCodegen {
             va_named_gp_count: 0,
             va_named_fp_count: 0,
             va_named_stack_bytes: 0,
+            fp_ret_buffer: None,
             bitop_nonneg_values: FxHashSet::default(),
             divrem_tail_dests: FxHashSet::default(),
             divrem_head_partners: FxHashMap::default(),
@@ -326,7 +343,9 @@ impl ArmCodegen {
             frame_base_offset: None,
             general_regs_only: false,
             conditional_increment_leaf: false,
-            conditional_increment_leaf_condition_32: false,
+            conditional_increment_leaf_condition_bytes: 8,
+            frameless_leaf: false,
+            x0_param_pending: None,
         }
     }
 
@@ -364,6 +383,26 @@ impl ArmCodegen {
         match op {
             Operand::Value(v) => self.reg_assignments.get(&v.0).copied(),
             _ => None,
+        }
+    }
+
+    /// Whether a nonzero test of `cond` must read only the W view: its value
+    /// is 32 bits wide or narrower. AAPCS64 leaves the bits of x[n] above an
+    /// argument's or a result's width unspecified (C.16 and the result
+    /// rules) -- `int f(int a, int b, long k) { return g(a, b, k); }` is a
+    /// bare `b g` from GCC and Clang, so g's third argument carries k's upper
+    /// half, and an `int` result may return one -- so the X view of such a
+    /// value is not its value. Narrower values are canonical in their W view
+    /// (the parameter, cast and load producers extend them), so `cbnz wN` /
+    /// `cmp wN, #0` is exact and costs what the X form did. A constant is
+    /// materialized exactly, and a value of unknown type keeps the X test.
+    pub(super) fn cond_is_w_view(&self, cond: &Operand) -> bool {
+        match cond {
+            Operand::Value(v) => self
+                .value_types
+                .get(&v.0)
+                .is_some_and(|ty| ty.is_integer() && ty.size() <= 4),
+            Operand::Const(_) => false,
         }
     }
 
@@ -1046,6 +1085,10 @@ impl ArmCodegen {
             "str" | "ldr" => {
                 if reg.starts_with('w') || reg.starts_with('s') {
                     4
+                } else if reg.starts_with('h') {
+                    2
+                } else if reg.starts_with('b') {
+                    1
                 } else if reg.starts_with('q') {
                     16
                 } else {
@@ -2363,7 +2406,7 @@ impl ArmCodegen {
     /// reports whether x11 currently holds that effective base (computed
     /// once per parameter in the capture loops); `instr` is the store
     /// mnemonic (str/strb/strh, or str qN for the 16-byte F128 form).
-    fn emit_param_home_store_impl(
+    pub(super) fn emit_param_home_store_impl(
         &mut self,
         over_aligned: bool,
         instr: &str,
@@ -2389,7 +2432,7 @@ impl ArmCodegen {
         }
     }
 
-    fn resolve_param_slot(
+    pub(super) fn resolve_param_slot(
         &self,
         func: &IrFunction,
         i: usize,
@@ -2527,30 +2570,21 @@ impl ArmCodegen {
     }
 
     /// Phase 2: Store FP register params to alloca slots.
+    /// Store the FP-register params (`FloatReg`, and `F128FpReg` long
+    /// doubles) into their homes.
+    ///
+    /// Uses x9/w9 as scratch instead of x0/w0 to avoid clobbering GP argument
+    /// registers (x0-x7) that may not have been spilled yet (e.g. when mem2reg
+    /// promoted their allocas and emit_param_ref will read them later).  A
+    /// long double goes from its q-register to its 16-byte home, which is its
+    /// full-precision source (`track_f128_self`); nothing reads an f64
+    /// approximation of it, so no `__trunctfdf2` call (and no save area to
+    /// protect v0-v7 from that call) is needed.
     pub(super) fn emit_store_fp_params(&mut self, func: &IrFunction, param_classes: &[ParamClass]) {
-        let has_f128_fp_params = param_classes.iter().enumerate().any(|(i, c)| {
-            matches!(c, ParamClass::F128FpReg { .. }) && find_param_alloca(func, i).is_some()
-        });
-
-        if has_f128_fp_params {
-            self.emit_store_fp_params_with_f128(func, param_classes);
-        } else {
-            self.emit_store_fp_params_simple(func, param_classes);
-        }
-    }
-
-    /// Store FP params when F128 params are present (save/restore q0-q7).
-    fn emit_store_fp_params_with_f128(&mut self, func: &IrFunction, param_classes: &[ParamClass]) {
-        self.emit_sub_sp(128);
-        for i in 0..8usize {
-            self.state
-                .emit_fmt(format_args!("    str q{}, [sp, #{}]", i, i * 16));
-        }
-
-        // Process non-F128 float params first (from saved Q area).
         for (i, _) in func.params.iter().enumerate() {
-            let reg_idx = match param_classes[i] {
-                ParamClass::FloatReg { reg_idx } => reg_idx,
+            let (reg_idx, is_f128) = match param_classes[i] {
+                ParamClass::FloatReg { reg_idx } => (reg_idx, false),
+                ParamClass::F128FpReg { reg_idx } => (reg_idx, true),
                 _ => continue,
             };
             let (slot, ty, dest_val) = match self.resolve_param_slot(func, i) {
@@ -2565,75 +2599,11 @@ impl ArmCodegen {
             if over_aligned {
                 self.emit_alloca_addr("x11", dest_val.0, slot.0);
             }
-            let fp_reg_off = (reg_idx * 16) as i64;
-            if ty == IrType::U16 {
-                self.state
-                    .emit_fmt(format_args!("    ldr s0, [sp, #{}]", fp_reg_off));
-                self.state.emit("    fmov w9, s0");
-                self.state.emit("    and w9, w9, #0xffff");
-            } else if ty == IrType::F32 {
-                self.state
-                    .emit_fmt(format_args!("    ldr s0, [sp, #{}]", fp_reg_off));
-                self.state.emit("    fmov w9, s0");
-            } else {
-                self.state
-                    .emit_fmt(format_args!("    ldr d0, [sp, #{}]", fp_reg_off));
-                self.state.emit("    fmov x9, d0");
-            }
-            self.emit_param_home_store_impl(over_aligned, "str", "x9", slot, 128);
-        }
-
-        // Process F128 FP reg params: store full 16-byte f128, then f64 approx.
-        for (i, _) in func.params.iter().enumerate() {
-            let reg_idx = match param_classes[i] {
-                ParamClass::F128FpReg { reg_idx } => reg_idx,
-                _ => continue,
-            };
-            let (slot, _, dest_val) = match self.resolve_param_slot(func, i) {
-                Some(v) => v,
-                None => continue,
-            };
-            let over_aligned = self
-                .state
-                .alloca_over_align(dest_val.0)
-                .filter(|&a| a > 16)
-                .is_some();
-            if over_aligned {
-                self.emit_alloca_addr("x11", dest_val.0, slot.0);
-            }
-            let fp_reg_off = (reg_idx * 16) as i64;
-            self.state
-                .emit_fmt(format_args!("    ldr q0, [sp, #{}]", fp_reg_off));
-            self.emit_param_home_store_impl(over_aligned, "str", "q0", slot, 128);
-            self.state.track_f128_self(dest_val.0);
-            self.state.emit("    bl __trunctfdf2");
-            self.state.emit("    fmov x0, d0");
-        }
-
-        self.emit_add_sp(128);
-    }
-
-    /// Store FP params when no F128 params are present (simple path).
-    fn emit_store_fp_params_simple(&mut self, func: &IrFunction, param_classes: &[ParamClass]) {
-        // Use x9/w9 as scratch instead of x0/w0 to avoid clobbering GP argument
-        // registers (x0-x7) that may not have been spilled yet (e.g. when mem2reg
-        // promoted their allocas and emit_param_ref will read them later).
-        for (i, _) in func.params.iter().enumerate() {
-            let reg_idx = match param_classes[i] {
-                ParamClass::FloatReg { reg_idx } => reg_idx,
-                _ => continue,
-            };
-            let (slot, ty, dest_val) = match self.resolve_param_slot(func, i) {
-                Some(v) => v,
-                None => continue,
-            };
-            let over_aligned = self
-                .state
-                .alloca_over_align(dest_val.0)
-                .filter(|&a| a > 16)
-                .is_some();
-            if over_aligned {
-                self.emit_alloca_addr("x11", dest_val.0, slot.0);
+            if is_f128 {
+                let q = format!("q{}", reg_idx);
+                self.emit_param_home_store_impl(over_aligned, "str", &q, slot, 0);
+                self.state.track_f128_self(dest_val.0);
+                continue;
             }
             if ty == IrType::U16 {
                 self.state
@@ -2659,7 +2629,7 @@ impl ArmCodegen {
         func: &IrFunction,
         param_classes: &[ParamClass],
     ) {
-        let frame_size = self.current_frame_size;
+        let frame_size = self.incoming_stack_base();
         for (i, _) in func.params.iter().enumerate() {
             let class = param_classes[i];
             if !class.is_stack() {
@@ -2760,11 +2730,20 @@ impl ArchCodegen for ArmCodegen {
         // alloca) or the x19 frame base are unaffected by a push, exactly as
         // the x86 RBP-frame case is.
         self.state.emit("    str x0, [sp, #-16]!");
+        // Without a frame record the CFA is sp-relative, so the push moves
+        // it; with one it is x29-relative and the push is invisible to the
+        // unwinder.
+        if self.frameless_leaf && self.state.emit_cfi {
+            self.state.emit("    .cfi_adjust_cfa_offset 16");
+        }
         16
     }
 
     fn emit_acc_restore(&mut self) {
         self.state.emit("    ldr x0, [sp], #16");
+        if self.frameless_leaf && self.state.emit_cfi {
+            self.state.emit("    .cfi_adjust_cfa_offset -16");
+        }
     }
 
     fn fp_contract(&self) -> crate::common::fp_contract::FpContract {
@@ -2858,23 +2837,33 @@ impl ArchCodegen for ArmCodegen {
     fn supports_fused_bit_test_cmp(&self) -> bool {
         std::env::var_os("CCC_NO_BT_FLAG_FUSION").is_none()
     }
-    /// A condition already in its GP home is tested in place: `cbnz xN`
-    /// reads exactly the 64 bits `mov x0, xN; cbnz x0` read, one move less.
+    /// A condition already in its GP home is tested in place, one move less
+    /// than `mov x0, xN; cbnz x0`. A 32-bit-or-narrower condition is tested
+    /// through its W view (`cond_is_w_view`): an `int` result or argument
+    /// may carry an unspecified upper half.
     fn emit_cond_branch_blocks(
         &mut self,
         cond: &Operand,
         true_block: BlockId,
         false_block: BlockId,
     ) {
+        let w_view = self.cond_is_w_view(cond);
         if let Some(reg) = self.operand_reg(cond).filter(|r| !is_arm_fp_phys(*r)) {
-            self.state.emit_fmt(format_args!(
-                "    cbnz {}, {}",
-                callee_saved_name(reg),
-                true_block.as_label()
-            ));
+            let name = if w_view {
+                callee_saved_name_32(reg)
+            } else {
+                callee_saved_name(reg)
+            };
+            self.state
+                .emit_fmt(format_args!("    cbnz {}, {}", name, true_block.as_label()));
         } else {
             self.emit_load_operand(cond);
-            self.emit_branch_nonzero(&true_block.as_label());
+            if w_view {
+                self.state
+                    .emit_fmt(format_args!("    cbnz w0, {}", true_block.as_label()));
+            } else {
+                self.emit_branch_nonzero(&true_block.as_label());
+            }
         }
         self.emit_branch_to_block(false_block);
     }
@@ -3603,12 +3592,13 @@ impl ArchCodegen for ArmCodegen {
         fn emit_call_compute_stack_space(&self, arg_classes: &[CallArgClass], arg_types: &[IrType], struct_arg_aligns: &[Option<usize>], _struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>], struct_arg_is_f128_sse: &[bool]) -> usize => emit_call_compute_stack_space_impl;
         fn emit_call_f128_pre_convert(&mut self, args: &[Operand], arg_classes: &[CallArgClass], arg_types: &[IrType], stack_arg_space: usize) -> usize => emit_call_f128_pre_convert_impl;
         fn emit_call_stack_args(&mut self, args: &[Operand], arg_classes: &[CallArgClass], arg_types: &[IrType], stack_arg_space: usize, fptr_spill: usize, f128_temp_space: usize, struct_arg_aligns: &[Option<usize>], _struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>], _struct_arg_is_f128_sse: &[bool]) -> i64 => emit_call_stack_args_impl;
-        fn emit_call_reg_args(&mut self, args: &[Operand], arg_classes: &[CallArgClass], arg_types: &[IrType], total_sp_adjust: i64, f128_temp_space: usize, stack_arg_space: usize, struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>]) => emit_call_reg_args_impl;
+        fn emit_call_reg_args(&mut self, args: &[Operand], arg_classes: &[CallArgClass], arg_types: &[IrType], total_sp_adjust: i64, f128_temp_space: usize, stack_arg_space: usize, struct_arg_fp_agg_classes: &[Option<crate::common::types::FpAggClass>]) => emit_call_reg_args_impl;
         fn emit_call_instruction(&mut self, direct_name: Option<&str>, func_ptr: Option<&Operand>, indirect: bool, stack_arg_space: usize) => emit_call_instruction_impl;
         fn emit_call_cleanup(&mut self, stack_arg_space: usize, f128_temp_space: usize, indirect: bool) => emit_call_cleanup_impl;
         fn emit_call_store_i128_result(&mut self, dest: &Value) => emit_call_store_i128_result_impl;
         fn emit_call_store_f128_result(&mut self, dest: &Value) => emit_call_store_f128_result_impl;
         fn emit_call_store_result(&mut self, dest: &Value, return_type: IrType) => emit_call_store_result_impl;
+        fn emit_call_store_fp_agg_return(&mut self, buffer: &Operand, class: crate::common::types::FpAggClass, dest: Option<&Value>) => emit_call_store_fp_agg_return_impl;
         fn set_call_ret_is_f128_sse(&mut self, is_f128: bool) => set_call_ret_is_f128_sse_impl;
         // globals
         fn emit_global_addr(&mut self, dest: &Value, name: &str) => emit_global_addr_impl;
@@ -3622,6 +3612,7 @@ impl ArchCodegen for ArmCodegen {
         fn emit_va_start(&mut self, va_list_ptr: &Value) => emit_va_start_impl;
         fn emit_va_copy(&mut self, dest_ptr: &Value, src_ptr: &Value) => emit_va_copy_impl;
         fn emit_va_arg_struct(&mut self, dest_ptr: &Value, va_list_ptr: &Value, size: usize, align: usize) => emit_va_arg_struct_impl;
+        fn emit_va_arg_hfa(&mut self, dest_ptr: &Value, va_list_ptr: &Value, size: usize, align: usize, member_size: usize, count: usize) => emit_va_arg_hfa_impl;
         // returns
         fn current_return_type(&self) -> IrType => current_return_type_impl;
         fn emit_return_i128_to_regs(&mut self) => emit_return_i128_to_regs_impl;
@@ -4167,5 +4158,69 @@ mod integer_compare_register_class_tests {
             IrType::I64,
         );
         assert_eq!(cg.state.out.buf.trim(), "cmp x19, #0");
+    }
+}
+
+#[cfg(test)]
+mod condition_width_tests {
+    use super::*;
+    use crate::ir::reexports::BlockId;
+
+    fn cg_with(ty: IrType, home: PhysReg) -> ArmCodegen {
+        let mut cg = ArmCodegen::new();
+        cg.reg_assignments.insert(5, home);
+        cg.value_types.insert(5, ty);
+        cg
+    }
+
+    /// AAPCS64 leaves the bits above a 32-bit argument or result
+    /// unspecified, so a branch on an `int` (or narrower, canonical) value
+    /// tests the W view; a 64-bit value keeps the X view.
+    #[test]
+    fn branch_on_a_narrow_condition_reads_the_w_view() {
+        for (ty, want) in [
+            (IrType::I32, "cbnz w19, .LBB1"),
+            (IrType::U32, "cbnz w19, .LBB1"),
+            (IrType::U8, "cbnz w19, .LBB1"),
+            (IrType::I16, "cbnz w19, .LBB1"),
+            (IrType::I64, "cbnz x19, .LBB1"),
+            (IrType::Ptr, "cbnz x19, .LBB1"),
+        ] {
+            let mut cg = cg_with(ty, PhysReg(19));
+            cg.emit_cond_branch_blocks(&Operand::Value(Value(5)), BlockId(1), BlockId(2));
+            assert!(
+                cg.state.out.buf.contains(want),
+                "{ty:?}: {}",
+                cg.state.out.buf
+            );
+        }
+    }
+
+    /// The select's zero test reads exactly the condition's width.
+    #[test]
+    fn select_zero_test_reads_the_condition_width() {
+        for (ty, want) in [
+            (IrType::I32, "cmp w19, #0"),
+            (IrType::U8, "cmp w19, #0"),
+            (IrType::U64, "cmp x19, #0"),
+        ] {
+            let mut cg = cg_with(ty, PhysReg(19));
+            cg.emit_select_cond_cmp_for_test(&Operand::Value(Value(5)));
+            assert_eq!(cg.state.out.buf.trim(), want, "{ty:?}");
+        }
+        // The fixed conditional-increment leaf reads a parameter condition
+        // in its ABI register, where nothing canonicalized it.
+        for (bytes, want) in [
+            (1, "tst w2, #0xff"),
+            (2, "tst w2, #0xffff"),
+            (4, "cmp w2, #0"),
+            (8, "cmp x2, #0"),
+        ] {
+            let mut cg = cg_with(IrType::U8, PhysReg(2));
+            cg.conditional_increment_leaf = true;
+            cg.conditional_increment_leaf_condition_bytes = bytes;
+            cg.emit_select_cond_cmp_for_test(&Operand::Value(Value(5)));
+            assert_eq!(cg.state.out.buf.trim(), want, "{bytes} bytes");
+        }
     }
 }

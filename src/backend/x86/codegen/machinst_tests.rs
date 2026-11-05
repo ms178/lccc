@@ -4769,7 +4769,7 @@ mod typed_indirect_calls {
                 struct_arg_sizes: vec![],
                 struct_arg_aligns: vec![],
                 struct_arg_classes: vec![],
-                struct_arg_riscv_float_classes: vec![],
+                struct_arg_fp_agg_classes: vec![],
                 struct_arg_is_f128_sse: vec![],
                 ret_is_f128_sse: false,
                 is_sret: false,

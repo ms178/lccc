@@ -20,6 +20,8 @@
 #      is a real semantic barrier — the store has to survive it.
 #   C. self-test: the shape checker must fire on a spill pair and stay quiet on
 #      a clean loop, so a checker that silently matches nothing cannot pass.
+#   D. register inputs: an empty template with a register input still has the
+#      input computed, on x86-64, i686, AArch64 and RISC-V (with a self-test).
 set -uo pipefail
 
 CC="${CCC:-./target/fastbuild/lccc}"
@@ -264,6 +266,105 @@ if [ -s "$tmp/clean_body.s" ] && [ "$(spill_stores "$tmp/clean_body.s")" -eq 0 ]
     note_pass "self-test: the checker accepts a spill-free loop"
 else
     note_fail "self-test: the checker flags a spill-free loop"
+fi
+
+# ---- D. register inputs are materialised ---------------------------------
+# The opposite contract for REGISTER operands: an empty template still gets
+# its inputs computed, as GCC and Clang compute them -- neither looks inside a
+# template.  `asm volatile("" : : "r"(v))` is how benchmark harnesses keep a
+# result alive (Google Benchmark's DoNotOptimize(const T&) is
+# `"" : : "r,m"(value) : "memory"`), and the kernel's barrier_data() hands a
+# pointer to "unknown code".  No line of the empty template reads the staged
+# register, so the x86-64 text peephole deleted the staging and then the
+# multiply feeding it, at -O1 and -O2, in all four forms below: a benchmark
+# loop measured nothing.  `i * k` is a pure register multiply, removable once
+# nothing reads it (a division would survive as a possible trap).
+cat >"$tmp/inputs.c" <<'EOF'
+void products(long n, long k) {
+    for (long i = 0; i < n; i++) {
+        long v = i * k;
+        __asm__ volatile("" : : "r"(v));
+    }
+}
+void products_barrier_data(long n, long k) {
+    for (long i = 0; i < n; i++) {
+        long v = i * k;
+        __asm__ volatile("" : : "r"(v) : "memory");
+    }
+}
+void products_rm(long n, long k) {
+    for (long i = 0; i < n; i++) {
+        long v = i * k;
+        __asm__ volatile("" : : "r,m"(v) : "memory");
+    }
+}
+void products_g(long n, long k) {
+    for (long i = 0; i < n; i++) {
+        long v = i * k;
+        __asm__ volatile("" : : "g"(v) : "memory");
+    }
+}
+EOF
+# Functions of LISTING whose body has no line matching the multiply PATTERN.
+missing_multiply() {
+    python3 - "$1" "$2" <<'PY'
+import re, sys
+path, pattern = sys.argv[1], sys.argv[2]
+seen, current = {}, None
+for line in open(path, errors="replace"):
+    text = line.strip()
+    m = re.match(r"^(products\w*):$", text)
+    if m:
+        current = m.group(1)
+        seen[current] = False
+        continue
+    if text.startswith(".size"):
+        current = None
+    elif current and re.search(pattern, text):
+        seen[current] = True
+names = ("products", "products_barrier_data", "products_rm", "products_g")
+print(" ".join(n for n in names if not seen.get(n)))
+PY
+}
+cc_dir=$(dirname "$CC")
+for target in "x86-64|$CC|" "i686|$CC|-m32" "aarch64|$cc_dir/lccc-arm|" "riscv64|$cc_dir/lccc-riscv|"; do
+    IFS='|' read -r name driver flag <<<"$target"
+    case "$name" in
+    x86-64 | i686) pattern='\bimul' ;;
+    aarch64) pattern='\bmul\b' ;;
+    riscv64) pattern='\bmul\b' ;;
+    esac
+    if [ ! -x "$driver" ]; then
+        note_fail "$name: compiler driver $driver missing"
+        continue
+    fi
+    for level in -O1 -O2; do
+        # shellcheck disable=SC2086 # $flag is empty or one word
+        if ! "$driver" $flag "$level" -S "$tmp/inputs.c" -o "$tmp/inputs_$name.s" 2>"$tmp/err.txt"; then
+            note_fail "$name $level: compiles the input fixture: $(tail -1 "$tmp/err.txt")"
+            continue
+        fi
+        missing=$(missing_multiply "$tmp/inputs_$name.s" "$pattern")
+        if [ -z "$missing" ]; then
+            note_pass "$name $level: every empty-template register input is computed"
+        else
+            note_fail "$name $level: input computation deleted in: $missing"
+        fi
+    done
+done
+cat >"$tmp/deleted.s" <<'EOF'
+products:
+    movq %rdi, %rbx
+    imulq %r12, %rax
+.size products, .-products
+products_barrier_data:
+    addq $1, %r13
+.size products_barrier_data, .-products_barrier_data
+EOF
+if [ "$(missing_multiply "$tmp/deleted.s" '\bimul')" = "products_barrier_data products_rm products_g" ]; then
+    note_pass "self-test: the checker names every function without its multiply"
+else
+    note_fail "self-test: the checker misses a deleted multiply"
 fi
 
 echo

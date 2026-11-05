@@ -255,12 +255,22 @@ pub(super) fn find_dead_param_allocas(
                         || (crate::common::types::target_elf_machine()
                             == 62 // EM_X86_64 (elf::constants is private)
                             && crate::backend::regalloc::x86_param_caller_homes_safe_with_config(func, ra_config));
+                    // - on AArch64, a caller-saved GPR in any function: only
+                    //   the allocator's Phase 2p hands a parameter one --
+                    //   from `param_volatile_pool` (no incoming argument
+                    //   register) or the parameter's own argument register
+                    //   (`param_arrival_regs`), ParamRefs an entry prefix,
+                    //   never call-spanning -- and `emit_param_ref_impl`
+                    //   writes the argument register straight into it (in
+                    //   place when they are the same register).
+                    let a64 = crate::common::types::target_elf_machine() == 183;
                     let has_stable_home = reg_assigned
                         .get(&dest_id)
                         .map(|phys| {
                             callee_saved_regs.contains(phys)
                                 || phys.0 >= 20
                                 || (leaf && is_leaf_caller_gpr(*phys))
+                                || (a64 && (4..=15).contains(&phys.0))
                         })
                         .unwrap_or(false);
                     if has_stable_home {

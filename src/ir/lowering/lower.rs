@@ -518,14 +518,41 @@ impl Lowerer {
         self.target == Target::Riscv64
     }
 
-    /// Returns true if the target decomposes _Complex long double into 2 F128 scalar
-    /// components for function argument/parameter passing.
-    /// On ARM64 (AAPCS64): _Complex long double is an HFA passed in Q0/Q1 registers,
-    ///   so we decompose into 2 F128 values.
-    /// On x86-64: _Complex long double is passed on the stack (MEMORY class), not decomposed.
-    /// On RISC-V: _Complex long double is passed by reference (pointer), not decomposed.
-    pub(super) fn decomposes_complex_long_double(&self) -> bool {
-        self.target == Target::Aarch64
+    /// Whether a `_Complex` argument or parameter of type `ct` (`unnamed`:
+    /// passed through a variadic `...`) crosses the call boundary whole, as
+    /// the two-member aggregate every psABI makes of it, rather than as one
+    /// packed scalar.  Returns false for non-complex types.
+    ///
+    /// A complex is never split into two independent scalar arguments:
+    /// each psABI places both halves together or not at all, and the two
+    /// halves of a decomposed pair land apart once the register file runs
+    /// short -- `f(double x0, ..., double x6, _Complex double z)` put the
+    /// real part in d7 / fa7 / %xmm7 and the imaginary part on the stack
+    /// (AArch64) or in a0 (RV64), where GCC and Clang pass the whole value
+    /// on the stack (AArch64 C.3, which also closes the SIMD file; x86-64
+    /// `[SSE, SSE]` atomicity) or in a0/a1 (RV64 integer convention).
+    ///
+    /// - AArch64: every complex is a two-member HFA (`Hfa`, see
+    ///   `Lowerer::fp_agg_class`) -- named or not (Linux AAPCS64).
+    /// - RV64: a named float/double complex is "a struct containing two
+    ///   floating-point reals" (`TwoFloats`: an fa pair, else the integer
+    ///   convention); an unnamed `_Complex double` and every `_Complex long
+    ///   double` are integer-convention aggregates (GP pair / by reference).
+    ///   An unnamed `_Complex float` packs into ONE integer register.
+    /// - x86-64: `_Complex double` is a `[SSE, SSE]` record, `_Complex long
+    ///   double` COMPLEX_X87 (memory); `_Complex float` packs into ONE %xmm.
+    /// - i686: cdecl stack aggregates.
+    pub(super) fn complex_arg_is_aggregate(&self, ct: &CType, unnamed: bool) -> bool {
+        ct.is_complex() && !self.complex_arg_is_packed(ct, unnamed)
+    }
+
+    /// Whether a `_Complex float` argument travels as ONE 8-byte scalar
+    /// holding both halves: an F64 in one %xmm on x86-64, an I64 in one GP
+    /// register for an unnamed RV64 argument (`complex_arg_is_aggregate`).
+    pub(super) fn complex_arg_is_packed(&self, ct: &CType, unnamed: bool) -> bool {
+        matches!(ct, CType::ComplexFloat)
+            && (self.uses_packed_complex_float()
+                || (unnamed && self.packs_complex_float_variadic()))
     }
 
     /// Returns true if the target returns _Complex long double via register pairs
@@ -686,7 +713,7 @@ impl Lowerer {
                 struct_arg_sizes: vec![None],
                 struct_arg_aligns: vec![],
                 struct_arg_classes: Vec::new(),
-                struct_arg_riscv_float_classes: Vec::new(),
+                struct_arg_fp_agg_classes: Vec::new(),
                 struct_arg_is_f128_sse: Vec::new(),
                 is_sret: false,
                 calling_convention: crate::common::types::CallingConvention::Default,
@@ -1822,14 +1849,9 @@ impl Lowerer {
         };
 
         // Collect per-parameter struct sizes for by-value struct passing ABI.
-        // ComplexLongDouble is included as a struct on platforms that don't decompose it
-        // (x86-64, RISC-V) since it's passed like a struct (on stack / by reference).
-        // On i686, ComplexDouble (16 bytes) and ComplexFloat (8 bytes) are also passed
-        // as structs on the stack since they aren't decomposed into separate FP args.
+        // A complex parameter is a by-value aggregate unless it packs into
+        // one scalar (`complex_arg_is_aggregate`).
         // Transparent unions are excluded — they are passed as their first member.
-        let decomposes_cld = self.decomposes_complex_long_double();
-        let decomposes_cd = self.decomposes_complex_double();
-        let decomposes_cf = self.decomposes_complex_float();
         let param_struct_sizes: Vec<Option<usize>> = params
             .iter()
             .map(|p| {
@@ -1841,12 +1863,8 @@ impl Lowerer {
                 } else if ctype.is_vector() {
                     // Vector types are passed by value like structs
                     Some(self.sizeof_type(&p.type_spec))
-                } else if !decomposes_cld && matches!(ctype, CType::ComplexLongDouble) {
-                    Some(self.sizeof_type(&p.type_spec))
-                } else if !decomposes_cd && matches!(ctype, CType::ComplexDouble) {
-                    Some(CType::ComplexDouble.size())
-                } else if !decomposes_cf && matches!(ctype, CType::ComplexFloat) {
-                    Some(CType::ComplexFloat.size())
+                } else if self.complex_arg_is_aggregate(&ctype, false) {
+                    Some(ctype.size())
                 } else if matches!(ctype, CType::Float128) || ctype == CType::Decimal128 {
                     // _Float128 is passed as a 16-byte SSE-class value (SysV psABI).
                     Some(16)
@@ -1899,25 +1917,20 @@ impl Lowerer {
             })
             .collect();
 
-        // Compute RISC-V LP64D float field classification for struct params
-        let param_riscv_float_classes: Vec<Option<crate::common::types::RiscvFloatClass>> = params
+        // FP-register class of each by-value aggregate parameter (RISC-V
+        // LP64D flattening, AAPCS64 HFA/HVA/short vector).
+        let param_fp_agg_classes: Vec<Option<crate::common::types::FpAggClass>> = params
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                if param_struct_sizes.get(i).copied().flatten().is_some() {
-                    if let Some(layout) = self.get_struct_layout_for_type(&p.type_spec) {
-                        layout.classify_riscv_float_fields(&*self.types.borrow_struct_layouts())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+                param_struct_sizes.get(i).copied().flatten()?;
+                self.fp_agg_class(&self.type_spec_to_ctype(&p.type_spec), false)
             })
             .collect();
 
         let ret_x87_aggregate = ret_aggregate_abi.as_ref().is_some_and(|a| a.x87);
         let ret_x87_pair = ret_aggregate_abi.as_ref().is_some_and(|a| a.x87_pair);
+        let ret_fp_agg_class = ret_aggregate_abi.as_ref().and_then(|a| a.fp_agg);
         if !variadic || !param_tys.is_empty() {
             FuncSig {
                 return_type: ret_ty,
@@ -1930,11 +1943,12 @@ impl Lowerer {
                 two_reg_ret_size,
                 ret_eightbyte_classes: ret_eightbyte_classes.clone(),
                 ret_is_f128_sse,
+                ret_fp_agg_class,
                 ret_x87_aggregate,
                 ret_x87_pair,
                 param_struct_sizes,
                 param_struct_classes,
-                param_riscv_float_classes,
+                param_fp_agg_classes,
                 param_is_f128_sse: param_is_f128_sse.clone(),
             }
         } else {
@@ -1949,11 +1963,12 @@ impl Lowerer {
                 two_reg_ret_size,
                 ret_eightbyte_classes,
                 ret_is_f128_sse,
+                ret_fp_agg_class,
                 ret_x87_aggregate,
                 ret_x87_pair,
                 param_struct_sizes: Vec::new(),
                 param_struct_classes: Vec::new(),
-                param_riscv_float_classes: Vec::new(),
+                param_fp_agg_classes: Vec::new(),
                 param_is_f128_sse,
             }
         }
@@ -2578,7 +2593,7 @@ impl Lowerer {
                     struct_arg_sizes: full_sizes,
                     struct_arg_aligns: full_aligns,
                     struct_arg_classes: full_classes,
-                    struct_arg_riscv_float_classes: Vec::new(),
+                    struct_arg_fp_agg_classes: Vec::new(),
                     struct_arg_is_f128_sse: full_f128,
                     is_sret: true,
                     calling_convention: crate::common::types::CallingConvention::Default,
@@ -2633,7 +2648,7 @@ impl Lowerer {
                 struct_arg_sizes,
                 struct_arg_aligns,
                 struct_arg_classes,
-                struct_arg_riscv_float_classes: Vec::new(),
+                struct_arg_fp_agg_classes: Vec::new(),
                 struct_arg_is_f128_sse: arg_is_f128,
                 is_sret: false,
                 calling_convention: crate::common::types::CallingConvention::Default,
@@ -3107,7 +3122,7 @@ impl Lowerer {
                 struct_arg_sizes: vec![None, None, None],
                 struct_arg_aligns: vec![None, None, None],
                 struct_arg_classes: vec![Vec::new(), Vec::new(), Vec::new()],
-                struct_arg_riscv_float_classes: Vec::new(),
+                struct_arg_fp_agg_classes: Vec::new(),
                 struct_arg_is_f128_sse: vec![false, false, false],
                 is_sret: false,
                 calling_convention: crate::common::types::CallingConvention::Default,
@@ -3150,7 +3165,7 @@ impl Lowerer {
                 struct_arg_sizes: vec![None, None, None],
                 struct_arg_aligns: vec![None, None, None],
                 struct_arg_classes: vec![Vec::new(), Vec::new(), Vec::new()],
-                struct_arg_riscv_float_classes: Vec::new(),
+                struct_arg_fp_agg_classes: Vec::new(),
                 struct_arg_is_f128_sse: vec![false, false, false],
                 is_sret: false,
                 calling_convention: crate::common::types::CallingConvention::Default,
@@ -3189,7 +3204,7 @@ impl Lowerer {
                 struct_arg_sizes: vec![None, None, None],
                 struct_arg_aligns: vec![None, None, None],
                 struct_arg_classes: vec![Vec::new(), Vec::new(), Vec::new()],
-                struct_arg_riscv_float_classes: Vec::new(),
+                struct_arg_fp_agg_classes: Vec::new(),
                 struct_arg_is_f128_sse: vec![false, false, false],
                 is_sret: false,
                 calling_convention: crate::common::types::CallingConvention::Default,

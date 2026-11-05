@@ -610,8 +610,25 @@ fn sets_second_fp(func: &IrFunction) -> (bool, bool) {
 fn live_return_regs(target: Target, func: &IrFunction) -> FxHashSet<&'static str> {
     let mut live = FxHashSet::default();
     let (sets_fp2, sets_f128_2) = sets_second_fp(func);
+    // Register-returned aggregates keep the sret shape in the IR, but the
+    // result leaves in vector/FP registers, not behind a returned address:
+    // `%ymm0`/`%zmm0` (`hidden_vector_return_bytes`), AAPCS64 v0..v3 or
+    // RISC-V fa0/fa1/a0 (`hidden_fp_agg_return`).
+    let fp_agg_return = crate::backend::call_abi::hidden_fp_agg_return(
+        func.uses_sret,
+        func.params.first().and_then(|p| p.fp_agg_class),
+    );
     match target {
         Target::X86_64 => {
+            if crate::backend::call_abi::hidden_vector_return_bytes(
+                func.uses_sret,
+                &func.ret_eightbyte_classes,
+            )
+            .is_some()
+            {
+                live.insert("xmm0");
+                return live;
+            }
             if func.uses_sret {
                 live.insert("rax");
                 return live;
@@ -705,6 +722,10 @@ fn live_return_regs(target: Target, func: &IrFunction) -> FxHashSet<&'static str
             }
         }
         Target::Aarch64 => {
+            if let Some((_, count)) = fp_agg_return.and_then(|class| class.hfa()) {
+                live.extend(["v0", "v1", "v2", "v3"].into_iter().take(count));
+                return live;
+            }
             // Note: on AAPCS64 sret passes the buffer address in x8; the caller
             // does NOT read x0 or x8 after return.
             if func.uses_sret || func.return_type == IrType::Void {
@@ -728,6 +749,18 @@ fn live_return_regs(target: Target, func: &IrFunction) -> FxHashSet<&'static str
             }
         }
         Target::Riscv64 => {
+            if let Some(class) = fp_agg_return {
+                use crate::common::types::FpAggClass;
+                match class {
+                    FpAggClass::OneFloat { .. } => live.extend(["fa0"]),
+                    FpAggClass::TwoFloats { .. } => live.extend(["fa0", "fa1"]),
+                    FpAggClass::FloatAndInt { .. } | FpAggClass::IntAndFloat { .. } => {
+                        live.extend(["fa0", "a0"])
+                    }
+                    FpAggClass::Hfa { .. } => {}
+                }
+                return live;
+            }
             if func.uses_sret || func.return_type == IrType::Void {
                 return live;
             }

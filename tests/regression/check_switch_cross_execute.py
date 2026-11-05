@@ -3,6 +3,9 @@
 
 Requires LCCC target drivers, Clang's integrated assembler, a GNU target linker or LLD (including Rust's bundled LLD), and QEMU user emulators. printf/puts are intentionally
 no-ops: every selected fixture checks its own result through main's exit code.
+The startup stub also supplies byte-loop memcpy/memset, which a freestanding
+compiler may call for aggregate copies and initializers (GCC, Clang and LCCC
+all do).
 No output comparison or target-performance claim is made by this smoke gate.
 
 Fixtures in LEVELS pin backend lowering, assembler and peephole contracts whose
@@ -28,6 +31,10 @@ FIXTURES = (
     "switch_i128_high_half", "switch_i128_wide_cases", "complex_float_return_cross",
     "divrem_pair_cross", "urem_by_one_cross", "va_arg_align16_cross",
     "overaligned_aggregate_arg_cross", "indirect_variadic_call_cross",
+    "callee_saved_return_paths_cross", "entry_copy_abi_reads_cross",
+    "asm_scalar_operand_classes_cross", "alias_copy_after_join_cross",
+    "predicate_inverted_signed_cmp_cross", "word_reload_sign_extension_cross",
+    "leaf_params_fp_domain_cross",
 )
 ALL_LEVELS = ("-O0", "-O1", "-O2", "-Os")
 LEVELS = {
@@ -48,17 +55,42 @@ LEVELS = {
     # Member/element/cast callees of variadic type classified as fixed calls
     # (RV64: unnamed doubles in FP registers that va_arg never reads).
     "indirect_variadic_call_cross": ALL_LEVELS,
+    # AArch64 -O1/-O2: an epilogue's callee-saved restore hoisted out of a
+    # "loop" whose backedge was a second path to the epilogue.
+    "callee_saved_return_paths_cross": ALL_LEVELS,
+    # RV64 -O1 and up: entry-copy coalescing renamed a callee-saved restore
+    # into the a0 that `ret` reads, and carried a value across an indirect
+    # call (`jalr ra, t2, 0`) in the argument register the call destroys.
+    "entry_copy_abi_reads_cross": ALL_LEVELS,
+    # AArch64 -O2: `"r"(double)` with an FP-register home was an internal
+    # compiler error; RISC-V -O1+: so was an `"f"` integer with a register home.
+    "asm_scalar_operand_classes_cross": ALL_LEVELS,
+    # AArch64 -O2/-Os: an address-alias rename carried `mov x8, x13` past a
+    # join that other paths reach with x8 holding another pointer.
+    "alias_copy_after_join_cross": ALL_LEVELS,
+    # RISC-V -O1+: `x < 0 ? 0u : 1u` materialized as an unsigned-typed signed
+    # compare: the operands were zero-extended, so negative x answered 1.
+    "predicate_inverted_signed_cmp_cross": ALL_LEVELS,
+    # RISC-V -O0: `sw t0; lw t0` was deleted as an identity once `lwu; sext.w`
+    # folded to `lw` -- a word reload sign-extends, so (int)0x8000_0000 came
+    # back zero-extended.
+    "word_reload_sign_extension_cross": ALL_LEVELS,
+    # AArch64: frameless leaves reading stack parameters at [sp], arrival
+    # homes for x4-x7 parameters, the x0 bounce that destroyed `k` in
+    # `double f(double d, int k)`, `fcsel` and register-to-register FP
+    # conversions.  RISC-V: narrow parameters in their psABI register form,
+    # the published argument extensions and the upper-word demand pass.
+    "leaf_params_fp_domain_cross": ALL_LEVELS,
 }
 # Two-unit psABI fixtures under interop/: `<name>_callee.c` and
 # `<name>_caller.c`, linked LCCC-with-LCCC and LCCC-with-Clang in both
 # directions.  A caller and a callee that merely agree with each other pass
 # the single-unit fixtures above while disagreeing with every other compiler.
-INTEROP = ("psabi_pair_interop", "psabi_float_interop")
+INTEROP = ("psabi_pair_interop", "psabi_float_interop", "psabi_hfa_interop", "psabi_wide_interop",
+           "psabi_byref_interop", "abi_dirty_upper_interop")
 INTEROP_LEVELS = ("-O0", "-O2")
 CLANG_FREESTANDING = ("-O2", "-ffreestanding", "-fno-builtin", "-fno-pic", "-fno-pie",
                       "-fno-stack-protector", "-nostdlibinc")
-# No linker relaxation for Clang's RV64 objects: the startup code sets no gp.
-CLANG_TARGET_FLAGS = {"aarch64": (), "riscv64": ("-mno-relax",)}
 CONTROL_PASSES = {
     "narrow_big_endian_cross": "byte_load",
     "join_store_forward_cross": "join_store_forward",
@@ -81,10 +113,35 @@ printf:
 puts:
  mov w0, #0
  ret
+.globl memcpy
+memcpy:
+ mov x3, x0
+1: cbz x2, 2f
+ ldrb w4, [x1], #1
+ strb w4, [x3], #1
+ sub x2, x2, #1
+ b 1b
+2: ret
+.globl memset
+memset:
+ mov x3, x0
+1: cbz x2, 2f
+ strb w1, [x3], #1
+ sub x2, x2, #1
+ b 1b
+2: ret
 """,
+    # gp is set up as crt1.o does: GNU ld relaxes an `auipc`/`addi` pair
+    # whose symbol lies within 2 KiB of `__global_pointer$` into a
+    # gp-relative `addi` (LLD does not by default), so an uninitialized gp
+    # faulted on the first small global a fixture touched.
     "riscv64": """.text
 .globl _start
 _start:
+ .option push
+ .option norelax
+ lla gp, __global_pointer$
+ .option pop
  call main
  li a7, 93
  ecall
@@ -97,6 +154,26 @@ printf:
 puts:
  li a0, 0
  ret
+.globl memcpy
+memcpy:
+ mv t0, a0
+1: beqz a2, 2f
+ lbu t1, 0(a1)
+ sb t1, 0(t0)
+ addi a1, a1, 1
+ addi t0, t0, 1
+ addi a2, a2, -1
+ j 1b
+2: ret
+.globl memset
+memset:
+ mv t0, a0
+1: beqz a2, 2f
+ sb a1, 0(t0)
+ addi t0, t0, 1
+ addi a2, a2, -1
+ j 1b
+2: ret
 """,
 }
 
@@ -127,7 +204,34 @@ def main():
     parser.add_argument("--clang", default=os.environ.get("CLANG", "clang-23"))
     parser.add_argument("--ld", help="optional GNU/LLD linker supporting both target emulations")
     parser.add_argument("--qemu-dir", type=Path, default=Path("/usr/bin"))
+    parser.add_argument("--only", action="append", metavar="FIXTURE",
+                        help="run only this fixture (repeatable; single-unit or interop name)")
+    parser.add_argument("--keep-going", action="store_true",
+                        help="run every contract and report each failure instead of stopping at the first")
     args = parser.parse_args()
+    known = set(FIXTURES) | set(INTEROP)
+    if args.only and (unknown := sorted(set(args.only) - known)):
+        parser.error(f"unknown fixture(s): {', '.join(unknown)}")
+    selected = set(args.only or known)
+    failures = []
+
+    def attempt(label, steps, env=None):
+        """Run each argv in `steps` in order; the first nonzero exit fails the contract."""
+        for step in steps:
+            status = subprocess.run(step, env=env, timeout=30).returncode
+            if status:
+                failures.append(f"{label}: {Path(step[0]).name} exited {status}")
+                print(f"FAIL {label} ({failures[-1].split(': ', 1)[1]})", flush=True)
+                if os.environ.get("GITHUB_ACTIONS") == "true":
+                    # An annotation is readable through the checks API when
+                    # the job log is not.
+                    print(f"::error title=Cross-target contract failed::{failures[-1]}", flush=True)
+                if not args.keep_going:
+                    raise SystemExit(1)
+                return False
+        print(f"PASS {label}", flush=True)
+        return True
+
     version = subprocess.check_output([args.clang, "-dumpversion"], text=True).strip()
     if version != "23.1.5":
         parser.error(f"Clang 23.1.5 required, found {version}")
@@ -145,7 +249,7 @@ def main():
             start.write_text(START[arch])
             startup = start.with_suffix(".o")
             subprocess.run([args.clang, target, "-c", str(start), "-o", str(startup)], check=True, timeout=30)
-            for fixture in FIXTURES:
+            for fixture in (f for f in FIXTURES if f in selected):
                 pass_name = CONTROL_PASSES.get(fixture, "switch_lut")
                 if fixture in LEVELS:
                     variants = [(level, None, level) for level in LEVELS[fixture]]
@@ -165,44 +269,47 @@ def main():
                     if fixture in LEVELS:
                         # LCCC's own assembler and ELF writer, as `-c` uses
                         # them by default: it once refused `and w2, w2, #-16`.
-                        subprocess.run([str(args.lccc_dir / driver), level, *include, "-c", source,
-                                        "-o", str(obj)], env=env, check=True, timeout=30)
+                        steps = [[str(args.lccc_dir / driver), level, *include, "-c", source,
+                                  "-o", str(obj)]]
                     else:
-                        subprocess.run([str(args.lccc_dir / driver), level, *include, "-S", source,
-                                        "-o", str(asm)], env=env, check=True, timeout=30)
-                        subprocess.run([args.clang, target, "-c", str(asm), "-o", str(obj)],
-                                       check=True, timeout=30)
-                    subprocess.run([*linker, "-m", emulation, "-static", "-e", "_start",
-                                    str(startup), str(obj), "-o", str(exe)], check=True, timeout=30)
-                    subprocess.run([str(args.qemu_dir / f"qemu-{arch}"), str(exe)],
-                                   check=True, timeout=30)
-                    count += 1
-                    print(f"PASS {arch} {fixture} {label}", flush=True)
+                        steps = [[str(args.lccc_dir / driver), level, *include, "-S", source,
+                                  "-o", str(asm)],
+                                 [args.clang, target, "-c", str(asm), "-o", str(obj)]]
+                    steps += [[*linker, "-m", emulation, "-static", "-e", "_start",
+                               str(startup), str(obj), "-o", str(exe)],
+                              [str(args.qemu_dir / f"qemu-{arch}"), str(exe)]]
+                    count += attempt(f"{arch} {fixture} {label}", steps, env)
             include = ["-isystem", str(Path(resource) / "include")]
-            clang_flags = [target, *CLANG_FREESTANDING, *CLANG_TARGET_FLAGS[arch], *include]
-            for fixture in INTEROP:
+            clang_flags = [target, *CLANG_FREESTANDING, *include]
+            for fixture in (f for f in INTEROP if f in selected):
                 base = ROOT / "tests/regression/interop" / fixture
                 units = {}
                 for unit in ("callee", "caller"):
                     source = str(base) + f"_{unit}.c"
                     units[unit, "clang"] = work / f"{unit}-clang.o"
+                    # Validates the fixture itself: Clang must accept it.
                     subprocess.run([args.clang, *clang_flags, "-c", source, "-o", str(units[unit, "clang"])],
                                    check=True, timeout=30)
                     for level in INTEROP_LEVELS:
                         units[unit, level] = work / f"{unit}-lccc{level}.o"
+                        units[unit, level].unlink(missing_ok=True)
                         subprocess.run([str(args.lccc_dir / driver), level, *include, "-c", source,
-                                        "-o", str(units[unit, level])], check=True, timeout=30)
+                                        "-o", str(units[unit, level])], timeout=30)
                 for level in INTEROP_LEVELS:
                     for callee, caller in (((level), (level)), ((level), "clang"), ("clang", (level))):
                         exe = work / "interop"
-                        subprocess.run([*linker, "-m", emulation, "-static", "-e", "_start", str(startup),
-                                        str(units["callee", callee]), str(units["caller", caller]),
-                                        "-o", str(exe)], check=True, timeout=30)
-                        subprocess.run([str(args.qemu_dir / f"qemu-{arch}"), str(exe)], check=True, timeout=30)
-                        count += 1
                         label = f"callee={'clang' if callee == 'clang' else 'lccc' + callee} " \
                                 f"caller={'clang' if caller == 'clang' else 'lccc' + caller}"
-                        print(f"PASS {arch} {fixture} {label}", flush=True)
+                        steps = [[*linker, "-m", emulation, "-static", "-e", "_start", str(startup),
+                                  str(units["callee", callee]), str(units["caller", caller]),
+                                  "-o", str(exe)],
+                                 [str(args.qemu_dir / f"qemu-{arch}"), str(exe)]]
+                        count += attempt(f"{arch} {fixture} {label}", steps)
+    if failures:
+        print(f"{len(failures)} cross-target execution contract(s) FAILED, {count} passed:")
+        for failure in failures:
+            print(f"  {failure}")
+        return 1
     print(f"{count} cross-target execution contracts passed")
     return 0
 

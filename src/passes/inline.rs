@@ -12,7 +12,7 @@
 use crate::common::asm_constraints::constraint_is_immediate_only;
 use crate::common::fx_hash::FxHashMap as FxInlineMap;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::common::types::{AddressSpace, EightbyteClass, IrType, RiscvFloatClass};
+use crate::common::types::{AddressSpace, EightbyteClass, FpAggClass, IrType};
 use crate::ir::reexports::{
     BasicBlock, BlockId, CallInfo, GlobalInit, Instruction, IrBinOp, IrConst, IrFunction, IrModule,
     Operand, Terminator, Value,
@@ -2821,7 +2821,7 @@ struct CallArgMeta {
     struct_arg_sizes: Vec<Option<usize>>,
     struct_arg_aligns: Vec<Option<usize>>,
     struct_arg_classes: Vec<Vec<EightbyteClass>>,
-    struct_arg_riscv_float_classes: Vec<Option<RiscvFloatClass>>,
+    struct_arg_fp_agg_classes: Vec<Option<FpAggClass>>,
     struct_arg_is_f128_sse: Vec<bool>,
 }
 
@@ -2832,7 +2832,7 @@ impl CallArgMeta {
             struct_arg_sizes: info.struct_arg_sizes.clone(),
             struct_arg_aligns: info.struct_arg_aligns.clone(),
             struct_arg_classes: info.struct_arg_classes.clone(),
-            struct_arg_riscv_float_classes: info.struct_arg_riscv_float_classes.clone(),
+            struct_arg_fp_agg_classes: info.struct_arg_fp_agg_classes.clone(),
             struct_arg_is_f128_sse: info.struct_arg_is_f128_sse.clone(),
         }
     }
@@ -2851,9 +2851,9 @@ impl CallArgMeta {
             struct_arg_classes: self.struct_arg_classes
                 [from.min(self.struct_arg_classes.len())..to.min(self.struct_arg_classes.len())]
                 .to_vec(),
-            struct_arg_riscv_float_classes: self.struct_arg_riscv_float_classes[from
-                .min(self.struct_arg_riscv_float_classes.len())
-                ..to.min(self.struct_arg_riscv_float_classes.len())]
+            struct_arg_fp_agg_classes: self.struct_arg_fp_agg_classes[from
+                .min(self.struct_arg_fp_agg_classes.len())
+                ..to.min(self.struct_arg_fp_agg_classes.len())]
                 .to_vec(),
             struct_arg_is_f128_sse: self.struct_arg_is_f128_sse[from
                 .min(self.struct_arg_is_f128_sse.len())
@@ -5920,9 +5920,9 @@ fn inline_call_site(
                                     &extra_meta.struct_arg_classes,
                                 );
                                 splice_slot(
-                                    &mut info.struct_arg_riscv_float_classes,
+                                    &mut info.struct_arg_fp_agg_classes,
                                     i,
-                                    &extra_meta.struct_arg_riscv_float_classes,
+                                    &extra_meta.struct_arg_fp_agg_classes,
                                 );
                                 splice_slot(
                                     &mut info.struct_arg_is_f128_sse,
@@ -6827,7 +6827,7 @@ fn remap_call_info(info: &CallInfo, vo: u32) -> CallInfo {
         struct_arg_sizes: info.struct_arg_sizes.clone(),
         struct_arg_aligns: info.struct_arg_aligns.clone(),
         struct_arg_classes: info.struct_arg_classes.clone(),
-        struct_arg_riscv_float_classes: info.struct_arg_riscv_float_classes.clone(),
+        struct_arg_fp_agg_classes: info.struct_arg_fp_agg_classes.clone(),
         // MUST be cloned, not cleared: an inlined _Float128 soft-float call
         // (e.g. __extenddftf2) keeps its single-XMM return convention and its
         // 16-byte XMM argument markers. Clearing them re-classified the
@@ -7013,12 +7013,14 @@ fn remap_instruction(inst: &Instruction, vo: u32, labels: &mut LabelMap) -> Inst
             size,
             align,
             eightbyte_classes,
+            fp_agg_class,
         } => Instruction::VaArgStruct {
             dest_ptr: remap_value(*dest_ptr, vo),
             va_list_ptr: remap_value(*va_list_ptr, vo),
             size: *size,
             align: *align,
             eightbyte_classes: eightbyte_classes.clone(),
+            fp_agg_class: *fp_agg_class,
         },
         Instruction::AtomicRmw {
             dest,
@@ -8632,7 +8634,7 @@ mod devirtualization_tests {
             param_align: None,
             struct_eightbyte_classes: Vec::new(),
             is_f128_sse: false,
-            riscv_float_class: None,
+            fp_agg_class: None,
         }
     }
 
@@ -8691,7 +8693,7 @@ mod devirtualization_tests {
                 struct_arg_sizes: vec![None],
                 struct_arg_aligns: vec![None],
                 struct_arg_classes: vec![Vec::new()],
-                struct_arg_riscv_float_classes: vec![None],
+                struct_arg_fp_agg_classes: vec![None],
                 struct_arg_is_f128_sse: vec![false],
                 ..CallInfo::default()
             },
@@ -9912,7 +9914,7 @@ mod extern_admission_tests {
                 struct_size: None,
                 struct_align: None,
                 struct_eightbyte_classes: Vec::new(),
-                riscv_float_class: None,
+                fp_agg_class: None,
                 is_f128_sse: false,
                 noalias: false,
                 param_align: None,
@@ -9962,7 +9964,7 @@ mod extern_admission_tests {
                         struct_arg_sizes: vec![None],
                         struct_arg_aligns: vec![None],
                         struct_arg_classes: vec![Vec::new()],
-                        struct_arg_riscv_float_classes: vec![None],
+                        struct_arg_fp_agg_classes: vec![None],
                         is_sret: false,
                         calling_convention: crate::common::types::CallingConvention::Default,
                         is_fastcall: false,
@@ -9982,7 +9984,7 @@ mod extern_admission_tests {
                         struct_arg_sizes: Vec::new(),
                         struct_arg_aligns: Vec::new(),
                         struct_arg_classes: Vec::new(),
-                        struct_arg_riscv_float_classes: Vec::new(),
+                        struct_arg_fp_agg_classes: Vec::new(),
                         is_sret: false,
                         calling_convention: crate::common::types::CallingConvention::Default,
                         is_fastcall: false,
@@ -10015,7 +10017,7 @@ mod extern_admission_tests {
                         struct_arg_sizes: vec![None],
                         struct_arg_aligns: vec![None],
                         struct_arg_classes: vec![Vec::new()],
-                        struct_arg_riscv_float_classes: vec![None],
+                        struct_arg_fp_agg_classes: vec![None],
                         is_sret: false,
                         calling_convention: crate::common::types::CallingConvention::Default,
                         is_fastcall: false,
@@ -10051,7 +10053,7 @@ mod extern_admission_tests {
             struct_size: None,
             struct_align: None,
             struct_eightbyte_classes: Vec::new(),
-            riscv_float_class: None,
+            fp_agg_class: None,
             is_f128_sse: false,
             noalias: false,
             param_align: None,
@@ -10075,7 +10077,7 @@ mod extern_admission_tests {
             struct_arg_sizes: vec![None; n],
             struct_arg_aligns: vec![None; n],
             struct_arg_classes: vec![Vec::new(); n],
-            struct_arg_riscv_float_classes: vec![None; n],
+            struct_arg_fp_agg_classes: vec![None; n],
             is_sret: false,
             calling_convention: crate::common::types::CallingConvention::Default,
             is_fastcall: false,
@@ -10992,7 +10994,7 @@ mod sroa_unlock_tests {
                 param_align: None,
                 struct_eightbyte_classes: vec![],
                 is_f128_sse: false,
-                riscv_float_class: None,
+                fp_agg_class: None,
             }],
             false,
         );
@@ -11065,7 +11067,7 @@ mod param_home_tests {
                 param_align: None,
                 struct_eightbyte_classes: Vec::new(),
                 is_f128_sse: false,
-                riscv_float_class: None,
+                fp_agg_class: None,
             }],
             false,
         );

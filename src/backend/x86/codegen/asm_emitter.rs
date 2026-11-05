@@ -503,6 +503,10 @@ impl InlineAsmEmitter for X86Codegen {
         let is_xmm = reg.starts_with("xmm");
 
         if is_xmm {
+            if let Some(carrier) = Self::xmm_scalar_carrier(ty) {
+                self.load_scalar_to_xmm(val, ty, carrier, reg);
+                return;
+            }
             // XMM register: use SSE/AVX load instructions
             match val {
                 Operand::Value(v) => {
@@ -512,8 +516,8 @@ impl InlineAsmEmitter for X86Codegen {
                             // Use movdqu (128-bit, unaligned-safe) for vector types,
                             // movss/movsd for scalar floats.
                             let load_instr = match ty {
-                                IrType::F32 => "movss",
-                                IrType::F64 => "movsd",
+                                IrType::F32 | IrType::D32 => "movss",
+                                IrType::F64 | IrType::D64 => "movsd",
                                 _ => "movdqu",
                             };
                             {
@@ -523,8 +527,8 @@ impl InlineAsmEmitter for X86Codegen {
                             }
                         } else {
                             let load_instr = match ty {
-                                IrType::F32 => "movss",
-                                IrType::F64 => "movsd",
+                                IrType::F32 | IrType::D32 => "movss",
+                                IrType::F64 | IrType::D64 => "movsd",
                                 _ => "movdqu",
                             };
                             {
@@ -697,8 +701,8 @@ impl InlineAsmEmitter for X86Codegen {
                 // Direct slot: the current value lives directly in this stack slot.
                 if is_xmm {
                     let load_instr = match ty {
-                        IrType::F32 => "movss",
-                        IrType::F64 => "movsd",
+                        IrType::F32 | IrType::D32 => "movss",
+                        IrType::F64 | IrType::D64 => "movsd",
                         _ => "movdqu",
                     };
                     {
@@ -719,8 +723,8 @@ impl InlineAsmEmitter for X86Codegen {
                 // Indirect slot: the slot contains a pointer to the live storage.
                 if is_xmm {
                     let load_instr = match ty {
-                        IrType::F32 => "movss",
-                        IrType::F64 => "movsd",
+                        IrType::F32 | IrType::D32 => "movss",
+                        IrType::F64 | IrType::D64 => "movsd",
                         _ => "movdqu",
                     };
                     let scratch = "rcx";
@@ -888,6 +892,43 @@ impl InlineAsmEmitter for X86Codegen {
         let reg = &op.reg;
         let ty = op.operand_type;
         let is_xmm = reg.starts_with("xmm");
+        if is_xmm
+            && Self::xmm_scalar_carrier(ty).is_some()
+            && !matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64)
+        {
+            // An integer in an SSE register (`"=x"(int)`): bridge it to a
+            // general register and store it exactly as an `"=r"` output of
+            // that type -- exact width into an alloca or through a pointer,
+            // zero-extended into a promoted value's 8-byte slot.  The SSE
+            // paths below move whole vectors (`movdqu`, 16 bytes), which
+            // overwrote the neighbouring frame slot or the pointee's
+            // neighbours.
+            let scratch = self.asm_output_scratch(all_output_regs, reg);
+            let preserve = all_output_regs.contains(&scratch.as_str());
+            if preserve {
+                self.state.out.emit_instr_reg("    pushq", &scratch);
+            }
+            if ty.size() <= 4 {
+                self.state.emit_fmt(format_args!(
+                    "    movd %{}, %{}",
+                    reg,
+                    Self::reg_to_32(&scratch)
+                ));
+            } else {
+                self.state
+                    .emit_fmt(format_args!("    movq %{}, %{}", reg, scratch));
+            }
+            let mut gp = op.clone();
+            gp.reg = scratch.clone();
+            gp.kind = AsmOperandKind::GpReg;
+            let mut taken: Vec<&str> = all_output_regs.to_vec();
+            taken.push(scratch.as_str());
+            self.store_output_from_reg(&gp, ptr, _constraint, &taken);
+            if preserve {
+                self.state.out.emit_instr_reg("    popq", &scratch);
+            }
+            return;
+        }
         if let Some(slot) = self.state.get_slot(ptr.0) {
             if is_xmm {
                 // XMM register: use SSE/AVX store instructions
@@ -897,8 +938,8 @@ impl InlineAsmEmitter for X86Codegen {
                     // (unaligned-safe since stack allocas may not be 16-byte aligned).
                     // Scalar floats use movss/movsd.
                     let store_instr = match ty {
-                        IrType::F32 => "movss",
-                        IrType::F64 => "movsd",
+                        IrType::F32 | IrType::D32 => "movss",
+                        IrType::F64 | IrType::D64 => "movsd",
                         _ => "movdqu",
                     };
                     {
@@ -908,8 +949,8 @@ impl InlineAsmEmitter for X86Codegen {
                     }
                 } else {
                     let store_instr = match ty {
-                        IrType::F32 => "movss",
-                        IrType::F64 => "movsd",
+                        IrType::F32 | IrType::D32 => "movss",
+                        IrType::F64 | IrType::D64 => "movsd",
                         _ => "movdqu",
                     };
                     let scratch = self.asm_output_scratch(all_output_regs, reg);
@@ -1026,6 +1067,77 @@ impl InlineAsmEmitter for X86Codegen {
 }
 
 impl X86Codegen {
+    /// The SSE scalar carrier of an `"x"`-class operand of type `ty`: the
+    /// type whose `movss`/`movsd`/`movd`/`movq` moves exactly the operand's
+    /// bytes.  Integers ride in the carrier of their width (GCC 16.2 accepts
+    /// `"x"` on 2-, 4- and 8-byte integers; a 1-byte one is a superset LCCC
+    /// shares with Clang).  `None` for vectors and 128-bit values, which move
+    /// the whole register.
+    fn xmm_scalar_carrier(ty: IrType) -> Option<IrType> {
+        match ty {
+            IrType::F32 | IrType::D32 => Some(IrType::F32),
+            IrType::F64 | IrType::D64 => Some(IrType::F64),
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32 => {
+                Some(IrType::F32)
+            }
+            IrType::I64 | IrType::U64 | IrType::Ptr => Some(IrType::F64),
+            _ => None,
+        }
+    }
+
+    /// Load a scalar `"x"` input (or the read half of a `"+x"` operand) into
+    /// `xmm`.
+    ///
+    /// Values go through the general SSE loader, which knows every home a
+    /// value can have -- an XMM register (FP allocation), a general register,
+    /// a frame slot, the accumulator cache.  The slot-only path this replaces
+    /// emitted nothing for a register-homed value: the synthetic input that
+    /// carries a `"+x"` operand's old value into the output's register was
+    /// never loaded at -O1 and up, so `asm("addsd %0, %0" : "+x"(v))` doubled
+    /// whatever the register held; and integers moved 16 bytes (`movdqu`)
+    /// out of 4- and 8-byte slots.  Constants come from the constant pool --
+    /// the old `movabsq` into %rax could overwrite an operand already loaded
+    /// there (`"a"(n), "x"(1.0)`).
+    fn load_scalar_to_xmm(&mut self, val: &Operand, ty: IrType, carrier: IrType, xmm: &str) {
+        let c = match val {
+            Operand::Value(_) => {
+                self.emit_fp_operand_to_xmm(val, carrier, xmm);
+                return;
+            }
+            Operand::Const(c) => c,
+        };
+        // Bits as the asm sees them.  A float operand's constant may arrive
+        // with an integer type after propagation (glibc's
+        // `divss_inline_asm(1.0f, 0.0f)`): it is converted, as before.
+        let bits = match (ty, c) {
+            (_, IrConst::D64(v)) => *v,
+            (_, IrConst::D32(v)) => *v as u64,
+            (IrType::F32, _) => (c.to_f64().unwrap_or(0.0) as f32).to_bits() as u64,
+            (IrType::F64, _) => c.to_f64().unwrap_or(0.0).to_bits(),
+            _ => {
+                let raw = c.to_i64().unwrap_or(0) as u64;
+                if carrier == IrType::F32 {
+                    raw & 0xffff_ffff
+                } else {
+                    raw
+                }
+            }
+        };
+        if bits == 0 {
+            self.state
+                .emit_fmt(format_args!("    pxor %{}, %{}", xmm, xmm));
+        } else {
+            let label = self.state.get_fp_const_label(bits);
+            let mov = if carrier == IrType::F32 {
+                "movd"
+            } else {
+                "movq"
+            };
+            self.state
+                .emit_fmt(format_args!("    {} {}(%rip), %{}", mov, label, xmm));
+        }
+    }
+
     /// Store one `=@cc<cond>` output operand.
     ///
     /// Three shapes, in the order the proof allows them:
@@ -1200,8 +1312,8 @@ impl X86Codegen {
         self.value_to_reg(ptr, &scratch);
         if reg.starts_with("xmm") {
             let store_instr = match ty {
-                IrType::F32 => "movss",
-                IrType::F64 => "movsd",
+                IrType::F32 | IrType::D32 => "movss",
+                IrType::F64 | IrType::D64 => "movsd",
                 _ => "movdqu",
             };
             self.state

@@ -3932,7 +3932,7 @@ impl X86Codegen {
                 continue;
             }
 
-            if let ParamClass::VectorReturnBuffer { .. } = class {
+            if let ParamClass::RegReturnBuffer { .. } = class {
                 // The hidden return pointer of a `%ymm0`/`%zmm0`-returned
                 // aggregate: no incoming register, its value is the address
                 // of the private frame buffer. Home it in the parameter's
@@ -4368,9 +4368,11 @@ impl X86Codegen {
                 | ParamClass::F128GpPair { .. }
                 | ParamClass::F128Stack { .. }
                 | ParamClass::StructSplitRegStack { .. }
+                // AAPCS64-only (`homogeneous_fp_aggregates`).
+                | ParamClass::StructHfaReg { .. }
                 | ParamClass::ZeroSizeSkip => {}
                 // Homed at the top of the loop (no incoming register).
-                ParamClass::VectorReturnBuffer { .. } => {}
+                ParamClass::RegReturnBuffer { .. } => {}
             }
         }
 
@@ -4673,7 +4675,7 @@ impl X86Codegen {
         let stack_base: i64 = if self.state.omit_frame_pointer { 8 } else { 16 };
 
         match class {
-            ParamClass::VectorReturnBuffer { .. } => {
+            ParamClass::RegReturnBuffer { .. } => {
                 // The hidden return pointer of a `%ymm0`/`%zmm0`-returned
                 // aggregate is the address of the private frame buffer.
                 self.emit_vector_ret_buffer_addr("rax");
@@ -5304,7 +5306,7 @@ mod incoming_byval_tests {
                 struct_align: Some(abi_align),
                 param_align: (object_align > abi_align).then_some(object_align),
                 struct_eightbyte_classes: vec![EightbyteClass::Memory],
-                riscv_float_class: None,
+                fp_agg_class: None,
                 is_f128_sse: false,
             }],
             false,

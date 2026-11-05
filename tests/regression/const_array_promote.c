@@ -337,6 +337,36 @@ __attribute__((noinline, used)) static int *leaky(void) {
     return a;
 }
 
+/* A9: a by-value parameter read, then overwritten by a constant tiling.
+ * The parameter's home is initialized by the prologue -- no IR store --
+ * so the reads ahead of the tiling see the ARGUMENT; promoting the home
+ * to the constant image made both hashes read it (found live: -O2/-O3
+ * returned 7 * hash({-1,...}) on every target).  AAPCS64 and RISC-V pass
+ * the 40-byte record by reference, SysV x86-64 on the stack. */
+struct big5 { long long a[5]; };
+NOINLINE static long long hash5(const struct big5 *b) {
+    long long h = 0;
+    for (int i = 0; i < 5; i++) h = h * 31 + b->a[i];
+    return h;
+}
+NOINLINE static long long a9(struct big5 b) {
+    long long before = hash5(&b);
+    for (int i = 0; i < 5; i++) b.a[i] = -1;
+    return before * 7 + hash5(&b);
+}
+static long long a9_ref(long long x) {
+    struct big5 ones = {{-1, -1, -1, -1, -1}};
+    return x * 7 + hash5(&ones);
+}
+
+/* A10: the same record read only AFTER its tiling: promotion is sound,
+ * and the result is the image alone. */
+NOINLINE static long long a10(struct big5 b) {
+    for (int i = 0; i < 5; i++) b.a[i] = 3 * i + 1;
+    return hash5(&b);
+}
+static long long a10_ref(void) { return (((1LL * 31 + 4) * 31 + 7) * 31 + 10) * 31 + 13; }
+
 /* ------------------------------------------------------------------ */
 
 static int fails = 0;
@@ -380,6 +410,13 @@ int main(void) {
     CHECK(a6(), a6_ref(), 15);
     CHECK(a7(0), a7_ref(0), 16);
     CHECK(a7(1), a7_ref(1), 17);
+    {
+        struct big5 arg = {{1, 2, 3, 4, 5}};
+        CHECK(a9(arg) == a9_ref(hash5(&arg)), 1, 18);
+        CHECK(a10(arg) == a10_ref(), 1, 19);
+        CHECK(arg.a[0] == 1 && arg.a[4] == 5, 1, 50); /* the caller's object */
+        h = h * 31 + (unsigned long long)a9(arg);
+    }
     /* Every start value of a1/a1b/a1c: the runtime store hits each index. */
     for (int k = 0; k < 4; k++) {
         CHECK(a1(k, 100 + k), a1_ref(k, 100 + k), 20 + k);

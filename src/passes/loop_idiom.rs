@@ -1504,7 +1504,7 @@ fn make_copy_call(
             struct_arg_sizes: vec![None, None, None],
             struct_arg_aligns: vec![None, None, None],
             struct_arg_classes: vec![Vec::new(), Vec::new(), Vec::new()],
-            struct_arg_riscv_float_classes: Vec::new(),
+            struct_arg_fp_agg_classes: Vec::new(),
             struct_arg_is_f128_sse: vec![false, false, false],
             is_sret: false,
             calling_convention: crate::common::types::CallingConvention::Default,
@@ -4397,7 +4397,7 @@ mod tests {
             param_align: None,
             struct_eightbyte_classes: Vec::new(),
             is_f128_sse: false,
-            riscv_float_class: None,
+            fp_agg_class: None,
         }
     }
     fn load(dest: u32, ptr: u32, ty: IrType) -> Instruction {
@@ -5328,7 +5328,7 @@ mod tests {
             param_align: None,
             struct_eightbyte_classes: Vec::new(),
             is_f128_sse: false,
-            riscv_float_class: None,
+            fp_agg_class: None,
         }
     }
 

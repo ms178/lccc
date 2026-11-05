@@ -87,7 +87,10 @@ if [ -x "$arm" ]; then
     cas=$(body "$td/arm.s" cas8)
     release=$(body "$td/arm.s" fence_release)
     grep -q 'sxtb x0, w0' <<<"$sub"
-    grep -q 'and w2, w2, #0xff' <<<"$cas"
+    # The expected value is masked to its byte in place, in whichever
+    # register holds it (`and wN, wN, #0xff`): the CAS loop compares the
+    # zero-extended `ldaxrb` result against it.
+    grep -Eq 'and (w[0-9]+), \1, #0xff' <<<"$cas"
     grep -q 'sxtb x0, w0' <<<"$cas"
     grep -q 'dmb ish' <<<"$release"
     ! grep -q 'dmb ishst' <<<"$release" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }

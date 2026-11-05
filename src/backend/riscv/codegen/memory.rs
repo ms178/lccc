@@ -318,20 +318,75 @@ impl RiscvCodegen {
         }
     }
 
+    /// Copy `size` bytes from t2 to t1 (t3/t4 scratch).  The IR carries no
+    /// alignment, and a misaligned `ld`/`sd` may trap into a slow emulation
+    /// path on RISC-V, so the doubleword copy is guarded by one runtime test
+    /// of both addresses -- passing for every record of pointer-sized
+    /// members and every frame slot -- with the byte loop as the fallback.
+    /// Up to 256 bytes the doublewords are unrolled; beyond that they loop.
+    /// A copy under 8 bytes is unrolled bytes, with no test at all.
     pub(super) fn emit_memcpy_impl_impl(&mut self, size: usize) {
+        if size < 8 {
+            for offset in 0..size {
+                self.state
+                    .emit_fmt(format_args!("    lbu t4, {}(t2)", offset));
+                self.state
+                    .emit_fmt(format_args!("    sb t4, {}(t1)", offset));
+            }
+            return;
+        }
         let label_id = self.state.next_label_id();
         let loop_label = format!(".Lmemcpy_loop_{}", label_id);
+        let bytes_label = format!(".Lmemcpy_bytes_{}", label_id);
         let done_label = format!(".Lmemcpy_done_{}", label_id);
+        self.state.emit("    or t3, t1, t2");
+        self.state.emit("    andi t3, t3, 7");
+        self.state
+            .emit_fmt(format_args!("    bnez t3, {}", bytes_label));
+        let dwords = size / 8;
+        let tail_base = if size <= 256 {
+            for k in 0..dwords {
+                self.state
+                    .emit_fmt(format_args!("    ld t4, {}(t2)", k * 8));
+                self.state
+                    .emit_fmt(format_args!("    sd t4, {}(t1)", k * 8));
+            }
+            dwords * 8
+        } else {
+            let dword_loop = format!(".Lmemcpy_dwords_{}", label_id);
+            self.state.emit_fmt(format_args!("    li t3, {}", dwords));
+            self.state.emit_fmt(format_args!("{}:", dword_loop));
+            self.state.emit("    ld t4, 0(t2)");
+            self.state.emit("    sd t4, 0(t1)");
+            self.state.emit("    addi t2, t2, 8");
+            self.state.emit("    addi t1, t1, 8");
+            self.state.emit("    addi t3, t3, -1");
+            self.state
+                .emit_fmt(format_args!("    bnez t3, {}", dword_loop));
+            0
+        };
+        // The 0-7 byte tail starts 8-byte aligned: each piece is aligned.
+        let mut offset = tail_base;
+        for (width, load, store) in [(4, "lw", "sw"), (2, "lh", "sh"), (1, "lbu", "sb")] {
+            if (size - dwords * 8) & width != 0 {
+                self.state
+                    .emit_fmt(format_args!("    {} t4, {}(t2)", load, offset));
+                self.state
+                    .emit_fmt(format_args!("    {} t4, {}(t1)", store, offset));
+                offset += width;
+            }
+        }
+        self.state.emit_fmt(format_args!("    j {}", done_label));
+        self.state.emit_fmt(format_args!("{}:", bytes_label));
         self.state.emit_fmt(format_args!("    li t3, {}", size));
         self.state.emit_fmt(format_args!("{}:", loop_label));
-        self.state
-            .emit_fmt(format_args!("    beqz t3, {}", done_label));
         self.state.emit("    lbu t4, 0(t2)");
         self.state.emit("    sb t4, 0(t1)");
         self.state.emit("    addi t1, t1, 1");
         self.state.emit("    addi t2, t2, 1");
         self.state.emit("    addi t3, t3, -1");
-        self.state.emit_fmt(format_args!("    j {}", loop_label));
+        self.state
+            .emit_fmt(format_args!("    bnez t3, {}", loop_label));
         self.state.emit_fmt(format_args!("{}:", done_label));
     }
 

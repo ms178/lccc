@@ -1796,6 +1796,12 @@ gate "tls-model-selection" fast \
 gate "switch-cross-execute" slow \
     python3 tests/regression/check_switch_cross_execute.py
 
+# The same two-unit psABI fixtures natively (x86-64, and i386 where the host
+# runs 32-bit programs), in both directions against GCC 16.
+gate "psabi-interop-native" fast \
+    env CCC=target/fastbuild/lccc GCC="${GCC16:-gcc-16}" \
+    bash tests/regression/check_psabi_interop_native.sh
+
 gate "tls-cross-models" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_tls_cross_models.sh
 
@@ -2044,6 +2050,12 @@ gate "cross-alu-abs-runtime" fast \
 # executed under qemu-riscv64 against a conforming RISC-V compiler.
 gate "riscv-psabi-narrow-args" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_riscv_psabi_narrow_args.sh
+
+# AArch64/RISC-V leaf, parameter and unwind shapes: arrival homes, frameless
+# leaves, W-view zero tests of narrow arguments and results, fcsel, the RISC-V
+# `sllw` bit set and unsigned pass-through, callee-saved/variadic CFI rows.
+gate "arm-riscv-leaf-contracts" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_arm_riscv_leaf_contracts.sh
 
 # Single-bit selection: `x | 1 << n` is `bts`, `x & ~(1 << n)` is `btr` and
 # `(x & 1 << n) != 0` is `bt` (6/8/7 -> 3/3/4 instructions), selected by the

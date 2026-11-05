@@ -626,7 +626,7 @@ mod tests {
                 param_align: None,
                 struct_eightbyte_classes: Vec::new(),
                 is_f128_sse: false,
-                riscv_float_class: None,
+                fp_agg_class: None,
             }],
             false,
         );
@@ -911,7 +911,7 @@ mod tests {
                 param_align: None,
                 struct_eightbyte_classes: Vec::new(),
                 is_f128_sse: false,
-                riscv_float_class: None,
+                fp_agg_class: None,
             }],
             false,
         );
@@ -1224,7 +1224,7 @@ mod tests {
                 param_align: None,
                 struct_eightbyte_classes: Vec::new(),
                 is_f128_sse: false,
-                riscv_float_class: None,
+                fp_agg_class: None,
             }],
             false,
         );

@@ -9,6 +9,13 @@ use crate::ir::reexports::{Operand, Value};
 impl ArmCodegen {
     pub(super) fn emit_return_impl(&mut self, val: Option<&Operand>, frame_size: i64) {
         if let Some(val) = val {
+            // HFA/HVA/short-vector result: the IR returns the hidden buffer
+            // pointer; AAPCS64 wants the members in v0..v3.
+            if let Some((_, class)) = self.fp_ret_buffer {
+                self.emit_return_fp_agg(val, class);
+                self.emit_epilogue_and_ret_impl(frame_size);
+                return;
+            }
             let ret_ty = self.current_return_type;
             if ret_ty.is_long_double() {
                 self.emit_f128_operand_to_q0_full(val);
@@ -29,6 +36,21 @@ impl ArmCodegen {
                     return;
                 }
                 self.emit_f128_carrier_operand_to_q0(val);
+                self.emit_epilogue_and_ret_impl(frame_size);
+                return;
+            }
+            // A float or double already in an FP register goes straight to
+            // v0: through the accumulator it crossed the register files
+            // twice (`fmov x0, d16; fmov d0, x0`).
+            if matches!(ret_ty, IrType::F32 | IrType::F64)
+                && let Operand::Value(v) = val
+                && let Some(&reg) = self.reg_assignments.get(&v.0)
+                && super::emit::is_arm_fp_phys(reg)
+            {
+                let src = super::emit::arm_fp_name(reg, ret_ty);
+                let dst = if ret_ty == IrType::F32 { "s0" } else { "d0" };
+                self.state
+                    .emit_fmt(format_args!("    fmov {}, {}", dst, src));
                 self.emit_epilogue_and_ret_impl(frame_size);
                 return;
             }

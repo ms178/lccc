@@ -432,7 +432,12 @@ impl ArmCodegen {
             self.state.emit("    fmov d0, x0");
         }
         self.state.emit("    cnt v0.8b, v0.8b");
-        self.state.emit("    uaddlv h0, v0.8b");
+        // A masked byte occupies lane 0 alone, so `cnt` already left the
+        // whole count there and zeroes in lanes 1-7: the across-lanes sum
+        // (`uaddlv`, 3-4 cycles on Cortex-A76/Neoverse N1) adds nothing.
+        if !matches!(ty, IrType::I8 | IrType::U8) {
+            self.state.emit("    uaddlv h0, v0.8b");
+        }
         self.state.emit("    fmov w0, s0");
     }
 
@@ -442,8 +447,8 @@ impl ArmCodegen {
     /// shapes, by what the target has:
     ///
     /// * With SIMD, the population count is four instructions (`fmov`, `cnt`,
-    ///   `uaddlv`, `fmov`) and `and #1` is the fifth -- shorter than any fold,
-    ///   so parity stays the count's low bit there.
+    ///   `uaddlv`, `fmov`; a byte needs no `uaddlv`) and `and #1` is the last
+    ///   -- shorter than any fold, so parity stays the count's low bit there.
     /// * Without SIMD (the general-registers-only mode the kernel and
     ///   freestanding targets use) folding to a byte and then reading a table is
     ///   the short form.  Four `eor`s with successive shifts fold 64/32 bits

@@ -38,7 +38,6 @@ int main(void)
         abort();
     if (ops->v(3, 1.5, 2.5, 3.0) != 1.5 + 5.0 + 12.0 || (*ops->v)(1, 8.0) != 8.0)
         abort();
-#if HFA_CALLS
     if (p_sum(p) != 3.25 || f_sum(3, f) != 11.5)
         abort();
     if (ops->p(p) != 3.25 || ops->f(3, f) != 11.5)
@@ -47,8 +46,5 @@ int main(void)
         abort();
     if (ops->vp(2, p, q) != 3.25 + 16.0 || v_points(1, q) != 4.0)
         abort();
-#else
-    (void)p, (void)q, (void)f, (void)elems, (void)local;
-#endif
     return 0;
 }

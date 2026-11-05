@@ -8,6 +8,7 @@ pub(crate) mod emit;
 mod f128;
 mod float_ops;
 mod globals;
+mod hfa;
 mod i128_ops;
 mod inline_asm;
 mod intrinsics;

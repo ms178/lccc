@@ -896,7 +896,7 @@ impl X86Codegen {
         total_sp_adjust: i64,
         _f128_temp_space: usize,
         _stack_arg_space: usize,
-        _struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
+        _struct_arg_fp_agg_classes: &[Option<crate::common::types::FpAggClass>],
     ) {
         // Stack args (Phase 2) may have adjusted rsp. Temporarily increase
         // the RSP frame size so rbp-to-rsp offset conversion is correct
@@ -2087,7 +2087,7 @@ impl X86Codegen {
             &info.struct_arg_sizes,
             &info.struct_arg_aligns,
             &info.struct_arg_classes,
-            &info.struct_arg_riscv_float_classes,
+            &info.struct_arg_fp_agg_classes,
             &info.struct_arg_is_f128_sse,
             info.is_variadic.then_some(info.num_fixed_args),
             &config,

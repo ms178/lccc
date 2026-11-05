@@ -1373,7 +1373,7 @@ impl I686Codegen {
             // CoreArgClass::StructXmmReg -> ParamClass::F128SseReg). Nothing
             // in the prologue uses an XMM register, so the store can sit in
             // parameter order; the parameter object is its 16-byte alloca.
-            if let ParamClass::VectorReturnBuffer { .. } = class {
+            if let ParamClass::RegReturnBuffer { .. } = class {
                 if let Some(slot) =
                     find_param_alloca(func, i).and_then(|(dest, _)| self.state.get_slot(dest.0))
                 {
@@ -1922,7 +1922,7 @@ impl I686Codegen {
                     );
                     return;
                 }
-                ParamClass::VectorReturnBuffer { .. } => {
+                ParamClass::RegReturnBuffer { .. } => {
                     let source = self.slot_ref(StackSlot(self.vector_ret_buffer_offset));
                     emit!(self.state, "    leal {}, %eax", source);
                     self.store_eax_to(dest);

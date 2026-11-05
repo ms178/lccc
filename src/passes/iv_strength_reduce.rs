@@ -3951,7 +3951,7 @@ mod tests {
                 param_align: None,
                 struct_eightbyte_classes: Vec::new(),
                 is_f128_sse: false,
-                riscv_float_class: None,
+                fp_agg_class: None,
             }]
         };
         let mut f = IrFunction::new("desc_address_add".into(), IrType::I64, params, false);

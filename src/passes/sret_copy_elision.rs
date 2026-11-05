@@ -903,7 +903,7 @@ mod tests {
                 struct_arg_sizes: vec![None, None],
                 struct_arg_aligns: vec![None, None],
                 struct_arg_classes: vec![vec![], vec![]],
-                struct_arg_riscv_float_classes: vec![None, None],
+                struct_arg_fp_agg_classes: vec![None, None],
                 struct_arg_is_f128_sse: vec![false, false],
                 ret_is_f128_sse: false,
                 is_sret: true,
@@ -930,7 +930,7 @@ mod tests {
             info.struct_arg_sizes = vec![None];
             info.struct_arg_aligns = vec![None];
             info.struct_arg_classes = vec![vec![]];
-            info.struct_arg_riscv_float_classes = vec![None];
+            info.struct_arg_fp_agg_classes = vec![None];
             info.struct_arg_is_f128_sse = vec![false];
         }
         inst

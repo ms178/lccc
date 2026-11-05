@@ -1178,7 +1178,7 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
         struct_arg_sizes: &[Option<usize>],
         struct_arg_aligns: &[Option<usize>],
         struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
-        struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
+        struct_arg_fp_agg_classes: &[Option<crate::common::types::FpAggClass>],
         struct_arg_is_f128_sse: &[bool],
         is_sret: bool,
         calling_convention: crate::common::types::CallingConvention,
@@ -1219,7 +1219,17 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
         // after the call (`emit_call_store_vector_return`).
         let vector_return_bytes =
             hidden_vector_return_bytes(is_sret, ret_eightbyte_classes).filter(|_| !args.is_empty());
-        let skip = usize::from(vector_return_bytes.is_some());
+        // AAPCS64 HFA / RISC-V float-struct result: the same buffer shape,
+        // the class riding on the hidden pointer (`hidden_fp_agg_return`).
+        // The pointer takes no register -- not x8, not a0 -- and the result
+        // registers are stored through it after the call
+        // (`emit_call_store_fp_agg_return`).
+        let fp_agg_return = hidden_fp_agg_return(
+            is_sret,
+            struct_arg_fp_agg_classes.first().copied().flatten(),
+        )
+        .filter(|_| !args.is_empty() && vector_return_bytes.is_none());
+        let skip = usize::from(vector_return_bytes.is_some() || fp_agg_return.is_some());
         // psABI §3.2.3 (x86-64): an unnamed `__m256`/`__m512` argument of a
         // variadic call is MEMORY -- the register save area has no room for
         // the upper lanes -- while a named one still rides in a vector
@@ -1257,7 +1267,7 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
             struct_arg_sizes.get(skip..).unwrap_or(&[]),
             struct_arg_aligns.get(skip..).unwrap_or(&[]),
             struct_arg_classes.get(skip..).unwrap_or(&[]),
-            struct_arg_riscv_float_classes.get(skip..).unwrap_or(&[]),
+            struct_arg_fp_agg_classes.get(skip..).unwrap_or(&[]),
             struct_arg_is_f128_sse.get(skip..).unwrap_or(&[]),
             is_variadic.then(|| num_fixed_args.saturating_sub(skip)),
             &config,
@@ -1274,56 +1284,57 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
         // Additionally, since the sret pointer freed up a GP register slot (the
         // classification used one for sret that actually goes in x8), promote
         // the first GP stack-overflow arg to use the freed register (x7).
-        let sret_operand = if is_sret && self.sret_uses_dedicated_reg() && !args.is_empty() {
-            arg_classes[0] = CallArgClass::ZeroSizeSkip;
-            // Find the max GP register index used after shifting, to know
-            // which register slot is now free for promotion.
-            let max_int_regs = config.max_int_regs; // 8 for ARM64
-            for cls in arg_classes.iter_mut().skip(1) {
-                match cls {
-                    CallArgClass::IntReg { reg_idx } if *reg_idx > 0 => {
-                        *reg_idx -= 1;
+        let sret_operand =
+            if is_sret && skip == 0 && self.sret_uses_dedicated_reg() && !args.is_empty() {
+                arg_classes[0] = CallArgClass::ZeroSizeSkip;
+                // Find the max GP register index used after shifting, to know
+                // which register slot is now free for promotion.
+                let max_int_regs = config.max_int_regs; // 8 for ARM64
+                for cls in arg_classes.iter_mut().skip(1) {
+                    match cls {
+                        CallArgClass::IntReg { reg_idx } if *reg_idx > 0 => {
+                            *reg_idx -= 1;
+                        }
+                        CallArgClass::I128RegPair { base_reg_idx } if *base_reg_idx > 0 => {
+                            *base_reg_idx -= 1;
+                        }
+                        CallArgClass::StructByValReg { base_reg_idx, .. } if *base_reg_idx > 0 => {
+                            *base_reg_idx -= 1;
+                        }
+                        _ => {}
                     }
-                    CallArgClass::I128RegPair { base_reg_idx } if *base_reg_idx > 0 => {
-                        *base_reg_idx -= 1;
-                    }
-                    CallArgClass::StructByValReg { base_reg_idx, .. } if *base_reg_idx > 0 => {
-                        *base_reg_idx -= 1;
-                    }
-                    _ => {}
                 }
-            }
-            // Promote the first single-register GP stack arg to the freed slot (max_int_regs - 1).
-            // The classification originally overflowed this arg because sret consumed a slot.
-            // IMPORTANT: Only promote non-float Stack args. Float args that overflowed from
-            // FP registers should stay on the stack, not be moved to a GP register.
-            let freed_reg = max_int_regs - 1; // x7
-            for i in 1..arg_classes.len() {
-                match &arg_classes[i] {
-                    CallArgClass::Stack => {
-                        // Check if this arg is a float type -- floats that overflowed
-                        // from FP registers must stay on the stack, not go in GP regs.
-                        let is_float = i < arg_types.len() && arg_types[i].is_float();
-                        if !is_float {
-                            arg_classes[i] = CallArgClass::IntReg { reg_idx: freed_reg };
+                // Promote the first single-register GP stack arg to the freed slot (max_int_regs - 1).
+                // The classification originally overflowed this arg because sret consumed a slot.
+                // IMPORTANT: Only promote non-float Stack args. Float args that overflowed from
+                // FP registers should stay on the stack, not be moved to a GP register.
+                let freed_reg = max_int_regs - 1; // x7
+                for i in 1..arg_classes.len() {
+                    match &arg_classes[i] {
+                        CallArgClass::Stack => {
+                            // Check if this arg is a float type -- floats that overflowed
+                            // from FP registers must stay on the stack, not go in GP regs.
+                            let is_float = i < arg_types.len() && arg_types[i].is_float();
+                            if !is_float {
+                                arg_classes[i] = CallArgClass::IntReg { reg_idx: freed_reg };
+                                break;
+                            }
+                        }
+                        CallArgClass::StructByValStack { size } if *size <= 8 => {
+                            let sz = *size;
+                            arg_classes[i] = CallArgClass::StructByValReg {
+                                base_reg_idx: freed_reg,
+                                size: sz,
+                            };
                             break;
                         }
+                        _ => {}
                     }
-                    CallArgClass::StructByValStack { size } if *size <= 8 => {
-                        let sz = *size;
-                        arg_classes[i] = CallArgClass::StructByValReg {
-                            base_reg_idx: freed_reg,
-                            size: sz,
-                        };
-                        break;
-                    }
-                    _ => {}
                 }
-            }
-            Some(&args[0])
-        } else {
-            None
-        };
+                Some(&args[0])
+            } else {
+                None
+            };
 
         // Phase 0: Spill indirect function pointer before any stack manipulation.
         let indirect = func_ptr.is_some() && direct_name.is_none();
@@ -1384,7 +1395,7 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
             total_sp_adjust,
             f128_temp_space,
             stack_arg_space,
-            struct_arg_riscv_float_classes,
+            struct_arg_fp_agg_classes,
         );
 
         // Phase 3.5: Set up sret pointer in dedicated register (x8 on AArch64).
@@ -1398,13 +1409,15 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
         // Phase 5: Clean up stack.
         // On i386 SysV, sret calls have the callee pop the hidden pointer with `ret $4`,
         // so we subtract those bytes from the caller's cleanup.
-        let callee_pops = self.callee_pops_bytes_for_sret(is_sret && vector_return_bytes.is_none());
+        let callee_pops = self.callee_pops_bytes_for_sret(is_sret && skip == 0);
         let effective_stack_cleanup = stack_arg_space.saturating_sub(callee_pops);
         self.emit_call_cleanup(effective_stack_cleanup, f128_temp_space, indirect);
 
         // Phase 6: Store return value.
         if let Some(bytes) = vector_return_bytes {
             self.emit_call_store_vector_return(&args[0], bytes, dest.as_ref());
+        } else if let Some(class) = fp_agg_return {
+            self.emit_call_store_fp_agg_return(&args[0], class, dest.as_ref());
         } else if let Some(dest) = dest {
             self.set_call_ret_eightbyte_classes(ret_eightbyte_classes);
             self.set_call_ret_is_f128_sse(ret_is_f128_sse);
@@ -1450,6 +1463,26 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
         debug_assert!(
             false,
             "{bytes}-byte vector-register aggregate return is an x86-64 convention"
+        );
+    }
+
+    /// Store an aggregate that came back in the FP (and integer) registers
+    /// of `class` -- an AAPCS64 HFA/HVA/short vector or a RISC-V flattened
+    /// float struct (`call_abi::hidden_fp_agg_return`) -- through the
+    /// caller's result buffer at `buffer` (the hidden argument 0 of the
+    /// sret-shaped call), then give `dest` that address.  Only the AArch64
+    /// and RISC-V lowerings produce such calls (`Lowerer::fp_agg_class` is
+    /// `None` elsewhere), so the default asserts that contract in debug
+    /// builds and emits nothing otherwise.
+    fn emit_call_store_fp_agg_return(
+        &mut self,
+        _buffer: &Operand,
+        class: crate::common::types::FpAggClass,
+        _dest: Option<&Value>,
+    ) {
+        debug_assert!(
+            false,
+            "FP-register aggregate return {class:?} is an AArch64/RISC-V convention"
         );
     }
 
@@ -1521,7 +1554,7 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
         total_sp_adjust: i64,
         f128_temp_space: usize,
         stack_arg_space: usize,
-        struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
+        struct_arg_fp_agg_classes: &[Option<crate::common::types::FpAggClass>],
     );
 
     /// Emit the call/bl/jalr instruction.
@@ -1951,6 +1984,29 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
         align: usize,
         _eightbyte_classes: &[crate::common::types::EightbyteClass],
     ) {
+        self.emit_va_arg_struct(dest_ptr, va_list_ptr, size, align);
+    }
+
+    /// Emit va_arg for an AAPCS64 homogeneous aggregate (HFA / HVA / short
+    /// vector) of `count` members of `member_size` bytes, `size` bytes in
+    /// memory, stack-aligned to `align`: the members come from the SIMD
+    /// register save area when `count` slots remain, else the whole object
+    /// from the stack.  Only AArch64 classifies such aggregates
+    /// (`VaArgStruct::fp_agg_class`).
+    fn emit_va_arg_hfa(
+        &mut self,
+        dest_ptr: &Value,
+        va_list_ptr: &Value,
+        size: usize,
+        align: usize,
+        member_size: usize,
+        count: usize,
+    ) {
+        debug_assert!(
+            false,
+            "homogeneous aggregate va_arg on a target without SIMD-register aggregates"
+        );
+        let _ = (member_size, count);
         self.emit_va_arg_struct(dest_ptr, va_list_ptr, size, align);
     }
 

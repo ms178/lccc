@@ -7,6 +7,7 @@ mod comparison;
 pub(crate) mod emit;
 mod f128;
 mod float_ops;
+mod fp_agg;
 mod globals;
 mod i128_ops;
 mod inline_asm;

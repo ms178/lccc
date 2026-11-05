@@ -562,11 +562,13 @@ pub struct IrParam {
     pub struct_eightbyte_classes: Vec<crate::common::types::EightbyteClass>,
     /// True for _Float128 params: ONE 16-byte XMM register.
     pub is_f128_sse: bool,
-    /// RISC-V LP64D float field classification for struct params.
-    /// When Some, indicates this struct should use FP registers per the psABI
-    /// hardware floating-point calling convention. None for non-struct params
-    /// or structs that don't qualify for FP register passing.
-    pub riscv_float_class: Option<crate::common::types::RiscvFloatClass>,
+    /// FP-register class of a by-value aggregate parameter (RISC-V LP64D
+    /// flattening or an AAPCS64 HFA/HVA; see `FpAggClass`).  None for
+    /// non-aggregate parameters and aggregates that use the integer or
+    /// memory convention.  On the hidden return pointer of a function whose
+    /// aggregate result comes back in FP registers it is the class of the
+    /// RESULT (see `backend::call_abi::hidden_fp_agg_return`).
+    pub fp_agg_class: Option<crate::common::types::FpAggClass>,
 }
 
 impl IrModule {

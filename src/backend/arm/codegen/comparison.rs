@@ -1,9 +1,10 @@
 //! ArmCodegen: comparison operations.
 
 use super::emit::{
-    ArmCodegen, arm_int_cond_code, arm_invert_cond_code, callee_saved_name, callee_saved_name_32,
-    is_arm_fp_phys,
+    ArmCodegen, arm_fp_name, arm_int_cond_code, arm_invert_cond_code, callee_saved_name,
+    callee_saved_name_32, is_arm_fp_phys,
 };
+use crate::backend::regalloc::PhysReg;
 use crate::common::types::IrType;
 use crate::ir::reexports::{IrCmpOp, Operand, Value};
 
@@ -234,37 +235,16 @@ impl ArmCodegen {
         // fused-select helper). Staging every arm through x0/x1/x2 added ~5
         // moves per if-converted diamond. Reuse `select_arm_reg` so the
         // fused and unfused paths cannot drift.
+        if self.fp_select_profitable(dest, true_val, false_val, ty) {
+            let (t_name, f_name) = self.fp_select_arms(true_val, false_val, ty);
+            self.emit_select_cond_cmp(cond);
+            self.emit_fcsel_result(dest, &t_name, &f_name, ty, "ne");
+            return;
+        }
         let use_32bit = ty.size() <= 4;
         let f_name = self.select_arm_reg(false_val, "x1", use_32bit);
         let t_name = self.select_arm_reg(true_val, "x2", use_32bit);
-        // Compare the condition in place. A 32-bit producer zero-extends into
-        // the X register on A64, so a 64-bit `cmp Rn, #0` is width-correct.
-        match cond {
-            Operand::Value(v) => {
-                if let Some(phys) = self
-                    .reg_assignments
-                    .get(&v.0)
-                    .copied()
-                    .filter(|r| !is_arm_fp_phys(*r))
-                {
-                    let c = if self.conditional_increment_leaf
-                        && self.conditional_increment_leaf_condition_32
-                    {
-                        callee_saved_name_32(phys)
-                    } else {
-                        callee_saved_name(phys)
-                    };
-                    self.state.emit_fmt(format_args!("    cmp {}, #0", c));
-                } else {
-                    self.operand_to_x0(cond);
-                    self.state.emit("    cmp x0, #0");
-                }
-            }
-            _ => {
-                self.operand_to_x0(cond);
-                self.state.emit("    cmp x0, #0");
-            }
-        }
+        self.emit_select_cond_cmp(cond);
         if let Some(dp) = self.dest_reg(dest).filter(|r| !is_arm_fp_phys(*r)) {
             let d = if use_32bit {
                 callee_saved_name_32(dp)
@@ -288,6 +268,126 @@ impl ArmCodegen {
         self.state.reg_cache.invalidate_acc();
     }
 
+    /// Set Z from "`cond` == 0" for a Select on a materialized boolean. A
+    /// condition in its GP home is tested in place; the test reads exactly
+    /// the condition's width (`cond_is_w_view`, `emit_zero_test_reg`).
+    fn emit_select_cond_cmp(&mut self, cond: &Operand) {
+        self.emit_zero_test(cond);
+    }
+
+    #[cfg(test)]
+    pub(super) fn emit_select_cond_cmp_for_test(&mut self, cond: &Operand) {
+        self.emit_select_cond_cmp(cond);
+    }
+
+    /// Set Z from "`cond` == 0", reading exactly the condition's width.
+    fn emit_zero_test(&mut self, cond: &Operand) {
+        if let Some(phys) = self.operand_reg(cond).filter(|r| !is_arm_fp_phys(*r)) {
+            self.emit_zero_test_reg(cond, phys);
+        } else {
+            let w_view = self.cond_is_w_view(cond);
+            self.operand_to_x0(cond);
+            self.state.emit(if w_view {
+                "    cmp w0, #0"
+            } else {
+                "    cmp x0, #0"
+            });
+        }
+    }
+
+    /// The width-exact zero test of `cond` held in GP register `phys`. The
+    /// fixed conditional-increment leaf keeps a parameter condition in its
+    /// ABI register, where no ParamRef canonicalized it: AAPCS64 leaves every
+    /// bit above the argument's width unspecified, so an 8- or 16-bit
+    /// condition is masked by `tst` (Z is all the `cinc`/`csel` condition
+    /// reads). Every other condition is canonical in its W view when it is
+    /// 32 bits wide or narrower.
+    fn emit_zero_test_reg(&mut self, cond: &Operand, phys: PhysReg) {
+        let bytes = if self.conditional_increment_leaf {
+            self.conditional_increment_leaf_condition_bytes
+        } else if self.cond_is_w_view(cond) {
+            4
+        } else {
+            8
+        };
+        let (x, w) = (callee_saved_name(phys), callee_saved_name_32(phys));
+        match bytes {
+            1 => self.state.emit_fmt(format_args!("    tst {}, #0xff", w)),
+            2 => self.state.emit_fmt(format_args!("    tst {}, #0xffff", w)),
+            4 => self.state.emit_fmt(format_args!("    cmp {}, #0", w)),
+            _ => self.state.emit_fmt(format_args!("    cmp {}, #0", x)),
+        }
+    }
+
+    /// Whether a Select of `ty` belongs in the FP domain: at least two of the
+    /// result and the two arms live in FP registers. The `csel` form moves
+    /// each of those through a GP register -- `double pick(double a, double
+    /// b, int k) { return k ? a : b; }` was `fmov x1, d17; fmov x2, d16;
+    /// cmp x4, #0; csel x0, x2, x1, ne; fmov d18, x0` -- where `fcsel` reads
+    /// and writes them in place. With fewer FP homes the GP form is no longer.
+    fn fp_select_profitable(
+        &self,
+        dest: &Value,
+        true_val: &Operand,
+        false_val: &Operand,
+        ty: IrType,
+    ) -> bool {
+        if !matches!(ty, IrType::F32 | IrType::F64) {
+            return false;
+        }
+        let fp = |r: Option<PhysReg>| r.is_some_and(is_arm_fp_phys);
+        [
+            fp(self.dest_reg(dest)),
+            fp(self.operand_reg(true_val)),
+            fp(self.operand_reg(false_val)),
+        ]
+        .into_iter()
+        .filter(|&b| b)
+        .count()
+            >= 2
+    }
+
+    /// The arms of an FP-domain Select as FP register names: a home in
+    /// place, anything else staged into the d0/d1 scratch (never allocation
+    /// homes). Staging never touches the flags, so it may follow the compare.
+    fn fp_select_arms(
+        &mut self,
+        true_val: &Operand,
+        false_val: &Operand,
+        ty: IrType,
+    ) -> (String, String) {
+        let (s0, s1) = if ty == IrType::F32 {
+            ("s0", "s1")
+        } else {
+            ("d0", "d1")
+        };
+        let f_name = self.float_operand_reg(false_val, ty, s0);
+        let t_name = self.float_operand_reg(true_val, ty, s1);
+        (t_name, f_name)
+    }
+
+    /// `fcsel` with the flags set (`cc` selects `t_name`), straight into an
+    /// FP home or through d0 to any other home.
+    fn emit_fcsel_result(
+        &mut self,
+        dest: &Value,
+        t_name: &str,
+        f_name: &str,
+        ty: IrType,
+        cc: &str,
+    ) {
+        let target = match self.dest_reg(dest).filter(|r| is_arm_fp_phys(*r)) {
+            Some(phys) => arm_fp_name(phys, ty),
+            None if ty == IrType::F32 => "s0".to_string(),
+            None => "d0".to_string(),
+        };
+        self.state.emit_fmt(format_args!(
+            "    fcsel {}, {}, {}, {}",
+            target, t_name, f_name, cc
+        ));
+        self.store_float_reg(dest, ty, &target);
+    }
+
     /// Fused integer compare-and-select: `cmp lhs, rhs` + `csel dest, tv, fv, cc`.
     /// The Cmp's boolean result was used only by this select, so the cset
     /// materialization is skipped entirely. Register-allocated select arms are
@@ -306,6 +406,11 @@ impl ArmCodegen {
     ) {
         self.emit_int_cmp_insn(lhs, rhs, cmp_ty);
         let cc = arm_int_cond_code(op);
+        if self.fp_select_profitable(dest, true_val, false_val, sel_ty) {
+            let (t_name, f_name) = self.fp_select_arms(true_val, false_val, sel_ty);
+            self.emit_fcsel_result(dest, &t_name, &f_name, sel_ty, cc);
+            return;
+        }
         let use_32bit = sel_ty.size() <= 4;
 
         // Stage the select arms before the dest: x1/x2 scratch are never
@@ -347,33 +452,7 @@ impl ArmCodegen {
         increment_on_true: bool,
         ty: IrType,
     ) {
-        match cond {
-            Operand::Value(value) => {
-                if let Some(phys) = self
-                    .reg_assignments
-                    .get(&value.0)
-                    .copied()
-                    .filter(|reg| !is_arm_fp_phys(*reg))
-                {
-                    let condition_reg = if self.conditional_increment_leaf
-                        && self.conditional_increment_leaf_condition_32
-                    {
-                        callee_saved_name_32(phys)
-                    } else {
-                        callee_saved_name(phys)
-                    };
-                    self.state
-                        .emit_fmt(format_args!("    cmp {}, #0", condition_reg));
-                } else {
-                    self.operand_to_x0(cond);
-                    self.state.emit("    cmp x0, #0");
-                }
-            }
-            Operand::Const(_) => {
-                self.operand_to_x0(cond);
-                self.state.emit("    cmp x0, #0");
-            }
-        }
+        self.emit_zero_test(cond);
         // `ne` is the Select's true condition. CSINC increments when its own
         // condition is false, so increment-on-true uses `eq`.
         let csinc_cc = if increment_on_true { "eq" } else { "ne" };

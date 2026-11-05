@@ -568,14 +568,15 @@ fn foreign_constant_carriers_are_read_in_the_select_ring() {
             ty,
         ),
     ];
+    // The zero test is typed by the value it tests (the I32 parameter).
     assert!(expect_shape(
         fold_last(&code, &[]),
         Instruction::Cmp {
             dest: Value(3),
             op: IrCmpOp::Ne,
             lhs: v(1),
-            rhs: Operand::Const(IrConst::from_i64(0, ty)),
-            ty,
+            rhs: Operand::Const(IrConst::from_i64(0, IrType::I32)),
+            ty: IrType::I32,
         }
     ));
 }
@@ -653,6 +654,8 @@ fn same_width_signedness_alone_does_not_block_the_inversion() {
             IrType::I32,
         ),
     ];
+    // The comparison keeps its OPERANDS' type: backends extend the operands
+    // by it.
     assert!(expect_shape(
         fold_last(&code, &[(2, 1)]),
         Instruction::Cmp {
@@ -660,6 +663,39 @@ fn same_width_signedness_alone_does_not_block_the_inversion() {
             op: IrCmpOp::Ugt,
             lhs: v(0),
             rhs: v(1),
+            ty: IrType::U32,
+        }
+    ));
+}
+
+#[test]
+fn inverted_signed_comparison_keeps_its_signed_operand_type() {
+    // `x < 0 ? 0u : 1u`: restating the comparison at the select's U32 made
+    // RISC-V zero-extend x before a signed compare, so every negative x
+    // answered 1.
+    let code = vec![
+        cmp(
+            2,
+            IrCmpOp::Slt,
+            v(0),
+            Operand::Const(IrConst::from_i64(0, IrType::I32)),
+            IrType::I32,
+        ),
+        sel(
+            3,
+            v(2),
+            Operand::Const(IrConst::from_i64(0, IrType::U32)),
+            Operand::Const(IrConst::from_i64(1, IrType::U32)),
+            IrType::U32,
+        ),
+    ];
+    assert!(expect_shape(
+        fold_last(&code, &[(2, 1)]),
+        Instruction::Cmp {
+            dest: Value(3),
+            op: IrCmpOp::Sge,
+            lhs: v(0),
+            rhs: Operand::Const(IrConst::from_i64(0, IrType::I32)),
             ty: IrType::I32,
         }
     ));

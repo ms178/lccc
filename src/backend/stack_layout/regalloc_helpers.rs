@@ -557,20 +557,40 @@ pub fn run_regalloc_and_merge_clobbers_ipa(
             return_consumes_accumulator: crate::common::types::target_is_32bit(),
         }
     };
-    // x86-64 is the only backend that publishes an indirect-call target
-    // register (`%r10` = PhysReg(11)); it is also the backend whose
-    // caller-saved pool (r11/r10/r8/r9/rdi/rsi) is wide enough for a leaf's
-    // loop state. i686 (3 scratch registers, %eax/%ecx/%edx hazards) keeps
-    // the Phase-1 hot-loop promotion.
+    // A leaf's loop state belongs in the volatile pool first, as GCC, Clang
+    // and ICX allocate it: every callee-saved home costs a save/restore pair
+    // per call.  x86-64 (the backend that publishes an indirect-call target,
+    // `%r10` = PhysReg(11)) has r11/r10/r8/r9/rdi/rsi; AArch64 x4-x8/x13/x14
+    // (plus x9-x12/x15 in pure-ALU bodies); RISC-V a0-a7 whenever its
+    // caller pool is open at all.  The pools hold values only where the
+    // emitters' scratch use leaves them alone, which is a property of the
+    // register, not of the value, so loop values are as safe there as the
+    // temporaries already homed in them.  i686 (3 scratch registers,
+    // %eax/%ecx/%edx hazards) keeps the Phase-1 hot-loop promotion.
+    // Measured on AArch64 -O2 `sum`/`count_if`/`max` style leaves: the
+    // x19-x22 pairs (4 stp/ldp + frame) disappear with the loop bodies
+    // unchanged.
     let leaf_caller_saved_homes = !crate::common::types::target_is_32bit()
-        && indirect_target_regs.iter().any(|r| r.0 == 11)
-        && caller_saved_regs.len() >= 4;
+        && caller_saved_regs.len() >= 4
+        && (indirect_target_regs.iter().any(|r| r.0 == 11)
+            || matches!(crate::common::types::target_elf_machine(), 183 | 243));
+    let (param_volatile_pool, param_arrival_regs) =
+        if crate::common::types::target_elf_machine() == 183 {
+            (
+                aarch64_param_volatile_pool(func, &caller_saved_regs),
+                aarch64_param_arrival_regs(func, &caller_saved_regs),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
     let mut config = super::super::regalloc::RegAllocConfig {
         ipa_regs,
         available_regs,
         accumulator_policy,
         caller_saved_regs,
         leaf_caller_saved_homes,
+        param_volatile_pool,
+        param_arrival_regs,
         call_arg_regs,
         indirect_target_regs,
         allow_inline_asm_regalloc,
@@ -827,6 +847,128 @@ pub fn x86_vector_param_loads(func: &IrFunction) -> Vec<Option<(Value, usize)>> 
         }
     }
     out
+}
+
+/// AArch64: the caller-saved registers a parameter web may be homed in
+/// (`RegAllocConfig::param_volatile_pool`).
+///
+/// The ARM emitter copies each register parameter out of its argument
+/// register at its `ParamRef` (`emit_param_ref_impl`), one parameter after
+/// the other, so a home must never be a register some parameter still
+/// arrives in: the copy into it would destroy that parameter before its own
+/// `ParamRef` reads it. With `k` integer-class parameters those are
+/// x0..x{k-1} (AAPCS64 C.9: one register each, in order), plus x8 when the
+/// function receives a hidden result pointer. Only scalar parameter lists
+/// are modelled -- an aggregate, 128-bit or `_Float128` parameter takes a
+/// register pair, an alignment gap or a by-reference copy, and such a
+/// function keeps the callee-saved-only rule (empty pool). Variadic
+/// functions have no caller-saved pool at all.
+///
+/// The ParamRefs must also form the entry prefix (block 0, preceded only by
+/// allocas and other ParamRefs): a value born before a ParamRef could take
+/// one of these registers and the copy into it would run first.
+pub(crate) fn aarch64_param_volatile_pool(
+    func: &IrFunction,
+    caller_saved_regs: &[PhysReg],
+) -> Vec<PhysReg> {
+    let Some(arrival) = aarch64_scalar_param_arrivals(func, caller_saved_regs) else {
+        return Vec::new();
+    };
+    let int_params = arrival.iter().flatten().count();
+    let arrives_in = |r: u8| usize::from(r) < int_params || (r == 8 && func.uses_sret);
+    caller_saved_regs
+        .iter()
+        .copied()
+        .filter(|r| !arrives_in(r.0))
+        .collect()
+}
+
+/// AArch64: the parameters whose argument register is itself a pool
+/// register (x4-x7), keyed by their `ParamRef` destination
+/// (`RegAllocConfig::param_arrival_regs`); the conditions are those of
+/// [`aarch64_param_volatile_pool`], empty otherwise.
+///
+/// Such a parameter can stay where it arrives: its `ParamRef` then emits at
+/// most the in-place extension of a narrow argument (dropped by the peephole
+/// where the upper bits are unobservable), where a home from the volatile
+/// pool costs a copy (and the argument register, never a pool home for
+/// anyone else, idles). No other
+/// `ParamRef` writes the register (every home is either a volatile-pool
+/// register, which no parameter arrives in, or the parameter's own argument
+/// register), and nothing else is born before the last `ParamRef`.
+pub(crate) fn aarch64_param_arrival_regs(
+    func: &IrFunction,
+    caller_saved_regs: &[PhysReg],
+) -> Vec<(u32, PhysReg)> {
+    let Some(arrival) = aarch64_scalar_param_arrivals(func, caller_saved_regs) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for inst in func.blocks.first().map_or(&[][..], |b| &b.instructions[..]) {
+        if let Instruction::ParamRef {
+            dest, param_idx, ..
+        } = inst
+        {
+            if let Some(Some(r)) = arrival.get(*param_idx) {
+                let reg = PhysReg(*r);
+                if caller_saved_regs.contains(&reg) {
+                    out.push((dest.0, reg));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Each parameter's AArch64 integer argument register (`Some(n)` for xn,
+/// `None` for an FP-class or stack-passed one) when the function qualifies
+/// for parameter homes in the caller-saved pool: not variadic, a non-empty
+/// pool, every parameter a scalar integer, pointer, `float` or `double`
+/// (AAPCS64 C.9/C.1: the j-th integer-class parameter takes x{j} while
+/// j < 8), and the ParamRefs forming the entry prefix of block 0.
+fn aarch64_scalar_param_arrivals(
+    func: &IrFunction,
+    caller_saved_regs: &[PhysReg],
+) -> Option<Vec<Option<u8>>> {
+    if func.is_variadic || caller_saved_regs.is_empty() {
+        return None;
+    }
+    let mut prefix = true;
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::ParamRef { .. } if bi == 0 && prefix => {}
+                Instruction::ParamRef { .. } => return None,
+                Instruction::Alloca { .. } => {}
+                _ => prefix = false,
+            }
+        }
+        prefix = false;
+    }
+    let mut next_gpr = 0u8;
+    let mut arrival = Vec::with_capacity(func.params.len());
+    for p in &func.params {
+        if p.struct_size.is_some() || p.is_f128_sse || p.fp_agg_class.is_some() {
+            return None;
+        }
+        match p.ty {
+            IrType::I8
+            | IrType::U8
+            | IrType::I16
+            | IrType::U16
+            | IrType::I32
+            | IrType::U32
+            | IrType::I64
+            | IrType::U64
+            | IrType::Ptr => {
+                arrival.push((next_gpr < 8).then_some(next_gpr));
+                next_gpr = next_gpr.saturating_add(1);
+            }
+            IrType::F32 | IrType::F64 => arrival.push(None),
+            _ => return None,
+        }
+    }
+    Some(arrival)
 }
 
 #[cfg(test)]

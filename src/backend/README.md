@@ -940,7 +940,9 @@ primitive methods (each 1--5 instructions), organized into categories:
 - **Storing**: `f128_store_const_halves_to_slot`, `f128_store_arg1_to_slot`,
   `f128_copy_slot_to_slot`, `f128_copy_addr_reg_to_slot`,
   `f128_store_const_halves_to_addr`, `f128_store_acc_to_dest`,
-  `f128_store_result_and_truncate`.
+  `f128_publish_approximation` (the slot-less fallback of the provided
+  `f128_publish_result`, which stores a result to its slot without an f64
+  approximation).
 - **Argument marshalling**: `f128_move_arg1_to_arg2`,
   `f128_save_arg1_to_sp`, `f128_reload_arg1_from_sp`,
   `f128_move_acc_to_arg0`, `f128_move_arg0_to_acc`.

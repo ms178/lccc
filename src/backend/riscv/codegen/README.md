@@ -147,10 +147,10 @@ CallAbiConfig {
 ## Hardware Float Classification
 
 The RISC-V psABI defines special rules for passing small structs that contain
-floating-point fields. The `RiscvFloatClass` enum captures these cases:
+floating-point fields. The `FpAggClass` enum captures these cases:
 
 ```
-RiscvFloatClass
+FpAggClass
   OneFloat   { is_double }                             -- e.g., struct { float x; }
   TwoFloats  { lo_is_double, hi_is_double }            -- e.g., struct { float x; double y; }
   FloatAndInt { float_is_double, float_offset,          -- e.g., struct { double x; int y; }
@@ -172,7 +172,7 @@ When FP registers are exhausted, or the struct does not match any of these
 patterns, the struct falls back to GP-register or stack passing.
 
 The classification is computed by the frontend and attached to IR parameter
-metadata via the `riscv_float_class` field. The backend reads this during
+metadata via the `fp_agg_class` field. The backend reads this during
 both callee-side parameter storage (`emit_store_params`) and caller-side
 argument loading (`emit_call_reg_args`), using `flw`/`fld`/`fsw`/`fsd`
 instructions with the correct field offsets derived from the classification.

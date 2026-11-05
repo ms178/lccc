@@ -17,15 +17,9 @@
  *    convention, which is where the callee's va_arg reads them.
  *
  * AAPCS64 passes and returns a homogeneous floating-point aggregate (struct P,
- * struct F) in SIMD registers.  LCCC does not implement HFAs yet -- it uses
- * the general registers on both sides, consistently with itself but not
- * with GCC or Clang -- so the HFA calls run on RV64 only; struct DI is no
- * HFA and runs on both targets. */
-#if defined(__aarch64__)
-#define HFA_CALLS 0
-#else
-#define HFA_CALLS 1
-#endif
+ * struct F) in SIMD registers -- a named one, and an unnamed one too, which
+ * va_arg reads from the FP save area; struct DI is no HFA and uses the
+ * general registers (psabi_hfa_interop covers the HFA rules in depth). */
 struct P { double x, y; };
 struct F { float a, b; };
 struct DI { double d; long long i; };

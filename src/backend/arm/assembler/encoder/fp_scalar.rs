@@ -484,6 +484,31 @@ pub(crate) fn encode_fmadd_fmsub(
     Ok(EncodeResult::Word(word))
 }
 
+/// Encode FCSEL: Rd = cond ? Rn : Rm (floating-point conditional select).
+/// Format: 0 00 11110 ftype 1 Rm cond 11 Rn Rd -- `fcsel d0, d1, d2, ne` is
+/// 0x1e621c20 (GNU as 2.47).
+pub(crate) fn encode_fcsel(operands: &[Operand]) -> Result<EncodeResult, String> {
+    let (regs, letter) = fp_same_width(operands, 3, "fcsel")?;
+    let (rd, rn, rm) = (regs[0], regs[1], regs[2]);
+    let ftype = fp_ftype_letter(letter, "fcsel")?;
+    let cond = match operands.get(3) {
+        Some(Operand::Cond(c)) => encode_cond(c).ok_or("fcsel: invalid condition")?,
+        _ => return Err("fcsel requires a condition".to_string()),
+    };
+    if operands.len() != 4 {
+        return Err(format!("fcsel takes 4 operands, got {}", operands.len()));
+    }
+    let word = (0b00011110u32 << 24)
+        | (ftype << 22)
+        | (1 << 21)
+        | (rm << 16)
+        | (cond << 12)
+        | (0b11 << 10)
+        | (rn << 5)
+        | rd;
+    Ok(EncodeResult::Word(word))
+}
+
 /// Encode FNMADD/FNMSUB: Rd = -Ra +/- (Rn * Rm)
 /// Format: 0 00 11111 ftype 1 Rm o1 Ra Rn Rd
 pub(crate) fn encode_fnmadd_fnmsub(

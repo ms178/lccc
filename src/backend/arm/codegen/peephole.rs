@@ -677,7 +677,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed = false;
         changed |= eliminate_adjacent_store_load(&mut lines, &mut kinds, n);
         changed |= eliminate_redundant_branches(&lines, &mut kinds, n);
-        changed |= eliminate_self_moves(&mut kinds, n);
+        changed |= eliminate_self_moves(&lines, &mut kinds, n);
         changed |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
         changed |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
         changed |= eliminate_redundant_zext_and(&mut lines, &mut kinds, n);
@@ -687,7 +687,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= eliminate_move_chains(&mut lines, &mut kinds, n);
         changed |= fold_zext_move_chains(&mut lines, &mut kinds, n);
         changed |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
-        changed |= propagate_address_aliases(&mut lines, &mut kinds, n);
+        changed |= per_function(&mut lines, &mut kinds, n, propagate_address_aliases);
         if merge_blocks {
             changed |= merge_identical_blocks(&mut lines, &mut kinds, n);
         }
@@ -705,8 +705,12 @@ pub fn peephole_optimize(asm: String) -> String {
         // After the folds: dead staging movs (their patterns must win first).
         changed |= eliminate_overwritten_moves(&lines, &mut kinds, n);
         changed |= eliminate_overwritten_stores(&lines, &mut kinds, n);
+        // Last: every pattern pass above (chain folds, remat CSE, slot
+        // threading) matches the accumulator shapes these two rewrite.
+        changed |= per_function(&mut lines, &mut kinds, n, retarget_defs_into_copies);
+        changed |= per_function(&mut lines, &mut kinds, n, fold_cset_add_to_cinc);
         if rotate {
-            changed |= rotate_simple_loops(&mut lines, &mut kinds, n);
+            changed |= per_function(&mut lines, &mut kinds, n, rotate_simple_loops);
         }
         rounds += 1;
     }
@@ -738,7 +742,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 = false;
             changed2 |= eliminate_adjacent_store_load(&mut lines, &mut kinds, n);
             changed2 |= eliminate_redundant_branches(&lines, &mut kinds, n);
-            changed2 |= eliminate_self_moves(&mut kinds, n);
+            changed2 |= eliminate_self_moves(&lines, &mut kinds, n);
             changed2 |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
             changed2 |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
             changed2 |= eliminate_redundant_zext_and(&mut lines, &mut kinds, n);
@@ -748,7 +752,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_move_chains(&mut lines, &mut kinds, n);
             changed2 |= fold_zext_move_chains(&mut lines, &mut kinds, n);
             changed2 |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
-            changed2 |= propagate_address_aliases(&mut lines, &mut kinds, n);
+            changed2 |= per_function(&mut lines, &mut kinds, n, propagate_address_aliases);
             if merge_blocks {
                 changed2 |= merge_identical_blocks(&mut lines, &mut kinds, n);
             }
@@ -766,9 +770,13 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= fold_zero_stores(&mut lines, &mut kinds, n);
             changed2 |= eliminate_overwritten_moves(&lines, &mut kinds, n);
             changed2 |= eliminate_overwritten_stores(&lines, &mut kinds, n);
+            changed2 |= per_function(&mut lines, &mut kinds, n, retarget_defs_into_copies);
+            changed2 |= per_function(&mut lines, &mut kinds, n, fold_cset_add_to_cinc);
             rounds2 += 1;
         }
     }
+
+    drop_orphaned_save_rows(&lines, &mut kinds, n);
 
     // Put the protected lines back, in order, and keep every one of them: no
     // pass may delete or duplicate opaque code.  A placeholder count that no
@@ -793,6 +801,55 @@ pub fn peephole_optimize(asm: String) -> String {
     // Build result: kept lines, with the hidden `-g` rows put back.
     debug_assert_eq!(lines.len(), kinds.len());
     crate::backend::peephole_common::join_with_debug_rows(&lines, |i| kinds[i] != LineKind::Nop)
+}
+
+/// Drop each callee-saved `.cfi_offset` row whose save the passes deleted.
+///
+/// `emit_prologue_impl` emits `.cfi_offset REG, OFF` right after the store
+/// that saves REG. A pass that proves such a save dead (its restore renamed
+/// into a dead load by the entry coalescer and deleted, then the slot store
+/// removed) must take the row along: REG then keeps the caller's value for
+/// the whole function, the right unwind rule is "same value", and a stale row
+/// would make the unwinder load REG from a slot nothing wrote. A row survives
+/// exactly when the nearest preceding live instruction is a store naming REG.
+fn drop_orphaned_save_rows(lines: &[String], kinds: &mut [LineKind], n: usize) {
+    fn callee_saved(reg: &str) -> bool {
+        let num = |p: char| {
+            reg.strip_prefix(p)
+                .and_then(|d| d.parse::<u8>().ok().filter(|v| v.to_string() == d))
+        };
+        num('x').is_some_and(|r| (19..=28).contains(&r))
+            || num('d').is_some_and(|r| (8..=15).contains(&r))
+    }
+    let mut last: Option<usize> = None;
+    for i in 0..n {
+        match kinds[i] {
+            LineKind::Nop => {}
+            LineKind::Directive => {
+                let Some(rest) = lines[i].trim().strip_prefix(".cfi_offset") else {
+                    continue;
+                };
+                let reg = rest.split(',').next().unwrap_or("").trim();
+                if !callee_saved(reg) {
+                    continue;
+                }
+                let saved = last.is_some_and(|j| {
+                    let t = lines[j].trim();
+                    matches!(t.split_whitespace().next(), Some("str" | "stp" | "stur"))
+                        && t.split('[')
+                            .next()
+                            .unwrap_or("")
+                            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                            .any(|tok| tok == reg)
+                });
+                if !saved {
+                    kinds[i] = LineKind::Nop;
+                }
+            }
+            LineKind::Label => last = None,
+            _ => last = Some(i),
+        }
+    }
 }
 
 /// Propagate a register copy used only as a memory-address alias within one
@@ -831,22 +888,18 @@ fn is_function_boundary(line: &str) -> bool {
 /// in the loop body and dominates all readers) and is rejected everywhere it is
 /// not (a reader on a path that never ran the redefinition).
 struct Cfg {
+    /// Block of every line.
     block_of: Vec<usize>,
-    /// First line index of every block.
-    starts: Vec<usize>,
-    /// Label introducing a block; empty when the block starts without one.
-    labels: Vec<String>,
     succs: Vec<Vec<usize>>,
-    /// Dominator bitsets: `dom[b]` has bit `d` set iff `d` dominates `b`.
-    dom: Vec<Vec<u64>>,
-    words: usize,
 }
 
 impl Cfg {
-    /// Build the CFG and its dominator sets.  `None` when the function contains
-    /// control flow that cannot be resolved statically (an indirect `br xN`, or
-    /// a branch whose label is not in this function): callers must then fall
-    /// back to the conservative answer.
+    /// Build the CFG.  `None` when the function contains control flow that
+    /// cannot be resolved statically (an indirect `br xN`, or a branch whose
+    /// label is not in this function): callers must then fall back to the
+    /// conservative answer.  The query walks successors only; the dominator
+    /// bitsets once computed here had no reader, and cost O(blocks^2) time and
+    /// memory per build.
     fn build(lines: &[String], kinds: &[LineKind], n: usize) -> Option<Cfg> {
         if n == 0 {
             return None;
@@ -870,13 +923,11 @@ impl Cfg {
             block_of[i] = starts.len() - 1;
         }
         let nb = starts.len();
-        let mut labels: Vec<String> = vec![String::new(); nb];
         let mut label_block: FxHashMap<&str, usize> = FxHashMap::default();
         for i in 0..n {
             if kinds[i] == LineKind::Label {
                 let name = lines[i].trim().trim_end_matches(':');
                 label_block.insert(name, block_of[i]);
-                labels[block_of[i]] = (*name).to_string();
             }
         }
         let end = |b: usize| -> usize { if b + 1 < nb { starts[b + 1] } else { n } };
@@ -928,78 +979,7 @@ impl Cfg {
                 }
             }
         }
-        // Reachability from the entry block.
-        let mut reachable = vec![false; nb];
-        reachable[0] = true;
-        let mut stack = vec![0usize];
-        while let Some(b) = stack.pop() {
-            for &s in &succs[b] {
-                if !reachable[s] {
-                    reachable[s] = true;
-                    stack.push(s);
-                }
-            }
-        }
-        // Iterative dominators over reachable blocks (bitsets).
-        let words = (nb + 63) / 64;
-        let mut dom: Vec<Vec<u64>> = vec![vec![!0u64; words]; nb];
-        dom[0].iter_mut().for_each(|w| *w = 0);
-        if words > 0 {
-            dom[0][0] = 1; // block 0 dominates itself
-        }
-        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb];
-        for b in 0..nb {
-            if !reachable[b] {
-                continue;
-            }
-            for &s in &succs[b] {
-                if reachable[s] {
-                    preds[s].push(b);
-                }
-            }
-        }
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for b in 0..nb {
-                if b == 0 || !reachable[b] {
-                    continue;
-                }
-                let mut newd = vec![!0u64; words];
-                let mut first = true;
-                for &p in &preds[b] {
-                    if first {
-                        newd.copy_from_slice(&dom[p]);
-                        first = false;
-                    } else {
-                        for w in 0..words {
-                            newd[w] &= dom[p][w];
-                        }
-                    }
-                }
-                newd[b / 64] |= 1u64 << (b % 64);
-                if newd != dom[b] {
-                    dom[b] = newd;
-                    changed = true;
-                }
-            }
-        }
-        Some(Cfg {
-            block_of,
-            starts: starts.clone(),
-            labels,
-            succs,
-            dom,
-            words,
-        })
-    }
-
-    /// `true` when `def` dominates `blk` (unreachable blocks dominate nothing).
-    fn dominates(&self, def: usize, blk: usize) -> bool {
-        if def >= self.succs.len() || blk >= self.succs.len() || self.words == 0 {
-            return false;
-        }
-        self.dom[blk][def / 64] & (1u64 << (def % 64)) != 0
+        Some(Cfg { block_of, succs })
     }
 
     /// True when the instruction at `redef` — a pure overwrite of `reg` — runs
@@ -1219,9 +1199,10 @@ fn gp_operands(line: &str, kind: LineKind, ret_value: bool) -> (u64, u64) {
     // A return also hands x19-x28 back to the caller (AAPCS64): the caller
     // reads them after the `ret` as surely as it reads the result, so a
     // rename that would leave a callee-saved register holding anything but
-    // the caller's value must see that read too.
+    // the caller's value must see that read too. The result itself is x0/x1
+    // (`A64_RET_GP`, the model `abi_liveness` uses as well).
     if ret_value && line.trim().starts_with("ret") {
-        uses |= 0xff | A64_CALLEE_SAVED_GP; // x0-x7, x19-x28
+        uses |= A64_RET_GP;
     }
     (uses, defs)
 }
@@ -1250,6 +1231,20 @@ impl Liveness {
         start: usize,
         end: usize,
         ret_value: bool,
+    ) -> Option<Self> {
+        Self::build_with(lines, kinds, start, end, |k| {
+            gp_operands(&lines[k], kinds[k], ret_value)
+        })
+    }
+
+    /// `build` over the (uses, defs) model `operands(k)` of line `k`: the
+    /// liveness of whatever property of a register those sets track.
+    fn build_with(
+        lines: &[String],
+        kinds: &[LineKind],
+        start: usize,
+        end: usize,
+        operands: impl Fn(usize) -> (u64, u64),
     ) -> Option<Self> {
         if start >= end {
             return None;
@@ -1319,21 +1314,21 @@ impl Liveness {
             }
             succs.push(s);
         }
-        let mut live_out = vec![0u64; nb];
         let mut live_in = vec![0u64; nb];
         let mut live_before = vec![0u64; end];
-        for _ in 0..64 {
+        // Iterate to the fixed point, and judge it by the live-in sets: the
+        // first sweep moves every block's live-in off zero without changing
+        // any live-out a later block already read, so watching live-outs
+        // alone could stop after one sweep with a loop-carried read still
+        // missing from the latch (a function with no `ret` to seed a
+        // change).  The sets only grow, so the loop terminates.
+        loop {
             let mut changed = false;
             for b in (0..nb).rev() {
-                let mut out = 0u64;
+                let mut live = 0u64;
                 for &sc in &succs[b] {
-                    out |= live_in[sc];
+                    live |= live_in[sc];
                 }
-                if out != live_out[b] {
-                    live_out[b] = out;
-                    changed = true;
-                }
-                let mut live = live_out[b];
                 for k in (starts[b]..bend(b)).rev() {
                     if matches!(
                         kinds[k],
@@ -1342,11 +1337,14 @@ impl Liveness {
                         live_before[k] = live;
                         continue;
                     }
-                    let (u, d) = gp_operands(&lines[k], kinds[k], ret_value);
+                    let (u, d) = operands(k);
                     live = (live & !d) | u;
                     live_before[k] = live;
                 }
-                live_in[b] = live;
+                if live != live_in[b] {
+                    live_in[b] = live;
+                    changed = true;
+                }
             }
             if !changed {
                 break;
@@ -1454,10 +1452,6 @@ fn may_write_gp(line: &str) -> u64 {
 }
 
 fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
-    fn mentions(line: &str, reg: u8) -> bool {
-        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .any(|tok| tok == xreg_name(reg) || tok == wreg_name(reg))
-    }
     if n == 0 {
         return false;
     }
@@ -1471,6 +1465,25 @@ fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize)
     let mut changed = false;
     for w in 0..starts.len() - 1 {
         let (fstart, fend) = (starts[w], starts[w + 1]);
+        // One rename per scan (it changes the liveness every later candidate
+        // is judged by), repeated until the entry run has nothing left: an
+        // entry with six parameter copies used to keep two of them because
+        // the phase-3 driver runs this pass at most four times.
+        while coalesce_one_entry_copy(lines, kinds, fstart, fend) {
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// One `coalesce_entry_copies` rename in the function `[fstart, fend)`.
+fn coalesce_one_entry_copy(
+    lines: &mut [String],
+    kinds: &mut [LineKind],
+    fstart: usize,
+    fend: usize,
+) -> bool {
+    {
         let mut eend = fend;
         for k in fstart + 1..fend {
             if matches!(
@@ -1494,18 +1507,33 @@ fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize)
         let mut i = fstart + 1;
         while i < eend {
             i += 1;
-            let LineKind::Move {
-                dst,
-                src,
-                is_32bit: false,
-            } = kinds[i - 1]
-            else {
+            let LineKind::Move { dst, src, is_32bit } = kinds[i - 1] else {
                 continue;
             };
             if dst == src || dst >= 29 || src >= 29 {
                 continue;
             }
             let i = i - 1;
+            // A 32-bit copy (`mov w5, w0`, the entry copy of an `int`
+            // parameter) leaves dst = zext(src<31:0>), while src keeps
+            // whatever upper half the caller left (AAPCS64 leaves it
+            // unspecified). The two agree on every 32-bit view, so the rename
+            // is exact only when no later line reads or writes the 64-bit view
+            // of dst.
+            if is_32bit {
+                let dx = xreg_name(dst);
+                let x_view_later = (i + 1..fend).any(|k| {
+                    !matches!(
+                        kinds[k],
+                        LineKind::Nop | LineKind::Directive | LineKind::Label
+                    ) && lines[k]
+                        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .any(|tok| tok == dx)
+                });
+                if x_view_later {
+                    continue;
+                }
+            }
             // Rule 1 (ported from x86): the source must be DEAD immediately
             // after the copy. The old test -- "`src` is mentioned nowhere else
             // in the function" -- is syntactic and says nothing about paths
@@ -1542,16 +1570,29 @@ fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize)
                         LineKind::Nop | LineKind::Directive | LineKind::Label => continue,
                         // `MemOther` names every register it touches (a
                         // pre/post-indexed base is written explicitly), so the
-                        // rename covers it. `Other` is an unrecognised
-                        // mnemonic the oracle cannot vouch for.
+                        // rename covers it. So does an `Other` line -- a
+                        // `csel`, `cset`, `ucvtf s16, w4`, `fmov d0, x5`:
+                        // AArch64 hides only the link register, a `ret`'s
+                        // target and a writeback base, which
+                        // `classify_implicit_operands_a64` reports below,
+                        // and `may_write_gp` answers rules 2 and 3 for any
+                        // mnemonic. The exceptions read registers they do not
+                        // name: an opaque inline-asm body and a supervisor
+                        // call (x0-x8). Refusing every `Other` line kept the
+                        // entry copies of any function with a select or an
+                        // FP conversion: `mov w4, w0; ucvtf s16, w4`.
                         LineKind::Other => {
-                            ok = false;
-                            break;
+                            let t = lines[k].trim();
+                            if t == OPAQUE_LINE || a64_traps_to_handler(t) {
+                                ok = false;
+                                break;
+                            }
                         }
-                        // x0-x7 carry the return value: an implicit read the
+                        // x0/x1 carry the result (a GP result never needs
+                        // more, see `A64_RET_GP`): an implicit read the
                         // rename cannot reach.
                         LineKind::Ret => {
-                            if dst < 8 {
+                            if A64_RET_GP & (1u64 << dst) != 0 {
                                 ok = false;
                                 break;
                             }
@@ -1672,11 +1713,10 @@ fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize)
                 }
             }
             kinds[i] = LineKind::Nop;
-            changed = true;
-            break; // renaming changes the picture: re-scan this function
+            return true;
         }
     }
-    changed
+    false
 }
 
 /// Merge identical basic blocks.
@@ -2003,7 +2043,10 @@ fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize
                     let last = parts.len() - 1;
                     if parts[last] == from {
                         parts[last] = to.as_str();
-                        lines[k] = parts.join(" ");
+                        // Keep the instruction indented: a column-0 line
+                        // reads as a symbol boundary to every census that
+                        // delimits functions by their first column.
+                        lines[k] = format!("    {}", parts.join(" "));
                         kinds[k] = classify_line(&lines[k]);
                     }
                 }
@@ -2040,6 +2083,19 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
     let mut cfg: Option<Cfg> = None;
     let mut cfg_resolvable = true;
     let mut changed = false;
+    // Labels some line other than their own definition names: the entry
+    // points of their blocks from elsewhere.
+    // Owned: the rewrites below change register operands, never labels.
+    let referenced: FxHashSet<String> = (0..n)
+        .filter(|&k| kinds[k] != LineKind::Label && kinds[k] != LineKind::Nop)
+        .flat_map(|k| {
+            lines[k]
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+                .filter(|tok| tok.starts_with(".L"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect();
     for i in 0..n {
         let LineKind::Move {
             dst,
@@ -2057,6 +2113,15 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
         let mut provably_dead = false;
         let mut dead_by_redef = false;
         let mut src_alive = true;
+        // Still on a straight path from the mov: no label another path can
+        // enter through, no unconditional transfer or return passed.  Only
+        // there is `dst == src` a fact at a read.  Past that point another
+        // path can reach the read with dst holding a different value (or
+        // src redefined further down a loop), so renaming it onto src is a
+        // miscompile: gcc.c-torture pr39100 at -O2 stored through x13 --
+        // the pointer of the other list -- because `mov x8, x13` ended one
+        // arm of a diamond and `str xzr, [x8]` sat after the join.
+        let mut straight = true;
         // Has the scan left the basic block that holds `mov dst, src`?  Only a
         // redefinition in that SAME block dominates every path leaving the mov,
         // so only there does an overwrite prove the mov's value dead.
@@ -2089,8 +2154,13 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
                         valid = false;
                         break;
                     }
+                    straight = false;
                 }
-                LineKind::Label => {}
+                LineKind::Label => {
+                    if referenced.contains(lines[j].trim().trim_end_matches(':')) {
+                        straight = false;
+                    }
+                }
                 // Calls clobber src (x0) and all caller-saved registers. Rather
                 // than reason about save/restore pairs, stop without committing.
                 LineKind::Call => {
@@ -2177,7 +2247,8 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
                             break;
                         }
                         let address = format!("[{}", xreg_name(dst));
-                        if src_alive
+                        if straight
+                            && src_alive
                             && mention_count(&lines[j], dst) == 1
                             && lines[j].contains(&address)
                         {
@@ -2192,6 +2263,11 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
                         }
                     }
                 }
+            }
+            // Code after an unconditional branch is reached only through a
+            // label, i.e. from some other path.
+            if kinds[j] == LineKind::Branch {
+                straight = false;
             }
             j += 1;
         }
@@ -2515,6 +2591,14 @@ fn written_gp_register(line: &str, kind: LineKind) -> Option<u8> {
             let dst = operands.split(',').next()?;
             let reg = parse_reg(dst);
             (reg != REG_NONE).then_some(reg)
+        }
+        // Loads, `adrp`, `cset`, `csel`, bitfield moves, GP transfers out
+        // of FP registers...: single-destination producers whose first
+        // operand is their only write (no writeback form qualifies).  Left
+        // unknown, the liveness counted their destination as a READ and kept
+        // a dead accumulator alive across every one of them.
+        LineKind::MemOther | LineKind::Other | LineKind::LoadsbReg => {
+            renamable_def_dest(line).map(|(reg, _)| reg)
         }
         _ => None,
     }
@@ -3423,20 +3507,167 @@ fn eliminate_redundant_branches(lines: &[String], kinds: &mut [LineKind], n: usi
 //
 // Pattern: mov xN, xN — no-op
 
-fn eliminate_self_moves(kinds: &mut [LineKind], n: usize) -> bool {
+fn eliminate_self_moves(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
+    // Function starts, and the X-view liveness of the function holding the
+    // current candidate: built at most once per function and pass, because
+    // deleting an unobservable `mov wN, wN` changes no register's X-view
+    // liveness (the line killed N, and N was not X-live after it).
+    let mut starts: Option<Vec<usize>> = None;
+    let mut x_view: Option<(usize, Option<Liveness>)> = None;
     for i in 0..n {
-        if let LineKind::Move { dst, src, is_32bit } = kinds[i] {
-            if dst == src && !is_32bit {
-                // Only eliminate 64-bit self-moves (mov xN, xN).
-                // On AArch64, `mov wN, wN` zeros the upper 32 bits of xN,
-                // so it is NOT a true no-op and must be preserved.
-                kinds[i] = LineKind::Nop;
-                changed = true;
+        let LineKind::Move { dst, src, is_32bit } = kinds[i] else {
+            continue;
+        };
+        if dst != src {
+            continue;
+        }
+        // `mov xN, xN` is a no-op. `mov wN, wN` clears bits 63:32 of xN, so
+        // it stays unless that is unobservable. The straight-line proof
+        // (`zext_self_move_unobservable`) is cheap: N is read, if at all,
+        // only through its W view until a W write of N zeroes the upper half
+        // again -- `mov w0, w0; and w0, w0, #0xff`, left behind when a
+        // parameter's entry copy folds into the narrow-count mask -- or
+        // until a `ret` that does not read N. Otherwise the CFG-wide one:
+        // N is not X-view live after the line on any path
+        // (`x_view_operands`) -- `mov w4, w4; cbz w4, .L1` for a 32-bit
+        // argument zero-extended in place and tested before two returns.
+        let removable = !is_32bit || zext_self_move_unobservable(lines, kinds, i, n, dst) || {
+            let starts = starts.get_or_insert_with(|| {
+                (0..n)
+                    .filter(|&k| is_function_boundary(&lines[k]))
+                    .collect()
+            });
+            let f = starts.partition_point(|&s| s <= i);
+            let fstart = f.checked_sub(1).map_or(0, |p| starts[p]);
+            let fend = starts.get(f).copied().unwrap_or(n);
+            if x_view.as_ref().is_none_or(|(s, _)| *s != fstart) {
+                let lv = Liveness::build_with(lines, kinds, fstart, fend, |k| {
+                    x_view_operands(&lines[k], kinds[k])
+                });
+                x_view = Some((fstart, lv));
             }
+            x_view
+                .as_ref()
+                .and_then(|(_, lv)| lv.as_ref())
+                .is_some_and(|lv| lv.live_after(i, dst) == Some(false))
+        };
+        if removable {
+            kinds[i] = LineKind::Nop;
+            changed = true;
         }
     }
     changed
+}
+
+/// The (uses, defs) of `line` for "can bits 63:32 of xN be observed?" (see
+/// `Liveness::build_with`). A use reads the X view: an explicit one
+/// (`explicit_x_view_reads`) or an implicit one -- a call's argument
+/// registers x0-x7, a return's result and callee-saved registers
+/// (`A64_RET_GP`) and link register, and everything for an opaque
+/// inline-asm body or a supervisor call (`svc` reads x0-x8 unnamed). A
+/// W-view read is no use. The defs are `gp_operands`' must-defs: a W write
+/// zeroes bits 63:32 again, an X write replaces them.
+fn x_view_operands(line: &str, kind: LineKind) -> (u64, u64) {
+    let t = line.trim();
+    if t == OPAQUE_LINE || a64_traps_to_handler(t) {
+        return (u64::MAX, 0);
+    }
+    let mut uses = explicit_x_view_reads(t, kind);
+    match kind {
+        LineKind::Call => uses |= 0xff,
+        LineKind::Ret => uses |= A64_RET_GP | 1 << 30,
+        _ => {}
+    }
+    (uses, gp_operands(line, kind, false).1)
+}
+
+/// The registers whose X view `line` names other than as its written
+/// destination: every `xN` token, except the destination of a
+/// single-destination producer that names it nowhere else -- `sxtw x0, w0`
+/// reads w0 and redefines all of x0, `add x0, x0, #1` reads x0.
+fn explicit_x_view_reads(line: &str, kind: LineKind) -> u64 {
+    let mut named = 0u64;
+    let mut twice = 0u64;
+    for r in line
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter_map(|tok| tok.strip_prefix('x')?.parse::<u8>().ok())
+        .filter(|&r| r <= 30)
+    {
+        twice |= named & 1u64 << r;
+        named |= 1u64 << r;
+    }
+    let dest = written_gp_register(line, kind).filter(|&r| {
+        r <= 30
+            && twice & 1u64 << r == 0
+            && line
+                .trim()
+                .split_once(|c: char| c.is_ascii_whitespace())
+                .and_then(|(_, ops)| ops.split(',').next())
+                .is_some_and(|first| first.trim() == xreg_name(r))
+    });
+    match dest {
+        Some(r) => named & !(1u64 << r),
+        None => named,
+    }
+}
+
+/// After line `i` (`mov wN, wN`), the straight-line code redefines N, or
+/// returns with N dead, before anything can see bits 63:32 of xN: every line
+/// up to that point reads N, if at all, only through its W view
+/// (`explicit_x_view_reads`), and the redefinition is a single-destination
+/// write of N (see `eliminate_self_moves`). `mov w0, w0; fmov s0, w0; cnt
+/// v0.8b, v0.8b; uaddlv h0, v0.8b; fmov w0, s0` qualifies, and so do `mov w0,
+/// w0; sxtw x0, w0` and `mov w4, w4; madd w0, w4, w5, w7; ret`.
+fn zext_self_move_unobservable(
+    lines: &[String],
+    kinds: &[LineKind],
+    i: usize,
+    n: usize,
+    reg: u8,
+) -> bool {
+    let (xn, wn) = (xreg_name(reg), wreg_name(reg));
+    for j in i + 1..n {
+        match kinds[j] {
+            LineKind::Nop => continue,
+            LineKind::Directive if inert_directive(&lines[j]) => continue,
+            // `ret` reads x0/x1 (the GP result registers) and needs every
+            // callee-saved register intact; any other caller-saved register
+            // is dead there, so its upper half is unobservable -- the
+            // in-place zero-extension of a 32-bit argument kept in its
+            // arrival register (`mov w4, w4`) before a straight-line return.
+            LineKind::Ret => return (2..=17).contains(&reg),
+            // Control flow ends the straight line; a raw `.inst`/`.word` is
+            // anything. An unclassified (`Other`) mnemonic is fine: only a
+            // call, a return or a trap reads a GP register it does not name,
+            // and naming wN reads the W view by definition.
+            LineKind::Label
+            | LineKind::Branch
+            | LineKind::CondBranch
+            | LineKind::CmpBranch
+            | LineKind::Call
+            | LineKind::Directive => return false,
+            _ => {}
+        }
+        let line = lines[j].trim();
+        if line == OPAQUE_LINE
+            || a64_traps_to_handler(line)
+            || explicit_x_view_reads(line, kinds[j]) & (1u64 << reg) != 0
+        {
+            return false;
+        }
+        let writes_n = may_write_gp(line) & (1u64 << reg) != 0;
+        if !writes_n {
+            // Reads wN at most: the upper half is invisible to it.
+            continue;
+        }
+        let first = line
+            .split_once(|c: char| c.is_ascii_whitespace())
+            .map(|(_, ops)| ops.split(',').next().unwrap_or("").trim());
+        return written_gp_register(&lines[j], kinds[j]) == Some(reg)
+            && (first == Some(wn) || first == Some(xn));
+    }
+    false
 }
 
 // ── Pass 3b: Redundant sign-extension elimination ───────────────────────────
@@ -3467,24 +3698,50 @@ fn eliminate_redundant_sxtw(lines: &mut [String], kinds: &mut [LineKind], n: usi
                 extended = [false; 33];
                 extended[32] = true;
             }
-            // Unknown/memory kinds may clobber registers — except ldrsw with
-            // non-sp addressing (classifies as MemOther), which CREATES a
-            // sign-extended register.
+            // Memory and unclassified kinds: when the line's register writes
+            // are known exactly (a single-destination producer, a store or a
+            // compare, plus any writeback base), only those registers change
+            // -- and some producers CREATE a sign-extended value: `ldrsw`,
+            // the 64-bit `ldrsb`/`ldrsh`/`sxtb`/`sxth`, any `ldrb`/`ldrh`/
+            // `uxtb`/`uxth` (at most 16 significant bits), `cset` (0 or 1)
+            // and the 64-bit `csetm` (0 or -1).  Anything else may clobber
+            // every register.
             LineKind::MemOther | LineKind::Other | LineKind::LoadsbReg | LineKind::LoadPairSp => {
                 let t = lines[i].trim();
-                let mut ldrsw_dst: Option<u8> = None;
-                if let Some(rest) = t.strip_prefix("ldrsw ") {
-                    if let Some((reg_str, _)) = rest.split_once(',') {
-                        let r = parse_reg(reg_str.trim());
-                        if r != REG_NONE && r < 32 {
-                            ldrsw_dst = Some(r);
+                let writeback = classify_implicit_operands_a64(t).1;
+                let mnem = t.split_whitespace().next().unwrap_or("");
+                let known = if t == OPAQUE_LINE || t.starts_with('#') {
+                    None
+                } else if let Some((dst, narrow)) = renamable_def_dest(t) {
+                    let sext64 = match mnem {
+                        "ldrsw" | "ldursw" | "ldrb" | "ldrh" | "ldurb" | "ldurh" | "uxtb"
+                        | "uxth" | "cset" => true,
+                        "ldrsb" | "ldrsh" | "ldursb" | "ldursh" | "sxtb" | "sxth" | "csetm" => {
+                            !narrow
+                        }
+                        _ => false,
+                    };
+                    Some((Some((dst, sext64)), writeback))
+                } else if A64_GP_READ_ONLY.contains(&mnem) {
+                    Some((None, writeback))
+                } else {
+                    None
+                };
+                match known {
+                    Some((def, writes)) => {
+                        for r in 0..32usize {
+                            if writes >> r & 1 != 0 {
+                                extended[r] = false;
+                            }
+                        }
+                        if let Some((dst, sext64)) = def {
+                            extended[dst as usize] = sext64;
                         }
                     }
-                }
-                extended = [false; 33];
-                extended[32] = true;
-                if let Some(r) = ldrsw_dst {
-                    extended[r as usize] = true;
+                    None => {
+                        extended = [false; 33];
+                        extended[32] = true;
+                    }
                 }
             }
             LineKind::LoadswSp { reg, .. } => {
@@ -4736,6 +4993,10 @@ fn eliminate_overwritten_moves(lines: &[String], kinds: &mut [LineKind], n: usiz
                 _ => {}
             }
             let t = &lines[j];
+            // A supervisor call reads x0-x7 (and x8) without naming them.
+            if a64_traps_to_handler(t) {
+                break;
+            }
             let mentions = t
                 .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
                 .any(|tok| tok == xn || tok == wn);
@@ -4783,6 +5044,11 @@ fn eliminate_overwritten_moves(lines: &[String], kinds: &mut [LineKind], n: usiz
 // idiom (the 32-bit self-move clears the top half; it is NOT a no-op, so
 // eliminate_self_moves correctly keeps it). The chain computes xD = zext32(wS),
 // exactly `mov wD, wS`. Sound only if A is not read later in the block.
+//
+// When A stays live (or no third move follows), the first two lines alone are
+// `mov wA, wS`: xA = zext32(wS) either way and S is untouched, so that fold
+// needs no condition at all -- `mov x0, x4; mov w0, w0`, a switch index
+// zero-extended on its way into the dispatch register.
 fn fold_zext_move_chains(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
     for i in 0..n {
@@ -4797,9 +5063,6 @@ fn fold_zext_move_chains(lines: &mut [String], kinds: &mut [LineKind], n: usize)
         let Some(m1) = next_live(kinds, i + 1, n) else {
             continue;
         };
-        let Some(m2) = next_live(kinds, m1 + 1, n) else {
-            continue;
-        };
         let LineKind::Move {
             dst: a2,
             src: s2,
@@ -4808,89 +5071,107 @@ fn fold_zext_move_chains(lines: &mut [String], kinds: &mut [LineKind], n: usize)
         else {
             continue;
         };
-        if a2 != a || s2 != a {
-            continue; // middle must be mov wA, wA
+        if a2 != a || s2 != a || s == a || a > 30 || s == 31 {
+            continue; // middle must be mov wA, wA; sp has no plain W move
         }
-        let LineKind::Move {
-            dst: d,
-            src: s3,
-            is_32bit: false,
-        } = kinds[m2]
-        else {
-            continue;
-        };
-        if s3 != a || d == a || s == a {
-            continue;
-        }
-        // A must be dead after the chain: no later READ before a boundary.
-        // A write-only line (e.g. `mov x0, #15`) ends the old value's life.
-        let (xa, wa) = (xreg_name(a), wreg_name(a));
-        let mut a_live = false;
-        for j in (m2 + 1)..n {
-            match kinds[j] {
-                // Control-flow boundaries are NOT "value is dead" proofs.
-                // levkropp's break-as-dead default folded d2hi()'s return-
-                // value chain (`mov x0,x22; mov w0,w0; mov x23,x0` right
-                // before the epilogue) into a dead callee-saved register and
-                // returned garbage: aarch64_fuzz seeds 0/2/5 at -O1, 40/100
-                // mismatches. ABI-precise handling instead:
-                // - ret implicitly reads the return-value registers x0/x1
-                //   (and x8 for sret); other registers are dead there.
-                LineKind::Ret => {
-                    a_live = a == 0 || a == 1 || a == 8;
-                    break;
-                }
-                // - calls read argument registers x0-x8; caller-saved temps
-                //   x9-x18 are clobbered unread (dead); callee-saved x19+
-                //   survive the call, so the scan must CONTINUE looking for
-                //   readers after the call rather than assume death.
-                LineKind::Call => {
-                    if a <= 8 {
-                        a_live = true;
-                        break;
-                    }
-                    if a >= 19 {
-                        continue;
-                    }
-                    break; // x9-x18: clobbered by the call without a read
-                }
-                // - labels and branches: the value may be read in the
-                //   target/fall-through block; this single-block scan cannot
-                //   see it, so it must be treated as live.
-                LineKind::Label | LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch => {
-                    a_live = true;
-                    break;
-                }
-                LineKind::Nop => continue,
-                _ => {}
+        match zext_chain_target(lines, kinds, n, a, s, m1) {
+            Some((d, m2)) => {
+                lines[i] = format!("    mov {}, {}", wreg_name(d), wreg_name(s));
+                kinds[i] = LineKind::Move {
+                    dst: d,
+                    src: s,
+                    is_32bit: true,
+                };
+                kinds[m2] = LineKind::Nop;
             }
-            let mentions = lines[j]
-                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .filter(|tok| *tok == xa || *tok == wa)
-                .count();
-            if mentions == 0 {
-                continue;
+            None => {
+                lines[i] = format!("    mov {}, {}", wreg_name(a), wreg_name(s));
+                kinds[i] = LineKind::Move {
+                    dst: a,
+                    src: s,
+                    is_32bit: true,
+                };
             }
-            if gp_reg_write_only(&lines[j], a) {
-                break; // write-only: the chain's value in A is dead here
-            }
-            a_live = true;
-            break;
         }
-        if a_live {
-            continue;
-        }
-        lines[i] = format!("    mov {}, {}", wreg_name(d), wreg_name(s));
-        kinds[i] = LineKind::Move {
-            dst: d,
-            src: s,
-            is_32bit: true,
-        };
         kinds[m1] = LineKind::Nop;
-        kinds[m2] = LineKind::Nop;
         changed = true;
     }
     changed
+}
+
+/// The `mov xD, xA` (destination and line) that completes the chain
+/// `mov xA, xS; mov wA, wA` ending at line `m1`, when A is dead after it.
+fn zext_chain_target(
+    lines: &[String],
+    kinds: &[LineKind],
+    n: usize,
+    a: u8,
+    s: u8,
+    m1: usize,
+) -> Option<(u8, usize)> {
+    let m2 = next_live(kinds, m1 + 1, n)?;
+    let LineKind::Move {
+        dst: d,
+        src: s3,
+        is_32bit: false,
+    } = kinds[m2]
+    else {
+        return None;
+    };
+    if s3 != a || d == a || s == a {
+        return None;
+    }
+    // A must be dead after the chain: no later READ before a boundary.
+    // A write-only line (e.g. `mov x0, #15`) ends the old value's life.
+    let (xa, wa) = (xreg_name(a), wreg_name(a));
+    for j in (m2 + 1)..n {
+        match kinds[j] {
+            // Control-flow boundaries are NOT "value is dead" proofs.
+            // levkropp's break-as-dead default folded d2hi()'s return-
+            // value chain (`mov x0,x22; mov w0,w0; mov x23,x0` right
+            // before the epilogue) into a dead callee-saved register and
+            // returned garbage: aarch64_fuzz seeds 0/2/5 at -O1, 40/100
+            // mismatches. ABI-precise handling instead:
+            // - ret implicitly reads the return-value registers x0/x1
+            //   (and x8 for sret); other registers are dead there.
+            LineKind::Ret => {
+                return (!(a == 0 || a == 1 || a == 8)).then_some((d, m2));
+            }
+            // - calls read argument registers x0-x8; caller-saved temps
+            //   x9-x18 are clobbered unread (dead); callee-saved x19+
+            //   survive the call, so the scan must CONTINUE looking for
+            //   readers after the call rather than assume death.
+            LineKind::Call => {
+                if a <= 8 {
+                    return None;
+                }
+                if a >= 19 {
+                    continue;
+                }
+                return Some((d, m2)); // x9-x18: clobbered by the call without a read
+            }
+            // - labels and branches: the value may be read in the
+            //   target/fall-through block; this single-block scan cannot
+            //   see it, so it must be treated as live.
+            LineKind::Label | LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch => {
+                return None;
+            }
+            LineKind::Nop => continue,
+            _ => {}
+        }
+        let mentions = lines[j]
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|tok| *tok == xa || *tok == wa)
+            .count();
+        if mentions == 0 {
+            continue;
+        }
+        if gp_reg_write_only(&lines[j], a) {
+            return Some((d, m2)); // write-only: the chain's value in A is dead here
+        }
+        return None;
+    }
+    Some((d, m2))
 }
 
 /// Retarget a move-immediate instruction to a different destination register.
@@ -4939,27 +5220,75 @@ fn retarget_move_imm(line: &str, new_dst: u8) -> Option<String> {
 // All four heads reach ±1 MB, the same window as `b.cond`, so the same
 // instruction-census range guard applies to each of them.
 
-/// Estimate the distance (in instructions) from position `from` to the label
-/// `target` in the assembly. Returns `None` if the label is not found.
-fn estimate_branch_distance(
-    lines: &[String],
-    kinds: &[LineKind],
-    from: usize,
-    target: &str,
-) -> Option<usize> {
-    // Search both forward and backward for the target label
-    let target_with_colon = format!("{}:", target);
-    for idx in 0..lines.len() {
-        if kinds[idx] == LineKind::Label && lines[idx].trim() == target_with_colon {
-            // Count non-Nop lines between from and idx (each is one 4-byte instruction)
-            let (lo, hi) = if from < idx { (from, idx) } else { (idx, from) };
-            let count = (lo..hi)
-                .filter(|&p| kinds[p] != LineKind::Nop && kinds[p] != LineKind::Label)
-                .count();
-            return Some(count);
+/// Where every label of the text is defined, and an upper bound on how many
+/// 4-byte instructions precede each line (every line that is neither `Nop`
+/// nor a label counts one, alignment padding its maximum): one O(n) census
+/// per pass turns every branch-distance query into two lookups.  The old
+/// per-query scan of the whole module for the target label made
+/// `fuse_branch_over_branch` quadratic in the module.  Lines a pass deletes
+/// after the census only shorten real distances, so a census distance never
+/// understates one.
+struct BranchCensus {
+    labels: FxHashMap<String, usize>,
+    insns_before: Vec<usize>,
+}
+
+impl BranchCensus {
+    fn new(lines: &[String], kinds: &[LineKind]) -> Self {
+        let mut labels = FxHashMap::default();
+        let mut insns_before = Vec::with_capacity(lines.len() + 1);
+        let mut count = 0usize;
+        for (idx, line) in lines.iter().enumerate() {
+            insns_before.push(count);
+            match kinds[idx] {
+                LineKind::Label => {
+                    // The first definition wins, as in a forward search.
+                    if let Some(name) = line.trim().strip_suffix(':') {
+                        labels.entry(name.to_string()).or_insert(idx);
+                    }
+                }
+                LineKind::Nop => {}
+                LineKind::Directive => count += directive_insn_bound(line),
+                _ => count += 1,
+            }
+        }
+        insns_before.push(count);
+        BranchCensus {
+            labels,
+            insns_before,
         }
     }
-    None
+
+    /// Instructions between line `from` and the definition of `target`
+    /// (either direction), or None when the label is not in the text.
+    fn distance(&self, from: usize, target: &str) -> Option<usize> {
+        let idx = *self.labels.get(target)?;
+        let (lo, hi) = if from < idx { (from, idx) } else { (idx, from) };
+        Some(self.insns_before[hi] - self.insns_before[lo])
+    }
+}
+
+/// Upper bound, in 4-byte instructions, on what a directive emits: 2^k bytes
+/// for an alignment to 2^k (`.p2align 4` pads at most 12 bytes after an
+/// instruction; it is charged four slots), one slot for anything else --
+/// the count every directive had before, which over-counts the ones that
+/// emit nothing.
+fn directive_insn_bound(line: &str) -> usize {
+    let t = line.trim();
+    let arg = |p: &str| -> Option<u32> {
+        let rest = t.strip_prefix(p)?;
+        if !rest.starts_with(|c: char| c.is_ascii_whitespace()) {
+            return None;
+        }
+        rest.split(',').next()?.trim().parse().ok()
+    };
+    if let Some(k) = arg(".p2align").or_else(|| arg(".align")) {
+        return ((1usize << k.min(16)) / 4).max(1);
+    }
+    if let Some(b) = arg(".balign") {
+        return (b as usize / 4).max(1);
+    }
+    1
 }
 
 /// Maximum number of instructions a `b.cond` (or `cbz`/`cbnz`/`tbz`/`tbnz`)
@@ -5007,28 +5336,73 @@ fn retarget_branch_over_branch(head: &str, kind: LineKind, real_target: &str) ->
 
 /// Recognise `head; b .target; .Lskip:` starting at `i` and return the index of
 /// the redundant unconditional branch together with the rewritten head.
+/// A line the branch-over-branch fusion may step over: padding whose size is
+/// bounded by its own text (`.p2align N[,,max]`, CFI, `.loc`) or a label no
+/// other line names (entered only by falling into it, so no path changes).
+/// The far-branch expansion leaves `.Lskip_N:` between a head and its `b`
+/// once its own head has been retargeted, and the code generator aligns
+/// every loop header, so the loop-entry `b.cc .Lbody; b .Lexit` pair was
+/// never fused.
+fn fusion_skippable(
+    lines: &[String],
+    kinds: &[LineKind],
+    k: usize,
+    referenced: &FxHashSet<String>,
+) -> bool {
+    match kinds[k] {
+        LineKind::Nop => true,
+        LineKind::Directive => {
+            let t = lines[k].trim();
+            t.starts_with(".cfi_")
+                || t.starts_with(".loc ")
+                || t.starts_with(".p2align ")
+                || t.starts_with(".balign ")
+                || t.starts_with(".align ")
+        }
+        LineKind::Label => {
+            let name = lines[k].trim().trim_end_matches(':');
+            name.starts_with(".L") && !referenced.contains(name)
+        }
+        _ => false,
+    }
+}
+
 fn fused_branch_head(
     lines: &[String],
     kinds: &[LineKind],
     n: usize,
     i: usize,
+    census: &BranchCensus,
+    referenced: &FxHashSet<String>,
 ) -> Option<(usize, String)> {
     let head_kind = kinds[i];
     if !is_range_limited_branch(head_kind) {
         return None;
     }
-    let j = next_insn(kinds, i + 1, n)?;
-    let k = next_insn(kinds, j + 1, n)?;
-    if kinds[j] != LineKind::Branch || kinds[k] != LineKind::Label {
-        return None;
-    }
     // The head must branch exactly over the unconditional branch.
     let skip_target = range_limited_branch_target(&lines[i], head_kind)?;
+    let mut j = i + 1;
+    while j < n && fusion_skippable(lines, kinds, j, referenced) {
+        j += 1;
+    }
+    if j >= n || kinds[j] != LineKind::Branch {
+        return None;
+    }
+    let mut k = j + 1;
+    while k < n
+        && !(kinds[k] == LineKind::Label && label_name(&lines[k]) == Some(skip_target))
+        && fusion_skippable(lines, kinds, k, referenced)
+    {
+        k += 1;
+    }
+    if k >= n || kinds[k] != LineKind::Label {
+        return None;
+    }
     if skip_target != label_name(&lines[k])? {
         return None;
     }
     let real_target = branch_target(&lines[j])?;
-    let in_range = match estimate_branch_distance(lines, kinds, i, real_target) {
+    let in_range = match census.distance(i, real_target) {
         Some(distance) => distance < COND_BRANCH_SAFE_DISTANCE,
         // `b.cc` head: keep the historical assumption that an unmeasurable
         // target is reachable, since the unconditional branch already reached
@@ -5047,9 +5421,30 @@ fn fused_branch_head(
 
 fn fuse_branch_over_branch(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
+    let mut census: Option<BranchCensus> = None;
+    // Labels some other line names; a retarget below changes which label a
+    // head names, so the set is a superset of the live references -- which
+    // only makes the fusion more conservative.
+    let referenced: FxHashSet<String> = (0..n)
+        .filter(|&k| !matches!(kinds[k], LineKind::Label | LineKind::Nop))
+        .flat_map(|k| {
+            lines[k]
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+                .filter(|tok| tok.starts_with(".L"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect();
     let mut i = 0;
     while i + 2 < n {
-        if let Some((removed, rewritten)) = fused_branch_head(lines, kinds, n, i) {
+        if !is_range_limited_branch(kinds[i]) {
+            i += 1;
+            continue;
+        }
+        let census = census.get_or_insert_with(|| BranchCensus::new(lines, kinds));
+        if let Some((removed, rewritten)) =
+            fused_branch_head(lines, kinds, n, i, census, &referenced)
+        {
             // Retarget the head, then drop the unconditional branch. The skip
             // label stays: other predecessors may still branch to it.
             lines[i] = rewritten;
@@ -6444,6 +6839,371 @@ fn sp_offsets_in_line(line: &str) -> Vec<i32> {
     out
 }
 
+// ── Definition retargeting into the copy that consumes it ───────────────────
+//
+// The emitter computes into x0 (the accumulator) and copies the result into
+// the value's home, so every homed definition paid a `mov`:
+//
+//     adrp x0, A                       adrp x0, A
+//     add  x0, x0, :lo12:A      ->     add  x19, x0, :lo12:A
+//     mov  x19, x0
+//
+//     ldrsw x0, [x6]            ->     ldrsw x8, [x6]
+//     mov   x8, x0
+//
+// GCC and Clang write the home directly.  The RISC-V backend has the same
+// rule (`retarget_dying_accumulator_moves`); this is its AArch64 port, on the
+// whole-function ABI liveness instead of a forward scan, so the source may
+// die anywhere -- across joins, at a `ret` that does not read it, or at a
+// later overwrite.
+//
+// Legality, for `mov D, S` at line j:
+//  1. S is dead after j (`abi_liveness`: every implicit AAPCS64 read, the
+//     result registers at `ret` and the arguments of a call included).
+//  2. Walking back from j inside the block, the first line that writes S is
+//     a renamable single-destination producer (`renamable_def_dest`): its
+//     first operand is the only register it writes, with no writeback.
+//  3. Every line between the definition and the copy that mentions S only
+//     reads it (`reads_gp_only`), and no line there mentions D at all: D's
+//     old value is then dead from the definition on, and the readers can be
+//     renamed to D.
+//  4. A 32-bit copy (`mov wD, wS`, which zero-extends) needs a 32-bit
+//     definition, whose upper half is zero already.
+// The definition's own reads (`add x0, x0, #1`) keep naming S: they read the
+// value S held before it.
+
+/// `svc`/`hvc`/`smc`: exception-generating calls whose handler reads the
+/// argument registers and writes x0 with no register named in the text.
+fn a64_traps_to_handler(line: &str) -> bool {
+    matches!(line.split_whitespace().next(), Some("svc" | "hvc" | "smc"))
+}
+
+/// Stores and compares: every general register they name is read (a
+/// writeback base aside), none is written.
+const A64_GP_READ_ONLY: &[&str] = &[
+    "str", "strb", "strh", "stur", "sturb", "sturh", "stp", "stnp", "cmp", "cmn", "tst", "ccmp",
+    "ccmn", "fcmp", "fcmpe",
+];
+
+/// Mnemonics whose first operand is their only register write.
+const A64_SINGLE_DEST_PRODUCERS: &[&str] = &[
+    "adrp", "adr", "add", "adds", "sub", "subs", "and", "ands", "orr", "orn", "eor", "eon", "bic",
+    "bics", "mul", "madd", "msub", "mneg", "smull", "umull", "smaddl", "umaddl", "smsubl",
+    "umsubl", "smulh", "umulh", "sdiv", "udiv", "neg", "negs", "mvn", "lsl", "lsr", "asr", "ror",
+    "lslv", "lsrv", "asrv", "rorv", "mov", "movz", "movn", "sxtw", "sxth", "sxtb", "uxth", "uxtb",
+    "ubfx", "sbfx", "ubfiz", "sbfiz", "extr", "csel", "csinc", "csinv", "csneg", "cset", "csetm",
+    "cinc", "cinv", "cneg", "clz", "cls", "rbit", "rev", "rev16", "rev32", "ldr", "ldrb", "ldrh",
+    "ldrsb", "ldrsh", "ldrsw", "ldur", "ldurb", "ldurh", "ldursb", "ldursh", "ldursw", "fmov",
+    "fcvtzs", "fcvtzu", "fcvtas", "fcvtau", "fcvtms", "fcvtmu", "fcvtps", "fcvtpu", "fcvtns",
+    "fcvtnu", "umov", "smov",
+];
+
+/// The general register a single-destination producer writes, and whether
+/// it names the 32-bit view: `None` for anything else (a store, a compare, a
+/// branch, a pair load, a writeback form, an FP or vector destination).
+fn renamable_def_dest(line: &str) -> Option<(u8, bool)> {
+    let t = line.trim();
+    let (mnem, rest) = t.split_once(char::is_whitespace)?;
+    if !A64_SINGLE_DEST_PRODUCERS.contains(&mnem) || classify_implicit_operands_a64(t).1 != 0 {
+        return None;
+    }
+    let first = rest.split(',').next()?.trim();
+    let narrow = first.starts_with('w');
+    if !(narrow || first.starts_with('x')) {
+        return None;
+    }
+    let reg = parse_reg(first);
+    (reg <= 30).then_some((reg, narrow))
+}
+
+/// Does `line` name `reg` only as a source, never writing it?  Stores and
+/// compares read every register they name (a writeback base excepted), a
+/// single-destination producer reads everything after its destination, and
+/// a transfer into an FP/vector register reads its general operands.
+fn reads_gp_only(line: &str, reg: u8) -> bool {
+    let t = line.trim();
+    if reg > 30 || classify_implicit_operands_a64(t).1 >> reg & 1 != 0 {
+        return false;
+    }
+    let Some((mnem, rest)) = t.split_once(char::is_whitespace) else {
+        return false;
+    };
+    let first = rest.split(',').next().unwrap_or("").trim();
+    match mnem {
+        _ if A64_GP_READ_ONLY.contains(&mnem) => true,
+        "fmov" | "scvtf" | "ucvtf" | "dup" | "ins" | "mov"
+            if first.starts_with(['d', 's', 'h', 'b', 'q', 'v']) =>
+        {
+            true
+        }
+        _ => renamable_def_dest(t).is_some_and(|(dest, _)| dest != reg),
+    }
+}
+
+/// `line` with every x/w mention of register `from` renamed to `to`.
+fn rename_gp_tokens(line: &str, from: u8, to: u8) -> String {
+    let (fx, fw) = (xreg_name(from), wreg_name(from));
+    let (tx, tw) = (xreg_name(to), wreg_name(to));
+    let mut out = String::with_capacity(line.len() + 2);
+    let mut token = String::new();
+    let flush = |token: &mut String, out: &mut String| {
+        if token == fx {
+            out.push_str(tx);
+        } else if token == fw {
+            out.push_str(tw);
+        } else {
+            out.push_str(token);
+        }
+        token.clear();
+    };
+    for c in line.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            token.push(c);
+        } else {
+            flush(&mut token, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut token, &mut out);
+    out
+}
+
+/// `line` with its destination (first operand) renamed to `to`, same width.
+fn rename_def_dest(line: &str, to: u8) -> Option<String> {
+    let indent = &line[..line.len() - line.trim_start().len()];
+    let (mnem, rest) = line.trim().split_once(char::is_whitespace)?;
+    let rest = rest.trim_start();
+    let (first, tail) = match rest.split_once(',') {
+        Some((first, tail)) => (first.trim(), Some(tail)),
+        None => (rest.trim(), None),
+    };
+    let name = if first.starts_with('w') {
+        wreg_name(to)
+    } else {
+        xreg_name(to)
+    };
+    Some(match tail {
+        Some(tail) => format!("{indent}{mnem} {name},{tail}"),
+        None => format!("{indent}{mnem} {name}"),
+    })
+}
+
+fn retarget_defs_into_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if n == 0 || lines[..n].iter().any(|l| l == OPAQUE_LINE) {
+        return false;
+    }
+    let Some(live_before) = abi_liveness(lines, kinds, n) else {
+        return false;
+    };
+    // Copies are visited in text order and each rewrite only shortens S's
+    // live range or lengthens D's inside (def, copy], so the liveness of the
+    // original text stays a sound answer for every later copy's death test.
+    let mut changed = false;
+    for j in 0..n {
+        let LineKind::Move { dst, src, is_32bit } = kinds[j] else {
+            continue;
+        };
+        if dst == src || dst >= 29 || src >= 29 || j + 1 >= n {
+            continue;
+        }
+        if live_before[j + 1] >> src & 1 != 0 {
+            continue;
+        }
+        let mut readers: Vec<usize> = Vec::new();
+        let mut def = None;
+        let mut k = j;
+        while k > 0 {
+            k -= 1;
+            match kinds[k] {
+                LineKind::Nop | LineKind::Directive => continue,
+                LineKind::Label
+                | LineKind::Branch
+                | LineKind::CondBranch
+                | LineKind::CmpBranch
+                | LineKind::Call
+                | LineKind::Ret => break,
+                _ => {}
+            }
+            let line = &lines[k];
+            // A supervisor call reads x0-x7 and writes x0 without naming
+            // them: neither the source nor the destination may cross it.
+            if a64_traps_to_handler(line) {
+                break;
+            }
+            if renamable_def_dest(line).is_some_and(|(dest, _)| dest == src) {
+                def = Some(k);
+                break;
+            }
+            if line_mentions_reg(line, dst) {
+                break;
+            }
+            if line_mentions_reg(line, src) {
+                if !reads_gp_only(line, src) {
+                    break;
+                }
+                readers.push(k);
+            }
+        }
+        let Some(i) = def else {
+            continue;
+        };
+        let Some((_, narrow)) = renamable_def_dest(&lines[i]) else {
+            continue;
+        };
+        let retargeted = if is_32bit && !narrow {
+            // A 32-bit copy of a 64-bit register move reads only the low
+            // word of the move's source: `mov xS, xR; mov wD, wS` is
+            // `mov wD, wR`.  Any other 64-bit definition keeps its copy.
+            // The readers in between saw all 64 bits of S, which D will
+            // not hold, so the narrowed form needs there to be none.
+            match kinds[i] {
+                LineKind::Move {
+                    src: r,
+                    is_32bit: false,
+                    ..
+                } if r <= 30 && readers.is_empty() => {
+                    let indent = &lines[i][..lines[i].len() - lines[i].trim_start().len()];
+                    format!("{indent}mov {}, {}", wreg_name(dst), wreg_name(r))
+                }
+                _ => continue,
+            }
+        } else {
+            match rename_def_dest(&lines[i], dst) {
+                Some(line) => line,
+                None => continue,
+            }
+        };
+        lines[i] = retargeted;
+        kinds[i] = classify_line(&lines[i]);
+        for &k in &readers {
+            lines[k] = rename_gp_tokens(&lines[k], src, dst);
+            kinds[k] = classify_line(&lines[k]);
+        }
+        kinds[j] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+// ── Conditional increment ────────────────────────────────────────────────────
+//
+// `cset t, cc` followed by `add a, b, t` is `cinc a, b, cc` once t dies at
+// the add: one instruction instead of two, and the 0/1 never occupies a
+// register (count_if's `c += a[i] < t`; Clang and GCC emit `cinc`).  The
+// flags must reach the add unchanged and nothing between may touch t; the
+// add may name t on either side.
+
+fn writes_flags_any_a64(mnemonic: &str) -> bool {
+    writes_flags_a64(mnemonic)
+        || matches!(
+            mnemonic,
+            "ccmp"
+                | "ccmn"
+                | "fccmp"
+                | "fccmpe"
+                | "adcs"
+                | "sbcs"
+                | "ngcs"
+                | "msr"
+                | "setf8"
+                | "setf16"
+                | "rmif"
+                | "cfinv"
+                | "axflag"
+                | "xaflag"
+        )
+}
+
+fn fold_cset_add_to_cinc(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if n == 0 || lines[..n].iter().any(|l| l == OPAQUE_LINE) {
+        return false;
+    }
+    let Some(live_before) = abi_liveness(lines, kinds, n) else {
+        return false;
+    };
+    let mut changed = false;
+    for i in 0..n {
+        let t = lines[i].trim();
+        let Some(rest) = t.strip_prefix("cset ") else {
+            continue;
+        };
+        let Some((treg, cc)) = rest.split_once(',') else {
+            continue;
+        };
+        let (treg, cc) = (treg.trim(), cc.trim());
+        let tnum = parse_reg(treg);
+        if tnum > 28 || invert_condition(cc).is_none() {
+            continue;
+        }
+        let cc = cc.to_string();
+        let mut k = i + 1;
+        let mut found = None;
+        while k < n {
+            match kinds[k] {
+                LineKind::Nop | LineKind::Directive => {
+                    k += 1;
+                    continue;
+                }
+                LineKind::Label
+                | LineKind::Branch
+                | LineKind::CondBranch
+                | LineKind::CmpBranch
+                | LineKind::Call
+                | LineKind::Ret => break,
+                _ => {}
+            }
+            let line = lines[k].trim();
+            let mnem = line.split_whitespace().next().unwrap_or("");
+            // A handler call may read the 0/1 as an argument register.
+            if a64_traps_to_handler(line) {
+                break;
+            }
+            if line_mentions_reg(line, tnum) {
+                found = Some(k);
+                break;
+            }
+            if writes_flags_any_a64(mnem) {
+                break;
+            }
+            k += 1;
+        }
+        let Some(k) = found else {
+            continue;
+        };
+        let Some((d, a, b)) = three_operands(&lines[k], "add") else {
+            continue;
+        };
+        // The 0/1 must die at the add -- unless the add overwrites t itself.
+        if k + 1 >= n || (parse_reg(d) != tnum && live_before[k + 1] >> tnum & 1 != 0) {
+            continue;
+        }
+        let wide = d.starts_with('x');
+        let other = if parse_reg(a) == tnum && a.starts_with(['x', 'w']) {
+            b
+        } else if parse_reg(b) == tnum && b.starts_with(['x', 'w']) {
+            a
+        } else {
+            continue;
+        };
+        // Both sources plain registers of the add's width; t's 0/1 is the
+        // same in either view.  `other` must not be t itself.
+        let (Some(dnum), Some(onum)) =
+            (plain_reg_of_width(d, wide), plain_reg_of_width(other, wide))
+        else {
+            continue;
+        };
+        if onum == tnum || dnum > 30 {
+            continue;
+        }
+        let indent = &lines[k][..lines[k].len() - lines[k].trim_start().len()];
+        lines[k] = format!("{indent}cinc {d}, {other}, {cc}");
+        kinds[k] = classify_line(&lines[k]);
+        kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
 /// True when the line's token stream mentions the given register (x or w form).
 fn line_mentions_reg(line: &str, reg: u8) -> bool {
     let xn = xreg_name(reg);
@@ -6989,22 +7749,31 @@ fn cse_adrp_remat_pairs(lines: &mut [String], kinds: &mut [LineKind], n: usize) 
 // twin.
 //
 // Operative rule for a def-sequence D at position p (loop [T..L], backedge
-// at L, loop top label at T):
+// at L, loop top label at T), destination xD:
 //   * D is pure: `movz xD,#imm` (+ contiguous movk chain on xD),
-//     `adrp xD,sym` [+ `add xD,xD,:lo12:sym`], or `ldr xD,[sp,#off]`;
-//   * the loop is call-free (a caller-saved dest would die at the call —
-//     the original re-def at p is what saved it) and has a single backedge
-//     (no other branch targets .Ltop);
-//   * p is at the TOP of the header block: no mention of xD between the
-//     label and p, and every mention of xD after p WITHIN the header block
-//     is use-first (a reader of D's value);
-//   * every OTHER def of xD in the loop is a textually identical sequence
-//     (so xD carries the same value at every in-loop point both before and
-//     after the transform); sp-slot loads additionally require no store in
-//     the loop overlapping [off-7, off+7];
-//   * transform: copy D above the loop-top label, delete the header copy.
-//     Cross-block, same-value co-defs stay (they rewrite xD with the same
-//     constant — harmless), and post-loop readers still see the constant.
+//     `adrp xD,sym` [+ `add xD,xD,:lo12:sym`], or `ldr xD,[sp,#off]`, and
+//     xD is neither x29 nor x30;
+//   * the loop is call-free, every branch in it is direct, and control
+//     enters it only at T -- by falling in or by a branch from above, both
+//     of which receive a copy of D.  A label inside the loop named by a
+//     branch from outside it or by anything but a branch (a jump table, an
+//     `adr`) is an entry that would bypass the copies;
+//   * nothing else in the loop defines xD, no line between T and p names
+//     it, and every mention after p is use-first;
+//   * every reader of xD in the loop runs after D: it sits in a block T
+//     cannot reach without passing D's block (a reader after `if (c) x = K;`
+//     saw the pre-loop value on the trips that skipped D);
+//   * xD is dead wherever the transform changes it outside the loop: on
+//     every exit from a block T reaches without passing D's block, and on
+//     the fall-through path of a conditional entry branch.  Liveness models
+//     the AAPCS64 implicit reads exactly (a call or `svc` reads x0-x8, a
+//     `ret` x0, x1 and x19-x29, a tail call both); a function whose control
+//     flow it cannot resolve (a jump table) only admits a scratch xD that
+//     no line outside the loop names;
+//   * sp-slot loads: nothing in the loop moves sp or may write the slot --
+//     an overlapping sp-relative store, or any store whose base can hold a
+//     frame address (always the case once one escapes into a register);
+//   * transform: copy D before every entry branch and above T, delete D.
 //
 // Kill switch: CCC_NO_INVAR_HOIST.
 
@@ -7079,15 +7848,675 @@ fn branch_targets(line: &str, kind: LineKind, label: &str) -> bool {
     }
 }
 
+/// `[start, end)` of every function delimited by `.cfi_startproc` and
+/// `.cfi_endproc` (inclusive) in `lines[..n]`, in order; the whole text as
+/// one range when the module carries no CFI delimiters
+/// (`-fno-asynchronous-unwind-tables`).
+fn function_body_ranges(lines: &[String], n: usize) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start = None;
+    for (i, line) in lines.iter().enumerate().take(n) {
+        match line.trim() {
+            ".cfi_startproc" => start = Some(i),
+            ".cfi_endproc" => {
+                if let Some(s) = start.take() {
+                    ranges.push((s, i + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        ranges.push((s, n));
+    }
+    if ranges.is_empty() {
+        ranges.push((0, n));
+    }
+    ranges
+}
+
+/// Run `pass` -- one that rewrites lines in place, never inserting or
+/// removing any -- on each function's own lines.  For a pass whose
+/// reasoning is function-local (loops, a function's CFG), a module-wide
+/// run only made each query pay for the whole text: `rotate_simple_loops`
+/// searched the module for every header label and counted backedges across
+/// it, and `propagate_address_aliases` built its "one function" CFG -- with
+/// dominator bitsets quadratic in the block count -- over every function
+/// at once and scanned every line of the module per query (memclr.c at
+/// -O2: 47 of 54 seconds of AArch64 codegen).
+fn per_function(
+    lines: &mut [String],
+    kinds: &mut [LineKind],
+    n: usize,
+    pass: fn(&mut [String], &mut [LineKind], usize) -> bool,
+) -> bool {
+    let mut changed = false;
+    for (start, end) in function_body_ranges(lines, n) {
+        changed |= pass(&mut lines[start..end], &mut kinds[start..end], end - start);
+    }
+    changed
+}
+
+/// Hoist loop-invariant rematerializations (see the rule above), one
+/// function at a time.  A loop never spans functions, so every scan of the
+/// walk -- the last backedge to a header, the entries above it, the readers
+/// after the loop -- is bounded by the function's own lines.  Over the
+/// whole module those scans, and the restart from line 0 after each hoist,
+/// made the pass quadratic in the number of functions (memclr.c, 2049
+/// functions: 400 of the 406 seconds of an AArch64 -O0 compile), and a
+/// mention of the register in a LATER function counted as a reader after
+/// the loop.
 fn hoist_loop_invariant_remats(
     lines: &mut Vec<String>,
     kinds: &mut Vec<LineKind>,
-    mut n: usize,
+    n: usize,
 ) -> bool {
     if std::env::var("CCC_NO_INVAR_HOIST").is_ok() {
         return false;
     }
+    let ranges = function_body_ranges(lines, n);
+    let outside = names_outside_functions(lines, kinds, n, &ranges);
+    let has_backedge_candidate = |k: &[LineKind]| {
+        k.iter().any(|kind| {
+            matches!(
+                kind,
+                LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch
+            )
+        })
+    };
     let mut changed = false;
+    let mut old_lines = std::mem::take(lines).into_iter();
+    let mut old_kinds = std::mem::take(kinds).into_iter();
+    let mut pos = 0;
+    for (start, end) in ranges {
+        lines.extend(old_lines.by_ref().take(start - pos));
+        kinds.extend(old_kinds.by_ref().take(start - pos));
+        let mut fn_lines: Vec<String> = old_lines.by_ref().take(end - start).collect();
+        let mut fn_kinds: Vec<LineKind> = old_kinds.by_ref().take(end - start).collect();
+        if has_backedge_candidate(&fn_kinds) {
+            changed |= hoist_loop_invariant_remats_in(&mut fn_lines, &mut fn_kinds, &outside);
+        }
+        lines.extend(fn_lines);
+        kinds.extend(fn_kinds);
+        pos = end;
+    }
+    lines.extend(old_lines);
+    kinds.extend(old_kinds);
+    changed
+}
+
+/// Every symbol-like token named on a line outside all function ranges.  A
+/// table of label addresses (`static void *t[] = { &&l, ... }`) is emitted in
+/// a data section between functions, so the labels it names are entries --
+/// targets of the function's indirect branches -- that a scan of the
+/// function's own lines never sees.
+fn names_outside_functions(
+    lines: &[String],
+    kinds: &[LineKind],
+    n: usize,
+    ranges: &[(usize, usize)],
+) -> FxHashSet<String> {
+    let mut names = FxHashSet::default();
+    let mut pos = 0;
+    // The ranges are ordered and disjoint; the empty one at `n` closes the
+    // text after the last function.
+    for &(start, end) in ranges.iter().chain(std::iter::once(&(n, n))) {
+        for m in pos..start {
+            if matches!(kinds[m], LineKind::Label | LineKind::Nop) {
+                continue;
+            }
+            for tok in lines[m].split(|c: char| !is_symbol_char(c)) {
+                if tok.starts_with(|c: char| c == '.' || c == '_' || c.is_ascii_alphabetic()) {
+                    names.insert(tok.to_string());
+                }
+            }
+        }
+        pos = end;
+    }
+    names
+}
+
+/// Characters of an assembler symbol as the hoist's label scans split them.
+fn is_symbol_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '$'
+}
+
+/// AAPCS64 registers a control transfer reads without naming them.  A call
+/// (`bl`, `blr`) or a system call reads the argument registers x0-x7 and the
+/// indirect-result register x8.
+const A64_ARG_GP: u64 = 0x1ff;
+/// A return hands the result registers (x0, x1: a GP result never needs
+/// more -- a larger one goes to memory through x8) and the callee-saved
+/// x19-x29 back to the caller.  The link register x30 is modeled by
+/// `classify_implicit_operands_a64`.
+const A64_RET_GP: u64 = 0x3 | 0x3ff8_0000;
+const A64_ALL_GP: u64 = (1u64 << 31) - 1;
+
+/// Backward liveness of the GP registers over one function with every
+/// implicit read of the AAPCS64 modeled exactly: `live_before[i]` is the set
+/// live immediately before line `i`.
+///
+/// `Liveness` answers a different question (it is shared with the copy
+/// coalescer, which deliberately leaves a call's arguments out and charges
+/// a `ret` with x0-x7): a transformation that CHANGES a register's value on
+/// some path must see every reader, so here a call and `svc` read
+/// `A64_ARG_GP`, a `ret` reads `A64_RET_GP`, and a direct branch out of the
+/// function (a tail call) reads both and the link register.  `None` when the
+/// control flow cannot be resolved: an indirect `br xN` (a jump table) or a
+/// conditional branch to a label this function does not define.
+fn abi_liveness(lines: &[String], kinds: &[LineKind], n: usize) -> Option<Vec<u64>> {
+    if n == 0 {
+        return None;
+    }
+    let is_transfer = |k: LineKind| {
+        matches!(
+            k,
+            LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch | LineKind::Ret
+        )
+    };
+    let mut starts = vec![0usize];
+    for m in 1..n {
+        if kinds[m] == LineKind::Label || is_transfer(kinds[m - 1]) {
+            starts.push(m);
+        }
+    }
+    let nb = starts.len();
+    let bend = |b: usize| if b + 1 < nb { starts[b + 1] } else { n };
+    let mut label_block: FxHashMap<&str, usize> = FxHashMap::default();
+    for (b, &s) in starts.iter().enumerate() {
+        if kinds[s] == LineKind::Label {
+            label_block.insert(lines[s].trim().trim_end_matches(':'), b);
+        }
+    }
+    // Successors; a block that runs off the end of the text keeps every
+    // register live (nothing says what follows it).
+    let mut succs: Vec<Vec<usize>> = Vec::with_capacity(nb);
+    let mut open_end = vec![false; nb];
+    for b in 0..nb {
+        let mut t = bend(b);
+        while t > starts[b] && matches!(kinds[t - 1], LineKind::Nop | LineKind::Directive) {
+            t -= 1;
+        }
+        let fall = |s: &mut Vec<usize>, open: &mut bool| {
+            if b + 1 < nb {
+                s.push(b + 1);
+            } else {
+                *open = true;
+            }
+        };
+        let mut s = Vec::new();
+        let last = if t > starts[b] { Some(t - 1) } else { None };
+        match last.map(|l| kinds[l]) {
+            Some(LineKind::Ret) => {}
+            Some(LineKind::Branch) => {
+                let text = lines[t - 1].trim();
+                if text.starts_with("br ") {
+                    return None;
+                }
+                let tgt = text.split_whitespace().next_back();
+                if let Some(&tb) = tgt.and_then(|l| label_block.get(l)) {
+                    s.push(tb);
+                }
+                // Otherwise a tail call: an exit whose reads the transfer
+                // function below adds.
+            }
+            Some(LineKind::CondBranch | LineKind::CmpBranch) => {
+                let tgt = lines[t - 1].trim().split_whitespace().next_back();
+                s.push(*tgt.and_then(|l| label_block.get(l))?);
+                fall(&mut s, &mut open_end[b]);
+            }
+            _ => fall(&mut s, &mut open_end[b]),
+        }
+        succs.push(s);
+    }
+    let transfer = |k: usize| -> (u64, u64) {
+        let (mut u, d) = gp_operands(&lines[k], kinds[k], false);
+        let text = lines[k].trim();
+        match kinds[k] {
+            LineKind::Call => u |= A64_ARG_GP,
+            LineKind::Ret => u |= A64_RET_GP,
+            LineKind::Branch => {
+                let tgt = text.split_whitespace().next_back();
+                if !tgt.is_some_and(|l| label_block.contains_key(l)) {
+                    u |= A64_ARG_GP | A64_RET_GP | (1u64 << 30);
+                }
+            }
+            _ => {
+                if text == "svc" || text.starts_with("svc ") {
+                    u |= A64_ARG_GP;
+                }
+            }
+        }
+        (u, d)
+    };
+    let mut live_in = vec![0u64; nb];
+    let mut live_before = vec![0u64; n];
+    // Iterate to the fixed point: the sets only grow, so this terminates,
+    // and stopping any earlier could report a live register as dead.
+    loop {
+        let mut changed = false;
+        for b in (0..nb).rev() {
+            let mut live = if open_end[b] { A64_ALL_GP } else { 0 };
+            for &sc in &succs[b] {
+                live |= live_in[sc];
+            }
+            for k in (starts[b]..bend(b)).rev() {
+                if !matches!(
+                    kinds[k],
+                    LineKind::Nop | LineKind::Directive | LineKind::Label
+                ) {
+                    let (u, d) = transfer(k);
+                    live = (live & !d) | u;
+                }
+                live_before[k] = live;
+            }
+            if live != live_in[b] {
+                live_in[b] = live;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Some(live_before)
+}
+
+/// May `line` write memory?  Every store (`st*`, including the pair, release
+/// and exclusive forms), every LSE atomic, the memory-setting/copying MOPS
+/// instructions, `dc` and `svc`.  Over-approximate on purpose.
+fn a64_may_write_memory(line: &str) -> bool {
+    const ATOMICS: [&str; 10] = [
+        "ldadd", "ldclr", "ldeor", "ldset", "ldsmax", "ldsmin", "ldumax", "ldumin", "swp", "cas",
+    ];
+    let m = line.split_whitespace().next().unwrap_or("");
+    m.starts_with("st")
+        || ATOMICS.iter().any(|p| m.starts_with(p))
+        || m.starts_with("cpy")
+        || m.starts_with("set")
+        || m == "dc"
+        || m == "svc"
+}
+
+/// The base register token of `line`'s first memory operand (`sp` in
+/// `str x0, [sp, #8]`), if it has one.
+fn a64_mem_base(line: &str) -> Option<&str> {
+    let open = line.find('[')?;
+    let inner = &line[open + 1..];
+    let base = inner.split([',', ']']).next()?.trim();
+    (!base.is_empty()).then_some(base)
+}
+
+/// The bytes `[lo, hi)` (sp-relative) that a store through `[sp]` or
+/// `[sp, #imm]` without writeback writes.  `None` for any other address or an
+/// access size this does not know.
+fn a64_sp_store_range(line: &str) -> Option<(i64, i64)> {
+    let (m, ops) = line.trim().split_once(char::is_whitespace)?;
+    let ops = ops.trim();
+    let open = ops.find('[')?;
+    let close = open + ops[open..].find(']')?;
+    if !ops[close + 1..].trim().is_empty() {
+        return None; // `]!` pre-index or `], #imm` post-index
+    }
+    let inner = ops[open + 1..close].trim();
+    let off: i64 = if inner == "sp" {
+        0
+    } else {
+        inner
+            .strip_prefix("sp,")?
+            .trim()
+            .strip_prefix('#')?
+            .parse()
+            .ok()?
+    };
+    let first = ops[..open].split(',').next()?.trim();
+    let reg_bytes = |r: &str| -> Option<i64> {
+        match r.chars().next()? {
+            'x' | 'd' => Some(8),
+            'w' | 's' => Some(4),
+            'h' => Some(2),
+            'b' => Some(1),
+            'q' => Some(16),
+            _ => None,
+        }
+    };
+    let size = match m {
+        "strb" | "sturb" => 1,
+        "strh" | "sturh" => 2,
+        "str" | "stur" => reg_bytes(first)?,
+        "stp" | "stnp" => 2 * reg_bytes(first)?,
+        _ => return None,
+    };
+    Some((off, off + size))
+}
+
+/// Does `line` change sp?  A pre/post-indexed access through sp, or an
+/// instruction naming sp as its destination (`sub sp, sp, #16`,
+/// `mov sp, x29`).
+fn a64_writes_sp(line: &str) -> bool {
+    let Some((m, ops)) = line.trim().split_once(char::is_whitespace) else {
+        return false;
+    };
+    let ops = ops.trim();
+    if writeback_base(ops) == Some(31) {
+        return true;
+    }
+    if m.starts_with("st") || m.starts_with("ld") || m.starts_with("prf") {
+        return false;
+    }
+    ops.split(',').next().map(str::trim) == Some("sp")
+}
+
+/// Can a register other than sp or the frame pointer hold an address in this
+/// function's frame?  True when any instruction computes one from sp or x29
+/// (`add x0, sp, #32` for an address-taken local, `add x1, x29, #16` for a
+/// va_list, `mov x0, x29` for `__builtin_frame_address`) or stores x29 (once
+/// it holds this frame) anywhere but the prologue's push.  When false, a
+/// store through any other base register cannot write a stack slot.
+fn a64_frame_address_escapes(lines: &[String], kinds: &[LineKind], n: usize) -> bool {
+    let frame_tok = |t: &str| t == "sp" || t == "x29" || t == "w29";
+    (0..n).any(|m| {
+        if matches!(
+            kinds[m],
+            LineKind::Nop | LineKind::Directive | LineKind::Label
+        ) {
+            return false;
+        }
+        let Some((mn, ops)) = lines[m].trim().split_once(char::is_whitespace) else {
+            return false;
+        };
+        let ops = ops.trim();
+        // Operands outside the memory operand; the base inside it is an
+        // access, not a computed address.
+        let regs_text = match ops.find('[') {
+            Some(open) => &ops[..open],
+            None => ops,
+        };
+        let mut regs = regs_text
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
+        if mn.starts_with("st") {
+            // Every register named before the address is a stored value; the
+            // prologue's `stp x29, x30, [sp, #-N]!` stores the CALLER's x29.
+            let push = writeback_base(ops) == Some(31) && ops.contains("]!");
+            return !push && regs.any(frame_tok);
+        }
+        if mn.starts_with("ld") || mn.starts_with("prf") {
+            return false; // registers before the address are written
+        }
+        if matches!(mn, "cmp" | "cmn" | "tst" | "ccmp" | "ccmn") {
+            return regs.any(frame_tok);
+        }
+        // Data processing: the first operand is the destination, and sp or
+        // x29 as the destination sets up or restores the frame
+        // (`mov x29, sp`, `sub sp, sp, #16`, `mov sp, x29`).
+        if regs.next().is_some_and(frame_tok) {
+            return false;
+        }
+        regs.any(frame_tok)
+    })
+}
+
+/// Can the loop `[top, end]` write the `[lo, hi)` sp-relative bytes a hoisted
+/// slot load reads, or move sp under it?
+fn loop_may_write_slot(
+    lines: &[String],
+    kinds: &[LineKind],
+    top: usize,
+    end: usize,
+    (lo, hi): (i64, i64),
+    frame_escapes: bool,
+) -> bool {
+    (top..=end).any(|m| {
+        if matches!(
+            kinds[m],
+            LineKind::Nop | LineKind::Directive | LineKind::Label
+        ) {
+            return false;
+        }
+        let line = lines[m].as_str();
+        if a64_writes_sp(line) {
+            return true;
+        }
+        if !a64_may_write_memory(line) {
+            return false;
+        }
+        if let Some((slo, shi)) = a64_sp_store_range(line) {
+            return slo < hi && lo < shi;
+        }
+        let m0 = line.split_whitespace().next().unwrap_or("");
+        if m0 == "svc" || m0 == "dc" || frame_escapes {
+            return true;
+        }
+        // A store whose base is sp (register offset) or the frame pointer
+        // addresses the frame; any other base cannot, the frame not escaping.
+        matches!(a64_mem_base(line), Some("sp" | "x29") | None)
+    })
+}
+
+/// Facts about one function that every loop of the hoist walk shares; rebuilt
+/// after each transform, which restarts the walk.
+struct HoistFacts {
+    /// Line of every label the function defines.
+    label_line: FxHashMap<String, usize>,
+    /// Lines (other than the definition) naming each label.
+    label_refs: FxHashMap<String, Vec<usize>>,
+    /// Labels of this function named outside every function (a data table
+    /// of label addresses): entries from an indirect branch.
+    escaped: FxHashSet<String>,
+    frame_escapes: bool,
+    /// `abi_liveness`, computed on first use.
+    live: Option<Option<Vec<u64>>>,
+}
+
+impl HoistFacts {
+    fn build(lines: &[String], kinds: &[LineKind], n: usize, outside: &FxHashSet<String>) -> Self {
+        let mut label_line: FxHashMap<String, usize> = FxHashMap::default();
+        for m in 0..n {
+            if kinds[m] == LineKind::Label {
+                label_line.insert(lines[m].trim().trim_end_matches(':').to_string(), m);
+            }
+        }
+        // Deleted lines keep their text with a `Nop` kind (a removed branch
+        // to the next line still reads `b.lt .L3`): they reference nothing.
+        let mut label_refs: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        for m in 0..n {
+            if matches!(kinds[m], LineKind::Label | LineKind::Nop) {
+                continue;
+            }
+            for tok in lines[m].split(|c: char| !is_symbol_char(c)) {
+                if label_line.contains_key(tok) {
+                    label_refs.entry(tok.to_string()).or_default().push(m);
+                }
+            }
+        }
+        let escaped = label_line
+            .keys()
+            .filter(|name| outside.contains(name.as_str()))
+            .cloned()
+            .collect();
+        HoistFacts {
+            label_line,
+            label_refs,
+            escaped,
+            frame_escapes: a64_frame_address_escapes(lines, kinds, n),
+            live: None,
+        }
+    }
+
+    fn live(&mut self, lines: &[String], kinds: &[LineKind], n: usize) -> Option<&[u64]> {
+        self.live
+            .get_or_insert_with(|| abi_liveness(lines, kinds, n))
+            .as_deref()
+    }
+}
+
+/// Where control goes when it leaves a loop: the line whose live-in set
+/// must not contain the hoisted register (a label outside the loop, the line
+/// after the backedge, or a `ret`/tail call inside it, whose own reads are in
+/// its live-in set), or somewhere unknown.
+#[derive(Clone, Copy)]
+enum LoopExit {
+    At(usize),
+    Unknown,
+}
+
+/// The control flow inside one loop `[top, end]` (`end` is the backedge).
+struct LoopShape {
+    top: usize,
+    block_of: Vec<usize>,
+    succs: Vec<Vec<usize>>,
+    /// Every way out of the loop, with the block it leaves from.
+    exits: Vec<(usize, LoopExit)>,
+}
+
+impl LoopShape {
+    /// `None` unless control enters the loop only at its top -- by falling
+    /// into it or by a branch from above, both of which receive a copy of a
+    /// hoisted sequence -- and every branch inside it is direct.  A label in
+    /// the loop named by a branch from outside it (a side entry), by a
+    /// branch below it, or by anything that is not a branch (a jump table's
+    /// `.word`, an `adr`, a label-address table in a data section outside
+    /// the function) is an entry that would bypass the copies.
+    fn build(
+        lines: &[String],
+        kinds: &[LineKind],
+        n: usize,
+        top: usize,
+        end: usize,
+        facts: &HoistFacts,
+    ) -> Option<LoopShape> {
+        let is_transfer = |k: LineKind| {
+            matches!(
+                k,
+                LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch | LineKind::Ret
+            )
+        };
+        let is_branch = |k: LineKind| {
+            matches!(
+                k,
+                LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch
+            )
+        };
+        let mut block_of = vec![0usize; end - top + 1];
+        let mut starts = vec![top];
+        let mut region_labels: FxHashMap<&str, usize> = FxHashMap::default();
+        for m in top..=end {
+            if m > top && (kinds[m] == LineKind::Label || is_transfer(kinds[m - 1])) {
+                starts.push(m);
+            }
+            block_of[m - top] = starts.len() - 1;
+            if kinds[m] == LineKind::Label {
+                region_labels.insert(lines[m].trim().trim_end_matches(':'), starts.len() - 1);
+            }
+            if kinds[m] == LineKind::Branch && lines[m].trim_start().starts_with("br ") {
+                return None;
+            }
+        }
+        let top_label = lines[top].trim().trim_end_matches(':');
+        for &label in region_labels.keys() {
+            if facts.escaped.contains(label) {
+                return None;
+            }
+            for &q in facts.label_refs.get(label).map_or(&[][..], |v| &v[..]) {
+                let inside = (top..=end).contains(&q);
+                let entry = q < top && label == top_label;
+                if !(is_branch(kinds[q]) && (inside || entry)) {
+                    return None;
+                }
+            }
+        }
+        let nb = starts.len();
+        let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nb];
+        let mut exits = Vec::new();
+        let leave = |line: usize| {
+            if line < n {
+                LoopExit::At(line)
+            } else {
+                LoopExit::Unknown
+            }
+        };
+        for b in 0..nb {
+            let be = if b + 1 < nb { starts[b + 1] } else { end + 1 };
+            let mut t = be;
+            while t > starts[b] && matches!(kinds[t - 1], LineKind::Nop | LineKind::Directive) {
+                t -= 1;
+            }
+            let last = if t > starts[b] { Some(t - 1) } else { None };
+            let target = |l: usize| lines[l].trim().split_whitespace().next_back();
+            let mut falls = true;
+            match last.map(|l| kinds[l]) {
+                Some(LineKind::Ret) => {
+                    exits.push((b, LoopExit::At(t - 1)));
+                    falls = false;
+                }
+                Some(k @ (LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch)) => {
+                    let l = t - 1;
+                    match target(l) {
+                        Some(name) if region_labels.contains_key(name) => {
+                            succs[b].push(region_labels[name]);
+                        }
+                        Some(name) if facts.label_line.contains_key(name) => {
+                            exits.push((b, LoopExit::At(facts.label_line[name])));
+                        }
+                        // A tail call reads what it reads at the branch.
+                        _ if k == LineKind::Branch => exits.push((b, LoopExit::At(l))),
+                        _ => exits.push((b, LoopExit::Unknown)),
+                    }
+                    falls = k != LineKind::Branch;
+                }
+                _ => {}
+            }
+            if falls {
+                if b + 1 < nb {
+                    succs[b].push(b + 1);
+                } else {
+                    exits.push((b, leave(end + 1)));
+                }
+            }
+        }
+        Some(LoopShape {
+            top,
+            block_of,
+            succs,
+            exits,
+        })
+    }
+
+    fn block(&self, line: usize) -> usize {
+        self.block_of[line - self.top]
+    }
+
+    /// Blocks reachable from the loop top without passing through `barrier`.
+    fn reachable_avoiding(&self, barrier: usize) -> Vec<bool> {
+        let mut seen = vec![false; self.succs.len()];
+        if barrier == 0 {
+            return seen;
+        }
+        seen[0] = true;
+        let mut stack = vec![0usize];
+        while let Some(b) = stack.pop() {
+            for &s in &self.succs[b] {
+                if s != barrier && !seen[s] {
+                    seen[s] = true;
+                    stack.push(s);
+                }
+            }
+        }
+        seen
+    }
+}
+
+/// The hoisting walk over one function's `lines`.
+fn hoist_loop_invariant_remats_in(
+    lines: &mut Vec<String>,
+    kinds: &mut Vec<LineKind>,
+    outside: &FxHashSet<String>,
+) -> bool {
+    let mut n = lines.len();
+    let mut changed = false;
+    let mut facts: Option<HoistFacts> = None;
     // Collect backward branches first (indices stable this pass: no inserts
     // happen until a transform commits, and after a commit we restart).
     let mut i = 0;
@@ -7147,24 +8576,18 @@ fn hoist_loop_invariant_remats(
             continue;
         }
 
-        // ── loop validity ──
-        // Entry edges into the loop top are the fallthrough and branches
-        // from ABOVE the top (handled by inserting copies at each such
-        // branch below). Branches from INSIDE the loop region to the top
-        // are additional backedges — sound without copies, because nothing
-        // in the loop defines dest after the transform (the value persists
-        // across them).
-        // Call-free loop.
+        // Call-free loop: a call clobbers the caller-saved registers, and a
+        // callee could write a slot through an escaped frame address.
         if (top..=i).any(|k| kinds[k] == LineKind::Call) {
             i += 1;
             continue;
         }
+        let fx = facts.get_or_insert_with(|| HoistFacts::build(lines, kinds, n, outside));
+        let Some(shape) = LoopShape::build(lines, kinds, n, top, i, fx) else {
+            i += 1;
+            continue;
+        };
         // Candidate scan: every position in the loop, starting at the top.
-        // The dest must be SELF-CONTAINED: defined exactly once (here), not
-        // mentioned before, and only read afterwards — then hoisting the
-        // pure sequence above the loop top preserves every value (the def
-        // executes once instead of once per trip; every reader sees the same
-        // constant/address either way).
         let mut transformed = false;
         let mut k = top;
         while k <= i {
@@ -7176,8 +8599,15 @@ fn hoist_loop_invariant_remats(
                 k += 1;
                 continue;
             };
+            // x29 (the frame pointer) and x30 (the link register) are not
+            // values a loop recomputes.
+            if dest > 28 {
+                k += 1;
+                continue;
+            }
             let seq_end = k + seq_len;
-            // No other def of dest anywhere in the loop.
+            // No other def of dest anywhere in the loop: once the sequence has
+            // run, dest holds its value until the loop is left.
             let mut other_def = false;
             let mut m = top;
             while m <= i {
@@ -7220,51 +8650,33 @@ fn hoist_loop_invariant_remats(
                 k += 1;
                 continue;
             }
-            // sp-slot loads: no overlapping store anywhere in the loop.
-            if lines[k].trim_start().starts_with("ldr ") {
-                let off = match kinds[k] {
-                    LineKind::LoadSp { offset, .. } => offset,
-                    _ => unreachable!(),
-                };
-                let mut bad = false;
-                let mut m = top;
-                while m <= i {
-                    if let LineKind::StoreSp { offset: so, .. } = kinds[m] {
-                        if (so - off).abs() < 8 {
-                            bad = true;
-                            break;
-                        }
-                    } else if matches!(kinds[m], LineKind::MemOther | LineKind::Other) {
-                        let t = lines[m].trim_start();
-                        if t.starts_with("str ") || t.starts_with("stur ") || t.starts_with("stp ")
-                        {
-                            for o in sp_offsets_in_line(t) {
-                                if (o - off).abs() < 8 {
-                                    bad = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if bad {
-                        break;
-                    }
-                    m += 1;
-                }
-                if bad {
+            // Every reader in the loop runs after the sequence: a reader in a
+            // block the loop top reaches without passing the sequence's
+            // block (a merge after `if (c) x = K;`) saw the value from before
+            // the loop on the trips that skipped the definition, and would
+            // see K after the hoist.
+            let free = shape.reachable_avoiding(shape.block(k));
+            if (top..=i).any(|m| {
+                (m < k || m >= seq_end)
+                    && free[shape.block(m)]
+                    && kinds[m] != LineKind::Nop
+                    && line_mentions_reg(&lines[m], dest)
+            }) {
+                k += 1;
+                continue;
+            }
+            // sp-slot loads: nothing in the loop may write the slot or move
+            // sp under it.
+            if let LineKind::LoadSp {
+                offset, is_word, ..
+            } = kinds[k]
+            {
+                let bytes = (offset as i64, offset as i64 + if is_word { 4 } else { 8 });
+                if loop_may_write_slot(lines, kinds, top, i, bytes, fx.frame_escapes) {
                     k += 1;
                     continue;
                 }
             }
-
-            // Dest must be dead after the loop: on paths whose seq block did
-            // not run, the register held an older value — post-loop readers
-            // must not observe the change.
-            if ((i + 1)..n).any(|m| line_mentions_reg(&lines[m], dest)) {
-                k += 1;
-                continue;
-            }
-
             // Entry edges: fallthrough (handled by inserting before the
             // label) plus every branch from ABOVE the loop that targets the
             // top. Entry branches must not read dest (the copy would change
@@ -7286,13 +8698,56 @@ fn hoist_loop_invariant_remats(
                 k += 1;
                 continue;
             }
+            // Where the transform changes dest outside the loop, nothing may
+            // read it: on an exit from a block the top reaches without
+            // passing the sequence (a trip that left before the sequence ever
+            // ran held the older value; an exit after it holds the same value
+            // either way), and on the fall-through path of a CONDITIONAL entry
+            // branch, where the copy placed before the branch also runs.  The
+            // exact liveness lets a later redefinition through; without it (a
+            // jump table) dest must be a scratch register no line outside the
+            // loop names.
+            let bit = 1u64 << dest;
+            let early_exits: Vec<LoopExit> = shape
+                .exits
+                .iter()
+                .filter(|&&(b, _)| free[b])
+                .map(|&(_, e)| e)
+                .collect();
+            let cond_entries: Vec<usize> = entry_branches
+                .iter()
+                .copied()
+                .filter(|&m| kinds[m] != LineKind::Branch)
+                .collect();
+            if !early_exits.is_empty() || !cond_entries.is_empty() {
+                let dead_outside = match fx.live(lines, kinds, n) {
+                    Some(lb) => {
+                        early_exits.iter().all(|e| match *e {
+                            LoopExit::At(t) => lb[t] & bit == 0,
+                            LoopExit::Unknown => false,
+                        }) && cond_entries
+                            .iter()
+                            .all(|&m| m + 1 < n && lb[m + 1] & bit == 0)
+                    }
+                    None => {
+                        (9..=18).contains(&dest)
+                            && !(0..top).chain(i + 1..n).any(|m| {
+                                kinds[m] != LineKind::Nop && line_mentions_reg(&lines[m], dest)
+                            })
+                    }
+                };
+                if !dead_outside {
+                    k += 1;
+                    continue;
+                }
+            }
 
             // ── transform: delete the in-loop sequence first (indices are
             //    still valid), then insert copies before every entry branch
             //    (descending order keeps earlier indices valid), then insert
             //    the fallthrough copy right before the (relocated) label. ──
             let seq_lines: Vec<String> = (k..seq_end).map(|q| lines[q].clone()).collect();
-            let seq_kinds: Vec<LineKind> = (k..seq_end).map(|q| kinds[q].clone()).collect();
+            let seq_kinds: Vec<LineKind> = (k..seq_end).map(|q| kinds[q]).collect();
             for _ in 0..seq_len {
                 lines.remove(k);
                 kinds.remove(k);
@@ -7300,7 +8755,7 @@ fn hoist_loop_invariant_remats(
             for &b in entry_branches.iter().rev() {
                 for (off, l) in seq_lines.iter().enumerate() {
                     lines.insert(b + off, l.clone());
-                    kinds.insert(b + off, seq_kinds[off].clone());
+                    kinds.insert(b + off, seq_kinds[off]);
                 }
             }
             let label_idx = (0..lines.len())
@@ -7310,7 +8765,7 @@ fn hoist_loop_invariant_remats(
                 .unwrap_or(top);
             for (off, l) in seq_lines.iter().enumerate() {
                 lines.insert(label_idx + off, l.clone());
-                kinds.insert(label_idx + off, seq_kinds[off].clone());
+                kinds.insert(label_idx + off, seq_kinds[off]);
             }
             transformed = true;
             break;
@@ -7318,11 +8773,11 @@ fn hoist_loop_invariant_remats(
         if transformed {
             changed = true;
             n = lines.len();
+            facts = None; // stale: lines moved
             i = 0; // loop shape changed: rescan
             continue;
         }
         i += 1;
-        continue;
     }
     changed
 }
@@ -7622,6 +9077,237 @@ mod tests {
         let asm = "f:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    str x21, [sp, #16]\n    add x21, x0, #5\n    add x9, x21, #3\n    mov x21, x9\n    add x0, x21, #1\n    ldr x21, [sp, #16]\n    ldp x29, x30, [sp], #32\n    ret\n";
         let out = coalesce_to_fixpoint(asm);
         assert_eq!(callee_saved_contract(&out), Ok(()), "{}", out.join("\n"));
+    }
+
+    /// The entry copies of `int` parameters are 32-bit: they fold into the
+    /// argument register when only W views of the home follow, all of them
+    /// in one pass (six copies used to leave two behind), and the copy whose
+    /// source the body overwrites while the home is live stays.
+    #[test]
+    fn entry_coalescing_folds_32_bit_parameter_copies() {
+        let asm = "six:\n    mov w7, w0\n    mov w8, w1\n    mov w13, w2\n    mov w14, w3\n    mov w9, w4\n    mov w10, w5\n    madd w5, w8, w13, w7\n    sub w5, w5, w14\n    madd w0, w9, w10, w5\n    ret\n";
+        let out = coalesce_to_fixpoint(asm);
+        assert_eq!(
+            out,
+            [
+                "six:",
+                "    mov w10, w5",
+                "    madd w5, w1, w2, w0",
+                "    sub w5, w5, w3",
+                "    madd w0, w4, w10, w5",
+                "    ret",
+            ],
+            "{}",
+            out.join("\n")
+        );
+        let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        assert!(coalesce_entry_copies(&mut lines, &mut kinds, n));
+        assert!(
+            !coalesce_entry_copies(&mut lines, &mut kinds, n),
+            "one call must reach the fixpoint"
+        );
+    }
+
+    /// `mov w5, w0` leaves x5 = zext(w0) while x0 keeps the caller's upper
+    /// half: a later 64-bit read of x5 forbids the fold.
+    #[test]
+    fn entry_coalescing_keeps_a_32_bit_copy_read_as_64_bits() {
+        for asm in [
+            "f:\n    mov w5, w0\n    add x0, x5, #1\n    ret\n",
+            "f:\n    mov w5, w0\n    ldr w0, [x1, x5, lsl #2]\n    ret\n",
+        ] {
+            let out = coalesce_to_fixpoint(asm);
+            assert!(
+                out.iter().any(|l| l.trim() == "mov w5, w0"),
+                "{}",
+                out.join("\n")
+            );
+        }
+    }
+
+    /// x0/x1 carry the result to the caller: a copy INTO one of them is never
+    /// renamed away, but x2-x7 are no result registers (`A64_RET_GP`).
+    #[test]
+    fn entry_coalescing_respects_only_the_result_registers_at_ret() {
+        let keep = coalesce_to_fixpoint("f:\n    mov x1, x5\n    add x0, x1, #1\n    ret\n");
+        assert!(
+            keep.iter().any(|l| l.trim() == "mov x1, x5"),
+            "{}",
+            keep.join("\n")
+        );
+        let fold = coalesce_to_fixpoint("f:\n    mov x5, x2\n    add x0, x5, #1\n    ret\n");
+        assert_eq!(
+            fold,
+            ["f:", "    add x0, x2, #1", "    ret"],
+            "{}",
+            fold.join("\n")
+        );
+    }
+
+    /// `mov wN, wN` clears bits 63:32 of xN: unobservable before a W write of
+    /// N that reads N only through its W view, observable otherwise.
+    #[test]
+    fn zext_self_move_goes_only_before_a_32_bit_overwrite() {
+        let gone = peephole_optimize(
+            "f:\n    mov w0, w0\n    and w0, w0, #0xff\n    fmov s0, w0\n    ret\n".to_string(),
+        );
+        assert!(!gone.contains("mov w0, w0"), "{gone}");
+        assert!(gone.contains("and w0, w0, #0xff"), "{gone}");
+        // W-view readers in between (the 32-bit count) do not see it either.
+        let count = peephole_optimize(
+            "f:\n    mov w0, w0\n    fmov s0, w0\n    cnt v0.8b, v0.8b\n    uaddlv h0, v0.8b\n    fmov w0, s0\n    ret\n"
+                .to_string(),
+        );
+        assert!(!count.contains("mov w0, w0"), "{count}");
+        assert!(count.contains("fmov s0, w0"), "{count}");
+        for (body, why) in [
+            ("    mov w0, w0\n    add x0, x0, #1\n", "64-bit read"),
+            (
+                "    mov w0, w0\n    add w1, w0, #1\n    mov x2, x0\n",
+                "no overwrite",
+            ),
+            ("    mov w0, w0\n    str x0, [x1]\n", "64-bit store"),
+            (
+                "    mov w0, w0\n    fmov s0, w0\n    fmov d1, x0\n    mov w0, #1\n",
+                "64-bit read after a W read",
+            ),
+            (
+                "    mov w0, w0\n    svc #0\n    mov w0, #1\n",
+                "the kernel reads x0",
+            ),
+        ] {
+            let out = peephole_optimize(format!("f:\n{body}    ret\n"));
+            assert!(out.contains("mov w0, w0"), "{why}: {out}");
+        }
+    }
+
+    /// The in-place zero-extension of a 32-bit argument kept in its arrival
+    /// register goes when no path reads bits 63:32 before N is redefined: a
+    /// `ret` that does not return N, both arms of a W-view test, a loop that
+    /// reads only the W view. Any X-view read on any path keeps it, and so
+    /// does control flow the analysis cannot follow.
+    #[test]
+    fn zext_self_move_goes_when_no_path_reads_the_x_view() {
+        let gone = [
+            "f:\n    mov w4, w4\n    madd w0, w4, w5, w0\n    ret\n",
+            "f:\n    mov w4, w4\n    cbz w4, .L1\n    sub w0, w0, w2\n    ret\n.L1:\n    mul w0, w1, w3\n    ret\n",
+            "f:\n    mov w4, w4\n.L1:\n    add w0, w0, w4\n    subs w1, w1, #1\n    b.ne .L1\n    ret\n",
+            // An X write that reads only the W view redefines all of x4.
+            "f:\n    mov w4, w4\n    sxtw x4, w4\n    bl g\n    ret\n",
+        ];
+        for asm in gone {
+            let out = peephole_optimize(asm.to_string());
+            assert!(!out.contains("mov w4, w4"), "{asm}=>{out}");
+        }
+        let kept = [
+            // x0 is the result register.
+            "f:\n    mov w0, w0\n    ret\n",
+            // One arm reads the X view.
+            "f:\n    mov w4, w4\n    cbz w4, .L1\n    ret\n.L1:\n    mov x0, x4\n    ret\n",
+            // A loop-carried X-view read.
+            "f:\n    mov w4, w4\n.L1:\n    add x0, x0, x4\n    subs w1, w1, #1\n    b.ne .L1\n    ret\n",
+            // A call may read its argument registers as 64-bit values.
+            "f:\n    mov w5, w5\n    bl g\n    ret\n",
+            // An indirect branch: no exact successor set.
+            "f:\n    mov w4, w4\n    adr x17, .L1\n    br x17\n.L1:\n    ret\n",
+        ];
+        for asm in kept {
+            let out = peephole_optimize(asm.to_string());
+            let zext = asm.lines().nth(1).unwrap_or_default().trim().to_string();
+            assert!(out.contains(&zext), "{asm}=>{out}");
+        }
+    }
+
+    /// `mov xA, xS; mov wA, wA` is `mov wA, wS` whatever follows: xA ends as
+    /// zext32(wS) either way and S is not touched.
+    #[test]
+    fn copy_then_zext_merges_into_one_32_bit_copy() {
+        let out = peephole_optimize(
+            "f:\n    mov x0, x4\n    mov w0, w0\n    cmp w0, #8\n    b.hs .L1\n    add x0, x0, #1\n.L1:\n    ret\n"
+                .to_string(),
+        );
+        assert!(out.contains("mov w0, w4"), "{out}");
+        assert!(
+            !out.contains("mov x0, x4") && !out.contains("mov w0, w0"),
+            "{out}"
+        );
+        // sp has no plain 32-bit move.
+        let sp = peephole_optimize(
+            "f:\n    mov x0, sp\n    mov w0, w0\n    str x0, [x1]\n    ret\n".to_string(),
+        );
+        assert!(
+            sp.contains("mov x0, sp") && sp.contains("mov w0, w0"),
+            "{sp}"
+        );
+    }
+
+    /// An entry copy coalesces across unclassified mnemonics that name every
+    /// register they touch (`ucvtf`, `csel`, `fmov`), never across a
+    /// supervisor call, which reads x0-x8 unnamed.
+    #[test]
+    fn entry_copy_coalesces_across_named_operand_mnemonics() {
+        let out = coalesce_to_fixpoint(
+            "f:\n    mov w4, w0\n    ucvtf s16, w4\n    fmov s0, s16\n    ret\n",
+        );
+        assert_eq!(
+            out,
+            ["f:", "    ucvtf s16, w0", "    fmov s0, s16", "    ret"],
+            "{}",
+            out.join("\n")
+        );
+        let sel = coalesce_to_fixpoint(
+            "f:\n    mov w8, w0\n    mov w9, w1\n    cmp w2, #0\n    csel w0, w8, w9, ne\n    ret\n",
+        );
+        assert_eq!(
+            sel,
+            ["f:", "    cmp w2, #0", "    csel w0, w0, w1, ne", "    ret"],
+            "{}",
+            sel.join("\n")
+        );
+        let svc = coalesce_to_fixpoint("f:\n    mov x8, x0\n    svc #0\n    mov x0, x8\n    ret\n");
+        assert!(
+            svc.iter().any(|l| l.trim() == "mov x8, x0"),
+            "{}",
+            svc.join("\n")
+        );
+    }
+
+    /// A callee-saved row lives exactly as long as its save: deleting the
+    /// save (or the half of a pair that named the register) drops the row,
+    /// a surviving save keeps it, and the frame-record rows are not touched.
+    #[test]
+    fn orphaned_callee_save_rows_follow_their_saves() {
+        let asm = "f:\n.cfi_startproc\n    stp x29, x30, [sp, #-48]!\n    .cfi_def_cfa_offset 48\n    .cfi_offset x29, -48\n    .cfi_offset x30, -40\n    mov x29, sp\n    .cfi_def_cfa_register x29\n    stp x19, x20, [sp, #16]\n    .cfi_offset x19, -32\n    .cfi_offset x20, -24\n    str d8, [sp, #32]\n    .cfi_offset d8, -16\n    mov x19, x0\n    ret\n.cfi_endproc\n";
+        let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        let live = |kinds: &[LineKind], lines: &[String]| -> Vec<String> {
+            lines
+                .iter()
+                .zip(kinds)
+                .filter(|(_, k)| **k != LineKind::Nop)
+                .map(|(l, _)| l.trim().to_owned())
+                .collect()
+        };
+        drop_orphaned_save_rows(&lines, &mut kinds, n);
+        assert_eq!(
+            live(&kinds, &lines).len(),
+            n,
+            "every save survives: no row goes"
+        );
+        // The d8 save is deleted; the pair is split down to x20.
+        kinds[11] = LineKind::Nop;
+        lines[8] = "    str x20, [sp, #24]".to_owned();
+        kinds[8] = classify_line(&lines[8]);
+        drop_orphaned_save_rows(&lines, &mut kinds, n);
+        let out = live(&kinds, &lines);
+        assert!(!out.iter().any(|l| l == ".cfi_offset d8, -16"), "{out:#?}");
+        assert!(!out.iter().any(|l| l == ".cfi_offset x19, -32"), "{out:#?}");
+        assert!(out.iter().any(|l| l == ".cfi_offset x20, -24"), "{out:#?}");
+        assert!(out.iter().any(|l| l == ".cfi_offset x29, -48"), "{out:#?}");
+        assert!(out.iter().any(|l| l == ".cfi_offset x30, -40"), "{out:#?}");
     }
 
     /// Coalescing an argument copy into a caller-saved home stays available.
@@ -7924,6 +9610,46 @@ mod tests {
         );
     }
 
+    /// The hoist walks one CFI-delimited function at a time: a later
+    /// function's mention of the register is not a reader after the loop
+    /// (it blocked the hoist when the scan ran to the end of the module),
+    /// and a hoist in the first function -- which inserts lines -- leaves
+    /// the second function's own hoist intact.
+    #[test]
+    fn test_invar_hoist_is_function_local() {
+        let looped = |name: &str| {
+            format!(
+                concat!(
+                    "{n}:\n.cfi_startproc\n",
+                    "    mov w0, #7\n",
+                    "    str w0, [sp, #40]\n",
+                    "    b.lt .L{n}\n",
+                    ".L{n}:\n",
+                    "    ldr w2, [sp, #40]\n",
+                    "    add w3, w2, #1\n",
+                    "    add w20, w20, #1\n",
+                    "    cmp w20, #100\n",
+                    "    b.lt .L{n}\n",
+                    "    ret\n",
+                    ".cfi_endproc\n",
+                ),
+                n = name
+            )
+        };
+        let reader = "other:\n.cfi_startproc\n    str w2, [x0]\n    ret\n.cfi_endproc\n";
+        let input = format!("{}{}{}", looped("first"), reader, looped("second"));
+        let result = peephole_optimize(input);
+        for name in ["first", "second"] {
+            let body = result.split(&format!(".L{name}:")).nth(1).unwrap_or("");
+            let loop_body = &body[..body.find("    ret").unwrap_or(body.len())];
+            assert!(
+                !loop_body.contains("[sp, #40]"),
+                "{name}: load not hoisted from the loop:\n{result}"
+            );
+        }
+        assert!(result.contains("other:\n.cfi_startproc\n    str w2, [x0]\n    ret\n"));
+    }
+
     #[test]
     fn test_invar_hoist_waits_for_last_backedge() {
         let input = concat!(
@@ -7978,32 +9704,393 @@ mod tests {
 
     #[test]
     fn test_invar_hoist_blocked_by_post_loop_reader() {
-        // x1 is read after the loop: paths that skip the original def block
-        // would observe a changed value.
+        // w2 is read after the loop, and the load sits in a block the loop
+        // top can skip: a run whose every trip skipped it leaves the loop
+        // with the older w2, which the hoist would replace.
         let input = concat!(
             "main:\n",
             "    mov w0, #7\n",
             "    str w0, [sp, #40]\n",
             "    b.lt .LBB10\n",
             ".LBB10:\n",
+            "    cbz w21, .LBB11\n",
             "    ldr w2, [sp, #40]\n",
+            "    str w2, [x22]\n",
+            ".LBB11:\n",
             "    add w20, w20, #1\n",
             "    cmp w20, #100\n",
             "    b.lt .LBB10\n",
             "    add w5, w2, #9\n",
             "    ret\n",
         );
-        let result = peephole_optimize(input.to_string());
-        let after = result
-            .split(".LBB10:")
-            .nth(1)
-            .unwrap_or("")
-            .trim_start_matches('\n');
-        assert!(
-            after.starts_with("    ldr w2, [sp, #40]"),
-            "hoisted despite post-loop reader:\n{}",
-            result
+        let result = hoist_only(input);
+        assert_eq!(result, input, "hoisted despite post-loop reader");
+    }
+
+    /// Run the hoist alone over `asm`.
+    fn hoist_only(asm: &str) -> String {
+        let mut lines: Vec<String> = asm.lines().map(str::to_string).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        hoist_loop_invariant_remats(&mut lines, &mut kinds, n);
+        let mut out = lines.join("\n");
+        out.push('\n');
+        out
+    }
+
+    /// The text between `label:` and the last branch back to it.
+    fn loop_text<'a>(asm: &'a str, label: &str) -> &'a str {
+        let start = asm.find(&format!("{label}:\n")).expect("loop label");
+        let tail = &asm[start..];
+        let end = tail.rfind(&format!(" {label}\n")).expect("backedge");
+        &tail[..end]
+    }
+
+    /// A definition in the loop's first block runs on every trip before
+    /// anything else, so every exit sees its value whether or not it was
+    /// hoisted: a reader after the loop does not block the hoist.
+    #[test]
+    fn test_invar_hoist_header_def_ignores_post_loop_reader() {
+        let input = concat!(
+            "f:\n.cfi_startproc\n",
+            "    mov w0, #7\n",
+            "    str w0, [sp, #40]\n",
+            ".LBB10:\n",
+            "    ldr w2, [sp, #40]\n",
+            "    add w20, w20, w2\n",
+            "    cmp w20, #100\n",
+            "    b.lt .LBB10\n",
+            "    add w0, w2, #9\n",
+            "    ret\n",
+            ".cfi_endproc\n",
         );
+        let result = hoist_only(input);
+        assert!(!loop_text(&result, ".LBB10").contains("ldr w2"), "{result}");
+        assert!(
+            result.contains("    ldr w2, [sp, #40]\n.LBB10:\n"),
+            "{result}"
+        );
+    }
+
+    /// `if (c) x = K;` inside the loop, `x` read after the merge: the trips
+    /// that skip the definition read the value from before the loop.
+    #[test]
+    fn test_invar_hoist_needs_the_def_to_dominate_its_readers() {
+        let looped = |guard: &str| {
+            format!(
+                concat!(
+                    "f:\n.cfi_startproc\n",
+                    "    mov x9, x2\n",
+                    "    mov x6, #0\n",
+                    ".LBB2:\n",
+                    "    ldr x0, [x20]\n",
+                    "{}",
+                    "    movz x9, #26505\n",
+                    "    movk x9, #9029, lsl #16\n",
+                    ".LBB4:\n",
+                    "    add x6, x6, x9\n",
+                    "    add x20, x20, #8\n",
+                    "    cmp x20, x21\n",
+                    "    b.lt .LBB2\n",
+                    "    mov x0, x6\n",
+                    "    ret\n",
+                    ".cfi_endproc\n",
+                ),
+                guard
+            )
+        };
+        let conditional = looped("    cbz x0, .LBB4\n");
+        assert_eq!(hoist_only(&conditional), conditional);
+        // The same definition on every trip moves.
+        let straight = looped("    str x0, [x22]\n");
+        let result = hoist_only(&straight);
+        assert!(!loop_text(&result, ".LBB2").contains("movz"), "{result}");
+        assert!(
+            result.contains("    movk x9, #9029, lsl #16\n.LBB2:\n"),
+            "{result}"
+        );
+    }
+
+    /// The inner loop defines x9 only on some trips and the outer loop reads
+    /// it at its top -- textually BEFORE the inner loop, where a scan of the
+    /// lines after the loop never looked.
+    #[test]
+    fn test_invar_hoist_sees_readers_above_the_loop() {
+        let input = concat!(
+            "f:\n.cfi_startproc\n",
+            "    mov x9, #7\n",
+            "    mov x6, #0\n",
+            ".LBB13:\n",
+            "    add x6, x6, x9\n",
+            "    mov x23, #0\n",
+            ".LBB16:\n",
+            "    ldr x0, [x24]\n",
+            "    cbz x0, .LBB18\n",
+            "    movz x9, #9029\n",
+            "    movk x9, #1, lsl #16\n",
+            "    str x23, [x20]\n",
+            ".LBB18:\n",
+            "    add x23, x23, #1\n",
+            "    cmp x23, x19\n",
+            "    b.lt .LBB16\n",
+            "    add x22, x22, #1\n",
+            "    cmp x22, x25\n",
+            "    b.lt .LBB13\n",
+            "    mov x0, x6\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        assert_eq!(hoist_only(input), input);
+    }
+
+    /// A later redefinition is not a reader: exact liveness lets the hoist
+    /// through where a textual "no mention after the loop" refused it.
+    #[test]
+    fn test_invar_hoist_ignores_a_later_redefinition() {
+        let input = concat!(
+            "f:\n.cfi_startproc\n",
+            "    mov x6, #0\n",
+            ".Ltop:\n",
+            "    cbz x4, .Lskip\n",
+            "    adrp x9, tbl\n",
+            "    add x9, x9, :lo12:tbl\n",
+            "    str x6, [x9]\n",
+            ".Lskip:\n",
+            "    subs x3, x3, #1\n",
+            "    b.ne .Ltop\n",
+            "    mov x9, x6\n",
+            "    add x0, x9, #1\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let result = hoist_only(input);
+        assert!(!loop_text(&result, ".Ltop").contains("adrp"), "{result}");
+        assert!(
+            result.contains("    add x9, x9, :lo12:tbl\n.Ltop:\n"),
+            "{result}"
+        );
+    }
+
+    /// A branch from above into the middle of the loop enters it without
+    /// passing the copies placed at its top.
+    #[test]
+    fn test_invar_hoist_refuses_side_entries() {
+        let input = concat!(
+            "f:\n.cfi_startproc\n",
+            "    mov x9, #5\n",
+            "    mov x6, #0\n",
+            "    cbz x3, .Lmid\n",
+            ".Ltop:\n",
+            "    movz x9, #77\n",
+            "    add x6, x6, x9\n",
+            ".Lmid:\n",
+            "    add x6, x6, x9\n",
+            "    subs x4, x4, #1\n",
+            "    b.ne .Ltop\n",
+            "    mov x0, x6\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        assert_eq!(hoist_only(input), input);
+        // An address-taken label inside the loop is an entry too.
+        let taken = input.replace("    cbz x3, .Lmid\n", "    adr x12, .Lmid\n");
+        assert_eq!(hoist_only(&taken), taken);
+    }
+
+    /// A label-address table (`static void *t[] = { &&mid }`) is emitted in
+    /// a data section outside the function: the label it names is an entry
+    /// for the function's indirect branch that its own lines never name.
+    #[test]
+    fn test_invar_hoist_sees_label_tables_outside_the_function() {
+        let func = concat!(
+            "f:\n.cfi_startproc\n",
+            "    mov x9, #5\n",
+            "    mov x6, #0\n",
+            "    ldr x12, [x13]\n",
+            "    cbz x3, .Lgo\n",
+            ".Ltop:\n",
+            "    movz x9, #77\n",
+            "    add x6, x6, x9\n",
+            ".Lmid:\n",
+            "    add x6, x6, x9\n",
+            "    subs x4, x4, #1\n",
+            "    b.ne .Ltop\n",
+            "    mov x0, x6\n",
+            "    ret\n",
+            ".Lgo:\n",
+            "    br x12\n",
+            ".cfi_endproc\n",
+        );
+        // Nothing names .Lmid: the hoist goes ahead.
+        let result = hoist_only(func);
+        assert!(!loop_text(&result, ".Ltop").contains("movz"), "{result}");
+        for label in [".Lmid", ".Ltop"] {
+            for table in [
+                format!(".section .data\nt:\n    .xword {label}\n.text\n{func}"),
+                format!("{func}.section .data\nt:\n    .xword {label}\n"),
+            ] {
+                assert_eq!(hoist_only(&table), table);
+            }
+        }
+    }
+
+    /// The copy placed before a conditional entry branch also runs on its
+    /// fall-through path, which here returns the older x9.
+    #[test]
+    fn test_invar_hoist_respects_a_conditional_entry_fallthrough() {
+        let input = concat!(
+            "f:\n.cfi_startproc\n",
+            "    mov x9, #3\n",
+            "    cmp x3, #0\n",
+            "    b.gt .Ltop\n",
+            "    add x0, x9, #1\n",
+            "    ret\n",
+            ".Ltop:\n",
+            "    movz x9, #500\n",
+            "    add x6, x6, x9\n",
+            "    subs x3, x3, #1\n",
+            "    b.ne .Ltop\n",
+            "    mov x0, x6\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        assert_eq!(hoist_only(input), input);
+        // With the fall-through path redefining x9 first, the copy is dead
+        // there and the hoist goes ahead.
+        let dead = input.replace(
+            "    add x0, x9, #1\n",
+            "    mov x9, #1\n    add x0, x9, #1\n",
+        );
+        let result = hoist_only(&dead);
+        assert!(!loop_text(&result, ".Ltop").contains("movz"), "{result}");
+        assert!(
+            result.contains("    movz x9, #500\n    b.gt .Ltop\n"),
+            "{result}"
+        );
+    }
+
+    /// Implicit readers after the loop: a tail call reads its arguments and
+    /// a `ret` reads x0 although neither names the register.
+    #[test]
+    fn test_invar_hoist_sees_implicit_abi_readers() {
+        let looped = |reg: &str, tail: &str| {
+            format!(
+                concat!(
+                    "f:\n.cfi_startproc\n",
+                    "    mov x6, #0\n",
+                    ".Ltop:\n",
+                    "    cbz x4, .Lskip\n",
+                    "    movz {r}, #1234\n",
+                    "    str {r}, [x5]\n",
+                    ".Lskip:\n",
+                    "    subs x3, x3, #1\n",
+                    "    b.ne .Ltop\n",
+                    "{t}",
+                    ".cfi_endproc\n",
+                ),
+                r = reg,
+                t = tail
+            )
+        };
+        for (reg, tail) in [
+            ("x1", "    mov x0, x6\n    b callee\n"),
+            ("x0", "    ret\n"),
+            ("x8", "    bl other\n    ret\n"),
+        ] {
+            let input = looped(reg, tail);
+            assert_eq!(hoist_only(&input), input, "{reg} read by `{tail}`");
+        }
+        // x10 is read by none of them.
+        let input = looped("x10", "    mov x0, x6\n    b callee\n");
+        let result = hoist_only(&input);
+        assert!(!loop_text(&result, ".Ltop").contains("movz"), "{result}");
+    }
+
+    /// A slot load stays while the loop can write the slot: through a
+    /// pointer once the frame address escapes, with a store pair or a byte
+    /// store that overlaps it, or with sp moving under it.
+    #[test]
+    fn test_invar_hoist_slot_load_needs_an_unwritten_slot() {
+        let looped = |pre: &str, store: &str| {
+            format!(
+                concat!(
+                    "f:\n.cfi_startproc\n",
+                    "{p}",
+                    "    mov x11, #0\n",
+                    ".Ltop:\n",
+                    "    ldr x9, [sp, #24]\n",
+                    "    add x11, x11, x9\n",
+                    "{s}",
+                    "    subs x3, x3, #1\n",
+                    "    b.ne .Ltop\n",
+                    "    mov x0, x11\n",
+                    "    ret\n",
+                    ".cfi_endproc\n",
+                ),
+                p = pre,
+                s = store
+            )
+        };
+        for (pre, store) in [
+            ("    add x10, sp, #24\n", "    str x11, [x10]\n"),
+            ("    add x10, x29, #8\n", "    str x11, [x10]\n"),
+            ("", "    str x11, [x29, #24]\n"),
+            ("", "    stp x11, x12, [sp, #16]\n"),
+            ("", "    strb w11, [sp, #31]\n"),
+            ("", "    str q0, [sp, #16]\n"),
+            ("", "    str x11, [sp, #-16]!\n    ldr x11, [sp], #16\n"),
+            ("", "    sub sp, sp, #16\n    add sp, sp, #16\n"),
+            ("", "    ldadd x11, x12, [x10]\n    add x10, sp, #0\n"),
+        ] {
+            let input = looped(pre, store);
+            assert_eq!(hoist_only(&input), input, "pre `{pre}` store `{store}`");
+        }
+        // Stores that cannot reach the slot: a disjoint sp slot, and a
+        // pointer while no frame address escapes.
+        for store in ["    str x11, [sp, #32]\n", "    str x11, [x10]\n"] {
+            let input = looped("", store);
+            let result = hoist_only(&input);
+            assert!(
+                !loop_text(&result, ".Ltop").contains("[sp, #24]"),
+                "`{store}`: {result}"
+            );
+        }
+    }
+
+    /// A function whose only loop sits at its very start and that never
+    /// returns: the first sweep of the dataflow moves the header's live-in
+    /// without changing any live-out a block already read, and must not stop
+    /// there with the loop-carried read missing from the latch.
+    #[test]
+    fn branch_census_charges_alignment_padding() {
+        assert_eq!(directive_insn_bound("    .p2align 4,,10"), 4);
+        assert_eq!(directive_insn_bound(".p2align 3"), 2);
+        assert_eq!(directive_insn_bound(".align 2"), 1);
+        assert_eq!(directive_insn_bound(".balign 64"), 16);
+        assert_eq!(directive_insn_bound(".cfi_startproc"), 1);
+        assert_eq!(directive_insn_bound(".p2alignx 4"), 1);
+        let lines: Vec<String> = ["    b.eq .L1", ".p2align 5", "    nop", ".L1:"]
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let census = BranchCensus::new(&lines, &kinds);
+        assert_eq!(census.distance(0, ".L1"), Some(1 + 8 + 1));
+        assert_eq!(census.distance(0, ".L2"), None);
+    }
+
+    #[test]
+    fn liveness_reaches_the_fixed_point_without_a_ret() {
+        let lines: Vec<String> = [".Ltop:", "    add x10, x10, x9", ".Lmid:", "    b .Ltop"]
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let lv = Liveness::build(&lines, &kinds, 0, lines.len(), false).expect("resolvable");
+        assert_eq!(lv.live_after(1, 9), Some(true));
+        assert_eq!(lv.live_after(1, 10), Some(true));
+        let abi = abi_liveness(&lines, &kinds, lines.len()).expect("resolvable");
+        assert_ne!(abi[3] & (1 << 9), 0);
     }
 
     #[test]
@@ -8240,20 +10327,36 @@ mod tests {
     add x3, x1, #1\n\
     ret\n";
         let result = peephole_optimize(input.to_string());
-        // Empirically-verified final shape (pass 6 threads, then copy-prop /
-        // move-chain fold the dead x1 hop): capture BEFORE the clobber, use
-        // of the captured original AFTER it, slot fully gone.
+        // The value flow, whatever registers carry it: the original x0 is
+        // captured BEFORE the clobber (spill-slot threading, then the
+        // definition retarget names the capture after its reader), the add
+        // reads the capture AFTER it, and the slot is gone.  A forwarding of
+        // the stale register -- `mov xK, x0` after `mov x0, #42` -- fails.
+        let rows: Vec<&str> = result.lines().map(str::trim).collect();
+        let clobber = rows
+            .iter()
+            .position(|l| *l == "mov x0, #42")
+            .unwrap_or_else(|| panic!("clobber lost:\n{result}"));
+        let add = rows
+            .iter()
+            .position(|l| l.starts_with("add x3, x") && l.ends_with(", #1"))
+            .unwrap_or_else(|| panic!("add lost:\n{result}"));
+        let k = rows[add]
+            .trim_start_matches("add x3, ")
+            .trim_end_matches(", #1");
+        assert_ne!(k, "x0", "stale forwarding:\n{result}");
+        let capture = format!("mov {k}, x0");
         assert!(
-            result.contains("mov x2, x0") && result.contains("add x3, x2, #1"),
-            "threaded original-value flow missing:\n{}",
-            result
+            rows[..clobber].contains(&capture.as_str()) && clobber < add,
+            "threaded original-value flow missing:\n{result}"
+        );
+        assert!(
+            !rows[clobber..add]
+                .iter()
+                .any(|l| l.starts_with(&format!("mov {k},"))),
+            "capture overwritten:\n{result}"
         );
         assert!(!result.contains("[sp, #16]"));
-        assert!(
-            !result.contains("mov x1, x0"),
-            "stale forwarding:\n{}",
-            result
-        );
     }
 
     #[test]
@@ -8460,7 +10563,18 @@ g:
         // Invariant: a surviving read of x9 must have a live definition.
         // The broken pipeline produced `ldr x0, [x0]; ldr x1, [x9, #8]`
         // with the defining mov deleted — the second half read a stale x9.
-        let stale_x9_read = result.contains("[x9") && !result.contains("mov x9,");
+        // Any write of x9 before its first read is a definition: the copy,
+        // or the GOT load once the definition retarget names x9 directly.
+        let rows: Vec<&str> = result.lines().map(str::trim).collect();
+        let stale_x9_read = rows
+            .iter()
+            .position(|l| l.contains("[x9"))
+            .is_some_and(|read| {
+                !rows[..read].iter().any(|l| {
+                    l.split_once(' ')
+                        .is_some_and(|(_, ops)| ops.split(',').next() == Some("x9"))
+                })
+            });
         // Both halves must load the global's 16 bytes: half one from the
         // GOT-resolved base (x0), half two from either a live x9 or the
         // propagated base.
@@ -8980,10 +11094,12 @@ f:
     mov x23, x0
     ret
 ";
+        // The copy and the zero-extension may only merge into the 32-bit
+        // copy that leaves the same x0.
         let result = peephole_optimize(input.to_string());
         assert!(
-            result.contains("mov w0, w0"),
-            "zext chain into x0 before ret must not fold:\n{}",
+            result.contains("mov w0, w22") && !result.contains("mov x0, x22"),
+            "zext chain into x0 before ret must not fold away x0:\n{}",
             result
         );
     }
@@ -8999,10 +11115,11 @@ f:
     add w5, w0, #1
     ret
 ";
-        // x0 is read after the chain: folding would lose the zext value.
+        // x0 is read after the chain: folding into x26 alone would lose
+        // the zext value, which only the 32-bit copy may produce now.
         let result = peephole_optimize(input.to_string());
         assert!(
-            result.contains("mov w0, w0"),
+            result.contains("mov w0, w24") && result.contains("add w5, w0, #1"),
             "live accumulator blocks fold:\n{}",
             result
         );
@@ -9153,13 +11270,15 @@ f:
 
     #[test]
     fn test_dead_pre_ret_w0_zext_semantics_kept() {
-        // `mov w0, w0` is a 32-bit write that zero-extends x0's low half —
-        // observable through the caller's view of x0. Never delete.
+        // `mov w0, w0` is a 32-bit write that zero-extends x0's low half --
+        // observable through the caller's view of x0. Never drop it; the
+        // copy and the zero-extension may only merge into the one 32-bit
+        // copy that computes the same x0.
         let input = "f:\n    mov x0, x22\n    mov w0, w0\n    ret\n";
         let result = peephole_optimize(input.to_string());
         assert!(
-            result.contains("mov w0, w0"),
-            "zext-into-x0 deleted:\n{}",
+            result.contains("mov w0, w22") && !result.contains("mov x0, x22"),
+            "zext-into-x0 lost or not merged:\n{}",
             result
         );
     }
@@ -9167,16 +11286,18 @@ f:
     #[test]
     fn test_dead_pre_ret_read_blocks_removal() {
         // The move's destination is read by a store through an argument
-        // pointer (which DSE cannot prove dead): the move is live and the
-        // whole sequence must survive verbatim.
+        // pointer (which DSE cannot prove dead): the move is live, so the
+        // pre-`ret` cleanup must not drop it. The entry-copy coalescer may
+        // still fold it into its source (x5 is no result register), which
+        // stores the very same value.
         let input = "f:\n    mov x5, x0\n    str x5, [x19]\n    ret\n";
         let result = peephole_optimize(input.to_string());
         assert!(
-            result.contains("mov x5, x0"),
-            "live move deleted:\n{}",
+            (result.contains("mov x5, x0") && result.contains("str x5, [x19]"))
+                || (!result.contains("x5") && result.contains("str x0, [x19]")),
+            "live move or its store lost:\n{}",
             result
         );
-        assert!(result.contains("str x5, [x19]"), "store lost:\n{}", result);
     }
 
     // ── fuse_and_cmp_zero ─────────────────────────────────────────────────
@@ -9225,20 +11346,23 @@ f:
             "redundant mask kept:\n{}",
             result
         );
+        // The mask becomes a copy, which the definition retarget then folds
+        // into the load itself (w5 dies there).
         assert!(
-            result.contains("mov w4, w5"),
-            "mask not rewritten to mov:\n{}",
+            result.contains("mov w4, w5") || result.contains("ldrb w4, [x19, x1]"),
+            "mask not rewritten to a copy:\n{}",
             result
         );
     }
 
     #[test]
     fn test_zext_and_unknown_source_kept() {
-        // w6's high bits are unknown: the mask is semantically required.
+        // w6's high bits are unknown: the mask is semantically required. (The
+        // 32-bit entry copy itself may fold into w6: only W views follow.)
         let input = "f:\n    mov w4, w6\n    and w5, w4, #0xff\n    add x9, x5, #1\n    ret\n";
         let result = peephole_optimize(input.to_string());
         assert!(
-            result.contains("and w5, w4, #0xff"),
+            result.contains("and w5, w4, #0xff") || result.contains("and w5, w6, #0xff"),
             "needed mask removed:\n{}",
             result
         );
@@ -9705,5 +11829,135 @@ mod frame_store_census_tests {
             "    sub sp, sp, #16\n    str x1, [sp, #8]\n    ld1 {v0.16b}, [sp]\n    add sp, sp, #16\n    ret\n",
         ));
         assert!(has(&out, "str x1, [sp, #8]"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod def_retarget_tests {
+    use super::peephole_optimize;
+
+    fn rows(asm: &str) -> Vec<String> {
+        peephole_optimize(asm.to_string())
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    /// The accumulator staging of a homed global address: three lines become
+    /// two, the address computed straight into its home.
+    #[test]
+    fn a_global_address_is_computed_into_its_home() {
+        let out = rows(
+            "f:\n    adrp x0, A\n    add x0, x0, :lo12:A\n    mov x19, x0\n    mov x0, #0\n    \
+             bl g\n    ldr x1, [x19]\n    add x0, x1, #1\n    ret\n",
+        );
+        assert!(out.contains(&"add x19, x0, :lo12:A".to_string()), "{out:?}");
+        assert!(!out.iter().any(|l| l == "mov x19, x0"), "{out:?}");
+    }
+
+    /// A load staged through x0 lands in the copy's register, and the
+    /// readers in between follow it.
+    #[test]
+    fn a_staged_load_lands_in_the_copy_and_its_readers_follow() {
+        let out = rows(
+            ".L1:\n    ldrsw x0, [x6]\n    str x0, [x7]\n    mov x8, x0\n    cmp w8, w21\n    \
+             b.lt .L1\n    mov x0, x8\n    ret\n",
+        );
+        assert!(out.contains(&"ldrsw x8, [x6]".to_string()), "{out:?}");
+        assert!(out.contains(&"str x8, [x7]".to_string()), "{out:?}");
+        assert!(!out.iter().any(|l| l == "mov x8, x0"), "{out:?}");
+    }
+
+    /// The source still read after the copy (here by `ret`, the result
+    /// register), the destination touched in between, a call in between,
+    /// or a 32-bit copy of a 64-bit load: every copy stays.
+    #[test]
+    fn the_copy_stays_whenever_the_rename_could_be_observed() {
+        let live_after = rows("f:\n    ldr x0, [x1]\n    mov x8, x0\n    str x8, [x2]\n    ret\n");
+        assert!(
+            live_after.contains(&"ldr x0, [x1]".to_string()),
+            "{live_after:?}"
+        );
+        let dest_read = rows(
+            "f:\n    ldr x0, [x1]\n    add x9, x8, #1\n    mov x8, x0\n    str x8, [x9]\n    \
+             mov x0, #0\n    ret\n",
+        );
+        assert!(
+            dest_read.contains(&"ldr x0, [x1]".to_string()),
+            "{dest_read:?}"
+        );
+        let across_call = rows(
+            "f:\n    ldr x0, [x1]\n    bl g\n    mov x19, x0\n    str x19, [x20]\n    \
+             mov x0, #0\n    ret\n",
+        );
+        assert!(
+            across_call.contains(&"mov x19, x0".to_string()),
+            "{across_call:?}"
+        );
+        let narrow = rows(
+            "f:\n    ldr x0, [x1]\n    mov w8, w0\n    str x8, [x2]\n    mov x0, #0\n    ret\n",
+        );
+        assert!(narrow.contains(&"mov w8, w0".to_string()), "{narrow:?}");
+    }
+
+    /// A 32-bit copy of a 32-bit definition is renamed like any other.
+    #[test]
+    fn a_word_copy_of_a_word_definition_is_renamed() {
+        let out = rows(
+            "f:\n    ldr w0, [x1]\n    mov w8, w0\n    str x8, [x2]\n    mov x0, #0\n    ret\n",
+        );
+        assert!(out.contains(&"ldr w8, [x1]".to_string()), "{out:?}");
+    }
+
+    /// A supervisor call reads x0-x7 without naming them: a definition of
+    /// x0 before it is the call's argument, never a copy's source, and a
+    /// `cset` into an argument register must keep its 0/1 across it.
+    #[test]
+    fn nothing_is_renamed_across_a_supervisor_call() {
+        let out = rows(
+            "f:\n    mov x8, #93\n    mov x0, #7\n    svc #0\n    mov x19, x0\n    \
+             str x19, [x20]\n    mov x0, #0\n    ret\n",
+        );
+        let def = out.iter().position(|l| l == "mov x0, #7");
+        let svc = out.iter().position(|l| l == "svc #0");
+        assert!(def.is_some() && def < svc, "{out:?}");
+        let flag = rows(
+            "f:\n    cmp w1, w2\n    cset x0, lt\n    svc #0\n    add x4, x4, x0\n    \
+             mov x0, x4\n    ret\n",
+        );
+        assert!(flag.iter().any(|l| l == "cset x0, lt"), "{flag:?}");
+    }
+
+    /// `cset; add` with the 0/1 dying at the add is `cinc` (count_if).
+    #[test]
+    fn a_counted_comparison_is_a_conditional_increment() {
+        let out = rows(
+            ".L1:\n    ldrsw x8, [x6]\n    cmp w8, w21\n    cset x0, lt\n    add x4, x4, x0\n    \
+             add x6, x6, #4\n    cmp x6, x7\n    b.lt .L1\n    mov x0, x4\n    ret\n",
+        );
+        assert!(out.contains(&"cinc x4, x4, lt".to_string()), "{out:?}");
+        assert!(!out.iter().any(|l| l.starts_with("cset")), "{out:?}");
+    }
+
+    /// The flags rewritten between the `cset` and the add, or the 0/1 read
+    /// again later: the pair stays.
+    #[test]
+    fn the_increment_stays_when_flags_or_the_flag_value_survive() {
+        let flags = rows(
+            "f:\n    cmp w8, w21\n    cset x0, lt\n    cmp x1, x2\n    add x4, x4, x0\n    \
+             csel x0, x4, x1, eq\n    ret\n",
+        );
+        assert!(
+            flags.iter().any(|l| l.starts_with("cset x0, lt")),
+            "{flags:?}"
+        );
+        let reused = rows(
+            "f:\n    cmp w8, w21\n    cset x3, lt\n    add x4, x4, x3\n    add x0, x4, x3\n    ret\n",
+        );
+        assert!(
+            reused.iter().any(|l| l.starts_with("cset x3, lt")),
+            "{reused:?}"
+        );
     }
 }

@@ -326,10 +326,10 @@ impl RiscvCodegen {
     }
 
     /// Store the binary128 result of an i128 -> long double conversion
-    /// (a0:a1) the way every other F128-producing cast does: the full value
-    /// in the slot plus the F64 working copy (`f128_store_result_and_truncate`).
+    /// (a0:a1) the way every other F128-producing cast does
+    /// (`f128_publish_result`).
     pub(super) fn emit_store_f128_a0_a1_result(&mut self, dest: &Value) {
-        crate::backend::f128_softfloat::F128SoftFloat::f128_store_result_and_truncate(self, dest);
+        crate::backend::f128_softfloat::F128SoftFloat::f128_publish_result(self, dest);
     }
 
     pub(super) fn emit_float_to_i128_call_impl(
