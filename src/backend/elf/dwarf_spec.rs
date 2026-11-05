@@ -319,6 +319,44 @@ impl DwarfType {
     }
 }
 
+/// Where a value's bytes are, as a `DW_AT_location` expression says it.
+///
+/// A location is a *promise*: a consumer prints whatever it finds there and
+/// never re-checks it, so the only form this type names is one the frame layout
+/// proved for the whole function body.  That is a constant displacement from the
+/// canonical frame address (`DW_OP_fbreg`, the expression `DW_AT_frame_base =
+/// DW_OP_call_frame_cfa` makes readable): the frame address and the slot are both
+/// fixed once the prologue has run, so their difference is a compile-time
+/// constant that stays true at every instruction -- no location list, no
+/// `DW_OP_piece`, and nothing to get wrong when the function has a branch.
+///
+/// A value the layout cannot promise (a parameter homed in a register, an
+/// over-aligned automatic object whose address is aligned at run time, a frame
+/// with no stable anchor) gets `None` instead.  A consumer renders that as
+/// `<optimized out>`; a wrong expression would render as a confident wrong
+/// number, which is the one failure mode DWARF cannot recover from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DwarfLocation {
+    /// `DW_OP_fbreg <delta>`: the value starts `delta` bytes from the canonical
+    /// frame address, whose rule is `DW_AT_frame_base` (`DW_OP_call_frame_cfa`).
+    FrameOffset(i32),
+}
+
+impl DwarfLocation {
+    /// The expression's bytes, without the length that a block form puts in
+    /// front: `DW_OP_fbreg` (one opcode) then a signed LEB128 displacement.
+    pub(crate) fn expression(&self) -> Vec<u8> {
+        match *self {
+            DwarfLocation::FrameOffset(delta) => {
+                let mut out = Vec::with_capacity(6);
+                out.push(super::dwarf::DW_OP_FBREG);
+                super::dwarf::write_sleb128(i64::from(delta), &mut out);
+                out
+            }
+        }
+    }
+}
+
 /// One parameter of a function this unit defines: the `DW_TAG_formal_parameter`
 /// a debugger lists `pq_frame` as taking.
 ///
@@ -331,6 +369,11 @@ pub(crate) struct DwarfParameter {
     /// value, and GCC 16.2 omits `DW_AT_name` there (measured).
     pub name: Option<String>,
     pub ty: u32,
+    /// Where the value is, once the code generator has laid the frame out.  The
+    /// analyser builds the parameter list before any frame exists, so this is
+    /// filled in later, by [`DwarfUnitSpec::apply_frame_facts`], and stays
+    /// `None` for a parameter the frame does not give a trustworthy home.
+    pub location: Option<DwarfLocation>,
 }
 
 /// The parameter list of one defined function.
@@ -369,6 +412,35 @@ impl DwarfUnitSpec {
     /// The parameter list of a defined function, when it has one.
     pub(crate) fn parameters_of(&self, name: &str) -> Option<&DwarfFunctionParameters> {
         self.parameters.get(name).filter(|list| !list.is_empty())
+    }
+
+    /// Give every parameter the home the code generator's frame layout gave it.
+    ///
+    /// The parameter *list* is built from the analysis, which runs before any
+    /// frame exists; the offsets come from the instruction selector, which is the
+    /// only component that knows where a parameter's bytes ended up.  Both sides
+    /// are keyed by the emitted symbol name, and the offsets are applied
+    /// positionally inside a list.
+    ///
+    /// A length mismatch is treated as "no facts" rather than as a partial
+    /// match.  The two lists come from different layers (a source-level
+    /// parameter list and an IR-level one, which a hidden return pointer could
+    /// grow), and applying a prefix of one to the other would attach the third
+    /// parameter's slot to the fourth parameter's name -- the exact class of
+    /// confident lie this whole module is arranged to avoid.  Nothing is lost by
+    /// declining: the DIEs simply carry no location.
+    pub(crate) fn apply_frame_facts(&mut self, facts: &crate::backend::debug_frame::DebugFrameFacts) {
+        for (name, offsets) in &facts.parameters {
+            let Some(list) = self.parameters.get_mut(name) else {
+                continue;
+            };
+            if offsets.len() != list.parameters.len() {
+                continue;
+            }
+            for (parameter, offset) in list.parameters.iter_mut().zip(offsets) {
+                parameter.location = offset.map(DwarfLocation::FrameOffset);
+            }
+        }
     }
 
     /// Drop the declarations this object does not reference, and every type that

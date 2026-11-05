@@ -155,6 +155,26 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
     /// Store function parameters from argument registers to their stack slots.
     fn emit_store_params(&mut self, func: &IrFunction);
 
+    /// `-g`: where the parameters of the function just emitted live, in bytes
+    /// from the canonical frame address (see [`crate::backend::debug_frame`]).
+    ///
+    /// The default is "nowhere I can prove", which is what every backend that has
+    /// not taught its prologue to report the fact answers -- and the writer then
+    /// emits no `DW_AT_location` rather than a guess.
+    fn take_debug_parameter_offsets(&mut self) -> Vec<Option<i32>> {
+        Vec::new()
+    }
+
+    /// `-g`: the frame facts of every function emitted so far, taking them out of
+    /// the generator.
+    ///
+    /// The default answers "none": a backend whose prologue does not report
+    /// parameter homes has nothing to hand over, and the writer then describes
+    /// names and types without locations.
+    fn take_debug_frame_facts(&mut self) -> crate::backend::debug_frame::DebugFrameFacts {
+        crate::backend::debug_frame::DebugFrameFacts::default()
+    }
+
     /// Emit a ParamRef instruction: load the value of parameter `param_idx` into `dest`.
     /// This is used when mem2reg has promoted a parameter alloca to SSA and the
     /// initial parameter value needs to be materialized as an SSA value.

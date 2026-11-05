@@ -16,6 +16,7 @@ pub(crate) mod cast; // Cast and float operation classification
 pub(crate) mod cfi_lower; // Shared .cfi_* -> .eh_frame lowering (x86, i686, AArch64, RISC-V)
 pub(crate) mod cfi_synth; // Unwind info derived from final x86/i686 code
 pub(crate) mod f128_softfloat; // Shared F128 soft-float orchestration (ARM + RISC-V)
+pub(crate) mod debug_frame; // Frame facts the code generator proves, consumed by the DWARF writer
 pub(crate) mod generation; // Module/function/instruction dispatch
 mod global_alignment;
 pub(crate) mod inline_asm; // InlineAsmEmitter trait and shared framework
@@ -41,6 +42,7 @@ pub(crate) mod riscv;
 pub mod x86;
 
 use crate::backend::state::FnEntryRows;
+use crate::backend::traits::ArchCodegen as _;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::reexports::{IrModule, TlsModel};
 use std::fmt::Write as _;
@@ -710,7 +712,7 @@ impl Target {
         module: &IrModule,
         opts: &CodegenOptions,
         source_mgr: Option<&crate::common::source::SourceManager>,
-    ) -> String {
+    ) -> (String, debug_frame::DebugFrameFacts) {
         match self {
             Target::X86_64 => {
                 // Interprocedural register allocation (`x86::codegen::ipa_ra`)
@@ -761,6 +763,9 @@ impl Target {
                         opts.debug_info,
                         source_mgr,
                     );
+                    // `-g`: this round's frame facts travel with this round's
+                    // text; a regenerated round is a different emission.
+                    let frame_facts = cg.take_debug_frame_facts();
                     // The whole-file peephole rewrites every function's text,
                     // so it runs under an ISA legal in all of them.
                     cg.publish_peephole_isa();
@@ -797,7 +802,7 @@ impl Target {
                             opts.emit_cfi,
                             cfi_synth::CfiArch::X86_64,
                         );
-                        break insert_fn_entry_locs(asm, &cg.state.fn_entry_locs);
+                        break (insert_fn_entry_locs(asm, &cg.state.fn_entry_locs), frame_facts);
                     }
                     if opts.ra_config.debug_ra {
                         eprintln!("[IPA-RA] round {round}: {violations:?}");
@@ -849,11 +854,12 @@ impl Target {
                     cfi_synth::CfiArch::I386,
                 );
                 let optimized = insert_fn_entry_locs(optimized, &cg.state.fn_entry_locs);
-                if opts.code16gcc {
+                let asm = if opts.code16gcc {
                     format!(".code16gcc\n{}", optimized)
                 } else {
                     optimized
-                }
+                };
+                (asm, cg.take_debug_frame_facts())
             }
             Target::Aarch64 => {
                 let mut cg = arm::ArmCodegen::new_with_ra_config(opts.ra_config.clone());
@@ -881,7 +887,8 @@ impl Target {
                         global_regparm: 0,
                     },
                 );
-                insert_fn_entry_locs(optimized, &cg.state.fn_entry_locs)
+                let asm = insert_fn_entry_locs(optimized, &cg.state.fn_entry_locs);
+                (asm, cg.take_debug_frame_facts())
             }
             Target::Riscv64 => {
                 let mut cg = riscv::RiscvCodegen::new_with_ra_config(opts.ra_config.clone());
@@ -914,7 +921,8 @@ impl Target {
                         global_regparm: 0,
                     },
                 );
-                insert_fn_entry_locs(optimized, &cg.state.fn_entry_locs)
+                let asm = insert_fn_entry_locs(optimized, &cg.state.fn_entry_locs);
+                (asm, cg.take_debug_frame_facts())
             }
         }
     }

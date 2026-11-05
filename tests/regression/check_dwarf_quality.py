@@ -128,6 +128,10 @@ DW_AT_GNU_VECTOR = 0x2107
 #: a fixed address.
 DW_OP_ADDR = 0x03
 
+#: `DW_OP_fbreg`: one signed LEB128 offset from the frame base, which is how a
+#: parameter that lives in the frame is described.
+DW_OP_FBREG = 0x91
+
 DW_FORM_STRING = 0x08
 DW_FORM_ADDR = 0x01
 #: Reference forms that are relative to the start of the unit's header, and the
@@ -145,14 +149,15 @@ SHN_UNDEF = 0
 #: value says what a debugger cannot do yet and where the work item lives. A gap
 #: that stops reproducing is reported (once) and the entry should be deleted.
 KNOWN_GAPS: dict[str, str] = {
+    "subprogram_abbreviations": (
+        "the subprogram shapes are declared as a cross product of declaration "
+        "kind, child list and linkage, so a unit carries a few abbreviations no "
+        "DIE takes; the parameter shapes are already chosen from the unit, and "
+        "the same treatment for these is D15"
+    ),
     "inlining": (
         "no DW_TAG_inlined_subroutine: an optimized frame shows the caller with "
         "the callee's line, so a debugger cannot report the inline stack (D6)"
-    ),
-    "parameter_locations": (
-        "a parameter DIE states its name and type but not where the value lives, "
-        "so a debugger lists the argument and cannot print it; the location needs "
-        "the frame layout the code generator owns (D1b)"
     ),
 }
 
@@ -382,6 +387,10 @@ class Die:
     #: Form each attribute was encoded with. `DW_AT_high_pc` needs it: an
     #: address is a form of its own, a constant is an offset from `low_pc`.
     forms: dict[int, int] = field(default_factory=dict)
+    #: The abbreviation this DIE was written with, so a declaration no DIE uses
+    #: can be found: an abbreviation costs bytes in every object and a parse for
+    #: every consumer, and one that describes nothing describes it for nobody.
+    code: int = 0
 
     def name(self) -> str:
         value = self.attrs.get(DW_AT_NAME, "")
@@ -457,6 +466,10 @@ class Unit:
     address_size: int
     offset_size: int
     dies: list[Die] = field(default_factory=list)
+    #: Abbreviation codes this unit's table declares, and the offset of that
+    #: table in `.debug_abbrev`: a linked object holds one table per unit.
+    declared: list[int] = field(default_factory=list)
+    abbrev_offset: int = 0
 
     def root(self) -> Die | None:
         return self.dies[0] if self.dies else None
@@ -541,6 +554,8 @@ def units(elf: Elf) -> list[Unit]:
             offset += 1
         table = _abbrevs(abbrev, abbrev_offset)
         unit = Unit(offset=start, version=version, address_size=address_size, offset_size=offset_size)
+        unit.declared = sorted(table)
+        unit.abbrev_offset = abbrev_offset
         depth = 0
         while offset < end:
             die_offset = offset
@@ -567,6 +582,7 @@ def units(elf: Elf) -> list[Unit]:
                         attrs=attrs,
                         depth=depth,
                         forms=forms,
+                        code=code,
                     )
                 )
             if declaration.children:
@@ -1362,6 +1378,32 @@ int pq_frame(int n) {
     }
     return pq_used_static(total);
 }
+/* Where each parameter of one function actually lands. The probe stores its own
+   parameters' addresses and prints each one's distance from the frame address,
+   so the gate compares a DWARF location with the address the running program
+   took -- not with another compiler's idea of where it should be. Eleven
+   parameters cover both register files (six integer, eight SSE) and the stack,
+   and every address is taken, so every parameter is an object in memory at
+   every optimization tier. */
+static long pq_arg_delta[11];
+static unsigned long pq_frame_record;
+__attribute__((noinline)) long pq_args(int a, long b, char c, short d, unsigned e,
+                                       float f, double g, void *h, int i, int j, int k) {
+    unsigned long frame = (unsigned long)__builtin_frame_address(0);
+    pq_frame_record = 2 * sizeof(void *);
+    pq_arg_delta[0] = (long)((unsigned long)(void *)&a - frame);
+    pq_arg_delta[1] = (long)((unsigned long)(void *)&b - frame);
+    pq_arg_delta[2] = (long)((unsigned long)(void *)&c - frame);
+    pq_arg_delta[3] = (long)((unsigned long)(void *)&d - frame);
+    pq_arg_delta[4] = (long)((unsigned long)(void *)&e - frame);
+    pq_arg_delta[5] = (long)((unsigned long)(void *)&f - frame);
+    pq_arg_delta[6] = (long)((unsigned long)(void *)&g - frame);
+    pq_arg_delta[7] = (long)((unsigned long)(void *)&h - frame);
+    pq_arg_delta[8] = (long)((unsigned long)(void *)&i - frame);
+    pq_arg_delta[9] = (long)((unsigned long)(void *)&j - frame);
+    pq_arg_delta[10] = (long)((unsigned long)(void *)&k - frame);
+    return a + b + c + d + (long)e + (long)f + (long)g + (i + j + k) + (h != 0);
+}
 /* The program's own answers: the checks below compare the DWARF with what this
    code computes, not with a second compiler's opinion about it. */
 int main(void) {
@@ -1384,6 +1426,11 @@ int main(void) {
     printf("value_red %d\\n", PQ_RED);
     printf("value_green %d\\n", PQ_GREEN);
     printf("value_blue %d\\n", PQ_BLUE);
+    printf("value_args %ld\\n", pq_args(1, 2, 3, 4, 5, 6.0f, 7.0, &pq_global, 9, 10, 11));
+    printf("frame_record %lu\\n", pq_frame_record);
+    for (int index = 0; index < 11; index++) {
+        printf("arg_delta_%d %ld\\n", index, pq_arg_delta[index]);
+    }
     /* `sizeof` of an inline function keeps its DIE reachable without calling it,
        and the exit status stays zero so the gate can run this binary. */
     (void)sizeof(pq_only_sizeof());
@@ -1525,6 +1572,52 @@ def check_unit_structure(report: Report, elf: Elf, version: int, label: str) -> 
                 "so no line table can be found",
             )
     return parsed
+
+
+def check_abbrev_usage(report: Report, elf: Elf, parsed: list[Unit], label: str) -> None:
+    """Every declared abbreviation must describe at least one DIE.
+
+    An abbreviation is a record in `.debug_abbrev` and a parse for every consumer
+    that walks the table, so one that no DIE uses is paid for by every object and
+    read by nobody. The writer declares the shapes its DIEs take and nothing
+    else: its parameter shapes are chosen from the unit (measured on a `-O2` unit
+    whose parameters live in registers, where two located shapes cost 20 bytes of
+    `.debug_abbrev` for nothing), and its type shapes are declared as they are
+    used.
+
+    The subprogram shapes are still declared as a cross product of declaration
+    kind, child list and linkage, so a unit typically carries a few it cannot
+    use; that is a known gap (`subprogram_abbreviations`, D15) and is reported as
+    one rather than failed, while any other unused declaration is a defect.
+    """
+    section = elf.sections.get(".debug_abbrev", b"")
+    for unit in parsed:
+        used = {die.code for die in unit.dies}
+        unused = [code for code in unit.declared if code not in used]
+        if not unused:
+            continue
+        try:
+            table = _abbrevs(section, unit.abbrev_offset)
+        except IndexError:
+            report.fail(
+                "abbrev_usage",
+                f"{label}: the abbreviation table at {unit.abbrev_offset:#x} does not decode",
+            )
+            continue
+        subprogram = [code for code in unused if table[code].tag == DW_TAG_SUBPROGRAM]
+        other = [code for code in unused if code not in subprogram]
+        if subprogram:
+            report.gap(
+                "subprogram_abbreviations",
+                f"{label}: unit at {unit.offset:#x} declares subprogram abbreviation(s) "
+                f"{subprogram} that no DIE uses",
+            )
+        if other:
+            report.fail(
+                "abbrev_usage",
+                f"{label}: unit at {unit.offset:#x} declares abbreviation(s) {other} that no "
+                f"DIE uses ({len(other)} of {len(unit.declared)} declared)",
+            )
 
 
 def is_dropped_die(low: int, high: int, name: str, live: set[str]) -> bool:
@@ -2619,6 +2712,120 @@ def location_address(die: Die, elf: Elf) -> int | None:
     return int.from_bytes(expression[1:], elf.order)
 
 
+#: The `pq_args` battery's parameters, in declaration order. The probe takes all
+#: eleven addresses, so each one is an object in memory at every tier and every
+#: one of them must be locatable -- which makes absence a defect and not a tier
+#: policy.
+PARAMETER_BATTERY = ("a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k")
+
+
+def frame_offset(die: Die) -> int | None:
+    """The `DW_OP_fbreg` offset of a location expression, or `None`.
+
+    `None` means the expression is not one frame-relative offset. For a parameter
+    of this writer that is a defect rather than a policy: `DW_OP_fbreg` is the
+    only form it emits for a parameter, and a consumer that meets anything else
+    either gives up on the variable or computes an address no object has.
+    """
+    expression = die.attrs.get(DW_AT_LOCATION)
+    if not isinstance(expression, bytes) or not expression:
+        return None
+    if expression[0] != DW_OP_FBREG:
+        return None
+    # A block that ends mid-LEB is truncated, which is unreadable rather than
+    # exceptional: a malformed object must be a reported failure, not a traceback.
+    try:
+        offset, after = _sleb(expression, 1)
+    except IndexError:
+        return None
+    return offset if after == len(expression) else None
+
+
+def check_parameter_locations(
+    report: Report, elf: Elf, parsed: list[Unit], label: str, facts: dict[str, int]
+) -> None:
+    """A parameter's stated location must be the address the program took for it.
+
+    The probe prints each parameter's distance from its own frame address, so the
+    expected offset is `distance + frame record` -- the address the *running*
+    code gave the object, not a second compiler's opinion about where it ought to
+    be. A `DW_OP_fbreg` that disagrees sends a debugger's `print` to the wrong
+    stack slot, which is worse than the `<optimized out>` a missing location
+    gives, so both a wrong value and an unreadable expression are failures.
+
+    Every parameter DIE in the unit is also required to hold a readable
+    expression: the writer emits nothing else, and a malformed block anywhere in
+    the unit would go unnoticed by a check that only looked at this battery.
+    """
+    unit = parsed[0]
+    subprogram = next(
+        (die for die in unit.by_tag(DW_TAG_SUBPROGRAM)
+         if die_name(die, unit) == "pq_args" and DW_AT_LOW_PC in die.attrs),
+        None,
+    )
+    if subprogram is None:
+        report.fail(
+            "parameter_locations",
+            f"{label}: pq_args has no subprogram DIE, so no parameter location can be checked",
+        )
+        return
+    parameters = [die for die in children(unit, subprogram)
+                  if die.tag == DW_TAG_FORMAL_PARAMETER]
+    if len(parameters) != len(PARAMETER_BATTERY):
+        report.fail(
+            "parameter_locations",
+            f"{label}: pq_args takes {len(PARAMETER_BATTERY)} parameters but its subprogram "
+            f"has {len(parameters)} DW_TAG_formal_parameter children",
+        )
+        return
+    record = facts["frame_record"]
+    checked = 0
+    for index, (name, die) in enumerate(zip(PARAMETER_BATTERY, parameters)):
+        spelled = die_name(die, unit)
+        if spelled != name:
+            report.fail(
+                "parameter_locations",
+                f"{label}: pq_args parameter {index} is {spelled!r} in DWARF and {name!r} in "
+                "the source, so every location in the list is off by one",
+            )
+            continue
+        expected = facts[f"arg_delta_{index}"] + record
+        value = die.attrs.get(DW_AT_LOCATION)
+        if value is None:
+            report.fail(
+                "parameter_locations",
+                f"{label}: pq_args.{name} lives at {expected} from the frame base in the "
+                "program's own frame but its DIE states no location",
+            )
+            continue
+        offset = frame_offset(die)
+        if offset is None:
+            report.fail(
+                "parameter_locations",
+                f"{label}: pq_args.{name} has a location a consumer cannot read as one frame "
+                f"offset: {value!r}",
+            )
+            continue
+        if offset != expected:
+            report.fail(
+                "parameter_locations",
+                f"{label}: pq_args.{name} is DW_OP_fbreg {offset} and the program's frame "
+                f"puts it at {expected} (distance from the frame address "
+                f"{facts[f'arg_delta_{index}']}, frame record {record})",
+            )
+            continue
+        checked += 1
+    # The rest of the unit: readable or nothing, never unreadable.
+    for die in unit.by_tag(DW_TAG_FORMAL_PARAMETER):
+        if DW_AT_LOCATION in die.attrs and frame_offset(die) is None:
+            report.fail(
+                "parameter_locations",
+                f"{label}: parameter {die_name(die, unit)!r} has a location a consumer cannot "
+                f"read as one frame offset: {die.attrs[DW_AT_LOCATION]!r}",
+            )
+    report.measurements.setdefault("parameter_locations", {})[label] = checked
+
+
 def check_parameters(report: Report, elf: Elf, parsed: list[Unit], label: str) -> None:
     """Every parameter of a function this unit defines needs its own DIE.
 
@@ -2630,6 +2837,7 @@ def check_parameters(report: Report, elf: Elf, parsed: list[Unit], label: str) -
     unit = parsed[0]
     required = {"pq_frame": ("n",), "pq_leaf": ("x",)}
     described = 0
+    located = 0
     # A function that takes `...` must say so: a consumer otherwise reads a
     # complete argument list and reports the extra ones as garbage.
     emitted = {symbol.name for symbol in elf.functions()}
@@ -2689,11 +2897,7 @@ def check_parameters(report: Report, elf: Elf, parsed: list[Unit], label: str) -
                 )
                 continue
             described += 1
-            if DW_AT_LOCATION not in die.attrs:
-                report.gap(
-                    "parameter_locations",
-                    f"{label}: parameter {name}.{parameter} has no DW_AT_location",
-                )
+            located += DW_AT_LOCATION in die.attrs
             target = resolved_type(die, unit)
             if target is None:
                 report.fail(
@@ -2706,6 +2910,7 @@ def check_parameters(report: Report, elf: Elf, parsed: list[Unit], label: str) -
                 )
     if described:
         report.measurements.setdefault("parameters", {})[label] = described
+    report.measurements.setdefault("param_located", {})[label] = located
 
 
 def check_declaration_policy(report: Report, path: Path, label: str) -> None:
@@ -2980,6 +3185,7 @@ def run_gate(lccc: list[str], gcc: list[str] | None, workdir: Path) -> Report:
         if not parsed:
             continue
         ranges = check_subprograms(report, elf, parsed, label, spans["probe"])
+        check_abbrev_usage(report, elf, parsed, label)
         check_lines(
             report, elf, parsed, ranges, label, spans["probe"],
             inlining=optimization != "-O0",
@@ -2993,6 +3199,7 @@ def run_gate(lccc: list[str], gcc: list[str] | None, workdir: Path) -> Report:
         if facts is not None:
             check_type_dies(report, elf, parsed, label, facts)
             check_object_locations(report, elf, parsed, label, facts)
+            check_parameter_locations(report, elf, parsed, label, facts)
 
     # One function per section is the kernel's and Debian's default packaging, and
     # it moves a unit from a low/high pair to a range list -- a different section,
@@ -3210,6 +3417,28 @@ def self_test() -> int:
         expect(after == len(encoded), f"uleb128 {value} consumed {after} bytes")
     negative, _ = _sleb(b"\x7f", 0)
     expect(negative == -1, f"sleb128 0x7f decoded as {negative}")
+
+    # A parameter location is one `DW_OP_fbreg` and a signed offset, and the
+    # widths in the corpus reach both the one-byte and the two-byte encoding.
+    class _Located:
+        def __init__(self, expression: bytes) -> None:
+            self.attrs = {DW_AT_LOCATION: expression}
+
+    for expression, wanted in (
+        (b"\x91\x70", -16),
+        (b"\x91\x00", 0),
+        (b"\x91\x08", 8),
+        (b"\x91\xb8\x7f", -72),
+        (b"\x91\xa8\x7f", -88),
+    ):
+        decoded = frame_offset(_Located(expression))
+        expect(decoded == wanted, f"{expression!r} decoded as {decoded}, wanted {wanted}")
+    # Anything that is not exactly one frame offset is not readable, and saying so
+    # is what keeps a wrong address out of a debugger.
+    for expression in (b"", b"\x91", b"\x91\x80", b"\x03\x00\x00\x00\x00",
+                       b"\x91\x08\x91\x10", b"\x9c"):
+        decoded = frame_offset(_Located(expression))
+        expect(decoded is None, f"{expression!r} decoded as {decoded}, wanted unreadable")
 
     # A line program with one sequence, one special opcode and an end_sequence.
     header = bytearray()

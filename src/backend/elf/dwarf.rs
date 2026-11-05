@@ -1374,11 +1374,39 @@ struct UnitAbbrevs {
     /// with parameters needs, so a debugger can list the arguments it takes.
     subprogram_with_children: [[u64; 2]; 2],
     /// `DW_TAG_formal_parameter` with a name, and without one (a prototype).
-    formal_parameter_named: u64,
-    formal_parameter_unnamed: u64,
+    formal_parameter_named: Option<u64>,
+    formal_parameter_unnamed: Option<u64>,
+    /// The same two shapes with a `DW_AT_location`: a parameter the frame layout
+    /// proved a home for.  Two extra codes rather than an attribute on every
+    /// parameter, because the compressor of a table is its shape count: a
+    /// parameter without a home (a prototype's, or one the layout could not
+    /// place) must not pay for an attribute it cannot fill.
+    ///
+    /// `None` in a unit that places *no* parameter at all -- every function in a
+    /// `-O2` unit whose parameters live in registers, or any unit built without a
+    /// frame -- because an abbreviation no DIE uses is bytes in every object and
+    /// a parse for every consumer.
+    formal_parameter_named_located: Option<u64>,
+    formal_parameter_unnamed_located: Option<u64>,
     /// `DW_TAG_unspecified_parameters`: the list continues with `...`.
     unspecified_parameters: u64,
     next_code: u64,
+}
+
+/// The parameter shapes a unit's DIEs take.
+///
+/// Read from the unit before the table is written, so the table declares the
+/// shapes that will be used and no others: at `-O0` a named parameter always has
+/// a home, which leaves the unlocated shape dead weight, while in a unit whose
+/// parameters all live in registers the located one is.  The unnamed axis is
+/// independent: only a prototype (or a C23 definition that names no parameter)
+/// takes an unnamed shape at all.
+#[derive(Default, Clone, Copy)]
+struct ParameterShapes {
+    named_unlocated: bool,
+    unnamed_unlocated: bool,
+    named_located: bool,
+    unnamed_located: bool,
 }
 
 /// Declare every abbreviation of a unit and return the codes its DIEs use.
@@ -1386,7 +1414,10 @@ struct UnitAbbrevs {
 /// One subprogram abbreviation per shape, numbered from 3.  `DW_FORM_flag_present`
 /// says "this function is external" by its presence, so from version 4 on a
 /// static function omits the attribute and needs its own abbreviation; versions 2
-/// and 3 carry the flag's value and serve both shapes with one.
+/// and 3 carry the flag's value and serve both shapes with one.  A shape is
+/// declared when the unit has a DIE that uses it, which for the parameter shapes
+/// is decided by [`ParameterShapes`]: a unit that places no parameter declares no
+/// located shape, and one that places all of them declares no unlocated one.
 fn declare_unit_abbrevs(
     abbrev: &mut Vec<u8>,
     config: DwarfConfig,
@@ -1395,6 +1426,7 @@ fn declare_unit_abbrevs(
     declarator_rows: bool,
     has_code: bool,
     has_stmt_list: bool,
+    parameters: ParameterShapes,
 ) -> UnitAbbrevs {
     let mut cu_attrs = vec![
         (DW_AT_NAME, forms.unit_path),
@@ -1510,24 +1542,62 @@ fn declare_unit_abbrevs(
     // The parameter shapes.  A named parameter states where the user wrote it and
     // what type it has; an unnamed one (a prototype's `void f(int)`) states only
     // the type, which is the difference `DW_AT_name`'s presence encodes.
-    declare_abbrev(
-        abbrev,
-        next_code,
-        DW_TAG_FORMAL_PARAMETER,
-        false,
-        &[(DW_AT_NAME, forms.string), (DW_AT_TYPE, DW_FORM_REF4)],
-    );
-    let formal_parameter_named = next_code;
-    next_code += 1;
-    declare_abbrev(
-        abbrev,
-        next_code,
-        DW_TAG_FORMAL_PARAMETER,
-        false,
-        &[(DW_AT_TYPE, DW_FORM_REF4)],
-    );
-    let formal_parameter_unnamed = next_code;
-    next_code += 1;
+    let formal_parameter_named = if parameters.named_unlocated {
+        declare_abbrev(
+            abbrev,
+            next_code,
+            DW_TAG_FORMAL_PARAMETER,
+            false,
+            &[(DW_AT_NAME, forms.string), (DW_AT_TYPE, DW_FORM_REF4)],
+        );
+        next_code += 1;
+        Some(next_code - 1)
+    } else {
+        None
+    };
+    let formal_parameter_unnamed = if parameters.unnamed_unlocated {
+        declare_abbrev(
+            abbrev,
+            next_code,
+            DW_TAG_FORMAL_PARAMETER,
+            false,
+            &[(DW_AT_TYPE, DW_FORM_REF4)],
+        );
+        next_code += 1;
+        Some(next_code - 1)
+    } else {
+        None
+    };
+    let formal_parameter_named_located = if parameters.named_located {
+        declare_abbrev(
+            abbrev,
+            next_code,
+            DW_TAG_FORMAL_PARAMETER,
+            false,
+            &[
+                (DW_AT_NAME, forms.string),
+                (DW_AT_TYPE, DW_FORM_REF4),
+                (DW_AT_LOCATION, DW_FORM_BLOCK1),
+            ],
+        );
+        next_code += 1;
+        Some(next_code - 1)
+    } else {
+        None
+    };
+    let formal_parameter_unnamed_located = if parameters.unnamed_located {
+        declare_abbrev(
+            abbrev,
+            next_code,
+            DW_TAG_FORMAL_PARAMETER,
+            false,
+            &[(DW_AT_TYPE, DW_FORM_REF4), (DW_AT_LOCATION, DW_FORM_BLOCK1)],
+        );
+        next_code += 1;
+        Some(next_code - 1)
+    } else {
+        None
+    };
     declare_abbrev(abbrev, next_code, DW_TAG_UNSPECIFIED_PARAMETERS, false, &[]);
     let unspecified_parameters = next_code;
     next_code += 1;
@@ -1540,6 +1610,8 @@ fn declare_unit_abbrevs(
         subprogram_with_children,
         formal_parameter_named,
         formal_parameter_unnamed,
+        formal_parameter_named_located,
+        formal_parameter_unnamed_located,
         unspecified_parameters,
         next_code,
     }
@@ -1680,6 +1752,19 @@ pub(crate) fn build_dwarf_info_sections(
     // section; anything else needs a range list.
     let range_list = code.len() > 1;
 
+    // Which parameter shapes this unit's DIEs take, so the table declares those
+    // and no others.
+    let mut parameters = ParameterShapes::default();
+    for function in unit.parameters.values() {
+        for parameter in &function.parameters {
+            match (parameter.name.is_some(), parameter.location.is_some()) {
+                (true, true) => parameters.named_located = true,
+                (false, true) => parameters.unnamed_located = true,
+                (true, false) => parameters.named_unlocated = true,
+                (false, false) => parameters.unnamed_unlocated = true,
+            }
+        }
+    }
     let mut abbrev = Vec::new();
     let abbrevs = declare_unit_abbrevs(
         &mut abbrev,
@@ -1689,6 +1774,7 @@ pub(crate) fn build_dwarf_info_sections(
         has_declarator_rows,
         has_code,
         stmt_list.is_some(),
+        parameters,
     );
     let cu_code = abbrevs.cu_code;
     // The abbreviation table grows as the compiler's DIE tables are written: a
@@ -2018,11 +2104,24 @@ fn emit_subprograms(
         // so they cannot answer "what is `n` in this frame".
         if let Some(list) = parameters {
             for parameter in &list.parameters {
-                let code = if parameter.name.is_some() {
-                    abbrevs.formal_parameter_named
-                } else {
-                    abbrevs.formal_parameter_unnamed
+                // Four shapes: named or not, located or not.  The abbreviation
+                // says which attributes follow, so a parameter the frame could not
+                // place simply takes the shorter shape instead of writing an empty
+                // location block -- an empty block is not "unknown", it is an
+                // expression of length zero, which a consumer must reject.
+                let shape = match (parameter.name.is_some(), parameter.location.is_some()) {
+                    (true, true) => abbrevs.formal_parameter_named_located,
+                    (false, true) => abbrevs.formal_parameter_unnamed_located,
+                    (true, false) => abbrevs.formal_parameter_named,
+                    (false, false) => abbrevs.formal_parameter_unnamed,
                 };
+                // A located parameter exists only in a unit that declared the
+                // shape for it, so a missing code is a writer bug and not input.
+                let code = shape.ok_or_else(|| {
+                    "internal: DWARF parameter has a location but the unit declared no \
+                     abbreviation for it"
+                        .to_string()
+                })?;
                 write_uleb128(code, info);
                 if let Some(name) = parameter.name.as_deref() {
                     if name.as_bytes().contains(&0) {
@@ -2043,6 +2142,19 @@ fn emit_subprograms(
                 // The type reference is patched once the type table has offsets.
                 dies.patches.push((info.len(), parameter.ty));
                 info.extend_from_slice(&[0; 4]);
+                if let Some(location) = parameter.location {
+                    // `DW_OP_fbreg <delta>` in a `block1`: one opcode, then a
+                    // signed LEB128.  The frame base is `DW_OP_call_frame_cfa`, so
+                    // this reads "the caller's stack pointer at the call, plus
+                    // `delta`", which is the slot the prologue writes and the
+                    // address `&parameter` yields.
+                    let expression = location.expression();
+                    let length = u8::try_from(expression.len()).map_err(|_| {
+                        "DWARF parameter location expression exceeds 255 bytes".to_string()
+                    })?;
+                    info.push(length);
+                    info.extend_from_slice(&expression);
+                }
             }
             if list.variadic {
                 write_uleb128(abbrevs.unspecified_parameters, info);
@@ -2159,6 +2271,13 @@ enum AttrValue {
     /// `DW_AT_location` of an object at a fixed address: `DW_OP_addr` and a
     /// relocation against the symbol the linker will place.
     LocationAddr(String),
+    /// `DW_AT_location` of a value the frame layout placed: a location
+    /// expression, written as a length-prefixed block.
+    ///
+    /// `DW_FORM_block1` is what GCC 16.2 writes at `-O0` (`2 byte block: 91 5c`)
+    /// and what every dialect from 2 to 5 accepts, so one form serves them all;
+    /// `DW_FORM_exprloc` would say the same thing one version later for no gain.
+    LocationExpr(Vec<u8>),
     /// `DW_AT_data_member_location`: a constant from version 4 on,
     /// `DW_OP_plus_uconst` in a block before it.
     MemberLocation(u64),
@@ -2185,6 +2304,7 @@ impl Attr {
             AttrValue::Data1(_) => DW_FORM_DATA1,
             AttrValue::Sdata(_) => DW_FORM_SDATA,
             AttrValue::TypeRef(_) => DW_FORM_REF4,
+            AttrValue::LocationExpr(_) => DW_FORM_BLOCK1,
             AttrValue::LocationAddr(_) => {
                 if config.version >= 4 {
                     DW_FORM_EXPRLOC
@@ -2351,6 +2471,17 @@ impl DieContext<'_, '_> {
                     symbol,
                     0,
                 )
+            }
+            AttrValue::LocationExpr(expression) => {
+                // `DW_FORM_block1`: a one-byte length, then the expression. A
+                // parameter's home is at most six bytes (`DW_OP_fbreg` plus a
+                // five-byte LEB128), so the length always fits; anything longer
+                // would be a writer bug, and is reported rather than truncated.
+                let length = u8::try_from(expression.len())
+                    .map_err(|_| "DWARF location expression exceeds 255 bytes".to_string())?;
+                self.info.push(length);
+                self.info.extend_from_slice(expression);
+                Ok(())
             }
             AttrValue::FlagPresent => {
                 if self.config.version < 4 {
@@ -3210,6 +3341,10 @@ const DW_FORM_BLOCK1: u64 = 0x0a;
 const DW_FORM_SDATA: u64 = 0x0d;
 /// `DW_OP_addr`: the address of an object, as a relocation the linker resolves.
 const DW_OP_ADDR: u8 = 0x03;
+/// `DW_OP_fbreg`: a signed displacement from the frame base of the enclosing
+/// subprogram.  Version 2 and later, so every dialect this writer emits can use
+/// it, and GCC 16.2 uses it for the same slots at `-O0`.
+pub(crate) const DW_OP_FBREG: u8 = 0x91;
 /// `DW_OP_plus_uconst`: the member offset a version 2 or 3 unit writes as a
 /// block rather than as a constant.
 const DW_OP_PLUS_UCONST: u8 = 0x23;
@@ -3519,7 +3654,7 @@ fn write_uleb128(mut value: u64, out: &mut Vec<u8>) {
     }
 }
 
-fn write_sleb128(mut value: i64, out: &mut Vec<u8>) {
+pub(crate) fn write_sleb128(mut value: i64, out: &mut Vec<u8>) {
     loop {
         let byte = (value as u8) & 0x7f;
         value >>= 7;
@@ -3913,10 +4048,12 @@ mod tests {
                     DwarfParameter {
                         name: Some("a".to_string()),
                         ty: 0,
+                        location: None,
                     },
                     DwarfParameter {
                         name: Some("b".to_string()),
                         ty: 2,
+                        location: None,
                     },
                 ],
                 variadic: false,
@@ -3928,6 +4065,7 @@ mod tests {
                 parameters: vec![DwarfParameter {
                     name: Some("count".to_string()),
                     ty: 0,
+                    location: None,
                 }],
                 variadic: true,
             },
