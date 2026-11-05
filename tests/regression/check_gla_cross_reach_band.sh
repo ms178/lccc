@@ -74,17 +74,21 @@ if [[ -x $arm_cc ]]; then
   # caller-saved x4-x6 -- matmul is a leaf, so nothing clobbers them -- and
   # x26-x28 are no longer bought (x19-x25 saved, all used; CCC_NO_COALESCE=1
   # restores 96).
+  # 80 -> 48: a leaf's loop values take the volatile pool first
+  # (regalloc_helpers::leaf_caller_saved_homes), so the inner loops run in
+  # x8-x15 and only the four outer values keep x19-x22 (two pairs saved
+  # instead of three and a half).
   for mm in mm10 mm6; do
     frame=$(fn_body "$tmp/$mm.s" matmul | grep -oE 'stp[[:space:]]+x29, x30, \[sp, #-[0-9]+\]!' | grep -oE '#-[0-9]+' || true)
-    [[ $frame == "#-80" ]] || {
-      echo "FAIL: aarch64 matmul frame ($mm) is ${frame:-none}, pinned #-80"; fail=1; }
+    [[ $frame == "#-48" ]] || {
+      echo "FAIL: aarch64 matmul frame ($mm) is ${frame:-none}, pinned #-48"; fail=1; }
   done
   fn_body "$tmp/mm10.s" matmul >"$tmp/mm10.body"
   fn_body "$tmp/mm6.s" matmul >"$tmp/mm6.body"
   [[ -s $tmp/mm10.body ]] || { echo "FAIL: aarch64 matmul body not found"; fail=1; }
   cmp -s "$tmp/mm10.body" "$tmp/mm6.body" || {
     echo "FAIL: aarch64 reach band changed matmul's code (pinned: identical)"; fail=1; }
-  [[ $fail -eq 0 ]] && echo "ok: aarch64 matmul frame 80 at bands 10 and 6, body identical"
+  [[ $fail -eq 0 ]] && echo "ok: aarch64 matmul frame 48 at bands 10 and 6, body identical"
 else
   echo "SKIP: aarch64 cross compiler unavailable"
 fi

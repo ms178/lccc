@@ -263,15 +263,28 @@ for f in clz32 clz64; do
     grep -qE '^\s+or\s+t0, t0, t1' <<<"$(fn_body "$f" "$tmp/rv.s")" ||
         fail "$f: no smear cascade on RISC-V"
 done
+# The mask's registers are the allocator's and the copy propagator's choice
+# (`not t2, a0` once the parameter copy is gone): pin the operations, any
+# registers -- `addi d, x, -1`, `not e, x` and the `and` of the two.
 for f in ctz32 ctz64; do
-    grep -qE '^\s+not\s+t2, t0' <<<"$(fn_body "$f" "$tmp/rv.s")" ||
+    body=$(fn_body "$f" "$tmp/rv.s")
+    mask=$(awk '$1 == "addi" && $4 == "-1" { sub(",", "", $3); dec[$3] = 1 }
+                $1 == "not" { sub(",", "", $3); inv[$3] = 1 }
+                END { for (r in dec) if (r in inv) ok = 1; print ok ? "yes" : "no" }' <<<"$body")
+    [ "$mask" = yes ] && grep -qE '^\s+and\s' <<<"$body" ||
         fail "$f: no (x - 1) & ~x mask on RISC-V"
 done
 
 # Pinned counts for the other backends: the numbers the round was measured at.
+# RISC-V 17 -> 14 / 13: the peephole's global liveness and block copy
+# propagation fold the parameter's staging copy into its first reader, and the
+# 64-bit form no longer copies the operand before the fold; every narrow pin
+# below dropped by the same copies (par8 12 -> 9, par16 16 -> 14, pc8 15 -> 12,
+# pc16 22 -> 20).  Values are unchanged: parity_and_popcount.c agrees at every
+# level on RV64 and AArch64 under qemu.
 pinrv() { local got; got=$(count_of "$1" "$tmp/rv.s"); [ "$got" = "$2" ] || fail "$1: $got instructions on RISC-V, pinned $2"; }
-pinrv par32 17
-pinrv par64 17
+pinrv par32 14
+pinrv par64 13
 # RISC-V's narrow sequences are its own: `andi` holds every mask a byte's SWAR
 # needs, so the narrow form is shorter than the 32-bit one by the constant
 # loads alone, and a byte's parity is three folds rather than folds plus the
@@ -293,10 +306,10 @@ pinarm() { local got; got=$(count_of "$1" "$tmp/arm.s"); [ "$got" = "$2" ] || fa
 pinarm par8 14
 pinarm pc8 13
 pinarm pc16 13
-pinrv par8 12
-pinrv par16 16
-pinrv pc8 15
-pinrv pc16 22
+pinrv par8 9
+pinrv par16 14
+pinrv pc8 12
+pinrv pc16 20
 pini686() { local got; got=$(count_of "$1" "$tmp/i686.s"); [ "$got" = "$2" ] || fail "$1: $got instructions on i686, pinned $2"; }
 # 10: the same 6-instruction algorithm as x86-64, plus the memory-argument
 # load and the two-instruction `subl $12/addl $12` frame. The select-diamond
