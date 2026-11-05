@@ -257,6 +257,48 @@ fn classify_implicit_operands_rv(line: &str) -> (u64, u64) {
     }
 }
 
+/// True for a line that calls: control returns to the next line with every
+/// caller-saved register clobbered, after the callee read a0-a7.
+///
+/// That is the `call` pseudo and every `jal`/`jalr` that links -- writes the
+/// return address into a register other than `zero`.  The emitter's indirect
+/// call is `jalr ra, t2, 0`; it used to classify as an ordinary instruction, so
+/// the passes that track a call's clobbers by `LineKind::Call` carried values
+/// across it in caller-saved registers.  Entry-copy coalescing renamed a
+/// parameter's callee-saved home onto the a-register it arrived in, past the
+/// call that destroys that register: `long f(long (*fp)(void), long x)
+/// { return fp() + x; }` added the callee's leftover a1 instead of `x`.
+///
+/// Operand forms (GNU as): `jal label` and `jalr rs1` / `jalr rs1, imm` link
+/// through ra; `jal rd, label`, `jalr rd, rs1`, `jalr rd, imm(rs1)` and
+/// `jalr rd, rs1, imm` name the link register first.
+fn is_call_line(trimmed: &str) -> bool {
+    let (mnem, rest) = match trimmed.split_once(char::is_whitespace) {
+        Some((m, r)) => (m, r.trim()),
+        None => (trimmed, ""),
+    };
+    let links = |rd: &str| !matches!(rd.trim(), "zero" | "x0");
+    match mnem {
+        "call" => true,
+        "jal" => match rest.split_once(',') {
+            None => !rest.is_empty(),
+            Some((rd, _)) => links(rd),
+        },
+        "jalr" => {
+            let ops: Vec<&str> = rest.split(',').map(str::trim).collect();
+            match ops.as_slice() {
+                [rs1] => !rs1.is_empty(),
+                // `jalr rs1, imm` links through ra; with a register or an
+                // `imm(rs1)` address second, the first operand is rd.
+                [first, second] => parse_asm_i64(second).is_some() || links(first),
+                [rd, _, _] => links(rd),
+                _ => true, // unknown shape: assume the worst
+            }
+        }
+        _ => false,
+    }
+}
+
 /// True when the line implicitly writes register `id` (the write half of
 /// [`classify_implicit_operands_rv`]).
 fn implicitly_writes_rv(line: &str, id: u8) -> bool {
@@ -385,8 +427,8 @@ fn classify_line(line: &str) -> LineKind {
         return LineKind::Ret;
     }
 
-    // call
-    if trimmed.starts_with("call ") || trimmed.starts_with("jal ra,") {
+    // call -- direct, or indirect through `jalr` (see `is_call_line`)
+    if is_call_line(trimmed) {
         return LineKind::Call;
     }
 
@@ -1722,6 +1764,44 @@ fn has_unmodelled_effects(line: &str) -> bool {
         || m.starts_with("amo")
 }
 
+/// `sb`/`sh`/`sw`/`sd` and the FP stores: they read every register they name.
+fn is_gp_store(line: &str) -> bool {
+    matches!(
+        line.trim().split_whitespace().next().unwrap_or(""),
+        "sb" | "sh" | "sw" | "sd" | "fsh" | "fsw" | "fsd" | "fsq"
+    )
+}
+
+/// The GP register a line names as its destination, if any.
+///
+/// A RISC-V instruction that writes a GP register names it first, so outside
+/// stores, branches and jumps the first operand is the destination.  This
+/// over-approximates on purpose (`jr t0` reports t0): callers use it to refuse
+/// a transformation, never to license one.
+fn named_gp_dest(line: &str, kind: LineKind) -> Option<u8> {
+    match kind {
+        LineKind::Nop
+        | LineKind::Directive
+        | LineKind::Label
+        | LineKind::Branch
+        | LineKind::Jump
+        | LineKind::Ret
+        | LineKind::StoreS0 { .. } => None,
+        LineKind::Move { dst, .. }
+        | LineKind::LoadImm { dst }
+        | LineKind::SextW { dst, .. }
+        | LineKind::LoadAddr { dst }
+        | LineKind::LoadS0 { reg: dst, .. } => Some(dst),
+        LineKind::Call | LineKind::Alu | LineKind::Other => {
+            if is_gp_store(line) {
+                None
+            } else {
+                parse_alu_dest(line)
+            }
+        }
+    }
+}
+
 /// Whole-function register-copy coalescing for the entry shuffle.
 ///
 /// Ported from the ARM backend, which ports the x86 pass
@@ -1741,19 +1821,19 @@ fn has_unmodelled_effects(line: &str) -> bool {
 ///     clobbers the coalesced value and no other live range is disturbed.  A
 ///     parameter's arrival in `src` is implicit, not a mention.
 ///  3. After the copy, `dst` has no unrenamable reader or writer: no implicit
-///     operand, no `ret` with `dst` in a0-a7 (the return-value registers), no
-///     call while the value lives in a caller-saved register *and is still used
-///     afterwards*, and no unmodelled instruction.  A far `jump` uses t6 as its
-///     scratch, so t6 is never renamed across one.
+///     operand, no `ret` or call with `dst` in a0-a7 (the return-value and
+///     argument registers), no call while the value lives in a caller-saved
+///     register *and may still be used afterwards* -- named past the
+///     straight-line run that follows the copy -- and no unmodelled
+///     instruction.  A far `jump` uses t6 as its scratch, so t6 is never
+///     renamed across one.
 ///  4. s0 (frame pointer), ra and sp are never renamed.
-/// `sb`/`sh`/`sw`/`sd` and the FP stores: they read every register they name.
-fn is_gp_store(line: &str) -> bool {
-    matches!(
-        line.trim().split_whitespace().next().unwrap_or(""),
-        "sb" | "sh" | "sw" | "sd" | "fsh" | "fsw" | "fsd" | "fsq"
-    )
-}
-
+///  5. After the rename every later write of `dst` lands in `src`, so `src`
+///     must be dead wherever such a write runs.  Rule 2 excludes the readers
+///     that name `src`; the ABI's implicit ones are a call (a0-a7, the
+///     arguments) and `ret` (a0/a1, the return value).  An epilogue restore of
+///     a callee-saved `dst` is not renamed at all: `dst` is never written again,
+///     so it still holds the caller's value and the restore is deleted.
 fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     fn mentions(line: &str, reg: u8) -> bool {
         let name = reg_name(reg);
@@ -1836,6 +1916,56 @@ fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize)
             {
                 continue;
             }
+            // Rule 5's restores: the frame slot the entry run saved a
+            // callee-saved `dst` to.  A doubleword load of that slot back into
+            // `dst` reinstates the caller's value, which `dst` keeps once the
+            // rename stops writing it, so such a line is deleted, not renamed.
+            let save_slot = if (REG_S1..=REG_S11).contains(&dst) {
+                (fstart + 1..i).find_map(|k| match kinds[k] {
+                    LineKind::StoreS0 {
+                        reg,
+                        offset,
+                        is_word: false,
+                    } if reg == dst => Some(offset),
+                    _ => None,
+                })
+            } else {
+                None
+            };
+            let is_restore = |kind: LineKind| {
+                save_slot.is_some()
+                    && matches!(kind, LineKind::LoadS0 { reg, offset, is_word: false }
+                        if reg == dst && Some(offset) == save_slot)
+            };
+            // Rule 5: every other write of `dst` after the copy becomes a
+            // write of `src`.  Rule 2 leaves `src` without a reader that names
+            // it, but an argument register has implicit ones: every call reads
+            // a0-a7 and `ret` reads a0/a1.  The epilogue restore was the write
+            // that bit before restores were deleted: in
+            // `foo(x) { asm("" :: "r"(x)); return x; }` the copy `mv s1, a0`
+            // was coalesced, `ld s1, -32(s0)` became `ld a0, -32(s0)`, and foo
+            // returned the caller's s1 (gcc.c-torture/execute/pr40022.c looped
+            // forever at -O1 and -O2).  The copy sits in the straight-line entry
+            // run, so any later line may run after any such write -- a back
+            // edge reaches lines above it -- and an implicit reader anywhere
+            // after the copy counts.
+            if (REG_A0..=REG_A7).contains(&src) {
+                let returns_src = src == REG_A0 || src == REG_A1;
+                let implicitly_read = (i + 1..fend).any(|k| match kinds[k] {
+                    LineKind::Ret => returns_src,
+                    LineKind::Call => true,
+                    _ => false,
+                });
+                if implicitly_read
+                    && (i + 1..fend).any(|k| {
+                        kinds[k] != LineKind::Nop
+                            && !is_restore(kinds[k])
+                            && named_gp_dest(&lines[k], kinds[k]) == Some(dst)
+                    })
+                {
+                    continue;
+                }
+            }
             let mut ok = true;
             for k in fstart..fend {
                 if k == i || kinds[k] == LineKind::Nop {
@@ -1847,6 +1977,28 @@ fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize)
                 }
             }
             if ok {
+                // After the rename the value lives in `src`, and a call
+                // destroys a caller-saved `src`: the value must then be dead
+                // after every call on every path.  Text order is not control
+                // flow -- a back edge carries a use above a call to the point
+                // after it -- so only the straight-line run that follows the
+                // copy is trusted: past the first label, jump, branch, call or
+                // return, nothing but a (deleted) restore may name `dst`.
+                let run_end = (i + 1..fend)
+                    .find(|&k| {
+                        matches!(
+                            kinds[k],
+                            LineKind::Label
+                                | LineKind::Jump
+                                | LineKind::Branch
+                                | LineKind::Call
+                                | LineKind::Ret
+                        )
+                    })
+                    .unwrap_or(fend);
+                let named_past_run = (run_end..fend).any(|m| {
+                    kinds[m] != LineKind::Nop && !is_restore(kinds[m]) && mentions(&lines[m], dst)
+                });
                 for k in i + 1..fend {
                     match kinds[k] {
                         LineKind::Nop | LineKind::Directive | LineKind::Label => {}
@@ -1863,9 +2015,11 @@ fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize)
                             }
                         }
                         LineKind::Call => {
-                            if caller_saved(src)
-                                && (k + 1..fend)
-                                    .any(|m| kinds[m] != LineKind::Nop && mentions(&lines[m], dst))
+                            // A call also reads a0-a7: an argument-register
+                            // `dst` the rename stops writing would reach the
+                            // callee stale.
+                            if (caller_saved(src) && named_past_run)
+                                || (REG_A0..=REG_A7).contains(&dst)
                             {
                                 ok = false;
                                 break;
@@ -1891,6 +2045,10 @@ fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize)
             let s = reg_name(src).to_string();
             for k in i + 1..fend {
                 if kinds[k] == LineKind::Nop {
+                    continue;
+                }
+                if is_restore(kinds[k]) {
+                    kinds[k] = LineKind::Nop;
                     continue;
                 }
                 let new =
@@ -3196,6 +3354,146 @@ mod tests {
             if *k != LineKind::Nop && (l.contains("lga") || l.contains("call")) {
                 assert!(l.trim().ends_with("t3"), "symbol renamed: {l}");
             }
+        }
+    }
+
+    fn live_lines(lines: &[String], kinds: &[LineKind]) -> Vec<String> {
+        lines
+            .iter()
+            .zip(kinds)
+            .filter(|(_, k)| **k != LineKind::Nop)
+            .map(|(l, _)| l.trim().to_string())
+            .collect()
+    }
+
+    /// gcc.c-torture/execute/pr40022.c: `foo(x) { asm("" :: "g"(x)); return
+    /// x; }` at -O2, as the emitter writes it (x homed in s1 because the asm is
+    /// a call point).  The local passes reduce the body to `mv s1, a0` before
+    /// the epilogue; coalescing it renamed the restore `ld s1` into `ld a0` and
+    /// foo returned the caller's s1.  a0 must reach `ret` unwritten.
+    #[test]
+    fn entry_coalescing_keeps_a_returned_argument_register_intact() {
+        let asm = "foo:\n    addi sp, sp, -32\n    sd ra, 24(sp)\n    sd s0, 16(sp)\n    addi s0, sp, 32\n    sd s1, -32(s0)\n    mv s1, a0\n    mv t0, s1\n    mv t0, s1\n    mv a0, t0\n    ld s1, -32(s0)\n    ld ra, 24(sp)\n    ld s0, 16(sp)\n    addi sp, sp, 32\n    ret\n";
+        let out = peephole_optimize(asm.into());
+        for line in out.lines() {
+            let kind = classify_line(line);
+            assert_ne!(
+                named_gp_dest(line, kind),
+                Some(REG_A0),
+                "a0 written before ret:\n{out}"
+            );
+            assert_ne!(
+                named_gp_dest(line, kind),
+                Some(REG_S1),
+                "s1 written without its restore:\n{out}"
+            );
+        }
+        assert!(out.contains("ret"), "{out}");
+    }
+
+    /// A coalesced callee-saved home is never written again, so its epilogue
+    /// restore is deleted -- not renamed into a write of the source register.
+    #[test]
+    fn entry_coalescing_deletes_the_restore_of_a_coalesced_callee_saved_dst() {
+        let asm = "f:\n    sd s1, -32(s0)\n    mv s1, a2\n    add t0, s1, s1\n    sd t0, 0(t5)\n    ld s1, -32(s0)\n    ret\n";
+        let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        while coalesce_entry_copies(&mut lines, &mut kinds, n) {}
+        let live = live_lines(&lines, &kinds);
+        assert_eq!(
+            live,
+            [
+                "f:",
+                "sd s1, -32(s0)",
+                "add t0, a2, a2",
+                "sd t0, 0(t5)",
+                "ret"
+            ],
+            "{live:#?}"
+        );
+    }
+
+    /// Any other write of the home lands in the source after the rename; with
+    /// an argument-register source that `ret` (a0/a1) or a call (a0-a7) reads,
+    /// the copy stays.
+    #[test]
+    fn entry_coalescing_refuses_to_write_an_implicitly_read_argument_register() {
+        for (src, reader) in [("a0", "ret"), ("a1", "ret"), ("a5", "call g\n    ret")] {
+            let asm = format!(
+                "f:\n    sd s1, -32(s0)\n    mv s1, {src}\n    sd s1, 0(t5)\n    li s1, 7\n    sd s1, 8(t5)\n    ld s1, -32(s0)\n    {reader}\n"
+            );
+            let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+            let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+            let n = lines.len();
+            assert!(
+                !coalesce_entry_copies(&mut lines, &mut kinds, n),
+                "{src}: {:#?}",
+                live_lines(&lines, &kinds)
+            );
+        }
+        // a2 is read by calls only: a leaf function may reuse it freely.
+        let asm = "f:\n    sd s1, -32(s0)\n    mv s1, a2\n    sd s1, 0(t5)\n    li s1, 7\n    sd s1, 8(t5)\n    ld s1, -32(s0)\n    ret\n";
+        let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        while coalesce_entry_copies(&mut lines, &mut kinds, n) {}
+        let live = live_lines(&lines, &kinds);
+        assert!(live.contains(&"li a2, 7".to_string()), "{live:#?}");
+        assert!(!live.iter().any(|l| l.starts_with("ld ")), "{live:#?}");
+    }
+
+    /// `long f(long (*fp)(void), long x) { return fp() + x; }` at -O2: x homed
+    /// in s1 across the indirect call.  `jalr ra, t2, 0` was not a call to the
+    /// coalescer, which renamed s1 onto a1 -- destroyed by the call.
+    #[test]
+    fn entry_coalescing_does_not_carry_a_value_across_an_indirect_call() {
+        let asm = "f:\n    sd s1, -48(s0)\n    sd s7, -40(s0)\n    mv t0, a0\n    mv s1, a1\n    mv t2, t0\n    jalr ra, t2, 0\n    mv s7, a0\n    add t0, s7, s1\n    mv a0, t0\n    ld s1, -48(s0)\n    ld s7, -40(s0)\n    ret\n";
+        let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        while coalesce_entry_copies(&mut lines, &mut kinds, n) {}
+        let live = live_lines(&lines, &kinds);
+        assert!(live.contains(&"mv s1, a1".to_string()), "{live:#?}");
+        assert!(live.contains(&"add t0, s7, s1".to_string()), "{live:#?}");
+    }
+
+    /// A use above the call inside a loop is reached again after the call: a
+    /// caller-saved source must not carry the value even though no line after
+    /// the call names it (restores aside).
+    #[test]
+    fn entry_coalescing_respects_back_edges_around_a_call() {
+        let asm = "f:\n    sd s1, -48(s0)\n    mv s1, a1\n.LBB1:\n    add t0, t0, s1\n    call g\n    bnez t0, .LBB1\n    ld s1, -48(s0)\n    ret\n";
+        let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        assert!(
+            !coalesce_entry_copies(&mut lines, &mut kinds, n),
+            "{:#?}",
+            live_lines(&lines, &kinds)
+        );
+    }
+
+    #[test]
+    fn linking_jumps_classify_as_calls() {
+        for line in [
+            "    call foo",
+            "    jal ra, foo",
+            "    jal foo",
+            "    jalr ra, t2, 0",
+            "    jalr ra, 0(t2)",
+            "    jalr t2",
+            "    jalr t2, 8",
+            "    jalr t1, t2",
+        ] {
+            assert_eq!(classify_line(line), LineKind::Call, "{line}");
+        }
+        for line in [
+            "    jalr zero, 0(t0)",
+            "    jalr x0, t0, 0",
+            "    jal zero, foo",
+        ] {
+            assert_ne!(classify_line(line), LineKind::Call, "{line}");
         }
     }
 

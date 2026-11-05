@@ -31,7 +31,7 @@ FIXTURES = (
     "switch_i128_high_half", "switch_i128_wide_cases", "complex_float_return_cross",
     "divrem_pair_cross", "urem_by_one_cross", "va_arg_align16_cross",
     "overaligned_aggregate_arg_cross", "indirect_variadic_call_cross",
-    "callee_saved_return_paths_cross",
+    "callee_saved_return_paths_cross", "entry_copy_abi_reads_cross",
 )
 ALL_LEVELS = ("-O0", "-O1", "-O2", "-Os")
 LEVELS = {
@@ -55,6 +55,10 @@ LEVELS = {
     # AArch64 -O1/-O2: an epilogue's callee-saved restore hoisted out of a
     # "loop" whose backedge was a second path to the epilogue.
     "callee_saved_return_paths_cross": ALL_LEVELS,
+    # RV64 -O1 and up: entry-copy coalescing renamed a callee-saved restore
+    # into the a0 that `ret` reads, and carried a value across an indirect
+    # call (`jalr ra, t2, 0`) in the argument register the call destroys.
+    "entry_copy_abi_reads_cross": ALL_LEVELS,
 }
 # Two-unit psABI fixtures under interop/: `<name>_callee.c` and
 # `<name>_caller.c`, linked LCCC-with-LCCC and LCCC-with-Clang in both
