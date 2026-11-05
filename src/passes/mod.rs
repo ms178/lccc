@@ -1985,11 +1985,15 @@ pub(crate) fn run_passes(
         // __fabstf2); LCCC links no libgcc, so fold them to the backend's own
         // inline intrinsics even at -O0 (semantics-preserving rename).
         simplify::fold_math_intrinsic_calls(module);
-        // Unreachable internal-linkage functions go at every level, as with
-        // GCC's call graph: lowering keeps a static function on a superset
-        // of its AST references (an unevaluated `sizeof`/`typeof` operand
-        // counts), and only the IR knows which survive.  An unreachable one
-        // may call functions defined nowhere, which must not reach the link.
+        // `-O0` keeps every internal definition, as GCC 16.2 does (measured:
+        // an unused `static` function or object is in the `-O0` object and gone
+        // at `-O1`).  Two consumers read that guarantee: a debugger looking up a
+        // function the user wrote, and inline asm naming a static function no C
+        // expression mentions -- the reference graph cannot see the second, so
+        // pruning here would turn GCC's successful link into an undefined-symbol
+        // error.  The tier still drops unreachable `static inline` bodies and
+        // anything the compiler never lowered, and it filters `symbol_attrs` to
+        // surviving names so a visibility directive cannot outlive its symbol.
         dead_statics::eliminate_dead_statics_at_o0(module);
         // -O0 runs one budgeted fixpoint above: the always-inline rounds,
         // whose second-pass budget is a correctness budget (an unexpanded

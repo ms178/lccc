@@ -2726,6 +2726,7 @@ impl Driver {
             diagnostics,
             self.gnu89_inline,
         )
+        .with_optimization_level(self.opt_level)
         .with_pass_policy(crate::common::pass_policy::PassPolicy::new(
             self.effective_wrap_signed_overflow(),
             fp_environment_observable,

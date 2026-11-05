@@ -981,6 +981,13 @@ gate "c17-c23-diagnostics" fast \
     python3 tests/regression/check_c_std_diagnostics.py \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" \
         --json target/c-std-diagnostics.json --markdown target/c-std-diagnostics.md
+# Debugging quality: line program, subprogram DIEs, .debug_aranges and .eh_frame
+# decoded by the gate's own reader, across four DWARF versions and the -O0/-O1/-O2
+# tiers, whose internal-definition policy is GCC 16.2's measured one.
+gate "dwarf-quality" fast \
+    python3 tests/regression/check_dwarf_quality.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" \
+        --json target/dwarf-quality.json --markdown target/dwarf-quality.md
 # Digraph spelling is observable in macro stringification; this also exercises
 # directives, token boundaries, maximal munch and native/i686 execution.
 gate "c-digraphs" fast \
