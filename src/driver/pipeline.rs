@@ -2591,11 +2591,12 @@ impl Driver {
                 }
                 // `param_typedefs` is parallel to `params`; reading it by index
                 // rather than zipping keeps a short list from silently dropping
-                // the parameters past its end.
-                let alias = info.param_typedefs.get(index).cloned().flatten();
+                // the parameters past its end, and borrowing the alias avoids an
+                // allocation per spelled parameter on the compiler's hot path.
+                let alias = info.param_typedefs.get(index).and_then(Option::as_deref);
                 described.push(crate::backend::elf::DwarfParameter {
                     name: parameter_name.clone(),
-                    ty: graph.intern_written(ty, alias.as_deref()),
+                    ty: graph.intern_written(ty, alias),
                 });
             }
             if described.is_empty() && !info.variadic {
