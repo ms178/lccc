@@ -301,11 +301,14 @@ grep -qE 'andi\s+t1, t1, 0x55' <<<"$(fn_body pc8 "$tmp/rv.s")" ||
 grep -qE '0x5555' <<<"$(fn_body pc16 "$tmp/rv.s")" ||
     fail "pc16: no halfword lane masks on RISC-V"
 # The narrow shapes are shorter than the 32-bit ones they replace, on every
-# backend that had to pay for the extension before.
+# backend that had to pay for the extension before.  AArch64 14/13/13 ->
+# 12/11/11: the parameter's staging copy and the mask that read it became
+# one `and` once the definition retarget computes the masked value straight
+# into w0.
 pinarm() { local got; got=$(count_of "$1" "$tmp/arm.s"); [ "$got" = "$2" ] || fail "$1: $got instructions on AArch64, pinned $2"; }
-pinarm par8 14
-pinarm pc8 13
-pinarm pc16 13
+pinarm par8 12
+pinarm pc8 11
+pinarm pc16 11
 pinrv par8 9
 pinrv par16 14
 pinrv pc8 12

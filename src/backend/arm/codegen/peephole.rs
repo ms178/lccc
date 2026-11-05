@@ -705,6 +705,10 @@ pub fn peephole_optimize(asm: String) -> String {
         // After the folds: dead staging movs (their patterns must win first).
         changed |= eliminate_overwritten_moves(&lines, &mut kinds, n);
         changed |= eliminate_overwritten_stores(&lines, &mut kinds, n);
+        // Last: every pattern pass above (chain folds, remat CSE, slot
+        // threading) matches the accumulator shapes these two rewrite.
+        changed |= per_function(&mut lines, &mut kinds, n, retarget_defs_into_copies);
+        changed |= per_function(&mut lines, &mut kinds, n, fold_cset_add_to_cinc);
         if rotate {
             changed |= per_function(&mut lines, &mut kinds, n, rotate_simple_loops);
         }
@@ -766,6 +770,8 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= fold_zero_stores(&mut lines, &mut kinds, n);
             changed2 |= eliminate_overwritten_moves(&lines, &mut kinds, n);
             changed2 |= eliminate_overwritten_stores(&lines, &mut kinds, n);
+            changed2 |= per_function(&mut lines, &mut kinds, n, retarget_defs_into_copies);
+            changed2 |= per_function(&mut lines, &mut kinds, n, fold_cset_add_to_cinc);
             rounds2 += 1;
         }
     }
@@ -2478,6 +2484,14 @@ fn written_gp_register(line: &str, kind: LineKind) -> Option<u8> {
             let reg = parse_reg(dst);
             (reg != REG_NONE).then_some(reg)
         }
+        // Loads, `adrp`, `cset`, `csel`, bitfield moves, GP transfers out
+        // of FP registers...: single-destination producers whose first
+        // operand is their only write (no writeback form qualifies).  Left
+        // unknown, the liveness counted their destination as a READ and kept
+        // a dead accumulator alive across every one of them.
+        LineKind::MemOther | LineKind::Other | LineKind::LoadsbReg => {
+            renamable_def_dest(line).map(|(reg, _)| reg)
+        }
         _ => None,
     }
 }
@@ -3429,24 +3443,50 @@ fn eliminate_redundant_sxtw(lines: &mut [String], kinds: &mut [LineKind], n: usi
                 extended = [false; 33];
                 extended[32] = true;
             }
-            // Unknown/memory kinds may clobber registers — except ldrsw with
-            // non-sp addressing (classifies as MemOther), which CREATES a
-            // sign-extended register.
+            // Memory and unclassified kinds: when the line's register writes
+            // are known exactly (a single-destination producer, a store or a
+            // compare, plus any writeback base), only those registers change
+            // -- and some producers CREATE a sign-extended value: `ldrsw`,
+            // the 64-bit `ldrsb`/`ldrsh`/`sxtb`/`sxth`, any `ldrb`/`ldrh`/
+            // `uxtb`/`uxth` (at most 16 significant bits), `cset` (0 or 1)
+            // and the 64-bit `csetm` (0 or -1).  Anything else may clobber
+            // every register.
             LineKind::MemOther | LineKind::Other | LineKind::LoadsbReg | LineKind::LoadPairSp => {
                 let t = lines[i].trim();
-                let mut ldrsw_dst: Option<u8> = None;
-                if let Some(rest) = t.strip_prefix("ldrsw ") {
-                    if let Some((reg_str, _)) = rest.split_once(',') {
-                        let r = parse_reg(reg_str.trim());
-                        if r != REG_NONE && r < 32 {
-                            ldrsw_dst = Some(r);
+                let writeback = classify_implicit_operands_a64(t).1;
+                let mnem = t.split_whitespace().next().unwrap_or("");
+                let known = if t == OPAQUE_LINE || t.starts_with('#') {
+                    None
+                } else if let Some((dst, narrow)) = renamable_def_dest(t) {
+                    let sext64 = match mnem {
+                        "ldrsw" | "ldursw" | "ldrb" | "ldrh" | "ldurb" | "ldurh" | "uxtb"
+                        | "uxth" | "cset" => true,
+                        "ldrsb" | "ldrsh" | "ldursb" | "ldursh" | "sxtb" | "sxth" | "csetm" => {
+                            !narrow
+                        }
+                        _ => false,
+                    };
+                    Some((Some((dst, sext64)), writeback))
+                } else if A64_GP_READ_ONLY.contains(&mnem) {
+                    Some((None, writeback))
+                } else {
+                    None
+                };
+                match known {
+                    Some((def, writes)) => {
+                        for r in 0..32usize {
+                            if writes >> r & 1 != 0 {
+                                extended[r] = false;
+                            }
+                        }
+                        if let Some((dst, sext64)) = def {
+                            extended[dst as usize] = sext64;
                         }
                     }
-                }
-                extended = [false; 33];
-                extended[32] = true;
-                if let Some(r) = ldrsw_dst {
-                    extended[r as usize] = true;
+                    None => {
+                        extended = [false; 33];
+                        extended[32] = true;
+                    }
                 }
             }
             LineKind::LoadswSp { reg, .. } => {
@@ -6520,6 +6560,371 @@ fn sp_offsets_in_line(line: &str) -> Vec<i32> {
     out
 }
 
+// ── Definition retargeting into the copy that consumes it ───────────────────
+//
+// The emitter computes into x0 (the accumulator) and copies the result into
+// the value's home, so every homed definition paid a `mov`:
+//
+//     adrp x0, A                       adrp x0, A
+//     add  x0, x0, :lo12:A      ->     add  x19, x0, :lo12:A
+//     mov  x19, x0
+//
+//     ldrsw x0, [x6]            ->     ldrsw x8, [x6]
+//     mov   x8, x0
+//
+// GCC and Clang write the home directly.  The RISC-V backend has the same
+// rule (`retarget_dying_accumulator_moves`); this is its AArch64 port, on the
+// whole-function ABI liveness instead of a forward scan, so the source may
+// die anywhere -- across joins, at a `ret` that does not read it, or at a
+// later overwrite.
+//
+// Legality, for `mov D, S` at line j:
+//  1. S is dead after j (`abi_liveness`: every implicit AAPCS64 read, the
+//     result registers at `ret` and the arguments of a call included).
+//  2. Walking back from j inside the block, the first line that writes S is
+//     a renamable single-destination producer (`renamable_def_dest`): its
+//     first operand is the only register it writes, with no writeback.
+//  3. Every line between the definition and the copy that mentions S only
+//     reads it (`reads_gp_only`), and no line there mentions D at all: D's
+//     old value is then dead from the definition on, and the readers can be
+//     renamed to D.
+//  4. A 32-bit copy (`mov wD, wS`, which zero-extends) needs a 32-bit
+//     definition, whose upper half is zero already.
+// The definition's own reads (`add x0, x0, #1`) keep naming S: they read the
+// value S held before it.
+
+/// `svc`/`hvc`/`smc`: exception-generating calls whose handler reads the
+/// argument registers and writes x0 with no register named in the text.
+fn a64_traps_to_handler(line: &str) -> bool {
+    matches!(line.split_whitespace().next(), Some("svc" | "hvc" | "smc"))
+}
+
+/// Stores and compares: every general register they name is read (a
+/// writeback base aside), none is written.
+const A64_GP_READ_ONLY: &[&str] = &[
+    "str", "strb", "strh", "stur", "sturb", "sturh", "stp", "stnp", "cmp", "cmn", "tst", "ccmp",
+    "ccmn", "fcmp", "fcmpe",
+];
+
+/// Mnemonics whose first operand is their only register write.
+const A64_SINGLE_DEST_PRODUCERS: &[&str] = &[
+    "adrp", "adr", "add", "adds", "sub", "subs", "and", "ands", "orr", "orn", "eor", "eon", "bic",
+    "bics", "mul", "madd", "msub", "mneg", "smull", "umull", "smaddl", "umaddl", "smsubl",
+    "umsubl", "smulh", "umulh", "sdiv", "udiv", "neg", "negs", "mvn", "lsl", "lsr", "asr", "ror",
+    "lslv", "lsrv", "asrv", "rorv", "mov", "movz", "movn", "sxtw", "sxth", "sxtb", "uxth", "uxtb",
+    "ubfx", "sbfx", "ubfiz", "sbfiz", "extr", "csel", "csinc", "csinv", "csneg", "cset", "csetm",
+    "cinc", "cinv", "cneg", "clz", "cls", "rbit", "rev", "rev16", "rev32", "ldr", "ldrb", "ldrh",
+    "ldrsb", "ldrsh", "ldrsw", "ldur", "ldurb", "ldurh", "ldursb", "ldursh", "ldursw", "fmov",
+    "fcvtzs", "fcvtzu", "fcvtas", "fcvtau", "fcvtms", "fcvtmu", "fcvtps", "fcvtpu", "fcvtns",
+    "fcvtnu", "umov", "smov",
+];
+
+/// The general register a single-destination producer writes, and whether
+/// it names the 32-bit view: `None` for anything else (a store, a compare, a
+/// branch, a pair load, a writeback form, an FP or vector destination).
+fn renamable_def_dest(line: &str) -> Option<(u8, bool)> {
+    let t = line.trim();
+    let (mnem, rest) = t.split_once(char::is_whitespace)?;
+    if !A64_SINGLE_DEST_PRODUCERS.contains(&mnem) || classify_implicit_operands_a64(t).1 != 0 {
+        return None;
+    }
+    let first = rest.split(',').next()?.trim();
+    let narrow = first.starts_with('w');
+    if !(narrow || first.starts_with('x')) {
+        return None;
+    }
+    let reg = parse_reg(first);
+    (reg <= 30).then_some((reg, narrow))
+}
+
+/// Does `line` name `reg` only as a source, never writing it?  Stores and
+/// compares read every register they name (a writeback base excepted), a
+/// single-destination producer reads everything after its destination, and
+/// a transfer into an FP/vector register reads its general operands.
+fn reads_gp_only(line: &str, reg: u8) -> bool {
+    let t = line.trim();
+    if reg > 30 || classify_implicit_operands_a64(t).1 >> reg & 1 != 0 {
+        return false;
+    }
+    let Some((mnem, rest)) = t.split_once(char::is_whitespace) else {
+        return false;
+    };
+    let first = rest.split(',').next().unwrap_or("").trim();
+    match mnem {
+        _ if A64_GP_READ_ONLY.contains(&mnem) => true,
+        "fmov" | "scvtf" | "ucvtf" | "dup" | "ins" | "mov"
+            if first.starts_with(['d', 's', 'h', 'b', 'q', 'v']) =>
+        {
+            true
+        }
+        _ => renamable_def_dest(t).is_some_and(|(dest, _)| dest != reg),
+    }
+}
+
+/// `line` with every x/w mention of register `from` renamed to `to`.
+fn rename_gp_tokens(line: &str, from: u8, to: u8) -> String {
+    let (fx, fw) = (xreg_name(from), wreg_name(from));
+    let (tx, tw) = (xreg_name(to), wreg_name(to));
+    let mut out = String::with_capacity(line.len() + 2);
+    let mut token = String::new();
+    let flush = |token: &mut String, out: &mut String| {
+        if token == fx {
+            out.push_str(tx);
+        } else if token == fw {
+            out.push_str(tw);
+        } else {
+            out.push_str(token);
+        }
+        token.clear();
+    };
+    for c in line.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            token.push(c);
+        } else {
+            flush(&mut token, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut token, &mut out);
+    out
+}
+
+/// `line` with its destination (first operand) renamed to `to`, same width.
+fn rename_def_dest(line: &str, to: u8) -> Option<String> {
+    let indent = &line[..line.len() - line.trim_start().len()];
+    let (mnem, rest) = line.trim().split_once(char::is_whitespace)?;
+    let rest = rest.trim_start();
+    let (first, tail) = match rest.split_once(',') {
+        Some((first, tail)) => (first.trim(), Some(tail)),
+        None => (rest.trim(), None),
+    };
+    let name = if first.starts_with('w') {
+        wreg_name(to)
+    } else {
+        xreg_name(to)
+    };
+    Some(match tail {
+        Some(tail) => format!("{indent}{mnem} {name},{tail}"),
+        None => format!("{indent}{mnem} {name}"),
+    })
+}
+
+fn retarget_defs_into_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if n == 0 || lines[..n].iter().any(|l| l == OPAQUE_LINE) {
+        return false;
+    }
+    let Some(live_before) = abi_liveness(lines, kinds, n) else {
+        return false;
+    };
+    // Copies are visited in text order and each rewrite only shortens S's
+    // live range or lengthens D's inside (def, copy], so the liveness of the
+    // original text stays a sound answer for every later copy's death test.
+    let mut changed = false;
+    for j in 0..n {
+        let LineKind::Move { dst, src, is_32bit } = kinds[j] else {
+            continue;
+        };
+        if dst == src || dst >= 29 || src >= 29 || j + 1 >= n {
+            continue;
+        }
+        if live_before[j + 1] >> src & 1 != 0 {
+            continue;
+        }
+        let mut readers: Vec<usize> = Vec::new();
+        let mut def = None;
+        let mut k = j;
+        while k > 0 {
+            k -= 1;
+            match kinds[k] {
+                LineKind::Nop | LineKind::Directive => continue,
+                LineKind::Label
+                | LineKind::Branch
+                | LineKind::CondBranch
+                | LineKind::CmpBranch
+                | LineKind::Call
+                | LineKind::Ret => break,
+                _ => {}
+            }
+            let line = &lines[k];
+            // A supervisor call reads x0-x7 and writes x0 without naming
+            // them: neither the source nor the destination may cross it.
+            if a64_traps_to_handler(line) {
+                break;
+            }
+            if renamable_def_dest(line).is_some_and(|(dest, _)| dest == src) {
+                def = Some(k);
+                break;
+            }
+            if line_mentions_reg(line, dst) {
+                break;
+            }
+            if line_mentions_reg(line, src) {
+                if !reads_gp_only(line, src) {
+                    break;
+                }
+                readers.push(k);
+            }
+        }
+        let Some(i) = def else {
+            continue;
+        };
+        let Some((_, narrow)) = renamable_def_dest(&lines[i]) else {
+            continue;
+        };
+        let retargeted = if is_32bit && !narrow {
+            // A 32-bit copy of a 64-bit register move reads only the low
+            // word of the move's source: `mov xS, xR; mov wD, wS` is
+            // `mov wD, wR`.  Any other 64-bit definition keeps its copy.
+            // The readers in between saw all 64 bits of S, which D will
+            // not hold, so the narrowed form needs there to be none.
+            match kinds[i] {
+                LineKind::Move {
+                    src: r,
+                    is_32bit: false,
+                    ..
+                } if r <= 30 && readers.is_empty() => {
+                    let indent = &lines[i][..lines[i].len() - lines[i].trim_start().len()];
+                    format!("{indent}mov {}, {}", wreg_name(dst), wreg_name(r))
+                }
+                _ => continue,
+            }
+        } else {
+            match rename_def_dest(&lines[i], dst) {
+                Some(line) => line,
+                None => continue,
+            }
+        };
+        lines[i] = retargeted;
+        kinds[i] = classify_line(&lines[i]);
+        for &k in &readers {
+            lines[k] = rename_gp_tokens(&lines[k], src, dst);
+            kinds[k] = classify_line(&lines[k]);
+        }
+        kinds[j] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+// ── Conditional increment ────────────────────────────────────────────────────
+//
+// `cset t, cc` followed by `add a, b, t` is `cinc a, b, cc` once t dies at
+// the add: one instruction instead of two, and the 0/1 never occupies a
+// register (count_if's `c += a[i] < t`; Clang and GCC emit `cinc`).  The
+// flags must reach the add unchanged and nothing between may touch t; the
+// add may name t on either side.
+
+fn writes_flags_any_a64(mnemonic: &str) -> bool {
+    writes_flags_a64(mnemonic)
+        || matches!(
+            mnemonic,
+            "ccmp"
+                | "ccmn"
+                | "fccmp"
+                | "fccmpe"
+                | "adcs"
+                | "sbcs"
+                | "ngcs"
+                | "msr"
+                | "setf8"
+                | "setf16"
+                | "rmif"
+                | "cfinv"
+                | "axflag"
+                | "xaflag"
+        )
+}
+
+fn fold_cset_add_to_cinc(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if n == 0 || lines[..n].iter().any(|l| l == OPAQUE_LINE) {
+        return false;
+    }
+    let Some(live_before) = abi_liveness(lines, kinds, n) else {
+        return false;
+    };
+    let mut changed = false;
+    for i in 0..n {
+        let t = lines[i].trim();
+        let Some(rest) = t.strip_prefix("cset ") else {
+            continue;
+        };
+        let Some((treg, cc)) = rest.split_once(',') else {
+            continue;
+        };
+        let (treg, cc) = (treg.trim(), cc.trim());
+        let tnum = parse_reg(treg);
+        if tnum > 28 || invert_condition(cc).is_none() {
+            continue;
+        }
+        let cc = cc.to_string();
+        let mut k = i + 1;
+        let mut found = None;
+        while k < n {
+            match kinds[k] {
+                LineKind::Nop | LineKind::Directive => {
+                    k += 1;
+                    continue;
+                }
+                LineKind::Label
+                | LineKind::Branch
+                | LineKind::CondBranch
+                | LineKind::CmpBranch
+                | LineKind::Call
+                | LineKind::Ret => break,
+                _ => {}
+            }
+            let line = lines[k].trim();
+            let mnem = line.split_whitespace().next().unwrap_or("");
+            // A handler call may read the 0/1 as an argument register.
+            if a64_traps_to_handler(line) {
+                break;
+            }
+            if line_mentions_reg(line, tnum) {
+                found = Some(k);
+                break;
+            }
+            if writes_flags_any_a64(mnem) {
+                break;
+            }
+            k += 1;
+        }
+        let Some(k) = found else {
+            continue;
+        };
+        let Some((d, a, b)) = three_operands(&lines[k], "add") else {
+            continue;
+        };
+        // The 0/1 must die at the add -- unless the add overwrites t itself.
+        if k + 1 >= n || (parse_reg(d) != tnum && live_before[k + 1] >> tnum & 1 != 0) {
+            continue;
+        }
+        let wide = d.starts_with('x');
+        let other = if parse_reg(a) == tnum && a.starts_with(['x', 'w']) {
+            b
+        } else if parse_reg(b) == tnum && b.starts_with(['x', 'w']) {
+            a
+        } else {
+            continue;
+        };
+        // Both sources plain registers of the add's width; t's 0/1 is the
+        // same in either view.  `other` must not be t itself.
+        let (Some(dnum), Some(onum)) =
+            (plain_reg_of_width(d, wide), plain_reg_of_width(other, wide))
+        else {
+            continue;
+        };
+        if onum == tnum || dnum > 30 {
+            continue;
+        }
+        let indent = &lines[k][..lines[k].len() - lines[k].trim_start().len()];
+        lines[k] = format!("{indent}cinc {d}, {other}, {cc}");
+        kinds[k] = classify_line(&lines[k]);
+        kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
 /// True when the line's token stream mentions the given register (x or w form).
 fn line_mentions_reg(line: &str, reg: u8) -> bool {
     let xn = xreg_name(reg);
@@ -9412,20 +9817,36 @@ mod tests {
     add x3, x1, #1\n\
     ret\n";
         let result = peephole_optimize(input.to_string());
-        // Empirically-verified final shape (pass 6 threads, then copy-prop /
-        // move-chain fold the dead x1 hop): capture BEFORE the clobber, use
-        // of the captured original AFTER it, slot fully gone.
+        // The value flow, whatever registers carry it: the original x0 is
+        // captured BEFORE the clobber (spill-slot threading, then the
+        // definition retarget names the capture after its reader), the add
+        // reads the capture AFTER it, and the slot is gone.  A forwarding of
+        // the stale register -- `mov xK, x0` after `mov x0, #42` -- fails.
+        let rows: Vec<&str> = result.lines().map(str::trim).collect();
+        let clobber = rows
+            .iter()
+            .position(|l| *l == "mov x0, #42")
+            .unwrap_or_else(|| panic!("clobber lost:\n{result}"));
+        let add = rows
+            .iter()
+            .position(|l| l.starts_with("add x3, x") && l.ends_with(", #1"))
+            .unwrap_or_else(|| panic!("add lost:\n{result}"));
+        let k = rows[add]
+            .trim_start_matches("add x3, ")
+            .trim_end_matches(", #1");
+        assert_ne!(k, "x0", "stale forwarding:\n{result}");
+        let capture = format!("mov {k}, x0");
         assert!(
-            result.contains("mov x2, x0") && result.contains("add x3, x2, #1"),
-            "threaded original-value flow missing:\n{}",
-            result
+            rows[..clobber].contains(&capture.as_str()) && clobber < add,
+            "threaded original-value flow missing:\n{result}"
+        );
+        assert!(
+            !rows[clobber..add]
+                .iter()
+                .any(|l| l.starts_with(&format!("mov {k},"))),
+            "capture overwritten:\n{result}"
         );
         assert!(!result.contains("[sp, #16]"));
-        assert!(
-            !result.contains("mov x1, x0"),
-            "stale forwarding:\n{}",
-            result
-        );
     }
 
     #[test]
@@ -9632,7 +10053,18 @@ g:
         // Invariant: a surviving read of x9 must have a live definition.
         // The broken pipeline produced `ldr x0, [x0]; ldr x1, [x9, #8]`
         // with the defining mov deleted — the second half read a stale x9.
-        let stale_x9_read = result.contains("[x9") && !result.contains("mov x9,");
+        // Any write of x9 before its first read is a definition: the copy,
+        // or the GOT load once the definition retarget names x9 directly.
+        let rows: Vec<&str> = result.lines().map(str::trim).collect();
+        let stale_x9_read = rows
+            .iter()
+            .position(|l| l.contains("[x9"))
+            .is_some_and(|read| {
+                !rows[..read].iter().any(|l| {
+                    l.split_once(' ')
+                        .is_some_and(|(_, ops)| ops.split(',').next() == Some("x9"))
+                })
+            });
         // Both halves must load the global's 16 bytes: half one from the
         // GOT-resolved base (x0), half two from either a live x9 or the
         // propagated base.
@@ -10397,9 +10829,11 @@ f:
             "redundant mask kept:\n{}",
             result
         );
+        // The mask becomes a copy, which the definition retarget then folds
+        // into the load itself (w5 dies there).
         assert!(
-            result.contains("mov w4, w5"),
-            "mask not rewritten to mov:\n{}",
+            result.contains("mov w4, w5") || result.contains("ldrb w4, [x19, x1]"),
+            "mask not rewritten to a copy:\n{}",
             result
         );
     }
@@ -10877,5 +11311,135 @@ mod frame_store_census_tests {
             "    sub sp, sp, #16\n    str x1, [sp, #8]\n    ld1 {v0.16b}, [sp]\n    add sp, sp, #16\n    ret\n",
         ));
         assert!(has(&out, "str x1, [sp, #8]"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod def_retarget_tests {
+    use super::peephole_optimize;
+
+    fn rows(asm: &str) -> Vec<String> {
+        peephole_optimize(asm.to_string())
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    /// The accumulator staging of a homed global address: three lines become
+    /// two, the address computed straight into its home.
+    #[test]
+    fn a_global_address_is_computed_into_its_home() {
+        let out = rows(
+            "f:\n    adrp x0, A\n    add x0, x0, :lo12:A\n    mov x19, x0\n    mov x0, #0\n    \
+             bl g\n    ldr x1, [x19]\n    add x0, x1, #1\n    ret\n",
+        );
+        assert!(out.contains(&"add x19, x0, :lo12:A".to_string()), "{out:?}");
+        assert!(!out.iter().any(|l| l == "mov x19, x0"), "{out:?}");
+    }
+
+    /// A load staged through x0 lands in the copy's register, and the
+    /// readers in between follow it.
+    #[test]
+    fn a_staged_load_lands_in_the_copy_and_its_readers_follow() {
+        let out = rows(
+            ".L1:\n    ldrsw x0, [x6]\n    str x0, [x7]\n    mov x8, x0\n    cmp w8, w21\n    \
+             b.lt .L1\n    mov x0, x8\n    ret\n",
+        );
+        assert!(out.contains(&"ldrsw x8, [x6]".to_string()), "{out:?}");
+        assert!(out.contains(&"str x8, [x7]".to_string()), "{out:?}");
+        assert!(!out.iter().any(|l| l == "mov x8, x0"), "{out:?}");
+    }
+
+    /// The source still read after the copy (here by `ret`, the result
+    /// register), the destination touched in between, a call in between,
+    /// or a 32-bit copy of a 64-bit load: every copy stays.
+    #[test]
+    fn the_copy_stays_whenever_the_rename_could_be_observed() {
+        let live_after = rows("f:\n    ldr x0, [x1]\n    mov x8, x0\n    str x8, [x2]\n    ret\n");
+        assert!(
+            live_after.contains(&"ldr x0, [x1]".to_string()),
+            "{live_after:?}"
+        );
+        let dest_read = rows(
+            "f:\n    ldr x0, [x1]\n    add x9, x8, #1\n    mov x8, x0\n    str x8, [x9]\n    \
+             mov x0, #0\n    ret\n",
+        );
+        assert!(
+            dest_read.contains(&"ldr x0, [x1]".to_string()),
+            "{dest_read:?}"
+        );
+        let across_call = rows(
+            "f:\n    ldr x0, [x1]\n    bl g\n    mov x19, x0\n    str x19, [x20]\n    \
+             mov x0, #0\n    ret\n",
+        );
+        assert!(
+            across_call.contains(&"mov x19, x0".to_string()),
+            "{across_call:?}"
+        );
+        let narrow = rows(
+            "f:\n    ldr x0, [x1]\n    mov w8, w0\n    str x8, [x2]\n    mov x0, #0\n    ret\n",
+        );
+        assert!(narrow.contains(&"mov w8, w0".to_string()), "{narrow:?}");
+    }
+
+    /// A 32-bit copy of a 32-bit definition is renamed like any other.
+    #[test]
+    fn a_word_copy_of_a_word_definition_is_renamed() {
+        let out = rows(
+            "f:\n    ldr w0, [x1]\n    mov w8, w0\n    str x8, [x2]\n    mov x0, #0\n    ret\n",
+        );
+        assert!(out.contains(&"ldr w8, [x1]".to_string()), "{out:?}");
+    }
+
+    /// A supervisor call reads x0-x7 without naming them: a definition of
+    /// x0 before it is the call's argument, never a copy's source, and a
+    /// `cset` into an argument register must keep its 0/1 across it.
+    #[test]
+    fn nothing_is_renamed_across_a_supervisor_call() {
+        let out = rows(
+            "f:\n    mov x8, #93\n    mov x0, #7\n    svc #0\n    mov x19, x0\n    \
+             str x19, [x20]\n    mov x0, #0\n    ret\n",
+        );
+        let def = out.iter().position(|l| l == "mov x0, #7");
+        let svc = out.iter().position(|l| l == "svc #0");
+        assert!(def.is_some() && def < svc, "{out:?}");
+        let flag = rows(
+            "f:\n    cmp w1, w2\n    cset x0, lt\n    svc #0\n    add x4, x4, x0\n    \
+             mov x0, x4\n    ret\n",
+        );
+        assert!(flag.iter().any(|l| l == "cset x0, lt"), "{flag:?}");
+    }
+
+    /// `cset; add` with the 0/1 dying at the add is `cinc` (count_if).
+    #[test]
+    fn a_counted_comparison_is_a_conditional_increment() {
+        let out = rows(
+            ".L1:\n    ldrsw x8, [x6]\n    cmp w8, w21\n    cset x0, lt\n    add x4, x4, x0\n    \
+             add x6, x6, #4\n    cmp x6, x7\n    b.lt .L1\n    mov x0, x4\n    ret\n",
+        );
+        assert!(out.contains(&"cinc x4, x4, lt".to_string()), "{out:?}");
+        assert!(!out.iter().any(|l| l.starts_with("cset")), "{out:?}");
+    }
+
+    /// The flags rewritten between the `cset` and the add, or the 0/1 read
+    /// again later: the pair stays.
+    #[test]
+    fn the_increment_stays_when_flags_or_the_flag_value_survive() {
+        let flags = rows(
+            "f:\n    cmp w8, w21\n    cset x0, lt\n    cmp x1, x2\n    add x4, x4, x0\n    \
+             csel x0, x4, x1, eq\n    ret\n",
+        );
+        assert!(
+            flags.iter().any(|l| l.starts_with("cset x0, lt")),
+            "{flags:?}"
+        );
+        let reused = rows(
+            "f:\n    cmp w8, w21\n    cset x3, lt\n    add x4, x4, x3\n    add x0, x4, x3\n    ret\n",
+        );
+        assert!(
+            reused.iter().any(|l| l.starts_with("cset x3, lt")),
+            "{reused:?}"
+        );
     }
 }
