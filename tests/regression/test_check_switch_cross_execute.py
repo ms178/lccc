@@ -3,7 +3,7 @@
 import unittest
 from unittest.mock import patch
 
-from check_switch_cross_execute import CONTROL_PASSES, FIXTURES, LEVELS, main, select_linker
+from check_switch_cross_execute import CONTROL_PASSES, FIXTURES, LEVELS, START, main, select_linker
 
 
 class LinkerDiscoveryTests(unittest.TestCase):
@@ -26,6 +26,14 @@ class LinkerDiscoveryTests(unittest.TestCase):
             self.assertEqual(LEVELS[fixture], ('-O0', '-O1', '-O2', '-Os'))
         self.assertLessEqual(set(LEVELS), set(FIXTURES))
         self.assertFalse(set(LEVELS) & set(CONTROL_PASSES))
+
+    def test_riscv_startup_sets_gp_before_main(self):
+        # GNU ld relaxes small-data accesses to gp-relative form; crt1.o
+        # sets gp first, and so must the freestanding stub, unrelaxed.
+        start = START['riscv64']
+        gp = start.index('lla gp, __global_pointer$')
+        self.assertLess(start.index('.option norelax'), gp)
+        self.assertLess(gp, start.index('call main'))
 
     @patch('check_switch_cross_execute.subprocess.check_output', side_effect=RuntimeError('probe'))
     @patch('sys.argv', ['check_switch_cross_execute.py'])

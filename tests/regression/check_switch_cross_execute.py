@@ -65,8 +65,6 @@ INTEROP = ("psabi_pair_interop", "psabi_float_interop", "psabi_hfa_interop", "ps
 INTEROP_LEVELS = ("-O0", "-O2")
 CLANG_FREESTANDING = ("-O2", "-ffreestanding", "-fno-builtin", "-fno-pic", "-fno-pie",
                       "-fno-stack-protector", "-nostdlibinc")
-# No linker relaxation for Clang's RV64 objects: the startup code sets no gp.
-CLANG_TARGET_FLAGS = {"aarch64": (), "riscv64": ("-mno-relax",)}
 CONTROL_PASSES = {
     "narrow_big_endian_cross": "byte_load",
     "join_store_forward_cross": "join_store_forward",
@@ -107,9 +105,17 @@ memset:
  b 1b
 2: ret
 """,
+    # gp is set up as crt1.o does: GNU ld relaxes an `auipc`/`addi` pair
+    # whose symbol lies within 2 KiB of `__global_pointer$` into a
+    # gp-relative `addi` (LLD does not by default), so an uninitialized gp
+    # faulted on the first small global a fixture touched.
     "riscv64": """.text
 .globl _start
 _start:
+ .option push
+ .option norelax
+ lla gp, __global_pointer$
+ .option pop
  call main
  li a7, 93
  ecall
@@ -190,6 +196,10 @@ def main():
             if status:
                 failures.append(f"{label}: {Path(step[0]).name} exited {status}")
                 print(f"FAIL {label} ({failures[-1].split(': ', 1)[1]})", flush=True)
+                if os.environ.get("GITHUB_ACTIONS") == "true":
+                    # An annotation is readable through the checks API when
+                    # the job log is not.
+                    print(f"::error title=Cross-target contract failed::{failures[-1]}", flush=True)
                 if not args.keep_going:
                     raise SystemExit(1)
                 return False
@@ -244,7 +254,7 @@ def main():
                               [str(args.qemu_dir / f"qemu-{arch}"), str(exe)]]
                     count += attempt(f"{arch} {fixture} {label}", steps, env)
             include = ["-isystem", str(Path(resource) / "include")]
-            clang_flags = [target, *CLANG_FREESTANDING, *CLANG_TARGET_FLAGS[arch], *include]
+            clang_flags = [target, *CLANG_FREESTANDING, *include]
             for fixture in (f for f in INTEROP if f in selected):
                 base = ROOT / "tests/regression/interop" / fixture
                 units = {}

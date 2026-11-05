@@ -9,7 +9,9 @@
  * result shows it; only the caller's register does.
  *
  * `call_checked` loads every callee-saved register with a known value, calls
- * the function and counts the registers that came back different.
+ * the function and counts the registers that came back different.  The
+ * cross harness runs it on AArch64 and RV64; the native corpus runs the same
+ * contract on x86-64 (and i386 under -m32).
  */
 
 static char *words[9];
@@ -179,8 +181,114 @@ __asm__(
     "    addi sp, sp, 112\n"
     "    ret\n"
     ".size call_checked, .-call_checked\n");
+#elif defined(__x86_64__)
+/* The native corpus runs the same contract on SysV x86-64: rbx, rbp and
+   r12-r15 must come back intact. */
+__asm__(
+    ".text\n"
+    ".globl call_checked\n"
+    ".type call_checked, @function\n"
+    "call_checked:\n"
+    "    pushq %rbp\n"
+    "    pushq %rbx\n"
+    "    pushq %r12\n"
+    "    pushq %r13\n"
+    "    pushq %r14\n"
+    "    pushq %r15\n"
+    "    subq $8, %rsp\n"
+    "    movq %rsi, %rax\n"
+    "    movq $0x1003, %rbx\n"
+    "    movq $0x1005, %rbp\n"
+    "    movq $0x1012, %r12\n"
+    "    movq $0x1013, %r13\n"
+    "    movq $0x1014, %r14\n"
+    "    movq $0x1015, %r15\n"
+    "    call *%rax\n"
+    "    xorl %eax, %eax\n"
+    "    cmpq $0x1003, %rbx\n"
+    "    setne %cl\n"
+    "    movzbl %cl, %ecx\n"
+    "    addl %ecx, %eax\n"
+    "    cmpq $0x1005, %rbp\n"
+    "    setne %cl\n"
+    "    movzbl %cl, %ecx\n"
+    "    addl %ecx, %eax\n"
+    "    cmpq $0x1012, %r12\n"
+    "    setne %cl\n"
+    "    movzbl %cl, %ecx\n"
+    "    addl %ecx, %eax\n"
+    "    cmpq $0x1013, %r13\n"
+    "    setne %cl\n"
+    "    movzbl %cl, %ecx\n"
+    "    addl %ecx, %eax\n"
+    "    cmpq $0x1014, %r14\n"
+    "    setne %cl\n"
+    "    movzbl %cl, %ecx\n"
+    "    addl %ecx, %eax\n"
+    "    cmpq $0x1015, %r15\n"
+    "    setne %cl\n"
+    "    movzbl %cl, %ecx\n"
+    "    addl %ecx, %eax\n"
+    "    addq $8, %rsp\n"
+    "    popq %r15\n"
+    "    popq %r14\n"
+    "    popq %r13\n"
+    "    popq %r12\n"
+    "    popq %rbx\n"
+    "    popq %rbp\n"
+    "    ret\n"
+    ".size call_checked, .-call_checked\n");
+#elif defined(__i386__)
+/* i386 cdecl: ebx, ebp, esi and edi must come back intact. */
+__asm__(
+    ".text\n"
+    ".globl call_checked\n"
+    ".type call_checked, @function\n"
+    "call_checked:\n"
+    "    pushl %ebp\n"
+    "    pushl %ebx\n"
+    "    pushl %esi\n"
+    "    pushl %edi\n"
+    "    movl 20(%esp), %eax\n"
+    "    movl 24(%esp), %ecx\n"
+    "    movl $0x1003, %ebx\n"
+    "    movl $0x1005, %ebp\n"
+    "    movl $0x1006, %esi\n"
+    "    movl $0x1007, %edi\n"
+    "    subl $8, %esp\n"
+    "    pushl %eax\n"
+    "    call *%ecx\n"
+    "    addl $12, %esp\n"
+    "    xorl %eax, %eax\n"
+    "    cmpl $0x1003, %ebx\n"
+    "    setne %cl\n"
+    "    movzbl %cl, %ecx\n"
+    "    addl %ecx, %eax\n"
+    "    cmpl $0x1005, %ebp\n"
+    "    setne %cl\n"
+    "    movzbl %cl, %ecx\n"
+    "    addl %ecx, %eax\n"
+    "    cmpl $0x1006, %esi\n"
+    "    setne %cl\n"
+    "    movzbl %cl, %ecx\n"
+    "    addl %ecx, %eax\n"
+    "    cmpl $0x1007, %edi\n"
+    "    setne %cl\n"
+    "    movzbl %cl, %ecx\n"
+    "    addl %ecx, %eax\n"
+    "    popl %edi\n"
+    "    popl %esi\n"
+    "    popl %ebx\n"
+    "    popl %ebp\n"
+    "    ret\n"
+    ".size call_checked, .-call_checked\n");
 #else
-#error "callee-saved checker: AArch64 and RV64 only"
+/* No register checker for this target: the split itself is still checked. */
+long call_checked(char *arg, char **(*fn)(char *))
+{
+    fn(arg);
+    return 0;
+}
 #endif
 
 int main(void)
