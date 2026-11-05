@@ -767,10 +767,9 @@ pub fn peephole_optimize(asm: String) -> String {
     global_changed |= propagate_copies_within_blocks(&mut lines, &mut kinds, n);
     global_changed |= eliminate_dead_defs_global(&lines, &mut kinds, n);
     global_changed |= fold_into_memory_operands(&mut lines, &mut kinds, n);
-    if !has_opaque_functions {
-        // Its whole-file escape and load census cannot see opaque bodies.
-        global_changed |= global_dead_store_elimination(&lines, &mut kinds, n);
-    }
+    global_changed |= fold_fp_bounces(&mut lines, &mut kinds, n);
+    // Per function; a function with an opaque body is skipped whole.
+    global_changed |= global_dead_store_elimination(&lines, &mut kinds, n);
 
     // Phase 3: Local cleanup after global passes (up to 4 rounds)
     if global_changed {
@@ -801,6 +800,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= propagate_copies_within_blocks(&mut lines, &mut kinds, n);
             changed2 |= eliminate_dead_defs_global(&lines, &mut kinds, n);
             changed2 |= fold_into_memory_operands(&mut lines, &mut kinds, n);
+            changed2 |= fold_fp_bounces(&mut lines, &mut kinds, n);
             rounds2 += 1;
         }
     }
@@ -3353,6 +3353,37 @@ fn rv_load_dest(line: &str) -> Option<u8> {
     (id != REG_NONE).then_some(id)
 }
 
+/// The general-register destination of an FP instruction that writes one
+/// (`fmv.x.d`, `fcvt.l.d`, `feq.s`, `fclass.d`, ...).
+fn rv_fp_gp_dest(line: &str) -> Option<u8> {
+    let t = line.trim();
+    let (m, ops) = t.split_once(|c: char| c.is_ascii_whitespace())?;
+    let writes_gp = m.starts_with("fmv.x.")
+        || (m.starts_with("fcvt.") && matches!(m.split('.').nth(1), Some("w" | "wu" | "l" | "lu")))
+        || matches!(m.split('.').next(), Some("feq" | "flt" | "fle" | "fclass"));
+    if !writes_gp {
+        return None;
+    }
+    let id = parse_reg(ops.split(',').next()?.trim());
+    (id != REG_NONE).then_some(id)
+}
+
+/// Does `line` read general registers only as FP-instruction sources
+/// (`fmv.d.x f, r`, `fcvt.d.l f, r`): its first operand is an FP register.
+fn rv_fp_reads_gp_sources(line: &str) -> bool {
+    let t = line.trim();
+    let Some((m, ops)) = t.split_once(|c: char| c.is_ascii_whitespace()) else {
+        return false;
+    };
+    let reads = (m.starts_with("fmv.") && m.ends_with(".x"))
+        || (m.starts_with("fcvt.") && matches!(m.split('.').nth(2), Some("w" | "wu" | "l" | "lu")));
+    reads
+        && ops
+            .split(',')
+            .next()
+            .is_some_and(|d| d.trim().starts_with('f'))
+}
+
 /// Is `line` a store (`sb`/`sh`/`sw`/`sd`, their FP and compressed forms):
 /// every register it names is read.
 fn rv_is_store(line: &str) -> bool {
@@ -3424,7 +3455,7 @@ fn rv_uses_defs(line: &str, kind: LineKind) -> (u64, u64) {
                 | LineKind::SextW { dst, .. } => Some(dst),
                 LineKind::LoadS0 { reg, .. } => Some(reg),
                 LineKind::Alu => parse_alu_dest(line),
-                LineKind::Other => rv_load_dest(line),
+                LineKind::Other => rv_load_dest(line).or_else(|| rv_fp_gp_dest(line)),
                 _ => None,
             };
             if let Some(d) = dest
@@ -3613,12 +3644,16 @@ fn rv_is_unmodelled_transfer(line: &str) -> bool {
 /// label to the next.
 fn rv_function_ranges(lines: &[String], kinds: &[LineKind], n: usize) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
-    let mut start: Option<usize> = None;
+    // Text before the first symbol (a bare instruction stream) is a range of
+    // its own.
+    let mut start: Option<usize> = (n > 0).then_some(0);
     for k in 0..n {
         if kinds[k] == LineKind::Label
             && lines[k].starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
         {
-            if let Some(s) = start {
+            if let Some(s) = start
+                && s < k
+            {
                 ranges.push((s, k));
             }
             start = Some(k);
@@ -3713,8 +3748,10 @@ fn rv_rename_reads(line: &str, kind: LineKind, old: u8, new: u8) -> Option<Strin
         LineKind::Alu | LineKind::StoreS0 { .. } => {
             replace_source_reg_in_instruction(line, old_name, new_name)
         }
-        // A load reads only its address: `ld t0, 8(t1)`.
-        LineKind::Other if rv_load_dest(line).is_some() => {
+        // A load reads only its address: `ld t0, 8(t1)`; an FP instruction
+        // with general sources (`fmv.d.x ft0, t1`) reads them after its FP
+        // destination.
+        LineKind::Other if rv_load_dest(line).is_some() || rv_fp_reads_gp_sources(line) => {
             replace_source_reg_in_instruction(line, old_name, new_name)
         }
         _ => None,
@@ -3847,6 +3884,157 @@ fn fold_into_memory_operands(lines: &mut [String], kinds: &mut [LineKind], n: us
     changed
 }
 
+/// An FP computation, FP load or FP move that names no general register
+/// other than a load's base (`fadd.d ft0, ft0, ft1`, `fld ft1, 8(a0)`,
+/// `fmv.d.x ft1, t0`): it writes no general register and no memory.
+fn rv_is_pure_fp_line(line: &str) -> bool {
+    let t = line.trim();
+    let Some((m, _)) = t.split_once(|c: char| c.is_ascii_whitespace()) else {
+        return false;
+    };
+    if !m.starts_with('f') || m.starts_with("fs") || m == "fence" || m.starts_with("fence.") {
+        return false; // FP stores, fences
+    }
+    if m.starts_with("fmv.x.") || rv_fp_gp_dest(line).is_some() {
+        return false;
+    }
+    // frcsr/fscsr/frflags... touch CSRs.
+    !matches!(
+        m,
+        "frcsr" | "fscsr" | "frrm" | "fsrm" | "frflags" | "fsflags" | "fsrmi" | "fsflagsi"
+    )
+}
+
+/// Fold the general-register round trips the emitter puts around every FP
+/// operation (FP values have no register home on RISC-V, so each operand is
+/// fetched into ft0/ft1 through a GPR and each result leaves through one):
+///
+/// ```text
+///   ld t0, 8(a0) ; ... ; fmv.d.x ft1, t0   ->  fld ft1, 8(a0)
+///   fmv.x.d t0, ft0 ; sd t0, 0(a0)         ->  fsd ft0, 0(a0)
+///   fmv.x.d t0, ft0 ; fmv.d.x ft1, t0      ->  fmv.d ft1, ft0
+/// ```
+///
+/// The temporary must die at the consumer.  A load may be sunk past up to
+/// three FP-only lines (no general write, no memory write, no label), which
+/// is how the emitter interleaves the two operand fetches.  `fmv.d` is
+/// `fsgnj.d`: a bit-exact copy, NaN payload included.
+fn fold_fp_bounces(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for (start, end) in rv_function_ranges(lines, kinds, n) {
+        let Some(live) = RvLiveness::build(lines, kinds, start, end) else {
+            continue;
+        };
+        for i in start..end {
+            if kinds[i] == LineKind::Nop || lines[i] == OPAQUE_LINE {
+                continue;
+            }
+            // fmv.x.{d,w} tA, fS ; (sd/sw tA, off(rB) | fmv.{d,w}.x fD, tA)
+            if let Some(ta) = rv_fp_gp_dest(&lines[i])
+                && let Some(rest) = lines[i].trim().strip_prefix("fmv.x.")
+            {
+                let width = &rest[..1];
+                let fs = rest[1..].split(',').nth(1).map(str::trim).unwrap_or("");
+                if !matches!(width, "d" | "w") || !fs.starts_with('f') {
+                    continue;
+                }
+                let mut j = i + 1;
+                while j < end && kinds[j] == LineKind::Nop {
+                    j += 1;
+                }
+                if j >= end || lines[j] == OPAQUE_LINE {
+                    continue;
+                }
+                if live.live_after(j) & rv_bit(ta) != 0 {
+                    continue;
+                }
+                let ta_name = reg_name(ta);
+                let store = match width {
+                    "d" => "sd",
+                    _ => "sw",
+                };
+                let new_line = if let Some((m, reg, off, base)) = rv_mem_parts(&lines[j])
+                    && m == store
+                    && reg == ta_name
+                    && base != ta_name
+                {
+                    Some(format!("    fs{width} {fs}, {off}({base})"))
+                } else if let Some(ops) = lines[j].trim().strip_prefix(&format!("fmv.{width}.x ")) {
+                    // The FP-to-FP move is `fmv.s`/`fmv.d` (fsgnj); `fmv.w`
+                    // names only the bit moves `fmv.w.x`/`fmv.x.w`.
+                    let fmt = if width == "w" { "s" } else { "d" };
+                    match ops.split_once(',') {
+                        Some((fd, src)) if src.trim() == ta_name => {
+                            Some(format!("    fmv.{fmt} {}, {fs}", fd.trim()))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(new_line) = new_line {
+                    kinds[i] = LineKind::Nop;
+                    kinds[j] = classify_line(&new_line);
+                    lines[j] = new_line;
+                    changed = true;
+                }
+                continue;
+            }
+            // l{d,w} tA, off(rB) ; [<= 3 FP-only lines] ; fmv.{d,w}.x fD, tA
+            if let Some(ta) = rv_load_dest(&lines[i])
+                && let Some((m, _, off, base)) = rv_mem_parts(&lines[i])
+                && matches!(m, "ld" | "lw")
+            {
+                let width = if m == "ld" { "d" } else { "w" };
+                let ta_name = reg_name(ta);
+                if base == ta_name {
+                    continue;
+                }
+                let mut j = i + 1;
+                let mut between = 0;
+                let mut found = None;
+                while j < end && between <= 3 {
+                    if kinds[j] == LineKind::Nop {
+                        j += 1;
+                        continue;
+                    }
+                    let t = lines[j].trim();
+                    if let Some(ops) = t.strip_prefix(&format!("fmv.{width}.x "))
+                        && let Some((fd, src)) = ops.split_once(',')
+                        && src.trim() == ta_name
+                    {
+                        found = Some((j, fd.trim().to_string()));
+                        break;
+                    }
+                    // Only FP-only lines -- no general-register write, no
+                    // memory write -- that do not read tA may be stepped
+                    // over: the base cannot change under them.
+                    if kinds[j] != LineKind::Other
+                        || !rv_is_pure_fp_line(&lines[j])
+                        || rv_named_regs(&lines[j]).0 & rv_bit(ta) != 0
+                    {
+                        break;
+                    }
+                    between += 1;
+                    j += 1;
+                }
+                let Some((j, fd)) = found else {
+                    continue;
+                };
+                if !fd.starts_with('f') || live.live_after(j) & rv_bit(ta) != 0 {
+                    continue;
+                }
+                let new_line = format!("    fl{width} {fd}, {off}({base})");
+                kinds[i] = LineKind::Nop;
+                kinds[j] = classify_line(&new_line);
+                lines[j] = new_line;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 /// Forward copy propagation inside each block: after `mv d, s`, reads of `d`
 /// read `s` instead until either register is written.  The copy is left in
 /// place; when no read remains, `eliminate_dead_defs_global` removes it.
@@ -3903,7 +4091,11 @@ fn propagate_copies_within_blocks(lines: &mut [String], kinds: &mut [LineKind], 
             if writes == Some(dst) || writes == Some(src) || kinds[j] == LineKind::Branch {
                 break;
             }
-            if kinds[j] == LineKind::Other && rv_load_dest(&lines[j]).is_none() {
+            if kinds[j] == LineKind::Other
+                && rv_load_dest(&lines[j]).is_none()
+                && rv_fp_gp_dest(&lines[j]).is_none()
+                && !rv_is_pure_fp_line(&lines[j])
+            {
                 break;
             }
             j += 1;
@@ -3926,13 +4118,39 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 // to register moves, leaving the original stores dead.
 
 fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    // Frame slots belong to one function: its `s0` names its own frame, and
+    // any other way in -- a pointer to a slot handed to a callee or kept in
+    // a register -- starts with that function taking the slot's address.
+    // The census is therefore per function.  It used to span the whole
+    // translation unit, so a slot offset that ANY function loaded kept every
+    // function's stores to that offset alive, and one `addi tX, s0, N`
+    // anywhere disabled the pass for the whole file: the dead FP spills in
+    // a float loop survived because a neighbouring function read the same
+    // offset.  A function with an opaque (inline-asm or volatile) body is
+    // skipped whole, which also lets the pass run in units that have one.
+    let mut changed = false;
+    for (start, end) in rv_function_ranges(lines, kinds, n) {
+        changed |= dead_stores_in_function(lines, kinds, start, end);
+    }
+    changed
+}
+
+fn dead_stores_in_function(
+    lines: &[String],
+    kinds: &mut [LineKind],
+    start: usize,
+    end: usize,
+) -> bool {
     // Safety: if any instruction takes the address of s0 or uses s0 in a way
     // that could create pointers to stack slots (e.g., `addi xN, s0, off`
     // where xN is not s0 itself), we bail out to avoid eliminating stores
     // that might be accessed through pointers.
-    for i in 0..n {
+    for i in start..end {
         if kinds[i] == LineKind::Nop {
             continue;
+        }
+        if lines[i] == OPAQUE_LINE {
+            return false;
         }
         let trimmed = lines[i].trim();
         // Check for address-of-frame-pointer patterns
@@ -3955,6 +4173,21 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
                 }
             }
         }
+        // Any other line that reads s0 as a value (not as a base) lets the
+        // frame address escape.
+        if !trimmed.contains("(s0)")
+            && kinds[i] != LineKind::Label
+            && kinds[i] != LineKind::Directive
+            && trimmed
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .skip(1)
+                .any(|tok| tok == "s0" || tok == "fp")
+            && !trimmed.starts_with("addi s0, sp,")
+            && !trimmed.starts_with("ld s0,")
+            && !trimmed.starts_with("sd s0,")
+        {
+            return false;
+        }
     }
 
     // Phase 1: Collect all (offset, size) byte ranges that are loaded from.
@@ -3962,7 +4195,7 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
     // store (e.g. `sd` at offset -24, 8 bytes) can be partially read by a
     // narrower load at a different offset (e.g. `lwu` at offset -20, 4 bytes).
     let mut loaded_ranges: Vec<(i32, i32)> = Vec::new(); // (offset, size)
-    for i in 0..n {
+    for i in start..end {
         match kinds[i] {
             LineKind::LoadS0 {
                 offset, is_word, ..
@@ -4006,7 +4239,7 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
 
     // Phase 2: Remove stores whose byte range does not overlap any load range
     let mut changed = false;
-    for i in 0..n {
+    for i in start..end {
         if let LineKind::StoreS0 {
             offset, is_word, ..
         } = kinds[i]
@@ -4405,6 +4638,65 @@ mod tests {
         assert_eq!(code_lines(&out), ["lw a0, 0(a1)", "ret"], "{out}");
     }
 
+    /// FP values reach and leave ft0/ft1 through general registers; the
+    /// round trips fold into FP loads, stores and moves when the temporary
+    /// dies at the consumer.
+    #[test]
+    fn fp_round_trips_fold_into_fp_memory_operations() {
+        let asm = "f:\n    ld t0, 0(a1)\n    ld t1, 8(a1)\n    mv t2, t0\n    fmv.d.x ft0, t1\n    fmv.d.x ft1, t2\n    fmul.d ft0, ft0, ft1\n    fmv.x.d t0, ft0\n    sd t0, 0(a0)\n    fmv.x.d t1, ft1\n    fmv.d.x fa0, t1\n    ret\n";
+        let out = peephole_optimize(asm.into());
+        assert_eq!(
+            code_lines(&out),
+            [
+                "fld ft0, 8(a1)",
+                "fld ft1, 0(a1)",
+                "fmul.d ft0, ft0, ft1",
+                "fsd ft0, 0(a0)",
+                "fmv.d fa0, ft1",
+                "ret"
+            ],
+            "{out}"
+        );
+        // Single precision: the FP-to-FP move is `fmv.s`, the memory forms
+        // `flw`/`fsw`.
+        let asm = "f:\n    lw t0, 4(a1)\n    fmv.w.x ft0, t0\n    fmv.x.w t1, ft0\n    fmv.w.x fa0, t1\n    fmv.x.w t2, ft0\n    sw t2, 0(a0)\n    ret\n";
+        let out = peephole_optimize(asm.into());
+        assert_eq!(
+            code_lines(&out),
+            ["flw ft0, 4(a1)", "fmv.s fa0, ft0", "fsw ft0, 0(a0)", "ret"],
+            "{out}"
+        );
+        // The temporary is read again: no fold.
+        let asm = "f:\n    fmv.x.d t0, ft0\n    sd t0, 0(a0)\n    mv a0, t0\n    ret\n";
+        let out = peephole_optimize(asm.into());
+        assert!(
+            code_lines(&out).contains(&"fmv.x.d t0, ft0".to_string()),
+            "{out}"
+        );
+        // A store between the load and its FP move blocks the sink.
+        let asm = "f:\n    ld t0, 0(a1)\n    fsd ft2, 0(a1)\n    fmv.d.x ft1, t0\n    fmv.x.d a0, ft1\n    ret\n";
+        let out = peephole_optimize(asm.into());
+        assert!(
+            code_lines(&out).contains(&"ld t0, 0(a1)".to_string()),
+            "{out}"
+        );
+    }
+
+    /// Frame slots are per function: another function reading the same
+    /// offset keeps nothing alive here, and a frame address that escapes in
+    /// one function does not disable the census in the others.
+    #[test]
+    fn dead_frame_stores_are_judged_per_function() {
+        let asm = "f:\n    sd a0, -32(s0)\n    li a0, 1\n    ret\ng:\n    ld a0, -32(s0)\n    addi t0, s0, -40\n    sd t0, 0(a1)\n    ret\nh:\n    sd a0, -24(s0)\n    ret\n";
+        let out = peephole_optimize(asm.into());
+        let f = out.split("g:").next().unwrap_or("");
+        assert!(!f.contains("sd a0, -32(s0)"), "{out}");
+        let h = out.rsplit("h:").next().unwrap_or("");
+        assert!(!h.contains("sd a0, -24(s0)"), "{out}");
+        // g takes a frame address: its stores stay.
+        assert!(out.contains("sd t0, 0(a1)"), "{out}");
+    }
+
     #[test]
     fn branch_pseudoinstructions_classify_as_branches() {
         for line in [
@@ -4708,14 +5000,17 @@ mod tests {
     #[test]
     fn test_gsf_invalidation_on_reg_overwrite() {
         // After t0 is overwritten, the mapping slot → t0 is stale
+        // Both the overwritten t0 and the reloaded value stay live.
         let input = "\
     sd t0, -24(s0)\n\
     li t0, 42\n\
     ld t1, -24(s0)\n\
+    add a0, t1, t0\n\
     ret\n";
         let result = peephole_optimize(input.to_string());
         // The load should NOT be forwarded since t0 was overwritten
-        assert!(result.contains("ld t1, -24(s0)"));
+        assert!(result.contains("ld t1, -24(s0)"), "{result}");
+        assert!(!result.contains("mv t1, t0"), "{result}");
     }
 
     #[test]
@@ -4726,10 +5021,14 @@ mod tests {
     jump .LBB1, t6\n\
 .LBB1:\n\
     ld t0, -24(s0)\n\
+    mv a0, t0\n\
     ret\n";
         let result = peephole_optimize(input.to_string());
         // Label invalidates mappings, so load should remain
-        assert!(result.contains("ld t0, -24(s0)"));
+        assert!(
+            result.contains("ld t0, -24(s0)") || result.contains("ld a0, -24(s0)"),
+            "{result}"
+        );
     }
 
     #[test]
@@ -4749,6 +5048,7 @@ mod tests {
         let input = "\
     sd t0, -24(s0)\n\
     addi t1, s0, -24\n\
+    sd t1, 0(a1)\n\
     ret\n";
         let result = peephole_optimize(input.to_string());
         // Store must be preserved
@@ -4890,6 +5190,7 @@ mod tests {
         let input = "\
     mv t0, s1\n\
     lla t0, main.s1.0\n\
+    mv a0, t0\n\
     ret\n";
         let result = peephole_optimize(input.to_string());
         assert!(
@@ -4908,10 +5209,10 @@ mod tests {
         // mv t0, s1 ; addw t2, t0, t1 → addw t2, s1, t1
         let input = "\
     mv t0, s1\n\
-    addw t2, t0, t1\n\
+    addw a0, t0, t1\n\
     ret\n";
         let result = peephole_optimize(input.to_string());
-        assert!(result.contains("addw t2, s1, t1"));
+        assert!(result.contains("addw a0, s1, t1"), "{result}");
     }
 
     #[test]
@@ -4928,7 +5229,11 @@ mod tests {
             "Expected dead move eliminated, got:\n{}",
             result
         );
-        assert!(result.contains("li t1, 42"));
+        // The constant still reaches the return register.
+        assert!(
+            result.contains("li a0, 42") || result.contains("li t1, 42"),
+            "{result}"
+        );
     }
 
     #[test]
