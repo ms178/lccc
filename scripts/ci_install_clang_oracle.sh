@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Install the Clang oracle the ext_vector_type gates compare against:
-# Clang 23.1.4, EXACTLY (tests/regression/lib/clang_oracle.sh states why the
+# Clang 23.1.5, EXACTLY (tests/regression/lib/clang_oracle.sh states why the
 # version is part of the contract). Hosted CI and developers without that
 # release on PATH both use this script; it is idempotent and cache-friendly.
 #
@@ -13,25 +13,45 @@
 # Usage:
 #   scripts/ci_install_clang_oracle.sh [--prefix DIR] [--print-bin]
 #
-# Exit status 0 means `$PREFIX/bin/clang -dumpversion` prints 23.1.4. Under
+# Exit status 0 means `$PREFIX/bin/clang -dumpversion` prints 23.1.5. Under
 # GitHub Actions the script also exports CLANG=<that binary> through
 # $GITHUB_ENV so every later step's gate resolves the oracle via $CLANG.
+#
+# This installer is the single live Clang pin of the repository. The
+# `harness-cache-4` release asset and the `harness-cache-7` tag payload still
+# carry a repacked 23.1.4 (a main-branch patch cannot re-issue release assets);
+# both are recorded as superseded transport payloads in
+# scripts/check_toolchain_cache_freshness.py and are re-issued as 23.1.5 by
+# scripts/publish_toolchain_cache.py / publish_agent_toolchain_cache.sh on
+# their next hosted run.
 set -Eeuo pipefail
 
-VERSION=23.1.4
+VERSION=23.1.5
 ASSET="LLVM-$VERSION-Linux-X64.tar.zst"
 URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-$VERSION/$ASSET"
-# `gh api repos/llvm/llvm-project/releases/tags/llvmorg-23.1.4 --jq
-#  '.assets[] | select(.name=="LLVM-23.1.4-Linux-X64.tar.zst") | .digest'`
-SHA256=efdd1dbd089b99bfcfcde7b8eb1236163f2e88df5a981cca4f783ec9cb5e0378
+# `gh api repos/llvm/llvm-project/releases/tags/llvmorg-23.1.5 --jq
+#  '.assets[] | select(.name=="LLVM-23.1.5-Linux-X64.tar.zst") | .digest'`
+# (published 2026-11-03; re-verified live against that API on 2026-11-05)
+SHA256=c3107384835f788768f614db610e87fba7077f125ca950eb02a78bab0a308065
 
 prefix=${LCCC_CLANG_ORACLE_PREFIX:-${XDG_CACHE_HOME:-$HOME/.cache}/lccc/clang-oracle/$VERSION}
 print_bin=0
 while [ $# -gt 0 ]; do
     case $1 in
         --prefix) prefix=$2; shift 2 ;;
+        # Callers may *state* the version they expect; it is verified against
+        # the pin rather than honoured, because two installable Clangs would
+        # make every "matches the Clang oracle" claim ambiguous. The flag
+        # exists so a workflow that names a version fails here, at
+        # provisioning, instead of silently installing a different one.
+        --version)
+            [ "${2:-}" = "$VERSION" ] || {
+                echo "ci_install_clang_oracle: --version ${2:-} is not the pinned oracle $VERSION" >&2
+                exit 2
+            }
+            shift 2 ;;
         --print-bin) print_bin=1; shift ;;
-        -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
         *) echo "ci_install_clang_oracle: unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -113,6 +133,24 @@ archive=$work/$ASSET
 errlog=$work/tools.err
 errlog_or_null=$errlog
 : > "$errlog"
+
+# Preflight the free space of the directory the archive lands in.
+#
+# The asset is >1 GiB, and on hosts whose TMPDIR is a small tmpfs -- agent
+# sandboxes mount /tmp as one, this harness has 992 MiB -- curl dies part-way
+# with exit 23 "write error". That reads exactly like a network failure, so the
+# real cause (a full filesystem) is invisible and the retry loop just repeats
+# it. Asking the filesystem first turns it into a named, actionable condition.
+# The size comes from the server (a HEAD costs one round trip); the fallback
+# constant is the 23.1.5 asset plus extraction headroom.
+asset_bytes=$(curl --head --location --silent --show-error --max-time 30 \
+    -o /dev/null -w '%{size_download}' "$URL" 2>>"$errlog" || true)
+[ "${asset_bytes:-0}" -gt 1048576 ] 2>/dev/null || asset_bytes=1198896522
+need_kb=$(( (asset_bytes * 11 / 10 + 209715200) / 1024 ))
+avail_kb=$(df -Pk "$work" 2>/dev/null | awk 'NR==2 {print $4}')
+if [ -n "${avail_kb:-}" ] && [ "$avail_kb" -lt "$need_kb" ]; then
+    fail "$work has $((avail_kb / 1024)) MiB free; downloading $ASSET needs ~$((need_kb / 1024)) MiB. Point TMPDIR at a disk-backed directory, e.g. TMPDIR=/var/tmp."
+fi
 # Tool identities, for the log only: never a failure path.
 versions=$( { zstd --version 2>&1 | head -n 1; tar --version 2>&1 | head -n 1; } | paste -sd ';' || true)
 log "tools: $versions"

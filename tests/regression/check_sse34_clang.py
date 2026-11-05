@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independently compare all positive legacy SIMD matrix bytes with Clang 23.1.4.
+"""Independently compare all positive legacy SIMD matrix bytes with Clang 23.1.5.
 
 GAS rejection-policy tests remain in asmdiff; LLVM need not copy GAS's syntax
 policy for malformed input. This gate never treats a missing/old LLVM as a pass.
@@ -17,7 +17,7 @@ import asmdiff
 
 
 def check_version(text):
-    return bool(re.search(r'\bclang version 23\.1\.4(?:\s|$)', text))
+    return bool(re.search(r'\bclang version 23\.1\.5(?:\s|$)', text))
 
 
 def fail(message):
@@ -35,7 +35,7 @@ def main():
     a = p.parse_args()
     version = subprocess.run([a.clang, '--version'], capture_output=True, text=True, check=True).stdout
     if not check_version(version):
-        fail('FAIL: require identified Clang 23.1.4, got '+version.splitlines()[0])
+        fail('FAIL: require identified Clang 23.1.5, got '+version.splitlines()[0])
     print(version.splitlines()[0], flush=True)
     with tempfile.TemporaryDirectory(prefix='sse34-clang-') as d:
         d = Path(d)

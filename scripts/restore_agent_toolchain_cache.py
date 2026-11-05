@@ -526,7 +526,7 @@ def shim_inputs(prefix: Path, cache: dict, selected: set[str]) -> tuple[list[str
                 lib_dirs.append(str(candidate))
     entries: list[Path] = []
     seen: set[str] = set()
-    # Priority order keeps current Rust/Clang ahead of the MSRV floor.  The
+    # Priority order comes from the cache's own `priority` list.  The
     # seen set is essential now that wrappers are repaired unconditionally:
     # a later lower-priority target must not overwrite the first choice.
     for name in cache.get('priority', list(tools)):
@@ -687,7 +687,7 @@ def restore(repo: Path, remote: str, tag: str, prefix: Path, lock_path: Path | N
             for entry in entries:
                 # Always repair/rewrite the selected wrapper.  shim_inputs has
                 # already deduplicated names by priority, so this cannot let a
-                # lower-priority MSRV tool replace the current tool.
+                # lower-priority target replace the current tool.
                 written[entry.name] = bytes_digest(write_wrapper(shim_dir / entry.name, entry, lib_dirs))
             record['shims'] = written
             record['env'] = bytes_digest(build_env(prefix, cache, lib_dirs, shim_dir))

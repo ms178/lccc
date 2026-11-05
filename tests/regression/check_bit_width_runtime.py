@@ -8,7 +8,7 @@ AArch64 and RISC-V.  Missing cross binaries or emulators are failures under
 ``--run``, not silent skips: the point is to certify every backend that the
 bit folds reach, including the x86 flag fusions and the i686 register paths.
 
-Every program is pinned to a checksum GCC 16.2 and Clang 23.1.4 agree on:
+Every program is pinned to a checksum GCC 16.2 and Clang 23.1.5 agree on:
 
 * ``check.c`` (one TU over ``runtime.c``): signed narrow results observed
   before any truncating return can mask a canonical-form bug.

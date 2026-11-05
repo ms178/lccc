@@ -130,7 +130,7 @@ def main(argv: list[str]) -> int:
 
     # SOURCE_DATE_EPOCH: reproducible, UTC, and shared by all three macros.
     # Only instants both reference compilers accept are candidates: a negative or
-    # five-digit-year value is *rejected* by GCC 16.2 and Clang 23.1.4 (and by
+    # five-digit-year value is *rejected* by GCC 16.2 and Clang 23.1.5 (and by
     # lccc, which diagnoses it), so it cannot carry a reproducible value.
     for stamp in [s for s in stamps if 0 <= s <= MAX_SOURCE_DATE_EPOCH]:
         env = dict(os.environ)

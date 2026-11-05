@@ -77,7 +77,7 @@ CASES = [
     # Per-level pointer qualifiers. `CType` erases qualifiers, so before the
     # per-level record these middle-level consts were invisible and every
     # `*p = 0` below was silently accepted. Measured against gcc 16.2.0 and
-    # clang 23.1.4: exactly the cases marked True are constraint violations.
+    # clang 23.1.5: exactly the cases marked True are constraint violations.
     ('const_middle_level', 'void f(int *const *p){*p=0;}', True, None),
     ('mutable_middle_pointee', 'void f(int *const *p){**p=1;}', False, None),
     ('mutable_middle_object', 'void f(int *const *p){p=0;}', False, None),

@@ -135,7 +135,7 @@ C
 # gcc_oracle_require_m32_sse2 <gate> -> 0 if $GCC_ORACLE_BIN's DEFAULT -m32
 # target has SSE2, else prints a configuration FAIL and returns 1. Contracts
 # that compare lccc's default i686 ABI (SSE2: 16-byte vectors in %xmm, the
-# Clang 23.1.4 `pentium4` default and the pinned tag-cache GCC 16.2 build's)
+# Clang 23.1.5 `pentium4` default and the pinned tag-cache GCC 16.2 build's)
 # against the oracle's default need an oracle whose `-m32` default agrees. A
 # distribution GCC configured --with-arch-32=i686 (Debian, Ubuntu) passes
 # those vectors on the stack; its verdict measures the packaging, not lccc.

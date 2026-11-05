@@ -16,7 +16,7 @@
 # things a fixture cannot: the oracle re-derivation, the *values* the lowering
 # must deliver, and the void-value diagnostics.
 #
-# Oracle: GCC 16.2 (this project's reference). Clang 23.1.4 answers `void` for
+# Oracle: GCC 16.2 (this project's reference). Clang 23.1.5 answers `void` for
 # every transparent tail; that divergence is documented in the fixture and
 # asserted below only when a Clang oracle is installed, so a future Clang that
 # changes its mind is reported instead of silently contradicting the comment.

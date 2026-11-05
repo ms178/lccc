@@ -175,7 +175,7 @@ elif name == 'apt-get':
         sys.exit(0)
 elif name in ('mold', 'ld.lld', 'lld'):
     print({'mold': 'mold 3.0.0 (compatible with GNU ld)',
-           'ld.lld': 'LLD 23.1.4 (compatible with GNU linkers)',
+           'ld.lld': 'LLD 23.1.5 (compatible with GNU linkers)',
            'lld': 'lld'}[name])
 '''
 

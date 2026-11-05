@@ -11,7 +11,7 @@
 # count.
 #
 # All expectations below were measured with gcc-16 (GCC) 16.2.0 at -O2 on
-# x86-64 and cross-checked with Clang 23.1.4 where Clang implements the GNU
+# x86-64 and cross-checked with Clang 23.1.5 where Clang implements the GNU
 # spelling.  Two deliberate divergences from the older gcc 14.2 measurement
 # are pinned here:
 #
@@ -280,7 +280,7 @@ report "gcc 16.2 accept/reject differential (${#diff_spellings[@]} spellings)" "
 # A deferred IsConstant query cannot be resolved by the -O0 tier, which
 # returns before `resolve_remaining_is_constant`. Both arms of the conditional
 # stayed live, so the untaken arm's `"i"` operand tripped the pipeline's final
-# immediate-only validation. GCC 16.2 and Clang 23.1.4 accept this at EVERY
+# immediate-only validation. GCC 16.2 and Clang 23.1.5 accept this at EVERY
 # -O level; the reference values measured at -O0 are 0 (local), 1 (literal),
 # 0 (parameter), and at -O1+ the local becomes 1. Pin verdict parity across
 # all tiers and both ABIs, plus which arm the -O0 lowering actually emits.

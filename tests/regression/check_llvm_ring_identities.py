@@ -111,8 +111,8 @@ def main():
     args = parser.parse_args()
     version = run([args.gcc, "-dumpfullversion"]).decode().strip()
     report_gcc_oracle(args.gcc, version, gcc_oracle_identity(version, allow_snapshot=True))
-    if args.clang and run([args.clang, "-dumpversion"]).decode().strip() != "23.1.4":
-        raise ValueError("Clang 23.1.4 oracle required")
+    if args.clang and run([args.clang, "-dumpversion"]).decode().strip() != "23.1.5":
+        raise ValueError("Clang 23.1.5 oracle required")
     source = SOURCE.read_text()
     env = os.environ | {
         "CCC_VERIFY_IR": "abort",

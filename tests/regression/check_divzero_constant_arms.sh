@@ -53,7 +53,7 @@ case_one floating-condition error 'int f(void){return 1.0?1:1/0;}'
 # GCC folds a constant operand of `&&`/`||` on EITHER side, and folds through
 # `!`, integer casts and conditionals, so the divisor's *value* decides the
 # warning rather than its constant-expression status (measured on 16.2: Clang
-# 23.1.4 folds only the left operand, which is why LCCC used to miss these).
+# 23.1.5 folds only the left operand, which is why LCCC used to miss these).
 case_one and-right-zero error 'int f(int x){return x/(x && 0);}'
 case_one and-chain-zero error 'int f(int x){return x/(0 && x && x);}'
 case_one and-nested-zero error 'int f(int x){return x/((x && 0) && 0);}'

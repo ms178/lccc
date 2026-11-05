@@ -261,6 +261,6 @@ Original non-kernel compiler stress workload, added 2026-11-03. Eight
 independent AVX FP clamps expose private-home traffic; a per-iteration input
 change and integer checksum keep all invocations observable. This is not a
 Linux kernel extraction or a whole-application benchmark. The paired runner
-verifies exit status and checksum against GCC16.2/Clang23.1.4; instrumentation
+verifies exit status and checksum against GCC16.2/Clang23.1.5; instrumentation
 uses the bounded `ITERATIONS=20000` override. Runtime and bit-pattern correctness
 fixtures also live under `tests/regression/avx256_fp_*`.

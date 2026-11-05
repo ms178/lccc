@@ -37,7 +37,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lccc", default="target/fastbuild/lccc")
     parser.add_argument("--gcc", default="gcc-16")
-    parser.add_argument("--clang", help="optional Clang 23.1.4 executable")
+    parser.add_argument("--clang", help="optional Clang 23.1.5 executable")
     parser.add_argument("--m32", action="store_true", help="require executable i686 multilib")
     args = parser.parse_args()
     version = run([args.gcc, "-dumpfullversion"])
@@ -46,8 +46,8 @@ def main() -> int:
     compilers = [("gcc", args.gcc), ("lccc", str(Path(args.lccc).resolve()))]
     if args.clang:
         version = run([args.clang, "--version"])
-        if version.returncode or not re.search(rb"clang version 23\.1\.4\b", version.stdout):
-            raise RuntimeError(f"expected Clang 23.1.4, got {version.stdout!r}")
+        if version.returncode or not re.search(rb"clang version 23\.1\.5\b", version.stdout):
+            raise RuntimeError(f"expected Clang 23.1.5, got {version.stdout!r}")
         compilers.append(("clang", args.clang))
     count = 0
     with tempfile.TemporaryDirectory(prefix="lccc-zlib-compare256-") as directory:

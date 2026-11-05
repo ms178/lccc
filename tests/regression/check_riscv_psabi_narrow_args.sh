@@ -9,7 +9,7 @@
 #
 # LCCC keeps a U32 value zero-extended internally and passed it that way:
 # a conforming callee that compares the incoming register with a W-instruction
-# result as is -- GCC 16.2 and Clang 23.1.4 both compile
+# result as is -- GCC 16.2 and Clang 23.1.5 both compile
 # `unsigned b = a + k; return a < b;` to `addw a1, a1, a0; sltu a0, a0, a1` --
 # answered 1 for 0x80000001 + 0xffffffff (b = 0x80000000), a returned U32
 # parameter (`return x;`) came back zero-extended to a conforming caller, and
@@ -94,7 +94,7 @@ unsigned long lccc_stack_widen(long r0, long r1, long r2, long r3, long r4, long
                                long r7, unsigned s0);
 unsigned long via_stack_widen(unsigned v) { return lccc_stack_widen(1, 2, 3, 4, 5, 6, 7, 8, v); }
 /* Every narrow type, both directions: these callees are a bare `ret` (GCC
- * 16.2 and Clang 23.1.4 rely on the extension the psABI guarantees). */
+ * 16.2 and Clang 23.1.5 rely on the extension the psABI guarantees). */
 long w_i32(int x) { return x; }
 long w_i16(short x) { return x; }
 long w_i8(signed char x) { return x; }

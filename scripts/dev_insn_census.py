@@ -15,7 +15,7 @@ REPO = Path("/home/user/lccc")
 PROGS = REPO / "tests/benchmark/programs"
 LCCC = REPO / "target/fastbuild/lccc"
 GCC = Path("/tmp/tc/opt/gcc-16/bin/gcc-16")
-CLANG = Path("/tmp/tc/opt/clang-23.1.4/bin/clang")
+CLANG = Path("/tmp/tc/opt/clang-23.1.5/bin/clang")
 
 INSN = re.compile(r"^\s+[a-z][a-z0-9]*(?:\s|$)")
 MOV = re.compile(r"^\s+(mov[a-z]*)\s")

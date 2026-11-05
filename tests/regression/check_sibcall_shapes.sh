@@ -404,7 +404,7 @@ echo "PASS: per-instruction void-call identity and runtime hook order"
 # --- Branch-arm sibling calls, frame-less tails, tail-call liveness ---------
 # backend::x86::ret_dup hands each call arm the shared return block's
 # `Return`, so `if (c) f(); else g();` / `return c ? f(x) : g(x);` end in two
-# `jmp`s (GCC 16.2, Clang 23.1.4 and ICX 2026.2 all emit that).  A function
+# `jmp`s (GCC 16.2, Clang 23.1.5 and ICX 2026.2 all emit that).  A function
 # whose every call converts owes no call-alignment pad (no `subq $8`), and
 # the `# LCCC_TAIL_CALL` marker lets the liveness oracle delete argument-
 # staging copies the tail callee never reads (`movq %rdi, %rax`).
@@ -425,7 +425,7 @@ int const_arm(int c, int x) { return c ? g1(x) : 0; }
 extern long sink7(long, long, long, long, long, long, long), gl(long);
 long arm7(int c, long v) { if (c) return sink7(v, v, v, v, v, v, 7); return gl(v); }
 /* The callee's int result must be sign-extended after it returns: never a
- * tail call (gcc-16.2 / clang-23.1.4: call g1; cltq). */
+ * tail call (gcc-16.2 / clang-23.1.5: call g1; cltq). */
 long widen(int x) { return g1(x); }
 int mixed(int c, int x) { int r = g1(x); if (c) return g2(r); return r + 1; }
 C
@@ -483,7 +483,7 @@ done
     echo "one: expected exactly 'jmp g1@PLT' (gcc-16.2: jmp g1):" >&2; body "$tmp/arms.s" one >&2; exit 1; }
 # `if (G & 32) fast(); else slow();`: the load+mask folds into a memory
 # test (GCC 16.2: `testb $32, G(%rip)`) and the slow arm becomes a
-# conditional sibling call (Clang 23.1.4: `je slow@PLT`) -- three
+# conditional sibling call (Clang 23.1.5: `je slow@PLT`) -- three
 # instructions, one fewer than GCC.
 b=$(insns "$(body "$tmp/arms.s" dispatch)")
 [ "$(wc -l <<<"$b")" -eq 3 ] && has "$b" '^    testb \$32, G(%rip)$' && has "$b" '^    je slow@PLT$' \

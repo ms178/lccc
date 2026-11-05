@@ -44,7 +44,7 @@ fetch() { curl -fL --retry 5 --retry-delay 2 --retry-all-errors -o "$1" "$2"; }
 # Existing immutable transport tags are the cheapest source of GCC, the
 # bookworm runtime debs, the binutils source tarball, Arm ISA XML and the MSRV
 # Rust components.  Their manifests are the trust root.
-for t in harness-cache-1 harness-cache-2 harness-cache-3 harness-cache-4 rust-cache-1.97.0; do
+for t in harness-cache-1 harness-cache-2 harness-cache-3 harness-cache-4; do
     log "fetching $t"
     git fetch --no-tags "$REMOTE" "refs/tags/$t:refs/tags/$t" >/dev/null 2>&1 || git fetch --no-tags "$REMOTE" "refs/tags/$t:refs/tags/$t"
 done
@@ -63,27 +63,12 @@ log "materialising Arm A64 ISA XML 2026-09 from harness-cache-2"
 blob harness-cache-2 ISA_A64_xml_A_profile-2026-09_md.tar.gz "$FILES/ISA_A64_xml_A_profile-2026-09_md.tar.gz"
 verify "$FILES/ISA_A64_xml_A_profile-2026-09_md.tar.gz" 62917cba0da668deb6c28005231f4b94d1044cd52dbe4a4729fcc26d1642d827
 
-log "materialising the 1.97.0 MSRV Rust components"
-MSRV="$STAGE/rust-1.97.0-msrv"
-mkdir -p "$MSRV"
-for comp in rustc cargo rust-std clippy rustfmt; do
-    member="$comp-1.97.0-x86_64-unknown-linux-gnu.tar.xz"
-    blob rust-cache-1.97.0 "$member.part00" "$MSRV/$member"
-    verify "$MSRV/$member" "$(git show rust-cache-1.97.0:MANIFEST.sha256 | awk -v m="$member" '$2==m{print $1}')"
-done
-tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -I 'xz -T2 -6' \
-    -cf "$FILES/rust-1.97.0-msrv.tar.xz" -C "$STAGE" rust-1.97.0-msrv
-
-log "downloading locked Clang 23.1.4 and Rust 1.99.1 release assets"
-CLANG_SHA=$(python3 -c 'import json;print(json.load(open("engineering/toolchains/cache-lock.json"))["tools"]["clang"]["sha256"])')
+log "downloading the locked Rust 1.99.1 release asset"
 RUST_SHA=$(python3 -c 'import json;print(json.load(open("engineering/toolchains/cache-lock.json"))["tools"]["rust"]["sha256"])')
-gh release download harness-cache-4 --repo "$REPO" --pattern 'clang-23.1.4-*.tar.xz' --dir "$SRC" --clobber
 gh release download harness-cache-4 --repo "$REPO" --pattern 'rust-1.99.1-*.tar.xz' --dir "$SRC" --clobber
-clang_asset=$(find "$SRC" -maxdepth 1 -name 'clang-23.1.4-*.tar.xz' -print -quit)
 rust_asset=$(find "$SRC" -maxdepth 1 -name 'rust-1.99.1-*.tar.xz' -print -quit)
-[ -n "$clang_asset" ] && [ -n "$rust_asset" ] || die "locked release assets not downloaded"
-verify "$clang_asset" "$CLANG_SHA"; verify "$rust_asset" "$RUST_SHA"
-cp "$clang_asset" "$FILES/clang-23.1.4-linux-x64.tar.xz"
+[ -n "$rust_asset" ] || die "locked Rust release asset not downloaded"
+verify "$rust_asset" "$RUST_SHA"
 cp "$rust_asset" "$FILES/rust-1.99.1-x86_64-unknown-linux-gnu.tar.xz"
 
 log "downloading mold 3.0.0 from its pinned upstream release"
@@ -143,52 +128,74 @@ PIN
 tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -I 'xz -T2 -6' \
     -cf "$FILES/binutils-2.47-x86_64-linux.tar.xz" -C "$STAGE" "$BINUTILS_ROOT"
 
-log "downloading QEMU user 11.1.2 from Debian sid"
+# Every QEMU field is read out of scripts/ensure_qemu_user.sh, the script that
+# enforces the pin at install time. A second copy of the version/digest here is
+# exactly how this cache came to hold mold 2.42.1 for three weeks.
+QEMU_VERSION=$(sed -n 's/^QEMU_VERSION=\([0-9.]*\)$/\1/p' scripts/ensure_qemu_user.sh)
+QEMU_DEB_VERSION=$(sed -n 's/^DEB_VERSION=\(.*\)$/\1/p' scripts/ensure_qemu_user.sh)
 QEMU_SHA=$(sed -n 's/^DEB_SHA256=\([0-9a-f]\{64\}\)$/\1/p' scripts/ensure_qemu_user.sh)
-QEMU_DEB=qemu-user_11.1.2+ds-3_amd64.deb
+QEMU_SHA1=$(sed -n 's/^DEB_SHA1=\([0-9a-f]\{40\}\)$/\1/p' scripts/ensure_qemu_user.sh)
+[ -n "$QEMU_VERSION" ] && [ -n "$QEMU_DEB_VERSION" ] && [ -n "$QEMU_SHA" ] && [ -n "$QEMU_SHA1" ] \
+    || die "cannot read the QEMU pins from scripts/ensure_qemu_user.sh"
+QEMU_DEB="qemu-user_${QEMU_DEB_VERSION}_amd64.deb"
+
+log "downloading QEMU user $QEMU_VERSION from Debian sid"
 fetch "$SRC/$QEMU_DEB" "https://deb.debian.org/debian/pool/main/q/qemu/$QEMU_DEB" || \
-    fetch "$SRC/$QEMU_DEB" "https://snapshot.debian.org/file/6067b061f3dd361d94e6c48a1044f79860c56c51"
+    fetch "$SRC/$QEMU_DEB" "https://snapshot.debian.org/file/$QEMU_SHA1"
 verify "$SRC/$QEMU_DEB" "$QEMU_SHA"
 : > "$FILES/debian-debs.sha256"
-printf '%s  %s (Debian qemu-user 11.1.2+ds-3)\n' "$QEMU_SHA" "$QEMU_DEB" >> "$FILES/debian-debs.sha256"
+printf '%s  %s (Debian qemu-user %s)\n' "$QEMU_SHA" "$QEMU_DEB" "$QEMU_DEB_VERSION" >> "$FILES/debian-debs.sha256"
 rm -rf "$EXTRACT/qemu"; mkdir -p "$EXTRACT/qemu"
 dpkg-deb -x "$SRC/$QEMU_DEB" "$EXTRACT/qemu"
-QEMU_ROOT=qemu-user-11.1.2-x86_64
+QEMU_ROOT="qemu-user-$QEMU_VERSION-x86_64"
 rm -rf "$STAGE/$QEMU_ROOT"; mkdir -p "$STAGE/$QEMU_ROOT/bin"
 for a in aarch64 arm i386 riscv64; do
     install -m755 "$EXTRACT/qemu/usr/bin/qemu-$a" "$STAGE/$QEMU_ROOT/bin/qemu-$a"
-    "$STAGE/$QEMU_ROOT/bin/qemu-$a" --version | head -1 | grep -F '11.1.2' >/dev/null || die "qemu-$a is not 11.1.2"
+    "$STAGE/$QEMU_ROOT/bin/qemu-$a" --version | head -1 | grep -F "$QEMU_VERSION" >/dev/null \
+        || die "qemu-$a is not $QEMU_VERSION"
 done
-printf '%s  %s\n' "$QEMU_SHA" "$QEMU_DEB (Debian qemu-user 11.1.2+ds-3)" > "$STAGE/$QEMU_ROOT/PIN"
+printf '%s  %s\n' "$QEMU_SHA" "$QEMU_DEB (Debian qemu-user $QEMU_DEB_VERSION)" > "$STAGE/$QEMU_ROOT/PIN"
 tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -I 'xz -T2 -6' \
-    -cf "$FILES/qemu-user-11.1.2-x86_64.tar.xz" -C "$STAGE" "$QEMU_ROOT"
+    -cf "$FILES/$QEMU_ROOT.tar.xz" -C "$STAGE" "$QEMU_ROOT"
 
-log "downloading and building kernel relocs v7.3"
-KREL_ROOT=kernel-relocs-v7.3-x86_64
+# The kver, the source tree and the six digests are all read from
+# tests/linker/setup_kernel_tools.sh -- the script whose gate verifies the very
+# same sources. The publisher used to carry a second copy of the pin table and
+# of the (torvalds) tree URL, which cannot survive a stable-release bump:
+# v7.3.1 does not exist in the torvalds tree at all.
+KVER=$(sed -n 's/^PINNED_KVER=\(v[0-9.]*\)$/\1/p' tests/linker/setup_kernel_tools.sh)
+KBASE=$(sed -n 's|^BASE="\(https://[^"]*\)"$|\1|p' tests/linker/setup_kernel_tools.sh)
+[ -n "$KVER" ] && [ -n "$KBASE" ] || die "cannot read the kernel relocs pins from tests/linker/setup_kernel_tools.sh"
+
+log "downloading and building kernel relocs $KVER"
+KREL_ROOT="kernel-relocs-$KVER-x86_64"
 rm -rf "$STAGE/$KREL_ROOT"; mkdir -p "$STAGE/$KREL_ROOT"/{bin,src/tools}
-BASE=https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/plain
-declare -A KPINS=(
-    [relocs.c]=acbeca7b2fb6f84502c96385edf117f5170756d743373a7a581b5b46427803f7
-    [relocs.h]=61783eeddcf582c6f8c74c63f8f5170df51e34819a8b8dad9af68117f5c185d0
-    [relocs_common.c]=a49f30d39b362c29bdd27f19cadffdcfefefe5ad35511dd4b8f00d002a1cf08f
-    [relocs_32.c]=ae8b4ffcfe0367bb457a73b9a9534bf2ec495e2f7d99e23b1257b0009d693680
-    [relocs_64.c]=88e45459755585c934a9e24ebb9f6b71fd27f8d10c2fa9cc4a4d51fe3719166b
-    [tools/le_byteshift.h]=87b40e54fed5b27a9acd784e41521d8bbf95922448d07bea17be6b4bb5fa7925
+# Emit "<file>\t<sha256>" straight from the gate's PINS definition, so the two
+# can never disagree about what "the pinned sources" means.
+while IFS=$'\t' read -r kfile ksha; do
+    [ -n "$kfile" ] || continue
+    if [[ $kfile == tools/* ]]; then url="$KBASE/tools/include/$kfile?h=$KVER"; else url="$KBASE/arch/x86/tools/$kfile?h=$KVER"; fi
+    fetch "$STAGE/$KREL_ROOT/src/$kfile" "$url"
+    verify "$STAGE/$KREL_ROOT/src/$kfile" "$ksha"
+done < <(python3 - <<'PYK'
+import pathlib, re
+text = pathlib.Path('tests/linker/setup_kernel_tools.sh').read_text()
+pins = re.search(r"^PINS='(.*?)'$", text, re.M | re.S).group(1)
+for line in pins.splitlines():
+    sha, _, name = line.strip().partition('  ')
+    if sha and name:
+        print(f"{name}\t{sha}")
+PYK
 )
-for f in "${!KPINS[@]}"; do
-    if [[ $f == tools/* ]]; then url="$BASE/tools/include/$f?h=v7.3"; else url="$BASE/arch/x86/tools/$f?h=v7.3"; fi
-    fetch "$STAGE/$KREL_ROOT/src/$f" "$url"
-    verify "$STAGE/$KREL_ROOT/src/$f" "${KPINS[$f]}"
-done
 ( cd "$STAGE/$KREL_ROOT/src" && cc -O2 -I. -o ../bin/relocs relocs_common.c relocs_32.c relocs_64.c )
-printf 'v7.3 sha256:digested-by-tag-manifest\n' > "$STAGE/$KREL_ROOT/STAMP"
+printf '%s sha256:digested-by-tag-manifest\n' "$KVER" > "$STAGE/$KREL_ROOT/STAMP"
 tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -I 'xz -T2 -6' \
-    -cf "$FILES/kernel-relocs-v7.3-x86_64.tar.xz" -C "$STAGE" "$KREL_ROOT"
+    -cf "$FILES/$KREL_ROOT.tar.xz" -C "$STAGE" "$KREL_ROOT"
 
-log "functional smoke test: GCC 16.2 + Debian binutils 2.47 + mold 3.0.0 + Clang 23.1.4 + QEMU i386"
+log "functional smoke test: GCC 16.2 + Debian binutils 2.47 + mold 3.0.0 + Clang $CLANG_VERSION + QEMU i386"
 mkdir -p "$EXTRACT/tools"
 tar -xf "$FILES/gcc-16.2.0-bookworm-x86_64.tar.xz" -C "$EXTRACT/tools"
-tar -xf "$FILES/clang-23.1.4-linux-x64.tar.xz" -C "$EXTRACT/tools"
+tar -xf "$FILES/clang-$CLANG_VERSION-linux-x64.tar.xz" -C "$EXTRACT/tools"
 tar -xf "$FILES/rust-1.99.1-x86_64-unknown-linux-gnu.tar.xz" -C "$EXTRACT/tools"
 tar -xf "$FILES/mold-3.0.0-x86_64-linux.tar.gz" -C "$EXTRACT/tools"
 tar -xf "$FILES/binutils-2.47-x86_64-linux.tar.xz" -C "$EXTRACT/tools"
@@ -225,10 +232,11 @@ C
 "$STAGE/$QEMU_ROOT/bin/qemu-i386" "$TEST/probe32" || [ $? = 42 ] || die "qemu-i386 did not run the 32-bit probe"
 
 log "writing metadata"
-python3 - "$FILES" "$TAG" "$STAGE/$KREL_ROOT" <<'PY'
-import hashlib, json, sys
+python3 - "$FILES" "$TAG" "$STAGE/$KREL_ROOT" "$CLANG_VERSION" "$QEMU_VERSION" "$KVER" <<'PY'
+import hashlib, json, os, sys
 from pathlib import Path
-files=Path(sys.argv[1]); tag=sys.argv[2]
+files=Path(sys.argv[1]); tag=sys.argv[2]; clang_version=sys.argv[4]
+qemu_version=sys.argv[5]; kver=sys.argv[6].removeprefix('v')
 def digest(p):
     with open(p,'rb') as f: return hashlib.file_digest(f,'sha256').hexdigest()
 tools={}
@@ -244,17 +252,16 @@ for name,ver,fn in [
  ('debs-bookworm','bookworm','debs-bookworm.tar.xz'),
  ('binutils-source','2.47','binutils-2.47-source.tar.xz'),
  ('arm-a64-xml','2026-09','ISA_A64_xml_A_profile-2026-09_md.tar.gz'),
- ('rust-msrv','1.97.0','rust-1.97.0-msrv.tar.xz'),
- ('clang','23.1.4','clang-23.1.4-linux-x64.tar.xz'),
+ ('clang',clang_version,f'clang-{clang_version}-linux-x64.tar.xz'),
  ('rust','1.99.1','rust-1.99.1-x86_64-unknown-linux-gnu.tar.xz'),
  ('mold','3.0.0','mold-3.0.0-x86_64-linux.tar.gz'),
  ('binutils','2.47','binutils-2.47-x86_64-linux.tar.xz'),
- ('qemu','11.1.2','qemu-user-11.1.2-x86_64.tar.xz'),
- ('kernel-relocs','7.3','kernel-relocs-v7.3-x86_64.tar.xz')]:
+ ('qemu',qemu_version,f'qemu-user-{qemu_version}-x86_64.tar.xz'),
+ ('kernel-relocs',kver,f'kernel-relocs-v{kver}-x86_64.tar.xz')]:
     add(name,ver,fn,top(fn),'tar.gz' if fn.endswith('.gz') else 'tar.xz')
 cache={'schema':1,'repository':'ms178/lccc','tag':tag,'part_size':90*1024*1024,
-       'tools':tools,'priority':['rust','clang','gcc','binutils','mold','qemu','kernel-relocs','arm-a64-xml','debs-bookworm','binutils-source','rust-msrv'],
-       'provenance':{'debian_sid_packages':'debian-debs.sha256 (QEMU user)','binutils':'one-time build from pinned 2.47 source in Debian bookworm container','kernel':'v7.3 torvalds tree','mold':'rui314/mold v3.0.0 release','clang_rust':'harness-cache-4 release assets'}}
+       'tools':tools,'priority':['rust','clang','gcc','binutils','mold','qemu','kernel-relocs','arm-a64-xml','debs-bookworm','binutils-source'],
+       'provenance':{'debian_sid_packages':'debian-debs.sha256 (QEMU user)','binutils':'one-time build from pinned 2.47 source in Debian bookworm container','kernel':f'v{kver} stable kernel.org tree (sources pinned by tests/linker/setup_kernel_tools.sh)','mold':'rui314/mold v3.0.0 release','clang':f'official LLVM {clang_version} asset, staged by scripts/ci_install_clang_oracle.sh','rust':'harness-cache-4 release asset'}}
 (files/'CACHE.json').write_text(json.dumps(cache,indent=2,sort_keys=True)+'\n')
 (files/'MANIFEST.sha256').write_text(''.join(f"{v['sha256']}  {v['file']}\n" for _,v in sorted(tools.items())) + f"{digest(files/'CACHE.json')}  CACHE.json\n")
 (files/'README.md').write_text(f'''# {tag}\n\nGitHub-only toolchain cache for network-constrained agents.\n\n```\ngit fetch origin tag {tag}\npython3 scripts/restore_agent_toolchain_cache.py --tag {tag} --prefix /path/to/toolchains\n. /path/to/toolchains/env.sh\n```\n\nEvery file is split into <90 MiB parts and verified against MANIFEST.sha256.\nCACHE.json records the tool versions, roots, sizes and digests.\n''')

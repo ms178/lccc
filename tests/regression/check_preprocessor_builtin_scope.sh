@@ -134,7 +134,7 @@ if [ "$have_clang" -eq 1 ]; then
         || fail "include level: clang-23 disagrees: '$ref'"
 fi
 
-# A force-included file runs at level 1 (GCC 16.2 and Clang 23.1.4 agree), not 0.
+# A force-included file runs at level 1 (GCC 16.2 and Clang 23.1.5 agree), not 0.
 printf 'int plain_level = __INCLUDE_LEVEL__;\n' >"$tmp/plain.c"
 mine=$(preprocess "$CCC" "$tmp/plain.c" -include "$tmp/prelude.h")
 expect_line "$mine" "-include" "int prelude_level = 1;"
@@ -651,7 +651,7 @@ fi
 # translation unit already answered 32 under `-mavx`: the macro reported a
 # biggest alignment smaller than a type the compiler itself accepts, so every
 # `char buf[__BIGGEST_ALIGNMENT__]` that AVX/AVX-512 code reinterprets as an
-# `__m256`/`__m512` was under-aligned. Clang 23.1.4 pins 16 and is
+# `__m256`/`__m512` was under-aligned. Clang 23.1.5 pins 16 and is
 # self-inconsistent in exactly that way (`_Alignof(v64)` is 64 there), so GCC
 # is the only coherent oracle and therefore the expectation.
 #

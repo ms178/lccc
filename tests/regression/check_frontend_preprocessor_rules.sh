@@ -2,7 +2,7 @@
 # Preprocessor behaviour that the frontend differential audit pins, asserted
 # without needing an oracle compiler so the check runs in every lane.
 #
-# Each case below was a measured divergence from gcc-16.2 and clang-23.1.4:
+# Each case below was a measured divergence from gcc-16.2 and clang-23.1.5:
 #
 #  1. C11 6.10.3.4p1 -- the rescan of a replacement list continues with the rest
 #     of the source, so an invocation begun inside a replacement list may take

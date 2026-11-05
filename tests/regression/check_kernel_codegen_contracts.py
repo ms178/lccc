@@ -117,7 +117,7 @@ def main():
                 if name == 'icx':
                     assert re.search(r'\b2026\.2(?:\.\d+)?\b', version), ('expected reviewed ICX 2026.2', version)
                 if name == 'clang':
-                    assert re.search(r'clang version 23\.1\.4\b', version), ('expected reviewed Clang 23.1.4', version)
+                    assert re.search(r'clang version 23\.1\.5\b', version), ('expected reviewed Clang 23.1.5', version)
             # Incoming parameters must survive trampoline scratch staging.
             # Two enclosing calls prevent constant specialization masking the
             # original O2/Os wrong-code witness. Clang/ICX do not implement GNU

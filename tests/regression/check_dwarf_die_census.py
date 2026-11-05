@@ -25,7 +25,7 @@ up in ``readelf`` as a warning or an error, never as a silent pass.
 The measured census on the fixture below (x86-64, ``-O0``, versions 2..5):
 
 =========================  ==============  ==============  ============
-                           LCCC            gcc 16.2        clang 23.1.4
+                           LCCC            gcc 16.2        clang 23.1.5
 =========================  ==============  ==============  ============
 DIE tags                   3               15              14
 attributes                 15              30              27

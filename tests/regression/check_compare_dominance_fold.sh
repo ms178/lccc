@@ -28,7 +28,7 @@
 #      imply each other nor decide the join (`(x < 5) | (x > 10)`, which the
 #      range-check fusion turns into one unsigned compare either way); the empty
 #      conjunction and the covering disjunction are a bare constant (GCC 16.2
-#      and Clang 23.1.4 emit the same two lines),
+#      and Clang 23.1.5 emit the same two lines),
 #   4. `CCC_NO_COMPARE_DOMINANCE=1` brings every folded shape back, which is
 #      what proves the assertions above belong to this fold and not to some
 #      other rule that happens to agree today,
@@ -106,7 +106,7 @@ expect ceiling 4 shapes.s
 expect zero_floor 4 shapes.s
 # 64- and 16-bit answers are a `setg` into the zeroed %eax, nothing more: the
 # extension chain that used to widen the flag twice collapses into it (GCC
-# 16.2 and Clang 23.1.4 emit the same four lines).
+# 16.2 and Clang 23.1.5 emit the same four lines).
 expect guard64 4 shapes.s
 expect guard16 4 shapes.s
 expect guard8 4 shapes.s

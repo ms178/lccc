@@ -1,6 +1,6 @@
 /* Freestanding checksum over the boolean-return kernels (bool_return.c).
  *
- * 5265056886320220448 is the value GCC 16.2 and Clang 23.1.4 both compute
+ * 5265056886320220448 is the value GCC 16.2 and Clang 23.1.5 both compute
  * at -O0, -O1, -O2, -O3 and -Os (hosted x86-64 build of both files), and
  * that a -fsanitize=undefined trap build of both compilers reproduces
  * without trapping.  Every observation is width-neutral (a boolean, or a

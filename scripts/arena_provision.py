@@ -85,10 +85,15 @@ DEBS_BLOB = "06185dd859247494e5c489656e0488a7f3edaf70"
 # payload fetched without a content pin. A tampered/corrupt bundle of the
 # right byte size would have been unpacked and `dpkg --unpack`ed.
 DEBS_SHA256 = "24a4be08d5c6a28aed78f424ebdc9596f85cc2e8ebd0ba230f99a2bf9cdfb20d"
-CLANG_BLOB = "83ddbd38300d497e362bf873c7291e3e24cb63aa"
-CLANG_SHA256 = "373e20c398712e21bbfdbb401176f5057b0adc6ae28816cd11da049fc111ecf0"
-CLANG_SIZE = 67_322_400
-CLANG_VERSION = "23.1.4"
+# Clang is NOT restored from a git blob any more. The harness-cache-7 payload
+# (blob 83ddbd38..., 67,322,400 bytes) is a repacked 23.1.4, and a main-branch
+# patch cannot re-issue a tag blob -- so a bumped version here would have named
+# bytes that do not exist. The oracle now comes from the same digest-pinned
+# upstream installer CI uses (scripts/ci_install_clang_oracle.sh), which pins
+# the official LLVM 23.1.5 asset by the SHA-256 GitHub publishes for it and
+# proves the identity with `clang -dumpversion` before exiting 0.
+CLANG_VERSION = "23.1.5"
+GDB_VERSION = "18.1"
 GCC_REPO = "ms178/lccc"
 GCC_TAG = "harness-cache-1"
 
@@ -296,35 +301,67 @@ def install_multilib(prefix: Path) -> None:
 
 
 def install_clang(prefix: Path) -> Path:
-    """Provision Clang 23.1.4 from the pinned harness-cache-7 git blob.
+    """Provision the pinned Clang oracle via its digest-pinned installer.
 
-    The `harness-cache-4` RELEASE asset for the same archive is served by
-    `release-assets.githubusercontent.com`, which the sandbox allowlist does
-    not reach; harness-cache-7 stores the identical 67,322,400-byte file as a
-    single git blob, so the Git Blobs API is the reachable, verifiable path.
+    The sandbox used to restore a repacked Clang from the `harness-cache-7`
+    git blob because the release-asset CDN was believed unreachable from an
+    agent sandbox. That was re-tested on 2026-11-05: a ranged GET of
+    `github.com/llvm/llvm-project/releases/download/llvmorg-23.1.5/...`
+    returns 206 from here, so the official asset IS reachable and the blob
+    detour now costs more than it saves -- it can only ever serve the last
+    published payload (23.1.4), which is exactly the "silently stale oracle"
+    failure the pin exists to prevent.
+
+    Delegating to scripts/ci_install_clang_oracle.sh means the sandbox and
+    hosted CI resolve one oracle through one code path, one digest and one
+    version probe. The installer exits non-zero unless `clang -dumpversion`
+    prints CLANG_VERSION, so a provisioning failure is loud rather than a
+    green gate that compared against the wrong compiler.
     """
     root = prefix / f"clang-{CLANG_VERSION}"
     clang = root / "bin/clang"
-    marker = root / ".verified"
-    if marker_ok(marker, CLANG_SHA256, (clang,)):
-        return clang
+    installer = REPO / "scripts" / "ci_install_clang_oracle.sh"
+    if not installer.is_file():
+        raise RuntimeError(f"missing Clang installer: {installer}")
+    # The asset is >1 GiB and the installer refuses a TMPDIR too small to hold
+    # it; /tmp is a small tmpfs in this harness, so point the download at the
+    # disk-backed prefix instead of letting curl die with a write error.
     downloads = prefix / "dl"
-    archive = downloads / f"clang-{CLANG_VERSION}-linux-x64.tar.xz"
-    blob(GCC_REPO, CLANG_BLOB, CLANG_SIZE, archive)
-    if sha256(archive) != CLANG_SHA256:
-        raise RuntimeError("Clang 23.1.4 archive SHA-256 mismatch")
-    # CACHE.json declares the archive's root as `clang-23.1.4/`, so extract
-    # into the prefix (like install_gcc) rather than into an extra nested dir.
-    with tarfile.open(archive, "r:xz") as source:
-        extract_untrusted(source, prefix)
+    downloads.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, TMPDIR=str(downloads),
+               LCCC_CLANG_ORACLE_PREFIX=str(root))
+    run(["bash", str(installer), "--prefix", str(root)], env=env, timeout=3600)
     if not clang.is_file():
-        raise RuntimeError("Clang archive lacks bin/clang")
+        raise RuntimeError(f"Clang installer succeeded but {clang} is missing")
     version = run([str(clang), "--version"])
     if CLANG_VERSION not in version:
         raise RuntimeError(f"unexpected Clang identity: {version}")
-    marker.write_text(CLANG_SHA256 + "\n")
     print(f"[arena] clang: {version.splitlines()[0]}")
     return clang
+
+
+def install_gdb(prefix: Path) -> Path:
+    """Provision the pinned GDB oracle (18.1, built with -march=haswell).
+
+    Opt-in (`--with-gdb`) because it is a from-source build of several
+    minutes, and only the DWARF/debug-info gates need it -- but when those
+    gates run without a gdb on PATH they SKIP their debugger cross-check and
+    still exit 0, so a session that touches debug info must ask for it.
+    """
+    root = prefix / f"gdb-{GDB_VERSION}"
+    gdb = root / "bin/gdb"
+    installer = REPO / "scripts" / "ci_install_gdb_oracle.sh"
+    if not installer.is_file():
+        raise RuntimeError(f"missing GDB installer: {installer}")
+    downloads = prefix / "dl"
+    downloads.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, TMPDIR=str(downloads),
+               LCCC_GDB_ORACLE_PREFIX=str(root))
+    run(["bash", str(installer), "--prefix", str(root)], env=env, timeout=7200)
+    if not gdb.is_file():
+        raise RuntimeError(f"GDB installer succeeded but {gdb} is missing")
+    print(f"[arena] gdb: {run([str(gdb), '--version']).splitlines()[0]}")
+    return gdb
 
 
 def verify(gcc: Path, rust: Path) -> None:
@@ -353,6 +390,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--verify-only", action="store_true",
                         help="probe an existing install; never download or write")
     parser.add_argument("--skip-corpus", action="store_true")
+    parser.add_argument("--with-gdb", action="store_true",
+                        help="also build the pinned GDB oracle (needed by the "
+                             "DWARF line-table gates, several minutes)")
     args = parser.parse_args(argv)
     prefix = args.prefix.resolve()
     gcc = prefix / "gcc-16.2/gcc-16/bin/gcc-16"
@@ -372,6 +412,8 @@ def main(argv: list[str] | None = None) -> int:
     install_rust(prefix)
     install_multilib(prefix)
     install_clang(prefix)
+    if args.with_gdb:
+        install_gdb(prefix)
     verify(gcc, rust)
     if not args.skip_corpus:
         provision_corpus()

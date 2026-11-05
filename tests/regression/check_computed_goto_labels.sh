@@ -19,7 +19,7 @@
 #      GCC 16.2 rejects all of them; a new zero-copy sema pass restores the
 #      C23/GNU contract and makes fix (1) unambiguous.
 #
-# Every expectation below was measured against GCC 16.2 and Clang 23.1.4
+# Every expectation below was measured against GCC 16.2 and Clang 23.1.5
 # where those compilers support the construct. Nested functions are a GNU
 # extension Clang does not implement, so that shape is checked against GCC.
 #

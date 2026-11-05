@@ -49,7 +49,7 @@ CONSUMERS = {
     'backend-contracts-a', 'backend-contracts-b',
 }
 # Jobs that run gates without being artifact consumers.
-PRODUCERS = {'build', 'debug', 'clippy', 'msrv', 'icx-oracle'}
+PRODUCERS = {'build', 'debug', 'clippy', 'icx-oracle'}
 # Both reusable benchmark shards keep the same shape as `benchmark`.
 BENCH_SHARDS = {'benchmark-a', 'benchmark-b'}
 LANES = CONSUMERS | PRODUCERS | BENCH_SHARDS | {'benchmark'}

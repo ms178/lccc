@@ -1242,7 +1242,7 @@
         },
         {
           "measured_s": 56.0,
-          "name": "ext_vector_type by-value ABI grid vs the Clang 23.1.4 oracle"
+          "name": "ext_vector_type by-value ABI grid vs the Clang 23.1.5 oracle"
         },
         {
           "measured_s": 10.0,
@@ -1318,7 +1318,7 @@
         },
         {
           "measured_s": 5.0,
-          "name": "ext_vector_type by-value ABI under the AVX ABI level vs the Clang 23.1.4 oracle"
+          "name": "ext_vector_type by-value ABI under the AVX ABI level vs the Clang 23.1.5 oracle"
         },
         {
           "measured_s": 0.25,
@@ -1418,7 +1418,7 @@
         },
         {
           "measured_s": 5.0,
-          "name": "ext_vector_type layout/lane matrix vs the pinned Clang 23.1.4 oracle"
+          "name": "ext_vector_type layout/lane matrix vs the pinned Clang 23.1.5 oracle"
         },
         {
           "measured_s": 1.0,
@@ -1586,7 +1586,7 @@
         },
         {
           "measured_s": 4.0,
-          "name": "Ring identities against GCC 16 and Clang 23.1.4"
+          "name": "Ring identities against GCC 16 and Clang 23.1.5"
         },
         {
           "measured_s": 2.45,
@@ -1650,7 +1650,7 @@
         },
         {
           "measured_s": 7.0,
-          "name": "Scalar logic against GCC 16 and Clang 23.1.4"
+          "name": "Scalar logic against GCC 16 and Clang 23.1.5"
         },
         {
           "measured_s": 0.25,
@@ -1730,11 +1730,11 @@
         },
         {
           "measured_s": 9.0,
-          "name": "Predicate relations against supplemental GCC 16 snapshot and Clang 23.1.4"
+          "name": "Predicate relations against supplemental GCC 16 snapshot and Clang 23.1.5"
         },
         {
           "measured_s": 78.0,
-          "name": "Packed vector relations against GCC 16 and Clang 23.1.4"
+          "name": "Packed vector relations against GCC 16 and Clang 23.1.5"
         },
         {
           "measured_s": 21.0,

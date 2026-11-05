@@ -6,7 +6,7 @@
 # constant untouched, at the arm's *storage* type. `1 ? -1 : 1u` then kept the
 # sign of `-1`, so `(unsigned long long)(1 ? -1 : 1u)` printed
 # 18446744073709551615 and `(long long)(...)` printed -1; gcc-16.2 and
-# clang-23.1.4 both print 4294967295, because the conditional is an
+# clang-23.1.5 both print 4294967295, because the conditional is an
 # `unsigned int` whose value is 4294967295. The same fold feeds sema's constant
 # values, so the defect was visible in `_Static_assert` and array bounds too.
 set -euo pipefail

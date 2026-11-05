@@ -129,8 +129,8 @@ def main():
     parser.add_argument("--qemu-dir", type=Path, default=Path("/usr/bin"))
     args = parser.parse_args()
     version = subprocess.check_output([args.clang, "-dumpversion"], text=True).strip()
-    if version != "23.1.4":
-        parser.error(f"Clang 23.1.4 required, found {version}")
+    if version != "23.1.5":
+        parser.error(f"Clang 23.1.5 required, found {version}")
     resource = subprocess.check_output([args.clang, "-print-resource-dir"], text=True).strip()
     count = 0
     with tempfile.TemporaryDirectory(prefix="switch-cross-") as directory:

@@ -33,7 +33,7 @@ def main():
     rust = rustc.parent.parent
     clang = Path(os.environ["LCCC_CLANG_ORACLE_PREFIX"]).resolve()
     assert run(str(rustc), "--version").split()[1] == "1.99.1"
-    assert run(str(clang / "bin/clang"), "-dumpversion") == "23.1.4"
+    assert run(str(clang / "bin/clang"), "-dumpversion") == "23.1.5"
     if subprocess.run(["gh", "release", "view", TAG, "--repo", REPO],
                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
         subprocess.run(["gh", "release", "create", TAG, "--verify-tag", "--repo", REPO,
@@ -42,7 +42,7 @@ def main():
     lock = {"schema": 1, "repository": REPO, "tag": TAG, "tools": {}}
     for name, version, root, binary, arguments in (
         ("rust", "1.99.1", rust, "bin/rustc", ["--version"]),
-        ("clang", "23.1.4", clang, "bin/clang", ["-dumpversion"]),
+        ("clang", "23.1.5", clang, "bin/clang", ["-dumpversion"]),
     ):
         archive = output / f"{name}-{version}.tar.xz"
         subprocess.run(["tar", "--sort=name", "--mtime=@0", "--owner=0", "--group=0",

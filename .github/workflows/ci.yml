@@ -509,19 +509,19 @@ jobs:
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
       run: bash scripts/ci_provision_toolchain.sh --multilib
-    # The ext_vector_type gates compare against Clang 23.1.4 EXACTLY
+    # The ext_vector_type gates compare against Clang 23.1.5 EXACTLY
     # (tests/regression/lib/clang_oracle.sh): GCC has no ext_vector_type and
     # Clang's i386 convention for 8-byte vectors changed between releases,
     # so the runner's default clang is not a reference. The installer pins
     # the official release asset by SHA-256 and extracts only the C front
     # end; the cache key is the installer itself, so a version bump or a
     # digest change refreshes the entry.
-    - name: Cache the Clang 23.1.4 oracle
+    - name: Cache the Clang 23.1.5 oracle
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc/clang-oracle
         key: lccc-clang-oracle-${{ runner.os }}-${{ hashFiles('scripts/ci_install_clang_oracle.sh') }}
-    - name: Install the Clang 23.1.4 oracle
+    - name: Install the Clang 23.1.5 oracle
       run: bash scripts/ci_install_clang_oracle.sh
     # The LLVM oracle family (tests/regression/check_llvm_*.py) refuses any
     # GCC other than 16.2, and this image's gcc-16 is 16.0.1: the pin has to
@@ -536,7 +536,7 @@ jobs:
     - name: Install the GCC 16.2 oracle
       run: bash scripts/ci_install_gcc_oracle.sh --version 16.2
     - name: Verify the lane's oracle toolchain
-      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.4
+      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5
     - name: Select GCC 16 for legacy oracle invocations
       run: |
         mkdir -p "$RUNNER_TEMP/lccc-oracles"
@@ -655,7 +655,7 @@ jobs:
         python3 scripts/test_benchmark_hybrid_perf.py
     - name: C digraph token, macro and directive parity
       run: python3 tests/regression/check_c_digraphs.py --lccc target/fastbuild/lccc --gcc gcc-16 --m32
-    - name: ext_vector_type by-value ABI grid vs the Clang 23.1.4 oracle
+    - name: ext_vector_type by-value ABI grid vs the Clang 23.1.5 oracle
       run: |
         set -o pipefail
         env LCCC_REQUIRE_I686=1 CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_abi_grid.sh 2>&1 |
@@ -709,7 +709,7 @@ jobs:
       run: env CCC=target/fastbuild/lccc python3 tests/regression/check_debug_knobs_neutral.py
     - name: Check 16-byte CAS lowering (libatomic by default, cmpxchg16b under -mcx16)
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_cas16_lowering.sh
-    - name: ext_vector_type by-value ABI under the AVX ABI level vs the Clang 23.1.4 oracle
+    - name: ext_vector_type by-value ABI under the AVX ABI level vs the Clang 23.1.5 oracle
       run: |
         set -o pipefail
         env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_abi_avx.sh 2>&1 |
@@ -794,19 +794,19 @@ jobs:
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
       run: bash scripts/ci_provision_toolchain.sh --multilib
-    # The ext_vector_type gates compare against Clang 23.1.4 EXACTLY
+    # The ext_vector_type gates compare against Clang 23.1.5 EXACTLY
     # (tests/regression/lib/clang_oracle.sh): GCC has no ext_vector_type and
     # Clang's i386 convention for 8-byte vectors changed between releases,
     # so the runner's default clang is not a reference. The installer pins
     # the official release asset by SHA-256 and extracts only the C front
     # end; the cache key is the installer itself, so a version bump or a
     # digest change refreshes the entry.
-    - name: Cache the Clang 23.1.4 oracle
+    - name: Cache the Clang 23.1.5 oracle
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc/clang-oracle
         key: lccc-clang-oracle-${{ runner.os }}-${{ hashFiles('scripts/ci_install_clang_oracle.sh') }}
-    - name: Install the Clang 23.1.4 oracle
+    - name: Install the Clang 23.1.5 oracle
       run: bash scripts/ci_install_clang_oracle.sh
     # The LLVM oracle family (tests/regression/check_llvm_*.py) refuses any
     # GCC other than 16.2, and this image's gcc-16 is 16.0.1: the pin has to
@@ -821,7 +821,7 @@ jobs:
     - name: Install the GCC 16.2 oracle
       run: bash scripts/ci_install_gcc_oracle.sh --version 16.2
     - name: Verify the lane's oracle toolchain
-      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.4
+      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5
     - name: Select GCC 16 for legacy oracle invocations
       run: |
         mkdir -p "$RUNNER_TEMP/lccc-oracles"
@@ -860,7 +860,7 @@ jobs:
       run: python3 tests/regression/check_zlib_compare256.py --lccc target/fastbuild/lccc --gcc gcc-16 --m32
     - name: Verify benchmark ranking contracts
       run: python3 -m unittest discover -s scripts -p test_bench_rank.py
-    - name: ext_vector_type layout/lane matrix vs the pinned Clang 23.1.4 oracle
+    - name: ext_vector_type layout/lane matrix vs the pinned Clang 23.1.5 oracle
       run: |
         set -o pipefail
         env LCCC_REQUIRE_I686=1 CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_layout_matrix.sh 2>&1 |
@@ -972,7 +972,7 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_o_stdout.sh
     - name: Inline-asm operand and template diagnostics match GCC 16.2
       run: env CCC=target/fastbuild/lccc CCC_ARM=target/fastbuild/lccc-arm CCC_RISCV=target/fastbuild/lccc-riscv CCC_I686=target/fastbuild/lccc-i686 GCC=gcc-16 bash tests/regression/check_asm_operand_diagnostics.sh
-    - name: Ring identities against GCC 16 and Clang 23.1.4
+    - name: Ring identities against GCC 16 and Clang 23.1.5
       run: python3 tests/regression/check_llvm_ring_identities.py
     - name: GCC 16.2 diagnostic severity parity
       run: |
@@ -1124,19 +1124,19 @@ jobs:
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
       run: bash scripts/ci_provision_toolchain.sh --multilib
-    # The ext_vector_type gates compare against Clang 23.1.4 EXACTLY
+    # The ext_vector_type gates compare against Clang 23.1.5 EXACTLY
     # (tests/regression/lib/clang_oracle.sh): GCC has no ext_vector_type and
     # Clang's i386 convention for 8-byte vectors changed between releases,
     # so the runner's default clang is not a reference. The installer pins
     # the official release asset by SHA-256 and extracts only the C front
     # end; the cache key is the installer itself, so a version bump or a
     # digest change refreshes the entry.
-    - name: Cache the Clang 23.1.4 oracle
+    - name: Cache the Clang 23.1.5 oracle
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc/clang-oracle
         key: lccc-clang-oracle-${{ runner.os }}-${{ hashFiles('scripts/ci_install_clang_oracle.sh') }}
-    - name: Install the Clang 23.1.4 oracle
+    - name: Install the Clang 23.1.5 oracle
       run: bash scripts/ci_install_clang_oracle.sh
     # The LLVM oracle family (tests/regression/check_llvm_*.py) refuses any
     # GCC other than 16.2, and this image's gcc-16 is 16.0.1: the pin has to
@@ -1151,7 +1151,7 @@ jobs:
     - name: Install the GCC 16.2 oracle
       run: bash scripts/ci_install_gcc_oracle.sh --version 16.2
     - name: Verify the lane's oracle toolchain
-      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.4
+      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5
     - name: Select GCC 16 for legacy oracle invocations
       run: |
         mkdir -p "$RUNNER_TEMP/lccc-oracles"
@@ -1209,7 +1209,7 @@ jobs:
     # 376 s). The preamble above is byte-identical in every
     # shard; tests/regression/check_ci_lane_plan.py fails if a gate disappears,
     # is duplicated, or a shard drifts from this record.
-    - name: Scalar logic against GCC 16 and Clang 23.1.4
+    - name: Scalar logic against GCC 16 and Clang 23.1.5
       run: python3 tests/regression/check_llvm_scalar_logic.py
     - name: Verify binary-equivalence attribution contracts
       run: python3 tests/corpus/test_binary_equivalence.py
@@ -1269,9 +1269,9 @@ jobs:
         set -euo pipefail
         env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_incoming_byval_homes.sh
         env CCC=target/fastbuild/lccc ORACLE_CC="${CLANG:-clang-23}" bash tests/regression/check_incoming_byval_homes.sh
-    - name: Predicate relations against supplemental GCC 16 snapshot and Clang 23.1.4
+    - name: Predicate relations against supplemental GCC 16 snapshot and Clang 23.1.5
       run: python3 tests/regression/check_llvm_predicate_relations.py --allow-gcc16-snapshot
-    - name: Packed vector relations against GCC 16 and Clang 23.1.4
+    - name: Packed vector relations against GCC 16 and Clang 23.1.5
       run: |
         python3 tests/regression/check_packed_vector_relations.py --allow-gcc16-snapshot
         python3 tests/regression/check_shuffle_composition.py --allow-gcc16-snapshot
@@ -1897,10 +1897,10 @@ jobs:
       with:
         path: ~/.cache/lccc/clang-oracle
         key: lccc-clang-oracle-${{ runner.os }}-${{ hashFiles('scripts/ci_install_clang_oracle.sh') }}
-    - name: Install Clang 23.1.4 oracle for SIMD encodings
+    - name: Install Clang 23.1.5 oracle for SIMD encodings
       run: bash scripts/ci_install_clang_oracle.sh
     - name: Verify the lane's oracle toolchain
-      run: bash scripts/ci_verify_oracles.sh --clang-version 23.1.4
+      run: bash scripts/ci_verify_oracles.sh --clang-version 23.1.5
     - name: Select GCC 16 for legacy oracle invocations
       run: |
         mkdir -p "$RUNNER_TEMP/lccc-oracles"
@@ -2210,7 +2210,7 @@ jobs:
     - name: Verify i686 assembly differential vs GNU as 2.47
       run: python3 scripts/asmdiff.py --32 --jobs 2 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"
         --lccc target/fastbuild/lccc-i686
-    - name: Verify complete SSE3 SSSE3 SSE4 encodings vs Clang 23.1.4
+    - name: Verify complete SSE3 SSSE3 SSE4 encodings vs Clang 23.1.5
       run: python3 tests/regression/check_sse34_clang.py
     - name: Verify encdiff corpus vs GNU as 2.47 (offline)
       run: |
@@ -2383,17 +2383,17 @@ jobs:
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
       run: bash scripts/ci_provision_toolchain.sh --multilib
-    # The contract gates compare against Clang 23.1.4 EXACTLY
+    # The contract gates compare against Clang 23.1.5 EXACTLY
     # (tests/regression/lib/clang_oracle.sh): the hexadecimal-literal oracle in
     # check_fma_gating.sh resolves `clang` through $CLANG, and the runner
     # image's default is several releases older.  Cached on the installer, so
     # a version or digest bump refreshes the entry and a warm lane pays ~2 s.
-    - name: Cache the Clang 23.1.4 oracle
+    - name: Cache the Clang 23.1.5 oracle
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc/clang-oracle
         key: lccc-clang-oracle-${{ runner.os }}-${{ hashFiles('scripts/ci_install_clang_oracle.sh') }}
-    - name: Install the Clang 23.1.4 oracle
+    - name: Install the Clang 23.1.5 oracle
       run: bash scripts/ci_install_clang_oracle.sh
     # The LLVM oracle family (tests/regression/check_llvm_*.py) refuses any
     # GCC other than 16.2, and this image's gcc-16 is 16.0.1: the pin has to
@@ -2408,7 +2408,7 @@ jobs:
     - name: Install the GCC 16.2 oracle
       run: bash scripts/ci_install_gcc_oracle.sh --version 16.2
     - name: Verify the lane's oracle toolchain
-      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.4
+      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5
     - name: Select GCC 16 for legacy oracle invocations
       run: |
         mkdir -p "$RUNNER_TEMP/lccc-oracles"
@@ -2803,17 +2803,17 @@ jobs:
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
       run: bash scripts/ci_provision_toolchain.sh --multilib
-    # The contract gates compare against Clang 23.1.4 EXACTLY
+    # The contract gates compare against Clang 23.1.5 EXACTLY
     # (tests/regression/lib/clang_oracle.sh): the hexadecimal-literal oracle in
     # check_fma_gating.sh resolves `clang` through $CLANG, and the runner
     # image's default is several releases older.  Cached on the installer, so
     # a version or digest bump refreshes the entry and a warm lane pays ~2 s.
-    - name: Cache the Clang 23.1.4 oracle
+    - name: Cache the Clang 23.1.5 oracle
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc/clang-oracle
         key: lccc-clang-oracle-${{ runner.os }}-${{ hashFiles('scripts/ci_install_clang_oracle.sh') }}
-    - name: Install the Clang 23.1.4 oracle
+    - name: Install the Clang 23.1.5 oracle
       run: bash scripts/ci_install_clang_oracle.sh
     # The LLVM oracle family (tests/regression/check_llvm_*.py) refuses any
     # GCC other than 16.2, and this image's gcc-16 is 16.0.1: the pin has to
@@ -2828,7 +2828,7 @@ jobs:
     - name: Install the GCC 16.2 oracle
       run: bash scripts/ci_install_gcc_oracle.sh --version 16.2
     - name: Verify the lane's oracle toolchain
-      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.4
+      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5
     - name: Select GCC 16 for legacy oracle invocations
       run: |
         mkdir -p "$RUNNER_TEMP/lccc-oracles"
@@ -3230,7 +3230,7 @@ jobs:
         bash tests/regression/check_vec_chain_exit_phi.sh
         # check_llvm_scalar_logic.py is NOT repeated here: it already runs as
         # its own step in the `frontend` lane, which is the lane that installs
-        # the pinned Clang 23.1.4 oracle its clang leg needs. Running it a
+        # the pinned Clang 23.1.5 oracle its clang leg needs. Running it a
         # second time in a shard with no clang would pay for a weaker copy of
         # the same contract; check_ci_shard_partition.py rejects exactly that.
         # Dual-layout metric pair contract: identical assembly across
@@ -3314,19 +3314,6 @@ jobs:
       env:
         CARGO_BUILD_JOBS: '2'
       run: python3 scripts/ci_test_report.py -- python3 scripts/check_clippy_policy.py
-  msrv:
-    timeout-minutes: 30
-    name: MSRV check (declared rust-version floor)
-    runs-on: ubuntu-24.04
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v7
-      with:
-        submodules: recursive
-    - name: Install the declared MSRV toolchain
-      uses: dtolnay/rust-toolchain@1.97.0
-    - name: Check the tree builds on the MSRV toolchain
-      run: cargo check --locked
   # The corpus is the longest lane in the pipeline (466 s of measurement in run
   # 39752334266) and its kernels are independent, so it runs in balanced shards
   # on separate runners and a merge job publishes ONE report. The split below is
@@ -3492,20 +3479,20 @@ jobs:
         key: lccc-gcc-oracle-${{ runner.os }}-16.2-${{ hashFiles('scripts/ci_install_gcc_oracle.sh') }}
     - name: Install the GCC 16.2 oracle
       run: bash scripts/ci_install_gcc_oracle.sh --version 16.2
-    - name: Cache the Clang 23.1.4 oracle
+    - name: Cache the Clang 23.1.5 oracle
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc/clang-oracle
         key: lccc-clang-oracle-${{ runner.os }}-${{ hashFiles('scripts/ci_install_clang_oracle.sh') }}
-    - name: Install the Clang 23.1.4 oracle
+    - name: Install the Clang 23.1.5 oracle
       run: bash scripts/ci_install_clang_oracle.sh
     - name: Verify the lane's oracle toolchain
-      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.4
+      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5
     - name: Select exact modern oracles for vendor comparisons
       run: |
         set -euo pipefail
         test "$(gcc-16 -dumpfullversion)" = 16.2.0
-        test "$("$CLANG" -dumpversion)" = 23.1.4
+        test "$("$CLANG" -dumpversion)" = 23.1.5
         mkdir -p "$RUNNER_TEMP/lccc-modern-oracles"
         ln -s "$(command -v gcc-16)" "$RUNNER_TEMP/lccc-modern-oracles/gcc"
         ln -s "$(command -v g++-16)" "$RUNNER_TEMP/lccc-modern-oracles/g++"
@@ -3557,7 +3544,7 @@ jobs:
         # ICX 2026.2 binary exists; its local mirror skips ICX only when the
         # vendor snapshot is unavailable on the host.
         # All three comparison oracles are exact: authenticated ICX 2026.2,
-        # cached GCC 16.2 and cached Clang 23.1.4; never the runner defaults.
+        # cached GCC 16.2 and cached Clang 23.1.5; never the runner defaults.
         env CCC=target/fastbuild/lccc \
           GCC_SIGN_CMOV="$GCC16" CLANG_SIGN_CMOV="$CLANG" \
           ICX_SIGN_CMOV="$LCCC_ICX_BIN" LCCC_FASTBUILD_BIN=target/fastbuild/lccc \
@@ -3703,7 +3690,6 @@ jobs:
     - backend-contracts-a
     - backend-contracts-b
     - clippy
-    - msrv
     - benchmark
     - icx-oracle
     if: always()

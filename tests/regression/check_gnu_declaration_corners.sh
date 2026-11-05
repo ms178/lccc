@@ -142,7 +142,7 @@ fi
 # ── `__attribute__((mode(M)))` on a POINTER typedef ───────────────────────
 # gcc 16.2: `mode(SI)` is a no-op on a 32-bit target (SI = pointer mode) and
 # an ERROR "invalid pointer mode 'SI'" on x86-64; `mode(DI)` is the 64-bit
-# spelling.  Clang 23.1.4 rejects pointer modes altogether, so GCC is the
+# spelling.  Clang 23.1.5 rejects pointer modes altogether, so GCC is the
 # oracle.  gcc.c-torture/compile/20111209-1.c is accepted by GCC on i686.
 cat >"$tmp/case.c" <<'C'
 typedef char* P __attribute__((mode(SI)));
@@ -272,7 +272,7 @@ check "gcc 16.2 mode(M) differential on both ABIs (2x${#mode_shapes[@]} shapes)"
 #     for another `(` outside, found none, rewound, and `extract_paren_name`
 #     left the parameter list unconsumed: "expected ')' before '('".
 #  2. TYPING (found by red-teaming the first fix). Acceptance parity alone
-#     was NOT enough: GCC 16.2 and Clang 23.1.4 type `int (* const (p)(int))`
+#     was NOT enough: GCC 16.2 and Clang 23.1.5 type `int (* const (p)(int))`
 #     as `int *const (*)(int)` -- the stars and their qualifiers bind to the
 #     function's RETURN type, and C11 6.7.6.3p8 adjusts the function-typed
 #     parameter to a pointer. The first fix produced `int (*const)(int)`,
@@ -289,7 +289,7 @@ check "gcc 16.2 mode(M) differential on both ABIs (2x${#mode_shapes[@]} shapes)"
 #          Repeated at -O0/-O1/-O2/-O3 so no optimisation level can hide a
 #          lowering bug. Assert lccc emits NO diagnostic for these fixtures.
 #
-# Oracles: the contracted GCC 16.2, Clang 23.1.4 when installed, and ICX
+# Oracles: the contracted GCC 16.2, Clang 23.1.5 when installed, and ICX
 # 2026.2 when installed. A missing optional oracle is REPORTED, never
 # silently treated as agreement (no claim is made for a compiler not run).
 # ---------------------------------------------------------------------------
@@ -494,7 +494,7 @@ check "K&R host-CPU execution + oracle control ($rt_checks checks, -O0..-O3, zer
 # D. Array-derivation constraints -- C11 6.7.6.3p7 / 6.7.6.2p4 / 6.7.6.3p1.
 #
 # Red-teaming Section C's array-qualifier check found FOUR classes of real
-# divergence against GCC 16.2 and Clang 23.1.4 (75-shape differential probe; 86 shapes pinned in this gate):
+# divergence against GCC 16.2 and Clang 23.1.5 (75-shape differential probe; 86 shapes pinned in this gate):
 #
 #  1. The check keyed on "is this a function pointer" instead of "is this
 #     the parameter's OUTERMOST array derivation". Quals in a LATER dimension
@@ -521,7 +521,7 @@ check "K&R host-CPU execution + oracle control ($rt_checks checks, -O0..-O3, zer
 d_oracles=("$GCC")
 d_names=("gcc 16.2")
 if command -v "$CLANG" >/dev/null 2>&1; then
-    d_oracles+=("$CLANG"); d_names+=("clang 23.1.4")
+    d_oracles+=("$CLANG"); d_names+=("clang 23.1.5")
 else
     printf 'D oracle note: Clang not installed; no Clang result claimed.\n'
 fi
@@ -670,7 +670,7 @@ printf 'D layer 1: %d declarator shapes x 2 ABIs x %d oracles = %d verdict compa
 check "D array-derivation verdict parity: ${#d_shapes[@]} shapes x 2 ABIs ($d_checks comparisons)" "$d_bad"
 
 # Layer 2: lccc must not merely reject -- it must name the violated
-# constraint. Exact wording is pinned to GCC 16.2 / Clang 23.1.4.
+# constraint. Exact wording is pinned to GCC 16.2 / Clang 23.1.5.
 d_msg_bad=0
 for pair in "${d_msgs[@]}"; do
     src=${pair%%|*}; needle=${pair#*|}

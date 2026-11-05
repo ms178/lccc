@@ -2,7 +2,7 @@
 """Is every package in the tag hash cache still the latest public release?
 
 The repository's oracle toolchains arrive through the transport tags
-(`harness-cache-1/2/3/4`, `rust-cache-1.97.0`), the reviewed
+(`harness-cache-1/2/3/4`), the reviewed
 content-addressed release assets (`engineering/toolchains/cache-lock.json`
 on the `harness-cache-4` release) and a set of digest-pinned upstream
 installers that replaced individual stale tag payloads.  A pin only
@@ -19,13 +19,14 @@ What this tool does
 Offline (`--offline`, no network, what the unit tests run):
     Reads the pinned version out of every file that states one —
     the tag restorer, each installer, the cache lock, the kernel
-    tools, the QEMU/ARM/ICX/Valgrind provisioners, the MSRV floor —
+    tools, the QEMU/ARM/ICX/Valgrind provisioners —
     and fails if any two files disagree about the same package.
     This is the check that makes a version bump a *complete* bump.
 
 Online (default):
     Additionally asks each upstream for its latest public release
-    (GitHub release APIs, ftp.gnu.org / sourceware listings,
+    (GitHub release APIs, ftp.gnu.org / sourceware listings (GCC, binutils,
+    GDB, Valgrind),
     kernel.org's releases.json, Arm's permalink catalogue, Intel's
     oneAPI APT index, download.qemu.org) and fails with STALE for
     every pin that is no longer the latest.  For mold and LLVM it
@@ -34,11 +35,24 @@ Online (default):
     even when the version string does not move.
 
 Intentional exceptions are reported as INFO, never silently skipped:
-    * `rust-cache-1.97.0` is the deliberate MSRV floor
-      (Cargo.toml `rust-version`); it must stay behind by design.
+    * the published `harness-cache-7` tag still packs QEMU user 11.1.2 and
+      the v7.3 kernel relocs tool, while the tree re-pinned 11.1.3 and
+      v7.3.1 on 2026-11-05 (scripts/ensure_qemu_user.sh and
+      tests/linker/setup_kernel_tools.sh). Both recorded versions are
+      ASSERTED for the same self-retiring reason as the Clang payloads
+      below: republishing the cache breaks the assertion and forces the
+      exception to be removed.
     * the `harness-cache-4` git tree's Clang 23.1.3 is a historical
-      transport payload, superseded by the 23.1.4 release asset;
-      nothing may restore from it (guarded in the offline checks).
+      transport payload; nothing may restore from it (guarded below).
+    * the `harness-cache-4` release ASSET and the `harness-cache-7` tag
+      payload both still carry a repacked Clang 23.1.4. A main-branch patch
+      cannot re-issue a published asset or a tag blob, so the live pin moved
+      to 23.1.5 (scripts/ci_install_clang_oracle.sh, the official LLVM asset
+      pinned by GitHub's own digest) and those two payloads are recorded as
+      superseded. Their recorded version is ASSERTED, not merely noted: when
+      the hosted publishers re-issue them at 23.1.5 the assertion stops
+      matching and forces the exception to be retired, so the note cannot
+      outlive the staleness it describes.
     * `debs-bookworm.tar.xz` is a compatibility snapshot of Debian
       bookworm for the bookworm-built GCC prefix; "latest" for it
       means the latest bookworm point versions (checked against
@@ -101,10 +115,25 @@ def read_pins():
         "icx": _one("scripts/icx_provision.py", r'^RELEASE = "([0-9.]+)"$', "ICX RELEASE"),
         "valgrind": _one("scripts/ci_install_valgrind_current.sh",
                          r"^version=([0-9.]+)$", "valgrind version"),
-        "rust-msrv": _one("Cargo.toml", r'^rust-version = "([0-9.]+)"$', "rust-version"),
+        "gdb": _one("scripts/ci_install_gdb_oracle.sh",
+                    r"^GDB_VERSION=([0-9.]+)$", "GDB_VERSION"),
         # Tag-tree facts (payloads live in the transport tags, digests in
         # each tag's MANIFEST.sha256; last verified 2026-10-27):
         "clang-tag-tree": "23.1.3",     # harness-cache-4 tree (historical)
+        # Superseded Clang transport payloads: PUBLISHED BYTES, which a
+        # main-branch patch cannot re-issue. The live pin is 23.1.5; these two
+        # stay 23.1.4 until the hosted cache job runs again. Asserting the
+        # value (rather than skipping the files) is what makes the exception
+        # retire itself the moment the payloads are re-published.
+        "clang-cache-asset": "23.1.4",    # harness-cache-4 release asset
+        "clang-agent-payload": "23.1.4",  # harness-cache-7 tag payload
+        # Same supersession, recorded 2026-11-05 when the tree re-pinned QEMU
+        # 11.1.2 -> 11.1.3 (scripts/ensure_qemu_user.sh) and the kernel relocs
+        # sources v7.3 -> v7.3.1 (tests/linker/setup_kernel_tools.sh, whose six
+        # digests are byte-identical across the two tags). The published
+        # harness-cache-7 tag still packs the older pair.
+        "qemu-agent-payload": "11.1.2",           # harness-cache-7 tag payload
+        "kernel-relocs-agent-payload": "7.3",     # harness-cache-7 tag payload
         "debs-bookworm-libc": "2.36-9+deb12u14",
         "debs-bookworm-gcc12": "12.2.0-14+deb12u1",
     }
@@ -142,8 +171,13 @@ def offline_problems(pins):
             expect(tool, version, "restore_toolchain_cache.py VERSIONS")
 
     lock = json.loads(_read("engineering/toolchains/cache-lock.json"))
+    # One lock entry is deliberately NOT the canonical pin: clang. Its pin
+    # moved to the digest-pinned upstream installer, and this asset cannot be
+    # re-issued from a patch, so it is checked against the superseded-payload
+    # fact instead -- a re-published 23.1.5 asset then fails here on purpose.
+    lock_pin = {"clang": "clang-cache-asset"}
     for tool, entry in lock["tools"].items():
-        expect(tool, entry["version"], "cache-lock.json")
+        expect(lock_pin.get(tool, tool), entry["version"], "cache-lock.json")
         asset = lock["tools"][tool]["url"].rsplit("/", 1)[-1]
         want = f"{tool}-{entry['version']}-{entry['sha256']}.tar.xz"
         if asset != want:
@@ -175,16 +209,62 @@ def offline_problems(pins):
         if agent.get('tag') != 'harness-cache-7':
             problems.append(f"agent-cache-lock.json names tag {agent.get('tag')!r}, expected 'harness-cache-7'")
         tools = agent.get('tools', {})
-        for package in ('gcc', 'binutils', 'clang', 'rust', 'mold', 'qemu',
-                        'kernel-relocs', 'arm-a64-xml', 'rust-msrv'):
+        for package in ('gcc', 'binutils', 'rust', 'mold', 'arm-a64-xml'):
             entry = tools.get(package)
             if not entry:
                 problems.append(f'agent-cache-lock.json has no {package} entry')
                 continue
             expect(package, entry.get('version', ''), 'agent-cache-lock.json')
+        # Three agent payloads describe what the PUBLISHED harness-cache-7 tag
+        # contains rather than what the tree currently pins, so each is checked
+        # against an asserted superseded value instead of the live pin. A patch
+        # cannot re-issue a published tag; the assertion makes that gap visible
+        # and retires itself the moment the cache is republished.
+        #   clang         superseded 23.1.4 payload (live pin 23.1.5)
+        #   qemu          superseded 11.1.2 payload (live pin 11.1.3,
+        #                 re-pinned 2026-11-05)
+        #   kernel-relocs superseded v7.3 payload (live pin v7.3.1,
+        #                 re-pinned 2026-11-05)
+        for package, fact in (('clang', 'clang-agent-payload'),
+                              ('qemu', 'qemu-agent-payload'),
+                              ('kernel-relocs', 'kernel-relocs-agent-payload')):
+            entry = tools.get(package)
+            if not entry:
+                problems.append(f'agent-cache-lock.json has no {package} entry')
+            else:
+                expect(fact, entry.get('version', ''), 'agent-cache-lock.json')
         for field in ('tag_sha', 'commit_sha', 'tree_sha', 'cache_json_sha256'):
             if not agent.get(field):
                 problems.append(f'agent-cache-lock.json has no {field}')
+
+    # gdb is pinned in one file, so the offline half checks the parts of the
+    # contract that are easy to lose silently: a 64-hex digest, and CFLAGS that
+    # really name the pinned ISA level. The owner's build preference is
+    # -march=haswell, and a generic-baseline gdb would pass a version probe
+    # while being a different binary from the one this project debugs with.
+    gdb_sha = _one("scripts/ci_install_gdb_oracle.sh", r"^GDB_SHA256=([0-9a-f]{64})$", "GDB_SHA256")
+    if not re.fullmatch(r"[0-9a-f]{64}", gdb_sha):
+        problems.append("gdb: GDB_SHA256 is not a SHA-256 digest")
+    gdb_march = _one("scripts/ci_install_gdb_oracle.sh", r"^GDB_MARCH=(\S+)$", "GDB_MARCH")
+    # The installer states the flags with the shell variable, so resolve it
+    # before checking: what matters is the effective -march the build gets.
+    gdb_cflags = _one("scripts/ci_install_gdb_oracle.sh", r'^GDB_CFLAGS="([^"]+)"$', "GDB_CFLAGS")
+    gdb_cflags = gdb_cflags.replace("${GDB_MARCH}", gdb_march).replace("$GDB_MARCH", gdb_march)
+    if f"-march={gdb_march}" not in gdb_cflags:
+        problems.append(f"gdb: GDB_CFLAGS {gdb_cflags!r} does not pin -march={gdb_march}")
+    if gdb_march != "haswell":
+        problems.append(f"gdb: GDB_MARCH is {gdb_march!r}; the project builds its oracles for haswell")
+    expect("gdb", _one("scripts/oracle_toolchains_from_tags.sh",
+                       r"^GDB_VERSION=([0-9.]+)$", "GDB_VERSION"),
+           "oracle_toolchains_from_tags.sh")
+
+    # The superseded Clang payloads must have no live consumer left.
+    if re.search(r"'clang'\s*:", _read("scripts/restore_toolchain_cache.py")):
+        problems.append("restore_toolchain_cache.py: still restores clang from the "
+                        "superseded harness-cache-4 asset (the pin is the upstream installer)")
+    if "CLANG_BLOB" in _read("scripts/arena_provision.py"):
+        problems.append("arena_provision.py: still restores clang from the superseded "
+                        "harness-cache-7 blob (the pin is the upstream installer)")
 
     # Nothing may restore Clang from the historical 23.1.3 tag tree or
     # mold from the superseded 2.42.1 tag binary any more.
@@ -194,6 +274,31 @@ def offline_problems(pins):
         for stale in ("clang-23.1.3", "mold-2.42.1-x86_64.part00", "86b918f8af9444"):
             if stale in text:
                 problems.append(f"{rel}: still references superseded payload {stale}")
+
+    # The 1.97.0 MSRV floor was retired on 2026-11-05: the project tracks
+    # current Rust so new language features are usable as they land, and a
+    # CI-policed floor is a promise to keep old syntax compiling. This is the
+    # durable half of that decision -- it fails if a `rust-version` key comes
+    # back, or if any live script, workflow or cache lock still reaches for the
+    # 1.97.0 toolchain. Dated evidence and engineering reports are not scanned;
+    # they record what was true then.
+    if re.search(r'^rust-version\s*=', _read("Cargo.toml"), re.M):
+        problems.append("Cargo.toml declares a rust-version floor again "
+                        "(the MSRV floor was retired on 2026-11-05)")
+    for rel in ("scripts/ci_local.sh",
+                "scripts/publish_agent_toolchain_cache.sh",
+                "scripts/restore_agent_toolchain_cache.py",
+                "scripts/restore_toolchain_cache.py",
+                ".github/workflows/ci.yml",
+                "engineering/toolchains/agent-cache-lock.json",
+                "engineering/toolchains/cache-lock.json"):
+        text = _read(rel)
+        hits = [n for n in ("rust-cache-1.97.0", "rust-1.97.0-msrv",
+                            "LCCC_MSRV_TOOLCHAIN", "msrv_check_gate",
+                            "cargo +1.97.0", "rust-toolchain@1.97.0",
+                            '"rust-msrv"') if n in text]
+        if hits:
+            problems.append(f"{rel}: retired MSRV floor referenced ({', '.join(hits)})")
     return problems
 
 
@@ -218,6 +323,11 @@ def parse_binutils_listing(text):
 
 def parse_qemu_listing(text):
     versions = {m for m in re.findall(r"qemu-([0-9]+\.[0-9]+\.[0-9]+)\.tar\.xz", text)}
+    return max(versions, key=vtuple)
+
+
+def parse_gdb_listing(text):
+    versions = {m for m in re.findall(r"gdb-([0-9]+\.[0-9]+(?:\.[0-9]+)?)\.tar\.xz", text)}
     return max(versions, key=vtuple)
 
 
@@ -358,6 +468,14 @@ def upstream_latest(pins):
             _fetch("https://sourceware.org/pub/valgrind/").decode("utf-8", "ignore")),
             "sourceware.org/pub/valgrind/"))
 
+    def gdb():
+        # GNU publishes no checksum for gdb tarballs, only a detached .sig, so
+        # staleness comes from the release listing; the digest itself is pinned
+        # in the installer and cross-verified against both GNU mirrors.
+        rows.append(("gdb", parse_gdb_listing(
+            _fetch("https://sourceware.org/pub/gdb/releases/").decode("utf-8", "ignore")),
+            "sourceware.org/pub/gdb/releases/"))
+
     def icx():
         rows.append(("icx", parse_icx_packages(_fetch(
             "https://apt.repos.intel.com/oneapi/dists/all/main/binary-amd64/Packages"
@@ -385,16 +503,22 @@ def upstream_latest(pins):
             rows.append((package, parse_madison(text, "bookworm"),
                          f"Debian madison ({source}, bookworm)"))
 
-    for source in (clang, rust, mold, gcc, binutils, qemu, kernel, valgrind, icx, arm, debs_bookworm):
+    for source in (clang, rust, mold, gcc, binutils, qemu, kernel, valgrind, gdb, icx, arm, debs_bookworm):
         attempt(source)
     return rows
 
 
 INFO_ROWS = (
-    ("rust-msrv", "deliberate MSRV floor (Cargo.toml rust-version); "
-                  "the rust-cache-{v} tag must stay behind current stable by design"),
-    ("clang-tag-tree", "historical harness-cache-4 git-tree payload; superseded by the "
-                       "content-addressed Clang release asset in cache-lock.json"),
+    ("qemu-agent-payload", "superseded qemu 11.1.2 in the published harness-cache-7 tag; "
+                           "scripts/ensure_qemu_user.sh pins 11.1.3 (re-pinned 2026-11-05)"),
+    ("kernel-relocs-agent-payload", "superseded v7.3 relocs in the published tag; "
+                                    "tests/linker/setup_kernel_tools.sh pins v7.3.1"),
+    ("clang-tag-tree", "historical harness-cache-4 git-tree payload; nothing restores from it"),
+    ("clang-cache-asset", "superseded harness-cache-4 release asset (a patch cannot re-issue a "
+                          "published asset); the live Clang pin is the digest-pinned upstream "
+                          "installer, and publish_toolchain_cache.py re-issues this asset"),
+    ("clang-agent-payload", "superseded harness-cache-7 tag payload for the same reason; "
+                            "publish_agent_toolchain_cache.sh re-issues it"),
 )
 
 

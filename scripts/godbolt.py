@@ -94,6 +94,19 @@ COMPILER_ALIASES: dict[str, str] = {
 }
 DEFAULT_ORACLES = ("gcc16.2", "clang", "icc", "icx")
 
+# NOTE ON TWO DIFFERENT CLANG PINS (2026-11-05)
+# ---------------------------------------------
+# This oracle compares against the newest Clang Compiler Explorer *serves*,
+# which is 23.1.0 (`cclang2310`). The repository's own oracle pin -- the one
+# `tests/regression/lib/clang_oracle.sh`, CI and
+# scripts/ci_install_clang_oracle.sh enforce -- is 23.1.5, because CE lags
+# upstream point releases and a local install does not have to. Neither is
+# wrong, but they are not the same binary: a "matches Clang" claim made here
+# is measured against 23.1.0, while a claim made by a regression gate is
+# measured against 23.1.5. Record which one a table came from. `audit` below
+# reports CE's newest, and the local pin is reported by
+# scripts/check_toolchain_cache_freshness.py.
+#
 # Aliases that are supposed to point at the newest available RELEASE of a
 # family (moving channels such as icx-latest / gcc-trunk are excluded: they
 # resolve server-side and are recorded per-run in every manifest instead).

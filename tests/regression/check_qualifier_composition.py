@@ -70,7 +70,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--lccc', action='append', required=True)
     parser.add_argument('--gcc', default='gcc-16')
-    parser.add_argument('--clang', help='optional Clang 23.1.4 semantic oracle')
+    parser.add_argument('--clang', help='optional Clang 23.1.5 semantic oracle')
     parser.add_argument('--icx', help='authenticated ICX 2026.2 semantic oracle')
     parser.add_argument('--vendor-only', action='store_true',
                         help='explicit vendor lane: LCCC contracts plus a required vendor oracle')
@@ -81,8 +81,8 @@ def main():
     compilers = ([gcc] if gcc else []) + [str(Path(cc).resolve()) for cc in args.lccc]
     if args.clang:
         version = subprocess.check_output([args.clang, '-dumpversion'], env=ENV, text=True).strip()
-        if version != '23.1.4':
-            raise SystemExit(f'expected Clang 23.1.4, got {version}')
+        if version != '23.1.5':
+            raise SystemExit(f'expected Clang 23.1.5, got {version}')
     if args.icx:
         version = subprocess.check_output([args.icx, '--version'], env=ENV, text=True,
                                           stderr=subprocess.STDOUT, timeout=20)

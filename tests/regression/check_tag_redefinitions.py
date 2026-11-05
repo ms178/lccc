@@ -90,7 +90,7 @@ def main() -> int:
     parser.add_argument("--gcc", default="gcc-16")
     parser.add_argument("--clang", default="clang-23")
     args = parser.parse_args()
-    compilers = (("LCCC", [args.lccc]), ("GCC 16.2", [args.gcc]), ("Clang 23.1.4", [args.clang]))
+    compilers = (("LCCC", [args.lccc]), ("GCC 16.2", [args.gcc]), ("Clang 23.1.5", [args.clang]))
     failures: list[str] = []
 
     with tempfile.TemporaryDirectory(prefix="lccc-tag-redefinitions-") as directory:

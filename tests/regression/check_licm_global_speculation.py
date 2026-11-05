@@ -4,7 +4,7 @@
 LICM's must-execute rule keeps a load in its loop unless its block
 dominates every loop block.  Before loop rotation even the body block of
 `for (i = 0; i < n; i++) c += G;` fails that test, so LCCC re-read `G` on
-every iteration, while GCC 16.2, Clang 23.1.4 and ICX 2026.2 load it once.
+every iteration, while GCC 16.2, Clang 23.1.5 and ICX 2026.2 load it once.
 A load of a non-weak object symbol, entirely inside the object, cannot
 fault (`passes::licm::speculation_safe_globals`), so the rule is waived for
 it; whether the loop modifies the object is still the memory analysis's

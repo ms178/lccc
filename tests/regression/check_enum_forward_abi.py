@@ -60,8 +60,8 @@ def run(lccc, *, gcc=None, clang=None, require_cross=False, require_icx=False):
     clang_version = subprocess.check_output([*oracles[1], '--version'], text=True, timeout=30)
     if not (gcc_version == '16.2' or gcc_version.startswith('16.2.')):
         raise AssertionError(f'expected GCC 16.2, got {gcc_version}')
-    if not re.search(r'\bclang version 23\.1\.4(?:\s|$)', clang_version):
-        raise AssertionError(f'expected Clang 23.1.4, got {clang_version}')
+    if not re.search(r'\bclang version 23\.1\.5(?:\s|$)', clang_version):
+        raise AssertionError(f'expected Clang 23.1.5, got {clang_version}')
     icx = os.environ.get('LCCC_ICX_BIN') or os.environ.get('ICX')
     if icx:
         icx = shlex.split(icx)

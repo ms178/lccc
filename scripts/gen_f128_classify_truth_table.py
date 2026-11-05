@@ -22,14 +22,14 @@ called the libc `__*l` entry points or fell into the `f64` mask path.
 `__builtin_isfinite(inf)` returned 1 for binary128.
 
 `__builtin_signbit` only has to be non-zero for a negative value (GCC 16.2
-returns 0x08, Clang 23.1.4 0x80, lccc 0x01), so the table stores `signbit != 0`.
+returns 0x08, Clang 23.1.5 0x80, lccc 0x01), so the table stores `signbit != 0`.
 
 Usage::
 
     scripts/gen_f128_classify_truth_table.py           # write the fixture
     scripts/gen_f128_classify_truth_table.py --check    # verify it is current
 
-Clang 23.1.4 does not implement the C23 spelling `_Float128` at all; it can run
+Clang 23.1.5 does not implement the C23 spelling `_Float128` at all; it can run
 this fixture through `__float128` (`sed 's/_Float128/__float128/g'`), which is
 how the three-way check in the campaign report was done.
 """

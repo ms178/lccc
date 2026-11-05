@@ -11,8 +11,8 @@ spec.loader.exec_module(m)
 
 class ClangGate(unittest.TestCase):
     def test_exact_released_version(self):
-        self.assertTrue(m.check_version('clang version 23.1.4 (vendor)'))
-        for bad in ('clang version 23.1.3','clang version 23.1.40','clang version 23.1.4git','gcc version 23.1.4'):
+        self.assertTrue(m.check_version('clang version 23.1.5 (vendor)'))
+        for bad in ('clang version 23.1.3','clang version 23.1.50','clang version 23.1.5git','gcc version 23.1.5'):
             self.assertFalse(m.check_version(bad),bad)
 
     def test_old_version_stops_before_any_assembly(self):
@@ -21,7 +21,7 @@ class ClangGate(unittest.TestCase):
             self.assertEqual(run.call_count,1)
 
     def test_both_modes_and_comparison_failure_are_mandatory(self):
-        version=subprocess.CompletedProcess([],0,'clang version 23.1.4\n','')
+        version=subprocess.CompletedProcess([],0,'clang version 23.1.5\n','')
         for mismatch in (False,True):
             with self.subTest(mismatch=mismatch), patch.object(m.subprocess,'run',return_value=version) as run, patch.object(m.asmdiff,'read_elf',return_value=m.asmdiff.ElfImage()), patch.object(m.asmdiff,'compare',return_value=['different bytes'] if mismatch else []) as compare, patch.object(m.sys,'argv',['gate','--clang','chosen-current-clang']), patch('builtins.print'):
                 if mismatch:
@@ -34,7 +34,7 @@ class ClangGate(unittest.TestCase):
                     self.assertEqual(compare.call_count,2)
 
     def test_assembler_failure_cannot_reach_comparison(self):
-        version=subprocess.CompletedProcess([],0,'clang version 23.1.4\n','')
+        version=subprocess.CompletedProcess([],0,'clang version 23.1.5\n','')
         broken=subprocess.CompletedProcess([],1,'','rejected valid input')
         with patch.object(m.subprocess,'run',side_effect=[version,broken]), patch.object(m.asmdiff,'compare') as compare, patch.object(m.sys,'argv',['gate']), patch('builtins.print'):
             with self.assertRaisesRegex(SystemExit,'rejected valid input'): m.main()
