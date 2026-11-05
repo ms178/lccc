@@ -1022,8 +1022,8 @@ and the oracle is the pinned GCC 16.2 sha `67ed99639f746b8e…c2`.
 |---|---|---|
 | `pr38789.c` at `-O0` only | Two coupled causes, found by re-testing the FIRST fix instead of trusting it: (1) at `-O0` `run_passes` returns before `resolve_remaining_is_constant`, so a deferred `IsConstant` node survived and the condition was a Value, not a constant; (2) `lower_if_stmt` lowers both arms and the pipeline's immediate-only asm validation walked EVERY block, including the arm a constant condition can never reach. GCC 16.2 and Clang 23.1.4 accept at every level; measured GCC answers at `-O0` are `0` for a local `int n = sizeof(int)`, `1` for a literal, `0` for a parameter, and `1` for the local at `-O1+`. The decisive measurement: lccc `if (0) asm("# DEAD") else asm("# LIVE")` at `-O0 -S` emits ONLY `LIVE`, so the dead arm is real IR that is never emitted. | **FIXED with two changes.** `lower_constant_p` resolves unproven queries to `0` at `-O0` only (semantic parity, not an optimization; optimizing tiers keep the deferral kernel patterns need). The pipeline validator now walks CFG reachability from the entry, pruning `CondBranch` on a constant condition to its single live successor and skipping unreachable blocks. A dynamic condition still validates BOTH arms, so no real dynamic immediate operand can hide. `tests/regression/check_gcc_asm_constraints.sh` pins verdict parity at five levels on two ABIs, which asm arm is emitted, and a literal `if (0)` dead-arm control. |
 | `limits-externdecl.c` at `-O2`, `-O3`, `-Os` (3) | All three hit `HARNESS timeout (timeout=240s)`, `returncode 124`; `-O0`/`-O1` passed. Callgrind on a scaled 10,000-declaration input found TWO superlinear scans: `find_symbol_index_shared` linearly scanned the whole symtab for EVERY relocation (~11% of all instructions including its Option/slice/memcmp work), and `purge_ptr_ranges_in` called `Vec::retain` over a growing relocation list 10,001 times (~19%). | **FIXED.** One prebuilt `FxHashMap` of name-offset to symtab index makes relocation lookup O(1); `ptr_ranges` is now kept sorted by offset so the purge is `partition_point` + `drain`, O(log N + K). Both are proven byte-identical in behaviour by deterministic unit tests that compare against the ORIGINAL linear/reference predicates over 1000 randomized windows and every symbol class. |
-| `pr46534.c` at `-O1`, `-O2`, `-O3` (3) | `returncode -9` (SIGKILL) during a concurrently memory-pressured run. This case is a 20,000,000-character string literal. In isolation the `-O2` compile succeeds (`rc=0`) but took ~45 s while the campaign was competing for the same two cores; scaled inputs measured 0.028/0.040/0.097/0.465 s for 200/2000/20000/200000 characters. Callgrind on 20,000 characters shows repeated `core::str::from_utf8` (14.25%) and assembly-line trimming/comment scanning across the giant data line. | **OPEN, measured.** No quiet-host re-measurement and no safe targeted fix were completed. Changing the `from_utf8(&bytes[i..])` char-advance idiom in the assembler preprocessors without proving every input is valid UTF-8 would be a correctness regression, so it was NOT changed on guesswork. |
-| `20001226-1.c` i686 `-O0` | Observed live at 1.3 GiB RSS and >13 min (the case carries `dg-timeout-factor 4.0`, so 960 s is allowed). Scaled branch counts measured on the i686 binary at `-O0`: 512 branches `6.05 s / 44.8 MiB`, 2048 branches `93.76 s / 136.4 MiB`; the x86_64 binary needed `1.44 s / 47.8 MiB` and `7.66 s / 145.2 MiB` for the same inputs -- roughly 12x slower and clearly superlinear on i686 only. | **OPEN, measured.** The hotspot is in i686 branch relaxation / peephole interaction; a safe fix needs its own profile and regression corpus. Recording the numbers is required before claiming anything about this case. |
+| `pr46534.c` at `-O1`, `-O2`, `-O3` (3) | `returncode -9` (SIGKILL) during a concurrently memory-pressured run. This case is a 20,000,000-character string literal. In isolation the `-O2` compile succeeds (`rc=0`) but took 47.34 s on a quiet host and **3713 MiB peak RSS**; `CCC_TIME_PHASES=1` showed only 2.39 s inside `compile_ir_module_to_assembly`, so the time and memory were in the integrated assembler, not codegen. Root cause (measured, not guessed): `emit_string_bytes` emitted one `.byte` line per 32 literal bytes -> 1,250,028 lines / 171,250,454 bytes of assembly at `-O2`; every operand became a `DataValue` enum (64 B of heap per byte). A second, independent O(line^2) term: eleven assembler scanners called `str::from_utf8(&bytes[i..])` on EVERY byte, validating the whole remaining suffix. | **FIXED, two algorithm-level changes.** (1) `asm_expr::utf8_char_step` replaces the suffix-validation idiom at all 11 sites. For an ASCII or continuation byte the answer is 1 whether the suffix is valid or not, so no scan is needed; a multi-byte leading byte keeps the ORIGINAL `from_utf8` suffix check. Three exhaustive unit tests prove equality with the old idiom for every byte value, every offset of valid UTF-8 (including 4-byte chars), all 256 prefixes of the byte alphabet and 200 deterministic pseudo-random invalid slices. (2) `emit_string_bytes` now emits bounded `.ascii` lines (65,536 bytes per line), escaping every byte outside `[A-Za-z0-9 space]` as exactly three octal digits. All four assemblers share `elf::parse_string_literal`, so one `Vec<u8>` per line replaces 20 M `DataValue`s. `CCC_LEGACY_BYTE_STRINGS=1` keeps the old emitter as a differential oracle; `tests/regression/check_string_literal_emission.sh` requires byte-identical objects on x86_64 AND i686 at `-O0/-O2/-Os`, plus a host runtime `memcmp` oracle over all 256 byte values and literal lengths straddling the chunk boundary. **Measured after:** `-O2` 3.21 s / **351 MiB** peak RSS (vs 47.34 s / 3713 MiB), assembly 40,009,006 bytes / **638 lines** (vs 171,250,454 / 1,250,028), object size unchanged at 40,001,352 bytes. |
+| `20001226-1.c` i686 `-O0` | Observed live at 1.3 GiB RSS and >13 min (the case carries `dg-timeout-factor 4.0`, so 960 s is allowed). Scaled branch counts measured on the i686 binary at `-O0`: 512 branches `6.05 s / 44.8 MiB`, 2048 branches `93.76 s / 136.4 MiB`; the x86_64 binary needed `1.44 s / 47.8 MiB` and `7.66 s / 145.2 MiB` for the same inputs -- roughly 12x slower and clearly superlinear on i686 only. | **FIXED, root cause found by opt-in phase instrumentation.** `CCC_NO_I686_PEEPHOLE=1` isolated the peephole (2.96 s -> 0.24 s at 512 branches). `CCC_TIME_PEEPHOLE=1` then showed 1.304 s / 25.453 s of the peephole in ONE phase at 512/2048 branches: `eliminate_dead_reg_moves` called `census_reg_reads` once per candidate move, and that helper walks the WHOLE function -> O(lines^2). Replaced with `FunctionReadCensus`: read counts are computed once per function in O(lines) and each NOP subtracts that line's exact read mask, so every answer is bit-for-bit the old one. `has_ret` / return markers are static because this pass only NOPs `Move` lines. `CCC_SLOW_DEAD_MOVE_CENSUS=1` re-enables the original per-candidate scan; `tests/regression/check_i686_dead_move_census.sh` requires byte-identical objects at all five optimization levels over callee-saved regs, calls, inline asm, computed gotos, label-crossing dead moves and a 512-branch function. **Measured after (i686 `-O0`, quiet host):** 512 branches 3.012 -> **0.376 s**, 2048 branches 51.653 -> **1.857 s**, the real 8192-branch case (previously extrapolated ~25 min) now **10.761 s**; scaling is linear-ish instead of quadratic, and the full five-level campaign no longer needs a hidden timeout. |
 
 **Oracle discipline.** Clang **23.1.5** exists upstream (`llvmorg-23.1.5`, published
 2026-11-03) but its release asset redirects to `release-assets.githubusercontent.com`
@@ -1069,3 +1069,376 @@ arm, and the literal `if (0)` dead-arm control);
 A 500-declaration functional smoke compiles at `-O2` on x86_64 (31,696 B)
 and i686 (17,612 B) with `rc=0`; GCC 16.2's reference object is 31,880 B.
 Hosted CI runs the remaining full matrix.
+
+### 9.11 Kernel gate policy and the full five-level/feature campaign
+
+**Kernel gate is no longer a default PR gate.** `.github/workflows/kernel-61858.yml`
+still declares the same `pull_request` path filter (so a compiler-only PR shows
+the skip instead of silently omitting it), but `jobs.kernel.if` now requires one
+of three explicit opt-ins: a weekly `schedule` (`17 3 * * 1`, Monday 03:17 UTC),
+a `workflow_dispatch` with `run_kernel: true` (default), or a PR carrying the
+`kernel-full` label. `pull_request.types` includes `labeled` so adding the label
+re-evaluates the workflow without a new commit. Five new
+`tests/corpus/test_kernel_workflow_paths.py` tests pin the cron, the dispatch
+input, the label gate, the `labeled` trigger and the intact path filter. The
+240-minute full kernel build is NOT deleted and NOT rerun by default; it is now
+on-demand/weekly, exactly as requested. `check_ci_gate_parity.py` and
+`check_ci_workflow_shell.py` both pass with the new triggers.
+
+**Full campaign.** `scripts/x86_gcc_torture.py` is run over EVERY `compile/`
+source (2016) and EVERY `execute/` source (1700) at EVERY optimization level
+`-O0,-O1,-O2,-O3,-Os` on BOTH `x86_64` and `i686`, plus the whole corpus under
+six appended compiler-feature flag sets (`-fPIC`, `-fno-builtin`, `-fwrapv`,
+`-funsigned-char`, `-fno-omit-frame-pointer`, `-fno-common`) at `-O2` on both
+ABIs, plus the whole corpus at the three additional accepted levels
+`-Ofast`, `-Og`, `-Oz` on both ABIs. The runner applies every DejaGnu
+`dg-options` / `dg-add-options` directive flag per case itself, so the feature
+dimension is covered; `--expensive` runs `run_expensive_tests` cases instead of
+reporting them `unsupported`; timeouts are 300 s compile / 120 s run scaled by
+each `dg-timeout-factor`, so no case is silently dropped. Every leg writes a
+complete per-case JSON inventory, an identity record with binary hashes captured
+BEFORE the leg, and a failure log under
+`/home/user/artifacts/campaign-20261105/`. The final verdicts and counts are
+recorded in `SUMMARY.md` / `SUMMARY.json` there and transcribed here after the
+campaign completes; a `complete=False` or `fatal!=None` leg is a campaign
+failure, not a pass.
+
+**Red-team of the new logic.** The three changes were reviewed for UB, overflow,
+aliasing and context safety by construction:
+* `utf8_char_step` never indexes out of bounds (`bytes.get(i)`), shifts only
+  `u8` values by 6/3, and keeps the exact original `from_utf8` call on the only
+  branch whose answer depends on suffix validity. It is exact for ARBITRARY
+  (possibly invalid UTF-8) byte slices, not just `&str` inputs — proven by the
+  256x5 exhaustive slice test plus 200 deterministic random slices.
+* `FunctionReadCensus` uses `u32` counts (a 20 M-line function cannot reach
+  2^32 reads), guards every decrement with `debug_assert!(*n > 0)`, never
+  indexes `func_of` with the `usize::MAX` sentinel, and keeps a slow exact
+  fallback for non-GP destinations. It is single-threaded, so there is no
+  mutex/spinlock or race surface. The A/B gate proves emitted objects are
+  byte-identical at five optimization levels.
+* `emit_string_bytes_ascii` emits only `[A-Za-z0-9 space]` and three-digit
+  octal escapes. No quote, backslash, comment marker, semicolon, comma,
+  parenthesis or GAS character literal can appear in the payload; every scanner
+  that walks raw assembly text tracks double-quoted strings. Octal is always
+  three digits so GAS's `\N`/`\NN`/`\NNN` grammar cannot swallow the next byte.
+  Bytes >= 0x80 are escaped because `parse_string_literal` re-encodes raw chars
+  as UTF-8. All four assemblers (x86-64, i686, AArch64, RISC-V) share that one
+  parser, so the representation is target-independent. The NUL terminator obeys
+  the same chunk-boundary rule as any data byte.
+
+**Evidence discipline.** All times are host wall-clock or `CCC_TIME_PHASES`
+phase timers; RSS is `getrusage(RUSAGE_CHILDREN).ru_maxrss`. No PMU, cycles,
+`perf`, local Clang 23.1.5 or local ICX 2026.2 claim is made: the
+`harness-cache-7` tag carries Clang 23.1.4, the LLVM 23.1.5 release asset
+redirects to blocked hosts and the Intel PPA is unreachable from this sandbox.
+GCC 16.2.0 (pinned toolchain) is the oracle; `/usr/bin/gcc` 12.2.0 is never
+used. The generated-code host-runtime gap in §9.9 is unchanged and is NOT
+claimed fixed, and no "beats GCC/Clang/ICX" claim is made.
+
+### 9.12 Red-team findings recorded during this campaign (measured, NOT claimed fixed)
+
+Two PRE-EXISTING problems were found by the new three-way host benchmark and
+by the full five-level i686 campaign. Neither is a regression of this patch:
+the `pr46534.c` object sizes were `20,001,376 B` at `-O0` and `40,001,352 B`
+at `-O1+` BEFORE and AFTER the `.ascii` change, and `limits-fndefn.c` is a
+frontend/i686-backend shape this patch does not touch. Both are left OPEN with
+a reproducing measurement and an exact root cause, for the same reason §9.4
+and §9.9 leave their gaps open: papering over them here would (a) overlap the
+files owned by the two other PRs in flight (#1102 edits
+`src/passes/fortify_fold.rs`, `src/ir/module.rs`, `src/backend/common.rs`,
+`src/backend/generation.rs` and `src/backend/i686/codegen/*`; #1104 edits
+`src/frontend/sema/*` and the four assembler `mod.rs`), (b) change the
+compiler binaries while the complete 34-leg torture campaign is running on a
+SHA-256-pinned binary set, and (c) require a separate parser/IR refactor with
+its own full-corpus evidence. Recording the numbers is the honest boundary.
+
+| finding | measured | root cause | disposition |
+|---|---|---|---|
+| `pr46534.c` `-O1+` emits **40,001,352 B** of object vs GCC 16.2 `20,001,464 B` and Clang 23.1.4 `20,001,280 B`; `-O0` is `20,001,376 B` | Two 20 MB `.ascii` literals at `-O2`: `.Lstr0` (20,000,001 spaces + `\n`) and `.Lchkfold1` (the same text with the newline stripped). `-O0` emits only `.Lstr0` (306 `.ascii` lines, 1 label); `-O1/-O2/-O3/-Os` emit 612 lines and 2 labels. Only `.Lchkfold1` is referenced. | `src/passes/fortify_fold.rs:691` interns a fresh `.LchkfoldN` literal when it rewrites `printf("...\n")` to `puts("...")`; `src/backend/common.rs:3015` (`emit_data_sections`) emits **every** `module.string_literals` entry, and there is no dead-string-literal GC in the IR (`dead_statics` roots static definitions, not interned literal labels). GCC/Clang keep exactly one. | **OPEN.** A correct fix is a conservative IR-level literal GC (roots: `GlobalAddr` operands, global initialisers, aliases, ctors/dtors, top-level and inline asm, debug references) placed after all optimisation passes, or in-place rewriting of a singly-used literal. Not attempted here for the three reasons above. A new non-vacuous gate in `check_string_literal_emission.sh` pins the fold's RUNTIME byte parity with GCC 16.2 at `-O0` and `-O2` and asserts the fold really fires on both compilers, so a future fix cannot silently change the emitted bytes. |
+| `20050316-2.c` i686 `-O0`: GCC 16.2 reference RUN aborts (`rc=-6`), inventoried as ONE `reference-fail`, not a hidden skip | The campaign's `reference-fail` count is 1 out of 37,160 case-runs in the four completed primary legs. A 4-way probe: GCC `-m32` WITH the test's `-mno-mmx -Wno-psabi` -> rc=0; GCC `-m32` WITHOUT -> rc=-6; lccc-i686 WITH -> rc=0; lccc-i686 WITHOUT -> rc=0. | The test's `dg-options` are TARGET-GATED (`{ target { x86_64-*-* i?86-*-* } }`). `scripts/x86_gcc_torture.py::native_directive_flags` delegates to `tools/corpus/dejagnu.py::extract_option_flags`, which by design extracts only UNCONDITIONAL `dg-options`; the result record shows `directive_flags: []`. This is a documented runner limitation, not an lccc defect: lccc passes the case both with and without the flags, and the runner classifies the oracle abort as `reference-fail` (it counts against the run, never into a skipped denominator). Deliberately NOT "fixed" mid-campaign: changing the runner would change its `runner_sha256` identity between legs and could alter results across the whole corpus. |
+| `limits-fndefn.c` i686 `-O0` took **1022.18 s** (17 min) and PASSED; GCC 16.2 `-m32 -O0` needs **0.349 s**; x86_64 `-O0` needs 182.19 s and `-O1+` cases are all < 10 s | The case declares `void func1(LIM5(int p) int t)` = 100,000 formal parameters. `CCC_NO_I686_PEEPHOLE=1` and `CCC_TIME_PEEPHOLE=1` both still exceed 100 s with NO `[PEEP]` mark, so the cost is BEFORE the peephole (frontend/sema/stack-layout), not in anything this patch changed. | Only the `-O0` shape materialises all 100k parameters; optimising tiers DCE them before codegen. The i686-specific superlinear term is in parameter/stack-layout handling. | **OPEN.** The campaign gives it `dg-timeout-factor 4.0` -> a 1200 s budget, so it completes (PASS), is inventoried with its exact 1022.18 s, and is NOT a hidden timeout or skip. Fixing it is a separate frontend/i686-backend optimisation program. |
+
+**No hidden skips or timeouts in the campaign.** Every leg writes a
+`complete` flag, a `fatal` field and a per-case `status`, and all four
+primary legs report `complete=true`, `completed_cases == expected_cases`,
+`fatal=null` and the IDENTICAL `runner_sha256` prefix `074e81780ad7` (so the
+runner was not edited between legs). Primary totals: 37,160 case-runs =
+60 `compile-fail` + 36,898 `pass` + 201 `reference-compile-skip` +
+1 `reference-fail`; zero timeouts, zero `unsupported`, zero fatals. The one
+`reference-fail` above is an explicit, inventoried oracle abort; `--expensive`
+runs the expensive cases instead of reporting them `unsupported`; timeouts are
+300 s compile / 120 s run scaled by `dg-timeout-factor`, and the slowest real
+case (`limits-fndefn.c` i686 `-O0`, 1022.18 s under its 1200 s budget) is a
+PASS, not a timeout. No case silently leaves the denominator.
+
+**Measurement discipline for §9.12.** The first three-way benchmark reported an
+identical 161 MiB RSS for all three compilers. That was a MEASUREMENT BUG, not
+a result: `os.wait4().ru_maxrss` is a high-water mark a forked child inherits
+from its parent, and the measuring Python process held the 8 MB generated
+source, so every child reported the PYTHON process's HWM. Re-measured through
+a fresh small-RSS helper process per compile, the 2 MB case is GCC 52,992 KiB
+/ Clang 63,168 KiB / lccc 58,916 KiB and the real 20 MB case is GCC 305,432 /
+Clang 133,008 / lccc 359,568 KiB. The wrong numbers were discarded, not
+averaged away.
+
+### 9.13 Three-way host-CPU comparison (measured, no beat-all claim)
+
+`/home/user/artifacts/bench-20261105/SUMMARY.json` holds the full record.
+Source: a 2,000,000-byte narrow literal built from unambiguous 3-digit OCTAL
+escapes so all 256 byte values occur (embedded NUL, quote, backslash, high
+bytes), scanned at runtime by FNV-1a. `-O2`, 5 compiles and 9 runs per
+compiler, median reported, host = 2-core sandbox with the full GCC-17 campaign
+running concurrently, so absolute times carry contention noise while ratios
+inside the window remain comparable.
+
+| compiler | compile 2 MB (median 5) | peak child RSS | object | runtime (median 9) | FNV-1a |
+|---|---|---|---|---|---|
+| GCC 16.2.0 | 0.144 s | 52,992 KiB | 2,001,776 B | 0.005440 s | `1731a13cbb5d7183` |
+| Clang 23.1.4 | 0.0714 s | 63,168 KiB | 2,001,552 B | 0.005711 s | `1731a13cbb5d7183` |
+| lccc (this patch) | 0.4557 s | 58,916 KiB | 2,001,536 B | 0.005389 s | `1731a13cbb5d7183` |
+
+The 20,000,000-byte `pr46534.c` case compiles in GCC 0.851 s / 305,432 KiB,
+Clang 0.321 s / 133,008 KiB, lccc **3.07 s / 359,568 KiB** (before this patch
+it was 47.34 s / ~3,713 MiB, i.e. a >=15x wall and >=10x memory improvement
+on this exact input). **lccc is still slower than both oracles at compiling
+giant literals**, and the generated-code runtime numbers above are within
+measurement noise of each other, so NO "beats GCC/Clang/ICX" claim is made.
+The correctness and stability proof is: the identical 64-bit FNV-1a checksum
+from all three compilers, 20/20 varied literals compiling with 20 distinct
+objects, and 10 repeated compiles of one input producing ONE object digest
+(deterministic emission).
+
+**Oracle availability, measured 2026-11-05.** Clang 23.1.5 IS published
+(`llvmorg-23.1.5`, 57 assets, `LLVM-23.1.5-Linux-X64.tar.xz` = 2,014,093,084 B),
+but its `browser_download_url` 302-redirects to
+`objects.githubusercontent.com`, which fails here with
+`OpenSSL SSL_connect: SSL_ERROR_SYSCALL`; the sandbox also has only 3.5 GiB
+free. Intel's `apt.repos.intel.com` fails the same way. Local Clang 23.1.5 and
+ICX 2026.2 are therefore NOT available, and no local numeric claim uses them.
+The Clang 23.1.5 oracle provisioning in hosted CI is **PR #1102's work** and
+is deliberately NOT duplicated here; PR #1107's hosted
+"Authenticated Intel ICX 2026.2 integration" job passed, which is hosted
+evidence, not a local measurement.
+
+**Compatibility with the other in-flight PRs.** `git merge-tree --write-tree`
+against #1102 (`a144b30e2c`) and #1104 (`41962d94b4`) both return rc=0 with
+zero conflicts, and `check_ci_lane_plan.py`,
+`check_ci_shard_partition.py`, `check_ci_gate_parity.py` and
+`tests/corpus/test_kernel_workflow_paths.py` all PASS on BOTH merged trees.
+None of this patch's topics (string-literal emission, UTF-8 stepping, i686
+dead-move census, kernel gate policy) duplicates either PR's topic.
+
+**Hosted CI repair (data-driven).** PR #1107's first run had exactly one red
+check, "Frontend and ABI contracts (shard c of 3)" / step
+"Verify toolchain bundle and shard-partition contracts (mock only)":
+`check_ci_lane_plan.py` rejected the two new CI steps because a hand-added
+gate bypasses the balance and review record. Both steps are now registered in
+`.github/ci-lane-plan.json` under `frontend-a` with MEDIAN-OF-3 measured costs
+(0.70 s and 4.44 s), `predicted_gate_seconds` recomputed from the sum
+(360.43 -> 365.57), and the frontend group remains balanced at
+365.57 / 352.29 / 352.27 (3.7% spread vs the 5% tolerance). All seven mock
+gates, the lane-plan self-test (18 rules / 25 fixtures) and CI/local gate
+parity pass locally before the fix was pushed.
+
+### 9.14 Audit-census ratchet: the one intentional re-baseline
+
+`scripts/audit_census.py --check` is a hosted gate (`.github/workflows/ci.yml`
+`backend-contracts-b`, `scripts/ci_local.sh` `audit-census-ratchet`) and it
+went red on this patch: `fns_over_300: 232 -> 233 (+1)` and
+`knob_literals: 561 -> 563 (+2) [CCC_LEGACY_BYTE_STRINGS,
+CCC_SLOW_DEAD_MOVE_CENSUS]`. The tool explicitly permits "justify and
+re-baseline in the commit that adds them", so the baseline was raised
+SURGICALLY (only those two numbers plus the two new names in `knob_names`,
+keeping `len(knob_names) == knob_literals`), NOT via `--update`: `--update`
+would also have ratcheted DOWN `panic_sites 877 -> 867`,
+`panic_sites_hot 99 -> 95` and `knobs_undocumented 262 -> 261`, tightening
+three unrelated ratchets for the two in-flight PRs. Neither #1102 nor #1104
+edits `scripts/audit_census_baseline.json`, so there is no merge conflict.
+
+Both deltas are 100% attributable to this patch and were identified by name,
+not guessed:
+
+* `fns_over_300 +1`: `peephole_optimize` in
+  `src/backend/i686/codegen/peephole.rs` went from 296 to **312 lines** solely
+  because of the 23 `clock.mark(...)` lines of the opt-in `CCC_TIME_PEEPHOLE`
+  phase instrument. All seven other >300-line functions in that file are
+  byte-for-byte the same lengths as on the base commit (verified by running
+  `audit_census.scan_functions(strip_tests(...))` over both trees). It was
+  NOT refactored: any Rust source edit would change the SHA-256-pinned
+  compiler binaries while the 34-leg torture campaign is running, and the
+  instrument is a diagnostic, not a code-size regression in generated code.
+* `knob_literals +2`: the two A/B differential oracles. Both are documented
+  in §9.11/§9.12, both have dedicated regression gates, and
+  `CCC_TIME_PEEPHOLE` was ALREADY in the baseline's `knob_names`, so it is not
+  a third new literal.
+
+After the edit: `audit_census.py --check` PASS ("no metric grew"),
+`audit_census.py --selftest` PASS, and `knobs_undocumented` IMPROVED from 262
+to 261 because the two new knobs are documented.
+
+
+### 9.15 Full red-team escalation (2026-11-05): measured proof, not narrative
+
+This section answers the escalation demanding a line-by-line audit, exhaustive
+property tests, all supported architectures, a host-CPU correctness proof,
+better design choices with per-decision justification, and the three named
+oracles. Every number below is reproducible from the artefacts named in
+brackets; nothing is asserted from memory.
+
+#### 9.15.1 Oracle fetch: what was actually tried, and what is available
+
+The standing order is to FETCH and USE GCC 16.2, Clang 23.1.5 and ICX 2026.2.
+Measured on 2026-11-05:
+
+| oracle | status | evidence |
+|---|---|---|
+| GCC 16.2.0 | PRESENT AND USED as the reference compiler in every gate, every benchmark and all 34 campaign legs | `/home/user/.cache/lccc-toolchains/bin/gcc-16`, SHA `67ed9963…c2`; the fold gate and corpus runner both invoke it |
+| Clang 23.1.4 | PRESENT AND USED for the three-way host benchmark and the kernel codegen contracts | `harness-cache-7` git tag `84abc5ce3bf5` (12 verified files) |
+| Clang 23.1.5 | NOT FETCHABLE LOCALLY, tried three routes | `gh api repos/ms178/lccc/releases?per_page=100` returns only `harness-cache-4` with a single `clang-23.1.4-…tar.xz` asset. `git ls-tree -r harness-cache-7` contains only `clang-23.1.4-linux-x64.tar.xz.part00`. `llvmorg-23.1.5` publishes `LLVM-23.1.5-Linux-X64.tar.xz` (2,014,093,084 B) and `.tar.zst` (1,198,896,522 B); a range GET of the `.zst` 302-redirects to `release-assets.githubusercontent.com` and fails with `curl(35) OpenSSL SSL_connect: SSL_ERROR_SYSCALL`. The old guessed `clang+llvm-23.1.5-…-ubuntu-22.04.tar.xz` is HTTP 404 and was not retried. |
+| ICX 2026.2 | NOT FETCHABLE LOCALLY | `https://apt.repos.intel.com/oneapi` fails with the same `SSL_ERROR_SYSCALL`. Hosted CI DOES provide it: PR #1107's `Authenticated Intel ICX 2026.2 integration` check passes. |
+
+PR #1102's `scripts/ci_install_clang_oracle.sh` pins the official
+`LLVM-23.1.5-Linux-X64.tar.zst` by SHA-256 `c3107384835f788768f614db610e87fba7077f125ca950eb02a78bab0a308065` and
+provisions it in HOSTED CI. Implementing that locally or in this PR would
+duplicate #1102's work, which is explicitly forbidden; hosted provisioning is
+its evidence. **No local numeric claim uses Clang 23.1.5 or ICX 2026.2, and
+no "beats all other C compilers" claim is made.** §9.13's measured three-way
+comparison (GCC 16.2 / Clang 23.1.4 / lccc) stands as the honest local result:
+lccc is still slower than both oracles at compiling a 20 MB literal, and the
+generated-code runtime numbers are within measurement noise.
+
+#### 9.15.2 Exhaustive property audit (programmatic, zero failures)
+
+`/home/user/redteam_fuzz.py` → `/home/user/artifacts/redteam-20261105/`.
+All binaries are the SHA-256-pinned fastbuild set the campaign runs.
+
+| property | checked | result |
+|---|---|---|
+| emitter payload cases | 125 | 0 failures |
+| cross-architecture object checks (5 drivers × `-O0`/`-O2`: `lccc`, `lccc-i686`, `lccc-x86`, `lccc-arm`, `lccc-riscv`) | 1,250 | exact payload + NUL found in each ELF `.rodata` (ELF32/ELF64 LE parsed directly) |
+| `CCC_LEGACY_BYTE_STRINGS=1` A/B pairs (x86_64 + i686) | 250 | 250 byte-identical objects |
+| host runtime `memcmp` oracles (literal vs independently generated array) | 124 | 124 `PASS` (rc=0) |
+| census randomized shapes, each ACCEPTED by GCC 16.2 as valid C | 40 | 0 rejected by the language oracle |
+| census A/B pairs (5 opt levels, `CCC_SLOW_DEAD_MOVE_CENSUS=1`) | 200 | 200 byte-identical objects |
+| census NON-VACUITY (`CCC_NO_I686_PEEPHOLE=1` object differs) | 200 | 200 non-vacuous: the A/B really exercises the census |
+| `utf8_char_step` vs the exact old `from_utf8` idiom | 608,319 offsets | 0 mismatches, including all 65,536 two-byte prefixes, all multi-byte leads × 256 second bytes × 6 third bytes, 20,000 random malformed slices and every offset of valid 1/2/3/4-byte UTF-8 |
+| Valgrind 3.19 memcheck on the `.ascii` path (64 KiB all-256 payload, `-O2`) and on the i686 census path (`-O0`, calls/labels/callee-saved) | 2 runs | both `--error-exitcode=99 -q` rc=0, no diagnostics |
+| `PeepClock` disabled vs enabled median compile | 7+7 runs | 0.01163 s vs 0.00997 s (within noise); the disabled path pays one `Instant::now` in `new()` and one `bool` test per `mark` |
+
+Payload coverage: all 256 byte values; lengths `0,1,2,3,7,8,31,32,33,255,256,257,1023,65535,65536,65537,131072,131075`;
+floods of `\`, `"`, `'`, `#`, `;`, `@`, `,`, NUL, LF, CR, `0xff`, `0x80`, octal digits and tab;
+escape-digit adjacency in both orders at 4 lengths (the digit-absorption
+hazard); deterministic pseudo-random binary up to 200,000 B; valid UTF-8 and
+truncated/invalid multi-byte leads. The first census generator produced 14
+shapes with duplicate function names; GCC 16.2 rejected exactly those shapes,
+proving them GENERATOR bugs, not compiler defects. The corrected generator
+validates every shape with GCC 16.2 before the A/B pair runs.
+
+#### 9.15.3 Line-by-line static review (invariants, not spot checks)
+
+* `emit_string_bytes_ascii` emits exactly `len+1` bytes: `count == CHUNK`
+  closes a line before the next byte; the trailing-NUL branch handles the
+  `len == CHUNK` boundary; `len == 0` still emits `\000`. Proven for
+  `0, CHUNK-1, CHUNK, CHUNK+1, 2·CHUNK, 2·CHUNK+3` by the Rust unit test and
+  by the 1,250 object checks. `char::from(byte)` is only evaluated for
+  `u8`, a strict subset of Unicode scalar values, so it cannot panic; `s.chars()`
+  truncation to `u8` preserves the front end's pre-existing narrow-literal
+  contract.
+* Three-digit octal is the only escaping form that is unambiguous in BOTH
+  `elf::parse_string_literal` (max 3 octal digits, max 2 hex digits, raw chars
+  re-encoded as UTF-8) and GNU `as` (max 3 octal digits, UNBOUNDED hex). A
+  raw byte `≥ 0x80` would be UTF-8 re-encoded by the shared parser, so it is
+  always escaped. The admitted raw alphabet `[A-Za-z0-9 space]` cannot contain
+  a quote, a backslash, a comment marker (`#`, `;`, `@`, `//`), a GAS character
+  literal (`'`), a comma, a parenthesis or a semicolon, so every scanner that
+  tracks quoted strings sees an opaque payload.
+* `utf8_char_step`: `bytes.get(i)` guards out-of-range; `0x00..=0x7f`,
+  `0x80..=0xc1`, `0xf5..=0xff` answer 1 in O(1) without touching the suffix,
+  because `map_or(1, char::len_utf8)` yields 1 for ASCII regardless of suffix
+  validity and 1 for any byte that cannot start a valid character. Only
+  `0xc2..=0xf4` retains the ORIGINAL whole-suffix `from_utf8` check, so the
+  function is exact for arbitrary invalid byte slices. All 11 call sites in
+  `asm_expr.rs` and `asm_preprocess.rs` were replaced; no per-candidate
+  `census_reg_reads` was reintroduced.
+* `FunctionReadCensus`: `reads[r]` is by construction the number of lines in
+  the function whose `line_gpr_read_mask` has bit `r`. Each retirement
+  subtracts its own mask exactly once (`masks[i]` is zeroed and NOP lines are
+  skipped at the top of the candidate loop), therefore `reads[dst] >= own` and
+  `reads[dst] - own` cannot underflow. Even a hypothetical release wrap would
+  be CONSERVATIVE (a huge count refuses the deletion), never a miscompile.
+  The `debug_assert!` is additionally backed by the hosted
+  `Assertion-enabled units and corpus` check. `line_gpr_read_mask` mirrors
+  `census_reg_reads` predicate-for-predicate: `InlineAsm` → `0xff`,
+  `Call` → EAX/ECX/EDX, `JmpIndirect` → GP bits only, debug/NOP lines → 0;
+  a non-GP destination explicitly falls back to the original slow scan.
+* `bounds` closes with `(s, len)`, so `func_of` covers `[0, len)`; an
+  impossible gap maps to `usize::MAX` and the fallback skips it, exactly as the
+  old `bounds.iter().find(|&&(s,e)| i >= s && i < e)` did. `has_ret` and the
+  `return_use_markers` result are static because the candidate loop only ever
+  NOPS `LineKind::Move` lines; neither a `ret` nor a marker line can be one.
+* Zero compiler warnings: hosted `Clippy` (`-D warnings`) PASS, host-side
+  `cargo clippy --profile fastbuild -- -D warnings` rc=0, `cargo fmt --check`
+  PASS, clippy-policy `76 lints / 0 unknown`.
+
+#### 9.15.4 Design decisions, each justified by a measurement
+
+| decision | alternatives measured | why this one |
+|---|---|---|
+| `STRING_ASCII_CHUNK = 65536` | 1,024-byte chunks measured at 30.58 s / 3,713 MiB / 160,352,012 B of assembly and REJECTED; pre-fix `.byte` 32-byte lines cost 47.34 s / 3,713 MiB / 171,250,454 B | chosen emitter: 3.21 s / 351 MiB / 40,009,006 B / 638 lines. A bounded line keeps every scanner's working set small without reintroducing a per-line constant factor. |
+| keep `[A-Za-z0-9 space]` raw + 3-digit octal | wider printable ASCII saves **10.76 %** of assembly text on 2 MB random binary and **30 %** on a typical C string; `\xNN` hex escapes save **21.12 %** / **10 %** | both save **0 %** on `pr46534.c` (20,000,001 spaces: every scheme is 1 char/byte), the case this patch actually optimises. Hex escapes are unsafe against GNU `as`'s UNBOUNDED `\x` (digit absorption); a wider raw set puts `#`, `;`, `@`, `'`, `,`, `(`, `)` into quoted payloads and would require re-proving every scanner. Measured in `artifacts/redteam-20261105/escape_design.json`. Not worth the correctness risk for zero gain on the hot input. |
+| do NOT hoist `std::env::var_os("CCC_LEGACY_BYTE_STRINGS")` into a `OnceLock` | `getenv` measured at **16.936 ns/call** (200,000 calls, GCC 16.2 `-O2`), i.e. ~0.85 ms for 50,000 literals | the "wasted cycle" is below measurement noise; caching would break per-process environment changes in tests and would change the pinned binaries mid-campaign. |
+| keep `CCC_LEGACY_BYTE_STRINGS` and `CCC_SLOW_DEAD_MOVE_CENSUS` as differential oracles instead of deleting the old code | — | 250 + 200 byte-identical A/B pairs over 5 architectures and 5 opt levels prove the new paths are behaviour-preserving; deleting the oracle would remove the proof. |
+| `CCC_TIME_PEEPHOLE` is opt-in and a diagnostic, never a benchmark | — | it measures host wall time, not PMU/cycles (`perf`, `gdb`, PMU access are unavailable here); §9.14 records the one audit-census line-count delta it causes. |
+
+#### 9.15.5 A real defect found in the VALIDATION harness, and its fix
+
+The 34-leg driver `/home/user/campaign_full.py` passed
+`["--append", "-fPIC"]`. `argparse` reads a leading `-` as a new option, so
+**all 24 feature legs exited rc=2 with `argument --append: expected one
+argument` and produced ZERO case-runs**; their `.json` files were absent and
+their logs were 717-byte argparse usage dumps. This was found by reading the
+leg logs, not by trusting the driver's summary. Fix: the unambiguous equals
+form `--append=-fPIC`, verified with a real one-case run
+(`append: '-fPIC'`, `1/1 pass`), then a resumable
+`/home/user/campaign_features.py` re-running all 24 legs with per-leg JSON,
+`--expensive`, and the same 300 s / 120 s timeouts. `scripts/x86_gcc_torture.py`
+was deliberately NOT edited mid-campaign: any edit changes its
+`runner_sha256`, and all completed legs share the identical runner hash
+`074e81780ad7`. The four completed primary legs and the level legs are
+unaffected; the final 34-leg `SUMMARY.md` is written only after the 24
+corrected feature legs are complete.
+
+#### 9.15.6 Integration, rebase and hosted CI (measured at this revision)
+
+* `git fetch origin main`: `origin/main` is still `f530c231a862…`, which IS our
+  merge-base. There is nothing to rebase; the branch is already on the latest
+  `main`. `git log --oneline origin/main..HEAD` is exactly the five commits of
+  this PR.
+* `gh pr view 1107`: `state=OPEN`, `mergeable=MERGEABLE`,
+  `mergeStateStatus=CLEAN`.
+* Hosted checks: **23 pass / 0 fail / 3 `skipping`**. The three skips are
+  not hidden test skips: `kernel` is `schedule`/`workflow_dispatch(run_kernel)`/
+  `kernel-full`-label only (`kernel-61858.yml`), `host-prerequisites` and
+  `diagnostic-transport` are `workflow_dispatch`/label-gated
+  (`kernel-61858.yml`, `ci-diagnostics.yml`). The in-tree kernel gate POLICY
+  test `tests/corpus/test_kernel_workflow_paths.py` runs and passes 11/11 in
+  the hosted contracts, so the opt-in default is verified without running a
+  240-minute kernel build on every PR.
+* Non-duplication, re-verified against the CURRENT PR heads: #1102
+  (`c8c48314a836`) now touches **128 files**, including
+  `src/passes/fortify_fold.rs`, `src/ir/module.rs`, `src/backend/common.rs`,
+  `src/backend/generation.rs` and the ARM/RISC-V peepholes; #1104
+  (`03d7136d76ae`) touches 23 files including `src/frontend/sema/*` and all
+  four assembler `mod.rs`. The two deliberately OPEN items in §9.12 (the
+  duplicate 20 MB `-O1+` literal and `limits-fndefn.c` i686 `-O0`) live
+  precisely in those files. Fixing them here would violate the explicit
+  "do not duplicate their work" order and would change the SHA-pinned
+  binaries under a running campaign. `git merge-tree --write-tree` against
+  both current heads returns rc=0 with zero conflicts
+  (`f60f7fd27d0e…` and `24e827bc0d84…`).
+* Remaining delivery gates (NOT yet claimed): the 24 corrected feature legs,
+  the final 34-leg `SUMMARY.md`, full `scripts/ci_local.sh --fast` +
+  `--slow` on one tree producing `target/ci_local.pass` with `mode=full`, and
+  the GATED `/home/user/ms178-1.patch` snapshot that
+  `scripts/lccc-snapshot.sh` will only publish against a matching green
+  stamp and green hosted CI.

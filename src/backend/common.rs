@@ -3783,18 +3783,96 @@ fn emit_int_data(out: &mut AsmOutput, val: i64, ty: IrType, ptr_dir: PtrDirectiv
     }
 }
 
-/// Emit string literal as .byte directives with null terminator.
-/// Each char in the string is treated as a raw byte value (0-255),
-/// not as a UTF-8 encoded character. This is correct for C narrow
-/// string literals where \xNN escapes produce single bytes.
+/// Maximum literal bytes per `.ascii` line.
 ///
-/// Writes directly into the output buffer without any intermediate
-/// heap allocations (no per-byte String, no Vec, no join). Uses
-/// a pre-computed lookup table to convert bytes to decimal strings
-/// without fmt::Write overhead.
+/// The old emitter wrote one `.byte` line per 32 bytes of string data. For
+/// the GCC torture case `pr46534.c` (a 20,000,000-byte literal) that is
+/// 625,000 lines (1.25M at -O2), 171 MB of assembly and 3.7 GiB peak RSS:
+/// every byte became a `DataValue` enum with two `String` variants, so the
+/// assembler held ~64 bytes of heap per emitted byte and the two-worker
+/// torture matrix SIGKILLed the process. `.ascii` carries the same bytes in
+/// one `Vec<u8>` per line (1 byte per byte), and all four assemblers share
+/// `elf::parse_string_literal`, so the representation is target-independent.
+/// A bounded line keeps every scanner's working set small; 65536 bytes makes
+/// 305 lines for the 20 MB literal.
+const STRING_ASCII_CHUNK: usize = 65536;
+
+/// Whether `b` may be written literally inside a GAS double-quoted string.
+///
+/// ONLY ASCII alphanumerics and the space are admitted. Everything else is
+/// emitted as a three-digit octal escape. That is deliberately stricter than
+/// necessary: it makes the payload a string over `[A-Za-z0-9 \\NNN]` which
+/// cannot contain a quote, a backslash-escape other than our own, a comment
+/// marker (`#`, `//`, `@`, `;`), a GAS character literal (`'`), a comma or a
+/// parenthesis. Every scanner that walks raw assembly text (`strip_c_comments`,
+/// `strip_comment`, `split_on_semicolons`, `trim_asm_line`, macro/rept
+/// expansion) tracks double-quoted strings, so the payload is opaque to them.
+/// It also avoids `parse_string_literal`'s UTF-8 re-encoding of raw chars:
+/// a byte >= 0x80 written literally would be expanded to two UTF-8 bytes.
+#[inline]
+fn ascii_literal_safe(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b' '
+}
+
+/// Append exactly one byte to an open `.ascii "..."` payload.
+#[inline]
+fn push_ascii_byte(out: &mut String, b: u8) {
+    if ascii_literal_safe(b) {
+        out.push(b as char);
+    } else {
+        // Exactly three digits: GAS accepts `\N`, `\NN` and `\NNN`, so a
+        // short escape could absorb the following byte's leading digit.
+        out.push('\\');
+        out.push((b'0' + (b >> 6)) as char);
+        out.push((b'0' + ((b >> 3) & 7)) as char);
+        out.push((b'0' + (b & 7)) as char);
+    }
+}
+
+/// Emit a C narrow string literal plus its NUL terminator as `.ascii` lines.
+///
+/// Byte semantics are unchanged from the `.byte` emitter: each `char` of the
+/// (possibly extended) source is truncated to `u8`, matching the front end's
+/// `\u0000...` / `\xNN` handling. The NUL is one ordinary escaped byte, so
+/// embedded NULs and a final NUL are indistinguishable only in the way C
+/// requires -- the object bytes are identical.
+///
+/// `CCC_LEGACY_BYTE_STRINGS=1` selects the former `.byte` emitter. It exists
+/// as a differential oracle: the regression gate compiles the same inputs
+/// with and without it and requires byte-identical objects.
 pub fn emit_string_bytes(out: &mut AsmOutput, s: &str) {
-    // Chunk output into lines of at most 32 bytes each to avoid
-    // extremely long lines that can cause parser performance issues.
+    if std::env::var_os("CCC_LEGACY_BYTE_STRINGS").is_some() {
+        emit_string_bytes_legacy(out, s);
+    } else {
+        emit_string_bytes_ascii(out, s);
+    }
+}
+
+/// The `.ascii` emitter, kept separate so the round-trip unit tests can call
+/// it without depending on the process environment.
+fn emit_string_bytes_ascii(out: &mut AsmOutput, s: &str) {
+    let mut count: usize = 0;
+    out.buf.push_str("    .ascii \"");
+    for c in s.chars() {
+        if count == STRING_ASCII_CHUNK {
+            out.buf.push_str("\"\n    .ascii \"");
+            count = 0;
+        }
+        push_ascii_byte(&mut out.buf, c as u8);
+        count += 1;
+    }
+    // NUL terminator, with the same chunk boundary rule as any data byte.
+    if count == STRING_ASCII_CHUNK {
+        out.buf.push_str("\"\n    .ascii \"");
+    }
+    push_ascii_byte(&mut out.buf, 0);
+    out.buf.push_str("\"\n");
+}
+
+/// The pre-`.ascii` emitter, retained verbatim as the A/B oracle. 32 bytes per
+/// `.byte` line was a workaround for the O(line_len^2) UTF-8 suffix scans in
+/// the assembler scanners; those scans are now O(1) (`asm_expr::utf8_char_step`).
+fn emit_string_bytes_legacy(out: &mut AsmOutput, s: &str) {
     let mut count: usize = 0;
     for c in s.chars() {
         if count.is_multiple_of(32) {
@@ -3808,7 +3886,6 @@ pub fn emit_string_bytes(out: &mut AsmOutput, s: &str) {
         push_u8_decimal(&mut out.buf, c as u8);
         count += 1;
     }
-    // Null terminator
     if count % 32 == 0 {
         if count > 0 {
             out.buf.push('\n');
@@ -5230,5 +5307,105 @@ mod slot_operand_split_tests {
         let mut o = out(false, 0, None);
         o.emit_instr_rbp_reg("    leaq", -24, "rax");
         assert_eq!(o.buf.trim_end(), "    leaq -24(%rbp), %rax");
+    }
+}
+
+#[cfg(test)]
+mod string_literal_emission_tests {
+    use super::{AsmOutput, STRING_ASCII_CHUNK, emit_string_bytes_ascii};
+
+    /// Reassemble the emitted `.ascii` lines through the SAME parser every
+    /// target uses, so the test measures real object bytes, not a private
+    /// reimplementation of the escaping rules.
+    fn round_trip(bytes: &[u8]) -> (Vec<u8>, String) {
+        // `emit_string_bytes` truncates each char to u8; Latin-1 chars rebuild
+        // the exact source bytes without any UTF-8 re-encoding.
+        let s: String = bytes.iter().map(|&b| char::from(b)).collect();
+        let mut out = AsmOutput::new();
+        emit_string_bytes_ascii(&mut out, &s);
+        let mut decoded = Vec::new();
+        for line in out.buf.lines() {
+            let payload = line
+                .trim_start()
+                .strip_prefix(".ascii ")
+                .expect("every emitted line must be an .ascii directive");
+            decoded.extend_from_slice(
+                &crate::backend::elf::parse_string_literal(payload)
+                    .unwrap_or_else(|e| panic!("invalid .ascii payload: {e}")),
+            );
+        }
+        (decoded, out.buf)
+    }
+
+    #[test]
+    fn all_256_byte_values_round_trip_exactly_with_a_nul_terminator() {
+        let all: Vec<u8> = (0u8..=255).collect();
+        let mut want = all.clone();
+        want.push(0);
+        let (got, _) = round_trip(&all);
+        assert_eq!(got, want, "byte-exact .ascii round trip failed");
+    }
+
+    #[test]
+    fn chunk_boundaries_are_exact() {
+        for len in [
+            0,
+            1,
+            STRING_ASCII_CHUNK - 1,
+            STRING_ASCII_CHUNK,
+            STRING_ASCII_CHUNK + 1,
+            2 * STRING_ASCII_CHUNK,
+            2 * STRING_ASCII_CHUNK + 3,
+        ] {
+            // Mix safe and escaped bytes so the boundary lands on both kinds.
+            let v: Vec<u8> = (0..len)
+                .map(|i| match i % 5 {
+                    0 => b' ',
+                    1 => b'Z',
+                    2 => 0,
+                    3 => 0xff,
+                    _ => b'"',
+                })
+                .collect();
+            let mut want = v.clone();
+            want.push(0);
+            let (got, buf) = round_trip(&v);
+            assert_eq!(got, want, "round trip failed at len={len}");
+            assert!(
+                buf.lines().all(|l| l.len() <= 4 * STRING_ASCII_CHUNK + 32),
+                "an .ascii line exceeded its bounded working set at len={len}"
+            );
+        }
+    }
+
+    #[test]
+    fn payload_cannot_contain_assembly_syntax() {
+        let all: Vec<u8> = (0u8..=255).collect();
+        let (_, buf) = round_trip(&all);
+        for line in buf.lines() {
+            let payload = line.trim_start().strip_prefix(".ascii ").unwrap();
+            let inner = payload
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .expect("quoted payload");
+            let bytes = inner.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b' ' => i += 1,
+                    b'\\' => {
+                        assert!(i + 3 < bytes.len(), "truncated octal escape");
+                        assert!(
+                            bytes[i + 1..i + 4]
+                                .iter()
+                                .all(|b| (b'0'..=b'7').contains(b)),
+                            "octal escape must be exactly three digits"
+                        );
+                        i += 4;
+                    }
+                    other => panic!("unsafe literal byte 0x{other:02x} in .ascii payload"),
+                }
+            }
+        }
     }
 }

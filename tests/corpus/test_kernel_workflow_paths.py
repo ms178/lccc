@@ -58,3 +58,47 @@ class KernelWorkflowPaths(unittest.TestCase):
 
     def test_no_negative_glob_can_silently_exclude_compiler_paths(self):
         self.assertTrue(all(not pattern.startswith("!") for pattern in self.patterns))
+
+
+class KernelJobIsOnDemandOrWeekly(unittest.TestCase):
+    """The 240-minute kernel gate must not be a default per-PR gate.
+
+    A normal compiler PR still triggers this workflow (so the skipped status
+    is visible), but `jobs.kernel` must be gated to a weekly schedule, a
+    manual dispatch, or the explicit `kernel-full` label. Keeping the path
+    filter intact is what makes the omission visible rather than silent.
+    """
+    @classmethod
+    def setUpClass(cls):
+        import yaml
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows/kernel-61858.yml").read_text())
+        cls.events = workflow.get("on", workflow.get(True))
+        cls.job_if = workflow["jobs"]["kernel"]["if"]
+
+    def test_weekly_schedule_exists(self):
+        crons = self.events["schedule"]
+        self.assertTrue(crons, "a weekly cron must be declared")
+        self.assertTrue(all("cron" in item for item in crons))
+        self.assertEqual(crons[0]["cron"], "17 3 * * 1")
+
+    def test_manual_dispatch_can_run_kernel(self):
+        inputs = self.events["workflow_dispatch"]["inputs"]
+        self.assertIn("run_kernel", inputs)
+        self.assertIn(inputs["run_kernel"]["default"], (True, "true"))
+        self.assertIn("inputs.run_kernel", self.job_if)
+
+    def test_kernel_job_requires_an_explicit_opt_in(self):
+        self.assertIn("github.event_name == 'schedule'", self.job_if)
+        self.assertIn("'kernel-full'", self.job_if)
+        self.assertIn("contains(github.event.pull_request.labels.*.name", self.job_if)
+        # A bare PR event must never be enough to start the 240-minute job.
+        self.assertIn("github.event_name == 'pull_request' &&", self.job_if)
+
+    def test_label_event_re_evaluates_the_workflow(self):
+        self.assertIn("labeled", self.events["pull_request"]["types"])
+
+    def test_path_filter_still_selects_compiler_changes(self):
+        # Regression guard for the visible-skip property: a compiler-only PR
+        # must still trigger the workflow, otherwise the skip would be silent.
+        self.assertTrue(self.events["pull_request"]["paths"])

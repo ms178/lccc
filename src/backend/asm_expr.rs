@@ -31,6 +31,38 @@ fn char_escape_value(esc: u8) -> i64 {
     }
 }
 
+/// Byte width of the first character of `bytes[i..]`, exactly as the old
+/// `std::str::from_utf8(&bytes[i..]).ok().and_then(|s| s.chars().next())
+///     .map_or(1, char::len_utf8)` idiom computed it.
+///
+/// That idiom validated the ENTIRE remaining suffix on every byte of an
+/// assembly line: O(line_len^2). `pr46534.c` emits a 20,000,000-character
+/// string literal, and a single such line dominated the whole compile (tens of
+/// seconds, SIGKILL under a two-worker campaign). Two observations make the
+/// common case O(1) without changing any answer:
+///
+/// * An ASCII byte is a one-byte character whenever the suffix is valid, and
+///   `map_or(1, ...)` yields 1 when it is not -- either way the answer is 1.
+/// * A continuation byte (0x80..=0xBF) or an invalid leading byte can never
+///   start a valid UTF-8 string, so `from_utf8` fails and the answer is 1 too.
+///
+/// Only a multi-byte LEADING byte needs the suffix check, and those are rare
+/// in assembly. Keeping the original `from_utf8` there makes this exact for
+/// arbitrary, possibly invalid, byte slices as well as for `&str` bytes.
+#[inline]
+pub fn utf8_char_step(bytes: &[u8], i: usize) -> usize {
+    let Some(&b) = bytes.get(i) else {
+        return 1;
+    };
+    match b {
+        0x00..=0x7f | 0x80..=0xc1 | 0xf5..=0xff => 1,
+        0xc2..=0xdf if std::str::from_utf8(&bytes[i..]).is_ok() => 2,
+        0xe0..=0xef if std::str::from_utf8(&bytes[i..]).is_ok() => 3,
+        0xf0..=0xf4 if std::str::from_utf8(&bytes[i..]).is_ok() => 4,
+        _ => 1,
+    }
+}
+
 /// Advance past a GAS character literal starting at `quote_idx` (`bytes[quote_idx] == b'\''`).
 ///
 /// In GAS (`do_scrub_chars`), a character literal is `'X` or `'\X`, optionally
@@ -43,16 +75,10 @@ pub fn skip_gas_char_literal(bytes: &[u8], quote_idx: usize) -> usize {
         if bytes[i] == b'\\' {
             i += 1;
             if i < bytes.len() {
-                i += std::str::from_utf8(&bytes[i..])
-                    .ok()
-                    .and_then(|s| s.chars().next())
-                    .map_or(1, char::len_utf8);
+                i += utf8_char_step(bytes, i);
             }
         } else {
-            i += std::str::from_utf8(&bytes[i..])
-                .ok()
-                .and_then(|s| s.chars().next())
-                .map_or(1, char::len_utf8);
+            i += utf8_char_step(bytes, i);
         }
         if i < bytes.len() && bytes[i] == b'\'' {
             i += 1;
@@ -78,10 +104,7 @@ pub fn trim_asm_line(s: &str) -> &str {
             if bytes[i] == b'\\' {
                 i += 1;
                 if i < bytes.len() {
-                    i += std::str::from_utf8(&bytes[i..])
-                        .ok()
-                        .and_then(|rest| rest.chars().next())
-                        .map_or(1, char::len_utf8);
+                    i += utf8_char_step(bytes, i);
                 }
                 keep_end = i;
                 continue;
@@ -107,10 +130,7 @@ pub fn trim_asm_line(s: &str) -> &str {
                 i += 1;
             }
             _ => {
-                i += std::str::from_utf8(&bytes[i..])
-                    .ok()
-                    .and_then(|rest| rest.chars().next())
-                    .map_or(1, char::len_utf8);
+                i += utf8_char_step(bytes, i);
                 keep_end = i;
             }
         }
@@ -140,10 +160,7 @@ pub fn split_comma_args(s: &str) -> Vec<&str> {
             if bytes[i] == b'\\' {
                 i += 1;
                 if i < bytes.len() {
-                    i += std::str::from_utf8(&bytes[i..])
-                        .ok()
-                        .and_then(|rest| rest.chars().next())
-                        .map_or(1, char::len_utf8);
+                    i += utf8_char_step(bytes, i);
                 }
                 continue;
             }
@@ -952,10 +969,7 @@ fn parse_single_integer(s: &str) -> Result<i64, String> {
             i += 1;
         } else {
             val = bytes[i] as i64;
-            i += std::str::from_utf8(&bytes[i..])
-                .ok()
-                .and_then(|rest| rest.chars().next())
-                .map_or(1, char::len_utf8);
+            i += utf8_char_step(bytes, i);
         }
         if i < bytes.len() && bytes[i] == b'\'' {
             i += 1;
@@ -1578,5 +1592,100 @@ mod tests {
                 b' ' as i64,
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod utf8_char_step_equivalence {
+    use super::utf8_char_step;
+
+    /// The exact idiom `utf8_char_step` replaces: validate the WHOLE suffix,
+    /// then take the first character's width (or 1 on any validation failure).
+    fn old_step(bytes: &[u8], i: usize) -> usize {
+        std::str::from_utf8(&bytes[i..])
+            .ok()
+            .and_then(|s| s.chars().next())
+            .map_or(1, char::len_utf8)
+    }
+
+    fn assert_equivalent(bytes: &[u8], label: &str) {
+        for i in 0..bytes.len() {
+            assert_eq!(
+                utf8_char_step(bytes, i),
+                old_step(bytes, i),
+                "{label}: mismatch at offset {i} of {} bytes",
+                bytes.len()
+            );
+        }
+        assert_eq!(utf8_char_step(bytes, bytes.len()), 1, "{label}: past-end");
+        assert_eq!(
+            utf8_char_step(bytes, bytes.len() + 7),
+            1,
+            "{label}: far past-end"
+        );
+    }
+
+    #[test]
+    fn matches_the_original_idiom_on_valid_utf8_at_every_offset() {
+        let samples = [
+            "",
+            "a",
+            "hello, world",
+            "caf\u{e9} \u{20ac} \u{1d11e}",
+            "\0\u{1}\u{7f}",
+            "\u{65e5}\u{672c}\u{8a9e}",
+            "a\u{10ffff}b",
+            "  mixed  \u{e9}  text  ",
+            "    .byte 32, 32, 32 # comment",
+        ];
+        for (n, s) in samples.iter().enumerate() {
+            assert_equivalent(s.as_bytes(), &format!("utf8 sample {n}"));
+        }
+    }
+
+    #[test]
+    fn matches_the_original_idiom_on_arbitrary_invalid_byte_slices() {
+        // Every single byte value in several positions, plus every prefix of
+        // the full byte alphabet (so truncated multi-byte sequences, lone
+        // continuations, overlong leads and surrogates all occur).
+        for b in 0u8..=255 {
+            assert_equivalent(&[b], "single byte");
+            assert_equivalent(&[b, b'a'], "byte plus ascii");
+            assert_equivalent(&[b'a', b], "ascii plus byte");
+            assert_equivalent(&[0xc2, b], "2-byte lead plus every byte");
+            assert_equivalent(&[0xe0, 0xa0, b], "3-byte lead plus every byte");
+            assert_equivalent(&[0xf0, 0x90, 0x80, b], "4-byte lead plus every byte");
+        }
+        let alphabet: Vec<u8> = (0u8..=255).collect();
+        for cut in [1usize, 2, 3, 7, 31, 63, 127, 128, 255, 256] {
+            assert_equivalent(&alphabet[..cut], "alphabet prefix");
+        }
+        // Deterministic xorshift64*: 200 arbitrary slices, no flaky RNG.
+        let mut state: u64 = 0x7815_342c_1234_5678;
+        let mut next = || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        };
+        for n in 0..200 {
+            let len = 1 + (next() % 96) as usize;
+            let v: Vec<u8> = (0..len).map(|_| (next() & 0xff) as u8).collect();
+            assert_equivalent(&v, &format!("random slice {n}"));
+        }
+    }
+
+    #[test]
+    fn ascii_bytes_are_decided_without_touching_the_suffix() {
+        // The performance contract: a 20 MB ASCII line must not revalidate its
+        // suffix per byte. `utf8_char_step` returns 1 immediately for ASCII;
+        // this pins the fast-path classification for all 128 ASCII bytes and
+        // all continuation bytes without any allocation.
+        for b in 0u8..=0x7f {
+            assert_eq!(utf8_char_step(&[b, 0xff, 0xff], 0), 1);
+        }
+        for b in 0x80..=0xbf {
+            assert_eq!(utf8_char_step(&[b, 0x41], 0), 1);
+        }
     }
 }

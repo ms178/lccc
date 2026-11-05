@@ -1,9 +1,9 @@
 {
   "fns_over_1000": 26,
-  "fns_over_300": 232,
+  "fns_over_300": 233,
   "fns_over_500": 97,
   "ignored_tests": 10,
-  "knob_literals": 561,
+  "knob_literals": 563,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -135,6 +135,7 @@
     "CCC_LAYOUT_TIE_ORIG",
     "CCC_LCR_LIMIT",
     "CCC_LEAF_STRICT_CALL_FREE",
+    "CCC_LEGACY_BYTE_STRINGS",
     "CCC_LIVE_IN_BLOCK_END",
     "CCC_LOOP_ALIGN_HOT",
     "CCC_LOOP_IDIOM",
@@ -436,6 +437,7 @@
     "CCC_SIMPLIFY_SKIP",
     "CCC_SINK_DEBUG",
     "CCC_SLOT_CENSUS",
+    "CCC_SLOW_DEAD_MOVE_CENSUS",
     "CCC_SPLIT_MAX",
     "CCC_SROA_COPYOUT",
     "CCC_SSA_PARAM_LOG",
