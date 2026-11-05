@@ -1929,7 +1929,10 @@ fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize
                     let last = parts.len() - 1;
                     if parts[last] == from {
                         parts[last] = to.as_str();
-                        lines[k] = parts.join(" ");
+                        // Keep the instruction indented: a column-0 line
+                        // reads as a symbol boundary to every census that
+                        // delimits functions by their first column.
+                        lines[k] = format!("    {}", parts.join(" "));
                         kinds[k] = classify_line(&lines[k]);
                     }
                 }
@@ -1966,6 +1969,19 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
     let mut cfg: Option<Cfg> = None;
     let mut cfg_resolvable = true;
     let mut changed = false;
+    // Labels some line other than their own definition names: the entry
+    // points of their blocks from elsewhere.
+    // Owned: the rewrites below change register operands, never labels.
+    let referenced: FxHashSet<String> = (0..n)
+        .filter(|&k| kinds[k] != LineKind::Label && kinds[k] != LineKind::Nop)
+        .flat_map(|k| {
+            lines[k]
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+                .filter(|tok| tok.starts_with(".L"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect();
     for i in 0..n {
         let LineKind::Move {
             dst,
@@ -1983,6 +1999,15 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
         let mut provably_dead = false;
         let mut dead_by_redef = false;
         let mut src_alive = true;
+        // Still on a straight path from the mov: no label another path can
+        // enter through, no unconditional transfer or return passed.  Only
+        // there is `dst == src` a fact at a read.  Past that point another
+        // path can reach the read with dst holding a different value (or
+        // src redefined further down a loop), so renaming it onto src is a
+        // miscompile: gcc.c-torture pr39100 at -O2 stored through x13 --
+        // the pointer of the other list -- because `mov x8, x13` ended one
+        // arm of a diamond and `str xzr, [x8]` sat after the join.
+        let mut straight = true;
         // Has the scan left the basic block that holds `mov dst, src`?  Only a
         // redefinition in that SAME block dominates every path leaving the mov,
         // so only there does an overwrite prove the mov's value dead.
@@ -2015,8 +2040,13 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
                         valid = false;
                         break;
                     }
+                    straight = false;
                 }
-                LineKind::Label => {}
+                LineKind::Label => {
+                    if referenced.contains(lines[j].trim().trim_end_matches(':')) {
+                        straight = false;
+                    }
+                }
                 // Calls clobber src (x0) and all caller-saved registers. Rather
                 // than reason about save/restore pairs, stop without committing.
                 LineKind::Call => {
@@ -2103,7 +2133,8 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
                             break;
                         }
                         let address = format!("[{}", xreg_name(dst));
-                        if src_alive
+                        if straight
+                            && src_alive
                             && mention_count(&lines[j], dst) == 1
                             && lines[j].contains(&address)
                         {
@@ -2118,6 +2149,11 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
                         }
                     }
                 }
+            }
+            // Code after an unconditional branch is reached only through a
+            // label, i.e. from some other path.
+            if kinds[j] == LineKind::Branch {
+                straight = false;
             }
             j += 1;
         }
@@ -4981,24 +5017,68 @@ fn retarget_branch_over_branch(head: &str, kind: LineKind, real_target: &str) ->
 
 /// Recognise `head; b .target; .Lskip:` starting at `i` and return the index of
 /// the redundant unconditional branch together with the rewritten head.
+/// A line the branch-over-branch fusion may step over: padding whose size is
+/// bounded by its own text (`.p2align N[,,max]`, CFI, `.loc`) or a label no
+/// other line names (entered only by falling into it, so no path changes).
+/// The far-branch expansion leaves `.Lskip_N:` between a head and its `b`
+/// once its own head has been retargeted, and the code generator aligns
+/// every loop header, so the loop-entry `b.cc .Lbody; b .Lexit` pair was
+/// never fused.
+fn fusion_skippable(
+    lines: &[String],
+    kinds: &[LineKind],
+    k: usize,
+    referenced: &FxHashSet<String>,
+) -> bool {
+    match kinds[k] {
+        LineKind::Nop => true,
+        LineKind::Directive => {
+            let t = lines[k].trim();
+            t.starts_with(".cfi_")
+                || t.starts_with(".loc ")
+                || t.starts_with(".p2align ")
+                || t.starts_with(".balign ")
+                || t.starts_with(".align ")
+        }
+        LineKind::Label => {
+            let name = lines[k].trim().trim_end_matches(':');
+            name.starts_with(".L") && !referenced.contains(name)
+        }
+        _ => false,
+    }
+}
+
 fn fused_branch_head(
     lines: &[String],
     kinds: &[LineKind],
     n: usize,
     i: usize,
     census: &BranchCensus,
+    referenced: &FxHashSet<String>,
 ) -> Option<(usize, String)> {
     let head_kind = kinds[i];
     if !is_range_limited_branch(head_kind) {
         return None;
     }
-    let j = next_insn(kinds, i + 1, n)?;
-    let k = next_insn(kinds, j + 1, n)?;
-    if kinds[j] != LineKind::Branch || kinds[k] != LineKind::Label {
-        return None;
-    }
     // The head must branch exactly over the unconditional branch.
     let skip_target = range_limited_branch_target(&lines[i], head_kind)?;
+    let mut j = i + 1;
+    while j < n && fusion_skippable(lines, kinds, j, referenced) {
+        j += 1;
+    }
+    if j >= n || kinds[j] != LineKind::Branch {
+        return None;
+    }
+    let mut k = j + 1;
+    while k < n
+        && !(kinds[k] == LineKind::Label && label_name(&lines[k]) == Some(skip_target))
+        && fusion_skippable(lines, kinds, k, referenced)
+    {
+        k += 1;
+    }
+    if k >= n || kinds[k] != LineKind::Label {
+        return None;
+    }
     if skip_target != label_name(&lines[k])? {
         return None;
     }
@@ -5023,6 +5103,19 @@ fn fused_branch_head(
 fn fuse_branch_over_branch(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
     let mut census: Option<BranchCensus> = None;
+    // Labels some other line names; a retarget below changes which label a
+    // head names, so the set is a superset of the live references -- which
+    // only makes the fusion more conservative.
+    let referenced: FxHashSet<String> = (0..n)
+        .filter(|&k| !matches!(kinds[k], LineKind::Label | LineKind::Nop))
+        .flat_map(|k| {
+            lines[k]
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+                .filter(|tok| tok.starts_with(".L"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect();
     let mut i = 0;
     while i + 2 < n {
         if !is_range_limited_branch(kinds[i]) {
@@ -5030,7 +5123,9 @@ fn fuse_branch_over_branch(lines: &mut [String], kinds: &mut [LineKind], n: usiz
             continue;
         }
         let census = census.get_or_insert_with(|| BranchCensus::new(lines, kinds));
-        if let Some((removed, rewritten)) = fused_branch_head(lines, kinds, n, i, census) {
+        if let Some((removed, rewritten)) =
+            fused_branch_head(lines, kinds, n, i, census, &referenced)
+        {
             // Retarget the head, then drop the unconditional branch. The skip
             // label stays: other predecessors may still branch to it.
             lines[i] = rewritten;

@@ -32,7 +32,7 @@ FIXTURES = (
     "divrem_pair_cross", "urem_by_one_cross", "va_arg_align16_cross",
     "overaligned_aggregate_arg_cross", "indirect_variadic_call_cross",
     "callee_saved_return_paths_cross", "entry_copy_abi_reads_cross",
-    "asm_scalar_operand_classes_cross",
+    "asm_scalar_operand_classes_cross", "alias_copy_after_join_cross",
 )
 ALL_LEVELS = ("-O0", "-O1", "-O2", "-Os")
 LEVELS = {
@@ -63,6 +63,9 @@ LEVELS = {
     # AArch64 -O2: `"r"(double)` with an FP-register home was an internal
     # compiler error; RISC-V -O1+: so was an `"f"` integer with a register home.
     "asm_scalar_operand_classes_cross": ALL_LEVELS,
+    # AArch64 -O2/-Os: an address-alias rename carried `mov x8, x13` past a
+    # join that other paths reach with x8 holding another pointer.
+    "alias_copy_after_join_cross": ALL_LEVELS,
 }
 # Two-unit psABI fixtures under interop/: `<name>_callee.c` and
 # `<name>_caller.c`, linked LCCC-with-LCCC and LCCC-with-Clang in both
