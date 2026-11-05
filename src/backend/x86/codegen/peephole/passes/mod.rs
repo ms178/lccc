@@ -2421,12 +2421,16 @@ fn peephole_optimize_inner(
     // Phase 8e also hoists identical arm heads above their `jcc` first
     // (`CCC_PEEPHOLE_SKIP=arm_head_hoist`): it turns `jcc .L; .LF: mov; jmp
     // f; .L: mov; jmp g` into a relay the conditional tail call can absorb.
-    if !sk("arm_head_hoist") {
-        jump_thread::hoist_common_arm_heads(&mut store, &mut infos);
-    }
-    if !sk("cond_tail_call") {
-        jump_thread::fold_conditional_tail_calls(&mut store, &mut infos);
-    }
+    // Both passes share ONE whole-TU label analysis (`run_phase8e`): the
+    // hoist finishes with counts for the final text, so the fold reuses them
+    // instead of scanning the translation unit a second time. The skip
+    // masks keep their exact bisection meaning.
+    let _ = jump_thread::run_phase8e(
+        &mut store,
+        &mut infos,
+        !sk("arm_head_hoist"),
+        !sk("cond_tail_call"),
+    );
 
     // Phase 9: Re-run the always-on text passes on the FINAL text. The early
     // pushfq/popfq elimination is conservative about rsp-relative memory

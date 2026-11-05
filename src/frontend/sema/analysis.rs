@@ -340,6 +340,42 @@ enum IConvContext<'a> {
     Argument { index: usize, callee: &'a str },
 }
 
+/// Which declarator layer owns a parameter's TOP-LEVEL `const`.
+///
+/// The two parameter-declaration sites in this file used to carry identical
+/// 14-line copies of this decision. A pure classifier makes drift impossible
+/// and lets every branch be unit-tested without constructing a full
+/// `ParamDecl`/`SemanticAnalyzer`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParamTopConstSource {
+    /// `int a[const 2]`: qualifiers of the adjusted pointer (C23 6.7.7.4p7).
+    AdjustedArray,
+    /// `int *const p` / `int (*const p)(int)`: the pointer object's quals.
+    PointerObject,
+    /// `const int p`: the base type (possibly via a typedef).
+    BaseType,
+}
+
+fn param_top_const_source(
+    decayed_array: bool,
+    pointer_depth: u32,
+    has_fptr_params: bool,
+    paren_star_quals: usize,
+) -> ParamTopConstSource {
+    if decayed_array {
+        return ParamTopConstSource::AdjustedArray;
+    }
+    // A function-POINTER parameter has no leading stars, but its object is
+    // still the group's pointer: `int (*const p)(int)` makes `p = 0`
+    // read-only. A function-TYPED parameter (`*const p(int)`) has no group
+    // star quals -- there the star is its return type, and top-level const
+    // belongs to the base type instead.
+    if pointer_depth > 0 || (has_fptr_params && paren_star_quals > 0) {
+        return ParamTopConstSource::PointerObject;
+    }
+    ParamTopConstSource::BaseType
+}
+
 impl SemanticAnalyzer {
     pub fn new() -> Self {
         let mut analyzer = Self {
@@ -666,13 +702,7 @@ impl SemanticAnalyzer {
                 // A parameter declared as an array is a pointer whose own
                 // qualifiers are those written inside its first `[...]`
                 // (C23 6.7.7.4p7): `int a[const 2]` makes `a = 0` an error.
-                let top_const = if param.decayed_array {
-                    param.adjusted_cvr & PtrQuals::CONST != 0
-                } else if param.pointer_depth > 0 {
-                    param.pointer_const
-                } else {
-                    param.is_const || self.base_typedef_is_top_const(&param.type_spec)
-                };
+                let top_const = self.param_top_const(param);
                 let mut pointer_quals =
                     self.base_typedef_pointer_quals(&param.type_spec, param.is_const);
                 pointer_quals.extend(param.pointer_quals.iter().copied());
@@ -954,13 +984,7 @@ impl SemanticAnalyzer {
                 // A parameter declared as an array is a pointer whose own
                 // qualifiers are those written inside its first `[...]`
                 // (C23 6.7.7.4p7): `int a[const 2]` makes `a = 0` an error.
-                let top_const = if param.decayed_array {
-                    param.adjusted_cvr & PtrQuals::CONST != 0
-                } else if param.pointer_depth > 0 {
-                    param.pointer_const
-                } else {
-                    param.is_const || self.base_typedef_is_top_const(&param.type_spec)
-                };
+                let top_const = self.param_top_const(param);
                 let mut pointer_quals =
                     self.base_typedef_pointer_quals(&param.type_spec, param.is_const);
                 pointer_quals.extend(param.pointer_quals.iter().copied());
@@ -10328,6 +10352,22 @@ dereference it before applying '->' to it?"
     /// stars' last one (`char *const p`), or an array parameter's first
     /// `[...]` (`int a[const 2]`). `None` for an alias of an array or
     /// function type, a function pointer and a parenthesised declarator.
+    /// Top-level const of a parameter object, from the ONE shared classifier.
+    fn param_top_const(&self, param: &ParamDecl) -> bool {
+        match param_top_const_source(
+            param.decayed_array,
+            param.pointer_depth,
+            param.fptr_params.is_some(),
+            param.paren_star_quals.len(),
+        ) {
+            ParamTopConstSource::AdjustedArray => param.adjusted_cvr & PtrQuals::CONST != 0,
+            ParamTopConstSource::PointerObject => param.pointer_const,
+            ParamTopConstSource::BaseType => {
+                param.is_const || self.base_typedef_is_top_const(&param.type_spec)
+            }
+        }
+    }
+
     fn param_object_cvr(&self, param: &ParamDecl, ty: &CType) -> Option<u8> {
         use crate::common::type_builder::TypeConvertContext;
         if param.fptr_params.is_some() || !param.paren_star_quals.is_empty() {
@@ -13009,5 +13049,65 @@ mod enum_conversion_metadata_tests {
         assert!(analyzer.enum_conversion_source(&expr).is_none());
         analyzer.symbol_table.pop_scope();
         assert!(analyzer.enum_conversion_source(&expr).is_some());
+    }
+}
+
+#[cfg(test)]
+mod param_top_const_tests {
+    use super::{ParamTopConstSource, param_top_const_source};
+
+    #[test]
+    fn adjusted_array_wins_over_everything_else() {
+        assert_eq!(
+            param_top_const_source(true, 0, false, 0),
+            ParamTopConstSource::AdjustedArray
+        );
+        assert_eq!(
+            param_top_const_source(true, 3, true, 2),
+            ParamTopConstSource::AdjustedArray
+        );
+    }
+
+    #[test]
+    fn any_leading_star_selects_the_pointer_object() {
+        for depth in 1..=3 {
+            assert_eq!(
+                param_top_const_source(false, depth, false, 0),
+                ParamTopConstSource::PointerObject
+            );
+        }
+    }
+
+    #[test]
+    fn function_pointer_group_stars_select_the_pointer_object() {
+        assert_eq!(
+            param_top_const_source(false, 0, true, 1),
+            ParamTopConstSource::PointerObject
+        );
+        assert_eq!(
+            param_top_const_source(false, 0, true, 2),
+            ParamTopConstSource::PointerObject
+        );
+    }
+
+    #[test]
+    fn function_typed_parameter_without_group_stars_uses_the_base_type() {
+        // `*const p(int)`: the star is the RETURN type, not the object.
+        assert_eq!(
+            param_top_const_source(false, 0, true, 0),
+            ParamTopConstSource::BaseType
+        );
+        assert_eq!(
+            param_top_const_source(false, 0, false, 1),
+            ParamTopConstSource::BaseType
+        );
+    }
+
+    #[test]
+    fn plain_scalar_uses_the_base_type() {
+        assert_eq!(
+            param_top_const_source(false, 0, false, 0),
+            ParamTopConstSource::BaseType
+        );
     }
 }

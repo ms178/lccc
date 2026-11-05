@@ -1544,6 +1544,21 @@ impl Parser {
             self.attrs.declarator_object_space = AddressSpace::Default;
             let (name, derived, _, _, decl_aligned, decl_packed) =
                 self.parse_declarator_with_attrs();
+            // C11 6.7.2.1p2: a member shall not have function type. GCC 16.2
+            // and Clang 23.1.4 reject `struct S { int m(int); };` and the K&R
+            // `int (*const (m)(int));` with "field 'm' declared as a
+            // function". A function-POINTER field ends in FunctionPointer
+            // (the parenthesised star keeps its Pointer marker), so the
+            // `derived.last()` test leaves `int (*m)(int)` legal.
+            if matches!(derived.last(), Some(DerivedDeclarator::Function(..))) {
+                self.emit_error(
+                    format!(
+                        "field '{}' declared as a function",
+                        name.as_deref().unwrap_or("")
+                    ),
+                    declarator_span,
+                );
+            }
             // The declarator's volatile qualifiers (see `declarator_base_volatile`).
             let decl_base_volatile = self.attrs.declarator_base_volatile;
             let decl_base_restrict = self.attrs.declarator_base_restrict;
