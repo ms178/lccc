@@ -94,6 +94,7 @@ DW_TAG_VOLATILE_TYPE = 0x35
 DW_TAG_RESTRICT_TYPE = 0x37
 
 DW_AT_LOCATION = 0x02
+DW_AT_RANGES = 0x55
 DW_AT_NAME = 0x03
 DW_AT_ABSTRACT_ORIGIN = 0x31
 DW_AT_SPECIFICATION = 0x47
@@ -975,6 +976,115 @@ def arange_sets(elf: Elf) -> list[ArangeSet]:
     return out
 
 
+# --- range lists --------------------------------------------------------------
+#
+# A unit whose code sits in more than one section cannot be described by one
+# low/high pair, so it names a range list instead (DWARF 5 `.debug_rnglists`,
+# DWARF 2..4 `.debug_ranges`). That is the shape of every `-ffunction-sections`
+# build -- the kernel's and Debian's default -- so a consumer that cannot read it
+# cannot debug those programs at all.
+
+
+@dataclass
+class RangeList:
+    offset: int
+    ranges: list[tuple[int, int]]
+
+
+def range_lists(elf: Elf, version: int) -> list[RangeList]:
+    """Every range list in `.debug_rnglists` (v5) or `.debug_ranges` (v2..4).
+
+    Version 5's section is a table: a twelve-byte header (unit length, version,
+    address size, segment selector size, offset-entry count), the offset table,
+    then the lists. The older section is a bare sequence of address pairs, where
+    `(0, 0)` ends a list and `(-1, base)` rebases the pairs that follow.
+    """
+    out: list[RangeList] = []
+    if version >= 5:
+        data = elf.sections.get(".debug_rnglists")
+        if data is None:
+            return out
+        offset = 0
+        while offset + 12 <= len(data):
+            length = int.from_bytes(data[offset : offset + 4], elf.order)
+            if length == 0:
+                break
+            if length == 0xFFFFFFFF:
+                raise ValueError("64-bit .debug_rnglists tables are not emitted by lccc")
+            end = offset + 4 + length
+            if end > len(data):
+                raise ValueError("range list table runs past .debug_rnglists")
+            table_version = int.from_bytes(data[offset + 4 : offset + 6], elf.order)
+            if table_version != 5:
+                raise ValueError(f"range list table version {table_version}, expected 5")
+            address_size = data[offset + 6]
+            entry_count = int.from_bytes(data[offset + 8 : offset + 12], elf.order)
+            cursor = offset + 12 + 4 * entry_count
+            if cursor > end:
+                raise ValueError("range list offset table runs past its header")
+            while cursor < end:
+                list_offset = cursor
+                ranges: list[tuple[int, int]] = []
+                base = 0
+                while True:
+                    if cursor >= end:
+                        raise ValueError("range list without DW_RLE_end_of_list")
+                    opcode = data[cursor]
+                    cursor += 1
+                    if opcode == 0x00:  # DW_RLE_end_of_list
+                        break
+                    if opcode == 0x07:  # DW_RLE_start_length
+                        start = int.from_bytes(data[cursor : cursor + address_size], elf.order)
+                        cursor += address_size
+                        length, cursor = _uleb(data, cursor)
+                        ranges.append((start, start + length))
+                    elif opcode == 0x06:  # DW_RLE_base_address
+                        base = int.from_bytes(data[cursor : cursor + address_size], elf.order)
+                        cursor += address_size
+                    elif opcode == 0x05:  # DW_RLE_offset_pair
+                        begin, cursor = _uleb(data, cursor)
+                        finish, cursor = _uleb(data, cursor)
+                        ranges.append((base + begin, base + finish))
+                    elif opcode in (0x02, 0x03, 0x04):  # the *_startx family
+                        raise ValueError("indexed range list opcodes are not emitted by lccc")
+                    else:
+                        raise ValueError(f"unknown range list opcode {opcode:#04x}")
+                out.append(RangeList(offset=list_offset, ranges=ranges))
+            offset = end
+        return out
+    data = elf.sections.get(".debug_ranges")
+    if data is None:
+        return out
+    address_size = elf.address_size
+    pair = 2 * address_size
+    maximum = (1 << (8 * address_size)) - 1
+    offset = 0
+    while offset + pair <= len(data):
+        list_offset = offset
+        ranges: list[tuple[int, int]] = []
+        base = 0
+        while offset + pair <= len(data):
+            start = int.from_bytes(data[offset : offset + address_size], elf.order)
+            finish = int.from_bytes(data[offset + address_size : offset + pair], elf.order)
+            offset += pair
+            if start == 0 and finish == 0:
+                break
+            if start == maximum:
+                base = finish
+                continue
+            ranges.append((base + start, base + finish))
+        if ranges:
+            out.append(RangeList(offset=list_offset, ranges=ranges))
+    return out
+
+
+def ranges_for(elf: Elf, lists: list[RangeList], offset: int) -> list[tuple[int, int]]:
+    for candidate in lists:
+        if candidate.offset == offset:
+            return candidate.ranges
+    raise ValueError(f"no range list starts at {offset:#x}")
+
+
 # --- .eh_frame ----------------------------------------------------------------
 
 
@@ -1359,6 +1469,17 @@ def check_unit_structure(report: Report, elf: Elf, version: int, label: str) -> 
     return parsed
 
 
+def is_dropped_die(low: int, high: int, name: str, live: set[str]) -> bool:
+    """Whether a DIE describes code a `--gc-sections` link removed.
+
+    A dropped section's address relocation resolves to zero, so the DIE survives
+    as `[0, size)`. That is only the linker's doing when the name is no longer a
+    symbol: a *live* function at address zero is a defect, and this predicate
+    deliberately says so.
+    """
+    return low == 0 and high > 0 and name not in live
+
+
 def check_subprograms(
     report: Report, elf: Elf, parsed: list[Unit], label: str, spans: list[FunctionSpan],
     prefix: str = "pq_"
@@ -1369,6 +1490,14 @@ def check_subprograms(
         for name, payload in elf.sections.items()
         if name == ".text" or name.startswith(".text.")
     }
+    # A link with `--gc-sections` (the kernel's and Debian's default) drops a
+    # function's section but leaves the DIE that described it, whose address
+    # relocation then resolves to zero. Both compilers leave those DIEs behind, so
+    # a zero address on a name that is *not* a live symbol is the linker's doing,
+    # not a range defect -- while a zero address on a live symbol still is one.
+    live = {symbol.name for symbol in elf.functions()}
+    dropped = 0
+    stale_spans: list[tuple[int, int]] = []
     ranges: dict[str, tuple[int, int]] = {}
     for unit in parsed:
         for name, low, high, die in subprogram_ranges(elf, unit, unit.version):
@@ -1377,6 +1506,10 @@ def check_subprograms(
             # function the probe did not name with the prefix.  The *assertions*
             # below are scoped to the probe's own names.
             probe_owned = name.startswith(prefix)
+            if is_dropped_die(low, high, name, live):
+                dropped += 1
+                stale_spans.append((low, high))
+                continue
             if name in ranges:
                 report.fail("subprogram_duplicate", f"{label}: {name} has two subprogram DIEs")
                 continue
@@ -1411,6 +1544,9 @@ def check_subprograms(
                     "local's address from the frame",
                 )
             ranges[name] = (low, high)
+    if dropped:
+        report.measurements.setdefault("dropped_dies", {})[label] = dropped
+        report.measurements.setdefault("dropped_spans", {})[label] = sorted(stale_spans)
     symbols = {symbol.name: symbol for symbol in elf.functions()}
     for name, symbol in symbols.items():
         if name not in ranges and not name.startswith(prefix):
@@ -1513,6 +1649,14 @@ def check_lines(
                 (name for name, (low, high) in ranges.items() if row.address == high),
                 None,
             )
+            if owner is None and any(
+                low <= row.address < high
+                for low, high in report.measurements.get("dropped_spans", {}).get(label, ())
+            ):
+                stale_rows = report.measurements.setdefault("stale_rows", {})
+                stale_rows[label] = stale_rows.get(label, 0) + 1
+                owner = None
+                continue
             if owner is None:
                 if width > 0:
                     report.fail(
@@ -1614,6 +1758,67 @@ def check_aranges(report: Report, elf: Elf, parsed: list[Unit], ranges: dict[str
             )
 
 
+def check_range_lists(
+    report: Report, elf: Elf, parsed: list[Unit], ranges: dict[str, tuple[int, int]], label: str
+) -> None:
+    """A multi-section unit describes itself with a range list a consumer can read."""
+    if not parsed:
+        return
+    try:
+        lists = range_lists(elf, parsed[0].version)
+    except ValueError as error:
+        report.fail("range_list", f"{label}: {error}")
+        return
+    for unit in parsed:
+        root = unit.root()
+        if root is None:
+            continue
+        offset = root.attrs.get(DW_AT_RANGES)
+        if not isinstance(offset, int):
+            continue
+        try:
+            listed = ranges_for(elf, lists, offset)
+        except ValueError as error:
+            report.fail("range_list", f"{label}: unit at {unit.offset:#x}: {error}")
+            continue
+        stale = [entry for entry in listed if entry[0] == 0]
+        listed = [entry for entry in listed if entry[0] != 0]
+        if stale:
+            report.measurements.setdefault("stale_ranges", {})[label] = len(stale)
+        if not listed:
+            report.fail(
+                "range_list",
+                f"{label}: unit at {unit.offset:#x} names an empty range list"
+                if not stale
+                else f"{label}: every range in the unit's list is stale",
+            )
+            continue
+        for start, end in listed:
+            if end <= start:
+                report.fail(
+                    "range_list",
+                    f"{label}: unit at {unit.offset:#x} lists [{start:#x}, {end:#x}), which "
+                    "covers nothing",
+                )
+        ordered = sorted(listed)
+        for (_, previous_end), (next_start, _) in zip(ordered, ordered[1:]):
+            if next_start < previous_end:
+                report.fail(
+                    "range_list",
+                    f"{label}: unit at {unit.offset:#x} lists overlapping ranges at "
+                    f"{next_start:#x}",
+                )
+        low = root.attrs.get(DW_AT_LOW_PC)
+        if isinstance(low, int) and low not in (0, ordered[0][0]):
+            report.fail(
+                "range_list",
+                f"{label}: DW_AT_low_pc {low:#x} is neither 0 nor the first range start "
+                f"{ordered[0][0]:#x}, so a consumer that offsets ranges by it lands in the "
+                "wrong place",
+            )
+    report.measurements.setdefault("range_lists", {})[label] = len(lists)
+
+
 def check_eh_frame(report: Report, elf: Elf, ranges: dict[str, tuple[int, int]], label: str) -> None:
     """Every function with code has an FDE, so a consumer can unwind out of it."""
     try:
@@ -1625,6 +1830,8 @@ def check_eh_frame(report: Report, elf: Elf, ranges: dict[str, tuple[int, int]],
         report.fail("eh_frame", f"{label}: no FDE covers any function")
         return
     for name, (low, high) in sorted(ranges.items()):
+        if low == 0 and high > 0:  # see is_dropped_die
+            continue
         if not any(entry.begin <= low and high <= entry.end for entry in entries):
             report.fail(
                 "eh_frame",
@@ -2540,6 +2747,68 @@ def run_gate(lccc: list[str], gcc: list[str] | None, workdir: Path) -> Report:
             check_type_dies(report, elf, parsed, label, facts)
             check_object_locations(report, elf, parsed, label, facts)
 
+    # One function per section is the kernel's and Debian's default packaging, and
+    # it moves a unit from a low/high pair to a range list -- a different section,
+    # a different encoding, and the only path in which `.debug_rnglists` (v5) or
+    # `.debug_ranges` (v2..4) is emitted at all.
+    for version, function_sections in (("2", False), ("4", True), ("5", True), ("5", False)):
+        if not function_sections:
+            continue
+        label = f"dwarf{version}-sections"
+        output = workdir / f"{label}.elf"
+        if not build(
+            report, lccc, ["-g", f"-gdwarf-{version}", "-O0", "-ffunction-sections", "-no-pie"],
+            [probes["probe"]], output, workdir
+        ):
+            continue
+        try:
+            elf = read_elf(output)
+        except ValueError as error:
+            report.fail("elf", f"{label}: {error}")
+            continue
+        parsed = check_unit_structure(report, elf, int(version), label)
+        if not parsed:
+            continue
+        if DW_AT_RANGES not in (parsed[0].root().attrs if parsed[0].root() else {}):
+            report.fail(
+                "range_list",
+                f"{label}: code in {len({name for name in elf.sections if name.startswith('.text')})} "
+                "sections but the unit states one low/high pair",
+            )
+        ranges = check_subprograms(report, elf, parsed, label, spans["probe"])
+        check_lines(report, elf, parsed, ranges, label, spans["probe"])
+        check_range_lists(report, elf, parsed, ranges, label)
+        check_aranges(report, elf, parsed, ranges, label)
+        check_eh_frame(report, elf, ranges, label)
+
+    # `-Wl,--gc-sections` is how the kernel and every Debian package link: it
+    # drops whole function sections, and the DIEs that described them survive with
+    # zeroed addresses. Both compilers leave those behind, so the checks must
+    # recognise them instead of reporting a phantom defect -- and must still fail
+    # when a *live* function's address is zero.
+    label = "dwarf5-gc-sections"
+    output = workdir / f"{label}.elf"
+    if build(
+        report,
+        lccc,
+        ["-g", "-gdwarf-5", "-O0", "-ffunction-sections", "-Wl,--gc-sections", "-no-pie"],
+        [probes["probe"]],
+        output,
+        workdir,
+    ):
+        try:
+            elf = read_elf(output)
+        except ValueError as error:
+            report.fail("elf", f"{label}: {error}")
+        else:
+            parsed = check_unit_structure(report, elf, 5, label)
+            if parsed:
+                ranges = check_subprograms(report, elf, parsed, label, spans["probe"])
+                check_lines(report, elf, parsed, ranges, label, spans["probe"])
+                check_range_lists(report, elf, parsed, ranges, label)
+                check_aranges(report, elf, parsed, ranges, label)
+                check_eh_frame(report, elf, ranges, label)
+
     # Two units in one program: every set must name exactly one unit.
     output = workdir / "multi.elf"
     if build(
@@ -2791,6 +3060,56 @@ def self_test() -> int:
         expect(entries[0].end == target + 0x20, f"self-test FDE end {entries[0].end:#x}")
     except (ValueError, IndexError) as error:
         failures.append(f"self-test eh_frame: {error}")
+
+    # Range lists, version 5: a twelve-byte header, then one list of
+    # `DW_RLE_start_length` entries.
+    rng = bytearray()
+    body = bytearray()
+    body += (5).to_bytes(2, "little") + bytes([8, 0]) + (0).to_bytes(4, "little")
+    for start, length in ((0x401000, 0x20), (0x401040, 0x10)):
+        body += bytes([0x07]) + start.to_bytes(8, "little") + bytes([length])
+    body += bytes([0x00])
+    rng += (len(body)).to_bytes(4, "little") + body
+    elf = Elf(sections={".debug_rnglists": bytes(rng)}, addresses={}, order="little")
+    try:
+        lists = range_lists(elf, 5)
+        expect(len(lists) == 1, f"self-test range list count {len(lists)}")
+        expect(
+            lists[0].ranges == [(0x401000, 0x401020), (0x401040, 0x401050)],
+            f"self-test range list {lists[0].ranges}",
+        )
+        expect(lists[0].offset == 12, f"self-test range list offset {lists[0].offset}")
+    except (ValueError, IndexError) as error:
+        failures.append(f"self-test range lists (v5): {error}")
+
+    # Range lists, DWARF 2..4: bare pairs, `(0, 0)` terminates, `(-1, base)`
+    # rebases what follows.
+    old_form = bytearray()
+    old_form += (0x100000).to_bytes(8, "little") + (0x100020).to_bytes(8, "little")
+    old_form += ((1 << 64) - 1).to_bytes(8, "little") + (0x200000).to_bytes(8, "little")
+    old_form += (0x10).to_bytes(8, "little") + (0x18).to_bytes(8, "little")
+    old_form += bytes(16)
+    elf = Elf(sections={".debug_ranges": bytes(old_form)}, addresses={}, order="little")
+    try:
+        lists = range_lists(elf, 4)
+        expect(len(lists) == 1, f"self-test range list count (v4) {len(lists)}")
+        expect(
+            lists[0].ranges == [(0x100000, 0x100020), (0x200010, 0x200018)],
+            f"self-test range list (v4) {lists[0].ranges}",
+        )
+    except (ValueError, IndexError) as error:
+        failures.append(f"self-test range lists (v4): {error}")
+
+    # A dropped DIE is only dropped when its name is gone from the symbol table.
+    expect(is_dropped_die(0, 0x28, "gone", set()), "self-test dropped DIE not detected")
+    expect(
+        not is_dropped_die(0, 0x28, "live", {"live"}),
+        "self-test: a live function at address zero must stay a defect",
+    )
+    expect(
+        not is_dropped_die(0x401000, 0x28, "gone", set()),
+        "self-test: a real address is never a dropped DIE",
+    )
 
     # Relocation application: a `.debug_str` reference on disk is zero plus an
     # addend, exactly like a real object.

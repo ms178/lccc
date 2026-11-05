@@ -105,6 +105,25 @@ benchmark programs) × 4 configurations (`lccc -O0 -gdwarf-5`, `lccc -O2 -gdwarf
   cannot desynchronize it; AArch64/RISC-V lower it from directives. `.eh_frame`
   and `.eh_frame_hdr` are present, and the gate asserts every function's range is
   covered by an FDE.
+* **`-Wl,--gc-sections` links** (the kernel's and Debian's configuration). The
+  linker drops whole function sections but rewrites neither `.debug_info` nor
+  `.debug_line`, so the DIEs and rows that described them survive with addresses
+  resolved to zero — in **both** compilers: measured, lccc keeps one dropped DIE
+  (`[0, 0x28)`), one stale range-list entry and four stale rows, GCC keeps one
+  (`[0, 0xe)`) and its own stale rows. The gate recognises exactly that residue
+  (a zero address whose name is no longer a symbol) and still fails when a *live*
+  function's address is zero, so the exemption cannot hide a defect. Verified
+  green for both compilers.
+* **Range lists** (the `-ffunction-sections` path, which is the kernel's and
+  Debian's packaging). A unit whose code sits in several sections names a range
+  list instead of a low/high pair, and the gate decodes both encodings:
+  `.debug_rnglists` for version 5 (header, offset table, `DW_RLE_start_length`
+  entries, `DW_RLE_end_of_list`) and `.debug_ranges` for versions 2–4 (`(0, 0)`
+  terminator, `(-1, base)` rebasing). Measured against GCC 16.2 on the same
+  source: identical table shape and length (27 bytes, three
+  `DW_RLE_start_length` entries, terminator), identical ordering, and the CU's
+  `DW_AT_low_pc` base is either 0 (GCC) or the first range's start (lccc) — both
+  legal, and the gate accepts exactly those two.
 * **Address map.** One `.debug_aranges` set per unit, each bound to its own
   `.debug_info` offset by a relocation, one tuple per code section — measured
   identical in *shape* to GCC 16.2 for single- and multi-section units, including
@@ -515,19 +534,25 @@ function. Both are legal, but a consumer that wants one function's rows must
 decode every row first, and a `DW_LNE_end_sequence` is exactly the marker that
 lets it stop. Measured: 5 functions → 1 sequence at every version.
 
-**Where.** `build_dwarf_line_section` (`src/backend/elf/dwarf.rs`): the row
-generator that ends a sequence only when the section changes.
+* GCC 16.2 emits **one sequence for the whole unit** as well. Measured on the
+  gate's five-function probe at `-gdwarf-2/3/4/5 -O0`: lccc `[1 sequence, 5
+  functions]`, GCC `[1, 5]`. At `-O2` GCC reports `[2, 3]` because it splits one
+  function's cold part into another section — a *section* boundary, not a
+  function boundary.
+* With `-ffunction-sections` — one section per function — lccc emits **one
+  sequence per function, exactly like GCC** (measured `[5 sequences, 5 functions]`
+  for both). The rule is "end a sequence where the section changes", which is what
+  both compilers implement; a single `.text` therefore yields a single sequence in
+  both. lccc was never wrong here, and there is nothing to fix.
+* With an address inside the alignment padding between two functions,
+  `addr2line` answers identically for both compilers (`pad.c:1` for an address
+  between `pq_first` and an aligned `pq_second`), because a consumer resolves a
+  gap to the preceding row either way.
 
-**Plan.** End the sequence at each function's end (the writer already knows the
-`DwarfFunction` list and its `offset`/`size`), starting a new one with
-`DW_LNE_set_address`. Keep rows sorted; a sequence must not straddle a gap.
-
-**Gate.** `sequences_vs_functions` in the gate's measurements becomes an
-assertion: `sequences >= functions with code`.
-
-**Risks.** A row emitted exactly at a function's end belongs to that function's
-sequence; ending the sequence after it (not before) keeps `addr2line` answers
-unchanged. Re-run the corpus audit after the change.
+An item that asks for work the other compiler does not do is worse than no item:
+it would rewrite a correct line program for no behavioural gain. The gate records
+the sequence/function ratio for both compilers and would flag a real divergence;
+it does not require a per-function split.
 
 ### D6 · P1 · L — `DW_TAG_inlined_subroutine`
 
@@ -709,6 +734,12 @@ contract:
 * **Mutation-verify**: break the compiler (or point the gate at a wrapper script
   that rewrites the flag), watch the gate fail, then fix. This is how the `-O0`
   static rule was verified in both directions.
+* **Measure a gap against the oracle before writing it down.** D5 was withdrawn
+  because the shape it objected to is GCC's own shape; running the gate with
+  `--lccc "$(which gcc-16)"` takes ten seconds and is the cheapest defence
+  against writing a wish list instead of a campaign. The same run keeps the gap
+  list honest in the other direction: it reports zero gaps for GCC, so every
+  remaining entry is a statement about lccc.
 
 Two properties make the instrument trustworthy, and both were learned by point
 it at **GCC 16.2 instead of lccc**:

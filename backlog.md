@@ -3034,8 +3034,8 @@ per-unit `.debug_aranges` sets, post-peephole synthesized CFI, dialect identity.
 | D14 | P1 | L | local variables and `DW_TAG_lexical_block` (GCC 695 variables, 207 blocks; lccc 68, 0) | every executable local's value equals what the program prints |
 | D15 | P2 | S | an unreferenced declaration costs nothing (`with_referenced` prunes the DIE *and* the types only it reached) | **landed with its gate** |
 
-Ordering is ROI: D4 and D5 are a day each and remove whole classes of
-"no debug info" answers; D1+D2+D3 are the centre (they are what "godlike
+Ordering is ROI: D4 is a day's work and removes a whole class of "no debug info"
+answers; D1+D2+D3 are the centre (they are what "godlike
 debugging" means) and land as a series, each with executable assertions; D6–D12
 are the polish that makes the artifact GCC-shaped rather than merely valid.
 
