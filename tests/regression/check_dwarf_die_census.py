@@ -403,6 +403,24 @@ def main() -> int:
                 f"{'version 3+' if version >= 3 else 'version 2 (absent)'} frame base"
             )
 
+    # A deferral may never name something LCCC actually emits. The static
+    # disjointness assertion above covers the pinned baseline; this one covers
+    # *new* capabilities: if the compiler starts emitting a DIE that is still
+    # listed as deferred, both halves of the gate would ignore it and a later
+    # regression would pass silently. Requiring the measured sets to be clean
+    # makes the deferral list self-invalidating as the compiler improves.
+    require(
+        not (ours_tags & set(DEFERRED_TAGS)),
+        f"DEFERRED_TAGS names DIEs LCCC now emits: "
+        f"{describe(ours_tags & set(DEFERRED_TAGS))} -- move them to BASELINE_TAGS",
+    )
+    require(
+        not (ours_attributes & set(DEFERRED_ATTRIBUTES)),
+        f"DEFERRED_ATTRIBUTES names attributes LCCC now emits: "
+        f"{describe(ours_attributes & set(DEFERRED_ATTRIBUTES))} -- "
+        f"move them to BASELINE_ATTRIBUTES",
+    )
+
     # The baseline is what LCCC states, measured with a readelf that knows every
     # name in it.  A host whose readelf predates an attribute (binutils before
     # `DW_AT_language_name` knew its name, say) cannot *see* it in any object --

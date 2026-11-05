@@ -172,5 +172,33 @@ class DynamicAgreement(unittest.TestCase):
         self.assertFalse(json.loads(proc.stdout)["dynamic"])
 
 
+class ArchitectureParity(unittest.TestCase):
+    """The driver option table is architecture-independent, but the gate only
+    ever runs against the primary driver. A per-arch CLI could diverge (a
+    different `cli.rs` arm, a target-specific refusal) and stay invisible.
+
+    Measured on the rebuilt fastbuild tree: lccc, lccc-i686, lccc-arm and
+    lccc-riscv all report 17 rows and zero problems. Each is a host executable
+    that emits a different target's assembly, so the same probes exercise
+    four back ends. Skip only when the binaries have not been built.
+    """
+
+    DRIVERS = ("lccc", "lccc-i686", "lccc-arm", "lccc-riscv")
+
+    def test_every_supported_arch_driver_agrees_with_the_ledger(self) -> None:
+        present = [REPO / "target/fastbuild" / name for name in self.DRIVERS]
+        if not all(path.is_file() for path in present):
+            self.skipTest("one or more fastbuild arch drivers were not built")
+        rows = ledger.parse_rows(ledger.LEDGER.read_text())
+        for path in present:
+            with self.subTest(driver=path.name):
+                problems = ledger.dynamic_problems(rows, str(path))
+                self.assertEqual(problems, [], f"{path.name}: {problems}")
+
+    def test_the_arch_driver_set_is_pinned(self) -> None:
+        """A new target must be added to the parity sweep deliberately."""
+        self.assertEqual(self.DRIVERS, ("lccc", "lccc-i686", "lccc-arm", "lccc-riscv"))
+
+
 if __name__ == "__main__":
     unittest.main()

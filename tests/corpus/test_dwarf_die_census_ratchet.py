@@ -154,6 +154,36 @@ class DieCensusRatchet(unittest.TestCase):
                             "a lost DW_TAG_variable was not caught:\n" + proc.stdout)
         self.assertIn("lost", proc.stdout + proc.stderr)
 
+    def test_runtime_check_rejects_a_deferral_the_compiler_now_emits(self) -> None:
+        """The import-time assertion only compares the two static tables. If a
+        new LCCC capability is added without updating BASELINE_TAGS, the gate
+        must still refuse a deferral that names it. Remove the baseline entry
+        *and* add the stale deferral, so only the runtime check can catch it."""
+        lccc = optional(os.environ.get("CCC", "target/fastbuild/lccc"))
+        gcc = optional(os.environ.get("GCC16", "gcc-16"))
+        readelf = optional(os.environ.get("READELF", "readelf"))
+        if not all((lccc, gcc, readelf)):
+            self.skipTest("rebuilt lccc, gcc-16 or readelf unavailable")
+        source = GATE.read_text()
+        mutated = source.replace('        "DW_TAG_variable",\n', '', 1)
+        mutated = mutated.replace(
+            'DEFERRED_TAGS = {',
+            'DEFERRED_TAGS = {\n    "DW_TAG_variable": "stale runtime deferral",', 1,
+        )
+        self.assertNotEqual(mutated, source)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "gate.py"
+            path.write_text(mutated)
+            proc = subprocess.run(
+                [shutil.which("python3") or "python3", str(path),
+                 "--lccc", lccc, "--gcc", gcc, "--readelf", readelf,
+                 "--versions", "5"],
+                cwd=ROOT, capture_output=True, text=True, timeout=180,
+            )
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("DEFERRED_TAGS names DIEs LCCC now emits",
+                      proc.stdout + proc.stderr)
+
     def test_live_gate_passes(self) -> None:
         lccc = optional(os.environ.get("CCC", "target/fastbuild/lccc"))
         gcc = optional(os.environ.get("GCC16", "gcc-16"))
