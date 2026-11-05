@@ -313,6 +313,11 @@ fn classify_line(line: &str) -> LineKind {
     if trimmed.is_empty() {
         return LineKind::Nop;
     }
+    // The prologue's return-register contract: read by the liveness, never
+    // emitted.
+    if trimmed.starts_with(RET_REGS_MARKER) {
+        return LineKind::Nop;
+    }
 
     // Directives
     if trimmed.starts_with('.') {
@@ -765,6 +770,7 @@ pub fn peephole_optimize(asm: String) -> String {
     global_changed |= propagate_register_copies(&mut lines, &mut kinds, n);
     global_changed |= eliminate_dead_reg_moves(&lines, &mut kinds, n);
     global_changed |= propagate_copies_within_blocks(&mut lines, &mut kinds, n);
+    global_changed |= propagate_zero_constants(&mut lines, &mut kinds, n);
     global_changed |= eliminate_dead_defs_global(&lines, &mut kinds, n);
     global_changed |= fold_into_memory_operands(&mut lines, &mut kinds, n);
     global_changed |= fold_fp_bounces(&mut lines, &mut kinds, n);
@@ -798,6 +804,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_li_mv_chain(&mut lines, &mut kinds, n);
             changed2 |= eliminate_dead_reg_moves(&lines, &mut kinds, n);
             changed2 |= propagate_copies_within_blocks(&mut lines, &mut kinds, n);
+            changed2 |= propagate_zero_constants(&mut lines, &mut kinds, n);
             changed2 |= eliminate_dead_defs_global(&lines, &mut kinds, n);
             changed2 |= fold_into_memory_operands(&mut lines, &mut kinds, n);
             changed2 |= fold_fp_bounces(&mut lines, &mut kinds, n);
@@ -3194,6 +3201,10 @@ fn eliminate_dead_reg_moves(lines: &[String], kinds: &mut [LineKind], n: usize) 
 // block turns `mv t1, a2; add a2, t1, a5` into `add a2, a2, a5` so that the
 // copy itself becomes one of those dead definitions.
 
+/// The prologue's `# LCCC_RET_REGS a0 a1|a0|-` line: the general registers
+/// the function's `ret` hands back as its value.
+const RET_REGS_MARKER: &str = "# LCCC_RET_REGS";
+
 /// Every general register the liveness tracks (`parse_reg`'s ids).
 const RV_LIVE_ALL: u64 =
     0x7f | (0xfff << REG_S0) | (0xff << REG_A0) | (1 << REG_RA) | (1 << REG_SP);
@@ -3570,6 +3581,23 @@ impl RvLiveness {
                 _ => succs.push(fall),
             }
         }
+        // What `ret` reads: the return-value registers the prologue
+        // published (a0 and a1 when it said nothing), the link register and
+        // every register the caller expects back.
+        let mut ret_value = rv_bit(REG_A0) | rv_bit(REG_A1);
+        if let Some(rest) = (start..end).find_map(|k| lines[k].trim().strip_prefix(RET_REGS_MARKER))
+        {
+            ret_value = 0;
+            for tok in rest.split_whitespace() {
+                match tok {
+                    "a0" => ret_value |= rv_bit(REG_A0),
+                    "a1" => ret_value |= rv_bit(REG_A1),
+                    "-" => {}
+                    _ => ret_value |= rv_bit(REG_A0) | rv_bit(REG_A1),
+                }
+            }
+        }
+        let ret_uses = ret_value | rv_bit(REG_RA) | RV_CALLEE_SAVED;
         let width = end - start;
         let mut live_before = vec![0u64; width];
         let mut live_in = vec![0u64; nb];
@@ -3594,7 +3622,11 @@ impl RvLiveness {
                     }
                 }
                 for k in (starts[b]..bend(b)).rev() {
-                    let (u, d) = rv_uses_defs(&lines[k], kinds[k]);
+                    let (u, d) = if kinds[k] == LineKind::Ret {
+                        (ret_uses, 0)
+                    } else {
+                        rv_uses_defs(&lines[k], kinds[k])
+                    };
                     live = (live & !d) | u;
                     live_before[k - start] = live;
                 }
@@ -4030,6 +4062,88 @@ fn fold_fp_bounces(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bo
                 lines[j] = new_line;
                 changed = true;
             }
+        }
+    }
+    changed
+}
+
+/// Reads of a register just set to 0 read `zero` instead: `li t2, 0;
+/// slt t0, a0, t2` -> `slt t0, a0, zero`.  x0 is a valid source in every
+/// base-ISA operand position, so the rename is shape-free for the line kinds
+/// `rv_rename_reads` knows; the `li` then dies (global liveness).  The
+/// emitter materialises every zero comparand and zero store through a
+/// temporary.
+fn propagate_zero_constants(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n {
+        let LineKind::LoadImm { dst } = kinds[i] else {
+            continue;
+        };
+        let imm = lines[i]
+            .trim()
+            .strip_prefix("li ")
+            .and_then(|r| r.split_once(','));
+        if !imm.is_some_and(|(_, v)| parse_asm_i64(v) == Some(0)) || dst == REG_NONE {
+            continue;
+        }
+        let name = reg_name(dst);
+        let mut j = i + 1;
+        while j < n {
+            match kinds[j] {
+                LineKind::Nop | LineKind::Directive => {
+                    j += 1;
+                    continue;
+                }
+                LineKind::Label | LineKind::Ret | LineKind::Call | LineKind::Jump => break,
+                _ => {}
+            }
+            if lines[j] == OPAQUE_LINE {
+                break;
+            }
+            let (uses, _) = rv_uses_defs(&lines[j], kinds[j]);
+            let writes = named_gp_dest(&lines[j], kinds[j]);
+            if uses & rv_bit(dst) != 0 {
+                let renamed = if matches!(kinds[j], LineKind::Alu | LineKind::Branch) {
+                    let t = lines[j].trim();
+                    t.split_once(|c: char| c.is_ascii_whitespace())
+                        .and_then(|(m, ops)| {
+                            let mut parts: Vec<String> =
+                                ops.split(',').map(|p| p.trim().to_string()).collect();
+                            // Sources: every operand of a branch but its label;
+                            // every operand after the destination of an ALU op.
+                            let (from, to) = if kinds[j] == LineKind::Branch {
+                                (0, parts.len().saturating_sub(1))
+                            } else {
+                                (1, parts.len())
+                            };
+                            let mut hit = false;
+                            for part in parts.iter_mut().take(to).skip(from) {
+                                if part == name {
+                                    *part = "zero".to_string();
+                                    hit = true;
+                                }
+                            }
+                            hit.then(|| format!("    {m} {}", parts.join(", ")))
+                        })
+                } else {
+                    None
+                };
+                match renamed {
+                    Some(new_line)
+                        if rv_uses_defs(&new_line, classify_line(&new_line)).0 & rv_bit(dst)
+                            == 0 =>
+                    {
+                        kinds[j] = classify_line(&new_line);
+                        lines[j] = new_line;
+                        changed = true;
+                    }
+                    _ => break,
+                }
+            }
+            if writes == Some(dst) || kinds[j] == LineKind::Branch || kinds[j] == LineKind::Other {
+                break;
+            }
+            j += 1;
         }
     }
     changed
@@ -4695,6 +4809,33 @@ mod tests {
         assert!(!h.contains("sd a0, -24(s0)"), "{out}");
         // g takes a frame address: its stores stay.
         assert!(out.contains("sd t0, 0(a1)"), "{out}");
+    }
+
+    #[test]
+    fn zero_constants_read_as_the_zero_register() {
+        let asm = "f:\n    li t2, 0\n    slt t0, a0, t2\n    blt a1, t2, .L1\n    mv a0, t0\n    ret\n.L1:\n    li a0, 7\n    ret\n";
+        let out = peephole_optimize(asm.into());
+        let code = code_lines(&out);
+        assert!(code.contains(&"slt t0, a0, zero".to_string()), "{out}");
+        assert!(code.contains(&"blt a1, zero, .L1".to_string()), "{out}");
+        assert!(!code.contains(&"li t2, 0".to_string()), "{out}");
+    }
+
+    /// The prologue publishes which registers `ret` hands back; a value left
+    /// in a1 by a single-register function is a dead write, while an
+    /// unannotated function keeps the conservative a0/a1.
+    #[test]
+    fn published_return_registers_bound_the_ret_reads() {
+        let asm = "f:\n    # LCCC_RET_REGS a0\n    mv a1, t0\n    sext.w a0, t0\n    ret\n";
+        let out = peephole_optimize(asm.into());
+        assert_eq!(code_lines(&out), ["sext.w a0, t0", "ret"], "{out}");
+        assert!(!out.contains("LCCC_RET_REGS"), "{out}");
+        let asm = "f:\n    # LCCC_RET_REGS -\n    li a0, 3\n    ret\n";
+        let out = peephole_optimize(asm.into());
+        assert_eq!(code_lines(&out), ["ret"], "{out}");
+        let asm = "f:\n    mv a1, t0\n    sext.w a0, t0\n    ret\n";
+        let out = peephole_optimize(asm.into());
+        assert!(code_lines(&out).contains(&"mv a1, t0".to_string()), "{out}");
     }
 
     #[test]

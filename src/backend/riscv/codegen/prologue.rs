@@ -406,6 +406,32 @@ impl RiscvCodegen {
         self.current_return_type = func.return_type;
         self.func_ret_is_f128_sse = func.ret_is_f128_sse;
         self.current_frame_size = frame_size;
+        // The general registers the closing `ret` hands back, for the text
+        // peephole's liveness (the x86 backend's `# LCCC_RET_*` contract):
+        // without it a0 and a1 both count as read at every `ret`, so a value
+        // the allocator homed in a1 and wrote there on the way out survived
+        // as a dead write in every single-register function.  FP results
+        // travel in fa0/fa1; a flattened FP struct (hidden sret buffer),
+        // 2xXLEN scalars, long double and anything unclassified keep both.
+        let ret_regs = if func.is_naked || func.uses_sret || self.fp_ret_buffer.is_some() {
+            "a0 a1"
+        } else {
+            match func.return_type {
+                IrType::Void | IrType::F32 | IrType::F64 => "-",
+                IrType::I8
+                | IrType::U8
+                | IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32
+                | IrType::I64
+                | IrType::U64
+                | IrType::Ptr => "a0",
+                _ => "a0 a1",
+            }
+        };
+        self.state
+            .emit_fmt(format_args!("    # LCCC_RET_REGS {ret_regs}"));
         // Frameless leaf: the 16-byte frame is EXACTLY the ra/s0 save
         // reservation (no slots, no allocas, no callee saves) plus
         // call-free plus every parameter in a register — there is NOTHING
