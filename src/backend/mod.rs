@@ -898,7 +898,7 @@ impl Target {
                     source_mgr,
                 );
                 let optimized = if std::env::var_os("LCCC_NO_PEEPHOLE").is_some() {
-                    peephole_common::strip_volatile_markers(raw)
+                    riscv::codegen::peephole::strip_internal_markers(raw)
                 } else {
                     riscv::codegen::peephole::peephole_optimize(raw)
                 };

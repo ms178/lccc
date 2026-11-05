@@ -261,24 +261,32 @@ impl RiscvCodegen {
 
     /// `BitSet`/`BitClear`/`BitToggle` with the base already staged in `t1`
     /// and the index in `t2`.  RV64I has no Zbs `bset`/`bclr`/`bext`-modify,
-    /// so build a one-hot mask and OR/AND-NOT/XOR it.  The shift count is reduced modulo the *operation* width,
-    /// not XLEN: an 8/16/32-bit operation must wrap at 8/16/32 even though
-    /// `sll` itself masks at 64.  The result is then put back into the rv64
-    /// canonical form for its type (signed narrow values sign-filled,
-    /// unsigned narrow values zero-extended) because downstream comparisons
-    /// and widening reads trust that invariant rather than re-truncating.
+    /// so build a one-hot mask and OR/AND-NOT/XOR it.  The shift count is
+    /// reduced modulo the *operation* width, not XLEN: an 8/16/32-bit
+    /// operation must wrap at 8/16/32 even though `sll` itself masks at 64.
+    ///
+    /// A 32-bit operation builds its mask with `sllw`, which reads only the
+    /// low five bits of the count -- that IS the modulo-32 reduction, so no
+    /// `andi` -- and sign-extends the word. The bitwise result of two
+    /// sign-extended words is a sign-extended word, so an `I32` result stays
+    /// canonical; a `U32` result is valid in its low 32 bits, the register
+    /// form every `U32` consumer reads (a widening cast or an unsigned compare
+    /// re-zero-extends; the plain `1u << n` shift is the same `sllw`), and
+    /// without the `andi` the folded `x | 1u << n` is no longer one
+    /// instruction longer than the unfolded shift-and-or it replaces.
+    ///
+    /// Narrow results are put back into the rv64 canonical form for their
+    /// type (signed sign-filled, unsigned zero-extended), which downstream
+    /// comparisons and widening reads of 8/16-bit values trust.
     fn emit_bit_modify_impl(&mut self, dest: &Value, op: IrBinOp, ty: IrType) {
         let bits = (ty.size() * 8) as u32;
         debug_assert!(matches!(bits, 8 | 16 | 32 | 64));
-        if bits < 64 {
+        if bits < 32 {
             self.state
                 .emit_fmt(format_args!("    andi t2, t2, {}", bits - 1));
         }
         self.state.emit("    li t0, 1");
-        // I32 needs a sign-extended word mask so OR/AND with a canonical
-        // sign-extended base stays sign-extended.  U32 and the narrow widths
-        // use an XLEN mask; narrow results are canonicalized explicitly below.
-        if ty == IrType::I32 {
+        if bits == 32 {
             self.state.emit("    sllw t0, t0, t2");
         } else {
             self.state.emit("    sll t0, t0, t2");
@@ -306,9 +314,7 @@ impl RiscvCodegen {
                 self.state.emit("    slli t0, t0, 48");
                 self.state.emit("    srli t0, t0, 48");
             }
-            // I32 preserved sign-extension through the sllw mask; U32 used a
-            // zero-extended XLEN mask and a zero-extended base, so the result
-            // is already canonical.  64-bit results need no normalization.
+            // 32-bit: see above. 64-bit results need no normalization.
             _ => {}
         }
         self.store_t0_to(dest);
@@ -360,11 +366,21 @@ mod bit_modify_width_tests {
             let width = (ty.size() * 8) as u32;
             for op in [IrBinOp::BitSet, IrBinOp::BitClear, IrBinOp::BitToggle] {
                 let asm = emit(op, ty);
-                if width < 64 {
-                    assert!(
+                match width {
+                    // `sllw` reads count bits 4:0 (modulo 32), `sll` bits 5:0
+                    // (modulo 64): an explicit mask would be dead code.
+                    32 => assert!(
+                        asm.contains("sllw t0, t0, t2") && !asm.contains("andi t2"),
+                        "{op:?} {ty:?} reduces modulo 32 through sllw:\n{asm}"
+                    ),
+                    64 => assert!(
+                        asm.contains("sll t0, t0, t2") && !asm.contains("andi t2"),
+                        "{op:?} {ty:?} reduces modulo 64 through sll:\n{asm}"
+                    ),
+                    _ => assert!(
                         asm.contains(&format!("andi t2, t2, {}", width - 1)),
                         "{op:?} {ty:?} must mask the index to {width} bits:\n{asm}"
-                    );
+                    ),
                 }
             }
         }
@@ -399,16 +415,15 @@ mod bit_modify_width_tests {
                 asm16.contains("slli t0, t0, 48") && asm16.contains("srai t0, t0, 48"),
                 "I16 {op:?} must sign-extend the result:\n{asm16}"
             );
-            let asm32 = emit(op, IrType::I32);
-            assert!(
-                asm32.contains("sllw t0, t0, t2"),
-                "I32 {op:?} must build a sign-extended word mask:\n{asm32}"
-            );
-            let asm_u32 = emit(op, IrType::U32);
-            assert!(
-                asm_u32.contains("sll t0, t0, t2") && !asm_u32.contains("sllw"),
-                "U32 {op:?} must build a zero-extended mask:\n{asm_u32}"
-            );
+            // Both 32-bit types build the sign-extended word mask: canonical
+            // for I32, low-32-valid (the U32 register form) for U32.
+            for ty in [IrType::I32, IrType::U32] {
+                let asm32 = emit(op, ty);
+                assert!(
+                    asm32.contains("sllw t0, t0, t2"),
+                    "{ty:?} {op:?} must build a sign-extended word mask:\n{asm32}"
+                );
+            }
         }
     }
 }

@@ -431,7 +431,8 @@ impl RiscvCodegen {
             }
         };
         self.state
-            .emit_fmt(format_args!("    # LCCC_RET_REGS {ret_regs}"));
+            .emit_fmt(format_args!("    # lccc-ret-regs {ret_regs}"));
+        self.emit_arg_extension_marker(func);
         // Frameless leaf: the 16-byte frame is EXACTLY the ra/s0 save
         // reservation (no slots, no allocas, no callee saves) plus
         // call-free plus every parameter in a register — there is NOTHING
@@ -498,11 +499,22 @@ impl RiscvCodegen {
 
         // Save callee-saved registers used by the register allocator.
         // They are saved at the bottom of the frame (highest negative offsets from s0).
+        // Each save gets its CFA-relative row (the CFA is `s0 + above`, see
+        // `emit_frame_record_cfi`): without them an unwinder resumes the
+        // caller with this function's values in s1-s11.
+        let above = if self.is_variadic { 64 } else { 0 };
         let used_regs = self.used_callee_saved.clone();
         for (i, &reg) in used_regs.iter().enumerate() {
             let offset = -frame_size + (i as i64 * 8);
             let reg_name = callee_saved_name(reg);
             self.emit_store_to_s0(reg_name, offset, "sd");
+            if self.state.emit_cfi {
+                self.state.emit_fmt(format_args!(
+                    "    .cfi_offset {}, {}",
+                    reg_name,
+                    offset - above
+                ));
+            }
         }
     }
 
@@ -645,6 +657,15 @@ impl RiscvCodegen {
                         let load_instr = Self::load_for_type(ty);
                         self.emit_load_from_s0("t0", save_off, load_instr);
                         self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
+                    } else if Self::arg_arrives_extended(ty) {
+                        // Already in register form (see arg_arrives_extended).
+                        self.emit_param_home_store_impl(
+                            over_aligned,
+                            "sd",
+                            RISCV_ARG_REGS[reg_idx],
+                            slot,
+                            0,
+                        );
                     } else {
                         Self::emit_extend_reg(&mut self.state, RISCV_ARG_REGS[reg_idx], "t0", ty);
                         self.emit_param_home_store_impl(over_aligned, "sd", "t0", slot, 0);
@@ -985,6 +1006,65 @@ impl RiscvCodegen {
         }
     }
 
+    /// Does an incoming integer argument of type `ty` already hold LCCC's
+    /// register form for it?  The RISC-V psABI widens an argument narrower
+    /// than XLEN by its type's signedness to 32 bits and then sign-extends
+    /// it to 64 (callers conform: GCC, Clang, and this backend's own call
+    /// staging, pinned both ways by `check_riscv_psabi_narrow_args.sh`).  For
+    /// `char`/`short`/`int` and their unsigned 8/16-bit forms that IS the
+    /// register form -- signed types sign-filled, unsigned ones zero-filled,
+    /// since their 32-bit widening leaves bit 31 clear -- so the entry
+    /// extension is the identity, and GCC and Clang emit none.  `unsigned
+    /// int` arrives sign-extended while LCCC keeps it zero-extended, so it
+    /// (and a float in a GP register) keeps its normalization.  A K&R
+    /// definition's narrow parameter is an `int` in the IR (the caller
+    /// promoted it) and narrows in the body.
+    pub(super) fn arg_arrives_extended(ty: IrType) -> bool {
+        matches!(
+            ty,
+            IrType::I8 | IrType::I16 | IrType::I32 | IrType::U8 | IrType::U16
+        )
+    }
+
+    /// The prologue's `# lccc-arg-ext` line for the text peephole: each
+    /// argument register holding an integer parameter narrower than XLEN,
+    /// which the psABI delivers sign-extended from bit 31 (`unsigned int`
+    /// included), tagged `/z8` or `/z16` when its 32-bit widening was a zero
+    /// extension from 8 or 16 bits (`unsigned char`/`unsigned short`).  The
+    /// facts hold at the function's entry, where the line sits; the passes
+    /// that read it track every later write.  `long f(int x) { return x; }`
+    /// then needs no `sext.w`, `parity16(unsigned short x)` no
+    /// re-normalising shift pair.
+    fn emit_arg_extension_marker(&mut self, func: &IrFunction) {
+        if func.is_naked || func.is_variadic {
+            return;
+        }
+        let config = self.call_abi_config_impl();
+        let classes = classify_params(func, &config);
+        let mut facts = String::new();
+        for (param, class) in func.params.iter().zip(classes.iter()) {
+            let ParamClass::IntReg { reg_idx } = *class else {
+                continue;
+            };
+            if param.struct_size.is_some() {
+                continue;
+            }
+            let tag = match param.ty {
+                IrType::I8 | IrType::I16 | IrType::I32 | IrType::U32 => "",
+                IrType::U8 => "/z8",
+                IrType::U16 => "/z16",
+                _ => continue,
+            };
+            facts.push(' ');
+            facts.push_str(RISCV_ARG_REGS[reg_idx]);
+            facts.push_str(tag);
+        }
+        if !facts.is_empty() {
+            self.state
+                .emit_fmt(format_args!("    # lccc-arg-ext{facts}"));
+        }
+    }
+
     /// Sign/zero-extend a GP register value to 64 bits for sub-64-bit types.
     /// For 64-bit or larger types, just moves src to dest.
     fn emit_extend_reg(
@@ -1100,7 +1180,10 @@ impl RiscvCodegen {
                 // trip.  Sub-64-bit homes keep the sign/zero-filling extend
                 // (canonical-form discipline: homes hold sext/zext values).
                 let home = self.reg_assignments.get(&dest.0).copied();
-                let is_word64 = matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr);
+                // A 64-bit value and an argument already in register form
+                // (see arg_arrives_extended) need a plain copy at most.
+                let is_word64 = matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr)
+                    || Self::arg_arrives_extended(ty);
                 if let Some(home) = home {
                     let home_name = callee_saved_name(home);
                     let arg = RISCV_ARG_REGS[reg_idx];
@@ -1121,7 +1204,12 @@ impl RiscvCodegen {
                         }
                     }
                 } else {
-                    Self::emit_extend_reg(&mut self.state, RISCV_ARG_REGS[reg_idx], "t0", ty);
+                    if Self::arg_arrives_extended(ty) {
+                        self.state
+                            .emit_fmt(format_args!("    mv t0, {}", RISCV_ARG_REGS[reg_idx]));
+                    } else {
+                        Self::emit_extend_reg(&mut self.state, RISCV_ARG_REGS[reg_idx], "t0", ty);
+                    }
                     self.store_t0_to(dest);
                 }
             }
@@ -1225,6 +1313,13 @@ impl RiscvCodegen {
             // Small frame: all offsets fit in 12-bit immediates
             self.state
                 .emit_fmt(format_args!("    addi sp, sp, -{}", total_alloc));
+            // The CFA moves with sp from here on: without this row an
+            // asynchronous unwind (a profiler sample, a signal) between the
+            // allocation and the s0 setup computed it as the new sp.
+            if self.state.emit_cfi {
+                self.state
+                    .emit_fmt(format_args!("    .cfi_def_cfa_offset {}", total_alloc));
+            }
             // ra and s0 are saved relative to s0, which is sp + frame_size
             // (NOT sp + total_alloc for variadic functions!)
             self.state
@@ -1233,11 +1328,7 @@ impl RiscvCodegen {
                 .emit_fmt(format_args!("    sd s0, {}(sp)", frame_size - 16));
             self.state
                 .emit_fmt(format_args!("    addi s0, sp, {}", frame_size));
-            if self.state.emit_cfi {
-                self.state.emit_fmt(format_args!("    .cfi_def_cfa s0, 0"));
-                self.state.emit("    .cfi_offset ra, -8");
-                self.state.emit("    .cfi_offset s0, -16");
-            }
+            self.emit_frame_record_cfi(frame_size, total_alloc);
         } else if total_alloc > PAGE_SIZE {
             // Stack probing: for large frames, touch each page so the kernel
             // can grow the stack mapping. Without this, a single large sub
@@ -1263,16 +1354,16 @@ impl RiscvCodegen {
             self.state.emit("    sd ra, -8(t0)");
             self.state.emit("    sd s0, -16(t0)");
             self.state.emit("    mv s0, t0");
-            if self.state.emit_cfi {
-                self.state.emit("    .cfi_def_cfa s0, 0");
-                self.state.emit("    .cfi_offset ra, -8");
-                self.state.emit("    .cfi_offset s0, -16");
-            }
+            self.emit_frame_record_cfi(frame_size, total_alloc);
         } else {
             // Large frame: use t0 for offsets
             self.state
                 .emit_fmt(format_args!("    li t0, {}", total_alloc));
             self.state.emit("    sub sp, sp, t0");
+            if self.state.emit_cfi {
+                self.state
+                    .emit_fmt(format_args!("    .cfi_def_cfa_offset {}", total_alloc));
+            }
             // Compute s0 = sp + frame_size (NOT total_alloc)
             self.state
                 .emit_fmt(format_args!("    li t0, {}", frame_size));
@@ -1281,12 +1372,29 @@ impl RiscvCodegen {
             self.state.emit("    sd ra, -8(t0)");
             self.state.emit("    sd s0, -16(t0)");
             self.state.emit("    mv s0, t0");
-            if self.state.emit_cfi {
-                self.state.emit("    .cfi_def_cfa s0, 0");
-                self.state.emit("    .cfi_offset ra, -8");
-                self.state.emit("    .cfi_offset s0, -16");
-            }
+            self.emit_frame_record_cfi(frame_size, total_alloc);
         }
+    }
+
+    /// CFA rows once s0 is the frame pointer: `s0 = sp + frame_size`, and
+    /// the CFA (the entry sp) is `sp + total_alloc`, so it sits `total_alloc -
+    /// frame_size` above s0 -- 0 normally, 64 in a variadic function, whose
+    /// a0-a7 save area lies between s0 and the caller's stack arguments. The
+    /// saved ra/s0 are at s0-8/s0-16. The old fixed `.cfi_def_cfa s0, 0`
+    /// put a variadic function's CFA 64 bytes low and every unwind through
+    /// one (C++ exceptions through `printf`-style callbacks, `backtrace()`)
+    /// read its return address from the register save area.
+    fn emit_frame_record_cfi(&mut self, frame_size: i64, total_alloc: i64) {
+        if !self.state.emit_cfi {
+            return;
+        }
+        let above = total_alloc - frame_size;
+        self.state
+            .emit_fmt(format_args!("    .cfi_def_cfa s0, {}", above));
+        self.state
+            .emit_fmt(format_args!("    .cfi_offset ra, {}", -8 - above));
+        self.state
+            .emit_fmt(format_args!("    .cfi_offset s0, {}", -16 - above));
     }
 
     /// Emit epilogue: restore ra/s0 and deallocate stack.
