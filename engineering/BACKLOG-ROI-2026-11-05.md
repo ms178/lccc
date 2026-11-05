@@ -115,7 +115,18 @@ without a test that fails when it regresses.
    `lccc-riscv` each report 17 rows and zero problems. The same probes now
    exercise four back ends in a pinned corpus sweep, so a fifth target cannot
    be added without deliberately extending the coverage.
-9. **Host-CPU runtime behaviour was checked with a real debugger, not just
+9. **A line-by-line audit of the new gate found three edge-case defects in
+   the gate itself.**  (a) A wrong `--lccc` path raised an uncaught
+   `FileNotFoundError`, so CI saw a Python traceback instead of a named
+   verdict. (b) `opt.s` was reused for all 17 rows; a compile that failed
+   without writing it left the previous row's bytes, which were then hashed
+   and could be reported as a codegen change. (c) A relative `--lccc` path
+   only worked from the repository root. Fixed with `resolve_binary` (named
+   problems, `PATH` lookup, repo-root fallback), `dest.unlink(missing_ok=True)`
+   before every compile, and exact-duplicate suppression in the problem list.
+   Seven new tests cover all three plus a non-executable file and a positive
+   control proving a fresh compile is still hashed correctly.
+10. **Host-CPU runtime behaviour was checked with a real debugger, not just
    assembly hashes.**  A four-frame `noinline` fixture compiled by LCCC,
    GCC 16.2 and Clang 23.1.5 at `-O2`, `-Ofast` and `-Og` produces identical
    results for inputs 5, -3, 0 and 12345 (`6n+16`). GDB's backtrace at `leaf`
@@ -184,9 +195,9 @@ GCC 16.2.0 / Clang 23.1.5 / GDB 18.1 / Rust 1.99.1 oracles.
 | `check_dwarf_die_census.py` (4 dialects × 3 compilers) | **PASS** with the tightened 12-tag / 20-attribute baseline |
 | `check_backlog_roi.py --self-test --json` | **20/20 PASS, 0 negative-control failures** |
 | `tests.corpus.test_dwarf_die_census_ratchet` | **8 tests OK**, incl. end-to-end lost-tag and stale-deferral negative controls |
-| `tests.corpus.test_option_effect_ledger` | **18 tests OK**, incl. the 4-architecture dynamic sweep |
+| `tests.corpus.test_option_effect_ledger` | **24 tests OK**, incl. the 4-architecture dynamic sweep and 7 gate-robustness controls |
 | `tests.corpus.test_gdb_option_runtime` | **7 tests OK** with pinned GDB 18.1 |
-| `unittest discover -s tests/corpus -p 'test_*.py'` | **1296 tests, 0 failures, 5 skips** |
+| `unittest discover -s tests/corpus -p 'test_*.py'` | **1302 tests, 0 failures, 5 skips** |
 | `check_doc_links.py`, `check_script_imports.py`, `check_no_conflict_markers.py`, `check_ci_workflow_shell.py` | **all PASS** |
 | Hosted CI on `fd3d490` | **22 pass / 3 skipping / 0 failures**, including the authenticated ICX 2026.2 integration lane |
 

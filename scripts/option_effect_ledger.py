@@ -45,7 +45,9 @@ import argparse
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -182,8 +184,6 @@ def static_problems(rows: list[Row], cli_text: str) -> list[str]:
 
 
 def _run(lccc: str, args: list[str], env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
-    import os
-
     merged = os.environ.copy()
     if env:
         merged.update(env)
@@ -196,10 +196,57 @@ def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def resolve_binary(lccc: str) -> tuple[str, str | None]:
+    """Resolve a compiler path to an absolute executable, or a named problem.
+
+    A gate must never die with a Python traceback because a path was wrong:
+    CI parses its exit status, not its stack. A relative path is resolved
+    against the caller's cwd first (the documented usage), then against the
+    repository root, so `--lccc target/fastbuild/lccc` also works when the
+    gate is invoked from a temporary directory.
+    """
+    path = Path(lccc).expanduser()
+    if not path.is_absolute():
+        if os.sep not in lccc and not path.is_file():
+            # A bare command name is a PATH lookup, not a file path: the
+            # documented usage is a path, but a gate must not regress a
+            # caller that passed `lccc` and previously worked.
+            found = shutil.which(lccc)
+            if found:
+                path = Path(found)
+        elif not path.is_file() and (ROOT / path).is_file():
+            path = ROOT / path
+    path = path.resolve()
+    if not path.is_file():
+        return str(path), f"--lccc {lccc!r}: no such file ({path})"
+    if not os.access(path, os.X_OK):
+        return str(path), f"--lccc {lccc!r}: {path} is not executable"
+    return str(path), None
+
+
+def compile_asm(lccc: str, work: Path, src: Path, extra: list[str],
+                out: str) -> tuple[subprocess.CompletedProcess, str]:
+    """Compile one variant and hash its assembly.
+
+    `opt.s` is reused for every row, so a failed compile must not leave the
+    previous row's bytes behind: hashing a stale file would make a broken
+    option look like a codegen change (or hide one). Remove it first; a
+    missing output hashes as the empty string, which never equals a real
+    baseline hash.
+    """
+    dest = work / out
+    dest.unlink(missing_ok=True)
+    proc = _run(lccc, ["-O2", *extra, "-S", str(src), "-o", str(dest)])
+    return proc, _sha(dest) if dest.is_file() else ""
+
+
 def dynamic_problems(rows: list[Row], lccc: str) -> list[str]:
     """Execute every row against the built compiler and compare the observed
     class with the declared class."""
     problems: list[str] = []
+    lccc, problem = resolve_binary(lccc)
+    if problem:
+        return [problem]
     with tempfile.TemporaryDirectory(prefix="lccc-option-ledger-") as td:
         work = Path(td)
         src = work / "fixture.c"
@@ -207,13 +254,11 @@ def dynamic_problems(rows: list[Row], lccc: str) -> list[str]:
         src.write_text(ASM_FIXTURE)
         macro_src.write_text(MACRO_FIXTURE)
 
-        def compile_asm(extra: list[str], out: str) -> tuple[subprocess.CompletedProcess, str]:
-            dest = work / out
-            proc = _run(lccc, ["-O2", *extra, "-S", str(src), "-o", str(dest)])
-            return proc, _sha(dest) if dest.is_file() else ""
+        def variant(extra: list[str], out: str) -> tuple[subprocess.CompletedProcess, str]:
+            return compile_asm(lccc, work, src, extra, out)
 
-        base1, hash1 = compile_asm([], "base1.s")
-        base2, hash2 = compile_asm([], "base2.s")
+        base1, hash1 = variant([], "base1.s")
+        base2, hash2 = variant([], "base2.s")
         if base1.returncode or base2.returncode:
             return [f"baseline compile failed: {base1.stderr.strip()} {base2.stderr.strip()}"]
         if hash1 != hash2:
@@ -223,7 +268,7 @@ def dynamic_problems(rows: list[Row], lccc: str) -> list[str]:
             return [f"baseline -dM -E failed: {base_macros.stderr.strip()}"]
 
         for row in rows:
-            proc, asm_hash = compile_asm([row.spelling], "opt.s")
+            proc, asm_hash = variant([row.spelling], "opt.s")
             macro = _run(lccc, [row.spelling, "-dM", "-E", str(macro_src)])
             diagnostic = "warning" in proc.stderr or "error" in proc.stderr
 
@@ -265,7 +310,9 @@ def dynamic_problems(rows: list[Row], lccc: str) -> list[str]:
             if kind == "no-delta" and (asm_hash != hash1 or macro.stdout != base_macros.stdout):
                 problems.append(f"{row.spelling}: probe {row.probe} claims no delta but one exists")
 
-    return problems
+    # Two branches can name the same defect (a class check and its probe
+    # check). Deduplicate while preserving order so --json is readable.
+    return list(dict.fromkeys(problems))
 
 
 def self_test(lccc: str | None) -> list[str]:
@@ -347,16 +394,24 @@ def main(argv: list[str] | None = None) -> int:
     rows = parse_rows(LEDGER.read_text())
     cli_text = CLI.read_text()
     problems = static_problems(rows, cli_text)
-    if args.self_test:
-        problems += [f"self-test: {f}" for f in self_test(args.lccc)]
+    binary: str | None = None
+    binary_problem: str | None = None
     if args.lccc and not args.offline:
-        problems += dynamic_problems(rows, args.lccc)
+        binary, binary_problem = resolve_binary(args.lccc)
+        if binary_problem:
+            binary = None
+    if args.self_test:
+        problems += [f"self-test: {f}" for f in self_test(binary)]
+    if binary_problem:
+        problems.append(binary_problem)
+    elif binary:
+        problems += dynamic_problems(rows, binary)
 
     report = {
         "rows": len(rows),
         "probes": len(PROBES),
         "priority_options": len(PRIORITY_SET),
-        "dynamic": bool(args.lccc and not args.offline),
+        "dynamic": bool(binary),
         "problems": problems,
     }
     if args.json:

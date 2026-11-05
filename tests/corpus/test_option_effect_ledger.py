@@ -14,9 +14,13 @@ ledger was created to prevent.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import stat
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -170,6 +174,102 @@ class DynamicAgreement(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertFalse(json.loads(proc.stdout)["dynamic"])
+
+
+class GateRobustness(unittest.TestCase):
+    """A CI gate must fail with a diagnosis, never with a traceback, and must
+    never hash output left behind by a previous invocation. These cases were
+    found by reading the gate line by line; none is covered by the happy path.
+    """
+
+    def cli(self, *args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(REPO / "scripts/option_effect_ledger.py"),
+             *args, "--json"],
+            cwd=cwd or REPO, capture_output=True, text=True, timeout=180,
+        )
+
+    def test_a_missing_binary_is_a_named_problem_not_a_traceback(self) -> None:
+        proc = self.cli("--lccc", "/definitely/not/a/compiler")
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn("Traceback", proc.stderr)
+        report = json.loads(proc.stdout)
+        self.assertFalse(report["dynamic"])
+        self.assertTrue(any("no such file" in p for p in report["problems"]))
+
+    def test_a_nonexecutable_binary_is_a_named_problem(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="lccc-ledger-noexec-") as tmp:
+            path = Path(tmp) / "lccc"
+            path.write_text("not an executable\n")
+            path.chmod(path.stat().st_mode & ~stat.S_IXUSR)
+            proc = self.cli("--lccc", str(path))
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertTrue(any("not executable" in p
+                            for p in json.loads(proc.stdout)["problems"]))
+
+    @unittest.skipUnless(LCCC.is_file(), "fastbuild binary not present")
+    def test_a_relative_binary_path_works_from_a_foreign_cwd(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="lccc-ledger-foreign-cwd-") as tmp:
+            proc = self.cli("--lccc", "target/fastbuild/lccc", cwd=Path(tmp))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertTrue(json.loads(proc.stdout)["dynamic"])
+
+    def test_stale_assembly_is_removed_before_hashing(self) -> None:
+        """`opt.s` is reused for all 17 rows. If a compile fails without
+        writing it, the previous row's bytes must not be hashed and reported
+        as a codegen change."""
+        with tempfile.TemporaryDirectory(prefix="lccc-ledger-stale-") as tmp:
+            work = Path(tmp)
+            src = work / "fixture.c"
+            src.write_text("int f(void){return 1;}\n")
+            dest = work / "opt.s"
+            dest.write_text("STALE FROM A PREVIOUS ROW\n")
+            stub = work / "compiler"
+            stub.write_text("#!/bin/sh\nexit 7\n")
+            stub.chmod(0o755)
+
+            proc, digest = ledger.compile_asm(str(stub), work, src, [], "opt.s")
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(digest, "", "a failed compile hashed stale bytes")
+            self.assertFalse(dest.exists())
+
+            # Positive control: a compiler that DOES write the output must be
+            # hashed, so the empty digest above is not a vacuous assertion.
+            writer = work / "writer"
+            writer.write_text(
+                "#!/bin/sh\n"
+                'while [ $# -gt 0 ]; do\n'
+                '  if [ "$1" = "-o" ]; then shift; printf "FRESH\\n" > "$1"; exit 0; fi\n'
+                "  shift\n"
+                "done\n"
+                "exit 0\n",
+            )
+            writer.chmod(0o755)
+            proc2, digest2 = ledger.compile_asm(str(writer), work, src, [], "opt.s")
+            self.assertEqual(proc2.returncode, 0)
+            self.assertEqual(digest2, hashlib.sha256(b"FRESH\n").hexdigest())
+
+    def test_resolve_binary_accepts_the_repo_root_fallback(self) -> None:
+        resolved, problem = ledger.resolve_binary("target/fastbuild/lccc")
+        if problem:
+            self.skipTest("fastbuild binary not present")
+        self.assertTrue(Path(resolved).is_absolute())
+        self.assertEqual(Path(resolved), (REPO / "target/fastbuild/lccc").resolve())
+
+    def test_resolve_binary_accepts_a_bare_command_on_path(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="lccc-ledger-path-") as tmp:
+            link = Path(tmp) / "lccc-on-path"
+            link.write_text("#!/bin/sh\nexit 0\n")
+            link.chmod(0o755)
+            old_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = tmp + os.pathsep + old_path
+            try:
+                resolved, problem = ledger.resolve_binary("lccc-on-path")
+            finally:
+                os.environ["PATH"] = old_path
+        self.assertIsNone(problem)
+        self.assertEqual(Path(resolved), link.resolve())
 
 
 class ArchitectureParity(unittest.TestCase):
