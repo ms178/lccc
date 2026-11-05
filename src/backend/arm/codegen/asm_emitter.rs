@@ -445,6 +445,28 @@ impl InlineAsmEmitter for ArmCodegen {
                         let src = super::emit::callee_saved_name(phys);
                         self.state.emit_fmt(format_args!("    mov x9, {}", src));
                         self.state.emit("    mov sp, x9");
+                    } else if super::emit::is_arm_fp_phys(phys) {
+                        // A floating-point value bound to a general register
+                        // (`"r"(double)`, DoNotOptimize on a double): its
+                        // home is an FP register, so the bits move across
+                        // with fmov.  callee_saved_name knows only general
+                        // registers and hit its unreachable arm.
+                        if op.operand_type.size() <= 4 {
+                            let src = super::emit::arm_fp_name(phys, IrType::F32);
+                            self.state.emit_fmt(format_args!(
+                                "    fmov {}, {}",
+                                Self::to_w_reg(reg),
+                                src
+                            ));
+                        } else {
+                            let src = super::emit::arm_fp_name(phys, IrType::F64);
+                            let dst = match reg.strip_prefix('w') {
+                                Some(number) => format!("x{number}"),
+                                None => reg.to_string(),
+                            };
+                            self.state
+                                .emit_fmt(format_args!("    fmov {}, {}", dst, src));
+                        }
                     } else {
                         let src = super::emit::callee_saved_name(phys);
                         self.state

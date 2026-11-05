@@ -449,18 +449,60 @@ impl InlineAsmEmitter for I686Codegen {
                 Operand::Value(v) => {
                     if let Some(slot) = self.state.get_slot(v.0) {
                         let sr = self.slot_ref(slot);
-                        let load_instr = match ty {
-                            IrType::F32 => "movss",
-                            IrType::F64 => "movsd",
-                            _ => "movdqu",
+                        // Scalars move their own width: a 16-byte `movdqu`
+                        // read past a 1-, 2-, 4- or 8-byte home.
+                        let load_instr = match Self::xmm_scalar_move(ty) {
+                            Some(mv) => mv,
+                            None if ty.size() <= 4 => "movd",
+                            None => "movdqu",
                         };
                         self.state
                             .emit_fmt(format_args!("    {} {}, %{}", load_instr, sr, reg));
+                    } else if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                        // A register home holds a 32-bit value (the i686
+                        // allocator homes nothing wider): move its bits.
+                        // Nothing was emitted here before, so the asm read
+                        // whatever the XMM register held.
+                        let home = super::emit::phys_reg_name(phys);
+                        self.state.emit_fmt(format_args!(
+                            "    movd %{}, %{}",
+                            Self::reg_to_32(home),
+                            reg
+                        ));
                     }
                 }
-                Operand::Const(_) => {
-                    self.state
-                        .emit_fmt(format_args!("    xorpd %{}, %{}", reg, reg));
+                Operand::Const(c) => {
+                    // The constant's bits, not zero: `xorpd` here made every
+                    // `"x"(2.5)` operand 0.0.
+                    let bits = match (ty, c) {
+                        (_, IrConst::D64(v)) => *v,
+                        (_, IrConst::D32(v)) => *v as u64,
+                        (IrType::F32, _) => (c.to_f64().unwrap_or(0.0) as f32).to_bits() as u64,
+                        (IrType::F64, _) => c.to_f64().unwrap_or(0.0).to_bits(),
+                        _ => c.to_i64().unwrap_or(0) as u64,
+                    };
+                    let wide = ty.size() > 4;
+                    let bits = if wide { bits } else { bits & 0xffff_ffff };
+                    if bits == 0 {
+                        self.state
+                            .emit_fmt(format_args!("    pxor %{}, %{}", reg, reg));
+                    } else {
+                        // Through scratch stack space: nothing inside the
+                        // window addresses a frame slot.
+                        self.state.emit("    subl $8, %esp");
+                        self.state
+                            .emit_fmt(format_args!("    movl ${}, (%esp)", bits as u32 as i32));
+                        self.state.emit_fmt(format_args!(
+                            "    movl ${}, 4(%esp)",
+                            (bits >> 32) as u32 as i32
+                        ));
+                        self.state.emit_fmt(format_args!(
+                            "    {} (%esp), %{}",
+                            if wide { "movq" } else { "movd" },
+                            reg
+                        ));
+                        self.state.emit("    addl $8, %esp");
+                    }
                 }
             }
             return;
@@ -468,7 +510,7 @@ impl InlineAsmEmitter for I686Codegen {
 
         // GP register - check for 64-bit register pair
         let reg_hi = &op.reg_hi;
-        let is_pair = !reg_hi.is_empty() && matches!(ty, IrType::I64 | IrType::U64);
+        let is_pair = !reg_hi.is_empty() && Self::is_gp_pair_type(ty);
 
         match val {
             Operand::Const(c) => {
@@ -606,7 +648,7 @@ impl InlineAsmEmitter for I686Codegen {
         let reg = &op.reg;
         let ty = op.operand_type;
         let reg_hi = &op.reg_hi;
-        let is_pair = !reg_hi.is_empty() && matches!(ty, IrType::I64 | IrType::U64);
+        let is_pair = !reg_hi.is_empty() && Self::is_gp_pair_type(ty);
         let is_xmm = reg.starts_with("xmm");
         if let Some(slot) = self.state.get_slot(ptr.0) {
             let sr = self.slot_ref(slot);
@@ -739,8 +781,8 @@ impl InlineAsmEmitter for I686Codegen {
         &mut self,
         op: &AsmOperand,
         ptr: &Value,
-        _constraint: &str,
-        _all_output_regs: &[&str],
+        constraint: &str,
+        all_output_regs: &[&str],
     ) {
         if matches!(op.kind, AsmOperandKind::Memory) {
             return;
@@ -834,25 +876,47 @@ impl InlineAsmEmitter for I686Codegen {
         let reg = &op.reg;
         let ty = op.operand_type;
         let reg_hi = &op.reg_hi;
-        let is_pair = !reg_hi.is_empty() && matches!(ty, IrType::I64 | IrType::U64);
+        let is_pair = !reg_hi.is_empty() && Self::is_gp_pair_type(ty);
         let is_xmm = reg.starts_with("xmm");
         if let Some(slot) = self.state.get_slot(ptr.0) {
+            if is_xmm && Self::xmm_scalar_move(ty).is_none() && ty.size() < 4 {
+                // A 1- or 2-byte integer in an SSE register: SSE2 stores no
+                // narrower than 4 bytes, so bridge it to a general register
+                // and store it as the `"=r"` output of that type (exact width
+                // into a one-byte `char` object or through a pointer,
+                // zero-extended into a promoted value's dword).  `movdqu`
+                // wrote 16 bytes over its neighbours.
+                let mut gp = op.clone();
+                gp.kind = AsmOperandKind::GpReg;
+                gp.reg = ["ecx", "edx", "esi", "edi", "eax", "ebx"]
+                    .into_iter()
+                    .find(|r| !all_output_regs.contains(r))
+                    .unwrap_or("ecx")
+                    .to_string();
+                let preserve = all_output_regs.contains(&gp.reg.as_str());
+                if preserve {
+                    self.state.emit_fmt(format_args!("    pushl %{}", gp.reg));
+                    self.esp_adjust += 4;
+                }
+                self.state
+                    .emit_fmt(format_args!("    movd %{}, %{}", reg, gp.reg));
+                let mut taken: Vec<&str> = all_output_regs.to_vec();
+                taken.push(gp.reg.as_str());
+                self.store_output_from_reg(&gp, ptr, constraint, &taken);
+                if preserve {
+                    self.state.emit_fmt(format_args!("    popl %{}", gp.reg));
+                    self.esp_adjust -= 4;
+                }
+                return;
+            }
             if is_xmm {
+                // Scalars store their own width; vectors the whole register.
+                let store_instr = Self::xmm_scalar_move(ty).unwrap_or("movdqu");
                 if self.state.is_direct_slot(ptr.0) {
                     let sr = self.slot_ref(slot);
-                    let store_instr = match ty {
-                        IrType::F32 => "movss",
-                        IrType::F64 => "movsd",
-                        _ => "movdqu",
-                    };
                     self.state
                         .emit_fmt(format_args!("    {} %{}, {}", store_instr, reg, sr));
                 } else {
-                    let store_instr = match ty {
-                        IrType::F32 => "movss",
-                        IrType::F64 => "movsd",
-                        _ => "movdqu",
-                    };
                     self.state.emit("    pushl %ecx");
                     self.esp_adjust += 4;
                     let sr = self.slot_ref(slot);
@@ -949,8 +1013,7 @@ impl InlineAsmEmitter for I686Codegen {
     }
 
     fn needs_register_pair(&self, ty: IrType) -> bool {
-        // On i686, 64-bit integer types need two 32-bit GP registers (a register pair).
-        matches!(ty, IrType::I64 | IrType::U64)
+        Self::is_gp_pair_type(ty)
     }
 
     fn reset_scratch_state(&mut self) {
@@ -963,6 +1026,29 @@ impl InlineAsmEmitter for I686Codegen {
 // Register conversion and condition code mapping delegate to the shared
 // `x86_common` module to avoid duplication with the x86-64 backend.
 impl I686Codegen {
+    /// 8-byte types a general-register operand carries in a register pair
+    /// (`reg` = low half, `reg_hi` = high half), as GCC does on IA-32: the
+    /// 64-bit integers and the 8-byte floating types.  `"r"(double)` used to
+    /// get one register: the low half went in, only the low half came back,
+    /// and the high half of the output was never written.
+    fn is_gp_pair_type(ty: IrType) -> bool {
+        matches!(ty, IrType::I64 | IrType::U64 | IrType::F64 | IrType::D64)
+    }
+
+    /// The SSE move that transfers exactly a scalar `"x"` operand's bytes
+    /// (GCC accepts `"x"` on 2-, 4- and 8-byte integers and on floats), or
+    /// `None` for vectors and for the 1- and 2-byte integers no SSE2 store
+    /// can write exactly.
+    fn xmm_scalar_move(ty: IrType) -> Option<&'static str> {
+        match ty {
+            IrType::F32 | IrType::D32 => Some("movss"),
+            IrType::F64 | IrType::D64 => Some("movsd"),
+            IrType::I32 | IrType::U32 | IrType::Ptr => Some("movd"),
+            IrType::I64 | IrType::U64 => Some("movq"),
+            _ => None,
+        }
+    }
+
     /// Whether an output's destination is a promoted SSA value's own home
     /// (a full 4-byte scalar slot) rather than user memory: an `Alloca` is
     /// the C object itself (a `char` variable is ONE byte — a wider store

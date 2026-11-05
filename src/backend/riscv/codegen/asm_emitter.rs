@@ -360,11 +360,27 @@ impl InlineAsmEmitter for RiscvCodegen {
                 // doesn't map the stack.
                 // This also handles Address operands whose pointer value was
                 // register-allocated (e.g., "+A" for AMO instructions).
-                if !self.state.is_alloca(v.0) && !is_fp {
+                if !self.state.is_alloca(v.0) {
                     if let Some(&phys) = self.reg_assignments.get(&v.0) {
                         let src_name = super::emit::callee_saved_name(phys);
-                        self.state
-                            .emit_fmt(format_args!("    mv {}, {}", reg, src_name));
+                        if is_fp {
+                            // The allocator homes only integer-class values,
+                            // so an "f" operand with a register home holds an
+                            // integer (`"f"(long)`): move its bits across, as
+                            // GCC does.  Skipping this path left the value
+                            // with neither home nor slot, and the panic below
+                            // fired at -O1 and up.
+                            let fmv = if op.operand_type.size() <= 4 {
+                                "fmv.w.x"
+                            } else {
+                                "fmv.d.x"
+                            };
+                            self.state
+                                .emit_fmt(format_args!("    {} {}, {}", fmv, reg, src_name));
+                        } else {
+                            self.state
+                                .emit_fmt(format_args!("    mv {}, {}", reg, src_name));
+                        }
                         return;
                     }
                 }
