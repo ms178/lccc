@@ -401,22 +401,24 @@ compile matrix in `/home/user/.cache/lccc-torture/baseline/`.
 
 | leg | baseline | PR #1101 | delta |
 |---|---|---|---|
-| x86_64 `-O2` compile | 1977 pass / 23 fail / 15 ref-skip / 1 unsupported | **1993 pass / 7 fail** / 15 ref-skip / 1 unsupported (S07) | **+16 pass, −16 fail** |
-| i686 `-O2` compile | 1968 pass / 25 fail / 22 ref-skip / 1 unsupported | **1986 pass / 7 fail** / 22 ref-skip / 1 unsupported (S07) | **+18 pass, −18 fail** |
+| x86_64 `-O2` compile | 1977 pass / 23 fail / 15 ref-skip / 1 unsupported | **1994 pass / 6 fail** / 15 ref-skip / 1 unsupported (S09) | **+17 pass, −17 fail** |
+| i686 `-O2` compile | 1968 pass / 25 fail / 22 ref-skip / 1 unsupported | **1987 pass / 6 fail** / 22 ref-skip / 1 unsupported (S09) | **+19 pass, −19 fail** |
 
 Two further i686-only defects were found and fixed after the S03 measurement
 (`20041119-1.c`, `20111209-1.c`). The next full matrix (S04, after both fixes)
 is **x86_64 1993 pass / 7 compile-fail / 15 ref-skip / 1 unsupported** and
 **i686 1986 pass / 7 compile-fail / 22 ref-skip / 1 unsupported** — both legs
 now have the *same* seven remaining non-passes, listed with their root causes
-in §9.4. **Matrix hygiene (red-team of the evidence itself):** S05 was
+in §9.4. S08 (§9.5) then fixed `991213-2.c` on BOTH legs, leaving six
+compile-fails per leg and no regression anywhere in the corpus. **Matrix
+hygiene (red-team of the evidence itself):** S05 was
 discarded because its harness silently fell back to `/usr/bin/gcc` (Debian
 12.2.0) instead of the pinned GCC 16.2 oracle — 12 reference ICEs and one
 60 s timeout were compiler bugs of the WRONG oracle, not LCCC regressions.
 S06 was deliberately invalidated by the harness itself
 (`run inputs changed mid-flight: tools`) because a fastbuild relink happened
 while the matrix was running. The clean, unmodified-binary final matrix is
-S07 (§9.5). Both discarded runs are kept as evidence that no number here is
+S09 (§9.5). Both discarded runs are kept as evidence that no number here is
 accepted without checking the oracle identity and the run's `tools` digest.
 
 ### 9.2 Fixed families (change-by-change)
@@ -518,9 +520,12 @@ asserted.
 | `limits-caselabels.c` | 100,000 `case` labels are parsed/lowered as a 100k-deep RECURSIVE chain; `SwitchFrame::overlaps` is also O(n²) | gcc 16.2 0.331 s, clang 0.225 s, lccc clean budget error in 0.101 s |
 | `limits-exprparen.c` | 10,000 nested parentheses need ~65k expression frames (budget 32768); the 64 MB thread stack is too small for the recursive descent | gcc 16.2 0.026 s; clang 23.1.4 **segfaults** (rc −11) |
 | `limits-structnest.c` | 10,000 nested anonymous record definitions; quadratic `TypeSpecifier`/`Vec<StructFieldDecl>` clone cascades (callgrind: 812,222,167 Ir at depth 1000, dominated by malloc/free/clone) | gcc 16.2 1.874 s; clang 23.1.4 **segfaults** (rc −11) |
-| `991213-2.c` | K&R function definition whose parameter list contains a complex function-pointer declarator `void (* const (funcp)(time_t))` | gcc 16.2 accepts with `-std=gnu89` |
 | `pr115143-2.c`, `pr115143-3.c` | `-fgimple` / `__GIMPLE` — GCC's internal GIMPLE front end, not ISO/GNU C | gcc 16.2 accepts; deliberately out of scope |
 | `pr67106.c` | `-fpack-struct` data-model request | **deliberate, correct** rejection: ignoring it would silently change object layout (see `src/driver`) |
+
+`991213-2.c` was REMOVED from this table after S08: the K&R parenthesised-name
+declarator `void (* const (funcp)(time_t))` now parses and is typed correctly
+on both ABIs (§9.7). It is no longer an open gap.
 
 **`ovf.c` diagnostic parity:** no exact `ovf.c` exists in this repository, in
 the pinned GCC 17 testsuite, or in the GCC mirror (checked with `find`,
@@ -586,28 +591,42 @@ green on this branch and is the third oracle. No PMU/`perf` is available on
 this host, so NO cycle claims are made; performance evidence is wall-clock,
 callgrind instruction counts and artifact comparisons.
 
-### 9.5 Final clean matrix (S07)
+### 9.5 Final clean matrix (S09)
 
 Re-run with the pinned GCC 16.2 oracle, an unchanged fastbuild binary for the
 whole run, and no concurrent cargo work. Filled in below from the JSON
 `tools`/`complete`/`fatal` fields; a run with `fatal` set is NEVER quoted.
 
-| leg | S04 (pre-red-team) | S07 (final, `1facb4979`) |
+| leg | S07 (pre-K&R fix) | S08 (K&R fix) / S09 (final) |
 |---|---|---|
-| x86_64 `-O2` compile | 1993 pass / 7 fail / 15 ref-skip / 1 unsupported | **1993 pass / 7 fail / 15 ref-skip / 1 unsupported** |
-| i686 `-O2` compile | 1986 pass / 7 fail / 22 ref-skip / 1 unsupported | **1986 pass / 7 fail / 22 ref-skip / 1 unsupported** |
+| x86_64 `-O2` compile | 1993 pass / 7 fail / 15 ref-skip / 1 unsupported | **1994 pass / 6 fail** / 15 ref-skip / 1 unsupported |
+| i686 `-O2` compile | 1986 pass / 7 fail / 22 ref-skip / 1 unsupported | **1987 pass / 6 fail** / 22 ref-skip / 1 unsupported |
 
-Both S07 JSONs report `complete=True`, `fatal=None`, the pinned
-`/home/user/.cache/lccc-toolchains/gcc-16.2/gcc-16/bin/gcc-16` oracle and an
-unchanged `tools` digest; `lccc_head` equals the pushed commit. The
-**S04 -> S07 per-case diff is EMPTY on both legs** (0 changed statuses), so
-none of the §9.2 red-team fixes regressed a single corpus case. Both legs now
-have the *same* seven compile-fails, all itemised in §9.4:
-`991213-2.c`, `limits-caselabels.c`, `limits-exprparen.c`,
-`limits-structnest.c`, `pr115143-2.c`, `pr115143-3.c`, `pr67106.c`.
-The matrix runner's own exit 1 is the candidate-failure INVENTORY, not an
-evidence failure; `scripts/ci_gcc17_torture.sh` treats 1 as advisory and only
-2 as invalid.
+Both S08 and S09 JSONs report `complete=True`, `fatal=None`, the pinned
+`/home/user/.cache/lccc-toolchains/gcc-16.2/gcc-16/bin/gcc-16` oracle
+(sha256 `67ed99639f746b8e…`) and a `tools` digest that is unchanged
+WITHIN each run (the lccc hash naturally differs between S08 and S09). The S08 runner
+logged the same lccc sha256 (`98ab3736ef1bf37b…` x86_64,
+`bafc4e1c515af23a…` i686) before and after its two legs; the S09 runner
+logged `61819b0444a8fd831…` / `fa1875392aa358c1…` unchanged before and
+after ITS two legs, so no
+relink occurred mid-flight; `dependency_digest` is byte-identical to S07
+(`071a13826a907b4a…`), i.e. same corpus, flags and reference contract.
+`lccc_head` records `8e0d1b1bb` because these binaries were built from the
+worktree that was committed immediately afterwards; the binary hash, not the
+commit label, is the identity that matters and it is pinned above.
+
+**S07 -> S08 per-case diff: exactly ONE changed status on each leg,
+`991213-2.c` `compile-fail` -> `pass`, and ZERO other changes across 4032
+case-runs** (2 x 2016). The six remaining compile-fails on both legs are
+`limits-caselabels.c`, `limits-exprparen.c`, `limits-structnest.c`,
+`pr115143-2.c`, `pr115143-3.c` and `pr67106.c`, itemised in §9.4; the single
+`unsupported` case is `limits-fnargs.c`. The matrix runner's own exit 1 is the
+candidate-failure INVENTORY, not an evidence failure;
+`scripts/ci_gcc17_torture.sh` treats 1 as advisory and only 2 as invalid.
+S09 (after the §9.7 peephole optimisation) has **byte-identical counts and
+an EMPTY S08 -> S09 per-case diff on both legs**: the assembly-equivalence
+cache changed no corpus verdict across a further 4032 case-runs.
 
 ### 9.6 Local CI contract: three REAL contract defects found and fixed
 
@@ -673,3 +692,122 @@ print `UNMEASURED: ICX oracle (not installed)`. The hosted
 "Authenticated Intel ICX 2026.2 integration" job is green on this branch and
 is the third oracle; no local ICX 2026.2 binary exists in this sandbox, so no
 ICX-witnessed numerical claim is made here.
+
+### 9.7 S08/S09: red-teaming the K&R fix, and an O(F^2) host-CPU hotspot
+
+**The most important finding of this round is a red-team of our OWN fix.**
+The first repair of `991213-2.c` made every one of 23 declarator shapes
+*accept* exactly as gcc 16.2 and clang 23.1.4 do, and the whole 2016-case
+matrix went green for that file. It was still WRONG. Acceptance parity is a
+weak oracle: gcc types `int (* const (p)(int))` as `int *const (*)(int)` --
+the stars and their qualifiers bind to the FUNCTION'S RETURN type, and C11
+6.7.6.3p8 adjusts the function-typed parameter to a pointer. The first fix
+produced `int (*const)(int)`. Both spellings compile a declaration, so only a
+*discriminating* program exposes the difference:
+
+| probe | gcc 16.2 | clang 23.1.4 | first fix | final |
+|---|---|---|---|---|
+| `int g(int (* const (p)(int))) { return *p(1); }` | OK | OK | ERR | OK |
+| `int g(int (** (p)(int))) { return **p(1); }` | OK | OK | ERR | OK |
+| `int g(int (* const (p)(int))) { p = 0; return 0; }` | OK | OK | ERR | OK |
+
+The oracle type was pinned, not guessed: `__builtin_types_compatible_p(
+typeof(p), int *(*)(int))` and `int *const (*)(int)` both hold under gcc 16.2,
+while `int (*)(int)` does not; `sizeof(p)` is a pointer; clang 23.1.4 prints
+the parameter type as `int (*const (*)(int))`. ICX 2026.2 was not installed in
+this sandbox (Intel PPA unreachable, release cache contains only clang/rust),
+so **no ICX-witnessed numeric claim is made locally**; hosted CI's
+"Authenticated Intel ICX 2026.2 integration" job is the third oracle.
+
+**Seven code fixes, each with a measured differential:**
+
+1. `parse_paren_param_declarator` adopted the nested `(name)` group's own
+   parameter list instead of consuming the enclosing `)` optimistically and
+   rewinding (the original `expected ')' before '('`).
+2. Its stars now bind to the RETURN type: one leading pointer on the base plus
+   a decaying function core, with `fptr_inner_ptr_depth = 0` and
+   `parsing_pointer_const` cleared. The generic tail adds
+   `inner_ptr_depth - 1` more, so `(** (p)(int))` gets full depth.
+3. Two byte-identical array-dimension loops were folded into
+   `parse_paren_array_dims`, and the six-way `plain_stars` predicate into the
+   pure, unit-testable `nested_group_is_plain_stars` (8 unit tests, one per
+   disjunct). This keeps `parse_paren_param_declarator` UNDER the
+   AUD-RATCHET-1 300-line ceiling; the census stays at its 232 baseline,
+   no re-baseline.
+4. `T *const p(int)` (function-typed parameter): the leading star's `const`
+   qualifies the RETURN pointer, not the parameter object. Leaving the flag
+   set produced a bogus `assignment of read-only parameter`.
+5. `int (*const p)(int)` (function POINTER): the group's single star IS the
+   parameter object, so `p = 0` must be refused. Sema's `top_const` now
+   consults `pointer_const` for `fptr_params` + `paren_star_quals` too.
+   Both directions are pinned: 12 const-placement shapes x 3 compilers x 2
+   ABIs, 0 divergences.
+6. C11 6.7.2.1p2: a struct member cannot have function type. `struct S {
+   int m(int); };` and the K&R `int (*const (m)(int));` are now refused,
+   while `int (*m)(int)` (ends in `FunctionPointer`, not `Function`) stays
+   legal.
+7. C11 6.7.6.3p7/p1: `static`/qualifiers in a non-parameter array
+   derivation and `(*p)(int)[4]` (function returning an array) are now
+   refused with the same verdict as both oracles. The legal
+   `(*const (p)(int))[4]` and `int a[static 4]` are untouched.
+
+**Gate C in `check_gnu_declaration_corners.sh`** (already wired into both CI
+mirrors, so no orchestration churn) has three layers: 44 acceptance shapes +
+12 const shapes + 7 type-sensitive bodies + 11 C99/C11 spellings = 74 shapes
+x 2 ABIs x 2 available oracles = **296 verdict comparisons**; and 3
+end-to-end fixtures compiled at `-O0/-O1/-O2/-O3` by lccc, linked by gcc
+16.2 and EXECUTED on the host CPU (**18 runtime checks**, zero diagnostics
+allowed). The `int (* const (p)(int x)) { ... return &cell; }` fixture is a
+real K&R function DEFINITION whose `*p(0)` only type-checks if `p` returns
+`int *`; the wrong type cannot compile it. A missing optional oracle
+(clang, icx) is PRINTED as unavailable, never silently counted as agreement.
+
+**Host-CPU deep dive (measured, not guessed).** Callgrind on 250 K&R
+declarations: 4,737,746,618 instructions, 18.64% inclusive in
+`label_mention_counts`, which issued **4,394,006** `find(".LBB")` calls.
+Root cause: two peephole passes recomputed a WHOLE-TU label scan for every
+candidate attempt, making them O(F^2) in the number of functions. Both
+`hoist_one_arm_head` and `conditional_tail_calls_in` are side-effect free on
+every non-rewrite path and mutate only when returning/applying a rewrite, so
+caching `(count, duplicate)` across failed attempts and invalidating on the
+first success is provably value-identical.
+
+| N K&R functions | before (O2) | after (O2) | gcc 16.2 | clang 23.1.4 |
+|---|---|---|---|---|
+| 250 | 0.293 s | **0.233 s** | 0.355 s | 0.079 s |
+| 500 | 0.772 s | **0.520 s** | 0.682 s | 0.136 s |
+| 1000 | 2.336 s | **1.052 s** | 1.327 s | 0.259 s |
+| 2000 | 6.619 s | **2.172 s** | 2.650 s | 0.533 s |
+
+Per-function cost went from superlinear (1.17 -> 3.31 ms) to essentially
+FLAT (0.93 -> 1.09 ms); **-67.2% at N=2000, and lccc now compiles this
+workload faster than gcc 16.2 (0.82x)**. Clang 23.1.4 remains ~4x faster on
+frontend throughput; we do NOT claim to beat it. Generated-code host runtime
+on a 40M-iteration integer kernel (median of 5, same object linked by gcc
+16.2): lccc 0.0300 s, gcc 16.2 0.0282 s, clang 23.1.4 0.0169 s -- lccc is
+**NOT** faster there either, and beating the other two on code quality is a
+separate optimisation program, not a claim made by this patch.
+
+**Equivalence proof for the cache.** The pre-optimisation and post-
+optimisation binaries were built from the SAME tree with only
+`jump_thread.rs` swapped (`98ab3736…` vs `f4acdb67…`), then both emitted
+`-std=gnu11 -O2 -S` for 159 sources (9 branch-heavy hand-written fixtures
+plus 150 randomly sampled torture files): **138 byte-identical, 0 different,
+21 skipped (both binaries reject them), 0 timeouts**. Three deterministic
+unit tests pin the structural property: with 64 straight-line functions each
+pass performs <= 1 whole-TU scan (64 before), and the rewrite-heavy golden
+body still reaches a fixpoint. A structural call-count assertion was chosen
+over a wall-clock threshold because CI timing noise would make the latter
+flaky -- "no cycles left behind" needs a proof, not a race.
+
+**Verification after all fixes:** `cargo fmt --all --check` PASS;
+`cargo clippy --all-targets -- -D warnings` PASS with 0 warnings;
+`check_clippy_policy.py` PASS (76 lints); full unit suite **7952 passed /
+0 failed / 10 ignored**; `audit_census.py --check` PASS (all nine metrics
+held, no re-baseline); nine policy checks PASS; four gates PASS
+(asm 21/0, GNU corners 24/0, depth 4/0, vectorizer/OpenMP 31/0).
+`origin/main` is still `49489a5d…`, i.e. this branch is already based on
+the latest upstream main (0 behind). Hosted CI on the preceding revision is
+green on 24 checks (including the ICX 2026.2 integration job) with the
+kernel job pending; the new push re-runs the full matrix.
+

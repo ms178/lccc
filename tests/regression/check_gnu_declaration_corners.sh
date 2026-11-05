@@ -260,5 +260,229 @@ for abi in x86_64 i686; do
 done
 check "gcc 16.2 mode(M) differential on both ABIs (2x${#mode_shapes[@]} shapes)" "$mode_bad"
 
+
+# ---------------------------------------------------------------------------
+# C. K&R parenthesised-name declarators -- `(* const (name)(params))`.
+#
+# gcc.c-torture/compile/991213-2.c uses this shape in a PARAMETER. Two
+# distinct defects were found here, and BOTH are pinned below:
+#
+#  1. PARSING. The nested `(name)` group parses its OWN trailing parameter
+#     list. The old code consumed the enclosing `)` optimistically looking
+#     for another `(` outside, found none, rewound, and `extract_paren_name`
+#     left the parameter list unconsumed: "expected ')' before '('".
+#  2. TYPING (found by red-teaming the first fix). Acceptance parity alone
+#     was NOT enough: GCC 16.2 and Clang 23.1.4 type `int (* const (p)(int))`
+#     as `int *const (*)(int)` -- the stars and their qualifiers bind to the
+#     function's RETURN type, and C11 6.7.6.3p8 adjusts the function-typed
+#     parameter to a pointer. The first fix produced `int (*const)(int)`,
+#     which silently accepted the declaration with the WRONG type. Only a
+#     discriminating program (`*p(1)`, `p = 0`, a real indirect call) exposes
+#     it. This is why the gate has three layers, not one.
+#
+# Layer 1: verdict parity over 49 declarator shapes (including invalid ones
+#          that ALL THREE oracles must reject) x 2 lccc ABIs.
+# Layer 2: 12 `p = 0` const-placement shapes + 5 type-sensitive bodies.
+# Layer 3: end-to-end host-CPU execution. lccc compiles a K&R function
+#          DEFINITION whose `*p(0)` only type-checks if `p` returns `int *`;
+#          GCC 16.2 links the object and the executable must return 0.
+#          Repeated at -O0/-O1/-O2/-O3 so no optimisation level can hide a
+#          lowering bug. Assert lccc emits NO diagnostic for these fixtures.
+#
+# Oracles: the contracted GCC 16.2, Clang 23.1.4 when installed, and ICX
+# 2026.2 when installed. A missing optional oracle is REPORTED, never
+# silently treated as agreement (no claim is made for a compiler not run).
+# ---------------------------------------------------------------------------
+CLANG=${CLANG:-clang}
+ICX=${ICX:-icx}
+kr_oracles=("$GCC")
+kr_names=("gcc")
+if command -v "$CLANG" >/dev/null 2>&1; then
+    kr_oracles+=("$CLANG")
+    kr_names+=("clang $( "$CLANG" --version 2>/dev/null | head -1 )")
+else
+    printf 'K&R oracle note: Clang not installed; no Clang result claimed.\n'
+fi
+if command -v "$ICX" >/dev/null 2>&1; then
+    kr_oracles+=("$ICX")
+    kr_names+=("icx $( "$ICX" --version 2>/dev/null | head -1 )")
+else
+    printf 'K&R oracle note: ICX 2026.2 not installed; no ICX result claimed.\n'
+fi
+
+# verdict <cc> <std> <extra-flags...> : 0 = accepted, 1 = rejected.
+# A non-zero exit AND an `error:` diagnostic both count as rejection; an
+# `error:` with rc=0 (recovered parse) must not be mistaken for success.
+verdict() {
+    local cc=$1 std=$2; shift 2
+    local out rc
+    out=$("$cc" "-std=$std" -O2 "$@" -c "$tmp/kr.c" -o "$tmp/kr.o" 2>&1) && rc=0 || rc=$?
+    if [ "$rc" -eq 0 ] && ! grep -q 'error:' <<<"$out"; then printf '0'; else printf '1'; fi
+}
+
+kr_accept=(
+  'void f(void (* const funcp)(int)){}'
+  'void f(void (* const (funcp))(int)){}'
+  'void f(void (* const (funcp)(int))){}'
+  'void f(void (*(funcp))(int)){}'
+  'void f(void (*(funcp)(int))){}'
+  'void f(void (* const (funcp)(int)), int x){}'
+  'int (* const (fp))(int);'
+  'void f(int (* const (p))(int));'
+  'void f(int (* const (p)(int)));'
+  'void f(int (*(p)(int)));'
+  'void f(int (** (p)(int)));'
+  'void f(int (* const (p)(int)), int y);'
+  'int (*(fp))(int);'
+  'int (*fp)(int);'
+  'void f(int (*p)[4]);'
+  'void f(int (*(*p))(int));'
+  'void f(int ((*p))(int));'
+  'void f(int (* const (*p))(int));'
+  'void f(int (fn)(int));'
+  'void f(int (fn(int)));'
+  'int (* const (fp)(int))(int);'
+  'void f(int (* const (p)(int))[4]);'
+  'void f(int (*(*p)[4])(int));'
+  'void f(int (* const ((p))(int)));'
+  'void f(int (* (((p)))(int)));'
+  'void f(int (* const (p)(int)), int (*(q)(int)));'
+  'int (* const (p)(int))(int);'
+  'int (* (p)(int))[4];'
+  'void f(int (* const (p)(void)));'
+  'void f(int (* const (p)()));'
+  'void f(int (* const (p)(int, ...)));'
+  'void f(char (* const (p)(int)));'
+  'void f(void (* const (p)(int)));'
+  'typedef int F(int); void f(F (* const (p)(int)));'
+  'int (* const (p)(int x)) { (void)x; return 0; }'
+  'static int cell; int * const (p)(int x) { (void)x; return &cell; }'
+  'void f(int (* const (* const (p))(int))(int));'
+  'void f(int (* const (p)(int)) const);'
+  'void f(int (* const (p)(int)), ...);'
+  'void f(int (* const (p)(int)), int, char);'
+  'void f(int (* const (p)(int)) __attribute__((unused)));'
+  'void f(register int (* const (p)(int)));'
+  'void f(int (* volatile (p)(int)));'
+  'void f(int (* const (p)(const int)));'
+  'void f(int (* const (p)(int *)));'
+)
+# The 12 const-placement shapes: the parameter object's own `const` is a
+# completely different question from a `const` on a RETURN pointer.
+kr_decls=(
+  'int * const p'
+  'int ** const p'
+  'int * const p(int)'
+  'int ** const p(int)'
+  'int (* const p)(int)'
+  'int * const (*p)(int)'
+  'int (* const (*p))(int)'
+  'int (* const (p)(int))'
+  'int (* (p)(int))'
+  'int (** (p)(int))'
+  'const int *p'
+  'int *p[3]'
+)
+kr_semantic=(
+  'int g(int (* const (p)(int))) { return *p(1); }'
+  'int g(int (* (p)(int))) { return *p(1); }'
+  'int g(int (** (p)(int))) { return **p(1); }'
+  'int g(int (* const (p)(int)), int x) { return *p(x); }'
+  'int g(int (* const p)(int)) { return *p(1); }'
+  'typedef long T; void f(void (* const (funcp)(T)), T t) { (*funcp)(t); }'
+  'int g(int * const p(int)) { return *p(1); }'
+)
+# C99/C11 spellings that are NOT keywords under -std=gnu89. They must be
+# compared under -std=gnu11, or the oracle's verdict is a dialect artifact.
+kr_gnu11=(
+  'void f(int (* restrict (p)(int)));'
+  'int f(int * restrict p){return 0;}'
+  'int * restrict p(int);'
+  'void f(int (* const (p)(int))[static 4]);'
+  'void f(int a[static 4]);'
+  'void f(int (* const p)(int)[4]);'
+  'void f(int (*p)(int)[4]);'
+  'void f(int (* const (p)(int))[4]);'
+  'struct S { int m(int); };'
+  'struct S { int (*m)(int); };'
+  'struct S { int (* const (m)(int)); };'
+)
+
+kr_sources=()
+for src in "${kr_accept[@]}"; do kr_sources+=("$src"); done
+for decl in "${kr_decls[@]}"; do
+    kr_sources+=("$(printf 'int g(%s) { p = 0; return 0; }' "$decl")")
+done
+for src in "${kr_semantic[@]}"; do kr_sources+=("$src"); done
+
+kr_bad=0
+kr_checks=0
+for abi in x86_64 i686; do
+    if [ "$abi" = i686 ]; then lcc=$CCC_I686; lf=(-m32); gf=(-m32); else lcc=$CCC; lf=(); gf=(); fi
+    if [ ! -x "$lcc" ]; then
+        printf 'K&R ABI note: %s binary %s not built; ABI skipped.\n' "$abi" "$lcc"
+        continue
+    fi
+    for std_group in gnu89 gnu11; do
+        if [ "$std_group" = gnu89 ]; then shapes=("${kr_sources[@]}"); else shapes=("${kr_gnu11[@]}"); fi
+        for src in "${shapes[@]}"; do
+            printf '%s\n' "$src" >"$tmp/kr.c"
+            lv=$(verdict "$lcc" "$std_group" "${lf[@]}")
+            for i in "${!kr_oracles[@]}"; do
+                ov=$(verdict "${kr_oracles[$i]}" "$std_group" "${gf[@]}")
+                kr_checks=$((kr_checks + 1))
+                if [ "$lv" != "$ov" ]; then
+                    printf 'FAIL: K&R %s %s %s %q lccc=%s oracle=%s\n' \
+                        "$abi" "$std_group" "${kr_names[$i]}" "$src" "$lv" "$ov"
+                    kr_bad=$((kr_bad + 1))
+                fi
+            done
+        done
+    done
+done
+check "K&R 3-oracle verdict parity: $(( ${#kr_sources[@]} + ${#kr_gnu11[@]} )) shapes x 2 ABIs ($kr_checks comparisons)" "$kr_bad"
+
+# Layer 3: host-CPU execution. lccc owns the object; gcc 16.2 links it.
+# `*p(0)` type-checks ONLY when the K&R declarator yields a function
+# returning `int *`; the wrong `int (*const)(int)` type fails to compile.
+kr_runtime=(
+  'static int cell = 42; int (* const (p)(int x)) { (void)x; return &cell; } int main(void) { return *p(0) != 42; }'
+  'static int cell = 42; static int *addr(int x) { (void)x; return &cell; } int kr(int (* (p)(int)), int v) { return *p(v); } int main(void) { return kr(addr, 0) != 42; }'
+  'static int cell = 42; static int *addr(int x) { (void)x; return &cell; } int kr(int (* const (p)(int)), int v) { int *(*q)(int) = (int *(*)(int))p; return *q(v); } int main(void) { return kr((int *const (*)(int))addr, 0) != 42; }'
+)
+rt_bad=0
+rt_checks=0
+for src in "${kr_runtime[@]}"; do
+    printf '%s\n' "$src" >"$tmp/kr.c"
+    for opt in 0 1 2 3; do
+        out=$("$CCC" -std=gnu89 -O"$opt" -c "$tmp/kr.c" -o "$tmp/kr.o" 2>&1) && rc=0 || rc=$?
+        rt_checks=$((rt_checks + 1))
+        if [ "$rc" -ne 0 ] || grep -q 'error:\|warning:' <<<"$out"; then
+            printf 'FAIL: K&R runtime fixture -O%s emitted a diagnostic: %s\n' "$opt" "$out"
+            rt_bad=$((rt_bad + 1)); continue
+        fi
+        if ! "$GCC" "$tmp/kr.o" -o "$tmp/kr.bin" >"$tmp/kr.link" 2>&1; then
+            printf 'FAIL: K&R runtime fixture -O%s failed to link: %s\n' "$opt" "$(cat "$tmp/kr.link")"
+            rt_bad=$((rt_bad + 1)); continue
+        fi
+        if ! "$tmp/kr.bin"; then
+            printf 'FAIL: K&R runtime fixture -O%s returned a wrong value\n' "$opt"
+            rt_bad=$((rt_bad + 1)); continue
+        fi
+    done
+    # Oracle control: the same source must also compile/link/run under each
+    # available oracle, proving the fixture itself is valid C.
+    for i in "${!kr_oracles[@]}"; do
+        rt_checks=$((rt_checks + 1))
+        if ! "${kr_oracles[$i]}" -std=gnu89 -O2 -c "$tmp/kr.c" -o "$tmp/kr.o" >"$tmp/kr.occ" 2>&1 \
+           || ! "$GCC" "$tmp/kr.o" -o "$tmp/kr.bin" >>"$tmp/kr.occ" 2>&1 \
+           || ! "$tmp/kr.bin"; then
+            printf 'FAIL: K&R runtime fixture rejected by oracle %s: %s\n' "${kr_names[$i]}" "$(cat "$tmp/kr.occ")"
+            rt_bad=$((rt_bad + 1))
+        fi
+    done
+done
+check "K&R host-CPU execution + oracle control ($rt_checks checks, -O0..-O3, zero diagnostics)" "$rt_bad"
+
 printf 'check_gnu_declaration_corners: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

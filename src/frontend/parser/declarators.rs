@@ -1424,7 +1424,22 @@ impl Parser {
             self.advance();
             // C99 array qualifiers (static, restrict, const, volatile); the
             // first dimension's qualify the adjusted pointer.
+            let quals_start = self.pos;
             let quals = self.skip_array_qualifiers();
+            self.check_non_param_array_quals(is_func_ptr, quals_start, quals);
+            // A function-pointer declarator with an OUTSIDE parameter list
+            // (`(*p)(int)[4]`) cannot return an array (C11 6.7.6.3p1). The
+            // K&R `(*(p)(int))[4]` has fptr_inner_ptr_depth == 0 and is a
+            // different, legal derivation -- GCC 16.2 accepts it.
+            if is_func_ptr && fptr_inner_ptr_depth > 0 {
+                self.emit_error(
+                    format!(
+                        "'{}' declared as function returning an array",
+                        name.as_deref().unwrap_or("type name")
+                    ),
+                    self.peek_span(),
+                );
+            }
             if array_dims.is_empty() {
                 self.attrs.param_adjusted_cvr = quals;
             }
@@ -1452,6 +1467,14 @@ impl Parser {
         // Also handles abstract declarators: `void (Dat *)` → function taking Dat*, returning void
         if matches!(self.peek(), TokenKind::LParen) {
             is_func_ptr = true;
+            // C11 6.7.6.3p8: `T *const p(int)` is a function-typed parameter
+            // adjusted to a pointer to function. The leading stars and their
+            // qualifiers describe the function's RETURN type (they are kept
+            // in pointer_quals), NOT the parameter object; leaving the flag
+            // set made `p = 0` a bogus "assignment of read-only parameter".
+            if !had_paren_decl && pointer_depth > 0 {
+                self.attrs.set_pointer_const(false);
+            }
             let (fp_params, variadic, has_prototype) = self.parse_param_list();
             fptr_params = Some(fp_params);
             fptr_variadic = variadic;
@@ -1478,6 +1501,20 @@ impl Parser {
             }
         }
 
+        // `int (*const p)(int)`: with no leading stars, the group's SINGLE
+        // star is the parameter object itself, so its qualifier is top-level
+        // const. Deeper nested groups keep the conservative path (their qual
+        // order is not the object's), and `(*const (p)(int))` is excluded by
+        // fptr_inner_ptr_depth == 0 -- there the star is a return pointer.
+        if is_func_ptr
+            && pointer_depth == 0
+            && fptr_inner_ptr_depth == 1
+            && paren_star_quals.len() == 1
+        {
+            self.attrs
+                .set_pointer_const(paren_star_quals[0] & CVR_CONST != 0);
+        }
+
         (
             name,
             pointer_depth,
@@ -1494,6 +1531,74 @@ impl Parser {
             paren_star_quals,
             outer_fn_returns,
         )
+    }
+
+    /// True when a nested parenthesised group contributes ONLY plain pointer
+    /// stars to its enclosing group.  Those stars bind OUTSIDE the enclosing
+    /// group's own stars; any array dimension, function-pointer parameter
+    /// list, pointer-to-array shape or outer function return means the nested
+    /// declarator carries its own derived-type contract and must instead keep
+    /// the rewind path.  Pure predicate: no parser state, no side effects,
+    /// so every disjunct is independently unit-testable.
+    fn nested_group_is_plain_stars(
+        nested_is_func_ptr: bool,
+        nested_array_dims: &[Option<Box<Expr>>],
+        nested_ptr_to_array_dims: &[Option<Box<Expr>>],
+        nested_paren_ptr_total: u32,
+        nested_outer_fn_returns: &[(Vec<ParamDecl>, bool, bool, u32)],
+        nested_fptr_params: &Option<Vec<ParamDecl>>,
+        at_rparen: bool,
+    ) -> bool {
+        !nested_is_func_ptr
+            && nested_array_dims.is_empty()
+            && nested_ptr_to_array_dims.is_empty()
+            && nested_paren_ptr_total == 0
+            && nested_outer_fn_returns.is_empty()
+            && nested_fptr_params.is_none()
+            && at_rparen
+    }
+
+    /// C11 6.7.6.3p7: `static` and type qualifiers are legal only in the
+    /// OUTERMOST array derivation of a parameter declared as an array. A
+    /// paren group that already produced a function type is not such a
+    /// derivation, so `(*const (p)(int))[static 4]` is rejected by GCC 16.2
+    /// and Clang 23.1.4. `skip_array_qualifiers` folds `static` into 0, so
+    /// scan the consumed tokens as well. Purely diagnostic; no state change
+    /// beyond the error itself.
+    fn check_non_param_array_quals(&mut self, is_func_ptr: bool, quals_start: usize, quals: u8) {
+        if !is_func_ptr {
+            return;
+        }
+        let has_static = self.tokens[quals_start..self.pos]
+            .iter()
+            .any(|tok| matches!(tok.kind, TokenKind::Static));
+        if has_static || quals != 0 {
+            self.emit_error(
+                "static or type qualifiers in non-parameter array declarator".to_owned(),
+                self.peek_span(),
+            );
+        }
+    }
+
+    /// Parse the `[N]` / `[]` dimensions inside a parenthesised declarator.
+    /// The abstract-array branch and the star branch used to carry identical
+    /// copies of this loop; one copy keeps them from drifting and keeps
+    /// `parse_paren_param_declarator` under the AUD-RATCHET-1 ceiling.
+    fn parse_paren_array_dims(&mut self) -> Vec<Option<Box<Expr>>> {
+        let mut dims = Vec::new();
+        while matches!(self.peek(), TokenKind::LBracket) && !self.is_c23_attr_start() {
+            self.advance();
+            self.skip_array_qualifiers();
+            if matches!(self.peek(), TokenKind::RBracket) {
+                dims.push(None);
+                self.advance();
+            } else {
+                let dim_expr = self.parse_expr();
+                dims.push(Some(Box::new(dim_expr)));
+                self.expect(&TokenKind::RBracket);
+            }
+        }
+        dims
     }
 
     /// Parse a parenthesized parameter declarator: (*name)(params), (name), etc.
@@ -1522,18 +1627,7 @@ impl Parser {
         if matches!(self.peek(), TokenKind::LBracket) && !self.is_c23_attr_start() {
             // Abstract array declarator in parens: ([4]) or ([])
             // E.g., `int f(int ([4]))` is equivalent to `int f(int *)`
-            while matches!(self.peek(), TokenKind::LBracket) && !self.is_c23_attr_start() {
-                self.advance();
-                self.skip_array_qualifiers();
-                if matches!(self.peek(), TokenKind::RBracket) {
-                    array_dims.push(None);
-                    self.advance();
-                } else {
-                    let dim_expr = self.parse_expr();
-                    array_dims.push(Some(Box::new(dim_expr)));
-                    self.expect(&TokenKind::RBracket);
-                }
-            }
+            array_dims.extend(self.parse_paren_array_dims());
             self.expect(&TokenKind::RParen);
             None
         } else if matches!(self.peek(), TokenKind::Star) {
@@ -1589,7 +1683,24 @@ impl Parser {
                     &mut nested_paren_star_quals,
                     &mut nested_outer_fn_returns,
                 );
-                if nested_is_func_ptr && self.consume_if(&TokenKind::RParen) {
+                // `(* const (name)(params))` (991213-2.c): adopt the nested
+                // group's own parameter list; see the regression gate.
+                let mut rewind = false;
+                let mut keep_nested_name = false;
+                if nested_is_func_ptr
+                    && nested_fptr_params.is_some()
+                    && matches!(self.peek(), TokenKind::RParen)
+                {
+                    // Stars + quals bind to the RETURN type (C11 6.7.6.3p8).
+                    self.attrs.set_pointer_const(false);
+                    *pointer_depth += 1;
+                    *is_func_ptr = true;
+                    *fptr_params = nested_fptr_params.take();
+                    *fptr_variadic = nested_fptr_variadic;
+                    *fptr_has_prototype = nested_fptr_has_prototype;
+                    *fptr_inner_ptr_depth = 0;
+                    keep_nested_name = true;
+                } else if nested_is_func_ptr && self.consume_if(&TokenKind::RParen) {
                     if matches!(self.peek(), TokenKind::LParen) {
                         let (ret_params, ret_variadic, ret_has_prototype) = self.parse_param_list();
                         outer_fn_returns.extend(nested_outer_fn_returns);
@@ -1607,25 +1718,30 @@ impl Parser {
                         *array_dims = nested_array_dims;
                         return nested_name;
                     }
+                    rewind = true;
                 }
-                // A nested group of plain stars closed by this group's `)`
-                // (`(*(*p))[3]`, `(*(*fp))(int)`): its stars bind outside the
-                // array or parameter list exactly like this group's own, so
-                // they add to its depth. Rewinding and keeping only the name
-                // dropped them (`int (*(*p))[3]` was typed `int (*)[3]`).
-                let plain_stars = !nested_is_func_ptr
-                    && nested_array_dims.is_empty()
-                    && nested_ptr_to_array_dims.is_empty()
-                    && nested_paren_ptr_total == 0
-                    && nested_outer_fn_returns.is_empty()
-                    && nested_fptr_params.is_none()
-                    && matches!(self.peek(), TokenKind::RParen);
-                if plain_stars {
-                    inner_ptr_depth += nested_ptr_depth;
-                    // Written after this group's stars, so further out.
-                    paren_star_quals.extend(nested_paren_star_quals);
+                if !rewind && !keep_nested_name {
+                    let plain_stars = Self::nested_group_is_plain_stars(
+                        nested_is_func_ptr,
+                        &nested_array_dims,
+                        &nested_ptr_to_array_dims,
+                        nested_paren_ptr_total,
+                        &nested_outer_fn_returns,
+                        &nested_fptr_params,
+                        matches!(self.peek(), TokenKind::RParen),
+                    );
+                    if plain_stars {
+                        inner_ptr_depth += nested_ptr_depth;
+                        paren_star_quals.extend(nested_paren_star_quals);
+                        keep_nested_name = true;
+                    } else {
+                        rewind = true;
+                    }
+                }
+                if keep_nested_name {
                     nested_group_name = Some(nested_name);
-                } else {
+                }
+                if rewind {
                     self.pos = inner_save;
                     self.attrs = inner_attrs;
                 }
@@ -1650,19 +1766,7 @@ impl Parser {
             // These represent "array of pointers" and need to be propagated
             // to the caller so array-to-pointer decay is properly applied.
             // E.g. int (*a[]) = array of ptr-to-int = int **a (after decay)
-            let mut inner_array_dims = Vec::with_capacity(8);
-            while matches!(self.peek(), TokenKind::LBracket) && !self.is_c23_attr_start() {
-                self.advance();
-                self.skip_array_qualifiers();
-                if matches!(self.peek(), TokenKind::RBracket) {
-                    inner_array_dims.push(None);
-                    self.advance();
-                } else {
-                    let dim_expr = self.parse_expr();
-                    inner_array_dims.push(Some(Box::new(dim_expr)));
-                    self.expect(&TokenKind::RBracket);
-                }
-            }
+            let inner_array_dims = self.parse_paren_array_dims();
             self.expect(&TokenKind::RParen);
             if !inner_array_dims.is_empty() && !matches!(self.peek(), TokenKind::LParen) {
                 // Array of pointers: (*a[]) or (*a[N])
@@ -1671,7 +1775,7 @@ impl Parser {
                 // E.g. int (*a[]) → array_dims=[None], pointer_depth+=1 → int **a
                 *pointer_depth += 1;
                 *array_dims = inner_array_dims;
-            } else if matches!(self.peek(), TokenKind::LParen) {
+            } else if !*is_func_ptr && matches!(self.peek(), TokenKind::LParen) {
                 // Function pointer: (*fp)(params) or (*fp[])(params)
                 *is_func_ptr = true;
                 *fptr_inner_ptr_depth = inner_ptr_depth;
@@ -1692,7 +1796,9 @@ impl Parser {
                 *paren_ptr_total = inner_ptr_depth;
                 while matches!(self.peek(), TokenKind::LBracket) && !self.is_c23_attr_start() {
                     self.advance();
-                    self.skip_array_qualifiers();
+                    let quals_start = self.pos;
+                    let quals = self.skip_array_qualifiers();
+                    self.check_non_param_array_quals(*is_func_ptr, quals_start, quals);
                     if matches!(self.peek(), TokenKind::RBracket) {
                         ptr_to_array_dims.push(None);
                         self.advance();
@@ -1702,7 +1808,7 @@ impl Parser {
                         self.expect(&TokenKind::RBracket);
                     }
                 }
-            } else {
+            } else if !*is_func_ptr {
                 *pointer_depth += 1;
             }
             name
@@ -2000,5 +2106,82 @@ impl Parser {
             self.exit_parser_frame();
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every disjunct of `nested_group_is_plain_stars` is load-bearing: a
+    /// false positive silently drops a nested declarator's derived-type
+    /// contract (the original `int (*(*p))[3]` bug), a false negative loses
+    /// the pointer stars added by `(*(*p))`.  Each case pins one disjunct.
+    fn plain(
+        func_ptr: bool,
+        dims: Vec<Option<Box<Expr>>>,
+        ptr_dims: Vec<Option<Box<Expr>>>,
+        paren_total: u32,
+        returns: Vec<(Vec<ParamDecl>, bool, bool, u32)>,
+        params: Option<Vec<ParamDecl>>,
+        rparen: bool,
+    ) -> bool {
+        Parser::nested_group_is_plain_stars(
+            func_ptr,
+            &dims,
+            &ptr_dims,
+            paren_total,
+            &returns,
+            &params,
+            rparen,
+        )
+    }
+
+    #[test]
+    fn plain_stars_accepts_the_empty_contract() {
+        assert!(plain(false, vec![], vec![], 0, vec![], None, true));
+    }
+
+    #[test]
+    fn plain_stars_rejects_a_nested_function_pointer() {
+        assert!(!plain(true, vec![], vec![], 0, vec![], None, true));
+    }
+
+    #[test]
+    fn plain_stars_rejects_nested_function_parameters() {
+        assert!(!plain(false, vec![], vec![], 0, vec![], Some(vec![]), true));
+    }
+
+    #[test]
+    fn plain_stars_rejects_nested_array_dimensions() {
+        assert!(!plain(false, vec![None], vec![], 0, vec![], None, true));
+    }
+
+    #[test]
+    fn plain_stars_rejects_pointer_to_array_dimensions() {
+        assert!(!plain(false, vec![], vec![None], 0, vec![], None, true));
+    }
+
+    #[test]
+    fn plain_stars_rejects_nested_pointer_star_qualifiers() {
+        assert!(!plain(false, vec![], vec![], 1, vec![], None, true));
+    }
+
+    #[test]
+    fn plain_stars_rejects_outer_function_returns() {
+        assert!(!plain(
+            false,
+            vec![],
+            vec![],
+            0,
+            vec![(vec![], false, false, 0)],
+            None,
+            true
+        ));
+    }
+
+    #[test]
+    fn plain_stars_requires_the_closing_paren() {
+        assert!(!plain(false, vec![], vec![], 0, vec![], None, false));
     }
 }

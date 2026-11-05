@@ -668,7 +668,14 @@ impl SemanticAnalyzer {
                 // (C23 6.7.7.4p7): `int a[const 2]` makes `a = 0` an error.
                 let top_const = if param.decayed_array {
                     param.adjusted_cvr & PtrQuals::CONST != 0
-                } else if param.pointer_depth > 0 {
+                } else if param.pointer_depth > 0
+                    || (param.fptr_params.is_some() && !param.paren_star_quals.is_empty())
+                {
+                    // A function-POINTER parameter has no leading stars, but
+                    // its object is still the group's pointer: `int
+                    // (*const p)(int)` makes `p = 0` read-only. Function
+                    // TYPED parameters (`*const p(int)`) instead leave
+                    // pointer_const false -- the star is their return type.
                     param.pointer_const
                 } else {
                     param.is_const || self.base_typedef_is_top_const(&param.type_spec)
@@ -956,7 +963,14 @@ impl SemanticAnalyzer {
                 // (C23 6.7.7.4p7): `int a[const 2]` makes `a = 0` an error.
                 let top_const = if param.decayed_array {
                     param.adjusted_cvr & PtrQuals::CONST != 0
-                } else if param.pointer_depth > 0 {
+                } else if param.pointer_depth > 0
+                    || (param.fptr_params.is_some() && !param.paren_star_quals.is_empty())
+                {
+                    // A function-POINTER parameter has no leading stars, but
+                    // its object is still the group's pointer: `int
+                    // (*const p)(int)` makes `p = 0` read-only. Function
+                    // TYPED parameters (`*const p(int)`) instead leave
+                    // pointer_const false -- the star is their return type.
                     param.pointer_const
                 } else {
                     param.is_const || self.base_typedef_is_top_const(&param.type_spec)
