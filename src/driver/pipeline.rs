@@ -2478,10 +2478,11 @@ impl Driver {
         if self.whole_program && !self.relocatable {
             crate::ir::whole_program::internalize_module(&mut module, false);
         }
-        let debug_param_homes = (self.debug_info && self.opt_level == 0)
-            .then(|| std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())));
-        let debug_local_homes = (self.debug_info && self.opt_level == 0)
-            .then(|| std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())));
+        let debug_homes = (self.debug_info && self.opt_level == 0).then(|| {
+            std::sync::Arc::new(std::sync::Mutex::new(
+                crate::backend::DebugHomeReport::default(),
+            ))
+        });
         let asm = self.compile_ir_module_to_assembly(
             module,
             source_manager.as_ref(),
@@ -2491,16 +2492,15 @@ impl Driver {
             tune,
             time_phases,
             t0,
-            debug_param_homes.clone(),
-            debug_local_homes.clone(),
+            debug_homes.clone(),
         )?;
         let mut debug_unit = debug_unit;
         if let Some(unit) = debug_unit.as_mut() {
-            if let Some(homes) = debug_param_homes {
+            if let Some(homes) = debug_homes {
                 let homes = homes
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                for ((function, index), home) in homes.iter() {
+                for ((function, index), home) in homes.parameters.iter() {
                     if let Some(parameter) = unit
                         .parameters
                         .get_mut(function)
@@ -2512,13 +2512,9 @@ impl Driver {
                         });
                     }
                 }
-            }
-            if let Some(homes) = debug_local_homes {
-                let homes = homes
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 for local in &mut unit.local_variables {
-                    if let Some(home) = homes.get(&(local.function.clone(), local.alloca_id)) {
+                    if let Some(home) = homes.locals.get(&(local.function.clone(), local.alloca_id))
+                    {
                         local.home = Some(crate::backend::elf::DwarfHome {
                             base_register: home.base_register,
                             offset: home.offset,
@@ -2767,7 +2763,6 @@ impl Driver {
             tune,
             time_phases,
             t0,
-            None,
             None,
         )
         .map(|(asm, _facts)| asm)
@@ -3164,8 +3159,7 @@ impl Driver {
         tune: crate::backend::x86::cpu_model::X86Tune,
         time_phases: bool,
         t0: std::time::Instant,
-        debug_param_homes: Option<crate::backend::DebugHomes>,
-        debug_local_homes: Option<crate::backend::DebugLocalHomes>,
+        debug_homes: Option<crate::backend::DebugHomes>,
     ) -> Result<String, String> {
         let (module, pgo_unit) = self.optimize_ir_module(
             module,
@@ -3304,8 +3298,7 @@ impl Driver {
             tune,
             time_phases,
             t0,
-            debug_param_homes,
-            debug_local_homes,
+            debug_homes,
         )
     }
 
@@ -4441,8 +4434,7 @@ impl Driver {
         tune: crate::backend::x86::cpu_model::X86Tune,
         time_phases: bool,
         t0: std::time::Instant,
-        debug_param_homes: Option<crate::backend::DebugHomes>,
-        debug_local_homes: Option<crate::backend::DebugLocalHomes>,
+        debug_homes: Option<crate::backend::DebugHomes>,
     ) -> Result<String, String> {
         if let Some(diagnostic) = unsettled_x86_requirement(module) {
             return Err(format!("{input_file}: {diagnostic}"));
@@ -4503,8 +4495,7 @@ impl Driver {
             .then(|| std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())));
         let opts = crate::backend::CodegenOptions {
             frame_report: frame_report.clone(),
-            debug_param_homes,
-            debug_local_homes,
+            debug_homes,
             ra_config,
             // At -O0 phi elimination leaves non-SSA multi-def webs. The linear
             // scan assumes one definition and miscompiled 125/200 CFG seeds;

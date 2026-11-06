@@ -88,14 +88,18 @@ pub(crate) type FrameReport = std::sync::Arc<
     std::sync::Mutex<std::collections::BTreeMap<String, (crate::common::source::Span, u64)>>,
 >;
 
-/// Codegen-proven parameter homes, keyed by (function, parameter).  Later IPA
-/// retries replace earlier observations; exploratory emissions never enter it.
-pub(crate) type DebugHomes =
-    std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<(String, usize), DebugHome>>>;
+/// Codegen-proven debug homes for one invocation. Parameters are keyed by
+/// (function, original C parameter index); locals by (function, alloca Value
+/// id). One lock gives the driver a consistent view and avoids per-map lock
+/// traffic on every shipped function. Later IPA retries replace earlier
+/// observations; exploratory emissions never enter the report.
+#[derive(Debug, Default)]
+pub(crate) struct DebugHomeReport {
+    pub parameters: std::collections::BTreeMap<(String, usize), DebugHome>,
+    pub locals: std::collections::BTreeMap<(String, u32), DebugHome>,
+}
 
-/// Codegen-proven local-variable homes, keyed by (function, alloca Value id).
-pub(crate) type DebugLocalHomes =
-    std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<(String, u32), DebugHome>>>;
+pub(crate) type DebugHomes = std::sync::Arc<std::sync::Mutex<DebugHomeReport>>;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DebugHome {
@@ -107,8 +111,7 @@ pub(crate) struct DebugHome {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CodegenOptions {
     pub(crate) frame_report: Option<FrameReport>,
-    pub(crate) debug_param_homes: Option<DebugHomes>,
-    pub(crate) debug_local_homes: Option<DebugLocalHomes>,
+    pub(crate) debug_homes: Option<DebugHomes>,
     /// Invocation-owned RA/codegen policy, parsed once by the driver before
     /// any per-function backend work starts.
     pub(crate) ra_config: std::sync::Arc<regalloc::RaConfig>,

@@ -5103,17 +5103,12 @@ pub fn generate_module(
             std::env::var("CCC_DISABLE_PASSES").unwrap_or_default(),
             "intbounds",
         );
-    if let Some(homes) = &cg.state_ref().debug_param_homes {
-        homes
+    if let Some(homes) = &cg.state_ref().debug_homes {
+        let mut homes = homes
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-    }
-    if let Some(homes) = &cg.state_ref().debug_local_homes {
-        homes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        homes.parameters.clear();
+        homes.locals.clear();
     }
     pre_size_output_buffer(cg, module);
     collect_symbol_sets(cg, module);
@@ -6137,7 +6132,7 @@ fn generate_function(
     // only the shipped emission may define a summary or a keep record.
     if !crate::backend::state::EXPLORATORY_EMISSION.with(std::cell::Cell::get) {
         cg.note_function_emitted(func, mark);
-        if let Some(homes) = &cg.state_ref().debug_param_homes {
+        if let Some(homes) = &cg.state_ref().debug_homes {
             let state = cg.state_ref();
             let mut homes = homes
                 .lock()
@@ -6163,7 +6158,7 @@ fn generate_function(
                 let Some((base_register, offset)) = cg.debug_frame_home(*slot) else {
                     continue;
                 };
-                homes.insert(
+                homes.parameters.insert(
                     (func.name.clone(), *original),
                     crate::backend::DebugHome {
                         base_register,
@@ -6171,12 +6166,6 @@ fn generate_function(
                     },
                 );
             }
-        }
-        if let Some(homes) = &cg.state_ref().debug_local_homes {
-            let state = cg.state_ref();
-            let mut homes = homes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for local in &func.debug_locals {
                 // Only a fixed Alloca denotes object storage here.  A DynAlloca
                 // or a promoted value may also have a value_locations entry, but
@@ -6193,7 +6182,7 @@ fn generate_function(
                 let Some((base_register, offset)) = cg.debug_frame_home(slot) else {
                     continue;
                 };
-                homes.insert(
+                homes.locals.insert(
                     (func.name.clone(), local.alloca.0),
                     crate::backend::DebugHome {
                         base_register,

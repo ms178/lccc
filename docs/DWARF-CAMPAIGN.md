@@ -499,7 +499,9 @@ locations remain the named quality gap.
 
 **Design decision.** The first draft proposed a `.dwarf_param` assembly
 pseudo-op. GAS rejects unknown pseudo-ops, so that design was withdrawn. Homes
-now travel as `DwarfUnitSpec` metadata keyed by the original C parameter index
+now travel through one invocation-owned `DebugHomeReport` (parameters and locals
+under a single lock) and are attached to `DwarfUnitSpec` metadata keyed by the
+original C parameter index
 (not the physical IR index: hidden sret and ABI-decomposed pieces must not steal
 a name). For `-S`, D7 renders the resulting DIE/location-list bytes as data, so
 GAS and lccc's assembler deliver the same tree.
