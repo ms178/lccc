@@ -809,6 +809,9 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_overwritten_moves(&lines, &mut kinds, n);
             changed2 |= eliminate_overwritten_stores(&lines, &mut kinds, n);
             changed2 |= per_function(&mut lines, &mut kinds, n, retarget_defs_into_copies);
+            changed2 |= fuse_fp_mul_neg(&mut lines, &mut kinds, n);
+            changed2 |= retarget_fp_return_copies(&mut lines, &mut kinds, n);
+            changed2 |= forward_fp_copies_to_return(&mut lines, &mut kinds, n);
             changed2 |= per_function(&mut lines, &mut kinds, n, fold_cset_add_to_cinc);
             changed2 |= per_function(&mut lines, &mut kinds, n, eliminate_dead_moves);
             changed2 |= per_function(&mut lines, &mut kinds, n, invert_loop_latches);
@@ -7138,6 +7141,458 @@ fn rename_def_dest(line: &str, to: u8) -> Option<String> {
     })
 }
 
+/// The FP register number of `token` when it names a SIMD&FP register view
+/// (`b`/`h`/`s`/`d`/`q`/`v` + 0-31, an arrangement or lane suffix allowed).
+fn fp_view_number(token: &str) -> Option<u8> {
+    let t = token.split(['.', '[']).next()?;
+    let (first, rest) = t.split_at_checked(1)?;
+    if !matches!(first, "b" | "h" | "s" | "d" | "q" | "v") || rest.is_empty() || rest.len() > 2 {
+        return None;
+    }
+    if !rest.bytes().all(|b| b.is_ascii_digit()) || (rest.len() == 2 && rest.starts_with('0')) {
+        return None;
+    }
+    rest.parse::<u8>().ok().filter(|n| *n <= 31)
+}
+
+/// Whether any operand of `line` names a SIMD&FP register -- including the
+/// SVE `z` view of the same file and any register list, whose `{v16-v19}`
+/// range form uses registers it never names.
+fn mentions_any_fp_reg(line: &str) -> bool {
+    let Some((_, rest)) = line.trim().split_once(char::is_whitespace) else {
+        return false;
+    };
+    let z_view = |tok: &str| {
+        tok.strip_prefix('z')
+            .and_then(|r| r.split('.').next())
+            .is_some_and(|r| !r.is_empty() && r.len() <= 2 && r.bytes().all(|b| b.is_ascii_digit()))
+    };
+    rest.contains('{')
+        || rest
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '[' || c == '_'))
+            .any(|tok| fp_view_number(tok).is_some() || z_view(tok))
+}
+
+/// `op dR, ...` / `fmov d0, dR` / (general-register epilogue) / `ret`
+/// becomes `op d0, ...` / ... / `ret`.
+///
+/// The emitter computes an FP result into its allocated home (d16 and up)
+/// and copies it into the return register: one `fmov` per returning path
+/// that GCC and Clang never emit.  The rewrite is exact when
+/// * the defining instruction immediately precedes the copy (no label, so
+///   no other path reaches the copy) and writes all of `dR` from operands
+///   it reads first (`fadd d16, d16, d17` becomes `fadd d0, d16, d17`);
+/// * `R >= 16`: d16-d31 hold neither a result nor a callee-saved value at
+///   `ret`, so `dR` is dead after the copy (d1-d7 may carry the rest of an
+///   HFA result and d8-d15 must survive, so those copies stay);
+/// * only general-register lines and directives separate the copy from the
+///   `ret` -- no label, branch, call or FP operand.
+///
+/// The copy and the definition must use the same view (`d`/`d` or `s`/`s`).
+fn retarget_fp_return_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    const PURE_FP_DEFS: &[&str] = &[
+        "fadd", "fsub", "fmul", "fdiv", "fnmul", "fneg", "fabs", "fsqrt", "fmax", "fmin", "fmaxnm",
+        "fminnm", "fmadd", "fmsub", "fnmadd", "fnmsub", "fcsel", "frinta", "frinti", "frintm",
+        "frintn", "frintp", "frintx", "frintz", "fcvt", "scvtf", "ucvtf",
+    ];
+    let mut changed = false;
+    for ret in 0..n {
+        if kinds[ret] != LineKind::Ret {
+            continue;
+        }
+        // The copy: the nearest FP-mentioning instruction above the `ret`,
+        // with only general-register lines in between.
+        let mut j = ret;
+        let copy = loop {
+            if j == 0 {
+                break None;
+            }
+            j -= 1;
+            match kinds[j] {
+                LineKind::Nop | LineKind::Directive => continue,
+                LineKind::Label
+                | LineKind::Branch
+                | LineKind::CondBranch
+                | LineKind::CmpBranch
+                | LineKind::Call
+                | LineKind::Ret => break None,
+                _ => {}
+            }
+            if a64_traps_to_handler(&lines[j]) || lines[j] == OPAQUE_LINE {
+                break None;
+            }
+            if mentions_any_fp_reg(&lines[j]) {
+                break Some(j);
+            }
+        };
+        let Some(c) = copy else {
+            continue;
+        };
+        let Some(("fmov", ops)) = lines[c].trim().split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Some((dst, src)) = ops.split_once(',') else {
+            continue;
+        };
+        let (dst, src) = (dst.trim(), src.trim());
+        let view = &dst[..1];
+        if !matches!(dst, "d0" | "s0") || !src.starts_with(view) {
+            continue;
+        }
+        let Some(r) = fp_view_number(src) else {
+            continue;
+        };
+        if r < 16 || src.len() != view.len() + r.to_string().len() {
+            continue;
+        }
+        // The definition: the previous instruction, adjacent to the copy.
+        let mut d = c;
+        let def = loop {
+            if d == 0 {
+                break None;
+            }
+            d -= 1;
+            match kinds[d] {
+                LineKind::Nop | LineKind::Directive => continue,
+                LineKind::Label => break None,
+                _ => break Some(d),
+            }
+        };
+        let Some(d) = def else {
+            continue;
+        };
+        let line = lines[d].trim();
+        let Some((mnem, rest)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if !PURE_FP_DEFS.contains(&mnem) {
+            continue;
+        }
+        let Some((first, tail)) = rest.trim_start().split_once(',') else {
+            continue;
+        };
+        if first.trim() != src {
+            continue;
+        }
+        let indent = &lines[d][..lines[d].len() - lines[d].trim_start().len()];
+        lines[d] = format!("{indent}{mnem} {dst},{tail}");
+        kinds[c] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// `fmov dN, dA` followed by a straight-line path to `ret`: the reads of
+/// `dN` on that path read `dA` instead and the copy goes.
+///
+/// This is the entry half of the FP home problem: a parameter arrives in
+/// d0-d7 and the emitter copies it into its d16+ home before use (`fmov
+/// d16, d0; fneg d17, d16; ...`).  The rewrite is exact when
+/// * `N >= 16` (dead at `ret`, see `retarget_fp_return_copies`);
+/// * the path from the copy to `ret` has no label, branch or call, so the
+///   copy reaches every read it feeds and nothing else reaches them;
+/// * every line on it that names an FP register is a scalar FP
+///   data-processing instruction, `fmov`, `fcmp`, or a scalar FP `ldr`/
+///   `str`, whose first operand is its only write (`str`/`fcmp` write
+///   none) -- anything else naming `N` or `A` stops the rewrite;
+/// * `N` is not written again, `A` is not written before the last read of
+///   `N` (an instruction reads before it writes, so `fneg d0, d16` may
+///   become `fneg d0, d0`), and every read of `N` is a `b`/`h`/`s`/`d`
+///   view: the copy zeroed bits 127:64 of `vN`, which `vA` need not have.
+fn forward_fp_copies_to_return(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    const READ_ONLY: &[&str] = &["fcmp", "fcmpe", "str", "stur"];
+    const WRITES_FIRST: &[&str] = &[
+        "fadd", "fsub", "fmul", "fdiv", "fnmul", "fneg", "fabs", "fsqrt", "fmax", "fmin", "fmaxnm",
+        "fminnm", "fmadd", "fmsub", "fnmadd", "fnmsub", "fcsel", "frinta", "frinti", "frintm",
+        "frintn", "frintp", "frintx", "frintz", "fcvt", "scvtf", "ucvtf", "fmov", "ldr", "ldur",
+    ];
+    // Operand tokens of `line` with their positions: (operand index, token).
+    fn operand_tokens(rest: &str) -> Vec<(usize, &str)> {
+        let mut out = Vec::new();
+        for (idx, op) in rest.split(',').enumerate() {
+            for tok in
+                op.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '[' || c == '_'))
+            {
+                if !tok.is_empty() {
+                    out.push((idx, tok));
+                }
+            }
+        }
+        out
+    }
+    let mut changed = false;
+    for i in 0..n {
+        let Some(("fmov", ops)) = lines[i].trim().split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Some((dst, src)) = ops.split_once(',') else {
+            continue;
+        };
+        let (dst, src) = (dst.trim(), src.trim());
+        let view = dst.as_bytes().first().copied();
+        if !matches!(view, Some(b'd' | b's')) || src.as_bytes().first().copied() != view {
+            continue;
+        }
+        let (Some(nreg), Some(areg)) = (fp_view_number(dst), fp_view_number(src)) else {
+            continue;
+        };
+        if nreg < 16 || nreg == areg || dst.contains('.') || src.contains('.') {
+            continue;
+        }
+        let mut renames: Vec<usize> = Vec::new();
+        let mut a_written = false;
+        let mut ok = false;
+        for (j, kind) in kinds.iter().enumerate().take(n).skip(i + 1) {
+            match kind {
+                LineKind::Nop | LineKind::Directive => continue,
+                LineKind::Ret => {
+                    ok = true;
+                    break;
+                }
+                LineKind::Label
+                | LineKind::Branch
+                | LineKind::CondBranch
+                | LineKind::CmpBranch
+                | LineKind::Call => break,
+                _ => {}
+            }
+            let line = &lines[j];
+            if line == OPAQUE_LINE || a64_traps_to_handler(line) {
+                break;
+            }
+            if !mentions_any_fp_reg(line) {
+                continue;
+            }
+            let Some((mnem, rest)) = line.trim().split_once(char::is_whitespace) else {
+                break;
+            };
+            let toks = operand_tokens(rest);
+            let writes_first = WRITES_FIRST.contains(&mnem);
+            // A register list may use registers it never names
+            // (`ld1 {v16.16b-v19.16b}`): it ends the rewrite.  Any other FP
+            // line of an unlisted shape names every register it touches, so
+            // it is harmless unless it names `N` or `A` in some view
+            // (including SVE's `z`).
+            if rest.contains('{') {
+                break;
+            }
+            if !writes_first && !READ_ONLY.contains(&mnem) {
+                let names = |r: u8| {
+                    toks.iter().any(|(_, t)| {
+                        fp_view_number(t) == Some(r)
+                            || t.strip_prefix('z')
+                                .and_then(|z| z.split('.').next())
+                                .and_then(|z| z.parse::<u8>().ok())
+                                == Some(r)
+                    })
+                };
+                if names(nreg) || names(areg) {
+                    break;
+                }
+                continue;
+            }
+            let mut reads_n = false;
+            let mut bad = false;
+            let mut writes_a = false;
+            for (idx, tok) in &toks {
+                let Some(r) = fp_view_number(tok) else {
+                    continue;
+                };
+                let is_dest = writes_first && *idx == 0;
+                if is_dest {
+                    if r == nreg {
+                        bad = true;
+                    }
+                    if r == areg {
+                        writes_a = true;
+                    }
+                } else if r == nreg {
+                    // A read no wider than the copy: after `fmov s16, s0`,
+                    // bits 63:32 of d16 are zero but those of d0 need not be.
+                    let narrow_enough = matches!(
+                        (view, tok.as_bytes()[0]),
+                        (Some(b'd'), b'b' | b'h' | b's' | b'd') | (Some(b's'), b'b' | b'h' | b's')
+                    );
+                    if a_written || !narrow_enough || tok.contains('.') {
+                        bad = true;
+                    }
+                    reads_n = true;
+                }
+            }
+            if bad {
+                break;
+            }
+            if reads_n {
+                renames.push(j);
+            }
+            a_written |= writes_a;
+        }
+        if !ok {
+            continue;
+        }
+        for j in renames {
+            let indent = &lines[j][..lines[j].len() - lines[j].trim_start().len()];
+            let Some((mnem, rest)) = lines[j].trim().split_once(char::is_whitespace) else {
+                continue;
+            };
+            let (head, tail) = if WRITES_FIRST.contains(&mnem) {
+                match rest.split_once(',') {
+                    Some((first, tail)) => (format!("{first},"), tail.to_string()),
+                    None => (String::new(), rest.to_string()),
+                }
+            } else {
+                (String::new(), rest.to_string())
+            };
+            let mut renamed = String::with_capacity(tail.len());
+            let mut token = String::new();
+            let flush = |token: &mut String, out: &mut String| {
+                if fp_view_number(token) == Some(nreg) {
+                    out.push(char::from(token.as_bytes()[0]));
+                    out.push_str(&areg.to_string());
+                } else {
+                    out.push_str(token);
+                }
+                token.clear();
+            };
+            for ch in tail.chars() {
+                if ch.is_ascii_alphanumeric() || ch == '_' {
+                    token.push(ch);
+                } else {
+                    flush(&mut token, &mut renamed);
+                    renamed.push(ch);
+                }
+            }
+            flush(&mut token, &mut renamed);
+            let new_line = format!("{indent}{mnem} {head}{renamed}");
+            // `fmov dK, dK` after the rename moves nothing.
+            let self_move = mnem == "fmov"
+                && new_line
+                    .trim()
+                    .split_once(char::is_whitespace)
+                    .and_then(|(_, o)| o.split_once(','))
+                    .is_some_and(|(a, b)| a.trim() == b.trim());
+            lines[j] = new_line;
+            if self_move {
+                kinds[j] = LineKind::Nop;
+            }
+        }
+        kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// `fmul dA, dX, dY; fneg dB, dA` becomes `fnmul dB, dX, dY`.
+///
+/// FNMUL is FMUL followed by FNEG (Arm ARM: `result = FPMul(...); result =
+/// FPNeg(result)`), one rounding then an exact sign flip, so the fusion is
+/// exact in every rounding mode and for NaNs; GCC and Clang emit it for
+/// `-(x * y)`.  The product register must be dead after the negation: it is
+/// the negation's own destination, or `A >= 16` and the straight-line path
+/// from the negation to `ret` never names it (see
+/// `retarget_fp_return_copies` for why d16-d31 are dead at `ret`).
+fn fuse_fp_mul_neg(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let operands = |line: &str| -> Option<(String, Vec<String>)> {
+        let (mnem, rest) = line.trim().split_once(char::is_whitespace)?;
+        Some((
+            mnem.to_string(),
+            rest.split(',').map(|o| o.trim().to_string()).collect(),
+        ))
+    };
+    let mut changed = false;
+    for i in 0..n {
+        let Some((mnem, ops)) = operands(&lines[i]) else {
+            continue;
+        };
+        if mnem != "fmul"
+            || ops.len() != 3
+            || ops.iter().any(|o| o.contains('.') || o.contains('['))
+        {
+            continue;
+        }
+        let view = ops[0].as_bytes()[0];
+        if !matches!(view, b'd' | b's') || ops.iter().any(|o| o.as_bytes().first() != Some(&view)) {
+            continue;
+        }
+        let Some(a) = fp_view_number(&ops[0]) else {
+            continue;
+        };
+        let Some(j) =
+            (i + 1..n).find(|&j| !matches!(kinds[j], LineKind::Nop | LineKind::Directive))
+        else {
+            continue;
+        };
+        let Some((m2, ops2)) = operands(&lines[j]) else {
+            continue;
+        };
+        if m2 != "fneg"
+            || ops2.len() != 2
+            || ops2[1] != ops[0]
+            || ops2[0].as_bytes().first() != Some(&view)
+        {
+            continue;
+        }
+        let Some(b) = fp_view_number(&ops2[0]) else {
+            continue;
+        };
+        if ops2[0].contains('.') {
+            continue;
+        }
+        let dead_after = a == b
+            || (a >= 16 && {
+                let mut ok = false;
+                for (k, kind) in kinds.iter().enumerate().take(n).skip(j + 1) {
+                    match kind {
+                        LineKind::Nop | LineKind::Directive => continue,
+                        LineKind::Ret => {
+                            ok = true;
+                            break;
+                        }
+                        LineKind::Label
+                        | LineKind::Branch
+                        | LineKind::CondBranch
+                        | LineKind::CmpBranch
+                        | LineKind::Call => break,
+                        _ => {}
+                    }
+                    let line = &lines[k];
+                    if line == OPAQUE_LINE || a64_traps_to_handler(line) {
+                        break;
+                    }
+                    if !mentions_any_fp_reg(line) {
+                        continue;
+                    }
+                    // Only plain scalar FP lines can be read register by
+                    // register; any other FP line may use `a` implicitly.
+                    let Some((m, rest)) = line.trim().split_once(char::is_whitespace) else {
+                        break;
+                    };
+                    let scalar_fp = m.starts_with('f')
+                        || matches!(m, "ldr" | "str" | "ldur" | "stur" | "scvtf" | "ucvtf");
+                    if !scalar_fp
+                        || rest.contains('{')
+                        || rest
+                            .split(|c: char| {
+                                !(c.is_ascii_alphanumeric() || c == '.' || c == '[' || c == '_')
+                            })
+                            .any(|t| fp_view_number(t) == Some(a))
+                    {
+                        break;
+                    }
+                }
+                ok
+            });
+        if !dead_after {
+            continue;
+        }
+        let indent = &lines[i][..lines[i].len() - lines[i].trim_start().len()];
+        lines[i] = format!("{indent}fnmul {}, {}, {}", ops2[0], ops[1], ops[2]);
+        kinds[j] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
 fn retarget_defs_into_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     if n == 0 || lines[..n].iter().any(|l| l == OPAQUE_LINE) {
         return false;
@@ -12435,6 +12890,125 @@ mod call_liveness_and_dead_move_tests {
         assert_eq!(kinds[3], LineKind::Nop);
         assert_eq!(kinds[4], LineKind::Ret);
         assert!(lines.iter().take(3).all(|l| !l.contains('\n')), "{lines:?}");
+    }
+
+    /// `-(x * y)` is one `fnmul` when the product dies at the negation.
+    #[test]
+    fn negated_products_are_fnmul() {
+        let out = rows("f:\n    fmov d16, d0\n    fmul d16, d16, d1\n    fneg d0, d16\n    ret\n");
+        assert_eq!(out, ["f:", "fnmul d0, d0, d1", "ret"], "{out:?}");
+        let out = rows("g:\n    fmul s20, s1, s2\n    fneg s20, s20\n    str s20, [x0]\n    ret\n");
+        assert!(out.contains(&"fnmul s20, s1, s2".to_string()), "{out:?}");
+        // The product read again, a d8-d15 product, or a branch before
+        // `ret`: the multiply and the negation stay apart.
+        for asm in [
+            "h:\n    fmul d16, d1, d2\n    fneg d0, d16\n    fadd d0, d0, d16\n    ret\n",
+            "k:\n    fmul d9, d1, d2\n    fneg d0, d9\n    ret\n",
+            "m:\n    fmul d16, d1, d2\n    fneg d0, d16\n    cbz x0, .L1\n.L1:\n    ret\n",
+            // A register-list range reads v17 without naming it.
+            "n:\n    fmul d17, d1, d2\n    fneg d0, d17\n    st1 {v16.2d-v18.2d}, [x0]\n    ret\n",
+        ] {
+            let out = rows(asm);
+            assert!(
+                !out.iter().any(|l| l.starts_with("fnmul")),
+                "{asm:?}: {out:?}"
+            );
+        }
+    }
+
+    /// A parameter copied from its argument register into a d16+ home is
+    /// read in place on a straight-line path to `ret`; the copy goes.
+    #[test]
+    fn fp_entry_copies_are_read_in_place() {
+        let out = rows("f:\n    fmov d16, d0\n    fneg d17, d16\n    fmov d0, d17\n    ret\n");
+        assert_eq!(out, ["f:", "fneg d0, d0", "ret"], "{out:?}");
+        let out = rows(
+            "g:\n    fmov d16, d0\n    fmov d17, d1\n    fmov d18, d2\n    \
+             fmadd d19, d16, d17, d18\n    fmov d0, d19\n    ret\n",
+        );
+        assert_eq!(out, ["g:", "fmadd d0, d0, d1, d2", "ret"], "{out:?}");
+        // Every shape that needs the copy keeps it: a q/v view of the home
+        // (bits 127:64 were zeroed), the source written before the last
+        // read, a branch on the path, the home written again.
+        for (asm, kept) in [
+            (
+                "h:\n    fmov d16, d0\n    mov v0.16b, v16.16b\n    ret\n",
+                "fmov d16, d0",
+            ),
+            // A read wider than the copy, and a register list.
+            (
+                "r:\n    fmov s16, s0\n    fmov x0, d16\n    ret\n",
+                "fmov s16, s0",
+            ),
+            (
+                "t:\n    fmov d16, d0\n    st1 {v16.2d}, [x0]\n    ret\n",
+                "fmov d16, d0",
+            ),
+            (
+                "k:\n    fmov d16, d0\n    fmov d0, d1\n    fadd d0, d0, d16\n    ret\n",
+                "fmov d16, d0",
+            ),
+            (
+                "m:\n    fmov d16, d0\n    cbz x0, .L1\n    fneg d0, d16\n.L1:\n    ret\n",
+                "fmov d16, d0",
+            ),
+            (
+                "p:\n    fmov d16, d0\n    fadd d16, d16, d1\n    fmul d17, d16, d16\n    \
+                 fmov d0, d17\n    ret\n",
+                "fmov d16, d0",
+            ),
+        ] {
+            let out = rows(asm);
+            assert!(out.contains(&kept.to_string()), "{asm:?}: {out:?}");
+        }
+    }
+
+    /// An FP result computed into a d16+ home and copied into d0 before
+    /// `ret` is computed into d0 directly; every shape whose copy carries
+    /// information keeps it.
+    #[test]
+    fn fp_results_are_computed_into_the_return_register() {
+        let out = rows("f:\n    fadd d18, d16, d17\n    fmov d0, d18\n    ret\n");
+        assert_eq!(out, ["f:", "fadd d0, d16, d17", "ret"], "{out:?}");
+        // With the entry copies forwarded too, the leaf is GCC's.
+        let out = rows(
+            "f:\n    fmov d16, d0\n    fmov d17, d1\n    fadd d18, d16, d17\n    fmov d0, d18\n    ret\n",
+        );
+        assert_eq!(out, ["f:", "fadd d0, d0, d1", "ret"], "{out:?}");
+        // General-register epilogue lines may separate the copy from `ret`.
+        let out = rows(
+            "g:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    bl h\n    fneg s17, s16\n    \
+             fmov s0, s17\n    ldp x29, x30, [sp], #16\n    ret\n",
+        );
+        assert!(out.contains(&"fneg s0, s16".to_string()), "{out:?}");
+        // d1-d15 (HFA members, callee-saved), a label between definition
+        // and copy, a view change, a non-arithmetic definition and an FP
+        // line after the copy all keep the copy.
+        for (asm, kept) in [
+            (
+                "h:\n    fadd d1, d2, d3\n    fmov d0, d1\n    ret\n",
+                "fmov d0, d1",
+            ),
+            (
+                "k:\n    fadd d18, d16, d17\n.L1:\n    fmov d0, d18\n    ret\n",
+                "fmov d0, d18",
+            ),
+            (
+                "m:\n    fadd s18, s16, s17\n    fmov d0, d18\n    ret\n",
+                "fmov d0, d18",
+            ),
+            (
+                "p:\n    str d18, [x0]\n    fmov d0, d18\n    ret\n",
+                "fmov d0, d18",
+            ),
+            (
+                "q:\n    fadd d18, d16, d17\n    fmov d0, d18\n    fmov d1, d16\n    ret\n",
+                "fmov d0, d18",
+            ),
+        ] {
+            let out = rows(asm);
+            assert!(out.contains(&kept.to_string()), "{asm:?}: {out:?}");
+        }
     }
 
     /// The emitter's annotation names the registers a callee takes values
