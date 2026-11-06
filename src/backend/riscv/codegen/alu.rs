@@ -55,6 +55,89 @@ fn immediate_form(op: IrBinOp, rhs: &Operand, use_32bit: bool) -> Option<(&'stat
     Some(form)
 }
 
+/// How `x * c` is computed without `mul` and without the `li` that stages
+/// `c`: a shift of `x` into t1 and one add/sub with `x` itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MulPlan {
+    /// `c = 2^k + 1`: `slli t1, x, k; add t0, t1, x`.
+    AddShifted(u32),
+    /// `c = 2^k - 1`: `slli t1, x, k; sub t0, t1, x`.
+    ShiftedMinus(u32),
+    /// `c = 1 - 2^k`: `slli t1, x, k; sub t0, x, t1`.
+    MinusShifted(u32),
+}
+
+/// The plan for multiplying by `c` modulo 2^`width`, if `c` has one.
+///
+/// `slli` shifts all 64 bits, and the 32-bit view adds or subtracts with
+/// `addw`/`subw`, which take the low 32 bits of the 64-bit operands and
+/// sign-extend the result -- the low 32 bits of `(x << k) ± x` are those of
+/// the exact product, so the register ends up bit for bit what `mulw`
+/// writes (and the 64-bit forms what `mul` writes). 0, 1 and powers of two
+/// (already shifts when they reach the backend) are left to the generic
+/// path.
+fn mul_plan(c: u64, width: u32) -> Option<MulPlan> {
+    let mask = if width == 32 {
+        u64::from(u32::MAX)
+    } else {
+        u64::MAX
+    };
+    let c = c & mask;
+    if c == 0 || c.is_power_of_two() {
+        return None;
+    }
+    let shift = |n: u64| {
+        let k = n.trailing_zeros();
+        (n.is_power_of_two() && (1..width).contains(&k)).then_some(k)
+    };
+    // `c` is at least 3 here, and `c + 1` cannot wrap unless `c == mask`.
+    if let Some(k) = shift(c - 1) {
+        return Some(MulPlan::AddShifted(k));
+    }
+    if c != mask {
+        if let Some(k) = shift(c + 1) {
+            return Some(MulPlan::ShiftedMinus(k));
+        }
+    }
+    shift(1u64.wrapping_sub(c) & mask).map(MulPlan::MinusShifted)
+}
+
+/// The view `emit_int_binop_impl` multiplies an integer type in: the W
+/// forms for `int`/`unsigned`, the 64-bit forms otherwise.
+fn mul_width(ty: IrType) -> u32 {
+    if matches!(ty, IrType::I32 | IrType::U32) {
+        32
+    } else {
+        64
+    }
+}
+
+/// Whether this backend multiplies an integer of type `ty` by the
+/// (sign-extended) constant `c` without a register for `c` (see
+/// [`mul_plan`]).
+///
+/// The loop constant hoist (`passes::int_const_hoist`) leaves such a factor
+/// in place; every other multiplier is staged with `li` per use and is
+/// worth a register across the loop. The plan's two single-cycle
+/// instructions replace `li` + `mul` one for one, off the multiplier (3+
+/// cycles of latency on SiFive U74- and C910-class cores): GCC 16.2 and
+/// Clang 23.1.5 expand the same factors (`x * 31` is `slli a4, a2, 5; sub
+/// a2, a4, a2` in both).
+pub(crate) fn mul_needs_no_constant(c: u64, ty: IrType) -> bool {
+    ty.is_integer() && ty.size() <= 8 && mul_plan(c, mul_width(ty)).is_some()
+}
+
+/// An integer constant operand, sign-extended to 64 bits.
+fn int_const_bits(op: &Operand) -> Option<u64> {
+    match op {
+        Operand::Const(IrConst::I8(v)) => Some(i64::from(*v) as u64),
+        Operand::Const(IrConst::I16(v)) => Some(i64::from(*v) as u64),
+        Operand::Const(IrConst::I32(v)) => Some(i64::from(*v) as u64),
+        Operand::Const(IrConst::I64(v)) => Some(*v as u64),
+        _ => None,
+    }
+}
+
 impl RiscvCodegen {
     // ---- Unary ----
 
@@ -154,6 +237,33 @@ impl RiscvCodegen {
             self.state.reg_cache.invalidate_acc();
             self.store_t0_to(dest);
             return;
+        }
+
+        // `x * c` with a shift-and-add plan: two single-cycle instructions
+        // in place of `li` + `mul` (see `mul_plan`). The W view is the one
+        // the `mulw` below would use.
+        if op == IrBinOp::Mul && ty.is_integer() && ty.size() <= 8 {
+            let factor = match (int_const_bits(lhs), int_const_bits(rhs)) {
+                (None, Some(c)) => Some((lhs, c)),
+                (Some(c), None) => Some((rhs, c)),
+                _ => None,
+            };
+            if let Some((x, plan)) =
+                factor.and_then(|(x, c)| mul_plan(c, mul_width(ty)).map(|plan| (x, plan)))
+            {
+                let w = if use_32bit { "w" } else { "" };
+                let (k, combine) = match plan {
+                    MulPlan::AddShifted(k) => (k, format!("add{w} t0, t1, t0")),
+                    MulPlan::ShiftedMinus(k) => (k, format!("sub{w} t0, t1, t0")),
+                    MulPlan::MinusShifted(k) => (k, format!("sub{w} t0, t0, t1")),
+                };
+                self.operand_to_t0(x);
+                self.state.emit_fmt(format_args!("    slli t1, t0, {k}"));
+                self.state.emit_fmt(format_args!("    {combine}"));
+                self.state.reg_cache.invalidate_acc();
+                self.store_t0_to(dest);
+                return;
+            }
         }
 
         self.operand_to_t0(lhs);
@@ -614,6 +724,8 @@ mod immediate_form_tests {
         }
     }
 
+    /// 6 has no shift-and-add plan, so the multiply keeps `mul` too (the
+    /// planned factors are `mul_plan_tests`' subject).
     #[test]
     fn operations_without_an_i_type_twin_keep_the_register_form() {
         for op in [
@@ -623,7 +735,7 @@ mod immediate_form_tests {
             IrBinOp::SRem,
             IrBinOp::URem,
         ] {
-            let asm = emit(op, IrType::I64, IrConst::I64(3));
+            let asm = emit(op, IrType::I64, IrConst::I64(6));
             assert!(asm.contains("t0, t1, t2"), "{op:?}:\n{asm}");
         }
         let rot = emit(IrBinOp::RotateLeft, IrType::I64, IrConst::I64(3));
@@ -715,5 +827,174 @@ mod immediate_form_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod mul_plan_tests {
+    use super::*;
+    use crate::backend::regalloc::PhysReg;
+    use std::collections::HashMap;
+
+    /// `%3 = %1 * c` through the real emitter, `%1` and `%3` in registers.
+    fn emit(ty: IrType, c: i64, constant_first: bool) -> Vec<String> {
+        let mut cg = RiscvCodegen::new();
+        cg.reg_assignments.insert(1, PhysReg(12));
+        cg.reg_assignments.insert(3, PhysReg(14));
+        let x = Operand::Value(Value(1));
+        let k = Operand::Const(IrConst::I64(c));
+        let (lhs, rhs) = if constant_first { (k, x) } else { (x, k) };
+        cg.emit_int_binop_impl(&Value(3), IrBinOp::Mul, &lhs, &rhs, ty);
+        cg.state
+            .out
+            .buf
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    /// Execute the register-only RV64 lines the multiply paths emit (`mv`,
+    /// `li`, `slli`, `add[w]`, `sub[w]`, `mul[w]`): a `w` form operates on
+    /// the low 32 bits and sign-extends its result.
+    fn exec(lines: &[String], regs: &mut HashMap<String, u64>) {
+        for line in lines {
+            let (mnem, rest) = line.split_once(' ').unwrap_or((line.as_str(), ""));
+            let ops: Vec<&str> = rest.split(',').map(str::trim).collect();
+            let get = |regs: &HashMap<String, u64>, r: &str| {
+                *regs
+                    .get(r)
+                    .unwrap_or_else(|| panic!("read of unset {r} in {line:?}"))
+            };
+            let sext32 = |v: u64| i64::from(v as u32 as i32) as u64;
+            let value = match mnem {
+                "mv" => get(regs, ops[1]),
+                "li" => ops[1]
+                    .parse::<i64>()
+                    .unwrap_or_else(|_| panic!("li {line:?}")) as u64,
+                "slli" => {
+                    let k: u32 = ops[2].parse().unwrap_or_else(|_| panic!("{line:?}"));
+                    get(regs, ops[1]) << k
+                }
+                "add" => get(regs, ops[1]).wrapping_add(get(regs, ops[2])),
+                "sub" => get(regs, ops[1]).wrapping_sub(get(regs, ops[2])),
+                "mul" => get(regs, ops[1]).wrapping_mul(get(regs, ops[2])),
+                "addw" => sext32(get(regs, ops[1]).wrapping_add(get(regs, ops[2]))),
+                "subw" => sext32(get(regs, ops[1]).wrapping_sub(get(regs, ops[2]))),
+                "mulw" => sext32(get(regs, ops[1]).wrapping_mul(get(regs, ops[2]))),
+                _ => panic!("unexpected line {line:?}"),
+            };
+            regs.insert(ops[0].to_string(), value);
+        }
+    }
+
+    /// The result register's name (the destination of the last line).
+    fn dest_of(lines: &[String]) -> String {
+        let last = lines.last().expect("no lines");
+        let (_, rest) = last.split_once(' ').expect("operands");
+        rest.split(',').next().expect("dest").trim().to_string()
+    }
+
+    /// The source register's name, read from the staging `mv t0, <reg>`.
+    fn source_of(lines: &[String]) -> String {
+        lines
+            .iter()
+            .find_map(|l| l.strip_prefix("mv t0, ").map(str::to_string))
+            .expect("staging of x")
+    }
+
+    /// Every constant in -1100..=1100 and every `2^k ± 1` / `1 - 2^k`
+    /// family member, in every integer view, from either operand side: a
+    /// planned factor is `slli` + `add[w]`/`sub[w]` with no `li` and no
+    /// `mul`, every other one keeps `li` + `mul[w]`, and both produce the
+    /// register value of the exact product (`mulw`'s sign-extended word
+    /// for `int`/`unsigned`, the 64-bit product otherwise).
+    #[test]
+    fn planned_factors_multiply_exactly_without_li_or_mul() {
+        let xs = [
+            0u64,
+            1,
+            3,
+            0x7fff_ffff,
+            0xffff_ffff_8000_0001,
+            0xffff_ffff_ffff_ffff,
+            0x1234_5678_9abc_def1,
+            0x0000_0000_dead_beef,
+        ];
+        let mut planned = 0usize;
+        for ty in [
+            IrType::I32,
+            IrType::U32,
+            IrType::I64,
+            IrType::U64,
+            IrType::I16,
+        ] {
+            let width = mul_width(ty);
+            let mut constants: Vec<i64> = (-1100..=1100).collect();
+            for k in 1..62 {
+                constants.extend([(1i64 << k) + 1, (1i64 << k) - 1, 1 - (1i64 << k)]);
+            }
+            for &c in &constants {
+                let has_plan = mul_plan(c as u64, width).is_some();
+                assert_eq!(mul_needs_no_constant(c as u64, ty), has_plan, "{c} {ty:?}");
+                for constant_first in [false, true] {
+                    let lines = emit(ty, c, constant_first);
+                    let uses_mul = lines.iter().any(|l| l.starts_with("mul"));
+                    let uses_li = lines.iter().any(|l| l.starts_with("li "));
+                    if has_plan {
+                        planned += 1;
+                        assert!(!uses_mul && !uses_li, "x * {c} ({ty:?}): {lines:?}");
+                        assert_eq!(lines.len(), 4, "mv, slli, add/sub, mv: {lines:?}");
+                    } else {
+                        assert!(uses_mul, "x * {c} ({ty:?}): {lines:?}");
+                    }
+                    let src = source_of(&lines);
+                    let dst = dest_of(&lines);
+                    for &x in &xs {
+                        // The rv64 register form of an `int`/`unsigned` value
+                        // is its sign-extended word.
+                        let x = if width == 32 {
+                            i64::from(x as u32 as i32) as u64
+                        } else {
+                            x
+                        };
+                        let mut regs = HashMap::new();
+                        regs.insert(src.clone(), x);
+                        exec(&lines, &mut regs);
+                        let product = x.wrapping_mul(c as u64);
+                        let want = if width == 32 {
+                            i64::from(product as u32 as i32) as u64
+                        } else {
+                            product
+                        };
+                        assert_eq!(regs[&dst], want, "{x:#x} * {c} ({ty:?}): {lines:?}");
+                    }
+                }
+            }
+        }
+        // Each type sees 3 + 5 + 9 + 17 + ... in the range and both sides.
+        assert!(planned > 1000, "{planned}");
+    }
+
+    #[test]
+    fn plan_shapes_match_the_constant_families() {
+        assert_eq!(mul_plan(3, 64), Some(MulPlan::AddShifted(1)));
+        assert_eq!(mul_plan(33, 32), Some(MulPlan::AddShifted(5)));
+        assert_eq!(mul_plan(31, 32), Some(MulPlan::ShiftedMinus(5)));
+        assert_eq!(mul_plan(7, 64), Some(MulPlan::ShiftedMinus(3)));
+        assert_eq!(mul_plan((-3i64) as u64, 64), Some(MulPlan::MinusShifted(2)));
+        assert_eq!(mul_plan(u64::MAX, 64), Some(MulPlan::MinusShifted(1)));
+        assert_eq!(mul_plan(0xffff_fffd, 32), Some(MulPlan::MinusShifted(2)));
+        assert_eq!(mul_plan(0x8000_0001, 32), Some(MulPlan::AddShifted(31)));
+        assert_eq!(
+            mul_plan(0x8000_0000_0000_0001, 64),
+            Some(MulPlan::AddShifted(63))
+        );
+        // Not one shift and one add/sub away, a power of two, 0 or 1.
+        for c in [0u64, 1, 2, 8, 6, 10, 12, 1000, (-5i64) as u64] {
+            assert_eq!(mul_plan(c, 64), None, "{c}");
+        }
+        // 0xffff_fffd is -3 in the 32-bit view only.
+        assert_eq!(mul_plan(0xffff_fffd, 64), None);
     }
 }

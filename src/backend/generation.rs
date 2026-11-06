@@ -4972,7 +4972,17 @@ pub(crate) fn andn_fusion_env_enabled() -> bool {
     std::env::var_os("CCC_NO_ANDN_FUSION").is_none()
 }
 
-/// Adjacent `shift-imm; logical` that AArch64 encodes as one instruction.
+/// Adjacent `shift-imm; op` that AArch64 encodes as one shifted-register
+/// instruction (returns the index of `op`):
+/// * `and`/`orr`/`eor` with the shift on either side;
+/// * `add` with the shift on either side (`add d, o, x, lsl #k`);
+/// * `sub` with the shift on the right (`sub d, o, x, lsl #k`): there is no
+///   reverse-subtract, so `(x << k) - o` stays two instructions.
+///
+/// An add/sub whose other operand is a constant is left alone: the plain
+/// shift followed by an immediate `add`/`sub` is the same two instructions
+/// and needs no register for the constant. `shifted_operand_fusions`
+/// filters the add/sub pairs another fusion already claims.
 fn detect_shifted_logical_fusions(block: &BasicBlock, use_counts: &[u32]) -> FxHashSet<usize> {
     let mut logical_indices = FxHashSet::default();
     for (idx, pair) in block.instructions.windows(2).enumerate() {
@@ -5004,19 +5014,56 @@ fn detect_shifted_logical_fusions(block: &BasicBlock, use_counts: &[u32]) -> FxH
         if use_counts.get(shift_dest.0 as usize).copied().unwrap_or(0) != 1 {
             continue;
         }
-        let (lhs, rhs, logical_ty) = match &pair[1] {
+        let (op, lhs, rhs, logical_ty) = match &pair[1] {
             Instruction::BinOp {
                 op, lhs, rhs, ty, ..
-            } if matches!(op, IrBinOp::And | IrBinOp::Or | IrBinOp::Xor) => (lhs, rhs, ty),
+            } if matches!(
+                op,
+                IrBinOp::And | IrBinOp::Or | IrBinOp::Xor | IrBinOp::Add | IrBinOp::Sub
+            ) =>
+            {
+                (op, lhs, rhs, ty)
+            }
             _ => continue,
         };
-        let uses_shift = matches!(lhs, Operand::Value(v) if v.0 == shift_dest.0)
-            || matches!(rhs, Operand::Value(v) if v.0 == shift_dest.0);
-        if uses_shift && logical_ty == shift_ty {
+        let is_shift = |o: &Operand| matches!(o, Operand::Value(v) if v.0 == shift_dest.0);
+        let register = |o: &Operand| !matches!(o, Operand::Const(_));
+        let fusable = match op {
+            IrBinOp::Add => (is_shift(lhs) && register(rhs)) || (is_shift(rhs) && register(lhs)),
+            IrBinOp::Sub => is_shift(rhs) && !is_shift(lhs) && register(lhs),
+            _ => is_shift(lhs) || is_shift(rhs),
+        };
+        if fusable && logical_ty == shift_ty {
             logical_indices.insert(idx + 1);
         }
     }
     logical_indices
+}
+
+/// `detect_shifted_logical_fusions` minus the add/sub pairs another fusion
+/// owns: an add that a multiply-add, gap-fma or conditional increment emits
+/// or the branch anchor covers (`OtherFusionClaims::add`), and a pair whose
+/// shift sits inside the branch range. The shifted emission runs at the
+/// shift and skips the partner, so a doubly claimed add would be emitted
+/// twice. Logical partners are never claimed by those fusions.
+fn shifted_operand_fusions(
+    block: &BasicBlock,
+    use_counts: &[u32],
+    claims: &OtherFusionClaims<'_>,
+) -> FxHashSet<usize> {
+    detect_shifted_logical_fusions(block, use_counts)
+        .into_iter()
+        .filter(|&i| {
+            let arithmetic = matches!(
+                block.instructions.get(i),
+                Some(Instruction::BinOp {
+                    op: IrBinOp::Add | IrBinOp::Sub,
+                    ..
+                })
+            );
+            !arithmetic || !(claims.add(i) || claims.by_branch(i.saturating_sub(1)))
+        })
+        .collect()
 }
 
 /// Detect `Not` + `And` pairs fusable into one 3-operand `andn`.
@@ -7202,22 +7249,23 @@ fn generate_function_body(
             .iter()
             .filter_map(|fusion| fusion.cmp_idx)
             .collect();
+        let other_claims = OtherFusionClaims {
+            branch_range: fuse_idx.map(|(a, end, _)| (a, end.unwrap_or(a))),
+            conditional_increment_cmps: &conditional_increment_cmps,
+            conditional_increment_adds: &conditional_increment_adds,
+            cmp_select_fusions: &cmp_select_fusions,
+            gap_add_fusions: &gap_add_fusions,
+            mul_add_fusions: &mul_add_fusions,
+        };
         let mut bit_test_fusions = BitTestFusionPlan::new(
             &*cg,
             block,
             &value_use_counts,
             fuse_idx.map(|f| f.0),
-            &OtherFusionClaims {
-                branch_range: fuse_idx.map(|(a, end, _)| (a, end.unwrap_or(a))),
-                conditional_increment_cmps: &conditional_increment_cmps,
-                conditional_increment_adds: &conditional_increment_adds,
-                cmp_select_fusions: &cmp_select_fusions,
-                gap_add_fusions: &gap_add_fusions,
-                mul_add_fusions: &mul_add_fusions,
-            },
+            &other_claims,
         );
         let shifted_logical_fusions = if cg.supports_shifted_logical() {
-            detect_shifted_logical_fusions(block, &value_use_counts)
+            shifted_operand_fusions(block, &value_use_counts, &other_claims)
         } else {
             FxHashSet::default()
         };
@@ -10917,5 +10965,123 @@ mod indexed_offset_dead_tests {
             src: Operand::Const(IrConst::I64(0)),
         });
         assert!(dead(&f, &m, &[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod shifted_operand_fusion_tests {
+    use super::*;
+    use crate::ir::reexports::BlockId;
+
+    fn bin(dest: u32, op: IrBinOp, lhs: Operand, rhs: Operand) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(dest),
+            op,
+            lhs,
+            rhs,
+            ty: IrType::I64,
+        }
+    }
+
+    fn v(id: u32) -> Operand {
+        Operand::Value(Value(id))
+    }
+
+    fn block(instructions: Vec<Instruction>) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        }
+    }
+
+    /// `[s = x << 3; d = op(..)]` with the shift used once.
+    fn pair(op: IrBinOp, lhs: Operand, rhs: Operand) -> BasicBlock {
+        block(vec![
+            bin(10, IrBinOp::Shl, v(1), Operand::Const(IrConst::I64(3))),
+            bin(11, op, lhs, rhs),
+        ])
+    }
+
+    fn counts() -> Vec<u32> {
+        let mut c = vec![0u32; 16];
+        c[10] = 1;
+        c
+    }
+
+    #[test]
+    fn add_either_side_and_sub_right_side_fuse() {
+        let c = counts();
+        let k = || Operand::Const(IrConst::I64(5));
+        for (op, lhs, rhs, fused) in [
+            (IrBinOp::Add, v(2), v(10), true),
+            (IrBinOp::Add, v(10), v(2), true),
+            (IrBinOp::Sub, v(2), v(10), true),
+            // No reverse subtract; a constant other operand stays an
+            // immediate after the plain shift.
+            (IrBinOp::Sub, v(10), v(2), false),
+            (IrBinOp::Add, v(10), k(), false),
+            (IrBinOp::Add, k(), v(10), false),
+            (IrBinOp::Sub, k(), v(10), false),
+            // The logical family is unchanged.
+            (IrBinOp::Xor, v(10), v(2), true),
+            (IrBinOp::And, v(2), v(10), true),
+            (IrBinOp::Mul, v(2), v(10), false),
+        ] {
+            let b = pair(op, lhs, rhs);
+            let got = detect_shifted_logical_fusions(&b, &c).contains(&1);
+            assert_eq!(got, fused, "{op:?}");
+        }
+        // A shift with a second use is materialized anyway.
+        let mut two = counts();
+        two[10] = 2;
+        assert!(detect_shifted_logical_fusions(&pair(IrBinOp::Add, v(2), v(10)), &two).is_empty());
+    }
+
+    #[test]
+    fn claimed_adds_are_left_to_their_fusion() {
+        let c = counts();
+        let b = pair(IrBinOp::Add, v(2), v(10));
+        let empty_set = FxHashSet::default();
+        let empty_gap = FxHashMap::default();
+        let empty_mul = FxHashMap::default();
+        let claims = |branch_range, adds, mul_add| OtherFusionClaims {
+            branch_range,
+            conditional_increment_cmps: &empty_set,
+            conditional_increment_adds: adds,
+            cmp_select_fusions: &[],
+            gap_add_fusions: &empty_gap,
+            mul_add_fusions: mul_add,
+        };
+        assert!(
+            shifted_operand_fusions(&b, &c, &claims(None, &empty_set, &empty_mul)).contains(&1)
+        );
+        let incr: FxHashSet<usize> = [1].into_iter().collect();
+        assert!(shifted_operand_fusions(&b, &c, &claims(None, &incr, &empty_mul)).is_empty());
+        let mut mul: FxHashMap<usize, MulAddFusion> = FxHashMap::default();
+        mul.insert(
+            0,
+            MulAddFusion {
+                partner_idx: 1,
+                neg_product_idx: None,
+                neg_result_idx: None,
+                negate_product: false,
+                negate_addend: false,
+            },
+        );
+        assert!(shifted_operand_fusions(&b, &c, &claims(None, &empty_set, &mul)).is_empty());
+        // The shift inside the branch range, or the add itself.
+        assert!(
+            shifted_operand_fusions(&b, &c, &claims(Some((0, 0)), &empty_set, &empty_mul))
+                .is_empty()
+        );
+        assert!(
+            shifted_operand_fusions(&b, &c, &claims(Some((1, 1)), &empty_set, &empty_mul))
+                .is_empty()
+        );
+        // A logical partner keeps its fusion whatever the claims say.
+        let x = pair(IrBinOp::Or, v(2), v(10));
+        assert!(shifted_operand_fusions(&x, &c, &claims(None, &incr, &mul)).contains(&1));
     }
 }

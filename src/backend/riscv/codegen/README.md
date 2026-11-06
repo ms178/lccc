@@ -57,10 +57,10 @@ All files live under `src/backend/riscv/codegen/`.
 | `prologue.rs` | Stack space calculation, register allocator invocation, prologue/epilogue emission (small-frame, large-frame, stack-probing paths), parameter classification and storage, variadic register save area setup. |
 | `calls.rs` | Outgoing call ABI: `CallAbiConfig` for LP64D, stack argument marshalling, GP/FP register argument staging (three-phase strategy using t3/t4/t5), F128 and i128 register-pair argument loading, call instruction emission, result retrieval. |
 | `memory.rs` | Load, store, and memcpy operations. Slot addressing (direct s0-relative, indirect through pointer, over-aligned alloca). GEP (get-element-pointer) with constant offsets (variable-offset GEP uses the shared trait default in `traits.rs`). Dynamic stack allocation helpers (`alloca` round-up, sp manipulation). |
-| `alu.rs` | Integer arithmetic: binary operations (`add`/`addw`, `sub`/`subw`, `mul`/`mulw`, `div`/`divw`/`divu`/`divuw`, `rem`/`remw`/`remu`/`remuw`, shifts, bitwise), unary negation, bitwise NOT, float negation (`fneg.{s,d}`), i128 copy. Selects 32-bit `*w` instruction variants for I32/U32 types. |
+| `alu.rs` | Integer arithmetic: binary operations (`add`/`addw`, `sub`/`subw`, `mul`/`mulw`, `div`/`divw`/`divu`/`divuw`, `rem`/`remw`/`remu`/`remuw`, shifts, bitwise), unary negation, bitwise NOT, float negation (`fneg.{s,d}`), i128 copy. Selects 32-bit `*w` instruction variants for I32/U32 types and the I-type form for an imm12 operand. A multiply by `2^k + 1`, `2^k - 1` or `1 - 2^k` is `slli` + `add[w]`/`sub[w]` (no `li`, no `mul`; bit for bit what `mul[w]` writes); `mul_needs_no_constant` tells the loop constant hoist which factors to leave in place. |
 | `float_ops.rs` | Floating-point binary operations (`fadd`, `fsub`, `fmul`, `fdiv`) for F32 and F64, using `fmv.w.x`/`fmv.d.x` (GP-to-FP) and `fmv.x.w`/`fmv.x.d` (FP-to-GP) to move between register files. F128 binary ops dispatch to soft-float libcalls. F128 negation (sign-bit flip). |
 | `comparison.rs` | Integer comparisons (via `slt`/`sltu`/`seqz`/`snez`), float comparisons (via `feq`/`flt`/`fle`), fused compare-and-branch (inverted branch + jump), select (`beqz`-based conditional move), F128 comparisons via libcalls. |
-| `cast_ops.rs` | Type conversions: integer widening/narrowing via `slli`/`srai`/`srli`/`andi`, float-to-int via `fcvt.l.d`/`fcvt.lu.d`, int-to-float via `fcvt.d.l`/`fcvt.s.l`, float-to-float via `fcvt.d.s`/`fcvt.s.d`, U32-to-I32 sign extension. |
+| `cast_ops.rs` | Type conversions: integer widening/narrowing via `slli`/`srai`/`srli`/`andi`, float-to-int via `fcvt.w[u].{s,d}` (targets of at most 32 bits) or `fcvt.l[u].{s,d}`, int-to-float via `fcvt.d.l`/`fcvt.s.l`, float-to-float via `fcvt.d.s`/`fcvt.s.d`, U32-to-I32 sign extension. |
 | `i128_ops.rs` | 128-bit integer arithmetic (add with carry, subtract with borrow, multiply, shifts with boundary cases), 128-bit comparisons (high-word-first cascade), div/rem via `__divti3`/`__modti3` libcalls, i128-to-float and float-to-i128 conversions via compiler-rt libcalls. |
 | `f128.rs` | `F128SoftFloat` trait implementation for RISC-V. Provides the arch-specific primitives (GP register pair `a0:a1` representation, `fmv.d.x`/`fmv.x.d` move instructions, s0-relative addressing) consumed by the shared F128 orchestration in `backend/f128_softfloat.rs`. |
 | `atomics.rs` | Atomic load, store, RMW, and CAS. Word/doubleword atomics via AMO instructions (`amoadd`, `amoswap`, `amoand`, etc.) and LR/SC loops (for NAND). Sub-word (8/16-bit) atomics via word-aligned LR.W/SC.W with bit masking. Software CLZ, CTZ, BSWAP, POPCOUNT. |
@@ -439,8 +439,10 @@ that classifies every source-to-destination type pair.
 - **Integer widening**: zero-extend unsigned types with `andi`/`slli`+`srli`;
   sign-extend signed types with `slli`+`srai` or `sext.w` for I32.
 - **Integer narrowing**: mask or sign-extend to the target width.
-- **Float-to-int**: `fmv.{d,w}.x` to FP register, then `fcvt.l.{d,s}` (signed)
-  or `fcvt.lu.{d,s}` (unsigned) with `rtz` (round-toward-zero) rounding mode.
+- **Float-to-int**: `fmv.{d,w}.x` to FP register, then `fcvt.w.{d,s}` /
+  `fcvt.wu.{d,s}` for targets of at most 32 bits (saturating, result
+  sign-extended to XLEN, so `int` needs no `sext.w`) or `fcvt.l.{d,s}` /
+  `fcvt.lu.{d,s}` for 64-bit targets, with `rtz` (round-toward-zero).
 - **Int-to-float**: optional sign-extension, then `fcvt.{d,s}.l` (signed) or
   `fcvt.{d,s}.lu`/`fcvt.{d,s}.wu` (unsigned), then `fmv.x.{d,w}` back to GP.
 - **Float-to-float**: `fcvt.d.s` (widen F32 to F64) or `fcvt.s.d` (narrow
@@ -838,8 +840,22 @@ LineKind
 | 5 | **Li-to-move chain** | `li rX, imm; mv rY, rX` is collapsed to `li rY, imm` when rX is a temp register and the move is the immediate next instruction. |
 | 6 | **Global store forwarding** | Tracks slot-to-register mappings within basic blocks. When a load reads a slot whose value is known to be in a register, the load is replaced with a register move (or eliminated if same register). Mappings are invalidated at calls, labels, and instructions that clobber the tracked register. |
 | 7 | **Register copy propagation** | After store forwarding creates moves, propagates `mv dst, src` into the next instruction's source operand fields. `lla`/`la` instructions are protected from propagation since symbol names may contain register-like substrings (e.g., `main.s1.0`). |
-| 8 | **Global dead store elimination** | Removes stores to stack slots that are never loaded anywhere in the function. Scans all lines for load instructions and builds a set of "live" offsets; stores to other offsets are deleted. |
+| 8 | **Global dead store elimination** | Removes stores to stack slots that are never loaded anywhere in the function (integer, FP and narrow stores alike). The census (`rv_frame_reads`) collects every byte range the function loads; a function whose frame address escapes, or that accesses a slot in a form of unknown width, keeps every store. Runs at the end of the global passes and in every cleanup round, after the forwarding passes below have answered the loads. |
 | 9 | **Dead register move elimination** | Removes `mv sN, t0` moves where the destination callee-saved register is never read before being overwritten. Applied in global and cleanup passes. |
+| 9a | **Redundant `sext.w` elimination** | A `sext.w` of a register that provably holds a sign-extended word becomes a copy (or goes, in place): block-local facts from the `*w` family, `lui`, `li` of a constant inside the signed 32-bit range (a wider `li` is no word), word loads and the entry contract, plus function-wide facts for registers that are not live on entry and whose every write is such a word (`rv_invariantly_wide`) -- a loop bound hoisted into `a3` is not re-extended on each iteration. |
+| 10 | **FP bit-move forwarding** | `fmv.x.d t0, ft0; ...; fmv.d.x ft1, t0` → `fmv.d ft1, ft0`, and a store of `t0` becomes `fsd ft0`: after a bit move in either direction both registers hold the same bits until one is rewritten. The bit move then dies (dead `fmv.x.*` are deleted with the other pure definitions). |
+| 11 | **FP round-trip folding** | `ld t0, off(rB); fmv.d.x ft1, t0` → `fld`; `ld`/`lw` + `fmv.w.x` → `flw` (the low word); `fmv.x.d t0, ft0; sd t0, ...` → `fsd`; `fmv.x.w t0, fa0; sd t0, off(s0)` → `fsw` when the census shows no read of the slot's upper word. |
+| 12 | **FP slot forwarding** | A reload of a slot an FP store wrote becomes a copy of the stored register (`fld` → `fmv.d`, `ld` → `fmv.x.d`, `flw` → `fmv.s`, `lw` → `fmv.x.w`). Forward dataflow over the CFG: facts survive a join when every predecessor agrees. Private frames only. |
+| 13 | **FP slot promotion** | A slot that one straight-line stretch stores (first) and reloads, with exact-width accesses only, lives in a free FP temporary instead (proved dead by FP liveness); every access becomes the copy or bit move with its exact semantics. Never a callee-saved register's save slot. |
+| 14 | **FP copy forwarding / result retargeting** | `fmv.d ft0, fa0; fadd.d ft0, ft0, ft1` → `fadd.d ft0, fa0, ft1` (the scratch rewritten or dead before the next transfer); `fadd.d ft0, ...; fmv.d fa0, ft0` → `fadd.d fa0, ...` (the scratch dies at the copy). Dead copies, loads and bit moves into scratch registers and `fmv.d fX, fX` go. |
+| 15 | **Vestigial frame elimination** | Last: a function whose body no longer names `sp`, `s0` or `ra` and makes no call loses its prologue, CFI rows and epilogues. `frameless_leaf` is decided before the passes run, so an FP leaf whose slots were all forwarded still set up a frame. |
+
+Every FP rewrite relies on the emitter's invariant that a single in an FP
+register is NaN-boxed (psABI arguments and results; every single-writing
+instruction boxes), so `fmv.s` copies a single bit for bit as `fmv.d`
+(`fsgnj.d`) copies a double. `double addd(double a, double b)` is
+`fadd.d fa0, fa0, fa1; ret` -- Clang's code -- instead of a 14-instruction
+framed body.
 
 ---
 

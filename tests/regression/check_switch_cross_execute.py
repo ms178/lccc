@@ -35,7 +35,7 @@ FIXTURES = (
     "asm_scalar_operand_classes_cross", "alias_copy_after_join_cross",
     "predicate_inverted_signed_cmp_cross", "word_reload_sign_extension_cross",
     "leaf_params_fp_domain_cross", "vector_fma_families_cross", "call_args_and_pool_regs_cross",
-    "fp_sign_and_vector_fms_cross",
+    "fp_sign_and_vector_fms_cross", "int_mul_const_and_fp_int_cast_cross",
 )
 ALL_LEVELS = ("-O0", "-O1", "-O2", "-Os")
 LEVELS = {
@@ -101,6 +101,18 @@ LEVELS = {
     # and NaNs; an FP constant compared as integer bits was an internal
     # compiler error at -O1 and up.
     "fp_sign_and_vector_fms_cross": ALL_LEVELS + ("-O3",),
+    # AArch64: a multiply by a constant feeding an add/sub fuses into the
+    # multiplier plan's shifted add/sub (a constant addend only as a 12-bit
+    # immediate), shifted operands fuse into the ALU op on either side of an
+    # add, and FP-to-integer conversions write their W/X home directly.
+    # RV64: word conversions saturate and sign-extend (a U8/U16/U32 result
+    # needs its zero extension), and the FP peephole forwards frame slots
+    # and copies, promotes a spilled temporary to a free FP scratch and
+    # drops frames nothing uses -- every copy checked bit for bit. Inside
+    # loops, the constant hoist leaves the factors each backend expands
+    # into shifted adds in place and hoists the rest (and, on RV64, every
+    # nonzero compare operand).
+    "int_mul_const_and_fp_int_cast_cross": ALL_LEVELS + ("-O3",),
 }
 # Two-unit psABI fixtures under interop/: `<name>_callee.c` and
 # `<name>_caller.c`, linked LCCC-with-LCCC and LCCC-with-Clang in both

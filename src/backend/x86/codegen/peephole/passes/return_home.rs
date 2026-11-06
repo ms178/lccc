@@ -254,6 +254,32 @@ fn reissue_root(text: &str, d_fam: RegId, force_32: bool) -> Option<String> {
         return Some(format!("    {out_mnem} {src}, {}", rax_alias(dst_tier)));
     }
 
+    // FP -> integer truncation: written fresh from an XMM register or memory
+    // (both read before the destination is written), so relocating the
+    // destination is the same conversion -- `cvttsd2siq %xmm2, %r12; movq
+    // %r12, %rax` becomes `cvttsd2siq %xmm2, %rax`. A `q` form declines a
+    // width-down: its low half is not the 32-bit conversion (out-of-range
+    // inputs give the low bits of the 64-bit result, not the integer
+    // indefinite 0x80000000), and keeping the `q` form would hand the caller
+    // the upper half the truncating copy cleared. A general-register source
+    // is not a conversion the emitter produces; decline it fail-closed.
+    if matches!(
+        mnem,
+        "cvttsd2sil"
+            | "cvttsd2siq"
+            | "cvttss2sil"
+            | "cvttss2siq"
+            | "vcvttsd2sil"
+            | "vcvttsd2siq"
+            | "vcvttss2sil"
+            | "vcvttss2siq"
+    ) {
+        if plain_gp_operand(src).is_some() || (force_32 && mnem.ends_with('q')) {
+            return None;
+        }
+        return Some(format!("    {mnem} {src}, {}", rax_alias(dst_tier)));
+    }
+
     // add: three-address lea.  Register sources join as the SIB index, the
     // destination family as the base; an immediate becomes the displacement.
     // lea_size law: a narrow result uses `leal` (a `leaw` would be a
@@ -896,6 +922,34 @@ mod tests {
         )));
         assert!(out.contains("addl %ecx, %edi"), "root kept:\\n{out}");
         assert!(out.contains("movl %edi, %eax"), "copy kept:\\n{out}");
+    }
+
+    #[test]
+    fn fp_to_int_conversion_root_converts_into_the_return_register() {
+        // `long f(double d) { return (long)d * 3 ... }` shapes: the
+        // conversion writes its home and the return copies it.
+        let out = run_home(&frame(concat!(
+            "    cvttsd2siq %xmm2, %r12\n",
+            "    movq %r12, %rax\n",
+            "    ret\n",
+        )));
+        assert!(out.contains("cvttsd2siq %xmm2, %rax"), "{out}");
+        assert!(!out.contains("%r12"), "{out}");
+        let out = run_home(&frame(concat!(
+            "    cvttss2sil -8(%rbp), %ebx\n",
+            "    movl %ebx, %eax\n",
+            "    ret\n",
+        )));
+        assert!(out.contains("cvttss2sil -8(%rbp), %eax"), "{out}");
+        assert!(!out.contains("movl %ebx, %eax"), "{out}");
+        // A 64-bit conversion behind a truncating copy keeps both lines.
+        let out = run_home(&frame(concat!(
+            "    cvttsd2siq %xmm2, %r12\n",
+            "    movl %r12d, %eax\n",
+            "    ret\n",
+        )));
+        assert!(out.contains("cvttsd2siq %xmm2, %r12"), "{out}");
+        assert!(out.contains("movl %r12d, %eax"), "{out}");
     }
 
     #[test]

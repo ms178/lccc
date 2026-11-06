@@ -554,6 +554,22 @@ impl ArmCodegen {
         self.current_return_type = func.return_type;
         self.func_ret_is_f128_sse = func.ret_is_f128_sse;
         self.current_frame_size = frame_size;
+        // The width of a narrow integer result, for the peephole: AAPCS64
+        // leaves the bits of x0 above it unspecified (callers extend what
+        // they read), so an extension that only rewrites those bits on the
+        // way to `ret` is unobservable.  Never emitted: the peephole drops it.
+        let ret_bits = match func.return_type {
+            IrType::I8 | IrType::U8 => Some(8),
+            IrType::I16 | IrType::U16 => Some(16),
+            IrType::I32 | IrType::U32 => Some(32),
+            _ => None,
+        };
+        if let Some(bits) = ret_bits.filter(|_| !func.uses_sret) {
+            self.state.emit_fmt(format_args!(
+                "    {}{bits}",
+                super::peephole::RET_BITS_MARKER
+            ));
+        }
         self.frame_base_offset = None;
         self.frameless_leaf =
             !self.conditional_increment_leaf && self.frameless_leaf_ok(func, frame_size);

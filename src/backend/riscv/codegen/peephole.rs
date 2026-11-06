@@ -774,7 +774,12 @@ pub fn peephole_optimize(asm: String) -> String {
     global_changed |= eliminate_dead_defs_global(&lines, &mut kinds, n);
     global_changed |= eliminate_undemanded_extensions(&mut lines, &mut kinds, n);
     global_changed |= fold_into_memory_operands(&mut lines, &mut kinds, n);
+    global_changed |= forward_fp_bit_moves(&mut lines, &mut kinds, n);
     global_changed |= fold_fp_bounces(&mut lines, &mut kinds, n);
+    global_changed |= forward_fp_slot_reloads(&mut lines, &mut kinds, n);
+    global_changed |= promote_fp_frame_slots(&mut lines, &mut kinds, n);
+    global_changed |= forward_fp_copies(&mut lines, &mut kinds, n);
+    global_changed |= retarget_fp_results(&mut lines, &mut kinds, n);
     // Per function; a function with an opaque body is skipped whole.
     global_changed |= global_dead_store_elimination(&lines, &mut kinds, n);
 
@@ -809,12 +814,22 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_dead_defs_global(&lines, &mut kinds, n);
             changed2 |= eliminate_undemanded_extensions(&mut lines, &mut kinds, n);
             changed2 |= fold_into_memory_operands(&mut lines, &mut kinds, n);
+            changed2 |= forward_fp_bit_moves(&mut lines, &mut kinds, n);
             changed2 |= fold_fp_bounces(&mut lines, &mut kinds, n);
+            changed2 |= forward_fp_slot_reloads(&mut lines, &mut kinds, n);
+            changed2 |= promote_fp_frame_slots(&mut lines, &mut kinds, n);
+            changed2 |= forward_fp_copies(&mut lines, &mut kinds, n);
+            changed2 |= retarget_fp_results(&mut lines, &mut kinds, n);
+            // The forwarding passes above leave the stores they answered
+            // dead; phase 2 judged the slots before they ran.
+            changed2 |= global_dead_store_elimination(&lines, &mut kinds, n);
             rounds2 += 1;
         }
     }
 
     drop_orphaned_save_rows(&lines, &mut kinds, n);
+    // Last: only now is it known which frames the body no longer touches.
+    eliminate_vestigial_frames(&lines, &mut kinds, n);
 
     // Restore protected functions byte-for-byte, including their original -g
     // rows and CFI. No placeholder is permitted to survive the optimizer.
@@ -1433,7 +1448,17 @@ fn sext_producing_def(line: &str, kind: LineKind) -> Option<(u8, bool)> {
     let t = line.trim();
     let (mnem, rest) = t.split_once(' ')?;
     match kind {
-        LineKind::LoadImm { dst } => Some((dst, true)), // li: sign-extended imm
+        // `li` writes its 64-bit constant: a sign-extended word only inside
+        // the signed 32-bit range. `int f(void) { long c = 0x100000001; return
+        // (int)c; }` at -O0 is `li t0, 4294967297; sext.w a0, t0`, and the
+        // sign extension is the psABI's int result (1), not a copy.
+        LineKind::LoadImm { dst } => {
+            let wide = rest
+                .split_once(',')
+                .and_then(|(_, imm)| parse_asm_i64(imm.trim()))
+                .is_some_and(|v| i32::try_from(v).is_ok());
+            Some((dst, wide))
+        }
         LineKind::SextW { dst, .. } => Some((dst, true)),
         LineKind::Move { dst, .. } => Some((dst, false)), // actual update below
         LineKind::LoadS0 { reg, is_word, .. } => Some((reg, is_word)), // lw yes, ld no
@@ -1481,7 +1506,141 @@ fn sext_producing_def(line: &str, kind: LineKind) -> Option<(u8, bool)> {
                 || long_srai;
             Some((dst, wide))
         }
+        // FP results in a general register: the word conversions and
+        // `fmv.x.w` sign-extend their 32-bit result to XLEN, the comparisons
+        // write 0 or 1 and `fclass` a 10-bit mask; the doubleword forms are
+        // full 64-bit values.
+        LineKind::Other => {
+            let dst = rv_fp_gp_dest(line)?;
+            let wide = match mnem.split('.').collect::<Vec<_>>()[..] {
+                ["fcvt", int, _] => matches!(int, "w" | "wu"),
+                ["fmv", "x", fmt] => fmt == "w",
+                [op, _] => matches!(op, "feq" | "flt" | "fle" | "fclass"),
+                _ => false,
+            };
+            Some((dst, wide))
+        }
         _ => None,
+    }
+}
+
+/// What a line writes to the general registers, as far as the
+/// function-wide sign-extension facts of [`rv_invariantly_wide`] care.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WordDef {
+    /// Writes no general register.
+    Nothing,
+    /// Writes the register with a sign-extended word.
+    Wide(u8),
+    /// `mv dst, src`: a sign-extended word exactly when `src` holds one.
+    Copy(u8, u8),
+    /// Writes these registers with values that need not be sign-extended
+    /// words.
+    Clobbers(u64),
+    /// A line whose general-register writes this cannot tell.
+    Unknown,
+}
+
+fn rv_word_def(line: &str, kind: LineKind) -> WordDef {
+    match kind {
+        LineKind::Nop
+        | LineKind::Label
+        | LineKind::Directive
+        | LineKind::StoreS0 { .. }
+        | LineKind::Ret
+        | LineKind::Branch => return WordDef::Nothing,
+        LineKind::Call => return WordDef::Clobbers(RV_CALLER_SAVED),
+        LineKind::Move { dst, src } => return WordDef::Copy(dst, src),
+        LineKind::Jump => {
+            // `jump label, t6` writes its scratch register, `j label` none.
+            let t = line.trim();
+            if !t.starts_with("jump ") {
+                return WordDef::Nothing;
+            }
+            let scratch = t
+                .rsplit(',')
+                .next()
+                .map_or(REG_NONE, |r| parse_reg(r.trim()));
+            return if scratch == REG_NONE {
+                WordDef::Unknown
+            } else {
+                WordDef::Clobbers(rv_bit(scratch))
+            };
+        }
+        _ => {}
+    }
+    if rv_is_store(line) || (kind == LineKind::Other && rv_is_pure_fp_line(line)) {
+        return WordDef::Nothing;
+    }
+    if kind == LineKind::Other
+        && let Some(dst) = rv_load_dest(line)
+    {
+        // `lw`/`lh`/`lb` sign-extend from bit 31 or below, `lhu`/`lbu`
+        // zero-extend fewer than 32 bits; `ld` and `lwu` do neither.
+        let mnemonic = line.trim().split_whitespace().next().unwrap_or("");
+        return if matches!(mnemonic, "lw" | "lh" | "lb" | "lhu" | "lbu") {
+            WordDef::Wide(dst)
+        } else {
+            WordDef::Clobbers(rv_bit(dst))
+        };
+    }
+    match sext_producing_def(line, kind) {
+        Some((dst, true)) => WordDef::Wide(dst),
+        Some((dst, false)) => WordDef::Clobbers(rv_bit(dst)),
+        None => WordDef::Unknown,
+    }
+}
+
+/// The general registers that hold a sign-extended word at every point of
+/// the function `[start, end)` that reads them: no path reads the value the
+/// register had on entry (it is not live there), and every line that
+/// writes it writes such a word -- directly, or by copying a register of
+/// the same set (the greatest such set: a register whose only writes are
+/// copies of each other is never read before one of them executes, and the
+/// first to execute would read a register live on entry). A hoisted loop
+/// constant (`li a3, 50` in the preheader) is the case the block-local
+/// tracking of [`eliminate_redundant_sext_w`] cannot see: its `int` compare
+/// re-extended it on every iteration (`sext.w t2, a3`). Any line whose
+/// writes are not modelled, or an unresolvable CFG, gives no facts.
+fn rv_invariantly_wide(lines: &[String], kinds: &[LineKind], start: usize, end: usize) -> u64 {
+    let mut defined = 0u64;
+    let mut clobbered = 0u64;
+    let mut copies: Vec<(u8, u8)> = Vec::new();
+    for k in start..end {
+        match rv_word_def(&lines[k], kinds[k]) {
+            WordDef::Nothing => {}
+            WordDef::Wide(r) => defined |= rv_bit(r),
+            WordDef::Copy(dst, src) => {
+                defined |= rv_bit(dst);
+                copies.push((dst, src));
+            }
+            WordDef::Clobbers(mask) => {
+                defined |= mask;
+                clobbered |= mask;
+            }
+            WordDef::Unknown => return 0,
+        }
+    }
+    let candidates = defined & !clobbered & !rv_bit(REG_SP) & !rv_bit(REG_RA);
+    if candidates == 0 {
+        return 0;
+    }
+    let Some(live) = RvLiveness::build(lines, kinds, start, end) else {
+        return 0;
+    };
+    let mut wide = candidates & !live.live_before.first().copied().unwrap_or(RV_LIVE_ALL);
+    loop {
+        let next = copies.iter().fold(wide, |acc, &(dst, src)| {
+            if wide & rv_bit(src) == 0 {
+                acc & !rv_bit(dst)
+            } else {
+                acc
+            }
+        });
+        if next == wide {
+            return wide;
+        }
+        wide = next;
     }
 }
 
@@ -1490,13 +1649,22 @@ fn eliminate_redundant_sext_w(lines: &mut [String], kinds: &mut [LineKind], n: u
         return false;
     }
     let mut changed = false;
+    // The registers that hold a sign-extended word wherever their function
+    // reads them (`rv_invariantly_wide`): facts no join or boundary ends.
+    let mut invariant = vec![0u64; n];
+    for (start, end) in rv_function_ranges(lines, kinds, n) {
+        let wide = rv_invariantly_wide(lines, kinds, start, end);
+        if wide != 0 {
+            invariant[start..end].fill(wide);
+        }
+    }
     // sext-wide set: bit per register id (0..=31 GPRs).
     let mut wide: u64 = 0;
     let mut i = 0;
     while i < n {
         match kinds[i] {
             LineKind::Label | LineKind::Branch | LineKind::Ret | LineKind::Jump => {
-                wide = 0; // join point / boundary
+                wide = invariant[i]; // join point / boundary
                 i += 1;
                 continue;
             }
@@ -1554,8 +1722,11 @@ fn eliminate_redundant_sext_w(lines: &mut [String], kinds: &mut [LineKind], n: u
             continue;
         }
         // Any other store defines no GP register either (RISC-V has no
-        // writeback addressing): keep every fact across it.
-        if rv_is_store(lines[i].trim()) {
+        // writeback addressing): keep every fact across it -- and so does an
+        // FP computation, load or move that writes no general register.
+        if rv_is_store(lines[i].trim())
+            || (kinds[i] == LineKind::Other && rv_is_pure_fp_line(&lines[i]))
+        {
             i += 1;
             continue;
         }
@@ -1563,8 +1734,10 @@ fn eliminate_redundant_sext_w(lines: &mut [String], kinds: &mut [LineKind], n: u
         let (dst, producer_sext) = match sext_producing_def(&lines[i], kinds[i]) {
             Some(x) => x,
             None => {
-                // Unknown line: clear nothing specific, be safe — clear all.
-                wide = 0;
+                // Unknown line: clear nothing specific, be safe — clear all
+                // (but the function-wide facts, which such a line would have
+                // prevented).
+                wide = invariant[i];
                 i += 1;
                 continue;
             }
@@ -2851,6 +3024,9 @@ fn retarget_dying_accumulator_moves(
             | LineKind::SextW { dst, .. }
             | LineKind::LoadS0 { reg: dst, .. } => dst,
             LineKind::Alu => parse_alu_dest(line)?,
+            // An FP result in a general register (`fcvt.l.d t0, ft0, rtz`,
+            // `flt.d t0, ft0, ft1`, `fmv.x.d t0, ft0`): its first operand.
+            LineKind::Other => rv_fp_gp_dest(line)?,
             _ => return None,
         };
         (dst <= REG_T6).then_some(dst)
@@ -2876,6 +3052,7 @@ fn retarget_dying_accumulator_moves(
         if lines[fstart..fend].iter().any(|line| line == OPAQUE_LINE) {
             continue;
         }
+        let mut live: Option<Option<RvLiveness>> = None;
         let mut i = fstart + 1;
         while i + 1 < fend {
             let Some(tmp) = producible_dest(&lines[i], kinds[i]) else {
@@ -2892,13 +3069,23 @@ fn retarget_dying_accumulator_moves(
             };
             // A value home is never a scratch, and `s0`, `sp` and `ra` carry
             // meaning of their own: leave those consumers alone.
-            if src != tmp
-                || dst == tmp
-                || dst == REG_S0
-                || dst == REG_SP
-                || dst == REG_RA
-                || !scratch_dead_after(lines, kinds, j + 1, tmp, fend)
-            {
+            if src != tmp || dst == tmp || dst == REG_S0 || dst == REG_SP || dst == REG_RA {
+                i += 1;
+                continue;
+            }
+            // The scratch must die at the move: the local scan settles
+            // straight-line code, the function's liveness what lies past a
+            // branch or a label (built once, on the first such question --
+            // each rewrite only shortens the scratch's live range).
+            let dead = scratch_dead_after(lines, kinds, j + 1, tmp, fend) || {
+                if live.is_none() {
+                    live = Some(RvLiveness::build(lines, kinds, fstart, fend));
+                }
+                live.as_ref()
+                    .and_then(Option::as_ref)
+                    .is_some_and(|l| l.live_after(j) & rv_bit(tmp) == 0)
+            };
+            if !dead {
                 i += 1;
                 continue;
             }
@@ -3784,7 +3971,18 @@ impl RvCfg {
     /// fixed point: `transfer(k, after)` is the set before line `k` given the
     /// set after it, and must be monotone.  Returns the set before every
     /// line of the function; exits start from every register.
-    fn solve_backward(&self, mut transfer: impl FnMut(usize, u64) -> u64) -> Vec<u64> {
+    fn solve_backward(&self, transfer: impl FnMut(usize, u64) -> u64) -> Vec<u64> {
+        self.solve_backward_from(RV_LIVE_ALL, transfer)
+    }
+
+    /// `solve_backward` with `exit_set` observed where the function's text
+    /// leaves (a tail jump, falling off the end) -- every register of the
+    /// problem's own domain.
+    fn solve_backward_from(
+        &self,
+        exit_set: u64,
+        mut transfer: impl FnMut(usize, u64) -> u64,
+    ) -> Vec<u64> {
         let nb = self.starts.len();
         let bend = |b: usize| {
             if b + 1 < nb {
@@ -3798,7 +3996,7 @@ impl RvCfg {
         loop {
             let mut changed = false;
             for b in (0..nb).rev() {
-                let mut set = if self.exits[b] { RV_LIVE_ALL } else { 0 };
+                let mut set = if self.exits[b] { exit_set } else { 0 };
                 for &s in &self.succs[b] {
                     set |= block_in[s];
                 }
@@ -3920,6 +4118,19 @@ fn eliminate_dead_defs_global(lines: &[String], kinds: &mut [LineKind], n: usize
                         continue;
                     }
                     match parse_alu_dest(&lines[k]) {
+                        Some(d) => d,
+                        None => continue,
+                    }
+                }
+                // A bit move out of an FP register: no flag, no trap (the
+                // conversions and comparisons may raise FP exceptions).
+                LineKind::Other
+                    if matches!(
+                        lines[k].split_whitespace().next(),
+                        Some("fmv.x.d" | "fmv.x.w")
+                    ) =>
+                {
+                    match rv_fp_gp_dest(&lines[k]) {
                         Some(d) => d,
                         None => continue,
                     }
@@ -4392,128 +4603,1378 @@ fn rv_is_pure_fp_line(line: &str) -> bool {
 ///
 /// ```text
 ///   ld t0, 8(a0) ; ... ; fmv.d.x ft1, t0   ->  fld ft1, 8(a0)
-///   fmv.x.d t0, ft0 ; sd t0, 0(a0)         ->  fsd ft0, 0(a0)
-///   fmv.x.d t0, ft0 ; fmv.d.x ft1, t0      ->  fmv.d ft1, ft0
+///   ld t0, 8(a0) ; ... ; fmv.w.x ft1, t0   ->  flw ft1, 8(a0)
+///   fmv.x.d t0, ft0 ; ... ; sd t0, 0(a0)   ->  fsd ft0, 0(a0)
+///   fmv.x.d t0, ft0 ; ... ; fmv.d.x ft1, t0 -> fmv.d ft1, ft0
+///   fmv.x.w t0, fa0 ; ... ; sd t0, -24(s0) ->  fsw fa0, -24(s0)
 /// ```
 ///
 /// The temporary must die at the consumer.  A load may be sunk past up to
 /// three FP-only lines (no general write, no memory write, no label), which
-/// is how the emitter interleaves the two operand fetches.  `fmv.d` is
-/// `fsgnj.d`: a bit-exact copy, NaN payload included.
+/// is how the emitter interleaves the two operand fetches; `fmv.w.x` reads
+/// only the low word of a doubleword reload, which is the word `flw` loads
+/// (little-endian).  A bit move out of an FP register reaches its consumer
+/// past lines that leave the temporary and the FP source alone, the consumer
+/// staying where it is; an FP-to-FP move whose source is rewritten on the
+/// way moves up to the bit move instead, when nothing in between names its
+/// destination.  The emitter spills a single through `fmv.x.w` and a
+/// doubleword `sd`, whose upper word is the sign copy of bit 31: it becomes
+/// `fsw` when the function's frame census shows no read of that upper word.
+/// `fmv.d` is `fsgnj.d`: a bit-exact copy, NaN payload included.
 fn fold_fp_bounces(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    const WINDOW: usize = 8;
     let mut changed = false;
     for (start, end) in rv_function_ranges(lines, kinds, n) {
         let Some(live) = RvLiveness::build(lines, kinds, start, end) else {
             continue;
         };
+        // Loads first: a doubleword reload folded into `flw` is what lets
+        // the census below narrow the spill that feeds it.
         for i in start..end {
             if kinds[i] == LineKind::Nop || lines[i] == OPAQUE_LINE {
                 continue;
             }
-            // fmv.x.{d,w} tA, fS ; (sd/sw tA, off(rB) | fmv.{d,w}.x fD, tA)
-            if let Some(ta) = rv_fp_gp_dest(&lines[i])
-                && let Some(rest) = lines[i].trim().strip_prefix("fmv.x.")
-            {
-                let width = &rest[..1];
-                let fs = rest[1..].split(',').nth(1).map(str::trim).unwrap_or("");
-                if !matches!(width, "d" | "w") || !fs.starts_with('f') {
-                    continue;
-                }
-                let mut j = i + 1;
-                while j < end && kinds[j] == LineKind::Nop {
-                    j += 1;
-                }
-                if j >= end || lines[j] == OPAQUE_LINE {
-                    continue;
-                }
-                if live.live_after(j) & rv_bit(ta) != 0 {
-                    continue;
-                }
-                let ta_name = reg_name(ta);
-                let store = match width {
-                    "d" => "sd",
-                    _ => "sw",
-                };
-                let new_line = if let Some((m, reg, off, base)) = rv_mem_parts(&lines[j])
-                    && m == store
-                    && reg == ta_name
-                    && base != ta_name
-                {
-                    Some(format!("    fs{width} {fs}, {off}({base})"))
-                } else if let Some(ops) = lines[j].trim().strip_prefix(&format!("fmv.{width}.x ")) {
-                    // The FP-to-FP move is `fmv.s`/`fmv.d` (fsgnj); `fmv.w`
-                    // names only the bit moves `fmv.w.x`/`fmv.x.w`.
-                    let fmt = if width == "w" { "s" } else { "d" };
-                    match ops.split_once(',') {
-                        Some((fd, src)) if src.trim() == ta_name => {
-                            Some(format!("    fmv.{fmt} {}, {fs}", fd.trim()))
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-                if let Some(new_line) = new_line {
-                    kinds[i] = LineKind::Nop;
-                    kinds[j] = classify_line(&new_line);
-                    lines[j] = new_line;
-                    changed = true;
-                }
+            // l{d,w,wu} tA, off(rB) ; [<= 3 FP-only lines] ; fmv.{d,w}.x fD, tA
+            let Some(ta) = rv_load_dest(&lines[i]) else {
+                continue;
+            };
+            let Some((m, _, off, base)) = rv_mem_parts(&lines[i]) else {
+                continue;
+            };
+            if !matches!(m, "ld" | "lw" | "lwu") {
                 continue;
             }
-            // l{d,w} tA, off(rB) ; [<= 3 FP-only lines] ; fmv.{d,w}.x fD, tA
-            if let Some(ta) = rv_load_dest(&lines[i])
-                && let Some((m, _, off, base)) = rv_mem_parts(&lines[i])
-                && matches!(m, "ld" | "lw")
-            {
-                let width = if m == "ld" { "d" } else { "w" };
-                let ta_name = reg_name(ta);
-                if base == ta_name {
-                    continue;
-                }
-                let mut j = i + 1;
-                let mut between = 0;
-                let mut found = None;
-                while j < end && between <= 3 {
-                    if kinds[j] == LineKind::Nop {
-                        j += 1;
-                        continue;
-                    }
-                    let t = lines[j].trim();
-                    if let Some(ops) = t.strip_prefix(&format!("fmv.{width}.x "))
-                        && let Some((fd, src)) = ops.split_once(',')
-                        && src.trim() == ta_name
-                    {
-                        found = Some((j, fd.trim().to_string()));
-                        break;
-                    }
-                    // Only FP-only lines -- no general-register write, no
-                    // memory write -- that do not read tA may be stepped
-                    // over: the base cannot change under them.
-                    if kinds[j] != LineKind::Other
-                        || !rv_is_pure_fp_line(&lines[j])
-                        || rv_named_regs(&lines[j]).0 & rv_bit(ta) != 0
-                    {
-                        break;
-                    }
-                    between += 1;
+            let ta_name = reg_name(ta);
+            if base == ta_name {
+                continue;
+            }
+            let mut j = i + 1;
+            let mut between = 0;
+            let mut found = None;
+            while j < end && between <= 3 {
+                if kinds[j] == LineKind::Nop {
                     j += 1;
-                }
-                let Some((j, fd)) = found else {
                     continue;
+                }
+                let t = lines[j].trim();
+                // `fmv.d.x` reads all 64 bits: only a doubleword load feeds it.
+                let consumer = t
+                    .strip_prefix("fmv.w.x ")
+                    .map(|ops| ("w", ops))
+                    .or_else(|| {
+                        t.strip_prefix("fmv.d.x ")
+                            .filter(|_| m == "ld")
+                            .map(|ops| ("d", ops))
+                    });
+                if let Some((width, ops)) = consumer
+                    && let Some((fd, src)) = ops.split_once(',')
+                    && src.trim() == ta_name
+                {
+                    found = Some((j, width, fd.trim().to_string()));
+                    break;
+                }
+                // Only FP-only lines -- no general-register write, no
+                // memory write -- that do not read tA may be stepped
+                // over: the base cannot change under them.
+                if kinds[j] != LineKind::Other
+                    || !rv_is_pure_fp_line(&lines[j])
+                    || rv_named_regs(&lines[j]).0 & rv_bit(ta) != 0
+                {
+                    break;
+                }
+                between += 1;
+                j += 1;
+            }
+            let Some((j, width, fd)) = found else {
+                continue;
+            };
+            if !fd.starts_with('f') || live.live_after(j) & rv_bit(ta) != 0 {
+                continue;
+            }
+            let new_line = format!("    fl{width} {fd}, {off}({base})");
+            kinds[i] = LineKind::Nop;
+            kinds[j] = classify_line(&new_line);
+            lines[j] = new_line;
+            changed = true;
+        }
+        let frame_reads = rv_frame_reads(lines, kinds, start, end);
+        for i in start..end {
+            if kinds[i] == LineKind::Nop || lines[i] == OPAQUE_LINE {
+                continue;
+            }
+            // fmv.x.{d,w} tA, fS ; ... ; (s{d,w} tA, off(rB) | fmv.{d,w}.x fD, tA)
+            let Some(ta) = rv_fp_gp_dest(&lines[i]) else {
+                continue;
+            };
+            let Some(rest) = lines[i].trim().strip_prefix("fmv.x.") else {
+                continue;
+            };
+            let width = if rest.starts_with('d') {
+                "d"
+            } else if rest.starts_with('w') {
+                "w"
+            } else {
+                continue;
+            };
+            let fs = rest[1..].split(',').nth(1).map(str::trim).unwrap_or("");
+            let Some(fs_id) = rv_fp_reg(fs) else {
+                continue;
+            };
+            let ta_name = reg_name(ta);
+            let mut j = i + 1;
+            let mut steps = 0;
+            let mut found = None;
+            // Whether a line in between rewrites the FP source, and the FP
+            // registers the lines in between name.
+            let mut fs_clobbered = false;
+            let mut between_fp = 0u32;
+            while j < end && steps < WINDOW {
+                if kinds[j] == LineKind::Nop || kinds[j] == LineKind::Directive {
+                    j += 1;
+                    continue;
+                }
+                if rv_fp_barrier(&lines[j], kinds[j]) {
+                    break;
+                }
+                let (named, unmodelled) = rv_named_regs(&lines[j]);
+                if unmodelled {
+                    break;
+                }
+                if named & rv_bit(ta) != 0 {
+                    found = Some(j);
+                    break;
+                }
+                let Some(roles) = rv_fp_roles(&lines[j]) else {
+                    break;
                 };
-                if !fd.starts_with('f') || live.live_after(j) & rv_bit(ta) != 0 {
-                    continue;
+                fs_clobbered |= roles.def == Some(fs_id);
+                between_fp |= roles.uses | roles.def_bit();
+                steps += 1;
+                j += 1;
+            }
+            let Some(j) = found else {
+                continue;
+            };
+            if live.live_after(j) & rv_bit(ta) != 0 {
+                continue;
+            }
+            let fs = rv_fp_name(fs_id);
+            // The consumer keeps its place and reads the FP source there,
+            // which must still hold the value -- or, for an FP-to-FP move
+            // whose source is rewritten on the way, the move takes the bit
+            // move's place when nothing in between names its destination.
+            let mut at = j;
+            let new_line = if fs_clobbered {
+                lines[j]
+                    .trim()
+                    .strip_prefix(&format!("fmv.{width}.x "))
+                    .and_then(|ops| ops.split_once(','))
+                    .filter(|(fd, src)| {
+                        src.trim() == ta_name
+                            && rv_fp_reg(fd.trim()).is_some_and(|d| between_fp & rv_fp_bit(d) == 0)
+                    })
+                    .map(|(fd, _)| {
+                        at = i;
+                        let fmt = if width == "w" { "s" } else { "d" };
+                        format!("    fmv.{fmt} {}, {fs}", fd.trim())
+                    })
+            } else if let Some((m, reg, off, base)) = rv_mem_parts(&lines[j])
+                && reg == ta_name
+                && base != ta_name
+            {
+                // `fmv.x.w; sd` spills the word with its sign copy above it:
+                // narrow it when nothing in the function reads that upper word.
+                let upper_unread = |off: i64| {
+                    base == "s0"
+                        && i32::try_from(off).is_ok_and(|off| {
+                            frame_reads.as_ref().is_some_and(|reads| {
+                                reads
+                                    .iter()
+                                    .all(|&(lo, sz)| !(lo < off + 8 && off + 4 < lo + sz))
+                            })
+                        })
+                };
+                match (width, m) {
+                    ("d", "sd") | ("w", "sw") => Some(format!("    fs{width} {fs}, {off}({base})")),
+                    ("w", "sd") if upper_unread(off) => {
+                        Some(format!("    fsw {fs}, {off}({base})"))
+                    }
+                    _ => None,
                 }
-                let new_line = format!("    fl{width} {fd}, {off}({base})");
-                kinds[i] = LineKind::Nop;
-                kinds[j] = classify_line(&new_line);
-                lines[j] = new_line;
+            } else if let Some(ops) = lines[j].trim().strip_prefix(&format!("fmv.{width}.x ")) {
+                // The FP-to-FP move is `fmv.s`/`fmv.d` (fsgnj); `fmv.w`
+                // names only the bit moves `fmv.w.x`/`fmv.x.w`.
+                let fmt = if width == "w" { "s" } else { "d" };
+                match ops.split_once(',') {
+                    Some((fd, src)) if src.trim() == ta_name => {
+                        Some(format!("    fmv.{fmt} {}, {fs}", fd.trim()))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(new_line) = new_line {
+                let gone = if at == i { j } else { i };
+                kinds[gone] = LineKind::Nop;
+                kinds[at] = classify_line(&new_line);
+                lines[at] = new_line;
                 changed = true;
             }
         }
     }
     changed
+}
+
+// ── FP register dataflow ─────────────────────────────────────────────────────
+//
+// FP values have no register home on RISC-V: the emitter fetches every
+// operand into ft0/ft1 -- from the frame slot the prologue spilled an
+// argument to, or through a general register -- and every result leaves
+// through a copy.  `fold_fp_bounces` removes the general-register legs; the
+// passes below remove the rest the way the integer passes treat the general
+// registers: a slot reload becomes a copy of the register that was stored, a
+// copy into a scratch is forwarded into its readers, a result computed into
+// a scratch only to be copied out is computed into the copy's destination,
+// and a frame nothing uses any more is not set up.
+//
+// Every rewrite relies on one invariant of the emitter's output: a
+// single-precision value in an FP register is NaN-boxed.  The psABI requires
+// it of arguments and results, and every instruction that writes a single
+// (`.s` arithmetic, `flw`, `fmv.w.x`, `fcvt.s.*`) boxes it, so `fmv.s` copies
+// a single bit for bit, exactly as `fmv.d` (`fsgnj.d`) copies a double.
+
+/// FP temporaries ft0-ft7 (f0-f7) and ft8-ft11 (f28-f31): never an ABI value.
+const RV_FP_TEMPS: u32 = 0xff | (0xf << 28);
+/// FP argument registers fa0-fa7 (f10-f17).
+const RV_FP_ARGS: u32 = 0xff << 10;
+/// FP return-value registers fa0/fa1.
+const RV_FP_RET: u32 = 0x3 << 10;
+/// FP callee-saved registers fs0/fs1 (f8/f9) and fs2-fs11 (f18-f27).
+const RV_FP_CALLEE_SAVED: u32 = (0x3 << 8) | (0x3ff << 18);
+
+/// The architectural number of an FP register name: the ABI spellings
+/// (`ft0`-`ft11`, `fs0`-`fs11`, `fa0`-`fa7`) and `f0`-`f31`.
+fn rv_fp_reg(name: &str) -> Option<u8> {
+    let num = |prefix: &str| -> Option<u8> {
+        let digits = name.strip_prefix(prefix)?;
+        let v = digits.parse::<u8>().ok()?;
+        (v.to_string() == digits).then_some(v)
+    };
+    if let Some(v) = num("ft") {
+        return match v {
+            0..=7 => Some(v),
+            8..=11 => Some(v + 20),
+            _ => None,
+        };
+    }
+    if let Some(v) = num("fs") {
+        return match v {
+            0 | 1 => Some(v + 8),
+            2..=11 => Some(v + 16),
+            _ => None,
+        };
+    }
+    if let Some(v) = num("fa") {
+        return (v <= 7).then_some(v + 10);
+    }
+    num("f").filter(|&v| v < 32)
+}
+
+/// The ABI name of FP register `id`, the spelling the emitter uses.
+fn rv_fp_name(id: u8) -> &'static str {
+    const NAMES: [&str; 32] = [
+        "ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7", "fs0", "fs1", "fa0", "fa1", "fa2",
+        "fa3", "fa4", "fa5", "fa6", "fa7", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7", "fs8", "fs9",
+        "fs10", "fs11", "ft8", "ft9", "ft10", "ft11",
+    ];
+    NAMES[usize::from(id & 31)]
+}
+
+fn rv_fp_bit(id: u8) -> u32 {
+    1u32 << (id & 31)
+}
+
+/// The static rounding-mode operand of an FP computation or conversion.
+fn rv_is_rounding_mode(op: &str) -> bool {
+    matches!(op, "rne" | "rtz" | "rdn" | "rup" | "rmm" | "dyn")
+}
+
+/// How one instruction line touches the FP registers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RvFpRoles {
+    /// The FP register the line writes -- always its first operand.
+    def: Option<u8>,
+    /// Bit k: operand k is an FP register the line reads.
+    src_ops: u8,
+    /// The FP registers the line reads.
+    uses: u32,
+    /// What it writes is a single-precision value, NaN-boxed.
+    single: bool,
+}
+
+impl RvFpRoles {
+    fn def_bit(&self) -> u32 {
+        self.def.map_or(0, rv_fp_bit)
+    }
+}
+
+/// The FP roles of a line that names no FP register (`Some` with nothing
+/// read or written), `None` when it does name one.
+fn rv_fp_free(line: &str) -> Option<RvFpRoles> {
+    let names_fp = line
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|tok| rv_fp_reg(tok).is_some());
+    (!names_fp).then(RvFpRoles::default)
+}
+
+/// The FP roles of an instruction line, over the F and D forms the emitter
+/// writes: arithmetic, sign injection, fused multiply-add, conversions,
+/// comparisons, classification, bit moves, loads and stores.  `None` when the
+/// line names an FP register in any other shape -- callers then assume it
+/// reads and writes every FP register.
+fn rv_fp_roles(line: &str) -> Option<RvFpRoles> {
+    let t = line.trim();
+    let (m, rest) = match t.split_once(|c: char| c.is_ascii_whitespace()) {
+        Some((m, rest)) => (m, rest.trim()),
+        None => (t, ""),
+    };
+    let ops: Vec<&str> = if rest.is_empty() {
+        Vec::new()
+    } else {
+        rest.split(',').map(str::trim).collect()
+    };
+    let fp = |k: usize| ops.get(k).and_then(|op| rv_fp_reg(op));
+    // `arity` register operands, optionally followed by a rounding mode;
+    // operand 0 is the FP destination when `def`, a general register
+    // otherwise; `srcs` are the FP sources, every other operand past 0 a
+    // general register.
+    let shape = |def: bool, srcs: &[usize], arity: usize, rm: bool, single: bool| {
+        let extra = ops.len().checked_sub(arity)?;
+        if extra > usize::from(rm) || (extra == 1 && !rv_is_rounding_mode(ops[arity])) {
+            return None;
+        }
+        let mut roles = RvFpRoles {
+            def: None,
+            single,
+            ..RvFpRoles::default()
+        };
+        for k in 0..arity {
+            match (k == 0 && def, srcs.contains(&k)) {
+                (true, _) => roles.def = Some(fp(0)?),
+                (false, true) => {
+                    roles.uses |= rv_fp_bit(fp(k)?);
+                    roles.src_ops |= 1 << k;
+                }
+                (false, false) => {
+                    if fp(k).is_some() || (ops[k] != "zero" && parse_reg(ops[k]) == REG_NONE) {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(roles)
+    };
+    let mut parts = m.split('.');
+    let base = parts.next().unwrap_or("");
+    let (f1, f2) = (parts.next(), parts.next());
+    if parts.next().is_some() {
+        return rv_fp_free(t);
+    }
+    let real = |f: Option<&str>| matches!(f, Some("s" | "d"));
+    let int = |f: Option<&str>| matches!(f, Some("w" | "wu" | "l" | "lu"));
+    let single = f1 == Some("s");
+    match (base, f2) {
+        ("fadd" | "fsub" | "fmul" | "fdiv", None) if real(f1) => {
+            shape(true, &[1, 2], 3, true, single)
+        }
+        ("fmin" | "fmax" | "fsgnj" | "fsgnjn" | "fsgnjx", None) if real(f1) => {
+            shape(true, &[1, 2], 3, false, single)
+        }
+        ("fsqrt", None) if real(f1) => shape(true, &[1], 2, true, single),
+        ("fmv" | "fneg" | "fabs", None) if real(f1) => shape(true, &[1], 2, false, single),
+        ("fmadd" | "fmsub" | "fnmadd" | "fnmsub", None) if real(f1) => {
+            shape(true, &[1, 2, 3], 4, true, single)
+        }
+        ("feq" | "flt" | "fle", None) if real(f1) => shape(false, &[1, 2], 3, false, false),
+        ("fclass", None) if real(f1) => shape(false, &[1], 2, false, false),
+        ("fcvt", Some(_)) if real(f1) && real(f2) && f1 != f2 => shape(true, &[1], 2, true, single),
+        ("fcvt", Some(_)) if int(f1) && real(f2) => shape(false, &[1], 2, true, false),
+        ("fcvt", Some(_)) if real(f1) && int(f2) => shape(true, &[], 2, true, single),
+        ("fmv", Some("x")) if matches!(f1, Some("w" | "d")) => {
+            shape(true, &[], 2, false, f1 == Some("w"))
+        }
+        ("fmv", Some("w" | "d")) if f1 == Some("x") => shape(false, &[1], 2, false, false),
+        ("flw" | "fld" | "fsw" | "fsd", None) if f1.is_none() => {
+            let (_, reg, _, mem_base) = rv_mem_parts(t)?;
+            let reg = rv_fp_reg(reg)?;
+            if parse_reg(mem_base) == REG_NONE || ops.len() != 2 {
+                return None;
+            }
+            Some(if base.starts_with("fl") {
+                RvFpRoles {
+                    def: Some(reg),
+                    single: base == "flw",
+                    ..RvFpRoles::default()
+                }
+            } else {
+                RvFpRoles {
+                    src_ops: 1,
+                    uses: rv_fp_bit(reg),
+                    ..RvFpRoles::default()
+                }
+            })
+        }
+        _ => rv_fp_free(t),
+    }
+}
+
+/// `line` with each FP register operand `k` in `ops_mask` that names `from`
+/// renamed to `to`.
+fn rv_rename_fp_operands(line: &str, ops_mask: u8, from: u8, to: u8) -> Option<String> {
+    let t = line.trim();
+    let (m, rest) = t.split_once(|c: char| c.is_ascii_whitespace())?;
+    let indent = &line[..line.len() - line.trim_start().len()];
+    let ops: Vec<&str> = rest
+        .split(',')
+        .map(str::trim)
+        .enumerate()
+        .map(|(k, op)| {
+            if k < 8 && ops_mask & (1 << k) != 0 && rv_fp_reg(op) == Some(from) {
+                rv_fp_name(to)
+            } else {
+                op
+            }
+        })
+        .collect();
+    Some(format!("{indent}{m} {}", ops.join(", ")))
+}
+
+/// A register-to-register FP copy `fmv.{s,d} fD, fS`: `(fD, fS, single)`.
+fn rv_fp_copy(line: &str) -> Option<(u8, u8, bool)> {
+    let t = line.trim();
+    let (m, _) = t.split_once(|c: char| c.is_ascii_whitespace())?;
+    if m != "fmv.d" && m != "fmv.s" {
+        return None;
+    }
+    let roles = rv_fp_roles(t)?;
+    if roles.uses.count_ones() != 1 {
+        return None;
+    }
+    let src = u8::try_from(roles.uses.trailing_zeros()).ok()?;
+    Some((roles.def?, src, m == "fmv.s"))
+}
+
+/// (uses, defs) of one line over the FP registers (bit k = fk), for backward
+/// liveness: uses over-approximate, definitions under-approximate.
+fn rv_fp_uses_defs(line: &str, kind: LineKind) -> (u32, u32) {
+    match kind {
+        LineKind::Nop | LineKind::Label | LineKind::Directive => (0, 0),
+        // A callee may read every FP argument register and clobbers every
+        // caller-saved one.
+        LineKind::Call => (RV_FP_ARGS, RV_FP_TEMPS | RV_FP_ARGS),
+        // The FP results and every register the caller expects back.
+        LineKind::Ret => (RV_FP_RET | RV_FP_CALLEE_SAVED, 0),
+        _ if line == OPAQUE_LINE => (u32::MAX, 0),
+        _ => match rv_fp_roles(line) {
+            Some(roles) => (roles.uses, roles.def_bit()),
+            None => (u32::MAX, 0),
+        },
+    }
+}
+
+/// Backward liveness of the FP registers over one function's lines.
+struct RvFpLiveness {
+    /// `live_before[k - start]`: FP registers live immediately before line k.
+    live_before: Vec<u64>,
+    start: usize,
+    end: usize,
+}
+
+impl RvFpLiveness {
+    /// `None` when the CFG is not resolvable (see `RvCfg::build`).
+    fn build(lines: &[String], kinds: &[LineKind], start: usize, end: usize) -> Option<Self> {
+        let cfg = RvCfg::build(lines, kinds, start, end)?;
+        let live_before = cfg.solve_backward_from(u64::from(u32::MAX), |k, live| {
+            let (uses, defs) = rv_fp_uses_defs(&lines[k], kinds[k]);
+            (live & !u64::from(defs)) | u64::from(uses)
+        });
+        Some(RvFpLiveness {
+            live_before,
+            start,
+            end,
+        })
+    }
+
+    /// FP registers live immediately before line `k`.
+    fn live_before(&self, k: usize) -> u32 {
+        // The solver only ever produces sets of the 32 FP bits.
+        self.live_before
+            .get(k.wrapping_sub(self.start))
+            .map_or(u32::MAX, |&set| {
+                u32::try_from(set & u64::from(u32::MAX)).unwrap_or(u32::MAX)
+            })
+    }
+
+    /// FP registers live immediately after line `k`, which must not be a
+    /// control transfer (its textual successor is its only successor).
+    fn live_after(&self, k: usize) -> u32 {
+        if k + 1 >= self.end {
+            u32::MAX
+        } else {
+            self.live_before(k + 1)
+        }
+    }
+}
+
+/// A line FP facts do not survive: a join point, a transfer, a call, an
+/// opaque body, a system call.
+fn rv_fp_barrier(line: &str, kind: LineKind) -> bool {
+    matches!(
+        kind,
+        LineKind::Label | LineKind::Branch | LineKind::Jump | LineKind::Ret | LineKind::Call
+    ) || line == OPAQUE_LINE
+        || (kind == LineKind::Other && rv_is_unmodelled_transfer(line))
+        || matches!(
+            line.split_whitespace().next(),
+            Some("ecall" | "ebreak" | "call" | "tail" | "jal" | "jalr" | "jr")
+        )
+}
+
+/// The byte width of a scalar load or store mnemonic, and whether it stores.
+fn rv_access_width(m: &str) -> Option<(i32, bool)> {
+    Some(match m {
+        "ld" | "fld" => (8, false),
+        "lw" | "lwu" | "flw" => (4, false),
+        "lh" | "lhu" | "flh" => (2, false),
+        "lb" | "lbu" => (1, false),
+        "flq" => (16, false),
+        "sd" | "fsd" => (8, true),
+        "sw" | "fsw" => (4, true),
+        "sh" | "fsh" => (2, true),
+        "sb" => (1, true),
+        "fsq" => (16, true),
+        _ => return None,
+    })
+}
+
+/// A store to a frame slot: `(offset, size)`.
+fn rv_frame_store(line: &str) -> Option<(i32, i32)> {
+    let (m, _, off, base) = rv_mem_parts(line)?;
+    match rv_access_width(m)? {
+        (size, true) if base == "s0" => Some((i32::try_from(off).ok()?, size)),
+        _ => None,
+    }
+}
+
+/// Forward a frame slot's FP value into the reloads its store reaches:
+///
+/// ```text
+///   fsd fa0, -24(s0) ; ... ; fld ft0, -24(s0)   ->  fmv.d   ft0, fa0
+///   fsd fa0, -24(s0) ; ... ; ld  t0, -24(s0)    ->  fmv.x.d t0, fa0
+///   fsw fa0, -24(s0) ; ... ; flw ft0, -24(s0)   ->  fmv.s   ft0, fa0
+///   fsw fa0, -24(s0) ; ... ; lw  t0, -24(s0)    ->  fmv.x.w t0, fa0
+/// ```
+///
+/// `fmv.x.w` sign-extends the low word exactly as `lw` does.  A fact "slot
+/// holds register r's bits" is born at an FP store and dies at a store
+/// overlapping the slot, any `sp`-based store, a write to r, a call or an
+/// opaque line; a forward dataflow over the function's CFG keeps the facts
+/// every predecessor of a join agrees on, so an argument the prologue
+/// spilled is still answered from its register after an `if`.  The frame
+/// must be private -- its address never escapes and every slot access has
+/// a known width (`rv_frame_reads`) -- so no store through another base can
+/// reach a slot.
+fn forward_fp_slot_reloads(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for (start, end) in rv_function_ranges(lines, kinds, n) {
+        if rv_frame_reads(lines, kinds, start, end).is_none() {
+            continue;
+        }
+        let Some(cfg) = RvCfg::build(lines, kinds, start, end) else {
+            continue;
+        };
+        let nb = cfg.starts.len();
+        let bend = |b: usize| if b + 1 < nb { cfg.starts[b + 1] } else { end };
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb];
+        for (b, succs) in cfg.succs.iter().enumerate() {
+            for &s in succs {
+                preds[s].push(b);
+            }
+        }
+        // The facts at each block's exit; `None` until a path reaches it.
+        let mut exits: Vec<Option<Vec<SlotFact>>> = vec![None; nb];
+        let entry = |b: usize, exits: &[Option<Vec<SlotFact>>]| -> Option<Vec<SlotFact>> {
+            if b == 0 {
+                return Some(Vec::new());
+            }
+            let mut met: Option<Vec<SlotFact>> = None;
+            for &p in &preds[b] {
+                if let Some(out) = &exits[p] {
+                    met = Some(match met {
+                        None => out.clone(),
+                        Some(acc) => acc.into_iter().filter(|f| out.contains(f)).collect(),
+                    });
+                }
+            }
+            met
+        };
+        loop {
+            let mut moved = false;
+            for b in 0..nb {
+                let Some(mut facts) = entry(b, &exits) else {
+                    continue;
+                };
+                for k in cfg.starts[b]..bend(b) {
+                    slot_fact_step(lines, kinds, k, &mut facts, false);
+                }
+                facts.sort_unstable();
+                if exits[b].as_ref() != Some(&facts) {
+                    exits[b] = Some(facts);
+                    moved = true;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+        for b in 0..nb {
+            let Some(mut facts) = entry(b, &exits) else {
+                continue;
+            };
+            for k in cfg.starts[b]..bend(b) {
+                changed |= slot_fact_step(lines, kinds, k, &mut facts, true);
+            }
+        }
+    }
+    changed
+}
+
+/// `(offset, size, FP register)`: the slot's bytes are the register's.
+type SlotFact = (i32, i32, u8);
+
+/// Advance the slot facts over line `k`; with `rewrite`, answer a reload
+/// the facts know (returns whether it did).  The analysis and the rewrite
+/// run this same step, so the facts each sees agree.
+fn slot_fact_step(
+    lines: &mut [String],
+    kinds: &mut [LineKind],
+    k: usize,
+    facts: &mut Vec<SlotFact>,
+    rewrite: bool,
+) -> bool {
+    // Transfers read general registers only (`jump` writes its t6 scratch):
+    // the facts flow to every successor, and a label's facts are the meet
+    // the dataflow computed for its block.
+    if matches!(
+        kinds[k],
+        LineKind::Nop | LineKind::Directive | LineKind::Label | LineKind::Branch | LineKind::Jump
+    ) {
+        return false;
+    }
+    if rv_fp_barrier(&lines[k], kinds[k]) {
+        facts.clear();
+        return false;
+    }
+    let overlaps = |&(off, size, _): &SlotFact, lo: i32, sz: i32| off < lo + sz && lo < off + size;
+    // A frame load the facts can answer.
+    let load = match kinds[k] {
+        LineKind::LoadS0 {
+            reg,
+            offset,
+            is_word,
+        } => Some((offset, if is_word { 4 } else { 8 }, None, Some(reg))),
+        LineKind::Other => rv_mem_parts(&lines[k]).and_then(|(m, reg, off, base)| {
+            let size = match m {
+                "fld" => 8,
+                "flw" => 4,
+                _ => return None,
+            };
+            (base == "s0").then_some((i32::try_from(off).ok()?, size, Some(rv_fp_reg(reg)), None))
+        }),
+        _ => None,
+    };
+    if let Some((off, size, fp_dst, gp_dst)) = load
+        && let Some(&(_, _, src)) = facts.iter().find(|&&(o, s, _)| o == off && s == size)
+    {
+        let fp_dst = match fp_dst {
+            Some(Some(d)) => Some(d),
+            Some(None) => {
+                facts.clear(); // an FP load this pass cannot read
+                return false;
+            }
+            None => None,
+        };
+        if let Some(d) = fp_dst
+            && d != src
+        {
+            facts.retain(|&(_, _, r)| r != d);
+        }
+        if !rewrite {
+            return false;
+        }
+        let new_line = match (fp_dst, gp_dst) {
+            (Some(d), _) if d == src => None,
+            (Some(d), _) => {
+                let fmt = if size == 8 { 'd' } else { 's' };
+                Some(format!(
+                    "    fmv.{fmt} {}, {}",
+                    rv_fp_name(d),
+                    rv_fp_name(src)
+                ))
+            }
+            (None, Some(g)) => {
+                let fmt = if size == 8 { 'd' } else { 'w' };
+                Some(format!(
+                    "    fmv.x.{fmt} {}, {}",
+                    reg_name(g),
+                    rv_fp_name(src)
+                ))
+            }
+            (None, None) => return false,
+        };
+        match new_line {
+            Some(new_line) => {
+                kinds[k] = classify_line(&new_line);
+                lines[k] = new_line;
+            }
+            None => kinds[k] = LineKind::Nop,
+        }
+        return true;
+    }
+    // Stores: a frame store replaces the facts it overlaps, an FP one
+    // records its own; an `sp`-based store may reach the frame's bottom, a
+    // form this pass cannot read may reach anything, and any other base
+    // cannot reach a private frame.
+    let frame_store = match kinds[k] {
+        LineKind::StoreS0 {
+            offset, is_word, ..
+        } => Some((offset, if is_word { 4 } else { 8 })),
+        _ => rv_frame_store(&lines[k]),
+    };
+    if let Some((off, size)) = frame_store {
+        facts.retain(|fact| !overlaps(fact, off, size));
+        if let Some((m, reg, _, _)) = rv_mem_parts(&lines[k])
+            && (m == "fsd" || m == "fsw")
+            && let Some(r) = rv_fp_reg(reg)
+        {
+            facts.push((off, size, r));
+        }
+        return false;
+    }
+    if rv_is_store(&lines[k])
+        && rv_mem_parts(&lines[k]).is_none_or(|(m, _, _, base)| {
+            base == "sp" || base == "s0" || rv_access_width(m).is_none()
+        })
+    {
+        facts.clear();
+        return false;
+    }
+    match rv_fp_roles(&lines[k]) {
+        Some(roles) => {
+            if let Some(d) = roles.def {
+                facts.retain(|&(_, _, r)| r != d);
+            }
+        }
+        None => facts.clear(),
+    }
+    false
+}
+
+/// Serve the uses of a bit move's general register from the FP register it
+/// mirrors:
+///
+/// ```text
+///   fmv.x.d t0, ft0 ; ... ; fmv.d.x ft1, t0   ->  ... ; fmv.d ft1, ft0
+///   fmv.x.d t0, ft0 ; ... ; sd t0, 8(a0)      ->  ... ; fsd ft0, 8(a0)
+///   fmv.d.x ft0, t0 ; ... ; fmv.d.x ft1, t0   ->  ... ; fmv.d ft1, ft0
+/// ```
+///
+/// A bit move in either direction leaves the two registers holding the same
+/// bits -- all 64 for `.d`; for `.w` the low word, which is all `sw`/`fsw`
+/// store and all `fmv.w.x` reads (`fmv.w.x` boxes the word it moves, so its
+/// FP side is a boxed single) -- until either is rewritten.  The emitter
+/// stages every FP value through a general register, so one value read
+/// twice paid two cross-file moves, and a spill kept the general register
+/// alive; once its uses move to the FP side the bit move dies
+/// (`eliminate_dead_defs_global`).  The facts are block-local and flow into
+/// a branch's fall-through.
+fn forward_fp_bit_moves(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    /// A bit move: `(gp, fp, width, gp_is_written)` for `fmv.x.{d,w}`
+    /// (`gp_is_written`) and `fmv.{d,w}.x`.
+    fn bit_move(line: &str) -> Option<(u8, u8, char, bool)> {
+        let t = line.trim();
+        let (m, ops) = t.split_once(|c: char| c.is_ascii_whitespace())?;
+        let (a, b) = ops.split_once(',')?;
+        let (a, b) = (a.trim(), b.trim());
+        let (gp_name, fp_name, width, to_gp) = match m {
+            "fmv.x.d" => (a, b, 'd', true),
+            "fmv.x.w" => (a, b, 'w', true),
+            "fmv.d.x" => (b, a, 'd', false),
+            "fmv.w.x" => (b, a, 'w', false),
+            _ => return None,
+        };
+        let gp = parse_reg(gp_name);
+        let fp = rv_fp_reg(fp_name)?;
+        (gp != REG_NONE).then_some((gp, fp, width, to_gp))
+    }
+    let mut changed = false;
+    for (start, end) in rv_function_ranges(lines, kinds, n) {
+        // (general register, FP register, width) holding the same bits.
+        let mut facts: Vec<(u8, u8, char)> = Vec::new();
+        for k in start..end {
+            if matches!(
+                kinds[k],
+                LineKind::Nop | LineKind::Directive | LineKind::Branch
+            ) {
+                continue; // a branch reads general registers only
+            }
+            if rv_fp_barrier(&lines[k], kinds[k]) {
+                facts.clear();
+                continue;
+            }
+            let (named, unmodelled) = rv_named_regs(&lines[k]);
+            if unmodelled {
+                facts.clear();
+                continue;
+            }
+            // A use the facts serve from the FP side.
+            if let Some((gp, fd, width, false)) = bit_move(&lines[k])
+                && let Some(&(_, fs, _)) = facts
+                    .iter()
+                    .find(|&&(g, f, w)| g == gp && w == width && f != fd)
+            {
+                let fmt = if width == 'd' { 'd' } else { 's' };
+                let new_line = format!("    fmv.{fmt} {}, {}", rv_fp_name(fd), rv_fp_name(fs));
+                kinds[k] = classify_line(&new_line);
+                lines[k] = new_line;
+                changed = true;
+                facts.retain(|&(_, f, _)| f != fd);
+                facts.push((gp, fd, width));
+                continue;
+            }
+            if let Some((m, reg, off, base)) = rv_mem_parts(&lines[k])
+                && rv_access_width(m).is_some_and(|(_, store)| store)
+                && let width @ ('d' | 'w') = match m {
+                    "sd" => 'd',
+                    "sw" => 'w',
+                    _ => ' ',
+                }
+                && base != reg
+                && let Some(&(_, fs, _)) = facts
+                    .iter()
+                    .find(|&&(g, _, w)| reg_name(g) == reg && w == width)
+            {
+                let new_line = format!("    fs{width} {}, {off}({base})", rv_fp_name(fs));
+                kinds[k] = classify_line(&new_line);
+                lines[k] = new_line;
+                changed = true;
+                continue; // a store writes no register
+            }
+            // Retire every fact the line may break: a general register it
+            // writes (any named register of a line that is not a store, a
+            // pure FP line or a bit move into the FP side), an FP register
+            // it writes.
+            let fp_def = match rv_fp_roles(&lines[k]) {
+                Some(roles) => roles.def,
+                None => {
+                    facts.clear();
+                    continue;
+                }
+            };
+            let gp_writes = match kinds[k] {
+                LineKind::Move { dst, .. }
+                | LineKind::LoadImm { dst }
+                | LineKind::LoadAddr { dst }
+                | LineKind::SextW { dst, .. }
+                | LineKind::LoadS0 { reg: dst, .. } => rv_bit(dst),
+                LineKind::StoreS0 { .. } => 0,
+                LineKind::Alu => parse_alu_dest(&lines[k]).map_or(named, rv_bit),
+                _ if rv_is_store(&lines[k]) => 0,
+                LineKind::Other if rv_is_pure_fp_line(&lines[k]) => 0,
+                _ => named,
+            };
+            facts.retain(|&(g, f, _)| gp_writes & rv_bit(g) == 0 && Some(f) != fp_def);
+            if let Some((gp, fp, width, _)) = bit_move(&lines[k]) {
+                facts.push((gp, fp, width));
+            }
+        }
+    }
+    changed
+}
+
+/// Keep an FP value that one straight-line stretch of code spills and
+/// reloads in a free FP scratch instead of its frame slot:
+///
+/// ```text
+///   fmul.d ft0, fa0, fa1          fmul.d ft0, fa0, fa1
+///   fsd    ft0, -48(s0)           fmv.d  ft11, ft0
+///   fmul.d ft0, fa2, fa0    ->    fmul.d ft0, fa2, fa0
+///   fld    ft1, -48(s0)           fmv.d  ft1, ft11
+/// ```
+///
+/// `forward_fp_slot_reloads` answers a reload from the register that was
+/// stored only while that register is intact; the emitter reuses ft0/ft1 for
+/// every operation, so a temporary that waits for another computation lost
+/// its register.  The slot qualifies when every access to its bytes in the
+/// whole function is an exact-width access of the same slot, at least one of
+/// them an FP access, the first a store, and no label, transfer or call lies
+/// between the first and the last (a branch's fall-through continues the
+/// stretch; the taken path never reads the slot).  The scratch is a
+/// temporary no line of the stretch names and the FP liveness proves dead
+/// where it starts -- so it is dead on every path out of it as well.  Each
+/// access becomes the copy or bit move with its exact semantics: `fsd`/`fld`
+/// `fmv.d`, `fsw`/`flw` `fmv.s`, `sd`/`ld` `fmv.d.x`/`fmv.x.d`, `sw`
+/// `fmv.w.x` (the low word, NaN-boxed) and `lw` `fmv.x.w` (sign-extended,
+/// as `lw` loads it).  A callee-saved register's save slot is never
+/// promoted: the unwinder reads it.
+fn promote_fp_frame_slots(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for (start, end) in rv_function_ranges(lines, kinds, n) {
+        if rv_frame_reads(lines, kinds, start, end).is_none() {
+            continue;
+        }
+        let Some(live) = RvFpLiveness::build(lines, kinds, start, end) else {
+            continue;
+        };
+        // Every frame access: (line, offset, size, mnemonic).
+        let mut accesses: Vec<(usize, i32, i32, String)> = Vec::new();
+        for k in start..end {
+            if kinds[k] == LineKind::Nop || kinds[k] == LineKind::Directive {
+                continue;
+            }
+            if let Some((m, _, off, base)) = rv_mem_parts(&lines[k])
+                && base == "s0"
+                && let Some((size, _)) = rv_access_width(m)
+                && let Ok(off) = i32::try_from(off)
+            {
+                accesses.push((k, off, size, m.to_string()));
+            }
+        }
+        let mut slots: Vec<(i32, i32)> = accesses
+            .iter()
+            .filter(|a| a.3.starts_with('f'))
+            .map(|a| (a.1, a.2))
+            .collect();
+        slots.sort_unstable();
+        slots.dedup();
+        // The scratch registers this invocation already gave a stretch:
+        // the liveness predates them.
+        let mut taken: Vec<(usize, usize, u8)> = Vec::new();
+        for (off, size) in slots {
+            if size != 4 && size != 8 {
+                continue;
+            }
+            let group: Vec<&(usize, i32, i32, String)> = accesses
+                .iter()
+                .filter(|a| a.1 < off + size && off < a.1 + a.2)
+                .collect();
+            let (Some(&&(first, ..)), Some(&&(last, ..))) = (group.first(), group.last()) else {
+                continue;
+            };
+            let exact = group.iter().all(|a| a.1 == off && a.2 == size);
+            let opens_with_store = rv_access_width(&group[0].3).is_some_and(|(_, st)| st);
+            if !exact || !opens_with_store {
+                continue;
+            }
+            let straight = (first..=last).all(|k| {
+                kinds[k] == LineKind::Branch
+                    || (!matches!(
+                        kinds[k],
+                        LineKind::Label | LineKind::Jump | LineKind::Ret | LineKind::Call
+                    ) && !rv_fp_barrier(&lines[k], kinds[k]))
+            });
+            if !straight {
+                continue;
+            }
+            // The FP registers the stretch names, and a free scratch.
+            let mut named = 0u32;
+            for k in first..=last {
+                if kinds[k] == LineKind::Nop || kinds[k] == LineKind::Directive {
+                    continue;
+                }
+                match rv_fp_roles(&lines[k]) {
+                    Some(roles) => named |= roles.uses | roles.def_bit(),
+                    None => named = u32::MAX,
+                }
+            }
+            let mut free = RV_FP_TEMPS & !named & !live.live_before(first);
+            for &(f, l, z) in &taken {
+                if f <= last && first <= l {
+                    free &= !rv_fp_bit(z);
+                }
+            }
+            let Some(z) = (0..32u8).rev().find(|&r| free & rv_fp_bit(r) != 0) else {
+                continue;
+            };
+            let zn = rv_fp_name(z);
+            let rewritten: Option<Vec<(usize, String)>> = group
+                .iter()
+                .map(|&&(k, _, _, ref m)| {
+                    let (_, reg, _, _) = rv_mem_parts(&lines[k])?;
+                    let fp = rv_fp_reg(reg);
+                    let gp = parse_reg(reg);
+                    let callee_saved = fp.is_some_and(|r| rv_fp_bit(r) & RV_FP_CALLEE_SAVED != 0)
+                        || (REG_S1..=REG_S11).contains(&gp)
+                        || matches!(gp, REG_S0 | REG_SP | REG_RA);
+                    if callee_saved || (fp.is_none() && gp == REG_NONE && reg != "zero") {
+                        return None;
+                    }
+                    let fr = fp.map(rv_fp_name);
+                    let line = match (m.as_str(), fr) {
+                        ("fsd", Some(r)) => format!("    fmv.d {zn}, {r}"),
+                        ("fsw", Some(r)) => format!("    fmv.s {zn}, {r}"),
+                        ("fld", Some(r)) => format!("    fmv.d {r}, {zn}"),
+                        ("flw", Some(r)) => format!("    fmv.s {r}, {zn}"),
+                        ("sd", None) => format!("    fmv.d.x {zn}, {reg}"),
+                        ("sw", None) => format!("    fmv.w.x {zn}, {reg}"),
+                        ("ld", None) if gp != REG_NONE => format!("    fmv.x.d {reg}, {zn}"),
+                        ("lw", None) if gp != REG_NONE => format!("    fmv.x.w {reg}, {zn}"),
+                        _ => return None,
+                    };
+                    Some((k, line))
+                })
+                .collect();
+            let Some(rewritten) = rewritten else {
+                continue;
+            };
+            for (k, line) in rewritten {
+                kinds[k] = classify_line(&line);
+                lines[k] = line;
+            }
+            taken.push((first, last, z));
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Forward a copy into an FP scratch into the copy's readers:
+///
+/// ```text
+///   fmv.d ft0, fa0 ; fadd.d ft0, ft0, ft1    ->   fadd.d ft0, fa0, ft1
+/// ```
+///
+/// The scratch (ft0-ft11, never an ABI value) must be written again before
+/// the next control transfer, or be dead there by the FP liveness; every
+/// reader on the way is renamed, and the source must still hold its value at
+/// each of them.  A read-modify-write reader (`fadd.d ft0, ft0, ft1`) renames
+/// its read and ends the copy's life.  Copies of a register to itself go
+/// (`fmv.d` is `fsgnj.d`: a bit copy), and so do dead copies, loads and bit
+/// moves into a scratch or argument register -- the only FP definitions
+/// that can neither trap nor set an exception flag.
+fn forward_fp_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    const WINDOW: usize = 64;
+    let mut changed = false;
+    for (start, end) in rv_function_ranges(lines, kinds, n) {
+        if (start..end).any(|k| lines[k] == OPAQUE_LINE) {
+            continue;
+        }
+        let Some(live) = RvFpLiveness::build(lines, kinds, start, end) else {
+            continue;
+        };
+        for i in start..end {
+            if kinds[i] != LineKind::Other {
+                continue;
+            }
+            let Some((ft, fs, _)) = rv_fp_copy(&lines[i]) else {
+                // A dead bit transfer into a scratch or argument register.
+                let transfer = lines[i]
+                    .trim()
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|m| matches!(m, "fld" | "flw" | "fmv.d.x" | "fmv.w.x"));
+                if transfer
+                    && let Some(RvFpRoles { def: Some(d), .. }) = rv_fp_roles(&lines[i])
+                    && rv_fp_bit(d) & (RV_FP_TEMPS | (RV_FP_ARGS & !RV_FP_RET)) != 0
+                    && live.live_after(i) & rv_fp_bit(d) == 0
+                {
+                    kinds[i] = LineKind::Nop;
+                    changed = true;
+                }
+                continue;
+            };
+            if ft == fs {
+                if lines[i].trim().starts_with("fmv.d") {
+                    kinds[i] = LineKind::Nop;
+                    changed = true;
+                }
+                continue;
+            }
+            if rv_fp_bit(ft) & RV_FP_TEMPS == 0 {
+                continue;
+            }
+            let mut readers: Vec<(usize, u8)> = Vec::new();
+            let mut fs_clobbered = false;
+            let mut ok = false;
+            let mut steps = 0;
+            let mut k = i + 1;
+            while k < end && steps < WINDOW {
+                if kinds[k] == LineKind::Nop || kinds[k] == LineKind::Directive {
+                    k += 1;
+                    continue;
+                }
+                if rv_fp_barrier(&lines[k], kinds[k]) {
+                    ok = live.live_before(k) & rv_fp_bit(ft) == 0;
+                    break;
+                }
+                let Some(roles) = rv_fp_roles(&lines[k]) else {
+                    break;
+                };
+                if roles.uses & rv_fp_bit(ft) != 0 {
+                    if fs_clobbered {
+                        break;
+                    }
+                    readers.push((k, roles.src_ops));
+                }
+                if roles.def == Some(ft) {
+                    ok = true;
+                    break;
+                }
+                if roles.def == Some(fs) {
+                    fs_clobbered = true;
+                }
+                steps += 1;
+                k += 1;
+            }
+            if !ok {
+                continue;
+            }
+            let renamed: Option<Vec<String>> = readers
+                .iter()
+                .map(|&(k, src_ops)| rv_rename_fp_operands(&lines[k], src_ops, ft, fs))
+                .collect();
+            let Some(renamed) = renamed else {
+                continue;
+            };
+            for ((k, _), new_line) in readers.into_iter().zip(renamed) {
+                kinds[k] = classify_line(&new_line);
+                lines[k] = new_line;
+            }
+            kinds[i] = LineKind::Nop;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Compute an FP result straight into the register it is copied to:
+///
+/// ```text
+///   fadd.d ft0, fa0, fa1 ; fmv.d fa0, ft0    ->   fadd.d fa0, fa0, fa1
+/// ```
+///
+/// The copy must be the first line after the producer to name the scratch,
+/// no line in between may name the copy's destination, and the scratch must
+/// die at the copy.  A single-precision copy (`fmv.s`) takes only a producer
+/// of a single.
+fn retarget_fp_results(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    const WINDOW: usize = 16;
+    let mut changed = false;
+    for (start, end) in rv_function_ranges(lines, kinds, n) {
+        if (start..end).any(|k| lines[k] == OPAQUE_LINE) {
+            continue;
+        }
+        let Some(live) = RvFpLiveness::build(lines, kinds, start, end) else {
+            continue;
+        };
+        for i in start..end {
+            if kinds[i] != LineKind::Other {
+                continue;
+            }
+            let Some(producer) = rv_fp_roles(&lines[i]) else {
+                continue;
+            };
+            let Some(ft) = producer.def else {
+                continue;
+            };
+            if rv_fp_bit(ft) & RV_FP_TEMPS == 0 {
+                continue;
+            }
+            let mut between = 0u32;
+            let mut found = None;
+            let mut steps = 0;
+            let mut j = i + 1;
+            while j < end && steps < WINDOW {
+                if kinds[j] == LineKind::Nop || kinds[j] == LineKind::Directive {
+                    j += 1;
+                    continue;
+                }
+                if rv_fp_barrier(&lines[j], kinds[j]) {
+                    break;
+                }
+                let Some(roles) = rv_fp_roles(&lines[j]) else {
+                    break;
+                };
+                if (roles.uses | roles.def_bit()) & rv_fp_bit(ft) != 0 {
+                    found = Some(j);
+                    break;
+                }
+                between |= roles.uses | roles.def_bit();
+                steps += 1;
+                j += 1;
+            }
+            let Some(j) = found else {
+                continue;
+            };
+            let Some((fd, src, copy_single)) = rv_fp_copy(&lines[j]) else {
+                continue;
+            };
+            if src != ft
+                || fd == ft
+                || between & rv_fp_bit(fd) != 0
+                || (copy_single && !producer.single)
+                || live.live_after(j) & rv_fp_bit(ft) != 0
+            {
+                continue;
+            }
+            let Some(new_line) = rv_rename_fp_operands(&lines[i], 1, ft, fd) else {
+                continue;
+            };
+            kinds[i] = classify_line(&new_line);
+            lines[i] = new_line;
+            kinds[j] = LineKind::Nop;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Delete the frame of a function whose body no longer uses it.
+///
+/// The emitter decides `frameless_leaf` before the passes run, so a leaf
+/// whose frame slots the passes all forwarded and deleted still sets up and
+/// tears down a frame nothing touches:
+///
+/// ```text
+///   addi sp, sp, -32 ; sd ra, 24(sp) ; sd s0, 16(sp) ; addi s0, sp, 32
+///   ... no sp, s0 or ra, no call ...
+///   ld ra, 24(sp) ; ld s0, 16(sp) ; addi sp, sp, 32 ; ret
+/// ```
+///
+/// Without a call `ra` keeps the return address, nothing writes `s0` and
+/// `sp` never moves, so the caller sees the same registers and memory; the
+/// CFA stays `sp + 0` with `ra` in `ra` -- the CIE's initial rule -- so the
+/// prologue's CFI rows go with it.  Anything else -- a callee-saved save, a
+/// stack-passed parameter, a variadic save area, `__builtin_frame_address`,
+/// a dynamic allocation, the large-frame forms -- names `s0` or `sp` in the
+/// body or changes the prologue's shape, and keeps the frame.
+fn eliminate_vestigial_frames(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for (start, end) in rv_function_ranges(lines, kinds, n) {
+        if let Some(frame) = rv_vestigial_frame(lines, kinds, start, end) {
+            for k in frame {
+                kinds[k] = LineKind::Nop;
+            }
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// The prologue, CFI and epilogue lines of a function whose frame its body
+/// never uses (see `eliminate_vestigial_frames`), or `None`.
+fn rv_vestigial_frame(
+    lines: &[String],
+    kinds: &[LineKind],
+    start: usize,
+    end: usize,
+) -> Option<Vec<usize>> {
+    let code: Vec<usize> = (start + 1..end)
+        .filter(|&k| kinds[k] != LineKind::Nop)
+        .collect();
+    if code.iter().any(|&k| lines[k] == OPAQUE_LINE) {
+        return None;
+    }
+    let text = |k: usize| lines[k].trim();
+    let is_cfi = |k: usize| kinds[k] == LineKind::Directive && text(k).starts_with(".cfi_");
+    let mut pos = 0;
+    // Directives ahead of the prologue: only `.cfi_startproc` among the CFI.
+    while pos < code.len() && kinds[code[pos]] == LineKind::Directive {
+        if is_cfi(code[pos]) && text(code[pos]) != ".cfi_startproc" {
+            return None;
+        }
+        pos += 1;
+    }
+    let size: i64 = text(*code.get(pos)?)
+        .strip_prefix("addi sp, sp, -")?
+        .parse()
+        .ok()
+        .filter(|&s: &i64| s >= 16 && s % 16 == 0 && s <= 2032)?;
+    let mut frame = vec![code[pos]];
+    pos += 1;
+    let mut expect = |pos: &mut usize, want: &str, optional: bool| -> Option<()> {
+        match code.get(*pos) {
+            Some(&k) if text(k) == want => {
+                frame.push(k);
+                *pos += 1;
+                Some(())
+            }
+            _ if optional => Some(()),
+            _ => None,
+        }
+    };
+    expect(&mut pos, &format!(".cfi_def_cfa_offset {size}"), true)?;
+    expect(&mut pos, &format!("sd ra, {}(sp)", size - 8), false)?;
+    expect(&mut pos, &format!("sd s0, {}(sp)", size - 16), false)?;
+    expect(&mut pos, &format!("addi s0, sp, {size}"), false)?;
+    expect(&mut pos, ".cfi_def_cfa s0, 0", true)?;
+    expect(&mut pos, ".cfi_offset ra, -8", true)?;
+    expect(&mut pos, ".cfi_offset s0, -16", true)?;
+    let epilogue = [
+        format!("ld ra, {}(sp)", size - 8),
+        format!("ld s0, {}(sp)", size - 16),
+        format!("addi sp, sp, {size}"),
+    ];
+    // Every return comes right after the three-line epilogue; the lines in
+    // between are the body, which may name neither sp, s0 nor ra.
+    let mut epilogue_lines = Vec::new();
+    for (idx, &k) in code.iter().enumerate().skip(pos) {
+        if kinds[k] == LineKind::Ret {
+            let tail = code.get(idx.checked_sub(3)?..idx)?;
+            if idx < pos + 3 || tail.iter().zip(&epilogue).any(|(&e, want)| text(e) != want) {
+                return None;
+            }
+            epilogue_lines.extend_from_slice(tail);
+        }
+    }
+    let frame_bits = rv_bit(REG_SP) | rv_bit(REG_S0) | rv_bit(REG_RA);
+    for &k in &code[pos..] {
+        if epilogue_lines.binary_search(&k).is_ok() {
+            continue;
+        }
+        match kinds[k] {
+            LineKind::Label | LineKind::Ret => continue,
+            LineKind::Directive => {
+                if is_cfi(k) && text(k) != ".cfi_endproc" {
+                    return None;
+                }
+                continue;
+            }
+            LineKind::Call => return None,
+            LineKind::Jump if !jump_target(&lines[k]).is_some_and(|t| t.starts_with(".L")) => {
+                return None;
+            }
+            _ => {}
+        }
+        let (named, unmodelled) = rv_named_regs(&lines[k]);
+        let (ireads, iwrites) = classify_implicit_operands_rv(&lines[k]);
+        if unmodelled
+            || (named | ireads | iwrites) & frame_bits != 0
+            || (kinds[k] == LineKind::Other && rv_is_unmodelled_transfer(&lines[k]))
+            || matches!(
+                text(k).split_whitespace().next(),
+                Some("ecall" | "ebreak" | "call" | "tail" | "jal" | "jalr" | "jr")
+            )
+        {
+            return None;
+        }
+    }
+    if epilogue_lines.is_empty() {
+        return None;
+    }
+    frame.extend(epilogue_lines);
+    Some(frame)
 }
 
 /// Reads of a register just set to 0 read `zero` instead: `li t2, 0;
@@ -4704,6 +6165,48 @@ fn dead_stores_in_function(
     start: usize,
     end: usize,
 ) -> bool {
+    let Some(loaded_ranges) = rv_frame_reads(lines, kinds, start, end) else {
+        return false;
+    };
+    // Remove stores whose byte range overlaps no load range: the integer
+    // `sd`/`sw` the classifier tracks, and the FP and narrow stores
+    // (`fsd`/`fsw`/`sh`/`sb`) a forwarded slot leaves behind.
+    let mut changed = false;
+    for i in start..end {
+        let (offset, store_size) = match kinds[i] {
+            LineKind::StoreS0 {
+                offset, is_word, ..
+            } => (offset, if is_word { 4 } else { 8 }),
+            LineKind::Other => match rv_frame_store(&lines[i]) {
+                Some(store) => store,
+                None => continue,
+            },
+            _ => continue,
+        };
+        let overlaps_any_load = loaded_ranges.iter().any(|&(load_off, load_sz)| {
+            // Two ranges [a, a+as) and [b, b+bs) overlap iff a < b+bs && b < a+as
+            offset < load_off + load_sz && load_off < offset + store_size
+        });
+        if !overlaps_any_load {
+            kinds[i] = LineKind::Nop;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// The frame bytes one function reads, as `(offset from s0, size)` ranges --
+/// or `None` when that census cannot be complete: a line is opaque, the
+/// frame address escapes (offset into or copied to another register, read
+/// as a value), or a line accesses a slot in a form whose width is unknown.
+/// Frame slots are reachable only through `s0` otherwise, so a slot outside
+/// every range is never read.
+fn rv_frame_reads(
+    lines: &[String],
+    kinds: &[LineKind],
+    start: usize,
+    end: usize,
+) -> Option<Vec<(i32, i32)>> {
     // Safety: if any instruction takes the address of s0 or uses s0 in a way
     // that could create pointers to stack slots (e.g., `addi xN, s0, off`
     // where xN is not s0 itself), we bail out to avoid eliminating stores
@@ -4713,7 +6216,7 @@ fn dead_stores_in_function(
             continue;
         }
         if lines[i] == OPAQUE_LINE {
-            return false;
+            return None;
         }
         let trimmed = lines[i].trim();
         // Check for address-of-frame-pointer patterns
@@ -4722,7 +6225,7 @@ fn dead_stores_in_function(
             // But `addi tX, s0, N` takes address of a stack slot.
             if let Some(dest) = parse_alu_dest(trimmed) {
                 if dest != REG_S0 {
-                    return false;
+                    return None;
                 }
             }
         }
@@ -4731,7 +6234,7 @@ fn dead_stores_in_function(
                 if let Some((_, src)) = rest.split_once(", ") {
                     if src.trim() == "s0" {
                         // mv xN, s0 — copying frame pointer
-                        return false;
+                        return None;
                     }
                 }
             }
@@ -4749,11 +6252,11 @@ fn dead_stores_in_function(
             && !trimmed.starts_with("ld s0,")
             && !trimmed.starts_with("sd s0,")
         {
-            return false;
+            return None;
         }
     }
 
-    // Phase 1: Collect all (offset, size) byte ranges that are loaded from.
+    // Collect all (offset, size) byte ranges that are loaded from.
     // We must use byte-range overlap (not exact offset match) because a wide
     // store (e.g. `sd` at offset -24, 8 bytes) can be partially read by a
     // narrower load at a different offset (e.g. `lwu` at offset -20, 4 bytes).
@@ -4778,47 +6281,17 @@ fn dead_stores_in_function(
                 if !trimmed.contains("(s0)") {
                     continue;
                 }
-                let load_size = match trimmed.split_whitespace().next().unwrap_or("") {
-                    "ld" | "fld" => Some(8),
-                    "lw" | "lwu" | "flw" => Some(4),
-                    "lh" | "lhu" | "flh" => Some(2),
-                    "lb" | "lbu" => Some(1),
-                    "flq" => Some(16),
-                    // A store writes the slot; it keeps no other store alive.
-                    "sd" | "sw" | "sh" | "sb" | "fsd" | "fsw" | "fsh" | "fsq" => None,
-                    // An atomic, a vector access or anything else unsized:
-                    // keep every store.
-                    _ => return false,
-                };
-                if let Some(sz) = load_size {
-                    match extract_s0_offset_from_line(trimmed) {
-                        Some(off) => loaded_ranges.push((off, sz)),
-                        None => return false,
-                    }
+                // An atomic, a vector access or anything else unsized: no
+                // census.  A store writes the slot; it keeps no store alive.
+                let (size, is_store) =
+                    rv_access_width(trimmed.split_whitespace().next().unwrap_or(""))?;
+                if !is_store {
+                    loaded_ranges.push((extract_s0_offset_from_line(trimmed)?, size));
                 }
             }
         }
     }
-
-    // Phase 2: Remove stores whose byte range does not overlap any load range
-    let mut changed = false;
-    for i in start..end {
-        if let LineKind::StoreS0 {
-            offset, is_word, ..
-        } = kinds[i]
-        {
-            let store_size = if is_word { 4 } else { 8 };
-            let overlaps_any_load = loaded_ranges.iter().any(|&(load_off, load_sz)| {
-                // Two ranges [a, a+as) and [b, b+bs) overlap iff a < b+bs && b < a+as
-                offset < load_off + load_sz && load_off < offset + store_size
-            });
-            if !overlaps_any_load {
-                kinds[i] = LineKind::Nop;
-                changed = true;
-            }
-        }
-    }
-    changed
+    Some(loaded_ranges)
 }
 
 /// Extract s0 offset from any instruction line containing `off(s0)`.
@@ -5036,8 +6509,21 @@ mod tests {
         let out = peephole_optimize(asm.to_string());
         assert!(!out.contains("sd s1"), "{out}");
         assert!(!out.contains(".cfi_offset s1"), "{out}");
-        assert!(out.contains(".cfi_offset ra, -8"), "{out}");
-        assert!(out.contains(".cfi_offset s0, -16"), "{out}");
+        // Nothing else uses the frame any more: it goes, rows and all.
+        assert!(
+            !out.contains("addi sp") && !out.contains(".cfi_offset"),
+            "{out}"
+        );
+        // A body that still reads the frame (a stack-passed argument) keeps
+        // it and the frame record's rows; only the dead save's row goes.
+        let framed = peephole_optimize(asm.replace(
+            "    sd t0, 0(t5)\n",
+            "    sd t0, 0(t5)\n    ld t1, 0(s0)\n    sd t1, 8(t5)\n",
+        ));
+        assert!(!framed.contains("sd s1"), "{framed}");
+        assert!(!framed.contains(".cfi_offset s1"), "{framed}");
+        assert!(framed.contains(".cfi_offset ra, -8"), "{framed}");
+        assert!(framed.contains(".cfi_offset s0, -16"), "{framed}");
         // With the restore in place the save and its row both stay.
         let kept = peephole_optimize(asm.replace("    mv s1, a2\n", "    mv s1, a2\n    call g\n"));
         assert!(kept.contains("sd s1, -32(s0)"), "{kept}");
@@ -5260,6 +6746,436 @@ mod tests {
             code_lines(&out).contains(&"ld t0, 0(a1)".to_string()),
             "{out}"
         );
+    }
+
+    fn run_fp_pass(
+        input: &str,
+        pass: fn(&mut [String], &mut [LineKind], usize) -> bool,
+    ) -> Vec<String> {
+        let mut lines: Vec<String> = input.lines().map(str::to_string).collect();
+        let n = lines.len();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let _ = pass(&mut lines, &mut kinds, n);
+        live_lines(&lines, &kinds)
+    }
+
+    /// The FP role table: every register spelling, the emitted F/D shapes,
+    /// and `None` for a shape it does not model.
+    #[test]
+    fn fp_roles_cover_the_emitted_shapes() {
+        for id in 0..32u8 {
+            assert_eq!(rv_fp_reg(rv_fp_name(id)), Some(id));
+            assert_eq!(rv_fp_reg(&format!("f{id}")), Some(id));
+        }
+        for bad in ["ft12", "fs12", "fa8", "f32", "f01", "fp", "fa", "x5"] {
+            assert_eq!(rv_fp_reg(bad), None, "{bad}");
+        }
+        let fa = |k: u8| rv_fp_bit(10 + k);
+        assert_eq!(
+            rv_fp_roles("    fadd.d ft0, fa0, fa1"),
+            Some(RvFpRoles {
+                def: Some(0),
+                src_ops: 0b110,
+                uses: fa(0) | fa(1),
+                single: false,
+            })
+        );
+        let shape = |l: &str| rv_fp_roles(l).map(|r| (r.def, r.src_ops, r.uses, r.single));
+        assert_eq!(
+            shape("fmul.s ft1, ft1, fa0, rne"),
+            Some((Some(1), 0b110, 2 | fa(0), true))
+        );
+        assert_eq!(
+            shape("fmadd.d fa0, fa1, fa2, fa3"),
+            Some((Some(10), 0b1110, fa(1) | fa(2) | fa(3), false))
+        );
+        assert_eq!(shape("fneg.d ft0, ft0"), Some((Some(0), 0b10, 1, false)));
+        assert_eq!(shape("fcvt.l.d t0, ft0, rtz"), Some((None, 0b10, 1, false)));
+        assert_eq!(shape("fcvt.s.l ft2, a0"), Some((Some(2), 0, 0, true)));
+        assert_eq!(
+            shape("fcvt.d.s ft0, fa0"),
+            Some((Some(0), 0b10, fa(0), false))
+        );
+        assert_eq!(shape("fmv.w.x ft0, zero"), Some((Some(0), 0, 0, true)));
+        assert_eq!(
+            shape("fmv.x.d a0, fs11"),
+            Some((None, 0b10, rv_fp_bit(27), false))
+        );
+        assert_eq!(shape("flt.d t0, ft0, ft1"), Some((None, 0b110, 3, false)));
+        assert_eq!(
+            shape("fclass.s t0, ft8"),
+            Some((None, 0b10, rv_fp_bit(28), false))
+        );
+        assert_eq!(shape("fld ft11, 8(a0)"), Some((Some(31), 0, 0, false)));
+        assert_eq!(shape("flw fs0, -4(s0)"), Some((Some(8), 0, 0, true)));
+        assert_eq!(
+            shape("fsd fs2, -8(s0)"),
+            Some((None, 1, rv_fp_bit(18), false))
+        );
+        // Lines without FP registers have no FP roles.
+        assert_eq!(shape("add a0, a1, a2"), Some((None, 0, 0, false)));
+        // Unknown shapes, a general register where an FP source belongs, an
+        // FP register where a general one belongs: unknown.
+        for line in [
+            "fli.d ft0, 1.0",
+            "fadd.d ft0, fa0, t1",
+            "fcvt.l.d ft0, ft1, rtz",
+            "fadd.d ft0, fa0, fa1, ft2",
+            "fsd ft0, 0(ft1)",
+            "vfmv.f.s fa0, v1",
+        ] {
+            assert_eq!(rv_fp_roles(line), None, "{line}");
+        }
+    }
+
+    /// A frame slot's FP value answers the reloads that follow its store, in
+    /// both register files; an overlapping or `sp`-based store, a write to
+    /// the stored register, a join point or a call retires the fact, and an
+    /// escaping frame address disables the pass.
+    #[test]
+    fn fp_slot_reloads_forward_from_the_stored_register() {
+        let out = run_fp_pass(
+            "f:\n    fsd fa0, -24(s0)\n    fsw fa1, -32(s0)\n    fld ft0, -24(s0)\n    flw ft1, -32(s0)\n    ld t0, -24(s0)\n    lw t1, -32(s0)\n    fld fa0, -24(s0)\n    ret\n",
+            forward_fp_slot_reloads,
+        );
+        assert_eq!(
+            out,
+            [
+                "f:",
+                "fsd fa0, -24(s0)",
+                "fsw fa1, -32(s0)",
+                "fmv.d ft0, fa0",
+                "fmv.s ft1, fa1",
+                "fmv.x.d t0, fa0",
+                "fmv.x.w t1, fa1",
+                "ret"
+            ]
+        );
+        for (between, why) in [
+            ("    sw t3, -20(s0)\n", "overlapping store"),
+            ("    fadd.d fa0, fa0, fa1\n", "stored register rewritten"),
+            ("    call g\n", "call"),
+            ("    sd t3, 8(sp)\n", "sp-based store"),
+        ] {
+            let asm = format!("f:\n    fsd fa0, -24(s0)\n{between}    fld ft0, -24(s0)\n    ret\n");
+            let out = run_fp_pass(&asm, forward_fp_slot_reloads);
+            assert!(
+                out.contains(&"fld ft0, -24(s0)".to_string()),
+                "{why}: {out:?}"
+            );
+        }
+        // A store through another base cannot reach a private frame, and a
+        // branch's fall-through keeps the fact.  At a join the facts every
+        // predecessor agrees on survive: an argument spilled at entry is
+        // answered from its register after an `if`, unless one path wrote
+        // the register.
+        let join = "f:\n    fsd fa0, -24(s0)\n    beqz a1, .L1\n    fadd.d fa1, fa1, fa1\n.L1:\n    fld ft0, -24(s0)\n    ret\n";
+        let out = run_fp_pass(join, forward_fp_slot_reloads);
+        assert!(out.contains(&"fmv.d ft0, fa0".to_string()), "{out:?}");
+        let out = run_fp_pass(
+            &join.replace("fadd.d fa1, fa1, fa1", "fadd.d fa0, fa1, fa1"),
+            forward_fp_slot_reloads,
+        );
+        assert!(out.contains(&"fld ft0, -24(s0)".to_string()), "{out:?}");
+        // An unconditional jump carries the facts to its target, where they
+        // meet the other predecessor's.
+        let jumped = "f:\n    fsd fa0, -24(s0)\n    beqz a1, .L1\n    j .L2\n.L1:\n    fsd fa1, -24(s0)\n.L2:\n    fld ft0, -24(s0)\n    ret\n";
+        let out = run_fp_pass(jumped, forward_fp_slot_reloads);
+        assert!(out.contains(&"fld ft0, -24(s0)".to_string()), "{out:?}");
+        let out = run_fp_pass(
+            &jumped.replace("fsd fa1, -24(s0)", "fsd fa0, -24(s0)"),
+            forward_fp_slot_reloads,
+        );
+        assert!(out.contains(&"fmv.d ft0, fa0".to_string()), "{out:?}");
+        // A loop: the back edge brings a store of another register.
+        let out = run_fp_pass(
+            "f:\n    fsd fa0, -24(s0)\n.L1:\n    fld ft0, -24(s0)\n    fsd ft1, -24(s0)\n    bnez a1, .L1\n    ret\n",
+            forward_fp_slot_reloads,
+        );
+        assert!(out.contains(&"fld ft0, -24(s0)".to_string()), "{out:?}");
+        let out = run_fp_pass(
+            "f:\n    fsd fa0, -24(s0)\n    sd t3, 0(a0)\n    beqz a1, .L1\n    fld ft0, -24(s0)\n.L1:\n    ret\n",
+            forward_fp_slot_reloads,
+        );
+        assert!(out.contains(&"fmv.d ft0, fa0".to_string()), "{out:?}");
+        // The frame address escapes: no forwarding.
+        let out = run_fp_pass(
+            "f:\n    addi a1, s0, -24\n    fsd fa0, -24(s0)\n    fld ft0, -24(s0)\n    ret\n",
+            forward_fp_slot_reloads,
+        );
+        assert!(out.contains(&"fld ft0, -24(s0)".to_string()), "{out:?}");
+        // Widths must match: a word reload of a doubleword store reads half.
+        let out = run_fp_pass(
+            "f:\n    fsd fa0, -24(s0)\n    flw ft0, -24(s0)\n    lw t0, -24(s0)\n    ret\n",
+            forward_fp_slot_reloads,
+        );
+        assert!(out.contains(&"flw ft0, -24(s0)".to_string()), "{out:?}");
+        assert!(out.contains(&"lw t0, -24(s0)".to_string()), "{out:?}");
+    }
+
+    /// A bit move leaves both registers with the same bits: the general
+    /// register's FP uses and stores read the FP side, and the bit move
+    /// then dies; a rewrite of either register ends the fact.
+    #[test]
+    fn fp_bit_moves_serve_their_uses_from_the_fp_side() {
+        let out = run_fp_pass(
+            "f:\n    fmv.x.d t0, fa0\n    fmv.d.x ft8, t0\n    fmv.d.x ft0, t0\n    sd t0, 0(a0)\n    ld t1, 8(a0)\n    fmv.d.x ft1, t1\n    fmv.d.x ft2, t1\n    fmv.x.w t2, fa1\n    sw t2, 16(a0)\n    fmv.w.x ft3, t2\n    ret\n",
+            forward_fp_bit_moves,
+        );
+        assert_eq!(
+            out,
+            [
+                "f:",
+                "fmv.x.d t0, fa0",
+                "fmv.d ft8, fa0",
+                "fmv.d ft0, fa0",
+                "fsd fa0, 0(a0)",
+                "ld t1, 8(a0)",
+                "fmv.d.x ft1, t1",
+                "fmv.d ft2, ft1",
+                "fmv.x.w t2, fa1",
+                "fsw fa1, 16(a0)",
+                "fmv.s ft3, fa1",
+                "ret"
+            ]
+        );
+        // The full pipeline then deletes the dead bit move.
+        let out = peephole_optimize(
+            "f:\n    fmv.x.d t0, fa0\n    fmv.d.x ft0, t0\n    fadd.d fa0, ft0, ft0\n    ret\n"
+                .into(),
+        );
+        assert_eq!(code_lines(&out), ["fadd.d fa0, fa0, fa0", "ret"], "{out}");
+        for (between, why) in [
+            ("    addi t0, t0, 1\n", "general register rewritten"),
+            ("    fneg.d fa0, fa0\n", "FP register rewritten"),
+            (".L1:\n", "join point"),
+            ("    call g\n", "call"),
+        ] {
+            let asm = format!("f:\n    fmv.x.d t0, fa0\n{between}    fmv.d.x ft1, t0\n    ret\n");
+            let out = run_fp_pass(&asm, forward_fp_bit_moves);
+            assert!(
+                out.contains(&"fmv.d.x ft1, t0".to_string()),
+                "{why}: {out:?}"
+            );
+        }
+        // Widths must agree: the doubleword fact serves no word move (fa0's
+        // low word is not a boxed single); the word move then mirrors t0's
+        // low word in ft1, which is all `sw` stores.
+        let out = run_fp_pass(
+            "f:\n    fmv.x.d t0, fa0\n    fmv.w.x ft1, t0\n    sw t0, 0(a0)\n    ret\n",
+            forward_fp_bit_moves,
+        );
+        assert_eq!(
+            out,
+            [
+                "f:",
+                "fmv.x.d t0, fa0",
+                "fmv.w.x ft1, t0",
+                "fsw ft1, 0(a0)",
+                "ret"
+            ]
+        );
+    }
+
+    /// A copy into an FP scratch is forwarded into its readers when the
+    /// scratch is rewritten or dead before the next transfer and the source
+    /// holds its value at every reader.
+    #[test]
+    fn fp_scratch_copies_forward_into_their_readers() {
+        let out = run_fp_pass(
+            "f:\n    fmv.d ft0, fa0\n    fmv.d ft1, fa1\n    fadd.d ft0, ft0, ft1\n    fmv.d fa0, ft0\n    ret\n",
+            forward_fp_copies,
+        );
+        assert_eq!(out, ["f:", "fadd.d ft0, fa0, fa1", "fmv.d fa0, ft0", "ret"]);
+        // The source is rewritten before the second reader.
+        let out = run_fp_pass(
+            "f:\n    fmv.d ft0, fa0\n    fadd.d ft1, ft0, fa1\n    fmv.d fa0, fa2\n    fadd.d fa1, ft0, ft1\n    ret\n",
+            forward_fp_copies,
+        );
+        assert!(out.contains(&"fmv.d ft0, fa0".to_string()), "{out:?}");
+        // The scratch is live into a successor.
+        let out = run_fp_pass(
+            "f:\n    fmv.d ft0, fa0\n    beqz a0, .L1\n    fmv.d fa0, fa1\n.L1:\n    fadd.d fa0, fa0, ft0\n    ret\n",
+            forward_fp_copies,
+        );
+        assert!(out.contains(&"fmv.d ft0, fa0".to_string()), "{out:?}");
+        // A double self copy and a dead load into a scratch go; a single
+        // self copy is a NaN-boxing check and stays.
+        let out = run_fp_pass(
+            "f:\n    fmv.d ft0, ft0\n    fmv.s ft2, ft2\n    fld ft1, 0(a0)\n    fmv.d fa0, ft0\n    ret\n",
+            forward_fp_copies,
+        );
+        assert_eq!(out, ["f:", "fmv.s ft2, ft2", "fmv.d fa0, ft0", "ret"]);
+    }
+
+    /// A result computed into a scratch only to be copied out is computed
+    /// into the copy's destination.
+    #[test]
+    fn fp_results_compute_into_their_copy() {
+        let out = run_fp_pass(
+            "f:\n    fadd.d ft0, fa0, fa1\n    fmv.d fa0, ft0\n    ret\n",
+            retarget_fp_results,
+        );
+        assert_eq!(out, ["f:", "fadd.d fa0, fa0, fa1", "ret"]);
+        for (asm, why) in [
+            (
+                "f:\n    fadd.d ft0, fa0, fa1\n    fmv.d fa0, ft0\n    fsd ft0, 0(a0)\n    ret\n",
+                "scratch read after the copy",
+            ),
+            (
+                "f:\n    fadd.d ft0, fa1, fa2\n    fsd fa0, 0(a0)\n    fmv.d fa0, ft0\n    ret\n",
+                "destination read in between",
+            ),
+            (
+                "f:\n    fadd.d ft0, fa0, fa1\n    fmv.s fa0, ft0\n    ret\n",
+                "single copy of a double",
+            ),
+            (
+                "f:\n    fadd.d ft0, fa0, fa1\n.L1:\n    fmv.d fa0, ft0\n    ret\n",
+                "join point in between",
+            ),
+        ] {
+            let out = run_fp_pass(asm, retarget_fp_results);
+            assert!(out.iter().any(|l| l.starts_with("fmv.")), "{why}: {out:?}");
+        }
+        let out = run_fp_pass(
+            "f:\n    fmul.s ft0, fa0, fa1\n    fsw fa2, 0(a0)\n    fmv.s fa0, ft0\n    ret\n",
+            retarget_fp_results,
+        );
+        assert_eq!(out, ["f:", "fmul.s fa0, fa0, fa1", "fsw fa2, 0(a0)", "ret"]);
+    }
+
+    /// FP and narrow frame stores nothing reads are dead; a store an integer
+    /// load reads back is not.
+    #[test]
+    fn dead_fp_and_narrow_frame_stores_are_deleted() {
+        let asm = "f:\n    fsd fa0, -24(s0)\n    fsw fa1, -32(s0)\n    sh a0, -40(s0)\n    sb a1, -48(s0)\n    fsd fa2, -56(s0)\n    ld a0, -56(s0)\n    ret\n";
+        let lines: Vec<String> = asm.lines().map(str::to_string).collect();
+        let n = lines.len();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        assert!(global_dead_store_elimination(&lines, &mut kinds, n));
+        assert_eq!(
+            live_lines(&lines, &kinds),
+            ["f:", "fsd fa2, -56(s0)", "ld a0, -56(s0)", "ret"]
+        );
+    }
+
+    /// The emitter spills a single through `fmv.x.w` and a doubleword `sd`:
+    /// when every reader of the slot reads the low word only, the spill
+    /// becomes `fsw` and a doubleword reload feeding `fmv.w.x` becomes `flw`.
+    #[test]
+    fn single_spills_narrow_to_fsw_when_the_upper_word_is_unread() {
+        let asm = "f:\n    fmv.x.w t0, fa0\n    sd t0, -24(s0)\n    fmv.x.w t0, fa1\n    ld t1, -24(s0)\n    fmv.w.x ft0, t1\n    fmv.w.x ft1, t0\n    fadd.s ft0, ft0, ft1\n    fmv.s fa0, ft0\n    ret\n";
+        let out = run_fp_pass(asm, fold_fp_bounces);
+        assert_eq!(
+            out,
+            [
+                "f:",
+                "fsw fa0, -24(s0)",
+                "flw ft0, -24(s0)",
+                "fmv.s ft1, fa1",
+                "fadd.s ft0, ft0, ft1",
+                "fmv.s fa0, ft0",
+                "ret"
+            ]
+        );
+        // A doubleword reader of the slot keeps the doubleword spill.
+        let out = run_fp_pass(
+            &asm.replace("    ret\n", "    ld a0, -24(s0)\n    ret\n"),
+            fold_fp_bounces,
+        );
+        assert!(out.contains(&"sd t0, -24(s0)".to_string()), "{out:?}");
+        // The FP source is rewritten before the consumer: the FP move takes
+        // the bit move's place -- unless a line in between names its
+        // destination, or the consumer is a store, which keeps its place.
+        let out = run_fp_pass(
+            "f:\n    fmv.x.d t0, fa1\n    fadd.d fa1, fa1, fa1\n    fmv.d.x ft1, t0\n    fsd ft1, 0(a0)\n    ret\n",
+            fold_fp_bounces,
+        );
+        assert_eq!(
+            out,
+            [
+                "f:",
+                "fmv.d ft1, fa1",
+                "fadd.d fa1, fa1, fa1",
+                "fsd ft1, 0(a0)",
+                "ret"
+            ]
+        );
+        for asm in [
+            "f:\n    fmv.x.d t0, fa1\n    fadd.d fa1, fa1, ft1\n    fmv.d.x ft1, t0\n    fsd ft1, 0(a0)\n    ret\n",
+            "f:\n    fmv.x.d t0, fa1\n    fadd.d fa1, fa1, fa1\n    sd t0, 0(a0)\n    ret\n",
+        ] {
+            let out = run_fp_pass(asm, fold_fp_bounces);
+            assert!(out.contains(&"fmv.x.d t0, fa1".to_string()), "{out:?}");
+        }
+    }
+
+    /// The emitter's `double addd(double a, double b) { return a + b; }` at
+    /// -O2, before the passes: every slot and copy goes, then the frame
+    /// nothing touches any more -- Clang's two instructions.
+    #[test]
+    fn fp_leaf_functions_drop_their_vestigial_frame() {
+        let asm = ".globl addd\n.type addd, @function\naddd:\n.cfi_startproc\n    # lccc-ret-regs -\n    addi sp, sp, -48\n    .cfi_def_cfa_offset 48\n    sd ra, 40(sp)\n    sd s0, 32(sp)\n    addi s0, sp, 48\n    .cfi_def_cfa s0, 0\n    .cfi_offset ra, -8\n    .cfi_offset s0, -16\n    fmv.x.d t0, fa0\n    sd t0, -24(s0)\n    fmv.x.d t0, fa1\n    sd t0, -32(s0)\n    ld t0, -24(s0)\n    mv t1, t0\n    ld t0, -32(s0)\n    mv t2, t0\n    fmv.d.x ft0, t1\n    fmv.d.x ft1, t2\n    fadd.d ft0, ft0, ft1\n    fmv.x.d t0, ft0\n    sd t0, -40(s0)\n    fmv.d.x fa0, t0\n    ld ra, 40(sp)\n    ld s0, 32(sp)\n    addi sp, sp, 48\n    ret\n.cfi_endproc\n.size addd, .-addd\n";
+        let out = peephole_optimize(asm.into());
+        assert_eq!(code_lines(&out), ["fadd.d fa0, fa0, fa1", "ret"], "{out}");
+        assert!(
+            !out.contains(".cfi_def_cfa") && !out.contains(".cfi_offset"),
+            "{out}"
+        );
+        assert!(
+            out.contains(".cfi_startproc") && out.contains(".cfi_endproc"),
+            "{out}"
+        );
+        // A call needs ra saved; a stack-passed argument read needs s0.
+        for (extra, why) in [
+            ("    call g\n", "call"),
+            ("    ld t3, 0(s0)\n    sd t3, 0(a0)\n", "frame read"),
+        ] {
+            let framed = peephole_optimize(asm.replace(
+                "    ld ra, 40(sp)\n",
+                &format!("{extra}    ld ra, 40(sp)\n"),
+            ));
+            assert!(framed.contains("addi sp, sp, -48"), "{why}: {framed}");
+            assert!(framed.contains("ld ra, 40(sp)"), "{why}: {framed}");
+        }
+    }
+
+    /// FP results in a general register: the word conversions, `fmv.x.w`,
+    /// the comparisons and `fclass` are sign-extended producers, and FP lines
+    /// in between keep the proof; the doubleword forms are not.
+    #[test]
+    fn fp_word_results_are_sext32_producers() {
+        for producer in [
+            "fcvt.w.d t0, ft0, rtz",
+            "fcvt.wu.s t0, ft0, rtz",
+            "fmv.x.w t0, ft0",
+            "flt.d t0, ft0, ft1",
+            "fclass.d t0, ft0",
+        ] {
+            let asm = format!(
+                "f:\n    {producer}\n    fadd.d ft2, ft2, ft3\n    sext.w t0, t0\n    sd t0, 0(a0)\n    ret\n"
+            );
+            let out = peephole_optimize(asm);
+            assert!(!out.contains("sext.w"), "{producer}: {out}");
+        }
+        for producer in [
+            "fcvt.l.d t0, ft0, rtz",
+            "fcvt.lu.d t0, ft0, rtz",
+            "fmv.x.d t0, ft0",
+        ] {
+            let asm = format!("f:\n    {producer}\n    sext.w t0, t0\n    sd t0, 0(a0)\n    ret\n");
+            let out = peephole_optimize(asm);
+            assert!(out.contains("sext.w"), "{producer}: {out}");
+        }
+    }
+
+    #[test]
+    fn retarget_fp_result_in_a_general_register_writes_the_home() {
+        let out = run_retarget("f:\n    fcvt.l.d t0, ft0, rtz\n    mv a0, t0\n    ret\n");
+        assert_eq!(out, "f:\n    fcvt.l.d a0, ft0, rtz\n    ret");
+        let out = run_retarget("f:\n    flt.d t1, fa0, fa1\n    mv a0, t1\n    ret\n");
+        assert_eq!(out, "f:\n    flt.d a0, fa0, fa1\n    ret");
     }
 
     /// Frame slots are per function: another function reading the same
@@ -5737,12 +7653,26 @@ mod tests {
         assert!(out.contains("addw t0, t1, a1"), "{out}");
     }
 
+    /// Past a label the function's liveness decides: the scratch read
+    /// after the join keeps the move, a scratch every path rewrites first
+    /// does not.
     #[test]
-    fn retarget_refuses_across_a_label() {
+    fn retarget_consults_the_liveness_across_a_label() {
+        let out = run_retarget(
+            "f:\n    addw t0, t1, a1\n    mv a0, t0\n.LBB9:\n    addw t0, t0, t6\n    ret\n",
+        );
+        assert!(out.contains("mv a0, t0"), "{out}");
+        let out = run_retarget(
+            "f:\n    addw t0, t1, a1\n    mv a0, t0\n    beqz a2, .LBB9\n    addw t0, t6, t6\n.LBB9:\n    addw t0, t0, t6\n    ret\n",
+        );
+        assert!(out.contains("mv a0, t0"), "{out}");
         let out = run_retarget(
             "f:\n    addw t0, t1, a1\n    mv a0, t0\n.LBB9:\n    addw t0, t6, t6\n    ret\n",
         );
-        assert!(out.contains("mv a0, t0"), "{out}");
+        assert_eq!(
+            out,
+            "f:\n    addw a0, t1, a1\n.LBB9:\n    addw t0, t6, t6\n    ret"
+        );
     }
 
     #[test]
@@ -6097,6 +8027,100 @@ mod jump_near_tests {
                 Some(rest) => rest.split_once(", ").is_some_and(|(_dst, s)| s == src),
                 None => false,
             })
+    }
+
+    /// A loop constant hoisted into a register (`li a3, 50` before the loop)
+    /// is a sign-extended word wherever the function reads it, so the `int`
+    /// compare inside the loop no longer re-extends it per iteration; each
+    /// way the fact can fail keeps the extension.
+    #[test]
+    fn invariantly_wide_registers_cross_joins() {
+        let shape = |pre: &str, body: &str| {
+            format!(
+                "f:\n{pre}    li a4, 0\n.L1:\n    lw t1, 0(a0)\n    sext.w t2, a3\n    slt a5, t1, t2\n    addw a4, a4, a5\n{body}    addi a0, a0, 4\n    addi a1, a1, -1\n    bnez a1, .L1\n    mv a0, a4\n    ret\n"
+            )
+        };
+        let extends = |out: &str| out.lines().any(|l| l.trim().starts_with("sext.w"));
+        // The fact holds: a3's only write is the word constant.
+        let out = peephole_optimize(shape("    li a3, 50\n", ""));
+        assert!(!extends(&out), "\n{out}");
+        // Through a copy of an invariantly wide register.
+        let out = peephole_optimize(shape("    li a6, -7\n    mv a3, a6\n", ""));
+        assert!(!extends(&out), "\n{out}");
+        // A constant beyond the word range.
+        let out = peephole_optimize(shape("    li a3, 4294967296\n", ""));
+        assert!(extends(&out), "\n{out}");
+        // Another write that is not a word: a doubleword load in the loop.
+        let out = peephole_optimize(shape("    li a3, 50\n", "    ld a3, 8(a0)\n"));
+        assert!(extends(&out), "\n{out}");
+        // Live on entry: the argument register itself.
+        let out = peephole_optimize(shape("", ""));
+        assert!(extends(&out), "\n{out}");
+        // A call clobbers the caller-saved register.
+        let out = peephole_optimize(shape("    li a3, 50\n", "    call g\n"));
+        assert!(extends(&out), "\n{out}");
+        // A write this does not model.
+        let out = peephole_optimize(shape("    li a3, 50\n", "    csrr a3, cycle\n"));
+        assert!(extends(&out), "\n{out}");
+    }
+
+    #[test]
+    fn invariant_word_facts_need_every_write_and_no_entry_value() {
+        let facts = |asm: &str| {
+            let lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+            let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+            rv_invariantly_wide(&lines, &kinds, 0, lines.len())
+        };
+        let a3 = rv_bit(REG_A3);
+        let a4 = rv_bit(REG_A4);
+        assert_eq!(
+            facts("f:\n    li a3, 1\n    lw a4, 0(a0)\n    ret\n") & (a3 | a4),
+            a3 | a4
+        );
+        // Copies of each other only: a4 is read before any write (live on entry).
+        assert_eq!(
+            facts("f:\n    mv a3, a4\n    beqz a0, .L1\n    mv a4, a3\n.L1:\n    ret\n")
+                & (a3 | a4),
+            0
+        );
+        // `lwu` and `ld` are not words; `lhu`/`lbu` are.
+        assert_eq!(facts("f:\n    lwu a3, 0(a0)\n    ret\n") & a3, 0);
+        assert_eq!(
+            facts("f:\n    lbu a3, 0(a0)\n    lhu a4, 2(a0)\n    ret\n") & (a3 | a4),
+            a3 | a4
+        );
+        // An unresolvable transfer gives no facts at all.
+        assert_eq!(facts("f:\n    li a3, 1\n    jr a0\n"), 0);
+    }
+
+    /// `li` of a constant outside the signed 32-bit range is no sign-extended
+    /// word: `(int)0x100000001L` at -O0 is `li t0, 4294967297; sext.w a0, t0`,
+    /// and dropping the extension returned 0x100000001 for the int 1 (the
+    /// RV64 psABI hands an int back sign-extended, and callers compare the
+    /// whole register).  The signed 32-bit range itself is still a producer.
+    #[test]
+    fn li_beyond_the_word_range_is_not_a_sext32_producer() {
+        for (imm, word) in [
+            ("4294967297", 1i64),
+            ("2147483648", -2147483648),
+            ("-2147483649", 2147483647),
+            ("0x100000000", 0),
+        ] {
+            let input = format!("f:\n    li t0, {imm}\n    sext.w a0, t0\n    ret\n");
+            let out = peephole_optimize(input.clone());
+            // The extension stays, or a0 receives the extended word itself.
+            assert!(
+                sext_from(&out, "t0") || out.contains(&format!("li a0, {word}\n")),
+                "li {imm}\n{out}"
+            );
+            assert!(!out.contains(&format!("li a0, {imm}")), "li {imm}\n{out}");
+        }
+        for imm in ["2147483647", "-2147483648", "-1", "0x7fffffff"] {
+            let input =
+                format!("f:\n    li t0, {imm}\n    sext.w t0, t0\n    mv a0, t0\n    ret\n");
+            let out = peephole_optimize(input.clone());
+            assert!(!out.contains("sext.w"), "li {imm}\n{out}");
+        }
     }
 
     #[test]
@@ -6509,9 +8533,11 @@ mod frame_store_census_tests {
     /// before the `flw` at -O2.
     #[test]
     fn a_slot_read_only_by_an_fp_load_keeps_its_store() {
+        // The label keeps the load out of reach of every forwarding pass:
+        // only the census decides.
         for (load, width) in [("flw fa1", 4), ("fld fa1", 8), ("flh fa1", 2)] {
             let asm = format!(
-                "f:\n    ld t0, -64(s0)\n    sd t0, -72(s0)\n    {load}, -72(s0)\n    ret\n"
+                "f:\n    ld t0, -64(s0)\n    sd t0, -72(s0)\n.L1:\n    {load}, -72(s0)\n    ret\n"
             );
             let out = code_lines(&peephole_optimize(asm.clone()));
             assert!(
@@ -6519,6 +8545,11 @@ mod frame_store_census_tests {
                 "{width}-byte FP reader lost its store:\n{asm} -> {out:?}"
             );
         }
+        // In straight-line code the doubleword slot is a register: the
+        // reload reads the source slot directly.
+        let asm = "f:\n    ld t0, -64(s0)\n    sd t0, -72(s0)\n    fld fa1, -72(s0)\n    ret\n";
+        let out = code_lines(&peephole_optimize(asm.to_string()));
+        assert_eq!(out, ["f:", "fld fa1, -64(s0)", "ret"], "{out:?}");
     }
 
     /// A slot named by an instruction the census cannot size (an atomic, a

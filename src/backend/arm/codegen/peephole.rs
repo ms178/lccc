@@ -304,7 +304,7 @@ fn wreg_name(id: u8) -> &'static str {
 /// Classify a single assembly line into a LineKind.
 fn classify_line(line: &str) -> LineKind {
     let trimmed = line.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || trimmed.starts_with(RET_BITS_MARKER) {
         return LineKind::Nop;
     }
 
@@ -635,11 +635,17 @@ const OPAQUE_LINE: &str = "# lccc_a64_inline_asm_opaque";
 /// `peephole_optimize` strips it from every line it returns.
 pub(super) const CALL_READS_TAG: &str = " // lccc-call-reads ";
 
+/// The prologue's narrow-result annotation `// lccc-ret-bits N`: the
+/// function returns an N-bit integer (8, 16 or 32), whose bits above N in x0
+/// AAPCS64 leaves unspecified.  Classified `Nop`, so no pass sees it and the
+/// output never carries it.
+pub(super) const RET_BITS_MARKER: &str = "// lccc-ret-bits ";
+
 /// `asm` without call annotations (`CALL_READS_TAG`), for the paths that
 /// return the text unoptimized.  Inline-assembly bodies (`#APP` ..
 /// `#NO_APP`) are user text and pass through untouched.
 fn strip_call_annotations(asm: String) -> String {
-    if !asm.contains(CALL_READS_TAG) {
+    if !asm.contains(CALL_READS_TAG) && !asm.contains(RET_BITS_MARKER) {
         return asm;
     }
     let mut out = String::with_capacity(asm.len());
@@ -649,6 +655,9 @@ fn strip_call_annotations(asm: String) -> String {
             "#APP" => user_text = true,
             "#NO_APP" => user_text = false,
             _ => {}
+        }
+        if !user_text && line.trim_start().starts_with(RET_BITS_MARKER) {
+            continue;
         }
         let code = match line.split_once(CALL_READS_TAG) {
             Some((code, _)) if !user_text => code,
@@ -720,6 +729,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= fuse_and_cmp_zero(&mut lines, &mut kinds, n);
         changed |= fold_sign_mask_abs_to_cneg(&mut lines, &mut kinds, n);
         changed |= eliminate_dead_pre_ret_moves(&mut lines, &mut kinds, n);
+        changed |= drop_unobservable_return_extensions(&mut lines, &mut kinds, n);
         changed |= eliminate_move_chains(&mut lines, &mut kinds, n);
         changed |= fold_zext_move_chains(&mut lines, &mut kinds, n);
         changed |= per_function(&mut lines, &mut kinds, n, propagate_address_aliases);
@@ -788,6 +798,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= fuse_and_cmp_zero(&mut lines, &mut kinds, n);
             changed2 |= fold_sign_mask_abs_to_cneg(&mut lines, &mut kinds, n);
             changed2 |= eliminate_dead_pre_ret_moves(&mut lines, &mut kinds, n);
+            changed2 |= drop_unobservable_return_extensions(&mut lines, &mut kinds, n);
             changed2 |= eliminate_move_chains(&mut lines, &mut kinds, n);
             changed2 |= fold_zext_move_chains(&mut lines, &mut kinds, n);
             changed2 |= per_function(&mut lines, &mut kinds, n, propagate_address_aliases);
@@ -841,8 +852,12 @@ pub fn peephole_optimize(asm: String) -> String {
                 let Some(original) = originals.next() else {
                     return strip_call_annotations(asm);
                 };
+                kinds[i] = if original.trim_start().starts_with(RET_BITS_MARKER) {
+                    LineKind::Nop
+                } else {
+                    LineKind::Other
+                };
                 lines[i] = original;
-                kinds[i] = LineKind::Other;
             }
         }
         if originals.next().is_some() {
@@ -4926,6 +4941,137 @@ mod abs_cneg_tests {
     }
 }
 
+// ── Unobservable extension of a narrow result ───────────────────────────────
+//
+// AAPCS64 returns an integer narrower than 64 bits in the low bits of x0 and
+// leaves the bits above it unspecified: every caller -- GCC's, Clang's and
+// LCCC's own (abi_dirty_upper interop fixture) -- extends what it reads.  The
+// emitter keeps a narrow value extended in its X register, so a narrow result
+// reached `ret` through `sxtw x0, w0`, `sxth`, `and x0, x0, #0xff` or a
+// zero-extending `mov w0, w0`: `int f(long x) { return (int)x; }` was
+// `sxtw x0, w0; ret` and `unsigned char f(unsigned x)` three instructions,
+// against Clang's bare `ret`.  The prologue publishes the result's width N
+// (`RET_BITS_MARKER`); walking back from each `ret` over lines that do not
+// name x0 (the epilogue's restores), the last write of x0 -- when it is an
+// extension that keeps at least the low N bits of its source -- changes only
+// bits no caller reads: it becomes `mov w0, wK`, or nothing when its source
+// is w0 itself (and the walk goes on to the write before it).  A 64-bit
+// result publishes nothing: there `mov w0, w0` is a real zero extension.
+
+/// A write of x0 that keeps the low `M` bits of `wK` and changes only bits
+/// above them: `(M, K)`.
+fn x0_extension(line: &str) -> Option<(u32, u8)> {
+    let t = line.trim();
+    let (m, rest) = t.split_once(char::is_whitespace)?;
+    let ops: Vec<&str> = rest.split(',').map(str::trim).collect();
+    let dst = |want_w_only: bool| match ops.first() {
+        Some(&"w0") => true,
+        Some(&"x0") => !want_w_only,
+        _ => false,
+    };
+    let src = |k: usize| ops.get(k).map(|o| parse_reg(o)).filter(|&r| r <= 30);
+    let imm = |k: usize| {
+        let o = ops.get(k)?.strip_prefix('#')?;
+        match o.strip_prefix("0x") {
+            Some(hex) => u64::from_str_radix(hex, 16).ok(),
+            None => o.parse::<u64>().ok(),
+        }
+    };
+    let width = match (m, ops.len()) {
+        ("sxtw", 2) if ops[0] == "x0" && ops[1].starts_with('w') => 32,
+        ("sxth", 2) if dst(false) && ops[1].starts_with('w') => 16,
+        ("sxtb", 2) if dst(false) && ops[1].starts_with('w') => 8,
+        ("uxth", 2) if dst(true) => 16,
+        ("uxtb", 2) if dst(true) => 8,
+        ("mov", 2) if dst(true) && ops[1].starts_with('w') => 32,
+        ("and", 3) if dst(false) && ops[0].get(..1) == ops[1].get(..1) => match imm(2)? {
+            0xff => 8,
+            0xffff => 16,
+            0xffff_ffff if ops[0] == "x0" => 32,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some((width, src(1)?))
+}
+
+fn drop_unobservable_return_extensions(
+    lines: &mut [String],
+    kinds: &mut [LineKind],
+    n: usize,
+) -> bool {
+    let mentions_x0 = |line: &str| {
+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|tok| tok == "x0" || tok == "w0")
+    };
+    let mut changed = false;
+    let mut bits: Option<u32> = None;
+    for i in 0..n {
+        let t = lines[i].trim();
+        if kinds[i] == LineKind::Label && !t.starts_with('.') {
+            bits = None; // a new function
+            continue;
+        }
+        if let Some(b) = t.strip_prefix(RET_BITS_MARKER) {
+            bits = b.trim().parse().ok().filter(|b| matches!(b, 8 | 16 | 32));
+            continue;
+        }
+        let (LineKind::Ret, Some(bits)) = (kinds[i], bits) else {
+            continue;
+        };
+        let mut j = i;
+        while j > 0 {
+            j -= 1;
+            match kinds[j] {
+                LineKind::Nop | LineKind::Directive => continue,
+                LineKind::Label
+                | LineKind::Branch
+                | LineKind::CondBranch
+                | LineKind::CmpBranch
+                | LineKind::Call
+                | LineKind::Ret => break,
+                _ => {}
+            }
+            let m = lines[j].split_whitespace().next().unwrap_or("");
+            let branch = matches!(m, "b" | "bl" | "br" | "blr")
+                || m.starts_with("b.")
+                || m.starts_with("bc.")
+                || m.starts_with("bra")
+                || m.starts_with("blra");
+            if lines[j] == OPAQUE_LINE
+                || branch
+                || matches!(
+                    m,
+                    "cbz" | "cbnz" | "tbz" | "tbnz" | "svc" | "hvc" | "smc" | "brk"
+                )
+            {
+                break;
+            }
+            if !mentions_x0(&lines[j]) {
+                continue;
+            }
+            let Some((width, src)) = x0_extension(&lines[j]) else {
+                break;
+            };
+            if width < bits {
+                break;
+            }
+            if src == 0 {
+                kinds[j] = LineKind::Nop;
+                changed = true;
+                continue;
+            }
+            if !lines[j].trim().starts_with("mov ") {
+                lines[j] = format!("    mov w0, {}", wreg_name(src));
+                kinds[j] = classify_line(&lines[j]);
+                changed = true;
+            }
+            break;
+        }
+    }
+    changed
+}
+
 // ── Dead move before return ──────────────────────────────────────────────────
 //
 // Return staging can leave `mov xD, xS` writes whose destination is the
@@ -7305,19 +7451,26 @@ fn retarget_fp_return_copies(lines: &mut [String], kinds: &mut [LineKind], n: us
 /// * the path from the copy to `ret` has no label, branch or call, so the
 ///   copy reaches every read it feeds and nothing else reaches them;
 /// * every line on it that names an FP register is a scalar FP
-///   data-processing instruction, `fmov`, `fcmp`, or a scalar FP `ldr`/
-///   `str`, whose first operand is its only write (`str`/`fcmp` write
-///   none) -- anything else naming `N` or `A` stops the rewrite;
+///   data-processing instruction, an FP -> integer conversion, `fmov`,
+///   `fcmp`/`fccmp`, or a scalar FP `ldr`/`str`, whose first operand is its
+///   only write (`str`/`fcmp`/`fccmp` write none) -- anything else naming
+///   `N` or `A` stops the rewrite;
 /// * `N` is not written again, `A` is not written before the last read of
 ///   `N` (an instruction reads before it writes, so `fneg d0, d16` may
 ///   become `fneg d0, d0`), and every read of `N` is a `b`/`h`/`s`/`d`
 ///   view: the copy zeroed bits 127:64 of `vN`, which `vA` need not have.
 fn forward_fp_copies_to_return(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
-    const READ_ONLY: &[&str] = &["fcmp", "fcmpe", "str", "stur"];
+    // `fccmp`/`fccmpe` read two FP registers and write only NZCV.
+    const READ_ONLY: &[&str] = &["fcmp", "fcmpe", "fccmp", "fccmpe", "str", "stur"];
+    // The FP -> integer conversions write a general register first (not an
+    // FP view, so the destination scan below ignores it) and read one FP
+    // source: `fcvtzs w0, d16` reads `d16` exactly like `fneg d0, d16`.
     const WRITES_FIRST: &[&str] = &[
         "fadd", "fsub", "fmul", "fdiv", "fnmul", "fneg", "fabs", "fsqrt", "fmax", "fmin", "fmaxnm",
         "fminnm", "fmadd", "fmsub", "fnmadd", "fnmsub", "fcsel", "frinta", "frinti", "frintm",
         "frintn", "frintp", "frintx", "frintz", "fcvt", "scvtf", "ucvtf", "fmov", "ldr", "ldur",
+        "fcvtzs", "fcvtzu", "fcvtas", "fcvtau", "fcvtms", "fcvtmu", "fcvtns", "fcvtnu", "fcvtps",
+        "fcvtpu",
     ];
     // Operand tokens of `line` with their positions: (operand index, token).
     fn operand_tokens(rest: &str) -> Vec<(usize, &str)> {
@@ -12940,6 +13093,23 @@ mod call_liveness_and_dead_move_tests {
              fmadd d19, d16, d17, d18\n    fmov d0, d19\n    ret\n",
         );
         assert_eq!(out, ["g:", "fmadd d0, d0, d1, d2", "ret"], "{out:?}");
+        // FP -> integer conversions read the home like any other source:
+        // `(int)d` / `(long)d` leave just the conversion.
+        let out = rows("c:\n    fmov d16, d0\n    fcvtzs w0, d16\n    sxtw x0, w0\n    ret\n");
+        assert_eq!(
+            out,
+            ["c:", "fcvtzs w0, d0", "sxtw x0, w0", "ret"],
+            "{out:?}"
+        );
+        let out = rows("u:\n    fmov s16, s0\n    fcvtzu x0, s16\n    ret\n");
+        assert_eq!(out, ["u:", "fcvtzu x0, s0", "ret"], "{out:?}");
+        // A conditional compare reads both homes and writes only flags.
+        let out = rows(
+            "q:\n    fmov d16, d0\n    fmov d17, d1\n    cmp x0, #0\n    \
+             fccmp d16, d17, #0, ne\n    cset w0, gt\n    ret\n",
+        );
+        assert!(out.contains(&"fccmp d0, d1, #0, ne".to_string()), "{out:?}");
+        assert!(!out.iter().any(|l| l.starts_with("fmov")), "{out:?}");
         // Every shape that needs the copy keeps it: a q/v view of the home
         // (bits 127:64 were zeroed), the source written before the last
         // read, a branch on the path, the home written again.
@@ -13111,5 +13281,81 @@ mod call_liveness_and_dead_move_tests {
              b .L1\n.L5:\n    mov x0, #5\n    ret\n.L9:\n    mov x0, x2\n    ret\n",
         );
         assert!(out.contains(&"tbz x1, #3, .L9".to_string()), "{out:?}");
+    }
+}
+
+#[cfg(test)]
+mod return_extension_tests {
+    use super::*;
+
+    fn run(body: &str, bits: u32) -> Vec<String> {
+        let asm = format!(
+            "f:\n.cfi_startproc\n    {RET_BITS_MARKER}{bits}\n{body}    ret\n.cfi_endproc\n"
+        );
+        peephole_optimize(asm)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('.') && !l.ends_with(':'))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// AAPCS64 leaves the bits of x0 above a narrow result unspecified: an
+    /// extension that keeps the result's own bits is unobservable at `ret`.
+    #[test]
+    fn narrow_result_extensions_before_ret_are_unobservable() {
+        // int f(long x) { return (int)x; }
+        assert_eq!(run("    sxtw x0, w0\n", 32), ["ret"]);
+        // unsigned char f(unsigned x): both extensions go.
+        assert_eq!(run("    mov w0, w0\n    and x0, x0, #0xff\n", 8), ["ret"]);
+        // short f(int a, int b) { return a * b; }
+        assert_eq!(
+            run("    mul w0, w0, w1\n    sxth x0, w0\n", 16),
+            ["mul w0, w0, w1", "ret"]
+        );
+        // The epilogue's restores sit between the extension and `ret`.
+        assert_eq!(
+            run(
+                "    add x0, x19, x20\n    sxtw x0, w0\n    ldp x19, x20, [sp, #16]\n    ldp x29, x30, [sp], #32\n",
+                32
+            ),
+            [
+                "add x0, x19, x20",
+                "ldp x19, x20, [sp, #16]",
+                "ldp x29, x30, [sp], #32",
+                "ret"
+            ]
+        );
+        // An extension of another register leaves a 32-bit move at most.
+        let out = run("    fcvtzs w4, d0\n    sxtw x0, w4\n", 32);
+        assert!(!out.iter().any(|l| l.starts_with("sxtw")), "{out:?}");
+        // Narrower than the result: the extension changes bits the caller
+        // reads (`unsigned short f(unsigned x) { return (unsigned char)x; }`).
+        assert_eq!(
+            run("    and w0, w0, #0xff\n", 16),
+            ["and w0, w0, #0xff", "ret"]
+        );
+        assert_eq!(run("    sxth x0, w0\n", 32), ["sxth x0, w0", "ret"]);
+        // x0 read on the way, or a join before the return: kept.
+        assert!(
+            run("    sxtw x0, w0\n    str x0, [x1]\n", 32).contains(&"sxtw x0, w0".to_string())
+        );
+        let joined = run("    sxtw x0, w0\n.L1:\n", 32);
+        assert!(joined.contains(&"sxtw x0, w0".to_string()), "{joined:?}");
+    }
+
+    /// Without the annotation (a 64-bit result) `mov w0, w0` is the zero
+    /// extension the caller reads, and the annotation never reaches the
+    /// output -- optimized or not.
+    #[test]
+    fn wide_results_keep_their_extension_and_the_annotation_never_leaks() {
+        let asm = "f:\n.cfi_startproc\n    mov w0, w0\n    ret\n.cfi_endproc\n";
+        assert!(peephole_optimize(asm.into()).contains("mov w0, w0"));
+        // The annotation of one function does not reach the next.
+        let two = format!("f:\n    {RET_BITS_MARKER}32\n    ret\ng:\n    mov w0, w0\n    ret\n");
+        let out = peephole_optimize(two.clone());
+        assert!(out.contains("mov w0, w0"), "{out}");
+        assert!(!out.contains("lccc-ret-bits"), "{out}");
+        assert!(!strip_call_annotations(two).contains("lccc-ret-bits"));
     }
 }

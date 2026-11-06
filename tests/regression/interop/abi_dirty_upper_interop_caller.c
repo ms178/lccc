@@ -54,6 +54,14 @@ long du_stack9_short(long a, long b, long c, long d, long e, long f, long g, lon
 int du_ret_s32(long x) __asm__("du_ret_s32");
 unsigned short du_ret_u16(long x) __asm__("du_ret_u16");
 signed char du_ret_s8(long x) __asm__("du_ret_s8");
+#if defined(__riscv)
+/* The whole register the RV64 psABI defines for an int result. */
+long du_trunc_wide(void) __asm__("du_trunc_wide");
+long du_trunc_wide_neg(void) __asm__("du_trunc_wide_neg");
+#else
+int du_trunc_wide(void);
+int du_trunc_wide_neg(void);
+#endif
 
 static const int table[8] = {10, 20, 30, 40, 50, 60, 70, 80};
 
@@ -154,6 +162,8 @@ static int check_results(void)
     CHECK(74, (int)du_ret_u16(DU_U16(0xfffe)) == 0xfffe);
     CHECK(75, (long)du_ret_s8(DU_S8(-3)) == -3L);
     CHECK(76, table[du_ret_s32(DU_S32(2))] == 30);
+    CHECK(77, du_trunc_wide() == 1);
+    CHECK(78, du_trunc_wide_neg() == -2);
     return 0;
 }
 

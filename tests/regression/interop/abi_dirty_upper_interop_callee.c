@@ -127,3 +127,17 @@ long du_stack9_short(int a, int b, int c, int d, int e, int f, int g, int h, sho
 long du_ret_s32(long x) { return x; }
 long du_ret_u16(long x) { return x; }
 long du_ret_s8(long x) { return x; }
+
+/* An int truncated from a 64-bit constant (folded only from -O1 on). The
+ * RV64 psABI returns it as the sign-extended word, which the caller reads
+ * as a whole register; on AArch64 the caller reads the W register. */
+int du_trunc_wide(void)
+{
+    long c = 0x100000001L;
+    return (int)c;
+}
+int du_trunc_wide_neg(void)
+{
+    long c = 0x1fffffffeL;
+    return (int)c;
+}

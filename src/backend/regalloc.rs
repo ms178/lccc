@@ -3389,19 +3389,36 @@ pub(crate) fn is_non_gpr_type(ty: &IrType, is_32bit: bool) -> bool {
 }
 
 /// Whether a `Cast`'s result can live in a general-purpose register: both
-/// sides are GPR types, or it is an integer truncation OUT of a 128-bit
-/// value. The truncation's result is an ordinary narrow scalar: every backend
+/// sides are GPR types, an integer truncation OUT of a 128-bit value, or a
+/// binary `float`/`double` converted to a GPR-sized integer.
+///
+/// The truncation's result is an ordinary narrow scalar: every backend
 /// routes it through `emit_cast_default` (x86-64 and AArch64 after their
 /// narrow/FP fast paths, RISC-V and i686 directly), which loads the pair,
 /// narrows the low half and writes the result with the register-aware
 /// `emit_store_result`. Refusing it parked every member a two-register
 /// struct return carries (`trunc(v)`, `trunc(v >> 64)`) in a stack slot.
+///
+/// An `F32`/`F64` -> integer conversion likewise produces a plain integer in
+/// the accumulator (`cvtts[sd]2si` -> `%rax`, `fcvtz[su]` -> `x0`,
+/// `fcvt.{w,l}[u].{s,d}` -> `t0`, i686's SSE/x87 truncation -> `%eax`), and
+/// each backend writes it with the same register-aware result store. Only
+/// the SOURCE is an FP value, and the allocator never homes the result by
+/// the source's class. Refusing it sent every `(int)x` -- the hottest cast
+/// in numeric loops -- through a stack slot and a store-to-load round trip
+/// (measured on x86-64: 2310 retired instructions either way, but 0.2027 s
+/// -> 0.1521 s on a 256-element conversion loop once the slot went away).
+/// `long double` (`F128`, an x87/soft-float pair) and the BID decimal
+/// containers (`D32`/`D64`, lowered through libcalls) keep the old refusal:
+/// their conversions are calls whose results arrive by a different route.
 /// The single source of truth for both `eligible` and
 /// `collect_non_gpr_values`.
 fn cast_result_is_gpr(from_ty: IrType, to_ty: IrType, is_32bit: bool) -> bool {
     let wide = |t: IrType| matches!(t, IrType::I128 | IrType::U128);
     let wide_int_trunc = wide(from_ty) && to_ty.is_integer() && !wide(to_ty);
-    !is_non_gpr_type(&to_ty, is_32bit) && (wide_int_trunc || !is_non_gpr_type(&from_ty, is_32bit))
+    let scalar_fp_to_int = matches!(from_ty, IrType::F32 | IrType::F64) && to_ty.is_integer();
+    !is_non_gpr_type(&to_ty, is_32bit)
+        && (wide_int_trunc || scalar_fp_to_int || !is_non_gpr_type(&from_ty, is_32bit))
 }
 
 fn propagate_coalesce_members(
@@ -20970,6 +20987,21 @@ mod wide_hazard_tests {
             (I128, U128, false, false),
             (I128, F64, false, false),
             (I32, I64, false, true),
+            // A binary float converted to a GPR-sized integer lands in the
+            // accumulator and is written with the register-aware store.
+            (F64, I64, false, true),
+            (F32, U32, false, true),
+            (F64, I8, true, true),
+            (F32, I32, true, true),
+            // ...but not into a pair (i686 I64, any I128), not to another
+            // float, and never out of long double or a decimal container.
+            (F64, I64, true, false),
+            (F64, I128, false, false),
+            (F32, F64, false, false),
+            (I64, F64, false, false),
+            (F128, I64, false, false),
+            (F128, I32, true, false),
+            (D64, I64, false, false),
         ] {
             assert_eq!(
                 cast_result_is_gpr(from, to, is_32bit),

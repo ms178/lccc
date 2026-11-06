@@ -61,6 +61,52 @@ fn mul_shift_add_plan(c: u64, width: u32) -> Option<MulPlan> {
     None
 }
 
+/// Whether this backend multiplies an integer of type `ty` by the
+/// (sign-extended) constant `c` with ONE shifted-register instruction and
+/// no register for `c`: `c = 2^k + 1` (`add d, x, x, lsl #k`) or
+/// `c = 1 - 2^k` (`sub d, x, x, lsl #k`), in every view a multiply of that
+/// type can be emitted in (the plain multiply uses the W view for
+/// `int`/`unsigned` only, the fused multiply-add for every type of at most
+/// four bytes, so the narrower types must have the plan in both).
+///
+/// The loop constant hoist (`passes::int_const_hoist`) leaves such a factor
+/// in place: hoisted into a register it turned `x * 3` into `mul` (a
+/// multi-cycle op on the single multiply pipe) and `acc + x * 3` into
+/// `madd`, where GCC 16.2 and Clang 23.1.5 emit `add x, x, x, lsl #1`.
+/// Factors whose plan takes two instructions (`(2^k ± 1) << m`,
+/// `2^k - 1`) stay hoisted: with the factor in a register, `madd` is one
+/// instruction where the plan is two, the choice Clang makes as well.
+pub(crate) fn mul_needs_no_constant(c: u64, ty: IrType) -> bool {
+    let one_op = |width: u32| {
+        matches!(
+            mul_shift_add_plan(c, width),
+            Some(MulPlan::AddShifted { m: 0, .. } | MulPlan::SubShifted { m: 0, .. })
+        )
+    };
+    if !ty.is_integer() {
+        return false;
+    }
+    match ty {
+        IrType::I32 | IrType::U32 => one_op(32),
+        _ if ty.size() == 8 => one_op(64),
+        _ if ty.size() < 4 => one_op(32) && one_op(64),
+        _ => false,
+    }
+}
+
+/// An integer constant operand, sign-extended to 64 bits. Products and sums
+/// are taken modulo the register width, so only the value modulo 2^width
+/// matters and a narrow negative constant keeps its short plan.
+fn int_const_bits(op: &Operand) -> Option<u64> {
+    match op {
+        Operand::Const(IrConst::I8(v)) => Some(i64::from(*v) as u64),
+        Operand::Const(IrConst::I16(v)) => Some(i64::from(*v) as u64),
+        Operand::Const(IrConst::I32(v)) => Some(i64::from(*v) as u64),
+        Operand::Const(IrConst::I64(v)) => Some(*v as u64),
+        _ => None,
+    }
+}
+
 impl ArmCodegen {
     /// True when `op` is a value whose **only** current home is the
     /// accumulator.
@@ -159,7 +205,11 @@ impl ArmCodegen {
         );
         let other_reg = staged[0].clone();
         let shifted_reg = staged[1].clone();
-        let output = if let Some(reg) = self.dest_reg(dest) {
+        // An FP-homed integer result is produced in x0 and handed to
+        // `store_x0_to` (`fmov dN, x0`): naming an FP index as a general
+        // register is the session-29 ICE (`callee_saved_name` rejects it).
+        let dest_phys = self.dest_reg(dest).filter(|r| !is_arm_fp_phys(*r));
+        let output = if let Some(reg) = dest_phys {
             if use_32bit {
                 callee_saved_name_32(reg)
             } else {
@@ -180,9 +230,181 @@ impl ArmCodegen {
             amount
         ));
         self.state.reg_cache.invalidate_acc();
-        if self.dest_reg(dest).is_none() {
+        if dest_phys.is_none() {
             self.store_x0_to(dest);
         }
+    }
+
+    /// `acc + x * c` (or `acc - x * c` when `subtract`) for an integer
+    /// constant `c` that has a `mul_shift_add_plan`, in two single-cycle
+    /// shifted-register instructions instead of materializing `c` for a
+    /// `madd`/`msub` (`mov` plus a 2-5 cycle multiply-accumulate on the one
+    /// multiplier pipe of Cortex-A5x/A7x and Neoverse cores). GCC 16.2 and
+    /// Clang 23.1.5 emit the same pairs:
+    /// * `a + x*3`  -> `add t, x, x, lsl #1; add d, a, t`
+    /// * `a + x*6`  -> `add t, x, x, lsl #1; add d, a, t, lsl #1`
+    /// * `a + x*7`  -> `sub t, x, x, lsl #3; sub d, a, t` (t = -7x)
+    /// * `a - x*c`  is `a + x*(-c)` (`a - x*3` -> `sub t, x, x, lsl #2;
+    ///   add d, a, t`)
+    /// * a constant addend in -4095..=4095 folds into an `add`/`sub`
+    ///   immediate when the plan's own shape is one instruction.
+    ///
+    /// Every rewrite is the product-plus-addend modulo 2^width in the same
+    /// W/X view as the `madd` it replaces, so the result register is bit
+    /// for bit what `madd` wrote. Returns false, emitting nothing, when no
+    /// factor is such a constant or the shape would need a third
+    /// instruction.
+    fn emit_fused_mul_by_const_plan(
+        &mut self,
+        lhs: &Operand,
+        rhs: &Operand,
+        acc: &Operand,
+        dest: &Value,
+        ty: IrType,
+        subtract: bool,
+    ) -> bool {
+        /// The addend of the second instruction.
+        enum Addend {
+            /// `add`/`sub` immediate, `0..=4095` (0 drops the instruction).
+            Imm { value: u64, negative: bool },
+            /// The register holding the (staged) addend operand.
+            Reg(String),
+        }
+        if !ty.is_integer() || ty.size() > 8 {
+            return false;
+        }
+        // The same view rule as the `madd` path below.
+        let use_32bit = ty.size() <= 4;
+        let width = if use_32bit { 32 } else { 64 };
+        let mask = if use_32bit {
+            u64::from(u32::MAX)
+        } else {
+            u64::MAX
+        };
+        let (x, c) = match (int_const_bits(lhs), int_const_bits(rhs)) {
+            (_, Some(c)) => (lhs, c),
+            (Some(c), None) => (rhs, c),
+            (None, None) => return false,
+        };
+        // `x` itself a constant is a fold the IR did not do; leave it.
+        if int_const_bits(x).is_some() {
+            return false;
+        }
+        let c = if subtract { c.wrapping_neg() } else { c } & mask;
+        let Some(plan) = mul_shift_add_plan(c, width) else {
+            return false;
+        };
+        // Everything that can decline is decided before the first
+        // instruction is emitted.
+        let imm = match int_const_bits(acc) {
+            Some(a) => {
+                // Only a plan whose product is a single instruction leaves
+                // room for the immediate.
+                if !matches!(
+                    plan,
+                    MulPlan::AddShifted { m: 0, .. } | MulPlan::SubShifted { m: 0, .. }
+                ) {
+                    return false;
+                }
+                let a = a & mask;
+                let neg = a.wrapping_neg() & mask;
+                if a <= 4095 {
+                    Some((a, false))
+                } else if neg <= 4095 {
+                    Some((neg, true))
+                } else {
+                    return false;
+                }
+            }
+            None if matches!(acc, Operand::Const(_)) => return false,
+            None => None,
+        };
+        let name = |reg: crate::backend::regalloc::PhysReg| {
+            if use_32bit {
+                callee_saved_name_32(reg)
+            } else {
+                callee_saved_name(reg)
+            }
+        };
+        let mut materialize = |this: &mut Self, op: &Operand, scratch: &'static str| -> String {
+            if let Some(reg) = this.operand_reg(op).filter(|r| !is_arm_fp_phys(*r)) {
+                return name(reg).to_string();
+            }
+            if let Operand::Value(v) = op {
+                if !this.state.is_alloca(v.0) {
+                    if let Some(slot) = this.state.get_slot(v.0) {
+                        this.emit_load_from_sp(scratch, slot.0, "ldr");
+                        return scratch.to_string();
+                    }
+                }
+            }
+            this.operand_to_x0(op);
+            let acc_name = if use_32bit { "w0" } else { "x0" };
+            this.state
+                .emit_fmt(format_args!("    mov {}, {}", scratch, acc_name));
+            scratch.to_string()
+        };
+        let (x1, x2, x3) = if use_32bit {
+            ("w1", "w2", "w3")
+        } else {
+            ("x1", "x2", "x3")
+        };
+        let (src, addend) = match imm {
+            Some((value, negative)) => (materialize(self, x, x1), Addend::Imm { value, negative }),
+            None => {
+                // Accumulator-resident operands are captured first
+                // (BUG-2026-09-09).
+                let staged = self.stage_operands_acc_first(&[(x, x1), (acc, x3)], &mut materialize);
+                (staged[0].clone(), Addend::Reg(staged[1].clone()))
+            }
+        };
+        let dest_phys = self.dest_reg(dest).filter(|r| !is_arm_fp_phys(*r));
+        let d = dest_phys.map_or_else(
+            || (if use_32bit { "w0" } else { "x0" }).to_string(),
+            |reg| name(reg).to_string(),
+        );
+        // The product goes to `d` unless `d` is the register addend, which
+        // the second instruction still has to read.
+        let t = match &addend {
+            Addend::Reg(a) if *a == d => x2.to_string(),
+            _ => d.clone(),
+        };
+        let (first, k) = match plan {
+            MulPlan::AddShifted { k, .. } => ("add", k),
+            MulPlan::SubShifted { k, .. } | MulPlan::ShiftedMinus { k } => ("sub", k),
+        };
+        self.state
+            .emit_fmt(format_args!("    {first} {t}, {src}, {src}, lsl #{k}"));
+        match addend {
+            Addend::Imm { value: 0, .. } => {}
+            Addend::Imm { value, negative } => {
+                let op = if negative { "sub" } else { "add" };
+                self.state
+                    .emit_fmt(format_args!("    {op} {d}, {t}, #{value}"));
+            }
+            Addend::Reg(a) => match plan {
+                // t = (2^k + 1)x or (1 - 2^k)x; the plan's `<< m` rides on
+                // the add's shifted operand.
+                MulPlan::AddShifted { m, .. } | MulPlan::SubShifted { m, .. } => {
+                    if m == 0 {
+                        self.state.emit_fmt(format_args!("    add {d}, {a}, {t}"));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    add {d}, {a}, {t}, lsl #{m}"));
+                    }
+                }
+                // t = -(2^k - 1)x, so a + c*x = a - t.
+                MulPlan::ShiftedMinus { .. } => {
+                    self.state.emit_fmt(format_args!("    sub {d}, {a}, {t}"));
+                }
+            },
+        }
+        if dest_phys.is_some() {
+            self.state.reg_cache.invalidate_acc();
+        } else {
+            self.store_x0_to(dest);
+        }
+        true
     }
 
     pub(super) fn emit_int_fused_mul_add_impl(
@@ -193,12 +415,17 @@ impl ArmCodegen {
         dest: &Value,
         ty: IrType,
     ) {
+        if self.emit_fused_mul_by_const_plan(lhs, rhs, acc, dest, ty, false) {
+            return;
+        }
         let use_32bit = matches!(
             ty,
             IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
         );
         let mut materialize = |this: &mut Self, op: &Operand, scratch: &'static str| -> String {
-            if let Some(reg) = this.operand_reg(op) {
+            // FP-homed integer values stage through the scratch GPR, as in
+            // `emit_int_fused_mul_sub_impl` (session-29 ICE class).
+            if let Some(reg) = this.operand_reg(op).filter(|r| !is_arm_fp_phys(*r)) {
                 if use_32bit {
                     callee_saved_name_32(reg).to_string()
                 } else {
@@ -268,6 +495,9 @@ impl ArmCodegen {
         dest: &Value,
         ty: IrType,
     ) {
+        if self.emit_fused_mul_by_const_plan(lhs, rhs, acc, dest, ty, true) {
+            return;
+        }
         let use_32bit = matches!(
             ty,
             IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
@@ -564,19 +794,7 @@ impl ArmCodegen {
             return false;
         }
         let use_32bit = ty == IrType::I32 || ty == IrType::U32;
-        // The constant, sign-extended: the product is taken modulo the
-        // register width, so only the constant's value modulo 2^width
-        // matters and a narrow negative constant keeps its short plan.
-        fn int_const(op: &Operand) -> Option<u64> {
-            match op {
-                Operand::Const(IrConst::I8(v)) => Some(i64::from(*v) as u64),
-                Operand::Const(IrConst::I16(v)) => Some(i64::from(*v) as u64),
-                Operand::Const(IrConst::I32(v)) => Some(i64::from(*v) as u64),
-                Operand::Const(IrConst::I64(v)) => Some(*v as u64),
-                _ => None,
-            }
-        }
-        let (x, c) = match (int_const(lhs), int_const(rhs)) {
+        let (x, c) = match (int_const_bits(lhs), int_const_bits(rhs)) {
             (_, Some(c)) => (lhs, c),
             (Some(c), None) => (rhs, c),
             (None, None) => return false,
@@ -1693,5 +1911,302 @@ mod mul_strength_tests {
         // No plan: the multiplier stays.
         let out = emit(x, Operand::Const(IrConst::I64(11)), IrType::I64, &homes);
         assert!(out.iter().any(|l| l.starts_with("mul ")), "{out:?}");
+    }
+
+    /// Execute the register-only A64 shapes the multiply paths emit
+    /// (`add`/`sub` with an optional `lsl`, immediate `add`/`sub`, `neg`,
+    /// `lsl`, register `mov`, `madd`/`msub`) with W-view semantics: a W read
+    /// sees bits 31:0, a W write zeroes bits 63:32.
+    fn exec(lines: &[String], regs: &mut [u64; 32]) {
+        fn reg(tok: &str) -> (usize, bool) {
+            let tok = tok.trim();
+            let w = tok.starts_with('w');
+            let n = tok[1..]
+                .parse::<usize>()
+                .unwrap_or_else(|_| panic!("register {tok:?}"));
+            (n, w)
+        }
+        fn imm(tok: &str) -> u64 {
+            let t = tok.trim().trim_start_matches('#');
+            match t.strip_prefix("0x") {
+                Some(h) => u64::from_str_radix(h, 16).unwrap_or_else(|_| panic!("imm {tok:?}")),
+                None => t.parse::<i64>().unwrap_or_else(|_| panic!("imm {tok:?}")) as u64,
+            }
+        }
+        for line in lines {
+            let (mnem, rest) = line.split_once(' ').unwrap_or((line.as_str(), ""));
+            let ops: Vec<&str> = rest.split(',').map(str::trim).collect();
+            let (d, w) = reg(ops[0]);
+            let mask = if w { u64::from(u32::MAX) } else { u64::MAX };
+            let read = |regs: &[u64; 32], tok: &str| regs[reg(tok).0] & mask;
+            let shifted = |regs: &[u64; 32], ops: &[&str], at: usize| {
+                let v = read(regs, ops[at]);
+                match ops.get(at + 1) {
+                    Some(sh) => {
+                        let amount = imm(sh.trim_start_matches("lsl").trim());
+                        (v << amount) & mask
+                    }
+                    None => v,
+                }
+            };
+            let value = match mnem {
+                "add" | "sub" => {
+                    let n = read(regs, ops[1]);
+                    let m = if ops[2].starts_with('#') {
+                        imm(ops[2]) & mask
+                    } else {
+                        shifted(regs, &ops, 2)
+                    };
+                    if mnem == "add" {
+                        n.wrapping_add(m)
+                    } else {
+                        n.wrapping_sub(m)
+                    }
+                }
+                "neg" => read(regs, ops[1]).wrapping_neg(),
+                "lsl" => read(regs, ops[1]) << imm(ops[2]),
+                "mov" => read(regs, ops[1]),
+                "madd" | "msub" => {
+                    let p = read(regs, ops[1]).wrapping_mul(read(regs, ops[2]));
+                    let a = read(regs, ops[3]);
+                    if mnem == "madd" {
+                        a.wrapping_add(p)
+                    } else {
+                        a.wrapping_sub(p)
+                    }
+                }
+                _ => panic!("unexpected line {line:?}"),
+            };
+            regs[d] = value & mask;
+        }
+    }
+
+    fn emit_fused(
+        x: Operand,
+        c: Operand,
+        acc: Operand,
+        ty: IrType,
+        subtract: bool,
+        homes: &[(u32, u8)],
+    ) -> Vec<String> {
+        let mut cg = ArmCodegen::new();
+        for &(id, phys) in homes {
+            cg.reg_assignments.insert(id, PhysReg(phys));
+        }
+        if subtract {
+            cg.emit_int_fused_mul_sub_impl(&x, &c, &acc, &Value(3), ty);
+        } else {
+            cg.emit_int_fused_mul_add_impl(&x, &c, &acc, &Value(3), ty);
+        }
+        cg.state
+            .out
+            .buf
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    /// `a ± x*c` with a planned constant is two shifted-register
+    /// instructions -- executed and compared with the exact product for
+    /// every constant in -1100..=1100 (and the plan families up to bit 62),
+    /// both widths, both signs, register and immediate addends, and every
+    /// placement of the destination (separate, on `x`, on the addend).
+    #[test]
+    fn fused_multiply_by_planned_constant_is_exact_in_two_instructions() {
+        let xs = [
+            0u64,
+            1,
+            3,
+            0x7fff_ffff,
+            0x8000_0001,
+            0xffff_ffff,
+            0x1234_5678_9abc_def1,
+            u64::MAX,
+        ];
+        let a_vals = [0u64, 5, 0x8000_0000, u64::MAX - 6];
+        let mut planned = 0usize;
+        for (ty, width) in [(IrType::I32, 32u32), (IrType::I64, 64)] {
+            let mask = if width == 32 {
+                u64::from(u32::MAX)
+            } else {
+                u64::MAX
+            };
+            let mut constants: Vec<i64> = (-1100..=1100).collect();
+            for k in 1..(width.min(62)) {
+                constants.push((1i64 << k) + 1);
+                constants.push((1i64 << k) - 1);
+                constants.push(1 - (1i64 << k));
+            }
+            for c in constants {
+                let c_op = if width == 32 {
+                    Operand::Const(IrConst::I32(c as i32))
+                } else {
+                    Operand::Const(IrConst::I64(c))
+                };
+                for subtract in [false, true] {
+                    // x in x20, a in x22; dest separate, on x, on a.
+                    for dest_home in [21u8, 20, 22] {
+                        let homes = [(1, 20), (2, 22), (3, dest_home)];
+                        let out = emit_fused(
+                            Operand::Value(Value(1)),
+                            c_op,
+                            Operand::Value(Value(2)),
+                            ty,
+                            subtract,
+                            &homes,
+                        );
+                        let fused = out
+                            .iter()
+                            .any(|l| l.starts_with("madd ") || l.starts_with("msub "));
+                        let signed_c = if subtract { c.wrapping_neg() } else { c } as u64;
+                        let expect_plan = mul_shift_add_plan(signed_c, width).is_some();
+                        assert_eq!(!fused, expect_plan, "c={c} sub={subtract} {out:?}");
+                        if fused {
+                            continue;
+                        }
+                        planned += 1;
+                        assert!(out.len() <= 2, "c={c} sub={subtract} {out:?}");
+                        for &x in &xs {
+                            for &a in &a_vals {
+                                let mut regs = [0u64; 32];
+                                regs[20] = x & mask;
+                                regs[22] = a & mask;
+                                let product = (x & mask).wrapping_mul(c as u64);
+                                let want = if subtract {
+                                    (a & mask).wrapping_sub(product)
+                                } else {
+                                    (a & mask).wrapping_add(product)
+                                } & mask;
+                                let mut run = regs;
+                                exec(&out, &mut run);
+                                assert_eq!(
+                                    run[usize::from(dest_home)],
+                                    want,
+                                    "c={c} sub={subtract} x={x:#x} a={a:#x} {out:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 2769 fused cases today (about 230 constants per width and
+        // direction, each tried with three destination homes): a floor well
+        // above zero catches a plan table that silently stopped planning.
+        assert!(planned > 2000, "plans unexpectedly sparse: {planned}");
+    }
+
+    #[test]
+    fn fused_multiply_by_constant_shapes() {
+        let x = Operand::Value(Value(1));
+        let a = Operand::Value(Value(2));
+        let homes = [(1, 20), (2, 22), (3, 21)];
+        let i64c = |c: i64| Operand::Const(IrConst::I64(c));
+        let i32c = |c: i32| Operand::Const(IrConst::I32(c));
+        let out = emit_fused(x, i64c(3), a, IrType::I64, false, &homes);
+        assert_eq!(out, ["add x21, x20, x20, lsl #1", "add x21, x22, x21"]);
+        let out = emit_fused(x, i64c(6), a, IrType::I64, false, &homes);
+        assert_eq!(
+            out,
+            ["add x21, x20, x20, lsl #1", "add x21, x22, x21, lsl #1"]
+        );
+        let out = emit_fused(x, i32c(7), a, IrType::I32, false, &homes);
+        assert_eq!(out, ["sub w21, w20, w20, lsl #3", "sub w21, w22, w21"]);
+        // a - x*3 = a + x*(-3).
+        let out = emit_fused(x, i64c(3), a, IrType::I64, true, &homes);
+        assert_eq!(out, ["sub x21, x20, x20, lsl #2", "add x21, x22, x21"]);
+        // The constant on the left is the same product.
+        let out = emit_fused(i32c(5), x, a, IrType::I32, false, &homes);
+        assert_eq!(out, ["add w21, w20, w20, lsl #2", "add w21, w22, w21"]);
+        // The destination is the addend: the product goes to the scratch.
+        let out = emit_fused(
+            x,
+            i64c(9),
+            a,
+            IrType::I64,
+            false,
+            &[(1, 20), (2, 22), (3, 22)],
+        );
+        assert_eq!(out, ["add x2, x20, x20, lsl #3", "add x22, x22, x2"]);
+        // A small constant addend is an immediate; a large one, or a plan
+        // that needs its own second instruction, keeps the multiplier.
+        let out = emit_fused(x, i32c(3), i32c(7), IrType::I32, false, &homes);
+        assert_eq!(out, ["add w21, w20, w20, lsl #1", "add w21, w21, #7"]);
+        let out = emit_fused(x, i32c(3), i32c(-7), IrType::I32, false, &homes);
+        assert_eq!(out, ["add w21, w20, w20, lsl #1", "sub w21, w21, #7"]);
+        for (c, addend) in [(3, 5000), (6, 7), (7, 7)] {
+            let out = emit_fused(x, i64c(c), i64c(addend), IrType::I64, false, &homes);
+            assert!(
+                out.iter().any(|l| l.starts_with("madd ")),
+                "c={c} a={addend} {out:?}"
+            );
+        }
+        // An FP-homed result is produced in x0 and moved with `fmov`.
+        let out = emit_fused(
+            x,
+            i64c(3),
+            a,
+            IrType::I64,
+            false,
+            &[(1, 20), (2, 22), (3, 40)],
+        );
+        assert_eq!(
+            out,
+            [
+                "add x0, x20, x20, lsl #1",
+                "add x0, x22, x0",
+                "fmov d16, x0"
+            ]
+        );
+        // No plan (11): `madd` with the constant materialized.
+        let out = emit_fused(x, i64c(11), a, IrType::I64, false, &homes);
+        assert!(
+            out.iter().any(|l| l.starts_with("madd x21, x20, x2, x22")),
+            "{out:?}"
+        );
+    }
+
+    /// The loop hoist's question -- does `x * c` need a register for `c`? --
+    /// is answered "no" exactly for the one-instruction plans, in every view
+    /// the type's multiplies use, and the emitted multiply agrees: no `mov`,
+    /// no `mul`, one shifted `add`/`sub`.
+    #[test]
+    fn constant_free_multipliers_are_the_one_instruction_plans() {
+        for (c, ty, free) in [
+            (3i64, IrType::I32, true),
+            (9, IrType::U32, true),
+            (33, IrType::I64, true),
+            (-3, IrType::I64, true),
+            (-15, IrType::U32, true),
+            (0x8000_0001, IrType::U32, true),
+            (0x8000_0001, IrType::I64, true),
+            (-3, IrType::I16, true),
+            // Two-instruction plans keep the register `madd` reads.
+            (6, IrType::I64, false),
+            (7, IrType::I32, false),
+            (31, IrType::U32, false),
+            // No plan, or no plan in the 64-bit view.
+            (1000, IrType::I64, false),
+            (0xffff_fffd, IrType::I64, false),
+            (5, IrType::F64, false),
+        ] {
+            assert_eq!(mul_needs_no_constant(c as u64, ty), free, "{c} {ty:?}");
+            if !free || !matches!(ty, IrType::I32 | IrType::U32 | IrType::I64) {
+                continue;
+            }
+            let homes = [(1u32, 20u8), (3, 21)];
+            let out = emit(
+                Operand::Value(Value(1)),
+                Operand::Const(IrConst::I64(c)),
+                ty,
+                &homes,
+            );
+            assert_eq!(out.len(), 1, "x * {c} ({ty:?}): {out:?}");
+            assert!(
+                out[0].starts_with("add ") || out[0].starts_with("sub "),
+                "x * {c} ({ty:?}): {out:?}"
+            );
+        }
     }
 }
