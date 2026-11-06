@@ -18,20 +18,27 @@ tool is a research witness, not a CI gate (the pinned oracles are only
 installed in the Debian lanes), so it never makes a hosted lane depend on a
 local cache path.
 
-Usage: python3 engineering/oracle_shifted_layout.py [out.json]
+Usage: python3 engineering/oracle_shifted_layout.py [out.json] \
+    [--old <fastbuild-dir-or-binary>] [--new <fastbuild-dir-or-binary>]
+
+The two LCCC legs are explicit (or LCCC_AB_OLD / LCCC_AB_NEW) and fail closed:
+a stale baseline path is never silently substituted for the one measured.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import pathlib
 import subprocess
 import sys
 import tempfile
 
+from compiler_legs import add_leg_arguments, resolve
+
 CACHE = pathlib.Path("/home/user/.cache/lccc/agent-toolchains/bin")
 COMPILERS = {
-    "lccc_old": "/home/user/lccc/target/fastbuild-baseline2/fastbuild/lccc",
-    "lccc_new": "/home/user/lccc/target/fastbuild/lccc",
+    "lccc_old": "",   # bound in main() from --old, fail-closed
+    "lccc_new": "",   # bound in main() from --new, fail-closed
     "gcc": str(CACHE / "gcc-16"),
     "clang": str(CACHE / "clang-23"),
 }
@@ -58,12 +65,22 @@ def shifted_source(prefix: bool) -> bytes:
 
 
 def main() -> int:
-    missing = [k for k, v in COMPILERS.items() if not pathlib.Path(v).exists()]
+    ap = argparse.ArgumentParser(description="four-way shifted-layout oracle")
+    add_leg_arguments(ap)
+    ap.add_argument("out", nargs="?", type=pathlib.Path,
+                    default=pathlib.Path("/home/user/artifacts/shifted_layout_oracle.json"))
+    ap.add_argument("--out", dest="out_opt", type=pathlib.Path, default=None)
+    a = ap.parse_args()
+    COMPILERS["lccc_old"], COMPILERS["lccc_new"] = resolve(a.old, a.new)
+    missing = [k for k, v in COMPILERS.items()
+               if not v or not pathlib.Path(v).exists()]
     if missing:
         print(f"MISSING: {missing}; restore the pinned toolchain cache",
               file=sys.stderr)
         return 2
-    out = {"expected": EXPECTED, "params": PARAMS, "rows": []}
+    out = {"expected": EXPECTED, "params": PARAMS,
+           "legs": {k: COMPILERS[k] for k in ("lccc_old", "lccc_new")},
+           "rows": []}
     with tempfile.TemporaryDirectory(prefix="lccc-shifted-oracle-") as td:
         d = pathlib.Path(td)
         for label, prefix in (("aligned", False), ("shifted", True)):
@@ -92,9 +109,8 @@ def main() -> int:
                       f"  -> {'PASS' if ok else 'FAIL'}", flush=True)
                 if not ok:
                     return 1
-    path = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else
-                        "/home/user/artifacts/shifted_layout_oracle.json")
-    path.parent.mkdir(exist_ok=True)
+    path = a.out_opt or a.out
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(out, indent=2) + "\n")
     print(f"SHIFTED_LAYOUT_ORACLE_OK ({len(out['rows'])} cases) -> {path}")
     return 0

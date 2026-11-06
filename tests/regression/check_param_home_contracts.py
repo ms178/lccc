@@ -27,8 +27,24 @@ Checks (every one is non-vacuous; `--self-test` proves each can FAIL):
      a reader that exits early must still exit 1 (a clean verdict), not 101
      (Rust `eprintln!` panicking on BrokenPipe).
   8. Structural guard: no `eprintln!`/`eprint!`/`println!`/`print!` remains
-     in shipped sources; all such text goes through `lccc::cli_output`, whose
+     in shipped sources; all such text goes through `lccc::cli`, whose
      four helpers ignore write errors and are byte-identical on success.
+  9. Latest-main interaction: `-g` must NOT change code for the SHIFTED
+     parameter-home layout on all four ISAs at -O0/-O2.  DWARF delivery and
+     mem2reg must agree on which allocas are parameter homes.  The debug-row
+     filter has a non-vacuous one-byte-instruction mutation self-test.
+ 10. Latest-main interaction: the round-cap exit-coverage gate uses a
+     line-count-independent report/exit bijection (a fixed 9-line lookback
+     produced a false red CI lane after the CLI rewrite), plus six built-in
+     mutations and a combined `CCC_TIME_PASSES` + `CCC_DUMP_IR_AFTER` witness.
+ 11. Reproducibility: no differential tool may name a stale baseline leg;
+     classifier/oracle/bench fail closed and the classifier self-test passes.
+ 12. `scripts/audit_census.py --check` holds every ratchet (including
+     `fns_over_500`): the exact check that turned hosted CI red when the long
+     `lccc::cli_output::` spelling wrapped a 498-line function past 500.  The
+     flat adjacency chain's O(1) heap-object invariant is pinned both by the
+     structural guard in check 6 and by `ParamHomeStats::allocations` unit
+     tests (1 allocation aligned, 3 general, independent of `params`).
 
 Usage:
   python3 tests/regression/check_param_home_contracts.py
@@ -37,6 +53,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import re
 import struct
@@ -451,6 +468,157 @@ def check_cli_text_is_best_effort() -> None:
           "no panicking print macros remain: PASS")
 
 
+# ---------------------------------------------------------------------------
+# Checks 9-12: cross-feature integration.  Latest main added DWARF delivery,
+# an option ledger and a round-cap observability gate in the very files this
+# patchset changes.  A merge can be conflict-free and still break an
+# invariant, so these pin the interactions rather than trusting `git merge`.
+# ---------------------------------------------------------------------------
+DEBUG_SECTION = re.compile(r"^\s*\.section\s+\.debug_")
+ANY_SECTION = re.compile(r"^\s*\.section\s+")
+DEBUG_ROW = re.compile(r"^\s*\.(?:loc|file)(?:\s|$)")
+DEBUG_ALIAS = re.compile(r"^\s*\.set\s+\.Llccc_debug_alias_")
+
+
+def strip_debug_rows(lines: list[str]) -> list[str]:
+    """Remove only debug metadata; keep every instruction, CFI row and label.
+
+    Mirrors `check_debug_info_invariance.sh`'s awk filter so the two gates
+    agree on what counts as code.  A `.debug_*` section is skipped until the
+    next non-debug section directive.
+    """
+    out: list[str] = []
+    in_debug = False
+    for line in lines:
+        if DEBUG_ROW.match(line) or DEBUG_ALIAS.match(line):
+            continue
+        if DEBUG_SECTION.match(line):
+            in_debug = True
+            continue
+        if in_debug:
+            if ANY_SECTION.match(line) and not DEBUG_SECTION.match(line):
+                in_debug = False
+            else:
+                continue
+        out.append(line)
+    return out
+
+
+def check_debug_info_invariance_on_shifted_layout(work: pathlib.Path) -> None:
+    """-g must not change code for the shifted parameter-home layout.
+
+    The mem2reg fix decides which entry-block allocas are parameter homes;
+    DWARF delivery describes those same homes.  If either side looked at a
+    different alloca set, -g would change instructions or lose a parameter
+    DIE.  All four ISAs are checked at -O0 and -O2.
+    """
+    src = with_temp(work, "shift-dwarf.c", SHIFTED_GUARD + shifted_source(True))
+    for isa, (driver, _machine, _cls) in DRIVERS.items():
+        for opt in ("-O0", "-O2"):
+            plain = work / f"dw-{isa}-{opt[1:]}-plain.s"
+            debug = work / f"dw-{isa}-{opt[1:]}-debug.s"
+            r = run([str(driver), "-w", opt, "-S", str(src), "-o", str(plain)])
+            require(r.returncode == 0,
+                    f"{isa} {opt} -S: {r.stderr.decode('utf-8', 'replace')[-200:]}")
+            r = run([str(driver), "-w", opt, "-g", "-S", str(src), "-o", str(debug)])
+            require(r.returncode == 0,
+                    f"{isa} {opt} -g -S: {r.stderr.decode('utf-8', 'replace')[-200:]}")
+            a = strip_debug_rows(plain.read_text(errors="replace").splitlines())
+            b = strip_debug_rows(debug.read_text(errors="replace").splitlines())
+            require(a == b,
+                    f"{isa} {opt}: -g changed {len(a)}/{len(b)} code rows for the "
+                    "shifted layout -- DWARF and mem2reg disagree on homes")
+            require(any("debug_" in line for line in
+                        debug.read_text(errors="replace").splitlines()),
+                    f"{isa} {opt}: -g emitted no debug section; the check "
+                    "would be vacuous")
+    print("  [9] -g does not change code for the shifted parameter-home layout "
+          "on x86-64/i686/AArch64/RISC-V at -O0/-O2: PASS")
+
+
+def check_round_cap_exit_coverage(work: pathlib.Path) -> None:
+    """The CLI rewrite must not hide the round_cap::report() invariant.
+
+    Hosted CI caught exactly this: a four-line formatting change in the -O1 IR
+    dump moved a dominating report() outside a fixed 9-line lookback window,
+    producing a false red lane.  The repaired gate uses a line-count-
+    independent region bijection with six built-in mutation self-tests.
+    """
+    gate = ROOT / "tests/regression/check_round_cap_observability.sh"
+    text = gate.read_text(encoding="utf-8")
+    require("len(reports) != len(returns) + 1" in text,
+            "the gate lost its line-count-independent report/exit bijection")
+    require("lines[max(0, n - 9):n]" not in text,
+            "the brittle fixed lookback window returned")
+    env = dict(os.environ)
+    env.update({k: str(v) for k, v in (
+        ("CCC", DRIVERS["x86_64"][0]),
+        ("CCC_I686", DRIVERS["i686"][0]),
+        ("CCC_ARM", DRIVERS["aarch64"][0]),
+        ("CCC_RISCV", DRIVERS["riscv64"][0]))})
+    r = subprocess.run(["bash", str(gate)], cwd=ROOT, env=env,
+                       capture_output=True, timeout=300)
+    require(r.returncode == 0,
+            f"round-cap gate failed: {(r.stdout + r.stderr).decode('utf-8', 'replace')[-400:]}")
+    require(b"exit-coverage self-test:" in r.stdout,
+            "the gate did not run its mutation self-test")
+    # Both opt-in dumps together: the report must still be observable even
+    # when a 33k-line IR dump is written to the same stderr stream.
+    env2 = dict(env, CCC_TIME_PASSES="1", CCC_DUMP_IR_AFTER="1")
+    r = subprocess.run([str(DRIVERS["x86_64"][0]), "-O2", "-c",
+                        str(ROOT / "tests/regression/cross_pr_redteam.c"),
+                        "-o", str(work / "roundcap-both.o")],
+                       cwd=ROOT, env=env2, capture_output=True, timeout=120)
+    require(r.returncode == 0, "combined time-passes + IR-dump compile failed")
+    require(b"round_cap backedge_pre:" in r.stderr,
+            "the cap report disappeared behind the IR dump")
+    print("  [10] round-cap exit coverage: bijection gate + 6 mutation "
+          "self-tests + combined dump witness: PASS")
+
+
+def check_research_tool_reproducibility() -> None:
+    """No differential tool may silently measure a stale baseline leg."""
+    stale: list[str] = []
+    for folder in ("scripts", "engineering"):
+        for p in (ROOT / folder).rglob("*.py"):
+            if "fastbuild-baseline2" in p.read_text(encoding="utf-8",
+                                                    errors="replace"):
+                stale.append(str(p.relative_to(ROOT)))
+    require(not stale, "hardcoded stale baseline leg: " + ", ".join(stale[:5]))
+    classifier = ROOT / "scripts/ab_classify_divergences.py"
+    helpers = ROOT / "engineering/compiler_legs.py"
+    require(helpers.is_file(), "engineering/compiler_legs.py is missing")
+    r = run([sys.executable, str(classifier), "--self-test"], timeout=60)
+    require(r.returncode == 0, "divergence classifier self-test failed")
+    bogus = str(ROOT / "target/does-not-exist")
+    # The leg check runs before the report is read, so a nonexistent report
+    # path is intentional: the only thing under test is fail-closed legs.
+    r = run([sys.executable, str(classifier),
+             "/tmp/nonexistent-ab-report.json", "/tmp/unused.json",
+             "--old", bogus, "--new", str(FB)], timeout=60)
+    require(r.returncode != 0, "classifier accepted a missing baseline leg")
+    for tool in ("engineering/oracle_shifted_layout.py",
+                 "engineering/bench_host_cpu.py"):
+        r = run([sys.executable, str(ROOT / tool),
+                 "--old", bogus, "--new", str(FB),
+                 "--out", "/tmp/unused.json"], timeout=60)
+        require(r.returncode != 0, f"{tool} accepted a missing baseline leg")
+    print("  [11] research tools name their legs explicitly, fail closed, and "
+          "the classifier self-test passes: PASS")
+
+
+def check_audit_census_ratchet() -> None:
+    """The exact hosted-CI ratchet must hold on this tree, not just upstream."""
+    r = run([sys.executable, str(ROOT / "scripts/audit_census.py"), "--check"],
+            timeout=300)
+    require(r.returncode == 0,
+            "audit census grew: " +
+            (r.stdout + r.stderr).decode("utf-8", "replace")[-400:])
+    require(b"PASS: audit census held" in r.stdout,
+            "audit census did not report a held ratchet")
+    print("  [12] audit census ratchet held (no metric grew): PASS")
+
+
 def structural_failures(production: bytes, prologues: dict[str, bytes]) -> list[str]:
     """Pure predicate behind the structural gate, so the self-test can prove
     every rule can reject a bad tree without mocking the filesystem."""
@@ -463,6 +631,14 @@ def structural_failures(production: bytes, prologues: dict[str, bytes]) -> list[
         bad.append("a per-instruction find_map scan reappeared in production code")
     if b"fn find_param_alloca(" in production:
         bad.append("the old per-query lookup reappeared")
+    # The general path must stay O(1) in heap objects, not just in instruction
+    # examinations.  These three rules pin the flat adjacency chain.
+    if b"pub allocations: usize" not in production:
+        bad.append("the portable allocation witness is gone")
+    if b"FxHashMap<Value, Vec<usize>>" in production:
+        bad.append("one Vec per distinct home id returned (O(params) allocations)")
+    if b"let mut next: Vec<usize>" not in production:
+        bad.append("the flat adjacency chain is gone")
     for arch in ("arm", "i686", "riscv", "x86"):
         if b"ParamAllocaIndex::build(func)" not in prologues.get(arch, b""):
             bad.append(f"{arch} prologue does not build the index")
@@ -559,7 +735,37 @@ def self_test() -> None:
     # A whole-tree guard must reject a synthetic regression, not just text.
     rejects(lambda: require(not cli_text_macro_hits("eprintln!(\"oops\");"),
                             "synthetic reintroduction"))
-    require(cases == 18, f"self-test covered {cases}/18 rejection paths")
+    # The O(1)-allocation invariant must be able to reject each way the flat
+    # adjacency chain could regress; otherwise the witness is decoration.
+    rejects(lambda: require(not structural_failures(
+        good_prod.replace(b"pub allocations: usize", b"pub gone: usize"),
+        good_prologues), "allocation witness deleted"))
+    rejects(lambda: require(not structural_failures(
+        good_prod + b"\nlet x: FxHashMap<Value, Vec<usize>>;\n",
+        good_prologues), "per-home Vec allocation returned"))
+    rejects(lambda: require(not structural_failures(
+        good_prod.replace(b"let mut next: Vec<usize>",
+                          b"let mut next: Vec<u8>"), good_prologues),
+        "flat adjacency chain deleted"))
+    # Debug-row filter: accept identical code with metadata added, but reject
+    # a one-byte instruction change hidden under the same metadata.
+    note = '\t.section\t.note.GNU-stack,"",@progbits'
+    plain = ["\t.text", "foo:", "\tadd\ta0, a0, 1", "\tret", note]
+    debug = ["\t.file\t1 \"x.c\"", "\t.text", "foo:", "\t.loc 1 1 0",
+             "\tadd\ta0, a0, 1", "\tret",
+             "\t.set .Llccc_debug_alias_1,.text+0",
+             '\t.section .debug_info,"",@progbits', "\t.byte 1,2,3", note]
+    require(strip_debug_rows(plain) == strip_debug_rows(debug),
+            "debug filter erased real code")
+    rejects(lambda: require(strip_debug_rows(debug) ==
+                            strip_debug_rows([l.replace("add", "sub")
+                                             for l in debug]),
+                            "one-byte instruction change"))
+    # The stale-leg detector must reject a hardcoded baseline path.
+    rejects(lambda: require("fastbuild-baseline2" not in
+                            "p='/home/user/lccc/target/fastbuild-baseline2/fastbuild'",
+                            "stale baseline string"))
+    require(cases == 23, f"self-test covered {cases}/23 rejection paths")
     print(f"SELF_TEST_OK ({cases} rejection paths proven non-vacuous)")
 
 
@@ -582,6 +788,10 @@ def main(argv: list[str] | None = None) -> int:
             check_no_scan_fallback(work)
             check_diagnostic_pipe_safety(work)
             check_cli_text_is_best_effort()
+            check_debug_info_invariance_on_shifted_layout(work)
+            check_round_cap_exit_coverage(work)
+            check_research_tool_reproducibility()
+            check_audit_census_ratchet()
     except Failure as exc:
         print(f"PARAM_HOME_CONTRACTS_FAIL: {exc}", file=sys.stderr)
         return 1

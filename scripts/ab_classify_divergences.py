@@ -185,8 +185,8 @@ def main() -> int:
     ap.add_argument("--new", type=pathlib.Path,
                     default=pathlib.Path(os.environ.get("LCCC_AB_NEW", DEFAULT_NEW)))
     ap.add_argument("--repeats", type=int, default=REPEATS)
-    a = ap.parse_args()
-    OLD, NEW, REPEATS = a.old, a.new, a.repeats
+    args = ap.parse_args()
+    OLD, NEW, REPEATS = args.old, args.new, args.repeats
     for leg, path in (("old", OLD), ("new", NEW)):
         if not path.is_dir() or not (path / "lccc").is_file():
             print(f"error: {leg} leg {path} is not a built fastbuild directory",
@@ -196,7 +196,7 @@ def main() -> int:
         print("error: --repeats must be >= 1", file=sys.stderr)
         return 2
 
-    report = json.loads(pathlib.Path(a.report).read_text())
+    report = json.loads(pathlib.Path(args.report).read_text())
     divs = [d for d in report["divergences"]
             if d["status"] in ("divergent", "rc-divergent", "diagnostic-divergent")]
     # Assembly diffs only make sense for pairs that both compiled successfully.
@@ -257,7 +257,7 @@ def main() -> int:
         "summary": dict(summary),
         "rows": rows,
     }
-    pathlib.Path(a.out).write_text(json.dumps(payload, indent=2) + "\n")
+    pathlib.Path(args.out).write_text(json.dumps(payload, indent=2) + "\n")
     print(json.dumps({"pairs": len(rows),
                       "changed_lines": sum(r["changed"] for r in rows),
                       "summary": dict(summary)}, indent=2))
