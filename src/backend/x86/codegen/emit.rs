@@ -9780,6 +9780,12 @@ impl ArchCodegen for X86Codegen {
         "ud2"
     }
 
+    fn debug_parameter_home(&self, slot: crate::backend::state::StackSlot) -> Option<(u8, i64)> {
+        // rbp is DWARF register 6.  FPO homes move with rsp and need
+        // CFA-relative location lists instead.
+        (!self.state.omit_frame_pointer).then_some((6, slot.0))
+    }
+
     fn note_function_emitted(&mut self, func: &IrFunction, mark: usize) {
         if !self.ipa.enabled() {
             return;

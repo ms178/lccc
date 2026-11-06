@@ -69,7 +69,7 @@ from check_c_std_diagnostics import (  # noqa: E402
     _uleb,
 )
 
-GATE_DATE = "2026-11-05"
+GATE_DATE = "2026-11-06"
 
 # --- DWARF tags and attributes used below ------------------------------------
 DW_TAG_ARRAY_TYPE = 0x01
@@ -138,7 +138,11 @@ DW_FORM_ADDR = 0x01
 #: Reference forms that are relative to the start of the unit's header, and the
 #: one form that is relative to `.debug_info`.
 DW_FORM_UNIT_REFS = (0x11, 0x12, 0x13, 0x14)  # ref1, ref2, ref4, ref8
-DW_FORM_REF_ADDR = 0x17
+DW_FORM_REF_ADDR = 0x10
+DW_FORM_REF_UDATA = 0x15
+DW_FORM_SEC_OFFSET = 0x17
+DW_FORM_EXPRLOC = 0x18
+DW_FORM_DATA4 = 0x06
 
 #: `.symtab` symbol types and bindings this gate reads.
 STT_FUNC = 2
@@ -153,6 +157,11 @@ KNOWN_GAPS: dict[str, str] = {
     "inlining": (
         "no DW_TAG_inlined_subroutine: an optimized frame shows the caller with "
         "the callee's line, so a debugger cannot report the inline stack (D6)"
+    ),
+    "optimized_parameter_locations": (
+        "an optimized parameter DIE states its name and type but not where the "
+        "value lives; entry-value/register tracking across optimized code is still "
+        "open (D1b). O0 x86/i686 homes are a hard gate, not this gap"
     ),
 }
 
@@ -411,12 +420,14 @@ def origin_chain(die: Die, unit: "Unit") -> list[Die]:
     seen = {die.offset}
     current = die
     while True:
-        reference = current.attrs.get(DW_AT_ABSTRACT_ORIGIN)
+        attribute = DW_AT_ABSTRACT_ORIGIN
+        reference = current.attrs.get(attribute)
         if reference is None:
-            reference = current.attrs.get(DW_AT_SPECIFICATION)
+            attribute = DW_AT_SPECIFICATION
+            reference = current.attrs.get(attribute)
         if not isinstance(reference, int):
             return chain
-        target = _die_offset(current, reference, unit)
+        target = _die_offset(current, reference, unit, attribute)
         if target is None or target in seen:
             return chain
         following = unit.die_at(target)
@@ -449,14 +460,20 @@ def die_name(die: Die, unit: "Unit") -> str:
     return name if isinstance(name, str) else ""
 
 
-def _die_offset(die: Die, reference: int, unit: "Unit") -> int | None:
-    """Turn a reference attribute into an offset inside `.debug_info`."""
-    form = die.forms.get(DW_AT_ABSTRACT_ORIGIN)
-    if DW_AT_SPECIFICATION in die.forms and die.forms.get(DW_AT_SPECIFICATION) == DW_FORM_REF_ADDR:
-        form = DW_FORM_REF_ADDR
+def _die_offset(
+    die: Die, reference: int, unit: "Unit", attribute: int = DW_AT_ABSTRACT_ORIGIN
+) -> int | None:
+    """Turn a reference attribute into an offset inside `.debug_info`.
+
+    `DW_FORM_ref_addr` (0x10) is already section-relative; the ref1/2/4/8 and
+    ref_udata forms are unit-relative.  0x17 is `DW_FORM_sec_offset`, not a DIE
+    reference -- confusing the two silently resolves an abstract origin to the
+    wrong DIE (or to none) as soon as D6 emits one.
+    """
+    form = die.forms.get(attribute)
     if form == DW_FORM_REF_ADDR:
         return reference
-    if form in DW_FORM_UNIT_REFS:
+    if form in DW_FORM_UNIT_REFS or form == DW_FORM_REF_UDATA:
         return unit.offset + reference
     return None
 
@@ -1004,6 +1021,10 @@ def arange_sets(elf: Elf) -> list[ArangeSet]:
 class RangeList:
     offset: int
     ranges: list[tuple[int, int]]
+    #: True when at least one tuple was spelled as an absolute address
+    #: (`start_length`, or a v2..4 pair before any base-address selection).
+    #: Such tuples must NOT be offset again by the CU's `DW_AT_low_pc`.
+    absolute_entries: bool = False
 
 
 def range_lists(elf: Elf, version: int) -> list[RangeList]:
@@ -1041,6 +1062,7 @@ def range_lists(elf: Elf, version: int) -> list[RangeList]:
                 list_offset = cursor
                 ranges: list[tuple[int, int]] = []
                 base = 0
+                absolute_entries = False
                 while True:
                     if cursor >= end:
                         raise ValueError("range list without DW_RLE_end_of_list")
@@ -1053,6 +1075,7 @@ def range_lists(elf: Elf, version: int) -> list[RangeList]:
                         cursor += address_size
                         length, cursor = _uleb(data, cursor)
                         ranges.append((start, start + length))
+                        absolute_entries = True
                     elif opcode == 0x06:  # DW_RLE_base_address
                         base = int.from_bytes(data[cursor : cursor + address_size], elf.order)
                         cursor += address_size
@@ -1064,7 +1087,8 @@ def range_lists(elf: Elf, version: int) -> list[RangeList]:
                         raise ValueError("indexed range list opcodes are not emitted by lccc")
                     else:
                         raise ValueError(f"unknown range list opcode {opcode:#04x}")
-                out.append(RangeList(offset=list_offset, ranges=ranges))
+                out.append(RangeList(offset=list_offset, ranges=ranges,
+                                     absolute_entries=absolute_entries))
             offset = end
         return out
     data = elf.sections.get(".debug_ranges")
@@ -1078,6 +1102,7 @@ def range_lists(elf: Elf, version: int) -> list[RangeList]:
         list_offset = offset
         ranges: list[tuple[int, int]] = []
         base = 0
+        absolute_entries = False
         while offset + pair <= len(data):
             start = int.from_bytes(data[offset : offset + address_size], elf.order)
             finish = int.from_bytes(data[offset + address_size : offset + pair], elf.order)
@@ -1087,9 +1112,11 @@ def range_lists(elf: Elf, version: int) -> list[RangeList]:
             if start == maximum:
                 base = finish
                 continue
+            absolute_entries |= base == 0
             ranges.append((base + start, base + finish))
         if ranges:
-            out.append(RangeList(offset=list_offset, ranges=ranges))
+            out.append(RangeList(offset=list_offset, ranges=ranges,
+                                 absolute_entries=absolute_entries))
     return out
 
 
@@ -1098,6 +1125,141 @@ def ranges_for(elf: Elf, lists: list[RangeList], offset: int) -> list[tuple[int,
         if candidate.offset == offset:
             return candidate.ranges
     raise ValueError(f"no range list starts at {offset:#x}")
+
+
+# --- location lists -----------------------------------------------------------
+
+
+@dataclass
+class LocationEntry:
+    #: Explicit base-address selection immediately governing this entry, or
+    #: `None` when the consumer must use the containing entity's low_pc.
+    base: int | None
+    start: int
+    end: int
+    expression: bytes
+
+
+@dataclass
+class LocationList:
+    offset: int
+    entries: list[LocationEntry]
+
+    @property
+    def has_explicit_base(self) -> bool:
+        return any(entry.base is not None for entry in self.entries)
+
+    def absolute_ranges(self, default_base: int) -> list[tuple[int, int]]:
+        return [
+            ((entry.base if entry.base is not None else default_base) + entry.start,
+             (entry.base if entry.base is not None else default_base) + entry.end)
+            for entry in self.entries
+        ]
+
+
+def location_lists(elf: Elf, version: int) -> dict[int, LocationList]:
+    """Decode `.debug_loc` (v2..4) / `.debug_loclists` (v5) without readelf.
+
+    Only the entry kinds lccc emits are accepted; an unknown opcode is an error
+    rather than a silent skip, because a location list a consumer cannot walk is
+    exactly the defect this gate exists to catch.
+    """
+    out: dict[int, LocationList] = {}
+    if version >= 5:
+        data = elf.sections.get(".debug_loclists")
+        if data is None:
+            return out
+        offset = 0
+        while offset + 12 <= len(data):
+            start = offset
+            length = int.from_bytes(data[offset:offset + 4], elf.order)
+            offset += 4
+            if length == 0xFFFFFFFF:
+                raise ValueError("64-bit .debug_loclists is not emitted by lccc")
+            end = offset + length
+            if end > len(data):
+                raise ValueError(".debug_loclists unit runs past the section")
+            table_version = int.from_bytes(data[offset:offset + 2], elf.order)
+            if table_version != 5:
+                raise ValueError(f".debug_loclists version {table_version}, expected 5")
+            address_size = data[offset + 2]
+            segment_size = data[offset + 3]
+            if segment_size != 0:
+                raise ValueError("segment selectors are not emitted by lccc")
+            entry_count = int.from_bytes(data[offset + 4:offset + 8], elf.order)
+            cursor = offset + 8 + 4 * entry_count
+            if cursor > end:
+                raise ValueError(".debug_loclists offset table runs past its header")
+            while cursor < end:
+                list_offset = cursor
+                entries: list[LocationEntry] = []
+                base: int | None = None
+                while True:
+                    if cursor >= end:
+                        raise ValueError("location list without DW_LLE_end_of_list")
+                    opcode = data[cursor]
+                    cursor += 1
+                    if opcode == 0x00:  # end_of_list
+                        break
+                    if opcode == 0x06:  # base_address
+                        base = int.from_bytes(data[cursor:cursor + address_size], elf.order)
+                        cursor += address_size
+                    elif opcode == 0x04:  # offset_pair
+                        begin, cursor = _uleb(data, cursor)
+                        finish, cursor = _uleb(data, cursor)
+                        size, cursor = _uleb(data, cursor)
+                        if cursor + size > end:
+                            raise ValueError("location expression runs past its list")
+                        entries.append(LocationEntry(base, begin, finish, data[cursor:cursor + size]))
+                        cursor += size
+                    else:
+                        raise ValueError(f"unsupported DW_LLE opcode {opcode:#04x}")
+                out[list_offset] = LocationList(list_offset, entries)
+            offset = end
+        return out
+    data = elf.sections.get(".debug_loc")
+    if data is None:
+        return out
+    address_size = elf.address_size
+    maximum = (1 << (8 * address_size)) - 1
+    offset = 0
+    while offset + 2 * address_size <= len(data):
+        list_offset = offset
+        entries = []
+        base = None
+        while offset + 2 * address_size <= len(data):
+            begin = int.from_bytes(data[offset:offset + address_size], elf.order)
+            finish = int.from_bytes(data[offset + address_size:offset + 2 * address_size], elf.order)
+            offset += 2 * address_size
+            if begin == 0 and finish == 0:
+                break
+            if begin == maximum:
+                base = finish
+                continue
+            if offset + 2 > len(data):
+                raise ValueError("location entry without an expression length")
+            size = int.from_bytes(data[offset:offset + 2], elf.order)
+            offset += 2
+            if offset + size > len(data):
+                raise ValueError("location expression runs past .debug_loc")
+            entries.append(LocationEntry(base, begin, finish, data[offset:offset + size]))
+            offset += size
+        if entries:
+            out[list_offset] = LocationList(list_offset, entries)
+    return out
+
+
+def breg_location(expression: bytes) -> tuple[int, int] | None:
+    """`DW_OP_bregN sleb` and nothing else: the home shape D1b proves."""
+    if not expression or not 0x70 <= expression[0] <= 0x8F:
+        return None
+    try:
+        offset, after = _sleb(expression, 1)
+    except IndexError:
+        return None
+    if after != len(expression):
+        return None
+    return expression[0] - 0x70, offset
 
 
 # --- .eh_frame ----------------------------------------------------------------
@@ -1925,9 +2087,10 @@ def check_range_lists(
         if not isinstance(offset, int):
             continue
         try:
-            listed = ranges_for(elf, lists, offset)
-        except ValueError as error:
-            report.fail("range_list", f"{label}: unit at {unit.offset:#x}: {error}")
+            candidate = next(item for item in lists if item.offset == offset)
+            listed = candidate.ranges
+        except StopIteration:
+            report.fail("range_list", f"{label}: unit at {unit.offset:#x}: no range list at {offset:#x}")
             continue
         stale = [entry for entry in listed if entry[0] == 0]
         listed = [entry for entry in listed if entry[0] != 0]
@@ -1957,7 +2120,17 @@ def check_range_lists(
                     f"{next_start:#x}",
                 )
         low = root.attrs.get(DW_AT_LOW_PC)
-        if isinstance(low, int) and low not in (0, ordered[0][0]):
+        if candidate.absolute_entries:
+            # Absolute relocated tuples are already addresses.  Naming the first
+            # code address as the CU base makes GDB add it a second time ("pc in
+            # read in CU, but not in symtab"); the base must be zero.
+            if isinstance(low, int) and low != 0:
+                report.fail(
+                    "range_list",
+                    f"{label}: absolute range entries with DW_AT_low_pc {low:#x}; a "
+                    "consumer adds the base twice, so the CU base must be 0",
+                )
+        elif isinstance(low, int) and low not in (0, ordered[0][0]):
             report.fail(
                 "range_list",
                 f"{label}: DW_AT_low_pc {low:#x} is neither 0 nor the first range start "
@@ -2206,12 +2379,8 @@ def reference_target(die: Die, unit: Unit, attribute: int) -> Die | None:
     value = die.attrs.get(attribute)
     if not isinstance(value, int):
         return None
-    form = die.forms.get(attribute)
-    if form == DW_FORM_REF_ADDR:
-        return unit.die_at(value)
-    if form in DW_FORM_UNIT_REFS:
-        return unit.die_at(unit.offset + value)
-    return None
+    target = _die_offset(die, value, unit, attribute)
+    return unit.die_at(target) if target is not None else None
 
 
 def children(unit: Unit, parent: Die) -> list[Die]:
@@ -2709,296 +2878,60 @@ def location_address(die: Die, elf: Elf) -> int | None:
     return int.from_bytes(expression[1:], elf.order)
 
 
-#: The `pq_args` battery's parameters, in declaration order. The probe takes all
-#: eleven addresses, so each one is an object in memory at every tier and every
-#: one of them must be locatable -- which makes absence a defect and not a tier
-#: policy.
-PARAMETER_BATTERY = ("a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k")
-
-# The 32-bit target is measured with a freestanding program: a host that can
-# compile `-m32` often cannot link a 32-bit libc, and the check needs to *run* on
-# the target, not merely decode an object.  `_start` writes with `int $0x80` and
-# prints the same two facts the 64-bit probe prints -- each parameter's distance
-# from its own frame address and the value the function itself read -- plus a
-# checksum of the ten integers, so a call that lost an argument is visible.
-PARAMETER_PROBE_32 = r"""
-static long delta[11];
-static long value[11];
-static char out[2048];
-static int out_len;
-
-static void put_char(char c) { out[out_len++] = c; }
-static void put_int(long v) {
-    char buf[24];
-    int n = 0;
-    unsigned long u;
-    if (v < 0) { put_char('-'); u = (unsigned long)(-v); } else { u = (unsigned long)v; }
-    do { buf[n++] = (char)('0' + (int)(u % 10)); u /= 10; } while (u);
-    while (n) put_char(buf[--n]);
-}
-static void put_entry(char prefix, int index, long v) {
-    put_char(prefix);
-    if (index >= 10) put_char((char)('0' + index / 10));
-    put_char((char)('0' + index % 10));
-    put_char(' ');
-    put_int(v);
-    put_char('\n');
-}
-
-__attribute__((noinline))
-long pq_args(int a, int b, int c, int d, int e, float f, double g, void *h, int i, int j, int k) {
-    unsigned long frame = (unsigned long)__builtin_frame_address(0);
-    delta[0] = (long)((unsigned long)(void *)&a - frame);
-    delta[1] = (long)((unsigned long)(void *)&b - frame);
-    delta[2] = (long)((unsigned long)(void *)&c - frame);
-    delta[3] = (long)((unsigned long)(void *)&d - frame);
-    delta[4] = (long)((unsigned long)(void *)&e - frame);
-    delta[5] = (long)((unsigned long)(void *)&f - frame);
-    delta[6] = (long)((unsigned long)(void *)&g - frame);
-    delta[7] = (long)((unsigned long)(void *)&h - frame);
-    delta[8] = (long)((unsigned long)(void *)&i - frame);
-    delta[9] = (long)((unsigned long)(void *)&j - frame);
-    delta[10] = (long)((unsigned long)(void *)&k - frame);
-    value[0] = a; value[1] = b; value[2] = c; value[3] = d; value[4] = e;
-    value[5] = (long)f; value[6] = (long)g; value[7] = (long)h;
-    value[8] = i; value[9] = j; value[10] = k;
-    return a + b + c + d + e + (long)f + (long)g + i + j + k;
-}
-
-void _start(void) {
-    long sum = pq_args(1, 2, 3, 4, 5, 6.0f, 7.0, (void *)0x1000, 9, 10, 11);
-    for (int n = 0; n < 11; n++) put_entry('d', n, delta[n]);
-    for (int n = 0; n < 11; n++) put_entry('v', n, value[n]);
-    put_entry('s', 0, sum);
-    __asm__ volatile("int $0x80" :: "a"(4), "b"(1), "c"(out), "d"(out_len));
-    __asm__ volatile("int $0x80" :: "a"(1), "b"(0));
-    for (;;) { }
-}
-"""
-
-
-def frame_offset(die: Die) -> int | None:
-    """The `DW_OP_fbreg` offset of a location expression, or `None`.
-
-    `None` means the expression is not one frame-relative offset. For a parameter
-    of this writer that is a defect rather than a policy: `DW_OP_fbreg` is the
-    only form it emits for a parameter, and a consumer that meets anything else
-    either gives up on the variable or computes an address no object has.
-    """
-    expression = die.attrs.get(DW_AT_LOCATION)
-    if not isinstance(expression, bytes) or not expression:
-        return None
-    if expression[0] != DW_OP_FBREG:
-        return None
-    # A block that ends mid-LEB is truncated, which is unreadable rather than
-    # exceptional: a malformed object must be a reported failure, not a traceback.
-    try:
-        offset, after = _sleb(expression, 1)
-    except IndexError:
-        return None
-    return offset if after == len(expression) else None
-
-
-def check_parameter_locations(
-    report: Report, elf: Elf, parsed: list[Unit], label: str, facts: dict[str, int],
-    place_every_parameter: bool = True,
+def check_parameter_location(
+    report: Report, elf: Elf, unit: Unit, die: Die, subprogram: Die, label: str, name: str
 ) -> None:
-    """A parameter's stated location must be the address the program took for it.
-
-    The probe prints its own frame address and where each parameter lives, so the
-    expected offset is `(address - frame) - frame record`: the `DW_OP_fbreg`
-    displacement is measured from the canonical frame address, which is one frame
-    record above the frame address the probe recorded.  Spelled as an address the
-    check is `frame + record + fbreg == address`, the evaluation a consumer
-    performs -- the address the *running* code gave the object, not a second
-    compiler's opinion about where it ought to be.  A `DW_OP_fbreg` that
-    disagrees sends a debugger's `print` to the wrong stack slot, which is worse
-    than the `<optimized out>` a missing location gives, so both a wrong value and
-    an unreadable expression are failures.
-
-    Every parameter DIE in the unit is also required to hold a readable
-    expression: the writer emits nothing else, and a malformed block anywhere in
-    the unit would go unnoticed by a check that only looked at this battery.
-    """
-    unit = parsed[0]
-    subprogram = next(
-        (die for die in unit.by_tag(DW_TAG_SUBPROGRAM)
-         if die_name(die, unit) == "pq_args" and DW_AT_LOW_PC in die.attrs),
-        None,
-    )
-    if subprogram is None:
+    """A claimed parameter home must decode to a live, frame-relative range."""
+    form = die.forms.get(DW_AT_LOCATION)
+    value = die.attrs.get(DW_AT_LOCATION)
+    if form not in (DW_FORM_SEC_OFFSET, DW_FORM_DATA4) or not isinstance(value, int):
+        report.fail("parameter_locations", f"{label}: {name} location is not a section offset")
+        return
+    try:
+        lists = location_lists(elf, unit.version)
+    except ValueError as error:
+        report.fail("parameter_locations", f"{label}: {name}: {error}")
+        return
+    candidate = lists.get(value)
+    if candidate is None or not candidate.entries:
+        report.fail("parameter_locations", f"{label}: {name} names an empty/missing location list")
+        return
+    if not candidate.has_explicit_base:
         report.fail(
             "parameter_locations",
-            f"{label}: pq_args has no subprogram DIE, so no parameter location can be checked",
+            f"{label}: {name} has no base-address selection; absolute entries would be "
+            "added to the subprogram low_pc a second time",
         )
         return
-    parameters = [die for die in children(unit, subprogram)
-                  if die.tag == DW_TAG_FORMAL_PARAMETER]
-    if len(parameters) != len(PARAMETER_BATTERY):
-        report.fail(
-            "parameter_locations",
-            f"{label}: pq_args takes {len(PARAMETER_BATTERY)} parameters but its subprogram "
-            f"has {len(parameters)} DW_TAG_formal_parameter children",
-        )
+    low = subprogram.attrs.get(DW_AT_LOW_PC)
+    high = subprogram.attrs.get(DW_AT_HIGH_PC)
+    if not isinstance(low, int) or not isinstance(high, int):
+        report.fail("parameter_locations", f"{label}: {name}'s subprogram has no address range")
         return
-    record = facts["frame_record"]
-    checked = 0
-    for index, (name, die) in enumerate(zip(PARAMETER_BATTERY, parameters)):
-        spelled = die_name(die, unit)
-        if spelled != name:
+    if subprogram.forms.get(DW_AT_HIGH_PC) not in (DW_FORM_ADDR, 0x01):
+        high = low + high
+    expected_register = {3: 5, 62: 6}.get(elf.machine)
+    for entry in candidate.entries:
+        base = entry.base if entry.base is not None else low
+        start, end = base + entry.start, base + entry.end
+        if not low < start < end <= high:
             report.fail(
                 "parameter_locations",
-                f"{label}: pq_args parameter {index} is {spelled!r} in DWARF and {name!r} in "
-                "the source, so every location in the list is off by one",
+                f"{label}: {name} home range [{start:#x}, {end:#x}) is not strictly inside "
+                f"the subprogram [{low:#x}, {high:#x}) after the prologue",
             )
-            continue
-        # The displacement is from the canonical frame address, which sits one
-        # frame record above the frame address the probe recorded -- not below it.
-        expected = facts[f"arg_delta_{index}"] - record
-        value = die.attrs.get(DW_AT_LOCATION)
-        if value is None:
-            # At `-O0` every parameter has a home the layout can name, so an
-            # absent location there is the regression this check exists for. At
-            # an optimizing tier a value legitimately lives in a register, where
-            # no `DW_OP_fbreg` can name it: absence is then the correct answer and
-            # only a *wrong* offset is a failure.
-            if place_every_parameter:
-                report.fail(
-                    "parameter_locations",
-                    f"{label}: pq_args.{name} lives at {expected} from the frame base in the "
-                    "program's own frame but its DIE states no location",
-                )
-            continue
-        offset = frame_offset(die)
-        if offset is None:
+        home = breg_location(entry.expression)
+        if home is None:
+            report.fail("parameter_locations", f"{label}: {name} home is not DW_OP_bregN+sleb")
+        elif expected_register is not None and home[0] != expected_register:
             report.fail(
                 "parameter_locations",
-                f"{label}: pq_args.{name} has a location a consumer cannot read as one frame "
-                f"offset: {value!r}",
+                f"{label}: {name} homes through register {home[0]}, expected the frame "
+                f"pointer {expected_register} for this target",
             )
-            continue
-        if offset != expected:
-            report.fail(
-                "parameter_locations",
-                f"{label}: pq_args.{name} is DW_OP_fbreg {offset}, which names "
-                f"{offset + record} from the frame address; the program's own "
-                f"frame puts it at {facts[f'arg_delta_{index}']}",
-            )
-            continue
-        checked += 1
-    # The rest of the unit: readable or nothing, never unreadable.
-    for die in unit.by_tag(DW_TAG_FORMAL_PARAMETER):
-        if DW_AT_LOCATION in die.attrs and frame_offset(die) is None:
-            report.fail(
-                "parameter_locations",
-                f"{label}: parameter {die_name(die, unit)!r} has a location a consumer cannot "
-                f"read as one frame offset: {die.attrs[DW_AT_LOCATION]!r}",
-            )
-    report.measurements.setdefault("parameter_locations", {})[label] = checked
-
-
-def run_debugger_lane(report: Report, lccc: list[str], gdb: str, workdir: Path) -> None:
-    """Build the probe at two tiers and ask a real debugger for its parameters.
-
-    `-O0` places every parameter, so GDB must print all eleven; `-O2` may keep
-    one in a register, and a parameter GDB calls `<optimized out>` is skipped
-    there -- but one it prints must be the value the function itself saw.
-    """
-    # Record which debugger answered.  A "debugger" measurement that does not
-    # name its consumer cannot be re-read later, and the pinned GDB in the
-    # toolchain cache is not the one a distribution ships.
-    version = subprocess.run([gdb, "--version"], text=True, stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT, check=False, timeout=60)
-    first = (version.stdout or "").strip().splitlines()
-    if first:
-        report.measurements.setdefault("debugger", {})["tool"] = first[0]
-    probes = write_probes(workdir)
-    for optimization in ("-O0", "-O2"):
-        label = f"debugger-{optimization.lstrip('-')}"
-        output = workdir / f"{label}.elf"
-        if not build(
-            report, lccc, ["-g", "-gdwarf-5", optimization, "-no-pie"], [probes["probe"]],
-            output, workdir,
-        ):
-            continue
-        facts = program_facts(report, output, label)
-        if facts is None:
-            continue
-        # `-O0` places every parameter, so a parameter the debugger cannot print
-        # is the regression this lane exists for; at `-O2` a register home is
-        # allowed and only a *wrong* value is a failure.
-        check_debugger_agreement(report, gdb, output, label, facts,
-                                 required=optimization == "-O0")
-
-
-def check_debugger_agreement(
-    report: Report, gdb: str, program: Path, label: str, facts: dict[str, int], required: bool
-) -> None:
-    """Ask a real debugger for the parameters and compare with the program.
-
-    Every other check here decodes what the writer produced and compares it with
-    what the probe measured -- and both sides are code this repository owns.  That
-    is not enough: a sign error in the frame arithmetic made the gate's own
-    formula agree with the writer while GDB, the consumer the information exists
-    for, printed the caller's saved frame pointer as the first argument.  So the
-    value GDB prints is compared with the value the function itself stored,
-    parameter by parameter.
-
-    The probe is asked for each parameter with its own `printf`, so a parameter
-    GDB cannot place is visibly absent instead of shifting every later answer by
-    one.  A GDB that cannot run here at all (no ptrace, no install) is a
-    measurement, not a failure: the environment is not the compiler.
-    """
-    commands = ["-batch", "-nx", "-ex", "break pq_args", "-ex", "run"]
-    for index, name in enumerate(PARAMETER_BATTERY):
-        commands += ["-ex", f'printf "arg{index}=%ld\\n", (long){name}']
-    try:
-        proc = subprocess.run(
-            [gdb, *commands, str(program)], text=True, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, check=False, timeout=180,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        report.measurements.setdefault("debugger", {})[label] = f"skipped: {error}"
-        return
-    printed = {int(index): int(value)
-               for index, value in re.findall(r"^arg(\d+)=(-?\d+)$", proc.stdout, re.MULTILINE)}
-    if not printed:
-        # A debugger that ran and stopped inside the function has answered: it
-        # could place none of the parameters, which at a tier that places all of
-        # them is the regression this lane exists for.  A debugger that could not
-        # run at all (no ptrace, no install) has not answered, and the environment
-        # is not the compiler.
-        if required and "Breakpoint 1, " in proc.stdout:
-            report.fail(
-                "debugger",
-                f"{label}: gdb stopped inside pq_args and resolved none of its "
-                f"{len(PARAMETER_BATTERY)} parameters, every one of which has a home at this tier",
-            )
-            return
-        reason = next(
-            (line.strip() for line in proc.stdout.splitlines()
-             if "ptrace" in line or "No such file" in line or "error" in line.lower()),
-            "no values",
-        )
-        report.measurements.setdefault("debugger", {})[label] = f"skipped: {reason}"[:200]
-        return
-    for index, name in enumerate(PARAMETER_BATTERY):
-        if index not in printed:
-            if required:
-                report.fail(
-                    "debugger",
-                    f"{label}: gdb cannot print pq_args.{name} and every parameter has a home at "
-                    "this tier, so the DIE names no address a consumer can resolve",
-                )
-            continue
-        want = facts[f"arg_value_{index}"]
-        if printed[index] != want:
-            report.fail(
-                "debugger",
-                f"{label}: gdb prints pq_args.{name} as {printed[index]} and the function's own "
-                f"parameter is {want}, so the location a consumer resolves is not the object",
-            )
-    report.measurements.setdefault("debugger", {})[label] = len(printed)
+    report.measurements.setdefault("parameter_location_ranges", {})[f"{label}:{name}"] = [
+        list(pair) for pair in candidate.absolute_ranges(low)
+    ]
 
 
 def check_parameters(report: Report, elf: Elf, parsed: list[Unit], label: str) -> None:
@@ -3072,7 +3005,22 @@ def check_parameters(report: Report, elf: Elf, parsed: list[Unit], label: str) -
                 )
                 continue
             described += 1
-            located += DW_AT_LOCATION in die.attrs
+            if DW_AT_LOCATION not in die.attrs:
+                if "-O0" in label:
+                    report.fail(
+                        "parameter_locations",
+                        f"{label}: parameter {name}.{parameter} has no DW_AT_location; "
+                        "O0 x86/i686 homes are codegen-proven and required (D1b)",
+                    )
+                else:
+                    report.gap(
+                        "optimized_parameter_locations",
+                        f"{label}: parameter {name}.{parameter} has no DW_AT_location",
+                    )
+            else:
+                check_parameter_location(
+                    report, elf, unit, die, subprogram, label, f"{name}.{parameter}"
+                )
             target = resolved_type(die, unit)
             if target is None:
                 report.fail(
@@ -3681,6 +3629,28 @@ def oracle_comparison(
     report.measurements["oracle_symbols"] = rows
 
 
+def _uleb_bytes(value: int) -> bytes:
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        out.append(byte | (0x80 if value else 0))
+        if not value:
+            return bytes(out)
+
+
+def _sleb_bytes(value: int) -> bytes:
+    """Signed LEB128 encoder used by the decoder self-tests."""
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        done = (value == 0 and not byte & 0x40) or (value == -1 and byte & 0x40)
+        out.append(byte if done else byte | 0x80)
+        if done:
+            return bytes(out)
+
+
 def self_test() -> int:
     """Prove the decoders on hand-built bytes, so the gate can be trusted."""
     failures: list[str] = []
@@ -3905,6 +3875,79 @@ def self_test() -> int:
     expect(elf32.sections[".debug_str"][8:] == bytes(4),
            "self-test ELF32 REL must not overwrite the next attribute")
 
+    # Reference forms: 0x10 is ref_addr (section-relative), 0x13 is ref4
+    # (unit-relative), and 0x17 is sec_offset -- NOT a DIE reference.
+    ref_unit = Unit(offset=0x100, version=4, address_size=8, offset_size=4, dies=[
+        Die(offset=0x110, tag=DW_TAG_SUBPROGRAM,
+            attrs={DW_AT_ABSTRACT_ORIGIN: 0x20}, forms={DW_AT_ABSTRACT_ORIGIN: 0x13}, depth=1),
+        Die(offset=0x120, tag=DW_TAG_SUBPROGRAM, attrs={DW_AT_NAME: "origin"}, forms={}, depth=1),
+    ])
+    expect(die_name(ref_unit.dies[0], ref_unit) == "origin",
+           "self-test ref4 abstract origin must resolve unit-relative")
+    sec_die = Die(offset=0x130, tag=DW_TAG_SUBPROGRAM,
+                  attrs={DW_AT_ABSTRACT_ORIGIN: 0x20}, forms={DW_AT_ABSTRACT_ORIGIN: DW_FORM_SEC_OFFSET}, depth=1)
+    expect(_die_offset(sec_die, 0x20, ref_unit) is None,
+           "self-test sec_offset must not be decoded as a DIE reference")
+    addr_unit = Unit(offset=0x100, version=4, address_size=8, offset_size=4, dies=[
+        Die(offset=0x110, tag=DW_TAG_SUBPROGRAM,
+            attrs={DW_AT_SPECIFICATION: 0x120}, forms={DW_AT_SPECIFICATION: DW_FORM_REF_ADDR}, depth=1),
+        Die(offset=0x120, tag=DW_TAG_SUBPROGRAM, attrs={DW_AT_NAME: "spec"}, forms={}, depth=1),
+    ])
+    expect(die_name(addr_unit.dies[0], addr_unit) == "spec",
+           "self-test ref_addr specification must resolve section-relative")
+
+    # Location lists: v4 base-selection + breg6, v5 base_address + offset_pair.
+    loc4 = bytearray()
+    loc4 += (0x1000).to_bytes(8, "little") * 1  # base selection: begin=all-ones
+    loc4[-8:] = b"\xff" * 8
+    loc4 += (0x1000).to_bytes(8, "little")
+    loc4 += (8).to_bytes(8, "little") + (0x20).to_bytes(8, "little")
+    expr4 = bytes([0x76]) + _sleb_bytes(-16)
+    loc4 += len(expr4).to_bytes(2, "little") + expr4
+    loc4 += bytes(16)
+    elf4 = Elf(sections={".debug_loc": bytes(loc4)}, order="little", address_size=8, machine=62)
+    lists4 = location_lists(elf4, 4)
+    expect(list(lists4) == [0] and lists4[0].has_explicit_base,
+           f"self-test v4 location list offsets/base {lists4}")
+    expect(lists4[0].absolute_ranges(0) == [(0x1008, 0x1020)],
+           "self-test v4 location range must use the selected base, not low_pc")
+    expect(breg_location(expr4) == (6, -16), "self-test breg6 sleb decode")
+    expect(breg_location(bytes([0x76])) is None, "self-test truncated breg must be rejected")
+    expect(breg_location(expr4 + b"\x00") is None, "self-test trailing expression bytes must be rejected")
+
+    loc5 = bytearray()
+    loc5 += b"\x00\x00\x00\x00" + (5).to_bytes(2, "little") + bytes([8, 0]) + (0).to_bytes(4, "little")
+    loc5 += bytes([0x06]) + (0x2000).to_bytes(8, "little")
+    expr5 = bytes([0x75]) + _sleb_bytes(12)
+    loc5 += bytes([0x04]) + _uleb_bytes(4) + _uleb_bytes(0x10) + _uleb_bytes(len(expr5)) + expr5
+    loc5 += bytes([0x00])
+    loc5[:4] = (len(loc5) - 4).to_bytes(4, "little")
+    elf5 = Elf(sections={".debug_loclists": bytes(loc5)}, order="little", address_size=8, machine=3)
+    lists5 = location_lists(elf5, 5)
+    expect(list(lists5) == [12] and lists5[12].absolute_ranges(0) == [(0x2004, 0x2010)],
+           f"self-test v5 location list {lists5}")
+    expect(breg_location(expr5) == (5, 12), "self-test breg5 sleb decode")
+    truncated = bytearray(loc5)
+    truncated[21] = 0x7F  # unknown opcode where offset_pair was
+    try:
+        location_lists(Elf(sections={".debug_loclists": bytes(truncated)}, order="little"), 5)
+        failures.append("self-test unknown DW_LLE opcode was silently accepted")
+    except ValueError:
+        pass
+
+    # Mutation of the withdrawn range-base rule: absolute tuples + nonzero CU
+    # low_pc is the doubled-address bug GDB reported on i686; zero base is legal.
+    ranges_payload = (0x1000).to_bytes(8, "little") + (0x1020).to_bytes(8, "little") + bytes(16)
+    range_elf = Elf(sections={".debug_ranges": ranges_payload}, order="little", address_size=8)
+    for low_pc, should_fail in ((0x1000, True), (0, False)):
+        root = Die(offset=0, tag=DW_TAG_COMPILE_UNIT,
+                   attrs={DW_AT_RANGES: 0, DW_AT_LOW_PC: low_pc}, forms={}, depth=0)
+        range_unit = Unit(offset=0, version=4, address_size=8, offset_size=4, dies=[root])
+        range_report = Report()
+        check_range_lists(range_report, range_elf, [range_unit], {"f": (0x1000, 0x1020)}, "mut")
+        expect(bool(range_report.failures) == should_fail,
+               f"self-test absolute range base {low_pc:#x}: failures {range_report.failures}")
+
     # The source scanner the attribution check rests on.
     def span_names(source: str) -> list[tuple[str, int, int]]:
         return [(span.name, span.first_line, span.last_line) for span in function_spans(source)]
@@ -3934,7 +3977,7 @@ def self_test() -> int:
         for failure in failures:
             print(f"SELF-TEST FAILURE: {failure}", file=sys.stderr)
         return 1
-    print("self-test: decoder, line program, aranges, eh_frame and source scanner agree")
+    print("self-test: decoder, references, line program, aranges, ranges, locations, eh_frame and source scanner agree")
     return 0
 
 

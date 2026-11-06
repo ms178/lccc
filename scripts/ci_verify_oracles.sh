@@ -480,7 +480,7 @@ MOCK
         rm -rf "$work"; return 1
     fi
 
-    # 11. GDB is opt-in for the DWARF delivery lane; a lane that asks for it
+    # 11. GDB is opt-in for the DWARF delivery/parameter lanes; a lane that asks for it
     # must not silently fall back to structural-only validation.
     status=0
     PATH="$work/tools-min:/usr/bin:/bin" LCCC_GDB_TOOL=gdb-case11-absent CLANG=clang CASES_VERSION=16.2.0 \

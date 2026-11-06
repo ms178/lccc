@@ -3168,6 +3168,14 @@ impl I686Codegen {
 // ─── ArchCodegen trait implementation ────────────────────────────────────────
 
 impl ArchCodegen for I686Codegen {
+    fn debug_parameter_home(&self, slot: crate::backend::state::StackSlot) -> Option<(u8, i64)> {
+        // i686 stack parameters may live in the caller's argument slot
+        // (positive ebp displacement) or a local alloca; slot_base_disp is
+        // the same translation the emitter uses.  ebp is DWARF register 5.
+        let (base, disp) = self.slot_base_disp(slot, 0);
+        (base == "ebp").then_some((5, disp))
+    }
+
     fn emit_indirect_branch_landing_pad(&mut self) {
         if self.state.cf_protection_branch {
             self.state.emit("    endbr32");

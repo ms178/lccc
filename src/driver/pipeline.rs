@@ -2478,7 +2478,11 @@ impl Driver {
         if self.whole_program && !self.relocatable {
             crate::ir::whole_program::internalize_module(&mut module, false);
         }
-        let (asm, frame_facts) = self.compile_ir_module_to_assembly(
+        let debug_param_homes = (self.debug_info && self.opt_level == 0)
+            .then(|| std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())));
+        let debug_local_homes = (self.debug_info && self.opt_level == 0)
+            .then(|| std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())));
+        let asm = self.compile_ir_module_to_assembly(
             module,
             source_manager.as_ref(),
             input_file,
@@ -2487,13 +2491,47 @@ impl Driver {
             tune,
             time_phases,
             t0,
+            debug_param_homes.clone(),
+            debug_local_homes.clone(),
         )?;
-        // `-g`: the parameter homes the code generator proved join the unit spec
-        // here, because this is the one place that holds both the analysis's
-        // description of a function and the frame the code generator gave it.
         let mut debug_unit = debug_unit;
-        if let Some(spec) = debug_unit.as_mut() {
-            spec.apply_frame_facts(&frame_facts);
+        if let Some(homes) = debug_param_homes
+            && let Some(unit) = debug_unit.as_mut()
+        {
+            let homes = homes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            unit.parameter_locations = homes
+                .iter()
+                .filter_map(|((function, index), home)| {
+                    let name = unit
+                        .parameters
+                        .get(function)?
+                        .parameters
+                        .get(*index)?
+                        .name
+                        .as_ref()?;
+                    Some(crate::backend::elf::DwarfParameterLocation {
+                        function: function.clone(),
+                        name: name.clone(),
+                        base_register: home.base_register,
+                        offset: home.offset,
+                    })
+                })
+                .collect();
+        }
+        if let Some(homes) = debug_local_homes
+            && let Some(unit) = debug_unit.as_mut()
+        {
+            let homes = homes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for local in &mut unit.local_variables {
+                if let Some(home) = homes.get(&(local.function.clone(), local.alloca_id)) {
+                    local.base_register = Some(home.base_register);
+                    local.offset = Some(home.offset);
+                }
+            }
         }
         Ok(CompiledUnit { asm, debug_unit })
     }
@@ -2524,6 +2562,7 @@ impl Driver {
             String,
             crate::frontend::sema::analysis::FunctionInfo,
         >,
+        module: Option<&crate::ir::module::IrModule>,
     ) -> crate::backend::elf::DwarfUnitSpec {
         use crate::backend::elf::DwarfUnitSpec;
 
@@ -2639,11 +2678,57 @@ impl Driver {
             );
         }
 
+        // D14: local variables whose alloca may survive into codegen. A name
+        // declared more than once in a function is ambiguous without lexical
+        // blocks, so fail closed until the scope ranges are emitted.
+        let mut local_variables = Vec::new();
+        if let Some(module) = module {
+            for func in &module.functions {
+                let mut counts: crate::common::fx_hash::FxHashMap<&str, usize> =
+                    crate::common::fx_hash::FxHashMap::default();
+                for local in &func.debug_locals {
+                    *counts.entry(local.name.as_str()).or_default() += 1;
+                }
+                for local in &func.debug_locals {
+                    if counts.get(local.name.as_str()).copied().unwrap_or(0) != 1 {
+                        continue;
+                    }
+                    let ty = graph.intern_written(&local.ty, local.typedef_name.as_deref());
+                    let (decl_file, decl_line, decl_column) = match sources {
+                        Some(sources)
+                            if local.decl_span != crate::common::source::Span::dummy() =>
+                        {
+                            let location = sources.resolve_span(local.decl_span);
+                            (
+                                Some(location.file),
+                                Some(location.line),
+                                Some(location.column),
+                            )
+                        }
+                        _ => (None, None, None),
+                    };
+                    local_variables.push(crate::backend::elf::DwarfLocalVariable {
+                        function: func.name.clone(),
+                        name: local.name.clone(),
+                        ty,
+                        decl_file,
+                        decl_line,
+                        decl_column,
+                        alloca_id: local.alloca.0,
+                        base_register: None,
+                        offset: None,
+                    });
+                }
+            }
+        }
+
         DwarfUnitSpec {
             types: graph.into_types(),
             variables,
             return_types,
             parameters: function_parameters,
+            parameter_locations: Vec::new(),
+            local_variables,
         }
     }
 
@@ -2672,6 +2757,8 @@ impl Driver {
             tune,
             time_phases,
             t0,
+            None,
+            None,
         )
         .map(|(asm, _facts)| asm)
     }
@@ -2926,23 +3013,10 @@ impl Driver {
         crate::passes::vectorize::set_x86_sse1_available(
             self.target == Target::X86_64 && !self.no_sse && !self.general_regs_only,
         );
-        // The debug information names this unit's types and objects, so it is
-        // built while the analysis that produced them is still readable: the
-        // lowerer takes the type system and the function records by value, and
-        // the syntax tree does not outlive lowering.  Only a `-g` compile pays for
-        // it, and the source manager is shared rather than taken, so lowering
-        // keeps its `file:line:col` diagnostics.
-        let debug_unit = if self.debug_info {
-            let sources = diagnostics.share_source_manager();
-            Some(Self::build_dwarf_unit(
-                &sema_result.file_scope_objects,
-                &sema_result.type_context,
-                sources.as_deref(),
-                &sema_result.functions,
-            ))
-        } else {
-            None
-        };
+        // The lowerer consumes the function records; `-g` still needs them to
+        // name parameters after lowering has returned the (possibly enriched)
+        // type context and the local-variable metadata.
+        let debug_functions = self.debug_info.then(|| sema_result.functions.clone());
         let lowerer = Lowerer::with_type_context(
             self.target,
             sema_result.type_context,
@@ -2953,6 +3027,7 @@ impl Driver {
             self.gnu89_inline,
         )
         .with_optimization_level(self.opt_level)
+        .with_debug_info(self.debug_info)
         .with_pass_policy(crate::common::pass_policy::PassPolicy::new(
             self.effective_wrap_signed_overflow(),
             fp_environment_observable,
@@ -2965,7 +3040,7 @@ impl Driver {
         .with_builtin_policy(self.builtin_policy.clone())
         .with_enumerator_refs(sema_result.enumerator_refs)
         .with_local_address_returns(sema_result.local_address_returns);
-        let (mut module, mut diagnostics) = lowerer.lower(&ast);
+        let (mut module, mut diagnostics, _lowered_types) = lowerer.lower(&ast);
         // IR lowering is a user-facing phase: it rejects ill-typed builtins,
         // target-specific intrinsics and unsupported constructs, and every one
         // of those diagnostics carries a span. The engine therefore keeps the
@@ -2975,6 +3050,17 @@ impl Driver {
         // the only consumer that needs the manager back, so take it once
         // lowering has returned the engine.
         let source_manager = diagnostics.take_source_manager();
+        let debug_unit = if self.debug_info {
+            Some(Self::build_dwarf_unit(
+                &sema_result.file_scope_objects,
+                &_lowered_types,
+                source_manager.as_deref(),
+                debug_functions.as_ref().expect("debug functions cloned"),
+                Some(&module),
+            ))
+        } else {
+            None
+        };
 
         // Apply #pragma weak directives from the preprocessor.
         for (symbol, target) in &weak_pragmas {
@@ -3068,7 +3154,9 @@ impl Driver {
         tune: crate::backend::x86::cpu_model::X86Tune,
         time_phases: bool,
         t0: std::time::Instant,
-    ) -> Result<(String, crate::backend::debug_frame::DebugFrameFacts), String> {
+        debug_param_homes: Option<crate::backend::DebugParamHomes>,
+        debug_local_homes: Option<crate::backend::DebugLocalHomes>,
+    ) -> Result<String, String> {
         let (module, pgo_unit) = self.optimize_ir_module(
             module,
             input_file,
@@ -3206,6 +3294,8 @@ impl Driver {
             tune,
             time_phases,
             t0,
+            debug_param_homes,
+            debug_local_homes,
         )
     }
 
@@ -4341,7 +4431,9 @@ impl Driver {
         tune: crate::backend::x86::cpu_model::X86Tune,
         time_phases: bool,
         t0: std::time::Instant,
-    ) -> Result<(String, crate::backend::debug_frame::DebugFrameFacts), String> {
+        debug_param_homes: Option<crate::backend::DebugParamHomes>,
+        debug_local_homes: Option<crate::backend::DebugLocalHomes>,
+    ) -> Result<String, String> {
         if let Some(diagnostic) = unsettled_x86_requirement(module) {
             return Err(format!("{input_file}: {diagnostic}"));
         }
@@ -4401,6 +4493,8 @@ impl Driver {
             .then(|| std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())));
         let opts = crate::backend::CodegenOptions {
             frame_report: frame_report.clone(),
+            debug_param_homes,
+            debug_local_homes,
             ra_config,
             // At -O0 phi elimination leaves non-SSA multi-def webs. The linear
             // scan assumes one definition and miscompiled 125/200 CFG seeds;

@@ -4499,6 +4499,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 sections.extend([info.info, info.abbrev]);
                 sections.extend(info.aranges);
                 sections.extend(info.ranges);
+                sections.extend(info.loc);
+                sections.extend(info.loclists);
                 sections.extend(debug_strings.into_section(".debug_str"));
             }
             for mut section in sections {

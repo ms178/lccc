@@ -5103,6 +5103,18 @@ pub fn generate_module(
             std::env::var("CCC_DISABLE_PASSES").unwrap_or_default(),
             "intbounds",
         );
+    if let Some(homes) = &cg.state_ref().debug_param_homes {
+        homes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+    if let Some(homes) = &cg.state_ref().debug_local_homes {
+        homes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
     pre_size_output_buffer(cg, module);
     collect_symbol_sets(cg, module);
     let file_table = build_and_emit_dwarf_file_table(cg, module, source_mgr);
@@ -6125,6 +6137,65 @@ fn generate_function(
     // only the shipped emission may define a summary or a keep record.
     if !crate::backend::state::EXPLORATORY_EMISSION.with(std::cell::Cell::get) {
         cg.note_function_emitted(func, mark);
+        if let Some(homes) = &cg.state_ref().debug_param_homes {
+            let state = cg.state_ref();
+            let mut homes = homes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for index in 0..func.params.len() {
+                // Physical ABI slots are not source parameters: a hidden sret
+                // pointer or a decomposed vector piece must not steal the next
+                // parameter's name.  Synthesized functions with no map fail closed.
+                let Some(Some(original)) = func.debug_param_indices.get(index) else {
+                    continue;
+                };
+                if state.param_pre_stored.contains(&index) {
+                    continue;
+                }
+                let Some(Some((slot, _, alloca_id))) = state.param_alloca_slots.get(index) else {
+                    continue;
+                };
+                // Over-aligned allocas store an adjusted address, not the raw
+                // slot base; leave those to a later CFA-relative description.
+                if state.alloca_over_align(*alloca_id).is_some() {
+                    continue;
+                }
+                let Some((base_register, offset)) = cg.debug_parameter_home(*slot) else {
+                    continue;
+                };
+                homes.insert(
+                    (func.name.clone(), *original),
+                    crate::backend::DebugParamHome {
+                        base_register,
+                        offset,
+                    },
+                );
+            }
+        }
+        if let Some(homes) = &cg.state_ref().debug_local_homes {
+            let state = cg.state_ref();
+            let mut homes = homes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for local in &func.debug_locals {
+                let Some(&slot) = state.value_locations.get(&local.alloca.0) else {
+                    continue;
+                };
+                if state.alloca_over_align(local.alloca.0).is_some() {
+                    continue;
+                }
+                let Some((base_register, offset)) = cg.debug_parameter_home(slot) else {
+                    continue;
+                };
+                homes.insert(
+                    (func.name.clone(), local.alloca.0),
+                    crate::backend::DebugParamHome {
+                        base_register,
+                        offset,
+                    },
+                );
+            }
+        }
         if let Some(report) = &cg.state_ref().frame_report {
             report
                 .lock()

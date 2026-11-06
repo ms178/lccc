@@ -15,6 +15,9 @@ use crate::ir::reexports::{
 
 impl Lowerer {
     pub(super) fn lower_compound_stmt(&mut self, compound: &CompoundStmt) {
+        let debug_scope = self
+            .debug_info
+            .then(|| self.func_mut().push_debug_scope(compound.span));
         // If this block has __label__ declarations, push a local label scope
         // that maps each declared name to a unique scope-qualified name.
         let has_local_labels = !compound.local_labels.is_empty();
@@ -66,6 +69,9 @@ impl Lowerer {
         // Pop the local label scope if we pushed one
         if has_local_labels {
             self.local_label_scopes.pop();
+        }
+        if debug_scope.is_some() {
+            self.func_mut().pop_debug_scope();
         }
     }
 
@@ -544,6 +550,25 @@ impl Lowerer {
             if max_char > self.func().ssp_max_char_array_bytes {
                 self.func_mut().ssp_max_char_array_bytes = max_char;
             }
+        }
+        if self.debug_info
+            && !decl.is_static()
+            && !decl.is_extern()
+            && local_info.asm_register.is_none()
+            && local_info.static_global_name.is_none()
+            && let Some(ty) = local_info.var.c_type.clone()
+            && let Some(&scope) = self.func().debug_scope_stack.last()
+        {
+            self.func_mut()
+                .debug_locals
+                .push(crate::ir::module::DebugLocal {
+                    name: declarator.name.clone(),
+                    ty,
+                    typedef_name: crate::common::qualifiers::written_typedef(type_spec),
+                    alloca,
+                    decl_span: declarator.span,
+                    scope,
+                });
         }
         self.insert_local_scoped(declarator.name.clone(), local_info);
     }

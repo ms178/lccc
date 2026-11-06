@@ -996,6 +996,26 @@ gate "dwarf-delivery" fast \
         --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv \
         --gcc "${GCC16:-gcc-16}" --gdb "${GDB:-gdb}" \
         --json target/dwarf-delivery.json
+# The DWARF decoders and the parameter-home policy must be able to fail on
+# synthetic mutations before they are trusted with a compiler object.
+gate "dwarf-quality-selftest" fast \
+    python3 tests/regression/check_dwarf_quality.py --self-test
+gate "dwarf-parameters-selftest" fast \
+    python3 tests/regression/check_dwarf_parameters.py --self-test
+# D1b: O0 x86/i686 parameter homes, GDB values before/after assignment, entry
+# exclusion, -S+GAS delivery, and byte-identical code with/without -g.
+gate "dwarf-parameters" fast \
+    python3 tests/regression/check_dwarf_parameters.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" --gdb "${GDB:-gdb}" \
+        --json target/dwarf-parameters.json
+# D14: aggregate/volatile local homes, GDB values before/after assignment,
+# -S+GAS delivery, and byte-identical code with/without -g.
+gate "dwarf-locals-selftest" fast \
+    python3 tests/regression/check_dwarf_locals.py --self-test
+gate "dwarf-locals" fast \
+    python3 tests/regression/check_dwarf_locals.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" --gdb "${GDB:-gdb}" \
+        --json target/dwarf-locals.json
 # Digraph spelling is observable in macro stringification; this also exercises
 # directives, token boundaries, maximal munch and native/i686 execution.
 gate "c-digraphs" fast \

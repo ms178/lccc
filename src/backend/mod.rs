@@ -88,10 +88,27 @@ pub(crate) type FrameReport = std::sync::Arc<
     std::sync::Mutex<std::collections::BTreeMap<String, (crate::common::source::Span, u64)>>,
 >;
 
+/// Codegen-proven parameter homes, keyed by (function, parameter).  Later IPA
+/// retries replace earlier observations; exploratory emissions never enter it.
+pub(crate) type DebugParamHomes =
+    std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<(String, usize), DebugParamHome>>>;
+
+/// Codegen-proven local-variable homes, keyed by (function, alloca Value id).
+pub(crate) type DebugLocalHomes =
+    std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<(String, u32), DebugParamHome>>>;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DebugParamHome {
+    pub base_register: u8,
+    pub offset: i64,
+}
+
 /// Options that control code generation, parsed from CLI flags.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CodegenOptions {
     pub(crate) frame_report: Option<FrameReport>,
+    pub(crate) debug_param_homes: Option<DebugParamHomes>,
+    pub(crate) debug_local_homes: Option<DebugLocalHomes>,
     /// Invocation-owned RA/codegen policy, parsed once by the driver before
     /// any per-function backend work starts.
     pub(crate) ra_config: std::sync::Arc<regalloc::RaConfig>,

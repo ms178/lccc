@@ -1860,6 +1860,9 @@ fn inline_run_with(
                                         // Reconstruct IrFunction for callee from callee_map data
                                         // callee_map stores blocks, we need to create a dummy IrFunction
                                         let dummy = crate::ir::reexports::IrFunction {
+                                            debug_param_indices: Vec::new(),
+                                            debug_locals: Vec::new(),
+                                            debug_scopes: Vec::new(),
                                             pass_policy: Default::default(),
                                             name: callee_name.clone(),
                                             return_type: crate::common::types::IrType::I32,
@@ -2201,6 +2204,9 @@ fn inline_run_with(
                                         // Reconstruct IrFunction for callee from callee_map data
                                         // callee_map stores blocks, we need to create a dummy IrFunction
                                         let dummy = crate::ir::reexports::IrFunction {
+                                            debug_param_indices: Vec::new(),
+                                            debug_locals: Vec::new(),
+                                            debug_scopes: Vec::new(),
                                             pass_policy: Default::default(),
                                             name: callee_name.clone(),
                                             return_type: crate::common::types::IrType::I32,
@@ -7797,6 +7803,9 @@ mod value_reference_tests {
 
     fn user_function(instructions: Vec<Instruction>) -> IrFunction {
         IrFunction {
+            debug_param_indices: Vec::new(),
+            debug_locals: Vec::new(),
+            debug_scopes: Vec::new(),
             pass_policy: Default::default(),
             name: "user".into(),
             return_type: IrType::Void,
@@ -8396,6 +8405,9 @@ mod const_trip_tests {
 
     fn function(blocks: Vec<BasicBlock>) -> IrFunction {
         IrFunction {
+            debug_param_indices: Vec::new(),
+            debug_locals: Vec::new(),
+            debug_scopes: Vec::new(),
             pass_policy: Default::default(),
             name: "callee".into(),
             return_type: IrType::Void,

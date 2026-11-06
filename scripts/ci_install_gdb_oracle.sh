@@ -14,6 +14,7 @@
 #                                                 table
 #   tests/regression/check_incoming_byval_homes.sh backtrace on a by-value crash
 #   tests/regression/check_dwarf_versions.py      form/attribute readability
+#   tests/regression/check_dwarf_parameters.py    O0 parameter homes and GDB values
 #
 # Every one of them resolves the debugger opportunistically
 # (`shutil.which("gdb")` / `command -v gdb`) and SKIPS the cross-check when it

@@ -2599,6 +2599,13 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
     /// the emission relied on; other backends ignore it.
     fn note_function_emitted(&mut self, _func: &IrFunction, _mark: usize) {}
 
+    /// A proven parameter home as `(DWARF frame-pointer register, offset)`,
+    /// or `None` when the slot is not addressable through a stable frame
+    /// pointer (FPO, over-aligned adjustment, or a target without one).
+    fn debug_parameter_home(&self, _slot: crate::backend::state::StackSlot) -> Option<(u8, i64)> {
+        None
+    }
+
     /// Optimize both dual-layout candidates for the instruction-count metric.
     ///
     /// Every shipped backend (x86-64, i686, AArch64, RISC-V) overrides this to

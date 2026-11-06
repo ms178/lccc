@@ -853,6 +853,8 @@ impl ElfWriterBase {
                 built.extend([info.info, info.abbrev]);
                 built.extend(info.aranges);
                 built.extend(info.ranges);
+                built.extend(info.loc);
+                built.extend(info.loclists);
             }
         }
         if let Some(line) = line {

@@ -1270,6 +1270,165 @@ pub(crate) struct DwarfInfoBuild {
     /// `.debug_ranges`/`.debug_rnglists`, present only when the unit's code is
     /// not one contiguous section (see [`build_debug_ranges`]).
     pub ranges: Option<ObjSection>,
+    /// `.debug_loc` (DWARF 2..4) parameter location lists.
+    pub loc: Option<ObjSection>,
+    /// `.debug_loclists` (DWARF 5) parameter location lists.
+    pub loclists: Option<ObjSection>,
+}
+
+/// Parameter location lists, in the dialect's own section.  Kept apart from
+/// `.debug_info` so a unit without proven homes pays no section header.
+#[derive(Default)]
+struct LocationLists {
+    loc: Vec<u8>,
+    loc_relocs: Vec<ObjReloc>,
+    loclists: Vec<u8>,
+    loclists_relocs: Vec<ObjReloc>,
+}
+
+impl LocationLists {
+    /// Append one `[start, end)` home and return the section offset a
+    /// `DW_AT_location` attribute names.  The expression is `DW_OP_bregN`
+    /// plus the codegen-proven slot offset; the range is the line table's
+    /// prologue_end..epilogue_begin, so the entry is not claimed while the
+    /// frame pointer or the home is still being established.
+    fn emit(
+        &mut self,
+        config: DwarfConfig,
+        address_size: usize,
+        abs_addr: u32,
+        section: &str,
+        function_start: u64,
+        start: u64,
+        end: u64,
+        base_register: u8,
+        offset: i64,
+    ) -> Result<(&'static str, u32), String> {
+        let mut expr = vec![DW_OP_BREG0 + base_register];
+        write_sleb128(offset, &mut expr);
+        let expr_len = u16::try_from(expr.len())
+            .map_err(|_| "DWARF parameter expression exceeds 65535 bytes".to_string())?;
+        if config.version >= 5 {
+            if self.loclists.is_empty() {
+                self.loclists.extend_from_slice(&[0; 4]); // unit_length, patched below
+                self.loclists.extend_from_slice(&5u16.to_le_bytes());
+                self.loclists.push(address_size as u8);
+                self.loclists.push(0); // segment_selector_size
+                self.loclists.extend_from_slice(&0u32.to_le_bytes()); // offset_entry_count
+            }
+            let at = u32::try_from(self.loclists.len())
+                .map_err(|_| "DWARF .debug_loclists exceeds 4 GiB".to_string())?;
+            self.loclists.push(DW_LLE_BASE_ADDRESS);
+            push_reloc(
+                &mut self.loclists,
+                &mut self.loclists_relocs,
+                abs_addr,
+                address_size,
+                section,
+                function_start,
+            )?;
+            self.loclists.push(DW_LLE_OFFSET_PAIR);
+            write_uleb128(start - function_start, &mut self.loclists);
+            write_uleb128(end - function_start, &mut self.loclists);
+            write_uleb128(expr.len() as u64, &mut self.loclists);
+            self.loclists.extend_from_slice(&expr);
+            self.loclists.push(DW_LLE_END_OF_LIST);
+            Ok((".debug_loclists", at))
+        } else {
+            let at = u32::try_from(self.loc.len())
+                .map_err(|_| "DWARF .debug_loc exceeds 4 GiB".to_string())?;
+            // DWARF 2..4 base-address selection: an all-ones begin marker and
+            // a relocated base, then offsets relative to it.  Absolute entries
+            // without a base are added to the subprogram's low_pc by consumers
+            // (GCC emits function-relative offsets), which would double-count
+            // the function address after linking.
+            self.loc.resize(self.loc.len() + address_size, 0xff);
+            push_reloc(
+                &mut self.loc,
+                &mut self.loc_relocs,
+                abs_addr,
+                address_size,
+                section,
+                function_start,
+            )?;
+            self.loc
+                .extend_from_slice(&(start - function_start).to_le_bytes()[..address_size]);
+            self.loc
+                .extend_from_slice(&(end - function_start).to_le_bytes()[..address_size]);
+            self.loc.extend_from_slice(&expr_len.to_le_bytes());
+            self.loc.extend_from_slice(&expr);
+            self.loc.resize(self.loc.len() + 2 * address_size, 0); // end-of-list
+            Ok((".debug_loc", at))
+        }
+    }
+
+    fn finish(mut self) -> (Option<ObjSection>, Option<ObjSection>) {
+        if !self.loclists.is_empty() {
+            let length = (self.loclists.len() - 4) as u32;
+            self.loclists[..4].copy_from_slice(&length.to_le_bytes());
+        }
+        let loc =
+            (!self.loc.is_empty()).then(|| debug_section(".debug_loc", self.loc, self.loc_relocs));
+        let loclists = (!self.loclists.is_empty())
+            .then(|| debug_section(".debug_loclists", self.loclists, self.loclists_relocs));
+        (loc, loclists)
+    }
+}
+
+/// The address range in which a parameter home is live: the first
+/// `prologue_end` row inside the function up to the first `epilogue_begin`
+/// after it (or the function end when the epilogue carries no marker).
+fn parameter_live_range(
+    function: &DwarfFunction<'_>,
+    locations: &[DwarfLineLocation],
+) -> Option<(u64, u64)> {
+    let function_end = function.offset.checked_add(function.size)?;
+    let inside = |row: &DwarfLineLocation| {
+        row.section_index == function.section_index
+            && row.offset >= function.offset
+            && row.offset < function_end
+    };
+    let start = locations
+        .iter()
+        .filter(|row| inside(row) && row.options.prologue_end)
+        .map(|row| row.offset)
+        .min()?;
+    let end = locations
+        .iter()
+        .filter(|row| {
+            row.section_index == function.section_index
+                && row.offset > start
+                && row.offset <= function_end
+                && row.options.epilogue_begin
+        })
+        .map(|row| row.offset)
+        .min()
+        .unwrap_or(function_end);
+    (end > start).then_some((start, end))
+}
+
+/// First row at or after a local variable's declaration, inside its live range.
+fn local_decl_start(
+    function: &DwarfFunction<'_>,
+    locations: &[DwarfLineLocation],
+    live_start: u64,
+    decl_file: Option<u64>,
+    decl_line: Option<u32>,
+    decl_column: Option<u32>,
+) -> Option<u64> {
+    let (file, line, column) = (decl_file?, decl_line?, decl_column.unwrap_or(0));
+    let function_end = function.offset.checked_add(function.size)?;
+    locations
+        .iter()
+        .filter(|row| {
+            row.section_index == function.section_index
+                && row.offset >= live_start
+                && row.offset < function_end
+                && u64::from(row.file_number) == file
+                && (row.line, row.column) >= (line, column)
+        })
+        .map(|row| row.offset)
+        .min()
 }
 
 /// Every attribute form one object's units use, decided once from the dialect.
@@ -1312,6 +1471,9 @@ struct UnitForms {
     /// as a constant before it (the attribute is a GNU extension in DWARF 2 and
     /// a standard one from DWARF 3, where its form is `DW_FORM_data4`).
     ranges: u64,
+    /// `DW_AT_location` pointing at a location list: sec_offset from v4,
+    /// data4 (a DWARF32 section offset) before it.
+    location: u64,
 }
 
 impl UnitForms {
@@ -1358,21 +1520,43 @@ impl UnitForms {
             } else {
                 DW_FORM_DATA4
             },
+            location: if four {
+                DW_FORM_SEC_OFFSET
+            } else {
+                DW_FORM_DATA4
+            },
         }
     }
 }
 
 /// Declare the compile unit's abbreviation and return its code.
 ///
-/// This is the one shape a unit needs before any DIE is written, because the
-/// unit DIE names the table every other DIE's code indexes.  Every other shape --
-/// subprogram, parameter, type, member, variable -- is declared by
-/// [`DieWriter::code_for`] the first time a DIE takes it, so the table holds
-/// exactly the shapes its DIEs use.  Declaring them up front instead, as the
-/// cross product of their optional attributes, cost every unit the shapes it had
-/// no DIE for: five of the eight subprogram combinations, and whichever parameter
-/// shapes the unit's own frame layout made unreachable.
-fn declare_unit_abbrev(
+/// Named rather than returned as a tuple of arrays because four of the six are
+/// indexed the same way and a caller that mixes two of them would still compile.
+struct UnitAbbrevs {
+    /// The compile-unit DIE.
+    cu_code: u64,
+    /// A subprogram without children, `[has no declaration][is external]`.
+    subprogram: [[u64; 2]; 2],
+    /// The same subprogram shapes with a child list: the one a defined function
+    /// with parameters needs, so a debugger can list the arguments it takes.
+    subprogram_with_children: [[u64; 2]; 2],
+    /// `DW_TAG_formal_parameter` with a name, and without one (a prototype).
+    formal_parameter_named: u64,
+    formal_parameter_named_loc: u64,
+    formal_parameter_unnamed: u64,
+    /// `DW_TAG_unspecified_parameters`: the list continues with `...`.
+    unspecified_parameters: u64,
+    next_code: u64,
+}
+
+/// Declare every abbreviation of a unit and return the codes its DIEs use.
+///
+/// One subprogram abbreviation per shape, numbered from 3.  `DW_FORM_flag_present`
+/// says "this function is external" by its presence, so from version 4 on a
+/// static function omits the attribute and needs its own abbreviation; versions 2
+/// and 3 carry the flag's value and serve both shapes with one.
+fn declare_unit_abbrevs(
     abbrev: &mut Vec<u8>,
     config: DwarfConfig,
     forms: UnitForms,
@@ -1418,11 +1602,129 @@ fn declare_unit_abbrev(
     // a translation unit that is only data (measured), and a consumer then finds
     // the unit by walking `.debug_info` rather than through `.debug_aranges`.
     declare_abbrev(abbrev, 1, DW_TAG_COMPILE_UNIT, true, &cu_attrs);
-    // Everything a DIE can take is declared by the DIE that takes it.
+    // The unspecified return type GAS uses, so a debugger never assumes `int`.
+    // Only a unit with code has subprograms to attach it to.
+    if has_code {
+        declare_abbrev(abbrev, 2, DW_TAG_UNSPECIFIED_TYPE, false, &[]);
+    }
+    let mut subprogram_code = [[3u64; 2]; 2];
+    let mut subprogram_with_children = [[3u64; 2]; 2];
+    let mut next_code = 3;
+    for has_declaration in [true, false] {
+        let mut attrs = vec![(DW_AT_NAME, forms.string)];
+        if config.version < 4 {
+            attrs.push((DW_AT_EXTERNAL, forms.external));
+        }
+        if has_declaration {
+            // `DW_FORM_udata` is never wider than the `DW_FORM_data1` GCC uses
+            // and never truncates either: it is the shortest form that holds any
+            // file index or line number.
+            attrs.push((DW_AT_DECL_FILE, DW_FORM_UDATA));
+            attrs.push((DW_AT_DECL_LINE, DW_FORM_UDATA));
+            if declarator_rows {
+                // Only where a declarator row can supply it: `udata` 0 is the
+                // standard spelling of "column unknown", and units assembled
+                // from `.loc` rows alone have nothing better to say.
+                attrs.push((DW_AT_DECL_COLUMN, DW_FORM_UDATA));
+            }
+        }
+        attrs.extend_from_slice(&[
+            // `DW_FORM_ref4`, not `ref_udata`: the compiler's type table is laid
+            // out after the subprograms, so a variable-width reference could not
+            // be written before its target's offset was known.
+            (DW_AT_TYPE, DW_FORM_REF4),
+            (DW_AT_LOW_PC, DW_FORM_ADDR),
+            (DW_AT_HIGH_PC, forms.high_pc),
+        ]);
+        if config.version >= 3 {
+            // Every subprogram this writer describes has code (the walk below
+            // skips functions whose size is zero), and the assembler gives all
+            // of it an FDE, so the CFA expression is always evaluable.
+            attrs.push((DW_AT_FRAME_BASE, DW_FORM_EXPRLOC));
+        }
+        // Two declarations of every shape: one without children (a function with
+        // no parameter to list) and one with, which the caller terminates with a
+        // zero code after the parameter DIEs.  A subprogram that declares
+        // children and has none would be a different byte stream for the same
+        // meaning, so the caller picks by the parameter list it has.
+        for children in [false, true] {
+            let slot = if children {
+                &mut subprogram_with_children[usize::from(!has_declaration)]
+            } else {
+                &mut subprogram_code[usize::from(!has_declaration)]
+            };
+            if config.version >= 4 {
+                let mut external_atts = attrs.clone();
+                external_atts.insert(1, (DW_AT_EXTERNAL, forms.external));
+                declare_abbrev(
+                    abbrev,
+                    next_code,
+                    DW_TAG_SUBPROGRAM,
+                    children,
+                    &external_atts,
+                );
+                slot[1] = next_code;
+                next_code += 1;
+                declare_abbrev(abbrev, next_code, DW_TAG_SUBPROGRAM, children, &attrs);
+                slot[0] = next_code;
+                next_code += 1;
+            } else {
+                declare_abbrev(abbrev, next_code, DW_TAG_SUBPROGRAM, children, &attrs);
+                *slot = [next_code, next_code];
+                next_code += 1;
+            }
+        }
+    }
+    // The parameter shapes.  A named parameter states where the user wrote it and
+    // what type it has; an unnamed one (a prototype's `void f(int)`) states only
+    // the type, which is the difference `DW_AT_name`'s presence encodes.
+    declare_abbrev(
+        abbrev,
+        next_code,
+        DW_TAG_FORMAL_PARAMETER,
+        false,
+        &[(DW_AT_NAME, forms.string), (DW_AT_TYPE, DW_FORM_REF4)],
+    );
+    let formal_parameter_named = next_code;
+    next_code += 1;
+    declare_abbrev(
+        abbrev,
+        next_code,
+        DW_TAG_FORMAL_PARAMETER,
+        false,
+        &[
+            (DW_AT_NAME, forms.string),
+            (DW_AT_TYPE, DW_FORM_REF4),
+            (DW_AT_LOCATION, forms.location),
+        ],
+    );
+    let formal_parameter_named_loc = next_code;
+    next_code += 1;
+    declare_abbrev(
+        abbrev,
+        next_code,
+        DW_TAG_FORMAL_PARAMETER,
+        false,
+        &[(DW_AT_TYPE, DW_FORM_REF4)],
+    );
+    let formal_parameter_unnamed = next_code;
+    next_code += 1;
+    declare_abbrev(abbrev, next_code, DW_TAG_UNSPECIFIED_PARAMETERS, false, &[]);
+    let unspecified_parameters = next_code;
+    next_code += 1;
     // The end-of-table marker is written by the caller, after the compiler's own
     // DIE tables have added their abbreviations: a terminator here would hide
     // every one of them from a consumer.
-    1
+    UnitAbbrevs {
+        cu_code: 1,
+        subprogram: subprogram_code,
+        subprogram_with_children,
+        formal_parameter_named,
+        formal_parameter_named_loc,
+        formal_parameter_unnamed,
+        unspecified_parameters,
+        next_code,
+    }
 }
 
 /// The code sections a unit describes, in section order.
@@ -1639,14 +1941,23 @@ pub(crate) fn build_dwarf_info_sections(
         // The unit's base address: the start of its first range.  With a range
         // list present this is the base a consumer may offset ranges against
         // (DWARF 5 §2.17.3); without one it is simply the start of the code.
-        push_reloc(
-            &mut info,
-            &mut relocs,
-            abs_addr,
-            address_size,
-            first.name,
-            0,
-        )?;
+        if range_list {
+            // With DW_AT_ranges the CU's low_pc is the *base* the range
+            // entries are relative to.  Our .debug_ranges/.debug_rnglists
+            // entries are absolute relocated addresses, so the base is zero;
+            // naming the first code address here makes consumers add it a
+            // second time (GDB: "pc in address map, but not in symtab").
+            info.resize(info.len() + address_size, 0);
+        } else {
+            push_reloc(
+                &mut info,
+                &mut relocs,
+                abs_addr,
+                address_size,
+                first.name,
+                0,
+            )?;
+        }
         if !range_list {
             if forms.high_pc == DW_FORM_ADDR {
                 if let Some(symbol_at) = symbol_at.as_deref_mut() {
@@ -1677,13 +1988,35 @@ pub(crate) fn build_dwarf_info_sections(
     }
 
     let void_die = length32((info.len() - start) as u64, "unit")?;
-    // The unspecified return type: `DW_TAG_unspecified_type`, so a debugger never
-    // assumes `int` for a return type the unit does not record.  Only a unit with
-    // code has subprograms to attach it to, and its code is declared here because
-    // the subprogram DIEs refer to the DIE by offset.
+    let mut location_lists = LocationLists::default();
     if has_code {
-        let void_code = dies.code_for(DW_TAG_UNSPECIFIED_TYPE, false, &[]);
-        write_uleb128(void_code, &mut info);
+        write_uleb128(2, &mut info);
+        emit_subprograms(
+            SubprogramSink {
+                info: &mut info,
+                relocs: &mut relocs,
+                dies: &mut dies,
+                strings: &mut *strings,
+                line_strings: &mut *line_strings,
+                symbol_at,
+                config,
+                forms,
+                abs32,
+                abs_addr,
+                address_size,
+                has_declarator_rows,
+                location_lists: &mut location_lists,
+            },
+            functions,
+            sections,
+            &covered,
+            unit,
+            &abbrevs,
+            &declaration,
+            void_die,
+            locations,
+            &file_table,
+        )?;
     }
     {
         let mut ctx = DieContext {
@@ -1725,12 +2058,38 @@ pub(crate) fn build_dwarf_info_sections(
 
     let unit_length = length32((info.len() - start - 4) as u64, "unit")?;
     info[start..start + 4].copy_from_slice(&unit_length.to_le_bytes());
+    let (loc, loclists) = location_lists.finish();
     Ok(Some(DwarfInfoBuild {
         info: debug_section(".debug_info", info, relocs),
         abbrev: debug_section(".debug_abbrev", dies.abbrev, Vec::new()),
         aranges: build_debug_aranges(start as u64, &code, address_size, abs32, abs_addr, labels)?,
         ranges: build_debug_ranges(config, &code, address_size, abs_addr)?,
+        loc,
+        loclists,
     }))
+}
+
+/// The three outputs a subprogram DIE appends to, and the dialect it must be
+/// spelled in.
+///
+/// Passing this as one value is what keeps [`emit_subprograms`] readable: the
+/// alternative is fifteen arguments, four of them mutable, in every recursive
+/// helper.  `symbol_at` is moved in because the caller has no further use for
+/// it — the unit's `low_pc` was already relocated against a label.
+struct SubprogramSink<'a, 's, 'f> {
+    info: &'a mut Vec<u8>,
+    relocs: &'a mut Vec<ObjReloc>,
+    dies: &'a mut DieWriter,
+    strings: &'a mut DwarfStrings,
+    line_strings: &'a mut DwarfStrings,
+    symbol_at: SymbolAt<'s, 'f>,
+    config: DwarfConfig,
+    forms: UnitForms,
+    abs32: u32,
+    abs_addr: u32,
+    address_size: usize,
+    has_declarator_rows: bool,
+    location_lists: &'a mut LocationLists,
 }
 
 /// Every function of the unit, as `DW_TAG_subprogram` DIEs in address order.
@@ -1758,7 +2117,26 @@ fn emit_subprograms(
     unit: &DwarfUnitSpec,
     declaration: &dyn Fn(usize, u64, u64) -> Option<SourcePosition>,
     void_die: u32,
+    locations: &[DwarfLineLocation],
+    file_table: &[(u32, &str)],
 ) -> Result<(), String> {
+    // Destructured into plain locals, so the emission below reads exactly as it
+    // did when it lived inline in the section builder.
+    let SubprogramSink {
+        info,
+        relocs,
+        dies,
+        strings,
+        line_strings,
+        mut symbol_at,
+        config,
+        forms,
+        abs32,
+        abs_addr,
+        address_size,
+        has_declarator_rows,
+        location_lists,
+    } = sink;
     let mut members: Vec<&DwarfFunction<'_>> = functions
         .iter()
         .filter(|f| f.size != 0 && covered[f.section_index])
@@ -1783,25 +2161,37 @@ fn emit_subprograms(
         // A function with parameters declares children; one without keeps the
         // compact shape, so the common case costs no trailing byte.
         let parameters = unit.parameters_of(function.name);
-        let mut attrs: Vec<Attr<'_>> = Vec::with_capacity(9);
-        attrs.push(Attr {
-            at: DW_AT_NAME,
-            value: AttrValue::Text(Cow::Borrowed(function.name)),
-        });
-        // `DW_FORM_flag` in DWARF 2 and 3: the byte after the name says whether
-        // the function is external, so a static function states `0`.  From
-        // version 4 the attribute is a `flag_present`, which can only say
-        // "true", so it exists on external functions alone and costs no bytes.
-        if ctx.config.version < 4 {
-            attrs.push(Attr {
-                at: DW_AT_EXTERNAL,
-                value: AttrValue::Flag(function.external),
-            });
-        } else if function.external {
-            attrs.push(Attr {
-                at: DW_AT_EXTERNAL,
-                value: AttrValue::Flag(true),
-            });
+        let locals: Vec<&crate::backend::elf::DwarfLocalVariable> = unit
+            .local_variables
+            .iter()
+            .filter(|local| {
+                local.function == function.name
+                    && local.base_register.is_some()
+                    && local.offset.is_some()
+            })
+            .collect();
+        let has_children = parameters.is_some() || !locals.is_empty();
+        let shape = if has_children {
+            &abbrevs.subprogram_with_children
+        } else {
+            &abbrevs.subprogram
+        };
+        let abbrev_code = shape[usize::from(known.is_none())][usize::from(function.external)];
+        write_uleb128(abbrev_code, info);
+        write_string_attribute(
+            function.name,
+            forms.string,
+            info,
+            relocs,
+            abs32,
+            strings,
+            line_strings,
+        )?;
+        if config.version < 4 {
+            // `DW_FORM_flag`: the byte after the name says whether the
+            // function is external. From DWARF 4 on the attribute is a
+            // `flag_present` and only exists on external functions.
+            info.push(u8::from(function.external));
         }
         if let Some(position) = known {
             // `DW_FORM_udata` is never wider than the `DW_FORM_data1` GCC uses
@@ -1887,9 +2277,22 @@ fn emit_subprograms(
         // function's arguments from here; the `DW_TAG_formal_parameter` DIEs
         // inside a `DW_TAG_subroutine_type` describe a *type* and are anonymous,
         // so they cannot answer "what is `n` in this frame".
+        let live_range = parameter_live_range(function, locations);
         if let Some(list) = parameters {
             for parameter in &list.parameters {
-                let mut attrs: Vec<Attr<'_>> = Vec::with_capacity(3);
+                let located = parameter
+                    .name
+                    .as_deref()
+                    .and_then(|name| unit.parameter_location(function.name, name))
+                    .zip(live_range);
+                let code = if located.is_some() {
+                    abbrevs.formal_parameter_named_loc
+                } else if parameter.name.is_some() {
+                    abbrevs.formal_parameter_named
+                } else {
+                    abbrevs.formal_parameter_unnamed
+                };
+                write_uleb128(code, info);
                 if let Some(name) = parameter.name.as_deref() {
                     if name.as_bytes().contains(&0) {
                         return Err(format!(
@@ -1901,30 +2304,121 @@ fn emit_subprograms(
                         value: AttrValue::Text(Cow::Borrowed(name)),
                     });
                 }
-                attrs.push(Attr {
-                    at: DW_AT_TYPE,
-                    value: AttrValue::TypeRef(parameter.ty),
-                });
-                if let Some(location) = parameter.location {
-                    // `DW_OP_fbreg <delta>` in a `block1`: one opcode, then a
-                    // signed LEB128.  The frame base is `DW_OP_call_frame_cfa`,
-                    // so this reads "the caller's stack pointer at the call, plus
-                    // `delta`" -- the slot the prologue writes and the address
-                    // `&parameter` yields.  A parameter the frame could not place
-                    // omits the attribute instead of writing an empty block: an
-                    // empty block is not "unknown", it is an expression of length
-                    // zero, which a consumer must reject.
-                    attrs.push(Attr {
-                        at: DW_AT_LOCATION,
-                        value: AttrValue::LocationExpr(location.expression()),
-                    });
+                // The type reference is patched once the type table has offsets.
+                dies.patches.push((info.len(), parameter.ty));
+                info.extend_from_slice(&[0; 4]);
+                if let Some((home, (start, end))) = located {
+                    let section = &sections[function.section_index];
+                    let (list_section, offset) = location_lists.emit(
+                        config,
+                        address_size,
+                        abs_addr,
+                        section.name,
+                        function.offset,
+                        start,
+                        end,
+                        home.base_register,
+                        home.offset,
+                    )?;
+                    push_reloc(info, relocs, abs32, 4, list_section, u64::from(offset))?;
                 }
-                ctx.write(DW_TAG_FORMAL_PARAMETER, false, &attrs)?;
             }
             if list.variadic {
                 ctx.write(DW_TAG_UNSPECIFIED_PARAMETERS, false, &[])?;
             }
-            ctx.info.push(0); // end of this subprogram's children
+        }
+        // D14: local variables with a proven frame home. A promoted/folded
+        // local has no home and is not described; a location that does not
+        // exist is worse than none.
+        if let Some((start, end)) = live_range {
+            for local in locals {
+                let (base_register, offset) = (
+                    local.base_register.expect("filtered above"),
+                    local.offset.expect("filtered above"),
+                );
+                let mut attrs = vec![(DW_AT_NAME, forms.string), (DW_AT_TYPE, DW_FORM_REF4)];
+                let decl_file = local.decl_file.as_deref().and_then(|name| {
+                    file_table
+                        .iter()
+                        .position(|(_, file)| *file == name)
+                        .map(|pos| {
+                            if config.version >= 5 {
+                                u64::from(file_table[pos].0)
+                            } else {
+                                pos as u64 + 1
+                            }
+                        })
+                });
+                if decl_file.is_some() {
+                    attrs.push((DW_AT_DECL_FILE, DW_FORM_UDATA));
+                    if local.decl_line.is_some() {
+                        attrs.push((DW_AT_DECL_LINE, DW_FORM_UDATA));
+                        if local.decl_column.is_some() {
+                            attrs.push((DW_AT_DECL_COLUMN, DW_FORM_UDATA));
+                        }
+                    }
+                }
+                attrs.push((DW_AT_LOCATION, forms.location));
+                let code = dies.code_for(DW_TAG_VARIABLE, false, &attrs);
+                write_uleb128(code, info);
+                if local.name.as_bytes().contains(&0) {
+                    return Err(format!(
+                        "DWARF local name contains a NUL byte: {:?}",
+                        local.name
+                    ));
+                }
+                write_string_attribute(
+                    &local.name,
+                    forms.string,
+                    info,
+                    relocs,
+                    abs32,
+                    strings,
+                    line_strings,
+                )?;
+                dies.patches.push((info.len(), local.ty));
+                info.extend_from_slice(&[0; 4]);
+                if let Some(file) = decl_file {
+                    write_uleb128(file, info);
+                    if let Some(line) = local.decl_line {
+                        write_uleb128(u64::from(line), info);
+                        if let Some(column) = local.decl_column {
+                            write_uleb128(u64::from(column), info);
+                        }
+                    }
+                }
+                // Do not claim the home before the declaration's own row: the
+                // slot exists in the frame, but the object is not initialized
+                // until the declaration runs.
+                let local_start = local_decl_start(
+                    function,
+                    locations,
+                    start,
+                    decl_file,
+                    local.decl_line,
+                    local.decl_column,
+                )
+                .unwrap_or(start);
+                if local_start >= end {
+                    continue;
+                }
+                let section = &sections[function.section_index];
+                let (list_section, list_offset) = location_lists.emit(
+                    config,
+                    address_size,
+                    abs_addr,
+                    section.name,
+                    function.offset,
+                    local_start,
+                    end,
+                    base_register,
+                    offset,
+                )?;
+                push_reloc(info, relocs, abs32, 4, list_section, u64::from(list_offset))?;
+            }
+        }
+        if has_children {
+            info.push(0); // end of this subprogram's children
         }
     }
     Ok(())
@@ -3220,10 +3714,13 @@ const DW_FORM_BLOCK1: u64 = 0x0a;
 const DW_FORM_SDATA: u64 = 0x0d;
 /// `DW_OP_addr`: the address of an object, as a relocation the linker resolves.
 const DW_OP_ADDR: u8 = 0x03;
-/// `DW_OP_fbreg`: a signed displacement from the frame base of the enclosing
-/// subprogram.  Version 2 and later, so every dialect this writer emits can use
-/// it, and GCC 16.2 uses it for the same slots at `-O0`.
-pub(crate) const DW_OP_FBREG: u8 = 0x91;
+/// `DW_OP_breg0 + N`: the value at register N plus a signed LEB128 offset.
+const DW_OP_BREG0: u8 = 0x70;
+/// DWARF 5 location-list entries: a relocated base address, then an
+/// offset pair relative to it, then the end-of-list marker.
+const DW_LLE_END_OF_LIST: u8 = 0x00;
+const DW_LLE_OFFSET_PAIR: u8 = 0x04;
+const DW_LLE_BASE_ADDRESS: u8 = 0x06;
 /// `DW_OP_plus_uconst`: the member offset a version 2 or 3 unit writes as a
 /// block rather than as a constant.
 const DW_OP_PLUS_UCONST: u8 = 0x23;
@@ -3954,6 +4451,8 @@ mod tests {
             variables: Vec::new(),
             return_types: FxHashMap::default(),
             parameters,
+            parameter_locations: Vec::new(),
+            local_variables: Vec::new(),
         };
         for version in 2..=5 {
             let config = DwarfConfig::for_c(version, None);
