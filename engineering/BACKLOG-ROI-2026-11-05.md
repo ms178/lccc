@@ -101,6 +101,25 @@ without a test that fails when it regresses.
    omit locations (measured, documented) or emit one GDB resolves to the true
    value; any half-correct implementation fails. The census docstring now
    records the GDB observation explicitly.
+
+   The deferral was re-measured rather than assumed on the final tree:
+   `lccc -g -O0 -S` emits 18 `.cfi_*` directives, the object carries
+   `.eh_frame` with relocations, and the subprogram already publishes
+   `DW_AT_frame_base = DW_OP_call_frame_cfa`, so a `DW_OP_fbreg` location is
+   *almost* expressible. At `-O0` the first two parameters live at
+   `-8(%rbp)` and `-16(%rbp)`; with CFA = `%rbp + 16` those are
+   `DW_OP_fbreg(-24)` and `DW_OP_fbreg(-32)`. But those locations are only
+   valid **after** the prologue stores them: a single static expression would
+   make GDB read garbage when the user stops at `*func` before the store.
+   A correct fix needs a location list split at the existing
+   `.loc ... prologue_end` marker (register at entry, frame slot afterwards),
+   and `writer_base.rs` has no `.debug_loc` / `.debug_loclists` section writer
+   -- its `debug_loc()` is the `.loc` *line-table* directive emitter. Adding
+   that infrastructure (plus its relocations, DWARF 2/3/4 vs 5 forms, four
+   target ABIs and a census-baseline update) is a separate feature. Shipping a
+   plausible-looking `DW_OP_regN` here would trade an honest
+   `<optimized out>` for a silently wrong value, which is strictly worse for
+   runtime debugging. The forward ratchet keeps this visible and testable.
 7. **The deferral list was still only statically checked.**  An import-time
    assertion compares two hard-coded tables; a new LCCC capability added
    without updating `BASELINE_TAGS` would still be masked by an old deferral.
@@ -273,7 +292,25 @@ without a test that fails when it regresses.
     inside `@response` files (including a malformed one that must be a hard
     error) and repeated mixed `-O` spellings with sticky explicit
     `-ffast-math` / `-fno-fast-math`.
-17. **Host-CPU runtime behaviour was checked with a real debugger, not just
+17. **The third oracle disagreed, and that settled a design question.**  The
+    authenticated ICX 2026.2 lane ran the new four-compiler parity gate and
+    failed with real data: `icx: probe is vacuous, -Ofast == -O3` and
+    `icx: -Ofast -O4/-O9/-O2 still defines __FAST_MATH__`. ICX's numeric
+    `-O<n>` clamping and its *assembly* withdrawal both matched GCC 16.2 /
+    Clang 23.1.5 / LCCC; only the macro and this fixture's vectorization
+    differ. ICX 2026.2 is built on an older LLVM base than Clang 23.1.5.
+    Decision: LCCC keeps the GCC/Clang 23.1.5 policy, because a stale
+    `__FAST_MATH__` macro after the compiler has withdrawn fast-math codegen
+    is a correctness hazard for source that branches on the macro. The gate
+    now asserts the two universal invariants (clamping, assembly withdrawal)
+    for all four compilers, asserts the macro withdrawal and probe
+    non-vacuity only for LCCC/GCC/Clang, and **reports and pins** the two ICX
+    observations so a future ICX adopting the GCC/Clang behaviour cannot turn
+    CI red. A negative control (a wrapper that drops every plain `-O*`) makes
+    the ICX slot fail with three `did not withdraw` errors, proving the
+    ICX-specific assertions are not vacuous. The measured divergence and the
+    policy decision are also pinned in `test_ofast_composition.py`'s docstring.
+18. **Host-CPU runtime behaviour was checked with a real debugger, not just
    assembly hashes.**  A four-frame `noinline` fixture compiled by LCCC,
    GCC 16.2 and Clang 23.1.5 at `-O2`, `-Ofast` and `-Og` produces identical
    results for inputs 5, -3, 0 and 12345 (`6n+16`). GDB's backtrace at `leaf`
@@ -330,9 +367,12 @@ stays still.
 
 ## Verification
 
-All results below are from the rebased tree (`origin/main` = `fe8d911`, which
-merged 146 unrelated files), rebuilt with the fastbuild preset and the pinned
-GCC 16.2.0 / Clang 23.1.5 / GDB 18.1 / Rust 1.99.1 oracles.
+All results below are from the rebased tree (`origin/main` = `32a8f6a`, which
+merged PR #1102 and later PR #1111's six backend/preprocessor commits),
+rebuilt with the fastbuild preset and the pinned GCC 16.2.0 / Clang 23.1.5 /
+GDB 18.1 / Rust 1.99.1 oracles. The rebase replayed all nine PR commits with
+no conflicts; the full Rust suite, corpus and every gate below were re-run
+against the rebuilt post-rebase binaries.
 
 | Check | Result |
 |---|---|

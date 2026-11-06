@@ -31,8 +31,16 @@ One vector is a genuine oracle disagreement: `-fno-fast-math -Ofast` is OFF
 in GCC 16.2 and ON in Clang 23.1. LCCC follows GCC, because an explicit user
 opt-out of unsafe FP math must never be silently revoked by a later `-O`
 spelling. That decision is pinned here with measured oracle values instead of
-being asserted from memory. The authenticated ICX 2026.2 lane in hosted CI
-supplies the third comparison oracle that this sandbox cannot install.
+being asserted from memory.
+
+The authenticated ICX 2026.2 lane in hosted CI supplies the third comparison
+oracle that this sandbox cannot install. Measured there (2026-11-06): ICX
+2026.2 keeps `__FAST_MATH__` defined after `-Ofast -O4` / `-O9` / `-O2`,
+whereas GCC 16.2, Clang 23.1.5 and LCCC withdraw it. ICX is built on an older
+LLVM base; a stale fast-math macro after the compiler has withdrawn fast-math
+codegen is a correctness hazard for source that branches on the macro, so
+LCCC deliberately follows GCC/Clang 23.1.5. The four-compiler measurement is
+`tests/regression/check_icx_o_level_parity.py`.
 """
 
 from __future__ import annotations
