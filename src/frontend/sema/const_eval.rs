@@ -653,7 +653,7 @@ impl<'a> SemaConstEval<'a> {
                 // answer here is a silently wrong constant in code that is
                 // *specified* by it, so the reasoning must be inspectable.
                 if std::env::var_os("CCC_DEBUG_TYPES_COMPATIBLE").is_some() {
-                    eprintln!(
+                    lccc::cli_output::stderr_line(format_args!(
                         "[types-compatible] {t1:?} vs {t2:?}: quals {q1:?}/{q2:?} \
                          levels {l1}/{l2} types_equal={teq} quals_compatible={qok}",
                         t1 = ctype1,
@@ -669,7 +669,7 @@ impl<'a> SemaConstEval<'a> {
                             qualifiers2,
                             qualifier_levels(&ctype2),
                         ),
-                    );
+                    ));
                 }
                 let compatible = crate::frontend::parser::ast::nested_type_qualifiers_compatible(
                     qualifiers1,

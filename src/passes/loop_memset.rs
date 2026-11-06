@@ -54,7 +54,7 @@ fn trace_enabled() -> bool {
 macro_rules! refuse {
     ($($arg:tt)*) => {{
         if trace_enabled() {
-            eprintln!("[loop-memset] refuse: {}", format_args!($($arg)*));
+            lccc::cli_output::stderr_line(format_args!("[loop-memset] refuse: {}", format_args!($($arg)*)));
         }
         return None;
     }};
@@ -304,12 +304,12 @@ fn find_idiom(func: &IrFunction) -> Option<Plan> {
     // single-block loop wins (at most one transform per sweep keeps the
     // block-index bookkeeping trivial).
     if trace_enabled() {
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "[loop-memset] fn='{}': {} natural loop(s), {} self-loop candidate(s)",
             func.name,
             loops.len(),
             loops.iter().filter(|lp| lp.is_self_loop()).count()
-        );
+        ));
     }
     let mut headers: Vec<usize> = loops
         .iter()
@@ -388,7 +388,9 @@ fn counter_never_wraps(func: &IrFunction, plan: &Plan) -> bool {
         // resolve_affine only resolves to recognized ivs; unreachable in
         // practice, refuse rather than assume.
         if trace_enabled() {
-            eprintln!("[loop-memset] refuse: address counter is not a recognized iv");
+            lccc::cli_output::stderr_line(format_args!(
+                "[loop-memset] refuse: address counter is not a recognized iv"
+            ));
         }
         return false;
     };
@@ -407,10 +409,10 @@ fn counter_never_wraps(func: &IrFunction, plan: &Plan) -> bool {
                 _ => false,
             };
     if !ok && trace_enabled() {
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "[loop-memset] refuse: address counter {:?} may wrap in its type",
             iv.ty
-        );
+        ));
     }
     ok
 }
@@ -563,7 +565,9 @@ fn try_recognize(func: &IrFunction, header_idx: usize, cfg: &CfgAnalysis) -> Opt
     )
     .map_err(|e| {
         if trace_enabled() {
-            eprintln!("[loop-memset] refuse: no rotate guard ({e})");
+            lccc::cli_output::stderr_line(format_args!(
+                "[loop-memset] refuse: no rotate guard ({e})"
+            ));
         }
     })
     .ok()?;
@@ -577,13 +581,13 @@ fn try_recognize(func: &IrFunction, header_idx: usize, cfg: &CfgAnalysis) -> Opt
         .find(|&p| p != header_idx)
         .inspect(|&p| {
             if trace_enabled() {
-                eprintln!("[loop-memset] guard pred = B{}", p);
+                lccc::cli_output::stderr_line(format_args!("[loop-memset] guard pred = B{}", p));
             }
         })
         .ok_or("guard has no non-header predecessor")
         .map_err(|e| {
             if trace_enabled() {
-                eprintln!("[loop-memset] refuse: {e}");
+                lccc::cli_output::stderr_line(format_args!("[loop-memset] refuse: {e}"));
             }
         })
         .ok()?;
@@ -592,7 +596,9 @@ fn try_recognize(func: &IrFunction, header_idx: usize, cfg: &CfgAnalysis) -> Opt
     let body = census_body(func, header_idx, &[header_idx], &ivs, &defs)
         .map_err(|e| {
             if trace_enabled() {
-                eprintln!("[loop-memset] refuse: body census ({e})");
+                lccc::cli_output::stderr_line(format_args!(
+                    "[loop-memset] refuse: body census ({e})"
+                ));
             }
         })
         .ok()?;
@@ -618,7 +624,9 @@ fn try_recognize(func: &IrFunction, header_idx: usize, cfg: &CfgAnalysis) -> Opt
         resolve_memory_ops(func, header_idx, &body, &ivs, &defs)
             .map_err(|e| {
                 if trace_enabled() {
-                    eprintln!("[loop-memset] refuse: memory-op resolution ({e})");
+                    lccc::cli_output::stderr_line(format_args!(
+                        "[loop-memset] refuse: memory-op resolution ({e})"
+                    ));
                 }
             })
             .ok()?;
@@ -1050,7 +1058,9 @@ fn try_recognize_while(
     let body = census_body(func, body_idx, &[header_idx, body_idx], &ivs, &defs)
         .map_err(|e| {
             if trace_enabled() {
-                eprintln!("[loop-memset] refuse: body census ({e})");
+                lccc::cli_output::stderr_line(format_args!(
+                    "[loop-memset] refuse: body census ({e})"
+                ));
             }
         })
         .ok()?;
@@ -1071,7 +1081,9 @@ fn try_recognize_while(
         resolve_memory_ops(func, body_idx, &body, &ivs, &defs)
             .map_err(|e| {
                 if trace_enabled() {
-                    eprintln!("[loop-memset] refuse: memory-op resolution ({e})");
+                    lccc::cli_output::stderr_line(format_args!(
+                        "[loop-memset] refuse: memory-op resolution ({e})"
+                    ));
                 }
             })
             .ok()?;
@@ -1157,10 +1169,10 @@ fn try_recognize_while(
     {
         let fail = |what: &str| {
             if trace_enabled() {
-                eprintln!(
+                lccc::cli_output::stderr_line(format_args!(
                     "[loop-memset] refuse: external use of non-iv {} (while-form)",
                     what
-                );
+                ));
             }
         };
         for (bi, block) in func.blocks.iter().enumerate() {

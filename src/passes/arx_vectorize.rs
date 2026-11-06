@@ -69,7 +69,7 @@ use crate::passes::loop_analysis;
 /// Debug trace for analyze bail-outs (LCCC_DEBUG_ARX).
 fn arx_dbg(what: &str) {
     if std::env::var("LCCC_DEBUG_ARX").is_ok() {
-        eprintln!("[ARX]   reject: {what}");
+        lccc::cli_output::stderr_line(format_args!("[ARX]   reject: {what}"));
     }
 }
 use std::rc::Rc;
@@ -1687,10 +1687,10 @@ fn transform_arx_loop(
 
     func.next_value_id = next_val_id;
     if debug {
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "[ARX] vectorized loop: header=blk{} main=blk{} pshufb={}",
             arx.header_idx, main_block, use_pshufb
-        );
+        ));
     }
     16
 }
@@ -1740,7 +1740,10 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
             Some(arx) => changed += transform_arx_loop(func, &cfg, &arx, use_pshufb, debug),
             None => {
                 if debug {
-                    eprintln!("[ARX] loop at blk{} not ARX-shaped", lp.header);
+                    lccc::cli_output::stderr_line(format_args!(
+                        "[ARX] loop at blk{} not ARX-shaped",
+                        lp.header
+                    ));
                 }
             }
         }

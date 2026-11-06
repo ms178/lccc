@@ -75,11 +75,11 @@ pub(crate) fn run_univsr(func: &mut IrFunction) -> usize {
     let debug = std::env::var("LCCC_DEBUG_UNIVSR").is_ok();
     let ivsr_pointers = detect_ivsr_pointer_ivs(func);
     if debug {
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "[univsr] {}: {} candidate pointer IVs",
             func.name,
             ivsr_pointers.len()
-        );
+        ));
     }
     if ivsr_pointers.is_empty() {
         return 0;
@@ -89,17 +89,17 @@ pub(crate) fn run_univsr(func: &mut IrFunction) -> usize {
     for ptr_iv in &ivsr_pointers {
         if !is_valid_sib_scale(ptr_iv.stride) {
             if debug {
-                eprintln!(
+                lccc::cli_output::stderr_line(format_args!(
                     "[univsr]   skip: stride {} not SIB-encodable",
                     ptr_iv.stride
-                );
+                ));
             }
             continue;
         }
 
         let ok = revert_pointer_iv(func, ptr_iv);
         if debug {
-            eprintln!(
+            lccc::cli_output::stderr_line(format_args!(
                 "[univsr]   phi v{} stride {} -> {}",
                 ptr_iv.ptr_phi_dest.0,
                 ptr_iv.stride,
@@ -108,7 +108,7 @@ pub(crate) fn run_univsr(func: &mut IrFunction) -> usize {
                 } else {
                     "rejected (uses/safety)"
                 }
-            );
+            ));
         }
         if ok {
             num_reverted += 1;
@@ -137,21 +137,21 @@ fn detect_ivsr_pointer_ivs(func: &IrFunction) -> Vec<IvsrPointerIV> {
                 let self_term = is_rotated_self_loop_block(block);
                 if self_in || self_term {
                     if std::env::var("LCCC_DEBUG_UNIVSR").is_ok() {
-                        eprintln!(
+                        lccc::cli_output::stderr_line(format_args!(
                             "[univsr]   skip rotated self-loop ptr phi v{} in {:?} self_in={} self_term={} incomings={:?}",
                             dest.0,
                             block.label,
                             self_in,
                             self_term,
                             incoming.iter().map(|(_, l)| l.0).collect::<Vec<_>>()
-                        );
+                        ));
                     }
                     continue;
                 }
 
                 if let Some(ptr_iv) = analyze_pointer_phi(func, dest, incoming, block.label) {
                     if std::env::var("LCCC_DEBUG_UNIVSR").is_ok() {
-                        eprintln!(
+                        lccc::cli_output::stderr_line(format_args!(
                             "[univsr]   candidate v{} in {:?} self_in={} self_term={} incomings={:?} idx=v{} base=v{} off={} stride={}",
                             dest.0,
                             block.label,
@@ -162,7 +162,7 @@ fn detect_ivsr_pointer_ivs(func: &IrFunction) -> Vec<IvsrPointerIV> {
                             ptr_iv.base_ptr.0,
                             ptr_iv.init_offset,
                             ptr_iv.stride
-                        );
+                        ));
                     }
                     result.push(ptr_iv);
                 }

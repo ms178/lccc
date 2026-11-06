@@ -192,10 +192,10 @@ fn reduce_loop(func: &mut IrFunction, lp: &loop_analysis::NaturalLoop, cfg: &Cfg
             if let Some(d2) = find_div2_result(func, &lp.body, *prod) {
                 triangular = Some((*prod, a_val, a_inv, d2));
                 if debug {
-                    eprintln!(
+                    lccc::cli_output::stderr_line(format_args!(
                         "[QUAD_SR] loop header={} triangular prod={} a={} div2={}",
                         header, prod.0, a_val.0, d2.0
-                    );
+                    ));
                 }
                 break;
             }
@@ -454,10 +454,10 @@ fn reduce_loop(func: &mut IrFunction, lp: &loop_analysis::NaturalLoop, cfg: &Cfg
 
     func.next_value_id = next_id;
     if debug {
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "[QUAD_SR] transformed loop header={} final_val={} -> idx_phi={}",
             header, final_val.0, idx_phi.0
-        );
+        ));
     }
     1
 }

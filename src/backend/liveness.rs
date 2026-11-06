@@ -624,18 +624,18 @@ pub fn compute_live_intervals_with_hidden_reads(
 
     if let Some(target) = debug_live_target().filter(|_| debug_live_func_matches(&func.name)) {
         if let Some(&dense) = id_to_dense.get(&target) {
-            eprintln!(
+            lccc::cli_output::stderr_line(format_args!(
                 "[LIVE] fn={} v{} def={} last_use={}",
                 func.name, target, ps.def_points[dense], ps.last_use_points[dense]
-            );
+            ));
             for (bi, b) in func.blocks.iter().enumerate() {
                 let li = live_in[bi].contains(dense);
                 let lo = live_out[bi].contains(dense);
                 if li || lo {
-                    eprintln!(
+                    lccc::cli_output::stderr_line(format_args!(
                         "[LIVE]   block {} (label {}) live_in={} live_out={} pts=[{},{}]",
                         bi, b.label.0, li, lo, ps.block_start_points[bi], ps.block_end_points[bi]
-                    );
+                    ));
                 }
             }
             let segs: Vec<(u32, u32)> = segments
@@ -643,8 +643,11 @@ pub fn compute_live_intervals_with_hidden_reads(
                 .filter(|iv| iv.value_id == target)
                 .map(|iv| (iv.start, iv.end))
                 .collect();
-            eprintln!("[LIVE]   call_points={:?}", ps.call_points);
-            eprintln!("[LIVE]   segments={segs:?}");
+            lccc::cli_output::stderr_line(format_args!(
+                "[LIVE]   call_points={:?}",
+                ps.call_points
+            ));
+            lccc::cli_output::stderr_line(format_args!("[LIVE]   segments={segs:?}"));
         }
     }
 
@@ -833,7 +836,10 @@ fn assign_program_points(
                 });
                 for_each_value_use_in_instruction(inst, |v| hit |= v.0 == t);
                 if hit || inst.dest().is_some_and(|d| d.0 == t) {
-                    eprintln!("[LIVE-TRACE] pt={} block={} {:?}", point, block_idx, inst);
+                    lccc::cli_output::stderr_line(format_args!(
+                        "[LIVE-TRACE] pt={} block={} {:?}",
+                        point, block_idx, inst
+                    ));
                 }
             }
             record_instruction_uses_dense(

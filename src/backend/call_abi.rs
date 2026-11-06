@@ -1942,7 +1942,7 @@ fn classify_param_slice(
                     .and_then(|p| p.struct_align)
                     .unwrap_or(slot_size as usize);
                 if std::env::var_os("CCC_DEBUG_STACK_ALIGN").is_some() {
-                    eprintln!(
+                    lccc::cli_output::stderr_line(format_args!(
                         "[STACK-ALIGN-ARM] fn={} i={} size={} ir_align={:?} slot_size={} cap={} aligning={}",
                         func_name,
                         i,
@@ -1951,7 +1951,7 @@ fn classify_param_slice(
                         slot_size,
                         config.stack_arg_align_cap,
                         struct_align > slot_size as usize
-                    );
+                    ));
                 }
                 let tf_carrier_ia32 =
                     slot_size == 4 && param.is_some_and(|p| p.is_f128_sse) && struct_align >= 16;
@@ -1976,10 +1976,10 @@ fn classify_param_slice(
                     stack_offset = (stack_offset + a - 1) & !(a - 1);
                 }
                 if std::env::var_os("CCC_DEBUG_STACK_ALIGN").is_some() {
-                    eprintln!(
+                    lccc::cli_output::stderr_line(format_args!(
                         "[STACK-ALIGN-ARM2] fn={} i={} post_align_offset={}",
                         func_name, i, stack_offset
-                    );
+                    ));
                 }
                 let off = stack_offset;
                 stack_offset += (size as i64 + slot_align_mask) & !slot_align_mask;
@@ -2037,18 +2037,18 @@ fn classify_param_slice(
 
     if std::env::var_os("CCC_DEBUG_STACK_ALIGN").is_some() {
         for (i, pc) in classes.iter().enumerate() {
-            eprintln!(
+            lccc::cli_output::stderr_line(format_args!(
                 "[STACK-ALIGN] fn={} param {} = {:?} ir_align={:?}",
                 func_name,
                 i,
                 pc,
                 params.get(i).and_then(|p| p.struct_align)
-            );
+            ));
         }
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "[STACK-ALIGN] fn={} total_stack_bytes={}",
             func_name, stack_offset
-        );
+        ));
     }
 
     ParamClassification {

@@ -341,10 +341,10 @@ pub(crate) fn compute_cmp_replay_scan(
                     && let Some(rec) = check_demorgan_pattern(insts, cond_v.0, use_counts, fused)
                 {
                     if demorgan_debug_enabled() {
-                        eprintln!(
+                        lccc::cli_output::stderr_line(format_args!(
                             "[demorgan] scan andor={} is_and={} fuzz=({},{})",
                             cond_v.0, rec.is_and, rec.cmp_dests[0], rec.cmp_dests[1]
-                        );
+                        ));
                     }
                     for op in [&rec.a.1, &rec.a.2, &rec.b.1, &rec.b.2] {
                         if let Operand::Value(v) = op {
@@ -815,10 +815,10 @@ impl X86Codegen {
         // so no pending-flag handshake state is skipped with it.
         if !fp_select_disabled() && self.fp_select_cmps.contains_key(&dest.0) {
             if fp_select_debug() {
-                eprintln!(
+                lccc::cli_output::stderr_line(format_args!(
                     "[FP-SELECT] cmp %{} emits nothing (blend at select)",
                     dest.0
-                );
+                ));
             }
             return;
         }
@@ -1324,7 +1324,10 @@ impl X86Codegen {
         // this block, which is exactly the short-circuit semantic).
         if let Some((andor_id, rec)) = self.take_demorgan(cond) {
             if demorgan_debug_enabled() {
-                eprintln!("[demorgan] fire andor={} is_and={}", andor_id, rec.is_and);
+                lccc::cli_output::stderr_line(format_args!(
+                    "[demorgan] fire andor={} is_and={}",
+                    andor_id, rec.is_and
+                ));
             }
             self.state.reg_cache.invalidate_acc();
             self.emit_int_cmp_replay_insn(&rec.a.1, &rec.a.2, rec.a.3);
@@ -1954,7 +1957,9 @@ impl X86Codegen {
             "minss"
         };
         if fp_select_debug() {
-            eprintln!("[FP-SELECT] min/max canonical shape -> {minmax}");
+            lccc::cli_output::stderr_line(format_args!(
+                "[FP-SELECT] min/max canonical shape -> {minmax}"
+            ));
         }
         // Case A: XMM-homed destination — dst arm into the home, then the
         // min/max straight into it. Homes are xmm2..xmm15, so the staged
@@ -2063,7 +2068,7 @@ impl X86Codegen {
         if let Some(d) = self.dest_reg(dest).filter(|r| is_xmm_reg(*r)) {
             let d_name = phys_reg_name(d);
             if fp_select_debug() {
-                eprintln!("[FP-SELECT] blend into {}", d_name);
+                lccc::cli_output::stderr_line(format_args!("[FP-SELECT] blend into {}", d_name));
             }
             // 1. mask: the vcmpsd source position takes the RHS directly
             //    (fresh XMM home / pool constant / stack slot — the same
@@ -2129,7 +2134,10 @@ impl X86Codegen {
         };
         let f_name = phys_reg_name(f_reg);
         if fp_select_debug() {
-            eprintln!("[FP-SELECT] blend into xmm0 (false in {})", f_name);
+            lccc::cli_output::stderr_line(format_args!(
+                "[FP-SELECT] blend into xmm0 (false in {})",
+                f_name
+            ));
         }
         // 1. mask → xmm1: register-direct when the LHS has a fresh home
         //    (RHS from the memory-capable source slot), else the staged
@@ -2473,10 +2481,10 @@ impl X86Codegen {
                             dest, cop, &clhs, &crhs, true_val, false_val, cty,
                         ) {
                             if fp_select_debug() {
-                                eprintln!(
+                                lccc::cli_output::stderr_line(format_args!(
                                     "[FP-SELECT] cmp %{}: blend refused, materialize boolean",
                                     cv.0
-                                );
+                                ));
                             }
                             fp_flags_cc = self.emit_fp_cmp_boolean(cv, cop, &clhs, &crhs, cty);
                         } else {
@@ -2484,10 +2492,10 @@ impl X86Codegen {
                         }
                     } else {
                         if fp_select_debug() {
-                            eprintln!(
+                            lccc::cli_output::stderr_line(format_args!(
                                 "[FP-SELECT] cmp %{}: arm types not blendable, materialize",
                                 cv.0
-                            );
+                            ));
                         }
                         fp_flags_cc = self.emit_fp_cmp_boolean(cv, cop, &clhs, &crhs, cty);
                     }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Parser resource-limit regression gate (gcc 16.2 oracle).
+# Parser resource-limit and unsupported-input refusal gate (gcc 16.2 oracle).
 #
 # gcc.c-torture/compile/limits-pointer.c expands PTR4 to 10,000 pointer stars.
 # lccc's old POINTER_DEPTH_BUDGET (4096, calibrated for a hypothetical 8 MB
@@ -57,6 +57,143 @@ if [ "$rc" -eq 1 ] && [ "$count" -eq 1 ]; then
 else
     printf 'FAIL: 80000 stars rc=%s diagnostics=%s: %s\n' "$rc" "$count" "$(head -3 "$tmp/over.log")"
     check '80000 stars clean rejection' 1
+fi
+
+# ---------------------------------------------------------------------------
+# The other three resource budgets (block / expression / type nesting).
+#
+# gcc.c-torture/compile/limits-caselabels.c, limits-exprparen.c and
+# limits-structnest.c deliberately exceed them.  A clean, bounded rejection
+# is the contract: rc=1, ONE diagnostic naming the budget, no signal, no
+# panic, no stack overflow.  The legal-depth legs prove the budgets are not
+# accidentally too small for real code.  Both sides are measured here so a
+# future "fix" that simply raises a bound into a stack overflow is caught.
+# ---------------------------------------------------------------------------
+budget_case() {
+    label=$1
+    expected=$2           # 0 = must compile, 1 = clean rejection
+    pattern=$3            # diagnostic substring required for a rejection
+    src=$4
+
+    set +e
+    "$CCC" -O0 -c "$src" -o "$tmp/budget.o" >"$tmp/budget.log" 2>&1
+    rc=$?
+    set -e
+
+    if [ "$expected" -eq 0 ]; then
+        if [ "$rc" -eq 0 ] && ! grep -q 'error:' "$tmp/budget.log"; then
+            check "$label compiles within the budget" 0
+        else
+            printf 'FAIL: %s rc=%s: %s\n' "$label" "$rc" "$(head -2 "$tmp/budget.log")"
+            check "$label compiles within the budget" 1
+        fi
+        return
+    fi
+
+    # rc=1 only: 101 is a Rust panic, 134/139/141 are signals.
+    count=$(grep -c "error: .*$pattern" "$tmp/budget.log" || true)
+    errs=$(grep -c 'error:' "$tmp/budget.log" || true)
+    # Two `error:` lines are expected: the primary budget diagnostic plus the
+    # driver's "1 parse error(s)" summary.  Anything more is cascading noise.
+    if [ "$rc" -eq 1 ] && [ "$count" -eq 1 ] && [ "$errs" -le 2 ] \
+       && ! grep -qi 'panicked\|internal error\|segmentation fault' "$tmp/budget.log"; then
+        check "$label: one clean budget diagnostic, rc=1" 0
+    else
+        printf 'FAIL: %s rc=%s diagnostics=%s matching=%s: %s\n' \
+            "$label" "$rc" "$errs" "$count" "$(head -3 "$tmp/budget.log")"
+        check "$label clean rejection" 1
+    fi
+}
+
+python3 - "$tmp" <<'PY'
+import pathlib, sys
+d = pathlib.Path(sys.argv[1])
+for n in (2000, 4000, 4200, 5000):
+    (d / f"block{n}.c").write_text(
+        "int f(void) {" + "{" * (n - 1) + " return 0; " + "}" * n + "\n")
+for n in (1000, 2000, 34000):
+    (d / f"expr{n}.c").write_text("int x = " + "(" * n + "1" + ")" * n + ";\n")
+for n in (1000, 2100):
+    src = "".join(f"struct A{i} {{ " for i in range(n)) + "int v; " \
+          + "".join(f"}} a{i}; " for i in range(n))
+    (d / f"type{n}.c").write_text(src + "\n")
+PY
+
+budget_case 'block nesting 4000'   0 '' "$tmp/block4000.c"
+budget_case 'block nesting 4200'   1 'block nesting too deep' "$tmp/block4200.c"
+budget_case 'block nesting 5000'   1 'block nesting too deep' "$tmp/block5000.c"
+budget_case 'expression nesting 1000' 0 '' "$tmp/expr1000.c"
+budget_case 'expression nesting 2000' 1 'expression nesting too deep' "$tmp/expr2000.c"
+budget_case 'expression nesting 34000' 1 'expression nesting too deep' "$tmp/expr34000.c"
+budget_case 'type nesting 1000'   0 '' "$tmp/type1000.c"
+budget_case 'type nesting 2100'   1 'type nesting too deep' "$tmp/type2100.c"
+
+# ---------------------------------------------------------------------------
+# Unsupported-input refusal contracts (self-contained; no corpus dependency).
+#
+# These three spellings appear in gcc.c-torture/compile as dg-options.  A
+# compiler must either implement the request or refuse it loudly; the worst
+# outcome is silently ignoring a data-model option, because the resulting
+# object disagrees with the code it is linked against.  The GIMPLE case is
+# GCC's own internal SSA IR, not C: LCCC deliberately has no GIMPLE front
+# end, so the contract is a bounded, panic-free rc=1 refusal (a cascade of
+# syntax errors is acceptable for invalid C, an unbounded one is not).
+# ---------------------------------------------------------------------------
+cat >"$tmp/unsupported.c" <<'EOF'
+struct S { char c; int i; short s; };
+struct S g = { 1, 2, 3 };
+int f(void) { return (int)sizeof(struct S) + g.i; }
+EOF
+cat >"$tmp/gimple.c" <<'EOF'
+unsigned __GIMPLE (ssa)
+foo (unsigned a, unsigned b)
+{
+  unsigned j;
+  __BB(2):
+  if (a_6(D) != 0u) goto __BB3; else goto __BB4;
+  __BB(3):
+  j_10 = __PHI (__BB2: b_11(D));
+  goto __BB4;
+  __BB(4):
+  return j_10;
+}
+EOF
+
+set +e
+"$CCC" -fpack-struct -c "$tmp/unsupported.c" -o "$tmp/pack.o" >"$tmp/pack.log" 2>&1
+pack_rc=$?
+"$CCC" -march=skylake -c "$tmp/unsupported.c" -o "$tmp/skylake.o" >"$tmp/skylake.log" 2>&1
+skylake_rc=$?
+"$CCC" -fgimple -c "$tmp/gimple.c" -o "$tmp/gimple.o" >"$tmp/gimple.log" 2>&1
+gimple_rc=$?
+set -e
+
+pack_errs=$(grep -c 'error:' "$tmp/pack.log" || true)
+if [ "$pack_rc" -eq 1 ] && [ "$pack_errs" -eq 1 ] \
+   && grep -q 'does not implement this data-model request' "$tmp/pack.log"; then
+    check '-fpack-struct fails closed with one honest diagnostic' 0
+else
+    printf 'FAIL: -fpack-struct rc=%s errors=%s: %s\n' "$pack_rc" "$pack_errs" \
+        "$(head -2 "$tmp/pack.log")"
+    check '-fpack-struct fails closed' 1
+fi
+
+if [ "$skylake_rc" -eq 0 ] && [ -s "$tmp/skylake.o" ] \
+   && ! grep -q 'error:' "$tmp/skylake.log"; then
+    check '-march=skylake is accepted on x86-64 and emits an object' 0
+else
+    printf 'FAIL: -march=skylake rc=%s: %s\n' "$skylake_rc" "$(head -2 "$tmp/skylake.log")"
+    check '-march=skylake accepted' 1
+fi
+
+gimple_errs=$(grep -c 'error:' "$tmp/gimple.log" || true)
+if [ "$gimple_rc" -eq 1 ] && [ "$gimple_errs" -ge 1 ] && [ "$gimple_errs" -le 40 ] \
+   && ! grep -qi 'panicked\|internal error\|segmentation fault' "$tmp/gimple.log"; then
+    check "GCC GIMPLE IR is refused cleanly (rc=1, $gimple_errs bounded errors, no ICE)" 0
+else
+    printf 'FAIL: GIMPLE rc=%s errors=%s: %s\n' "$gimple_rc" "$gimple_errs" \
+        "$(head -3 "$tmp/gimple.log")"
+    check 'GCC GIMPLE IR clean refusal' 1
 fi
 
 printf 'check_parser_depth_limits: %d passed, %d failed\n' "$pass" "$fail"

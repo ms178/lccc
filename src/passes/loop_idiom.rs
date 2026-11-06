@@ -382,7 +382,7 @@ fn debug_enabled() -> bool {
 macro_rules! dlog {
     ($($arg:tt)*) => {
         if debug_enabled() {
-            eprintln!("[IDIOM] {}", format!($($arg)*));
+            lccc::cli_output::stderr_line(format_args!("[IDIOM] {}", format!($($arg)*)));
         }
     };
 }

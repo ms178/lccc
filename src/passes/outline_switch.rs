@@ -551,13 +551,13 @@ fn outline_switch_cases(
             switch_info.cases.iter().map(|(_, bid)| *bid).collect();
 
         if debug {
-            eprintln!(
+            lccc::cli_output::stderr_line(format_args!(
                 "[OUTLINE] function: {}, switch with {} cases, end_block: {:?}, global_max_block_id: {}",
                 func.name,
                 switch_info.cases.len(),
                 switch_info.end_block,
                 *global_max_block_id
-            );
+            ));
         }
 
         // Analyze each case for outlinability.
@@ -591,13 +591,13 @@ fn outline_switch_cases(
             }
 
             if debug {
-                eprintln!(
+                lccc::cli_output::stderr_line(format_args!(
                     "[OUTLINE]   case {}: entry={:?}, blocks={:?}, ext_count={}",
                     case_value,
                     case_entry,
                     case_blocks,
                     find_external_values(func, &case_blocks, &block_map).len()
-                );
+                ));
             }
 
             // Count instructions.
@@ -644,10 +644,10 @@ fn outline_switch_cases(
         if debug {
             let total = switch_info.cases.len();
             let outlined = outlinable.len();
-            eprintln!(
+            lccc::cli_output::stderr_line(format_args!(
                 "[OUTLINE]   {} of {} cases outlinable (skip: {} block_collect, {} empty, {} small, {} return, {} args)",
                 outlined, total, skip_block_collect, skip_empty, skip_small, skip_return, skip_args
-            );
+            ));
         }
 
         if outlinable.is_empty() {
@@ -734,10 +734,10 @@ fn build_outlined_function(
 
     let debug = std::env::var("CCC_DEBUG_OUTLINE").is_ok();
     if debug {
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "[OUTLINE]   building {}: old_to_new = {:?}",
             name, old_to_new_block
-        );
+        ));
     }
 
     // Compute value offset: outlined function's values start from 0, but we need

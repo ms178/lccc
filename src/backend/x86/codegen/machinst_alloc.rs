@@ -869,7 +869,10 @@ fn window_busy_regs(ctx: &WindowCtx<'_>) -> FxHashSet<u8> {
     let mut busy = FxHashSet::default();
     for (&r, spans) in ctx.reg_busy {
         if watch == Some(r) {
-            eprintln!("[WS-busy] r{} spans={:?} window=({}, {})", r, spans, w0, w1);
+            lccc::cli_output::stderr_line(format_args!(
+                "[WS-busy] r{} spans={:?} window=({}, {})",
+                r, spans, w0, w1
+            ));
         }
         if spans.iter().any(|&(s, e)| s <= w1 && e >= w0) {
             busy.insert(r);

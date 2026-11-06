@@ -497,9 +497,15 @@ fn dump_dead_instructions(func: &IrFunction, live: &[u8], block_off: &[u32]) {
                 _ => continue,
             }
             if let Some(d) = inst.dest() {
-                eprintln!("[DCE] Removing Value({}) in block {}: {:?}", d.0, bi, inst);
+                lccc::cli_output::stderr_line(format_args!(
+                    "[DCE] Removing Value({}) in block {}: {:?}",
+                    d.0, bi, inst
+                ));
             } else {
-                eprintln!("[DCE] Removing dest-less inst in block {}: {:?}", bi, inst);
+                lccc::cli_output::stderr_line(format_args!(
+                    "[DCE] Removing dest-less inst in block {}: {:?}",
+                    bi, inst
+                ));
             }
         }
     }

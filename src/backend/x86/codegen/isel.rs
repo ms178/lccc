@@ -1619,21 +1619,21 @@ pub mod stats {
         if total == 0 {
             return;
         }
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "[ISEL-STATS] {} of {} instructions lowered through MachInst ({:.1}%)",
             lowered,
             total,
             lowered as f64 * 100.0 / total as f64
-        );
+        ));
         if let Ok(mut v) = BY_KIND.lock() {
             v.sort_by(|a, b| b.1.cmp(&a.1));
             for (kind, n) in v.iter().take(12) {
-                eprintln!(
+                lccc::cli_output::stderr_line(format_args!(
                     "[ISEL-STATS]   rejected {:>7}  {} ({:.1}% of all)",
                     n,
                     kind,
                     *n as f64 * 100.0 / total as f64
-                );
+                ));
             }
         }
     }

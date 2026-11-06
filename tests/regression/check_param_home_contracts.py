@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gate the four invariants of the O(n) parameter-homing / cross-ISA patch.
+"""Gate the parameter-homing / cross-ISA patch and its CLI-output invariants.
 
 This is deliberately a *structural* gate, not a wall-clock record: a ratio
 between two input sizes is portable across CI machines, an absolute second
@@ -26,6 +26,9 @@ Checks (every one is non-vacuous; `--self-test` proves each can FAIL):
   7. Diagnostic output is best-effort: piping a diagnostic-heavy compile to
      a reader that exits early must still exit 1 (a clean verdict), not 101
      (Rust `eprintln!` panicking on BrokenPipe).
+  8. Structural guard: no `eprintln!`/`eprint!`/`println!`/`print!` remains
+     in shipped sources; all such text goes through `lccc::cli_output`, whose
+     four helpers ignore write errors and are byte-identical on success.
 
 Usage:
   python3 tests/regression/check_param_home_contracts.py
@@ -345,6 +348,109 @@ def check_diagnostic_pipe_safety(work: pathlib.Path) -> None:
           f"no Rust ICE): PASS")
 
 
+# ---------------------------------------------------------------------------
+# Check 8: the CLI-text panic class must be impossible, not merely fixed once.
+#
+# `eprintln!` / `println!` call `std::io::stdio::print_to`, which panics
+# ("failed printing to stderr: Broken pipe") when the reader disappears. The
+# first fix only covered two files; GDB traced the surviving rc=101 to
+# `src/lib.rs:157`, the driver's final verdict. A runtime test alone cannot
+# stop the macro from being reintroduced on a less-travelled path, so this
+# structural guard scans every non-test source file with a literal/comment-
+# aware lexer and forbids the four macros outright.
+# ---------------------------------------------------------------------------
+CLI_TEXT_MACRO = re.compile(r"(eprintln|eprint|println|print)!")
+_RAW_STRING = re.compile(r"(?:b|c|br|cr)?r(#*)\"")
+_CLI_DELIMS = {"(": ")", "[": "]", "{": "}"}
+
+
+def _skip_literal(text: str, i: int) -> int | None:
+    """Return the end of a literal/comment starting at i, else None."""
+    if text.startswith("//", i):
+        j = text.find("\n", i)
+        return len(text) if j < 0 else j
+    if text.startswith("/*", i):
+        depth, j = 1, i + 2
+        while j < len(text) and depth:
+            if text.startswith("/*", j):
+                depth, j = depth + 1, j + 2
+            elif text.startswith("*/", j):
+                depth, j = depth - 1, j + 2
+            else:
+                j += 1
+        return j
+    m = _RAW_STRING.match(text, i)
+    if m:
+        end = '"' + "#" * len(m.group(1))
+        j = text.find(end, m.end())
+        return len(text) if j < 0 else j + len(end)
+    if text[i] == '"':
+        j = i + 1
+        while j < len(text):
+            if text[j] == "\\":
+                j += 2
+            elif text[j] == '"':
+                return j + 1
+            else:
+                j += 1
+        return j
+    if text[i] == "'":
+        # A char literal has a closing quote either right after one scalar or
+        # after an escape; `'static` / `'label` are lifetimes/labels instead.
+        if i + 1 < len(text) and text[i + 1] == "\\":
+            j = text.find("'", i + 2)
+            return len(text) if j < 0 else j + 1
+        if i + 2 < len(text) and text[i + 2] == "'":
+            return i + 3
+        return i + 1
+    return None
+
+
+def cli_text_macro_hits(source: str) -> list[tuple[int, str]]:
+    """Find panicking CLI-text macros outside literals, comments and tests."""
+    hits: list[tuple[int, str]] = []
+    i = 0
+    while i < len(source):
+        end = _skip_literal(source, i)
+        if end is not None:
+            i = end
+            continue
+        m = CLI_TEXT_MACRO.match(source, i)
+        if m and (i == 0 or not (source[i - 1].isalnum() or source[i - 1] == "_")):
+            hits.append((source.count("\n", 0, i) + 1, m.group(1)))
+        i += 1
+    return hits
+
+
+def check_cli_text_is_best_effort() -> None:
+    offenders: list[str] = []
+    for p in sorted((ROOT / "src").rglob("*.rs")):
+        rel = p.relative_to(ROOT / "src").as_posix()
+        if rel == "common/cli_output.rs":
+            continue
+        hits = cli_text_macro_hits(p.read_text(encoding="utf-8"))
+        # A source file may keep macros inside its #[cfg(test)] module, where
+        # libtest owns stdout; none of the shipped files needs this today.
+        test_from = p.read_text(encoding="utf-8").find("#[cfg(test)]")
+        if test_from >= 0:
+            line = p.read_text(encoding="utf-8").count("\n", 0, test_from) + 1
+            hits = [(ln, name) for ln, name in hits if ln < line]
+        if hits:
+            offenders.append(f"{rel}:{hits[0][0]} {hits[0][1]}!")
+    require(not offenders,
+            "panicking CLI text macro reintroduced: " + ", ".join(offenders[:5]))
+    lib = (ROOT / "src/lib.rs").read_text(encoding="utf-8")
+    require("extern crate self as lccc;" in lib,
+            "lib.rs lost the self-alias used by binary call sites")
+    require("pub use common::cli_output;" in lib,
+            "lib.rs lost the public cli_output re-export")
+    helper = (ROOT / "src/common/cli_output.rs").read_text(encoding="utf-8")
+    for fn in ("stderr_line", "stderr_text", "stdout_line", "stdout_text"):
+        require(f"pub fn {fn}(" in helper, f"cli_output is missing {fn}")
+    print("  [8] all CLI text goes through the best-effort sink; "
+          "no panicking print macros remain: PASS")
+
+
 def structural_failures(production: bytes, prologues: dict[str, bytes]) -> list[str]:
     """Pure predicate behind the structural gate, so the self-test can prove
     every rule can reject a bad tree without mocking the filesystem."""
@@ -435,7 +541,25 @@ def self_test() -> None:
     rejects(lambda: require(pipe_verdict_is_clean(101), "rust ICE"))
     rejects(lambda: require(pipe_verdict_is_clean(0), "wrong verdict"))
     require(pipe_verdict_is_clean(1), "clean verdict rejected")
-    require(cases == 13, f"self-test covered {cases}/13 rejection paths")
+    # The CLI-text guard must reject each macro form and must NOT be fooled
+    # by the same spelling inside a string, a raw string, or a comment.
+    for macro in ("eprintln!", "eprint!", "println!", "print!"):
+        rejects(lambda m=macro: require(not cli_text_macro_hits(
+            f"fn f() {{ {m}(\"x\"); }}"), f"guard missed {m}"))
+    require(cli_text_macro_hits('let s = "eprintln!(x)";') == [],
+            "guard falsely matched a normal string literal")
+    require(cli_text_macro_hits('let s = r#"eprintln!(x)"#;') == [],
+            "guard falsely matched a raw string literal")
+    require(cli_text_macro_hits('// eprintln!(x)\nlet a = 1;') == [],
+            "guard falsely matched a line comment")
+    require(cli_text_macro_hits('/* println!(x) */ let a = 1;') == [],
+            "guard falsely matched a block comment")
+    require(cli_text_macro_hits("let c = '\\n';") == [],
+            "guard falsely matched a char literal")
+    # A whole-tree guard must reject a synthetic regression, not just text.
+    rejects(lambda: require(not cli_text_macro_hits("eprintln!(\"oops\");"),
+                            "synthetic reintroduction"))
+    require(cases == 18, f"self-test covered {cases}/18 rejection paths")
     print(f"SELF_TEST_OK ({cases} rejection paths proven non-vacuous)")
 
 
@@ -457,6 +581,7 @@ def main(argv: list[str] | None = None) -> int:
             check_shifted_layout(work)
             check_no_scan_fallback(work)
             check_diagnostic_pipe_safety(work)
+            check_cli_text_is_best_effort()
     except Failure as exc:
         print(f"PARAM_HOME_CONTRACTS_FAIL: {exc}", file=sys.stderr)
         return 1

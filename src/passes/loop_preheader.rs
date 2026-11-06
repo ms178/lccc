@@ -179,7 +179,7 @@ fn report_census(func_name: &str, c: Census) {
     // check_env_test_hygiene.sh, and the census must not spend that budget to
     // print diagnostics nobody asked for.
     debug(|| {
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "[LOOP-PREHEADER-CENSUS] {func_name}: loops={loops} inserted={inserted}          rejected: profitability={no_profit} no_single_outside_pred={no_single_pred}          already_dedicated={already_dedicated} indirect_pred={indirect_pred}",
             func_name = func_name,
             loops = c.loops,
@@ -188,7 +188,7 @@ fn report_census(func_name: &str, c: Census) {
             no_single_pred = c.no_single_pred,
             already_dedicated = c.already_dedicated,
             indirect_pred = c.indirect_pred,
-        );
+        ));
     });
 }
 
@@ -384,32 +384,32 @@ fn plan_insertions(
         let pred_block = &func.blocks[pred];
         if is_dedicated_to(&pred_block.terminator, header_label) {
             debug(|| {
-                eprintln!(
+                lccc::cli_output::stderr_line(format_args!(
                     "[LOOP-PREHEADER] loop header {} already has a dedicated \
                      preheader {}",
                     header_label.0, pred_block.label.0
-                )
+                ))
             });
             census.already_dedicated += 1;
             continue; // already dedicated
         }
         if matches!(pred_block.terminator, Terminator::IndirectBranch { .. }) {
             debug(|| {
-                eprintln!(
+                lccc::cli_output::stderr_line(format_args!(
                     "[LOOP-PREHEADER] loop header {} reached by IndirectBranch \
                      from {}: cannot reroute",
                     header_label.0, pred_block.label.0
-                )
+                ))
             });
             census.indirect_pred += 1;
             continue; // a computed goto into the header cannot be rerouted
         }
         debug(|| {
-            eprintln!(
+            lccc::cli_output::stderr_line(format_args!(
                 "[LOOP-PREHEADER] header {} preheader {} is not dedicated: \
                  inserting {}",
                 header_label.0, pred_block.label.0, next_label
-            )
+            ))
         });
         let new_label = BlockId(next_label);
         next_label = next_label.saturating_add(1);

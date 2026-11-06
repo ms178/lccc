@@ -380,13 +380,13 @@ impl FpLiveness {
                 format!("no textual reader below; live ranges:{ranges}")
             }
         };
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "fp_liveness: xmm{} live after line {} `{}` - {}",
             n,
             idx,
             store.get(idx).trim(),
             why
-        );
+        ));
     }
 
     /// Slot counterpart of [`Self::xmm_dead_after`].  There is no textual
@@ -1517,12 +1517,12 @@ pub(super) fn ret_xmm_read_bits(
 /// `CCC_DEBUG_FP_LIVENESS=1`: report why a function stayed unanalysable.
 fn debug_unknown(store: &LineStore, n: usize, why: &str) {
     if std::env::var_os("CCC_DEBUG_FP_LIVENESS").is_some() {
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "fp_liveness: line {} unanalysable ({}): {}",
             n,
             why,
             store.get(n).trim()
-        );
+        ));
     }
 }
 

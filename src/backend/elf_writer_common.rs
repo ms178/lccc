@@ -1557,14 +1557,14 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 // an error — mixing e.g. @nobits and @progbits content in one
                 // section would silently drop one of them.
                 if let Some(well_known) = crate::backend::elf::well_known_section_type(name) {
-                    eprintln!(
+                    lccc::cli_output::stderr_line(format_args!(
                         "warning: ignoring incorrect section type for {name} (@{} requested)",
                         if well_known == SHT_NOBITS {
                             "nobits"
                         } else {
                             "progbits"
                         }
-                    );
+                    ));
                     return Ok(idx);
                 }
                 return Err(format!("changed section type for {name}"));
@@ -2946,7 +2946,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
             A::encode_instruction_code16_gcc(instr, base_offset)?
         } else if self.code_mode == 16 && A::default_code_mode() != 64 {
             if std::env::var("LCCC_DBG16").is_ok() {
-                eprintln!("[C16] dispatch code16 for {}", instr.mnemonic);
+                lccc::cli_output::stderr_line(format_args!(
+                    "[C16] dispatch code16 for {}",
+                    instr.mnemonic
+                ));
             }
             A::encode_instruction_code16(instr, base_offset)?
         } else if (self.code_mode == 16 || self.code_mode == 17) && A::default_code_mode() == 64 {
@@ -4683,7 +4686,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         jump.target_addend,
                     );
                     if dbg {
-                        eprintln!(
+                        lccc::cli_output::stderr_line(format_args!(
                             "[RELAX] sec{} j{} off={} len={} cond={} target={:?} target_off={:?} relaxed={} growable={}",
                             sec_idx,
                             j_idx,
@@ -4694,7 +4697,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                             target_off_opt,
                             jump.relaxed,
                             jump.can_grow
-                        );
+                        ));
                     }
                     let Some(target_off) = target_off_opt else {
                         continue;
@@ -4718,7 +4721,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         // layout has settled.
                         actions.push((j_idx, JumpAction::Shrink));
                     } else if dbg && jump.relaxed && jump.can_grow && !fits_short {
-                        eprintln!("[RELAX] sec{sec_idx} j{j_idx} misses disp8 in the snapshot");
+                        lccc::cli_output::stderr_line(format_args!(
+                            "[RELAX] sec{sec_idx} j{j_idx} misses disp8 in the snapshot"
+                        ));
                     }
                 }
                 // Growth passes decide in one sequential sweep, as GAS does
@@ -5477,10 +5482,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         };
                         let align = 1u64 << log2;
                         if dbg {
-                            eprintln!(
+                            lccc::cli_output::stderr_line(format_args!(
                                 "[TIGHT] sec{} header={} span={} log2={} align={}",
                                 sec_idx, header, size, log2, align
-                            );
+                            ));
                         }
                         (
                             Some((current_offset as u64).div_ceil(align) * align),
@@ -5489,7 +5494,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     };
                     if let Some(why) = reject_reason {
                         if dbg {
-                            eprintln!("[TIGHT] sec{} header={} reject={}", sec_idx, header, why);
+                            lccc::cli_output::stderr_line(format_args!(
+                                "[TIGHT] sec{} header={} reject={}",
+                                sec_idx, header, why
+                            ));
                         }
                     }
                     // Record this sweep's bucket (None on reject); the

@@ -235,7 +235,10 @@ fn widen_ivs_in_function(func: &mut IrFunction) -> usize {
         }
     }
     if debug && total > 0 {
-        eprintln!("[IV-WIDEN] {}: widened {} IVs", func.name, total);
+        lccc::cli_output::stderr_line(format_args!(
+            "[IV-WIDEN] {}: widened {} IVs",
+            func.name, total
+        ));
     }
     total
 }
@@ -711,19 +714,19 @@ fn try_widen_loop(
         // revision checked only the cmp's other operand, not the step.
         if !operand_hoistable_to_preheader(&plan.step, lp, func, plan.phi_dest, &hoist) {
             if debug {
-                eprintln!(
+                lccc::cli_output::stderr_line(format_args!(
                     "[IV-WIDEN] skip phi {:?}: latch step not loop-invariant",
                     cand.phi_dest
-                );
+                ));
             }
             continue;
         }
         if !verify_plan(func, &plan, lp, &hoist) {
             if debug {
-                eprintln!(
+                lccc::cli_output::stderr_line(format_args!(
                     "[IV-WIDEN] skip phi {:?}: plan failed live-IR verification",
                     cand.phi_dest
-                );
+                ));
             }
             continue;
         }
@@ -3449,10 +3452,10 @@ fn apply_widen(func: &mut IrFunction, plan: &WidenPlan, preheader_idx: usize, de
                 *to_ty = wide_ty;
             }
             if debug {
-                eprintln!(
+                lccc::cli_output::stderr_line(format_args!(
                     "[IV-WIDEN] retained cast v{} as wide identity (still used)",
                     from.0
-                );
+                ));
             }
         } else if droppable {
             to_remove.push((bi, ii));
@@ -3611,22 +3614,25 @@ fn apply_widen(func: &mut IrFunction, plan: &WidenPlan, preheader_idx: usize, de
             },
         );
         if debug {
-            eprintln!(
+            lccc::cli_output::stderr_line(format_args!(
                 "[IV-WIDEN] escaping use of v{} in block {} truncated via v{}",
                 member.0, bi, narrow.0
-            );
+            ));
         }
     }
 
     func.next_value_id = next_id;
     if debug {
         if plan.sibling_mirror {
-            eprintln!("[IV-WIDEN-MIRROR] fn={} phi={}", func.name, phi_dest.0);
+            lccc::cli_output::stderr_line(format_args!(
+                "[IV-WIDEN-MIRROR] fn={} phi={}",
+                func.name, phi_dest.0
+            ));
         }
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "[IV-WIDEN] widened phi {:?} (ty {:?} → {:?})",
             phi_dest, phi_ty, wide_ty
-        );
+        ));
     }
     true
 }

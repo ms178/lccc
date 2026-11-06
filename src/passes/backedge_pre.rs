@@ -981,7 +981,10 @@ fn plan_loop(cx: &Ctx<'_>, lp: &NaturalLoop, out: &mut Vec<Rewrite>) {
 
     let explain = |e: Value, why: &str| {
         if cx.env.debug {
-            eprintln!("[BEPRE] func={} skip v{}: {}", func.name, e.0, why);
+            lccc::cli_output::stderr_line(format_args!(
+                "[BEPRE] func={} skip v{}: {}",
+                func.name, e.0, why
+            ));
         }
     };
 
@@ -1260,10 +1263,10 @@ fn apply(
             func.fp_expr_tags.remove(&rw.e_dest.0);
             carried.push(q);
             if env.debug {
-                eprintln!(
+                lccc::cli_output::stderr_line(format_args!(
                     "[BEPRE] func={} v{} -> shared v{}",
                     func.name, rw.e_dest.0, q.0
-                );
+                ));
             }
             continue;
         }
@@ -1326,7 +1329,7 @@ fn apply(
         func.fp_expr_tags.remove(&rw.e_dest.0);
         carried.push(q);
         if env.debug {
-            eprintln!(
+            lccc::cli_output::stderr_line(format_args!(
                 "[BEPRE] func={} v{} -> v{} = phi({:?} [{}], v{} [{}]) in header block {}",
                 func.name,
                 rw.e_dest.0,
@@ -1336,7 +1339,7 @@ fn apply(
                 rw.e2_dest.0,
                 rw.latch_label,
                 rw.header
-            );
+            ));
         }
     }
 
@@ -1391,10 +1394,10 @@ fn apply(
     for rw in rewrites {
         if leaked.contains(&rw.e_dest.0) {
             if env.debug {
-                eprintln!(
+                lccc::cli_output::stderr_line(format_args!(
                     "[BEPRE] func={} v{} kept: uses remain after rename",
                     func.name, rw.e_dest.0
-                );
+                ));
             }
             continue;
         }

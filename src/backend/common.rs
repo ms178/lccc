@@ -28,10 +28,10 @@ use std::sync::Once;
 fn warn_gcc_assembler(command: &str) {
     static WARN_ONCE: Once = Once::new();
     WARN_ONCE.call_once(|| {
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "WARNING: Using GCC-backed assembler ({}) [gcc_assembler feature enabled]",
             command
-        );
+        ));
     });
 }
 
@@ -43,10 +43,10 @@ fn warn_gcc_assembler(command: &str) {
 fn warn_gcc_linker(command: &str) {
     static WARN_ONCE: Once = Once::new();
     WARN_ONCE.call_once(|| {
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "WARNING: Using GCC-backed linker ({}) [gcc_linker feature enabled]",
             command
-        );
+        ));
     });
 }
 

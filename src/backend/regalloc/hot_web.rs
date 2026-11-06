@@ -174,12 +174,12 @@ pub(super) fn steal_hot_loop_webs(
     // compile answers "what would it take for the steal to fire here".
     let debug = std::env::var_os("CCC_DEBUG_HOT_WEB_STEAL").is_some();
     if debug {
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "hot-web-steal: phi_pairs={} loop_carried={} candidates={}",
             phi_pairs.len(),
             loop_carried.len(),
             candidates.len()
-        );
+        ));
     }
 
     let overlaps_vid = |a: u32, b: u32| -> bool {
@@ -200,14 +200,14 @@ pub(super) fn steal_hot_loop_webs(
     for &(vid, hot_count) in &candidates {
         if steals >= k || assignments.contains_key(&vid) {
             if debug {
-                eprintln!(
+                lccc::cli_output::stderr_line(format_args!(
                     "hot-web-steal: cand v{vid} uses={hot_count} skipped ({})",
                     if steals >= k {
                         "steal budget exhausted"
                     } else {
                         "already assigned"
                     }
-                );
+                ));
             }
             continue;
         }
@@ -298,19 +298,19 @@ pub(super) fn steal_hot_loop_webs(
         }
         if debug {
             match best {
-                Some((reg_id, _, cost)) => eprintln!(
+                Some((reg_id, _, cost)) => lccc::cli_output::stderr_line(format_args!(
                     "hot-web-steal: cand v{vid} uses={hot_count} -> reg {reg_id} (evict cost {cost})"
-                ),
+                )),
                 None => {
                     for (reg_id, reason) in &refusals {
-                        eprintln!(
+                        lccc::cli_output::stderr_line(format_args!(
                             "hot-web-steal: cand v{vid} uses={hot_count} reg {reg_id} refused: {reason}"
-                        );
+                        ));
                     }
                     if refusals.is_empty() {
-                        eprintln!(
+                        lccc::cli_output::stderr_line(format_args!(
                             "hot-web-steal: cand v{vid} uses={hot_count} refused: no available register had holders"
-                        );
+                        ));
                     }
                 }
             }

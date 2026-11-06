@@ -200,13 +200,13 @@ impl<'s> StaticInitChecker<'s> {
         if std::env::var_os("CCC_DEBUG_STATIC_INIT").is_none() {
             return;
         }
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "[static-init] leaf rejected as non-constant: {e:?}\n\
              [static-init]   inferred type: {:?}\n\
              [static-init]   kind: {:?}",
             (self.ctype)(e),
             self.leaf_kind(e)
-        );
+        ));
     }
 
     fn collect_bad(&self, init: &Initializer, out: &mut Vec<Span>) {

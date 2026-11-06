@@ -129,11 +129,11 @@ pub(super) fn color_stack_slots(
 ) {
     let per_segment = std::env::var_os("CCC_TIER2_SEGMENTS").is_some();
     if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "[SLOTS]   color_stack_slots: {} mbv (segment model: {})",
             multi_block_values.len(),
             if per_segment { "per-segment" } else { "hull" }
-        );
+        ));
     }
 
     let mut segments: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
@@ -180,12 +180,12 @@ pub(super) fn color_stack_slots(
         }
     }
     if std::env::var("CCC_DEBUG_SLOTS").is_ok() && !no_segments.is_empty() {
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "[SLOTS]   color_stack_slots: {} mbv have NO liveness segments \
              (conservative unique slot): {:?}",
             no_segments.len(),
             no_segments
-        );
+        ));
     }
 
     // Iterate size classes DESCENDING (8/16/32-byte before 4-byte): wider
@@ -252,13 +252,13 @@ pub(super) fn color_stack_slots(
             assigned += 1;
         }
         if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
-            eprintln!(
+            lccc::cli_output::stderr_line(format_args!(
                 "[SLOTS]   color_stack_slots: {} distinct slots for {} values (reused {}; {} new)",
                 colors.len(),
                 multi_block_values.len(),
                 reused,
                 assigned
-            );
+            ));
         }
     }
 }

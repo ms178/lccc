@@ -356,23 +356,32 @@ pub fn init_pgo_profile(path: Option<&str>) {
     let d = match path {
         Some(p) => match profile::load_profile(p) {
             Ok(x) => {
-                eprintln!(
+                lccc::cli_output::stderr_line(format_args!(
                     "lccc: PGO: loaded {} functions from {}",
                     x.functions.len(),
                     p
-                );
+                ));
                 // Debug/inspection hook: dump the loaded profile as text for
                 // a human-readable view (LCCC_PGO_DUMP_TEXT=<file>).
                 if let Ok(txt) = std::env::var("LCCC_PGO_DUMP_TEXT") {
                     match profile::write_text_profile(std::path::Path::new(&txt), &x) {
-                        Ok(()) => eprintln!("lccc: PGO: wrote text profile to {}", txt),
-                        Err(e) => eprintln!("lccc: PGO warning: text dump failed: {}", e),
+                        Ok(()) => lccc::cli_output::stderr_line(format_args!(
+                            "lccc: PGO: wrote text profile to {}",
+                            txt
+                        )),
+                        Err(e) => lccc::cli_output::stderr_line(format_args!(
+                            "lccc: PGO warning: text dump failed: {}",
+                            e
+                        )),
                     }
                 }
                 x
             }
             Err(e) => {
-                eprintln!("lccc: PGO warning: {} -- continuing without profile", e);
+                lccc::cli_output::stderr_line(format_args!(
+                    "lccc: PGO warning: {} -- continuing without profile",
+                    e
+                ));
                 ProfileData::default()
             }
         },
@@ -409,16 +418,16 @@ pub fn propagate_profile(m: &mut IrModule, u: &str) {
     }
     ACTIVE_PROFILE_VALID.with(|valid| valid.set(good > 0));
     if bad > 0 {
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "lccc: PGO: no profile for {} function(s) in this unit (new/changed code?)",
             bad
-        )
+        ))
     }
     if drifted > 0 {
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "lccc: PGO: {} function(s) drifted from the training CFG (PGO-guided transforms); edge profiles degrade gracefully",
             drifted
-        )
+        ))
     }
     // Derive block counts and tree-edge counts from the instrumented edge
     // counts (flow conservation) into a leaked per-unit map that
@@ -457,11 +466,11 @@ pub fn propagate_profile(m: &mut IrModule, u: &str) {
         derived.insert(profile::function_key(u, &f.name), copy);
     }
     if drifted_edges > 0 {
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "lccc: PGO: {} function(s) drifted from the training CFG: \
              edge-derived branch/layout/unroll data disabled for them (hot/cold sections kept)",
             drifted_edges
-        );
+        ));
     }
     if !derived.is_empty() {
         let leaked: &'static FxHashMap<String, FunctionProfile> = Box::leak(Box::new(derived));

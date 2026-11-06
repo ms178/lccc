@@ -12219,7 +12219,9 @@ mod kr_prototype_tests {
             .as_ref()
             .map(|p| format!("{:?}", p.return_type))
             .unwrap_or_else(|| "<none>".to_string());
-        eprintln!("LADDER functions[\"f\"].prototype.return_type = {got}");
+        lccc::cli_output::stderr_line(format_args!(
+            "LADDER functions[\"f\"].prototype.return_type = {got}"
+        ));
         assert_eq!(got, "Int", "the outer `f` must keep its own prototype");
     }
 

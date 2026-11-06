@@ -158,7 +158,7 @@ pub fn report_execstack<'a>(
             Err(format!("warning treated as error: {w}"))
         }
         Some(ExecstackReport::Warning(w)) => {
-            eprintln!("lccc-ld: warning: {w}");
+            lccc::cli_output::stderr_line(format_args!("lccc-ld: warning: {w}"));
             Ok(())
         }
     }

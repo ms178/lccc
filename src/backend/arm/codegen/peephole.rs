@@ -6858,13 +6858,20 @@ fn sink_loop_carried_stores(lines: &mut [String], kinds: &mut [LineKind], n: usi
                 }
             }
             if bad && debug {
-                eprintln!("sink bail: {} (slot re-referenced in region)", text);
+                lccc::cli_output::stderr_line(format_args!(
+                    "sink bail: {} (slot re-referenced in region)",
+                    text
+                ));
             }
             // (b) No exiting branch anywhere (v1: fall-through exit only).
             if !bad && !exits.is_empty() {
                 bad = true;
                 if debug {
-                    eprintln!("sink bail: {} ({} exit branches)", text, exits.len());
+                    lccc::cli_output::stderr_line(format_args!(
+                        "sink bail: {} ({} exit branches)",
+                        text,
+                        exits.len()
+                    ));
                 }
             }
             // (c) No labels between the store and the backedge (no way to
@@ -6878,7 +6885,10 @@ fn sink_loop_carried_stores(lines: &mut [String], kinds: &mut [LineKind], n: usi
                     if v[p].2.ends_with(':') {
                         bad = true;
                         if debug {
-                            eprintln!("sink bail: {} (label {} in region)", text, v[p].2);
+                            lccc::cli_output::stderr_line(format_args!(
+                                "sink bail: {} (label {} in region)",
+                                text, v[p].2
+                            ));
                         }
                         break;
                     }
@@ -6890,7 +6900,10 @@ fn sink_loop_carried_stores(lines: &mut [String], kinds: &mut [LineKind], n: usi
                     if instr_clobbers_reg(&v[p].2, num) {
                         bad = true;
                         if debug {
-                            eprintln!("sink bail: {} (clobbered by {})", text, v[p].2);
+                            lccc::cli_output::stderr_line(format_args!(
+                                "sink bail: {} (clobbered by {})",
+                                text, v[p].2
+                            ));
                         }
                         break;
                     }
@@ -6902,7 +6915,7 @@ fn sink_loop_carried_stores(lines: &mut [String], kinds: &mut [LineKind], n: usi
             sunk_slot[slot] = true;
             edits.push((slot, format!("    {}", text), v[j].0, v[j].1));
             if debug {
-                eprintln!("sink ok: {}", text);
+                lccc::cli_output::stderr_line(format_args!("sink ok: {}", text));
             }
         }
     }

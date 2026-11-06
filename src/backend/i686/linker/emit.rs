@@ -2043,7 +2043,9 @@ pub(super) fn resolve_entry_point(
             return v;
         }
     }
-    eprintln!("lccc-ld: warning: cannot find entry symbol {name}; defaulting to {text_start:08x}");
+    lccc::cli_output::stderr_line(format_args!(
+        "lccc-ld: warning: cannot find entry symbol {name}; defaulting to {text_start:08x}"
+    ));
     text_start
 }
 
@@ -2090,7 +2092,7 @@ pub(super) fn write_link_map_32(
         }
     }
     if opts.print_map {
-        print!("{map}");
+        lccc::cli_output::stdout_text(format_args!("{map}"));
     }
     if let Some(ref path) = opts.map_path {
         std::fs::write(path, map).map_err(|e| format!("failed to write map {path}: {e}"))?;

@@ -410,7 +410,9 @@ pub fn instrument_module(
         return 0;
     }
     if target != Target::X86_64 {
-        eprintln!("lccc: PGO: instrumentation is x86-64 only; skipping");
+        lccc::cli_output::stderr_line(format_args!(
+            "lccc: PGO: instrumentation is x86-64 only; skipping"
+        ));
         return 0;
     }
     let uid = unit_hash(unit);
@@ -865,12 +867,12 @@ pub fn instrument_module(
         let lookup_name = format!("__lccc_pgo_lookup_{:016x}", uid);
         dump_helper(m, &path, &rec, &helper, &func_sites, &lookup_name);
     }
-    eprintln!(
+    lccc::cli_output::stderr_line(format_args!(
         "lccc: PGO: instrumented {} functions ({} value-profile sites) into {}",
         rec.len(),
         func_sites.values().map(|v| v.len()).sum::<usize>(),
         path.display()
-    );
+    ));
     rec.len()
 }
 

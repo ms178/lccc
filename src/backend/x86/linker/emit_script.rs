@@ -1491,7 +1491,7 @@ fn link_with_script_machine(
                     if extras.fatal_warnings {
                         return Err(format!("warning treated as error: {message}"));
                     }
-                    eprintln!("lccc-ld: warning: {message}");
+                    lccc::cli_output::stderr_line(format_args!("lccc-ld: warning: {message}"));
                 }
                 OrphanHandling::Discard | OrphanHandling::Place => {}
             }
@@ -2093,14 +2093,14 @@ fn link_with_script_machine(
 
                 if std::env::var("LCCC_LD_MAP").is_ok() {
                     for p in &placed {
-                        eprintln!(
+                        lccc::cli_output::stderr_line(format_args!(
                             "MAP {} 0x{:x} 0x{:x} {}({})",
                             def.name,
                             p.vaddr,
                             p.size,
                             objects[p.obj_idx].source_name,
                             objects[p.obj_idx].sections[p.sec_idx].name
-                        );
+                        ));
                     }
                 }
 
@@ -4503,7 +4503,10 @@ fn link_with_script_machine(
                 ))
             })
             .collect();
-        print!("{}", linker_common::format_memory_usage_table(&rows));
+        lccc::cli_output::stdout_text(format_args!(
+            "{}",
+            linker_common::format_memory_usage_table(&rows)
+        ));
     }
 
     std::fs::write(output_path, &out)

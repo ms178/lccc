@@ -1486,13 +1486,13 @@ impl X86Codegen {
                             }
                             Some(SlotAddr::Indirect(slot)) => {
                                 if std::env::var_os("LCCC_DBG_STORE").is_some() {
-                                    eprintln!(
+                                    lccc::cli_output::stderr_line(format_args!(
                                         "[DBGSTORE] base={} get_slot={:?} reg_assign={:?} offset={}",
                                         base.0,
                                         self.state.get_slot(base.0),
                                         self.reg_assignments.get(&base.0),
                                         offset
-                                    );
+                                    ));
                                 }
                                 if let Some(&reg) = self.reg_assignments.get(&base.0) {
                                     let reg_name = phys_reg_name(reg);

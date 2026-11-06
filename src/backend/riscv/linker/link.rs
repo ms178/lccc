@@ -131,10 +131,10 @@ pub fn link_builtin(
 
     if trace {
         for (name, _) in &input_objs {
-            println!("{name}");
+            lccc::cli_output::stdout_line(format_args!("{name}"));
         }
         for lib in &actual_needed_libs {
-            println!("{lib}");
+            lccc::cli_output::stdout_line(format_args!("{lib}"));
         }
     }
 
@@ -383,7 +383,7 @@ fn link_objects(
         super::attributes::merge_into_output(input_objs, &mut merged_sections, &merged_map)?;
     if probe.is_none() {
         for warning in attr_warnings {
-            eprintln!("lccc-ld: warning: {warning}");
+            lccc::cli_output::stderr_line(format_args!("lccc-ld: warning: {warning}"));
         }
     }
     let mut debug_sections = super::debug::DebugSections::collect(
@@ -711,7 +711,7 @@ fn link_shared_objects(
         super::attributes::merge_into_output(input_objs, &mut merged_sections, &merged_map)?;
     if probe.is_none() {
         for warning in attr_warnings {
-            eprintln!("lccc-ld: warning: {warning}");
+            lccc::cli_output::stderr_line(format_args!("lccc-ld: warning: {warning}"));
         }
     }
     let mut debug_sections = super::debug::DebugSections::collect(

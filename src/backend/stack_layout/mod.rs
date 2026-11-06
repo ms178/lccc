@@ -193,10 +193,10 @@ pub fn calculate_stack_space_common(
     use crate::ir::intrinsics::IntrinsicOp;
     let debug_protect = std::env::var("LCCC_DEBUG_PROTECT").is_ok();
     if debug_protect {
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "[PROTECT] Scanning function {} for vector intrinsics",
             func.name
-        );
+        ));
     }
 
     // Pass 1: Mark all vector intrinsic destinations as vector values.
@@ -219,10 +219,10 @@ pub fn calculate_stack_space_common(
                         state.vector_values.insert(d.0);
                         state.protected_slot_values.insert(d.0);
                         if debug_protect {
-                            eprintln!(
+                            lccc::cli_output::stderr_line(format_args!(
                                 "[PROTECT] Marked SSA value {} as protected 256-bit ({:?})",
                                 d.0, op
-                            );
+                            ));
                         }
                     }
                     Some(16) => {
@@ -230,10 +230,10 @@ pub fn calculate_stack_space_common(
                         state.vector_values.insert(d.0);
                         state.protected_slot_values.insert(d.0);
                         if debug_protect {
-                            eprintln!(
+                            lccc::cli_output::stderr_line(format_args!(
                                 "[PROTECT] Marked SSA value {} as protected 128-bit ({:?})",
                                 d.0, op
-                            );
+                            ));
                         }
                     }
                     _ => {}
@@ -252,17 +252,20 @@ pub fn calculate_stack_space_common(
         for inst in &block.instructions {
             if let crate::ir::instruction::Instruction::Phi { dest, incoming, .. } = inst {
                 if debug_protect {
-                    eprintln!(
+                    lccc::cli_output::stderr_line(format_args!(
                         "[PROTECT-PHI] Checking PHI SSA {}, incoming: {:?}",
                         dest.0, incoming
-                    );
+                    ));
                 }
                 // If any incoming value is a vector, the PHI result is also a vector
                 let has_vector_incoming = incoming.iter().any(|(val, _)| {
                     if let crate::ir::instruction::Operand::Value(v) = val {
                         let is_vec = state.vector_values.contains(&v.0);
                         if debug_protect && is_vec {
-                            eprintln!("[PROTECT-PHI]   Incoming SSA {} is a vector!", v.0);
+                            lccc::cli_output::stderr_line(format_args!(
+                                "[PROTECT-PHI]   Incoming SSA {} is a vector!",
+                                v.0
+                            ));
                         }
                         is_vec
                     } else {
@@ -286,10 +289,10 @@ pub fn calculate_stack_space_common(
                     }
                     state.protected_slot_values.insert(dest.0);
                     if debug_protect {
-                        eprintln!(
+                        lccc::cli_output::stderr_line(format_args!(
                             "[PROTECT] Marked PHI SSA value {} as protected (has vector incoming)",
                             dest.0
-                        );
+                        ));
                     }
                 }
             }
@@ -317,10 +320,10 @@ pub fn calculate_stack_space_common(
                                 state.vector128_values.insert(dest.0);
                             }
                             if debug_protect {
-                                eprintln!(
+                                lccc::cli_output::stderr_line(format_args!(
                                     "[PROTECT-COPY] Marked SSA {} as protected (copy from vector SSA {})",
                                     dest.0, src_val.0
-                                );
+                                ));
                             }
                         }
                     }
@@ -333,10 +336,10 @@ pub fn calculate_stack_space_common(
     }
 
     if debug_protect {
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "[PROTECT] Total protected values: {}",
             state.protected_slot_values.len()
-        );
+        ));
     }
 
     // Phase 1: Build analysis context (use-blocks, def-blocks, used values,
@@ -644,7 +647,10 @@ fn dump_debug_slots(state: &super::state::CodegenState, func: &IrFunction, total
     if std::env::var("CCC_DEBUG_SLOTS").is_err() {
         return;
     }
-    eprintln!("[SLOTS] fn={} total_space={}", func.name, total_space);
+    lccc::cli_output::stderr_line(format_args!(
+        "[SLOTS] fn={} total_space={}",
+        func.name, total_space
+    ));
     let mut ids: Vec<u32> = state.value_locations.keys().copied().collect();
     ids.sort_unstable();
     for id in ids {
@@ -666,7 +672,12 @@ fn dump_debug_slots(state: &super::state::CodegenState, func: &IrFunction, total
         if state.alloca_values.contains(&id) {
             t.push("alloca");
         }
-        eprintln!("[SLOTS]   v{:<5} slot={:<5} {}", id, slot, t.join(","));
+        lccc::cli_output::stderr_line(format_args!(
+            "[SLOTS]   v{:<5} slot={:<5} {}",
+            id,
+            slot,
+            t.join(",")
+        ));
     }
 }
 
@@ -764,34 +775,34 @@ fn build_layout_context(
                                 _ => "_".to_string(),
                             })
                             .collect();
-                        eprintln!(
+                        lccc::cli_output::stderr_line(format_args!(
                             "[VDEFER-IR] b{} i{} Intrinsic {:?} dp={:?} args=[{}]",
                             bi,
                             ii,
                             op,
                             dest_ptr.map(|v| v.0),
                             argids.join(",")
-                        );
+                        ));
                     }
                     crate::ir::instruction::Instruction::Memcpy { dest, src, size } => {
-                        eprintln!(
+                        lccc::cli_output::stderr_line(format_args!(
                             "[VDEFER-IR] b{} i{} Memcpy dest={} src={} size={}",
                             bi, ii, dest.0, src.0, size
-                        );
+                        ));
                     }
                     crate::ir::instruction::Instruction::Copy { src, dest, .. } => {
-                        eprintln!(
+                        lccc::cli_output::stderr_line(format_args!(
                             "[VDEFER-IR] b{} i{} Copy dest={} src={:?}",
                             bi, ii, dest.0, src
-                        );
+                        ));
                     }
                     other => {
-                        eprintln!(
+                        lccc::cli_output::stderr_line(format_args!(
                             "[VDEFER-IR] b{} i{} {:?}",
                             bi,
                             ii,
                             std::mem::discriminant(other)
-                        );
+                        ));
                     }
                 }
             }

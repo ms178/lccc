@@ -24,12 +24,12 @@ pub(super) fn emit_executable(
     strip_all: bool,
 ) -> Result<(), String> {
     if std::env::var("LINKER_DEBUG").is_ok() {
-        eprintln!("output sections:");
+        lccc::cli_output::stderr_line(format_args!("output sections:"));
         for (i, sec) in output_sections.iter().enumerate() {
-            eprintln!(
+            lccc::cli_output::stderr_line(format_args!(
                 "  [{}]: {} type={} flags=0x{:x} size={} align={}",
                 i, sec.name, sec.sh_type, sec.flags, sec.mem_size, sec.alignment
-            );
+            ));
         }
     }
 
@@ -69,10 +69,10 @@ pub(super) fn emit_executable(
             sec.addr = BASE_ADDR + offset;
             sec.file_offset = offset;
             if debug_layout {
-                eprintln!(
+                lccc::cli_output::stderr_line(format_args!(
                     "  LAYOUT RO: {} addr=0x{:x} foff=0x{:x} sz=0x{:x} flags=0x{:x}",
                     sec.name, sec.addr, sec.file_offset, sec.mem_size, sec.flags
-                );
+                ));
             }
             offset += sec.mem_size;
         }
@@ -84,10 +84,10 @@ pub(super) fn emit_executable(
         .as_ref()
         .map_or((0, 0, 0), |h| (h.offset, h.vaddr, h.size));
     if debug_layout && let Some(h) = &eh_frame_hdr {
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "  LAYOUT EH_FRAME_HDR: addr=0x{:x} foff=0x{:x} sz=0x{:x} fde_count={}",
             h.vaddr, h.offset, h.size, h.fde_count
-        );
+        ));
     }
 
     let rx_filesz = offset; // RX segment: [0, rx_filesz)
@@ -136,10 +136,10 @@ pub(super) fn emit_executable(
             tls_file_size += sec.mem_size;
             tls_mem_size += sec.mem_size;
             if debug_layout {
-                eprintln!(
+                lccc::cli_output::stderr_line(format_args!(
                     "  LAYOUT TLS: {} addr=0x{:x} foff=0x{:x} sz=0x{:x} align={} flags=0x{:x}",
                     sec.name, sec.addr, sec.file_offset, sec.mem_size, a, sec.flags
-                );
+                ));
             }
             offset += sec.mem_size;
         }
@@ -158,10 +158,10 @@ pub(super) fn emit_executable(
             sec.addr = tls_addr + aligned;
             sec.file_offset = offset;
             if debug_layout {
-                eprintln!(
+                lccc::cli_output::stderr_line(format_args!(
                     "  LAYOUT TBSS: {} addr=0x{:x} aligned_off=0x{:x} sz=0x{:x} align={} tls_mem_size=0x{:x}",
                     sec.name, sec.addr, aligned, sec.mem_size, a, tls_mem_size
-                );
+                ));
             }
             tls_mem_size = aligned + sec.mem_size;
             if a > tls_align {
@@ -204,10 +204,10 @@ pub(super) fn emit_executable(
             sec.addr = BASE_ADDR + offset;
             sec.file_offset = offset;
             if debug_layout {
-                eprintln!(
+                lccc::cli_output::stderr_line(format_args!(
                     "  LAYOUT RW: {} addr=0x{:x} foff=0x{:x} sz=0x{:x} flags=0x{:x}",
                     sec.name, sec.addr, sec.file_offset, sec.mem_size, sec.flags
-                );
+                ));
             }
             offset += sec.mem_size;
         }
@@ -227,10 +227,10 @@ pub(super) fn emit_executable(
             sec.addr = BASE_ADDR + offset;
             sec.file_offset = offset;
             if debug_layout {
-                eprintln!(
+                lccc::cli_output::stderr_line(format_args!(
                     "  LAYOUT RW: {} addr=0x{:x} foff=0x{:x} sz=0x{:x} flags=0x{:x}",
                     sec.name, sec.addr, sec.file_offset, sec.mem_size, sec.flags
-                );
+                ));
             }
             offset += sec.mem_size;
         }
@@ -310,32 +310,35 @@ pub(super) fn emit_executable(
     }
 
     if std::env::var("LINKER_DEBUG").is_ok() {
-        eprintln!("section layout:");
+        lccc::cli_output::stderr_line(format_args!("section layout:"));
         for sec in output_sections.iter() {
-            eprintln!(
+            lccc::cli_output::stderr_line(format_args!(
                 "  {} addr=0x{:x} foff=0x{:x} size=0x{:x}",
                 sec.name, sec.addr, sec.file_offset, sec.mem_size
-            );
+            ));
         }
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "  GOT addr=0x{:x} foff=0x{:x} size=0x{:x} entries={}",
             got_addr,
             got_offset,
             got_size,
             got_entries.len()
-        );
+        ));
         if iplt_got_count > 0 {
-            eprintln!(
+            lccc::cli_output::stderr_line(format_args!(
                 "  IPLT GOT addr=0x{:x} entries={}",
                 iplt_got_addr, iplt_got_count
-            );
-            eprintln!(
+            ));
+            lccc::cli_output::stderr_line(format_args!(
                 "  RELA.IPLT addr=0x{:x}..0x{:x}",
                 rela_iplt_addr, rela_iplt_end_addr
-            );
-            eprintln!("  IPLT stubs addr=0x{:x}", iplt_stub_addr);
+            ));
+            lccc::cli_output::stderr_line(format_args!("  IPLT stubs addr=0x{:x}", iplt_stub_addr));
         }
-        eprintln!("  BSS addr=0x{:x} size=0x{:x}", bss_addr, bss_size);
+        lccc::cli_output::stderr_line(format_args!(
+            "  BSS addr=0x{:x} size=0x{:x}",
+            bss_addr, bss_size
+        ));
     }
 
     // Merge section data
@@ -371,7 +374,7 @@ pub(super) fn emit_executable(
                     let old_val = gsym.value;
                     gsym.value += output_sections[oi].addr + so;
                     if std::env::var("LINKER_DEBUG").is_ok() && gsym.info & 0xf == STT_TLS {
-                        eprintln!(
+                        lccc::cli_output::stderr_line(format_args!(
                             "  TLS sym '{}': old=0x{:x} -> new=0x{:x} (sec={} addr=0x{:x} off=0x{:x})",
                             name,
                             old_val,
@@ -379,10 +382,13 @@ pub(super) fn emit_executable(
                             output_sections[oi].name,
                             output_sections[oi].addr,
                             so
-                        );
+                        ));
                     }
                 } else if std::env::var("LINKER_DEBUG").is_ok() && gsym.info & 0xf == STT_TLS {
-                    eprintln!("  TLS sym '{}': NO MAPPING for ({}, {})", name, obj_idx, si);
+                    lccc::cli_output::stderr_line(format_args!(
+                        "  TLS sym '{}': NO MAPPING for ({}, {})",
+                        name, obj_idx, si
+                    ));
                 }
             }
         }
@@ -409,14 +415,14 @@ pub(super) fn emit_executable(
 
     if std::env::var("LINKER_DEBUG").is_ok() && !ifunc_syms.is_empty() {
         for (i, (name, resolver)) in ifunc_syms.iter().enumerate() {
-            eprintln!(
+            lccc::cli_output::stderr_line(format_args!(
                 "  IFUNC[{}]: {} resolver=0x{:x} plt=0x{:x} got=0x{:x}",
                 i,
                 name,
                 resolver,
                 iplt_stub_addr + i as u64 * 16,
                 iplt_got_addr + i as u64 * 8
-            );
+            ));
         }
     }
 
@@ -567,15 +573,18 @@ pub(super) fn emit_executable(
 
     if std::env::var("LINKER_DEBUG").is_ok() {
         if let Some(g) = globals.get("main") {
-            eprintln!("  main resolved to 0x{:x}", g.value);
+            lccc::cli_output::stderr_line(format_args!("  main resolved to 0x{:x}", g.value));
         }
         if let Some(g) = globals.get("_start") {
-            eprintln!("  _start resolved to 0x{:x}", g.value);
+            lccc::cli_output::stderr_line(format_args!("  _start resolved to 0x{:x}", g.value));
         }
         if let Some(g) = globals.get("__libc_start_main") {
-            eprintln!("  __libc_start_main resolved to 0x{:x}", g.value);
+            lccc::cli_output::stderr_line(format_args!(
+                "  __libc_start_main resolved to 0x{:x}",
+                g.value
+            ));
         }
-        eprintln!("  entry_addr = 0x{:x}", entry_addr);
+        lccc::cli_output::stderr_line(format_args!("  entry_addr = 0x{:x}", entry_addr));
     }
 
     // Debug sections follow the load image in the file, unmapped.
@@ -644,10 +653,10 @@ pub(super) fn emit_executable(
                 if tls_addr != 0 {
                     let offset = (sym_addr as i64) - (tls_addr as i64) + 16;
                     if reloc::tls_debug() {
-                        eprintln!(
+                        lccc::cli_output::stderr_line(format_args!(
                             "  GOT TLS IE: key='{}' sym_addr=0x{:x} tls_addr=0x{:x} -> got_val=0x{:x}",
                             key, sym_addr, tls_addr, offset as u64
-                        );
+                        ));
                     }
                     offset as u64
                 } else {
@@ -659,7 +668,7 @@ pub(super) fn emit_executable(
         let entry_off = got_offset as usize + idx * 8;
         w64(&mut out, entry_off, val);
         if std::env::var("LINKER_DEBUG").is_ok() && val == 0 {
-            eprintln!("  GOT[{}] = 0 for symbol '{}'", idx, key);
+            lccc::cli_output::stderr_line(format_args!("  GOT[{}] = 0 for symbol '{}'", idx, key));
         }
     }
 

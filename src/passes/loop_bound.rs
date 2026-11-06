@@ -274,10 +274,10 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         }
     }
     if count > 0 && super::loop_rotate::affine_fold_debug() {
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "[AFFOLD] {}: affine exit-compare folds: {} (early unsigned)",
             func.name, count
-        );
+        ));
     }
     count
 }

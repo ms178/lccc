@@ -803,12 +803,12 @@ fn plan_loop(cx: &Ctx, sh: &LoopShape, out: &mut Vec<Rewrite>) {
         for (i, inst) in cx.func.blocks[b].instructions.iter().enumerate() {
             if !is_modelled(inst) {
                 if cx.env.debug {
-                    eprintln!(
+                    lccc::cli_output::stderr_line(format_args!(
                         "[lcfwd] {}: loop@{} rejected: unmodelled memory effect {:?}",
                         cx.func.name,
                         sh.header,
                         std::mem::discriminant(inst)
-                    );
+                    ));
                 }
                 return;
             }
@@ -886,7 +886,7 @@ fn plan_loop(cx: &Ctx, sh: &LoopShape, out: &mut Vec<Rewrite>) {
                 .find(|(_, t)| may_overlap(t, ll, size));
             if let Some((_, t)) = conflict {
                 if cx.env.debug {
-                    eprintln!(
+                    lccc::cli_output::stderr_line(format_args!(
                         "[lcfwd] {}: loop@{} pair (load b{}i{}, store b{}i{}) rejected: \
                          store b{}i{} may alias (load {:?}, store {:?})",
                         cx.func.name,
@@ -899,17 +899,17 @@ fn plan_loop(cx: &Ctx, sh: &LoopShape, out: &mut Vec<Rewrite>) {
                         t.idx,
                         ll,
                         t.lin
-                    );
+                    ));
                 }
                 continue;
             }
             if !cx.preheader_load_safe(sh, ll, size, l.block) {
                 if cx.env.debug {
-                    eprintln!(
+                    lccc::cli_output::stderr_line(format_args!(
                         "[lcfwd] {}: loop@{} pair (load b{}i{}, store b{}i{}) rejected: \
                          preheader load not provably safe",
                         cx.func.name, sh.header, l.block, l.idx, s.block, s.idx
-                    );
+                    ));
                 }
                 continue;
             }
@@ -927,11 +927,11 @@ fn plan_loop(cx: &Ctx, sh: &LoopShape, out: &mut Vec<Rewrite>) {
             };
             if store_val_multi_def || cx.multi_def.contains(&dest.0) {
                 if cx.env.debug {
-                    eprintln!(
+                    lccc::cli_output::stderr_line(format_args!(
                         "[lcfwd] {}: loop@{} pair (load b{}i{}, store b{}i{}) rejected: \
                          multi-def operand",
                         cx.func.name, sh.header, l.block, l.idx, s.block, s.idx
-                    );
+                    ));
                 }
                 continue;
             }
@@ -945,7 +945,7 @@ fn plan_loop(cx: &Ctx, sh: &LoopShape, out: &mut Vec<Rewrite>) {
                 lin0: ll.clone(),
             });
             if cx.env.debug {
-                eprintln!(
+                lccc::cli_output::stderr_line(format_args!(
                     "[lcfwd] {}: loop@{} forward store b{}i{} -> load b{}i{} ({:?}, stride {}, base {})",
                     cx.func.name,
                     sh.header,
@@ -956,7 +956,7 @@ fn plan_loop(cx: &Ctx, sh: &LoopShape, out: &mut Vec<Rewrite>) {
                     l.ty,
                     ll.stride,
                     ll.base
-                );
+                ));
             }
             if out.len() >= MAX_REWRITES {
                 return;
@@ -1218,10 +1218,10 @@ fn run_round(func: &mut IrFunction, globals: &FxHashMap<String, usize>, env: Env
             };
             let Some(root) = root_value(func, &defs, &rw.lin0, load_ptr) else {
                 if env.debug {
-                    eprintln!(
+                    lccc::cli_output::stderr_line(format_args!(
                         "[lcfwd] {}: could not materialise root for load {:?}",
                         func.name, rw.load_dest
-                    );
+                    ));
                 }
                 continue;
             };

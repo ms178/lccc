@@ -353,7 +353,7 @@ fn rewrite_covered_arm_loads(
                     {
                         pending.push((inst_pos, *dest, *covering));
                     } else if debug {
-                        eprintln!(
+                        lccc::cli_output::stderr_line(format_args!(
                             "[IFCONV] arm block {} load ptr={} ty={:?} not covered by pred loads {:?}",
                             arm_idx,
                             ptr.0,
@@ -362,13 +362,16 @@ fn rewrite_covered_arm_loads(
                                 .iter()
                                 .map(|(p, t, _, d)| (p.as_str(), *t, d.0))
                                 .collect::<Vec<_>>()
-                        );
+                        ));
                         for b in &func.blocks {
                             for i in &b.instructions {
                                 if i.dest() == Some(*ptr)
                                     || pred_loads.iter().any(|(_, _, _, d)| i.dest() == Some(*d))
                                 {
-                                    eprintln!("[IFCONV]   def: {:?}", i);
+                                    lccc::cli_output::stderr_line(format_args!(
+                                        "[IFCONV]   def: {:?}",
+                                        i
+                                    ));
                                 }
                             }
                         }
@@ -1055,10 +1058,10 @@ fn try_if_combine_loop(
                 Instruction::Call { .. } | Instruction::InlineAsm { .. }
             ) {
                 if dbg {
-                    eprintln!(
+                    lccc::cli_output::stderr_line(format_args!(
                         "[IFCOMB] {} loop@{}: reject (call/asm)",
                         func.name, nl.header
-                    );
+                    ));
                 }
                 return 0;
             }
@@ -1087,10 +1090,10 @@ fn try_if_combine_loop(
         if leaves {
             if exiting.is_some() {
                 if dbg {
-                    eprintln!(
+                    lccc::cli_output::stderr_line(format_args!(
                         "[IFCOMB] {} loop@{}: reject (multiple exiting blocks)",
                         func.name, nl.header
-                    );
+                    ));
                 }
                 return 0;
             }
@@ -1108,10 +1111,10 @@ fn try_if_combine_loop(
         .any(|c| c.pred_idx == exiting || c.inner_idx == exiting)
     {
         if dbg {
-            eprintln!(
+            lccc::cli_output::stderr_line(format_args!(
                 "[IFCOMB] {} loop@{}: reject (candidate touches the exiting block {})",
                 func.name, nl.header, exiting
-            );
+            ));
         }
         return 0;
     }
@@ -1154,22 +1157,22 @@ fn try_if_combine_loop(
                 continue;
             }
             if dbg {
-                eprintln!(
+                lccc::cli_output::stderr_line(format_args!(
                     "[IFCOMB] {} loop@{}: reject (branch in block {} survives)",
                     func.name, nl.header, b
-                );
+                ));
             }
             return 0;
         }
     }
     if dbg {
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "[IFCOMB] {} loop@{}: accept, {} candidate(s), exiting={}",
             func.name,
             nl.header,
             cands.len(),
             exiting
-        );
+        ));
     }
     // Accepted: apply this round's candidates.  The caller's fixpoint comes
     // back for the next level of the chain and re-derives the same decision.
@@ -1359,7 +1362,7 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
             }
         }
         if std::env::var("CCC_DEBUG_IFCOMBINE").is_ok() {
-            eprintln!(
+            lccc::cli_output::stderr_line(format_args!(
                 "[IFCOMB] {} loop@{} body={:?}: {} candidate(s)",
                 func.name,
                 nl.header,
@@ -1369,7 +1372,7 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
                     v
                 },
                 loop_cands.len()
-            );
+            ));
         }
         if !loop_cands.is_empty() {
             per_loop.push((li, loop_cands));

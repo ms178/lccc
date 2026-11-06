@@ -703,9 +703,19 @@ pub fn filter_available_regs(callee_saved: &[PhysReg], asm_clobbered: &[PhysReg]
 /// the index stays exact even for IR that violates SSA dest uniqueness.
 ///
 /// Two build paths: `aligned_homes` handles the layout lowering emits with
-/// zero allocations, and `general_homes` handles every other layout with one
-/// hash table and one entry-block pass.  Both are proven exact in their
-/// documentation and by the exhaustive/randomized equivalence tests below.
+/// ONE `Vec` allocation and no hash table, and `general_homes` handles every
+/// other layout with that same `Vec` plus one hash table and one entry-block
+/// pass.  (The fast path is "hash-table-free", not heap-free: the index must
+/// own its `homes` array.)  Both are proven exact in their documentation and
+/// by the exhaustive/randomized equivalence tests below.
+///
+/// When the aligned probe fails at instruction `k`, the general pass re-walks
+/// that prefix.  This is bounded by `params` extra instruction examinations
+/// (at 4096 params: <= 4096 examinations, i.e. microseconds against a
+/// multi-second compile) and buys a much simpler, exhaustively provable
+/// implementation than a fused single-pass design that would have to
+/// retroactively seed the general state.  The complexity witness below pins
+/// that bound so the redundancy can never grow into a second full scan.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParamAllocaIndex {
     homes: Vec<Option<(Value, IrType)>>,
@@ -714,12 +724,14 @@ pub struct ParamAllocaIndex {
 /// Portable complexity witness for [`ParamAllocaIndex::build_with_stats`].
 ///
 /// Wall-clock ratios are not portable across CI machines; this counts the one
-/// resource the algorithm must bound: entry-block instructions examined while
-/// building the index.  The contract is
+/// resource the algorithm must bound: instruction *examinations* performed
+/// while building the index.  A failed aligned probe examines a prefix that
+/// the general pass then re-examines, so this is an examination count, not a
+/// count of distinct instructions.  The contract is
 /// `instructions_examined <= params + entry_instructions`, i.e. LINEAR, and
 /// the unit tests assert it on adversarial shifted layouts.  The counter is a
-/// single `usize` increment per examined instruction; `build` discards the
-/// stats value, so optimized builds fold the accounting away.
+/// single `usize` increment per examination; `build` discards the stats value,
+/// so optimized builds fold the accounting away.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ParamHomeStats {
     pub instructions_examined: usize,
@@ -1783,5 +1795,111 @@ mod param_alloca_index_tests {
         let aligned = function(aligned_instructions, aligned_homes_ids);
         let (_, aligned_stats) = ParamAllocaIndex::build_with_stats(&aligned);
         assert_eq!(aligned_stats.instructions_examined, N);
+    }
+
+    /// The complexity witness is only evidence about the SHIPPED path if the
+    /// instrumented instantiation produces the identical index.  Prove that
+    /// identity on every shape that selects a different build path.
+    #[test]
+    fn instrumented_build_is_identical_to_the_shipped_build() {
+        let tys = [IrType::I32, IrType::I64, IrType::F32, IrType::F64];
+        let mut cases: Vec<IrFunction> = Vec::new();
+        // (a) aligned, (b) shifted by a prefix, (c) promoted away,
+        // (d) duplicate home ids, (e) a reused dest with a different width,
+        // (f) two blocks, (g) no blocks.
+        cases.push(function(
+            (0..6)
+                .map(|i| alloca(10 + i, tys[i as usize % 4]))
+                .collect(),
+            (0..6).map(|i| 10 + i).collect(),
+        ));
+        cases.push(function(
+            vec![
+                alloca(99, IrType::I32),
+                alloca(10, IrType::I32),
+                alloca(11, IrType::F64),
+            ],
+            vec![10, 11],
+        ));
+        cases.push(function(vec![alloca(99, IrType::I32)], vec![10]));
+        cases.push(function(
+            vec![
+                alloca(10, IrType::I64),
+                alloca(10, IrType::F64),
+                alloca(11, IrType::I32),
+            ],
+            vec![10, 10, 11],
+        ));
+        cases.push(function(
+            vec![
+                alloca(10, IrType::F32),
+                alloca(77, IrType::I32),
+                alloca(10, IrType::I64),
+            ],
+            vec![10],
+        ));
+        let mut two = function(vec![alloca(99, IrType::I32)], vec![1]);
+        two.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![alloca(1, IrType::I64)],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        cases.push(two);
+        let mut none = function(vec![alloca(1, IrType::I32)], vec![1]);
+        none.blocks.clear();
+        cases.push(none);
+
+        for (case, f) in cases.iter().enumerate() {
+            let shipped = ParamAllocaIndex::build(f);
+            let (witness, _) = ParamAllocaIndex::build_with_stats(f);
+            assert_eq!(
+                shipped, witness,
+                "case {case}: instrumentation changed the index"
+            );
+            for i in 0..=f.param_alloca_values.len() + 1 {
+                assert_eq!(
+                    shipped.get(i),
+                    reference_full_scan(f, i),
+                    "case {case}: ordinal {i}"
+                );
+            }
+        }
+    }
+
+    /// A late-failing aligned probe must cost at most `params` extra
+    /// examinations, never a second unbounded scan.  The count is pinned
+    /// exactly, so a future change that re-walks the whole prefix twice is
+    /// caught by a machine-independent assertion rather than a timing test.
+    #[test]
+    fn failed_aligned_probe_costs_exactly_one_bounded_prefix() {
+        const N: usize = 64usize;
+        const FAIL_AT: usize = N - 1; // aligned hypothesis survives 63 checks
+        let tys = [IrType::I32, IrType::I64, IrType::F32, IrType::F64];
+        let homes: Vec<u32> = (0..N).map(|i| 1000 + i as u32).collect();
+        let mut instructions: Vec<Instruction> = Vec::with_capacity(2 * N);
+        for i in 0..FAIL_AT {
+            instructions.push(alloca(homes[i], tys[i % 4]));
+        }
+        // The probe breaks here: dest differs from wants[FAIL_AT].
+        instructions.push(alloca(9999, IrType::I32));
+        // Authoritative homes at the very end force the general pass to walk
+        // the whole entry block, making the expected count unambiguous.
+        for (i, dest) in homes.iter().enumerate() {
+            instructions.push(alloca(*dest, tys[(i + 1) % 4]));
+        }
+        let entry_instructions = instructions.len();
+        let f = function(instructions, homes.clone());
+        let (index, stats) = ParamAllocaIndex::build_with_stats(&f);
+        // FAIL_AT + 1 examinations in the probe, then one full general pass.
+        assert_eq!(
+            stats.instructions_examined,
+            FAIL_AT + 1 + entry_instructions,
+            "the fallback must not re-examine more than the proven prefix"
+        );
+        assert!(stats.instructions_examined <= N + entry_instructions);
+        for i in 0..=N {
+            assert_eq!(index.get(i), reference_full_scan(&f, i), "ordinal {i}");
+        }
     }
 }

@@ -3738,7 +3738,10 @@ pub fn emit_cast_default(
     // integer -> i128/u128: widen to 64-bit then sign/zero extend high half
     if is_i128_type(to_ty) && !is_i128_type(from_ty) {
         if trace_i128_enabled() {
-            eprintln!("[I128] cast {:?} -> {:?} dest={:?}", from_ty, to_ty, dest.0);
+            lccc::cli_output::stderr_line(format_args!(
+                "[I128] cast {:?} -> {:?} dest={:?}",
+                from_ty, to_ty, dest.0
+            ));
         }
         cg.emit_load_operand(src);
         if from_ty.size() < 8 {

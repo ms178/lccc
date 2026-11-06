@@ -431,10 +431,10 @@ pub fn check_rwx_segments(path: impl AsRef<Path>, warn: bool, fatal: bool) -> Re
     let mut file =
         File::open(path).map_err(|e| format!("failed to read '{}': {e}", path.display()))?;
     if elf_has_rwx_load(&mut file)? {
-        eprintln!(
+        lccc::cli_output::stderr_line(format_args!(
             "lccc-ld: warning: {} has a LOAD segment with RWX permissions",
             path.display()
-        );
+        ));
         if fatal {
             return Err("warning treated as error: LOAD segment with RWX permissions".into());
         }
