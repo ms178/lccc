@@ -365,6 +365,11 @@ impl ArmCodegen {
             available_regs.clear();
             caller_saved_regs.clear();
         }
+        // A nested function leaving through a nonlocal `goto` never runs its
+        // epilogue's restores (see `leaves_through_nonlocal_goto`).
+        if crate::backend::generation::leaves_through_nonlocal_goto(func) {
+            available_regs.clear();
+        }
 
         // AArch64 x4..x7 are argument registers 4..7 and x8 is the indirect-
         // result register; all are in the caller-saved pool. A value consumed

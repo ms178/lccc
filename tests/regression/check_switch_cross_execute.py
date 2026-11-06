@@ -36,7 +36,7 @@ FIXTURES = (
     "predicate_inverted_signed_cmp_cross", "word_reload_sign_extension_cross",
     "leaf_params_fp_domain_cross", "vector_fma_families_cross", "call_args_and_pool_regs_cross",
     "fp_sign_and_vector_fms_cross", "int_mul_const_and_fp_int_cast_cross",
-    "int_cmp_const_select_cross",
+    "int_cmp_const_select_cross", "narrow_sign_test_cross", "nested_fn_chain_goto_cross",
 )
 ALL_LEVELS = ("-O0", "-O1", "-O2", "-Os")
 LEVELS = {
@@ -122,6 +122,17 @@ LEVELS = {
     # conditional, which must wrap at 32 bits and zero-extend. The loop
     # constant hoist keeps the constants those forms encode in place.
     "int_cmp_const_select_cross": ALL_LEVELS + ("-O3",),
+    # A sign test of a narrow value reads its top bit: AArch64 `tst #0x80`
+    # (or `ubfx`/`sbfx`) for `sxtb; cmp #0` and a sign condition, RV64 no
+    # `srai` before `slti 0`/`bltz` (`srli 7` of an `lbu`, `andi 128; seqz`
+    # for a negated byte test), and RV64 `signed char`/`short` arguments
+    # trusted to arrive sign-extended.
+    "narrow_sign_test_cross": ALL_LEVELS + ("-O3",),
+    # GNU nested functions: AArch64 -O0 saved the static chain through x0
+    # before reading the first parameter; a nested function leaving through
+    # a nonlocal goto kept a value in a callee-saved register its abandoned
+    # epilogue never restored (AArch64 and RV64 -O1).
+    "nested_fn_chain_goto_cross": ALL_LEVELS + ("-O3",),
 }
 # Two-unit psABI fixtures under interop/: `<name>_callee.c` and
 # `<name>_caller.c`, linked LCCC-with-LCCC and LCCC-with-Clang in both

@@ -747,6 +747,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= fold_zext32_into_sext_w(&lines, &mut kinds, n);
         changed |= eliminate_redundant_zext_byte(&mut lines, &mut kinds, n);
         changed |= eliminate_redundant_sign_extensions(&mut lines, &mut kinds, n);
+        changed |= fold_sign_masks(&mut lines, &mut kinds, n);
         changed |= eliminate_self_moves(&mut kinds, n);
         changed |= eliminate_redundant_mv_chain(&mut lines, &mut kinds, n);
         if merge_blocks {
@@ -798,6 +799,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= fold_zext32_into_sext_w(&lines, &mut kinds, n);
             changed2 |= eliminate_redundant_zext_byte(&mut lines, &mut kinds, n);
             changed2 |= eliminate_redundant_sign_extensions(&mut lines, &mut kinds, n);
+            changed2 |= fold_sign_masks(&mut lines, &mut kinds, n);
             changed2 |= eliminate_self_moves(&mut kinds, n);
             changed2 |= eliminate_redundant_mv_chain(&mut lines, &mut kinds, n);
             if merge_blocks {
@@ -1875,9 +1877,9 @@ fn eliminate_redundant_zext_byte(lines: &mut [String], kinds: &mut [LineKind], n
             // The entry contract (see `ARG_EXT_MARKER`): an `unsigned
             // char`/`unsigned short` argument arrives zero-extended.
             LineKind::Nop if lines[i].trim_start().starts_with(ARG_EXT_MARKER) => {
-                for (reg, zext) in arg_ext_facts(lines[i].trim_start()) {
-                    if zext != 0 {
-                        set_width(&mut widths, reg, zext);
+                for (reg, ext) in arg_ext_facts(lines[i].trim_start()) {
+                    if let ArgExt::Zero(bits) = ext {
+                        set_width(&mut widths, reg, bits);
                     }
                 }
                 i += 1;
@@ -2203,8 +2205,9 @@ impl RvLazyLiveness {
         self.cached = None;
     }
 
-    /// Whether `reg` is dead after line `k`.  Without a resolvable CFG only
-    /// a scratch register's block-local proof answers.
+    /// Whether `reg` is dead after line `k` -- after a branch, on both edges.
+    /// Without a resolvable CFG only a scratch register's block-local proof
+    /// answers, and it sees no taken edge.
     fn dead_after(&mut self, lines: &[String], kinds: &[LineKind], k: usize, reg: u8) -> bool {
         let Some(f) = self.funcs.iter().position(|&(s, e)| s <= k && k < e) else {
             return false;
@@ -2215,7 +2218,11 @@ impl RvLazyLiveness {
         }
         match self.cached.as_ref().and_then(|c| c.1.as_ref()) {
             Some(live) => reg != REG_NONE && live.live_after(k) & rv_bit(reg) == 0,
-            None => reg <= REG_T6 && scratch_dead_after(lines, kinds, k + 1, reg, self.funcs[f].1),
+            None => {
+                reg <= REG_T6
+                    && !matches!(kinds[k], LineKind::Branch | LineKind::Jump)
+                    && scratch_dead_after(lines, kinds, k + 1, reg, self.funcs[f].1)
+            }
         }
     }
 }
@@ -2315,6 +2322,226 @@ fn rv_fold_extension_into_compare(
     Some(c)
 }
 
+/// How a line reads only the sign of register `t`: `slti d,t,0`,
+/// `slt d,t,zero` and `srli d,t,63` leave the sign bit in `d`; `bltz`/`bgez`
+/// (and their `blt`/`bge`/`bgt`/`ble` spellings against `zero`) branch on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RvSignReader {
+    Value(u8),
+    Branch,
+}
+
+fn rv_sign_only_reader(line: &str, t: u8) -> Option<RvSignReader> {
+    let (mnem, rest) = line.trim().split_once(' ')?;
+    let ops: Vec<&str> = rest.split(',').map(str::trim).collect();
+    let is_t = |o: &str| parse_reg(o) == t;
+    let is_zero = |o: &str| o == "zero" || o == "x0";
+    let value = |d: &str| {
+        let d = parse_reg(d);
+        (d != REG_NONE).then_some(RvSignReader::Value(d))
+    };
+    match (mnem, ops.as_slice()) {
+        ("slti", [d, s, k]) if is_t(s) && parse_asm_i64(k) == Some(0) => value(d),
+        ("slt", [d, s, z]) if is_t(s) && is_zero(z) => value(d),
+        ("srli", [d, s, k]) if is_t(s) && parse_asm_i64(k) == Some(63) => value(d),
+        ("bltz" | "bgez", [s, _]) if is_t(s) => Some(RvSignReader::Branch),
+        ("blt" | "bge", [s, z, _]) if is_t(s) && is_zero(z) => Some(RvSignReader::Branch),
+        ("bgt" | "ble", [z, s, _]) if is_t(s) && is_zero(z) => Some(RvSignReader::Branch),
+        _ => None,
+    }
+}
+
+/// `slli t,s,K; srai t,t,K` (from line `i`) read only by a sign test: the
+/// arithmetic shift leaves bit 63 where the left shift put it, so the test
+/// reads the same bit without it (`(unsigned)(signed char)x < 300`, which
+/// `cross_domain_sign_test` turns into `(signed char)x >= 0`, kept a
+/// three-instruction extension-and-compare).  When `s` is a non-negative
+/// value of at most 64 - K bits (an `lbu` for K = 56), a value-producing
+/// test is that value's top bit, `srli d,s,63-K`, and the left shift goes
+/// too; when it is negated next (`xori e,d,1`) and the bit fits an `andi`
+/// immediate, the pair is `andi d,s,1<<(63-K); seqz e,d` -- Clang 23.1.5's
+/// `andi a0, a0, 128; seqz a0, a0` for `(signed char)x >= 0`.  The line to
+/// resume the scan at.
+fn rv_sign_test_of_extension(
+    lines: &mut [String],
+    kinds: &mut [LineKind],
+    n: usize,
+    i: usize,
+    src_range: RvRange,
+    live: &mut RvLazyLiveness,
+) -> Option<usize> {
+    let shl = rv_operands_of(&lines[i], "slli");
+    let (t, s) = (parse_reg(shl.first()?), parse_reg(shl.get(1)?));
+    let k = parse_asm_i64(shl.get(2)?).filter(|k| (1..64).contains(k))?;
+    if t == REG_NONE || s == REG_NONE {
+        return None;
+    }
+    let j = rv_next_kept_line(kinds, i + 1, n);
+    let sra = rv_operands_of(lines.get(j)?, "srai");
+    if sra.len() != 3
+        || parse_reg(&sra[0]) != t
+        || parse_reg(&sra[1]) != t
+        || parse_asm_i64(&sra[2]) != Some(k)
+    {
+        return None;
+    }
+    let c = rv_next_kept_line(kinds, j + 1, n);
+    let reader = rv_sign_only_reader(lines.get(c)?, t)?;
+    if reader != RvSignReader::Value(t) && !live.dead_after(lines, kinds, c, t) {
+        return None;
+    }
+    let top = 63 - k;
+    let RvSignReader::Value(d) = reader else {
+        kinds[j] = LineKind::Nop;
+        live.invalidate();
+        return Some(i);
+    };
+    let negation = rv_next_kept_line(kinds, c + 1, n);
+    let not = lines
+        .get(negation)
+        .map_or(Vec::new(), |l| rv_operands_of(l, "xori"));
+    let e = not.first().map_or(REG_NONE, |o| parse_reg(o));
+    if top <= 10
+        && not.len() == 3
+        && parse_reg(&not[1]) == d
+        && parse_asm_i64(&not[2]) == Some(1)
+        && e != REG_NONE
+        && (e == d || live.dead_after(lines, kinds, negation, d))
+    {
+        lines[i] = format!("    andi {}, {}, {}", reg_name(d), reg_name(s), 1i64 << top);
+        lines[negation] = format!("    seqz {}, {}", reg_name(e), reg_name(d));
+        kinds[i] = classify_line(&lines[i]);
+        kinds[negation] = classify_line(&lines[negation]);
+        kinds[j] = LineKind::Nop;
+        kinds[c] = LineKind::Nop;
+    } else if rv_range_within(src_range, rv_unsigned_range((64 - k) as u32)) {
+        lines[i] = format!("    srli {}, {}, {top}", reg_name(d), reg_name(s));
+        kinds[i] = classify_line(&lines[i]);
+        kinds[j] = LineKind::Nop;
+        kinds[c] = LineKind::Nop;
+    } else {
+        kinds[j] = LineKind::Nop;
+    }
+    live.invalidate();
+    Some(i)
+}
+
+/// `l{b,h,w}[u] s, M; slli t, s, K; srai d, t, K` with K = 64 - the load's
+/// width (the shift at line `i`): the load's value extended the other way
+/// round is the load of that signedness, `lb d, M` -- and a zero-extension
+/// (`srli`) makes it `lbu`/`lhu`/`lwu`.  The access reads the same bytes
+/// either way; GCC and Clang load `(signed char)p[i]` with `lb`, where the
+/// emitter stages `lbu` and a shift pair.  The load must be the previous
+/// kept line, `s` die at the left shift unless the pair overwrites it, and
+/// `t` at the right shift unless it is `d`.  Returns the load's line, where
+/// the scan resumes to record `d`'s new range.
+fn rv_retype_extended_load(
+    lines: &mut [String],
+    kinds: &mut [LineKind],
+    n: usize,
+    i: usize,
+    live: &mut RvLazyLiveness,
+) -> Option<usize> {
+    let shl = rv_operands_of(&lines[i], "slli");
+    let [t, s, k] = shl.as_slice() else {
+        return None;
+    };
+    let (t, s, k) = (parse_reg(t), parse_reg(s), parse_asm_i64(k)?);
+    if t == REG_NONE || s == REG_NONE {
+        return None;
+    }
+    let j = rv_next_kept_line(kinds, i + 1, n);
+    let (signed, back) = match lines.get(j) {
+        Some(line) if line.trim().starts_with("srai ") => (true, rv_operands_of(line, "srai")),
+        Some(line) => (false, rv_operands_of(line, "srli")),
+        None => return None,
+    };
+    let d = back.first().map_or(REG_NONE, |o| parse_reg(o));
+    if back.len() != 3
+        || d == REG_NONE
+        || parse_reg(&back[1]) != t
+        || parse_asm_i64(&back[2]) != Some(k)
+    {
+        return None;
+    }
+    let p = (0..i).rev().find(|&q| kinds[q] != LineKind::Nop)?;
+    let (m, ops) = lines[p].trim().split_once(' ')?;
+    let (dest, mem) = ops.split_once(',')?;
+    let mem = mem.trim();
+    if parse_reg(dest.trim()) != s || !mem.ends_with(')') {
+        return None;
+    }
+    let width = match m {
+        "lb" | "lbu" => 8,
+        "lh" | "lhu" => 16,
+        "lw" | "lwu" => 32,
+        _ => return None,
+    };
+    if k != 64 - width
+        || (s != t && s != d && !live.dead_after(lines, kinds, i, s))
+        || (t != d && !live.dead_after(lines, kinds, j, t))
+    {
+        return None;
+    }
+    let base = &m[..2];
+    let new_m = if signed {
+        base.to_string()
+    } else {
+        format!("{base}u")
+    };
+    lines[p] = format!("    {new_m} {}, {mem}", reg_name(d));
+    kinds[p] = classify_line(&lines[p]);
+    kinds[i] = LineKind::Nop;
+    kinds[j] = LineKind::Nop;
+    live.invalidate();
+    Some(p)
+}
+
+/// `slti t, x, 0; neg d, t` broadcasts the sign of `x`: `srai d, x, 63`.
+/// `negw`, `sub d, zero, t` and `subw d, zero, t` alike -- the negation of 0
+/// or 1 is 0 or all ones in either width.  Clang 23.1.5 spells `-(x < 0)`
+/// as the one shift (`srai`), where the emitter stages a compare and a
+/// negation.  The negation must be the compare's next kept line and `t` die
+/// there unless it is `d`; the shift writes `d` where the compare wrote
+/// `t`, with nothing between.
+fn fold_sign_masks(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut live = RvLazyLiveness::new(lines, kinds, n);
+    let mut changed = false;
+    for i in 0..n {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        let cmp = rv_operands_of(&lines[i], "slti");
+        let [t, x, zero] = cmp.as_slice() else {
+            continue;
+        };
+        let (t, x) = (parse_reg(t), parse_reg(x));
+        if t == REG_NONE || x == REG_NONE || parse_asm_i64(zero) != Some(0) {
+            continue;
+        }
+        let j = rv_next_kept_line(kinds, i + 1, n);
+        let Some(line) = lines.get(j) else {
+            continue;
+        };
+        let (m, ops) = line.trim().split_once(' ').unwrap_or(("", ""));
+        let ops: Vec<&str> = ops.split(',').map(str::trim).collect();
+        let d = match (m, ops.as_slice()) {
+            ("neg" | "negw", [d, s]) if parse_reg(s) == t => parse_reg(d),
+            ("sub" | "subw", [d, "zero" | "x0", s]) if parse_reg(s) == t => parse_reg(d),
+            _ => continue,
+        };
+        if d == REG_NONE || (t != d && !live.dead_after(lines, kinds, j, t)) {
+            continue;
+        }
+        lines[i] = format!("    srai {}, {}, 63", reg_name(d), reg_name(x));
+        kinds[i] = classify_line(&lines[i]);
+        kinds[j] = LineKind::Nop;
+        live.invalidate();
+        changed = true;
+    }
+    changed
+}
+
 /// The range a recognised producer leaves in its destination; `None` for an
 /// instruction this table does not model.
 fn rv_produced_range(mnem: &str, imm: Option<i64>, src: RvRange) -> Option<RvRange> {
@@ -2386,11 +2613,11 @@ fn eliminate_redundant_sign_extensions(
                 continue;
             }
             LineKind::Nop if lines[i].trim_start().starts_with(ARG_EXT_MARKER) => {
-                for (reg, zext) in arg_ext_facts(lines[i].trim_start()) {
-                    let r = if zext == 0 {
-                        RV_WORD
-                    } else {
-                        rv_unsigned_range(u32::from(zext))
+                for (reg, ext) in arg_ext_facts(lines[i].trim_start()) {
+                    let r = match ext {
+                        ArgExt::Word => RV_WORD,
+                        ArgExt::Zero(bits) => rv_unsigned_range(u32::from(bits)),
+                        ArgExt::Sign(bits) => rv_signed_range(u32::from(bits)),
                     };
                     set(&mut rng, reg, r);
                 }
@@ -2430,26 +2657,46 @@ fn eliminate_redundant_sign_extensions(
                 && j < n
                 && rv_range_width(get(&rng, src)) <= (64 - k) as u32
             {
+                // `srai e, dst, K` into another register leaves `dst` holding
+                // the shifted value, which must then be dead.
                 let pair = rv_operands_of(&lines[j], "srai");
+                let e = pair.first().map_or(REG_NONE, |o| parse_reg(o));
                 if pair.len() == 3
-                    && parse_reg(&pair[0]) == dst
+                    && e != REG_NONE
                     && parse_reg(&pair[1]) == dst
                     && parse_asm_i64(&pair[2]) == Some(k)
+                    && (e == dst || live.dead_after(lines, kinds, j, dst))
                 {
-                    if dst == src {
+                    if e == src {
                         kinds[i] = LineKind::Nop;
                     } else {
-                        lines[i] = format!("    mv {}, {}", reg_name(dst), reg_name(src));
-                        kinds[i] = LineKind::Move { dst, src };
+                        lines[i] = format!("    mv {}, {}", reg_name(e), reg_name(src));
+                        kinds[i] = LineKind::Move { dst: e, src };
                     }
                     kinds[j] = LineKind::Nop;
                     let r = get(&rng, src);
-                    set(&mut rng, dst, r);
+                    set(&mut rng, e, r);
                     live.invalidate();
                     changed = true;
                     i = j + 1;
                     continue;
                 }
+            }
+            // Otherwise the pair is real, unless it extends a load (which
+            // can extend by itself) or only a sign test reads it.  The scan
+            // resumes at the rewritten line, which records its own range
+            // like any other.
+            if let Some(resume) = rv_retype_extended_load(lines, kinds, n, i, &mut live) {
+                changed = true;
+                i = resume;
+                continue;
+            }
+            if let Some(resume) =
+                rv_sign_test_of_extension(lines, kinds, n, i, get(&rng, src), &mut live)
+            {
+                changed = true;
+                i = resume;
+                continue;
             }
         }
 
@@ -3440,8 +3687,15 @@ fn retarget_dying_accumulator_moves(
             | LineKind::LoadS0 { reg: dst, .. } => dst,
             LineKind::Alu => parse_alu_dest(line)?,
             // An FP result in a general register (`fcvt.l.d t0, ft0, rtz`,
-            // `flt.d t0, ft0, ft1`, `fmv.x.d t0, ft0`): its first operand.
-            LineKind::Other => rv_fp_gp_dest(line)?,
+            // `flt.d t0, ft0, ft1`, `fmv.x.d t0, ft0`) or a plain load
+            // (`lbu t0, 0(t0)`, which reads its base before it writes):
+            // its first operand.
+            LineKind::Other => rv_fp_gp_dest(line).or_else(|| {
+                let m = line.trim().split_whitespace().next()?;
+                matches!(m, "lb" | "lbu" | "lh" | "lhu" | "lw" | "lwu" | "ld")
+                    .then(|| rv_load_dest(line))
+                    .flatten()
+            })?,
             _ => return None,
         };
         (dst <= REG_T6).then_some(dst)
@@ -3934,11 +4188,12 @@ fn eliminate_dead_reg_moves(lines: &[String], kinds: &mut [LineKind], n: usize) 
 /// a configuration knob: every exit of `peephole_optimize` removes it.
 const RET_REGS_MARKER: &str = "# lccc-ret-regs";
 
-/// The prologue's `# lccc-arg-ext a0 a1/z16 ...` line (see
+/// The prologue's `# lccc-arg-ext a0 a1/z16 a2/s8 ...` line (see
 /// `emit_arg_extension_marker`): argument registers that arrive sign-extended
 /// from bit 31, `/z8` and `/z16` marking those also zero-extended from 8 or 16
-/// bits. It sits in the entry block before any instruction, so the facts are
-/// the entry state the forward extension trackers start from.
+/// bits, `/s8` and `/s16` those sign-extended from bit 7 or 15. It sits in the
+/// entry block before any instruction, so the facts are the entry state the
+/// forward extension trackers start from.
 const ARG_EXT_MARKER: &str = "# lccc-arg-ext";
 
 /// A line of the prologue's internal contracts (never emitted).
@@ -3946,9 +4201,21 @@ fn is_internal_marker(trimmed: &str) -> bool {
     trimmed.starts_with(RET_REGS_MARKER) || trimmed.starts_with(ARG_EXT_MARKER)
 }
 
-/// The argument-extension facts of an `ARG_EXT_MARKER` line: (register, bits
-/// it is zero-extended from or 0 when only sign-extended from bit 31).
-fn arg_ext_facts(trimmed: &str) -> impl Iterator<Item = (u8, u8)> + '_ {
+/// How an argument register arrives (one `ARG_EXT_MARKER` fact).  Every
+/// kind is also a sign-extended word: the psABI widens a narrow integer by
+/// its type's signedness to 32 bits, then sign-extends that word to 64.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArgExt {
+    /// Sign-extended from bit 31 only (`int`, `unsigned int`).
+    Word,
+    /// Zero-extended from bit `n - 1` (`unsigned char`, `unsigned short`).
+    Zero(u8),
+    /// Sign-extended from bit `n - 1` (`signed char`, `short`).
+    Sign(u8),
+}
+
+/// The argument-extension facts of an `ARG_EXT_MARKER` line.
+fn arg_ext_facts(trimmed: &str) -> impl Iterator<Item = (u8, ArgExt)> + '_ {
     trimmed
         .strip_prefix(ARG_EXT_MARKER)
         .unwrap_or("")
@@ -3956,13 +4223,15 @@ fn arg_ext_facts(trimmed: &str) -> impl Iterator<Item = (u8, u8)> + '_ {
         .filter_map(|token| {
             let (name, tag) = token.split_once('/').unwrap_or((token, ""));
             let reg = parse_reg(name);
-            let zext = match tag {
-                "" => 0,
-                "z8" => 8,
-                "z16" => 16,
+            let ext = match tag {
+                "" => ArgExt::Word,
+                "z8" => ArgExt::Zero(8),
+                "z16" => ArgExt::Zero(16),
+                "s8" => ArgExt::Sign(8),
+                "s16" => ArgExt::Sign(16),
                 _ => return None,
             };
-            (REG_A0..REG_A0 + 8).contains(&reg).then_some((reg, zext))
+            (REG_A0..REG_A0 + 8).contains(&reg).then_some((reg, ext))
         })
 }
 
@@ -4390,6 +4659,44 @@ impl RvCfg {
         self.solve_backward_from(RV_LIVE_ALL, transfer)
     }
 
+    /// The set after each block-closing branch or jump of a solved backward
+    /// problem (`before`, from `solve_backward_from` with `exit_set`): the
+    /// union of its successors' entry sets, and `exit_set` where the block
+    /// leaves the function.  The next line's set is only the fall-through
+    /// successor's -- and a jump's textual successor is no successor at all
+    /// -- so `before[k + 1]` would miss what the taken edge reads.  Sorted
+    /// by line.
+    fn transfer_outs(
+        &self,
+        kinds: &[LineKind],
+        before: &[u64],
+        exit_set: u64,
+    ) -> Vec<(usize, u64)> {
+        let nb = self.starts.len();
+        let mut outs = Vec::new();
+        for b in 0..nb {
+            let end = if b + 1 < nb {
+                self.starts[b + 1]
+            } else {
+                self.end
+            };
+            let mut t = end;
+            while t > self.starts[b] && matches!(kinds[t - 1], LineKind::Nop | LineKind::Directive)
+            {
+                t -= 1;
+            }
+            if t == self.starts[b] || !matches!(kinds[t - 1], LineKind::Branch | LineKind::Jump) {
+                continue;
+            }
+            let mut out = if self.exits[b] { exit_set } else { 0 };
+            for &succ in &self.succs[b] {
+                out |= before[self.starts[succ] - self.start];
+            }
+            outs.push((t - 1, out));
+        }
+        outs
+    }
+
     /// `solve_backward` with `exit_set` observed where the function's text
     /// leaves (a tail jump, falling off the end) -- every register of the
     /// problem's own domain.
@@ -4432,10 +4739,18 @@ impl RvCfg {
     }
 }
 
+/// The `RvCfg::transfer_outs` entry of line `k`, if it closes a block.
+fn transfer_out_at(outs: &[(usize, u64)], k: usize) -> Option<u64> {
+    let at = outs.binary_search_by_key(&k, |&(line, _)| line).ok()?;
+    Some(outs[at].1)
+}
+
 /// Backward liveness of the tracked registers over one function's lines.
 struct RvLiveness {
     /// `live_before[k - start]`: registers live immediately before line `k`.
     live_before: Vec<u64>,
+    /// `RvCfg::transfer_outs`: what is live after each closing branch/jump.
+    transfer_out: Vec<(usize, u64)>,
     start: usize,
     end: usize,
 }
@@ -4453,16 +4768,21 @@ impl RvLiveness {
             };
             (live & !d) | u
         });
+        let transfer_out = cfg.transfer_outs(kinds, &live_before, RV_LIVE_ALL);
         Some(RvLiveness {
             live_before,
+            transfer_out,
             start,
             end,
         })
     }
 
-    /// Registers live immediately after line `k`.
+    /// Registers live immediately after line `k`: after a branch, on either
+    /// edge.
     fn live_after(&self, k: usize) -> u64 {
-        if k + 1 >= self.end {
+        if let Some(set) = transfer_out_at(&self.transfer_out, k) {
+            set
+        } else if k + 1 >= self.end {
             RV_LIVE_ALL
         } else {
             self.live_before[k + 1 - self.start]
@@ -5502,6 +5822,8 @@ fn rv_fp_uses_defs(line: &str, kind: LineKind) -> (u32, u32) {
 struct RvFpLiveness {
     /// `live_before[k - start]`: FP registers live immediately before line k.
     live_before: Vec<u64>,
+    /// `RvCfg::transfer_outs`: what is live after each closing branch/jump.
+    transfer_out: Vec<(usize, u64)>,
     start: usize,
     end: usize,
 }
@@ -5514,8 +5836,10 @@ impl RvFpLiveness {
             let (uses, defs) = rv_fp_uses_defs(&lines[k], kinds[k]);
             (live & !u64::from(defs)) | u64::from(uses)
         });
+        let transfer_out = cfg.transfer_outs(kinds, &live_before, u64::from(u32::MAX));
         Some(RvFpLiveness {
             live_before,
+            transfer_out,
             start,
             end,
         })
@@ -5531,10 +5855,13 @@ impl RvFpLiveness {
             })
     }
 
-    /// FP registers live immediately after line `k`, which must not be a
-    /// control transfer (its textual successor is its only successor).
+    /// FP registers live immediately after line `k`: after a branch, on
+    /// either edge.
     fn live_after(&self, k: usize) -> u32 {
-        if k + 1 >= self.end {
+        if let Some(set) = transfer_out_at(&self.transfer_out, k) {
+            // The solver only ever produces sets of the 32 FP bits.
+            u32::try_from(set & u64::from(u32::MAX)).unwrap_or(u32::MAX)
+        } else if k + 1 >= self.end {
             u32::MAX
         } else {
             self.live_before(k + 1)
@@ -7049,8 +7376,9 @@ mod tests {
                 "li a2, 0",
                 "li a3, 0",
                 "bge a3, a1, .LBB3",
-                "ld t0, 0(a0)",
-                "add a2, a2, t0",
+                // The load writes the copy's destination directly.
+                "ld a5, 0(a0)",
+                "add a2, a2, a5",
                 "addi a3, a3, 1",
                 "addi a0, a0, 8",
                 "blt a3, a1, .LBB2",
@@ -8049,6 +8377,27 @@ mod tests {
         assert!(out.contains("lw a1, 8(s0)"), "{out}");
     }
 
+    /// A plain load staged through a scratch loads straight into the copy's
+    /// destination (`load_zext8`: `lbu t0, 0(t0); mv a0, t0`), even when the
+    /// scratch is the load's own base; a reserved load is no plain load.
+    #[test]
+    fn retarget_plain_load_producer_writes_the_home() {
+        let out =
+            run_retarget("f:\n    add t0, a0, a1\n    lbu t0, 0(t0)\n    mv a0, t0\n    ret\n");
+        assert!(out.contains("lbu a0, 0(t0)"), "{out}");
+        assert!(!out.contains("mv a0, t0"), "{out}");
+        for m in ["lb", "lh", "lhu", "lw", "lwu", "ld"] {
+            let out = run_retarget(&format!("f:\n    {m} t1, 8(a2)\n    mv a1, t1\n    ret\n"));
+            assert!(out.contains(&format!("{m} a1, 8(a2)")), "{out}");
+        }
+        let out = run_retarget("f:\n    lr.w t0, (a0)\n    mv a1, t0\n    ret\n");
+        assert!(out.contains("mv a1, t0"), "{out}");
+        // The scratch is read again: the load keeps it.
+        let out =
+            run_retarget("f:\n    lw t0, 0(a0)\n    mv a1, t0\n    add a0, t0, a1\n    ret\n");
+        assert!(out.contains("mv a1, t0"), "{out}");
+    }
+
     #[test]
     fn retarget_self_move_drops_both_lines() {
         let out = run_retarget("f:\n    sext.w a0, a0\n    mv t0, a0\n    mv a0, t0\n    ret\n");
@@ -8385,8 +8734,14 @@ mod jump_near_tests {
             sign_ext("f:\n    lb t0, 0(a0)\n    slli t0, t0, 56\n    srai t0, t0, 56\n    ret\n");
         assert!(changed);
         assert_eq!((kinds[2], kinds[3]), (LineKind::Nop, LineKind::Nop));
+        // An `lbu` is one bit too wide for the pair to be redundant, but the
+        // pair extends the load: it loads signed instead.
+        let (changed, lines, kinds) =
+            sign_ext("f:\n    lbu t0, 0(a0)\n    slli t0, t0, 56\n    srai t0, t0, 56\n    ret\n");
+        assert!(changed);
+        assert_eq!(lines[1].trim(), "lb t0, 0(a0)");
+        assert_eq!((kinds[2], kinds[3]), (LineKind::Nop, LineKind::Nop));
         for wider in [
-            "f:\n    lbu t0, 0(a0)\n    slli t0, t0, 56\n    srai t0, t0, 56\n    ret\n",
             "f:\n    lh t0, 0(a0)\n    slli t0, t0, 56\n    srai t0, t0, 56\n    ret\n",
             "f:\n    lh t0, 0(a0)\n.L1:\n    slli t1, t0, 48\n    srai t1, t1, 48\n    ret\n",
             "f:\n    lh t0, 0(a0)\n    call g\n    slli t1, t0, 48\n    srai t1, t1, 48\n    ret\n",
@@ -8509,9 +8864,9 @@ mod jump_near_tests {
 
     /// Decode the live lines of `lines`; every load reads the run's input.
     fn decode_rv(lines: &[String], kinds: &[LineKind]) -> Vec<RvOp> {
-        const MNEMONICS: [&str; 16] = [
-            "lbu", "lb", "lhu", "lh", "lw", "mv", "addiw", "addi", "andi", "xori", "slli", "srli",
-            "srai", "sltiu", "slti", "seqz",
+        const MNEMONICS: [&str; 20] = [
+            "lbu", "lb", "lhu", "lh", "lw", "lwu", "ld", "mv", "addiw", "addi", "andi", "xori",
+            "slli", "srli", "srai", "sltiu", "slti", "seqz", "neg", "negw",
         ];
         let mut ops = Vec::new();
         for (line, kind) in lines.iter().zip(kinds) {
@@ -8543,7 +8898,17 @@ mod jump_near_tests {
         for op in ops {
             let v = x[op.rs.min(NUM_REGS)];
             x[op.rd.min(NUM_REGS)] = match op.mnem {
-                "lbu" | "lb" | "lhu" | "lh" | "lw" => input,
+                // `input` is the memory's content, read at the load's width
+                // and extended by its signedness.
+                "lb" => i64::from(input as i8),
+                "lbu" => i64::from(input as u8),
+                "lh" => i64::from(input as i16),
+                "lhu" => i64::from(input as u16),
+                "lw" => i64::from(input as i32),
+                "lwu" => i64::from(input as u32),
+                "ld" => input,
+                "neg" => v.wrapping_neg(),
+                "negw" => i64::from((v as i32).wrapping_neg()),
                 "mv" => v,
                 "addiw" => i64::from(v.wrapping_add(op.imm) as i32),
                 "addi" => v.wrapping_add(op.imm),
@@ -8631,6 +8996,456 @@ mod jump_near_tests {
         // 3131 of the 6336 functions fold: the count pins the coverage, so
         // a pass that stops (or starts) firing on any shape shows up here.
         assert_eq!(folds, 3131, "folds fired");
+    }
+
+    /// What is live after a branch is what its successors read: the taken
+    /// edge's reads as well as the fall-through's after a conditional
+    /// branch, and the target's alone after `j` (whose next line is no
+    /// successor) -- for the general and the FP registers alike.
+    #[test]
+    fn liveness_after_a_branch_is_every_successor_live_in() {
+        let text = |asm: &str| {
+            let lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+            let kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
+            (lines, kinds)
+        };
+        let (lines, kinds) = text(
+            "f:\n    beqz a0, .L1\n    mv a0, t2\n    j .L2\n.L1:\n    mv a0, t1\n    ret\n.L2:\n    add a0, a0, t3\n    ret\n",
+        );
+        let live = RvLiveness::build(&lines, &kinds, 0, lines.len()).expect("resolvable");
+        let [t1, t2, t3, t4] = ["t1", "t2", "t3", "t4"].map(parse_reg);
+        // After `beqz`: t1 on the taken edge, t2 and t3 on the fall-through.
+        for reg in [t1, t2, t3] {
+            assert_ne!(live.live_after(1) & rv_bit(reg), 0, "{}", reg_name(reg));
+        }
+        assert_eq!(live.live_after(1) & rv_bit(t4), 0);
+        // After `j .L2`: t3 only -- not t1, which `.L1` (the next line) reads.
+        assert_ne!(live.live_after(3) & rv_bit(t3), 0);
+        assert_eq!(live.live_after(3) & (rv_bit(t1) | rv_bit(t2)), 0);
+        let mut lazy = RvLazyLiveness::new(&lines, &kinds, lines.len());
+        assert!(!lazy.dead_after(&lines, &kinds, 1, t1));
+        assert!(lazy.dead_after(&lines, &kinds, 3, t1));
+        // Without a resolvable CFG (`jr`), the block-local proof sees no
+        // taken edge, so it answers nothing for a branch.
+        let (lines, kinds) =
+            text("f:\n    bltz a0, .L1\n    li t1, 0\n    jr a1\n.L1:\n    mv a0, t1\n    ret\n");
+        let mut lazy = RvLazyLiveness::new(&lines, &kinds, lines.len());
+        assert!(!lazy.dead_after(&lines, &kinds, 1, t1));
+        let (lines, kinds) = text(
+            "f:\n    beqz a0, .L1\n    fmv.d fa0, ft2\n    j .L2\n.L1:\n    fmv.d fa0, ft1\n    ret\n.L2:\n    fadd.d fa0, fa0, ft3\n    ret\n",
+        );
+        let live = RvFpLiveness::build(&lines, &kinds, 0, lines.len()).expect("resolvable");
+        let [ft1, ft2, ft3, ft4] = ["ft1", "ft2", "ft3", "ft4"].map(|r| rv_fp_reg(r).expect("fp"));
+        for reg in [ft1, ft2, ft3] {
+            assert_ne!(live.live_after(1) & rv_fp_bit(reg), 0, "ft{reg}");
+        }
+        assert_eq!(live.live_after(1) & rv_fp_bit(ft4), 0);
+        assert_ne!(live.live_after(3) & rv_fp_bit(ft3), 0);
+        assert_eq!(live.live_after(3) & (rv_fp_bit(ft1) | rv_fp_bit(ft2)), 0);
+    }
+
+    /// `(signed char)x >= 0` staged as `slli; srai; slti 0`: the arithmetic
+    /// shift does not move the sign bit, so a test that reads only the sign
+    /// needs no `srai`, whether it is a value (`slti`/`slt`/`srli 63`) or a
+    /// branch.  Anything else reading the extended value keeps it.
+    #[test]
+    fn a_sign_test_needs_no_arithmetic_shift() {
+        for reader in [
+            "slti a0, t1, 0",
+            "slt a0, t1, zero",
+            "srli a0, t1, 63",
+            "slti t1, t1, 0\n    mv a0, t1",
+        ] {
+            let asm =
+                format!("f:\n    slli t1, a0, 56\n    srai t1, t1, 56\n    {reader}\n    ret\n");
+            let (changed, lines, kinds) = sign_ext(&asm);
+            assert!(changed, "{asm}");
+            assert_eq!(lines[1].trim(), "slli t1, a0, 56", "{asm}");
+            assert_eq!(kinds[2], LineKind::Nop, "{asm}");
+        }
+        for branch in [
+            "blt t1, zero, .L1",
+            "bge t1, zero, .L1",
+            "bltz t1, .L1",
+            "bgez t1, .L1",
+            "bgt zero, t1, .L1",
+            "ble zero, t1, .L1",
+        ] {
+            let asm = format!(
+                "f:\n    slli t1, a0, 48\n    srai t1, t1, 48\n    {branch}\n    li a0, 1\n    ret\n.L1:\n    li a0, 2\n    ret\n"
+            );
+            let (changed, _, kinds) = sign_ext(&asm);
+            assert!(changed, "{asm}");
+            assert_eq!(kinds[2], LineKind::Nop, "{asm}");
+        }
+        for kept in [
+            // The extended value is read again after the test.
+            "f:\n    slli t1, a0, 56\n    srai t1, t1, 56\n    slti a1, t1, 0\n    add a0, a1, t1\n    ret\n",
+            // ... or on the taken edge of the branch.
+            "f:\n    slli t1, a0, 56\n    srai t1, t1, 56\n    bltz t1, .L1\n    li a0, 0\n    ret\n.L1:\n    mv a0, t1\n    ret\n",
+            // Not sign tests: `t < 1`, bit 62, a zero test.
+            "f:\n    slli t1, a0, 56\n    srai t1, t1, 56\n    slti a0, t1, 1\n    ret\n",
+            "f:\n    slli t1, a0, 56\n    srai t1, t1, 56\n    srli a0, t1, 62\n    ret\n",
+            "f:\n    slli t1, a0, 56\n    srai t1, t1, 56\n    beqz t1, .L1\n.L1:\n    ret\n",
+            // Not an extension pair, or not adjacent.
+            "f:\n    slli t1, a0, 56\n    srai t1, t1, 48\n    slti a0, t1, 0\n    ret\n",
+            "f:\n    slli t1, a0, 56\n.L1:\n    srai t1, t1, 56\n    slti a0, t1, 0\n    ret\n",
+            "f:\n    slli t1, a0, 56\n    srai t1, t1, 56\n.L1:\n    slti a0, t1, 0\n    ret\n",
+        ] {
+            assert!(!sign_ext(kept).0, "{kept}");
+        }
+    }
+
+    /// The sign of a zero-extended byte's sign extension is the byte's top
+    /// bit: one `srli 7` of the byte.  A source wider than the extension
+    /// only loses the `srai`, and a narrow load right before the pair takes
+    /// the extension instead (`lb`, which the sign test then reads).
+    #[test]
+    fn a_sign_test_of_a_zero_extended_value_is_its_top_bit() {
+        let (changed, lines, kinds) = sign_ext(
+            "f:\n    andi t0, a2, 255\n    slli t1, t0, 56\n    srai t1, t1, 56\n    slti t1, t1, 0\n    addw a0, a1, t1\n    ret\n",
+        );
+        assert!(changed);
+        assert_eq!(lines[2].trim(), "srli t1, t0, 7");
+        assert_eq!((kinds[3], kinds[4]), (LineKind::Nop, LineKind::Nop));
+        let (changed, lines, _) = sign_ext(
+            "f:\n    srli t0, a2, 48\n    slli t0, t0, 48\n    srai t0, t0, 48\n    srli a0, t0, 63\n    ret\n",
+        );
+        assert!(changed);
+        assert_eq!(lines[2].trim(), "srli a0, t0, 15");
+        let (changed, lines, kinds) = sign_ext(
+            "f:\n    lhu t0, 0(a0)\n    slli t1, t0, 56\n    srai t1, t1, 56\n    slti a0, t1, 0\n    ret\n",
+        );
+        assert!(changed);
+        assert_eq!(lines[2].trim(), "slli t1, t0, 56");
+        assert_eq!(
+            (kinds[3], lines[4].trim()),
+            (LineKind::Nop, "slti a0, t1, 0")
+        );
+        let (changed, lines, kinds) = sign_ext(
+            "f:\n    lbu t0, 0(a0)\n    slli t1, t0, 56\n    srai t1, t1, 56\n    slti t1, t1, 0\n    addw a0, a1, t1\n    ret\n",
+        );
+        assert!(changed);
+        assert_eq!(lines[1].trim(), "lb t1, 0(a0)");
+        assert_eq!((kinds[2], kinds[3]), (LineKind::Nop, LineKind::Nop));
+        assert_eq!(lines[4].trim(), "slti t1, t1, 0");
+    }
+
+    /// `x >= 0` on a byte is `andi 128; seqz` (Clang 23.1.5); a short's bit
+    /// 15 does not fit `andi`, so only the `srai` goes.
+    #[test]
+    fn a_negated_byte_sign_test_is_an_andi_and_seqz() {
+        let (changed, lines, kinds) = sign_ext(
+            "f:\n    slli t0, a0, 56\n    srai t0, t0, 56\n    slti t0, t0, 0\n    xori a0, t0, 1\n    ret\n",
+        );
+        assert!(changed);
+        assert_eq!(lines[1].trim(), "andi t0, a0, 128");
+        assert_eq!((kinds[2], kinds[3]), (LineKind::Nop, LineKind::Nop));
+        assert_eq!(lines[4].trim(), "seqz a0, t0");
+        let (changed, lines, kinds) = sign_ext(
+            "f:\n    slli t0, a0, 48\n    srai t0, t0, 48\n    slti t0, t0, 0\n    xori a0, t0, 1\n    ret\n",
+        );
+        assert!(changed);
+        assert_eq!(lines[1].trim(), "slli t0, a0, 48");
+        assert_eq!(kinds[2], LineKind::Nop);
+        assert_eq!(
+            (lines[3].trim(), lines[4].trim()),
+            ("slti t0, t0, 0", "xori a0, t0, 1")
+        );
+        // The test's result read after the negation keeps the `slti`.
+        let kept = "f:\n    slli t1, a0, 56\n    srai t1, t1, 56\n    slti t0, t1, 0\n    xori a1, t0, 1\n    add a0, a1, t0\n    ret\n";
+        let (_, lines, _) = sign_ext(kept);
+        assert!(
+            !lines.iter().any(|l| l.trim().starts_with("andi")),
+            "{lines:?}"
+        );
+    }
+
+    /// `signed char`/`short` arguments arrive sign-extended from bit 7/15
+    /// (psABI), so re-extending one is a move; a byte view of a short still
+    /// needs its pair, minus the `srai` when only the sign is read.
+    #[test]
+    fn signed_narrow_arguments_arrive_extended() {
+        let (changed, lines, kinds) = sign_ext(
+            "f:\n    # lccc-arg-ext a0/s8\n    slli t1, a0, 56\n    srai t1, t1, 56\n    slti t0, t1, 0\n    xori a0, t0, 1\n    ret\n",
+        );
+        assert!(changed);
+        assert_eq!(lines[2].trim(), "mv t1, a0");
+        assert_eq!(kinds[3], LineKind::Nop);
+        let (changed, lines, kinds) = sign_ext(
+            "f:\n    # lccc-arg-ext a0/s16\n    slli t1, a0, 48\n    srai t1, t1, 48\n    ret\n",
+        );
+        assert!(changed);
+        assert_eq!((lines[2].trim(), kinds[3]), ("mv t1, a0", LineKind::Nop));
+        let (changed, lines, kinds) = sign_ext(
+            "f:\n    # lccc-arg-ext a0/s16\n    slli t1, a0, 56\n    srai t1, t1, 56\n    slti a0, t1, 0\n    ret\n",
+        );
+        assert!(changed);
+        assert_eq!(
+            (lines[2].trim(), kinds[3]),
+            ("slli t1, a0, 56", LineKind::Nop)
+        );
+        // A write ends the entry fact.
+        let asm = "f:\n    # lccc-arg-ext a0/s8\n    addi a0, a0, 1\n    slli t1, a0, 56\n    srai t1, t1, 56\n    ret\n";
+        assert!(!sign_ext(asm).0, "{asm}");
+    }
+
+    /// Every sign-test fold against the interpreter: each load, offsets on
+    /// both sides of the narrow bounds, each shift amount in place and into a
+    /// second register, and each reader (plain, in place, negated), over
+    /// every value the load produces.
+    #[test]
+    fn sign_tests_of_extensions_preserve_every_value() {
+        // A stride through [lo, hi] plus its edges and the values around
+        // zero the load can produce (an unsigned load never yields -1).
+        let sampled = |lo: i64, hi: i64, step: usize| -> Vec<i64> {
+            (lo..=hi)
+                .step_by(step)
+                .chain(
+                    [lo, lo + 1, -1, 0, 1, hi - 1, hi]
+                        .into_iter()
+                        .filter(|v| (lo..=hi).contains(v)),
+                )
+                .collect()
+        };
+        let loads: [(&str, Vec<i64>); 5] = [
+            ("lbu t0, 0(a0)", (0..=255).collect()),
+            ("lb t0, 0(a0)", (-128..=127).collect()),
+            ("lhu t0, 0(a0)", sampled(0, 65535, 37)),
+            ("lh t0, 0(a0)", sampled(-32768, 32767, 37)),
+            (
+                "lw t0, 0(a0)",
+                sampled(i64::from(i32::MIN), i64::from(i32::MAX), 9_999_991),
+            ),
+        ];
+        let readers = [
+            ("slti a1, {t}, 0", "a1"),
+            ("srli a1, {t}, 63", "a1"),
+            ("slti {t}, {t}, 0", "{t}"),
+            ("slti a2, {t}, 0\n    xori a1, a2, 1", "a1"),
+            ("slti {t}, {t}, 0\n    xori {t}, {t}, 1", "{t}"),
+        ];
+        // Folds by the shape the shift became: `andi` (and `seqz`), `srli`
+        // of the source, or still `slli` (the `srai` dropped).
+        let mut shapes = [0usize; 3];
+        for (load, inputs) in &loads {
+            for off in [0i64, -1, 1, -128, 127, 128, 255, 256] {
+                for k in [56i64, 48, 32, 60, 40] {
+                    for t in ["t0", "t1"] {
+                        for (reader, result) in readers {
+                            let reader = reader.replace("{t}", t);
+                            let result = result.replace("{t}", t);
+                            let asm = format!(
+                                "f:\n    {load}\n    addiw t0, t0, {off}\n    slli {t}, t0, {k}\n    srai {t}, {t}, {k}\n    {reader}\n    mv a0, {result}\n    ret\n"
+                            );
+                            let lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+                            let kinds: Vec<LineKind> =
+                                lines.iter().map(|l| classify_line(l)).collect();
+                            let before = decode_rv(&lines, &kinds);
+                            let (changed, new_lines, new_kinds) = sign_ext(&asm);
+                            if !changed {
+                                continue;
+                            }
+                            shapes[match new_lines[3].trim().split(' ').next() {
+                                Some("andi") => 0,
+                                Some("srli") => 1,
+                                _ => 2,
+                            }] += 1;
+                            let after = decode_rv(&new_lines, &new_kinds);
+                            assert!(after.len() < before.len(), "{asm}");
+                            for &v in inputs {
+                                assert_eq!(
+                                    run_rv(&before, v),
+                                    run_rv(&after, v),
+                                    "input {v}:\n{asm}=>\n{}",
+                                    new_lines.join("\n")
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Every one of the 2000 functions folds.  A pair whose source
+        // already fits in 64 - K bits is redundant first (every K = 32 pair,
+        // as `addiw` leaves a word; the narrow loads at K = 40 and K = 48;
+        // `lb + 0` and `lbu - 128` at K = 56).  Of the rest, the 2 negated
+        // readers of bit 7 or bit 3 (K = 56, 60) become `andi; seqz`: 5
+        // loads x 8 offsets x 2 shifts x 2 registers x 2 readers = 320, less
+        // the 8 redundant ones = 312.  A source in [0, 2^(64-K)) becomes one
+        // `srli` -- `lbu + 0` and `lb + 128` at K = 56 under the 3 plain
+        // readers (2 x 2 x 3 = 12), `lhu + 0` at K = 48 under all 5 (2 x 5 =
+        // 10): 22.  The other 1666 drop the `srai` or the redundant pair.
+        assert_eq!(shapes, [312, 22, 1666], "folds by shape");
+    }
+
+    /// `-(x < 0)` is the sign broadcast, `srai d, x, 63`: each negation
+    /// spelling, in place and into another register, against the
+    /// interpreter over values at every sign and width boundary.
+    #[test]
+    fn a_negated_sign_test_is_an_arithmetic_shift() {
+        let fold = |asm: &str| {
+            let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+            let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+            let n = lines.len();
+            let changed = fold_sign_masks(&mut lines, &mut kinds, n);
+            (changed, lines, kinds)
+        };
+        let values = [
+            0i64,
+            1,
+            -1,
+            2,
+            i64::MAX,
+            i64::MIN,
+            0x7fff_ffff,
+            -0x8000_0000,
+            0x8000_0000,
+            0xffff_ffff,
+            -0x1_0000_0000,
+            0x1234_5678_9abc_def0,
+        ];
+        let mut folds = 0;
+        for neg in ["neg {d}, {t}", "negw {d}, {t}"] {
+            for (t, d) in [("t1", "t1"), ("t1", "a3"), ("t0", "t0"), ("t0", "a0")] {
+                let neg = neg.replace("{d}", d).replace("{t}", t);
+                let asm = format!(
+                    "f:\n    ld t0, 0(a0)\n    slti {t}, t0, 0\n    {neg}\n    mv a0, {d}\n    ret\n"
+                );
+                let lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+                let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+                let before = decode_rv(&lines, &kinds);
+                let (changed, new_lines, new_kinds) = fold(&asm);
+                assert!(changed, "{asm}");
+                assert_eq!(new_lines[2].trim(), format!("srai {d}, t0, 63"));
+                folds += 1;
+                let after = decode_rv(&new_lines, &new_kinds);
+                for &v in &values {
+                    assert_eq!(run_rv(&before, v), run_rv(&after, v), "input {v}:\n{asm}");
+                }
+            }
+        }
+        assert_eq!(folds, 8);
+        for sub in ["sub a0, zero, t1", "subw a0, x0, t1"] {
+            let (changed, lines, kinds) =
+                fold(&format!("f:\n    slti t1, a1, 0\n    {sub}\n    ret\n"));
+            assert!(changed, "{sub}");
+            assert_eq!(
+                (lines[1].trim(), kinds[2]),
+                ("srai a0, a1, 63", LineKind::Nop)
+            );
+        }
+        for kept in [
+            // The test's result is read again.
+            "f:\n    slti t1, a1, 0\n    neg a0, t1\n    add a0, a0, t1\n    ret\n",
+            // Not a sign test, or not its negation.
+            "f:\n    slti t1, a1, 1\n    neg a0, t1\n    ret\n",
+            "f:\n    slti t1, a1, 0\n    neg a0, t2\n    ret\n",
+            "f:\n    slti t1, a1, 0\n    sub a0, a2, t1\n    ret\n",
+            // Not the next line.
+            "f:\n    slti t1, a1, 0\n    addi a2, a2, 1\n    neg a0, t1\n    ret\n",
+            "f:\n    slti t1, a1, 0\n.L1:\n    neg a0, t1\n    ret\n",
+        ] {
+            assert!(!fold(kept).0, "{kept}");
+        }
+    }
+
+    /// A narrow load extended the other way round is the load of that
+    /// signedness (`lbu; slli 56; srai 56` is `lb`, `lw; slli 32; srli 32`
+    /// is `lwu`): every load, both extensions at the load's width and one bit
+    /// either side (which must leave the load alone -- one bit wider, a
+    /// sign-extension is redundant instead), with the shifts in place, into
+    /// a second register, and the right shift into a third (`slli t0, t0,
+    /// 56; srai a5, t0, 56`, as the emitter stages a byte sum), over every
+    /// value the memory can hold.
+    #[test]
+    fn extended_loads_take_the_extension_for_every_value() {
+        let memory = |width: u32| -> Vec<i64> {
+            match width {
+                8 => (0..=255).collect(),
+                16 => (0..=65535)
+                    .step_by(13)
+                    .chain([32767, 32768, 65535])
+                    .collect(),
+                _ => (0..=u32::MAX)
+                    .step_by(9_999_991)
+                    .map(i64::from)
+                    .chain([0x7fff_ffff, 0x8000_0000, 0xffff_ffff])
+                    .collect(),
+            }
+        };
+        let mut folds = 0;
+        for (load, width) in [
+            ("lbu", 8u32),
+            ("lb", 8),
+            ("lhu", 16),
+            ("lh", 16),
+            ("lw", 32),
+            ("lwu", 32),
+        ] {
+            let exact = 64 - width;
+            for (back, k) in [
+                ("srai", exact),
+                ("srli", exact),
+                ("srai", exact - 1),
+                ("srli", exact + 1),
+            ] {
+                for (t, d) in [("t0", "t0"), ("t1", "t1"), ("t0", "a3"), ("t1", "a3")] {
+                    let asm = format!(
+                        "f:\n    {load} t0, 4(a0)\n    slli {t}, t0, {k}\n    {back} {d}, {t}, {k}\n    mv a0, {d}\n    ret\n"
+                    );
+                    let lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+                    let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+                    let before = decode_rv(&lines, &kinds);
+                    let (changed, new_lines, new_kinds) = sign_ext(&asm);
+                    if k != exact {
+                        assert_eq!(new_lines[1], lines[1], "{asm}");
+                    }
+                    if !changed {
+                        continue;
+                    }
+                    folds += 1;
+                    let after = decode_rv(&new_lines, &new_kinds);
+                    assert!(after.len() < before.len(), "{asm}");
+                    for v in memory(width) {
+                        assert_eq!(
+                            run_rv(&before, v),
+                            run_rv(&after, v),
+                            "memory {v:#x}:\n{asm}=>\n{}",
+                            new_lines.join("\n")
+                        );
+                    }
+                }
+            }
+        }
+        // All 48 at the load's width (a retype, or the redundant `lb`/`lh`/
+        // `lw` sign-extension) and the 24 one bit wider sign-extensions.
+        assert_eq!(folds, 72, "folds fired");
+        // The retyped load, and what keeps the staging.
+        let (changed, lines, kinds) = sign_ext(
+            "f:\n    lbu t0, %lo(sym)(a5)\n    slli t1, t0, 56\n    srai t1, t1, 56\n    bltz t1, .L1\n    ret\n.L1:\n    li a0, 1\n    ret\n",
+        );
+        assert!(changed);
+        assert_eq!(lines[1].trim(), "lb t1, %lo(sym)(a5)");
+        assert_eq!((kinds[2], kinds[3]), (LineKind::Nop, LineKind::Nop));
+        for kept in [
+            // The zero-extended byte is read again.
+            "f:\n    lbu t0, 0(a0)\n    slli t1, t0, 56\n    srai t1, t1, 56\n    add a0, t1, t0\n    ret\n",
+            // Not the previous line, or across a label.
+            "f:\n    lbu t0, 0(a0)\n    addi t2, t2, 1\n    slli t1, t0, 56\n    srai t1, t1, 56\n    mv a0, t1\n    ret\n",
+            "f:\n    lbu t0, 0(a0)\n.L1:\n    slli t1, t0, 56\n    srai t1, t1, 56\n    mv a0, t1\n    ret\n",
+            // A doubleword load, or another register's extension.
+            "f:\n    ld t0, 0(a0)\n    slli t1, t0, 56\n    srai t1, t1, 56\n    mv a0, t1\n    ret\n",
+            "f:\n    lbu t0, 0(a0)\n    slli t1, t2, 56\n    srai t1, t1, 56\n    mv a0, t1\n    ret\n",
+            // The left shift's result is read after the right shift.
+            "f:\n    lbu t0, 0(a0)\n    slli t1, t0, 56\n    srai a3, t1, 56\n    add a0, a3, t1\n    ret\n",
+        ] {
+            let (changed, lines, _) = sign_ext(kept);
+            assert!(
+                !changed || !lines.iter().any(|l| l.trim().starts_with("lb ")),
+                "{kept}"
+            );
+        }
     }
 
     #[test]
@@ -9717,10 +10532,19 @@ mod arg_extension_marker_tests {
     #[test]
     fn the_marker_is_internal_and_strict() {
         assert_eq!(
-            arg_ext_facts("# lccc-arg-ext a0 a1/z16 a2/z8").collect::<Vec<_>>(),
-            [(REG_A0, 0), (REG_A0 + 1, 16), (REG_A0 + 2, 8)]
+            arg_ext_facts("# lccc-arg-ext a0 a1/z16 a2/z8 a3/s8 a4/s16").collect::<Vec<_>>(),
+            [
+                (REG_A0, ArgExt::Word),
+                (REG_A0 + 1, ArgExt::Zero(16)),
+                (REG_A0 + 2, ArgExt::Zero(8)),
+                (REG_A0 + 3, ArgExt::Sign(8)),
+                (REG_A0 + 4, ArgExt::Sign(16)),
+            ]
         );
-        assert_eq!(arg_ext_facts("# lccc-arg-ext a0/z32 t0 s1 a9").count(), 0);
+        assert_eq!(
+            arg_ext_facts("# lccc-arg-ext a0/z32 a1/s32 t0 s1 a9").count(),
+            0
+        );
         let asm = "f:\n    # lccc-arg-ext a0/z16\n    ret\n";
         assert!(!peephole_optimize(asm.into()).contains("lccc-arg-ext"));
         assert!(!strip_internal_markers(asm.into()).contains("lccc-arg-ext"));

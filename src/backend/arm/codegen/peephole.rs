@@ -725,6 +725,8 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= eliminate_self_moves(&lines, &mut kinds, n);
         changed |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
         changed |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
+        changed |= fold_narrow_sign_tests(&mut lines, &mut kinds, n);
+        changed |= fold_extensions_into_loads(&mut lines, &mut kinds, n);
         changed |= eliminate_redundant_zext_and(&mut lines, &mut kinds, n);
         changed |= fuse_and_cmp_zero(&mut lines, &mut kinds, n);
         changed |= fold_sign_mask_abs_to_cneg(&mut lines, &mut kinds, n);
@@ -794,6 +796,8 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_self_moves(&lines, &mut kinds, n);
             changed2 |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
             changed2 |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
+            changed2 |= fold_narrow_sign_tests(&mut lines, &mut kinds, n);
+            changed2 |= fold_extensions_into_loads(&mut lines, &mut kinds, n);
             changed2 |= eliminate_redundant_zext_and(&mut lines, &mut kinds, n);
             changed2 |= fuse_and_cmp_zero(&mut lines, &mut kinds, n);
             changed2 |= fold_sign_mask_abs_to_cneg(&mut lines, &mut kinds, n);
@@ -828,6 +832,16 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= per_function(&mut lines, &mut kinds, n, invert_loop_latches);
             rounds2 += 1;
         }
+    }
+
+    // Pass 3e once the cleanup rounds settle: every narrow sign test Pass 3c
+    // can fold is folded by then (a dead copy of the extension, retired only
+    // at a round's end, no longer hides one from it), `cset; add` is `cinc`,
+    // and a W-copied parameter is read where it arrives -- a shift reading
+    // its X view (`sbfx x0, x6, #31, #1` after `mov w6, w0`) would keep the
+    // copy alive.
+    if per_function(&mut lines, &mut kinds, n, fold_sign_bit_tests) {
+        per_function(&mut lines, &mut kinds, n, eliminate_dead_moves);
     }
 
     drop_orphaned_save_rows(&lines, &mut kinds, n);
@@ -1328,6 +1342,12 @@ fn gp_operands(line: &str, kind: LineKind, ret_value: bool) -> (u64, u64) {
 /// then keep the conservative answer rather than assume the best one.
 struct Liveness {
     live_before: Vec<u64>,
+    /// What is live after each block-closing branch: the union of its
+    /// successors' live-ins.  The next line's set is only the fall-through
+    /// successor's -- and an unconditional branch's textual successor is no
+    /// successor at all -- so it would miss what the taken edge reads.
+    /// Sorted by line.
+    transfer_out: Vec<(usize, u64)>,
     end: usize,
 }
 
@@ -1457,16 +1477,42 @@ impl Liveness {
                 break;
             }
         }
-        Some(Liveness { live_before, end })
+        let mut transfer_out = Vec::new();
+        for b in 0..nb {
+            let mut t = bend(b);
+            while t > starts[b] && kinds[t - 1] == LineKind::Nop {
+                t -= 1;
+            }
+            if t > starts[b]
+                && matches!(
+                    kinds[t - 1],
+                    LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch
+                )
+            {
+                let out = succs[b].iter().fold(0u64, |set, &sc| set | live_in[sc]);
+                transfer_out.push((t - 1, out));
+            }
+        }
+        Some(Liveness {
+            live_before,
+            transfer_out,
+            end,
+        })
     }
 
-    /// Is `reg` live immediately after line `i`? `None` at the end of the
-    /// function, where the answer depends on the caller.
+    /// Is `reg` live immediately after line `i` -- after a branch, on either
+    /// edge? `None` at the end of the function, where the answer depends on
+    /// the caller.
     fn live_after(&self, i: usize, reg: u8) -> Option<bool> {
         if reg > 30 || i + 1 >= self.end {
             return None;
         }
-        Some(self.live_before[i + 1] & (1u64 << reg) != 0)
+        let out = &self.transfer_out;
+        let set = match out.binary_search_by_key(&i, |&(line, _)| line) {
+            Ok(at) => out[at].1,
+            Err(_) => self.live_before[i + 1],
+        };
+        Some(set & (1u64 << reg) != 0)
     }
 }
 
@@ -4163,6 +4209,556 @@ fn kill_writeback_base(line: &str, zext: &mut [u8; 33]) {
     }
 }
 
+// ── Pass 3c: Sign test of a narrow sign extension ───────────────────────────
+//
+// `sxtb t, s; cmp t, #0` read only by a sign condition -- `lt`/`ge`, or
+// `mi`/`pl` -- tests bit 7 of `s` (bit 15 for `sxth`): after `cmp t, #0`,
+// N = t<31> = s<7> and V = 0 (ARM ARM, SUBS with a zero operand), so `lt` is
+// s<7> = 1 and `ge` is s<7> = 0.  `tst s, #0x80` leaves s<7> = 0 in Z, so the
+// condition becomes `ne`/`eq` and the extension goes: `(signed char)c < 0`,
+// an ASCII fast path's test, in two instructions instead of three.  A `cset`
+// of `lt` is the bit itself, `ubfx d, s, #7, #1`, and a `csetm` of it is
+// `sbfx`, with no flags at all (Clang 23.1.5 spells `(signed char)x < 0` as
+// that `ubfx`).
+//
+// Legality: the reader is the first line after the compare that touches
+// NZCV, past at most eight flag-neutral lines of its block
+// (`first_flag_access`: a select's constant operands are staged there), and
+// the compare follows the extension in its block past lines that neither
+// read `t` nor may write `t` or `s` (`narrow_sign_compare`); `t` is dead
+// after the compare and NZCV after the reader, on every path (the global
+// liveness: `tst` clears C where `cmp #0` set it, and Z/N differ too, so no
+// later flag reader may exist); a function with an indirect branch keeps
+// its code.  `s` is read where `t` was written, so `t == s` is fine.
+
+/// NZCV as one bit of a `Liveness::build_with` model: a reader uses it, a
+/// writer and a call define it (AAPCS64 does not preserve the flags across a
+/// call), and a line the model does not know reads it.
+fn flag_operands(line: &str, kind: LineKind) -> (u64, u64) {
+    match kind {
+        LineKind::Call => return (0, 1),
+        LineKind::Ret => return (0, 0),
+        _ => {}
+    }
+    let t = line.trim();
+    let mnemonic = t.split_whitespace().next().unwrap_or("");
+    let uses = u64::from(t.starts_with('#') || reads_flags_a64(mnemonic));
+    let defs = u64::from(writes_flags_any_a64(mnemonic));
+    (uses, defs)
+}
+
+/// A flag reader whose condition is a sign condition: whether it asks for
+/// a negative value (`lt`/`mi`) or not (`ge`/`pl`), and the line's text
+/// before and after the condition (`b.lt L`, `cset d, ge`, `csel d, a, b,
+/// mi`, `cinc d, a, pl`...).
+fn sign_condition_reader(line: &str) -> Option<(bool, String, String)> {
+    let t = line.trim();
+    let negative = |cc: &str| match cc {
+        "lt" | "mi" => Some(true),
+        "ge" | "pl" => Some(false),
+        _ => None,
+    };
+    if let Some(rest) = t.strip_prefix("b.") {
+        let (cc, target) = rest.split_once(' ')?;
+        return Some((
+            negative(cc)?,
+            "    b.".into(),
+            format!(" {}", target.trim()),
+        ));
+    }
+    let (mnemonic, ops) = t.split_once(' ')?;
+    if !matches!(
+        mnemonic,
+        "cset" | "csetm" | "csel" | "csinc" | "csinv" | "csneg" | "cinc" | "cinv" | "cneg"
+    ) {
+        return None;
+    }
+    let (head, cc) = ops.rsplit_once(',')?;
+    Some((
+        negative(cc.trim())?,
+        format!("    {mnemonic} {}, ", head.trim()),
+        String::new(),
+    ))
+}
+
+/// The `cmp t, #0` of a narrow sign extension at line `at`: the next line
+/// that names `t`, past at most eight lines of the same block that neither
+/// read `t` nor may write `t` or `s` (a flag reader there reads older
+/// flags, and a flag writer's result the compare replaces either way --
+/// `br_lt(signed char x, ...)` stages its other arguments in between).  A
+/// W-form extension zeroes bits 63:32, so only a W-form compare tests its
+/// sign; an X-form one leaves bit 7 (bit 15) in bits 31 and 63 alike.
+fn narrow_sign_compare(
+    lines: &[String],
+    kinds: &[LineKind],
+    at: usize,
+    n: usize,
+    (t_reg, t_is_w): (u8, bool),
+    s_reg: u8,
+) -> Option<usize> {
+    let (tbit, sbit) = (1u64 << t_reg, 1u64 << s_reg);
+    let mut seen = 0;
+    for b in at + 1..n {
+        match kinds[b] {
+            LineKind::Nop => continue,
+            LineKind::Directive if inert_directive(&lines[b]) => continue,
+            LineKind::Label
+            | LineKind::Branch
+            | LineKind::CondBranch
+            | LineKind::CmpBranch
+            | LineKind::Call
+            | LineKind::Ret
+            | LineKind::Directive => return None,
+            _ => {}
+        }
+        let text = lines[b].trim();
+        if let Some((creg, cimm)) = text.strip_prefix("cmp ").and_then(|o| o.split_once(','))
+            && kinds[b] == LineKind::Compare
+            && parse_reg(creg) == t_reg
+        {
+            let full_view = creg.trim().starts_with('x');
+            return (matches!(cimm.trim(), "#0" | "wzr" | "xzr") && !(t_is_w && full_view))
+                .then_some(b);
+        }
+        let (uses, _) = gp_operands(&lines[b], kinds[b], true);
+        seen += 1;
+        if seen > 8
+            || text.starts_with('#')
+            || uses & tbit != 0
+            || may_write_gp(&lines[b]) & (tbit | sbit) != 0
+        {
+            return None;
+        }
+    }
+    None
+}
+
+/// The first line after line `b` of its block that reads or writes NZCV,
+/// past at most eight lines that do neither; `None` at a label, a transfer,
+/// a call or a directive that may hide an instruction.
+fn first_flag_access(lines: &[String], kinds: &[LineKind], b: usize, n: usize) -> Option<usize> {
+    let mut seen = 0;
+    for c in b + 1..n {
+        match kinds[c] {
+            LineKind::Nop => continue,
+            LineKind::Directive if inert_directive(&lines[c]) => continue,
+            LineKind::CondBranch => return Some(c),
+            LineKind::Label
+            | LineKind::Branch
+            | LineKind::CmpBranch
+            | LineKind::Call
+            | LineKind::Ret
+            | LineKind::Directive => return None,
+            _ => {}
+        }
+        if flag_operands(&lines[c], kinds[c]) != (0, 0) {
+            return Some(c);
+        }
+        seen += 1;
+        if seen > 8 {
+            return None;
+        }
+    }
+    None
+}
+
+fn fold_narrow_sign_tests(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    per_function(lines, kinds, n, fold_narrow_sign_tests_in)
+}
+
+/// `fold_narrow_sign_tests` over one function's lines.
+fn fold_narrow_sign_tests_in(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    // (GP liveness with every ABI read, NZCV liveness), built on the first
+    // candidate and dropped by every rewrite.
+    let mut live: Option<Option<(Vec<u64>, Liveness)>> = None;
+    let mut i = 0;
+    while i < n {
+        let at = i;
+        i += 1;
+        let t = lines[at].trim();
+        let (bit, ops) = if let Some(ops) = t.strip_prefix("sxtb ") {
+            (7, ops)
+        } else if let Some(ops) = t.strip_prefix("sxth ") {
+            (15, ops)
+        } else {
+            continue;
+        };
+        let Some((dst, src)) = ops.split_once(',') else {
+            continue;
+        };
+        let (dst, src) = (dst.trim(), src.trim());
+        let (t_reg, s_reg) = (parse_reg(dst), parse_reg(src));
+        if t_reg > 30 || s_reg > 30 || !src.starts_with('w') {
+            continue;
+        }
+        let t_view = (t_reg, dst.starts_with('w'));
+        let Some(b) = narrow_sign_compare(lines, kinds, at, n, t_view, s_reg) else {
+            continue;
+        };
+        let Some(c) = first_flag_access(lines, kinds, b, n) else {
+            continue;
+        };
+        let Some((negative, before_cc, after_cc)) = sign_condition_reader(&lines[c]) else {
+            continue;
+        };
+        let built = live.get_or_insert_with(|| {
+            let gp = abi_liveness(lines, kinds, n)?;
+            let flags =
+                Liveness::build_with(lines, kinds, 0, n, |k| flag_operands(&lines[k], kinds[k]))?;
+            Some((gp, flags))
+        });
+        let Some((gp, flags)) = built.as_ref() else {
+            return changed;
+        };
+        // After a conditional branch the flags must be dead on both edges.
+        let t_dead = gp.get(b + 1).is_some_and(|set| set & (1u64 << t_reg) == 0);
+        if !t_dead || flags.live_after(c, 0) != Some(false) {
+            continue;
+        }
+        let reader = lines[c].trim().to_string();
+        let cset = reader
+            .split_once(' ')
+            .map(|(m, o)| (m, o.split(',').next().unwrap_or("").trim()));
+        let (new_b, new_c) = match cset {
+            Some((m @ ("cset" | "csetm"), d)) if negative => {
+                let extract = if m == "cset" { "ubfx" } else { "sbfx" };
+                let view = if d.starts_with('x') { 'x' } else { 'w' };
+                (
+                    None,
+                    format!("    {extract} {d}, {view}{s_reg}, #{bit}, #1"),
+                )
+            }
+            _ => (
+                Some(format!("    tst w{s_reg}, #{:#x}", 1u32 << bit)),
+                format!(
+                    "{before_cc}{}{after_cc}",
+                    if negative { "ne" } else { "eq" }
+                ),
+            ),
+        };
+        kinds[at] = LineKind::Nop;
+        match new_b {
+            Some(tst) => {
+                lines[b] = tst;
+                kinds[b] = classify_line(&lines[b]);
+            }
+            None => kinds[b] = LineKind::Nop,
+        }
+        lines[c] = new_c;
+        kinds[c] = classify_line(&lines[c]);
+        live = None;
+        changed = true;
+        i = c + 1;
+    }
+    changed
+}
+
+// ── Pass 3d: Extension of a narrow load folded into the load ────────────────
+//
+// `ldrb wT, [M]; sxtb xD, wT` zero-extends a byte only to sign-extend it
+// next: `ldrsb xD, [M]` reads the same byte with the extension built in
+// (GCC and Clang load `(signed char)p[i]` that way).  Likewise `ldrh` then
+// `sxth` is `ldrsh`, `ldr w` then `sxtw x` is `ldrsw x`, and the other way
+// round `ldrsb`/`ldrsh` then `uxtb`/`uxth` (or `and #0xff`/`#0xffff`) is
+// `ldrb`/`ldrh`, and `ldrsw x` then `mov w` is `ldr w`.  The unscaled
+// `ldur*` forms map the same way; each pair accesses the same size, so every
+// addressing form, offset scale and relocation class of the original is one
+// of the new load.
+//
+// Legality: the extension is the load's next live line and reads T's W
+// view, and T dies there unless it is D (`abi_liveness`, built once: a fold
+// only removes a read, so the sets stay sound for later folds).  A literal
+// load has no byte form, and a writeback form keeps its code when D is its
+// base (`ldrsb x1, [x1], #1` is UNPREDICTABLE).
+
+/// The load an extension `ext` of a `load_m` load of `t` (a register of
+/// that load's width) folds into: the new mnemonic and destination.
+fn load_with_extension(load_m: &str, t: &str, ext: &str) -> Option<(&'static str, String)> {
+    let (em, ops) = ext.trim().split_once(' ')?;
+    let ops: Vec<&str> = ops.split(',').map(str::trim).collect();
+    let t_reg = parse_reg(t);
+    let w_view = |op: &str| op.starts_with('w') && parse_reg(op) == t_reg;
+    let any_view = |op: &str| parse_reg(op) == t_reg;
+    let w_dest = |d: &str| d.starts_with('w').then(|| d.to_string());
+    let new_m = match (load_m, em, ops.as_slice()) {
+        ("ldrb", "sxtb", [d, s]) if w_view(s) => return Some(("ldrsb", d.to_string())),
+        ("ldurb", "sxtb", [d, s]) if w_view(s) => return Some(("ldursb", d.to_string())),
+        ("ldrh", "sxth", [d, s]) if w_view(s) => return Some(("ldrsh", d.to_string())),
+        ("ldurh", "sxth", [d, s]) if w_view(s) => return Some(("ldursh", d.to_string())),
+        ("ldr", "sxtw", [d, s]) if t.starts_with('w') && w_view(s) => {
+            return Some(("ldrsw", d.to_string()));
+        }
+        ("ldur", "sxtw", [d, s]) if t.starts_with('w') && w_view(s) => {
+            return Some(("ldursw", d.to_string()));
+        }
+        ("ldrsb" | "ldursb", "uxtb", [d, s]) if w_view(s) => {
+            (if load_m == "ldrsb" { "ldrb" } else { "ldurb" }, w_dest(d)?)
+        }
+        ("ldrsb" | "ldursb", "and", [d, s, m]) if any_view(s) && is_imm(m, 0xff) => (
+            if load_m == "ldrsb" { "ldrb" } else { "ldurb" },
+            d.to_string(),
+        ),
+        ("ldrsh" | "ldursh", "uxth", [d, s]) if w_view(s) => {
+            (if load_m == "ldrsh" { "ldrh" } else { "ldurh" }, w_dest(d)?)
+        }
+        ("ldrsh" | "ldursh", "and", [d, s, m]) if any_view(s) && is_imm(m, 0xffff) => (
+            if load_m == "ldrsh" { "ldrh" } else { "ldurh" },
+            d.to_string(),
+        ),
+        ("ldrsw" | "ldursw", "mov", [d, s]) if w_view(s) => {
+            (if load_m == "ldrsw" { "ldr" } else { "ldur" }, w_dest(d)?)
+        }
+        _ => return None,
+    };
+    // A zero-extending load writes the W view and clears bits 63:32.
+    let (m, d) = new_m;
+    Some((m, format!("w{}", parse_reg(&d))))
+}
+
+/// Whether operand `op` is the immediate `value` (`#255`, `#0xff`).
+fn is_imm(op: &str, value: u64) -> bool {
+    op.strip_prefix('#').is_some_and(|v| {
+        v.strip_prefix("0x")
+            .map_or_else(|| v.parse().ok(), |hex| u64::from_str_radix(hex, 16).ok())
+            == Some(value)
+    })
+}
+
+fn fold_extensions_into_loads(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    const LOADS: &[&str] = &[
+        "ldrb", "ldurb", "ldrh", "ldurh", "ldr", "ldur", "ldrsb", "ldursb", "ldrsh", "ldursh",
+        "ldrsw", "ldursw",
+    ];
+    let mut live: Option<Option<Vec<u64>>> = None;
+    let mut changed = false;
+    for i in 0..n {
+        let Some((m, ops)) = lines[i].trim().split_once(' ') else {
+            continue;
+        };
+        if !LOADS.contains(&m) || kinds[i] == LineKind::Nop {
+            continue;
+        }
+        let Some((t, mem)) = ops.split_once(',') else {
+            continue;
+        };
+        let (t, mem) = (t.trim(), mem.trim());
+        let t_reg = parse_reg(t);
+        if t_reg > 30 || !mem.starts_with('[') {
+            continue;
+        }
+        let Some(e) = next_live(kinds, i + 1, n) else {
+            continue;
+        };
+        let Some((new_m, d)) = load_with_extension(m, t, &lines[e]) else {
+            continue;
+        };
+        let d_reg = parse_reg(&d);
+        if d_reg > 30 {
+            continue;
+        }
+        let writeback = mem.ends_with('!') || !mem.ends_with(']');
+        let base = parse_reg(mem[1..].split([',', ']']).next().unwrap_or(""));
+        if writeback && base == d_reg {
+            continue;
+        }
+        if d_reg != t_reg {
+            let Some(set) = live
+                .get_or_insert_with(|| abi_liveness(lines, kinds, n))
+                .as_ref()
+            else {
+                return changed;
+            };
+            if set.get(e + 1).is_none_or(|set| set & (1u64 << t_reg) != 0) {
+                continue;
+            }
+        }
+        lines[i] = format!("    {new_m} {d}, {mem}");
+        kinds[i] = classify_line(&lines[i]);
+        kinds[e] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+// ── Pass 3e: Sign bit of a full register ────────────────────────────────────
+//
+// `cmp x, #0` read only by `cset d, lt` is the sign bit of `x` moved to bit
+// 0: `lsr d, x, #31` (#63 for an X compare) -- after a compare with zero
+// N = x<31> (x<63>) and V = 0, so `lt`, like `mi`, is that bit.  `csetm d,
+// lt` is the bit broadcast, `asr d, x, #31` (`sbfx d, x, #31, #1` into an X
+// register from a W compare), and `cinc d, s, lt` adds the bit, `add d, s,
+// x, lsr #31`.  One instruction instead of two, and no flags: Clang 23.1.5
+// spells `x < 0`, `-(x < 0)` and `c + (x < 0)` this way under every tuning
+// tried (generic, neoverse-n1, neoverse-v2, cortex-a55, apple-m1).  The
+// emitter's `-(x < 0)` is `cset d, lt; neg d, d`, which is `csetm d, lt` in
+// the negation's view (0 - 1 is all ones in either width), and a sign bit
+// already shifted down and negated in place, `lsr d, x, #31; neg d, d`, is
+// the same broadcast.  A `ge`
+// reader has no one-instruction form (`mvn` first) and keeps its pair.  The
+// pass runs once, after the cleanup rounds: a narrow sign test is Pass 3c's
+// (`ubfx d, s, #7, #1` also drops the extension), `cset; add` has become
+// `cinc`, and a W-copied parameter is read where it arrives.
+//
+// Legality: the reader is the compare's first flag access in its block
+// (`first_flag_access`), and no line between may write `x`, which the
+// reader now reads; NZCV is dead after the reader on every path (the global
+// flag liveness); a view the shift cannot produce -- a W `csetm` or `cinc`
+// of an X compare, an X `cinc` of a W one, a zero register -- keeps the
+// pair.
+
+/// The one-instruction form of the sign-test reader `reader` of `cmp x, #0`
+/// (`x` register number `x`, an X compare when `wide`), if it has one.
+fn sign_bit_reader(reader: &str, x: u8, wide: bool) -> Option<String> {
+    let (m, ops) = reader.trim().split_once(' ')?;
+    sign_bit_form(m, ops, x, wide)
+}
+
+/// `cset d, lt` (or `mi`) negated in place by `neg`: the `csetm` in the
+/// negation's view, as a reader `sign_bit_form` takes.
+fn negated_cset(reader: &str, negation: &str) -> Option<String> {
+    let (d, cc) = reader.trim().strip_prefix("cset ")?.split_once(',')?;
+    let (e, f) = negation.trim().strip_prefix("neg ")?.split_once(',')?;
+    let (d, e) = (parse_reg(d), e.trim());
+    (matches!(cc.trim(), "lt" | "mi") && d <= 30 && parse_reg(e) == d && parse_reg(f) == d)
+        .then(|| format!("{e}, {}", cc.trim()))
+}
+
+/// `sign_bit_reader` of the reader mnemonic `m` with operands `ops`.
+fn sign_bit_form(m: &str, ops: &str, x: u8, wide: bool) -> Option<String> {
+    let ops: Vec<&str> = ops.split(',').map(str::trim).collect();
+    let gp = |r: &str| parse_reg(r) <= 30;
+    let (v, top) = if wide { ('x', 63) } else { ('w', 31) };
+    Some(match (m, ops.as_slice()) {
+        ("cset", [d, "lt" | "mi"]) if gp(d) => {
+            format!("    lsr {v}{}, {v}{x}, #{top}", parse_reg(d))
+        }
+        ("csetm", [d, "lt" | "mi"]) if gp(d) => match (wide, d.starts_with('x')) {
+            (false, false) => format!("    asr {d}, w{x}, #31"),
+            (false, true) => format!("    sbfx {d}, x{x}, #31, #1"),
+            (true, true) => format!("    asr {d}, x{x}, #63"),
+            (true, false) => return None,
+        },
+        ("cinc", [d, a, "lt" | "mi"]) if gp(d) && gp(a) && d.starts_with(v) && a.starts_with(v) => {
+            format!("    add {d}, {a}, {v}{x}, lsr #{top}")
+        }
+        _ => return None,
+    })
+}
+
+/// A sign bit moved to bit 0 and negated in place, `lsr d, x, #31` (`#63`)
+/// or `ubfx d, s, #k, #1` then `neg d, d`: the bit broadcast, `asr` or
+/// `sbfx`, in the negation's view (Pass 3c's `ubfx` of a narrow sign test
+/// reaches here when the emitter negates it for `-(x < 0)`).
+fn negated_sign_shift(shift: &str, negation: &str) -> Option<String> {
+    let (m, ops) = shift.trim().split_once(' ')?;
+    let ops: Vec<&str> = ops.split(',').map(str::trim).collect();
+    let (e, f) = negation.trim().strip_prefix("neg ")?.split_once(',')?;
+    let e = e.trim();
+    let (d, x) = match ops.as_slice() {
+        [d, x, _] | [d, x, _, _] => (*d, *x),
+        _ => return None,
+    };
+    let (dn, xn) = (parse_reg(d), parse_reg(x));
+    if dn > 30 || xn > 30 || parse_reg(e) != dn || parse_reg(f) != dn {
+        return None;
+    }
+    let wide_neg = e.starts_with('x');
+    Some(match (m, ops.as_slice()) {
+        ("lsr", [_, _, top]) if d.starts_with('w') == x.starts_with('w') => {
+            match (*top, x.starts_with('x'), wide_neg) {
+                ("#31", false, false) => format!("    asr {e}, w{xn}, #31"),
+                ("#31", false, true) => format!("    sbfx {e}, x{xn}, #31, #1"),
+                ("#63", true, true) => format!("    asr {e}, x{xn}, #63"),
+                _ => return None,
+            }
+        }
+        ("ubfx", [_, _, lsb, "#1"]) => {
+            let k: u32 = lsb.strip_prefix('#')?.parse().ok()?;
+            if k > 63 || (!wide_neg && k > 31) {
+                return None;
+            }
+            let v = if wide_neg { 'x' } else { 'w' };
+            format!("    sbfx {e}, {v}{xn}, #{k}, #1")
+        }
+        _ => return None,
+    })
+}
+
+/// Pass 3e over one function's lines.
+fn fold_sign_bit_tests(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    // NZCV liveness, built on the first candidate and dropped by a rewrite.
+    let mut flags: Option<Option<Liveness>> = None;
+    for b in 0..n {
+        if kinds[b] == LineKind::Nop {
+            continue;
+        }
+        if let Some(k) = next_live(kinds, b + 1, n)
+            && let Some(new) = negated_sign_shift(&lines[b], &lines[k])
+        {
+            lines[b] = new;
+            kinds[b] = classify_line(&lines[b]);
+            kinds[k] = LineKind::Nop;
+            changed = true;
+            continue;
+        }
+        if kinds[b] != LineKind::Compare {
+            continue;
+        }
+        let Some((x, zero)) = lines[b]
+            .trim()
+            .strip_prefix("cmp ")
+            .and_then(|o| o.split_once(','))
+        else {
+            continue;
+        };
+        let (x_reg, wide) = (parse_reg(x), x.trim().starts_with('x'));
+        if x_reg > 30 || !matches!(zero.trim(), "#0" | "wzr" | "xzr") {
+            continue;
+        }
+        let Some(c) = first_flag_access(lines, kinds, b, n) else {
+            continue;
+        };
+        // A `cset` negated in place on the next line reads as its `csetm`,
+        // where the shift can produce that view.
+        let negation = next_live(kinds, c + 1, n).and_then(|k| {
+            let ops = negated_cset(&lines[c], &lines[k])?;
+            Some((k, sign_bit_form("csetm", &ops, x_reg, wide)?))
+        });
+        let (new, negation) = match negation {
+            Some((k, new)) => (Some(new), Some(k)),
+            None => (sign_bit_reader(&lines[c], x_reg, wide), None),
+        };
+        let Some(new) = new else {
+            continue;
+        };
+        if (b + 1..c)
+            .any(|k| kinds[k] != LineKind::Nop && may_write_gp(&lines[k]) & (1u64 << x_reg) != 0)
+        {
+            continue;
+        }
+        let built = flags.get_or_insert_with(|| {
+            Liveness::build_with(lines, kinds, 0, n, |k| flag_operands(&lines[k], kinds[k]))
+        });
+        let Some(live) = built.as_ref() else {
+            return changed;
+        };
+        if live.live_after(c, 0) != Some(false) {
+            continue;
+        }
+        kinds[b] = LineKind::Nop;
+        lines[c] = new;
+        kinds[c] = classify_line(&lines[c]);
+        if let Some(k) = negation {
+            kinds[k] = LineKind::Nop;
+        }
+        flags = None;
+        changed = true;
+    }
+    changed
+}
+
 fn eliminate_redundant_zext_and(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     if std::env::var("CCC_NO_ZEXT_MASK_FOLD").is_ok() {
         return false;
@@ -5571,8 +6167,9 @@ fn retarget_move_imm(line: &str, new_dst: u8) -> Option<String> {
 // AArch64 counterpart of the x86 `test`+`jcc` fusion and cover every emitter
 // that materialises "branch if non-zero" as `cbz .Lskip; b .Ltarget; .Lskip:`.
 //
-// All four heads reach ±1 MB, the same window as `b.cond`, so the same
-// instruction-census range guard applies to each of them.
+// `b.cond`, `cbz` and `cbnz` reach ±1 MB (a 19-bit word offset); `tbz` and
+// `tbnz` only ±32 KB (14 bits).  The instruction-census range guard measures
+// each head against its own window.
 
 /// Where every label of the text is defined, and an upper bound on how many
 /// 4-byte instructions precede each line (every line that is neither `Nop`
@@ -5645,10 +6242,14 @@ fn directive_insn_bound(line: &str) -> usize {
     1
 }
 
-/// Maximum number of instructions a `b.cond` (or `cbz`/`cbnz`/`tbz`/`tbnz`)
-/// can reach (±1 MB = ±262144 instructions).  Use a conservative threshold of
-/// 200,000 to leave margin.
+/// Maximum number of instructions a `b.cond` (or `cbz`/`cbnz`) can reach
+/// (±1 MB = ±262144 instructions).  Use a conservative threshold of 200,000
+/// to leave margin.
 const COND_BRANCH_SAFE_DISTANCE: usize = 200_000;
+
+/// The same for `tbz`/`tbnz`: ±32 KB = ±8192 instructions, with the margin
+/// of `COND_BRANCH_SAFE_DISTANCE`.
+const TEST_BRANCH_SAFE_DISTANCE: usize = 6_000;
 
 /// Does this kind carry a branch target that `fuse_branch_over_branch` can
 /// retarget, and reach the same ±1 MB window as `b.cond`?
@@ -5688,8 +6289,6 @@ fn retarget_branch_over_branch(head: &str, kind: LineKind, real_target: &str) ->
     ))
 }
 
-/// Recognise `head; b .target; .Lskip:` starting at `i` and return the index of
-/// the redundant unconditional branch together with the rewritten head.
 /// A line the branch-over-branch fusion may step over: padding whose size is
 /// bounded by its own text (`.p2align N[,,max]`, CFI, `.loc`) or a label no
 /// other line names (entered only by falling into it, so no path changes).
@@ -5721,6 +6320,8 @@ fn fusion_skippable(
     }
 }
 
+/// Recognise `head; b .target; .Lskip:` starting at `i` and return the index of
+/// the redundant unconditional branch together with the rewritten head.
 fn fused_branch_head(
     lines: &[String],
     kinds: &[LineKind],
@@ -5756,14 +6357,21 @@ fn fused_branch_head(
         return None;
     }
     let real_target = branch_target(&lines[j])?;
+    let bit_test = cmp_branch_parts(&lines[i]).is_some_and(|(m, _, _)| m == "tbz" || m == "tbnz");
+    let reach = if bit_test {
+        TEST_BRANCH_SAFE_DISTANCE
+    } else {
+        COND_BRANCH_SAFE_DISTANCE
+    };
     let in_range = match census.distance(i, real_target) {
-        Some(distance) => distance < COND_BRANCH_SAFE_DISTANCE,
+        Some(distance) => distance < reach,
         // `b.cc` head: keep the historical assumption that an unmeasurable
         // target is reachable, since the unconditional branch already reached
         // it and `b.cond` reaches ±1 MB.
         None if head_kind == LineKind::CondBranch => true,
-        // `cbz`/`cbnz`/`tbz`/`tbnz` reach ±1 MB, 128x narrower than `b`.
-        // Fail closed unless the instruction census proves the distance.
+        // `cbz`/`cbnz` reach ±1 MB, 128x narrower than `b`, and `tbz`/`tbnz`
+        // ±32 KB.  Fail closed unless the instruction census proves the
+        // distance.
         None => false,
     };
     if !in_range {
@@ -10977,10 +11585,6 @@ mod tests {
         }
     }
 
-    /// A function whose only loop sits at its very start and that never
-    /// returns: the first sweep of the dataflow moves the header's live-in
-    /// without changing any live-out a block already read, and must not stop
-    /// there with the loop-carried read missing from the latch.
     #[test]
     fn branch_census_charges_alignment_padding() {
         assert_eq!(directive_insn_bound("    .p2align 4,,10"), 4);
@@ -10999,6 +11603,10 @@ mod tests {
         assert_eq!(census.distance(0, ".L2"), None);
     }
 
+    /// A function whose only loop sits at its very start and that never
+    /// returns: the first sweep of the dataflow moves the header's live-in
+    /// without changing any live-out a block already read, and must not stop
+    /// there with the loop-carried read missing from the latch.
     #[test]
     fn liveness_reaches_the_fixed_point_without_a_ret() {
         let lines: Vec<String> = [".Ltop:", "    add x10, x10, x9", ".Lmid:", "    b .Ltop"]
@@ -11011,6 +11619,62 @@ mod tests {
         assert_eq!(lv.live_after(1, 10), Some(true));
         let abi = abi_liveness(&lines, &kinds, lines.len()).expect("resolvable");
         assert_ne!(abi[3] & (1 << 9), 0);
+    }
+
+    /// What is live after a branch is what its successors read: the taken
+    /// edge's reads as well as the fall-through's after a conditional
+    /// branch, and the target's alone after `b` (whose next line is no
+    /// successor).
+    #[test]
+    fn liveness_after_a_branch_is_every_successor_live_in() {
+        let lines: Vec<String> = [
+            "f:",
+            "    cbz x0, .L1",
+            "    mov x0, x10",
+            "    b .L2",
+            ".L1:",
+            "    mov x0, x9",
+            "    ret",
+            ".L2:",
+            "    add x0, x0, x11",
+            "    ret",
+        ]
+        .iter()
+        .map(|l| l.to_string())
+        .collect();
+        let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let lv = Liveness::build(&lines, &kinds, 0, lines.len(), true).expect("resolvable");
+        // After `cbz`: x9 on the taken edge, x10 and x11 on the fall-through.
+        for reg in [9, 10, 11] {
+            assert_eq!(lv.live_after(1, reg), Some(true), "x{reg}");
+        }
+        assert_eq!(lv.live_after(1, 12), Some(false));
+        // After `b .L2`: x11 only -- not x9, which `.L1` (the next line) reads.
+        assert_eq!(lv.live_after(3, 11), Some(true));
+        assert_eq!(lv.live_after(3, 9), Some(false));
+        assert_eq!(lv.live_after(3, 10), Some(false));
+        // A flag model over the same text: NZCV set before a `b.lt` and read
+        // on its taken edge only is live after the branch.
+        let lines: Vec<String> = [
+            "f:",
+            "    cmp w0, #0",
+            "    b.lt .L1",
+            "    ret",
+            ".L1:",
+            "    cset w0, eq",
+            "    ret",
+        ]
+        .iter()
+        .map(|l| l.to_string())
+        .collect();
+        let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let flags = Liveness::build_with(&lines, &kinds, 0, lines.len(), |k| {
+            flag_operands(&lines[k], kinds[k])
+        })
+        .expect("resolvable");
+        assert_eq!(flags.live_after(2, 0), Some(true));
+        assert_eq!(flags.live_after(1, 0), Some(true));
+        assert_eq!(flags.live_after(5, 0), Some(false));
     }
 
     #[test]
@@ -12703,6 +13367,31 @@ f:
         );
     }
 
+    /// `tbz`/`tbnz` reach ±32 KB, not the ±1 MB of `cbz`: a target 7000
+    /// instructions away keeps its `b` behind a bit-test head, while a `cbz`
+    /// head still takes it.
+    #[test]
+    fn branch_over_branch_measures_bit_test_heads_against_their_reach() {
+        let far = |head: &str| {
+            let mut asm = format!("f:\n    {head}, .Lskip\n    b .Lfar\n.Lskip:\n");
+            for _ in 0..7000 {
+                asm.push_str("    .inst 0xd503201f\n");
+            }
+            asm.push_str("    ret\n.Lfar:\n    mov x0, #2\n    ret\n");
+            peephole_optimize(asm)
+        };
+        let result = far("tbz x2, #63");
+        assert!(
+            result.contains("    tbz x2, #63, .Lskip\n"),
+            "{}",
+            &result[..80]
+        );
+        assert!(result.contains("    b .Lfar\n"), "{}", &result[..80]);
+        let result = far("cbz x2");
+        assert!(result.contains("    cbnz x2, .Lfar\n"), "{}", &result[..80]);
+        assert!(!result.contains("    b .Lfar\n"), "{}", &result[..80]);
+    }
+
     #[test]
     fn branch_over_branch_leaves_compare_and_branch_alone_when_unmeasurable() {
         // `external_fn` is not defined in this unit, so the census cannot prove
@@ -13657,5 +14346,497 @@ mod return_extension_tests {
         assert!(out.contains("mov w0, w0"), "{out}");
         assert!(!out.contains("lccc-ret-bits"), "{out}");
         assert!(!strip_call_annotations(two).contains("lccc-ret-bits"));
+    }
+}
+
+#[cfg(test)]
+mod narrow_sign_test_tests {
+    use super::*;
+
+    fn fold(body: &str) -> (bool, Vec<String>) {
+        let asm = format!("f:\n.cfi_startproc\n{body}.cfi_endproc\n");
+        let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        let changed = fold_narrow_sign_tests(&mut lines, &mut kinds, n);
+        let kept = lines
+            .iter()
+            .zip(&kinds)
+            .filter(|(l, k)| {
+                **k != LineKind::Nop && !l.trim().starts_with(".cfi") && !l.ends_with(':')
+            })
+            .map(|(l, _)| l.trim().to_string())
+            .collect();
+        (changed, kept)
+    }
+
+    /// `(signed char)c < 0` / `>= 0`: bit 7 of the source, through `tst`
+    /// for a branch or a select and `ubfx`/`sbfx` for a materialized `lt`.
+    #[test]
+    fn a_narrow_sign_test_reads_the_source_bit() {
+        let (changed, out) = fold("    sxtb x4, w0\n    cmp w4, #0\n    cset x0, ge\n    ret\n");
+        assert!(changed);
+        assert_eq!(out, ["tst w0, #0x80", "cset x0, eq", "ret"]);
+        let (_, out) = fold("    sxtb w4, w0\n    cmp w4, #0\n    cset w0, lt\n    ret\n");
+        assert_eq!(out, ["ubfx w0, w0, #7, #1", "ret"]);
+        let (_, out) = fold("    sxth x5, w1\n    cmp x5, #0\n    cset x0, lt\n    ret\n");
+        assert_eq!(out, ["ubfx x0, x1, #15, #1", "ret"]);
+        let (_, out) = fold("    sxtb w4, w2\n    cmp w4, #0\n    csetm w0, mi\n    ret\n");
+        assert_eq!(out, ["sbfx w0, w2, #7, #1", "ret"]);
+        let (_, out) = fold(
+            "    sxth w4, w2\n    cmp w4, wzr\n    csinc w5, w5, w5, ge\n    mov w0, w5\n    ret\n",
+        );
+        assert_eq!(
+            out,
+            [
+                "tst w2, #0x8000",
+                "csinc w5, w5, w5, eq",
+                "mov w0, w5",
+                "ret"
+            ]
+        );
+        let (_, out) = fold("    sxtb w9, w9\n    cmp w9, #0\n    csel w0, w2, w3, pl\n    ret\n");
+        assert_eq!(out, ["tst w9, #0x80", "csel w0, w2, w3, eq", "ret"]);
+        // x1 is part of a full-width result, so a `ret` reads it ...
+        let (changed, _) = fold("    sxtb w1, w1\n    cmp w1, #0\n    cset w0, ge\n    ret\n");
+        assert!(!changed);
+        // ... but not when the prologue marks an `int` result.
+        let (changed, out) = fold(&format!(
+            "    {RET_BITS_MARKER}32\n    sxtb w1, w1\n    cmp w1, #0\n    cset w0, ge\n    ret\n"
+        ));
+        assert!(changed);
+        assert_eq!(out, ["tst w1, #0x80", "cset w0, eq", "ret"]);
+        // Lines between that leave the source and the extension alone.
+        let (changed, out) = fold(
+            "    sxtb x5, w0\n    mov w6, w1\n    mov w7, w2\n    cmp w5, #0\n    csel w0, w6, w7, ge\n    ret\n",
+        );
+        assert!(changed);
+        assert_eq!(
+            out,
+            [
+                "mov w6, w1",
+                "mov w7, w2",
+                "tst w0, #0x80",
+                "csel w0, w6, w7, eq",
+                "ret"
+            ]
+        );
+        // A select whose operands are staged after the compare
+        // (`load_sign8`: `(signed char)p[i] < 0 ? 5 : 9`); the staging
+        // overwrites the extension.
+        let (changed, out) = fold(
+            "    sxtb w1, w4\n    cmp w1, #0\n    mov x1, #9\n    mov x2, #5\n    csel w0, w2, w1, lt\n    ret\n",
+        );
+        assert!(changed);
+        assert_eq!(
+            out,
+            [
+                "tst w4, #0x80",
+                "mov x1, #9",
+                "mov x2, #5",
+                "csel w0, w2, w1, ne",
+                "ret"
+            ]
+        );
+        // A branch: the flags die on both edges.
+        let (changed, out) = fold(
+            "    sxtb w7, w6\n    cmp w7, #0\n    b.lt .L1\n    mov w0, #1\n    ret\n.L1:\n    mov w0, #2\n    ret\n",
+        );
+        assert!(changed);
+        assert_eq!(
+            out,
+            [
+                "tst w6, #0x80",
+                "b.ne .L1",
+                "mov w0, #1",
+                "ret",
+                "mov w0, #2",
+                "ret"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_narrow_sign_test_keeps_what_else_reads() {
+        for kept in [
+            // The extension is read after the compare (here by the select).
+            "    sxtb w4, w0\n    cmp w4, #0\n    csel w0, w4, wzr, lt\n    ret\n",
+            // ... or returned.
+            "    sxtb x0, w0\n    cmp w0, #0\n    cset w1, lt\n    ret\n",
+            // Conditions that read Z or C.
+            "    sxtb w4, w0\n    cmp w4, #0\n    cset w0, gt\n    ret\n",
+            "    sxtb w4, w0\n    cmp w4, #0\n    cset w0, eq\n    ret\n",
+            "    sxtb w4, w0\n    cmp w4, #0\n    cset w0, hs\n    ret\n",
+            // A second flag reader after the first.
+            "    sxtb w4, w0\n    cmp w4, #0\n    cset w0, lt\n    cinc w0, w0, ge\n    ret\n",
+            "    sxtb w4, w0\n    cmp w4, #0\n    b.lt .L1\n    b.gt .L2\n    ret\n.L1:\n    ret\n.L2:\n    ret\n",
+            // ... on the branch's taken edge.
+            "    sxtb w4, w0\n    cmp w4, #0\n    b.lt .L1\n    ret\n.L1:\n    cset w0, eq\n    ret\n",
+            // Not a compare with zero, or not in the extension's block.
+            "    sxtb w4, w0\n    cmp w4, #1\n    cset w0, lt\n    ret\n",
+            "    sxtb w4, w0\n.L0:\n    cmp w4, #0\n    cset w0, lt\n    ret\n",
+            "    sxtb w4, w0\n    bl g\n    cmp w4, #0\n    cset w0, lt\n    ret\n",
+            // A line between that writes the source or reads the extension.
+            "    sxtb w4, w0\n    add w0, w0, #1\n    cmp w4, #0\n    cset w2, lt\n    ret\n",
+            "    sxtb w4, w0\n    add w5, w4, #1\n    cmp w4, #0\n    cset w0, lt\n    ret\n",
+            // A compare of another register.
+            "    sxtb w4, w0\n    cmp w5, #0\n    cset w0, lt\n    ret\n",
+            // The first flag access past the compare is a writer, or a
+            // reader of the extension; a call or a label comes first.
+            "    sxtb w4, w0\n    cmp w4, #0\n    adds w5, w5, #1\n    cset w0, lt\n    ret\n",
+            "    sxtb w4, w0\n    cmp w4, #0\n    mov w5, w4\n    cset w0, lt\n    ret\n",
+            "    sxtb w4, w0\n    cmp w4, #0\n    bl g\n    cset w0, lt\n    ret\n",
+            "    sxtb w4, w0\n    cmp w4, #0\n.L3:\n    cset w0, lt\n    ret\n",
+            // A 64-bit compare of a W-form extension: bit 63 is zero, so
+            // `lt` never holds -- not bit 7.
+            "    sxtb w4, w0\n    cmp x4, #0\n    cset w0, lt\n    ret\n",
+            "    sxth w4, w0\n    cmp x4, xzr\n    b.ge .L1\n    ret\n.L1:\n    ret\n",
+        ] {
+            let (changed, out) = fold(kept);
+            assert!(!changed, "{kept} => {out:?}");
+        }
+    }
+
+    /// The flag semantics the rewrite rests on, for every byte and halfword
+    /// pattern with arbitrary bits above: after `cmp sext(s), #0`, `lt`/`mi`
+    /// hold exactly when `tst s, #sign` leaves Z clear, and the `ubfx` of the
+    /// sign bit is the `cset lt` value.
+    #[test]
+    fn the_sign_bit_is_the_compare_with_zero() {
+        for (bits, sign) in [(8u32, 0x80u32), (16, 0x8000)] {
+            for low in (0u32..1 << bits).step_by(if bits == 8 { 1 } else { 7 }) {
+                for high in [
+                    0u32,
+                    0x5a5a_0000 & !((1 << bits) - 1),
+                    0xffff_ff00 << (bits - 8),
+                ] {
+                    let s = low | high;
+                    let t = if bits == 8 {
+                        i32::from(s as u8 as i8)
+                    } else {
+                        i32::from(s as u16 as i16)
+                    };
+                    // cmp t, #0: N = t<31>, V = 0, so lt = N.
+                    let lt = t < 0;
+                    let z_after_tst = s & sign == 0;
+                    assert_eq!(lt, !z_after_tst, "{s:#x}");
+                    assert_eq!(u32::from(lt), (s >> (bits - 1)) & 1, "{s:#x}");
+                }
+            }
+        }
+    }
+
+    /// End to end: a signed-char sign test in a loop and a `cset` lose the
+    /// extension (`ascii_prefix`, `count_hi`).
+    #[test]
+    fn the_pipeline_folds_narrow_sign_tests() {
+        let asm = format!(
+            "f:\n.cfi_startproc\n    {RET_BITS_MARKER}32\n.LBB2:\n    ldrb w6, [x0, x5]\n    sxtb w1, w6\n    cmp w1, #0\n    b.lt .L9\n    add x5, x5, #1\n    cmp x5, x4\n    b.lt .LBB2\n.L9:\n    mov x0, x5\n    ret\n.cfi_endproc\n"
+        );
+        let out = peephole_optimize(asm);
+        assert!(out.contains("tst w6, #0x80"), "{out}");
+        assert!(out.contains("b.ne .L9"), "{out}");
+        assert!(!out.contains("sxtb"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod extension_load_tests {
+    use super::*;
+
+    fn fold(body: &str) -> (bool, Vec<String>) {
+        let asm = format!("f:\n.cfi_startproc\n{body}.cfi_endproc\n");
+        let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        let changed = fold_extensions_into_loads(&mut lines, &mut kinds, n);
+        let kept = lines
+            .iter()
+            .zip(&kinds)
+            .filter(|(l, k)| {
+                **k != LineKind::Nop && !l.trim().starts_with(".cfi") && !l.ends_with(':')
+            })
+            .map(|(l, _)| l.trim().to_string())
+            .collect();
+        (changed, kept)
+    }
+
+    /// Each load and extension pair, in every addressing form the emitter
+    /// uses: the narrow load of the extension's signedness.
+    #[test]
+    fn a_narrow_load_takes_the_extension() {
+        for (body, load) in [
+            (
+                "ldrb w4, [x0, w1, sxtw #0]\n    sxtb x0, w4",
+                "ldrsb x0, [x0, w1, sxtw #0]",
+            ),
+            ("ldrb w6, [x0, x5]\n    sxtb w1, w6", "ldrsb w1, [x0, x5]"),
+            (
+                "ldrh w4, [x0, w1, sxtw #1]\n    sxth x0, w4",
+                "ldrsh x0, [x0, w1, sxtw #1]",
+            ),
+            (
+                "ldr w4, [x0, w1, sxtw #2]\n    sxtw x0, w4",
+                "ldrsw x0, [x0, w1, sxtw #2]",
+            ),
+            (
+                "ldr w4, [x9, :lo12:tab]\n    sxtw x2, w4",
+                "ldrsw x2, [x9, :lo12:tab]",
+            ),
+            (
+                "ldrsw x6, [x0, w1, sxtw #2]\n    mov w0, w6",
+                "ldr w0, [x0, w1, sxtw #2]",
+            ),
+            (
+                "ldurb w4, [x0, #-3]\n    sxtb w0, w4",
+                "ldursb w0, [x0, #-3]",
+            ),
+            (
+                "ldurh w4, [x0, #-6]\n    sxth x0, w4",
+                "ldursh x0, [x0, #-6]",
+            ),
+            (
+                "ldur w4, [x0, #-12]\n    sxtw x0, w4",
+                "ldursw x0, [x0, #-12]",
+            ),
+            ("ldrsb w4, [x1, #7]\n    uxtb w0, w4", "ldrb w0, [x1, #7]"),
+            ("ldrsb x4, [x1]\n    and x0, x4, #0xff", "ldrb w0, [x1]"),
+            (
+                "ldursb w4, [x1, #-1]\n    and w0, w4, #255",
+                "ldurb w0, [x1, #-1]",
+            ),
+            (
+                "ldrsh w4, [x1, #2]\n    and w0, w4, #0xffff",
+                "ldrh w0, [x1, #2]",
+            ),
+            ("ldrsh x4, [x1, #2]\n    uxth w0, w4", "ldrh w0, [x1, #2]"),
+            ("ldursw x4, [x1, #-4]\n    mov w0, w4", "ldur w0, [x1, #-4]"),
+            // A writeback form whose base is not the destination.
+            ("ldrb w4, [x1], #1\n    sxtb x0, w4", "ldrsb x0, [x1], #1"),
+            ("ldrh w4, [x1, #2]!\n    sxth x0, w4", "ldrsh x0, [x1, #2]!"),
+            // In place.
+            ("ldrb w0, [x1]\n    sxtb x0, w0", "ldrsb x0, [x1]"),
+        ] {
+            let (changed, out) = fold(&format!("    {body}\n    ret\n"));
+            assert!(changed, "{body}");
+            assert_eq!(out, [load, "ret"], "{body}");
+        }
+    }
+
+    #[test]
+    fn a_narrow_load_keeps_what_needs_it() {
+        for kept in [
+            // The loaded value is read again.
+            "    ldrb w4, [x1]\n    sxtb w5, w4\n    add w0, w5, w4\n    ret\n",
+            // ... or returned (x1 is part of a full-width result).
+            "    ldrb w1, [x2]\n    sxtb w0, w1\n    ret\n",
+            // A writeback base the new load would also write.
+            "    ldrb w4, [x1], #1\n    sxtb x1, w4\n    ret\n",
+            "    ldrsw x4, [x0, #4]!\n    mov w0, w4\n    ret\n",
+            // A literal load, a doubleword load, another view or register.
+            "    ldr w4, =0x12345678\n    sxtw x0, w4\n    ret\n",
+            "    ldr x4, [x1]\n    sxtw x0, w4\n    ret\n",
+            "    ldrsw x6, [x0]\n    mov x0, x6\n    ret\n",
+            "    ldrb w4, [x1]\n    sxtb x0, w5\n    ret\n",
+            "    ldrsb w4, [x1]\n    and w0, w4, #0x7f\n    ret\n",
+            "    ldrb w4, [x1]\n    sxth x0, w4\n    ret\n",
+            // Not the next line, or across a label.
+            "    ldrb w4, [x1]\n    add x9, x9, #1\n    sxtb x0, w4\n    ret\n",
+            "    ldrb w4, [x1]\n.L1:\n    sxtb x0, w4\n    ret\n",
+        ] {
+            let (changed, out) = fold(kept);
+            assert!(!changed, "{kept} => {out:?}");
+        }
+    }
+
+    /// End to end: `(signed char)p[i]` and `(short)p[i]` returned as `long`
+    /// load signed.
+    #[test]
+    fn the_pipeline_loads_extended_values_signed() {
+        let out = peephole_optimize(
+            "f:\n.cfi_startproc\n    ldrb w4, [x0, w1, sxtw #0]\n    sxtb x0, w4\n    ret\n.cfi_endproc\n"
+                .to_string(),
+        );
+        assert!(out.contains("ldrsb x0, [x0, w1, sxtw #0]"), "{out}");
+        assert!(!out.contains("sxtb"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod sign_bit_tests {
+    use super::*;
+
+    fn fold(body: &str) -> (bool, Vec<String>) {
+        let asm = format!("f:\n.cfi_startproc\n{body}.cfi_endproc\n");
+        let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        let changed = fold_sign_bit_tests(&mut lines, &mut kinds, n);
+        let kept = lines
+            .iter()
+            .zip(&kinds)
+            .filter(|(l, k)| {
+                **k != LineKind::Nop && !l.trim().starts_with(".cfi") && !l.ends_with(':')
+            })
+            .map(|(l, _)| l.trim().to_string())
+            .collect();
+        (changed, kept)
+    }
+
+    /// Each reader with a one-instruction form, from W and X compares.
+    #[test]
+    fn a_sign_test_of_a_register_is_its_top_bit() {
+        for (body, shift) in [
+            ("cmp w0, #0\n    cset w0, lt", "lsr w0, w0, #31"),
+            ("cmp w1, #0\n    cset x0, lt", "lsr w0, w1, #31"),
+            ("cmp x1, #0\n    cset x0, lt", "lsr x0, x1, #63"),
+            ("cmp x1, xzr\n    cset w0, mi", "lsr x0, x1, #63"),
+            ("cmp w1, wzr\n    cset w0, mi", "lsr w0, w1, #31"),
+            ("cmp w1, #0\n    csetm w0, lt", "asr w0, w1, #31"),
+            ("cmp w1, #0\n    csetm x0, lt", "sbfx x0, x1, #31, #1"),
+            ("cmp x1, #0\n    csetm x0, mi", "asr x0, x1, #63"),
+            ("cmp w1, #0\n    cinc w0, w0, lt", "add w0, w0, w1, lsr #31"),
+            ("cmp x1, #0\n    cinc x0, x2, mi", "add x0, x2, x1, lsr #63"),
+            // `-(x < 0)`: a `cset` negated in place.
+            (
+                "cmp w0, #0\n    cset w0, lt\n    neg w0, w0",
+                "asr w0, w0, #31",
+            ),
+            (
+                "cmp w0, #0\n    cset x0, lt\n    neg x0, x0",
+                "sbfx x0, x0, #31, #1",
+            ),
+            (
+                "cmp x1, #0\n    cset x3, lt\n    neg x3, x3",
+                "asr x3, x1, #63",
+            ),
+        ] {
+            let (changed, out) = fold(&format!("    {body}\n    ret\n"));
+            assert!(changed, "{body}");
+            assert_eq!(out, [shift, "ret"], "{body}");
+        }
+        // Past a line that neither touches the flags nor writes the source.
+        let (changed, out) = fold("    cmp w1, #0\n    mov w2, #5\n    cset w0, lt\n    ret\n");
+        assert!(changed);
+        assert_eq!(out, ["mov w2, #5", "lsr w0, w1, #31", "ret"]);
+    }
+
+    #[test]
+    fn a_sign_test_keeps_what_needs_the_flags() {
+        for kept in [
+            // No one-instruction form, or not a sign condition.
+            "    cmp w1, #0\n    cset w0, ge\n    ret\n",
+            "    cmp w1, #0\n    cinc w0, w0, pl\n    ret\n",
+            "    cmp w1, #0\n    cset w0, gt\n    ret\n",
+            "    cmp w1, #1\n    cset w0, lt\n    ret\n",
+            "    cmp w1, #0\n    csel w0, w2, w3, lt\n    ret\n",
+            "    cmp w1, #0\n    b.lt .L1\n    ret\n.L1:\n    ret\n",
+            // The source changes before the reader.
+            "    cmp w1, #0\n    mov w1, #5\n    cset w0, lt\n    ret\n",
+            // The flags are read again, on a path or after a branch.
+            "    cmp w1, #0\n    cset w0, lt\n    cset w2, eq\n    add w0, w0, w2\n    ret\n",
+            "    cmp w1, #0\n    cset w0, lt\n    b.eq .L1\n    ret\n.L1:\n    ret\n",
+            // Views the shift cannot produce.
+            "    cmp x1, #0\n    csetm w0, lt\n    ret\n",
+            "    cmp w1, #0\n    cinc x0, x0, lt\n    ret\n",
+            "    cmp x1, #0\n    cinc w0, w0, lt\n    ret\n",
+            "    cmp w1, #0\n    cinc w0, wzr, lt\n    ret\n",
+            "    cmp sp, #0\n    cset w0, lt\n    ret\n",
+        ] {
+            let (changed, out) = fold(kept);
+            assert!(!changed, "{kept} => {out:?}");
+        }
+        // A negation elsewhere, or of an X compare into a W view, leaves the
+        // `cset` to its own shift.
+        for (body, out) in [
+            (
+                "    cmp w1, #0\n    cset w0, lt\n    neg w2, w0\n    ret\n",
+                ["lsr w0, w1, #31", "neg w2, w0", "ret"],
+            ),
+            (
+                "    cmp x1, #0\n    cset w0, lt\n    neg w0, w0\n    ret\n",
+                ["lsr x0, x1, #63", "neg w0, w0", "ret"],
+            ),
+        ] {
+            let (changed, kept) = fold(body);
+            assert!(changed, "{body}");
+            assert_eq!(kept, out, "{body}");
+        }
+        // A sign bit already shifted down and negated in place.
+        for (body, out) in [
+            (
+                "    lsr w0, w1, #31\n    neg w0, w0\n    ret\n",
+                "asr w0, w1, #31",
+            ),
+            (
+                "    lsr w0, w0, #31\n    neg x0, x0\n    ret\n",
+                "sbfx x0, x0, #31, #1",
+            ),
+            (
+                "    lsr x2, x1, #63\n    neg x2, x2\n    ret\n",
+                "asr x2, x1, #63",
+            ),
+            (
+                "    ubfx x0, x0, #7, #1\n    neg w0, w0\n    ret\n",
+                "sbfx w0, w0, #7, #1",
+            ),
+            (
+                "    ubfx w2, w5, #15, #1\n    neg x2, x2\n    ret\n",
+                "sbfx x2, x5, #15, #1",
+            ),
+            (
+                "    ubfx x2, x5, #40, #1\n    neg x2, x2\n    ret\n",
+                "sbfx x2, x5, #40, #1",
+            ),
+        ] {
+            let (changed, kept) = fold(body);
+            assert!(changed, "{body}");
+            assert_eq!(kept, [out, "ret"], "{body}");
+        }
+        for kept in [
+            "    cmp w1, #0\n    cset w0, ge\n    neg w0, w0\n    ret\n",
+            // Not the sign bit, not in place, or a W negation of bit 63.
+            "    lsr w0, w1, #30\n    neg w0, w0\n    ret\n",
+            "    lsr w0, w1, #31\n    neg w2, w0\n    ret\n",
+            "    lsr x0, x1, #63\n    neg w0, w0\n    ret\n",
+            "    lsr w0, w1, #31\n    add w3, w3, #1\n    neg w0, w0\n    ret\n",
+            // More than one bit, or bit 40 into a W view.
+            "    ubfx w0, w1, #7, #2\n    neg w0, w0\n    ret\n",
+            "    ubfx x0, x1, #40, #1\n    neg w0, w0\n    ret\n",
+        ] {
+            let (changed, out) = fold(kept);
+            assert!(!changed, "{kept} => {out:?}");
+        }
+    }
+
+    /// End to end, the emitter's `int f(signed char x) { return x < 0; }`:
+    /// the redundant second extension becomes a copy that hides the first
+    /// from Pass 3c until a round's end retires it, and Pass 3e must not
+    /// take the compare meanwhile -- `ubfx` drops the extension too, where
+    /// `lsr` would keep it.
+    #[test]
+    fn a_narrow_sign_test_stays_a_bit_extract() {
+        let out = peephole_optimize(
+            "f:\n.cfi_startproc\n    sxtb x5, w0\n    sxtb w1, w5\n    cmp w1, #0\n    cset x0, lt\n    mov x4, x0\n    ret\n.cfi_endproc\n"
+                .to_string(),
+        );
+        let code: Vec<&str> = out
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('.') && !l.ends_with(':'))
+            .collect();
+        assert_eq!(code, ["ubfx x0, x0, #7, #1", "ret"], "{out}");
+    }
+
+    /// End to end: `c + (x < 0)` is formed as `cinc` first and then becomes
+    /// the shifted add.
+    #[test]
+    fn the_pipeline_counts_negatives_with_a_shift() {
+        let out = peephole_optimize(
+            "f:\n.cfi_startproc\n    cmp w1, #0\n    cset w2, lt\n    add w0, w0, w2\n    ret\n.cfi_endproc\n"
+                .to_string(),
+        );
+        assert!(out.contains("add w0, w0, w1, lsr #31"), "{out}");
+        assert!(!out.contains("cmp") && !out.contains("cinc"), "{out}");
     }
 }

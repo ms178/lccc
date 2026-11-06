@@ -48,9 +48,9 @@ pub use inline_asm::{
     collect_inline_asm_callee_saved_with_generic, collect_inline_asm_callee_saved_with_overflow,
 };
 pub use regalloc_helpers::{
-    ParamAllocaIndex, filter_available_regs, run_regalloc_and_merge_clobbers,
-    run_regalloc_and_merge_clobbers_ex, run_regalloc_and_merge_clobbers_ipa,
-    x86_vector_param_loads,
+    ParamAllocaIndex, filter_available_regs, leaves_through_nonlocal_goto,
+    run_regalloc_and_merge_clobbers, run_regalloc_and_merge_clobbers_ex,
+    run_regalloc_and_merge_clobbers_ipa, x86_vector_param_loads,
 };
 pub use slot_census::{build_slot_census, emit_slot_census, slot_census_enabled};
 

@@ -9560,7 +9560,8 @@ pub(crate) fn collect_bitop_nonneg_values(func: &IrFunction) -> FxHashSet<u32> {
 pub use super::stack_layout::{
     ParamAllocaIndex, calculate_stack_space_common, collect_inline_asm_callee_saved,
     collect_inline_asm_callee_saved_with_generic, filter_available_regs,
-    run_regalloc_and_merge_clobbers, run_regalloc_and_merge_clobbers_ex,
+    leaves_through_nonlocal_goto, run_regalloc_and_merge_clobbers,
+    run_regalloc_and_merge_clobbers_ex,
 };
 
 #[cfg(test)]

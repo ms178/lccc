@@ -198,7 +198,11 @@ impl RiscvCodegen {
 
         let mut available_regs =
             crate::backend::generation::filter_available_regs(&all_available, &asm_clobbered_regs);
-        if self.state.disable_regalloc {
+        // A nested function leaving through a nonlocal `goto` never runs its
+        // epilogue's restores (see `leaves_through_nonlocal_goto`).
+        if self.state.disable_regalloc
+            || crate::backend::generation::leaves_through_nonlocal_goto(func)
+        {
             available_regs.clear();
         }
         // Caller-saved Phase-2 pool: a0–a7 for emitter-safe functions (see
@@ -1033,11 +1037,15 @@ impl RiscvCodegen {
     /// argument register holding an integer parameter narrower than XLEN,
     /// which the psABI delivers sign-extended from bit 31 (`unsigned int`
     /// included), tagged `/z8` or `/z16` when its 32-bit widening was a zero
-    /// extension from 8 or 16 bits (`unsigned char`/`unsigned short`).  The
-    /// facts hold at the function's entry, where the line sits; the passes
-    /// that read it track every later write.  `long f(int x) { return x; }`
-    /// then needs no `sext.w`, `parity16(unsigned short x)` no
-    /// re-normalising shift pair.
+    /// extension from 8 or 16 bits (`unsigned char`/`unsigned short`) and
+    /// `/s8` or `/s16` when it was a sign extension from bit 7 or 15
+    /// (`signed char`/`short`: a narrow signed value's register form is that
+    /// extension here too, so this backend's own call sites deliver it as
+    /// GCC's and Clang's do).  The facts hold at the function's entry, where
+    /// the line sits; the passes that read it track every later write.
+    /// `long f(int x) { return x; }` then needs no `sext.w`,
+    /// `parity16(unsigned short x)` no re-normalising shift pair, and
+    /// `int f(signed char c) { return c < 0; }` no `slli; srai` pair.
     fn emit_arg_extension_marker(&mut self, func: &IrFunction) {
         if func.is_naked || func.is_variadic {
             return;
@@ -1053,9 +1061,11 @@ impl RiscvCodegen {
                 continue;
             }
             let tag = match param.ty {
-                IrType::I8 | IrType::I16 | IrType::I32 | IrType::U32 => "",
+                IrType::I32 | IrType::U32 => "",
                 IrType::U8 => "/z8",
                 IrType::U16 => "/z16",
+                IrType::I8 => "/s8",
+                IrType::I16 => "/s16",
                 _ => continue,
             };
             facts.push(' ');
