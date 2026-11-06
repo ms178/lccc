@@ -85,6 +85,98 @@ class I386MultilibSafetyTests(unittest.TestCase):
             )
             self.assertNotEqual(proc.returncode, 0, f"accepted unsafe sysroot {unsafe}")
 
+    def test_validate_sysroot_path_rejects_every_shared_top_level_tree(self):
+        """Staging *replaces* the sysroot, so a shared tree must be refused.
+
+        The first implementation used a denylist of the obvious system paths
+        and then `rm -rf "$sysroot"`.  `LCCC_I686_SYSROOT=/tmp` (or `/var`, or
+        `/opt`) passed that list and would have deleted the directory wholesale.
+        A dedicated sysroot is at least two components deep; every legitimate
+        path satisfies that, and no shared top-level tree does.
+        """
+        unsafe = ("/tmp", "/var", "/opt", "/srv", "/root", "/home", "/mnt",
+                  "/media", "/dev", "/proc", "/sys", "/boot", "/run",
+                  "/dev/shm", "/proc/self", "/sys/kernel", "/run/user")
+        for path in unsafe:
+            proc = subprocess.run(
+                ["bash", str(SAFE_SCRIPT), "--validate-sysroot-path", path],
+                cwd=ROOT, text=True, capture_output=True, timeout=15)
+            self.assertNotEqual(proc.returncode, 0, f"accepted shared tree {path}")
+        for path in ("/var/tmp/lccc-i686-sysroot", "/opt/lccc-sysroot",
+                     "/var/tmp/nested/deep/sysroot"):
+            proc = subprocess.run(
+                ["bash", str(SAFE_SCRIPT), "--validate-sysroot-path", path],
+                cwd=ROOT, text=True, capture_output=True, timeout=15)
+            self.assertEqual(proc.returncode, 0,
+                             f"refused legitimate sysroot {path}: {proc.stderr}")
+
+    def test_staging_never_replaces_a_directory_it_did_not_create(self):
+        """`rm -rf` may only ever run on a tree proven to be ours."""
+        script = SAFE_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("assert_replaceable_sysroot()", script)
+        self.assertIn('assert_replaceable_sysroot "$sysroot"', script)
+        # The guard must run BEFORE the removal, not after it.
+        self.assertLess(script.index('assert_replaceable_sysroot "$sysroot"'),
+                        script.index('rm -rf "$sysroot"'))
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as tmp:
+            root = Path(tmp)
+            populated = root / "someone-elses-data"
+            populated.mkdir()
+            (populated / "precious").write_text("do not delete")
+            probe = (
+                f'source "{SAFE_SCRIPT}" --print-env >/dev/null 2>&1; '
+                f'assert_replaceable_sysroot "{populated}"'
+            )
+            proc = subprocess.run(["bash", "-c", probe], cwd=ROOT, text=True,
+                                  capture_output=True, timeout=20)
+            self.assertNotEqual(proc.returncode, 0, "accepted a populated foreign tree")
+            self.assertTrue((populated / "precious").exists(), "the guard deleted data")
+            # Empty, absent and marker-carrying trees are all replaceable.
+            for name, marker in (("empty", False), ("ours", True)):
+                candidate = root / name
+                candidate.mkdir()
+                if marker:
+                    (candidate / "README.DO_NOT_COPY_TO_ROOT.txt").write_text("ours")
+                proc = subprocess.run(
+                    ["bash", "-c", f'source "{SAFE_SCRIPT}" --print-env >/dev/null 2>&1; '
+                                   f'assert_replaceable_sysroot "{candidate}"'],
+                    cwd=ROOT, text=True, capture_output=True, timeout=20)
+                self.assertEqual(proc.returncode, 0, f"{name}: {proc.stderr}")
+            proc = subprocess.run(
+                ["bash", "-c", f'source "{SAFE_SCRIPT}" --print-env >/dev/null 2>&1; '
+                               f'assert_replaceable_sysroot "{root / "absent"}"'],
+                cwd=ROOT, text=True, capture_output=True, timeout=20)
+            self.assertEqual(proc.returncode, 0, f"absent: {proc.stderr}")
+
+    def test_generated_wrappers_embed_an_absolute_driver_path(self):
+        """A wrapper must work outside the environment that created it.
+
+        `exec gcc-16` resolved only while the toolchain's bin dir was on PATH;
+        a gate running the wrapper from its own environment failed with
+        `exec: gcc-16: not found` (measured).  The driver is now resolved to an
+        absolute path at generation time.
+        """
+        script = SAFE_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('resolved=$(command -v "$real"', script)
+        self.assertIn("compiler not found on PATH", script)
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as tmp:
+            sysroot = Path(tmp) / "sysroot"
+            (sysroot / "lib32").mkdir(parents=True)
+            (sysroot / "lib32" / "ld-linux.so.2").write_text("")
+            probe = (
+                f'source "{SAFE_SCRIPT}" --print-env >/dev/null 2>&1; '
+                f'write_m32_wrappers "{sysroot}" true true; '
+                f'sed -n "4p" "{sysroot}/bin/m32-cc"'
+            )
+            proc = subprocess.run(["bash", "-c", probe], cwd=ROOT, text=True,
+                                  capture_output=True, timeout=20)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            # A *bare* driver name is the regression: passing an already
+            # absolute path would pass even if resolution were removed.
+            self.assertTrue(proc.stdout.startswith("exec /"),
+                            f"wrapper does not exec an absolute path: {proc.stdout}")
+            self.assertNotIn("exec true ", proc.stdout)
+
     def test_restore_agent_toolchain_cache_refuses_live_root_prefixes(self):
         mod = _load_restore_module()
         for bad in (Path("/"), Path("/usr"), Path("/lib"), Path("/lib64"), Path("/usr/local")):

@@ -30,6 +30,7 @@ jobs:
       - name: Install Debian toolchain and report package identity
         run: |
           apt-get update
+          # rootfs-write-policy: allow(disposable Debian container in CI, not a persistent sandbox)
           apt-get install -y --no-install-recommends gcc-16 g++-16 gcc gcc-16-multilib binutils libc6-dev libc6-dev-i386 valgrind python3 ca-certificates curl git
           test "$(gcc-16 -dumpfullversion)" = 16.2.0
           dpkg-query -W gcc-16 g++-16 libc6-dev binutils

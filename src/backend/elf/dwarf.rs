@@ -465,6 +465,12 @@ pub(crate) struct DwarfConfig {
     /// case it is used exactly as given.  Unpinned, the dialect follows the unit
     /// the input already carries -- see [`DwarfConfig::continuing_unit`].
     pub version_pinned: bool,
+    /// `-gpubnames`: write the `.debug_pubnames`/`.debug_pubtypes` accelerator
+    /// tables.  Off by default, exactly as GCC 16.2 and Clang 23.1.5 (measured:
+    /// neither emits an index at plain `-g`).  The flag does not enable debug
+    /// info by itself -- `gcc -gpubnames` without `-g` emits no debug section at
+    /// all (measured), so it only selects content for a unit that `-g` builds.
+    pub pubnames: bool,
 }
 
 impl DwarfConfig {
@@ -477,6 +483,7 @@ impl DwarfConfig {
             language_name: None,
             language_version: None,
             version_pinned: false,
+            pubnames: false,
         }
     }
 
@@ -528,6 +535,7 @@ impl DwarfConfig {
                 // A C translation unit is compiled here and now: there is no
                 // input unit whose dialect could be adopted.
                 version_pinned: true,
+                pubnames: false,
             };
         }
         let c11_or_newer = year.is_some_and(|year| year >= 201112);
@@ -546,6 +554,7 @@ impl DwarfConfig {
             language_version: year.filter(|year| *year >= 201710),
             // See the version-4 arm: a C unit is always written here.
             version_pinned: true,
+            pubnames: false,
         }
     }
 }
@@ -1273,6 +1282,10 @@ pub(crate) struct DwarfInfoBuild {
     pub loc: Option<ObjSection>,
     /// `.debug_loclists` (DWARF 5) parameter location lists.
     pub loclists: Option<ObjSection>,
+    /// `.debug_pubnames` (`-gpubnames`): file-scope objects and functions.
+    pub pubnames: Option<ObjSection>,
+    /// `.debug_pubtypes` (`-gpubnames`): named types of the unit.
+    pub pubtypes: Option<ObjSection>,
 }
 
 /// Parameter location lists, in the dialect's own section.  Kept apart from
@@ -2090,6 +2103,7 @@ pub(crate) fn build_dwarf_info_sections(
                 address_size,
                 has_declarator_rows,
                 location_lists: &mut location_lists,
+                unit_start: start,
             },
             functions,
             sections,
@@ -2126,6 +2140,16 @@ pub(crate) fn build_dwarf_info_sections(
     let unit_length = length32((info.len() - start - 4) as u64, "unit")?;
     info[start..start + 4].copy_from_slice(&unit_length.to_le_bytes());
     let (loc, loclists) = location_lists.finish()?;
+    // The contribution length includes its own 4-byte length field, which is
+    // what GCC 16.2 writes here (measured: 266 for a 266-byte `.debug_info`).
+    let contribution = u64::try_from(info.len() - start)
+        .map_err(|_| "DWARF unit length exceeds 64 bits".to_string())?;
+    let pubnames = build_pubnames_table(
+        ".debug_pubnames", &dies.pubnames, start as u64, contribution, abs32,
+    )?;
+    let pubtypes = build_pubnames_table(
+        ".debug_pubtypes", &dies.pubtypes, start as u64, contribution, abs32,
+    )?;
     Ok(Some(DwarfInfoBuild {
         info: debug_section(".debug_info", info, relocs),
         abbrev: debug_section(".debug_abbrev", dies.abbrev, Vec::new()),
@@ -2133,6 +2157,8 @@ pub(crate) fn build_dwarf_info_sections(
         ranges: build_debug_ranges(config, &code, address_size, abs_addr)?,
         loc,
         loclists,
+        pubnames,
+        pubtypes,
     }))
 }
 
@@ -2157,6 +2183,9 @@ struct SubprogramSink<'a, 's, 'f> {
     address_size: usize,
     has_declarator_rows: bool,
     location_lists: &'a mut LocationLists,
+    /// Where the unit starts in `info`, so a `.debug_pubnames` entry is
+    /// unit-relative exactly like every other offset this writer emits.
+    unit_start: usize,
 }
 
 /// Every function of the unit, as `DW_TAG_subprogram` DIEs in address order.
@@ -2353,6 +2382,15 @@ fn emit_subprograms(
             &abbrevs.subprogram
         };
         let abbrev_code = shape[usize::from(known.is_none())][usize::from(function.external)];
+        if config.pubnames {
+            // Only functions this object *defines* reach here: `members` is
+            // filtered to non-zero size inside a covered section, which is the
+            // same condition GCC 16.2 uses (measured: an `extern` declaration
+            // is absent from its table).
+            let offset = u64::try_from(sink.info.len() - sink.unit_start)
+                .map_err(|_| "DWARF pubnames offset exceeds 64 bits".to_string())?;
+            sink.dies.pubnames.push((offset, function.name.to_string()));
+        }
         write_uleb128(abbrev_code, sink.info);
         write_string_attribute(
             function.name,
@@ -2869,6 +2907,19 @@ struct DieWriter {
     /// `(position, type index)` for every `DW_AT_type` written, patched once
     /// every type offset is known.
     patches: Vec<(usize, u32)>,
+    /// `-gpubnames` entries: `(DIE offset relative to the unit, name)`, in
+    /// emission order.  Emission is sequential, so the vector is already
+    /// ascending by offset and needs no sort -- and a consumer reads the table
+    /// as a set (GDB and elfutils both build a name map), so ordering by name
+    /// would cost compile time and buy no lookup.
+    ///
+    /// Collected at exactly three unit-level sites -- the type table, the
+    /// file-scope variables and the subprograms -- so a local, a formal
+    /// parameter or a struct member can never be indexed by accident.  That is
+    /// a structural property, not a filter that a later edit could weaken.
+    pubnames: Vec<(u64, String)>,
+    /// `-gpubtypes` entries, same shape and same guarantee.
+    pubtypes: Vec<(u64, String)>,
 }
 
 impl DieWriter {
@@ -2879,6 +2930,8 @@ impl DieWriter {
             next_code,
             type_offsets: vec![None; types],
             patches: Vec::new(),
+            pubnames: Vec::new(),
+            pubtypes: Vec::new(),
         }
     }
 
@@ -3061,6 +3114,11 @@ fn emit_types(ctx: &mut DieContext<'_, '_>, spec: &DwarfUnitSpec) -> Result<(), 
         if let Some(slot) = ctx.writer.type_offsets.get_mut(index) {
             *slot = Some(offset);
         }
+        if ctx.config.pubnames {
+            if let Some(name) = ty.pubtype_name() {
+                ctx.writer.pubtypes.push((offset, name.to_string()));
+            }
+        }
         emit_type(ctx, spec, ty)?;
     }
     Ok(())
@@ -3236,6 +3294,21 @@ fn emit_type(
             }
             ctx.write(DW_TAG_ENUMERATION_TYPE, true, &attrs)?;
             for (name, value) in enumerators {
+                if ctx.config.pubnames {
+                    // An enumerator is a file-scope named constant, and both
+                    // oracles publish it in `.debug_pubnames` (measured: GCC
+                    // 16.2 and Clang 23.1.5 both list RED/GREEN/BLUE for the
+                    // same probe).  Omitting it would make `break`/`print RED`
+                    // fall back to a full unit walk on a large program, which
+                    // is exactly the cost this table exists to remove.
+                    //
+                    // This is the one nested tag the index publishes, and it is
+                    // safe by construction: an enumerator's parent is always an
+                    // enumeration type, never a scope with storage.
+                    let offset = u64::try_from(ctx.info.len() - ctx.unit_start)
+                        .map_err(|_| "DWARF pubnames offset exceeds 64 bits".to_string())?;
+                    ctx.writer.pubnames.push((offset, name.clone()));
+                }
                 ctx.write(
                     DW_TAG_ENUMERATOR,
                     false,
@@ -3519,6 +3592,15 @@ fn emit_variables(
         // also be a *relocation* against a symbol the object does not define, and
         // the link would fail on it -- measured: GCC 16.2 keeps the DIE and drops
         // the location for an unused static at `-O2`.
+        if ctx.config.pubnames && !variable.declaration {
+            // GCC 16.2 omits a declared-only object even when the unit uses it
+            // (measured: `extern int ext_var; int f(void){return ext_var;}`
+            // publishes `f` and not `ext_var`), because there is no definition
+            // here for a consumer to find.
+            let offset = u64::try_from(ctx.info.len() - ctx.unit_start)
+                .map_err(|_| "DWARF pubnames offset exceeds 64 bits".to_string())?;
+            ctx.writer.pubnames.push((offset, variable.name.clone()));
+        }
         ctx.write(DW_TAG_VARIABLE, false, &attrs)?;
     }
     Ok(())
@@ -3571,6 +3653,72 @@ fn spec_type_size(spec: &DwarfUnitSpec, index: u32) -> Option<u64> {
 /// deletes bytes (RISC-V relaxation), so a range would be slightly too long and
 /// would claim code that belongs to the next unit: an address map that is wrong
 /// is worse than the scan a consumer falls back to.  `labels` is that case.
+/// One `-gpubnames` accelerator table (`.debug_pubnames` or `.debug_pubtypes`).
+///
+/// The shape is GCC 16.2's exactly, measured on `-g -gpubnames` objects: a
+/// 32-bit unit length, version 2, a 32-bit `.debug_info` offset carrying one
+/// relocation against that section, the 32-bit length of the unit's
+/// contribution, then `(offset, NUL-terminated name)` pairs and a zero word.
+/// The version stays 2 for every DWARF dialect -- GCC 16.2 emits version 2
+/// tables even under `-gdwarf-5` (measured), and elfutils/GDB read exactly that.
+///
+/// A unit with no publishable name produces no section: an empty table would
+/// only give a consumer a header to skip, and `-gpubnames` on a unit that
+/// defines nothing must not grow the object.
+///
+/// Every width conversion is checked.  A name containing NUL would silently
+/// truncate the entry and shift every following one, so it is an error rather
+/// than a byte copied into the table.
+fn build_pubnames_table(
+    section: &str,
+    entries: &[(u64, String)],
+    info_offset: u64,
+    contribution: u64,
+    abs32: u32,
+) -> Result<Option<ObjSection>, String> {
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    // A name may appear once: two file-scope entities cannot share a spelling
+    // in C, so a repeat means the writer indexed something it should not have
+    // (a block-scope enumerator lifted to unit scope, say).  GCC 16.2 emits
+    // duplicates for tentative definitions -- 26 wasted bytes in a 247-byte
+    // table, measured -- and an ambiguous index entry resolves a name to
+    // whichever DIE the consumer saw last.  Refusing is the honest answer, and
+    // it matches how this writer already treats an unmarked type reference.
+    let mut seen: FxHashMap<&str, ()> = FxHashMap::default();
+    for (_, name) in entries {
+        if seen.insert(name.as_str(), ()).is_some() {
+            return Err(format!(
+                "internal: DWARF {section} would publish {name:?} twice"
+            ));
+        }
+    }
+    let mut data = Vec::new();
+    let mut relocs = Vec::new();
+    data.extend_from_slice(&[0; 4]); // unit_length, patched below
+    data.extend_from_slice(&2u16.to_le_bytes()); // version: 2 in every dialect
+    push_reloc(&mut data, &mut relocs, abs32, 4, ".debug_info", info_offset)?;
+    let contribution32 = u32::try_from(contribution)
+        .map_err(|_| format!("DWARF {section}: unit contribution exceeds 32 bits"))?;
+    data.extend_from_slice(&contribution32.to_le_bytes());
+    for (offset, name) in entries {
+        if name.as_bytes().contains(&0) {
+            return Err(format!("DWARF pubnames name contains a NUL byte: {name:?}"));
+        }
+        let offset32 = u32::try_from(*offset)
+            .map_err(|_| format!("DWARF {section}: DIE offset exceeds 32 bits"))?;
+        data.extend_from_slice(&offset32.to_le_bytes());
+        data.extend_from_slice(name.as_bytes());
+        data.push(0);
+    }
+    data.extend_from_slice(&0u32.to_le_bytes()); // end of table
+    let length = u32::try_from(data.len() - 4)
+        .map_err(|_| format!("DWARF {section} table exceeds 32 bits"))?;
+    data[..4].copy_from_slice(&length.to_le_bytes());
+    Ok(Some(debug_section(section, data, relocs)))
+}
+
 fn build_debug_aranges(
     info_offset: u64,
     code: &[&DwarfSectionInfo<'_>],

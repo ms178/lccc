@@ -271,6 +271,38 @@ fn remap_of(remap: &[u32], index: u32) -> u32 {
 }
 
 impl DwarfType {
+    /// The name `.debug_pubtypes` publishes for this type, or `None` when a
+    /// consumer could not look the type up by name.
+    ///
+    /// Every rule here is measured on GCC 16.2 with `-g -gpubnames`, one probe
+    /// per rule (`tests/regression/check_dwarf_pubnames.py` pins them):
+    ///
+    /// * base types are published under their source spelling (`int`,
+    ///   `long unsigned int`), because that is what `ptype` accepts;
+    /// * a `struct`/`union`/`enum` is published only when it is *complete* --
+    ///   `struct declared_only;` is absent from GCC's table even when a global
+    ///   pointer uses it, because the definition a consumer wants lives in
+    ///   another unit;
+    /// * an anonymous record has no name to publish;
+    /// * a typedef is published: `ptype ulong` must find it;
+    /// * pointer, qualified, array and subroutine types are not published --
+    ///   they have no name a user can spell, and GCC lists none of them;
+    /// * enumerators are values, not types, and belong to neither table.
+    pub(crate) fn pubtype_name(&self) -> Option<&str> {
+        match self {
+            Self::Base { kind, .. } => Some(kind.spelling()),
+            Self::Typedef { name, .. } => Some(name.as_str()),
+            Self::Record { name, complete, .. } | Self::Enum { name, complete, .. } => {
+                if *complete { name.as_deref() } else { None }
+            }
+            Self::Pointer { .. }
+            | Self::Qualified { .. }
+            | Self::Array { .. }
+            | Self::Subroutine { .. }
+            | Self::Unspecified { .. } => None,
+        }
+    }
+
     /// Every type this one names, for the reachability walk in
     /// [`DwarfUnitSpec::with_referenced`].
     fn children(&self) -> Vec<u32> {

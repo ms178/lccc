@@ -95,10 +95,17 @@ the evidence. Re-oracle and check gzip `longest_match` stack-mem after
 
 ## Environment / process
 
-26. Build: `scripts/build_lccc_o1_j2.sh` → `target/fastbuild/lccc`
-    (fastbuild, `-O1`, `-j 2`, foreground — lower parallelism on the
-    4 GiB no-swap VM OOM-kills less). Swap: `scripts/ensure_swap.sh` on
-    2 GiB VMs (needs CAP_SYS_ADMIN; otherwise rely on `-j2`).
+26. Build: `scripts/build_lccc_fast.sh` → `target/fastbuild/lccc`
+    (the `fastbuild` Cargo profile: `-O1`, LTO off, incremental, `-j 2`,
+    warnings denied — lower parallelism on the 4 GiB VM OOM-kills less).
+    **Not `build_lccc_o1_j2.sh`**: that script builds the *release* profile
+    with thin LTO into `target/release/`, which is the ship-quality binary and
+    a ~14 min non-incremental rebuild on this host. This rule used to name it
+    while claiming it produced `target/fastbuild/lccc`; the mismatch sent
+    agents into a thin-LTO build and then every gate that reads
+    `target/fastbuild/lccc` failed on a missing file (measured 2026-11-06).
+    Swap: `scripts/ci_enable_swap.sh` (4 GiB, rootless-capable);
+    `scripts/ensure_swap.sh` on 2 GiB VMs (needs CAP_SYS_ADMIN).
     `.cargo/config.toml` defaults to gcc/bfd — no linker environment
     overrides are needed anymore; do not reintroduce clang/mold pins
     (mold/wild are differential test oracles only, see
@@ -125,6 +132,25 @@ the evidence. Re-oracle and check gzip `longest_match` stack-mem after
     change and an allocator demotion rule is base-dependent by construction.
     Amplify to >=200 ms/arm before believing any ratio. See
     `engineering/evidence/ra-web-inloop-use-2026-09-11/`.
+
+31. **NEVER write a package payload onto the live root.** `dpkg-deb -x … /`,
+    `dpkg -i/--unpack`, `dpkg --add-architecture i386`, unaudited
+    `apt-get install libc6-dev-i386 gcc-multilib lib32*`, `tar -C /`, and
+    `cp -a … /usr/` are forbidden in this workspace. On a usr-merged root the
+    biarch payload replaces `/lib -> usr/lib` and `/lib64 -> usr/lib64` with
+    i386 trees; `/lib64/ld-linux-x86-64.so.2` vanishes and **every** subsequent
+    `execve` fails, including the tools needed to repair the machine. This
+    happened in three separate sessions through three different scripts, one
+    of them the post-wipe "environment recovery" script. Use
+    `scripts/ensure_i386_multilib_safe.sh` (offline `.deb` staging into
+    `/var/tmp/lccc-i686-sysroot`, extracted through the fail-closed user-namespace
+    jail in `scripts/rootfs_jail.sh`, then `source <sysroot>/env.sh`): it gives
+    **identical** 32-bit compile/link/run coverage for C *and* C++ with zero
+    live-root writes, measured at ~1.4 s for 12 packages. Any genuinely
+    required live-root write in a disposable CI container must carry
+    `# rootfs-write-policy: allow(<reason>)` and is inventoried by
+    `scripts/check_rootfs_write_policy.py`, which gates both CI paths.
+    See `docs/I386-MULTILIB-SAFETY.md`.
 
 ## Kill switches (bisection / soundness fallback)
 

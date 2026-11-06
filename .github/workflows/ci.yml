@@ -1053,6 +1053,11 @@ jobs:
         --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv \
         --gcc gcc-16 --gdb gdb --json "$RUNNER_TEMP/dwarf-delivery.json"
         run_gate dwarf_quality_selftest python3 tests/regression/check_dwarf_quality.py --self-test
+        run_gate dwarf_pubnames_selftest python3 tests/regression/check_dwarf_pubnames.py --self-test
+        run_gate dwarf_pubnames python3 tests/regression/check_dwarf_pubnames.py \
+        --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 \
+        --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv \
+        --gcc gcc-16 --gdb gdb --json "$RUNNER_TEMP/dwarf-pubnames.json"
         run_gate dwarf_parameters_selftest python3 tests/regression/check_dwarf_parameters.py --self-test
         run_gate dwarf_parameters python3 tests/regression/check_dwarf_parameters.py \
         --lccc target/fastbuild/lccc --gcc gcc-16 --gdb gdb \
@@ -2733,6 +2738,13 @@ jobs:
         # into one is valid YAML that dies with exit 127 on the runner
         # and silently skips every gate sequenced after it.
         python3 scripts/check_ci_workflow_shell.py
+        # Static live-root write policy: `dpkg-deb -x <biarch>.deb /` on a
+        # usr-merged root replaces /lib -> usr/lib and makes every execve fail.
+        # Three sessions died that way through three different scripts, so the
+        # pattern is a build failure now. The detector self-test runs first:
+        # a scanner that silently stopped matching would be worse than none.
+        python3 scripts/check_rootfs_write_policy.py --self-test
+        python3 scripts/check_rootfs_write_policy.py
         bash tests/regression/check_machinst_fallback_replay.sh
         # Artifact and lane-mode contracts, static: a job that downloads BARE
         # compiler binaries must restore their executable bit (upload-artifact
