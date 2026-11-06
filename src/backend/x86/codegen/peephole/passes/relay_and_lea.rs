@@ -8277,6 +8277,9 @@ mod tests {
     /// marks real instructions as known — and silently decline the fold.
     #[test]
     fn latch_fold_settled_by_dataflow_when_family_reused_in_loop() {
+        // Pins the latch fold on the %rbx counter; the Phase 6 scratch
+        // rename would move it into %r10.
+        let _skip = super::super::test_skips::skip_passes(&["scratch_rename"]);
         let out = run(concat!(
             "shift_half:\n",
             ".cfi_startproc\n",

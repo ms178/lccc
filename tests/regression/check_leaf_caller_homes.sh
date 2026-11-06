@@ -21,6 +21,14 @@
 #      the policy engages, it just cannot conjure registers that do not exist;
 #   2. `CCC_NO_LEAF_CALLER_HOME=1` restores the callee-saved shape — the kill
 #      switch still isolates the policy for A/B runs;
+#   2b. after allocation, the late peephole moves a call-free leaf's saved
+#      values into scratch registers its final text never names
+#      (`callee_saves::rename_saved_values_into_free_scratch`), so the full
+#      pipeline leaves the pressured leaf with no callee-saved register and
+#      no push/pop at all, and with the allocator policy off it still never
+#      ends with MORE saved registers than the allocator chose. Arms 1b and 2
+#      measure the allocator alone and therefore skip that pass
+#      (`CCC_PEEPHOLE_SKIP=scratch_rename`);
 #   3. the same loop wrapped around a call DOES preserve its state in
 #      callee-saved registers (the policy must not leak into non-leaves);
 #   4. every arm prints gcc's own output, so a policy that changes behaviour
@@ -183,18 +191,36 @@ census leaf_light "$work/leaf_light.s"
 
 # ---- 1b: a leaf past the pool still improves ---------------------------
 run_both "$work/leaf.c" leaf
-callee_wide=$(callee_refs "$work/leaf.s")
-CCC_NO_LEAF_CALLER_HOME=1 "$CCC" -O2 -S -o "$work/leaf_wide_nop.s" "$work/leaf.c" \
+CCC_PEEPHOLE_SKIP=scratch_rename "$CCC" -O2 -S -o "$work/leaf_alloc.s" "$work/leaf.c" \
+    || bad "allocator-only -S failed"
+callee_wide=$(callee_refs "$work/leaf_alloc.s")
+CCC_NO_LEAF_CALLER_HOME=1 CCC_PEEPHOLE_SKIP=scratch_rename \
+    "$CCC" -O2 -S -o "$work/leaf_wide_nop.s" "$work/leaf.c" \
     || bad "wide kill-switch -S failed"
 callee_wide_no=$(callee_refs "$work/leaf_wide_nop.s")
-census leaf "$work/leaf.s"
+census leaf_alloc "$work/leaf_alloc.s"
 census leaf_nop "$work/leaf_wide_nop.s"
 [ "$callee_wide" -lt "$callee_wide_no" ] \
     && ok "a leaf past the pool still takes fewer callee-saved homes ($callee_wide < $callee_wide_no)" \
     || bad "the leaf policy did nothing under pressure ($callee_wide vs $callee_wide_no)"
 
+# ---- 2b: the late scratch rename finishes the job ----------------------
+census leaf "$work/leaf.s"
+callee_final=$(callee_refs "$work/leaf.s")
+push_final=$(pushes "$work/leaf.s")
+[ "$callee_final" -eq 0 ] && [ "$push_final" -eq 0 ] \
+    && ok "the full pipeline leaves the pressured leaf no callee-saved register and no push/pop" \
+    || bad "the pressured leaf keeps $callee_final callee-saved reference(s) and $push_final push/pop"
+CCC_NO_LEAF_CALLER_HOME=1 "$CCC" -O2 -S -o "$work/leaf_nop_renamed.s" "$work/leaf.c" \
+    || bad "kill-switch (renamed) -S failed"
+callee_nop_renamed=$(callee_refs "$work/leaf_nop_renamed.s")
+[ "$callee_nop_renamed" -le "$callee_wide_no" ] \
+    && ok "the rename never adds a saved register ($callee_nop_renamed <= $callee_wide_no with the policy off)" \
+    || bad "the rename added saved registers ($callee_nop_renamed > $callee_wide_no)"
+
 # ---- 2: the kill switch still isolates the policy ----------------------
-CCC_NO_LEAF_CALLER_HOME=1 "$CCC" -O2 -S -o "$work/leaf_nop.s" "$work/leaf.c" \
+CCC_NO_LEAF_CALLER_HOME=1 CCC_PEEPHOLE_SKIP=scratch_rename \
+    "$CCC" -O2 -S -o "$work/leaf_nop.s" "$work/leaf.c" \
     || bad "kill-switch -S failed"
 callee_no=$(callee_refs "$work/leaf_nop.s")
 [ "$callee_no" -ge 1 ] && ok "CCC_NO_LEAF_CALLER_HOME restores the callee-saved shape ($callee_no refs)" \

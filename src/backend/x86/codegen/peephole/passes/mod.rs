@@ -974,6 +974,15 @@ fn peephole_optimize_inner(
                 changed |= c;
             }
         }
+        // Load straight into the register a whole-register copy fills from
+        // the loaded one (`movsd M, %xmmA; …; movapd %xmmA, %xmmB`).
+        if !sk("fp_load_retarget") {
+            {
+                let c = memory_fold::retarget_fp_load_into_copy(&mut store, &mut infos);
+                trace("retarget_fp_load_into_copy", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
         // Fold a single-use scalar FP load into an adjacent scalar FMA's
         // memory operand — any role the form algebra can put there (the
         // dot-product src2 shape is just the most common one).
@@ -1973,6 +1982,9 @@ fn peephole_optimize_inner(
             if !sk("fp_reg_mem_fold") {
                 changed2 |= memory_fold::fold_fp_register_loads(&mut store, &mut infos);
             }
+            if !sk("fp_load_retarget") {
+                changed2 |= memory_fold::retarget_fp_load_into_copy(&mut store, &mut infos);
+            }
             if !sk("fp_const_hoist") {
                 changed2 |= memory_fold::hoist_repeated_fp_constant_loads(&mut store, &mut infos);
             }
@@ -2147,6 +2159,9 @@ fn peephole_optimize_inner(
             if !sk("fp_reg_mem_fold") {
                 changed3 |= memory_fold::fold_fp_register_loads(&mut store, &mut infos);
             }
+            if !sk("fp_load_retarget") {
+                changed3 |= memory_fold::retarget_fp_load_into_copy(&mut store, &mut infos);
+            }
             changed3 |= local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos);
             changed3 |= local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos);
             if !sk("dead_regs") {
@@ -2256,10 +2271,18 @@ fn peephole_optimize_inner(
         vector_copy::fold_composed_dword_shuffles(&mut store, &mut infos);
     }
 
-    // Phase 6: Eliminate unused callee-saved register saves/restores.
+    // Phase 6: Eliminate unused callee-saved register saves/restores. A
+    // call-free function's still-used saved value first moves into a
+    // scratch register it never names (`scratch_rename`), making the save
+    // unused; renames whose save survives the elimination are reverted.
     if !skip_phase6 {
+        let renames = (!sk("scratch_rename"))
+            .then(|| callee_saves::rename_saved_values_into_free_scratch(&mut store, &mut infos));
         callee_saves::eliminate_unused_callee_saves(&mut store, &mut infos);
         callee_saves::eliminate_unused_callee_saves_fpo(&mut store, &mut infos);
+        if let Some(renames) = renames {
+            renames.revert_unprofitable(&mut store, &mut infos);
+        }
     }
 
     // Phase 7: Compact stack frames.
@@ -5971,6 +5994,9 @@ mod regression_tests {
     }
     #[test]
     fn fpo_dead_callee_save_is_dropped_and_cfa_rewritten() {
+        // The live %rbx/%r12 saves must survive for the CFA rewrite to be
+        // observable; the scratch rename would move both into %r11/%r10.
+        let _skip = super::test_skips::skip_passes(&["scratch_rename"]);
         let asm = concat!(
             "isort:\n",
             ".cfi_startproc\n",

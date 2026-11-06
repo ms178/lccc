@@ -286,40 +286,45 @@ impl RiscvCodegen {
         self.state.emit("    mv t1, t0");
         self.operand_to_t0(rhs);
         self.state.emit("    mv t2, t0");
+        self.emit_cmp_extend("t1", ty);
+        self.emit_cmp_extend("t2", ty);
+    }
 
+    /// Put a compare operand in `reg` into the rv64 form its compare type is
+    /// compared in: unsigned types zero-extended, signed types sign-extended
+    /// from their width; I64/U64/Ptr need nothing.
+    /// [`super::comparison::cmp_const_value`] models the same extension for
+    /// a constant operand.
+    pub(super) fn emit_cmp_extend(&mut self, reg: &str, ty: IrType) {
         match ty {
-            IrType::U8 => {
-                self.state.emit("    andi t1, t1, 0xff");
-                self.state.emit("    andi t2, t2, 0xff");
-            }
+            IrType::U8 => self
+                .state
+                .emit_fmt(format_args!("    andi {reg}, {reg}, 0xff")),
             IrType::U16 => {
-                self.state.emit("    slli t1, t1, 48");
-                self.state.emit("    srli t1, t1, 48");
-                self.state.emit("    slli t2, t2, 48");
-                self.state.emit("    srli t2, t2, 48");
+                self.state
+                    .emit_fmt(format_args!("    slli {reg}, {reg}, 48"));
+                self.state
+                    .emit_fmt(format_args!("    srli {reg}, {reg}, 48"));
             }
             IrType::U32 => {
-                self.state.emit("    slli t1, t1, 32");
-                self.state.emit("    srli t1, t1, 32");
-                self.state.emit("    slli t2, t2, 32");
-                self.state.emit("    srli t2, t2, 32");
+                self.state
+                    .emit_fmt(format_args!("    slli {reg}, {reg}, 32"));
+                self.state
+                    .emit_fmt(format_args!("    srli {reg}, {reg}, 32"));
             }
             IrType::I8 => {
-                self.state.emit("    slli t1, t1, 56");
-                self.state.emit("    srai t1, t1, 56");
-                self.state.emit("    slli t2, t2, 56");
-                self.state.emit("    srai t2, t2, 56");
+                self.state
+                    .emit_fmt(format_args!("    slli {reg}, {reg}, 56"));
+                self.state
+                    .emit_fmt(format_args!("    srai {reg}, {reg}, 56"));
             }
             IrType::I16 => {
-                self.state.emit("    slli t1, t1, 48");
-                self.state.emit("    srai t1, t1, 48");
-                self.state.emit("    slli t2, t2, 48");
-                self.state.emit("    srai t2, t2, 48");
+                self.state
+                    .emit_fmt(format_args!("    slli {reg}, {reg}, 48"));
+                self.state
+                    .emit_fmt(format_args!("    srai {reg}, {reg}, 48"));
             }
-            IrType::I32 => {
-                self.state.emit("    sext.w t1, t1");
-                self.state.emit("    sext.w t2, t2");
-            }
+            IrType::I32 => self.state.emit_fmt(format_args!("    sext.w {reg}, {reg}")),
             _ => {} // I64/U64/Ptr: no extension needed
         }
     }
@@ -930,6 +935,23 @@ impl ArchCodegen for RiscvCodegen {
         )
     }
 
+    /// `select(c, base + 1, base)` lowers to `seqz`/`snez` + `add[w]`
+    /// instead of a branch around a copy (`comparison.rs`).
+    fn supports_conditional_increment_select(&self) -> bool {
+        true
+    }
+
+    /// `addw` sign-extends, so the fused increment reproduces the unfused
+    /// `addw` + select only when Add and Select have one width: a U32 Add
+    /// under a 64-bit Select (zero-extended arms) stays a plain select.
+    fn accepts_conditional_increment_widths(
+        &self,
+        increment_ty: IrType,
+        select_ty: IrType,
+    ) -> bool {
+        increment_ty.size() == select_ty.size()
+    }
+
     fn emit_branch(&mut self, label: &str) {
         self.state.emit_fmt(format_args!("    jump {}, t6", label));
     }
@@ -1267,6 +1289,8 @@ impl ArchCodegen for RiscvCodegen {
         fn emit_int_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) => emit_int_cmp_impl;
         fn emit_fused_cmp_branch(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType, true_label: &str, false_label: &str) => emit_fused_cmp_branch_impl;
         fn emit_select(&mut self, dest: &Value, cond: &Operand, true_val: &Operand, false_val: &Operand, ty: IrType) => emit_select_impl;
+        fn emit_conditional_increment_select(&mut self, dest: &Value, cond: &Operand, base: &Operand, increment_on_true: bool, ty: IrType) => emit_conditional_increment_select_impl;
+        fn emit_fused_cmp_conditional_increment_select(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, cmp_ty: IrType, base: &Operand, increment_on_true: bool, dest: &Value, sel_ty: IrType) => emit_fused_cmp_conditional_increment_select_impl;
         // GNU C nested-function direct static-chain calls.
         fn emit_get_static_chain(&mut self, dest: &Value) => emit_get_static_chain_impl;
         fn emit_set_static_chain(&mut self, src: &Operand) => emit_set_static_chain_impl;

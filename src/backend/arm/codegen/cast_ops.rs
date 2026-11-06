@@ -13,36 +13,17 @@ impl ArmCodegen {
         match classify_cast(from_ty, to_ty) {
             CastKind::Noop | CastKind::UnsignedToSignedSameSize { .. } => {}
 
-            CastKind::FloatToSigned { from_f64 } => {
-                if from_f64 {
+            kind @ (CastKind::FloatToSigned { from_f64 }
+            | CastKind::FloatToUnsigned { from_f64, .. }) => {
+                let signed = matches!(kind, CastKind::FloatToSigned { .. });
+                let source = if from_f64 {
                     self.state.emit("    fmov d0, x0");
-                    self.state.emit("    fcvtzs x0, d0");
+                    "d0"
                 } else {
                     self.state.emit("    fmov s0, w0");
-                    self.state.emit("    fcvtzs x0, s0");
-                }
-                match to_ty {
-                    IrType::I8 => self.state.emit("    sxtb x0, w0"),
-                    IrType::I16 => self.state.emit("    sxth x0, w0"),
-                    IrType::I32 => self.state.emit("    sxtw x0, w0"),
-                    _ => {}
-                }
-            }
-
-            CastKind::FloatToUnsigned { from_f64, .. } => {
-                if from_f64 {
-                    self.state.emit("    fmov d0, x0");
-                    self.state.emit("    fcvtzu x0, d0");
-                } else {
-                    self.state.emit("    fmov s0, w0");
-                    self.state.emit("    fcvtzu x0, s0");
-                }
-                match to_ty {
-                    IrType::U8 => self.state.emit("    and x0, x0, #0xff"),
-                    IrType::U16 => self.state.emit("    and x0, x0, #0xffff"),
-                    IrType::U32 => self.state.emit("    mov w0, w0"),
-                    _ => {}
-                }
+                    "s0"
+                };
+                self.emit_fp_to_int_conversion(("x0", "w0"), source, to_ty, signed);
             }
 
             CastKind::SignedToFloat { to_f64, from_ty } => {
@@ -129,13 +110,61 @@ impl ArmCodegen {
         }
     }
 
+    /// Truncate the FP register `source` (an `sN`/`dN` name) toward zero into
+    /// the integer type `to_ty`, writing the GPR named by `(x, w)` in the
+    /// backend's register convention for that type (signed types
+    /// sign-extended, unsigned types zero-extended to 64 bits).
+    ///
+    /// Targets of at most 32 bits convert with the W form. `FCVTZS Wd` /
+    /// `FCVTZU Wd` saturate to the 32-bit range (Arm ARM C7.2, FCVTZS
+    /// (scalar, integer)) and the W write zeroes bits 63:32, so:
+    /// * `unsigned` needs nothing more (`fcvtzu w0, d0` replaces
+    ///   `fcvtzu x0, d0; mov w0, w0`);
+    /// * `int` keeps one `sxtw`, now of a value that saturates exactly like
+    ///   GCC's and Clang's `fcvtzs w0, d0` (`(int)3e9 == INT_MAX`; the X form
+    ///   produced `3000000000` and `sxtw` wrapped it to a negative number);
+    /// * 8/16-bit targets extend from the saturated 32-bit value, matching
+    ///   the C semantics the mainstream compilers implement for in-range
+    ///   values and their behavior on out-of-range ones.
+    ///
+    /// 64-bit targets (and pointers) use the X form unchanged.
+    pub(super) fn emit_fp_to_int_conversion(
+        &mut self,
+        (x, w): (&str, &str),
+        source: &str,
+        to_ty: IrType,
+        signed: bool,
+    ) {
+        let mnemonic = if signed { "fcvtzs" } else { "fcvtzu" };
+        if to_ty.size() > 4 {
+            self.state
+                .emit_fmt(format_args!("    {} {}, {}", mnemonic, x, source));
+            return;
+        }
+        self.state
+            .emit_fmt(format_args!("    {} {}, {}", mnemonic, w, source));
+        match to_ty {
+            IrType::I8 => self.state.emit_fmt(format_args!("    sxtb {}, {}", x, w)),
+            IrType::I16 => self.state.emit_fmt(format_args!("    sxth {}, {}", x, w)),
+            IrType::I32 => self.state.emit_fmt(format_args!("    sxtw {}, {}", x, w)),
+            IrType::U8 => self
+                .state
+                .emit_fmt(format_args!("    and {}, {}, #0xff", w, w)),
+            IrType::U16 => self
+                .state
+                .emit_fmt(format_args!("    and {}, {}, #0xffff", w, w)),
+            _ => {}
+        }
+    }
+
     /// Conversions with an operand in an FP register, register to register.
     /// The accumulator convention moves the value through x0 and d0 on both
     /// sides -- `(double)f` with both in FP homes was `fmov x0, d16; fmov s0,
     /// w0; fcvt d0, s0; fmov x0, d0; fmov d18, x0` for one `fcvt d18, s16`,
     /// and `(int)d` was `fmov x0, d16; fmov d0, x0; fcvtzs x0, d0` for one
-    /// `fcvtzs x0, d16`. Integer results keep the accumulator's 64-bit
-    /// conversion and narrowing (`emit_cast_instrs_impl`) bit for bit.
+    /// `fcvtzs x0, d16`. An integer result with a GPR home is converted
+    /// straight into that register (`fcvtzs x20, d16`, not `fcvtzs x0, d16;
+    /// mov x20, x0`); `emit_fp_to_int_conversion` owns the width rules.
     fn emit_fp_register_cast(
         &mut self,
         dest: &Value,
@@ -181,29 +210,28 @@ impl ArmCodegen {
                 self.store_float_reg(dest, to_ty, &target);
                 true
             }
-            CastKind::FloatToSigned { .. } | CastKind::FloatToUnsigned { .. } => {
+            kind @ (CastKind::FloatToSigned { .. } | CastKind::FloatToUnsigned { .. }) => {
                 let Some(phys) = src_fp else {
                     return false;
                 };
-                let signed = matches!(
-                    classify_cast(from_ty, to_ty),
-                    CastKind::FloatToSigned { .. }
-                );
-                self.state.emit_fmt(format_args!(
-                    "    {} x0, {}",
-                    if signed { "fcvtzs" } else { "fcvtzu" },
-                    arm_fp_name(phys, from_ty)
-                ));
-                match to_ty {
-                    IrType::I8 => self.state.emit("    sxtb x0, w0"),
-                    IrType::I16 => self.state.emit("    sxth x0, w0"),
-                    IrType::I32 => self.state.emit("    sxtw x0, w0"),
-                    IrType::U8 => self.state.emit("    and x0, x0, #0xff"),
-                    IrType::U16 => self.state.emit("    and x0, x0, #0xffff"),
-                    IrType::U32 => self.state.emit("    mov w0, w0"),
-                    _ => {}
+                let signed = matches!(kind, CastKind::FloatToSigned { .. });
+                let source = arm_fp_name(phys, from_ty);
+                // `dest_fp` is None here unless the allocator broke its own
+                // class rule; a GPR home takes the result directly and leaves
+                // the accumulator (and its cache entry) untouched.
+                let dest_gp = self
+                    .get_phys_reg_for_value(dest.0)
+                    .filter(|r| !is_arm_fp_phys(*r));
+                match dest_gp {
+                    Some(reg) => {
+                        let names = (callee_saved_name(reg), callee_saved_name_32(reg));
+                        self.emit_fp_to_int_conversion(names, &source, to_ty, signed);
+                    }
+                    None => {
+                        self.emit_fp_to_int_conversion(("x0", "w0"), &source, to_ty, signed);
+                        self.store_x0_to(dest);
+                    }
                 }
-                self.store_x0_to(dest);
                 true
             }
             _ => false,

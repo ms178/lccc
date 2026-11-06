@@ -1401,6 +1401,77 @@ fn loop_latch_data_in_the_loop_keeps_the_extension() {
     assert!(out.contains("movslq %r10d, %r10"), "{out}");
 }
 
+// ── dead in-place sign extension across control flow ────────────────────────
+
+/// `sum += 3*(long)a[i] + (long)(int)(a[i]*0.5)`: `cltq_relay` moved the
+/// 64-bit consumer onto `movslq %eax, %r11`, leaving a `cltq` whose widened
+/// bits nothing reads — the loop header and the exit both redefine `%rax`
+/// before any read. The scan reaches the latch `jl`; the CFG-aware liveness
+/// proves the family dead across it.
+#[test]
+fn a_cltq_dead_across_the_loop_latch_is_deleted() {
+    let out = run(&f(concat!(
+        "    xorl %r9d, %r9d\n",
+        ".LBB11:\n",
+        "    movsd (%rdi, %r9, 8), %xmm3\n",
+        "    cvttsd2sil %xmm3, %eax\n",
+        "    cltq\n",
+        "    movslq %eax, %r11\n",
+        "    addq %r11, %rsi\n",
+        "    addq $1, %r9\n",
+        "    cmpq %rdx, %r9\n",
+        "    jl .LBB11\n",
+        "    movq %rsi, %rax\n",
+        "    ret"
+    )));
+    assert_eq!(count(&out, "cltq"), 0, "{out}");
+    assert!(out.contains("movslq %eax, %r11"), "{out}");
+}
+
+/// A 64-bit read on the exit path, or at the top of the next iteration,
+/// observes the widened bits: the extension stays.
+#[test]
+fn a_cltq_whose_bits_a_successor_reads_stays() {
+    for body in [
+        concat!(
+            "    xorl %r9d, %r9d\n",
+            ".LBB11:\n",
+            "    movsd (%rdi, %r9, 8), %xmm3\n",
+            "    cvttsd2sil %xmm3, %eax\n",
+            "    cltq\n",
+            "    movslq %eax, %r11\n",
+            "    addq %r11, %rsi\n",
+            "    addq $1, %r9\n",
+            "    cmpq %rdx, %r9\n",
+            "    jl .LBB11\n",
+            "    addq %rax, %rsi\n",
+            "    movq %rsi, %rax\n",
+            "    ret"
+        ),
+        concat!(
+            "    xorl %r9d, %r9d\n",
+            "    xorl %eax, %eax\n",
+            ".LBB11:\n",
+            "    addq %rax, %rsi\n",
+            "    movsd (%rdi, %r9, 8), %xmm3\n",
+            "    cvttsd2sil %xmm3, %eax\n",
+            "    cltq\n",
+            "    movslq %eax, %r11\n",
+            "    addq %r11, %rsi\n",
+            "    addq $1, %r9\n",
+            "    cmpq %rdx, %r9\n",
+            "    jl .LBB11\n",
+            "    movq %rsi, %rax\n",
+            "    ret"
+        ),
+        // `ret` itself reads the full return register.
+        "    cvttsd2sil %xmm0, %eax\n    cltq\n    movl %eax, (%rdi)\n    ret",
+    ] {
+        let out = run(&f(body));
+        assert_eq!(count(&out, "cltq"), 1, "{body}:\n{out}");
+    }
+}
+
 // ── dead in-place zero-extension ────────────────────────────────────────────
 
 /// FreeType `ps_mask_set_bit` after its base copy is coalesced: the byte

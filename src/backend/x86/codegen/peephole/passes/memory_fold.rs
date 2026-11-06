@@ -18,13 +18,13 @@
 use super::super::types::*;
 use super::dead_writes::LabelRefs;
 use super::fma_forms::{FmaWidth, parse_scalar_fma};
-use super::fp_liveness::FpLiveness;
+use super::fp_liveness::{FpLiveness, has_implicit_vector_effects_line};
 use super::helpers::{
     implicit_read_reg_family, is_read_modify_write, is_rsp_shift_line, src_mentions_family,
     writes_family,
 };
 use super::liveness::{FileLiveness, call_window_verdict};
-use super::relay_and_lea::{LazyDeadness, split_two_operands};
+use super::relay_and_lea::{LazyDeadness, plain_gp_operand, split_two_operands};
 
 /// True when a line transfers control or merges paths, so that textual line
 /// order can diverge from execution order.  A load-value reader textually
@@ -185,6 +185,24 @@ pub(super) fn fold_fp_memory_operands(store: &mut LineStore, infos: &mut [LineIn
     changed
 }
 
+/// The scalar load (`movsd`/`movss`) whose value a legacy scalar FP→GPR
+/// conversion mnemonic reads: `movsd` for `cvt(t)sd2si`, `movss` for
+/// `cvt(t)ss2si`, with or without the `l`/`q` operand-size suffix (the
+/// unsuffixed spelling takes its width from the GPR, as the assembler does).
+/// `None` for every other mnemonic, including the VEX spellings (those are
+/// produced only after the peephole, by `vex_promote`).
+fn scalar_cvt_to_gp_load(op: &str) -> Option<&'static str> {
+    let base = op
+        .strip_suffix('l')
+        .or_else(|| op.strip_suffix('q'))
+        .unwrap_or(op);
+    match base {
+        "cvtsd2si" | "cvttsd2si" => Some("movsd"),
+        "cvtss2si" | "cvttss2si" => Some("movss"),
+        _ => None,
+    }
+}
+
 /// Fold a single-use scalar-FP register load into an adjacent scalar-FP
 /// arithmetic instruction (VEX 3-operand and legacy 2-operand forms).
 ///
@@ -210,6 +228,25 @@ pub(super) fn fold_fp_memory_operands(store: &mut LineStore, infos: &mut [LineIn
 /// The load and consumer must be adjacent, so no address register or memory
 /// state can change between them.  Source==destination is rejected because the
 /// removed load also supplies the destructive destination's old value.
+///
+/// The scalar FP→integer conversions (`cvttsd2si`/`cvtsd2si` after `movsd`,
+/// the `ss` forms after `movss`, any operand-size suffix) fold the same way:
+///
+/// ```text
+/// movsd (%rsi,%r9,8), %xmm2
+/// cvttsd2sil %xmm2, %edx
+///   ->
+/// cvttsd2sil (%rsi,%r9,8), %edx
+/// ```
+///
+/// Their memory form reads exactly the scalar the load read (SDM Vol. 2A
+/// CVTTSD2SI `xmm1/m64`, CVTTSS2SI `xmm1/m32`; no alignment requirement) and
+/// they write only the GPR, so there is no destructive destination to
+/// preserve. The folded form decodes to the same load + convert uops as the
+/// pair (one instruction and one XMM write fewer); GCC 16.2 and Clang 23.1.5
+/// both emit it. Deliberately NOT extended to `cvtss2sd`/`cvtsd2ss`/
+/// `sqrts[sd]`: their memory forms merge into the destination XMM register and
+/// would inherit a false dependency on its previous value.
 pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
@@ -249,28 +286,51 @@ pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInf
             i += 1;
             continue;
         };
-        let legal_op = match load_op {
-            "movsd" => matches!(
-                arith_op,
-                "vaddsd" | "vsubsd" | "vmulsd" | "vdivsd" | "addsd" | "subsd" | "mulsd" | "divsd"
-            ),
-            "movss" => matches!(
-                arith_op,
-                "vaddss" | "vsubss" | "vmulss" | "vdivss" | "addss" | "subss" | "mulss" | "divss"
-            ),
-            _ => false,
-        };
+        let to_gp = scalar_cvt_to_gp_load(arith_op) == Some(load_op);
+        let legal_op = to_gp
+            || match load_op {
+                "movsd" => matches!(
+                    arith_op,
+                    "vaddsd"
+                        | "vsubsd"
+                        | "vmulsd"
+                        | "vdivsd"
+                        | "addsd"
+                        | "subsd"
+                        | "mulsd"
+                        | "divsd"
+                ),
+                "movss" => matches!(
+                    arith_op,
+                    "vaddss"
+                        | "vsubss"
+                        | "vmulss"
+                        | "vdivss"
+                        | "addss"
+                        | "subss"
+                        | "mulss"
+                        | "divss"
+                ),
+                _ => false,
+            };
         if !legal_op {
             i += 1;
             continue;
         }
         let ops: Vec<&str> = arith_operands.split(',').map(str::trim).collect();
-        // VEX 3-operand form (dst == src2 required, and dst may not be the
-        // loaded register: the removed load also supplies the destructive
-        // destination's old value).  Legacy 2-operand form (mulsd/addsd/
-        // subsd/divsd and the *ss variants): src must be the loaded register
-        // and dst must differ from it for the same reason.
-        if arith_op.starts_with('v') {
+        // Conversion to a GPR: `cvt(t)s?2si %xmmS, %gpr` reads the loaded
+        // register once and writes only the GPR.  VEX 3-operand form (dst ==
+        // src2 required, and dst may not be the loaded register: the removed
+        // load also supplies the destructive destination's old value).
+        // Legacy 2-operand form (mulsd/addsd/subsd/divsd and the *ss
+        // variants): src must be the loaded register and dst must differ
+        // from it for the same reason.
+        if to_gp {
+            if ops.len() != 2 || ops[0] != src_reg || plain_gp_operand(ops[1]).is_none() {
+                i += 1;
+                continue;
+            }
+        } else if arith_op.starts_with('v') {
             if ops.len() != 3 || ops[0] != src_reg || ops[1] != ops[2] || ops[1] == src_reg {
                 i += 1;
                 continue;
@@ -314,6 +374,175 @@ pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInf
         i = j + 1;
     }
     changed
+}
+
+/// A load whose destination XMM register is copied whole to another XMM
+/// register a few instructions later, after which the loaded register is
+/// dead, loads into the copy's destination instead:
+///
+/// ```text
+/// movsd (%rdi,%r8,8), %xmm3          movapd %xmm2, %xmm1
+/// movapd %xmm2, %xmm1        ->      movsd (%rdi,%r8,8), %xmm2
+/// movapd %xmm3, %xmm2                maxsd %xmm1, %xmm2
+/// maxsd %xmm1, %xmm2
+/// ```
+///
+/// (the running-maximum loop; Clang 23.1.5 emits the right-hand shape). The
+/// allocator gave the load its own register and the loop-carried value a
+/// second one; the copy between them is one instruction per occurrence --
+/// 198 in 32 files of the GCC torture corpus at -O2, most of them a load
+/// staged into a temporary and then copied into an argument register.
+///
+/// Legal when, with `A` the loaded register, `B` the copy's destination and
+/// `M` the memory operand:
+/// 1. the load is a memory-source move that defines all of `A` the way the
+///    copy then defines `B` (`movs[sd]`/`movq`/`movd` zero the rest of the
+///    low 128 bits, the packed forms write all of it) and the copy is a
+///    whole-register `mov{a,u}p[sd]`/`movdq[au]` of the same encoding family
+///    (legacy SSE keeps bits 255:128 of the destination, VEX clears them, so
+///    the rewritten load must clear them exactly when the copy did);
+/// 2. up to three straight-line instructions separate them, none of which
+///    names `A`, accesses memory (a store could alias `M`, and moving the
+///    load past another access could reorder two observable accesses),
+///    orders memory (a fence), writes a register `M` addresses through, or
+///    is pinned; the load itself is not volatile;
+/// 3. `A` is dead after the copy ([`FpLiveness`], CFG-aware, including the
+///    upper regions of a VEX write).
+///
+/// `B` may be read in between (it still holds its old value until the copy's
+/// position, where the load now writes it) or written (the copy overwrote that
+/// write anyway).
+pub(super) fn retarget_fp_load_into_copy(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    const MAX_GAP: usize = 3;
+    let len = store.len();
+    let mut changed = false;
+    let mut lv: Option<FpLiveness> = None;
+    for i in 0..len {
+        if infos[i].is_nop() || infos[i].pinned || infos[i].volatile_access {
+            continue;
+        }
+        let load = infos[i].trimmed(store.get(i));
+        let Some((load_op, operands)) = load.split_once(' ') else {
+            continue;
+        };
+        let vex = match load_op {
+            "movsd" | "movss" | "movq" | "movd" | "movaps" | "movapd" | "movups" | "movupd"
+            | "movdqa" | "movdqu" => false,
+            "vmovsd" | "vmovss" | "vmovq" | "vmovd" | "vmovaps" | "vmovapd" | "vmovups"
+            | "vmovupd" | "vmovdqa" | "vmovdqu" => true,
+            _ => continue,
+        };
+        let Some((mem, a_reg)) = operands.rsplit_once(',') else {
+            continue;
+        };
+        let (mem, a_reg) = (mem.trim(), a_reg.trim());
+        let Some(a) = xmm_number(a_reg) else {
+            continue;
+        };
+        if !mem.contains('(') || mem.starts_with('$') {
+            continue;
+        }
+        // Families `M` addresses through (a segment override names none).
+        let addr_fams: Vec<RegId> = mem
+            .split('%')
+            .skip(1)
+            .map(|r| {
+                let name: String = r.chars().take_while(char::is_ascii_alphanumeric).collect();
+                register_family_fast(&format!("%{name}"))
+            })
+            .filter(|&f| f <= REG_GP_MAX)
+            .collect();
+        let mut gap = 0usize;
+        let mut k = i;
+        let copy = loop {
+            k = next_non_debug(store, infos, k + 1, len);
+            if k >= len || infos[k].is_barrier() || infos[k].pinned {
+                break None;
+            }
+            let t = infos[k].trimmed(store.get(k));
+            if let Some((copy_op, copy_ops)) = t.split_once(' ') {
+                let whole = matches!(
+                    copy_op.strip_prefix('v').unwrap_or(copy_op),
+                    "movaps" | "movapd" | "movups" | "movupd" | "movdqa" | "movdqu"
+                ) && copy_op.starts_with('v') == vex;
+                if whole {
+                    if let Some((src, dst)) = copy_ops.split_once(',') {
+                        let (src, dst) = (src.trim(), dst.trim());
+                        if xmm_number(src) == Some(a) {
+                            break xmm_number(dst).filter(|&b| b != a).map(|_| (k, dst));
+                        }
+                    }
+                }
+            }
+            // `vzeroall` (and every other implicit vector writer) names no
+            // operand yet zeroes `A` before the copy reads it: the original
+            // copy would deliver 0 where the retargeted load delivers `M`.
+            if gap == MAX_GAP
+                || mentions_xmm(t, a)
+                || has_implicit_vector_effects_line(t)
+                || touches_memory(t)
+                || addr_fams.iter().any(|&f| writes_family(&infos[k], t, f))
+            {
+                break None;
+            }
+            gap += 1;
+        };
+        let Some((j, b_reg)) = copy else {
+            continue;
+        };
+        let lv_ref = lv.get_or_insert_with(|| FpLiveness::new(store, infos));
+        if !lv_ref.deleted_write_regions_dead_after(store, infos, j, a, &[i, j]) {
+            continue;
+        }
+        let replacement = format!("    {load_op} {mem}, {b_reg}");
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[j], j, replacement);
+        lv_ref.refresh_at(store, infos, i);
+        changed = true;
+    }
+    changed
+}
+
+/// `n` of a plain `%xmmN` operand.
+fn xmm_number(operand: &str) -> Option<u32> {
+    operand
+        .strip_prefix("%xmm")?
+        .parse::<u32>()
+        .ok()
+        .filter(|&n| n < 32)
+}
+
+/// Whether `t` names `%xmmN`/`%ymmN`/`%zmmN` (any width of register `n`).
+fn mentions_xmm(t: &str, n: u32) -> bool {
+    ["%xmm", "%ymm", "%zmm"].iter().any(|bank| {
+        t.match_indices(bank).any(|(at, _)| {
+            let digits: String = t[at + bank.len()..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse::<u32>().ok() == Some(n)
+        })
+    })
+}
+
+/// Whether `t` may access or order memory: any memory operand (`lea`
+/// included, conservatively), an implicit access (string instructions,
+/// `xlat`, `maskmovdqu`, `enter`/`leave`, a `rep` prefix) or a fence.
+fn touches_memory(t: &str) -> bool {
+    let (mnemonic, operands) = t.split_once(' ').unwrap_or((t, ""));
+    let operands = operands.trim();
+    operands.contains('(')
+        || mnemonic.starts_with("rep")
+        || mnemonic.starts_with("lock")
+        || matches!(
+            mnemonic,
+            "mfence" | "lfence" | "sfence" | "xlat" | "xlatb" | "enter" | "leave" | "leaveq"
+        )
+        || mnemonic.contains("maskmov")
+        || operands.is_empty()
+            && ["movs", "stos", "lods", "scas", "cmps", "ins", "outs"]
+                .iter()
+                .any(|p| mnemonic.starts_with(p))
 }
 
 /// Fold stack-load-to-scratch relay moves: eliminate the scratch register
@@ -3918,6 +4147,76 @@ mod fp_reg_load_tests {
         assert_eq!(out[1], "vmulsd 32(%rsi), %xmm2, %xmm2", "{out:?}");
     }
 
+    /// `(int)a[i]` as GCC 16.2 and Clang 23.1.5 emit it: the scalar load
+    /// folds into the conversion's memory operand, for both precisions,
+    /// both destination widths, the truncating and the rounding form, and
+    /// the unsuffixed spelling (width from the GPR).
+    #[test]
+    fn folds_load_into_conversion_to_gpr() {
+        for (load, cvt, want) in [
+            (
+                "movsd (%rsi, %r9, 8), %xmm2",
+                "cvttsd2sil %xmm2, %edx",
+                "cvttsd2sil (%rsi, %r9, 8), %edx",
+            ),
+            // (`ret` may read %xmm0/%xmm1 as return registers, so the
+            // loaded register is chosen outside them.)
+            (
+                "movss 4(%rdi), %xmm5",
+                "cvttss2siq %xmm5, %rax",
+                "cvttss2siq 4(%rdi), %rax",
+            ),
+            (
+                "movsd (%rdi), %xmm6",
+                "cvtsd2si %xmm6, %rcx",
+                "cvtsd2si (%rdi), %rcx",
+            ),
+            (
+                "movss .LC0(%rip), %xmm4",
+                "cvtss2sil %xmm4, %r8d",
+                "cvtss2sil .LC0(%rip), %r8d",
+            ),
+        ] {
+            let (changed, out) = run(&format!("    {load}\n    {cvt}\n    ret\n"));
+            assert!(changed, "{load}; {cvt}: {out:?}");
+            assert_eq!(out, [want, "ret"], "{load}; {cvt}");
+        }
+    }
+
+    /// Every legality condition of the conversion fold, one shape each.
+    #[test]
+    fn conversion_fold_refusals() {
+        for (body, why) in [
+            (
+                "    movss (%rsi), %xmm2\n    cvttsd2sil %xmm2, %edx\n    ret\n",
+                "a 4-byte load cannot feed an 8-byte memory read",
+            ),
+            (
+                "    movsd (%rsi), %xmm2\n    cvttss2sil %xmm2, %edx\n    ret\n",
+                "an 8-byte load does not become a 4-byte memory read",
+            ),
+            (
+                "    movsd (%rsi), %xmm2\n    cvttsd2sil %xmm3, %edx\n    ret\n",
+                "the conversion must read the loaded register",
+            ),
+            (
+                "    movsd (%rsi), %xmm2\n    cvttsd2sil %xmm2, %edx\n    addsd %xmm2, %xmm0\n    ret\n",
+                "the loaded value is read again",
+            ),
+            (
+                "    movss (%rsi), %xmm2\n    cvtss2sd %xmm2, %xmm0\n    ret\n",
+                "cvtss2sd's memory form merges into the destination",
+            ),
+            (
+                "    movsd (%rsi), %xmm2\n    sqrtsd %xmm2, %xmm0\n    ret\n",
+                "sqrtsd's memory form merges into the destination",
+            ),
+        ] {
+            let (changed, out) = run(body);
+            assert!(!changed, "{why}: {out:?}");
+        }
+    }
+
     /// A BRANCH between the consumer and the pure overwrite invalidates the
     /// textual kill proof: the taken path reaches the reader past the merge
     /// with the LOADED value still in %xmm3, while the overwrite only runs
@@ -3932,6 +4231,174 @@ mod fp_reg_load_tests {
              \x20   vaddsd %xmm3, %xmm0, %xmm0\n\
              \x20   ret\n");
         assert!(!changed, "taken path reads the loaded value: {out:?}");
+    }
+}
+
+#[cfg(test)]
+mod fp_load_retarget_tests {
+    use super::super::super::types::classify_line;
+    use super::retarget_fp_load_into_copy;
+    use crate::backend::peephole_common::LineStore;
+
+    fn run(body: &str) -> (bool, Vec<String>) {
+        let asm = format!("f:\n.cfi_startproc\n{body}.cfi_endproc\n");
+        let mut store = LineStore::new(asm);
+        let n = store.len();
+        let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        let changed = retarget_fp_load_into_copy(&mut store, &mut infos);
+        let out: Vec<String> = (0..store.len())
+            .filter(|i| !infos[*i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .filter(|l| !l.starts_with(".cfi") && l != "f:")
+            .collect();
+        (changed, out)
+    }
+
+    /// The running-maximum loop: the element loads straight into the
+    /// loop-carried register once its old value has been copied out.
+    #[test]
+    fn the_running_maximum_loads_into_its_loop_register() {
+        let (changed, out) = run(concat!(
+            "    movsd (%rdi), %xmm2\n",
+            "    movl $1, %r8d\n",
+            ".LBB15:\n",
+            "    movsd (%rdi,%r8,8), %xmm3\n",
+            "    movapd %xmm2, %xmm1\n",
+            "    movapd %xmm3, %xmm2\n",
+            "    maxsd %xmm1, %xmm2\n",
+            "    addq $1, %r8\n",
+            "    cmpq %rsi, %r8\n",
+            "    jl .LBB15\n",
+            "    cvttsd2siq %xmm2, %rax\n",
+            "    ret\n",
+        ));
+        assert!(changed, "{out:?}");
+        let at = out.iter().position(|l| l == ".LBB15:").unwrap_or(0);
+        assert_eq!(
+            out[at + 1..at + 4],
+            [
+                "movapd %xmm2, %xmm1",
+                "movsd (%rdi,%r8,8), %xmm2",
+                "maxsd %xmm1, %xmm2"
+            ],
+            "{out:?}"
+        );
+    }
+
+    /// Adjacent pairs, every load form, both encodings (each family kept).
+    #[test]
+    fn every_load_form_retargets_within_its_encoding() {
+        for (load, copy, want) in [
+            (
+                "movsd 8(%rsi), %xmm9",
+                "movapd %xmm9, %xmm0",
+                "movsd 8(%rsi), %xmm0",
+            ),
+            (
+                "movss v+4(%rip), %xmm8",
+                "movaps %xmm8, %xmm0",
+                "movss v+4(%rip), %xmm0",
+            ),
+            (
+                "movq (%rdi), %xmm9",
+                "movdqa %xmm9, %xmm4",
+                "movq (%rdi), %xmm4",
+            ),
+            (
+                "movd 4(%rdi), %xmm10",
+                "movdqa %xmm10, %xmm5",
+                "movd 4(%rdi), %xmm5",
+            ),
+            (
+                "movups (%rdi), %xmm11",
+                "movaps %xmm11, %xmm6",
+                "movups (%rdi), %xmm6",
+            ),
+            (
+                "vmovss (%rdi), %xmm9",
+                "vmovaps %xmm9, %xmm0",
+                "vmovss (%rdi), %xmm0",
+            ),
+            (
+                "vmovsd %fs:16(%rax), %xmm12",
+                "vmovapd %xmm12, %xmm7",
+                "vmovsd %fs:16(%rax), %xmm7",
+            ),
+        ] {
+            let (changed, out) = run(&format!("    {load}\n    {copy}\n    ret\n"));
+            assert!(changed, "{load}; {copy}: {out:?}");
+            assert_eq!(out, [want, "ret"], "{load}; {copy}");
+        }
+    }
+
+    /// One shape per legality rule.
+    #[test]
+    fn every_legality_rule_blocks_the_retarget() {
+        for (body, why) in [
+            (
+                "    movsd (%rdi), %xmm9\n    vmovapd %xmm9, %xmm0\n    ret\n",
+                "a VEX copy clears bits 255:128 that a legacy load keeps",
+            ),
+            (
+                "    vmovsd (%rdi), %xmm9\n    movapd %xmm9, %xmm0\n    ret\n",
+                "a legacy copy keeps bits 255:128 that a VEX load clears",
+            ),
+            (
+                "    movsd (%rdi), %xmm9\n    movapd %xmm9, %xmm0\n    addsd %xmm9, %xmm0\n    ret\n",
+                "the loaded register is read after the copy",
+            ),
+            (
+                "    movsd (%rdi), %xmm9\n    addsd %xmm9, %xmm1\n    movapd %xmm9, %xmm0\n    ret\n",
+                "the loaded register is read before the copy",
+            ),
+            (
+                "    movsd (%rdi), %xmm9\n    movl $0, (%rsi)\n    movapd %xmm9, %xmm0\n    ret\n",
+                "a store in between may alias the load",
+            ),
+            (
+                "    movsd (%rdi), %xmm9\n    movl (%rsi), %eax\n    movapd %xmm9, %xmm0\n    ret\n",
+                "two loads would swap",
+            ),
+            (
+                "    movsd (%rdi), %xmm9\n    addq $8, %rdi\n    movapd %xmm9, %xmm0\n    ret\n",
+                "the address register changes in between",
+            ),
+            (
+                "    movsd 8(%rsp), %xmm9\n    subq $8, %rsp\n    movapd %xmm9, %xmm0\n    ret\n",
+                "the stack pointer the address uses changes in between",
+            ),
+            (
+                "    movsd (%rdi), %xmm9\n    mfence\n    movapd %xmm9, %xmm0\n    ret\n",
+                "a fence orders the load",
+            ),
+            (
+                "    movsd (%rdi), %xmm9\n    jne .L1\n    movapd %xmm9, %xmm0\n.L1:\n    ret\n",
+                "control flow in between",
+            ),
+            (
+                "    movsd (%rdi), %xmm9\n    movl %eax, %ecx\n    movl %eax, %edx\n    movl %eax, %r8d\n    movl %eax, %r9d\n    movapd %xmm9, %xmm0\n    ret\n",
+                "more than three instructions in between",
+            ),
+            (
+                "    movsd (%rdi), %xmm9\n    movsd %xmm9, %xmm0\n    ret\n",
+                "a register-to-register movsd merges, it is not a whole copy",
+            ),
+            (
+                "    movapd %xmm1, %xmm9\n    movapd %xmm9, %xmm0\n    ret\n",
+                "not a load",
+            ),
+            (
+                "    vmovsd (%rdi), %xmm9\n    vzeroall\n    vmovapd %xmm9, %xmm0\n    ret\n",
+                "vzeroall zeroes the loaded register before the copy reads it",
+            ),
+            (
+                "    vmovsd (%rdi), %xmm9{%k1}{z}\n    vmovapd %xmm9, %xmm0\n    ret\n",
+                "a masked load is a merge, not a whole-register definition",
+            ),
+        ] {
+            let (changed, out) = run(body);
+            assert!(!changed, "{why}: {out:?}");
+        }
     }
 }
 

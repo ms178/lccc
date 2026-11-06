@@ -2862,6 +2862,20 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
         false
     }
 
+    /// Whether a conditional increment whose Add is `increment_ty` may
+    /// replace a Select of type `select_ty` (asked only when
+    /// [`Self::supports_conditional_increment_select`] holds). The generic
+    /// detector admits a U32 Add under a wider Select, which a backend
+    /// whose 32-bit add zero-extends (AArch64 `W` writes) reproduces
+    /// exactly; one whose 32-bit add sign-extends must decline it.
+    fn accepts_conditional_increment_widths(
+        &self,
+        _increment_ty: IrType,
+        _select_ty: IrType,
+    ) -> bool {
+        true
+    }
+
     /// Emit the SSA-proven conditional-increment select. Called only when the
     /// Add result has one use and the opposite Select arm is exactly its base.
     fn emit_conditional_increment_select(

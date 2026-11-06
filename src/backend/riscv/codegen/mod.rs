@@ -18,3 +18,6 @@ pub(crate) mod peephole;
 mod prologue;
 mod returns;
 mod variadic;
+
+pub(crate) use alu::mul_needs_no_constant;
+pub(crate) use comparison::cmp_needs_no_register;

@@ -674,6 +674,23 @@ pub fn filter_available_regs(callee_saved: &[PhysReg], asm_clobbered: &[PhysReg]
     available
 }
 
+/// Whether `func` leaves through a nonlocal `goto` -- a nested function
+/// jumping to a `__label__` of its parent.  The jump restores the parent's
+/// frame and stack pointers and abandons this function's epilogue, so a
+/// callee-saved register it homed a value in is never restored: the
+/// parent's own caller then finds it clobbered (torture execute/pr24135.c at
+/// -O1 on AArch64 and RISC-V, where `x.y` homed its argument in x19/s1 and
+/// `main` kept a loop counter there).  Such a function takes no callee-saved
+/// homes; the x86-64 prologue applies the same rule.
+pub fn leaves_through_nonlocal_goto(func: &IrFunction) -> bool {
+    func.blocks.iter().any(|block| {
+        block
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst, Instruction::NonlocalGoto { .. }))
+    })
+}
+
 // ── Utility ───────────────────────────────────────────────────────────────
 
 /// Per-function index from parameter ordinal to its authoritative home

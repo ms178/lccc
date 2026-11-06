@@ -467,6 +467,10 @@ impl X86Codegen {
             }
         }
 
+        if self.try_emit_fp_to_int_into_home(dest, src, from_ty, to_ty) {
+            return;
+        }
+
         // Scalar FP casts: stage FP sources directly in XMM registers and keep
         // FP results in the SSE domain instead of round-tripping through %rax.
         if !is_i128_type(from_ty)
@@ -482,6 +486,67 @@ impl X86Codegen {
 
         // Fall through to default implementation for all other cases
         crate::backend::traits::emit_cast_default(self, dest, src, from_ty, to_ty);
+    }
+
+    /// `(int)x`, `(long)x` or `(unsigned)x` of a `float`/`double` whose
+    /// result has a general-register home: truncate straight into that
+    /// register, reading an XMM-homed source in place.
+    ///
+    /// The accumulator route was `cvttsd2sil %xmm0, %eax; cltq; movq %rax,
+    /// %r12` (plus a `movapd` when the source had its own XMM home). Now
+    /// that the allocator homes these results in GPRs (`cast_result_is_gpr`)
+    /// the conversion writes the home itself:
+    /// * `I32`: the 32-bit `cvtts[sd]2sil`, so NaN and out-of-range inputs
+    ///   still produce the integer indefinite `0x80000000` (the 64-bit form
+    ///   truncated to 32 bits would not), then the I32 home contract
+    ///   (`emit_sext32_for_value`) sign-extends only for wide readers;
+    /// * `I64` and pointers: `cvtts[sd]2siq`;
+    /// * `U32`: `cvtts[sd]2siq` (all of 0..2^32 needs the 64-bit form), then
+    ///   `movl` re-establishes the zero-extended image the accumulator path's
+    ///   `movl %eax, %eax` guaranteed.
+    ///
+    /// Sub-word targets and `U64` (whose >= 2^63 split needs %rcx and %xmm1)
+    /// keep the general path, as does every XMM-homed result.
+    fn try_emit_fp_to_int_into_home(
+        &mut self,
+        dest: &Value,
+        src: &Operand,
+        from_ty: IrType,
+        to_ty: IrType,
+    ) -> bool {
+        if !matches!(from_ty, IrType::F32 | IrType::F64)
+            || !matches!(to_ty, IrType::I32 | IrType::I64 | IrType::U32 | IrType::Ptr)
+        {
+            return false;
+        }
+        let Some(dest_phys) = self.dest_reg(dest) else {
+            return false;
+        };
+        if super::emit::is_xmm_reg(dest_phys) {
+            return false;
+        }
+        let cvt = if from_ty == IrType::F64 {
+            "cvttsd2si"
+        } else {
+            "cvttss2si"
+        };
+        // The source's own XMM register, or %xmm0 loaded from its home.
+        let source = self.fp_store_value_xmm(src, from_ty);
+        let d64 = super::emit::phys_reg_name(dest_phys);
+        let d32 = phys_reg_name_32(dest_phys);
+        if to_ty == IrType::I32 {
+            self.state
+                .emit_fmt(format_args!("    {cvt}l %{source}, %{d32}"));
+            self.emit_sext32_for_value(d32, d64, false, dest.0);
+        } else {
+            self.state
+                .emit_fmt(format_args!("    {cvt}q %{source}, %{d64}"));
+            if to_ty == IrType::U32 {
+                self.state.emit_fmt(format_args!("    movl %{d32}, %{d32}"));
+            }
+        }
+        self.note_inplace_compute(dest_phys, dest.0);
+        true
     }
 
     /// Try to emit an integer widening cast of a value whose home register
@@ -1508,6 +1573,63 @@ impl X86Codegen {
                 return false;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fp_to_int_home_tests {
+    use super::*;
+    use crate::backend::state::StackSlot;
+
+    /// Source Value(1) (F64 or F32), destination Value(9) in %r12.
+    fn convert(src_home: Option<u8>, from: IrType, to: IrType, wide: bool) -> String {
+        let mut cg = X86Codegen::new();
+        cg.state.value_use_counts = vec![1; 10];
+        match src_home {
+            Some(reg) => {
+                cg.reg_assignments.insert(1, PhysReg(reg));
+            }
+            None => {
+                cg.state.value_locations.insert(1, StackSlot(-8));
+            }
+        }
+        cg.reg_assignments.insert(9, PhysReg(2));
+        if wide {
+            cg.needs_sext_values.insert(9);
+        } else {
+            cg.skip_i32_sext = true;
+        }
+        cg.emit_cast_impl(&Value(9), &Operand::Value(Value(1)), from, to);
+        cg.state.out.buf.clone()
+    }
+
+    #[test]
+    fn fp_to_int_results_convert_straight_into_their_home() {
+        // XMM-homed source (PhysReg 20 = %xmm2), read in place.
+        let out = convert(Some(20), IrType::F64, IrType::I64, false);
+        assert!(out.contains("cvttsd2siq %xmm2, %r12"), "{out}");
+        assert!(!out.contains("%rax") && !out.contains("xmm0"), "{out}");
+        // I32 keeps the 32-bit form (integer indefinite 0x80000000) and
+        // extends only for wide readers.
+        let out = convert(Some(20), IrType::F64, IrType::I32, false);
+        assert!(out.contains("cvttsd2sil %xmm2, %r12d"), "{out}");
+        assert!(!out.contains("movslq"), "{out}");
+        let out = convert(Some(20), IrType::F64, IrType::I32, true);
+        assert!(out.contains("cvttsd2sil %xmm2, %r12d"), "{out}");
+        assert!(out.contains("movslq %r12d, %r12"), "{out}");
+        // U32 converts with the 64-bit form and re-zero-extends.
+        let out = convert(Some(21), IrType::F32, IrType::U32, false);
+        assert!(out.contains("cvttss2siq %xmm3, %r12"), "{out}");
+        assert!(out.contains("movl %r12d, %r12d"), "{out}");
+        // A slot-homed source is loaded into %xmm0 first.
+        let out = convert(None, IrType::F64, IrType::I64, false);
+        assert!(out.contains("movsd"), "{out}");
+        assert!(out.contains("cvttsd2siq %xmm0, %r12"), "{out}");
+        // U64 and sub-word targets keep the accumulator route.
+        let out = convert(Some(20), IrType::F64, IrType::U64, false);
+        assert!(out.contains("%rax"), "{out}");
+        let out = convert(Some(20), IrType::F64, IrType::I16, false);
+        assert!(out.contains("%eax"), "{out}");
     }
 }
 
