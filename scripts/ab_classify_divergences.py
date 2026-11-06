@@ -21,16 +21,26 @@ reproduces.  This harness therefore regenerates BOTH legs five times each:
 and accepts each benign class, so the classifier itself cannot be a rubber
 stamp.
 
+The two compiler legs are explicit arguments (or ``LCCC_AB_OLD`` /
+``LCCC_AB_NEW``), so a re-run can never silently classify against a stale
+baseline tree.  Exit status 1 is a red-team FLAG, not a tool error: it means at
+least one divergence was classified ``semantic-risk`` or ``nondeterministic``
+and needs a human, tool-backed attribution (see the PR body).  Exit 0 means
+every divergence was proven frame/register/label-only.
+
 Usage:
-  python3 scripts/ab_classify_divergences.py <ab-report.json> <out.json>
+  python3 scripts/ab_classify_divergences.py <ab-report.json> <out.json> \
+      --old <dir> --new <dir> [--repeats N]
   python3 scripts/ab_classify_divergences.py --self-test
 """
 from __future__ import annotations
 
+import argparse
 import collections
 import difflib
 import hashlib
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -40,8 +50,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from ab_param_home_index import directives
 
 SUITE = pathlib.Path("/home/user/.cache/lccc-gcc17/gcc/testsuite/gcc.c-torture")
-OLD = pathlib.Path("/home/user/lccc/target/fastbuild-baseline2/fastbuild")
-NEW = pathlib.Path("/home/user/lccc/target/fastbuild")
+DEFAULT_OLD = pathlib.Path("/home/user/lccc/target/fastbuild-baseline3/fastbuild")
+DEFAULT_NEW = pathlib.Path("/home/user/lccc/target/fastbuild")
+OLD = NEW = None  # bound in main(); never a silent stale constant
 BIN = {
     "x86_64": "lccc",
     "i686": "lccc-i686",
@@ -163,14 +174,29 @@ def self_test() -> int:
 
 
 def main() -> int:
+    global OLD, NEW, REPEATS
     if len(sys.argv) == 2 and sys.argv[1] == "--self-test":
         return self_test()
-    if len(sys.argv) != 3:
-        print("usage: ab_classify_divergences.py <report.json> <out.json> | --self-test",
-              file=sys.stderr)
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("report", help="JSON emitted by ab_param_home_index.py")
+    ap.add_argument("out", help="where to write the classified JSON")
+    ap.add_argument("--old", type=pathlib.Path,
+                    default=pathlib.Path(os.environ.get("LCCC_AB_OLD", DEFAULT_OLD)))
+    ap.add_argument("--new", type=pathlib.Path,
+                    default=pathlib.Path(os.environ.get("LCCC_AB_NEW", DEFAULT_NEW)))
+    ap.add_argument("--repeats", type=int, default=REPEATS)
+    a = ap.parse_args()
+    OLD, NEW, REPEATS = a.old, a.new, a.repeats
+    for leg, path in (("old", OLD), ("new", NEW)):
+        if not path.is_dir() or not (path / "lccc").is_file():
+            print(f"error: {leg} leg {path} is not a built fastbuild directory",
+                  file=sys.stderr)
+            return 2
+    if REPEATS < 1:
+        print("error: --repeats must be >= 1", file=sys.stderr)
         return 2
 
-    report = json.loads(pathlib.Path(sys.argv[1]).read_text())
+    report = json.loads(pathlib.Path(a.report).read_text())
     divs = [d for d in report["divergences"]
             if d["status"] in ("divergent", "rc-divergent", "diagnostic-divergent")]
     # Assembly diffs only make sense for pairs that both compiled successfully.
@@ -221,6 +247,8 @@ def main() -> int:
     summary = collections.Counter(r["verdict"] for r in rows)
     payload = {
         "complete": True,
+        "old_leg": str(OLD),
+        "new_leg": str(NEW),
         "repeats_per_leg": REPEATS,
         "non_assembly_divergences": [
             {k: d[k] for k in ("source", "arch", "opt", "status", "old_rc", "new_rc")}
@@ -229,7 +257,7 @@ def main() -> int:
         "summary": dict(summary),
         "rows": rows,
     }
-    pathlib.Path(sys.argv[2]).write_text(json.dumps(payload, indent=2) + "\n")
+    pathlib.Path(a.out).write_text(json.dumps(payload, indent=2) + "\n")
     print(json.dumps({"pairs": len(rows),
                       "changed_lines": sum(r["changed"] for r in rows),
                       "summary": dict(summary)}, indent=2))

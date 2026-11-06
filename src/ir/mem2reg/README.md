@@ -171,10 +171,11 @@ both must fit within the register width.
 ### Invocation 1: Before Inlining (`promote_allocas`)
 
 Called in the driver immediately after IR lowering, before any optimization passes run. This
-invocation **skips parameter allocas** (the first *N* allocas in the entry block, where *N* is
-the number of function parameters). Parameter allocas are left in place because the inliner
-assumes they exist: it maps caller arguments to callee parameter allocas via `Store`
-instructions when splicing the inlined body.
+invocation **skips parameter homes** (the values recorded in `param_alloca_values`, the
+authoritative field every pass and backend uses). They are left in place because the inliner
+assumes they exist: it maps caller arguments to callee parameter homes via `Store`
+instructions when splicing the inlined body. Position in the entry block is not a valid
+definition: an unrelated prefix alloca makes a positional rule delete the real home.
 
 This early promotion converts most local variables to SSA form, enabling the optimizer to
 work on SSA values from the start.

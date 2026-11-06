@@ -4347,8 +4347,8 @@ fn scalar_cleanup_blocked(func: &IrFunction, module: &IrModule) -> bool {
 /// locals): the passes below cannot see through a home, so without it a
 /// cleaned body kept every clone's store/load traffic (zstd's
 /// FSE_encodeSymbol: 47 raw, 83 "cleaned", 59 with the promotion). The
-/// function's OWN parameter homes -- the first `params.len()` entry
-/// allocas, the positional contract the inliner's argument binding and the
+/// function's OWN parameter homes -- exactly the values recorded in
+/// `param_alloca_values`, the contract the inliner's argument binding and the
 /// backend's `ParamAllocaIndex` rely on -- stay, so sizes remain in the
 /// home form of the raw snapshots they are compared with. Promoting them
 /// too (`promote_params = true`) measured +13..+21 % zstd Ir, with calls to

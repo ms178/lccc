@@ -1166,7 +1166,7 @@ fn find_escaped_param_allocas(func: &IrFunction) -> FxHashSet<u32> {
     escaped
 }
 
-/// All parameter allocas (first `num_params` allocas in the entry block).
+/// All parameter homes, from the authoritative `param_alloca_values` field.
 fn find_param_allocas(func: &IrFunction) -> FxHashSet<u32> {
     func.param_alloca_values.iter().map(|v| v.0).collect()
 }
