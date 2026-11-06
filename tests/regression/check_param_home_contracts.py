@@ -428,13 +428,13 @@ def check_cli_text_is_best_effort() -> None:
         rel = p.relative_to(ROOT / "src").as_posix()
         if rel == "common/cli_output.rs":
             continue
+        # One read per file, and NO exemption for #[cfg(test)] blocks: a
+        # panicking print macro is wrong in a test helper too, and exempting
+        # everything after the first #[cfg(test)] would create a silent hole
+        # for any file that puts an inline test attribute before production
+        # code. Forbidding the four macros everywhere is both simpler and
+        # strictly stronger.
         hits = cli_text_macro_hits(p.read_text(encoding="utf-8"))
-        # A source file may keep macros inside its #[cfg(test)] module, where
-        # libtest owns stdout; none of the shipped files needs this today.
-        test_from = p.read_text(encoding="utf-8").find("#[cfg(test)]")
-        if test_from >= 0:
-            line = p.read_text(encoding="utf-8").count("\n", 0, test_from) + 1
-            hits = [(ln, name) for ln, name in hits if ln < line]
         if hits:
             offenders.append(f"{rel}:{hits[0][0]} {hits[0][1]}!")
     require(not offenders,

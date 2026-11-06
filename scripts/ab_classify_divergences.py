@@ -36,6 +36,9 @@ import re
 import subprocess
 import sys
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from ab_param_home_index import directives
+
 SUITE = pathlib.Path("/home/user/.cache/lccc-gcc17/gcc/testsuite/gcc.c-torture")
 OLD = pathlib.Path("/home/user/lccc/target/fastbuild-baseline2/fastbuild")
 NEW = pathlib.Path("/home/user/lccc/target/fastbuild")
@@ -113,17 +116,6 @@ def compile_asm(base: pathlib.Path, binary: str, opt: str, src: pathlib.Path,
     return 0, hashlib.sha256(out.read_bytes()).hexdigest()
 
 
-def directives(text: str) -> list[str]:
-    """The same unconditional dg-options the A/B harness applies to both legs."""
-    quoted = re.compile(r"\{\s*dg-options\s+\"((?:[^\"\\]|\\.)*)\"")
-    braces = re.compile(r"\{\s*dg-options\s+\{([^}]*)\}", re.S)
-    out: list[str] = []
-    head = text[:8192]
-    for m in quoted.finditer(head):
-        out.extend(m.group(1).split())
-    for m in braces.finditer(head):
-        out.extend(m.group(1).split())
-    return [f for f in out if f.startswith("-") and not f.startswith("-Werror")]
 
 
 def self_test() -> int:
