@@ -3168,12 +3168,16 @@ impl I686Codegen {
 // ─── ArchCodegen trait implementation ────────────────────────────────────────
 
 impl ArchCodegen for I686Codegen {
-    fn debug_parameter_home(&self, slot: crate::backend::state::StackSlot) -> Option<(u8, i64)> {
-        // i686 stack parameters may live in the caller's argument slot
-        // (positive ebp displacement) or a local alloca; slot_base_disp is
-        // the same translation the emitter uses.  ebp is DWARF register 5.
-        let (base, disp) = self.slot_base_disp(slot, 0);
-        (base == "ebp").then_some((5, disp))
+    fn debug_frame_home(&self, slot: crate::backend::state::StackSlot) -> Option<(u8, i64)> {
+        // A directly-homed stack parameter's base slot is redirected to the
+        // caller's argument area.  Debug homes name object bases, never interior
+        // aliases, so the exact map lookup is sufficient and avoids the emitter's
+        // interior-alias interval scan on the compiler's hot path.
+        if let Some(&(src, _)) = self.param_direct_homes.get(&slot.0) {
+            let (base, disp) = self.param_base_disp(src);
+            return (base == "ebp").then_some((5, disp));
+        }
+        (!self.omit_frame_pointer).then_some((5, slot.0))
     }
 
     fn emit_indirect_branch_landing_pad(&mut self) {

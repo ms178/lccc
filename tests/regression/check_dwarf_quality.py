@@ -161,7 +161,8 @@ KNOWN_GAPS: dict[str, str] = {
     "optimized_parameter_locations": (
         "an optimized parameter DIE states its name and type but not where the "
         "value lives; entry-value/register tracking across optimized code is still "
-        "open (D1b). O0 x86/i686 homes are a hard gate, not this gap"
+        "open (D1b). O0 frame homes are a hard gate (x86/i686 under GDB; "
+        "AArch64/RISC-V structurally), not this gap"
     ),
 }
 
@@ -2910,7 +2911,7 @@ def check_parameter_location(
         return
     if subprogram.forms.get(DW_AT_HIGH_PC) not in (DW_FORM_ADDR, 0x01):
         high = low + high
-    expected_register = {3: 5, 62: 6}.get(elf.machine)
+    expected_register = {3: 5, 62: 6, 183: 29, 243: 8}.get(elf.machine)
     for entry in candidate.entries:
         base = entry.base if entry.base is not None else low
         start, end = base + entry.start, base + entry.end
@@ -3010,7 +3011,7 @@ def check_parameters(report: Report, elf: Elf, parsed: list[Unit], label: str) -
                     report.fail(
                         "parameter_locations",
                         f"{label}: parameter {name}.{parameter} has no DW_AT_location; "
-                        "O0 x86/i686 homes are codegen-proven and required (D1b)",
+                        "O0 frame homes are codegen-proven and required (D1b/D14)",
                     )
                 else:
                     report.gap(

@@ -1028,8 +1028,9 @@ jobs:
         --json "$RUNNER_TEMP/dwarf-parameters.json"
         run_gate dwarf_locals_selftest python3 tests/regression/check_dwarf_locals.py --self-test
         run_gate dwarf_locals python3 tests/regression/check_dwarf_locals.py \
-        --lccc target/fastbuild/lccc --gcc gcc-16 --gdb gdb \
-        --json "$RUNNER_TEMP/dwarf-locals.json"
+          --lccc target/fastbuild/lccc --lccc-arm target/fastbuild/lccc-arm \
+          --lccc-riscv target/fastbuild/lccc-riscv --gcc gcc-16 --gdb gdb \
+          --json "$RUNNER_TEMP/dwarf-locals.json"
         run_gate warning_compat python3 tests/regression/check_warning_compat.py \
         --lccc target/fastbuild/lccc --gcc gcc-16
         run_gate warning_precedence python3 tests/regression/check_warning_precedence.py \

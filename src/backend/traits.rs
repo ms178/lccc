@@ -2602,7 +2602,7 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
     /// A proven parameter home as `(DWARF frame-pointer register, offset)`,
     /// or `None` when the slot is not addressable through a stable frame
     /// pointer (FPO, over-aligned adjustment, or a target without one).
-    fn debug_parameter_home(&self, _slot: crate::backend::state::StackSlot) -> Option<(u8, i64)> {
+    fn debug_frame_home(&self, _slot: crate::backend::state::StackSlot) -> Option<(u8, i64)> {
         None
     }
 

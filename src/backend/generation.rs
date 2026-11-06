@@ -6160,12 +6160,12 @@ fn generate_function(
                 if state.alloca_over_align(*alloca_id).is_some() {
                     continue;
                 }
-                let Some((base_register, offset)) = cg.debug_parameter_home(*slot) else {
+                let Some((base_register, offset)) = cg.debug_frame_home(*slot) else {
                     continue;
                 };
                 homes.insert(
                     (func.name.clone(), *original),
-                    crate::backend::DebugParamHome {
+                    crate::backend::DebugHome {
                         base_register,
                         offset,
                     },
@@ -6178,18 +6178,24 @@ fn generate_function(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for local in &func.debug_locals {
+                // Only a fixed Alloca denotes object storage here.  A DynAlloca
+                // or a promoted value may also have a value_locations entry, but
+                // that slot holds a pointer/SSA value, not the source object.
+                if !state.is_alloca(local.alloca.0) {
+                    continue;
+                }
                 let Some(&slot) = state.value_locations.get(&local.alloca.0) else {
                     continue;
                 };
                 if state.alloca_over_align(local.alloca.0).is_some() {
                     continue;
                 }
-                let Some((base_register, offset)) = cg.debug_parameter_home(slot) else {
+                let Some((base_register, offset)) = cg.debug_frame_home(slot) else {
                     continue;
                 };
                 homes.insert(
                     (func.name.clone(), local.alloca.0),
-                    crate::backend::DebugParamHome {
+                    crate::backend::DebugHome {
                         base_register,
                         offset,
                     },

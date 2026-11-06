@@ -369,11 +369,10 @@ pub(crate) struct DwarfParameter {
     /// value, and GCC 16.2 omits `DW_AT_name` there (measured).
     pub name: Option<String>,
     pub ty: u32,
-    /// Where the value is, once the code generator has laid the frame out.  The
-    /// analyser builds the parameter list before any frame exists, so this is
-    /// filled in later, by [`DwarfUnitSpec::apply_frame_facts`], and stays
-    /// `None` for a parameter the frame does not give a trustworthy home.
-    pub location: Option<DwarfLocation>,
+    /// Codegen-proven frame home, attached by original parameter index after
+    /// emission.  Storing it on the parameter itself keeps the writer O(1) per
+    /// argument instead of searching a unit-wide location vector by name.
+    pub location: Option<DwarfHome>,
 }
 
 /// The parameter list of one defined function.
@@ -391,13 +390,13 @@ impl DwarfFunctionParameters {
     }
 }
 
-/// A parameter home proven by codegen: a frame-pointer-relative stack slot
-/// live between the line table's prologue_end and epilogue_begin.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct DwarfParameterLocation {
-    pub function: String,
-    pub name: String,
-    /// DWARF register number of the frame pointer (x86-64 rbp=6, i686 ebp=5).
+/// A frame-pointer-relative home proven by codegen.  The writer turns it into
+/// `DW_OP_bregN + offset`; `None` means the object has no stable memory home
+/// (promoted, folded, frameless, or not yet supported) and is not described.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DwarfHome {
+    /// DWARF frame-pointer register: x86-64 rbp=6, i686 ebp=5, AArch64 x29=29,
+    /// RISC-V s0/fp=8.
     pub base_register: u8,
     pub offset: i64,
 }
@@ -415,8 +414,24 @@ pub(crate) struct DwarfLocalVariable {
     pub decl_column: Option<u32>,
     /// IR alloca id, used by the driver to attach the codegen home.
     pub alloca_id: u32,
-    pub base_register: Option<u8>,
-    pub offset: Option<i64>,
+    /// Index into [`DwarfUnitSpec::lexical_scopes`].
+    pub scope: usize,
+    pub home: Option<DwarfHome>,
+}
+
+/// One lexical block, as the lowerer recorded it.  `parent == None` is the
+/// function body itself and is represented by the subprogram DIE rather than
+/// an extra lexical block.  Source positions are resolved by the driver so the
+/// byte writer never needs the source manager.
+#[derive(Clone, Debug)]
+pub(crate) struct DwarfLexicalScope {
+    pub function: String,
+    pub parent: Option<usize>,
+    pub file: String,
+    pub start_line: u32,
+    pub start_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
 }
 
 /// Everything the writer needs to describe a translation unit's data.
@@ -430,8 +445,8 @@ pub(crate) struct DwarfUnitSpec {
     /// function with no parameters has no entry, so the writer knows it can
     /// describe the subprogram without children.
     pub parameters: FxHashMap<String, DwarfFunctionParameters>,
-    pub parameter_locations: Vec<DwarfParameterLocation>,
     pub local_variables: Vec<DwarfLocalVariable>,
+    pub lexical_scopes: Vec<DwarfLexicalScope>,
 }
 
 impl DwarfUnitSpec {
@@ -457,16 +472,6 @@ impl DwarfUnitSpec {
     /// The parameter list of a defined function, when it has one.
     pub(crate) fn parameters_of(&self, name: &str) -> Option<&DwarfFunctionParameters> {
         self.parameters.get(name).filter(|list| !list.is_empty())
-    }
-
-    pub(crate) fn parameter_location(
-        &self,
-        function: &str,
-        name: &str,
-    ) -> Option<&DwarfParameterLocation> {
-        self.parameter_locations
-            .iter()
-            .find(|loc| loc.function == function && loc.name == name)
     }
 
     /// Drop the declarations this object does not reference, and every type that
@@ -588,8 +593,8 @@ impl DwarfUnitSpec {
             variables,
             return_types,
             parameters,
-            parameter_locations: self.parameter_locations.clone(),
             local_variables,
+            lexical_scopes: self.lexical_scopes.clone(),
         }
     }
 
@@ -1532,8 +1537,8 @@ mod tests {
             ],
             return_types: FxHashMap::default(),
             parameters: FxHashMap::default(),
-            parameter_locations: Vec::new(),
             local_variables: Vec::new(),
+            lexical_scopes: Vec::new(),
         };
         let mut referenced = FxHashMap::default();
         referenced.insert("used".to_string(), ());

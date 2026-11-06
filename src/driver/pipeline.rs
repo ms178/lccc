@@ -2495,41 +2495,35 @@ impl Driver {
             debug_local_homes.clone(),
         )?;
         let mut debug_unit = debug_unit;
-        if let Some(homes) = debug_param_homes
-            && let Some(unit) = debug_unit.as_mut()
-        {
-            let homes = homes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            unit.parameter_locations = homes
-                .iter()
-                .filter_map(|((function, index), home)| {
-                    let name = unit
+        if let Some(unit) = debug_unit.as_mut() {
+            if let Some(homes) = debug_param_homes {
+                let homes = homes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for ((function, index), home) in homes.iter() {
+                    if let Some(parameter) = unit
                         .parameters
-                        .get(function)?
-                        .parameters
-                        .get(*index)?
-                        .name
-                        .as_ref()?;
-                    Some(crate::backend::elf::DwarfParameterLocation {
-                        function: function.clone(),
-                        name: name.clone(),
-                        base_register: home.base_register,
-                        offset: home.offset,
-                    })
-                })
-                .collect();
-        }
-        if let Some(homes) = debug_local_homes
-            && let Some(unit) = debug_unit.as_mut()
-        {
-            let homes = homes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for local in &mut unit.local_variables {
-                if let Some(home) = homes.get(&(local.function.clone(), local.alloca_id)) {
-                    local.base_register = Some(home.base_register);
-                    local.offset = Some(home.offset);
+                        .get_mut(function)
+                        .and_then(|list| list.parameters.get_mut(*index))
+                    {
+                        parameter.location = Some(crate::backend::elf::DwarfHome {
+                            base_register: home.base_register,
+                            offset: home.offset,
+                        });
+                    }
+                }
+            }
+            if let Some(homes) = debug_local_homes {
+                let homes = homes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for local in &mut unit.local_variables {
+                    if let Some(home) = homes.get(&(local.function.clone(), local.alloca_id)) {
+                        local.home = Some(crate::backend::elf::DwarfHome {
+                            base_register: home.base_register,
+                            offset: home.offset,
+                        });
+                    }
                 }
             }
         }
@@ -2660,9 +2654,6 @@ impl Driver {
                 described.push(crate::backend::elf::DwarfParameter {
                     name: parameter_name.clone(),
                     ty: graph.intern_written(ty, alias),
-                    // Filled in by `apply_frame_facts` once the code generator
-                    // has laid the frame out; the analysis runs before any frame
-                    // exists, so nothing here can know where the value lives.
                     location: None,
                 });
             }
@@ -2678,21 +2669,40 @@ impl Driver {
             );
         }
 
-        // D14: local variables whose alloca may survive into codegen. A name
-        // declared more than once in a function is ambiguous without lexical
-        // blocks, so fail closed until the scope ranges are emitted.
+        // D14: local variables and their lexical blocks.  The lowerer records
+        // one scope per compound statement; the writer nests variable DIEs under
+        // those blocks so a shadowed name is visible only inside its own scope.
+        // A promoted/folded local still gets a DIE here, but the driver attaches
+        // a home only when codegen proves one; without a home the writer omits it.
         let mut local_variables = Vec::new();
+        let mut lexical_scopes = Vec::new();
         if let Some(module) = module {
             for func in &module.functions {
-                let mut counts: crate::common::fx_hash::FxHashMap<&str, usize> =
-                    crate::common::fx_hash::FxHashMap::default();
-                for local in &func.debug_locals {
-                    *counts.entry(local.name.as_str()).or_default() += 1;
+                let scope_base = lexical_scopes.len();
+                for scope in &func.debug_scopes {
+                    let (file, start_line, start_column, end_line, end_column) = match sources {
+                        Some(sources) if scope.span != crate::common::source::Span::dummy() => {
+                            let start = sources.resolve_span(scope.span);
+                            let end = sources.resolve_span(crate::common::source::Span::new(
+                                scope.span.end.saturating_sub(1),
+                                scope.span.end,
+                                scope.span.file_id,
+                            ));
+                            (start.file, start.line, start.column, end.line, end.column)
+                        }
+                        _ => (String::new(), 0, 0, 0, 0),
+                    };
+                    lexical_scopes.push(crate::backend::elf::DwarfLexicalScope {
+                        function: func.name.clone(),
+                        parent: scope.parent.map(|parent| scope_base + parent),
+                        file,
+                        start_line,
+                        start_column,
+                        end_line,
+                        end_column,
+                    });
                 }
                 for local in &func.debug_locals {
-                    if counts.get(local.name.as_str()).copied().unwrap_or(0) != 1 {
-                        continue;
-                    }
                     let ty = graph.intern_written(&local.ty, local.typedef_name.as_deref());
                     let (decl_file, decl_line, decl_column) = match sources {
                         Some(sources)
@@ -2715,8 +2725,8 @@ impl Driver {
                         decl_line,
                         decl_column,
                         alloca_id: local.alloca.0,
-                        base_register: None,
-                        offset: None,
+                        scope: scope_base + local.scope,
+                        home: None,
                     });
                 }
             }
@@ -2727,8 +2737,8 @@ impl Driver {
             variables,
             return_types,
             parameters: function_parameters,
-            parameter_locations: Vec::new(),
             local_variables,
+            lexical_scopes,
         }
     }
 
@@ -3154,7 +3164,7 @@ impl Driver {
         tune: crate::backend::x86::cpu_model::X86Tune,
         time_phases: bool,
         t0: std::time::Instant,
-        debug_param_homes: Option<crate::backend::DebugParamHomes>,
+        debug_param_homes: Option<crate::backend::DebugHomes>,
         debug_local_homes: Option<crate::backend::DebugLocalHomes>,
     ) -> Result<String, String> {
         let (module, pgo_unit) = self.optimize_ir_module(
@@ -4431,7 +4441,7 @@ impl Driver {
         tune: crate::backend::x86::cpu_model::X86Tune,
         time_phases: bool,
         t0: std::time::Instant,
-        debug_param_homes: Option<crate::backend::DebugParamHomes>,
+        debug_param_homes: Option<crate::backend::DebugHomes>,
         debug_local_homes: Option<crate::backend::DebugLocalHomes>,
     ) -> Result<String, String> {
         if let Some(diagnostic) = unsettled_x86_requirement(module) {

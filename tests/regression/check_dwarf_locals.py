@@ -25,6 +25,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tests/regression"))
 from check_dwarf_quality import (  # noqa: E402
     DW_AT_LOCATION,
+    DW_TAG_FORMAL_PARAMETER,
+    DW_TAG_LEXICAL_BLOCK,
     DW_TAG_SUBPROGRAM,
     DW_TAG_VARIABLE,
     Report,
@@ -49,12 +51,25 @@ __attribute__((noinline)) int locals(int n) {
     int observed = array[0]; /* after-update */
     return observed + array[3] + s.a + (int)s.b + v;
 }
+volatile int shadow_sink;
+__attribute__((noinline)) int shadow(int n) {
+    volatile int x = n + 1;
+    {
+        volatile int x = n + 10;
+        shadow_sink = x; /* shadow-inner */
+        x += 1;
+    }
+    shadow_sink = x; /* shadow-outer */
+    return x;
+}
 int main(void) {
-    return locals(7) == 8 + 10 + 19 + 27 + 40 ? 0 : 1;
+    return locals(7) == 8 + 10 + 19 + 27 + 40 && shadow(7) == 8 ? 0 : 1;
 }
 """
 
 LOCALS = ("array", "s", "v")
+SHADOW_INNER = 17
+SHADOW_OUTER = 8
 BEFORE = {"array[0]": 7, "array[3]": 10, "s.a": 17, "s.b": 27, "v": 37}
 AFTER = {"array[0]": 8, "array[3]": 10, "s.a": 19, "s.b": 27, "v": 40}
 
@@ -106,25 +121,69 @@ quit
     return before, after
 
 
+def gdb_shadow(gdb: str, exe: Path, cwd: Path, source_name: str) -> tuple[str, str]:
+    script = f"""set pagination off
+set confirm off
+break {source_name}:{marker_line('/* shadow-inner */')}
+run
+print x
+break {source_name}:{marker_line('/* shadow-outer */')}
+continue
+print x
+quit
+"""
+    command_file = cwd / "shadow.gdb"
+    command_file.write_text(script)
+    result = run([gdb, "-q", "-batch", "-x", str(command_file), str(exe)], cwd)
+    if result.returncode != 0:
+        fail("gdb-shadow", result.stdout + result.stderr)
+    values = re.findall(r"\$\d+ = ([^\n]+)", result.stdout)
+    if len(values) < 2:
+        fail("gdb-shadow", f"expected two printed values, got {result.stdout!r}")
+    return values[0].strip(), values[1].strip()
+
+
 def check_locations(label: str, path: Path) -> None:
     elf = read_elf(path)
     report = Report()
     located: set[str] = set()
+    located_parameters: set[str] = set()
     for unit in units(elf):
         for subprogram in unit.by_tag(DW_TAG_SUBPROGRAM):
             if die_name(subprogram, unit) != "locals":
                 continue
             for die in children(unit, subprogram):
+                if die.tag == DW_TAG_FORMAL_PARAMETER and DW_AT_LOCATION in die.attrs:
+                    name = die_name(die, unit)
+                    located_parameters.add(name)
+                    check_parameter_location(report, elf, unit, die, subprogram, label, f"locals.{name}")
                 if die.tag != DW_TAG_VARIABLE or DW_AT_LOCATION not in die.attrs:
                     continue
                 name = die_name(die, unit)
                 located.add(name)
                 check_parameter_location(report, elf, unit, die, subprogram, label, name)
+            if die_name(subprogram, unit) == "shadow":
+                outer = [die for die in children(unit, subprogram)
+                         if die.tag == DW_TAG_VARIABLE and die_name(die, unit) == "x"
+                         and DW_AT_LOCATION in die.attrs]
+                inner = []
+                for block in children(unit, subprogram):
+                    if block.tag != DW_TAG_LEXICAL_BLOCK:
+                        continue
+                    inner.extend(die for die in children(unit, block)
+                                 if die.tag == DW_TAG_VARIABLE and die_name(die, unit) == "x"
+                                 and DW_AT_LOCATION in die.attrs)
+                if len(outer) != 1 or len(inner) != 1:
+                    fail(label + "/shadow", f"expected one outer and one inner x, got {len(outer)}/{len(inner)}")
+                for die in (*outer, *inner):
+                    check_parameter_location(report, elf, unit, die, subprogram, label, "shadow.x")
     if report.failures:
         fail(label, "; ".join(str(failure) for failure in report.failures))
     missing = set(LOCALS) - located
     if missing:
         fail(label, f"locals without a proven home: {sorted(missing)}")
+    if "n" not in located_parameters:
+        fail(label, "locals.n has no proven parameter home")
 
 
 def check_mode(lccc: str, gcc: str, gdb: str | None, bits: int, version: int, root: Path) -> int:
@@ -164,6 +223,11 @@ def check_mode(lccc: str, gcc: str, gdb: str | None, bits: int, version: int, ro
 
     if gdb:
         for candidate in (exe, via_exe):
+            inner, outer = gdb_shadow(gdb, candidate, work, source.name)
+            if gdb_number(inner) != SHADOW_INNER:
+                fail(label + "/gdb-shadow-inner", f"x = {inner}, expected {SHADOW_INNER}")
+            if gdb_number(outer) != SHADOW_OUTER:
+                fail(label + "/gdb-shadow-outer", f"x = {outer}, expected {SHADOW_OUTER}")
             before, after = gdb_values(gdb, candidate, work, source.name)
             for expr, expected in BEFORE.items():
                 if gdb_number(before[expr]) != expected:
@@ -184,9 +248,41 @@ def check_mode(lccc: str, gcc: str, gdb: str | None, bits: int, version: int, ro
     return 4 if gdb else 3
 
 
+def check_cross(lccc: str, label: str, version: int, root: Path) -> int:
+    """AArch64/RISC-V: structural homes and debug-free code bytes.
+
+    The pinned GDB is x86-only, so these legs prove the DIE/location-list shape
+    and the frame-pointer register through the shared decoder rather than
+    pretending a cross debugger ran.  QEMU execution is covered by the wider
+    cross gates; this gate owns the debug contract.
+    """
+    work = root / f"{label}_v{version}"
+    work.mkdir()
+    source = work / "locals.c"
+    source.write_text(SOURCE)
+    common = ["-O0", f"-gdwarf-{version}", "-g"]
+    obj = work / "direct.o"
+    result = run([lccc, *common, "-c", str(source), "-o", str(obj)], work)
+    if result.returncode != 0:
+        fail(label, result.stderr)
+    check_locations(f"{label}-v{version}", obj)
+    for level in ("-O0", "-O2"):
+        plain = work / f"plain{level}.o"
+        debug = work / f"debug{level}.o"
+        for output, extra in ((plain, []), (debug, ["-g"])):
+            result = run([lccc, level, *extra, "-c", str(source), "-o", str(output)], work)
+            if result.returncode != 0:
+                fail(label + level, result.stderr)
+        if code_sections(read_elf(plain)) != code_sections(read_elf(debug)):
+            fail(label + level, "-g changed code bytes; debug info must be free at runtime")
+    return 2
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lccc")
+    parser.add_argument("--lccc-arm")
+    parser.add_argument("--lccc-riscv")
     parser.add_argument("--gcc", default="gcc-16")
     parser.add_argument("--gdb", default=None)
     parser.add_argument("--allow-missing-gdb", action="store_true")
@@ -215,8 +311,15 @@ def main() -> int:
         for bits in (64, 32):
             for version in (2, 3, 4, 5):
                 contracts += check_mode(args.lccc, args.gcc, gdb, bits, version, root)
+        for label, value in (("aarch64", args.lccc_arm), ("riscv64", args.lccc_riscv)):
+            if value:
+                compiler = str(Path(value).resolve()) if Path(value).exists() else value
+                for version in (2, 3, 4, 5):
+                    contracts += check_cross(compiler, label, version, root)
     report = {"status": "pass", "contracts": contracts, "gdb": gdb,
-              "locals": list(LOCALS), "before": BEFORE, "after": AFTER}
+              "locals": list(LOCALS), "before": BEFORE, "after": AFTER,
+              "shadow": {"inner": SHADOW_INNER, "outer": SHADOW_OUTER},
+              "cross_structural": {"aarch64": bool(args.lccc_arm), "riscv64": bool(args.lccc_riscv)}}
     if args.json:
         args.json.write_text(json.dumps(report, indent=2) + "\n")
     print(f"PASS: DWARF local homes ({contracts} contracts{'; GDB ' + gdb if gdb else ''})")

@@ -1014,7 +1014,8 @@ gate "dwarf-locals-selftest" fast \
     python3 tests/regression/check_dwarf_locals.py --self-test
 gate "dwarf-locals" fast \
     python3 tests/regression/check_dwarf_locals.py \
-        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" --gdb "${GDB:-gdb}" \
+        --lccc "$LCCC" --lccc-arm target/fastbuild/lccc-arm \
+        --lccc-riscv target/fastbuild/lccc-riscv --gcc "${GCC16:-gcc-16}" --gdb "${GDB:-gdb}" \
         --json target/dwarf-locals.json
 # Digraph spelling is observable in macro stringification; this also exercises
 # directives, token boundaries, maximal munch and native/i686 execution.

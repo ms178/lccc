@@ -301,7 +301,7 @@ pub struct FnEntryRows {
 
 pub struct CodegenState {
     pub(crate) frame_report: Option<crate::backend::FrameReport>,
-    pub(crate) debug_param_homes: Option<crate::backend::DebugParamHomes>,
+    pub(crate) debug_param_homes: Option<crate::backend::DebugHomes>,
     pub(crate) debug_local_homes: Option<crate::backend::DebugLocalHomes>,
     pub out: AsmOutput,
     /// Set from CodegenOptions for -O0 non-SSA correctness.

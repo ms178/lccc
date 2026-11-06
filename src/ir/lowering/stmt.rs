@@ -554,6 +554,11 @@ impl Lowerer {
         if self.debug_info
             && !decl.is_static()
             && !decl.is_extern()
+            // A VLA's stack slot holds a dynamically adjusted pointer, not the
+            // array object; describing it as a fixed frame home would read the
+            // pointer bytes as elements.  Dynamic DWARF array bounds/locations
+            // are a separate feature, so fail closed here.
+            && vla_size.is_none()
             && local_info.asm_register.is_none()
             && local_info.static_global_name.is_none()
             && let Some(ty) = local_info.var.c_type.clone()
