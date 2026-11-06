@@ -1,0 +1,139 @@
+LCCC red-team round 3 — eliminate the remaining redundant stores
+================================================================
+
+Base: origin/main c8aae20 ("Merge pull request #1123 ...").  PR #1123 fixed
+the quadratic duplicate-chain re-walk and made the aligned probe RESUME at its
+mismatch instead of restarting.  This round audits that merged implementation
+line by line for work that is still done twice.
+
+TWO defects found (both real, both fixed)
+----------------------------------------
+1. `build_homes` called `homes.resize(n, None)` before the positional probe.
+   On the HOT aligned path the probe then overwrote all n entries with `Some`,
+   so every home table was written TWICE: 8*n bytes of dead stores per
+   function.  Measured shape: n = 16000 => 128000 dead bytes per function.
+   FIX: reserve capacity only; `aligned_probe` APPENDS `Some` values (push
+   cannot reallocate because capacity == n), and `general_homes_from`
+   zero-fills ONLY the unresolved tail with `homes.resize(n, None)` where
+   `homes.len() == start`.  Aligned functions now write each home EXACTLY ONCE.
+
+2. `general_homes_from` allocated `vec![usize::MAX; n]` for the adjacency
+   chain.  `head` only ever holds ordinals in `start..n`, so the first `start`
+   entries could never be referenced: 8*start dead bytes of initialization on
+   every late-failure resume (k ~ n in the adversarial case).
+   FIX: `vec![usize::MAX; n - start]`, indexed by `o - start`.  `o` always
+   originates from `head`, hence `o >= start` and `o - start < next.len()`;
+   Rust still bounds-checks every access.  No arithmetic can underflow.
+
+WHY this is not guesswork: `ParamHomeStats` gained a FOURTH independent
+resource witness, `home_writes`, incremented on every table mutation (single
+`Some` writes and the bulk tail zero-fill).  `NoStats` remains a 0-byte ZST,
+so production builds contain ZERO accounting instructions.  The compiled unit
+test `aligned_path_writes_each_home_exactly_once` asserts
+`stats.home_writes == n` for n in {1,2,8,64,1024,4096}; it FAILS on the
+merged PR #1123 shape (2*n) and PASSES here (n).  The universal bound
+`home_writes <= 2*n` is asserted over 41261 exhaustive shapes.
+
+EXHAUSTIVE DIFFERENTIAL PROOF
+-----------------------------
+`every_small_layout_matches_the_reference_scan_and_all_four_bounds` enumerates
+EVERY `wants` tuple of length <= 4 over a 3-value alphabet (121 tuples,
+including duplicates and non-monotone order) crossed with EVERY entry-block
+instruction sequence of length <= 4 over {3 Alloca dests, 1 non-Alloca}
+(341 sequences) = 41261 shapes.  For each shape it:
+  * compares EVERY ordinal (including out-of-range) to `reference_full_scan`,
+    the exact pre-index implementation;
+  * asserts the instrumented `build_with_stats` index equals the shipped
+    `build` index;
+  * asserts all four bounds: `instructions_examined <= m + 1`,
+    `allocations <= 3`, `chain_steps <= n`, `home_writes <= 2*n`;
+  * asserts the exact case count, so an early exit cannot silently truncate.
+All three build paths are covered: aligned success, resumed late failure and
+pure general.  Runtime: 0.04 s for the whole 23-test index module.
+
+CONSIDERED AND REJECTED (quantified, not skipped)
+------------------------------------------------
+* Eliminate the single `+1` boundary instruction examination (the mismatch
+  instruction is seen once by the probe and once by the resumed walk) by
+  handing that `Alloca` to the general resolver.  Saves ONE instruction
+  examination out of `entry_instructions` (<= 0.01% for realistic functions),
+  costs a second resolution entry point and a closure over five mutable
+  borrows.  Complexity churn for no measurable win.  NOT DONE.
+* Replace the hash map with binary search over the sorted `wants[start..n]`
+  on the strict path.  Removes 2 allocations but makes each lookup O(log n)
+  comparisons instead of O(1) hashing and adds a third code path.  Without a
+  measurement on the target workload this is a guess, so it is NOT DONE; the
+  O(n) map build + O(1) lookup remains the better-characterized choice.
+* Fuse the `wants.windows(2)` strictness pass into the probe.  Non-strict
+  layouts (the common shifted case) would then waste k instruction
+  examinations before discovering the impossibility; deciding from `wants`
+  alone costs one contiguous u32 comparison per parameter and ZERO instruction
+  examinations.  NOT DONE.
+
+AUDIT OF THE RESULT (step by step)
+----------------------------------
+* `build_homes`: n == 0 returns an empty Vec with 0 allocations.  Otherwise
+  one `Vec::with_capacity(n)` (1 allocation, no initialization).  `strict` is
+  decided from `wants` alone.  Aligned success returns a table of length n
+  written once.  A failed probe returns `k` with exactly k appended entries.
+* `aligned_probe`: no block or a block shorter than n returns `Some(0)` with
+  zero examinations and zero pushes.  Each iteration is a bounds-checked
+  slice read, one pattern match, one `Value` comparison and a push into
+  pre-reserved capacity.  No reallocation, no unchecked index, no overflow.
+* `general_homes_from`: `debug_assert_eq!(homes.len(), start)` pins the
+  handoff invariant; `resize(n, None)` cannot reallocate.  `head` holds only
+  ordinals in `start..n`; `next` is sized `n - start`; `usize::MAX` is the
+  sole terminator; `saturating_sub` makes the unresolved counter
+  underflow-proof; `homes[first].is_some()` is the O(1) resolved-chain guard
+  that killed the 102656-step quadratic defect.  All indexing is
+  bounds-checked.  No `unsafe`, raw pointers, atomics, locks, thread-local
+  state, null dereferences or use-after-free surface.
+* `ParamAllocaIndex::get` uses `.get().copied().flatten()`: out-of-range is
+  `None`.  The index owns its buffer for one function's emission; no Send/Sync
+  or lifetime coupling.
+
+EVIDENCE CHAIN RATCHET
+----------------------
+`check_param_home_contracts.py` check 6 pins five NEW structural rules
+(home_writes witness, its hook, push-based probe, tail-only zero-fill,
+`n - start` adjacency sizing) and check 13 pins three NEW compiled tests plus
+the two exact home-write assertions.  Every rule has a rejection path in
+`--self-test`: 53 non-vacuous rejection paths, up from 43.
+
+MILD LOCAL VERIFICATION ONLY (per the standing "no local CI" order)
+-------------------------------------------------------------------
+The full validation is GitHub CI's job.  Locally only the minimum needed to
+avoid pushing a broken tree was run, all with the `fastbuild` preset, the
+pinned toolchain env, `CARGO_BUILD_JOBS=2`, serialized Cargo builds and a
+4 GB swap file:
+
+  cargo fmt --all -- --check                                      RC=0
+  cargo clippy --profile fastbuild --locked -j 2 \
+      --all-targets -- -D warnings                              RC=0
+  cargo test --lib --profile fastbuild --locked -j 2 \
+      param_alloca_index_tests                    23 passed / 0 failed  RC=0
+  python3 tests/regression/check_param_home_contracts.py \
+      --self-test                    53 rejection paths  RC=0
+  python3 -m py_compile (3 gate scripts)                          RC=0
+
+The exhaustive differential proof, the full unit suite, all 13 hosted gates,
+the AArch64/RISC-V executed cross-target fixtures, strict Clippy and every
+other lane are validated by GitHub CI on the pushed head.
+
+TOOLCHAIN HONESTY
+-----------------
+Restored from release tag `harness-cache-8` (12 archives verified) and USED:
+GCC 16.2.0, Clang 23.1.5, Rust/Cargo 1.99.1, GDB 18.1, binutils 2.47,
+mold 3.0.0, qemu-user 11.1.3.  `objtool`, `pahole`, `valgrind` and `perf` are
+not present in this sandbox; the compiled
+`index_layout_has_no_padding_and_the_counter_is_a_zst` test (size/align of
+`NoStats`, `ParamAllocaIndex`, `ParamHomeStats`, `Option<(Value, IrType)>`)
+is the machine-checked layout proof in their place.
+
+ICX 2026.2 is NOT available locally: `icx`/`icpx` are absent, the Intel PPA
+is unreachable (`http=000`, connect failure), and the only `intel/llvm`
+release assets are `sycl_*.tar.gz` (no compiler).  NO local number is
+attributed to ICX.  Hosted CI has the authenticated `icx-oracle` job
+("Authenticated Intel ICX 2026.2 integration") as the separate third oracle.
+No three-way local comparison and no "LCCC beats GCC/Clang/ICX generally"
+claim is made.

@@ -743,6 +743,17 @@ pub fn leaves_through_nonlocal_goto(func: &IrFunction) -> bool {
 /// entry point and a closure over five mutable borrows to save ONE instruction
 /// examination out of thousands.  That is complexity churn, not an
 /// optimization; it is deliberately not done.
+///
+/// The table is written at most TWICE per entry.  `build_homes` reserves
+/// capacity but does NOT zero-fill: `aligned_probe` APPENDS its authoritative
+/// `Some` values (one write each), and `general_homes_from` zero-fills only
+/// the UNRESOLVED tail (`n - start` writes) plus one `Some` per resolved
+/// ordinal.  The adjacency vector is likewise sized to `n - start`, not `n`:
+/// `head` only ever holds ordinals in `start..n`, so prefix entries could
+/// never be referenced.  Both facts are pinned by the `home_writes` witness
+/// and by `aligned_path_writes_each_home_exactly_once`; the previous shape
+/// paid `2*n` home stores on every aligned function and `8*start` dead bytes
+/// of adjacency initialization on every late-failure resume.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParamAllocaIndex {
     homes: Vec<Option<(Value, IrType)>>,
@@ -751,12 +762,14 @@ pub struct ParamAllocaIndex {
 /// Portable complexity witness for [`ParamAllocaIndex::build_with_stats`].
 ///
 /// Wall-clock ratios are not portable across CI machines, so this counts the
-/// THREE resources the algorithm must bound: entry-block instruction
-/// *examinations*, *heap allocations*, and duplicate-home *chain links*.  The
-/// contracts are `instructions_examined <= entry_instructions + 1` (the
-/// resumed pass sees the boundary instruction twice and nothing else),
-/// `allocations <= 3` (O(1) in `params`), and `chain_steps <= params` (each
-/// disjoint chain is walked at most once).  All three are pinned by unit
+/// FOUR resources the algorithm must bound: entry-block instruction
+/// *examinations*, *heap allocations*, duplicate-home *chain links*, and
+/// *writes to the home table itself*.  The contracts are
+/// `instructions_examined <= entry_instructions + 1` (the resumed pass sees
+/// the boundary instruction twice and nothing else), `allocations <= 3`
+/// (O(1) in `params`), `chain_steps <= params` (each disjoint chain is walked
+/// at most once), and `home_writes <= 2 * params` with EXACTLY `params` on the
+/// aligned fast path (no redundant zero-fill).  All four are pinned by unit
 /// tests on adversarial layouts.  Each counter is one `usize` increment and
 /// `build` instantiates them as ZST no-ops, so optimized builds fold the
 /// accounting away completely.
@@ -776,6 +789,13 @@ pub struct ParamHomeStats {
     /// Each chain must be walked at most once, so the contract is
     /// `chain_steps <= params`.  The adversarial regression tests pin it.
     pub chain_steps: usize,
+    /// Writes to the home table itself.  Each of the `n` entries must be
+    /// written at most TWICE (once `None`, once `Some`), and the aligned fast
+    /// path must write each entry exactly ONCE.  The previous implementation
+    /// zero-filled the whole table with `resize(n, None)` and then overwrote
+    /// every entry on the aligned path: 2*n dead stores.  This witness makes
+    /// that regression impossible to reintroduce without a unit-test failure.
+    pub home_writes: usize,
 }
 
 /// Monomorphized instrumentation hook.  `build` instantiates it as the ZST
@@ -787,6 +807,7 @@ pub trait ParamHomeCounter {
     fn note_instruction(&mut self);
     fn note_allocation(&mut self);
     fn note_chain_step(&mut self);
+    fn note_home_writes(&mut self, count: usize);
 }
 
 /// The production counter: a zero-sized no-op.
@@ -800,6 +821,8 @@ impl ParamHomeCounter for NoStats {
     fn note_allocation(&mut self) {}
     #[inline(always)]
     fn note_chain_step(&mut self) {}
+    #[inline(always)]
+    fn note_home_writes(&mut self, _count: usize) {}
 }
 
 impl ParamHomeCounter for ParamHomeStats {
@@ -814,6 +837,10 @@ impl ParamHomeCounter for ParamHomeStats {
     #[inline(always)]
     fn note_chain_step(&mut self) {
         self.chain_steps += 1;
+    }
+    #[inline(always)]
+    fn note_home_writes(&mut self, count: usize) {
+        self.home_writes += count;
     }
 }
 
@@ -865,16 +892,18 @@ fn build_homes<C: ParamHomeCounter>(
 ) -> Vec<Option<(Value, IrType)>> {
     let wants = &func.param_alloca_values;
     let n = wants.len();
-    // ONE buffer for every path.  `with_capacity(n)` is the only allocation;
-    // `resize` cannot reallocate, and the aligned probe fills entries BY INDEX
-    // instead of pushing, so a late failure leaves the resolved prefix intact
-    // for the resumed general walk instead of discarding its work.
+    // ONE buffer for every path, and NO redundant zero-fill.  The previous
+    // shape called `resize(n, None)` here and then overwrote all n entries
+    // with `Some` on the hot aligned path: 8*n bytes of dead stores per
+    // function.  Instead the positional probe APPENDS its `Some` values (the
+    // capacity is n, so push never reallocates), and only the UNRESOLVED tail
+    // is ever zero-filled by `general_homes_from`.  On a fully aligned
+    // function the table is written exactly once.
     let mut homes: Vec<Option<(Value, IrType)>> = Vec::with_capacity(n);
     if n == 0 {
         return homes;
     }
     counter.note_allocation();
-    homes.resize(n, None);
 
     // Decide from `wants` ALONE whether the positional exactness proof can
     // apply.  Duplicate home ids break the `wants[j] < wants[i]` step, so such
@@ -897,11 +926,14 @@ fn build_homes<C: ParamHomeCounter>(
 /// The positional probe, valid ONLY when `wants` is strictly increasing (the
 /// caller established that from `wants` alone).
 ///
-/// Fills `homes[0..n]` while the first `n` entry-block instructions are
-/// `Alloca`s whose destinations equal `wants[0..n]` in order.  Returns `None`
-/// when all `n` matched (the table is exact and complete) or `Some(k)` at the
-/// first mismatch, with `homes[0..k]` ALREADY EXACT.  Unlike the old probe it
-/// does not clear its work on failure: the general pass resumes at `k`.
+/// APPENDS one `Some` per matching ordinal while the first `n` entry-block
+/// instructions are `Alloca`s whose destinations equal `wants[0..n]` in
+/// order.  Returns `None` when all `n` matched (the table is exact and
+/// complete) or `Some(k)` at the first mismatch, with `homes[0..k]` (exactly
+/// `k` pushed entries) ALREADY EXACT.  The caller-sized capacity makes every
+/// push allocation-free.  Unlike the old probe it does not clear its work on
+/// failure: the general pass resumes at `k`, and `homes.len() == k` is the
+/// invariant that lets `general_homes_from` zero-fill only the tail.
 ///
 /// ## Exactness proof (against the `reference_full_scan` test oracle)
 ///
@@ -930,7 +962,7 @@ fn build_homes<C: ParamHomeCounter>(
 fn aligned_probe<C: ParamHomeCounter>(
     func: &IrFunction,
     counter: &mut C,
-    homes: &mut [Option<(Value, IrType)>],
+    homes: &mut Vec<Option<(Value, IrType)>>,
 ) -> Option<usize> {
     let wants = &func.param_alloca_values;
     let n = wants.len();
@@ -948,9 +980,10 @@ fn aligned_probe<C: ParamHomeCounter>(
         if *dest != wants[i] {
             return Some(i);
         }
-        // `homes` was sized to `n` by the caller, so this is a bounds-checked
-        // index with no reallocation.  A late failure leaves the prefix.
-        homes[i] = Some((*dest, *ty));
+        // Capacity == n, so this push cannot reallocate.  A late failure
+        // leaves exactly `i` authoritative entries for the resumed walk.
+        homes.push(Some((*dest, *ty)));
+        counter.note_home_writes(1);
     }
     None
 }
@@ -999,19 +1032,26 @@ fn general_homes_from<C: ParamHomeCounter>(
     let wants = &func.param_alloca_values;
     let n = wants.len();
     debug_assert!(start < n, "the general pass must have work to do");
-    debug_assert_eq!(homes.len(), n, "the shared buffer must be sized to n");
-    // Reuse the caller's buffer (already sized to n, no allocation).  Only
-    // the map and the flat adjacency vector are new heap objects, giving
-    // exactly three allocations independent of `params`.
+    // The probe appended exactly `start` authoritative homes; a non-strict
+    // layout appended none.  Zero-fill ONLY the unresolved tail (n - start
+    // entries), never the already-written prefix.
+    debug_assert_eq!(homes.len(), start, "the resolved prefix must be intact");
+    homes.resize(n, None); // capacity == n, so this cannot reallocate
+    counter.note_home_writes(n - start);
+    // Only the map and the flat adjacency vector are new heap objects, giving
+    // exactly three allocations independent of `params`.  `next` covers ONLY
+    // the unresolved ordinals: a late aligned failure at k used to pay
+    // 8*k bytes of dead `usize::MAX` stores for prefix entries that no chain
+    // can ever reference (head only ever holds ordinals in start..n).
     counter.note_allocation();
     let mut head: FxHashMap<Value, usize> =
         FxHashMap::with_capacity_and_hasher(n - start, Default::default());
     counter.note_allocation();
-    let mut next: Vec<usize> = vec![usize::MAX; n];
+    let mut next: Vec<usize> = vec![usize::MAX; n - start];
     for i in start..n {
         match head.entry(wants[i]) {
             std::collections::hash_map::Entry::Occupied(mut slot) => {
-                next[i] = *slot.get();
+                next[i - start] = *slot.get();
                 *slot.get_mut() = i;
             }
             std::collections::hash_map::Entry::Vacant(slot) => {
@@ -1045,16 +1085,20 @@ fn general_homes_from<C: ParamHomeCounter>(
                 // branches per function -- noise next to a full compile.
                 if homes[o].is_none() {
                     homes[o] = Some((*dest, *ty));
+                    counter.note_home_writes(1);
                     debug_assert!(unresolved > 0);
                     unresolved = unresolved.saturating_sub(1);
                     if unresolved == 0 {
                         break 'walk;
                     }
                 }
-                if next[o] == usize::MAX {
+                // `o` always comes from `head`, which holds only ordinals in
+                // `start..n`, so `o - start` is in `0..next.len()` and cannot
+                // underflow.  Rust still bounds-checks the index.
+                if next[o - start] == usize::MAX {
                     break;
                 }
-                o = next[o];
+                o = next[o - start];
             }
         }
     }
@@ -1592,7 +1636,9 @@ mod param_alloca_index_tests {
         if !f.param_alloca_values.windows(2).all(|w| w[0].0 < w[1].0) {
             return false;
         }
-        let mut buf: Vec<Option<(Value, IrType)>> = vec![None; n];
+        // Mirror production: an EMPTY buffer with capacity n that the probe
+        // appends to.  A pre-filled buffer would not exercise the push path.
+        let mut buf: Vec<Option<(Value, IrType)>> = Vec::with_capacity(n);
         super::aligned_probe(f, &mut super::NoStats, &mut buf).is_none()
     }
 
@@ -2375,10 +2421,133 @@ mod param_alloca_index_tests {
         assert_eq!(align_of::<ParamAllocaIndex>(), word);
         assert_eq!(
             size_of::<ParamHomeStats>(),
-            3 * word,
-            "stats witness must be three usize fields with no padding"
+            4 * word,
+            "stats witness must be four usize fields with no padding"
         );
         assert_eq!(align_of::<ParamHomeStats>(), word);
         assert_eq!(size_of::<Option<(Value, IrType)>>(), 8, "enum niche");
+    }
+
+    /// EXHAUSTIVE differential proof: EVERY `wants` tuple of length <= 4 over
+    /// a 3-value alphabet (including duplicates and non-monotone order) x
+    /// EVERY entry-block instruction sequence of length <= 4 over
+    /// {three Alloca dests, one non-Alloca}.  121 x 341 = 41261 shapes, all
+    /// three build paths (aligned success, resumed late failure, pure
+    /// general).  Every ordinal, including out-of-range, is compared against
+    /// the original full-scan oracle; the instrumented build must equal the
+    /// shipped build; and all four complexity contracts must hold.  A test
+    /// that silently stops early fails the exact `cases` assertion.
+    #[test]
+    fn every_small_layout_matches_the_reference_scan_and_all_four_bounds() {
+        let tys = [IrType::I32, IrType::I64, IrType::F32, IrType::F64];
+        let values = [10u32, 11, 12];
+        let mut cases = 0usize;
+        for n in 0..=4usize {
+            for wants_code in 0..3usize.pow(n as u32) {
+                let mut w = wants_code;
+                let wants: Vec<u32> = (0..n)
+                    .map(|_| {
+                        let v = values[w % 3];
+                        w /= 3;
+                        v
+                    })
+                    .collect();
+                for m in 0..=4usize {
+                    for inst_code in 0..4usize.pow(m as u32) {
+                        let mut ic = inst_code;
+                        let mut instructions = Vec::with_capacity(m);
+                        for j in 0..m {
+                            instructions.push(match ic % 4 {
+                                0 => alloca(values[0], tys[j % 4]),
+                                1 => alloca(values[1], tys[(j + 1) % 4]),
+                                2 => alloca(values[2], tys[(j + 2) % 4]),
+                                _ => Instruction::StackSave { dest: Value(7) },
+                            });
+                            ic /= 4;
+                        }
+                        let f = function(instructions.clone(), wants.clone());
+                        let (index, stats) = ParamAllocaIndex::build_with_stats(&f);
+                        assert_eq!(index, ParamAllocaIndex::build(&f));
+                        assert!(
+                            stats.instructions_examined <= m + 1,
+                            "n={n} m={m}: {} examinations",
+                            stats.instructions_examined
+                        );
+                        assert!(stats.allocations <= 3, "n={n} m={m}: allocations");
+                        assert!(stats.chain_steps <= n, "n={n} m={m}: chain steps");
+                        assert!(
+                            stats.home_writes <= 2 * n,
+                            "n={n} m={m}: {} home writes",
+                            stats.home_writes
+                        );
+                        for i in 0..=n {
+                            assert_eq!(
+                                index.get(i),
+                                reference_full_scan(&f, i),
+                                "n={n} m={m} wants={wants:?} code={inst_code} ordinal {i}"
+                            );
+                        }
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        let per_wants: usize = (0..=4usize).map(|m| 4usize.pow(m as u32)).sum();
+        let expected: usize = (0..=4usize).map(|n| 3usize.pow(n as u32) * per_wants).sum();
+        assert_eq!(cases, expected, "exhaustive enumeration was truncated");
+    }
+
+    /// The aligned fast path must write each home EXACTLY ONCE.  The merged
+    /// PR #1123 implementation called `resize(n, None)` before the probe and
+    /// then overwrote all n entries: this assertion fails there with 2*n and
+    /// passes here with n.  It is a machine-independent, non-vacuous proof
+    /// that the redundant zero-fill is gone, not a wall-clock guess.
+    #[test]
+    fn aligned_path_writes_each_home_exactly_once() {
+        let tys = [IrType::I32, IrType::I64, IrType::F32, IrType::F64];
+        for n in [1usize, 2, 8, 64, 1024, 4096] {
+            let wants: Vec<u32> = (0..n).map(|i| 1000 + i as u32).collect();
+            let instructions: Vec<Instruction> =
+                (0..n).map(|i| alloca(wants[i], tys[i % 4])).collect();
+            let f = function(instructions, wants.clone());
+            assert!(aligned_hypothesis(&f));
+            let (index, stats) = ParamAllocaIndex::build_with_stats(&f);
+            assert_eq!(stats.home_writes, n, "aligned n={n}: redundant home stores");
+            assert_eq!(stats.allocations, 1, "aligned n={n}: one allocation");
+            assert_eq!(stats.instructions_examined, n);
+            assert_eq!(stats.chain_steps, 0, "aligned path must never walk a chain");
+            for i in 0..=n {
+                assert_eq!(index.get(i), reference_full_scan(&f, i), "ordinal {i}");
+            }
+        }
+    }
+
+    /// A late-failure resume must zero-fill ONLY the unresolved tail, never
+    /// the k authoritative homes the probe already appended.
+    #[test]
+    fn resumed_path_never_overwrites_the_resolved_prefix() {
+        const N: usize = 64;
+        const K: usize = 63;
+        let tys = [IrType::I32, IrType::I64, IrType::F32, IrType::F64];
+        let wants: Vec<u32> = (0..N).map(|i| 1000 + i as u32).collect();
+        let mut instructions: Vec<Instruction> =
+            (0..K).map(|i| alloca(wants[i], tys[i % 4])).collect();
+        instructions.push(alloca(9999, IrType::I32)); // mismatch at K
+        for (i, dest) in wants.iter().enumerate() {
+            instructions.push(alloca(*dest, tys[(i + 1) % 4]));
+        }
+        let f = function(instructions.clone(), wants.clone());
+        assert!(!aligned_hypothesis(&f));
+        let (index, stats) = ParamAllocaIndex::build_with_stats(&f);
+        // K authoritative Some writes + (N-K) tail None writes + at most
+        // (N-K) resolved Some writes.  Bounded by N + (N-K), and STRICTLY
+        // below the old 2*N-from-resize shape when K is large.
+        assert_eq!(stats.home_writes, N + (N - K), "resumed n={N} k={K}");
+        assert_eq!(stats.allocations, 3);
+        assert_eq!(stats.instructions_examined, instructions.len() + 1);
+        assert!(stats.chain_steps <= N - K);
+        for i in 0..=N {
+            assert_eq!(index.get(i), reference_full_scan(&f, i), "ordinal {i}");
+        }
     }
 }
