@@ -64,7 +64,7 @@ def run(cmd: list[str], timeout: float = 20.0):
 
 
 def one(job: tuple) -> dict:
-    old_dir, new_dir, suite, arch, opt, source, directives_flags, idx = job
+    old_dir, new_dir, suite, arch, opt, source, directives_flags, idx, timeout = job
     binary = BINARIES[arch]
     tmp = pathlib.Path("/tmp/lccc-param-home-ab")
     tmp.mkdir(exist_ok=True)
@@ -75,8 +75,8 @@ def one(job: tuple) -> dict:
     common += ["-I", suite]
     common += directives_flags
     args_tail = [str(source)]
-    rco, _, eo = run([str(pathlib.Path(old_dir) / binary)] + common + ["-o", str(old_out)] + args_tail)
-    rcn, _, en = run([str(pathlib.Path(new_dir) / binary)] + common + ["-o", str(new_out)] + args_tail)
+    rco, _, eo = run([str(pathlib.Path(old_dir) / binary)] + common + ["-o", str(old_out)] + args_tail, timeout)
+    rcn, _, en = run([str(pathlib.Path(new_dir) / binary)] + common + ["-o", str(new_out)] + args_tail, timeout)
 
     def digest(path: pathlib.Path) -> str | None:
         if not path.exists():
@@ -116,10 +116,21 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--opts", default="-O0,-O2")
     ap.add_argument("--arches", default="x86_64,i686,aarch64,riscv64")
+    ap.add_argument("--timeout", type=float, default=20.0)
+    ap.add_argument("--exclude", default="limits-*",
+                    help="glob of source basenames to skip (default: the 15 "
+                         "compiler stress cases, run separately with a long timeout)")
+    ap.add_argument("--include", default="",
+                    help="if set, ONLY sources matching this glob are run")
     args = ap.parse_args()
 
     suite = pathlib.Path(args.suite)
+    import fnmatch
     sources = sorted((suite / "compile").glob("*.c"))
+    if args.include:
+        sources = [s for s in sources if fnmatch.fnmatch(s.name, args.include)]
+    elif args.exclude:
+        sources = [s for s in sources if not fnmatch.fnmatch(s.name, args.exclude)]
     if args.limit:
         sources = sources[: args.limit]
     opts = args.opts.split(",")
@@ -132,7 +143,8 @@ def main() -> int:
             flags = []
         for arch in arches:
             for opt in opts:
-                jobs.append((args.old, args.new, str(suite), arch, opt, src, flags, len(jobs)))
+                jobs.append((args.old, args.new, str(suite), arch, opt, src, flags,
+                             len(jobs), args.timeout))
     print(f"A/B: {len(sources)} sources x {len(arches)} arches x {len(opts)} opts = {len(jobs)} pairs", flush=True)
 
     counts: dict[str, int] = {}
@@ -143,8 +155,15 @@ def main() -> int:
             counts[res["status"]] = counts.get(res["status"], 0) + 1
             if "divergent" in res["status"]:
                 divergences.append(res)
-            if i % 1000 == 0:
+                print(f"  DIVERGENCE {res['source']} {res['arch']} {res['opt']} "
+                      f"status={res['status']} old_rc={res['old_rc']} new_rc={res['new_rc']} "
+                      f"old_err={res['old_stderr'][-120:]!r} new_err={res['new_stderr'][-120:]!r}",
+                      flush=True)
+            if i % 2000 == 0:
                 print(f"  {i}/{len(jobs)} {counts} {time.monotonic()-started:.1f}s", flush=True)
+                pathlib.Path(args.out + ".partial").write_text(json.dumps({
+                    "complete": False, "done": i, "pairs": len(jobs),
+                    "counts": counts, "divergences": divergences}, indent=2) + "\n")
 
     payload = {
         "complete": True,
@@ -155,6 +174,9 @@ def main() -> int:
         "counts": counts,
         "divergences": divergences,
         "seconds": time.monotonic() - started,
+        "timeout": args.timeout,
+        "excluded": args.exclude,
+        "included": args.include,
     }
     pathlib.Path(args.out).write_text(json.dumps(payload, indent=2) + "\n")
     print(json.dumps({k: v for k, v in payload.items() if k != "divergences"}, indent=2), flush=True)
