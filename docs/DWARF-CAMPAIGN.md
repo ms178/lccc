@@ -502,7 +502,11 @@ one; otherwise the DIE omits `DW_AT_location` and a consumer prints
 `<optimized out>`. Refused: no CFA anchor (frame pointer omitted), no alloca
 slot (the store was folded away), a run-time-aligned alloca, a vector slot whose
 direct value is dead, and any `i32` offset overflow. Measured, not assumed: a
-`-O0 -fomit-frame-pointer` object emits **zero** location expressions.
+`-O0 -fomit-frame-pointer` object emits **zero** location expressions on x86-64,
+where the prologue really does address the frame through `%rsp`
+(`mov %rdi,0x20(%rsp)`), while the same flag at `-O0` on i686 keeps `%ebp`
+(`push %ebp; mov %esp,%ebp`, as GCC does at `-O0`) and its eleven locations still
+match the addresses the program takes.
 
 **The hidden return buffer.** A struct-returning function carries the return
 buffer as IR parameter 0 while the DWARF list starts at the first source
