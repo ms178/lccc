@@ -24,7 +24,7 @@ use super::helpers::{
     writes_family,
 };
 use super::liveness::{FileLiveness, call_window_verdict};
-use super::relay_and_lea::{LazyDeadness, split_two_operands};
+use super::relay_and_lea::{LazyDeadness, plain_gp_operand, split_two_operands};
 
 /// True when a line transfers control or merges paths, so that textual line
 /// order can diverge from execution order.  A load-value reader textually
@@ -185,6 +185,24 @@ pub(super) fn fold_fp_memory_operands(store: &mut LineStore, infos: &mut [LineIn
     changed
 }
 
+/// The scalar load (`movsd`/`movss`) whose value a legacy scalar FP→GPR
+/// conversion mnemonic reads: `movsd` for `cvt(t)sd2si`, `movss` for
+/// `cvt(t)ss2si`, with or without the `l`/`q` operand-size suffix (the
+/// unsuffixed spelling takes its width from the GPR, as the assembler does).
+/// `None` for every other mnemonic, including the VEX spellings (those are
+/// produced only after the peephole, by `vex_promote`).
+fn scalar_cvt_to_gp_load(op: &str) -> Option<&'static str> {
+    let base = op
+        .strip_suffix('l')
+        .or_else(|| op.strip_suffix('q'))
+        .unwrap_or(op);
+    match base {
+        "cvtsd2si" | "cvttsd2si" => Some("movsd"),
+        "cvtss2si" | "cvttss2si" => Some("movss"),
+        _ => None,
+    }
+}
+
 /// Fold a single-use scalar-FP register load into an adjacent scalar-FP
 /// arithmetic instruction (VEX 3-operand and legacy 2-operand forms).
 ///
@@ -210,6 +228,25 @@ pub(super) fn fold_fp_memory_operands(store: &mut LineStore, infos: &mut [LineIn
 /// The load and consumer must be adjacent, so no address register or memory
 /// state can change between them.  Source==destination is rejected because the
 /// removed load also supplies the destructive destination's old value.
+///
+/// The scalar FP→integer conversions (`cvttsd2si`/`cvtsd2si` after `movsd`,
+/// the `ss` forms after `movss`, any operand-size suffix) fold the same way:
+///
+/// ```text
+/// movsd (%rsi,%r9,8), %xmm2
+/// cvttsd2sil %xmm2, %edx
+///   ->
+/// cvttsd2sil (%rsi,%r9,8), %edx
+/// ```
+///
+/// Their memory form reads exactly the scalar the load read (SDM Vol. 2A
+/// CVTTSD2SI `xmm1/m64`, CVTTSS2SI `xmm1/m32`; no alignment requirement) and
+/// they write only the GPR, so there is no destructive destination to
+/// preserve. The folded form decodes to the same load + convert uops as the
+/// pair (one instruction and one XMM write fewer); GCC 16.2 and Clang 23.1.5
+/// both emit it. Deliberately NOT extended to `cvtss2sd`/`cvtsd2ss`/
+/// `sqrts[sd]`: their memory forms merge into the destination XMM register and
+/// would inherit a false dependency on its previous value.
 pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
@@ -249,28 +286,51 @@ pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInf
             i += 1;
             continue;
         };
-        let legal_op = match load_op {
-            "movsd" => matches!(
-                arith_op,
-                "vaddsd" | "vsubsd" | "vmulsd" | "vdivsd" | "addsd" | "subsd" | "mulsd" | "divsd"
-            ),
-            "movss" => matches!(
-                arith_op,
-                "vaddss" | "vsubss" | "vmulss" | "vdivss" | "addss" | "subss" | "mulss" | "divss"
-            ),
-            _ => false,
-        };
+        let to_gp = scalar_cvt_to_gp_load(arith_op) == Some(load_op);
+        let legal_op = to_gp
+            || match load_op {
+                "movsd" => matches!(
+                    arith_op,
+                    "vaddsd"
+                        | "vsubsd"
+                        | "vmulsd"
+                        | "vdivsd"
+                        | "addsd"
+                        | "subsd"
+                        | "mulsd"
+                        | "divsd"
+                ),
+                "movss" => matches!(
+                    arith_op,
+                    "vaddss"
+                        | "vsubss"
+                        | "vmulss"
+                        | "vdivss"
+                        | "addss"
+                        | "subss"
+                        | "mulss"
+                        | "divss"
+                ),
+                _ => false,
+            };
         if !legal_op {
             i += 1;
             continue;
         }
         let ops: Vec<&str> = arith_operands.split(',').map(str::trim).collect();
-        // VEX 3-operand form (dst == src2 required, and dst may not be the
-        // loaded register: the removed load also supplies the destructive
-        // destination's old value).  Legacy 2-operand form (mulsd/addsd/
-        // subsd/divsd and the *ss variants): src must be the loaded register
-        // and dst must differ from it for the same reason.
-        if arith_op.starts_with('v') {
+        // Conversion to a GPR: `cvt(t)s?2si %xmmS, %gpr` reads the loaded
+        // register once and writes only the GPR.  VEX 3-operand form (dst ==
+        // src2 required, and dst may not be the loaded register: the removed
+        // load also supplies the destructive destination's old value).
+        // Legacy 2-operand form (mulsd/addsd/subsd/divsd and the *ss
+        // variants): src must be the loaded register and dst must differ
+        // from it for the same reason.
+        if to_gp {
+            if ops.len() != 2 || ops[0] != src_reg || plain_gp_operand(ops[1]).is_none() {
+                i += 1;
+                continue;
+            }
+        } else if arith_op.starts_with('v') {
             if ops.len() != 3 || ops[0] != src_reg || ops[1] != ops[2] || ops[1] == src_reg {
                 i += 1;
                 continue;
@@ -3916,6 +3976,76 @@ mod fp_reg_load_tests {
             "memory-source movsd zeroes the high half: full overwrite"
         );
         assert_eq!(out[1], "vmulsd 32(%rsi), %xmm2, %xmm2", "{out:?}");
+    }
+
+    /// `(int)a[i]` as GCC 16.2 and Clang 23.1.5 emit it: the scalar load
+    /// folds into the conversion's memory operand, for both precisions,
+    /// both destination widths, the truncating and the rounding form, and
+    /// the unsuffixed spelling (width from the GPR).
+    #[test]
+    fn folds_load_into_conversion_to_gpr() {
+        for (load, cvt, want) in [
+            (
+                "movsd (%rsi, %r9, 8), %xmm2",
+                "cvttsd2sil %xmm2, %edx",
+                "cvttsd2sil (%rsi, %r9, 8), %edx",
+            ),
+            // (`ret` may read %xmm0/%xmm1 as return registers, so the
+            // loaded register is chosen outside them.)
+            (
+                "movss 4(%rdi), %xmm5",
+                "cvttss2siq %xmm5, %rax",
+                "cvttss2siq 4(%rdi), %rax",
+            ),
+            (
+                "movsd (%rdi), %xmm6",
+                "cvtsd2si %xmm6, %rcx",
+                "cvtsd2si (%rdi), %rcx",
+            ),
+            (
+                "movss .LC0(%rip), %xmm4",
+                "cvtss2sil %xmm4, %r8d",
+                "cvtss2sil .LC0(%rip), %r8d",
+            ),
+        ] {
+            let (changed, out) = run(&format!("    {load}\n    {cvt}\n    ret\n"));
+            assert!(changed, "{load}; {cvt}: {out:?}");
+            assert_eq!(out, [want, "ret"], "{load}; {cvt}");
+        }
+    }
+
+    /// Every legality condition of the conversion fold, one shape each.
+    #[test]
+    fn conversion_fold_refusals() {
+        for (body, why) in [
+            (
+                "    movss (%rsi), %xmm2\n    cvttsd2sil %xmm2, %edx\n    ret\n",
+                "a 4-byte load cannot feed an 8-byte memory read",
+            ),
+            (
+                "    movsd (%rsi), %xmm2\n    cvttss2sil %xmm2, %edx\n    ret\n",
+                "an 8-byte load does not become a 4-byte memory read",
+            ),
+            (
+                "    movsd (%rsi), %xmm2\n    cvttsd2sil %xmm3, %edx\n    ret\n",
+                "the conversion must read the loaded register",
+            ),
+            (
+                "    movsd (%rsi), %xmm2\n    cvttsd2sil %xmm2, %edx\n    addsd %xmm2, %xmm0\n    ret\n",
+                "the loaded value is read again",
+            ),
+            (
+                "    movss (%rsi), %xmm2\n    cvtss2sd %xmm2, %xmm0\n    ret\n",
+                "cvtss2sd's memory form merges into the destination",
+            ),
+            (
+                "    movsd (%rsi), %xmm2\n    sqrtsd %xmm2, %xmm0\n    ret\n",
+                "sqrtsd's memory form merges into the destination",
+            ),
+        ] {
+            let (changed, out) = run(body);
+            assert!(!changed, "{why}: {out:?}");
+        }
     }
 
     /// A BRANCH between the consumer and the pure overwrite invalidates the

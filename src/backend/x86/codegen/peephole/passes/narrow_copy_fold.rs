@@ -914,9 +914,20 @@ pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]
 /// the store reads only `%eax`, so the extension is dead weight, and it is
 /// additionally a window barrier for the LEA→memory fold
 /// ([`has_implicit_reg_usage`] aborts the scan at `cltq`).
+///
+/// The forward scan ends at the first control-flow line. When that line is a
+/// plain transfer or label (`jcc`/`jmp`/`ret`/a fall-through label) and every
+/// family-0 mention before it was a ≤32-bit read, the extension is also dead
+/// when the CFG-aware [`FileLiveness`] proves the whole family dead across the
+/// transfer: no successor reads any bit of `%rax` before redefining it. That
+/// is the loop shape `cvttsd2sil %xmm3, %eax; cltq; movslq %eax, %r11; …;
+/// jl .Lhead` (the `cltq_relay` fold already moved the 64-bit consumer onto
+/// `movslq`), where the header and the exit both redefine `%rax`. Indirect
+/// jumps, pinned lines and inline asm still stop the scan conservatively.
 pub(super) fn eliminate_dead_inplace_ext(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
+    let mut lv: Option<FileLiveness> = None;
     let mut i = 0;
     while i < len {
         if infos[i].is_nop() || infos[i].pinned {
@@ -930,6 +941,10 @@ pub(super) fn eliminate_dead_inplace_ext(store: &mut LineStore, infos: &mut [Lin
             continue;
         }
         let mut dead = false;
+        // The last instruction the scan accepted (the extension itself to
+        // begin with): the liveness query at a transfer asks about the
+        // point just before it.
+        let mut last = i;
         let mut j = i + 1;
         while j < len {
             if infos[j].is_nop() {
@@ -947,7 +962,23 @@ pub(super) fn eliminate_dead_inplace_ext(store: &mut LineStore, infos: &mut [Lin
                 dead = !contains_reg(l, "%rax");
                 break;
             }
-            if infos[j].is_barrier() || infos[j].pinned {
+            if infos[j].pinned {
+                break;
+            }
+            if infos[j].is_barrier() {
+                // Every line in `(i, j)` touched family 0 only as a ≤32-bit
+                // read, so the widened bits are still unobserved here; they
+                // stay unobserved iff no path from this point reads any bit
+                // of the family before redefining it. `live_after` answers
+                // for the whole family (a stronger fact than "bits 63:32
+                // dead"), `None` when the function is not analysable.
+                if matches!(
+                    infos[j].kind,
+                    LineKind::Label | LineKind::Jmp | LineKind::CondJmp | LineKind::Ret
+                ) {
+                    let lv = lv.get_or_insert_with(|| FileLiveness::new(store, infos));
+                    dead = lv.live_after(last, 0) == Some(false);
+                }
                 break;
             }
             if infos[j].kind == LineKind::InlineAsm {
@@ -988,10 +1019,19 @@ pub(super) fn eliminate_dead_inplace_ext(store: &mut LineStore, infos: &mut [Lin
             // Family-0 mentions at ≤32 bits that do not write (`cmpl`,
             // `movl %eax, …`, `(%rax)`-free address operands) or no mention
             // at all: the widened bits stay unread so far.
+            if !matches!(infos[j].kind, LineKind::Directive | LineKind::Empty) {
+                last = j;
+            }
             j += 1;
         }
         if dead {
             mark_nop(&mut infos[i]);
+            // A deleted line whose writes were dead only retires its reads,
+            // so a stale solution would merely be conservative; refreshing
+            // keeps later queries in the same function exact.
+            if let Some(lv) = lv.as_mut() {
+                lv.refresh_at(store, infos, i);
+            }
             changed = true;
         }
         i += 1;

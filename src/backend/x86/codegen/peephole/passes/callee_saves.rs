@@ -24,9 +24,16 @@
 //!   there moves `%rsp` by 8, so the FPO variant only fires in call-free
 //!   functions without aligned vector stack traffic or `%rsp` realignment, and
 //!   it rewrites the single `.cfi_def_cfa_offset` the prologue emits.
+//!
+//! A saved register that IS still used can often move instead:
+//! [`rename_saved_values_into_free_scratch`] renames its value into a
+//! caller-saved scratch register a call-free function never names, which
+//! makes the save unused for the two passes above (transactionally: a rename
+//! whose save survives them is reverted).
 
 use super::super::types::*;
 use super::helpers::*;
+use super::liveness::FileLiveness;
 
 pub(super) fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) {
     let len = store.len();
@@ -692,5 +699,440 @@ fn collapse_superseded_cfa(
             pending = None;
             at_entry = false;
         }
+    }
+}
+
+// ── Saved values into free scratch registers ────────────────────────────────
+
+/// Scratch families a call-free function may take over without a save:
+/// caller-saved under SysV and Microsoft x64 alike, never an argument, return
+/// or IPA-RA keep register (`ipa_ra::KEEP_CANDIDATES` is `%rsi %rdi %r8 %r9`,
+/// so no caller ever relies on a callee preserving these two), and with no
+/// implicit use outside `syscall`/`sysret`, which the implicit-operand oracle
+/// reports.
+const FREE_SCRATCH: [RegId; 2] = [11, 10];
+
+/// What [`rename_saved_values_into_free_scratch`] rewrote, for the
+/// transactional revert: per renamed family, its prologue save line and the
+/// original text of every rewritten line.
+pub(super) struct ScratchRenames {
+    renames: Vec<(usize, Vec<(usize, String)>)>,
+}
+
+impl ScratchRenames {
+    /// Undo every rename whose save line survived Phase 6 (a frame shape the
+    /// elimination refuses): the rename pays only by deleting the save and
+    /// its restores, so a surviving pair would just add REX prefixes.
+    /// Returns how many renames were kept.
+    pub(super) fn revert_unprofitable(
+        self,
+        store: &mut LineStore,
+        infos: &mut [LineInfo],
+    ) -> usize {
+        let mut kept = 0;
+        for (save, lines) in self.renames {
+            if infos[save].is_nop() {
+                kept += 1;
+                continue;
+            }
+            for (k, old) in lines {
+                replace_line(store, &mut infos[k], k, old);
+            }
+        }
+        kept
+    }
+}
+
+/// Move the value of a used callee-saved register into a caller-saved
+/// scratch register the function never names, so that Phase 6
+/// ([`eliminate_unused_callee_saves`], [`eliminate_unused_callee_saves_fpo`])
+/// drops its `pushq`/`popq` pair.
+///
+/// The register allocator assigns homes before the peephole folds staged
+/// address arithmetic into memory operands, so a leaf that needed `%r10` and
+/// `%r11` at allocation time can end with both unused while a temporary
+/// still lives in `%rbx` behind a save/restore pair (the `halve_add` loop:
+/// `pushq %rbx; …; movl %edx, %ebx; sarl $1, %ebx; …; popq %rbx`). GCC 16.2
+/// and Clang 23.1.5 never save a callee-saved register while a scratch
+/// register is free.
+///
+/// Legal, for the function bounded by `.cfi_startproc`/`.cfi_endproc`, when:
+/// 1. it makes no call and holds no inline asm, pinned line, indirect or
+///    tail jump (a callee could read the scratch register as an argument or
+///    static chain, or clobber it) and no `iret`/`sysret` (an interrupt or
+///    system-call frame preserves every register);
+/// 2. the saved family is pushed exactly once, in the prologue, popped only
+///    in epilogues, and its incoming value is dead after the push
+///    ([`FileLiveness`]) — every other mention belongs to the function's
+///    own value;
+/// 3. the scratch family is mentioned nowhere in the function, and no
+///    instruction uses it or the saved family implicitly (`cpuid`,
+///    `cmpxchg16b`, `syscall`, …);
+/// 4. no rewritten line names a high-byte register (`%bh` has no `%r11`
+///    spelling, and `%ah`..`%dh` cannot be encoded beside a REX operand).
+///
+/// The scratch register's incoming value is never read (it is never named
+/// and no call or tail jump forwards it), `ret` reads only `%rax`/`%rdx`,
+/// and the caller assumes it clobbered, so taking it over is invisible
+/// outside the function. Directives are never rewritten: the `.cfi_offset`
+/// of the save belongs to the pair Phase 6 deletes.
+pub(super) fn rename_saved_values_into_free_scratch(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> ScratchRenames {
+    let len = store.len();
+    let mut out = ScratchRenames {
+        renames: Vec::new(),
+    };
+    let mut lv: Option<FileLiveness> = None;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || !infos[i].trimmed(store.get(i)).starts_with(".cfi_startproc") {
+            i += 1;
+            continue;
+        }
+        let end = (i + 1..len)
+            .find(|&k| {
+                !infos[k].is_nop() && infos[k].trimmed(store.get(k)).starts_with(".cfi_endproc")
+            })
+            .unwrap_or(len);
+        rename_in_function(store, infos, i, end, &mut lv, &mut out);
+        i = end.max(i + 1);
+    }
+    out
+}
+
+/// High-byte spellings: no `%r10`/`%r11` counterpart, and not encodable in
+/// an instruction that also needs a REX prefix.
+const HIGH_BYTES: [&str; 4] = ["%ah", "%bh", "%ch", "%dh"];
+
+fn rename_in_function(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    start: usize,
+    end: usize,
+    lv: &mut Option<FileLiveness>,
+    out: &mut ScratchRenames,
+) {
+    // Rule 1, and the census of explicit and implicit register uses.
+    let mut named: u16 = 0;
+    let mut implicit: u16 = 0;
+    for k in start + 1..end {
+        if infos[k].is_nop() {
+            continue;
+        }
+        let t = infos[k].trimmed(store.get(k));
+        match infos[k].kind {
+            LineKind::Call | LineKind::JmpIndirect | LineKind::InlineAsm => return,
+            LineKind::Jmp
+                if !t
+                    .split_whitespace()
+                    .nth(1)
+                    .is_some_and(|l| l.starts_with(".L")) =>
+            {
+                return;
+            }
+            _ => {}
+        }
+        if infos[k].pinned || t.starts_with("iret") || t.starts_with("sysret") {
+            return;
+        }
+        named |= infos[k].reg_refs;
+        implicit |= implicit_reg_refs(t.as_bytes());
+    }
+
+    // The prologue's callee-saved pushes, after an optional frame setup.
+    let mut j = next_insn(store, infos, start + 1, end);
+    if j < end && matches!(infos[j].kind, LineKind::Push { reg: REG_RBP }) {
+        let n = next_insn(store, infos, j + 1, end);
+        if n < end && infos[n].trimmed(store.get(n)) == "movq %rsp, %rbp" {
+            j = next_insn(store, infos, n + 1, end);
+        }
+    }
+    let mut saves: Vec<(RegId, usize)> = Vec::new();
+    while j < end {
+        match infos[j].kind {
+            LineKind::Push { reg } if is_callee_saved_reg(reg) => saves.push((reg, j)),
+            // A frame-pointer-omitted `%rbp` save: never renamed, but the
+            // pushes after it are still prologue saves.
+            LineKind::Push { reg: REG_RBP } => {}
+            _ => break,
+        }
+        j = next_insn(store, infos, j + 1, end);
+    }
+
+    for (fam, save) in saves {
+        let fam_bit = 1u16 << fam;
+        if implicit & fam_bit != 0 {
+            continue;
+        }
+        let Some(&scratch) = FREE_SCRATCH
+            .iter()
+            .find(|&&r| (named | implicit) & (1u16 << r) == 0)
+        else {
+            return;
+        };
+        // Rule 2: the one prologue push, epilogue pops, and body mentions.
+        let mut body: Vec<usize> = Vec::new();
+        let mut legal = true;
+        for k in start + 1..end {
+            if k == save || infos[k].is_nop() || infos[k].reg_refs & fam_bit == 0 {
+                continue;
+            }
+            let t = infos[k].trimmed(store.get(k));
+            match infos[k].kind {
+                LineKind::Pop { reg } if reg == fam && fpo_epilogue_pop(store, infos, k, end) => {}
+                LineKind::Push { .. } | LineKind::Pop { .. } => legal = false,
+                LineKind::Directive if t.starts_with(".cfi_") => {}
+                LineKind::Directive | LineKind::Label => legal = false,
+                _ if HIGH_BYTES.iter().any(|h| t.contains(h)) => legal = false,
+                _ => body.push(k),
+            }
+            if !legal {
+                break;
+            }
+        }
+        if !legal || body.is_empty() {
+            continue;
+        }
+        let lv = lv.get_or_insert_with(|| FileLiveness::new(store, infos));
+        if lv.live_after(save, fam) != Some(false) {
+            continue;
+        }
+        let mut undo: Vec<(usize, String)> = Vec::with_capacity(body.len());
+        for &k in &body {
+            let old = store.get(k).to_string();
+            let renamed = replace_reg_family(infos[k].trimmed(&old), fam, scratch);
+            replace_line(store, &mut infos[k], k, format!("    {renamed}"));
+            undo.push((k, old));
+        }
+        lv.refresh_at(store, infos, save);
+        named |= 1u16 << scratch;
+        out.renames.push((save, undo));
+    }
+}
+
+#[cfg(test)]
+mod scratch_rename_tests {
+    use super::*;
+    use crate::backend::peephole_common::LineStore;
+
+    fn lines(asm: &str) -> (LineStore, Vec<LineInfo>) {
+        let store = LineStore::new(asm.to_string());
+        let infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        (store, infos)
+    }
+
+    /// The Phase 6 transaction as `peephole_optimize` runs it.
+    fn phase6(asm: &str) -> (usize, String) {
+        let (mut store, mut infos) = lines(asm);
+        let renames = rename_saved_values_into_free_scratch(&mut store, &mut infos);
+        eliminate_unused_callee_saves(&mut store, &mut infos);
+        eliminate_unused_callee_saves_fpo(&mut store, &mut infos);
+        let kept = renames.revert_unprofitable(&mut store, &mut infos);
+        (kept, store.build_result(|i| infos[i].is_nop()))
+    }
+
+    /// Whether the rename step alone proposes anything.
+    fn proposes(asm: &str) -> bool {
+        let (mut store, mut infos) = lines(asm);
+        !rename_saved_values_into_free_scratch(&mut store, &mut infos)
+            .renames
+            .is_empty()
+    }
+
+    /// `halve_add` after the address folds: `%r10`/`%r11` are free, the
+    /// `sar` temporary sits in `%rbx` behind a save/restore pair.
+    const HALVE_ADD: &str = concat!(
+        "halve_add:\n",
+        ".cfi_startproc\n",
+        "    pushq %rbx\n",
+        "    movslq %edx, %r8\n",
+        "    xorl %r9d, %r9d\n",
+        ".LBB6:\n",
+        "    cmpq %r8, %r9\n",
+        "    jge .LBB8\n",
+        ".LBB7:\n",
+        "    cvttsd2sil (%rsi,%r9,8), %edx\n",
+        "    movl %edx, %ebx\n",
+        "    sarl $1, %ebx\n",
+        "    leal (%rdx,%rbx), %eax\n",
+        "    movl %eax, (%rdi,%r9,4)\n",
+        "    addq $1, %r9\n",
+        "    cmpq %r8, %r9\n",
+        "    jl .LBB7\n",
+        ".LBB8:\n",
+        "    popq %rbx\n",
+        "    ret\n",
+        ".cfi_endproc\n",
+        ".size halve_add, .-halve_add\n",
+    );
+
+    #[test]
+    fn a_saved_temporary_moves_into_a_free_scratch_register() {
+        let (kept, out) = phase6(HALVE_ADD);
+        assert_eq!(kept, 1, "{out}");
+        for want in [
+            "movl %edx, %r11d",
+            "sarl $1, %r11d",
+            "leal (%rdx,%r11), %eax",
+        ] {
+            assert!(out.contains(want), "{want}:\n{out}");
+        }
+        for gone in ["%rbx", "%ebx", "pushq", "popq"] {
+            assert!(!out.contains(gone), "{gone}:\n{out}");
+        }
+    }
+
+    /// The whole pipeline reaches the same result (the leaf GCC 16.2 and
+    /// Clang 23.1.5 emit without any save).
+    #[test]
+    fn the_pipeline_drops_the_save_of_a_renamed_temporary() {
+        let out = super::super::super::peephole_optimize(HALVE_ADD.to_string());
+        assert!(!out.contains("pushq") && !out.contains("popq"), "{out}");
+        assert!(!out.contains("%rbx") && !out.contains("%ebx"), "{out}");
+        assert!(out.contains("sarl $1, %r11d"), "{out}");
+    }
+
+    /// Two saved families take the two scratch registers (`%r11` first);
+    /// a dead third save goes as before.
+    #[test]
+    fn two_saved_families_take_both_scratch_registers() {
+        let (kept, out) = phase6(concat!(
+            "isort:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    pushq %r12\n",
+            "    pushq %r13\n",
+            "    .cfi_def_cfa_offset 32\n",
+            "    leaq 4(%rdi), %rbx\n",
+            "    movl $1, %r12d\n",
+            ".LBB1:\n",
+            "    addl %r12d, %ebx\n",
+            "    addl $1, %r12d\n",
+            "    cmpl %esi, %r12d\n",
+            "    jl .LBB1\n",
+            "    movl %ebx, %eax\n",
+            "    popq %r13\n",
+            "    popq %r12\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size isort, .-isort\n",
+        ));
+        assert_eq!(kept, 2, "{out}");
+        assert!(out.contains("leaq 4(%rdi), %r11"), "{out}");
+        assert!(out.contains("addl %r10d, %r11d"), "{out}");
+        assert!(!out.contains("push") && !out.contains("pop"), "{out}");
+        assert!(!out.contains(".cfi_def_cfa_offset 32"), "{out}");
+    }
+
+    /// Frame-pointer shape: the `%rbx` pair goes, the frame stays.
+    #[test]
+    fn frame_pointer_functions_rename_too() {
+        let (kept, out) = phase6(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbp\n",
+            "    movq %rsp, %rbp\n",
+            "    pushq %rbx\n",
+            "    movl %edi, %ebx\n",
+            "    imull %ebx, %ebx\n",
+            "    movl %ebx, %eax\n",
+            "    popq %rbx\n",
+            "    popq %rbp\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        ));
+        assert_eq!(kept, 1, "{out}");
+        assert!(out.contains("imull %r11d, %r11d"), "{out}");
+        assert!(!out.contains("%rbx") && !out.contains("%ebx"), "{out}");
+        assert!(
+            out.contains("pushq %rbp") && out.contains("popq %rbp"),
+            "{out}"
+        );
+    }
+
+    /// A pushes-only frame with a slot below the saves cannot be
+    /// re-anchored, so Phase 6 keeps the pair and the rename is reverted
+    /// byte for byte.
+    #[test]
+    fn a_rename_whose_save_survives_is_reverted() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbp\n",
+            "    movq %rsp, %rbp\n",
+            "    pushq %rbx\n",
+            "    movl %edi, %ebx\n",
+            "    movl %ebx, -12(%rbp)\n",
+            "    movl -12(%rbp), %eax\n",
+            "    popq %rbx\n",
+            "    popq %rbp\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        );
+        assert!(proposes(asm), "the rename itself is legal here");
+        let (kept, out) = phase6(asm);
+        assert_eq!(kept, 0, "{out}");
+        assert_eq!(out, asm);
+    }
+
+    /// One shape per legality rule; none may be renamed.
+    #[test]
+    fn every_legality_rule_blocks_the_rename() {
+        let wrap = |body: &str| {
+            format!(
+                "f:\n.cfi_startproc\n    pushq %rbx\n{body}    popq %rbx\n    ret\n.cfi_endproc\n.size f, .-f\n"
+            )
+        };
+        for (body, why) in [
+            (
+                "    movl %edi, %ebx\n    call g\n    movl %ebx, %eax\n",
+                "a call clobbers the scratch registers",
+            ),
+            (
+                "    movl %edi, %ebx\n    movl %ebx, %eax\n    popq %rbx\n    jmp g\n",
+                "a tail jump forwards registers to its callee",
+            ),
+            (
+                "    movl %edi, %ebx\n    movl %esi, %r10d\n    movl %edx, %r11d\n    addl %r10d, %ebx\n    addl %r11d, %ebx\n    movl %ebx, %eax\n",
+                "both scratch registers are named",
+            ),
+            (
+                "    movl %edi, %ebx\n    movb %bh, (%rsi)\n",
+                "%bh has no %r11 spelling",
+            ),
+            (
+                "    movl %edi, %ebx\n    movb %ah, (%rsi,%rbx)\n",
+                "a high-byte operand cannot sit beside a REX register",
+            ),
+            (
+                "    movq %rbx, %rax\n    movl %edi, %ebx\n    addq %rbx, %rax\n",
+                "the caller's %rbx is read",
+            ),
+            (
+                "    movl %edi, %ebx\n    cpuid\n    movl %ebx, %eax\n",
+                "cpuid writes %rbx implicitly",
+            ),
+            (
+                "    movl %edi, %ebx\n    pushq %rbx\n    popq %rbx\n    movl %ebx, %eax\n",
+                "a body push/pop of the saved family",
+            ),
+            (
+                "    movl %edi, %ebx\n    syscall\n    movl %ebx, %eax\n",
+                "syscall clobbers %r11 (and %r10 is an argument)",
+            ),
+        ] {
+            assert!(!proposes(&wrap(body)), "{why}:\n{}", wrap(body));
+        }
+        // Control: the same frame with a plain body is renamed.
+        assert!(proposes(&wrap(
+            "    movl %edi, %ebx\n    movl %ebx, %eax\n"
+        )));
     }
 }

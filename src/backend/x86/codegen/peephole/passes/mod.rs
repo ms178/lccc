@@ -2256,10 +2256,18 @@ fn peephole_optimize_inner(
         vector_copy::fold_composed_dword_shuffles(&mut store, &mut infos);
     }
 
-    // Phase 6: Eliminate unused callee-saved register saves/restores.
+    // Phase 6: Eliminate unused callee-saved register saves/restores. A
+    // call-free function's still-used saved value first moves into a
+    // scratch register it never names (`scratch_rename`), making the save
+    // unused; renames whose save survives the elimination are reverted.
     if !skip_phase6 {
+        let renames = (!sk("scratch_rename"))
+            .then(|| callee_saves::rename_saved_values_into_free_scratch(&mut store, &mut infos));
         callee_saves::eliminate_unused_callee_saves(&mut store, &mut infos);
         callee_saves::eliminate_unused_callee_saves_fpo(&mut store, &mut infos);
+        if let Some(renames) = renames {
+            renames.revert_unprofitable(&mut store, &mut infos);
+        }
     }
 
     // Phase 7: Compact stack frames.
@@ -5971,6 +5979,9 @@ mod regression_tests {
     }
     #[test]
     fn fpo_dead_callee_save_is_dropped_and_cfa_rewritten() {
+        // The live %rbx/%r12 saves must survive for the CFA rewrite to be
+        // observable; the scratch rename would move both into %r11/%r10.
+        let _skip = super::test_skips::skip_passes(&["scratch_rename"]);
         let asm = concat!(
             "isort:\n",
             ".cfi_startproc\n",

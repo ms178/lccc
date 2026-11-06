@@ -273,6 +273,9 @@ mod tests {
 
     #[test]
     fn parameter_shuffle_is_coalesced_away() {
+        // Pins the coalescer on a callee-saved loop counter; the Phase 6
+        // scratch rename would move %rbx into %r11 (its own tests).
+        let _skip = super::super::test_skips::skip_passes(&["scratch_rename"]);
         let out = run(concat!(
             "sum8:\n",
             ".cfi_startproc\n",
