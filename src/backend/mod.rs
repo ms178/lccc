@@ -820,7 +820,9 @@ impl Target {
                         break insert_fn_entry_locs(asm, &cg.state.fn_entry_locs);
                     }
                     if opts.ra_config.debug_ra {
-                        eprintln!("[IPA-RA] round {round}: {violations:?}");
+                        lccc::cli::stderr_line(format_args!(
+                            "[IPA-RA] round {round}: {violations:?}"
+                        ));
                     }
                     poisoned_callees.extend(violations.callees);
                     poisoned_callers.extend(violations.callers);
@@ -975,7 +977,9 @@ impl Target {
             // Handle -Wa,--version: print GNU-compatible version string for
             // kernel build system's as-version.sh probe.
             if extra_args.iter().any(|a| a == "--version") {
-                println!("GNU assembler (Claude's C Compiler built-in) 2.42");
+                lccc::cli::stdout_line(format_args!(
+                    "GNU assembler (Claude's C Compiler built-in) 2.42"
+                ));
                 return Ok(());
             }
 

@@ -1166,7 +1166,7 @@ fn find_escaped_param_allocas(func: &IrFunction) -> FxHashSet<u32> {
     escaped
 }
 
-/// All parameter allocas (first `num_params` allocas in the entry block).
+/// All parameter homes, from the authoritative `param_alloca_values` field.
 fn find_param_allocas(func: &IrFunction) -> FxHashSet<u32> {
     func.param_alloca_values.iter().map(|v| v.0).collect()
 }
@@ -1999,7 +1999,10 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                     match state.ptr_base.get(&pvn) {
                         Some(base) => {
                             if std::env::var_os("CCC_DEBUG_GVN").is_some() {
-                                eprintln!("[GVNDBG] store bumps epoch of {:?}", base);
+                                lccc::cli::stderr_line(format_args!(
+                                    "[GVNDBG] store bumps epoch of {:?}",
+                                    base
+                                ));
                             }
                             let key = obj_key(base);
                             state.next_base_epoch = state.next_base_epoch.saturating_add(1);
@@ -2010,14 +2013,18 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                         }
                         None => {
                             if std::env::var_os("CCC_DEBUG_GVN").is_some() {
-                                eprintln!("[GVNDBG] store UNKNOWN base -> global gen++");
+                                lccc::cli::stderr_line(format_args!(
+                                    "[GVNDBG] store UNKNOWN base -> global gen++"
+                                ));
                             }
                             state.load_generation += 1;
                         }
                     }
                 } else {
                     if std::env::var_os("CCC_DEBUG_GVN").is_some() {
-                        eprintln!("[GVNDBG] store CONST base -> global gen++");
+                        lccc::cli::stderr_line(format_args!(
+                            "[GVNDBG] store CONST base -> global gen++"
+                        ));
                     }
                     state.load_generation += 1;
                 }
@@ -2084,19 +2091,19 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                             let stored_is_multi_def = matches!(stored_op, Operand::Value(v)
                                 if state.multi_def_values.contains(&v.0));
                             if std::env::var_os("CCC_DEBUG_GVN").is_some() {
-                                eprintln!(
+                                lccc::cli::stderr_line(format_args!(
                                     "[GVNDBG] fwd cand ptr_vn={:?} valid={}",
                                     ptr_vn,
                                     state.entry_valid_for(ptr_vn, *version)
-                                );
+                                ));
                             }
                             if state.entry_valid_for(ptr_vn, *version) && !stored_is_multi_def {
                                 let stored_op = *stored_op;
                                 if std::env::var_os("CCC_DEBUG_GVN").is_some() {
-                                    eprintln!(
+                                    lccc::cli::stderr_line(format_args!(
                                         "[GVNDBG] FORWARD store->load dest={} stored={:?}",
                                         dest.0, stored_op
-                                    );
+                                    ));
                                 }
                                 // Forward the stored value to the load destination.
                                 // Assign the dest a VN matching the stored value.
@@ -2291,12 +2298,15 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                 if let Some((existing_value, xload_tys)) = cse_source {
                     if std::env::var_os("CCC_DEBUG_GVN").is_some() {
                         if let Some((canon_ty, cand_ty)) = xload_tys {
-                            eprintln!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[GVNDBG] CSE xload dest={} <- {} ({:?}->{:?})",
                                 dest.0, existing_value.0, canon_ty, cand_ty
-                            );
+                            ));
                         } else {
-                            eprintln!("[GVNDBG] CSE load dest={} <- {}", dest.0, existing_value.0);
+                            lccc::cli::stderr_line(format_args!(
+                                "[GVNDBG] CSE load dest={} <- {}",
+                                dest.0, existing_value.0
+                            ));
                         }
                     }
                     let idx = existing_value.0 as usize;

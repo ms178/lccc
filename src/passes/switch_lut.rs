@@ -1384,7 +1384,9 @@ mod tests {
             .collect();
         let lookup = start.elapsed();
         assert_eq!(old, indexed);
-        eprintln!("2000 definitions/queries: scan={scan:?}, collect+lookup={lookup:?}");
+        lccc::cli::stderr_line(format_args!(
+            "2000 definitions/queries: scan={scan:?}, collect+lookup={lookup:?}"
+        ));
     }
 
     #[test]

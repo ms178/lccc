@@ -256,7 +256,7 @@ pub(crate) fn sink_vector_loads(func: &mut IrFunction) -> usize {
                     Instruction::Intrinsic { op, .. } => format!("{:?}", op),
                     _ => String::new(),
                 };
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-LOAD-SINK] {} b{}: move %{} from i{} to i{} (consumer {})",
                     func.name,
                     bi,
@@ -264,7 +264,7 @@ pub(crate) fn sink_vector_loads(func: &mut IrFunction) -> usize {
                     i,
                     uj - 1,
                     consumer
-                );
+                ));
             }
             let inst = block.instructions.remove(i);
             block.instructions.insert(uj - 1, inst);

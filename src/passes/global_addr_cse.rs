@@ -48,7 +48,7 @@ use crate::ir::reexports::{Instruction, IrFunction, IrModule, Operand, Value};
 
 fn debug_merged(name: &str, n: usize) {
     if std::env::var_os("CCC_DEBUG_GADDR_CSE").is_some() {
-        eprintln!("[GADDR_CSE] fn={} merged={}", name, n);
+        lccc::cli::stderr_line(format_args!("[GADDR_CSE] fn={} merged={}", name, n));
     }
 }
 

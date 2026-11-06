@@ -160,10 +160,10 @@ pub fn eliminate_phis(module: &mut IrModule, narrow_gprs: bool) {
         }
     }
     if std::env::var("LCCC_DEBUG_LABELS").is_ok() {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[PHI] Starting phi_eliminate with next_block_id = {} policy={:?}",
             next_block_id, policy
-        );
+        ));
     }
 
     for func in &mut module.functions {
@@ -171,20 +171,20 @@ pub fn eliminate_phis(module: &mut IrModule, narrow_gprs: bool) {
             continue;
         }
         if std::env::var("LCCC_DEBUG_LABELS").is_ok() {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[PHI] Processing function {}, current labels: {:?}",
                 func.name,
                 func.blocks.iter().map(|b| b.label.0).collect::<Vec<_>>()
-            );
+            ));
         }
         eliminate_phis_with_policy(func, &mut next_block_id, policy);
         if std::env::var("LCCC_DEBUG_LABELS").is_ok() {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[PHI] After processing {}, labels: {:?}, next_block_id now {}",
                 func.name,
                 func.blocks.iter().map(|b| b.label.0).collect::<Vec<_>>(),
                 next_block_id
-            );
+            ));
         }
     }
 }
@@ -319,11 +319,11 @@ fn get_or_create_trampoline(
             let idx = trampolines.len();
             let label = BlockId(*next_block_id);
             if std::env::var("LCCC_DEBUG_LABELS").is_ok() {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[PHI] Creating trampoline block with BlockId({}), next will be {}",
                     label.0,
                     *next_block_id + 1
-                );
+                ));
             }
             *next_block_id += 1;
             trampolines.push(TrampolineBlock {
@@ -860,13 +860,13 @@ fn emit_multi_phi_copies(
         let edge_copies =
             build_edge_copies(phis, &phi_temps, &phi_src_maps, pred_label, &plan.ordered);
         if std::env::var_os("CCC_DEBUG_PHIELIM").is_some() {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[PHIELIM] block {} phis={:?} pred {} copies={:?}",
                 target_block_id.0,
                 phis.iter().map(|p| p.dest.0).collect::<Vec<_>>(),
                 pred_label.0,
                 edge_copies
-            );
+            ));
         }
         place_copies(ctx, pred_idx, target_block_id, edge_copies);
     }
@@ -1337,13 +1337,13 @@ fn resolve_self_loop_copies(func: &IrFunction, ctx: &mut PhiElimCtx) {
                     _ => "?".to_string(),
                 })
                 .collect();
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[PHI] self-loop block {}: {} ({} copies: {})",
                 target_block_id.0,
                 if hoist { "absorb" } else { "split" },
                 copies.len(),
                 dests.join(", ")
-            );
+            ));
         }
         if hoist {
             ctx.pred_copies.entry(block_idx).or_default().extend(copies);

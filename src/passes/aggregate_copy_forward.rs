@@ -652,7 +652,10 @@ fn reject_conflicting_constructions(
     }
     if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
         for r in &reject {
-            eprintln!("[STOREFWD-REJ] {} root=v{} dest-window", func.name, r);
+            lccc::cli::stderr_line(format_args!(
+                "[STOREFWD-REJ] {} root=v{} dest-window",
+                func.name, r
+            ));
         }
     }
     for root in reject {
@@ -673,8 +676,8 @@ fn forward_store_only_temporaries(
         .filter_map(|(&v, (root, path))| (v == *root && path.is_empty()).then_some(v))
         .collect();
     // Entry-block allocas homing register parameters are written by the
-    // PROLOGUE, not by IR-visible stores (find_param_alloca maps param i to
-    // the i-th entry-block alloca; the x86/arm prologues spill incoming
+    // PROLOGUE, not by IR-visible stores (`ParamAllocaIndex` maps param i to
+    // `param_alloca_values[i]`; the x86/arm prologues spill incoming
     // registers there). Forwarding such a root redirects only the IR stores
     // and deletes the copy — the implicit prologue write is lost and the
     // copy destination stays uninitialized (dump128(__m128 v): the
@@ -862,10 +865,10 @@ fn forward_store_only_temporaries(
         }
         if let Some((bi, gep_idx, insert_at)) = hoist {
             if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[STOREFWD-HOIST] {} b{} gep@{} -> {}",
                     func.name, bi, gep_idx, insert_at
-                );
+                ));
             }
             let block = &mut func.blocks[bi];
             // Source spans are optional metadata and must be parallel to the
@@ -979,7 +982,10 @@ fn forward_store_only_temporaries(
     }
     if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
         for r in &invalid {
-            eprintln!("[STOREFWD-REJ] {} root=v{} invalid-use", func.name, r);
+            lccc::cli::stderr_line(format_args!(
+                "[STOREFWD-REJ] {} root=v{} invalid-use",
+                func.name, r
+            ));
         }
     }
     for root in invalid {
@@ -1026,10 +1032,10 @@ fn forward_store_only_temporaries(
 
     if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
         for (&root, &(bi, copy_i, dest)) in &copies {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[STOREFWD] {} root=v{} dest=v{} at b{}:{}",
                 func.name, root, dest.0, bi, copy_i
-            );
+            ));
         }
     }
     let mut changes = 0;
@@ -1446,10 +1452,10 @@ fn run_impl(
 
     if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
         for (root, c) in &candidates {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[AGGFWD] {} root=v{} src=v{} src_root=v{} at b{}:{}",
                 func.name, root, c.source.0, c.source_root, c.block, c.inst
-            );
+            ));
         }
     }
     let mut changes = 0;

@@ -960,7 +960,7 @@ impl I686Codegen {
                 && !self.divrem_broken_tails.contains(&dest.0)
             {
                 if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
-                    eprintln!("[DIVREM] tail-skip dest={}", dest.0);
+                    lccc::cli::stderr_line(format_args!("[DIVREM] tail-skip dest={}", dest.0));
                 }
                 // Tail: nothing to emit. The accumulator cache makes no
                 // claim about this dest (it was never staged through %eax),
@@ -971,16 +971,19 @@ impl I686Codegen {
                 // Pair was broken at head-emission time (pathological home
                 // combination): both sides emit standalone divisions.
                 if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
-                    eprintln!("[DIVREM] tail-broken dest={} (standalone)", dest.0);
+                    lccc::cli::stderr_line(format_args!(
+                        "[DIVREM] tail-broken dest={} (standalone)",
+                        dest.0
+                    ));
                 }
             } else if let Some(&(partner_dest, partner_from_eax)) =
                 self.divrem_head_partners.get(&dest.0)
             {
                 if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[DIVREM] head-emit dest={} op={:?} partner={} partner_from_eax={}",
                         dest.0, op, partner_dest, partner_from_eax
-                    );
+                    ));
                 }
                 let fused =
                     self.emit_divrem_pair_head(dest, op, lhs, rhs, partner_dest, partner_from_eax);
@@ -990,7 +993,10 @@ impl I686Codegen {
                 // Broken pair: fall through to the standalone path; the
                 // partner (tail) was marked broken above.
                 if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
-                    eprintln!("[DIVREM] head-broken dest={} (standalone)", dest.0);
+                    lccc::cli::stderr_line(format_args!(
+                        "[DIVREM] head-broken dest={} (standalone)",
+                        dest.0
+                    ));
                 }
             }
         }

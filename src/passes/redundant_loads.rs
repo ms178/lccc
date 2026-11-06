@@ -65,14 +65,14 @@ fn retain_available_across_call(
     available
         .retain(|(_, _, _, pointer)| !analysis.may_call_modify(func, block, instruction, *pointer));
     if std::env::var_os("CCC_IPA_PTA_STATS").is_some() {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[IPA-PTA] consumer function={} block={} instruction={} available={}->{}",
             func.name,
             block,
             instruction,
             before,
             available.len()
-        );
+        ));
     }
 }
 

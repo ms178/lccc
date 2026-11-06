@@ -657,16 +657,16 @@ impl ArmCodegen {
         ) {
             if self.divrem_tail_dests.contains(&dest.0) {
                 if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
-                    eprintln!("[DIVREM-ARM] tail-skip dest={}", dest.0);
+                    lccc::cli::stderr_line(format_args!("[DIVREM-ARM] tail-skip dest={}", dest.0));
                 }
                 return;
             }
             if let Some(&partner_dest) = self.divrem_head_partners.get(&dest.0) {
                 if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[DIVREM-ARM] head-emit dest={} op={:?} partner={}",
                         dest.0, op, partner_dest
-                    );
+                    ));
                 }
                 self.emit_divrem_pair_head_arm(dest, op, lhs, rhs, use_32bit, partner_dest);
                 return;

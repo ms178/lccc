@@ -122,7 +122,7 @@ fn load_file_depth(
     depth: usize,
 ) -> Result<(), String> {
     if std::env::var("LINKER_DEBUG").is_ok() {
-        eprintln!("load_file: {}", path);
+        lccc::cli::stderr_line(format_args!("load_file: {}", path));
     }
 
     // Map the file instead of reading it.

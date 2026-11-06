@@ -1644,14 +1644,17 @@ pub(crate) fn collect_folded_index_links(
     if std::env::var_os("CCC_DEBUG_FOLDED_INDEX").is_some() {
         let mut links: Vec<(&u32, &Vec<u32>)> = out.iter().collect();
         links.sort_unstable();
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[FOLDIDX] fn={} links={} gep_map={}",
             func.name,
             links.len(),
             m.len()
-        );
+        ));
         for (idx, dests) in links {
-            eprintln!("[FOLDIDX]   idx=v{} consumers={:?}", idx, dests);
+            lccc::cli::stderr_line(format_args!(
+                "[FOLDIDX]   idx=v{} consumers={:?}",
+                idx, dests
+            ));
         }
     }
     out
@@ -2003,14 +2006,17 @@ pub(crate) fn collect_folded_gep_links_all(
     if std::env::var_os("CCC_DEBUG_FOLDED_INDEX").is_some() {
         let mut links: Vec<(&u32, &Vec<u32>)> = out.iter().collect();
         links.sort_unstable();
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[FOLDLINKS] fn={} links={} indexed_gep_map={}",
             func.name,
             links.len(),
             m.len()
-        );
+        ));
         for (operand, dests) in links {
-            eprintln!("[FOLDLINKS]   operand=v{} consumers={:?}", operand, dests);
+            lccc::cli::stderr_line(format_args!(
+                "[FOLDLINKS]   operand=v{} consumers={:?}",
+                operand, dests
+            ));
         }
     }
     out
@@ -2744,11 +2750,11 @@ fn build_gep_fold_map(
     retain_used(&mut gep_map, use_counts);
 
     if env_flag_set("CCC_DEBUG_GEPFOLD") {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[GEPFOLD] total_candidates={} remaining={}",
             original_count,
             gep_map.len()
-        );
+        ));
     }
     gep_map
 }
@@ -5765,7 +5771,7 @@ fn emit_functions_and_sections(
                         crate::passes::block_layout::count_stack_operands(&chain_peep);
                     let orig_stack = crate::passes::block_layout::count_stack_operands(&orig_peep);
                     if std::env::var_os("CCC_DEBUG_CHAIN").is_some() {
-                        eprintln!(
+                        lccc::cli::stderr_line(format_args!(
                             "[LAYOUT] chain {} ins + {} br = {} (stack {}) | orig {} ins + {} br = {} (stack {})",
                             chain_lines,
                             chain_branch,
@@ -5775,7 +5781,7 @@ fn emit_functions_and_sections(
                             orig_branch,
                             orig_count,
                             orig_stack
-                        );
+                        ));
                     }
                     crate::backend::state::EXPLORATORY_EMISSION.with(|flag| flag.set(false));
                     // Emit the measured winner for real: debug traces fire
@@ -6242,7 +6248,7 @@ fn generate_function_body(
             }
             let _ = writeln!(out, "  term: {:?}", block.terminator);
         }
-        eprintln!("{}", out);
+        lccc::cli::stderr_line(format_args!("{}", out));
     }
 
     let type_dir = cg.function_type_directive();
@@ -6364,10 +6370,10 @@ fn generate_function_body(
             if classic && !cg.supports_classic_mcount() {
                 if !cg.state().mcount_unsupported_warned {
                     cg.state().mcount_unsupported_warned = true;
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "ccc: warning: classic -pg (call mcount) is not yet implemented \
                          for this target; use -mfentry/-mnop-mcount or disable ftrace"
-                    );
+                    ));
                 }
             } else if cg.supports_mcount() {
                 let mcount_label = if mc.record {
@@ -6427,10 +6433,10 @@ fn generate_function_body(
                 }
             } else if !cg.state().mcount_unsupported_warned {
                 cg.state().mcount_unsupported_warned = true;
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "ccc: warning: -pg function-entry instrumentation is not yet \
                      implemented for this target; no mcount/__fentry__ sites are emitted"
-                );
+                ));
             }
         }
     }
@@ -7396,22 +7402,22 @@ fn generate_function_body(
             // can fold against alloca+c1+c2.
             if let Some(dest) = inst.dest() {
                 if std::env::var_os("LCCC_DBG_FOLD").is_some() {
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[FOLD] inst dest={} in_gep_map={} in_idx_map={} dead_gaddr={}",
                         dest.0,
                         gep_fold_map.get(&dest.0).is_some(),
                         indexed_gep_map.get(&dest.0).is_some(),
                         dead_global_addrs.contains(&dest.0)
-                    );
+                    ));
                 }
                 if let Some(info) = gep_fold_map.get(&dest.0) {
                     if can_const_addr_fold(cg, info) {
                         cg.state().folded_gep_values.insert(dest.0);
                         if std::env::var_os("LCCC_DBG_FOLD").is_some() {
-                            eprintln!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[FOLD] SKIPPED dest={} base={} off={}",
                                 dest.0, info.base.0, info.offset
-                            );
+                            ));
                         }
                         cg.state().current_program_point += 1;
                         continue;
@@ -8229,7 +8235,7 @@ fn generate_instruction_body(
             h
         };
         if hit {
-            eprintln!("[IRW] {:?}", inst);
+            lccc::cli::stderr_line(format_args!("[IRW] {:?}", inst));
         }
     }
     match inst {
@@ -9283,7 +9289,7 @@ fn generate_terminator(
     if let Some((all, watch)) = ir_watch() {
         let hit = all || term.used_values().iter().any(|id| watch.contains(&id));
         if hit {
-            eprintln!("[IRW-term] {:?}", term);
+            lccc::cli::stderr_line(format_args!("[IRW-term] {:?}", term));
         }
     }
     match term {
@@ -9497,8 +9503,8 @@ pub(crate) fn collect_bitop_nonneg_values(func: &IrFunction) -> FxHashSet<u32> {
 }
 
 pub use super::stack_layout::{
-    calculate_stack_space_common, collect_inline_asm_callee_saved,
-    collect_inline_asm_callee_saved_with_generic, filter_available_regs, find_param_alloca,
+    ParamAllocaIndex, calculate_stack_space_common, collect_inline_asm_callee_saved,
+    collect_inline_asm_callee_saved_with_generic, filter_available_regs,
     run_regalloc_and_merge_clobbers, run_regalloc_and_merge_clobbers_ex,
 };
 

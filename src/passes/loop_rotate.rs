@@ -164,7 +164,7 @@ pub(crate) fn rotate_loops(func: &mut IrFunction) -> usize {
         }
         let loops = merge_loops_by_header(raw);
         if std::env::var("CCC_DEBUG_LOOP_ROTATE").is_ok() {
-            eprintln!("[ROT] found {} loops", loops.len());
+            lccc::cli::stderr_line(format_args!("[ROT] found {} loops", loops.len()));
         }
         // Process innermost loops first (smallest body) — their rotation is
         // least likely to disturb outer-loop assumptions, and nested
@@ -190,7 +190,10 @@ pub(crate) fn rotate_loops(func: &mut IrFunction) -> usize {
                 .any(|outer| outer.header != lp.header && outer.body.contains(&lp.header));
             if nested {
                 if std::env::var("CCC_DEBUG_LOOP_ROTATE").is_ok() {
-                    eprintln!("[ROT] nested loop header={} — bail (Guard E)", lp.header);
+                    lccc::cli::stderr_line(format_args!(
+                        "[ROT] nested loop header={} — bail (Guard E)",
+                        lp.header
+                    ));
                 }
                 continue;
             }
@@ -279,31 +282,31 @@ fn try_rotate_loop(
     // 1. Single latch that is NOT the header (a self-loop is already rotated).
     let Some(latch_idx) = lp.single_latch(&cfg.preds) else {
         if debug {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[ROT] no single latch (header={}, body_len={})",
                 lp.header,
                 lp.body.len()
-            );
+            ));
         }
         return false;
     };
     if latch_idx == lp.header {
         if debug {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[ROT] self-loop (latch==header={}, body_len={})",
                 lp.header,
                 lp.body.len()
-            );
+            ));
         }
         return false;
     }
     if debug {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[ROT] candidate: header={}, latch={}, body_len={}",
             lp.header,
             latch_idx,
             lp.body.len()
-        );
+        ));
     }
 
     // 2. Latch terminator must be a pure backedge `Branch(header)`.
@@ -314,7 +317,7 @@ fn try_rotate_loop(
         Terminator::Branch(t) if *t == header_label
     ) {
         if debug {
-            eprintln!("[ROT] latch not Branch(header)");
+            lccc::cli::stderr_line(format_args!("[ROT] latch not Branch(header)"));
         }
         return false;
     }
@@ -328,43 +331,44 @@ fn try_rotate_loop(
         .enumerate()
         .map(|(i, b)| (b.label, i))
         .collect();
-    let (cond, continue_label, exit_label, continue_on_true) =
-        match &func.blocks[lp.header].terminator {
-            Terminator::CondBranch {
-                cond,
-                true_label,
-                false_label,
-            } => {
-                let t_in = is_in_loop(*true_label, &label_to_idx, lp);
-                let f_in = is_in_loop(*false_label, &label_to_idx, lp);
-                if t_in == f_in {
-                    if debug {
-                        eprintln!("[ROT] CondBranch both-in or both-out");
-                    }
-                    return false; // both in (infinite) or both out (no body)
-                }
-                let c = *cond;
-                if t_in {
-                    (c, *true_label, *false_label, true)
-                } else {
-                    (c, *false_label, *true_label, false)
-                }
-            }
-            _ => {
+    let (cond, continue_label, exit_label, continue_on_true) = match &func.blocks[lp.header]
+        .terminator
+    {
+        Terminator::CondBranch {
+            cond,
+            true_label,
+            false_label,
+        } => {
+            let t_in = is_in_loop(*true_label, &label_to_idx, lp);
+            let f_in = is_in_loop(*false_label, &label_to_idx, lp);
+            if t_in == f_in {
                 if debug {
-                    eprintln!(
-                        "[ROT] header not CondBranch: {:?}",
-                        func.blocks[lp.header].terminator
-                    );
+                    lccc::cli::stderr_line(format_args!("[ROT] CondBranch both-in or both-out"));
                 }
-                return false;
+                return false; // both in (infinite) or both out (no body)
             }
-        };
+            let c = *cond;
+            if t_in {
+                (c, *true_label, *false_label, true)
+            } else {
+                (c, *false_label, *true_label, false)
+            }
+        }
+        _ => {
+            if debug {
+                lccc::cli::stderr_line(format_args!(
+                    "[ROT] header not CondBranch: {:?}",
+                    func.blocks[lp.header].terminator
+                ));
+            }
+            return false;
+        }
+    };
     if debug {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[ROT] CondBranch OK, continue={:?} exit={:?}",
             continue_label, exit_label
-        );
+        ));
     }
 
     // 4. The guard cond must be a Value (not a constant — those are folded
@@ -404,10 +408,10 @@ fn try_rotate_loop(
         }
         if !is_cloneable_pure(inst) {
             if debug {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[ROT] closure: inst not cloneable-pure: idx={} {:?}",
                     idx, inst
-                );
+                ));
             }
             return false; // cond setup touches memory/calls — bail
         }
@@ -448,10 +452,10 @@ fn try_rotate_loop(
         .find(|(idx, inst)| !matches!(inst, Instruction::Phi { .. }) && !closure.contains(idx))
     {
         if debug {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[ROT] header non-Phi inst outside condition closure: idx={} {:?} — bail (Guard F, un-cloned header effect)",
                 idx, inst
-            );
+            ));
         }
         return false;
     }
@@ -497,10 +501,10 @@ fn try_rotate_loop(
         }
         if foreign_iv {
             if debug {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[ROT] cond uses foreign loop-header phi v{} — bail (Guard E, nested IV as trip limit)",
                     foreign_phi
-                );
+                ));
             }
             return false;
         }
@@ -548,10 +552,10 @@ fn try_rotate_loop(
             }
             if multi_pre_header {
                 if debug {
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[ROT] header phi v{} has >1 non-latch incoming — bail (Guard C)",
                         dest.0
-                    );
+                    ));
                 }
                 return false;
             }
@@ -594,10 +598,10 @@ fn try_rotate_loop(
             continue; // cross-phi latch incoming: v17 rewrite handles this
         }
         if debug {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[ROT] header phi v{} latch incoming v{} is defined in the header (not a phi) — bail (Guard D, while(--i) shape)",
                 phi_dest, v.0
-            );
+            ));
         }
         return false;
     }
@@ -619,11 +623,11 @@ fn try_rotate_loop(
     let single_block_body = lp.body.len() == 2 && continue_label == latch_label;
     if !single_block_body {
         if debug {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[ROT] not single-block body (body_len={}, continue==latch={})",
                 lp.body.len(),
                 continue_label == latch_label
-            );
+            ));
         }
         return false;
     }
@@ -642,16 +646,18 @@ fn try_rotate_loop(
         match inst {
             Instruction::Call { .. } | Instruction::CallIndirect { .. } => {
                 if debug {
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[ROT] body has Call/CallIndirect — bail (call clobbers exit-merge values)"
-                    );
+                    ));
                 }
                 return false;
             }
             Instruction::Load { volatile: true, .. }
             | Instruction::Store { volatile: true, .. } => {
                 if debug {
-                    eprintln!("[ROT] body has volatile mem op — bail (ordering)");
+                    lccc::cli::stderr_line(format_args!(
+                        "[ROT] body has volatile mem op — bail (ordering)"
+                    ));
                 }
                 return false;
             }
@@ -661,9 +667,9 @@ fn try_rotate_loop(
             // had a chance to run (rotation is post-vectorize).
             Instruction::Intrinsic { .. } => {
                 if debug {
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[ROT] body has Intrinsic — bail (XMM phi / vector-reg home mismatch)"
-                    );
+                    ));
                 }
                 return false;
             }
@@ -702,10 +708,10 @@ fn try_rotate_loop(
         let budget = rotation_pressure_budget();
         if live_out > budget {
             if debug {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[ROT] {} loop-carried values live out of the loop, budget {} — bail (Guard G, register pressure)",
                     live_out, budget
-                );
+                ));
             }
             return false;
         }
@@ -872,10 +878,10 @@ fn try_rotate_loop(
         let exit_preds = cfg.preds.row(exit_idx);
         if exit_preds.len() != 1 || exit_preds[0] as usize != lp.header {
             if debug {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[ROT] exit block has {} predecessors (expected 1 = header); bailing",
                     exit_preds.len()
-                );
+                ));
             }
             // v17 fix: undo step 6.6's state changes before bailing. Step
             // 6.6 added `n_new_phis` new self-loop phis at the top of
@@ -977,11 +983,11 @@ fn try_rotate_loop(
                     // v16 Guard B: external use must be dominated by exit.
                     if exit_idx != usize::MAX && !is_dominated_by(bi, exit_idx, cfg) {
                         if debug {
-                            eprintln!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[ROT] header phi {} has external use in block {} \
                                  not dominated by exit {} — bailing",
                                 phi_dest, bi, exit_idx
-                            );
+                            ));
                         }
                         guard_b_fail = Some(bi);
                         break 'outer;
@@ -1152,7 +1158,9 @@ fn try_rotate_loop(
         0
     };
     if debug && affine_folds > 0 {
-        eprintln!("[ROT] affine exit-compare folds: {affine_folds}");
+        lccc::cli::stderr_line(format_args!(
+            "[ROT] affine exit-compare folds: {affine_folds}"
+        ));
     }
 
     // The cloned cond value (new ID) is the latch's new CondBranch cond.
@@ -1198,10 +1206,10 @@ fn try_rotate_loop(
     func.next_value_id = next_val;
 
     if debug {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[ROT] SUCCESS: rotated header={} latch={}",
             lp.header, latch_idx
-        );
+        ));
     }
     true
 }
@@ -1547,10 +1555,10 @@ pub(crate) fn fold_affine_exit_compares(func: &mut IrFunction) -> usize {
         total += fold_loop_value_bound(func, lp, &cfg);
     }
     if total > 0 && affine_fold_debug() {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[AFFOLD] {}: affine exit-compare folds: {}",
             func.name, total
-        );
+        ));
     }
     total
 }
@@ -2258,10 +2266,10 @@ fn fold_loop_value_bound(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnaly
             *rhs = Operand::Value(tdest);
         }
         if affine_fold_debug() {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[AFFOLD] {}: value-bound fold: iv v{} + {} <strict> v{} -> v{} <strict> (v{} - {})",
                 func.name, shape.iv, c_total, nv.0, anchor, nv.0, c_rel
-            );
+            ));
         }
         return 1;
     }

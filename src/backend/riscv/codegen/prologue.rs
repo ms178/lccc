@@ -5,7 +5,7 @@ use super::emit::{
     collect_inline_asm_callee_saved_riscv,
 };
 use crate::backend::call_abi::{ParamClass, classify_params};
-use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
+use crate::backend::generation::{ParamAllocaIndex, calculate_stack_space_common};
 use crate::backend::state::StackSlot;
 use crate::common::types::IrType;
 use crate::ir::reexports::IrFunction;
@@ -577,6 +577,9 @@ impl RiscvCodegen {
     }
 
     pub(super) fn emit_store_params_impl(&mut self, func: &IrFunction) {
+        // One O(instructions + params) pass replaces every
+        // parameter-home full scan in this prologue.
+        let param_homes = ParamAllocaIndex::build(func);
         let float_arg_regs = ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
 
         // For variadic functions: save all integer register args (a0-a7) to the
@@ -601,7 +604,7 @@ impl RiscvCodegen {
         // Pre-compute param alloca slots for emit_param_ref
         self.state.param_alloca_slots = (0..func.params.len())
             .map(|i| {
-                find_param_alloca(func, i).and_then(|(dest, ty)| {
+                param_homes.get(i).and_then(|(dest, ty)| {
                     self.state.get_slot(dest.0).map(|slot| (slot, ty, dest.0))
                 })
             })
@@ -619,7 +622,7 @@ impl RiscvCodegen {
         for (i, _param) in func.params.iter().enumerate() {
             let class = param_classes[i];
 
-            let (slot, ty, dest_id) = match find_param_alloca(func, i) {
+            let (slot, ty, dest_id) = match param_homes.get(i) {
                 Some((dest, ty)) => match self.state.get_slot(dest.0) {
                     Some(slot) => (slot, ty, dest.0),
                     None => continue,

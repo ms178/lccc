@@ -829,7 +829,7 @@ pub fn verify_after_func_pass(func: &IrFunction, stage: &str) {
         return;
     }
     for v in &violations {
-        eprintln!("{}", v);
+        lccc::cli::stderr_line(format_args!("{}", v));
     }
     if m == Mode::Abort {
         panic!(
@@ -855,7 +855,7 @@ pub fn verify_after_pass(module: &IrModule, stage: &str) {
         return;
     }
     for v in &violations {
-        eprintln!("{}", v);
+        lccc::cli::stderr_line(format_args!("{}", v));
     }
     if m == Mode::Abort {
         panic!(

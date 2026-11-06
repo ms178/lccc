@@ -1072,13 +1072,13 @@ fn find_assembler() -> Option<(String, String)> {
 /// project pins GAS 2.47 and a run against anything older is weaker evidence.
 fn announce_assembler(which: &str, ver: &str) {
     if ver.contains("2.47") {
-        eprintln!("MachInst differential: using {which} ({ver})");
+        lccc::cli::stderr_line(format_args!("MachInst differential: using {which} ({ver})"));
     } else {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "MachInst differential: using {which} ({ver}) -- NOT the pinned GAS 2.47. \
              Run scripts/ensure_gas_247.sh or set LCCC_GAS to probe against the \
              assembler the project actually targets."
-        );
+        ));
     }
 }
 
@@ -1087,10 +1087,10 @@ fn every_emitted_instruction_is_accepted_by_the_real_assembler() {
     let Some((asm, ver)) = find_assembler() else {
         // Do NOT pass silently: a vacuous green here would hide the strongest
         // check in the file.
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "SKIP: no assembler found; the MachInst differential test cannot \
              run in this environment"
-        );
+        ));
         return;
     };
     announce_assembler(&asm, &ver);
@@ -1486,7 +1486,9 @@ fn random_corpus(n: usize) -> Vec<MachInst> {
 #[test]
 fn a_large_randomized_corpus_is_accepted_by_the_real_assembler() {
     let Some((asm, ver)) = find_assembler() else {
-        eprintln!("SKIP: no assembler; randomized MachInst stress cannot run");
+        lccc::cli::stderr_line(format_args!(
+            "SKIP: no assembler; randomized MachInst stress cannot run"
+        ));
         return;
     };
     announce_assembler(&asm, &ver);
@@ -1734,7 +1736,9 @@ fn alu_operations_compute_the_right_answer_when_executed() {
             size: OpSize::S64,
         };
         let Some(got) = run_emitted(&probe_body(dst, src, &inst), EXEC_INPUTS) else {
-            eprintln!("SKIP: no assembler/linker; MachInst execution differential cannot run");
+            lccc::cli::stderr_line(format_args!(
+                "SKIP: no assembler/linker; MachInst execution differential cannot run"
+            ));
             return;
         };
         for (i, (a, b)) in EXEC_INPUTS.iter().enumerate() {
@@ -1843,7 +1847,9 @@ fn a_symbol_address_is_the_real_address_when_executed() {
     // distinguishable at runtime, and indistinguishable by any check that only
     // asks whether the text assembles.
     let Some((asm, _)) = find_assembler() else {
-        eprintln!("SKIP: no assembler; LeaSym execution check cannot run");
+        lccc::cli::stderr_line(format_args!(
+            "SKIP: no assembler; LeaSym execution check cannot run"
+        ));
         return;
     };
     if std::process::Command::new("cc")
@@ -1940,7 +1946,9 @@ fn imul3_computes_the_right_answer_when_executed() {
             size: OpSize::S64,
         };
         let Some(got) = run_emitted(&probe_body(dst, src, &inst), EXEC_INPUTS) else {
-            eprintln!("SKIP: no assembler/linker; Imul3 execution differential cannot run");
+            lccc::cli::stderr_line(format_args!(
+                "SKIP: no assembler/linker; Imul3 execution differential cannot run"
+            ));
             return;
         };
         for (i, (_a, b)) in EXEC_INPUTS.iter().enumerate() {
@@ -1968,7 +1976,9 @@ fn neg_and_not_compute_the_right_answer_when_executed() {
     };
     // The probe loads rdi into dst first, so Neg/Not operate on the input.
     let Some(g) = run_emitted(&probe_body(dst, src, &neg), EXEC_INPUTS) else {
-        eprintln!("SKIP: no assembler/linker; Neg execution differential cannot run");
+        lccc::cli::stderr_line(format_args!(
+            "SKIP: no assembler/linker; Neg execution differential cannot run"
+        ));
         return;
     };
     for (i, (a, _)) in EXEC_INPUTS.iter().enumerate() {
@@ -2003,7 +2013,9 @@ fn lea_computes_base_plus_index_scale_plus_offset_when_executed() {
     };
     let model = |b: i64, i: i64| b.wrapping_add(i.wrapping_mul(4)).wrapping_add(7);
     let Some(got) = run_emitted(&probe_body(dst, src, &inst), EXEC_INPUTS) else {
-        eprintln!("SKIP: no assembler/linker; Lea execution differential cannot run");
+        lccc::cli::stderr_line(format_args!(
+            "SKIP: no assembler/linker; Lea execution differential cannot run"
+        ));
         return;
     };
     for (i, (a, b)) in EXEC_INPUTS.iter().enumerate() {
@@ -2039,7 +2051,9 @@ fn div_uses_rax_rdx_and_computes_quotient_when_executed() {
     let _ = dst;
     let inputs = &[(100i64, 7i64), (-100, 7), (7, 100), (i64::MIN, 2), (0, 5)];
     let Some(got) = run_emitted(&body_q, inputs) else {
-        eprintln!("SKIP: no assembler/linker; Div execution differential cannot run");
+        lccc::cli::stderr_line(format_args!(
+            "SKIP: no assembler/linker; Div execution differential cannot run"
+        ));
         return;
     };
     for (i, (a, b)) in inputs.iter().enumerate() {
@@ -2103,7 +2117,9 @@ fn narrow_divide_the_selector_builds_computes_the_narrow_quotient_when_executed(
             emit_machinst(inst, &mut out);
         }
         let Some(got) = run_emitted(&out.buf, inputs) else {
-            eprintln!("SKIP: no assembler/linker; narrow-divide execution cannot run");
+            lccc::cli::stderr_line(format_args!(
+                "SKIP: no assembler/linker; narrow-divide execution cannot run"
+            ));
             return;
         };
         for ((a, b), g) in inputs.iter().zip(got.iter()) {
@@ -2211,7 +2227,9 @@ fn div64_width_bypass_is_emitted_only_where_the_tuning_row_asks_and_runs_correct
             (0, 5),
         ];
         let Some(got) = run_emitted(&body, inputs) else {
-            eprintln!("SKIP: no assembler/linker; Div bypass execution cannot run");
+            lccc::cli::stderr_line(format_args!(
+                "SKIP: no assembler/linker; Div bypass execution cannot run"
+            ));
             continue;
         };
         for (i, (a, b)) in inputs.iter().enumerate() {
@@ -2251,7 +2269,9 @@ fn cmov_selects_the_right_operand_when_executed() {
         out.buf
     );
     let Some(got) = run_emitted(&body, EXEC_INPUTS) else {
-        eprintln!("SKIP: no assembler/linker; Cmov execution differential cannot run");
+        lccc::cli::stderr_line(format_args!(
+            "SKIP: no assembler/linker; Cmov execution differential cannot run"
+        ));
         return;
     };
     for (i, (a, b)) in EXEC_INPUTS.iter().enumerate() {
@@ -2291,7 +2311,9 @@ fn shiftx_computes_the_right_answer_when_executed() {
             out.buf
         );
         let Some(got) = run_emitted(&body, EXEC_INPUTS) else {
-            eprintln!("SKIP: no assembler/linker; ShiftX execution differential cannot run");
+            lccc::cli::stderr_line(format_args!(
+                "SKIP: no assembler/linker; ShiftX execution differential cannot run"
+            ));
             return;
         };
         for (i, (a, _)) in EXEC_INPUTS.iter().enumerate() {
@@ -2331,7 +2353,9 @@ fn mov128_moves_the_full_16_bytes_when_executed() {
     // Expected: low half ^ high half in rax, high half in rdx.
     let inputs = &[(1i64, 1i64)];
     let Some(got) = run_emitted(&body, inputs) else {
-        eprintln!("SKIP: no assembler/linker; Mov128 execution differential cannot run");
+        lccc::cli::stderr_line(format_args!(
+            "SKIP: no assembler/linker; Mov128 execution differential cannot run"
+        ));
         return;
     };
     let lo: u64 = 0x1122334455667788;
@@ -2400,7 +2424,9 @@ fn falu_computes_the_right_answer_when_executed() {
             .map(|(a, b)| (a.to_bits() as i64, b.to_bits() as i64))
             .collect();
         let Some(got) = run_emitted(&body, &iinputs) else {
-            eprintln!("SKIP: no assembler/linker; FAlu execution differential cannot run");
+            lccc::cli::stderr_line(format_args!(
+                "SKIP: no assembler/linker; FAlu execution differential cannot run"
+            ));
             return;
         };
         for (i, (a, b)) in inputs.iter().enumerate() {
@@ -4377,7 +4403,7 @@ mod float_const_stores {
     #[test]
     fn f32_and_f64_const_stores_produce_the_exact_bit_patterns_when_executed() {
         let Some((asm, _)) = find_assembler() else {
-            eprintln!("skipping: no assembler available");
+            lccc::cli::stderr_line(format_args!("skipping: no assembler available"));
             return;
         };
         let dir = probe_dir("machinst-fconst");
@@ -4470,7 +4496,7 @@ mod float_const_stores {
         // Static executable: no libc, no entry symbol beyond _start.
         let ld = find_linker();
         let Some(ld) = ld else {
-            eprintln!("skipping execution: no linker available");
+            lccc::cli::stderr_line(format_args!("skipping execution: no linker available"));
             let _ = std::fs::remove_dir_all(&dir);
             return;
         };

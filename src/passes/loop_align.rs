@@ -351,10 +351,10 @@ impl TightLoopMode {
             other => {
                 // Fail closed: an unknown knob must never pad more than
                 // the size-bucketed policy.
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "lccc: warning: unknown CCC_LOOP_ALIGN_HOT={other:?}, \
                      falling back to the GCC-size-bucketed tight-loop policy"
-                );
+                ));
                 TightLoopMode::Gcc
             }
         }
@@ -767,14 +767,14 @@ fn audit_tight_loop(
     if std::env::var("CCC_DUMP_ALIGN").is_ok() {
         let header_label = func.blocks[lp.header].label.0;
         match result {
-            Ok(()) => eprintln!(
+            Ok(()) => lccc::cli::stderr_line(format_args!(
                 "loop_align: func={} header=L{header_label} tight=yes bound={constant_bound:?}",
                 func.name
-            ),
-            Err(reason) => eprintln!(
+            )),
+            Err(reason) => lccc::cli::stderr_line(format_args!(
                 "loop_align: func={} header=L{header_label} tight=no ({reason})                  bound={constant_bound:?}",
                 func.name
-            ),
+            )),
         }
     }
     result

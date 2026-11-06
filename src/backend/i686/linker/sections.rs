@@ -107,10 +107,10 @@ pub(super) fn merge_sections(
     let dropped_fdes = prune_discarded_fdes(inputs, &discarded);
     // Same diagnostic channel as the x86-64 linker's GC/ICF FDE pruning.
     if std::env::var_os("LCCC_DEBUG_GCEH").is_some() {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[gceh] dropped_fdes={dropped_fdes} discarded_sections={}",
             discarded.len()
-        );
+        ));
     }
     let inputs: &[InputObject] = inputs;
 

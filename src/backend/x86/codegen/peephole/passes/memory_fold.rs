@@ -2901,7 +2901,10 @@ pub(super) fn fold_load_copy_relay(store: &mut LineStore, infos: &mut [LineInfo]
         if !copy_ok {
             stats[4] += 1;
             if dbg && stats[4] < 30 {
-                eprintln!("[LCR][{}] copy-bad: load=[{}] copy=[{}]", cur_fn, t, tc);
+                lccc::cli::stderr_line(format_args!(
+                    "[LCR][{}] copy-bad: load=[{}] copy=[{}]",
+                    cur_fn, t, tc
+                ));
             }
             i += 1;
             continue;
@@ -2994,7 +2997,10 @@ pub(super) fn fold_load_copy_relay(store: &mut LineStore, infos: &mut [LineInfo]
         if !dead {
             stats[5] += 1;
             if dbg && stats[5] < 30 {
-                eprintln!("[LCR][{}] not-dead: load=[{}] copy=[{}]", cur_fn, t, tc);
+                lccc::cli::stderr_line(format_args!(
+                    "[LCR][{}] not-dead: load=[{}] copy=[{}]",
+                    cur_fn, t, tc
+                ));
             }
             i = j + 1;
             continue;
@@ -3017,10 +3023,10 @@ pub(super) fn fold_load_copy_relay(store: &mut LineStore, infos: &mut [LineInfo]
         }
         stats[3] += 1;
         if dbg {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[LCR][{}] FUSE #{}: [{}] + [{}] -> dest {}",
                 cur_fn, stats[3], t, tc, cdest
-            );
+            ));
         }
         let new_load = format!("    {} {}, {}", mnem, mem, cdest);
         replace_line(store, &mut infos[i], i, new_load);
@@ -3029,10 +3035,10 @@ pub(super) fn fold_load_copy_relay(store: &mut LineStore, infos: &mut [LineInfo]
         i = j + 1;
     }
     if dbg && stats[0] > 0 {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[LCR] loads={} copy-ok={} dead={} fused={} copy-bad={} not-dead={}",
             stats[0], stats[1], stats[2], stats[3], stats[4], stats[5]
-        );
+        ));
     }
     changed
 }

@@ -700,11 +700,17 @@ pub(super) fn create_plt_got(
 
     if std::env::var("LCCC_DEBUG_GOT").is_ok() {
         for (i, (name, is_plt)) in got_entries.iter().enumerate() {
-            eprintln!("[GOT] idx={} plt={} name={:?}", i, is_plt, name);
+            lccc::cli::stderr_line(format_args!(
+                "[GOT] idx={} plt={} name={:?}",
+                i, is_plt, name
+            ));
         }
     }
     if is_pie && std::env::var("LCCC_DEBUG_GOT").is_ok() {
-        eprintln!("[GOT] pie_relative={} entries", pie_relative.len());
+        lccc::cli::stderr_line(format_args!(
+            "[GOT] pie_relative={} entries",
+            pie_relative.len()
+        ));
     }
     (
         plt_names,

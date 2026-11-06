@@ -1532,10 +1532,10 @@ fn inline_run_with(
         FxHashSet::default()
     };
     if debug_inline && !devirtualized.is_empty() {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[INLINE] Devirtualized constant indirect calls (caller, callee): {:?}",
             devirtualized
-        );
+        ));
     }
     let callee_ctx = callee_context(module);
     let mut callee_map = build_callee_map_with(module, &callee_ctx);
@@ -1555,26 +1555,26 @@ fn inline_run_with(
     // PGO: check for profile to guide inlining
     let pgo_profile = crate::pgo::get_pgo_profile();
     if pgo_profile.is_some() {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "lccc: PGO inline: using profile with {} functions",
             pgo_profile.unwrap().functions.len()
-        );
+        ));
     }
 
     if debug_inline {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[INLINE] Callee map has {} eligible functions:",
             callee_map.len()
-        );
+        ));
         for (name, data) in &callee_map {
             let ic: usize = data.blocks.iter().map(|b| b.instructions.len()).sum();
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[INLINE]   '{}': {} blocks, {} instructions, {} params",
                 name,
                 data.blocks.len(),
                 ic,
                 data.num_params
-            );
+            ));
         }
     }
 
@@ -1769,10 +1769,10 @@ fn inline_run_with(
             total_inlined += 1;
             module.functions[func_idx].has_inlined_calls = true;
             if debug_inline {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[INLINE] Phase-0 drained always_inline '{}' in '{}'",
                     site.callee_name, module.functions[func_idx].name
-                );
+                ));
             }
         }
 
@@ -2032,20 +2032,20 @@ fn inline_run_with(
                                 .sum();
                             size_after_cleanup = Some(cleaned);
                             if debug_inline {
-                                eprintln!(
+                                lccc::cli::stderr_line(format_args!(
                                     "[INLINE] Cleaned capped caller '{}': {} -> {} instructions",
                                     module.functions[func_idx].name, caller_inst_count, cleaned
-                                );
+                                ));
                             }
                             if cleaned < caller_inst_count {
                                 continue;
                             }
                         }
                         if debug_inline && caller_too_large {
-                            eprintln!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[INLINE] No more always_inline callees to inline into '{}' (caller has {} instructions)",
                                 module.functions[func_idx].name, caller_inst_count
-                            );
+                            ));
                         }
                         break;
                     }
@@ -2068,10 +2068,10 @@ fn inline_run_with(
                         size_inlined_large_callees.insert(site.callee_name.clone());
                     }
                     if debug_inline {
-                        eprintln!(
+                        lccc::cli::stderr_line(format_args!(
                             "[INLINE] Inlined '{}' into '{}'",
                             site.callee_name, module.functions[func_idx].name
-                        );
+                        ));
                     }
                     if std::env::var("CCC_INLINE_VALIDATE").is_ok() {
                         validate_function_values(&module.functions[func_idx], &site.callee_name);
@@ -2321,10 +2321,10 @@ fn inline_run_with(
                     );
                     if success {
                         if debug_inline {
-                            eprintln!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[INLINE] Inlined always_inline '{}' into '{}' (second pass)",
                                 site.callee_name, module.functions[func_idx].name
-                            );
+                            ));
                         }
                         if std::env::var("CCC_INLINE_VALIDATE").is_ok() {
                             validate_function_values(
@@ -2456,18 +2456,21 @@ fn resolve_inline_asm_symbols(func: &mut IrFunction) {
             } = inst
             {
                 if debug_resolve && template.contains(".pushsection") {
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[RESOLVE_ASM] Found InlineAsm with .pushsection in func '{}'",
                         func.name
-                    );
-                    eprintln!(
+                    ));
+                    lccc::cli::stderr_line(format_args!(
                         "[RESOLVE_ASM]   inputs: {:?}",
                         inputs
                             .iter()
                             .map(|(c, o, n)| (c.clone(), format!("{:?}", o), n.clone()))
                             .collect::<Vec<_>>()
-                    );
-                    eprintln!("[RESOLVE_ASM]   input_symbols: {:?}", input_symbols);
+                    ));
+                    lccc::cli::stderr_line(format_args!(
+                        "[RESOLVE_ASM]   input_symbols: {:?}",
+                        input_symbols
+                    ));
                 }
                 let num_outputs_in_sym = if input_symbols.len() > inputs.len() {
                     input_symbols.len() - inputs.len()
@@ -2478,61 +2481,67 @@ fn resolve_inline_asm_symbols(func: &mut IrFunction) {
                     let sym_idx = num_outputs_in_sym + i;
                     if sym_idx >= input_symbols.len() {
                         if debug_resolve {
-                            eprintln!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[RESOLVE_ASM]   input[{}]: sym_idx {} >= input_symbols.len() {}, skip",
                                 i,
                                 sym_idx,
                                 input_symbols.len()
-                            );
+                            ));
                         }
                         continue;
                     }
                     // Only fix up entries that are currently None
                     if input_symbols[sym_idx].is_some() {
                         if debug_resolve {
-                            eprintln!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[RESOLVE_ASM]   input[{}]: already has symbol {:?}, skip",
                                 i, input_symbols[sym_idx]
-                            );
+                            ));
                         }
                         continue;
                     }
                     // Only care about immediate-only constraints ("i", "n", etc.)
                     if !constraint_is_immediate_only(constraint) {
                         if debug_resolve {
-                            eprintln!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[RESOLVE_ASM]   input[{}]: constraint '{}' not imm-only, skip",
                                 i, constraint
-                            );
+                            ));
                         }
                         continue;
                     }
                     if debug_resolve {
-                        eprintln!(
+                        lccc::cli::stderr_line(format_args!(
                             "[RESOLVE_ASM]   input[{}]: constraint '{}', operand={:?}",
                             i, constraint, operand
-                        );
+                        ));
                     }
                     match operand {
                         Operand::Value(v) => {
                             // Try to trace this value back to a GlobalAddr
                             if let Some(sym_name) = trace_to_global(v.0) {
                                 if debug_resolve {
-                                    eprintln!(
+                                    lccc::cli::stderr_line(format_args!(
                                         "[RESOLVE_ASM]   -> resolved to symbol '{}'",
                                         sym_name
-                                    );
+                                    ));
                                 }
                                 input_symbols[sym_idx] = Some(sym_name);
                             }
                             // Also try to resolve to a constant and convert the operand
                             else if let Some(const_val) = trace_to_const(&Operand::Value(*v)) {
                                 if debug_resolve {
-                                    eprintln!("[RESOLVE_ASM]   -> resolved to const {}", const_val);
+                                    lccc::cli::stderr_line(format_args!(
+                                        "[RESOLVE_ASM]   -> resolved to const {}",
+                                        const_val
+                                    ));
                                 }
                                 *operand = Operand::Const(IrConst::I64(const_val));
                             } else if debug_resolve {
-                                eprintln!("[RESOLVE_ASM]   -> FAILED to resolve Value({})", v.0);
+                                lccc::cli::stderr_line(format_args!(
+                                    "[RESOLVE_ASM]   -> FAILED to resolve Value({})",
+                                    v.0
+                                ));
                             }
                         }
                         Operand::Const(_) => {
@@ -2780,17 +2789,17 @@ fn validate_function_values(func: &IrFunction, last_inlined_callee: &str) {
     }
 
     if !errors.is_empty() {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[INLINE_VALIDATE] ERRORS in '{}' after inlining '{}': {} undefined value uses",
             func.name,
             last_inlined_callee,
             errors.len()
-        );
+        ));
         for e in errors.iter().take(20) {
-            eprintln!("{}", e);
+            lccc::cli::stderr_line(format_args!("{}", e));
         }
         if errors.len() > 20 {
-            eprintln!("  ... and {} more", errors.len() - 20);
+            lccc::cli::stderr_line(format_args!("  ... and {} more", errors.len() - 20));
         }
     }
 }
@@ -4054,7 +4063,7 @@ fn callee_data_for(
             && !func.is_gnu_inline_def
         {
             if debug_callee {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[INLINE_DEBUG] {} skipped: is_static={}, is_inline={}, blocks={}, inst_count={}, has_loops={}, direct_calls={}, medium_block_limit={}, single_site={}, survives_via_reference={}, is_declaration={}",
                     func.name,
                     func.is_static,
@@ -4067,13 +4076,13 @@ fn callee_data_for(
                     has_single_call_site,
                     survives_via_reference,
                     func.is_declaration,
-                );
+                ));
             }
             return None;
         }
         if debug_callee {
             let ic: usize = func.blocks.iter().map(|b| b.instructions.len()).sum();
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[INLINE_DEBUG] {} candidate: blocks={}, inst_count={}, direct_calls={}, is_variadic={}, params={}",
                 func.name,
                 func.blocks.len(),
@@ -4081,7 +4090,7 @@ fn callee_data_for(
                 direct_call_count,
                 func.is_variadic,
                 func.params.len()
-            );
+            ));
         }
         // Don't inline variadic functions (complex ABI) — EXCEPT the
         // always_inline wrapper shape whose only variadic forwarding is a
@@ -4338,9 +4347,9 @@ fn scalar_cleanup_blocked(func: &IrFunction, module: &IrModule) -> bool {
 /// locals): the passes below cannot see through a home, so without it a
 /// cleaned body kept every clone's store/load traffic (zstd's
 /// FSE_encodeSymbol: 47 raw, 83 "cleaned", 59 with the promotion). The
-/// function's OWN parameter homes -- the first `params.len()` entry
-/// allocas, the positional contract the inliner's argument binding and the
-/// backend's `find_param_alloca` rely on -- stay, so sizes remain in the
+/// function's OWN parameter homes -- exactly the values recorded in
+/// `param_alloca_values`, the contract the inliner's argument binding and the
+/// backend's `ParamAllocaIndex` rely on -- stay, so sizes remain in the
 /// home form of the raw snapshots they are compared with. Promoting them
 /// too (`promote_params = true`) measured +13..+21 % zstd Ir, with calls to
 /// ERR_isError, MEM_readLEST and BIT_readBitsFast left behind in
@@ -5730,10 +5739,10 @@ fn clone_self_recursion_sites(
         // heuristics that read this flag must see that.
         module.functions[func_idx].has_inlined_calls = true;
         if debug_inline {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[INLINE] Cloned one level of self-recursion in '{}' ({} site(s), {} instructions)",
                 module.functions[func_idx].name, inlined_here, entry_size
-            );
+            ));
         }
     }
     cloned
@@ -5799,7 +5808,7 @@ fn inline_call_site(
 
     let debug_inline_detail = std::env::var("CCC_INLINE_DEBUG_DETAIL").is_ok();
     if debug_inline_detail {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[INLINE_DETAIL] Inlining '{}' into '{}': value_offset={}, label_base={}, callee.next_value_id={}, caller.next_value_id={}",
             site.callee_name,
             caller.name,
@@ -5807,13 +5816,13 @@ fn inline_call_site(
             label_base,
             callee.next_value_id,
             caller.next_value_id
-        );
-        eprintln!(
+        ));
+        lccc::cli::stderr_line(format_args!(
             "[INLINE_DETAIL]   site.block_idx={}, site.inst_idx={}",
             site.block_idx, site.inst_idx
-        );
+        ));
         for (i, arg) in site.args.iter().enumerate() {
-            eprintln!("[INLINE_DETAIL]   arg[{}] = {:?}", i, arg);
+            lccc::cli::stderr_line(format_args!("[INLINE_DETAIL]   arg[{}] = {:?}", i, arg));
         }
     }
 
@@ -6144,7 +6153,10 @@ fn inline_call_site(
                     .flatten()
                     .is_some_and(|h| param_substitutable(callee, i, h));
             if ok && ssa_log {
-                eprintln!("[SSA_PARAM] {} arg{} substituted", site.callee_name, i);
+                lccc::cli::stderr_line(format_args!(
+                    "[SSA_PARAM] {} arg{} substituted",
+                    site.callee_name, i
+                ));
             }
             ok
         })
@@ -6372,10 +6384,10 @@ fn inline_call_site(
                 }
             };
             if paramref_debug {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[INLINE_PARAMREF] {} param{} remapped v{} -> {:?}",
                     site.callee_name, param_idx, paramref_dest.0, replacement
-                );
+                ));
             }
             paramref_subst.insert(paramref_dest.0, replacement);
         }
@@ -6475,10 +6487,10 @@ fn inline_call_site(
                 inst.for_each_value_use_mut(|value| {
                     if let Some(Operand::Value(replacement)) = paramref_subst.get(&value.0) {
                         if paramref_debug {
-                            eprintln!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[INLINE_PARAMREF] {} direct v{} -> v{}",
                                 site.callee_name, value.0, replacement.0
-                            );
+                            ));
                         }
                         *value = *replacement;
                     }
@@ -6505,10 +6517,10 @@ fn inline_call_site(
             if let Operand::Value(v) = op {
                 if let Some(&replacement) = paramref_subst.get(&v.0) {
                     if paramref_debug {
-                        eprintln!(
+                        lccc::cli::stderr_line(format_args!(
                             "[INLINE_PARAMREF] {} return-phi v{} -> {:?}",
                             site.callee_name, v.0, replacement
-                        );
+                        ));
                     }
                     *op = replacement;
                 }
@@ -6674,10 +6686,10 @@ fn inline_call_site(
     let new_next_value_id = std::cmp::max(value_offset + callee.next_value_id, paramref_next_value);
     caller.next_value_id = std::cmp::max(new_next_value_id, caller.next_value_id);
     if debug_inline_detail {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[INLINE_DETAIL]   after inline: caller.next_value_id={}",
             caller.next_value_id
-        );
+        ));
     }
 
     // Update the global max block ID so subsequent inlines use fresh IDs.
@@ -7287,19 +7299,22 @@ fn remap_terminator(term: &Terminator, vo: u32, labels: &mut LabelMap) -> Termin
 
 /// Debug: dump function IR in a readable text format.
 fn dump_function_ir(func: &IrFunction, context: &str) {
-    eprintln!("=== IR DUMP {} ===", context);
-    eprintln!(
+    lccc::cli::stderr_line(format_args!("=== IR DUMP {} ===", context));
+    lccc::cli::stderr_line(format_args!(
         "function {} (next_value_id={})",
         func.name, func.next_value_id
-    );
+    ));
     for (bi, block) in func.blocks.iter().enumerate() {
-        eprintln!("  block[{}] .L{}:", bi, block.label.0);
+        lccc::cli::stderr_line(format_args!("  block[{}] .L{}:", bi, block.label.0));
         for (ii, inst) in block.instructions.iter().enumerate() {
-            eprintln!("    [{}] {}", ii, format_instruction(inst));
+            lccc::cli::stderr_line(format_args!("    [{}] {}", ii, format_instruction(inst)));
         }
-        eprintln!("    terminator: {}", format_terminator(&block.terminator));
+        lccc::cli::stderr_line(format_args!(
+            "    terminator: {}",
+            format_terminator(&block.terminator)
+        ));
     }
-    eprintln!("=== END IR DUMP ===");
+    lccc::cli::stderr_line(format_args!("=== END IR DUMP ==="));
 }
 
 fn format_operand(op: &Operand) -> String {

@@ -2,7 +2,7 @@ use super::asm_emitter::ARM_GP_SCRATCH;
 use crate::backend::call_abi::ParamClass;
 use crate::backend::call_abi::{CallAbiConfig, CallArgClass};
 use crate::backend::common::PtrDirective;
-use crate::backend::generation::find_param_alloca;
+use crate::backend::generation::ParamAllocaIndex;
 use crate::backend::inline_asm::emit_inline_asm_common;
 use crate::backend::regalloc::{PhysReg, RaConfig};
 use crate::backend::state::{CodegenState, StackSlot};
@@ -2466,10 +2466,10 @@ impl ArmCodegen {
 
     pub(super) fn resolve_param_slot(
         &self,
-        func: &IrFunction,
+        param_homes: &ParamAllocaIndex,
         i: usize,
     ) -> Option<(StackSlot, IrType, Value)> {
-        let (dest, ty) = find_param_alloca(func, i)?;
+        let (dest, ty) = param_homes.get(i)?;
         let slot = self.state.get_slot(dest.0)?;
         Some((slot, ty, dest))
     }
@@ -2491,7 +2491,12 @@ impl ArmCodegen {
     }
 
     /// Phase 1: Store GP register params to alloca slots.
-    pub(super) fn emit_store_gp_params(&mut self, func: &IrFunction, param_classes: &[ParamClass]) {
+    pub(super) fn emit_store_gp_params(
+        &mut self,
+        func: &IrFunction,
+        param_homes: &ParamAllocaIndex,
+        param_classes: &[ParamClass],
+    ) {
         // AArch64 ABI: when a function uses sret, the hidden pointer comes in x8
         // (not x0). All other GP register params shift down by one so that the
         // first real argument is in x0 instead of x1.
@@ -2503,7 +2508,7 @@ impl ArmCodegen {
                 continue;
             }
 
-            let (slot, ty, dest_val) = match self.resolve_param_slot(func, i) {
+            let (slot, ty, dest_val) = match self.resolve_param_slot(param_homes, i) {
                 Some(v) => v,
                 None => continue,
             };
@@ -2612,14 +2617,19 @@ impl ArmCodegen {
     /// full-precision source (`track_f128_self`); nothing reads an f64
     /// approximation of it, so no `__trunctfdf2` call (and no save area to
     /// protect v0-v7 from that call) is needed.
-    pub(super) fn emit_store_fp_params(&mut self, func: &IrFunction, param_classes: &[ParamClass]) {
+    pub(super) fn emit_store_fp_params(
+        &mut self,
+        func: &IrFunction,
+        param_homes: &ParamAllocaIndex,
+        param_classes: &[ParamClass],
+    ) {
         for (i, _) in func.params.iter().enumerate() {
             let (reg_idx, is_f128) = match param_classes[i] {
                 ParamClass::FloatReg { reg_idx } => (reg_idx, false),
                 ParamClass::F128FpReg { reg_idx } => (reg_idx, true),
                 _ => continue,
             };
-            let (slot, ty, dest_val) = match self.resolve_param_slot(func, i) {
+            let (slot, ty, dest_val) = match self.resolve_param_slot(param_homes, i) {
                 Some(v) => v,
                 None => continue,
             };
@@ -2659,6 +2669,7 @@ impl ArmCodegen {
     pub(super) fn emit_store_stack_params(
         &mut self,
         func: &IrFunction,
+        param_homes: &ParamAllocaIndex,
         param_classes: &[ParamClass],
     ) {
         let frame_size = self.incoming_stack_base();
@@ -2668,7 +2679,7 @@ impl ArmCodegen {
                 continue;
             }
 
-            let (slot, ty, dest_val) = match self.resolve_param_slot(func, i) {
+            let (slot, ty, dest_val) = match self.resolve_param_slot(param_homes, i) {
                 Some(v) => v,
                 None => continue,
             };

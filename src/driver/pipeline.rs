@@ -1116,10 +1116,10 @@ impl Driver {
                 let pp_errors = preprocessor.errors();
                 if !pp_errors.is_empty() {
                     for err in pp_errors {
-                        eprintln!(
+                        crate::common::cli_output::stderr_line(format_args!(
                             "{}:{}:{}: error: {}",
                             err.file, err.line, err.col, err.message
-                        );
+                        ));
                     }
                     return Err(format!(
                         "{} preprocessor error(s) in {}",
@@ -1162,7 +1162,7 @@ impl Driver {
                     // tests/regression/check_o_stdout.sh).
                     self.write_text_output(&dep_text)?;
                 } else {
-                    print!("{}", dep_text);
+                    lccc::cli::stdout_text(format_args!("{}", dep_text));
                 }
                 continue;
             }
@@ -1188,10 +1188,10 @@ impl Driver {
                 let pp_errors = preprocessor.errors();
                 if !pp_errors.is_empty() {
                     for err in pp_errors {
-                        eprintln!(
+                        crate::common::cli_output::stderr_line(format_args!(
                             "{}:{}:{}: error: {}",
                             err.file, err.line, err.col, err.message
-                        );
+                        ));
                     }
                     return Err(format!(
                         "{} preprocessor error(s) in {}",
@@ -1213,7 +1213,7 @@ impl Driver {
                         &Self::dep_rule_object_target(input_file),
                     )?;
                 } else {
-                    println!("{}", output);
+                    lccc::cli::stdout_line(format_args!("{}", output));
                     self.write_dep_file(
                         input_file,
                         input_file,
@@ -1255,7 +1255,7 @@ impl Driver {
                         &Self::dep_rule_object_target(input_file),
                     )?;
                 } else {
-                    print!("{}", output);
+                    lccc::cli::stdout_text(format_args!("{}", output));
                     // GCC writes the dep rule on this path too: `-E -MF -
                     // -MMD x.c` streams `x.o: x.c` on stdout and `-E -MD`
                     // derives x.d (both measured, gcc 14.2).  Same contract
@@ -1304,10 +1304,10 @@ impl Driver {
                 let pp_errors = preprocessor.errors();
                 if !pp_errors.is_empty() {
                     for err in pp_errors {
-                        eprintln!(
+                        crate::common::cli_output::stderr_line(format_args!(
                             "{}:{}:{}: error: {}",
                             err.file, err.line, err.col, err.message
-                        );
+                        ));
                     }
                     return Err(format!(
                         "{} preprocessor error(s) in {}",
@@ -1431,10 +1431,10 @@ impl Driver {
             let pp_errors = preprocessor.errors();
             if !pp_errors.is_empty() {
                 for err in pp_errors {
-                    eprintln!(
+                    crate::common::cli_output::stderr_line(format_args!(
                         "{}:{}:{}: error: {}",
                         err.file, err.line, err.col, err.message
-                    );
+                    ));
                 }
                 return Err(format!(
                     "{} preprocessor error(s) in {}",
@@ -1446,7 +1446,10 @@ impl Driver {
             if Self::is_assembly_source(input_file) || self.is_explicit_assembly() {
                 // Nothing past the preprocessor to check for assembly.
                 if self.verbose {
-                    eprintln!("syntax check passed (assembly): {}", filename);
+                    crate::common::cli_output::stderr_line(format_args!(
+                        "syntax check passed (assembly): {}",
+                        filename
+                    ));
                 }
                 continue;
             }
@@ -1521,10 +1524,16 @@ impl Driver {
                 ));
             }
             if self.verbose && diagnostics.warning_count() > 0 {
-                eprintln!("{} warning(s) generated", diagnostics.warning_count());
+                crate::common::cli_output::stderr_line(format_args!(
+                    "{} warning(s) generated",
+                    diagnostics.warning_count()
+                ));
             }
             if self.verbose {
-                eprintln!("syntax check passed: {}", filename);
+                crate::common::cli_output::stderr_line(format_args!(
+                    "syntax check passed: {}",
+                    filename
+                ));
             }
         }
         Ok(())
@@ -1571,10 +1580,10 @@ impl Driver {
             let pp_errors = preprocessor.errors();
             if !pp_errors.is_empty() {
                 for err in pp_errors {
-                    eprintln!(
+                    crate::common::cli_output::stderr_line(format_args!(
                         "{}:{}:{}: error: {}",
                         err.file, err.line, err.col, err.message
-                    );
+                    ));
                 }
                 return Err(format!(
                     "{} preprocessor error(s) in {}",
@@ -1600,7 +1609,7 @@ impl Driver {
                     &Self::dep_rule_object_target(input_file),
                 )?;
             } else {
-                print!("{}", output);
+                lccc::cli::stdout_text(format_args!("{}", output));
                 // No -o: GCC still writes the dep rule (`.S -E -MF -` streams
                 // `s1.o: s1.S` on stdout; `.S -E -MD` derives s1.d) — same
                 // input-derived names as the C -E path.
@@ -1718,7 +1727,7 @@ impl Driver {
             .output()
             .map_err(|e| format!("Failed to preprocess {}: {}", input_file, e))?;
         if !self.output_path_set {
-            print!("{}", String::from_utf8_lossy(&result.stdout));
+            lccc::cli::stdout_text(format_args!("{}", String::from_utf8_lossy(&result.stdout)));
         }
         if !result.status.success() {
             let stderr = String::from_utf8_lossy(&result.stderr);
@@ -1737,7 +1746,10 @@ impl Driver {
                 self.compile_with_gcc_m16(input_file, &out_path, GccM16Mode::Assembly)?;
                 self.write_dep_file_gcc_semantics(input_file, &out_path)?;
                 if self.verbose {
-                    eprintln!("Assembly output (GCC -m16): {}", out_path);
+                    crate::common::cli_output::stderr_line(format_args!(
+                        "Assembly output (GCC -m16): {}",
+                        out_path
+                    ));
                 }
                 continue;
             }
@@ -1764,7 +1776,10 @@ impl Driver {
             }
             self.write_dep_file_gcc_semantics(input_file, &out_path)?;
             if self.verbose {
-                eprintln!("Assembly output: {}", out_path);
+                crate::common::cli_output::stderr_line(format_args!(
+                    "Assembly output: {}",
+                    out_path
+                ));
             }
         }
         Ok(())
@@ -1828,7 +1843,10 @@ impl Driver {
                     self.compile_with_gcc_m16(input_file, &out_path, GccM16Mode::Object)?;
                     self.write_dep_file_gcc_semantics(input_file, &out_path)?;
                     if self.verbose {
-                        eprintln!("Object output (GCC -m16): {}", out_path);
+                        crate::common::cli_output::stderr_line(format_args!(
+                            "Object output (GCC -m16): {}",
+                            out_path
+                        ));
                     }
                     continue;
                 }
@@ -1844,7 +1862,7 @@ impl Driver {
             }
             self.write_dep_file_gcc_semantics(input_file, &out_path)?;
             if self.verbose {
-                eprintln!("Object output: {}", out_path);
+                crate::common::cli_output::stderr_line(format_args!("Object output: {}", out_path));
             }
         }
         Ok(())
@@ -1893,7 +1911,10 @@ impl Driver {
                         GccM16Mode::Object,
                     )?;
                     if self.verbose {
-                        eprintln!("Compiled (GCC -m16): {}", input_file);
+                        crate::common::cli_output::stderr_line(format_args!(
+                            "Compiled (GCC -m16): {}",
+                            input_file
+                        ));
                     }
                     self.write_dep_file(input_file, &self.output_path, &self.output_path)?;
                     temp_guards.push(tmp);
@@ -1983,13 +2004,13 @@ impl Driver {
                 .filter(|p| !p.is_empty())
                 .map(|p| format!(" -L{}", p))
                 .collect();
-            eprintln!(
+            crate::common::cli_output::stderr_line(format_args!(
                 " /usr/bin/ld -dynamic-linker {} -o {}{}",
                 self.target.dynamic_linker(),
                 self.output_path,
                 l_flags,
-            );
-            eprintln!("LIBRARY_PATH={}", lib_paths);
+            ));
+            crate::common::cli_output::stderr_line(format_args!("LIBRARY_PATH={}", lib_paths));
         }
 
         if linker_args.is_empty() {
@@ -2003,7 +2024,7 @@ impl Driver {
         // (Also cleans up on early return via ? above.)
 
         if self.verbose {
-            eprintln!("Output: {}", self.output_path);
+            crate::common::cli_output::stderr_line(format_args!("Output: {}", self.output_path));
         }
 
         Ok(())
@@ -2494,14 +2515,17 @@ impl Driver {
         if let Ok(v) = std::env::var("LCCC_DUMP_TUNE") {
             if v == "all" {
                 for cpu in crate::backend::x86::cpu_model::X86Cpu::ALL {
-                    eprintln!("{}", cpu.tune().dump());
+                    crate::common::cli_output::stderr_line(format_args!("{}", cpu.tune().dump()));
                 }
             } else if !v.is_empty() && v != "0" {
-                eprint!("{}", tune.dump());
+                lccc::cli::stderr_text(format_args!("{}", tune.dump()));
             }
         }
         if self.verbose {
-            eprintln!("lccc: note: x86 tuning row '{}'", tune.name);
+            crate::common::cli_output::stderr_line(format_args!(
+                "lccc: note: x86 tuning row '{}'",
+                tune.name
+            ));
         }
         let time_phases = std::env::var("CCC_TIME_PHASES").is_ok();
         (ra_config, tune, time_phases)
@@ -2842,7 +2866,10 @@ impl Driver {
             self.fp_trapping_math || self.fp_rounding_math || preprocessor.fenv_access_requested;
         *self.last_dep_files.borrow_mut() = preprocessor.take_dep_files();
         if time_phases {
-            eprintln!("[TIME] preprocess: {:.3}s", t0.elapsed().as_secs_f64());
+            crate::common::cli_output::stderr_line(format_args!(
+                "[TIME] preprocess: {:.3}s",
+                t0.elapsed().as_secs_f64()
+            ));
         }
 
         // Create diagnostic engine for structured error/warning reporting
@@ -2887,15 +2914,19 @@ impl Driver {
         lexer.set_c23(self.c23_dialect());
         let tokens = lexer.tokenize();
         if time_phases {
-            eprintln!(
+            crate::common::cli_output::stderr_line(format_args!(
                 "[TIME] lex: {:.3}s ({} tokens)",
                 t1.elapsed().as_secs_f64(),
                 tokens.len()
-            );
+            ));
         }
 
         if self.verbose {
-            eprintln!("Lexed {} tokens from {}", tokens.len(), input_file);
+            crate::common::cli_output::stderr_line(format_args!(
+                "Lexed {} tokens from {}",
+                tokens.len(),
+                input_file
+            ));
         }
 
         // Parse -- the diagnostic engine holds the source manager for span
@@ -2917,7 +2948,10 @@ impl Driver {
         parser.set_deferred_asm_immediate_validation(true);
         let ast = parser.parse();
         if time_phases {
-            eprintln!("[TIME] parse: {:.3}s", t2.elapsed().as_secs_f64());
+            crate::common::cli_output::stderr_line(format_args!(
+                "[TIME] parse: {:.3}s",
+                t2.elapsed().as_secs_f64()
+            ));
         }
 
         if parser.error_count > 0 {
@@ -2931,7 +2965,10 @@ impl Driver {
         let diagnostics = parser.take_diagnostics();
 
         if self.verbose {
-            eprintln!("Parsed {} declarations", ast.decls.len());
+            crate::common::cli_output::stderr_line(format_args!(
+                "Parsed {} declarations",
+                ast.decls.len()
+            ));
         }
 
         // Semantic analysis -- pass diagnostic engine to sema (still holds
@@ -2956,7 +2993,10 @@ impl Driver {
         let diagnostics = sema.take_diagnostics();
         let sema_result = sema.into_result();
         if time_phases {
-            eprintln!("[TIME] sema: {:.3}s", t3.elapsed().as_secs_f64());
+            crate::common::cli_output::stderr_line(format_args!(
+                "[TIME] sema: {:.3}s",
+                t3.elapsed().as_secs_f64()
+            ));
         }
 
         // Check for warnings promoted to errors by -Werror / -Werror=<name>.
@@ -2971,7 +3011,10 @@ impl Driver {
 
         // Log diagnostic summary if there were any warnings
         if self.verbose && diagnostics.warning_count() > 0 {
-            eprintln!("{} warning(s) generated", diagnostics.warning_count());
+            crate::common::cli_output::stderr_line(format_args!(
+                "{} warning(s) generated",
+                diagnostics.warning_count()
+            ));
         }
 
         Ok((
@@ -3159,11 +3202,11 @@ impl Driver {
         }
 
         if time_phases {
-            eprintln!(
+            crate::common::cli_output::stderr_line(format_args!(
                 "[TIME] lowering: {:.3}s ({} functions)",
                 t4.elapsed().as_secs_f64(),
                 module.functions.len()
-            );
+            ));
         }
 
         // Check for errors emitted during lowering (e.g., unresolved types, invalid constructs)
@@ -3176,11 +3219,17 @@ impl Driver {
 
         // Log diagnostic summary if there were any warnings during lowering
         if self.verbose && diagnostics.warning_count() > 0 {
-            eprintln!("{} warning(s) during lowering", diagnostics.warning_count());
+            crate::common::cli_output::stderr_line(format_args!(
+                "{} warning(s) during lowering",
+                diagnostics.warning_count()
+            ));
         }
 
         if self.verbose {
-            eprintln!("Lowered to {} IR functions", module.functions.len());
+            crate::common::cli_output::stderr_line(format_args!(
+                "Lowered to {} IR functions",
+                module.functions.len()
+            ));
         }
 
         Ok((
@@ -3409,7 +3458,10 @@ impl Driver {
         let t5 = std::time::Instant::now();
         promote_allocas(&mut module);
         if time_phases {
-            eprintln!("[TIME] mem2reg: {:.3}s", t5.elapsed().as_secs_f64());
+            crate::common::cli_output::stderr_line(format_args!(
+                "[TIME] mem2reg: {:.3}s",
+                t5.elapsed().as_secs_f64()
+            ));
         }
 
         // Profile identity. The PRE-pass fingerprint (right after mem2reg,
@@ -3510,7 +3562,10 @@ impl Driver {
             self.tls_model_floor,
         );
         if time_phases {
-            eprintln!("[TIME] opt passes: {:.3}s", t6.elapsed().as_secs_f64());
+            crate::common::cli_output::stderr_line(format_args!(
+                "[TIME] opt passes: {:.3}s",
+                t6.elapsed().as_secs_f64()
+            ));
         }
 
         // Post-pass fingerprint snapshot (the CFG drift detector). The
@@ -3799,15 +3854,22 @@ impl Driver {
         let narrow_gprs = self.target.ptr_size() == 4;
         eliminate_phis(&mut module, narrow_gprs);
         if std::env::var("CCC_DUMP_IR_PHI").is_ok() {
-            eprintln!("==== IR after eliminate_phis ====");
-            eprintln!("{:#?}", module);
-            eprintln!("==== END IR after eliminate_phis ====");
+            crate::common::cli_output::stderr_line(format_args!(
+                "==== IR after eliminate_phis ===="
+            ));
+            crate::common::cli_output::stderr_line(format_args!("{:#?}", module));
+            crate::common::cli_output::stderr_line(format_args!(
+                "==== END IR after eliminate_phis ===="
+            ));
         }
         if std::env::var_os("CCC_VALIDATE_SSA").is_some() {
             crate::passes::validate_unique_defs(&module, "backend:eliminate_phis");
         }
         if time_phases {
-            eprintln!("[TIME] phi elimination: {:.3}s", t7.elapsed().as_secs_f64());
+            crate::common::cli_output::stderr_line(format_args!(
+                "[TIME] phi elimination: {:.3}s",
+                t7.elapsed().as_secs_f64()
+            ));
         }
 
         // ms178: phi elimination is the LAST IR transform, so the copy-backs it
@@ -3825,10 +3887,10 @@ impl Driver {
                 }
             }
             if time_phases {
-                eprintln!(
+                crate::common::cli_output::stderr_line(format_args!(
                     "[TIME] post-phi cleanup: {:.3}s",
                     t7b.elapsed().as_secs_f64()
-                );
+                ));
             }
         }
 
@@ -3854,11 +3916,11 @@ impl Driver {
                 }
             }
             if time_phases && merged_webs > 0 {
-                eprintln!(
+                crate::common::cli_output::stderr_line(format_args!(
                     "[TIME] web congruence: {:.3}s ({} webs merged)",
                     t7c.elapsed().as_secs_f64(),
                     merged_webs
-                );
+                ));
             }
         }
 
@@ -4189,17 +4251,19 @@ impl Driver {
             crate::passes::validate_unique_defs(&module, "backend:pre-codegen");
         }
         if std::env::var("LCCC_DUMP_PRECG").is_ok() {
-            eprintln!("==== IR immediately before codegen ====");
-            eprintln!("{:#?}", module);
-            eprintln!("==== END IR before codegen ====");
+            crate::common::cli_output::stderr_line(format_args!(
+                "==== IR immediately before codegen ===="
+            ));
+            crate::common::cli_output::stderr_line(format_args!("{:#?}", module));
+            crate::common::cli_output::stderr_line(format_args!("==== END IR before codegen ===="));
         }
         if std::env::var("LCCC_DEBUG_LABELS").is_ok() {
             for func in &module.functions {
-                eprintln!(
+                crate::common::cli_output::stderr_line(format_args!(
                     "[IR] Function {}: labels = {:?}",
                     func.name,
                     func.blocks.iter().map(|b| b.label.0).collect::<Vec<_>>()
-                );
+                ));
             }
         }
         // `LCCC_DUMP_IR`: the final IR, one instruction per line (documented
@@ -4209,13 +4273,19 @@ impl Driver {
                 if func.is_declaration {
                     continue;
                 }
-                eprintln!("=== IR {} ===", func.name);
+                crate::common::cli_output::stderr_line(format_args!("=== IR {} ===", func.name));
                 for (bi, b) in func.blocks.iter().enumerate() {
-                    eprintln!("  block {} (label {}):", bi, b.label.0);
+                    crate::common::cli_output::stderr_line(format_args!(
+                        "  block {} (label {}):",
+                        bi, b.label.0
+                    ));
                     for inst in &b.instructions {
-                        eprintln!("    {:?}", inst);
+                        crate::common::cli_output::stderr_line(format_args!("    {:?}", inst));
                     }
-                    eprintln!("    term: {:?}", b.terminator);
+                    crate::common::cli_output::stderr_line(format_args!(
+                        "    term: {:?}",
+                        b.terminator
+                    ));
                 }
             }
         }
@@ -4456,12 +4526,12 @@ impl Driver {
         // never-silently-wrong law that guards port-I/O and SSE lowering.
         let defines_code = module.functions.iter().any(|func| !func.is_declaration);
         if self.debug_info && defines_code && !asm_contains_debug_records(asm) {
-            eprintln!(
+            crate::common::cli_output::stderr_line(format_args!(
                 "{}: warning: -g requested but no debug information was \
                  generated for this translation unit (lccc emits line tables, \
                  compile units and subprograms; type DIEs are not implemented)",
                 input_file
-            );
+            ));
         }
         Ok(())
     }
@@ -4658,23 +4728,27 @@ impl Driver {
             asm
         };
         if time_phases {
-            eprintln!(
+            crate::common::cli_output::stderr_line(format_args!(
                 "[TIME] codegen: {:.3}s ({} bytes asm)",
                 t8.elapsed().as_secs_f64(),
                 asm.len()
-            );
+            ));
         }
 
         if time_phases {
-            eprintln!(
+            crate::common::cli_output::stderr_line(format_args!(
                 "[TIME] total compile {}: {:.3}s",
                 input_file,
                 t0.elapsed().as_secs_f64()
-            );
+            ));
         }
 
         if self.verbose {
-            eprintln!("Generated {:?} assembly ({} bytes)", self.target, asm.len());
+            crate::common::cli_output::stderr_line(format_args!(
+                "Generated {:?} assembly ({} bytes)",
+                self.target,
+                asm.len()
+            ));
         }
 
         // Runtime CPU probe helper (AUD-CPU-1): appended only when a probe

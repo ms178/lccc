@@ -5,7 +5,7 @@ use super::emit::{
     X86_CALLER_SAVED, X86Codegen, collect_inline_asm_callee_saved_x86, is_xmm_reg, phys_reg_name,
 };
 use crate::backend::call_abi::{ParamClass, classify_params};
-use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
+use crate::backend::generation::{ParamAllocaIndex, calculate_stack_space_common};
 use crate::backend::liveness::{
     LiveInterval, for_each_operand_in_instruction, for_each_operand_in_terminator,
 };
@@ -526,9 +526,9 @@ fn replay_span_home_collision(
     let debug = std::env::var_os("CCC_DEBUG_REPLAY_PRUNE").is_some();
     let collide = |o: u32, d: u32, pos: (usize, usize), why: &str| -> bool {
         if debug {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[replay-prune] fn={func_name} collide: operand=v{o} sharer=v{d} def={pos:?} ({why})"
-            );
+            ));
         }
         true
     };
@@ -634,9 +634,9 @@ impl X86Codegen {
         self.masked_guard_zero_splats = collect_zero_splats(func, &self.masked_guard_splats);
         // ms178 debug: dump IR per function
         if self.state.ra_config.dump_ir {
-            eprintln!("===== IR for {} =====", func.name);
-            eprintln!("{:#?}", func);
-            eprintln!("===== end IR =====");
+            lccc::cli::stderr_line(format_args!("===== IR for {} =====", func.name));
+            lccc::cli::stderr_line(format_args!("{:#?}", func));
+            lccc::cli::stderr_line(format_args!("===== end IR ====="));
         }
         // Store function pointer for indexed addressing detection
         self.current_func = Some(func as *const IrFunction);
@@ -866,14 +866,14 @@ impl X86Codegen {
             self.vararg_gp_save = needs_gp;
             self.vararg_fp_save = needs_fp;
             if self.state.ra_config.debug_vararg {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "debug vararg {}: gp={} fp={} stable={} va_ids={:?}",
                     func.name,
                     needs_gp,
                     needs_fp,
                     seeds.iter().all(|s| va_root_is_stable(func, s.0)),
                     va_ids
-                );
+                ));
             }
         }
         // Count named params using the shared ABI classification, so this
@@ -2325,7 +2325,9 @@ impl X86Codegen {
                 let gap = self.cmp_replay_gaps.get(cdest);
                 if home_invalidated_in_gap(lhs, gap) || home_invalidated_in_gap(rhs, gap) {
                     if std::env::var_os("LCCC_DEBUG_REPLAY").is_some() {
-                        eprintln!("[replay] gap-audit prune cdest={cdest} (home rewrite in gap)");
+                        lccc::cli::stderr_line(format_args!(
+                            "[replay] gap-audit prune cdest={cdest} (home rewrite in gap)"
+                        ));
                     }
                     prune.push(*cdest);
                 }
@@ -2443,7 +2445,7 @@ impl X86Codegen {
             && !fn_disabled)
             || fn_forced;
         if self.state.ra_config.mi_debug {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[MI-PROFIT] fn={} loop_insts={} limit={} enabled={} fn_disabled={} fn_forced={}",
                 func.name,
                 loop_insts,
@@ -2451,7 +2453,7 @@ impl X86Codegen {
                 self.machinst_function_enabled,
                 fn_disabled,
                 fn_forced
-            );
+            ));
         }
 
         // W2 Load->Cast fold (2026-08-10): when a Load's result is used
@@ -2635,11 +2637,11 @@ impl X86Codegen {
                 pp += 1; // terminator
             }
             if self.state.ra_config.debug_load_cast_fold && !lcf.is_empty() {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[LOAD-CAST-FOLD] fn={} folds={} (candidates; each fires only if its load takes a redirecting path)",
                     func.name,
                     lcf.len()
-                );
+                ));
             }
             if self.state.ra_config.no_load_cast_fold {
                 lcf.clear();
@@ -3064,11 +3066,11 @@ impl X86Codegen {
                             }
                         })
                         .collect();
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[demorgan] prune-check andor={} homes=[{}]",
                         andor_id,
                         homes.join(", ")
-                    );
+                    ));
                 }
                 // NOTE: skipped defs (the And/Or, its passthru, both Cmps)
                 // need NO accumulator-homing refusal. The accumulator
@@ -3091,7 +3093,7 @@ impl X86Codegen {
                     || home_invalidated_in_gap(&rec.b.2, gap_b)
                 {
                     if debug {
-                        eprintln!("[demorgan] prune andor={}", andor_id);
+                        lccc::cli::stderr_line(format_args!("[demorgan] prune andor={}", andor_id));
                     }
                     prune_dm.push(*andor_id);
                     continue;
@@ -3141,11 +3143,14 @@ impl X86Codegen {
                 };
                 if collides {
                     if debug {
-                        eprintln!("[demorgan] prune andor={} (home collision)", andor_id);
+                        lccc::cli::stderr_line(format_args!(
+                            "[demorgan] prune andor={} (home collision)",
+                            andor_id
+                        ));
                     }
                     prune_dm.push(*andor_id);
                 } else if debug {
-                    eprintln!("[demorgan] survive andor={}", andor_id);
+                    lccc::cli::stderr_line(format_args!("[demorgan] survive andor={}", andor_id));
                 }
             }
             for d in prune_dm {
@@ -3834,6 +3839,9 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_store_params_impl(&mut self, func: &IrFunction) {
+        // One O(instructions + params) pass replaces every
+        // parameter-home full scan in this prologue.
+        let param_homes = ParamAllocaIndex::build(func);
         let xmm_regs = [
             "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
         ];
@@ -3847,7 +3855,7 @@ impl X86Codegen {
 
         self.state.param_alloca_slots = (0..func.params.len())
             .map(|i| {
-                find_param_alloca(func, i).and_then(|(dest, ty)| {
+                param_homes.get(i).and_then(|(dest, ty)| {
                     self.state.get_slot(dest.0).map(|slot| (slot, ty, dest.0))
                 })
             })
@@ -3979,15 +3987,16 @@ impl X86Codegen {
             // 3. We must save the value NOW, before any other code runs
             // 4. emit_param_ref will see param_pre_stored and skip code generation
             if let Some(paramref_dest) = paramref_dests[i] {
-                let has_slot = find_param_alloca(func, i)
+                let has_slot = param_homes
+                    .get(i)
                     .and_then(|(dest, _)| self.state.get_slot(dest.0))
                     .is_some();
                 if self.state.ra_config.debug_param_store {
                     let reg = self.reg_assignments.get(&paramref_dest.0);
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[PRE-STORE] param {} paramref_dest={} has_slot={} reg={:?}",
                         i, paramref_dest.0, has_slot, reg
-                    );
+                    ));
                 }
                 if !has_slot {
                     if let Some(&phys_reg) = self.reg_assignments.get(&paramref_dest.0) {
@@ -4011,10 +4020,10 @@ impl X86Codegen {
                         if self.state.ra_config.debug_param_store {
                             let shared =
                                 reg_to_params.get(&phys_reg.0).is_some_and(|u| u.len() > 1);
-                            eprintln!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[PRE-STORE]   callee={} caller={} shared={} class={:?}",
                                 is_callee_saved, is_caller_saved_gpr, shared, class
-                            );
+                            ));
                         }
                         if is_callee_saved || is_caller_saved_gpr || is_xmm {
                             let shared = reg_to_params
@@ -4059,53 +4068,55 @@ impl X86Codegen {
             } else {
                 // DEBUG: dump entry block instructions for this param
                 if self.state.ra_config.debug_param_store {
-                    if let Some((alloca_dest, _)) = find_param_alloca(func, i) {
-                        eprintln!(
+                    if let Some((alloca_dest, _)) = param_homes.get(i) {
+                        lccc::cli::stderr_line(format_args!(
                             "[PARAM-STORE] param {} has alloca dest={}, no ParamRef",
                             i, alloca_dest.0
-                        );
-                        eprintln!(
+                        ));
+                        lccc::cli::stderr_line(format_args!(
                             "[PARAM-STORE] has_slot={}",
                             self.state.get_slot(alloca_dest.0).is_some()
-                        );
+                        ));
                         for (bi, block) in func.blocks.iter().enumerate() {
                             for inst in &block.instructions {
                                 match inst {
                                     Instruction::Store { ptr, val, .. }
                                         if ptr.0 == alloca_dest.0 =>
                                     {
-                                        eprintln!(
+                                        lccc::cli::stderr_line(format_args!(
                                             "[PARAM-STORE]   block[{}] Store to alloca: val={:?}",
                                             bi, val
-                                        )
+                                        ))
                                     }
                                     Instruction::Load { ptr, dest, .. }
                                         if ptr.0 == alloca_dest.0 =>
                                     {
-                                        eprintln!(
+                                        lccc::cli::stderr_line(format_args!(
                                             "[PARAM-STORE]   block[{}] Load from alloca: dest={}",
                                             bi, dest.0
-                                        )
+                                        ))
                                     }
-                                    Instruction::Copy { dest, src } => eprintln!(
-                                        "[PARAM-STORE]   block[{}] Copy dest={} src={:?}",
-                                        bi, dest.0, src
-                                    ),
+                                    Instruction::Copy { dest, src } => {
+                                        lccc::cli::stderr_line(format_args!(
+                                            "[PARAM-STORE]   block[{}] Copy dest={} src={:?}",
+                                            bi, dest.0, src
+                                        ))
+                                    }
                                     Instruction::ParamRef {
                                         dest, param_idx, ..
-                                    } => eprintln!(
+                                    } => lccc::cli::stderr_line(format_args!(
                                         "[PARAM-STORE]   block[{}] ParamRef dest={} idx={}",
                                         bi, dest.0, param_idx
-                                    ),
+                                    )),
                                     _ => {}
                                 }
                             }
                         }
                         for (&vid, &reg) in self.reg_assignments.iter() {
-                            eprintln!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[PARAM-STORE]   reg_assign: val={} -> PhysReg({})",
                                 vid, reg.0
-                            );
+                            ));
                         }
                     }
                 }
@@ -4121,11 +4132,12 @@ impl X86Codegen {
                 // instructions that write TO that alloca. The Store's source value
                 // (which may be a Copy from the original param) tells us which SSA
                 // value represents the parameter after store-to-load forwarding.
-                let has_slot = find_param_alloca(func, i)
+                let has_slot = param_homes
+                    .get(i)
                     .and_then(|(dest, _)| self.state.get_slot(dest.0))
                     .is_some();
                 if !has_slot {
-                    if let Some((alloca_dest, _)) = find_param_alloca(func, i) {
+                    if let Some((alloca_dest, _)) = param_homes.get(i) {
                         let alloca_id = alloca_dest.0;
                         // Collect all SSA values stored to this alloca, then
                         // propagate through Copy chains to find all derived values.
@@ -4188,7 +4200,7 @@ impl X86Codegen {
                 }
             }
 
-            let (slot, ty, dest_id) = if let Some((dest, ty)) = find_param_alloca(func, i) {
+            let (slot, ty, dest_id) = if let Some((dest, ty)) = param_homes.get(i) {
                 if let Some(slot) = self.state.get_slot(dest.0) {
                     (slot, ty, dest.0)
                 } else {
@@ -4455,10 +4467,10 @@ impl X86Codegen {
             if !early.is_empty() {
                 for (i, dest, ty) in early {
                     if self.state.ra_config.debug_param_store {
-                        eprintln!(
+                        lccc::cli::stderr_line(format_args!(
                             "[PRE-STORE] param {} early ABI read -> slot (dest=v{})",
                             i, dest.0
-                        );
+                        ));
                     }
                     self.emit_param_ref_impl(&dest, i, ty);
                     self.state.param_pre_stored.insert(i);
@@ -4686,10 +4698,10 @@ impl X86Codegen {
                 let load_instr = Self::mov_load_for_type(ty);
                 let dest_reg = Self::load_dest_reg(ty);
                 if self.state.ra_config.debug_paramref {
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[PARAMREF] dest=v{} param_idx={} reg_idx={} src={} ty={:?}",
                         dest.0, param_idx, reg_idx, src_reg, ty
-                    );
+                    ));
                 }
                 // The fallback ABI read is a pinned contract: the operand is
                 // the parameter's *incoming* ABI register. A caller-saved

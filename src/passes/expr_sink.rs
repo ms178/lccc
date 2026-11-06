@@ -803,7 +803,7 @@ fn try_sink_atomic_chain(
             let after = live_range_cost(&after_live, &plan.affected_values, frequency);
             let accept = force_chain_sink() || strictly_improves_live_range(before, after);
             if trace_chain_sink() {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[expr-chain] {} b{}:{} -> b{} ({} insts, {} values): points {:.1}->{:.1}, calls {:.1}->{:.1}, peak {}->{}",
                     if accept { "accept" } else { "reject" },
                     plan.source,
@@ -817,7 +817,7 @@ fn try_sink_atomic_chain(
                     after.weighted_call_crossings,
                     before.peak_pressure,
                     after.peak_pressure,
-                );
+                ));
             }
             if accept {
                 return true;

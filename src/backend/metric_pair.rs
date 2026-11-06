@@ -234,12 +234,12 @@ fn schedule<R>(arch: &'static str, sizes: (usize, usize), run: impl FnOnce(PairM
     };
     if telemetry_enabled() {
         let (parallel, serial, deduped) = pair_counters();
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[pair] arch={arch} chain={}B orig={}B mode={} parallel={parallel} serial={serial} deduped={deduped}",
             sizes.0,
             sizes.1,
             mode.label()
-        );
+        ));
     }
     run(mode)
 }

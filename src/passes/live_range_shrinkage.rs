@@ -708,14 +708,14 @@ pub(crate) fn run_with_budget(
         }
     }
     if std::env::var_os("CCC_LR_SHRINK_STATS").is_some() {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[LR-SHRINK] regions={} high-pressure={} changed={} excess-area={}->{}",
             stats.regions,
             stats.high_pressure_regions,
             stats.changed_regions,
             stats.excess_area_before,
             stats.excess_area_after
-        );
+        ));
     }
     stats
 }

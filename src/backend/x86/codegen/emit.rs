@@ -2047,19 +2047,19 @@ impl X86Codegen {
                 // (the RA's disjoint-live-range invariant).
                 let group_ok = self.home_sharers.get(&reg.0).is_some_and(|g| g.contains(w));
                 if alias_refuse_dbg() && !group_ok {
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[alias-refine] blk={} val={} w={} reg={} w_not_in_group",
                         self.home_dbg_block, val_id, w, reg.0
-                    );
+                    ));
                 }
                 group_ok
             }
             Some(HomeWrite::Clobber) => {
                 if alias_refuse_dbg() {
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[alias-refine] blk={} val={} reg={} state=Clobber (calibrated blessing narrowed)",
                         self.home_dbg_block, val_id, reg.0
-                    );
+                    ));
                 }
                 false
             }
@@ -2152,16 +2152,21 @@ impl X86Codegen {
                 let srcs = edge_srcs.as_ref();
                 for (i, m) in all_edges.iter().enumerate() {
                     let src = srcs.and_then(|v| v.get(i));
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[WS-m] blk={} e{}(from blk {:?}) r{}={:?}",
                         label.0,
                         i,
                         src,
                         wr,
                         m.get(&wr)
-                    );
+                    ));
                 }
-                eprintln!("[WS-m] blk={} res r{}={:?}", label.0, wr, merged.get(&wr));
+                lccc::cli::stderr_line(format_args!(
+                    "[WS-m] blk={} res r{}={:?}",
+                    label.0,
+                    wr,
+                    merged.get(&wr)
+                ));
             }
             self.home_write_state = merged;
         } else if !self.home_fallthrough && !self.home_entry_pending {
@@ -2214,13 +2219,16 @@ impl X86Codegen {
     pub(super) fn note_home_written(&mut self, dest_id: u32) {
         if let Some(&home) = self.reg_assignments.get(&dest_id) {
             if ws_watch(home.0) {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[WS-ev] blk={} pp={} r{}=Def({})",
                     self.home_dbg_block, self.state.current_program_point, home.0, dest_id
-                );
+                ));
             }
             if trace_notes_enabled() {
-                eprintln!("[INS] fn={} v={}", self.state.current_func_name, dest_id);
+                lccc::cli::stderr_line(format_args!(
+                    "[INS] fn={} v={}",
+                    self.state.current_func_name, dest_id
+                ));
             }
             self.home_fresh.insert(dest_id);
             self.clear_home_clobbered(dest_id);
@@ -2261,10 +2269,10 @@ impl X86Codegen {
         // last write is now a non-definition write.
         self.home_write_state.insert(phys, HomeWrite::Clobber);
         if ws_watch(phys) {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[WS-ev] blk={} pp={} r{}=Clobber",
                 self.home_dbg_block, self.state.current_program_point, phys
-            );
+            ));
         }
         if let Some(index) = self.home_live_index.get(&phys) {
             let point = self.state.current_program_point;
@@ -2290,10 +2298,10 @@ impl X86Codegen {
             // Cheap test first: the eviction list is empty for the vast
             // majority of clobbers, and only a non-empty one can trace.
             if !stale.is_empty() && trace_notes_enabled() {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[CLOB] fn={} phys={} pp={} evicts={:?}",
                     self.state.current_func_name, phys, point, stale
-                );
+                ));
             }
             for v in stale {
                 if !terminator_point
@@ -4953,10 +4961,10 @@ impl X86Codegen {
                     } else if self.state.is_i128_value(v.0) {
                         // 128-bit value in 16-byte stack slot
                         if crate::backend::traits::trace_i128_enabled() {
-                            eprintln!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[I128] load_acc_pair value {} slot {} rsp_frame_size={}",
                                 v.0, slot.0, self.state.out.rsp_frame_size
-                            );
+                            ));
                         }
                         self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rax");
                         self.state
@@ -5043,20 +5051,20 @@ impl X86Codegen {
     pub(super) fn store_rax_rdx_to(&mut self, dest: &Value) {
         if let Some(slot) = self.state.get_slot(dest.0) {
             if crate::backend::traits::trace_i128_enabled() {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[I128] store_rax_rdx_to: value {} -> slot {}",
                     dest.0, slot.0
-                );
+                ));
             }
             self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
             self.state
                 .out
                 .emit_instr_reg_rbp("    movq", "rdx", slot.0 + 8);
         } else if crate::backend::traits::trace_i128_enabled() {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[I128] store_rax_rdx_to: value {} has NO slot — pair left in rax:rdx (may be clobbered)",
                 dest.0
-            );
+            ));
         }
         // rax holds only the low 64 bits of an i128, not a valid scalar IR value.
         self.state.reg_cache.invalidate_all();
@@ -8116,7 +8124,7 @@ impl X86Codegen {
         let home = self.reg_assignments.get(&v).map(|r| r.0);
         let fresh = self.home_fresh.contains(&v);
         let sharers = home.and_then(|h| self.home_sharers.get(&h).cloned());
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[NOHOME] fn={} value={} home={:?} fresh={} sharers={:?} defined_by={:?} \
              in_ir_shadow={}",
             self.state.current_func_name,
@@ -8128,7 +8136,7 @@ impl X86Codegen {
             self.machinst_buf_ir
                 .iter()
                 .any(|i| i.dest().map(|d| d.0) == Some(v))
-        );
+        ));
         // Per-sibling mark audit (H1 blind-spot triage): for each group
         // sibling, its clobber mark, chain rep, and live segments against the
         // current point.
@@ -8140,17 +8148,17 @@ impl X86Codegen {
                 .get(&h)
                 .is_some_and(|iv| iv.iter().any(|&(s, e)| s <= point && point <= e))
         });
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[NOHOME-home] v={} write_state={:?} caller_spilled={} \
              caller_interval_covers_now={}",
             v, home_state, caller_spilled, caller_interval
-        );
-        eprintln!(
+        ));
+        lccc::cli::stderr_line(format_args!(
             "[NOHOME-cause] v={} cause={:?}",
             v,
             self.home_clobber_cause.get(&v)
-        );
-        eprintln!(
+        ));
+        lccc::cli::stderr_line(format_args!(
             "[NOHOME-self] v={} clobbered={} fresh={} rep={} segs={:?} now={} use={:?}",
             v,
             self.home_clobbered.contains(&v),
@@ -8159,7 +8167,7 @@ impl X86Codegen {
             self.value_live_segments.get(&v),
             point,
             self.value_use_counts.get(&v)
-        );
+        ));
         let Some(sharers) = sharers else {
             return;
         };
@@ -8167,7 +8175,7 @@ impl X86Codegen {
             if s == v {
                 continue;
             }
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[NOHOME-sib] s={} clobbered={} fresh={} rep={} segs={:?} now={}",
                 s,
                 self.home_clobbered.contains(&s),
@@ -8175,7 +8183,7 @@ impl X86Codegen {
                 self.chain_rep(s),
                 self.value_live_segments.get(&s),
                 point
-            );
+            ));
         }
     }
 
@@ -9311,13 +9319,13 @@ impl ArchCodegen for X86Codegen {
         use super::machinst::{MachInst, MachOperand, MachReg, OpSize};
 
         if mi_stream_dbg() {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "### MI-STREAM fn={} n={}",
                 self.state.current_func_name,
                 self.machinst_buf.len()
-            );
+            ));
             for mi in &self.machinst_buf {
-                eprintln!("  {mi:?}");
+                lccc::cli::stderr_line(format_args!("  {mi:?}"));
             }
         }
 
@@ -9430,17 +9438,19 @@ impl ArchCodegen for X86Codegen {
             .any(|mi| machinst_needs_text_fallback(mi, Some(&self.state.out)));
         if has_bad {
             if self.state.ra_config.mi_debug {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[MI-FALLBACK] {} instructions -> default path",
                     self.machinst_buf_ir.len()
-                );
+                ));
                 for mi in &final_insts {
                     if has_unresolvable_vreg(mi, &self.reg_assignments) {
-                        eprintln!("[MI-FALLBACK]   unresolvable: {mi:?}");
+                        lccc::cli::stderr_line(format_args!(
+                            "[MI-FALLBACK]   unresolvable: {mi:?}"
+                        ));
                     }
                 }
                 for inst in &self.machinst_buf_ir {
-                    eprintln!("[MI-FALLBACK]   ir: {inst:?}");
+                    lccc::cli::stderr_line(format_args!("[MI-FALLBACK]   ir: {inst:?}"));
                 }
             }
             // CORRECTNESS: never delete instructions. Re-emit the buffered IR
@@ -9616,10 +9626,10 @@ impl ArchCodegen for X86Codegen {
                                 if self.reg_assignments.get(&v).is_some_and(|&r| r == home) =>
                             {
                                 if ws_watch(*reg_id) {
-                                    eprintln!(
+                                    lccc::cli::stderr_line(format_args!(
                                         "[WS-win] blk={} r{} vreg Def({})",
                                         self.home_dbg_block, reg_id, v
-                                    );
+                                    ));
                                 }
                                 self.home_write_state.insert(*reg_id, HomeWrite::Def(v));
                             }
@@ -9628,7 +9638,7 @@ impl ArchCodegen for X86Codegen {
                             // clobber: foreign content.
                             other => {
                                 if ws_watch(*reg_id) {
-                                    eprintln!(
+                                    lccc::cli::stderr_line(format_args!(
                                         "[WS-win] blk={} r{} Clobber writer={:?} kind={:?} state_before={:?}",
                                         self.home_dbg_block,
                                         reg_id,
@@ -9637,7 +9647,7 @@ impl ArchCodegen for X86Codegen {
                                             .as_ref()
                                             .and_then(|m| m.get(reg_id)),
                                         self.home_write_state.get(reg_id)
-                                    );
+                                    ));
                                 }
                                 self.home_write_state.insert(*reg_id, HomeWrite::Clobber);
                             }
@@ -10400,12 +10410,12 @@ impl ArchCodegen for X86Codegen {
                 let debug = std::env::var("LCCC_DEBUG_PROTECT").is_ok();
                 let is_128 = self.state.vector128_values.contains(&v.0);
                 if debug {
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[COPY-VEC] Copying {}-bit vector SSA {} to SSA {}",
                         if is_128 { 128 } else { 256 },
                         v.0,
                         dest.0
-                    );
+                    ));
                 }
 
                 // Coalesced loop-carried vectors already occupy the same

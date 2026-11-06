@@ -99,7 +99,7 @@ fn load_file_depth(
     depth: usize,
 ) -> Result<(), String> {
     if std::env::var("LINKER_DEBUG").is_ok() {
-        eprintln!("load_file: {}", path);
+        lccc::cli::stderr_line(format_args!("load_file: {}", path));
     }
     let data = std::fs::read(path).map_err(|e| format!("failed to read '{}': {}", path, e))?;
 

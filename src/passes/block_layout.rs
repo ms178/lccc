@@ -900,22 +900,22 @@ pub(crate) fn relayout_blocks_static_chain(
         cost
     };
     if std::env::var("CCC_DEBUG_CHAIN").is_ok() {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[CHAIN] {}: blocks={} current_cost={} chain_cost={} gain={}",
             func.name,
             n,
             current_cost,
             chain_cost,
             current_cost.saturating_sub(chain_cost)
-        );
-        eprintln!(
+        ));
+        lccc::cli::stderr_line(format_args!(
             "[CHAIN-ORDER] {}",
             placed
                 .iter()
                 .map(|b| b.to_string())
                 .collect::<Vec<_>>()
                 .join(",")
-        );
+        ));
         let succ_dump: Vec<String> = (0..n)
             .map(|b| {
                 format!(
@@ -929,7 +929,7 @@ pub(crate) fn relayout_blocks_static_chain(
                 )
             })
             .collect();
-        eprintln!("[CHAIN-SUCCS] {}", succ_dump.join(" "));
+        lccc::cli::stderr_line(format_args!("[CHAIN-SUCCS] {}", succ_dump.join(" ")));
     }
     // Minimum improvement for the chain to fire. Below 4 weighted units the
     // reorder buys no meaningful branch saving — it is a pure register-

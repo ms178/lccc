@@ -359,10 +359,10 @@ pub fn apply_string_merge<G: super::symbols::GlobalSymbolOps>(
                         }
                         None => {
                             if debug {
-                                eprintln!(
+                                lccc::cli::stderr_line(format_args!(
                                     "[strmerge] exclude {} sec {}: off {} (rtype {})",
                                     obj.source_name, tsec, old_off, rela.rela_type
-                                );
+                                ));
                             }
                             excluded.insert((oi, tsec));
                             newly_excluded = true;

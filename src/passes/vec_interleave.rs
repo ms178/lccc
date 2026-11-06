@@ -394,7 +394,10 @@ fn analyze(
 ) -> Option<Candidate> {
     let reject = |why: &str| -> Option<Candidate> {
         if debug {
-            eprintln!("[VEC-IL] loop@{} not interleaved: {}", lp.header, why);
+            lccc::cli::stderr_line(format_args!(
+                "[VEC-IL] loop@{} not interleaved: {}",
+                lp.header, why
+            ));
         }
         None
     };
@@ -677,11 +680,11 @@ fn choose_factor(func: &IrFunction, c: &Candidate) -> u32 {
     let model = crate::backend::x86::cpu_model::active().reduction_interleave(shape);
     let factor = model.min(X86_VEC_CHAIN_REG_CAP);
     if why_not() && factor != model {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-IL] roofline wants x{model} for {:?}, clamped to x{factor} by \
              X86_VEC_CHAIN_REG_CAP (vector RA capability)",
             shape
-        );
+        ));
     }
     match c.accs.len() {
         1 => factor,
@@ -1212,14 +1215,14 @@ fn transform(func: &mut IrFunction, c: &Candidate, factor: u32, debug: bool) -> 
     func.next_value_id = next_val.max(func.next_value_id);
     func.next_label = next_label.max(func.next_label);
     if debug {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-IL] {}: loop@{} interleaved x{} ({} accumulator(s), step {})",
             func.name,
             c.header,
             factor,
             c.accs.len(),
             c.step
-        );
+        ));
     }
     true
 }

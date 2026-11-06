@@ -234,6 +234,6 @@ pub fn emit_slot_census(
         }
     });
     if changed {
-        eprintln!("{}", line);
+        lccc::cli::stderr_line(format_args!("{}", line));
     }
 }

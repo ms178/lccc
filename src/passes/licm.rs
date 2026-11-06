@@ -908,10 +908,10 @@ fn build_loop_alias_info(func: &IrFunction, natural_loop: &NaturalLoop) -> LoopA
         stores.push((form, size));
     }
     if std::env::var_os("CCC_DEBUG_LICM_ALIAS").is_some() {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[LICM-ALIAS] fn={} header={} forms={:?} stores={:?} complete={}",
             func.name, natural_loop.header, forms, stores, complete
-        );
+        ));
     }
     LoopAliasInfo {
         forms,
@@ -1005,7 +1005,9 @@ fn is_load_hoistable(
             return true;
         }
         if !preheader_is_dedicated && !root_global_addr_values.contains(&ptr_id) {
-            licm_debug(|| eprintln!("[LICM] global load: preheader not dedicated"));
+            licm_debug(|| {
+                lccc::cli::stderr_line(format_args!("[LICM] global load: preheader not dedicated"))
+            });
             return false;
         }
         if loop_mem.has_calls {
@@ -1038,28 +1040,42 @@ fn is_load_hoistable(
     // successor is the loop header (see hoist_loop_invariants).
     if !preheader_is_dedicated {
         licm_debug(|| {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[LICM] derived-pointer load v{}: preheader is not dedicated \
                  (LOOP-PREHEADER-1 inserts one)",
                 ptr_id
-            )
+            ))
         });
         return false;
     }
     if std::env::var_os("CCC_NO_LICM_ALIAS").is_some() {
-        licm_debug(|| eprintln!("[LICM] load v{}: alias engine off", ptr_id));
+        licm_debug(|| {
+            lccc::cli::stderr_line(format_args!("[LICM] load v{}: alias engine off", ptr_id))
+        });
         return false;
     }
     if loop_mem.has_calls {
-        licm_debug(|| eprintln!("[LICM] load v{}: loop has calls", ptr_id));
+        licm_debug(|| {
+            lccc::cli::stderr_line(format_args!("[LICM] load v{}: loop has calls", ptr_id))
+        });
         return false;
     }
     if !alias_info.complete {
-        licm_debug(|| eprintln!("[LICM] load v{}: alias info incomplete", ptr_id));
+        licm_debug(|| {
+            lccc::cli::stderr_line(format_args!(
+                "[LICM] load v{}: alias info incomplete",
+                ptr_id
+            ))
+        });
         return false;
     }
     let Some(load_form) = alias_info.forms.get(&ptr_id) else {
-        licm_debug(|| eprintln!("[LICM] load v{}: pointer has no linear form", ptr_id));
+        licm_debug(|| {
+            lccc::cli::stderr_line(format_args!(
+                "[LICM] load v{}: pointer has no linear form",
+                ptr_id
+            ))
+        });
         return false;
     };
     alias_info.stores.iter().all(|(store_form, store_size)| {
@@ -1812,12 +1828,12 @@ fn hoist_loop_invariants_with(
                     // forwarding/CSE/DCE and cannot observe a hoist.
                     if *volatile {
                         licm_debug(|| {
-                            eprintln!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[LICM] load v{} in block {} not hoisted: volatile \
                                  (hoisting would change the number of observable \
                                  accesses, C11 5.1.2.3)",
                                 dest.0, block_idx
-                            )
+                            ))
                         });
                         false
                     } else if !(natural_loop
@@ -1833,12 +1849,12 @@ fn hoist_loop_invariants_with(
                         })
                     {
                         licm_debug(|| {
-                            eprintln!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[LICM] load v{} in block {} not hoisted: its block does \
                                  not dominate every loop block (block is not the header, \
                                  so the load is not must-execute)",
                                 dest.0, block_idx
-                            )
+                            ))
                         });
                         false
                     } else {

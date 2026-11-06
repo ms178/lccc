@@ -203,7 +203,9 @@ fn classify(
                 let (root, _) = resolve(&scan.gep, base.0);
                 if (root == d_root || root == s_root) && const_i64(offset).is_none() {
                     if dbg {
-                        eprintln!("[byval]   variable-offset GEP of v{root}: {inst:?}");
+                        lccc::cli::stderr_line(format_args!(
+                            "[byval]   variable-offset GEP of v{root}: {inst:?}"
+                        ));
                     }
                     return Err("variable-offset GEP");
                 }
@@ -269,7 +271,9 @@ fn classify(
                     }
                     other => {
                         if dbg {
-                            eprintln!("[byval]   unmodelled use of D: {other:?}");
+                            lccc::cli::stderr_line(format_args!(
+                                "[byval]   unmodelled use of D: {other:?}"
+                            ));
                         }
                         return Err("unmodelled use of D");
                     }
@@ -538,7 +542,9 @@ pub(super) fn run_function(
         // old storage.
         if param_homes.contains(&d_root) || param_homes.contains(&s_root) {
             if dbg {
-                eprintln!("[byval] copy b{mb}/{mi}: a parameter home is involved");
+                lccc::cli::stderr_line(format_args!(
+                    "[byval] copy b{mb}/{mi}: a parameter home is involved"
+                ));
             }
             continue;
         }
@@ -546,7 +552,9 @@ pub(super) fn run_function(
         // instructions this pass enumerated.
         if any_escape(&scan.escapes, &scan.gep, s_root) {
             if dbg {
-                eprintln!("[byval] copy b{mb}/{mi} S=v{s_root}: source escapes");
+                lccc::cli::stderr_line(format_args!(
+                    "[byval] copy b{mb}/{mi} S=v{s_root}: source escapes"
+                ));
             }
             continue;
         }
@@ -554,7 +562,9 @@ pub(super) fn run_function(
             Ok(u) => u,
             Err(why) => {
                 if dbg {
-                    eprintln!("[byval] copy b{mb}/{mi} D=v{d_root} S=v{s_root} size={size}: {why}");
+                    lccc::cli::stderr_line(format_args!(
+                        "[byval] copy b{mb}/{mi} D=v{d_root} S=v{s_root} size={size}: {why}"
+                    ));
                 }
                 continue;
             }
@@ -569,17 +579,19 @@ pub(super) fn run_function(
             .collect();
         if !uses_of_d.iter().all(|&(b, i)| before(mb, mi, b, i)) {
             if dbg {
-                eprintln!("[byval] copy b{mb}/{mi}: a use of D is not dominated by the copy");
+                lccc::cli::stderr_line(format_args!(
+                    "[byval] copy b{mb}/{mi}: a use of D is not dominated by the copy"
+                ));
             }
             continue;
         }
         // ...and S must have no observer after the copy.
         if let Some(w) = find_interference(&u.s_uses, &uses_of_d, mb, mi, &succs, &preds, n) {
             if dbg {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[byval] copy b{mb}/{mi}: S is still used at b{}/{}",
                     w.0, w.1
-                );
+                ));
             }
             continue;
         }
@@ -595,7 +607,9 @@ pub(super) fn run_function(
         let max_width = d_align.min(s_align);
         let Some(pieces) = tile(&u.d_accesses, size, max_width) else {
             if dbg {
-                eprintln!("[byval] copy b{mb}/{mi}: field tiling failed");
+                lccc::cli::stderr_line(format_args!(
+                    "[byval] copy b{mb}/{mi}: field tiling failed"
+                ));
             }
             continue;
         };
@@ -654,12 +668,12 @@ pub(super) fn run_function(
         claimed.insert(s_root);
         changed += 1;
         if dbg {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[byval] fn {}: coalesced copy b{mb}/{mi} D=v{d_root} -> S=v{s_root} size={size} fields={} byval={}",
                 func.name,
                 pieces.len(),
                 u.byval.len()
-            );
+            ));
         }
     }
     changed

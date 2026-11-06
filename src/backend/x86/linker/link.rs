@@ -293,7 +293,11 @@ pub fn link_builtin(
     macro_rules! phase {
         ($name:expr_2021) => {
             if ld_time {
-                eprintln!("[ldtime] {:<24} {:>7.1} ms", $name, t_phase.lap_ms());
+                lccc::cli::stderr_line(format_args!(
+                    "[ldtime] {:<24} {:>7.1} ms",
+                    $name,
+                    t_phase.lap_ms()
+                ));
             }
         };
     }
@@ -329,7 +333,7 @@ pub fn link_builtin(
         return Err(format!("warning treated as error: {}", option_warnings[0]));
     }
     for warning in &option_warnings {
-        eprintln!("lccc-ld: warning: {warning}");
+        lccc::cli::stderr_line(format_args!("lccc-ld: warning: {warning}"));
     }
     if parsed_args.warn_common {
         objects.enable_warn_common();
@@ -617,7 +621,7 @@ pub fn link_builtin(
     if trace_files {
         for obj in objects.iter() {
             if !obj.source_name.starts_with('<') {
-                println!("{}", obj.source_name);
+                lccc::cli::stdout_line(format_args!("{}", obj.source_name));
             }
         }
     }
@@ -709,12 +713,12 @@ pub fn link_builtin(
     // surviving copy, not the referencing object's own.
     let comdat_plan = linker_common::comdat::plan_comdat(&objects);
     if std::env::var("LCCC_DEBUG_COMDAT").is_ok() {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[comdat] groups_discarded={} sections={} bytes_saved={}",
             comdat_plan.groups_discarded,
             comdat_plan.dead.len(),
             comdat_plan.bytes_saved
-        );
+        ));
     }
 
     // Garbage-collect unreferenced sections when --gc-sections is active.
@@ -806,13 +810,21 @@ pub fn link_builtin(
                 &plan,
             );
             if std::env::var("LCCC_DEBUG_STRMERGE").is_ok() {
-                eprintln!("[strmerge] pools={} applied={}", plan.pools.len(), applied);
+                lccc::cli::stderr_line(format_args!(
+                    "[strmerge] pools={} applied={}",
+                    plan.pools.len(),
+                    applied
+                ));
                 for p in &plan.pools {
-                    eprintln!("[strmerge]   {} {} bytes", p.name, p.data.len());
+                    lccc::cli::stderr_line(format_args!(
+                        "[strmerge]   {} {} bytes",
+                        p.name,
+                        p.data.len()
+                    ));
                 }
             }
         } else if std::env::var("LCCC_DEBUG_STRMERGE").is_ok() {
-            eprintln!("[strmerge] no plan (no eligible sections)");
+            lccc::cli::stderr_line(format_args!("[strmerge] no plan (no eligible sections)"));
         }
     }
 
@@ -824,10 +836,10 @@ pub fn link_builtin(
     // its FDE is still needed, whereas a COMDAT/GC loser's is not.
     let dropped_fdes = linker_common::prune_dead_fdes(&mut objects, &dead_sections);
     if std::env::var("LCCC_DEBUG_GCEH").is_ok() {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[gceh] dropped_fdes={dropped_fdes} dead_sections={}",
             dead_sections.len()
-        );
+        ));
     }
 
     phase!("strmerge");
@@ -857,7 +869,9 @@ pub fn link_builtin(
             icf_plan.redirect.keys().copied().collect();
         let dropped_folded_fdes = linker_common::prune_dead_fdes(&mut objects, &folded);
         if std::env::var("LCCC_DEBUG_GCEH").is_ok() {
-            eprintln!("[gceh] dropped_folded_fdes={dropped_folded_fdes}");
+            lccc::cli::stderr_line(format_args!(
+                "[gceh] dropped_folded_fdes={dropped_folded_fdes}"
+            ));
         }
     }
 
@@ -914,7 +928,7 @@ pub fn link_builtin(
             }
         }
         if std::env::var("LCCC_DEBUG_ICF").is_ok() {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[icf] mode={} groups={} folded={} bytes_saved={} rejected_unsafe={} iters={} comparisons={} shattered={}",
                 icf_mode.as_deref().unwrap_or("none"),
                 icf_plan.result.candidate_groups,
@@ -924,7 +938,7 @@ pub fn link_builtin(
                 icf_plan.result.iterations,
                 icf_plan.result.comparisons,
                 icf_plan.result.shattered
-            );
+            ));
         }
     }
 
@@ -1024,11 +1038,11 @@ pub fn link_builtin(
     );
     phase!("emit-exec");
     if ld_time {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[ldtime] {:<24} {:>7.1} ms",
             "TOTAL",
             t_all.elapsed().as_secs_f64() * 1e3
-        );
+        ));
     }
     r
 }
@@ -1093,7 +1107,7 @@ pub fn link_shared(
         return Err(format!("warning treated as error: {}", option_warnings[0]));
     }
     for warning in &option_warnings {
-        eprintln!("lccc-ld: warning: {warning}");
+        lccc::cli::stderr_line(format_args!("lccc-ld: warning: {warning}"));
     }
     // CET/ISA flags up front, as in `link_builtin`: an invalid `-z
     // x86-64-*` level fails the link before any real work happens.
@@ -1330,7 +1344,7 @@ pub fn link_shared(
     if trace_files {
         for obj in objects.iter() {
             if !obj.source_name.starts_with('<') {
-                println!("{}", obj.source_name);
+                lccc::cli::stdout_line(format_args!("{}", obj.source_name));
             }
         }
     }

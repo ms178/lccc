@@ -2162,7 +2162,10 @@ fn ipa_make_room(
         return false;
     };
     if fill.trace {
-        eprintln!("[RA-IPA] displace {:?} from r{} to r{}", group, p.0, q.0);
+        lccc::cli::stderr_line(format_args!(
+            "[RA-IPA] displace {:?} from r{} to r{}",
+            group, p.0, q.0
+        ));
     }
     for &(v, _) in &group {
         assignments.insert(v, q);
@@ -2287,7 +2290,7 @@ fn ipa_fill_preserved_regs(
                 })?,
             };
         if fill.trace {
-            eprintln!("[RA-IPA] home {:?} in r{}", tenants, p.0);
+            lccc::cli::stderr_line(format_args!("[RA-IPA] home {:?} in r{}", tenants, p.0));
         }
         for (f, &n) in free_at.iter_mut().zip(&covered) {
             if n > 0 {
@@ -4304,17 +4307,20 @@ fn build_coalesce_groups(
     }
 
     if ra_config.debug_coalesce {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[COALESCE] fn={} groups={} members={}",
             func.name,
             result.len(),
             result.values().map(|m| m.len()).sum::<usize>()
-        );
+        ));
         if ra_config.debug_coalesce_members {
             let mut rows: Vec<(&u32, &Vec<u32>)> = result.iter().collect();
             rows.sort_unstable();
             for (leader, members) in rows {
-                eprintln!("[COALESCE]   leader=v{} members={:?}", leader, members);
+                lccc::cli::stderr_line(format_args!(
+                    "[COALESCE]   leader=v{} members={:?}",
+                    leader, members
+                ));
             }
         }
     }
@@ -4748,10 +4754,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         for cand in &all_phi_pairs {
             if is_frame_address_pair(cand) {
                 if config.ra_config.debug_phi_coalesce {
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[PHI_COALESCE] fn={} FRAME_ADDRESS phi_dest=v{} src=v{} (block={} copy_idx={})",
                         func.name, cand.phi_dest, cand.backedge_src, cand.block_idx, cand.copy_idx
-                    );
+                    ));
                 }
                 continue;
             }
@@ -4796,14 +4802,14 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             && !src_has_other_consumers
         {
             if config.ra_config.debug_phi_coalesce {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[PHI_COALESCE] fn={} HOMELESS src=v{} (dest=v{} block={} copy_idx={})",
                     func.name,
                     candidate.backedge_src,
                     candidate.phi_dest,
                     candidate.block_idx,
                     candidate.copy_idx
-                );
+                ));
             }
             eligible.remove(&candidate.backedge_src);
         }
@@ -5229,10 +5235,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             } else {
                 "optional"
             };
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[RA-P1C] fn={} v={} [{},{}) uses={} priority={} spans_loop={} segments={} {}",
                 func.name, id, start, end, uses, prio, spans, nseg, hint
-            );
+            ));
         }
     }
     bump_coalesce_group_priority(&mut phase1_ranges, &coalesce_groups, &use_count);
@@ -5295,14 +5301,14 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     if config.ra_config.debug_ra_phases {
         let mut ids: Vec<u32> = assignments.keys().copied().collect();
         ids.sort_unstable();
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[RA-P1] fn={} pool={:?} candidates={} assigned={:?} (optional wave {})",
             func.name,
             config.available_regs,
             phase1_intervals.len(),
             ids,
             phase1_assigned_optional
-        );
+        ));
     }
 
     let mut used_regs_set: FxHashSet<u8> = FxHashSet::default();
@@ -5334,10 +5340,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
 
         if let Some((ecx_hazards, edx_hazards)) = hazards {
             if config.ra_config.debug_ra_intervals {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[RA-P2] fn={} ecx_hazards={:?} edx_hazards={:?}",
                     func.name, ecx_hazards, edx_hazards
-                );
+                ));
             }
             for (reg, reg_hazards) in [(PhysReg(5), &edx_hazards), (PhysReg(4), &ecx_hazards)] {
                 if !config.caller_saved_regs.contains(&reg) {
@@ -5359,10 +5365,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .collect();
                 if config.ra_config.debug_ra_intervals {
                     let cands: Vec<u32> = intervals.iter().map(|iv| iv.value_id).collect();
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[RA-P2] fn={} reg={:?} candidates={:?}",
                         func.name, reg, cands
-                    );
+                    ));
                 }
                 if intervals.is_empty() {
                     continue;
@@ -5476,7 +5482,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         .filter(|iv| assignments.contains_key(&iv.value_id))
                         .map(|iv| (iv.value_id, assignments[&iv.value_id].0))
                         .collect();
-                    eprintln!("[RA-W1] fn={} homes={:?}", func.name, ids);
+                    lccc::cli::stderr_line(format_args!(
+                        "[RA-W1] fn={} homes={:?}",
+                        func.name, ids
+                    ));
                 }
                 // Wave 2: indirect-call args at index 0 — avoid the indirect-
                 // target register only; argument registers are still safe.
@@ -5516,7 +5525,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         .filter(|iv| assignments.contains_key(&iv.value_id))
                         .map(|iv| (iv.value_id, assignments[&iv.value_id].0))
                         .collect();
-                    eprintln!("[RA-W2] fn={} homes={:?}", func.name, ids);
+                    lccc::cli::stderr_line(format_args!(
+                        "[RA-W2] fn={} homes={:?}",
+                        func.name, ids
+                    ));
                 }
                 // Wave 3: direct-call arguments with a staging hazard -- each
                 // avoids exactly the argument registers its hazard depth names
@@ -5626,7 +5638,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         .filter(|iv| assignments.contains_key(&iv.value_id))
                         .map(|iv| (iv.value_id, assignments[&iv.value_id].0))
                         .collect();
-                    eprintln!("[RA-W3] fn={} homes={:?}", func.name, ids);
+                    lccc::cli::stderr_line(format_args!(
+                        "[RA-W3] fn={} homes={:?}",
+                        func.name, ids
+                    ));
                 }
                 // Wave 4: the rest (non-call-args and direct arg-0 values) —
                 // full caller-saved pool.
@@ -5636,7 +5651,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         regs.push((r.0, spans.clone()));
                     }
                     regs.sort_unstable();
-                    eprintln!("[RA-W4SEED] fn={} seed={:?}", func.name, regs);
+                    lccc::cli::stderr_line(format_args!(
+                        "[RA-W4SEED] fn={} seed={:?}",
+                        func.name, regs
+                    ));
                 }
                 let w4: Vec<LiveInterval> = scan_ivs
                     .iter()
@@ -5690,7 +5708,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                             .filter(|iv| assignments.contains_key(&iv.value_id))
                             .map(|iv| (iv.value_id, assignments[&iv.value_id].0))
                             .collect();
-                        eprintln!("[RA-W4] fn={} homes={:?}", func.name, ids);
+                        lccc::cli::stderr_line(format_args!(
+                            "[RA-W4] fn={} homes={:?}",
+                            func.name, ids
+                        ));
                     }
                 }
             }
@@ -5794,12 +5815,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 .collect();
             if config.ra_config.debug_ra_intervals {
                 let cands: Vec<u32> = intervals.iter().map(|iv| iv.value_id).collect();
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[RA-P2X] fn={} rdx-hazard clobbers={} candidates={:?}",
                     func.name,
                     rdx_clobbers.len(),
                     cands
-                );
+                ));
             }
             if !intervals.is_empty() {
                 let ranges = build_gpr_ranges(&intervals);
@@ -5864,12 +5885,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .collect();
         if config.ra_config.debug_ra_intervals {
             let cands: Vec<u32> = intervals.iter().map(|iv| iv.value_id).collect();
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[RA-P2W] fn={} wide-hazard points={} candidates={:?}",
                 func.name,
                 hazards.len(),
                 cands
-            );
+            ));
         }
         if !intervals.is_empty() {
             let ranges = build_gpr_ranges(&intervals);
@@ -5912,12 +5933,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .collect();
         if config.ra_config.debug_ra_intervals {
             let cands: Vec<u32> = intervals.iter().map(|iv| iv.value_id).collect();
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[RA-P2P] fn={} pool={:?} candidates={:?}",
                 func.name,
                 pool.iter().map(|r| r.0).collect::<Vec<_>>(),
                 cands
-            );
+            ));
         }
         // A parameter whose argument register is a pool register stays
         // there when no earlier home occupies it during the parameter's
@@ -5958,7 +5979,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         assignments.get(&leader).map(|r| (leader, *r))
                     })
                     .collect();
-                eprintln!("[RA-P2P] fn={} arrival homes={:?}", func.name, homes);
+                lccc::cli::stderr_line(format_args!(
+                    "[RA-P2P] fn={} arrival homes={:?}",
+                    func.name, homes
+                ));
             }
         }
         if !intervals.is_empty() {
@@ -5979,7 +6003,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 LinearScanAllocator::new_with_config(ranges, pool.clone(), &config.ra_config);
             alloc.run_with_seed(&seeded);
             if config.ra_config.debug_ra_intervals {
-                eprintln!("[RA-P2P] fn={} homes={:?}", func.name, alloc.assignments);
+                lccc::cli::stderr_line(format_args!(
+                    "[RA-P2P] fn={} homes={:?}",
+                    func.name, alloc.assignments
+                ));
             }
             for (vid, reg) in alloc.assignments {
                 assignments.insert(vid, reg);
@@ -6141,10 +6168,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             s.sort_unstable();
             s
         };
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[RA-FINAL] fn={} assigned={:?} spilled={:?}",
             func.name, ids, spills
-        );
+        ));
     }
 
     // Phase 2d (i686): load-hazard refinement.  Phase 2 treated every
@@ -6620,10 +6647,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 &config.ra_config,
             );
             if config.ra_config.debug_ra_intervals {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[RA-P2h] fn={} round={} refined edx_hazards={:?}",
                     func.name, round, edx_hazards_h
-                );
+                ));
             }
             let mut assigned_this_round = 0usize;
             for (reg, reg_hazards) in [(PhysReg(5), &edx_hazards_h), (PhysReg(4), &ecx_hazards_h)] {
@@ -6645,10 +6672,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                                 .map(|iv| format!("v{}[{}..{}]", v, iv.0, iv.1))
                         })
                         .collect();
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[RA-P2h] fn={} reg={:?} holders={:?}",
                         func.name, reg, holders_dbg
-                    );
+                    ));
                 }
                 let intervals: Vec<LiveInterval> = scan_ivs
                     .iter()
@@ -6688,10 +6715,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         .map(|iv| format!("{}:[{}..{}]", iv.value_id, iv.start, iv.end))
                         .collect();
                     let cands: Vec<u32> = intervals.iter().map(|iv| iv.value_id).collect();
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[RA-P2h] fn={} round={} reg={:?} unassigned={:?} candidates={:?}",
                         func.name, round, reg, unassigned, cands
-                    );
+                    ));
                 }
                 if intervals.is_empty() {
                     continue;
@@ -6711,10 +6738,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 break;
             }
             if config.ra_config.debug_ra_intervals {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[RA-P2h] fn={} round={} assigned={}",
                     func.name, round, assigned_this_round
-                );
+                ));
             }
         }
     }
@@ -6845,7 +6872,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 continue;
             };
             if config.ra_config.debug_segment_fill {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[RA-SEGMENT-FILL] fn={} v{} group={:?} segs={:?} -> r{} occupied={:?}",
                     func.name,
                     value,
@@ -6853,7 +6880,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     candidate_segments,
                     reg.0,
                     occupied_by_reg.get(&reg.0)
-                );
+                ));
             }
             assignments.insert(value, reg);
             added += 1;
@@ -6862,14 +6889,17 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             propagate_coalesce_members(&mut assignments, &coalesce_member_of);
         }
         if config.ra_config.debug_segment_fill {
-            eprintln!("[RA-SEGMENT-FILL] fn={} added={}", func.name, added);
+            lccc::cli::stderr_line(format_args!(
+                "[RA-SEGMENT-FILL] fn={} added={}",
+                func.name, added
+            ));
         }
     }
 
     if config.ra_config.debug_ra {
         let mut v: Vec<(u32, u8)> = assignments.iter().map(|(k, r)| (*k, r.0)).collect();
         v.sort_unstable();
-        eprintln!("[RA] fn={} FINAL={:?}", func.name, v);
+        lccc::cli::stderr_line(format_args!("[RA] fn={} FINAL={:?}", func.name, v));
         if config.ra_config.debug_ra_intervals {
             let mut ivs: Vec<(u32, u32, u32, bool, u64)> = iv_map
                 .iter()
@@ -6889,7 +6919,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     Some(r) => format!("reg={}", r.0),
                     None => String::from("SLOT"),
                 };
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[RA-IV] fn={} v{} [{},{}] len={} callspan={} uses={} {}",
                     func.name,
                     vid,
@@ -6899,7 +6929,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     spans,
                     uses,
                     home
-                );
+                ));
             }
         }
     }
@@ -7457,7 +7487,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     if !config.ra_config.no_save_set_compact {
         let moves = compact_callee_saved_homes(&mut assignments, &iv_map, &config.available_regs);
         if config.ra_config.debug_ra && !moves.is_empty() {
-            eprintln!("[RA-COMPACT] fn={} folded {:?}", func.name, moves);
+            lccc::cli::stderr_line(format_args!(
+                "[RA-COMPACT] fn={} folded {:?}",
+                func.name, moves
+            ));
         }
     }
 
@@ -7503,19 +7536,19 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             }
             round += 1;
             if config.ra_config.debug_ra_repair {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[RA-REPAIR] fn={} round={} scanned assignments={} classes={} overlaps={}",
                     func.name,
                     round,
                     assignments.len(),
                     parent.len(),
                     rep.len()
-                );
+                ));
                 for (reg, a, b, s, e) in &rep {
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[RA-REPAIR] fn={} r{}: class v{} overlaps class v{} at [{},{}] — evicting colder",
                         func.name, reg, a, b, s, e
-                    );
+                    ));
                 }
             }
             // Evict the colder class of each conflicting pair (fewer total
@@ -7560,10 +7593,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 }
             }
             if config.ra_config.debug_ra_repair {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[RA-REPAIR] fn={} round={} evicted {:?} (classes {:?})",
                     func.name, round, evicted, evict_classes
-                );
+                ));
             }
         }
         debug_assert!(
@@ -7671,7 +7704,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             },
         );
         if config.ra_config.debug_ra && !ipa_used.is_empty() {
-            eprintln!("[RA-IPA] fn={} used {:?}", func.name, ipa_used);
+            lccc::cli::stderr_line(format_args!(
+                "[RA-IPA] fn={} used {:?}",
+                func.name, ipa_used
+            ));
         }
     }
 
@@ -7709,14 +7745,17 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 ));
             }
             rows.sort();
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[RA] fn={} values={} assigned={}",
                 func.name,
                 rows.len(),
                 assignments.len()
-            );
+            ));
             for (s, e, vid, info) in rows {
-                eprintln!("[RA]   v{:>5} [{:>5}, {:>5}] {}", vid, s, e, info);
+                lccc::cli::stderr_line(format_args!(
+                    "[RA]   v{:>5} [{:>5}, {:>5}] {}",
+                    vid, s, e, info
+                ));
             }
         }
     }
@@ -7742,7 +7781,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 .values()
                 .filter(|r| callee_ids.contains(&r.0))
                 .count();
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[RA-STATS] fn={} eligible={} scan={} assigned={} spilled={} segments={} holes={} callee-homes={} caller-homes={}",
                 func.name,
                 eligible.len(),
@@ -7753,7 +7792,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 holes,
                 callee_homes,
                 caller_homes
-            );
+            ));
         }
     }
 
@@ -7769,13 +7808,13 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 .filter(|iv| !assignments.contains_key(&iv.value_id))
                 .collect();
             spills.sort_unstable_by_key(|iv| (iv.start, iv.value_id));
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[RA-EXPLAIN] fn={} spills={} assigned={} fat-values={}",
                 func.name,
                 spills.len(),
                 assignments.len(),
                 scan_ivs.len()
-            );
+            ));
             // Assignment dump (CCC_RA_EXPLAIN_HOMES=1): every register-homed
             // value with its physical register, fat interval and hole-aware
             // segments. This is the primary tool for diagnosing "two values
@@ -7796,10 +7835,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         .map(|s| (s.start, s.end))
                         .collect();
                     segs.sort_unstable();
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[RA-EXPLAIN] home v{} reg={} fat={:?} segments={:?}",
                         v, reg.0, fat, segs
-                    );
+                    ));
                 }
             }
             for iv in spills {
@@ -7810,7 +7849,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 } else {
                     "hazard-or-register-pressure"
                 };
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[RA-EXPLAIN] spill v{} range=[{},{}] segments={} uses={} reason={}",
                     iv.value_id,
                     iv.start,
@@ -7818,7 +7857,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     segment_count.get(&iv.value_id).copied().unwrap_or(0),
                     use_count.get(&iv.value_id).copied().unwrap_or(0),
                     reason
-                );
+                ));
             }
         }
     }
@@ -7840,7 +7879,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 let tok = tok.strip_prefix('v').unwrap_or(tok);
                 if let Ok(v) = tok.parse::<u32>() {
                     if assignments.remove(&v).is_some() && config.ra_config.debug_ra {
-                        eprintln!("[RA-DROP] fn={} v{} demoted to slot", func.name, v);
+                        lccc::cli::stderr_line(format_args!(
+                            "[RA-DROP] fn={} v{} demoted to slot",
+                            func.name, v
+                        ));
                     }
                 }
             }
@@ -7921,7 +7963,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .iter()
             .map(|v| format!("v{v}=r{}", assignments[v].0))
             .collect();
-        eprintln!("[RA-HOMES] fn={} {}", func.name, homes.join(" "));
+        lccc::cli::stderr_line(format_args!(
+            "[RA-HOMES] fn={} {}",
+            func.name,
+            homes.join(" ")
+        ));
     }
     RegAllocResult {
         ipa_used,
@@ -9104,10 +9150,10 @@ fn allocate_vector_registers_destructive(
         let pool_ids: Vec<u8> = pool.iter().map(|r| r.0).collect();
         let mut taken_ids: Vec<u32> = candidates.iter().copied().filter(|v| taken(*v)).collect();
         taken_ids.sort_unstable();
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[SSE-CHAIN] func={} pool={pool_ids:?} taken={taken_ids:?}",
             func.name
-        );
+        ));
     }
     // Coverage: hole-aware segments where present, fat-envelope fallback.
     // Chain values never join a GPR coalesce web, so the owner map is empty
@@ -9198,14 +9244,14 @@ fn allocate_vector_registers_destructive(
     if debug {
         let mut vs: Vec<u32> = coverage.keys().copied().collect();
         vs.sort_unstable();
-        eprintln!("[SSE-CHAIN] func={} coverage:", func.name);
+        lccc::cli::stderr_line(format_args!("[SSE-CHAIN] func={} coverage:", func.name));
         for x in &vs {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[SSE-CHAIN]   v{x} pieces={:?} last_read={:?} hidden={}",
                 coverage[x],
                 last_read.get(x),
                 hidden.contains(x)
-            );
+            ));
         }
     }
 
@@ -9307,10 +9353,10 @@ fn allocate_vector_registers_destructive(
     if debug {
         let mut es: Vec<(u32, u32)> = death_from.iter().map(|(&d, &a)| (d, a)).collect();
         es.sort_unstable();
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[SSE-CHAIN] func={} handoffs={es:?} order={order:?}",
             func.name
-        );
+        ));
     }
 
     let mut held: FxHashMap<u8, Vec<(u32, u32)>> = FxHashMap::default();
@@ -9364,7 +9410,9 @@ fn allocate_vector_registers_destructive(
                 .copied()
         };
         if debug {
-            eprintln!("[SSE-CHAIN]   v{v} pref={preference:?} chosen={chosen:?} pieces={pieces:?}");
+            lccc::cli::stderr_line(format_args!(
+                "[SSE-CHAIN]   v{v} pref={preference:?} chosen={chosen:?} pieces={pieces:?}"
+            ));
         }
         if let Some(reg) = chosen {
             held.entry(reg.0).or_default().extend_from_slice(pieces);
@@ -10391,7 +10439,10 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                         ) =>
                 {
                     if std::env::var("CCC_DEBUG_VECWEB").is_ok() {
-                        eprintln!("[VECWEB-POISON] fn={} op={:?}", func.name, op);
+                        lccc::cli::stderr_line(format_args!(
+                            "[VECWEB-POISON] fn={} op={:?}",
+                            func.name, op
+                        ));
                     }
                     return FxHashSet::default();
                 }
@@ -10445,7 +10496,10 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
     if std::env::var("CCC_DEBUG_VECWEB").is_ok() {
         let mut v: Vec<u32> = classes.keys().copied().collect();
         v.sort_unstable();
-        eprintln!("[VECWEB-1] fn={} classes_after_prop={:?}", func.name, v);
+        lccc::cli::stderr_line(format_args!(
+            "[VECWEB-1] fn={} classes_after_prop={:?}",
+            func.name, v
+        ));
     }
 
     loop {
@@ -10506,10 +10560,10 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
         if std::env::var("CCC_DEBUG_VECWEB").is_ok() {
             let mut v: Vec<u32> = classes.keys().copied().collect();
             v.sort_unstable();
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[VECWEB-2] fn={} evict={:?} remaining={:?}",
                 func.name, bad, v
-            );
+            ));
         }
         for value in bad {
             classes.remove(&value);
@@ -10541,7 +10595,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
     if std::env::var("CCC_DEBUG_VECWEB").is_ok() {
         let mut v: Vec<u32> = classes.keys().copied().collect();
         v.sort_unstable();
-        eprintln!("[VECWEB] fn={} web={:?}", func.name, v);
+        lccc::cli::stderr_line(format_args!("[VECWEB] fn={} web={:?}", func.name, v));
     }
     classes.into_keys().collect()
 }
@@ -12181,23 +12235,23 @@ fn collect_i686_scratch_hazard_points_refined(
             if !ecx_clean {
                 ecx.push(point);
                 if ra_config.debug_hazards {
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[HZ] fn={} pt={} ECX-DIRTY {:?}",
                         func.name,
                         point,
                         inst_kind_name(inst)
-                    );
+                    ));
                 }
             }
             if !edx_clean {
                 edx.push(point);
                 if ra_config.debug_hazards {
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[HZ] fn={} pt={} EDX-DIRTY {:?}",
                         func.name,
                         point,
                         inst_kind_name(inst)
-                    );
+                    ));
                 }
             }
             point += 1;
@@ -12216,13 +12270,19 @@ fn collect_i686_scratch_hazard_points_refined(
         if !t_ecx_clean {
             ecx.push(point);
             if ra_config.debug_hazards {
-                eprintln!("[HZ] fn={} pt={} ECX-DIRTY term", func.name, point);
+                lccc::cli::stderr_line(format_args!(
+                    "[HZ] fn={} pt={} ECX-DIRTY term",
+                    func.name, point
+                ));
             }
         }
         if !t_edx_clean {
             edx.push(point);
             if ra_config.debug_hazards {
-                eprintln!("[HZ] fn={} pt={} EDX-DIRTY term", func.name, point);
+                lccc::cli::stderr_line(format_args!(
+                    "[HZ] fn={} pt={} EDX-DIRTY term",
+                    func.name, point
+                ));
             }
         }
         point += 1;
@@ -13573,10 +13633,10 @@ fn apply_phi_coalesce_assignments_with_config(
             source_home_facts.get_or_insert_with(|| SourceHomeFacts::new(func)),
         ) {
             if ra_config.debug_phi_coalesce {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[PHI_COALESCE] BLOCKED assign dest=v{} src=v{}: source home does not survive dest redefs",
                     phi_dest, backedge_src
-                );
+                ));
             }
             continue;
         }
@@ -13596,10 +13656,10 @@ fn apply_phi_coalesce_assignments_with_config(
                     && haz.indirect_target_regs.contains(&reg))
             {
                 if ra_config.debug_phi_coalesce {
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[PHI_COALESCE] BLOCKED assign dest=v{} src=v{} r{}: call-arg/indirect-target hazard",
                         phi_dest, backedge_src, reg.0
-                    );
+                    ));
                 }
                 continue;
             }
@@ -13610,10 +13670,10 @@ fn apply_phi_coalesce_assignments_with_config(
             && !callee_saved.iter().any(|r| r.0 == reg.0)
         {
             if ra_config.debug_phi_coalesce {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[PHI_COALESCE] BLOCKED assign dest=v{} src=v{} r{}: call in window",
                     phi_dest, backedge_src, reg.0
-                );
+                ));
             }
             continue;
         }
@@ -13636,10 +13696,10 @@ fn apply_phi_coalesce_assignments_with_config(
             ) && !callee_saved.iter().any(|r| r.0 == reg.0)
             {
                 if ra_config.debug_phi_coalesce {
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[PHI_COALESCE] BLOCKED assign dest=v{} src=v{} r{}: source live across a call",
                         phi_dest, backedge_src, reg.0
-                    );
+                    ));
                 }
                 continue;
             }
@@ -13668,10 +13728,10 @@ fn apply_phi_coalesce_assignments_with_config(
                 };
                 if overlaps_inclusive_skip_birth_liveness(liveness, None, &src_live, rdx_clobbers) {
                     if ra_config.debug_phi_coalesce {
-                        eprintln!(
+                        lccc::cli::stderr_line(format_args!(
                             "[PHI_COALESCE] BLOCKED assign dest=v{} src=v{} r{}: source live across an rdx clobber point",
                             phi_dest, backedge_src, reg.0
-                        );
+                        ));
                     }
                     continue;
                 }
@@ -13730,7 +13790,7 @@ fn apply_phi_coalesce_assignments_with_config(
                             format!("v{b}[{},{}]", iv.0, iv.1)
                         })
                         .collect();
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[PHI_COALESCE] BLOCKED assign dest=v{} src=v{} r{} src_iv=[{},{}]: home conflict with {}",
                         phi_dest,
                         backedge_src,
@@ -13738,7 +13798,7 @@ fn apply_phi_coalesce_assignments_with_config(
                         src_iv.0,
                         src_iv.1,
                         held.join(" ")
-                    );
+                    ));
                 }
                 continue;
             }
@@ -13748,18 +13808,18 @@ fn apply_phi_coalesce_assignments_with_config(
         // scoped with CCC_PHI_COALESCE_FUNC=<function name>).
         if phi_coalesce_skip_listed_with_config(func, backedge_src, ra_config) {
             if ra_config.debug_phi_coalesce {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[PHI_COALESCE] fn={} SKIPPED (env) dest=v{} src=v{} r{}",
                     func.name, phi_dest, backedge_src, reg.0
-                );
+                ));
             }
             continue;
         }
         if ra_config.debug_phi_coalesce {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[PHI_COALESCE] fn={} ASSIGN dest=v{} src=v{} r{}",
                 func.name, phi_dest, backedge_src, reg.0
-            );
+            ));
         }
         assignments.insert(backedge_src, reg);
         applied.push(*candidate);
@@ -13877,10 +13937,10 @@ fn rehome_phi_blockers(
     }
     for &(b, target) in &moves {
         if let Some(name) = debug_fn {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[PHI_COALESCE] fn={} REHOME blocker v{} r{} -> r{}",
                 name, b, phi_reg.0, target.0
-            );
+            ));
         }
         assignments.insert(b, target);
     }
@@ -14334,19 +14394,19 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
             } else {
                 if multi_def.contains(&src.0) {
                     if debug {
-                        eprintln!(
+                        lccc::cli::stderr_line(format_args!(
                             "[PHI_COALESCE] BLOCKED phi_dest=Value({}) src=Value({}): multi-def source outside the Part-2 chain shape",
                             dest.0, src.0
-                        );
+                        ));
                     }
                     continue;
                 }
                 let Some(site) = unique_def_site.get(&src.0).copied().flatten() else {
                     if debug {
-                        eprintln!(
+                        lccc::cli::stderr_line(format_args!(
                             "[PHI_COALESCE] BLOCKED phi_dest=Value({}) src=Value({}): source is not single-def",
                             dest.0, src.0
-                        );
+                        ));
                     }
                     continue;
                 };
@@ -14392,10 +14452,10 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
             let part2_pred_ok = part2.is_some();
             if !part2_pred_ok && !(same_block && source_def_idx < copy_idx || pred_region_ok) {
                 if debug {
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[PHI_COALESCE] BLOCKED phi_dest=Value({}) src=Value({}): def block/index {}:{} cannot feed copy {}:{}",
                         dest.0, src.0, source_block, source_def_idx, block_idx, copy_idx
-                    );
+                    ));
                 }
                 continue;
             }
@@ -14582,7 +14642,7 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
                 || source_used_before_copy
             {
                 if debug {
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[PHI_COALESCE] BLOCKED phi_dest=Value({}) src=Value({}) block={} source_block={} used_in_window={} derived_in_window={} live_in_window={} src_used_elsewhere={} src_home_killed={} src_before_copy={}",
                         dest.0,
                         src.0,
@@ -14594,16 +14654,16 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
                         source_used_elsewhere,
                         source_home_killed,
                         source_used_before_copy
-                    );
+                    ));
                 }
                 continue;
             }
 
             if debug {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[PHI_COALESCE] Coalescing phi_dest=Value({}) with backedge_src=Value({}) source block {} idx {} copy block {} idx {}",
                     dest.0, src.0, source_block, source_def_idx, block_idx, copy_idx
-                );
+                ));
             }
             candidates.push(source_home_probe);
         }

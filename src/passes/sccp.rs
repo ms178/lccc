@@ -1132,14 +1132,14 @@ fn rewrite(func: &mut IrFunction, state: &SccpState) -> SccpStats {
                     let k = keep(from_label);
                     if !k && g.trace_prune {
                         let fi = state.label_to_idx.get(from_label).copied();
-                        eprintln!(
+                        lccc::cli::stderr_line(format_args!(
                             "[sccp] fn {:?} prune: block#{bi} drops incoming ({:?} from {:?}) predidx={:?} pred_exec={:?}",
                             func_name_dbg,
                             op,
                             from_label,
                             fi,
                             fi.map(|i| state.block_executable[i as usize])
-                        );
+                        ));
                     }
                     k
                 });

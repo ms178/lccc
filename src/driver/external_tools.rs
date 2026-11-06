@@ -16,7 +16,7 @@ use std::sync::Once;
 fn warn_gcc_source_assembler(command: &str) {
     static WARN_ONCE: Once = Once::new();
     WARN_ONCE.call_once(|| {
-        eprintln!("WARNING: Using GCC-backed assembler for source files ({}) [gcc_assembler feature enabled]", command);
+        lccc::cli::stderr_line(format_args!("WARNING: Using GCC-backed assembler for source files ({}) [gcc_assembler feature enabled]", command));
     });
 }
 
@@ -50,9 +50,15 @@ impl Driver {
         // Warn prominently about using GCC for -m16 compilation
         static WARN_ONCE: std::sync::Once = std::sync::Once::new();
         WARN_ONCE.call_once(|| {
-            eprintln!("WARNING: *** Using GCC for -m16 compilation (boot code) ***");
-            eprintln!("WARNING: *** This delegates the ENTIRE compilation to GCC ***");
-            eprintln!("WARNING: *** The gcc_m16 feature flag is enabled ***");
+            lccc::cli::stderr_line(format_args!(
+                "WARNING: *** Using GCC for -m16 compilation (boot code) ***"
+            ));
+            lccc::cli::stderr_line(format_args!(
+                "WARNING: *** This delegates the ENTIRE compilation to GCC ***"
+            ));
+            lccc::cli::stderr_line(format_args!(
+                "WARNING: *** The gcc_m16 feature flag is enabled ***"
+            ));
         });
 
         let mut cmd = std::process::Command::new("gcc");
@@ -138,7 +144,9 @@ impl Driver {
         {
             // Handle -Wa,--version: print GNU-compatible version string
             if self.assembler_extra_args.iter().any(|a| a == "--version") {
-                println!("GNU assembler (Claude's C Compiler built-in) 2.42");
+                lccc::cli::stdout_line(format_args!(
+                    "GNU assembler (Claude's C Compiler built-in) 2.42"
+                ));
                 return Ok(());
             }
             self.assemble_source_file_builtin(input_file, output_path)
@@ -303,10 +311,10 @@ impl Driver {
             let pp_errors = preprocessor.errors();
             if !pp_errors.is_empty() {
                 for err in pp_errors {
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "{}:{}:{}: error: {}",
                         err.file, err.line, err.col, err.message
-                    );
+                    ));
                 }
                 return Err(format!(
                     "{} preprocessor error(s) in {}",
@@ -343,11 +351,14 @@ impl Driver {
                 "s",
                 asm_text.as_bytes(),
             ) {
-                Some(path) => eprintln!("[ccc] CCC_ASM_DEBUG: wrote {}", path.display()),
-                None => eprintln!(
+                Some(path) => lccc::cli::stderr_line(format_args!(
+                    "[ccc] CCC_ASM_DEBUG: wrote {}",
+                    path.display()
+                )),
+                None => lccc::cli::stderr_line(format_args!(
                     "[ccc] CCC_ASM_DEBUG: could not write the assembly dump for {}",
                     input_file
-                ),
+                )),
             }
         }
 

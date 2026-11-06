@@ -550,10 +550,10 @@ pub fn split_loop_transparent_ranges(func: &mut IrFunction, max_splits: usize) -
             };
 
             if debug {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[SPLIT-LOOP] func {} loop header {}: split value {} at exit block {}",
                     func.name, header, vid, exit_block
-                );
+                ));
             }
 
             insert_entry_alloca(func, alloca_val, ty, true);
@@ -941,10 +941,10 @@ fn apply_local_call_split(
     }
 
     if split_debug_enabled() {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[SPLIT-CALL] func {} value {} wrapped {} call(s) in block {}",
             func.name, vid, wrapped, site_block
-        );
+        ));
     }
     Some(wrapped)
 }
@@ -1745,14 +1745,14 @@ fn plan_block_splits(
     }
     let bl = analyze_block_liveness(func, liveness, bi, types);
     if split_debug_enabled() {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[SPLIT-PRESSURE] {} block {} pts={} live_spans={} budget={}",
             func.name,
             bi,
             n_pts,
             bl.span.len(),
             budget
-        );
+        ));
     }
     if bl.span.len() <= budget {
         return plan;
@@ -1883,10 +1883,10 @@ fn plan_block_splits(
                     }
                 }
             }
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[SPLIT-PRESSURE] {} blk{} peak_pt={} peak={} REJECT span={} used_at_peak={} noprev={} gap={} outside={}",
                 func.name, bi, peak_pt, peak, r_span, r_used, r_noprev, r_gap, r_out
-            );
+            ));
         }
         let Some((_, vid, store_at, reload_before)) = best else {
             // Nothing further is splittable here; leave the rest to the
@@ -2087,10 +2087,10 @@ fn apply_block_splits(
         // ordinary frame home.
         insert_entry_alloca(func, m.alloca, m.ty, true);
         if split_debug_enabled() {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[SPLIT-PRESSURE] {} block {} value {} store@{} reload@{}",
                 func.name, bi, m.vid, m.store_at, m.reload_at
-            );
+            ));
         }
     }
     mats.len()

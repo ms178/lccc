@@ -352,10 +352,10 @@ impl X86Codegen {
         }
         let deferred = self.state.vector_defer_values.contains(&dest_ptr.0);
         if deferred && std::env::var("CCC_DEBUG_VDEFER").is_ok() {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[VDEFER-EMIT] deferring result store for dest_ptr={}",
                 dest_ptr.0
-            );
+            ));
         }
         use crate::backend::state::SlotAddr;
         if let Some(addr) = self.state.resolve_slot_addr(dest_ptr.0) {
@@ -977,7 +977,10 @@ impl X86Codegen {
             None => format!("{}(%{})", disp_str, phys_reg_name(base)),
         };
         if std::env::var("CCC_DEBUG_VLFOLD").is_ok() {
-            eprintln!("[VLFOLD-EMIT] elide load %{} <- {} {}", d.0, mnemonic, mem);
+            lccc::cli::stderr_line(format_args!(
+                "[VLFOLD-EMIT] elide load %{} <- {} {}",
+                d.0, mnemonic, mem
+            ));
         }
         self.state.vector_values.insert(d.0);
         self.state.pending_vec_memfold = Some(crate::backend::state::PendingVecMemfold {
@@ -1010,10 +1013,10 @@ impl X86Codegen {
             return;
         };
         if std::env::var("CCC_DEBUG_VLFOLD").is_ok() {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[VLFOLD-EMIT] materialising %{} (unexpected consumer)",
                 pf.val
-            );
+            ));
         }
         self.flush_pending_vec_store_impl();
         if pf.width == 16 {
@@ -1036,7 +1039,10 @@ impl X86Codegen {
             return;
         };
         if std::env::var("CCC_DEBUG_VDEFER").is_ok() {
-            eprintln!("[VDEFER-EMIT] flushing pending store for val={}", val_id);
+            lccc::cli::stderr_line(format_args!(
+                "[VDEFER-EMIT] flushing pending store for val={}",
+                val_id
+            ));
         }
         let val = Value(val_id);
         use crate::backend::state::SlotAddr;
@@ -1980,10 +1986,10 @@ impl X86Codegen {
         }
         let deferred = self.state.vector_defer_values.contains(&dest_ptr.0);
         if deferred && std::env::var("CCC_DEBUG_VDEFER").is_ok() {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[VDEFER-EMIT] deferring result store for dest_ptr={}",
                 dest_ptr.0
-            );
+            ));
         }
         use crate::backend::state::SlotAddr;
         if let Some(addr) = self.state.resolve_slot_addr(dest_ptr.0) {

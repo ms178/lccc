@@ -795,7 +795,10 @@ fn classify_alloca(
     // Skip dead param allocas (still registered so backend recognizes them).
     if ctx.dead_param_allocas.contains(&dest.0) {
         if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
-            eprintln!("[SLOTS]   alloca v{} SKIPPED: dead param", dest.0);
+            lccc::cli::stderr_line(format_args!(
+                "[SLOTS]   alloca v{} SKIPPED: dead param",
+                dest.0
+            ));
         }
         return;
     }
@@ -803,10 +806,10 @@ fn classify_alloca(
     // Skip dead non-param allocas (never referenced by any instruction).
     if ctx.coalescable_allocas.dead.contains(&dest.0) {
         if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[SLOTS]   alloca v{} SKIPPED: dead (no recorded uses)",
                 dest.0
-            );
+            ));
         }
         return;
     }
@@ -1014,10 +1017,10 @@ fn classify_value(
     // Skip register-assigned values (no stack slot needed).
     if reg_assigned.contains_key(&dest.0) {
         if debug_protect && state.protected_slot_values.contains(&dest.0) {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[CLASSIFY] SSA {} is protected but register-assigned, skipping slot",
                 dest.0
-            );
+            ));
         }
         return;
     }
@@ -1025,10 +1028,10 @@ fn classify_value(
     // Skip dead values (defined but never used).
     if !ctx.used_values.contains(&dest.0) {
         if debug_protect && state.protected_slot_values.contains(&dest.0) {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[CLASSIFY] SSA {} is protected but not in used_values, skipping slot",
                 dest.0
-            );
+            ));
         }
         return;
     }
@@ -1068,10 +1071,10 @@ fn classify_value(
         // Otherwise: fall through to normal classification — give the value its own slot.
     }
     if debug_protect && is_protected && is_copy_aliased {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[CLASSIFY] SSA {} is protected AND copy-aliased, allocating slot anyway",
             dest.0
-        );
+        ));
     }
 
     // Skip immediately-consumed values: produced and consumed in adjacent
@@ -1382,10 +1385,10 @@ pub(super) fn assign_tier3_block_local_slots(
                 });
                 if !overlaps_active {
                     if debug_protect {
-                        eprintln!(
+                        lccc::cli::stderr_line(format_args!(
                             "[PROTECT-T3] SSA {} reused block-local slot {}",
                             dest_id, reused
-                        );
+                        ));
                     }
                     reused_offset = Some(reused);
                 }
@@ -1436,10 +1439,10 @@ pub(super) fn assign_tier3_block_local_slots(
                 // window (mirrors assign_slot's new_space bookkeeping).
                 block_peak = off + extent + if slot_size >= 16 { fpo_vec_shift } else { 0 };
                 if debug_protect && !can_reuse {
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[PROTECT-T3] SSA {} is protected, forced new slot at offset {}",
                         dest_id, off
-                    );
+                    ));
                 }
                 off
             };
@@ -1619,12 +1622,12 @@ pub(super) fn finalize_deferred_slots(
         // (site-607 allocas always did this; the Tier-3 pool/fallback do it
         // via the same probed shift).
         if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[SLOTS]   block-region base aligned_nls={} max_block_local_space={} n_deferred={}",
                 aligned_nls,
                 max_block_local_space,
                 deferred_slots.len()
-            );
+            ));
         }
         // The pool accounting (`max_block_local_space`) and the placement
         // below must agree: a slot whose extent reaches past the returned
@@ -1648,10 +1651,10 @@ pub(super) fn finalize_deferred_slots(
             );
             deepest_end = deepest_end.max(end);
             if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[SLOTS]   deferred v{} block_offset={} size={} align={} -> slot {}",
                     ds.dest_id, ds.block_offset, ds.size, ds.align, slot
-                );
+                ));
             }
             state.value_locations.insert(ds.dest_id, StackSlot(slot));
         }
@@ -1796,10 +1799,10 @@ pub(super) fn resolve_copy_aliases(
             // the phi dest is used again on later iterations — does not apply.
             // CFG-proven aliases (phi-web analysis) carry their own proof too.
             if std::env::var("CCC_DEBUG_LOOP_PHI").is_ok() && loop_phi_aliases.contains(&dest_id) {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[LOOP_PHI-RESOLVE] dest=v{} root=v{} slot={} certified",
                     dest_id, root_id, slot.0
-                );
+                ));
             }
             if !cfg_proven && !loop_phi_aliases.contains(&dest_id) {
                 let dest_def = def_point.get(&dest_id).copied().unwrap_or(u32::MAX);
@@ -1829,7 +1832,7 @@ pub(super) fn resolve_copy_aliases(
     }
 
     if debug_slot_coalesce && !copy_alias.is_empty() {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[SLOT-COALESCE] resolve fn={} requested={} resolved={} blocked_overlap={} blocked_missing_root={} blocked_width_mismatch={}",
             func.name,
             copy_alias.len(),
@@ -1837,7 +1840,7 @@ pub(super) fn resolve_copy_aliases(
             blocked_overlap_count,
             blocked_missing_root_count,
             blocked_width_mismatch_count,
-        );
+        ));
     }
 }
 

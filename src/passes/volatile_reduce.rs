@@ -551,7 +551,7 @@ impl CostlyAddresses {
 /// lines that no reader can act on.
 fn volred_dbg(args: std::fmt::Arguments<'_>) {
     if std::env::var_os("CCC_DEBUG_VOLRED").is_some() {
-        eprintln!("volatile_reduce: {args}");
+        lccc::cli::stderr_line(format_args!("volatile_reduce: {args}"));
     }
 }
 

@@ -676,57 +676,312 @@ pub fn filter_available_regs(callee_saved: &[PhysReg], asm_clobbered: &[PhysReg]
 
 // ── Utility ───────────────────────────────────────────────────────────────
 
-/// Find the nth alloca instruction in the entry block (used for parameter storage).
-pub fn find_param_alloca(func: &IrFunction, param_idx: usize) -> Option<(Value, IrType)> {
-    // Parameter allocas are authoritative in `func.param_alloca_values`; using
-    // "the Nth alloca in the entry block" is unsound after mem2reg removes a
-    // parameter home.  A later local alloca (notably a volatile local) can then
-    // be mistaken for the parameter slot, making emit_store_params overwrite it
-    // with the incoming argument and later reload the local as the pointer
-    // parameter (gcc.c-torture/execute/20180112-1.c).  Look up the indexed
-    // parameter-home value and verify that its Alloca still exists.
-    let want = *func.param_alloca_values.get(param_idx)?;
-    let block = func.blocks.first()?;
-    // O(1) fast path. Lowering emits the parameter homes as the first N
-    // Alloca instructions of the entry block, in parameter order, so slot
-    // `param_idx` is exactly the home we want. Probing it first avoids the
-    // O(params x instructions) full scan that dominated codegen for
-    // gcc.c-torture/compile/limits-fndefn.c (100,000 formal parameters):
-    // Callgrind attributed 18.6% inclusive / 6.8% self to this function at
-    // 10,000 parameters. The probe verifies `dest == want`, so it can only
-    // return what the authoritative scan below would return (SSA dests are
-    // unique). When mem2reg removed a home, inlining inserted a prefix, or
-    // anything else shifted the layout, the probe misses and the original
-    // exact scan still decides -- no behavioural change is possible.
-    if let Some(Instruction::Alloca { dest, ty, .. }) = block.instructions.get(param_idx) {
-        if *dest == want {
-            // Proof obligation: this O(1) probe must equal the authoritative
-            // first-match scan. It can only disagree if an earlier Alloca
-            // reused `want`, i.e. if SSA dests were duplicated upstream.
-            //
-            // That equivalence is proven in `param_alloca_fast_path_tests`:
-            // exhaustively over every small layout (prefix allocas, removed
-            // homes, mixed types) and over 5,000 randomized larger layouts,
-            // with `reference_full_scan` as the oracle. Those tests run in the
-            // hosted debug-assertions lane too.
-            //
-            // Deliberately NOT a `debug_assert_eq!` against a full scan here:
-            // this function is called once per parameter, so an O(instructions)
-            // verification per call reintroduces exactly the O(params^2)
-            // behaviour this fast path removes. Measured on 32,000 parameters
-            // with CARGO_PROFILE_FASTBUILD_DEBUG_ASSERTIONS=true, such an
-            // assertion made the audit compiler 31.53 s vs 5.81 s (5.42x),
-            // with the ratio growing 1.03x -> 1.25x -> 2.22x -> 5.42x over
-            // 4k/8k/16k/32k. An audit instrument must not create the
-            // pathology it is auditing, and a pure function equivalence
-            // belongs in a test, not in the hot path.
-            return Some((*dest, *ty));
+/// Per-function index from parameter ordinal to its authoritative home
+/// `Alloca`.  Built once per function, queried in unconditional O(1).
+///
+/// `func.param_alloca_values[i]` names the SSA value that lowering chose as
+/// the home of parameter `i`.  That home is only usable while the entry block
+/// still contains an `Instruction::Alloca` defining it: mem2reg may have
+/// promoted the parameter and removed the `Alloca`, and an unrelated local
+/// must never be mistaken for a parameter home
+/// (gcc.c-torture/execute/20180112-1.c).  The original lookup answered that
+/// question with a full scan of the entry block for *every* parameter.  A
+/// positional O(1) probe covered the common aligned layout but still fell
+/// back to the scan whenever a home was removed, a prefix was inserted, or
+/// inlining shifted the layout.  Since every backend queries every parameter
+/// (often several times), that fallback was O(params x instructions) per
+/// function -- quadratic for parameter-heavy code.
+///
+/// `ParamAllocaIndex` removes the fallback entirely: [`build`](Self::build)
+/// walks the entry block exactly once, O(instructions + params), and
+/// [`get`](Self::get) is a bounds check plus an array read.  Semantics are
+/// exactly the original full scan: for parameter `i`, the FIRST `Alloca` in
+/// the entry block whose `dest` equals `param_alloca_values[i]` supplies both
+/// the home `Value` and its `IrType`; with no such `Alloca` (mem2reg, or no
+/// entry block) the answer is `None`, as it is for an out-of-range ordinal.
+/// Duplicated home ids and duplicated `dest`s are handled by construction, so
+/// the index stays exact even for IR that violates SSA dest uniqueness.
+///
+/// Two build paths: `aligned_homes` handles the layout lowering emits with
+/// ONE `Vec` allocation and no hash table, and `general_homes` handles every
+/// other layout with that same `Vec` plus one hash table and one entry-block
+/// pass.  (The fast path is "hash-table-free", not heap-free: the index must
+/// own its `homes` array.)  Both are proven exact in their documentation and
+/// by the exhaustive/randomized equivalence tests below.
+///
+/// When the aligned probe fails at instruction `k`, the general pass re-walks
+/// that prefix.  This is bounded by `params` extra instruction examinations
+/// (at 4096 params: <= 4096 examinations, i.e. microseconds against a
+/// multi-second compile) and buys a much simpler, exhaustively provable
+/// implementation than a fused single-pass design that would have to
+/// retroactively seed the general state.  The complexity witness below pins
+/// that bound so the redundancy can never grow into a second full scan.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParamAllocaIndex {
+    homes: Vec<Option<(Value, IrType)>>,
+}
+
+/// Portable complexity witness for [`ParamAllocaIndex::build_with_stats`].
+///
+/// Wall-clock ratios are not portable across CI machines, so this counts the
+/// two resources the algorithm must bound: instruction *examinations* and
+/// *heap allocations*.  A failed aligned probe examines a prefix that the
+/// general pass then re-examines, so the former is an examination count, not
+/// a count of distinct instructions.  The contracts are
+/// `instructions_examined <= params + entry_instructions` (LINEAR) and
+/// `allocations <= 3` (O(1) in `params`), both pinned by unit tests on
+/// adversarial shifted layouts.  Each counter is one `usize` increment and
+/// `build` instantiates them as ZST no-ops, so optimized builds fold the
+/// accounting away completely.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ParamHomeStats {
+    pub instructions_examined: usize,
+    /// Heap allocations performed by the build.  This is the second bounded
+    /// resource: the aligned path needs exactly one (`homes`), the general
+    /// path exactly three (`homes`, one map, one flat adjacency vector).  The
+    /// old general shape allocated one small `Vec` per distinct home id, i.e.
+    /// up to `params` extra allocations; the flat chain makes the cost
+    /// independent of `params` and the unit tests pin the exact count.
+    pub allocations: usize,
+}
+
+/// Monomorphized instrumentation hook.  `build` instantiates it as the ZST
+/// [`NoStats`], whose `note_instruction` is a no-op: after inlining, the
+/// production build contains ZERO accounting instructions.  Only
+/// `build_with_stats` instantiates the counting version; there is no global
+/// mutable state, no lock, and no `cfg`-dependent behaviour to diverge.
+pub trait ParamHomeCounter {
+    fn note_instruction(&mut self);
+    fn note_allocation(&mut self);
+}
+
+/// The production counter: a zero-sized no-op.
+#[derive(Debug, Default)]
+pub struct NoStats;
+
+impl ParamHomeCounter for NoStats {
+    #[inline(always)]
+    fn note_instruction(&mut self) {}
+    #[inline(always)]
+    fn note_allocation(&mut self) {}
+}
+
+impl ParamHomeCounter for ParamHomeStats {
+    #[inline(always)]
+    fn note_instruction(&mut self) {
+        self.instructions_examined += 1;
+    }
+    #[inline(always)]
+    fn note_allocation(&mut self) {
+        self.allocations += 1;
+    }
+}
+
+impl ParamAllocaIndex {
+    /// Build the index for `func`.
+    ///
+    /// The aligned layout (the one lowering emits) takes an O(params) path
+    /// with exactly one allocation and no hash table.  Everything else takes
+    /// one O(params + instructions) pass with exactly three allocations.
+    /// There is no per-query fallback and no per-query scan in either case.
+    pub fn build(func: &IrFunction) -> Self {
+        Self {
+            homes: build_homes(func, &mut NoStats),
         }
     }
-    block.instructions.iter().find_map(|inst| match inst {
-        Instruction::Alloca { dest, ty, .. } if *dest == want => Some((*dest, *ty)),
-        _ => None,
-    })
+
+    /// Same index, plus the exact number of entry-block instructions examined.
+    /// `build` is the zero-overhead production entry point; this one exists so
+    /// tests and tools can assert the complexity bound instead of timing a CI
+    /// machine.  Both instantiate the SAME algorithm, so the measurement is
+    /// of the shipped code path and not of a test-only copy.
+    pub fn build_with_stats(func: &IrFunction) -> (Self, ParamHomeStats) {
+        let mut stats = ParamHomeStats::default();
+        let homes = build_homes(func, &mut stats);
+        (Self { homes }, stats)
+    }
+
+    /// O(1) lookup of the home of `param_idx`.
+    #[inline]
+    pub fn get(&self, param_idx: usize) -> Option<(Value, IrType)> {
+        self.homes.get(param_idx).copied().flatten()
+    }
+
+    /// Number of indexed parameter ordinals.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.homes.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.homes.is_empty()
+    }
+}
+
+fn build_homes<C: ParamHomeCounter>(
+    func: &IrFunction,
+    counter: &mut C,
+) -> Vec<Option<(Value, IrType)>> {
+    // One buffer is shared by BOTH paths.  Previously the aligned probe
+    // allocated its own `Vec`, and a failed probe dropped it immediately:
+    // every shifted-layout function paid for a dead allocation that the
+    // allocation witness exposed.  Allocating here instead means the general
+    // path reuses the same capacity (`clear` + `resize`, no reallocation).
+    // This costs nothing on the hot aligned path and removes one heap object
+    // from every shifted compilation, with no extra instruction pass.
+    let n = func.param_alloca_values.len();
+    let mut homes: Vec<Option<(Value, IrType)>> = Vec::with_capacity(n);
+    if n > 0 {
+        counter.note_allocation();
+    }
+    if aligned_homes(func, counter, &mut homes) {
+        return homes;
+    }
+    general_homes(func, counter, homes)
+}
+
+/// The single-pass positional path, valid ONLY for the aligned layout.
+///
+/// Fills the caller's buffer (already reserved for `n` entries) and returns
+/// `true` when the first `n` entry-block instructions are `Alloca`s whose
+/// destinations equal `param_alloca_values[0..n]` in order, and those home
+/// ids are strictly increasing.  On failure the buffer is left empty, with
+/// its capacity intact, for `general_homes` to reuse.  No allocation and no
+/// second pass is needed on either outcome.
+///
+/// ## Exactness proof (against the `reference_full_scan` test oracle)
+///
+/// The reference answer for ordinal `i` is the FIRST `Alloca` in the entry
+/// block whose `dest == want[i]`.  This path answers with instruction `i`,
+/// which is an `Alloca` with `dest == want[i]`.  It can disagree only if some
+/// instruction `j < i` is also an `Alloca` with `dest == want[i]`.  For every
+/// `j < n`, instruction `j` is an `Alloca` with `dest == want[j]` by the
+/// checked condition; strict increase gives `want[j] < want[i]`, hence
+/// `dest != want[i]`.  So no earlier match exists, and instruction `i` is
+/// the authoritative first match.  Instructions at indices `>= n` cannot
+/// precede it.  The `IrType` returned is likewise the authoritative one.
+///
+/// Strict increase is required because duplicate home ids would break the
+/// `want[j] < want[i]` step; such IR (malformed, or two parameters sharing a
+/// home) is routed to `general_homes`, which handles duplicates by
+/// construction.  Requiring *strictly increasing* rather than merely
+/// distinct costs nothing (lowering assigns ascending SSA ids) and avoids a
+/// hash set, which would defeat the point of this path.
+fn aligned_homes<C: ParamHomeCounter>(
+    func: &IrFunction,
+    counter: &mut C,
+    homes: &mut Vec<Option<(Value, IrType)>>,
+) -> bool {
+    homes.clear();
+    let wants = &func.param_alloca_values;
+    let n = wants.len();
+    if n == 0 {
+        return true;
+    }
+    if wants.windows(2).any(|w| w[0].0 >= w[1].0) {
+        return false;
+    }
+    let Some(block) = func.blocks.first() else {
+        return false;
+    };
+    if block.instructions.len() < n {
+        return false;
+    }
+    for (i, want) in wants.iter().enumerate() {
+        counter.note_instruction();
+        let Instruction::Alloca { dest, ty, .. } = &block.instructions[i] else {
+            homes.clear();
+            return false;
+        };
+        if *dest != *want {
+            homes.clear();
+            return false;
+        }
+        // `homes` was created with capacity >= n, so this push cannot
+        // reallocate.  A failed probe leaves an empty buffer of exactly the
+        // right capacity for `general_homes` to reuse.
+        homes.push(Some((*dest, *ty)));
+    }
+    true
+}
+
+/// The general one-pass path, for any entry-block layout.
+///
+/// `dest -> head ordinal` is one hash map, and the ordinals sharing a `dest`
+/// form a singly linked chain through one flat `next` vector.  The previous
+/// shape mapped each home id to a small vector of ordinals: it allocated one
+/// such vector per distinct home id (up to `params` allocations on an
+/// adversarial function) and stored 24-byte vector headers in the table.
+/// The chain stores one
+/// `usize` per entry, needs exactly three allocations regardless of `params`,
+/// and touches contiguous memory while walking the ordinals.
+///
+/// Order within a chain is reverse insertion order, which is immaterial: all
+/// ordinals sharing a home id are filled from the SAME FIRST matching
+/// `Alloca`, so every permutation yields the identical reference answer.
+/// No ordinal is filled twice, so `unresolved` decrements at most `params`
+/// times; `saturating_sub` additionally makes underflow impossible by
+/// construction.
+fn general_homes<C: ParamHomeCounter>(
+    func: &IrFunction,
+    counter: &mut C,
+    mut homes: Vec<Option<(Value, IrType)>>,
+) -> Vec<Option<(Value, IrType)>> {
+    let wants = &func.param_alloca_values;
+    let n = wants.len();
+    if n == 0 {
+        return homes;
+    }
+    // Reuse the aligned probe's buffer: capacity >= n, so `resize` cannot
+    // allocate.  Only the map and the flat adjacency vector are new heap
+    // objects, giving exactly three allocations independent of `params`.
+    homes.clear();
+    homes.resize(n, None);
+    counter.note_allocation();
+    let mut head: FxHashMap<Value, usize> =
+        FxHashMap::with_capacity_and_hasher(n, Default::default());
+    counter.note_allocation();
+    let mut next: Vec<usize> = vec![usize::MAX; n];
+    for (i, value) in wants.iter().enumerate() {
+        match head.entry(*value) {
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                next[i] = *slot.get();
+                *slot.get_mut() = i;
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(i);
+            }
+        }
+    }
+    let mut unresolved = n;
+    if let Some(block) = func.blocks.first() {
+        'walk: for inst in &block.instructions {
+            counter.note_instruction();
+            let Instruction::Alloca { dest, ty, .. } = inst else {
+                continue;
+            };
+            let Some(&first) = head.get(dest) else {
+                continue;
+            };
+            let mut o = first;
+            loop {
+                if homes[o].is_none() {
+                    homes[o] = Some((*dest, *ty));
+                    debug_assert!(unresolved > 0);
+                    unresolved = unresolved.saturating_sub(1);
+                    if unresolved == 0 {
+                        break 'walk;
+                    }
+                }
+                if next[o] == usize::MAX {
+                    break;
+                }
+                o = next[o];
+            }
+        }
+    }
+    homes
 }
 
 /// PhysReg id of the ABI static-chain register, or `None` when this target's
@@ -1235,8 +1490,8 @@ mod vector_location_contract_tests {
 }
 
 #[cfg(test)]
-mod param_alloca_fast_path_tests {
-    use super::find_param_alloca;
+mod param_alloca_index_tests {
+    use super::ParamAllocaIndex;
     use crate::common::types::IrType;
     use crate::ir::instruction::{BasicBlock, Instruction, Terminator};
     use crate::ir::reexports::{BlockId, IrFunction, Value};
@@ -1252,6 +1507,13 @@ mod param_alloca_fast_path_tests {
         }
     }
 
+    /// The aligned hypothesis, evaluated with the same shared-buffer API the
+    /// production `build_homes` uses (capacity reserved for `n` entries).
+    fn aligned_hypothesis(f: &IrFunction) -> bool {
+        let mut buf: Vec<Option<(Value, IrType)>> = Vec::with_capacity(f.param_alloca_values.len());
+        super::aligned_homes(f, &mut super::NoStats, &mut buf)
+    }
+
     fn function(instructions: Vec<Instruction>, homes: Vec<u32>) -> IrFunction {
         let mut f = IrFunction::new("t".to_string(), IrType::Void, Vec::new(), false);
         f.blocks = vec![BasicBlock {
@@ -1264,43 +1526,9 @@ mod param_alloca_fast_path_tests {
         f
     }
 
-    /// The O(1) probe must return byte-for-byte what the former full scan
-    /// returned: the same dest AND the same type (a wrong type would change
-    /// the emitted parameter store width).
-    #[test]
-    fn aligned_homes_hit_the_fast_path_with_the_same_answer() {
-        let f = function(
-            vec![
-                alloca(10, IrType::I32),
-                alloca(11, IrType::I64),
-                alloca(12, IrType::F64),
-            ],
-            vec![10, 11, 12],
-        );
-        assert_eq!(find_param_alloca(&f, 0), Some((Value(10), IrType::I32)));
-        assert_eq!(find_param_alloca(&f, 1), Some((Value(11), IrType::I64)));
-        assert_eq!(find_param_alloca(&f, 2), Some((Value(12), IrType::F64)));
-        assert_eq!(find_param_alloca(&f, 3), None);
-    }
-
-    /// A prefix instruction or a removed parameter home shifts the layout;
-    /// the probe must miss and the authoritative scan must still find the
-    /// home (this is the 20180112-1.c mem2reg class).
-    #[test]
-    fn shifted_layout_falls_back_to_the_exact_scan() {
-        let f = function(
-            vec![
-                alloca(99, IrType::I32), // unrelated local first
-                alloca(10, IrType::I32),
-                alloca(11, IrType::I64),
-            ],
-            vec![10, 11],
-        );
-        assert_eq!(find_param_alloca(&f, 0), Some((Value(10), IrType::I32)));
-        assert_eq!(find_param_alloca(&f, 1), Some((Value(11), IrType::I64)));
-    }
-
-    /// The exact pre-change implementation, used as the oracle.
+    /// The exact pre-index implementation, used as the oracle.  Nothing in
+    /// the production path calls a scan any more; this exists solely so the
+    /// tests can prove the index is a semantic identity.
     fn reference_full_scan(f: &IrFunction, param_idx: usize) -> Option<(Value, IrType)> {
         let want = *f.param_alloca_values.get(param_idx)?;
         f.blocks.first().and_then(|block| {
@@ -1311,14 +1539,48 @@ mod param_alloca_fast_path_tests {
         })
     }
 
+    #[test]
+    fn aligned_homes_are_indexed_with_the_same_answer() {
+        let f = function(
+            vec![
+                alloca(10, IrType::I32),
+                alloca(11, IrType::I64),
+                alloca(12, IrType::F64),
+            ],
+            vec![10, 11, 12],
+        );
+        let index = ParamAllocaIndex::build(&f);
+        assert_eq!(index.len(), 3);
+        assert!(!index.is_empty());
+        assert_eq!(index.get(0), Some((Value(10), IrType::I32)));
+        assert_eq!(index.get(1), Some((Value(11), IrType::I64)));
+        assert_eq!(index.get(2), Some((Value(12), IrType::F64)));
+        assert_eq!(index.get(3), None);
+    }
+
+    /// A prefix instruction or a removed parameter home shifts the layout.
+    /// Unlike the old O(1) probe, the index does not need a fallback: the
+    /// answer is still exact (this is the 20180112-1.c mem2reg class).
+    #[test]
+    fn shifted_layout_is_exact_without_a_scan() {
+        let f = function(
+            vec![
+                alloca(99, IrType::I32), // unrelated local first
+                alloca(10, IrType::I32),
+                alloca(11, IrType::I64),
+            ],
+            vec![10, 11],
+        );
+        let index = ParamAllocaIndex::build(&f);
+        assert_eq!(index.get(0), Some((Value(10), IrType::I32)));
+        assert_eq!(index.get(1), Some((Value(11), IrType::I64)));
+    }
+
     /// Exhaustive proof over EVERY small layout (no sampling): all prefix
     /// lengths, all subsets of homes removed by mem2reg, all I32/I64/F32/F64
-    /// width assignments, and every index including out-of-range ones. This
-    /// is the deterministic complement to the randomized large-layout test;
-    /// together they are the proof obligation for the O(1) probe, so the hot
-    /// path itself pays no per-call verification cost in ANY build profile.
+    /// width assignments, and every index including out-of-range ones.
     #[test]
-    fn fast_path_matches_the_reference_scan_over_all_small_layouts() {
+    fn index_matches_the_reference_scan_over_all_small_layouts() {
         let tys = [IrType::I32, IrType::I64, IrType::F32, IrType::F64];
         let mut layouts = 0usize;
         let mut checks = 0usize;
@@ -1351,10 +1613,12 @@ mod param_alloca_fast_path_tests {
                             next_dest += 1;
                         }
                         let f = function(instructions, homes);
+                        let index = ParamAllocaIndex::build(&f);
+                        assert_eq!(index.len(), nparams);
                         layouts += 1;
                         for i in 0..=nparams + 1 {
                             assert_eq!(
-                                find_param_alloca(&f, i),
+                                index.get(i),
                                 reference_full_scan(&f, i),
                                 "layout {layouts}: prefix={nprefix} params={nparams} \
                                  present={present:b} widths={widths:b} index={i}"
@@ -1372,12 +1636,10 @@ mod param_alloca_fast_path_tests {
         );
     }
 
-    /// Randomized proof that the fast path never changes the answer OR the
-    /// type of a parameter home. Layouts cover aligned homes, unrelated
-    /// prefix allocas, removed homes, out-of-range indices and mixed types.
-    /// Dests are unique (the SSA invariant the exhaustive test relies on).
+    /// Randomized large-layout proof: aligned homes, unrelated prefix
+    /// allocas, removed homes, out-of-range indices and mixed types.
     #[test]
-    fn fast_path_matches_the_reference_scan_over_random_layouts() {
+    fn index_matches_the_reference_scan_over_random_layouts() {
         let mut seed = 0xC0FF_EE11_DEAD_1234u64;
         let mut next = || {
             seed ^= seed << 13;
@@ -1399,17 +1661,18 @@ mod param_alloca_fast_path_tests {
             for i in 0..nparams {
                 // Some parameter homes are removed by mem2reg.
                 if next() % 5 == 0 {
-                    homes.push(Value(9000 + i as u32)); // deliberately absent
+                    homes.push(9000 + i as u32); // deliberately absent
                 } else {
-                    homes.push(Value(next_dest));
+                    homes.push(next_dest);
                 }
                 instructions.push(alloca(next_dest, tys[(next() % 4) as usize]));
                 next_dest += 1;
             }
-            let f = function(instructions, homes.iter().map(|v| v.0).collect());
+            let f = function(instructions, homes);
+            let index = ParamAllocaIndex::build(&f);
             for i in 0..=nparams + 1 {
                 assert_eq!(
-                    find_param_alloca(&f, i),
+                    index.get(i),
                     reference_full_scan(&f, i),
                     "param {i} of {} homes",
                     nparams
@@ -1419,8 +1682,413 @@ mod param_alloca_fast_path_tests {
     }
 
     #[test]
+    fn aligned_layout_takes_exactly_one_allocation() {
+        let f = function(
+            vec![
+                alloca(10, IrType::I32),
+                alloca(11, IrType::I64),
+                alloca(12, IrType::F64),
+                alloca(13, IrType::I32), // trailing unrelated local is irrelevant
+            ],
+            vec![10, 11, 12],
+        );
+        assert!(aligned_hypothesis(&f));
+        assert_eq!(
+            ParamAllocaIndex::build(&f).get(2),
+            Some((Value(12), IrType::F64))
+        );
+        // The aligned path allocates exactly the `homes` Vec -- no hash table,
+        // no adjacency vector.  The old test name said "zero allocation",
+        // which was simply false and is now pinned by the witness.
+        let (_, stats) = ParamAllocaIndex::build_with_stats(&f);
+        assert_eq!(stats.allocations, 1);
+
+        // A prefix alloca, a missing home and non-increasing home ids all
+        // route to the general path, which is exactly equivalent.
+        let shifted = function(
+            vec![
+                alloca(99, IrType::I32),
+                alloca(10, IrType::I32),
+                alloca(11, IrType::I64),
+            ],
+            vec![10, 11],
+        );
+        assert!(!aligned_hypothesis(&shifted));
+        let promoted = function(vec![alloca(99, IrType::I32)], vec![10]);
+        assert!(!aligned_hypothesis(&promoted));
+        let duplicates = function(
+            vec![alloca(10, IrType::I32), alloca(10, IrType::I64)],
+            vec![10, 10],
+        );
+        assert!(!aligned_hypothesis(&duplicates));
+        assert_eq!(
+            ParamAllocaIndex::build(&duplicates).get(0),
+            reference_full_scan(&duplicates, 0)
+        );
+        let no_blocks = {
+            let mut f = function(vec![], vec![]);
+            f.blocks.clear();
+            f
+        };
+        assert_eq!(ParamAllocaIndex::build(&no_blocks).len(), 0);
+    }
+
+    #[test]
     fn a_home_removed_by_mem2reg_is_not_replaced_by_a_later_alloca() {
         let f = function(vec![alloca(99, IrType::I32)], vec![10]);
-        assert_eq!(find_param_alloca(&f, 0), None);
+        let index = ParamAllocaIndex::build(&f);
+        assert_eq!(index.get(0), None);
+    }
+
+    #[test]
+    fn the_first_matching_alloca_wins_even_when_a_dest_is_reused() {
+        // SSA says dests are unique, but the former scan returned the FIRST
+        // match; a malformed IR with a reused dest must not silently pick a
+        // different width from a later instruction.
+        let f = function(
+            vec![
+                alloca(10, IrType::F32),
+                alloca(77, IrType::I32),
+                alloca(10, IrType::I64),
+            ],
+            vec![10],
+        );
+        assert_eq!(
+            ParamAllocaIndex::build(&f).get(0),
+            reference_full_scan(&f, 0)
+        );
+        assert_eq!(
+            ParamAllocaIndex::build(&f).get(0),
+            Some((Value(10), IrType::F32))
+        );
+    }
+
+    #[test]
+    fn duplicate_home_ids_resolve_to_the_same_first_alloca() {
+        let f = function(
+            vec![
+                alloca(10, IrType::I64),
+                alloca(10, IrType::F64),
+                alloca(11, IrType::I32),
+            ],
+            vec![10, 10, 11],
+        );
+        let index = ParamAllocaIndex::build(&f);
+        for i in 0..=3 {
+            assert_eq!(index.get(i), reference_full_scan(&f, i), "parameter {i}");
+        }
+    }
+
+    #[test]
+    fn edge_cases_are_none_or_empty() {
+        let f = function(vec![], vec![]);
+        let index = ParamAllocaIndex::build(&f);
+        assert!(index.is_empty());
+        assert_eq!(index.len(), 0);
+        assert_eq!(index.get(0), None);
+        assert_eq!(index, ParamAllocaIndex::default());
+
+        let mut no_blocks = function(vec![alloca(1, IrType::I32)], vec![1]);
+        no_blocks.blocks.clear();
+        assert_eq!(ParamAllocaIndex::build(&no_blocks).get(0), None);
+
+        // A later block must not contribute a home: only the entry block is
+        // authoritative, exactly as in the original scan.
+        let mut two_blocks = function(vec![alloca(99, IrType::I32)], vec![1]);
+        two_blocks.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![alloca(1, IrType::I64)],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        assert_eq!(ParamAllocaIndex::build(&two_blocks).get(0), None);
+    }
+
+    /// The whole point of the refactor: ONE build answers every query, with
+    /// no per-query dependence on the entry block length.  This test uses a
+    /// deliberately adversarial layout (no home is aligned, all homes are at
+    /// the very end) and checks every ordinal.
+    #[test]
+    fn one_build_answers_every_ordinal_in_a_shifted_large_layout() {
+        const N: usize = 1024;
+        let tys = [IrType::I32, IrType::I64, IrType::F32, IrType::F64];
+        let mut instructions = Vec::with_capacity(2 * N);
+        for i in 0..N {
+            instructions.push(alloca(50_000 + i as u32, tys[i % 4]));
+        }
+        let homes: Vec<u32> = (0..N).map(|i| 100_000 + i as u32).collect();
+        for (i, dest) in homes.iter().enumerate() {
+            instructions.push(alloca(*dest, tys[(i + 1) % 4]));
+        }
+        let f = function(instructions, homes.clone());
+        let index = ParamAllocaIndex::build(&f);
+        for (i, dest) in homes.iter().enumerate() {
+            assert_eq!(
+                index.get(i),
+                Some((Value(*dest), tys[(i + 1) % 4])),
+                "parameter {i}"
+            );
+        }
+        assert_eq!(index.get(N), None);
+    }
+
+    /// The complexity contract: building the index examines each entry-block
+    /// instruction at most once per build path, so the total is bounded by
+    /// `params + entry_instructions` -- NEVER `params * entry_instructions`.
+    /// This is the machine-independent proof that the old O(N^2) fallback
+    /// cannot come back, and it is asserted on the ADVERSARIAL shifted layout
+    /// (all homes at the very end, none aligned) rather than the easy case.
+    #[test]
+    fn build_is_linear_in_instructions_even_for_adversarial_layouts() {
+        const N: usize = 4096;
+        let tys = [IrType::I32, IrType::I64, IrType::F32, IrType::F64];
+        let mut instructions = Vec::with_capacity(2 * N);
+        for i in 0..N {
+            instructions.push(alloca(50_000 + i as u32, tys[i % 4]));
+        }
+        let homes: Vec<u32> = (0..N).map(|i| 100_000 + i as u32).collect();
+        for (i, dest) in homes.iter().enumerate() {
+            instructions.push(alloca(*dest, tys[(i + 1) % 4]));
+        }
+        let entry_instructions = instructions.len();
+        let f = function(instructions, homes.clone());
+
+        let (index, stats) = ParamAllocaIndex::build_with_stats(&f);
+        assert!(
+            stats.instructions_examined <= N + entry_instructions,
+            "examined {} instructions for {} params + {} entry instructions",
+            stats.instructions_examined,
+            N,
+            entry_instructions
+        );
+        // `params * entry_instructions` is the shape the old fallback had;
+        // assert we are orders of magnitude below it so a regression that is
+        // merely "linear with a huge constant" cannot slip through.
+        assert!(stats.instructions_examined < (N * entry_instructions) / 16);
+        for (i, dest) in homes.iter().enumerate() {
+            assert_eq!(index.get(i), Some((Value(*dest), tys[(i + 1) % 4])));
+        }
+
+        // The aligned path examines exactly `params` instructions.
+        let aligned_instructions: Vec<Instruction> = (0..N)
+            .map(|i| alloca(200_000 + i as u32, tys[i % 4]))
+            .collect();
+        let aligned_homes_ids: Vec<u32> = (0..N).map(|i| 200_000 + i as u32).collect();
+        let aligned = function(aligned_instructions, aligned_homes_ids);
+        let (_, aligned_stats) = ParamAllocaIndex::build_with_stats(&aligned);
+        assert_eq!(aligned_stats.instructions_examined, N);
+    }
+
+    /// The complexity witness is only evidence about the SHIPPED path if the
+    /// instrumented instantiation produces the identical index.  Prove that
+    /// identity on every shape that selects a different build path.
+    #[test]
+    fn instrumented_build_is_identical_to_the_shipped_build() {
+        let tys = [IrType::I32, IrType::I64, IrType::F32, IrType::F64];
+        let mut cases: Vec<IrFunction> = Vec::new();
+        // (a) aligned, (b) shifted by a prefix, (c) promoted away,
+        // (d) duplicate home ids, (e) a reused dest with a different width,
+        // (f) two blocks, (g) no blocks.
+        cases.push(function(
+            (0..6)
+                .map(|i| alloca(10 + i, tys[i as usize % 4]))
+                .collect(),
+            (0..6).map(|i| 10 + i).collect(),
+        ));
+        cases.push(function(
+            vec![
+                alloca(99, IrType::I32),
+                alloca(10, IrType::I32),
+                alloca(11, IrType::F64),
+            ],
+            vec![10, 11],
+        ));
+        cases.push(function(vec![alloca(99, IrType::I32)], vec![10]));
+        cases.push(function(
+            vec![
+                alloca(10, IrType::I64),
+                alloca(10, IrType::F64),
+                alloca(11, IrType::I32),
+            ],
+            vec![10, 10, 11],
+        ));
+        cases.push(function(
+            vec![
+                alloca(10, IrType::F32),
+                alloca(77, IrType::I32),
+                alloca(10, IrType::I64),
+            ],
+            vec![10],
+        ));
+        let mut two = function(vec![alloca(99, IrType::I32)], vec![1]);
+        two.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![alloca(1, IrType::I64)],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        cases.push(two);
+        let mut none = function(vec![alloca(1, IrType::I32)], vec![1]);
+        none.blocks.clear();
+        cases.push(none);
+
+        for (case, f) in cases.iter().enumerate() {
+            let shipped = ParamAllocaIndex::build(f);
+            let (witness, _) = ParamAllocaIndex::build_with_stats(f);
+            assert_eq!(
+                shipped, witness,
+                "case {case}: instrumentation changed the index"
+            );
+            for i in 0..=f.param_alloca_values.len() + 1 {
+                assert_eq!(
+                    shipped.get(i),
+                    reference_full_scan(f, i),
+                    "case {case}: ordinal {i}"
+                );
+            }
+        }
+    }
+
+    /// A late-failing aligned probe must cost at most `params` extra
+    /// examinations, never a second unbounded scan.  The count is pinned
+    /// exactly, so a future change that re-walks the whole prefix twice is
+    /// caught by a machine-independent assertion rather than a timing test.
+    #[test]
+    fn failed_aligned_probe_costs_exactly_one_bounded_prefix() {
+        const N: usize = 64usize;
+        const FAIL_AT: usize = N - 1; // aligned hypothesis survives 63 checks
+        let tys = [IrType::I32, IrType::I64, IrType::F32, IrType::F64];
+        let homes: Vec<u32> = (0..N).map(|i| 1000 + i as u32).collect();
+        let mut instructions: Vec<Instruction> = Vec::with_capacity(2 * N);
+        for i in 0..FAIL_AT {
+            instructions.push(alloca(homes[i], tys[i % 4]));
+        }
+        // The probe breaks here: dest differs from wants[FAIL_AT].
+        instructions.push(alloca(9999, IrType::I32));
+        // Authoritative homes at the very end force the general pass to walk
+        // the whole entry block, making the expected count unambiguous.
+        for (i, dest) in homes.iter().enumerate() {
+            instructions.push(alloca(*dest, tys[(i + 1) % 4]));
+        }
+        let entry_instructions = instructions.len();
+        let f = function(instructions, homes.clone());
+        let (index, stats) = ParamAllocaIndex::build_with_stats(&f);
+        // FAIL_AT + 1 examinations in the probe, then one full general pass.
+        assert_eq!(
+            stats.instructions_examined,
+            FAIL_AT + 1 + entry_instructions,
+            "the fallback must not re-examine more than the proven prefix"
+        );
+        assert!(stats.instructions_examined <= N + entry_instructions);
+        for i in 0..=N {
+            assert_eq!(index.get(i), reference_full_scan(&f, i), "ordinal {i}");
+        }
+    }
+
+    /// The flat adjacency chain replaces up to `params` tiny Vec allocations
+    /// with one vector.  Portable proof: the instrumented build counts exactly
+    /// three heap objects on the general path for every parameter count from
+    /// 1 to 4096, and exactly one on the aligned path.  No wall-clock ratios,
+    /// no CI-machine-dependent claims.
+    #[test]
+    fn allocations_are_constant_in_the_number_of_parameters() {
+        let tys = [IrType::I32, IrType::I64, IrType::F32, IrType::F64];
+        for n in [1usize, 2, 8, 64, 1024, 4096] {
+            let homes: Vec<u32> = (0..n).map(|i| 100_000 + i as u32).collect();
+            // One unrelated prefix alloca guarantees the aligned probe fails
+            // at instruction 0, so this exercises the general path.
+            let mut instructions = vec![alloca(7, IrType::I32)];
+            instructions.extend(
+                homes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, d)| alloca(*d, tys[i % 4])),
+            );
+            let entry_instructions = instructions.len();
+            let f = function(instructions.clone(), homes.clone());
+            assert!(!aligned_hypothesis(&f));
+            let (index, stats) = ParamAllocaIndex::build_with_stats(&f);
+            assert_eq!(stats.allocations, 3, "general path with {n} params");
+            assert!(stats.instructions_examined <= n + entry_instructions);
+            for i in 0..=n {
+                assert_eq!(
+                    index.get(i),
+                    reference_full_scan(&f, i),
+                    "general path, {n} params, ordinal {i}"
+                );
+            }
+
+            let aligned = function(instructions[1..].to_vec(), homes.clone());
+            assert!(aligned_hypothesis(&aligned));
+            let (_, aligned_stats) = ParamAllocaIndex::build_with_stats(&aligned);
+            assert_eq!(aligned_stats.allocations, 1, "aligned path with {n} params");
+        }
+        // The empty function must not allocate at all.
+        let (_, empty_stats) = ParamAllocaIndex::build_with_stats(&function(vec![], vec![]));
+        assert_eq!(empty_stats.allocations, 0);
+    }
+
+    /// Every ordinal sharing a home id forms one chain of length `params`.
+    /// Walk it to exhaustion: all ordinals must be filled from the FIRST
+    /// matching `Alloca`, later repeated allocas with the same dest must not
+    /// change any width, and the labelled early exit must terminate.
+    #[test]
+    fn duplicate_chains_resolve_from_the_first_matching_alloca() {
+        const N: usize = 4096;
+        let homes = vec![42u32; N];
+        let instructions = vec![
+            alloca(1, IrType::I32),  // unrelated prefix
+            alloca(42, IrType::F64), // authoritative FIRST match
+            alloca(42, IrType::I8),  // must never win
+            alloca(99, IrType::I32), // unrelated
+            alloca(42, IrType::F32), // must never win
+        ];
+        let f = function(instructions, homes);
+        assert!(!aligned_hypothesis(&f));
+        let (index, stats) = ParamAllocaIndex::build_with_stats(&f);
+        assert_eq!(stats.allocations, 3);
+        // prefix + first matching alloca; the walk stops there.
+        assert_eq!(stats.instructions_examined, 2);
+        for i in 0..=N {
+            assert_eq!(index.get(i), reference_full_scan(&f, i), "ordinal {i}");
+            if i < N {
+                assert_eq!(index.get(i), Some((Value(42), IrType::F64)));
+            }
+        }
+        // The instrumented and shipped builds must agree on this shape too.
+        assert_eq!(index, ParamAllocaIndex::build(&f));
+    }
+
+    /// Interleaved non-alloca instructions, non-monotone home ids, several
+    /// duplicate ids and missing homes all at once: an end-to-end shape that
+    /// no single existing test covers.  Compare every ordinal (including
+    /// out-of-range) against the pre-index oracle.
+    #[test]
+    fn mixed_layout_with_duplicates_and_missing_homes_matches_the_oracle() {
+        let tys = [IrType::I32, IrType::I64, IrType::F32, IrType::F64];
+        let homes = vec![90u32, 10, 10, 70, 90, 10, 999, 70];
+        let instructions = vec![
+            alloca(10, tys[0]),
+            Instruction::StackSave { dest: Value(3) }, // a non-Alloca instruction
+            alloca(70, tys[1]),
+            alloca(90, tys[2]),
+            alloca(10, tys[3]), // duplicate dest, different width
+            alloca(70, tys[0]), // duplicate dest, different width
+            alloca(55, tys[1]), // unrelated local
+            alloca(90, tys[2]), // duplicate dest
+        ];
+        let f = function(instructions, homes);
+        assert!(!aligned_hypothesis(&f));
+        let (index, stats) = ParamAllocaIndex::build_with_stats(&f);
+        assert_eq!(stats.allocations, 3);
+        assert_eq!(index, ParamAllocaIndex::build(&f));
+        for i in 0..=f.param_alloca_values.len() {
+            assert_eq!(index.get(i), reference_full_scan(&f, i), "ordinal {i}");
+        }
+        // The missing home is deliberately unresolved; duplicates all resolve
+        // to the first matching alloca, not the later wider/narrower ones.
+        assert_eq!(index.get(6), None);
+        assert_eq!(index.get(1), Some((Value(10), tys[0])));
+        assert_eq!(index.get(5), Some((Value(10), tys[0])));
     }
 }

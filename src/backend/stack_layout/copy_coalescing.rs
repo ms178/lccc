@@ -947,13 +947,13 @@ fn build_cfg_copy_alias_map(
     if env_flag("CCC_DEBUG_SLOT_COALESCE") && !aliases.is_empty() {
         let mut pairs: Vec<(u32, u32)> = aliases.iter().map(|(&a, &b)| (a, b)).collect();
         pairs.sort_unstable();
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[CFG-SLOT-COALESCE] fn={} candidates={} aliases={} pairs={:?}",
             func.name,
             tracked.len(),
             pairs.len(),
             pairs,
-        );
+        ));
     }
     (aliases, force_aliases)
 }
@@ -1258,7 +1258,7 @@ pub(super) fn build_copy_alias_map(
                 let (phi_dest, backedge_src) = (cand.phi_dest, cand.backedge_src);
                 let src_ty_ok = def_ty_ok.get(&backedge_src).copied().unwrap_or(false);
                 if debug_loop_phi {
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[LOOP_PHI] func={} pair dest=v{} src=v{} dest_reg={} src_reg={} aliased={} ty_ok={}",
                         func.name,
                         phi_dest,
@@ -1267,7 +1267,7 @@ pub(super) fn build_copy_alias_map(
                         reg_assigned.contains_key(&backedge_src),
                         already_aliased.contains(&backedge_src),
                         src_ty_ok,
-                    );
+                    ));
                 }
                 if reg_assigned.contains_key(&phi_dest)
                     || reg_assigned.contains_key(&backedge_src)
@@ -1342,14 +1342,14 @@ pub(super) fn build_copy_alias_map(
             .map(|(&dest, &root)| (dest, root))
             .collect();
         aliases.sort_unstable();
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[SLOT-COALESCE] fn={} aliases={} phi_web_aliases={} loop_phi_aliases={} pairs={:?}",
             func.name,
             aliases.len(),
             phi_web_aliases.len(),
             loop_phi_aliases.len(),
             aliases,
-        );
+        ));
     }
 
     (copy_alias, phi_web_aliases, loop_phi_aliases)
@@ -2914,10 +2914,10 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
             }
             if let Some(d) = pick {
                 if debug {
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VLFOLD-IR] {} b{} i{} fold load %{} into {:?}",
                         func.name, bi, j, d, cop
-                    );
+                    ));
                 }
                 result.insert(d);
             }
@@ -3242,10 +3242,10 @@ pub(super) fn compute_vector_defer_values(
                 break;
             }
             if debug_vdefer {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "[VDEFER] slot={} def=({},{})(uses_in_window={:?}) consumer=({},{})({:?}) site-ok",
                     slot, bi, i, window_uses, bi, u, cop
-                );
+                ));
             }
         }
         if all_sites_ok {

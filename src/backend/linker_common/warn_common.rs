@@ -257,7 +257,7 @@ pub fn shared_definitions(dyn_syms: &[DynSymbol]) -> impl Iterator<Item = &str> 
 /// is reported, then the link fails if any was emitted.
 pub fn report_common_warnings(warnings: &[String], fatal: bool) -> Result<(), String> {
     for warning in warnings {
-        eprintln!("lccc-ld: {warning}");
+        lccc::cli::stderr_line(format_args!("lccc-ld: {warning}"));
     }
     match warnings.first() {
         Some(first) if fatal => Err(format!("warning treated as error: {first}")),

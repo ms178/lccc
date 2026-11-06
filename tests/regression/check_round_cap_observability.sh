@@ -59,6 +59,101 @@ if ! python3 - src/passes/mod.rs <<'PYEOF'
 import re
 import sys
 
+
+def check(lines):
+    """Every pass-bearing early exit owns exactly one round_cap::report().
+
+    A fixed 9-line lookback was NOT a dominance proof: adding four lines of
+    formatting to a debug dump moved an otherwise dominating report() out of
+    the window and turned a correct tree into a red CI lane.  Distance in
+    lines is not a control-flow property.  Instead partition the function
+    body at each early exit and require exactly one report per region, with
+    one further report for the fall-through.  With N pass-bearing exits the
+    count must therefore be N+1, so a deleted, duplicated or misplaced report
+    fails regardless of how many lines anybody inserts -- while a report
+    genuinely in a different region cannot be borrowed by a neighbour.
+    Comments are stripped so a magic string in a comment cannot satisfy it.
+    """
+    problems = []
+    exempt = 0
+    returns = []
+    for n, line in enumerate(lines, 1):
+        # Match the unit-return TOKEN, not the whole line: a fullmatch on
+        # `\s*return;\s*` silently missed compact forms such as
+        # `if (c) { return; }`.  `return EXPR;` can only be a nested closure
+        # return in this unit-returning function, never a pipeline exit.
+        code = line.split("//")[0]
+        if not re.search(r"\breturn;", code):
+            continue
+        j = n - 2
+        while j >= 0 and not lines[j].strip():
+            j -= 1
+        guard = code + ("\n" + lines[j] if j >= 0 else "")
+        if 'pass_disabled(&disabled, "all")' in guard:
+            exempt += 1
+            continue
+        returns.append(n)
+    reports = [n for n, l in enumerate(lines, 1)
+               if "round_cap::report()" in l.split("//")[0]]
+    if exempt != 1:
+        problems.append('expected exactly 1 exempt pass_disabled("all") '
+                        f'exit, found {exempt}')
+    if len(reports) != len(returns) + 1:
+        problems.append(f"expected {len(returns) + 1} report() calls for "
+                        f"{len(returns)} pass-bearing exits + fall-through, "
+                        f"found {len(reports)}")
+    prev = 0
+    for n in returns:
+        owned = [r for r in reports if prev < r < n]
+        if len(owned) != 1:
+            problems.append(f"run_passes body line {n}: {len(owned)} "
+                            "report() calls dominate this exit, want 1")
+        prev = n
+    tail = "\n".join(l.split("//")[0] for l in lines[-15:])
+    if "round_cap::report()" not in tail:
+        problems.append("the main fall-through exit of run_passes lacks a "
+                        "round_cap::report()")
+    if prev and not any(r > prev for r in reports):
+        problems.append("no report() after the last early exit")
+    return problems
+
+
+def self_test():
+    """Prove the checker accepts distance but rejects real regressions."""
+    filler = ["        // formatting-only line"] * 40
+    good = (['    if pass_disabled(&disabled, "all") { return; }',
+             '    if time_passes { round_cap::report(); }',
+             '    return;']
+            + filler
+            + ['    if time_passes { round_cap::report(); }',
+               '    return;',
+               '    if time_passes { round_cap::report(); }']
+            + ["    // tail"] * 4)
+    cases = [
+        ("40 formatting lines between report and exit", good, True),
+        ("a report hidden in a comment",
+         [l.replace('round_cap::report();', '// round_cap::report();')
+          if i == 1 else l for i, l in enumerate(good)], False),
+        ("a deleted report",
+         [l for i, l in enumerate(good) if i != 43], False),
+        ("a duplicated report", good[:2] + good[1:2] + good[2:], False),
+        ("the exempt guard removed",
+         ['    return;' if i == 0 else l for i, l in enumerate(good)], False),
+        ("compact early exit with a report", good, True),
+    ]
+    failures = []
+    for label, lines, want_ok in cases:
+        got_ok = not check(lines)
+        if got_ok != want_ok:
+            failures.append(f"{label}: accepted={got_ok}, want {want_ok}")
+    if failures:
+        for f in failures:
+            print(f"FAIL self-test: {f}", file=sys.stderr)
+        return 1
+    print(f"exit-coverage self-test: {len(cases)} mutations classified")
+    return 0
+
+
 src = open(sys.argv[1], encoding="utf-8").read()
 m = re.search(r"\npub\(crate\) fn run_passes\(", src)
 if m is None:
@@ -78,45 +173,17 @@ if end is None:
     sys.exit("FAIL: could not brace-match run_passes")
 lines = src[i:end + 1].split("\n")
 
-fail = 0
-exempt = 0
-returns = []
-for n, line in enumerate(lines, 1):
-    # Comment-stripped code only. Match the unit-return TOKEN, not the
-    # whole line: a fullmatch on `\s*return;\s*` silently missed one-line
-    # forms (`if (c) { return; }`, `} else { return; }`), so a future
-    # compact early exit could skip the report without this gate noticing.
-    # `return EXPR;` stays out of scope: it can only appear inside a
-    # nested closure in this unit-returning function (the i686 walk below
-    # has one), and a closure return never exits the pipeline.
-    code = line.split("//")[0]
-    if re.search(r"\breturn;", code):
-        window = "\n".join(lines[max(0, n - 9):n])
-        if 'pass_disabled(&disabled, "all")' in window:
-            exempt += 1
-            continue
-        if "round_cap::report()" not in window:
-            print(f"FAIL: run_passes body line {n}: 'return' without a "
-                  f"round_cap::report() dominating it", file=sys.stderr)
-            fail = 1
-        returns.append(n)
-
-# The fall-through at the end of the function is an exit too.  The window is
-# wider than the per-return one: it still fails on a deleted report(), but
-# tolerates a few lines of trailing dumps.
-tail = "\n".join(lines[-15:])
-if "round_cap::report()" not in tail:
-    print("FAIL: the main fall-through exit of run_passes lacks a "
-          "round_cap::report()", file=sys.stderr)
-    fail = 1
-if exempt != 1:
-    print(f"FAIL: expected exactly 1 exempt pass_disabled(\"all\") exit, "
-          f"found {exempt}", file=sys.stderr)
-    fail = 1
-if fail == 0:
-    print(f"exit-coverage: {len(returns)} pass-bearing early exits report, "
-          f"1 exempt (pass-disabled), fall-through reports")
-sys.exit(fail)
+rc = self_test()
+problems = check(lines)
+for p in problems:
+    print(f"FAIL: {p}", file=sys.stderr)
+    rc = 1
+if rc == 0:
+    n_returns = sum(bool(re.search(r"\breturn;", l.split("//")[0]))
+                    for l in lines)
+    print(f"exit-coverage: {n_returns - 1} pass-bearing early exits report, "
+          "1 exempt (pass-disabled), fall-through reports")
+sys.exit(rc)
 PYEOF
 then
     die "pipeline-exit coverage check failed"

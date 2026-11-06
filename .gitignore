@@ -63,6 +63,10 @@ bench_*
 !scripts/bench_kernels.py
 !scripts/bench_iv_widen_ab.sh
 !scripts/bench_rank.py
+# The host-CPU differential harness is source too: it is one of the four legs
+# the PR's runtime claims are measured with, and leaving it ignored makes the
+# published numbers unreproducible (and any gate that invokes it vacuous).
+!engineering/bench_host_cpu.py
 # Benchmark / test output
 /test-results/
 /tmp-results/

@@ -10786,7 +10786,7 @@ mod lea_scan_debug {
             .collect();
         let changed = fold_lea_all_uses_in_block(&mut store, &mut infos);
         let out: Vec<String> = (0..store.len()).map(|i| store.get(i).to_string()).collect();
-        eprintln!("changed={} out=\n{}", changed, out.join("\n"));
+        lccc::cli::stderr_line(format_args!("changed={} out=\n{}", changed, out.join("\n")));
         for line in &out {
             assert!(
                 !(line.contains("xmm5") && line.contains("(%r15,%r11)")),

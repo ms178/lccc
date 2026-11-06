@@ -5143,10 +5143,10 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
     // when both the stream displacement and loop step match the pack size.
     if closes_loop_carried_recurrence(ctx, cand) {
         if ctx.debug {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[SLP] decline seed (width {}) at block {:?}: loop-carried store->load recurrence",
                 cand.width, ctx.block.label
-            );
+            ));
         }
         return None;
     }
@@ -6628,10 +6628,10 @@ fn apply_plan(
         &extract_dest,
     ) {
         if debug {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[SLP] decline plan at block {:?}: emitted schedule would break intra-block SSA order",
                 func.blocks[block_idx].label
-            );
+            ));
         }
         return false;
     }
@@ -6742,7 +6742,7 @@ fn apply_plan(
                 PackKind::CmpBlendv { .. } => "CmpBlendv".into(),
             })
             .collect();
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[BB-SLP] fn={} block B{}: packed {}x{:?} ({} packs, benefit {}): [{}]",
             func.name,
             block_idx,
@@ -6751,7 +6751,7 @@ fn apply_plan(
             plan.packs.len(),
             plan.benefit,
             kinds.join(", ")
-        );
+        ));
     }
     true
 }

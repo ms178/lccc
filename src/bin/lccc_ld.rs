@@ -118,7 +118,7 @@ fn main() {
     match result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            eprintln!("lccc-ld: error: {}", e);
+            lccc::cli::stderr_line(format_args!("lccc-ld: error: {}", e));
             std::process::exit(1);
         }
         Err(payload) => {
@@ -127,11 +127,11 @@ fn main() {
                 .map(|s| (*s).to_string())
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "unknown panic".to_string());
-            eprintln!("lccc-ld: internal error: {}", msg);
-            eprintln!(
+            lccc::cli::stderr_line(format_args!("lccc-ld: internal error: {}", msg));
+            lccc::cli::stderr_line(format_args!(
                 "lccc-ld: this is a bug; re-run with LCCC_LD_PANIC_TRACE=1 \
                  (and RUST_BACKTRACE=1) for details"
-            );
+            ));
             // Exit 1, like every other linker rejecting an input, so build
             // systems surface the file rather than an internal-error code.
             std::process::exit(1);
@@ -269,11 +269,11 @@ fn warn_unimplemented(a: &str) {
     if let Ok(mut guard) = seen.lock()
         && guard.insert(key.clone())
     {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "lccc-ld: warning: '{}' is accepted but not implemented; \
              the requested behavior is not applied",
             key
-        );
+        ));
     }
 }
 
@@ -562,15 +562,18 @@ fn run(args: &[String]) -> Result<(), String> {
                 passthrough.push("--strip-all".to_string());
             }
             "-v" | "-V" | "--version" => {
-                println!("{}", lccc::linker_entry::GNU_LD_VERSION_OUTPUT);
+                lccc::cli::stdout_line(format_args!(
+                    "{}",
+                    lccc::linker_entry::GNU_LD_VERSION_OUTPUT
+                ));
                 return Ok(());
             }
             "--help" => {
-                println!("Usage: lccc-ld [options] file...");
-                println!(
+                lccc::cli::stdout_line(format_args!("Usage: lccc-ld [options] file..."));
+                lccc::cli::stdout_line(format_args!(
                     "  Standard userspace (elf_x86_64, elf_i386), -r relocatable (elf_x86_64),"
-                );
-                println!("  and -T script links (both) supported.");
+                ));
+                lccc::cli::stdout_line(format_args!("  and -T script links (both) supported."));
                 return Ok(());
             }
             "-e" | "--entry" => {
@@ -983,7 +986,7 @@ fn run(args: &[String]) -> Result<(), String> {
         ));
     }
     for w in &top_warnings {
-        eprintln!("lccc-ld: warning: {w}");
+        lccc::cli::stderr_line(format_args!("lccc-ld: warning: {w}"));
     }
     for option in &unimplemented_warnings {
         warn_unimplemented(option);
@@ -1026,7 +1029,9 @@ fn run(args: &[String]) -> Result<(), String> {
                     "warning treated as error: -r with a linker script: script ignored".into(),
                 );
             }
-            eprintln!("lccc-ld: warning: -r with a linker script: script ignored");
+            lccc::cli::stderr_line(format_args!(
+                "lccc-ld: warning: -r with a linker script: script ignored"
+            ));
         }
         let ordered = ordered_args(&passthrough, &positional_files);
         let inputs = lccc::linker_entry::expand_file_mode_libs(&ordered, &inputs, &[], "-r")?;
@@ -1035,7 +1040,7 @@ fn run(args: &[String]) -> Result<(), String> {
         lccc::linker_entry::load_inputs_x86(&inputs, &mut objects, &undefined_symbols, &lib_dirs)?;
         if trace {
             for obj in &objects {
-                println!("{}", obj.source_name);
+                lccc::cli::stdout_line(format_args!("{}", obj.source_name));
             }
         }
         if strip_debug || !emit_symtab {
@@ -1111,13 +1116,13 @@ fn run(args: &[String]) -> Result<(), String> {
             ));
         }
         for warning in &script_option_warnings {
-            eprintln!("lccc-ld: warning: {warning}");
+            lccc::cli::stderr_line(format_args!("lccc-ld: warning: {warning}"));
         }
         if fatal_warnings && !z_warnings.is_empty() {
             return Err(format!("warning treated as error: {}", z_warnings[0]));
         }
         for warning in &z_warnings {
-            eprintln!("lccc-ld: warning: {warning}");
+            lccc::cli::stderr_line(format_args!("lccc-ld: warning: {warning}"));
         }
 
         let mut script_src = std::fs::read_to_string(&script_path)
@@ -1141,7 +1146,7 @@ fn run(args: &[String]) -> Result<(), String> {
         };
         if trace {
             for obj in &objects {
-                println!("{}", obj.source_name);
+                lccc::cli::stdout_line(format_args!("{}", obj.source_name));
             }
         }
         if strip_debug || !emit_symtab {

@@ -200,10 +200,10 @@ pub(crate) fn recursion_to_iteration(func: &mut IrFunction) -> usize {
     // ── 5. Transform: replace function body with iterative loop ────────────
     let debug = std::env::var("LCCC_DEBUG_RECURSION").is_ok();
     if debug {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[REC→ITER] Detected binary recursion in '{}': f(n) = f(n-{}) + f(n-{}), base: n <= {}",
             func_name, small_dec, large_dec, base_threshold
-        );
+        ));
     }
 
     // Allocate fresh values
@@ -392,11 +392,11 @@ pub(crate) fn recursion_to_iteration(func: &mut IrFunction) -> usize {
     func.next_label = max_label + 6;
 
     if debug {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[REC→ITER] Transformed '{}' to iterative loop with {} blocks",
             func_name,
             func.blocks.len()
-        );
+        ));
     }
 
     1

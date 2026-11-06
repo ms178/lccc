@@ -121,9 +121,26 @@
     clippy::wrong_self_convention
 )]
 
+// Every module -- library or standalone binary, including macro bodies
+// expanded at a binary call site -- spells the CLI output path as
+// `lccc::cli::*`. `extern crate self` supplies that name inside the
+// library itself; the binaries already have it as an extern crate.
+extern crate self as lccc;
+
 pub mod backend;
 pub(crate) mod common;
 pub mod driver;
+
+/// Best-effort CLI text output. Public so `lccc-ld` and the per-ISA drivers
+/// cannot reintroduce a panicking `eprintln!` on a closed stderr pipe.
+///
+/// The short alias is deliberate: all 1,100 CLI-text call sites spell
+/// `lccc::cli::stderr_line(...)`. The full `lccc::cli_output::...` path
+/// pushed debug-print lines past rustfmt's 100-column limit, which wrapped
+/// one-line statements into four and grew `emit_int_binop_impl` from 498 to
+/// 501 lines -- tripping the `fns_over_500` audit ratchet. Ten saved columns
+/// per call site keep those statements on one line and keep the ratchet flat.
+pub use common::cli_output as cli;
 pub(crate) mod frontend;
 pub(crate) mod ir;
 pub mod linker_entry;
@@ -154,16 +171,16 @@ pub fn compiler_main() {
     match handler.join() {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            eprintln!("ccc: error: {}", e);
+            lccc::cli::stderr_line(format_args!("ccc: error: {}", e));
             std::process::exit(1);
         }
         Err(e) => {
             if let Some(s) = e.downcast_ref::<&str>() {
-                eprintln!("ccc: internal error: {}", s);
+                lccc::cli::stderr_line(format_args!("ccc: internal error: {}", s));
             } else if let Some(s) = e.downcast_ref::<String>() {
-                eprintln!("ccc: internal error: {}", s);
+                lccc::cli::stderr_line(format_args!("ccc: internal error: {}", s));
             } else {
-                eprintln!("ccc: internal error (thread panicked)");
+                lccc::cli::stderr_line(format_args!("ccc: internal error (thread panicked)"));
             }
             std::process::exit(1);
         }

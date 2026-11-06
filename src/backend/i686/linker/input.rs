@@ -1176,10 +1176,10 @@ fn probe(dir: &str, file: &str, lib: &str) -> Result<Option<(String, Vec<u8>)>, 
     if candidate_compatible(&data, &path) {
         return Ok(Some((path, data)));
     }
-    eprintln!(
+    lccc::cli::stderr_line(format_args!(
         "lccc-ld: skipping incompatible {} when searching for -l{}",
         path, lib
-    );
+    ));
     Ok(None)
 }
 

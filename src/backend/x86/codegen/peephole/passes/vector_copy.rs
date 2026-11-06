@@ -2602,9 +2602,9 @@ mod tests {
                 "pipeline must run its positive canary"
             );
             if !std::arch::is_x86_feature_detected!("avx2") {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "SKIP native fixture execution: AVX2 unavailable; pipeline canary passed"
-                );
+                ));
                 continue;
             }
             let assembly = TempFile::try_new("pr832", "fixture", "s")
@@ -2678,7 +2678,9 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     fn pr824_external_redteam_pipeline_upper_zero_native_witness() {
         if !std::arch::is_x86_feature_detected!("avx2") {
-            eprintln!("SKIP native upper-zero witness: AVX2 unavailable");
+            lccc::cli::stderr_line(format_args!(
+                "SKIP native upper-zero witness: AVX2 unavailable"
+            ));
             return;
         }
         use crate::common::temp_files::TempFile;
@@ -2729,7 +2731,9 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     fn pr832_gcc_architectural_fixtures_through_real_peephole_pipeline() {
         if !std::arch::is_x86_feature_detected!("avx2") {
-            eprintln!("SKIP native VEX fixtures: AVX2 unavailable; effect tests still mandatory");
+            lccc::cli::stderr_line(format_args!(
+                "SKIP native VEX fixtures: AVX2 unavailable; effect tests still mandatory"
+            ));
             return;
         }
         use crate::common::temp_files::TempFile;
@@ -2975,11 +2979,11 @@ mod tests {
             forwarded, groups,
             "stress must exercise every narrow forwarding"
         );
-        println!(
+        lccc::cli::stdout_line(format_args!(
             "PR834_STRESS groups={groups} instructions={} refreshes={refreshes} pass_ns={}",
             groups * 4,
             elapsed.as_nanos()
-        );
+        ));
         refreshes
     }
 
@@ -3504,7 +3508,9 @@ mod tests {
         use crate::common::temp_files::TempFile;
         use std::process::Command;
         if !std::arch::is_x86_feature_detected!("avx2") {
-            eprintln!("SKIP composed shuffle native witness: AVX2 required");
+            lccc::cli::stderr_line(format_args!(
+                "SKIP composed shuffle native witness: AVX2 required"
+            ));
             return;
         }
         let mut assembly = String::from(".text\n");
@@ -3762,7 +3768,9 @@ mod tests {
         use crate::common::temp_files::TempFile;
         use std::process::Command;
         if !std::arch::is_x86_feature_detected!("avx2") {
-            eprintln!("SKIP uniform shift native execution: AVX2 required");
+            lccc::cli::stderr_line(format_args!(
+                "SKIP uniform shift native execution: AVX2 required"
+            ));
             return;
         }
         let make_assembly = |avx512: bool| {
@@ -3861,7 +3869,9 @@ mod tests {
         if std::arch::is_x86_feature_detected!("avx512f") {
             compile_and_run(make_assembly(true), true);
         } else {
-            eprintln!("SKIP AVX-512 uniform shifts: AVX512F required");
+            lccc::cli::stderr_line(format_args!(
+                "SKIP AVX-512 uniform shifts: AVX512F required"
+            ));
         }
     }
 
@@ -3889,7 +3899,9 @@ mod tests {
         if !std::arch::is_x86_feature_detected!("avx2")
             || !std::arch::is_x86_feature_detected!("fma")
         {
-            eprintln!("SKIP packed FMA native execution: AVX2 and FMA required");
+            lccc::cli::stderr_line(format_args!(
+                "SKIP packed FMA native execution: AVX2 and FMA required"
+            ));
             return;
         }
         let mut assembly = String::from(".text\n");

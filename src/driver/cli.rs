@@ -1793,7 +1793,7 @@ impl Driver {
             }
             match arg.as_str() {
                 "-dumpmachine" => {
-                    println!("{}", target.triple());
+                    lccc::cli::stdout_line(format_args!("{}", target.triple()));
                     return Ok(true);
                 }
                 // `-dumpversion` and `-dumpfullversion` both answer the full
@@ -1802,11 +1802,11 @@ impl Driver {
                 // that parse it accept either. Answering the shorter form here
                 // was a measurable divergence.
                 "-dumpversion" => {
-                    println!("{}", GCC_COMPAT_FULL_VERSION);
+                    lccc::cli::stdout_line(format_args!("{}", GCC_COMPAT_FULL_VERSION));
                     return Ok(true);
                 }
                 "-dumpfullversion" => {
-                    println!("{}", GCC_COMPAT_FULL_VERSION);
+                    lccc::cli::stdout_line(format_args!("{}", GCC_COMPAT_FULL_VERSION));
                     return Ok(true);
                 }
                 "-print-sysroot" | "--print-sysroot" => {
@@ -1822,7 +1822,7 @@ impl Driver {
                     // glibc's configure and pkg-config use this as the library
                     // directory suffix ("x86_64-linux-gnu"). Empty output makes
                     // them fall back to a bogus multiarch tuple.
-                    println!("{}", multiarch_triple(target));
+                    lccc::cli::stdout_line(format_args!("{}", multiarch_triple(target)));
                     return Ok(true);
                 }
                 "-print-multi-lib" | "--print-multi-lib" => {
@@ -1833,9 +1833,9 @@ impl Driver {
                     // halves of the x86 pair, so the capability list does
                     // not depend on the active target; non-x86 targets have
                     // no sub-multilibs.
-                    println!(".;");
+                    lccc::cli::stdout_line(format_args!(".;"));
                     if matches!(*target, Target::X86_64 | Target::I686) {
-                        println!("32;@m32");
+                        lccc::cli::stdout_line(format_args!("32;@m32"));
                     }
                     return Ok(true);
                 }
@@ -1867,7 +1867,7 @@ impl Driver {
                                 if std::path::Path::new(&a).exists()
                                     || std::path::Path::new(&s).exists()
                                 {
-                                    println!("{}", a);
+                                    lccc::cli::stdout_line(format_args!("{}", a));
                                     printed = true;
                                     break;
                                 }
@@ -1878,7 +1878,7 @@ impl Driver {
                         }
                     }
                     if !printed {
-                        println!("libgcc.a");
+                        lccc::cli::stdout_line(format_args!("libgcc.a"));
                     }
                     return Ok(true);
                 }
@@ -1890,20 +1890,24 @@ impl Driver {
                     // through one implementation, so they cannot drift apart.
                     let name = arg.trim_start_matches('-').trim_start_matches('-');
                     let name = name.strip_prefix("print-file-name=").unwrap_or(name);
-                    println!("{}", Self::print_file_name(name, target));
+                    lccc::cli::stdout_line(format_args!("{}", Self::print_file_name(name, target)));
                     return Ok(true);
                 }
                 "--version" => {
                     // Meson detects GCC by checking for "Free Software Foundation"
                     // in the --version output. The claimed version is the GCC
                     // release this compiler implements (see GCC_COMPAT_*).
-                    println!(
+                    lccc::cli::stdout_line(format_args!(
                         "lccc (a high performance Claude's C Compiler fork, GCC-compatible) {}",
                         GCC_COMPAT_FULL_VERSION
-                    );
-                    println!("GCC is maintained by the Free Software Foundation, Inc.");
-                    println!("This program is a fork of CCC (written by Claude Opus 4.6);");
-                    println!("It is not intended for production use.");
+                    ));
+                    lccc::cli::stdout_line(format_args!(
+                        "GCC is maintained by the Free Software Foundation, Inc."
+                    ));
+                    lccc::cli::stdout_line(format_args!(
+                        "This program is a fork of CCC (written by Claude Opus 4.6);"
+                    ));
+                    lccc::cli::stdout_line(format_args!("It is not intended for production use."));
                     // Show which GCC fallback features are enabled (if any)
                     let mut features = Vec::new();
                     if cfg!(feature = "gcc_linker") {
@@ -1916,22 +1920,25 @@ impl Driver {
                         features.push("gcc_m16");
                     }
                     if features.is_empty() {
-                        println!("Backend: standalone");
+                        lccc::cli::stdout_line(format_args!("Backend: standalone"));
                     } else {
-                        println!("Backend: {}", features.join(", "));
+                        lccc::cli::stdout_line(format_args!("Backend: {}", features.join(", ")));
                     }
                     return Ok(true);
                 }
                 "-v" if args.len() == 2 => {
-                    println!(
+                    lccc::cli::stdout_line(format_args!(
                         "lccc (a high performance Claude's C Compiler fork, GCC-compatible) {}",
                         GCC_COMPAT_FULL_VERSION
-                    );
+                    ));
                     // GCC-style line so configure scripts that grep `-v` output
                     // for "gcc" (e.g. zlib-ng's compiler detection) classify the
                     // driver as GCC-compatible and enable the -fPIC/-std paths.
-                    println!("gcc version {} (lccc)", GCC_COMPAT_FULL_VERSION);
-                    println!("Target: {}", target.triple());
+                    lccc::cli::stdout_line(format_args!(
+                        "gcc version {} (lccc)",
+                        GCC_COMPAT_FULL_VERSION
+                    ));
+                    lccc::cli::stdout_line(format_args!("Target: {}", target.triple()));
                     return Ok(true);
                 }
                 "-print-multi-directory" | "--print-multi-directory" => {
@@ -1941,9 +1948,9 @@ impl Driver {
                     // Measured against gcc-16.2: `.` for the primary and
                     // `32` when -m32 selects the 32-bit multilib.
                     if *target == Target::I686 {
-                        println!("32");
+                        lccc::cli::stdout_line(format_args!("32"));
                     } else {
-                        println!(".");
+                        lccc::cli::stdout_line(format_args!("."));
                     }
                     return Ok(true);
                 }
@@ -1969,25 +1976,31 @@ impl Driver {
                                 .and_then(|p| p.parent().map(|d| d.join("lccc-ld")))
                                 .filter(|p| p.exists());
                             match sibling {
-                                Some(p) => println!("{}", p.display()),
-                                None => println!("lccc-ld"),
+                                Some(p) => lccc::cli::stdout_line(format_args!("{}", p.display())),
+                                None => lccc::cli::stdout_line(format_args!("lccc-ld")),
                             }
                         }
-                        other => println!("{}", other),
+                        other => lccc::cli::stdout_line(format_args!("{}", other)),
                     }
                     return Ok(true);
                 }
                 "-print-search-dirs" | "--print-search-dirs" => {
-                    println!("install: /usr/lib/gcc/{}/13/", target.triple());
-                    println!("programs: /usr/bin/");
-                    println!("libraries: {}", target.implicit_library_paths());
+                    lccc::cli::stdout_line(format_args!(
+                        "install: /usr/lib/gcc/{}/13/",
+                        target.triple()
+                    ));
+                    lccc::cli::stdout_line(format_args!("programs: /usr/bin/"));
+                    lccc::cli::stdout_line(format_args!(
+                        "libraries: {}",
+                        target.implicit_library_paths()
+                    ));
                     return Ok(true);
                 }
                 _ if arg.starts_with("-print-file-name=") => {
-                    println!(
+                    lccc::cli::stdout_line(format_args!(
                         "{}",
                         Self::print_file_name(&arg["-print-file-name=".len()..], target)
-                    );
+                    ));
                     return Ok(true);
                 }
                 _ => {}
@@ -2430,16 +2443,16 @@ impl Driver {
                 "-gdwarf64" => unknown_option_tolerated("-gdwarf64", strict_options)?,
                 "-gsplit-dwarf" => {
                     self.debug_info = true;
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "lccc: warning: -gsplit-dwarf is not supported; \
                          emitting non-split debug info"
-                    );
+                    ));
                 }
                 "-gz" => {
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "lccc: warning: compressed debug sections (-gz) are not \
                          supported; emitting uncompressed debug info"
-                    );
+                    ));
                     unsupported_tolerated("-gz", strict_options)?;
                 }
                 arg if arg.starts_with("-gz=") => {
@@ -2451,11 +2464,11 @@ impl Driver {
                     if !gnu_debug_selector_known(&arg[2..]) {
                         unknown_option(arg, strict_options)?;
                     }
-                    eprintln!(
+                    lccc::cli::stderr_line(format_args!(
                         "lccc: warning: compressed debug sections ({}) are not \
                          supported; emitting uncompressed debug info",
                         arg
-                    );
+                    ));
                     unsupported_tolerated(arg, strict_options)?;
                 }
                 // A `-gno-<feature>` modifier asks for a feature to be OFF.
@@ -3542,9 +3555,9 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                     self.wrap_signed_overflow = true;
                     self.trapv = false;
                     if unknown_options.insert("-fno-strict-overflow".to_string()) {
-                        eprintln!(
+                        lccc::cli::stderr_line(format_args!(
                             "warning: '-fno-strict-overflow' implements signed-overflow policy only; pointer-overflow semantics are not established; set LCCC_STRICT_OPTIONS=1 to make this an error"
-                        );
+                        ));
                     }
                 }
                 "-fstrict-overflow" => {
@@ -4113,7 +4126,10 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
             // Print GNU ld-compatible version info for build system detection.
             // This is shared with standalone lccc-ld so Kconfig/Meson probes
             // see one stable linker identity on both paths.
-            println!("{}", crate::linker_entry::GNU_LD_VERSION_OUTPUT);
+            lccc::cli::stdout_line(format_args!(
+                "{}",
+                crate::linker_entry::GNU_LD_VERSION_OUTPUT
+            ));
         }
     }
 
@@ -4411,12 +4427,12 @@ pub fn unknown_option_tolerated(arg: &str, strict: bool) -> Result<(), String> {
             arg
         ));
     }
-    eprintln!(
+    lccc::cli::stderr_line(format_args!(
         "warning: unrecognized command-line option '{}' is tolerated but not \
          implemented by LCCC (nothing will act on it); set LCCC_STRICT_OPTIONS=1 \
          to make this an error",
         arg
-    );
+    ));
     Ok(())
 }
 
@@ -4454,10 +4470,10 @@ pub fn fortify_source_unsupported(strict: bool) -> Result<(), String> {
     if strict {
         return Err(format!("{}; LCCC_STRICT_OPTIONS is set", msg));
     }
-    eprintln!(
+    lccc::cli::stderr_line(format_args!(
         "lccc: warning: {} (set LCCC_STRICT_OPTIONS=1 to make this an error)",
         msg
-    );
+    ));
     Ok(())
 }
 

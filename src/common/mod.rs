@@ -2,6 +2,9 @@ pub(crate) mod asm_constraints;
 pub(crate) mod asm_scan;
 pub(crate) mod avx_test;
 pub(crate) mod avx_widen;
+// Public: the standalone driver binaries must use the same best-effort CLI
+// text policy as the library. Re-exported as `lccc::cli_output` in lib.rs.
+pub mod cli_output;
 pub(crate) mod const_arith;
 pub(crate) mod const_eval;
 pub(crate) mod cpu_is_table;

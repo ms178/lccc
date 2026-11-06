@@ -326,7 +326,10 @@ impl X86Codegen {
             == 0
         {
             if std::env::var_os("CCC_DEBUG_SIMD").is_some() {
-                eprintln!("[SIMD] skipping dead dest {} op {:?}", dptr.0, op);
+                lccc::cli::stderr_line(format_args!(
+                    "[SIMD] skipping dead dest {} op {:?}",
+                    dptr.0, op
+                ));
             }
             return true;
         }

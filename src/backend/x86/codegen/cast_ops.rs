@@ -179,7 +179,7 @@ impl X86Codegen {
 
     fn pf15_trace(&self, msg: &str) {
         if std::env::var_os("CCC_DEBUG_PF15").is_some() {
-            eprintln!("[pf15] {msg}");
+            lccc::cli::stderr_line(format_args!("[pf15] {msg}"));
         }
     }
 

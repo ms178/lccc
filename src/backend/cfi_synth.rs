@@ -1184,12 +1184,12 @@ fn call_pops(
             }
         } else if list.iter().any(|p| *p != Some(0)) {
             if debug {
-                eprintln!(
+                lccc::cli::stderr_line(format_args!(
                     "lccc: cfi: {}: {} indirect calls in the final code, {} recorded",
                     name,
                     indirect_lines.len(),
                     list.len()
-                );
+                ));
             }
             for &k in &indirect_lines {
                 out[k] = None;
@@ -1368,10 +1368,10 @@ fn synthesize_function<'b>(
                             // CFA (e.g. a `__builtin_setjmp` resume point)
                             // describes the same frame.
                             if debug && cur.is_some_and(|c| c.rule() != s.rule()) {
-                                eprintln!(
+                                lccc::cli::stderr_line(format_args!(
                                     "lccc: cfi: {}: {} reached with two frame states",
                                     name, lbl
-                                );
+                                ));
                             }
                             cur = Some(s);
                         }
@@ -1532,10 +1532,10 @@ fn synthesize_function<'b>(
             &mut unknown,
         );
         if unknown && debug && !reported_unknown {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "lccc: cfi: {}: unmodelled stack pointer write `{}`",
                 name, t
-            );
+            ));
             reported_unknown = true;
         }
         user.describe(out, f.rule(), arch);
@@ -1555,12 +1555,12 @@ fn synthesize_function<'b>(
         };
     }
     if debug && n_saves_emitted != saves.len() {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "lccc: cfi: {}: {} of {} prologue saves announced",
             name,
             n_saves_emitted,
             saves.len()
-        );
+        ));
     }
 }
 
