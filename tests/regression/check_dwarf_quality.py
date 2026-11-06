@@ -3481,22 +3481,28 @@ def run_32_bit_parameters(
     it, so a rule that only the compiler under test obeys is caught here rather
     than discovered by a user.
     """
-    targets = [("m32-dwarf5--O0", lccc, True)]
+    # `-O0` and `-O2` are two different 32-bit layouts (measured: the `double`
+    # parameter sits at `%ebp - 32` at `-O0` and `%ebp - 44` at `-O2`), so the
+    # check tracks a layout that moves rather than one fixed arrangement.  At
+    # `-O2` a parameter may legitimately be register-homed, where only a wrong
+    # offset is a failure; at `-O0` every parameter must resolve.
+    targets = [("m32-dwarf5--O0", lccc, "-O0", True), ("m32-dwarf5--O2", lccc, "-O2", False)]
     if gcc:
-        targets.append(("m32-gcc-oracle--O0", gcc, False))
-    for label, compiler, required in targets:
-        measure_32_bit_parameters(report, compiler, workdir, label, required)
+        targets.append(("m32-gcc-oracle--O0", gcc, "-O0", False))
+    for label, compiler, optimization, required in targets:
+        measure_32_bit_parameters(report, compiler, workdir, label, optimization, required)
 
 
 def measure_32_bit_parameters(
-    report: Report, compiler: list[str], workdir: Path, label: str, required: bool
+    report: Report, compiler: list[str], workdir: Path, label: str, optimization: str,
+    required: bool,
 ) -> None:
     """Build, run and check the freestanding 32-bit probe with one compiler."""
     source = workdir / "pq_args32.c"
     source.write_text(PARAMETER_PROBE_32)
-    output = workdir / "pq_args32.elf"
-    argv = [*compiler, "-m32", "-O0", "-g", "-gdwarf-5", "-nostdlib", "-static", "-no-pie",
-            "-o", str(output), str(source)]
+    output = workdir / f"{label}.elf"
+    argv = [*compiler, "-m32", optimization, "-g", "-gdwarf-5", "-nostdlib", "-static",
+            "-no-pie", "-o", str(output), str(source)]
     proc = subprocess.run(argv, cwd=workdir, text=True, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, check=False, timeout=180)
     report.objects += 1
@@ -3557,7 +3563,7 @@ def measure_32_bit_parameters(
         return
     # The 32-bit frame record is one four-byte return address.
     facts["frame_record"] = 8
-    check_parameter_locations(report, elf, parsed, label, facts)
+    check_parameter_locations(report, elf, parsed, label, facts, place_every_parameter=required)
     report.measurements.setdefault("parameter_locations", {})[label] = "checked"
 
 
