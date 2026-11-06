@@ -305,10 +305,25 @@ jobs:
           --gcc gcc-16 \
           --json regression-dbgassert-results.json 2>&1 | tee regression-dbgassert-results.log
     - name: Upload regression results
+      id: upload_debug_regression_results
       if: always()
+      continue-on-error: true
       uses: actions/upload-artifact@v7
       with:
         name: debug-regression-results
+        path: |-
+          regression-dbgassert-results.json
+          regression-dbgassert-results.log
+        if-no-files-found: warn
+    - name: Wait for artifact service recovery
+      if: always() && steps.upload_debug_regression_results.outcome == 'failure'
+      run: sleep 10
+    - name: Retry regression results upload after transient artifact-service failure
+      if: always() && steps.upload_debug_regression_results.outcome == 'failure'
+      uses: actions/upload-artifact@v7
+      with:
+        name: debug-regression-results
+        overwrite: true
         path: |-
           regression-dbgassert-results.json
           regression-dbgassert-results.log
@@ -454,10 +469,26 @@ jobs:
                 print(f"::error title=Regression {name} ({phases})::{detail[:1500]}")
         PY
     - name: Upload regression results
+      id: upload_normal_regression_results
       if: always()
+      continue-on-error: true
       uses: actions/upload-artifact@v7
       with:
         name: normal-regression-results
+        path: |-
+          regression-results.json
+          regression-results.log
+          ci-regression-environment.txt
+        if-no-files-found: warn
+    - name: Wait for artifact service recovery
+      if: always() && steps.upload_normal_regression_results.outcome == 'failure'
+      run: sleep 10
+    - name: Retry regression results upload after transient artifact-service failure
+      if: always() && steps.upload_normal_regression_results.outcome == 'failure'
+      uses: actions/upload-artifact@v7
+      with:
+        name: normal-regression-results
+        overwrite: true
         path: |-
           regression-results.json
           regression-results.log

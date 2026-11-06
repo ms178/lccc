@@ -654,6 +654,13 @@ pub struct Driver {
     pub(super) preferred_stack_bytes: u8,
     /// Whether to omit the frame pointer (-fomit-frame-pointer).
     pub(super) omit_frame_pointer: bool,
+    /// Explicit user frame-pointer request, if any.  GCC 16.2 and Clang 23.1.5
+    /// both treat `-f{,no-}omit-frame-pointer` as an opts_set user option: an
+    /// optimization level supplies only the default.  Measured on x86-64:
+    /// `-fno-omit-frame-pointer -O2` keeps the saved rbp chain, and
+    /// `-fomit-frame-pointer -O0` omits it.  Without this origin field the
+    /// shared `-O` helper silently revoked the earlier explicit request.
+    pub(super) explicit_omit_frame_pointer: Option<bool>,
     /// Whether to suppress .eh_frame unwind table generation
     /// (-fno-asynchronous-unwind-tables / -fno-unwind-tables).
     pub(super) no_unwind_tables: bool,
@@ -912,6 +919,7 @@ impl Driver {
             regparm: 0,
             preferred_stack_bytes: 16,
             omit_frame_pointer: false,
+            explicit_omit_frame_pointer: None,
             no_unwind_tables: false,
             raw_args: Vec::new(),
             pthread: false,

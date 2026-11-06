@@ -269,14 +269,15 @@ impl Driver {
     /// all five fields in one place removes eight duplicated assignment
     /// blocks (48 lines to 8 one-line calls) and guarantees the `-Ofast`
     /// withdrawal cannot be forgotten when a new level spelling is added.
-    /// `optimize` and `omit_frame_pointer` are derived from `level > 0`,
-    /// which is exactly what the eight previous arms spelled out.
+    /// `optimize` is derived from `level > 0`.  The frame pointer defaults to
+    /// `level > 0`, but an explicit `-f{,no-}omit-frame-pointer` is a user
+    /// option (GCC/Clang opts_set semantics) and survives every later level.
     fn set_optimization_level(&mut self, level: u32, size: bool, debug: bool) {
         self.optimize_debug = debug;
         self.opt_level = level;
         self.optimize = level > 0;
         self.optimize_size = size;
-        self.omit_frame_pointer = level > 0;
+        self.omit_frame_pointer = self.explicit_omit_frame_pointer.unwrap_or(level > 0);
         self.withdraw_implicit_fast_math();
     }
 
@@ -3389,8 +3390,14 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                     }
                     self.patchable_function_entry = Some((total, before));
                 }
-                "-fomit-frame-pointer" => self.omit_frame_pointer = true,
-                "-fno-omit-frame-pointer" => self.omit_frame_pointer = false,
+                "-fomit-frame-pointer" => {
+                    self.explicit_omit_frame_pointer = Some(true);
+                    self.omit_frame_pointer = true;
+                }
+                "-fno-omit-frame-pointer" => {
+                    self.explicit_omit_frame_pointer = Some(false);
+                    self.omit_frame_pointer = false;
+                }
                 // ── Code alignment control ─────────────────────────────────
                 // GCC grammar: -falign-loops[=N[:M]] / -fno-align-loops, with
                 // N a power-of-two byte alignment and M an optional max-skip
@@ -5840,6 +5847,79 @@ mod cli_tests {
                 "{flag}: {err}"
             );
         }
+    }
+
+    /// GCC 16.2 and Clang 23.1.5 both treat `-f{,no-}omit-frame-pointer` as
+    /// an explicit user option: a later `-O` supplies only the default.
+    /// Measured on x86-64 with a volatile-array probe: both oracles keep the
+    /// saved rbp chain for `-fno-omit-frame-pointer -O2` and omit it for
+    /// `-fomit-frame-pointer -O0`.  The old level helper revoked the earlier
+    /// explicit request, a silent debuggability/performance defect.
+    #[test]
+    fn explicit_frame_pointer_options_survive_every_optimization_level() {
+        let parse = |flags: &[&str]| {
+            let mut driver = Driver::new();
+            let mut argv = vec!["lccc".to_string()];
+            argv.extend(flags.iter().map(|s| s.to_string()));
+            argv.push("x.c".to_string());
+            driver.parse_cli_args(&argv).map(|_| driver).unwrap()
+        };
+        let levels = [
+            ("-O0", false),
+            ("-O1", true),
+            ("-O2", true),
+            ("-O3", true),
+            ("-O4", true),
+            ("-Os", true),
+            ("-Oz", true),
+            ("-Og", true),
+            ("-Ofast", true),
+        ];
+        for (level, default_omit) in levels {
+            let plain = parse(&[level]);
+            assert_eq!(plain.explicit_omit_frame_pointer, None, "{level}");
+            assert_eq!(plain.omit_frame_pointer, default_omit, "{level} default");
+
+            let keep_before = parse(&["-fno-omit-frame-pointer", level]);
+            let keep_after = parse(&[level, "-fno-omit-frame-pointer"]);
+            assert_eq!(
+                keep_before.explicit_omit_frame_pointer,
+                Some(false),
+                "{level}"
+            );
+            assert!(
+                !keep_before.omit_frame_pointer,
+                "-fno-omit-frame-pointer {level}"
+            );
+            assert!(
+                !keep_after.omit_frame_pointer,
+                "{level} -fno-omit-frame-pointer"
+            );
+
+            let omit_before = parse(&["-fomit-frame-pointer", level]);
+            let omit_after = parse(&[level, "-fomit-frame-pointer"]);
+            assert_eq!(
+                omit_before.explicit_omit_frame_pointer,
+                Some(true),
+                "{level}"
+            );
+            assert!(
+                omit_before.omit_frame_pointer,
+                "-fomit-frame-pointer {level}"
+            );
+            assert!(
+                omit_after.omit_frame_pointer,
+                "{level} -fomit-frame-pointer"
+            );
+        }
+        // Last explicit request wins across level changes in both directions.
+        assert!(
+            parse(&["-fno-omit-frame-pointer", "-O2", "-fomit-frame-pointer"]).omit_frame_pointer
+        );
+        assert!(
+            !parse(&["-fomit-frame-pointer", "-O0", "-fno-omit-frame-pointer"]).omit_frame_pointer
+        );
+        assert!(!parse(&["-Ofast", "-O2", "-fno-omit-frame-pointer"]).omit_frame_pointer);
     }
 
     #[test]

@@ -442,6 +442,23 @@ def main() -> int:
             f"the DIE {label} lost {describe(lost)}",
         )
 
+    # A baseline is a two-sided pin.  Losing a name fails above; gaining an
+    # unrecorded name must also fail, otherwise a new capability could appear
+    # and later disappear without either half of the ratchet noticing.
+    new_tags = ours_tags - set(BASELINE_TAGS)
+    new_attributes = ours_attributes - set(BASELINE_ATTRIBUTES)
+    require(
+        not new_tags,
+        f"LCCC emits DIE tags absent from BASELINE_TAGS: {describe(new_tags)} "
+        f"-- measure the capability and record it in the baseline",
+    )
+    require(
+        not new_attributes,
+        f"LCCC emits attributes absent from BASELINE_ATTRIBUTES: "
+        f"{describe(new_attributes)} -- measure the capability and record it "
+        f"in the baseline",
+    )
+
     for name, _ in oracles:
         unexpected_tags = oracle_tags[name] - ours_tags - set(DEFERRED_TAGS)
         unexpected_attributes = (

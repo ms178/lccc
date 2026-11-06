@@ -184,6 +184,52 @@ class DieCensusRatchet(unittest.TestCase):
         self.assertIn("DEFERRED_TAGS names DIEs LCCC now emits",
                       proc.stdout + proc.stderr)
 
+    def test_an_unbaselined_lccc_tag_is_rejected(self) -> None:
+        """Two-sided ratchet: a new capability must be recorded, not silently
+        accepted and then silently lost later."""
+        lccc = optional(os.environ.get("CCC", "target/fastbuild/lccc"))
+        gcc = optional(os.environ.get("GCC16", "gcc-16"))
+        readelf = optional(os.environ.get("READELF", "readelf"))
+        if not all((lccc, gcc, readelf)):
+            self.skipTest("rebuilt lccc, gcc-16 or readelf unavailable")
+        source = GATE.read_text()
+        needle = 'ours_tags |= found["tags"]'
+        self.assertIn(needle, source)
+        mutated = source.replace(needle, needle + ' | {"DW_TAG_label"}', 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "gate.py"
+            path.write_text(mutated)
+            proc = subprocess.run(
+                [shutil.which("python3") or "python3", str(path),
+                 "--lccc", lccc, "--gcc", gcc, "--readelf", readelf,
+                 "--versions", "5"],
+                cwd=ROOT, capture_output=True, text=True, timeout=180,
+            )
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("absent from BASELINE_TAGS", proc.stdout + proc.stderr)
+
+    def test_an_unbaselined_lccc_attribute_is_rejected(self) -> None:
+        lccc = optional(os.environ.get("CCC", "target/fastbuild/lccc"))
+        gcc = optional(os.environ.get("GCC16", "gcc-16"))
+        readelf = optional(os.environ.get("READELF", "readelf"))
+        if not all((lccc, gcc, readelf)):
+            self.skipTest("rebuilt lccc, gcc-16 or readelf unavailable")
+        source = GATE.read_text()
+        needle = 'ours_attributes |= found["attributes"]'
+        self.assertIn(needle, source)
+        mutated = source.replace(needle, needle + ' | {"DW_AT_inline"}', 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "gate.py"
+            path.write_text(mutated)
+            proc = subprocess.run(
+                [shutil.which("python3") or "python3", str(path),
+                 "--lccc", lccc, "--gcc", gcc, "--readelf", readelf,
+                 "--versions", "5"],
+                cwd=ROOT, capture_output=True, text=True, timeout=180,
+            )
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("absent from BASELINE_ATTRIBUTES", proc.stdout + proc.stderr)
+
     def test_live_gate_passes(self) -> None:
         lccc = optional(os.environ.get("CCC", "target/fastbuild/lccc"))
         gcc = optional(os.environ.get("GCC16", "gcc-16"))
