@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 """Audit the DIE vocabulary a unit carries, and ratchet it against the oracles.
 
-A debugger can do exactly what the DIE tree tells it.  LCCC describes units and
-subprograms (with their declared positions, ranges, return type and frame base)
-and nothing else: there are no type DIEs and no variable or parameter DIEs, so a
-consumer can break on ``file:line``, name a frame and unwind it, but cannot print
-a local.  That gap is a *feature* gap, not a bug, and the only honest way to keep
-a feature gap from silently growing -- or from being claimed closed without being
-measured -- is to measure it on every run:
+A debugger can do exactly what the DIE tree tells it. LCCC describes units and
+subprograms (declared positions, ranges, return type, frame base), the C type
+graph the fixture uses, global variables with their addresses, and named formal
+parameter lists. It does NOT describe enumerated types, enumerator constants,
+lexical block scopes or call-site bookkeeping, and it does not give optimized
+locals or parameters a location -- GDB 18.1 reports those as
+``<optimized out>`` while GCC 16.2 and Clang 23.1.5 resolve them through
+``DW_AT_location`` plus entry-value expressions. That remaining gap is a
+*feature* gap, not a bug; the only honest way to keep it from silently growing
+-- or from being claimed closed without being measured -- is to measure it on
+every run:
 
-* what LCCC emits (unit, subprogram and their attributes) is pinned as a
-  baseline, and a run that loses any of it fails;
+* what LCCC emits is pinned as a baseline, and a run that loses ANY of it fails;
 * what gcc and clang emit for the same source is measured at the same time, and
   every tag or attribute they have and LCCC does not must be *declared* below
-  with the reason it is absent -- a new one fails the gate until it is either
-  implemented or added here deliberately;
+  with the reason it is absent -- a new one fails the gate until implemented or
+  added here deliberately;
+* the declaration list is itself checked: an entry naming something LCCC
+  already emits is a lie that would mask a regression in BOTH checks, so
+  ``tests/corpus/test_dwarf_die_census_ratchet.py`` asserts the baseline and
+  the deferred sets are disjoint and that the measured gap matches them;
 * the two dialect rules LCCC does state are asserted directly: a subprogram
   states ``DW_AT_frame_base`` exactly when its dialect can decode
   ``DW_OP_call_frame_cfa`` (version 3 and newer), and never in a version 2 unit.
@@ -22,17 +29,26 @@ measured -- is to measure it on every run:
 Every object is also required to read back cleanly: a malformed DIE tree shows
 up in ``readelf`` as a warning or an error, never as a silent pass.
 
-The measured census on the fixture below (x86-64, ``-O0``, versions 2..5):
+The measured census on the fixture below (x86-64, ``-std=c17 -O0``, versions
+2..5, readelf from binutils 2.47):
 
 =========================  ==============  ==============  ============
                            LCCC            gcc 16.2        clang 23.1.5
 =========================  ==============  ==============  ============
-DIE tags                   3               15              14
-attributes                 15              30              27
-parameter/variable DIEs    none            yes             yes
-type DIEs                  none            yes             yes
+DIE tags                   12              14              14
+attributes                 20              27              21
+parameter/variable DIEs    yes             yes             yes
+type DIEs                  partial         yes             yes
+``DW_AT_location``         globals only    yes             yes
 ``DW_AT_frame_base``       v3+             v3+ (v2: list)  all versions
 =========================  ==============  ==============  ============
+
+An earlier revision of this gate claimed LCCC emitted only three tags and no
+variable or parameter DIEs, and pre-declared fifteen tags and five attributes as
+"deferred" that the compiler had since started emitting. Both halves of the
+ratchet then ignored those names: losing the entire type graph or every
+parameter DIE would have passed. The baseline below is the measured union, and
+the deferral list is the measured difference; neither is a wish list.
 """
 
 from __future__ import annotations
@@ -68,25 +84,43 @@ int main(void) { return compute(1, "x", 2.0); }
 # Losing any of these is a regression: a consumer would stop seeing something it
 # is entitled to.
 BASELINE_TAGS = frozenset(
-    {"DW_TAG_compile_unit", "DW_TAG_subprogram", "DW_TAG_unspecified_type"}
+    {
+        "DW_TAG_array_type",
+        "DW_TAG_base_type",
+        "DW_TAG_compile_unit",
+        "DW_TAG_formal_parameter",
+        "DW_TAG_member",
+        "DW_TAG_pointer_type",
+        "DW_TAG_structure_type",
+        "DW_TAG_subprogram",
+        "DW_TAG_subrange_type",
+        "DW_TAG_typedef",
+        "DW_TAG_unspecified_type",
+        "DW_TAG_variable",
+    }
 )
 BASELINE_ATTRIBUTES = frozenset(
     {
+        "DW_AT_byte_size",
         "DW_AT_comp_dir",
+        "DW_AT_data_member_location",
         "DW_AT_decl_column",
         "DW_AT_decl_file",
         "DW_AT_decl_line",
+        "DW_AT_encoding",
         "DW_AT_external",
         "DW_AT_frame_base",
         "DW_AT_high_pc",
         "DW_AT_language",
         "DW_AT_language_name",
         "DW_AT_language_version",
+        "DW_AT_location",
         "DW_AT_low_pc",
         "DW_AT_name",
         "DW_AT_producer",
         "DW_AT_stmt_list",
         "DW_AT_type",
+        "DW_AT_upper_bound",
     }
 )
 
@@ -119,58 +153,44 @@ SUBPROGRAM_ATTRIBUTES = frozenset(
 # is absent.  This is the ratchet: a *new* oracle tag or attribute fails the gate
 # until it is implemented, or listed here with its reason.
 DEFERRED_TAGS = {
-    # The type graph.  It needs the frontend's type information in the writer,
-    # which today is fed by assembler records only (`.loc`-shaped directives
-    # carry positions, not types), so this is a vocabulary to add, not a bug to
-    # fix: `DW_TAG_base_type` for the scalar types, then the composites.
-    "DW_TAG_base_type": "type graph: no type vocabulary in the lowering",
-    "DW_TAG_pointer_type": "type graph: no type vocabulary in the lowering",
-    "DW_TAG_array_type": "type graph: no type vocabulary in the lowering",
-    "DW_TAG_subrange_type": "type graph: no type vocabulary in the lowering",
-    "DW_TAG_structure_type": "type graph: no type vocabulary in the lowering",
-    "DW_TAG_union_type": "type graph: no type vocabulary in the lowering",
-    "DW_TAG_member": "type graph: no type vocabulary in the lowering",
-    "DW_TAG_enumeration_type": "type graph: no type vocabulary in the lowering",
-    "DW_TAG_enumerator": "type graph: no type vocabulary in the lowering",
-    "DW_TAG_typedef": "type graph: no type vocabulary in the lowering",
-    "DW_TAG_const_type": "type graph: no type vocabulary in the lowering",
-    "DW_TAG_volatile_type": "type graph: no type vocabulary in the lowering",
-    "DW_TAG_function_type": "type graph: no type vocabulary in the lowering",
-    "DW_TAG_unspecified_parameters": "type graph: no type vocabulary in the lowering",
-    # Variables need both the type graph (for `DW_AT_type`) and a location
-    # channel in the writer (a stack offset per variable, which codegen knows
-    # but the assembler records do not carry).
-    "DW_TAG_variable": "variables: needs the type graph and a location channel",
-    "DW_TAG_formal_parameter": "variables: needs the type graph and a location channel",
-    "DW_TAG_lexical_block": "variables: needs block scopes in the lowering",
-    "DW_TAG_label": "variables: no label vocabulary in the lowering",
+    # Measured: the fixture declares `enum color { RED, GREEN = 3 }`, and both
+    # oracles emit an enumeration_type with two enumerators. LCCC's unit spec
+    # can represent DwarfType::Enum (dwarf_spec.rs), but the frontend spec
+    # builder does not add one for a C enum, so no enumerator DIE follows.
+    "DW_TAG_enumeration_type": "C enum types are absent from the unit spec (measured)",
+    "DW_TAG_enumerator": "enumerator constants follow DW_TAG_enumeration_type",
+    "DW_TAG_lexical_block": "block scopes are absent from the unit spec (measured)",
 }
 
+# The measured attribute difference. Every name LCCC already states belongs in
+# BASELINE_ATTRIBUTES instead: listing it here too would let a regression pass.
 DEFERRED_ATTRIBUTES = {
-    "DW_AT_location": "variables: needs a location channel",
-    "DW_AT_data_member_location": "type graph: member offsets are frontend data",
-    "DW_AT_byte_size": "type graph: sizes are frontend data",
-    "DW_AT_encoding": "type graph: scalar encodings are frontend data",
-    "DW_AT_count": "type graph: array bounds are frontend data",
-    "DW_AT_upper_bound": "type graph: array bounds are frontend data",
-    "DW_AT_const_value": "type graph: enumerator values are frontend data",
-    "DW_AT_prototyped": (
-        "needs the declaration's parameter list in the writer; the DIE is built "
-        "from symbol and `.loc` records, which carry no prototype information"
-    ),
-    "DW_AT_sibling": "an optimization: a consumer reads children without it",
     "DW_AT_GNU_all_call_sites": "gcc's call-site bookkeeping; no call-site DIEs",
     "DW_AT_GNU_all_tail_call_sites": "gcc's call-site bookkeeping; no call-site DIEs",
     "DW_AT_call_all_calls": "call-site bookkeeping; no call-site DIEs",
     "DW_AT_call_all_tail_calls": "call-site bookkeeping; no call-site DIEs",
+    "DW_AT_const_value": "enumerator constants are not emitted (measured)",
+    # clang 23 states an array's element count; LCCC states its upper bound,
+    # which is what gcc emits for the same dialect. Both are valid.
+    "DW_AT_count": "clang's DWARF-5 array-count form; LCCC writes gcc's upper_bound",
+    "DW_AT_prototyped": "subprogram DIEs do not state the prototype flag (measured)",
+    "DW_AT_sibling": "an optimization: a consumer reads children without it",
     # clang 23's default for version 5 is the indexed string/address form, which
-    # needs `.debug_str_offsets`/`.debug_addr` bases.  LCCC writes `strp`/`addr`
+    # needs `.debug_str_offsets`/`.debug_addr` bases. LCCC writes `strp`/`addr`
     # -- byte for byte what gcc writes for the same dialect -- and the two are
     # equally valid; adopting the indexed form is a size optimization, not a
     # capability.
     "DW_AT_addr_base": "clang's version-5 indexed form; LCCC writes gcc's strp/addr",
     "DW_AT_str_offsets_base": "clang's version-5 indexed form; LCCC writes gcc's strp/addr",
 }
+
+# A deferral and a baseline entry cannot describe the same name: the deferral
+# would make the oracle-only check ignore it while the baseline claims it is
+# present. Assert the invariant at import time so a stale edit cannot land.
+assert not (set(DEFERRED_TAGS) & set(BASELINE_TAGS)), \
+    "a DEFERRED_TAGS entry is already in BASELINE_TAGS"
+assert not (set(DEFERRED_ATTRIBUTES) & set(BASELINE_ATTRIBUTES)), \
+    "a DEFERRED_ATTRIBUTES entry is already in BASELINE_ATTRIBUTES"
 
 DIE_LINE = re.compile(r"^\s*<(\d+)><([0-9a-f]+)>:\s*(.*)$")
 ATTRIBUTE_LINE = re.compile(r"^\s*<[0-9a-f]+>\s+(DW_AT_\w+)\s*:")
@@ -382,6 +402,24 @@ def main() -> int:
                 f"PASS {label}: unit and subprogram vocabulary, and the "
                 f"{'version 3+' if version >= 3 else 'version 2 (absent)'} frame base"
             )
+
+    # A deferral may never name something LCCC actually emits. The static
+    # disjointness assertion above covers the pinned baseline; this one covers
+    # *new* capabilities: if the compiler starts emitting a DIE that is still
+    # listed as deferred, both halves of the gate would ignore it and a later
+    # regression would pass silently. Requiring the measured sets to be clean
+    # makes the deferral list self-invalidating as the compiler improves.
+    require(
+        not (ours_tags & set(DEFERRED_TAGS)),
+        f"DEFERRED_TAGS names DIEs LCCC now emits: "
+        f"{describe(ours_tags & set(DEFERRED_TAGS))} -- move them to BASELINE_TAGS",
+    )
+    require(
+        not (ours_attributes & set(DEFERRED_ATTRIBUTES)),
+        f"DEFERRED_ATTRIBUTES names attributes LCCC now emits: "
+        f"{describe(ours_attributes & set(DEFERRED_ATTRIBUTES))} -- "
+        f"move them to BASELINE_ATTRIBUTES",
+    )
 
     # The baseline is what LCCC states, measured with a readelf that knows every
     # name in it.  A host whose readelf predates an attribute (binutils before

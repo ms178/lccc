@@ -5,6 +5,8 @@ import io
 import json
 from pathlib import Path
 import subprocess
+import threading
+import time
 import sys
 import tempfile
 import unittest
@@ -244,6 +246,80 @@ class RunnerContract(unittest.TestCase):
         # The queued cases were cancelled rather than run to completion behind
         # the fault, so the toolchain is not spent on work nobody will read.
         self.assertEqual(len(calls), 1)
+
+    def test_fault_stops_queue_even_when_the_consumer_is_delayed(self):
+        """F07 regression: cancelling futures from the consumer thread is too
+        late. With --jobs=1 a single worker can dequeue and finish EVERY queued
+        (fast, mocked) case before the consumer wakes up, so `future.cancel()`
+        is a no-op. Delaying `as_completed` by 50 ms reproduces the race
+        deterministically; the worker-side abort must keep calls == 1."""
+        for index in range(4):
+            (self.suite / f"c{index}.c").write_text("int f(void);\n")
+        calls = []
+
+        def flaky(case, **kwargs):
+            calls.append(case.source.name)
+            if len(calls) == 1:
+                raise OSError("mocked ccache exploded")
+            return torture.Result(case.source.name, case.opt_flags, [], "pass",
+                                  "complete", 0, 0.01)
+
+        real = torture.concurrent.futures.as_completed
+
+        def delayed(futures, *args, **kwargs):
+            time.sleep(0.05)
+            return real(futures, *args, **kwargs)
+
+        with mock.patch.object(torture, "reference_preflight", return_value=None), \
+             mock.patch.object(torture, "run_identity",
+                               return_value={"mode": "compile"}), \
+             mock.patch.object(torture, "compile_case", side_effect=flaky), \
+             mock.patch.object(torture.concurrent.futures, "as_completed",
+                               side_effect=delayed):
+            self.assertEqual(self.invoke(["--jobs=1"]), 2)
+        self.assertEqual(calls, ["c0.c"],
+                         "queued cases ran behind a fatal runner fault")
+        report = json.loads(self.report.read_text())
+        self.assertFalse(report["complete"])
+        self.assertIn("mocked ccache exploded", report["fatal"])
+        self.assertEqual(report["completed_cases"], 0)
+
+    def test_fault_bounds_in_flight_work_with_multiple_jobs(self):
+        """With several workers, cases already inside `run_case` may finish,
+        but no NEW work may start after the fault. Bound the total by the
+        worker count so a late consumer cannot silently drain the queue."""
+        for index in range(12):
+            (self.suite / f"c{index}.c").write_text("int f(void);\n")
+        calls = []
+        lock = threading.Lock()
+
+        def flaky(case, **kwargs):
+            with lock:
+                calls.append(case.source.name)
+                first = len(calls) == 1
+            if first:
+                raise OSError("mocked ccache exploded")
+            return torture.Result(case.source.name, case.opt_flags, [], "pass",
+                                  "complete", 0, 0.01)
+
+        real = torture.concurrent.futures.as_completed
+
+        def delayed(futures, *args, **kwargs):
+            time.sleep(0.05)
+            return real(futures, *args, **kwargs)
+
+        with mock.patch.object(torture, "reference_preflight", return_value=None), \
+             mock.patch.object(torture, "run_identity",
+                               return_value={"mode": "compile"}), \
+             mock.patch.object(torture, "compile_case", side_effect=flaky), \
+             mock.patch.object(torture.concurrent.futures, "as_completed",
+                               side_effect=delayed):
+            self.assertEqual(self.invoke(["--jobs=4"]), 2)
+        self.assertLessEqual(len(calls), 4,
+                             "new work started after the worker fault")
+        report = json.loads(self.report.read_text())
+        self.assertIn("mocked ccache exploded", report["fatal"])
+        self.assertFalse(report["complete"])
 
     def test_identity_pins_quoted_included_headers(self):
         """F06: an input the compiler reads is an input the pin must cover."""

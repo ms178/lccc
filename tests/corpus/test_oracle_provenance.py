@@ -27,21 +27,57 @@ def live_clang_pin() -> str:
     return match.group(1)
 
 
+def assert_provenance(data: dict, pin: str) -> None:
+    """The one provenance contract, used both on the live baseline and on
+    mutated negative controls.  A matrix measured with a superseded oracle
+    must be rejected even if every other key looks plausible."""
+    provenance = data.get("provenance", {})
+    if provenance.get("recorded_with") != data.get("toolchains"):
+        raise AssertionError("recorded_with is not the toolchain set that measured the rows")
+    note = provenance.get("note", "")
+    if "--update-baseline" not in note or pin not in note:
+        raise AssertionError(f"note does not name the live pin {pin} and the regeneration command")
+    if provenance.get("rederived_with", {}).get("clang") != pin:
+        raise AssertionError(f"rederived_with.clang is not the live pin {pin}")
+    clang = provenance.get("recorded_with", {}).get("clang", "")
+    if f"clang version {pin}" not in clang:
+        raise AssertionError(f"recorded Clang banner is not the live pin {pin}")
+    if "Measured with Clang 23.1.4" in note:
+        raise AssertionError("a stale Clang 23.1.4 measurement was relabelled as current")
+
+
 class OracleProvenance(unittest.TestCase):
     def test_baseline_records_the_oracles_that_measured_it(self) -> None:
         data = json.loads(BASELINE.read_text())
-        self.assertIn("provenance", data)
-        self.assertEqual(data["provenance"]["recorded_with"], data["toolchains"])
-        self.assertIn("23.1.4", data["provenance"]["note"])
-        self.assertIn("--update-baseline", data["provenance"]["note"])
+        assert_provenance(data, live_clang_pin())
+
+    def test_a_superseded_measurement_is_rejected(self) -> None:
+        """Negative controls: each way a stale matrix could masquerade as a
+        re-derived one must be caught by the same contract."""
+        pin = live_clang_pin()
+        data = json.loads(BASELINE.read_text())
+        for name, mutate in (
+            ("old note", lambda d: d["provenance"].update(note="Measured with Clang 23.1.4.")),
+            ("old rederived_with", lambda d: d["provenance"].update(rederived_with={"clang": "23.1.4"})),
+            ("old banner", lambda d: d["provenance"]["recorded_with"].update(clang="clang version 23.1.4")),
+            ("dropped note", lambda d: d["provenance"].pop("note")),
+            ("dropped rederived_with", lambda d: d["provenance"].pop("rederived_with")),
+        ):
+            with self.subTest(name=name):
+                mutated = json.loads(json.dumps(data))
+                mutate(mutated)
+                with self.assertRaises(AssertionError):
+                    assert_provenance(mutated, pin)
 
     def test_generator_keeps_provenance_on_regeneration(self) -> None:
-        # --update-baseline rewrites the whole file; if it dropped the field,
-        # a re-derived baseline would again be indistinguishable from an old
-        # measurement. This is a source-level contract, not a data assertion.
+        # --update-baseline rewrites the whole file; if it dropped the note
+        # or the machine-readable pin, a re-derived baseline would again be
+        # indistinguishable from an old measurement.  This is a source-level
+        # contract, not a data assertion.
         text = MATRIX_GATE.read_text()
-        self.assertIn('base["provenance"]', text)
-        self.assertIn('"recorded_with"', text)
+        for needle in ('base["provenance"]', '"recorded_with"', '"rederived_with"',
+                       "clang version ([0-9]", '"note"'):
+            self.assertIn(needle, text)
 
     def test_grid_expectations_name_the_live_oracle(self) -> None:
         pin = live_clang_pin()

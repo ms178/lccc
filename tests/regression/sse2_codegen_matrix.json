@@ -2,95 +2,463 @@
  "configs": [
   "O2"
  ],
+ "counts": {
+  "addpd": {
+   "O2": 24
+  },
+  "addps": {
+   "O2": 19
+  },
+  "addsd": {
+   "O2": 30
+  },
+  "addss": {
+   "O2": 22
+  },
+  "andnpd": {
+   "O2": 30
+  },
+  "andnps": {
+   "O2": 22
+  },
+  "andpd": {
+   "O2": 30
+  },
+  "andps": {
+   "O2": 22
+  },
+  "cmpeqpd": {
+   "O2": 30
+  },
+  "cmpeqps": {
+   "O2": 21
+  },
+  "cmpgtpd": {
+   "O2": 46
+  },
+  "cmpgtps": {
+   "O2": 38
+  },
+  "cmpltpd": {
+   "O2": 30
+  },
+  "cmpltps": {
+   "O2": 21
+  },
+  "cvtdq2pd": {
+   "O2": 20
+  },
+  "cvtdq2ps": {
+   "O2": 14
+  },
+  "cvtpd2dq": {
+   "O2": 14
+  },
+  "cvtps2dq": {
+   "O2": 14
+  },
+  "cvtsd2si": {
+   "O2": 16
+  },
+  "cvtsd2ss": {
+   "O2": 14
+  },
+  "cvtsi2sd": {
+   "O2": 20
+  },
+  "cvtsi2ss": {
+   "O2": 13
+  },
+  "cvtss2sd": {
+   "O2": 20
+  },
+  "cvttpd2dq": {
+   "O2": 14
+  },
+  "cvttps2dq": {
+   "O2": 14
+  },
+  "cvttsd2si": {
+   "O2": 16
+  },
+  "divpd": {
+   "O2": 48
+  },
+  "divps": {
+   "O2": 39
+  },
+  "divsd": {
+   "O2": 30
+  },
+  "divss": {
+   "O2": 22
+  },
+  "matmul_ikj": {
+   "O2": 67
+  },
+  "maxpd": {
+   "O2": 48
+  },
+  "maxps": {
+   "O2": 39
+  },
+  "maxsd": {
+   "O2": 30
+  },
+  "minpd": {
+   "O2": 48
+  },
+  "minps": {
+   "O2": 39
+  },
+  "minsd": {
+   "O2": 30
+  },
+  "movapd": {
+   "O2": 21
+  },
+  "movdqa": {
+   "O2": 17
+  },
+  "movmskpd": {
+   "O2": 51
+  },
+  "mulpd": {
+   "O2": 24
+  },
+  "mulps": {
+   "O2": 19
+  },
+  "mulsd": {
+   "O2": 30
+  },
+  "mulss": {
+   "O2": 22
+  },
+  "orpd": {
+   "O2": 30
+  },
+  "orps": {
+   "O2": 22
+  },
+  "packssdw": {
+   "O2": 22
+  },
+  "packsswb": {
+   "O2": 22
+  },
+  "packuswb": {
+   "O2": 22
+  },
+  "paddb": {
+   "O2": 22
+  },
+  "paddd": {
+   "O2": 22
+  },
+  "paddq": {
+   "O2": 22
+  },
+  "paddsb": {
+   "O2": 22
+  },
+  "paddsw": {
+   "O2": 22
+  },
+  "paddusb": {
+   "O2": 22
+  },
+  "paddusw": {
+   "O2": 22
+  },
+  "paddw": {
+   "O2": 22
+  },
+  "pand": {
+   "O2": 22
+  },
+  "pandn": {
+   "O2": 22
+  },
+  "pavgb": {
+   "O2": 22
+  },
+  "pavgw": {
+   "O2": 22
+  },
+  "pcmpeqb": {
+   "O2": 22
+  },
+  "pcmpeqd": {
+   "O2": 22
+  },
+  "pcmpeqw": {
+   "O2": 22
+  },
+  "pcmpgtb": {
+   "O2": 22
+  },
+  "pcmpgtd": {
+   "O2": 22
+  },
+  "pcmpgtw": {
+   "O2": 22
+  },
+  "pmaddwd": {
+   "O2": 22
+  },
+  "pmaxub": {
+   "O2": 22
+  },
+  "pminsw": {
+   "O2": 22
+  },
+  "pmulhuw": {
+   "O2": 22
+  },
+  "pmulhw": {
+   "O2": 22
+  },
+  "pmullw": {
+   "O2": 22
+  },
+  "pmuludq": {
+   "O2": 22
+  },
+  "por": {
+   "O2": 22
+  },
+  "psadbw": {
+   "O2": 22
+  },
+  "pshufd": {
+   "O2": 20
+  },
+  "pshufhw": {
+   "O2": 20
+  },
+  "pshuflw": {
+   "O2": 20
+  },
+  "pslld": {
+   "O2": 20
+  },
+  "pslldq": {
+   "O2": 20
+  },
+  "psllq": {
+   "O2": 20
+  },
+  "psllw": {
+   "O2": 20
+  },
+  "psrad": {
+   "O2": 20
+  },
+  "psraw": {
+   "O2": 20
+  },
+  "psrld": {
+   "O2": 20
+  },
+  "psrldq": {
+   "O2": 20
+  },
+  "psrlq": {
+   "O2": 20
+  },
+  "psrlw": {
+   "O2": 20
+  },
+  "psubb": {
+   "O2": 22
+  },
+  "psubd": {
+   "O2": 22
+  },
+  "psubq": {
+   "O2": 22
+  },
+  "psubsb": {
+   "O2": 22
+  },
+  "psubsw": {
+   "O2": 22
+  },
+  "psubusb": {
+   "O2": 22
+  },
+  "psubusw": {
+   "O2": 22
+  },
+  "psubw": {
+   "O2": 22
+  },
+  "punpckhbw": {
+   "O2": 22
+  },
+  "punpckhdq": {
+   "O2": 22
+  },
+  "punpckhqdq": {
+   "O2": 22
+  },
+  "punpckhwd": {
+   "O2": 22
+  },
+  "punpcklbw": {
+   "O2": 22
+  },
+  "punpckldq": {
+   "O2": 22
+  },
+  "punpcklqdq": {
+   "O2": 22
+  },
+  "punpcklwd": {
+   "O2": 22
+  },
+  "pxor": {
+   "O2": 22
+  },
+  "shufpd": {
+   "O2": 30
+  },
+  "shufps": {
+   "O2": 21
+  },
+  "sqrtpd": {
+   "O2": 40
+  },
+  "sqrtps": {
+   "O2": 34
+  },
+  "sqrtsd": {
+   "O2": 26
+  },
+  "sqrtss": {
+   "O2": 20
+  },
+  "subpd": {
+   "O2": 24
+  },
+  "subps": {
+   "O2": 19
+  },
+  "subsd": {
+   "O2": 30
+  },
+  "subss": {
+   "O2": 22
+  },
+  "unpckhpd": {
+   "O2": 48
+  },
+  "unpckhps": {
+   "O2": 40
+  },
+  "unpcklpd": {
+   "O2": 48
+  },
+  "unpcklps": {
+   "O2": 40
+  },
+  "xorpd": {
+   "O2": 30
+  },
+  "xorps": {
+   "O2": 22
+  }
+ },
  "debt": {
   "addpd": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 24
    }
   },
   "addps": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 19
    }
   },
   "addsd": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 16
+    "lccc": 30
    }
   },
   "addss": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "andnpd": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 30
    }
   },
   "andnps": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "andpd": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 30
    }
   },
   "andps": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "cmpeqpd": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 32
+    "lccc": 30
    }
   },
   "cmpeqps": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 32
+    "lccc": 21
    }
   },
   "cmpgtpd": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 46
    }
   },
   "cmpgtps": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 38
    }
   },
   "cmpltpd": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 32
+    "lccc": 30
    }
   },
   "cmpltps": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 32
+    "lccc": 21
    }
   },
   "cvtdq2pd": {
    "O2": {
     "best_oracle": 10,
-    "lccc": 14
+    "lccc": 20
    }
   },
   "cvtdq2ps": {
@@ -114,7 +482,7 @@
   "cvtsd2si": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 18
+    "lccc": 16
    }
   },
   "cvtsd2ss": {
@@ -126,7 +494,7 @@
   "cvtsi2sd": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 14
+    "lccc": 20
    }
   },
   "cvtsi2ss": {
@@ -138,7 +506,7 @@
   "cvtss2sd": {
    "O2": {
     "best_oracle": 10,
-    "lccc": 14
+    "lccc": 20
    }
   },
   "cvttpd2dq": {
@@ -156,583 +524,583 @@
   "cvttsd2si": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 18
+    "lccc": 16
    }
   },
   "divpd": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 48
    }
   },
   "divps": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 39
    }
   },
   "divsd": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 16
+    "lccc": 30
    }
   },
   "divss": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "matmul_ikj": {
    "O2": {
     "best_oracle": 16,
-    "lccc": 73
+    "lccc": 67
    }
   },
   "maxpd": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 48
    }
   },
   "maxps": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 39
    }
   },
   "maxsd": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 16
+    "lccc": 30
    }
   },
   "minpd": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 48
    }
   },
   "minps": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 39
    }
   },
   "minsd": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 16
+    "lccc": 30
    }
   },
   "movapd": {
    "O2": {
     "best_oracle": 8,
-    "lccc": 13
+    "lccc": 21
    }
   },
   "movdqa": {
    "O2": {
     "best_oracle": 8,
-    "lccc": 13
+    "lccc": 17
    }
   },
   "movmskpd": {
    "O2": {
     "best_oracle": 15,
-    "lccc": 36
+    "lccc": 51
    }
   },
   "mulpd": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 24
    }
   },
   "mulps": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 19
    }
   },
   "mulsd": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 16
+    "lccc": 30
    }
   },
   "mulss": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "orpd": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 30
    }
   },
   "orps": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "packssdw": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "packsswb": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "packuswb": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "paddb": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "paddd": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "paddq": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "paddsb": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "paddsw": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "paddusb": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "paddusw": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "paddw": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "pand": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "pandn": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "pavgb": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "pavgw": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "pcmpeqb": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "pcmpeqd": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "pcmpeqw": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "pcmpgtb": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "pcmpgtd": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "pcmpgtw": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "pmaddwd": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "pmaxub": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "pminsw": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "pmulhuw": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "pmulhw": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "pmullw": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "pmuludq": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "por": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "psadbw": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "pshufd": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 14
+    "lccc": 20
    }
   },
   "pshufhw": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 14
+    "lccc": 20
    }
   },
   "pshuflw": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 14
+    "lccc": 20
    }
   },
   "pslld": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 14
+    "lccc": 20
    }
   },
   "pslldq": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 14
+    "lccc": 20
    }
   },
   "psllq": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 14
+    "lccc": 20
    }
   },
   "psllw": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 14
+    "lccc": 20
    }
   },
   "psrad": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 14
+    "lccc": 20
    }
   },
   "psraw": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 14
+    "lccc": 20
    }
   },
   "psrld": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 14
+    "lccc": 20
    }
   },
   "psrldq": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 14
+    "lccc": 20
    }
   },
   "psrlq": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 14
+    "lccc": 20
    }
   },
   "psrlw": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 14
+    "lccc": 20
    }
   },
   "psubb": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "psubd": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "psubq": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "psubsb": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "psubsw": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "psubusb": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "psubusw": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "psubw": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "punpckhbw": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "punpckhdq": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "punpckhqdq": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "punpckhwd": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "punpcklbw": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "punpckldq": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "punpcklqdq": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "punpcklwd": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "pxor": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "shufpd": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 32
+    "lccc": 30
    }
   },
   "shufps": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 32
+    "lccc": 21
    }
   },
   "sqrtpd": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 14
+    "lccc": 40
    }
   },
   "sqrtps": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 14
+    "lccc": 34
    }
   },
   "sqrtsd": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 15
+    "lccc": 26
    }
   },
   "sqrtss": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 14
+    "lccc": 20
    }
   },
   "subpd": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 24
    }
   },
   "subps": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 19
    }
   },
   "subsd": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 16
+    "lccc": 30
    }
   },
   "subss": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 16
+    "lccc": 22
    }
   },
   "unpckhpd": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 48
    }
   },
   "unpckhps": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 40
    }
   },
   "unpcklpd": {
    "O2": {
     "best_oracle": 11,
-    "lccc": 16
+    "lccc": 48
    }
   },
   "unpcklps": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 40
    }
   },
   "xorpd": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 30
    }
   },
   "xorps": {
    "O2": {
     "best_oracle": 12,
-    "lccc": 16
+    "lccc": 22
    }
   }
  },
@@ -741,13 +1109,16 @@
    "O2": [
     "addl",
     "addpd",
+    "addq",
     "cmpl",
     "jg",
     "jle",
     "leal",
     "leaq",
     "movdqu",
+    "movupd",
     "ret",
+    "subq",
     "xorl"
    ]
   },
@@ -760,7 +1131,9 @@
     "jle",
     "leal",
     "leaq",
+    "movdqa",
     "movdqu",
+    "movups",
     "ret",
     "xorl"
    ]
@@ -768,6 +1141,7 @@
   "addsd": {
    "O2": [
     "addl",
+    "addq",
     "addsd",
     "cmpl",
     "jg",
@@ -775,13 +1149,16 @@
     "leal",
     "leaq",
     "movdqu",
+    "movupd",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "addss": {
    "O2": [
     "addl",
+    "addq",
     "addss",
     "cmpl",
     "jg",
@@ -789,63 +1166,77 @@
     "leal",
     "leaq",
     "movdqu",
+    "movups",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "andnpd": {
    "O2": [
     "addl",
+    "addq",
+    "andnpd",
     "cmpl",
     "jg",
     "jle",
     "leal",
     "leaq",
     "movdqu",
-    "pandn",
+    "movupd",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "andnps": {
    "O2": [
     "addl",
+    "addq",
+    "andnps",
     "cmpl",
     "jg",
     "jle",
     "leal",
     "leaq",
     "movdqu",
-    "pandn",
+    "movups",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "andpd": {
    "O2": [
     "addl",
+    "addq",
+    "andpd",
     "cmpl",
     "jg",
     "jle",
     "leal",
     "leaq",
     "movdqu",
-    "pand",
+    "movupd",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "andps": {
    "O2": [
     "addl",
+    "addq",
+    "andps",
     "cmpl",
     "jg",
     "jle",
     "leal",
     "leaq",
     "movdqu",
-    "pand",
+    "movups",
     "ret",
+    "subq",
     "xorl"
    ]
   },
@@ -860,9 +1251,7 @@
     "leal",
     "leaq",
     "movdqu",
-    "movq",
-    "popq",
-    "pushq",
+    "movupd",
     "ret",
     "subq",
     "xorl"
@@ -879,9 +1268,7 @@
     "leal",
     "leaq",
     "movdqu",
-    "movq",
-    "popq",
-    "pushq",
+    "movups",
     "ret",
     "subq",
     "xorl"
@@ -890,6 +1277,7 @@
   "cmpgtpd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "cmppd",
     "jg",
@@ -897,13 +1285,19 @@
     "leal",
     "leaq",
     "movdqu",
+    "movq",
+    "movupd",
+    "popq",
+    "pushq",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "cmpgtps": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "cmpps",
     "jg",
@@ -911,7 +1305,12 @@
     "leal",
     "leaq",
     "movdqu",
+    "movq",
+    "movups",
+    "popq",
+    "pushq",
     "ret",
+    "subq",
     "xorl"
    ]
   },
@@ -926,9 +1325,7 @@
     "leal",
     "leaq",
     "movdqu",
-    "movq",
-    "popq",
-    "pushq",
+    "movupd",
     "ret",
     "subq",
     "xorl"
@@ -945,9 +1342,7 @@
     "leal",
     "leaq",
     "movdqu",
-    "movq",
-    "popq",
-    "pushq",
+    "movups",
     "ret",
     "subq",
     "xorl"
@@ -956,6 +1351,7 @@
   "cvtdq2pd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "cvtdq2pd",
     "jg",
@@ -963,7 +1359,9 @@
     "leal",
     "leaq",
     "movdqu",
+    "movupd",
     "ret",
+    "subq",
     "xorl"
    ]
   },
@@ -1020,8 +1418,6 @@
     "leaq",
     "movd",
     "movdqu",
-    "movq",
-    "movslq",
     "pshufd",
     "ret",
     "xorl"
@@ -1044,6 +1440,7 @@
   "cvtsi2sd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "cvtsi2sd",
     "jg",
@@ -1052,8 +1449,10 @@
     "leaq",
     "movdqu",
     "movslq",
+    "movupd",
     "pxor",
     "ret",
+    "subq",
     "xorl"
    ]
   },
@@ -1067,14 +1466,15 @@
     "leal",
     "leaq",
     "movdqu",
-    "pxor",
     "ret",
-    "xorl"
+    "xorl",
+    "xorps"
    ]
   },
   "cvtss2sd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "cvtps2pd",
     "jg",
@@ -1082,7 +1482,9 @@
     "leal",
     "leaq",
     "movdqu",
+    "movupd",
     "ret",
+    "subq",
     "xorl"
    ]
   },
@@ -1125,8 +1527,6 @@
     "leaq",
     "movd",
     "movdqu",
-    "movq",
-    "movslq",
     "pshufd",
     "ret",
     "xorl"
@@ -1135,6 +1535,7 @@
   "divpd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "divpd",
     "jg",
@@ -1142,13 +1543,19 @@
     "leal",
     "leaq",
     "movdqu",
+    "movq",
+    "movupd",
+    "popq",
+    "pushq",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "divps": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "divps",
     "jg",
@@ -1156,13 +1563,19 @@
     "leal",
     "leaq",
     "movdqu",
+    "movq",
+    "movups",
+    "popq",
+    "pushq",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "divsd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "divsd",
     "jg",
@@ -1170,13 +1583,16 @@
     "leal",
     "leaq",
     "movdqu",
+    "movupd",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "divss": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "divss",
     "jg",
@@ -1184,7 +1600,9 @@
     "leal",
     "leaq",
     "movdqu",
+    "movups",
     "ret",
+    "subq",
     "xorl"
    ]
   },
@@ -1193,7 +1611,6 @@
     "addpd",
     "addq",
     "addsd",
-    "cltq",
     "cmpq",
     "jge",
     "jl",
@@ -1210,7 +1627,6 @@
     "pushq",
     "ret",
     "shlq",
-    "subq",
     "unpcklpd",
     "xorl"
    ]
@@ -1218,6 +1634,7 @@
   "maxpd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1225,13 +1642,19 @@
     "leaq",
     "maxpd",
     "movdqu",
+    "movq",
+    "movupd",
+    "popq",
+    "pushq",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "maxps": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1239,13 +1662,19 @@
     "leaq",
     "maxps",
     "movdqu",
+    "movq",
+    "movups",
+    "popq",
+    "pushq",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "maxsd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1253,13 +1682,16 @@
     "leaq",
     "maxsd",
     "movdqu",
+    "movupd",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "minpd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1267,13 +1699,19 @@
     "leaq",
     "minpd",
     "movdqu",
+    "movq",
+    "movupd",
+    "popq",
+    "pushq",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "minps": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1281,13 +1719,19 @@
     "leaq",
     "minps",
     "movdqu",
+    "movq",
+    "movups",
+    "popq",
+    "pushq",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "minsd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1295,20 +1739,25 @@
     "leaq",
     "minsd",
     "movdqu",
+    "movupd",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "movapd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
     "leal",
     "leaq",
     "movdqu",
+    "movupd",
     "ret",
+    "subq",
     "xorl"
    ]
   },
@@ -1339,7 +1788,7 @@
     "movdqu",
     "movmskpd",
     "movq",
-    "movslq",
+    "movupd",
     "popq",
     "pshufd",
     "pushq",
@@ -1351,14 +1800,17 @@
   "mulpd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
     "leal",
     "leaq",
     "movdqu",
+    "movupd",
     "mulpd",
     "ret",
+    "subq",
     "xorl"
    ]
   },
@@ -1370,7 +1822,9 @@
     "jle",
     "leal",
     "leaq",
+    "movdqa",
     "movdqu",
+    "movups",
     "mulps",
     "ret",
     "xorl"
@@ -1379,62 +1833,75 @@
   "mulsd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
     "leal",
     "leaq",
     "movdqu",
+    "movupd",
     "mulsd",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "mulss": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
     "leal",
     "leaq",
     "movdqu",
+    "movups",
     "mulss",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "orpd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
     "leal",
     "leaq",
     "movdqu",
-    "por",
+    "movupd",
+    "orpd",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "orps": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
     "leal",
     "leaq",
     "movdqu",
-    "por",
+    "movups",
+    "orps",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "packssdw": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1443,12 +1910,14 @@
     "movdqu",
     "packssdw",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "packsswb": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1457,12 +1926,14 @@
     "movdqu",
     "packsswb",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "packuswb": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1471,12 +1942,14 @@
     "movdqu",
     "packuswb",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "paddb": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1485,12 +1958,14 @@
     "movdqu",
     "paddb",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "paddd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1499,12 +1974,14 @@
     "movdqu",
     "paddd",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "paddq": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1513,12 +1990,14 @@
     "movdqu",
     "paddq",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "paddsb": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1527,12 +2006,14 @@
     "movdqu",
     "paddsb",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "paddsw": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1541,12 +2022,14 @@
     "movdqu",
     "paddsw",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "paddusb": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1555,12 +2038,14 @@
     "movdqu",
     "paddusb",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "paddusw": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1569,12 +2054,14 @@
     "movdqu",
     "paddusw",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "paddw": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1583,12 +2070,14 @@
     "movdqu",
     "paddw",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "pand": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1597,12 +2086,14 @@
     "movdqu",
     "pand",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "pandn": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1611,12 +2102,14 @@
     "movdqu",
     "pandn",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "pavgb": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1625,12 +2118,14 @@
     "movdqu",
     "pavgb",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "pavgw": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1639,12 +2134,14 @@
     "movdqu",
     "pavgw",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "pcmpeqb": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1653,12 +2150,14 @@
     "movdqu",
     "pcmpeqb",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "pcmpeqd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1667,12 +2166,14 @@
     "movdqu",
     "pcmpeqd",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "pcmpeqw": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1681,12 +2182,14 @@
     "movdqu",
     "pcmpeqw",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "pcmpgtb": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1695,12 +2198,14 @@
     "movdqu",
     "pcmpgtb",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "pcmpgtd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1709,12 +2214,14 @@
     "movdqu",
     "pcmpgtd",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "pcmpgtw": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1723,12 +2230,14 @@
     "movdqu",
     "pcmpgtw",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "pmaddwd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1737,12 +2246,14 @@
     "movdqu",
     "pmaddwd",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "pmaxub": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1751,12 +2262,14 @@
     "movdqu",
     "pmaxub",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "pminsw": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1765,12 +2278,14 @@
     "movdqu",
     "pminsw",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "pmulhuw": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1779,12 +2294,14 @@
     "movdqu",
     "pmulhuw",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "pmulhw": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1793,12 +2310,14 @@
     "movdqu",
     "pmulhw",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "pmullw": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1807,12 +2326,14 @@
     "movdqu",
     "pmullw",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "pmuludq": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1821,12 +2342,14 @@
     "movdqu",
     "pmuludq",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "por": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1835,12 +2358,14 @@
     "movdqu",
     "por",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "psadbw": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1849,12 +2374,14 @@
     "movdqu",
     "psadbw",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "pshufd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1863,12 +2390,14 @@
     "movdqu",
     "pshufd",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "pshufhw": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1877,12 +2406,14 @@
     "movdqu",
     "pshufhw",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "pshuflw": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1891,12 +2422,14 @@
     "movdqu",
     "pshuflw",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "pslld": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1905,12 +2438,14 @@
     "movdqu",
     "pslld",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "pslldq": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1919,12 +2454,14 @@
     "movdqu",
     "pslldq",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "psllq": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1933,12 +2470,14 @@
     "movdqu",
     "psllq",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "psllw": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1947,12 +2486,14 @@
     "movdqu",
     "psllw",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "psrad": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1961,12 +2502,14 @@
     "movdqu",
     "psrad",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "psraw": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1975,12 +2518,14 @@
     "movdqu",
     "psraw",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "psrld": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -1989,12 +2534,14 @@
     "movdqu",
     "psrld",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "psrldq": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -2003,12 +2550,14 @@
     "movdqu",
     "psrldq",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "psrlq": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -2017,12 +2566,14 @@
     "movdqu",
     "psrlq",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "psrlw": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -2031,12 +2582,14 @@
     "movdqu",
     "psrlw",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "psubb": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -2045,12 +2598,14 @@
     "movdqu",
     "psubb",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "psubd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -2059,12 +2614,14 @@
     "movdqu",
     "psubd",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "psubq": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -2073,12 +2630,14 @@
     "movdqu",
     "psubq",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "psubsb": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -2087,12 +2646,14 @@
     "movdqu",
     "psubsb",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "psubsw": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -2101,12 +2662,14 @@
     "movdqu",
     "psubsw",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "psubusb": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -2115,12 +2678,14 @@
     "movdqu",
     "psubusb",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "psubusw": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -2129,12 +2694,14 @@
     "movdqu",
     "psubusw",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "psubw": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -2143,12 +2710,14 @@
     "movdqu",
     "psubw",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "punpckhbw": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -2157,12 +2726,14 @@
     "movdqu",
     "punpckhbw",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "punpckhdq": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -2171,12 +2742,14 @@
     "movdqu",
     "punpckhdq",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "punpckhqdq": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -2185,12 +2758,14 @@
     "movdqu",
     "punpckhqdq",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "punpckhwd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -2199,12 +2774,14 @@
     "movdqu",
     "punpckhwd",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "punpcklbw": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -2213,12 +2790,14 @@
     "movdqu",
     "punpcklbw",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "punpckldq": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -2227,12 +2806,14 @@
     "movdqu",
     "punpckldq",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "punpcklqdq": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -2241,12 +2822,14 @@
     "movdqu",
     "punpcklqdq",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "punpcklwd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -2255,12 +2838,14 @@
     "movdqu",
     "punpcklwd",
     "ret",
+    "subq",
     "xorl"
    ]
   },
   "pxor": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
@@ -2269,6 +2854,7 @@
     "movdqu",
     "pxor",
     "ret",
+    "subq",
     "xorl"
    ]
   },
@@ -2282,9 +2868,7 @@
     "leal",
     "leaq",
     "movdqu",
-    "movq",
-    "popq",
-    "pushq",
+    "movupd",
     "ret",
     "shufpd",
     "subq",
@@ -2301,9 +2885,7 @@
     "leal",
     "leaq",
     "movdqu",
-    "movq",
-    "popq",
-    "pushq",
+    "movups",
     "ret",
     "shufps",
     "subq",
@@ -2313,70 +2895,91 @@
   "sqrtpd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
     "leal",
     "leaq",
     "movdqu",
+    "movq",
+    "movupd",
+    "popq",
+    "pushq",
     "ret",
     "sqrtpd",
+    "subq",
     "xorl"
    ]
   },
   "sqrtps": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
     "leal",
     "leaq",
     "movdqu",
+    "movq",
+    "movups",
+    "popq",
+    "pushq",
     "ret",
     "sqrtps",
+    "subq",
     "xorl"
    ]
   },
   "sqrtsd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
     "leal",
     "leaq",
     "movdqu",
+    "movupd",
     "ret",
     "sqrtsd",
+    "subq",
     "xorl"
    ]
   },
   "sqrtss": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
     "leal",
     "leaq",
     "movdqu",
+    "movups",
     "ret",
     "sqrtss",
+    "subq",
     "xorl"
    ]
   },
   "subpd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
     "leal",
     "leaq",
     "movdqu",
+    "movupd",
     "ret",
     "subpd",
+    "subq",
     "xorl"
    ]
   },
@@ -2388,7 +2991,9 @@
     "jle",
     "leal",
     "leaq",
+    "movdqa",
     "movdqu",
+    "movups",
     "ret",
     "subps",
     "xorl"
@@ -2397,13 +3002,16 @@
   "subsd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
     "leal",
     "leaq",
     "movdqu",
+    "movupd",
     "ret",
+    "subq",
     "subsd",
     "xorl"
    ]
@@ -2411,13 +3019,16 @@
   "subss": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
     "leal",
     "leaq",
     "movdqu",
+    "movups",
     "ret",
+    "subq",
     "subss",
     "xorl"
    ]
@@ -2425,13 +3036,19 @@
   "unpckhpd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
     "leal",
     "leaq",
     "movdqu",
+    "movq",
+    "movupd",
+    "popq",
+    "pushq",
     "ret",
+    "subq",
     "unpckhpd",
     "xorl"
    ]
@@ -2439,13 +3056,19 @@
   "unpckhps": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
     "leal",
     "leaq",
     "movdqu",
+    "movq",
+    "movups",
+    "popq",
+    "pushq",
     "ret",
+    "subq",
     "unpckhps",
     "xorl"
    ]
@@ -2453,13 +3076,19 @@
   "unpcklpd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
     "leal",
     "leaq",
     "movdqu",
+    "movq",
+    "movupd",
+    "popq",
+    "pushq",
     "ret",
+    "subq",
     "unpcklpd",
     "xorl"
    ]
@@ -2467,13 +3096,19 @@
   "unpcklps": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
     "leal",
     "leaq",
     "movdqu",
+    "movq",
+    "movups",
+    "popq",
+    "pushq",
     "ret",
+    "subq",
     "unpcklps",
     "xorl"
    ]
@@ -2481,44 +3116,53 @@
   "xorpd": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
     "leal",
     "leaq",
     "movdqu",
-    "pxor",
+    "movupd",
     "ret",
-    "xorl"
+    "subq",
+    "xorl",
+    "xorpd"
    ]
   },
   "xorps": {
    "O2": [
     "addl",
+    "addq",
     "cmpl",
     "jg",
     "jle",
     "leal",
     "leaq",
     "movdqu",
-    "pxor",
+    "movups",
     "ret",
-    "xorl"
+    "subq",
+    "xorl",
+    "xorps"
    ]
   }
  },
  "provenance": {
-  "note": "Measured with Clang 23.1.4. Re-derive against the live 23.1.5 pin with --update-baseline on a host carrying that oracle. The enforced lccc instruction-count ratchet is host-independent.",
+  "note": "Measured with Clang 23.1.5. Re-derive against the live Clang pin with --update-baseline on a host carrying that oracle. The enforced lccc instruction-count ratchet is host-independent; the debt and verdict columns are comparisons against the recorded oracles and are only valid for those exact builds.",
   "recorded_with": {
-   "clang": "clang version 23.1.4 (https://github.com/llvm/llvm-project 0d261d1ca552c95a8f007e061c787ac7132fbcbc)",
+   "clang": "clang version 23.1.5 (https://github.com/llvm/llvm-project 392dfff97d29b59d77e5cac6d4b6ef2585fe7117)",
    "gcc": "gcc-16 (GCC) 16.2.0",
-   "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+   "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0"
+  },
+  "rederived_with": {
+   "clang": "23.1.5"
   }
  },
  "toolchains": {
-  "clang": "clang version 23.1.4 (https://github.com/llvm/llvm-project 0d261d1ca552c95a8f007e061c787ac7132fbcbc)",
+  "clang": "clang version 23.1.5 (https://github.com/llvm/llvm-project 392dfff97d29b59d77e5cac6d4b6ef2585fe7117)",
   "gcc": "gcc-16 (GCC) 16.2.0",
-  "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+  "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0"
  },
  "verdicts": {
   "addpd": {

@@ -92,6 +92,13 @@ pub struct Driver {
     /// `-ffast-math -ffp-contract=off` also ends OFF (explicit flag is sticky
     /// in both orders; explicit-vs-explicit remains last-wins).
     pub(super) fp_contract_explicit: bool,
+    /// Whether `-ffast-math` / `-fno-fast-math` was given explicitly on the
+    /// command line. `None` means the fast-math state is owned by the current
+    /// `-O` spelling: only `-Ofast` enables it implicitly, so a later plain
+    /// `-O*` must withdraw it (GCC 16.2 and Clang 23.1 both do this).
+    /// `Some(true)` keeps it enabled across `-O` changes; `Some(false)` is an
+    /// explicit opt-out that no later `-Ofast` may silently revoke (GCC 16.2).
+    pub(super) explicit_fast_math: Option<bool>,
     /// Whether the umbrella -ffast-math option is active.  Kept separate from
     /// fp_reassoc because GCC does not define __FAST_MATH__ for the individual
     /// -fassociative-math/-funsafe-math-optimizations options.
@@ -132,6 +139,13 @@ pub struct Driver {
     pub(super) fp_trapping_math: bool,
     /// Dynamic rounding is observable independently of exception trapping.
     pub(super) fp_rounding_math: bool,
+    /// `-f{,no-}trapping-math` given by the user, or `None` when unset.
+    /// `-ffast-math` must override both fenv bits, but withdrawing the
+    /// umbrella (`-fno-fast-math`, or a later plain `-O*` after `-Ofast`)
+    /// must restore an explicit fenv request instead of silently losing it.
+    pub(super) explicit_fp_trapping_math: Option<bool>,
+    /// `-f{,no-}rounding-math` given by the user, or `None` when unset.
+    pub(super) explicit_fp_rounding_math: Option<bool>,
     pub(super) verbose: bool,
     pub(super) mode: CompileMode,
     pub(super) debug_info: bool,
@@ -700,6 +714,7 @@ impl Driver {
             fp_contract: crate::common::fp_contract::FpContract::c_language_default(),
             fp_contract_explicit: false,
             fast_math: false,
+            explicit_fast_math: None,
             wrap_signed_overflow: false,
             trapv: false,
             whole_program: false,
@@ -714,6 +729,8 @@ impl Driver {
             builtin_policy: crate::common::pass_policy::BuiltinFlags::default(),
             fp_trapping_math: false,
             fp_rounding_math: false,
+            explicit_fp_trapping_math: None,
+            explicit_fp_rounding_math: None,
             verbose: false,
             mode: CompileMode::Full,
             debug_info: false,
@@ -5007,8 +5024,10 @@ impl Driver {
     /// GCC's *flag* default), and applying it at every optimization level made
     /// `-O0`/`-O1` output differ from GCC's in the last ulp(s) — which is how
     /// 26 in-repo reproducers came to be filed as "miscompile" although both
-    /// results are conforming.  An explicit `-ffp-contract=` or `-ffast-math`
-    /// still wins at any level.
+    /// results are conforming. Only an explicit `-ffp-contract=` overrides
+    /// this gate (`fp_contract_explicit`): `-ffast-math` alone does not, which
+    /// is what GCC 16.2 does on the FMA fixture at `-O1` (measured; Clang
+    /// 23.1 does fuse there, a documented divergence).
     pub(super) fn resolved_fp_contract(&self) -> crate::common::fp_contract::FpContract {
         use crate::common::fp_contract::FpContract;
         if !self.fp_contract_explicit && self.opt_level < 2 {
