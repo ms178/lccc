@@ -567,9 +567,16 @@ higher) and it must still satisfy the rule.
 Controls (all measured): a deliberate sign error in `parameter_homes` produces 88
 failures and GDB reports `pq_args.k` as `0` where the program passed `11`;
 reverting the i686 direct-home rule produces 10 failures on the 32-bit lane;
-reverting the two i686 delegations produces 11 "states no location" failures;
-demanding a location for a register-homed parameter produces the same failure at
-`-O2`. So neither the value, the address, nor the absence rule is vacuous.
+refusing every home produces 56 failures across three checks — 11 per tier "states
+no location", 11 on the 32-bit lane, and one from the debugger lane.
+
+That last control exposed a hole in the debugger lane and closed it: a GDB that
+stops inside the function and resolves *none* of the parameters was reported as
+"skipped: no values", because "the debugger could not run here" and "the debugger
+ran and found nothing" looked alike. They are different answers, and only the
+first is the environment's fault, so the check now distinguishes them by whether
+the breakpoint was reached: at a tier where every parameter has a home, a
+debugger that places none is a failure.
 
 **A defect this item shipped with — found by a debugger, not by its gate.**
 The first version of `parameter_homes` computed `slot + bias` and the gate

@@ -2948,6 +2948,18 @@ def check_debugger_agreement(
     printed = {int(index): int(value)
                for index, value in re.findall(r"^arg(\d+)=(-?\d+)$", proc.stdout, re.MULTILINE)}
     if not printed:
+        # A debugger that ran and stopped inside the function has answered: it
+        # could place none of the parameters, which at a tier that places all of
+        # them is the regression this lane exists for.  A debugger that could not
+        # run at all (no ptrace, no install) has not answered, and the environment
+        # is not the compiler.
+        if required and "Breakpoint 1, " in proc.stdout:
+            report.fail(
+                "debugger",
+                f"{label}: gdb stopped inside pq_args and resolved none of its "
+                f"{len(PARAMETER_BATTERY)} parameters, every one of which has a home at this tier",
+            )
+            return
         reason = next(
             (line.strip() for line in proc.stdout.splitlines()
              if "ptrace" in line or "No such file" in line or "error" in line.lower()),
