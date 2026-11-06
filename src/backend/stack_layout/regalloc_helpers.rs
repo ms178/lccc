@@ -857,11 +857,13 @@ impl ParamAllocaIndex {
         }
     }
 
-    /// Same index, plus the exact number of entry-block instructions examined.
-    /// `build` is the zero-overhead production entry point; this one exists so
-    /// tests and tools can assert the complexity bound instead of timing a CI
-    /// machine.  Both instantiate the SAME algorithm, so the measurement is
-    /// of the shipped code path and not of a test-only copy.
+    /// Same index, plus exact counters for all four bounded resources
+    /// (instruction examinations, heap allocations, chain links and home
+    /// table writes).  `build` is the zero-overhead production entry point;
+    /// this one exists so tests and tools can assert the complexity bounds
+    /// instead of timing a CI machine.  Both instantiate the SAME algorithm,
+    /// so the measurement is of the shipped code path and not of a test-only
+    /// copy.
     pub fn build_with_stats(func: &IrFunction) -> (Self, ParamHomeStats) {
         let mut stats = ParamHomeStats::default();
         let homes = build_homes(func, &mut stats);
@@ -995,9 +997,9 @@ fn aligned_probe<C: ParamHomeCounter>(
 /// shape mapped each home id to a small vector of ordinals: it allocated one
 /// such vector per distinct home id (up to `params` allocations on an
 /// adversarial function) and stored 24-byte vector headers in the table.
-/// The chain stores one
-/// `usize` per entry, needs exactly three allocations regardless of `params`,
-/// and touches contiguous memory while walking the ordinals.
+/// The chain stores one `usize` per UNRESOLVED ordinal, needs exactly three
+/// allocations regardless of `params`, and touches contiguous memory while
+/// walking the ordinals.
 ///
 /// Order within a chain is reverse insertion order, which is immaterial: all
 /// ordinals sharing a home id are filled from the SAME FIRST matching
@@ -1018,9 +1020,11 @@ fn aligned_probe<C: ParamHomeCounter>(
 ///
 /// No ordinal is filled twice, so `unresolved` decrements at most `n - start`
 /// times; `saturating_sub` additionally makes underflow impossible by
-/// construction.  All `homes[o]` / `next[o]` accesses are bounds-checked;
-/// every `o` originates from `head`, which only ever holds ordinals in
-/// `start..n`; `usize::MAX` is the sole chain terminator.  There is no
+/// construction.  All `homes[o]` and `next[o - start]` accesses are
+/// bounds-checked; every `o` originates from `head`, which only ever holds
+/// ordinals in `start..n`, so `o >= start` makes the subtraction total and
+/// `o - start < n - start == next.len()`; `usize::MAX` is the sole chain
+/// terminator.  There is no
 /// `unsafe`, no raw pointer, no lock, no thread-local state and no arithmetic
 /// that can overflow.
 fn general_homes_from<C: ParamHomeCounter>(
