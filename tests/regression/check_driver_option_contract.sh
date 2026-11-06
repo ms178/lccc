@@ -497,4 +497,12 @@ fi
     exit 1
 }
 
-echo "driver option contract: PASS (hosted/freestanding macros, builtin gating, accepted/refused vectorizer and builtin flags, -ftrapv m64/m32 overflow matrix, stack clash probes)"
+# GP-22: execute EVERY ledger row against this exact binary.  A classification
+# that disagrees with the compiler's observable behaviour fails here, in the
+# same lane that already gates the option contract.
+python3 "$repo/scripts/option_effect_ledger.py" --lccc "$CCC" || {
+    echo "FAIL: option-effect ledger disagrees with the built compiler" >&2
+    exit 1
+}
+
+echo "driver option contract: PASS (hosted/freestanding macros, builtin gating, accepted/refused vectorizer and builtin flags, -ftrapv m64/m32 overflow matrix, stack clash probes, executable GP-22 ledger)"

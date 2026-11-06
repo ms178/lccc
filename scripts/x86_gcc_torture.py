@@ -58,6 +58,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -882,10 +883,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     if fatal:
         print("error: " + fatal, file=sys.stderr)
         return 2
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
-        futures = {
-            pool.submit(
-                compile_case if args.mode == "compile" else execute_case,
+    # A runner fault must stop queued work *from the worker side*. Cancelling
+    # futures in the consumer thread is too late: with --jobs=1 a single worker
+    # can dequeue and finish every queued (fast) case before the consumer wakes
+    # up, so `future.cancel()` is a no-op and the "stop the queue" guarantee is
+    # a lie under load (reproduced by delaying as_completed by 50 ms). The
+    # worker sets `abort` in the same thread that raised, before it can dequeue
+    # another case; every subsequent invocation short-circuits to None.
+    abort = threading.Event()
+    aborted = object()  # distinct sentinel: never conflated with a real Result
+
+    def run_case(case):
+        if abort.is_set():
+            return aborted
+        try:
+            return (compile_case if args.mode == "compile" else execute_case)(
                 case,
                 arch=args.arch,
                 lccc=args.lccc,
@@ -898,12 +910,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 append_args=append_args,
                 link_mode=args.link_mode,
                 run_expensive=args.expensive,
-            ): case
-            for case in cases
-        }
+            )
+        except Exception:
+            abort.set()
+            raise
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+        futures = {pool.submit(run_case, case): case for case in cases}
         for index, future in enumerate(concurrent.futures.as_completed(futures), 1):
             try:
                 result = future.result()
+                if result is aborted:
+                    # Work that never started because another case faulted.
+                    continue
             except Exception as exc:  # noqa: BLE001 - the point is to classify
                 # An escaping exception must not abort `main` mid-iteration: the
                 # queued cases would keep running to completion behind it, the last

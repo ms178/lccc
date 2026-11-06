@@ -305,10 +305,25 @@ jobs:
           --gcc gcc-16 \
           --json regression-dbgassert-results.json 2>&1 | tee regression-dbgassert-results.log
     - name: Upload regression results
+      id: upload_debug_regression_results
       if: always()
+      continue-on-error: true
       uses: actions/upload-artifact@v7
       with:
         name: debug-regression-results
+        path: |-
+          regression-dbgassert-results.json
+          regression-dbgassert-results.log
+        if-no-files-found: warn
+    - name: Wait for artifact service recovery
+      if: always() && steps.upload_debug_regression_results.outcome == 'failure'
+      run: sleep 10
+    - name: Retry regression results upload after transient artifact-service failure
+      if: always() && steps.upload_debug_regression_results.outcome == 'failure'
+      uses: actions/upload-artifact@v7
+      with:
+        name: debug-regression-results
+        overwrite: true
         path: |-
           regression-dbgassert-results.json
           regression-dbgassert-results.log
@@ -454,10 +469,26 @@ jobs:
                 print(f"::error title=Regression {name} ({phases})::{detail[:1500]}")
         PY
     - name: Upload regression results
+      id: upload_normal_regression_results
       if: always()
+      continue-on-error: true
       uses: actions/upload-artifact@v7
       with:
         name: normal-regression-results
+        path: |-
+          regression-results.json
+          regression-results.log
+          ci-regression-environment.txt
+        if-no-files-found: warn
+    - name: Wait for artifact service recovery
+      if: always() && steps.upload_normal_regression_results.outcome == 'failure'
+      run: sleep 10
+    - name: Retry regression results upload after transient artifact-service failure
+      if: always() && steps.upload_normal_regression_results.outcome == 'failure'
+      uses: actions/upload-artifact@v7
+      with:
+        name: normal-regression-results
+        overwrite: true
         path: |-
           regression-results.json
           regression-results.log
@@ -3540,6 +3571,18 @@ jobs:
         "$binary" --version | tee intel-evidence/version.txt
         "$binary" -E -dM -x c /dev/null > intel-evidence/macros.txt
         sha256sum "$binary" > intel-evidence/binary.sha256
+    - name: Numeric -O and -Ofast parity against ICX 2026.2, GCC 16.2 and Clang 23.1.5
+      env:
+        CCC: target/fastbuild/lccc
+        GCC16: gcc-16
+      run: |
+        set -euo pipefail
+        trap 'status=$?; if [ "$status" -ne 0 ]; then python3 scripts/ci_annotate_log.py --title "numeric -O / -Ofast four-compiler parity" intel-evidence/o-level-parity.log; fi; exit "$status"' EXIT
+        python3 tests/regression/check_icx_o_level_parity.py \
+          --lccc "$CCC" --gcc "$GCC16" --clang "${CLANG:-clang-23}" \
+          --icx "$LCCC_ICX_BIN" --require-icx \
+          --json intel-evidence/o-level-parity.json \
+          2>&1 | tee intel-evidence/o-level-parity.log
     - name: Enum callback ABI against authenticated ICX, GCC and Clang
       run: |
         set -euo pipefail

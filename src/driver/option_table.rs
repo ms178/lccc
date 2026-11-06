@@ -100,18 +100,24 @@ pub(super) const CONTRACTS: &[Contract] = &[
         rationale: "The conservative interposition assumption is retained: correct code, missed optimisation only.",
         probe_id: Some("probe-interposition-conservative"),
     },
-    // --- GP-22 priority inert set (accepted-and-inert must be proven, not assumed) ---
+    // --- GP-22 priority set ----------------------------------------------
+    // These two are REFUSED, not inert: cli.rs's explicit above-the-fold arm
+    // produces a diagnostic naming the missing gcov emission.  The previous
+    // `Inert` rows contradicted that observable and gave the ledger a false
+    // "accepted with no effect" claim.  scripts/option_effect_ledger.py
+    // executes every row against the built compiler, so this cannot drift
+    // back silently.
     Contract {
         spelling: "-ftest-coverage",
-        class: Class::Inert,
-        rationale: "No .gcno/.gcda emission and no __gcov_* symbols (GP-13 covers real gcov).",
-        probe_id: Some("probe-test-coverage-inert"),
+        class: Class::Refused,
+        rationale: "gcov coverage is not implemented: no .gcno/.gcda and no __gcov_* counters (GP-13).",
+        probe_id: None,
     },
     Contract {
         spelling: "-fprofile-arcs",
-        class: Class::Inert,
-        rationale: "No .gcno/.gcda emission and no __gcov_* symbols (GP-13 covers real gcov).",
-        probe_id: Some("probe-profile-arcs-inert"),
+        class: Class::Refused,
+        rationale: "gcov coverage is not implemented: no .gcno/.gcda and no __gcov_* counters (GP-13).",
+        probe_id: None,
     },
     Contract {
         spelling: "-Wattributes",
@@ -121,21 +127,21 @@ pub(super) const CONTRACTS: &[Contract] = &[
     },
     Contract {
         spelling: "-Ofast",
-        class: Class::Inert,
-        rationale: "Beyond the tolerated tier; -O3 is the highest implemented optimisation level.",
-        probe_id: Some("probe-Ofast-inert"),
+        class: Class::Implemented,
+        rationale: "-O3 with the full -ffast-math umbrella: __FAST_MATH__=1, FP reassociation, fast contraction; a packed reduction vectorizes.",
+        probe_id: Some("probe-Ofast-fast-math"),
     },
     Contract {
         spelling: "-Og",
-        class: Class::Inert,
-        rationale: "No debug-aware optimisation mode is implemented; -O0 is the debug baseline.",
-        probe_id: Some("probe-Og-inert"),
+        class: Class::Implemented,
+        rationale: "-O1 codegen with optimize_debug=true and frame-pointer omission: __OPTIMIZE__=1; distinct from -O2 on the probe.",
+        probe_id: Some("probe-Og-debug-opt"),
     },
     Contract {
         spelling: "-static-pie",
-        class: Class::Inert,
-        rationale: "Produces ET_EXEC (no ASLR), not a static PIE; the warning documents this.",
-        probe_id: Some("probe-static-pie-inert"),
+        class: Class::Refused,
+        rationale: "Static PIE link layout requires special crt objects and is not supported by the driver.",
+        probe_id: None,
     },
     Contract {
         spelling: "-pedantic",
@@ -245,15 +251,36 @@ mod tests {
             Class::Inert
         );
         assert!(lookup("-fdefinitely-not-a-flag").is_none());
-        // Every Inert entry must carry a probe_id.
+        // Every accepted option carries a probe id; a refused one must not
+        // (there is no effect to observe).  scripts/option_effect_ledger.py
+        // additionally executes each row against the built compiler, so a
+        // row that merely *looks* right cannot survive.
+        let mut probes = std::collections::HashSet::new();
         for c in CONTRACTS {
-            if c.class == Class::Inert {
-                assert!(
+            match c.class {
+                Class::Inert | Class::Implemented => assert!(
                     c.probe_id.is_some(),
-                    "{}: inert contract needs a probe_id",
+                    "{}: accepted contract needs a probe_id",
                     c.spelling
-                );
+                ),
+                Class::Refused => assert!(
+                    c.probe_id.is_none(),
+                    "{}: refused contract must not carry a probe_id",
+                    c.spelling
+                ),
             }
+            if let Some(probe) = c.probe_id {
+                assert!(probes.insert(probe), "duplicate probe_id {probe}");
+            }
+        }
+        // The five rows corrected by the GP-22 executable-ledger audit.  A
+        // classification that contradicts observable behaviour is a lie in
+        // the trust ledger, so it is pinned here as well as in the gate.
+        for flag in ["-ftest-coverage", "-fprofile-arcs", "-static-pie"] {
+            assert_eq!(lookup(flag).unwrap().class, Class::Refused, "{flag}");
+        }
+        for flag in ["-Ofast", "-Og"] {
+            assert_eq!(lookup(flag).unwrap().class, Class::Implemented, "{flag}");
         }
     }
 }

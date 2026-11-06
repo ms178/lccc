@@ -61,6 +61,17 @@ FIXTURES = {
         "int proto_def() { return 0; }\n"
         "void proto_nested(int (*cb)());\n"
     ),
+    # A packed FP reduction: reassociation is observable here. The scalar
+    # probe below has no reduction, so -O3/-Ofast/-O3 -ffast-math all emit
+    # identical bytes on it and a composition check that uses ONLY that probe
+    # is vacuous. Measured on x86-64 with GCC 16.2.0 and LCCC 16.2.0.
+    "fastmath.c": (
+        "double fp_reduce(const double *p, int n) {\n"
+        "    double s = 0.0;\n"
+        "    for (int i = 0; i < n; i++) s += p[i];\n"
+        "    return s;\n"
+        "}\n"
+    ),
     "noplt.c": (
         "extern void nf(void) __attribute__((noplt));\n"
         "extern void pf(void);\n"
@@ -99,6 +110,13 @@ def asm(compiler: list[str], source: Path, *flags: str) -> str:
 
 def compile_obj(compiler: list[str], source: Path, *flags: str, out: Path) -> subprocess.CompletedProcess:
     return run(compiler, *flags, "-c", str(source), "-o", str(out), cwd=source.parent)
+
+
+def fast_math_macro(compiler: list[str], source: Path, *flags: str) -> bool:
+    proc = run(compiler, *flags, "-dM", "-E", str(source), cwd=source.parent)
+    if proc.returncode:
+        raise RuntimeError(f"macro probe failed: {compiler} {flags}: {proc.stderr[:300]}")
+    return "__FAST_MATH__" in proc.stdout
 
 
 def main() -> int:
@@ -142,6 +160,7 @@ def main() -> int:
         div_quiet_c = base / "divquiet.c"
         proto_c = base / "proto.c"
         noplt_c = base / "noplt.c"
+        fast_c = base / "fastmath.c"
 
         # --- effect: -fwhole-program internalises (GP-16's verified row) ---
         need("-fwhole-program")
@@ -181,15 +200,118 @@ def main() -> int:
             print("ledger -Og: PASS (LCCC == -O1 everywhere; GCC scalar probe agrees)")
 
         # --- composition: -Ofast == -O3 + fast-math, both compilers -------
+        # `opt.c` cannot discriminate: with no reduction to reassociate,
+        # -O3, -Ofast and -O3 -ffast-math emit identical bytes. Checking only
+        # that probe once let -Ofast set the __FAST_MATH__ macro without
+        # setting fp_reassoc, so the fast-math pipeline stayed off. The
+        # inequality rows below are non-vacuity controls: if either compiler
+        # stops showing a fast-math delta on `fastmath.c`, the equality rows
+        # are meaningless and the gate must fail.
         need("-Ofast")
-        if asm(lccc, opt, "-Ofast") != asm(lccc, opt, "-O3", "-ffast-math"):
-            failures.append("-Ofast: LCCC -Ofast != -O3 -ffast-math")
-        if asm(gcc, opt, "-Ofast") != asm(gcc, opt, "-O3"):
-            failures.append("-Ofast: GCC -Ofast != -O3 on the probe (oracle drift)")
+        for fixture in (opt, fast_c):
+            composed = asm(lccc, fixture, "-O3", "-ffast-math")
+            if asm(lccc, fixture, "-Ofast") != composed:
+                failures.append(
+                    f"-Ofast: LCCC -Ofast != -O3 -ffast-math on {fixture.name}")
+            if asm(gcc, fixture, "-Ofast") != asm(gcc, fixture, "-O3", "-ffast-math"):
+                failures.append(
+                    f"-Ofast: GCC -Ofast != -O3 -ffast-math on {fixture.name} (oracle drift)")
+        if asm(lccc, fast_c, "-O3") == asm(lccc, fast_c, "-Ofast"):
+            failures.append(
+                "-Ofast: LCCC composition check is vacuous (no fast-math codegen delta)")
+        if asm(gcc, fast_c, "-O3") == asm(gcc, fast_c, "-Ofast"):
+            failures.append(
+                "-Ofast: GCC composition check is vacuous (oracle drift)")
         if asm(lccc, opt, "-Ofast") == asm(lccc, opt):
             failures.append("-Ofast: LCCC artifact unchanged from default")
         if not any(f.startswith("-Ofast") for f in failures):
-            print("ledger -Ofast: PASS (== -O3 -ffast-math; differs from default)")
+            print("ledger -Ofast: PASS (== -O3 -ffast-math on scalar and packed "
+                  "reduction; non-vacuous)")
+
+        # --- -Ofast fast-math belongs to the -O level, not the flag list ----
+        # GCC 16.2 and Clang 23.1 both withdraw -Ofast's implicit fast-math
+        # when a later plain -O* option is seen, but keep an EXPLICIT
+        # -ffast-math sticky. Macro state alone is not enough: on the packed
+        # reduction we also require byte-identical codegen with the plain
+        # level (or level + -ffast-math), so a compiler that leaves one of
+        # the six umbrella fields behind cannot pass.
+        # (flags, final level, expected fast-math, GCC oracle macro)
+        order_matrix = (
+            (("-Ofast",), "-Ofast", True, True),
+            (("-Ofast", "-O2"), "-O2", False, False),
+            (("-Ofast", "-O3"), "-O3", False, False),
+            (("-Ofast", "-O0"), "-O0", False, False),
+            (("-Ofast", "-O1"), "-O1", False, False),
+            (("-Ofast", "-Os"), "-Os", False, False),
+            (("-Ofast", "-Oz"), "-Oz", False, False),
+            (("-Ofast", "-Og"), "-Og", False, False),
+            (("-O2", "-Ofast"), "-Ofast", True, True),
+            (("-Ofast", "-O2", "-Ofast"), "-Ofast", True, True),
+            (("-Ofast", "-ffast-math", "-O2"), "-O2", True, True),
+            (("-Ofast", "-O2", "-ffast-math"), "-O2", True, True),
+            (("-O3", "-ffast-math", "-O2"), "-O2", True, True),
+            (("-Ofast", "-fno-fast-math", "-O2"), "-O2", False, False),
+            (("-Ofast", "-fno-fast-math", "-ffast-math"), "-Ofast", True, True),
+            # GCC honours an explicit opt-out even across -Ofast; Clang 23.1
+            # disagrees (measured). LCCC follows GCC: an explicit opt-out of
+            # unsafe FP math must never be silently revoked.
+            (("-fno-fast-math", "-Ofast"), "-Ofast", False, False),
+            (("-Ofast", "-fno-fast-math", "-Ofast"), "-Ofast", False, False),
+        )
+        if asm(lccc, fast_c, "-O2") == asm(lccc, fast_c, "-O2", "-ffast-math"):
+            failures.append("-Ofast order: reduction fixture is vacuous")
+        for flags, level, expected, gcc_expected in order_matrix:
+            label = " ".join(flags)
+            if fast_math_macro(lccc, fast_c, *flags) != expected:
+                failures.append(f"-Ofast order: LCCC macro wrong for {label}")
+            if fast_math_macro(gcc, fast_c, *flags) != gcc_expected:
+                failures.append(f"-Ofast order: GCC oracle drift for {label}")
+            if level not in ("-O2", "-O3", "-Ofast"):
+                # At -O0/-O1/-Os/-Oz/-Og the vectorizer does not run, so the
+                # macro is the only observable on this fixture (measured).
+                continue
+            if level == "-Ofast":
+                reference = ("-O3", "-ffast-math") if expected else ("-O3",)
+            else:
+                reference = (level, "-ffast-math") if expected else (level,)
+            if asm(lccc, fast_c, *flags) != asm(lccc, fast_c, *reference):
+                failures.append(
+                    f"-Ofast order: LCCC {label} != {' '.join(reference)}")
+        if not any(f.startswith("-Ofast order") for f in failures):
+            print(f"ledger -Ofast order: PASS ({len(order_matrix)} vectors, "
+                  "macro + codegen + GCC oracle)")
+
+        # --- numeric -O<n> is a real level, not a tolerated no-op ----------
+        # Before this row, -O4 fell through to the generic unknown handler and
+        # emitted the *unoptimized* default with only a warning (measured on
+        # the reduction: 8ffb18df vs -O3 189a4c8373a1). GCC 16.2 and
+        # Clang 23.1 both clamp n>=3 to their own -O3.
+        o3 = asm(lccc, fast_c, "-O3")
+        for level in ("-O4", "-O5", "-O9", "-O10", "-O2147483647",
+                      "-O0000000000000000000000004"):
+            probe = run(lccc, level, "-S", str(fast_c), "-o", "-", cwd=base)
+            if probe.returncode or probe.stdout != o3:
+                failures.append(f"-O<n>: LCCC {level} != -O3 (rc={probe.returncode})")
+            if probe.stderr:
+                failures.append(f"-O<n>: LCCC {level} emitted a diagnostic: "
+                                f"{probe.stderr[:120]!r}")
+            if fast_math_macro(lccc, fast_c, level):
+                failures.append(f"-O<n>: {level} wrongly enables fast-math")
+        if asm(gcc, fast_c, "-O4") != asm(gcc, fast_c, "-O3"):
+            failures.append("-O<n>: GCC -O4 != -O3 (oracle drift)")
+        for bad in ("-O-1", "-O+2", "-O2x", "-O2147483648",
+                    "-O4294967296", "-Ofast=3"):
+            probe = run(lccc, bad, "-S", str(fast_c), "-o", "-", cwd=base)
+            if probe.returncode == 0:
+                failures.append(f"-O<n>: malformed {bad} was accepted")
+            elif "unrecognized command-line option" not in probe.stderr:
+                failures.append(f"-O<n>: malformed {bad} had no named verdict")
+        if (asm(lccc, fast_c, "-Ofast", "-O4") != o3
+                or fast_math_macro(lccc, fast_c, "-Ofast", "-O4")):
+            failures.append("-O<n>: -Ofast -O4 did not withdraw fast-math")
+        if not any(f.startswith("-O<n>") for f in failures):
+            print("ledger -O<n>: PASS (6 clamped levels, 6 malformed refusals, "
+                  "no warning, GCC oracle, -Ofast withdrawal)")
 
         # --- refusal: coverage flags (GP-13's honest refusal) ---------------
         # GCC's side is recorded as the divergence: -ftest-coverage writes a
