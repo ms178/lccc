@@ -1726,17 +1726,26 @@ pub(crate) fn run_passes(
     // the policy every TLS model decision in the pipeline is made under.
     tls_floor: Option<crate::ir::reexports::TlsModel>,
 ) {
-    let policy = crate::common::pass_policy::PassPolicy::new(
-        wrap_signed_overflow,
-        fp_environment_observable,
-    );
     for func in &mut module.functions {
-        // Re-stamp the two command-line semantics this entry owns; the
-        // builtin policy is a per-TU fact `builtin_policy::apply` already
-        // derived from the definitions after lowering, and resetting it here
-        // would let loop_memset turn the TU's own `memset` loop into a
-        // `call memset` (infinite recursion).
-        func.pass_policy = policy.with_builtins(func.pass_policy.builtins);
+        // Re-stamp ONLY the two command-line semantics this entry owns.
+        //
+        // Writing the two fields instead of installing a freshly built
+        // `PassPolicy` is what makes that ownership *structural* rather than
+        // a comment: every other field survives by construction. The previous
+        // `PassPolicy::new(wrap, fenv).with_builtins(func.pass_policy.builtins)`
+        // silently reset every field the lowerer had resolved and that this
+        // entry did not know about -- notably `finite_math_only`, which the
+        // driver stamps during lowering. It was latent only because no pass
+        // read the flag yet; the first pass that does would have seen `false`
+        // on every function under `-ffinite-math-only` / `-Ofast`.
+        //
+        // The builtin policy stays untouched for the same reason: it is a
+        // per-TU fact `builtin_policy::apply` derived from the definitions
+        // after lowering, and resetting it here would let loop_memset turn
+        // the TU's own `memset` loop into a `call memset` (infinite
+        // recursion).
+        func.pass_policy.wrap_signed_overflow = wrap_signed_overflow;
+        func.pass_policy.fp_environment_observable = fp_environment_observable;
     }
     let fp_reassoc = fp_reassoc && !fp_environment_observable;
     let fp_contract = if fp_environment_observable {

@@ -131,6 +131,35 @@ pub(super) const CONTRACTS: &[Contract] = &[
         rationale: "-O3 with the full -ffast-math umbrella: __FAST_MATH__=1, FP reassociation, fast contraction; a packed reduction vectorizes.",
         probe_id: Some("probe-Ofast-fast-math"),
     },
+    // --- Origin-aware fast-math sub-options (2026-11-06) --------------------
+    // These three have an observable effect in ISOLATION, so the ledger's
+    // single-option probe can verify them on each of the four arch drivers.
+    // Their counterparts (-fno-fast-math, -fno-finite-math-only,
+    // -fmath-errno, -fno-math-errno's inverse, -f{no-,}rounding-math,
+    // -f{no-,}trapping-math, -f{no-,}associative-math) are explicit cli.rs
+    // arms whose effect is only visible relative to a preceding fast-math
+    // umbrella; declaring them Inert here would be a false claim. Their
+    // order-dependent state machine is pinned exhaustively by
+    // tests/corpus/test_fast_math_contracts.py (44 flag vectors against
+    // GCC 16.2 and Clang 23.1.5) instead.
+    Contract {
+        spelling: "-ffast-math",
+        class: Class::Implemented,
+        rationale: "Hard umbrella: __FAST_MATH__=1, __FINITE_MATH_ONLY__=1, __NO_MATH_ERRNO__=1 and FP reassociation/vectorization.",
+        probe_id: Some("probe-ffast-math-macro"),
+    },
+    Contract {
+        spelling: "-ffinite-math-only",
+        class: Class::Implemented,
+        rationale: "Assumes no NaN/Inf: __FINITE_MATH_ONLY__=1 and folds the four FP classification builtins to constants while keeping argument side effects.",
+        probe_id: Some("probe-finite-math-only-macro"),
+    },
+    Contract {
+        spelling: "-fno-math-errno",
+        class: Class::Implemented,
+        rationale: "Sets __NO_MATH_ERRNO__=1 and disables errno-setting math calls.",
+        probe_id: Some("probe-no-math-errno-macro"),
+    },
     Contract {
         spelling: "-Og",
         class: Class::Implemented,
