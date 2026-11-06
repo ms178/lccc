@@ -252,14 +252,15 @@ impl RiscvCodegen {
                 factor.and_then(|(x, c)| mul_plan(c, mul_width(ty)).map(|plan| (x, plan)))
             {
                 let w = if use_32bit { "w" } else { "" };
-                let (k, combine) = match plan {
-                    MulPlan::AddShifted(k) => (k, format!("add{w} t0, t1, t0")),
-                    MulPlan::ShiftedMinus(k) => (k, format!("sub{w} t0, t1, t0")),
-                    MulPlan::MinusShifted(k) => (k, format!("sub{w} t0, t0, t1")),
+                let (k, op, operands) = match plan {
+                    MulPlan::AddShifted(k) => (k, "add", "t1, t0"),
+                    MulPlan::ShiftedMinus(k) => (k, "sub", "t1, t0"),
+                    MulPlan::MinusShifted(k) => (k, "sub", "t0, t1"),
                 };
                 self.operand_to_t0(x);
                 self.state.emit_fmt(format_args!("    slli t1, t0, {k}"));
-                self.state.emit_fmt(format_args!("    {combine}"));
+                self.state
+                    .emit_fmt(format_args!("    {op}{w} t0, {operands}"));
                 self.state.reg_cache.invalidate_acc();
                 self.store_t0_to(dest);
                 return;
