@@ -127,11 +127,14 @@ impl ArmCodegen {
                 return;
             }
         }
-        if self.state.get_slot(dest.0).is_none() {
+        // Straight from x18, not through the x0 accumulator: the chain is
+        // read at entry, before the parameters' `ParamRef`s, so x0 still
+        // holds the first argument (torture execute/921017-1.c at -O0:
+        // `g(i)` indexed its parent's array with the chain pointer).
+        let Some(slot) = self.state.get_slot(dest.0) else {
             return;
-        }
-        self.state.emit("    mov x0, x18");
-        self.store_x0_to(dest);
+        };
+        self.emit_store_to_sp("x18", slot.0, "str");
         self.state.reg_cache.invalidate_all();
     }
 

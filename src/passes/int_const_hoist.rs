@@ -17,7 +17,9 @@ use super::loop_analysis;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::analysis;
-use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
+use crate::ir::reexports::{
+    Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Terminator, Value,
+};
 use std::cell::Cell;
 
 /// Target immediate-encoding model that drives the hoist decision. One
@@ -33,10 +35,10 @@ pub(crate) enum ImmModel {
     /// AArch64: add/sub/cmp take imm12 (0..=4095) / cmn (-4095..=-1);
     /// mul has no immediate form at all.
     Aarch64,
-    /// RISC-V (RV64): no ALU immediate reaches this pass's operand forms
-    /// beyond imm12 — every integer constant materializes through `li`
-    /// (register-form-only emitters), and `li` itself is one `addi` inside
-    /// [-2048, 2047] and a `lui`+`addi` pair outside it.
+    /// RISC-V (RV64): add/sub/logical/shift forms take imm12 in place;
+    /// multiply/divide/remainder/compare take none, so their constants are
+    /// staged with `li` -- one `addi` inside [-2048, 2047], a `lui`+`addi`
+    /// pair outside it.
     Riscv,
 }
 
@@ -59,6 +61,92 @@ pub(crate) fn model_for(target: crate::backend::Target) -> Option<ImmModel> {
         crate::backend::Target::Riscv64 => Some(ImmModel::Riscv),
         crate::backend::Target::X86_64 => Some(ImmModel::X86_64),
         _ => None,
+    }
+}
+
+/// Whether an operand position can encode a constant in place, which the
+/// hoist criterion ([`large_int_const_in`]) weighs against the constant.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RegNeed {
+    /// The position has an immediate form (within the target's range).
+    Imm,
+    /// The position has no immediate form at all: div/rem everywhere, mul
+    /// on AArch64 and RISC-V.
+    Reg,
+    /// A RISC-V compare operand. A compare fused into a branch compares two
+    /// registers; a materialized boolean compares in place exactly when the
+    /// backend has an I-type form for the constant
+    /// (`riscv::codegen::cmp_needs_no_register`).
+    RiscvCmp {
+        op: IrCmpOp,
+        const_on_rhs: bool,
+        ty: IrType,
+        branch: bool,
+    },
+}
+
+impl RegNeed {
+    /// Whether this position stages the constant `c` in a register.
+    fn for_const(self, c: &IrConst) -> bool {
+        match self {
+            RegNeed::Imm => false,
+            RegNeed::Reg => true,
+            RegNeed::RiscvCmp {
+                op,
+                const_on_rhs,
+                ty,
+                branch,
+            } => {
+                branch
+                    || !crate::backend::riscv::codegen::cmp_needs_no_register(
+                        op,
+                        const_on_rhs,
+                        c,
+                        ty,
+                    )
+            }
+        }
+    }
+}
+
+/// The compares of `func` whose boolean may feed a conditional branch:
+/// the value a `CondBranch` tests, followed back through `Copy` and integer
+/// `Cast` (the chain the backends' compare-branch fusion follows). A superset
+/// of the fused compares on purpose -- misclassifying a fused compare as
+/// materialized would leave its constant un-hoisted, a `li` per branch.
+fn branch_compares(func: &IrFunction) -> FxHashSet<u32> {
+    let mut tested: FxHashSet<u32> = func
+        .blocks
+        .iter()
+        .filter_map(|b| match &b.terminator {
+            Terminator::CondBranch {
+                cond: Operand::Value(v),
+                ..
+            } => Some(v.0),
+            _ => None,
+        })
+        .collect();
+    loop {
+        let before = tested.len();
+        for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+            match inst {
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Value(src),
+                }
+                | Instruction::Cast {
+                    dest,
+                    src: Operand::Value(src),
+                    ..
+                } if tested.contains(&dest.0) => {
+                    tested.insert(src.0);
+                }
+                _ => {}
+            }
+        }
+        if tested.len() == before {
+            return tested;
+        }
     }
 }
 
@@ -131,12 +219,37 @@ pub(crate) fn const_homes(func: &IrFunction, model: ImmModel) -> FxHashSet<u32> 
     if consts.is_empty() {
         return homes;
     }
+    let branch_cmps = branch_compares(func);
     for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
-        for_each_int_operand_in(model, inst, &mut |op, needs_reg, imm32_exact| {
+        // Whether value `v`, holding `c`, is the factor of a multiply the
+        // backend expands once `c` is forwarded into it.
+        let expanded_factor = |v: u32, c: &IrConst| match inst {
+            Instruction::BinOp {
+                op: IrBinOp::Mul,
+                lhs,
+                rhs,
+                ty,
+                ..
+            } => {
+                let other = if matches!(lhs, Operand::Value(x) if x.0 == v) {
+                    rhs
+                } else {
+                    lhs
+                };
+                const_bits(other).is_none()
+                    && const_bits(&Operand::Const(*c))
+                        .is_some_and(|bits| mul_expanded(model, bits, *ty))
+            }
+            _ => false,
+        };
+        for_each_int_operand_in(model, &branch_cmps, inst, &mut |op, need, imm32_exact| {
             if let Operand::Value(v) = op {
                 if let Some(Some(c)) = consts.get(&v.0) {
+                    if expanded_factor(v.0, c) {
+                        return;
+                    }
                     let op = Operand::Const(*c);
-                    if large_int_const_in(model, &op, needs_reg, imm32_exact).is_some() {
+                    if large_int_const_in(model, &op, need, imm32_exact).is_some() {
                         homes.insert(v.0);
                     }
                 }
@@ -165,6 +278,9 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     if loops.is_empty() {
         return 0;
     }
+    // Rewriting operands touches neither compare destinations nor
+    // terminators, so one census serves every loop.
+    let branch_cmps = branch_compares(func);
     // Outermost first so constants used by nested loops hoist as far out as
     // possible and inner loops can reuse the dominating value.
     loops.sort_by_key(|l| l.body.len());
@@ -177,8 +293,8 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
             let mut set = FxHashSet::default();
             for &bi in &lp.body {
                 for inst in &func.blocks[bi].instructions {
-                    for_each_int_operand(inst, &mut |op, needs_reg, imm32_exact| {
-                        if let Some(bits) = large_int_const(op, needs_reg, imm32_exact) {
+                    for_each_int_operand(&branch_cmps, inst, &mut |op, need, imm32_exact| {
+                        if let Some(bits) = large_int_const(op, need, imm32_exact) {
                             set.insert(bits);
                         }
                     });
@@ -202,8 +318,8 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         let mut seen: FxHashSet<u64> = FxHashSet::default();
         for &bi in &lp.body {
             for inst in &func.blocks[bi].instructions {
-                for_each_int_operand(inst, &mut |op, needs_reg, imm32_exact| {
-                    if let Some(bits) = large_int_const(op, needs_reg, imm32_exact) {
+                for_each_int_operand(&branch_cmps, inst, &mut |op, need, imm32_exact| {
+                    if let Some(bits) = large_int_const(op, need, imm32_exact) {
                         if seen.insert(bits) {
                             consts.push(bits);
                         }
@@ -252,7 +368,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
             // Rewrite uses within the loop body.
             for &bi in &lp.body {
                 for inst in &mut func.blocks[bi].instructions {
-                    rewrite_int_operands(inst, bits, new_val);
+                    rewrite_int_operands(model, inst, bits, new_val);
                 }
             }
         }
@@ -285,11 +401,12 @@ fn leaf_subloops(loops: &[loop_analysis::NaturalLoop]) -> Vec<Vec<usize>> {
 
 /// Whether `run` would hoist anything for this loop.
 fn loop_has_candidate(func: &IrFunction, lp: &loop_analysis::NaturalLoop) -> bool {
+    let branch_cmps = branch_compares(func);
     let mut found = false;
     for &bi in &lp.body {
         for inst in &func.blocks[bi].instructions {
-            for_each_int_operand(inst, &mut |op, needs_reg, imm32_exact| {
-                found |= large_int_const(op, needs_reg, imm32_exact).is_some();
+            for_each_int_operand(&branch_cmps, inst, &mut |op, need, imm32_exact| {
+                found |= large_int_const(op, need, imm32_exact).is_some();
             });
             if found {
                 return true;
@@ -313,25 +430,27 @@ fn loop_has_candidate(func: &IrFunction, lp: &loop_analysis::NaturalLoop) -> boo
 ///   *verbatim*, so the unsigned half `[2^31, 2^32)` is free too and must not
 ///   be hoisted. This covers essentially every hash multiplier in existence
 ///   (0x9E3779B1, 0x85EBCA77, 0xCC9E2D51, 0x1B873593).
-/// * RISC-V (RV64): the ALU emitters are register-form-only, so every
-///   constant pays a `li` materialization per iteration; inside imm12
-///   ([-2048, 2047]) `li` is a single `addi` (free in place), outside it a
-///   `lui`+`addi` pair (hoist — the RISC-V analogue of AArch64's under-hoist
-///   before fix B: RISC-V previously never ran this pass at all).
+/// * RISC-V (RV64): add/sub/logical/shift positions take an imm12
+///   ([-2048, 2047]) operand in place; outside it a constant pays a
+///   `lui`+`addi` pair per iteration (hoist). Multiply, divide, remainder
+///   and compare have no immediate form, so there even an imm12 constant
+///   pays a `li` per iteration (hoist) -- unless it is zero (`x0`) or a
+///   multiplier the backend expands into a shift and an add, which never
+///   reaches this function.
 ///
 /// `imm32_exact` says the consuming instruction encodes a *verbatim* imm32 bit
 /// pattern (x86-64 32-bit ALU/imul/cmp forms) rather than sign-extending it.
 ///
 /// Returns the value as u64 bits.
-fn large_int_const(op: &Operand, needs_reg: bool, imm32_exact: bool) -> Option<u64> {
-    large_int_const_in(MODEL.with(|c| c.get()), op, needs_reg, imm32_exact)
+fn large_int_const(op: &Operand, need: RegNeed, imm32_exact: bool) -> Option<u64> {
+    large_int_const_in(MODEL.with(|c| c.get()), op, need, imm32_exact)
 }
 
 /// [`large_int_const`] under an explicit model.
 fn large_int_const_in(
     model: ImmModel,
     op: &Operand,
-    needs_reg: bool,
+    need: RegNeed,
     imm32_exact: bool,
 ) -> Option<u64> {
     let v: i64 = match op {
@@ -341,27 +460,27 @@ fn large_int_const_in(
         Operand::Const(IrConst::I64(v)) => *v,
         _ => return None,
     };
+    let needs_reg = match op {
+        Operand::Const(c) => need.for_const(c),
+        Operand::Value(_) => return None,
+    };
     if model == ImmModel::Riscv {
-        // RISC-V: the backend stages EVERY integer constant through `li`
-        // (the ALU emitters are register-form only — there is no imm32
-        // bit-pattern relaxation and no position without materialization),
-        // so the only cost axis is `li`'s own expansion: imm12 is a single
-        // `addi` (free in place — hoisting such a constant trades a free
-        // one-instruction materialization for a register live across the
-        // whole loop, the exact x86 "one movl is cheaper" rule), while
-        // anything outside imm12 costs `lui`+`addi` on EVERY iteration —
-        // the movz/movk-class per-iteration waste this pass exists to
-        // remove. The `needs_reg`/`imm32_exact` axes are x86/AArch64
-        // distinctions that do not exist here: the rule is uniform across
-        // operand positions.
+        // RISC-V: add/sub/and/or/xor and the shifts take an imm12 operand
+        // in place (`riscv::codegen::alu::immediate_form`), so there an
+        // imm12 constant is free and only a wider one costs `lui`+`addi` on
+        // EVERY iteration -- the movz/movk-class per-iteration waste this
+        // pass exists to remove. A position with no immediate form at all
+        // (`needs_reg`: multiply, divide, remainder, compare) stages even an
+        // imm12 constant with a `li` per iteration, which one register
+        // across the loop removes; multipliers the backend expands into a
+        // shift and an add never reach `for_each_int_operand_in`'s callback,
+        // and zero is the `x0` register everywhere.
         //
-        // PREMISE: "one addi is free" holds relative to the CURRENT
-        // register-form-only emitters. If the RISC-V backend ever grows
-        // `addi`/`andi`/`slti` immediate folds (like x86's imm32 forms), an
-        // in-place imm12 becomes strictly cheaper than a hoisted register
-        // even in short loops — revisit this arm then.
-        if (-2048..=2047).contains(&v) {
-            return None; // `li` = one addi — free in place
+        // A materialized compare whose constant an I-type form holds
+        // (`xori`/`slti`/`sltiu`, see `RegNeed::RiscvCmp`) is not a
+        // register position; a compare fused into a branch still is.
+        if v == 0 || ((-2048..=2047).contains(&v) && !needs_reg) {
+            return None; // `x0`, or an I-type immediate -- free in place
         }
         return Some(v as u64);
     }
@@ -414,33 +533,61 @@ fn large_int_const_in(
     Some(v as u64)
 }
 
+/// An integer constant operand as sign-extended 64-bit bits.
+fn const_bits(op: &Operand) -> Option<u64> {
+    match op {
+        Operand::Const(IrConst::I8(v)) => Some(i64::from(*v) as u64),
+        Operand::Const(IrConst::I16(v)) => Some(i64::from(*v) as u64),
+        Operand::Const(IrConst::I32(v)) => Some(i64::from(*v) as u64),
+        Operand::Const(IrConst::I64(v)) => Some(*v as u64),
+        _ => None,
+    }
+}
+
+/// Whether the `model` backend multiplies a `ty` value by the constant `c`
+/// with shifted adds and no register for `c`.
+fn mul_expanded(model: ImmModel, c: u64, ty: IrType) -> bool {
+    match model {
+        ImmModel::Aarch64 => crate::backend::arm::codegen::mul_needs_no_constant(c, ty),
+        ImmModel::Riscv => crate::backend::riscv::codegen::mul_needs_no_constant(c, ty),
+        ImmModel::X86_64 => false,
+    }
+}
+
 /// Visit operands of the instruction forms with range-limited immediate encodings.
 /// `needs_reg` is true when the operand position has NO immediate encoding at
-/// all (div/rem on both targets; mul on AArch64), so even a small constant
-/// pays a materialization there (Lev Kropp's 558e3ed9 insight, generalized
-/// per target).
-fn for_each_int_operand(inst: &Instruction, f: &mut dyn FnMut(&Operand, bool, bool)) {
-    for_each_int_operand_in(MODEL.with(|c| c.get()), inst, f);
+/// all (div/rem on every target; mul on AArch64 and RISC-V), so even a small
+/// constant pays a materialization there (Lev Kropp's 558e3ed9 insight,
+/// generalized per target). A multiplier the target expands into shifted
+/// adds is not visited at all.
+fn for_each_int_operand(
+    branch_cmps: &FxHashSet<u32>,
+    inst: &Instruction,
+    f: &mut dyn FnMut(&Operand, RegNeed, bool),
+) {
+    for_each_int_operand_in(MODEL.with(|c| c.get()), branch_cmps, inst, f);
 }
 
 /// [`for_each_int_operand`] under an explicit immediate model.
+/// `branch_cmps` is the function's [`branch_compares`].
 fn for_each_int_operand_in(
     model: ImmModel,
+    branch_cmps: &FxHashSet<u32>,
     inst: &Instruction,
-    f: &mut dyn FnMut(&Operand, bool, bool),
+    f: &mut dyn FnMut(&Operand, RegNeed, bool),
 ) {
     match inst {
         Instruction::BinOp {
             op, lhs, rhs, ty, ..
         } => {
-            let needs_reg = match op {
-                IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem => true,
-                // AArch64 `mul` has no immediate form while its neighbours
-                // take imm12, so a small constant is a materialization ONLY
-                // at that position. RISC-V has no immediate forms anywhere
-                // (uniform `li` staging), so `mul` is not special there.
-                IrBinOp::Mul => model == ImmModel::Aarch64,
-                _ => false,
+            let need = match op {
+                IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem => RegNeed::Reg,
+                // AArch64 and RISC-V `mul` have no immediate form while
+                // their neighbours take imm12, so a small constant is a
+                // materialization ONLY at that position. x86-64 `imul`
+                // takes an imm32.
+                IrBinOp::Mul if model != ImmModel::X86_64 => RegNeed::Reg,
+                _ => RegNeed::Imm,
             };
             // Shift counts are a separate encoding (imm8 / %cl) and never take
             // a 32-bit immediate, so they get no bit-pattern relaxation.
@@ -452,16 +599,50 @@ fn for_each_int_operand_in(
                     | IrBinOp::RotateLeft
                     | IrBinOp::RotateRight
             ) && matches!(ty, IrType::I32 | IrType::U32);
-            f(lhs, needs_reg, imm32_exact);
-            f(rhs, needs_reg, imm32_exact);
+            // A multiplier the backend expands into shifted adds is no
+            // materialization at any size: hoisted into a register it would
+            // turn the expansion back into a multiply (see each backend's
+            // `mul_needs_no_constant`). A constant times a constant is a
+            // fold the IR did not do, so a factor only stands next to a
+            // non-constant operand.
+            let expanded = |factor: &Operand, other: &Operand| {
+                *op == IrBinOp::Mul
+                    && const_bits(other).is_none()
+                    && const_bits(factor).is_some_and(|c| mul_expanded(model, c, *ty))
+            };
+            if !expanded(lhs, rhs) {
+                f(lhs, need, imm32_exact);
+            }
+            if !expanded(rhs, lhs) {
+                f(rhs, need, imm32_exact);
+            }
         }
-        Instruction::Cmp { lhs, rhs, ty, .. } => {
+        Instruction::Cmp {
+            dest,
+            op,
+            lhs,
+            rhs,
+            ty,
+        } => {
             // `cmpl $imm32` takes the bit pattern verbatim (comparison.rs
             // computes `use_32bit` from the same type). Narrower compares use
             // imm8/imm16 and get no relaxation.
             let imm32_exact = matches!(ty, IrType::I32 | IrType::U32);
-            f(lhs, false, imm32_exact);
-            f(rhs, false, imm32_exact);
+            // RISC-V branches compare two registers, so every operand of a
+            // branch compare but zero (`x0`) is a `li` per evaluation --
+            // `i < 100` cost a `li` on every iteration of its loop. A
+            // materialized boolean takes `xori`/`slti`/`sltiu` in place.
+            let need = |const_on_rhs: bool| match model {
+                ImmModel::Riscv => RegNeed::RiscvCmp {
+                    op: *op,
+                    const_on_rhs,
+                    ty: *ty,
+                    branch: branch_cmps.contains(&dest.0),
+                },
+                _ => RegNeed::Imm,
+            };
+            f(lhs, need(false), imm32_exact);
+            f(rhs, need(true), imm32_exact);
         }
         _ => {}
     }
@@ -469,8 +650,26 @@ fn for_each_int_operand_in(
 
 /// Replace operands equal to the constant `bits` with the hoisted value.
 /// Position-agnostic by value: a constant rewritten at one operand position
-/// (e.g. a div magic multiplier) is identical everywhere it appears.
-fn rewrite_int_operands(inst: &mut Instruction, bits: u64, new_val: u32) {
+/// (e.g. a div magic multiplier) is identical everywhere it appears --
+/// except as a multiplier `model`'s backend expands into shifted adds,
+/// which the register would turn back into a multiply.
+fn rewrite_int_operands(model: ImmModel, inst: &mut Instruction, bits: u64, new_val: u32) {
+    if let Instruction::BinOp {
+        op: IrBinOp::Mul,
+        lhs,
+        rhs,
+        ty,
+        ..
+    } = inst
+    {
+        let keep = |factor: &Operand, other: &Operand| {
+            const_bits(other).is_none()
+                && const_bits(factor).is_some_and(|c| mul_expanded(model, c, *ty))
+        };
+        if keep(lhs, rhs) || keep(rhs, lhs) {
+            return;
+        }
+    }
     let sub = |op: &mut Operand| {
         let matches = match op {
             Operand::Const(IrConst::I8(v)) => (*v as i64) as u64 == bits,
@@ -657,11 +856,15 @@ mod tests {
             ty: IrType::U32,
         };
         let mut seen = Vec::new();
-        for_each_int_operand(&inst, &mut |op, _needs_reg, imm32_exact| {
-            if matches!(op, Operand::Const(_)) {
-                seen.push(imm32_exact);
-            }
-        });
+        for_each_int_operand(
+            &FxHashSet::default(),
+            &inst,
+            &mut |op, _need, imm32_exact| {
+                if matches!(op, Operand::Const(_)) {
+                    seen.push(imm32_exact);
+                }
+            },
+        );
         assert_eq!(seen, vec![false]);
     }
 
@@ -677,9 +880,13 @@ mod tests {
             ty: IrType::U32,
         };
         let mut hoisted = Vec::new();
-        for_each_int_operand(&inst, &mut |op, needs_reg, imm32_exact| {
-            hoisted.push(large_int_const(op, needs_reg, imm32_exact));
-        });
+        for_each_int_operand(
+            &FxHashSet::default(),
+            &inst,
+            &mut |op, need, imm32_exact| {
+                hoisted.push(large_int_const(op, need, imm32_exact));
+            },
+        );
         assert_eq!(hoisted, vec![None, None]);
     }
 
@@ -732,12 +939,36 @@ mod tests {
     }
 
     /// AArch64 `mul` has no immediate form at all, so even a small constant
-    /// must be hoisted out of the loop there.
+    /// must be hoisted out of the loop there -- unless the backend
+    /// multiplies by it with one shifted `add`/`sub` (`2^k + 1`,
+    /// `1 - 2^k`), which needs no register for it. Two-instruction plans
+    /// (`(2^k + 1) << m`, `2^k - 1`) keep the register, which `madd`
+    /// consumes in one instruction.
     #[test]
-    fn aarch64_hoists_mul_operand_regardless_of_size() {
+    fn aarch64_hoists_mul_operand_without_a_one_instruction_plan() {
         with_aarch64(|| {
-            let mut func = make_op_loop(IrBinOp::Mul, IrType::U32, IrConst::I64(3));
-            assert_eq!(run(&mut func), 1);
+            for (k, ty, hoisted) in [
+                (3i64, IrType::U32, false),
+                (5, IrType::I64, false),
+                (33, IrType::U32, false),
+                (-3, IrType::I32, false),
+                (-7, IrType::I64, false),
+                (0x8000_0001, IrType::U32, false),
+                (6, IrType::I64, true),
+                (7, IrType::I32, true),
+                (31, IrType::U32, true),
+                (1000, IrType::I64, true),
+                // Not a plan in the 64-bit view the type is multiplied in.
+                (0xffff_fffd, IrType::I64, true),
+            ] {
+                let mut func = make_op_loop(IrBinOp::Mul, ty, IrConst::I64(k));
+                assert_eq!(run(&mut func) == 1, hoisted, "x * {k} ({ty:?})");
+                assert_eq!(
+                    matches!(mul_rhs(&func), Operand::Value(_)),
+                    hoisted,
+                    "x * {k} ({ty:?})"
+                );
+            }
         });
     }
 
@@ -755,6 +986,122 @@ mod tests {
                 assert!(matches!(mul_rhs(&func), Operand::Const(_)));
             }
         });
+    }
+
+    /// A loop whose header compares the counter against the constant `k`.
+    fn make_bound_loop(k: i64) -> IrFunction {
+        let mut func = make_op_loop(IrBinOp::Add, IrType::I32, IrConst::I32(1));
+        if let Instruction::Cmp { rhs, .. } = &mut func.blocks[1].instructions[1] {
+            *rhs = Operand::Const(IrConst::I32(k as i32));
+        }
+        func
+    }
+
+    /// The header compare's right operand after `run`.
+    fn bound_rhs(func: &IrFunction) -> Operand {
+        match &func.blocks[1].instructions[1] {
+            Instruction::Cmp { rhs, .. } => rhs.clone(),
+            other => panic!("expected Cmp, got {other:?}"),
+        }
+    }
+
+    /// RISC-V branches and the `slt` staging take registers only, so a
+    /// nonzero loop bound is a `li` per iteration and is hoisted even
+    /// inside imm12; zero is `x0`. AArch64 `cmp` and x86-64 `cmp` take the
+    /// immediate.
+    #[test]
+    fn riscv_hoists_a_nonzero_compare_operand() {
+        with_riscv(|| {
+            for k in [100i64, 1, -1, 2047, -2048] {
+                let mut func = make_bound_loop(k);
+                assert_eq!(run(&mut func), 1, "bound {k}");
+                assert!(matches!(bound_rhs(&func), Operand::Value(_)), "bound {k}");
+            }
+            let mut func = make_bound_loop(0);
+            assert_eq!(run(&mut func), 0);
+            assert!(matches!(bound_rhs(&func), Operand::Const(_)));
+        });
+        with_aarch64(|| {
+            let mut func = make_bound_loop(100);
+            assert_eq!(run(&mut func), 0);
+        });
+        let mut func = make_bound_loop(100);
+        assert_eq!(run(&mut func), 0, "x86-64");
+    }
+
+    /// The `make_op_loop` shape whose body materializes `x <op> k` as a
+    /// boolean (the function's result) instead of feeding a branch.
+    fn make_flag_loop(op: IrCmpOp, ty: IrType, k: IrConst) -> IrFunction {
+        let mut func = make_op_loop(IrBinOp::Add, IrType::I32, IrConst::I32(1));
+        func.blocks[2].instructions[0] = Instruction::Cmp {
+            dest: Value(4),
+            op,
+            lhs: Operand::Value(Value(2)),
+            rhs: Operand::Const(k),
+            ty,
+        };
+        func
+    }
+
+    /// A materialized RISC-V compare takes `xori`/`slti`/`sltiu` in place
+    /// (`riscv::codegen::cmp_needs_no_register`), so its constant stays an
+    /// immediate; only a constant no I-type form holds is hoisted. The
+    /// branch compare of the same loop keeps hoisting
+    /// (`riscv_hoists_a_nonzero_compare_operand`).
+    #[test]
+    fn riscv_materialized_compare_keeps_an_encodable_constant() {
+        with_riscv(|| {
+            for (op, ty, k) in [
+                (IrCmpOp::Eq, IrType::U8, IrConst::I8(32)),
+                (IrCmpOp::Ne, IrType::I32, IrConst::I32(-7)),
+                (IrCmpOp::Slt, IrType::I32, IrConst::I32(100)),
+                (IrCmpOp::Sle, IrType::I32, IrConst::I32(2046)),
+                (IrCmpOp::Ugt, IrType::U8, IrConst::I8(-1)),
+                (IrCmpOp::Ule, IrType::U32, IrConst::I32(25)),
+            ] {
+                let mut func = make_flag_loop(op, ty, k);
+                assert_eq!(run(&mut func), 0, "{op:?} {ty:?} {k:?}");
+            }
+            for (op, ty, k) in [
+                // x <= 2047 needs slti 2048.
+                (IrCmpOp::Sle, IrType::I32, IrConst::I32(2047)),
+                // 0xffffffff after the U32 zero-extension.
+                (IrCmpOp::Ne, IrType::U32, IrConst::I32(-1)),
+                // The unsigned maximum has no `+ 1`.
+                (IrCmpOp::Ule, IrType::I64, IrConst::I64(-1)),
+            ] {
+                let mut func = make_flag_loop(op, ty, k);
+                assert_eq!(run(&mut func), 1, "{op:?} {ty:?} {k:?}");
+            }
+        });
+    }
+
+    /// A boolean that reaches the branch through a copy and a cast is a
+    /// branch compare (the backends' fusion chain), not a materialized one.
+    #[test]
+    fn branch_compares_follow_copies_and_casts() {
+        let mut func = make_op_loop(IrBinOp::Add, IrType::I32, IrConst::I32(1));
+        func.blocks[1].instructions.push(Instruction::Cast {
+            dest: Value(6),
+            src: Operand::Value(Value(3)),
+            from_ty: IrType::I32,
+            to_ty: IrType::I64,
+        });
+        func.blocks[1].instructions.push(Instruction::Copy {
+            dest: Value(7),
+            src: Operand::Value(Value(6)),
+        });
+        func.blocks[1].terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(7)),
+            true_label: BlockId(2),
+            false_label: BlockId(3),
+        };
+        let set = branch_compares(&func);
+        assert!(
+            set.contains(&3) && set.contains(&6) && set.contains(&7),
+            "{set:?}"
+        );
+        assert!(!set.contains(&4), "{set:?}");
     }
 
     /// 2048 is the first value whose `li` expands to lui+addi — the per-iteration
@@ -782,15 +1129,35 @@ mod tests {
         });
     }
 
-    /// `mul` is NOT a needs_reg position on RISC-V (no immediate forms exist
-    /// anywhere, so a small constant at a mul position costs the same one
-    /// `addi` as at an add position) — an imm12 multiplier stays in place.
+    /// RISC-V `mul` has no immediate form: an imm12 multiplier is a `li`
+    /// per iteration, so it is hoisted -- unless the backend multiplies by
+    /// it with a shift and an add/sub (`2^k + 1`, `2^k - 1`, `1 - 2^k`),
+    /// which needs no register for it and must keep seeing the constant.
     #[test]
-    fn riscv_mul_imm12_operand_stays_an_immediate() {
+    fn riscv_mul_operand_is_hoisted_unless_expanded() {
         with_riscv(|| {
-            let mut func = make_op_loop(IrBinOp::Mul, IrType::U32, IrConst::I64(3));
+            for (k, ty, hoisted) in [
+                (3i64, IrType::U32, false),
+                (31, IrType::U32, false),
+                (7, IrType::I64, false),
+                (-3, IrType::I32, false),
+                (0x7fff_ffff, IrType::I32, false),
+                (6, IrType::I64, true),
+                (10, IrType::U32, true),
+                (-5, IrType::I64, true),
+                (1000, IrType::I32, true),
+            ] {
+                let mut func = make_op_loop(IrBinOp::Mul, ty, IrConst::I64(k));
+                assert_eq!(run(&mut func) == 1, hoisted, "x * {k} ({ty:?})");
+                assert_eq!(
+                    matches!(mul_rhs(&func), Operand::Value(_)),
+                    hoisted,
+                    "x * {k} ({ty:?})"
+                );
+            }
+            // An add keeps its imm12 operand in place.
+            let mut func = make_op_loop(IrBinOp::Add, IrType::I64, IrConst::I64(6));
             assert_eq!(run(&mut func), 0);
-            assert!(matches!(mul_rhs(&func), Operand::Const(_)));
         });
     }
 
@@ -848,9 +1215,11 @@ mod tests {
     /// their use positions: AArch64 hoists a small constant only for `mul`
     /// / `sdiv` (no immediate form), so `#7` is a home there and not under
     /// `add`; x86-64 64-bit forms sign-extend imm32 while 32-bit forms take
-    /// the bit pattern verbatim; RISC-V's boundary is imm12. %2 (a small
-    /// constant in the left position) is never a home, and a multiply
-    /// defined copy never is either.
+    /// the bit pattern verbatim; RISC-V's boundary is imm12 for the I-type
+    /// positions and every `mul`/`div` constant is staged. A multiplier the
+    /// backend expands is never a home. %2 (a small constant in the left
+    /// position) is never a home, and a multiply defined copy never is
+    /// either.
     #[test]
     fn const_homes_follow_the_hoisting_criterion_per_position() {
         use IrBinOp::{Add, Mul, SDiv};
@@ -870,9 +1239,17 @@ mod tests {
         assert!(!is_home(x86, IrConst::I64(0x9e37_79b1), Mul, I32));
         assert!(is_home(x86, IrConst::I64(1 << 40), SDiv, I64));
 
+        // A multiplier the backend expands is no home: forwarding it into
+        // the multiply is what lets the backend expand it.
+        assert!(!is_home(a64, IrConst::I64(9), Mul, I64));
+        assert!(!is_home(a64, IrConst::I64(-3), Mul, I32));
+
         let rv = ImmModel::Riscv;
         assert!(!is_home(rv, IrConst::I64(2047), Add, I64));
-        assert!(!is_home(rv, IrConst::I64(-2048), Mul, I64));
+        assert!(is_home(rv, IrConst::I64(-2048), Mul, I64));
+        assert!(is_home(rv, IrConst::I64(6), Mul, I64));
+        assert!(is_home(rv, IrConst::I64(7), SDiv, I64));
+        assert!(!is_home(rv, IrConst::I64(31), Mul, I32));
         assert!(is_home(rv, IrConst::I64(2048), Add, I64));
 
         for model in [a64, x86, rv] {

@@ -35,7 +35,8 @@ FIXTURES = (
     "asm_scalar_operand_classes_cross", "alias_copy_after_join_cross",
     "predicate_inverted_signed_cmp_cross", "word_reload_sign_extension_cross",
     "leaf_params_fp_domain_cross", "vector_fma_families_cross", "call_args_and_pool_regs_cross",
-    "fp_sign_and_vector_fms_cross",
+    "fp_sign_and_vector_fms_cross", "int_mul_const_and_fp_int_cast_cross",
+    "int_cmp_const_select_cross", "narrow_sign_test_cross", "nested_fn_chain_goto_cross",
     # Parameter-home index: both build paths must EXECUTE, not merely assemble.
     # `shifted` covers the aligned (positional) and general (resumed) paths in
     # one TU; `wide` pushes 48 mixed-width parameters through stack homes on
@@ -112,6 +113,37 @@ LEVELS = {
     # assembles still passes a compile-only gate, so these MUST execute.
     "param_home_shifted_cross": ALL_LEVELS,
     "param_home_wide_cross": ALL_LEVELS,
+    # AArch64: a multiply by a constant feeding an add/sub fuses into the
+    # multiplier plan's shifted add/sub (a constant addend only as a 12-bit
+    # immediate), shifted operands fuse into the ALU op on either side of an
+    # add, and FP-to-integer conversions write their W/X home directly.
+    # RV64: word conversions saturate and sign-extend (a U8/U16/U32 result
+    # needs its zero extension), and the FP peephole forwards frame slots
+    # and copies, promotes a spilled temporary to a free FP scratch and
+    # drops frames nothing uses -- every copy checked bit for bit. Inside
+    # loops, the constant hoist leaves the factors each backend expands
+    # into shifted adds in place and hoists the rest (and, on RV64, every
+    # nonzero compare operand).
+    "int_mul_const_and_fp_int_cast_cross": ALL_LEVELS + ("-O3",),
+    # RV64: a materialized compare against a constant takes the I-type form
+    # (`xori`+`seqz`/`snez`, `slti`/`sltiu` with `x <= k` as `x < k + 1`,
+    # `slt t0, zero, t1` for `x > 0`) at every type, with the constant on
+    # either side, and `if (c) n++` lowers to `seqz`/`snez` + `add[w]`
+    # instead of a branch -- except a U32 increment under a 64-bit
+    # conditional, which must wrap at 32 bits and zero-extend. The loop
+    # constant hoist keeps the constants those forms encode in place.
+    "int_cmp_const_select_cross": ALL_LEVELS + ("-O3",),
+    # A sign test of a narrow value reads its top bit: AArch64 `tst #0x80`
+    # (or `ubfx`/`sbfx`) for `sxtb; cmp #0` and a sign condition, RV64 no
+    # `srai` before `slti 0`/`bltz` (`srli 7` of an `lbu`, `andi 128; seqz`
+    # for a negated byte test), and RV64 `signed char`/`short` arguments
+    # trusted to arrive sign-extended.
+    "narrow_sign_test_cross": ALL_LEVELS + ("-O3",),
+    # GNU nested functions: AArch64 -O0 saved the static chain through x0
+    # before reading the first parameter; a nested function leaving through
+    # a nonlocal goto kept a value in a callee-saved register its abandoned
+    # epilogue never restored (AArch64 and RV64 -O1).
+    "nested_fn_chain_goto_cross": ALL_LEVELS + ("-O3",),
 }
 # Two-unit psABI fixtures under interop/: `<name>_callee.c` and
 # `<name>_caller.c`, linked LCCC-with-LCCC and LCCC-with-Clang in both

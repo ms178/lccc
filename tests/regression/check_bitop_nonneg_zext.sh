@@ -44,19 +44,31 @@ for function in "${bitops[@]}"; do
     fi
 done
 
-# Control: a plain signed int widen must keep the extension on both targets.
+# Controls: a widen whose input bits are not already a sign-extended word
+# must keep the extension. On AArch64 that includes a plain `int` argument
+# (AAPCS64 leaves its upper bits unspecified); on RISC-V the psABI delivers
+# an `int` argument sign-extended to XLEN, so widen_plain is a bare `ret`
+# there (Clang 23.1.5 parity) and the truncated 64-bit value is the control.
 body=$(function_body widen_plain "$tmp/arm.s")
 grep -qE '^[[:space:]]+sxtw[[:space:]]' <<<"$body" || {
     echo "FAIL: arm widen_plain lost its sign-extension" >&2
     printf '%s\n' "$body" >&2
     exit 1
 }
+for target in arm riscv; do
+    body=$(function_body widen_trunc "$tmp/$target.s")
+    grep -qE '^[[:space:]]+(sxtw|sext\.w)[[:space:]]' <<<"$body" || {
+        echo "FAIL: $target widen_trunc lost its sign-extension" >&2
+        printf '%s\n' "$body" >&2
+        exit 1
+    }
+done
 body=$(function_body widen_plain "$tmp/riscv.s")
-grep -qE '^[[:space:]]+sext\.w[[:space:]]' <<<"$body" || {
-    echo "FAIL: riscv widen_plain lost its sign-extension" >&2
+if grep -qE '^[[:space:]]+sext\.w[[:space:]]' <<<"$body"; then
+    echo "FAIL: riscv widen_plain re-extends a psABI sign-extended int argument" >&2
     printf '%s\n' "$body" >&2
     exit 1
-}
+fi
 
 # The emitted assembly must be accepted by lccc's own assemblers — this
 # catches any malformed mnemonic/register shape the grep above cannot.

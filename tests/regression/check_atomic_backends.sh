@@ -86,12 +86,18 @@ if [ -x "$arm" ]; then
     sub=$(body "$td/arm.s" sub8)
     cas=$(body "$td/arm.s" cas8)
     release=$(body "$td/arm.s" fence_release)
-    grep -q 'sxtb x0, w0' <<<"$sub"
+    # AAPCS64 leaves the bits of x0 above an 8-bit result unspecified (C.16
+    # and "Result return"), so the callee returns the byte the exclusive
+    # load left in w0 without re-extending it -- Clang 23.1.5 ends both
+    # functions with `mov w0, w8; ret` -- and every caller extends it
+    # (executed by int_mul_const_and_fp_int_cast_cross check 16).
+    grep -q 'ldaxrb' <<<"$sub" && grep -q 'stlxrb' <<<"$sub"
+    ! grep -Eq '^[[:space:]]*sxtb x0, w0$' <<<"$sub" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
     # The expected value is masked to its byte in place, in whichever
     # register holds it (`and wN, wN, #0xff`): the CAS loop compares the
     # zero-extended `ldaxrb` result against it.
     grep -Eq 'and (w[0-9]+), \1, #0xff' <<<"$cas"
-    grep -q 'sxtb x0, w0' <<<"$cas"
+    ! grep -Eq '^[[:space:]]*sxtb x0, w0$' <<<"$cas" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
     grep -q 'dmb ish' <<<"$release"
     ! grep -q 'dmb ishst' <<<"$release" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
     if command -v aarch64-linux-gnu-gcc >/dev/null; then

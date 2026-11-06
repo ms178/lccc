@@ -45,7 +45,8 @@
 //!    text, so after the whole-module peephole and TLS lowering
 //!    [`verify`] recomputes every summary from the FINAL text and re-checks
 //!    every caller's calls. A callee whose final clobbers exceed its
-//!    prediction, or a caller with a call the record does not cover, is
+//!    prediction in a keep candidate, or a caller with a call the record
+//!    does not cover or whose keep set meets a callee's final clobbers, is
 //!    reported; the driver regenerates the module with those functions
 //!    excluded, and finally with IPA-RA off, so a violated assumption can
 //!    never reach the output.
@@ -947,8 +948,14 @@ pub(crate) fn verify(asm: &str, state: &IpaRaState) -> IpaViolations {
             function_body(&lines, &index, name)
         })
         .and_then(|body| text_clobbers(&body.join("\n"), &|s| actual.get(s).copied()));
+        // Only growth in a keep candidate can falsify a keep set: every
+        // keep set is a subset of `KEEP_CANDIDATES` (`keep_set`), and the
+        // caller check below tests the FINAL mask against it exactly. Growth
+        // elsewhere — the late peephole moving a saved value into `%r11`
+        // (`callee_saves::rename_saved_values_into_free_scratch`) — is
+        // recorded in `actual` and composes into the callers' masks.
         match final_mask {
-            Some(m) if m & !predicted == 0 => {
+            Some(m) if m & !predicted & KEEP_CANDIDATES == 0 => {
                 actual.insert(name.as_str(), m);
             }
             _ => out.callees.push(name.clone()),
@@ -1251,6 +1258,20 @@ mod tests {
         );
         assert_eq!(verify(&grown, &st).callees, vec!["helper".to_string()]);
         assert_eq!(verify(&grown, &st).callers, vec!["main".to_string()]);
+        // Growth outside the keep candidates (a saved value moved into
+        // %r11 by the late peephole) falsifies no keep set.
+        let scratch = good.replace(
+            "    movq %rdi, %rax\n",
+            "    movq %rdi, %r11\n    movq %r11, %rax\n",
+        );
+        assert!(verify(&scratch, &st).is_empty());
+        // ...but it still composes: a caller keeping %r11 would be caught
+        // by the exact caller check (here a record that keeps it).
+        let mut st11 = IpaRaState::new(true, FxHashSet::default(), FxHashSet::default(), false);
+        st11.summaries.insert("helper".into(), RAX | RDI);
+        st11.order.push("helper".into());
+        st11.record("main", R11, vec!["helper".into()]);
+        assert_eq!(verify(&scratch, &st11).callers, vec!["main".to_string()]);
         // A call the record does not cover (a late libcall).
         let extra = good.replace(
             "    ret\n.size main",

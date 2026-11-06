@@ -6,6 +6,54 @@ use crate::common::types::IrType;
 use crate::ir::reexports::{Operand, Value};
 
 impl RiscvCodegen {
+    /// Truncate `ft0` toward zero into the integer type `to_ty` in `t0`,
+    /// leaving the backend's register image for that type (signed types
+    /// sign-extended, unsigned types zero-extended to 64 bits).
+    ///
+    /// Targets of at most 32 bits use the W forms. `fcvt.w.{s,d}` and
+    /// `fcvt.wu.{s,d}` saturate to the 32-bit range and sign-extend the
+    /// 32-bit result to XLEN (RISC-V Unprivileged ISA, "Floating-Point
+    /// Conversion and Move Instructions"), so:
+    /// * `int` is the conversion alone -- `fcvt.l.d; sext.w` was two
+    ///   instructions, and its out-of-range results wrapped where GCC's and
+    ///   Clang's `fcvt.w.d` saturate (`(int)3e9 == INT_MAX`);
+    /// * 8/16-bit targets extend from the saturated 32-bit value;
+    /// * `unsigned` keeps the zero extension: `fcvt.wu` sign-extends bit 31.
+    ///
+    /// 64-bit targets (and pointers) use the L forms unchanged.
+    fn emit_fp_to_int_from_ft0(&mut self, from_f64: bool, to_ty: IrType, signed: bool) {
+        let fmt = if from_f64 { "d" } else { "s" };
+        let wide = to_ty.size() > 4;
+        let op = match (wide, signed) {
+            (true, true) => "l",
+            (true, false) => "lu",
+            (false, true) => "w",
+            (false, false) => "wu",
+        };
+        self.state
+            .emit_fmt(format_args!("    fcvt.{op}.{fmt} t0, ft0, rtz"));
+        match to_ty {
+            IrType::I8 => {
+                self.state.emit("    slli t0, t0, 56");
+                self.state.emit("    srai t0, t0, 56");
+            }
+            IrType::I16 => {
+                self.state.emit("    slli t0, t0, 48");
+                self.state.emit("    srai t0, t0, 48");
+            }
+            IrType::U8 => self.state.emit("    andi t0, t0, 0xff"),
+            IrType::U16 => {
+                self.state.emit("    slli t0, t0, 48");
+                self.state.emit("    srli t0, t0, 48");
+            }
+            IrType::U32 => {
+                self.state.emit("    slli t0, t0, 32");
+                self.state.emit("    srli t0, t0, 32");
+            }
+            _ => {}
+        }
+    }
+
     pub(super) fn emit_cast_instrs_impl(&mut self, from_ty: IrType, to_ty: IrType) {
         match classify_cast(from_ty, to_ty) {
             CastKind::Noop => {}
@@ -21,48 +69,15 @@ impl RiscvCodegen {
                 // U8->I8, U16->I16, U64->I64 are true noops
             }
 
-            CastKind::FloatToSigned { from_f64 } => {
+            kind @ (CastKind::FloatToSigned { from_f64 }
+            | CastKind::FloatToUnsigned { from_f64, .. }) => {
                 if from_f64 {
                     self.state.emit("    fmv.d.x ft0, t0");
-                    self.state.emit("    fcvt.l.d t0, ft0, rtz");
                 } else {
                     self.state.emit("    fmv.w.x ft0, t0");
-                    self.state.emit("    fcvt.l.s t0, ft0, rtz");
                 }
-                match to_ty {
-                    IrType::I8 => {
-                        self.state.emit("    slli t0, t0, 56");
-                        self.state.emit("    srai t0, t0, 56");
-                    }
-                    IrType::I16 => {
-                        self.state.emit("    slli t0, t0, 48");
-                        self.state.emit("    srai t0, t0, 48");
-                    }
-                    IrType::I32 => self.state.emit("    sext.w t0, t0"),
-                    _ => {}
-                }
-            }
-
-            CastKind::FloatToUnsigned { from_f64, .. } => {
-                if from_f64 {
-                    self.state.emit("    fmv.d.x ft0, t0");
-                    self.state.emit("    fcvt.lu.d t0, ft0, rtz");
-                } else {
-                    self.state.emit("    fmv.w.x ft0, t0");
-                    self.state.emit("    fcvt.lu.s t0, ft0, rtz");
-                }
-                match to_ty {
-                    IrType::U8 => self.state.emit("    andi t0, t0, 0xff"),
-                    IrType::U16 => {
-                        self.state.emit("    slli t0, t0, 48");
-                        self.state.emit("    srli t0, t0, 48");
-                    }
-                    IrType::U32 => {
-                        self.state.emit("    slli t0, t0, 32");
-                        self.state.emit("    srli t0, t0, 32");
-                    }
-                    _ => {}
-                }
+                let signed = matches!(kind, CastKind::FloatToSigned { .. });
+                self.emit_fp_to_int_from_ft0(from_f64, to_ty, signed);
             }
 
             CastKind::SignedToFloat { to_f64, from_ty } => {

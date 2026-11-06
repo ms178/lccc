@@ -316,7 +316,9 @@ fn a_dead_frame_in_a_multi_exit_leaf_rewrites_the_post_ret_cfa_row() {
 #[test]
 fn a_dead_frame_under_live_pushes_folds_with_exact_cfi() {
     // `wsum`/`utf8_scan` shape: a live callee-saved push, then a frame no
-    // line references, two exits.
+    // line references, two exits. The push must stay live, so the Phase 6
+    // scratch rename (which would move %rbx into %r11) is off here.
+    let _skip = super::super::test_skips::skip_passes(&["scratch_rename"]);
     let out = run(&f(&format!(
         "{}{}{}",
         concat!(
