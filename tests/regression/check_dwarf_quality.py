@@ -2897,6 +2897,14 @@ def run_debugger_lane(report: Report, lccc: list[str], gdb: str, workdir: Path) 
     one in a register, and a parameter GDB calls `<optimized out>` is skipped
     there -- but one it prints must be the value the function itself saw.
     """
+    # Record which debugger answered.  A "debugger" measurement that does not
+    # name its consumer cannot be re-read later, and the pinned GDB in the
+    # toolchain cache is not the one a distribution ships.
+    version = subprocess.run([gdb, "--version"], text=True, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, check=False, timeout=60)
+    first = (version.stdout or "").strip().splitlines()
+    if first:
+        report.measurements.setdefault("debugger", {})["tool"] = first[0]
     probes = write_probes(workdir)
     for optimization in ("-O0", "-O2"):
         label = f"debugger-{optimization.lstrip('-')}"
