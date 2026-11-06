@@ -7,6 +7,12 @@ after the assignments.  A location that names the wrong slot, double-counts the
 function base, or claims the object before its declaration fails the decoder or
 the debugger.  `-g` must still leave every instruction byte unchanged.
 
+A second probe covers the two shapes where the description used to be lost
+outright rather than merely incomplete: a GNU nested function (whose record was
+built without its parameter map, scopes and locals) and a record type defined
+inside a body (whose layout was popped with the block, leaving an incomplete
+declaration of size zero).  Both are ordinary C a user can write today.
+
 Lexical-block ranges and promoted scalar locals are not yet described; the gate
 pins the proven subset so it cannot regress while those are added.
 """
@@ -24,9 +30,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tests/regression"))
 from check_dwarf_quality import (  # noqa: E402
+    DW_AT_BYTE_SIZE,
+    DW_AT_DECLARATION,
     DW_AT_LOCATION,
+    DW_AT_LOW_PC,
+    DW_AT_TYPE,
     DW_TAG_FORMAL_PARAMETER,
     DW_TAG_LEXICAL_BLOCK,
+    DW_TAG_MEMBER,
+    DW_TAG_STRUCTURE_TYPE,
     DW_TAG_SUBPROGRAM,
     DW_TAG_VARIABLE,
     Report,
@@ -66,6 +78,31 @@ int main(void) {
     return locals(7) == 8 + 10 + 19 + 27 + 40 && shadow(7) == 8 ? 0 : 1;
 }
 """
+
+#: A GNU nested function that also declares a block-scope record type.  Both
+#: descriptions were once lost: the nested function's record was finalized
+#: without its parameter map, its lexical scopes and its locals, and the record's
+#: layout was popped when the block closed, so `pair`'s type reached the writer
+#: as a name it no longer knew.
+SCOPED = r"""
+volatile int scoped_sink;
+__attribute__((noinline)) int outer(int n) {
+    int inner(int k) {
+        volatile int m = k * n;
+        struct { int a, b; } pair = { m, n };
+        return pair.a + pair.b; /* nested-inner */
+    }
+    int t = inner(3);
+    scoped_sink = t;
+    return t + n;
+}
+int main(void) { return outer(4) == 20 ? 0 : 1; }
+"""
+
+#: The nested function's mangled name, which is also its `LOCAL` symbol.
+NESTED = "outer.inner"
+#: `outer(4)` calls `inner(3)` with `n = 4`: `m = 12` and `pair = {12, 4}`.
+SCOPED_VALUES = {"k": 3, "m": 12, "pair.a": 12, "pair.b": 4}
 
 LOCALS = ("array", "s", "v")
 SHADOW_INNER = 17
@@ -141,6 +178,129 @@ quit
     if len(values) < 2:
         fail("gdb-shadow", f"expected two printed values, got {result.stdout!r}")
     return values[0].strip(), values[1].strip()
+
+
+def scoped_marker_line(marker: str = "/* nested-inner */") -> int:
+    for number, line in enumerate(SCOPED.splitlines(), 1):
+        if marker in line:
+            return number
+    raise ValueError(f"scoped probe lost {marker}")
+
+
+def gdb_scoped(gdb: str, exe: Path, cwd: Path, source_name: str) -> dict[str, str]:
+    expressions = list(SCOPED_VALUES)
+    prints = "\n".join(f"print {expr}" for expr in expressions)
+    script = f"""set pagination off
+set confirm off
+break {source_name}:{scoped_marker_line()}
+run
+{prints}
+quit
+"""
+    command_file = cwd / "scoped.gdb"
+    command_file.write_text(script)
+    result = run([gdb, "-q", "-batch", "-x", str(command_file), str(exe)], cwd)
+    if result.returncode != 0:
+        fail("gdb-scoped", result.stdout + result.stderr)
+    values = re.findall(r"\$\d+ = ([^\n]+)", result.stdout)
+    if len(values) < len(expressions):
+        fail("gdb-scoped", f"expected {len(expressions)} printed values, got {result.stdout!r}")
+    return dict(zip(expressions, (value.strip() for value in values)))
+
+
+def check_scoped(label: str, path: Path) -> None:
+    """A GNU nested function and a block-scope record are both described.
+
+    Neither is reachable from the file-scope probe, and both failed closed in a
+    way the DWARF itself cannot show: a nested function's record used to be
+    finalized without its parameter map, scopes and locals, so `outer.inner`
+    claimed to take no arguments; and a record defined inside a body lost its
+    layout when the block closed, so `pair`'s type was written as
+    `DW_AT_declaration` with a zero size -- gdb prints `<incomplete type>` and
+    no member can be read.
+
+    The subprogram is found at depth 1 because that is where this writer puts
+    it: the nested function is a sibling of its lexical parent, named by the
+    mangled symbol it is emitted under.
+    """
+    elf = read_elf(path)
+    report = Report()
+    described = False
+    for unit in units(elf):
+        nested = [
+            die
+            for die in unit.dies
+            if die.tag == DW_TAG_SUBPROGRAM
+            and die.depth == 1
+            and die_name(die, unit) == NESTED
+        ]
+        if not nested:
+            continue
+        described = True
+        subprogram = nested[0]
+        if DW_AT_LOW_PC not in subprogram.attrs:
+            fail(f"{label}/nested", f"{NESTED} states no code range")
+        kids = children(unit, subprogram)
+        parameter = next(
+            (die for die in kids
+             if die.tag == DW_TAG_FORMAL_PARAMETER and die_name(die, unit) == "k"),
+            None,
+        )
+        if parameter is None:
+            fail(
+                f"{label}/nested",
+                f"{NESTED} describes no `DW_TAG_formal_parameter k`; a debugger "
+                "cannot name its argument",
+            )
+        if DW_AT_LOCATION not in parameter.attrs:
+            fail(f"{label}/nested", f"{NESTED}'s parameter k has no DW_AT_location")
+        check_parameter_location(
+            report, elf, unit, parameter, subprogram, label, f"{NESTED}.k"
+        )
+        for name in ("m", "pair"):
+            die = next(
+                (candidate for candidate in kids
+                 if candidate.tag == DW_TAG_VARIABLE and die_name(candidate, unit) == name),
+                None,
+            )
+            if die is None:
+                fail(f"{label}/nested", f"{NESTED} describes no local `{name}`")
+            if DW_AT_LOCATION not in die.attrs:
+                fail(f"{label}/nested", f"{NESTED}'s local {name} has no DW_AT_location")
+            check_parameter_location(
+                report, elf, unit, die, subprogram, label, f"{NESTED}.{name}"
+            )
+        pair = next(
+            (candidate for candidate in kids
+             if candidate.tag == DW_TAG_VARIABLE and die_name(candidate, unit) == "pair"),
+            None,
+        )
+        type_offset = pair.attrs.get(DW_AT_TYPE) if pair is not None else None
+        record = unit.die_at(type_offset) if isinstance(type_offset, int) else None
+        if record is None:
+            fail(f"{label}/nested", f"{NESTED}'s local pair names no type DIE")
+        if record.tag != DW_TAG_STRUCTURE_TYPE:
+            fail(f"{label}/nested", f"pair's type is tag {record.tag:#x}, not a structure")
+        if DW_AT_DECLARATION in record.attrs:
+            fail(
+                f"{label}/nested",
+                "pair's block-scope struct type is described as a declaration, so "
+                "the object cannot be inspected",
+            )
+        size = record.attrs.get(DW_AT_BYTE_SIZE)
+        if size != 8:
+            fail(f"{label}/nested", f"pair's struct says DW_AT_byte_size {size}, expected 8")
+        members = sorted(
+            die_name(die, unit)
+            for die in children(unit, record)
+            if die.tag == DW_TAG_MEMBER
+        )
+        if members != ["a", "b"]:
+            fail(f"{label}/nested", f"pair's struct members are {members}, expected ['a', 'b']")
+    if not described:
+        fail(f"{label}/nested", f"no subprogram DIE named {NESTED}")
+    if report.failures:
+        fail(label + "/nested", "; ".join(str(failure) for failure in report.failures))
 
 
 def check_locations(label: str, path: Path) -> None:
@@ -246,7 +406,54 @@ def check_mode(lccc: str, gcc: str, gdb: str | None, bits: int, version: int, ro
                 fail(label + level, result.stderr)
         if code_sections(read_elf(plain)) != code_sections(read_elf(debug)):
             fail(label + level, "-g changed code bytes; debug info must be free at runtime")
-    return 4 if gdb else 3
+
+    # A nested function and a block-scope record type: both are ordinary C, and
+    # both used to lose their description before the writer saw them.
+    scoped_source = work / "scoped.c"
+    scoped_source.write_text(SCOPED)
+    scoped_obj = work / "scoped.o"
+    result = run(target + common + ["-c", str(scoped_source), "-o", str(scoped_obj)], work)
+    if result.returncode != 0:
+        fail(label + "/scoped", result.stderr)
+    check_scoped(label, scoped_obj)
+    scoped_exe = work / "scoped"
+    result = run([gcc, "-m32" if bits == 32 else "-m64", "-no-pie", str(scoped_obj),
+                  "-o", str(scoped_exe)], work)
+    if result.returncode != 0:
+        fail(label + "/scoped-link", result.stderr)
+    result = run([str(scoped_exe)], work)
+    if result.returncode != 0:
+        fail(label + "/scoped-run", f"exit {result.returncode}")
+    asm = work / "scoped.s"
+    via_obj = work / "scoped-via.o"
+    result = run(target + common + ["-S", str(scoped_source), "-o", str(asm)], work)
+    if result.returncode != 0:
+        fail(label + "/scoped -S", result.stderr)
+    result = run([gcc, "-m32" if bits == 32 else "-m64", "-c", str(asm), "-o", str(via_obj)], work)
+    if result.returncode != 0:
+        fail(label + "/scoped-gas", result.stderr)
+    check_scoped(label + "/gas", via_obj)
+    if gdb:
+        for candidate in (scoped_exe,):
+            values = gdb_scoped(gdb, candidate, work, scoped_source.name)
+            for expr, expected in SCOPED_VALUES.items():
+                if gdb_number(values[expr]) != expected:
+                    fail(
+                        label + "/gdb-scoped",
+                        f"{expr} = {values[expr]}, expected {expected}",
+                    )
+    for level in ("-O0", "-O2"):
+        plain = work / f"scoped-plain{level}.o"
+        debug = work / f"scoped-debug{level}.o"
+        for output, extra in ((plain, []), (debug, ["-g"])):
+            result = run(target + [level] + extra + ["-c", str(scoped_source),
+                                                     "-o", str(output)], work)
+            if result.returncode != 0:
+                fail(label + level + "/scoped", result.stderr)
+        if code_sections(read_elf(plain)) != code_sections(read_elf(debug)):
+            fail(label + level + "/scoped",
+                 "-g changed code bytes; debug info must be free at runtime")
+    return 8 if gdb else 6
 
 
 def check_cross(lccc: str, label: str, version: int, root: Path) -> int:
@@ -276,7 +483,14 @@ def check_cross(lccc: str, label: str, version: int, root: Path) -> int:
                 fail(label + level, result.stderr)
         if code_sections(read_elf(plain)) != code_sections(read_elf(debug)):
             fail(label + level, "-g changed code bytes; debug info must be free at runtime")
-    return 2
+    scoped_source = work / "scoped.c"
+    scoped_source.write_text(SCOPED)
+    scoped_obj = work / "scoped.o"
+    result = run([lccc, *common, "-c", str(scoped_source), "-o", str(scoped_obj)], work)
+    if result.returncode != 0:
+        fail(label + "/scoped", result.stderr)
+    check_scoped(f"{label}-v{version}", scoped_obj)
+    return 3
 
 
 def main() -> int:
