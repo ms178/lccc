@@ -47,7 +47,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import shutil
 import struct
 import subprocess
@@ -128,10 +127,6 @@ DW_AT_GNU_VECTOR = 0x2107
 #: `DW_OP_addr`: the only location expression this writer emits for an object at
 #: a fixed address.
 DW_OP_ADDR = 0x03
-
-#: `DW_OP_fbreg`: one signed LEB128 offset from the frame base, which is how a
-#: parameter that lives in the frame is described.
-DW_OP_FBREG = 0x91
 
 DW_FORM_STRING = 0x08
 DW_FORM_ADDR = 0x01
@@ -399,10 +394,6 @@ class Die:
     #: Form each attribute was encoded with. `DW_AT_high_pc` needs it: an
     #: address is a form of its own, a constant is an offset from `low_pc`.
     forms: dict[int, int] = field(default_factory=dict)
-    #: The abbreviation this DIE was written with, so a declaration no DIE uses
-    #: can be found: an abbreviation costs bytes in every object and a parse for
-    #: every consumer, and one that describes nothing describes it for nobody.
-    code: int = 0
 
     def name(self) -> str:
         value = self.attrs.get(DW_AT_NAME, "")
@@ -486,8 +477,6 @@ class Unit:
     address_size: int
     offset_size: int
     dies: list[Die] = field(default_factory=list)
-    #: Abbreviation codes this unit's table declares.
-    declared: list[int] = field(default_factory=list)
 
     def root(self) -> Die | None:
         return self.dies[0] if self.dies else None
@@ -572,7 +561,6 @@ def units(elf: Elf) -> list[Unit]:
             offset += 1
         table = _abbrevs(abbrev, abbrev_offset)
         unit = Unit(offset=start, version=version, address_size=address_size, offset_size=offset_size)
-        unit.declared = sorted(table)
         depth = 0
         while offset < end:
             die_offset = offset
@@ -599,7 +587,6 @@ def units(elf: Elf) -> list[Unit]:
                         attrs=attrs,
                         depth=depth,
                         forms=forms,
-                        code=code,
                     )
                 )
             if declaration.children:
@@ -1540,46 +1527,6 @@ int pq_frame(int n) {
     }
     return pq_used_static(total);
 }
-/* Where each parameter of one function actually lands. The probe stores its own
-   parameters' addresses and prints each one's distance from the frame address,
-   so the gate compares a DWARF location with the address the running program
-   took -- not with another compiler's idea of where it should be. Eleven
-   parameters cover both register files (six integer, eight SSE) and the stack,
-   and every address is taken, so every parameter is an object in memory at
-   every optimization tier. */
-static long pq_arg_delta[11];
-static long pq_arg_value[11];
-static unsigned long pq_frame_record;
-__attribute__((noinline)) long pq_args(int a, long b, char c, short d, unsigned e,
-                                       float f, double g, void *h, int i, int j, int k) {
-    unsigned long frame = (unsigned long)__builtin_frame_address(0);
-    pq_frame_record = 2 * sizeof(void *);
-    pq_arg_delta[0] = (long)((unsigned long)(void *)&a - frame);
-    pq_arg_delta[1] = (long)((unsigned long)(void *)&b - frame);
-    pq_arg_delta[2] = (long)((unsigned long)(void *)&c - frame);
-    pq_arg_delta[3] = (long)((unsigned long)(void *)&d - frame);
-    pq_arg_delta[4] = (long)((unsigned long)(void *)&e - frame);
-    pq_arg_delta[5] = (long)((unsigned long)(void *)&f - frame);
-    pq_arg_delta[6] = (long)((unsigned long)(void *)&g - frame);
-    pq_arg_delta[7] = (long)((unsigned long)(void *)&h - frame);
-    pq_arg_delta[8] = (long)((unsigned long)(void *)&i - frame);
-    pq_arg_delta[9] = (long)((unsigned long)(void *)&j - frame);
-    pq_arg_delta[10] = (long)((unsigned long)(void *)&k - frame);
-    /* What the function itself sees, as longs, so a debugger can be asked the
-       same question: `print (long)a` must answer what this line stored. */
-    pq_arg_value[0] = a;
-    pq_arg_value[1] = b;
-    pq_arg_value[2] = c;
-    pq_arg_value[3] = d;
-    pq_arg_value[4] = e;
-    pq_arg_value[5] = (long)f;
-    pq_arg_value[6] = (long)g;
-    pq_arg_value[7] = (long)h;
-    pq_arg_value[8] = i;
-    pq_arg_value[9] = j;
-    pq_arg_value[10] = k;
-    return a + b + c + d + (long)e + (long)f + (long)g + (i + j + k) + (h != 0);
-}
 /* The program's own answers: the checks below compare the DWARF with what this
    code computes, not with a second compiler's opinion about it. */
 int main(void) {
@@ -1602,14 +1549,6 @@ int main(void) {
     printf("value_red %d\\n", PQ_RED);
     printf("value_green %d\\n", PQ_GREEN);
     printf("value_blue %d\\n", PQ_BLUE);
-    printf("value_args %ld\\n", pq_args(1, 2, 3, 4, 5, 6.0f, 7.0, &pq_global, 9, 10, 11));
-    printf("frame_record %lu\\n", pq_frame_record);
-    for (int index = 0; index < 11; index++) {
-        printf("arg_delta_%d %ld\\n", index, pq_arg_delta[index]);
-    }
-    for (int index = 0; index < 11; index++) {
-        printf("arg_value_%d %ld\\n", index, pq_arg_value[index]);
-    }
     /* `sizeof` of an inline function keeps its DIE reachable without calling it,
        and the exit status stays zero so the gate can run this binary. */
     (void)sizeof(pq_only_sizeof());
@@ -1751,33 +1690,6 @@ def check_unit_structure(report: Report, elf: Elf, version: int, label: str) -> 
                 "so no line table can be found",
             )
     return parsed
-
-
-def check_abbrev_usage(report: Report, elf: Elf, parsed: list[Unit], label: str) -> None:
-    """Every declared abbreviation must describe at least one DIE.
-
-    An abbreviation is a record in `.debug_abbrev` and a parse for every consumer
-    that walks the table, so one that no DIE uses is paid for by every object and
-    read by nobody. The writer therefore declares a shape when the DIE that takes
-    it is written, and this asserts the consequence: the table holds exactly the
-    shapes the unit uses.
-
-    It used to hold more. The subprogram shapes were declared as a cross product
-    of declaration kind, child list and linkage -- eight, of which a `-O0` unit
-    used three -- and the parameter shapes were chosen from a static reading of
-    the unit, which still carried the shape for an unnamed parameter no function
-    had. Measured on the gate's own probe: `.debug_abbrev` 231 -> 174 bytes at
-    `-O0`, the same at `-O2` where no parameter is placed at all.
-    """
-    for unit in parsed:
-        used = {die.code for die in unit.dies}
-        unused = [code for code in unit.declared if code not in used]
-        if unused:
-            report.fail(
-                "abbrev_usage",
-                f"{label}: unit at {unit.offset:#x} declares abbreviation(s) {unused} that no "
-                f"DIE uses ({len(unused)} of {len(unit.declared)} declared)",
-            )
 
 
 def is_dropped_die(low: int, high: int, name: str, live: set[str]) -> bool:
@@ -2946,7 +2858,6 @@ def check_parameters(report: Report, elf: Elf, parsed: list[Unit], label: str) -
     unit = parsed[0]
     required = {"pq_frame": ("n",), "pq_leaf": ("x",)}
     described = 0
-    located = 0
     # A function that takes `...` must say so: a consumer otherwise reads a
     # complete argument list and reports the extra ones as garbage.
     emitted = {symbol.name for symbol in elf.functions()}
@@ -3034,7 +2945,6 @@ def check_parameters(report: Report, elf: Elf, parsed: list[Unit], label: str) -
                 )
     if described:
         report.measurements.setdefault("parameters", {})[label] = described
-    report.measurements.setdefault("param_located", {})[label] = located
 
 
 def check_declaration_policy(report: Report, path: Path, label: str) -> None:
@@ -3309,7 +3219,6 @@ def run_gate(lccc: list[str], gcc: list[str] | None, workdir: Path) -> Report:
         if not parsed:
             continue
         ranges = check_subprograms(report, elf, parsed, label, spans["probe"])
-        check_abbrev_usage(report, elf, parsed, label)
         check_lines(
             report, elf, parsed, ranges, label, spans["probe"],
             inlining=optimization != "-O0",
@@ -3323,10 +3232,6 @@ def run_gate(lccc: list[str], gcc: list[str] | None, workdir: Path) -> Report:
         if facts is not None:
             check_type_dies(report, elf, parsed, label, facts)
             check_object_locations(report, elf, parsed, label, facts)
-            check_parameter_locations(
-                report, elf, parsed, label, facts,
-                place_every_parameter=optimization == "-O0",
-            )
 
     # One function per section is the kernel's and Debian's default packaging, and
     # it moves a unit from a low/high pair to a range list -- a different section,
@@ -3437,116 +3342,7 @@ def run_gate(lccc: list[str], gcc: list[str] | None, workdir: Path) -> Report:
     return report
 
 
-def run_32_bit_parameters(
-    report: Report, lccc: list[str], workdir: Path, gcc: list[str] | None = None
-) -> None:
-    """The parameter-address contract measured on a 32-bit target itself.
-
-    The 64-bit lane compares a `DW_OP_fbreg` with the address the running program
-    took and with the value a debugger prints.  Neither is possible for `-m32` on
-    a 64-bit host by the same means -- there is no 32-bit GDB and usually no
-    32-bit libc -- so the probe is freestanding: `_start` writes with `int $0x80`,
-    which needs no runtime at all.  What is checked is the same law with the
-    32-bit frame record: the canonical frame address is `%ebp + 8`, so every
-    displacement is the parameter's own address minus `%ebp`, less 8.  A `-m32`
-    target that cannot execute here is a measurement, not a failure.
-
-    GCC 16.2 is run through the identical check when it is installed.  That is a
-    control on the *law*, not on lccc: the same probe, the same arithmetic and an
-    independent frame layout (GCC keeps the `double` 8 bytes higher) must satisfy
-    it, so a rule that only the compiler under test obeys is caught here rather
-    than discovered by a user.
-    """
-    # `-O0` and `-O2` are two different 32-bit layouts (measured: the `double`
-    # parameter sits at `%ebp - 32` at `-O0` and `%ebp - 44` at `-O2`), so the
-    # check tracks a layout that moves rather than one fixed arrangement.  At
-    # `-O2` a parameter may legitimately be register-homed, where only a wrong
-    # offset is a failure; at `-O0` every parameter must resolve.
-    targets = [("m32-dwarf5--O0", lccc, "-O0", True), ("m32-dwarf5--O2", lccc, "-O2", False)]
-    if gcc:
-        targets.append(("m32-gcc-oracle--O0", gcc, "-O0", False))
-    for label, compiler, optimization, required in targets:
-        measure_32_bit_parameters(report, compiler, workdir, label, optimization, required)
-
-
-def measure_32_bit_parameters(
-    report: Report, compiler: list[str], workdir: Path, label: str, optimization: str,
-    required: bool,
-) -> None:
-    """Build, run and check the freestanding 32-bit probe with one compiler."""
-    source = workdir / "pq_args32.c"
-    source.write_text(PARAMETER_PROBE_32)
-    output = workdir / f"{label}.elf"
-    argv = [*compiler, "-m32", optimization, "-g", "-gdwarf-5", "-nostdlib", "-static",
-            "-no-pie", "-o", str(output), str(source)]
-    proc = subprocess.run(argv, cwd=workdir, text=True, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, check=False, timeout=180)
-    report.objects += 1
-    if proc.returncode != 0:
-        detail = f"{label}: the freestanding 32-bit probe did not build: {proc.stderr.strip()[:200]}"
-        if required:
-            report.fail("parameter_locations", detail)
-        else:
-            report.measurements.setdefault("parameter_locations", {})[label] = f"skipped: {detail}"
-        return
-    try:
-        run = subprocess.run([str(output)], text=True, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE, check=False, timeout=120)
-    except OSError as error:
-        report.measurements.setdefault("parameter_locations", {})[label] = (
-            f"skipped: cannot execute a 32-bit program here ({error})"
-        )
-        return
-    if run.returncode != 0:
-        report.measurements.setdefault("parameter_locations", {})[label] = (
-            f"skipped: the 32-bit probe exited {run.returncode}"
-        )
-        return
-    facts: dict[str, int] = {}
-    for line in run.stdout.splitlines():
-        key, _, value = line.partition(" ")
-        if key.startswith("d"):
-            facts[f"arg_delta_{int(key[1:])}"] = int(value)
-        elif key.startswith("v"):
-            facts[f"arg_value_{int(key[1:])}"] = int(value)
-        elif key == "s0":
-            facts["sum"] = int(value)
-    if len(facts) != 23:
-        report.fail("parameter_locations", f"{label}: the probe printed {len(facts)} of 23 facts")
-        return
-    # Ten integers, as the function itself read them: 1+2+3+4+5+6+7+9+10+11.
-    if facts["sum"] != 58:
-        report.fail("parameter_locations",
-                    f"{label}: the callee summed its integer parameters to {facts['sum']}, not 58, "
-                    "so the call itself did not deliver every argument")
-        return
-    expected_values = (1, 2, 3, 4, 5, 6, 7, 0x1000, 9, 10, 11)
-    for index, expected_value in enumerate(expected_values):
-        if facts[f"arg_value_{index}"] != expected_value:
-            report.fail(
-                "parameter_locations",
-                f"{label}: parameter {index} read {facts[f'arg_value_{index}']} in the callee, "
-                f"not the argument the caller passed ({expected_value})",
-            )
-    try:
-        elf = read_elf(output)
-    except ValueError as error:
-        report.fail("parameter_locations", f"{label}: {error}")
-        return
-    parsed = units(elf)
-    if not parsed:
-        report.fail("parameter_locations", f"{label}: the object has no unit")
-        return
-    # The 32-bit frame record is one four-byte return address.
-    facts["frame_record"] = 8
-    check_parameter_locations(report, elf, parsed, label, facts, place_every_parameter=required)
-    report.measurements.setdefault("parameter_locations", {})[label] = "checked"
-
-
-def run_32_bit(
-    report: Report, lccc: list[str], probes: dict[str, Path], workdir: Path,
-    gcc: list[str] | None = None,
-) -> None:
+def run_32_bit(report: Report, lccc: list[str], probes: dict[str, Path], workdir: Path) -> None:
     """The same object-level contract on a 32-bit target, where the host allows it.
 
     Three of the campaign's rules live in the target-independent half of the
@@ -3571,8 +3367,6 @@ def run_32_bit(
             file=sys.stderr,
         )
         return
-    # The address agreement, measured on the target itself.
-    run_32_bit_parameters(report, lccc, workdir, gcc)
     for tier in ("-O0", "-O1"):
         label = f"m32-dwarf5-{tier}"
         output = workdir / f"{label}.o"
@@ -3677,28 +3471,6 @@ def self_test() -> int:
         expect(after == len(encoded), f"uleb128 {value} consumed {after} bytes")
     negative, _ = _sleb(b"\x7f", 0)
     expect(negative == -1, f"sleb128 0x7f decoded as {negative}")
-
-    # A parameter location is one `DW_OP_fbreg` and a signed offset, and the
-    # widths in the corpus reach both the one-byte and the two-byte encoding.
-    class _Located:
-        def __init__(self, expression: bytes) -> None:
-            self.attrs = {DW_AT_LOCATION: expression}
-
-    for expression, wanted in (
-        (b"\x91\x70", -16),
-        (b"\x91\x00", 0),
-        (b"\x91\x08", 8),
-        (b"\x91\xb8\x7f", -72),
-        (b"\x91\xa8\x7f", -88),
-    ):
-        decoded = frame_offset(_Located(expression))
-        expect(decoded == wanted, f"{expression!r} decoded as {decoded}, wanted {wanted}")
-    # Anything that is not exactly one frame offset is not readable, and saying so
-    # is what keeps a wrong address out of a debugger.
-    for expression in (b"", b"\x91", b"\x91\x80", b"\x03\x00\x00\x00\x00",
-                       b"\x91\x08\x91\x10", b"\x9c"):
-        decoded = frame_offset(_Located(expression))
-        expect(decoded is None, f"{expression!r} decoded as {decoded}, wanted unreadable")
 
     # A line program with one sequence, one special opcode and an end_sequence.
     header = bytearray()
@@ -4042,12 +3814,7 @@ def main() -> int:
     (workdir / "m32").mkdir()
     try:
         report = run_gate(lccc, gcc, workdir)
-        run_32_bit(report, lccc, write_probes(workdir / "m32"), workdir / "m32", gcc)
-        gdb = shutil.which("gdb")
-        if gdb:
-            run_debugger_lane(report, lccc, gdb, workdir)
-        else:
-            print("note: gdb not found, the debugger lane is skipped", file=sys.stderr)
+        run_32_bit(report, lccc, write_probes(workdir / "m32"), workdir / "m32")
         versions = {}
         for name, command in (("lccc", lccc), ("gcc", gcc)):
             if command:

@@ -83,7 +83,11 @@ pub(super) fn append_debug_sections(
             while end < relocs.len() && relocs[end].offset == first.offset {
                 end += 1;
             }
-            let width = relocs[group..end].iter().map(|r| r.width).max().unwrap();
+            let width = relocs[group..end]
+                .iter()
+                .map(|r| r.width)
+                .max()
+                .ok_or("empty debug relocation group")?;
             if first.offset < cursor || first.offset + width > section.data.len() {
                 return Err("overlapping or out-of-bounds debug relocation".into());
             }
@@ -375,10 +379,15 @@ impl<'a> Elf<'a> {
                         .data
                         .get(offset..offset.checked_add(width).ok_or("REL overflow")?)
                         .ok_or("REL addend outside section")?;
-                    if width == 4 {
-                        u32::from_le_bytes(data.try_into().unwrap()) as i32 as i64
-                    } else {
-                        u64::from_le_bytes(data.try_into().unwrap()) as i64
+                    match width {
+                        1 => i8::from_le_bytes(data.try_into().map_err(|_| "REL addend width")?)
+                            as i64,
+                        2 => i16::from_le_bytes(data.try_into().map_err(|_| "REL addend width")?)
+                            as i64,
+                        4 => i32::from_le_bytes(data.try_into().map_err(|_| "REL addend width")?)
+                            as i64,
+                        8 => i64::from_le_bytes(data.try_into().map_err(|_| "REL addend width")?),
+                        _ => return Err("unsupported REL addend width".into()),
                     }
                 };
                 result.push(Reloc {
@@ -398,19 +407,22 @@ fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, String> {
     let data = bytes
         .get(offset..offset.checked_add(2).ok_or("ELF integer overflow")?)
         .ok_or("truncated ELF integer")?;
-    Ok(u16::from_le_bytes(data.try_into().unwrap()))
+    let bytes = data.try_into().map_err(|_| "truncated ELF integer")?;
+    Ok(u16::from_le_bytes(bytes))
 }
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, String> {
     let data = bytes
         .get(offset..offset.checked_add(4).ok_or("ELF integer overflow")?)
         .ok_or("truncated ELF integer")?;
-    Ok(u32::from_le_bytes(data.try_into().unwrap()))
+    let bytes = data.try_into().map_err(|_| "truncated ELF integer")?;
+    Ok(u32::from_le_bytes(bytes))
 }
 fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, String> {
     let data = bytes
         .get(offset..offset.checked_add(8).ok_or("ELF integer overflow")?)
         .ok_or("truncated ELF integer")?;
-    Ok(u64::from_le_bytes(data.try_into().unwrap()))
+    let bytes = data.try_into().map_err(|_| "truncated ELF integer")?;
+    Ok(u64::from_le_bytes(bytes))
 }
 fn read_string(table: &[u8], offset: usize) -> Result<&str, String> {
     let bytes = table.get(offset..).ok_or("string offset outside table")?;

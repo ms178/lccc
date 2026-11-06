@@ -805,17 +805,6 @@ pub struct CodegenState {
     /// skip the alloca load for these and just emit a no-op (the value is
     /// already in the register-allocated destination).
     pub param_pre_stored: FxHashSet<usize>,
-    /// `-g`: each parameter's home as a displacement from the canonical frame
-    /// address, computed once the prologue has laid the frame out (`None` for a
-    /// parameter whose home the layout cannot promise).  The DWARF writer turns
-    /// these into `DW_AT_location` expressions; see `backend::debug_frame` for
-    /// why only a proven home is reported.
-    pub debug_param_homes: Vec<Option<i32>>,
-    /// `-g`: the homes of every function emitted so far.  Module-wide, unlike
-    /// [`Self::debug_param_homes`], which each function overwrites: nothing
-    /// resets this but [`Self::take`](../../backend/debug_frame) at the end of a
-    /// unit, so a later function cannot erase an earlier one's facts.
-    pub debug_frames: crate::backend::debug_frame::DebugFrameFacts,
     /// Entry-prefix `VecLoad` results whose value the prologue already moved
     /// from the incoming `%xmmN`/`%ymmN` argument register into the load's
     /// register home (`regalloc_helpers::x86_vector_param_loads`). The load
@@ -1079,8 +1068,6 @@ impl CodegenState {
             frame_offset_aliases: FxHashMap::default(),
             dead_param_ref_dests: FxHashSet::default(),
             param_pre_stored: FxHashSet::default(),
-            debug_param_homes: Vec::new(),
-            debug_frames: crate::backend::debug_frame::DebugFrameFacts::default(),
             vec_param_preloaded: FxHashSet::default(),
             uses_sret: false,
             function_sections: false,
@@ -1356,9 +1343,6 @@ impl CodegenState {
         self.call_gp_arg_count = 6;
         self.call_fp_arg_count = None;
         self.value_locations.clear();
-        // Per function, not per unit: the next function recomputes its own homes
-        // and `debug_frames` keeps the ones already handed over.
-        self.debug_param_homes.clear();
         self.incoming_byval_slots.clear();
         self.alloca_values.clear();
         self.volatile_alloca_values.clear();

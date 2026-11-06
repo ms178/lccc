@@ -319,44 +319,6 @@ impl DwarfType {
     }
 }
 
-/// Where a value's bytes are, as a `DW_AT_location` expression says it.
-///
-/// A location is a *promise*: a consumer prints whatever it finds there and
-/// never re-checks it, so the only form this type names is one the frame layout
-/// proved for the whole function body.  That is a constant displacement from the
-/// canonical frame address (`DW_OP_fbreg`, the expression `DW_AT_frame_base =
-/// DW_OP_call_frame_cfa` makes readable): the frame address and the slot are both
-/// fixed once the prologue has run, so their difference is a compile-time
-/// constant that stays true at every instruction -- no location list, no
-/// `DW_OP_piece`, and nothing to get wrong when the function has a branch.
-///
-/// A value the layout cannot promise (a parameter homed in a register, an
-/// over-aligned automatic object whose address is aligned at run time, a frame
-/// with no stable anchor) gets `None` instead.  A consumer renders that as
-/// `<optimized out>`; a wrong expression would render as a confident wrong
-/// number, which is the one failure mode DWARF cannot recover from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DwarfLocation {
-    /// `DW_OP_fbreg <delta>`: the value starts `delta` bytes from the canonical
-    /// frame address, whose rule is `DW_AT_frame_base` (`DW_OP_call_frame_cfa`).
-    FrameOffset(i32),
-}
-
-impl DwarfLocation {
-    /// The expression's bytes, without the length that a block form puts in
-    /// front: `DW_OP_fbreg` (one opcode) then a signed LEB128 displacement.
-    pub(crate) fn expression(&self) -> Vec<u8> {
-        match *self {
-            DwarfLocation::FrameOffset(delta) => {
-                let mut out = Vec::with_capacity(6);
-                out.push(super::dwarf::DW_OP_FBREG);
-                super::dwarf::write_sleb128(i64::from(delta), &mut out);
-                out
-            }
-        }
-    }
-}
-
 /// One parameter of a function this unit defines: the `DW_TAG_formal_parameter`
 /// a debugger lists `pq_frame` as taking.
 ///

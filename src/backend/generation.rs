@@ -6597,13 +6597,6 @@ fn generate_function_body(
     // ABI entry needs); the next source row is where a prologue skip stops.
     if debug_rows_enabled(cg, source_mgr, file_table) {
         cg.state().pending_prologue_end = true;
-        // The parameter homes the prologue just decided, for the writer that
-        // will describe them. This is the only moment they exist: the slots are
-        // assigned by `emit_store_params`, and nothing after it changes them.
-        let homes = cg.take_debug_parameter_offsets();
-        if homes.iter().any(Option::is_some) {
-            cg.state().debug_frames.record(&func.name, homes);
-        }
     }
 
     let entry_label = func.blocks.first().map(|b| b.label);

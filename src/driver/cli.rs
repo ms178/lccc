@@ -3359,7 +3359,9 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                     || arg.starts_with("-falign-jumps=")
                     || arg.starts_with("-falign-functions=") =>
                 {
-                    let (kind, value) = arg.split_once('=').unwrap();
+                    let Some((kind, value)) = arg.split_once('=') else {
+                        return Err(format!("invalid alignment argument '{arg}'"));
+                    };
                     match Self::parse_align_spec(value) {
                         Some(control) => match kind {
                             "-falign-loops" => self.align_loops = control,
@@ -3525,7 +3527,10 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                     || arg.starts_with("-fmacro-prefix-map=")
                     || arg.starts_with("-ffile-prefix-map=") =>
                 {
-                    let value = arg.split_once('=').expect("prefix-map has =").1;
+                    let value = arg
+                        .split_once('=')
+                        .map(|(_, value)| value)
+                        .ok_or_else(|| format!("invalid prefix map '{arg}': expected OLD=NEW"))?;
                     let (prefix, replacement) = value
                         .split_once('=')
                         .ok_or_else(|| format!("invalid prefix map '{arg}': expected OLD=NEW"))?;

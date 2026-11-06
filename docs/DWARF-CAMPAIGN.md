@@ -501,7 +501,10 @@ locations remain the named quality gap.
 pseudo-op. GAS rejects unknown pseudo-ops, so that design was withdrawn. Homes
 now travel through one invocation-owned `DebugHomeReport` (parameters and locals
 under a single lock) and are attached to `DwarfUnitSpec` metadata keyed by the
-original C parameter index
+original C parameter index. This supersedes the earlier constant
+`DebugFrameFacts`/`DW_OP_fbreg` channel: a whole-function constant is wrong at
+the entry instruction before the prologue store, while the location list claims
+only `prologue_end..epilogue_begin`
 (not the physical IR index: hidden sret and ABI-decomposed pieces must not steal
 a name). For `-S`, D7 renders the resulting DIE/location-list bytes as data, so
 GAS and lccc's assembler deliver the same tree.

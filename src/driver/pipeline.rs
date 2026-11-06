@@ -2751,9 +2751,6 @@ impl Driver {
         }
         let mut merged = crate::ir::whole_program::merge_modules(modules)?;
         crate::ir::whole_program::internalize_module(&mut merged, false);
-        // `-g`: a whole-program module has no per-unit spec to attach frame facts
-        // to (the DIE tree of this path is statement-level only), so the facts are
-        // dropped rather than described against the wrong unit.
         self.compile_ir_module_to_assembly(
             merged,
             None,
@@ -2765,7 +2762,6 @@ impl Driver {
             t0,
             None,
         )
-        .map(|(asm, _facts)| asm)
     }
 
     fn parse_and_analyze_c_tu(
@@ -3060,7 +3056,9 @@ impl Driver {
                 &sema_result.file_scope_objects,
                 &_lowered_types,
                 source_manager.as_deref(),
-                debug_functions.as_ref().expect("debug functions cloned"),
+                debug_functions
+                    .as_ref()
+                    .ok_or_else(|| "debug function metadata missing".to_string())?,
                 Some(&module),
             ))
         } else {
@@ -4583,7 +4581,7 @@ impl Driver {
             zero_call_used_regs: self.zero_call_used_regs,
             zero_call_used_regs_fp_simd: self.resolved_zero_call_used_regs_fp_simd(),
         };
-        let (asm, frame_facts) = self.target.generate_assembly_with_opts_and_debug(
+        let asm = self.target.generate_assembly_with_opts_and_debug(
             module,
             &opts,
             source_manager.map(|sm| &**sm),
@@ -4659,7 +4657,7 @@ impl Driver {
             _ => asm,
         };
 
-        Ok((asm, frame_facts))
+        Ok(asm)
     }
 }
 
