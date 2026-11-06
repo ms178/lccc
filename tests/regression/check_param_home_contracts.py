@@ -23,6 +23,9 @@ Checks (every one is non-vacuous; `--self-test` proves each can FAIL):
      O(1) probe missed and the O(instructions) fallback used to handle.
   6. The shipped parameter-home index has no per-query full scan left in
      production code (structural guard, with a non-vacuous self-test).
+  7. Diagnostic output is best-effort: piping a diagnostic-heavy compile to
+     a reader that exits early must still exit 1 (a clean verdict), not 101
+     (Rust `eprintln!` panicking on BrokenPipe).
 
 Usage:
   python3 tests/regression/check_param_home_contracts.py
@@ -189,7 +192,7 @@ def check_headers(work: pathlib.Path) -> None:
         got, etype = elf_machine(obj)
         require(got == machine and etype == 1,
                 f"{isa}: e_machine={got} e_type={etype}, want {machine}/ET_REL")
-    print("  [1a/7] all four drivers resolve target-neutral GCC private headers"
+    print("  [1a] all four drivers resolve target-neutral GCC private headers"
           " WITHOUT extra flags: PASS")
 
     # The glibc half: build the documented overlay in the gate itself so CI
@@ -210,7 +213,7 @@ def check_headers(work: pathlib.Path) -> None:
         got, etype = elf_machine(obj)
         require(got == machine and etype == 1,
                 f"{isa}: glibc overlay produced {got}/{etype}, want {machine}/ET_REL")
-    print("  [1b/7] documented host-header overlay resolves <limits.h> on all"
+    print("  [1b] documented host-header overlay resolves <limits.h> on all"
           " four drivers: PASS (compile-only, NOT ABI/execute coverage)")
 
 
@@ -228,7 +231,7 @@ def check_arm_x87_asm(work: pathlib.Path) -> None:
     require(not BAD_FMOV.search(text), "width-mismatched fmov in emitted assembly")
     require(GOOD_FMOV.search(text) is not None,
             "expected a width-correct fmov (the FP->GP move the fix emits)")
-    print("  [2/7] AArch64 x87-only inline asm: no ICE, valid object, width-correct fmov: PASS")
+    print("  [2] AArch64 x87-only inline asm: no ICE, valid object, width-correct fmov: PASS")
 
 
 def check_scaling(work: pathlib.Path) -> None:
@@ -245,7 +248,7 @@ def check_scaling(work: pathlib.Path) -> None:
     require(ratio < QUADRATIC_RATIO,
             f"parameter homing still quadratic: t({LARGE_PARAMS})/t({SMALL_PARAMS})"
             f" = {ratio:.2f} (limit {QUADRATIC_RATIO}; pre-change was ~39x)")
-    print(f"  [3/7] i686 param homing scaling {ratio:.2f}x for 10x params"
+    print(f"  [3] i686 param homing scaling {ratio:.2f}x for 10x params"
           f" (limit {QUADRATIC_RATIO}x): PASS")
 
 
@@ -257,7 +260,7 @@ def check_determinism(work: pathlib.Path) -> None:
     compile_ok(driver, src, b, ["-O0"])
     require(a.read_bytes() == b.read_bytes(),
             "the slot index made object emission nondeterministic")
-    print("  [4/7] object emission is deterministic with the new slot index: PASS")
+    print("  [4] object emission is deterministic with the new slot index: PASS")
 
 
 def check_shifted_layout(work: pathlib.Path) -> None:
@@ -283,7 +286,7 @@ def check_shifted_layout(work: pathlib.Path) -> None:
             require(got == str(SHIFTED_EXPECTED).encode(),
                     f"x86_64 {opt} {label}: checksum {got!r}, "
                     f"want {SHIFTED_EXPECTED} -- parameter homing is wrong")
-    print(f"  [5a/7] shifted vs aligned parameter homes: identical checksum "
+    print(f"  [5a] shifted vs aligned parameter homes: identical checksum "
           f"{SHIFTED_EXPECTED} at -O0/-O2/-Os: PASS")
 
     # All four targets: a valid, panic-free object for the shifted layout.
@@ -298,8 +301,48 @@ def check_shifted_layout(work: pathlib.Path) -> None:
             compile_ok(driver, shifted, twin, [opt])
             require(obj.read_bytes() == twin.read_bytes(),
                     f"{isa} {opt}: shifted-layout object is nondeterministic")
-    print("  [5b/7] all four drivers emit deterministic, panic-free ELF objects "
+    print("  [5b] all four drivers emit deterministic, panic-free ELF objects "
           "for the shifted layout: PASS")
+
+
+def pipe_verdict_is_clean(rc: int) -> bool:
+    """The compiler's verdict must survive a vanished stderr reader."""
+    return rc == 1
+
+
+def check_diagnostic_pipe_safety(work: pathlib.Path) -> None:
+    # Enough diagnostics to overflow the pipe buffer after the reader closes;
+    # a handful of lines would fit in the kernel buffer and never see EPIPE.
+    bad = with_temp(work, "many-errors.c",
+                    b"int f(void) {\n" + b"  @ ;\n" * 2000 + b"}\n")
+    driver = DRIVERS["x86_64"][0]
+    control = work / "many-errors.log"
+    with control.open("wb") as log:
+        r = run([str(driver), "-w", "-c", str(bad), "-o", str(work / "many-errors.o")])
+        log.write(r.stdout + r.stderr)
+    require(r.returncode == 1,
+            f"control compile should fail cleanly, got rc={r.returncode}")
+    require(b"error:" in control.read_bytes(), "control emitted no diagnostics")
+
+    proc = subprocess.Popen(
+        [str(driver), "-w", "-c", str(bad), "-o", str(work / "many-errors-pipe.o")],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        for _ in range(2):
+            require(proc.stdout is not None and proc.stdout.readline() != b"",
+                    "compiler produced no diagnostics to pipe")
+        # Closing the read end is exactly what `| head -2` does.
+        proc.stdout.close()
+        rc = proc.wait(timeout=60)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    require(pipe_verdict_is_clean(rc),
+            f"broken-pipe diagnostics changed the compiler verdict: rc={rc} "
+            f"(101 = eprintln! panicking on BrokenPipe, 141 = SIGPIPE)")
+    print(f"  [7] diagnostic output survives a closed stderr pipe (rc={rc}, "
+          f"no Rust ICE): PASS")
 
 
 def structural_failures(production: bytes, prologues: dict[str, bytes]) -> list[str]:
@@ -330,7 +373,7 @@ def check_no_scan_fallback(work: pathlib.Path) -> None:
     }
     bad = structural_failures(production, prologues)
     require(not bad, "; ".join(bad))
-    print("  [6/7] no per-query full scan in production; all four prologues build "
+    print("  [6] no per-query full scan in production; all four prologues build "
           "the index once: PASS")
 
 
@@ -388,7 +431,11 @@ def self_test() -> None:
     missing["riscv"] = b""
     rejects(lambda: require(not structural_failures(good_prod, missing),
                             "prologue without an index build"))
-    require(cases == 11, f"self-test covered {cases}/11 rejection paths")
+    # The broken-pipe verdict rule must reject an ICE and a success.
+    rejects(lambda: require(pipe_verdict_is_clean(101), "rust ICE"))
+    rejects(lambda: require(pipe_verdict_is_clean(0), "wrong verdict"))
+    require(pipe_verdict_is_clean(1), "clean verdict rejected")
+    require(cases == 13, f"self-test covered {cases}/13 rejection paths")
     print(f"SELF_TEST_OK ({cases} rejection paths proven non-vacuous)")
 
 
@@ -409,6 +456,7 @@ def main(argv: list[str] | None = None) -> int:
             check_determinism(work)
             check_shifted_layout(work)
             check_no_scan_fallback(work)
+            check_diagnostic_pipe_safety(work)
     except Failure as exc:
         print(f"PARAM_HOME_CONTRACTS_FAIL: {exc}", file=sys.stderr)
         return 1

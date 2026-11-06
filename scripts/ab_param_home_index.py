@@ -86,10 +86,25 @@ def one(job: tuple) -> dict:
     do, dn = digest(old_out), digest(new_out)
     old_out.unlink(missing_ok=True)
     new_out.unlink(missing_ok=True)
-    if rco == 0 and rcn == 0:
+    # Timeouts are classified explicitly: the refactor is faster on the
+    # pathological sources, so "old timed out, new succeeded" is EVIDENCE,
+    # not a divergence.  Only a NEW timeout with an OLD success is a
+    # regression, and a double timeout is deferred to the long-timeout leg.
+    if rco == 124 and rcn == 124:
+        status = "both-timeout"
+    elif rco == 124 and rcn == 0:
+        status = "old-timeout-new-succeeded"
+    elif rcn == 124 and rco == 0:
+        status = "new-timeout-old-succeeded"
+    elif rco == 0 and rcn == 0:
         status = "identical" if do == dn else "divergent"
     elif rco != 0 and rcn != 0:
-        status = "both-fail" if (rco == rcn and eo == en) else "diagnostic-divergent"
+        # Output paths differ by construction (the two legs write to
+        # *_old.s / *_new.s); normalise them before comparing diagnostics so
+        # the comparison measures the compiler, not our own filenames.
+        eo_norm = eo.replace(b"_old.s", b"_OUT.s").replace(b"_old.o", b"_OUT.o")
+        en_norm = en.replace(b"_new.s", b"_OUT.s").replace(b"_new.o", b"_OUT.o")
+        status = "both-fail" if (rco == rcn and eo_norm == en_norm) else "diagnostic-divergent"
     else:
         status = "rc-divergent"
     return {
@@ -122,6 +137,10 @@ def main() -> int:
                          "compiler stress cases, run separately with a long timeout)")
     ap.add_argument("--include", default="",
                     help="if set, ONLY sources matching this glob are run")
+    ap.add_argument("--exclude-file", default="",
+                    help="file with one basename per line to skip")
+    ap.add_argument("--include-file", default="",
+                    help="file with one basename per line to run exclusively")
     args = ap.parse_args()
 
     suite = pathlib.Path(args.suite)
@@ -131,6 +150,12 @@ def main() -> int:
         sources = [s for s in sources if fnmatch.fnmatch(s.name, args.include)]
     elif args.exclude:
         sources = [s for s in sources if not fnmatch.fnmatch(s.name, args.exclude)]
+    if args.exclude_file:
+        names = set(pathlib.Path(args.exclude_file).read_text().split())
+        sources = [s for s in sources if s.name not in names]
+    if args.include_file:
+        names = set(pathlib.Path(args.include_file).read_text().split())
+        sources = [s for s in sources if s.name in names]
     if args.limit:
         sources = sources[: args.limit]
     opts = args.opts.split(",")
@@ -153,7 +178,8 @@ def main() -> int:
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
         for i, res in enumerate(pool.map(one, jobs), 1):
             counts[res["status"]] = counts.get(res["status"], 0) + 1
-            if "divergent" in res["status"]:
+            if res["status"] in ("divergent", "diagnostic-divergent", "rc-divergent",
+                                 "new-timeout-old-succeeded"):
                 divergences.append(res)
                 print(f"  DIVERGENCE {res['source']} {res['arch']} {res['opt']} "
                       f"status={res['status']} old_rc={res['old_rc']} new_rc={res['new_rc']} "

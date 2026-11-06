@@ -1810,28 +1810,28 @@ impl DiagnosticEngine {
             let suffix = if is_last { ":" } else { "," };
             if i == 0 {
                 if self.use_color {
-                    eprintln!(
+                    crate::common::cli_output::stderr_line(format_args!(
                         "\x1b[1mIn file included from {}:{}{}\x1b[0m",
                         origin.file, origin.line, suffix
-                    );
+                    ));
                 } else {
-                    eprintln!(
+                    crate::common::cli_output::stderr_line(format_args!(
                         "In file included from {}:{}{}",
                         origin.file, origin.line, suffix
-                    );
+                    ));
                 }
             } else {
                 // "                 from " aligns with "In file included from "
                 if self.use_color {
-                    eprintln!(
+                    crate::common::cli_output::stderr_line(format_args!(
                         "\x1b[1m                 from {}:{}{}\x1b[0m",
                         origin.file, origin.line, suffix
-                    );
+                    ));
                 } else {
-                    eprintln!(
+                    crate::common::cli_output::stderr_line(format_args!(
                         "                 from {}:{}{}",
                         origin.file, origin.line, suffix
-                    );
+                    ));
                 }
             }
         }
@@ -1896,7 +1896,7 @@ impl DiagnosticEngine {
             }
             let _ = write!(msg, "{}: {}", diag.severity, diag.message);
         }
-        eprintln!("{}", msg);
+        crate::common::cli_output::stderr_line(format_args!("{}", msg));
 
         // Source snippet with caret underline
         if let Some(span) = diag.span {
@@ -1906,9 +1906,12 @@ impl DiagnosticEngine {
         // Render fix-it hint if present
         if let Some(ref hint) = diag.fix_hint {
             if self.use_color {
-                eprintln!("  \x1b[1;32mfix-it hint:\x1b[0m {}", hint);
+                crate::common::cli_output::stderr_line(format_args!(
+                    "  \x1b[1;32mfix-it hint:\x1b[0m {}",
+                    hint
+                ));
             } else {
-                eprintln!("  fix-it hint: {}", hint);
+                crate::common::cli_output::stderr_line(format_args!("  fix-it hint: {}", hint));
             }
         }
 
@@ -1974,15 +1977,15 @@ impl DiagnosticEngine {
         // Limit to 3 levels to avoid noisy output for deeply nested macros.
         for name in interesting.iter().take(3) {
             if self.use_color {
-                eprintln!(
+                crate::common::cli_output::stderr_line(format_args!(
                     "\x1b[1m{}:{}:{}: \x1b[0m\x1b[1;36mnote:\x1b[0m \x1b[1min expansion of macro '{}'\x1b[0m",
                     loc.file, loc.line, loc.column, name
-                );
+                ));
             } else {
-                eprintln!(
+                crate::common::cli_output::stderr_line(format_args!(
                     "{}:{}:{}: note: in expansion of macro '{}'",
                     loc.file, loc.line, loc.column, name
-                );
+                ));
             }
         }
     }
@@ -2059,7 +2062,7 @@ impl DiagnosticEngine {
         };
 
         // Print the source line with indentation
-        eprintln!(" {}", shown);
+        crate::common::cli_output::stderr_line(format_args!(" {}", shown));
 
         // Build the caret line: spaces up to the column, then ^ with tildes
         if caret_pad > 0 {
@@ -2084,9 +2087,12 @@ impl DiagnosticEngine {
                 "^".to_string()
             };
             if self.use_color {
-                eprintln!("{}\x1b[1;32m{}\x1b[0m", padding, underline);
+                crate::common::cli_output::stderr_line(format_args!(
+                    "{}\x1b[1;32m{}\x1b[0m",
+                    padding, underline
+                ));
             } else {
-                eprintln!("{}{}", padding, underline);
+                crate::common::cli_output::stderr_line(format_args!("{}{}", padding, underline));
             }
         }
     }
