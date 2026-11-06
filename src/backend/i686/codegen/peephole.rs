@@ -15484,7 +15484,7 @@ impl PeepClock {
     fn new(lines: usize) -> Self {
         let enabled = std::env::var_os("CCC_TIME_PEEPHOLE").is_some();
         if enabled {
-            lccc::cli_output::stderr_line(format_args!("[PEEP] lines={lines}"));
+            lccc::cli::stderr_line(format_args!("[PEEP] lines={lines}"));
         }
         Self {
             enabled,
@@ -15494,7 +15494,7 @@ impl PeepClock {
     #[inline]
     fn mark(&mut self, label: &str) {
         if self.enabled {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[PEEP] {label}: {:.3}s",
                 self.last.elapsed().as_secs_f64()
             ));
@@ -25067,7 +25067,7 @@ f:
         let asm =
             pair_fn("    andl $4, %eax\n    movl %eax, 8(%esp)\n    movl %esi, %eax\n    ret\n");
         let out = peephole_optimize(asm);
-        lccc::cli_output::stderr_line(format_args!("=== without testb pass:\n{out}"));
+        lccc::cli::stderr_line(format_args!("=== without testb pass:\n{out}"));
         assert!(
             out.contains("andl $4"),
             "without the testb pass the AND must survive"
@@ -26740,7 +26740,7 @@ mod dispatch_and_pin_tests {
                     assert_eq!(out.lines().filter(|s| s.ends_with(':')).count(), 2);
                 }
                 timings.sort();
-                lccc::cli_output::stdout_line(format_args!(
+                lccc::cli::stdout_line(format_args!(
                     "chain={chain} candidates={count} median_us={}",
                     timings[2].as_micros()
                 ));

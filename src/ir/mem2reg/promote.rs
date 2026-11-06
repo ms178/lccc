@@ -110,7 +110,7 @@ pub fn promote_function(func: &mut IrFunction, promote_params: bool) {
             .iter()
             .filter(|i| matches!(i, Instruction::Alloca { .. }))
             .count();
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[mem2reg] func '{}': {} total allocas, {} promotable, {} params",
             func.name,
             total_allocas,

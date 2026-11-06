@@ -352,7 +352,7 @@ impl X86Codegen {
         }
         let deferred = self.state.vector_defer_values.contains(&dest_ptr.0);
         if deferred && std::env::var("CCC_DEBUG_VDEFER").is_ok() {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VDEFER-EMIT] deferring result store for dest_ptr={}",
                 dest_ptr.0
             ));
@@ -977,7 +977,7 @@ impl X86Codegen {
             None => format!("{}(%{})", disp_str, phys_reg_name(base)),
         };
         if std::env::var("CCC_DEBUG_VLFOLD").is_ok() {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VLFOLD-EMIT] elide load %{} <- {} {}",
                 d.0, mnemonic, mem
             ));
@@ -1013,7 +1013,7 @@ impl X86Codegen {
             return;
         };
         if std::env::var("CCC_DEBUG_VLFOLD").is_ok() {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VLFOLD-EMIT] materialising %{} (unexpected consumer)",
                 pf.val
             ));
@@ -1039,7 +1039,7 @@ impl X86Codegen {
             return;
         };
         if std::env::var("CCC_DEBUG_VDEFER").is_ok() {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VDEFER-EMIT] flushing pending store for val={}",
                 val_id
             ));
@@ -1986,7 +1986,7 @@ impl X86Codegen {
         }
         let deferred = self.state.vector_defer_values.contains(&dest_ptr.0);
         if deferred && std::env::var("CCC_DEBUG_VDEFER").is_ok() {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VDEFER-EMIT] deferring result store for dest_ptr={}",
                 dest_ptr.0
             ));

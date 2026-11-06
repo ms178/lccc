@@ -1754,7 +1754,7 @@ fn peephole_optimize_inner(
             }
         }
         if let Some(s) = iter_start {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[PEEPHOLE-TIME] phase1 iteration {}: {:.1} ms",
                 pass_count,
                 s.elapsed().as_secs_f64() * 1e3
@@ -1882,7 +1882,7 @@ fn peephole_optimize_inner(
         global_changed
     };
     if let Some(s) = phase2_start {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[PEEPHOLE-TIME] phase2: {:.1} ms",
             s.elapsed().as_secs_f64() * 1e3
         ));
@@ -2315,7 +2315,7 @@ fn peephole_optimize_inner(
     }
 
     if let Some(s) = peephole_total {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[PEEPHOLE-TIME] total: {:.1} ms",
             s.elapsed().as_secs_f64() * 1e3
         ));
@@ -3554,7 +3554,7 @@ mod tests {
     fn test_fp_xmm_roundtrip_load_rax() {
         let asm = "    movq -32(%rbp), %rax\n    movq %rax, %xmm0\n".to_string();
         let result = peephole_optimize(asm);
-        lccc::cli_output::stderr_line(format_args!("fp_roundtrip result: {:?}", result));
+        lccc::cli::stderr_line(format_args!("fp_roundtrip result: {:?}", result));
         assert!(
             result.contains("movsd -32(%rbp), %xmm0"),
             "should eliminate rax roundtrip: {}",
@@ -3586,7 +3586,7 @@ mod tests {
     fn test_fp_xmm_roundtrip_store() {
         let asm = "    movq %xmm0, %rax\n    movq %rax, -48(%rbp)\n".to_string();
         let result = peephole_optimize(asm);
-        lccc::cli_output::stderr_line(format_args!("fp_store result: {:?}", result));
+        lccc::cli::stderr_line(format_args!("fp_store result: {:?}", result));
         assert!(
             result.contains("movsd %xmm0, -48(%rbp)"),
             "should eliminate store roundtrip: {}",
@@ -5382,7 +5382,7 @@ mod regression_tests {
         // The correct result should be something like:
         //   movq %rdi, -8(%rbp) or movq %rdi, %rax + leaq 208(%rax)...
         // NOT: leaq 208(%rax) with rax uninitialized!
-        lccc::cli_output::stderr_line(format_args!("Result:\n{}", result));
+        lccc::cli::stderr_line(format_args!("Result:\n{}", result));
         assert!(
             result.contains("movq %rdi, %rax")
                 || result.contains("movq -8(%rbp), %rax")
@@ -5660,7 +5660,7 @@ mod regression_tests {
             "    movb $0, (%rax)",
         ]);
         let result = peephole_optimize(asm);
-        lccc::cli_output::stderr_line(format_args!("sib_direct result: {:?}", result));
+        lccc::cli::stderr_line(format_args!("sib_direct result: {:?}", result));
         // Scale 1 and neither register is %rsp: base and index commute (the
         // copy+add fold may form the lea as (%r14,%rbx) before this fold).
         assert!(

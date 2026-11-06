@@ -129,7 +129,7 @@ pub(crate) fn set_trace_enabled(enabled: bool) {
 macro_rules! decline {
     () => {{
         if trace_enabled() {
-            lccc::cli_output::stderr_line(format_args!("[STRIDED] decline at line {}", line!()));
+            lccc::cli::stderr_line(format_args!("[STRIDED] decline at line {}", line!()));
         }
         return None;
     }};

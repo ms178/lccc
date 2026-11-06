@@ -306,7 +306,7 @@ impl IpaRaState {
                 // Usually a callee emitted later than its caller (one pass,
                 // no fixpoint); otherwise an unclassified body instruction.
                 let missing = missing_callee_summaries(text, summaries);
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[IPA-RA] {} not summarized: {}",
                     func.name,
                     if missing.is_empty() {

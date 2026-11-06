@@ -741,7 +741,7 @@ fn run_with_budget(
     solver.finish();
     if !solver.complete {
         if std::env::var_os("CCC_IPA_PTA_STATS").is_some() {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[IPA-PTA] analysis budget exhausted; all consumers disabled"
             ));
         }
@@ -756,7 +756,7 @@ fn run_with_budget(
                 .iter()
                 .map(|&target| module.functions[target].name.as_str())
                 .collect();
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[IPA-PTA] site id={} caller={} targets={:?} external={} effects={:?}",
                 site_id, module.functions[site.caller].name, targets, site.external, effects
             ));
@@ -783,7 +783,7 @@ fn run_with_budget(
         escaped_objects,
     };
     if std::env::var_os("CCC_IPA_PTA_STATS").is_some() {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[IPA-PTA] nodes={} objects={} edges={} calls={} escaped={} work={}",
             analysis.nodes,
             analysis.objects.len(),
@@ -803,7 +803,7 @@ fn run_with_budget(
         module.for_each_function(super::dce::eliminate_dead_code);
     }
     if std::env::var_os("CCC_IPA_PTA_STATS").is_some() {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[IPA-PTA] redundant-loads-forwarded={eliminated}"
         ));
     }

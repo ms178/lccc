@@ -2159,7 +2159,7 @@ impl LinearScanAllocator {
                 || range.remaining_cost(range.start) <= MAX_SPAN_REMCOST)
         {
             if self.ra_config.trace_alloc {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[SPILL-TRACE] demote v{} @{} spans_loop={} in_loop_use={} in_loop_uses={} exposed={} recur={} remcost={} bar={} reserve={} total_spans={} site={}",
                     range.value_id,
                     range.start,
@@ -2256,7 +2256,7 @@ impl LinearScanAllocator {
             // this rule no longer demotes the hottest values in the loop.
             if range.span_marked && !range.span_has_in_loop_use && self.total_spans > allowed {
                 if self.ra_config.trace_alloc {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[SPILL-TRACE] demote v{} @{} spans_loop={} in_loop_use={} in_loop_uses={} exposed={} recur={} remcost={} bar={} reserve={} total_spans={} site={}",
                         range.value_id,
                         range.start,
@@ -2339,7 +2339,7 @@ impl LinearScanAllocator {
             if self.total_spans > allowed && worth_capping {
                 if self.loop_spanned_register_count() >= allowed {
                     if self.ra_config.trace_alloc {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[SPILL-TRACE] demote v{} @{} spans_loop={} in_loop_use={} in_loop_uses={} exposed={} recur={} remcost={} bar={} reserve={} total_spans={} site={}",
                             range.value_id,
                             range.start,
@@ -2367,7 +2367,7 @@ impl LinearScanAllocator {
                     return;
                 }
                 if self.ra_config.trace_alloc {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[SPILL-TRACE] demote v{} @{} spans_loop={} in_loop_use={} in_loop_uses={} exposed={} recur={} remcost={} bar={} reserve={} total_spans={} site={}",
                         range.value_id,
                         range.start,
@@ -2401,7 +2401,7 @@ impl LinearScanAllocator {
                                 active.range.conflicts_with(&range)
                             })
                         {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[ALLOC-BUG] Assigning val{}[{}-{}] to reg={} but val{}[{}-{}] already in reg={}!",
                                 range.value_id,
                                 range.start,
@@ -2441,7 +2441,7 @@ impl LinearScanAllocator {
         // it later if pressure ever arrives.
         if range.spans_loop && range.span_marked && !range.span_has_in_loop_use {
             if self.ra_config.trace_alloc {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[SPILL-TRACE] demote v{} @{} spans_loop={} in_loop_use={} in_loop_uses={} exposed={} recur={} remcost={} bar={} reserve={} total_spans={} site={}",
                     range.value_id,
                     range.start,
@@ -2521,7 +2521,7 @@ impl LinearScanAllocator {
         let floor_victim = if victim.is_none() {
             let idx = self.find_recurrence_floor_victim(&range);
             if idx.is_some() && self.ra_config.trace_alloc {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[SPILL-TRACE] recurrence-floor steal for v{} @{} remcost={} site=6",
                     range.value_id,
                     range.start,
@@ -2539,7 +2539,7 @@ impl LinearScanAllocator {
         } else {
             // `range` moved only on the success path above.
             if self.ra_config.trace_alloc {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[SPILL-TRACE] demote v{} @{} spans_loop={} in_loop_use={} in_loop_uses={} exposed={} recur={} remcost={} bar={} reserve={} total_spans={} site={}",
                     range.value_id,
                     range.start,
@@ -2847,7 +2847,7 @@ impl LinearScanAllocator {
         self.allocate_spill_slot(evicted_vid);
 
         if self.ra_config.trace_allocstats {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[EVICT] val{} reg={} -> val{}[{}] fut_in={}",
                 evicted_vid,
                 reg.0,

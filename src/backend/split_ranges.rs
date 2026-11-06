@@ -550,7 +550,7 @@ pub fn split_loop_transparent_ranges(func: &mut IrFunction, max_splits: usize) -
             };
 
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[SPLIT-LOOP] func {} loop header {}: split value {} at exit block {}",
                     func.name, header, vid, exit_block
                 ));
@@ -941,7 +941,7 @@ fn apply_local_call_split(
     }
 
     if split_debug_enabled() {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[SPLIT-CALL] func {} value {} wrapped {} call(s) in block {}",
             func.name, vid, wrapped, site_block
         ));
@@ -1745,7 +1745,7 @@ fn plan_block_splits(
     }
     let bl = analyze_block_liveness(func, liveness, bi, types);
     if split_debug_enabled() {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[SPLIT-PRESSURE] {} block {} pts={} live_spans={} budget={}",
             func.name,
             bi,
@@ -1883,7 +1883,7 @@ fn plan_block_splits(
                     }
                 }
             }
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[SPLIT-PRESSURE] {} blk{} peak_pt={} peak={} REJECT span={} used_at_peak={} noprev={} gap={} outside={}",
                 func.name, bi, peak_pt, peak, r_span, r_used, r_noprev, r_gap, r_out
             ));
@@ -2087,7 +2087,7 @@ fn apply_block_splits(
         // ordinary frame home.
         insert_entry_alloca(func, m.alloca, m.ty, true);
         if split_debug_enabled() {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[SPLIT-PRESSURE] {} block {} value {} store@{} reload@{}",
                 func.name, bi, m.vid, m.store_at, m.reload_at
             ));

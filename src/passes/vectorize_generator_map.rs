@@ -942,7 +942,7 @@ pub(super) fn transform_function(func: &mut IrFunction, trace: bool) -> usize {
         return 0;
     };
     if trace {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-GEN] fn={} body=B{} header=H{} N={} C0={} iv_ty={:?}: packed generator loop",
             func.name, plan.body, plan.header, plan.limit, plan.c0, plan.iv_ty
         ));

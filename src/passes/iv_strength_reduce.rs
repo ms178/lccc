@@ -374,7 +374,7 @@ pub(crate) fn ivsr_with_analysis(
             .any(|kept| !kept.is_disjoint(&natural_loop.body));
         if overlaps_kept {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[IVSR] skip outer overlapping loop header={} blocks={} (overlaps kept inner)",
                     natural_loop.header,
                     natural_loop.body.len()
@@ -422,10 +422,7 @@ fn reduce_loop(
         Some(ph) => ph,
         None => {
             if dbg {
-                lccc::cli_output::stderr_line(format_args!(
-                    "[IVSR] header={} no preheader",
-                    header
-                ));
+                lccc::cli::stderr_line(format_args!("[IVSR] header={} no preheader", header));
             }
             return 0;
         }
@@ -442,7 +439,7 @@ fn reduce_loop(
     // Only handle simple single-latch loops
     if back_blocks.len() != 1 {
         if dbg {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[IVSR] header={} back_blocks={}",
                 header,
                 back_blocks.len()
@@ -455,12 +452,12 @@ fn reduce_loop(
     let basic_ivs = find_basic_ivs(func, header, &natural_loop.body, preheader, &back_blocks);
     if basic_ivs.is_empty() {
         if dbg {
-            lccc::cli_output::stderr_line(format_args!("[IVSR] header={} no basic ivs", header));
+            lccc::cli::stderr_line(format_args!("[IVSR] header={} no basic ivs", header));
         }
         return 0;
     }
     if dbg {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[IVSR] header={} ivs={}",
             header,
             basic_ivs.len()
@@ -478,15 +475,12 @@ fn reduce_loop(
     );
     if derived.is_empty() {
         if dbg {
-            lccc::cli_output::stderr_line(format_args!(
-                "[IVSR] header={} no derived exprs",
-                header
-            ));
+            lccc::cli::stderr_line(format_args!("[IVSR] header={} no derived exprs", header));
         }
         return 0;
     }
     if dbg {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[IVSR] header={} derived={}",
             header,
             derived.len()
@@ -645,7 +639,7 @@ fn reduce_loop(
             let bound = unsigned_iv_bound(func, natural_loop, iv, &back_blocks);
             if bound.is_none() {
                 if dbg {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[IVSR] header={} reject unproven modular iv v{} ty={:?} step={}",
                         header, iv.phi_dest.0, iv.ty, iv.step
                     ));
@@ -661,7 +655,7 @@ fn reduce_loop(
         };
         if !offset_product_cannot_overflow(mul_ty, stride, add_offset, unsigned_bound) {
             if dbg {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[IVSR] header={} reject overflowing {:?} offset product (stride {stride})",
                     header, mul_ty
                 ));
@@ -732,7 +726,7 @@ fn reduce_loop(
             && iv.ty.size() < crate::common::types::target_ptr_size();
         if sib_scaled && !from_address_add && !narrow_symbol_index {
             if dbg {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[IVSR] header={} skip SIB-friendly group iv={} stride={} (scaled-index form is free)",
                     header, iv_index, stride
                 ));
@@ -788,7 +782,7 @@ fn reduce_loop(
             }
             if chained > 0 {
                 if dbg {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[IVSR] header={} chained group iv={} k={} -> parent phi v{} + {} ({} uses)",
                         header, iv_index, add_offset, parent_phi.0, delta, chained
                     ));
@@ -1646,7 +1640,7 @@ fn find_derived_exprs(
     if dbg {
         let mut d: Vec<u32> = iv_derived.keys().copied().collect();
         d.sort_unstable();
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[IVSR-DERIV] iv_values={:?} iv_derived={:?}",
             iv_values.keys().collect::<Vec<_>>(),
             d
@@ -1660,7 +1654,7 @@ fn find_derived_exprs(
         }
         for inst in func.blocks[bi].instructions.iter() {
             if dbg {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[IVSR-DERIV] b{} label={} inst={:?}",
                     bi,
                     func.blocks[bi].label.0,
@@ -1670,7 +1664,7 @@ fn find_derived_exprs(
                     dest, op, lhs, rhs, ..
                 } = inst
                 {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[IVSR-DERIV] b{} label={} BinOp v{} op={:?} lhs={:?} rhs={:?}",
                         bi, func.blocks[bi].label.0, dest.0, op, lhs, rhs
                     ));
@@ -1792,7 +1786,7 @@ fn find_derived_exprs(
                     from_address_add: false,
                 });
             } else if dbg {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[IVSR-DERIV] mul v{} stride {} has no GEP uses",
                     mul_dest.0, stride
                 ));

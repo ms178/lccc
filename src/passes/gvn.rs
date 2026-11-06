@@ -1999,7 +1999,7 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                     match state.ptr_base.get(&pvn) {
                         Some(base) => {
                             if std::env::var_os("CCC_DEBUG_GVN").is_some() {
-                                lccc::cli_output::stderr_line(format_args!(
+                                lccc::cli::stderr_line(format_args!(
                                     "[GVNDBG] store bumps epoch of {:?}",
                                     base
                                 ));
@@ -2013,7 +2013,7 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                         }
                         None => {
                             if std::env::var_os("CCC_DEBUG_GVN").is_some() {
-                                lccc::cli_output::stderr_line(format_args!(
+                                lccc::cli::stderr_line(format_args!(
                                     "[GVNDBG] store UNKNOWN base -> global gen++"
                                 ));
                             }
@@ -2022,7 +2022,7 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                     }
                 } else {
                     if std::env::var_os("CCC_DEBUG_GVN").is_some() {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[GVNDBG] store CONST base -> global gen++"
                         ));
                     }
@@ -2091,7 +2091,7 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                             let stored_is_multi_def = matches!(stored_op, Operand::Value(v)
                                 if state.multi_def_values.contains(&v.0));
                             if std::env::var_os("CCC_DEBUG_GVN").is_some() {
-                                lccc::cli_output::stderr_line(format_args!(
+                                lccc::cli::stderr_line(format_args!(
                                     "[GVNDBG] fwd cand ptr_vn={:?} valid={}",
                                     ptr_vn,
                                     state.entry_valid_for(ptr_vn, *version)
@@ -2100,7 +2100,7 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                             if state.entry_valid_for(ptr_vn, *version) && !stored_is_multi_def {
                                 let stored_op = *stored_op;
                                 if std::env::var_os("CCC_DEBUG_GVN").is_some() {
-                                    lccc::cli_output::stderr_line(format_args!(
+                                    lccc::cli::stderr_line(format_args!(
                                         "[GVNDBG] FORWARD store->load dest={} stored={:?}",
                                         dest.0, stored_op
                                     ));
@@ -2298,12 +2298,12 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                 if let Some((existing_value, xload_tys)) = cse_source {
                     if std::env::var_os("CCC_DEBUG_GVN").is_some() {
                         if let Some((canon_ty, cand_ty)) = xload_tys {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[GVNDBG] CSE xload dest={} <- {} ({:?}->{:?})",
                                 dest.0, existing_value.0, canon_ty, cand_ty
                             ));
                         } else {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[GVNDBG] CSE load dest={} <- {}",
                                 dest.0, existing_value.0
                             ));

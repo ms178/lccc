@@ -193,7 +193,7 @@ pub fn calculate_stack_space_common(
     use crate::ir::intrinsics::IntrinsicOp;
     let debug_protect = std::env::var("LCCC_DEBUG_PROTECT").is_ok();
     if debug_protect {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[PROTECT] Scanning function {} for vector intrinsics",
             func.name
         ));
@@ -219,7 +219,7 @@ pub fn calculate_stack_space_common(
                         state.vector_values.insert(d.0);
                         state.protected_slot_values.insert(d.0);
                         if debug_protect {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[PROTECT] Marked SSA value {} as protected 256-bit ({:?})",
                                 d.0, op
                             ));
@@ -230,7 +230,7 @@ pub fn calculate_stack_space_common(
                         state.vector_values.insert(d.0);
                         state.protected_slot_values.insert(d.0);
                         if debug_protect {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[PROTECT] Marked SSA value {} as protected 128-bit ({:?})",
                                 d.0, op
                             ));
@@ -252,7 +252,7 @@ pub fn calculate_stack_space_common(
         for inst in &block.instructions {
             if let crate::ir::instruction::Instruction::Phi { dest, incoming, .. } = inst {
                 if debug_protect {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[PROTECT-PHI] Checking PHI SSA {}, incoming: {:?}",
                         dest.0, incoming
                     ));
@@ -262,7 +262,7 @@ pub fn calculate_stack_space_common(
                     if let crate::ir::instruction::Operand::Value(v) = val {
                         let is_vec = state.vector_values.contains(&v.0);
                         if debug_protect && is_vec {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[PROTECT-PHI]   Incoming SSA {} is a vector!",
                                 v.0
                             ));
@@ -289,7 +289,7 @@ pub fn calculate_stack_space_common(
                     }
                     state.protected_slot_values.insert(dest.0);
                     if debug_protect {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[PROTECT] Marked PHI SSA value {} as protected (has vector incoming)",
                             dest.0
                         ));
@@ -320,7 +320,7 @@ pub fn calculate_stack_space_common(
                                 state.vector128_values.insert(dest.0);
                             }
                             if debug_protect {
-                                lccc::cli_output::stderr_line(format_args!(
+                                lccc::cli::stderr_line(format_args!(
                                     "[PROTECT-COPY] Marked SSA {} as protected (copy from vector SSA {})",
                                     dest.0, src_val.0
                                 ));
@@ -336,7 +336,7 @@ pub fn calculate_stack_space_common(
     }
 
     if debug_protect {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[PROTECT] Total protected values: {}",
             state.protected_slot_values.len()
         ));
@@ -647,7 +647,7 @@ fn dump_debug_slots(state: &super::state::CodegenState, func: &IrFunction, total
     if std::env::var("CCC_DEBUG_SLOTS").is_err() {
         return;
     }
-    lccc::cli_output::stderr_line(format_args!(
+    lccc::cli::stderr_line(format_args!(
         "[SLOTS] fn={} total_space={}",
         func.name, total_space
     ));
@@ -672,7 +672,7 @@ fn dump_debug_slots(state: &super::state::CodegenState, func: &IrFunction, total
         if state.alloca_values.contains(&id) {
             t.push("alloca");
         }
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[SLOTS]   v{:<5} slot={:<5} {}",
             id,
             slot,
@@ -775,7 +775,7 @@ fn build_layout_context(
                                 _ => "_".to_string(),
                             })
                             .collect();
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VDEFER-IR] b{} i{} Intrinsic {:?} dp={:?} args=[{}]",
                             bi,
                             ii,
@@ -785,19 +785,19 @@ fn build_layout_context(
                         ));
                     }
                     crate::ir::instruction::Instruction::Memcpy { dest, src, size } => {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VDEFER-IR] b{} i{} Memcpy dest={} src={} size={}",
                             bi, ii, dest.0, src.0, size
                         ));
                     }
                     crate::ir::instruction::Instruction::Copy { src, dest, .. } => {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VDEFER-IR] b{} i{} Copy dest={} src={:?}",
                             bi, ii, dest.0, src
                         ));
                     }
                     other => {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VDEFER-IR] b{} i{} {:?}",
                             bi,
                             ii,

@@ -1346,7 +1346,7 @@ fn depends_only_on_const_and_iv(
 /// flag itself is resolved once by the driver (see `PERSIST_GATE_TRACE`).
 fn trace_persist_veto(func: &IrFunction, outer_header: usize, inner_header: usize, arm: &str) {
     if persist_gate_trace() {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[UNROLL-GATE] veto fn={} outer={} inner={} arm={}",
             func.name, outer_header, inner_header, arm
         ));

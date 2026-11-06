@@ -167,11 +167,11 @@ pub fn load_profile(path: &str) -> std::io::Result<ProfileData> {
             // A single corrupt/partial profraw (e.g. a crashed training run)
             // must not invalidate the whole profile: warn and continue.
             warned += 1;
-            lccc::cli_output::stderr_line(format_args!("lccc: PGO warning: {} -- skipped", e));
+            lccc::cli::stderr_line(format_args!("lccc: PGO warning: {} -- skipped", e));
         }
     }
     if warned > 0 {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "lccc: PGO warning: skipped {} of {} profile file(s)",
             warned,
             files.len()

@@ -1486,7 +1486,7 @@ impl X86Codegen {
                             }
                             Some(SlotAddr::Indirect(slot)) => {
                                 if std::env::var_os("LCCC_DBG_STORE").is_some() {
-                                    lccc::cli_output::stderr_line(format_args!(
+                                    lccc::cli::stderr_line(format_args!(
                                         "[DBGSTORE] base={} get_slot={:?} reg_assign={:?} offset={}",
                                         base.0,
                                         self.state.get_slot(base.0),

@@ -587,7 +587,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                     let u32z = (sf as usize).lt(&GP_FAMILIES) && upper32_zero[sf as usize];
                     let bytez = (sf as usize).lt(&GP_FAMILIES) && is_byte[sf as usize];
                     if trace_ext() {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[EXT] t='{}' src_fam={:?} dst_fam={:?} is32={} u32z={} bytez={}",
                             t, sf, df, is32, u32z, bytez
                         ));
@@ -687,7 +687,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                         && is_16[sf as usize]
                         && (is_32bit_or_smaller(dst) || upper32_zero[sf as usize]);
                     if trace_ext() {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[EXT16] t='{}' src_fam={:?} dst_fam={:?} fits16={}",
                             t, sf, df, fits16
                         ));

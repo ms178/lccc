@@ -109,10 +109,7 @@ pub(crate) fn run(module: &mut IrModule) -> usize {
             total += n;
         }
         if fn_changes > 0 && split::sroa_trace() {
-            lccc::cli_output::stderr_line(format_args!(
-                "[SROA] fn {} changes={}",
-                f.name, fn_changes
-            ));
+            lccc::cli::stderr_line(format_args!("[SROA] fn {} changes={}", f.name, fn_changes));
         }
     }
     total

@@ -1644,14 +1644,14 @@ pub(crate) fn collect_folded_index_links(
     if std::env::var_os("CCC_DEBUG_FOLDED_INDEX").is_some() {
         let mut links: Vec<(&u32, &Vec<u32>)> = out.iter().collect();
         links.sort_unstable();
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[FOLDIDX] fn={} links={} gep_map={}",
             func.name,
             links.len(),
             m.len()
         ));
         for (idx, dests) in links {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[FOLDIDX]   idx=v{} consumers={:?}",
                 idx, dests
             ));
@@ -2006,14 +2006,14 @@ pub(crate) fn collect_folded_gep_links_all(
     if std::env::var_os("CCC_DEBUG_FOLDED_INDEX").is_some() {
         let mut links: Vec<(&u32, &Vec<u32>)> = out.iter().collect();
         links.sort_unstable();
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[FOLDLINKS] fn={} links={} indexed_gep_map={}",
             func.name,
             links.len(),
             m.len()
         ));
         for (operand, dests) in links {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[FOLDLINKS]   operand=v{} consumers={:?}",
                 operand, dests
             ));
@@ -2750,7 +2750,7 @@ fn build_gep_fold_map(
     retain_used(&mut gep_map, use_counts);
 
     if env_flag_set("CCC_DEBUG_GEPFOLD") {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[GEPFOLD] total_candidates={} remaining={}",
             original_count,
             gep_map.len()
@@ -5764,7 +5764,7 @@ fn emit_functions_and_sections(
                         crate::passes::block_layout::count_stack_operands(&chain_peep);
                     let orig_stack = crate::passes::block_layout::count_stack_operands(&orig_peep);
                     if std::env::var_os("CCC_DEBUG_CHAIN").is_some() {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[LAYOUT] chain {} ins + {} br = {} (stack {}) | orig {} ins + {} br = {} (stack {})",
                             chain_lines,
                             chain_branch,
@@ -6182,7 +6182,7 @@ fn generate_function_body(
             }
             let _ = writeln!(out, "  term: {:?}", block.terminator);
         }
-        lccc::cli_output::stderr_line(format_args!("{}", out));
+        lccc::cli::stderr_line(format_args!("{}", out));
     }
 
     let type_dir = cg.function_type_directive();
@@ -6304,7 +6304,7 @@ fn generate_function_body(
             if classic && !cg.supports_classic_mcount() {
                 if !cg.state().mcount_unsupported_warned {
                     cg.state().mcount_unsupported_warned = true;
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "ccc: warning: classic -pg (call mcount) is not yet implemented \
                          for this target; use -mfentry/-mnop-mcount or disable ftrace"
                     ));
@@ -6367,7 +6367,7 @@ fn generate_function_body(
                 }
             } else if !cg.state().mcount_unsupported_warned {
                 cg.state().mcount_unsupported_warned = true;
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "ccc: warning: -pg function-entry instrumentation is not yet \
                      implemented for this target; no mcount/__fentry__ sites are emitted"
                 ));
@@ -7343,7 +7343,7 @@ fn generate_function_body(
             // can fold against alloca+c1+c2.
             if let Some(dest) = inst.dest() {
                 if std::env::var_os("LCCC_DBG_FOLD").is_some() {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[FOLD] inst dest={} in_gep_map={} in_idx_map={} dead_gaddr={}",
                         dest.0,
                         gep_fold_map.get(&dest.0).is_some(),
@@ -7355,7 +7355,7 @@ fn generate_function_body(
                     if can_const_addr_fold(cg, info) {
                         cg.state().folded_gep_values.insert(dest.0);
                         if std::env::var_os("LCCC_DBG_FOLD").is_some() {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[FOLD] SKIPPED dest={} base={} off={}",
                                 dest.0, info.base.0, info.offset
                             ));
@@ -8176,7 +8176,7 @@ fn generate_instruction_body(
             h
         };
         if hit {
-            lccc::cli_output::stderr_line(format_args!("[IRW] {:?}", inst));
+            lccc::cli::stderr_line(format_args!("[IRW] {:?}", inst));
         }
     }
     match inst {
@@ -9230,7 +9230,7 @@ fn generate_terminator(
     if let Some((all, watch)) = ir_watch() {
         let hit = all || term.used_values().iter().any(|id| watch.contains(&id));
         if hit {
-            lccc::cli_output::stderr_line(format_args!("[IRW-term] {:?}", term));
+            lccc::cli::stderr_line(format_args!("[IRW-term] {:?}", term));
         }
     }
     match term {

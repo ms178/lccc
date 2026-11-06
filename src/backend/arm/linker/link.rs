@@ -38,7 +38,7 @@ pub fn link_builtin(
     is_static: bool,
 ) -> Result<(), String> {
     if std::env::var("LINKER_DEBUG").is_ok() {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "arm linker: object_files={:?} output={} user_args={:?} static={}",
             object_files, output_path, user_args, is_static
         ));
@@ -318,10 +318,10 @@ pub fn link_builtin(
 
     if parsed_common.trace_files {
         for obj in objects.iter() {
-            lccc::cli_output::stdout_line(format_args!("{}", obj.source_name));
+            lccc::cli::stdout_line(format_args!("{}", obj.source_name));
         }
         for soname in &needed_sonames {
-            lccc::cli_output::stdout_line(format_args!("{soname}"));
+            lccc::cli::stdout_line(format_args!("{soname}"));
         }
     }
 

@@ -310,7 +310,7 @@ impl LinkerArgs {
             return Err(format!("warning treated as error: {}", warnings[0]));
         }
         for warning in &warnings {
-            lccc::cli_output::stderr_line(format_args!("lccc-ld: warning: {warning}"));
+            lccc::cli::stderr_line(format_args!("lccc-ld: warning: {warning}"));
         }
         Ok(())
     }
@@ -949,14 +949,14 @@ impl TextrelPolicy {
         match self {
             Self::Allow => Ok(()),
             Self::Warn => {
-                lccc::cli_output::stderr_line(format_args!("lccc-ld: {site}"));
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!("lccc-ld: {site}"));
+                lccc::cli::stderr_line(format_args!(
                     "lccc-ld: warning: creating DT_TEXTREL in a {output}"
                 ));
                 Ok(())
             }
             Self::Error => {
-                lccc::cli_output::stderr_line(format_args!("lccc-ld: {site}"));
+                lccc::cli::stderr_line(format_args!("lccc-ld: {site}"));
                 Err("read-only segment has dynamic relocations".to_string())
             }
         }

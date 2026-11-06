@@ -359,7 +359,7 @@ fn layout_function(
                     }
                 }
                 if std::env::var("LCCC_DEBUG_LAYOUT").is_ok() {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[LAYOUT-SW] {} switch block {} count={} cold={} hint={:?}",
                         f.name, b.label.0, c, cold, hint
                     ));
@@ -379,7 +379,7 @@ fn layout_function(
     // Keep promoted hot blocks adjacent to their predecessor. These synthetic
     // blocks have no profile entries and can otherwise fall to the function tail.
     if std::env::var("LCCC_DEBUG_LAYOUT").is_ok() {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[LAYOUT] {} promoted labels: {:?} ({} blocks)",
             f.name,
             promoted.iter().collect::<Vec<_>>(),

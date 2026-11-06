@@ -1283,7 +1283,7 @@ impl Lowerer {
                     // family defines and declares in one shape).
                     if let Some(ref da) = func.attrs.diagnose_as {
                         if std::env::var_os("CCC_DBG_DA").is_some() {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[DA-def] {} -> {}",
                                 func.name, da
                             ));
@@ -1989,7 +1989,7 @@ impl Lowerer {
         let l = BlockId(self.next_label);
         self.next_label += 1;
         if std::env::var("LCCC_DEBUG_LABELS").is_ok() {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[LABEL] Allocated BlockId({}) in function {:?}, next_label now {}",
                 l.0,
                 self.func_state.as_ref().map(|f| &f.name),

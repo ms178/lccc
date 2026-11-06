@@ -119,10 +119,10 @@ fn trace_inputs_32(inputs: &[InputObject], resolved: &super::input::ResolvedInpu
         return;
     }
     for obj in inputs {
-        lccc::cli_output::stdout_line(format_args!("{}", obj.filename));
+        lccc::cli::stdout_line(format_args!("{}", obj.filename));
     }
     for lib in &resolved.shared_libs {
-        lccc::cli_output::stdout_line(format_args!("{}", lib.soname));
+        lccc::cli::stdout_line(format_args!("{}", lib.soname));
     }
 }
 

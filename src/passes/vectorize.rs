@@ -588,7 +588,7 @@ fn take_reject() -> Option<&'static str> {
 /// `loops:` count stays in the trace — and a message duplicated across them
 /// would drift.
 fn report_simd_disabled(func_name: &str) {
-    lccc::cli_output::stderr_line(format_args!(
+    lccc::cli::stderr_line(format_args!(
         "[VEC] Function {}: not vectorized: x86 SIMD disabled by ISA flags \
          (-mno-sse/-mno-sse2/-mgeneral-regs-only)",
         func_name
@@ -678,7 +678,7 @@ fn vectorize_with_analysis_mode(
     let loops = loop_analysis::find_natural_loops(num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
 
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC] Function: {}, blocks: {}, loops: {}",
             func.name,
             num_blocks,
@@ -710,7 +710,7 @@ fn vectorize_with_analysis_mode(
         });
 
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC] Loop {} at header={}, body_size={}, innermost={}",
                 idx,
                 loop_info.header,
@@ -730,7 +730,7 @@ fn vectorize_with_analysis_mode(
         // -O3 reduction over a `__seg_gs` array returned a wrong checksum.
         if loop_touches_named_space(func, loop_info) {
             if debug || why_not {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC] Loop {} (header block {}) not vectorized: named address space access",
                     idx, loop_info.header
                 ));
@@ -748,7 +748,7 @@ fn vectorize_with_analysis_mode(
             Some(false)
         ) {
             if debug || std::env::var("LCCC_WHY_NOT_VECTORIZE").is_ok() {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC] Loop {} (header block {}) not vectorized: PGO trip/body cost veto",
                     idx, loop_info.header
                 ));
@@ -829,7 +829,7 @@ fn vectorize_with_analysis_mode(
             // there is nothing for the contract half to fall back to.
             if skip_small {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC] Skip: constant trip count < 2x machine step width ({})",
                         machine_step_width
                     ));
@@ -840,7 +840,7 @@ fn vectorize_with_analysis_mode(
                 // returns before this arm otherwise), but the arm must not
                 // depend on a debugging variable for its legality.
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC] Skip matmul arm: SIMD disabled for this target"
                     ));
                 }
@@ -848,7 +848,7 @@ fn vectorize_with_analysis_mode(
                 && (neon || !x86_64_vector_intrinsics_available())
             {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC] Skip matmul arm: fused arithmetic not requested/available \
                          (fp_contract={fp_contract:?}, x86_fma={})",
                         x86_fma_enabled()
@@ -856,13 +856,13 @@ fn vectorize_with_analysis_mode(
                 }
             } else if !use_sse2 && !x86_64_vector_intrinsics_available() {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC] Skip matmul arm: no 256-bit vector intrinsics on this target"
                     ));
                 }
             } else if use_sse2 {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC] Matmul pattern matched! Transforming to {} (SSE2, 2-wide)",
                         if fma_transform_allowed(neon, fp_contract) {
                             "FmaF64x2"
@@ -879,7 +879,7 @@ fn vectorize_with_analysis_mode(
             } else {
                 // Use AVX2 by default (or if LCCC_FORCE_AVX2 is set)
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC] Matmul pattern matched! Transforming to packed AVX2 multiply/add (fused={})",
                         fma_transform_allowed(neon, fp_contract)
                     ));
@@ -927,7 +927,7 @@ fn vectorize_with_analysis_mode(
             let n = transform_byte_compare_loop(func, &bcmp_pattern, debug);
             if n > 0 {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC] Byte-compare loop matched! {} changes (loop {})",
                         n, idx
                     ));
@@ -950,7 +950,7 @@ fn vectorize_with_analysis_mode(
             let n = transform_byte_count_reduction(func, &count_pattern);
             if n > 0 {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC] Byte-count reduction matched! {} changes (loop {})",
                         n, idx
                     ));
@@ -967,7 +967,7 @@ fn vectorize_with_analysis_mode(
             && n > 0
         {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC] Normalized byte-count reduction matched: {n}"
                 ));
             }
@@ -991,7 +991,7 @@ fn vectorize_with_analysis_mode(
             let n = transform_adler_loop(func, &adler_pattern);
             if n > 0 {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC] Adler-32 epic matched! {} changes (loop {})",
                         n, idx
                     ));
@@ -1016,7 +1016,7 @@ fn vectorize_with_analysis_mode(
             n > 0
         } {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC] Strided I32 reduction pattern matched! Transformed to SIMD"
                 ));
             }
@@ -1039,7 +1039,7 @@ fn vectorize_with_analysis_mode(
             // costs only the vectorization of that bound form.
             if !reduction_exit_is_canonical(func, &red_pattern) {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC] Reduction refused: exit comparison is not the canonical exclusive IV test"
                     ));
                 }
@@ -1070,7 +1070,7 @@ fn vectorize_with_analysis_mode(
                     && red_pattern.guard_cond.is_some())
             {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC] Late rerun: only min/max reductions are admitted (this one is {:?})",
                         red_pattern.kind
                     ));
@@ -1085,7 +1085,7 @@ fn vectorize_with_analysis_mode(
             // explicit fast-math/associative-math contract for this rewrite.
             if matches!(red_pattern.element_type, IrType::F32 | IrType::F64) && !fp_reassoc {
                 if debug || std::env::var("LCCC_WHY_NOT_VECTORIZE").is_ok() {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC] Loop {} (header block {}) not vectorized: floating-point reduction requires -fassociative-math or -ffast-math",
                         idx, loop_info.header
                     ));
@@ -1178,7 +1178,7 @@ fn vectorize_with_analysis_mode(
                 }
                 if narrow_iv {
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC] Skip reduction: induction variable is narrower than 32 bits (stays scalar)"
                         ));
                     }
@@ -1198,7 +1198,7 @@ fn vectorize_with_analysis_mode(
                         && const_nonzero_init)
                 {
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC] Skip reduction: induction variable does not start at a constant 0 (limit rescale + remainder math assume an element-0 start)"
                         ));
                     }
@@ -1218,7 +1218,7 @@ fn vectorize_with_analysis_mode(
             };
             if skip_small {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC] Skip reduction: constant trip count < 2x vector width ({})",
                         vec_width
                     ));
@@ -1227,14 +1227,14 @@ fn vectorize_with_analysis_mode(
                 // I64 AVX2 4-wide path not wired yet; 2-wide SSE/AVX is competitive
                 // and beats scalar (Godbolt: GCC/Clang/ICX all vectorize I64 sums).
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC] Reduction pattern matched! Transforming to SSE2 2-wide"
                     ));
                 }
                 total_changes += transform_reduction_sse2(func, &red_pattern, neon);
             } else {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC] Reduction pattern matched! Transforming to AVX2 4-wide"
                     ));
                 }
@@ -1274,7 +1274,7 @@ fn vectorize_with_analysis_mode(
                 // every other pair of elements.
                 let avx2 = avx2 && !matches!(map_pattern.elem_ty, IrType::I64 | IrType::U64);
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC] Map pattern matched! Transforming to {}-bit {:?}",
                         if avx2 { 256 } else { 128 },
                         map_pattern.elem_ty
@@ -1303,7 +1303,7 @@ fn vectorize_with_analysis_mode(
                             let avx2 =
                                 !force_two_wide && !map_sse_forced() && x86_avx2_width_wanted();
                             if debug {
-                                lccc::cli_output::stderr_line(format_args!(
+                                lccc::cli::stderr_line(format_args!(
                                     "[VEC] Stencil pattern matched! taps={} {:?} ({}-bit)",
                                     stencil_pattern.taps.len(),
                                     stencil_pattern.elem_ty,
@@ -1316,7 +1316,7 @@ fn vectorize_with_analysis_mode(
                     } else {
                         let why = take_reject().unwrap_or("pattern shape not recognized");
                         if debug || std::env::var("LCCC_WHY_NOT_VECTORIZE").is_ok() {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[VEC] Loop {} (header block {}) not vectorized: {}",
                                 idx, loop_info.header, why
                             ));
@@ -1325,7 +1325,7 @@ fn vectorize_with_analysis_mode(
                 } else {
                     let why = take_reject().unwrap_or("pattern shape not recognized");
                     if debug || std::env::var("LCCC_WHY_NOT_VECTORIZE").is_ok() {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC] Loop {} (header block {}) not vectorized: {}",
                             idx, loop_info.header, why
                         ));
@@ -1335,7 +1335,7 @@ fn vectorize_with_analysis_mode(
         } else {
             let why = take_reject().unwrap_or("pattern shape not recognized");
             if debug || std::env::var("LCCC_WHY_NOT_VECTORIZE").is_ok() {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC] Loop {} (header block {}) not vectorized: {}",
                     idx, loop_info.header, why
                 ));
@@ -1557,7 +1557,7 @@ fn analyze_loop_pattern(
         }
     }
     if iv.is_none() && debug {
-        lccc::cli_output::stderr_line(format_args!("[VEC]   No IV phi found in header"));
+        lccc::cli::stderr_line(format_args!("[VEC]   No IV phi found in header"));
         return None;
     }
     let (iv, iv_ty) = iv?;
@@ -1594,7 +1594,7 @@ fn analyze_loop_pattern(
                 if iv_derived.contains(lhs_val) {
                     exit_cmp_info = Some((idx, *dest, rhs.clone()));
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC]   Found comparison with IV-derived on left: {:?} < {:?}",
                             lhs, rhs
                         ));
@@ -1606,7 +1606,7 @@ fn analyze_loop_pattern(
                     // IV is on the right, use lhs as the limit
                     exit_cmp_info = Some((idx, *dest, lhs.clone()));
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC]   Found comparison with IV-derived on right: {:?} > {:?}",
                             lhs, rhs
                         ));
@@ -1618,15 +1618,15 @@ fn analyze_loop_pattern(
     }
     if exit_cmp_info.is_none() {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC]   No comparison instruction found for IV"
             ));
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC]   Header block has {} instructions:",
                 header.instructions.len()
             ));
             for (idx, inst) in header.instructions.iter().enumerate() {
-                lccc::cli_output::stderr_line(format_args!("[VEC]     {}: {:?}", idx, inst));
+                lccc::cli::stderr_line(format_args!("[VEC]     {}: {:?}", idx, inst));
             }
         }
         return None;
@@ -1822,7 +1822,7 @@ fn analyze_loop_pattern(
 
     if body_idx.is_none() {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC]   No store instruction found in any loop body block"
             ));
         }
@@ -1843,7 +1843,7 @@ fn analyze_loop_pattern(
         .count();
     if store_count != 1 {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC]   Loop has {} stores; matmul transform requires exactly one",
                 store_count
             ));
@@ -1888,7 +1888,7 @@ fn analyze_loop_pattern(
 
     if exit_label.is_none() {
         if debug {
-            lccc::cli_output::stderr_line(format_args!("[VEC]   No exit block found"));
+            lccc::cli::stderr_line(format_args!("[VEC]   No exit block found"));
         }
         return None;
     }
@@ -1899,7 +1899,7 @@ fn analyze_loop_pattern(
     let latch_idx = find_latch(func, loop_info);
     if latch_idx.is_none() {
         if debug {
-            lccc::cli_output::stderr_line(format_args!("[VEC]   No latch block found"));
+            lccc::cli::stderr_line(format_args!("[VEC]   No latch block found"));
         }
         return None;
     }
@@ -1930,9 +1930,7 @@ fn analyze_loop_pattern(
     }
     if iv_inc_idx.is_none() {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
-                "[VEC]   No IV increment by 1 found in latch"
-            ));
+            lccc::cli::stderr_line(format_args!("[VEC]   No IV increment by 1 found in latch"));
         }
         return None;
     }
@@ -1953,7 +1951,7 @@ fn analyze_loop_pattern(
     }
     if store_info.is_none() {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC]   No store instruction found in body block {}",
                 body_idx
             ));
@@ -1962,7 +1960,7 @@ fn analyze_loop_pattern(
     }
     let (store_idx, store_addr, store_value) = store_info?;
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC]   Found store in block {}, tracing backward...",
             body_idx
         ));
@@ -1972,7 +1970,7 @@ fn analyze_loop_pattern(
     let fadd_inst = find_inst_by_dest(body, store_value);
     if fadd_inst.is_none() {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC]   Store value not produced in body block"
             ));
         }
@@ -1988,7 +1986,7 @@ fn analyze_loop_pattern(
         } => Some((lhs, rhs)),
         _ => {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC]   Store value not from Add instruction"
                 ));
             }
@@ -2001,9 +1999,7 @@ fn analyze_loop_pattern(
         Operand::Value(v) => v,
         _ => {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
-                    "[VEC]   Multiply operand is not a Value"
-                ));
+                lccc::cli::stderr_line(format_args!("[VEC]   Multiply operand is not a Value"));
             }
             return None;
         }
@@ -2011,7 +2007,7 @@ fn analyze_loop_pattern(
     let fmul_inst = find_inst_by_dest(body, *mul_dest);
     if fmul_inst.is_none() {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC]   Multiply value not produced in body block"
             ));
         }
@@ -2025,7 +2021,7 @@ fn analyze_loop_pattern(
     if let Instruction::BinOp { ty, .. } = fmul_inst {
         if *ty != IrType::F64 {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC]   Rejecting matmul: element type {:?} != F64 (only double FMA is supported)",
                     ty
                 ));
@@ -2043,7 +2039,7 @@ fn analyze_loop_pattern(
         } => Some((lhs, rhs)),
         _ => {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC]   Add operand not from Mul instruction"
                 ));
             }
@@ -2056,9 +2052,7 @@ fn analyze_loop_pattern(
         Operand::Value(v) => v,
         _ => {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
-                    "[VEC]   C load operand is not a Value"
-                ));
+                lccc::cli::stderr_line(format_args!("[VEC]   C load operand is not a Value"));
             }
             return None;
         }
@@ -2066,7 +2060,7 @@ fn analyze_loop_pattern(
     let c_load_inst = find_inst_by_dest(body, *c_load_dest);
     if c_load_inst.is_none() {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC]   C load value not produced in body block"
             ));
         }
@@ -2077,9 +2071,7 @@ fn analyze_loop_pattern(
         Instruction::Load { ptr, .. } => *ptr,
         _ => {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
-                    "[VEC]   C load not from Load instruction"
-                ));
+                lccc::cli::stderr_line(format_args!("[VEC]   C load not from Load instruction"));
             }
             return None;
         }
@@ -2088,7 +2080,7 @@ fn analyze_loop_pattern(
     // Store and load must use the same GEP.
     if c_load_addr != store_addr {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC]   C load and store use different addresses"
             ));
         }
@@ -2100,7 +2092,7 @@ fn analyze_loop_pattern(
     // Verify C GEP exists somewhere in the loop (may have been hoisted by LICM)
     if find_inst_in_loop(func, &loop_info.body, c_gep).is_none() {
         if debug {
-            lccc::cli_output::stderr_line(format_args!("[VEC]   C GEP not found in loop"));
+            lccc::cli::stderr_line(format_args!("[VEC]   C GEP not found in loop"));
         }
         return None;
     }
@@ -2110,9 +2102,7 @@ fn analyze_loop_pattern(
         Operand::Value(v) => v,
         _ => {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
-                    "[VEC]   B value operand is not a Value"
-                ));
+                lccc::cli::stderr_line(format_args!("[VEC]   B value operand is not a Value"));
             }
             return None;
         }
@@ -2121,7 +2111,7 @@ fn analyze_loop_pattern(
     let b_load_result = find_inst_in_loop(func, &loop_info.body, *b_load_dest);
     if b_load_result.is_none() {
         if debug {
-            lccc::cli_output::stderr_line(format_args!("[VEC]   B load not found in loop"));
+            lccc::cli::stderr_line(format_args!("[VEC]   B load not found in loop"));
         }
         return None;
     }
@@ -2130,9 +2120,7 @@ fn analyze_loop_pattern(
         Instruction::Load { ptr, .. } => ptr,
         _ => {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
-                    "[VEC]   B load not from Load instruction"
-                ));
+                lccc::cli::stderr_line(format_args!("[VEC]   B load not from Load instruction"));
             }
             return None;
         }
@@ -2141,7 +2129,7 @@ fn analyze_loop_pattern(
     // Verify B GEP exists somewhere in the loop
     if find_inst_in_loop(func, &loop_info.body, b_gep).is_none() {
         if debug {
-            lccc::cli_output::stderr_line(format_args!("[VEC]   B GEP not found in loop"));
+            lccc::cli::stderr_line(format_args!("[VEC]   B GEP not found in loop"));
         }
         return None;
     }
@@ -2159,7 +2147,7 @@ fn analyze_loop_pattern(
     };
     if !contiguous_f64_stream(c_gep) || !contiguous_f64_stream(b_gep) {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC]   C/B stream is not a contiguous F64 IV walk"
             ));
         }
@@ -2172,9 +2160,7 @@ fn analyze_loop_pattern(
         Operand::Value(v) => v,
         _ => {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
-                    "[VEC]   A value operand is not a Value"
-                ));
+                lccc::cli::stderr_line(format_args!("[VEC]   A value operand is not a Value"));
             }
             return None;
         }
@@ -2183,7 +2169,7 @@ fn analyze_loop_pattern(
     let a_load_result = find_inst_in_loop(func, &loop_info.body, *a_load_dest);
     if a_load_result.is_none() {
         if debug {
-            lccc::cli_output::stderr_line(format_args!("[VEC]   A load not found in loop"));
+            lccc::cli::stderr_line(format_args!("[VEC]   A load not found in loop"));
         }
         return None;
     }
@@ -2192,9 +2178,7 @@ fn analyze_loop_pattern(
         Instruction::Load { ptr, .. } => *ptr,
         _ => {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
-                    "[VEC]   A load not from Load instruction"
-                ));
+                lccc::cli::stderr_line(format_args!("[VEC]   A load not from Load instruction"));
             }
             return None;
         }
@@ -2210,7 +2194,7 @@ fn analyze_loop_pattern(
         || !roots_proven_distinct(&c_root, &a_root, symbol_facts)
     {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC]   Rejecting matmul: C may alias source (C={:?}, B={:?}, A={:?})",
                 c_root, b_root, a_root
             ));
@@ -2273,7 +2257,7 @@ fn find_guarded_reduction_select(
     }
     if guarded_select.is_none() {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED]   Rejecting: recognized reduction guard has no exact Select update"
             ));
         }
@@ -2316,7 +2300,7 @@ fn reduction_loop_values_do_not_escape(
             });
             if unsafe_escape {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Rejecting: unmodelled reduction value escapes loop"
                     ));
                 }
@@ -2334,7 +2318,7 @@ fn reduction_loop_values_do_not_escape(
         });
         if unsafe_escape {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-RED]   Rejecting: unmodelled reduction value escapes through terminator"
                 ));
             }
@@ -2412,7 +2396,7 @@ fn reduction_pattern_is_sound(
             )
         {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-RED]   Rejecting: loop block {} has an unsupported exit/terminator {:?}",
                     block_idx, func.blocks[block_idx].terminator
                 ));
@@ -2443,7 +2427,7 @@ fn reduction_pattern_is_sound(
                         });
                         if loop_carried {
                             if debug {
-                                lccc::cli_output::stderr_line(format_args!(
+                                lccc::cli::stderr_line(format_args!(
                                     "[VEC-RED]   Rejecting: unhandled loop-carried phi {} in block {}",
                                     dest.0, block_idx
                                 ));
@@ -2462,7 +2446,7 @@ fn reduction_pattern_is_sound(
                             || !accumulator_phis.iter().any(|phi| *phi == *dest))
                     {
                         if debug {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[VEC-RED]   Rejecting: accumulator-derived phi {} in block {}",
                                 dest.0, block_idx
                             ));
@@ -2475,7 +2459,7 @@ fn reduction_pattern_is_sound(
                         && !matches!(src, Operand::Value(v) if accumulator_derived.contains(v))
                     {
                         if debug {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[VEC-RED]   Rejecting: copy/cast {} = {:?} overwrites accumulator with foreign value",
                                 dest.0, src
                             ));
@@ -2488,7 +2472,7 @@ fn reduction_pattern_is_sound(
                 } => {
                     if op.can_trap() {
                         if debug {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[VEC-RED]   Rejecting: potentially trapping BinOp in loop"
                             ));
                         }
@@ -2498,7 +2482,7 @@ fn reduction_pattern_is_sound(
                         || matches!(rhs, Operand::Value(v) if accumulator_derived.contains(v));
                     if uses_acc && !is_add(block_idx, inst_idx, *dest) {
                         if debug {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[VEC-RED]   Rejecting: BinOp {} reads accumulator outside identified Add",
                                 dest.0
                             ));
@@ -2507,7 +2491,7 @@ fn reduction_pattern_is_sound(
                     }
                     if accumulator_derived.contains(dest) {
                         if debug {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[VEC-RED]   Rejecting: BinOp writes accumulator-derived {}",
                                 dest.0
                             ));
@@ -2536,7 +2520,7 @@ fn reduction_pattern_is_sound(
                 | Instruction::InlineAsm { .. }
                 | Instruction::Intrinsic { .. } => {
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-RED]   Rejecting: foreign side-effect instruction in loop block {}",
                             block_idx
                         ));
@@ -2554,7 +2538,7 @@ fn reduction_pattern_is_sound(
                         || !allowed_loads.iter().any(|l| *l == *dest)
                     {
                         if debug {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[VEC-RED]   Rejecting: foreign/volatile/segmented load {} in loop block {}",
                                 dest.0, block_idx
                             ));
@@ -2570,7 +2554,7 @@ fn reduction_pattern_is_sound(
                 | Instruction::ParamRef { .. } => {}
                 _ => {
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-RED]   Rejecting: unsupported instruction in reduction loop block {}",
                             block_idx
                         ));
@@ -2607,7 +2591,7 @@ fn reduction_pattern_is_sound(
             });
             if uses_acc {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Rejecting: instruction {} in block {} reads accumulator",
                         inst_idx, block_idx
                     ));
@@ -2626,7 +2610,7 @@ fn reduction_pattern_is_sound(
             });
             if uses_acc {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Rejecting: terminator in block {} reads accumulator",
                         block_idx
                     ));
@@ -2647,7 +2631,7 @@ fn reduction_pattern_is_sound(
         .unwrap_or(usize::MAX);
     if latch_idx == usize::MAX {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED]   Rejecting: no latch found in loop body"
             ));
         }
@@ -2665,7 +2649,7 @@ fn reduction_pattern_is_sound(
     }
     if cur != body_idx {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED]   Rejecting: accumulator Add block {} does not dominate latch {}",
                 body_idx, latch_idx
             ));
@@ -2932,7 +2916,7 @@ fn minmax_reduction_pattern_is_sound(
         } if in_loop(*true_label) && *false_label == exit_label && !in_loop(*false_label) => {}
         _ => {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-RED]   Rejecting min/max with unsupported header branch"
                 ));
             }
@@ -3006,7 +2990,7 @@ fn minmax_reduction_pattern_is_sound(
             )
         {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-RED]   Rejecting min/max side exit/terminator in block {}",
                     block_idx
                 ));
@@ -3028,7 +3012,7 @@ fn minmax_reduction_pattern_is_sound(
                 });
                 if reads_accumulator {
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-RED]   Rejecting min/max with an unmodelled accumulator use"
                         ));
                     }
@@ -3041,7 +3025,7 @@ fn minmax_reduction_pattern_is_sound(
                         && (*dest == iv || *dest == accumulator_phi || *dest == array_gep) => {}
                 Instruction::Phi { dest, .. } => {
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-RED]   Rejecting min/max unmodelled loop phi {}",
                             dest.0
                         ));
@@ -3060,7 +3044,7 @@ fn minmax_reduction_pattern_is_sound(
                 }
                 Instruction::Load { .. } => {
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-RED]   Rejecting min/max volatile/foreign/segmented load"
                         ));
                     }
@@ -3077,7 +3061,7 @@ fn minmax_reduction_pattern_is_sound(
                 | Instruction::ParamRef { .. } => {}
                 _ => {
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-RED]   Rejecting min/max side-effect/unsupported instruction in block {}",
                             block_idx
                         ));
@@ -3094,7 +3078,7 @@ fn minmax_reduction_pattern_is_sound(
         });
         if terminator_reads_accumulator {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-RED]   Rejecting min/max accumulator use in a terminator"
                 ));
             }
@@ -3122,7 +3106,7 @@ fn minmax_reduction_pattern_is_sound(
             });
             if unsafe_escape {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Rejecting min/max loop value escaping its loop"
                     ));
                 }
@@ -3137,7 +3121,7 @@ fn minmax_reduction_pattern_is_sound(
         });
         if unsafe_escape {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-RED]   Rejecting min/max loop value escaping through terminator"
                 ));
             }
@@ -4369,7 +4353,7 @@ fn analyze_reduction_pattern(
     let header = &func.blocks[header_idx];
 
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-RED] Analyzing reduction pattern for loop at header {}",
             header_idx
         ));
@@ -4379,7 +4363,7 @@ fn analyze_reduction_pattern(
     let exit_idx = find_exit(func, loop_info);
     if exit_idx.is_none() {
         if debug {
-            lccc::cli_output::stderr_line(format_args!("[VEC-RED]   Could not find exit block"));
+            lccc::cli::stderr_line(format_args!("[VEC-RED]   Could not find exit block"));
         }
         return None;
     }
@@ -4388,7 +4372,7 @@ fn analyze_reduction_pattern(
     let latch_idx = find_latch(func, loop_info);
     if latch_idx.is_none() {
         if debug {
-            lccc::cli_output::stderr_line(format_args!("[VEC-RED]   Could not find latch block"));
+            lccc::cli::stderr_line(format_args!("[VEC-RED]   Could not find latch block"));
         }
         return None;
     }
@@ -4407,7 +4391,7 @@ fn analyze_reduction_pattern(
             )
     }) {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED]   Rejecting conditional reduction loop"
             ));
         }
@@ -4445,7 +4429,7 @@ fn analyze_reduction_pattern(
         }
     }
     if iv.is_none() && debug {
-        lccc::cli_output::stderr_line(format_args!("[VEC-RED]   No IV increment found in latch"));
+        lccc::cli::stderr_line(format_args!("[VEC-RED]   No IV increment found in latch"));
         return None;
     }
     let iv = iv?;
@@ -4482,7 +4466,7 @@ fn analyze_reduction_pattern(
     }
 
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-RED]   IV-derived values: {:?}",
             iv_derived
         ));
@@ -4567,7 +4551,7 @@ fn analyze_reduction_pattern(
     };
     if !supported_exit {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED]   Unsupported reduction exit comparison/branch shape: IV={iv:?}/{iv_ty:?}, cmp={:?}, branch={:?}",
                 header.instructions[exit_cmp_inst_idx], header.terminator
             ));
@@ -4770,7 +4754,7 @@ fn analyze_reduction_pattern(
     }
     if accumulator_phi.is_none() {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED]   No accumulator phi found (initialized to zero)"
             ));
         }
@@ -4863,16 +4847,16 @@ fn analyze_reduction_pattern(
         }
         let block = &func.blocks[block_idx];
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED]   Searching block {} for accumulator update (accumulator_phi = {})",
                 block_idx, accumulator_phi.0
             ));
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED]   Accumulator-derived values: {:?}",
                 accumulator_derived
             ));
             for (idx, inst) in block.instructions.iter().enumerate() {
-                lccc::cli_output::stderr_line(format_args!("[VEC-RED]     {}: {:?}", idx, inst));
+                lccc::cli::stderr_line(format_args!("[VEC-RED]     {}: {:?}", idx, inst));
             }
         }
         for (idx, inst) in block.instructions.iter().enumerate() {
@@ -4971,7 +4955,7 @@ fn analyze_reduction_pattern(
     }
     if body_idx.is_none() {
         if debug {
-            lccc::cli_output::stderr_line(format_args!("[VEC-RED]   No accumulator update found"));
+            lccc::cli::stderr_line(format_args!("[VEC-RED]   No accumulator update found"));
         }
         return None;
     }
@@ -5002,7 +4986,7 @@ fn analyze_reduction_pattern(
         .is_none()
         {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-RED]   Min/Max accumulator has no unique latch/preheader seed shape"
                 ));
             }
@@ -5063,7 +5047,7 @@ fn analyze_reduction_pattern(
         let gep_is_iv_indexed = gep_uses_iv(func, &loop_info.body, array_gep, iv, &iv_derived, 4);
         if !gep_is_iv_indexed && !marches_one_element {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-RED]   Min/Max-reduction array GEP doesn't use IV"
                 ));
             }
@@ -5072,7 +5056,7 @@ fn analyze_reduction_pattern(
         let iv_init = iv_init_const(func, header_idx, iv, latch_label);
         let Some(iv_init) = iv_init else {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-RED]   Max-reduction IV init is not a constant"
                 ));
             }
@@ -5129,7 +5113,7 @@ fn analyze_reduction_pattern(
         };
         if !supported_exit {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-RED]   Min/Max remainder requires a width-matched signed exclusive-bound IV"
                 ));
             }
@@ -5143,7 +5127,7 @@ fn analyze_reduction_pattern(
         // nonnegative I32 seed range before forming c*4 or c*width.
         if iv_init < 0 || i32::try_from(iv_init).is_err() {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-RED]   Min/Max IV start is outside the supported nonnegative I32 range"
                 ));
             }
@@ -5151,7 +5135,7 @@ fn analyze_reduction_pattern(
         }
         let Some(iv_init_bytes) = iv_init.checked_mul(4) else {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-RED]   Min/max IV start cannot be represented as an I64 byte offset"
                 ));
             }
@@ -5229,7 +5213,7 @@ fn analyze_reduction_pattern(
             && find_reduction_byte_iv(func, &loop_info.body, array_gep, 4, iv).is_some();
         if !ptr_init_ok && !iv_indexed_zero_start && !iv_indexed_byte_start {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-RED]   Min/Max-reduction pointer/IV init mismatch \
                      (iv_init={}, marching-pointer form={})",
                     iv_init, ptr_init_ok
@@ -5287,7 +5271,7 @@ fn analyze_reduction_pattern(
             }
             if stray_accumulator {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Min/Max reduction shares the loop with another \
                          accumulator (unmodelled): staying scalar"
                     ));
@@ -5310,7 +5294,7 @@ fn analyze_reduction_pattern(
             debug,
         ) {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-RED]   Rejecting unsound min/max reduction body"
                 ));
             }
@@ -5319,11 +5303,11 @@ fn analyze_reduction_pattern(
         }
         if debug {
             if is_min_reduction {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-RED]   Min reduction detected: mn = min(mn, load(arr[iv]))"
                 ));
             } else {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-RED]   Max reduction detected: mx = max(mx, load(arr[iv]))"
                 ));
             }
@@ -5377,7 +5361,7 @@ fn analyze_reduction_pattern(
         IrType::F64 | IrType::F32 | IrType::I32 | IrType::I64 | IrType::U32 | IrType::U64
     ) {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED]   Unsupported element type: {:?}",
                 element_type
             ));
@@ -5416,7 +5400,7 @@ fn analyze_reduction_pattern(
         lhs_val?
     } else {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED]   Add instruction doesn't use accumulator or derived value"
             ));
         }
@@ -5427,7 +5411,7 @@ fn analyze_reduction_pattern(
     let added_inst = find_inst_by_dest(body, added_value)?;
 
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-RED]   Added value {} is produced by: {:?}",
             added_value.0, added_inst
         ));
@@ -5451,7 +5435,7 @@ fn analyze_reduction_pattern(
         // message about `loaded > rhs`).
         if guard_swapped {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-RED]   Rejecting: conditional-sum guard has the add on the FALSE arm (staying scalar)"
                 ));
             }
@@ -5503,7 +5487,7 @@ fn analyze_reduction_pattern(
         }
         if !valid {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-RED]   Rejecting: conditional-sum guard is not `loaded > rhs` (staying scalar)"
                 ));
             }
@@ -5561,16 +5545,14 @@ fn analyze_reduction_pattern(
                 reduction_element_size(*ty).unwrap_or(0),
             ) {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
-                        "[VEC-RED]   Array GEP doesn't use IV"
-                    ));
+                    lccc::cli::stderr_line(format_args!("[VEC-RED]   Array GEP doesn't use IV"));
                 }
                 set_reject("array index is not based on the loop induction variable");
                 return None;
             }
 
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-RED]   Simple sum pattern detected: {:?} += load(arr[iv])",
                     element_type
                 ));
@@ -5612,7 +5594,7 @@ fn analyze_reduction_pattern(
             // The cast should be widening the element type to match the accumulator
             if *to_ty != element_type {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Cast type mismatch: cast to {:?} but accumulator is {:?}",
                         to_ty, element_type
                     ));
@@ -5634,7 +5616,7 @@ fn analyze_reduction_pattern(
             {
                 if *load_ty != *from_ty {
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-RED]   Load type {:?} doesn't match cast from_ty {:?}",
                             load_ty, from_ty
                         ));
@@ -5653,7 +5635,7 @@ fn analyze_reduction_pattern(
                     reduction_element_size(*load_ty).unwrap_or(0),
                 ) {
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-RED]   Array GEP doesn't use IV"
                         ));
                     }
@@ -5661,7 +5643,7 @@ fn analyze_reduction_pattern(
                 }
 
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Simple sum pattern with cast detected: {:?} += ({:?})load(arr[iv])",
                         element_type, from_ty
                     ));
@@ -5686,7 +5668,7 @@ fn analyze_reduction_pattern(
                     allow_widening_i32 && element_type == IrType::I64 && *from_ty == IrType::I32;
                 if *from_ty != element_type && !allowed_widen {
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-RED]   Rejecting: cast from {:?} to accumulator type {:?} (only redundant casts are vectorizable)",
                             from_ty, element_type
                         ));
@@ -5721,7 +5703,7 @@ fn analyze_reduction_pattern(
                 }
             } else {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Cast source is not a load: {:?}",
                         cast_src_inst
                     ));
@@ -5797,7 +5779,7 @@ fn analyze_reduction_pattern(
                 // expressible form and stays scalar.
                 if !both_widened || element_type != IrType::I64 || unsigned_source {
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-RED]   Rejecting partially or unsigned widened dot product"
                         ));
                     }
@@ -5825,16 +5807,14 @@ fn analyze_reduction_pattern(
                 reduction_element_size(element_type).unwrap_or(0),
             ) {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
-                        "[VEC-RED]   Array GEPs don't use IV"
-                    ));
+                    lccc::cli::stderr_line(format_args!("[VEC-RED]   Array GEPs don't use IV"));
                 }
                 set_reject("array index is not based on the loop induction variable");
                 return None;
             }
 
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-RED]   Dot product pattern detected: {:?} += load(a[iv]) * load(b[iv])",
                     element_type
                 ));
@@ -5868,7 +5848,7 @@ fn analyze_reduction_pattern(
 
         _ => {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-RED]   Unsupported accumulator update pattern"
                 ));
             }
@@ -5894,7 +5874,7 @@ fn analyze_reduction_pattern(
                 secondary_phi,
             )?;
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-RED]   Multi-reduction: extra accumulator phi {} (add @{} in body {})",
                     sec.accumulator_phi.0, sec.accumulator_add_idx, body_idx,
                 ));
@@ -5933,9 +5913,7 @@ fn analyze_reduction_pattern(
             iv,
         ) {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
-                    "[VEC-RED]   Rejecting unsound reduction"
-                ));
+                lccc::cli::stderr_line(format_args!("[VEC-RED]   Rejecting unsound reduction"));
             }
             set_reject("reduction rejected: side effects / control flow / foreign memory in loop");
             return None;
@@ -5970,7 +5948,7 @@ fn analyze_secondary_accumulator(
     // historical behavior (reject the whole loop) is preserved.
     if primary.element_type != primary.accumulator_type {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED]   Rejecting multi-reduction: widening accumulator not supported"
             ));
         }
@@ -6004,7 +5982,7 @@ fn analyze_secondary_accumulator(
     // and is rejected here, keeping the loop scalar.
     if acc_derived.iter().any(|v| primary_derived.contains(v)) {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED]   Rejecting multi-reduction: dependent accumulator (sum2 += sum1)"
             ));
         }
@@ -6034,7 +6012,7 @@ fn analyze_secondary_accumulator(
             }
             if *ty != primary.accumulator_type {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Rejecting multi-reduction: second accumulator type {:?} != {:?}",
                         ty, primary.accumulator_type
                     ));
@@ -6166,7 +6144,7 @@ fn analyze_secondary_accumulator(
             }
             _ => {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Rejecting multi-reduction: second accumulator kind mismatch"
                     ));
                 }
@@ -6808,7 +6786,7 @@ fn rewrite_uses_where_available(
         }
     }
     if trace {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-AVAIL] fn={} redirected={} refused_unavailable={} (replacement v{})",
             func.name, updates, refused, replacement.0
         ));
@@ -9035,7 +9013,7 @@ fn rewrite_conditional_store(
         b.terminator = Terminator::Branch(latch_label);
     }
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-MAP] conditional-store rewrite: {} condition(s), store folded into select",
             n_conds
         ));
@@ -9628,7 +9606,7 @@ fn rewrite_folded_cond_store(
         g.terminator = Terminator::Branch(store_label);
     }
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-MAP] conditional-store rewrite (folded mask form): store folded into select"
         ));
     }
@@ -9644,7 +9622,7 @@ fn analyze_map_pattern(
     let header_idx = loop_info.header;
     let header = &func.blocks[header_idx];
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-MAP] ENTER: header={}, body={:?}",
             header_idx, loop_info.body
         ));
@@ -9654,7 +9632,7 @@ fn analyze_map_pattern(
         Some(e) => e,
         None => {
             if debug {
-                lccc::cli_output::stderr_line(format_args!("[VEC-MAP] BAIL: no exit"));
+                lccc::cli::stderr_line(format_args!("[VEC-MAP] BAIL: no exit"));
             }
             return None;
         }
@@ -9663,7 +9641,7 @@ fn analyze_map_pattern(
         Some(l) => l,
         None => {
             if debug {
-                lccc::cli_output::stderr_line(format_args!("[VEC-MAP] BAIL: no latch"));
+                lccc::cli::stderr_line(format_args!("[VEC-MAP] BAIL: no latch"));
             }
             return None;
         }
@@ -9679,7 +9657,7 @@ fn analyze_map_pattern(
         } => (*dest, *true_label, *false_label),
         _ => {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-MAP] BAIL: header has no value-tested conditional branch"
                 ));
             }
@@ -9694,7 +9672,7 @@ fn analyze_map_pattern(
             .any(|&block_idx| func.blocks[block_idx].label == branch_true)
     {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-MAP] BAIL: header branch is not true-to-loop/false-to-exit"
             ));
         }
@@ -9710,7 +9688,7 @@ fn analyze_map_pattern(
             )
     }) {
         if debug {
-            lccc::cli_output::stderr_line(format_args!("[VEC-MAP] BAIL: internal condbranch"));
+            lccc::cli::stderr_line(format_args!("[VEC-MAP] BAIL: internal condbranch"));
         }
         return None;
     }
@@ -9751,7 +9729,7 @@ fn analyze_map_pattern(
     }
     let Some((iv, iv_ty)) = iv else {
         if debug {
-            lccc::cli_output::stderr_line(format_args!("[VEC-MAP] BAIL: no IV phi"));
+            lccc::cli::stderr_line(format_args!("[VEC-MAP] BAIL: no IV phi"));
         }
         return None;
     };
@@ -9767,7 +9745,7 @@ fn analyze_map_pattern(
     ) {
         set_reject("map induction variable does not start at a constant 0 on its preheader edge");
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-MAP] BAIL: IV seed is not positive zero on the unique preheader edge"
             ));
         }
@@ -9775,7 +9753,7 @@ fn analyze_map_pattern(
     }
     if !map_iv_has_unit_latch_increment(func, header_idx, latch_idx, iv, iv_ty) {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-MAP] BAIL: IV phi does not use its unique latch i+1 definition"
             ));
         }
@@ -9798,7 +9776,7 @@ fn analyze_map_pattern(
     {
         set_reject("map loop carries a value other than its induction variable");
         if debug {
-            lccc::cli_output::stderr_line(format_args!("[VEC-MAP] BAIL: non-IV header phi"));
+            lccc::cli::stderr_line(format_args!("[VEC-MAP] BAIL: non-IV header phi"));
         }
         return None;
     }
@@ -9809,7 +9787,7 @@ fn analyze_map_pattern(
     if !loop_escape_closed(func, &loop_info.body, header_idx, exit_idx, iv) {
         set_reject("map loop boundary not closed (second exit or escaping non-IV value)");
         if debug {
-            lccc::cli_output::stderr_line(format_args!("[VEC-MAP] BAIL: loop boundary not closed"));
+            lccc::cli::stderr_line(format_args!("[VEC-MAP] BAIL: loop boundary not closed"));
         }
         return None;
     }
@@ -9856,7 +9834,7 @@ fn analyze_map_pattern(
     });
     let Some((exit_cmp_dest, exit_cmp_op, limit)) = exit_cmp_info else {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-MAP] BAIL: branch-tested exit comparison is unsupported"
             ));
         }
@@ -9867,7 +9845,7 @@ fn analyze_map_pattern(
     {
         set_reject("map trip count is not loop-invariant");
         if debug {
-            lccc::cli_output::stderr_line(format_args!("[VEC-MAP] BAIL: trip count not invariant"));
+            lccc::cli::stderr_line(format_args!("[VEC-MAP] BAIL: trip count not invariant"));
         }
         return None;
     }
@@ -9912,7 +9890,7 @@ fn analyze_map_pattern(
                         || load_infos.len() >= MAP_MAX_STREAMS
                     {
                         if debug {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[VEC-MAP] BAIL: bad load ty/streams"
                             ));
                         }
@@ -9935,7 +9913,7 @@ fn analyze_map_pattern(
                         || store_info.is_some()
                     {
                         if debug {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[VEC-MAP] BAIL: bad store ty/dup"
                             ));
                         }
@@ -9943,7 +9921,7 @@ fn analyze_map_pattern(
                     }
                     let Operand::Value(store_val) = val else {
                         if debug {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[VEC-MAP] BAIL: store val not value"
                             ));
                         }
@@ -9953,9 +9931,7 @@ fn analyze_map_pattern(
                 }
                 Instruction::BinOp { op, ty, .. } if op.can_trap() && !ty.is_float() => {
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
-                            "[VEC-MAP] BAIL: trapping binop"
-                        ));
+                        lccc::cli::stderr_line(format_args!("[VEC-MAP] BAIL: trapping binop"));
                     }
                     return None;
                 }
@@ -9993,7 +9969,7 @@ fn analyze_map_pattern(
                 | Instruction::GlobalAddr { .. } => {}
                 _ => {
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-MAP] BAIL: unwhitelisted inst in scan"
                         ));
                     }
@@ -10004,7 +9980,7 @@ fn analyze_map_pattern(
     }
     let Some((body_idx, dst_gep, store_val, elem_ty)) = store_info else {
         if debug {
-            lccc::cli_output::stderr_line(format_args!("[VEC-MAP] BAIL: no store info"));
+            lccc::cli::stderr_line(format_args!("[VEC-MAP] BAIL: no store info"));
         }
         return None;
     };
@@ -10012,13 +9988,13 @@ fn analyze_map_pattern(
     // invariant is not a map).
     if load_infos.is_empty() {
         if debug {
-            lccc::cli_output::stderr_line(format_args!("[VEC-MAP] BAIL: no loads"));
+            lccc::cli::stderr_line(format_args!("[VEC-MAP] BAIL: no loads"));
         }
         return None;
     }
     if load_infos.iter().any(|&(_, _, _, ty)| ty != elem_ty) {
         if debug {
-            lccc::cli_output::stderr_line(format_args!("[VEC-MAP] BAIL: load/store ty mismatch"));
+            lccc::cli::stderr_line(format_args!("[VEC-MAP] BAIL: load/store ty mismatch"));
         }
         return None;
     }
@@ -10035,7 +10011,7 @@ fn analyze_map_pattern(
     // addition can wrap before the pointer-width extension.
     if !gep_uses_iv(func, &loop_info.body, dst_gep, iv, &iv_derived, elem_size) {
         if debug {
-            lccc::cli_output::stderr_line(format_args!("[VEC-MAP]   GEPs don't use IV"));
+            lccc::cli::stderr_line(format_args!("[VEC-MAP]   GEPs don't use IV"));
         }
         return None;
     }
@@ -10050,7 +10026,7 @@ fn analyze_map_pattern(
     ) {
         set_reject("map destination GEP offset can wrap before address widening");
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-MAP] BAIL: destination offset may wrap/truncate"
             ));
         }
@@ -10059,7 +10035,7 @@ fn analyze_map_pattern(
     if find_reduction_byte_iv(func, &loop_info.body, dst_gep, elem_size, iv).is_none() {
         set_reject("map access is not a contiguous element-size stride");
         if debug {
-            lccc::cli_output::stderr_line(format_args!("[VEC-MAP] BAIL: dst not contiguous"));
+            lccc::cli::stderr_line(format_args!("[VEC-MAP] BAIL: dst not contiguous"));
         }
         return None;
     }
@@ -10079,7 +10055,7 @@ fn analyze_map_pattern(
         {
             set_reject("map source access is not a safe contiguous element-size stride");
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-MAP] BAIL: src not contiguous or offset may wrap"
                 ));
             }
@@ -10150,7 +10126,7 @@ fn analyze_map_pattern(
             elem_size,
         );
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-MAP]   byte parse store_val={} -> {:?}",
                 store_val.0, parsed
             ));
@@ -10163,7 +10139,7 @@ fn analyze_map_pattern(
     } else {
         let parsed = parse_tree(store_val, 0);
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-MAP]   parse store_val={} -> {:?}",
                 store_val.0, parsed
             ));
@@ -10253,7 +10229,7 @@ fn analyze_map_pattern(
             (Some(d), Some(s)) if roots_proven_distinct(d, s, symbol_facts));
         if !distinct {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-MAP]   GEP {:?}/{:?} bases not provably distinct ({:?} vs {:?}): runtime alias guard",
                     dst_gep, src_gep, dst_root, src_root
                 ));
@@ -10263,7 +10239,7 @@ fn analyze_map_pattern(
     }
 
     if debug {
-        lccc::cli_output::stderr_line(format_args!("[VEC-MAP]   Map pattern detected: {:?}", expr));
+        lccc::cli::stderr_line(format_args!("[VEC-MAP]   Map pattern detected: {:?}", expr));
     }
 
     Some(MapPattern {
@@ -11852,7 +11828,7 @@ fn analyze_byte_count_loop(
         if let Instruction::Phi { dest, .. } = inst {
             if *dest != iv && *dest != acc_phi {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-CNT] extra header phi v{} (not the IV or the accumulator); declining",
                         dest.0
                     ));
@@ -11865,9 +11841,7 @@ fn analyze_byte_count_loop(
         for inst in &func.blocks[b].instructions {
             if inst.may_write_memory() {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
-                        "[VEC-CNT] loop writes memory; declining"
-                    ));
+                    lccc::cli::stderr_line(format_args!("[VEC-CNT] loop writes memory; declining"));
                 }
                 return None;
             }
@@ -11876,7 +11850,7 @@ fn analyze_byte_count_loop(
                 Instruction::Call { .. } | Instruction::CallIndirect { .. }
             ) {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-CNT] loop contains a call; declining"
                     ));
                 }
@@ -11884,7 +11858,7 @@ fn analyze_byte_count_loop(
             }
             if let Instruction::Load { volatile: true, .. } = inst {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-CNT] loop contains a volatile load; declining"
                     ));
                 }
@@ -11914,7 +11888,7 @@ fn analyze_byte_count_loop(
                     || terminator_uses_value(&other.terminator, d);
                 if used {
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-CNT] body value v{} is live-out; declining",
                             d.0
                         ));
@@ -11970,7 +11944,7 @@ fn analyze_byte_count_loop(
     }
     if leaf_tys.is_empty() {
         if debug {
-            lccc::cli_output::stderr_line(format_args!("[VEC-CNT] no byte streams; declining"));
+            lccc::cli::stderr_line(format_args!("[VEC-CNT] no byte streams; declining"));
         }
         return None;
     }
@@ -11998,7 +11972,7 @@ fn analyze_byte_count_loop(
         1,
     ) else {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-CNT] added value is not a byte-exact tree; declining"
             ));
         }
@@ -12006,7 +11980,7 @@ fn analyze_byte_count_loop(
     };
     let Some(kind) = classify_byte_sum(&tree, tree_range) else {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-CNT] added value is neither a 0/1 predicate nor a lane-exact byte \
                  in [0,255] / [-128,127] (range {tree_range:?}); declining"
             ));
@@ -12022,7 +11996,7 @@ fn analyze_byte_count_loop(
     if let Operand::Const(c) = &limit {
         if c.to_i64().is_some_and(|n| n < 2 * width.lanes()) {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-CNT] constant trip count below two packed iterations; declining"
                 ));
             }
@@ -12579,9 +12553,7 @@ fn transform_byte_count_reduction_inner(
         None,
     ) {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
-                "[VEC-CNT] tree has no lowering; declining"
-            ));
+            lccc::cli::stderr_line(format_args!("[VEC-CNT] tree has no lowering; declining"));
         }
         return 0;
     }
@@ -12657,7 +12629,7 @@ fn transform_byte_count_reduction_inner(
     for &b in &p.src_bases {
         let Some(plan) = plan_remainder_reference(func, b, &p.loop_blocks) else {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-CNT] source base has no dominance plan; declining"
                 ));
             }
@@ -12681,7 +12653,7 @@ fn transform_byte_count_reduction_inner(
     *next_val_id = mirror_next;
     let Some(scalar_v) = scalar_v else {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-CNT] scalar mirror emission failed; declining"
             ));
         }
@@ -13408,7 +13380,7 @@ fn transform_byte_count_reduction_inner(
     }
 
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-CNT] fn={} loop H{}: counting reduction, {} changes",
             func.name, p.header_idx, changes
         ));
@@ -13765,7 +13737,7 @@ fn analyze_byte_compare_loop(
     macro_rules! decline {
         ($($arg:tt)*) => {{
             if debug {
-                lccc::cli_output::stderr_line(format_args!("[BCMP] {}; declining", format_args!($($arg)*)));
+                lccc::cli::stderr_line(format_args!("[BCMP] {}; declining", format_args!($($arg)*)));
             }
             return None;
         }};
@@ -14453,7 +14425,7 @@ fn transform_byte_compare_loop(
             // The analyzer guaranteed this shape; a mismatch would mean the
             // CFG changed underneath the analysis. Do not half-apply.
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[BCMP] preheader terminator changed under the analysis; aborting"
                 ));
             }
@@ -14514,7 +14486,7 @@ fn transform_byte_compare_loop(
         });
     }
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[BCMP] byte-compare loop vectorized ({}-byte windows): {} changes",
             width, changes
         ));
@@ -14810,7 +14782,7 @@ fn analyze_adler_loop(
         .collect();
     if body_candidates.len() != 1 {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-ADLER] not a single body block; declining"
             ));
         }
@@ -14997,7 +14969,7 @@ fn analyze_adler_loop(
         };
         if !cursor_ok {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-ADLER] loads are not p+0..p+K; declining"
                 ));
             }
@@ -15136,7 +15108,7 @@ fn analyze_adler_loop(
         let (Some(p_phi), Some(p_init), Some(_), Some(p_ty)) = (p_phi, p_init, p_back, p_ty_found)
         else {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-ADLER] cursor phi/backedge not recognized; declining"
                 ));
             }
@@ -15230,9 +15202,7 @@ fn analyze_adler_loop(
         }
         let Some((n_phi, n_ty, n_init, n_back, n_signed)) = counter else {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
-                    "[VEC-ADLER] no byte-counter phi; declining"
-                ));
+                lccc::cli::stderr_line(format_args!("[VEC-ADLER] no byte-counter phi; declining"));
             }
             continue;
         };
@@ -15306,7 +15276,7 @@ fn analyze_adler_loop(
             };
             if !allowed.contains(&d.0) {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-ADLER] body instruction #{} ({:?}) outside the grammar; declining",
                         ii, inst
                     ));
@@ -15354,7 +15324,7 @@ fn analyze_adler_loop(
                         || terminator_uses_value(&other.terminator, d);
                     if used {
                         if debug {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[VEC-ADLER] body value v{} is live-out; declining",
                                 d.0
                             ));
@@ -15378,9 +15348,7 @@ fn analyze_adler_loop(
             .any(|(d, _, _)| ![*s1_phi, s2_phi, n_phi, p_phi].contains(d))
         {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
-                    "[VEC-ADLER] extra header phi; declining"
-                ));
+                lccc::cli::stderr_line(format_args!("[VEC-ADLER] extra header phi; declining"));
             }
             continue;
         }
@@ -15894,7 +15862,7 @@ fn transform_adler_loop_inner(
     changes += rewire(p.p_phi, Operand::Value(vp_phi), &mut func.blocks);
 
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-ADLER] fn={} loop H{}: adler32 vectorized (K={}), {} changes",
             func.name, p.header_idx, p.chain_len, changes
         ));
@@ -18399,9 +18367,7 @@ fn analyze_stencil_pattern(
     if !loop_escape_closed(func, &loop_info.body, header_idx, exit_idx, iv) {
         set_reject("stencil loop boundary not closed (second exit or escaping non-IV value)");
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
-                "[VEC-STENCIL] BAIL: loop boundary not closed"
-            ));
+            lccc::cli::stderr_line(format_args!("[VEC-STENCIL] BAIL: loop boundary not closed"));
         }
         return None;
     }
@@ -18658,7 +18624,7 @@ fn analyze_stencil_pattern(
         needs_alias_guard,
     };
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-STENCIL] matched: taps={} elem={:?} start={} k={} dst_disp={} disps={:?}",
             pattern.taps.len(),
             pattern.elem_ty,
@@ -18694,7 +18660,7 @@ fn transform_stencil_vector(
         || plan_remainder_reference(func, pattern.dst_base, &pattern.loop_blocks).is_none()
     {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-STENCIL] bases not dominance-safe; skipping loop"
             ));
         }
@@ -18751,7 +18717,7 @@ fn transform_stencil_vector(
             )
         {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-STENCIL] alias-guard preflight failed; staying scalar"
                 ));
             }
@@ -18769,7 +18735,7 @@ fn transform_stencil_vector(
         build_stencil_remainder_loop(func, pattern, vec_width, &mut next_val_id, &mut next_label)
     else {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-STENCIL] scalar remainder mirror unavailable; bailing"
             ));
         }
@@ -19041,7 +19007,7 @@ fn transform_stencil_vector(
         // Fail soft: revert the bound rewrite so the scalar loop keeps its
         // original trip count, and drop the byte-IV plumbing.
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-STENCIL] expression mirror failed; reverting"
             ));
         }
@@ -19086,7 +19052,7 @@ fn transform_stencil_vector(
             |inst| matches!(inst, Instruction::Store { ptr, .. } if *ptr == pattern.store_gep),
         ) else {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-STENCIL] store not found at transform time"
                 ));
             }
@@ -19188,7 +19154,7 @@ fn transform_stencil_vector(
     func.next_value_id = next_val_id;
     func.next_label = next_label;
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-STENCIL] transform complete: {} changes",
             changes
         ));
@@ -20929,7 +20895,7 @@ fn find_exit(func: &IrFunction, loop_info: &loop_analysis::NaturalLoop) -> Optio
     }
 
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-RED]   find_exit: loop body contains block indices: {:?}",
             loop_info.body
         ));
@@ -20938,7 +20904,7 @@ fn find_exit(func: &IrFunction, loop_info: &loop_analysis::NaturalLoop) -> Optio
     for &block_idx in &loop_info.body {
         let block = &func.blocks[block_idx];
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED]   Block[{}] (label={}) terminator: {:?}",
                 block_idx, block.label.0, block.terminator
             ));
@@ -20961,7 +20927,7 @@ fn find_exit(func: &IrFunction, loop_info: &loop_analysis::NaturalLoop) -> Optio
                     .unwrap_or(false);
 
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Block[{}] CondBranch: true=BlockId({}) [idx={:?}] (in_loop={}), false=BlockId({}) [idx={:?}] (in_loop={})",
                         block_idx,
                         true_label.0,
@@ -20993,7 +20959,7 @@ fn find_latch(func: &IrFunction, loop_info: &loop_analysis::NaturalLoop) -> Opti
     let header_label = func.blocks[loop_info.header].label;
 
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-RED]   find_latch: looking for backedge to header BlockId({})",
             header_label.0
         ));
@@ -21002,7 +20968,7 @@ fn find_latch(func: &IrFunction, loop_info: &loop_analysis::NaturalLoop) -> Opti
     for &block_idx in &loop_info.body {
         let block = &func.blocks[block_idx];
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED]   Block[{}] (label={}) terminator: {:?}",
                 block_idx, block.label.0, block.terminator
             ));
@@ -21010,7 +20976,7 @@ fn find_latch(func: &IrFunction, loop_info: &loop_analysis::NaturalLoop) -> Opti
         match &block.terminator {
             Terminator::Branch(target) if *target == header_label => {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Found latch: block[{}]",
                         block_idx
                     ));
@@ -21024,7 +20990,7 @@ fn find_latch(func: &IrFunction, loop_info: &loop_analysis::NaturalLoop) -> Opti
             } => {
                 if *true_label == header_label || *false_label == header_label {
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-RED]   Found latch: block[{}]",
                             block_idx
                         ));
@@ -22145,7 +22111,7 @@ fn transform_strict_computed_recip_reduction(
     func.next_label = next_label;
 
     if std::env::var("LCCC_DEBUG_VECTORIZE").is_ok() {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-STRICT-RECIP] {}: inserted ordered 4-wide prefix before block {}",
             func.name, original_header_label.0
         ));
@@ -23061,9 +23027,7 @@ fn verify_gep_pattern(block: &BasicBlock, gep_val: Value, iv: Value) -> Option<(
     let gep_inst = find_inst_by_dest(block, gep_val);
     if gep_inst.is_none() {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
-                "[VEC]     GEP instruction not found in block"
-            ));
+            lccc::cli::stderr_line(format_args!("[VEC]     GEP instruction not found in block"));
         }
         return None;
     }
@@ -23073,9 +23037,7 @@ fn verify_gep_pattern(block: &BasicBlock, gep_val: Value, iv: Value) -> Option<(
             match offset {
                 Operand::Value(v) if *v == iv => {
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
-                            "[VEC]     GEP uses IV directly"
-                        ));
+                        lccc::cli::stderr_line(format_args!("[VEC]     GEP uses IV directly"));
                     }
                     Some(())
                 }
@@ -23084,7 +23046,7 @@ fn verify_gep_pattern(block: &BasicBlock, gep_val: Value, iv: Value) -> Option<(
                     let mul_inst = find_inst_by_dest(block, *idx_val);
                     if mul_inst.is_none() {
                         if debug {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[VEC]     GEP offset value not found in block"
                             ));
                         }
@@ -23110,14 +23072,14 @@ fn verify_gep_pattern(block: &BasicBlock, gep_val: Value, iv: Value) -> Option<(
                             };
                             if lhs_matches || rhs_matches {
                                 if debug {
-                                    lccc::cli_output::stderr_line(format_args!(
+                                    lccc::cli::stderr_line(format_args!(
                                         "[VEC]     GEP uses IV * scale"
                                     ));
                                 }
                                 Some(())
                             } else {
                                 if debug {
-                                    lccc::cli_output::stderr_line(format_args!(
+                                    lccc::cli::stderr_line(format_args!(
                                         "[VEC]     GEP offset multiply doesn't involve IV"
                                     ));
                                 }
@@ -23126,7 +23088,7 @@ fn verify_gep_pattern(block: &BasicBlock, gep_val: Value, iv: Value) -> Option<(
                         }
                         _ => {
                             if debug {
-                                lccc::cli_output::stderr_line(format_args!(
+                                lccc::cli::stderr_line(format_args!(
                                     "[VEC]     GEP offset not from Mul instruction"
                                 ));
                             }
@@ -23136,9 +23098,7 @@ fn verify_gep_pattern(block: &BasicBlock, gep_val: Value, iv: Value) -> Option<(
                 }
                 _ => {
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
-                            "[VEC]     GEP offset is not a Value"
-                        ));
+                        lccc::cli::stderr_line(format_args!("[VEC]     GEP offset is not a Value"));
                     }
                     None
                 }
@@ -23146,9 +23106,7 @@ fn verify_gep_pattern(block: &BasicBlock, gep_val: Value, iv: Value) -> Option<(
         }
         _ => {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
-                    "[VEC]     Instruction is not GetElementPtr"
-                ));
+                lccc::cli::stderr_line(format_args!("[VEC]     Instruction is not GetElementPtr"));
             }
             None
         }
@@ -23493,7 +23451,7 @@ fn hoist_fma_a_broadcast(
             crate::common::source::Span::dummy(),
         );
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC]   Hoisted BroadcastLoadF64 for A ptr Value({}) into entry block {} ({})",
                 bc_ptr.0,
                 site,
@@ -23608,7 +23566,7 @@ fn insert_remainder_loop(
     // phis of a chained loop stay valid without relabelling.
     if fma_remainder_is_dead(func, pattern, vec_width) {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC] Remainder omitted: constant trip count divides {vec_width} exactly"
             ));
         }
@@ -23674,20 +23632,20 @@ fn insert_remainder_loop(
     *next_val_id += 1;
 
     if debug {
-        lccc::cli_output::stderr_line(format_args!("[VEC] Creating remainder loop blocks..."));
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!("[VEC] Creating remainder loop blocks..."));
+        lccc::cli::stderr_line(format_args!(
             "[VEC]   vec_exit (BlockId({}))",
             vec_exit_label.0
         ));
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC]   remainder_header (BlockId({}))",
             remainder_header_label.0
         ));
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC]   remainder_body (BlockId({}))",
             remainder_body_label.0
         ));
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC]   remainder_latch (BlockId({}))",
             remainder_latch_label.0
         ));
@@ -23703,7 +23661,7 @@ fn insert_remainder_loop(
     } = &mut header_block.terminator
     {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC]   Redirecting header exit {} → {}",
                 false_label, vec_exit_label
             ));
@@ -23738,7 +23696,7 @@ fn insert_remainder_loop(
             }
         }
         if debug && retargeted > 0 {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC]   Retargeted {} chained exit-phi incoming edge(s) to the remainder header",
                 retargeted
             ));
@@ -23979,11 +23937,11 @@ fn insert_remainder_loop(
     func.blocks.push(remainder_latch_block);
 
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC] Remainder phi: [(Value({}), BlockId({})), (Value({}), BlockId({}))]",
             j_rem_start.0, vec_exit_label.0, j_rem_iv_next.0, remainder_latch_label.0
         ));
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC] Transformation complete: 4 blocks added"
         ));
     }
@@ -24020,7 +23978,7 @@ fn transform_to_fma_f64x2(
     let mut next_val_id = func.next_value_id;
     if !normalize_iv_exit_comparison(func, pattern, &mut next_val_id, debug) {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC] exit comparison is not a supported counted-loop bound; skipping loop"
             ));
         }
@@ -24036,7 +23994,7 @@ fn transform_to_fma_f64x2(
     // fma_broadcast_entry_edges).
     if !fma_remainder_references_sound(func, pattern) {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC] remainder references not dominance-safe; skipping loop"
             ));
         }
@@ -24044,7 +24002,7 @@ fn transform_to_fma_f64x2(
     }
     let Some(entry_edges) = fma_broadcast_entry_edges(func, pattern) else {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC] no isolatable entry edge for the A broadcast; skipping loop"
             ));
         }
@@ -24092,7 +24050,7 @@ fn transform_to_fma_f64x2(
                     if let Operand::Value(offset_val) = offset {
                         gep_ivs.insert(*offset_val);
                         if debug {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[VEC]   GEP Value({}) uses offset Value({})",
                                 dest.0, offset_val.0
                             ));
@@ -24189,12 +24147,12 @@ fn transform_to_fma_f64x2(
     }
 
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC]   IV-derived values (including j-loop IV): {:?}",
             iv_derived
         ));
-        lccc::cli_output::stderr_line(format_args!("[VEC]   GEP offset chain: {:?}", gep_ivs));
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!("[VEC]   GEP offset chain: {:?}", gep_ivs));
+        lccc::cli::stderr_line(format_args!(
             "[VEC]   Loop contains blocks: {:?}",
             pattern.loop_blocks
         ));
@@ -24242,7 +24200,7 @@ fn transform_to_fma_f64x2(
                 );
 
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC]   Inserted division for dynamic limit: Value({})",
                         div_dest.0
                     ));
@@ -24252,7 +24210,7 @@ fn transform_to_fma_f64x2(
             }
             _ => {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!("[VEC]   Unsupported limit type"));
+                    lccc::cli::stderr_line(format_args!("[VEC]   Unsupported limit type"));
                 }
                 return 0;
             }
@@ -24273,7 +24231,7 @@ fn transform_to_fma_f64x2(
                         ty: _,
                     } = inst
                     {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC]   Block {} has comparison: {:?} <cmp> {:?}, dest={:?}",
                             block_idx, lhs, rhs, dest
                         ));
@@ -24305,7 +24263,7 @@ fn transform_to_fma_f64x2(
 
                     if modifies_lhs || modifies_rhs {
                         if debug {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[VEC]   -> This is an IV comparison (will modify)"
                             ));
                         }
@@ -24315,7 +24273,7 @@ fn transform_to_fma_f64x2(
                             *rhs = halved_limit.clone();
                             changes += 1;
                             if debug {
-                                lccc::cli_output::stderr_line(format_args!(
+                                lccc::cli::stderr_line(format_args!(
                                     "[VEC]   -> Modified comparison RHS to {:?}",
                                     halved_limit
                                 ));
@@ -24324,7 +24282,7 @@ fn transform_to_fma_f64x2(
                             *lhs = halved_limit.clone();
                             changes += 1;
                             if debug {
-                                lccc::cli_output::stderr_line(format_args!(
+                                lccc::cli::stderr_line(format_args!(
                                     "[VEC]   -> Modified comparison LHS to {:?}",
                                     halved_limit
                                 ));
@@ -24365,7 +24323,7 @@ fn transform_to_fma_f64x2(
                     );
 
                     if debug && (lhs_is_iv_derived || rhs_is_8) {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC]   Found multiply in block {}: Value({}) = {:?} * {:?}, lhs_is_iv_derived={}, rhs_is_8={}",
                             block_idx, dest.0, lhs, rhs, lhs_is_iv_derived, rhs_is_8
                         ));
@@ -24381,7 +24339,7 @@ fn transform_to_fma_f64x2(
                         changes += 1;
                         modified_any_increment = true;
                         if debug {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[VEC]   Changed GEP stride from 8 to 16 for Value({})",
                                 dest.0
                             ));
@@ -24395,7 +24353,7 @@ fn transform_to_fma_f64x2(
         // Look for pointer increments (ptr + 8) and change them to (ptr + 16)
         if !modified_any_increment {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC]   No IV*8 multiplies found, searching for strength-reduced pointer increments"
                 ));
             }
@@ -24435,7 +24393,7 @@ fn transform_to_fma_f64x2(
             }
 
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC]   Tracked pointer values: {} pointers",
                     pointer_values.len()
                 ));
@@ -24465,7 +24423,7 @@ fn transform_to_fma_f64x2(
                             } else {
                                 false
                             };
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[VEC]   Block {} has add by 8: Value({}) = {:?} + 8, is_pointer={}",
                                 block_idx, dest.0, lhs, is_pointer
                             ));
@@ -24487,7 +24445,7 @@ fn transform_to_fma_f64x2(
                             changes += 1;
                             modified_any_increment = true;
                             if debug {
-                                lccc::cli_output::stderr_line(format_args!(
+                                lccc::cli::stderr_line(format_args!(
                                     "[VEC]   -> Changed pointer increment from 8 to 16 for Value({})",
                                     dest.0
                                 ));
@@ -24498,10 +24456,10 @@ fn transform_to_fma_f64x2(
             }
 
             if debug && !modified_any_increment {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC]   No add-by-8 found in IR - GEPs likely using IV directly"
                 ));
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC]   Will modify GEP offsets to use IV*2 instead of IV"
                 ));
             }
@@ -24523,7 +24481,7 @@ fn transform_to_fma_f64x2(
                             if let Operand::Value(offset_val) = offset {
                                 geps_to_modify.push((block_idx, inst_idx, *offset_val, *ty));
                                 if debug {
-                                    lccc::cli_output::stderr_line(format_args!(
+                                    lccc::cli::stderr_line(format_args!(
                                         "[VEC]   Found GEP in block {} inst {}: Value({}) with offset Value({})",
                                         block_idx, inst_idx, dest.0, offset_val.0
                                     ));
@@ -24567,7 +24525,7 @@ fn transform_to_fma_f64x2(
                     changes += 1;
                     modified_any_increment = true;
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC]   Inserted mul and updated GEP offset: Value({}) = Value({}) * 2",
                             mul_dest.0, offset_val.0
                         ));
@@ -24576,7 +24534,7 @@ fn transform_to_fma_f64x2(
             }
 
             if debug && !modified_any_increment {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC]   Warning: Could not modify GEP offsets"
                 ));
             }
@@ -24636,7 +24594,7 @@ fn transform_to_fma_f64x2(
         }
         changes += 1;
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC]   Inserted hoisted FmaF64x2 intrinsic, dest_ptr=Value({}), B=Value({})",
                 pattern.c_gep.0, pattern.b_gep.0
             ));
@@ -24656,7 +24614,7 @@ fn transform_to_fma_f64x2(
         );
         changes += remainder_changes;
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC]   Added remainder loop: {} blocks created",
                 remainder_changes / 4
             ));
@@ -24741,7 +24699,7 @@ fn normalize_iv_exit_comparison(
             (_, Operand::Value(r)) if *r == iv => (false, lhs.clone(), *ty),
             _ => {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC] exit comparison does not name the IV itself; refusing"
                     ));
                 }
@@ -24772,7 +24730,7 @@ fn normalize_iv_exit_comparison(
         (false, IrCmpOp::Ne) => (IrCmpOp::Ne, false),
         (_, IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge) => {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC] unsigned exit comparison on a signed-IV transform; refusing"
                 ));
             }
@@ -24780,7 +24738,7 @@ fn normalize_iv_exit_comparison(
         }
         _ => {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC] exit comparison {op:?} (iv_on_left={iv_on_left}) has no exclusive-trip form; refusing"
                 ));
             }
@@ -24796,7 +24754,7 @@ fn normalize_iv_exit_comparison(
                 let Some(v) = c.to_i64() else { return false };
                 let Some(plus) = v.checked_add(1) else {
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC] inclusive bound overflows the IV type; refusing"
                         ));
                     }
@@ -24815,7 +24773,7 @@ fn normalize_iv_exit_comparison(
                         // contract that is not implemented is not a contract.)
                         let Ok(narrow) = i32::try_from(plus) else {
                             if debug {
-                                lccc::cli_output::stderr_line(format_args!(
+                                lccc::cli::stderr_line(format_args!(
                                     "[VEC] inclusive bound does not fit i32; refusing"
                                 ));
                             }
@@ -24961,7 +24919,7 @@ fn rewrite_reduction_exit_comparison(
         unreachable!("preflighted reduction exit destination remains a Cmp");
     };
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-RED]   exit CMP before: {:?} {:?} {:?}",
             lhs, op, rhs
         ));
@@ -24972,7 +24930,7 @@ fn rewrite_reduction_exit_comparison(
         *lhs = divided_limit.clone();
     }
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-RED]   exit CMP after:  {:?} {:?} {:?}",
             lhs, op, rhs
         ));
@@ -25272,7 +25230,7 @@ fn matmul_f64x4_byte_limit_operand(
                 );
             }
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC]   Inserted clamped I64 byte limit: Value({})",
                     byte_limit.0
                 ));
@@ -25341,7 +25299,7 @@ fn transform_to_fma_f64x4(
     let mut next_val_id = func.next_value_id;
     if !normalize_iv_exit_comparison(func, pattern, &mut next_val_id, debug) {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC] exit comparison is not a supported counted-loop bound; skipping loop"
             ));
         }
@@ -25357,7 +25315,7 @@ fn transform_to_fma_f64x4(
     // fma_broadcast_entry_edges).
     if !fma_remainder_references_sound(func, pattern) {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC] remainder references not dominance-safe; skipping loop"
             ));
         }
@@ -25365,7 +25323,7 @@ fn transform_to_fma_f64x4(
     }
     let Some(entry_edges) = fma_broadcast_entry_edges(func, pattern) else {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC] no isolatable entry edge for the A broadcast; skipping loop"
             ));
         }
@@ -25414,7 +25372,7 @@ fn transform_to_fma_f64x4(
                     if let Operand::Value(offset_val) = offset {
                         gep_ivs.insert(*offset_val);
                         if debug {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[VEC]   GEP Value({}) uses offset Value({})",
                                 dest.0, offset_val.0
                             ));
@@ -25511,12 +25469,12 @@ fn transform_to_fma_f64x4(
     }
 
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC]   IV-derived values (including j-loop IV): {:?}",
             iv_derived
         ));
-        lccc::cli_output::stderr_line(format_args!("[VEC]   GEP offset chain: {:?}", gep_ivs));
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!("[VEC]   GEP offset chain: {:?}", gep_ivs));
+        lccc::cli::stderr_line(format_args!(
             "[VEC]   Loop contains blocks: {:?}",
             pattern.loop_blocks
         ));
@@ -25542,7 +25500,7 @@ fn transform_to_fma_f64x4(
                 Some(limit) => limit,
                 None => {
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC]   Unsupported signed matmul limit type"
                         ));
                     }
@@ -25565,7 +25523,7 @@ fn transform_to_fma_f64x4(
                         ty: _,
                     } = inst
                     {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC]   Block {} has comparison: {:?} <cmp> {:?}, dest={:?}",
                             block_idx, lhs, rhs, dest
                         ));
@@ -25597,7 +25555,7 @@ fn transform_to_fma_f64x4(
 
                     if modifies_lhs || modifies_rhs {
                         if debug {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[VEC]   -> This is an IV comparison (will modify)"
                             ));
                         }
@@ -25607,7 +25565,7 @@ fn transform_to_fma_f64x4(
                             *rhs = byte_limit.clone();
                             changes += 1;
                             if debug {
-                                lccc::cli_output::stderr_line(format_args!(
+                                lccc::cli::stderr_line(format_args!(
                                     "[VEC]   -> Modified comparison RHS to {:?}",
                                     byte_limit
                                 ));
@@ -25616,7 +25574,7 @@ fn transform_to_fma_f64x4(
                             *lhs = byte_limit.clone();
                             changes += 1;
                             if debug {
-                                lccc::cli_output::stderr_line(format_args!(
+                                lccc::cli::stderr_line(format_args!(
                                     "[VEC]   -> Modified comparison LHS to {:?}",
                                     byte_limit
                                 ));
@@ -25668,7 +25626,7 @@ fn transform_to_fma_f64x4(
                         eliminated_mul = true;
                         changes += 1;
                         if debug {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[VEC]   Eliminated IV*8 multiply for Value({}) (IV is now byte offset)",
                                 mul_dest.0
                             ));
@@ -25704,7 +25662,7 @@ fn transform_to_fma_f64x4(
                         eliminated_mul = true;
                         changes += 1;
                         if debug {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[VEC]   Eliminated IV<<3 shift for Value({}) (IV is now byte offset)",
                                 shl_dest.0
                             ));
@@ -25736,7 +25694,7 @@ fn transform_to_fma_f64x4(
                     *ty = IrType::I64;
                     changes += 1;
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC]   Changed IV increment from +1 to +128 (quad FMA) and promoted to I64"
                         ));
                     }
@@ -25745,7 +25703,7 @@ fn transform_to_fma_f64x4(
         }
 
         if debug && !eliminated_mul {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC]   Warning: Could not find IV*8 multiply to eliminate"
             ));
         }
@@ -25769,7 +25727,7 @@ fn transform_to_fma_f64x4(
                             }
                             changes += 1;
                             if debug {
-                                lccc::cli_output::stderr_line(format_args!(
+                                lccc::cli::stderr_line(format_args!(
                                     "[VEC]   Promoted IV Phi Value({}) from I32 to I64",
                                     dest.0
                                 ));
@@ -25802,7 +25760,7 @@ fn transform_to_fma_f64x4(
                                 };
                                 changes += 1;
                                 if debug {
-                                    lccc::cli_output::stderr_line(format_args!(
+                                    lccc::cli::stderr_line(format_args!(
                                         "[VEC]   Promoted Cast I32->I64 for Value({}) to Copy (IV now I64)",
                                         cast_dest.0
                                     ));
@@ -25840,7 +25798,7 @@ fn transform_to_fma_f64x4(
                                 }
                                 changes += 1;
                                 if debug {
-                                    lccc::cli_output::stderr_line(format_args!(
+                                    lccc::cli::stderr_line(format_args!(
                                         "[VEC]   Promoted IV comparison to I64"
                                     ));
                                 }
@@ -25966,7 +25924,7 @@ fn transform_to_fma_f64x4(
         }
         changes += 4;
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC]   Inserted quad FmaF64x4HoistedSIB intrinsics (SIB + hoisted broadcast, step 128)"
             ));
         }
@@ -25983,7 +25941,7 @@ fn transform_to_fma_f64x4(
         );
         changes += remainder_changes;
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC]   Added remainder loop: {} blocks created",
                 remainder_changes / 4
             ));
@@ -26487,7 +26445,7 @@ fn rewire_escaping_iv_uses(
     }
 
     if debug && rewrites > 0 {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "{}   Rewired {} escaping use(s) of counter v{} to the \
              remainder IV v{}",
             tag, rewrites, iv.0, rem_iv.0
@@ -26632,7 +26590,7 @@ fn reduction_array_a_base(func: &IrFunction, pattern: &ReductionPattern) -> Valu
     }
     let result = base.unwrap_or(pattern.array_a_gep);
     if std::env::var("LCCC_DEBUG_VECTORIZE").is_ok() {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-RED] array_a_base = Value({}), array_a_gep = Value({})",
             result.0, pattern.array_a_gep.0
         ));
@@ -26969,7 +26927,7 @@ fn insert_reduction_remainder_loop(
     let iv_starts_at_zero = iv_start == 0;
     if iv_starts_at_zero && const_trip_covers_exactly(&pattern.limit, 0, vec_width, element_size) {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED] exact coverage (limit {:?}, width {}): omitting scalar remainder",
                 pattern.limit, vec_width
             ));
@@ -27079,7 +27037,7 @@ fn insert_reduction_remainder_loop(
         }
         *rem_iv_out = Some(i_rem_start);
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED]   no-remainder rewrite: {} accumulator uses → h-reduce",
                 primary_updates
             ));
@@ -27255,20 +27213,20 @@ fn insert_reduction_remainder_loop(
     }
 
     if debug {
-        lccc::cli_output::stderr_line(format_args!("[VEC-RED] Creating remainder loop blocks..."));
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!("[VEC-RED] Creating remainder loop blocks..."));
+        lccc::cli::stderr_line(format_args!(
             "[VEC-RED]   vec_exit (BlockId({}))",
             vec_exit_label.0
         ));
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-RED]   remainder_header (BlockId({}))",
             remainder_header_label.0
         ));
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-RED]   remainder_body (BlockId({}))",
             remainder_body_label.0
         ));
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-RED]   remainder_latch (BlockId({}))",
             remainder_latch_label.0
         ));
@@ -27278,7 +27236,7 @@ fn insert_reduction_remainder_loop(
     let header_block = &mut func.blocks[pattern.header_idx];
     if let Terminator::CondBranch { false_label, .. } = &mut header_block.terminator {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED]   Redirecting header exit {} → {}",
                 false_label, vec_exit_label
             ));
@@ -27773,7 +27731,7 @@ fn insert_reduction_remainder_loop(
             );
         }
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED]   Rewired {} uses of accumulator outside the loop",
                 primary_updates
             ));
@@ -27781,7 +27739,7 @@ fn insert_reduction_remainder_loop(
     }
 
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-RED] Remainder loop complete: 4 blocks added"
         ));
     }
@@ -28706,7 +28664,7 @@ fn emit_invariant_vector_bound(
     }
 
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-RED]   Divided dynamic limit in {}: Value({})",
             if preheader_idx.is_some() {
                 "the preheader"
@@ -29417,7 +29375,7 @@ fn transform_reduction_avx2(
     // it; a loop whose bases cannot be soundly referenced is skipped whole.
     let Some(remainder_refs) = plan_reduction_remainder_references(func, pattern) else {
         if std::env::var("LCCC_DEBUG_VECTORIZE").is_ok() {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED] remainder references not dominance-safe; skipping loop"
             ));
         }
@@ -29601,7 +29559,7 @@ fn transform_reduction_avx2(
             ),
             _ => {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED] Unsupported type for AVX2: {:?}",
                         pattern.element_type
                     ));
@@ -29611,39 +29569,39 @@ fn transform_reduction_avx2(
         };
 
     if debug {
-        lccc::cli_output::stderr_line(format_args!("[VEC-RED] Transforming reduction to AVX2:"));
-        lccc::cli_output::stderr_line(format_args!("[VEC-RED]   Kind: {:?}", pattern.kind));
-        lccc::cli_output::stderr_line(format_args!("[VEC-RED]   Type: {:?}", pattern.element_type));
-        lccc::cli_output::stderr_line(format_args!("[VEC-RED]   Vec width: {}", vec_width));
+        lccc::cli::stderr_line(format_args!("[VEC-RED] Transforming reduction to AVX2:"));
+        lccc::cli::stderr_line(format_args!("[VEC-RED]   Kind: {:?}", pattern.kind));
+        lccc::cli::stderr_line(format_args!("[VEC-RED]   Type: {:?}", pattern.element_type));
+        lccc::cli::stderr_line(format_args!("[VEC-RED]   Vec width: {}", vec_width));
 
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-RED] === LOOP STRUCTURE BEFORE TRANSFORM ==="
         ));
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-RED]   Header: {}, Body: {}, Latch: {}, Exit: {}",
             pattern.header_idx, pattern.body_idx, pattern.latch_idx, pattern.exit_idx
         ));
 
         // Print header terminator
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-RED]   Header terminator: {:?}",
             func.blocks[pattern.header_idx].terminator
         ));
 
         // Print body terminator
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-RED]   Body terminator: {:?}",
             func.blocks[pattern.body_idx].terminator
         ));
 
         // Print latch terminator
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-RED]   Latch terminator: {:?}",
             func.blocks[pattern.latch_idx].terminator
         ));
 
         // Print IV and limit
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-RED]   IV: {}, Limit: {:?}",
             pattern.iv.0, pattern.limit
         ));
@@ -29680,7 +29638,7 @@ fn transform_reduction_avx2(
     let Some(exit_iv_on_left) = reduction_exit_comparison_iv_on_left(func, pattern, &iv_derived)
     else {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED]   Exit comparison rewrite preflight failed; staying scalar"
             ));
         }
@@ -29741,7 +29699,7 @@ fn transform_reduction_avx2(
         && !matches!(pattern.kind, ReductionKind::Max | ReductionKind::Min)
     {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED]   Nonzero ordinary reduction requires a direct byte-IV form"
             ));
         }
@@ -29770,7 +29728,7 @@ fn transform_reduction_avx2(
             || marching_pointer_step.is_none())
     {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED]   Unsupported marching-pointer recurrence; staying scalar"
             ));
         }
@@ -29804,7 +29762,7 @@ fn transform_reduction_avx2(
                 start_c,
             ) else {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Unsupported or unrepresentable constant limit"
                     ));
                 }
@@ -29825,7 +29783,7 @@ fn transform_reduction_avx2(
                 debug,
             ) else {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Unsupported dynamic limit domain"
                     ));
                 }
@@ -29883,7 +29841,7 @@ fn transform_reduction_avx2(
                 };
                 changes += 1;
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Changed IV increment to byte stride {}",
                         byte_stride
                     ));
@@ -29945,7 +29903,7 @@ fn transform_reduction_avx2(
             }
 
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-RED]   Scaled GEP offset by {}",
                     vec_width
                 ));
@@ -30094,11 +30052,11 @@ fn transform_reduction_avx2(
 
                 if debug {
                     if pattern.kind == ReductionKind::Max {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-RED]   Transformed max body: load + vpmaxsd (AVX2 8-wide)"
                         ));
                     } else {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-RED]   Transformed min body: load + vpminsd (AVX2 8-wide)"
                         ));
                     }
@@ -30141,7 +30099,7 @@ fn transform_reduction_avx2(
                 };
 
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Using register-based intrinsics: {:?}, {:?}",
                         vec_load_op, vec_add_op
                     ));
@@ -30353,23 +30311,23 @@ fn transform_reduction_avx2(
 
                     // Debug: Log vector accumulator flow
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-RED-DEBUG] Vec load SSA value: {}",
                             vec_load.0
                         ));
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-RED-DEBUG] Vector accumulator SSA value: {}",
                             vec_sum_value.0
                         ));
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-RED-DEBUG] Accumulator PHI: {}",
                             pattern.accumulator_phi.0
                         ));
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-RED-DEBUG] Entry init value: {}",
                             init_zero_value.0
                         ));
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-RED-DEBUG] Vector add op: {:?}",
                             vec_add_op
                         ));
@@ -30393,7 +30351,7 @@ fn transform_reduction_avx2(
                 }
 
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Transformed sum body: vec_load + vec_add (register-based)"
                     ));
                 }
@@ -30438,7 +30396,7 @@ fn transform_reduction_avx2(
                         ),
                         _ => {
                             if debug {
-                                lccc::cli_output::stderr_line(format_args!(
+                                lccc::cli::stderr_line(format_args!(
                                     "[VEC-RED] Unsupported AVX2 dot product type: {:?}",
                                     pattern.element_type
                                 ));
@@ -30448,7 +30406,7 @@ fn transform_reduction_avx2(
                     };
 
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Using register-based dot product intrinsics"
                     ));
                 }
@@ -30587,7 +30545,7 @@ fn transform_reduction_avx2(
                 }
 
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Transformed dot product body: load_a + load_b + mul + add"
                     ));
                 }
@@ -30761,7 +30719,7 @@ fn transform_reduction_avx2(
     changes += remainder_changes;
 
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-RED]   Added remainder loop: {} blocks created",
             remainder_changes / 4
         ));
@@ -30797,7 +30755,7 @@ fn transform_reduction_sse2(
     // twin for the rationale).
     let Some(remainder_refs) = plan_reduction_remainder_references(func, pattern) else {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED] remainder references not dominance-safe; skipping loop"
             ));
         }
@@ -30889,7 +30847,7 @@ fn transform_reduction_sse2(
                 && matches!(pattern.accumulator_type, IrType::I64 | IrType::I32)))
     {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED] SSE2 path cannot express a guarded reduction; staying scalar"
             ));
         }
@@ -30921,9 +30879,7 @@ fn transform_reduction_sse2(
             // shape instead of reaching an unreachable!() below.
             IrType::I32 if pattern.kind == ReductionKind::Min => {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
-                        "[VEC-RED] Min reduction requires AVX2"
-                    ));
+                    lccc::cli::stderr_line(format_args!("[VEC-RED] Min reduction requires AVX2"));
                 }
                 return 0;
             }
@@ -30934,7 +30890,7 @@ fn transform_reduction_sse2(
                     // (pmaxsd exists but the epilogue lacks a horizontal-max;
                     // detector already gates on neon, this is defense).
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-RED] Max reduction requires NEON"
                         ));
                     }
@@ -31047,7 +31003,7 @@ fn transform_reduction_sse2(
             ),
             _ => {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED] Unsupported type for SSE2: {:?}",
                         pattern.element_type
                     ));
@@ -31057,10 +31013,10 @@ fn transform_reduction_sse2(
         };
 
     if debug {
-        lccc::cli_output::stderr_line(format_args!("[VEC-RED] Transforming reduction to SSE2:"));
-        lccc::cli_output::stderr_line(format_args!("[VEC-RED]   Kind: {:?}", pattern.kind));
-        lccc::cli_output::stderr_line(format_args!("[VEC-RED]   Type: {:?}", pattern.element_type));
-        lccc::cli_output::stderr_line(format_args!("[VEC-RED]   Vec width: {}", vec_width));
+        lccc::cli::stderr_line(format_args!("[VEC-RED] Transforming reduction to SSE2:"));
+        lccc::cli::stderr_line(format_args!("[VEC-RED]   Kind: {:?}", pattern.kind));
+        lccc::cli::stderr_line(format_args!("[VEC-RED]   Type: {:?}", pattern.element_type));
+        lccc::cli::stderr_line(format_args!("[VEC-RED]   Vec width: {}", vec_width));
     }
 
     // Build IV-derived values using fixed-point iteration
@@ -31094,7 +31050,7 @@ fn transform_reduction_sse2(
     let Some(exit_iv_on_left) = reduction_exit_comparison_iv_on_left(func, pattern, &iv_derived)
     else {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED]   Exit comparison rewrite preflight failed; staying scalar"
             ));
         }
@@ -31154,7 +31110,7 @@ fn transform_reduction_sse2(
         && !matches!(pattern.kind, ReductionKind::Max | ReductionKind::Min)
     {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED]   Nonzero ordinary reduction requires a direct byte-IV form"
             ));
         }
@@ -31183,7 +31139,7 @@ fn transform_reduction_sse2(
             || marching_pointer_step.is_none())
     {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-RED]   Unsupported marching-pointer recurrence; staying scalar"
             ));
         }
@@ -31217,7 +31173,7 @@ fn transform_reduction_sse2(
                 start_c,
             ) else {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Unsupported or unrepresentable constant limit"
                     ));
                 }
@@ -31238,7 +31194,7 @@ fn transform_reduction_sse2(
                 debug,
             ) else {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Unsupported dynamic limit domain"
                     ));
                 }
@@ -31296,7 +31252,7 @@ fn transform_reduction_sse2(
                 };
                 changes += 1;
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Changed IV increment to byte stride {}",
                         byte_stride
                     ));
@@ -31357,7 +31313,7 @@ fn transform_reduction_sse2(
             }
 
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-RED]   Scaled GEP offset by {}",
                     vec_width
                 ));
@@ -31386,7 +31342,7 @@ fn transform_reduction_sse2(
             // fail-closed if the table ever changes.
             ReductionKind::Min => {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Min reduction requires the AVX2 path"
                     ));
                 }
@@ -31513,7 +31469,7 @@ fn transform_reduction_sse2(
                 }
 
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Transformed max body: load + smax (NEON 4-wide)"
                     ));
                 }
@@ -31599,7 +31555,7 @@ fn transform_reduction_sse2(
                 changes += 1;
 
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Created SSA values: vec_load={}, vec_sum={}",
                         vec_load.0, vec_sum_value.0
                     ));
@@ -31700,19 +31656,19 @@ fn transform_reduction_sse2(
 
                     // Debug: Log vector accumulator flow
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-RED-DEBUG-SSE2] Vector accumulator SSA value: {}",
                             vec_sum_value.0
                         ));
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-RED-DEBUG-SSE2] Accumulator PHI: {}",
                             pattern.accumulator_phi.0
                         ));
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-RED-DEBUG-SSE2] Entry init value: {}",
                             init_zero_value.0
                         ));
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-RED-DEBUG-SSE2] Vector add op: {:?}",
                             vec_add_op
                         ));
@@ -31736,7 +31692,7 @@ fn transform_reduction_sse2(
                 }
 
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Transformed sum body: load + add (register-based)"
                     ));
                 }
@@ -31808,7 +31764,7 @@ fn transform_reduction_sse2(
                 }
                 let Some(preheader_label) = preheader_label else {
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[VEC-RED]   NEON dot: no preheader edge on accumulator phi"
                         ));
                     }
@@ -31903,7 +31859,7 @@ fn transform_reduction_sse2(
                 }
 
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Transformed dot product body: load_a + load_b + smlal + smlal2 (NEON 4-wide)"
                     ));
                 }
@@ -31955,7 +31911,7 @@ fn transform_reduction_sse2(
                     ),
                     _ => {
                         if debug {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[VEC-RED] Unsupported SSE2 dot product type: {:?}",
                                 load_intrinsic
                             ));
@@ -31978,7 +31934,7 @@ fn transform_reduction_sse2(
                 changes += 1;
 
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Created SSA values: vec_load_a={}, vec_load_b={}, vec_mul={}, vec_sum={}",
                         vec_load_a.0, vec_load_b.0, vec_mul.0, vec_sum_value.0
                     ));
@@ -32103,7 +32059,7 @@ fn transform_reduction_sse2(
                 }
 
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-RED]   Transformed dot product body: load_a + load_b + mul + add (register-based)"
                     ));
                 }
@@ -32255,7 +32211,7 @@ fn transform_reduction_sse2(
     changes += remainder_changes;
 
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-RED]   Added remainder loop: {} blocks created",
             remainder_changes / 4
         ));
@@ -32599,7 +32555,7 @@ fn transform_map_vector(
     let mut changes = 0;
     if !matches!(&pattern.limit, Operand::Const(_) | Operand::Value(_)) {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-MAP]   Unsupported loop-limit operand; staying scalar"
             ));
         }
@@ -32677,7 +32633,7 @@ fn transform_map_vector(
         && matching_exit_cmps == 1;
     if !branch_tests_exit_cmp || !exit_cmp_shape {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-MAP]   Branch-tested exit comparison changed; staying scalar"
             ));
         }
@@ -32809,7 +32765,7 @@ fn transform_map_vector(
         .then_some(idx)
     }) else {
         if debug {
-            lccc::cli_output::stderr_line(format_args!("[VEC-MAP]   No preheader found; bailing"));
+            lccc::cli::stderr_line(format_args!("[VEC-MAP]   No preheader found; bailing"));
         }
         return 0;
     };
@@ -32824,7 +32780,7 @@ fn transform_map_vector(
         .is_none()
     {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-MAP]   Alias-guard checks cannot reject; declining before mutation"
             ));
         }
@@ -32859,7 +32815,7 @@ fn transform_map_vector(
         .map(|(idx, _)| idx);
     let Some(preflighted_store_pos) = destination_stores.next() else {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-MAP]   Destination store missing during preflight; declining"
             ));
         }
@@ -32867,7 +32823,7 @@ fn transform_map_vector(
     };
     if destination_stores.next().is_some() {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-MAP]   Destination store is ambiguous during preflight; declining"
             ));
         }
@@ -32891,7 +32847,7 @@ fn transform_map_vector(
     if !pattern.guarded_streams.is_empty() {
         let Some(plan) = plan_remainder_reference(func, dst_base, &pattern.loop_blocks) else {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-MAP]   Guard destination base has no sound preheader reference; declining"
                 ));
             }
@@ -32902,7 +32858,7 @@ fn transform_map_vector(
             let Some(plan) = plan_remainder_reference(func, src_bases[i], &pattern.loop_blocks)
             else {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-MAP]   Guarded stream base has no sound preheader reference; declining"
                     ));
                 }
@@ -33222,7 +33178,7 @@ fn transform_map_vector(
         builtin_fma_op,
     ) {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[VEC-MAP]   Tree requires an op with no vector lowering"
             ));
         }
@@ -33284,7 +33240,7 @@ fn transform_map_vector(
             &mut next_label,
         ) else {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VEC-MAP]   Scalar remainder mirror unavailable; bailing"
                 ));
             }
@@ -33407,7 +33363,7 @@ fn transform_map_vector(
             ctx.node_cache.clear();
             let Some(current) = ctx.emit(&packed_expr) else {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!("[VEC-MAP]   Tree emission failed"));
+                    lccc::cli::stderr_line(format_args!("[VEC-MAP]   Tree emission failed"));
                 }
                 return 0;
             };
@@ -34055,7 +34011,7 @@ fn transform_map_vector(
     func.next_label = next_label;
 
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[VEC-MAP]   Map transform complete: {} changes",
             changes
         ));
@@ -35716,7 +35672,7 @@ pub(crate) fn vectorize_const_trip_map_loops(
             let n = transform_map_vector(func, &pattern, avx2, false, fp_contract);
             if n > 0 {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VEC-MAP-EARLY] fn={} loop H{}: {} changes (pre-unroll const-trip map)",
                         func.name, lp.header, n
                     ));

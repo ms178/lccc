@@ -708,7 +708,7 @@ pub(crate) fn run_with_budget(
         }
     }
     if std::env::var_os("CCC_LR_SHRINK_STATS").is_some() {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[LR-SHRINK] regions={} high-pressure={} changed={} excess-area={}->{}",
             stats.regions,
             stats.high_pressure_regions,

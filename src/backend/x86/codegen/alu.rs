@@ -1668,10 +1668,7 @@ impl X86Codegen {
                 && !self.divrem_broken_tails.contains(&dest.0)
             {
                 if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
-                    lccc::cli_output::stderr_line(format_args!(
-                        "[DIVREM] tail-skip dest={}",
-                        dest.0
-                    ));
+                    lccc::cli::stderr_line(format_args!("[DIVREM] tail-skip dest={}", dest.0));
                 }
                 // Tail: nothing to emit. The accumulator cache makes no
                 // claim about this dest (it was never staged through %rax),
@@ -1682,7 +1679,7 @@ impl X86Codegen {
                 // Pair was broken at head-emission time (pathological home
                 // combination): both sides emit standalone divisions.
                 if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[DIVREM] tail-broken dest={} (standalone)",
                         dest.0
                     ));
@@ -1691,7 +1688,7 @@ impl X86Codegen {
                 self.divrem_head_partners.get(&dest.0)
             {
                 if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[DIVREM] head-emit dest={} op={:?} partner={} partner_from_eax={}",
                         dest.0, op, partner_dest, partner_from_eax
                     ));
@@ -1711,7 +1708,7 @@ impl X86Codegen {
                 // Broken pair: fall through to the standalone path; the
                 // partner (tail) was marked broken above.
                 if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[DIVREM] head-broken dest={} (standalone)",
                         dest.0
                     ));

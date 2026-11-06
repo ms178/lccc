@@ -641,7 +641,7 @@ impl Lowerer {
         let enclosing_labels = self.visible_label_names();
         let capture = self.analyze_nested_captures(nf, &visible, &enclosing_labels);
         if std::env::var_os("CCC_DEBUG_NESTED_CAPTURE").is_some() {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[NESTED_CAPTURE] parent={} child={} visible={:?} captured={:?}",
                 self.func().name,
                 nf.name,

@@ -548,7 +548,7 @@ pub fn apply_one_reloc(
         R_AARCH64_TLSLE_ADD_TPREL_HI12 => {
             let tp = tprel(s, a, tls_info);
             if tls_debug() {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "  TLSLE_HI12: sym='{}' s=0x{:x} a={} tls_addr=0x{:x} tls_size=0x{:x} -> tp=0x{:x}",
                     sym_name, s, a, tls_info.tls_addr, tls_info.tls_size, tp as u64
                 ));
@@ -559,7 +559,7 @@ pub fn apply_one_reloc(
         R_AARCH64_TLSLE_ADD_TPREL_LO12 | R_AARCH64_TLSLE_ADD_TPREL_LO12_NC => {
             let tp = tprel(s, a, tls_info);
             if tls_debug() {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "  TLSLE_LO12: sym='{}' s=0x{:x} a={} tls_addr=0x{:x} -> tp=0x{:x}",
                     sym_name, s, a, tls_info.tls_addr, tp as u64
                 ));

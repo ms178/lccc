@@ -203,7 +203,7 @@ fn classify(
                 let (root, _) = resolve(&scan.gep, base.0);
                 if (root == d_root || root == s_root) && const_i64(offset).is_none() {
                     if dbg {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[byval]   variable-offset GEP of v{root}: {inst:?}"
                         ));
                     }
@@ -271,7 +271,7 @@ fn classify(
                     }
                     other => {
                         if dbg {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[byval]   unmodelled use of D: {other:?}"
                             ));
                         }
@@ -542,7 +542,7 @@ pub(super) fn run_function(
         // old storage.
         if param_homes.contains(&d_root) || param_homes.contains(&s_root) {
             if dbg {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[byval] copy b{mb}/{mi}: a parameter home is involved"
                 ));
             }
@@ -552,7 +552,7 @@ pub(super) fn run_function(
         // instructions this pass enumerated.
         if any_escape(&scan.escapes, &scan.gep, s_root) {
             if dbg {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[byval] copy b{mb}/{mi} S=v{s_root}: source escapes"
                 ));
             }
@@ -562,7 +562,7 @@ pub(super) fn run_function(
             Ok(u) => u,
             Err(why) => {
                 if dbg {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[byval] copy b{mb}/{mi} D=v{d_root} S=v{s_root} size={size}: {why}"
                     ));
                 }
@@ -579,7 +579,7 @@ pub(super) fn run_function(
             .collect();
         if !uses_of_d.iter().all(|&(b, i)| before(mb, mi, b, i)) {
             if dbg {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[byval] copy b{mb}/{mi}: a use of D is not dominated by the copy"
                 ));
             }
@@ -588,7 +588,7 @@ pub(super) fn run_function(
         // ...and S must have no observer after the copy.
         if let Some(w) = find_interference(&u.s_uses, &uses_of_d, mb, mi, &succs, &preds, n) {
             if dbg {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[byval] copy b{mb}/{mi}: S is still used at b{}/{}",
                     w.0, w.1
                 ));
@@ -607,7 +607,7 @@ pub(super) fn run_function(
         let max_width = d_align.min(s_align);
         let Some(pieces) = tile(&u.d_accesses, size, max_width) else {
             if dbg {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[byval] copy b{mb}/{mi}: field tiling failed"
                 ));
             }
@@ -668,7 +668,7 @@ pub(super) fn run_function(
         claimed.insert(s_root);
         changed += 1;
         if dbg {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[byval] fn {}: coalesced copy b{mb}/{mi} D=v{d_root} -> S=v{s_root} size={size} fields={} byval={}",
                 func.name,
                 pieces.len(),

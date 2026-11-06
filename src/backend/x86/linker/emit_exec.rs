@@ -221,7 +221,7 @@ pub(super) fn emit_executable(
     macro_rules! zone {
         ($name:expr_2021) => {
             if ld_time {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[ldtime]   emit/{:<18} {:>7.1} ms",
                     $name,
                     t_zone.lap_ms()
@@ -3279,7 +3279,7 @@ pub(super) fn emit_executable(
                             ));
                         };
                         if std::env::var_os("LCCC_DEBUG_GOT").is_some() {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[GOTREL] name={:?} gea=0x{gea:x} got_addr=0x{got_addr:x} p=0x{p:x} addend={a}",
                                 sym.name
                             ));

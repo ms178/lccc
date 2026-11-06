@@ -14,7 +14,7 @@
 //! object/assembly/binary writers keep their own strict `?` handling. Those
 //! writers use `File`, not these helpers.
 //!
-//! The helpers are public and re-exported as `lccc::cli_output` so the
+//! The helpers are public and re-exported as `lccc::cli` so the
 //! standalone driver binaries (`lccc-ld`, `lccc-x86`, ...) use exactly the
 //! same policy as the library. `extern crate self as lccc;` in `lib.rs`
 //! lets library modules and binary modules spell the path identically,

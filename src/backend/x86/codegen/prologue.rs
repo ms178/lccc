@@ -526,7 +526,7 @@ fn replay_span_home_collision(
     let debug = std::env::var_os("CCC_DEBUG_REPLAY_PRUNE").is_some();
     let collide = |o: u32, d: u32, pos: (usize, usize), why: &str| -> bool {
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[replay-prune] fn={func_name} collide: operand=v{o} sharer=v{d} def={pos:?} ({why})"
             ));
         }
@@ -634,9 +634,9 @@ impl X86Codegen {
         self.masked_guard_zero_splats = collect_zero_splats(func, &self.masked_guard_splats);
         // ms178 debug: dump IR per function
         if self.state.ra_config.dump_ir {
-            lccc::cli_output::stderr_line(format_args!("===== IR for {} =====", func.name));
-            lccc::cli_output::stderr_line(format_args!("{:#?}", func));
-            lccc::cli_output::stderr_line(format_args!("===== end IR ====="));
+            lccc::cli::stderr_line(format_args!("===== IR for {} =====", func.name));
+            lccc::cli::stderr_line(format_args!("{:#?}", func));
+            lccc::cli::stderr_line(format_args!("===== end IR ====="));
         }
         // Store function pointer for indexed addressing detection
         self.current_func = Some(func as *const IrFunction);
@@ -866,7 +866,7 @@ impl X86Codegen {
             self.vararg_gp_save = needs_gp;
             self.vararg_fp_save = needs_fp;
             if self.state.ra_config.debug_vararg {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "debug vararg {}: gp={} fp={} stable={} va_ids={:?}",
                     func.name,
                     needs_gp,
@@ -2325,7 +2325,7 @@ impl X86Codegen {
                 let gap = self.cmp_replay_gaps.get(cdest);
                 if home_invalidated_in_gap(lhs, gap) || home_invalidated_in_gap(rhs, gap) {
                     if std::env::var_os("LCCC_DEBUG_REPLAY").is_some() {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[replay] gap-audit prune cdest={cdest} (home rewrite in gap)"
                         ));
                     }
@@ -2445,7 +2445,7 @@ impl X86Codegen {
             && !fn_disabled)
             || fn_forced;
         if self.state.ra_config.mi_debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[MI-PROFIT] fn={} loop_insts={} limit={} enabled={} fn_disabled={} fn_forced={}",
                 func.name,
                 loop_insts,
@@ -2637,7 +2637,7 @@ impl X86Codegen {
                 pp += 1; // terminator
             }
             if self.state.ra_config.debug_load_cast_fold && !lcf.is_empty() {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[LOAD-CAST-FOLD] fn={} folds={} (candidates; each fires only if its load takes a redirecting path)",
                     func.name,
                     lcf.len()
@@ -3066,7 +3066,7 @@ impl X86Codegen {
                             }
                         })
                         .collect();
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[demorgan] prune-check andor={} homes=[{}]",
                         andor_id,
                         homes.join(", ")
@@ -3093,10 +3093,7 @@ impl X86Codegen {
                     || home_invalidated_in_gap(&rec.b.2, gap_b)
                 {
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
-                            "[demorgan] prune andor={}",
-                            andor_id
-                        ));
+                        lccc::cli::stderr_line(format_args!("[demorgan] prune andor={}", andor_id));
                     }
                     prune_dm.push(*andor_id);
                     continue;
@@ -3146,17 +3143,14 @@ impl X86Codegen {
                 };
                 if collides {
                     if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[demorgan] prune andor={} (home collision)",
                             andor_id
                         ));
                     }
                     prune_dm.push(*andor_id);
                 } else if debug {
-                    lccc::cli_output::stderr_line(format_args!(
-                        "[demorgan] survive andor={}",
-                        andor_id
-                    ));
+                    lccc::cli::stderr_line(format_args!("[demorgan] survive andor={}", andor_id));
                 }
             }
             for d in prune_dm {
@@ -3999,7 +3993,7 @@ impl X86Codegen {
                     .is_some();
                 if self.state.ra_config.debug_param_store {
                     let reg = self.reg_assignments.get(&paramref_dest.0);
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[PRE-STORE] param {} paramref_dest={} has_slot={} reg={:?}",
                         i, paramref_dest.0, has_slot, reg
                     ));
@@ -4026,7 +4020,7 @@ impl X86Codegen {
                         if self.state.ra_config.debug_param_store {
                             let shared =
                                 reg_to_params.get(&phys_reg.0).is_some_and(|u| u.len() > 1);
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[PRE-STORE]   callee={} caller={} shared={} class={:?}",
                                 is_callee_saved, is_caller_saved_gpr, shared, class
                             ));
@@ -4075,11 +4069,11 @@ impl X86Codegen {
                 // DEBUG: dump entry block instructions for this param
                 if self.state.ra_config.debug_param_store {
                     if let Some((alloca_dest, _)) = param_homes.get(i) {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[PARAM-STORE] param {} has alloca dest={}, no ParamRef",
                             i, alloca_dest.0
                         ));
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[PARAM-STORE] has_slot={}",
                             self.state.get_slot(alloca_dest.0).is_some()
                         ));
@@ -4089,7 +4083,7 @@ impl X86Codegen {
                                     Instruction::Store { ptr, val, .. }
                                         if ptr.0 == alloca_dest.0 =>
                                     {
-                                        lccc::cli_output::stderr_line(format_args!(
+                                        lccc::cli::stderr_line(format_args!(
                                             "[PARAM-STORE]   block[{}] Store to alloca: val={:?}",
                                             bi, val
                                         ))
@@ -4097,20 +4091,20 @@ impl X86Codegen {
                                     Instruction::Load { ptr, dest, .. }
                                         if ptr.0 == alloca_dest.0 =>
                                     {
-                                        lccc::cli_output::stderr_line(format_args!(
+                                        lccc::cli::stderr_line(format_args!(
                                             "[PARAM-STORE]   block[{}] Load from alloca: dest={}",
                                             bi, dest.0
                                         ))
                                     }
                                     Instruction::Copy { dest, src } => {
-                                        lccc::cli_output::stderr_line(format_args!(
+                                        lccc::cli::stderr_line(format_args!(
                                             "[PARAM-STORE]   block[{}] Copy dest={} src={:?}",
                                             bi, dest.0, src
                                         ))
                                     }
                                     Instruction::ParamRef {
                                         dest, param_idx, ..
-                                    } => lccc::cli_output::stderr_line(format_args!(
+                                    } => lccc::cli::stderr_line(format_args!(
                                         "[PARAM-STORE]   block[{}] ParamRef dest={} idx={}",
                                         bi, dest.0, param_idx
                                     )),
@@ -4119,7 +4113,7 @@ impl X86Codegen {
                             }
                         }
                         for (&vid, &reg) in self.reg_assignments.iter() {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[PARAM-STORE]   reg_assign: val={} -> PhysReg({})",
                                 vid, reg.0
                             ));
@@ -4473,7 +4467,7 @@ impl X86Codegen {
             if !early.is_empty() {
                 for (i, dest, ty) in early {
                     if self.state.ra_config.debug_param_store {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[PRE-STORE] param {} early ABI read -> slot (dest=v{})",
                             i, dest.0
                         ));
@@ -4769,7 +4763,7 @@ impl X86Codegen {
                 let load_instr = Self::mov_load_for_type(ty);
                 let dest_reg = Self::load_dest_reg(ty);
                 if self.state.ra_config.debug_paramref {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[PARAMREF] dest=v{} param_idx={} reg_idx={} src={} ty={:?}",
                         dest.0, param_idx, reg_idx, src_reg, ty
                     ));

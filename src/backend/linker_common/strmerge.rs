@@ -359,7 +359,7 @@ pub fn apply_string_merge<G: super::symbols::GlobalSymbolOps>(
                         }
                         None => {
                             if debug {
-                                lccc::cli_output::stderr_line(format_args!(
+                                lccc::cli::stderr_line(format_args!(
                                     "[strmerge] exclude {} sec {}: off {} (rtype {})",
                                     obj.source_name, tsec, old_off, rela.rela_type
                                 ));

@@ -707,7 +707,7 @@ fn affine_disjoint(
         RESOLVE_FUEL,
     );
     if promote_debug() {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[AFFINE] cand={} -> {:?}; store={} -> {:?}",
             cand.0,
             cf.as_ref().map(|f| (f.root, &f.syms, f.konst, f.march)),
@@ -1110,7 +1110,7 @@ fn find_promotion(func: &IrFunction) -> Option<PromotePlan> {
             }
 
             if promote_debug() {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[PROMOTE] func={} loop header={} ptr=Value({}) ty={:?} exit_from={} latch={}",
                     func.name, lp.header, ptr_id, load_ty, exit_from, latch
                 ));

@@ -119,14 +119,14 @@ fn volatile_reduction_enabled() -> bool {
             "0" => false,
             "4" => true,
             "2" | "8" => {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "volatile_reduce: non-default lanes={} requested but only 4 is validated; using 4",
                     value.trim()
                 ));
                 true
             }
             _ => {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "volatile_reduce: invalid CCC_VOLATILE_REDUCE_LANES={value:?}, using 4 (expected 0/2/4/8)"
                 ));
                 true
@@ -538,7 +538,7 @@ fn dump_ir_filtered_inner(module: &IrModule, tag: &str) {
         }
     }
     let _ = writeln!(out, "==== END IR {} ====", tag);
-    lccc::cli_output::stderr_line(format_args!("{}", out));
+    lccc::cli::stderr_line(format_args!("{}", out));
 }
 
 /// Run a per-function pass only on functions in the visit set.
@@ -643,7 +643,7 @@ fn run_gvn_licm_ivsr_shared(
             let n = gvn::run_gvn_with_analysis_and_context(func, &cfg, &gvn_context);
             verify::verify_after_func_pass(func, "gvn");
             if let Some(t0) = t0 {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[PASS] iter={} gvn (func {}): {:.4}s ({} changes)",
                     iter,
                     func.name,
@@ -670,7 +670,7 @@ fn run_gvn_licm_ivsr_shared(
             let n = licm::licm_with_analysis(func, &cfg, &licm_safe_globals);
             verify::verify_after_func_pass(func, "licm");
             if let Some(t0) = t0 {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[PASS] iter={} licm (func {}): {:.4}s ({} changes)",
                     iter,
                     func.name,
@@ -738,7 +738,7 @@ fn run_gvn_licm_ivsr_shared(
                     changed[i] = true;
                 }
                 if time_passes {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[PASS] iter={} univsr (func {}): {} pointer IVs reverted",
                         iter, func.name, n
                     ));
@@ -764,7 +764,7 @@ fn run_gvn_licm_ivsr_shared(
                     changed[i] = true;
                 }
                 if time_passes {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[PASS] iter={} ptr_iv_collapse (func {}): {} pointer IVs collapsed",
                         iter, func.name, n
                     ));
@@ -774,15 +774,15 @@ fn run_gvn_licm_ivsr_shared(
     }
 
     if time_passes {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[PASS] iter={} gvn_total: {} changes",
             iter, gvn_total
         ));
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[PASS] iter={} licm_total: {} changes",
             iter, licm_total
         ));
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[PASS] iter={} ivsr_total: {} changes",
             iter, ivsr_total
         ));
@@ -1969,12 +1969,12 @@ pub(crate) fn run_passes(
     }
     // Debug hook: dump the module IR to stderr before optimization.
     if ra_config.dump_ir {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "==== IR before passes (opt_level={}) ====",
             opt_level
         ));
-        lccc::cli_output::stderr_line(format_args!("{:#?}", module));
-        lccc::cli_output::stderr_line(format_args!("==== END IR ===="));
+        lccc::cli::stderr_line(format_args!("{:#?}", module));
+        lccc::cli::stderr_line(format_args!("==== END IR ===="));
     }
     if pass_disabled(&disabled, "all") {
         return;
@@ -2049,7 +2049,7 @@ pub(crate) fn run_passes(
         // kept the old home).
         crate::ir::mem2reg::promote_allocas_with_params(module);
         if time_passes {
-            lccc::cli_output::stderr_line(format_args!("[PASS] o1 mem2reg"));
+            lccc::cli::stderr_line(format_args!("[PASS] o1 mem2reg"));
         }
         o1_checkpoint!("o1 mem2reg");
         ip_purity::run(module);
@@ -2200,12 +2200,12 @@ pub(crate) fn run_passes(
             round_cap::report();
         }
         if std::env::var("CCC_DUMP_IR_AFTER").is_ok() {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "==== IR after all passes (opt_level={}) ====",
                 opt_level
             ));
-            lccc::cli_output::stderr_line(format_args!("{:#?}", module));
-            lccc::cli_output::stderr_line(format_args!("==== END IR after all passes ===="));
+            lccc::cli::stderr_line(format_args!("{:#?}", module));
+            lccc::cli::stderr_line(format_args!("==== END IR after all passes ===="));
         }
         return;
     }
@@ -2475,7 +2475,7 @@ pub(crate) fn run_passes(
                     let t0 = std::time::Instant::now();
                     let n = $body;
                     let elapsed = t0.elapsed().as_secs_f64();
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[PASS] iter={} {}: {:.4}s ({} changes)",
                         iter, $name, elapsed, n
                     ));
@@ -3967,12 +3967,12 @@ pub(crate) fn run_passes(
                                 );
                             }
                         }
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[PROBE-DCE] fn={} bcast v{} uses={}",
                             f.name, id, uses
                         ));
                     }
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[PROBE-DCE] fn={} removed={}",
                         f.name, removed
                     ));
@@ -4084,12 +4084,12 @@ pub(crate) fn run_passes(
                                 );
                             }
                         }
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[PROBE-DCE] fn={} bcast v{} uses={}",
                             f.name, id, uses
                         ));
                     }
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[PROBE-DCE] fn={} removed={}",
                         f.name, removed
                     ));
@@ -4174,16 +4174,13 @@ pub(crate) fn run_passes(
             if func.is_declaration {
                 continue;
             }
-            lccc::cli_output::stderr_line(format_args!("=== IR(pre-promote) {} ===", func.name));
+            lccc::cli::stderr_line(format_args!("=== IR(pre-promote) {} ===", func.name));
             for (bi, b) in func.blocks.iter().enumerate() {
-                lccc::cli_output::stderr_line(format_args!(
-                    "  block {} (label {}):",
-                    bi, b.label.0
-                ));
+                lccc::cli::stderr_line(format_args!("  block {} (label {}):", bi, b.label.0));
                 for inst in &b.instructions {
-                    lccc::cli_output::stderr_line(format_args!("    {:?}", inst));
+                    lccc::cli::stderr_line(format_args!("    {:?}", inst));
                 }
-                lccc::cli_output::stderr_line(format_args!("    term: {:?}", b.terminator));
+                lccc::cli::stderr_line(format_args!("    term: {:?}", b.terminator));
             }
         }
     }
@@ -4281,7 +4278,7 @@ pub(crate) fn run_passes(
             verify::verify_after_pass(module, "fp_double");
         }
         if let Some(start) = start {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[PASS-TIME] fp_double: {:.3} ms ({changes} changes)",
                 start.elapsed().as_secs_f64() * 1e3
             ));
@@ -4408,12 +4405,12 @@ pub(crate) fn run_passes(
                                 );
                             }
                         }
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[PROBE-DCE] fn={} bcast v{} uses={}",
                             f.name, id, uses
                         ));
                     }
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[PROBE-DCE] fn={} removed={}",
                         f.name, removed
                     ));
@@ -4701,12 +4698,12 @@ pub(crate) fn run_passes(
         round_cap::report();
     }
     if std::env::var("CCC_DUMP_IR_AFTER").is_ok() {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "==== IR after all passes (opt_level={}) ====",
             opt_level
         ));
-        lccc::cli_output::stderr_line(format_args!("{:#?}", module));
-        lccc::cli_output::stderr_line(format_args!("==== END IR after all passes ===="));
+        lccc::cli::stderr_line(format_args!("{:#?}", module));
+        lccc::cli::stderr_line(format_args!("==== END IR after all passes ===="));
     }
 }
 

@@ -624,7 +624,7 @@ pub fn compute_live_intervals_with_hidden_reads(
 
     if let Some(target) = debug_live_target().filter(|_| debug_live_func_matches(&func.name)) {
         if let Some(&dense) = id_to_dense.get(&target) {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[LIVE] fn={} v{} def={} last_use={}",
                 func.name, target, ps.def_points[dense], ps.last_use_points[dense]
             ));
@@ -632,7 +632,7 @@ pub fn compute_live_intervals_with_hidden_reads(
                 let li = live_in[bi].contains(dense);
                 let lo = live_out[bi].contains(dense);
                 if li || lo {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[LIVE]   block {} (label {}) live_in={} live_out={} pts=[{},{}]",
                         bi, b.label.0, li, lo, ps.block_start_points[bi], ps.block_end_points[bi]
                     ));
@@ -643,11 +643,8 @@ pub fn compute_live_intervals_with_hidden_reads(
                 .filter(|iv| iv.value_id == target)
                 .map(|iv| (iv.start, iv.end))
                 .collect();
-            lccc::cli_output::stderr_line(format_args!(
-                "[LIVE]   call_points={:?}",
-                ps.call_points
-            ));
-            lccc::cli_output::stderr_line(format_args!("[LIVE]   segments={segs:?}"));
+            lccc::cli::stderr_line(format_args!("[LIVE]   call_points={:?}", ps.call_points));
+            lccc::cli::stderr_line(format_args!("[LIVE]   segments={segs:?}"));
         }
     }
 
@@ -836,7 +833,7 @@ fn assign_program_points(
                 });
                 for_each_value_use_in_instruction(inst, |v| hit |= v.0 == t);
                 if hit || inst.dest().is_some_and(|d| d.0 == t) {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[LIVE-TRACE] pt={} block={} {:?}",
                         point, block_idx, inst
                     ));

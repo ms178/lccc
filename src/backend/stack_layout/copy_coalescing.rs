@@ -947,7 +947,7 @@ fn build_cfg_copy_alias_map(
     if env_flag("CCC_DEBUG_SLOT_COALESCE") && !aliases.is_empty() {
         let mut pairs: Vec<(u32, u32)> = aliases.iter().map(|(&a, &b)| (a, b)).collect();
         pairs.sort_unstable();
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[CFG-SLOT-COALESCE] fn={} candidates={} aliases={} pairs={:?}",
             func.name,
             tracked.len(),
@@ -1258,7 +1258,7 @@ pub(super) fn build_copy_alias_map(
                 let (phi_dest, backedge_src) = (cand.phi_dest, cand.backedge_src);
                 let src_ty_ok = def_ty_ok.get(&backedge_src).copied().unwrap_or(false);
                 if debug_loop_phi {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[LOOP_PHI] func={} pair dest=v{} src=v{} dest_reg={} src_reg={} aliased={} ty_ok={}",
                         func.name,
                         phi_dest,
@@ -1342,7 +1342,7 @@ pub(super) fn build_copy_alias_map(
             .map(|(&dest, &root)| (dest, root))
             .collect();
         aliases.sort_unstable();
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[SLOT-COALESCE] fn={} aliases={} phi_web_aliases={} loop_phi_aliases={} pairs={:?}",
             func.name,
             aliases.len(),
@@ -2914,7 +2914,7 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
             }
             if let Some(d) = pick {
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[VLFOLD-IR] {} b{} i{} fold load %{} into {:?}",
                         func.name, bi, j, d, cop
                     ));
@@ -3242,7 +3242,7 @@ pub(super) fn compute_vector_defer_values(
                 break;
             }
             if debug_vdefer {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[VDEFER] slot={} def=({},{})(uses_in_window={:?}) consumer=({},{})({:?}) site-ok",
                     slot, bi, i, window_uses, bi, u, cop
                 ));

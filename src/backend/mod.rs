@@ -808,7 +808,7 @@ impl Target {
                         );
                     }
                     if opts.ra_config.debug_ra {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[IPA-RA] round {round}: {violations:?}"
                         ));
                     }
@@ -968,7 +968,7 @@ impl Target {
             // Handle -Wa,--version: print GNU-compatible version string for
             // kernel build system's as-version.sh probe.
             if extra_args.iter().any(|a| a == "--version") {
-                lccc::cli_output::stdout_line(format_args!(
+                lccc::cli::stdout_line(format_args!(
                     "GNU assembler (Claude's C Compiler built-in) 2.42"
                 ));
                 return Ok(());

@@ -396,7 +396,7 @@ mod tests {
     #[test]
     fn native_results_and_all_arithmetic_flags_match_independent_model() {
         if !std::is_x86_feature_detected!("bmi2") {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "native BMI2 mask check unavailable: host lacks BMI2"
             ));
             return;

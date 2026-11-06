@@ -1184,7 +1184,7 @@ fn call_pops(
             }
         } else if list.iter().any(|p| *p != Some(0)) {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "lccc: cfi: {}: {} indirect calls in the final code, {} recorded",
                     name,
                     indirect_lines.len(),
@@ -1368,7 +1368,7 @@ fn synthesize_function<'b>(
                             // CFA (e.g. a `__builtin_setjmp` resume point)
                             // describes the same frame.
                             if debug && cur.is_some_and(|c| c.rule() != s.rule()) {
-                                lccc::cli_output::stderr_line(format_args!(
+                                lccc::cli::stderr_line(format_args!(
                                     "lccc: cfi: {}: {} reached with two frame states",
                                     name, lbl
                                 ));
@@ -1532,7 +1532,7 @@ fn synthesize_function<'b>(
             &mut unknown,
         );
         if unknown && debug && !reported_unknown {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "lccc: cfi: {}: unmodelled stack pointer write `{}`",
                 name, t
             ));
@@ -1555,7 +1555,7 @@ fn synthesize_function<'b>(
         };
     }
     if debug && n_saves_emitted != saves.len() {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "lccc: cfi: {}: {} of {} prologue saves announced",
             name,
             n_saves_emitted,

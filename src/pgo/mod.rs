@@ -356,7 +356,7 @@ pub fn init_pgo_profile(path: Option<&str>) {
     let d = match path {
         Some(p) => match profile::load_profile(p) {
             Ok(x) => {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "lccc: PGO: loaded {} functions from {}",
                     x.functions.len(),
                     p
@@ -365,11 +365,11 @@ pub fn init_pgo_profile(path: Option<&str>) {
                 // a human-readable view (LCCC_PGO_DUMP_TEXT=<file>).
                 if let Ok(txt) = std::env::var("LCCC_PGO_DUMP_TEXT") {
                     match profile::write_text_profile(std::path::Path::new(&txt), &x) {
-                        Ok(()) => lccc::cli_output::stderr_line(format_args!(
+                        Ok(()) => lccc::cli::stderr_line(format_args!(
                             "lccc: PGO: wrote text profile to {}",
                             txt
                         )),
-                        Err(e) => lccc::cli_output::stderr_line(format_args!(
+                        Err(e) => lccc::cli::stderr_line(format_args!(
                             "lccc: PGO warning: text dump failed: {}",
                             e
                         )),
@@ -378,7 +378,7 @@ pub fn init_pgo_profile(path: Option<&str>) {
                 x
             }
             Err(e) => {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "lccc: PGO warning: {} -- continuing without profile",
                     e
                 ));
@@ -418,13 +418,13 @@ pub fn propagate_profile(m: &mut IrModule, u: &str) {
     }
     ACTIVE_PROFILE_VALID.with(|valid| valid.set(good > 0));
     if bad > 0 {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "lccc: PGO: no profile for {} function(s) in this unit (new/changed code?)",
             bad
         ))
     }
     if drifted > 0 {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "lccc: PGO: {} function(s) drifted from the training CFG (PGO-guided transforms); edge profiles degrade gracefully",
             drifted
         ))
@@ -466,7 +466,7 @@ pub fn propagate_profile(m: &mut IrModule, u: &str) {
         derived.insert(profile::function_key(u, &f.name), copy);
     }
     if drifted_edges > 0 {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "lccc: PGO: {} function(s) drifted from the training CFG: \
              edge-derived branch/layout/unroll data disabled for them (hot/cold sections kept)",
             drifted_edges

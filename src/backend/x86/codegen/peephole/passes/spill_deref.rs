@@ -82,7 +82,7 @@ pub(super) fn fold_spill_deref_roundtrip(store: &mut LineStore, infos: &mut [Lin
     let mut changed = false;
     let mut i = 0usize;
     if std::env::var("CCC_DEBUG_SPILL_DEREF_ALWAYS").is_ok() {
-        lccc::cli_output::stderr_line(format_args!("[SPILL_DEREF] pass entered, lines={}", len));
+        lccc::cli::stderr_line(format_args!("[SPILL_DEREF] pass entered, lines={}", len));
     }
     let dbg = std::env::var("CCC_DEBUG_SPILL_DEREF").is_ok();
     let mut dbg_stats = [0usize; 8];
@@ -328,7 +328,7 @@ pub(super) fn fold_spill_deref_roundtrip(store: &mut LineStore, infos: &mut [Lin
     }
 
     if dbg {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[SPILL_DEREF] stores={} adj_load={} dirty_between={} no_deref={} wrong_base={} after_unsafe={} FIRED={} parse_fail={}",
             dbg_stats[0],
             dbg_stats[1],
@@ -926,7 +926,7 @@ pub(super) fn fold_save_reload_roundtrip(store: &mut LineStore, infos: &mut [Lin
     }
 
     if dbg {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[SAVRELOAD] stores={} l0_bad={} window_bad={} no_l2={} slot_live={} FIRED={}",
             dbg_stats[0], dbg_stats[1], dbg_stats[2], dbg_stats[3], dbg_stats[4], dbg_stats[5]
         ));

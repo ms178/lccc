@@ -139,7 +139,7 @@ pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
                 ordinal += 1;
                 let Some(site) = site else { continue };
                 if std::env::var("LCCC_DEBUG_PROMOTE").is_ok() {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[PROMOTE] {} site ordinal={} total={} targets={:?}",
                         f.name, site.ordinal, site.total, site.targets
                     ));
@@ -168,7 +168,7 @@ pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
                 }
                 if site.sig != sig_of(info) {
                     if std::env::var("LCCC_DEBUG_PROMOTE").is_ok() {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[PROMOTE] {} site {} sig mismatch: recorded={} actual={}",
                             f.name,
                             site.ordinal,
@@ -430,7 +430,7 @@ pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
         crate::pgo::record_promoted_hot(u, hot_labels);
     }
     if promoted > 0 {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "lccc: PGO: promoted {} indirect call sites",
             promoted
         ));

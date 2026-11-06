@@ -3443,7 +3443,7 @@ impl ArchCodegen for I686Codegen {
             if op == IrBinOp::Mul {
                 if let Some(&pi) = self.mulacc_head_of.get(&dest.0) {
                     if std::env::var_os("CCC_DEBUG_MULACC").is_some() {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[MULACC] head-emit dest={} plan={}",
                             dest.0, pi
                         ));
@@ -3456,10 +3456,7 @@ impl ArchCodegen for I686Codegen {
             // fused head stored the result at the Mul's program point.
             if op == IrBinOp::Add && self.mulacc_fused_tails.contains(&dest.0) {
                 if std::env::var_os("CCC_DEBUG_MULACC").is_some() {
-                    lccc::cli_output::stderr_line(format_args!(
-                        "[MULACC] tail-skip dest={}",
-                        dest.0
-                    ));
+                    lccc::cli::stderr_line(format_args!("[MULACC] tail-skip dest={}", dest.0));
                 }
                 return;
             }

@@ -1619,7 +1619,7 @@ pub mod stats {
         if total == 0 {
             return;
         }
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[ISEL-STATS] {} of {} instructions lowered through MachInst ({:.1}%)",
             lowered,
             total,
@@ -1628,7 +1628,7 @@ pub mod stats {
         if let Ok(mut v) = BY_KIND.lock() {
             v.sort_by(|a, b| b.1.cmp(&a.1));
             for (kind, n) in v.iter().take(12) {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[ISEL-STATS]   rejected {:>7}  {} ({:.1}% of all)",
                     n,
                     kind,

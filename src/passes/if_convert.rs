@@ -353,7 +353,7 @@ fn rewrite_covered_arm_loads(
                     {
                         pending.push((inst_pos, *dest, *covering));
                     } else if debug {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[IFCONV] arm block {} load ptr={} ty={:?} not covered by pred loads {:?}",
                             arm_idx,
                             ptr.0,
@@ -368,10 +368,7 @@ fn rewrite_covered_arm_loads(
                                 if i.dest() == Some(*ptr)
                                     || pred_loads.iter().any(|(_, _, _, d)| i.dest() == Some(*d))
                                 {
-                                    lccc::cli_output::stderr_line(format_args!(
-                                        "[IFCONV]   def: {:?}",
-                                        i
-                                    ));
+                                    lccc::cli::stderr_line(format_args!("[IFCONV]   def: {:?}", i));
                                 }
                             }
                         }
@@ -1058,7 +1055,7 @@ fn try_if_combine_loop(
                 Instruction::Call { .. } | Instruction::InlineAsm { .. }
             ) {
                 if dbg {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[IFCOMB] {} loop@{}: reject (call/asm)",
                         func.name, nl.header
                     ));
@@ -1090,7 +1087,7 @@ fn try_if_combine_loop(
         if leaves {
             if exiting.is_some() {
                 if dbg {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[IFCOMB] {} loop@{}: reject (multiple exiting blocks)",
                         func.name, nl.header
                     ));
@@ -1111,7 +1108,7 @@ fn try_if_combine_loop(
         .any(|c| c.pred_idx == exiting || c.inner_idx == exiting)
     {
         if dbg {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[IFCOMB] {} loop@{}: reject (candidate touches the exiting block {})",
                 func.name, nl.header, exiting
             ));
@@ -1157,7 +1154,7 @@ fn try_if_combine_loop(
                 continue;
             }
             if dbg {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[IFCOMB] {} loop@{}: reject (branch in block {} survives)",
                     func.name, nl.header, b
                 ));
@@ -1166,7 +1163,7 @@ fn try_if_combine_loop(
         }
     }
     if dbg {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[IFCOMB] {} loop@{}: accept, {} candidate(s), exiting={}",
             func.name,
             nl.header,
@@ -1362,7 +1359,7 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
             }
         }
         if std::env::var("CCC_DEBUG_IFCOMBINE").is_ok() {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[IFCOMB] {} loop@{} body={:?}: {} candidate(s)",
                 func.name,
                 nl.header,

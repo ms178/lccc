@@ -6858,7 +6858,7 @@ fn sink_loop_carried_stores(lines: &mut [String], kinds: &mut [LineKind], n: usi
                 }
             }
             if bad && debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "sink bail: {} (slot re-referenced in region)",
                     text
                 ));
@@ -6867,7 +6867,7 @@ fn sink_loop_carried_stores(lines: &mut [String], kinds: &mut [LineKind], n: usi
             if !bad && !exits.is_empty() {
                 bad = true;
                 if debug {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "sink bail: {} ({} exit branches)",
                         text,
                         exits.len()
@@ -6885,7 +6885,7 @@ fn sink_loop_carried_stores(lines: &mut [String], kinds: &mut [LineKind], n: usi
                     if v[p].2.ends_with(':') {
                         bad = true;
                         if debug {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "sink bail: {} (label {} in region)",
                                 text, v[p].2
                             ));
@@ -6900,7 +6900,7 @@ fn sink_loop_carried_stores(lines: &mut [String], kinds: &mut [LineKind], n: usi
                     if instr_clobbers_reg(&v[p].2, num) {
                         bad = true;
                         if debug {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "sink bail: {} (clobbered by {})",
                                 text, v[p].2
                             ));
@@ -6915,7 +6915,7 @@ fn sink_loop_carried_stores(lines: &mut [String], kinds: &mut [LineKind], n: usi
             sunk_slot[slot] = true;
             edits.push((slot, format!("    {}", text), v[j].0, v[j].1));
             if debug {
-                lccc::cli_output::stderr_line(format_args!("sink ok: {}", text));
+                lccc::cli::stderr_line(format_args!("sink ok: {}", text));
             }
         }
     }

@@ -1176,7 +1176,7 @@ fn probe(dir: &str, file: &str, lib: &str) -> Result<Option<(String, Vec<u8>)>, 
     if candidate_compatible(&data, &path) {
         return Ok(Some((path, data)));
     }
-    lccc::cli_output::stderr_line(format_args!(
+    lccc::cli::stderr_line(format_args!(
         "lccc-ld: skipping incompatible {} when searching for -l{}",
         path, lib
     ));

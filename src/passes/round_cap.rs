@@ -127,7 +127,7 @@ pub(crate) fn report_line(site: Site, count: u64) -> Option<String> {
 pub(crate) fn report() {
     for site in Site::ALL {
         if let Some(line) = report_line(site, GLOBAL.take(site)) {
-            lccc::cli_output::stderr_line(format_args!("{line}"));
+            lccc::cli::stderr_line(format_args!("{line}"));
         }
     }
 }

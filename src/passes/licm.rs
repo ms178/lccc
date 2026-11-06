@@ -908,7 +908,7 @@ fn build_loop_alias_info(func: &IrFunction, natural_loop: &NaturalLoop) -> LoopA
         stores.push((form, size));
     }
     if std::env::var_os("CCC_DEBUG_LICM_ALIAS").is_some() {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[LICM-ALIAS] fn={} header={} forms={:?} stores={:?} complete={}",
             func.name, natural_loop.header, forms, stores, complete
         ));
@@ -1006,9 +1006,7 @@ fn is_load_hoistable(
         }
         if !preheader_is_dedicated && !root_global_addr_values.contains(&ptr_id) {
             licm_debug(|| {
-                lccc::cli_output::stderr_line(format_args!(
-                    "[LICM] global load: preheader not dedicated"
-                ))
+                lccc::cli::stderr_line(format_args!("[LICM] global load: preheader not dedicated"))
             });
             return false;
         }
@@ -1042,7 +1040,7 @@ fn is_load_hoistable(
     // successor is the loop header (see hoist_loop_invariants).
     if !preheader_is_dedicated {
         licm_debug(|| {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[LICM] derived-pointer load v{}: preheader is not dedicated \
                  (LOOP-PREHEADER-1 inserts one)",
                 ptr_id
@@ -1052,19 +1050,19 @@ fn is_load_hoistable(
     }
     if std::env::var_os("CCC_NO_LICM_ALIAS").is_some() {
         licm_debug(|| {
-            lccc::cli_output::stderr_line(format_args!("[LICM] load v{}: alias engine off", ptr_id))
+            lccc::cli::stderr_line(format_args!("[LICM] load v{}: alias engine off", ptr_id))
         });
         return false;
     }
     if loop_mem.has_calls {
         licm_debug(|| {
-            lccc::cli_output::stderr_line(format_args!("[LICM] load v{}: loop has calls", ptr_id))
+            lccc::cli::stderr_line(format_args!("[LICM] load v{}: loop has calls", ptr_id))
         });
         return false;
     }
     if !alias_info.complete {
         licm_debug(|| {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[LICM] load v{}: alias info incomplete",
                 ptr_id
             ))
@@ -1073,7 +1071,7 @@ fn is_load_hoistable(
     }
     let Some(load_form) = alias_info.forms.get(&ptr_id) else {
         licm_debug(|| {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[LICM] load v{}: pointer has no linear form",
                 ptr_id
             ))
@@ -1830,7 +1828,7 @@ fn hoist_loop_invariants_with(
                     // forwarding/CSE/DCE and cannot observe a hoist.
                     if *volatile {
                         licm_debug(|| {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[LICM] load v{} in block {} not hoisted: volatile \
                                  (hoisting would change the number of observable \
                                  accesses, C11 5.1.2.3)",
@@ -1851,7 +1849,7 @@ fn hoist_loop_invariants_with(
                         })
                     {
                         licm_debug(|| {
-                            lccc::cli_output::stderr_line(format_args!(
+                            lccc::cli::stderr_line(format_args!(
                                 "[LICM] load v{} in block {} not hoisted: its block does \
                                  not dominate every loop block (block is not the header, \
                                  so the load is not must-execute)",

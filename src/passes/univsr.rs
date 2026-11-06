@@ -75,7 +75,7 @@ pub(crate) fn run_univsr(func: &mut IrFunction) -> usize {
     let debug = std::env::var("LCCC_DEBUG_UNIVSR").is_ok();
     let ivsr_pointers = detect_ivsr_pointer_ivs(func);
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[univsr] {}: {} candidate pointer IVs",
             func.name,
             ivsr_pointers.len()
@@ -89,7 +89,7 @@ pub(crate) fn run_univsr(func: &mut IrFunction) -> usize {
     for ptr_iv in &ivsr_pointers {
         if !is_valid_sib_scale(ptr_iv.stride) {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[univsr]   skip: stride {} not SIB-encodable",
                     ptr_iv.stride
                 ));
@@ -99,7 +99,7 @@ pub(crate) fn run_univsr(func: &mut IrFunction) -> usize {
 
         let ok = revert_pointer_iv(func, ptr_iv);
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[univsr]   phi v{} stride {} -> {}",
                 ptr_iv.ptr_phi_dest.0,
                 ptr_iv.stride,
@@ -137,7 +137,7 @@ fn detect_ivsr_pointer_ivs(func: &IrFunction) -> Vec<IvsrPointerIV> {
                 let self_term = is_rotated_self_loop_block(block);
                 if self_in || self_term {
                     if std::env::var("LCCC_DEBUG_UNIVSR").is_ok() {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[univsr]   skip rotated self-loop ptr phi v{} in {:?} self_in={} self_term={} incomings={:?}",
                             dest.0,
                             block.label,
@@ -151,7 +151,7 @@ fn detect_ivsr_pointer_ivs(func: &IrFunction) -> Vec<IvsrPointerIV> {
 
                 if let Some(ptr_iv) = analyze_pointer_phi(func, dest, incoming, block.label) {
                     if std::env::var("LCCC_DEBUG_UNIVSR").is_ok() {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[univsr]   candidate v{} in {:?} self_in={} self_term={} incomings={:?} idx=v{} base=v{} off={} stride={}",
                             dest.0,
                             block.label,

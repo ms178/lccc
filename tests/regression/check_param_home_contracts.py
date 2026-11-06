@@ -442,8 +442,8 @@ def check_cli_text_is_best_effort() -> None:
     lib = (ROOT / "src/lib.rs").read_text(encoding="utf-8")
     require("extern crate self as lccc;" in lib,
             "lib.rs lost the self-alias used by binary call sites")
-    require("pub use common::cli_output;" in lib,
-            "lib.rs lost the public cli_output re-export")
+    require("pub use common::cli_output as cli;" in lib,
+            "lib.rs lost the short public cli_output re-export")
     helper = (ROOT / "src/common/cli_output.rs").read_text(encoding="utf-8")
     for fn in ("stderr_line", "stderr_text", "stdout_line", "stdout_text"):
         require(f"pub fn {fn}(" in helper, f"cli_output is missing {fn}")

@@ -272,7 +272,7 @@ fn evaluate_constant_calls(module: &mut IrModule) -> usize {
                 ) {
                     replacements.push((caller_idx, block_idx, inst_idx, result));
                     if std::env::var("CCC_DEBUG_IPCP_EVAL").is_ok() {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[IPCP-EVAL] {} -> {} = {:?}",
                             callee, dest.0, result
                         ));

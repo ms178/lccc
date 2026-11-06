@@ -16,7 +16,7 @@ use std::sync::Once;
 fn warn_gcc_source_assembler(command: &str) {
     static WARN_ONCE: Once = Once::new();
     WARN_ONCE.call_once(|| {
-        lccc::cli_output::stderr_line(format_args!("WARNING: Using GCC-backed assembler for source files ({}) [gcc_assembler feature enabled]", command));
+        lccc::cli::stderr_line(format_args!("WARNING: Using GCC-backed assembler for source files ({}) [gcc_assembler feature enabled]", command));
     });
 }
 
@@ -50,13 +50,13 @@ impl Driver {
         // Warn prominently about using GCC for -m16 compilation
         static WARN_ONCE: std::sync::Once = std::sync::Once::new();
         WARN_ONCE.call_once(|| {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "WARNING: *** Using GCC for -m16 compilation (boot code) ***"
             ));
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "WARNING: *** This delegates the ENTIRE compilation to GCC ***"
             ));
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "WARNING: *** The gcc_m16 feature flag is enabled ***"
             ));
         });
@@ -144,7 +144,7 @@ impl Driver {
         {
             // Handle -Wa,--version: print GNU-compatible version string
             if self.assembler_extra_args.iter().any(|a| a == "--version") {
-                lccc::cli_output::stdout_line(format_args!(
+                lccc::cli::stdout_line(format_args!(
                     "GNU assembler (Claude's C Compiler built-in) 2.42"
                 ));
                 return Ok(());
@@ -311,7 +311,7 @@ impl Driver {
             let pp_errors = preprocessor.errors();
             if !pp_errors.is_empty() {
                 for err in pp_errors {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "{}:{}:{}: error: {}",
                         err.file, err.line, err.col, err.message
                     ));
@@ -351,11 +351,11 @@ impl Driver {
                 "s",
                 asm_text.as_bytes(),
             ) {
-                Some(path) => lccc::cli_output::stderr_line(format_args!(
+                Some(path) => lccc::cli::stderr_line(format_args!(
                     "[ccc] CCC_ASM_DEBUG: wrote {}",
                     path.display()
                 )),
-                None => lccc::cli_output::stderr_line(format_args!(
+                None => lccc::cli::stderr_line(format_args!(
                     "[ccc] CCC_ASM_DEBUG: could not write the assembly dump for {}",
                     input_file
                 )),

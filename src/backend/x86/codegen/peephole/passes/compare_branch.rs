@@ -627,7 +627,7 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
             }
             if refuse {
                 if std::env::var_os("CCC_DEBUG_CMP_FUSE").is_some() {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[CMPFUSE] refusing: transparent line touches carrier/slot"
                     ));
                 }
@@ -673,7 +673,7 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
             };
             if !dead {
                 if std::env::var_os("CCC_DEBUG_CMP_FUSE").is_some() {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[CMPFUSE] refusing fusion (setcc_fam={} setcc_live_after={:?} relay_live_after={:?} region_dropped_live={:?})",
                         setcc_fam,
                         lv.live_after(jcc_pos, setcc_fam),
@@ -733,7 +733,7 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
         };
         if flags_hazard {
             if std::env::var_os("CCC_DEBUG_CMP_FUSE").is_some() {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[CMPFUSE] flags-reader hazard after fused jcc — refusing"
                 ));
             }

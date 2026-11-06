@@ -299,7 +299,7 @@ pub(super) fn materialize(
                         inline_edge_rename.push((bi, s, std::mem::take(&mut renames)));
                     }
                     if split_debug_enabled() && !deferred.is_empty() {
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[GLA] {}: skip edge remat b{}->b{}: indirect-branch pred",
                             func.name, bi, s
                         ));
@@ -363,7 +363,7 @@ pub(super) fn materialize(
     // plan unnameable, so apply NONE of it rather than emitting a plan with
     // missing reloads or a duplicate/truncated block label.
     if id_overflow.get() {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[GLA] {}: fresh id space exhausted; aborting {} planned split(s) \
              with zero edits",
             func.name,
@@ -541,7 +541,7 @@ pub(super) fn materialize(
         if std::env::var_os("CCC_VERIFY_REGALLOC").is_some() {
             panic!("[GLA] {}: rewrite failed verification: {}", func.name, msg);
         }
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[GLA] {name}: rewrite failed structural verification ({msg}); \
              aborting plan with zero edits",
             name = func.name
@@ -554,7 +554,7 @@ pub(super) fn materialize(
         return 0;
     }
     if split_debug_enabled() {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[GLA] {} applied: {} values ({} remat, {} capture slots), {} trampolines",
             func.name,
             n_applied,

@@ -266,7 +266,7 @@ impl I686Codegen {
             let Some(rhs_lo) = resolve_rhs_lo(self, &chain.rhs, chain.rhs_feeder, &feeder_src)
             else {
                 if std::env::var_os("CCC_DEBUG_MULACC").is_some() {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[MULACC] chain head={} tail={} REJECTED (rhs unresolved)",
                         chain.head_dest, chain.tail_dest
                     ));
@@ -281,7 +281,7 @@ impl I686Codegen {
                 &feeder_src,
             ) else {
                 if std::env::var_os("CCC_DEBUG_MULACC").is_some() {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[MULACC] chain head={} tail={} REJECTED (addend unresolved)",
                         chain.head_dest, chain.tail_dest
                     ));
@@ -291,7 +291,7 @@ impl I686Codegen {
             // t2 must take the fused dual store.
             if self.state.get_slot(chain.tail_dest).is_none() {
                 if std::env::var_os("CCC_DEBUG_MULACC").is_some() {
-                    lccc::cli_output::stderr_line(format_args!(
+                    lccc::cli::stderr_line(format_args!(
                         "[MULACC] chain head={} tail={} REJECTED (tail dest slotless)",
                         chain.head_dest, chain.tail_dest
                     ));
@@ -319,7 +319,7 @@ impl I686Codegen {
                 self.mulacc_virtual_casts.insert(*d);
             }
             if std::env::var_os("CCC_DEBUG_MULACC").is_some() {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[MULACC] chain head={} tail={} FUSED (rhs_lo={:?} addend_lo={:?} addend_hi={:?} rhs_feeder={:?} addend_feeder={:?})",
                     chain.head_dest,
                     chain.tail_dest,

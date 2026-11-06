@@ -510,14 +510,14 @@ pub(super) fn plan_function(
         // budget: the per-target reach band is a planning input, and its
         // gates must observe it even when exact liveness leaves a function
         // under budget everywhere.
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[GLA] {}: policy budget={} reach={} max_splits={}",
             func.name, budget, policy.reach_band, max_splits
         ));
         for (bi, b) in func.blocks.iter().enumerate() {
             let (pt, pk) = pressure.peak(bi);
             if pk as usize > budget {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[GLA] {}: block{} depth{} peak {}/{} reach={} at point {}/{}",
                     func.name,
                     bi,
@@ -566,7 +566,7 @@ pub(super) fn plan_function(
                     format!("b{}..b{}[{}-{}]", sb, eb, iv.start, iv.end)
                 })
                 .collect();
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[GLA] {}: remat-candidate v{} weighted_uses={} segments={} covers_reachable={} {}",
                 func.name,
                 vid,
@@ -581,7 +581,7 @@ pub(super) fn plan_function(
         }
         if nseg > policy.remat_max_segments {
             if split_debug_enabled() && std::env::var("CCC_GLA_TRACE").is_ok() {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[GLA] {}: remat-candidate v{} rejected: {} segments > {}",
                     func.name, vid, nseg, policy.remat_max_segments
                 ));
@@ -859,7 +859,7 @@ pub(super) fn plan_function(
         }
         used += 1;
         if split_debug_enabled() {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[GLA] {}: gap v{} block{} [{},{}) benefit={} cost={} closure={}",
                 func.name,
                 cand.vid,
@@ -966,7 +966,7 @@ fn run_planned(func: &mut IrFunction, policy: GlaPolicy, tls_symbols: &FxHashSet
                     _ => "other",
                 })
                 .unwrap_or("?");
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[GLA] {}: remat v{} ({})",
                 func.name, vid, kind
             ));

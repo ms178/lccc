@@ -132,7 +132,7 @@ fn create_private_dir() -> Option<PathBuf> {
         let candidate = base.join(name);
         if create_private_dir_at(&candidate) {
             if std::env::var_os("CCC_TEMP_DEBUG").is_some() {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[ccc] private temp dir: {}",
                     candidate.display()
                 ));
@@ -144,7 +144,7 @@ fn create_private_dir() -> Option<PathBuf> {
     }
     // Never substitute an unowned flat path: even an unwritable directory can
     // contain attacker-controlled symlinks to files the compiler can overwrite.
-    lccc::cli_output::stderr_line(format_args!(
+    lccc::cli::stderr_line(format_args!(
         "ccc: warning: no private temp directory could be created under {}; \
          refusing insecure flat temp-file names",
         base.display()

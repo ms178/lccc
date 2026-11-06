@@ -1127,7 +1127,7 @@ impl Driver {
                     // tests/regression/check_o_stdout.sh).
                     self.write_text_output(&dep_text)?;
                 } else {
-                    lccc::cli_output::stdout_text(format_args!("{}", dep_text));
+                    lccc::cli::stdout_text(format_args!("{}", dep_text));
                 }
                 continue;
             }
@@ -1178,7 +1178,7 @@ impl Driver {
                         &Self::dep_rule_object_target(input_file),
                     )?;
                 } else {
-                    lccc::cli_output::stdout_line(format_args!("{}", output));
+                    lccc::cli::stdout_line(format_args!("{}", output));
                     self.write_dep_file(
                         input_file,
                         input_file,
@@ -1220,7 +1220,7 @@ impl Driver {
                         &Self::dep_rule_object_target(input_file),
                     )?;
                 } else {
-                    lccc::cli_output::stdout_text(format_args!("{}", output));
+                    lccc::cli::stdout_text(format_args!("{}", output));
                     // GCC writes the dep rule on this path too: `-E -MF -
                     // -MMD x.c` streams `x.o: x.c` on stdout and `-E -MD`
                     // derives x.d (both measured, gcc 14.2).  Same contract
@@ -1574,7 +1574,7 @@ impl Driver {
                     &Self::dep_rule_object_target(input_file),
                 )?;
             } else {
-                lccc::cli_output::stdout_text(format_args!("{}", output));
+                lccc::cli::stdout_text(format_args!("{}", output));
                 // No -o: GCC still writes the dep rule (`.S -E -MF -` streams
                 // `s1.o: s1.S` on stdout; `.S -E -MD` derives s1.d) — same
                 // input-derived names as the C -E path.
@@ -1692,10 +1692,7 @@ impl Driver {
             .output()
             .map_err(|e| format!("Failed to preprocess {}: {}", input_file, e))?;
         if !self.output_path_set {
-            lccc::cli_output::stdout_text(format_args!(
-                "{}",
-                String::from_utf8_lossy(&result.stdout)
-            ));
+            lccc::cli::stdout_text(format_args!("{}", String::from_utf8_lossy(&result.stdout)));
         }
         if !result.status.success() {
             let stderr = String::from_utf8_lossy(&result.stderr);
@@ -2467,7 +2464,7 @@ impl Driver {
                     crate::common::cli_output::stderr_line(format_args!("{}", cpu.tune().dump()));
                 }
             } else if !v.is_empty() && v != "0" {
-                lccc::cli_output::stderr_text(format_args!("{}", tune.dump()));
+                lccc::cli::stderr_text(format_args!("{}", tune.dump()));
             }
         }
         if self.verbose {

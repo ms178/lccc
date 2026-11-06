@@ -199,7 +199,7 @@ pub fn load_shared_library_elf64_as_needed<G: GlobalSymbolOps>(
 
     let dyn_syms = parse_shared_library_symbols(&data, path)?;
     if std::env::var_os("CCC_DEBUG_LD_SYMS").is_some() {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[LD-SO] load path={} soname={} as_needed={} dynsyms={}",
             path,
             soname,
@@ -214,7 +214,7 @@ pub fn load_shared_library_elf64_as_needed<G: GlobalSymbolOps>(
     let in_link =
         !as_needed || needed_sonames.contains(&soname) || shared_library_needed(&dyn_syms, globals);
     if std::env::var_os("CCC_DEBUG_LD_SYMS").is_some() {
-        lccc::cli_output::stderr_line(format_args!("[LD-SO]   -> in_link={in_link}"));
+        lccc::cli::stderr_line(format_args!("[LD-SO]   -> in_link={in_link}"));
     }
     if in_link {
         match_shared_library_dynsyms(&dyn_syms, &soname, globals);

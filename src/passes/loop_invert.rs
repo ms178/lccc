@@ -345,7 +345,7 @@ fn find_one(func: &IrFunction, debug: bool) -> Option<Plan> {
         }
         if !hb.instructions.iter().all(is_duplicable) {
             if debug {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[INV] header {} has a non-duplicable instruction",
                     h
                 ));
@@ -381,7 +381,7 @@ fn find_one(func: &IrFunction, debug: bool) -> Option<Plan> {
                 if let Some(v) = escaped {
                     if debug {
                         let used_in_loop = lp.body.contains(&bi);
-                        lccc::cli_output::stderr_line(format_args!(
+                        lccc::cli::stderr_line(format_args!(
                             "[INV] header {} defines v{}, used in block {} ({})",
                             h,
                             v,
@@ -409,7 +409,7 @@ fn find_one(func: &IrFunction, debug: bool) -> Option<Plan> {
         }
 
         if debug {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[INV] rotating header={} latch={} ({} latches)",
                 h,
                 t,
@@ -816,7 +816,7 @@ fn fold_value_bound_after_invert(func: &mut IrFunction, plan: &Plan, debug: bool
     }
     func.next_value_id = func.next_value_id.max(tsub.0 + 1);
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[AFFOLD] {}: value-bound fold (inverted latch): v{} + {} <strict> v{} -> v{} <strict> (v{} - {})",
             func.name, x0.0, c, nv.0, x0.0, nv.0, c
         ));
@@ -1047,7 +1047,7 @@ fn downcount_after_invert(func: &mut IrFunction, plan: &Plan, debug: bool) -> bo
         *rhs = Operand::Const(IrConst::from_i64(0, ty));
     }
     if debug {
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[LOOP-DOWNCOUNT] {}: v{} 0..{} -> N..0 in .LBB{}",
             func.name, iv.0, limit, body.0
         ));

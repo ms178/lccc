@@ -337,7 +337,7 @@ pub(super) fn check_capabilities(
         return Err(format!("warning treated as error: {}", warnings[0]));
     }
     for w in &warnings {
-        lccc::cli_output::stderr_line(format_args!("lccc-ld: warning: {w}"));
+        lccc::cli::stderr_line(format_args!("lccc-ld: warning: {w}"));
     }
 
     // The last of -Bsymbolic / -Bsymbolic-functions / -Bno-symbolic

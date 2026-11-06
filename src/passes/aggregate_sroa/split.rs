@@ -504,7 +504,7 @@ pub(super) fn run_function(
                         if !cst {
                             c.variable = true;
                             if dbg_on() {
-                                lccc::cli_output::stderr_line(format_args!(
+                                lccc::cli::stderr_line(format_args!(
                                     "[split] VARIABLE load root v{} at block {} inst {}",
                                     root, bi, ii
                                 ));
@@ -555,7 +555,7 @@ pub(super) fn run_function(
                         if !cst {
                             c.variable = true;
                             if dbg_on() {
-                                lccc::cli_output::stderr_line(format_args!(
+                                lccc::cli::stderr_line(format_args!(
                                     "[split] VARIABLE store root v{} at block {} inst {}",
                                     root, bi, ii
                                 ));
@@ -674,7 +674,7 @@ pub(super) fn run_function(
             if cfg!(debug_assertions) {
                 panic!("{msg}");
             }
-            lccc::cli_output::stderr_line(format_args!("{msg}"));
+            lccc::cli::stderr_line(format_args!("{msg}"));
         }
     }
 
@@ -704,7 +704,7 @@ pub(super) fn run_function(
         let Some(c) = cand.get(&root) else { continue };
         let size = scan.alloca_size.get(&root).copied().unwrap_or(0);
         if dbg_on() {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[split] root v{} size={} accesses={} refuse={} variable={} escapes={} memcpy_skip={}",
                 root,
                 size,
@@ -729,7 +729,7 @@ pub(super) fn run_function(
         // (rule 3, with rule 3b's covering accesses).
         let Some((mut fields, covering)) = field_layout(&c.accesses, size) else {
             if dbg_on() {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[split]   v{} rejected: overlapping or unsized views",
                     root
                 ));
@@ -767,7 +767,7 @@ pub(super) fn run_function(
             })
         {
             if dbg_on() {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[split]   v{} rejected: copy claimed by another object",
                     root
                 ));
@@ -809,7 +809,7 @@ pub(super) fn run_function(
                     .any(|&(_, ty, _)| memset_splat(ty, byte).is_none())
         }) {
             if dbg_on() {
-                lccc::cli_output::stderr_line(format_args!(
+                lccc::cli::stderr_line(format_args!(
                     "[split]   v{} rejected: memset not expressible per field",
                     root
                 ));
@@ -1025,7 +1025,7 @@ pub(super) fn run_function(
         split_roots.push(root);
         total += 1;
         if dbg_on() || sroa_trace() {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[SROA-split] fn {} alloca v{} size={} fields={}",
                 func.name,
                 root,

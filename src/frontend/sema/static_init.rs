@@ -200,7 +200,7 @@ impl<'s> StaticInitChecker<'s> {
         if std::env::var_os("CCC_DEBUG_STATIC_INIT").is_none() {
             return;
         }
-        lccc::cli_output::stderr_line(format_args!(
+        lccc::cli::stderr_line(format_args!(
             "[static-init] leaf rejected as non-constant: {e:?}\n\
              [static-init]   inferred type: {:?}\n\
              [static-init]   kind: {:?}",

@@ -692,7 +692,7 @@ impl Lowerer {
         // runtime semantics — the same license GCC's own fold runs on.
         let alias = self.diagnose_as_builtins.get(name).cloned();
         if std::env::var_os("CCC_DBG_DA").is_some() && name.contains("strlen") {
-            lccc::cli_output::stderr_line(format_args!(
+            lccc::cli::stderr_line(format_args!(
                 "[DA-call] {} map={:?}",
                 name,
                 self.diagnose_as_builtins.get(name)
