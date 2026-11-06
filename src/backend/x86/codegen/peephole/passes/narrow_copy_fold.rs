@@ -1018,8 +1018,12 @@ pub(super) fn eliminate_dead_inplace_ext(store: &mut LineStore, infos: &mut [Lin
             }
             // Family-0 mentions at ≤32 bits that do not write (`cmpl`,
             // `movl %eax, …`, `(%rax)`-free address operands) or no mention
-            // at all: the widened bits stay unread so far.
-            if !matches!(infos[j].kind, LineKind::Directive | LineKind::Empty) {
+            // at all: the widened bits stay unread so far.  The liveness
+            // query asks about the point after `last`: a line the directive
+            // law steps over (a nop, an inert directive) has no transfer of
+            // its own and must not become that point.  (A blank line may:
+            // its solution is its predecessor's.)
+            if !super::helpers::steps_over_line(&infos[j], l) {
                 last = j;
             }
             j += 1;

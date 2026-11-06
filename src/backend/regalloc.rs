@@ -6030,6 +6030,39 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 caller_used_regs_set.insert(reg.0);
             }
         }
+        // Overflow first fit over the exact homes.  The scan above runs in
+        // envelope mode -- a parameter's range is one contiguous segment, so
+        // no range carries hole coverage -- where each seeded register counts
+        // as busy from point 0 to its last seeded point: a pool register that
+        // any later value lives in is closed to a parameter that dies in the
+        // entry block.  `long count_neg(const long *a, int n)` reads `n` once,
+        // in the `sxtw` of the loop bound, and paid x19 plus a frame record
+        // for it because x4-x8 and x13 hold loop values later.  What the scan
+        // left takes the first pool register no assignment occupies during
+        // its range (the overlap test of the arrival homes above), preferring
+        // one nothing else uses, so the entry copy stays coalescible.
+        intervals.retain(|iv| !assignments.contains_key(&iv.value_id));
+        for iv in &intervals {
+            let (start, end) = allocation_owner_bounds(iv.value_id, &merged_of, &iv_map)
+                .unwrap_or((iv.start, iv.end));
+            let occupied = |reg: PhysReg| {
+                assignments.iter().any(|(vid, r)| {
+                    *r == reg
+                        && allocation_owner_bounds(*vid, &merged_of, &iv_map)
+                            .is_none_or(|(s, e)| s <= end && start <= e)
+                })
+            };
+            let unused = |reg: PhysReg| !assignments.values().any(|r| *r == reg);
+            let home = pool
+                .iter()
+                .copied()
+                .find(|&reg| unused(reg))
+                .or_else(|| pool.iter().copied().find(|&reg| !occupied(reg)));
+            if let Some(reg) = home {
+                assignments.insert(iv.value_id, reg);
+                caller_used_regs_set.insert(reg.0);
+            }
+        }
     }
 
     // Phase 2c: leftover callee-saved for call-free overflow. Callee-saved

@@ -18,7 +18,7 @@
 use super::super::types::*;
 use super::dead_writes::LabelRefs;
 use super::fma_forms::{FmaWidth, parse_scalar_fma};
-use super::fp_liveness::FpLiveness;
+use super::fp_liveness::{FpLiveness, has_implicit_vector_effects_line};
 use super::helpers::{
     implicit_read_reg_family, is_read_modify_write, is_rsp_shift_line, src_mentions_family,
     writes_family,
@@ -474,8 +474,12 @@ pub(super) fn retarget_fp_load_into_copy(store: &mut LineStore, infos: &mut [Lin
                     }
                 }
             }
+            // `vzeroall` (and every other implicit vector writer) names no
+            // operand yet zeroes `A` before the copy reads it: the original
+            // copy would deliver 0 where the retargeted load delivers `M`.
             if gap == MAX_GAP
                 || mentions_xmm(t, a)
+                || has_implicit_vector_effects_line(t)
                 || touches_memory(t)
                 || addr_fams.iter().any(|&f| writes_family(&infos[k], t, f))
             {
@@ -4382,6 +4386,14 @@ mod fp_load_retarget_tests {
             (
                 "    movapd %xmm1, %xmm9\n    movapd %xmm9, %xmm0\n    ret\n",
                 "not a load",
+            ),
+            (
+                "    vmovsd (%rdi), %xmm9\n    vzeroall\n    vmovapd %xmm9, %xmm0\n    ret\n",
+                "vzeroall zeroes the loaded register before the copy reads it",
+            ),
+            (
+                "    vmovsd (%rdi), %xmm9{%k1}{z}\n    vmovapd %xmm9, %xmm0\n    ret\n",
+                "a masked load is a merge, not a whole-register definition",
             ),
         ] {
             let (changed, out) = run(body);

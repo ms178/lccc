@@ -746,6 +746,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= eliminate_redundant_sext_w(&mut lines, &mut kinds, n);
         changed |= fold_zext32_into_sext_w(&lines, &mut kinds, n);
         changed |= eliminate_redundant_zext_byte(&mut lines, &mut kinds, n);
+        changed |= eliminate_redundant_sign_extensions(&mut lines, &mut kinds, n);
         changed |= eliminate_self_moves(&mut kinds, n);
         changed |= eliminate_redundant_mv_chain(&mut lines, &mut kinds, n);
         if merge_blocks {
@@ -796,6 +797,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_redundant_sext_w(&mut lines, &mut kinds, n);
             changed2 |= fold_zext32_into_sext_w(&lines, &mut kinds, n);
             changed2 |= eliminate_redundant_zext_byte(&mut lines, &mut kinds, n);
+            changed2 |= eliminate_redundant_sign_extensions(&mut lines, &mut kinds, n);
             changed2 |= eliminate_self_moves(&mut kinds, n);
             changed2 |= eliminate_redundant_mv_chain(&mut lines, &mut kinds, n);
             if merge_blocks {
@@ -2086,6 +2088,419 @@ fn eliminate_redundant_zext_byte(lines: &mut [String], kinds: &mut [LineKind], n
             _ => match sext_producing_def(&lines[i], kinds[i]) {
                 Some((dst, _)) => set_width(&mut widths, dst, 0),
                 None => widths.fill(0),
+            },
+        }
+        i += 1;
+    }
+    changed
+}
+
+// ── Value ranges: redundant sign extensions and masks ────────────────────────
+//
+// The signed and interval counterpart of `eliminate_redundant_zext_byte`:
+// track, per register, an interval [lo, hi] its 64-bit value lies in (the
+// whole i64 range when nothing is known).  The loads give their type's range,
+// comparisons [0, 1], non-negative masks [0, mask], `srli`/`srai` shift the
+// bounds, `addi` and an in-range `addiw` offset them, the other `*w`
+// producers and `lui` give the signed word range, moves copy.  Three
+// redundancies follow:
+//
+// * the sign-extension `slli d,s,K; srai d,d,K` of a value that already fits
+//   64 - K bits -- the compare staging of a `short` loaded by `lh` (`lh t0;
+//   slli t1,t0,48; srai t1,t1,48; slti`);
+// * `sext.w d,s` of a value in [0, 2^31), which the word-def proof of
+//   `eliminate_redundant_sext_w` does not model (`andi t0,t0,0xff; sext.w
+//   t1,t0`).  Values that may be negative stay with that pass: a `lw` +
+//   `sext.w` pair is the shape the memory-operand fold retargets into the
+//   load;
+// * a zero-extension of `s` to n bits -- `andi t,s,2^n-1` or `slli t,s,64-n;
+//   srli t,t,64-n` -- whose only reader is `sltiu`/`slti d,t,k` or `xori
+//   d,t,k` + a zero test, k in [0, 2047], when the range of `s` makes its low
+//   n bits decide the comparison exactly as the whole register does:
+//
+//       t <u k  ==  s <u k   for every s in [k - 2^n, 2^n - 1]
+//       t == k  ==  s == k   for every s in (k - 2^n, k + 2^n)
+//
+//   (below zero, t = s + 2^n is at least k while s is unsigned-huge; the
+//   equality's window holds one value congruent to k).  `t` is non-negative,
+//   so `slti` and `sltiu` agree on it; the compare then reads `s`, unsigned.
+//   `(unsigned char)(c - 'a') <= 25` and `(unsigned)(c - '0') < 10` are
+//   `addiw; sltiu` (Clang 23.1.5), no mask.
+//
+// Block-local facts: labels, branches, jumps and returns reset every range,
+// calls the caller-saved ones, unknown instructions all of them.  Whether the
+// dropped extension's result is dead comes from the function's global
+// liveness, rebuilt after every rewrite.
+
+/// An interval [lo, hi] a register's 64-bit value lies in.
+type RvRange = (i64, i64);
+const RV_FULL: RvRange = (i64::MIN, i64::MAX);
+const RV_WORD: RvRange = (i32::MIN as i64, i32::MAX as i64);
+
+/// Bits every value of `r` needs as a sign-extended number.
+fn rv_range_width(r: RvRange) -> u32 {
+    let signed_bits = |v: i64| 65 - (v ^ (v >> 63)).leading_zeros();
+    signed_bits(r.0).max(signed_bits(r.1))
+}
+
+fn rv_range_within(r: RvRange, outer: RvRange) -> bool {
+    outer.0 <= r.0 && r.1 <= outer.1
+}
+
+/// [0, 2^bits - 1], `bits` in 1..=63.
+fn rv_unsigned_range(bits: u32) -> RvRange {
+    (0, i64::MAX >> (63 - bits.clamp(1, 63)))
+}
+
+/// [-2^(bits-1), 2^(bits-1) - 1], `bits` in 1..=64.
+fn rv_signed_range(bits: u32) -> RvRange {
+    let shift = 64 - bits.clamp(1, 64);
+    (i64::MIN >> shift, i64::MAX >> shift)
+}
+
+/// `r + imm` without wrapping, or the whole range.
+fn rv_offset_range(r: RvRange, imm: i64) -> RvRange {
+    match (r.0.checked_add(imm), r.1.checked_add(imm)) {
+        (Some(lo), Some(hi)) => (lo, hi),
+        _ => RV_FULL,
+    }
+}
+
+/// The first line at or after `from` that is not deleted.
+fn rv_next_kept_line(kinds: &[LineKind], from: usize, n: usize) -> usize {
+    let mut j = from;
+    while j < n && matches!(kinds[j], LineKind::Nop) {
+        j += 1;
+    }
+    j
+}
+
+/// The operands of `line` when its mnemonic is `mnemonic`.
+fn rv_operands_of(line: &str, mnemonic: &str) -> Vec<String> {
+    line.trim()
+        .strip_prefix(mnemonic)
+        .filter(|rest| rest.starts_with(' '))
+        .map(|rest| rest.split(',').map(|o| o.trim().to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// The liveness of one function of the text, built on demand and dropped
+/// whenever a rewrite changes the function.
+struct RvLazyLiveness {
+    funcs: Vec<(usize, usize)>,
+    cached: Option<(usize, Option<RvLiveness>)>,
+}
+
+impl RvLazyLiveness {
+    fn new(lines: &[String], kinds: &[LineKind], n: usize) -> Self {
+        RvLazyLiveness {
+            funcs: rv_function_ranges(lines, kinds, n),
+            cached: None,
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.cached = None;
+    }
+
+    /// Whether `reg` is dead after line `k`.  Without a resolvable CFG only
+    /// a scratch register's block-local proof answers.
+    fn dead_after(&mut self, lines: &[String], kinds: &[LineKind], k: usize, reg: u8) -> bool {
+        let Some(f) = self.funcs.iter().position(|&(s, e)| s <= k && k < e) else {
+            return false;
+        };
+        if self.cached.as_ref().map(|c| c.0) != Some(f) {
+            let (s, e) = self.funcs[f];
+            self.cached = Some((f, RvLiveness::build(lines, kinds, s, e)));
+        }
+        match self.cached.as_ref().and_then(|c| c.1.as_ref()) {
+            Some(live) => reg != REG_NONE && live.live_after(k) & rv_bit(reg) == 0,
+            None => reg <= REG_T6 && scratch_dead_after(lines, kinds, k + 1, reg, self.funcs[f].1),
+        }
+    }
+}
+
+/// The zero-extension at line `i` (`andi t,s,2^n-1`, or `slli t,s,64-n` +
+/// `srli t,t,64-n`): `(t, s, n, last line)`.
+fn rv_zero_extension(
+    lines: &[String],
+    kinds: &[LineKind],
+    n: usize,
+    i: usize,
+) -> Option<(u8, u8, u32, usize)> {
+    let text = lines[i].trim();
+    let (mnem, rest) = text.split_once(' ')?;
+    let ops: Vec<&str> = rest.split(',').map(str::trim).collect();
+    if ops.len() != 3 {
+        return None;
+    }
+    let (t, s) = (parse_reg(ops[0]), parse_reg(ops[1]));
+    if t == REG_NONE || s == REG_NONE {
+        return None;
+    }
+    let imm = parse_asm_i64(ops[2])?;
+    match mnem {
+        "andi" if (1..=2047).contains(&imm) && (imm & (imm + 1)) == 0 => {
+            Some((t, s, (imm + 1).trailing_zeros(), i))
+        }
+        "slli" if (32..64).contains(&imm) => {
+            let j = rv_next_kept_line(kinds, i + 1, n);
+            let srli = rv_operands_of(lines.get(j).map_or("", String::as_str), "srli");
+            (j < n
+                && srli.len() == 3
+                && parse_reg(&srli[0]) == t
+                && parse_reg(&srli[1]) == t
+                && parse_asm_i64(&srli[2]) == Some(imm))
+            .then_some((t, s, (64 - imm) as u32, j))
+        }
+        _ => None,
+    }
+}
+
+/// Drop the zero-extension at line `i` when its only reader is a compare its
+/// source's range `r` decides the same way (see the section comment), and
+/// rewrite the compare to read the source.  The compare's line on success.
+fn rv_fold_extension_into_compare(
+    lines: &mut [String],
+    kinds: &mut [LineKind],
+    n: usize,
+    i: usize,
+    rng: &[RvRange; NUM_REGS],
+    live: &mut RvLazyLiveness,
+) -> Option<usize> {
+    let (t, src, bits, last) = rv_zero_extension(lines, kinds, n, i)?;
+    let r = rng.get(src as usize).copied().unwrap_or(RV_FULL);
+    let m = 1i64 << bits;
+    let c = rv_next_kept_line(kinds, last + 1, n);
+    let ctext = lines.get(c)?.trim().to_owned();
+    let (cm, crest) = ctext.split_once(' ')?;
+    let cops: Vec<&str> = crest.split(',').map(str::trim).collect();
+    if cops.len() != 3 || parse_reg(cops[1]) != t {
+        return None;
+    }
+    let cdst = parse_reg(cops[0]);
+    let k = parse_asm_i64(cops[2]).filter(|k| (0..=2047).contains(k))?;
+    if cdst == REG_NONE {
+        return None;
+    }
+    let replacement = match cm {
+        "sltiu" | "slti" if k <= m && rv_range_within(r, (k - m, m - 1)) => {
+            format!("    sltiu {}, {}, {k}", reg_name(cdst), reg_name(src))
+        }
+        "xori" if k < m && rv_range_within(r, (k - m + 1, k + m - 1)) => {
+            // The difference itself differs: only a zero test of it may
+            // follow, and nothing else may read it.
+            let z = rv_next_kept_line(kinds, c + 1, n);
+            let line = lines.get(z).map_or("", String::as_str);
+            let mut zops = rv_operands_of(line, "seqz");
+            if zops.is_empty() {
+                zops = rv_operands_of(line, "snez");
+            }
+            let zero_test_only = zops.len() == 2
+                && parse_reg(&zops[1]) == cdst
+                && (parse_reg(&zops[0]) == cdst || live.dead_after(lines, kinds, z, cdst));
+            if !zero_test_only {
+                return None;
+            }
+            format!("    xori {}, {}, {k}", reg_name(cdst), reg_name(src))
+        }
+        _ => return None,
+    };
+    if cdst != t && !live.dead_after(lines, kinds, c, t) {
+        return None;
+    }
+    lines[c] = replacement;
+    kinds[i..=last].fill(LineKind::Nop);
+    live.invalidate();
+    Some(c)
+}
+
+/// The range a recognised producer leaves in its destination; `None` for an
+/// instruction this table does not model.
+fn rv_produced_range(mnem: &str, imm: Option<i64>, src: RvRange) -> Option<RvRange> {
+    Some(match mnem {
+        "lb" => rv_signed_range(8),
+        "lh" => rv_signed_range(16),
+        "lw" => RV_WORD,
+        "lbu" => rv_unsigned_range(8),
+        "lhu" => rv_unsigned_range(16),
+        "lwu" | "zext.w" => rv_unsigned_range(32),
+        "ld" => RV_FULL,
+        "seqz" | "snez" | "slt" | "sltu" | "slti" | "sltiu" => (0, 1),
+        // `s & m` of a non-negative `m` is in [0, m], and below `s` when
+        // `s` is non-negative too.
+        "andi" => match imm.filter(|m| *m >= 0) {
+            Some(m) if src.0 >= 0 => (0, m.min(src.1)),
+            Some(m) => (0, m),
+            None => RV_FULL,
+        },
+        "srli" => match imm.filter(|k| (1..64).contains(k)) {
+            Some(k) if src.0 >= 0 => (src.0 >> k, src.1 >> k),
+            Some(k) => rv_unsigned_range((64 - k) as u32),
+            None => RV_FULL,
+        },
+        "srai" => match imm.filter(|k| (0..64).contains(k)) {
+            Some(k) => (src.0 >> k, src.1 >> k),
+            None => RV_FULL,
+        },
+        "addi" => imm.map_or(RV_FULL, |v| rv_offset_range(src, v)),
+        // The low word plus `v`, sign-extended: the offset range itself when
+        // both it and the source are words.
+        "addiw" => match imm.map(|v| rv_offset_range(src, v)) {
+            Some(r) if rv_range_within(src, RV_WORD) && rv_range_within(r, RV_WORD) => r,
+            _ => RV_WORD,
+        },
+        _ => return None,
+    })
+}
+
+fn eliminate_redundant_sign_extensions(
+    lines: &mut [String],
+    kinds: &mut [LineKind],
+    n: usize,
+) -> bool {
+    fn get(rng: &[RvRange; NUM_REGS], reg: u8) -> RvRange {
+        rng.get(reg as usize).copied().unwrap_or(RV_FULL)
+    }
+    fn set(rng: &mut [RvRange; NUM_REGS], reg: u8, r: RvRange) {
+        if let Some(slot) = rng.get_mut(reg as usize) {
+            *slot = r;
+        }
+    }
+    let mut live = RvLazyLiveness::new(lines, kinds, n);
+    let mut rng = [RV_FULL; NUM_REGS];
+    let mut changed = false;
+    let mut i = 0;
+    while i < n {
+        match kinds[i] {
+            LineKind::Label | LineKind::Branch | LineKind::Jump | LineKind::Ret => {
+                rng.fill(RV_FULL);
+                i += 1;
+                continue;
+            }
+            LineKind::Call => {
+                for r in (0..=6usize).chain(30..=37).chain([REG_RA as usize]) {
+                    rng[r] = RV_FULL;
+                }
+                i += 1;
+                continue;
+            }
+            LineKind::Nop if lines[i].trim_start().starts_with(ARG_EXT_MARKER) => {
+                for (reg, zext) in arg_ext_facts(lines[i].trim_start()) {
+                    let r = if zext == 0 {
+                        RV_WORD
+                    } else {
+                        rv_unsigned_range(u32::from(zext))
+                    };
+                    set(&mut rng, reg, r);
+                }
+                i += 1;
+                continue;
+            }
+            LineKind::Nop | LineKind::Directive => {
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if let Some(c) = rv_fold_extension_into_compare(lines, kinds, n, i, &rng, &mut live) {
+            // The compare is read next with its new source; the extension's
+            // destination was never written, so its range stands.
+            changed = true;
+            i = c;
+            continue;
+        }
+        let text = lines[i].trim().to_owned();
+        let Some((mnem, rest)) = text.split_once(' ') else {
+            rng.fill(RV_FULL);
+            i += 1;
+            continue;
+        };
+        let ops: Vec<&str> = rest.split(',').map(str::trim).collect();
+        let reg = |k: usize| ops.get(k).map_or(REG_NONE, |o| parse_reg(o));
+        let imm = |k: usize| ops.get(k).and_then(|o| parse_asm_i64(o));
+
+        // `slli d,s,K; srai d,d,K` of a value already 64 - K bits wide.
+        if mnem == "slli" && ops.len() == 3 {
+            let (dst, src) = (reg(0), reg(1));
+            let j = rv_next_kept_line(kinds, i + 1, n);
+            if let Some(k) = imm(2).filter(|k| (1..64).contains(k))
+                && dst != REG_NONE
+                && src != REG_NONE
+                && j < n
+                && rv_range_width(get(&rng, src)) <= (64 - k) as u32
+            {
+                let pair = rv_operands_of(&lines[j], "srai");
+                if pair.len() == 3
+                    && parse_reg(&pair[0]) == dst
+                    && parse_reg(&pair[1]) == dst
+                    && parse_asm_i64(&pair[2]) == Some(k)
+                {
+                    if dst == src {
+                        kinds[i] = LineKind::Nop;
+                    } else {
+                        lines[i] = format!("    mv {}, {}", reg_name(dst), reg_name(src));
+                        kinds[i] = LineKind::Move { dst, src };
+                    }
+                    kinds[j] = LineKind::Nop;
+                    let r = get(&rng, src);
+                    set(&mut rng, dst, r);
+                    live.invalidate();
+                    changed = true;
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+
+        if let LineKind::SextW { dst, src } = kinds[i] {
+            let r = get(&rng, src);
+            if rv_range_within(r, (0, i64::from(i32::MAX))) {
+                if dst == src {
+                    kinds[i] = LineKind::Nop;
+                } else {
+                    lines[i] = format!("    mv {}, {}", reg_name(dst), reg_name(src));
+                    kinds[i] = LineKind::Move { dst, src };
+                }
+                live.invalidate();
+                changed = true;
+            }
+            set(
+                &mut rng,
+                dst,
+                if rv_range_within(r, RV_WORD) {
+                    r
+                } else {
+                    RV_WORD
+                },
+            );
+            i += 1;
+            continue;
+        }
+
+        let dst = reg(0);
+        if let Some(r) = rv_produced_range(mnem, imm(2), get(&rng, reg(1))) {
+            if dst == REG_NONE {
+                rng.fill(RV_FULL);
+            } else {
+                set(&mut rng, dst, r);
+            }
+            i += 1;
+            continue;
+        }
+        if matches!(mnem, "sb" | "sh" | "sw" | "sd") {
+            i += 1;
+            continue;
+        }
+        match kinds[i] {
+            LineKind::Move { dst, src } => {
+                let r = get(&rng, src);
+                set(&mut rng, dst, r);
+            }
+            LineKind::LoadImm { dst } => set(&mut rng, dst, imm(1).map_or(RV_FULL, |v| (v, v))),
+            _ => match sext_producing_def(&lines[i], kinds[i]) {
+                Some((dst, wide)) => set(&mut rng, dst, if wide { RV_WORD } else { RV_FULL }),
+                None => rng.fill(RV_FULL),
             },
         }
         i += 1;
@@ -7947,6 +8362,277 @@ mod jump_near_tests {
         assert_eq!(kinds[3], LineKind::Alu);
     }
 
+    /// Run `eliminate_redundant_sign_extensions` on `input`.
+    fn sign_ext(input: &str) -> (bool, Vec<String>, Vec<LineKind>) {
+        let mut lines: Vec<String> = input.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
+        let n = lines.len();
+        let changed = eliminate_redundant_sign_extensions(&mut lines, &mut kinds, n);
+        (changed, lines, kinds)
+    }
+
+    /// `lh`/`lb` already sign-extend: the compare staging's shift pair is a
+    /// move (or nothing, in place). One bit too wide keeps it.
+    #[test]
+    fn narrow_signed_loads_need_no_shift_pair() {
+        let (changed, lines, kinds) = sign_ext(
+            "f:\n    lh t0, 0(a0)\n    slli t1, t0, 48\n    srai t1, t1, 48\n    slti a0, t1, 8\n    ret\n",
+        );
+        assert!(changed);
+        assert_eq!(lines[2].trim(), "mv t1, t0");
+        assert_eq!(kinds[3], LineKind::Nop);
+        let (changed, _, kinds) =
+            sign_ext("f:\n    lb t0, 0(a0)\n    slli t0, t0, 56\n    srai t0, t0, 56\n    ret\n");
+        assert!(changed);
+        assert_eq!((kinds[2], kinds[3]), (LineKind::Nop, LineKind::Nop));
+        for wider in [
+            "f:\n    lbu t0, 0(a0)\n    slli t0, t0, 56\n    srai t0, t0, 56\n    ret\n",
+            "f:\n    lh t0, 0(a0)\n    slli t0, t0, 56\n    srai t0, t0, 56\n    ret\n",
+            "f:\n    lh t0, 0(a0)\n.L1:\n    slli t1, t0, 48\n    srai t1, t1, 48\n    ret\n",
+            "f:\n    lh t0, 0(a0)\n    call g\n    slli t1, t0, 48\n    srai t1, t1, 48\n    ret\n",
+        ] {
+            assert!(!sign_ext(wider).0, "{wider}");
+        }
+    }
+
+    /// A non-negative value under 2^31 is its own sign-extended word.
+    #[test]
+    fn a_narrow_nonnegative_value_needs_no_sext_w() {
+        let (changed, lines, _) =
+            sign_ext("f:\n    andi t0, t0, 0xff\n    sext.w t1, t0\n    ret\n");
+        assert!(changed);
+        assert_eq!(lines[2].trim(), "mv t1, t0");
+        for kept in [
+            // bit 31 may be set after a 32-bit shift down.
+            "f:\n    srli t0, t0, 32\n    sext.w t1, t0\n    ret\n",
+            "f:\n    andi t0, t0, -16\n    sext.w t1, t0\n    ret\n",
+            "f:\n    ld t0, 0(a0)\n    sext.w t1, t0\n    ret\n",
+        ] {
+            assert!(!sign_ext(kept).0, "{kept}");
+        }
+    }
+
+    /// `(unsigned)(c - '0') < 10`: a sign-extended word compares against a
+    /// small constant exactly like its zero-extension (Clang 23.1.5:
+    /// `addiw; sltiu`), and so does an equality zero test.  The zero-extended
+    /// value is non-negative, so a signed `slti` of it is the same compare.
+    #[test]
+    fn a_sign_extended_word_needs_no_zext_for_a_small_unsigned_compare() {
+        let (changed, lines, kinds) = sign_ext(
+            "f:\n    addiw t0, a0, -48\n    slli t0, t0, 32\n    srli t0, t0, 32\n    sltiu a0, t0, 10\n    ret\n",
+        );
+        assert!(changed);
+        assert_eq!((kinds[2], kinds[3]), (LineKind::Nop, LineKind::Nop));
+        assert_eq!(lines[4].trim(), "sltiu a0, t0, 10");
+        let (changed, lines, kinds) = sign_ext(
+            "f:\n    addiw t1, a0, -5\n    slli t2, t1, 32\n    srli t2, t2, 32\n    xori t0, t2, 7\n    seqz t0, t0\n    mv a0, t0\n    ret\n",
+        );
+        assert!(changed);
+        assert_eq!((kinds[2], kinds[3]), (LineKind::Nop, LineKind::Nop));
+        assert_eq!(lines[4].trim(), "xori t0, t1, 7");
+        let (changed, lines, _) = sign_ext(
+            "f:\n    addiw t0, a0, -48\n    slli t0, t0, 32\n    srli t0, t0, 32\n    slti a0, t0, 10\n    ret\n",
+        );
+        assert!(changed);
+        assert_eq!(lines[4].trim(), "sltiu a0, t0, 10");
+        for kept in [
+            // Not a sign-extended word.
+            "f:\n    ld t0, 0(a1)\n    slli t0, t0, 32\n    srli t0, t0, 32\n    sltiu a0, t0, 10\n    ret\n",
+            // The zero-extended copy is read again.
+            "f:\n    addiw t0, a0, -48\n    slli t1, t0, 32\n    srli t1, t1, 32\n    sltiu a0, t1, 10\n    mv a1, t1\n    ret\n",
+            // The xori result itself is observed, not just tested for zero.
+            "f:\n    addiw t1, a0, -5\n    slli t1, t1, 32\n    srli t1, t1, 32\n    xori t0, t1, 7\n    mv a0, t0\n    ret\n",
+            // A negative bound compares against the top of the range.
+            "f:\n    addiw t0, a0, -48\n    slli t0, t0, 32\n    srli t0, t0, 32\n    sltiu a0, t0, -1\n    ret\n",
+        ] {
+            assert!(!sign_ext(kept).0, "{kept}");
+        }
+    }
+
+    /// `(unsigned char)(p[i] - 'a') <= 25`: the byte mask cannot change the
+    /// compare of a value in [-97, 158], so the compare reads it unmasked
+    /// and unsigned (Clang 23.1.5: `addi; sltiu`), the mask disappears, and
+    /// the same holds for an equality test.  The mask stays where some value
+    /// of the range would answer differently, or where it is read again.
+    #[test]
+    fn a_mask_that_cannot_change_the_comparison_is_dropped() {
+        let (changed, lines, kinds) = sign_ext(concat!(
+            "f:\n",
+            "    lbu t0, 0(t0)\n",
+            "    addiw t0, t0, -97\n",
+            "    andi t0, t0, 0xff\n",
+            "    slti a7, t0, 26\n",
+            "    addw a3, a3, a7\n",
+            "    ret\n",
+        ));
+        assert!(changed);
+        assert_eq!(kinds[3], LineKind::Nop);
+        assert_eq!(lines[4].trim(), "sltiu a7, t0, 26");
+        let (changed, lines, kinds) = sign_ext(concat!(
+            "f:\n",
+            "    lbu t0, 0(a0)\n",
+            "    addiw t0, t0, -97\n",
+            "    andi t1, t0, 255\n",
+            "    xori t1, t1, 3\n",
+            "    seqz a0, t1\n",
+            "    ret\n",
+        ));
+        assert!(changed);
+        assert_eq!(kinds[3], LineKind::Nop);
+        assert_eq!(lines[4].trim(), "xori t1, t0, 3");
+        for kept in [
+            // [-97, 65438]: 65439 - 97 masks to 2 and compares below 26.
+            "f:\n    lhu t0, 0(a0)\n    addiw t0, t0, -97\n    andi t0, t0, 0xff\n    slti a0, t0, 26\n    ret\n",
+            // [-240, 15]: -235 masks to 21 but is no unsigned value below 26.
+            "f:\n    lbu t0, 0(a0)\n    addiw t0, t0, -240\n    andi t0, t0, 0xff\n    sltiu a0, t0, 26\n    ret\n",
+            // [200, 455]: 259 masks to 3 but is not 3.
+            "f:\n    lbu t0, 0(a0)\n    addi t0, t0, 200\n    andi t0, t0, 0xff\n    xori t0, t0, 3\n    seqz a0, t0\n    ret\n",
+            // The masked value is read again.
+            "f:\n    lbu t0, 0(a0)\n    addiw t0, t0, -97\n    andi t1, t0, 0xff\n    sltiu a0, t1, 26\n    mv a1, t1\n    ret\n",
+            // Not a low-bit mask.
+            "f:\n    lbu t0, 0(a0)\n    addiw t0, t0, -97\n    andi t0, t0, 0xfe\n    sltiu a0, t0, 26\n    ret\n",
+            // A join forgets the range.
+            "f:\n    lbu t0, 0(a0)\n    addiw t0, t0, -97\n.L1:\n    andi t0, t0, 0xff\n    sltiu a0, t0, 26\n    ret\n",
+        ] {
+            assert!(!sign_ext(kept).0, "{kept}");
+        }
+    }
+
+    /// One decoded line of the straight-line subset `run_rv` executes.
+    #[derive(Clone, Copy)]
+    struct RvOp {
+        mnem: &'static str,
+        rd: usize,
+        rs: usize,
+        imm: i64,
+    }
+
+    /// Decode the live lines of `lines`; every load reads the run's input.
+    fn decode_rv(lines: &[String], kinds: &[LineKind]) -> Vec<RvOp> {
+        const MNEMONICS: [&str; 16] = [
+            "lbu", "lb", "lhu", "lh", "lw", "mv", "addiw", "addi", "andi", "xori", "slli", "srli",
+            "srai", "sltiu", "slti", "seqz",
+        ];
+        let mut ops = Vec::new();
+        for (line, kind) in lines.iter().zip(kinds) {
+            if matches!(kind, LineKind::Nop | LineKind::Label | LineKind::Ret) {
+                continue;
+            }
+            let t = line.trim();
+            let (m, rest) = t.split_once(' ').unwrap_or((t, ""));
+            let o: Vec<&str> = rest.split(',').map(str::trim).collect();
+            let mnem = MNEMONICS
+                .iter()
+                .copied()
+                .find(|&x| x == m)
+                .unwrap_or_else(|| panic!("unmodelled `{t}`"));
+            let rs = o.get(1).map_or(REG_NONE, |r| parse_reg(r));
+            ops.push(RvOp {
+                mnem,
+                rd: parse_reg(o[0]) as usize,
+                rs: rs as usize,
+                imm: o.get(2).and_then(|v| parse_asm_i64(v)).unwrap_or(0),
+            });
+        }
+        ops
+    }
+
+    /// Execute `ops` with every load producing `input`; the final `a0`.
+    fn run_rv(ops: &[RvOp], input: i64) -> i64 {
+        let mut x = [0i64; NUM_REGS + 1];
+        for op in ops {
+            let v = x[op.rs.min(NUM_REGS)];
+            x[op.rd.min(NUM_REGS)] = match op.mnem {
+                "lbu" | "lb" | "lhu" | "lh" | "lw" => input,
+                "mv" => v,
+                "addiw" => i64::from(v.wrapping_add(op.imm) as i32),
+                "addi" => v.wrapping_add(op.imm),
+                "andi" => v & op.imm,
+                "xori" => v ^ op.imm,
+                "slli" => v << op.imm,
+                "srli" => ((v as u64) >> op.imm) as i64,
+                "srai" => v >> op.imm,
+                "sltiu" => i64::from((v as u64) < (op.imm as u64)),
+                "slti" => i64::from(v < op.imm),
+                _ => i64::from(v == 0), // seqz
+            };
+        }
+        x[REG_A0 as usize]
+    }
+
+    /// Every fold of the range pass, against an interpreter: each load
+    /// type, an offset either side of every bound, each extension spelling
+    /// (in place and into a second register) and each compare form, over
+    /// every value the load can produce.  The rewritten function must return
+    /// what the original returns for all of them, and the folds must fire
+    /// (the exact count pins that the oracle is not vacuous).
+    #[test]
+    fn range_folds_preserve_every_comparison_exhaustively() {
+        let loads: [(&str, Vec<i64>); 4] = [
+            ("lbu t0, 0(a0)", (0..=255).collect()),
+            ("lb t0, 0(a0)", (-128..=127).collect()),
+            (
+                "lw t0, 0(a0)\n    andi t0, t0, 1023",
+                (-1100..=1100).collect(),
+            ),
+            (
+                "lhu t0, 0(a0)",
+                (0..=65535)
+                    .step_by(59)
+                    .chain([255, 256, 257, 65534, 65535])
+                    .collect(),
+            ),
+        ];
+        let extensions = [
+            ("andi t0, t0, 0xff", "t0"),
+            ("andi t1, t0, 255", "t1"),
+            ("andi t0, t0, 2047", "t0"),
+            ("slli t1, t0, 56\n    srli t1, t1, 56", "t1"),
+            ("slli t0, t0, 48\n    srli t0, t0, 48", "t0"),
+            ("slli t0, t0, 32\n    srli t0, t0, 32", "t0"),
+        ];
+        let mut folds = 0;
+        for (load, inputs) in &loads {
+            for off in [-2048i64, -300, -231, -230, -129, -97, -1, 0, 1, 200, 2047] {
+                for (ext, t) in extensions {
+                    for k in [0i64, 1, 3, 25, 26, 255, 256, 2047] {
+                        for cmp in ["sltiu", "slti", "xori"] {
+                            let tail = if cmp == "xori" {
+                                format!("    xori a1, {t}, {k}\n    seqz a1, a1\n")
+                            } else {
+                                format!("    {cmp} a1, {t}, {k}\n")
+                            };
+                            let asm = format!(
+                                "f:\n    {load}\n    addiw t0, t0, {off}\n    {ext}\n{tail}    mv a0, a1\n    ret\n"
+                            );
+                            let lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+                            let kinds: Vec<LineKind> =
+                                lines.iter().map(|l| classify_line(l)).collect();
+                            let before = decode_rv(&lines, &kinds);
+                            let (changed, new_lines, new_kinds) = sign_ext(&asm);
+                            if !changed {
+                                continue;
+                            }
+                            folds += 1;
+                            let after = decode_rv(&new_lines, &new_kinds);
+                            for &v in inputs {
+                                assert_eq!(
+                                    run_rv(&before, v),
+                                    run_rv(&after, v),
+                                    "input {v}:\n{asm}=>\n{}",
+                                    new_lines.join("\n")
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 3131 of the 6336 functions fold: the count pins the coverage, so
+        // a pass that stops (or starts) firing on any shape shows up here.
+        assert_eq!(folds, 3131, "folds fired");
+    }
+
     #[test]
     fn byte_zext_tracks_lbu_through_moves() {
         let input = "f:\n    lbu t0, 0(t2)\n    mv a0, t0\n    andi t0, t0, 0xff\n    ret\n";
@@ -9002,18 +9688,28 @@ mod arg_extension_marker_tests {
         assert!(rows.iter().any(|l| l == "srli t2, t2, 56"), "{out}");
     }
 
-    /// The facts describe the entry value: a write to the register ends them.
+    /// The facts describe the entry value: a write to the register ends them
+    /// (an unknown 64-bit sum keeps both extensions).  A write the range
+    /// analysis models derives the new value's fact from the old one instead:
+    /// `a0 + 1` of a 16-bit `a0` lies in [1, 65536], so its 16-bit
+    /// zero-extension is real code (65536 wraps to 0) while its `sext.w` is
+    /// not.
     #[test]
     fn a_write_ends_the_entry_fact() {
+        let srli_48 = |rows: &[String]| {
+            rows.iter()
+                .any(|l| l.ends_with(", 48") && l.starts_with("srli"))
+        };
+        let asm = "f:\n    # lccc-ret-regs a0\n    # lccc-arg-ext a0/z16\n    add a0, a0, a1\n    slli t0, a0, 48\n    srli t0, t0, 48\n    sext.w t1, a0\n    add a0, t0, t1\n    ret\n";
+        let out = peephole_optimize(asm.into());
+        let rows = code(&out);
+        assert!(srli_48(&rows), "{out}");
+        assert!(rows.iter().any(|l| l.starts_with("sext.w")), "{out}");
         let asm = "f:\n    # lccc-ret-regs a0\n    # lccc-arg-ext a0/z16\n    addi a0, a0, 1\n    slli t0, a0, 48\n    srli t0, t0, 48\n    sext.w t1, a0\n    add a0, t0, t1\n    ret\n";
         let out = peephole_optimize(asm.into());
         let rows = code(&out);
-        assert!(
-            rows.iter()
-                .any(|l| l.ends_with(", 48") && l.starts_with("srli")),
-            "{out}"
-        );
-        assert!(rows.iter().any(|l| l.starts_with("sext.w")), "{out}");
+        assert!(srli_48(&rows), "{out}");
+        assert!(!rows.iter().any(|l| l.starts_with("sext.w")), "{out}");
     }
 
     /// Malformed tags state nothing, and the line itself never reaches the

@@ -37,6 +37,10 @@
 #    constant: `r = r * 3 + a[i]` and `h = h * 33 + s[i]` are a shifted add
 #    with no `mul`, `madd` or materialized factor, while `s += a[i] * 6`
 #    keeps one `madd` with the factor hoisted out of the loop.
+#  - Counting loops compare what they load: no `uxtb` after `ldrb`, no
+#    `sxth` after `ldrsh`, and no W copy relays a masked byte into its
+#    compare.  A call-free loop whose `int` bound is read once keeps that
+#    parameter in a caller-saved register: no frame record, no x19-x28.
 # RISC-V:
 #  - `x | 1u << n` is `sllw` + `or` + one `sext.w`, a returned `unsigned`
 #    parameter is a bare `ret` (it arrives sign-extended), a variadic
@@ -48,9 +52,14 @@
 #    computed across another product stays in an FP register, and a select
 #    of doubles has no frame slot.
 #  - Loops: a multiply by 2^k + 1, 2^k - 1 or 1 - 2^k is `slli` + `add`/`sub`
-#    (no `li`, no `mul`); any other constant factor and a nonzero compare
-#    operand are hoisted out of the loop (`li` is not in the loop body), and
-#    the hoisted `int` bound is not re-extended per iteration.
+#    (no `li`, no `mul`); any other constant factor is hoisted out of the
+#    loop, a compare against a constant with an I-type form is that form
+#    (`slti`/`sltiu`/`xori` + `seqz`, no `li` in the loop body), and the
+#    hoisted `int` bound is not re-extended per iteration.
+#  - A zero-extension that cannot change a compare is not emitted:
+#    `(unsigned char)(p[i] - 'a') <= 25` is `addiw` + `sltiu` with no `andi`,
+#    and `(unsigned)(c - '0') < 10` is `addiw` + `sltiu` + `ret` (Clang's
+#    instruction count).
 #  - An int truncated from a 64-bit constant keeps its `sext.w` at -O0 (the
 #    psABI returns it sign-extended).
 set -euo pipefail
@@ -166,6 +175,10 @@ short mul16(int a, int b) { return (short)(a * b); }
 long poly3(const long *a, int n) { long r = 0; for (int i = 0; i < n; i++) r = r * 3 + a[i]; return r; }
 unsigned djb2(const unsigned char *s, int n) { unsigned h = 5381; for (int i = 0; i < n; i++) h = h * 33 + s[i]; return h; }
 long sum6(const long *a, int n) { long s = 0; for (int i = 0; i < n; i++) s += a[i] * 6; return s; }
+int count_lower(const unsigned char *p, int n) { int s = 0; for (int i = 0; i < n; i++) s += (unsigned char)(p[i] - 'a') <= 25; return s; }
+int count_sp(const unsigned char *p, int n) { int s = 0; for (int i = 0; i < n; i++) if (p[i] == ' ') s++; return s; }
+unsigned count_le7(const short *a, int n) { unsigned s = 0; for (int i = 0; i < n; i++) if (a[i] <= 7) s++; return s; }
+long count_neg(const long *a, int n) { long s = 0; for (int i = 0; i < n; i++) if (a[i] < 0) s++; return s; }
 EOF
 
 if [ -x "$ARM" ]; then
@@ -247,6 +260,12 @@ if [ -x "$ARM" ]; then
     done
     loop_has "$a" sum6 '^madd x' || bad "AArch64 sum6: s += a[i] * 6 is not one madd"
     if loop_has "$a" sum6 '^mov '; then bad "AArch64 sum6: the factor is materialized in the loop"; fi
+    if loop_has "$a" count_lower '^mov w'; then bad "AArch64 count_lower: a W copy relays the byte into its compare ($(loop_body "$a" count_lower | tr '\n' ';'))"; fi
+    if loop_has "$a" count_sp '^uxtb '; then bad "AArch64 count_sp: an ldrb result is zero-extended again ($(loop_body "$a" count_sp | tr '\n' ';'))"; fi
+    if loop_has "$a" count_le7 '^sxth '; then bad "AArch64 count_le7: an ldrsh result is sign-extended again ($(loop_body "$a" count_le7 | tr '\n' ';'))"; fi
+    for f in count_lower count_sp count_le7 count_neg; do
+        if has "$a" "$f" 'x29|x30|[xw](19|2[0-8])\b'; then bad "AArch64 $f: a call-free loop built a frame or took a callee-saved register ($(body "$a" "$f" | tr '\n' ';'))"; fi
+    done
 else
     echo "note: $ARM is absent; AArch64 leg skipped"
 fi
@@ -288,6 +307,8 @@ long poly3(const long *a, int n) { long r = 0; for (int i = 0; i < n; i++) r = r
 long sum6(const long *a, int n) { long s = 0; for (int i = 0; i < n; i++) s += a[i] * 6; return s; }
 long sum100(const long *a) { long s = 0; for (int i = 0; i < 100; i++) s += a[i]; return s; }
 int count_lt(const int *a, int n) { int c = 0; for (int i = 0; i < n; i++) c += a[i] < 50; return c; }
+int count_lower(const unsigned char *p, int n) { int s = 0; for (int i = 0; i < n; i++) s += (unsigned char)(p[i] - 'a') <= 25; return s; }
+int is_digit(int c) { return (unsigned)(c - '0') < 10; }
 EOF
 
 if [ -x "$RV" ]; then
@@ -327,6 +348,10 @@ if [ -x "$RV" ]; then
         if loop_has "$r" "$f" '^li '; then bad "RISC-V $f: a loop constant is staged per iteration ($(loop_body "$r" "$f" | tr '\n' ';'))"; fi
     done
     if loop_has "$r" count_lt '^sext\.w '; then bad "RISC-V count_lt: an int compare operand is re-extended per iteration"; fi
+    loop_has "$r" count_lower '^sltiu ' || bad "RISC-V count_lower: the byte range test is not one sltiu"
+    if loop_has "$r" count_lower '^(andi|li|slli|srli) '; then bad "RISC-V count_lower: the compare re-extends its operand or stages a constant ($(loop_body "$r" count_lower | tr '\n' ';'))"; fi
+    { [ "$(count "$r" is_digit)" -le 3 ] && has "$r" is_digit '^addiw ' && has "$r" is_digit '^sltiu a0, [a-z0-9]+, 10$'; } ||
+        bad "RISC-V is_digit: not addiw + sltiu + ret ($(body "$r" is_digit | tr '\n' ';'))"
     printf 'int trunc_wide(void) { long c = 0x100000001L; return (int)c; }\n' >"$tmp/rv0.c"
     "$RV" -O0 -S "$tmp/rv0.c" -o "$tmp/rv0.s"
     has "$tmp/rv0.s" trunc_wide '^sext\.w a0, ' || bad "RISC-V -O0 trunc_wide: (int) of a 64-bit constant lost its sign extension"

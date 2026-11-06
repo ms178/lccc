@@ -3949,16 +3949,30 @@ fn eliminate_redundant_sxtw(lines: &mut [String], kinds: &mut [LineKind], n: usi
     changed
 }
 
-// ── Pass 3b: Redundant byte sign-extension elimination ──────────────────────
+// ── Pass 3b: Redundant byte/halfword sign-extension elimination ──────────────
 //
-// Mirror of eliminate_redundant_sxtw for byte-level extensions: `ldrsb`
-// produces a value whose bits 7..63 are uniform (a sign-extended byte), so a
-// later `sxtb xD, wS` on it is redundant. Fires on char-byte loops like
-// sieve's count loop (`ldrsb x0, [p]` then `sxtb` before the zero test).
+// Mirror of eliminate_redundant_sxtw for byte and halfword extensions.  Per
+// register, two facts: the narrowest k such that the 64-bit value is the sign
+// extension of its low k bits (`ldrsb x`/`sxtb x` give 8, `ldrsh x`/`sxth x`
+// 16, `ldrsw` 32), and the same k for the low 32 bits alone -- a W-form
+// `ldrsb w`/`sxtb w` gives 8 there but zero-fills bits 63:32, so it states
+// nothing about the X view.  An `sxtb`/`sxth` of a value already that narrow
+// in the view it writes is a move: the char-byte loops (`ldrsb x0, [p]` then
+// `sxtb` before the zero test, sieve's count loop) and the `short` compare
+// (`ldrsh x8, [x0]; sxth w1, w8; cmp w1, #7`), where copy propagation then
+// retires the move.  Labels, branches, calls and returns forget everything;
+// any other line forgets every register it may write (`may_write_gp`: the
+// writeback bases and LSE registers too).
 
 fn eliminate_redundant_sxtb(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
-    let mut extb = [false; 33];
-    extb[32] = true; // the zero register is "byte-extended"
+    /// No fact: the X view is a 64-bit value, the W view a 32-bit one.
+    const UNKNOWN: [u8; 2] = [64, 32];
+    fn fresh() -> [[u8; 2]; 33] {
+        let mut width = [UNKNOWN; 33];
+        width[32] = [1, 1]; // the zero register
+        width
+    }
+    let mut width = fresh();
     let mut changed = false;
     for i in 0..n {
         match kinds[i] {
@@ -3968,64 +3982,84 @@ fn eliminate_redundant_sxtb(lines: &mut [String], kinds: &mut [LineKind], n: usi
             | LineKind::CmpBranch
             | LineKind::Call
             | LineKind::Ret => {
-                extb = [false; 33];
-                extb[32] = true;
+                width = fresh();
+                continue;
             }
+            LineKind::Nop | LineKind::Directive => continue,
             LineKind::Move { dst, src, is_32bit } => {
-                if is_32bit {
-                    // w-mov zeroes bits 32-63, breaking byte-extension of negatives.
-                    if dst < 32 {
-                        extb[dst as usize] = false;
-                    }
-                } else if dst < 32 {
-                    extb[dst as usize] = extb[src as usize];
+                if dst < 32 {
+                    let from = width.get(src as usize).copied().unwrap_or(UNKNOWN);
+                    // A W move copies the low word and zero-fills the rest.
+                    width[dst as usize] = if is_32bit { [64, from[1]] } else { from };
                 }
+                continue;
             }
-            _ => {
-                let t = lines[i].trim().to_string();
-                // sxtb xD, wS
-                if let Some(rest) = t.strip_prefix("sxtb ") {
-                    if let Some((d, s)) = rest.split_once(", ") {
-                        let dst = parse_reg(d.trim());
-                        let src = parse_reg(s.trim());
-                        if dst != REG_NONE && src != REG_NONE && dst < 32 && src < 32 {
-                            if extb[src as usize] {
-                                if dst == src {
-                                    kinds[i] = LineKind::Nop;
-                                } else {
-                                    lines[i] =
-                                        format!("    mov {}, {}", xreg_name(dst), xreg_name(src));
-                                    kinds[i] = LineKind::Move {
-                                        dst,
-                                        src,
-                                        is_32bit: false,
-                                    };
-                                }
-                                changed = true;
-                            }
-                            // The sxtb result is byte-extended either way.
-                            extb[dst as usize] = true;
-                            continue;
-                        }
+            _ => {}
+        }
+        let t = lines[i].trim().to_owned();
+        let (mnemonic, rest) = t.split_once(' ').unwrap_or((t.as_str(), ""));
+        let ops: Vec<&str> = rest.split(',').map(str::trim).collect();
+        let dst = ops.first().map_or(REG_NONE, |o| parse_reg(o));
+        let x_form = ops.first().is_some_and(|o| o.starts_with('x'));
+        let extension = match mnemonic {
+            "sxtb" => Some(8u8),
+            "sxth" => Some(16),
+            _ => None,
+        };
+        if let Some(bits) = extension
+            && dst < 32
+            && ops.len() == 2
+            && ops[1].starts_with('w')
+        {
+            let src = parse_reg(ops[1]);
+            if let Some(from) = width.get(src as usize).copied() {
+                if from[usize::from(!x_form)] <= bits {
+                    if dst == src {
+                        kinds[i] = LineKind::Nop;
+                    } else if x_form {
+                        lines[i] = format!("    mov {}, {}", xreg_name(dst), xreg_name(src));
+                        kinds[i] = LineKind::Move {
+                            dst,
+                            src,
+                            is_32bit: false,
+                        };
+                    } else {
+                        lines[i] = format!("    mov {}, {}", wreg_name(dst), wreg_name(src));
+                        kinds[i] = LineKind::Move {
+                            dst,
+                            src,
+                            is_32bit: true,
+                        };
                     }
+                    changed = true;
                 }
-                // ldrsb xD/wD, [...] creates a byte-sign-extended value.
-                if let Some(rest) = t.strip_prefix("ldrsb ") {
-                    if let Some((d, _)) = rest.split_once(',') {
-                        let dst = parse_reg(d.trim());
-                        if dst != REG_NONE && dst < 32 {
-                            extb[dst as usize] = true;
-                        }
-                        continue;
-                    }
-                }
-                // Any other write clobbers the tracking.
-                if let Some(dst) = written_gp_register(&t, kinds[i]) {
-                    if dst < 32 {
-                        extb[dst as usize] = false;
-                    }
-                }
+                width[dst as usize] = if x_form { [bits, bits] } else { [64, bits] };
+                continue;
             }
+        }
+        let written = may_write_gp(&t);
+        for (r, slot) in width.iter_mut().enumerate().take(31) {
+            if written & (1u64 << r) != 0 {
+                *slot = UNKNOWN;
+            }
+        }
+        let load = match mnemonic {
+            "ldrsb" | "ldursb" => Some(8u8),
+            "ldrsh" | "ldursh" => Some(16),
+            "ldrsw" | "ldursw" => Some(32),
+            _ => None,
+        };
+        // A writeback base equal to the destination is UNPREDICTABLE: only
+        // a load that writes nothing but its destination states a fact.
+        if let Some(bits) = load
+            && dst < 31
+            && written == 1u64 << dst
+        {
+            width[dst as usize] = if x_form {
+                [bits, bits.min(32)]
+            } else {
+                [64, bits.min(32)]
+            };
         }
     }
     changed
@@ -4247,12 +4281,30 @@ fn eliminate_redundant_zext_and(lines: &mut [String], kinds: &mut [LineKind], n:
                     };
                 }
             }
+            // `uxtb`/`uxth` of a value already below 2^8 / 2^16 is that
+            // value: a W move (bits 63:32 are zero either way) that copy
+            // propagation retires -- the byte compare `ldrb w8, [x0, x6];
+            // uxtb w1, w8; cmp w1, #32` needs no extension.
             "uxtb" | "uxth" => {
-                if let Some((d, _)) = rest.split_once(',') {
-                    let dst = parse_reg(d.trim());
-                    if dst < 32 {
-                        zext[dst as usize] = if mnemonic == "uxtb" { 8 } else { 16 };
+                let bits: u8 = if mnemonic == "uxtb" { 8 } else { 16 };
+                let mut ops = rest.split(',').map(str::trim);
+                let dst = ops.next().map_or(REG_NONE, parse_reg);
+                let src = ops.next().map_or(REG_NONE, parse_reg);
+                if dst < 32 && src < 33 && ops.next().is_none() && zext[src as usize] <= bits {
+                    if dst == src {
+                        kinds[i] = LineKind::Nop;
+                    } else {
+                        lines[i] = format!("    mov {}, {}", wreg_name(dst), wreg_name(src));
+                        kinds[i] = LineKind::Move {
+                            dst,
+                            src,
+                            is_32bit: true,
+                        };
                     }
+                    changed = true;
+                }
+                if dst < 32 {
+                    zext[dst as usize] = bits;
                 }
             }
             // adrp: page-aligned (bits 11:0 zero) is an ALIGNMENT fact,
@@ -4809,7 +4861,10 @@ mod abs_cneg_tests {
 
     #[test]
     fn the_wide_identity_reads_the_parameter_home_through_its_copy() {
-        // `labs`: the shift reads the incoming x0, the XOR its x19 home.
+        // `labs`: the shift reads the incoming x0, the XOR its x19 home.  The
+        // compare then reads x0 itself: copy propagation forwards `mov x19,
+        // x0` into it (a compare's operands are all sources), which takes
+        // the copy off the compare's dependency chain.
         let body = concat!(
             "    mov x19, x0\n",
             "    asr x4, x0, #63\n",
@@ -4820,7 +4875,7 @@ mod abs_cneg_tests {
         );
         let out = peephole_optimize(leaf("labs_", body));
         let insts = instructions(&out);
-        assert!(insts.iter().any(|l| l == "cmp x19, #0"), "{out}");
+        assert!(insts.iter().any(|l| l == "cmp x0, #0"), "{out}");
         assert!(insts.iter().any(|l| l == "cneg x0, x19, lt"), "{out}");
         assert!(
             !insts
@@ -5867,23 +5922,26 @@ fn thread_trampolines(lines: &mut [String], kinds: &mut [LineKind], n: usize) ->
 // copies into subsequent instructions. For `mov xDST, xSRC`, replace
 // references to xDST with xSRC in the immediately following instruction
 // (within the same basic block).
+//
+// A 32-bit `mov wDST, wSRC` zero-extends, so only the W view of its
+// destination equals a view of the source (`wSRC`): it forwards into a
+// next instruction that names no `xDST`.  Compares (`cmp`, `cmn`, `tst`,
+// `ccmp`, `ccmn`) write no register, so every operand is a source there --
+// the general rewrite treats operand 0 as a destination and would leave the
+// compare reading the copy (`and x8, x0, #0xff; mov w7, w8; cmp w7, #25`
+// is a zero-extended byte compared through a dead copy).
 
 fn propagate_register_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
 
     for i in 0..n {
-        // Only process 64-bit register-to-register moves
-        let (dst, src) = match kinds[i] {
-            LineKind::Move {
-                dst,
-                src,
-                is_32bit: false,
-            } => {
+        let (dst, src, wide) = match kinds[i] {
+            LineKind::Move { dst, src, is_32bit } => {
                 // Don't propagate sp/fp moves
                 if dst >= 29 || src >= 29 {
                     continue;
                 }
-                (dst, src)
+                (dst, src, !is_32bit)
             }
             _ => continue,
         };
@@ -5936,6 +5994,50 @@ fn propagate_register_copies(lines: &mut [String], kinds: &mut [LineKind], n: us
         // later readers.  The oracle supplies the base write the
         // destination-oriented operand parse cannot see.
         if implicitly_writes_a64(trimmed_j, src) || implicitly_writes_a64(trimmed_j, dst) {
+            continue;
+        }
+
+        // The source rewrite below treats operand 0 as the only destination;
+        // a line that may write either register anywhere else (an LSE
+        // old-value register, a second `ldp` destination) is not renamed.
+        let first_dest = trimmed_j
+            .split_once(|c: char| c.is_ascii_whitespace())
+            .and_then(|(_, ops)| ops.split(',').next())
+            .map(|op| parse_reg(op.trim()))
+            .filter(|&r| r <= 30)
+            .map_or(0u64, |r| 1u64 << r);
+        if may_write_gp(trimmed_j) & !first_dest & ((1u64 << dst) | (1u64 << src)) != 0 {
+            continue;
+        }
+        let names_x = |reg: u8| {
+            trimmed_j
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|tok| tok == xreg_name(reg))
+        };
+        if !wide && names_x(dst) {
+            continue;
+        }
+        let mnemonic = trimmed_j.split_whitespace().next().unwrap_or("");
+        if matches!(mnemonic, "cmp" | "cmn" | "tst" | "ccmp" | "ccmn") {
+            let mut new_line = replace_whole_word(&lines[j], wreg_name(dst), wreg_name(src));
+            if wide {
+                new_line = replace_whole_word(&new_line, xreg_name(dst), xreg_name(src));
+            }
+            if new_line != lines[j] {
+                lines[j] = new_line;
+                kinds[j] = classify_line(&lines[j]);
+                changed = true;
+            }
+            continue;
+        }
+        if !wide {
+            if let Some(new_line) =
+                replace_source_reg_in_instruction(&lines[j], wreg_name(dst), wreg_name(src))
+            {
+                lines[j] = new_line;
+                kinds[j] = classify_line(&lines[j]);
+                changed = true;
+            }
             continue;
         }
 
@@ -8785,6 +8887,11 @@ fn a64_call_reads(line: &str) -> u64 {
 /// x19-x29 back to the caller.  The link register x30 is modeled by
 /// `classify_implicit_operands_a64`.
 const A64_RET_GP: u64 = 0x3 | 0x3ff8_0000;
+/// The return of a function the prologue marked as producing an 8-, 16- or
+/// 32-bit integer (`RET_BITS_MARKER`): the result is w0 alone, so x1 is
+/// not read (`unsigned count(...)` copied a loaded value into the dead
+/// argument register w1 every iteration).
+const A64_RET_GP_NARROW: u64 = 0x1 | 0x3ff8_0000;
 const A64_ALL_GP: u64 = (1u64 << 31) - 1;
 
 /// Backward liveness of the GP registers over one function with every
@@ -8865,6 +8972,19 @@ fn abi_liveness(lines: &[String], kinds: &[LineKind], n: usize) -> Option<Vec<u6
         }
         succs.push(s);
     }
+    // Per line: whether the enclosing function returns a narrow integer.
+    // The marker follows the function label and precedes every `ret`.
+    let mut narrow_ret = vec![false; n];
+    let mut narrow = false;
+    for (k, flag) in narrow_ret.iter_mut().enumerate() {
+        let t = lines[k].trim();
+        if is_function_boundary(t) {
+            narrow = false;
+        } else if let Some(b) = t.strip_prefix(RET_BITS_MARKER) {
+            narrow = matches!(b.trim().parse::<u32>(), Ok(8 | 16 | 32));
+        }
+        *flag = narrow;
+    }
     let transfer = |k: usize| -> (u64, u64) {
         let (mut u, mut d) = gp_operands(&lines[k], kinds[k], false);
         let text = lines[k].trim();
@@ -8873,6 +8993,7 @@ fn abi_liveness(lines: &[String], kinds: &[LineKind], n: usize) -> Option<Vec<u6
                 u |= a64_call_reads(text);
                 d |= A64_CALL_CLOBBER_GP;
             }
+            LineKind::Ret if narrow_ret[k] => u |= A64_RET_GP_NARROW,
             LineKind::Ret => u |= A64_RET_GP,
             LineKind::Branch => {
                 let tgt = text.split_whitespace().next_back();
@@ -12309,6 +12430,185 @@ f:
             result.contains("str x9, [x1], #8"),
             "the writeback base must keep the copy's destination:\n{result}"
         );
+    }
+
+    /// Run one local pass over `asm`; the trimmed lines and kinds after it.
+    fn run_local(
+        asm: &str,
+        pass: fn(&mut [String], &mut [LineKind], usize) -> bool,
+    ) -> (bool, Vec<String>, Vec<LineKind>) {
+        let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        let changed = pass(&mut lines, &mut kinds, n);
+        (
+            changed,
+            lines.iter().map(|l| l.trim().to_owned()).collect(),
+            kinds,
+        )
+    }
+
+    /// `sxtb`/`sxth` of a value already sign-extended from that width, in
+    /// the view the extension writes, is a move; a W-form signed load or
+    /// extension says nothing about bits 63:32, and a write ends the fact.
+    #[test]
+    fn narrow_sign_extensions_of_extended_values_are_moves() {
+        for (asm, want) in [
+            (
+                "f:\n    ldrsh x8, [x0]\n    sxth w1, w8\n    ret\n",
+                "mov w1, w8",
+            ),
+            (
+                "f:\n    ldrsb w8, [x0]\n    sxtb w1, w8\n    ret\n",
+                "mov w1, w8",
+            ),
+            (
+                "f:\n    ldrsb x8, [x0]\n    sxth x1, w8\n    ret\n",
+                "mov x1, x8",
+            ),
+            (
+                "f:\n    ldrsb x8, [x0]\n    sxtb x1, w8\n    ret\n",
+                "mov x1, x8",
+            ),
+            (
+                "f:\n    sxth x8, w2\n    mov x9, x8\n    sxth w1, w9\n    ret\n",
+                "mov w1, w9",
+            ),
+            (
+                "f:\n    ldrsh w8, [x0, #2]\n    mov w9, w8\n    sxth w1, w9\n    ret\n",
+                "mov w1, w9",
+            ),
+        ] {
+            let (changed, out, _) = run_local(asm, eliminate_redundant_sxtb);
+            assert!(changed, "{asm}");
+            assert!(out.iter().any(|l| l == want), "{asm} => {out:?}");
+        }
+        let (changed, _, kinds) = run_local(
+            "f:\n    ldrsh x8, [x0]\n    sxth w8, w8\n    ret\n",
+            eliminate_redundant_sxtb,
+        );
+        assert!(changed);
+        assert_eq!(kinds[2], LineKind::Nop);
+        for kept in [
+            // A halfword is no byte.
+            "f:\n    ldrsh x8, [x0]\n    sxtb w1, w8\n    ret\n",
+            // A W-form load zero-fills bits 63:32.
+            "f:\n    ldrsh w8, [x0]\n    sxth x1, w8\n    ret\n",
+            "f:\n    ldrsb x8, [x0]\n    mov w9, w8\n    sxtb x1, w9\n    ret\n",
+            // A write ends the fact; so does a writeback of the base.
+            "f:\n    ldrsb x8, [x0]\n    add x8, x8, #1\n    sxtb w1, w8\n    ret\n",
+            "f:\n    ldrsb x8, [x0]\n    ldr x9, [x8], #8\n    sxtb w1, w8\n    ret\n",
+            // A join forgets everything.
+            "f:\n    ldrsb x8, [x0]\n.L1:\n    sxtb w1, w8\n    ret\n",
+        ] {
+            let (changed, out, _) = run_local(kept, eliminate_redundant_sxtb);
+            assert!(!changed, "{kept} => {out:?}");
+        }
+    }
+
+    /// `uxtb`/`uxth` of a value already below 2^8 / 2^16 is a W move.
+    #[test]
+    fn narrow_zero_extensions_of_narrow_values_are_moves() {
+        for (asm, want) in [
+            (
+                "f:\n    ldrb w8, [x0, x6]\n    uxtb w1, w8\n    ret\n",
+                "mov w1, w8",
+            ),
+            (
+                "f:\n    ldrb w8, [x0]\n    uxth w1, w8\n    ret\n",
+                "mov w1, w8",
+            ),
+            (
+                "f:\n    ldrh w8, [x0]\n    uxth w1, w8\n    ret\n",
+                "mov w1, w8",
+            ),
+            (
+                "f:\n    and x8, x2, #0xff\n    uxtb w1, w8\n    ret\n",
+                "mov w1, w8",
+            ),
+        ] {
+            let (changed, out, _) = run_local(asm, eliminate_redundant_zext_and);
+            assert!(changed, "{asm}");
+            assert!(out.iter().any(|l| l == want), "{asm} => {out:?}");
+        }
+        for kept in [
+            "f:\n    ldrh w8, [x0]\n    uxtb w1, w8\n    ret\n",
+            "f:\n    ldr w8, [x0]\n    uxth w1, w8\n    ret\n",
+            "f:\n    ldrb w8, [x0]\n.L1:\n    uxtb w1, w8\n    ret\n",
+        ] {
+            let (changed, out, _) = run_local(kept, eliminate_redundant_zext_and);
+            assert!(!changed, "{kept} => {out:?}");
+        }
+    }
+
+    /// A function marked as returning a narrow integer returns w0 alone: a
+    /// move into x1 before its `ret` is dead.  Without the marker -- and in
+    /// the next function of the same text -- x1 may be half of the result.
+    #[test]
+    fn a_narrow_result_leaves_x1_dead_at_the_return() {
+        let marked = format!(
+            "f:\n    {RET_BITS_MARKER}32\n    mov w1, w8\n    mov w0, w2\n    ret\ng:\n    mov w1, w8\n    mov w0, w2\n    ret\n"
+        );
+        let (changed, _, kinds) = run_local(&marked, eliminate_dead_moves);
+        assert!(changed);
+        assert_eq!(
+            kinds[2],
+            LineKind::Nop,
+            "f: x1 is no part of a 32-bit result"
+        );
+        assert_ne!(kinds[3], LineKind::Nop, "f: w0 is the result");
+        assert_ne!(kinds[6], LineKind::Nop, "g: no marker, x1 may be returned");
+        assert_ne!(kinds[7], LineKind::Nop);
+    }
+
+    /// Run `propagate_register_copies` alone; the rewritten lines.
+    fn copy_prop(asm: &str) -> (bool, Vec<String>) {
+        let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        let changed = propagate_register_copies(&mut lines, &mut kinds, n);
+        (changed, lines.iter().map(|l| l.trim().to_owned()).collect())
+    }
+
+    /// A compare writes no register: every operand is a source, so a copy
+    /// forwards into operand 0 too -- through a 32-bit copy for the W view
+    /// (the zero-extension is invisible to a W reader), through a 64-bit one
+    /// for either view.
+    #[test]
+    fn copies_forward_into_every_operand_of_a_compare() {
+        for (copy, cmp, want) in [
+            ("mov w7, w8", "cmp w7, #25", "cmp w8, #25"),
+            ("mov w7, w8", "cmp w9, w7", "cmp w9, w8"),
+            ("mov w7, w8", "tst w7, #0xff", "tst w8, #0xff"),
+            ("mov w7, w8", "ccmp w7, #3, #0, ne", "ccmp w8, #3, #0, ne"),
+            ("mov x7, x8", "cmp x7, #25", "cmp x8, #25"),
+            ("mov x7, x8", "cmn w7, #1", "cmn w8, #1"),
+        ] {
+            let (changed, out) = copy_prop(&format!("f:\n    {copy}\n    {cmp}\n    ret\n"));
+            assert!(changed, "{copy}; {cmp}");
+            assert_eq!(out[2], want, "{copy}; {cmp}");
+        }
+    }
+
+    /// A 32-bit copy forwards its W view into ordinary sources as well, and
+    /// never where the line names the X view (bits 63:32 differ) or may
+    /// write a register through an operand other than the first.
+    #[test]
+    fn a_32_bit_copy_forwards_only_its_w_view() {
+        let (changed, out) = copy_prop("f:\n    mov w7, w8\n    add w9, w7, #1\n    ret\n");
+        assert!(changed);
+        assert_eq!(out[2], "add w9, w8, #1");
+        for kept in [
+            "f:\n    mov w7, w8\n    cmp x7, #25\n    ret\n",
+            "f:\n    mov w7, w8\n    add x9, x7, #1\n    ret\n",
+            "f:\n    mov w7, w8\n    ldr w9, [x7]\n    ret\n",
+            "f:\n    mov w7, w8\n    swp w9, w7, [x1]\n    ret\n",
+            "f:\n    mov x7, x8\n    ldadd x9, x7, [x1]\n    ret\n",
+            "f:\n    mov w7, w8\n.L1:\n    cmp w7, #25\n    ret\n",
+        ] {
+            let (changed, out) = copy_prop(kept);
+            assert!(!changed, "{kept} => {out:?}");
+        }
     }
 
     #[test]
