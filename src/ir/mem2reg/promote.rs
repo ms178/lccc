@@ -223,16 +223,25 @@ pub fn promote_function(func: &mut IrFunction, promote_params: bool) {
 /// - Only be used by Load and Store instructions (not address-taken)
 /// - Not be volatile
 fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<AllocaInfo> {
-    let num_params = func.params.len();
-
-    // Collect all allocas from the entry block.
-    // When promote_params is false, skip the first num_params allocas (parameter allocas)
-    // because the inliner relies on their presence for argument passing.
-    // When promote_params is true (post-inlining), parameter allocas are eligible
-    // because the IR has explicit ParamRef + Store instructions for their initial values.
-    let mut alloca_index = 0;
-    let mut all_allocas: Vec<(Value, IrType, usize)> = func.blocks[0]
-        .instructions
+    // Collect all allocas from the entry block.  When `promote_params` is
+    // false, parameter homes stay in memory because the prologue writes the
+    // incoming ABI registers into them and the inliner binds arguments to
+    // them.  Identify them by `func.param_alloca_values`, the same
+    // authoritative set every other pass and `ParamAllocaIndex` uses -- not
+    // by "the first `params.len()` allocas", which is wrong as soon as an
+    // unrelated alloca precedes the homes.  When `promote_params` is true
+    // (post-inlining) the homes are eligible because the IR has explicit
+    // ParamRef + Store instructions for their initial values.
+    let protected_homes: FxHashSet<u32> = if promote_params {
+        FxHashSet::default()
+    } else {
+        func.param_alloca_values.iter().map(|v| v.0).collect()
+    };
+    let mut all_allocas: Vec<(Value, IrType, usize)> = func
+        .blocks
+        .first()
+        .map(|block| block.instructions.as_slice())
+        .unwrap_or_default()
         .iter()
         .filter_map(|inst| {
             if let Instruction::Alloca {
@@ -243,10 +252,7 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
                 ..
             } = inst
             {
-                let idx = alloca_index;
-                alloca_index += 1;
-                // Skip parameter allocas when not promoting params
-                if !promote_params && idx < num_params {
+                if protected_homes.contains(&dest.0) {
                     return None;
                 }
                 // Never promote volatile allocas -- volatile locals must remain
@@ -278,7 +284,7 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
     // non-entry blocks in the caller. Without promoting these, inlined parameters
     // remain as store/load pairs through stack slots, preventing constant propagation
     // into inline asm "i" constraints and other optimizations.
-    for block in &func.blocks[1..] {
+    for block in func.blocks.iter().skip(1) {
         for inst in &block.instructions {
             if let Instruction::Alloca {
                 dest,
@@ -954,22 +960,22 @@ fn get_successor_labels(term: &Terminator) -> Vec<BlockId> {
 
 /// Remove promoted alloca, load, and store instructions.
 fn remove_promoted_instructions(func: &mut IrFunction, alloca_to_idx: &FxHashMap<u32, usize>) {
-    // Count the total number of allocas that are parameters (by position in entry block).
-    // The first N allocas (where N = number of params) are parameter allocas.
-    // We must NOT remove those because the backend's find_param_alloca uses positional indexing.
-    let num_params = func.params.len();
-
-    // Identify which promoted allocas are parameter allocas by their position
-    let mut param_alloca_values: FxHashSet<u32> = FxHashSet::default();
-    let mut alloca_count = 0;
-    for inst in &func.blocks[0].instructions {
-        if let Instruction::Alloca { dest, .. } = inst {
-            if alloca_count < num_params {
-                param_alloca_values.insert(dest.0);
-            }
-            alloca_count += 1;
-        }
-    }
+    // `func.param_alloca_values` is the authoritative record of parameter
+    // homes; every other pass (GVN, aggregate SROA, inlining, the backend's
+    // `ParamAllocaIndex`) keys off it.  The old code here re-derived the set
+    // by counting the first `params.len()` entry-block allocas, which is both
+    // a redundant O(instructions) pass and WRONG as soon as an unrelated
+    // alloca precedes the homes (inlining, VLA, volatile locals): it would
+    // keep that local and delete a real parameter home, leaving the prologue
+    // nowhere to spill the incoming ABI register.  It also indexed
+    // `func.blocks[0]` unconditionally, which panics for a block-less
+    // function.  Reading the field removes all three defects at once.
+    //
+    // Parameter homes must stay even when promoted: their `Alloca` is what
+    // `ParamAllocaIndex` resolves, and the prologue writes the incoming
+    // register arguments into it.
+    let param_alloca_values: FxHashSet<u32> =
+        func.param_alloca_values.iter().map(|v| v.0).collect();
 
     for block in &mut func.blocks {
         let has_spans = !block.source_spans.is_empty();
@@ -2004,5 +2010,121 @@ mod tests {
                 .iter()
                 .any(|inst| matches!(inst, Instruction::Store { ptr: Value(0), .. }))
         );
+    }
+
+    /// A prefix alloca (inlined local, VLA, volatile local) must not be
+    /// mistaken for a parameter home.  The parameter homes are identified by
+    /// `func.param_alloca_values`, NOT by their position among entry-block
+    /// allocas.  Before this fix the first `params.len()` allocas were
+    /// protected, so the prefix local survived while the REAL home was
+    /// promoted away -- leaving the prologue nowhere to spill the incoming
+    /// ABI register.
+    #[test]
+    fn prefix_alloca_does_not_steal_parameter_home_protection() {
+        let param = IrParam {
+            ty: IrType::I32,
+            noalias: false,
+            struct_size: None,
+            struct_align: None,
+            param_align: None,
+            struct_eightbyte_classes: Vec::new(),
+            fp_agg_class: None,
+            is_f128_sse: false,
+        };
+        let mut func = IrFunction::new("f".to_string(), IrType::I32, vec![param], false);
+        // Value(0) is an unrelated local placed BEFORE the home Value(1).
+        func.param_alloca_values = vec![Value(1)];
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Store {
+                    val: Operand::Const(IrConst::I32(7)),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::ParamRef {
+                    dest: Value(2),
+                    param_idx: 0,
+                    ty: IrType::I32,
+                },
+                Instruction::Store {
+                    val: Operand::Value(Value(2)),
+                    ptr: Value(1),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::Load {
+                    dest: Value(3),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::Load {
+                    dest: Value(4),
+                    ptr: Value(1),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::BinOp {
+                    dest: Value(5),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Value(Value(4)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(5)))),
+            source_spans: Vec::new(),
+        });
+
+        promote_function(&mut func, false);
+
+        let allocas: Vec<u32> = func.blocks[0]
+            .instructions
+            .iter()
+            .filter_map(|i| match i {
+                Instruction::Alloca { dest, .. } => Some(dest.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            allocas,
+            vec![1],
+            "the authoritative parameter home must survive; the prefix local \
+             must be promoted away"
+        );
+        assert_eq!(func.param_alloca_values, vec![Value(1)]);
+    }
+
+    /// A block-less function must not panic in either mem2reg scan.
+    #[test]
+    fn empty_block_list_is_a_no_op() {
+        let mut func = IrFunction::new("f".to_string(), IrType::Void, vec![], false);
+        promote_function(&mut func, false);
+        assert!(func.blocks.is_empty());
+        assert!(find_promotable_allocas(&func, false).is_empty());
+        remove_promoted_instructions(&mut func, &FxHashMap::default());
+        assert!(func.blocks.is_empty());
     }
 }

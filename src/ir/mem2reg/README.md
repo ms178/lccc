@@ -142,7 +142,8 @@ dominator-tree children that are goto targets.
 
 **Cleanup.** After renaming completes, the pass removes all promoted `Alloca`, `Store`, and
 `Load` instructions from the IR. Parameter allocas in the entry block are retained even if
-promoted, because the backend's `find_param_alloca` relies on their positional indexing.
+promoted, because the backend prologue spills incoming ABI registers into them
+(keyed by `param_alloca_values` through `ParamAllocaIndex`).
 
 ---
 

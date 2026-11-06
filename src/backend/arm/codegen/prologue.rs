@@ -5,7 +5,7 @@ use super::emit::{
     callee_saved_name_32, is_arm_fp_phys,
 };
 use crate::backend::call_abi::{ParamClass, classify_params};
-use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
+use crate::backend::generation::{ParamAllocaIndex, calculate_stack_space_common};
 use crate::common::types::IrType;
 use crate::ir::reexports::{Instruction, IrBinOp, IrFunction, Operand, Terminator, Value};
 
@@ -788,6 +788,9 @@ impl ArmCodegen {
     // ---- emit_store_params ----
 
     pub(super) fn emit_store_params_impl(&mut self, func: &IrFunction) {
+        // One O(instructions + params) pass replaces every
+        // parameter-home full scan in this prologue.
+        let param_homes = ParamAllocaIndex::build(func);
         if func.is_variadic {
             self.emit_save_variadic_regs();
         }
@@ -800,7 +803,7 @@ impl ArmCodegen {
 
         self.state.param_alloca_slots = (0..func.params.len())
             .map(|i| {
-                find_param_alloca(func, i).and_then(|(dest, ty)| {
+                param_homes.get(i).and_then(|(dest, ty)| {
                     self.state.get_slot(dest.0).map(|slot| (slot, ty, dest.0))
                 })
             })
@@ -916,10 +919,10 @@ impl ArmCodegen {
             }
         }
 
-        self.emit_store_gp_params(func, &param_classes);
-        self.emit_store_hfa_params(func, &param_classes);
-        self.emit_store_fp_params(func, &param_classes);
-        self.emit_store_stack_params(func, &param_classes);
+        self.emit_store_gp_params(func, &param_homes, &param_classes);
+        self.emit_store_hfa_params(func, &param_homes, &param_classes);
+        self.emit_store_fp_params(func, &param_homes, &param_classes);
+        self.emit_store_stack_params(func, &param_homes, &param_classes);
 
         // The parameter that arrives in x0 and is read only at its own
         // ParamRef (no pre-store, no alloca capture): until that ParamRef

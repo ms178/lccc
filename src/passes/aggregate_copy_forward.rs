@@ -673,8 +673,8 @@ fn forward_store_only_temporaries(
         .filter_map(|(&v, (root, path))| (v == *root && path.is_empty()).then_some(v))
         .collect();
     // Entry-block allocas homing register parameters are written by the
-    // PROLOGUE, not by IR-visible stores (find_param_alloca maps param i to
-    // the i-th entry-block alloca; the x86/arm prologues spill incoming
+    // PROLOGUE, not by IR-visible stores (`ParamAllocaIndex` maps param i to
+    // `param_alloca_values[i]`; the x86/arm prologues spill incoming
     // registers there). Forwarding such a root redirects only the IR stores
     // and deletes the copy — the implicit prologue write is lost and the
     // copy destination stays uninitialized (dump128(__m128 v): the

@@ -11,7 +11,7 @@
 
 use super::emit::ArmCodegen;
 use crate::backend::call_abi::{CallArgClass, ParamClass};
-use crate::backend::generation::find_param_alloca;
+use crate::backend::generation::ParamAllocaIndex;
 use crate::common::types::FpAggClass;
 use crate::ir::reexports::{IrFunction, Operand, Value};
 
@@ -91,6 +91,7 @@ impl ArmCodegen {
     pub(super) fn emit_store_hfa_params(
         &mut self,
         func: &IrFunction,
+        param_homes: &ParamAllocaIndex,
         param_classes: &[ParamClass],
     ) {
         for (i, class) in param_classes.iter().enumerate().take(func.params.len()) {
@@ -104,7 +105,7 @@ impl ArmCodegen {
                     let Some(offset) = self.fp_ret_buffer.map(|(offset, _)| offset) else {
                         continue;
                     };
-                    let Some((slot, _, dest_val)) = self.resolve_param_slot(func, i) else {
+                    let Some((slot, _, dest_val)) = self.resolve_param_slot(param_homes, i) else {
                         continue;
                     };
                     let over_aligned = self.home_over_aligned(dest_val.0);
@@ -117,10 +118,10 @@ impl ArmCodegen {
                 }
                 _ => continue,
             };
-            if find_param_alloca(func, i).is_none() {
+            if param_homes.get(i).is_none() {
                 continue;
             }
-            let Some((slot, _, dest_val)) = self.resolve_param_slot(func, i) else {
+            let Some((slot, _, dest_val)) = self.resolve_param_slot(param_homes, i) else {
                 continue;
             };
             let over_aligned = self.home_over_aligned(dest_val.0);

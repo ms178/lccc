@@ -31,7 +31,7 @@
 //! - `collect_inline_asm_callee_saved`: shared ASM clobber scan
 //! - `run_regalloc_and_merge_clobbers`: register allocator + clobber merge
 //! - `filter_available_regs`: callee-saved register filtering
-//! - `find_param_alloca`: parameter alloca lookup
+//! - `ParamAllocaIndex`: O(1) per-function parameter-home index
 
 mod alloca_coalescing;
 mod analysis;
@@ -48,7 +48,7 @@ pub use inline_asm::{
     collect_inline_asm_callee_saved_with_generic, collect_inline_asm_callee_saved_with_overflow,
 };
 pub use regalloc_helpers::{
-    filter_available_regs, find_param_alloca, run_regalloc_and_merge_clobbers,
+    ParamAllocaIndex, filter_available_regs, run_regalloc_and_merge_clobbers,
     run_regalloc_and_merge_clobbers_ex, run_regalloc_and_merge_clobbers_ipa,
     x86_vector_param_loads,
 };

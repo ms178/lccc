@@ -6,7 +6,7 @@ use super::emit::{
 };
 use crate::backend::call_abi::{ParamClass, classify_params};
 use crate::backend::generation::{
-    calculate_stack_space_common, filter_available_regs, find_param_alloca, is_i128_type,
+    ParamAllocaIndex, calculate_stack_space_common, filter_available_regs, is_i128_type,
     run_regalloc_and_merge_clobbers,
 };
 use crate::backend::regalloc::PhysReg;
@@ -1098,6 +1098,9 @@ impl I686Codegen {
     }
 
     pub(super) fn emit_store_params_impl(&mut self, func: &IrFunction) {
+        // One O(instructions + params) pass replaces every
+        // parameter-home full scan in this prologue.
+        let param_homes = ParamAllocaIndex::build(func);
         let config = self.call_abi_config();
         let param_classes = classify_params(func, &config);
         self.state.param_classes = param_classes.clone();
@@ -1106,7 +1109,7 @@ impl I686Codegen {
 
         self.state.param_alloca_slots = (0..func.params.len())
             .map(|i| {
-                find_param_alloca(func, i).and_then(|(dest, ty)| {
+                param_homes.get(i).and_then(|(dest, ty)| {
                     self.state.get_slot(dest.0).map(|slot| (slot, ty, dest.0))
                 })
             })
@@ -1176,7 +1179,8 @@ impl I686Codegen {
                 IrType,
             )> = Vec::new(); // (param_idx, src, dst, ty)
             for (i, class) in param_classes.iter().enumerate() {
-                let alloca_slot = find_param_alloca(func, i)
+                let alloca_slot = param_homes
+                    .get(i)
                     .and_then(|(dest, _)| self.state.get_slot(dest.0).map(|s| (dest, s)));
                 match *class {
                     ParamClass::IntReg { reg_idx } => {
@@ -1375,7 +1379,8 @@ impl I686Codegen {
                 let src_byte: &'static str = ["%cl", "%dl"][reg_idx as usize];
                 let src_word: &'static str = ["%cx", "%dx"][reg_idx as usize];
                 let ty = func.params[i].ty;
-                let has_alloca_slot = find_param_alloca(func, i)
+                let has_alloca_slot = param_homes
+                    .get(i)
                     .and_then(|(dest, _)| self.state.get_slot(dest.0))
                     .is_some();
                 if has_alloca_slot {
@@ -1438,8 +1443,9 @@ impl I686Codegen {
             // in the prologue uses an XMM register, so the store can sit in
             // parameter order; the parameter object is its 16-byte alloca.
             if let ParamClass::RegReturnBuffer { .. } = class {
-                if let Some(slot) =
-                    find_param_alloca(func, i).and_then(|(dest, _)| self.state.get_slot(dest.0))
+                if let Some(slot) = param_homes
+                    .get(i)
+                    .and_then(|(dest, _)| self.state.get_slot(dest.0))
                 {
                     let source = self.slot_ref(StackSlot(self.vector_ret_buffer_offset));
                     let destination = self.slot_ref(slot);
@@ -1449,7 +1455,7 @@ impl I686Codegen {
                 continue;
             }
             if let ParamClass::F128SseReg { reg_idx, size } = class {
-                if let Some((destination, _)) = find_param_alloca(func, i) {
+                if let Some((destination, _)) = param_homes.get(i) {
                     let Some(slot) = self.state.get_slot(destination.0) else {
                         continue;
                     };
@@ -1495,7 +1501,8 @@ impl I686Codegen {
                 if self.conflict_param_slots.contains_key(&i) {
                     continue;
                 }
-                let has_alloca_slot = find_param_alloca(func, i)
+                let has_alloca_slot = param_homes
+                    .get(i)
                     .and_then(|(dest, _)| self.state.get_slot(dest.0))
                     .is_some();
                 if !has_alloca_slot {
@@ -1539,7 +1546,7 @@ impl I686Codegen {
                 }
             }
 
-            let (slot, ty, dest_id) = if let Some((dest, ty)) = find_param_alloca(func, i) {
+            let (slot, ty, dest_id) = if let Some((dest, ty)) = param_homes.get(i) {
                 if let Some(slot) = self.state.get_slot(dest.0) {
                     (slot, ty, dest.0)
                 } else {

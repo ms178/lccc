@@ -5,7 +5,7 @@ use super::emit::{
     X86_CALLER_SAVED, X86Codegen, collect_inline_asm_callee_saved_x86, is_xmm_reg, phys_reg_name,
 };
 use crate::backend::call_abi::{ParamClass, classify_params};
-use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
+use crate::backend::generation::{ParamAllocaIndex, calculate_stack_space_common};
 use crate::backend::liveness::{
     LiveInterval, for_each_operand_in_instruction, for_each_operand_in_terminator,
 };
@@ -3834,6 +3834,9 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_store_params_impl(&mut self, func: &IrFunction) {
+        // One O(instructions + params) pass replaces every
+        // parameter-home full scan in this prologue.
+        let param_homes = ParamAllocaIndex::build(func);
         let xmm_regs = [
             "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
         ];
@@ -3847,7 +3850,7 @@ impl X86Codegen {
 
         self.state.param_alloca_slots = (0..func.params.len())
             .map(|i| {
-                find_param_alloca(func, i).and_then(|(dest, ty)| {
+                param_homes.get(i).and_then(|(dest, ty)| {
                     self.state.get_slot(dest.0).map(|slot| (slot, ty, dest.0))
                 })
             })
@@ -3979,7 +3982,8 @@ impl X86Codegen {
             // 3. We must save the value NOW, before any other code runs
             // 4. emit_param_ref will see param_pre_stored and skip code generation
             if let Some(paramref_dest) = paramref_dests[i] {
-                let has_slot = find_param_alloca(func, i)
+                let has_slot = param_homes
+                    .get(i)
                     .and_then(|(dest, _)| self.state.get_slot(dest.0))
                     .is_some();
                 if self.state.ra_config.debug_param_store {
@@ -4059,7 +4063,7 @@ impl X86Codegen {
             } else {
                 // DEBUG: dump entry block instructions for this param
                 if self.state.ra_config.debug_param_store {
-                    if let Some((alloca_dest, _)) = find_param_alloca(func, i) {
+                    if let Some((alloca_dest, _)) = param_homes.get(i) {
                         eprintln!(
                             "[PARAM-STORE] param {} has alloca dest={}, no ParamRef",
                             i, alloca_dest.0
@@ -4121,11 +4125,12 @@ impl X86Codegen {
                 // instructions that write TO that alloca. The Store's source value
                 // (which may be a Copy from the original param) tells us which SSA
                 // value represents the parameter after store-to-load forwarding.
-                let has_slot = find_param_alloca(func, i)
+                let has_slot = param_homes
+                    .get(i)
                     .and_then(|(dest, _)| self.state.get_slot(dest.0))
                     .is_some();
                 if !has_slot {
-                    if let Some((alloca_dest, _)) = find_param_alloca(func, i) {
+                    if let Some((alloca_dest, _)) = param_homes.get(i) {
                         let alloca_id = alloca_dest.0;
                         // Collect all SSA values stored to this alloca, then
                         // propagate through Copy chains to find all derived values.
@@ -4188,7 +4193,7 @@ impl X86Codegen {
                 }
             }
 
-            let (slot, ty, dest_id) = if let Some((dest, ty)) = find_param_alloca(func, i) {
+            let (slot, ty, dest_id) = if let Some((dest, ty)) = param_homes.get(i) {
                 if let Some(slot) = self.state.get_slot(dest.0) {
                     (slot, ty, dest.0)
                 } else {

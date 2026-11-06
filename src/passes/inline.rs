@@ -4334,7 +4334,7 @@ fn scalar_cleanup_blocked(func: &IrFunction, module: &IrModule) -> bool {
 /// FSE_encodeSymbol: 47 raw, 83 "cleaned", 59 with the promotion). The
 /// function's OWN parameter homes -- the first `params.len()` entry
 /// allocas, the positional contract the inliner's argument binding and the
-/// backend's `find_param_alloca` rely on -- stay, so sizes remain in the
+/// backend's `ParamAllocaIndex` rely on -- stay, so sizes remain in the
 /// home form of the raw snapshots they are compared with. Promoting them
 /// too (`promote_params = true`) measured +13..+21 % zstd Ir, with calls to
 /// ERR_isError, MEM_readLEST and BIT_readBitsFast left behind in
