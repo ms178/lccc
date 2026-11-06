@@ -602,7 +602,37 @@ impl X86Codegen {
     /// Materialize the FP boolean (`setcc` chain) — used by
     /// `emit_float_cmp_impl` right after the ucomisd and by the FP-SELECT
     /// fallback at a non-adjacent position (flags were just set there).
-    fn emit_fp_cmp_setcc(&mut self, dest: &Value, op: IrCmpOp) {
+    fn emit_fp_cmp_setcc(&mut self, dest: &Value, op: IrCmpOp, self_cmp: bool) {
+        // A value compared against ITSELF cannot be ordered-and-unequal, so
+        // the second flag of the Eq/Ne pair is dead and PF alone is the answer:
+        // `x != x` is exactly "unordered", which is exactly "x is NaN". This is
+        // the shape `__builtin_isnan` lowers to, and it is what both oracles
+        // emit for it:
+        //
+        //   lccc (old): ucomisd / setp / setne / orb / movzbl   5 insns, 4 deep
+        //   lccc (new): ucomisd / setp  / movzbl                3 insns, 2 deep
+        //   gcc-16.2:   xorl / ucomisd / setp                   3 insns, 2 deep
+        //
+        // Dropping the pair also drops the `%cl` partial clobber, so the
+        // secondary-register claim survives the compare instead of being
+        // invalidated below.
+        // Written as a lookup rather than a `match` + `unreachable!()`: a
+        // relational predicate reaching here must fall through to the ordinary
+        // path, not abort the compiler.
+        let solo = match op {
+            IrCmpOp::Ne => Some("    setp %al"),
+            IrCmpOp::Eq => Some("    setnp %al"),
+            _ => None,
+        };
+        if self_cmp {
+            if let Some(setcc) = solo {
+                self.state.emit(setcc);
+                self.state.emit("    movzbl %al, %eax");
+                self.state.reg_cache.invalidate_acc();
+                self.store_rax_to(dest);
+                return;
+            }
+        }
         match op {
             IrCmpOp::Eq => {
                 self.state.emit("    setnp %al");
@@ -684,7 +714,7 @@ impl X86Codegen {
             IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sgt | IrCmpOp::Ugt => Some("a"),
             IrCmpOp::Sle | IrCmpOp::Ule | IrCmpOp::Sge | IrCmpOp::Uge => Some("ae"),
             IrCmpOp::Eq | IrCmpOp::Ne => {
-                self.emit_fp_cmp_setcc(dest, op);
+                self.emit_fp_cmp_setcc(dest, op, is_self_compare(first, second));
                 None
             }
         }
@@ -895,7 +925,7 @@ impl X86Codegen {
             }
         }
 
-        self.emit_fp_cmp_setcc(dest, op);
+        self.emit_fp_cmp_setcc(dest, op, is_self_compare(lhs, rhs));
     }
 
     /// Consume a pending FP fused-Cmp's live flags for a boolean condition.

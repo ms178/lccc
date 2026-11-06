@@ -239,7 +239,28 @@ impl Driver {
             self.fp_rounding_math = false;
             self.fast_math = true;
             self.fp_reassoc = true;
-            self.math_errno = false;
+            // `-ffast-math` implies `-fno-math-errno` and
+            // `-ffinite-math-only`. An explicit sub-option is a user request
+            // that a *soft* `-Ofast` must not revoke (GCC 16.2, measured:
+            // `-O3 -fmath-errno -Ofast` still defines `__FINITE_MATH_ONLY__ 1`
+            // but leaves `__NO_MATH_ERRNO__` absent). The two hard umbrella
+            // arms clear these origins before calling this helper, so
+            // `-O3 -fmath-errno -ffast-math` correctly gets errno off.
+            self.math_errno = self.explicit_math_errno.unwrap_or(false);
+            self.finite_math_only = self.explicit_finite_math_only.unwrap_or(true);
+            // `-ffast-math` also expands to `-fno-signed-zeros`,
+            // `-freciprocal-math` and `-funsafe-math-optimizations`. All three
+            // are source-visible (`__NO_SIGNED_ZEROS__`,
+            // `__RECIPROCAL_MATH__`, `__ASSOCIATIVE_MATH__`) and all three
+            // withdraw the IEEE-754 conformance claim, so they must be part of
+            // the umbrella rather than left at their strict defaults.
+            self.signed_zeros = self.explicit_signed_zeros.unwrap_or(false);
+            self.reciprocal_math = self.explicit_reciprocal_math.unwrap_or(true);
+            self.unsafe_math_optimizations = true;
+            // The group also expands to `-fno-trapping-math` and to
+            // `-fcx-limited-range`, so both claims move with the umbrella.
+            self.no_trapping_math = true;
+            self.cx_limited_range = true;
             // GCC: fast-math implies contract=fast only when no explicit
             // -ffp-contract was given (opts_set semantics).
             if !self.fp_contract_explicit {
@@ -248,7 +269,23 @@ impl Driver {
         } else {
             self.fast_math = false;
             self.fp_reassoc = false;
-            self.math_errno = true;
+            // Withdraw the umbrella-owned sub-options to their explicit
+            // request, or to the C default when the user never set one.
+            self.math_errno = self.explicit_math_errno.unwrap_or(true);
+            self.finite_math_only = self.explicit_finite_math_only.unwrap_or(false);
+            // Mirror of the enable path: withdrawal restores the strict C /
+            // IEEE-754 defaults for the zero sign and for division, and drops
+            // the unsafe-math claim entirely (`-fno-unsafe-math-optimizations`
+            // is what GCC reports as the absence of `__ASSOCIATIVE_MATH__`).
+            self.signed_zeros = self.explicit_signed_zeros.unwrap_or(true);
+            self.reciprocal_math = self.explicit_reciprocal_math.unwrap_or(false);
+            self.unsafe_math_optimizations = false;
+            self.no_trapping_math = false;
+            // Withdrawing the umbrella restores the complex-division range by
+            // default; an explicit `-f{,no-}cx-limited-range` is a user request
+            // and wins, and the `-fno-fast-math` arm re-asserts the bit for
+            // `-Ofast -fno-fast-math` on top of that.
+            self.cx_limited_range = self.explicit_cx_limited_range.unwrap_or(false);
             // Withdraw the umbrella's fenv overrides. An explicit
             // -f{,no-}trapping-math / -f{,no-}rounding-math is a user option
             // and must survive, exactly like an explicit -ffp-contract.
@@ -263,6 +300,107 @@ impl Driver {
                 self.fp_contract = FpContract::c_language_default();
             }
         }
+    }
+
+    /// `__FAST_MATH__` is the *source-visible* claim that every unsafe-FP
+    /// sub-contract this compiler models is active. GCC 16.2 and Clang 23.1.5
+    /// withdraw it as soon as a sub-option is turned off:
+    ///
+    ///   -O3 -ffast-math -fno-finite-math-only  -> absent (both)
+    ///   -O3 -ffast-math -fmath-errno           -> absent (both)
+    ///   -Ofast -ftrapping-math                 -> absent (both)
+    ///   -Ofast -frounding-math                 -> absent in Clang 23.1.5,
+    ///                                            present in GCC 16.2
+    ///
+    /// LCCC follows the safer Clang answer for the one disagreement: a user
+    /// who asked for observable rounding must not be told that source may
+    /// assume fast-math. Keeping the umbrella bit for *codegen* while
+    /// withdrawing the *macro* is deliberate: `-ffast-math -fmath-errno`
+    /// still reassociates a reduction in both oracles (measured assembly),
+    /// but their headers must not take a fast-math-only branch.
+    ///
+    /// Every term below is a measured GCC 16.2 / Clang 23.1.5 behaviour, not a
+    /// guess. The predicate is GCC's `fast_math_flags_set_p` for the flags this
+    /// compiler models:
+    ///
+    ///   -O3 -ffast-math -fno-finite-math-only       -> absent (both oracles)
+    ///   -O3 -ffast-math -fmath-errno                -> absent (both)
+    ///   -Ofast -ftrapping-math                      -> absent (both)
+    ///   -O3 -ffast-math -fsigned-zeros              -> absent (GCC 16.2:
+    ///                                                  re-enabling signed
+    ///                                                  zeros withdraws it)
+    ///   -O3 -ffast-math -fno-unsafe-math-optimizations -> absent (GCC 16.2)
+    ///   -O3 -ffast-math -fno-reciprocal-math        -> PRESENT (GCC 16.2:
+    ///                                                  reciprocal is not part
+    ///                                                  of the umbrella claim)
+    ///   -O3 -ffast-math -fno-associative-math       -> PRESENT (GCC 16.2 keys
+    ///                                                  on the unsafe-math flag,
+    ///                                                  not on reassociation)
+    ///
+    /// `-fp_reassoc` is deliberately *not* a term: `-fno-associative-math`
+    /// clears it while GCC keeps `__FAST_MATH__`, so using it here would
+    /// withdraw the macro on a row both oracles publish. `unsafe_math_optimizations`
+    /// is the flag GCC actually keys on.
+    ///
+    /// This is a pure O(1) derivation over already-owned driver state: no
+    /// allocation, no extra state to drift out of sync with the options.
+    pub(super) fn fast_math_macro_active(&self) -> bool {
+        self.fast_math
+            && self.unsafe_math_optimizations
+            && self.finite_math_only
+            && !self.math_errno
+            && !self.signed_zeros
+            && !self.fp_trapping_math
+            && !self.fp_rounding_math
+    }
+
+    /// Whether GCC 16.2 would report `__ASSOCIATIVE_MATH__`.
+    ///
+    /// Measured on GCC 16.2, this is *not* simply "reassociation is allowed":
+    ///
+    ///   -O3 -fassociative-math                                -> absent
+    ///   -O3 -funsafe-math-optimizations                       -> present
+    ///   -O3 -funsafe-math-optimizations -fno-associative-math -> absent
+    ///   -Ofast -fno-associative-math                          -> absent
+    ///   -Ofast -fno-associative-math -funsafe-math-optimizations -> present
+    ///   -Ofast -fsigned-zeros                                 -> absent
+    ///   -O3 -funsafe-math-optimizations -ftrapping-math       -> absent
+    ///
+    /// The order sensitivity is real and asymmetric:
+    ///
+    ///   -O3 -ftrapping-math -funsafe-math-optimizations   -> present
+    ///   -O3 -funsafe-math-optimizations -ftrapping-math   -> absent
+    ///   -O3 -funsafe-math-optimizations -fsigned-zeros    -> absent
+    ///
+    /// so it is not a conjunction of the sub-options at report time — it is
+    /// pure last-wins on a single bit. A "safe" spelling given *after* the
+    /// group therefore clears `unsafe_math_optimizations` (see the
+    /// `-ftrapping-math` / `-fsigned-zeros` arms), which is exactly what
+    /// reproduces all three rows above.
+    pub(super) fn associative_math_macro(&self) -> bool {
+        self.unsafe_math_optimizations && self.fp_reassoc
+    }
+
+    /// Whether the compiler may still claim IEEE-754 / ISO C Annex F
+    /// conformance to *source code*.
+    ///
+    /// GCC 16.2's predicate (measured over 40+ command lines) is
+    /// `!finite_math_only && signed_zeros && !reciprocal_math`. It is
+    /// deliberately narrower than `-ffast-math`: `-fno-trapping-math` and
+    /// `-fassociative-math` each keep the claim (traps and reassociation do
+    /// not change the arithmetic results), while any of the three terms above
+    /// genuinely changes what `+`, `*` and `/` may produce. Getting this wrong
+    /// is not cosmetic — `__STDC_IEC_559__` is how real numerics headers choose
+    /// between an exact and a fast algorithm.
+    pub(super) fn iec_559_conformant(&self) -> bool {
+        !self.finite_math_only && self.signed_zeros && !self.reciprocal_math
+    }
+
+    /// The *complex* Annex F claim, which `-fcx-limited-range` withdraws on its
+    /// own (GCC 16.2: `-O3 -fcx-limited-range` keeps `__STDC_IEC_559__` 1 but
+    /// drops `__STDC_IEC_559_COMPLEX__`).
+    pub(super) fn iec_559_complex_conformant(&self) -> bool {
+        self.iec_559_conformant() && !self.cx_limited_range
     }
 
     /// Own the complete optimization policy for one `-O` spelling. Keeping
@@ -3499,13 +3637,33 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                     self.explicit_fp_rounding_math = Some(false);
                     self.fp_rounding_math = false;
                 }
+                // `-ftrapping-math` is a *safe* spelling, so it withdraws the
+                // unsafe-math group when it comes last: GCC 16.2 reports
+                // `-O3 -funsafe-math-optimizations -ftrapping-math` without
+                // `__ASSOCIATIVE_MATH__`, and the reverse order with it.
                 "-ftrapping-math" => {
                     self.explicit_fp_trapping_math = Some(true);
                     self.fp_trapping_math = true;
+                    self.no_trapping_math = false;
+                    self.unsafe_math_optimizations = false;
                 }
                 "-fno-trapping-math" => {
                     self.explicit_fp_trapping_math = Some(false);
                     self.fp_trapping_math = false;
+                    self.no_trapping_math = true;
+                }
+                // `-fcx-limited-range` is part of the -ffast-math group in GCC
+                // and withdraws the *complex* Annex F claim on its own. Only
+                // the claim is modelled: this compiler already uses the naive
+                // complex-division range, so the flag has no codegen work to
+                // do and simply has to stop lying about conformance.
+                "-fcx-limited-range" => {
+                    self.explicit_cx_limited_range = Some(true);
+                    self.cx_limited_range = true;
+                }
+                "-fno-cx-limited-range" => {
+                    self.explicit_cx_limited_range = Some(false);
+                    self.cx_limited_range = false;
                 }
                 // GCC's umbrella also changes pointer-overflow assumptions.
                 //
@@ -3672,21 +3830,113 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                         .withdraw_name(&arg["-fno-builtin-".len()..]);
                 }
                 "-ffast-math" => {
+                    // A *hard* umbrella: GCC's -ffast-math owns every
+                    // sub-option it sets, so an explicit sub-option given
+                    // before it is overridden (measured: -O3 -fmath-errno
+                    // -ffast-math still defines __NO_MATH_ERRNO__). Clear the
+                    // soft origins; the helper then installs the defaults.
                     self.explicit_fast_math = Some(true);
+                    self.explicit_math_errno = None;
+                    self.explicit_finite_math_only = None;
+                    self.explicit_signed_zeros = None;
+                    self.explicit_reciprocal_math = None;
+                    self.explicit_cx_limited_range = None;
                     self.set_fast_math(true);
                 }
                 "-fno-fast-math" => {
+                    // `-fcx-limited-range` is the one group member an
+                    // *implicit* umbrella leaves behind. GCC 16.2 measured:
+                    //   -Ofast          -fno-fast-math -> complex claim withdrawn
+                    //   -O3 -ffast-math -fno-fast-math -> complex claim restored
+                    // So the bit survives only when the umbrella being
+                    // withdrawn was the one `-Ofast` installed. Read that
+                    // origin before this arm overwrites it.
+                    let keep_cx = (self.cx_limited_range && self.explicit_fast_math.is_none())
+                        || self.explicit_cx_limited_range == Some(true);
                     self.explicit_fast_math = Some(false);
+                    self.explicit_math_errno = None;
+                    self.explicit_finite_math_only = None;
+                    self.explicit_signed_zeros = None;
+                    self.explicit_reciprocal_math = None;
+                    self.explicit_cx_limited_range = None;
                     self.set_fast_math(false);
+                    self.cx_limited_range = keep_cx;
                 }
-                "-fmath-errno" => self.math_errno = true,
-                "-fno-math-errno" => self.math_errno = false,
-                "-funsafe-math-optimizations" | "-fassociative-math" => {
+                "-fmath-errno" => {
+                    self.explicit_math_errno = Some(true);
+                    self.math_errno = true;
+                }
+                "-fno-math-errno" => {
+                    self.explicit_math_errno = Some(false);
+                    self.math_errno = false;
+                }
+                // GCC 16.2 / Clang 23.1.5 always define
+                // __FINITE_MATH_ONLY__ (0 or 1). -ffinite-math-only is a real
+                // option with a source-visible effect, not a tolerated noop.
+                "-ffinite-math-only" => {
+                    self.explicit_finite_math_only = Some(true);
+                    self.finite_math_only = true;
+                }
+                "-fno-finite-math-only" => {
+                    self.explicit_finite_math_only = Some(false);
+                    self.finite_math_only = false;
+                }
+                // `-fsigned-zeros` is a safe spelling too: after the group it
+                // withdraws `__ASSOCIATIVE_MATH__` (GCC 16.2 measured on
+                // `-O3 -funsafe-math-optimizations -fsigned-zeros`).
+                "-fsigned-zeros" => {
+                    self.explicit_signed_zeros = Some(true);
+                    self.signed_zeros = true;
+                    self.unsafe_math_optimizations = false;
+                }
+                "-fno-signed-zeros" => {
+                    self.explicit_signed_zeros = Some(false);
+                    self.signed_zeros = false;
+                }
+                "-freciprocal-math" => {
+                    self.explicit_reciprocal_math = Some(true);
+                    self.reciprocal_math = true;
+                }
+                "-fno-reciprocal-math" => {
+                    self.explicit_reciprocal_math = Some(false);
+                    self.reciprocal_math = false;
+                }
+                // GCC expands `-funsafe-math-optimizations` to the group
+                // `-fno-signed-zeros -fno-trapping-math -fassociative-math
+                // -freciprocal-math` (verified against GCC 16.2 `-dM -E`:
+                // it publishes all four macros), so it is a group setter and
+                // must set all four, not just reassociation. Last option wins,
+                // which is also GCC's behaviour: `-fsigned-zeros
+                // -funsafe-math-optimizations` reports `__NO_SIGNED_ZEROS__`,
+                // the reverse order does not.
+                //
+                // `explicit_fp_trapping_math` is deliberately left alone:
+                // clearing it would silently drop an explicit `-ftrapping-math`
+                // the user asked for, and this compiler's `fp_trapping_math`
+                // drives fenv-observable codegen rather than GCC's default-on
+                // trapping flag.
+                "-funsafe-math-optimizations" => {
                     self.fp_reassoc = true;
+                    self.unsafe_math_optimizations = true;
+                    self.signed_zeros = false;
+                    self.reciprocal_math = true;
+                    self.no_trapping_math = true;
                 }
-                "-fno-unsafe-math-optimizations" | "-fno-associative-math" => {
+                // Withdrawal restores the strict defaults for the whole group,
+                // unconditionally. Honouring a previously *explicit* sub-option
+                // here would be wrong: GCC 16.2 reports
+                // `-O3 -fno-signed-zeros -fno-unsafe-math-optimizations`
+                // without `__NO_SIGNED_ZEROS__`, i.e. the group withdrawal
+                // resets its members rather than deferring to an earlier flag.
+                "-fno-unsafe-math-optimizations" => {
                     self.fp_reassoc = false;
+                    self.unsafe_math_optimizations = false;
+                    self.signed_zeros = true;
+                    self.reciprocal_math = false;
+                    self.no_trapping_math = false;
                 }
+                "-fassociative-math" => self.fp_reassoc = true,
+                "-fno-associative-math" => self.fp_reassoc = false,
                 "-ffp-contract=fast" => {
                     self.fp_contract = FpContract::Fast;
                     self.fp_contract_explicit = true;
@@ -5217,6 +5467,153 @@ mod cli_tests {
             .collect();
         assert!(d2.parse_cli_args(&args2).is_ok());
         assert!(d2.no_sse);
+    }
+
+    /// Build a driver from one argument list. Every case below is a measured
+    /// GCC 16.2 `-dM -E` row, so these are oracle values, not preferences.
+    fn driver_with(args: &[&str]) -> Driver {
+        let mut d = Driver::new();
+        let owned: Vec<String> = std::iter::once("ccc")
+            .chain(args.iter().copied())
+            .map(String::from)
+            .collect();
+        assert!(d.parse_cli_args(&owned).is_ok(), "rejected: {args:?}");
+        d
+    }
+
+    /// The Annex F / IEEE-754 conformance claim is the predicate GCC 16.2
+    /// actually uses: `!finite_math_only && signed_zeros && !reciprocal_math`.
+    /// It used to be defined unconditionally, which told every numerics header
+    /// that `-Ofast` was still IEEE-exact.
+    #[test]
+    fn iec_559_claim_follows_the_gcc_predicate() {
+        // Neither traps nor reassociation can change what `+` produces, so
+        // they must NOT withdraw the claim.
+        for keep in [
+            "-O3",
+            "-O3 -fno-trapping-math",
+            "-O3 -fassociative-math",
+            "-O3 -fno-math-errno",
+            "-O3 -frounding-math",
+        ] {
+            let d = driver_with(&keep.split(' ').collect::<Vec<_>>());
+            assert!(d.iec_559_conformant(), "{keep} must keep the claim");
+            assert!(
+                d.iec_559_complex_conformant(),
+                "{keep} must keep it for complex"
+            );
+        }
+        // Each of the three real terms withdraws it on its own.
+        for drop in [
+            "-O3 -ffinite-math-only",
+            "-O3 -fno-signed-zeros",
+            "-O3 -freciprocal-math",
+            "-Ofast",
+            "-O3 -ffast-math",
+            "-O3 -funsafe-math-optimizations",
+        ] {
+            let d = driver_with(&drop.split(' ').collect::<Vec<_>>());
+            assert!(!d.iec_559_conformant(), "{drop} must withdraw the claim");
+            assert!(!d.iec_559_complex_conformant(), "{drop} complex too");
+        }
+    }
+
+    /// `-fcx-limited-range` withdraws the COMPLEX claim only; the real claim
+    /// stays. GCC 16.2 measured: `-O3 -fcx-limited-range` reports
+    /// `__STDC_IEC_559__` 1 and `__STDC_IEC_559_COMPLEX__` undefined.
+    #[test]
+    fn cx_limited_range_withdraws_only_the_complex_claim() {
+        let d = driver_with(&["-O3", "-fcx-limited-range"]);
+        assert!(d.iec_559_conformant(), "real claim must survive");
+        assert!(!d.iec_559_complex_conformant(), "complex claim must go");
+        assert_eq!(d.cx_limited_range, true);
+    }
+
+    /// `-funsafe-math-optimizations` is the GROUP
+    /// `-fno-signed-zeros -fno-trapping-math -fassociative-math
+    /// -freciprocal-math`, not a synonym for `-fassociative-math`.
+    #[test]
+    fn unsafe_math_optimizations_is_a_group_not_a_synonym() {
+        let unsafe_d = driver_with(&["-O3", "-funsafe-math-optimizations"]);
+        assert_eq!(unsafe_d.fp_reassoc, true);
+        assert_eq!(unsafe_d.signed_zeros, false);
+        assert_eq!(unsafe_d.reciprocal_math, true);
+        assert_eq!(unsafe_d.no_trapping_math, true);
+        assert!(unsafe_d.associative_math_macro());
+
+        let assoc = driver_with(&["-O3", "-fassociative-math"]);
+        assert_eq!(assoc.fp_reassoc, true, "reassociation is shared");
+        // ...but the group's other three members are NOT implied, and GCC
+        // keys __ASSOCIATIVE_MATH__ on the unsafe-math flag.
+        assert_eq!(assoc.signed_zeros, true);
+        assert_eq!(assoc.reciprocal_math, false);
+        assert!(!assoc.associative_math_macro());
+    }
+
+    /// Group setters are pure LAST-Option-WINS in GCC 16.2, in both orders.
+    #[test]
+    fn fast_math_group_is_last_option_wins() {
+        let a = driver_with(&["-O3", "-fsigned-zeros", "-ffast-math"]);
+        assert_eq!(a.signed_zeros, false, "umbrella overrides an earlier flag");
+        assert!(a.fast_math_macro_active());
+
+        let b = driver_with(&["-O3", "-ffast-math", "-fsigned-zeros"]);
+        assert_eq!(b.signed_zeros, true, "later flag overrides the umbrella");
+        assert!(
+            !b.fast_math_macro_active(),
+            "__FAST_MATH__ must be withdrawn"
+        );
+    }
+
+    /// A safe spelling given AFTER the unsafe group withdraws the
+    /// `__ASSOCIATIVE_MATH__` macro; the reverse order does not.
+    #[test]
+    fn associative_macro_is_order_sensitive() {
+        let before = driver_with(&["-O3", "-ftrapping-math", "-funsafe-math-optimizations"]);
+        assert!(
+            before.associative_math_macro(),
+            "group last -> macro present"
+        );
+        let after = driver_with(&["-O3", "-funsafe-math-optimizations", "-ftrapping-math"]);
+        assert!(
+            !after.associative_math_macro(),
+            "safe flag last -> withdrawn"
+        );
+        let sz = driver_with(&["-O3", "-funsafe-math-optimizations", "-fsigned-zeros"]);
+        assert!(
+            !sz.associative_math_macro(),
+            "-fsigned-zeros last -> withdrawn"
+        );
+    }
+
+    /// Withdrawal restores the strict defaults, and an explicit
+    /// `-fcx-limited-range` is a user request that survives it.
+    #[test]
+    fn umbrella_withdrawal_restores_strict_defaults() {
+        let d = driver_with(&["-O3", "-ffast-math", "-fno-fast-math"]);
+        assert_eq!(d.finite_math_only, false);
+        assert_eq!(d.signed_zeros, true);
+        assert_eq!(d.reciprocal_math, false);
+        assert_eq!(d.no_trapping_math, false);
+        assert_eq!(d.unsafe_math_optimizations, false);
+        assert!(d.iec_559_conformant());
+        // The one member an *implicit* umbrella leaves behind:
+        assert_eq!(d.cx_limited_range, false);
+
+        let implicit = driver_with(&["-Ofast", "-fno-fast-math"]);
+        assert_eq!(implicit.cx_limited_range, true, "GCC keeps -Ofast's copy");
+
+        let explicit_cx = driver_with(&["-ffast-math", "-fcx-limited-range", "-fno-fast-math"]);
+        assert_eq!(explicit_cx.cx_limited_range, true, "user request survives");
+    }
+
+    /// An explicit `-f{,no-}cx-limited-range` survives a later `-O` level.
+    #[test]
+    fn explicit_cx_limited_range_survives_level_change() {
+        let d = driver_with(&["-Ofast", "-fcx-limited-range", "-O2"]);
+        assert_eq!(d.cx_limited_range, true);
+        let off = driver_with(&["-Ofast", "-fno-cx-limited-range"]);
+        assert_eq!(off.cx_limited_range, false);
     }
 
     /// An explicit `-msse` after `-mno-sse` re-enables (GCC last ISA flag).

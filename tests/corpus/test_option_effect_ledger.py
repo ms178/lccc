@@ -35,7 +35,7 @@ LCCC = REPO / "target/fastbuild/lccc"
 class LedgerParsing(unittest.TestCase):
     def test_every_declarative_row_is_parsed(self) -> None:
         rows = ledger.parse_rows(ledger.LEDGER.read_text())
-        self.assertEqual(len(rows), 17, "a new row must be accounted for in the registry")
+        self.assertEqual(len(rows), 20, "a new row must be accounted for in the registry")
         self.assertTrue(all(r.spelling.startswith("-") for r in rows))
 
     def test_generated_family_rows_are_not_declarative_entries(self) -> None:
@@ -163,7 +163,7 @@ class DynamicAgreement(unittest.TestCase):
         report = json.loads(proc.stdout)
         self.assertEqual(report["problems"], [])
         self.assertTrue(report["dynamic"])
-        self.assertEqual(report["rows"], 17)
+        self.assertEqual(report["rows"], 20)
 
     @unittest.skipUnless(LCCC.is_file(), "fastbuild binary not present")
     def test_offline_mode_never_needs_the_binary(self) -> None:
@@ -216,7 +216,7 @@ class GateRobustness(unittest.TestCase):
         self.assertTrue(json.loads(proc.stdout)["dynamic"])
 
     def test_stale_assembly_is_removed_before_hashing(self) -> None:
-        """`opt.s` is reused for all 17 rows. If a compile fails without
+        """`opt.s` is reused for all 20 rows. If a compile fails without
         writing it, the previous row's bytes must not be hashed and reported
         as a codegen change."""
         with tempfile.TemporaryDirectory(prefix="lccc-ledger-stale-") as tmp:
@@ -278,7 +278,7 @@ class ArchitectureParity(unittest.TestCase):
     different `cli.rs` arm, a target-specific refusal) and stay invisible.
 
     Measured on the rebuilt fastbuild tree: lccc, lccc-i686, lccc-arm and
-    lccc-riscv all report 17 rows and zero problems. Each is a host executable
+    lccc-riscv all report 20 rows and zero problems. Each is a host executable
     that emits a different target's assembly, so the same probes exercise
     four back ends. Skip only when the binaries have not been built.
     """

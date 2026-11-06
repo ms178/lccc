@@ -613,6 +613,16 @@ impl Lowerer {
             return Some(Operand::Const(IrConst::I64(0)));
         }
         let (arg_ty, arg_ct, arg_val) = self.lower_fp_classify_arg(args);
+        // Under -ffinite-math-only the value cannot be NaN or infinity.
+        // GCC 16.2 / Clang 23.1.5 fold __builtin_isnan to a constant while
+        // still evaluating the argument (measured: a call in the
+        // argument survives as `call g`). Lowering the argument
+        // above is therefore load-bearing for side effects; DCE
+        // removes the now-unused pure value at -O1+.
+        if self.pass_policy.finite_math_only {
+            let _ = (arg_ty, arg_ct, arg_val);
+            return Some(Operand::Const(IrConst::I64(0)));
+        }
         if Self::is_binary128(&arg_ct) {
             let f = self.binary128_fields(arg_val, arg_ty);
             let mant_not_zero = self.flag_not(f.mant_is_zero);
@@ -623,15 +633,27 @@ impl Lowerer {
             let bool_result = self.classify_result_to_bool(result);
             return Some(Operand::Value(bool_result));
         }
-        let (bits, int_ty) = self.bitcast_float_to_int(arg_val, arg_ty, &arg_ct);
-        let masks = Self::fp_masks_for(arg_ty, &arg_ct);
-        let abs_val = self.fp_abs_bits(&bits, int_ty, masks.0);
-        let result = self.emit_cmp_val(
-            IrCmpOp::Ugt,
-            Operand::Value(abs_val),
-            Operand::Const(IrConst::I64(masks.1)),
-            int_ty,
-        );
+        // `x != x` is the whole test. A NaN is the only IEEE-754 value that is
+        // not equal to itself, so one unordered compare is exact for every
+        // binary format — and it stays in the FP domain, where the back end
+        // already has a comparison. The previous shape bitcast the value to an
+        // integer, masked off the sign and compared against the infinity
+        // pattern, which is what GCC 15-era compilers did:
+        //
+        //   lccc (old):  movq / movabsq / andq / movabsq / xorl / cmpq / seta
+        //   gcc-16.2:    xorl / ucomisd / setp
+        //   clang-23.1:  xorl / ucomisd / setp
+        //
+        // Seven instructions with two 64-bit immediate materialisations and a
+        // vector->GPR transfer against three, on the single most commonly used
+        // FP classifier there is. Deriving it from `Ne` also keeps every
+        // backend's existing unordered handling in charge of correctness
+        // (`ucomisd`+`setp` on x86, `fcmp`+`vs` on AArch64, ...) instead of
+        // hard-coding one ISA's idiom in the lowerer.
+        //
+        // A signalling NaN raises invalid here exactly as it does for both
+        // oracles, which use the same compare.
+        let result = self.emit_cmp_val(IrCmpOp::Ne, arg_val, arg_val, arg_ty);
         Some(Operand::Value(result))
     }
 
@@ -642,6 +664,16 @@ impl Lowerer {
             return Some(Operand::Const(IrConst::I64(0)));
         }
         let (arg_ty, arg_ct, arg_val) = self.lower_fp_classify_arg(args);
+        // Under -ffinite-math-only the value cannot be NaN or infinity.
+        // GCC 16.2 / Clang 23.1.5 fold __builtin_isinf to a constant while
+        // still evaluating the argument (measured: a call in the
+        // argument survives as `call g`). Lowering the argument
+        // above is therefore load-bearing for side effects; DCE
+        // removes the now-unused pure value at -O1+.
+        if self.pass_policy.finite_math_only {
+            let _ = (arg_ty, arg_ct, arg_val);
+            return Some(Operand::Const(IrConst::I64(0)));
+        }
         if Self::is_binary128(&arg_ct) {
             let f = self.binary128_fields(arg_val, arg_ty);
             return Some(Operand::Value(self.flag_and(f.exp_is_max, f.mant_is_zero)));
@@ -670,6 +702,16 @@ impl Lowerer {
             return Some(Operand::Const(IrConst::I64(0)));
         }
         let (arg_ty, arg_ct, arg_val) = self.lower_fp_classify_arg(args);
+        // Under -ffinite-math-only the value cannot be NaN or infinity.
+        // GCC 16.2 / Clang 23.1.5 fold __builtin_isfinite to a constant while
+        // still evaluating the argument (measured: a call in the
+        // argument survives as `call g`). Lowering the argument
+        // above is therefore load-bearing for side effects; DCE
+        // removes the now-unused pure value at -O1+.
+        if self.pass_policy.finite_math_only {
+            let _ = (arg_ty, arg_ct, arg_val);
+            return Some(Operand::Const(IrConst::I64(1)));
+        }
         if Self::is_binary128(&arg_ct) {
             let f = self.binary128_fields(arg_val, arg_ty);
             // Finite iff the exponent is not all ones: an all-ones exponent
@@ -797,6 +839,16 @@ impl Lowerer {
             return Some(Operand::Const(IrConst::I64(0)));
         }
         let (arg_ty, arg_ct, arg_val) = self.lower_fp_classify_arg(args);
+        // Under -ffinite-math-only the value cannot be NaN or infinity.
+        // GCC 16.2 / Clang 23.1.5 fold __builtin_isinf_sign to a constant while
+        // still evaluating the argument (measured: a call in the
+        // argument survives as `call g`). Lowering the argument
+        // above is therefore load-bearing for side effects; DCE
+        // removes the now-unused pure value at -O1+.
+        if self.pass_policy.finite_math_only {
+            let _ = (arg_ty, arg_ct, arg_val);
+            return Some(Operand::Const(IrConst::I64(0)));
+        }
         if Self::is_binary128(&arg_ct) {
             let f = self.binary128_fields(arg_val, arg_ty);
             let is_inf = self.flag_and(f.exp_is_max, f.mant_is_zero);

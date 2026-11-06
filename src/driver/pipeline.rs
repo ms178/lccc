@@ -106,7 +106,79 @@ pub struct Driver {
     /// `-fmath-errno`: library math functions report domain errors through
     /// `errno` (C default; cleared by `-fno-math-errno` and `-ffast-math`,
     /// restored by `-fmath-errno` / `-fno-fast-math`, last option wins).
+    /// Drives the source-visible `__NO_MATH_ERRNO__` contract.
     pub(super) math_errno: bool,
+    /// `-f{,no-}math-errno` given by the user, or `None` when unset. A *soft*
+    /// level change (`-Ofast`, or a later plain `-O*`) restores this; a *hard*
+    /// `-ffast-math` / `-fno-fast-math` clears it because the umbrella owns
+    /// every sub-option it sets (GCC 16.2 `opts_set` semantics, measured).
+    pub(super) explicit_math_errno: Option<bool>,
+    /// `-ffinite-math-only`: the compiler may assume no NaN/Inf. Drives
+    /// `__FINITE_MATH_ONLY__`, which GCC 16.2 and Clang 23.1.5 always define
+    /// (0 or 1) and set to 1 under `-ffast-math` / `-Ofast`.
+    pub(super) finite_math_only: bool,
+    /// `-f{,no-}finite-math-only` given by the user, or `None` when unset.
+    /// Same hard/soft ownership rule as `explicit_math_errno`.
+    pub(super) explicit_finite_math_only: Option<bool>,
+    /// `-fsigned-zeros`: the sign of a zero result is significant (the C and
+    /// IEEE-754 default; GCC's `flag_signed_zeros`). Cleared by
+    /// `-fno-signed-zeros`, by `-ffast-math` / `-Ofast` and by
+    /// `-funsafe-math-optimizations`, which GCC expands to a group that
+    /// includes `-fno-signed-zeros`.
+    ///
+    /// It is one third of GCC's `__STDC_IEC_559__` predicate and one term of
+    /// its `__FAST_MATH__` predicate, so it is modelled even though no pass
+    /// consumes it yet: leaving it at "always significant" made this compiler
+    /// *claim IEEE-754 conformance while running with `-Ofast`*, which lets
+    /// real headers select an algorithm the optimizer is about to break.
+    pub(super) signed_zeros: bool,
+    /// `-f{,no-}signed-zeros` given by the user, or `None` when unset.
+    /// Same hard/soft ownership rule as `explicit_math_errno`.
+    pub(super) explicit_signed_zeros: Option<bool>,
+    /// `-freciprocal-math`: allow `x / y` to be rewritten as `x * (1 / y)`.
+    /// Set by `-ffast-math` / `-Ofast` and by `-funsafe-math-optimizations`;
+    /// GCC's `__RECIPROCAL_MATH__` reports it and `__STDC_IEC_559__` is
+    /// withdrawn while it is on.
+    pub(super) reciprocal_math: bool,
+    /// `-f{,no-}reciprocal-math` given by the user, or `None` when unset.
+    /// Same hard/soft ownership rule as `explicit_math_errno`.
+    pub(super) explicit_reciprocal_math: Option<bool>,
+    /// Whether the *source-visible* `__NO_TRAPPING_MATH__` claim holds.
+    ///
+    /// This is deliberately a separate bit from `fp_trapping_math`, which asks
+    /// the opposite question ("are traps observable to codegen?", default no).
+    /// GCC's `flag_trapping_math` defaults to *true*, so folding the macro into
+    /// `!fp_trapping_math` would publish `__NO_TRAPPING_MATH__` on every
+    /// ordinary command line, where GCC 16.2 leaves it undefined. This bit is
+    /// GCC's inverted flag and follows pure last-wins over the spellings that
+    /// set it: `-fno-trapping-math` and the two groups that expand to it
+    /// (`-ffast-math`, `-funsafe-math-optimizations`); every positive or
+    /// withdrawing spelling clears it.
+    pub(super) no_trapping_math: bool,
+    /// `-fcx-limited-range`: complex division may use the naive
+    /// `(a+bi)/(c+di)` formula without the overflow/underflow guarding Annex G
+    /// requires. It is part of GCC's `-ffast-math` group and is the *only*
+    /// member that withdraws the *complex* IEC claim
+    /// (`__STDC_IEC_559_COMPLEX__`, `__STDC_IEC_60559_COMPLEX__`,
+    /// `__GCC_IEC_559_COMPLEX`) while leaving the real claim intact — measured
+    /// on GCC 16.2: `-O3 -fcx-limited-range` reports `__STDC_IEC_559__` 1 and
+    /// `__STDC_IEC_559_COMPLEX__` undefined.
+    pub(super) cx_limited_range: bool,
+    /// `-f{,no-}cx-limited-range` given by the user, or `None` when unset.
+    /// An explicit request survives both the umbrella withdrawal and a later
+    /// `-O` level: GCC 16.2 keeps the complex claim withdrawn for
+    /// `-Ofast -fcx-limited-range -O2` and for
+    /// `-ffast-math -fcx-limited-range -fno-fast-math`.
+    pub(super) explicit_cx_limited_range: Option<bool>,
+    /// `-funsafe-math-optimizations` as opposed to the narrower
+    /// `-fassociative-math`. The two are *not* the same bit in GCC 16.2 even
+    /// though both enable reassociation: measured `-dM -E` output has
+    /// `-funsafe-math-optimizations -fno-associative-math` still defining
+    /// `__ASSOCIATIVE_MATH__`, and `-fno-unsafe-math-optimizations
+    /// -fassociative-math` not defining it. `__ASSOCIATIVE_MATH__` and
+    /// `__FAST_MATH__` are keyed on this flag, so conflating the two spellings
+    /// would misreport both contracts.
+    pub(super) unsafe_math_optimizations: bool,
     /// -fwrapv makes signed Add/Sub/Mul modular; never infer no-wrap from C UB.
     pub(super) wrap_signed_overflow: bool,
     /// -ftrapv emits runtime traps on signed integer overflow.
@@ -708,6 +780,21 @@ impl Driver {
             min_function_alignment: 0,
             fp_reassoc: false,
             math_errno: true,
+            explicit_math_errno: None,
+            finite_math_only: false,
+            explicit_finite_math_only: None,
+            // Signed zeros are significant unless something relaxes them;
+            // `x / y` is a real division unless something relaxes it. Both are
+            // the C / IEEE-754 defaults and both are what GCC 16.2 reports
+            // through `__STDC_IEC_559__` / `__GCC_IEC_559` on a bare `-O3`.
+            signed_zeros: true,
+            explicit_signed_zeros: None,
+            reciprocal_math: false,
+            explicit_reciprocal_math: None,
+            no_trapping_math: false,
+            cx_limited_range: false,
+            explicit_cx_limited_range: None,
+            unsafe_math_optimizations: false,
             // Contraction default for C: FAST, matching GCC's C default
             // (-ffp-contract=fast). The previous Off default claimed to match
             // "GCC 14 behavior in loops" -- refuted by the godbolt oracles:
@@ -2108,10 +2195,36 @@ impl Driver {
         // The Linux kernel's BUILD_BUG() relies on __OPTIMIZE__ to expand to a noreturn
         // function call instead of a no-op.
         preprocessor.set_optimize(self.optimize, self.optimize_size);
-        // GCC-compatible umbrella feature-test macro.  Individual unsafe or
-        // associative-math flags permit selected transforms but do not define
-        // __FAST_MATH__.
-        preprocessor.set_fast_math(self.fast_math);
+        // GCC-compatible source-visible fast-math contracts. The umbrella
+        // macro is a *derived* claim: GCC 16.2 / Clang 23.1.5 withdraw it
+        // when a sub-option (-fno-finite-math-only, -fmath-errno,
+        // -ftrapping-math, ...) is turned back on, even though codegen still
+        // reassociates. Individual associative/unsafe-math flags permit
+        // selected transforms but never advertise the full umbrella.
+        // __FINITE_MATH_ONLY__ is always defined (0 or 1) by both oracles;
+        // __NO_MATH_ERRNO__ is a presence test.
+        preprocessor.set_finite_math_only(self.finite_math_only);
+        preprocessor.set_no_math_errno(!self.math_errno);
+        preprocessor.set_fast_math_macro(self.fast_math_macro_active());
+        // The rest of the fast-math sub-option macros, plus the Annex F
+        // conformance claim that `-ffinite-math-only` / `-fno-signed-zeros` /
+        // `-freciprocal-math` withdraw. One total call: the five are a single
+        // contract and a partial update would publish a macro set no oracle
+        // produces -- in particular the old unconditional
+        // `__STDC_IEC_559__`/`__GCC_IEC_559` claim, which told headers this
+        // compiler was IEEE-754 exact while `-Ofast` was rewriting the
+        // arithmetic.
+        preprocessor.set_fast_math_sub_macros(
+            crate::frontend::preprocessor::predefined_macros::FastMathSubMacros {
+                no_signed_zeros: !self.signed_zeros,
+                no_trapping_math: self.no_trapping_math,
+                reciprocal_math: self.reciprocal_math,
+                associative_math: self.associative_math_macro(),
+                rounding_math: self.fp_rounding_math,
+                iec_559: self.iec_559_conformant(),
+                iec_559_complex: self.iec_559_complex_conformant(),
+            },
+        );
         // PIE and full PIC both define __PIC__; only PIE defines __PIE__.
         // Kernel `-fno-pic` clears both before RIP_REL_REF inline asm expands.
         preprocessor.set_pic(self.pic || self.pie || self.shared_lib);
@@ -3062,10 +3175,13 @@ impl Driver {
         )
         .with_optimization_level(self.opt_level)
         .with_debug_info(self.debug_info)
-        .with_pass_policy(crate::common::pass_policy::PassPolicy::new(
-            self.effective_wrap_signed_overflow(),
-            fp_environment_observable,
-        ))
+        .with_pass_policy(
+            crate::common::pass_policy::PassPolicy::new(
+                self.effective_wrap_signed_overflow(),
+                fp_environment_observable,
+            )
+            .with_finite_math_only(self.finite_math_only),
+        )
         .with_wrapv(self.wrap_signed_overflow)
         .with_trapv(self.trapv)
         .with_ubsan_trap(self.effective_ubsan_trap())
