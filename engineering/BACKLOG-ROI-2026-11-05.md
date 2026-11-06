@@ -191,7 +191,50 @@ without a test that fails when it regresses.
     source-level pin and a wrapper that reproduces the old cliff. The pinned
     GDB 18.1 runtime suite now also executes `-O4`, comparing host-CPU
     results and unwind chains against GCC and Clang.
-13. **Host-CPU runtime behaviour was checked with a real debugger, not just
+13. **A first host-CPU benchmark was itself wrong, and the correction is
+    measured.**  A dot-product timing harness put `volatile double sink`
+    *inside* the outer repetition loop. LCCC's reduction legality check
+    rejects a loop body containing a volatile access, so the inner dot
+    product stayed scalar; GCC/Clang vectorized it and appeared 2x/3.6x
+    faster. Reporting that as a missed optimization would have been
+    guesswork about a harness artifact. Red-teaming the harness moved the
+    volatile store after the loop and added a data-dependent mutation that
+    prevents hoisting. All three compilers then pack the dot product, and
+    on this 2-vCPU x86-64 host (9 interleaved runs of 40 000 dots of 2048
+    doubles, minimum seconds): LCCC `-O3` 0.0993, LCCC `-O4` 0.0991,
+    LCCC `-Ofast` 0.0147, GCC 16.2.0 `-Ofast` 0.0496, Clang 23.1.5
+    `-Ofast` 0.0263. LCCC's `-Ofast` is 3.4x faster than GCC and 1.8x
+    faster than Clang **on this one workload on this one CPU**; that is a
+    measurement, not a general throughput claim. All five checksums agree
+    with the strict `-O0` reference to one ulp (relative 1.7e-16). The
+    six-test corpus module pins codegen shape, byte identity, checksums,
+    a loose interleaved-minimum ratio gate with a >4x margin, the
+    three-way measurement and a macro-only wrapper negative control.
+    ICX 2026.2 remains unavailable locally; hosted CI's authenticated lane
+    is authoritative.
+14. **A pre-existing runner race was exposed by the loaded host.**  The
+    full corpus, run concurrently with strict Clippy, the Rust suite and the
+    local CI contract, failed
+    `test_worker_exception_publishes_fatal_and_stops_the_queue`: it expected
+    one `compile_case` call after a fatal runner fault but observed five.
+    Root cause proven deterministically by delaying
+    `concurrent.futures.as_completed` by 50 ms: `scripts/x86_gcc_torture.py`
+    submits every case up front and cancels the remaining futures from the
+    *consumer* thread. With `--jobs=1` the single worker dequeues and
+    finishes all queued (instant, mocked) cases before the consumer wakes
+    up, so `future.cancel()` is a no-op and the "stop the queue" guarantee
+    is false under load. Fix: a `threading.Event` set by the worker in the
+    same thread that raised, before it can dequeue another case, plus a
+    pre-invocation check that returns a distinct sentinel (never conflated
+    with a real `Result`). Two new regression tests pin the delayed-consumer
+    race at `--jobs=1` (exactly one call) and bound in-flight work at
+    `--jobs=4` (< =4 calls); all 37 tests in the module pass. A second
+    failure in the same run was our own redundant wall-clock assertion
+    comparing two byte-identical binaries (-O4 vs -O3): it differed by 36%
+    under load for identical code. Removed; structural byte identity is the
+    proof, and the remaining timing gate (LCCC -Ofast >= 1.5x faster than
+    -O3, observed 6.8x) passed with a >4x margin.
+15. **Host-CPU runtime behaviour was checked with a real debugger, not just
    assembly hashes.**  A four-frame `noinline` fixture compiled by LCCC,
    GCC 16.2 and Clang 23.1.5 at `-O2`, `-Ofast` and `-Og` produces identical
    results for inputs 5, -3, 0 and 12345 (`6n+16`). GDB's backtrace at `leaf`
@@ -269,10 +312,12 @@ GCC 16.2.0 / Clang 23.1.5 / GDB 18.1 / Rust 1.99.1 oracles.
 | `tests.corpus.test_ofast_composition` | **9 tests OK** (composition, GCC/Clang agreement, macro-only wrapper, shared-helper pin, 17-vector order matrix, order-blind wrapper) |
 | `tests.corpus.test_dwarf_die_census_ratchet` | **8 tests OK**, incl. end-to-end lost-tag and stale-deferral negative controls |
 | `tests.corpus.test_option_effect_ledger` | **24 tests OK**: 2 architecture-parity tests sweeping 4 drivers, 6 gate-robustness tests (7 behaviours), 16 parsing/static/dynamic tests |
-| `tests.corpus.test_numeric_o_levels` | **8 tests OK** (byte equality with `-O3`, macros, zero diagnostics, GCC/Clang clamping, 8 refusals with pinned divergences, strict options, withdrawal, wrapper cliff) |
-| new/changed corpus modules together | **73 tests OK** |
+| `tests.corpus.test_numeric_o_levels` | **10 tests OK** (byte equality with `-O3`, macros, zero diagnostics, GCC/Clang clamping, 8 refusals with pinned divergences, strict options, withdrawal, wrapper cliff, 4-arch sweep + pinned set) |
+| `tests.corpus.test_host_cpu_dot_product` | **6 tests OK** (packed-codegen non-vacuity, `-O4 == -O3`, one-ulp checksums, loose interleaved timing gate, three-way measurement, wrapper negative control) |
+| `tests.corpus.test_x86_torture_contracts` | **37 tests OK**, incl. 2 new delayed-consumer race regressions |
+| new/changed corpus modules together | **81 tests OK** |
 | `tests.corpus.test_gdb_option_runtime` | **7 tests OK** with pinned GDB 18.1, now also at `-O4` (12 compiler/level runtime + unwind pairs) |
-| `unittest discover -s tests/corpus -p 'test_*.py'` | **1319 tests, 0 failures, 5 skips** |
+| `unittest discover -s tests/corpus -p 'test_*.py'` | **1329 tests, 0 failures, 5 skips** |
 | `check_doc_links.py`, `check_script_imports.py`, `check_no_conflict_markers.py`, `check_ci_workflow_shell.py` | **all PASS** |
 | Hosted CI on `fd3d490` | **22 pass / 3 skipping / 0 failures**, including the authenticated ICX 2026.2 integration lane |
 

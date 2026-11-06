@@ -233,6 +233,53 @@ class NumericOptimizationLevels(unittest.TestCase):
                 self.assertEqual(proc.returncode == 0, want_rc == 0,
                                  f"{flag}: {proc.stderr[:300]}")
 
+    def test_all_four_arch_drivers_agree_on_the_new_levels(self) -> None:
+        """The driver option table is architecture-independent, but a
+        per-target CLI could diverge. Measured on the rebuilt fastbuild tree:
+        lccc, lccc-i686, lccc-arm and lccc-riscv all satisfy the same level
+        invariants and macro states. Each is a host executable emitting a
+        different target's assembly, so this exercises four back ends."""
+        drivers = ("lccc", "lccc-i686", "lccc-arm", "lccc-riscv")
+        paths = [ROOT / "target" / "fastbuild" / name for name in drivers]
+        if not all(path.is_file() for path in paths):
+            self.skipTest("one or more fastbuild arch drivers were not built")
+        vectors = {
+            "O3": ("-O3",),
+            "O2": ("-O2",),
+            "O4": ("-O4",),
+            "Ofast": ("-Ofast",),
+            "O3FF": ("-O3", "-ffast-math"),
+            "OfastO2": ("-Ofast", "-O2"),
+            "OfastO4": ("-Ofast", "-O4"),
+        }
+        macro_states = {"O4": 0, "Ofast": 1, "OfastO2": 0,
+                        "OfastO4": 0, "O3FF": 1}
+        for path in paths:
+            with self.subTest(driver=path.name):
+                codegen = {name: compile_asm(str(path), self.source, *flags).stdout
+                           for name, flags in vectors.items()}
+                self.assertEqual(codegen["O4"], codegen["O3"], "numeric clamp")
+                self.assertEqual(codegen["Ofast"], codegen["O3FF"], "umbrella")
+                self.assertEqual(codegen["OfastO2"], codegen["O2"], "withdrawal")
+                self.assertEqual(codegen["OfastO4"], codegen["O3"], "-Ofast -O4")
+                for name, expected in macro_states.items():
+                    with self.subTest(driver=path.name, vector=name):
+                        self.assertEqual(
+                            int("__FAST_MATH__" in macros(
+                                str(path), self.source, *vectors[name])),
+                            expected)
+
+    def test_the_arch_driver_set_is_pinned(self) -> None:
+        """A new target must be added to BOTH parity sweeps deliberately.
+        Read the executable ledger's own driver set as text (import-path
+        independent under `unittest discover`), not a literal copy of this
+        module's tuple (which would be vacuous)."""
+        other = (ROOT / "tests/corpus/test_option_effect_ledger.py").read_text()
+        self.assertIn(
+            'DRIVERS = ("lccc", "lccc-i686", "lccc-arm", "lccc-riscv")',
+            other,
+            "the ledger sweep's arch set changed; update this sweep too")
+
     def test_numeric_level_uses_the_shared_optimization_helper(self) -> None:
         """Source pin: a second state-assignment block would reintroduce the
         drift that made -O4 a no-op."""

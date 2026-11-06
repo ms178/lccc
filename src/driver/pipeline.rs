@@ -91,14 +91,14 @@ pub struct Driver {
     /// `-ffp-contract=off -ffast-math` keeps contraction OFF while
     /// `-ffast-math -ffp-contract=off` also ends OFF (explicit flag is sticky
     /// in both orders; explicit-vs-explicit remains last-wins).
-    /// `-ffast-math` / `-fno-fast-math` given explicitly on the command line.
-    /// `None` means the fast-math state is owned by the current `-O` spelling:
-    /// only `-Ofast` enables it implicitly, so a later plain `-O*` must
-    /// withdraw it (GCC 16.2 and Clang 23.1 both do this). `Some(true)` keeps
-    /// it enabled across `-O` changes; `Some(false)` is an explicit opt-out
-    /// that no later `-Ofast` may silently revoke (GCC 16.2 semantics).
-    pub(super) explicit_fast_math: Option<bool>,
     pub(super) fp_contract_explicit: bool,
+    /// Whether `-ffast-math` / `-fno-fast-math` was given explicitly on the
+    /// command line. `None` means the fast-math state is owned by the current
+    /// `-O` spelling: only `-Ofast` enables it implicitly, so a later plain
+    /// `-O*` must withdraw it (GCC 16.2 and Clang 23.1 both do this).
+    /// `Some(true)` keeps it enabled across `-O` changes; `Some(false)` is an
+    /// explicit opt-out that no later `-Ofast` may silently revoke (GCC 16.2).
+    pub(super) explicit_fast_math: Option<bool>,
     /// Whether the umbrella -ffast-math option is active.  Kept separate from
     /// fp_reassoc because GCC does not define __FAST_MATH__ for the individual
     /// -fassociative-math/-funsafe-math-optimizations options.
@@ -4890,9 +4890,10 @@ impl Driver {
     /// GCC's *flag* default), and applying it at every optimization level made
     /// `-O0`/`-O1` output differ from GCC's in the last ulp(s) — which is how
     /// 26 in-repo reproducers came to be filed as "miscompile" although both
-    /// results are conforming.  An explicit `-ffp-contract=` or `-ffast-math`
-    /// still wins at any level; `-ffast-math` alone does not, which is exactly
-    /// what GCC 16.2 does on the FMA fixture at `-O1` (Clang 23.1 does fuse).
+    /// results are conforming. Only an explicit `-ffp-contract=` overrides
+    /// this gate (`fp_contract_explicit`): `-ffast-math` alone does not, which
+    /// is what GCC 16.2 does on the FMA fixture at `-O1` (measured; Clang
+    /// 23.1 does fuse there, a documented divergence).
     pub(super) fn resolved_fp_contract(&self) -> crate::common::fp_contract::FpContract {
         use crate::common::fp_contract::FpContract;
         if !self.fp_contract_explicit && self.opt_level < 2 {
