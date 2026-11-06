@@ -1892,7 +1892,9 @@ fn emit_subprograms(
                 let mut attrs: Vec<Attr<'_>> = Vec::with_capacity(3);
                 if let Some(name) = parameter.name.as_deref() {
                     if name.as_bytes().contains(&0) {
-                        return Err(format!("DWARF parameter name contains a NUL byte: {name:?}"));
+                        return Err(format!(
+                            "DWARF parameter name contains a NUL byte: {name:?}"
+                        ));
                     }
                     attrs.push(Attr {
                         at: DW_AT_NAME,
@@ -1927,7 +1929,6 @@ fn emit_subprograms(
     }
     Ok(())
 }
-
 
 /// Move a built line program to where it starts inside the section it belongs
 /// to, and answer that offset.
@@ -2156,7 +2157,10 @@ impl DieWriter {
     }
 
     fn code_for(&mut self, tag: u64, children: bool, attrs: &[(u64, u64)]) -> u64 {
-        let bucket = self.codes.entry(shape_fingerprint(tag, children, attrs)).or_default();
+        let bucket = self
+            .codes
+            .entry(shape_fingerprint(tag, children, attrs))
+            .or_default();
         if let Some(&(_, code)) = bucket
             .iter()
             .find(|(shape, _)| shape.0 == tag && shape.1 == children && shape.2 == attrs)

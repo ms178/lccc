@@ -2793,7 +2793,8 @@ def frame_offset(die: Die) -> int | None:
 
 
 def check_parameter_locations(
-    report: Report, elf: Elf, parsed: list[Unit], label: str, facts: dict[str, int]
+    report: Report, elf: Elf, parsed: list[Unit], label: str, facts: dict[str, int],
+    place_every_parameter: bool = True,
 ) -> None:
     """A parameter's stated location must be the address the program took for it.
 
@@ -2849,11 +2850,17 @@ def check_parameter_locations(
         expected = facts[f"arg_delta_{index}"] - record
         value = die.attrs.get(DW_AT_LOCATION)
         if value is None:
-            report.fail(
-                "parameter_locations",
-                f"{label}: pq_args.{name} lives at {expected} from the frame base in the "
-                "program's own frame but its DIE states no location",
-            )
+            # At `-O0` every parameter has a home the layout can name, so an
+            # absent location there is the regression this check exists for. At
+            # an optimizing tier a value legitimately lives in a register, where
+            # no `DW_OP_fbreg` can name it: absence is then the correct answer and
+            # only a *wrong* offset is a failure.
+            if place_every_parameter:
+                report.fail(
+                    "parameter_locations",
+                    f"{label}: pq_args.{name} lives at {expected} from the frame base in the "
+                    "program's own frame but its DIE states no location",
+                )
             continue
         offset = frame_offset(die)
         if offset is None:
@@ -3340,7 +3347,10 @@ def run_gate(lccc: list[str], gcc: list[str] | None, workdir: Path) -> Report:
         if facts is not None:
             check_type_dies(report, elf, parsed, label, facts)
             check_object_locations(report, elf, parsed, label, facts)
-            check_parameter_locations(report, elf, parsed, label, facts)
+            check_parameter_locations(
+                report, elf, parsed, label, facts,
+                place_every_parameter=optimization == "-O0",
+            )
 
     # One function per section is the kernel's and Debian's default packaging, and
     # it moves a unit from a low/high pair to a range list -- a different section,

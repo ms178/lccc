@@ -4471,9 +4471,11 @@ impl Driver {
             zero_call_used_regs: self.zero_call_used_regs,
             zero_call_used_regs_fp_simd: self.resolved_zero_call_used_regs_fp_simd(),
         };
-        let (asm, frame_facts) =
-            self.target
-                .generate_assembly_with_opts_and_debug(module, &opts, source_manager.map(|sm| &**sm));
+        let (asm, frame_facts) = self.target.generate_assembly_with_opts_and_debug(
+            module,
+            &opts,
+            source_manager.map(|sm| &**sm),
+        );
         if let Some(report) = frame_report {
             let report = report
                 .lock()
@@ -4507,7 +4509,6 @@ impl Driver {
                 asm.len()
             );
         }
-
 
         if time_phases {
             eprintln!(

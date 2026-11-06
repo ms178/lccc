@@ -429,7 +429,10 @@ impl DwarfUnitSpec {
     /// parameter's slot to the fourth parameter's name -- the exact class of
     /// confident lie this whole module is arranged to avoid.  Nothing is lost by
     /// declining: the DIEs simply carry no location.
-    pub(crate) fn apply_frame_facts(&mut self, facts: &crate::backend::debug_frame::DebugFrameFacts) {
+    pub(crate) fn apply_frame_facts(
+        &mut self,
+        facts: &crate::backend::debug_frame::DebugFrameFacts,
+    ) {
         for (name, offsets) in &facts.parameters {
             let Some(list) = self.parameters.get_mut(name) else {
                 continue;

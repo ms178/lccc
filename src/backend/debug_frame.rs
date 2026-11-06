@@ -157,7 +157,13 @@ mod tests {
         // same program: it states `DW_OP_fbreg: -36` for a parameter it keeps at
         // `-20(%rbp)`, and the running program agrees.
         assert_eq!(
-            parameter_homes(Some(16), 0, &[Some(-8), Some(-16)], &[false, false], &[false, false]),
+            parameter_homes(
+                Some(16),
+                0,
+                &[Some(-8), Some(-16)],
+                &[false, false],
+                &[false, false]
+            ),
             vec![Some(-24), Some(-32)]
         );
         // i686: `%ebp + 8` is the CFA, so `-8(%ebp)` is 16 below it.
@@ -173,7 +179,13 @@ mod tests {
         // slot displacement is relative to a register the expression does not
         // name, so every number it could print would be wrong.
         assert_eq!(
-            parameter_homes(None, 0, &[Some(-8), Some(-16)], &[false, false], &[false, false]),
+            parameter_homes(
+                None,
+                0,
+                &[Some(-8), Some(-16)],
+                &[false, false],
+                &[false, false]
+            ),
             vec![None, None]
         );
     }
@@ -181,7 +193,13 @@ mod tests {
     #[test]
     fn a_missing_slot_is_not_described() {
         assert_eq!(
-            parameter_homes(Some(16), 0, &[None, Some(-24)], &[false, false], &[false, false]),
+            parameter_homes(
+                Some(16),
+                0,
+                &[None, Some(-24)],
+                &[false, false],
+                &[false, false]
+            ),
             vec![None, Some(-40)]
         );
     }
@@ -191,7 +209,13 @@ mod tests {
         // `_Alignas(32) int a` has a slot, but the object sits at a run-time
         // aligned address above it, so the slot is a bound and not the object.
         assert_eq!(
-            parameter_homes(Some(16), 0, &[Some(-64), Some(-80)], &[true, false], &[false, false]),
+            parameter_homes(
+                Some(16),
+                0,
+                &[Some(-64), Some(-80)],
+                &[true, false],
+                &[false, false]
+            ),
             vec![None, Some(-96)]
         );
     }
@@ -250,17 +274,35 @@ mod tests {
         // the frame address than an `i32` reaches.  Refusing keeps the arithmetic
         // checked instead of wrapping.
         assert_eq!(
-            parameter_homes(Some(16), 0, &[Some(i64::from(i32::MIN))], &[false], &[false]),
+            parameter_homes(
+                Some(16),
+                0,
+                &[Some(i64::from(i32::MIN))],
+                &[false],
+                &[false]
+            ),
             vec![None]
         );
         // The largest slot stays representable once the bias is removed, and the
         // slot that only an `i64` names is refused before the subtraction runs.
         assert_eq!(
-            parameter_homes(Some(16), 0, &[Some(i64::from(i32::MAX))], &[false], &[false]),
+            parameter_homes(
+                Some(16),
+                0,
+                &[Some(i64::from(i32::MAX))],
+                &[false],
+                &[false]
+            ),
             vec![Some(i32::MAX - 16)]
         );
         assert_eq!(
-            parameter_homes(Some(16), 0, &[Some(i64::from(i32::MAX) + 1)], &[false], &[false]),
+            parameter_homes(
+                Some(16),
+                0,
+                &[Some(i64::from(i32::MAX) + 1)],
+                &[false],
+                &[false]
+            ),
             vec![None]
         );
     }

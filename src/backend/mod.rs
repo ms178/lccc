@@ -15,8 +15,8 @@ pub(crate) mod call_abi; // Unified ABI classification: call args + callee param
 pub(crate) mod cast; // Cast and float operation classification
 pub(crate) mod cfi_lower; // Shared .cfi_* -> .eh_frame lowering (x86, i686, AArch64, RISC-V)
 pub(crate) mod cfi_synth; // Unwind info derived from final x86/i686 code
-pub(crate) mod f128_softfloat; // Shared F128 soft-float orchestration (ARM + RISC-V)
 pub(crate) mod debug_frame; // Frame facts the code generator proves, consumed by the DWARF writer
+pub(crate) mod f128_softfloat; // Shared F128 soft-float orchestration (ARM + RISC-V)
 pub(crate) mod generation; // Module/function/instruction dispatch
 mod global_alignment;
 pub(crate) mod inline_asm; // InlineAsmEmitter trait and shared framework
@@ -802,7 +802,10 @@ impl Target {
                             opts.emit_cfi,
                             cfi_synth::CfiArch::X86_64,
                         );
-                        break (insert_fn_entry_locs(asm, &cg.state.fn_entry_locs), frame_facts);
+                        break (
+                            insert_fn_entry_locs(asm, &cg.state.fn_entry_locs),
+                            frame_facts,
+                        );
                     }
                     if opts.ra_config.debug_ra {
                         eprintln!("[IPA-RA] round {round}: {violations:?}");
