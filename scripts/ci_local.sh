@@ -170,6 +170,18 @@ gate "archived-bulk-absent" fast \
 gate "ci-workflow-shell" fast \
     python3 scripts/check_ci_workflow_shell.py
 
+# Compiler-independent, and the cheapest gate in the suite relative to the
+# damage it prevents: extracting a Debian biarch payload onto `/` of a
+# usr-merged machine replaces /lib -> usr/lib and kills every subsequent
+# execve, including the tools needed to repair it. That happened in three
+# separate sessions through three different scripts. Prose warnings did not
+# stop it; this static scan does. Coverage is preserved by the offline, jailed,
+# rootless sysroot in scripts/ensure_i386_multilib_safe.sh.
+gate "rootfs-write-policy-self-test" fast \
+    python3 scripts/check_rootfs_write_policy.py --self-test
+gate "rootfs-write-policy" fast \
+    python3 scripts/check_rootfs_write_policy.py
+
 # The helper scripts are tools, not gates, so the suite that runs the gates
 # never runs them -- which is how `ab_interleaved.py` shipped with an import
 # that cannot resolve and stayed dead for an entire series. This checks every
@@ -1000,6 +1012,17 @@ gate "dwarf-delivery" fast \
 # synthetic mutations before they are trusted with a compiler object.
 gate "dwarf-quality-selftest" fast \
     python3 tests/regression/check_dwarf_quality.py --self-test
+gate "dwarf-pubnames-selftest" fast \
+    python3 tests/regression/check_dwarf_pubnames.py --self-test
+# D15: -gpubnames accelerator tables. Every published offset is re-derived from
+# the DIE tree by an independent reader, so a wrong offset or a leaked local
+# cannot pass; the tables must also survive a two-unit link and resolve in GDB.
+gate "dwarf-pubnames" fast \
+    python3 tests/regression/check_dwarf_pubnames.py \
+        --lccc "$LCCC" --lccc-i686 target/fastbuild/lccc-i686 \
+        --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv \
+        --gcc "${GCC16:-gcc-16}" --gdb "${GDB:-gdb}" \
+        --json target/dwarf-pubnames.json
 gate "dwarf-parameters-selftest" fast \
     python3 tests/regression/check_dwarf_parameters.py --self-test
 # D1b: O0 x86/i686 parameter homes, GDB values before/after assignment, entry

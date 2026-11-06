@@ -9,7 +9,21 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-from scripts import restore_toolchain_cache as cache
+try:
+    from scripts import restore_toolchain_cache as cache
+except RuntimeError as exc:
+    # The restorer deliberately refuses to import on an unpatched interpreter
+    # without the secure-extraction backport.  Report that as an actionable
+    # dependency skip during collection, not as an opaque traceback.  CI's
+    # patched Python still runs every contract; no extraction fallback is
+    # introduced here.
+    if 'tarfile.data_filter' not in str(exc):
+        raise
+    raise unittest.SkipTest(
+        "secure toolchain-cache extraction requires a patched Python or "
+        "backports.tarfile (install with `python3 -m pip install "
+        "--user --break-system-packages backports.tarfile` on PEP 668 hosts)"
+    ) from exc
 
 tarfile = cache.tarfile
 REPO = Path(cache.LOCK).resolve().parents[2]

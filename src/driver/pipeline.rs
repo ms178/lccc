@@ -159,6 +159,11 @@ pub struct Driver {
     /// asked for a dialect, and the program is the only DWARF an assembler
     /// emits for such an input).
     pub(super) dwarf_version_explicit: bool,
+    /// `-gpubnames`: publish `.debug_pubnames`/`.debug_pubtypes`.  Independent
+    /// of `debug_info` because GCC 16.2 treats the flag as a content selector,
+    /// not as a request for debug info (measured: `-gpubnames` alone emits no
+    /// debug section).
+    pub(super) debug_pubnames: bool,
     pub(super) debug_prefix_map: crate::common::path_map::PathPrefixMap,
     pub(super) macro_prefix_map: crate::common::path_map::PathPrefixMap,
     pub(super) defines: Vec<CliDefine>,
@@ -743,6 +748,7 @@ impl Driver {
             debug_info: false,
             dwarf_version: crate::backend::elf::DWARF_DEFAULT_VERSION,
             dwarf_version_explicit: false,
+            debug_pubnames: false,
             debug_prefix_map: Default::default(),
             macro_prefix_map: Default::default(),
             defines: Vec::new(),
@@ -1782,7 +1788,13 @@ impl Driver {
             config.version_pinned = self.dwarf_version_explicit;
             config
         } else {
-            DwarfConfig::for_c(self.dwarf_version, self.stdc_version)
+            let mut config = DwarfConfig::for_c(self.dwarf_version, self.stdc_version);
+            // An assembler input has no analysed names to publish: GAS emits
+            // no accelerator table for one, and a symbol there may be a label
+            // rather than a source-level object.  The selector is a C-unit
+            // property, so it is applied on this branch only.
+            config.pubnames = self.debug_pubnames;
+            config
         })
     }
 

@@ -4501,6 +4501,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 sections.extend(info.ranges);
                 sections.extend(info.loc);
                 sections.extend(info.loclists);
+                sections.extend(info.pubnames);
+                sections.extend(info.pubtypes);
                 sections.extend(debug_strings.into_section(".debug_str"));
             }
             for mut section in sections {

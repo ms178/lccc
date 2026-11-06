@@ -113,14 +113,49 @@ exit 1
             self.assertFalse(marker.exists())
             self.assertFalse((root / "prefix").exists())
 
-    def test_bootstrap_installs_i386_kernel_headers_without_old_compilers(self):
+    def test_bootstrap_installs_i386_kernel_headers_only_on_disposable_runners(self):
+        """The i386 payload must be runner-scoped, never sandbox-scoped.
+
+        `dpkg --add-architecture i386` + `libc6-dev-i386` on a persistent,
+        usr-merged sandbox is the transaction class that destroyed /lib ->
+        usr/lib and killed entire agent sessions.  The bootstrap therefore
+        installs those packages only when GITHUB_ACTIONS/RUNNER_TEMP prove the
+        machine is a disposable runner, and otherwise routes 32-bit coverage
+        through the audited, offline-first, jailed provisioner.  Coverage is
+        identical in both branches; only the blast radius differs.
+        """
         script = (ROOT / "scripts/ci_prepare_research_tools.sh").read_text()
-        self.assertLess(script.index("sudo dpkg --add-architecture i386"),
-                        script.index("sudo apt-get update"))
-        install = next(line for line in script.splitlines() if line.startswith("sudo apt-get install"))
-        self.assertIn("linux-libc-dev:i386", install.split())
-        self.assertIn("libc6-dev-i386", install.split())
-        self.assertFalse(any(token.startswith(("gcc", "g++", "binutils")) for token in install.split()))
+        lines = [line.strip() for line in script.splitlines()]
+        guard = "if [[ ${GITHUB_ACTIONS:-false} == true && -n ${RUNNER_TEMP:-} ]]; then"
+        self.assertIn(guard, lines)
+        split = lines.index(guard)
+        else_at = lines.index("else", split)
+        runner_branch = lines[split + 1:else_at]
+        sandbox_branch = lines[else_at + 1:lines.index("fi", else_at)]
+
+        runner_install = next(line for line in runner_branch
+                              if line.startswith("sudo apt-get install"))
+        self.assertIn("linux-libc-dev:i386", runner_install.split())
+        self.assertIn("libc6-dev-i386", runner_install.split())
+        self.assertFalse(any(token.startswith(("gcc", "g++", "binutils"))
+                             for token in runner_install.split()))
+        self.assertTrue(any(line.startswith("sudo dpkg --add-architecture i386")
+                            for line in runner_branch))
+
+        # Persistent sandbox: no foreign architecture, no i386 payload, and the
+        # audited provisioner is mandatory (not optional).
+        self.assertFalse(any("add-architecture" in line for line in sandbox_branch))
+        sandbox_install = next(line for line in sandbox_branch
+                               if line.startswith("sudo apt-get install"))
+        self.assertNotIn("libc6-dev-i386", sandbox_install.split())
+        self.assertNotIn("linux-libc-dev:i386", sandbox_install.split())
+        self.assertIn("bash scripts/ensure_i386_multilib_safe.sh", sandbox_branch)
+
+        # Every runner-only live-root write carries an inventoried exemption.
+        for line in runner_branch:
+            if line.startswith(("sudo dpkg", "sudo apt-get install")):
+                idx = lines.index(line)
+                self.assertIn("rootfs-write-policy: allow(", lines[idx - 1])
 
     def test_unknown_option_is_a_usage_error(self):
         with tempfile.TemporaryDirectory() as directory:

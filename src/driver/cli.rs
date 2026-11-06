@@ -2411,6 +2411,13 @@ impl Driver {
                 // which is exactly what a bare `-g` produces here (GCC 16.2
                 // emits version 5 for it, measured), so it is honoured with no
                 // diagnostic.
+                // `-gpubnames` selects the `.debug_pubnames`/`.debug_pubtypes`
+                // accelerator tables.  It does NOT enable debug info: measured
+                // on GCC 16.2, `gcc -gpubnames` without `-g` emits no debug
+                // section at all, so the flag only chooses content for a unit
+                // that `-g` builds.  Last spelling wins, exactly as GCC.
+                "-gpubnames" => self.debug_pubnames = true,
+                "-gno-pubnames" => self.debug_pubnames = false,
                 "-gdwarf" => self.debug_info = true,
                 // `-gdwarf32`/`-gdwarf64` select the 32- or 64-bit *unit
                 // format* and never enable debug info by themselves: measured
@@ -4272,7 +4279,7 @@ pub fn unknown_option(arg: &str, strict: bool) -> Result<(), String> {
 /// `dwarf-2..dwarf-5` (`-gdwarf-1`, `-gdwarf-6` and `-gdwarf-9` are errors on
 /// both), `dwarf32`/`dwarf64`, the format selectors (`stabs`, `stabs+`,
 /// `xcoff`, `xcoff+`, `coff1..3`, `vms`, `codeview`, `btf`, `ctf`), the
-/// content modifiers (`column-info`, `record-gcc-switches`, `pubnames`,
+/// content modifiers (`column-info`, `record-gcc-switches`,
 /// `gnu-pubnames`, `statement-frontiers`, `variable-location-views`,
 /// `internal-reset-location-views`, `describe-dies`, `strict-dwarf`,
 /// `as-loc-support`, `gas-locview-support`, `inline-points`, `toggle`) and
@@ -4325,7 +4332,6 @@ fn gnu_debug_selector_known(selector: &str) -> bool {
             | "coff2"
             | "coff3"
             | "vms"
-            | "pubnames"
             | "gnu-pubnames"
             | "statement-frontiers"
             | "variable-location-views"
@@ -4353,7 +4359,6 @@ fn gnu_debug_feature_off_known(modifier: &str) -> bool {
         modifier,
         "record-gcc-switches"
             | "column-info"
-            | "pubnames"
             | "statement-frontiers"
             | "variable-location-views"
             | "internal-reset-location-views"
@@ -4645,6 +4650,62 @@ mod cli_tests {
         // args[0] is argv[0] (used for target detection from the binary name).
         let args = vec!["ccc".to_string(), flag.to_string(), "x.c".to_string()];
         d.parse_cli_args(&args).map(|_| ())
+    }
+
+    /// `-gpubnames` is implemented, order-sensitive, and independent of `-g`.
+    ///
+    /// The contract is GCC 16.2's, measured one spelling per probe: the flag
+    /// selects content but does not enable debug info, `-gno-pubnames` turns it
+    /// back off, and the last spelling wins.  Strict mode must report both
+    /// spellings as *implemented* -- that is what lets a capability probe tell
+    /// a real feature from a tolerated no-op by exit status alone.
+    #[test]
+    fn gpubnames_is_implemented_and_order_sensitive() {
+        fn flags(args: &[&str]) -> (bool, bool) {
+            let argv: Vec<String> = std::iter::once("ccc".to_string())
+                .chain(args.iter().map(|s| (*s).to_string()))
+                .chain(std::iter::once("x.c".to_string()))
+                .collect();
+            let mut driver = Driver::new();
+            driver
+                .parse_cli_args(&argv)
+                .unwrap_or_else(|e| panic!("{args:?} must parse: {e}"));
+            (driver.debug_info, driver.debug_pubnames)
+        }
+        assert_eq!(flags(&["-g"]), (true, false));
+        assert_eq!(flags(&["-gpubnames"]), (false, true));
+        assert_eq!(flags(&["-g", "-gpubnames"]), (true, true));
+        assert_eq!(flags(&["-gpubnames", "-g"]), (true, true));
+        assert_eq!(flags(&["-g", "-gpubnames", "-gno-pubnames"]), (true, false));
+        assert_eq!(flags(&["-g", "-gno-pubnames", "-gpubnames"]), (true, true));
+        // The capability contract is the *strict parse*, not a call to the
+        // tolerated-option reporter: `unknown_option_tolerated` always errors
+        // under strict mode by design, so asking it about an implemented flag
+        // tests the reporter, not the flag.  A capability probe runs the
+        // compiler with LCCC_STRICT_OPTIONS=1 and reads the exit status, which
+        // is exactly what this reproduces without mutating process state.
+        for spelling in ["-gpubnames", "-gno-pubnames"] {
+            let argv = vec!["ccc".to_string(), spelling.to_string(), "x.c".to_string()];
+            let mut driver = Driver::new();
+            driver
+                .parse_cli_args_with_strict(&argv, true)
+                .unwrap_or_else(|e| {
+                    panic!("{spelling} must be implemented, strict mode said: {e}")
+                });
+        }
+        // And the negative control: a spelling that really is unimplemented
+        // must still be refused under the same policy, or the check above
+        // would pass for any flag whatsoever.
+        let argv = vec![
+            "ccc".to_string(),
+            "-ggnu-pubnames".to_string(),
+            "x.c".to_string(),
+        ];
+        let mut driver = Driver::new();
+        assert!(
+            driver.parse_cli_args_with_strict(&argv, true).is_err(),
+            "-ggnu-pubnames is not implemented and strict mode must say so"
+        );
     }
 
     #[test]
@@ -7127,7 +7188,6 @@ mod cli_tests {
             "-gtoggle",
             "-gno-record-gcc-switches",
             "-gno-column-info",
-            "-gno-pubnames",
             "-gno-strict-dwarf",
             // `-gdwarf64` selects a unit format this compiler does not write,
             // so it stays diagnosed (and strict-fatal) even though the 32-bit

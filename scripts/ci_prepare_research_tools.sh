@@ -1,10 +1,23 @@
 #!/usr/bin/env bash
 # Private, current-toolchain research bootstrap. Invoked through ci_test_report.
 set -euo pipefail
-# The -m32 compiler needs the i386 UAPI asm/ headers, not only libc stubs.
-sudo dpkg --add-architecture i386
-sudo apt-get update
-sudo apt-get install -y --no-install-recommends python3-yaml autoconf automake libc6-dev-i386 linux-libc-dev:i386 libc6-dbg
+# Host-side research tools.  The i386 payload is deliberately NOT installed
+# here: on a persistent, usr-merged sandbox `dpkg --add-architecture i386` plus
+# `libc6-dev-i386` is the transaction class that has destroyed /lib -> usr/lib
+# and killed whole sessions.  scripts/ensure_i386_multilib_safe.sh provides the
+# same 32-bit compile/link/run coverage (C and C++) from an offline, jailed,
+# rootless sysroot, and only falls back to a simulated+audited apt transaction.
+if [[ ${GITHUB_ACTIONS:-false} == true && -n ${RUNNER_TEMP:-} ]]; then
+    # rootfs-write-policy: allow(disposable GitHub runner, destroyed after the job)
+    sudo dpkg --add-architecture i386
+    sudo apt-get update
+    # rootfs-write-policy: allow(disposable GitHub runner, destroyed after the job)
+    sudo apt-get install -y --no-install-recommends python3-yaml autoconf automake libc6-dev-i386 linux-libc-dev:i386 libc6-dbg
+else
+    sudo apt-get update
+    sudo apt-get install -y --no-install-recommends python3-yaml autoconf automake libc6-dbg
+    bash scripts/ensure_i386_multilib_safe.sh
+fi
 # Bootstrap with a current binary linker and Clang's integrated assembler.
 # mold 3.0.0 superseded the harness-cache-1 tag binary (2.42.1); the
 # dedicated installer pins the upstream release digest and link-probes

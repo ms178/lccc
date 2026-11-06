@@ -288,7 +288,8 @@ policy removed more than the new DIEs cost.
 Ordered by value: D1–D4 and D13 are **landed** (see
 [§3.5](#35-what-the-campaign-has-landed-measured)), and what remains is the
 optimized-location tail of D1b/D14, D6 (inline instances),
-then the `.debug_macro`/compression/split-DWARF/name-index items.
+then the `.debug_macro`/compression/split-DWARF/name-index items. D7 (`-S -g`)
+and D15 (`-gpubnames`) are landed and measured below.
 
 Format: **ID · class · evidence** — Why, Where, Plan (each step landable alone),
 Gate (what the regression gate must assert; every gate is mutation-verified by
@@ -723,6 +724,22 @@ it does not require a per-function split.
 
 ### D6 · P1 · L — `DW_TAG_inlined_subroutine`
 
+**User-visible damage, measured 2026-11-06.** Same source, `-O2 -g`, GDB 18.1:
+
+```
+$ gdb -batch -ex 'break callee' gcc.elf
+Breakpoint 1 at 0x401150: file main2.c, line 2.      # both inlined instances
+$ gdb -batch -ex 'break callee' lccc.elf
+Function "callee" not defined.                     # no inline DIE => no symbol
+```
+
+`readelf --debug-dump=info` on the two objects of the same probe: GCC emits
+**2 `DW_TAG_inlined_subroutine` + 1 abstract `DW_TAG_subprogram` with
+`DW_AT_inline`**; lccc emits **0**. lccc *does* inline the callee (the caller is
+three instructions) and its line rows carry the callee's lines 3 and 4 inside
+the caller, so the debugger attributes those addresses to a function whose
+source does not contain them. This is the highest-value remaining item.
+
 **Why.** At `-O2` a row inside `main` legitimately carries the inlined callee's
 line (the gate sees exactly this today); without an inlined-subroutine DIE the
 debugger shows the caller at a line that does not exist in the caller, and
@@ -748,7 +765,19 @@ assert two inlined-subroutine DIEs whose ranges are inside the caller, each with
 **Accept.** `bt` inside an inlined function shows both frames; `step` enters the
 callee's source range.
 
-### D7 · P1 · M — `-S -g` must carry the DIE tree
+### D7 · **landed** — `-S -g` carries the DIE tree
+
+**Measured 2026-11-06** on `unit.c` (14 file-scope entities, `-O2 -g`):
+`lccc -S -g` emits six debug sections in the assembly text
+(`.debug_abbrev`, `.debug_aranges`, `.debug_info`, `.debug_line`,
+`.debug_line_str`, `.debug_str`), and `as --64 -g unit.s` produces an object with
+**42 DIEs / 30 `DW_AT_name` attributes — identical to the direct `-c` object**.
+The implementation is `src/driver/debug_assembly::append_debug_sections`: it
+assembles the text in memory, reads the finished sections back and renders their
+bytes plus relocations, so there is exactly one DWARF emitter. The line program
+is left to `.file`/`.loc` because its addresses must follow assembler relaxation.
+
+The text below is the original work item, kept for the design record.
 
 **Why.** Measured: GCC's `-S -g` output contains the complete `.debug_info`,
 `.debug_abbrev`, `.debug_aranges` and an empty `.debug_line` that GAS fills from
@@ -847,8 +876,24 @@ emits neither a `.dwo` side file nor `.dwo` sections while split DWARF is absent
 
 ### D12 · P3 · M — `.debug_names` (DWARF 5 name index)
 
-**Why.** `info functions pq_` and `break pq_frame` currently walk every unit;
-GCC emits a name index at `-g` on DWARF 5, which makes lookup O(log n).
+**Premise corrected 2026-11-06 by measurement.** The original claim "GCC emits a
+name index at `-g` on DWARF 5" is **false**. Section inventory of the same probe:
+
+| command | index sections emitted |
+| --- | --- |
+| `gcc-16 -g -O2` | *none* |
+| `gcc-16 -g3 -O2` | *none* (`.debug_macro` only) |
+| `gcc-16 -g -gpubnames` (v2..v5) | `.debug_pubnames`, `.debug_pubtypes` |
+| `clang-23.1.5 -g -O2` | *none* |
+| `clang-23.1.5 -gdwarf-5 -g -gpubnames` | `.debug_names` |
+
+So `.debug_names` is **opt-in and Clang-only** among the two oracles; GCC's
+`-gpubnames` produces the *legacy* tables on every dialect including v5. D15
+lands the legacy tables (GCC parity, universal consumer support). What remains
+here is the DWARF 5 index as an *additional* opt-in spelling.
+
+**Why.** `info functions pq_` and `break pq_frame` walk every unit when no index
+is present; a name index makes the lookup a hash probe.
 
 **Where.** New index writer; the CU's `DW_AT_addr_base`/`DW_AT_str_offsets_base`.
 
@@ -859,6 +904,54 @@ name hash, entries for subprograms and variables with `DW_IDX_compile_unit` and
 **Gate.** Assert the index parses, that every `pq_` subprogram and variable
 appears exactly once, and that a lookup by name returns the same DIE offsets a
 full walk would.
+
+---
+
+### D15 · **landed** — `-gpubnames` accelerator tables
+
+**What.** `-gpubnames` publishes `.debug_pubnames` (file-scope objects, defined
+functions and enumerators) and `.debug_pubtypes` (named base types, complete
+records/enums, typedefs). `-gno-pubnames` turns it off; last spelling wins; the
+selector does not enable debug info by itself. Off by default, so an ordinary
+build pays zero bytes.
+
+**Why this shape and not `.debug_names`.** Measured above: GCC 16.2 emits the
+legacy tables on *every* dialect, Clang emits `.debug_names` only under
+`-gdwarf-5 -gpubnames`. The legacy tables are what every consumer (GDB, lldb,
+elfutils) reads on every version, they need no `.debug_addr`/`.debug_str_offsets`
+plumbing, and they give a byte-comparable oracle. `.debug_names` stays open as
+D12 for the DWARF 5 spelling.
+
+**Rules, each measured on GCC 16.2 and cross-checked on Clang 23.1.5:**
+
+| entity | published | evidence |
+| --- | --- | --- |
+| defined function (incl. `static`) | pubnames | both oracles |
+| file-scope object (incl. `static`) | pubnames | both oracles |
+| enumerator | pubnames | both oracles list `RED/GREEN/BLUE` |
+| `extern` declaration without definition | **no** | GCC omits `ext_var` even when used |
+| declaration-only `struct` | **no** | GCC omits `declared_only`, lists `defined` |
+| base type, complete record/enum, typedef | pubtypes | both oracles |
+| local, parameter, member, anonymous type | **no** | neither oracle |
+
+**A GCC defect this does not reproduce.** GCC 16.2 emits a **duplicate** entry
+for every tentative definition (measured: `opaque_ptr` and `anonymous_holder`
+each twice, 26 wasted bytes in a 247-byte table). Clang does not. lccc's table is
+duplicate-free by construction and the gate rejects duplicates.
+
+**Where.** Collection happens at exactly three unit-level emission sites in
+`src/backend/elf/dwarf.rs` (type table, file-scope variables, subprograms) plus
+the enumerator loop; `build_pubnames_table` writes the section. Because the
+hooks are at the unit-level sites, a local or a member *cannot* be indexed by
+accident — the property is structural, not a filter a later edit could weaken.
+
+**Gate.** `tests/regression/check_dwarf_pubnames.py` re-derives the expected
+table from `.debug_info` with the campaign's independent DIE reader, then checks
+exactness, completeness, exclusivity, header, terminator, the single
+absolute-32 relocation at offset 6, two-unit link safety, flag semantics across
+DWARF 2..5 and four optimization levels, GCC name-set agreement against each
+compiler's own tree, and GDB resolution through the linked index. Its own
+validator is mutation-tested with 9 corruptions plus 3 scope filters.
 
 ---
 

@@ -13,19 +13,20 @@ export PATH=/home/user/.cargo/bin:$PATH
 
 step() { printf '\n=== %s ===\n' "$*"; }
 
-step "1/6 32-bit toolchain (i686 native execution)"
-if gcc -m32 -x c -o /tmp/.m32probe - <<'EOF' 2>/dev/null
-int main(void){return 0;}
-EOF
-then
-    echo "gcc -m32 works"
+step "1/6 32-bit toolchain (i686 compile/link/run, zero live-root writes)"
+# This step used to run `sudo dpkg --add-architecture i386` followed by an
+# UNAUDITED `apt-get install libc6-dev-i386 gcc-multilib lib32gcc-14-dev` with
+# all output discarded.  On a usr-merged sandbox that class of command has
+# destroyed /lib -> usr/lib and killed every shell in the session, repeatedly,
+# across agent sessions -- and this recovery script is exactly what an agent
+# runs first after a wipe.  It now goes through the audited, offline-first,
+# user-namespace-jailed provisioner, which provides the SAME coverage (real
+# 32-bit compile, link and execute, C and C++) without touching the live root.
+if bash "$REPO/scripts/ensure_i386_multilib_safe.sh"; then
+    echo "32-bit coverage ready (host multilib or isolated sysroot)"
 else
-    sudo dpkg --add-architecture i386 >/dev/null 2>&1
-    sudo apt-get update -qq >/dev/null 2>&1
-    sudo apt-get install -y -qq libc6-dev-i386 gcc-multilib lib32gcc-14-dev >/dev/null 2>&1
-    gcc -m32 -x c -o /tmp/.m32probe - <<'EOF' 2>/dev/null && echo "gcc -m32 now works" || echo "FAILED: gcc -m32"
-int main(void){return 0;}
-EOF
+    echo "WARNING: 32-bit coverage unavailable; i686 gates must be reported as"
+    echo "         NOT RUN (never as passed).  See docs/I386-MULTILIB-SAFETY.md."
 fi
 
 step "2/6 rust toolchain"
@@ -46,17 +47,11 @@ else
 fi
 ( cd "$REPO" && git log --oneline -1 2>/dev/null || echo "no commits yet" )
 
-step "4/6 swap file"
-if [ -e /swapfile ]; then
-    sudo swapon /swapfile 2>/dev/null
-fi
-if ! sudo swapon --show 2>/dev/null | grep -q swap; then
-    sudo fallocate -l 8G /swapfile 2>/dev/null || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 status=none
-    sudo chmod 600 /swapfile
-    sudo mkswap /swapfile >/dev/null 2>&1
-    sudo swapon /swapfile 2>/dev/null
-fi
-sudo swapon --show 2>/dev/null || echo "(swapon unavailable)"
+step "4/6 swap file (4 GiB, audited helper)"
+# Was: an open-coded 8 GiB /swapfile created through sudo.  The standing
+# requirement is 4 GiB, and scripts/ci_enable_swap.sh already implements the
+# idempotent, verified, non-destructive version.
+bash "$REPO/scripts/ci_enable_swap.sh" || echo "(swap unavailable in this sandbox)"
 
 step "5/6 script exec bits"
 chmod +x "$REPO"/scripts/*.sh "$REPO"/scripts/*.py 2>/dev/null
