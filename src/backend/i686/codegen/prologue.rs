@@ -1019,6 +1019,11 @@ impl I686Codegen {
     ///
     /// Kill switch: `CCC_NO_PARAM_DIRECT_HOME=1` restores the homing copy
     /// verbatim (bisection escape hatch, mirrors the other `CCC_NO_*` gates).
+    /// The flag is read ONCE per function by `emit_store_params_impl` and
+    /// passed in: the environment is process-global, so reading it once per
+    /// stack parameter was both O(params) redundant work and a context-safety
+    /// hazard (a concurrent `set_var` could make different parameters of the
+    /// SAME function take different homing paths).
     /// Look up the direct-home eligibility of `slot` in the O(1) index built
     /// once per function by `param_home_eligibility_index`.
     ///
@@ -1036,8 +1041,9 @@ impl I686Codegen {
         slot: StackSlot,
         ty: IrType,
         index: &FxHashMap<i64, Option<i64>>,
+        no_direct_home: bool,
     ) -> Option<i64> {
-        if std::env::var_os("CCC_NO_PARAM_DIRECT_HOME").is_some() {
+        if no_direct_home {
             return None;
         }
         if self.state.alloca_over_align(dest_id).is_some() {
@@ -1140,6 +1146,13 @@ impl I686Codegen {
         // one O(instructions) pass. See stack_param_direct_home_eligible for
         // the measured O(params x instructions) hotspot this replaces.
         let param_home_index = self.param_home_eligibility_index(func);
+        // Read the global kill switch ONCE for this function.  It used to be
+        // re-read inside `stack_param_direct_home_eligible` for every stack
+        // parameter: O(params) redundant environment lookups, and different
+        // parameters could observe a different value if another thread
+        // mutated the process environment mid-loop.  `var_os` is safe in
+        // edition 2024; only `set_var` is `unsafe`, and we never call it.
+        let no_direct_home = std::env::var_os("CCC_NO_PARAM_DIRECT_HOME").is_some();
 
         // NOTE: ParamRef dest values never share an over-aligned (>16)
         // parameter alloca's slot — resolve_copy_aliases refuses the share
@@ -1654,9 +1667,13 @@ impl I686Codegen {
                             emit!(self.state, "    movl {}, %eax", src_ref_hi);
                             emit!(self.state, "    movl %eax, {}", dst_ref_hi);
                         }
-                    } else if let Some(extent) =
-                        self.stack_param_direct_home_eligible(dest_id, slot, ty, &param_home_index)
-                    {
+                    } else if let Some(extent) = self.stack_param_direct_home_eligible(
+                        dest_id,
+                        slot,
+                        ty,
+                        &param_home_index,
+                        no_direct_home,
+                    ) {
                         // Direct homing (GCC model): the callee owns the
                         // incoming argument slot, so the ParamRef dest lives
                         // THERE — no `movl 220(%esp),%eax; movl %eax,

@@ -36,6 +36,11 @@ FIXTURES = (
     "predicate_inverted_signed_cmp_cross", "word_reload_sign_extension_cross",
     "leaf_params_fp_domain_cross", "vector_fma_families_cross", "call_args_and_pool_regs_cross",
     "fp_sign_and_vector_fms_cross",
+    # Parameter-home index: both build paths must EXECUTE, not merely assemble.
+    # `shifted` covers the aligned (positional) and general (resumed) paths in
+    # one TU; `wide` pushes 48 mixed-width parameters through stack homes on
+    # every ABI.  See check 13 in check_param_home_contracts.py.
+    "param_home_shifted_cross", "param_home_wide_cross",
 )
 ALL_LEVELS = ("-O0", "-O1", "-O2", "-Os")
 LEVELS = {
@@ -101,6 +106,12 @@ LEVELS = {
     # and NaNs; an FP constant compared as integer bits was an internal
     # compiler error at -O1 and up.
     "fp_sign_and_vector_fms_cross": ALL_LEVELS + ("-O3",),
+    # The parameter-home index is consulted at every optimization level: -O0
+    # keeps all allocas, -O1/-O2 may promote some away (shifting the layout
+    # again), and -Os changes the frame layout.  A shifted home that merely
+    # assembles still passes a compile-only gate, so these MUST execute.
+    "param_home_shifted_cross": ALL_LEVELS,
+    "param_home_wide_cross": ALL_LEVELS,
 }
 # Two-unit psABI fixtures under interop/: `<name>_callee.c` and
 # `<name>_caller.c`, linked LCCC-with-LCCC and LCCC-with-Clang in both
