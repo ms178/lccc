@@ -9,6 +9,31 @@ use std::path::PathBuf;
 use super::macro_defs::{MacroDef, MacroTable};
 use super::pipeline::Preprocessor;
 
+/// Decide whether a default include path survives a switch to a non-x86
+/// target when no target sysroot is installed.
+///
+/// GCC's private `<prefix>/lib/gcc/<triplet>/<version>/include` directory is
+/// TARGET-NEUTRAL: it owns `stdbool.h`, `stdarg.h`, `stddef.h`, `float.h` and
+/// `iso646.h`. Dropping every path containing "x86_64" (the old AArch64 and
+/// RISC-V setup) made even a trivial translation unit fail without a cross
+/// sysroot. Everything else that mentions x86_64 is ABI-specific and must go:
+/// glibc multiarch directories encode `__WORDSIZE` / `__x86_64__` in
+/// `bits/wordsize.h`, and GCC's `include-fixed` holds a `limits.h` wrapper
+/// that pulls glibc headers which do not exist for the cross target.
+///
+/// Recognise the GCC-private directory by its SHAPE rather than by a
+/// hard-coded `/usr/lib/gcc/x86_64-` prefix: the oracle toolchain may live in
+/// a release-tag cache under `$HOME`, where the old predicate silently
+/// dropped it again. Pure string predicate, so the whole decision matrix is
+/// unit-testable without a filesystem or an installed cross toolchain.
+pub(super) fn keeps_cross_target_include(path: &str) -> bool {
+    if !path.contains("x86_64") {
+        return true;
+    }
+    let normalized = path.trim_end_matches('/');
+    normalized.contains("/gcc/") && normalized.ends_with("/include")
+}
+
 /// LCCC_SYSROOT-aware candidate mapping for built-in include discovery.
 ///
 /// This legacy overlay is not GNU `--sysroot`: when `LCCC_SYSROOT` is set,
@@ -1242,10 +1267,8 @@ impl Preprocessor {
                 // insert_arch_paths_after_bundled, so they take precedence;
                 // x86_64 *glibc* multiarch headers are still removed because
                 // bits/wordsize.h there encodes __WORDSIZE for __x86_64__.
-                self.system_include_paths.retain(|p| {
-                    let s = p.to_string_lossy();
-                    s.contains("/usr/lib/gcc/x86_64-") || !s.contains("x86_64")
-                });
+                self.system_include_paths
+                    .retain(|p| keeps_cross_target_include(&p.to_string_lossy()));
                 let aarch64_paths = [
                     "/usr/lib/gcc/aarch64-linux-gnu/16/include",
                     "/usr/lib/gcc/aarch64-linux-gnu/15/include",
@@ -1324,10 +1347,8 @@ impl Preprocessor {
                 // insert_arch_paths_after_bundled, so they take precedence;
                 // x86_64 *glibc* multiarch headers are still removed because
                 // bits/wordsize.h there encodes __WORDSIZE for __x86_64__.
-                self.system_include_paths.retain(|p| {
-                    let s = p.to_string_lossy();
-                    s.contains("/usr/lib/gcc/x86_64-") || !s.contains("x86_64")
-                });
+                self.system_include_paths
+                    .retain(|p| keeps_cross_target_include(&p.to_string_lossy()));
                 let riscv_paths = [
                     "/usr/lib/gcc/riscv64-linux-gnu/16/include",
                     "/usr/lib/gcc/riscv64-linux-gnu/15/include",
@@ -1875,5 +1896,70 @@ mod sse_macro_tests {
         assert!(pp.macros.is_defined("__MMX_WITH_SSE__"));
         pp.set_sse_macros(true, false, true); // denial again clears it
         assert!(!pp.macros.is_defined("__MMX_WITH_SSE__"));
+    }
+}
+
+#[cfg(test)]
+mod cross_target_include_tests {
+    use super::keeps_cross_target_include;
+
+    /// The whole decision matrix: the two layouts that motivated the
+    /// shape-based rule, the ABI-specific paths that must NOT survive, and
+    /// the non-x86 paths that are unaffected. A hard-coded
+    /// `/usr/lib/gcc/x86_64-` prefix fails case 4 (the CI oracle cache).
+    #[test]
+    fn only_target_neutral_paths_survive_a_cross_target_switch() {
+        const CASES: &[(&str, bool)] = &[
+            // GCC-private include dirs are target-neutral: KEEP.
+            ("/usr/lib/gcc/x86_64-linux-gnu/12/include", true),
+            ("/usr/lib/gcc/x86_64-redhat-linux/16/include", true),
+            ("/usr/lib/gcc/x86_64-linux-gnu/12/include/", true),
+            (
+                "/home/runner/.cache/lccc/gcc-oracle/16.2/lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+                true,
+            ),
+            // Non-x86 paths are unaffected: KEEP.
+            ("/usr/lib/gcc/aarch64-linux-gnu/16/include", true),
+            ("/usr/lib/gcc/riscv64-linux-gnu/16/include", true),
+            ("/usr/include", true),
+            ("/usr/local/include", true),
+            ("/opt/lccc/include", true),
+            // ABI-specific x86_64 paths must be removed: DROP.
+            ("/usr/include/x86_64-linux-gnu", false),
+            ("/usr/include/x86_64-pc-linux-gnu", false),
+            ("/usr/lib/gcc/x86_64-linux-gnu/12/include-fixed", false),
+            ("/usr/lib/x86_64-linux-gnu", false),
+            ("/opt/gcc/x86_64-wrappers", false),
+        ];
+        for (path, want) in CASES {
+            assert_eq!(
+                keeps_cross_target_include(path),
+                *want,
+                "include path {path}"
+            );
+        }
+        assert_eq!(CASES.len(), 14, "decision matrix must stay explicit");
+    }
+
+    /// Total over degenerate spellings: no panic, no indexing, no accidental
+    /// "no x86_64 means keep" escape for a truncated x86_64-only path.
+    #[test]
+    fn predicate_is_total_over_degenerate_spellings() {
+        for path in [
+            "",
+            "x86_64",
+            "/",
+            "/gcc/",
+            "x86_64/include",
+            "/gcc/x86_64/include/",
+        ] {
+            let _ = keeps_cross_target_include(path);
+        }
+        assert!(keeps_cross_target_include("/gcc/x86_64/include/"));
+        assert!(!keeps_cross_target_include("x86_64"));
+        // A bare relative name has no arch marker, so it is kept; the
+        // include-fixed DROP case needs the x86_64 marker (see CASES above).
+        assert!(keeps_cross_target_include("include-fixed"));
+        assert!(!keeps_cross_target_include("/gcc/x86_64/include-fixed"));
     }
 }
