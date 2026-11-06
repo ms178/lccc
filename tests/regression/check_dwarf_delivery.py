@@ -158,6 +158,42 @@ def check_assembly(lccc: str, gas: str | None, gcc: str, gdb: str | None,
                 results[f"assembly-{label}-{name}"] = "PASS"
 
 
+def check_unsupported_debug_flags(lccc: str, root: Path, results: dict) -> None:
+    """D8/D9/D11: unimplemented debug transports must not masquerade as done.
+
+    `-g3` currently carries the `-g` macro-free payload, `-gz` emits
+    uncompressed sections, and `-gsplit-dwarf` emits a non-split unit.  The
+    driver warns for the latter two; this gate pins that the object does not
+    silently acquire a macro table, a compressed section, or a `.dwo` side file.
+    """
+    cwd = root / "unsupported-debug-flags"
+    cwd.mkdir()
+    source = cwd / "flags.c"
+    source.write_text(SOURCE)
+    cases = (
+        ("-g3", None, (".debug_macro", ".debug_macinfo")),
+        ("-gz", "compressed debug sections", (".zdebug_info", ".zdebug_line")),
+        ("-gz=zlib", "compressed debug sections", (".zdebug_info", ".zdebug_line")),
+        ("-gsplit-dwarf", "-gsplit-dwarf is not supported", (".debug_info.dwo", ".debug_abbrev.dwo")),
+    )
+    for flag, warning, absent in cases:
+        obj = cwd / f"{flag.replace('=', '_').replace('-', '_')}.o"
+        result = run([lccc, "-O0", "-g", flag, "-c", str(source), "-o", str(obj)], cwd)
+        if result.returncode != 0:
+            raise AssertionError(f"{flag}: compile failed: {result.stderr}")
+        if warning is not None and warning not in result.stderr:
+            raise AssertionError(f"{flag}: expected warning containing {warning!r}, got {result.stderr!r}")
+        elf = q.read_elf(obj)
+        if ".debug_info" not in elf.sections:
+            raise AssertionError(f"{flag}: -g payload disappeared")
+        for name in absent:
+            if name in elf.sections:
+                raise AssertionError(f"{flag}: emitted unsupported section {name}")
+        if flag == "-gsplit-dwarf" and list(cwd.glob("*.dwo")):
+            raise AssertionError("-gsplit-dwarf: emitted a .dwo side file")
+        results[f"unsupported{flag}"] = "PASS"
+
+
 def check_paths(lccc: str, gas: str | None, root: Path, results: dict) -> None:
     logical = "."
     objects: dict[str, bytes] = {}
@@ -258,6 +294,7 @@ def main() -> int:
     try:
         with tempfile.TemporaryDirectory(prefix="dwarf-delivery-") as directory:
             root = Path(directory)
+            check_unsupported_debug_flags(lccc, root, results)
             check_assembly(lccc, gas, gcc, gdb, root, results)
             for name, value, bits, execute in (
                     ("i686", args.lccc_i686, 32, True),

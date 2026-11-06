@@ -23,7 +23,8 @@ over-aligned adjusted homes, `.debug_macro`, `-gz`, split DWARF and
 D1b/D14. The historical census below is kept for provenance, but the current
 acceptance evidence is the dedicated gates: `check_dwarf_parameters.py` (32
 contracts), `check_dwarf_locals.py` (48 contracts including shadowing and
-AArch64/RISC-V structural legs), `check_dwarf_delivery.py` (52 contracts), and
+AArch64/RISC-V structural legs), `check_dwarf_delivery.py` (56 contracts,
+including unsupported `-g3`/`-gz`/`-gsplit-dwarf` transport pins), and
 `check_dwarf_quality.py` (30 objects, 0 failures, 2 named optimized gaps).
 
 ---
@@ -616,7 +617,9 @@ capability limit, not a guessed location.
 
 **Evidence.** `check_dwarf_locals.py --lccc target/fastbuild/lccc --lccc-arm
 target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv --gcc gcc-16
---gdb "$GDB"`: PASS 48 contracts. GDB reads inner shadowed `x = 17` and outer
+--gdb "$GDB"`: PASS 48 contracts. The structural leg now also decodes the
+`shadow` subprogram's lexical-block DIEs (the earlier loop only inspected
+`locals`, so the tree assertion was skipped). GDB reads inner shadowed `x = 17` and outer
 `x = 8`; the decoder asserts one outer variable under the subprogram and one
 inner variable under a lexical block. AArch64/RISC-V legs assert the frame
 register and code-byte equality without pretending the x86-only pinned GDB ran
@@ -731,6 +734,8 @@ one macro unit per file, imported with `DW_MACRO_import` for headers. Only at
 
 **Gate.** A probe with two macros; assert both are present with the right line
 and replacement text, and that `-g2`/`-g` emits no `.debug_macro` at all.
+**Interim pin.** `check_dwarf_delivery.py` asserts `-g3` does not silently emit
+`.debug_macro`/`.debug_macinfo` while the feature is absent.
 
 ### D9 · P2 · S — `-gz` must compress or be refused
 
@@ -749,6 +754,8 @@ ignoring it.
 
 **Gate.** Assert `SHF_COMPRESSED` is set, and that the gate's own decoder reads
 the sections back (it already decompresses).
+**Interim pin.** `check_dwarf_delivery.py` asserts `-gz`/`-gz=zlib` warn and do
+not emit `.zdebug_*` sections while compression is absent.
 
 ### D10 · P2 · S — `-fdebug-prefix-map` / `-ffile-prefix-map`
 
@@ -781,6 +788,8 @@ coordinate with the driver so the `.dwo` lands next to the object.
 **Gate.** Assert the object's `.debug_info` is a skeleton unit with
 `DW_AT_dwo_name`, the `.dwo` exists and holds the tree, and a consumer that
 follows `DW_AT_dwo_name` resolves `pq_global`.
+**Interim pin.** `check_dwarf_delivery.py` asserts `-gsplit-dwarf` warns and
+emits neither a `.dwo` side file nor `.dwo` sections while split DWARF is absent.
 
 ### D12 · P3 · M — `.debug_names` (DWARF 5 name index)
 

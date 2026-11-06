@@ -150,7 +150,8 @@ def check_locations(label: str, path: Path) -> None:
     located_parameters: set[str] = set()
     for unit in units(elf):
         for subprogram in unit.by_tag(DW_TAG_SUBPROGRAM):
-            if die_name(subprogram, unit) != "locals":
+            function_name = die_name(subprogram, unit)
+            if function_name not in {"locals", "shadow"}:
                 continue
             for die in children(unit, subprogram):
                 if die.tag == DW_TAG_FORMAL_PARAMETER and DW_AT_LOCATION in die.attrs:
@@ -162,7 +163,7 @@ def check_locations(label: str, path: Path) -> None:
                 name = die_name(die, unit)
                 located.add(name)
                 check_parameter_location(report, elf, unit, die, subprogram, label, name)
-            if die_name(subprogram, unit) == "shadow":
+            if function_name == "shadow":
                 outer = [die for die in children(unit, subprogram)
                          if die.tag == DW_TAG_VARIABLE and die_name(die, unit) == "x"
                          and DW_AT_LOCATION in die.attrs]
