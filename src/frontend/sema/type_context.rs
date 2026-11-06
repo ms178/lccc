@@ -369,6 +369,25 @@ pub struct TypeContext {
     pub scope_stack: RefCell<Vec<TypeScopeFrame>>,
     /// Complete tag definitions at translation-unit scope (no disposable frame).
     pub file_scope_tag_definitions: RefCell<FxHashMap<String, TagDefinitionSites>>,
+    /// Record layouts installed while a lexical scope was open -- that is, from
+    /// inside a function body -- keyed by the address of the layout they
+    /// installed.
+    ///
+    /// Two `struct T`s with different members, one at file scope and one in a
+    /// body, share the type key `struct.T`; installing the second replaces the
+    /// first's layout until `pop_scope` restores it.  The DWARF writer runs
+    /// after every body has been lowered, so it cannot tell from the key alone
+    /// which definition an object was declared with.  It asks this table
+    /// instead, and the `Rc` is kept alive here so a later definition cannot
+    /// reuse the address and inherit the mark.
+    ///
+    /// Nothing is recorded until `start_tracking_body_record_layouts` is called:
+    /// analysis installs layouts too, and its `Rc`s are not the ones lowering
+    /// hands the writer.  Lowering starts the table for a `-g` build only, so a
+    /// release compile neither fills nor keeps it.
+    body_record_layouts: RefCell<FxHashMap<usize, RcLayout>>,
+    /// Whether the table above is live; see `start_tracking_body_record_layouts`.
+    track_body_record_layouts: std::cell::Cell<bool>,
     /// Counter for anonymous struct/union CType keys generated from &self contexts.
     /// Uses Cell for interior mutability since type_spec_to_ctype takes &self.
     anon_ctype_counter: std::cell::Cell<u32>,
@@ -415,6 +434,8 @@ impl TypeContext {
             // and frame index N corresponds to lexical depth N + 1.
             scope_stack: RefCell::new(Vec::new()),
             file_scope_tag_definitions: RefCell::new(FxHashMap::default()),
+            body_record_layouts: RefCell::new(FxHashMap::default()),
+            track_body_record_layouts: std::cell::Cell::new(false),
             anon_ctype_counter: std::cell::Cell::new(0),
             struct_variant_counter: std::cell::Cell::new(0),
             constexpr_compound_literals: FxHashMap::default(),
@@ -766,6 +787,36 @@ impl TypeContext {
         self.struct_layouts
             .borrow_mut()
             .insert(key.to_string(), Rc::new(layout));
+    }
+
+    /// The address of the layout `key` currently holds, when that layout was
+    /// installed from inside a function body.
+    ///
+    /// The address is the identity of the definition: installing a definition
+    /// allocates a fresh `Rc`, so two definitions of one tag never share it.
+    /// `None` means the layout came from file scope, or there is none at all.
+    pub fn body_record_layout_id(&self, key: &str) -> Option<usize> {
+        let layouts = self.struct_layouts.borrow();
+        let layout = layouts.get(key)?;
+        let identity = Rc::as_ptr(layout) as usize;
+        self.body_record_layouts
+            .borrow()
+            .contains_key(&identity)
+            .then_some(identity)
+    }
+
+    /// Start recording body-scope record definitions, discarding anything
+    /// recorded so far.
+    ///
+    /// Called once when lowering begins, and only for a `-g` build.  Analysis
+    /// also installs layouts while its scopes are open, but its `Rc`s are not
+    /// the ones lowering hands the writer, and reusing those addresses would
+    /// describe the wrong definition; lowering re-installs every definition it
+    /// needs, so the table is rebuilt from this point and then describes exactly
+    /// the layouts the writer will see.
+    pub fn start_tracking_body_record_layouts(&self) {
+        self.body_record_layouts.borrow_mut().clear();
+        self.track_body_record_layouts.set(true);
     }
 
     /// Check if a struct key is currently shadowed by an inner scope redefinition.
@@ -1128,6 +1179,8 @@ impl TypeContext {
     /// Insert a struct layout, tracking the change in the current scope frame
     /// so it can be undone on scope exit.
     pub fn insert_struct_layout_scoped(&mut self, key: String, layout: StructLayout) {
+        let in_body =
+            self.track_body_record_layouts.get() && !self.scope_stack.get_mut().is_empty();
         let layouts = self.struct_layouts.get_mut();
         if let Some(frame) = self.scope_stack.get_mut().last_mut() {
             if let Some(prev) = layouts.get(&key).cloned() {
@@ -1136,7 +1189,13 @@ impl TypeContext {
                 frame.struct_layouts_added.push(key.clone());
             }
         }
-        layouts.insert(key, Rc::new(layout));
+        let installed = Rc::new(layout);
+        if in_body {
+            self.body_record_layouts
+                .get_mut()
+                .insert(Rc::as_ptr(&installed) as usize, Rc::clone(&installed));
+        }
+        layouts.insert(key, installed);
     }
 
     /// Insert a typedef, tracking the change in the current scope frame
@@ -1299,14 +1358,20 @@ impl TypeContext {
     pub fn insert_struct_layout_scoped_from_ref(&self, key: &str, layout: StructLayout) {
         let mut layouts = self.struct_layouts.borrow_mut();
         let mut stack = self.scope_stack.borrow_mut();
+        let installed = Rc::new(layout);
         if let Some(frame) = stack.last_mut() {
             if let Some(prev) = layouts.get(key).cloned() {
                 frame.struct_layouts_shadowed.push((key.to_string(), prev));
             } else {
                 frame.struct_layouts_added.push(key.to_string());
             }
+            if self.track_body_record_layouts.get() {
+                self.body_record_layouts
+                    .borrow_mut()
+                    .insert(Rc::as_ptr(&installed) as usize, Rc::clone(&installed));
+            }
         }
-        layouts.insert(key.to_string(), Rc::new(layout));
+        layouts.insert(key.to_string(), installed);
     }
 
     /// Invalidate a ctype_cache entry from a &self context, tracking the change
