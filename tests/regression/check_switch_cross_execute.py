@@ -36,6 +36,7 @@ FIXTURES = (
     "predicate_inverted_signed_cmp_cross", "word_reload_sign_extension_cross",
     "leaf_params_fp_domain_cross", "vector_fma_families_cross", "call_args_and_pool_regs_cross",
     "fp_sign_and_vector_fms_cross", "int_mul_const_and_fp_int_cast_cross",
+    "int_cmp_const_select_cross",
 )
 ALL_LEVELS = ("-O0", "-O1", "-O2", "-Os")
 LEVELS = {
@@ -113,6 +114,14 @@ LEVELS = {
     # into shifted adds in place and hoists the rest (and, on RV64, every
     # nonzero compare operand).
     "int_mul_const_and_fp_int_cast_cross": ALL_LEVELS + ("-O3",),
+    # RV64: a materialized compare against a constant takes the I-type form
+    # (`xori`+`seqz`/`snez`, `slti`/`sltiu` with `x <= k` as `x < k + 1`,
+    # `slt t0, zero, t1` for `x > 0`) at every type, with the constant on
+    # either side, and `if (c) n++` lowers to `seqz`/`snez` + `add[w]`
+    # instead of a branch -- except a U32 increment under a 64-bit
+    # conditional, which must wrap at 32 bits and zero-extend. The loop
+    # constant hoist keeps the constants those forms encode in place.
+    "int_cmp_const_select_cross": ALL_LEVELS + ("-O3",),
 }
 # Two-unit psABI fixtures under interop/: `<name>_callee.c` and
 # `<name>_caller.c`, linked LCCC-with-LCCC and LCCC-with-Clang in both

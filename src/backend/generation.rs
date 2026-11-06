@@ -4346,6 +4346,7 @@ struct ConditionalIncrementFusion {
     cmp_idx: Option<usize>,
     base: Operand,
     increment_ty: IrType,
+    select_ty: IrType,
     increment_on_true: bool,
 }
 
@@ -4497,6 +4498,7 @@ fn detect_conditional_increment_selects(
                 cmp_idx,
                 base: base.clone(),
                 increment_ty: *add_ty,
+                select_ty: *ty,
                 increment_on_true,
             });
             break;
@@ -7235,12 +7237,17 @@ fn generate_function_body(
             } else {
                 Vec::new()
             };
-        let conditional_increment_fusions =
-            if cg.supports_conditional_increment_select() && !env_flag_set("CCC_NO_CSINC_FOLD") {
-                detect_conditional_increment_selects(block, &value_use_counts, &stab)
-            } else {
-                Vec::new()
-            };
+        let conditional_increment_fusions = if cg.supports_conditional_increment_select()
+            && !env_flag_set("CCC_NO_CSINC_FOLD")
+        {
+            let mut fusions = detect_conditional_increment_selects(block, &value_use_counts, &stab);
+            fusions.retain(|fusion| {
+                cg.accepts_conditional_increment_widths(fusion.increment_ty, fusion.select_ty)
+            });
+            fusions
+        } else {
+            Vec::new()
+        };
         let conditional_increment_adds: FxHashSet<usize> = conditional_increment_fusions
             .iter()
             .map(|fusion| fusion.add_idx)

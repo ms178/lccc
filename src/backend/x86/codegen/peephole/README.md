@@ -819,6 +819,7 @@ the `CCC_PEEPHOLE_SKIP` values that disable it.
 | 4e | `ebb_reuse` | `ebb_reuse.rs` | delete copies/compares a single-predecessor path already established |
 | 4e | `copy_sink` | `ebb_reuse.rs` | move a copy only the fall-through arm reads past its `jcc` |
 | 4e | `dead_flag_writes` | `mod.rs` | retire flag-only writes the deletions left dead |
+| 2 | `fp_load_retarget` | `memory_fold.rs` | `movsd M, %xmmA; …; movapd %xmmA, %xmmB` -> `…; movsd M, %xmmB` when `%xmmA` dies at the copy |
 | 6 | `scratch_rename` | `callee_saves.rs` | move a call-free function's saved value into an unnamed `%r11`/`%r10` so Phase 6 drops its `push`/`pop` pair (reverted when the pair survives) |
 | 8d' | `sign_test` | `sign_test.rs` | sign test as copy/load + shift (below) |
 | 8e | `arm_head_hoist` | `jump_thread.rs` | hoist identical arm heads above their `jcc` |

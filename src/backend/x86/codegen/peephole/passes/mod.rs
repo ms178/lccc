@@ -974,6 +974,15 @@ fn peephole_optimize_inner(
                 changed |= c;
             }
         }
+        // Load straight into the register a whole-register copy fills from
+        // the loaded one (`movsd M, %xmmA; …; movapd %xmmA, %xmmB`).
+        if !sk("fp_load_retarget") {
+            {
+                let c = memory_fold::retarget_fp_load_into_copy(&mut store, &mut infos);
+                trace("retarget_fp_load_into_copy", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
         // Fold a single-use scalar FP load into an adjacent scalar FMA's
         // memory operand — any role the form algebra can put there (the
         // dot-product src2 shape is just the most common one).
@@ -1973,6 +1982,9 @@ fn peephole_optimize_inner(
             if !sk("fp_reg_mem_fold") {
                 changed2 |= memory_fold::fold_fp_register_loads(&mut store, &mut infos);
             }
+            if !sk("fp_load_retarget") {
+                changed2 |= memory_fold::retarget_fp_load_into_copy(&mut store, &mut infos);
+            }
             if !sk("fp_const_hoist") {
                 changed2 |= memory_fold::hoist_repeated_fp_constant_loads(&mut store, &mut infos);
             }
@@ -2146,6 +2158,9 @@ fn peephole_optimize_inner(
             changed3 |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
             if !sk("fp_reg_mem_fold") {
                 changed3 |= memory_fold::fold_fp_register_loads(&mut store, &mut infos);
+            }
+            if !sk("fp_load_retarget") {
+                changed3 |= memory_fold::retarget_fp_load_into_copy(&mut store, &mut infos);
             }
             changed3 |= local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos);
             changed3 |= local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos);

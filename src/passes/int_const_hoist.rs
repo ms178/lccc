@@ -17,7 +17,9 @@ use super::loop_analysis;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::analysis;
-use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
+use crate::ir::reexports::{
+    Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Terminator, Value,
+};
 use std::cell::Cell;
 
 /// Target immediate-encoding model that drives the hoist decision. One
@@ -59,6 +61,92 @@ pub(crate) fn model_for(target: crate::backend::Target) -> Option<ImmModel> {
         crate::backend::Target::Riscv64 => Some(ImmModel::Riscv),
         crate::backend::Target::X86_64 => Some(ImmModel::X86_64),
         _ => None,
+    }
+}
+
+/// Whether an operand position can encode a constant in place, which the
+/// hoist criterion ([`large_int_const_in`]) weighs against the constant.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RegNeed {
+    /// The position has an immediate form (within the target's range).
+    Imm,
+    /// The position has no immediate form at all: div/rem everywhere, mul
+    /// on AArch64 and RISC-V.
+    Reg,
+    /// A RISC-V compare operand. A compare fused into a branch compares two
+    /// registers; a materialized boolean compares in place exactly when the
+    /// backend has an I-type form for the constant
+    /// (`riscv::codegen::cmp_needs_no_register`).
+    RiscvCmp {
+        op: IrCmpOp,
+        const_on_rhs: bool,
+        ty: IrType,
+        branch: bool,
+    },
+}
+
+impl RegNeed {
+    /// Whether this position stages the constant `c` in a register.
+    fn for_const(self, c: &IrConst) -> bool {
+        match self {
+            RegNeed::Imm => false,
+            RegNeed::Reg => true,
+            RegNeed::RiscvCmp {
+                op,
+                const_on_rhs,
+                ty,
+                branch,
+            } => {
+                branch
+                    || !crate::backend::riscv::codegen::cmp_needs_no_register(
+                        op,
+                        const_on_rhs,
+                        c,
+                        ty,
+                    )
+            }
+        }
+    }
+}
+
+/// The compares of `func` whose boolean may feed a conditional branch:
+/// the value a `CondBranch` tests, followed back through `Copy` and integer
+/// `Cast` (the chain the backends' compare-branch fusion follows). A superset
+/// of the fused compares on purpose -- misclassifying a fused compare as
+/// materialized would leave its constant un-hoisted, a `li` per branch.
+fn branch_compares(func: &IrFunction) -> FxHashSet<u32> {
+    let mut tested: FxHashSet<u32> = func
+        .blocks
+        .iter()
+        .filter_map(|b| match &b.terminator {
+            Terminator::CondBranch {
+                cond: Operand::Value(v),
+                ..
+            } => Some(v.0),
+            _ => None,
+        })
+        .collect();
+    loop {
+        let before = tested.len();
+        for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+            match inst {
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Value(src),
+                }
+                | Instruction::Cast {
+                    dest,
+                    src: Operand::Value(src),
+                    ..
+                } if tested.contains(&dest.0) => {
+                    tested.insert(src.0);
+                }
+                _ => {}
+            }
+        }
+        if tested.len() == before {
+            return tested;
+        }
     }
 }
 
@@ -131,6 +219,7 @@ pub(crate) fn const_homes(func: &IrFunction, model: ImmModel) -> FxHashSet<u32> 
     if consts.is_empty() {
         return homes;
     }
+    let branch_cmps = branch_compares(func);
     for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
         // Whether value `v`, holding `c`, is the factor of a multiply the
         // backend expands once `c` is forwarded into it.
@@ -153,14 +242,14 @@ pub(crate) fn const_homes(func: &IrFunction, model: ImmModel) -> FxHashSet<u32> 
             }
             _ => false,
         };
-        for_each_int_operand_in(model, inst, &mut |op, needs_reg, imm32_exact| {
+        for_each_int_operand_in(model, &branch_cmps, inst, &mut |op, need, imm32_exact| {
             if let Operand::Value(v) = op {
                 if let Some(Some(c)) = consts.get(&v.0) {
                     if expanded_factor(v.0, c) {
                         return;
                     }
                     let op = Operand::Const(*c);
-                    if large_int_const_in(model, &op, needs_reg, imm32_exact).is_some() {
+                    if large_int_const_in(model, &op, need, imm32_exact).is_some() {
                         homes.insert(v.0);
                     }
                 }
@@ -189,6 +278,9 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     if loops.is_empty() {
         return 0;
     }
+    // Rewriting operands touches neither compare destinations nor
+    // terminators, so one census serves every loop.
+    let branch_cmps = branch_compares(func);
     // Outermost first so constants used by nested loops hoist as far out as
     // possible and inner loops can reuse the dominating value.
     loops.sort_by_key(|l| l.body.len());
@@ -201,8 +293,8 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
             let mut set = FxHashSet::default();
             for &bi in &lp.body {
                 for inst in &func.blocks[bi].instructions {
-                    for_each_int_operand(inst, &mut |op, needs_reg, imm32_exact| {
-                        if let Some(bits) = large_int_const(op, needs_reg, imm32_exact) {
+                    for_each_int_operand(&branch_cmps, inst, &mut |op, need, imm32_exact| {
+                        if let Some(bits) = large_int_const(op, need, imm32_exact) {
                             set.insert(bits);
                         }
                     });
@@ -226,8 +318,8 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         let mut seen: FxHashSet<u64> = FxHashSet::default();
         for &bi in &lp.body {
             for inst in &func.blocks[bi].instructions {
-                for_each_int_operand(inst, &mut |op, needs_reg, imm32_exact| {
-                    if let Some(bits) = large_int_const(op, needs_reg, imm32_exact) {
+                for_each_int_operand(&branch_cmps, inst, &mut |op, need, imm32_exact| {
+                    if let Some(bits) = large_int_const(op, need, imm32_exact) {
                         if seen.insert(bits) {
                             consts.push(bits);
                         }
@@ -309,11 +401,12 @@ fn leaf_subloops(loops: &[loop_analysis::NaturalLoop]) -> Vec<Vec<usize>> {
 
 /// Whether `run` would hoist anything for this loop.
 fn loop_has_candidate(func: &IrFunction, lp: &loop_analysis::NaturalLoop) -> bool {
+    let branch_cmps = branch_compares(func);
     let mut found = false;
     for &bi in &lp.body {
         for inst in &func.blocks[bi].instructions {
-            for_each_int_operand(inst, &mut |op, needs_reg, imm32_exact| {
-                found |= large_int_const(op, needs_reg, imm32_exact).is_some();
+            for_each_int_operand(&branch_cmps, inst, &mut |op, need, imm32_exact| {
+                found |= large_int_const(op, need, imm32_exact).is_some();
             });
             if found {
                 return true;
@@ -349,15 +442,15 @@ fn loop_has_candidate(func: &IrFunction, lp: &loop_analysis::NaturalLoop) -> boo
 /// pattern (x86-64 32-bit ALU/imul/cmp forms) rather than sign-extending it.
 ///
 /// Returns the value as u64 bits.
-fn large_int_const(op: &Operand, needs_reg: bool, imm32_exact: bool) -> Option<u64> {
-    large_int_const_in(MODEL.with(|c| c.get()), op, needs_reg, imm32_exact)
+fn large_int_const(op: &Operand, need: RegNeed, imm32_exact: bool) -> Option<u64> {
+    large_int_const_in(MODEL.with(|c| c.get()), op, need, imm32_exact)
 }
 
 /// [`large_int_const`] under an explicit model.
 fn large_int_const_in(
     model: ImmModel,
     op: &Operand,
-    needs_reg: bool,
+    need: RegNeed,
     imm32_exact: bool,
 ) -> Option<u64> {
     let v: i64 = match op {
@@ -366,6 +459,10 @@ fn large_int_const_in(
         Operand::Const(IrConst::I32(v)) => *v as i64,
         Operand::Const(IrConst::I64(v)) => *v,
         _ => return None,
+    };
+    let needs_reg = match op {
+        Operand::Const(c) => need.for_const(c),
+        Operand::Value(_) => return None,
     };
     if model == ImmModel::Riscv {
         // RISC-V: add/sub/and/or/xor and the shifts take an imm12 operand
@@ -379,9 +476,9 @@ fn large_int_const_in(
         // shift and an add never reach `for_each_int_operand_in`'s callback,
         // and zero is the `x0` register everywhere.
         //
-        // PREMISE: the compare staging is register-only. If the backend
-        // grows `slti`/`sltiu` forms for materialized compares, an imm12
-        // operand there is free again (branches still take registers only).
+        // A materialized compare whose constant an I-type form holds
+        // (`xori`/`slti`/`sltiu`, see `RegNeed::RiscvCmp`) is not a
+        // register position; a compare fused into a branch still is.
         if v == 0 || ((-2048..=2047).contains(&v) && !needs_reg) {
             return None; // `x0`, or an I-type immediate -- free in place
         }
@@ -463,28 +560,34 @@ fn mul_expanded(model: ImmModel, c: u64, ty: IrType) -> bool {
 /// constant pays a materialization there (Lev Kropp's 558e3ed9 insight,
 /// generalized per target). A multiplier the target expands into shifted
 /// adds is not visited at all.
-fn for_each_int_operand(inst: &Instruction, f: &mut dyn FnMut(&Operand, bool, bool)) {
-    for_each_int_operand_in(MODEL.with(|c| c.get()), inst, f);
+fn for_each_int_operand(
+    branch_cmps: &FxHashSet<u32>,
+    inst: &Instruction,
+    f: &mut dyn FnMut(&Operand, RegNeed, bool),
+) {
+    for_each_int_operand_in(MODEL.with(|c| c.get()), branch_cmps, inst, f);
 }
 
 /// [`for_each_int_operand`] under an explicit immediate model.
+/// `branch_cmps` is the function's [`branch_compares`].
 fn for_each_int_operand_in(
     model: ImmModel,
+    branch_cmps: &FxHashSet<u32>,
     inst: &Instruction,
-    f: &mut dyn FnMut(&Operand, bool, bool),
+    f: &mut dyn FnMut(&Operand, RegNeed, bool),
 ) {
     match inst {
         Instruction::BinOp {
             op, lhs, rhs, ty, ..
         } => {
-            let needs_reg = match op {
-                IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem => true,
+            let need = match op {
+                IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem => RegNeed::Reg,
                 // AArch64 and RISC-V `mul` have no immediate form while
                 // their neighbours take imm12, so a small constant is a
                 // materialization ONLY at that position. x86-64 `imul`
                 // takes an imm32.
-                IrBinOp::Mul => model != ImmModel::X86_64,
-                _ => false,
+                IrBinOp::Mul if model != ImmModel::X86_64 => RegNeed::Reg,
+                _ => RegNeed::Imm,
             };
             // Shift counts are a separate encoding (imm8 / %cl) and never take
             // a 32-bit immediate, so they get no bit-pattern relaxation.
@@ -508,24 +611,38 @@ fn for_each_int_operand_in(
                     && const_bits(factor).is_some_and(|c| mul_expanded(model, c, *ty))
             };
             if !expanded(lhs, rhs) {
-                f(lhs, needs_reg, imm32_exact);
+                f(lhs, need, imm32_exact);
             }
             if !expanded(rhs, lhs) {
-                f(rhs, needs_reg, imm32_exact);
+                f(rhs, need, imm32_exact);
             }
         }
-        Instruction::Cmp { lhs, rhs, ty, .. } => {
+        Instruction::Cmp {
+            dest,
+            op,
+            lhs,
+            rhs,
+            ty,
+        } => {
             // `cmpl $imm32` takes the bit pattern verbatim (comparison.rs
             // computes `use_32bit` from the same type). Narrower compares use
             // imm8/imm16 and get no relaxation.
             let imm32_exact = matches!(ty, IrType::I32 | IrType::U32);
-            // RISC-V branches compare two registers and the backend's `slt`
-            // staging takes no immediate either, so every compare operand
-            // but zero (`x0`) is a `li` per evaluation -- `i < 100` cost a
-            // `li` on every iteration of its loop.
-            let needs_reg = model == ImmModel::Riscv;
-            f(lhs, needs_reg, imm32_exact);
-            f(rhs, needs_reg, imm32_exact);
+            // RISC-V branches compare two registers, so every operand of a
+            // branch compare but zero (`x0`) is a `li` per evaluation --
+            // `i < 100` cost a `li` on every iteration of its loop. A
+            // materialized boolean takes `xori`/`slti`/`sltiu` in place.
+            let need = |const_on_rhs: bool| match model {
+                ImmModel::Riscv => RegNeed::RiscvCmp {
+                    op: *op,
+                    const_on_rhs,
+                    ty: *ty,
+                    branch: branch_cmps.contains(&dest.0),
+                },
+                _ => RegNeed::Imm,
+            };
+            f(lhs, need(false), imm32_exact);
+            f(rhs, need(true), imm32_exact);
         }
         _ => {}
     }
@@ -739,11 +856,15 @@ mod tests {
             ty: IrType::U32,
         };
         let mut seen = Vec::new();
-        for_each_int_operand(&inst, &mut |op, _needs_reg, imm32_exact| {
-            if matches!(op, Operand::Const(_)) {
-                seen.push(imm32_exact);
-            }
-        });
+        for_each_int_operand(
+            &FxHashSet::default(),
+            &inst,
+            &mut |op, _need, imm32_exact| {
+                if matches!(op, Operand::Const(_)) {
+                    seen.push(imm32_exact);
+                }
+            },
+        );
         assert_eq!(seen, vec![false]);
     }
 
@@ -759,9 +880,13 @@ mod tests {
             ty: IrType::U32,
         };
         let mut hoisted = Vec::new();
-        for_each_int_operand(&inst, &mut |op, needs_reg, imm32_exact| {
-            hoisted.push(large_int_const(op, needs_reg, imm32_exact));
-        });
+        for_each_int_operand(
+            &FxHashSet::default(),
+            &inst,
+            &mut |op, need, imm32_exact| {
+                hoisted.push(large_int_const(op, need, imm32_exact));
+            },
+        );
         assert_eq!(hoisted, vec![None, None]);
     }
 
@@ -902,6 +1027,81 @@ mod tests {
         });
         let mut func = make_bound_loop(100);
         assert_eq!(run(&mut func), 0, "x86-64");
+    }
+
+    /// The `make_op_loop` shape whose body materializes `x <op> k` as a
+    /// boolean (the function's result) instead of feeding a branch.
+    fn make_flag_loop(op: IrCmpOp, ty: IrType, k: IrConst) -> IrFunction {
+        let mut func = make_op_loop(IrBinOp::Add, IrType::I32, IrConst::I32(1));
+        func.blocks[2].instructions[0] = Instruction::Cmp {
+            dest: Value(4),
+            op,
+            lhs: Operand::Value(Value(2)),
+            rhs: Operand::Const(k),
+            ty,
+        };
+        func
+    }
+
+    /// A materialized RISC-V compare takes `xori`/`slti`/`sltiu` in place
+    /// (`riscv::codegen::cmp_needs_no_register`), so its constant stays an
+    /// immediate; only a constant no I-type form holds is hoisted. The
+    /// branch compare of the same loop keeps hoisting
+    /// (`riscv_hoists_a_nonzero_compare_operand`).
+    #[test]
+    fn riscv_materialized_compare_keeps_an_encodable_constant() {
+        with_riscv(|| {
+            for (op, ty, k) in [
+                (IrCmpOp::Eq, IrType::U8, IrConst::I8(32)),
+                (IrCmpOp::Ne, IrType::I32, IrConst::I32(-7)),
+                (IrCmpOp::Slt, IrType::I32, IrConst::I32(100)),
+                (IrCmpOp::Sle, IrType::I32, IrConst::I32(2046)),
+                (IrCmpOp::Ugt, IrType::U8, IrConst::I8(-1)),
+                (IrCmpOp::Ule, IrType::U32, IrConst::I32(25)),
+            ] {
+                let mut func = make_flag_loop(op, ty, k);
+                assert_eq!(run(&mut func), 0, "{op:?} {ty:?} {k:?}");
+            }
+            for (op, ty, k) in [
+                // x <= 2047 needs slti 2048.
+                (IrCmpOp::Sle, IrType::I32, IrConst::I32(2047)),
+                // 0xffffffff after the U32 zero-extension.
+                (IrCmpOp::Ne, IrType::U32, IrConst::I32(-1)),
+                // The unsigned maximum has no `+ 1`.
+                (IrCmpOp::Ule, IrType::I64, IrConst::I64(-1)),
+            ] {
+                let mut func = make_flag_loop(op, ty, k);
+                assert_eq!(run(&mut func), 1, "{op:?} {ty:?} {k:?}");
+            }
+        });
+    }
+
+    /// A boolean that reaches the branch through a copy and a cast is a
+    /// branch compare (the backends' fusion chain), not a materialized one.
+    #[test]
+    fn branch_compares_follow_copies_and_casts() {
+        let mut func = make_op_loop(IrBinOp::Add, IrType::I32, IrConst::I32(1));
+        func.blocks[1].instructions.push(Instruction::Cast {
+            dest: Value(6),
+            src: Operand::Value(Value(3)),
+            from_ty: IrType::I32,
+            to_ty: IrType::I64,
+        });
+        func.blocks[1].instructions.push(Instruction::Copy {
+            dest: Value(7),
+            src: Operand::Value(Value(6)),
+        });
+        func.blocks[1].terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(7)),
+            true_label: BlockId(2),
+            false_label: BlockId(3),
+        };
+        let set = branch_compares(&func);
+        assert!(
+            set.contains(&3) && set.contains(&6) && set.contains(&7),
+            "{set:?}"
+        );
+        assert!(!set.contains(&4), "{set:?}");
     }
 
     /// 2048 is the first value whose `li` expands to lui+addi — the per-iteration
