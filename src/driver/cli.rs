@@ -5526,7 +5526,7 @@ mod cli_tests {
         let d = driver_with(&["-O3", "-fcx-limited-range"]);
         assert!(d.iec_559_conformant(), "real claim must survive");
         assert!(!d.iec_559_complex_conformant(), "complex claim must go");
-        assert_eq!(d.cx_limited_range, true);
+        assert!(d.cx_limited_range);
     }
 
     /// `-funsafe-math-optimizations` is the GROUP
@@ -5535,18 +5535,18 @@ mod cli_tests {
     #[test]
     fn unsafe_math_optimizations_is_a_group_not_a_synonym() {
         let unsafe_d = driver_with(&["-O3", "-funsafe-math-optimizations"]);
-        assert_eq!(unsafe_d.fp_reassoc, true);
-        assert_eq!(unsafe_d.signed_zeros, false);
-        assert_eq!(unsafe_d.reciprocal_math, true);
-        assert_eq!(unsafe_d.no_trapping_math, true);
+        assert!(unsafe_d.fp_reassoc);
+        assert!(!unsafe_d.signed_zeros);
+        assert!(unsafe_d.reciprocal_math);
+        assert!(unsafe_d.no_trapping_math);
         assert!(unsafe_d.associative_math_macro());
 
         let assoc = driver_with(&["-O3", "-fassociative-math"]);
-        assert_eq!(assoc.fp_reassoc, true, "reassociation is shared");
+        assert!(assoc.fp_reassoc, "reassociation is shared");
         // ...but the group's other three members are NOT implied, and GCC
         // keys __ASSOCIATIVE_MATH__ on the unsafe-math flag.
-        assert_eq!(assoc.signed_zeros, true);
-        assert_eq!(assoc.reciprocal_math, false);
+        assert!(assoc.signed_zeros);
+        assert!(!assoc.reciprocal_math);
         assert!(!assoc.associative_math_macro());
     }
 
@@ -5554,11 +5554,11 @@ mod cli_tests {
     #[test]
     fn fast_math_group_is_last_option_wins() {
         let a = driver_with(&["-O3", "-fsigned-zeros", "-ffast-math"]);
-        assert_eq!(a.signed_zeros, false, "umbrella overrides an earlier flag");
+        assert!(!a.signed_zeros, "umbrella overrides an earlier flag");
         assert!(a.fast_math_macro_active());
 
         let b = driver_with(&["-O3", "-ffast-math", "-fsigned-zeros"]);
-        assert_eq!(b.signed_zeros, true, "later flag overrides the umbrella");
+        assert!(b.signed_zeros, "later flag overrides the umbrella");
         assert!(
             !b.fast_math_macro_active(),
             "__FAST_MATH__ must be withdrawn"
@@ -5591,29 +5591,29 @@ mod cli_tests {
     #[test]
     fn umbrella_withdrawal_restores_strict_defaults() {
         let d = driver_with(&["-O3", "-ffast-math", "-fno-fast-math"]);
-        assert_eq!(d.finite_math_only, false);
-        assert_eq!(d.signed_zeros, true);
-        assert_eq!(d.reciprocal_math, false);
-        assert_eq!(d.no_trapping_math, false);
-        assert_eq!(d.unsafe_math_optimizations, false);
+        assert!(!d.finite_math_only);
+        assert!(d.signed_zeros);
+        assert!(!d.reciprocal_math);
+        assert!(!d.no_trapping_math);
+        assert!(!d.unsafe_math_optimizations);
         assert!(d.iec_559_conformant());
         // The one member an *implicit* umbrella leaves behind:
-        assert_eq!(d.cx_limited_range, false);
+        assert!(!d.cx_limited_range);
 
         let implicit = driver_with(&["-Ofast", "-fno-fast-math"]);
-        assert_eq!(implicit.cx_limited_range, true, "GCC keeps -Ofast's copy");
+        assert!(implicit.cx_limited_range, "GCC keeps -Ofast's copy");
 
         let explicit_cx = driver_with(&["-ffast-math", "-fcx-limited-range", "-fno-fast-math"]);
-        assert_eq!(explicit_cx.cx_limited_range, true, "user request survives");
+        assert!(explicit_cx.cx_limited_range, "user request survives");
     }
 
     /// An explicit `-f{,no-}cx-limited-range` survives a later `-O` level.
     #[test]
     fn explicit_cx_limited_range_survives_level_change() {
         let d = driver_with(&["-Ofast", "-fcx-limited-range", "-O2"]);
-        assert_eq!(d.cx_limited_range, true);
+        assert!(d.cx_limited_range);
         let off = driver_with(&["-Ofast", "-fno-cx-limited-range"]);
-        assert_eq!(off.cx_limited_range, false);
+        assert!(!off.cx_limited_range);
     }
 
     /// An explicit `-msse` after `-mno-sse` re-enables (GCC last ISA flag).

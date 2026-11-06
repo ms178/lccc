@@ -653,7 +653,30 @@ impl Lowerer {
         //
         // A signalling NaN raises invalid here exactly as it does for both
         // oracles, which use the same compare.
-        let result = self.emit_cmp_val(IrCmpOp::Ne, arg_val, arg_val, arg_ty);
+        //
+        // F32/F64 ONLY. `IrType` has no F16/BF16 variant: `_Float16` and
+        // `__bf16` reach the IR in a 16-bit *integer* carrier, so `x != x`
+        // on them is an ordinary integer self-comparison, which is
+        // constant-false. That returned 0 for every input -- including NaN --
+        // and broke `gcc16_half_bfloat16_abi`. The narrow formats keep the
+        // bit-pattern test below, which reads the carrier as float bits.
+        //
+        // F128 is excluded the same way: it has already been handled by the
+        // binary128 / libc paths above, and an `IrType::F128` that reaches
+        // here must not be reinterpreted.
+        if matches!(arg_ty, IrType::F32 | IrType::F64) {
+            let result = self.emit_cmp_val(IrCmpOp::Ne, arg_val, arg_val, arg_ty);
+            return Some(Operand::Value(result));
+        }
+        let (bits, int_ty) = self.bitcast_float_to_int(arg_val, arg_ty, &arg_ct);
+        let masks = Self::fp_masks_for(arg_ty, &arg_ct);
+        let abs_val = self.fp_abs_bits(&bits, int_ty, masks.0);
+        let result = self.emit_cmp_val(
+            IrCmpOp::Ugt,
+            Operand::Value(abs_val),
+            Operand::Const(IrConst::I64(masks.1)),
+            int_ty,
+        );
         Some(Operand::Value(result))
     }
 

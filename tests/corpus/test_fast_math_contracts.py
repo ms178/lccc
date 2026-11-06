@@ -444,6 +444,70 @@ class FiniteMathCodegen(_Compile):
         self.assertIn("setp", body, "isnan is not testing the unordered flag")
         self.assertNotIn("movabsq", body, "isnan still materialises a bit mask")
 
+    def test_narrow_float_isnan_is_correct(self) -> None:
+        """`_Float16` and `__bf16` have NO `IrType` variant: they reach the IR
+        in a 16-bit integer carrier. Lowering `__builtin_isnan` on them as
+        `x != x` therefore produced an *integer* self-comparison, which is
+        constant-false, so `isnan(NaN)` returned 0. Both oracles return 1.
+        The narrow formats must keep the bit-pattern test."""
+        src = self.dir / "narrow.c"
+        src.write_text(
+            '#include <stdio.h>\n'
+            'static int n16(_Float16 x){ return __builtin_isnan(x); }\n'
+            'static int b16(__bf16 x){ return __builtin_isnan(x); }\n'
+            'static int f32(float x){ return __builtin_isnan(x); }\n'
+            'static int f64(double x){ return __builtin_isnan(x); }\n'
+            'int main(void){\n'
+            '  volatile _Float16 h = __builtin_nanf16("");\n'
+            '  volatile __bf16 b = (__bf16)__builtin_nanf("");\n'
+            '  volatile float f = __builtin_nanf("");\n'
+            '  volatile double d = __builtin_nan("");\n'
+            '  printf("%d%d%d%d\\n", n16(h), b16(b), f32(f), f64(d));\n'
+            '  return 0;\n'
+            '}\n'
+        )
+        for flags in ("-O0", "-O1", "-O2", "-O3"):
+            with self.subTest(flags=flags):
+                exe = self.dir / "narrow.bin"
+                proc = self.run_lccc(*flags.split(), str(src), "-o", str(exe))
+                self.assertEqual(proc.returncode, 0, proc.stderr[:400])
+                out = subprocess.run([str(exe)], cwd=self.dir,
+                                     capture_output=True, text=True, timeout=60)
+                self.assertEqual(out.stdout.strip(), "1111",
+                                 f"{flags}: isnan on narrow formats is wrong")
+
+    def test_narrow_float_isnan_matches_oracles(self) -> None:
+        """Same fixture, cross-checked against whichever oracle is installed."""
+        src = self.dir / "narrow2.c"
+        src.write_text(
+            '#include <stdio.h>\n'
+            'int main(void){\n'
+            '  volatile _Float16 h = __builtin_nanf16("");\n'
+            '  volatile __bf16 b = (__bf16)__builtin_nanf("");\n'
+            '  printf("%d%d\\n", __builtin_isnan(h), __builtin_isnan(b));\n'
+            '  return 0;\n'
+            '}\n'
+        )
+        for oracle in ("gcc-16", "clang-23"):
+            binary = optional(oracle)
+            if binary is None:
+                continue
+            with self.subTest(oracle=oracle):
+                ours = self.dir / "n2_ours.bin"
+                theirs = self.dir / f"n2_{oracle.replace('-', '_')}.bin"
+                a = self.run_lccc("-O2", str(src), "-o", str(ours))
+                self.assertEqual(a.returncode, 0, a.stderr[:400])
+                b = subprocess.run([binary, "-O2", str(src), "-o", str(theirs)],
+                                   cwd=self.dir, capture_output=True, text=True,
+                                   timeout=60)
+                self.assertEqual(b.returncode, 0, b.stderr[:300])
+                ra = subprocess.run([str(ours)], cwd=self.dir, capture_output=True,
+                                    text=True, timeout=60)
+                rb = subprocess.run([str(theirs)], cwd=self.dir, capture_output=True,
+                                    text=True, timeout=60)
+                self.assertEqual(ra.stdout.strip(), rb.stdout.strip(), oracle)
+                self.assertEqual(ra.stdout.strip(), "11", oracle)
+
     def test_isnan_matches_both_oracles_instruction_for_instruction(self) -> None:
         for oracle in ("gcc-16", "clang-23"):
             binary = optional(oracle)
