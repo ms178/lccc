@@ -665,6 +665,19 @@ def structural_failures(production: bytes, prologues: dict[str, bytes]) -> list[
         bad.append("the resumed general pass re-examines the resolved prefix")
     if b"for i in start..n" not in production:
         bad.append("the general map is no longer restricted to unresolved ordinals")
+    # RED-TEAM round 2: no redundant stores.  `resize(n, None)` before the
+    # aligned probe wrote every home twice; the adjacency vector sized to `n`
+    # initialized `start` entries that no chain could ever reference.
+    if b"pub home_writes: usize" not in production:
+        bad.append("the home-write witness is gone")
+    if b"fn note_home_writes(&mut self, count: usize)" not in production:
+        bad.append("the home-write instrumentation hook is gone")
+    if b"homes.push(Some((*dest, *ty)))" not in production:
+        bad.append("the aligned probe no longer appends without zero-fill")
+    if b"counter.note_home_writes(n - start)" not in production:
+        bad.append("the general pass no longer zero-fills only the tail")
+    if b"vec![usize::MAX; n - start]" not in production:
+        bad.append("the adjacency vector no longer covers only unresolved ordinals")
     for arch in ("arm", "i686", "riscv", "x86"):
         if b"ParamAllocaIndex::build(func)" not in prologues.get(arch, b""):
             bad.append(f"{arch} prologue does not build the index")
@@ -701,13 +714,20 @@ def cross_execute_failures(tests_rs: bytes, harness: bytes, cross_gate: bytes,
                  b"fn chain_steps_are_linear_in_every_duplicate_shape",
                  b"fn index_layout_has_no_padding_and_the_counter_is_a_zst",
                  b"fn resumed_probe_matches_the_oracle_over_all_late_failure_shapes",
-                 b"fn failed_aligned_probe_resumes_without_reexamining_the_prefix"):
+                 b"fn failed_aligned_probe_resumes_without_reexamining_the_prefix",
+                 b"fn every_small_layout_matches_the_reference_scan_and_all_four_bounds",
+                 b"fn aligned_path_writes_each_home_exactly_once",
+                 b"fn resumed_path_never_overwrites_the_resolved_prefix"):
         if name not in tests_rs:
             bad.append(f"adversarial unit test {name.decode()} is gone")
     if b"stats.chain_steps <= N" not in tests_rs or b"stats.chain_steps <= n" not in tests_rs:
         bad.append("the chain_steps <= params bound is not asserted")
     if b"stats.instructions_examined <= entry_instructions + 1" not in tests_rs:
         bad.append("the resumed single-pass bound is not asserted")
+    if b"stats.home_writes, n" not in tests_rs:
+        bad.append("the exact-once aligned home-write proof is gone")
+    if b"stats.home_writes <= 2 * n" not in tests_rs:
+        bad.append("the universal home-write bound is not asserted")
     for token in (b'"x86_64"', b'"i686"', b'"aarch64"', b'"riscv64"',
                   b"qemu-i386", b"qemu-aarch64", b"qemu-riscv64",
                   b'"--self-test"', b"expect_machine", b"fail closed",
@@ -880,6 +900,26 @@ def self_test() -> None:
     rejects(lambda: require(not structural_failures(
         good_prod.replace(b"for i in start..n", b"for i in 0..n"),
         good_prologues), "general map no longer restricted to unresolved ordinals"))
+    # Round-2 store rules: each must be able to reject the pre-fix shape.
+    rejects(lambda: require(not structural_failures(
+        good_prod.replace(b"pub home_writes: usize", b"pub gone: usize"),
+        good_prologues), "home-write witness deleted"))
+    rejects(lambda: require(not structural_failures(
+        good_prod.replace(b"fn note_home_writes(&mut self, count: usize)",
+                          b"fn gone(&mut self)"), good_prologues),
+        "home-write hook deleted"))
+    rejects(lambda: require(not structural_failures(
+        good_prod.replace(b"homes.push(Some((*dest, *ty)))",
+                          b"homes[i] = Some((*dest, *ty));"), good_prologues),
+        "aligned probe stopped appending"))
+    rejects(lambda: require(not structural_failures(
+        good_prod.replace(b"counter.note_home_writes(n - start)",
+                          b"counter.note_home_writes(n)"), good_prologues),
+        "general pass stopped tracking only the tail"))
+    rejects(lambda: require(not structural_failures(
+        good_prod.replace(b"vec![usize::MAX; n - start]",
+                          b"vec![usize::MAX; n]"), good_prologues),
+        "adjacency vector grew back to n"))
     # Check 13: load the real evidence bundle once, then prove EVERY rule can
     # reject a mutated copy.  A structural gate whose rules never fire is
     # decoration; this is the non-vacuity proof.
@@ -907,6 +947,21 @@ def self_test() -> None:
     rejects(lambda: require(not cross_execute_failures(
         tests_rs.replace(b"stats.instructions_examined <= entry_instructions + 1",
                          b"true"), *bundle), "resumed single-pass bound deleted"))
+    rejects(lambda: require(not cross_execute_failures(
+        tests_rs.replace(b"fn every_small_layout_matches_the_reference_scan_and_all_four_bounds",
+                         b"fn gone"), *bundle), "exhaustive differential test deleted"))
+    rejects(lambda: require(not cross_execute_failures(
+        tests_rs.replace(b"fn aligned_path_writes_each_home_exactly_once",
+                         b"fn gone"), *bundle), "aligned single-write proof deleted"))
+    rejects(lambda: require(not cross_execute_failures(
+        tests_rs.replace(b"fn resumed_path_never_overwrites_the_resolved_prefix",
+                         b"fn gone"), *bundle), "resume prefix-write proof deleted"))
+    rejects(lambda: require(not cross_execute_failures(
+        tests_rs.replace(b"stats.home_writes, n", b"true"), *bundle),
+        "exact-once aligned home-write assertion deleted"))
+    rejects(lambda: require(not cross_execute_failures(
+        tests_rs.replace(b"stats.home_writes <= 2 * n", b"true"), *bundle),
+        "universal home-write bound deleted"))
     bundle_fails(0, b'"riscv64"', b'"s390x"', "harness lost an ISA")
     bundle_fails(0, b"qemu-i386", b"qemu-none", "harness lost a qemu runner")
     bundle_fails(0, b"expect_machine", b"skip_machine", "harness lost ELF guard")
@@ -936,7 +991,7 @@ def self_test() -> None:
     rejects(lambda: require("fastbuild-baseline2" not in
                             "p='/home/user/lccc/target/fastbuild-baseline2/fastbuild'",
                             "stale baseline string"))
-    require(cases == 43, f"self-test covered {cases}/43 rejection paths")
+    require(cases == 53, f"self-test covered {cases}/53 rejection paths")
     print(f"SELF_TEST_OK ({cases} rejection paths proven non-vacuous)")
 
 
