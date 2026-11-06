@@ -13,6 +13,7 @@ use super::definitions::{LocalInfo, SwitchFrame};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
 use crate::common::types::{CType, IrType};
+use crate::ir::module::{DebugLocal, DebugScope};
 use crate::ir::reexports::{BasicBlock, BlockId, Instruction, Value};
 
 /// Records undo operations for function-local scoped variables.
@@ -148,6 +149,10 @@ pub(super) struct FunctionBuildState {
     pub user_label_depths: FxHashMap<String, usize>,
     /// Scope stack for function-local variable undo tracking
     pub scope_stack: Vec<FuncScopeFrame>,
+    /// `-g` lexical scopes and the stack of active scope ids.
+    pub debug_scopes: Vec<DebugScope>,
+    pub debug_scope_stack: Vec<usize>,
+    pub debug_locals: Vec<DebugLocal>,
     /// Static local variable name -> mangled global name
     pub static_local_names: FxHashMap<String, String>,
     /// Const-qualified local variable values
@@ -331,6 +336,9 @@ impl FunctionBuildState {
             defined_user_labels: FxHashSet::default(),
             user_label_depths: FxHashMap::default(),
             scope_stack: Vec::new(),
+            debug_scopes: Vec::new(),
+            debug_scope_stack: Vec::new(),
+            debug_locals: Vec::new(),
             static_local_names: FxHashMap::default(),
             const_local_values: FxHashMap::default(),
             var_ctypes: FxHashMap::default(),
@@ -365,6 +373,20 @@ impl FunctionBuildState {
     /// Push a new function-local scope frame.
     pub fn push_scope(&mut self) {
         self.scope_stack.push(FuncScopeFrame::new());
+    }
+
+    /// Record a `-g` lexical block and make it the active scope.
+    pub fn push_debug_scope(&mut self, span: Span) -> usize {
+        let id = self.debug_scopes.len();
+        let parent = self.debug_scope_stack.last().copied();
+        self.debug_scopes.push(DebugScope { parent, span });
+        self.debug_scope_stack.push(id);
+        id
+    }
+
+    /// Leave the active `-g` lexical block.
+    pub fn pop_debug_scope(&mut self) {
+        self.debug_scope_stack.pop();
     }
 
     /// Declare a nested function in the CURRENT scope (with undo bookkeeping

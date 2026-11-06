@@ -15,7 +15,6 @@ pub(crate) mod call_abi; // Unified ABI classification: call args + callee param
 pub(crate) mod cast; // Cast and float operation classification
 pub(crate) mod cfi_lower; // Shared .cfi_* -> .eh_frame lowering (x86, i686, AArch64, RISC-V)
 pub(crate) mod cfi_synth; // Unwind info derived from final x86/i686 code
-pub(crate) mod debug_frame; // Frame facts the code generator proves, consumed by the DWARF writer
 pub(crate) mod f128_softfloat; // Shared F128 soft-float orchestration (ARM + RISC-V)
 pub(crate) mod generation; // Module/function/instruction dispatch
 mod global_alignment;
@@ -42,7 +41,6 @@ pub(crate) mod riscv;
 pub mod x86;
 
 use crate::backend::state::FnEntryRows;
-use crate::backend::traits::ArchCodegen as _;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::reexports::{IrModule, TlsModel};
 use std::fmt::Write as _;
@@ -88,10 +86,30 @@ pub(crate) type FrameReport = std::sync::Arc<
     std::sync::Mutex<std::collections::BTreeMap<String, (crate::common::source::Span, u64)>>,
 >;
 
+/// Codegen-proven debug homes for one invocation. Parameters are keyed by
+/// (function, original C parameter index); locals by (function, alloca Value
+/// id). One lock gives the driver a consistent view and avoids per-map lock
+/// traffic on every shipped function. Later IPA retries replace earlier
+/// observations; exploratory emissions never enter the report.
+#[derive(Debug, Default)]
+pub(crate) struct DebugHomeReport {
+    pub parameters: std::collections::BTreeMap<(String, usize), DebugHome>,
+    pub locals: std::collections::BTreeMap<(String, u32), DebugHome>,
+}
+
+pub(crate) type DebugHomes = std::sync::Arc<std::sync::Mutex<DebugHomeReport>>;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DebugHome {
+    pub base_register: u8,
+    pub offset: i64,
+}
+
 /// Options that control code generation, parsed from CLI flags.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CodegenOptions {
     pub(crate) frame_report: Option<FrameReport>,
+    pub(crate) debug_homes: Option<DebugHomes>,
     /// Invocation-owned RA/codegen policy, parsed once by the driver before
     /// any per-function backend work starts.
     pub(crate) ra_config: std::sync::Arc<regalloc::RaConfig>,
@@ -712,7 +730,7 @@ impl Target {
         module: &IrModule,
         opts: &CodegenOptions,
         source_mgr: Option<&crate::common::source::SourceManager>,
-    ) -> (String, debug_frame::DebugFrameFacts) {
+    ) -> String {
         match self {
             Target::X86_64 => {
                 // Interprocedural register allocation (`x86::codegen::ipa_ra`)
@@ -763,9 +781,6 @@ impl Target {
                         opts.debug_info,
                         source_mgr,
                     );
-                    // `-g`: this round's frame facts travel with this round's
-                    // text; a regenerated round is a different emission.
-                    let frame_facts = cg.take_debug_frame_facts();
                     // The whole-file peephole rewrites every function's text,
                     // so it runs under an ISA legal in all of them.
                     cg.publish_peephole_isa();
@@ -802,10 +817,7 @@ impl Target {
                             opts.emit_cfi,
                             cfi_synth::CfiArch::X86_64,
                         );
-                        break (
-                            insert_fn_entry_locs(asm, &cg.state.fn_entry_locs),
-                            frame_facts,
-                        );
+                        break insert_fn_entry_locs(asm, &cg.state.fn_entry_locs);
                     }
                     if opts.ra_config.debug_ra {
                         eprintln!("[IPA-RA] round {round}: {violations:?}");
@@ -857,12 +869,11 @@ impl Target {
                     cfi_synth::CfiArch::I386,
                 );
                 let optimized = insert_fn_entry_locs(optimized, &cg.state.fn_entry_locs);
-                let asm = if opts.code16gcc {
+                if opts.code16gcc {
                     format!(".code16gcc\n{}", optimized)
                 } else {
                     optimized
-                };
-                (asm, cg.take_debug_frame_facts())
+                }
             }
             Target::Aarch64 => {
                 let mut cg = arm::ArmCodegen::new_with_ra_config(opts.ra_config.clone());
@@ -890,8 +901,7 @@ impl Target {
                         global_regparm: 0,
                     },
                 );
-                let asm = insert_fn_entry_locs(optimized, &cg.state.fn_entry_locs);
-                (asm, cg.take_debug_frame_facts())
+                insert_fn_entry_locs(optimized, &cg.state.fn_entry_locs)
             }
             Target::Riscv64 => {
                 let mut cg = riscv::RiscvCodegen::new_with_ra_config(opts.ra_config.clone());
@@ -924,8 +934,7 @@ impl Target {
                         global_regparm: 0,
                     },
                 );
-                let asm = insert_fn_entry_locs(optimized, &cg.state.fn_entry_locs);
-                (asm, cg.take_debug_frame_facts())
+                insert_fn_entry_locs(optimized, &cg.state.fn_entry_locs)
             }
         }
     }
@@ -978,6 +987,32 @@ impl Target {
                 }
                 Target::I686 => i686::assembler::assemble(asm_text, output_path, debug),
             }
+        }
+    }
+
+    /// Assemble in memory so `-S -g` can reuse the object writer's finalized
+    /// DIE tree without a temporary file or a second debug-information model.
+    pub(crate) fn assemble_bytes(
+        &self,
+        asm_text: &str,
+        extra_args: &[String],
+        debug: Option<elf::DwarfDebug>,
+    ) -> Result<Vec<u8>, String> {
+        #[cfg(feature = "gcc_assembler")]
+        {
+            let temporary = crate::common::temp_files::TempFile::try_new("lccc-debug", "unit", "o")
+                .map_err(|error| error.to_string())?;
+            let path = temporary.to_str().map_err(|error| error.to_string())?;
+            self.assemble_with_extra(asm_text, path, extra_args, debug)?;
+            return std::fs::read(path)
+                .map_err(|error| format!("read assembled debug unit: {error}"));
+        }
+        #[cfg(not(feature = "gcc_assembler"))]
+        match self {
+            Target::Aarch64 => arm::assembler::assemble_bytes(asm_text, debug),
+            Target::X86_64 => x86::assembler::assemble_bytes(asm_text, debug),
+            Target::I686 => i686::assembler::assemble_bytes(asm_text, debug),
+            Target::Riscv64 => riscv::assembler::assemble_bytes(asm_text, extra_args, debug),
         }
     }
 

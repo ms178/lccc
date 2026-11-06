@@ -301,6 +301,7 @@ pub struct FnEntryRows {
 
 pub struct CodegenState {
     pub(crate) frame_report: Option<crate::backend::FrameReport>,
+    pub(crate) debug_homes: Option<crate::backend::DebugHomes>,
     pub out: AsmOutput,
     /// Set from CodegenOptions for -O0 non-SSA correctness.
     pub disable_regalloc: bool,
@@ -804,17 +805,6 @@ pub struct CodegenState {
     /// skip the alloca load for these and just emit a no-op (the value is
     /// already in the register-allocated destination).
     pub param_pre_stored: FxHashSet<usize>,
-    /// `-g`: each parameter's home as a displacement from the canonical frame
-    /// address, computed once the prologue has laid the frame out (`None` for a
-    /// parameter whose home the layout cannot promise).  The DWARF writer turns
-    /// these into `DW_AT_location` expressions; see `backend::debug_frame` for
-    /// why only a proven home is reported.
-    pub debug_param_homes: Vec<Option<i32>>,
-    /// `-g`: the homes of every function emitted so far.  Module-wide, unlike
-    /// [`Self::debug_param_homes`], which each function overwrites: nothing
-    /// resets this but [`Self::take`](../../backend/debug_frame) at the end of a
-    /// unit, so a later function cannot erase an earlier one's facts.
-    pub debug_frames: crate::backend::debug_frame::DebugFrameFacts,
     /// Entry-prefix `VecLoad` results whose value the prologue already moved
     /// from the incoming `%xmmN`/`%ymmN` argument register into the load's
     /// register home (`regalloc_helpers::x86_vector_param_loads`). The load
@@ -965,6 +955,7 @@ impl CodegenState {
     pub fn new_with_ra_config(ra_config: Arc<crate::backend::regalloc::RaConfig>) -> Self {
         Self {
             frame_report: None,
+            debug_homes: None,
             out: AsmOutput::new(),
             disable_regalloc: false,
             ra_config,
@@ -1077,8 +1068,6 @@ impl CodegenState {
             frame_offset_aliases: FxHashMap::default(),
             dead_param_ref_dests: FxHashSet::default(),
             param_pre_stored: FxHashSet::default(),
-            debug_param_homes: Vec::new(),
-            debug_frames: crate::backend::debug_frame::DebugFrameFacts::default(),
             vec_param_preloaded: FxHashSet::default(),
             uses_sret: false,
             function_sections: false,
@@ -1354,9 +1343,6 @@ impl CodegenState {
         self.call_gp_arg_count = 6;
         self.call_fp_arg_count = None;
         self.value_locations.clear();
-        // Per function, not per unit: the next function recomputes its own homes
-        // and `debug_frames` keeps the ones already handed over.
-        self.debug_param_homes.clear();
         self.incoming_byval_slots.clear();
         self.alloca_values.clear();
         self.volatile_alloca_values.clear();
@@ -1643,6 +1629,7 @@ impl CodegenState {
     /// every backend's `apply_options`).
     pub fn apply_tls_options(&mut self, opts: &crate::backend::CodegenOptions) {
         self.frame_report = opts.frame_report.clone();
+        self.debug_homes = opts.debug_homes.clone();
         self.shared_lib = opts.shared_lib;
         self.stack_clash_protection = opts.stack_clash_protection;
         self.stack_protector_guard = opts.stack_protector_guard.clone();

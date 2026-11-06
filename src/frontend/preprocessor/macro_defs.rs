@@ -198,6 +198,7 @@ pub(super) struct SavedMacroDefinition {
 pub struct MacroTable {
     macros: FxHashMap<String, MacroDef>,
     pub(super) source_filename: String,
+    file_prefix_map: crate::common::path_map::PathPrefixMap,
     /// Counter for the __COUNTER__ built-in macro. Increments on each expansion.
     counter: Cell<usize>,
     /// Per-line __LINE__ resolver: maps a byte offset within the line being
@@ -396,6 +397,7 @@ impl MacroTable {
         Self {
             macros: FxHashMap::default(),
             source_filename: "\"<stdin>\"".to_string(),
+            file_prefix_map: Default::default(),
             counter: Cell::new(0),
             line_resolver: std::cell::RefCell::new(super::text_processing::LineResolver::Flat(1)),
             line_offset_base: Cell::new(0),
@@ -634,7 +636,20 @@ impl MacroTable {
     pub fn set_file(&mut self, body: String) {
         // Diagnostic provenance is not the user-overridable __FILE__ macro.
         self.source_filename = body.clone();
-        self.set_builtin_body("__FILE__", &body);
+        let raw = body
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .unwrap_or(&body);
+        let mapped = self.file_prefix_map.apply(raw);
+        self.set_builtin_body("__FILE__", &format!("\"{}\"", mapped));
+    }
+
+    pub(crate) fn set_file_prefix_map(&mut self, map: crate::common::path_map::PathPrefixMap) {
+        self.file_prefix_map = map;
+    }
+
+    pub(crate) fn mapped_file<'a>(&self, filename: &'a str) -> std::borrow::Cow<'a, str> {
+        self.file_prefix_map.apply(filename)
     }
 
     /// Record that preprocessor work moved into `path` (`#include`, `-include`,

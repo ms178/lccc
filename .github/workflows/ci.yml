@@ -536,7 +536,7 @@ jobs:
     - name: Install the GCC 16.2 oracle
       run: bash scripts/ci_install_gcc_oracle.sh --version 16.2
     - name: Verify the lane's oracle toolchain
-      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5
+      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5 --require gcc,multilib,valgrind,pyyaml,gdb
     - name: Select GCC 16 for legacy oracle invocations
       run: |
         mkdir -p "$RUNNER_TEMP/lccc-oracles"
@@ -821,7 +821,7 @@ jobs:
     - name: Install the GCC 16.2 oracle
       run: bash scripts/ci_install_gcc_oracle.sh --version 16.2
     - name: Verify the lane's oracle toolchain
-      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5
+      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5 --require gcc,multilib,valgrind,pyyaml,gdb
     - name: Select GCC 16 for legacy oracle invocations
       run: |
         mkdir -p "$RUNNER_TEMP/lccc-oracles"
@@ -1017,6 +1017,20 @@ jobs:
         --lccc target/fastbuild/lccc --gcc gcc-16 \
         --json "$RUNNER_TEMP/dwarf-quality.json" \
         --markdown "$RUNNER_TEMP/dwarf-quality.md"
+        run_gate dwarf_delivery python3 tests/regression/check_dwarf_delivery.py \
+        --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 \
+        --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv \
+        --gcc gcc-16 --gdb gdb --json "$RUNNER_TEMP/dwarf-delivery.json"
+        run_gate dwarf_quality_selftest python3 tests/regression/check_dwarf_quality.py --self-test
+        run_gate dwarf_parameters_selftest python3 tests/regression/check_dwarf_parameters.py --self-test
+        run_gate dwarf_parameters python3 tests/regression/check_dwarf_parameters.py \
+        --lccc target/fastbuild/lccc --gcc gcc-16 --gdb gdb \
+        --json "$RUNNER_TEMP/dwarf-parameters.json"
+        run_gate dwarf_locals_selftest python3 tests/regression/check_dwarf_locals.py --self-test
+        run_gate dwarf_locals python3 tests/regression/check_dwarf_locals.py \
+          --lccc target/fastbuild/lccc --lccc-arm target/fastbuild/lccc-arm \
+          --lccc-riscv target/fastbuild/lccc-riscv --gcc gcc-16 --gdb gdb \
+          --json "$RUNNER_TEMP/dwarf-locals.json"
         run_gate warning_compat python3 tests/regression/check_warning_compat.py \
         --lccc target/fastbuild/lccc --gcc gcc-16
         run_gate warning_precedence python3 tests/regression/check_warning_precedence.py \
@@ -1151,7 +1165,7 @@ jobs:
     - name: Install the GCC 16.2 oracle
       run: bash scripts/ci_install_gcc_oracle.sh --version 16.2
     - name: Verify the lane's oracle toolchain
-      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5
+      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5 --require gcc,multilib,valgrind,pyyaml,gdb
     - name: Select GCC 16 for legacy oracle invocations
       run: |
         mkdir -p "$RUNNER_TEMP/lccc-oracles"

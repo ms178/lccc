@@ -319,44 +319,6 @@ impl DwarfType {
     }
 }
 
-/// Where a value's bytes are, as a `DW_AT_location` expression says it.
-///
-/// A location is a *promise*: a consumer prints whatever it finds there and
-/// never re-checks it, so the only form this type names is one the frame layout
-/// proved for the whole function body.  That is a constant displacement from the
-/// canonical frame address (`DW_OP_fbreg`, the expression `DW_AT_frame_base =
-/// DW_OP_call_frame_cfa` makes readable): the frame address and the slot are both
-/// fixed once the prologue has run, so their difference is a compile-time
-/// constant that stays true at every instruction -- no location list, no
-/// `DW_OP_piece`, and nothing to get wrong when the function has a branch.
-///
-/// A value the layout cannot promise (a parameter homed in a register, an
-/// over-aligned automatic object whose address is aligned at run time, a frame
-/// with no stable anchor) gets `None` instead.  A consumer renders that as
-/// `<optimized out>`; a wrong expression would render as a confident wrong
-/// number, which is the one failure mode DWARF cannot recover from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DwarfLocation {
-    /// `DW_OP_fbreg <delta>`: the value starts `delta` bytes from the canonical
-    /// frame address, whose rule is `DW_AT_frame_base` (`DW_OP_call_frame_cfa`).
-    FrameOffset(i32),
-}
-
-impl DwarfLocation {
-    /// The expression's bytes, without the length that a block form puts in
-    /// front: `DW_OP_fbreg` (one opcode) then a signed LEB128 displacement.
-    pub(crate) fn expression(&self) -> Vec<u8> {
-        match *self {
-            DwarfLocation::FrameOffset(delta) => {
-                let mut out = Vec::with_capacity(6);
-                out.push(super::dwarf::DW_OP_FBREG);
-                super::dwarf::write_sleb128(i64::from(delta), &mut out);
-                out
-            }
-        }
-    }
-}
-
 /// One parameter of a function this unit defines: the `DW_TAG_formal_parameter`
 /// a debugger lists `pq_frame` as taking.
 ///
@@ -369,11 +331,10 @@ pub(crate) struct DwarfParameter {
     /// value, and GCC 16.2 omits `DW_AT_name` there (measured).
     pub name: Option<String>,
     pub ty: u32,
-    /// Where the value is, once the code generator has laid the frame out.  The
-    /// analyser builds the parameter list before any frame exists, so this is
-    /// filled in later, by [`DwarfUnitSpec::apply_frame_facts`], and stays
-    /// `None` for a parameter the frame does not give a trustworthy home.
-    pub location: Option<DwarfLocation>,
+    /// Codegen-proven frame home, attached by original parameter index after
+    /// emission.  Storing it on the parameter itself keeps the writer O(1) per
+    /// argument instead of searching a unit-wide location vector by name.
+    pub location: Option<DwarfHome>,
 }
 
 /// The parameter list of one defined function.
@@ -391,6 +352,50 @@ impl DwarfFunctionParameters {
     }
 }
 
+/// A frame-pointer-relative home proven by codegen.  The writer turns it into
+/// `DW_OP_bregN + offset`; `None` means the object has no stable memory home
+/// (promoted, folded, frameless, or not yet supported) and is not described.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DwarfHome {
+    /// DWARF frame-pointer register: x86-64 rbp=6, i686 ebp=5, AArch64 x29=29,
+    /// RISC-V s0/fp=8.
+    pub base_register: u8,
+    pub offset: i64,
+}
+
+/// A local variable with a codegen-proven frame home (D14). The writer emits
+/// it as a `DW_TAG_variable` child of the subprogram; a folded/promoted local
+/// never reaches this list because codegen reports no home for it.
+#[derive(Clone, Debug)]
+pub(crate) struct DwarfLocalVariable {
+    pub function: String,
+    pub name: String,
+    pub ty: u32,
+    pub decl_file: Option<String>,
+    pub decl_line: Option<u32>,
+    pub decl_column: Option<u32>,
+    /// IR alloca id, used by the driver to attach the codegen home.
+    pub alloca_id: u32,
+    /// Index into [`DwarfUnitSpec::lexical_scopes`].
+    pub scope: usize,
+    pub home: Option<DwarfHome>,
+}
+
+/// One lexical block, as the lowerer recorded it.  `parent == None` is the
+/// function body itself and is represented by the subprogram DIE rather than
+/// an extra lexical block.  Source positions are resolved by the driver so the
+/// byte writer never needs the source manager.
+#[derive(Clone, Debug)]
+pub(crate) struct DwarfLexicalScope {
+    pub function: String,
+    pub parent: Option<usize>,
+    pub file: String,
+    pub start_line: u32,
+    pub start_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+}
+
 /// Everything the writer needs to describe a translation unit's data.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DwarfUnitSpec {
@@ -402,6 +407,8 @@ pub(crate) struct DwarfUnitSpec {
     /// function with no parameters has no entry, so the writer knows it can
     /// describe the subprogram without children.
     pub parameters: FxHashMap<String, DwarfFunctionParameters>,
+    pub local_variables: Vec<DwarfLocalVariable>,
+    pub lexical_scopes: Vec<DwarfLexicalScope>,
 }
 
 impl DwarfUnitSpec {
@@ -409,41 +416,24 @@ impl DwarfUnitSpec {
         self.variables.is_empty() && self.types.is_empty()
     }
 
+    pub(crate) fn map_paths(&self, map: &crate::common::path_map::PathPrefixMap) -> Self {
+        let mut result = self.clone();
+        for variable in &mut result.variables {
+            if let Some(file) = &variable.decl_file {
+                variable.decl_file = Some(map.apply(file).into_owned());
+            }
+        }
+        for variable in &mut result.local_variables {
+            if let Some(file) = &variable.decl_file {
+                variable.decl_file = Some(map.apply(file).into_owned());
+            }
+        }
+        result
+    }
+
     /// The parameter list of a defined function, when it has one.
     pub(crate) fn parameters_of(&self, name: &str) -> Option<&DwarfFunctionParameters> {
         self.parameters.get(name).filter(|list| !list.is_empty())
-    }
-
-    /// Give every parameter the home the code generator's frame layout gave it.
-    ///
-    /// The parameter *list* is built from the analysis, which runs before any
-    /// frame exists; the offsets come from the instruction selector, which is the
-    /// only component that knows where a parameter's bytes ended up.  Both sides
-    /// are keyed by the emitted symbol name, and the offsets are applied
-    /// positionally inside a list.
-    ///
-    /// A length mismatch is treated as "no facts" rather than as a partial
-    /// match.  The two lists come from different layers (a source-level
-    /// parameter list and an IR-level one, which a hidden return pointer could
-    /// grow), and applying a prefix of one to the other would attach the third
-    /// parameter's slot to the fourth parameter's name -- the exact class of
-    /// confident lie this whole module is arranged to avoid.  Nothing is lost by
-    /// declining: the DIEs simply carry no location.
-    pub(crate) fn apply_frame_facts(
-        &mut self,
-        facts: &crate::backend::debug_frame::DebugFrameFacts,
-    ) {
-        for (name, offsets) in &facts.parameters {
-            let Some(list) = self.parameters.get_mut(name) else {
-                continue;
-            };
-            if offsets.len() != list.parameters.len() {
-                continue;
-            }
-            for (parameter, offset) in list.parameters.iter_mut().zip(offsets) {
-                parameter.location = offset.map(DwarfLocation::FrameOffset);
-            }
-        }
     }
 
     /// Drop the declarations this object does not reference, and every type that
@@ -499,6 +489,9 @@ impl DwarfUnitSpec {
                 root(parameter.ty);
             }
         }
+        for local in &self.local_variables {
+            root(local.ty);
+        }
         while let Some(index) = work.pop() {
             let Some(ty) = self.types.get(index as usize) else {
                 continue;
@@ -548,11 +541,22 @@ impl DwarfUnitSpec {
                 (name.clone(), list)
             })
             .collect();
+        let local_variables = self
+            .local_variables
+            .iter()
+            .map(|local| {
+                let mut local = local.clone();
+                local.ty = remap_of(&remap, local.ty);
+                local
+            })
+            .collect();
         DwarfUnitSpec {
             types,
             variables,
             return_types,
             parameters,
+            local_variables,
+            lexical_scopes: self.lexical_scopes.clone(),
         }
     }
 
@@ -580,18 +584,24 @@ pub struct DwarfDebug {
     /// `None` for input that is only assembly: its `.loc` rows are all the debug
     /// information there is.
     pub unit: Option<Arc<DwarfUnitSpec>>,
+    pub path_map: Arc<crate::common::path_map::PathPrefixMap>,
 }
 
 impl DwarfDebug {
     /// A dialect with no analysed unit: what an assembler-only input gets.
     pub(crate) fn dialect(config: DwarfConfig) -> Self {
-        Self { config, unit: None }
+        Self {
+            config,
+            unit: None,
+            path_map: Arc::default(),
+        }
     }
 
     pub(crate) fn with_unit(config: DwarfConfig, unit: DwarfUnitSpec) -> Self {
         Self {
             config,
             unit: Some(Arc::new(unit)),
+            path_map: Arc::default(),
         }
     }
 }
@@ -1489,6 +1499,8 @@ mod tests {
             ],
             return_types: FxHashMap::default(),
             parameters: FxHashMap::default(),
+            local_variables: Vec::new(),
+            lexical_scopes: Vec::new(),
         };
         let mut referenced = FxHashMap::default();
         referenced.insert("used".to_string(), ());

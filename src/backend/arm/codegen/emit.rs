@@ -2735,6 +2735,13 @@ pub(super) const ARM_ARG_REGS: [&str; 8] = ["x0", "x1", "x2", "x3", "x4", "x5", 
 const ARM_TMP_REGS: [&str; 8] = ["x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16"];
 
 impl ArchCodegen for ArmCodegen {
+    fn debug_frame_home(&self, slot: crate::backend::state::StackSlot) -> Option<(u8, i64)> {
+        // Ordinary AAPCS64 frames keep x29 == the body's sp, and stack slots
+        // are offsets from that sp.  The frameless/conditional-increment leaf
+        // plans deliberately never establish x29, so they have no proven home.
+        (!self.frameless_leaf && !self.conditional_increment_leaf).then_some((29, slot.0))
+    }
+
     /// Provenance markers for user inline-asm bodies: `#APP`/`#NO_APP`.
     /// `#` starts a comment in this target's GAS syntax, so the markers are
     /// invisible to the assembler, to objdump, and to this backend's text

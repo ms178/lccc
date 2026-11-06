@@ -19,6 +19,7 @@ impl Parser {
         // empty block so the caller's progress guarantee unwinds safely.
         if !self.enter_block_frame(open_brace) {
             return CompoundStmt {
+                span: Span::dummy(),
                 items: Vec::new(),
                 local_labels: Vec::new(),
                 is_synthetic_init_scope: false,
@@ -176,6 +177,7 @@ impl Parser {
             }
         }
 
+        let close_brace = self.peek_span();
         self.expect_closing(&TokenKind::RBrace, open_brace);
         self.restore_typedef_scope(typedef_mark);
         self.shadowed_typedefs = saved_shadowed;
@@ -188,6 +190,7 @@ impl Parser {
         self.attrs.parsing_ext_vector_nelem = saved_ext_vector_nelem;
         self.exit_parser_frame();
         CompoundStmt {
+            span: Span::new(open_brace.start, close_brace.end, open_brace.file_id),
             items,
             local_labels,
             is_synthetic_init_scope: false,
@@ -315,6 +318,7 @@ impl Parser {
                 let if_stmt = Stmt::If(cond, Box::new(then_stmt), else_stmt, span);
                 if let Some(init) = init_item {
                     Stmt::Compound(CompoundStmt {
+                        span,
                         items: vec![init, BlockItem::Statement(if_stmt)],
                         local_labels: Vec::new(),
                         is_synthetic_init_scope: true,
@@ -391,6 +395,7 @@ impl Parser {
                 let sw_stmt = Stmt::Switch(expr, Box::new(body), span);
                 if let Some(init) = init_item {
                     Stmt::Compound(CompoundStmt {
+                        span,
                         items: vec![init, BlockItem::Statement(sw_stmt)],
                         local_labels: Vec::new(),
                         is_synthetic_init_scope: true,

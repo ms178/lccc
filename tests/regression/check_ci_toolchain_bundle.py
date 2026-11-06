@@ -260,11 +260,12 @@ class ProvisionToolchain(unittest.TestCase):
         self.assertEqual(len(apt), 1, lines)
         # qemu-user is the i686 execution oracle; python3-yaml is the gate
         # parser; valgrind is the Memcheck oracle and libc6-dbg lets it
-        # relocate loader symbols. The linker pair has its own retrying,
-        # fail-closed installer and must not be folded back into this apt call.
+        # relocate loader symbols; gdb is the DWARF value oracle. The linker
+        # pair has its own retrying, fail-closed installer and must not be
+        # folded back into this apt call.
         self.assertEqual(apt[0].split()[1:], [
             "install", "-y", "--no-install-recommends",
-            "qemu-user", "python3-yaml", "valgrind", "libc6-dbg"])
+            "qemu-user", "python3-yaml", "valgrind", "libc6-dbg", "gdb"])
         delegated = [line for line in lines if line == "install-link-oracles"]
         self.assertEqual(delegated, ["install-link-oracles"],
                          f"mold+lld must use the dedicated installer: {lines}")

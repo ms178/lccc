@@ -180,7 +180,9 @@ def preamble(step_list: list[dict], planned: set[str], mode: str) -> list[str]:
 #   R4  a lane that installs the pinned oracle also asserts its version in that
 #       verification (--clang-version), so "the oracle" cannot silently be a
 #       different release;
-#   R5  the provisioning script's EXTRAS still carries valgrind and libc6-dbg.
+#   R5  the provisioning script's EXTRAS still carries valgrind, libc6-dbg and gdb.
+#   R10 a lane running a GDB-backed DWARF gate provisions the toolchain and
+#       requires the gdb probe; the structural-only escape hatch is not coverage.
 #
 # R1/R2 are derived from the gate scripts rather than from a hand-kept list: a
 # new gate that pins the Clang oracle or runs Memcheck pulls its lane into the
@@ -191,7 +193,7 @@ TOOLCHAIN_PROVISION = "scripts/ci_provision_toolchain.sh"
 ORACLE_VERIFY = "scripts/ci_verify_oracles.sh"
 VERIFY_STEP = "Verify the lane's oracle toolchain"
 PROVISIONING_SCRIPT = ROOT / TOOLCHAIN_PROVISION
-REQUIRED_EXTRAS = ("valgrind", "libc6-dbg")
+REQUIRED_EXTRAS = ("valgrind", "libc6-dbg", "gdb")
 GATE_CALL = re.compile(r"\b(?:bash|sh|python3?)\s+(\S+\.(?:sh|py))")
 
 # Files that DESCRIBE a tool requirement instead of consuming it: the
@@ -274,10 +276,19 @@ GCC_ORACLE_INSTALL = "scripts/ci_install_gcc_oracle.sh"
 GCC_ORACLE_CACHE = "~/.cache/lccc/gcc-oracle"
 # What the verifier probes unless a lane says otherwise (ci_verify_oracles.sh).
 DEFAULT_REQUIRE = {"gcc", "multilib", "valgrind", "pyyaml"}
-KNOWN_PROBES = DEFAULT_REQUIRE | {"mold", "lld", "qemu"}
+KNOWN_PROBES = DEFAULT_REQUIRE | {"mold", "lld", "qemu", "gdb"}
 # Gate tool -> the probe that proves it.  `clang` is not here on purpose: it is
 # proven by the --clang-version assertion (R1/R4), which is an exact release.
-PROBE_FOR_TOOL = {"valgrind": "valgrind"}
+PROBE_FOR_TOOL = {"valgrind": "valgrind", "gdb": "gdb"}
+# Gates whose oracle is a live debugger, not a structural decoder.  The
+# parameter/delivery gates refuse to run without GDB unless the caller
+# explicitly asks for structural-only mode; a hosted lane must not take
+# that escape hatch.
+GDB_GATE_SCRIPTS = frozenset({
+    "tests/regression/check_dwarf_delivery.py",
+    "tests/regression/check_dwarf_parameters.py",
+    "tests/regression/check_dwarf_locals.py",
+})
 
 
 def gcc_oracle_installer_version() -> str:
@@ -336,6 +347,17 @@ def oracle_provisioning(document: dict) -> list[str]:
                 f"{name}: runs a Memcheck gate but no step provisions the toolchain "
                 f"({TOOLCHAIN_PROVISION}), which is the only path that installs "
                 f"valgrind + libc6-dbg")
+        # R10: a live-debugger gate is only as good as the GDB the lane proved.
+        for run in runs:
+            if "--allow-missing-gdb" in run:
+                continue
+            for match in GATE_CALL.finditer(run):
+                if _repo_relative(match.group(1)) in GDB_GATE_SCRIPTS:
+                    tools.add("gdb")
+        if "gdb" in tools and not provisions:
+            problems.append(
+                f"{name}: runs a GDB-backed DWARF gate but no step provisions the "
+                f"toolchain ({TOOLCHAIN_PROVISION}), whose EXTRAS install gdb")
         if provisions and not verifies:
             problems.append(
                 f"{name}: provisions a toolchain but never verifies it "
@@ -742,12 +764,34 @@ def self_test() -> None:
     assert any("--gcc-version" in p and "16.2" in p for p in problems), problems
     assert oracle_provisioning(complete) == [], oracle_provisioning(complete)
 
+    # R10: a GDB-backed DWARF gate with no provisioning and no gdb probe is the
+    # silent structural-only escape hatch this rule removes.
+    gdb_bare = {"jobs": {"debug": {"steps": [
+        step("Checkout"),
+        step("Run", "python3 tests/regression/check_dwarf_parameters.py --lccc out/lccc --gdb gdb"),
+    ]}}}
+    problems = oracle_provisioning(gdb_bare)
+    assert any("GDB-backed" in p and "debug" in p for p in problems), problems
+    gdb_unproved = {"jobs": {"debug": {"steps": [
+        step("Checkout"),
+        step("Provision", "bash scripts/ci_provision_toolchain.sh --multilib"),
+        step(VERIFY_STEP, "bash scripts/ci_verify_oracles.sh --require gcc,multilib,valgrind,pyyaml"),
+        step("Run", "python3 tests/regression/check_dwarf_parameters.py --lccc out/lccc --gdb gdb"),
+    ]}}}
+    problems = oracle_provisioning(gdb_unproved)
+    assert any("does not require the 'gdb' probe" in p for p in problems), problems
+    gdb_structural = {"jobs": {"debug": {"steps": [
+        step("Checkout"),
+        step("Run", "python3 tests/regression/check_dwarf_parameters.py --lccc out/lccc --allow-missing-gdb"),
+    ]}}}
+    assert not any("GDB-backed" in p for p in oracle_provisioning(gdb_structural))
+
     # R5: the package set is what every bundle is built from.
     assert provisioning_extras_problems('EXTRAS="qemu-user mold lld"') != []
-    assert provisioning_extras_problems('EXTRAS="qemu-user valgrind libc6-dbg"') == []
+    assert provisioning_extras_problems('EXTRAS="qemu-user valgrind libc6-dbg gdb"') == []
     assert provisioning_extras_problems("PACKAGES=qemu") != []
 
-    print("check_ci_lane_plan: self-test PASS (18 rules, 25 fixtures)")
+    print("check_ci_lane_plan: self-test PASS (19 rules, 28 fixtures)")
 
 
 def main(argv: list[str] | None = None) -> int:

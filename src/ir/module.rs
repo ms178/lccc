@@ -8,7 +8,7 @@ use crate::common::source::Span;
 /// string literals, and linker directives. `IrFunction` represents a single
 /// function with its parameter list, basic blocks, and ABI metadata.
 /// `IrGlobal` defines a global variable with its initializer and linkage.
-use crate::common::types::IrType;
+use crate::common::types::{CType, IrType};
 
 /// A compilation unit in the IR.
 #[derive(Debug)]
@@ -438,6 +438,14 @@ pub struct IrFunction {
     pub body_span: crate::common::source::Span,
     /// `-g` rows for terminators (see [`TerminatorSpans`]).
     pub terminator_spans: TerminatorSpans,
+    /// Maps each physical IR parameter to its original C parameter index.
+    /// `None` marks a hidden sret pointer or an ABI-decomposed piece that has no
+    /// single source object home. Empty for synthesized functions/tests, which
+    /// fail closed (no parameter location) rather than guessing an index.
+    pub debug_param_indices: Vec<Option<usize>>,
+    /// `-g` local variables and lexical blocks (empty without debug info).
+    pub debug_locals: Vec<DebugLocal>,
+    pub debug_scopes: Vec<DebugScope>,
     /// __attribute__((section("..."))) - place in specific ELF section.
     pub section: Option<String>,
     /// Normalized `__attribute__((target("...")))` features: lower-case,
@@ -534,6 +542,29 @@ impl SspInfo {
             self.max_char_array_bytes = callee.max_char_array_bytes;
         }
     }
+}
+
+/// A source-level local variable whose storage may survive into codegen.
+/// Recorded only under `-g`; the backend describes it only when the alloca
+/// still has a proven frame home (a promoted/folded local is not described).
+#[derive(Debug, Clone)]
+pub struct DebugLocal {
+    pub name: String,
+    pub ty: CType,
+    pub typedef_name: Option<String>,
+    /// The alloca Value holding the object's address.
+    pub alloca: Value,
+    pub decl_span: Span,
+    /// Index into [`IrFunction::debug_scopes`].
+    pub scope: usize,
+}
+
+/// A lexical block, identified by its source brace span. The writer maps the
+/// span onto line-table rows to recover address ranges after optimization.
+#[derive(Debug, Clone)]
+pub struct DebugScope {
+    pub parent: Option<usize>,
+    pub span: Span,
 }
 
 /// A function parameter.
@@ -740,6 +771,9 @@ impl IrFunction {
             decl_span: crate::common::source::Span::dummy(),
             body_span: crate::common::source::Span::dummy(),
             terminator_spans: Default::default(),
+            debug_param_indices: Vec::new(),
+            debug_locals: Vec::new(),
+            debug_scopes: Vec::new(),
         }
     }
 

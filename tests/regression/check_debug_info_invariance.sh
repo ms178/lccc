@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # -g must not change generated code: with and without -g, the assembly of a
-# source must be identical once .loc/.file rows are removed.  Debug rows used
+# source must be identical once debug-only rows are removed.  Debug rows used
 # to be visible to the peephole passes as ordinary lines, so window caps, slot
 # reuse and textual matchers decided differently under -g (see
-# docs/DWARF-LINE-TABLES.md).
+# docs/DWARF-LINE-TABLES.md).  D7/D10 also render `.set .Llccc_debug_alias_*`
+# and `.section .debug_*` data into `-S`; those are metadata, not code, and the
+# filter below removes them while leaving instructions, CFI and non-debug
+# sections byte-for-byte comparable.
 #
 # Checked: every entry of debug_invariance_sentinels.txt (each historical
 # divergence, at the target and level where it diverged) plus a breadth
@@ -27,6 +30,67 @@ STRIDE=${STRIDE:-32}
 OPTS=${OPTS:-"-O2"}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+
+# Strip only debug metadata.  A `.section .debug_*` block is skipped until the
+# next non-debug section directive; `.loc`, `.file` and the writer's
+# `.Llccc_debug_alias_*` absolute symbols are skipped line-wise.  Ordinary
+# `.set`, instructions, labels, CFI and data sections are preserved.
+strip_debug_rows() {
+    awk '
+        /^[[:space:]]*\.(loc|file)([[:space:]]|$)/ { next }
+        /^[[:space:]]*\.set[[:space:]]+\.Llccc_debug_alias_/ { next }
+        /^[[:space:]]*\.section[[:space:]]+\.debug_/ { indebug = 1; next }
+        indebug {
+            if ($0 ~ /^[[:space:]]*\.section[[:space:]]+/ && $0 !~ /^[[:space:]]*\.section[[:space:]]+\.debug_/) {
+                indebug = 0
+            } else {
+                next
+            }
+        }
+        { print }
+    ' "$1"
+}
+
+# The filter is load-bearing: prove it ignores D7 metadata but still rejects a
+# one-byte instruction change hidden under the same metadata.
+filter_self_test() {
+    local d="$work/filter-self-test"
+    mkdir -p "$d"
+    cat > "$d/plain.s" <<'EOF'
+	.text
+foo:
+	add	a0, a0, 1
+	ret
+	.section	.note.GNU-stack,"",@progbits
+EOF
+    cat > "$d/debug.s" <<'EOF'
+	.file	1 "x.c"
+	.text
+foo:
+	.loc	1 1 0
+	add	a0, a0, 1
+	ret
+	.section	.note.GNU-stack,"",@progbits
+	.set	.Llccc_debug_alias_1,.text+0
+	.section	.debug_info,"",%progbits
+	.byte	1,2,3
+	.section	.debug_str,"MS",%progbits,1
+	.byte	4
+EOF
+    strip_debug_rows "$d/plain.s" > "$d/a"
+    strip_debug_rows "$d/debug.s" > "$d/b"
+    if ! cmp -s "$d/a" "$d/b"; then
+        echo "FAIL: debug-row filter self-test rejected metadata-only difference" >&2
+        exit 1
+    fi
+    sed 's/add	a0, a0, 1/add	a0, a0, 2/' "$d/debug.s" > "$d/changed.s"
+    strip_debug_rows "$d/changed.s" > "$d/c"
+    if cmp -s "$d/a" "$d/c"; then
+        echo "FAIL: debug-row filter self-test missed an instruction change" >&2
+        exit 1
+    fi
+}
+filter_self_test
 
 # One job per line: <compiler> <level> <source>.
 {
@@ -63,8 +127,8 @@ check() {
         echo "FAIL $(basename "$cc") $level $3: rejected only under -g"
         return
     fi
-    grep -v '^[[:space:]]*\.\(loc\|file\)\b' "$out/plain.s" > "$out/a"
-    grep -v '^[[:space:]]*\.\(loc\|file\)\b' "$out/debug.s" > "$out/b"
+    strip_debug_rows "$out/plain.s" > "$out/a"
+    strip_debug_rows "$out/debug.s" > "$out/b"
     if cmp -s "$out/a" "$out/b"; then
         echo "PASS"
     else
@@ -73,7 +137,7 @@ check() {
     fi
     rm -rf "$out"
 }
-export -f check
+export -f check strip_debug_rows
 export here work
 
 xargs -P "$(nproc)" -L 1 bash -c 'check "$@"' _ < "$work/jobs" > "$work/results"

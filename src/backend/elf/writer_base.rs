@@ -476,6 +476,7 @@ pub struct ElfWriterBase {
     /// `None` for input that carries only `.loc` rows (a hand-written `.s`, or
     /// `gcc -S -g` output).
     debug_unit: Option<std::sync::Arc<super::dwarf_spec::DwarfUnitSpec>>,
+    debug_path_map: std::sync::Arc<crate::common::path_map::PathPrefixMap>,
 }
 
 impl ElfWriterBase {
@@ -536,6 +537,7 @@ impl ElfWriterBase {
             debug_files: Vec::new(),
             debug_rows: Vec::new(),
             debug_unit: None,
+            debug_path_map: Default::default(),
         }
     }
 
@@ -550,6 +552,13 @@ impl ElfWriterBase {
     /// this describes the code alone, which is all an assembler can know.
     pub fn set_debug_unit(&mut self, unit: std::sync::Arc<super::dwarf_spec::DwarfUnitSpec>) {
         self.debug_unit = Some(unit);
+    }
+
+    pub fn set_debug_path_map(
+        &mut self,
+        map: std::sync::Arc<crate::common::path_map::PathPrefixMap>,
+    ) {
+        self.debug_path_map = map;
     }
 
     /// Ensure a section exists. If it doesn't, create it with the given properties.
@@ -712,14 +721,25 @@ impl ElfWriterBase {
                 })
             })
             .collect();
-        let primary_file = self
-            .debug_files
+        let mapped_files: Vec<(u32, String)> = if self.debug_path_map.is_empty() {
+            self.debug_files.clone()
+        } else {
+            self.debug_files
+                .iter()
+                .map(|(n, p)| (*n, self.debug_path_map.apply(p).into_owned()))
+                .collect()
+        };
+        let primary_file = mapped_files
             .iter()
             .find(|(number, _)| *number == 1)
-            .or_else(|| self.debug_files.first())
+            .or_else(|| mapped_files.first())
             .map_or("", |(_, name)| name.as_str());
         let comp_dir = std::env::current_dir()
-            .map(|dir| dir.to_string_lossy().into_owned())
+            .map(|dir| {
+                self.debug_path_map
+                    .apply(&dir.to_string_lossy())
+                    .into_owned()
+            })
             .unwrap_or_default();
 
         let first_new_label = at_labels.len();
@@ -770,7 +790,7 @@ impl ElfWriterBase {
         // file table, which `DW_AT_decl_file` indexes), and it may be absent
         // altogether when there is neither code nor a file to name.
         let mut line = build_dwarf_line_section(
-            &self.debug_files,
+            &mapped_files,
             &locations,
             &section_info,
             address_size,
@@ -794,7 +814,8 @@ impl ElfWriterBase {
         // describes only the declarations the object actually relocates against --
         // GCC 16.2's measured rule.
         let referenced = self.referenced_symbols();
-        let unit = unit.with_referenced(&referenced);
+        let mapped_unit = unit.map_paths(&self.debug_path_map);
+        let unit = mapped_unit.with_referenced(&referenced);
         let unit = &unit;
         // The objects this file defines: a variable DIE may only state an address
         // for one of them.
@@ -812,7 +833,7 @@ impl ElfWriterBase {
             if let Some(info) = build_dwarf_info_sections(
                 &code_sections,
                 stmt_list,
-                &self.debug_files,
+                &mapped_files,
                 &locations,
                 &section_info,
                 &functions,
@@ -832,6 +853,8 @@ impl ElfWriterBase {
                 built.extend([info.info, info.abbrev]);
                 built.extend(info.aranges);
                 built.extend(info.ranges);
+                built.extend(info.loc);
+                built.extend(info.loclists);
             }
         }
         if let Some(line) = line {
@@ -2489,6 +2512,16 @@ impl ElfWriterBase {
         config: &ElfConfig,
         include_referenced_locals: bool,
     ) -> Result<(), String> {
+        let bytes = self.build_elf(config, include_referenced_locals)?;
+        std::fs::write(output_path, bytes).map_err(|e| format!("failed to write ELF file: {}", e))
+    }
+
+    /// Serialize without filesystem side effects, for the `-S -g` DIE emitter.
+    pub fn build_elf(
+        &mut self,
+        config: &ElfConfig,
+        include_referenced_locals: bool,
+    ) -> Result<Vec<u8>, String> {
         if !include_referenced_locals {
             self.resolve_local_data_relocs();
         }
@@ -2545,12 +2578,6 @@ impl ElfWriterBase {
             sec.relocs.sort_by_key(|r| r.offset);
         }
 
-        let elf_bytes =
-            write_relocatable_object(config, &self.section_order, &self.sections, &symbols)?;
-
-        std::fs::write(output_path, &elf_bytes)
-            .map_err(|e| format!("failed to write ELF file: {}", e))?;
-
-        Ok(())
+        write_relocatable_object(config, &self.section_order, &self.sections, &symbols)
     }
 }

@@ -1786,6 +1786,9 @@ pub struct EnumVariant {
 /// A compound statement (block).
 #[derive(Debug, Clone)]
 pub struct CompoundStmt {
+    /// Opening brace through closing brace, for DWARF lexical-block ranges.
+    /// `Span::dummy()` for a synthetic scope with no source braces.
+    pub span: Span,
     pub items: Vec<BlockItem>,
     /// GNU __label__ declarations: local label names scoped to this block.
     /// When non-empty, label definitions and gotos within this block use
@@ -1999,7 +2002,8 @@ impl Stmt {
             Stmt::Expr(Some(expr)) => Some(expr.span()),
             Stmt::Declaration(decl) => Some(decl.span),
             Stmt::InlineAsm { span, .. } => Some(*span),
-            Stmt::Expr(None) | Stmt::Compound(_) => None,
+            Stmt::Compound(compound) => (compound.span != Span::dummy()).then_some(compound.span),
+            Stmt::Expr(None) => None,
         }
     }
 }
