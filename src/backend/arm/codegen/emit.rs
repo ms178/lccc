@@ -262,6 +262,12 @@ pub struct ArmCodegen {
     /// unmodeled class), so the call is published unannotated and the
     /// peephole assumes it reads all of x0-x8.
     pub(super) call_gp_reads: Option<u16>,
+    /// The significant width (8, 16 or 32 bits; 0 = all 64) of the integer
+    /// argument in each of x0-x7 for the call being emitted, armed beside
+    /// `call_gp_reads` and published with it (`peephole::late`): AAPCS64
+    /// callees ignore the bits above a narrow argument, so an extension
+    /// that only the call reads is dead.
+    pub(super) call_gp_narrow: [u8; 8],
     /// For variadic functions: offset from SP where the GP register save area starts (x0-x7).
     pub(super) va_gp_save_offset: i64,
     /// For variadic functions: offset from SP where the FP register save area starts (q0-q7).
@@ -350,6 +356,7 @@ impl ArmCodegen {
             func_ret_is_f128_sse: false,
             call_ret_is_f128_sse: false,
             call_gp_reads: None,
+            call_gp_narrow: [0; 8],
             va_gp_save_offset: 0,
             va_fp_save_offset: 0,
             va_named_gp_count: 0,
@@ -3133,12 +3140,25 @@ impl ArchCodegen for ArmCodegen {
             ty,
             IrType::I32 | IrType::U32 | IrType::I16 | IrType::U16 | IrType::I8 | IrType::U8
         );
-        if use_32bit {
-            self.emit_load_imm64("w1", case_val as i32 as i64);
-            self.state.emit("    cmp w0, w1");
+        // The chain only asks "equal?", so a case constant within the
+        // 12-bit immediate range of `cmp` (or of `cmn`, which compares with
+        // its negation) needs no register: `cmp w0, #35` where the chain used
+        // to emit `movz w1, #35; cmp w0, w1` for every case (GCC 16.2 and
+        // Clang 23.1.5 use the immediate forms).
+        let (acc, scratch, value) = if use_32bit {
+            ("w0", "w1", case_val as i32 as i64)
         } else {
-            self.emit_load_imm64("x1", case_val);
-            self.state.emit("    cmp x0, x1");
+            ("x0", "x1", case_val)
+        };
+        if (0..=4095).contains(&value) {
+            self.state.emit_fmt(format_args!("    cmp {acc}, #{value}"));
+        } else if (-4095..0).contains(&value) {
+            self.state
+                .emit_fmt(format_args!("    cmn {acc}, #{}", -value));
+        } else {
+            self.emit_load_imm64(scratch, value);
+            self.state
+                .emit_fmt(format_args!("    cmp {acc}, {scratch}"));
         }
         let skip = self.state.fresh_label("skip");
         self.state.emit_fmt(format_args!("    b.ne {}", skip));

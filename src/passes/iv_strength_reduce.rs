@@ -28,6 +28,8 @@ use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, V
 
 #[path = "iv_strength_reduce_compare.rs"]
 mod compare_recurrence;
+#[path = "iv_strength_reduce_exit_test.rs"]
+mod exit_test;
 pub(crate) use compare_recurrence::set_enabled as set_compare_recurrence_enabled;
 
 /// Maximum byte stride eligible for pointer induction. Matrix row strides are
@@ -238,7 +240,7 @@ pub(crate) fn ivsr_function(func: &mut IrFunction) -> usize {
 
     // Build CFG and dominator tree
     let cfg = analysis::CfgAnalysis::build(func);
-    ivsr_with_analysis(func, &cfg, false, true, true)
+    ivsr_with_analysis(func, &cfg, false, true, true, false)
 }
 
 /// Run IVSR on a single function with the scalar derived-IV flavor armed
@@ -253,7 +255,7 @@ pub(crate) fn ivsr_function_scalar(func: &mut IrFunction) -> usize {
 
     // Build CFG and dominator tree
     let cfg = analysis::CfgAnalysis::build(func);
-    ivsr_with_analysis(func, &cfg, true, true, true)
+    ivsr_with_analysis(func, &cfg, true, true, true, false)
 }
 
 /// Run IVSR using pre-computed CFG analysis (avoids redundant analysis when
@@ -270,7 +272,14 @@ pub(crate) fn ivsr_function_scalar(func: &mut IrFunction) -> usize {
 /// `x86_sib_cost` arms the x86 SIB cost rule below. It is a TARGET property
 /// (scaled-index addressing is free on x86, absent on RISC-V): the pipeline
 /// passes `matches!(target, X86_64 | I686)` and the unit wrappers pin `true`
-/// because the rule's contracts are written against x86 codegen.
+/// because the rule's contracts are written against x86 codegen.  The same
+/// target split arms the stride-1 `GEP(base, iv)` groups (`!x86_sib_cost`:
+/// on x86 the index form is a free SIB operand, elsewhere it is an add per
+/// access or a register offset that blocks post-indexing).
+///
+/// `lftr` arms `exit_test::replace_counter_exit_test` (AArch64, RISC-V
+/// 64): a counter kept only for the exit test is replaced by a test of a
+/// pointer recurrence against its end value.
 // Only topology matters to cached dominance: IVSR may rewrite a terminator's
 // value operands, but must not change block identity, terminator kind or edges.
 #[cfg(any(test, debug_assertions))]
@@ -330,6 +339,7 @@ pub(crate) fn ivsr_with_analysis(
     scalar_derived: bool,
     ptr_add: bool,
     x86_sib_cost: bool,
+    lftr: bool,
 ) -> usize {
     #[cfg(debug_assertions)]
     assert!(
@@ -389,6 +399,7 @@ pub(crate) fn ivsr_with_analysis(
             scalar_derived,
             ptr_add,
             x86_sib_cost,
+            lftr,
         );
         #[cfg(debug_assertions)]
         assert!(
@@ -412,6 +423,7 @@ fn reduce_loop(
     scalar_derived: bool,
     ptr_add: bool,
     x86_sib_cost: bool,
+    lftr: bool,
 ) -> usize {
     let preds = &cfg.preds;
     let header = natural_loop.header;
@@ -470,6 +482,7 @@ fn reduce_loop(
         &basic_ivs,
         &natural_loop.body,
         ptr_add,
+        !x86_sib_cost,
         natural_loop,
         &back_blocks,
     );
@@ -477,7 +490,21 @@ fn reduce_loop(
         if dbg {
             lccc::cli::stderr_line(format_args!("[IVSR] header={} no derived exprs", header));
         }
-        return 0;
+        // A pointer recurrence an earlier round (or the source) made may
+        // still take over the exit test.
+        return if lftr {
+            exit_test::replace_counter_exit_test(
+                func,
+                natural_loop,
+                preds,
+                preheader,
+                back_blocks[0],
+                &basic_ivs,
+                dbg,
+            )
+        } else {
+            0
+        };
     }
     if dbg {
         lccc::cli::stderr_line(format_args!(
@@ -1280,6 +1307,17 @@ fn reduce_loop(
     if reductions > 0 {
         func.next_value_id = next_id;
     }
+    if lftr {
+        reductions += exit_test::replace_counter_exit_test(
+            func,
+            natural_loop,
+            preds,
+            preheader,
+            back_blocks[0],
+            &basic_ivs,
+            dbg,
+        );
+    }
 
     reductions
 }
@@ -1422,6 +1460,7 @@ fn find_derived_exprs(
     basic_ivs: &[BasicIV],
     loop_body: &FxHashSet<usize>,
     ptr_add: bool,
+    direct_gep: bool,
     natural_loop: &NaturalLoop,
     back_blocks: &[usize],
 ) -> Vec<DerivedExpr> {
@@ -1791,6 +1830,68 @@ fn find_derived_exprs(
                     mul_dest.0, stride
                 ));
             }
+        }
+    }
+
+    // ── Stride-1 GEP offsets: `GEP(base, iv)` ──────────────────────────────
+    //
+    // A byte-array subscript reaches the GEP with the counter itself as the
+    // offset -- no `Mul`/`Shl` for the scan above to find -- so `p[i]` over
+    // `unsigned char` never formed a recurrence.  On x86 that index form is a
+    // free SIB operand (`direct_gep` is off there, and the SIB cost rule
+    // would skip the group anyway); on AArch64 the register-offset access
+    // `ldrb w6, [x0, x5]` keeps the counter alive and cannot post-index, and
+    // RISC-V pays an `add` per access.  Measured (QEMU dynamic counts, 512
+    // bytes): AArch64 count_hi 6 -> 3 instructions per byte with the
+    // recurrence, post-indexing and the pointer exit test, RISC-V 8 -> 5.
+    // The counter or a value-preserving widening cast of it qualifies; the
+    // pointer-group proofs in `reduce_loop` (no-wrap, invariant base) apply
+    // unchanged.
+    if direct_gep {
+        let claimed: FxHashSet<u32> = derived
+            .iter()
+            .map(|d| alias_root(&aliases, d.mul_dest.0))
+            .collect();
+        let mut roots: Vec<u32> = gep_uses_by_index.keys().copied().collect();
+        roots.sort_unstable();
+        for root in roots {
+            if claimed.contains(&root) {
+                continue;
+            }
+            let found = if let Some(&idx) = iv_values.get(&root) {
+                Some((idx, basic_ivs[idx].ty))
+            } else if let Some(Instruction::Cast {
+                src: Operand::Value(v),
+                from_ty,
+                to_ty,
+                ..
+            }) = definitions.get(&root).copied()
+                && from_ty.cast_preserves_offset_value(*to_ty)
+            {
+                iv_values.get(&v.0).map(|&idx| (idx, *to_ty))
+            } else {
+                None
+            };
+            let Some((iv_idx, ty)) = found else {
+                continue;
+            };
+            if !ty.is_integer()
+                || ty.size() != crate::common::types::target_ptr_size()
+                || !exit_test::counter_is_dedicated(func, loop_body, &basic_ivs[iv_idx])
+            {
+                continue;
+            }
+            derived.push(DerivedExpr {
+                stride: 1,
+                iv_index: iv_idx,
+                add_offset: 0,
+                gep_uses: gep_uses_by_index.get(&root).cloned().unwrap_or_default(),
+                vec_uses: vec_uses_by_index.get(&root).cloned().unwrap_or_default(),
+                mul_dest: Value(root),
+                mul_ty: ty,
+                has_uses: true,
+                from_address_add: false,
+            });
         }
     }
 
@@ -3232,7 +3333,10 @@ mod tests {
             {
                 let mut no_sib = f.clone();
                 let cfg = analysis::CfgAnalysis::build(&no_sib);
-                assert_eq!(ivsr_with_analysis(&mut no_sib, &cfg, false, true, false), 1);
+                assert_eq!(
+                    ivsr_with_analysis(&mut no_sib, &cfg, false, true, false, false),
+                    1
+                );
             }
             assert_eq!(
                 ivsr_function(&mut f),
@@ -3682,12 +3786,12 @@ mod tests {
         let cfg = analysis::CfgAnalysis::build(&address_add_loop(true, false));
         let mut on = address_add_loop(true, false);
         assert!(
-            ivsr_with_analysis(&mut on, &cfg, false, true, true) > 0,
+            ivsr_with_analysis(&mut on, &cfg, false, true, true, false) > 0,
             "ptr_add=true must reduce the address-forming Add"
         );
         let mut off = address_add_loop(true, false);
         assert_eq!(
-            ivsr_with_analysis(&mut off, &cfg, false, false, true),
+            ivsr_with_analysis(&mut off, &cfg, false, false, true, false),
             0,
             "ptr_add=false must disable the arm entirely"
         );
@@ -5881,7 +5985,10 @@ mod tests {
     fn symbol_recurrence_preserves_non_x86_materialization_policy() {
         let mut func = symbol_recurrence_fixture(24, true);
         let cfg = analysis::CfgAnalysis::build(&func);
-        assert_eq!(ivsr_with_analysis(&mut func, &cfg, false, true, false), 1);
+        assert_eq!(
+            ivsr_with_analysis(&mut func, &cfg, false, true, false, false),
+            1
+        );
         assert_eq!(
             func.blocks[0]
                 .instructions

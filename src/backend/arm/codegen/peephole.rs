@@ -52,6 +52,9 @@
 // CCC_NO_STORE_DSE, CCC_NO_STORE_SINK, CCC_NO_GDSE, CCC_NO_REUSE_STACK_LOADS.
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
+#[path = "peephole_late.rs"]
+pub(super) mod late;
+
 /// Compact classification of an assembly line.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum LineKind {
@@ -757,6 +760,12 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= per_function(&mut lines, &mut kinds, n, retarget_defs_into_copies);
         changed |= per_function(&mut lines, &mut kinds, n, fold_cset_add_to_cinc);
         changed |= per_function(&mut lines, &mut kinds, n, eliminate_dead_moves);
+        changed |= per_function(
+            &mut lines,
+            &mut kinds,
+            n,
+            late::drop_narrow_call_arg_extensions,
+        );
         if rotate && per_function(&mut lines, &mut kinds, n, rotate_simple_loops) {
             changed = true;
             n = split_multiline_slots(&mut lines, &mut kinds);
@@ -830,6 +839,12 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= per_function(&mut lines, &mut kinds, n, fold_cset_add_to_cinc);
             changed2 |= per_function(&mut lines, &mut kinds, n, eliminate_dead_moves);
             changed2 |= per_function(&mut lines, &mut kinds, n, invert_loop_latches);
+            changed2 |= per_function(
+                &mut lines,
+                &mut kinds,
+                n,
+                late::drop_narrow_call_arg_extensions,
+            );
             rounds2 += 1;
         }
     }
@@ -843,6 +858,20 @@ pub fn peephole_optimize(asm: String) -> String {
     if per_function(&mut lines, &mut kinds, n, fold_sign_bit_tests) {
         per_function(&mut lines, &mut kinds, n, eliminate_dead_moves);
     }
+
+    // The late passes (`late`), once, on the settled assignments: copies
+    // first (a `csel` then reads the copy's source), then the flag folds and
+    // the shift fusion, which consume what the copies freed, and writeback
+    // addressing last -- no pass before it needs to see a writeback form.
+    let mut late_changed = per_function(&mut lines, &mut kinds, n, late::forward_block_copies);
+    late_changed |= per_function(&mut lines, &mut kinds, n, late::fold_cset_retests);
+    late_changed |= per_function(&mut lines, &mut kinds, n, late::fold_csel_constants);
+    late_changed |= per_function(&mut lines, &mut kinds, n, late::fuse_shift_into_alu);
+    if late_changed {
+        per_function(&mut lines, &mut kinds, n, eliminate_dead_moves);
+        per_function(&mut lines, &mut kinds, n, late::eliminate_dead_pure_defs);
+    }
+    per_function(&mut lines, &mut kinds, n, late::form_writeback_addressing);
 
     drop_orphaned_save_rows(&lines, &mut kinds, n);
 
@@ -4483,6 +4512,30 @@ fn load_with_extension(load_m: &str, t: &str, ext: &str) -> Option<(&'static str
     let w_dest = |d: &str| d.starts_with('w').then(|| d.to_string());
     let new_m = match (load_m, em, ops.as_slice()) {
         ("ldrb", "sxtb", [d, s]) if w_view(s) => return Some(("ldrsb", d.to_string())),
+        // An extension that repeats the load's own: `ldrsb w8, [M]; sxtb x7,
+        // w8` is `ldrsb x7, [M]` (the byte sign-extended into D's view),
+        // `ldrh w8; uxth w7, w8` is `ldrh w7`.
+        ("ldrsb" | "ldursb", "sxtb", [d, s]) if w_view(s) => {
+            return Some((load_with_static_name(load_m), d.to_string()));
+        }
+        ("ldrsh" | "ldursh", "sxth", [d, s]) if w_view(s) => {
+            return Some((load_with_static_name(load_m), d.to_string()));
+        }
+        ("ldrsw" | "ldursw", "sxtw", [d, s]) if w_view(s) && d.starts_with('x') => {
+            return Some((load_with_static_name(load_m), d.to_string()));
+        }
+        ("ldrb" | "ldurb", "uxtb", [d, s]) if w_view(s) => {
+            (load_with_static_name(load_m), w_dest(d)?)
+        }
+        ("ldrb" | "ldurb", "and", [d, s, m]) if any_view(s) && is_imm(m, 0xff) => {
+            (load_with_static_name(load_m), d.to_string())
+        }
+        ("ldrh" | "ldurh", "uxth", [d, s]) if w_view(s) => {
+            (load_with_static_name(load_m), w_dest(d)?)
+        }
+        ("ldrh" | "ldurh", "and", [d, s, m]) if any_view(s) && is_imm(m, 0xffff) => {
+            (load_with_static_name(load_m), d.to_string())
+        }
         ("ldurb", "sxtb", [d, s]) if w_view(s) => return Some(("ldursb", d.to_string())),
         ("ldrh", "sxth", [d, s]) if w_view(s) => return Some(("ldrsh", d.to_string())),
         ("ldurh", "sxth", [d, s]) if w_view(s) => return Some(("ldursh", d.to_string())),
@@ -4514,6 +4567,23 @@ fn load_with_extension(load_m: &str, t: &str, ext: &str) -> Option<(&'static str
     // A zero-extending load writes the W view and clears bits 63:32.
     let (m, d) = new_m;
     Some((m, format!("w{}", parse_reg(&d))))
+}
+
+/// The `'static` spelling of one of the narrow load mnemonics Pass 3d
+/// rewrites (the extension then folds into the same load).
+fn load_with_static_name(load_m: &str) -> &'static str {
+    match load_m {
+        "ldrsb" => "ldrsb",
+        "ldursb" => "ldursb",
+        "ldrsh" => "ldrsh",
+        "ldursh" => "ldursh",
+        "ldrsw" => "ldrsw",
+        "ldursw" => "ldursw",
+        "ldrb" => "ldrb",
+        "ldurb" => "ldurb",
+        "ldrh" => "ldrh",
+        _ => "ldurh",
+    }
 }
 
 /// Whether operand `op` is the immediate `value` (`#255`, `#0xff`).
@@ -5460,7 +5530,8 @@ mod abs_cneg_tests {
         // `labs`: the shift reads the incoming x0, the XOR its x19 home.  The
         // compare then reads x0 itself: copy propagation forwards `mov x19,
         // x0` into it (a compare's operands are all sources), which takes
-        // the copy off the compare's dependency chain.
+        // the copy off the compare's dependency chain -- and the late
+        // forward propagation does the same for the `cneg`.
         let body = concat!(
             "    mov x19, x0\n",
             "    asr x4, x0, #63\n",
@@ -5472,7 +5543,7 @@ mod abs_cneg_tests {
         let out = peephole_optimize(leaf("labs_", body));
         let insts = instructions(&out);
         assert!(insts.iter().any(|l| l == "cmp x0, #0"), "{out}");
-        assert!(insts.iter().any(|l| l == "cneg x0, x19, lt"), "{out}");
+        assert!(insts.iter().any(|l| l == "cneg x0, x0, lt"), "{out}");
         assert!(
             !insts
                 .iter()
@@ -5540,7 +5611,8 @@ mod abs_cneg_tests {
 
     #[test]
     fn a_result_register_read_after_the_copy_is_not_retargeted() {
-        // x4 stays live after the copy: the negate must still land in x4.
+        // x4 stays live after the copy: the negate must still land in x4
+        // (the copy itself is forwarded into the add and dies).
         let body = concat!(
             "    asr w5, w4, #31\n",
             "    eor w4, w4, w5\n",
@@ -5552,7 +5624,7 @@ mod abs_cneg_tests {
         let out = peephole_optimize(leaf("keep_copy", body));
         let insts = instructions(&out);
         assert!(insts.iter().any(|l| l == "cneg w4, w4, lt"), "{out}");
-        assert!(insts.iter().any(|l| l == "mov x0, x4"), "{out}");
+        assert!(insts.iter().any(|l| l == "add w0, w4, w4"), "{out}");
     }
 
     #[test]
@@ -6504,15 +6576,41 @@ fn thread_trampolines(lines: &mut [String], kinds: &mut [LineKind], n: usize) ->
             }
         }
         let mut rewrites = Vec::new();
+        let mut census: Option<BranchCensus> = None;
         for i in 0..n {
-            if kinds[i] != LineKind::Branch {
+            let conditional = matches!(kinds[i], LineKind::CondBranch | LineKind::CmpBranch);
+            if kinds[i] != LineKind::Branch && !conditional {
                 continue;
             }
-            let Some(target) = branch_target(&lines[i]) else {
+            let target = if conditional {
+                lines[i].split_whitespace().next_back()
+            } else {
+                branch_target(&lines[i])
+            };
+            let Some(target) = target else {
                 continue;
             };
-            if let Some(final_target) = resolved.get(target) {
+            let Some(final_target) = resolved.get(target) else {
+                continue;
+            };
+            if !conditional {
                 rewrites.push((i, format!("    b {}", final_target)));
+                continue;
+            }
+            // A conditional head reaches +-1 MB (`tbz`/`tbnz` +-32 KB): it
+            // is retargeted only when the instruction census proves the new
+            // target within that reach, never on an unmeasurable distance.
+            let census = census.get_or_insert_with(|| BranchCensus::new(lines, kinds));
+            let bit_test = matches!(lines[i].split_whitespace().next(), Some("tbz" | "tbnz"));
+            let reach = if bit_test {
+                TEST_BRANCH_SAFE_DISTANCE
+            } else {
+                COND_BRANCH_SAFE_DISTANCE
+            };
+            if census.distance(i, final_target).is_some_and(|d| d < reach)
+                && let Some(at) = lines[i].rfind(target)
+            {
+                rewrites.push((i, format!("{}{final_target}", &lines[i][..at])));
             }
         }
         rewrites
@@ -7116,29 +7214,14 @@ fn rotate_simple_loops(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
             continue;
         }
 
-        // No calls, returns, or indirect branches inside the loop.
-        let mut bad = false;
-        for j in h..=i {
-            match kinds[j] {
-                LineKind::Ret | LineKind::Call | LineKind::CmpBranch => {
-                    bad = true;
-                    break;
-                }
-                _ => {
-                    let t = lines[j].trim_start();
-                    if t.starts_with("br ") || t.starts_with("blr ") {
-                        bad = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if bad {
-            continue;
-        }
-
-        // Collect the header setup: pure, flag-preserving instructions after
-        // the label, ending in a Compare, followed by a conditional branch.
+        // Collect the header setup: pure instructions after the label (moves,
+        // compares, plain loads), ending in a conditional branch -- `b.cc`
+        // after a compare, or a `cbz`/`cbnz` of a register.  A load is as
+        // duplicable as a move: the copy at the latch runs exactly where the
+        // next iteration's header would, after the same body, so it reads
+        // the same memory, and the header still runs once per iteration plus
+        // once on exit -- the same dynamic access sequence, so even a
+        // volatile access keeps its count and order.
         let mut setup: Vec<usize> = Vec::new();
         let mut pos = h + 1;
         let mut cj = None;
@@ -7149,6 +7232,12 @@ fn rotate_simple_loops(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
             }
             match kinds[pos] {
                 LineKind::CondBranch => {
+                    cj = Some(pos);
+                    break;
+                }
+                LineKind::CmpBranch
+                    if matches!(lines[pos].split_whitespace().next(), Some("cbz" | "cbnz")) =>
+                {
                     cj = Some(pos);
                     break;
                 }
@@ -7166,16 +7255,58 @@ fn rotate_simple_loops(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
                     }
                     pos += 1;
                 }
+                _ if rotatable_header_load(&lines[pos]) => {
+                    setup.push(pos);
+                    if setup.len() > 3 {
+                        break;
+                    }
+                    pos += 1;
+                }
                 _ => break,
             }
         }
         let Some(cj_pos) = cj else { continue };
-        if setup.is_empty() || setup.len() > 3 {
+        let cmp_branch = kinds[cj_pos] == LineKind::CmpBranch;
+
+        // No calls, returns, or indirect branches inside the loop, and no
+        // compare-and-branch but the header's own (their reach is the
+        // conditional branch's, but the rotated copy is only built for the
+        // header).
+        let mut bad = false;
+        for j in h..=i {
+            match kinds[j] {
+                LineKind::Ret | LineKind::Call => {
+                    bad = true;
+                    break;
+                }
+                LineKind::CmpBranch if j != cj_pos => {
+                    bad = true;
+                    break;
+                }
+                _ => {
+                    let t = lines[j].trim_start();
+                    if t.starts_with("br ") || t.starts_with("blr ") {
+                        bad = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if bad || setup.len() > 3 {
+            continue;
+        }
+        if cmp_branch {
+            if rotate_cmp_branch_header(lines, kinds, n, (h, cj_pos, i), &setup) {
+                changed = true;
+            }
+            continue;
+        }
+        if setup.is_empty() {
             continue;
         }
         // The compare must be the last setup instruction: it sets the flags
         // the conditional branch consumes (moves/loads don't touch flags).
-        if kinds[*setup.last().unwrap()] != LineKind::Compare {
+        if setup.last().is_none_or(|&s| kinds[s] != LineKind::Compare) {
             continue;
         }
 
@@ -7227,6 +7358,84 @@ fn rotate_simple_loops(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
         changed = true;
     }
     changed
+}
+
+/// A load a rotated header may duplicate: a plain single-register load
+/// (`ldr`/`ldrb`/`ldrh`/`ldrsb`/`ldrsh`/`ldrsw`) from a bracketed address
+/// with no writeback.  Exclusive, acquire and pair loads are not plain.
+fn rotatable_header_load(line: &str) -> bool {
+    let t = line.trim();
+    let Some((m, ops)) = t.split_once(char::is_whitespace) else {
+        return false;
+    };
+    matches!(m, "ldr" | "ldrb" | "ldrh" | "ldrsb" | "ldrsh" | "ldrsw")
+        && ops.contains('[')
+        && classify_implicit_operands_a64(t).1 == 0
+}
+
+/// `rotate_simple_loops` for a header ending in `cbz`/`cbnz r, L` at
+/// `cj` (the loop spans `h..=i`, `i` being its only `b .Lhdr`).  Either the
+/// branch enters the body (`L` a label inside the loop; the fall-through is
+/// the exit) or it leaves (`L` outside; the fall-through, which must start
+/// with a label, is the body).  The latch's `b .Lhdr` becomes the setup
+/// copy, the branch back into the body (inverted in the second form) and
+/// `b <exit>` -- one branch per iteration instead of two.
+fn rotate_cmp_branch_header(
+    lines: &mut [String],
+    kinds: &mut [LineKind],
+    n: usize,
+    (h, cj, i): (usize, usize, usize),
+    setup: &[usize],
+) -> bool {
+    let Some((m, ops)) = lines[cj].trim().split_once(char::is_whitespace) else {
+        return false;
+    };
+    let Some((reg, target)) = ops.split_once(',') else {
+        return false;
+    };
+    let (m, reg, target) = (
+        m.to_string(),
+        reg.trim().to_string(),
+        target.trim().to_string(),
+    );
+    let label_at = |name: &str, lo: usize, hi: usize| {
+        (lo..hi).any(|l| kinds[l] == LineKind::Label && label_name(lines[l].trim()) == Some(name))
+    };
+    // The first label after the branch: the fall-through block.
+    let fall = ((cj + 1)..n)
+        .find(|&l| kinds[l] != LineKind::Nop)
+        .filter(|&l| kinds[l] == LineKind::Label)
+        .and_then(|l| label_name(lines[l].trim()).map(str::to_string));
+    let Some(fall) = fall else {
+        return false;
+    };
+    let header = label_name(lines[h].trim()).map(str::to_string);
+    let (back_m, body, exit) = if label_at(&target, cj + 1, i + 1) {
+        // Enters the body when taken; the fall-through leaves.
+        if label_at(&fall, cj + 1, i + 1) {
+            return false;
+        }
+        (m.clone(), target.clone(), fall)
+    } else {
+        // Leaves when taken; the fall-through is the body.
+        if !label_at(&fall, cj + 1, i + 1) || label_at(&target, h, i + 1) {
+            return false;
+        }
+        let inverse = if m == "cbz" { "cbnz" } else { "cbz" };
+        (inverse.to_string(), fall, target.clone())
+    };
+    if Some(&exit) == header.as_ref() || exit == body {
+        return false;
+    }
+    let mut repl = String::new();
+    for &s in setup {
+        repl.push_str(&lines[s]);
+        repl.push('\n');
+    }
+    repl.push_str(&format!("    {back_m} {reg}, {body}\n    b {exit}"));
+    lines[i] = repl;
+    kinds[i] = LineKind::Other;
+    true
 }
 
 // ── Loop-carried store sinking ───────────────────────────────────────────────
@@ -9484,9 +9693,12 @@ const A64_CALL_CLOBBER_GP: u64 = 0x7_ffff | (1u64 << 30);
 /// hand-written text) keep the full set: an absent annotation can only cost
 /// precision, never drop a read.
 fn a64_call_reads(line: &str) -> u64 {
+    // The mask is the first token after the tag; the narrow-argument widths
+    // (`late::CALL_NARROW_KEY`) may follow it.
     let args = line
         .split_once(CALL_READS_TAG)
-        .and_then(|(_, mask)| mask.trim().parse::<u64>().ok())
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .and_then(|mask| mask.parse::<u64>().ok())
         .map_or(A64_ARG_GP, |mask| mask & A64_ARG_GP);
     args | A64_CHAIN_GP
 }
@@ -12700,6 +12912,7 @@ f:
     mov x26, x0
     mul w4, w26, w25
     add w5, w0, #1
+    stp w4, w5, [x2]
     ret
 ";
         // x0 is read after the chain: folding into x26 alone would lose

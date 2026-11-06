@@ -43,6 +43,28 @@ pub(super) fn call_gp_arg_reads(arg_classes: &[CallArgClass]) -> Option<u16> {
     Some(mask)
 }
 
+/// The significant width of the integer argument in each GP argument
+/// register (`call_gp_narrow`): 8, 16 or 32 for an argument of that C width,
+/// 0 for a 64-bit (pointer, `long`) one or a register no integer class
+/// names.  Only `IntReg` classes count -- a struct or `__int128` in GP
+/// registers carries all of its bits.
+pub(super) fn call_gp_narrow_widths(arg_classes: &[CallArgClass], arg_types: &[IrType]) -> [u8; 8] {
+    let mut widths = [0u8; 8];
+    for (class, ty) in arg_classes.iter().zip(arg_types) {
+        if let CallArgClass::IntReg { reg_idx } = *class
+            && reg_idx < 8
+        {
+            widths[reg_idx] = match ty {
+                IrType::I8 | IrType::U8 => 8,
+                IrType::I16 | IrType::U16 => 16,
+                IrType::I32 | IrType::U32 => 32,
+                _ => 0,
+            };
+        }
+    }
+    widths
+}
+
 impl ArmCodegen {
     pub(super) fn call_abi_config_impl(&self) -> CallAbiConfig {
         CallAbiConfig::aapcs64()
@@ -308,6 +330,7 @@ impl ArmCodegen {
         };
         let needs_adjusted_load = total_sp_adjust > 0;
         self.call_gp_reads = call_gp_arg_reads(arg_classes);
+        self.call_gp_narrow = call_gp_narrow_widths(arg_classes, arg_types);
 
         self.emit_call_gp_to_temps(args, arg_classes, slot_adjust, needs_adjusted_load);
         self.emit_call_fp_reg_args(
@@ -332,13 +355,15 @@ impl ArmCodegen {
     ) {
         // Taken on every path: a stale set must never reach a later call.
         let reads = self.call_gp_reads.take();
+        let narrow = std::mem::take(&mut self.call_gp_narrow);
         if let Some(name) = direct_name {
             match reads {
                 Some(mask) => self.state.emit_fmt(format_args!(
-                    "    bl {}{}{}",
+                    "    bl {}{}{}{}",
                     name,
                     super::peephole::CALL_READS_TAG,
-                    mask
+                    mask,
+                    super::peephole::late::format_call_narrow(&narrow)
                 )),
                 None => self.state.emit_fmt(format_args!("    bl {}", name)),
             }
