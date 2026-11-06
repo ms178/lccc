@@ -556,10 +556,13 @@ and one it does place must be the truth.
 The third is the same contract on a **32-bit target**, measured on the target
 itself: `run_32_bit_parameters` builds a freestanding `-m32 -nostdlib -static`
 probe (no libc — `_start` writes with `int $0x80`), runs it, and applies the
-identical law with the eight-byte frame record. **GCC 16.2 runs through the same
-probe and the same check when it is installed**, which is a control on the law
-rather than on lccc: GCC's frame is a different layout (it keeps the `double` 8
-bytes higher) and it must still satisfy the rule.
+identical law with the eight-byte frame record. It runs at `-O0` **and** at
+`-O2`, where the same program gives its `double` parameter a different slot
+(measured: `%ebp - 32` against `%ebp - 44`), so the check exercises a layout that
+moves rather than one fixed arrangement. **GCC 16.2 runs through the same probe
+and the same check when it is installed**, which is a control on the law rather
+than on lccc: GCC's frame is a different layout (it keeps the `double` 8 bytes
+higher) and it must still satisfy the rule.
 
 Controls (all measured): a deliberate sign error in `parameter_homes` produces 88
 failures and GDB reports `pq_args.k` as `0` where the program passed `11`;
@@ -649,8 +652,9 @@ offsets for the same program.
 `-m32 -nostdlib -static` probe directly on the target — `_start`, `int $0x80`,
 no libc — because a 64-bit host usually cannot link a 32-bit libc and a check
 that cannot run is not a check. It requires 11 of 11 parameters to resolve to the
-address the program took, and GCC 16.2 is run through the same probe and the same
-law as a control: 11 of 11 for both compilers, with different frame layouts.
+address the program took, at `-O0` and at `-O2` (two different frame layouts for
+the same source), and GCC 16.2 is run through the same probe and the same law as
+a control: 11 of 11 for both compilers.
 Reverting the direct-home rule produces 10 failures, reverting the two
 delegations produces 11.
 
