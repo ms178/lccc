@@ -12,9 +12,11 @@ use crate::backend::generation::{
 use crate::backend::regalloc::PhysReg;
 use crate::backend::state::StackSlot;
 use crate::backend::traits::ArchCodegen;
+use crate::common::fx_hash::FxHashMap;
 use crate::common::types::IrType;
 use crate::emit;
 use crate::ir::reexports::{Instruction, IntrinsicOp, IrFunction, Value};
+use std::collections::hash_map::Entry;
 
 fn has_overaligned_call_args(func: &IrFunction) -> bool {
     func.blocks.iter().any(|block| {
@@ -25,6 +27,32 @@ fn has_overaligned_call_args(func: &IrFunction) -> bool {
             _ => false,
         })
     })
+}
+
+/// Merge one instruction verdict into a slot's aggregate eligibility.
+///
+/// This is the exact fold of the former per-parameter walk: the extent starts
+/// at 1, an `Alloca` raises it, and the FIRST disqualifier (`None`) makes the
+/// whole slot ineligible -- a later benign instruction must not resurrect it.
+/// Extracted as a pure function so the property test can compare it against a
+/// literal re-implementation of the old loop over thousands of random streams.
+fn merge_param_home_verdict(
+    index: &mut FxHashMap<i64, Option<i64>>,
+    slot: i64,
+    verdict: Option<i64>,
+) {
+    match index.entry(slot) {
+        Entry::Occupied(mut e) => {
+            let merged = match (e.get(), verdict) {
+                (Some(cur), Some(v)) => Some((*cur).max(v)),
+                _ => None,
+            };
+            *e.get_mut() = merged;
+        }
+        Entry::Vacant(e) => {
+            e.insert(verdict.map(|v| v.max(1)));
+        }
+    }
 }
 
 impl I686Codegen {
@@ -991,12 +1019,23 @@ impl I686Codegen {
     ///
     /// Kill switch: `CCC_NO_PARAM_DIRECT_HOME=1` restores the homing copy
     /// verbatim (bisection escape hatch, mirrors the other `CCC_NO_*` gates).
+    /// Look up the direct-home eligibility of `slot` in the O(1) index built
+    /// once per function by `param_home_eligibility_index`.
+    ///
+    /// The old implementation walked EVERY instruction of EVERY block for
+    /// EVERY stack parameter: O(params x instructions). `limits-fndefn.c`
+    /// declares 100,000 formal parameters; Callgrind attributed 39.7% of the
+    /// whole compile (271,167,897 of 683,538,828 instructions at 1,000
+    /// parameters) to that walk, and the measured wall time scaled 0.120 s
+    /// (1,000) -> 4.725 s (10,000) -> 589.493 s (100,000). The answer depends
+    /// only on the StackSlot an instruction's dest is assigned to, plus four
+    /// immutable value sets, so one pass serves every parameter.
     fn stack_param_direct_home_eligible(
         &self,
-        func: &IrFunction,
         dest_id: u32,
         slot: StackSlot,
         ty: IrType,
+        index: &FxHashMap<i64, Option<i64>>,
     ) -> Option<i64> {
         if std::env::var_os("CCC_NO_PARAM_DIRECT_HOME").is_some() {
             return None;
@@ -1007,35 +1046,55 @@ impl I686Codegen {
         if ty.size() > 4 {
             return None;
         }
-        let mut extent = 1i64;
+        // A slot with no instruction assigned to it kept `extent = 1` in the
+        // old walk. A slot present but marked `None` was disqualified; do NOT
+        // resurrect it with `unwrap_or`.
+        match index.get(&slot.0) {
+            Some(v) => *v,
+            None => Some(1),
+        }
+    }
+
+    /// One instruction's contribution to its dest slot's eligibility.
+    /// `None` disqualifies direct homing; `Some(n)` raises the redirected
+    /// frame extent to `n` (1 for an ordinary instruction).
+    #[inline]
+    fn param_home_verdict(&self, inst: &Instruction, dest: u32) -> Option<i64> {
+        if self.state.wide_values.contains(&dest)
+            || self.state.i128_values.contains(&dest)
+            || self.state.vector_values.contains(&dest)
+            || self.state.vector128_values.contains(&dest)
+        {
+            return None;
+        }
+        if let Instruction::Alloca { size, .. } = inst {
+            return if *size > 4 { None } else { Some(*size as i64) };
+        }
+        if let Some(res_ty) = inst.result_type() {
+            if res_ty.size() > 4 {
+                return None;
+            }
+        }
+        Some(1)
+    }
+
+    /// Build the whole eligibility index in ONE O(instructions) pass.
+    /// `value_locations` is immutable during `emit_store_params_impl` (there
+    /// are no writes to it in this module), so the index stays valid for the
+    /// entire parameter loop. Full-corpus A/B object parity against the
+    /// pre-change compiler is the integration proof.
+    fn param_home_eligibility_index(&self, func: &IrFunction) -> FxHashMap<i64, Option<i64>> {
+        let mut index: FxHashMap<i64, Option<i64>> = FxHashMap::default();
         for block in &func.blocks {
             for inst in &block.instructions {
                 let Some(dest) = inst.dest() else { continue };
-                if self.state.get_slot(dest.0).map(|s| s.0) != Some(slot.0) {
+                let Some(slot) = self.state.get_slot(dest.0) else {
                     continue;
-                }
-                if self.state.wide_values.contains(&dest.0)
-                    || self.state.i128_values.contains(&dest.0)
-                    || self.state.vector_values.contains(&dest.0)
-                    || self.state.vector128_values.contains(&dest.0)
-                {
-                    return None;
-                }
-                if let Instruction::Alloca { size, .. } = inst {
-                    if *size > 4 {
-                        return None;
-                    }
-                    extent = extent.max(*size as i64);
-                    continue;
-                }
-                if let Some(res_ty) = inst.result_type() {
-                    if res_ty.size() > 4 {
-                        return None;
-                    }
-                }
+                };
+                merge_param_home_verdict(&mut index, slot.0, self.param_home_verdict(inst, dest.0));
             }
         }
-        Some(extent)
+        index
     }
 
     pub(super) fn emit_store_params_impl(&mut self, func: &IrFunction) {
@@ -1073,6 +1132,11 @@ impl I686Codegen {
                 }
             }
         }
+
+        // O(1) direct-home eligibility for the WHOLE parameter loop, built in
+        // one O(instructions) pass. See stack_param_direct_home_eligible for
+        // the measured O(params x instructions) hotspot this replaces.
+        let param_home_index = self.param_home_eligibility_index(func);
 
         // NOTE: ParamRef dest values never share an over-aligned (>16)
         // parameter alloca's slot — resolve_copy_aliases refuses the share
@@ -1584,7 +1648,7 @@ impl I686Codegen {
                             emit!(self.state, "    movl %eax, {}", dst_ref_hi);
                         }
                     } else if let Some(extent) =
-                        self.stack_param_direct_home_eligible(func, dest_id, slot, ty)
+                        self.stack_param_direct_home_eligible(dest_id, slot, ty, &param_home_index)
                     {
                         // Direct homing (GCC model): the callee owns the
                         // incoming argument slot, so the ParamRef dest lives
@@ -2104,5 +2168,79 @@ fn emit_stack_alloc_i686(
         state.emit("    subl %eax, %esp");
         state.emit("    orl $0, (%esp)");
         state.emit_fmt(format_args!("    movl {}(%ebp), %eax", saved_eax_ebp_off));
+    }
+}
+
+#[cfg(test)]
+mod param_home_index_tests {
+    use super::merge_param_home_verdict;
+    use crate::common::fx_hash::FxHashMap;
+
+    /// A literal re-implementation of the OLD per-parameter walk: extent
+    /// starts at 1, the first disqualifier returns None, benign instructions
+    /// raise it. This is the oracle the new fold must agree with exactly.
+    fn reference_walk(slots: &[i64], verdicts: &[Option<i64>], q: i64) -> Option<i64> {
+        let mut extent = 1i64;
+        for (&s, &v) in slots.iter().zip(verdicts) {
+            if s != q {
+                continue;
+            }
+            match v {
+                None => return None,
+                Some(n) => extent = extent.max(n),
+            }
+        }
+        Some(extent)
+    }
+
+    #[test]
+    fn one_pass_index_matches_the_former_per_parameter_walk() {
+        let mut seed = 0x5EED_1234_C0FF_EE01u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..3000 {
+            let len = (next() % 48) as usize;
+            let nslots = 1 + (next() % 7) as i64;
+            let slots: Vec<i64> = (0..len).map(|_| (next() % nslots as u64) as i64).collect();
+            let verdicts: Vec<Option<i64>> = (0..len)
+                .map(|_| match next() % 6 {
+                    0 => None,
+                    1 => Some(1),
+                    2 => Some(2),
+                    3 => Some(3),
+                    4 => Some(4),
+                    _ => Some(1),
+                })
+                .collect();
+            let mut index: FxHashMap<i64, Option<i64>> = FxHashMap::default();
+            for (&s, &v) in slots.iter().zip(&verdicts) {
+                merge_param_home_verdict(&mut index, s, v);
+            }
+            for q in 0..nslots {
+                let got = match index.get(&q) {
+                    Some(v) => *v,
+                    None => Some(1),
+                };
+                assert_eq!(
+                    got,
+                    reference_walk(&slots, &verdicts, q),
+                    "slot {q} of slots={slots:?} verdicts={verdicts:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_disqualified_slot_is_never_resurrected() {
+        let mut index: FxHashMap<i64, Option<i64>> = FxHashMap::default();
+        merge_param_home_verdict(&mut index, 7, Some(4));
+        merge_param_home_verdict(&mut index, 7, None);
+        merge_param_home_verdict(&mut index, 7, Some(1));
+        assert_eq!(index.get(&7), Some(&None));
+        assert_eq!(index.get(&8), None); // absent slot keeps extent 1
     }
 }

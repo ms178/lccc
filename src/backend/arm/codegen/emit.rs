@@ -73,6 +73,14 @@ pub(super) fn callee_saved_name(reg: PhysReg) -> &'static str {
         13 => "x13",
         14 => "x14",
         15 => "x15",
+        // The remaining real AArch64 general-purpose registers. They are
+        // outside the allocator's pools (IP0/IP1, platform, FP, LR), but an
+        // explicit register variable or a scratch path can still name one;
+        // naming it is always valid, whereas the old `unreachable!` aborted
+        // the compile. Keep the GP id space total over x0..x30.
+        16 => "x16",
+        17 => "x17",
+        18 => "x18",
         // Callee-saved registers
         19 => "x19",
         20 => "x20",
@@ -84,7 +92,12 @@ pub(super) fn callee_saved_name(reg: PhysReg) -> &'static str {
         26 => "x26",
         27 => "x27",
         28 => "x28",
-        _ => unreachable!("invalid ARM register index"),
+        29 => "x29",
+        30 => "x30",
+        // 31 is xzr/sp (not a writable GP home) and 32..55 are FP/SIMD ids
+        // handled by `is_arm_fp_phys` + `arm_fp_name`. Reaching here is an
+        // internal invariant violation: fail loudly with the offending id.
+        _ => unreachable!("invalid ARM register index {}", reg.0),
     }
 }
 
@@ -107,6 +120,9 @@ pub(super) fn callee_saved_name_32(reg: PhysReg) -> &'static str {
         13 => "w13",
         14 => "w14",
         15 => "w15",
+        16 => "w16",
+        17 => "w17",
+        18 => "w18",
         // Callee-saved registers
         19 => "w19",
         20 => "w20",
@@ -118,7 +134,9 @@ pub(super) fn callee_saved_name_32(reg: PhysReg) -> &'static str {
         26 => "w26",
         27 => "w27",
         28 => "w28",
-        _ => unreachable!("invalid ARM register index"),
+        29 => "w29",
+        30 => "w30",
+        _ => unreachable!("invalid ARM register index {}", reg.0),
     }
 }
 
