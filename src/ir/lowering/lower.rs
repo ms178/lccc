@@ -54,8 +54,7 @@ pub struct Lowerer {
     /// after the whole unit has been lowered.  Copying the layout here, when the
     /// declaration is still live, is what lets the writer describe a local of
     /// such a type at all; see `capture_debug_layouts`.
-    pub(super) debug_record_layouts:
-        FxHashMap<String, crate::common::types::RcLayout>,
+    pub(super) debug_record_layouts: FxHashMap<String, crate::common::types::RcLayout>,
     /// Counter for unique static local variable names
     pub(super) next_static_local: u32,
     pub(super) module: IrModule,
