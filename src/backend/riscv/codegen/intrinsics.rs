@@ -370,10 +370,10 @@ impl RiscvCodegen {
                 // sign INVERTED (fnmadd = -(rs1*rs2) - rs3,
                 // fnmsub = -(rs1*rs2) + rs3, per the unprivileged ISA
                 // spec's F-extension table).
-                // NOTE: unreachable from C today (the fma libcall fold is
-                // x86/ARM-gated); the arm exists so the target-neutral IR
-                // variant is lowerable on every backend, mirroring how
-                // this file already lowers the plain FmaScalar variants.
+                // Reached from C through the fma/fmaf libcall fold and the
+                // IR negation peel (`fma(-a, b, c)` and friends), which RV64
+                // enables like AArch64: the F/D extensions carry all four
+                // fused spellings.
                 let is_f64 = matches!(op, IntrinsicOp::FmaScalarF64Signed(..));
                 let (mv, sx) = if is_f64 {
                     ("fmv.d.x", "fmv.x.d")

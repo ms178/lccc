@@ -753,6 +753,11 @@ impl ArmCodegen {
                         }
                     }
                     Instruction::GetElementPtr { .. } | Instruction::LabelAddr { .. } => {}
+                    // Scalar FP intrinsics lower to inline instructions on
+                    // caller-saved scratch (`fabs`, `fsqrt`, `frint*`, the
+                    // `fmadd` family, copysign's bit merge in x0/x1): no
+                    // call and no x29.  `fabs(x)` kept a frame record.
+                    Instruction::Intrinsic { op, .. } if arm_call_free_scalar_intrinsic(op) => {}
                     Instruction::GlobalAddr { name, .. } => {
                         if self.state.tls_symbols.contains(name)
                             && matches!(
@@ -1192,6 +1197,29 @@ impl ArmCodegen {
             }
         }
     }
+}
+
+/// Scalar FP intrinsics whose AArch64 lowering (`emit_intrinsic_arm`) is
+/// inline instructions on caller-saved scratch registers only: no `bl`, no
+/// frame-pointer access, no slot of its own.  The frameless-leaf allowlist
+/// admits exactly these; every other intrinsic keeps the frame.
+fn arm_call_free_scalar_intrinsic(op: &crate::ir::reexports::IntrinsicOp) -> bool {
+    use crate::ir::reexports::IntrinsicOp;
+    matches!(
+        op,
+        IntrinsicOp::FabsF32
+            | IntrinsicOp::FabsF64
+            | IntrinsicOp::SqrtF32
+            | IntrinsicOp::SqrtF64
+            | IntrinsicOp::RoundScalarF32(_)
+            | IntrinsicOp::RoundScalarF64(_)
+            | IntrinsicOp::FmaScalarF32
+            | IntrinsicOp::FmaScalarF64
+            | IntrinsicOp::FmaScalarF32Signed(..)
+            | IntrinsicOp::FmaScalarF64Signed(..)
+            | IntrinsicOp::CopysignF32
+            | IntrinsicOp::CopysignF64
+    )
 }
 
 #[cfg(test)]

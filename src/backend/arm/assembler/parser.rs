@@ -1874,6 +1874,13 @@ fn parse_single_operand(s: &str) -> Result<Operand, String> {
                             "4h" | "8h" => "h".to_string(),
                             "2s" | "4s" => "s".to_string(),
                             "1d" | "2d" => "d".to_string(),
+                            // BFDOT's indexed operand names a *pair* of
+                            // BFloat16 elements (`v17.2h[1]`, GNU as 2.47);
+                            // it stays distinct so no `.h[i]` form takes it.
+                            "2h" => "2h".to_string(),
+                            // SDOT/UDOT/USDOT/SUDOT index a group of four
+                            // bytes (`v17.4b[3]`), the same pairing rule.
+                            "4b" => "4b".to_string(),
                             _ => return Ok(Operand::Symbol(s.to_string())),
                         };
                         return Ok(Operand::RegLane {
@@ -1903,6 +1910,10 @@ fn parse_single_operand(s: &str) -> Result<Operand, String> {
                     | "1d"
                     | "2d"
                     | "1q"
+                    // `2h`: the FEAT_FP16 scalar pairwise source
+                    // (`faddp h3, v29.2h`) and the FEAT_FHM 64-bit source
+                    // (`fmlal v3.2s, v29.2h, v17.2h`).
+                    | "2h"
                     | "b"
                     | "h"
                     | "s"

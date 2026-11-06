@@ -45,6 +45,7 @@ const fn fp_arith_name(opcode: u32) -> &'static str {
         0b0101 => "fmin",
         0b0110 => "fmaxnm",
         0b0111 => "fminnm",
+        0b1000 => "fnmul",
         _ => "scalar-FP arithmetic",
     }
 }
@@ -291,7 +292,7 @@ pub(crate) fn encode_fmov(operands: &[Operand]) -> Result<EncodeResult, String> 
     // grammar: a candidate matches iff its value equals the requested one
     // under the destination's precision (GAS rounds `#1.00000001` into
     // f32 1.0 for `fmov s0` and rejects `#1.0000001`, measured).
-    if !matches!(operands[1], Operand::Reg(_)) {
+    if !matches!(operands[1], Operand::Reg(_) | Operand::RegLane { .. }) {
         let want: f64 = match &operands[1] {
             Operand::Imm(v) => *v as f64,
             Operand::Expr(e) => e
@@ -306,6 +307,9 @@ pub(crate) fn encode_fmov(operands: &[Operand]) -> Result<EncodeResult, String> 
         };
         let rd_name = match &operands[0] {
             Operand::Reg(r) => r.to_lowercase(),
+            Operand::RegArrangement { reg, arrangement } => {
+                return encode_fmov_vector_imm(reg, arrangement, want);
+            }
             other => {
                 return Err(format!(
                     "fmov: expected an FP destination register, got {other:?}"
@@ -320,23 +324,11 @@ pub(crate) fn encode_fmov(operands: &[Operand]) -> Result<EncodeResult, String> 
         }
         let rd = parse_reg_num(&rd_name).ok_or_else(|| format!("fmov: bad dest `{rd_name}`"))?;
         let ftype = fp_ftype_letter(letter, "fmov")?;
-        for imm8 in 0u32..=0xFF {
-            let cand = fmov_imm8_value(imm8);
-            let hit = match letter {
-                b'd' => cand == want,
-                b's' => (want as f32) as f64 == cand,
-                _ => f64_as_f16(want) == Some(cand),
-            };
-            if hit {
-                // 0 00 11110 ftype 1 imm8 1 Rn(=0) Rd
-                let word = (0b00011110u32 << 24)
-                    | (ftype << 22)
-                    | (1 << 21)
-                    | (imm8 << 13)
-                    | (1 << 12)
-                    | rd;
-                return Ok(EncodeResult::Word(word));
-            }
+        if let Some(imm8) = fp_imm8_for(want, letter) {
+            // 0 00 11110 ftype 1 imm8 1 Rn(=0) Rd
+            let word =
+                (0b00011110u32 << 24) | (ftype << 22) | (1 << 21) | (imm8 << 13) | (1 << 12) | rd;
+            return Ok(EncodeResult::Word(word));
         }
         return Err(format!(
             "fmov: the value {} is not representable by the 8-bit floating-point \
@@ -355,6 +347,9 @@ pub(crate) fn encode_fmov(operands: &[Operand]) -> Result<EncodeResult, String> 
 
     let (rd_name, rm_name) = match (&operands[0], &operands[1]) {
         (Operand::Reg(a), Operand::Reg(b)) => (a.clone(), b.clone()),
+        (Operand::RegLane { .. }, Operand::Reg(_)) | (Operand::Reg(_), Operand::RegLane { .. }) => {
+            return encode_fmov_top_half(operands);
+        }
         _ => return Err("fmov needs register operands".to_string()),
     };
 
@@ -373,6 +368,201 @@ pub(crate) fn encode_fmov(operands: &[Operand]) -> Result<EncodeResult, String> 
             "fmov: at least one operand must be a floating-point register, but `{rd_name}` and `{rm_name}` are both general-purpose (use `mov`)"
         )),
     }
+}
+
+/// The FMOV 8-bit immediate whose value equals `want` at the precision of
+/// `letter` (`h`, `s` or `d`), or `None` when no encoding exists.
+///
+/// The 256 candidates are enumerated rather than inverted from the bit
+/// grammar: a candidate matches iff it equals the requested value once that
+/// value is rounded to the element precision, which is GAS's rule (`fmov s0,
+/// #1.00000001` rounds into 1.0 and assembles; `#1.0000001` does not).
+fn fp_imm8_for(want: f64, letter: u8) -> Option<u32> {
+    (0u32..=0xFF).find(|&imm8| {
+        let cand = fmov_imm8_value(imm8);
+        match letter {
+            b'd' => cand == want,
+            b's' => f64::from(want as f32) == cand,
+            _ => f64_as_f16(want) == Some(cand),
+        }
+    })
+}
+
+/// FMOV (vector, immediate): `0 Q op 0111100000 a:b:c 1111 o2 1 d:e:f:g:h Rd`.
+///
+/// `.2s`/`.4s` use op=0, o2=0; `.2d` is Q=1, op=1; the FEAT_FP16 `.4h`/`.8h`
+/// forms set o2.  The 8-bit immediate is the scalar FMOV one, compared at the
+/// element precision.  GNU as 2.47: `fmov v3.4s, #1.0` = 0x4f03f603, `fmov
+/// v3.2d, #-2.5` = 0x6f04f483, `fmov v3.4h, #1.0` = 0x0f03fe03.  A compiler
+/// splats an FP constant with exactly this instruction, and inline assembly
+/// that did so could not be assembled at all.
+fn encode_fmov_vector_imm(reg: &str, arrangement: &str, want: f64) -> Result<EncodeResult, String> {
+    let (q, op, o2, letter) = match arrangement {
+        "2s" => (0u32, 0u32, 0u32, b's'),
+        "4s" => (1, 0, 0, b's'),
+        "2d" => (1, 1, 0, b'd'),
+        "4h" => (0, 0, 1, b'h'),
+        "8h" => (1, 0, 1, b'h'),
+        _ => {
+            return Err(format!(
+                "fmov: `{reg}.{arrangement}` has no floating-point immediate form \
+                 (the arrangement must be 2s, 4s, 2d, 4h or 8h)"
+            ));
+        }
+    };
+    if !reg.starts_with(['v', 'V']) {
+        return Err(format!(
+            "fmov: `{reg}.{arrangement}` is not a vector register"
+        ));
+    }
+    let rd = parse_reg_num(reg).ok_or_else(|| format!("fmov: bad vector register `{reg}`"))?;
+    let imm8 = fp_imm8_for(want, letter).ok_or_else(|| {
+        format!(
+            "fmov: {want} is not representable by the 8-bit floating-point immediate \
+             (0.0 has no FMOV encoding; use movi)"
+        )
+    })?;
+    Ok(EncodeResult::Word(
+        (q << 30)
+            | (op << 29)
+            | (0b0111100000 << 19)
+            | ((imm8 >> 5) << 16)
+            | (0b1111 << 12)
+            | (o2 << 11)
+            | (1 << 10)
+            | ((imm8 & 0x1F) << 5)
+            | rd,
+    ))
+}
+
+/// FMOV (general) between a 64-bit general register and the upper half of a
+/// vector register: `fmov Vd.d[1], Xn` = 0x9eaf0000 | n<<5 | d and `fmov Xd,
+/// Vn.d[1]` = 0x9eae0000 | n<<5 | d (GNU as 2.47; rmode=01, opcode 11x).
+/// The lane must be `d[1]` and the general register 64-bit -- GAS rejects
+/// `d[0]`, `s[1]` and W registers -- and 31 is the zero register.
+fn encode_fmov_top_half(operands: &[Operand]) -> Result<EncodeResult, String> {
+    let (lane_idx, gp_idx, to_vector) = match (&operands[0], &operands[1]) {
+        (Operand::RegLane { .. }, _) => (0, 1, true),
+        _ => (1, 0, false),
+    };
+    let Some(Operand::RegLane {
+        reg,
+        elem_size,
+        index,
+    }) = operands.get(lane_idx)
+    else {
+        return Err("fmov: expected a vector lane operand".to_string());
+    };
+    if elem_size != "d" || *index != 1 || !reg.starts_with(['v', 'V']) {
+        return Err(format!(
+            "fmov: `{reg}.{elem_size}[{index}]` is not a movable lane; the only \
+             general-register lane form is Vn.d[1]"
+        ));
+    }
+    let v = parse_reg_num(reg).ok_or_else(|| format!("fmov: bad vector register `{reg}`"))?;
+    let gp = reg_operand(operands, gp_idx, GpRole::RegOrZr, "fmov")?;
+    if !gp.is_64 {
+        return Err("fmov: the general register of a Vn.d[1] move must be 64-bit".to_string());
+    }
+    let (rd, rn, opcode) = if to_vector {
+        (v, gp.num, 0b111u32)
+    } else {
+        (gp.num, v, 0b110)
+    };
+    Ok(EncodeResult::Word(
+        (1 << 31)
+            | (0b0011110 << 24)
+            | (0b10 << 22)
+            | (1 << 21)
+            | (0b01 << 19)
+            | (opcode << 16)
+            | (rn << 5)
+            | rd,
+    ))
+}
+
+/// FCCMP / FCCMPE `Fn, Fm, #nzcv, cond`:
+/// `0 0 0 11110 ftype 1 Rm cond 01 Rn op nzcv` (op = 1 for the signaling
+/// FCCMPE).  GNU as 2.47: `fccmp s3, s29, #4, ne` = 0x1e3d1464, `fccmpe d3,
+/// d29, #15, lt` = 0x1e7db47f, `fccmp h3, h29, #0, eq` = 0x1efd0460.  This is
+/// what a compiler emits for `a < b && c < d` on floating point; it was
+/// missing from the assembler entirely.
+pub(crate) fn encode_fccmp(operands: &[Operand], signaling: bool) -> Result<EncodeResult, String> {
+    let mn = if signaling { "fccmpe" } else { "fccmp" };
+    if operands.len() != 4 {
+        return Err(format!(
+            "{mn} takes 4 operands (Fn, Fm, #nzcv, cond), got {}",
+            operands.len()
+        ));
+    }
+    let (regs, letter) = fp_same_width(operands, 2, mn)?;
+    let ftype = fp_ftype_letter(letter, mn)?;
+    let nzcv = match operands.get(2) {
+        Some(Operand::Imm(v)) if (0..=15).contains(v) => *v as u32,
+        other => {
+            return Err(format!(
+                "{mn}: #nzcv must be an immediate 0-15, got {other:?}"
+            ));
+        }
+    };
+    let cond = match operands.get(3) {
+        Some(Operand::Cond(c)) => {
+            encode_cond(c).ok_or_else(|| format!("{mn}: invalid condition `{c}`"))?
+        }
+        other => return Err(format!("{mn}: expected a condition code, got {other:?}")),
+    };
+    Ok(EncodeResult::Word(
+        (0b00011110 << 24)
+            | (ftype << 22)
+            | (1 << 21)
+            | (regs[1] << 16)
+            | (cond << 12)
+            | (0b01 << 10)
+            | (regs[0] << 5)
+            | (u32::from(signaling) << 4)
+            | nzcv,
+    ))
+}
+
+/// FJCVTZS `Wd, Dn` (FEAT_JSCVT): JavaScript-semantics double-to-int32,
+/// `0 0 0 11110 01 1 11 110 000000 Rn Rd` = 0x1e7e0000 | n<<5 | d
+/// (`fjcvtzs w3, d29` = 0x1e7e03a3, GNU as 2.47).
+pub(crate) fn encode_fjcvtzs(operands: &[Operand]) -> Result<EncodeResult, String> {
+    if operands.len() != 2 {
+        return Err(format!(
+            "fjcvtzs takes 2 operands (Wd, Dn), got {}",
+            operands.len()
+        ));
+    }
+    let gp = reg_operand(operands, 0, GpRole::RegOrZr, "fjcvtzs")?;
+    if gp.is_64 {
+        return Err("fjcvtzs: the destination must be a W register".to_string());
+    }
+    let (rn, letter, name) = fp_reg(operands, 1, "fjcvtzs")?;
+    if letter != b'd' {
+        return Err(format!(
+            "fjcvtzs: the source must be a D register, got `{name}`"
+        ));
+    }
+    Ok(EncodeResult::Word(0x1e7e_0000 | (rn << 5) | gp.num))
+}
+
+/// BFCVT `Hd, Sn` (FEAT_BF16): single to BFloat16, FP data-processing
+/// 1-source with ftype=01, opcode 000110 -- `bfcvt h3, s29` = 0x1e6343a3
+/// (GNU as 2.47).
+pub(crate) fn encode_bfcvt(operands: &[Operand]) -> Result<EncodeResult, String> {
+    if operands.len() != 2 {
+        return Err(format!(
+            "bfcvt takes 2 operands (Hd, Sn), got {}",
+            operands.len()
+        ));
+    }
+    let (rd, ld, nd) = fp_reg(operands, 0, "bfcvt")?;
+    let (rn, ln, nn) = fp_reg(operands, 1, "bfcvt")?;
+    if ld != b'h' || ln != b's' {
+        return Err(format!("bfcvt: expected `Hd, Sn`, got `{nd}, {nn}`"));
+    }
+    Ok(EncodeResult::Word(0x1e63_4000 | (rn << 5) | rd))
 }
 
 pub(crate) fn encode_fp_arith(operands: &[Operand], opcode: u32) -> Result<EncodeResult, String> {

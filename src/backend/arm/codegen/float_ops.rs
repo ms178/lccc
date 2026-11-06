@@ -83,6 +83,28 @@ impl ArmCodegen {
         }
     }
 
+    /// `-x` for an F32/F64 value: `fneg dD, dS` from wherever the operand
+    /// lives into the destination's home -- one instruction for register
+    /// homes.  The accumulator form (`emit_float_neg_impl`) bounced the bits
+    /// through x0 (`fmov x0, dS; fmov d0, x0; fneg d0, d0; fmov x0, d0;
+    /// fmov dD, x0`): five instructions and two domain crossings for an
+    /// exact sign flip.  Same instruction, same result, NaN payloads
+    /// included.
+    pub(super) fn emit_float_neg_reg(&mut self, dest: &Value, src: &Operand, ty: IrType) {
+        let scratch = if ty == IrType::F32 { "s0" } else { "d0" };
+        let output = self
+            .reg_assignments
+            .get(&dest.0)
+            .copied()
+            .filter(|r| is_arm_fp_phys(*r))
+            .map(|r| arm_fp_name(r, ty))
+            .unwrap_or_else(|| scratch.to_string());
+        let input = self.float_operand_reg(src, ty, scratch);
+        self.state
+            .emit_fmt(format_args!("    fneg {}, {}", output, input));
+        self.store_float_reg(dest, ty, &output);
+    }
+
     pub(super) fn store_float_reg(&mut self, dest: &Value, ty: IrType, source: &str) {
         if let Some(&phys) = self.reg_assignments.get(&dest.0) {
             if is_arm_fp_phys(phys) {

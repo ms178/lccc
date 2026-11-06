@@ -7,6 +7,42 @@ use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;
 use crate::ir::reexports::{IrConst, Operand, Value};
 
+/// The AAPCS64 GP argument registers (bit N = xN) that a call with these
+/// argument classes passes values in, or `None` when a class could stage a
+/// GP register this does not model -- the call is then published without
+/// the annotation and the peephole keeps assuming all of x0-x8.
+///
+/// FP/SIMD-register, stack and zero-size classes name no GP register.  A
+/// span reaching past x7 cannot come from the AAPCS64 classifier, so it is
+/// refused rather than truncated.
+pub(super) fn call_gp_arg_reads(arg_classes: &[CallArgClass]) -> Option<u16> {
+    let mut mask = 0u16;
+    for class in arg_classes {
+        let (base, count) = match *class {
+            CallArgClass::IntReg { reg_idx } => (reg_idx, 1),
+            CallArgClass::I128RegPair { base_reg_idx } => (base_reg_idx, 2),
+            CallArgClass::StructByValReg { base_reg_idx, size } => {
+                (base_reg_idx, size.div_ceil(8).max(1))
+            }
+            CallArgClass::FloatReg { .. }
+            | CallArgClass::F128Reg { .. }
+            | CallArgClass::StructHfaReg { .. }
+            | CallArgClass::Stack
+            | CallArgClass::F128Stack
+            | CallArgClass::I128Stack
+            | CallArgClass::StructByValStack { .. }
+            | CallArgClass::LargeStructStack { .. }
+            | CallArgClass::ZeroSizeSkip => continue,
+            _ => return None,
+        };
+        let end = base.checked_add(count).filter(|&end| end <= 8)?;
+        for reg in base..end {
+            mask |= 1 << reg;
+        }
+    }
+    Some(mask)
+}
+
 impl ArmCodegen {
     pub(super) fn call_abi_config_impl(&self) -> CallAbiConfig {
         CallAbiConfig::aapcs64()
@@ -271,6 +307,7 @@ impl ArmCodegen {
             total_sp_adjust
         };
         let needs_adjusted_load = total_sp_adjust > 0;
+        self.call_gp_reads = call_gp_arg_reads(arg_classes);
 
         self.emit_call_gp_to_temps(args, arg_classes, slot_adjust, needs_adjusted_load);
         self.emit_call_fp_reg_args(
@@ -293,8 +330,18 @@ impl ArmCodegen {
         indirect: bool,
         stack_arg_space: usize,
     ) {
+        // Taken on every path: a stale set must never reach a later call.
+        let reads = self.call_gp_reads.take();
         if let Some(name) = direct_name {
-            self.state.emit_fmt(format_args!("    bl {}", name));
+            match reads {
+                Some(mask) => self.state.emit_fmt(format_args!(
+                    "    bl {}{}{}",
+                    name,
+                    super::peephole::CALL_READS_TAG,
+                    mask
+                )),
+                None => self.state.emit_fmt(format_args!("    bl {}", name)),
+            }
         } else if indirect {
             let spill_offset = stack_arg_space as i64;
             if Self::is_valid_imm_offset(spill_offset, "ldr", "x17") {
@@ -374,5 +421,52 @@ impl ArmCodegen {
         // must not claim it holds `dest`: every consumer reads the 16-byte
         // home.
         self.state.reg_cache.invalidate_all();
+    }
+}
+
+#[cfg(test)]
+mod call_gp_arg_reads_tests {
+    use super::call_gp_arg_reads;
+    use crate::backend::call_abi::CallArgClass;
+
+    #[test]
+    fn masks_follow_the_argument_classes() {
+        use CallArgClass::*;
+        let classes = [
+            IntReg { reg_idx: 0 },
+            FloatReg { reg_idx: 0 },
+            I128RegPair { base_reg_idx: 2 },
+            StructByValReg {
+                base_reg_idx: 4,
+                size: 12,
+            },
+            StructHfaReg {
+                fp_idx: 1,
+                count: 2,
+                member_size: 8,
+            },
+            Stack,
+            ZeroSizeSkip,
+        ];
+        assert_eq!(call_gp_arg_reads(&classes), Some(0b11_1101));
+        assert_eq!(call_gp_arg_reads(&[]), Some(0));
+        assert_eq!(
+            call_gp_arg_reads(&[StructByValReg {
+                base_reg_idx: 7,
+                size: 1
+            }]),
+            Some(0x80)
+        );
+        // Classes outside the AAPCS64 model, or a span past x7, leave the
+        // call unannotated.
+        assert_eq!(
+            call_gp_arg_reads(&[StructSplitRegStack {
+                reg_idx: 7,
+                size: 12
+            }]),
+            None
+        );
+        assert_eq!(call_gp_arg_reads(&[IntReg { reg_idx: 8 }]), None);
+        assert_eq!(call_gp_arg_reads(&[I128RegPair { base_reg_idx: 7 }]), None);
     }
 }

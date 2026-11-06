@@ -5,7 +5,7 @@
 # re-derives the arm set and re-assembles every row through the full
 # parser->dispatcher->leaf path, so a new arm without a row, or a
 # drifted word, fails cargo test --lib on a host with no cross tools.
-# arms: 527 -- arm count as enumerated by this script;
+# arms: 598 -- arm count as enumerated by this script;
 # the ratchet test compares its own re-derivation against it, so
 # the two copies of the enumeration rule cannot drift apart.
 # mnemonic	instruction	encoding (GNU as 2.47, LE hex)
@@ -29,8 +29,16 @@ ands	ands w0, w1, w21, lsr #27	206c556a
 asr	asr w0, w5, #13	a07c0d13
 at	at s1e1r, x0	007808d5
 b	b 0x1010be8	fa424014
+bcax	bcax v0.16b, v6.16b, v5.16b, v17.16b	c04425ce
+bfcvt	bfcvt h0, s1	2040631e
+bfcvtn	bfcvtn v0.4h, v1.4s	2068a10e
+bfcvtn2	bfcvtn2 v0.8h, v1.4s	2068a14e
+bfdot	bfdot v10.4s, v3.8h, v6.2h[1]	6af0664f
 bfi	bfi w0, w11, #1, #5	60111f33
 bfm	bfm x0, x1, #1, #2	200841b3
+bfmlalb	bfmlalb v1.4s, v11.8h, v6.h[7]	61f9f60f
+bfmlalt	bfmlalt v12.4s, v14.8h, v1.h[6]	ccf9e14f
+bfmmla	bfmmla v21.4s, v8.8h, v23.8h	15ed576e
 bfxil	bfxil w10, w10, #12, #18	4a750c33
 bic	bic v10.8b, v1.8b, v11.8b	2a1c6b0e
 bics	bics w0, w15, w6, asr #9	e025a66a
@@ -67,11 +75,11 @@ cinv	cinv x0, x1, eq	201081da
 clrex	clrex	5f3f03d5
 cls	cls v22.4s, v2.4s	5648a04e
 clz	clz w1, w0	0110c05a
-cmeq	cmeq v13.16b, v5.16b, v21.16b	ad8c356e
-cmge	cmge v0.4h, v0.4h, v19.4h	003c730e
-cmgt	cmgt v12.2d, v3.2d, v2.2d	6c34e24e
-cmhi	cmhi v0.16b, v6.16b, v24.16b	c034386e
-cmhs	cmhs v10.2d, v8.2d, v3.2d	0a3de36e
+cmeq	cmeq d20, d8, d13	148ded7e
+cmge	cmge d23, d26, d22	573ff65e
+cmgt	cmgt d0, d6, d14	c034ee5e
+cmhi	cmhi d13, d28, d13	8d37ed7e
+cmhs	cmhs d15, d9, d24	2f3df87e
 cmle	cmle v0.8h, v1.8h, #0	2098606e
 cmlt	cmlt v0.4s, v1.4s, #0	20a8a04e
 cmn	cmn sp, #0xb18, lsl #12	ff636cb1
@@ -103,14 +111,19 @@ eor3	eor3 v0.16b, v0.16b, v2.16b, v27.16b	006c02ce
 eret	eret	e0039fd6
 ext	ext v0.8b, v23.8b, v6.8b, #4	e022062e
 extr	extr w10, w23, w22, #29	ea769613
+fabd	fabd d10, d13, d18	aad5f27e
 fabs	fabs v5.2s, v30.2s	c5fba00e
-facge	facge v3.2d, v30.2d, v26.2d	c3ef7a6e
-facgt	facgt v17.2s, v21.2s, v7.2s	b1eea72e
+facge	facge d26, d14, d20	daed747e
+facgt	facgt h19, h8, h19	132dd37e
 fadd	fadd d0, d8, d3	0029631e
 faddp	faddp v0.2s, v24.2s, v20.2s	00d7342e
-fcmeq	fcmeq v11.2d, v11.2d, v22.2d	6be5764e
-fcmge	fcmge v10.2d, v26.2d, v2.2d	4ae7626e
-fcmgt	fcmgt v23.4s, v8.4s, v3.4s	17e5a36e
+fcadd	fcadd v1.4s, v3.4s, v20.4s, #90	61e4946e
+fccmp	fccmp d15, d8, #0xf, eq	ef05681e
+fccmpe	fccmpe d14, d14, #0x8, ge	d8a56e1e
+fcmeq	fcmeq h4, h15, h12	e4254c5e
+fcmge	fcmge d16, d21, d18	b0e6727e
+fcmgt	fcmgt d1, d13, d11	a1e5eb7e
+fcmla	fcmla v0.4h, v17.4h, v15.h[0], #90	20324f2f
 fcmle	fcmle v0.4s, v1.4s, #0	20d8a06e
 fcmlt	fcmlt v0.4s, v1.4s, #0	20e8a04e
 fcmp	fcmp d30, #0.0	c823601e
@@ -129,20 +142,31 @@ fcvtns	fcvtns s0, s1	20a8215e
 fcvtnu	fcvtnu v0.4s, v1.4s	20a8216e
 fcvtps	fcvtps x22, d6	d600689e
 fcvtpu	fcvtpu v4.4h, v6.4h	c4a8f92e
+fcvtxn	fcvtxn s0, d1	2068617e
+fcvtxn2	fcvtxn2 v0.4s, v1.2d	2068616e
 fcvtzs	fcvtzs d18, d5, #11	b2fc755f
 fcvtzu	fcvtzu d21, d27, #4	75ff7c7f
 fdiv	fdiv d14, d25, d22	2e1b761e
+fjcvtzs	fjcvtzs w0, d1	20007e1e
 fmadd	fmadd d1, d2, d0, d16	4140401f
 fmax	fmax d17, d22, d3	d14a631e
 fmaxnm	fmaxnm h1, h18, h17	416af11e
+fmaxnmp	fmaxnmp h18, v8.2h	12c9305e
 fmaxnmv	fmaxnmv s0, v1.4s	20c8306e
+fmaxp	fmaxp v19.4h, v15.4h, v24.4h	f335582e
 fmaxv	fmaxv s0, v1.4s	20f8306e
 fmin	fmin d25, d25, d20	395b741e
 fminnm	fminnm d28, d17, d5	3c7a651e
+fminnmp	fminnmp h7, v4.2h	87c8b05e
 fminnmv	fminnmv s0, v1.4s	20c8b06e
+fminp	fminp v13.2d, v4.2d, v29.2d	8df4fd6e
 fminv	fminv s0, v1.4s	20f8b06e
 fmla	fmla d19, d8, v10.d[0]	1311ca5f
+fmlal	fmlal v0.2s, v3.2h, v14.h[1]	60009e0f
+fmlal2	fmlal2 v0.4s, v27.4h, v29.4h	60cf3d6e
 fmls	fmls d12, d27, v30.d[1]	6c5bde5f
+fmlsl	fmlsl v1.2s, v5.2h, v17.2h	a1ecb10e
+fmlsl2	fmlsl2 v0.2s, v4.2h, v6.h[0]	80c0862f
 fmov	fmov d12, #1.050000000000000000e+01	0cb0641e
 fmsub	fmsub d0, d21, d24, d29	a0f6581f
 fmul	fmul d1, d23, v12.d[0]	e192cc5f
@@ -150,7 +174,14 @@ fmulx	fmulx d10, d27, v0.d[0]	6a93c07f
 fneg	fneg d0, d1	2040611e
 fnmadd	fnmadd d0, d26, d22, d0	4003761f
 fnmsub	fnmsub d0, d5, d31, d19	a0cc7f1f
-frecps	frecps v30.2d, v6.2d, v16.2d	defc704e
+fnmul	fnmul d10, d0, d20	0a88741e
+frecpe	frecpe v0.2d, v1.2d	20d8e14e
+frecps	frecps h0, h7, h18	e03c525e
+frecpx	frecpx d0, d1	20f8e15e
+frint32x	frint32x v0.4s, v1.4s	20e8216e
+frint32z	frint32z d0, d1	2040681e
+frint64x	frint64x s0, s1	20c0291e
+frint64z	frint64z v0.2d, v1.2d	20f8614e
 frinta	frinta d0, d1	2040661e
 frinti	frinti s0, s1	20c0271e
 frintm	frintm v0.4s, v1.4s	2098214e
@@ -158,7 +189,8 @@ frintn	frintn v31.2s, v28.2s	9f8b210e
 frintp	frintp v6.2s, v2.2s	4688a10e
 frintx	frintx v0.4s, v1.4s	2098216e
 frintz	frintz d0, d1	20c0651e
-frsqrts	frsqrts v14.2s, v21.2s, v20.2s	aefeb40e
+frsqrte	frsqrte v31.8h, v11.8h	7fd9f96e
+frsqrts	frsqrts h15, h22, h18	cf3ed25e
 fsqrt	fsqrt d0, d1	20c0611e
 fsub	fsub d19, d6, d7	d338671e
 hint	hint #0	1f2003d5
@@ -285,6 +317,7 @@ prfm	prfm #0x19, [x11, #17952]	7911a3f9
 prfum	prfum #0x1a, [x9, #156]	3ac189f8
 raddhn	raddhn v0.4h, v1.4s, v20.4s	2040742e
 raddhn2	raddhn2 v12.16b, v18.8h, v13.8h	4c422d6e
+rax1	rax1 v30.2d, v30.2d, v30.2d	de8f7ece
 rbit	rbit w1, w0	0100c05a
 ret	ret	c0035fd6
 rev	rev x0, x1	200cc0da
@@ -316,16 +349,40 @@ sbfm	sbfm x0, x1, #1, #2	20084193
 sbfx	sbfx w0, w4, #3, #24	80680313
 scvtf	scvtf d0, d3, #33	60e45f5f
 sdiv	sdiv w4, w14, w0	c40dc01a
+sdot	sdot v13.2s, v7.8b, v31.4b[3]	ede8bf0f
 sev	sev	9f2003d5
 sevl	sevl	bf2003d5
+sha1c	sha1c q15, s9, v27.4s	2f011b5e
+sha1h	sha1h s0, s1	2008285e
+sha1m	sha1m q26, s15, v19.4s	fa21135e
+sha1p	sha1p q0, s1, v2.4s	2010025e
+sha1su0	sha1su0 v21.4s, v5.4s, v21.4s	b530155e
+sha1su1	sha1su1 v0.4s, v1.4s	2018285e
+sha256h	sha256h q12, q22, v27.4s	cc421b5e
+sha256h2	sha256h2 q14, q30, v5.4s	ce53055e
+sha256su0	sha256su0 v0.4s, v1.4s	2028285e
+sha256su1	sha256su1 v0.4s, v1.4s, v2.4s	2060025e
+sha512h	sha512h q31, q20, v13.2d	9f826dce
+sha512h2	sha512h2 q1, q26, v30.2d	41877ece
+sha512su0	sha512su0 v0.2d, v1.2d	2080c0ce
+sha512su1	sha512su1 v4.2d, v3.2d, v27.2d	64887bce
 shadd	shadd v10.16b, v28.16b, v20.16b	8a07344e
-shl	shl v11.2s, v7.2s, #4	eb54240f
+shl	shl d19, d9, #51	3355735f
 shll	shll v0.4s, v0.4h, #16	0038612e
 shll2	shll2 v0.4s, v0.8h, #16	0038616e
 shrn	shrn v18.8b, v5.8h, #6	b2840a0f
 shrn2	shrn2 v10.16b, v13.8h, #5	aa850b4f
 shsub	shsub v10.8h, v4.8h, v31.8h	8a247f4e
-sli	sli v12.4s, v10.4s, #0	4c55206f
+sli	sli d25, d23, #4	f956447f
+sm3partw1	sm3partw1 v26.4s, v5.4s, v14.4s	bac06ece
+sm3partw2	sm3partw2 v0.4s, v1.4s, v2.4s	20c462ce
+sm3ss1	sm3ss1 v0.4s, v1.4s, v1.4s, v28.4s	207041ce
+sm3tt1a	sm3tt1a v12.4s, v5.4s, v19.s[0]	ac8053ce
+sm3tt1b	sm3tt1b v14.4s, v24.4s, v9.s[3]	0eb749ce
+sm3tt2a	sm3tt2a v14.4s, v26.4s, v29.s[3]	4ebb5dce
+sm3tt2b	sm3tt2b v1.4s, v9.4s, v5.s[2]	21ad45ce
+sm4e	sm4e v0.4s, v1.4s	2084c0ce
+sm4ekey	sm4ekey v8.4s, v22.4s, v24.4s	c8ca78ce
 smaddl	smaddl x0, w16, w20, x16	0042349b
 smax	smax v11.8h, v7.8h, v25.8h	eb64794e
 smaxp	smaxp v19.4h, v23.4h, v27.4h	f3a67b0e
@@ -338,46 +395,50 @@ smlal	smlal v0.2d, v7.2s, v24.2s	e080b80e
 smlal2	smlal2 v1.2d, v10.4s, v24.s[2]	4129984f
 smlsl	smlsl v1.2d, v1.2s, v1.s[0]	2160810f
 smlsl2	smlsl2 v10.2d, v30.4s, v5.s[3]	ca6ba54f
+smmla	smmla v30.4s, v21.16b, v10.16b	bea68a4e
 smov	smov w13, v19.h[7]	6d2e1e0e
 smulh	smulh x0, x6, x30	c07c5e9b
 smull	smull v0.2d, v4.2s, v0.s[0]	80a0800f
 smull2	smull2 v14.2d, v10.4s, v0.4s	4ec1a04e
 sqabs	sqabs v0.16b, v1.16b	2078204e
-sqadd	sqadd v1.2s, v13.2s, v16.2s	a10db00e
-sqdmlal	sqdmlal v0.4s, v7.4h, v1.h[2]	e030610f
+sqadd	sqadd b15, b1, b12	2f0c2c5e
+sqdmlal	sqdmlal d15, s29, v7.s[2]	af3b875f
 sqdmlal2	sqdmlal2 v1.2d, v27.4s, v10.s[0]	61338a4f
-sqdmlsl	sqdmlsl v0.2d, v10.2s, v0.2s	40b1a00e
+sqdmlsl	sqdmlsl d0, s5, s30	a0b0be5e
 sqdmlsl2	sqdmlsl2 v0.2d, v10.4s, v0.s[1]	4071a04f
-sqdmulh	sqdmulh v10.4h, v6.4h, v3.h[2]	cac0630f
-sqdmull	sqdmull v10.2d, v15.2s, v5.s[3]	eab9a50f
+sqdmulh	sqdmulh h1, h28, v15.h[6]	81cb6f5f
+sqdmull	sqdmull d13, s14, s28	cdd1bc5e
 sqdmull2	sqdmull2 v10.2d, v3.4s, v20.4s	6ad0b44e
 sqneg	sqneg b16, b2	5078207e
-sqrdmulh	sqrdmulh v0.4h, v13.4h, v8.h[2]	a0d1680f
-sqrshl	sqrshl v11.2s, v3.2s, v8.2s	6b5ca80e
+sqrdmlah	sqrdmlah h0, h6, v15.h[7]	c0d87f7f
+sqrdmlsh	sqrdmlsh h10, h7, v13.h[5]	eaf85d7f
+sqrdmulh	sqrdmulh h17, h4, v8.h[3]	91d0785f
+sqrshl	sqrshl b15, b0, b18	0f5c325e
 sqrshrn	sqrshrn b27, h23, #3	fb9e0d5f
 sqrshrn2	sqrshrn2 v15.4s, v16.2d, #27	0f9e254f
 sqrshrun	sqrshrun b10, h15, #6	ea8d0a7f
 sqrshrun2	sqrshrun2 v4.4s, v29.2d, #14	a48f326f
-sqshl	sqshl v1.2d, v18.2d, v9.2d	414ee94e
+sqshl	sqshl b10, b6, b20	ca4c345e
+sqshlu	sqshlu d17, d24, #9	1167497f
 sqshrn	sqshrn b31, h23, #2	ff960e5f
 sqshrn2	sqshrn2 v10.16b, v8.8h, #6	0a950a4f
 sqshrun	sqshrun b24, h30, #5	d8870b7f
 sqshrun2	sqshrun2 v4.16b, v24.8h, #2	04870e6f
-sqsub	sqsub v0.2d, v16.2d, v14.2d	002eee4e
+sqsub	sqsub b15, b21, b8	af2e285e
 sqxtn	sqxtn v0.4h, v0.4s	0048610e
 sqxtn2	sqxtn2 v0.8h, v0.4s	0048614e
 sqxtun	sqxtun v0.8b, v0.8h	0028212e
 sqxtun2	sqxtun2 v0.16b, v0.8h	0028216e
 srhadd	srhadd v10.8h, v29.8h, v8.8h	aa17684e
-sri	sri v12.2d, v21.2d, #29	ac46636f
-srshl	srshl v0.2s, v5.2s, v11.2s	a054ab0e
-srshr	srshr v0.2s, v21.2s, #24	a026280f
-srsra	srsra v14.2d, v9.2d, #50	2e354e4f
-sshl	sshl v16.16b, v24.16b, v18.16b	1047324e
+sri	sri d14, d25, #55	2e47497f
+srshl	srshl d0, d5, d8	a054e85e
+srshr	srshr d14, d14, #18	ce256e5f
+srsra	srsra d14, d12, #44	8e35545f
+sshl	sshl d20, d0, d8	1444e85e
 sshll	sshll v23.4s, v1.4h, #15	37a41f0f
 sshll2	sshll2 v19.2d, v19.4s, #16	73a6304f
-sshr	sshr v1.2s, v3.2s, #31	6104210f
-ssra	ssra v23.2s, v27.2s, #32	7717200f
+sshr	sshr d21, d27, #17	75076f5f
+ssra	ssra d12, d18, #19	4c166d5f
 ssubl	ssubl v3.2d, v22.2s, v27.2s	c322bb0e
 ssubl2	ssubl2 v11.8h, v15.16b, v5.16b	eb21254e
 ssubw	ssubw v13.4s, v24.4s, v20.4h	0d33740e
@@ -436,6 +497,8 @@ sub	sub d26, d26, d5	5a87e57e
 subhn	subhn v22.2s, v4.2d, v30.2d	9660be0e
 subhn2	subhn2 v15.16b, v10.8h, v19.8h	4f61334e
 subs	subs w0, w1, #0xf4c, lsl #12	20307d71
+sudot	sudot v10.4s, v18.16b, v4.4b[0]	4af2044f
+suqadd	suqadd v22.8h, v12.8h	9639604e
 svc	svc #0x2859	210b05d4
 swp	swp w1, w4, [sp]	e48321b8
 swpa	swpa w13, w0, [x6]	c080adb8
@@ -482,6 +545,7 @@ ubfm	ubfm x0, x1, #1, #2	200841d3
 ubfx	ubfx w0, w19, #15, #16	607a0f53
 ucvtf	ucvtf d11, d3, #4	6be47c7f
 udiv	udiv w21, w22, w8	d50ac81a
+udot	udot v1.4s, v27.16b, v31.4b[1]	61e3bf6f
 uhadd	uhadd v11.4s, v18.4s, v6.4s	4b06a66e
 uhsub	uhsub v0.4s, v12.4s, v14.4s	8025ae6e
 umaddl	umaddl x0, w0, w22, x28	0070b69b
@@ -495,29 +559,35 @@ umlal	umlal v10.4s, v21.4h, v9.h[7]	aa2a792f
 umlal2	umlal2 v0.2d, v1.4s, v12.4s	2080ac6e
 umlsl	umlsl v10.4s, v22.4h, v3.h[2]	ca62632f
 umlsl2	umlsl2 v17.2d, v8.4s, v16.s[3]	1169b06f
+ummla	ummla v0.4s, v1.16b, v2.16b	20a4826e
 umov	umov w25, v7.b[9]	f93c130e
 umulh	umulh x0, x17, x1	207ec19b
 umull	umull v0.4s, v15.4h, v3.h[1]	e0a1532f
 umull2	umull2 v1.2d, v27.4s, v15.s[3]	61abaf6f
-uqadd	uqadd v1.16b, v17.16b, v23.16b	210e376e
-uqrshl	uqrshl v0.4h, v10.4h, v27.4h	405d7b2e
+uqadd	uqadd b30, b6, b29	de0c3d7e
+uqrshl	uqrshl b21, b4, b15	955c2f7e
 uqrshrn	uqrshrn s10, d6, #16	ca9c307f
 uqrshrn2	uqrshrn2 v7.8h, v24.4s, #13	079f136f
-uqshl	uqshl v0.2d, v27.2d, #7	6077476f
+uqshl	uqshl b21, b21, b29	b54e3d7e
 uqshrn	uqshrn s29, d30, #16	dd97307f
 uqshrn2	uqshrn2 v30.16b, v2.8h, #8	5e94086f
-uqsub	uqsub v17.8b, v7.8b, v15.8b	f12c2f2e
+uqsub	uqsub b8, b1, b26	282c3a7e
 uqxtn	uqxtn v0.4h, v0.4s	0048612e
 uqxtn2	uqxtn2 v0.8h, v0.4s	0048616e
+urecpe	urecpe v0.4s, v1.4s	20c8a14e
 urhadd	urhadd v0.4s, v19.4s, v19.4s	6016b36e
-urshl	urshl v12.8h, v10.8h, v20.8h	4c55746e
-urshr	urshr v0.2d, v7.2d, #1	e0247f6f
-ursra	ursra v11.4s, v7.4s, #29	eb34236f
-ushl	ushl v18.2s, v28.2s, v31.2s	9247bf2e
+urshl	urshl d5, d14, d18	c555f27e
+urshr	urshr d21, d23, #61	f526437f
+ursqrte	ursqrte v0.2s, v1.2s	20c8a12e
+ursra	ursra d12, d22, #20	cc366c7f
+usdot	usdot v0.4s, v0.16b, v9.4b[3]	00f8a94f
+ushl	ushl d25, d26, d9	5947e97e
 ushll	ushll v17.2d, v27.2s, #28	71a73c2f
 ushll2	ushll2 v0.2d, v18.4s, #17	40a6316f
-ushr	ushr v10.2s, v7.2s, #12	ea04342f
-usra	usra v0.8b, v24.8b, #2	00170e2f
+ushr	ushr d28, d4, #14	9c04727f
+usmmla	usmmla v18.4s, v5.16b, v28.16b	b2ac9c4e
+usqadd	usqadd s23, s17	373aa07e
+usra	usra d15, d24, #50	0f174e7f
 usubl	usubl v1.2d, v30.2s, v9.2s	c123a92e
 usubl2	usubl2 v11.2d, v19.4s, v6.4s	6b22a66e
 usubw	usubw v14.4s, v12.4s, v8.4h	8e31682e
@@ -531,6 +601,7 @@ uzp1	uzp1 v1.4s, v10.4s, v12.4s	41198c4e
 uzp2	uzp2 v0.8h, v3.8h, v21.8h	6058554e
 wfe	wfe	5f2003d5
 wfi	wfi	7f2003d5
+xar	xar v0.2d, v18.2d, v30.2d, #50	40ca9ece
 xtn	xtn v0.4h, v0.4s	0028610e
 xtn2	xtn2 v23.8h, v19.4s	772a614e
 yield	yield	3f2003d5

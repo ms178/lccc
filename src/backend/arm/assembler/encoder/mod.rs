@@ -11,19 +11,26 @@
 
 use super::parser::Operand;
 
+mod advsimd_int;
 mod bitfield;
 mod compare_branch;
 mod data_processing;
 mod fp_scalar;
+mod fp_simd;
 mod load_store;
 mod neon;
 mod sysreg_table;
 mod system;
 
+#[cfg(test)]
+mod advsimd_gas247_tests;
+
+pub(crate) use advsimd_int::*;
 pub(crate) use bitfield::*;
 pub(crate) use compare_branch::*;
 pub(crate) use data_processing::*;
 pub(crate) use fp_scalar::*;
+pub(crate) use fp_simd::*;
 pub(crate) use load_store::*;
 pub(crate) use neon::*;
 pub(crate) use system::*;
@@ -884,6 +891,27 @@ pub fn encode_instruction(
 ) -> Result<EncodeResult, String> {
     let mn = mnemonic.to_lowercase();
 
+    // Advanced-SIMD scalar integer forms (`ushr d0, d0, #32`, `cmeq d0, d1,
+    // #0`, `movi d0, #0`, `sqxtn s0, d1`, ...): operand 0 is a `b`/`h`/`s`/`d`
+    // register, which no general-register or vector arm below accepts for
+    // these mnemonics, so the hook claims nothing those arms encode.
+    if let Some(result) = encode_advsimd_scalar_integer(&mn, operands) {
+        return result;
+    }
+    // Arrangement legality of the integer vector same-shape forms, one table
+    // for every leaf (see `neon_int_same_shape_arrangements`).
+    if let (Some(allowed), Some(Operand::RegArrangement { arrangement, .. })) = (
+        neon_int_same_shape_arrangements(&mn, operands),
+        operands.first(),
+    ) {
+        if !allowed.contains(&arrangement.as_str()) {
+            return Err(format!(
+                "{mn}: there is no `.{arrangement}` form (the arrangement must be one of {})",
+                allowed.join(", ")
+            ));
+        }
+    }
+
     // Handle condition-code suffixed branches: b.eq, b.ne, b.lt, etc.
     if let Some(cond) = mn.strip_prefix("b.") {
         return encode_cond_branch(cond, operands);
@@ -1144,7 +1172,11 @@ pub fn encode_instruction(
             if matches!(operands.get(2), Some(Operand::RegLane { .. })) {
                 encode_neon_float_elem(operands, 0b1001, 1, "fmulx")
             } else {
-                encode_neon_float_three_same(operands, 1, 0, 0b11011)
+                // FMULX (vector and Advanced-SIMD scalar): U=0, opcode 11011.
+                // U=1 is FMUL: the vector form assembled silently as an
+                // ordinary multiply, which differs exactly at 0 x inf (FMULX
+                // gives +-2.0); the scalar form was not accepted at all.
+                encode_neon_fp_three_same_any(operands, 0, 0, 0b11011, "fmulx")
             }
         }
         "fdiv" => {
@@ -1168,6 +1200,10 @@ pub fn encode_instruction(
                 encode_fp_arith(operands, 0b0101)
             }
         }
+        // FNMUL exists only as scalar FP data-processing (2-source opcode
+        // 1000): `fnmul s3, s29, s17` = 0x1e318ba3, `fnmul h3, h29, h17` =
+        // 0x1ef18ba3 (GNU as 2.47).
+        "fnmul" => encode_fp_arith(operands, 0b1000),
         "fmaxnm" => {
             if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
                 encode_neon_float_three_same(operands, 0, 0, 0b11000)
@@ -1184,7 +1220,10 @@ pub fn encode_instruction(
         }
         "fneg" => {
             if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
-                encode_neon_float_two_misc(operands, 1, 0, 0b01111)
+                // FNEG (vector): U=1, size=1x, opcode 01111 (FABS is U=0).
+                // size<1> was 0, an unallocated encoding: `fneg v2.2d` was
+                // 0x6e60f842 for Clang's and GAS's 0x6ee0f842 (SIGILL).
+                encode_neon_float_two_misc(operands, 1, 1, 0b01111)
             } else {
                 encode_fneg(operands)
             }
@@ -1372,8 +1411,55 @@ pub fn encode_instruction(
                 encode_neon_float_three_same(operands, 0, 1, 0b11001)
             }
         }
-        "frecps" => encode_neon_float_three_same(operands, 0, 0, 0b11111),
-        "frsqrts" => encode_neon_float_three_same(operands, 0, 1, 0b11111),
+        "frecps" => encode_neon_fp_three_same_any(operands, 0, 0, 0b11111, "frecps"),
+        "frsqrts" => encode_neon_fp_three_same_any(operands, 0, 1, 0b11111, "frsqrts"),
+        // Reciprocal (square root) estimates, the absolute difference and the
+        // FP pairwise max/min: vector forms in the float two-misc and
+        // three-same classes, scalar forms in their Advanced-SIMD scalar
+        // classes (`frecpe d3, d29` = 0x5ee1dba3, `fmaxnmp d3, v29.2d` =
+        // 0x7e70cba3, both GAS/Clang-measured).  They were unsupported, so
+        // inline assembly using them failed to assemble under `-c`.
+        "frecpe" | "frsqrte" => {
+            encode_neon_fp_two_misc_any(operands, u32::from(mn == "frsqrte"), 1, 0b11101, &mn)
+        }
+        "fabd" => encode_neon_fp_three_same_any(operands, 1, 1, 0b11010, "fabd"),
+        // FRECPX exists only in the Advanced-SIMD scalar class (`frecpx d3,
+        // d29` = 0x5ee1fba3, `frecpx h3, h29` = 0x5ef9fba3).
+        "frecpx" => encode_neon_fp_scalar_two_misc(operands, 0, 1, 0b11111, "frecpx"),
+        // FEAT_FRINTTS rounding to a 32/64-bit-representable integral value.
+        "frint32z" | "frint32x" | "frint64z" | "frint64x" => {
+            encode_frint_ts(operands, &mn, mn.ends_with('x'), mn.starts_with("frint64"))
+        }
+        "urecpe" | "ursqrte" => encode_neon_urecpe(operands, u32::from(mn == "ursqrte"), &mn),
+        "fcvtxn" => encode_fcvtxn(operands, false),
+        "fcvtxn2" => encode_fcvtxn(operands, true),
+        "fccmp" => encode_fccmp(operands, false),
+        "fccmpe" => encode_fccmp(operands, true),
+        "fjcvtzs" => encode_fjcvtzs(operands),
+        // FEAT_FHM widening half-precision multiply-accumulate.
+        "fmlal" | "fmlal2" | "fmlsl" | "fmlsl2" => {
+            encode_fmlal(operands, mn.starts_with("fmlsl"), mn.ends_with('2'))
+        }
+        // FEAT_FCMA complex arithmetic.
+        "fcmla" => encode_fcmla(operands),
+        "fcadd" => encode_fcadd(operands),
+        // FEAT_BF16.
+        "bfcvt" => encode_bfcvt(operands),
+        "bfcvtn" => encode_bfcvtn(operands, false),
+        "bfcvtn2" => encode_bfcvtn(operands, true),
+        "bfdot" => encode_bfdot(operands),
+        "bfmmla" => encode_bfmmla(operands),
+        "bfmlalb" => encode_bfmlal(operands, false),
+        "bfmlalt" => encode_bfmlal(operands, true),
+        "fmaxnmp" | "fminnmp" | "fmaxp" | "fminp" => {
+            let min = u32::from(mn.starts_with("fmin"));
+            let nm = mn.ends_with("nmp");
+            if operands.len() == 3 {
+                encode_neon_float_three_same(operands, 1, min, if nm { 0b11000 } else { 0b11110 })
+            } else {
+                encode_neon_fp_scalar_pairwise(operands, min, if nm { 0b01100 } else { 0b01111 }, &mn)
+            }
+        }
         // The two `FMNMX`-class spellings of fcmeq differ only in whether
         // operand 3 is an immediate at all, so the gate tests the *shape* and
         // leaves the value to `fcmp_is_positive_zero` in the leaf -- which
@@ -1390,7 +1476,7 @@ pub fn encode_instruction(
             ) {
                 encode_neon_float_cmp_zero(operands, raw_operands, 0, 1, 0b01101)
             } else {
-                encode_neon_float_three_same(operands, 0, 0, 0b11100)
+                encode_neon_fp_three_same_any(operands, 0, 0, 0b11100, "fcmeq")
             }
         }
         // The two `FMNMX`-class spellings of fcmge differ only in whether
@@ -1409,7 +1495,7 @@ pub fn encode_instruction(
             ) {
                 encode_neon_float_cmp_zero(operands, raw_operands, 1, 1, 0b01100)
             } else {
-                encode_neon_float_three_same(operands, 1, 0, 0b11100)
+                encode_neon_fp_three_same_any(operands, 1, 0, 0b11100, "fcmge")
             }
         }
         // The two `FMNMX`-class spellings of fcmgt differ only in whether
@@ -1428,13 +1514,13 @@ pub fn encode_instruction(
             ) {
                 encode_neon_float_cmp_zero(operands, raw_operands, 0, 1, 0b01100)
             } else {
-                encode_neon_float_three_same(operands, 1, 1, 0b11100)
+                encode_neon_fp_three_same_any(operands, 1, 1, 0b11100, "fcmgt")
             }
         }
         "fcmle" => encode_neon_float_cmp_zero(operands, raw_operands, 1, 1, 0b01101),
         "fcmlt" => encode_neon_float_cmp_zero(operands, raw_operands, 0, 1, 0b01110),
-        "facge" => encode_neon_float_three_same(operands, 1, 0, 0b11101),
-        "facgt" => encode_neon_float_three_same(operands, 1, 1, 0b11101),
+        "facge" => encode_neon_fp_three_same_any(operands, 1, 0, 0b11101, "facge"),
+        "facgt" => encode_neon_fp_three_same_any(operands, 1, 1, 0b11101, "facgt"),
 
         // NEON/SIMD
         "cnt" => encode_cnt(operands),
@@ -1781,6 +1867,23 @@ pub fn encode_instruction(
         "zip1" => encode_neon_zip_uzp(operands, 0b011, false),
         "zip2" => encode_neon_zip_uzp(operands, 0b111, false),
         "eor3" => encode_neon_eor3(operands),
+        // SHA1/SHA256/SHA512, the rest of SHA3, SM3 and SM4 (BoringSSL's and
+        // OpenSSL's AArch64 `.S` files are written in these).
+        "sha1c" | "sha1p" | "sha1m" | "sha1h" | "sha1su0" | "sha1su1" | "sha256h"
+        | "sha256h2" | "sha256su0" | "sha256su1" | "sha512h" | "sha512h2" | "sha512su0"
+        | "sha512su1" | "rax1" | "xar" | "bcax" | "sm3ss1" | "sm3tt1a" | "sm3tt1b"
+        | "sm3tt2a" | "sm3tt2b" | "sm3partw1" | "sm3partw2" | "sm4e" | "sm4ekey" => {
+            encode_crypto_ext(operands, &mn)
+        }
+        // FEAT_DotProd / FEAT_I8MM.
+        "sdot" | "udot" | "usdot" | "sudot" => encode_neon_dot(operands, &mn),
+        "smmla" | "ummla" | "usmmla" => encode_neon_mmla(operands, &mn),
+        // FEAT_RDM (the scalar forms are claimed by the scalar-integer hook).
+        "sqrdmlah" => encode_neon_sqrdmlxh(operands, false),
+        "sqrdmlsh" => encode_neon_sqrdmlxh(operands, true),
+        "suqadd" => encode_neon_sqadd_acc(operands, 0, "suqadd"),
+        "usqadd" => encode_neon_sqadd_acc(operands, 1, "usqadd"),
+        "sqshlu" => encode_neon_sqshlu(operands),
         "pmull" => encode_neon_pmull(operands, false),
         "pmull2" => encode_neon_pmull(operands, true),
         "aese" => encode_neon_aes(operands, 0b00100),
@@ -3449,12 +3552,11 @@ mod gas247_golden_word_tests {
                 "{text:?}: wrong diagnostic {msg:?}"
             );
         }
-        // The scalar register form of the same class: GAS encodes it in the
-        // floating-point compare class (0x5e22e420), and LCCC does not reach it
-        // through this leaf. Pinned as a *rejection* so that the day someone
-        // routes it here, this test fails and the measured word above is the
-        // thing to match -- a wrong encoding is worse than a refusal.
-        assert!(encode1_opt("fcmeq s0, s1, s2").is_err());
+        // The scalar register form of the same class, pinned here as a refusal
+        // until it had a leaf of its own: the Advanced-SIMD scalar three-same
+        // class now encodes it, to exactly the word measured above.
+        assert_eq!(encode1_opt("fcmeq s0, s1, s2"), Ok(0x5e22e420));
+        assert!(encode1_opt("fcmeq s0, s1, d2").is_err());
         // And the scalar forms that are already right, unchanged by this:
         assert_eq!(encode1_opt("fmax s0, s1, s2"), Ok(0x1e224820));
     }

@@ -624,11 +624,47 @@ fn label_name(line: &str) -> Option<&str> {
 /// register and matches no pattern.  Never emitted.
 const OPAQUE_LINE: &str = "# lccc_a64_inline_asm_opaque";
 
+/// Separator of the call-argument annotation `bl f // lccc-call-reads M`:
+/// `M` is the decimal mask of the GP registers (bit N = xN, N <= 8) the
+/// callee takes values in, from the emitter's authoritative argument
+/// classification (`calls::call_gp_arg_reads`).  It replaces the blanket
+/// "every call reads x0-x8" (`a64_call_reads`), which kept every dead
+/// argument-register move in front of a call and stopped the entry-copy
+/// coalescer at every call.  Only direct calls carry it -- `bl` takes no
+/// register operand, so no operand parser sees the comment -- and
+/// `peephole_optimize` strips it from every line it returns.
+pub(super) const CALL_READS_TAG: &str = " // lccc-call-reads ";
+
+/// `asm` without call annotations (`CALL_READS_TAG`), for the paths that
+/// return the text unoptimized.  Inline-assembly bodies (`#APP` ..
+/// `#NO_APP`) are user text and pass through untouched.
+fn strip_call_annotations(asm: String) -> String {
+    if !asm.contains(CALL_READS_TAG) {
+        return asm;
+    }
+    let mut out = String::with_capacity(asm.len());
+    let mut user_text = false;
+    for line in asm.lines() {
+        match line.trim() {
+            "#APP" => user_text = true,
+            "#NO_APP" => user_text = false,
+            _ => {}
+        }
+        let code = match line.split_once(CALL_READS_TAG) {
+            Some((code, _)) if !user_text => code,
+            _ => line,
+        };
+        out.push_str(code);
+        out.push('\n');
+    }
+    out
+}
+
 /// Run peephole optimization on AArch64 assembly text.
 /// Returns the optimized assembly string.
 pub fn peephole_optimize(asm: String) -> String {
     if std::env::var("CCC_NO_PEEPHOLE").is_ok() {
-        return asm;
+        return strip_call_annotations(asm);
     }
     let mut lines: Vec<String> = asm.lines().map(String::from).collect();
     let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
@@ -646,7 +682,7 @@ pub fn peephole_optimize(asm: String) -> String {
     let protected_ranges = if asm.contains("#APP") || asm.contains("#NO_APP") {
         match inline_asm_protected_ranges(&lines) {
             Some(ranges) => ranges,
-            None => return asm,
+            None => return strip_call_annotations(asm),
         }
     } else {
         Vec::new()
@@ -686,7 +722,6 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= eliminate_dead_pre_ret_moves(&mut lines, &mut kinds, n);
         changed |= eliminate_move_chains(&mut lines, &mut kinds, n);
         changed |= fold_zext_move_chains(&mut lines, &mut kinds, n);
-        changed |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
         changed |= per_function(&mut lines, &mut kinds, n, propagate_address_aliases);
         if merge_blocks {
             changed |= merge_identical_blocks(&mut lines, &mut kinds, n);
@@ -709,8 +744,10 @@ pub fn peephole_optimize(asm: String) -> String {
         // threading) matches the accumulator shapes these two rewrite.
         changed |= per_function(&mut lines, &mut kinds, n, retarget_defs_into_copies);
         changed |= per_function(&mut lines, &mut kinds, n, fold_cset_add_to_cinc);
-        if rotate {
-            changed |= per_function(&mut lines, &mut kinds, n, rotate_simple_loops);
+        changed |= per_function(&mut lines, &mut kinds, n, eliminate_dead_moves);
+        if rotate && per_function(&mut lines, &mut kinds, n, rotate_simple_loops) {
+            changed = true;
+            n = split_multiline_slots(&mut lines, &mut kinds);
         }
         rounds += 1;
     }
@@ -732,7 +769,9 @@ pub fn peephole_optimize(asm: String) -> String {
     }
     // After rotation (phase 1) and dead-store cleanup: sink loop-carried
     // slot-home stores out of bottom-tested loops.
-    sink_loop_carried_stores(&mut lines, &mut kinds, n);
+    if sink_loop_carried_stores(&mut lines, &mut kinds, n) {
+        n = split_multiline_slots(&mut lines, &mut kinds);
+    }
 
     // Phase 3: Local cleanup after global passes (up to 4 rounds)
     {
@@ -751,7 +790,6 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_dead_pre_ret_moves(&mut lines, &mut kinds, n);
             changed2 |= eliminate_move_chains(&mut lines, &mut kinds, n);
             changed2 |= fold_zext_move_chains(&mut lines, &mut kinds, n);
-            changed2 |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
             changed2 |= per_function(&mut lines, &mut kinds, n, propagate_address_aliases);
             if merge_blocks {
                 changed2 |= merge_identical_blocks(&mut lines, &mut kinds, n);
@@ -771,12 +809,26 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_overwritten_moves(&lines, &mut kinds, n);
             changed2 |= eliminate_overwritten_stores(&lines, &mut kinds, n);
             changed2 |= per_function(&mut lines, &mut kinds, n, retarget_defs_into_copies);
+            changed2 |= fuse_fp_mul_neg(&mut lines, &mut kinds, n);
+            changed2 |= retarget_fp_return_copies(&mut lines, &mut kinds, n);
+            changed2 |= forward_fp_copies_to_return(&mut lines, &mut kinds, n);
             changed2 |= per_function(&mut lines, &mut kinds, n, fold_cset_add_to_cinc);
+            changed2 |= per_function(&mut lines, &mut kinds, n, eliminate_dead_moves);
+            changed2 |= per_function(&mut lines, &mut kinds, n, invert_loop_latches);
             rounds2 += 1;
         }
     }
 
     drop_orphaned_save_rows(&lines, &mut kinds, n);
+
+    // The call annotations end with the passes that read them.  Every line
+    // is checked, whatever a pass made of it; the protected user text is
+    // still behind its placeholders here and cannot be touched.
+    for line in lines.iter_mut() {
+        if let Some(at) = line.find(CALL_READS_TAG) {
+            line.truncate(at);
+        }
+    }
 
     // Put the protected lines back, in order, and keep every one of them: no
     // pass may delete or duplicate opaque code.  A placeholder count that no
@@ -787,20 +839,60 @@ pub fn peephole_optimize(asm: String) -> String {
         for i in 0..lines.len() {
             if lines[i] == OPAQUE_LINE {
                 let Some(original) = originals.next() else {
-                    return asm;
+                    return strip_call_annotations(asm);
                 };
                 lines[i] = original;
                 kinds[i] = LineKind::Other;
             }
         }
         if originals.next().is_some() {
-            return asm;
+            return strip_call_annotations(asm);
         }
     }
 
     // Build result: kept lines, with the hidden `-g` rows put back.
     debug_assert_eq!(lines.len(), kinds.len());
     crate::backend::peephole_common::join_with_debug_rows(&lines, |i| kinds[i] != LineKind::Nop)
+}
+
+/// Give every line of a multi-line slot a slot of its own; returns the new
+/// line count.
+///
+/// `rotate_simple_loops` writes the rotated latch (`cmp; b.cc .Lbody;
+/// b .Lexit`) into the one slot of the backedge it replaces, and
+/// `sink_loop_carried_stores` splices sunk stores into a backedge slot the
+/// same way.  Such a slot classifies as a single `Other` instruction: every
+/// pass that builds a CFG saw a block falling through where the latch
+/// branches, and `abi_liveness` let the rotated latch of gcc.c-torture
+/// pr24716 run into the exit block -- the loop-carried `mov x7, #1` that
+/// ends the loop looked dead, was deleted, and `f` never returned (-O1).
+/// Splitting right after the two producers keeps the text every other pass
+/// reads truthful.  A deleted slot stays one deleted slot.
+fn split_multiline_slots(lines: &mut Vec<String>, kinds: &mut Vec<LineKind>) -> usize {
+    debug_assert_eq!(lines.len(), kinds.len());
+    if !lines
+        .iter()
+        .zip(kinds.iter())
+        .any(|(l, k)| *k != LineKind::Nop && l.contains('\n'))
+    {
+        return lines.len();
+    }
+    let mut out_lines = Vec::with_capacity(lines.len() + 16);
+    let mut out_kinds = Vec::with_capacity(lines.len() + 16);
+    for (line, kind) in std::mem::take(lines).into_iter().zip(std::mem::take(kinds)) {
+        if kind == LineKind::Nop || !line.contains('\n') {
+            out_lines.push(line);
+            out_kinds.push(kind);
+            continue;
+        }
+        for sub in line.split('\n') {
+            out_kinds.push(classify_line(sub));
+            out_lines.push(sub.to_string());
+        }
+    }
+    *lines = out_lines;
+    *kinds = out_kinds;
+    lines.len()
 }
 
 /// Drop each callee-saved `.cfi_offset` row whose save the passes deleted.
@@ -1612,12 +1704,18 @@ fn coalesce_one_entry_copy(
                                 ok = false;
                                 break;
                             }
-                            // The callee reads x0-x7 and that read cannot be
-                            // rewritten, so `dst` must not still be live at
-                            // the call. An argument the code sets up
-                            // explicitly is safe: the setup line renames with
-                            // everything else, and it kills `dst` right here.
-                            if dst < 8 && lv.live_before[k] & (1u64 << dst) != 0 {
+                            // The callee may read any argument register
+                            // x0-x8 (x8: the indirect result location), and
+                            // that read cannot be renamed. Whatever `dst`
+                            // holds at the call -- the coalesced value, or an
+                            // argument a later line stages in it -- moves to
+                            // `src` with the rename, so the callee would read
+                            // a stale `dst`: `mov w5, w0; ...; mov w5, w20;
+                            // bl f` became `...; mov w0, w20; bl f` with f's
+                            // sixth argument never written. Without the
+                            // emitter's annotation every argument register
+                            // counts as read (`a64_call_reads`).
+                            if a64_call_reads(&lines[k]) & (1u64 << dst) != 0 {
                                 ok = false;
                                 break;
                             }
@@ -2604,77 +2702,122 @@ fn written_gp_register(line: &str, kind: LineKind) -> Option<u8> {
     }
 }
 
-/// Remove `mov x9, xN` when x9's staged address is provably dead after the
-/// mov. Regalloc-aware loads and copy propagation can make the legacy x9
-/// setup dead.
+/// Delete a register move or constant materialization (`mov`, `movz`,
+/// `movn`) whose destination no path reads before redefining it.
 ///
-/// Soundness requires a FULL dead-value scan, not a single-instruction
-/// lookahead: `propagate_register_copies` rewrites only the FIRST use of the
-/// copy (`ldr x0, [x9]` -> `ldr x0, [x0]`), so the instruction after the mov
-/// can look clean while a later instruction (`ldr x1, [x9, #8]` — the high
-/// half of a 16-byte _Float128-carrier global load) still reads x9. Deleting
-/// the mov on the one-line view left a stale-x9 SIGSEGV (f128_softfloat).
-/// The scan stops at the first x9 read (mov stays), the first pure x9
-/// redefinition (mov is dead past it), a control-flow boundary, a call (x9
-/// is caller-saved: a later read would need a fresh definition), or the
-/// end of the function.
-fn eliminate_unused_x9_address_moves(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
-    fn mentions_x9(line: &str) -> bool {
-        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .any(|tok| tok == "x9" || tok == "w9")
+/// The question is pure dataflow, answered by `abi_liveness` over the whole
+/// function: a call reads x0-x8, a return x0/x1 and x19-x30, a tail call
+/// all of them, and control flow it cannot resolve (a jump table) keeps
+/// every move.  The pass this replaces deleted `mov x9, xN` when a
+/// straight-line scan reached a label, branch, call or return before any
+/// mention of x9 -- sound only while x9 held a block-local address, which
+/// stopped being true once pure scalar-ALU functions allocate x9-x15 as
+/// ordinary registers (`mov x9, x3; .Lloop: ... add x0, x0, x9` lost its
+/// loop-carried operand).  Writes to x29, x30 and sp are frame bookkeeping
+/// and stay.
+fn eliminate_dead_moves(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let candidate = |k: LineKind| match k {
+        LineKind::Move { dst, .. } | LineKind::MoveImm { dst } | LineKind::MoveWide { dst } => {
+            (dst < 29).then_some(dst)
+        }
+        _ => None,
+    };
+    if !kinds[..n].iter().any(|&k| candidate(k).is_some()) {
+        return false;
     }
-    fn mentions_x9_count(line: &str) -> usize {
-        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .filter(|&tok| tok == "x9" || tok == "w9")
-            .count()
-    }
+    let Some(live) = abi_liveness(lines, kinds, n) else {
+        return false;
+    };
     let mut changed = false;
     for i in 0..n {
-        let LineKind::Move {
-            dst: 9,
-            is_32bit: false,
-            ..
-        } = kinds[i]
-        else {
+        let Some(dst) = candidate(kinds[i]) else {
             continue;
         };
-        let mut dead = true;
-        let mut j = i + 1;
-        while j < n {
-            if is_function_boundary(&lines[j]) {
-                break;
-            }
-            match kinds[j] {
-                LineKind::Nop | LineKind::Directive => {}
-                // Path ends: textually later lines belong to other paths, and
-                // a label can only be joined from before the mov (skipping it).
-                LineKind::Label
-                | LineKind::Branch
-                | LineKind::CondBranch
-                | LineKind::CmpBranch
-                | LineKind::Ret
-                | LineKind::Call => break,
-                _ => {
-                    if written_gp_register(&lines[j], kinds[j]) == Some(9)
-                        && mentions_x9_count(&lines[j]) == 1
-                    {
-                        // Pure redefinition of x9: the staged value is dead
-                        // past this instruction.
-                        break;
-                    }
-                    if mentions_x9(&lines[j]) {
-                        // A read (or read-modify-write) of x9: the mov is live.
-                        dead = false;
-                        break;
-                    }
-                }
-            }
-            j += 1;
-        }
-        if dead {
+        // Live after line i = live before line i + 1 (Nop/Directive/Label
+        // lines carry the set through unchanged); the end of the text is an
+        // open exit where everything is live.
+        let live_after = live.get(i + 1).copied().unwrap_or(A64_ALL_GP);
+        if live_after & (1u64 << dst) == 0 {
             kinds[i] = LineKind::Nop;
             changed = true;
         }
+    }
+    changed
+}
+
+/// Give a loop latch the conditional back edge.
+///
+/// A latch ending `b.cc .Lexit; b .Lhead` runs two branches per iteration
+/// (the exit test falls through into the back edge); `b.!cc .Lhead; b
+/// .Lexit` runs one, and the exit branch runs once.  GCC and Clang always
+/// close a loop with the conditional branch.  When `.Lexit` directly
+/// follows, `fuse_branch_over_branch` already deletes the second branch;
+/// this is the layout where the exit block lives elsewhere.
+///
+/// The rewrite only swaps which edge is conditional, so it is exact.  It
+/// applies when:
+/// * `.Lhead` is defined above the pair in this function (a back edge);
+/// * `.Lexit` is not inside `[.Lhead, latch]`: a target inside the loop is
+///   no exit, and the rewritten pair would match again with the roles
+///   swapped;
+/// * the conditional is `b.cc` (`al`/`nv` have no inverse) or `cbz`/`cbnz`
+///   -- `tbz`/`tbnz` reach only +-32 KB;
+/// * nothing but deleted lines and inert directives separate the two
+///   branches (a label there would make `b .Lhead` a block of its own);
+/// * the header is within reach of the conditional (`BranchCensus`).
+fn invert_loop_latches(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut census: Option<BranchCensus> = None;
+    let mut changed = false;
+    for i in 0..n {
+        let kind = kinds[i];
+        if !matches!(kind, LineKind::CondBranch | LineKind::CmpBranch) {
+            continue;
+        }
+        if kind == LineKind::CmpBranch
+            && cmp_branch_parts(&lines[i]).is_none_or(|(m, _, _)| m != "cbz" && m != "cbnz")
+        {
+            continue;
+        }
+        let Some(j) = (i + 1..n).find(|&k| {
+            !(kinds[k] == LineKind::Nop
+                || (kinds[k] == LineKind::Directive && inert_directive(&lines[k])))
+        }) else {
+            continue;
+        };
+        if kinds[j] != LineKind::Branch {
+            continue;
+        }
+        let (Some(exit), Some(head)) = (
+            range_limited_branch_target(&lines[i], kind),
+            branch_target(&lines[j]),
+        ) else {
+            continue;
+        };
+        // Labels are never rewritten here, so one census serves the walk.
+        let census = census.get_or_insert_with(|| BranchCensus::new(lines, kinds));
+        let Some(h) = census.labels.get(head).copied().filter(|&h| h < i) else {
+            continue;
+        };
+        // An exit label defined in this function must lie outside the
+        // loop; one defined elsewhere (a tail call) is outside by nature.
+        if census.labels.get(exit).is_some_and(|e| (h..=j).contains(e)) {
+            continue;
+        }
+        if census
+            .distance(i, head)
+            .is_none_or(|d| d >= COND_BRANCH_SAFE_DISTANCE)
+        {
+            continue;
+        }
+        let Some(cond) = retarget_branch_over_branch(&lines[i], kind, head) else {
+            continue;
+        };
+        let back = format!("    b {exit}");
+        lines[i] = cond;
+        kinds[i] = classify_line(&lines[i]);
+        lines[j] = back;
+        kinds[j] = classify_line(&lines[j]);
+        changed = true;
     }
     changed
 }
@@ -3562,8 +3705,9 @@ fn eliminate_self_moves(lines: &[String], kinds: &mut [LineKind], n: usize) -> b
 
 /// The (uses, defs) of `line` for "can bits 63:32 of xN be observed?" (see
 /// `Liveness::build_with`). A use reads the X view: an explicit one
-/// (`explicit_x_view_reads`) or an implicit one -- a call's argument
-/// registers x0-x7, a return's result and callee-saved registers
+/// (`explicit_x_view_reads`) or an implicit one -- the argument, indirect
+/// result and static-chain registers of a call (`a64_call_reads`), a
+/// return's result and callee-saved registers
 /// (`A64_RET_GP`) and link register, and everything for an opaque
 /// inline-asm body or a supervisor call (`svc` reads x0-x8 unnamed). A
 /// W-view read is no use. The defs are `gp_operands`' must-defs: a W write
@@ -3575,7 +3719,7 @@ fn x_view_operands(line: &str, kind: LineKind) -> (u64, u64) {
     }
     let mut uses = explicit_x_view_reads(t, kind);
     match kind {
-        LineKind::Call => uses |= 0xff,
+        LineKind::Call => uses |= a64_call_reads(t),
         LineKind::Ret => uses |= A64_RET_GP | 1 << 30,
         _ => {}
     }
@@ -4428,10 +4572,13 @@ fn flags_dead_from(lines: &[String], kinds: &[LineKind], from: usize, n: usize) 
 /// scan meets a definition of it before any read, label or branch, or
 /// reaches a `ret` that does not read it.  A `ret` reads the AAPCS64 result
 /// registers x0/x1 (a composite above 16 bytes returns through memory),
-/// hands x19-x28 back to the caller, and needs x29/x30.  A line the
-/// classifier does not model counts every register it names, and every
-/// implicit operand `classify_implicit_operands_a64` knows, as read, and
-/// defines nothing -- so it can only keep the register live.
+/// hands x19-x28 back to the caller, and needs x29/x30.  A call (and a
+/// supervisor call) reads the argument registers x0-x8 without naming them
+/// -- `classify_implicit_operands_a64` reports a `bl` as touching only x30
+/// -- and a call destroys the other caller-saved registers x9-x17 unread.
+/// A line the classifier does not model counts every register it names,
+/// and every implicit operand `classify_implicit_operands_a64` knows, as
+/// read, and defines nothing -- so it can only keep the register live.
 fn gp_dead_from(lines: &[String], kinds: &[LineKind], from: usize, n: usize, reg: u8) -> bool {
     let bit = 1u64 << reg;
     for k in from..n {
@@ -4444,6 +4591,11 @@ fn gp_dead_from(lines: &[String], kinds: &[LineKind], from: usize, n: usize, reg
             | LineKind::Branch
             | LineKind::CondBranch
             | LineKind::CmpBranch => return false,
+            // The callee reads its arguments and clobbers the rest of
+            // x0-x18 unread; x19 and up survive the call.
+            LineKind::Call if a64_call_reads(&lines[k]) & bit != 0 => return false,
+            LineKind::Call if reg <= 18 => return true,
+            _ if A64_ARG_GP & bit != 0 && a64_traps_to_handler(lines[k].trim()) => return false,
             _ => {}
         }
         let (uses, defs) = gp_operands(&lines[k], kinds[k], false);
@@ -5137,18 +5289,19 @@ fn zext_chain_target(
             LineKind::Ret => {
                 return (!(a == 0 || a == 1 || a == 8)).then_some((d, m2));
             }
-            // - calls read argument registers x0-x8; caller-saved temps
-            //   x9-x18 are clobbered unread (dead); callee-saved x19+
-            //   survive the call, so the scan must CONTINUE looking for
-            //   readers after the call rather than assume death.
+            // - a call reads its arguments and the static chain
+            //   (`a64_call_reads`) and clobbers the rest of x0-x18 unread
+            //   (dead); callee-saved x19+ survive the call, so the scan
+            //   must CONTINUE looking for readers after the call rather
+            //   than assume death.
             LineKind::Call => {
-                if a <= 8 {
+                if a64_call_reads(&lines[j]) & (1u64 << a) != 0 {
                     return None;
                 }
                 if a >= 19 {
                     continue;
                 }
-                return Some((d, m2)); // x9-x18: clobbered by the call without a read
+                return Some((d, m2)); // clobbered by the call without a read
             }
             // - labels and branches: the value may be read in the
             //   target/fall-through block; this single-block scan cannot
@@ -6988,6 +7141,458 @@ fn rename_def_dest(line: &str, to: u8) -> Option<String> {
     })
 }
 
+/// The FP register number of `token` when it names a SIMD&FP register view
+/// (`b`/`h`/`s`/`d`/`q`/`v` + 0-31, an arrangement or lane suffix allowed).
+fn fp_view_number(token: &str) -> Option<u8> {
+    let t = token.split(['.', '[']).next()?;
+    let (first, rest) = t.split_at_checked(1)?;
+    if !matches!(first, "b" | "h" | "s" | "d" | "q" | "v") || rest.is_empty() || rest.len() > 2 {
+        return None;
+    }
+    if !rest.bytes().all(|b| b.is_ascii_digit()) || (rest.len() == 2 && rest.starts_with('0')) {
+        return None;
+    }
+    rest.parse::<u8>().ok().filter(|n| *n <= 31)
+}
+
+/// Whether any operand of `line` names a SIMD&FP register -- including the
+/// SVE `z` view of the same file and any register list, whose `{v16-v19}`
+/// range form uses registers it never names.
+fn mentions_any_fp_reg(line: &str) -> bool {
+    let Some((_, rest)) = line.trim().split_once(char::is_whitespace) else {
+        return false;
+    };
+    let z_view = |tok: &str| {
+        tok.strip_prefix('z')
+            .and_then(|r| r.split('.').next())
+            .is_some_and(|r| !r.is_empty() && r.len() <= 2 && r.bytes().all(|b| b.is_ascii_digit()))
+    };
+    rest.contains('{')
+        || rest
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '[' || c == '_'))
+            .any(|tok| fp_view_number(tok).is_some() || z_view(tok))
+}
+
+/// `op dR, ...` / `fmov d0, dR` / (general-register epilogue) / `ret`
+/// becomes `op d0, ...` / ... / `ret`.
+///
+/// The emitter computes an FP result into its allocated home (d16 and up)
+/// and copies it into the return register: one `fmov` per returning path
+/// that GCC and Clang never emit.  The rewrite is exact when
+/// * the defining instruction immediately precedes the copy (no label, so
+///   no other path reaches the copy) and writes all of `dR` from operands
+///   it reads first (`fadd d16, d16, d17` becomes `fadd d0, d16, d17`);
+/// * `R >= 16`: d16-d31 hold neither a result nor a callee-saved value at
+///   `ret`, so `dR` is dead after the copy (d1-d7 may carry the rest of an
+///   HFA result and d8-d15 must survive, so those copies stay);
+/// * only general-register lines and directives separate the copy from the
+///   `ret` -- no label, branch, call or FP operand.
+///
+/// The copy and the definition must use the same view (`d`/`d` or `s`/`s`).
+fn retarget_fp_return_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    const PURE_FP_DEFS: &[&str] = &[
+        "fadd", "fsub", "fmul", "fdiv", "fnmul", "fneg", "fabs", "fsqrt", "fmax", "fmin", "fmaxnm",
+        "fminnm", "fmadd", "fmsub", "fnmadd", "fnmsub", "fcsel", "frinta", "frinti", "frintm",
+        "frintn", "frintp", "frintx", "frintz", "fcvt", "scvtf", "ucvtf",
+    ];
+    let mut changed = false;
+    for ret in 0..n {
+        if kinds[ret] != LineKind::Ret {
+            continue;
+        }
+        // The copy: the nearest FP-mentioning instruction above the `ret`,
+        // with only general-register lines in between.
+        let mut j = ret;
+        let copy = loop {
+            if j == 0 {
+                break None;
+            }
+            j -= 1;
+            match kinds[j] {
+                LineKind::Nop | LineKind::Directive => continue,
+                LineKind::Label
+                | LineKind::Branch
+                | LineKind::CondBranch
+                | LineKind::CmpBranch
+                | LineKind::Call
+                | LineKind::Ret => break None,
+                _ => {}
+            }
+            if a64_traps_to_handler(&lines[j]) || lines[j] == OPAQUE_LINE {
+                break None;
+            }
+            if mentions_any_fp_reg(&lines[j]) {
+                break Some(j);
+            }
+        };
+        let Some(c) = copy else {
+            continue;
+        };
+        let Some(("fmov", ops)) = lines[c].trim().split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Some((dst, src)) = ops.split_once(',') else {
+            continue;
+        };
+        let (dst, src) = (dst.trim(), src.trim());
+        let view = &dst[..1];
+        if !matches!(dst, "d0" | "s0") || !src.starts_with(view) {
+            continue;
+        }
+        let Some(r) = fp_view_number(src) else {
+            continue;
+        };
+        if r < 16 || src.len() != view.len() + r.to_string().len() {
+            continue;
+        }
+        // The definition: the previous instruction, adjacent to the copy.
+        let mut d = c;
+        let def = loop {
+            if d == 0 {
+                break None;
+            }
+            d -= 1;
+            match kinds[d] {
+                LineKind::Nop | LineKind::Directive => continue,
+                LineKind::Label => break None,
+                _ => break Some(d),
+            }
+        };
+        let Some(d) = def else {
+            continue;
+        };
+        let line = lines[d].trim();
+        let Some((mnem, rest)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if !PURE_FP_DEFS.contains(&mnem) {
+            continue;
+        }
+        let Some((first, tail)) = rest.trim_start().split_once(',') else {
+            continue;
+        };
+        if first.trim() != src {
+            continue;
+        }
+        let indent = &lines[d][..lines[d].len() - lines[d].trim_start().len()];
+        lines[d] = format!("{indent}{mnem} {dst},{tail}");
+        kinds[c] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// `fmov dN, dA` followed by a straight-line path to `ret`: the reads of
+/// `dN` on that path read `dA` instead and the copy goes.
+///
+/// This is the entry half of the FP home problem: a parameter arrives in
+/// d0-d7 and the emitter copies it into its d16+ home before use (`fmov
+/// d16, d0; fneg d17, d16; ...`).  The rewrite is exact when
+/// * `N >= 16` (dead at `ret`, see `retarget_fp_return_copies`);
+/// * the path from the copy to `ret` has no label, branch or call, so the
+///   copy reaches every read it feeds and nothing else reaches them;
+/// * every line on it that names an FP register is a scalar FP
+///   data-processing instruction, `fmov`, `fcmp`, or a scalar FP `ldr`/
+///   `str`, whose first operand is its only write (`str`/`fcmp` write
+///   none) -- anything else naming `N` or `A` stops the rewrite;
+/// * `N` is not written again, `A` is not written before the last read of
+///   `N` (an instruction reads before it writes, so `fneg d0, d16` may
+///   become `fneg d0, d0`), and every read of `N` is a `b`/`h`/`s`/`d`
+///   view: the copy zeroed bits 127:64 of `vN`, which `vA` need not have.
+fn forward_fp_copies_to_return(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    const READ_ONLY: &[&str] = &["fcmp", "fcmpe", "str", "stur"];
+    const WRITES_FIRST: &[&str] = &[
+        "fadd", "fsub", "fmul", "fdiv", "fnmul", "fneg", "fabs", "fsqrt", "fmax", "fmin", "fmaxnm",
+        "fminnm", "fmadd", "fmsub", "fnmadd", "fnmsub", "fcsel", "frinta", "frinti", "frintm",
+        "frintn", "frintp", "frintx", "frintz", "fcvt", "scvtf", "ucvtf", "fmov", "ldr", "ldur",
+    ];
+    // Operand tokens of `line` with their positions: (operand index, token).
+    fn operand_tokens(rest: &str) -> Vec<(usize, &str)> {
+        let mut out = Vec::new();
+        for (idx, op) in rest.split(',').enumerate() {
+            for tok in
+                op.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '[' || c == '_'))
+            {
+                if !tok.is_empty() {
+                    out.push((idx, tok));
+                }
+            }
+        }
+        out
+    }
+    let mut changed = false;
+    for i in 0..n {
+        let Some(("fmov", ops)) = lines[i].trim().split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Some((dst, src)) = ops.split_once(',') else {
+            continue;
+        };
+        let (dst, src) = (dst.trim(), src.trim());
+        let view = dst.as_bytes().first().copied();
+        if !matches!(view, Some(b'd' | b's')) || src.as_bytes().first().copied() != view {
+            continue;
+        }
+        let (Some(nreg), Some(areg)) = (fp_view_number(dst), fp_view_number(src)) else {
+            continue;
+        };
+        if nreg < 16 || nreg == areg || dst.contains('.') || src.contains('.') {
+            continue;
+        }
+        let mut renames: Vec<usize> = Vec::new();
+        let mut a_written = false;
+        let mut ok = false;
+        for (j, kind) in kinds.iter().enumerate().take(n).skip(i + 1) {
+            match kind {
+                LineKind::Nop | LineKind::Directive => continue,
+                LineKind::Ret => {
+                    ok = true;
+                    break;
+                }
+                LineKind::Label
+                | LineKind::Branch
+                | LineKind::CondBranch
+                | LineKind::CmpBranch
+                | LineKind::Call => break,
+                _ => {}
+            }
+            let line = &lines[j];
+            if line == OPAQUE_LINE || a64_traps_to_handler(line) {
+                break;
+            }
+            if !mentions_any_fp_reg(line) {
+                continue;
+            }
+            let Some((mnem, rest)) = line.trim().split_once(char::is_whitespace) else {
+                break;
+            };
+            let toks = operand_tokens(rest);
+            let writes_first = WRITES_FIRST.contains(&mnem);
+            // A register list may use registers it never names
+            // (`ld1 {v16.16b-v19.16b}`): it ends the rewrite.  Any other FP
+            // line of an unlisted shape names every register it touches, so
+            // it is harmless unless it names `N` or `A` in some view
+            // (including SVE's `z`).
+            if rest.contains('{') {
+                break;
+            }
+            if !writes_first && !READ_ONLY.contains(&mnem) {
+                let names = |r: u8| {
+                    toks.iter().any(|(_, t)| {
+                        fp_view_number(t) == Some(r)
+                            || t.strip_prefix('z')
+                                .and_then(|z| z.split('.').next())
+                                .and_then(|z| z.parse::<u8>().ok())
+                                == Some(r)
+                    })
+                };
+                if names(nreg) || names(areg) {
+                    break;
+                }
+                continue;
+            }
+            let mut reads_n = false;
+            let mut bad = false;
+            let mut writes_a = false;
+            for (idx, tok) in &toks {
+                let Some(r) = fp_view_number(tok) else {
+                    continue;
+                };
+                let is_dest = writes_first && *idx == 0;
+                if is_dest {
+                    if r == nreg {
+                        bad = true;
+                    }
+                    if r == areg {
+                        writes_a = true;
+                    }
+                } else if r == nreg {
+                    // A read no wider than the copy: after `fmov s16, s0`,
+                    // bits 63:32 of d16 are zero but those of d0 need not be.
+                    let narrow_enough = matches!(
+                        (view, tok.as_bytes()[0]),
+                        (Some(b'd'), b'b' | b'h' | b's' | b'd') | (Some(b's'), b'b' | b'h' | b's')
+                    );
+                    if a_written || !narrow_enough || tok.contains('.') {
+                        bad = true;
+                    }
+                    reads_n = true;
+                }
+            }
+            if bad {
+                break;
+            }
+            if reads_n {
+                renames.push(j);
+            }
+            a_written |= writes_a;
+        }
+        if !ok {
+            continue;
+        }
+        for j in renames {
+            let indent = &lines[j][..lines[j].len() - lines[j].trim_start().len()];
+            let Some((mnem, rest)) = lines[j].trim().split_once(char::is_whitespace) else {
+                continue;
+            };
+            let (head, tail) = if WRITES_FIRST.contains(&mnem) {
+                match rest.split_once(',') {
+                    Some((first, tail)) => (format!("{first},"), tail.to_string()),
+                    None => (String::new(), rest.to_string()),
+                }
+            } else {
+                (String::new(), rest.to_string())
+            };
+            let mut renamed = String::with_capacity(tail.len());
+            let mut token = String::new();
+            let flush = |token: &mut String, out: &mut String| {
+                if fp_view_number(token) == Some(nreg) {
+                    out.push(char::from(token.as_bytes()[0]));
+                    out.push_str(&areg.to_string());
+                } else {
+                    out.push_str(token);
+                }
+                token.clear();
+            };
+            for ch in tail.chars() {
+                if ch.is_ascii_alphanumeric() || ch == '_' {
+                    token.push(ch);
+                } else {
+                    flush(&mut token, &mut renamed);
+                    renamed.push(ch);
+                }
+            }
+            flush(&mut token, &mut renamed);
+            let new_line = format!("{indent}{mnem} {head}{renamed}");
+            // `fmov dK, dK` after the rename moves nothing.
+            let self_move = mnem == "fmov"
+                && new_line
+                    .trim()
+                    .split_once(char::is_whitespace)
+                    .and_then(|(_, o)| o.split_once(','))
+                    .is_some_and(|(a, b)| a.trim() == b.trim());
+            lines[j] = new_line;
+            if self_move {
+                kinds[j] = LineKind::Nop;
+            }
+        }
+        kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// `fmul dA, dX, dY; fneg dB, dA` becomes `fnmul dB, dX, dY`.
+///
+/// FNMUL is FMUL followed by FNEG (Arm ARM: `result = FPMul(...); result =
+/// FPNeg(result)`), one rounding then an exact sign flip, so the fusion is
+/// exact in every rounding mode and for NaNs; GCC and Clang emit it for
+/// `-(x * y)`.  The product register must be dead after the negation: it is
+/// the negation's own destination, or `A >= 16` and the straight-line path
+/// from the negation to `ret` never names it (see
+/// `retarget_fp_return_copies` for why d16-d31 are dead at `ret`).
+fn fuse_fp_mul_neg(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let operands = |line: &str| -> Option<(String, Vec<String>)> {
+        let (mnem, rest) = line.trim().split_once(char::is_whitespace)?;
+        Some((
+            mnem.to_string(),
+            rest.split(',').map(|o| o.trim().to_string()).collect(),
+        ))
+    };
+    let mut changed = false;
+    for i in 0..n {
+        let Some((mnem, ops)) = operands(&lines[i]) else {
+            continue;
+        };
+        if mnem != "fmul"
+            || ops.len() != 3
+            || ops.iter().any(|o| o.contains('.') || o.contains('['))
+        {
+            continue;
+        }
+        let view = ops[0].as_bytes()[0];
+        if !matches!(view, b'd' | b's') || ops.iter().any(|o| o.as_bytes().first() != Some(&view)) {
+            continue;
+        }
+        let Some(a) = fp_view_number(&ops[0]) else {
+            continue;
+        };
+        let Some(j) =
+            (i + 1..n).find(|&j| !matches!(kinds[j], LineKind::Nop | LineKind::Directive))
+        else {
+            continue;
+        };
+        let Some((m2, ops2)) = operands(&lines[j]) else {
+            continue;
+        };
+        if m2 != "fneg"
+            || ops2.len() != 2
+            || ops2[1] != ops[0]
+            || ops2[0].as_bytes().first() != Some(&view)
+        {
+            continue;
+        }
+        let Some(b) = fp_view_number(&ops2[0]) else {
+            continue;
+        };
+        if ops2[0].contains('.') {
+            continue;
+        }
+        let dead_after = a == b
+            || (a >= 16 && {
+                let mut ok = false;
+                for (k, kind) in kinds.iter().enumerate().take(n).skip(j + 1) {
+                    match kind {
+                        LineKind::Nop | LineKind::Directive => continue,
+                        LineKind::Ret => {
+                            ok = true;
+                            break;
+                        }
+                        LineKind::Label
+                        | LineKind::Branch
+                        | LineKind::CondBranch
+                        | LineKind::CmpBranch
+                        | LineKind::Call => break,
+                        _ => {}
+                    }
+                    let line = &lines[k];
+                    if line == OPAQUE_LINE || a64_traps_to_handler(line) {
+                        break;
+                    }
+                    if !mentions_any_fp_reg(line) {
+                        continue;
+                    }
+                    // Only plain scalar FP lines can be read register by
+                    // register; any other FP line may use `a` implicitly.
+                    let Some((m, rest)) = line.trim().split_once(char::is_whitespace) else {
+                        break;
+                    };
+                    let scalar_fp = m.starts_with('f')
+                        || matches!(m, "ldr" | "str" | "ldur" | "stur" | "scvtf" | "ucvtf");
+                    if !scalar_fp
+                        || rest.contains('{')
+                        || rest
+                            .split(|c: char| {
+                                !(c.is_ascii_alphanumeric() || c == '.' || c == '[' || c == '_')
+                            })
+                            .any(|t| fp_view_number(t) == Some(a))
+                    {
+                        break;
+                    }
+                }
+                ok
+            });
+        if !dead_after {
+            continue;
+        }
+        let indent = &lines[i][..lines[i].len() - lines[i].trim_start().len()];
+        lines[i] = format!("{indent}fnmul {}, {}, {}", ops2[0], ops[1], ops[2]);
+        kinds[j] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
 fn retarget_defs_into_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     if n == 0 || lines[..n].iter().any(|l| l == OPAQUE_LINE) {
         return false;
@@ -7985,6 +8590,30 @@ fn is_symbol_char(c: char) -> bool {
 /// (`bl`, `blr`) or a system call reads the argument registers x0-x7 and the
 /// indirect-result register x8.
 const A64_ARG_GP: u64 = 0x1ff;
+/// The static chain: GCC's AArch64 convention passes a nested function its
+/// frame in x18 (`emit_set_static_chain_impl`), so a call reads it unnamed.
+/// LCCC never allocates x18, so charging every call with it costs nothing.
+const A64_CHAIN_GP: u64 = 1 << 18;
+/// What a call destroys: the caller-saved x0-x18 (AAPCS64 6.1.1; x18 is a
+/// temporary on Linux) and the link register.  A value in any of them before
+/// the call is dead after it.
+const A64_CALL_CLOBBER_GP: u64 = 0x7_ffff | (1u64 << 30);
+
+/// The GP registers the call on `line` reads: the argument registers its
+/// callee takes values in plus x8 for a result in memory -- exactly, when the
+/// emitter annotated the call (`CALL_READS_TAG`, decimal mask), else all of
+/// x0-x8 -- and the static chain x18.
+///
+/// Calls the emitter does not annotate (runtime helpers, indirect `blr`,
+/// hand-written text) keep the full set: an absent annotation can only cost
+/// precision, never drop a read.
+fn a64_call_reads(line: &str) -> u64 {
+    let args = line
+        .split_once(CALL_READS_TAG)
+        .and_then(|(_, mask)| mask.trim().parse::<u64>().ok())
+        .map_or(A64_ARG_GP, |mask| mask & A64_ARG_GP);
+    args | A64_CHAIN_GP
+}
 /// A return hands the result registers (x0, x1: a GP result never needs
 /// more -- a larger one goes to memory through x8) and the callee-saved
 /// x19-x29 back to the caller.  The link register x30 is modeled by
@@ -7999,9 +8628,10 @@ const A64_ALL_GP: u64 = (1u64 << 31) - 1;
 /// `Liveness` answers a different question (it is shared with the copy
 /// coalescer, which deliberately leaves a call's arguments out and charges
 /// a `ret` with x0-x7): a transformation that CHANGES a register's value on
-/// some path must see every reader, so here a call and `svc` read
-/// `A64_ARG_GP`, a `ret` reads `A64_RET_GP`, and a direct branch out of the
-/// function (a tail call) reads both and the link register.  `None` when the
+/// some path must see every reader, so here a call reads `a64_call_reads`
+/// and kills `A64_CALL_CLOBBER_GP`, `svc` reads `A64_ARG_GP`, a `ret` reads
+/// `A64_RET_GP`, and a direct branch out of the function (a tail call) reads
+/// all of them and the link register.  `None` when the
 /// control flow cannot be resolved: an indirect `br xN` (a jump table) or a
 /// conditional branch to a label this function does not define.
 fn abi_liveness(lines: &[String], kinds: &[LineKind], n: usize) -> Option<Vec<u64>> {
@@ -8070,15 +8700,18 @@ fn abi_liveness(lines: &[String], kinds: &[LineKind], n: usize) -> Option<Vec<u6
         succs.push(s);
     }
     let transfer = |k: usize| -> (u64, u64) {
-        let (mut u, d) = gp_operands(&lines[k], kinds[k], false);
+        let (mut u, mut d) = gp_operands(&lines[k], kinds[k], false);
         let text = lines[k].trim();
         match kinds[k] {
-            LineKind::Call => u |= A64_ARG_GP,
+            LineKind::Call => {
+                u |= a64_call_reads(text);
+                d |= A64_CALL_CLOBBER_GP;
+            }
             LineKind::Ret => u |= A64_RET_GP,
             LineKind::Branch => {
                 let tgt = text.split_whitespace().next_back();
                 if !tgt.is_some_and(|l| label_block.contains_key(l)) {
-                    u |= A64_ARG_GP | A64_RET_GP | (1u64 << 30);
+                    u |= A64_ARG_GP | A64_CHAIN_GP | A64_RET_GP | (1u64 << 30);
                 }
             }
             _ => {
@@ -10243,6 +10876,9 @@ mod tests {
             "    adrp x0, ring\n",
             "    add x0, x0, :lo12:ring\n",
             "    mov x0, x5\n",
+            // A reader keeps the clobbering copy live (a dead one is deleted
+            // by `eliminate_dead_moves`, and then nothing clobbers the pair).
+            "    str x0, [x1]\n",
             "    adrp x0, ring\n",
             "    add x0, x0, :lo12:ring\n",
             "    ret\n",
@@ -11959,5 +12595,508 @@ mod def_retarget_tests {
             reused.iter().any(|l| l.starts_with("cset x3, lt")),
             "{reused:?}"
         );
+    }
+}
+
+/// Calls read the argument registers and destroy the other caller-saved
+/// registers without naming any of them, and a move is dead exactly when the
+/// function's dataflow says so -- whatever role its register usually plays.
+#[cfg(test)]
+mod call_liveness_and_dead_move_tests {
+    use super::*;
+
+    fn rows(input: &str) -> Vec<String> {
+        peephole_optimize(input.to_string())
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    fn classified(text: &[&str]) -> (Vec<String>, Vec<LineKind>) {
+        let lines: Vec<String> = text.iter().map(|l| (*l).to_string()).collect();
+        let kinds = lines.iter().map(|l| classify_line(l)).collect();
+        (lines, kinds)
+    }
+
+    /// `mov w5, w0` renamed onto w0 moved the callee's sixth argument out of
+    /// x5: the coalescer's liveness does not model the call's argument
+    /// reads, so a later write of x0 looked harmless and the call read a
+    /// stale x5 (gcc.c-torture va-arg-6, 20040823-1, pr98853-1, ...).
+    #[test]
+    fn entry_copy_into_argument_register_survives_a_call() {
+        let out =
+            rows("f:\n    mov w5, w0\n    add w1, w5, #3\n    mov w0, #7\n    bl g\n    ret\n");
+        let call = out.iter().position(|l| l == "bl g").expect("call kept");
+        assert!(
+            out[..call]
+                .iter()
+                .any(|l| l.starts_with("mov w5, ") || l.starts_with("mov x5, ")),
+            "x5 (g's sixth argument) is no longer written before the call: {out:?}"
+        );
+        // A staged argument renamed with the copy is the same hazard.
+        let out = rows(
+            "f:\n    mov w5, w0\n    add w20, w5, #3\n    mov w0, #7\n    mov w5, w20\n    \
+             bl g\n    mov w0, #0\n    ret\n",
+        );
+        let call = out.iter().position(|l| l == "bl g").expect("call kept");
+        assert!(
+            out[..call].iter().any(|l| l.starts_with("mov w5, ")),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn gp_dead_from_models_call_reads_and_clobbers() {
+        let (lines, kinds) =
+            classified(&["    bl g", "    mov x0, #1", "    mov x9, #1", "    ret"]);
+        let n = lines.len();
+        // x0-x8 are read by the call: live, even though redefined after it.
+        for reg in 0..=8 {
+            assert!(!gp_dead_from(&lines, &kinds, 0, n, reg), "x{reg}");
+        }
+        // x9-x17 die at the call unread.
+        for reg in 9..=17 {
+            assert!(gp_dead_from(&lines, &kinds, 0, n, reg), "x{reg}");
+        }
+        // The static chain is read by every call.
+        assert!(!gp_dead_from(&lines, &kinds, 0, n, 18));
+        // Callee-saved registers are handed back by the `ret`.
+        assert!(!gp_dead_from(&lines, &kinds, 0, n, 19));
+        // Annotated, the call reads exactly its arguments (x0, x2 here) and
+        // clobbers the other caller-saved registers unread.
+        let call = format!("    bl g{CALL_READS_TAG}5");
+        let (lines, kinds) = classified(&[&call, "    mov x0, #1", "    ret"]);
+        let n = lines.len();
+        for reg in 0..=18 {
+            let read = matches!(reg, 0 | 2 | 18);
+            assert_eq!(gp_dead_from(&lines, &kinds, 0, n, reg), !read, "x{reg}");
+        }
+        // A supervisor call reads x0-x8 too (x8 = the syscall number).
+        let (lines, kinds) =
+            classified(&["    svc #0", "    mov x8, #1", "    mov x0, #0", "    ret"]);
+        let n = lines.len();
+        assert!(!gp_dead_from(&lines, &kinds, 0, n, 8));
+        assert!(!gp_dead_from(&lines, &kinds, 0, n, 2));
+    }
+
+    /// `eliminate_unused_x9_address_moves` deleted `mov x9, x3` because the
+    /// next line was a label -- but x9 is an ordinary allocatable register in
+    /// a pure scalar-ALU function, here a loop-carried operand
+    /// (gcc.c-torture pr42833).
+    #[test]
+    fn dead_moves_follow_liveness_not_register_roles() {
+        // x3 changes inside the loop, so x9 must keep its entry value.
+        let out = rows(
+            "f:\n    mov x9, x3\n.L1:\n    add x0, x0, x9\n    eor x3, x3, x0\n    \
+             subs x1, x1, #1\n    b.ne .L1\n    add x0, x0, x3\n    ret\n",
+        );
+        assert!(out.contains(&"mov x9, x3".to_string()), "{out:?}");
+        // A move dead on every path is deleted, across labels and branches.
+        let out = rows(
+            "g:\n    mov x3, x0\n    cbz x1, .L2\n    mov x3, #1\n    b .L3\n.L2:\n    \
+             mov x3, #2\n.L3:\n    add x0, x3, x2\n    ret\n",
+        );
+        assert!(!out.contains(&"mov x3, x0".to_string()), "{out:?}");
+        assert!(out.contains(&"mov x3, #1".to_string()), "{out:?}");
+        assert!(out.contains(&"mov x3, #2".to_string()), "{out:?}");
+        // Moves the ABI reads stay: an argument before a call, the result
+        // before a return, and an indirect-result pointer (x8).
+        let out = rows("h:\n    mov x8, x2\n    mov x1, x4\n    bl k\n    mov x0, x5\n    ret\n");
+        for kept in ["mov x8, x2", "mov x1, x4", "mov x0, x5"] {
+            assert!(out.contains(&kept.to_string()), "{kept}: {out:?}");
+        }
+        // A jump table hides the successors: every move stays.
+        let out = rows("j:\n    mov x3, x0\n    br x2\n.L5:\n    mov x3, #1\n    ret\n");
+        assert!(out.contains(&"mov x3, x0".to_string()), "{out:?}");
+    }
+
+    /// gcc.c-torture pr24716 at -O1, as the emitter hands it to the
+    /// peephole (`f`, with the debug directives removed).  The inner loops
+    /// rotate, and the rotated latch used to stay one multi-line slot
+    /// (`cmp; b.cc .Lbody; b .Lexit` classified `Other`): every CFG pass
+    /// then saw it fall through into the exit block, `eliminate_dead_moves`
+    /// deleted the loop-carried `mov x7, #1` (`j = 1`) and the copies feeding
+    /// `.LBB1`, and `f` never returned.  Splitting the slot right after
+    /// rotation keeps them.
+    #[test]
+    fn rotated_latches_are_real_branches_to_every_cfg_pass() {
+        let out = rows(
+            "f:\n\
+                 stp x29, x30, [sp, #-32]!\n\
+                 mov x29, sp\n\
+                 stp x19, x21, [sp, #16]\n\
+                 mov w19, w0\n\
+                 mov w21, w1\n\
+                 mov x4, x19\n\
+                 mov x5, x21\n\
+                 mov x0, #0\n\
+                 mov x21, x0\n\
+                 mov x0, #0\n\
+                 mov x7, x0\n\
+             .LBB1:\n\
+                 cmp w21, #2\n\
+                 b.le .Lskip_26\n\
+                 b .LBB2\n\
+             .Lskip_26:\n\
+                 b .LBB5\n\
+             .LBB2:\n\
+                 mov x8, x21\n\
+                 mov x6, x7\n\
+             .LBB3:\n\
+                 sub w6, w6, #1\n\
+                 add w8, w8, #1\n\
+                 cmp w6, #2\n\
+                 b.le .Lskip_27\n\
+                 b .LBB3\n\
+             .Lskip_27:\n\
+                 b .LBB4\n\
+             .LBB4:\n\
+                 mov x21, x8\n\
+                 mov x7, x6\n\
+             .LBB5:\n\
+                 cmp w7, #1\n\
+                 b.ne .Lskip_28\n\
+                 b .LBB27\n\
+             .Lskip_28:\n\
+                 b .LBB6\n\
+             .LBB6:\n\
+                 mov x13, x21\n\
+             .LBB7:\n\
+                 cmp w13, w5\n\
+                 b.le .Lskip_29\n\
+                 b .LBB8\n\
+             .Lskip_29:\n\
+                 b .LBB11\n\
+             .LBB8:\n\
+                 cmp w7, w5\n\
+                 b.ne .Lskip_30\n\
+                 b .LBB9\n\
+             .Lskip_30:\n\
+                 b .LBB10\n\
+             .LBB9:\n\
+                 add w13, w13, #1\n\
+             .LBB10:\n\
+                 cmp w13, w5\n\
+                 b.le .Lskip_31\n\
+                 b .LBB8\n\
+             .Lskip_31:\n\
+                 b .LBB11\n\
+             .LBB11:\n\
+                 adrp x0, :got:W\n\
+                 ldr x0, [x0, :got_lo12:W]\n\
+                 mov x14, x0\n\
+             .LBB12:\n\
+                 sxtw x6, w4\n\
+                 ldrsw x6, [x14, x6, lsl #2]\n\
+             .LBB13:\n\
+                 cmp w6, #0\n\
+                 b.eq .Lskip_32\n\
+                 b .LBB14\n\
+             .Lskip_32:\n\
+                 b .LBB15\n\
+             .LBB14:\n\
+                 sxtw x13, w4\n\
+                 lsl x6, x13, #2\n\
+                 str wzr, [x14, x13, lsl #2]\n\
+                 mov x0, #1\n\
+                 mov x13, x0\n\
+                 mov x0, #0\n\
+                 mov x6, x0\n\
+             .LBB15:\n\
+                 cmp w5, #1\n\
+                 b.ge .Lskip_33\n\
+                 b .LBB13\n\
+             .Lskip_33:\n\
+                 b .LBB16\n\
+             .LBB16:\n\
+                 cmp w4, #0\n\
+                 b.le .Lskip_34\n\
+                 b .LBB17\n\
+             .Lskip_34:\n\
+                 b .LBB18\n\
+             .LBB17:\n\
+                 b .LBB12\n\
+             .LBB18:\n\
+                 mov x8, x4\n\
+             .LBB19:\n\
+                 sxtw x14, w8\n\
+                 adrp x0, :got:Link\n\
+                 ldr x0, [x0, :got_lo12:Link]\n\
+                 mov x4, x0\n\
+                 ldrsw x6, [x4, x14, lsl #2]\n\
+                 mov x0, #0\n\
+                 mov x8, x0\n\
+             .LBB20:\n\
+                 cmp w8, w7\n\
+                 b.ge .Lskip_35\n\
+                 b .LBB21\n\
+             .Lskip_35:\n\
+                 b .LBB24\n\
+             .LBB21:\n\
+                 cmn w6, #1\n\
+                 b.eq .Lskip_36\n\
+                 b .LBB22\n\
+             .Lskip_36:\n\
+                 b .LBB23\n\
+             .LBB22:\n\
+                 add w13, w13, #1\n\
+                 add w8, w8, #1\n\
+             .LBB23:\n\
+                 cmp w8, w7\n\
+                 b.ge .Lskip_37\n\
+                 b .LBB21\n\
+             .Lskip_37:\n\
+                 b .LBB24\n\
+             .LBB24:\n\
+                 cmn w6, #1\n\
+                 b.eq .Lskip_38\n\
+                 b .LBB25\n\
+             .Lskip_38:\n\
+                 b .LBB26\n\
+             .LBB25:\n\
+                 mov x8, x6\n\
+                 b .LBB19\n\
+             .LBB26:\n\
+                 mov x4, x6\n\
+                 mov x5, x8\n\
+                 mov x21, x13\n\
+                 mov x0, #1\n\
+                 mov x7, x0\n\
+                 b .LBB1\n\
+             .LBB27:\n\
+                 mov x0, x21\n\
+                 ldp x19, x21, [sp, #16]\n\
+                 ldp x29, x30, [sp], #32\n\
+                 ret\n\
+             .size f, .-f\n",
+        );
+        for kept in ["mov x7, #1", "mov x4, x6", "mov x5, x8"] {
+            assert!(out.contains(&kept.to_string()), "{kept} deleted: {out:?}");
+        }
+        // The split itself: a live multi-line slot becomes one classified row
+        // per line, a deleted one stays one deleted row.
+        let mut lines = vec![
+            "    cmp w6, #2\n    b.gt .LBB3\n    b .Lskip_27".to_string(),
+            "    mov x1, x2\n    mov x3, x4".to_string(),
+            "    ret".to_string(),
+        ];
+        let mut kinds = vec![LineKind::Other, LineKind::Nop, LineKind::Ret];
+        let n = split_multiline_slots(&mut lines, &mut kinds);
+        assert_eq!(n, 5);
+        assert_eq!(kinds[0], LineKind::Compare);
+        assert_eq!(kinds[1], LineKind::CondBranch);
+        assert_eq!(kinds[2], LineKind::Branch);
+        assert_eq!(kinds[3], LineKind::Nop);
+        assert_eq!(kinds[4], LineKind::Ret);
+        assert!(lines.iter().take(3).all(|l| !l.contains('\n')), "{lines:?}");
+    }
+
+    /// `-(x * y)` is one `fnmul` when the product dies at the negation.
+    #[test]
+    fn negated_products_are_fnmul() {
+        let out = rows("f:\n    fmov d16, d0\n    fmul d16, d16, d1\n    fneg d0, d16\n    ret\n");
+        assert_eq!(out, ["f:", "fnmul d0, d0, d1", "ret"], "{out:?}");
+        let out = rows("g:\n    fmul s20, s1, s2\n    fneg s20, s20\n    str s20, [x0]\n    ret\n");
+        assert!(out.contains(&"fnmul s20, s1, s2".to_string()), "{out:?}");
+        // The product read again, a d8-d15 product, or a branch before
+        // `ret`: the multiply and the negation stay apart.
+        for asm in [
+            "h:\n    fmul d16, d1, d2\n    fneg d0, d16\n    fadd d0, d0, d16\n    ret\n",
+            "k:\n    fmul d9, d1, d2\n    fneg d0, d9\n    ret\n",
+            "m:\n    fmul d16, d1, d2\n    fneg d0, d16\n    cbz x0, .L1\n.L1:\n    ret\n",
+            // A register-list range reads v17 without naming it.
+            "n:\n    fmul d17, d1, d2\n    fneg d0, d17\n    st1 {v16.2d-v18.2d}, [x0]\n    ret\n",
+        ] {
+            let out = rows(asm);
+            assert!(
+                !out.iter().any(|l| l.starts_with("fnmul")),
+                "{asm:?}: {out:?}"
+            );
+        }
+    }
+
+    /// A parameter copied from its argument register into a d16+ home is
+    /// read in place on a straight-line path to `ret`; the copy goes.
+    #[test]
+    fn fp_entry_copies_are_read_in_place() {
+        let out = rows("f:\n    fmov d16, d0\n    fneg d17, d16\n    fmov d0, d17\n    ret\n");
+        assert_eq!(out, ["f:", "fneg d0, d0", "ret"], "{out:?}");
+        let out = rows(
+            "g:\n    fmov d16, d0\n    fmov d17, d1\n    fmov d18, d2\n    \
+             fmadd d19, d16, d17, d18\n    fmov d0, d19\n    ret\n",
+        );
+        assert_eq!(out, ["g:", "fmadd d0, d0, d1, d2", "ret"], "{out:?}");
+        // Every shape that needs the copy keeps it: a q/v view of the home
+        // (bits 127:64 were zeroed), the source written before the last
+        // read, a branch on the path, the home written again.
+        for (asm, kept) in [
+            (
+                "h:\n    fmov d16, d0\n    mov v0.16b, v16.16b\n    ret\n",
+                "fmov d16, d0",
+            ),
+            // A read wider than the copy, and a register list.
+            (
+                "r:\n    fmov s16, s0\n    fmov x0, d16\n    ret\n",
+                "fmov s16, s0",
+            ),
+            (
+                "t:\n    fmov d16, d0\n    st1 {v16.2d}, [x0]\n    ret\n",
+                "fmov d16, d0",
+            ),
+            (
+                "k:\n    fmov d16, d0\n    fmov d0, d1\n    fadd d0, d0, d16\n    ret\n",
+                "fmov d16, d0",
+            ),
+            (
+                "m:\n    fmov d16, d0\n    cbz x0, .L1\n    fneg d0, d16\n.L1:\n    ret\n",
+                "fmov d16, d0",
+            ),
+            (
+                "p:\n    fmov d16, d0\n    fadd d16, d16, d1\n    fmul d17, d16, d16\n    \
+                 fmov d0, d17\n    ret\n",
+                "fmov d16, d0",
+            ),
+        ] {
+            let out = rows(asm);
+            assert!(out.contains(&kept.to_string()), "{asm:?}: {out:?}");
+        }
+    }
+
+    /// An FP result computed into a d16+ home and copied into d0 before
+    /// `ret` is computed into d0 directly; every shape whose copy carries
+    /// information keeps it.
+    #[test]
+    fn fp_results_are_computed_into_the_return_register() {
+        let out = rows("f:\n    fadd d18, d16, d17\n    fmov d0, d18\n    ret\n");
+        assert_eq!(out, ["f:", "fadd d0, d16, d17", "ret"], "{out:?}");
+        // With the entry copies forwarded too, the leaf is GCC's.
+        let out = rows(
+            "f:\n    fmov d16, d0\n    fmov d17, d1\n    fadd d18, d16, d17\n    fmov d0, d18\n    ret\n",
+        );
+        assert_eq!(out, ["f:", "fadd d0, d0, d1", "ret"], "{out:?}");
+        // General-register epilogue lines may separate the copy from `ret`.
+        let out = rows(
+            "g:\n    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    bl h\n    fneg s17, s16\n    \
+             fmov s0, s17\n    ldp x29, x30, [sp], #16\n    ret\n",
+        );
+        assert!(out.contains(&"fneg s0, s16".to_string()), "{out:?}");
+        // d1-d15 (HFA members, callee-saved), a label between definition
+        // and copy, a view change, a non-arithmetic definition and an FP
+        // line after the copy all keep the copy.
+        for (asm, kept) in [
+            (
+                "h:\n    fadd d1, d2, d3\n    fmov d0, d1\n    ret\n",
+                "fmov d0, d1",
+            ),
+            (
+                "k:\n    fadd d18, d16, d17\n.L1:\n    fmov d0, d18\n    ret\n",
+                "fmov d0, d18",
+            ),
+            (
+                "m:\n    fadd s18, s16, s17\n    fmov d0, d18\n    ret\n",
+                "fmov d0, d18",
+            ),
+            (
+                "p:\n    str d18, [x0]\n    fmov d0, d18\n    ret\n",
+                "fmov d0, d18",
+            ),
+            (
+                "q:\n    fadd d18, d16, d17\n    fmov d0, d18\n    fmov d1, d16\n    ret\n",
+                "fmov d0, d18",
+            ),
+        ] {
+            let out = rows(asm);
+            assert!(out.contains(&kept.to_string()), "{asm:?}: {out:?}");
+        }
+    }
+
+    /// The emitter's annotation names the registers a callee takes values
+    /// in: a value left in any other argument register dies at the call, and
+    /// the annotation never reaches the output.
+    #[test]
+    fn annotated_call_reads_only_its_arguments() {
+        let tag = CALL_READS_TAG;
+        let out = rows(&format!(
+            "f:\n    mov x1, #5\n    mov x0, #1\n    bl g{tag}1\n    mov x0, #0\n    ret\n"
+        ));
+        assert!(!out.contains(&"mov x1, #5".to_string()), "{out:?}");
+        assert!(out.contains(&"mov x0, #1".to_string()), "{out:?}");
+        assert!(out.contains(&"bl g".to_string()), "{out:?}");
+        // Unannotated, the call may read x1.
+        let out = rows("f:\n    mov x1, #5\n    mov x0, #1\n    bl g\n    mov x0, #0\n    ret\n");
+        assert!(out.contains(&"mov x1, #5".to_string()), "{out:?}");
+        // x8 (a memory-result pointer) is read when its bit says so, the
+        // static chain x18 always.
+        let out = rows(&format!(
+            "f:\n    mov x8, x2\n    mov x18, x3\n    mov x7, x4\n    bl g{tag}256\n    \
+             mov x0, #0\n    ret\n"
+        ));
+        assert!(out.contains(&"mov x8, x2".to_string()), "{out:?}");
+        assert!(out.contains(&"mov x18, x3".to_string()), "{out:?}");
+        assert!(!out.contains(&"mov x7, x4".to_string()), "{out:?}");
+        assert!(
+            out.iter().all(|l| !l.contains("lccc-call-reads")),
+            "{out:?}"
+        );
+        // The entry-copy coalescer may rename a copy into an argument
+        // register the next call does not read (unannotated, the same input
+        // keeps the copy: `entry_copy_into_argument_register_survives_a_call`).
+        let out = rows(&format!(
+            "f:\n    mov w5, w0\n    add w1, w5, #3\n    mov w0, #7\n    bl g{tag}3\n    \
+             mov w0, #0\n    ret\n"
+        ));
+        assert!(out.contains(&"add w1, w0, #3".to_string()), "{out:?}");
+        assert!(
+            out.iter().all(|l| !l.contains("w5") && !l.contains("x5")),
+            "{out:?}"
+        );
+    }
+
+    /// The unoptimized paths drop the annotation too, but never touch the
+    /// text of an inline-assembly body.
+    #[test]
+    fn call_annotations_are_stripped_outside_user_text() {
+        let tag = CALL_READS_TAG;
+        let text = format!("f:\n    bl g{tag}3\n#APP\n    nop{tag}9\n#NO_APP\n    ret\n");
+        assert_eq!(
+            strip_call_annotations(text),
+            format!("f:\n    bl g\n#APP\n    nop{tag}9\n#NO_APP\n    ret\n")
+        );
+        let plain = "f:\n    bl g\n    ret\n".to_string();
+        assert_eq!(strip_call_annotations(plain.clone()), plain);
+    }
+
+    /// `b.ge .L9; b .L1` closing a loop whose exit block is laid out
+    /// elsewhere: the conditional takes the back edge, so an iteration runs
+    /// one branch instead of two.
+    #[test]
+    fn loop_latch_takes_the_conditional_back_edge() {
+        let out = rows(
+            "f:\n    mov x2, #0\n.L1:\n    add x2, x2, x0\n    subs x1, x1, #1\n    \
+             b.eq .L9\n    b .L1\n.L5:\n    mov x0, #5\n    ret\n.L9:\n    mov x0, x2\n    ret\n",
+        );
+        let latch = out
+            .iter()
+            .position(|l| l == "b.ne .L1")
+            .expect("conditional back edge");
+        assert_eq!(out[latch + 1], "b .L9", "{out:?}");
+        // cbz/cbnz invert the same way.
+        let out = rows(
+            "f:\n    mov x2, #0\n.L1:\n    add x2, x2, x0\n    sub x1, x1, #1\n    \
+             cbz x1, .L9\n    b .L1\n.L5:\n    mov x0, #5\n    ret\n.L9:\n    mov x0, x2\n    ret\n",
+        );
+        assert!(out.contains(&"cbnz x1, .L1".to_string()), "{out:?}");
+        // An "exit" into the loop body, and tbz (+-32 KB), stay as written.
+        let out = rows(
+            "f:\n.L1:\n    add x2, x2, x0\n.L2:\n    subs x1, x1, #1\n    b.eq .L2\n    \
+             b .L1\n    mov x0, x2\n    ret\n",
+        );
+        assert!(out.contains(&"b.eq .L2".to_string()), "{out:?}");
+        let out = rows(
+            "f:\n.L1:\n    add x2, x2, x0\n    sub x1, x1, #1\n    tbz x1, #3, .L9\n    \
+             b .L1\n.L5:\n    mov x0, #5\n    ret\n.L9:\n    mov x0, x2\n    ret\n",
+        );
+        assert!(out.contains(&"tbz x1, #3, .L9".to_string()), "{out:?}");
     }
 }

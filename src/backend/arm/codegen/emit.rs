@@ -254,6 +254,14 @@ pub struct ArmCodegen {
     /// from the CallInfo). The result arrives in Q0; the result store must
     /// take the 16-byte path instead of the x0:x1 pair.
     pub(super) call_ret_is_f128_sse: bool,
+    /// The GP argument registers (bit N = xN, N <= 8) the call being emitted
+    /// passes values in, armed by `emit_call_reg_args_impl` from the
+    /// authoritative `CallArgClass` list, widened by the x8 setup of a
+    /// memory-returned result, and published on the call line as the
+    /// peephole's `CALL_READS_TAG` annotation.  `None`: not armed (an
+    /// unmodeled class), so the call is published unannotated and the
+    /// peephole assumes it reads all of x0-x8.
+    pub(super) call_gp_reads: Option<u16>,
     /// For variadic functions: offset from SP where the GP register save area starts (x0-x7).
     pub(super) va_gp_save_offset: i64,
     /// For variadic functions: offset from SP where the FP register save area starts (q0-q7).
@@ -341,6 +349,7 @@ impl ArmCodegen {
             current_return_type: IrType::I64,
             func_ret_is_f128_sse: false,
             call_ret_is_f128_sse: false,
+            call_gp_reads: None,
             va_gp_save_offset: 0,
             va_fp_save_offset: 0,
             va_named_gp_count: 0,
@@ -797,6 +806,23 @@ impl ArmCodegen {
     /// values are sign-extended and unsigned values are zero-extended to 32
     /// bits. This distinction is essential for `(unsigned short)-2`: its
     /// compare value is 0x0000fffe, not the 32-bit -2 pattern 0xfffffffe.
+    /// The right operand of an integer compare in x0.  An integer constant
+    /// takes the comparison type's normalization, not its storage variant's
+    /// signed reading.  A floating-point constant stands for its bit
+    /// pattern -- a folded type pun such as `union { double d; u64 u; }`
+    /// compares the bits as `U64` -- which the operand loader materializes
+    /// exactly; it was an internal error ("integer comparison constant must
+    /// normalize").
+    fn load_cmp_rhs_to_x0(&mut self, rhs: &Operand, ty: IrType) {
+        match rhs {
+            Operand::Const(c) => match Self::normalized_cmp_const(c, ty) {
+                Some(value) => self.emit_load_imm64("x0", value as i64),
+                None => self.operand_to_x0(rhs),
+            },
+            Operand::Value(_) => self.operand_to_x0(rhs),
+        }
+    }
+
     fn normalized_cmp_const(c: &IrConst, ty: IrType) -> Option<u64> {
         if !ty.is_integer() && ty != IrType::Ptr {
             return None;
@@ -987,13 +1013,7 @@ impl ArmCodegen {
                 // lhs in register, rhs needs loading into x0. Constants must
                 // use comparison-type normalization rather than their storage
                 // variant's signed interpretation.
-                if let Operand::Const(c) = rhs {
-                    let value = Self::normalized_cmp_const(c, ty)
-                        .expect("integer comparison constant must normalize");
-                    self.emit_load_imm64("x0", value as i64);
-                } else {
-                    self.operand_to_x0(rhs);
-                }
+                self.load_cmp_rhs_to_x0(rhs, ty);
                 if use_32bit {
                     self.state.emit_fmt(format_args!("    cmp {}, w0", lhs_reg));
                 } else {
@@ -1048,13 +1068,7 @@ impl ArmCodegen {
         // Fallback: load both into x0/x1
         self.operand_to_x0(lhs);
         self.state.emit("    mov x1, x0");
-        if let Operand::Const(c) = rhs {
-            let value = Self::normalized_cmp_const(c, ty)
-                .expect("integer comparison constant must normalize");
-            self.emit_load_imm64("x0", value as i64);
-        } else {
-            self.operand_to_x0(rhs);
-        }
+        self.load_cmp_rhs_to_x0(rhs, ty);
         if use_32bit {
             self.state.emit("    cmp w1, w0");
         } else {
@@ -3475,6 +3489,20 @@ impl ArchCodegen for ArmCodegen {
     fn sret_uses_dedicated_reg(&self) -> bool {
         true
     }
+    fn emit_unaryop(
+        &mut self,
+        dest: &Value,
+        op: crate::ir::reexports::IrUnaryOp,
+        src: &Operand,
+        ty: IrType,
+    ) {
+        // `-x` stays in the FP domain: one `fneg` (`emit_float_neg_reg`).
+        if op == crate::ir::reexports::IrUnaryOp::Neg && matches!(ty, IrType::F32 | IrType::F64) {
+            self.emit_float_neg_reg(dest, src, ty);
+            return;
+        }
+        crate::backend::traits::emit_unaryop_default(self, dest, op, src, ty);
+    }
     fn emit_call_sret_setup(&mut self, sret_operand: &Operand, total_sp_adjust: i64) {
         let slot_adjust = if self.state.has_dyn_alloca {
             0
@@ -3483,6 +3511,10 @@ impl ArchCodegen for ArmCodegen {
         };
         let needs_adjusted = total_sp_adjust > 0;
         self.emit_load_arg_to_reg(sret_operand, "x8", slot_adjust, 0, needs_adjusted);
+        // The callee stores its result through x8.
+        if let Some(reads) = self.call_gp_reads.as_mut() {
+            *reads |= 1 << 8;
+        }
     }
 
     // ---- Inline asm / intrinsics (kept inline - has extra logic) ----

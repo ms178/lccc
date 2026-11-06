@@ -55,12 +55,13 @@ DISPATCHER = REPO / "src/backend/arm/assembler/encoder/mod.rs"
 TSV = REPO / "tests/aarch64/dispatcher-goldens.tsv"
 
 # The pinned architectural law (scripts/aarch64_operand_legality_matrix.py
-# PROLOGUE) plus the AES/SHA3 feature extensions GAS's `.arch armv9.4-a`
-# mapping does not imply by itself (measured: `aese v0.16b, v1.16b` and
-# `eor3 ...` assemble only with the explicit flags).  Encoding words are
+# PROLOGUE) plus the AES/SHA3/SM4 feature extensions GAS's `.arch armv9.4-a`
+# mapping does not imply by itself (measured: `aese v0.16b, v1.16b`,
+# `eor3 ...` and `sm4e v0.4s, v1.4s` assemble only with the explicit flags).
+# Encoding words are
 # flag-independent -- the flags only widen what as accepts -- so one
 # prologue gives every candidate the same verdict surface lccc must meet.
-PROLOGUE = ".arch armv9.4-a+sme+aes+sha3\n.text\n"
+PROLOGUE = ".arch armv9.4-a+sme+aes+sha3+sm4\n.text\n"
 
 # Representative instructions for arms the random-word corpus cannot reach
 # (objdump prints aliases or never decodes the form).  Every template is
@@ -113,6 +114,7 @@ HAND_TEMPLATES: dict[str, list[str]] = {
     "fminnmv": ["fminnmv s0, v1.4s"],
     "fminv": ["fminv s0, v1.4s"],
     "fneg": ["fneg d0, d1", "fneg v0.4s, v1.4s"],
+    "frecpe": ["frecpe v0.2d, v1.2d", "frecpe d0, d1"],
     "frinta": ["frinta d0, d1"],
     "frinti": ["frinti s0, s1"],
     "frintm": ["frintm v0.4s, v1.4s"],
@@ -176,6 +178,73 @@ HAND_TEMPLATES: dict[str, list[str]] = {
     "xtn": ["xtn v0.4h, v0.4s"],
     "xtn2": ["xtn2 v0.8h, v0.4s"],
     "yield": ["yield"],
+    # Arms added with the FP16 / Advanced-SIMD scalar / FHM / FCMA / BF16 /
+    # DotProd / I8MM / RDM / crypto coverage (every text GAS-validated at
+    # generation time like the rest).
+    "bcax": ["bcax v0.16b, v1.16b, v2.16b, v3.16b"],
+    "bfcvt": ["bfcvt h0, s1"],
+    "bfcvtn": ["bfcvtn v0.4h, v1.4s"],
+    "bfcvtn2": ["bfcvtn2 v0.8h, v1.4s"],
+    "bfdot": ["bfdot v0.4s, v1.8h, v2.8h"],
+    "bfmlalb": ["bfmlalb v0.4s, v1.8h, v2.8h"],
+    "bfmlalt": ["bfmlalt v0.4s, v1.8h, v2.8h"],
+    "bfmmla": ["bfmmla v0.4s, v1.8h, v2.8h"],
+    "fcadd": ["fcadd v0.4s, v1.4s, v2.4s, #90"],
+    "fccmp": ["fccmp d0, d1, #4, ne"],
+    "fccmpe": ["fccmpe s0, s1, #15, lt"],
+    "fcmla": ["fcmla v0.4s, v1.4s, v2.4s, #90"],
+    "fcvtxn": ["fcvtxn s0, d1"],
+    "fcvtxn2": ["fcvtxn2 v0.4s, v1.2d"],
+    "fjcvtzs": ["fjcvtzs w0, d1"],
+    "fmlal": ["fmlal v0.4s, v1.4h, v2.4h"],
+    "fmlal2": ["fmlal2 v0.4s, v1.4h, v2.4h"],
+    "fmlsl": ["fmlsl v0.4s, v1.4h, v2.4h"],
+    "fmlsl2": ["fmlsl2 v0.4s, v1.4h, v2.4h"],
+    "fnmul": ["fnmul d0, d1, d2"],
+    "frecpx": ["frecpx d0, d1"],
+    "frint32x": ["frint32x v0.4s, v1.4s"],
+    "frint32z": ["frint32z d0, d1"],
+    "frint64x": ["frint64x s0, s1"],
+    "frint64z": ["frint64z v0.2d, v1.2d"],
+    "rax1": ["rax1 v0.2d, v1.2d, v2.2d"],
+    "sdot": ["sdot v0.4s, v1.16b, v2.16b"],
+    "sha1c": ["sha1c q0, s1, v2.4s"],
+    "sha1h": ["sha1h s0, s1"],
+    "sha1m": ["sha1m q0, s1, v2.4s"],
+    "sha1p": ["sha1p q0, s1, v2.4s"],
+    "sha1su0": ["sha1su0 v0.4s, v1.4s, v2.4s"],
+    "sha1su1": ["sha1su1 v0.4s, v1.4s"],
+    "sha256h": ["sha256h q0, q1, v2.4s"],
+    "sha256h2": ["sha256h2 q0, q1, v2.4s"],
+    "sha256su0": ["sha256su0 v0.4s, v1.4s"],
+    "sha256su1": ["sha256su1 v0.4s, v1.4s, v2.4s"],
+    "sha512h": ["sha512h q0, q1, v2.2d"],
+    "sha512h2": ["sha512h2 q0, q1, v2.2d"],
+    "sha512su0": ["sha512su0 v0.2d, v1.2d"],
+    "sha512su1": ["sha512su1 v0.2d, v1.2d, v2.2d"],
+    "sm3partw1": ["sm3partw1 v0.4s, v1.4s, v2.4s"],
+    "sm3partw2": ["sm3partw2 v0.4s, v1.4s, v2.4s"],
+    "sm3ss1": ["sm3ss1 v0.4s, v1.4s, v2.4s, v3.4s"],
+    "sm3tt1a": ["sm3tt1a v0.4s, v1.4s, v2.s[3]"],
+    "sm3tt1b": ["sm3tt1b v0.4s, v1.4s, v2.s[2]"],
+    "sm3tt2a": ["sm3tt2a v0.4s, v1.4s, v2.s[1]"],
+    "sm3tt2b": ["sm3tt2b v0.4s, v1.4s, v2.s[0]"],
+    "sm4e": ["sm4e v0.4s, v1.4s"],
+    "sm4ekey": ["sm4ekey v0.4s, v1.4s, v2.4s"],
+    "smmla": ["smmla v0.4s, v1.16b, v2.16b"],
+    "sqrdmlah": ["sqrdmlah v0.8h, v1.8h, v2.8h"],
+    "sqrdmlsh": ["sqrdmlsh v0.4s, v1.4s, v2.4s"],
+    "sqshlu": ["sqshlu v0.4s, v1.4s, #3"],
+    "sudot": ["sudot v0.4s, v1.16b, v2.4b[1]"],
+    "suqadd": ["suqadd v0.4s, v1.4s"],
+    "udot": ["udot v0.4s, v1.16b, v2.16b"],
+    "ummla": ["ummla v0.4s, v1.16b, v2.16b"],
+    "urecpe": ["urecpe v0.4s, v1.4s"],
+    "ursqrte": ["ursqrte v0.2s, v1.2s"],
+    "usdot": ["usdot v0.4s, v1.16b, v2.16b"],
+    "usmmla": ["usmmla v0.4s, v1.16b, v2.16b"],
+    "usqadd": ["usqadd v0.2d, v1.2d"],
+    "xar": ["xar v0.2d, v1.2d, v2.2d, #13"],
 }
 
 
