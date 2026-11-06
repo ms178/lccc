@@ -1,0 +1,58 @@
+# GDB negative proof: CLI text cannot panic on a closed stderr pipe
+#
+# Two harness dead ends were measured and rejected on the way here:
+#  (1) GDB stops on SIGPIPE by default, masking the EPIPE return entirely;
+#  (2) giving GDB's own stderr the closing pipe kills GDB with signal 13
+#      while it prints its transcript. The final harness keeps GDB's stderr
+#      on /dev/null and dup2()s an inherited pipe onto the inferior's fd 2
+#      at 'break main'. Both legs use the identical GDB command file.
+#
+GDB CLI-pipe panic proof
+  binary: target/fastbuild/lccc
+  gdb: GNU gdb (GDB) 18.1
+  breakpoint: __rustc::rust_panic (symbol confirmed by pinned nm)
+
+--- NEGATIVE shipped compiler
+  gdb_returncode=0
+  panic_breakpoint_hits=0 (want 0)
+  inferior_exit=01
+  reader_lines_before_close=2
+
+  VERDICT: PASS
+
+  gdb transcript tail:
+    Breakpoint 1 at 0x1ab7548: file library/std/src/panicking.rs, line 887.
+    Breakpoint 2 at 0x60a960
+    [Thread debugging using libthread_db enabled]
+    Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+    
+    Breakpoint 2, 0x0000555555b5e960 in main ()
+    $1 = 2
+    [New Thread 0x7ffff7dab6c0 (LWP 602301) (id 2)]
+    [Thread 0x7ffff7dab6c0 (LWP 602301) (id 2) exited]
+    [Inferior 1 (process 602298) exited with code 01]
+    GDB_PROBE_DONE
+
+--- POSITIVE eprintln! control
+  gdb_returncode=0
+  panic_breakpoint_hits=1 (want 1)
+  inferior_exit=not reported
+  reader_lines_before_close=2
+
+  VERDICT: PASS
+
+  gdb transcript tail:
+    
+    Breakpoint 2, 0x0000555555568830 in main ()
+    $1 = 2
+    
+    Breakpoint 1, std::panicking::rust_panic () at library/std/src/panicking.rs:887
+    #0  std::panicking::rust_panic () at library/std/src/panicking.rs:887
+    #1  0x000055555558be75 in std::panicking::panic_with_hook () at library/std/src/panicking.rs:840
+    #2  0x00005555555796c2 in std::panicking::panic_handler::{closure#0} () at library/std/src/panicking.rs:688
+    #3  0x0000555555572509 in std::sys::backtrace::__rust_end_short_backtrace<std::panicking::panic_handler::{closure_env#0}, !> () at library/std/src/sys/backtrace.rs:182
+    #4  0x0000555555579e3d in std::panicking::panic_handler () at library/std/src/panicking.rs:679
+    #5  0x00005555555a037c in core::panicking::panic_fmt () at library/core/src/panicking.rs:80
+    GDB_PROBE_DONE
+
+OVERALL: PASS
