@@ -199,6 +199,7 @@ class Elf:
     symbols: list[Symbol] = field(default_factory=list)
     order: str = "little"
     address_size: int = 8
+    machine: int = 62
 
     def u32(self, offset: int, data: bytes) -> int:
         return int.from_bytes(data[offset : offset + 4], self.order)
@@ -234,7 +235,8 @@ def read_elf(path: Path) -> Elf:
     if encoding not in (1, 2):
         raise ValueError(f"unknown ELF encoding {encoding}")
     order = "little" if encoding == 1 else "big"
-    elf = Elf(order=order, address_size=8 if elf_class == 2 else 4)
+    machine = int.from_bytes(blob[18:20], order)
+    elf = Elf(order=order, address_size=8 if elf_class == 2 else 4, machine=machine)
     if elf_class == 2:
         table = int.from_bytes(blob[0x28:0x30], order)
         entry_size = int.from_bytes(blob[0x3A:0x3C], order)
@@ -283,15 +285,20 @@ def read_elf(path: Path) -> Elf:
 #: an object file is one of these, and in an object the value on disk is zero
 #: until the linker applies it -- which is why a reader that ignores relocations
 #: sees every string offset as 0.
-_ABSOLUTE_RELOCATIONS = frozenset(
-    {
-        1,  # R_X86_64_64, R_386_32, R_ARM_ABS32, R_RISCV_32
-        10,  # R_X86_64_32
-        11,  # R_X86_64_32S
-        257,  # R_AARCH64_ABS64
-        258,  # R_AARCH64_ABS32
-    }
-)
+# Relocation numbers are machine-local: R_386_32 and R_X86_64_64 are both 1
+# but have different widths.  A class-only table silently patches eight bytes
+# for every i686 debug reference and corrupts the following DIE attribute.
+_ABSOLUTE_RELOCATION_WIDTHS = {
+    (3, 1): 4,    # R_386_32
+    (40, 1): 4,   # R_ARM_ABS32
+    (62, 1): 8,   # R_X86_64_64
+    (62, 10): 4,  # R_X86_64_32
+    (62, 11): 4,  # R_X86_64_32S
+    (183, 257): 8,  # R_AARCH64_ABS64
+    (183, 258): 4,  # R_AARCH64_ABS32
+    (243, 1): 4,  # R_RISCV_32
+    (243, 2): 8,  # R_RISCV_64
+}
 
 
 def _apply_relocations(elf: "Elf", elf_class: int, order: str) -> None:
@@ -324,9 +331,9 @@ def _apply_relocations(elf: "Elf", elf_class: int, order: str) -> None:
             addend = fields[2] if has_addend else None
             symbol_index = info >> 32 if elf_class == 2 else info >> 8
             kind = info & 0xFFFFFFFF if elf_class == 2 else info & 0xFF
-            if kind not in _ABSOLUTE_RELOCATIONS:
+            width = _ABSOLUTE_RELOCATION_WIDTHS.get((elf.machine, kind))
+            if width is None:
                 continue
-            width = {1: 8, 10: 4, 11: 4, 257: 8, 258: 4}[kind]
             if where + width > len(patched):
                 continue
             if addend is None:
@@ -3885,6 +3892,18 @@ def self_test() -> int:
     _apply_relocations(elf, 2, "little")
     resolved_value = int.from_bytes(elf.sections[".debug_str"][4:8], "little")
     expect(resolved_value == 8, f"self-test relocation produced {resolved_value}")
+
+    # ELF32 REL carries the addend in the field.  R_386_32 is number 1 just
+    # like R_X86_64_64, but patches four bytes, not eight.
+    rel = (4).to_bytes(4, "little") + (1).to_bytes(4, "little")  # sym 0, R_386_32
+    elf32 = Elf(sections={".debug_str": bytes(12), ".rel.debug_str": rel},
+                symbols=[Symbol(name="s", value=7, size=0, info=0, shndx=1)],
+                order="little", address_size=4, machine=3)
+    _apply_relocations(elf32, 1, "little")
+    expect(int.from_bytes(elf32.sections[".debug_str"][4:8], "little") == 7,
+           "self-test ELF32 REL relocation width/value")
+    expect(elf32.sections[".debug_str"][8:] == bytes(4),
+           "self-test ELF32 REL must not overwrite the next attribute")
 
     # The source scanner the attribution check rests on.
     def span_names(source: str) -> list[tuple[str, int, int]]:

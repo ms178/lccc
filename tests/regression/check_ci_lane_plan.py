@@ -274,7 +274,7 @@ GCC_ORACLE_INSTALL = "scripts/ci_install_gcc_oracle.sh"
 GCC_ORACLE_CACHE = "~/.cache/lccc/gcc-oracle"
 # What the verifier probes unless a lane says otherwise (ci_verify_oracles.sh).
 DEFAULT_REQUIRE = {"gcc", "multilib", "valgrind", "pyyaml"}
-KNOWN_PROBES = DEFAULT_REQUIRE | {"mold", "lld", "qemu"}
+KNOWN_PROBES = DEFAULT_REQUIRE | {"mold", "lld", "qemu", "gdb"}
 # Gate tool -> the probe that proves it.  `clang` is not here on purpose: it is
 # proven by the --clang-version assertion (R1/R4), which is an exact release.
 PROBE_FOR_TOOL = {"valgrind": "valgrind"}

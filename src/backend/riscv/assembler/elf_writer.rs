@@ -1874,6 +1874,11 @@ impl ElfWriter {
 
     /// Write the final ELF object file.
     pub fn write_elf(&mut self, output_path: &str) -> Result<(), String> {
+        let bytes = self.build_elf()?;
+        std::fs::write(output_path, bytes).map_err(|e| format!("failed to write ELF file: {}", e))
+    }
+
+    pub(crate) fn build_elf(&mut self) -> Result<Vec<u8>, String> {
         let config = elf::ElfConfig {
             e_machine: EM_RISCV,
             e_flags: self.elf_flags,
@@ -1892,7 +1897,7 @@ impl ElfWriter {
             abs_addr.elf_type(),
         )?;
         // RISC-V needs include_referenced_locals=true for pcrel_hi synthetic labels
-        self.base.write_elf(output_path, &config, true)
+        self.base.build_elf(&config, true)
     }
 }
 

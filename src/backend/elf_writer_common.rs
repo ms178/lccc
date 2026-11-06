@@ -1353,6 +1353,7 @@ pub struct ElfWriterCore<A: X86Arch> {
     /// The types and file-scope objects the compiler analysed, for `.debug_info`
     /// (see `elf::dwarf_spec`).  `None` for text that carries only `.loc` rows.
     debug_unit: Option<std::sync::Arc<elf_mod::DwarfUnitSpec>>,
+    debug_path_map: std::sync::Arc<crate::common::path_map::PathPrefixMap>,
     /// Source files and `.loc` rows for the generated DWARF line table.
     debug_files: Vec<(u32, String)>,
     debug_line_locations: Vec<elf_mod::DwarfLineLocation>,
@@ -1415,6 +1416,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             symver_flags: FxHashMap::default(),
             debug_config: elf_mod::DwarfConfig::assembler(elf_mod::DWARF_DEFAULT_VERSION),
             debug_unit: None,
+            debug_path_map: Default::default(),
             debug_files: Vec::new(),
             debug_line_locations: Vec::new(),
             section_stack: Vec::new(),
@@ -1442,6 +1444,13 @@ impl<A: X86Arch> ElfWriterCore<A> {
     /// so this object's `.debug_info` names them.
     pub fn set_debug_unit(&mut self, unit: std::sync::Arc<elf_mod::DwarfUnitSpec>) {
         self.debug_unit = Some(unit);
+    }
+
+    pub fn set_debug_path_map(
+        &mut self,
+        map: std::sync::Arc<crate::common::path_map::PathPrefixMap>,
+    ) {
+        self.debug_path_map = map;
     }
 
     /// Build the ELF object file from parsed assembly items.
@@ -4150,6 +4159,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // resolved by the final linker, after code layout is fixed.
         // The code sections the single line program describes, in sequence order.
         let mut debug_line_units: Vec<usize> = Vec::new();
+        let mapped_files: Vec<(u32, String)> = self
+            .debug_files
+            .iter()
+            .map(|(n, p)| (*n, self.debug_path_map.apply(p).into_owned()))
+            .collect();
         // Two string tables per object, as DWARF 5 splits them: paths in
         // `.debug_line_str`, names in `.debug_str` (see `elf::dwarf`).
         // An input may already have begun the debug sections: `gcc -S -g`
@@ -4189,10 +4203,14 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 .collect();
             let address_size = if A::elf_class() == ELFCLASS32 { 4 } else { 8 };
             let comp_dir = std::env::current_dir()
-                .map(|dir| dir.to_string_lossy().into_owned())
+                .map(|dir| {
+                    self.debug_path_map
+                        .apply(&dir.to_string_lossy())
+                        .into_owned()
+                })
                 .unwrap_or_default();
             let built = elf_mod::build_dwarf_line_section(
-                &self.debug_files,
+                &mapped_files,
                 &self.debug_line_locations,
                 &section_info,
                 address_size,
@@ -4412,14 +4430,17 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     })
                 })
                 .collect();
-            let primary_file = self
-                .debug_files
+            let primary_file = mapped_files
                 .iter()
                 .find(|(number, _)| *number == 1)
-                .or_else(|| self.debug_files.first())
+                .or_else(|| mapped_files.first())
                 .map_or("", |(_, name)| name.as_str());
             let comp_dir = std::env::current_dir()
-                .map(|dir| dir.to_string_lossy().into_owned())
+                .map(|dir| {
+                    self.debug_path_map
+                        .apply(&dir.to_string_lossy())
+                        .into_owned()
+                })
                 .unwrap_or_default();
             let address_size = if A::elf_class() == ELFCLASS32 { 4 } else { 8 };
             // An empty unit is the honest answer for text with no analysed
@@ -4441,7 +4462,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     }
                 }
             }
-            let unit_spec = unit.with_referenced(&referenced);
+            let mapped_unit = unit.map_paths(&self.debug_path_map);
+            let unit_spec = mapped_unit.with_referenced(&referenced);
             let unit_spec = &unit_spec;
             let defined_objects: crate::common::fx_hash::FxHashMap<String, ()> = self
                 .pending_types
@@ -4455,7 +4477,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             let built = elf_mod::build_dwarf_info_sections(
                 &debug_line_units,
                 Some(stmt_list),
-                &self.debug_files,
+                &mapped_files,
                 &self.debug_line_locations,
                 &section_info,
                 &functions,

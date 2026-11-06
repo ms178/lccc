@@ -409,6 +409,16 @@ impl DwarfUnitSpec {
         self.variables.is_empty() && self.types.is_empty()
     }
 
+    pub(crate) fn map_paths(&self, map: &crate::common::path_map::PathPrefixMap) -> Self {
+        let mut result = self.clone();
+        for variable in &mut result.variables {
+            if let Some(file) = &variable.decl_file {
+                variable.decl_file = Some(map.apply(file).into_owned());
+            }
+        }
+        result
+    }
+
     /// The parameter list of a defined function, when it has one.
     pub(crate) fn parameters_of(&self, name: &str) -> Option<&DwarfFunctionParameters> {
         self.parameters.get(name).filter(|list| !list.is_empty())
@@ -580,18 +590,24 @@ pub struct DwarfDebug {
     /// `None` for input that is only assembly: its `.loc` rows are all the debug
     /// information there is.
     pub unit: Option<Arc<DwarfUnitSpec>>,
+    pub path_map: Arc<crate::common::path_map::PathPrefixMap>,
 }
 
 impl DwarfDebug {
     /// A dialect with no analysed unit: what an assembler-only input gets.
     pub(crate) fn dialect(config: DwarfConfig) -> Self {
-        Self { config, unit: None }
+        Self {
+            config,
+            unit: None,
+            path_map: Arc::default(),
+        }
     }
 
     pub(crate) fn with_unit(config: DwarfConfig, unit: DwarfUnitSpec) -> Self {
         Self {
             config,
             unit: Some(Arc::new(unit)),
+            path_map: Arc::default(),
         }
     }
 }

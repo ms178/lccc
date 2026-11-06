@@ -1,4 +1,5 @@
 mod cli;
+mod debug_assembly;
 mod external_tools;
 mod file_types;
 mod option_table;

@@ -97,6 +97,7 @@ valgrind_tool=${LCCC_VALGRIND_TOOL:-valgrind}
 mold_tool=${LCCC_MOLD_TOOL:-mold}
 lld_tool=${LCCC_LLD_TOOL:-ld.lld}
 qemu_tool=${LCCC_QEMU_TOOL:-qemu-i386}
+gdb_tool=${LCCC_GDB_TOOL:-gdb}
 # Capability probes are on by default; the presence probes are opt-in and the
 # union is checked against what the lane's gates actually consume by
 # tests/regression/check_ci_lane_plan.py.
@@ -159,8 +160,8 @@ probes=()
 IFS=, read -r -a probes <<<"$required"
 for probe in "${probes[@]}"; do
     case $probe in
-        gcc|multilib|valgrind|pyyaml|mold|lld|qemu) ;;
-        *) printf 'ci_verify_oracles: --require: unknown probe %s (gcc,multilib,valgrind,pyyaml,mold,lld,qemu)\n' "$probe" >&2
+        gcc|multilib|valgrind|pyyaml|mold|lld|qemu|gdb) ;;
+        *) printf 'ci_verify_oracles: --require: unknown probe %s (gcc,multilib,valgrind,pyyaml,mold,lld,qemu,gdb)\n' "$probe" >&2
            exit 2 ;;
     esac
 done
@@ -479,8 +480,20 @@ MOCK
         rm -rf "$work"; return 1
     fi
 
-    notice 'Oracle self-test' '10/10 cases pass'
-    echo "  self-test: 10/10 cases pass"
+    # 11. GDB is opt-in for the DWARF delivery lane; a lane that asks for it
+    # must not silently fall back to structural-only validation.
+    status=0
+    PATH="$work/tools-min:/usr/bin:/bin" LCCC_GDB_TOOL=gdb-case11-absent CLANG=clang CASES_VERSION=16.2.0 \
+        bash "$0" --require gcc,gdb >"$work/out" 2>"$work/err" || status=$?
+    if (( status != 0 )) && grep -q 'gdb-case11-absent is not on PATH' "$work/err"; then
+        echo "  ok   --require gdb fails closed and names the tool"
+    else
+        case_fail "  FAIL --require gdb: exit $status, err=$(sed -n '1,5p' "$work/err")"
+        rm -rf "$work"; return 1
+    fi
+
+    notice 'Oracle self-test' '11/11 cases pass'
+    echo "  self-test: 11/11 cases pass"
     rm -rf "$work"
     return 0
 }
@@ -500,6 +513,7 @@ for probe in "${probes[@]}"; do
         mold) require_runner mold "$mold_tool" ;;
         lld) require_runner ld.lld "$lld_tool" ;;
         qemu) require_runner qemu-i386 "$qemu_tool" ;;
+        gdb) require_runner gdb "$gdb_tool" ;;
     esac
 done
 if [[ -n $clang_version_expected ]]; then require_clang "$clang_version_expected"; fi

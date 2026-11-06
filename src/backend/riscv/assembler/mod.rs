@@ -33,11 +33,25 @@ pub fn assemble_with_args(
     extra_args: &[String],
     debug: Option<crate::backend::elf::DwarfDebug>,
 ) -> Result<(), String> {
+    let bytes = assemble_bytes(asm_text, extra_args, debug)?;
+    std::fs::write(output_path, bytes).map_err(|e| format!("Failed to write object file: {}", e))
+}
+
+pub(crate) fn assemble_bytes(
+    asm_text: &str,
+    extra_args: &[String],
+    debug: Option<crate::backend::elf::DwarfDebug>,
+) -> Result<Vec<u8>, String> {
     let statements = parse_asm(asm_text)?;
     let mut writer = ElfWriter::new();
     if let Some(debug) = debug {
-        let crate::backend::elf::DwarfDebug { config, unit } = debug;
+        let crate::backend::elf::DwarfDebug {
+            config,
+            unit,
+            path_map,
+        } = debug;
         writer.base.set_debug_config(config);
+        writer.base.set_debug_path_map(path_map);
         if let Some(unit) = unit {
             writer.base.set_debug_unit(unit);
         }
@@ -85,8 +99,7 @@ pub fn assemble_with_args(
     }
 
     writer.process_statements(&statements)?;
-    writer.write_elf(output_path)?;
-    Ok(())
+    writer.build_elf()
 }
 
 /// Map an ABI name to ELF e_flags, with optional RVC flag.

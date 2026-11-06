@@ -3521,6 +3521,25 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                 // scripts/check_no_ub_exploitation.py in the same change,
                 // and start setting a real policy bit from this arm.
                 "-fno-delete-null-pointer-checks" => {}
+                arg if arg.starts_with("-fdebug-prefix-map=")
+                    || arg.starts_with("-fmacro-prefix-map=")
+                    || arg.starts_with("-ffile-prefix-map=") =>
+                {
+                    let value = arg.split_once('=').expect("prefix-map has =").1;
+                    let (prefix, replacement) = value
+                        .split_once('=')
+                        .ok_or_else(|| format!("invalid prefix map '{arg}': expected OLD=NEW"))?;
+                    let is_debug = !arg.starts_with("-fmacro-");
+                    let is_macro = !arg.starts_with("-fdebug-");
+                    if is_debug {
+                        self.debug_prefix_map
+                            .push(prefix.to_string(), replacement.to_string());
+                    }
+                    if is_macro {
+                        self.macro_prefix_map
+                            .push(prefix.to_string(), replacement.to_string());
+                    }
+                }
                 "-fno-plt" => self.no_plt = true,
                 "-fplt" => self.no_plt = false,
                 arg if self.apply_hardening_or_ipa_fflag(arg)? => {}

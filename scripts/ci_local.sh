@@ -988,6 +988,14 @@ gate "dwarf-quality" fast \
     python3 tests/regression/check_dwarf_quality.py \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" \
         --json target/dwarf-quality.json --markdown target/dwarf-quality.md
+# The delivery paths must preserve that tree: -S + GAS/lccc assembler, native
+# execution, GDB visibility, and reproducible debug/macro path maps.
+gate "dwarf-delivery" fast \
+    python3 tests/regression/check_dwarf_delivery.py \
+        --lccc "$LCCC" --lccc-i686 target/fastbuild/lccc-i686 \
+        --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv \
+        --gcc "${GCC16:-gcc-16}" --gdb "${GDB:-gdb}" \
+        --json target/dwarf-delivery.json
 # Digraph spelling is observable in macro stringification; this also exercises
 # directives, token boundaries, maximal munch and native/i686 execution.
 gate "c-digraphs" fast \

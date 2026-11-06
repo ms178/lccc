@@ -981,6 +981,32 @@ impl Target {
         }
     }
 
+    /// Assemble in memory so `-S -g` can reuse the object writer's finalized
+    /// DIE tree without a temporary file or a second debug-information model.
+    pub(crate) fn assemble_bytes(
+        &self,
+        asm_text: &str,
+        extra_args: &[String],
+        debug: Option<elf::DwarfDebug>,
+    ) -> Result<Vec<u8>, String> {
+        #[cfg(feature = "gcc_assembler")]
+        {
+            let temporary = crate::common::temp_files::TempFile::try_new("lccc-debug", "unit", "o")
+                .map_err(|error| error.to_string())?;
+            let path = temporary.to_str().map_err(|error| error.to_string())?;
+            self.assemble_with_extra(asm_text, path, extra_args, debug)?;
+            return std::fs::read(path)
+                .map_err(|error| format!("read assembled debug unit: {error}"));
+        }
+        #[cfg(not(feature = "gcc_assembler"))]
+        match self {
+            Target::Aarch64 => arm::assembler::assemble_bytes(asm_text, debug),
+            Target::X86_64 => x86::assembler::assemble_bytes(asm_text, debug),
+            Target::I686 => i686::assembler::assemble_bytes(asm_text, debug),
+            Target::Riscv64 => riscv::assembler::assemble_bytes(asm_text, extra_args, debug),
+        }
+    }
+
     /// Link object files into executable.
     pub(crate) fn link(&self, object_files: &[&str], output_path: &str) -> Result<(), String> {
         self.link_with_args(object_files, output_path, &[])

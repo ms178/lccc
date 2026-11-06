@@ -145,6 +145,8 @@ pub struct Driver {
     /// asked for a dialect, and the program is the only DWARF an assembler
     /// emits for such an input).
     pub(super) dwarf_version_explicit: bool,
+    pub(super) debug_prefix_map: crate::common::path_map::PathPrefixMap,
+    pub(super) macro_prefix_map: crate::common::path_map::PathPrefixMap,
     pub(super) defines: Vec<CliDefine>,
     pub(super) include_paths: Vec<String>,
     /// Quote-only include paths (from -iquote flags).
@@ -717,6 +719,8 @@ impl Driver {
             debug_info: false,
             dwarf_version: crate::backend::elf::DWARF_DEFAULT_VERSION,
             dwarf_version_explicit: false,
+            debug_prefix_map: Default::default(),
+            macro_prefix_map: Default::default(),
             defines: Vec::new(),
             include_paths: Vec::new(),
             quote_include_paths: Vec::new(),
@@ -1707,7 +1711,17 @@ impl Driver {
                 continue;
             }
             // Default path: compile with internal codegen (handles .code16gcc prepend)
-            let asm = self.compile_to_assembly(input_file)?.asm;
+            let compiled = self.compile_to_assembly(input_file)?;
+            let mut asm = compiled.asm;
+            if let Some(debug) = self.debug_request(compiled.debug_unit) {
+                asm = super::debug_assembly::append_debug_sections(
+                    self.target,
+                    &asm,
+                    debug,
+                    &self.build_asm_extra_args(),
+                )?;
+                asm = super::debug_assembly::map_file_directives(&asm, &self.debug_prefix_map);
+            }
             if self.output_path_set {
                 // `-o -` streams the assembly (write_text_output is the single
                 // place that knows the convention); a real path is written
@@ -1755,10 +1769,12 @@ impl Driver {
     ) -> Option<crate::backend::elf::DwarfDebug> {
         use crate::backend::elf::DwarfDebug;
         let config = self.dwarf_config(false)?;
-        Some(match unit {
+        let mut request = match unit {
             Some(unit) => DwarfDebug::with_unit(config, unit),
             None => DwarfDebug::dialect(config),
-        })
+        };
+        request.path_map = std::sync::Arc::new(self.debug_prefix_map.clone());
+        Some(request)
     }
 
     fn run_object_only(&self) -> Result<(), String> {
@@ -2022,6 +2038,7 @@ impl Driver {
         preprocessor: &mut Preprocessor,
     ) -> Result<(), String> {
         preprocessor.set_warning_config(self.effective_warning_config());
+        preprocessor.set_macro_prefix_map(self.macro_prefix_map.clone());
         // Set target architecture macros
         match self.target {
             Target::Aarch64 => preprocessor.set_target("aarch64"),
