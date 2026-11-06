@@ -4652,6 +4652,62 @@ mod cli_tests {
         d.parse_cli_args(&args).map(|_| ())
     }
 
+    /// `-gpubnames` is implemented, order-sensitive, and independent of `-g`.
+    ///
+    /// The contract is GCC 16.2's, measured one spelling per probe: the flag
+    /// selects content but does not enable debug info, `-gno-pubnames` turns it
+    /// back off, and the last spelling wins.  Strict mode must report both
+    /// spellings as *implemented* -- that is what lets a capability probe tell
+    /// a real feature from a tolerated no-op by exit status alone.
+    #[test]
+    fn gpubnames_is_implemented_and_order_sensitive() {
+        fn flags(args: &[&str]) -> (bool, bool) {
+            let argv: Vec<String> = std::iter::once("ccc".to_string())
+                .chain(args.iter().map(|s| (*s).to_string()))
+                .chain(std::iter::once("x.c".to_string()))
+                .collect();
+            let mut driver = Driver::new();
+            driver
+                .parse_cli_args(&argv)
+                .unwrap_or_else(|e| panic!("{args:?} must parse: {e}"));
+            (driver.debug_info, driver.debug_pubnames)
+        }
+        assert_eq!(flags(&["-g"]), (true, false));
+        assert_eq!(flags(&["-gpubnames"]), (false, true));
+        assert_eq!(flags(&["-g", "-gpubnames"]), (true, true));
+        assert_eq!(flags(&["-gpubnames", "-g"]), (true, true));
+        assert_eq!(flags(&["-g", "-gpubnames", "-gno-pubnames"]), (true, false));
+        assert_eq!(flags(&["-g", "-gno-pubnames", "-gpubnames"]), (true, true));
+        // The capability contract is the *strict parse*, not a call to the
+        // tolerated-option reporter: `unknown_option_tolerated` always errors
+        // under strict mode by design, so asking it about an implemented flag
+        // tests the reporter, not the flag.  A capability probe runs the
+        // compiler with LCCC_STRICT_OPTIONS=1 and reads the exit status, which
+        // is exactly what this reproduces without mutating process state.
+        for spelling in ["-gpubnames", "-gno-pubnames"] {
+            let argv = vec!["ccc".to_string(), spelling.to_string(), "x.c".to_string()];
+            let mut driver = Driver::new();
+            driver
+                .parse_cli_args_with_strict(&argv, true)
+                .unwrap_or_else(|e| {
+                    panic!("{spelling} must be implemented, strict mode said: {e}")
+                });
+        }
+        // And the negative control: a spelling that really is unimplemented
+        // must still be refused under the same policy, or the check above
+        // would pass for any flag whatsoever.
+        let argv = vec![
+            "ccc".to_string(),
+            "-ggnu-pubnames".to_string(),
+            "x.c".to_string(),
+        ];
+        let mut driver = Driver::new();
+        assert!(
+            driver.parse_cli_args_with_strict(&argv, true).is_err(),
+            "-ggnu-pubnames is not implemented and strict mode must say so"
+        );
+    }
+
     #[test]
     fn ipa_pta_and_live_range_shrinkage_are_real_last_wins_options() {
         for flag in [
@@ -8367,39 +8423,4 @@ mod x86_macro_gate_tests {
         assert!(err.contains("unrecognized argument in option"), "{err}");
         assert!(err.contains("128 256 512 none"), "{err}");
     }
-
-    /// `-gpubnames` is implemented, order-sensitive, and independent of `-g`.
-    ///
-    /// The contract is GCC 16.2's, measured one spelling per probe: the flag
-    /// selects content but does not enable debug info, `-gno-pubnames` turns it
-    /// back off, and the last spelling wins.  Strict mode must report both
-    /// spellings as *implemented* -- that is what lets a capability probe tell
-    /// a real feature from a tolerated no-op by exit status alone.
-    #[test]
-    fn gpubnames_is_implemented_and_order_sensitive() {
-        fn flags(args: &[&str]) -> (bool, bool) {
-            let argv: Vec<String> = std::iter::once("ccc".to_string())
-                .chain(args.iter().map(|s| (*s).to_string()))
-                .chain(std::iter::once("x.c".to_string()))
-                .collect();
-            let mut driver = Driver::new();
-            driver
-                .parse_cli_args(&argv)
-                .unwrap_or_else(|e| panic!("{args:?} must parse: {e}"));
-            (driver.debug_info, driver.debug_pubnames)
-        }
-        assert_eq!(flags(&["-g"]), (true, false));
-        assert_eq!(flags(&["-gpubnames"]), (false, true));
-        assert_eq!(flags(&["-g", "-gpubnames"]), (true, true));
-        assert_eq!(flags(&["-gpubnames", "-g"]), (true, true));
-        assert_eq!(flags(&["-g", "-gpubnames", "-gno-pubnames"]), (true, false));
-        assert_eq!(flags(&["-g", "-gno-pubnames", "-gpubnames"]), (true, true));
-        for spelling in ["-gpubnames", "-gno-pubnames"] {
-            assert!(
-                unknown_option_tolerated(spelling, true).is_ok(),
-                "{spelling}: strict mode must report it as implemented"
-            );
-        }
-    }
-
 }

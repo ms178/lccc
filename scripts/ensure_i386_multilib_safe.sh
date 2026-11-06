@@ -375,7 +375,10 @@ write_m32_wrappers() {
         # PATH -- and the whole point of this wrapper is that a gate can run it
         # from its own environment.  Measured failure before this fix:
         # `m32-cc: line 4: exec: gcc-16: not found`.
-        resolved=$(command -v "$real" 2>/dev/null || true)
+        # `type -P` searches PATH for an executable file only.  `command -v`
+        # can answer with a shell builtin, function or alias (e.g. `true`),
+        # which would be turned into a bogus "$PWD/true" driver path.
+        resolved=$(type -P "$real" 2>/dev/null || true)
         [[ -n $resolved ]] || die "compiler not found on PATH: $real"
         case $resolved in /*) ;; *) resolved=$(pwd)/$resolved ;; esac
         real=$resolved
@@ -774,4 +777,10 @@ main() {
     die "unable to verify -m32 multilib via either safe --no-upgrade apt or isolated sysroot ($DEFAULT_SYSROOT)"
 }
 
-main "$@"
+# Sourcing exposes the helpers to the contract tests without provisioning a
+# sysroot, consulting apt, or requiring an already-staged env.sh.  The nested
+# rootfs_jail.sh has the same guard; this outer script must not undo it by
+# unconditionally running main with the caller's positional parameters.
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi

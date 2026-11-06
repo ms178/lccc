@@ -1,6 +1,7 @@
 """Offline contract tests preventing the -m32 libc container-harness trap."""
 
 import importlib.util
+import os
 import subprocess
 import sys
 import tempfile
@@ -157,25 +158,62 @@ class I386MultilibSafetyTests(unittest.TestCase):
         absolute path at generation time.
         """
         script = SAFE_SCRIPT.read_text(encoding="utf-8")
-        self.assertIn('resolved=$(command -v "$real"', script)
+        self.assertIn('resolved=$(type -P "$real"', script)
         self.assertIn("compiler not found on PATH", script)
         with tempfile.TemporaryDirectory(dir="/var/tmp") as tmp:
-            sysroot = Path(tmp) / "sysroot"
+            root = Path(tmp)
+            sysroot = root / "sysroot"
             (sysroot / "lib32").mkdir(parents=True)
             (sysroot / "lib32" / "ld-linux.so.2").write_text("")
-            probe = (
-                f'source "{SAFE_SCRIPT}" --print-env >/dev/null 2>&1; '
-                f'write_m32_wrappers "{sysroot}" true true; '
-                f'sed -n "4p" "{sysroot}/bin/m32-cc"'
+            bindir = root / "toolchain" / "bin"
+            bindir.mkdir(parents=True)
+            driver = bindir / "lccc-wrapper-probe-cc"
+            marker = root / "driver-ran"
+            driver.write_text(
+                "#!/bin/sh\n"
+                'if [ "${1:-}" = -print-multiarch ]; then echo x86_64-linux-gnu; exit 0; fi\n'
+                f'printf "%s\\n" "$@" > "{marker}"\n'
             )
-            proc = subprocess.run(["bash", "-c", probe], cwd=ROOT, text=True,
-                                  capture_output=True, timeout=20)
-            self.assertEqual(proc.returncode, 0, proc.stderr)
+            driver.chmod(0o755)
             # A *bare* driver name is the regression: passing an already
             # absolute path would pass even if resolution were removed.
-            self.assertTrue(proc.stdout.startswith("exec /"),
-                            f"wrapper does not exec an absolute path: {proc.stdout}")
-            self.assertNotIn("exec true ", proc.stdout)
+            probe = (
+                f'source "{SAFE_SCRIPT}" --print-env >/dev/null 2>&1; '
+                # A shell function must not masquerade as the driver file.
+                'lccc-wrapper-probe-cc() { :; }; '
+                f'write_m32_wrappers "{sysroot}" lccc-wrapper-probe-cc lccc-wrapper-probe-cc; '
+                f'sed -n "4p" "{sysroot}/bin/m32-cc"'
+            )
+            env = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}")
+            proc = subprocess.run(["bash", "-c", probe], cwd=ROOT, text=True,
+                                  capture_output=True, timeout=20, env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertTrue(proc.stdout.startswith(f"exec {driver} "),
+                            f"wrapper does not exec the resolved driver: {proc.stdout}")
+            # Execute the wrapper with the generating toolchain removed from
+            # PATH.  Inspecting the text alone would not catch a broken exec.
+            clean = {"PATH": "/usr/bin:/bin"}
+            run = subprocess.run([str(sysroot / "bin" / "m32-cc"), "a file.c"],
+                                 cwd=root, text=True, capture_output=True,
+                                 timeout=20, env=clean)
+            self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+            argv = marker.read_text().splitlines()
+            self.assertIn("-m32", argv)
+            self.assertEqual(argv[-1], "a file.c")
+
+    def test_sourcing_exposes_helpers_without_running_the_cli(self):
+        """A helper import must not provision, consult apt, or need env.sh."""
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as tmp:
+            absent = Path(tmp) / "absent" / "sysroot"
+            env = dict(os.environ, LCCC_I686_SYSROOT=str(absent))
+            proc = subprocess.run(
+                ["bash", "-c", f'source "{SAFE_SCRIPT}" --print-env; '
+                               'type assert_replaceable_sysroot >/dev/null; '
+                               'type write_m32_wrappers >/dev/null'],
+                cwd=ROOT, text=True, capture_output=True, timeout=20, env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertEqual(proc.stdout, "")
+            self.assertFalse(absent.exists())
 
     def test_restore_agent_toolchain_cache_refuses_live_root_prefixes(self):
         mod = _load_restore_module()

@@ -2145,10 +2145,18 @@ pub(crate) fn build_dwarf_info_sections(
     let contribution = u64::try_from(info.len() - start)
         .map_err(|_| "DWARF unit length exceeds 64 bits".to_string())?;
     let pubnames = build_pubnames_table(
-        ".debug_pubnames", &dies.pubnames, start as u64, contribution, abs32,
+        ".debug_pubnames",
+        &dies.pubnames,
+        start as u64,
+        contribution,
+        abs32,
     )?;
     let pubtypes = build_pubnames_table(
-        ".debug_pubtypes", &dies.pubtypes, start as u64, contribution, abs32,
+        ".debug_pubtypes",
+        &dies.pubtypes,
+        start as u64,
+        contribution,
+        abs32,
     )?;
     Ok(Some(DwarfInfoBuild {
         info: debug_section(".debug_info", info, relocs),

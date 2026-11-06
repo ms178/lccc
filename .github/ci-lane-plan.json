@@ -3,7 +3,7 @@
     "backend-contracts-a": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 529.22,
+      "predicted_gate_seconds": 535.16,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard a of 2)",
       "steps": [
@@ -254,6 +254,14 @@
         {
           "measured_s": 0.42,
           "name": "python3 scripts/check_ci_workflow_shell.py"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 scripts/check_rootfs_write_policy.py --self-test"
+        },
+        {
+          "measured_s": 5.69,
+          "name": "python3 scripts/check_rootfs_write_policy.py"
         },
         {
           "measured_s": 0.25,
@@ -1834,8 +1842,8 @@
   "provenance": {
     "backend-contracts": {
       "costs": "/tmp/gates.tsv",
-      "measured_seconds_total": 1058.58,
-      "source": "measured by scripts/ci_gate_costs.py"
+      "measured_seconds_total": 1064.77,
+      "source": "measured by scripts/ci_gate_costs.py; rootfs-write-policy gates measured locally (max of 3 runs)"
     },
     "codegen": {
       "costs": "/home/user/.cache/tmp/codegen.tsv",

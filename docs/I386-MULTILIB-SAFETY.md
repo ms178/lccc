@@ -56,7 +56,7 @@ while caller-owned trees (`/var/tmp`, `$HOME`, `$RUNNER_TEMP`) stay writable.
 `sudo` cannot escape because there is no unmapped uid to escalate to.
 
 ```bash
-bash scripts/rootfs_jail.sh --self-test     # 6 proofs, exit 0
+bash scripts/rootfs_jail.sh --self-test     # 9 proofs, exit 0
 bash scripts/rootfs_jail.sh --available     # exit 0 = usable, 3 = unavailable
 bash scripts/rootfs_jail.sh -- exec dpkg-deb -x "$deb" "$sysroot"
 ```
@@ -151,8 +151,11 @@ silently stopped matching would be worse than no scanner):
 
 * `scripts/ci_local.sh`: gates `rootfs-write-policy-self-test`, `rootfs-write-policy`
 * `.github/workflows/ci.yml`: same two commands in the static-gate step
+* `.github/ci-lane-plan.json`: both invocations are registered in the
+  backend-contracts-a shard with measured cost, so the lane-plan audit cannot
+  mistake them for unreviewed hand additions
 
-**Measured state:** 1316 tracked source files scanned, 32 detector vectors
+**Measured state:** 1320 tracked source files scanned, 32 detector vectors
 (19 positive / 10 negative) plus 3 exemption-mechanism vectors, 4 inventoried
 exemptions (all disposable CI containers), 0 violations.
 
@@ -190,12 +193,14 @@ a licence to try the extraction.
 
 | Test | What it proves |
 | --- | --- |
-| `tests/corpus/test_rootfs_jail.py::test_jail_self_test_passes` | The jail's six properties hold on this host (or it correctly reports itself unavailable). |
+| `tests/corpus/test_rootfs_jail.py::test_jail_self_test_passes` | The jail's nine properties hold on this host (or it correctly reports itself unavailable). |
 | `…::test_jail_blocks_a_live_root_write_and_host_is_unchanged` | A real `.deb` extraction aimed at `/` fails, no canary reaches the live root, the identity (symlink target / inode / mode) of `lib`, `lib64`, `lib32`, `libx32`, `bin`, `sbin`, `usr` is unchanged, and `execve` still works. The payload contains only a **benign canary**, never `lib32/`, so a jail regression yields a red test instead of a dead sandbox. |
 | `…::test_jail_fails_closed_without_unshare` | With `unshare` removed from `PATH`, exit is 3 and the payload marker is **never created**. |
 | `…::test_jail_keeps_caller_owned_trees_writable` | The jail does not break legitimate staging writes. |
 | `…::test_gate_rejects_the_exact_historical_catastrophe` | The literal command from the incident is classified `live-root-extraction`. |
 | `…::test_repository_has_no_unguarded_live_root_writes` | Repo-wide scan is clean. |
+| `tests/corpus/test_i386_multilib_safety.py::test_sourcing_exposes_helpers_without_running_the_cli` | Sourcing the provisioner defines helpers without running `main`, consulting apt, or requiring a staged `env.sh`; removing the source/execute guard fails the test. |
+| `…::test_generated_wrappers_embed_an_absolute_driver_path` | A bare driver name is resolved through `type -P` to an executable file (not a shell function/builtin), embedded absolutely, and the wrapper still runs with the generating toolchain removed from `PATH`. |
 | `…::RecoveryScriptTests` | The post-wipe recovery script has no unaudited multilib transaction and uses the 4 GiB helper. |
 | `tests/corpus/test_i386_multilib_safety.py` | Sysroot path validation, apt-simulation audit, restore-script constraints, and the provisioner's own 9-proof self-test. |
 | `tests/corpus/test_valgrind_provisioning.py::test_bootstrap_installs_i386_kernel_headers_only_on_disposable_runners` | The runner/sandbox split is real, annotated, and the sandbox branch *must* call the audited provisioner. |
