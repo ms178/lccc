@@ -719,20 +719,30 @@ pub fn leaves_through_nonlocal_goto(func: &IrFunction) -> bool {
 /// Duplicated home ids and duplicated `dest`s are handled by construction, so
 /// the index stays exact even for IR that violates SSA dest uniqueness.
 ///
-/// Two build paths: `aligned_homes` handles the layout lowering emits with
-/// ONE `Vec` allocation and no hash table, and `general_homes` handles every
-/// other layout with that same `Vec` plus one hash table and one entry-block
-/// pass.  (The fast path is "hash-table-free", not heap-free: the index must
-/// own its `homes` array.)  Both are proven exact in their documentation and
-/// by the exhaustive/randomized equivalence tests below.
+/// Two build paths: `aligned_probe` handles the layout lowering emits with
+/// ONE `Vec` allocation and no hash table, and `general_homes_from` handles
+/// every other layout with that same `Vec` plus one hash table and ONE
+/// entry-block pass that RESUMES at the probe's mismatch instead of restarting.
+/// (The fast path is "hash-table-free", not heap-free: the index must own its
+/// `homes` array.)  Both are proven exact in their documentation and by the
+/// exhaustive/randomized equivalence tests below.
 ///
-/// When the aligned probe fails at instruction `k`, the general pass re-walks
-/// that prefix.  This is bounded by `params` extra instruction examinations
-/// (at 4096 params: <= 4096 examinations, i.e. microseconds against a
-/// multi-second compile) and buys a much simpler, exhaustively provable
-/// implementation than a fused single-pass design that would have to
-/// retroactively seed the general state.  The complexity witness below pins
-/// that bound so the redundancy can never grow into a second full scan.
+/// When the aligned probe fails at instruction `k`, the `k` homes it already
+/// resolved are EXACT and are KEPT: the general pass resumes at `k` rather than
+/// re-walking the prefix.  For strictly increasing `wants`, instruction `j <
+/// k` has `dest == wants[j] < wants[k] <= wants[i]` for every unresolved
+/// ordinal `i >= k`, so it can never be the first match for any of them and
+/// skipping it is sound.  Total work is therefore
+/// `instructions_examined <= entry_instructions + 1` (the single `+1` is the
+/// boundary instruction `k`, seen once by the probe and once by the resumed
+/// walk), NOT the old `params + entry_instructions`.  The witness below pins
+/// this bound so the redundancy can never grow back into a second full scan.
+///
+/// A single fused pass that hands the boundary `Alloca` to the general
+/// resolver would remove that last `+1`, but costs a second resolution
+/// entry point and a closure over five mutable borrows to save ONE instruction
+/// examination out of thousands.  That is complexity churn, not an
+/// optimization; it is deliberately not done.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParamAllocaIndex {
     homes: Vec<Option<(Value, IrType)>>,
@@ -741,13 +751,13 @@ pub struct ParamAllocaIndex {
 /// Portable complexity witness for [`ParamAllocaIndex::build_with_stats`].
 ///
 /// Wall-clock ratios are not portable across CI machines, so this counts the
-/// two resources the algorithm must bound: instruction *examinations* and
-/// *heap allocations*.  A failed aligned probe examines a prefix that the
-/// general pass then re-examines, so the former is an examination count, not
-/// a count of distinct instructions.  The contracts are
-/// `instructions_examined <= params + entry_instructions` (LINEAR) and
-/// `allocations <= 3` (O(1) in `params`), both pinned by unit tests on
-/// adversarial shifted layouts.  Each counter is one `usize` increment and
+/// THREE resources the algorithm must bound: entry-block instruction
+/// *examinations*, *heap allocations*, and duplicate-home *chain links*.  The
+/// contracts are `instructions_examined <= entry_instructions + 1` (the
+/// resumed pass sees the boundary instruction twice and nothing else),
+/// `allocations <= 3` (O(1) in `params`), and `chain_steps <= params` (each
+/// disjoint chain is walked at most once).  All three are pinned by unit
+/// tests on adversarial layouts.  Each counter is one `usize` increment and
 /// `build` instantiates them as ZST no-ops, so optimized builds fold the
 /// accounting away completely.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -760,6 +770,12 @@ pub struct ParamHomeStats {
     /// up to `params` extra allocations; the flat chain makes the cost
     /// independent of `params` and the unit tests pin the exact count.
     pub allocations: usize,
+    /// Links traversed while walking a duplicate-home ordinal chain.  This is
+    /// a THIRD, independent resource: counting only entry-block instructions
+    /// is blind to one chain being re-walked once per duplicate `Alloca`.
+    /// Each chain must be walked at most once, so the contract is
+    /// `chain_steps <= params`.  The adversarial regression tests pin it.
+    pub chain_steps: usize,
 }
 
 /// Monomorphized instrumentation hook.  `build` instantiates it as the ZST
@@ -770,6 +786,7 @@ pub struct ParamHomeStats {
 pub trait ParamHomeCounter {
     fn note_instruction(&mut self);
     fn note_allocation(&mut self);
+    fn note_chain_step(&mut self);
 }
 
 /// The production counter: a zero-sized no-op.
@@ -781,6 +798,8 @@ impl ParamHomeCounter for NoStats {
     fn note_instruction(&mut self) {}
     #[inline(always)]
     fn note_allocation(&mut self) {}
+    #[inline(always)]
+    fn note_chain_step(&mut self) {}
 }
 
 impl ParamHomeCounter for ParamHomeStats {
@@ -791,6 +810,10 @@ impl ParamHomeCounter for ParamHomeStats {
     #[inline(always)]
     fn note_allocation(&mut self) {
         self.allocations += 1;
+    }
+    #[inline(always)]
+    fn note_chain_step(&mut self) {
+        self.chain_steps += 1;
     }
 }
 
@@ -840,87 +863,96 @@ fn build_homes<C: ParamHomeCounter>(
     func: &IrFunction,
     counter: &mut C,
 ) -> Vec<Option<(Value, IrType)>> {
-    // One buffer is shared by BOTH paths.  Previously the aligned probe
-    // allocated its own `Vec`, and a failed probe dropped it immediately:
-    // every shifted-layout function paid for a dead allocation that the
-    // allocation witness exposed.  Allocating here instead means the general
-    // path reuses the same capacity (`clear` + `resize`, no reallocation).
-    // This costs nothing on the hot aligned path and removes one heap object
-    // from every shifted compilation, with no extra instruction pass.
-    let n = func.param_alloca_values.len();
+    let wants = &func.param_alloca_values;
+    let n = wants.len();
+    // ONE buffer for every path.  `with_capacity(n)` is the only allocation;
+    // `resize` cannot reallocate, and the aligned probe fills entries BY INDEX
+    // instead of pushing, so a late failure leaves the resolved prefix intact
+    // for the resumed general walk instead of discarding its work.
     let mut homes: Vec<Option<(Value, IrType)>> = Vec::with_capacity(n);
-    if n > 0 {
-        counter.note_allocation();
-    }
-    if aligned_homes(func, counter, &mut homes) {
+    if n == 0 {
         return homes;
     }
-    general_homes(func, counter, homes)
+    counter.note_allocation();
+    homes.resize(n, None);
+
+    // Decide from `wants` ALONE whether the positional exactness proof can
+    // apply.  Duplicate home ids break the `wants[j] < wants[i]` step, so such
+    // layouts go straight to the general path with ZERO wasted instruction
+    // examinations.  This pass touches only the contiguous `wants` array (one
+    // u32 comparison per element) and buys a hash-table-free fast path.
+    let strict = wants.windows(2).all(|w| w[0].0 < w[1].0);
+    let resume = if strict {
+        match aligned_probe(func, counter, &mut homes) {
+            None => return homes, // all n matched: exact, one allocation
+            Some(k) => k,         // homes[0..k] are exact; continue at k
+        }
+    } else {
+        0
+    };
+    debug_assert!(resume < n, "an aligned resume must leave work to do");
+    general_homes_from(func, counter, homes, resume)
 }
 
-/// The single-pass positional path, valid ONLY for the aligned layout.
+/// The positional probe, valid ONLY when `wants` is strictly increasing (the
+/// caller established that from `wants` alone).
 ///
-/// Fills the caller's buffer (already reserved for `n` entries) and returns
-/// `true` when the first `n` entry-block instructions are `Alloca`s whose
-/// destinations equal `param_alloca_values[0..n]` in order, and those home
-/// ids are strictly increasing.  On failure the buffer is left empty, with
-/// its capacity intact, for `general_homes` to reuse.  No allocation and no
-/// second pass is needed on either outcome.
+/// Fills `homes[0..n]` while the first `n` entry-block instructions are
+/// `Alloca`s whose destinations equal `wants[0..n]` in order.  Returns `None`
+/// when all `n` matched (the table is exact and complete) or `Some(k)` at the
+/// first mismatch, with `homes[0..k]` ALREADY EXACT.  Unlike the old probe it
+/// does not clear its work on failure: the general pass resumes at `k`.
 ///
 /// ## Exactness proof (against the `reference_full_scan` test oracle)
 ///
 /// The reference answer for ordinal `i` is the FIRST `Alloca` in the entry
-/// block whose `dest == want[i]`.  This path answers with instruction `i`,
-/// which is an `Alloca` with `dest == want[i]`.  It can disagree only if some
-/// instruction `j < i` is also an `Alloca` with `dest == want[i]`.  For every
-/// `j < n`, instruction `j` is an `Alloca` with `dest == want[j]` by the
-/// checked condition; strict increase gives `want[j] < want[i]`, hence
-/// `dest != want[i]`.  So no earlier match exists, and instruction `i` is
-/// the authoritative first match.  Instructions at indices `>= n` cannot
-/// precede it.  The `IrType` returned is likewise the authoritative one.
+/// block whose `dest == want[i]`.  For any `i < k`, this probe answered with
+/// instruction `i`, an `Alloca` with `dest == want[i]`.  It can disagree only
+/// if some instruction `j < i` is also an `Alloca` with `dest == want[i]`.
+/// Every `j < i < k` was checked to be an `Alloca` with `dest == want[j]`;
+/// strict increase gives `want[j] < want[i]`, hence `dest != want[i]`.  So no
+/// earlier match exists and `homes[i]` is authoritative.
 ///
-/// Strict increase is required because duplicate home ids would break the
-/// `want[j] < want[i]` step; such IR (malformed, or two parameters sharing a
-/// home) is routed to `general_homes`, which handles duplicates by
-/// construction.  Requiring *strictly increasing* rather than merely
-/// distinct costs nothing (lowering assigns ascending SSA ids) and avoids a
-/// hash set, which would defeat the point of this path.
-fn aligned_homes<C: ParamHomeCounter>(
+/// ## Exactness of the RESUME (the new part)
+///
+/// For an unresolved ordinal `i >= k`, the first matching instruction cannot
+/// be at index `j < k`: every such `j` has `dest == want[j]` and strict
+/// increase gives `want[j] < want[k] <= want[i]`, so `dest != want[i]`.  Any
+/// later `Alloca` repeating one of those earlier dests is likewise absent
+/// from the general map, which is built only over `wants[k..n]`.  Therefore
+/// examining `instructions[k..]` is sufficient, and the `k` already-filled
+/// homes need not be reconsidered.  Instructions at index `>= n` are examined
+/// by the resumed walk, exactly as the reference scan would.
+///
+/// Requiring *strictly increasing* rather than merely distinct costs nothing
+/// (lowering assigns ascending SSA ids) and avoids a hash set, which would
+/// defeat the point of this path.
+fn aligned_probe<C: ParamHomeCounter>(
     func: &IrFunction,
     counter: &mut C,
-    homes: &mut Vec<Option<(Value, IrType)>>,
-) -> bool {
-    homes.clear();
+    homes: &mut [Option<(Value, IrType)>],
+) -> Option<usize> {
     let wants = &func.param_alloca_values;
     let n = wants.len();
-    if n == 0 {
-        return true;
-    }
-    if wants.windows(2).any(|w| w[0].0 >= w[1].0) {
-        return false;
-    }
     let Some(block) = func.blocks.first() else {
-        return false;
+        return Some(0);
     };
     if block.instructions.len() < n {
-        return false;
+        return Some(0);
     }
-    for (i, want) in wants.iter().enumerate() {
+    for i in 0..n {
         counter.note_instruction();
         let Instruction::Alloca { dest, ty, .. } = &block.instructions[i] else {
-            homes.clear();
-            return false;
+            return Some(i);
         };
-        if *dest != *want {
-            homes.clear();
-            return false;
+        if *dest != wants[i] {
+            return Some(i);
         }
-        // `homes` was created with capacity >= n, so this push cannot
-        // reallocate.  A failed probe leaves an empty buffer of exactly the
-        // right capacity for `general_homes` to reuse.
-        homes.push(Some((*dest, *ty)));
+        // `homes` was sized to `n` by the caller, so this is a bounds-checked
+        // index with no reallocation.  A late failure leaves the prefix.
+        homes[i] = Some((*dest, *ty));
     }
-    true
+    None
 }
 
 /// The general one-pass path, for any entry-block layout.
@@ -937,31 +969,47 @@ fn aligned_homes<C: ParamHomeCounter>(
 /// Order within a chain is reverse insertion order, which is immaterial: all
 /// ordinals sharing a home id are filled from the SAME FIRST matching
 /// `Alloca`, so every permutation yields the identical reference answer.
-/// No ordinal is filled twice, so `unresolved` decrements at most `params`
+/// `start` is the first UNRESOLVED ordinal / instruction index: 0 for a
+/// non-strict layout, or the mismatch index `k` of a failed aligned probe.
+/// Only `wants[start..n]` is put in the map, so a late `Alloca` repeating an
+/// already-resolved home id is ignored for free (it is not the first match).
+///
+/// A chain is filled ATOMICALLY: every ordinal in it gets `Some` in the same
+/// visit (the only early exit is `break 'walk`, which ends the whole build).
+/// Therefore `homes[first]` is an exact O(1) "this chain is already resolved"
+/// flag.  Without it, every later duplicate `Alloca` re-walks the whole chain
+/// -- with a second chain left unresolved the early exit never fires, so R
+/// duplicates cost O(R x params).  That defect is invisible to
+/// `instructions_examined` (which counts instructions, not links); the
+/// `chain_steps` witness pins it.
+///
+/// No ordinal is filled twice, so `unresolved` decrements at most `n - start`
 /// times; `saturating_sub` additionally makes underflow impossible by
-/// construction.
-fn general_homes<C: ParamHomeCounter>(
+/// construction.  All `homes[o]` / `next[o]` accesses are bounds-checked;
+/// every `o` originates from `head`, which only ever holds ordinals in
+/// `start..n`; `usize::MAX` is the sole chain terminator.  There is no
+/// `unsafe`, no raw pointer, no lock, no thread-local state and no arithmetic
+/// that can overflow.
+fn general_homes_from<C: ParamHomeCounter>(
     func: &IrFunction,
     counter: &mut C,
     mut homes: Vec<Option<(Value, IrType)>>,
+    start: usize,
 ) -> Vec<Option<(Value, IrType)>> {
     let wants = &func.param_alloca_values;
     let n = wants.len();
-    if n == 0 {
-        return homes;
-    }
-    // Reuse the aligned probe's buffer: capacity >= n, so `resize` cannot
-    // allocate.  Only the map and the flat adjacency vector are new heap
-    // objects, giving exactly three allocations independent of `params`.
-    homes.clear();
-    homes.resize(n, None);
+    debug_assert!(start < n, "the general pass must have work to do");
+    debug_assert_eq!(homes.len(), n, "the shared buffer must be sized to n");
+    // Reuse the caller's buffer (already sized to n, no allocation).  Only
+    // the map and the flat adjacency vector are new heap objects, giving
+    // exactly three allocations independent of `params`.
     counter.note_allocation();
     let mut head: FxHashMap<Value, usize> =
-        FxHashMap::with_capacity_and_hasher(n, Default::default());
+        FxHashMap::with_capacity_and_hasher(n - start, Default::default());
     counter.note_allocation();
     let mut next: Vec<usize> = vec![usize::MAX; n];
-    for (i, value) in wants.iter().enumerate() {
-        match head.entry(*value) {
+    for i in start..n {
+        match head.entry(wants[i]) {
             std::collections::hash_map::Entry::Occupied(mut slot) => {
                 next[i] = *slot.get();
                 *slot.get_mut() = i;
@@ -971,9 +1019,11 @@ fn general_homes<C: ParamHomeCounter>(
             }
         }
     }
-    let mut unresolved = n;
+    let mut unresolved = n - start;
     if let Some(block) = func.blocks.first() {
-        'walk: for inst in &block.instructions {
+        // `start <= block.instructions.len()` holds: the probe only returns
+        // k < n after establishing `len >= n`; otherwise `start == 0`.
+        'walk: for inst in &block.instructions[start..] {
             counter.note_instruction();
             let Instruction::Alloca { dest, ty, .. } = inst else {
                 continue;
@@ -981,8 +1031,18 @@ fn general_homes<C: ParamHomeCounter>(
             let Some(&first) = head.get(dest) else {
                 continue;
             };
+            if homes[first].is_some() {
+                continue;
+            }
             let mut o = first;
             loop {
+                counter.note_chain_step();
+                // After the resolved-chain guard this is always true.  It is
+                // kept as the cheapest RUNTIME verification of the non-local
+                // chain-disjointness invariant: `fastbuild` inherits
+                // `release`, so a `debug_assert!` would never run in this
+                // project's test suite either.  Cost is <= n predictable
+                // branches per function -- noise next to a full compile.
                 if homes[o].is_none() {
                     homes[o] = Some((*dest, *ty));
                     debug_assert!(unresolved > 0);
@@ -1524,11 +1584,16 @@ mod param_alloca_index_tests {
         }
     }
 
-    /// The aligned hypothesis, evaluated with the same shared-buffer API the
-    /// production `build_homes` uses (capacity reserved for `n` entries).
+    /// Whether the production build would take the hash-table-free aligned
+    /// path.  `build_homes` decides that from `wants` alone plus a successful
+    /// positional probe, so this helper mirrors BOTH predicates.
     fn aligned_hypothesis(f: &IrFunction) -> bool {
-        let mut buf: Vec<Option<(Value, IrType)>> = Vec::with_capacity(f.param_alloca_values.len());
-        super::aligned_homes(f, &mut super::NoStats, &mut buf)
+        let n = f.param_alloca_values.len();
+        if !f.param_alloca_values.windows(2).all(|w| w[0].0 < w[1].0) {
+            return false;
+        }
+        let mut buf: Vec<Option<(Value, IrType)>> = vec![None; n];
+        super::aligned_probe(f, &mut super::NoStats, &mut buf).is_none()
     }
 
     fn function(instructions: Vec<Instruction>, homes: Vec<u32>) -> IrFunction {
@@ -1849,12 +1914,13 @@ mod param_alloca_index_tests {
         assert_eq!(index.get(N), None);
     }
 
-    /// The complexity contract: building the index examines each entry-block
-    /// instruction at most once per build path, so the total is bounded by
-    /// `params + entry_instructions` -- NEVER `params * entry_instructions`.
-    /// This is the machine-independent proof that the old O(N^2) fallback
-    /// cannot come back, and it is asserted on the ADVERSARIAL shifted layout
-    /// (all homes at the very end, none aligned) rather than the easy case.
+    /// The complexity contract: the probe's resolved prefix is KEPT and the
+    /// general pass RESUMES at the mismatch, so the total is bounded by
+    /// `entry_instructions + 1` -- never `params + entry_instructions`, and
+    /// certainly never `params * entry_instructions`.  This is the
+    /// machine-independent proof that neither the old O(N^2) fallback nor the
+    /// old full-prefix re-walk can come back.  Asserted on the ADVERSARIAL
+    /// shifted layout (all homes at the very end, none aligned).
     #[test]
     fn build_is_linear_in_instructions_even_for_adversarial_layouts() {
         const N: usize = 4096;
@@ -1872,11 +1938,19 @@ mod param_alloca_index_tests {
 
         let (index, stats) = ParamAllocaIndex::build_with_stats(&f);
         assert!(
-            stats.instructions_examined <= N + entry_instructions,
-            "examined {} instructions for {} params + {} entry instructions",
+            stats.instructions_examined <= entry_instructions + 1,
+            "examined {} instructions for {} entry instructions (bound {})",
             stats.instructions_examined,
-            N,
-            entry_instructions
+            entry_instructions,
+            entry_instructions + 1
+        );
+        // The chain witness must be linear in params independently of the
+        // instruction witness: distinct homes form n chains of length 1.
+        assert!(
+            stats.chain_steps <= N,
+            "{} chain steps for {} params",
+            stats.chain_steps,
+            N
         );
         // `params * entry_instructions` is the shape the old fallback had;
         // assert we are orders of magnitude below it so a regression that is
@@ -1966,12 +2040,15 @@ mod param_alloca_index_tests {
         }
     }
 
-    /// A late-failing aligned probe must cost at most `params` extra
-    /// examinations, never a second unbounded scan.  The count is pinned
-    /// exactly, so a future change that re-walks the whole prefix twice is
-    /// caught by a machine-independent assertion rather than a timing test.
+    /// A late-failing aligned probe must RESUME, not restart.  The old design
+    /// examined `FAIL_AT + 1 + entry_instructions` (it re-walked the whole
+    /// entry block after the probe); the resumed design examines exactly
+    /// `entry_instructions + 1` -- the `+1` is the boundary instruction seen
+    /// by both the probe and the resumed walk.  The count is pinned EXACTLY,
+    /// so any regression that re-walks the prefix is caught by a
+    /// machine-independent assertion rather than a timing test.
     #[test]
-    fn failed_aligned_probe_costs_exactly_one_bounded_prefix() {
+    fn failed_aligned_probe_resumes_without_reexamining_the_prefix() {
         const N: usize = 64usize;
         const FAIL_AT: usize = N - 1; // aligned hypothesis survives 63 checks
         let tys = [IrType::I32, IrType::I64, IrType::F32, IrType::F64];
@@ -1990,13 +2067,18 @@ mod param_alloca_index_tests {
         let entry_instructions = instructions.len();
         let f = function(instructions, homes.clone());
         let (index, stats) = ParamAllocaIndex::build_with_stats(&f);
-        // FAIL_AT + 1 examinations in the probe, then one full general pass.
+        // FAIL_AT + 1 examinations in the probe, then ONLY the suffix from
+        // FAIL_AT onward.  (FAIL_AT + 1) + (entry_instructions - FAIL_AT)
+        // == entry_instructions + 1.
         assert_eq!(
             stats.instructions_examined,
-            FAIL_AT + 1 + entry_instructions,
-            "the fallback must not re-examine more than the proven prefix"
+            entry_instructions + 1,
+            "the resumed pass must not re-examine the resolved prefix"
         );
         assert!(stats.instructions_examined <= N + entry_instructions);
+        // The probe already resolved FAIL_AT homes; only N - FAIL_AT ordinals
+        // remain, and each forms a chain of length 1.
+        assert!(stats.chain_steps <= N - FAIL_AT);
         for i in 0..=N {
             assert_eq!(index.get(i), reference_full_scan(&f, i), "ordinal {i}");
         }
@@ -2026,7 +2108,7 @@ mod param_alloca_index_tests {
             assert!(!aligned_hypothesis(&f));
             let (index, stats) = ParamAllocaIndex::build_with_stats(&f);
             assert_eq!(stats.allocations, 3, "general path with {n} params");
-            assert!(stats.instructions_examined <= n + entry_instructions);
+            assert!(stats.instructions_examined <= entry_instructions + 1);
             for i in 0..=n {
                 assert_eq!(
                     index.get(i),
@@ -2107,5 +2189,196 @@ mod param_alloca_index_tests {
         assert_eq!(index.get(6), None);
         assert_eq!(index.get(1), Some((Value(10), tys[0])));
         assert_eq!(index.get(5), Some((Value(10), tys[0])));
+    }
+
+    /// RED-TEAM WITNESS: `instructions_examined` alone cannot see a chain
+    /// being re-walked once per duplicate `Alloca`.  Two disjoint chains, one
+    /// resolved and one deliberately left unresolved (so the `unresolved == 0`
+    /// early exit can never hide the cost), plus 400 duplicate allocas for the
+    /// resolved home.  The naive shape walks 256 + 400*256 = 102656 links; the
+    /// correct shape walks each chain once, i.e. `chain_steps <= N`.
+    #[test]
+    fn duplicate_allocas_do_not_rescan_resolved_chains() {
+        const HALF: usize = 256;
+        const N: usize = 2 * HALF;
+        const REPEAT: usize = 400;
+        let mut homes = vec![1000u32; HALF];
+        homes.resize(N, 2000u32);
+        let mut instructions = vec![alloca(1000, IrType::I32)];
+        // Every one of these is a duplicate of an already-resolved home.
+        instructions.extend((0..REPEAT).map(|_| alloca(1000, IrType::I64)));
+        // Unrelated allocas must be equally cheap (hash miss, no chain walk).
+        instructions.extend((0..REPEAT).map(|_| alloca(7777, IrType::I32)));
+        let f = function(instructions, homes);
+        assert!(!aligned_hypothesis(&f));
+        let (index, stats) = ParamAllocaIndex::build_with_stats(&f);
+        assert!(
+            stats.chain_steps > 0,
+            "the counter must be wired into the chain walk"
+        );
+        assert!(
+            stats.chain_steps <= N,
+            "{} chain steps for {} params: a resolved chain was re-walked",
+            stats.chain_steps,
+            N
+        );
+        for i in 0..=N {
+            assert_eq!(index.get(i), reference_full_scan(&f, i), "ordinal {i}");
+        }
+        assert_eq!(index, ParamAllocaIndex::build(&f));
+    }
+
+    /// The chain-step bound must hold for EVERY duplicate shape, not just one
+    /// hand-picked case: sweep chain counts, chain lengths and duplicate
+    /// multiplicities, and compare every ordinal against the full-scan oracle.
+    #[test]
+    fn chain_steps_are_linear_in_every_duplicate_shape() {
+        const REPEAT: usize = 64;
+        for &(chains, width) in &[(1usize, 7usize), (2, 5), (4, 3), (8, 2), (16, 1)] {
+            let n = chains * width;
+            let mut homes = Vec::with_capacity(n);
+            for c in 0..chains {
+                homes.extend((0..width).map(|_| 100u32 + c as u32));
+            }
+            // Resolve only the FIRST chain; leaving the others unresolved
+            // prevents the early exit from masking a re-walk.
+            let mut instructions = vec![alloca(100, IrType::I32)];
+            instructions.extend((0..REPEAT).map(|_| alloca(100, IrType::I64)));
+            instructions.extend((0..REPEAT).map(|_| alloca(9999, IrType::F32)));
+            let f = function(instructions, homes);
+            let (index, stats) = ParamAllocaIndex::build_with_stats(&f);
+            assert!(
+                stats.chain_steps <= n,
+                "{chains} chains x {width}: {} steps for n={n}",
+                stats.chain_steps
+            );
+            for i in 0..=n {
+                assert_eq!(index.get(i), reference_full_scan(&f, i), "ordinal {i}");
+            }
+        }
+    }
+
+    /// EXHAUSTIVE proof of the NEW resume path.  For every small n, every
+    /// mismatch position k, and every kind of boundary instruction, enumerate
+    /// tail layouts (homes in order, reversed, duplicated, missing, with
+    /// interleaved non-Alloca instructions) and compare EVERY ordinal against
+    /// the pre-index full-scan oracle.  This is the shape the previous PR
+    /// never tested: `wants` strictly increasing but the aligned probe fails
+    /// late, so `homes[0..k]` are seeded and the general walk starts at k.
+    #[test]
+    fn resumed_probe_matches_the_oracle_over_all_late_failure_shapes() {
+        let tys = [IrType::I32, IrType::I64, IrType::F32, IrType::F64];
+        let mut cases = 0usize;
+        for n in 1..=5usize {
+            let wants: Vec<u32> = (0..n).map(|i| 100 + i as u32).collect();
+            for k in 0..n {
+                // Six boundary behaviours: an unrelated dest below/above all
+                // wants, a repeat of an ALREADY RESOLVED home (must be
+                // ignored), the authoritative first match of a LATER ordinal
+                // (must be caught by the resumed walk), a non-Alloca, and a
+                // duplicate of wants[k] with the wrong width.
+                // A LATER ordinal's home id (when one exists) is > wants[k],
+                // so it is still a mismatch at index k but IS the authoritative
+                // first match for that later ordinal.  With k == n-1 there is
+                // no later ordinal, so use an id that matches nothing.
+                let later = if k + 1 < n { wants[k + 1] } else { 999 };
+                let boundaries: Vec<Instruction> = vec![
+                    alloca(1, IrType::I32),
+                    alloca(999, IrType::I64),
+                    alloca(if k > 0 { wants[0] } else { 1 }, IrType::F32),
+                    alloca(later, IrType::F64),
+                    Instruction::StackSave { dest: Value(3) },
+                    alloca(50 + k as u32, IrType::I8),
+                ];
+                for (bi, boundary) in boundaries.into_iter().enumerate() {
+                    // Four tail shapes: in-order, reversed, duplicated with a
+                    // different width, and one home missing entirely.
+                    for tail_kind in 0..4 {
+                        let mut instructions: Vec<Instruction> =
+                            (0..k).map(|i| alloca(wants[i], tys[i % 4])).collect();
+                        instructions.push(boundary.clone());
+                        let mut tail: Vec<u32> = wants[k..].to_vec();
+                        match tail_kind {
+                            1 => tail.reverse(),
+                            2 => tail.extend(tail.clone()),
+                            3 => {
+                                if !tail.is_empty() {
+                                    tail.remove(0);
+                                }
+                            }
+                            _ => {}
+                        }
+                        for (j, dest) in tail.iter().enumerate() {
+                            if j % 3 == 2 {
+                                instructions.push(Instruction::StackSave { dest: Value(7) });
+                            }
+                            instructions.push(alloca(*dest, tys[(j + 1) % 4]));
+                        }
+                        let f = function(instructions.clone(), wants.clone());
+                        assert!(
+                            !aligned_hypothesis(&f),
+                            "n={n} k={k} bi={bi} tk={tail_kind}"
+                        );
+                        let (index, stats) = ParamAllocaIndex::build_with_stats(&f);
+                        assert_eq!(
+                            index,
+                            ParamAllocaIndex::build(&f),
+                            "instrumentation changed the index: n={n} k={k} bi={bi} tk={tail_kind}"
+                        );
+                        assert!(
+                            stats.instructions_examined <= instructions.len() + 1,
+                            "prefix re-walked: {} for {} instructions (n={n} k={k} bi={bi} tk={tail_kind})",
+                            stats.instructions_examined,
+                            instructions.len()
+                        );
+                        assert!(stats.chain_steps <= n);
+                        for i in 0..=n {
+                            assert_eq!(
+                                index.get(i),
+                                reference_full_scan(&f, i),
+                                "n={n} k={k} bi={bi} tk={tail_kind} ordinal {i}"
+                            );
+                        }
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        // 15 (n, k) pairs x 6 boundary shapes x 4 tail shapes.
+        let expected: usize = (1..=5usize).map(|n| n * 6 * 4).sum();
+        assert_eq!(cases, expected);
+    }
+
+    /// Machine-checkable layout proof (the `pahole` equivalent).  `NoStats`
+    /// must be a genuine ZST, the shipped index must be exactly one `Vec`
+    /// header, and the stats witness must be three plain `usize`s with no
+    /// padding.  A future field addition that bloats the production index or
+    /// makes the counter non-ZST fails here instead of silently costing
+    /// cycles in every function emission.
+    #[test]
+    fn index_layout_has_no_padding_and_the_counter_is_a_zst() {
+        use super::{NoStats, ParamHomeStats};
+        use std::mem::{align_of, size_of};
+
+        let word = size_of::<usize>();
+        assert_eq!(
+            size_of::<NoStats>(),
+            0,
+            "the production counter must be a ZST"
+        );
+        assert_eq!(align_of::<NoStats>(), 1);
+        assert_eq!(
+            size_of::<ParamAllocaIndex>(),
+            3 * word,
+            "index is one Vec header"
+        );
+        assert_eq!(align_of::<ParamAllocaIndex>(), word);
+        assert_eq!(
+            size_of::<ParamHomeStats>(),
+            3 * word,
+            "stats witness must be three usize fields with no padding"
+        );
+        assert_eq!(align_of::<ParamHomeStats>(), word);
+        assert_eq!(size_of::<Option<(Value, IrType)>>(), 8, "enum niche");
     }
 }

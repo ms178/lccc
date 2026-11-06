@@ -45,6 +45,14 @@ Checks (every one is non-vacuous; `--self-test` proves each can FAIL):
      flat adjacency chain's O(1) heap-object invariant is pinned both by the
      structural guard in check 6 and by `ParamHomeStats::allocations` unit
      tests (1 allocation aligned, 3 general, independent of `params`).
+ 13. Red-team: the O(1) resolved-chain guard and its `chain_steps` witness,
+     the resumed single-pass bound, the compiled layout test, a four-ISA
+     EXECUTION harness (compile-only evidence is vacuous for a wrong home),
+     the same fixtures wired into the hosted cross lane at every opt level,
+     and the i686 single-read kill switch.  This is a structural ratchet over
+     the evidence chain; the behavioural proof is the separately executed
+     `check_param_home_cross_execute.py` / `check_switch_cross_execute.py`
+     runs and `cargo test`, not this gate.
 
 Usage:
   python3 tests/regression/check_param_home_contracts.py
@@ -625,7 +633,7 @@ def structural_failures(production: bytes, prologues: dict[str, bytes]) -> list[
     bad: list[str] = []
     if b"pub struct ParamAllocaIndex" not in production:
         bad.append("ParamAllocaIndex is gone from production code")
-    if b"fn aligned_homes" not in production or b"fn general_homes" not in production:
+    if b"fn aligned_probe" not in production or b"fn general_homes_from" not in production:
         bad.append("the two proven build paths are gone")
     if b"find_map(|inst| match inst" in production:
         bad.append("a per-instruction find_map scan reappeared in production code")
@@ -639,6 +647,24 @@ def structural_failures(production: bytes, prologues: dict[str, bytes]) -> list[
         bad.append("one Vec per distinct home id returned (O(params) allocations)")
     if b"let mut next: Vec<usize>" not in production:
         bad.append("the flat adjacency chain is gone")
+    # RED-TEAM: the resolved-chain guard and its independent witness.  Without
+    # them, `instructions_examined` stays linear while duplicate allocas make
+    # the chain walk quadratic (measured: 102656 steps for 512 params).
+    if b"if homes[first].is_some()" not in production:
+        bad.append("the O(1) resolved-chain guard is gone (quadratic re-walk)")
+    if b"pub chain_steps: usize" not in production:
+        bad.append("the portable chain-step witness is gone")
+    if b"fn note_chain_step(&mut self)" not in production:
+        bad.append("the chain-step instrumentation hook is gone")
+    # RED-TEAM: the seeded single-pass RESUME.  A reverted implementation that
+    # re-walks the whole prefix passes every semantic test but silently loses
+    # instruction examinations; pin the structural shape too.
+    if b"general_homes_from(func, counter, homes, resume)" not in production:
+        bad.append("the general pass no longer resumes at the probe mismatch")
+    if b"&block.instructions[start..]" not in production:
+        bad.append("the resumed general pass re-examines the resolved prefix")
+    if b"for i in start..n" not in production:
+        bad.append("the general map is no longer restricted to unresolved ordinals")
     for arch in ("arm", "i686", "riscv", "x86"):
         if b"ParamAllocaIndex::build(func)" not in prologues.get(arch, b""):
             bad.append(f"{arch} prologue does not build the index")
@@ -657,6 +683,83 @@ def check_no_scan_fallback(work: pathlib.Path) -> None:
     require(not bad, "; ".join(bad))
     print("  [6] no per-query full scan in production; all four prologues build "
           "the index once: PASS")
+
+
+def cross_execute_failures(tests_rs: bytes, harness: bytes, cross_gate: bytes,
+                           shifted_c: bytes, wide_c: bytes,
+                           i686: bytes) -> list[str]:
+    """Pure predicate for check 13, so the self-test can prove each rule fires.
+
+    An assembly-only "cross-ISA" claim is vacuous: a home resolved into the
+    wrong slot still assembles.  These rules pin the evidence chain --
+    adversarial unit tests, a four-ISA EXECUTION harness with its own
+    non-vacuity proof, the SAME fixtures in the hosted cross-execution lane,
+    and the i686 single-read kill switch.
+    """
+    bad: list[str] = []
+    for name in (b"fn duplicate_allocas_do_not_rescan_resolved_chains",
+                 b"fn chain_steps_are_linear_in_every_duplicate_shape",
+                 b"fn index_layout_has_no_padding_and_the_counter_is_a_zst",
+                 b"fn resumed_probe_matches_the_oracle_over_all_late_failure_shapes",
+                 b"fn failed_aligned_probe_resumes_without_reexamining_the_prefix"):
+        if name not in tests_rs:
+            bad.append(f"adversarial unit test {name.decode()} is gone")
+    if b"stats.chain_steps <= N" not in tests_rs or b"stats.chain_steps <= n" not in tests_rs:
+        bad.append("the chain_steps <= params bound is not asserted")
+    if b"stats.instructions_examined <= entry_instructions + 1" not in tests_rs:
+        bad.append("the resumed single-pass bound is not asserted")
+    for token in (b'"x86_64"', b'"i686"', b'"aarch64"', b'"riscv64"',
+                  b"qemu-i386", b"qemu-aarch64", b"qemu-riscv64",
+                  b'"--self-test"', b"expect_machine", b"fail closed",
+                  b"PARAM_HOME_CROSS_OK"):
+        if token not in harness:
+            bad.append(f"four-ISA execution harness lost {token!r}")
+    for name in (b"param_home_shifted_cross", b"param_home_wide_cross"):
+        if name not in cross_gate:
+            bad.append(f"hosted cross lane lost fixture {name.decode()}")
+        if name + b'": ALL_LEVELS' not in cross_gate:
+            bad.append(f"fixture {name.decode()} is not run at every opt level")
+    if b"volatile int local" not in shifted_c:
+        bad.append("shifted fixture no longer forces the general build path")
+    if b"int aligned(" not in shifted_c:
+        bad.append("aligned fast-path control is gone")
+    if b"return 1;" not in shifted_c or b"return 2;" not in shifted_c:
+        bad.append("shifted fixture cannot distinguish which shape broke")
+    if b"long long wide(" not in wide_c or b"volatile long long local" not in wide_c:
+        bad.append("wide mixed-width fixture is gone")
+    if wide_c.count(b"int p") < 40 or b"long long q0" not in wide_c:
+        bad.append("wide fixture no longer exceeds every ABI's register budget")
+    # A process-global read inside a per-parameter predicate is redundant
+    # work AND a context-safety hazard.  Exactly one read per function.
+    if i686.count(b'std::env::var_os("CCC_NO_PARAM_DIRECT_HOME")') != 1:
+        bad.append("the i686 kill switch is not read exactly once")
+    if b"no_direct_home: bool" not in i686 or b"let no_direct_home = " not in i686:
+        bad.append("the i686 kill switch is not threaded as an explicit bool")
+    return bad
+
+
+def check_chain_step_and_cross_execute() -> None:
+    """Check 13: no re-walked chains, no prefix re-walk, and BOTH index paths
+    EXECUTED on all four ISAs with a non-vacuous harness."""
+    whole = (ROOT / "src/backend/stack_layout/regalloc_helpers.rs").read_bytes()
+    tests_rs = whole.split(b"#[cfg(test)]", 1)[-1]
+    paths = {
+        "harness": ROOT / "tests/regression/check_param_home_cross_execute.py",
+        "cross_gate": ROOT / "tests/regression/check_switch_cross_execute.py",
+        "shifted_c": ROOT / "tests/regression/param_home_shifted_cross.c",
+        "wide_c": ROOT / "tests/regression/param_home_wide_cross.c",
+        "i686": ROOT / "src/backend/i686/codegen/prologue.rs",
+    }
+    for label, path in paths.items():
+        require(path.is_file(), f"{label} is missing: {path}")
+    bad = cross_execute_failures(tests_rs, paths["harness"].read_bytes(),
+                                 paths["cross_gate"].read_bytes(),
+                                 paths["shifted_c"].read_bytes(),
+                                 paths["wide_c"].read_bytes(),
+                                 paths["i686"].read_bytes())
+    require(not bad, "; ".join(bad))
+    print("  [13] resolved-chain guard, resumed single pass, four-ISA execution "
+          "harness and hosted cross-lane fixtures: PASS")
 
 
 def self_test() -> None:
@@ -747,6 +850,74 @@ def self_test() -> None:
         good_prod.replace(b"let mut next: Vec<usize>",
                           b"let mut next: Vec<u8>"), good_prologues),
         "flat adjacency chain deleted"))
+    # Every NEW red-team structural rule must be able to reject a bad tree.
+    # These are the exact shapes that regressed in the merged PR #1115 head.
+    rejects(lambda: require(not structural_failures(
+        good_prod.replace(b"fn aligned_probe", b"fn aligned_gone"),
+        good_prologues), "aligned probe renamed away"))
+    rejects(lambda: require(not structural_failures(
+        good_prod.replace(b"fn general_homes_from", b"fn general_gone"),
+        good_prologues), "resumed general pass renamed away"))
+    rejects(lambda: require(not structural_failures(
+        good_prod.replace(b"if homes[first].is_some()",
+                          b"if false // guard removed"),
+        good_prologues), "resolved-chain guard deleted"))
+    rejects(lambda: require(not structural_failures(
+        good_prod.replace(b"pub chain_steps: usize", b"pub gone: usize"),
+        good_prologues), "chain-step witness deleted"))
+    rejects(lambda: require(not structural_failures(
+        good_prod.replace(b"fn note_chain_step(&mut self)",
+                          b"fn gone(&mut self)"),
+        good_prologues), "chain-step hook deleted"))
+    rejects(lambda: require(not structural_failures(
+        good_prod.replace(b"general_homes_from(func, counter, homes, resume)",
+                          b"general_homes_from(func, counter, homes, 0)"),
+        good_prologues), "resume replaced with a full restart"))
+    rejects(lambda: require(not structural_failures(
+        good_prod.replace(b"&block.instructions[start..]",
+                          b"&block.instructions[..]"),
+        good_prologues), "resumed pass re-examines the prefix"))
+    rejects(lambda: require(not structural_failures(
+        good_prod.replace(b"for i in start..n", b"for i in 0..n"),
+        good_prologues), "general map no longer restricted to unresolved ordinals"))
+    # Check 13: load the real evidence bundle once, then prove EVERY rule can
+    # reject a mutated copy.  A structural gate whose rules never fire is
+    # decoration; this is the non-vacuity proof.
+    tests_rs = good.split(b"#[cfg(test)]", 1)[-1]
+    bundle = [(ROOT / p).read_bytes() for p in (
+        "tests/regression/check_param_home_cross_execute.py",
+        "tests/regression/check_switch_cross_execute.py",
+        "tests/regression/param_home_shifted_cross.c",
+        "tests/regression/param_home_wide_cross.c",
+        "src/backend/i686/codegen/prologue.rs")]
+
+    def bundle_fails(i: int, old: bytes, new: bytes, why: str) -> None:
+        parts = list(bundle)
+        parts[i] = parts[i].replace(old, new)
+        rejects(lambda: require(not cross_execute_failures(tests_rs, *parts), why))
+
+    require(not cross_execute_failures(tests_rs, *bundle),
+            "the shipped tree fails its own check-13 guard")
+    rejects(lambda: require(not cross_execute_failures(
+        tests_rs.replace(b"fn duplicate_allocas_do_not_rescan_resolved_chains",
+                         b"fn gone"), *bundle), "chain-walk test deleted"))
+    rejects(lambda: require(not cross_execute_failures(
+        tests_rs.replace(b"stats.chain_steps <= N", b"0 < N"), *bundle),
+        "chain-step bound deleted"))
+    rejects(lambda: require(not cross_execute_failures(
+        tests_rs.replace(b"stats.instructions_examined <= entry_instructions + 1",
+                         b"true"), *bundle), "resumed single-pass bound deleted"))
+    bundle_fails(0, b'"riscv64"', b'"s390x"', "harness lost an ISA")
+    bundle_fails(0, b"qemu-i386", b"qemu-none", "harness lost a qemu runner")
+    bundle_fails(0, b"expect_machine", b"skip_machine", "harness lost ELF guard")
+    bundle_fails(0, b"PARAM_HOME_CROSS_OK", b"NOT_OK", "harness lost verdict")
+    bundle_fails(1, b'param_home_shifted_cross": ALL_LEVELS',
+                 b'param_home_shifted_cross": ("-O2",)', "fixture not at all levels")
+    bundle_fails(2, b"volatile int local", b"int local", "shifted shape lost")
+    bundle_fails(2, b"return 2;", b"return 0;", "path discrimination lost")
+    bundle_fails(3, b"long long wide(", b"int wide(", "wide fixture lost")
+    bundle_fails(4, b"std::env::var_os(\"CCC_NO_PARAM_DIRECT_HOME\")",
+                 b"", "i686 single read lost")
     # Debug-row filter: accept identical code with metadata added, but reject
     # a one-byte instruction change hidden under the same metadata.
     note = '\t.section\t.note.GNU-stack,"",@progbits'
@@ -765,7 +936,7 @@ def self_test() -> None:
     rejects(lambda: require("fastbuild-baseline2" not in
                             "p='/home/user/lccc/target/fastbuild-baseline2/fastbuild'",
                             "stale baseline string"))
-    require(cases == 23, f"self-test covered {cases}/23 rejection paths")
+    require(cases == 43, f"self-test covered {cases}/43 rejection paths")
     print(f"SELF_TEST_OK ({cases} rejection paths proven non-vacuous)")
 
 
@@ -792,6 +963,7 @@ def main(argv: list[str] | None = None) -> int:
             check_round_cap_exit_coverage(work)
             check_research_tool_reproducibility()
             check_audit_census_ratchet()
+            check_chain_step_and_cross_execute()
     except Failure as exc:
         print(f"PARAM_HOME_CONTRACTS_FAIL: {exc}", file=sys.stderr)
         return 1
