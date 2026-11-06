@@ -139,6 +139,13 @@ pub struct Driver {
     pub(super) fp_trapping_math: bool,
     /// Dynamic rounding is observable independently of exception trapping.
     pub(super) fp_rounding_math: bool,
+    /// `-f{,no-}trapping-math` given by the user, or `None` when unset.
+    /// `-ffast-math` must override both fenv bits, but withdrawing the
+    /// umbrella (`-fno-fast-math`, or a later plain `-O*` after `-Ofast`)
+    /// must restore an explicit fenv request instead of silently losing it.
+    pub(super) explicit_fp_trapping_math: Option<bool>,
+    /// `-f{,no-}rounding-math` given by the user, or `None` when unset.
+    pub(super) explicit_fp_rounding_math: Option<bool>,
     pub(super) verbose: bool,
     pub(super) mode: CompileMode,
     pub(super) debug_info: bool,
@@ -720,6 +727,8 @@ impl Driver {
             builtin_policy: crate::common::pass_policy::BuiltinFlags::default(),
             fp_trapping_math: false,
             fp_rounding_math: false,
+            explicit_fp_trapping_math: None,
+            explicit_fp_rounding_math: None,
             verbose: false,
             mode: CompileMode::Full,
             debug_info: false,

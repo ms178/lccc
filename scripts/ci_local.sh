@@ -1051,6 +1051,19 @@ gate "driver-queries" fast \
 gate "option-effect-ledger" fast \
     python3 tests/regression/check_option_effect_ledger.py \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+# Four-compiler measurement of the numeric -O / -Ofast decisions. ICX 2026.2
+# is optional locally (the authenticated hosted lane always has it); GCC 16.2
+# and Clang 23.1.5 are pinned here so the local gate is never vacuous.
+icx_o_level_parity() {
+    local -a icx_args=()
+    if [ -n "${LCCC_ICX_BIN:-}" ] && [ -x "$LCCC_ICX_BIN" ]; then
+        icx_args=(--icx "$LCCC_ICX_BIN" --require-icx)
+    fi
+    python3 tests/regression/check_icx_o_level_parity.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" --clang "${CLANG:-clang-23}" \
+        "${icx_args[@]}"
+}
+gate "icx-o-level-parity" fast icx_o_level_parity
 gate "attribute-diagnostics" fast \
     env GCC="${GCC16:-gcc-16}" python3 tests/regression/check_attribute_diagnostics.py
 # Kernel _calc_vm_trans selects an arm using an integer comparison. Check

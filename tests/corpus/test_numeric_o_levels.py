@@ -292,5 +292,64 @@ class NumericOptimizationLevels(unittest.TestCase):
         self.assertIn("fn set_optimization_level(&mut self, level: u32,", text)
 
 
+    def test_numeric_levels_in_response_files_are_real_levels(self) -> None:
+        """`@file` must go through the same parser, not a tolerant side path.
+
+        Build systems that still emit -O4 often put it in a response file, so
+        a fix that only covers argv would leave the performance cliff in
+        place. Both a valid clamped level and a malformed one are pinned.
+        """
+        lccc = self.require(self.lccc)
+        reference = compile_asm(lccc, self.source, "-O3")
+        self.assertEqual(reference.returncode, 0)
+        for level in ("-O4", "-O9", "-O2147483647", "-O0000000000000000000000004"):
+            with self.subTest(level=level):
+                rsp = self.work / "level.rsp"
+                rsp.write_text(level + "\n", encoding="utf-8")
+                got = compile_asm(lccc, self.source, "@level.rsp")
+                self.assertEqual(got.returncode, 0, got.stderr[:300])
+                self.assertEqual(got.stdout, reference.stdout,
+                                 f"{level} in a response file did not produce -O3 code")
+                self.assertEqual(got.stderr, "", "no tolerated-unknown warning")
+                self.assertNotIn("__FAST_MATH__", macros(lccc, self.source, "@level.rsp"))
+        bad = self.work / "bad.rsp"
+        bad.write_text("-O2x\n", encoding="utf-8")
+        rejected = compile_asm(lccc, self.source, "@bad.rsp")
+        self.assertNotEqual(rejected.returncode, 0,
+                            "a malformed level in a response file was tolerated")
+        self.assertEqual(rejected.stdout, "", "no assembly may be produced")
+
+    def test_repeated_level_spellings_keep_last_wins_and_sticky_explicit_opts(
+        self,
+    ) -> None:
+        """parse_cli_args is called repeatedly; ownership must be idempotent.
+
+        Pins both competing state machines at once: the -O level always
+        wins last, while an explicit -ffast-math / -fno-fast-math is a user
+        option that survives any number of later -O spellings.
+        """
+        lccc = self.require(self.lccc)
+        strict = compile_asm(lccc, self.source, "-O3")
+        fast = compile_asm(lccc, self.source, "-O3", "-ffast-math")
+        self.assertNotEqual(strict.stdout, fast.stdout, "vacuous: no fast-math delta")
+        cases = (
+            (("-Ofast",), fast.stdout, True),
+            (("-Ofast", "-O4"), strict.stdout, False),
+            (("-O4", "-Ofast"), fast.stdout, True),
+            (("-O3", "-ffast-math", "-O9"), fast.stdout, True),
+            (("-Ofast", "-O9", "-ffast-math"), fast.stdout, True),
+            (("-O9", "-ffast-math", "-Ofast", "-O9"), fast.stdout, True),
+            (("-Ofast", "-fno-fast-math", "-O9"), strict.stdout, False),
+            (("-O9", "-fno-fast-math", "-Ofast", "-O9"), strict.stdout, False),
+        )
+        for flags, expected, expect_macro in cases:
+            with self.subTest(flags=" ".join(flags)):
+                got = compile_asm(lccc, self.source, *flags)
+                self.assertEqual(got.returncode, 0, got.stderr[:300])
+                self.assertEqual(got.stdout, expected, "wrong final codegen state")
+                has_macro = "__FAST_MATH__" in macros(lccc, self.source, *flags)
+                self.assertEqual(has_macro, expect_macro, "wrong final macro state")
+
+
 if __name__ == "__main__":
     unittest.main()

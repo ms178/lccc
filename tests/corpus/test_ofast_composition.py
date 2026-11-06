@@ -322,5 +322,84 @@ class OfastOptionOrder(unittest.TestCase):
         self.assertIn("-Ofast -O2", problems)
 
 
+# A _Float16 expression is one of the few LCCC paths where
+# `fp_environment_observable` (trapping OR rounding math OR FENV_ACCESS)
+# changes emitted assembly: with fenv observability the half-float folding in
+# ir/lowering/half_float.rs is disabled. It is therefore an excellent
+# non-vacuous probe for whether withdrawing -ffast-math restores an explicit
+# fenv option.
+FENV_FIXTURE = "_Float16 g(_Float16 a, _Float16 b) { return a * b + b; }\n"
+
+
+class FenvOptionWithdrawal(unittest.TestCase):
+    """-ffast-math overrides fenv bits; withdrawing it must restore explicit ones."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        compiler = optional(os.environ.get("CCC", "target/fastbuild/lccc"))
+        if compiler is None:
+            raise unittest.SkipTest("lccc binary not built")
+        cls.compiler = compiler
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.source = Path(cls.tmp.name) / "fenv.c"
+        cls.source.write_text(FENV_FIXTURE, encoding="utf-8")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.tmp.cleanup()
+
+    def test_probe_is_non_vacuous(self) -> None:
+        plain = assembly(self.compiler, self.source, "-O2")
+        trapping = assembly(self.compiler, self.source, "-O2", "-ftrapping-math")
+        rounding = assembly(self.compiler, self.source, "-O2", "-frounding-math")
+        self.assertNotEqual(plain, trapping, "fenv fixture cannot see trapping math")
+        self.assertEqual(trapping, rounding, "both fenv bits must gate the same fold")
+
+    def test_explicit_fenv_survives_fno_fast_math(self) -> None:
+        explicit = assembly(self.compiler, self.source, "-O2", "-ftrapping-math")
+        # The umbrella really does override the explicit request while active:
+        # otherwise this test would not prove that a restore is needed.
+        active = assembly(
+            self.compiler, self.source, "-O2", "-ftrapping-math", "-ffast-math"
+        )
+        self.assertNotEqual(explicit, active, "fast-math did not override fenv")
+        for flag in ("-ftrapping-math", "-frounding-math"):
+            restored = assembly(
+                self.compiler, self.source, "-O2", flag, "-ffast-math", "-fno-fast-math"
+            )
+            self.assertEqual(explicit, restored, f"{flag} was lost on withdrawal")
+
+    def test_plain_o_withdrawal_restores_explicit_fenv_after_ofast(self) -> None:
+        explicit = assembly(self.compiler, self.source, "-O2", "-ftrapping-math")
+        for flags in (
+            ("-O2", "-ftrapping-math", "-Ofast", "-O2"),
+            ("-O2", "-frounding-math", "-Ofast", "-O4"),
+        ):
+            self.assertEqual(explicit, assembly(self.compiler, self.source, *flags))
+        # With no explicit fenv request the withdrawal must return to the
+        # driver default, not to the last explicit value from another option.
+        plain = assembly(self.compiler, self.source, "-O2")
+        self.assertEqual(
+            plain, assembly(self.compiler, self.source, "-O2", "-ffast-math", "-fno-fast-math")
+        )
+        self.assertEqual(plain, assembly(self.compiler, self.source, "-O2", "-Ofast", "-O2"))
+
+    def test_gcc_oracle_restores_trapping_math_on_withdrawal(self) -> None:
+        gcc = optional(os.environ.get("GCC16", "gcc-16"))
+        if gcc is None:
+            raise unittest.SkipTest("pinned GCC 16.2.0 not installed")
+        proc = subprocess.run(
+            [gcc, "-O2", "-ftrapping-math", "-ffast-math", "-fno-fast-math",
+             "-Q", "--help=optimizers"],
+            cwd=self.source.parent, capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[:300])
+        line = next(
+            (ln for ln in proc.stdout.splitlines()
+             if ln.strip().startswith("-ftrapping-math")), ""
+        )
+        self.assertIn("[enabled]", line, f"GCC 16.2 withdrew differently: {line!r}")
+
+
 if __name__ == "__main__":
     unittest.main()

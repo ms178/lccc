@@ -249,6 +249,13 @@ impl Driver {
             self.fast_math = false;
             self.fp_reassoc = false;
             self.math_errno = true;
+            // Withdraw the umbrella's fenv overrides. An explicit
+            // -f{,no-}trapping-math / -f{,no-}rounding-math is a user option
+            // and must survive, exactly like an explicit -ffp-contract.
+            // Without this restore, -ftrapping-math -ffast-math -fno-fast-math
+            // silently lost the request and changed _Float16 lowering.
+            self.fp_trapping_math = self.explicit_fp_trapping_math.unwrap_or(false);
+            self.fp_rounding_math = self.explicit_fp_rounding_math.unwrap_or(false);
             // Restore the language default. In GCC, -ffp-contract is
             // orthogonal to -fno-fast-math: the C default (fast) stands.
             // Explicit -ffp-contract={on,off,fast} wins in either order.
@@ -3475,10 +3482,22 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                 // of these flags permits it. Keep a deliberately narrow bit
                 // rather than pretending that every GCC fast-math sub-option is
                 // implemented.
-                "-frounding-math" => self.fp_rounding_math = true,
-                "-fno-rounding-math" => self.fp_rounding_math = false,
-                "-ftrapping-math" => self.fp_trapping_math = true,
-                "-fno-trapping-math" => self.fp_trapping_math = false,
+                "-frounding-math" => {
+                    self.explicit_fp_rounding_math = Some(true);
+                    self.fp_rounding_math = true;
+                }
+                "-fno-rounding-math" => {
+                    self.explicit_fp_rounding_math = Some(false);
+                    self.fp_rounding_math = false;
+                }
+                "-ftrapping-math" => {
+                    self.explicit_fp_trapping_math = Some(true);
+                    self.fp_trapping_math = true;
+                }
+                "-fno-trapping-math" => {
+                    self.explicit_fp_trapping_math = Some(false);
+                    self.fp_trapping_math = false;
+                }
                 // GCC's umbrella also changes pointer-overflow assumptions.
                 //
                 // `-fno-strict-overflow` asks for signed wraparound, which is
@@ -5583,6 +5602,63 @@ mod cli_tests {
             FpContract::Off,
             "explicit -ffp-contract is sticky in both orders"
         );
+    }
+
+    /// Withdrawing the fast-math umbrella restores an *explicit* fenv request.
+    /// `-ffast-math` legitimately overrides `-ftrapping-math` while active
+    /// (GCC 16.2 reports `-ftrapping-math [disabled]`), but GCC reports it
+    /// `[enabled]` again after `-fno-fast-math`. Before this was tracked,
+    /// `-ftrapping-math -ffast-math -fno-fast-math` silently lost the user's
+    /// flag and changed `_Float16` lowering in LCCC.
+    #[test]
+    fn fast_math_withdrawal_restores_explicit_fenv_options() {
+        let parse = |flags: &[&str]| {
+            let mut driver = Driver::new();
+            let mut args = vec!["lccc".to_string()];
+            args.extend(flags.iter().map(|f| (*f).to_string()));
+            args.push("x.c".to_string());
+            driver.parse_cli_args(&args).unwrap();
+            driver
+        };
+        type FenvGetter = fn(&Driver) -> bool;
+        let cases: [(&str, &str, FenvGetter); 2] = [
+            ("-ftrapping-math", "-fno-trapping-math", |d| {
+                d.fp_trapping_math
+            }),
+            ("-frounding-math", "-fno-rounding-math", |d| {
+                d.fp_rounding_math
+            }),
+        ];
+        for (on, off, get) in cases {
+            let explicit = parse(&["-O2", on]);
+            let active = parse(&["-O2", on, "-ffast-math"]);
+            let restored = parse(&["-O2", on, "-ffast-math", "-fno-fast-math"]);
+            let after_ofast = parse(&["-O2", on, "-Ofast", "-O2"]);
+            let explicit_off = parse(&["-O2", off, "-ffast-math", "-fno-fast-math"]);
+            let plain = parse(&["-O2"]);
+            assert!(get(&explicit), "{on} must be observable");
+            assert!(!get(&active), "-ffast-math must override {on} while active");
+            assert!(get(&restored), "explicit {on} lost on -fno-fast-math");
+            assert!(get(&after_ofast), "explicit {on} lost on -O2 withdrawal");
+            assert!(!get(&explicit_off), "last explicit fenv option must win");
+            assert!(!get(&plain), "driver default must stay fenv-off");
+
+            let last_on = parse(&[off, on, "-ffast-math", "-fno-fast-math"]);
+            let last_off = parse(&[on, off, "-ffast-math", "-fno-fast-math"]);
+            assert!(
+                get(&last_on) && !get(&last_off),
+                "explicit order must be sticky"
+            );
+        }
+        // With no explicit fenv request, withdrawal returns to the driver's
+        // default (no fenv observability), never to a stale value.
+        for flags in [
+            vec!["-O2", "-ffast-math", "-fno-fast-math"],
+            vec!["-Ofast", "-O2"],
+        ] {
+            let driver = parse(&flags);
+            assert!(!driver.fp_trapping_math && !driver.fp_rounding_math);
+        }
     }
 
     /// GCC 16.2 and Clang 23.1 both treat `-Ofast`'s fast-math as a property

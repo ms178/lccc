@@ -3526,6 +3526,18 @@ jobs:
         "$binary" --version | tee intel-evidence/version.txt
         "$binary" -E -dM -x c /dev/null > intel-evidence/macros.txt
         sha256sum "$binary" > intel-evidence/binary.sha256
+    - name: Numeric -O and -Ofast parity against ICX 2026.2, GCC 16.2 and Clang 23.1.5
+      env:
+        CCC: target/fastbuild/lccc
+        GCC16: gcc-16
+      run: |
+        set -euo pipefail
+        trap 'status=$?; if [ "$status" -ne 0 ]; then python3 scripts/ci_annotate_log.py --title "numeric -O / -Ofast four-compiler parity" intel-evidence/o-level-parity.log; fi; exit "$status"' EXIT
+        python3 tests/regression/check_icx_o_level_parity.py \
+          --lccc "$CCC" --gcc "$GCC16" --clang "${CLANG:-clang-23}" \
+          --icx "$LCCC_ICX_BIN" --require-icx \
+          --json intel-evidence/o-level-parity.json \
+          2>&1 | tee intel-evidence/o-level-parity.log
     - name: Enum callback ABI against authenticated ICX, GCC and Clang
       run: |
         set -euo pipefail

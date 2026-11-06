@@ -234,7 +234,46 @@ without a test that fails when it regresses.
     under load for identical code. Removed; structural byte identity is the
     proof, and the remaining timing gate (LCCC -Ofast >= 1.5x faster than
     -O3, observed 6.8x) passed with a >4x margin.
-15. **Host-CPU runtime behaviour was checked with a real debugger, not just
+15. **A line-by-line audit of `set_fast_math` found a pre-existing fenv state
+    leak.**  The helper's `enabled` branch clears `fp_trapping_math` and
+    `fp_rounding_math`, but the withdrawal branch never restored them: an
+    explicit `-ftrapping-math` followed by `-ffast-math -fno-fast-math`
+    silently disappeared. This is observable, not theoretical: a `_Float16`
+    expression changes emitted assembly when either fenv bit gates half-float
+    folding (`ir/lowering/half_float.rs`), and the digest reverted to plain
+    `-O2` after the withdrawal. GCC 16.2 reports `-ftrapping-math [enabled]`
+    after the same sequence (`-Q --help=optimizers`), and preserves explicit
+    `-fno-trapping-math` across `-Ofast -O2`. Fix: two `Option<bool>` explicit
+    origin fields (the same design already used for `fp_contract_explicit`
+    and `explicit_fast_math`), recorded by the four `-f{,no-}{trapping,
+    rounding}-math` arms and restored on withdrawal; `None` falls back to
+    LCCC's documented fenv-off default. Last-explicit-option precedence is
+    preserved. One Rust unit test sweeps both bits, both withdrawal paths,
+    explicit on/off and the default; four corpus tests pin the non-vacuous
+    `_Float16` probe, the restore, the `-Ofast -O2` restore and the GCC oracle.
+    Neither of the two pre-existing 17-vector order matrices changes, because
+    none of their vectors sets an explicit fenv flag.
+16. **The third comparison oracle is now measured, not deferred.**  ICX 2026.2
+    is not installable in this sandbox (Intel PPA blocked), so
+    `tests/regression/check_icx_o_level_parity.py` was added and wired into the
+    authenticated `icx-oracle` lane with `--require-icx` plus a local
+    `ci_local.sh` gate. It measures the numeric-`-O` / `-Ofast` decisions on
+    all four compilers (LCCC, GCC 16.2.0, Clang 23.1.5, ICX 2026.2), prints a
+    digest/macro/exit-status divergence table, and asserts only the universal
+    invariants: numeric levels >=3 clamp to that compiler's own `-O3`, a later
+    plain `-O*` withdraws `-Ofast`'s implicit fast-math, and the probe is
+    non-vacuous. Parser-limit spellings near `INT_MAX` are reported, not
+    asserted, because LLVM versions legitimately differ on them. The first
+    version of this gate was **wrong** and the measurement caught it: it
+    compared `-Ofast -O2` against `-O3`, but GCC 16.2's `-O2` and `-O3`
+    assembly differ, so the gate reported a false GCC failure. The oracle was
+    corrected to compare each withdrawal against its own final `-O` spelling;
+    the gate is now 3-compiler PASS locally and runs with all four in hosted
+    CI. Two more corpus tests close the last parser-path TODOs: numeric levels
+    inside `@response` files (including a malformed one that must be a hard
+    error) and repeated mixed `-O` spellings with sticky explicit
+    `-ffast-math` / `-fno-fast-math`.
+17. **Host-CPU runtime behaviour was checked with a real debugger, not just
    assembly hashes.**  A four-frame `noinline` fixture compiled by LCCC,
    GCC 16.2 and Clang 23.1.5 at `-O2`, `-Ofast` and `-Og` produces identical
    results for inputs 5, -3, 0 and 12345 (`6n+16`). GDB's backtrace at `leaf`
@@ -300,8 +339,8 @@ GCC 16.2.0 / Clang 23.1.5 / GDB 18.1 / Rust 1.99.1 oracles.
 | `cargo build --profile fastbuild --locked`, `RUSTFLAGS=-D warnings` | **exit 0, zero warnings** (0 `warning` lines in the build log) |
 | `cargo fmt --check` | **exit 0** |
 | `scripts/check_clippy_policy.py` (CI's exact strict Clippy gate) | **exit 0**, 76 policy lint names probed, 0 unknown, zero warnings |
-| `cargo test --profile fastbuild --locked` (full Rust suite, `RUSTFLAGS=-D warnings`) | **8077 passed, 0 failed, 10 ignored**, zero compiler warnings |
-| `cargo test --profile fastbuild --locked driver_option_contract_table` | **1 passed, 0 failed**, 8086 filtered |
+| `cargo test --profile fastbuild --locked` (full Rust suite, `RUSTFLAGS=-D warnings`) | **8078 passed, 0 failed, 10 ignored**, zero compiler warnings |
+| `cargo test --profile fastbuild --locked driver_option_contract_table` | **1 passed, 0 failed**, 8087 filtered |
 | `cargo test … ofast_* / numeric_o_levels_*` | **3 passed** (six umbrella fields, contract precedence, 17-vector option matrix, 11 accepted + 8 rejected numeric levels) |
 | `option_effect_ledger.py --lccc … --self-test --json` | 17 rows, 11 probes, 7 priority options, **0 problems** |
 | `check_driver_option_contract.sh --skip-trapv-matrix` | **exit 0**, including the executable ledger |
@@ -315,9 +354,9 @@ GCC 16.2.0 / Clang 23.1.5 / GDB 18.1 / Rust 1.99.1 oracles.
 | `tests.corpus.test_numeric_o_levels` | **10 tests OK** (byte equality with `-O3`, macros, zero diagnostics, GCC/Clang clamping, 8 refusals with pinned divergences, strict options, withdrawal, wrapper cliff, 4-arch sweep + pinned set) |
 | `tests.corpus.test_host_cpu_dot_product` | **6 tests OK** (packed-codegen non-vacuity, `-O4 == -O3`, one-ulp checksums, loose interleaved timing gate, three-way measurement, wrapper negative control) |
 | `tests.corpus.test_x86_torture_contracts` | **37 tests OK**, incl. 2 new delayed-consumer race regressions |
-| new/changed corpus modules together | **81 tests OK** |
+| new/changed corpus modules together | **87 tests OK** |
 | `tests.corpus.test_gdb_option_runtime` | **7 tests OK** with pinned GDB 18.1, now also at `-O4` (12 compiler/level runtime + unwind pairs) |
-| `unittest discover -s tests/corpus -p 'test_*.py'` | **1329 tests, 0 failures, 5 skips** |
+| `unittest discover -s tests/corpus -p 'test_*.py'` | **1335 tests, 0 failures, 5 skips** |
 | `check_doc_links.py`, `check_script_imports.py`, `check_no_conflict_markers.py`, `check_ci_workflow_shell.py` | **all PASS** |
 | Hosted CI on `fd3d490` | **22 pass / 3 skipping / 0 failures**, including the authenticated ICX 2026.2 integration lane |
 
