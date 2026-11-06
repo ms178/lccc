@@ -480,63 +480,114 @@ impl Lowerer {
         }
     }
 
-    /// Keep the layouts of every record a `-g` type mentions, before its scope
-    /// is popped.
+    /// The `-g` type to record for a local declared with `ty`.
     ///
-    /// `pop_scope` undoes a block-scope `struct`/`union` definition, and DWARF
-    /// is emitted after lowering the whole unit, so a local declared with such a
-    /// type would reach the writer as a key the type context no longer knows.
-    /// `TypeGraph::record` answers that with `DW_AT_declaration` and a zero
-    /// size, which is truthful but useless: gdb prints `<incomplete type>` for
-    /// the object and no member can be read (measured on
-    /// `struct { int a, b; } pair = { n, 2 * n };` inside a function body).
+    /// Two jobs, both only for a scope that is about to close:
     ///
-    /// The walk is transitive because a field may itself be a block-scope
-    /// record, and it is bounded by the keys already kept -- a record that
-    /// mentions itself through a pointer therefore terminates.
-    pub(super) fn capture_debug_layouts(&mut self, ty: &CType) {
+    /// * **Give each block-scope record definition a key of its own.**  Two
+    ///   `struct T`s with different members -- one at file scope, one inside a
+    ///   body -- share the source tag `struct.T`, and the DWARF type graph keys
+    ///   its DIEs by that string, so one of the two objects was described with
+    ///   the other's members (measured: gdb printed `{a = 2}` for a local whose
+    ///   type has `a` and `b`).  A definition installed while a lexical scope
+    ///   was open was made inside a body -- the type context records those --
+    ///   so it is described under `struct.T#d<n>`; `record_name` strips at `#`,
+    ///   so the DIE still says `T`, exactly as GCC emits one `T` per
+    ///   definition.
+    /// * **Keep the layout.**  `pop_scope` undoes a block-scope record when the
+    ///   block closes, and DWARF is written after the whole unit is lowered, so
+    ///   a key the context no longer holds would be described as an incomplete
+    ///   declaration: gdb prints `<incomplete type>` and no member can be read
+    ///   (measured on `struct { int a, b; } pair = { n, 2 * n };`).
+    ///
+    /// The recursion is transitive because a field may itself be a block-scope
+    /// record, and it terminates because a key already kept is not visited
+    /// again -- a record that mentions itself through a pointer stops there.
+    pub(super) fn debug_local_type(&mut self, ty: &CType) -> CType {
         if !self.debug_info {
-            return;
+            return ty.clone();
         }
-        let mut pending = vec![ty.clone()];
-        while let Some(ty) = pending.pop() {
-            let key = match &ty {
-                CType::Struct(key) | CType::Union(key) => key.clone(),
-                // A pointer, array or vector type reaches a record through its
-                // element or pointee; the object itself has no layout.
-                CType::Pointer(inner, _)
-                | CType::Array(inner, _)
-                | CType::Vector(inner, _)
-                | CType::ExtVector(inner, _) => {
-                    pending.push(inner.as_ref().clone());
-                    continue;
-                }
-                CType::Function(function) => {
-                    pending.push(function.return_type.clone());
-                    pending.extend(function.params.iter().map(|(ty, _)| ty.clone()));
-                    continue;
-                }
-                _ => continue,
-            };
-            let key = key.to_string();
-            if self.debug_record_layouts.contains_key(&key) {
-                continue;
+        self.debug_type_inner(ty)
+    }
+
+    fn debug_type_inner(&mut self, ty: &CType) -> CType {
+        match ty {
+            // A pointer, array or vector type reaches a record through its
+            // element or pointee; the object itself has no layout.
+            CType::Pointer(inner, quals) => {
+                CType::Pointer(Box::new(self.debug_type_inner(inner)), *quals)
             }
-            let layout = self
-                .types
-                .borrow_struct_layouts()
-                .get(key.as_str())
-                .map(RcLayout::clone);
-            let Some(layout) = layout else {
-                // A forward declaration has no layout to keep, and the writer's
-                // incomplete description is the correct answer for it.
-                continue;
-            };
-            for field in &layout.fields {
-                pending.push(field.ty.clone());
+            CType::Array(inner, count) => {
+                CType::Array(Box::new(self.debug_type_inner(inner)), *count)
             }
-            self.debug_record_layouts.insert(key, layout);
+            CType::Vector(inner, bytes) => {
+                CType::Vector(Box::new(self.debug_type_inner(inner)), *bytes)
+            }
+            CType::ExtVector(inner, layout) => {
+                CType::ExtVector(Box::new(self.debug_type_inner(inner)), *layout)
+            }
+            CType::Function(function) => {
+                let mut rewritten = function.clone();
+                rewritten.return_type = self.debug_type_inner(&function.return_type);
+                for (ty, _) in &mut rewritten.params {
+                    *ty = self.debug_type_inner(ty);
+                }
+                CType::Function(rewritten)
+            }
+            CType::Struct(key) | CType::Union(key) => {
+                let rewritten = match self.debug_record_key(key) {
+                    Some(unique) => unique,
+                    None => key.to_string(),
+                };
+                if !self.debug_record_layouts.contains_key(&rewritten) {
+                    let live = self
+                        .types
+                        .borrow_struct_layouts()
+                        .get(key.as_ref())
+                        .map(RcLayout::clone);
+                    // A forward declaration has no layout to keep, and the
+                    // writer's incomplete description is right for it.
+                    if let Some(layout) = live {
+                        let fields: Vec<CType> =
+                            layout.fields.iter().map(|field| field.ty.clone()).collect();
+                        // Insert before descending: a record that reaches itself
+                        // through a pointer must stop here.
+                        self.debug_record_layouts.insert(rewritten.clone(), layout);
+                        for field in fields {
+                            self.debug_type_inner(&field);
+                        }
+                    }
+                }
+                match ty {
+                    CType::Union(_) => CType::Union(rewritten.as_str().into()),
+                    _ => CType::Struct(rewritten.as_str().into()),
+                }
+            }
+            _ => ty.clone(),
         }
+    }
+
+    /// The debug key for the record `key` currently resolves to, when that
+    /// definition was installed inside a function body.
+    ///
+    /// Identity comes from the allocation: installing a definition stores a
+    /// fresh `Rc`, so two definitions of one tag hold different addresses even
+    /// when their members are equal, and `body_record_layouts` (written when the
+    /// definition was installed) says which of them a body owns.  A record whose
+    /// definition came from file scope keeps its tag, so a local of that type and
+    /// the file-scope objects share one DIE exactly as GCC emits one.
+    fn debug_record_key(&mut self, key: &str) -> Option<String> {
+        // Outside a body every visible record is a file-scope definition and
+        // keeps its tag.
+        self.func_state.as_ref()?;
+        let identity = self.types.body_record_layout_id(key)?;
+        if let Some(existing) = self.debug_record_keys.get(&(key.to_string(), identity)) {
+            return Some(existing.clone());
+        }
+        let unique = format!("{}#d{}", key, self.debug_record_keys.len());
+        self.debug_record_keys
+            .insert((key.to_string(), identity), unique.clone());
+        Some(unique)
     }
 
     /// Insert a struct layout into the cache, tracking the change in the current

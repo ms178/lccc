@@ -22,8 +22,9 @@ over-aligned adjusted homes, `.debug_macro`, `-gz`, split DWARF and
 `.debug_names`. Those remain D6/D8/D9/D11/D12 and the optimized-location tail of
 D1b/D14. The historical census below is kept for provenance, but the current
 acceptance evidence is the dedicated gates: `check_dwarf_parameters.py` (32
-contracts), `check_dwarf_locals.py` (88 contracts including shadowing, GNU
-nested functions, block-scope record types and AArch64/RISC-V structural legs),
+contracts), `check_dwarf_locals.py` (104 contracts including shadowing, GNU
+nested functions, block-scope and shadowed record tags, and AArch64/RISC-V
+structural legs),
 `check_dwarf_delivery.py` (56 contracts,
 including unsupported `-g3`/`-gz`/`-gsplit-dwarf` transport pins), and
 `check_dwarf_quality.py` (30 objects, 0 failures, 2 named optimized gaps).
@@ -88,7 +89,7 @@ python3 tests/regression/check_dwarf_delivery.py --lccc target/fastbuild/lccc \
     --json target/dwarf-delivery.json
 ```
 
-Measured on 2026-11-06: parameters PASS 32, locals PASS 88, delivery PASS 52,
+Measured on 2026-11-06: parameters PASS 32, locals PASS 104, delivery PASS 52,
 quality 30 objects / 0 failures / 2 named optimized gaps. A missing-home mutation
 (disabling the driver's home maps) made the parameter and local gates fail with
 missing-location diagnostics before the implementation was restored.
@@ -266,7 +267,7 @@ fails if it regresses. Sizes are `.debug_info` + `.debug_abbrev` + `.debug_str` 
 | Declarations only for referenced names | measured `extern int q_used` / `extern int q_missing`: GCC describes the first and not the second, and lccc now does the same; the `_IO_FILE` structure and its thirty members left the payload with it |
 | Function parameters | a `DW_TAG_formal_parameter` child per parameter of every defined function, with `DW_AT_name` and a `DW_AT_type` that resolves; `DW_TAG_unspecified_parameters` on a variadic definition |
 | Parameter values at `-O0` | `check_dwarf_parameters.py`: 32 contracts over x86-64/i686 × DWARF 2–5 × direct/`-S`+GAS; GDB reads integer, wide, pointer, double, unsigned, narrow and stack arguments before/after assignment, plus a hidden-sret probe; entry breakpoint must not claim the home |
-| Local values and shadowing at `-O0` | `check_dwarf_locals.py`: 88 contracts; array/struct/volatile locals before/after update, nested `volatile int x` shadowing (inner 17, outer 8), lexical-block parenting, AArch64/RISC-V structural homes, and `-g` code-byte equality |
+| Local values and shadowing at `-O0` | `check_dwarf_locals.py`: 104 contracts; array/struct/volatile locals before/after update, nested `volatile int x` shadowing (inner 17, outer 8), lexical-block parenting, a record tag redefined inside a body, AArch64/RISC-V structural homes, and `-g` code-byte equality |
 | Nested functions and block-scope record types | a GNU nested function's record carries its `DW_TAG_formal_parameter` and its homed locals, and a `struct`/`union` defined inside a body is described completely (`DW_AT_byte_size`, members, no `DW_AT_declaration`), so `print k`, `info locals` and `ptype` work inside `outer.inner`; GDB reads `k = 3`, `m = 12`, `pair.a = 12`, `pair.b = 4` on x86-64/i686 and the structural legs assert the same tree on AArch64/RISC-V |
 | Four-target frame homes | x86-64 rbp=6, i686 ebp=5 (including direct caller-slot homing), AArch64 x29=29, RISC-V s0=8; frameless/RA-only/over-aligned/promoted cases fail closed rather than inventing a location |
 | Debug information changes nothing at run time | with and without `-g -gdwarf-5`, every one of the 86 compilable benchmark objects has byte-identical `.text*` at `-O2`, and the gate re-asserts that identity in every configuration it builds (`code_unchanged`), so a change that leaks from DWARF into code selection fails the gate |
@@ -619,7 +620,7 @@ capability limit, not a guessed location.
 
 **Evidence.** `check_dwarf_locals.py --lccc target/fastbuild/lccc --lccc-arm
 target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv --gcc gcc-16
---gdb "$GDB"`: PASS 88 contracts. The structural leg now also decodes the
+--gdb "$GDB"`: PASS 104 contracts. The structural leg now also decodes the
 `shadow` subprogram's lexical-block DIEs (the earlier loop only inspected
 `locals`, so the tree assertion was skipped). GDB reads inner shadowed `x = 17` and outer
 `x = 8`; the decoder asserts one outer variable under the subprogram and one
@@ -648,12 +649,37 @@ the DWARF looked well-formed, it just described something else.
   read.  The lowerer now copies the layout of every record a `-g` local names
   (transitively) before the scope closes and publishes them once lowering ends.
 
-The shadowed-tag case (`struct T` at file scope and another `struct T` in a body)
-is still described by the file-scope layout, because both definitions share one
-type key and one DIE.  Restoring the block's layout there would move the lie from
-the local to the file-scope object, so the merge leaves an existing key alone;
-describing both needs a per-scope record key, which is a change to how a record
-is named.  Measured on GCC 16.2 (`v = {a = 2, b = 3}` there, `v = {a = 2}` here).
+* *A tag redefined inside a body was described with the file-scope layout.*
+  `struct T` at file scope and another `struct T` in a body share one type key,
+  and installing the body's definition replaces the file-scope layout until the
+  block closes -- so the object was described with the wrong member list:
+  well-formed DWARF pointing at the wrong size (`print v` gave `{a = 2}` where
+  the object held `{a = 2, b = 3}`, and `ptype v` showed one member).  The type
+  context now records the address of every layout it installs while a lexical
+  scope is open, i.e. from inside a body (`body_record_layouts`, one `Rc` clone
+  per definition, kept alive so a later definition cannot reuse the address).
+  The writer asks that table for the layout a local names, and a layout that was
+  installed in a body is described under the internal key `<spelling>#d<n>`;
+  `record_name` truncates at `#`, so the DIE still reads `T`.  Keys are memoised
+  per `(spelling, address)`, so a pointer and an array of the same definition
+  share one DIE, and a layout is inserted before its members are walked so a
+  self-referential definition through a pointer terminates.  A file-scope
+  definition is never marked, so a local that names one shares the file-scope
+  DIE instead of getting a duplicate of it.  The table is cleared when lowering
+  starts -- analysis installs layouts too, and its `Rc`s are not lowering's --
+  and a build without `-g` neither fills nor reads it.
+  Measured at `-O0 -gdwarf-5` on x86-64/i686/AArch64/RISC-V: `v = {a = 2, b = 3}`,
+  `g = {a = 1}`, `ptype v` two members, and `readelf` reports two
+  `DW_TAG_structure_type` DIEs named `T` with byte sizes 8 and 4.  A probe with
+  four `T` shapes at once (file scope, two sibling blocks and a nested function)
+  reads `{a = 10}`, `{a = 2, b = 3}`, `{{a = 4, b = 5}, {a = 6, b = 7}}` and
+  `{s = 9, t = 11}` under GDB -- value for value what GCC 16.2 prints for the
+  same source, including `{a = 0}` when the breakpoint sits on the declaration
+  line in both compilers -- and emits **four** `T` DIEs, the same count GCC
+  emits.  On i686 the second block's `long q` makes its record 4 bytes while the
+  two-`int` block record stays 8, so each definition is laid out by its own
+  target.  The probe's pointer local is still omitted (promoted scalars, the
+  fail-closed case above); GCC describes it, and that stays in the D14 tail.
 
 ### D5 · withdrawn 2026-11-05, re-measured — "one line sequence per function"
 

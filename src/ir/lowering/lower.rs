@@ -47,13 +47,17 @@ pub struct Lowerer {
     pub(super) next_label: u32,
     pub(super) next_string: u32,
     pub(super) next_anon_struct: u32,
+    /// `(record key, layout address)` -> the key its debug DIEs are described
+    /// under.  One entry per body-scope definition, shared by every variable
+    /// that names it.
+    pub(super) debug_record_keys: FxHashMap<(String, usize), String>,
     /// Record layouts a `-g` local or parameter named, kept additively.
     ///
     /// A block-scope `struct`/`union` definition lives in the type context only
     /// while its scope is open -- `pop_scope` removes it -- but DWARF is built
     /// after the whole unit has been lowered.  Copying the layout here, when the
     /// declaration is still live, is what lets the writer describe a local of
-    /// such a type at all; see `capture_debug_layouts`.
+    /// such a type at all; see `debug_local_type`.
     pub(super) debug_record_layouts: FxHashMap<String, crate::common::types::RcLayout>,
     /// Counter for unique static local variable names
     pub(super) next_static_local: u32,
@@ -414,6 +418,7 @@ impl Lowerer {
             next_label: 0,
             next_string: 0,
             next_anon_struct: 0,
+            debug_record_keys: FxHashMap::default(),
             debug_record_layouts: FxHashMap::default(),
             next_static_local: 0,
             module: IrModule::new(),
@@ -1072,6 +1077,15 @@ impl Lowerer {
             }
         }
 
+        // Analysis also installs record layouts while its scopes are open, and
+        // those `Rc`s are not the ones lowering installs.  The table that marks
+        // body-scope definitions is therefore rebuilt from here on; see
+        // `body_record_layouts` and `debug_record_key`.  A build without `-g`
+        // never consults it and pays nothing.
+        if self.debug_info {
+            self.types.start_tracking_body_record_layouts();
+        }
+
         // First pass: collect all function signatures (return types, param types,
         // variadic status, sret) so we can distinguish functions from globals and
         // insert proper casts/ABI handling during lowering.
@@ -1494,18 +1508,14 @@ impl Lowerer {
 
         self.finalize_module_visibility();
 
-        // Publish the block-scope records the `-g` metadata named.  Their scopes
-        // were popped while lowering, and the DWARF type graph is built from
-        // this context after `lower` returns, so a type that is not restored
-        // here is described as an incomplete declaration -- gdb then prints
-        // `<incomplete type>` for the object.
-        //
-        // A key this context still holds is left alone.  That is the shadowed-tag
-        // case (`struct T` at file scope, another `struct T` inside a body): the
-        // two definitions share one key and one DIE, so restoring the block's
-        // layout would move the lie from the local to the file-scope object
-        // rather than remove it.  Describing both needs a per-scope key, which
-        // is a change to how a record is named, not to when it is kept.
+        // Publish the block-scope records the `-g` metadata named, under the keys
+        // `debug_local_type` assigned them.  Their scopes were popped while
+        // lowering and the DWARF type graph is built from this context after
+        // `lower` returns, so a layout that is not restored here is described as
+        // an incomplete declaration -- gdb then prints `<incomplete type>`.
+        // A generated key cannot collide with a live one, and the guard keeps a
+        // future caller that publishes under a source tag from overwriting the
+        // file-scope definition that owns it.
         let captured = std::mem::take(&mut self.debug_record_layouts);
         for (key, layout) in captured {
             if self

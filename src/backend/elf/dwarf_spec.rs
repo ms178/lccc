@@ -1127,6 +1127,82 @@ mod tests {
         assert_eq!(*size, 8);
     }
 
+    fn layout(size: usize, fields: Vec<(&str, CType)>) -> Rc<StructLayout> {
+        Rc::new(StructLayout {
+            is_complete: true,
+            fields: fields
+                .into_iter()
+                .map(|(name, ty)| StructFieldLayout {
+                    written_typedef: None,
+                    name: name.to_string(),
+                    offset: 0,
+                    ty,
+                    bit_offset: None,
+                    bit_width: None,
+                    sso: SsoMode::None,
+                    sso_storage_ty: None,
+                    base_volatile: false,
+                    base_const: false,
+                    object_volatile: false,
+                    object_const: false,
+                    counted_by: None,
+                    pointer_quals: Vec::new(),
+                    own_cvr: None,
+                })
+                .collect(),
+            size,
+            align: 4,
+            is_union: false,
+            is_transparent_union: false,
+            requires_designators: false,
+            reverse_sso: false,
+            user_align: false,
+            member_align: 4,
+        })
+    }
+
+    #[test]
+    fn a_tag_redefined_in_a_body_keeps_its_own_die() {
+        // `struct T { int a; };` at file scope and `struct T { int a, b; };` in a
+        // body are two types with one spelling.  Keying the DIEs by the spelling
+        // merged them, so the inner object was described with the outer members
+        // (gdb: `print v` gave `{a = 2}` for a two-member object).  The lowerer
+        // now spells the body's definition `struct.T#d<n>`; `record_name` strips
+        // the suffix before the writer names the DIE.
+        let mut layouts = empty_layouts();
+        layouts.insert("struct.T".to_string(), layout(4, vec![("a", CType::Int)]));
+        layouts.insert(
+            "struct.T#d0".to_string(),
+            layout(8, vec![("a", CType::Int), ("b", CType::Int)]),
+        );
+        let typedefs = FxHashMap::default();
+        let mut types = graph(&layouts, &typedefs);
+        let outer = types.intern_ctype(&CType::Struct("struct.T".into()));
+        let inner = types.intern_ctype(&CType::Struct("struct.T#d0".into()));
+        let built = types.into_types();
+        assert_ne!(outer, inner, "two definitions are two DIEs");
+        let summarize = |index: u32| match &built[index as usize] {
+            DwarfType::Record {
+                name,
+                complete,
+                size,
+                members,
+                ..
+            } => (name.clone(), *complete, *size, members.len()),
+            other => panic!("expected a record, got {other:?}"),
+        };
+        assert_eq!(summarize(outer), (Some("T".to_string()), true, 4, 1));
+        assert_eq!(summarize(inner), (Some("T".to_string()), true, 8, 2));
+        assert_eq!(record_name("struct.T#d0").as_deref(), Some("T"));
+        assert_eq!(record_name("union.U#d12").as_deref(), Some("U"));
+        assert_eq!(record_name("struct.T").as_deref(), Some("T"));
+        assert_eq!(
+            record_name("struct.__anon_struct_7"),
+            None,
+            "a synthesised tag is never named"
+        );
+    }
+
     #[test]
     fn a_typedef_stays_a_die_of_its_own() {
         let layouts = empty_layouts();

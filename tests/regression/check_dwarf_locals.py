@@ -13,6 +13,13 @@ built without its parameter map, scopes and locals) and a record type defined
 inside a body (whose layout was popped with the block, leaving an incomplete
 declaration of size zero).  Both are ordinary C a user can write today.
 
+A third shape is a record tag redefined inside a body, which shadows the
+file-scope tag of the same name: `struct scoped_tag { int a, b; } shadowed`
+inside `outer` must describe two members while the file-scope
+`struct scoped_tag { int a; }` stays at one.  One layout shared between them
+truncates the inner object to the outer size, so the gate requires the two
+variables to name *different* type DIEs with the right member lists.
+
 Lexical-block ranges and promoted scalar locals are not yet described; the gate
 pins the proven subset so it cannot regress while those are added.
 """
@@ -86,23 +93,33 @@ int main(void) {
 #: as a name it no longer knew.
 SCOPED = r"""
 volatile int scoped_sink;
+struct scoped_tag { int a; };
+struct scoped_tag scoped_file_scope = { 1 };
 __attribute__((noinline)) int outer(int n) {
     int inner(int k) {
         volatile int m = k * n;
         struct { int a, b; } pair = { m, n };
         return pair.a + pair.b; /* nested-inner */
     }
-    int t = inner(3);
+    struct scoped_tag { int a, b; } shadowed = { n, 2 * n };
+    int t = inner(3) + shadowed.a + shadowed.b; /* shadowed-outer */
     scoped_sink = t;
     return t + n;
 }
-int main(void) { return outer(4) == 20 ? 0 : 1; }
+int main(void) { return outer(4) == 32 ? 0 : 1; }
 """
 
 #: The nested function's mangled name, which is also its `LOCAL` symbol.
 NESTED = "outer.inner"
-#: `outer(4)` calls `inner(3)` with `n = 4`: `m = 12` and `pair = {12, 4}`.
-SCOPED_VALUES = {"k": 3, "m": 12, "pair.a": 12, "pair.b": 4}
+#: `outer(4)` calls `inner(3)` with `n = 4`: `m = 12`, `pair = {12, 4}` and the
+#: block-scope `struct scoped_tag shadowed = {4, 8}` that shadows the file-scope
+#: one-member definition.
+#: The two frames are probed at their own markers: the nested function cannot
+#: name its parent's ``shadowed``, and `outer` cannot name the callee's locals.
+SCOPED_INNER_MARKER = "/* nested-inner */"
+SCOPED_OUTER_MARKER = "/* shadowed-outer */"
+SCOPED_INNER_VALUES = {"k": 3, "m": 12, "pair.a": 12, "pair.b": 4}
+SCOPED_OUTER_VALUES = {"shadowed.a": 4, "shadowed.b": 8, "shadowed": "{a = 4, b = 8}"}
 
 LOCALS = ("array", "s", "v")
 SHADOW_INNER = 17
@@ -180,19 +197,20 @@ quit
     return values[0].strip(), values[1].strip()
 
 
-def scoped_marker_line(marker: str = "/* nested-inner */") -> int:
+def scoped_marker_line(marker: str = SCOPED_INNER_MARKER) -> int:
     for number, line in enumerate(SCOPED.splitlines(), 1):
         if marker in line:
             return number
     raise ValueError(f"scoped probe lost {marker}")
 
 
-def gdb_scoped(gdb: str, exe: Path, cwd: Path, source_name: str) -> dict[str, str]:
-    expressions = list(SCOPED_VALUES)
+def gdb_scoped(
+    gdb: str, exe: Path, cwd: Path, source_name: str, marker: str, expressions
+) -> dict[str, str]:
     prints = "\n".join(f"print {expr}" for expr in expressions)
     script = f"""set pagination off
 set confirm off
-break {source_name}:{scoped_marker_line()}
+break {source_name}:{scoped_marker_line(marker)}
 run
 {prints}
 quit
@@ -299,8 +317,102 @@ def check_scoped(label: str, path: Path) -> None:
             fail(f"{label}/nested", f"pair's struct members are {members}, expected ['a', 'b']")
     if not described:
         fail(f"{label}/nested", f"no subprogram DIE named {NESTED}")
+    check_shadowed_tag(label, elf)
     if report.failures:
         fail(label + "/nested", "; ".join(str(failure) for failure in report.failures))
+
+
+def _subtree(unit, die):
+    """`die` and every DIE nested under it, in pre-order."""
+    yield die
+    for kid in children(unit, die):
+        yield from _subtree(unit, kid)
+
+
+def _variable(unit, name):
+    return next(
+        (die for die in unit.dies
+         if die.tag == DW_TAG_VARIABLE and die_name(die, unit) == name),
+        None,
+    )
+
+
+def _members(unit, record):
+    return sorted(
+        die_name(member, unit)
+        for member in children(unit, record)
+        if member.tag == DW_TAG_MEMBER
+    )
+
+
+def check_shadowed_tag(label: str, elf) -> None:
+    """A tag redefined inside a body keeps its own layout.
+
+    The two definitions disagree: the file scope declares one `int`, the body
+    declares two.  Differential debugging is the only way to see the bug -- the
+    DWARF is well formed either way, and the program computes the same answer;
+    only the object reads wrong (`shadowed.b` prints the neighbouring slot, or
+    the whole value prints truncated to the file-scope size).  Therefore the
+    gate requires separate DIEs, each with its own member list and size.
+    """
+    described = False
+    for unit in units(elf):
+        block = _variable(unit, "shadowed")
+        outer = _variable(unit, "scoped_file_scope")
+        if block is None or outer is None:
+            continue
+        described = True
+        block_offset = block.attrs.get(DW_AT_TYPE)
+        outer_offset = outer.attrs.get(DW_AT_TYPE)
+        block_record = unit.die_at(block_offset) if isinstance(block_offset, int) else None
+        outer_record = unit.die_at(outer_offset) if isinstance(outer_offset, int) else None
+        for name, record in (("shadowed", block_record), ("scoped_file_scope", outer_record)):
+            if record is None:
+                fail(f"{label}/shadowed-tag", f"{name} names no type DIE")
+            if record.tag != DW_TAG_STRUCTURE_TYPE:
+                fail(f"{label}/shadowed-tag",
+                     f"{name}'s type is tag {record.tag:#x}, not a structure")
+            if DW_AT_DECLARATION in record.attrs:
+                fail(f"{label}/shadowed-tag",
+                     f"{name}'s type is a declaration, so the object cannot be inspected")
+        # Both definitions spell the tag identically; the suffix that tells them
+        # apart is internal and must not reach the DIE.
+        for record in (block_record, outer_record):
+            if die_name(record, unit) != "scoped_tag":
+                fail(f"{label}/shadowed-tag",
+                     f"type DIE is named {die_name(record, unit)!r}, expected 'scoped_tag'")
+        if block_record.offset == outer_record.offset:
+            fail(f"{label}/shadowed-tag",
+                 "the block-scope and file-scope tags share one type DIE, so the "
+                 "inner object is described with the outer layout")
+        size = block_record.attrs.get(DW_AT_BYTE_SIZE)
+        if size != 8:
+            fail(f"{label}/shadowed-tag",
+                 f"shadowed says DW_AT_byte_size {size}, expected 8 (two ints)")
+        members = _members(unit, block_record)
+        if members != ["a", "b"]:
+            fail(f"{label}/shadowed-tag",
+                 f"shadowed's members are {members}, expected ['a', 'b']")
+        size = outer_record.attrs.get(DW_AT_BYTE_SIZE)
+        if size != 4:
+            fail(f"{label}/shadowed-tag",
+                 f"scoped_file_scope says DW_AT_byte_size {size}, expected 4")
+        members = _members(unit, outer_record)
+        if members != ["a"]:
+            fail(f"{label}/shadowed-tag",
+                 f"scoped_file_scope's members are {members}, expected ['a']")
+        # Exactly one DIE per definition: a local that reuses the file-scope type
+        # must share its DIE, not get a second copy of the same layout.
+        named = [
+            die for die in unit.dies
+            if die.tag == DW_TAG_STRUCTURE_TYPE and die_name(die, unit) == "scoped_tag"
+        ]
+        if len(named) != 2:
+            fail(f"{label}/shadowed-tag",
+                 f"{len(named)} DIEs are named 'scoped_tag', expected exactly 2 "
+                 "(one per definition)")
+    if not described:
+        fail(f"{label}/shadowed-tag", "probe lost its shadowed-tag objects")
 
 
 def check_locations(label: str, path: Path) -> None:
@@ -435,13 +547,26 @@ def check_mode(lccc: str, gcc: str, gdb: str | None, bits: int, version: int, ro
     check_scoped(label + "/gas", via_obj)
     if gdb:
         for candidate in (scoped_exe,):
-            values = gdb_scoped(gdb, candidate, work, scoped_source.name)
-            for expr, expected in SCOPED_VALUES.items():
-                if gdb_number(values[expr]) != expected:
-                    fail(
-                        label + "/gdb-scoped",
-                        f"{expr} = {values[expr]}, expected {expected}",
-                    )
+            for marker, expected_values in (
+                (SCOPED_INNER_MARKER, SCOPED_INNER_VALUES),
+                (SCOPED_OUTER_MARKER, SCOPED_OUTER_VALUES),
+            ):
+                values = gdb_scoped(
+                    gdb, candidate, work, scoped_source.name, marker, expected_values
+                )
+                for expr, expected in expected_values.items():
+                    observed = values[expr]
+                    if isinstance(expected, str):
+                        if observed != expected:
+                            fail(
+                                label + "/gdb-scoped",
+                                f"{expr} = {observed}, expected {expected}",
+                            )
+                    elif gdb_number(observed) != expected:
+                        fail(
+                            label + "/gdb-scoped",
+                            f"{expr} = {observed}, expected {expected}",
+                        )
     for level in ("-O0", "-O2"):
         plain = work / f"scoped-plain{level}.o"
         debug = work / f"scoped-debug{level}.o"
@@ -453,7 +578,7 @@ def check_mode(lccc: str, gcc: str, gdb: str | None, bits: int, version: int, ro
         if code_sections(read_elf(plain)) != code_sections(read_elf(debug)):
             fail(label + level + "/scoped",
                  "-g changed code bytes; debug info must be free at runtime")
-    return 8 if gdb else 6
+    return 9 if gdb else 7
 
 
 def check_cross(lccc: str, label: str, version: int, root: Path) -> int:
@@ -490,7 +615,7 @@ def check_cross(lccc: str, label: str, version: int, root: Path) -> int:
     if result.returncode != 0:
         fail(label + "/scoped", result.stderr)
     check_scoped(f"{label}-v{version}", scoped_obj)
-    return 3
+    return 4
 
 
 def main() -> int:
