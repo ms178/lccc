@@ -10762,6 +10762,8 @@ impl ArchCodegen for X86Codegen {
         fn emit_prologue(&mut self, func: &IrFunction, frame_size: i64) => emit_prologue_impl;
         fn emit_epilogue(&mut self, frame_size: i64) => emit_epilogue_impl;
         fn emit_store_params(&mut self, func: &IrFunction) => emit_store_params_impl;
+        fn take_debug_parameter_offsets(&mut self) -> Vec<Option<i32>> => take_debug_parameter_offsets_impl;
+        fn take_debug_frame_facts(&mut self) -> crate::backend::debug_frame::DebugFrameFacts => take_debug_frame_facts_impl;
         fn emit_param_ref(&mut self, dest: &Value, param_idx: usize, ty: IrType) => emit_param_ref_impl;
         fn emit_epilogue_and_ret(&mut self, frame_size: i64) => emit_epilogue_and_ret_impl;
         fn store_instr_for_type(&self, ty: IrType) -> &'static str => store_instr_for_type_impl;

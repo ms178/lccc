@@ -4624,6 +4624,71 @@ impl X86Codegen {
                 }
             }
         }
+
+        // ── `-g`: the parameter homes the frame can promise ────────────────
+        //
+        // The DWARF writer describes a parameter's value with one expression,
+        // compiled once for the whole function, so the expression may only name a
+        // place whose address is a constant of the layout. Two facts make that
+        // true here: the frame pointer is established (`push %rbp; mov %rsp,
+        // %rbp`), so a slot's address never moves, and the canonical frame
+        // address is `%rbp + 16` -- the return address and the saved `%rbp` --
+        // for the whole body, including the epilogue (`.cfi_def_cfa` keeps
+        // describing it after `pop %rbp`). A `-fomit-frame-pointer` function has
+        // no such anchor: its slots are spelled from a `%rsp` the call staging
+        // windows move, so no single displacement is true everywhere and nothing
+        // is reported.
+        {
+            let slots: Vec<Option<i64>> = self
+                .state
+                .param_alloca_slots
+                .iter()
+                .map(|entry| entry.map(|(slot, _, _)| slot.0))
+                .collect();
+            // A run-time-aligned alloca (align > 16) sits above its raw slot: the
+            // slot is a bound, not the object.
+            let over_aligned: Vec<bool> = self
+                .state
+                .param_alloca_slots
+                .iter()
+                .map(|entry| {
+                    entry.is_some_and(|(_, _, id)| self.state.alloca_over_align(id).is_some())
+                })
+                .collect();
+            // The vector-direct entry prefix moves the incoming `%xmm`/`%ymm`
+            // straight into the value's register home and leaves the alloca slot
+            // unread (`x86_vector_param_loads`). Its slot holds stale bytes, so no
+            // expression may name it.
+            let slot_dead: Vec<bool> = (0..func.params.len())
+                .map(|index| vector_direct.get(index).copied().flatten().is_some())
+                .collect();
+            let bias = (!self.state.omit_frame_pointer).then_some(16);
+            // A struct-returning function carries the return buffer as its first
+            // IR parameter; the DWARF list is the source's parameter list, so the
+            // hidden one is skipped.
+            let skip = usize::from(func.uses_sret);
+            self.state.debug_param_homes = crate::backend::debug_frame::parameter_homes(
+                bias,
+                skip,
+                &slots,
+                &over_aligned,
+                &slot_dead,
+            );
+        }
+    }
+
+    /// `-g`: the parameter homes [`Self::emit_store_params_impl`] just proved.
+    /// Taken, not cloned: the writer is the only consumer and it runs once.
+    pub(super) fn take_debug_parameter_offsets_impl(&mut self) -> Vec<Option<i32>> {
+        std::mem::take(&mut self.state.debug_param_homes)
+    }
+
+    /// `-g`: hand the accumulated frame facts to the driver, which is the only
+    /// layer that knows both the code generator and the DWARF writer.
+    pub(super) fn take_debug_frame_facts_impl(
+        &mut self,
+    ) -> crate::backend::debug_frame::DebugFrameFacts {
+        std::mem::take(&mut self.state.debug_frames)
     }
 
     pub(super) fn emit_param_ref_impl(&mut self, dest: &Value, param_idx: usize, ty: IrType) {

@@ -2461,7 +2461,7 @@ impl Driver {
         if self.whole_program && !self.relocatable {
             crate::ir::whole_program::internalize_module(&mut module, false);
         }
-        let asm = self.compile_ir_module_to_assembly(
+        let (asm, frame_facts) = self.compile_ir_module_to_assembly(
             module,
             source_manager.as_ref(),
             input_file,
@@ -2471,6 +2471,13 @@ impl Driver {
             time_phases,
             t0,
         )?;
+        // `-g`: the parameter homes the code generator proved join the unit spec
+        // here, because this is the one place that holds both the analysis's
+        // description of a function and the frame the code generator gave it.
+        let mut debug_unit = debug_unit;
+        if let Some(spec) = debug_unit.as_mut() {
+            spec.apply_frame_facts(&frame_facts);
+        }
         Ok(CompiledUnit { asm, debug_unit })
     }
 
@@ -2597,6 +2604,10 @@ impl Driver {
                 described.push(crate::backend::elf::DwarfParameter {
                     name: parameter_name.clone(),
                     ty: graph.intern_written(ty, alias),
+                    // Filled in by `apply_frame_facts` once the code generator
+                    // has laid the frame out; the analysis runs before any frame
+                    // exists, so nothing here can know where the value lives.
+                    location: None,
                 });
             }
             if described.is_empty() && !info.variadic {
@@ -2632,6 +2643,9 @@ impl Driver {
         }
         let mut merged = crate::ir::whole_program::merge_modules(modules)?;
         crate::ir::whole_program::internalize_module(&mut merged, false);
+        // `-g`: a whole-program module has no per-unit spec to attach frame facts
+        // to (the DIE tree of this path is statement-level only), so the facts are
+        // dropped rather than described against the wrong unit.
         self.compile_ir_module_to_assembly(
             merged,
             None,
@@ -2642,6 +2656,7 @@ impl Driver {
             time_phases,
             t0,
         )
+        .map(|(asm, _facts)| asm)
     }
 
     fn parse_and_analyze_c_tu(
@@ -3036,7 +3051,7 @@ impl Driver {
         tune: crate::backend::x86::cpu_model::X86Tune,
         time_phases: bool,
         t0: std::time::Instant,
-    ) -> Result<String, String> {
+    ) -> Result<(String, crate::backend::debug_frame::DebugFrameFacts), String> {
         let (module, pgo_unit) = self.optimize_ir_module(
             module,
             input_file,
@@ -4309,7 +4324,7 @@ impl Driver {
         tune: crate::backend::x86::cpu_model::X86Tune,
         time_phases: bool,
         t0: std::time::Instant,
-    ) -> Result<String, String> {
+    ) -> Result<(String, crate::backend::debug_frame::DebugFrameFacts), String> {
         if let Some(diagnostic) = unsettled_x86_requirement(module) {
             return Err(format!("{input_file}: {diagnostic}"));
         }
@@ -4456,7 +4471,7 @@ impl Driver {
             zero_call_used_regs: self.zero_call_used_regs,
             zero_call_used_regs_fp_simd: self.resolved_zero_call_used_regs_fp_simd(),
         };
-        let asm = self.target.generate_assembly_with_opts_and_debug(
+        let (asm, frame_facts) = self.target.generate_assembly_with_opts_and_debug(
             module,
             &opts,
             source_manager.map(|sm| &**sm),
@@ -4532,7 +4547,7 @@ impl Driver {
             _ => asm,
         };
 
-        Ok(asm)
+        Ok((asm, frame_facts))
     }
 }
 

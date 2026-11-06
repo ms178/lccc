@@ -1823,6 +1823,93 @@ impl I686Codegen {
         // scratch moves overwrite %ecx/%edx before an alloca-slot capture
         // further down the parameter list read them.
         self.resolve_incoming_reg_moves(&mut fc_reg_moves);
+
+        // ── `-g`: the parameter homes the frame can promise ────────────────
+        //
+        // Same contract as the x86-64 backend (see its `emit_store_params_impl`)
+        // with the 32-bit frame record: `push %ebp; mov %esp, %ebp` establishes
+        // the anchor, and the canonical frame address is `%ebp + 8` (the return
+        // address alone -- `%esp` is four bytes wide), which `.cfi_def_cfa` keeps
+        // describing for the whole body.
+        //
+        // An omitted frame pointer is refused for the same reason as on x86-64,
+        // and it is refused *after* `emit_prologue` has made the final decision,
+        // so a function that asked for `-fomit-frame-pointer` but kept the frame
+        // pointer (fastcall stack cleanup, `__builtin_frame_address`, a dynamic
+        // alloca) still reports its slots.
+        //
+        // i686 has no vector-direct parameter prefix: every parameter with an
+        // alloca slot reaches it through the IR homing store, which the prologue
+        // capture (`%eax`/`%edx`/`%ecx`, `fastcall` slots, the conflict-slot
+        // machinery) always feeds. The remaining refusal is the run-time-aligned
+        // alloca, whose raw slot is a bound rather than the object.
+        {
+            // Where a parameter's storage actually is depends on how the store
+            // phase above homed it, and the two cases are different objects:
+            //
+            // * **Directly homed** (`param_direct_homes`): the callee reads and
+            //   writes the caller's argument slot itself -- the i386 psABI gives
+            //   it that ownership -- so `&p` *is* `%ebp + 8 + k` and the frame
+            //   slot the IR names is an alias of that area with no bytes of its
+            //   own. Measured at `-O0`: `&a == %ebp + 8` holds for a parameter
+            //   written directly, written through its address and merely read,
+            //   and the incoming slot holds the new value afterwards. GCC 16.2
+            //   states exactly that offset (`fbreg 0`, `fbreg 4`, ...), so the
+            //   home is the incoming offset and not the slot.
+            // * **Copied into its frame slot**: the prologue stored the argument
+            //   there and every use reads that copy, so the copy is the home.
+            //
+            // Naming the slot in the first case would point a consumer at frame
+            // bytes nothing ever writes -- a confident garbage value, the one
+            // failure mode a location must never have.
+            let slots: Vec<Option<i64>> = self
+                .state
+                .param_alloca_slots
+                .iter()
+                .map(|entry| {
+                    entry.map(|(slot, _, _)| {
+                        self.param_direct_homes
+                            .get(&slot.0)
+                            .map_or(slot.0, |&(incoming, _)| incoming)
+                    })
+                })
+                .collect();
+            let over_aligned: Vec<bool> = self
+                .state
+                .param_alloca_slots
+                .iter()
+                .map(|entry| {
+                    entry.is_some_and(|(_, _, id)| self.state.alloca_over_align(id).is_some())
+                })
+                .collect();
+            let slot_dead = vec![false; slots.len()];
+            let bias = (!self.state.omit_frame_pointer).then_some(8);
+            // A struct-returning function carries the return buffer as its first
+            // IR parameter; the DWARF list is the source's parameter list, so the
+            // hidden one is skipped.
+            let skip = usize::from(func.uses_sret);
+            self.state.debug_param_homes = crate::backend::debug_frame::parameter_homes(
+                bias,
+                skip,
+                &slots,
+                &over_aligned,
+                &slot_dead,
+            );
+        }
+    }
+
+    /// `-g`: the parameter homes [`Self::emit_store_params_impl`] just proved.
+    /// Taken, not cloned: the writer is the only consumer and it runs once.
+    pub(super) fn take_debug_parameter_offsets_impl(&mut self) -> Vec<Option<i32>> {
+        std::mem::take(&mut self.state.debug_param_homes)
+    }
+
+    /// `-g`: hand the accumulated frame facts to the driver, which is the only
+    /// layer that knows both the code generator and the DWARF writer.
+    pub(super) fn take_debug_frame_facts_impl(
+        &mut self,
+    ) -> crate::backend::debug_frame::DebugFrameFacts {
+        std::mem::take(&mut self.state.debug_frames)
     }
 
     // ---- emit_param_ref ----
