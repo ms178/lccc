@@ -47,6 +47,14 @@ pub struct Lowerer {
     pub(super) next_label: u32,
     pub(super) next_string: u32,
     pub(super) next_anon_struct: u32,
+    /// Record layouts a `-g` local or parameter named, kept additively.
+    ///
+    /// A block-scope `struct`/`union` definition lives in the type context only
+    /// while its scope is open -- `pop_scope` removes it -- but DWARF is built
+    /// after the whole unit has been lowered.  Copying the layout here, when the
+    /// declaration is still live, is what lets the writer describe a local of
+    /// such a type at all; see `capture_debug_layouts`.
+    pub(super) debug_record_layouts: FxHashMap<String, crate::common::types::RcLayout>,
     /// Counter for unique static local variable names
     pub(super) next_static_local: u32,
     pub(super) module: IrModule,
@@ -406,6 +414,7 @@ impl Lowerer {
             next_label: 0,
             next_string: 0,
             next_anon_struct: 0,
+            debug_record_layouts: FxHashMap::default(),
             next_static_local: 0,
             module: IrModule::new(),
             func_state: None,
@@ -1484,6 +1493,31 @@ impl Lowerer {
         self.module.noplt_symbols.extend(noplt_symbols);
 
         self.finalize_module_visibility();
+
+        // Publish the block-scope records the `-g` metadata named.  Their scopes
+        // were popped while lowering, and the DWARF type graph is built from
+        // this context after `lower` returns, so a type that is not restored
+        // here is described as an incomplete declaration -- gdb then prints
+        // `<incomplete type>` for the object.
+        //
+        // A key this context still holds is left alone.  That is the shadowed-tag
+        // case (`struct T` at file scope, another `struct T` inside a body): the
+        // two definitions share one key and one DIE, so restoring the block's
+        // layout would move the lie from the local to the file-scope object
+        // rather than remove it.  Describing both needs a per-scope key, which
+        // is a change to how a record is named, not to when it is kept.
+        let captured = std::mem::take(&mut self.debug_record_layouts);
+        for (key, layout) in captured {
+            if self
+                .types
+                .borrow_struct_layouts()
+                .contains_key(key.as_str())
+            {
+                continue;
+            }
+            self.types
+                .insert_struct_layout_from_ref(&key, layout.as_ref().clone());
+        }
         (self.module, self.diagnostics.into_inner(), self.types)
     }
 

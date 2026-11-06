@@ -564,6 +564,9 @@ impl Lowerer {
             && let Some(ty) = local_info.var.c_type.clone()
             && let Some(&scope) = self.func().debug_scope_stack.last()
         {
+            // Keep any block-scope record this type names before its scope is
+            // popped: DWARF is written after lowering, when the layout is gone.
+            self.capture_debug_layouts(&ty);
             self.func_mut()
                 .debug_locals
                 .push(crate::ir::module::DebugLocal {

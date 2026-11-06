@@ -1040,7 +1040,7 @@ impl Lowerer {
     /// Physical IR parameter -> original C parameter index, for D1b homes.
     /// Hidden sret and ABI-decomposed pieces have no single source object and
     /// map to `None`; the writer fails closed rather than naming the wrong slot.
-    fn debug_param_indices(info: &IrParamBuildResult) -> Vec<Option<usize>> {
+    pub(super) fn debug_param_indices(info: &IrParamBuildResult) -> Vec<Option<usize>> {
         let mut indices = vec![None; info.params.len()];
         for (original, kind) in info.param_kinds.iter().enumerate() {
             match kind {
