@@ -1596,6 +1596,9 @@ fn dump_helper(
         ty: IrType::I32,
     });
     let f = IrFunction {
+        debug_param_indices: Vec::new(),
+        debug_locals: Vec::new(),
+        debug_scopes: Vec::new(),
         pass_policy: Default::default(),
         name: name.into(),
         return_type: IrType::I32,
@@ -1671,6 +1674,9 @@ fn dump_helper(
     ] {
         if !m.functions.iter().any(|f| f.name == n) {
             m.functions.push(IrFunction {
+                debug_param_indices: Vec::new(),
+                debug_locals: Vec::new(),
+                debug_scopes: Vec::new(),
                 pass_policy: Default::default(),
                 name: n.into(),
                 return_type: t,
@@ -1964,6 +1970,9 @@ fn push_helper_fn(
         .map(|x| x + 1)
         .unwrap_or(label_base + 1);
     m.functions.push(IrFunction {
+        debug_param_indices: Vec::new(),
+        debug_locals: Vec::new(),
+        debug_scopes: Vec::new(),
         pass_policy: Default::default(),
         name: name.into(),
         return_type: IrType::I32,

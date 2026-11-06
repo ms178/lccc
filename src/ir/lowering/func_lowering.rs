@@ -146,7 +146,14 @@ impl Lowerer {
 
         // Step 7: Finalize
         let uses_sret = param_info.uses_sret;
-        self.finalize_function(func, return_type, param_info.params, uses_sret);
+        let debug_param_indices = Self::debug_param_indices(&param_info);
+        self.finalize_function(
+            func,
+            return_type,
+            param_info.params,
+            uses_sret,
+            debug_param_indices,
+        );
         self.func_no_sanitize = prev_no_sanitize;
     }
 
@@ -1030,12 +1037,29 @@ impl Lowerer {
     }
 
     /// Finalize a function: add implicit return, build IrFunction, push to module.
+    /// Physical IR parameter -> original C parameter index, for D1b homes.
+    /// Hidden sret and ABI-decomposed pieces have no single source object and
+    /// map to `None`; the writer fails closed rather than naming the wrong slot.
+    fn debug_param_indices(info: &IrParamBuildResult) -> Vec<Option<usize>> {
+        let mut indices = vec![None; info.params.len()];
+        for (original, kind) in info.param_kinds.iter().enumerate() {
+            match kind {
+                ParamKind::Normal(index)
+                | ParamKind::Struct(index)
+                | ParamKind::ComplexFloatPacked(index) => indices[*index] = Some(original),
+                ParamKind::ExtVectorDecomposed(_) | ParamKind::ExtVectorXmm(_) => {}
+            }
+        }
+        indices
+    }
+
     fn finalize_function(
         &mut self,
         func: &FunctionDef,
         return_type: IrType,
         params: Vec<IrParam>,
         uses_sret: bool,
+        debug_param_indices: Vec<Option<usize>>,
     ) {
         if !self.func_mut().instrs.is_empty()
             || self.func_mut().blocks.is_empty()
@@ -1165,6 +1189,9 @@ impl Lowerer {
         });
 
         let ir_func = IrFunction {
+            debug_param_indices,
+            debug_locals: std::mem::take(&mut self.func_mut().debug_locals),
+            debug_scopes: std::mem::take(&mut self.func_mut().debug_scopes),
             pass_policy: Default::default(),
             // GCC __asm__("symbol") asm labels: a function DEFINITION must be
             // emitted under the asm label, not its C name. The declaration

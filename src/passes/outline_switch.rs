@@ -883,6 +883,9 @@ fn build_outlined_function(
     let outlined_next_label = outlined_blocks.iter().map(|b| b.label.0).max().unwrap_or(0) + 1;
 
     IrFunction {
+        debug_param_indices: Vec::new(),
+        debug_locals: Vec::new(),
+        debug_scopes: Vec::new(),
         pass_policy: func.pass_policy,
         name: name.to_string(),
         return_type,

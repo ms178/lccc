@@ -925,7 +925,27 @@ def build_baseline(result, rows, configs, names):
     # enforced count ratchet is host-independent, but the verdict/debt columns
     # are comparisons against whatever oracle was installed, so provenance is
     # part of the data, not a comment that --update-baseline can drop.
-    base["provenance"] = {"recorded_with": dict(result["toolchains"])}
+    # `recorded_with` alone is not enough: the human-readable note used to be
+    # dropped on regeneration, so a matrix re-derived against a NEW oracle
+    # looked exactly like one that still carried the old measurement debt.
+    # Derive the note from the banner that actually produced the data, and
+    # keep a machine-readable `rederived_with` field the corpus can pin to
+    # the installer's live Clang version.
+    toolchains = dict(result["toolchains"])
+    clang_banner = toolchains.get("clang", "")
+    version = re.search(r"clang version ([0-9]+\.[0-9]+\.[0-9]+)", clang_banner)
+    clang_version = version.group(1) if version else "unavailable"
+    base["provenance"] = {
+        "recorded_with": toolchains,
+        "rederived_with": {"clang": clang_version},
+        "note": (
+            f"Measured with Clang {clang_version}. Re-derive against the live "
+            "Clang pin with --update-baseline on a host carrying that oracle. "
+            "The enforced lccc instruction-count ratchet is host-independent; "
+            "the debt and verdict columns are comparisons against the recorded "
+            "oracles and are only valid for those exact builds."
+        ),
+    }
     for r in rows:
         e = result["rows"][r.mnemonic]
         for cfg in configs:

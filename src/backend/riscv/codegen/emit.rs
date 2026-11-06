@@ -828,6 +828,13 @@ impl RiscvCodegen {
 }
 
 impl ArchCodegen for RiscvCodegen {
+    fn debug_frame_home(&self, slot: crate::backend::state::StackSlot) -> Option<(u8, i64)> {
+        // The ordinary prologue sets s0 (DWARF fp, register 8) to the top of
+        // the frame and every stack slot is an s0-relative displacement.  The
+        // frameless leaf and RA-only TLS frames never establish s0.
+        (!self.frameless_leaf && !self.ra_only_frame).then_some((8, slot.0))
+    }
+
     /// Provenance markers for user inline-asm bodies: `#APP`/`#NO_APP`, as
     /// GCC emits them.  `#` starts a comment in RISC-V GAS syntax (and in
     /// the built-in assembler), so the markers are invisible to assemblers

@@ -113,6 +113,8 @@ pub struct Lowerer {
     /// (unit tests) keeps the optimizing tier's behaviour; the driver always
     /// sets the real level with [`Self::with_optimization_level`].
     pub(super) optimization_level: u32,
+    /// `-g`: record local-variable/lexical-block metadata for the DWARF writer.
+    pub(super) debug_info: bool,
     /// Set while lowering a top-level expression whose result is discarded
     /// (expression statement, for-increment), so a discarded post-inc/dec can
     /// skip its volatile old-value spill.
@@ -307,6 +309,12 @@ impl Lowerer {
         self
     }
 
+    /// Tell lowering to keep source-level local/lexical metadata for `-g`.
+    pub(crate) fn with_debug_info(mut self, enabled: bool) -> Self {
+        self.debug_info = enabled;
+        self
+    }
+
     pub(crate) fn with_trapv(mut self, trapv: bool) -> Self {
         self.trapv = trapv;
         self
@@ -419,6 +427,7 @@ impl Lowerer {
             pure_functions: FxHashSet::default(),
             const_functions: FxHashSet::default(),
             optimization_level: 2,
+            debug_info: false,
             discard_expr_result: false,
             lvalue_for_mutation: false,
             discard_assign_result: false,
@@ -1010,7 +1019,7 @@ impl Lowerer {
         }
     }
 
-    pub fn lower(mut self, tu: &TranslationUnit) -> (IrModule, DiagnosticEngine) {
+    pub fn lower(mut self, tu: &TranslationUnit) -> (IrModule, DiagnosticEngine, TypeContext) {
         // Sema has already populated TypeContext with typedefs, enum constants,
         // struct/union layouts, function typedefs, and function pointer typedefs.
         // We only need to seed target-dependent builtin typedefs (va_list, size_t, etc.)
@@ -1478,7 +1487,7 @@ impl Lowerer {
         self.module.noplt_symbols.extend(noplt_symbols);
 
         self.finalize_module_visibility();
-        (self.module, self.diagnostics.into_inner())
+        (self.module, self.diagnostics.into_inner(), self.types)
     }
 
     fn finalize_module_visibility(&mut self) {

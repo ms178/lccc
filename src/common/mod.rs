@@ -34,3 +34,4 @@ pub(crate) mod x86_builtin_types;
 pub(crate) mod x86_features;
 
 pub(crate) mod pass_policy;
+pub(crate) mod path_map;

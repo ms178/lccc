@@ -305,10 +305,25 @@ jobs:
           --gcc gcc-16 \
           --json regression-dbgassert-results.json 2>&1 | tee regression-dbgassert-results.log
     - name: Upload regression results
+      id: upload_debug_regression_results
       if: always()
+      continue-on-error: true
       uses: actions/upload-artifact@v7
       with:
         name: debug-regression-results
+        path: |-
+          regression-dbgassert-results.json
+          regression-dbgassert-results.log
+        if-no-files-found: warn
+    - name: Wait for artifact service recovery
+      if: always() && steps.upload_debug_regression_results.outcome == 'failure'
+      run: sleep 10
+    - name: Retry regression results upload after transient artifact-service failure
+      if: always() && steps.upload_debug_regression_results.outcome == 'failure'
+      uses: actions/upload-artifact@v7
+      with:
+        name: debug-regression-results
+        overwrite: true
         path: |-
           regression-dbgassert-results.json
           regression-dbgassert-results.log
@@ -454,10 +469,26 @@ jobs:
                 print(f"::error title=Regression {name} ({phases})::{detail[:1500]}")
         PY
     - name: Upload regression results
+      id: upload_normal_regression_results
       if: always()
+      continue-on-error: true
       uses: actions/upload-artifact@v7
       with:
         name: normal-regression-results
+        path: |-
+          regression-results.json
+          regression-results.log
+          ci-regression-environment.txt
+        if-no-files-found: warn
+    - name: Wait for artifact service recovery
+      if: always() && steps.upload_normal_regression_results.outcome == 'failure'
+      run: sleep 10
+    - name: Retry regression results upload after transient artifact-service failure
+      if: always() && steps.upload_normal_regression_results.outcome == 'failure'
+      uses: actions/upload-artifact@v7
+      with:
+        name: normal-regression-results
+        overwrite: true
         path: |-
           regression-results.json
           regression-results.log
@@ -536,7 +567,7 @@ jobs:
     - name: Install the GCC 16.2 oracle
       run: bash scripts/ci_install_gcc_oracle.sh --version 16.2
     - name: Verify the lane's oracle toolchain
-      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5
+      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5 --require gcc,multilib,valgrind,pyyaml,gdb
     - name: Select GCC 16 for legacy oracle invocations
       run: |
         mkdir -p "$RUNNER_TEMP/lccc-oracles"
@@ -821,7 +852,7 @@ jobs:
     - name: Install the GCC 16.2 oracle
       run: bash scripts/ci_install_gcc_oracle.sh --version 16.2
     - name: Verify the lane's oracle toolchain
-      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5
+      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5 --require gcc,multilib,valgrind,pyyaml,gdb
     - name: Select GCC 16 for legacy oracle invocations
       run: |
         mkdir -p "$RUNNER_TEMP/lccc-oracles"
@@ -1017,6 +1048,20 @@ jobs:
         --lccc target/fastbuild/lccc --gcc gcc-16 \
         --json "$RUNNER_TEMP/dwarf-quality.json" \
         --markdown "$RUNNER_TEMP/dwarf-quality.md"
+        run_gate dwarf_delivery python3 tests/regression/check_dwarf_delivery.py \
+        --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 \
+        --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv \
+        --gcc gcc-16 --gdb gdb --json "$RUNNER_TEMP/dwarf-delivery.json"
+        run_gate dwarf_quality_selftest python3 tests/regression/check_dwarf_quality.py --self-test
+        run_gate dwarf_parameters_selftest python3 tests/regression/check_dwarf_parameters.py --self-test
+        run_gate dwarf_parameters python3 tests/regression/check_dwarf_parameters.py \
+        --lccc target/fastbuild/lccc --gcc gcc-16 --gdb gdb \
+        --json "$RUNNER_TEMP/dwarf-parameters.json"
+        run_gate dwarf_locals_selftest python3 tests/regression/check_dwarf_locals.py --self-test
+        run_gate dwarf_locals python3 tests/regression/check_dwarf_locals.py \
+          --lccc target/fastbuild/lccc --lccc-arm target/fastbuild/lccc-arm \
+          --lccc-riscv target/fastbuild/lccc-riscv --gcc gcc-16 --gdb gdb \
+          --json "$RUNNER_TEMP/dwarf-locals.json"
         run_gate warning_compat python3 tests/regression/check_warning_compat.py \
         --lccc target/fastbuild/lccc --gcc gcc-16
         run_gate warning_precedence python3 tests/regression/check_warning_precedence.py \
@@ -1151,7 +1196,7 @@ jobs:
     - name: Install the GCC 16.2 oracle
       run: bash scripts/ci_install_gcc_oracle.sh --version 16.2
     - name: Verify the lane's oracle toolchain
-      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5
+      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5 --require gcc,multilib,valgrind,pyyaml,gdb
     - name: Select GCC 16 for legacy oracle invocations
       run: |
         mkdir -p "$RUNNER_TEMP/lccc-oracles"
@@ -3526,6 +3571,18 @@ jobs:
         "$binary" --version | tee intel-evidence/version.txt
         "$binary" -E -dM -x c /dev/null > intel-evidence/macros.txt
         sha256sum "$binary" > intel-evidence/binary.sha256
+    - name: Numeric -O and -Ofast parity against ICX 2026.2, GCC 16.2 and Clang 23.1.5
+      env:
+        CCC: target/fastbuild/lccc
+        GCC16: gcc-16
+      run: |
+        set -euo pipefail
+        trap 'status=$?; if [ "$status" -ne 0 ]; then python3 scripts/ci_annotate_log.py --title "numeric -O / -Ofast four-compiler parity" intel-evidence/o-level-parity.log; fi; exit "$status"' EXIT
+        python3 tests/regression/check_icx_o_level_parity.py \
+          --lccc "$CCC" --gcc "$GCC16" --clang "${CLANG:-clang-23}" \
+          --icx "$LCCC_ICX_BIN" --require-icx \
+          --json intel-evidence/o-level-parity.json \
+          2>&1 | tee intel-evidence/o-level-parity.log
     - name: Enum callback ABI against authenticated ICX, GCC and Clang
       run: |
         set -euo pipefail

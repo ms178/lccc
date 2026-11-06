@@ -703,6 +703,9 @@ mod tests {
             source_spans: vec![],
         };
         IrFunction {
+            debug_param_indices: Vec::new(),
+            debug_locals: Vec::new(),
+            debug_scopes: Vec::new(),
             pass_policy: Default::default(),
             name: "loop_fn".into(),
             return_type: IrType::I32,

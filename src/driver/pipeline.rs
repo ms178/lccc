@@ -92,6 +92,13 @@ pub struct Driver {
     /// `-ffast-math -ffp-contract=off` also ends OFF (explicit flag is sticky
     /// in both orders; explicit-vs-explicit remains last-wins).
     pub(super) fp_contract_explicit: bool,
+    /// Whether `-ffast-math` / `-fno-fast-math` was given explicitly on the
+    /// command line. `None` means the fast-math state is owned by the current
+    /// `-O` spelling: only `-Ofast` enables it implicitly, so a later plain
+    /// `-O*` must withdraw it (GCC 16.2 and Clang 23.1 both do this).
+    /// `Some(true)` keeps it enabled across `-O` changes; `Some(false)` is an
+    /// explicit opt-out that no later `-Ofast` may silently revoke (GCC 16.2).
+    pub(super) explicit_fast_math: Option<bool>,
     /// Whether the umbrella -ffast-math option is active.  Kept separate from
     /// fp_reassoc because GCC does not define __FAST_MATH__ for the individual
     /// -fassociative-math/-funsafe-math-optimizations options.
@@ -132,6 +139,13 @@ pub struct Driver {
     pub(super) fp_trapping_math: bool,
     /// Dynamic rounding is observable independently of exception trapping.
     pub(super) fp_rounding_math: bool,
+    /// `-f{,no-}trapping-math` given by the user, or `None` when unset.
+    /// `-ffast-math` must override both fenv bits, but withdrawing the
+    /// umbrella (`-fno-fast-math`, or a later plain `-O*` after `-Ofast`)
+    /// must restore an explicit fenv request instead of silently losing it.
+    pub(super) explicit_fp_trapping_math: Option<bool>,
+    /// `-f{,no-}rounding-math` given by the user, or `None` when unset.
+    pub(super) explicit_fp_rounding_math: Option<bool>,
     pub(super) verbose: bool,
     pub(super) mode: CompileMode,
     pub(super) debug_info: bool,
@@ -145,6 +159,8 @@ pub struct Driver {
     /// asked for a dialect, and the program is the only DWARF an assembler
     /// emits for such an input).
     pub(super) dwarf_version_explicit: bool,
+    pub(super) debug_prefix_map: crate::common::path_map::PathPrefixMap,
+    pub(super) macro_prefix_map: crate::common::path_map::PathPrefixMap,
     pub(super) defines: Vec<CliDefine>,
     pub(super) include_paths: Vec<String>,
     /// Quote-only include paths (from -iquote flags).
@@ -638,6 +654,13 @@ pub struct Driver {
     pub(super) preferred_stack_bytes: u8,
     /// Whether to omit the frame pointer (-fomit-frame-pointer).
     pub(super) omit_frame_pointer: bool,
+    /// Explicit user frame-pointer request, if any.  GCC 16.2 and Clang 23.1.5
+    /// both treat `-f{,no-}omit-frame-pointer` as an opts_set user option: an
+    /// optimization level supplies only the default.  Measured on x86-64:
+    /// `-fno-omit-frame-pointer -O2` keeps the saved rbp chain, and
+    /// `-fomit-frame-pointer -O0` omits it.  Without this origin field the
+    /// shared `-O` helper silently revoked the earlier explicit request.
+    pub(super) explicit_omit_frame_pointer: Option<bool>,
     /// Whether to suppress .eh_frame unwind table generation
     /// (-fno-asynchronous-unwind-tables / -fno-unwind-tables).
     pub(super) no_unwind_tables: bool,
@@ -698,6 +721,7 @@ impl Driver {
             fp_contract: crate::common::fp_contract::FpContract::c_language_default(),
             fp_contract_explicit: false,
             fast_math: false,
+            explicit_fast_math: None,
             wrap_signed_overflow: false,
             trapv: false,
             whole_program: false,
@@ -712,11 +736,15 @@ impl Driver {
             builtin_policy: crate::common::pass_policy::BuiltinFlags::default(),
             fp_trapping_math: false,
             fp_rounding_math: false,
+            explicit_fp_trapping_math: None,
+            explicit_fp_rounding_math: None,
             verbose: false,
             mode: CompileMode::Full,
             debug_info: false,
             dwarf_version: crate::backend::elf::DWARF_DEFAULT_VERSION,
             dwarf_version_explicit: false,
+            debug_prefix_map: Default::default(),
+            macro_prefix_map: Default::default(),
             defines: Vec::new(),
             include_paths: Vec::new(),
             quote_include_paths: Vec::new(),
@@ -891,6 +919,7 @@ impl Driver {
             regparm: 0,
             preferred_stack_bytes: 16,
             omit_frame_pointer: false,
+            explicit_omit_frame_pointer: None,
             no_unwind_tables: false,
             raw_args: Vec::new(),
             pthread: false,
@@ -1719,7 +1748,17 @@ impl Driver {
                 continue;
             }
             // Default path: compile with internal codegen (handles .code16gcc prepend)
-            let asm = self.compile_to_assembly(input_file)?.asm;
+            let compiled = self.compile_to_assembly(input_file)?;
+            let mut asm = compiled.asm;
+            if let Some(debug) = self.debug_request(compiled.debug_unit) {
+                asm = super::debug_assembly::append_debug_sections(
+                    self.target,
+                    &asm,
+                    debug,
+                    &self.build_asm_extra_args(),
+                )?;
+                asm = super::debug_assembly::map_file_directives(&asm, &self.debug_prefix_map);
+            }
             if self.output_path_set {
                 // `-o -` streams the assembly (write_text_output is the single
                 // place that knows the convention); a real path is written
@@ -1770,10 +1809,12 @@ impl Driver {
     ) -> Option<crate::backend::elf::DwarfDebug> {
         use crate::backend::elf::DwarfDebug;
         let config = self.dwarf_config(false)?;
-        Some(match unit {
+        let mut request = match unit {
             Some(unit) => DwarfDebug::with_unit(config, unit),
             None => DwarfDebug::dialect(config),
-        })
+        };
+        request.path_map = std::sync::Arc::new(self.debug_prefix_map.clone());
+        Some(request)
     }
 
     fn run_object_only(&self) -> Result<(), String> {
@@ -2043,6 +2084,7 @@ impl Driver {
         preprocessor: &mut Preprocessor,
     ) -> Result<(), String> {
         preprocessor.set_warning_config(self.effective_warning_config());
+        preprocessor.set_macro_prefix_map(self.macro_prefix_map.clone());
         // Set target architecture macros
         match self.target {
             Target::Aarch64 => preprocessor.set_target("aarch64"),
@@ -2485,7 +2527,12 @@ impl Driver {
         if self.whole_program && !self.relocatable {
             crate::ir::whole_program::internalize_module(&mut module, false);
         }
-        let (asm, frame_facts) = self.compile_ir_module_to_assembly(
+        let debug_homes = (self.debug_info && self.opt_level == 0).then(|| {
+            std::sync::Arc::new(std::sync::Mutex::new(
+                crate::backend::DebugHomeReport::default(),
+            ))
+        });
+        let asm = self.compile_ir_module_to_assembly(
             module,
             source_manager.as_ref(),
             input_file,
@@ -2494,13 +2541,36 @@ impl Driver {
             tune,
             time_phases,
             t0,
+            debug_homes.clone(),
         )?;
-        // `-g`: the parameter homes the code generator proved join the unit spec
-        // here, because this is the one place that holds both the analysis's
-        // description of a function and the frame the code generator gave it.
         let mut debug_unit = debug_unit;
-        if let Some(spec) = debug_unit.as_mut() {
-            spec.apply_frame_facts(&frame_facts);
+        if let Some(unit) = debug_unit.as_mut() {
+            if let Some(homes) = debug_homes {
+                let homes = homes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for ((function, index), home) in homes.parameters.iter() {
+                    if let Some(parameter) = unit
+                        .parameters
+                        .get_mut(function)
+                        .and_then(|list| list.parameters.get_mut(*index))
+                    {
+                        parameter.location = Some(crate::backend::elf::DwarfHome {
+                            base_register: home.base_register,
+                            offset: home.offset,
+                        });
+                    }
+                }
+                for local in &mut unit.local_variables {
+                    if let Some(home) = homes.locals.get(&(local.function.clone(), local.alloca_id))
+                    {
+                        local.home = Some(crate::backend::elf::DwarfHome {
+                            base_register: home.base_register,
+                            offset: home.offset,
+                        });
+                    }
+                }
+            }
         }
         Ok(CompiledUnit { asm, debug_unit })
     }
@@ -2531,6 +2601,7 @@ impl Driver {
             String,
             crate::frontend::sema::analysis::FunctionInfo,
         >,
+        module: Option<&crate::ir::module::IrModule>,
     ) -> crate::backend::elf::DwarfUnitSpec {
         use crate::backend::elf::DwarfUnitSpec;
 
@@ -2628,9 +2699,6 @@ impl Driver {
                 described.push(crate::backend::elf::DwarfParameter {
                     name: parameter_name.clone(),
                     ty: graph.intern_written(ty, alias),
-                    // Filled in by `apply_frame_facts` once the code generator
-                    // has laid the frame out; the analysis runs before any frame
-                    // exists, so nothing here can know where the value lives.
                     location: None,
                 });
             }
@@ -2646,11 +2714,76 @@ impl Driver {
             );
         }
 
+        // D14: local variables and their lexical blocks.  The lowerer records
+        // one scope per compound statement; the writer nests variable DIEs under
+        // those blocks so a shadowed name is visible only inside its own scope.
+        // A promoted/folded local still gets a DIE here, but the driver attaches
+        // a home only when codegen proves one; without a home the writer omits it.
+        let mut local_variables = Vec::new();
+        let mut lexical_scopes = Vec::new();
+        if let Some(module) = module {
+            for func in &module.functions {
+                let scope_base = lexical_scopes.len();
+                for scope in &func.debug_scopes {
+                    let (file, start_line, start_column, end_line, end_column) = match sources {
+                        Some(sources) if scope.span != crate::common::source::Span::dummy() => {
+                            let start = sources.resolve_span(scope.span);
+                            let end = sources.resolve_span(crate::common::source::Span::new(
+                                scope.span.end.saturating_sub(1),
+                                scope.span.end,
+                                scope.span.file_id,
+                            ));
+                            (start.file, start.line, start.column, end.line, end.column)
+                        }
+                        _ => (String::new(), 0, 0, 0, 0),
+                    };
+                    lexical_scopes.push(crate::backend::elf::DwarfLexicalScope {
+                        function: func.name.clone(),
+                        parent: scope.parent.map(|parent| scope_base + parent),
+                        file,
+                        start_line,
+                        start_column,
+                        end_line,
+                        end_column,
+                    });
+                }
+                for local in &func.debug_locals {
+                    let ty = graph.intern_written(&local.ty, local.typedef_name.as_deref());
+                    let (decl_file, decl_line, decl_column) = match sources {
+                        Some(sources)
+                            if local.decl_span != crate::common::source::Span::dummy() =>
+                        {
+                            let location = sources.resolve_span(local.decl_span);
+                            (
+                                Some(location.file),
+                                Some(location.line),
+                                Some(location.column),
+                            )
+                        }
+                        _ => (None, None, None),
+                    };
+                    local_variables.push(crate::backend::elf::DwarfLocalVariable {
+                        function: func.name.clone(),
+                        name: local.name.clone(),
+                        ty,
+                        decl_file,
+                        decl_line,
+                        decl_column,
+                        alloca_id: local.alloca.0,
+                        scope: scope_base + local.scope,
+                        home: None,
+                    });
+                }
+            }
+        }
+
         DwarfUnitSpec {
             types: graph.into_types(),
             variables,
             return_types,
             parameters: function_parameters,
+            local_variables,
+            lexical_scopes,
         }
     }
 
@@ -2667,9 +2800,6 @@ impl Driver {
         }
         let mut merged = crate::ir::whole_program::merge_modules(modules)?;
         crate::ir::whole_program::internalize_module(&mut merged, false);
-        // `-g`: a whole-program module has no per-unit spec to attach frame facts
-        // to (the DIE tree of this path is statement-level only), so the facts are
-        // dropped rather than described against the wrong unit.
         self.compile_ir_module_to_assembly(
             merged,
             None,
@@ -2679,8 +2809,8 @@ impl Driver {
             tune,
             time_phases,
             t0,
+            None,
         )
-        .map(|(asm, _facts)| asm)
     }
 
     fn parse_and_analyze_c_tu(
@@ -2952,23 +3082,10 @@ impl Driver {
         crate::passes::vectorize::set_x86_sse1_available(
             self.target == Target::X86_64 && !self.no_sse && !self.general_regs_only,
         );
-        // The debug information names this unit's types and objects, so it is
-        // built while the analysis that produced them is still readable: the
-        // lowerer takes the type system and the function records by value, and
-        // the syntax tree does not outlive lowering.  Only a `-g` compile pays for
-        // it, and the source manager is shared rather than taken, so lowering
-        // keeps its `file:line:col` diagnostics.
-        let debug_unit = if self.debug_info {
-            let sources = diagnostics.share_source_manager();
-            Some(Self::build_dwarf_unit(
-                &sema_result.file_scope_objects,
-                &sema_result.type_context,
-                sources.as_deref(),
-                &sema_result.functions,
-            ))
-        } else {
-            None
-        };
+        // The lowerer consumes the function records; `-g` still needs them to
+        // name parameters after lowering has returned the (possibly enriched)
+        // type context and the local-variable metadata.
+        let debug_functions = self.debug_info.then(|| sema_result.functions.clone());
         let lowerer = Lowerer::with_type_context(
             self.target,
             sema_result.type_context,
@@ -2979,6 +3096,7 @@ impl Driver {
             self.gnu89_inline,
         )
         .with_optimization_level(self.opt_level)
+        .with_debug_info(self.debug_info)
         .with_pass_policy(crate::common::pass_policy::PassPolicy::new(
             self.effective_wrap_signed_overflow(),
             fp_environment_observable,
@@ -2991,7 +3109,7 @@ impl Driver {
         .with_builtin_policy(self.builtin_policy.clone())
         .with_enumerator_refs(sema_result.enumerator_refs)
         .with_local_address_returns(sema_result.local_address_returns);
-        let (mut module, mut diagnostics) = lowerer.lower(&ast);
+        let (mut module, mut diagnostics, _lowered_types) = lowerer.lower(&ast);
         // IR lowering is a user-facing phase: it rejects ill-typed builtins,
         // target-specific intrinsics and unsupported constructs, and every one
         // of those diagnostics carries a span. The engine therefore keeps the
@@ -3001,6 +3119,19 @@ impl Driver {
         // the only consumer that needs the manager back, so take it once
         // lowering has returned the engine.
         let source_manager = diagnostics.take_source_manager();
+        let debug_unit = if self.debug_info {
+            Some(Self::build_dwarf_unit(
+                &sema_result.file_scope_objects,
+                &_lowered_types,
+                source_manager.as_deref(),
+                debug_functions
+                    .as_ref()
+                    .ok_or_else(|| "debug function metadata missing".to_string())?,
+                Some(&module),
+            ))
+        } else {
+            None
+        };
 
         // Apply #pragma weak directives from the preprocessor.
         for (symbol, target) in &weak_pragmas {
@@ -3100,7 +3231,8 @@ impl Driver {
         tune: crate::backend::x86::cpu_model::X86Tune,
         time_phases: bool,
         t0: std::time::Instant,
-    ) -> Result<(String, crate::backend::debug_frame::DebugFrameFacts), String> {
+        debug_homes: Option<crate::backend::DebugHomes>,
+    ) -> Result<String, String> {
         let (module, pgo_unit) = self.optimize_ir_module(
             module,
             input_file,
@@ -3238,6 +3370,7 @@ impl Driver {
             tune,
             time_phases,
             t0,
+            debug_homes,
         )
     }
 
@@ -4394,7 +4527,8 @@ impl Driver {
         tune: crate::backend::x86::cpu_model::X86Tune,
         time_phases: bool,
         t0: std::time::Instant,
-    ) -> Result<(String, crate::backend::debug_frame::DebugFrameFacts), String> {
+        debug_homes: Option<crate::backend::DebugHomes>,
+    ) -> Result<String, String> {
         if let Some(diagnostic) = unsettled_x86_requirement(module) {
             return Err(format!("{input_file}: {diagnostic}"));
         }
@@ -4454,6 +4588,7 @@ impl Driver {
             .then(|| std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())));
         let opts = crate::backend::CodegenOptions {
             frame_report: frame_report.clone(),
+            debug_homes,
             ra_config,
             // At -O0 phi elimination leaves non-SSA multi-def webs. The linear
             // scan assumes one definition and miscompiled 125/200 CFG seeds;
@@ -4541,7 +4676,7 @@ impl Driver {
             zero_call_used_regs: self.zero_call_used_regs,
             zero_call_used_regs_fp_simd: self.resolved_zero_call_used_regs_fp_simd(),
         };
-        let (asm, frame_facts) = self.target.generate_assembly_with_opts_and_debug(
+        let asm = self.target.generate_assembly_with_opts_and_debug(
             module,
             &opts,
             source_manager.map(|sm| &**sm),
@@ -4621,7 +4756,7 @@ impl Driver {
             _ => asm,
         };
 
-        Ok((asm, frame_facts))
+        Ok(asm)
     }
 }
 
@@ -4971,8 +5106,10 @@ impl Driver {
     /// GCC's *flag* default), and applying it at every optimization level made
     /// `-O0`/`-O1` output differ from GCC's in the last ulp(s) — which is how
     /// 26 in-repo reproducers came to be filed as "miscompile" although both
-    /// results are conforming.  An explicit `-ffp-contract=` or `-ffast-math`
-    /// still wins at any level.
+    /// results are conforming. Only an explicit `-ffp-contract=` overrides
+    /// this gate (`fp_contract_explicit`): `-ffast-math` alone does not, which
+    /// is what GCC 16.2 does on the FMA fixture at `-O1` (measured; Clang
+    /// 23.1 does fuse there, a documented divergence).
     pub(super) fn resolved_fp_contract(&self) -> crate::common::fp_contract::FpContract {
         use crate::common::fp_contract::FpContract;
         if !self.fp_contract_explicit && self.opt_level < 2 {

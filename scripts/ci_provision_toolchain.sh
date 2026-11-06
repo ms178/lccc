@@ -66,7 +66,7 @@ FORCE_INSTALL=0
 # mandatory for this platform-tool combination cannot be set up") unless the
 # matching debug symbols are installed.  Both are immutable for a runner
 # image, so they belong in the same cached bundle as the compilers.
-EXTRAS="qemu-user mold lld python3-yaml valgrind libc6-dbg"
+EXTRAS="qemu-user mold lld python3-yaml valgrind libc6-dbg gdb"
 
 usage() {
     cat >&2 <<'EOF'
@@ -80,7 +80,7 @@ usage: ci_provision_toolchain.sh [--bundle-dir DIR] [--root DIR]
   --bundle-dir    where the content-addressed toolchain bundle lives
   --root DIR      restore into DIR instead of / (bundle path only)
   --extras PKGS   oracle packages installed with the compiler, default:
-                  "qemu-user mold lld python3-yaml valgrind libc6-dbg"
+                  "qemu-user mold lld python3-yaml valgrind libc6-dbg gdb"
   --no-bundle     never read or write the bundle (pure installer path)
   --force-install ignore a cached bundle and reinstall from packages
 EOF

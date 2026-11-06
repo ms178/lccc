@@ -988,6 +988,35 @@ gate "dwarf-quality" fast \
     python3 tests/regression/check_dwarf_quality.py \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" \
         --json target/dwarf-quality.json --markdown target/dwarf-quality.md
+# The delivery paths must preserve that tree: -S + GAS/lccc assembler, native
+# execution, GDB visibility, and reproducible debug/macro path maps.
+gate "dwarf-delivery" fast \
+    python3 tests/regression/check_dwarf_delivery.py \
+        --lccc "$LCCC" --lccc-i686 target/fastbuild/lccc-i686 \
+        --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv \
+        --gcc "${GCC16:-gcc-16}" --gdb "${GDB:-gdb}" \
+        --json target/dwarf-delivery.json
+# The DWARF decoders and the parameter-home policy must be able to fail on
+# synthetic mutations before they are trusted with a compiler object.
+gate "dwarf-quality-selftest" fast \
+    python3 tests/regression/check_dwarf_quality.py --self-test
+gate "dwarf-parameters-selftest" fast \
+    python3 tests/regression/check_dwarf_parameters.py --self-test
+# D1b: O0 x86/i686 parameter homes, GDB values before/after assignment, entry
+# exclusion, -S+GAS delivery, and byte-identical code with/without -g.
+gate "dwarf-parameters" fast \
+    python3 tests/regression/check_dwarf_parameters.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" --gdb "${GDB:-gdb}" \
+        --json target/dwarf-parameters.json
+# D14: aggregate/volatile local homes, GDB values before/after assignment,
+# -S+GAS delivery, and byte-identical code with/without -g.
+gate "dwarf-locals-selftest" fast \
+    python3 tests/regression/check_dwarf_locals.py --self-test
+gate "dwarf-locals" fast \
+    python3 tests/regression/check_dwarf_locals.py \
+        --lccc "$LCCC" --lccc-arm target/fastbuild/lccc-arm \
+        --lccc-riscv target/fastbuild/lccc-riscv --gcc "${GCC16:-gcc-16}" --gdb "${GDB:-gdb}" \
+        --json target/dwarf-locals.json
 # Digraph spelling is observable in macro stringification; this also exercises
 # directives, token boundaries, maximal munch and native/i686 execution.
 gate "c-digraphs" fast \
@@ -1051,6 +1080,19 @@ gate "driver-queries" fast \
 gate "option-effect-ledger" fast \
     python3 tests/regression/check_option_effect_ledger.py \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+# Four-compiler measurement of the numeric -O / -Ofast decisions. ICX 2026.2
+# is optional locally (the authenticated hosted lane always has it); GCC 16.2
+# and Clang 23.1.5 are pinned here so the local gate is never vacuous.
+icx_o_level_parity() {
+    local -a icx_args=()
+    if [ -n "${LCCC_ICX_BIN:-}" ] && [ -x "$LCCC_ICX_BIN" ]; then
+        icx_args=(--icx "$LCCC_ICX_BIN" --require-icx)
+    fi
+    python3 tests/regression/check_icx_o_level_parity.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" --clang "${CLANG:-clang-23}" \
+        "${icx_args[@]}"
+}
+gate "icx-o-level-parity" fast icx_o_level_parity
 gate "attribute-diagnostics" fast \
     env GCC="${GCC16:-gcc-16}" python3 tests/regression/check_attribute_diagnostics.py
 # Kernel _calc_vm_trans selects an arm using an integer comparison. Check

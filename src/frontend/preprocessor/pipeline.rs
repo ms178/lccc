@@ -1095,8 +1095,9 @@ impl Preprocessor {
         self.macros.set_file(format!("\"{}\"", filename));
         // __BASE_FILE__ always expands to the main input file name,
         // unlike __FILE__ which changes during #include processing.
+        let mapped = self.macros.mapped_file(filename);
         self.macros
-            .set_builtin_body("__BASE_FILE__", &format!("\"{}\"", filename));
+            .set_builtin_body("__BASE_FILE__", &format!("\"{}\"", mapped));
         // Push the file path onto the include stack for relative includes.
         // Use make_absolute (not canonicalize) to preserve symlinks, matching GCC
         // behavior: #include "..." searches relative to the directory where the
@@ -1106,6 +1107,10 @@ impl Preprocessor {
         self.macros.push_file_scope(&abs);
         self.include_stack.push(abs);
         self.include_origins.push(None);
+    }
+
+    pub(crate) fn set_macro_prefix_map(&mut self, map: crate::common::path_map::PathPrefixMap) {
+        self.macros.set_file_prefix_map(map);
     }
 
     /// Get preprocessing errors.

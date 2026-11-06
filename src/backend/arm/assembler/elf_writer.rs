@@ -1126,6 +1126,11 @@ impl ElfWriter {
 
     /// Write the final ELF object file.
     pub fn write_elf(&mut self, output_path: &str) -> Result<(), String> {
+        let bytes = self.build_elf()?;
+        std::fs::write(output_path, bytes).map_err(|e| format!("failed to write ELF file: {}", e))
+    }
+
+    pub(crate) fn build_elf(&mut self) -> Result<Vec<u8>, String> {
         let config = elf::ElfConfig {
             e_machine: EM_AARCH64,
             e_flags: 0,
@@ -1138,7 +1143,7 @@ impl ElfWriter {
             RelocType::Abs32.elf_type(),
             RelocType::Abs64.elf_type(),
         )?;
-        self.base.write_elf(output_path, &config, false)
+        self.base.build_elf(&config, false)
     }
 }
 

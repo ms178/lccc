@@ -9790,6 +9790,12 @@ impl ArchCodegen for X86Codegen {
         "ud2"
     }
 
+    fn debug_frame_home(&self, slot: crate::backend::state::StackSlot) -> Option<(u8, i64)> {
+        // rbp is DWARF register 6.  FPO homes move with rsp and need
+        // CFA-relative location lists instead.
+        (!self.state.omit_frame_pointer).then_some((6, slot.0))
+    }
+
     fn note_function_emitted(&mut self, func: &IrFunction, mark: usize) {
         if !self.ipa.enabled() {
             return;
@@ -10772,8 +10778,6 @@ impl ArchCodegen for X86Codegen {
         fn emit_prologue(&mut self, func: &IrFunction, frame_size: i64) => emit_prologue_impl;
         fn emit_epilogue(&mut self, frame_size: i64) => emit_epilogue_impl;
         fn emit_store_params(&mut self, func: &IrFunction) => emit_store_params_impl;
-        fn take_debug_parameter_offsets(&mut self) -> Vec<Option<i32>> => take_debug_parameter_offsets_impl;
-        fn take_debug_frame_facts(&mut self) -> crate::backend::debug_frame::DebugFrameFacts => take_debug_frame_facts_impl;
         fn emit_param_ref(&mut self, dest: &Value, param_idx: usize, ty: IrType) => emit_param_ref_impl;
         fn emit_epilogue_and_ret(&mut self, frame_size: i64) => emit_epilogue_and_ret_impl;
         fn store_instr_for_type(&self, ty: IrType) -> &'static str => store_instr_for_type_impl;

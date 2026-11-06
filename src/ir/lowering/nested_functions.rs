@@ -1142,6 +1142,9 @@ impl Lowerer {
                 .unwrap_or_default()
         });
         let ir_func = crate::ir::reexports::IrFunction {
+            debug_param_indices: Vec::new(),
+            debug_locals: Vec::new(),
+            debug_scopes: Vec::new(),
             pass_policy: Default::default(),
             name: nf.name.clone(),
             return_type,

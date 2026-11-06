@@ -79,8 +79,8 @@ pub(crate) use dwarf::{
 // The model a compiler hands the writer: types and file-scope objects.
 #[expect(unused_imports)]
 pub(crate) use dwarf_spec::{
-    DwarfDebug, DwarfFunctionParameters, DwarfParameter, DwarfType, DwarfUnitSpec, DwarfVariable,
-    TypeGraph,
+    DwarfDebug, DwarfFunctionParameters, DwarfHome, DwarfLexicalScope, DwarfLocalVariable,
+    DwarfParameter, DwarfType, DwarfUnitSpec, DwarfVariable, TypeGraph,
 };
 
 // numeric_labels

@@ -28,18 +28,32 @@ pub fn assemble(
     output_path: &str,
     debug: Option<crate::backend::elf::DwarfDebug>,
 ) -> Result<(), String> {
+    let elf_bytes = assemble_bytes(asm_text, debug)?;
+    std::fs::write(output_path, elf_bytes)
+        .map_err(|e| format!("Failed to write object file: {}", e))
+}
+
+pub(crate) fn assemble_bytes(
+    asm_text: &str,
+    debug: Option<crate::backend::elf::DwarfDebug>,
+) -> Result<Vec<u8>, String> {
     let items = parse_asm(asm_text)?;
-    let items = cfi::lower_cfi(items, cfi::CfiArch::X86_64)?;
+    let items = crate::backend::x86::assembler::cfi::lower_cfi(
+        items,
+        crate::backend::x86::assembler::cfi::CfiArch::X86_64,
+    )?;
     let mut obj = ElfWriter::new();
     if let Some(debug) = debug {
-        let crate::backend::elf::DwarfDebug { config, unit } = debug;
+        let crate::backend::elf::DwarfDebug {
+            config,
+            unit,
+            path_map,
+        } = debug;
         obj.set_debug_config(config);
+        obj.set_debug_path_map(path_map);
         if let Some(unit) = unit {
             obj.set_debug_unit(unit);
         }
     }
-    let elf_bytes = obj.build(&items)?;
-    std::fs::write(output_path, &elf_bytes)
-        .map_err(|e| format!("Failed to write object file: {}", e))?;
-    Ok(())
+    obj.build(&items)
 }

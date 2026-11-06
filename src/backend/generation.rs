@@ -5109,6 +5109,13 @@ pub fn generate_module(
             std::env::var("CCC_DISABLE_PASSES").unwrap_or_default(),
             "intbounds",
         );
+    if let Some(homes) = &cg.state_ref().debug_homes {
+        let mut homes = homes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        homes.parameters.clear();
+        homes.locals.clear();
+    }
     pre_size_output_buffer(cg, module);
     collect_symbol_sets(cg, module);
     let file_table = build_and_emit_dwarf_file_table(cg, module, source_mgr);
@@ -6131,6 +6138,65 @@ fn generate_function(
     // only the shipped emission may define a summary or a keep record.
     if !crate::backend::state::EXPLORATORY_EMISSION.with(std::cell::Cell::get) {
         cg.note_function_emitted(func, mark);
+        if let Some(homes) = &cg.state_ref().debug_homes {
+            let state = cg.state_ref();
+            let mut homes = homes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for index in 0..func.params.len() {
+                // Physical ABI slots are not source parameters: a hidden sret
+                // pointer or a decomposed vector piece must not steal the next
+                // parameter's name.  Synthesized functions with no map fail closed.
+                let Some(Some(original)) = func.debug_param_indices.get(index) else {
+                    continue;
+                };
+                if state.param_pre_stored.contains(&index) {
+                    continue;
+                }
+                let Some(Some((slot, _, alloca_id))) = state.param_alloca_slots.get(index) else {
+                    continue;
+                };
+                // Over-aligned allocas store an adjusted address, not the raw
+                // slot base; leave those to a later CFA-relative description.
+                if state.alloca_over_align(*alloca_id).is_some() {
+                    continue;
+                }
+                let Some((base_register, offset)) = cg.debug_frame_home(*slot) else {
+                    continue;
+                };
+                homes.parameters.insert(
+                    (func.name.clone(), *original),
+                    crate::backend::DebugHome {
+                        base_register,
+                        offset,
+                    },
+                );
+            }
+            for local in &func.debug_locals {
+                // Only a fixed Alloca denotes object storage here.  A DynAlloca
+                // or a promoted value may also have a value_locations entry, but
+                // that slot holds a pointer/SSA value, not the source object.
+                if !state.is_alloca(local.alloca.0) {
+                    continue;
+                }
+                let Some(&slot) = state.value_locations.get(&local.alloca.0) else {
+                    continue;
+                };
+                if state.alloca_over_align(local.alloca.0).is_some() {
+                    continue;
+                }
+                let Some((base_register, offset)) = cg.debug_frame_home(slot) else {
+                    continue;
+                };
+                homes.locals.insert(
+                    (func.name.clone(), local.alloca.0),
+                    crate::backend::DebugHome {
+                        base_register,
+                        offset,
+                    },
+                );
+            }
+        }
         if let Some(report) = &cg.state_ref().frame_report {
             report
                 .lock()
@@ -6537,13 +6603,6 @@ fn generate_function_body(
     // ABI entry needs); the next source row is where a prologue skip stops.
     if debug_rows_enabled(cg, source_mgr, file_table) {
         cg.state().pending_prologue_end = true;
-        // The parameter homes the prologue just decided, for the writer that
-        // will describe them. This is the only moment they exist: the slots are
-        // assigned by `emit_store_params`, and nothing after it changes them.
-        let homes = cg.take_debug_parameter_offsets();
-        if homes.iter().any(Option::is_some) {
-            cg.state().debug_frames.record(&func.name, homes);
-        }
     }
 
     let entry_label = func.blocks.first().map(|b| b.label);

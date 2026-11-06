@@ -402,6 +402,9 @@ impl Lowerer {
         self.func_state = prev_state;
 
         let ir_func = IrFunction {
+            debug_param_indices: Vec::new(),
+            debug_locals: Vec::new(),
+            debug_scopes: Vec::new(),
             pass_policy: self.pass_policy,
             name: resolver_name.to_string(),
             return_type: IrType::Ptr,
