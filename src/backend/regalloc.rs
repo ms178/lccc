@@ -7367,8 +7367,14 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             }
             // Sharing the dest home is a new live range for the source.
             // Caller-saved XMM/volatile NEON cannot inherit a home that
-            // the source already needed to survive a call.
-            let dest_callee_fp = arm_fp_pool && (32..=38).contains(&d.0);
+            // the source already needed to survive a call.  A d8-d14 home
+            // survives one only for a scalar: AAPCS64 6.1.2 preserves the
+            // low 64 bits of v8-v15, so a 128-bit vector's upper lanes would
+            // be the callee's.
+            let dest_callee_fp = arm_fp_pool
+                && (32..=38).contains(&d.0)
+                && !vector_values.contains(&candidate.phi_dest)
+                && !vector_values.contains(&candidate.backedge_src);
             if liveness.range_spans_any_call(
                 candidate.backedge_src,
                 src_iv.0,

@@ -35,6 +35,7 @@ FIXTURES = (
     "asm_scalar_operand_classes_cross", "alias_copy_after_join_cross",
     "predicate_inverted_signed_cmp_cross", "word_reload_sign_extension_cross",
     "leaf_params_fp_domain_cross", "vector_fma_families_cross", "call_args_and_pool_regs_cross",
+    "fp_sign_and_vector_fms_cross",
 )
 ALL_LEVELS = ("-O0", "-O1", "-O2", "-Os")
 LEVELS = {
@@ -93,6 +94,13 @@ LEVELS = {
     # definition to a pass that assumed x9 held a block-local address
     # (pr42833).
     "call_args_and_pool_regs_cross": ALL_LEVELS + ("-O3",),
+    # AArch64: the GNU-vector `a*b - c` / `-(a*b) - c` lowering negates a
+    # vector register, and the built-in assembler encoded `fneg v.2d/.4s`
+    # with size<1> = 0 (unallocated, SIGILL under `-c`); scalar `-x`,
+    # `fabs`, `copysign` and `fma` bit-exact over signed zeros, infinities
+    # and NaNs; an FP constant compared as integer bits was an internal
+    # compiler error at -O1 and up.
+    "fp_sign_and_vector_fms_cross": ALL_LEVELS + ("-O3",),
 }
 # Two-unit psABI fixtures under interop/: `<name>_callee.c` and
 # `<name>_caller.c`, linked LCCC-with-LCCC and LCCC-with-Clang in both

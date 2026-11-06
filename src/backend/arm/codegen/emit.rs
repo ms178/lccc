@@ -806,6 +806,23 @@ impl ArmCodegen {
     /// values are sign-extended and unsigned values are zero-extended to 32
     /// bits. This distinction is essential for `(unsigned short)-2`: its
     /// compare value is 0x0000fffe, not the 32-bit -2 pattern 0xfffffffe.
+    /// The right operand of an integer compare in x0.  An integer constant
+    /// takes the comparison type's normalization, not its storage variant's
+    /// signed reading.  A floating-point constant stands for its bit
+    /// pattern -- a folded type pun such as `union { double d; u64 u; }`
+    /// compares the bits as `U64` -- which the operand loader materializes
+    /// exactly; it was an internal error ("integer comparison constant must
+    /// normalize").
+    fn load_cmp_rhs_to_x0(&mut self, rhs: &Operand, ty: IrType) {
+        match rhs {
+            Operand::Const(c) => match Self::normalized_cmp_const(c, ty) {
+                Some(value) => self.emit_load_imm64("x0", value as i64),
+                None => self.operand_to_x0(rhs),
+            },
+            Operand::Value(_) => self.operand_to_x0(rhs),
+        }
+    }
+
     fn normalized_cmp_const(c: &IrConst, ty: IrType) -> Option<u64> {
         if !ty.is_integer() && ty != IrType::Ptr {
             return None;
@@ -996,13 +1013,7 @@ impl ArmCodegen {
                 // lhs in register, rhs needs loading into x0. Constants must
                 // use comparison-type normalization rather than their storage
                 // variant's signed interpretation.
-                if let Operand::Const(c) = rhs {
-                    let value = Self::normalized_cmp_const(c, ty)
-                        .expect("integer comparison constant must normalize");
-                    self.emit_load_imm64("x0", value as i64);
-                } else {
-                    self.operand_to_x0(rhs);
-                }
+                self.load_cmp_rhs_to_x0(rhs, ty);
                 if use_32bit {
                     self.state.emit_fmt(format_args!("    cmp {}, w0", lhs_reg));
                 } else {
@@ -1057,13 +1068,7 @@ impl ArmCodegen {
         // Fallback: load both into x0/x1
         self.operand_to_x0(lhs);
         self.state.emit("    mov x1, x0");
-        if let Operand::Const(c) = rhs {
-            let value = Self::normalized_cmp_const(c, ty)
-                .expect("integer comparison constant must normalize");
-            self.emit_load_imm64("x0", value as i64);
-        } else {
-            self.operand_to_x0(rhs);
-        }
+        self.load_cmp_rhs_to_x0(rhs, ty);
         if use_32bit {
             self.state.emit("    cmp w1, w0");
         } else {
@@ -3483,6 +3488,20 @@ impl ArchCodegen for ArmCodegen {
     // AArch64 ABI: sret pointer goes in x8, not x0.
     fn sret_uses_dedicated_reg(&self) -> bool {
         true
+    }
+    fn emit_unaryop(
+        &mut self,
+        dest: &Value,
+        op: crate::ir::reexports::IrUnaryOp,
+        src: &Operand,
+        ty: IrType,
+    ) {
+        // `-x` stays in the FP domain: one `fneg` (`emit_float_neg_reg`).
+        if op == crate::ir::reexports::IrUnaryOp::Neg && matches!(ty, IrType::F32 | IrType::F64) {
+            self.emit_float_neg_reg(dest, src, ty);
+            return;
+        }
+        crate::backend::traits::emit_unaryop_default(self, dest, op, src, ty);
     }
     fn emit_call_sret_setup(&mut self, sret_operand: &Operand, total_sp_adjust: i64) {
         let slot_adjust = if self.state.has_dyn_alloca {

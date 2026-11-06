@@ -745,8 +745,9 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= per_function(&mut lines, &mut kinds, n, retarget_defs_into_copies);
         changed |= per_function(&mut lines, &mut kinds, n, fold_cset_add_to_cinc);
         changed |= per_function(&mut lines, &mut kinds, n, eliminate_dead_moves);
-        if rotate {
-            changed |= per_function(&mut lines, &mut kinds, n, rotate_simple_loops);
+        if rotate && per_function(&mut lines, &mut kinds, n, rotate_simple_loops) {
+            changed = true;
+            n = split_multiline_slots(&mut lines, &mut kinds);
         }
         rounds += 1;
     }
@@ -768,7 +769,9 @@ pub fn peephole_optimize(asm: String) -> String {
     }
     // After rotation (phase 1) and dead-store cleanup: sink loop-carried
     // slot-home stores out of bottom-tested loops.
-    sink_loop_carried_stores(&mut lines, &mut kinds, n);
+    if sink_loop_carried_stores(&mut lines, &mut kinds, n) {
+        n = split_multiline_slots(&mut lines, &mut kinds);
+    }
 
     // Phase 3: Local cleanup after global passes (up to 4 rounds)
     {
@@ -847,6 +850,46 @@ pub fn peephole_optimize(asm: String) -> String {
     // Build result: kept lines, with the hidden `-g` rows put back.
     debug_assert_eq!(lines.len(), kinds.len());
     crate::backend::peephole_common::join_with_debug_rows(&lines, |i| kinds[i] != LineKind::Nop)
+}
+
+/// Give every line of a multi-line slot a slot of its own; returns the new
+/// line count.
+///
+/// `rotate_simple_loops` writes the rotated latch (`cmp; b.cc .Lbody;
+/// b .Lexit`) into the one slot of the backedge it replaces, and
+/// `sink_loop_carried_stores` splices sunk stores into a backedge slot the
+/// same way.  Such a slot classifies as a single `Other` instruction: every
+/// pass that builds a CFG saw a block falling through where the latch
+/// branches, and `abi_liveness` let the rotated latch of gcc.c-torture
+/// pr24716 run into the exit block -- the loop-carried `mov x7, #1` that
+/// ends the loop looked dead, was deleted, and `f` never returned (-O1).
+/// Splitting right after the two producers keeps the text every other pass
+/// reads truthful.  A deleted slot stays one deleted slot.
+fn split_multiline_slots(lines: &mut Vec<String>, kinds: &mut Vec<LineKind>) -> usize {
+    debug_assert_eq!(lines.len(), kinds.len());
+    if !lines
+        .iter()
+        .zip(kinds.iter())
+        .any(|(l, k)| *k != LineKind::Nop && l.contains('\n'))
+    {
+        return lines.len();
+    }
+    let mut out_lines = Vec::with_capacity(lines.len() + 16);
+    let mut out_kinds = Vec::with_capacity(lines.len() + 16);
+    for (line, kind) in std::mem::take(lines).into_iter().zip(std::mem::take(kinds)) {
+        if kind == LineKind::Nop || !line.contains('\n') {
+            out_lines.push(line);
+            out_kinds.push(kind);
+            continue;
+        }
+        for sub in line.split('\n') {
+            out_kinds.push(classify_line(sub));
+            out_lines.push(sub.to_string());
+        }
+    }
+    *lines = out_lines;
+    *kinds = out_kinds;
+    lines.len()
 }
 
 /// Drop each callee-saved `.cfi_offset` row whose save the passes deleted.
@@ -12211,6 +12254,187 @@ mod call_liveness_and_dead_move_tests {
         // A jump table hides the successors: every move stays.
         let out = rows("j:\n    mov x3, x0\n    br x2\n.L5:\n    mov x3, #1\n    ret\n");
         assert!(out.contains(&"mov x3, x0".to_string()), "{out:?}");
+    }
+
+    /// gcc.c-torture pr24716 at -O1, as the emitter hands it to the
+    /// peephole (`f`, with the debug directives removed).  The inner loops
+    /// rotate, and the rotated latch used to stay one multi-line slot
+    /// (`cmp; b.cc .Lbody; b .Lexit` classified `Other`): every CFG pass
+    /// then saw it fall through into the exit block, `eliminate_dead_moves`
+    /// deleted the loop-carried `mov x7, #1` (`j = 1`) and the copies feeding
+    /// `.LBB1`, and `f` never returned.  Splitting the slot right after
+    /// rotation keeps them.
+    #[test]
+    fn rotated_latches_are_real_branches_to_every_cfg_pass() {
+        let out = rows(
+            "f:\n\
+                 stp x29, x30, [sp, #-32]!\n\
+                 mov x29, sp\n\
+                 stp x19, x21, [sp, #16]\n\
+                 mov w19, w0\n\
+                 mov w21, w1\n\
+                 mov x4, x19\n\
+                 mov x5, x21\n\
+                 mov x0, #0\n\
+                 mov x21, x0\n\
+                 mov x0, #0\n\
+                 mov x7, x0\n\
+             .LBB1:\n\
+                 cmp w21, #2\n\
+                 b.le .Lskip_26\n\
+                 b .LBB2\n\
+             .Lskip_26:\n\
+                 b .LBB5\n\
+             .LBB2:\n\
+                 mov x8, x21\n\
+                 mov x6, x7\n\
+             .LBB3:\n\
+                 sub w6, w6, #1\n\
+                 add w8, w8, #1\n\
+                 cmp w6, #2\n\
+                 b.le .Lskip_27\n\
+                 b .LBB3\n\
+             .Lskip_27:\n\
+                 b .LBB4\n\
+             .LBB4:\n\
+                 mov x21, x8\n\
+                 mov x7, x6\n\
+             .LBB5:\n\
+                 cmp w7, #1\n\
+                 b.ne .Lskip_28\n\
+                 b .LBB27\n\
+             .Lskip_28:\n\
+                 b .LBB6\n\
+             .LBB6:\n\
+                 mov x13, x21\n\
+             .LBB7:\n\
+                 cmp w13, w5\n\
+                 b.le .Lskip_29\n\
+                 b .LBB8\n\
+             .Lskip_29:\n\
+                 b .LBB11\n\
+             .LBB8:\n\
+                 cmp w7, w5\n\
+                 b.ne .Lskip_30\n\
+                 b .LBB9\n\
+             .Lskip_30:\n\
+                 b .LBB10\n\
+             .LBB9:\n\
+                 add w13, w13, #1\n\
+             .LBB10:\n\
+                 cmp w13, w5\n\
+                 b.le .Lskip_31\n\
+                 b .LBB8\n\
+             .Lskip_31:\n\
+                 b .LBB11\n\
+             .LBB11:\n\
+                 adrp x0, :got:W\n\
+                 ldr x0, [x0, :got_lo12:W]\n\
+                 mov x14, x0\n\
+             .LBB12:\n\
+                 sxtw x6, w4\n\
+                 ldrsw x6, [x14, x6, lsl #2]\n\
+             .LBB13:\n\
+                 cmp w6, #0\n\
+                 b.eq .Lskip_32\n\
+                 b .LBB14\n\
+             .Lskip_32:\n\
+                 b .LBB15\n\
+             .LBB14:\n\
+                 sxtw x13, w4\n\
+                 lsl x6, x13, #2\n\
+                 str wzr, [x14, x13, lsl #2]\n\
+                 mov x0, #1\n\
+                 mov x13, x0\n\
+                 mov x0, #0\n\
+                 mov x6, x0\n\
+             .LBB15:\n\
+                 cmp w5, #1\n\
+                 b.ge .Lskip_33\n\
+                 b .LBB13\n\
+             .Lskip_33:\n\
+                 b .LBB16\n\
+             .LBB16:\n\
+                 cmp w4, #0\n\
+                 b.le .Lskip_34\n\
+                 b .LBB17\n\
+             .Lskip_34:\n\
+                 b .LBB18\n\
+             .LBB17:\n\
+                 b .LBB12\n\
+             .LBB18:\n\
+                 mov x8, x4\n\
+             .LBB19:\n\
+                 sxtw x14, w8\n\
+                 adrp x0, :got:Link\n\
+                 ldr x0, [x0, :got_lo12:Link]\n\
+                 mov x4, x0\n\
+                 ldrsw x6, [x4, x14, lsl #2]\n\
+                 mov x0, #0\n\
+                 mov x8, x0\n\
+             .LBB20:\n\
+                 cmp w8, w7\n\
+                 b.ge .Lskip_35\n\
+                 b .LBB21\n\
+             .Lskip_35:\n\
+                 b .LBB24\n\
+             .LBB21:\n\
+                 cmn w6, #1\n\
+                 b.eq .Lskip_36\n\
+                 b .LBB22\n\
+             .Lskip_36:\n\
+                 b .LBB23\n\
+             .LBB22:\n\
+                 add w13, w13, #1\n\
+                 add w8, w8, #1\n\
+             .LBB23:\n\
+                 cmp w8, w7\n\
+                 b.ge .Lskip_37\n\
+                 b .LBB21\n\
+             .Lskip_37:\n\
+                 b .LBB24\n\
+             .LBB24:\n\
+                 cmn w6, #1\n\
+                 b.eq .Lskip_38\n\
+                 b .LBB25\n\
+             .Lskip_38:\n\
+                 b .LBB26\n\
+             .LBB25:\n\
+                 mov x8, x6\n\
+                 b .LBB19\n\
+             .LBB26:\n\
+                 mov x4, x6\n\
+                 mov x5, x8\n\
+                 mov x21, x13\n\
+                 mov x0, #1\n\
+                 mov x7, x0\n\
+                 b .LBB1\n\
+             .LBB27:\n\
+                 mov x0, x21\n\
+                 ldp x19, x21, [sp, #16]\n\
+                 ldp x29, x30, [sp], #32\n\
+                 ret\n\
+             .size f, .-f\n",
+        );
+        for kept in ["mov x7, #1", "mov x4, x6", "mov x5, x8"] {
+            assert!(out.contains(&kept.to_string()), "{kept} deleted: {out:?}");
+        }
+        // The split itself: a live multi-line slot becomes one classified row
+        // per line, a deleted one stays one deleted row.
+        let mut lines = vec![
+            "    cmp w6, #2\n    b.gt .LBB3\n    b .Lskip_27".to_string(),
+            "    mov x1, x2\n    mov x3, x4".to_string(),
+            "    ret".to_string(),
+        ];
+        let mut kinds = vec![LineKind::Other, LineKind::Nop, LineKind::Ret];
+        let n = split_multiline_slots(&mut lines, &mut kinds);
+        assert_eq!(n, 5);
+        assert_eq!(kinds[0], LineKind::Compare);
+        assert_eq!(kinds[1], LineKind::CondBranch);
+        assert_eq!(kinds[2], LineKind::Branch);
+        assert_eq!(kinds[3], LineKind::Nop);
+        assert_eq!(kinds[4], LineKind::Ret);
+        assert!(lines.iter().take(3).all(|l| !l.contains('\n')), "{lines:?}");
     }
 
     /// The emitter's annotation names the registers a callee takes values

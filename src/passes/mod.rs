@@ -1849,11 +1849,16 @@ pub(crate) fn run_passes(
     // SIMD register file (vfmadd is a VEX-encoded SSE instruction, so a
     // kernel TU built with `-mno-sse` would #UD on the folded form).
     simplify::set_math_errno(math_errno);
+    // AArch64 (`fmadd`) and RV64GC (`fmadd.s`/`fmadd.d`, part of the F and D
+    // extensions every LCCC RISC-V target assumes) have the fused forms in
+    // the base ISA.  RV64 used to fall through to `false`, so `fma()` stayed
+    // a libm call -- slower than the one instruction GCC and Clang emit, and
+    // an undefined symbol in freestanding links -- although the RISC-V
+    // emitter has lowered every FmaScalar variant all along.
     simplify::set_has_fma3(match target {
         crate::backend::Target::X86_64 => x86_isa.fma,
         crate::backend::Target::I686 => x86_fma,
-        crate::backend::Target::Aarch64 => true,
-        _ => false,
+        crate::backend::Target::Aarch64 | crate::backend::Target::Riscv64 => true,
     });
     // SSE4.1 directed rounding (`roundsd`/`vroundsd`) for the floor/ceil/
     // trunc/rint/nearbyint libcall fold.  x86-64 needs the ISA bit; i686

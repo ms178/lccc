@@ -29,6 +29,66 @@ pub(crate) fn validate_consecutive_reglist(regs: &[Operand], rt: u32) -> Result<
     Ok(())
 }
 
+/// The arrangements an integer vector instruction accepts in its
+/// *same-shape* form (three-same, two-misc, compare-with-zero), or `None`
+/// when the operand list is another form of the mnemonic (by element,
+/// immediate, scalar, widening/narrowing) that its own leaf validates.
+///
+/// The element size of these classes is not a free parameter: for the
+/// logical group it *is* the operation (`and`/`bic`/`orr`/`orn` differ only
+/// in `size`), so `and v0.4h, v1.4h, v2.4h` -- which GNU as rejects --
+/// assembled as BIC; `mul v0.2d`, `cnt v0.4s`, `rev16 v0.2s` and every `.1d`
+/// three-same assembled into words of other instructions or unallocated
+/// encodings.  One table here, checked before dispatch, replaces a check per
+/// leaf (GAS 2.47 measured every mnemonic x arrangement cell).
+pub(crate) fn neon_int_same_shape_arrangements(
+    mn: &str,
+    operands: &[Operand],
+) -> Option<&'static [&'static str]> {
+    const B: &[&str] = &["8b", "16b"];
+    const BH: &[&str] = &["8b", "16b", "4h", "8h"];
+    const BHS: &[&str] = &["8b", "16b", "4h", "8h", "2s", "4s"];
+    const HS: &[&str] = &["4h", "8h", "2s", "4s"];
+    const BHSD: &[&str] = &["8b", "16b", "4h", "8h", "2s", "4s", "2d"];
+    let is_vec = |i: usize| matches!(operands.get(i), Some(Operand::RegArrangement { .. }));
+    if !is_vec(0) || !is_vec(1) {
+        return None;
+    }
+    let third_vec = is_vec(2);
+    let third_zero = matches!(operands.get(2), Some(Operand::Imm(0)));
+    // A mixed spelling is the leaves' "operand mismatch" (GAS's own wording
+    // for it); the arrangement question only arises once the shapes agree.
+    if neon_shapes_agree(operands, if third_vec { 3 } else { 2 }, mn).is_err() {
+        return None;
+    }
+    match (mn, operands.len()) {
+        ("and" | "orr" | "eor" | "bic" | "orn" | "bsl" | "bit" | "bif" | "pmul", 3)
+            if third_vec =>
+        {
+            Some(B)
+        }
+        ("not" | "mvn" | "cnt" | "rev16" | "rbit", 2) => Some(B),
+        ("rev32", 2) => Some(BH),
+        ("rev64" | "cls" | "clz", 2) => Some(BHS),
+        (
+            "mul" | "mla" | "mls" | "shadd" | "uhadd" | "srhadd" | "urhadd" | "shsub" | "uhsub"
+            | "smax" | "smin" | "umax" | "umin" | "sabd" | "uabd" | "saba" | "uaba" | "smaxp"
+            | "sminp" | "umaxp" | "uminp",
+            3,
+        ) if third_vec => Some(BHS),
+        ("sqdmulh" | "sqrdmulh", 3) if third_vec => Some(HS),
+        (
+            "add" | "sub" | "cmeq" | "cmge" | "cmgt" | "cmhi" | "cmhs" | "cmtst" | "sqadd"
+            | "uqadd" | "sqsub" | "uqsub" | "sshl" | "ushl" | "srshl" | "urshl" | "sqshl" | "uqshl"
+            | "sqrshl" | "uqrshl" | "addp" | "zip1" | "zip2" | "uzp1" | "uzp2" | "trn1" | "trn2",
+            3,
+        ) if third_vec => Some(BHSD),
+        ("cmeq" | "cmge" | "cmgt" | "cmle" | "cmlt", 3) if third_zero => Some(BHSD),
+        ("abs" | "neg" | "sqabs" | "sqneg", 2) => Some(BHSD),
+        _ => None,
+    }
+}
+
 pub(crate) fn get_neon_reg(operands: &[Operand], idx: usize) -> Result<(u32, String), String> {
     match operands.get(idx) {
         Some(Operand::RegArrangement { reg, arrangement }) => {
@@ -523,8 +583,15 @@ pub(crate) fn encode_neon_elem_long(
         _ => return Err("unsupported element size for by-element".to_string()),
     };
 
-    // Limit Rm for half-word indexing (only v0-v15)
-    let rm_enc = if size == 0b01 { rm & 0xF } else { rm & 0x1F };
+    // A `.h` element is indexed by H:L:M, leaving four bits for Rm: v16-v31
+    // have no encoding (GAS rejects them).  Masking the number used to turn
+    // `smull v3.4s, v29.4h, v16.h[0]` into a multiply by v0.
+    if size == 0b01 && rm > 15 {
+        return Err(format!(
+            "by-element: a `.h` element register must be v0-v15, got v{rm}"
+        ));
+    }
+    let rm_enc = rm & 0xF;
 
     // 0 Q U 01111 size L M Rm opcode H 0 Rn Rd
     let word = (q << 30)
@@ -788,8 +855,8 @@ fn check_across_dest_class(operands: &[Operand], size: u32, mn: &str) -> Result<
 /// 0 Q 1 01110 size 11000 opcode 10 Rn Rd
 /// ```
 ///
-/// Only the `4s` source exists (GNU as rejects `fmaxv s0,v1.2s` and
-/// `fmaxv h0,v1.8h`), the destination is always spelled as a scalar `s0`, and
+/// Only the `4s` source exists for an `s` result (GNU as rejects `fmaxv
+/// s0,v1.2s`); FEAT_FP16 adds the `h` result over `4h`/`8h`, and
 /// the two opcodes differ by `size` as well as by the opcode field: FMAX/FMIN
 /// use size 00 and 10 respectively.  These were simply unimplemented, so every
 /// call to them was a hard error rather than a wrong word -- but a missing
@@ -808,12 +875,37 @@ pub(crate) fn encode_neon_fp_across(
         ));
     }
     let (rd, _) = get_neon_reg(operands, 0)?;
-    if neon_operand_class(&operands[0]) != Some(b's') {
-        return Err(format!(
-            "{mn}: the destination must be a scalar FP register (s0-s31)"
+    let (rn, arr_n) = get_neon_reg(operands, 1)?;
+    // FEAT_FP16: an `h` result reduces `4h`/`8h` in the FP16 across-lanes
+    // class, `0 Q 0 01110 o1 0 11000 opcode 10 Rn Rd` -- U and sz clear,
+    // `o1` (bit 23) still separating MIN from MAX (`fmaxv h3, v29.4h` =
+    // 0x0e30fba3, `fminnmv h3, v29.8h` = 0x4eb0cba3, GNU as 2.47).
+    if neon_operand_class(&operands[0]) == Some(b'h') {
+        let q = match arr_n.as_str() {
+            "4h" => 0u32,
+            "8h" => 1,
+            _ => {
+                return Err(format!(
+                    "{mn}: an h result reduces v.4h or v.8h, not v.{arr_n}"
+                ));
+            }
+        };
+        return Ok(EncodeResult::Word(
+            (q << 30)
+                | (0b01110 << 24)
+                | ((size >> 1) << 23)
+                | (0b11000 << 17)
+                | (opcode << 12)
+                | (0b10 << 10)
+                | (rn << 5)
+                | rd,
         ));
     }
-    let (rn, arr_n) = get_neon_reg(operands, 1)?;
+    if neon_operand_class(&operands[0]) != Some(b's') {
+        return Err(format!(
+            "{mn}: the destination must be a scalar FP register (h0-h31 or s0-s31)"
+        ));
+    }
     if arr_n != "4s" {
         return Err(format!(
             "{mn}: source arrangement `v.{arr_n}` has no FP reduction encoding \
@@ -1682,12 +1774,63 @@ pub(crate) fn encode_neon_ld_st_dispatch(
     encode_neon_ld_st_multi(operands, is_load, num_structs)
 }
 
+/// The addressing of an LD/ST multiple- or single-structure instruction:
+/// the base register and the Rm field of the post-indexed forms -- `None`
+/// for plain `[Xn|SP]`, `Some(31)` for `[Xn|SP], #imm`, `Some(m)` for
+/// `[Xn|SP], Xm`.
+///
+/// The immediate is not a free offset: the architecture encodes "advance by
+/// the bytes transferred" (`total`), so any other amount has no word (GAS:
+/// "invalid post-increment amount").  Accepting it encoded the *implied*
+/// amount instead of the written one -- `ld1 {v3.16b}, [x5], #8` advanced the
+/// pointer by 16.  Field 31 is the immediate form, so `xzr`/`sp` cannot be a
+/// post-index register.
+fn ld_st_struct_addressing(
+    operands: &[Operand],
+    total: u32,
+    mn: &str,
+) -> Result<(u32, Option<u32>), String> {
+    if operands.len() > 3 {
+        return Err(format!(
+            "{mn}: expected a register list, an address and at most one post-index, got {} operands",
+            operands.len()
+        ));
+    }
+    match (&operands[1], operands.get(2)) {
+        (Operand::Mem { base, offset: 0 }, None) => Ok((base_gp_reg(base, mn)?, None)),
+        (Operand::Mem { base, offset: 0 }, Some(Operand::Reg(name))) => {
+            Ok((base_gp_reg(base, mn)?, Some(post_index_reg(name, mn)?)))
+        }
+        (Operand::Mem { base, offset: 0 }, Some(Operand::Imm(off)))
+        | (Operand::MemPostIndex { base, offset: off }, None) => {
+            if *off != i64::from(total) {
+                return Err(format!(
+                    "{mn}: post-index #{off} is not the {total} bytes this form transfers; \
+                     the architecture only encodes `[{{Xn|SP}}], #{total}` or `[{{Xn|SP}}], Xm`"
+                ));
+            }
+            Ok((base_gp_reg(base, mn)?, Some(0b11111)))
+        }
+        (Operand::Mem { base, offset }, _) if *offset != 0 => Err(format!(
+            "{mn}: `[{base}, #{offset}]` is an offset address, but structure loads and \
+             stores only take `[Xn|SP]` with optional post-index writeback"
+        )),
+        (Operand::MemRegOffset { base, index, .. }, _) => Err(format!(
+            "{mn}: `[{base}, {index}]` is a register-offset address; write `[{base}], {index}` \
+             for post-index writeback"
+        )),
+        (addr, extra) => Err(format!(
+            "{mn}: expected `[Xn|SP]`, `[Xn|SP], #imm` or `[Xn|SP], Xm`, got {addr:?}{}",
+            extra.map_or(String::new(), |e| format!(", {e:?}"))
+        )),
+    }
+}
+
 /// Encode NEON LD/ST single structure (element):
 /// st1 {v0.s}[0], [x3]
-/// st2 {v0.s, v1.s}[0], [x3]
-/// st4 {v0.s, v1.s, v2.s, v3.s}[0], [x3]
+/// st2 {v0.s, v1.s}[0], [x3], #8
+/// st4 {v0.s, v1.s, v2.s, v3.s}[0], [x3], x4
 /// ld2 {v0.s, v1.s}[0], [x3]
-// TODO: add post-index form [Xn], #imm
 pub(crate) fn encode_neon_ld_st_single(
     operands: &[Operand],
     is_load: bool,
@@ -1764,29 +1907,14 @@ pub(crate) fn encode_neon_ld_st_single(
         }
     }
 
-    // Get base register and check for post-index
-    let (rn, post_index) = match &operands[1] {
-        Operand::Mem { base, offset: 0 } => {
-            let rn =
-                parse_reg_num(base).ok_or_else(|| format!("invalid base register: {}", base))?;
-            // Check for post-index immediate: operands[2] is the post-index offset
-            let pi = if operands.len() > 2 {
-                match &operands[2] {
-                    Operand::Imm(off) => Some(*off),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            (rn, pi)
-        }
-        Operand::MemPostIndex { base, offset } => {
-            let rn =
-                parse_reg_num(base).ok_or_else(|| format!("invalid base register: {}", base))?;
-            (rn, Some(*offset))
-        }
-        _ => return Err("expected [Xn] memory operand".to_string()),
+    let mn = format!("{}{num_structs}", if is_load { "ld" } else { "st" });
+    let elem_bytes = match elem_size.as_str() {
+        "b" => 1u32,
+        "h" => 2,
+        "s" => 4,
+        _ => 8,
     };
+    let (rn, post_rm) = ld_st_struct_addressing(operands, num_structs * elem_bytes, &mn)?;
 
     let l_bit = if is_load { 1u32 } else { 0u32 };
 
@@ -1837,14 +1965,18 @@ pub(crate) fn encode_neon_ld_st_single(
         }
     };
 
-    if let Some(_offset) = post_index {
-        // Post-index form: Q 0011011 L R 11111 opcode S size Rn Rt
-        // (Rm=11111 means immediate post-index, the amount is implicit from element size)
+    if let Some(rm) = post_rm {
+        // Post-index form: Q 0011011 L R Rm opcode S size Rn Rt, where Rm=11111
+        // is the immediate form (the amount is implied by the transfer size)
+        // and any other Rm is the register form.  The register form used to
+        // be dropped on the floor: `ld1 {v3.d}[1], [x5], x6` assembled as the
+        // non-writeback `ld1 {v3.d}[1], [x5]` (0x4d4084a3 for GAS's
+        // 0x4dc684a3), so a lane-load loop never advanced its pointer.
         let word = (q_bit << 30)
             | (0b0011011 << 23)
             | (l_bit << 22)
             | (r_bit << 21)
-            | (0b11111 << 16)
+            | (rm << 16)
             | (opcode << 13)
             | (s_bit << 12)
             | (size_field << 10)
@@ -1906,26 +2038,22 @@ pub(crate) fn encode_neon_ld_st_multi(
     };
 
     let (q, size) = neon_arr_to_q_size(&arr)?;
-
-    // Second operand: [Xn] memory base or [Xn], #imm (post-index, merged by parser)
-    let (rn, post_index) = match &operands[1] {
-        Operand::Mem { base, offset: 0 } => {
-            let r =
-                parse_reg_num(base).ok_or_else(|| format!("invalid base register: {}", base))?;
-            (r, None)
-        }
-        Operand::MemPostIndex { base, offset } => {
-            let r =
-                parse_reg_num(base).ok_or_else(|| format!("invalid base register: {}", base))?;
-            (r, Some(*offset))
-        }
-        _ => {
+    let mn = format!("{}{num_structs}", if is_load { "ld" } else { "st" });
+    // LD2-LD4/ST2-ST4 interleave exactly `n` registers and have no 64-bit
+    // element `.1d` form; LD1/ST1 take one to four registers of any
+    // arrangement.  `ld2 {v3.4s}, [x5]` used to assemble -- as an LD2 that
+    // also overwrites v4, which the source never named.
+    if num_structs > 1 {
+        if num_regs != num_structs {
             return Err(format!(
-                "ld{}/st{}: expected [Xn] memory operand",
-                num_structs, num_structs
+                "{mn}: the register list must hold exactly {num_structs} registers, got {num_regs}"
             ));
         }
-    };
+        if arr == "1d" {
+            return Err(format!("{mn}: there is no `.1d` form (use ld1/st1)"));
+        }
+    }
+    let (rn, post_rm) = ld_st_struct_addressing(operands, num_regs * (8 << q), &mn)?;
 
     // opcode field based on structure count and number of registers:
     // LD1/ST1: 1 reg=0111, 2 reg=1010, 3 reg=0110, 4 reg=0010
@@ -1948,43 +2076,16 @@ pub(crate) fn encode_neon_ld_st_multi(
 
     let l_bit = if is_load { 1u32 } else { 0u32 };
 
-    // Handle post-index form from merged MemPostIndex
-    if let Some(_imm) = post_index {
-        // Post-index with immediate: use Rm=11111 (0x1F)
+    // Post-index: `0 Q 001100 1 L 0 Rm opcode size Rn Rt`, Rm = 11111 for the
+    // immediate form (validated against the transfer size above).
+    if let Some(rm) = post_rm {
         let word = ((q << 30) | (0b001100 << 24) | (1 << 23) | (l_bit << 22))
-            | (0b11111 << 16)
+            | (rm << 16)
             | (opcode << 12)
             | (size << 10)
             | (rn << 5)
             | rt;
         return Ok(EncodeResult::Word(word));
-    }
-
-    // Check for post-index form via separate operands: [Xn], Xm
-    if operands.len() > 2 {
-        match &operands[2] {
-            Operand::Imm(_) => {
-                // Post-index with immediate: use Rm=11111
-                let word = ((q << 30) | (0b001100 << 24) | (1 << 23) | (l_bit << 22))
-                    | (0b11111 << 16)
-                    | (opcode << 12)
-                    | (size << 10)
-                    | (rn << 5)
-                    | rt;
-                return Ok(EncodeResult::Word(word));
-            }
-            Operand::Reg(rm_name) => {
-                let rm = parse_reg_num(rm_name).ok_or("invalid rm")?;
-                let word = ((q << 30) | (0b001100 << 24) | (1 << 23) | (l_bit << 22))
-                    | (rm << 16)
-                    | (opcode << 12)
-                    | (size << 10)
-                    | (rn << 5)
-                    | rt;
-                return Ok(EncodeResult::Word(word));
-            }
-            _ => {}
-        }
     }
 
     // No post-index: LD1/ST1 {Vt.T...}, [Xn]
@@ -2382,12 +2483,38 @@ pub(crate) fn encode_neon_float_three_same(
         "2s" => (0u32, 0u32),
         "4s" => (1, 0),
         "2d" => (1, 1),
-        // Deliberately no `s`/`d` here: the scalar spellings of these
-        // mnemonics are not this encoding class with bit 28 set (measured:
-        // `fmax s0, s1, s2` = 0x1e224820, whose fields sit elsewhere), and
-        // they already reach the scalar FP encoder that knows that class --
-        // `fcmeq s0, s1, s2` (GAS: 0x5e22e420) is the one gap left in the
-        // compare family, recorded with the measurement rather than guessed at.
+        // FEAT_FP16 vectors live in their own three-same class, `0 Q U 01110
+        // a 10 Rm 00 opc 1 Rn Rd`, whose 3-bit `opc` is the low three bits of
+        // the single/double opcode: every caller passes an FP opcode of the
+        // `0b11xxx` group, and each (U, a, opc) cell it can form is allocated
+        // to the same operation (`fadd v3.4h` = 0x0e5117a3, `fmulx v3.8h` =
+        // 0x4e511fa3, `fabd v3.4h` = 0x2ed117a3, GNU as 2.47).  Without this
+        // arm every half-precision vector arithmetic op was unassemblable.
+        "4h" | "8h" => {
+            debug_assert_eq!(
+                opcode >> 3,
+                0b11,
+                "FP16 three-same opcodes are the 0b11xxx group"
+            );
+            let q = u32::from(arr_d == "8h");
+            return Ok(EncodeResult::Word(
+                (q << 30)
+                    | (u_bit << 29)
+                    | (0b01110 << 24)
+                    | (size_hi << 23)
+                    | (0b10 << 21)
+                    | (rm << 16)
+                    | ((opcode & 0b111) << 11)
+                    | (1 << 10)
+                    | (rn << 5)
+                    | rd,
+            ));
+        }
+        // Deliberately no `h`/`s`/`d` here: the scalar spellings belong to
+        // other classes -- FP data-processing for `fmax s0, s1, s2`
+        // (0x1e224820), the Advanced-SIMD scalar three-same class for
+        // `fcmeq s0, s1, s2` (0x5e22e420) -- which their own leaves encode
+        // (`encode_fp_arith`, `encode_neon_fp_scalar_three_same`).
         _ => {
             return Err(format!(
                 "float three-same: unsupported arrangement: {}",
@@ -2484,6 +2611,15 @@ pub(crate) fn encode_neon_float_two_misc(
     size_hi: u32,
     opcode: u32,
 ) -> Result<EncodeResult, String> {
+    if operands.len() != 2 {
+        return Err(format!(
+            "float two-misc: expected 2 operands, got {}",
+            operands.len()
+        ));
+    }
+    // One size/Q field for both registers: `fneg v3.4s, v29.2d` has no word
+    // (GAS rejects it); it used to assemble as `fneg v3.4s, v29.4s`.
+    neon_shapes_agree(operands, 2, "float two-misc")?;
     let (rd, arr_d) = get_neon_reg(operands, 0)?;
     let (rn, _) = get_neon_reg(operands, 1)?;
     // GAS 2.47-measured law (every (op, arrangement) cell probed):
@@ -3111,6 +3247,13 @@ fn base_gp_reg(name: &str, mn: &str) -> Result<u32, String> {
             "{mn}: base register `{name}` must be 64-bit; `wsp` cannot be a base"
         ));
     }
+    // Field 31 of a base slot is the stack pointer: the zero register has no
+    // spelling here, and accepting `[xzr]` silently addressed `[sp]`.
+    if lower == "xzr" || lower == "wzr" {
+        return Err(format!(
+            "{mn}: `{name}` cannot be a base register (x0-x30 or sp)"
+        ));
+    }
     if lower.starts_with('w') {
         return Err(format!(
             "{mn}: base register `{name}` must be 64-bit (x0-x30 or sp)"
@@ -3162,14 +3305,14 @@ pub(crate) fn encode_neon_float_cmp_zero(
     let (rn, _) = get_neon_reg(operands, 1)?;
     let arr_d = match arr_d.as_str() {
         "" => match operands.first() {
-            Some(Operand::Reg(name)) if name.starts_with('s') || name.starts_with('d') => {
-                name[..1].to_string()
+            Some(Operand::Reg(name)) if name.starts_with(['h', 's', 'd', 'H', 'S', 'D']) => {
+                name[..1].to_ascii_lowercase()
             }
             _ => arr_d,
         },
         _ => arr_d,
     };
-    let scalar = matches!(arr_d.as_str(), "s" | "d");
+    let scalar = matches!(arr_d.as_str(), "h" | "s" | "d");
     let (q, sz, x) = match arr_d.as_str() {
         "2s" => (0u32, 0u32, 0u32),
         "4s" => (1, 0, 0),
@@ -3184,6 +3327,9 @@ pub(crate) fn encode_neon_float_cmp_zero(
         // match, so the scalar forms were unreachable in both senses.
         "s" => (1, 0, 0),
         "d" => (1, 1, 0),
+        // FEAT_FP16 scalar: the FP16 two-misc class bits, as for the `4h`
+        // vector (`fcmeq h3, h29, #0.0` = 0x5ef8dba3, GNU as 2.47).
+        "h" => (1, 1, 0b110),
         _ => return Err(format!("float cmp zero: unsupported: {}", arr_d)),
     };
     let size = (size_hi << 1) | sz;
@@ -3229,7 +3375,19 @@ pub(crate) fn encode_neon_elem(
         0b10 => ((index >> 1) & 1, index & 1, (rm >> 4) & 1),
         _ => return Err("unsupported element size for by-element".to_string()),
     };
-    let rm_enc = if size == 0b01 { rm & 0xF } else { rm & 0x1F };
+    // Same law as the long forms: `.h` elements reach v0-v15 only, and the
+    // index must exist (`mul v0.4h, v1.4h, v2.h[8]` has no word).
+    if size == 0b01 && (rm > 15 || index > 7) {
+        return Err(format!(
+            "by-element: `v{rm}.h[{index}]` is not encodable (v0-v15, index 0-7)"
+        ));
+    }
+    if size == 0b10 && index > 3 {
+        return Err(format!(
+            "by-element: `.s[{index}]` index out of range 0 to 3"
+        ));
+    }
+    let rm_enc = rm & 0xF;
     let word = (q << 30)
         | (u << 29)
         | (0b01111 << 24)
@@ -3450,12 +3608,27 @@ pub(crate) fn encode_neon_fcvtl(
     operands: &[Operand],
     is_high: bool,
 ) -> Result<EncodeResult, String> {
+    if operands.len() != 2 {
+        return Err(format!(
+            "fcvtl: expected 2 operands, got {}",
+            operands.len()
+        ));
+    }
     let (rd, arr_d) = get_neon_reg(operands, 0)?;
-    let (rn, _) = get_neon_reg(operands, 1)?;
-    let sz = match arr_d.as_str() {
-        "4s" | "2s" => 0u32,
-        "2d" => 1,
-        _ => return Err(format!("fcvtl: unsupported dest: {}", arr_d)),
+    let (rn, arr_n) = get_neon_reg(operands, 1)?;
+    // The destination fixes the element width and the mnemonic fixes which
+    // half of the source is read; any other pairing has no word (GNU as
+    // rejects `fcvtl v3.2d, v29.4s` and `fcvtl2 v3.2d, v29.2s`, which this
+    // leaf used to assemble from the destination alone).
+    let sz = match (arr_d.as_str(), arr_n.as_str(), is_high) {
+        ("4s", "4h", false) | ("4s", "8h", true) => 0u32,
+        ("2d", "2s", false) | ("2d", "4s", true) => 1,
+        _ => {
+            return Err(format!(
+                "{}: no form widens `{arr_n}` into `{arr_d}`",
+                if is_high { "fcvtl2" } else { "fcvtl" }
+            ));
+        }
     };
     let q = if is_high { 1u32 } else { 0 };
     let word = (q << 30)
@@ -3474,12 +3647,25 @@ pub(crate) fn encode_neon_fcvtn(
     operands: &[Operand],
     is_high: bool,
 ) -> Result<EncodeResult, String> {
-    let (rd, _) = get_neon_reg(operands, 0)?;
+    if operands.len() != 2 {
+        return Err(format!(
+            "fcvtn: expected 2 operands, got {}",
+            operands.len()
+        ));
+    }
+    let (rd, arr_d) = get_neon_reg(operands, 0)?;
     let (rn, arr_n) = get_neon_reg(operands, 1)?;
-    let sz = match arr_n.as_str() {
-        "4s" | "2s" => 0u32,
-        "2d" => 1,
-        _ => return Err(format!("fcvtn: unsupported source: {}", arr_n)),
+    // Same law as FCVTL in the narrowing direction: `fcvtn v3.4h, v29.2s`
+    // and `fcvtn v3.4s, v29.2d` have no word (GAS rejects both).
+    let sz = match (arr_d.as_str(), arr_n.as_str(), is_high) {
+        ("4h", "4s", false) | ("8h", "4s", true) => 0u32,
+        ("2s", "2d", false) | ("4s", "2d", true) => 1,
+        _ => {
+            return Err(format!(
+                "{}: no form narrows `{arr_n}` into `{arr_d}`",
+                if is_high { "fcvtn2" } else { "fcvtn" }
+            ));
+        }
     };
     let q = if is_high { 1u32 } else { 0 };
     let word = (q << 30)
@@ -3530,52 +3716,17 @@ pub(crate) fn encode_neon_bitwise_insert(
 /// Scalar form: FADDP Sd, Vn.2S  or FADDP Dd, Vn.2D
 ///   Format: 01 1 11110 0 sz 11000 01101 10 Rn Rd
 pub(crate) fn encode_neon_faddp(operands: &[Operand]) -> Result<EncodeResult, String> {
-    if operands.len() >= 3 {
-        // Vector form: 3 operands
-        let (rd, arr_d) = get_neon_reg(operands, 0)?;
-        let (rn, _) = get_neon_reg(operands, 1)?;
-        let (rm, _) = get_neon_reg(operands, 2)?;
-        let (q, sz) = match arr_d.as_str() {
-            "2s" => (0u32, 0u32),
-            "4s" => (1, 0),
-            "2d" => (1, 1),
-            _ => return Err(format!("faddp: unsupported arrangement: {}", arr_d)),
-        };
-        let word = (q << 30)
-            | (1 << 29)
-            | (0b01110 << 24)
-            | (sz << 22)
-            | (1 << 21)
-            | (rm << 16)
-            | (0b110101 << 10)
-            | (rn << 5)
-            | rd;
-        Ok(EncodeResult::Word(word))
-    } else if operands.len() == 2 {
-        // Scalar form: FADDP Sd, Vn.2S or FADDP Dd, Vn.2D
-        let rd = match &operands[0] {
-            Operand::Reg(r) => parse_reg_num(r).ok_or("invalid dest reg")?,
-            _ => return Err("faddp scalar: expected register".to_string()),
-        };
-        let (rn, arr_n) = get_neon_reg(operands, 1)?;
-        let sz = match arr_n.as_str() {
-            "2s" => 0u32,
-            "2d" => 1,
-            _ => return Err(format!("faddp scalar: unsupported source: {}", arr_n)),
-        };
-        // 01 1 11110 0 sz 11000 01101 10 Rn Rd
-        let word = (0b01 << 30)
-            | (1 << 29)
-            | (0b11110 << 24)
-            | (sz << 22)
-            | (0b11000 << 17)
-            | (0b01101 << 12)
-            | (0b10 << 10)
-            | (rn << 5)
-            | rd;
-        Ok(EncodeResult::Word(word))
-    } else {
-        Err("faddp requires 2 or 3 operands".to_string())
+    // FADDP (vector) is float three-same U=1, a=0, opcode 11010 -- the shared
+    // leaf checks that all three shapes agree and covers the FEAT_FP16 `4h`/
+    // `8h` forms (`faddp v3.8h, v29.8h, v17.8h` = 0x6e5117a3); the scalar
+    // pairwise leaf checks that the result width matches the `2h`/`2s`/`2d`
+    // source (`faddp h3, v29.2h` = 0x5e30dba3).  The previous body checked
+    // neither: `faddp v3.4s, v29.4s, v17.2s` and `faddp d3, v29.2s`
+    // assembled although GAS rejects both.
+    match operands.len() {
+        3 => encode_neon_float_three_same(operands, 1, 0, 0b11010),
+        2 => encode_neon_fp_scalar_pairwise(operands, 0, 0b01101, "faddp"),
+        n => Err(format!("faddp requires 2 or 3 operands, got {n}")),
     }
 }
 
@@ -3620,9 +3771,10 @@ pub(crate) fn encode_neon_shift_left_imm(
     if operands.len() < 3 {
         return Err("shift left immediate requires 3 operands".to_string());
     }
+    neon_shapes_agree(operands, 2, "shift left immediate")?;
     let (rd, arr_d) = get_neon_reg(operands, 0)?;
     let (rn, _) = get_neon_reg(operands, 1)?;
-    let shift = get_imm(operands, 2)? as u32;
+    let shift_imm = get_imm(operands, 2)?;
 
     let (q, _immh_base, esize) = match arr_d.as_str() {
         "8b" => (0u32, 0b0001u32, 8u32),
@@ -3640,6 +3792,16 @@ pub(crate) fn encode_neon_shift_left_imm(
         }
     };
 
+    // The shift must stay inside the element: `esize + shift` with shift >=
+    // esize carries into the next `immh` class, i.e. encodes a shift of a
+    // *wider* element (GAS rejects `shl v0.8b, v1.8b, #8`).
+    if !(0..i64::from(esize)).contains(&shift_imm) {
+        return Err(format!(
+            "shift left immediate: #{shift_imm} out of range 0 to {} for .{arr_d}",
+            esize - 1
+        ));
+    }
+    let shift = shift_imm as u32;
     // immh:immb = esize + shift_amount
     // For 8-bit: immh=0001, shift in 0..7 => immh:immb = 8 + shift
     // For 16-bit: immh=001x, shift in 0..15 => immh:immb = 16 + shift

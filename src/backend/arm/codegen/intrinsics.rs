@@ -193,12 +193,78 @@ impl ArmCodegen {
         }
     }
 
-    /// Emit a unary F32 operation: apply `op_inst` with the operand in s0, store result.
+    /// Emit a unary F32 operation: apply `op_inst` straight into the dest's
+    /// FP register when it has one (as `emit_f64_unary_neon` does), else
+    /// with the operand in s0, then store the result.
     fn emit_f32_unary_neon(&mut self, dest: &Option<Value>, args: &[Operand], op_inst: &str) {
+        let dest_reg = dest.and_then(|d| {
+            self.reg_assignments
+                .get(&d.0)
+                .copied()
+                .filter(|&phys| is_arm_fp_phys(phys))
+                .map(|phys| arm_fp_name(phys, IrType::F32))
+        });
+        if let Some(dreg) = dest_reg {
+            let src = self.float_operand_reg(&args[0], IrType::F32, "s0");
+            self.state
+                .emit_fmt(format_args!("    {} {}, {}", op_inst, dreg, src));
+            return;
+        }
         self.float_operand_to_reg(&args[0], IrType::F32, "s0");
         self.state.emit_fmt(format_args!("    {} s0, s0", op_inst));
         if let Some(d) = dest {
             self.store_float_reg(d, IrType::F32, "s0");
+        }
+    }
+
+    /// The dest's FP register (`dN`/`sN`) when it has one.
+    fn fp_dest_reg(&self, dest: &Option<Value>, ty: IrType) -> Option<String> {
+        dest.and_then(|d| {
+            self.reg_assignments
+                .get(&d.0)
+                .copied()
+                .filter(|&phys| is_arm_fp_phys(phys))
+                .map(|phys| arm_fp_name(phys, ty))
+        })
+    }
+
+    /// `copysign(x, y)`: x's magnitude under y's sign as one bit select,
+    /// `bif out, y, mask` with mask = every bit but the sign (Clang's
+    /// sequence).  The integer form crossed to x0/x1 and back: 8
+    /// instructions plus moves.  The mask is `mvni v2.4s, #0x80, lsl #24`
+    /// (0x7fffffff) for F32 and all-ones with each lane's sign cleared by
+    /// `fneg` (0x7fff_ffff_ffff_ffff) for F64.  `bif` overwrites its first
+    /// operand, so x moves into the output first -- through v0 when the
+    /// output is y's register, which that move would destroy.
+    fn emit_scalar_copysign(&mut self, dest: &Option<Value>, args: &[Operand], ty: IrType) {
+        let (s0, s1) = if ty == IrType::F32 {
+            ("s0", "s1")
+        } else {
+            ("d0", "d1")
+        };
+        let x = self.float_operand_reg(&args[0], ty, s0);
+        let y = self.float_operand_reg(&args[1], ty, s1);
+        let out = self
+            .fp_dest_reg(dest, ty)
+            .filter(|o| *o == x || *o != y)
+            .unwrap_or_else(|| s0.to_string());
+        if ty == IrType::F32 {
+            self.state.emit("    mvni v2.4s, #0x80, lsl #24");
+        } else {
+            self.state.emit("    movi v2.2d, #0xffffffffffffffff");
+            self.state.emit("    fneg v2.2d, v2.2d");
+        }
+        if out != x {
+            self.state.emit_fmt(format_args!("    fmov {out}, {x}"));
+        }
+        let vec = |r: &str| format!("v{}", &r[1..]);
+        self.state.emit_fmt(format_args!(
+            "    bif {}.8b, {}.8b, v2.8b",
+            vec(&out),
+            vec(&y)
+        ));
+        if let Some(d) = dest {
+            self.store_float_reg(d, ty, &out);
         }
     }
 
@@ -595,23 +661,21 @@ impl ArmCodegen {
                 };
                 self.emit_f32_unary_neon(dest, args, frint);
             }
-            IntrinsicOp::FmaScalarF64 => {
-                // dest = a*b + c, single rounding: native fmadd.
-                self.float_operand_to_reg(&args[0], IrType::F64, "d0");
-                self.float_operand_to_reg(&args[1], IrType::F64, "d1");
-                self.float_operand_to_reg(&args[2], IrType::F64, "d2");
-                self.state.emit("    fmadd d0, d0, d1, d2");
+            IntrinsicOp::FmaScalarF64 | IntrinsicOp::FmaScalarF32 => {
+                // dest = a*b + c, single rounding: one `fmadd` from the
+                // operands' registers into the dest's (the signed hook with
+                // neither negation).  The fixed-scratch form copied every
+                // allocated operand into d0-d2 and the result back out:
+                // `fma(a, b, c)` was 7 instructions for Clang's 1.
                 if let Some(d) = dest {
-                    self.store_float_reg(d, IrType::F64, "d0");
-                }
-            }
-            IntrinsicOp::FmaScalarF32 => {
-                self.float_operand_to_reg(&args[0], IrType::F32, "s0");
-                self.float_operand_to_reg(&args[1], IrType::F32, "s1");
-                self.float_operand_to_reg(&args[2], IrType::F32, "s2");
-                self.state.emit("    fmadd s0, s0, s1, s2");
-                if let Some(d) = dest {
-                    self.store_float_reg(d, IrType::F32, "s0");
+                    let ty = if matches!(op, IntrinsicOp::FmaScalarF64) {
+                        IrType::F64
+                    } else {
+                        IrType::F32
+                    };
+                    self.emit_fused_fma_signed_impl(
+                        &args[0], &args[1], &args[2], d, ty, false, false,
+                    );
                 }
             }
             IntrinsicOp::FmaScalarF64Signed(np, na) | IntrinsicOp::FmaScalarF32Signed(np, na) => {
@@ -627,34 +691,8 @@ impl ArmCodegen {
                     self.emit_fused_fma_signed_impl(&args[0], &args[1], &args[2], &d, ty, *np, *na);
                 }
             }
-            IntrinsicOp::CopysignF64 => {
-                // result = |x| with y's sign bit: pure integer bit ops on
-                // the F64 bit patterns (no branch, no libm call).
-                self.float_operand_to_reg(&args[0], IrType::F64, "d0");
-                self.float_operand_to_reg(&args[1], IrType::F64, "d1");
-                self.state.emit("    fmov x0, d0");
-                self.state.emit("    fmov x1, d1");
-                self.state.emit("    and x0, x0, #0x7fffffffffffffff");
-                self.state.emit("    and x1, x1, #0x8000000000000000");
-                self.state.emit("    orr x0, x0, x1");
-                self.state.emit("    fmov d0, x0");
-                if let Some(d) = dest {
-                    self.store_float_reg(d, IrType::F64, "d0");
-                }
-            }
-            IntrinsicOp::CopysignF32 => {
-                self.float_operand_to_reg(&args[0], IrType::F32, "s0");
-                self.float_operand_to_reg(&args[1], IrType::F32, "s1");
-                self.state.emit("    fmov w0, s0");
-                self.state.emit("    fmov w1, s1");
-                self.state.emit("    and w0, w0, #0x7fffffff");
-                self.state.emit("    and w1, w1, #0x80000000");
-                self.state.emit("    orr w0, w0, w1");
-                self.state.emit("    fmov s0, w0");
-                if let Some(d) = dest {
-                    self.store_float_reg(d, IrType::F32, "s0");
-                }
-            }
+            IntrinsicOp::CopysignF64 => self.emit_scalar_copysign(dest, args, IrType::F64),
+            IntrinsicOp::CopysignF32 => self.emit_scalar_copysign(dest, args, IrType::F32),
             // x86-specific SSE/AES-NI/CLMUL intrinsics - these are x86-only and should
             // not appear in ARM codegen in practice. Cross-compiled code that conditionally
             // uses these behind #ifdef __x86_64__ will have the calls dead-code eliminated.

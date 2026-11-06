@@ -551,14 +551,19 @@ impl ArmCodegen {
     /// `x * 5` is `add d, x, x, lsl #2` (one instruction, one or two cycles)
     /// where the multiplier path was `mov x0, #5; mul d, x, x0` (two
     /// instructions and the 2-4 cycle multiplier latency).  GCC and Clang
-    /// pick the same sequences.  Returns false when no plan applies.
+    /// pick the same sequences.  Returns false when no plan applies (and for
+    /// every type that is not a scalar integer of at most 64 bits).
     fn emit_mul_by_shift_add(
         &mut self,
         dest: &Value,
         lhs: &Operand,
         rhs: &Operand,
-        use_32bit: bool,
+        ty: IrType,
     ) -> bool {
+        if !ty.is_integer() || ty.size() > 8 {
+            return false;
+        }
+        let use_32bit = ty == IrType::I32 || ty == IrType::U32;
         // The constant, sign-extended: the product is taken modulo the
         // register width, so only the constant's value modulo 2^width
         // matters and a narrow negative constant keeps its short plan.
@@ -636,11 +641,7 @@ impl ArmCodegen {
     ) {
         let use_32bit = ty == IrType::I32 || ty == IrType::U32;
 
-        if op == IrBinOp::Mul
-            && ty.is_integer()
-            && ty.size() <= 8
-            && self.emit_mul_by_shift_add(dest, lhs, rhs, use_32bit)
-        {
+        if op == IrBinOp::Mul && self.emit_mul_by_shift_add(dest, lhs, rhs, ty) {
             return;
         }
 

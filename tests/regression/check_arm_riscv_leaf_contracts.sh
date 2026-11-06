@@ -20,10 +20,14 @@
 #    forms (2^k +- 1) << m are shift-adds.
 #  - The emitter's call annotation (`// lccc-call-reads`) never reaches the
 #    output.
+#  - FP negation is one `fneg` (no constant-pool XOR through x0); `fabs`,
+#    `copysign` (`bif`) and `fma` (`fmadd`) are inline instructions in
+#    frameless leaves, never libm calls.
 # RISC-V:
 #  - `x | 1u << n` is `sllw` + `or` + one `sext.w`, a returned `unsigned`
 #    parameter is a bare `ret` (it arrives sign-extended), a variadic
 #    function's CFA is s0 + 64 and saved callee-saved registers have rows.
+#  - `fma`/`fmaf` are `fmadd.d`/`fmadd.s`, not calls into libm.
 set -euo pipefail
 
 CCC=${LCCC_BIN:-${CCC:-target/fastbuild/lccc}}
@@ -93,6 +97,12 @@ void axpy_f(float *restrict y, const float *restrict x, float a, int n)
     for (int i = 0; i < n; i++)
         y[i] = a * x[i] + y[i];
 }
+double negd(double x) { return -x; }
+float negf(float x) { return -x; }
+double absd(double x) { return __builtin_fabs(x); }
+double csd(double x, double y) { return __builtin_copysign(x, y); }
+float csf(float x, float y) { return __builtin_copysignf(x, y); }
+double fmad(double a, double b, double c) { return __builtin_fma(a, b, c); }
 EOF
 
 if [ -x "$ARM" ]; then
@@ -134,6 +144,16 @@ if [ -x "$ARM" ]; then
     has "$a" axpy_d '^fmla v[0-9]+\.2d, ' || bad "AArch64 axpy_d: no packed fmla"
     has "$a" axpy_f '^fmla v[0-9]+\.4s, ' || bad "AArch64 axpy_f: no packed fmla"
     has "$a" call_one '^bl h1$' || bad "AArch64 call_one: the call is not a bare bl"
+    for f in negd negf absd csd csf fmad; do
+        if has "$a" "$f" 'x29|x30|^bl '; then bad "AArch64 $f: FP sign/fused op built a frame or called out"; fi
+    done
+    has "$a" negd '^fneg d[0-9]+, d[0-9]+$' || bad "AArch64 negd: negation is not one fneg"
+    has "$a" negf '^fneg s[0-9]+, s[0-9]+$' || bad "AArch64 negf: negation is not one fneg"
+    if has "$a" negd '^(eor|ldr|adrp) '; then bad "AArch64 negd: negation through a constant-pool XOR"; fi
+    has "$a" absd '^fabs d[0-9]+, ' || bad "AArch64 absd: no fabs"
+    has "$a" csd '^bif v[0-9]+\.8b, ' || bad "AArch64 csd: copysign is not a bif select"
+    has "$a" csf '^bif v[0-9]+\.8b, ' || bad "AArch64 csf: copysign is not a bif select"
+    has "$a" fmad '^fmadd d[0-9]+, ' || bad "AArch64 fmad: fma is not fmadd"
     if grep -q 'lccc-call-reads' "$a"; then bad "AArch64: call annotation leaked into the output"; fi
 else
     echo "note: $ARM is absent; AArch64 leg skipped"
@@ -159,6 +179,8 @@ long keep(long a)
     g(a + 1);
     return a;
 }
+double fmad(double a, double b, double c) { return __builtin_fma(a, b, c); }
+float fmaf_(float a, float b, float c) { return __builtin_fmaf(a, b, c); }
 EOF
 
 if [ -x "$RV" ]; then
@@ -172,6 +194,11 @@ if [ -x "$RV" ]; then
         bad "RISC-V vsum: variadic CFA is not s0 + 64"
     awk '$0 == "keep:" { on = 1 } on && /\.cfi_offset s1, -[0-9]+/ { ok = 1 } on && /^\.size/ { exit } END { exit !ok }' "$r" ||
         bad "RISC-V keep: no .cfi_offset row for saved s1"
+    has "$r" fmad '^fmadd\.d ' || bad "RISC-V fmad: fma is not fmadd.d"
+    has "$r" fmaf_ '^fmadd\.s ' || bad "RISC-V fmaf_: fmaf is not fmadd.s"
+    for f in fmad fmaf_; do
+        if has "$r" "$f" '^call '; then bad "RISC-V $f: fused multiply-add became a libm call"; fi
+    done
 else
     echo "note: $RV is absent; RISC-V leg skipped"
 fi

@@ -907,6 +907,13 @@ pub(crate) fn encode_logical(
     opc: u32,
     mn: &str,
 ) -> Result<EncodeResult, String> {
+    // ORR (vector, immediate): `orr v3.4s, #0x12, lsl #16`.
+    if opc == 0b01
+        && matches!(operands.first(), Some(Operand::RegArrangement { .. }))
+        && matches!(operands.get(1), Some(Operand::Imm(_)))
+    {
+        return encode_neon_orr_bic_imm(operands, false);
+    }
     if operands.len() < 3 {
         return Err("logical op requires 3 operands".to_string());
     }
@@ -1741,6 +1748,12 @@ pub(crate) fn encode_bics(operands: &[Operand]) -> Result<EncodeResult, String> 
 /// Scalar immediate: BIC Xd, Xn, #imm -> AND Xd, Xn, #~imm
 /// NEON vector: BIC Vd.T, Vn.T, Vm.T
 pub(crate) fn encode_bic(operands: &[Operand]) -> Result<EncodeResult, String> {
+    // BIC (vector, immediate): `bic v3.8h, #0x12`.
+    if matches!(operands.first(), Some(Operand::RegArrangement { .. }))
+        && matches!(operands.get(1), Some(Operand::Imm(_)))
+    {
+        return encode_neon_orr_bic_imm(operands, true);
+    }
     if operands.len() < 3 {
         return Err("bic requires 3 operands".to_string());
     }
