@@ -3,6 +3,11 @@
 pub struct PassPolicy {
     pub wrap_signed_overflow: bool,
     pub fp_environment_observable: bool,
+    /// `-ffinite-math-only` (possibly implied by -ffast-math / -Ofast): the
+    /// compiler may assume no NaN and no infinity. Carried with the IR, never
+    /// read from ambient thread state, so a unit compiled with the flag cannot
+    /// leak the assumption into another unit in the same process.
+    pub finite_math_only: bool,
     /// Which standard-library functions may be assumed to BE the library
     /// function (and so be synthesized, folded into, or expanded inline).
     pub builtins: BuiltinPolicy,
@@ -13,7 +18,15 @@ impl PassPolicy {
         Self {
             wrap_signed_overflow,
             fp_environment_observable,
+            finite_math_only: false,
             builtins: BuiltinPolicy::HOSTED,
+        }
+    }
+
+    pub const fn with_finite_math_only(self, finite_math_only: bool) -> Self {
+        Self {
+            finite_math_only,
+            ..self
         }
     }
 

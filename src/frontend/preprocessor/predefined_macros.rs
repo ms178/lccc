@@ -559,6 +559,51 @@ const PREDEFINED_FUNC_MACROS: &[(&str, &[&str], &str)] = &[
     // - #if evaluation uses resolve_defined_in_expr() in expr_eval.rs
 ];
 
+/// The real-valued Annex F / IEEE-754 claim: the two macros GCC 16.2 removes
+/// when the claim is withdrawn.
+///
+/// Values are copied from `gcc-16 -dM -E` byte for byte. The `__GCC_IEC_559*`
+/// pair is not in either table because it is not removed when withdrawn — GCC
+/// redefines it to 0 — so it needs a different value per state.
+const IEC_559_CLAIM_MACROS: &[(&str, &str)] = &[
+    ("__STDC_IEC_559__", "1"),
+    ("__STDC_IEC_60559_BFP__", "201404L"),
+];
+
+/// The *complex* claim, which `-fcx-limited-range` withdraws on its own (GCC
+/// 16.2 keeps `__STDC_IEC_559__` 1 but drops `__STDC_IEC_559_COMPLEX__`).
+const IEC_559_COMPLEX_CLAIM_MACROS: &[(&str, &str)] = &[
+    ("__STDC_IEC_559_COMPLEX__", "1"),
+    ("__STDC_IEC_60559_COMPLEX__", "201404L"),
+];
+
+/// The source-visible fast-math sub-option macros the driver derives.
+///
+/// A plain POD of `bool`s: it is built once per translation unit from driver
+/// state and consumed by [`Preprocessor::set_fast_math_sub_macros`], so the
+/// whole group is always installed together and the compiler can never publish
+/// a half-updated macro set.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct FastMathSubMacros {
+    /// `__NO_SIGNED_ZEROS__`: the sign of a zero result is not significant.
+    pub no_signed_zeros: bool,
+    /// `__NO_TRAPPING_MATH__`: floating-point traps are not observable.
+    pub no_trapping_math: bool,
+    /// `__RECIPROCAL_MATH__`: `x / y` may become `x * (1 / y)`.
+    pub reciprocal_math: bool,
+    /// `__ASSOCIATIVE_MATH__`: `-funsafe-math-optimizations` is in force
+    /// (GCC 16.2 keys this on the unsafe-math flag, not on reassociation).
+    pub associative_math: bool,
+    /// `__ROUNDING_MATH__`: the dynamic rounding mode is observable.
+    pub rounding_math: bool,
+    /// The Annex F / IEEE-754 conformance claim still holds for real arithmetic.
+    pub iec_559: bool,
+    /// The same claim still holds for complex arithmetic. `-fcx-limited-range`
+    /// withdraws this one on its own, so it is a separate term rather than a
+    /// copy of `iec_559`.
+    pub iec_559_complex: bool,
+}
+
 impl Preprocessor {
     /// Define standard predefined macros.
     ///
@@ -829,14 +874,92 @@ impl Preprocessor {
         }
     }
 
-    /// Define `__FAST_MATH__` when the command line explicitly permits FP
-    /// reassociation. Ordinary optimization levels must not define it.
-    pub fn set_fast_math(&mut self, enabled: bool) {
+    /// Define `__FAST_MATH__` when *every* unsafe-FP sub-contract the driver
+    /// models is active. The argument is the derived source-visible contract,
+    /// not the raw umbrella bit: `-ffast-math -fmath-errno` still reassociates
+    /// code, but GCC 16.2 / Clang 23.1.5 withdraw the macro so headers do not
+    /// take a fast-math-only branch. Ordinary optimization levels and the
+    /// individual `-fassociative-math` / `-funsafe-math-optimizations`
+    /// spellings must not define it.
+    pub fn set_fast_math_macro(&mut self, enabled: bool) {
         if enabled {
             self.define_simple_macro("__FAST_MATH__", "1");
         } else {
             self.macros.undefine("__FAST_MATH__");
         }
+    }
+
+    /// `__FINITE_MATH_ONLY__` is defined by GCC 16.2 and Clang 23.1.5 on
+    /// *every* command line, with value 0 or 1. The static table supplies the
+    /// strict default ("0"); this only has to redefine it to "1" when
+    /// `-ffinite-math-only` (possibly implied by `-ffast-math` / `-Ofast`) is
+    /// active. Source such as glibc's math headers branches on this value.
+    pub fn set_finite_math_only(&mut self, enabled: bool) {
+        self.define_simple_macro("__FINITE_MATH_ONLY__", if enabled { "1" } else { "0" });
+    }
+
+    /// `__NO_MATH_ERRNO__` is defined exactly when `-fno-math-errno` (possibly
+    /// implied by `-ffast-math` / `-Ofast`) is in force; both oracles leave it
+    /// undefined for the C default. It is a presence test in real headers, so
+    /// it must be undefined rather than defined as 0.
+    pub fn set_no_math_errno(&mut self, enabled: bool) {
+        if enabled {
+            self.define_simple_macro("__NO_MATH_ERRNO__", "1");
+        } else {
+            self.macros.undefine("__NO_MATH_ERRNO__");
+        }
+    }
+
+    /// Install every remaining source-visible fast-math sub-option macro in one
+    /// call.
+    ///
+    /// The five are one contract and must never be installed piecemeal: a
+    /// caller that updates four of them leaves the fifth describing a state the
+    /// compiler is no longer in, and the resulting macro set is one no oracle
+    /// ever produces. One POD argument makes the call total — there is no
+    /// partial application to get wrong — and keeps the driver-side derivation
+    /// (`Driver::fast_math_macro_active` and friends) as the only place that
+    /// decides what the flags mean.
+    pub fn set_fast_math_sub_macros(&mut self, m: FastMathSubMacros) {
+        for (name, on) in [
+            ("__NO_SIGNED_ZEROS__", m.no_signed_zeros),
+            ("__NO_TRAPPING_MATH__", m.no_trapping_math),
+            ("__RECIPROCAL_MATH__", m.reciprocal_math),
+            ("__ASSOCIATIVE_MATH__", m.associative_math),
+            ("__ROUNDING_MATH__", m.rounding_math),
+        ] {
+            if on {
+                self.define_simple_macro(name, "1");
+            } else {
+                self.macros.undefine(name);
+            }
+        }
+        // The Annex F conformance claim is the one *withdrawal* in the group:
+        // GCC 16.2 undefines the four standard macros but redefines the two
+        // `__GCC_IEC_559*` ones to 0 rather than removing them, because they
+        // are value tests (`#if __GCC_IEC_559 > 0`) in headers that assume the
+        // macro exists. `__FLT_IS_IEC_60559__` / `__DBL_IS_IEC_60559__` /
+        // `__LDBL_IS_IEC_60559__` are *not* withdrawn — GCC keeps them at 1
+        // under `-ffast-math` — so they stay in the static table untouched.
+        for (name, value) in IEC_559_CLAIM_MACROS {
+            if m.iec_559 {
+                self.define_simple_macro(name, value);
+            } else {
+                self.macros.undefine(name);
+            }
+        }
+        for (name, value) in IEC_559_COMPLEX_CLAIM_MACROS {
+            if m.iec_559_complex {
+                self.define_simple_macro(name, value);
+            } else {
+                self.macros.undefine(name);
+            }
+        }
+        self.define_simple_macro("__GCC_IEC_559", if m.iec_559 { "2" } else { "0" });
+        self.define_simple_macro(
+            "__GCC_IEC_559_COMPLEX",
+            if m.iec_559_complex { "2" } else { "0" },
+        );
     }
 
     /// Define or undefine __CET__ based on -fcf-protection.

@@ -155,7 +155,13 @@ const EXTRA_GCC_PREDEFINES: &[(&str, &str)] = &[
         "__DBL_NORM_MAX__",
         "((double)1.79769313486231570814527423731704357e+308L)",
     ),
-    ("__FINITE_MATH_ONLY__", "0"),
+    // `__FINITE_MATH_ONLY__` is NOT here any more: it is a *dynamic* contract
+    // (0 or 1) owned by `predefined_macros::set_finite_math_only`, driven by
+    // -ffinite-math-only / -ffast-math / -Ofast. This table is installed after
+    // the predefined table, so a hardcoded 0 here silently overwrote the
+    // driver's decision on every path that skipped `configure_preprocessor`.
+    // The single definition lives in `predefined_macros.rs` and is always
+    // refreshed by `Driver::configure_preprocessor`.
     ("__FLOAT_WORD_ORDER__", "__ORDER_LITTLE_ENDIAN__"),
     ("__FLT128_IS_IEC_60559__", "1"),
     ("__FLT32X_DECIMAL_DIG__", "17"),
