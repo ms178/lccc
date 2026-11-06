@@ -11,7 +11,7 @@ GCC 16.2 and Clang 23.1.5.
 
 Measured with GNU gdb (GDB) 18.1 on x86-64 (2026-11-05):
 
-* all three compilers print ``46`` for input 5 at -O2/-Ofast/-Og;
+* all three compilers print ``46`` for input 5 at -O2/-Ofast/-Og/-O4;
 * GDB's backtrace at ``leaf`` is ``leaf -> middle -> top -> main`` for all
   three, so LCCC's unwind info is on par with the oracles;
 * with `-fno-omit-frame-pointer`, LCCC's `info frame` reports a saved ``rbp``;
@@ -60,7 +60,11 @@ LEAF_LINE = next(
     i for i, line in enumerate(SOURCE.splitlines(), 1) if "int leaf(" in line
 )
 
-OPTIONS = ("-O2", "-Ofast", "-Og")
+# `-O4` is the numeric-level path (GCC/Clang clamp it to -O3). Including it
+# here makes the pinned debugger verify host-CPU runtime results, unwind
+# chains and line tables for the newly implemented option, not just its
+# assembly bytes.
+OPTIONS = ("-O2", "-Ofast", "-Og", "-O4")
 INPUTS = (5, -3, 0, 12345)
 FRAME_ORDER = ("leaf", "middle", "top", "main")
 # GDB prints `#0  leaf (...)` for the innermost frame but prefixes outer

@@ -258,6 +258,34 @@ impl Driver {
         }
     }
 
+    /// Own the complete optimization policy for one `-O` spelling. Keeping
+    /// all five fields in one place removes eight duplicated assignment
+    /// blocks (48 lines to 8 one-line calls) and guarantees the `-Ofast`
+    /// withdrawal cannot be forgotten when a new level spelling is added.
+    /// `optimize` and `omit_frame_pointer` are derived from `level > 0`,
+    /// which is exactly what the eight previous arms spelled out.
+    fn set_optimization_level(&mut self, level: u32, size: bool, debug: bool) {
+        self.optimize_debug = debug;
+        self.opt_level = level;
+        self.optimize = level > 0;
+        self.optimize_size = size;
+        self.omit_frame_pointer = level > 0;
+        self.withdraw_implicit_fast_math();
+    }
+
+    /// A plain `-O*` option replaces the optimization *level*. GCC 16.2 and
+    /// Clang 23.1 both treat `-Ofast`'s `-ffast-math` as part of that level's
+    /// default set, so a later `-O2`/`-O3`/`-Os`/... withdraws it -- while an
+    /// explicit `-ffast-math` is a user option and survives the change.
+    /// Measured on the packed reduction fixture (`__FAST_MATH__` + assembly
+    /// SHA-256): both oracles report `-Ofast -O2` == `-O2` and
+    /// `-O3 -ffast-math -O2` still fast-math enabled.
+    fn withdraw_implicit_fast_math(&mut self) {
+        if self.explicit_fast_math.is_none() && self.fast_math {
+            self.set_fast_math(false);
+        }
+    }
+
     /// Parse the value of `-falign-*=N[:M]`: a power-of-two byte alignment
     /// with an optional max-skip (`.p2align` third operand). Returns `None`
     /// for anything GCC would reject at option processing.
@@ -2288,49 +2316,16 @@ impl Driver {
                 "-dM" => self.dump_defines = true,
 
                 // Optimization levels.  Numeric values are interpreted by
-                // passes::run_passes(): 0=-O0, 1=-O1, 2=-O2, 3=-O3, 4=-Os, 5=-Oz.
-                "-O0" => {
-                    self.optimize_debug = false;
-                    self.opt_level = 0;
-                    self.optimize = false;
-                    self.optimize_size = false;
-                    self.omit_frame_pointer = false;
-                }
-                "-O" | "-O1" => {
-                    self.optimize_debug = false;
-                    self.opt_level = 1;
-                    self.optimize = true;
-                    self.optimize_size = false;
-                    self.omit_frame_pointer = true;
-                }
-                "-O2" => {
-                    self.optimize_debug = false;
-                    self.opt_level = 2;
-                    self.optimize = true;
-                    self.optimize_size = false;
-                    self.omit_frame_pointer = true;
-                }
-                "-O3" => {
-                    self.optimize_debug = false;
-                    self.opt_level = 3;
-                    self.optimize = true;
-                    self.optimize_size = false;
-                    self.omit_frame_pointer = true;
-                }
-                "-Os" => {
-                    self.optimize_debug = false;
-                    self.opt_level = 4;
-                    self.optimize = true;
-                    self.optimize_size = true;
-                    self.omit_frame_pointer = true;
-                }
-                "-Oz" => {
-                    self.optimize_debug = false;
-                    self.opt_level = 5;
-                    self.optimize = true;
-                    self.optimize_size = true;
-                    self.omit_frame_pointer = true;
-                }
+                // passes::run_passes(): 0=-O0, 1=-O1, 2=-O2, 3=-O3, 4=-Os,
+                // 5=-Oz. One helper owns the state, so every spelling --
+                // including a numeric -O<n> -- withdraws -Ofast's implicit
+                // fast-math in exactly one place.
+                "-O0" => self.set_optimization_level(0, false, false),
+                "-O" | "-O1" => self.set_optimization_level(1, false, false),
+                "-O2" => self.set_optimization_level(2, false, false),
+                "-O3" => self.set_optimization_level(3, false, false),
+                "-Os" => self.set_optimization_level(4, true, false),
+                "-Oz" => self.set_optimization_level(5, true, false),
                 // Scalar probes matched -O1/-O3 code for -Og/-Ofast.
                 // This is not universal equivalence: GCC skips VLA range
                 // diagnostics at -Og, so retain its distinct debug policy.
@@ -2338,21 +2333,37 @@ impl Driver {
                 // so both requests become real pipeline settings instead of
                 // tolerated no-ops (GP-22 option-effect ledger: an accepted
                 // spelling must change an artifact).
-                "-Og" => {
-                    self.optimize_debug = true;
-                    self.opt_level = 1;
-                    self.optimize = true;
-                    self.optimize_size = false;
-                    self.omit_frame_pointer = true;
-                }
+                "-Og" => self.set_optimization_level(1, false, true),
                 "-Ofast" => {
-                    self.optimize_debug = false;
-                    self.opt_level = 3;
-                    self.optimize = true;
-                    self.optimize_size = false;
-                    self.omit_frame_pointer = true;
+                    self.set_optimization_level(3, false, false);
                     // -Ofast IS -O3 -ffast-math, not merely a macro define.
-                    self.set_fast_math(true);
+                    // An explicit -fno-fast-math is a user opt-out that -Ofast
+                    // must not silently revoke (GCC 16.2: macro stays absent).
+                    self.set_fast_math(self.explicit_fast_math != Some(false));
+                }
+                // GCC 16.2 silently clamps a numeric `-O<n>` with n >= 3 to
+                // -O3; Clang 23.1 does the same and warns. Before this arm,
+                // -O4 fell through to the generic tolerated-unknown handler
+                // and produced *unoptimized* code with only a warning -- a
+                // silent performance cliff in build systems that still pass
+                // -O4 (measured: default 8ffb18df vs -O3 189a4c8373a1 on the
+                // packed reduction). Values above i32::MAX are rejected:
+                // Clang rejects them, and GCC's 2^32 wraparound to -O0 is an
+                // arithmetic-overflow artifact we must not reproduce.
+                arg if arg.starts_with("-O") => {
+                    let digits = &arg[2..];
+                    let value = if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit())
+                    {
+                        None
+                    } else {
+                        // u64::from_str uses checked multiply/add, so a long
+                        // digit string overflows into `Err` instead of UB.
+                        digits.parse::<u64>().ok()
+                    };
+                    let value = value
+                        .filter(|v| *v <= i32::MAX as u64)
+                        .ok_or_else(|| format!("unrecognized command-line option '{arg}'"))?;
+                    self.set_optimization_level(value.min(3) as u32, false, false);
                 }
 
                 // Debug info — GCC flag semantics, honored exactly:
@@ -3610,8 +3621,14 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                     self.builtin_policy
                         .withdraw_name(&arg["-fno-builtin-".len()..]);
                 }
-                "-ffast-math" => self.set_fast_math(true),
-                "-fno-fast-math" => self.set_fast_math(false),
+                "-ffast-math" => {
+                    self.explicit_fast_math = Some(true);
+                    self.set_fast_math(true);
+                }
+                "-fno-fast-math" => {
+                    self.explicit_fast_math = Some(false);
+                    self.set_fast_math(false);
+                }
                 "-fmath-errno" => self.math_errno = true,
                 "-fno-math-errno" => self.math_errno = false,
                 "-funsafe-math-optimizations" | "-fassociative-math" => {
@@ -5566,6 +5583,163 @@ mod cli_tests {
             FpContract::Off,
             "explicit -ffp-contract is sticky in both orders"
         );
+    }
+
+    /// GCC 16.2 and Clang 23.1 both treat `-Ofast`'s fast-math as a property
+    /// of that `-O` spelling: a later plain `-O*` withdraws it, while an
+    /// explicit `-ffast-math` is a sticky user option. Measured oracle matrix
+    /// (`__FAST_MATH__` + assembly SHA-256 on a packed reduction):
+    ///
+    ///   -Ofast                on / on
+    ///   -Ofast -O2            off / off
+    ///   -Ofast -O3            off / off
+    ///   -Ofast -O0, -Os, -Og off / off
+    ///   -O2 -Ofast            on / on
+    ///   -Ofast -O2 -Ofast     on / on
+    ///   -Ofast -ffast-math -O2  on / on
+    ///   -Ofast -O2 -ffast-math  on / on
+    ///   -O3 -ffast-math -O2     on / on
+    ///   -Ofast -fno-fast-math -O2 off / off
+    ///
+    /// One case is a genuine oracle disagreement: `-fno-fast-math -Ofast` is
+    /// off in GCC 16.2 and on in Clang 23.1. LCCC follows GCC here because an
+    /// explicit user opt-out must never be silently revoked by a later `-O`.
+    #[test]
+    fn ofast_fast_math_belongs_to_the_o_level_not_to_the_flag_list() {
+        let parse = |flags: &[&str]| {
+            let mut driver = Driver::new();
+            let mut args = vec!["lccc".to_string()];
+            args.extend(flags.iter().map(|f| (*f).to_string()));
+            args.push("x.c".to_string());
+            driver.parse_cli_args(&args).unwrap();
+            driver
+        };
+        let matrix: &[(&[&str], bool)] = &[
+            (&["-Ofast"], true),
+            (&["-Ofast", "-O2"], false),
+            (&["-Ofast", "-O3"], false),
+            (&["-Ofast", "-O0"], false),
+            (&["-Ofast", "-O1"], false),
+            (&["-Ofast", "-Os"], false),
+            (&["-Ofast", "-Oz"], false),
+            (&["-Ofast", "-Og"], false),
+            (&["-O2", "-Ofast"], true),
+            (&["-Ofast", "-O2", "-Ofast"], true),
+            (&["-Ofast", "-ffast-math", "-O2"], true),
+            (&["-Ofast", "-O2", "-ffast-math"], true),
+            (&["-O3", "-ffast-math", "-O2"], true),
+            (&["-Ofast", "-fno-fast-math", "-O2"], false),
+            (&["-fno-fast-math", "-Ofast"], false),
+            (&["-Ofast", "-fno-fast-math", "-Ofast"], false),
+            (&["-Ofast", "-fno-fast-math", "-ffast-math"], true),
+        ];
+        for &(flags, expected) in matrix {
+            let d = parse(flags);
+            assert_eq!(d.fast_math, expected, "fast_math for {flags:?}");
+            assert_eq!(d.fp_reassoc, expected, "fp_reassoc for {flags:?}");
+            assert_eq!(d.math_errno, !expected, "math_errno for {flags:?}");
+        }
+
+        // A withdrawn -Ofast must be state-identical to the plain level, not
+        // merely macro-identical: all six umbrella fields plus the -O state.
+        let a = parse(&["-Ofast", "-O2"]);
+        let b = parse(&["-O2"]);
+        assert_eq!(a.fast_math, b.fast_math);
+        assert_eq!(a.fp_reassoc, b.fp_reassoc);
+        assert_eq!(a.fp_contract, b.fp_contract);
+        assert_eq!(a.math_errno, b.math_errno);
+        assert_eq!(a.fp_trapping_math, b.fp_trapping_math);
+        assert_eq!(a.fp_rounding_math, b.fp_rounding_math);
+        assert_eq!(a.opt_level, b.opt_level);
+        assert_eq!(a.optimize, b.optimize);
+        assert_eq!(a.optimize_debug, b.optimize_debug);
+    }
+
+    /// Numeric -O<n> is a real GCC/Clang optimization level, not a tolerated
+    /// no-op. Measured on the packed reduction: before this fix `-O4` emitted
+    /// the *unoptimized* default (8ffb18df) while GCC 16.2 and Clang 23.1
+    /// both emitted their -O3 code. Values above i32::MAX are rejected rather
+    /// than reproducing GCC's 2^32 wraparound to -O0.
+    #[test]
+    fn numeric_o_levels_clamp_to_o3_and_reject_out_of_range() {
+        let parse = |flag: &str| {
+            let mut driver = Driver::new();
+            driver
+                .parse_cli_args(&["lccc".to_string(), flag.to_string(), "x.c".to_string()])
+                .map(|_| driver)
+        };
+        let accepted = [
+            "-O0",
+            "-O1",
+            "-O2",
+            "-O3",
+            "-O4",
+            "-O5",
+            "-O9",
+            "-O10",
+            "-O999",
+            "-O2147483647",
+            "-O0000000000000000000000004",
+        ];
+        for flag in accepted {
+            let d = parse(flag).unwrap_or_else(|e| panic!("{flag}: {e}"));
+            let expected = match flag {
+                "-O0" => 0,
+                "-O1" => 1,
+                "-O2" => 2,
+                _ => 3,
+            };
+            assert_eq!(d.opt_level, expected, "{flag}");
+            assert_eq!(d.optimize, expected > 0, "{flag} optimize");
+            assert_eq!(d.omit_frame_pointer, expected > 0, "{flag} frame pointer");
+            assert!(!d.optimize_size && !d.optimize_debug, "{flag} policy");
+        }
+
+        // A numeric level is state-identical to its literal spelling.
+        let numeric = parse("-O4").unwrap();
+        let literal = parse("-O3").unwrap();
+        assert_eq!(numeric.opt_level, literal.opt_level);
+        assert_eq!(numeric.optimize, literal.optimize);
+        assert_eq!(numeric.optimize_size, literal.optimize_size);
+        assert_eq!(numeric.optimize_debug, literal.optimize_debug);
+        assert_eq!(numeric.omit_frame_pointer, literal.omit_frame_pointer);
+
+        // A plain numeric -O after -Ofast withdraws the implicit umbrella.
+        let withdrawn = {
+            let mut d = Driver::new();
+            d.parse_cli_args(&[
+                "lccc".to_string(),
+                "-Ofast".to_string(),
+                "-O4".to_string(),
+                "x.c".to_string(),
+            ])
+            .unwrap();
+            d
+        };
+        assert!(!withdrawn.fast_math, "-Ofast -O4 must withdraw fast-math");
+        assert_eq!(withdrawn.opt_level, 3);
+
+        let rejected = [
+            "-O-1",
+            "-O+2",
+            "-O2x",
+            "-O2147483648",
+            "-O4294967295",
+            "-O4294967296",
+            "-O999999999999999999999999",
+            "-Ofast=3",
+        ];
+        for flag in rejected {
+            // Driver is intentionally not Debug; match instead of expect_err.
+            let err = match parse(flag) {
+                Ok(_) => panic!("{flag} must be rejected"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("unrecognized command-line option"),
+                "{flag}: {err}"
+            );
+        }
     }
 
     #[test]

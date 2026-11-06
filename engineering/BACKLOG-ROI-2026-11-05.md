@@ -21,7 +21,7 @@ against the rebuilt compiler and the live tree before admission:
 | GCC 16.2 / Clang 23.1.5 `-dM -E`, 4 dialects | 30 lccc-only, 13 GCC-only, 28 value-spelling differences (all numeric synonyms) |
 | `tests/regression/sse2_codegen_matrix.json` | 122 rows, provenance still named Clang 23.1.4 |
 | `gcc-16 -m32` before/after the pinned bookworm multilib bundle | FAIL (`bits/libc-header-start.h`) → PASS (4-byte pointer) |
-| Full corpus | 1268 tests, 0 failures, 6 skips |
+| Full corpus (at sweep start, before any change) | 1268 tests, 0 failures, 6 skips |
 
 Selection rule: **ROI = provable defect × cost of the gate that prevents its
 return ÷ implementation risk.**  Items whose premise was already false on this
@@ -33,7 +33,7 @@ without a test that fails when it regresses.
 
 | # | ID | Backlog source | Measured state before | Decision & change | Regression |
 |---|---|---|---|---|---|
-| 1 | GP-22/1 | `backlog.md` §12 | 17 ledger rows, 5 contradicted the binary | Reclassified 3 `Inert`→`Refused` and 2 `Inert`→`Implemented` by measurement; tracing `-Ofast` further exposed a macro-only implementation, fixed with a shared fast-math umbrella (finding 10) | `option_effect_ledger.py`, Rust unit test, non-vacuous composition gate, `test_ofast_composition.py` |
+| 1 | GP-22/1 | `backlog.md` §12 | 17 ledger rows, 5 contradicted the binary | Reclassified 3 `Inert`→`Refused` and 2 `Inert`→`Implemented` by measurement; tracing `-Ofast` further exposed a macro-only implementation (finding 10), `-O`-level fast-math ownership (11) and a silent unoptimized-code cliff at numeric `-O<n>` (12) | `option_effect_ledger.py`, 3 Rust unit tests, non-vacuous composition gate, `test_ofast_composition.py` (9 tests), `test_numeric_o_levels.py` (8 tests), GDB runtime suite |
 | 2 | GP-22/2 | §12 | 17 `probe_id`s, **zero consumers** | New probe registry; every accepted row must resolve to an implemented probe | `static_problems` + 16 tests |
 | 3 | GP-22/3 | §12 | registry could gain orphans silently | Exact set equality between ledger probes and registry; duplicates rejected | check 3 + negative control |
 | 4 | GP-22/4 | §12 | priority set asserted only in prose | 7 priority spellings must all be ledgered | check 4 + Rust unit test |
@@ -124,8 +124,12 @@ without a test that fails when it regresses.
    only worked from the repository root. Fixed with `resolve_binary` (named
    problems, `PATH` lookup, repo-root fallback), `dest.unlink(missing_ok=True)`
    before every compile, and exact-duplicate suppression in the problem list.
-   Seven new tests cover all three plus a non-executable file and a positive
-   control proving a fresh compile is still hashed correctly.
+   Six new `GateRobustness` test methods cover all three plus a
+   non-executable file and both halves of the stale-output contract (the
+   failed-compile hash and a positive control proving a fresh compile is
+   still hashed). An earlier description of this delta said "seven tests";
+   there are six methods exercising seven distinct behaviours — the count
+   here is the measured `unittest` result (18 to 24).
 10. **`-Ofast` was a macro-only lie: a real missed optimization and GCC
     incompatibility.**  Tracing the reclassified rows into `cli.rs` showed
     `-ffast-math` sets six driver fields (`fp_trapping_math`,
@@ -149,11 +153,49 @@ without a test that fails when it regresses.
     check rejects with two distinct diagnostics). This is the only change in the
     PR that alters compiler output, and it removes a genuine "cycles left
     behind" defect rather than adding an unmeasured optimization.
-11. **Host-CPU runtime behaviour was checked with a real debugger, not just
+11. **`-Ofast`'s fast-math is a property of the `-O` spelling, not of the
+    flag list.**  Tracing the fix in finding 10 into the option-order space
+    exposed a second GCC/Clang incompatibility: both oracles withdraw
+    `-Ofast`'s implicit fast-math when a later plain `-O*` option appears,
+    but keep an *explicit* `-ffast-math` sticky. On the packed reduction,
+    LCCC used to emit the vectorized loop for all of `-Ofast -O0`,
+    `-Ofast -O1`, `-Ofast -O2`, `-Ofast -O3`, `-Ofast -Os`, `-Ofast -Oz`
+    and `-Ofast -Og`. Measured 20-vector matrix (macros and assembly hashes
+    on LCCC / GCC 16.2.0 / Clang 23.1.5) is encoded in
+    `tests/corpus/test_ofast_composition.py` and in the CI-executed GP-22
+    gate. Design: one `Option<bool>` origin field (`explicit_fast_math`)
+    plus one `withdraw_implicit_fast_math()` helper; no per-arm bookkeeping.
+    The two oracles disagree on exactly one vector, `-fno-fast-math -Ofast`
+    (GCC off, Clang on). LCCC follows GCC, because an explicit user opt-out
+    of unsafe FP math must never be silently revoked; the divergence is
+    pinned with measured values rather than hidden. 17 matrix vectors are
+    executed per CI run with macro state, codegen equality and GCC oracle
+    checks, plus an order-blind wrapper negative control.
+12. **Numeric `-O<n>` silently produced unoptimized code.**  GCC 16.2 and
+    Clang 23.1 clamp `-O4`..`-O2147483647` to their own `-O3`. In LCCC those
+    spellings fell through to the generic tolerated-unknown handler and
+    emitted the *unoptimized default* with only a warning — measured on the
+    reduction: `8ffb18df` at `-O4` versus `189a4c8373a1` at `-O3`. Real
+    build systems still pass `-O4`, so this was a live "cycles left behind"
+    defect on the host CPU, and `-Ofast -O4` also leaked fast-math. Fix: a
+    numeric `-O` arm that parses ASCII digits with `u64::from_str` (checked
+    multiply/add, so overflow returns a named error rather than UB), rejects
+    values above `i32::MAX` instead of reproducing GCC's `2^32` wraparound
+    to `-O0`, and clamps to level 3. All eight `-O` spellings now share one
+    `set_optimization_level(level, size, debug)` helper — 48 duplicated
+    assignments became 8 one-line calls, and the `-Ofast` withdrawal lives
+    in exactly one place. A dedicated 8-test corpus module covers byte
+    equality with `-O3`, `__OPTIMIZE__`, zero diagnostics, GCC/Clang oracle
+    clamping, 8 malformed/out-of-range refusals with pinned oracle
+    divergences, strict-options behaviour, `-Ofast -O4` withdrawal, a
+    source-level pin and a wrapper that reproduces the old cliff. The pinned
+    GDB 18.1 runtime suite now also executes `-O4`, comparing host-CPU
+    results and unwind chains against GCC and Clang.
+13. **Host-CPU runtime behaviour was checked with a real debugger, not just
    assembly hashes.**  A four-frame `noinline` fixture compiled by LCCC,
    GCC 16.2 and Clang 23.1.5 at `-O2`, `-Ofast` and `-Og` produces identical
    results for inputs 5, -3, 0 and 12345 (`6n+16`). GDB's backtrace at `leaf`
-   is `leaf -> middle -> top -> main` for all nine compiler/level pairs, line
+   is `leaf -> middle -> top -> main` for all twelve compiler/level pairs, line
    breakpoints resolve for all three, and `-fno-omit-frame-pointer` produces a
    saved `rbp` chain where default `-O2` reports only `rip`. These are the
    two optimisation levels reclassified in item 1, so their "implemented"
@@ -181,6 +223,9 @@ in a per-compilation loop. Measured on the 2-vCPU host (minimum of 3 runs):
 | `check_backlog_roi.run_all` | O(20) | included above | Each check returns named problems, so `--json` can attribute a failure to one item. |
 | `check_dwarf_die_census.census` | O(DIE lines), streaming | 0.364 s for 4 dialects × 3 compilers | Line-by-line state machine; no DOM, no retained DIE tree, so memory is O(tags + attributes). |
 | `Driver::set_fast_math` | O(1), six field writes | n/a (per-process option parse) | One shared helper replaced two duplicated assignment blocks; zero allocations, zero branches beyond the `enabled` flag and the sticky explicit-contract check. The removed defect cost an entire vectorized FP reduction at `-Ofast`. |
+| `Driver::set_optimization_level` | O(1), five field writes + one call | n/a (per-process option parse) | Eight literal `-O` arms collapsed from 48 duplicated assignments to 8 calls. `optimize` and `omit_frame_pointer` are derived from `level > 0` instead of stored twice, so the two can no longer disagree. Zero allocations; inlined at fastbuild. |
+| `Driver::withdraw_implicit_fast_math` | O(1), one `Option` tag test + one bool test, ≤6 writes | n/a (per-process option parse) | Called once, from the shared level helper, so no `-O` spelling can bypass it. Guarded on `fast_math` and `explicit_fast_math.is_none()`, so a plain `-O2` with no prior `-Ofast` writes nothing. |
+| numeric `-O<n>` arm | O(digits), one `u64::from_str` with checked multiply/add, one `min(3)` | n/a (per-process option parse) | Overflow returns a named error instead of UB or a wraparound; `i32::MAX` bound is an explicit comparison, no cast that can truncate. Zero allocations. Measured effect: `-O4` now emits `189a4c8373a1` (`-O3`) instead of `8ffb18df` (unoptimized default). |
 | `option_effect_ledger` × 4 arch drivers | O(4 × rows × probes) | 1.675 s for all 18 option-ledger tests | The same 17 rows are probed against four host executables that emit four targets' assembly; reuses parsed rows instead of re-reading the source four times. |
 | `check_sse2_codegen_matrix` `--check` | O(122 rows × 3 compilers) | 6.230 s | Dominated by 366 real compilations; the checker itself is linear. |
 
@@ -211,22 +256,23 @@ GCC 16.2.0 / Clang 23.1.5 / GDB 18.1 / Rust 1.99.1 oracles.
 |---|---|
 | `cargo build --profile fastbuild --locked`, `RUSTFLAGS=-D warnings` | **exit 0, zero warnings** (0 `warning` lines in the build log) |
 | `cargo fmt --check` | **exit 0** |
-| `cargo clippy --profile fastbuild --locked -- -D warnings` | **exit 0** (hosted Clippy lane passes too) |
-| `cargo test --profile fastbuild --locked` (full Rust suite, `RUSTFLAGS=-D warnings`) | **8075 passed, 0 failed, 10 ignored**, zero compiler warnings |
-| `cargo test --profile fastbuild --locked driver_option_contract_table` | **1 passed, 0 failed**, 8084 filtered |
-| `cargo test … ofast_is_exactly_o3_plus_ffast_math` | **1 passed** (six driver fields, last-wins, explicit-contract precedence) |
+| `scripts/check_clippy_policy.py` (CI's exact strict Clippy gate) | **exit 0**, 76 policy lint names probed, 0 unknown, zero warnings |
+| `cargo test --profile fastbuild --locked` (full Rust suite, `RUSTFLAGS=-D warnings`) | **8077 passed, 0 failed, 10 ignored**, zero compiler warnings |
+| `cargo test --profile fastbuild --locked driver_option_contract_table` | **1 passed, 0 failed**, 8086 filtered |
+| `cargo test … ofast_* / numeric_o_levels_*` | **3 passed** (six umbrella fields, contract precedence, 17-vector option matrix, 11 accepted + 8 rejected numeric levels) |
 | `option_effect_ledger.py --lccc … --self-test --json` | 17 rows, 11 probes, 7 priority options, **0 problems** |
 | `check_driver_option_contract.sh --skip-trapv-matrix` | **exit 0**, including the executable ledger |
 | `check_sse2_codegen_matrix.py --check / --self-test / --update-baseline` | **all PASS** (122 rows; re-derived against the live oracles) |
 | `check_dwarf_die_census.py` (4 dialects × 3 compilers) | **PASS** with the tightened 12-tag / 20-attribute baseline |
 | `check_backlog_roi.py --self-test --json` | **20/20 PASS, 0 negative-control failures** |
-| `tests/regression/check_option_effect_ledger.py` (rebuilt binary, GCC 16.2.0) | **PASS**, now with non-vacuous `-Ofast` composition rows; a simulated macro-only compiler makes it exit 1 with two diagnostics |
-| `tests.corpus.test_ofast_composition` | **4 tests OK** (LCCC/GCC/Clang agreement, non-vacuity, wrapper negative control, shared-helper source pin) |
+| `tests/regression/check_option_effect_ledger.py` (rebuilt binary, GCC 16.2.0) | **PASS**: non-vacuous `-Ofast` composition, 17 option-order vectors, 6 numeric levels + 6 malformed refusals, zero diagnostics; a macro-only wrapper exits 1 with two distinct diagnostics |
+| `tests.corpus.test_ofast_composition` | **9 tests OK** (composition, GCC/Clang agreement, macro-only wrapper, shared-helper pin, 17-vector order matrix, order-blind wrapper) |
 | `tests.corpus.test_dwarf_die_census_ratchet` | **8 tests OK**, incl. end-to-end lost-tag and stale-deferral negative controls |
-| `tests.corpus.test_option_effect_ledger` | **24 tests OK**, incl. the 4-architecture dynamic sweep and 7 gate-robustness controls |
-| new/changed corpus modules together | **60 tests OK** |
-| `tests.corpus.test_gdb_option_runtime` | **7 tests OK** with pinned GDB 18.1 |
-| `unittest discover -s tests/corpus -p 'test_*.py'` | **1306 tests, 0 failures, 5 skips** |
+| `tests.corpus.test_option_effect_ledger` | **24 tests OK**: 2 architecture-parity tests sweeping 4 drivers, 6 gate-robustness tests (7 behaviours), 16 parsing/static/dynamic tests |
+| `tests.corpus.test_numeric_o_levels` | **8 tests OK** (byte equality with `-O3`, macros, zero diagnostics, GCC/Clang clamping, 8 refusals with pinned divergences, strict options, withdrawal, wrapper cliff) |
+| new/changed corpus modules together | **73 tests OK** |
+| `tests.corpus.test_gdb_option_runtime` | **7 tests OK** with pinned GDB 18.1, now also at `-O4` (12 compiler/level runtime + unwind pairs) |
+| `unittest discover -s tests/corpus -p 'test_*.py'` | **1319 tests, 0 failures, 5 skips** |
 | `check_doc_links.py`, `check_script_imports.py`, `check_no_conflict_markers.py`, `check_ci_workflow_shell.py` | **all PASS** |
 | Hosted CI on `fd3d490` | **22 pass / 3 skipping / 0 failures**, including the authenticated ICX 2026.2 integration lane |
 
