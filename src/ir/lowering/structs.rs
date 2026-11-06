@@ -489,10 +489,11 @@ impl Lowerer {
     ///   body -- share the source tag `struct.T`, and the DWARF type graph keys
     ///   its DIEs by that string, so one of the two objects was described with
     ///   the other's members (measured: gdb printed `{a = 2}` for a local whose
-    ///   type has `a` and `b`).  A definition that is not in
-    ///   `file_scope_record_layouts` was made inside a body, so it is described
-    ///   under `struct.T#d<n>`; `record_name` strips at `#`, so the DIE still
-    ///   says `T`, exactly as GCC emits one `T` per scope.
+    ///   type has `a` and `b`).  A definition installed while a lexical scope
+    ///   was open was made inside a body -- the type context records those --
+    ///   so it is described under `struct.T#d<n>`; `record_name` strips at `#`,
+    ///   so the DIE still says `T`, exactly as GCC emits one `T` per
+    ///   definition.
     /// * **Keep the layout.**  `pop_scope` undoes a block-scope record when the
     ///   block closes, and DWARF is written after the whole unit is lowered, so
     ///   a key the context no longer holds would be described as an incomplete
