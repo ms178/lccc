@@ -480,6 +480,65 @@ impl Lowerer {
         }
     }
 
+    /// Keep the layouts of every record a `-g` type mentions, before its scope
+    /// is popped.
+    ///
+    /// `pop_scope` undoes a block-scope `struct`/`union` definition, and DWARF
+    /// is emitted after lowering the whole unit, so a local declared with such a
+    /// type would reach the writer as a key the type context no longer knows.
+    /// `TypeGraph::record` answers that with `DW_AT_declaration` and a zero
+    /// size, which is truthful but useless: gdb prints `<incomplete type>` for
+    /// the object and no member can be read (measured on
+    /// `struct { int a, b; } pair = { n, 2 * n };` inside a function body).
+    ///
+    /// The walk is transitive because a field may itself be a block-scope
+    /// record, and it is bounded by the keys already kept -- a record that
+    /// mentions itself through a pointer therefore terminates.
+    pub(super) fn capture_debug_layouts(&mut self, ty: &CType) {
+        if !self.debug_info {
+            return;
+        }
+        let mut pending = vec![ty.clone()];
+        while let Some(ty) = pending.pop() {
+            let key = match &ty {
+                CType::Struct(key) | CType::Union(key) => key.clone(),
+                // A pointer, array or vector type reaches a record through its
+                // element or pointee; the object itself has no layout.
+                CType::Pointer(inner, _)
+                | CType::Array(inner, _)
+                | CType::Vector(inner, _)
+                | CType::ExtVector(inner, _) => {
+                    pending.push(inner.as_ref().clone());
+                    continue;
+                }
+                CType::Function(function) => {
+                    pending.push(function.return_type.clone());
+                    pending.extend(function.params.iter().map(|(ty, _)| ty.clone()));
+                    continue;
+                }
+                _ => continue,
+            };
+            let key = key.to_string();
+            if self.debug_record_layouts.contains_key(&key) {
+                continue;
+            }
+            let layout = self
+                .types
+                .borrow_struct_layouts()
+                .get(key.as_str())
+                .map(RcLayout::clone);
+            let Some(layout) = layout else {
+                // A forward declaration has no layout to keep, and the writer's
+                // incomplete description is the correct answer for it.
+                continue;
+            };
+            for field in &layout.fields {
+                pending.push(field.ty.clone());
+            }
+            self.debug_record_layouts.insert(key, layout);
+        }
+    }
+
     /// Insert a struct layout into the cache, tracking the change in the current
     /// scope frame so it can be undone on scope exit.
     fn insert_struct_layout_scoped(&mut self, key: String, layout: StructLayout) {

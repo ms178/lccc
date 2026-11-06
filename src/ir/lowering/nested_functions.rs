@@ -1039,9 +1039,21 @@ impl Lowerer {
 
         self.lower_compound_stmt(&nf.body);
 
-        // 3h. Finalize the nested function.
+        // 3h. Finalize the nested function.  The parameter map and the lexical
+        // scopes are `-g` state, and this path owns its own `FuncState`, so the
+        // record has to be built here exactly as `finalize_function` does it for
+        // a file-scope definition; dropping it left every GNU nested function
+        // with a subprogram DIE that described neither its arguments nor its
+        // locals (measured on `int inner(int k)` inside `outer`).
         let uses_sret = param_info.uses_sret;
-        self.finalize_nested_function(&nf_clone, return_type, param_info.params, uses_sret);
+        let debug_param_indices = Self::debug_param_indices(&param_info);
+        self.finalize_nested_function(
+            &nf_clone,
+            return_type,
+            param_info.params,
+            uses_sret,
+            debug_param_indices,
+        );
 
         // 3i. Restore the parent state.
         self.func_state = Some(parent_state);
@@ -1070,6 +1082,7 @@ impl Lowerer {
         return_type: IrType,
         params: Vec<crate::ir::reexports::IrParam>,
         uses_sret: bool,
+        debug_param_indices: Vec<Option<usize>>,
     ) {
         if !self.func_mut().instrs.is_empty()
             || self.func_mut().blocks.is_empty()
@@ -1121,6 +1134,12 @@ impl Lowerer {
 
         let next_val = self.func_mut().next_value;
         let param_alloca_vals = std::mem::take(&mut self.func_mut().param_alloca_values);
+        // The `-g` record of this function's body: the lexical blocks the
+        // statement lowerer opened and the locals it described.  Taken before
+        // the literal below so the immutable `self.func()` reads inside it and
+        // these `&mut` takes do not overlap.
+        let debug_locals = std::mem::take(&mut self.func_mut().debug_locals);
+        let debug_scopes = std::mem::take(&mut self.func_mut().debug_scopes);
         let ret_eightbyte_classes = self
             .func_meta
             .sigs
@@ -1142,9 +1161,9 @@ impl Lowerer {
                 .unwrap_or_default()
         });
         let ir_func = crate::ir::reexports::IrFunction {
-            debug_param_indices: Vec::new(),
-            debug_locals: Vec::new(),
-            debug_scopes: Vec::new(),
+            debug_param_indices,
+            debug_locals,
+            debug_scopes,
             pass_policy: Default::default(),
             name: nf.name.clone(),
             return_type,

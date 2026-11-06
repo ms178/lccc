@@ -2297,14 +2297,26 @@ def reference_target(die: Die, unit: Unit, attribute: int) -> Die | None:
 
 
 def children(unit: Unit, parent: Die) -> list[Die]:
-    """The DIEs directly below `parent` in the flattened tree."""
+    """The DIEs directly below `parent` in the flattened tree.
+
+    `unit.dies` is pre-order, so a parent's subtree is the run of deeper DIEs
+    after it and the first DIE at the parent's own depth or above ends that run --
+    whether or not the parent had any children at all. Continuing past a childless
+    parent (as this once did, because the stop condition also required that a
+    child had already been collected) reports the *next* function's parameters as
+    this one's: measured on `void empty(void) { } int g(int a) { return a; }`,
+    `children()` of `empty` returned `g`'s `a`. Every check that walks a
+    subprogram's children then compares the wrong list -- a parameterless
+    function appears to have a parameter, and a function that follows one is
+    attributed with it.
+    """
     out: list[Die] = []
     for die in unit.dies:
-        if die.depth <= parent.depth:
-            if die.offset > parent.offset and out:
-                break
+        if die.offset <= parent.offset:
             continue
-        if die.depth == parent.depth + 1 and die.offset > parent.offset:
+        if die.depth <= parent.depth:
+            break
+        if die.depth == parent.depth + 1:
             out.append(die)
     return out
 
@@ -3720,6 +3732,29 @@ def self_test() -> int:
         check_range_lists(range_report, range_elf, [range_unit], {"f": (0x1000, 0x1020)}, "mut")
         expect(bool(range_report.failures) == should_fail,
                f"self-test absolute range base {low_pc:#x}: failures {range_report.failures}")
+
+    # A childless parent must not adopt the next subtree. `void empty(void)` in
+    # front of `int g(int a)` is the shape that exposed it: `empty` reported `a`.
+    tree = Unit(offset=0, version=5, address_size=8, offset_size=4)
+    tree.dies = [
+        Die(offset=0x0C, tag=DW_TAG_SUBPROGRAM, attrs={}, depth=0),
+        Die(offset=0x1C, tag=DW_TAG_SUBPROGRAM, attrs={}, depth=0),
+        Die(offset=0x2C, tag=DW_TAG_FORMAL_PARAMETER, attrs={}, depth=1),
+        Die(offset=0x3C, tag=DW_TAG_FORMAL_PARAMETER, attrs={}, depth=1),
+        Die(offset=0x4C, tag=DW_TAG_SUBPROGRAM, attrs={}, depth=0),
+    ]
+    expect(
+        children(tree, tree.dies[0]) == [],
+        f"self-test: a childless parent gained {len(children(tree, tree.dies[0]))} children",
+    )
+    expect(
+        [die.offset for die in children(tree, tree.dies[1])] == [0x2C, 0x3C],
+        "self-test: a parent lost its own children or took its sibling's",
+    )
+    expect(
+        children(tree, tree.dies[4]) == [],
+        "self-test: the last parent in a unit absorbed the end of the tree",
+    )
 
     # The source scanner the attribution check rests on.
     def span_names(source: str) -> list[tuple[str, int, int]]:

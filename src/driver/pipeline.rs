@@ -2666,8 +2666,16 @@ impl Driver {
 
         // One pass over the unit's functions describes all of them.  A `void`
         // return is *no* type in DWARF, so it is skipped and the subprogram then
-        // carries none; a nested function's record is keyed by its mangled name
-        // and has no symbol of its own in the object, so it is not described.
+        // carries none.
+        //
+        // A GNU nested function is described too, under the mangled name its
+        // subprogram DIE and its `LOCAL` function symbol both carry: GCC 16.2
+        // emits `inner` with its `formal_parameter k`, and lccc emits
+        // `outer.inner` with the same list.  A dotted key is not a proxy for
+        // "describes no code" here -- `outer.inner` is a real 58-byte function
+        // in `.text` (measured), so filtering it out dropped every one of that
+        // function's parameter DIEs.  A key with no emitted definition simply
+        // never matches a subprogram, which costs nothing.
         let mut return_types = crate::common::fx_hash::FxHashMap::default();
 
         // A parameter's type is what a debugger prints for it, and an unnamed
@@ -2677,7 +2685,7 @@ impl Driver {
         // describe a value nobody can pass.
         let mut function_parameters = crate::common::fx_hash::FxHashMap::default();
         for (name, info) in functions {
-            if name.contains('.') || !info.is_defined {
+            if !info.is_defined {
                 continue;
             }
             if !matches!(info.return_type, crate::common::types::CType::Void) {
