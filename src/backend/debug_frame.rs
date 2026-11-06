@@ -106,11 +106,23 @@ pub(crate) fn parameter_homes(
             {
                 return None;
             }
-            // The displacement has to be an `i32`: a slot beyond two gigabytes of
-            // frame is not a displacement any consumer should be handed, and
-            // saturating would state a wrong address. `i32::try_from` on the sum
+            // `DW_OP_fbreg` is an offset *from* the canonical frame address, and
+            // a slot sits *below* it, so the displacement is the slot minus the
+            // bias.  (`%rbp - 8` with `%rbp + 16` as the CFA is -24, which is
+            // what GCC 16.2 states for the same slot.)  Adding instead of
+            // subtracting lands the parameter 32 bytes above where the prologue
+            // put it -- a debugger then prints the saved frame pointer and calls
+            // it the first argument, which is the failure this module exists to
+            // prevent, and it is why the gate compares addresses the program
+            // computed rather than the arithmetic that produced them.
+            //
+            // The result has to be an `i32`: a slot beyond two gigabytes of frame
+            // is not a displacement any consumer should be handed, and saturating
+            // would state a wrong address. `i32::try_from` on the difference
             // keeps the arithmetic checked rather than wrapping in release.
-            i32::try_from(slot).ok().and_then(|slot| slot.checked_add(bias))
+            i32::try_from(slot)
+                .ok()
+                .and_then(|slot| slot.checked_sub(bias))
         })
         .collect()
 }
@@ -139,17 +151,19 @@ mod tests {
     }
 
     #[test]
-    fn a_proven_home_is_slot_plus_bias() {
-        // `-8(%rbp)` on x86-64 is 24 bytes below the caller's stack pointer:
-        // -8 + 16. This is the number GCC 16.2 states for the same slot.
+    fn a_proven_home_is_the_slot_below_the_cfa() {
+        // `-8(%rbp)` with the caller's stack pointer at `%rbp + 16` is 24 bytes
+        // below it, so the displacement is -24.  Measured against GCC 16.2 on the
+        // same program: it states `DW_OP_fbreg: -36` for a parameter it keeps at
+        // `-20(%rbp)`, and the running program agrees.
         assert_eq!(
             parameter_homes(Some(16), 0, &[Some(-8), Some(-16)], &[false, false], &[false, false]),
-            vec![Some(8), Some(0)]
+            vec![Some(-24), Some(-32)]
         );
-        // i686: `%ebp + 8`, so `-8(%ebp)` is 16 below the caller's stack pointer.
+        // i686: `%ebp + 8` is the CFA, so `-8(%ebp)` is 16 below it.
         assert_eq!(
             parameter_homes(Some(8), 0, &[Some(-8)], &[false], &[false]),
-            vec![Some(0)]
+            vec![Some(-16)]
         );
     }
 
@@ -168,7 +182,7 @@ mod tests {
     fn a_missing_slot_is_not_described() {
         assert_eq!(
             parameter_homes(Some(16), 0, &[None, Some(-24)], &[false, false], &[false, false]),
-            vec![None, Some(-8)]
+            vec![None, Some(-40)]
         );
     }
 
@@ -178,7 +192,7 @@ mod tests {
         // aligned address above it, so the slot is a bound and not the object.
         assert_eq!(
             parameter_homes(Some(16), 0, &[Some(-64), Some(-80)], &[true, false], &[false, false]),
-            vec![None, Some(-64)]
+            vec![None, Some(-96)]
         );
     }
 
@@ -199,7 +213,7 @@ mod tests {
         // "aligned" verdict it did not measure.
         assert_eq!(
             parameter_homes(Some(16), 0, &[Some(-8), Some(-16)], &[], &[]),
-            vec![Some(8), Some(0)],
+            vec![Some(-24), Some(-32)],
             "absent flags mean 'not over-aligned, not dead'; they are indexed by \
              presence, not by length"
         );
@@ -222,7 +236,7 @@ mod tests {
                 &[false, false, false],
                 &[false, false, false]
             ),
-            vec![Some(-8), Some(-24)]
+            vec![Some(-40), Some(-56)]
         );
         // A skip past the end is an empty list, never a panic.
         assert!(parameter_homes(Some(16), 9, &[Some(-8)], &[false], &[false]).is_empty());
@@ -230,10 +244,23 @@ mod tests {
 
     #[test]
     fn a_displacement_that_does_not_fit_is_refused() {
-        // A frame beyond two gigabytes has slots no `i32` displacement names;
-        // refusing keeps the arithmetic checked instead of wrapping.
+        // A frame beyond two gigabytes has slots no `i32` displacement names, and
+        // the displacement is measured downwards, so the end that overflows the
+        // subtraction is the most negative slot: it is a full bias further from
+        // the frame address than an `i32` reaches.  Refusing keeps the arithmetic
+        // checked instead of wrapping.
+        assert_eq!(
+            parameter_homes(Some(16), 0, &[Some(i64::from(i32::MIN))], &[false], &[false]),
+            vec![None]
+        );
+        // The largest slot stays representable once the bias is removed, and the
+        // slot that only an `i64` names is refused before the subtraction runs.
         assert_eq!(
             parameter_homes(Some(16), 0, &[Some(i64::from(i32::MAX))], &[false], &[false]),
+            vec![Some(i32::MAX - 16)]
+        );
+        assert_eq!(
+            parameter_homes(Some(16), 0, &[Some(i64::from(i32::MAX) + 1)], &[false], &[false]),
             vec![None]
         );
     }

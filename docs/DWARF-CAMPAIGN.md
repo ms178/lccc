@@ -10,13 +10,13 @@ The campaign's single sentence: lccc already ships **correct line tables and
 correct unwinding** for every architecture it supports, and now ships a **DIE
 tree with types, file-scope objects, function parameters and their addresses**.
 A debugger can stop at the right source line, unwind the stack, print a global
-or a static, list a function's parameters with their types, `ptype` any type
-those objects name, and read an object's address. What it still cannot do is
-print a *local* variable or a parameter's *value*, or report the inline stack --
-see [§3.5](#35-what-the-campaign-has-landed-measured) for the measured state and
-D1b/D6 in [§4](#4-work-items) for the two remaining items. The work items are
-ordered so that each one turns one more debugger command from "cannot" into
-"works", and each one lands with a gate that fails when it regresses.
+or a static, list a function's parameters with their types **and their values**
+(on x86-64 and i686), `ptype` any type those objects name, and read an object's
+address. What it still cannot do is print a *local* variable or report the inline
+stack -- see [§3.5](#35-what-the-campaign-has-landed-measured) for the measured
+state and D14/D6 in [§4](#4-work-items) for the two remaining items. The work
+items are ordered so that each one turns one more debugger command from "cannot"
+into "works", and each one lands with a gate that fails when it regresses.
 
 ---
 
@@ -234,6 +234,7 @@ fails if it regresses. Sizes are `.debug_info` + `.debug_abbrev` + `.debug_str` 
 | File-scope objects, defined and declared | `DW_AT_location` present exactly when `.symtab` defines the object, and equal to the symbol's address (gated); a removed static keeps its DIE and loses the location, which is GCC 16.2's rule and also what stops a `DW_AT_location` relocation against a dropped symbol from breaking the link |
 | Declarations only for referenced names | measured `extern int q_used` / `extern int q_missing`: GCC describes the first and not the second, and lccc now does the same; the `_IO_FILE` structure and its thirty members left the payload with it |
 | Function parameters | a `DW_TAG_formal_parameter` child per parameter of every defined function, with `DW_AT_name` and a `DW_AT_type` that resolves; `DW_TAG_unspecified_parameters` on a variadic definition |
+| A parameter's value | `DW_OP_fbreg <slot - cfa>` on x86-64 and i686, equal to the address the running program takes for the parameter (11 of 11 at six profiles, and on a freestanding 32-bit program measured on the target), and cross-checked by GDB 18.1 printing the same values the function itself stored; refused, never guessed, where the frame cannot prove a home |
 | Debug information changes nothing at run time | with and without `-g -gdwarf-5`, every one of the 86 compilable benchmark objects has byte-identical `.text*` at `-O2`, and the gate re-asserts that identity in every configuration it builds (`code_unchanged`), so a change that leaks from DWARF into code selection fails the gate |
 | The spelling a declaration wrote | a typedef keeps its name as a `DW_TAG_typedef` for objects, parameters, pointer layers above the alias, return types and record members; `ptype` prints `pair_t *` and `size_t n`, not `struct pair *` and `long unsigned int n`. Gated on all five shapes and against GCC 16.2 as the subject |
 | A data-only translation unit | a unit with `DW_AT_stmt_list` and no `DW_AT_low_pc`, a line program whose header carries the file table, and one `variable` DIE per object |
@@ -249,10 +250,10 @@ policy removed more than the new DIEs cost.
 
 ## 4. Work items
 
-Ordered by value: D1–D4 and D13 are **landed** (see
-[§3.5](#35-what-the-campaign-has-landed-measured)), and what remains is D1b
-(parameter locations), D6 (inline instances), D14 (locals and lexical blocks),
-then the `-S`/`.debug_macro`/compression items.
+Ordered by value: D1–D4, D13 and D1b (both architectures) are **landed** (see
+[§3.5](#35-what-the-campaign-has-landed-measured)), and what remains is D14
+(locals and lexical blocks), D6 (inline instances), then the
+`-S`/`.debug_macro`/compression items.
 
 Format: **ID · class · evidence** — Why, Where, Plan (each step landable alone),
 Gate (what the regression gate must assert; every gate is mutation-verified by
@@ -458,38 +459,234 @@ delete the `data_only_unit` gap.
 **Accept.** `print pq_only_data` works from a program whose only debug source is a
 data TU.
 
-### D1b · P1 · M — a parameter's location
+### D1b · **landed** — a parameter's location
 
 **Why.** A parameter DIE without `DW_AT_location` lets a debugger list `n` and
 its type but not print `n = 4`; GCC 16.2 at `-O0` emits
-`DW_AT_location : 2 byte block: 91 f4 (DW_OP_fbreg: -12)` for it. This is the last
-piece of `info args` and the reason the quality gate carries a
+`DW_AT_location : 2 byte block: 91 f4 (DW_OP_fbreg: -12)` for it. This was the
+last piece of `info args`, and the reason the quality gate carried a
 `parameter_locations` known gap.
 
 **Where.** The frame layout is the code generator's: `emit_store_params`
 (`src/backend/generation.rs`) is where a parameter's home slot is chosen, and
-`State::data_home_slot` (`src/backend/state.rs`) is the accessor. The writer
-(`src/backend/elf/dwarf.rs`) has `DW_AT_frame_base = DW_OP_call_frame_cfa`, so a
-location is `DW_OP_fbreg <slot - cfa_offset>`.
+`State::data_home_slot` (`src/backend/state.rs`) is the accessor. The writer's
+unit DIE states `DW_AT_frame_base = DW_OP_call_frame_cfa`, so a parameter's
+location is `DW_OP_fbreg <slot - cfa>` — one opcode and one signed LEB128,
+two bytes for every offset from -64 to 63.
 
-**Plan.** Carry the offsets from the instruction selector to the writer the way
-line rows already travel: a `.dwarf_param <index> <cfa_offset>` directive in the
-prologue, parsed by the assembler into a per-function table, consumed by the
-parameter DIE writer. The directive form is what keeps `-S -g` honest as well —
-the alternative (a side table passed to the in-process assembler only) silently
-loses the information the moment a user assembles the text with `gas`.
+The sign matters, and it is `slot **minus** cfa`: a home sits *below* the
+canonical frame address, so the displacement is negative for every local slot.
+Measured on GCC 16.2 at `-O0 -gdwarf-5` for `work(int n, double scale, struct
+pair p, const char *tag)`, which keeps its parameters at `-20`, `-32`, `-40` and
+`-48(%rbp)` and states `DW_OP_fbreg -36`, `-48`, `-56` and `-64`: each is the
+slot minus 16, the frame record `%rbp + 16` puts between the CFA and the saved
+`%rbp`. On i686 the record is eight bytes and the CFA is `%ebp + 8`, so the
+displacement is the slot minus 8.
 
-**Gate.** The quality gate's `parameter_locations` gap is deleted in the same
-commit; the probe runs, and every parameter's `DW_OP_fbreg` is checked against
-the *program's* value by reading the byte at `CFA + offset` from the stopped
-frame (`ptrace`-free: the probe prints `n` and the gate checks the location
-expression resolves to the same slot the callee wrote).
+**How the facts travel.** `DebugFrameFacts` (`src/backend/debug_frame.rs`) is a
+`symbol -> [Option<i32>; n]` map: for each function the prologue emitter records
+where each source parameter landed, or `None` when it cannot prove the home. It
+leaves the code generator with the assembly it produced
+(`ArchCodegen::take_debug_frame_facts`), and the driver applies it to the unit
+spec (`DwarfUnitSpec::apply_frame_facts`) before the writer runs.
 
-**Risks.** An offset that is wrong by one register saves a wrong value into a
-debugger's answer, which is the worst failure mode DWARF has. The gate must
-compare values, not just decode the expression.
+The campaign originally prescribed a `.dwarf_param` directive in the assembly
+text. That is **withdrawn**: `lccc -S -g` carries no DWARF at all — measured,
+the text contains no `.debug_*` section and no `DW_AT` (the writer lives in the
+assembler, so `-S` output has no DIE tree to annotate). A directive would have
+added assembly the assembler ignores on the only path that produces debug info.
+What `-S -g` should mean is D7's question, and it is not this one.
 
-**Effort** M. **ROI** 4.
+**The refusal law.** A parameter gets a location only when the layout *proves*
+one; otherwise the DIE omits `DW_AT_location` and a consumer prints
+`<optimized out>`. Refused: no CFA anchor (frame pointer omitted), no alloca
+slot (the store was folded away), a run-time-aligned alloca, a vector slot whose
+direct value is dead, and any `i32` offset overflow. Measured, not assumed: a
+`-O0 -fomit-frame-pointer` object emits **zero** location expressions.
+
+**The hidden return buffer.** A struct-returning function carries the return
+buffer as IR parameter 0 while the DWARF list starts at the first source
+parameter, so the list is shifted by `usize::from(func.uses_sret)` before it is
+built — shifting after would apply one function's homes to another's parameters.
+`a_hidden_return_pointer_does_not_shift_the_list` pins it.
+
+**The 32-bit home is not the frame slot.** Measured on `-m32 -O0`: a stack-passed
+parameter's `&parameter` *is* the incoming argument area (`%ebp + 8 + k`), and the
+frame slot the allocator assigned it is an alias with no bytes of its own — the
+i386 psABI gives the callee ownership of the incoming slot, and the i686 backend
+uses it directly (`param_direct_homes`). Three measurements settle where a
+parameter's storage is in each case, all taken at `-O0`:
+
+| the callee does | `&a == %ebp + 8` | incoming slot holds the new value |
+| --- | --- | --- |
+| `a = 77;` (direct write) | yes | yes |
+| `*p = 88;` through `p = &a` | yes | yes |
+| reads `a` only | yes | yes |
+
+So the home is the incoming offset when the prologue homed the parameter there
+directly, and the frame slot when it copied the argument into one. Naming the
+slot in the direct case would point a consumer at frame bytes nothing ever
+writes — garbage, presented confidently. GCC 16.2 states the same offsets for the
+same program (`fbreg 0`, `4`, ... for the incoming area — the offsets are
+`%ebp + 8 + k` minus the CFA). Two more things were wrong and are fixed: the
+i686 backend never delegated `take_debug_parameter_offsets` /
+`take_debug_frame_facts` to its own implementations, so the homes its prologue
+computed were dropped on the floor and `-m32` emitted *zero* parameter locations
+(measured before the fix, on `add(int, long)`: a subprogram DIE, two
+`DW_TAG_formal_parameter` children, no `DW_AT_location`).
+
+**Gate — three independent checks, because two of them once agreed on a
+falsehood.** `check_parameter_locations` compares the emitted `DW_OP_fbreg` with
+the address the *running program* takes for the parameter: the probe's `pq_args`
+records `&parameter - __builtin_frame_address(0)` for eleven parameters covering
+both register files and the stack (six integer, eight SSE, three passed in
+memory), prints them, and the gate requires
+`frame + record + fbreg == address`, i.e. `fbreg == distance - record`, at
+`-O0`, `-O1` and `-O2`, in DWARF 2, 3, 4 and 5 — 11 of 11 at each of the six
+profiles.
+
+The second check is a **real debugger**: `check_debugger_agreement` breaks inside
+`pq_args` under GDB 18.1 and prints all eleven parameters, then compares them with
+the values the function itself stored. This is the check that matters, because it
+is the only one whose two sides are not both this repository's code — the
+arithmetic above and the writer can share a mistake, and did. It runs at `-O0`
+(11 of 11) and at `-O2` (11 of 11); a parameter GDB cannot place is skipped there
+and one it does place must be the truth.
+
+The third is the same contract on a **32-bit target**, measured on the target
+itself: `run_32_bit_parameters` builds a freestanding `-m32 -nostdlib -static`
+probe (no libc — `_start` writes with `int $0x80`), runs it, and applies the
+identical law with the eight-byte frame record. **GCC 16.2 runs through the same
+probe and the same check when it is installed**, which is a control on the law
+rather than on lccc: GCC's frame is a different layout (it keeps the `double` 8
+bytes higher) and it must still satisfy the rule.
+
+Controls (all measured): a deliberate sign error in `parameter_homes` produces 88
+failures and GDB reports `pq_args.k` as `0` where the program passed `11`;
+reverting the i686 direct-home rule produces 10 failures on the 32-bit lane;
+reverting the two i686 delegations produces 11 "states no location" failures;
+demanding a location for a register-homed parameter produces the same failure at
+`-O2`. So neither the value, the address, nor the absence rule is vacuous.
+
+**A defect this item shipped with — found by a debugger, not by its gate.**
+The first version of `parameter_homes` computed `slot + bias` and the gate
+computed its expectation as `distance + frame_record`: the same wrong law on both
+sides, so the gate passed 11 of 11 while GDB printed garbage. Measured on
+`work(int n, double scale, struct pair p, const char *tag)` compiled by lccc at
+`-O0 -gdwarf-5`, whose prologue spills its arguments to `-8`, `-16`, `-24` and
+`-32(%rbp)` but whose DIEs stated `fbreg 8`, `0`, `-8` and `-16`:
+
+```
+Breakpoint 1, work (n=0, scale=0, p={a=4200070, b=0}, tag=0x... "\001")   before
+Breakpoint 1, work (n=3, scale=1.5, p={a=2, b=3}, tag=0x402787 "dbg")     after
+```
+
+The parameters were 32 bytes off in the wrong direction, on every function, on
+both architectures. Two lessons are now built into the gate: a check whose two
+sides are both this repository's arithmetic is not an oracle, and the arithmetic
+underneath a stated law has to be measured rather than derived (`slot - cfa`, and
+GCC's own numbers are the witness). The fix changes `parameter_homes` to a
+checked subtraction, and — measured against the pre-fix binary on 80 corpus
+objects, decoded DIE trees compared line by line with abbreviation codes and
+offsets normalised — it changes **358 `DW_AT_location` lines and nothing else**:
+no tag, no attribute, no type, no size beyond the two the different LEB lengths
+imply.
+
+**A third defect: dead abbreviation shapes.** The writer declared its
+abbreviation *shapes* up front: eight subprogram shapes (declaration or
+definition, with or without children, external or static), four parameter shapes,
+and the `...` marker — whether or not a DIE used them. Measured on the gate's
+probe, that is five to eight dead records per unit, and the parameter shapes were
+the visible symptom: a unit that places every parameter still carried the two
+shapes for an unplaced one, and one that places none carried the placed ones.
+
+The writer already had the right mechanism — `DieWriter::code_for` declares a
+shape the first time a DIE takes it, which is what the type tables use — and its
+module comment already claimed the invariant ("one list of `Attr` values produces
+both, so the two cannot drift"). The subprogram writer bypassed it. Every DIE now
+goes through `DieContext::write`, so the abbreviation is derived from the very
+attributes the bytes hold, and a shape exists exactly when a DIE uses it.
+
+Measured, on `switch_table.c` at `-O2 -gdwarf-5`: `.debug_abbrev` 287 -> 174
+bytes and 22 -> 15 shapes; at `-O0`: 219 -> 106 bytes. Every other section is
+byte-identical, and the decoded DIE tree is identical apart from the codes
+(`diff_refactor.py` over the corpus). `check_abbrev_usage` now fails on any
+declaration no DIE uses, with no exceptions — a dead shape injected into the
+writer produces "unit at 0x0 declares abbreviation(s) [2] that no DIE uses (1 of
+25 declared)". The static `ParameterShapes` flags this item briefly carried are
+gone with the mechanism that needed them. The declaration path itself was made
+allocation-free afterwards: shapes are looked up through an FNV-1a fingerprint
+into a per-code bucket list and confirmed by a full comparison, so a collision
+cannot alias an abbreviation code, and a first-seen shape is the only one that
+allocates. Verified output-identical to the previous writer on 240 objects, and
+the corpus sweep is clean.
+
+**Risks.** An offset wrong by one register saves a wrong value into a debugger's
+answer, which is the worst failure mode DWARF has — hence a gate that compares
+addresses the program computed, not shapes that look plausible.
+
+### D1b-i686 · **landed** — the same for `-m32`
+
+**Why.** The i686 backend reported no parameter homes, so `-m32 -g` debug info
+named its arguments without placing them. Two distinct defects, both fixed:
+the prologue *computed* the homes and the trait methods that carry them to the
+driver were never wired for this backend (so the facts were dropped), and once
+they travelled, the home itself was the wrong object — the frame slot instead of
+the incoming argument area the callee actually uses.
+
+**Where.** `src/backend/i686/codegen/prologue.rs` (`emit_store_params_impl`
+computes the homes; `param_direct_homes` records which slots are aliases of the
+caller's argument area) and `src/backend/i686/codegen/emit.rs` (the
+`delegate_to_impl!` list).
+
+**The rule, measured.** A parameter's home is the incoming offset
+(`%ebp + 8 + k`, i.e. `param_direct_homes[slot]`) when the prologue homed it
+there directly, and the frame slot when it copied the argument into one. The
+three-way measurement that settled it is in D1b above; GCC 16.2 states the same
+offsets for the same program.
+
+**Gate.** The 32-bit lane of `check_dwarf_quality.py` runs a freestanding
+`-m32 -nostdlib -static` probe directly on the target — `_start`, `int $0x80`,
+no libc — because a 64-bit host usually cannot link a 32-bit libc and a check
+that cannot run is not a check. It requires 11 of 11 parameters to resolve to the
+address the program took, and GCC 16.2 is run through the same probe and the same
+law as a control: 11 of 11 for both compilers, with different frame layouts.
+Reverting the direct-home rule produces 10 failures, reverting the two
+delegations produces 11.
+
+**Effort** S. **ROI** 3.
+
+### D1b-arm · D1b-riscv · P2 · M — parameter homes on the two RISC targets
+
+**Why.** `-g` on AArch64 and RISC-V describes a parameter's name and type and no
+location, so a debugger lists an argument and cannot print it. That is the honest
+answer, not a wrong one: measured on `-O0 -gdwarf-5` for a two-parameter function,
+both targets emit four `DW_TAG_formal_parameter` DIEs and **zero**
+`DW_AT_location` attributes, so nothing is being guessed. On x86-64 and i686 the
+same source now places every parameter.
+
+**Where.** `src/backend/arm/codegen/prologue.rs` and
+`src/backend/riscv/codegen/prologue.rs` (`emit_store_params`), which own
+`param_alloca_slots` but never call `parameter_homes`; the plumbing below them
+(`DebugFrameFacts`, `apply_frame_facts`, the writer) is architecture-independent
+and already works.
+
+**Plan.** 1. Measure the CFA rule from the emitted FDE for both targets
+(`readelf --debug-dump=frames`) rather than from the ABI document: what matters is
+the `.cfi_def_cfa` the prologue actually emits, and x86-64's turned out to be the
+one fact that had to be measured twice. 2. Ask each prologue for the slot offset
+it gave each parameter and convert with that target's bias. 3. Refuse under FPO,
+where the anchor is `sp`/`x19`-relative and the displacement changes as the frame
+is built. 4. Reuse `check_parameter_locations` with a freestanding probe per
+target — both assemblers and linkers here are lccc's own, so a `-nostdlib` static
+program runs under qemu if it is installed, and the gate must skip honestly when
+it is not.
+
+**Gate.** The 32-bit/i686 lane generalised to a per-target table: every target
+that reports homes must resolve 11 of 11, every target that does not must emit
+zero locations rather than a wrong one.
+
+**Effort** M. **ROI** 3.
 
 ### D13 · **landed** — the type spelling a declaration wrote
 

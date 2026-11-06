@@ -95,6 +95,7 @@ use super::dwarf_spec::{
 };
 use super::{ObjReloc, ObjSection, SHF_MERGE, SHF_STRINGS, SHT_PROGBITS, parse_string_literal};
 use crate::common::fx_hash::FxHashMap;
+use std::borrow::Cow;
 
 /// Names the symbol at (section index, offset): see the module documentation.
 /// The callback's own lifetime `'f` is separate from the borrow `'a`, so one
@@ -1361,73 +1362,24 @@ impl UnitForms {
     }
 }
 
-/// The abbreviation codes one unit's DIEs use, by shape.
+/// Declare the compile unit's abbreviation and return its code.
 ///
-/// Named rather than returned as a tuple of arrays because four of the six are
-/// indexed the same way and a caller that mixes two of them would still compile.
-struct UnitAbbrevs {
-    /// The compile-unit DIE.
-    cu_code: u64,
-    /// A subprogram without children, `[has no declaration][is external]`.
-    subprogram: [[u64; 2]; 2],
-    /// The same subprogram shapes with a child list: the one a defined function
-    /// with parameters needs, so a debugger can list the arguments it takes.
-    subprogram_with_children: [[u64; 2]; 2],
-    /// `DW_TAG_formal_parameter` with a name, and without one (a prototype).
-    formal_parameter_named: Option<u64>,
-    formal_parameter_unnamed: Option<u64>,
-    /// The same two shapes with a `DW_AT_location`: a parameter the frame layout
-    /// proved a home for.  Two extra codes rather than an attribute on every
-    /// parameter, because the compressor of a table is its shape count: a
-    /// parameter without a home (a prototype's, or one the layout could not
-    /// place) must not pay for an attribute it cannot fill.
-    ///
-    /// `None` in a unit that places *no* parameter at all -- every function in a
-    /// `-O2` unit whose parameters live in registers, or any unit built without a
-    /// frame -- because an abbreviation no DIE uses is bytes in every object and
-    /// a parse for every consumer.
-    formal_parameter_named_located: Option<u64>,
-    formal_parameter_unnamed_located: Option<u64>,
-    /// `DW_TAG_unspecified_parameters`: the list continues with `...`.
-    unspecified_parameters: u64,
-    next_code: u64,
-}
-
-/// The parameter shapes a unit's DIEs take.
-///
-/// Read from the unit before the table is written, so the table declares the
-/// shapes that will be used and no others: at `-O0` a named parameter always has
-/// a home, which leaves the unlocated shape dead weight, while in a unit whose
-/// parameters all live in registers the located one is.  The unnamed axis is
-/// independent: only a prototype (or a C23 definition that names no parameter)
-/// takes an unnamed shape at all.
-#[derive(Default, Clone, Copy)]
-struct ParameterShapes {
-    named_unlocated: bool,
-    unnamed_unlocated: bool,
-    named_located: bool,
-    unnamed_located: bool,
-}
-
-/// Declare every abbreviation of a unit and return the codes its DIEs use.
-///
-/// One subprogram abbreviation per shape, numbered from 3.  `DW_FORM_flag_present`
-/// says "this function is external" by its presence, so from version 4 on a
-/// static function omits the attribute and needs its own abbreviation; versions 2
-/// and 3 carry the flag's value and serve both shapes with one.  A shape is
-/// declared when the unit has a DIE that uses it, which for the parameter shapes
-/// is decided by [`ParameterShapes`]: a unit that places no parameter declares no
-/// located shape, and one that places all of them declares no unlocated one.
-fn declare_unit_abbrevs(
+/// This is the one shape a unit needs before any DIE is written, because the
+/// unit DIE names the table every other DIE's code indexes.  Every other shape --
+/// subprogram, parameter, type, member, variable -- is declared by
+/// [`DieWriter::code_for`] the first time a DIE takes it, so the table holds
+/// exactly the shapes its DIEs use.  Declaring them up front instead, as the
+/// cross product of their optional attributes, cost every unit the shapes it had
+/// no DIE for: five of the eight subprogram combinations, and whichever parameter
+/// shapes the unit's own frame layout made unreachable.
+fn declare_unit_abbrev(
     abbrev: &mut Vec<u8>,
     config: DwarfConfig,
     forms: UnitForms,
     range_list: bool,
-    declarator_rows: bool,
     has_code: bool,
     has_stmt_list: bool,
-    parameters: ParameterShapes,
-) -> UnitAbbrevs {
+) -> u64 {
     let mut cu_attrs = vec![
         (DW_AT_NAME, forms.unit_path),
         (DW_AT_COMP_DIR, forms.unit_path),
@@ -1466,155 +1418,11 @@ fn declare_unit_abbrevs(
     // a translation unit that is only data (measured), and a consumer then finds
     // the unit by walking `.debug_info` rather than through `.debug_aranges`.
     declare_abbrev(abbrev, 1, DW_TAG_COMPILE_UNIT, true, &cu_attrs);
-    // The unspecified return type GAS uses, so a debugger never assumes `int`.
-    // Only a unit with code has subprograms to attach it to.
-    if has_code {
-        declare_abbrev(abbrev, 2, DW_TAG_UNSPECIFIED_TYPE, false, &[]);
-    }
-    let mut subprogram_code = [[3u64; 2]; 2];
-    let mut subprogram_with_children = [[3u64; 2]; 2];
-    let mut next_code = 3;
-    for has_declaration in [true, false] {
-        let mut attrs = vec![(DW_AT_NAME, forms.string)];
-        if config.version < 4 {
-            attrs.push((DW_AT_EXTERNAL, forms.external));
-        }
-        if has_declaration {
-            // `DW_FORM_udata` is never wider than the `DW_FORM_data1` GCC uses
-            // and never truncates either: it is the shortest form that holds any
-            // file index or line number.
-            attrs.push((DW_AT_DECL_FILE, DW_FORM_UDATA));
-            attrs.push((DW_AT_DECL_LINE, DW_FORM_UDATA));
-            if declarator_rows {
-                // Only where a declarator row can supply it: `udata` 0 is the
-                // standard spelling of "column unknown", and units assembled
-                // from `.loc` rows alone have nothing better to say.
-                attrs.push((DW_AT_DECL_COLUMN, DW_FORM_UDATA));
-            }
-        }
-        attrs.extend_from_slice(&[
-            // `DW_FORM_ref4`, not `ref_udata`: the compiler's type table is laid
-            // out after the subprograms, so a variable-width reference could not
-            // be written before its target's offset was known.
-            (DW_AT_TYPE, DW_FORM_REF4),
-            (DW_AT_LOW_PC, DW_FORM_ADDR),
-            (DW_AT_HIGH_PC, forms.high_pc),
-        ]);
-        if config.version >= 3 {
-            // Every subprogram this writer describes has code (the walk below
-            // skips functions whose size is zero), and the assembler gives all
-            // of it an FDE, so the CFA expression is always evaluable.
-            attrs.push((DW_AT_FRAME_BASE, DW_FORM_EXPRLOC));
-        }
-        // Two declarations of every shape: one without children (a function with
-        // no parameter to list) and one with, which the caller terminates with a
-        // zero code after the parameter DIEs.  A subprogram that declares
-        // children and has none would be a different byte stream for the same
-        // meaning, so the caller picks by the parameter list it has.
-        for children in [false, true] {
-            let slot = if children {
-                &mut subprogram_with_children[usize::from(!has_declaration)]
-            } else {
-                &mut subprogram_code[usize::from(!has_declaration)]
-            };
-            if config.version >= 4 {
-                let mut external_atts = attrs.clone();
-                external_atts.insert(1, (DW_AT_EXTERNAL, forms.external));
-                declare_abbrev(
-                    abbrev,
-                    next_code,
-                    DW_TAG_SUBPROGRAM,
-                    children,
-                    &external_atts,
-                );
-                slot[1] = next_code;
-                next_code += 1;
-                declare_abbrev(abbrev, next_code, DW_TAG_SUBPROGRAM, children, &attrs);
-                slot[0] = next_code;
-                next_code += 1;
-            } else {
-                declare_abbrev(abbrev, next_code, DW_TAG_SUBPROGRAM, children, &attrs);
-                *slot = [next_code, next_code];
-                next_code += 1;
-            }
-        }
-    }
-    // The parameter shapes.  A named parameter states where the user wrote it and
-    // what type it has; an unnamed one (a prototype's `void f(int)`) states only
-    // the type, which is the difference `DW_AT_name`'s presence encodes.
-    let formal_parameter_named = if parameters.named_unlocated {
-        declare_abbrev(
-            abbrev,
-            next_code,
-            DW_TAG_FORMAL_PARAMETER,
-            false,
-            &[(DW_AT_NAME, forms.string), (DW_AT_TYPE, DW_FORM_REF4)],
-        );
-        next_code += 1;
-        Some(next_code - 1)
-    } else {
-        None
-    };
-    let formal_parameter_unnamed = if parameters.unnamed_unlocated {
-        declare_abbrev(
-            abbrev,
-            next_code,
-            DW_TAG_FORMAL_PARAMETER,
-            false,
-            &[(DW_AT_TYPE, DW_FORM_REF4)],
-        );
-        next_code += 1;
-        Some(next_code - 1)
-    } else {
-        None
-    };
-    let formal_parameter_named_located = if parameters.named_located {
-        declare_abbrev(
-            abbrev,
-            next_code,
-            DW_TAG_FORMAL_PARAMETER,
-            false,
-            &[
-                (DW_AT_NAME, forms.string),
-                (DW_AT_TYPE, DW_FORM_REF4),
-                (DW_AT_LOCATION, DW_FORM_BLOCK1),
-            ],
-        );
-        next_code += 1;
-        Some(next_code - 1)
-    } else {
-        None
-    };
-    let formal_parameter_unnamed_located = if parameters.unnamed_located {
-        declare_abbrev(
-            abbrev,
-            next_code,
-            DW_TAG_FORMAL_PARAMETER,
-            false,
-            &[(DW_AT_TYPE, DW_FORM_REF4), (DW_AT_LOCATION, DW_FORM_BLOCK1)],
-        );
-        next_code += 1;
-        Some(next_code - 1)
-    } else {
-        None
-    };
-    declare_abbrev(abbrev, next_code, DW_TAG_UNSPECIFIED_PARAMETERS, false, &[]);
-    let unspecified_parameters = next_code;
-    next_code += 1;
+    // Everything a DIE can take is declared by the DIE that takes it.
     // The end-of-table marker is written by the caller, after the compiler's own
     // DIE tables have added their abbreviations: a terminator here would hide
     // every one of them from a consumer.
-    UnitAbbrevs {
-        cu_code: 1,
-        subprogram: subprogram_code,
-        subprogram_with_children,
-        formal_parameter_named,
-        formal_parameter_unnamed,
-        formal_parameter_named_located,
-        formal_parameter_unnamed_located,
-        unspecified_parameters,
-        next_code,
-    }
+    1
 }
 
 /// The code sections a unit describes, in section order.
@@ -1752,35 +1560,19 @@ pub(crate) fn build_dwarf_info_sections(
     // section; anything else needs a range list.
     let range_list = code.len() > 1;
 
-    // Which parameter shapes this unit's DIEs take, so the table declares those
-    // and no others.
-    let mut parameters = ParameterShapes::default();
-    for function in unit.parameters.values() {
-        for parameter in &function.parameters {
-            match (parameter.name.is_some(), parameter.location.is_some()) {
-                (true, true) => parameters.named_located = true,
-                (false, true) => parameters.unnamed_located = true,
-                (true, false) => parameters.named_unlocated = true,
-                (false, false) => parameters.unnamed_unlocated = true,
-            }
-        }
-    }
     let mut abbrev = Vec::new();
-    let abbrevs = declare_unit_abbrevs(
+    let cu_code = declare_unit_abbrev(
         &mut abbrev,
         config,
         forms,
         range_list,
-        has_declarator_rows,
         has_code,
         stmt_list.is_some(),
-        parameters,
     );
-    let cu_code = abbrevs.cu_code;
     // The abbreviation table grows as the compiler's DIE tables are written: a
     // record with five members shares one member abbreviation, and a repeated
     // shape is declared exactly once.
-    let mut dies = DieWriter::new(abbrev, abbrevs.next_code, unit.types.len());
+    let mut dies = DieWriter::new(abbrev, cu_code + 1, unit.types.len());
 
     let mut info = Vec::new();
     let mut relocs = Vec::new();
@@ -1885,33 +1677,15 @@ pub(crate) fn build_dwarf_info_sections(
     }
 
     let void_die = length32((info.len() - start) as u64, "unit")?;
+    // The unspecified return type: `DW_TAG_unspecified_type`, so a debugger never
+    // assumes `int` for a return type the unit does not record.  Only a unit with
+    // code has subprograms to attach it to, and its code is declared here because
+    // the subprogram DIEs refer to the DIE by offset.
     if has_code {
-        write_uleb128(2, &mut info);
-        emit_subprograms(
-            SubprogramSink {
-                info: &mut info,
-                relocs: &mut relocs,
-                dies: &mut dies,
-                strings: &mut *strings,
-                line_strings: &mut *line_strings,
-                symbol_at,
-                config,
-                forms,
-                abs32,
-                abs_addr,
-                address_size,
-                has_declarator_rows,
-            },
-            functions,
-            sections,
-            &covered,
-            unit,
-            &abbrevs,
-            &declaration,
-            void_die,
-        )?;
+        let void_code = dies.code_for(DW_TAG_UNSPECIFIED_TYPE, false, &[]);
+        write_uleb128(void_code, &mut info);
     }
-    if !unit.types.is_empty() || !unit.variables.is_empty() {
+    {
         let mut ctx = DieContext {
             info: &mut info,
             relocs: &mut relocs,
@@ -1923,10 +1697,27 @@ pub(crate) fn build_dwarf_info_sections(
             abs_addr,
             address_size,
             unit_start: start,
+            declarator_rows: has_declarator_rows,
             writer: &mut dies,
         };
-        emit_types(&mut ctx, unit)?;
-        emit_variables(&mut ctx, &unit.variables, files, defined_objects)?;
+        if has_code {
+            emit_subprograms(
+                &mut ctx,
+                &mut symbol_at,
+                functions,
+                sections,
+                &covered,
+                unit,
+                &declaration,
+                void_die,
+            )?;
+        }
+        if !unit.types.is_empty() || !unit.variables.is_empty() {
+            emit_types(&mut ctx, unit)?;
+            emit_variables(&mut ctx, &unit.variables, files, defined_objects)?;
+        }
+        // Every `DW_AT_type` a subprogram or a type wrote is patched here, once
+        // the type table has a position for each entry.
         ctx.patch_type_refs()?;
     }
     dies.abbrev.push(0); // end of the abbreviation table
@@ -1942,28 +1733,6 @@ pub(crate) fn build_dwarf_info_sections(
     }))
 }
 
-/// The three outputs a subprogram DIE appends to, and the dialect it must be
-/// spelled in.
-///
-/// Passing this as one value is what keeps [`emit_subprograms`] readable: the
-/// alternative is fifteen arguments, four of them mutable, in every recursive
-/// helper.  `symbol_at` is moved in because the caller has no further use for
-/// it — the unit's `low_pc` was already relocated against a label.
-struct SubprogramSink<'a, 's, 'f> {
-    info: &'a mut Vec<u8>,
-    relocs: &'a mut Vec<ObjReloc>,
-    dies: &'a mut DieWriter,
-    strings: &'a mut DwarfStrings,
-    line_strings: &'a mut DwarfStrings,
-    symbol_at: SymbolAt<'s, 'f>,
-    config: DwarfConfig,
-    forms: UnitForms,
-    abs32: u32,
-    abs_addr: u32,
-    address_size: usize,
-    has_declarator_rows: bool,
-}
-
 /// Every function of the unit, as `DW_TAG_subprogram` DIEs in address order.
 ///
 /// The sort key is `(section, offset, name)` rather than the input order because
@@ -1971,35 +1740,25 @@ struct SubprogramSink<'a, 's, 'f> {
 /// functions that start at the same address, which keeps the output
 /// byte-reproducible when two sections alias.
 ///
-/// A function is described when it has a size and lies inside a section the
-/// unit covers: a zero-size symbol is an alias or an assembler label, and
-/// describing it would produce a DIE whose `low_pc`/`high_pc` range is empty.
+/// A function is described when it has a size and lies inside a section the unit
+/// covers: a zero-size symbol is an alias or an assembler label, and describing
+/// it would produce a DIE whose `low_pc`/`high_pc` range is empty.
+///
+/// Every DIE goes through [`DieContext::write`], so the abbreviation a function
+/// takes is derived from the attributes its bytes then hold, and a shape exists
+/// exactly when some DIE uses it.  Deciding the shapes up front instead -- the
+/// cross product of declaration kind, child list and linkage -- cost every unit
+/// the combinations it had no DIE for.
 fn emit_subprograms(
-    sink: SubprogramSink<'_, '_, '_>,
+    ctx: &mut DieContext<'_, '_>,
+    symbol_at: &mut SymbolAt<'_, '_>,
     functions: &[DwarfFunction<'_>],
     sections: &[DwarfSectionInfo<'_>],
     covered: &[bool],
     unit: &DwarfUnitSpec,
-    abbrevs: &UnitAbbrevs,
     declaration: &dyn Fn(usize, u64, u64) -> Option<SourcePosition>,
     void_die: u32,
 ) -> Result<(), String> {
-    // Destructured into plain locals, so the emission below reads exactly as it
-    // did when it lived inline in the section builder.
-    let SubprogramSink {
-        info,
-        relocs,
-        dies,
-        strings,
-        line_strings,
-        mut symbol_at,
-        config,
-        forms,
-        abs32,
-        abs_addr,
-        address_size,
-        has_declarator_rows,
-    } = sink;
     let mut members: Vec<&DwarfFunction<'_>> = functions
         .iter()
         .filter(|f| f.size != 0 && covered[f.section_index])
@@ -2021,149 +1780,154 @@ fn emit_subprograms(
             ));
         }
         let known = declaration(function.section_index, function.offset, function.size);
-        // A function with parameters needs a subprogram abbreviation that declares
-        // children; one without keeps the compact shape, so the common case costs
-        // no extra byte.
+        // A function with parameters declares children; one without keeps the
+        // compact shape, so the common case costs no trailing byte.
         let parameters = unit.parameters_of(function.name);
-        let shape = if parameters.is_some() {
-            &abbrevs.subprogram_with_children
-        } else {
-            &abbrevs.subprogram
-        };
-        let abbrev_code = shape[usize::from(known.is_none())][usize::from(function.external)];
-        write_uleb128(abbrev_code, info);
-        write_string_attribute(
-            function.name,
-            forms.string,
-            info,
-            relocs,
-            abs32,
-            strings,
-            line_strings,
-        )?;
-        if config.version < 4 {
-            // `DW_FORM_flag`: the byte after the name says whether the
-            // function is external. From DWARF 4 on the attribute is a
-            // `flag_present` and only exists on external functions.
-            info.push(u8::from(function.external));
+        let mut attrs: Vec<Attr<'_>> = Vec::with_capacity(9);
+        attrs.push(Attr {
+            at: DW_AT_NAME,
+            value: AttrValue::Text(Cow::Borrowed(function.name)),
+        });
+        // `DW_FORM_flag` in DWARF 2 and 3: the byte after the name says whether
+        // the function is external, so a static function states `0`.  From
+        // version 4 the attribute is a `flag_present`, which can only say
+        // "true", so it exists on external functions alone and costs no bytes.
+        if ctx.config.version < 4 {
+            attrs.push(Attr {
+                at: DW_AT_EXTERNAL,
+                value: AttrValue::Flag(function.external),
+            });
+        } else if function.external {
+            attrs.push(Attr {
+                at: DW_AT_EXTERNAL,
+                value: AttrValue::Flag(true),
+            });
         }
         if let Some(position) = known {
-            write_uleb128(position.file, info);
-            write_uleb128(position.line, info);
-            if has_declarator_rows {
-                write_uleb128(u64::from(position.column), info);
+            // `DW_FORM_udata` is never wider than the `DW_FORM_data1` GCC uses
+            // and never truncates either: it is the shortest form that holds any
+            // file index or line number.
+            attrs.push(Attr {
+                at: DW_AT_DECL_FILE,
+                value: AttrValue::Udata(position.file),
+            });
+            attrs.push(Attr {
+                at: DW_AT_DECL_LINE,
+                value: AttrValue::Udata(position.line),
+            });
+            if ctx.declarator_rows {
+                attrs.push(Attr {
+                    at: DW_AT_DECL_COLUMN,
+                    value: AttrValue::Udata(u64::from(position.column)),
+                });
             }
         }
-        // The return type, when the compiler knows it.  `DW_AT_type` is a
-        // four-byte reference in both cases -- a type reference cannot be a
-        // ULEB here, because the type table is laid out after the subprograms
-        // and a `ref_udata` would change width when the offset moved.
-        match unit.return_types.get(function.name) {
-            Some(&index) => {
-                dies.patches.push((info.len(), index));
-                info.extend_from_slice(&[0; 4]);
-            }
-            None => {
-                // The `DW_TAG_unspecified_type` the unit opened with: a debugger
-                // then never assumes `int` for an unknown return type.
-                info.extend_from_slice(&void_die.to_le_bytes());
-            }
-        }
-        if let Some(symbol_at) = symbol_at.as_deref_mut() {
-            let start_at = symbol_at(function.section_index, function.offset);
-            let end_at = symbol_at(function.section_index, function.offset + function.size);
-            push_reloc(info, relocs, abs_addr, address_size, &start_at, 0)?;
-            push_reloc(info, relocs, abs_addr, address_size, &end_at, 0)?;
-        } else {
-            let section = &sections[function.section_index];
-            push_reloc(
-                info,
-                relocs,
-                abs_addr,
-                address_size,
-                section.name,
-                function.offset,
-            )?;
-            if forms.high_pc == DW_FORM_ADDR {
+        // `DW_AT_type` is a four-byte reference in both cases: a type reference
+        // cannot be a ULEB here, because the type table is laid out after the
+        // subprograms and a `ref_udata` would change width when the offset moved.
+        attrs.push(Attr {
+            at: DW_AT_TYPE,
+            value: match unit.return_types.get(function.name) {
+                Some(&index) => AttrValue::TypeRef(index),
+                // The unit's `DW_TAG_unspecified_type`: a debugger then never
+                // assumes `int` for a return type the compiler did not record.
+                None => AttrValue::UnitRef(void_die),
+            },
+        });
+        // The range: an address pair, or `low_pc` plus the size when the dialect
+        // has a constant form for `high_pc` (version 4 and later).
+        let section = &sections[function.section_index];
+        let (low, high) = match symbol_at.as_mut() {
+            Some(resolve) => (
+                AttrValue::CodeAddr(
+                    CodeTarget::Label(resolve(function.section_index, function.offset)),
+                    0,
+                ),
+                AttrValue::CodeAddr(
+                    CodeTarget::Label(resolve(
+                        function.section_index,
+                        function.offset + function.size,
+                    )),
+                    0,
+                ),
+            ),
+            None if ctx.forms.high_pc == DW_FORM_ADDR => {
                 let end = function.offset.checked_add(function.size).ok_or_else(|| {
                     "internal: DWARF function range overflows the code section".to_string()
                 })?;
-                push_reloc(info, relocs, abs_addr, address_size, section.name, end)?;
-            } else {
-                push_high_pc(info, forms.high_pc, function.size);
+                (
+                    AttrValue::CodeAddr(CodeTarget::Section(section.name), function.offset),
+                    AttrValue::CodeAddr(CodeTarget::Section(section.name), end),
+                )
             }
+            None => (
+                AttrValue::CodeAddr(CodeTarget::Section(section.name), function.offset),
+                AttrValue::Udata(function.size),
+            ),
+        };
+        attrs.push(Attr {
+            at: DW_AT_LOW_PC,
+            value: low,
+        });
+        attrs.push(Attr {
+            at: DW_AT_HIGH_PC,
+            value: high,
+        });
+        if ctx.config.version >= 3 {
+            // Every subprogram this writer describes has code (the filter above
+            // skips functions whose size is zero) and the assembler gives all of
+            // it an FDE, so the CFA expression is always evaluable.
+            attrs.push(Attr {
+                at: DW_AT_FRAME_BASE,
+                value: AttrValue::FrameBase,
+            });
         }
-        if config.version >= 3 {
-            // A one-byte expression block: `uleb` length, then the opcode.
-            info.push(1);
-            info.push(DW_OP_CALL_FRAME_CFA);
-        }
+        ctx.write(DW_TAG_SUBPROGRAM, parameters.is_some(), &attrs)?;
         // The parameter list, as children of the subprogram.  A consumer lists a
         // function's arguments from here; the `DW_TAG_formal_parameter` DIEs
         // inside a `DW_TAG_subroutine_type` describe a *type* and are anonymous,
         // so they cannot answer "what is `n` in this frame".
         if let Some(list) = parameters {
             for parameter in &list.parameters {
-                // Four shapes: named or not, located or not.  The abbreviation
-                // says which attributes follow, so a parameter the frame could not
-                // place simply takes the shorter shape instead of writing an empty
-                // location block -- an empty block is not "unknown", it is an
-                // expression of length zero, which a consumer must reject.
-                let shape = match (parameter.name.is_some(), parameter.location.is_some()) {
-                    (true, true) => abbrevs.formal_parameter_named_located,
-                    (false, true) => abbrevs.formal_parameter_unnamed_located,
-                    (true, false) => abbrevs.formal_parameter_named,
-                    (false, false) => abbrevs.formal_parameter_unnamed,
-                };
-                // A located parameter exists only in a unit that declared the
-                // shape for it, so a missing code is a writer bug and not input.
-                let code = shape.ok_or_else(|| {
-                    "internal: DWARF parameter has a location but the unit declared no \
-                     abbreviation for it"
-                        .to_string()
-                })?;
-                write_uleb128(code, info);
+                let mut attrs: Vec<Attr<'_>> = Vec::with_capacity(3);
                 if let Some(name) = parameter.name.as_deref() {
                     if name.as_bytes().contains(&0) {
-                        return Err(format!(
-                            "DWARF parameter name contains a NUL byte: {name:?}"
-                        ));
+                        return Err(format!("DWARF parameter name contains a NUL byte: {name:?}"));
                     }
-                    write_string_attribute(
-                        name,
-                        forms.string,
-                        info,
-                        relocs,
-                        abs32,
-                        strings,
-                        line_strings,
-                    )?;
+                    attrs.push(Attr {
+                        at: DW_AT_NAME,
+                        value: AttrValue::Text(Cow::Borrowed(name)),
+                    });
                 }
-                // The type reference is patched once the type table has offsets.
-                dies.patches.push((info.len(), parameter.ty));
-                info.extend_from_slice(&[0; 4]);
+                attrs.push(Attr {
+                    at: DW_AT_TYPE,
+                    value: AttrValue::TypeRef(parameter.ty),
+                });
                 if let Some(location) = parameter.location {
                     // `DW_OP_fbreg <delta>` in a `block1`: one opcode, then a
-                    // signed LEB128.  The frame base is `DW_OP_call_frame_cfa`, so
-                    // this reads "the caller's stack pointer at the call, plus
-                    // `delta`", which is the slot the prologue writes and the
-                    // address `&parameter` yields.
-                    let expression = location.expression();
-                    let length = u8::try_from(expression.len()).map_err(|_| {
-                        "DWARF parameter location expression exceeds 255 bytes".to_string()
-                    })?;
-                    info.push(length);
-                    info.extend_from_slice(&expression);
+                    // signed LEB128.  The frame base is `DW_OP_call_frame_cfa`,
+                    // so this reads "the caller's stack pointer at the call, plus
+                    // `delta`" -- the slot the prologue writes and the address
+                    // `&parameter` yields.  A parameter the frame could not place
+                    // omits the attribute instead of writing an empty block: an
+                    // empty block is not "unknown", it is an expression of length
+                    // zero, which a consumer must reject.
+                    attrs.push(Attr {
+                        at: DW_AT_LOCATION,
+                        value: AttrValue::LocationExpr(location.expression()),
+                    });
                 }
+                ctx.write(DW_TAG_FORMAL_PARAMETER, false, &attrs)?;
             }
             if list.variadic {
-                write_uleb128(abbrevs.unspecified_parameters, info);
+                ctx.write(DW_TAG_UNSPECIFIED_PARAMETERS, false, &[])?;
             }
-            info.push(0); // end of this subprogram's children
+            ctx.info.push(0); // end of this subprogram's children
         }
     }
     Ok(())
 }
+
 
 /// Move a built line program to where it starts inside the section it belongs
 /// to, and answer that offset.
@@ -2257,17 +2021,33 @@ fn declare_abbrev(abbrev: &mut Vec<u8>, code: u64, tag: u64, children: bool, att
 // contain) makes every later DIE in the unit unreadable, and it is the one a
 // debug-info writer most easily ships.
 
+/// Where a code address lives.
+///
+/// The in-process object path relocates against a section and an offset into it;
+/// the assembly-text path has no sections yet and relocates against a label the
+/// assembler resolves.  A function's `DW_AT_low_pc` is described the same way
+/// either way, so the value is a target rather than bytes.
+enum CodeTarget<'a> {
+    /// A label the assembler or linker resolves, with the addend folded in.
+    Label(String),
+    /// A section and an offset into it.
+    Section(&'a str),
+}
+
 /// The value of one DIE attribute, in the shape the writer has to produce.
-enum AttrValue {
+enum AttrValue<'a> {
     /// A string in the unit's dialect: `DW_FORM_strp` from version 5, inline
     /// before it.
-    Text(String),
+    Text(Cow<'a, str>),
     Udata(u64),
     Data1(u8),
     Sdata(i64),
     /// A reference to a DIE in this unit's type table, patched once the table
     /// is laid out: a type may name a type that is written after it.
     TypeRef(u32),
+    /// A reference to a DIE whose unit-relative offset is already known, such as
+    /// the unit's own `DW_TAG_unspecified_type`.
+    UnitRef(u32),
     /// `DW_AT_location` of an object at a fixed address: `DW_OP_addr` and a
     /// relocation against the symbol the linker will place.
     LocationAddr(String),
@@ -2284,14 +2064,25 @@ enum AttrValue {
     /// A flag whose value is always true: `DW_FORM_flag_present` from version 4
     /// on, which costs no bytes, and `DW_FORM_flag` before it.
     FlagPresent,
+    /// A flag with a value: `DW_FORM_flag_present` from version 4 on -- which
+    /// can only say "true", so a false flag is not written at all -- and
+    /// `DW_FORM_flag` before it, which carries the byte either way.  A static
+    /// function states `0` in DWARF 2 and 3 and nothing from version 4.
+    Flag(bool),
+    /// A code address: `DW_AT_low_pc` and, in DWARF 2 and 3, `DW_AT_high_pc`.
+    CodeAddr(CodeTarget<'a>, u64),
+    /// `DW_AT_frame_base`: `DW_OP_call_frame_cfa` in an expression block, which
+    /// says "wherever the unwinder puts the frame", so one expression serves a
+    /// function with a frame record and one without.
+    FrameBase,
 }
 
-struct Attr {
+struct Attr<'a> {
     at: u64,
-    value: AttrValue,
+    value: AttrValue<'a>,
 }
 
-impl Attr {
+impl Attr<'_> {
     /// The form this attribute takes in the unit's dialect.  The abbreviation and
     /// the value writer both call this, so a form cannot be declared for one
     /// shape and written in another.
@@ -2312,13 +2103,20 @@ impl Attr {
                     DW_FORM_BLOCK1
                 }
             }
-            AttrValue::FlagPresent => {
+            AttrValue::FlagPresent | AttrValue::Flag(_) => {
                 if config.version >= 4 {
                     DW_FORM_FLAG_PRESENT
                 } else {
                     DW_FORM_FLAG
                 }
             }
+            AttrValue::UnitRef(_) => DW_FORM_REF4,
+            AttrValue::CodeAddr(_, _) => DW_FORM_ADDR,
+            // `DW_FORM_exprloc` is what GCC 16.2 writes for a frame base and what
+            // every dialect from 3 on accepts; DWARF 2 has no such form, and this
+            // writer emits `DW_AT_frame_base` only where the CFA expression
+            // exists, which is version 3 and later.
+            AttrValue::FrameBase => DW_FORM_EXPRLOC,
         }
     }
 }
@@ -2328,9 +2126,15 @@ impl Attr {
 struct DieWriter {
     /// `.debug_abbrev` bytes, including the unit's own declarations.
     abbrev: Vec<u8>,
-    /// `(tag, has_children, attributes)` to abbreviation code, so a shape that
+    /// Shape fingerprint to `(shape, abbreviation code)`, so a shape that
     /// repeats -- 40 `int` members, say -- is declared once.
-    codes: FxHashMap<(u64, bool, Vec<(u64, u64)>), u64>,
+    ///
+    /// Every DIE in the unit passes through this lookup, so it may not allocate:
+    /// the fingerprint is computed over the attribute list in place, and the
+    /// stored shape is compared before a hit is trusted.  Keying the map on the
+    /// shape itself needed an owned copy of the attributes for every DIE, which
+    /// was the writer's only allocation in its hottest loop.
+    codes: FxHashMap<u64, Vec<(Shape, u64)>>,
     next_code: u64,
     /// Where each type DIE starts, relative to the unit, filled as the table is
     /// written.
@@ -2352,16 +2156,42 @@ impl DieWriter {
     }
 
     fn code_for(&mut self, tag: u64, children: bool, attrs: &[(u64, u64)]) -> u64 {
-        let key = (tag, children, attrs.to_vec());
-        if let Some(&code) = self.codes.get(&key) {
+        let bucket = self.codes.entry(shape_fingerprint(tag, children, attrs)).or_default();
+        if let Some(&(_, code)) = bucket
+            .iter()
+            .find(|(shape, _)| shape.0 == tag && shape.1 == children && shape.2 == attrs)
+        {
             return code;
         }
         let code = self.next_code;
         self.next_code += 1;
         declare_abbrev(&mut self.abbrev, code, tag, children, attrs);
-        self.codes.insert(key, code);
+        bucket.push(((tag, children, attrs.to_vec()), code));
         code
     }
+}
+
+/// One DIE shape: its tag, whether it has children, and its attribute list.
+type Shape = (u64, bool, Vec<(u64, u64)>);
+
+/// FNV-1a over a shape, so a repeated shape costs one integer comparison and a
+/// new one costs nothing at all.
+///
+/// A fingerprint collision is harmless by construction: the bucket holds every
+/// shape that hashes to the same value and each is compared in full, so two
+/// different shapes can never share an abbreviation code.
+fn shape_fingerprint(tag: u64, children: bool, attrs: &[(u64, u64)]) -> u64 {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for value in [tag, u64::from(children), attrs.len() as u64] {
+        hash = (hash ^ value).wrapping_mul(PRIME);
+    }
+    for (at, form) in attrs {
+        for value in [*at, *form] {
+            hash = (hash ^ value).wrapping_mul(PRIME);
+        }
+    }
+    hash
 }
 
 /// Everything one DIE needs to write its bytes: the output buffers, the
@@ -2378,12 +2208,15 @@ struct DieContext<'a, 'b> {
     address_size: usize,
     /// Where the unit starts, so a reference can be made unit-relative.
     unit_start: usize,
+    /// Whether the unit's rows carry declarator columns, which decides whether
+    /// a subprogram states `DW_AT_decl_column`.
+    declarator_rows: bool,
     writer: &'b mut DieWriter,
 }
 
 impl DieContext<'_, '_> {
     /// Write one DIE: its abbreviation code, then each attribute value.
-    fn write(&mut self, tag: u64, children: bool, attrs: &[Attr]) -> Result<(), String> {
+    fn write(&mut self, tag: u64, children: bool, attrs: &[Attr<'_>]) -> Result<(), String> {
         let forms: Vec<(u64, u64)> = attrs
             .iter()
             .map(|attr| (attr.at, attr.form(self.config, self.forms)))
@@ -2396,10 +2229,10 @@ impl DieContext<'_, '_> {
         Ok(())
     }
 
-    fn value(&mut self, value: &AttrValue) -> Result<(), String> {
+    fn value(&mut self, value: &AttrValue<'_>) -> Result<(), String> {
         match value {
             AttrValue::Text(text) => write_string_attribute(
-                text,
+                text.as_ref(),
                 self.forms.string,
                 self.info,
                 self.relocs,
@@ -2489,6 +2322,48 @@ impl DieContext<'_, '_> {
                 }
                 Ok(())
             }
+            AttrValue::Flag(value) => {
+                if self.config.version >= 4 {
+                    // `flag_present` carries no byte and means "true"; a false
+                    // flag in a version that has no byte to say so is a builder
+                    // mistake, and saying nothing would claim the opposite.
+                    return if *value {
+                        Ok(())
+                    } else {
+                        Err("internal: DWARF flag_present attribute is false".to_string())
+                    };
+                }
+                self.info.push(u8::from(*value));
+                Ok(())
+            }
+            AttrValue::UnitRef(offset) => {
+                self.info.extend_from_slice(&offset.to_le_bytes());
+                Ok(())
+            }
+            AttrValue::CodeAddr(target, offset) => match target {
+                CodeTarget::Label(label) => push_reloc(
+                    self.info,
+                    self.relocs,
+                    self.abs_addr,
+                    self.address_size,
+                    label,
+                    0,
+                ),
+                CodeTarget::Section(section) => push_reloc(
+                    self.info,
+                    self.relocs,
+                    self.abs_addr,
+                    self.address_size,
+                    section,
+                    *offset,
+                ),
+            },
+            AttrValue::FrameBase => {
+                // A one-byte expression block: `uleb` length, then the opcode.
+                self.info.push(1);
+                self.info.push(DW_OP_CALL_FRAME_CFA);
+                Ok(())
+            }
         }
     }
 
@@ -2574,7 +2449,7 @@ fn emit_type(
                 },
                 Attr {
                     at: DW_AT_NAME,
-                    value: AttrValue::Text(kind.spelling().to_string()),
+                    value: AttrValue::Text(Cow::Owned(kind.spelling().to_string())),
                 },
             ],
         ),
@@ -2615,7 +2490,7 @@ fn emit_type(
             &[
                 Attr {
                     at: DW_AT_NAME,
-                    value: AttrValue::Text(name.clone()),
+                    value: AttrValue::Text(Cow::Owned(name.clone())),
                 },
                 Attr {
                     at: DW_AT_TYPE,
@@ -2690,7 +2565,7 @@ fn emit_type(
             if let Some(name) = name {
                 attrs.push(Attr {
                     at: DW_AT_NAME,
-                    value: AttrValue::Text(name.clone()),
+                    value: AttrValue::Text(Cow::Owned(name.clone())),
                 });
             }
             attrs.push(Attr {
@@ -2722,7 +2597,7 @@ fn emit_type(
                     &[
                         Attr {
                             at: DW_AT_NAME,
-                            value: AttrValue::Text(name.clone()),
+                            value: AttrValue::Text(Cow::Owned(name.clone())),
                         },
                         Attr {
                             at: DW_AT_CONST_VALUE,
@@ -2775,7 +2650,7 @@ fn emit_type(
             false,
             &[Attr {
                 at: DW_AT_NAME,
-                value: AttrValue::Text((*name).to_string()),
+                value: AttrValue::Text(Cow::Owned((*name).to_string())),
             }],
         ),
     }
@@ -2816,7 +2691,7 @@ fn emit_record(
     if let Some(name) = name {
         attrs.push(Attr {
             at: DW_AT_NAME,
-            value: AttrValue::Text(name.to_string()),
+            value: AttrValue::Text(Cow::Owned(name.to_string())),
         });
     }
     attrs.push(Attr {
@@ -2851,7 +2726,7 @@ fn emit_member(
     if let Some(name) = &member.name {
         attrs.push(Attr {
             at: DW_AT_NAME,
-            value: AttrValue::Text(name.clone()),
+            value: AttrValue::Text(Cow::Owned(name.clone())),
         });
     }
     attrs.push(Attr {
@@ -2947,7 +2822,7 @@ fn emit_variables(
     for variable in variables {
         let mut attrs = vec![Attr {
             at: DW_AT_NAME,
-            value: AttrValue::Text(variable.name.clone()),
+            value: AttrValue::Text(Cow::Owned(variable.name.clone())),
         }];
         let file_number = variable
             .decl_file

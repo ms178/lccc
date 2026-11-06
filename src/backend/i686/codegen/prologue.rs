@@ -1780,11 +1780,35 @@ impl I686Codegen {
         // machinery) always feeds. The remaining refusal is the run-time-aligned
         // alloca, whose raw slot is a bound rather than the object.
         {
+            // Where a parameter's storage actually is depends on how the store
+            // phase above homed it, and the two cases are different objects:
+            //
+            // * **Directly homed** (`param_direct_homes`): the callee reads and
+            //   writes the caller's argument slot itself -- the i386 psABI gives
+            //   it that ownership -- so `&p` *is* `%ebp + 8 + k` and the frame
+            //   slot the IR names is an alias of that area with no bytes of its
+            //   own. Measured at `-O0`: `&a == %ebp + 8` holds for a parameter
+            //   written directly, written through its address and merely read,
+            //   and the incoming slot holds the new value afterwards. GCC 16.2
+            //   states exactly that offset (`fbreg 0`, `fbreg 4`, ...), so the
+            //   home is the incoming offset and not the slot.
+            // * **Copied into its frame slot**: the prologue stored the argument
+            //   there and every use reads that copy, so the copy is the home.
+            //
+            // Naming the slot in the first case would point a consumer at frame
+            // bytes nothing ever writes -- a confident garbage value, the one
+            // failure mode a location must never have.
             let slots: Vec<Option<i64>> = self
                 .state
                 .param_alloca_slots
                 .iter()
-                .map(|entry| entry.map(|(slot, _, _)| slot.0))
+                .map(|entry| {
+                    entry.map(|(slot, _, _)| {
+                        self.param_direct_homes
+                            .get(&slot.0)
+                            .map_or(slot.0, |&(incoming, _)| incoming)
+                    })
+                })
                 .collect();
             let over_aligned: Vec<bool> = self
                 .state
