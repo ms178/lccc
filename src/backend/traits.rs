@@ -97,6 +97,50 @@ pub const MAX_JUMP_TABLE_RANGE: usize = 4096;
 /// of compare-and-branch instructions is more efficient.
 pub const MIN_JUMP_TABLE_DENSITY_PERCENT: usize = 40;
 
+/// Most case clusters a switch-tree leaf tests one after another; a larger
+/// set splits at its median (`ArchCodegen::emit_switch_tree`).  Three keeps a
+/// leaf at most three compares deep, as GCC 16.2's and Clang 23.1.5's
+/// balanced trees do.
+pub const SWITCH_TREE_LEAF: usize = 3;
+
+/// A run of consecutive case values with one target: `lo..=hi` in the
+/// selector type's order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwitchCluster {
+    pub lo: i64,
+    pub hi: i64,
+    pub target: BlockId,
+}
+
+/// The switch cases as clusters sorted in the order of `unsigned` (the
+/// selector type's signedness): values ascending, a run of consecutive
+/// values with one target merged.  Duplicate values keep the first target
+/// (the frontend emits each case value once).
+pub fn switch_clusters(cases: &[(i64, BlockId)], unsigned: bool) -> Vec<SwitchCluster> {
+    let key = |v: i64| -> i128 {
+        if unsigned {
+            i128::from(v as u64)
+        } else {
+            i128::from(v)
+        }
+    };
+    let mut sorted: Vec<(i64, BlockId)> = cases.to_vec();
+    sorted.sort_by_key(|&(v, _)| key(v));
+    sorted.dedup_by_key(|&mut (v, _)| key(v));
+    let mut clusters: Vec<SwitchCluster> = Vec::with_capacity(sorted.len());
+    for (v, target) in sorted {
+        match clusters.last_mut() {
+            Some(last) if last.target == target && key(last.hi) + 1 == key(v) => last.hi = v,
+            _ => clusters.push(SwitchCluster {
+                lo: v,
+                hi: v,
+                target,
+            }),
+        }
+    }
+    clusters
+}
+
 /// Trait that each architecture implements to provide its specific code generation.
 ///
 /// The shared framework calls these methods during instruction dispatch.
@@ -3060,7 +3104,9 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
             false
         };
 
-        if use_jump_table {
+        if !use_jump_table && hint.is_none() && self.supports_switch_tree(ty) {
+            self.emit_switch_tree(val, cases, default, ty);
+        } else if use_jump_table {
             // Profile-guided partitioning: hoist the dominant case (>= 50% of
             // executions) OUT of the table into a single compare — the common
             // path skips the bounds check and the indirect jump entirely.
@@ -3088,6 +3134,109 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
             }
             self.emit_branch_to_block(*default);
         }
+    }
+
+    /// Whether a sparse switch on `ty` may take `emit_switch_tree` (the
+    /// target implements the `emit_switch_tree_*` primitives for it).
+    fn supports_switch_tree(&self, _ty: IrType) -> bool {
+        false
+    }
+
+    /// Load the selector into the accumulator in the form the tree's
+    /// compares read; called once per switch.
+    fn emit_switch_tree_load(&mut self, val: &Operand, _ty: IrType) {
+        self.emit_load_operand(val);
+    }
+
+    /// Branch to `label` when the accumulator equals `value`.
+    fn emit_switch_tree_eq(&mut self, value: i64, label: &str, ty: IrType) {
+        self.emit_switch_case_branch(value, label, ty);
+    }
+
+    /// Branch to `label` when the accumulator is below `pivot` in `ty`'s
+    /// order (signed or unsigned), leaving it intact.
+    fn emit_switch_tree_below(&mut self, _pivot: i64, _label: &str, _ty: IrType) {}
+
+    /// Branch to `label` when `lo <= accumulator <= hi` in `ty`'s order,
+    /// leaving the accumulator intact.
+    fn emit_switch_tree_range(&mut self, _lo: i64, _hi: i64, _label: &str, _ty: IrType) {}
+
+    /// Branch to `below` when the accumulator is below `pivot`, then to
+    /// `equal` when it equals it: one compare where the target can read
+    /// both outcomes from it (the split value is the upper half's first
+    /// case).
+    fn emit_switch_tree_below_or_eq(&mut self, pivot: i64, below: &str, equal: &str, ty: IrType) {
+        self.emit_switch_tree_below(pivot, below, ty);
+        self.emit_switch_tree_eq(pivot, equal, ty);
+    }
+
+    /// Sparse-switch dispatch as a balanced binary tree of case clusters
+    /// (GCC 16.2's and Clang 23.1.5's lowering of a switch neither a jump
+    /// table nor a lookup table serves): consecutive values with one target
+    /// test as one range, a set of more than `SWITCH_TREE_LEAF` clusters
+    /// branches on its median to the lower half, and a leaf tests its
+    /// clusters in order and falls to the default.  `sw_sparse`'s cases 10,
+    /// 100, 1000, 10000 cost two compares instead of four; a `' '`, `'\t'`,
+    /// `'\n'`, `'\r'` run costs one range test.
+    fn emit_switch_tree(
+        &mut self,
+        val: &Operand,
+        cases: &[(i64, BlockId)],
+        default: &BlockId,
+        ty: IrType,
+    ) {
+        let clusters = switch_clusters(cases, ty.is_unsigned() || ty == IrType::Ptr);
+        self.emit_switch_tree_load(val, ty);
+        // Every leaf but the last emitted ends in a real jump to the
+        // default: the next leaf's code follows it, not the next block.
+        let next_block = self.state().next_block_label.take();
+        self.emit_switch_subtree(&clusters, *default, ty, next_block);
+        self.state().next_block_label = next_block;
+    }
+
+    /// One subtree of `emit_switch_tree`.  `next_block` is the layout
+    /// successor when this subtree is emitted last (its leaf may fall into
+    /// the default), `None` otherwise.
+    fn emit_switch_subtree(
+        &mut self,
+        clusters: &[SwitchCluster],
+        default: BlockId,
+        ty: IrType,
+        next_block: Option<BlockId>,
+    ) {
+        if clusters.len() <= SWITCH_TREE_LEAF {
+            for cluster in clusters {
+                let label = cluster.target.as_label();
+                if cluster.lo == cluster.hi {
+                    self.emit_switch_tree_eq(cluster.lo, &label, ty);
+                } else {
+                    self.emit_switch_tree_range(cluster.lo, cluster.hi, &label, ty);
+                }
+            }
+            self.state().next_block_label = next_block;
+            self.emit_branch_to_block(default);
+            self.state().next_block_label = None;
+            return;
+        }
+        let mid = clusters.len() / 2;
+        let lower = self.state().fresh_label("sw_lo");
+        let split = clusters[mid];
+        let upper = if split.lo == split.hi {
+            // The split value is a case of its own: the pivot's compare
+            // answers it too.
+            let label = split.target.as_label();
+            self.emit_switch_tree_below_or_eq(split.lo, &lower, &label, ty);
+            &clusters[mid + 1..]
+        } else {
+            self.emit_switch_tree_below(split.lo, &lower, ty);
+            &clusters[mid..]
+        };
+        self.emit_switch_subtree(upper, default, ty, None);
+        // Only the branch above reaches here, with the accumulator intact;
+        // the cached register contents describe the upper half's end.
+        self.state().emit_fmt(format_args!("{}:", lower));
+        self.state().reg_cache.invalidate_all();
+        self.emit_switch_subtree(&clusters[..mid], default, ty, next_block);
     }
 
     /// Emit a jump table for a dense switch statement.

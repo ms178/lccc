@@ -587,6 +587,7 @@ fn run_gvn_licm_ivsr_shared(
     run_ivsr_scalar: bool,
     run_ivsr_ptr_add: bool,
     ivsr_x86_sib_cost: bool,
+    ivsr_lftr: bool,
     run_univsr: bool,
     run_ptr_iv_collapse: bool,
     time_passes: bool,
@@ -710,6 +711,7 @@ fn run_gvn_licm_ivsr_shared(
                     run_ivsr_scalar,
                     run_ivsr_ptr_add,
                     ivsr_x86_sib_cost,
+                    ivsr_lftr,
                 );
                 verify::verify_after_func_pass(func, "ivsr");
                 n += round;
@@ -3503,6 +3505,15 @@ pub(crate) fn run_passes(
                 target,
                 crate::backend::Target::X86_64 | crate::backend::Target::I686
             );
+            // Pointer exit tests (IVSR's `exit_test`): AArch64 post-indexes
+            // the pointer bump into the access and RISC-V compares two
+            // registers in its branch, so a counter kept only for the exit
+            // test is pure overhead there; x86 keeps the index form (univsr).
+            let ivsr_lftr = run_ivsr
+                && matches!(
+                    target,
+                    crate::backend::Target::Aarch64 | crate::backend::Target::Riscv64
+                );
             // Un-IVSR only pays off on targets with scaled-index addressing
             // (x86-64 SIB). Gated for diagnostics like the other loop passes.
             let run_univsr = run_ivsr
@@ -3536,6 +3547,7 @@ pub(crate) fn run_passes(
                     run_ivsr_scalar,
                     run_ivsr_ptr_add,
                     ivsr_x86_sib_cost,
+                    ivsr_lftr,
                     run_univsr,
                     run_ptr_iv_collapse,
                     time_passes,

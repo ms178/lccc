@@ -33,6 +33,7 @@ pub(crate) mod liveness; // Live interval computation
 pub(crate) mod location_alloc;
 pub(crate) mod narrow_copy; // Bounded aggregate tail copy, shared by both x86 backends
 pub(crate) mod regalloc; // Linear scan register allocator
+pub(crate) mod ret_dup; // Return duplication into call blocks (sibling calls in branch arms)
 pub(crate) mod split_ranges; // Live range splitting for call-spanning values // P0-A global location allocation (cross-block GLA)
 
 pub(crate) mod arm;

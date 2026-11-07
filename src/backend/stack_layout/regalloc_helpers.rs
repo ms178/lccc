@@ -574,15 +574,18 @@ pub fn run_regalloc_and_merge_clobbers_ipa(
         && caller_saved_regs.len() >= 4
         && (indirect_target_regs.iter().any(|r| r.0 == 11)
             || matches!(crate::common::types::target_elf_machine(), 183 | 243));
-    let (param_volatile_pool, param_arrival_regs) =
-        if crate::common::types::target_elf_machine() == 183 {
-            (
-                aarch64_param_volatile_pool(func, &caller_saved_regs),
-                aarch64_param_arrival_regs(func, &caller_saved_regs),
-            )
-        } else {
-            (Vec::new(), Vec::new())
-        };
+    let (param_volatile_pool, param_arrival_regs) = match crate::common::types::target_elf_machine()
+    {
+        183 => (
+            aarch64_param_volatile_pool(func, &caller_saved_regs),
+            aarch64_param_arrival_regs(func, &caller_saved_regs),
+        ),
+        243 => (
+            riscv_param_volatile_pool(func, &caller_saved_regs),
+            riscv_param_arrival_regs(func, &caller_saved_regs),
+        ),
+        _ => (Vec::new(), Vec::new()),
+    };
     let mut config = super::super::regalloc::RegAllocConfig {
         ipa_regs,
         available_regs,
@@ -1509,6 +1512,119 @@ fn aarch64_scalar_param_arrivals(
                 next_gpr = next_gpr.saturating_add(1);
             }
             IrType::F32 | IrType::F64 => arrival.push(None),
+            _ => return None,
+        }
+    }
+    Some(arrival)
+}
+
+/// riscv64: the caller-saved registers a parameter web may be homed in
+/// (`RegAllocConfig::param_volatile_pool`) -- the AArch64 rule over a0-a7.
+///
+/// The RISC-V emitter copies each register parameter out of its argument
+/// register at its `ParamRef`, one after the other, so a home must never be
+/// a register some parameter still arrives in: with `k` integer-class
+/// parameters those are a0..a{k-1}.  Only scalar parameter lists are
+/// modelled ([`riscv_scalar_param_arrivals`]); anything else keeps the
+/// callee-saved-only rule (empty pool).  A leaf whose parameters stay in
+/// their argument registers (`riscv_ordered_param_copies`) never consults
+/// it.
+pub(crate) fn riscv_param_volatile_pool(
+    func: &IrFunction,
+    caller_saved_regs: &[PhysReg],
+) -> Vec<PhysReg> {
+    let Some(arrival) = riscv_scalar_param_arrivals(func, caller_saved_regs) else {
+        return Vec::new();
+    };
+    caller_saved_regs
+        .iter()
+        .copied()
+        .filter(|r| !arrival.contains(&Some(r.0)))
+        .collect()
+}
+
+/// riscv64: each integer-class parameter's argument register, keyed by its
+/// `ParamRef` destination (`RegAllocConfig::param_arrival_regs`): a
+/// parameter may stay where it arrives (see [`aarch64_param_arrival_regs`]);
+/// no other parameter is ever homed there (the pool excludes it), and the
+/// allocator's entry guard keeps every value born before the last
+/// `ParamRef` out of the a-registers.
+pub(crate) fn riscv_param_arrival_regs(
+    func: &IrFunction,
+    caller_saved_regs: &[PhysReg],
+) -> Vec<(u32, PhysReg)> {
+    let Some(arrival) = riscv_scalar_param_arrivals(func, caller_saved_regs) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for inst in func.blocks.first().map_or(&[][..], |b| &b.instructions[..]) {
+        if let Instruction::ParamRef {
+            dest, param_idx, ..
+        } = inst
+            && let Some(Some(r)) = arrival.get(*param_idx)
+            && caller_saved_regs.contains(&PhysReg(*r))
+        {
+            out.push((dest.0, PhysReg(*r)));
+        }
+    }
+    out
+}
+
+/// Each parameter's riscv64 integer argument register as a `PhysReg` id
+/// (a0 = 12, ..., a7 = 19; `None` for an FP-class or stack-passed one) when
+/// the function qualifies for parameter homes in the caller-saved pool: not
+/// variadic, a non-empty pool, every parameter a scalar integer, pointer,
+/// `float` or `double`, and the ParamRefs forming the entry prefix of block
+/// 0.  The LP64D integer-class parameters take a0-a7 in order; an FP-class
+/// one takes fa0-fa7, and past those a GP register -- which this does not
+/// model: a ninth FP parameter refuses the pool.  A call-free function
+/// refuses too: there the parameters stay pinned to their argument
+/// registers (`riscv_ordered_param_copies`), Phase 2p never runs, and the
+/// pools would only reorder the temporaries' choices for it.
+fn riscv_scalar_param_arrivals(
+    func: &IrFunction,
+    caller_saved_regs: &[PhysReg],
+) -> Option<Vec<Option<u8>>> {
+    if func.is_variadic || func.uses_sret || caller_saved_regs.is_empty() {
+        return None;
+    }
+    let calls = func.blocks.iter().any(|b| {
+        b.instructions.iter().any(|inst| {
+            matches!(
+                inst,
+                Instruction::Call { .. } | Instruction::CallIndirect { .. }
+            )
+        })
+    });
+    if !calls {
+        return None;
+    }
+    if !crate::backend::regalloc::riscv_params_in_entry_prefix(func) {
+        return None;
+    }
+    let (mut next_gpr, mut next_fpr) = (0u8, 0u8);
+    let mut arrival = Vec::with_capacity(func.params.len());
+    for p in &func.params {
+        if p.struct_size.is_some() || p.is_f128_sse || p.fp_agg_class.is_some() {
+            return None;
+        }
+        match p.ty {
+            IrType::I8
+            | IrType::U8
+            | IrType::I16
+            | IrType::U16
+            | IrType::I32
+            | IrType::U32
+            | IrType::I64
+            | IrType::U64
+            | IrType::Ptr => {
+                arrival.push((next_gpr < 8).then_some(12 + next_gpr));
+                next_gpr = next_gpr.saturating_add(1);
+            }
+            IrType::F32 | IrType::F64 if next_fpr < 8 => {
+                arrival.push(None);
+                next_fpr += 1;
+            }
             _ => return None,
         }
     }

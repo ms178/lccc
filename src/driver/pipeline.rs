@@ -3752,25 +3752,26 @@ impl Driver {
             }
         }
 
-        // x86-64 sibling calls in branch arms: give each call block that
-        // ends in `Branch(R)` the shared return block's `Return`, so the
-        // backend's per-block sibling-call shape matches (see
-        // backend::x86::ret_dup). Last CFG change before the splitters;
+        // Sibling calls in branch arms (x86-64, AArch64, RISC-V): give each
+        // call block that ends in `Branch(R)` the shared return block's
+        // `Return`, so the backend's per-block sibling-call shape matches
+        // (see backend::ret_dup). Last CFG change before the splitters;
         // after the PGO post-pass fingerprint, so generate and use builds
         // hash the same CFG. `CCC_NO_SIBCALL` turns the conversion off, and
         // with it this rewrite (a duplicated epilogue would be its only
         // effect); `CCC_DISABLE_PASSES=ret_dup` turns off only the rewrite.
-        if self.target == Target::X86_64
-            && self.opt_level >= 1
-            && std::env::var_os("CCC_NO_SIBCALL").is_none()
-            && !crate::passes::pass_disabled(
-                std::env::var("CCC_DISABLE_PASSES").unwrap_or_default(),
-                "ret_dup",
-            )
-        {
+        let sibling_abi = crate::backend::ret_dup::SiblingAbi::for_target(self.target);
+        if let Some(abi) = sibling_abi.filter(|_| {
+            self.opt_level >= 1
+                && std::env::var_os("CCC_NO_SIBCALL").is_none()
+                && !crate::passes::pass_disabled(
+                    std::env::var("CCC_DISABLE_PASSES").unwrap_or_default(),
+                    "ret_dup",
+                )
+        }) {
             let mut changed = 0;
             for func in &mut module.functions {
-                changed += crate::backend::x86::ret_dup::run(func);
+                changed += crate::backend::ret_dup::run(func, abi);
             }
             if changed != 0 {
                 crate::passes::verify::verify_after_pass(&module, "ret_dup");

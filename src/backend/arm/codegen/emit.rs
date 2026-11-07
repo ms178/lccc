@@ -262,6 +262,12 @@ pub struct ArmCodegen {
     /// unmodeled class), so the call is published unannotated and the
     /// peephole assumes it reads all of x0-x8.
     pub(super) call_gp_reads: Option<u16>,
+    /// The significant width (8, 16 or 32 bits; 0 = all 64) of the integer
+    /// argument in each of x0-x7 for the call being emitted, armed beside
+    /// `call_gp_reads` and published with it (`peephole::late`): AAPCS64
+    /// callees ignore the bits above a narrow argument, so an extension
+    /// that only the call reads is dead.
+    pub(super) call_gp_narrow: [u8; 8],
     /// For variadic functions: offset from SP where the GP register save area starts (x0-x7).
     pub(super) va_gp_save_offset: i64,
     /// For variadic functions: offset from SP where the FP register save area starts (q0-q7).
@@ -350,6 +356,7 @@ impl ArmCodegen {
             func_ret_is_f128_sse: false,
             call_ret_is_f128_sse: false,
             call_gp_reads: None,
+            call_gp_narrow: [0; 8],
             va_gp_save_offset: 0,
             va_fp_save_offset: 0,
             va_named_gp_count: 0,
@@ -1424,6 +1431,22 @@ impl ArmCodegen {
     /// Load a 64-bit immediate value into a register using movz/movn + movk sequence.
     /// Uses MOVN (move-not) for values where most halfwords are 0xFFFF, which
     /// gives shorter sequences for negative numbers and large values.
+    /// `cmp acc, #value` -- or `cmn` for a negated 12-bit immediate, or
+    /// the value materialized in `scratch` -- as the switch compares need
+    /// (GCC 16.2 and Clang 23.1.5 use the immediate forms).
+    fn emit_cmp_imm_or_reg(&mut self, acc: &str, scratch: &str, value: i64) {
+        if (0..=4095).contains(&value) {
+            self.state.emit_fmt(format_args!("    cmp {acc}, #{value}"));
+        } else if (-4095..0).contains(&value) {
+            self.state
+                .emit_fmt(format_args!("    cmn {acc}, #{}", -value));
+        } else {
+            self.emit_load_imm64(scratch, value);
+            self.state
+                .emit_fmt(format_args!("    cmp {acc}, {scratch}"));
+        }
+    }
+
     pub(super) fn emit_load_imm64(&mut self, reg: &str, val: i64) {
         let bits = val as u64;
         if bits == 0 {
@@ -3128,18 +3151,96 @@ impl ArchCodegen for ArmCodegen {
         }
     }
 
+    fn supports_switch_tree(&self, ty: IrType) -> bool {
+        matches!(
+            ty,
+            IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64 | IrType::Ptr
+        )
+    }
+
+    fn emit_switch_tree_below(&mut self, pivot: i64, label: &str, ty: IrType) {
+        let word = matches!(ty, IrType::I32 | IrType::U32);
+        let (acc, scratch, value) = if word {
+            ("w0", "w1", i64::from(pivot as i32))
+        } else {
+            ("x0", "x1", pivot)
+        };
+        self.emit_cmp_imm_or_reg(acc, scratch, value);
+        // Inverted over an unconditional branch, like every switch compare
+        // here (reach); the peephole fuses the pair into `b.lt`/`b.lo`.
+        let unsigned = ty.is_unsigned() || ty == IrType::Ptr;
+        let skip = self.state.fresh_label("skip");
+        let cond = if unsigned { "hs" } else { "ge" };
+        self.state.emit_fmt(format_args!("    b.{cond} {skip}"));
+        self.state.emit_fmt(format_args!("    b {label}"));
+        self.state.emit_fmt(format_args!("{skip}:"));
+    }
+
+    fn emit_switch_tree_below_or_eq(&mut self, pivot: i64, below: &str, equal: &str, ty: IrType) {
+        // One `cmp`, read by both branches (the flags survive them).
+        self.emit_switch_tree_below(pivot, below, ty);
+        let skip = self.state.fresh_label("skip");
+        self.state.emit_fmt(format_args!("    b.ne {skip}"));
+        self.state.emit_fmt(format_args!("    b {equal}"));
+        self.state.emit_fmt(format_args!("{skip}:"));
+    }
+
+    fn emit_switch_tree_range(&mut self, lo: i64, hi: i64, label: &str, ty: IrType) {
+        // `lo <= x <= hi` as `(x - lo) <=u (hi - lo)` at the selector's
+        // width; x1/x2 are emitter scratch outside every allocator pool.
+        let word = matches!(ty, IrType::I32 | IrType::U32);
+        let (acc, diff, tmp) = if word {
+            ("w0", "w1", "w2")
+        } else {
+            ("x0", "x1", "x2")
+        };
+        let (lo, span) = if word {
+            (
+                i64::from(lo as i32),
+                i64::from((hi as i32).wrapping_sub(lo as i32) as u32),
+            )
+        } else {
+            (lo, hi.wrapping_sub(lo))
+        };
+        if (0..=4095).contains(&lo) {
+            self.state
+                .emit_fmt(format_args!("    sub {diff}, {acc}, #{lo}"));
+        } else if (-4095..0).contains(&lo) {
+            self.state
+                .emit_fmt(format_args!("    add {diff}, {acc}, #{}", -lo));
+        } else {
+            self.emit_load_imm64(tmp, lo);
+            self.state
+                .emit_fmt(format_args!("    sub {diff}, {acc}, {tmp}"));
+        }
+        if (0..=4095).contains(&span) {
+            self.state.emit_fmt(format_args!("    cmp {diff}, #{span}"));
+        } else {
+            self.emit_load_imm64(tmp, span);
+            self.state.emit_fmt(format_args!("    cmp {diff}, {tmp}"));
+        }
+        let skip = self.state.fresh_label("skip");
+        self.state.emit_fmt(format_args!("    b.hi {skip}"));
+        self.state.emit_fmt(format_args!("    b {label}"));
+        self.state.emit_fmt(format_args!("{skip}:"));
+    }
+
     fn emit_switch_case_branch(&mut self, case_val: i64, label: &str, ty: IrType) {
         let use_32bit = matches!(
             ty,
             IrType::I32 | IrType::U32 | IrType::I16 | IrType::U16 | IrType::I8 | IrType::U8
         );
-        if use_32bit {
-            self.emit_load_imm64("w1", case_val as i32 as i64);
-            self.state.emit("    cmp w0, w1");
+        // The chain only asks "equal?", so a case constant within the
+        // 12-bit immediate range of `cmp` (or of `cmn`, which compares with
+        // its negation) needs no register: `cmp w0, #35` where the chain used
+        // to emit `movz w1, #35; cmp w0, w1` for every case (GCC 16.2 and
+        // Clang 23.1.5 use the immediate forms).
+        let (acc, scratch, value) = if use_32bit {
+            ("w0", "w1", case_val as i32 as i64)
         } else {
-            self.emit_load_imm64("x1", case_val);
-            self.state.emit("    cmp x0, x1");
-        }
+            ("x0", "x1", case_val)
+        };
+        self.emit_cmp_imm_or_reg(acc, scratch, value);
         let skip = self.state.fresh_label("skip");
         self.state.emit_fmt(format_args!("    b.ne {}", skip));
         self.state.emit_fmt(format_args!("    b {}", label));
@@ -3666,6 +3767,7 @@ impl ArchCodegen for ArmCodegen {
         fn emit_call_store_i128_result(&mut self, dest: &Value) => emit_call_store_i128_result_impl;
         fn emit_call_store_f128_result(&mut self, dest: &Value) => emit_call_store_f128_result_impl;
         fn emit_call_store_result(&mut self, dest: &Value, return_type: IrType) => emit_call_store_result_impl;
+        fn arm_sibcall_candidate(&mut self, info: &crate::ir::reexports::CallInfo) => arm_sibcall_candidate_impl;
         fn emit_call_store_fp_agg_return(&mut self, buffer: &Operand, class: crate::common::types::FpAggClass, dest: Option<&Value>) => emit_call_store_fp_agg_return_impl;
         fn set_call_ret_is_f128_sse(&mut self, is_f128: bool) => set_call_ret_is_f128_sse_impl;
         // globals
