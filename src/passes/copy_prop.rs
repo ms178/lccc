@@ -17,6 +17,7 @@
 //! overhead and gives O(1) lookups with better cache locality.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::ir::intrinsics::IntrinsicOp;
 use crate::ir::reexports::{
     Instruction, IrConst, IrFunction, IrModule, Operand, Terminator, Value,
 };
@@ -25,6 +26,22 @@ use crate::ir::reexports::{
 /// Returns the number of operand replacements made.
 pub fn run(module: &mut IrModule) -> usize {
     module.for_each_function(propagate_copies)
+}
+
+/// True when an intrinsic reads an argument naming a slot as a WHOLE vector of
+/// exactly `size` bytes, so that `memcpy tmp, src` feeding that argument can be
+/// folded by pointing the argument at `src` instead.
+///
+/// `vector_home_width() == size` is what makes the read whole-object: the op
+/// consumes vectors of that width, so it cannot be reading a prefix or a field
+/// of a wider aggregate.
+///
+/// `writes_memory_via_args` ops (the `VecStore*` family) are refused: they carry
+/// their destination in `args[1]` rather than `dest_ptr`, so the scan below --
+/// which only recognises writes through `dest_ptr` -- cannot see them, and
+/// folding `src` into one of their operands would turn a read into a write.
+fn memcpy_folds_into_intrinsic(op: &IntrinsicOp, size: usize) -> bool {
+    op.vector_home_width() == Some(size as u32) && !op.writes_memory_via_args()
 }
 
 /// Forward a purely intermediate memcpy source:
@@ -37,6 +54,20 @@ pub fn run(module: &mut IrModule) -> usize {
 /// becomes `memcpy dst, src` when `tmp` has no other use. This is a local
 /// copy-chain rewrite; unlike general aggregate forwarding it does not remove
 /// the final copy or change any load/store aliasing.
+///
+/// The consumer may also be a vector INTRINSIC that reads `tmp` as a whole
+/// vector operand, in which case the argument is re-pointed at `src`:
+///
+/// ```text
+///     memcpy tmp, src
+///     vminps dst, [tmp], [hi]
+/// ```
+///
+/// becomes `vminps dst, [src], [hi]`. That second form is what removes the
+/// per-clamp slot round-trips in explicit-SIMD code: the vector lowering gives
+/// every temporary its own stack slot and moves the operands into it, so a
+/// kernel of eight `vminps`/`vmaxps` clamps emitted 42 allocas, 24 memcpys and
+/// 222 instructions where GCC emits 36 and Clang 37 (a 16.9x runtime loss).
 pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
     let mut total = 0;
     for func in &mut module.functions {
@@ -78,8 +109,8 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
         for block in &mut func.blocks {
             let mut i = 0;
             while i < block.instructions.len() {
-                let (tmp, src) = match block.instructions[i] {
-                    Instruction::Memcpy { dest, src, .. } if dest != src => (dest, src),
+                let (tmp, src, size) = match block.instructions[i] {
+                    Instruction::Memcpy { dest, src, size } if dest != src => (dest, src, size),
                     _ => {
                         i += 1;
                         continue;
@@ -97,6 +128,25 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
                     let inst = &block.instructions[j];
                     match inst {
                         Instruction::Memcpy { src: copy_src, .. } if *copy_src == tmp => {
+                            if consumer.is_some() {
+                                safe = false;
+                                break;
+                            }
+                            consumer = Some(j);
+                        }
+                        // A whole-vector read of `tmp` is a valid consumer too;
+                        // re-pointing the argument at `src` is exactly the
+                        // chain rewrite, one operand at a time. `tmp` is the
+                        // read operand, so it must not also be the destination
+                        // the op writes through.
+                        Instruction::Intrinsic {
+                            op, args, dest_ptr, ..
+                        } if memcpy_folds_into_intrinsic(op, size)
+                            && *dest_ptr != Some(tmp)
+                            && args
+                                .iter()
+                                .any(|a| matches!(a, Operand::Value(v) if *v == tmp)) =>
+                        {
                             if consumer.is_some() {
                                 safe = false;
                                 break;
@@ -142,9 +192,16 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
                     i += 1;
                     continue;
                 }
-                if let Instruction::Memcpy { src: copy_src, .. } = &mut block.instructions[consumer]
-                {
-                    *copy_src = src;
+                match &mut block.instructions[consumer] {
+                    Instruction::Memcpy { src: copy_src, .. } => *copy_src = src,
+                    Instruction::Intrinsic { args, .. } => {
+                        for arg in args.iter_mut() {
+                            if matches!(arg, Operand::Value(v) if *v == tmp) {
+                                *arg = Operand::Value(src);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 block.instructions.remove(i);
                 if block.source_spans.len() > i {
@@ -2069,5 +2126,276 @@ mod tests {
             propagate_copies_sparing(&mut func, 4, spare);
             assert_eq!(operands_of(&func, 5).1, Operand::Value(Value(2)));
         }
+    }
+
+    // ---- memcpy -> whole-vector intrinsic operand forwarding ----------------
+    //
+    // `forward_memcpy_chains` folds `memcpy tmp, src` into a consumer. The
+    // consumer may be a second memcpy, or -- added here -- a vector intrinsic
+    // that reads `tmp` as a whole vector operand. These tests pin both arms
+    // and, more importantly, the refusals that keep the rewrite sound.
+
+    /// Build a one-block function whose instructions are `insts`.
+    fn one_block(insts: Vec<Instruction>) -> IrFunction {
+        let mut func = IrFunction::new("t".to_string(), IrType::Void, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        func
+    }
+
+    fn alloca(dest: u32) -> Instruction {
+        Instruction::Alloca {
+            dest: Value(dest),
+            ty: IrType::Ptr,
+            size: 32,
+            align: 0,
+            volatile: false,
+            semantic_volatile: false,
+        }
+    }
+
+    fn memcpy(dest: u32, src: u32, size: usize) -> Instruction {
+        Instruction::Memcpy {
+            dest: Value(dest),
+            src: Value(src),
+            size,
+        }
+    }
+
+    /// `MinPs256` reads two 32-byte slots and writes a third.
+    fn minps256(dest_ptr: u32, a: u32, b: u32) -> Instruction {
+        Instruction::Intrinsic {
+            dest: Some(Value(900)),
+            op: IntrinsicOp::MinPs256,
+            dest_ptr: Some(Value(dest_ptr)),
+            args: vec![Operand::Value(Value(a)), Operand::Value(Value(b))],
+        }
+    }
+
+    /// The instructions of block 0 after the rewrite, as (index, kind) pairs.
+    fn shape(func: &IrFunction) -> Vec<String> {
+        func.blocks[0]
+            .instructions
+            .iter()
+            .map(|i| match i {
+                Instruction::Memcpy { dest, src, .. } => {
+                    format!("Memcpy({}<-{})", dest.0, src.0)
+                }
+                Instruction::Intrinsic { op, args, .. } => format!(
+                    "{:?}({})",
+                    op,
+                    args.iter()
+                        .map(|a| match a {
+                            Operand::Value(v) => v.0.to_string(),
+                            _ => "_".to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                other => format!("{:?}", other)
+                    .split([' ', '('])
+                    .next()
+                    .unwrap_or("?")
+                    .to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn memcpy_folds_into_a_whole_vector_intrinsic_operand() {
+        //   %1 = alloca 32          (tmp)
+        //   memcpy %1, %7           (32 bytes)
+        //   MinPs256 dst=%2, [%1, %8]
+        // becomes
+        //   MinPs256 dst=%2, [%7, %8]      and the memcpy disappears.
+        let mut module = IrModule {
+            functions: vec![one_block(vec![
+                alloca(1),
+                memcpy(1, 7, 32),
+                minps256(2, 1, 8),
+            ])],
+            ..IrModule::default()
+        };
+        assert_eq!(forward_memcpy_chains(&mut module), 1, "one chain folded");
+        assert_eq!(
+            shape(&module.functions[0]),
+            vec!["Alloca".to_string(), "MinPs256(7,8)".to_string()],
+            "the operand must be re-pointed at the memcpy source"
+        );
+    }
+
+    /// The temp must have EXACTLY two operand occurrences: the memcpy's dest
+    /// and one consumer reference. An op naming the temp twice -- `_mm256_mul_ps
+    /// (v, v)` shaped -- has three, and is refused.
+    ///
+    /// This is deliberately conservative, not a bug: folding both operands
+    /// would be sound, but the pre-existing occurrence-count guard is shared
+    /// with the memcpy-to-memcpy arm, and widening it would change that arm's
+    /// behaviour too. The shape is rare because the vector lowering gives each
+    /// operand its own temp, so the win is not worth the blast radius.
+    #[test]
+    fn memcpy_is_refused_when_one_intrinsic_names_the_temp_twice() {
+        let mut module = IrModule {
+            functions: vec![one_block(vec![
+                alloca(1),
+                memcpy(1, 7, 32),
+                minps256(2, 1, 1),
+            ])],
+            ..IrModule::default()
+        };
+        assert_eq!(
+            forward_memcpy_chains(&mut module),
+            0,
+            "three operand occurrences exceeds the two-use guard"
+        );
+        assert_eq!(
+            shape(&module.functions[0]),
+            vec![
+                "Alloca".to_string(),
+                "Memcpy(1<-7)".to_string(),
+                "MinPs256(1,1)".to_string()
+            ],
+            "the IR must be left untouched"
+        );
+    }
+
+    /// SOUNDNESS: `VecStore*` carries its destination in `args`, not
+    /// `dest_ptr`, so the scan's "does anything write `src`?" check cannot see
+    /// it. Folding `src` into one of its operands would turn a read into a
+    /// write, so these ops must be refused outright.
+    #[test]
+    fn memcpy_is_never_folded_into_an_intrinsic_that_writes_via_args() {
+        let store = Instruction::Intrinsic {
+            dest: None,
+            op: IntrinsicOp::VecStoreF32x8,
+            dest_ptr: None,
+            args: vec![
+                Operand::Value(Value(5)),
+                Operand::Value(Value(1)),
+                Operand::Const(IrConst::I64(0)),
+            ],
+        };
+        let mut module = IrModule {
+            functions: vec![one_block(vec![alloca(1), memcpy(1, 7, 32), store])],
+            ..IrModule::default()
+        };
+        assert_eq!(
+            forward_memcpy_chains(&mut module),
+            0,
+            "a VecStore consumer must never be folded: it writes through args"
+        );
+    }
+
+    /// SOUNDNESS: the fold is only sound when the op reads the WHOLE object.
+    /// A 16-byte copy feeding a 32-byte consumer is a partial read.
+    #[test]
+    fn memcpy_is_not_folded_when_the_copy_width_is_not_the_vector_width() {
+        let mut module = IrModule {
+            functions: vec![one_block(vec![
+                alloca(1),
+                memcpy(1, 7, 16),
+                minps256(2, 1, 8),
+            ])],
+            ..IrModule::default()
+        };
+        assert_eq!(
+            forward_memcpy_chains(&mut module),
+            0,
+            "16-byte copy into a 32-byte consumer is not a whole-object read"
+        );
+    }
+
+    /// SOUNDNESS: if `src` is overwritten between the memcpy and the consumer,
+    /// forwarding would read the NEW value.
+    #[test]
+    fn memcpy_is_not_folded_across_a_write_to_the_source() {
+        let clobber = Instruction::Store {
+            val: Operand::Const(IrConst::I32(1)),
+            ptr: Value(7),
+            ty: IrType::I32,
+            seg_override: Default::default(),
+            volatile: false,
+        };
+        let mut module = IrModule {
+            functions: vec![one_block(vec![
+                alloca(1),
+                memcpy(1, 7, 32),
+                clobber,
+                minps256(2, 1, 8),
+            ])],
+            ..IrModule::default()
+        };
+        assert_eq!(
+            forward_memcpy_chains(&mut module),
+            0,
+            "`src` is clobbered before the consumer reads it"
+        );
+    }
+
+    /// The temp must have exactly two uses. A third use (here a second
+    /// consumer) means the slot is genuinely observed.
+    #[test]
+    fn memcpy_is_not_folded_when_the_temp_has_more_than_one_consumer() {
+        let mut module = IrModule {
+            functions: vec![one_block(vec![
+                alloca(1),
+                memcpy(1, 7, 32),
+                minps256(2, 1, 8),
+                minps256(3, 1, 8),
+            ])],
+            ..IrModule::default()
+        };
+        assert_eq!(forward_memcpy_chains(&mut module), 0);
+    }
+
+    /// The temp must be an alloca: only then is its slot known to be private.
+    #[test]
+    fn memcpy_is_not_folded_when_the_temp_is_not_an_alloca() {
+        let mut module = IrModule {
+            // No Alloca for %1 at all.
+            functions: vec![one_block(vec![memcpy(1, 7, 32), minps256(2, 1, 8)])],
+            ..IrModule::default()
+        };
+        assert_eq!(forward_memcpy_chains(&mut module), 0);
+    }
+
+    /// A non-vector consumer (an op with no vector home width) is left to the
+    /// pre-existing memcpy-to-memcpy arm, which this is not.
+    #[test]
+    fn memcpy_is_not_folded_into_a_non_vector_intrinsic() {
+        let sqrt = Instruction::Intrinsic {
+            dest: Some(Value(900)),
+            op: IntrinsicOp::SqrtF32,
+            dest_ptr: Some(Value(2)),
+            args: vec![Operand::Value(Value(1))],
+        };
+        let mut module = IrModule {
+            functions: vec![one_block(vec![alloca(1), memcpy(1, 7, 4), sqrt])],
+            ..IrModule::default()
+        };
+        assert_eq!(forward_memcpy_chains(&mut module), 0);
+    }
+
+    /// The original memcpy-to-memcpy arm must still work — the new arm must
+    /// not have displaced it.
+    #[test]
+    fn memcpy_to_memcpy_chains_still_forward() {
+        let mut module = IrModule {
+            functions: vec![one_block(vec![
+                alloca(1),
+                memcpy(1, 7, 32),
+                memcpy(2, 1, 32),
+            ])],
+            ..IrModule::default()
+        };
+        assert_eq!(forward_memcpy_chains(&mut module), 1);
+        assert_eq!(
+            shape(&module.functions[0]),
+            vec!["Alloca".to_string(), "Memcpy(2<-7)".to_string()]
+        );
     }
 }

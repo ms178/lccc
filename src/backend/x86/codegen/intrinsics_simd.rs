@@ -69,11 +69,28 @@ impl X86Codegen {
 
     /// Whether arg[0] may be folded as a memory operand (never if the value is
     /// still provably in a register — its slot may be stale).
-    fn evex_arg_mem(&self, arg: &Operand) -> Option<String> {
+    fn evex_arg_mem(&mut self, arg: &Operand) -> Option<String> {
         match arg {
             Operand::Value(v) => {
                 if self.state.vec_live_regs.contains_key(&v.0) {
                     return None;
+                }
+                // LAZY-FLUSH SOUNDNESS: a deferred result for this value has
+                // not reached its slot yet, so folding it as a memory operand
+                // would read a never-written slot. Commit the store first:
+                // the slot is then valid AND the fold is still profitable.
+                //
+                // Refusing the fold instead (returning `None`) is also sound
+                // but costs more: the caller then loads the value into a
+                // register, and the value ends up stored twice, which is +2
+                // instructions in tests/regression/i686_over_aligned_struct_arg.c.
+                //
+                // Without this guard at all, keeping a pending store alive
+                // across `emit_avx_fp_256_op` made `_mm256_cvtps_pd` and
+                // `_mm256_cvtepi32_pd` read an unwritten slot and produce
+                // zeros (caught by tests/intrinsics/cases/t256_fp.c).
+                if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
+                    self.flush_pending_vec_store_impl();
                 }
                 self.operand_ptr_mem_operand(arg)
             }
@@ -1854,8 +1871,24 @@ impl X86Codegen {
     /// 256-bit AVX FP op dispatch (all shapes).
     fn emit_avx_fp_256_op(&mut self, dest_ptr: &Value, op: &IntrinsicOp, args: &[Operand]) {
         use IntrinsicOp::*;
-        self.flush_pending_vec_store_impl();
-        self.state.invalidate_vec_peephole();
+        // Preserve a deferred vector result — and the register peephole that
+        // lets the operand load be elided — when THIS op is the pending
+        // value's cache-aware consumer. That is exactly the contract
+        // `compute_vector_defer_values` establishes for back-to-back op
+        // chains: the clamp idiom `vminps; vmaxps` must keep its intermediate
+        // in %ymm0, not round-trip it through a stack slot.
+        //
+        // Flushing and invalidating unconditionally here defeated that for
+        // every AVX FP 256-bit op, so `avx_fp_private` spent a store plus a
+        // reload on each of its eight clamp stages.
+        //
+        // Soundness: `avx_load_arg_to` clears `pending_vec_store` on every
+        // register path and flushes it before every memory path, so keeping
+        // the store pending can never expose an unwritten slot.
+        if !self.pending_vec_store_consumed_by(op, args) {
+            self.flush_pending_vec_store_impl();
+            self.state.invalidate_vec_peephole();
+        }
         // binary 3-op
         let binary = |this: &mut Self, inst: &str, commutative: bool| {
             this.emit_avx_binary_256(dest_ptr, args, inst, commutative);
@@ -2123,5 +2156,204 @@ mod avx_fp_order_tests {
                 assert!(cg.state.pending_vec_memfold.is_none(), "{out}");
             }
         }
+    }
+
+    /// Bare codegen with values 0/1/2 homed in YMM registers, matching the
+    /// shape `emit_avx_fp_256_op` sees from the real pipeline.
+    fn codegen_with_homes() -> X86Codegen {
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(0, PhysReg(24)); // ymm6
+        cg.reg_assignments.insert(1, PhysReg(23)); // ymm5
+        cg.reg_assignments.insert(2, PhysReg(25)); // ymm7
+        cg.state.vector_values.extend([0, 1, 2]);
+        cg
+    }
+
+    /// A back-to-back AVX FP 256-bit op chain must keep its intermediate in
+    /// the scratch register rather than round-tripping it through the slot.
+    ///
+    /// `emit_avx_fp_256_op` used to flush the pending store and invalidate the
+    /// register peephole unconditionally on entry, so the clamp idiom
+    /// `vminps; vmaxps` paid a store plus a reload on every stage. Eight such
+    /// stages made `avx_fp_private` 16.9x slower than the fastest reference.
+    #[test]
+    fn avx_fp_256_op_keeps_a_deferred_result_for_its_consumer() {
+        let mut cg = codegen_with_homes();
+        // Value 0 is the intermediate: its slot store is still pending and
+        // %ymm0 still holds it.
+        cg.state.pending_vec_store = Some((0, "ymm0", true));
+        cg.state.vec_last_store_val = Some(0);
+        cg.state.vec_last_store_reg = true;
+        cg.state.vec_last_store_reg_name = Some("ymm0");
+        cg.emit_avx_fp_256_op(
+            &Value(2),
+            &IntrinsicOp::MaxPs256,
+            &[Operand::Value(Value(0)), Operand::Value(Value(1))],
+        );
+        let out = &cg.state.out.buf;
+        assert!(
+            out.contains("vmaxps"),
+            "the op must still be emitted: {out}"
+        );
+        assert!(
+            !out.contains("vmovdqu %ymm0, (%rax)"),
+            "the pending store was flushed even though this op consumes the \
+             value; the intermediate must stay in %ymm0: {out}"
+        );
+        assert!(
+            !out.contains("(%rax), %ymm0"),
+            "the operand was reloaded from the never-written slot: {out}"
+        );
+    }
+
+    /// The mirror image: when the op does NOT read the pending value, the
+    /// store MUST still be flushed. Keeping it would leave the slot unwritten
+    /// for whatever reads it next.
+    #[test]
+    fn avx_fp_256_op_flushes_a_deferred_result_it_does_not_consume() {
+        let mut cg = codegen_with_homes();
+        cg.state.pending_vec_store = Some((0, "ymm0", true));
+        cg.state.vec_last_store_val = Some(0);
+        cg.state.vec_last_store_reg = true;
+        cg.state.vec_last_store_reg_name = Some("ymm0");
+        // Neither operand is the pending value 0.
+        cg.emit_avx_fp_256_op(
+            &Value(2),
+            &IntrinsicOp::MaxPs256,
+            &[Operand::Value(Value(1)), Operand::Value(Value(1))],
+        );
+        assert!(
+            cg.state.pending_vec_store.is_none(),
+            "an unrelated op must flush the pending store"
+        );
+        assert!(
+            cg.state.out.buf.contains("vmovdqu %ymm0, (%rax)"),
+            "the deferred value must be committed to its slot: {}",
+            cg.state.out.buf
+        );
+    }
+
+    /// `pending_vec_store_consumed_by` is the single predicate shared by the
+    /// generic lazy-flush service and the AVX FP entry check. Pin the classes
+    /// that matter: a plain elementwise consumer, a non-consumer, a raw
+    /// reader, and an op that writes through its args.
+    #[test]
+    fn pending_vec_store_consumed_by_classifies_consumers() {
+        let mut cg = codegen_with_homes();
+        cg.state.pending_vec_store = Some((0, "ymm0", true));
+
+        // Elementwise op reading the value: kept.
+        assert!(
+            cg.pending_vec_store_consumed_by(
+                &IntrinsicOp::MaxPs256,
+                &[Operand::Value(Value(0)), Operand::Value(Value(1))]
+            ),
+            "MaxPs256 reads the value as a whole vector operand"
+        );
+        // A different value: not a consumer.
+        assert!(
+            !cg.pending_vec_store_consumed_by(
+                &IntrinsicOp::MaxPs256,
+                &[Operand::Value(Value(1)), Operand::Value(Value(2))]
+            ),
+            "the pending value is not among the operands"
+        );
+        // A raw reader reads the slot's bytes, so the store must be flushed.
+        assert!(
+            !cg.pending_vec_store_consumed_by(
+                &IntrinsicOp::VecLoadF32x8,
+                &[
+                    Operand::Value(Value(0)),
+                    Operand::Const(crate::ir::constants::IrConst::I64(0))
+                ]
+            ),
+            "VecLoadF32x8 is a raw reader: the slot must be written first"
+        );
+        // An op that writes through args carries its destination there, so
+        // nothing at this level can tell datum from destination. The whole
+        // family is refused rather than guessed at. (The emitter for the
+        // VecStore family IS pending-aware on all three of its paths, so this
+        // is deliberate conservatism costing a redundant store in rare cases,
+        // not a correctness requirement -- soundness must not depend on which
+        // arg position happens to be the destination.)
+        assert!(
+            !cg.pending_vec_store_consumed_by(
+                &IntrinsicOp::VecStoreF32x8,
+                &[Operand::Value(Value(0)), Operand::Value(Value(1))]
+            ),
+            "ops writing through args are refused wholesale"
+        );
+        // No pending store at all: not a consumer.
+        cg.state.pending_vec_store = None;
+        assert!(
+            !cg.pending_vec_store_consumed_by(&IntrinsicOp::MaxPs256, &[Operand::Value(Value(0))])
+        );
+    }
+
+    /// A value whose slot store is still pending has NOT been written to its
+    /// slot, so folding it as a memory operand requires committing that store
+    /// first.
+    ///
+    /// Regression: keeping a pending store alive across `emit_avx_fp_256_op`
+    /// (so `vminps; vmaxps` keeps its intermediate in %ymm0) made the `widen`
+    /// and `unary` arms fold such a value through `evex_arg_mem`, which read
+    /// the never-written slot. `_mm256_cvtps_pd` and `_mm256_cvtepi32_pd`
+    /// returned zeros — caught by tests/intrinsics/cases/t256_fp.c via CI.
+    #[test]
+    fn evex_arg_mem_commits_a_pending_store_before_folding_it() {
+        let mut cg = codegen_with_homes();
+        cg.state.pending_vec_store = Some((0, "ymm0", true));
+        let _ = cg.evex_arg_mem(&Operand::Value(Value(0)));
+        assert!(
+            cg.state.pending_vec_store.is_none(),
+            "the pending store must be committed before the slot can be read"
+        );
+        assert!(
+            cg.state.out.buf.contains("vmovdqu %ymm0"),
+            "the committed value must actually be written: {}",
+            cg.state.out.buf
+        );
+        // A DIFFERENT value must not be flushed: the guard is value-specific.
+        let mut cg = codegen_with_homes();
+        cg.state.pending_vec_store = Some((7, "ymm0", true));
+        let _ = cg.evex_arg_mem(&Operand::Value(Value(0)));
+        assert!(
+            cg.state.pending_vec_store.is_some(),
+            "an unrelated value must not trigger the flush"
+        );
+        assert!(
+            !cg.state.out.buf.contains("vmovdqu %ymm0"),
+            "an unrelated value must not be written: {}",
+            cg.state.out.buf
+        );
+    }
+
+    /// The end-to-end shape the guard protects: a width-changing convert whose
+    /// operand is a deferred 256-bit result must not read the slot.
+    #[test]
+    fn widening_convert_of_a_deferred_operand_does_not_read_the_slot() {
+        let mut cg = codegen_with_homes();
+        cg.state.pending_vec_store = Some((0, "ymm0", true));
+        cg.state.vec_last_store_val = Some(0);
+        cg.state.vec_last_store_reg = true;
+        cg.state.vec_last_store_reg_name = Some("ymm0");
+        // CvtPs2Pd256 is the `widen` arm: it reads args[0]'s LOW 128 bits.
+        cg.emit_avx_fp_256_op(
+            &Value(2),
+            &IntrinsicOp::CvtPs2Pd256,
+            &[Operand::Value(Value(0))],
+        );
+        let out = &cg.state.out.buf;
+        assert!(
+            out.contains("vcvtps2pd"),
+            "the convert must still be emitted: {out}"
+        );
+        // A folded memory operand would be `vcvtps2pd <mem>, %ymm0`; the only
+        // sound form here is the register one, `%xmm0, %ymm0`.
+        assert!(
+            out.contains("vcvtps2pd %xmm0, %ymm0"),
+            "the convert must read the deferred value from the register, \
+             not from its never-written slot: {out}"
+        );
     }
 }

@@ -3120,11 +3120,25 @@ pub(super) fn compute_vector_defer_values(
     let debug_vdefer = env_flag("CCC_DEBUG_VDEFER");
 
     for (&slot, sites) in &defs {
-        if volatile_allocas.contains(&slot)
-            || copy_alias_roots.contains(&slot)
-            || has_value_ref_use.contains(&slot)
-            || non_intrinsic_arg_use.contains(&slot)
-        {
+        let reject = |why: &str| {
+            if debug_vdefer {
+                lccc::cli::stderr_line(format_args!("[VDEFER] slot={} REJECT: {}", slot, why));
+            }
+        };
+        if volatile_allocas.contains(&slot) {
+            reject("volatile alloca");
+            continue;
+        }
+        if copy_alias_roots.contains(&slot) {
+            reject("copy alias root");
+            continue;
+        }
+        if has_value_ref_use.contains(&slot) {
+            reject("escapes as a value-ref use");
+            continue;
+        }
+        if non_intrinsic_arg_use.contains(&slot) {
+            reject("used by a non-intrinsic instruction");
             continue;
         }
 
@@ -3134,6 +3148,7 @@ pub(super) fn compute_vector_defer_values(
                 .iter()
                 .any(|&(ubi, _)| !written.map(|b| b.contains(&ubi)).unwrap_or(false));
             if orphan {
+                reject("read outside the blocks that define it");
                 continue;
             }
         }
@@ -3149,6 +3164,7 @@ pub(super) fn compute_vector_defer_values(
                 .get(&slot)
                 .is_some_and(|u| u.iter().any(|&(ubi, uii)| ubi == bi && uii <= i));
             if earlier_use {
+                reject("a use at or before the defining site");
                 all_sites_ok = false;
                 break;
             }
@@ -3172,6 +3188,7 @@ pub(super) fn compute_vector_defer_values(
                 .unwrap_or_default();
 
             if window_uses.len() != 1 {
+                reject("not exactly one use after the def");
                 all_sites_ok = false;
                 break;
             }
@@ -3208,6 +3225,7 @@ pub(super) fn compute_vector_defer_values(
                 }
             }
             if !ok {
+                reject("an intervening instruction may clobber the scratch");
                 all_sites_ok = false;
                 break;
             }
@@ -3238,6 +3256,7 @@ pub(super) fn compute_vector_defer_values(
                 _ => false,
             };
             if !cache_aware {
+                reject("consumer is not cache-aware at this operand position");
                 all_sites_ok = false;
                 break;
             }

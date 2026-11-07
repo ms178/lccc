@@ -1087,20 +1087,33 @@ impl X86Codegen {
         }
     }
 
-    /// Lazy-flush entry check for an intrinsic about to be emitted: if a
-    /// deferred vector result is pending and this instruction is NOT the
-    /// cache-aware consumer of that value, flush the store first — this
-    /// instruction may clobber the holding register or rely on slot contents.
-    fn service_pending_vec_store(&mut self, op: &IntrinsicOp, args: &[Operand]) {
+    /// True when a pending deferred vector result is read by THIS intrinsic as
+    /// a whole-vector operand, so the store may stay pending and the operand
+    /// load may be elided.
+    ///
+    /// Soundness rests on the lazy-flush discipline in `avx_load_arg_to`, which
+    /// every operand load goes through: a path that reads the value from a
+    /// register clears `pending_vec_store`, and every path that reads it from
+    /// MEMORY calls `flush_pending_vec_store_impl` first. So leaving the store
+    /// pending can never make a consumer observe an unwritten slot.
+    pub(super) fn pending_vec_store_consumed_by(&self, op: &IntrinsicOp, args: &[Operand]) -> bool {
         use crate::backend::stack_layout::copy_coalescing::is_raw_reader_intrinsic;
         let Some((pval, _, _)) = self.state.pending_vec_store else {
-            return;
+            return false;
         };
         use crate::ir::intrinsics::IntrinsicOp as O;
-        let consumed_here = args
-            .iter()
+        args.iter()
             .any(|a| matches!(a, Operand::Value(v) if v.0 == pval))
             && !is_raw_reader_intrinsic(op)
+            // Ops that write memory through `args` carry their destination
+            // there rather than in `dest_ptr`, so nothing here can tell
+            // whether the pending value is the datum or the destination. Which
+            // arg is which is not knowable from the operand list alone, so the
+            // whole family is refused rather than guessed at. (The explicit
+            // legacy list below is the pre-existing policy; this is its
+            // args-side generalisation, the same rule `copy_prop` applies when
+            // folding a memcpy into an intrinsic.)
+            && !op.writes_memory_via_args()
             && !matches!(
                 op,
                 O::Pblendvb128
@@ -1111,8 +1124,15 @@ impl X86Codegen {
                     | O::Movntdq
                     | O::Movntpd
                     | O::Movntps
-            );
-        if !consumed_here {
+            )
+    }
+
+    /// Lazy-flush entry check for an intrinsic about to be emitted: if a
+    /// deferred vector result is pending and this instruction is NOT the
+    /// cache-aware consumer of that value, flush the store first — this
+    /// instruction may clobber the holding register or rely on slot contents.
+    fn service_pending_vec_store(&mut self, op: &IntrinsicOp, args: &[Operand]) {
+        if !self.pending_vec_store_consumed_by(op, args) {
             self.flush_pending_vec_store_impl();
         }
     }
@@ -12037,9 +12057,12 @@ impl X86Codegen {
             }
             match arg {
                 Operand::Value(v) => {
+                    // A pending deferred store is one more way the value can
+                    // be in a register rather than in its slot.
                     if this.state.vec_live_regs.contains_key(&v.0)
                         || (this.state.vec_last_store_reg
                             && this.state.vec_last_store_val == Some(v.0))
+                        || this.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0)
                     {
                         return None;
                     }
