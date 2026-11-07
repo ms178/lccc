@@ -783,11 +783,29 @@ pub struct ParamHomeStats {
     /// up to `params` extra allocations; the flat chain makes the cost
     /// independent of `params` and the unit tests pin the exact count.
     pub allocations: usize,
-    /// Links traversed while walking a duplicate-home ordinal chain.  This is
-    /// a THIRD, independent resource: counting only entry-block instructions
-    /// is blind to one chain being re-walked once per duplicate `Alloca`.
-    /// Each chain must be walked at most once, so the contract is
-    /// `chain_steps <= params`.  The adversarial regression tests pin it.
+    /// Ordinal probes: links traversed while walking a duplicate-home ordinal
+    /// chain on the table path, or `wants` entries compared on the linear path.
+    /// This is a THIRD, independent resource: counting only entry-block
+    /// instructions is blind to one chain being re-walked once per duplicate
+    /// `Alloca` (the quadratic this witness was added to expose), AND to the
+    /// per-instruction inner work of a scan.
+    ///
+    /// The bound is PER PATH, because the two paths buy their speed from
+    /// different resources:
+    ///
+    /// | path                  | extra allocations | probe bound                |
+    /// |-----------------------|-------------------|----------------------------|
+    /// | `general_homes_from`  | 2 (map + `next`)  | `chain_steps <= params`    |
+    /// | `linear_homes_from`   | 0                 | `chain_steps <= LINEAR_SCAN_PROBE_BUDGET` |
+    ///
+    /// The table spends two heap allocations to make each `Alloca` an O(1)
+    /// lookup, which is what keeps its probe count at `params`.  The linear
+    /// path spends no allocation and instead probes the unresolved ordinals,
+    /// which costs `O(params * instructions)` -- bounded by BOTH factors being
+    /// constants, so it is `O(1)` in the worst case and cannot grow.  Measured
+    /// on realistic shapes (`params` 1..8, entry block 4..64) the linear path
+    /// is 1.8x-4.0x FASTER, which is why it is used despite the looser bound.
+    /// Both bounds are pinned by tests, so neither path can regress.
     pub chain_steps: usize,
     /// Writes to the home table itself.  Each of the `n` entries must be
     /// written at most TWICE (once `None`, once `Some`), and the aligned fast
@@ -888,6 +906,32 @@ impl ParamAllocaIndex {
     }
 }
 
+/// Upper bound on `params` for which a LINEAR scan over `wants` beats a hash
+/// table.  At 8 the scan costs at most 8 integer comparisons per `Alloca`,
+/// against one `FxHash` of a `u32` plus a bucket walk for the table -- and it
+/// needs NO heap allocation beyond the `homes` buffer.
+///
+/// Measured shape of the non-aligned path on a 238-file sample of
+/// `tests/regression` (2,454 index builds, 751 non-aligned): every one of
+/// those 751 had `params <= 8`, and 682 of them had an entry block of at most
+/// 64 instructions.  Over an 8,000-function translation unit, 8,000 of 8,000
+/// builds were inside the window.  So this constant covers essentially all
+/// real IR; the exceptions are adversarial, not real.
+pub const LINEAR_SCAN_MAX_PARAMS: usize = 8;
+
+/// Upper bound on the entry-block length for which the linear scan is used.
+///
+/// The scan is `O(params * entry_instructions)`, so bounding BOTH factors is
+/// what makes it `O(1)` in the worst case.  `8 * 64 == 512` comparisons is
+/// cheaper than the two heap allocations the table path needs before its
+/// first probe, and it cannot grow into the next quadratic.
+pub const LINEAR_SCAN_MAX_INSTRUCTIONS: usize = 64;
+
+/// The linear path's total probe budget: `MAX_PARAMS * MAX_INSTRUCTIONS`.
+///
+/// A CONSTANT, so the path is `O(1)` in the worst case.  Pinned by a test.
+pub const LINEAR_SCAN_PROBE_BUDGET: usize = LINEAR_SCAN_MAX_PARAMS * LINEAR_SCAN_MAX_INSTRUCTIONS;
+
 fn build_homes<C: ParamHomeCounter>(
     func: &IrFunction,
     counter: &mut C,
@@ -922,6 +966,15 @@ fn build_homes<C: ParamHomeCounter>(
         0
     };
     debug_assert!(resume < n, "an aligned resume must leave work to do");
+    // Small shapes dominate real IR, and for them a bounded linear scan is
+    // strictly better than a table: no hashing, no bucket walk, and no second
+    // or third allocation.  Both factors are bounded constants, so the
+    // fallback still sees only the shapes large enough to justify a table.
+    if n - resume <= LINEAR_SCAN_MAX_PARAMS
+        && func.blocks.first().map_or(0, |b| b.instructions.len()) <= LINEAR_SCAN_MAX_INSTRUCTIONS
+    {
+        return linear_homes_from(func, counter, homes, resume);
+    }
     general_homes_from(func, counter, homes, resume)
 }
 
@@ -988,6 +1041,82 @@ fn aligned_probe<C: ParamHomeCounter>(
         counter.note_home_writes(1);
     }
     None
+}
+
+/// The allocation-free path for small shapes.
+///
+/// For every `Alloca` in the unresolved suffix of the entry block, probe the
+/// still-unresolved ordinals by identity and fill each match.  No hash table
+/// and no chain vector: an index built here costs ONE allocation in total,
+/// the `homes` buffer the caller already sized.
+///
+/// ## Exactness proof (against the `reference_full_scan` test oracle)
+///
+/// Instructions are visited in entry-block order and an ordinal is written at
+/// most once, because `homes[i].is_some()` excludes it from every later probe.
+/// So the value written is the `(dest, ty)` of the FIRST `Alloca` with
+/// `dest == wants[i]` -- the reference answer.  Starting at `start` instead of
+/// 0 is justified by the resume proof on [`aligned_probe`]; when `start == 0`
+/// this is the reference scan verbatim.
+///
+/// ## Complexity
+///
+/// The scan is `O((n - start) * instructions)`, and `build_homes` admits it
+/// only when `n - start <= LINEAR_SCAN_MAX_PARAMS` and the entry block is at
+/// most `LINEAR_SCAN_MAX_INSTRUCTIONS` long.  Both bounds are constants, so
+/// the whole path is bounded by [`LINEAR_SCAN_PROBE_BUDGET`] probes -- `O(1)`
+/// in the worst case, and incapable of becoming the next quadratic.  Larger
+/// shapes fall through to [`general_homes_from`], which is `O(n + m)`.
+///
+/// ## Why the linear shape is the one that matters in practice
+///
+/// `x86::ms_wide_abi::legalize` rewrites the home of each `__int128`
+/// parameter to a FRESH, strictly-higher value while non-wide parameters keep
+/// their original low ascending ones, so `wants` comes out UNSORTED and
+/// `strict` is false on a supported ABI -- not on malformed IR.  Such a
+/// function can never take the aligned probe, so `resume == 0` and the resume
+/// optimization is worth exactly nothing to it: only this path (or the table)
+/// can answer it.  Verified end to end by
+/// `ms_wide_abi_legalized_shape_is_exact`.
+fn linear_homes_from<C: ParamHomeCounter>(
+    func: &IrFunction,
+    counter: &mut C,
+    mut homes: Vec<Option<(Value, IrType)>>,
+    start: usize,
+) -> Vec<Option<(Value, IrType)>> {
+    let wants = &func.param_alloca_values;
+    let n = wants.len();
+    debug_assert!(start < n, "the linear pass must have work to do");
+    debug_assert_eq!(homes.len(), start, "the resolved prefix must be intact");
+    // Zero-fill ONLY the unresolved tail: the probe's prefix is authoritative.
+    homes.resize(n, None); // capacity == n, so this cannot reallocate
+    counter.note_home_writes(n - start);
+    let mut unresolved = n - start;
+    if let Some(block) = func.blocks.first() {
+        // `start <= block.instructions.len()` holds: the probe only returns
+        // k < n after establishing `len >= n`; otherwise `start == 0`.
+        for inst in &block.instructions[start..] {
+            counter.note_instruction();
+            let Instruction::Alloca { dest, ty, .. } = inst else {
+                continue;
+            };
+            for i in start..n {
+                if homes[i].is_some() {
+                    continue;
+                }
+                counter.note_chain_step();
+                if wants[i] == *dest {
+                    homes[i] = Some((*dest, *ty));
+                    counter.note_home_writes(1);
+                    unresolved -= 1;
+                }
+            }
+            if unresolved == 0 {
+                break;
+            }
+        }
+    }
+    homes
 }
 
 /// The general one-pass path, for any entry-block layout.
@@ -2157,7 +2286,19 @@ mod param_alloca_index_tests {
             let f = function(instructions.clone(), homes.clone());
             assert!(!aligned_hypothesis(&f));
             let (index, stats) = ParamAllocaIndex::build_with_stats(&f);
-            assert_eq!(stats.allocations, 3, "general path with {n} params");
+            // Shapes inside the linear window take ONE allocation (no map, no
+            // chain vector); only the large ones pay for a table.
+            let expected = if n <= super::LINEAR_SCAN_MAX_PARAMS {
+                1
+            } else {
+                3
+            };
+            assert_eq!(stats.allocations, expected, "general path with {n} params");
+            assert!(
+                stats.chain_steps <= n.max(super::LINEAR_SCAN_PROBE_BUDGET),
+                "{} chain steps for {n} params",
+                stats.chain_steps
+            );
             assert!(stats.instructions_examined <= entry_instructions + 1);
             for i in 0..=n {
                 assert_eq!(
@@ -2229,7 +2370,9 @@ mod param_alloca_index_tests {
         let f = function(instructions, homes);
         assert!(!aligned_hypothesis(&f));
         let (index, stats) = ParamAllocaIndex::build_with_stats(&f);
-        assert_eq!(stats.allocations, 3);
+        // 8 params / 8 instructions: inside the linear window, so one
+        // allocation and no hash table.
+        assert_eq!(stats.allocations, 1);
         assert_eq!(index, ParamAllocaIndex::build(&f));
         for i in 0..=f.param_alloca_values.len() {
             assert_eq!(index.get(i), reference_full_scan(&f, i), "ordinal {i}");
@@ -2381,7 +2524,15 @@ mod param_alloca_index_tests {
                             stats.instructions_examined,
                             instructions.len()
                         );
-                        assert!(stats.chain_steps <= n);
+                        // Per-path bound: the table keeps probes at `n` by
+                        // spending two allocations on an O(1) lookup; the
+                        // linear path spends none and is bounded by a
+                        // constant instead (see ParamHomeStats::chain_steps).
+                        assert!(
+                            stats.chain_steps <= n.max(super::LINEAR_SCAN_PROBE_BUDGET),
+                            "{} chain steps (n={n} k={k} bi={bi} tk={tail_kind})",
+                            stats.chain_steps
+                        );
                         for i in 0..=n {
                             assert_eq!(
                                 index.get(i),
@@ -2478,7 +2629,14 @@ mod param_alloca_index_tests {
                             stats.instructions_examined
                         );
                         assert!(stats.allocations <= 3, "n={n} m={m}: allocations");
-                        assert!(stats.chain_steps <= n, "n={n} m={m}: chain steps");
+                        // The bound is per path: the table pays two
+                        // allocations to keep probes at `n`; the linear path
+                        // pays none and is bounded by a constant instead.
+                        assert!(
+                            stats.chain_steps <= n.max(super::LINEAR_SCAN_PROBE_BUDGET),
+                            "n={n} m={m}: {} chain steps",
+                            stats.chain_steps
+                        );
                         assert!(
                             stats.home_writes <= 2 * n,
                             "n={n} m={m}: {} home writes",
@@ -2551,6 +2709,146 @@ mod param_alloca_index_tests {
         assert_eq!(stats.instructions_examined, instructions.len() + 1);
         assert!(stats.chain_steps <= N - K);
         for i in 0..=N {
+            assert_eq!(index.get(i), reference_full_scan(&f, i), "ordinal {i}");
+        }
+    }
+    /// The linear path is exact, allocation-free apart from `homes`, and
+    /// bounded by a constant -- so it cannot become the next quadratic.
+    ///
+    /// `duplicate_allocas_do_not_rescan_resolved_chains` covers the same
+    /// property for the TABLE path; this pins it for the linear one, which has
+    /// no chain and therefore no `homes[first]` guard to rely on.
+    #[test]
+    fn small_linear_path_is_exact_allocates_once_and_stays_in_budget() {
+        let homes = vec![70u32, 10, 90, 10, 55, 999, 70, 31];
+        let instructions = vec![
+            Instruction::StackSave { dest: Value(3) },
+            alloca(10, IrType::I32),
+            alloca(70, IrType::F64),
+            Instruction::StackSave { dest: Value(4) },
+            alloca(31, IrType::I8),
+            alloca(90, IrType::F32),
+            alloca(70, IrType::I64), // duplicate dest: must not win
+            alloca(55, IrType::I32),
+            alloca(10, IrType::F64), // duplicate dest: must not win
+        ];
+        let f = function(instructions, homes);
+        assert!(!aligned_hypothesis(&f));
+        let (index, stats) = ParamAllocaIndex::build_with_stats(&f);
+        // ONE allocation: no hash table, no chain vector.
+        assert_eq!(stats.allocations, 1);
+        assert!(
+            stats.chain_steps <= super::LINEAR_SCAN_PROBE_BUDGET,
+            "{} probes exceeds the {} budget",
+            stats.chain_steps,
+            super::LINEAR_SCAN_PROBE_BUDGET
+        );
+        assert!(stats.home_writes <= 2 * f.param_alloca_values.len());
+        assert_eq!(index, ParamAllocaIndex::build(&f));
+        for i in 0..=f.param_alloca_values.len() {
+            assert_eq!(index.get(i), reference_full_scan(&f, i), "ordinal {i}");
+        }
+        // Duplicates resolve to the FIRST matching alloca: ordinals 1 and 3
+        // want 10 -> I32 (index 1), not the later F64; 0 and 6 want 70 -> F64.
+        assert_eq!(index.get(1), Some((Value(10), IrType::I32)));
+        assert_eq!(index.get(3), Some((Value(10), IrType::I32)));
+        assert_eq!(index.get(0), Some((Value(70), IrType::F64)));
+        assert_eq!(index.get(6), Some((Value(70), IrType::F64)));
+        assert_eq!(index.get(5), None); // 999 never allocated
+    }
+
+    /// The shape `x86::ms_wide_abi::legalize` actually produces, and the one
+    /// real-world reason a non-aligned path is needed at all.
+    ///
+    /// `legalize` replaces the home of each `__int128` parameter with a FRESH,
+    /// strictly-higher value and prepends that parameter's physical alloca to
+    /// the entry block, while non-wide parameters keep their original low
+    /// ascending homes.  The result is an UNSORTED `wants` array with
+    /// non-Alloca instructions interleaved into the entry block -- so `strict`
+    /// is false, the aligned probe can never apply, and `resume` is 0: the
+    /// resume optimization is worth exactly nothing to it.  This is a SUPPORTED
+    /// ABI transformation, not malformed IR, so the fallback is load-bearing
+    /// rather than defensive.  Confirmed end to end with
+    /// `lccc -O2 -c` on `__attribute__((ms_abi)) f(int, __int128, int,
+    /// __int128)`, which reports the unsorted shape.
+    #[test]
+    fn ms_wide_abi_legalized_shape_is_exact() {
+        // Mirrors legalize() on `f(int a, __int128 b, int c, __int128 d)`:
+        //   wants[1] and wants[3] became fresh high values (100, 103);
+        //   wants[0] and wants[2] kept the original low ones (1, 3).
+        let homes = vec![1u32, 100, 3, 103];
+        let instructions = vec![
+            alloca(100, IrType::Ptr),                  // physical home for b
+            Instruction::StackSave { dest: Value(9) }, // ParamRef / load
+            alloca(1, IrType::I32),                    // moved original alloca
+            Instruction::StackSave { dest: Value(8) }, // store
+            alloca(103, IrType::Ptr),                  // physical home for d
+            Instruction::StackSave { dest: Value(7) },
+            alloca(3, IrType::I64),
+        ];
+        let f = function(instructions, homes);
+        // The precondition this test exists to pin: NOT strictly increasing,
+        // so the aligned probe is permanently inapplicable.
+        assert!(
+            !f.param_alloca_values.windows(2).all(|w| w[0].0 < w[1].0),
+            "the ms_wide_abi shape must be unsorted"
+        );
+        assert!(!aligned_hypothesis(&f));
+        let (index, stats) = ParamAllocaIndex::build_with_stats(&f);
+        // ...so `resume` is 0 and the answer comes from the linear scan, which
+        // still costs one allocation and stays inside the probe budget.
+        assert_eq!(stats.allocations, 1);
+        assert!(stats.chain_steps <= super::LINEAR_SCAN_PROBE_BUDGET);
+        assert_eq!(index, ParamAllocaIndex::build(&f));
+        for i in 0..=4 {
+            assert_eq!(index.get(i), reference_full_scan(&f, i), "ordinal {i}");
+        }
+        assert_eq!(index.get(0), Some((Value(1), IrType::I32)));
+        assert_eq!(index.get(1), Some((Value(100), IrType::Ptr)));
+        assert_eq!(index.get(2), Some((Value(3), IrType::I64)));
+        assert_eq!(index.get(3), Some((Value(103), IrType::Ptr)));
+    }
+
+    /// The linear path is gated on BOTH factors because its cost is
+    /// `params * instructions`.  Pin the gate itself: blow past either limit
+    /// and the build must fall back to the table (3 allocations) rather than
+    /// pay an unbounded scan.  Without this, raising either constant would
+    /// silently turn an O(1) path into a large one.
+    #[test]
+    fn exceeding_either_linear_gate_falls_back_to_the_table_path() {
+        let tys = [IrType::I32, IrType::I64, IrType::F32, IrType::F64];
+        // (a) one param too many for the linear scan.
+        let n = super::LINEAR_SCAN_MAX_PARAMS + 1;
+        let homes: Vec<u32> = (0..n).map(|i| 100_000 + i as u32).collect();
+        let mut instructions = vec![alloca(7, IrType::I32)];
+        instructions.extend(homes.iter().map(|d| alloca(*d, IrType::I32)));
+        let f = function(instructions, homes);
+        assert!(!aligned_hypothesis(&f));
+        let (index, stats) = ParamAllocaIndex::build_with_stats(&f);
+        assert_eq!(stats.allocations, 3, "params over the gate -> table path");
+        assert!(stats.chain_steps <= n, "table path keeps the tight bound");
+        assert_eq!(index, ParamAllocaIndex::build(&f));
+        for i in 0..=n {
+            assert_eq!(index.get(i), reference_full_scan(&f, i), "ordinal {i}");
+        }
+
+        // (b) few params but one instruction too many.
+        let long = super::LINEAR_SCAN_MAX_INSTRUCTIONS + 1;
+        let homes: Vec<u32> = (0..4).map(|i| 200_000 + i as u32).collect();
+        let mut instructions: Vec<Instruction> =
+            (0..long).map(|_| alloca(7, IrType::I32)).collect();
+        instructions.extend(
+            homes
+                .iter()
+                .enumerate()
+                .map(|(i, d)| alloca(*d, tys[i % 4])),
+        );
+        let f = function(instructions, homes);
+        assert!(!aligned_hypothesis(&f));
+        let (index, stats) = ParamAllocaIndex::build_with_stats(&f);
+        assert_eq!(stats.allocations, 3, "long entry block -> table path");
+        assert_eq!(index, ParamAllocaIndex::build(&f));
+        for i in 0..=4 {
             assert_eq!(index.get(i), reference_full_scan(&f, i), "ordinal {i}");
         }
     }
