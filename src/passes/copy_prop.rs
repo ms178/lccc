@@ -91,7 +91,11 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
             .iter()
             .flat_map(|b| b.instructions.iter())
             .filter_map(|i| match i {
-                Instruction::Alloca { dest, .. } => Some(dest.0),
+                Instruction::Alloca {
+                    dest,
+                    semantic_volatile: false,
+                    ..
+                } => Some(dest.0),
                 _ => None,
             })
             .collect();
@@ -127,8 +131,20 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
                 for j in (i + 1)..block.instructions.len() {
                     let inst = &block.instructions[j];
                     match inst {
-                        Instruction::Memcpy { src: copy_src, .. } if *copy_src == tmp => {
-                            if consumer.is_some() {
+                        Instruction::Memcpy {
+                            dest: copy_dest,
+                            src: copy_src,
+                            size: copy_size,
+                        } if *copy_src == tmp => {
+                            // The original second copy reads a fresh alloca;
+                            // forwarding must not turn it into an overlapping
+                            // copy. Two distinct alloca roots are disjoint.
+                            if consumer.is_some()
+                                || *copy_size != size
+                                || !allocas.contains(&src.0)
+                                || !allocas.contains(&copy_dest.0)
+                                || src == *copy_dest
+                            {
                                 safe = false;
                                 break;
                             }
@@ -159,29 +175,20 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
                         }
                         _ => {}
                     }
-                    // SOUNDNESS: if the source location `src` is modified between
-                    // the two memcpys, forwarding would read stale data.  Check
-                    // for stores/memcpys/intrinsics that write to `src`.
-                    // Without this, zlib-ng's fold_1 pattern
-                    //   x_tmp3 = *c3; *c3 = *c0; ... *c2 = x_tmp3;
-                    // was miscompiled: x_tmp3 was forwarded to re-read *c3,
-                    // but *c3 had already been overwritten by *c0.
-                    match inst {
-                        Instruction::Store { ptr, .. } if *ptr == src => {
-                            safe = false;
-                            break;
-                        }
-                        Instruction::Memcpy { dest, .. } if *dest == src => {
-                            safe = false;
-                            break;
-                        }
-                        Instruction::Intrinsic {
-                            dest_ptr: Some(dp), ..
-                        } if *dp == src => {
-                            safe = false;
-                            break;
-                        }
-                        _ => {}
+                    // Without alias analysis, *any* intervening write can
+                    // modify src, including through another pointer, a call,
+                    // an atomic, or an intrinsic writing via its arguments.
+                    // Only instructions before the consumer matter; the
+                    // consumer itself writes the destination after its read.
+                    if consumer.is_none()
+                        && (inst.may_write_memory()
+                            || matches!(
+                                inst,
+                                Instruction::Fence { .. } | Instruction::AtomicLoad { .. }
+                            ))
+                    {
+                        safe = false;
+                        break;
                     }
                 }
                 let Some(consumer) = consumer else {
