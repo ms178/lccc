@@ -294,6 +294,14 @@ def host_controls(args: argparse.Namespace, work: Path) -> list[dict]:
     require(proc.returncode == 0, f"SLP provenance verifier aborted:\n{proc.stderr}")
     rows.append({"kind": "slp-provenance", "result": "vectorized concrete blocks keep sparse provenance valid"})
 
+    licm = work / "licm.c"
+    licm.write_text("static inline int triple(int x) { return x * 3; }\n"
+                    "int sum(int n, const int *p) { int s = 0; for (int i = 0; i < n; ++i) { int t = triple(n); s += p[i] + t; } return s; }\n")
+    licm_obj = work / "licm.o"
+    proc = run([lccc, "-std=c23", "-O2", "-g", "-c", str(licm), "-o", str(licm_obj)], work, verify_env)
+    require(proc.returncode == 0, f"LICM provenance verifier aborted:\n{proc.stderr}")
+    rows.append({"kind": "licm-provenance", "result": "hoisting keeps inline-id arrays well-formed"})
+
     if args.gdb:
         exe = work / "nested.elf"
         compile_source(lccc, nested, exe, work, "-O2", "-g", "-fno-omit-frame-pointer", str(seed))

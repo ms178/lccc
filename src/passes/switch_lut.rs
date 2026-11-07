@@ -666,10 +666,12 @@ fn make_typed_const(val: i64, ty: IrType) -> IrConst {
 }
 
 fn push_inst(block: &mut BasicBlock, tracked_spans: bool, tail_span: Span, inst: Instruction) {
-    block.instructions.push(inst);
-    if tracked_spans {
-        block.source_spans.push(tail_span);
-    }
+    let span = if tracked_spans {
+        tail_span
+    } else {
+        crate::common::source::Span::dummy()
+    };
+    block.push_inst(inst, span);
 }
 
 fn fresh(next_vid: &mut u32) -> Value {

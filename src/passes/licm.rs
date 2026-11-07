@@ -2033,11 +2033,16 @@ fn hoist_loop_invariants_with(
         if block_idx < func.blocks.len() {
             let block = &mut func.blocks[block_idx];
             let mut new_instructions = Vec::with_capacity(block.instructions.len());
-            let old_spans = std::mem::take(&mut block.source_spans);
-            let spans_in_lockstep =
-                !old_spans.is_empty() && old_spans.len() == block.instructions.len();
+            let (old_spans, old_ids) = block.take_parallel_debug();
+            let spans_in_lockstep = !old_spans.is_empty();
+            let ids_in_lockstep = !old_ids.is_empty();
             let mut new_spans = if spans_in_lockstep {
                 Vec::with_capacity(old_spans.len())
+            } else {
+                Vec::new()
+            };
+            let mut new_ids = if ids_in_lockstep {
+                Vec::with_capacity(old_ids.len())
             } else {
                 Vec::new()
             };
@@ -2047,10 +2052,14 @@ fn hoist_loop_invariants_with(
                     if spans_in_lockstep {
                         new_spans.push(old_spans[index]);
                     }
+                    if ids_in_lockstep {
+                        new_ids.push(old_ids[index]);
+                    }
                 }
             }
             block.instructions = new_instructions;
             block.source_spans = new_spans;
+            block.source_inline_ids = new_ids;
         }
     }
 
@@ -2064,6 +2073,10 @@ fn hoist_loop_invariants_with(
     if !preheader_block.source_spans.is_empty() {
         preheader_block.source_spans.clear();
     }
+    // Provenance travels with spans; a preheader whose span table is dropped
+    // must not keep a stale inline-id array (the verifier rejects nonempty ids
+    // without parallel spans/instructions).
+    preheader_block.source_inline_ids.clear();
 
     num_hoisted
 }
