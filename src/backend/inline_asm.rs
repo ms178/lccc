@@ -584,81 +584,142 @@ pub fn normalize_inline_asm_reg_name(name: &str) -> &str {
     }
 }
 
+/// Does `template` contain an unescaped `%=`? `%%=` is an escaped percent
+/// followed by a literal `=`, not a unique-label request.
+pub(crate) fn has_unique_label_marker(template: &str) -> bool {
+    let b = template.as_bytes();
+    let mut i = 0;
+    while i + 1 < b.len() {
+        if b[i] == b'%' {
+            if b[i + 1] == b'%' {
+                i += 2;
+                continue;
+            }
+            if b[i + 1] == b'=' {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Replace every unescaped `%=` with `id`, leaving `%%` (and therefore `%%=`)
+/// for the per-target substitutor to unescape.
+///
+/// Text is moved as `&str` slices, never as `byte as char`: the latter decodes
+/// each UTF-8 continuation byte as Latin-1 and double-encodes every non-ASCII
+/// comment in the template (an inline-asm template is text, not a byte
+/// carrier). `find` only ever returns the offset of an ASCII `%`, so every
+/// slice boundary is a character boundary by construction, and the run between
+/// two markers is one `memcpy` rather than a push per byte.
+pub(crate) fn expand_unique_labels(template: &str, id: u32) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(template.len() + 8);
+    let mut rest = template;
+    while let Some(pos) = rest.find('%') {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 1..];
+        if let Some(tail) = after.strip_prefix('%') {
+            out.push_str("%%");
+            rest = tail;
+        } else if let Some(tail) = after.strip_prefix('=') {
+            // Writing into a String is infallible.
+            let _ = write!(out, "{id}");
+            rest = tail;
+        } else {
+            out.push('%');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// This handles the syntax used in GCC's `<cpuid.h>` for i686 CPUID detection.
 /// Expand GCC dialect alternatives in an inline assembly template string.
 ///
 /// GCC inline assembly supports dialect alternatives: `{att|intel}` where the
 /// first alternative is AT&T syntax and the second is Intel syntax. Since our
 /// compiler always emits AT&T syntax, we select the first alternative from each
-/// `{...|...}` group.
+/// `{...|...}` group. `%{` and `%}` are GCC escapes for literal braces.
 ///
 /// Examples:
-///   `pushf{l|d}`           -> `pushfl`
-///   `mov{l}\t{%0, %1|%1, %0}` -> `movl\t%0, %1`
-///   `pop{l}\t%0`           -> `popl\t%0`
-///   `no_braces`            -> `no_braces`    (unchanged)
+///   `pushf{l|d}`            -> `pushfl`
+///   `mov\t{%0, %1|%1, %0}`  -> `mov\t%0, %1`
+///   `no_braces`             -> `no_braces`   (unchanged, borrowed)
+///   `ld1 {v0.4s}, [%0]`     -> unchanged: a group with no `|` keeps its braces
 ///
-/// This handles the syntax used in GCC's `<cpuid.h>` for i686 CPUID detection.
+/// That last rule is a known divergence from GCC, which strips the braces and
+/// keeps the single alternative whenever the statement has operands or
+/// clobbers (`mov{l}` -> `movl`). It predates this function's slice-based
+/// rewrite; the measured rule and a repro live in
+/// `docs/FOLLOWUP-2026-11-07-asm-dialect-braces.md`.
+
 pub fn expand_dialect_alternatives(template: &str) -> Cow<'_, str> {
     // Fast path: if there are no braces, return as-is
     if !template.contains('{') {
         return Cow::Borrowed(template);
     }
 
+    // Every delimiter here (`%`, `{`, `}`, `|`) is ASCII, and a UTF-8
+    // continuation byte is never ASCII, so scanning bytes and copying `&str`
+    // slices is both correct and allocation-free apart from the result. The
+    // previous shape built a `Vec<char>` (4 bytes per input byte for ASCII)
+    // plus one `String` per brace group; this is one buffer and one memcpy per
+    // run, which matters for NEON templates like `ld1 {v0.4s}, [%0]`.
+    let b = template.as_bytes();
     let mut result = String::with_capacity(template.len());
-    let chars: Vec<char> = template.chars().collect();
     let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '%' && i + 1 < chars.len() && chars[i + 1] == '{' {
-            // GCC escape sequence %{ -> literal '{'
-            result.push('{');
+    while i < b.len() {
+        if b[i] == b'%' && i + 1 < b.len() && (b[i + 1] == b'{' || b[i + 1] == b'}') {
+            // GCC escape sequences %{ and %} -> the literal brace.
+            result.push(char::from(b[i + 1]));
             i += 2;
-        } else if chars[i] == '%' && i + 1 < chars.len() && chars[i + 1] == '}' {
-            // GCC escape sequence %} -> literal '}'
-            result.push('}');
-            i += 2;
-        } else if chars[i] == '{' {
-            // Could be a dialect alternatives group {att|intel} or literal braces
-            // used in ARM NEON instructions like ld1 {v0.4s}, [x0].
-            // Scan ahead to find matching '}' and check for '|'.
+        } else if b[i] == b'{' {
+            // Either a dialect group {att|intel} or literal braces (ARM NEON
+            // register lists). Find the matching '}' and a depth-1 '|'.
             let brace_start = i;
-            i += 1; // skip '{'
-            let start = i;
-            let mut depth = 1;
+            i += 1;
+            let content_start = i;
+            let mut depth = 1i32;
             let mut pipe_pos = None;
-            // Find the matching '}' and the '|' separator
-            while i < chars.len() && depth > 0 {
-                if chars[i] == '{' {
-                    depth += 1;
-                } else if chars[i] == '}' {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
+            while i < b.len() {
+                match b[i] {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
                     }
-                } else if chars[i] == '|' && depth == 1 && pipe_pos.is_none() {
-                    pipe_pos = Some(i);
+                    b'|' if depth == 1 && pipe_pos.is_none() => pipe_pos = Some(i),
+                    _ => {}
                 }
                 i += 1;
             }
-            if let Some(p) = pipe_pos {
-                // This IS a dialect alternatives group: {alt1|alt2}
-                // Extract the first alternative (before '|')
-                let alt: String = chars[start..p].iter().collect();
-                result.push_str(&alt);
-            } else {
-                // No pipe found: these are literal braces (e.g., ARM NEON {v0.4s}).
-                // Preserve the braces and their content as-is.
-                let content: String = chars[brace_start..i].iter().collect();
-                result.push_str(&content);
-                if i < chars.len() && chars[i] == '}' {
-                    result.push('}');
+            match pipe_pos {
+                // A dialect group: keep the first (AT&T / native) alternative.
+                Some(pipe) => result.push_str(&template[content_start..pipe]),
+                // Literal braces: keep them and their content verbatim.
+                None => {
+                    result.push_str(&template[brace_start..i]);
+                    if i < b.len() {
+                        result.push('}');
+                    }
                 }
             }
-            if i < chars.len() && chars[i] == '}' {
-                i += 1; // skip '}'
+            if i < b.len() {
+                i += 1; // skip the matching '}'
             }
         } else {
-            result.push(chars[i]);
+            // Copy the whole run up to the next delimiter as one slice.
+            let run_start = i;
             i += 1;
+            while i < b.len() && b[i] != b'%' && b[i] != b'{' {
+                i += 1;
+            }
+            result.push_str(&template[run_start..i]);
         }
     }
     Cow::Owned(result)
@@ -856,6 +917,20 @@ pub fn emit_inline_asm_common_impl(
     // Phase 3: Substitute operand references in template and emit
     // First, expand GCC dialect alternatives {att|intel} -> att
     let expanded = expand_dialect_alternatives(template);
+    // GCC's `%=` is a number unique to this instance of the asm statement in
+    // the whole compilation, which is how a template defines a local label and
+    // refers to it more than once. Expand it here, once, for every target: the
+    // per-target substitutors only know about operands. The id comes from the
+    // module-wide label counter, so it is deterministic and cannot collide with
+    // another statement, another function, or an inlined copy of the same
+    // statement (each emitted instance allocates its own). A template without
+    // `%=` allocates nothing, so no other label's numbering moves.
+    let expanded = if has_unique_label_marker(&expanded) {
+        let id = emitter.asm_state().next_label_id();
+        Cow::Owned(expand_unique_labels(&expanded, id))
+    } else {
+        expanded
+    };
     let lines: Vec<&str> = expanded.split('\n').collect();
     let body_nonempty = !lines.iter().all(|l| l.trim().is_empty());
     // An empty template gets here only with a register operand staged: the
@@ -1916,6 +1991,91 @@ fn to_8bit_setcc_dest(line: &str) -> String {
 }
 
 #[cfg(test)]
+mod unique_label_tests {
+    use super::{expand_unique_labels, has_unique_label_marker};
+
+    #[test]
+    fn detection_ignores_escaped_percents_and_other_modifiers() {
+        for yes in [
+            "%=",
+            ".Lloop%=:",
+            "jmp .Lloop%=",
+            "%0 %= %1",
+            "%%%%%=", // two escaped percents, then a real marker
+            "caf\u{e9} %=",
+        ] {
+            assert!(has_unique_label_marker(yes), "should detect {yes:?}");
+        }
+        for no in [
+            "",
+            "%",
+            "%%",
+            "%%=",   // escaped percent then a literal '='
+            "%%%%=", // still escaped
+            "%0 %1 %[x]",
+            "%k0 %q1",
+            "movl %%eax, %0",
+            "x = y",
+            "=%%",
+        ] {
+            assert!(!has_unique_label_marker(no), "should not detect {no:?}");
+        }
+    }
+
+    #[test]
+    fn expansion_replaces_every_marker_with_the_same_id() {
+        assert_eq!(
+            expand_unique_labels(".La%=:\n\tjmp .La%=", 42),
+            ".La42:\n\tjmp .La42"
+        );
+        assert_eq!(expand_unique_labels("nop", 7), "nop");
+        assert_eq!(expand_unique_labels("%=", 0), "0");
+        assert_eq!(expand_unique_labels("%=", u32::MAX), "4294967295");
+    }
+
+    #[test]
+    fn escaped_percents_and_operands_survive_for_the_next_stage() {
+        // `%%` must reach the per-target substitutor still escaped, and `%%=`
+        // must end up a literal percent followed by '=' rather than an id.
+        assert_eq!(expand_unique_labels("movl %%eax, %0", 9), "movl %%eax, %0");
+        assert_eq!(expand_unique_labels("%%=", 9), "%%=");
+        assert_eq!(expand_unique_labels("%%%%= %=", 9), "%%%%= 9");
+        assert_eq!(expand_unique_labels("%k0 %q1 %[val]", 9), "%k0 %q1 %[val]");
+    }
+
+    #[test]
+    fn multibyte_utf8_is_copied_unchanged() {
+        let template = "# caf\u{e9} \u{20ac} \u{1f980}\n\t.Lx%=:";
+        let out = expand_unique_labels(template, 1234);
+        assert_eq!(out, "# caf\u{e9} \u{20ac} \u{1f980}\n\t.Lx1234:");
+        // Byte-wise copying must not split a code point.
+        assert_eq!(out.chars().count(), template.chars().count() + 2);
+    }
+
+    #[test]
+    fn a_trailing_lone_percent_is_not_a_marker_and_is_preserved() {
+        assert!(!has_unique_label_marker("nop %"));
+        assert_eq!(expand_unique_labels("nop %", 3), "nop %");
+    }
+
+    #[test]
+    fn detection_and_expansion_agree() {
+        // The allocator only runs when detection fires, so a template the
+        // expander would change must always be detected.
+        for template in [
+            "%=", "%%=", "%%%%=", "a%=b%=c", "%0", "%%", "", "%", "x%=y%%=z",
+        ] {
+            let changed = expand_unique_labels(template, 11) != template;
+            assert_eq!(
+                changed,
+                has_unique_label_marker(template),
+                "detection/expansion disagree on {template:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2061,5 +2221,154 @@ mod tests {
         assert_eq!(dest.imm_value, Some(7));
         assert_eq!(dest.imm_symbol.as_deref(), Some("sym"));
         assert_eq!(dest.seg_prefix, "%gs:");
+    }
+}
+
+#[cfg(test)]
+mod dialect_equivalence_tests {
+    use super::expand_dialect_alternatives;
+
+    /// The implementation this one replaced, kept verbatim as a test oracle so
+    /// the rewrite is proved equivalent rather than asserted to be.
+    fn reference(template: &str) -> String {
+        if !template.contains('{') {
+            return template.to_string();
+        }
+        let mut result = String::new();
+        let chars: Vec<char> = template.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '%' && i + 1 < chars.len() && chars[i + 1] == '{' {
+                result.push('{');
+                i += 2;
+            } else if chars[i] == '%' && i + 1 < chars.len() && chars[i + 1] == '}' {
+                result.push('}');
+                i += 2;
+            } else if chars[i] == '{' {
+                let brace_start = i;
+                i += 1;
+                let start = i;
+                let mut depth = 1;
+                let mut pipe_pos = None;
+                while i < chars.len() && depth > 0 {
+                    if chars[i] == '{' {
+                        depth += 1;
+                    } else if chars[i] == '}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else if chars[i] == '|' && depth == 1 && pipe_pos.is_none() {
+                        pipe_pos = Some(i);
+                    }
+                    i += 1;
+                }
+                if let Some(p) = pipe_pos {
+                    let alt: String = chars[start..p].iter().collect();
+                    result.push_str(&alt);
+                } else {
+                    let content: String = chars[brace_start..i].iter().collect();
+                    result.push_str(&content);
+                    if i < chars.len() && chars[i] == '}' {
+                        result.push('}');
+                    }
+                }
+                if i < chars.len() && chars[i] == '}' {
+                    i += 1;
+                }
+            } else {
+                result.push(chars[i]);
+                i += 1;
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn documented_shapes() {
+        for (input, want) in [
+            ("mov\t{%0, %1|%1, %0}", "mov\t%0, %1"),
+            ("xchg{l|}\t%0", "xchgl\t%0"),
+            ("no_braces", "no_braces"),
+            ("%{ %}", "{ }"),
+            ("{a|b}", "a"),
+            ("{a{b|c}|d}", "a{b|c}"),
+            ("{unterminated", "{unterminated"),
+            ("{a|", "a"),
+            ("{}", "{}"),
+            ("{|}", ""),
+        ] {
+            assert_eq!(
+                expand_dialect_alternatives(input).as_ref(),
+                want,
+                "{input:?}"
+            );
+        }
+    }
+
+    /// Deterministic pseudo-random corpus over an alphabet that mixes every
+    /// delimiter with multi-byte code points, including one whose low byte is
+    /// ASCII-looking. 20000 cases, lengths 0..24.
+    #[test]
+    fn rewrite_is_equivalent_to_the_previous_implementation() {
+        const ALPHABET: [&str; 12] = [
+            "%",
+            "{",
+            "}",
+            "|",
+            "a",
+            "0",
+            " ",
+            "\t",
+            "\u{e9}",
+            "\u{20ac}",
+            "\u{1f980}",
+            "\u{25}",
+        ];
+        let mut state = 0x243F_6A88_85A3_08D3u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for case in 0..20_000 {
+            let len = (next() % 25) as usize;
+            let mut text = String::new();
+            for _ in 0..len {
+                text.push_str(ALPHABET[(next() % ALPHABET.len() as u64) as usize]);
+            }
+            assert_eq!(
+                expand_dialect_alternatives(&text).as_ref(),
+                reference(&text),
+                "case {case}: {text:?}"
+            );
+        }
+    }
+
+    /// CHARACTERIZATION, not a correctness claim: a brace group with no pipe is
+    /// preserved verbatim today, so `mov{l}` reaches the assembler as `mov{l}`.
+    /// GCC 16.2 strips the braces and keeps the single alternative whenever the
+    /// statement has operands or clobbers. That divergence predates this
+    /// rewrite and is measured, with the operand/clobber rule and a repro, in
+    /// `docs/FOLLOWUP-2026-11-07-asm-dialect-braces.md`. This test keeps the
+    /// slice-based rewrite provably neutral and must change with the fix.
+    #[test]
+    fn a_pipeless_brace_group_is_preserved_today() {
+        for input in ["mov{l} %0", "ld1 {v0.4s}, [%0]", "vaddps {rn-sae}, %0"] {
+            assert_eq!(expand_dialect_alternatives(input).as_ref(), input);
+            assert_eq!(
+                expand_dialect_alternatives(input).as_ref(),
+                reference(input)
+            );
+        }
+    }
+
+    #[test]
+    fn multibyte_text_is_never_split() {
+        let text = "# caf\u{e9} \u{1f980} {att|intel} \u{20ac}";
+        let out = expand_dialect_alternatives(text);
+        assert_eq!(out.as_ref(), "# caf\u{e9} \u{1f980} att \u{20ac}");
+        assert!(out.chars().all(|c| c != '\u{fffd}'));
     }
 }

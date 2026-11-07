@@ -3282,6 +3282,15 @@ jobs:
         python3 tests/regression/check_dwarf_versions.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv --gcc gcc-16
         python3 tests/regression/check_dwarf_inlining.py --lccc target/fastbuild/lccc --self-test
         python3 tests/regression/check_dwarf_inlining.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv --gdb gdb --gcc gcc-16 --json target/dwarf-inlining.json
+        # -S -g must accept exactly what -S accepts: `-S -g` assembles the text
+        # in memory to size its DWARF ranges, so an unencodable inline-asm
+        # template used to fail only when -g was added.  Pins rc parity, code
+        # identity after debug rows are stripped, that -c still REJECTS an
+        # unencodable template (the fallback is not a silent accept), GCC 16.2
+        # as the oracle, `%=` uniqueness per statement and per inlined copy,
+        # and byte-exact UTF-8 template text on all four targets.
+        python3 tests/regression/check_debug_acceptance_parity.py --self-test
+        python3 tests/regression/check_debug_acceptance_parity.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv --gcc gcc-16 --json target/debug-acceptance-parity.json
         bash tests/regression/check_gla_backedge_no_trampoline.sh
         python3 scripts/edg_changes_mine.py verify-artifacts
         python3 tests/regression/check_count_observations.py --clang "${CLANG:-clang-23}"

@@ -2258,6 +2258,56 @@ struct SubprogramSink<'a, 's, 'f> {
 /// A function is described when it has a size and lies inside a section the
 /// unit covers: a zero-size symbol is an alias or an assembler label, and
 /// describing it would produce a DIE whose `low_pc`/`high_pc` range is empty.
+/// The subprogram DIEs this unit owes, in a deterministic order.
+///
+/// A function is described when it has a size and lies inside a section the
+/// unit covers: a zero-size symbol is an alias or an assembler label, and a
+/// range that runs past its section is not describable. Sorting by (section,
+/// offset, name) keeps the output byte-reproducible when two sections alias.
+fn sorted_subprogram_members<'a>(
+    functions: &'a [DwarfFunction<'a>],
+    sections: &[DwarfSectionInfo<'_>],
+    covered: &[bool],
+) -> Vec<&'a DwarfFunction<'a>> {
+    let mut members: Vec<&DwarfFunction<'a>> = functions
+        .iter()
+        .filter(|f| f.size != 0 && covered[f.section_index])
+        .filter(|f| {
+            sections[f.section_index]
+                .size
+                .checked_sub(f.size)
+                .is_some_and(|limit| f.offset <= limit)
+        })
+        .collect();
+    members.sort_by(|a, b| {
+        (a.section_index, a.offset, a.name).cmp(&(b.section_index, b.offset, b.name))
+    });
+    members
+}
+
+/// Index the line program's file table once for the whole unit.
+///
+/// Returns the raw file number per name (what `DW_AT_decl_file` means before
+/// DWARF 5) and the attribute value per name (DWARF 5 indexes the table
+/// directly, earlier versions index it from 1 in emission order). The first
+/// entry for a name wins, so a table that repeats a file keeps one identity.
+fn index_file_table<'a>(
+    config: DwarfConfig,
+    file_table: &[(u32, &'a str)],
+) -> (FxHashMap<&'a str, u32>, FxHashMap<&'a str, u64>) {
+    let mut file_raw: FxHashMap<&str, u32> = FxHashMap::default();
+    let mut file_attr: FxHashMap<&str, u64> = FxHashMap::default();
+    for (pos, (number, name)) in file_table.iter().enumerate() {
+        file_raw.entry(*name).or_insert(*number);
+        file_attr.entry(*name).or_insert(if config.version >= 5 {
+            u64::from(*number)
+        } else {
+            pos as u64 + 1
+        });
+    }
+    (file_raw, file_attr)
+}
+
 fn emit_subprograms(
     mut sink: SubprogramSink<'_, '_, '_>,
     functions: &[DwarfFunction<'_>],
@@ -2274,35 +2324,14 @@ fn emit_subprograms(
 ) -> Result<(), String> {
     let config = sink.config;
     let forms = sink.forms;
-    let mut members: Vec<&DwarfFunction<'_>> = functions
-        .iter()
-        .filter(|f| f.size != 0 && covered[f.section_index])
-        .filter(|f| {
-            sections[f.section_index]
-                .size
-                .checked_sub(f.size)
-                .is_some_and(|limit| f.offset <= limit)
-        })
-        .collect();
-    members.sort_by(|a, b| {
-        (a.section_index, a.offset, a.name).cmp(&(b.section_index, b.offset, b.name))
-    });
+    let members = sorted_subprogram_members(functions, sections, covered);
 
     // Index the unit once.  The previous shape rescanned every local and every
     // line row for each function, and searched parameter homes by name; all of
     // those are O(unit) per function.  These maps make the writer linear in the
     // debug payload it actually emits.
     let location_index = LocationIndex::new(locations, sections.len());
-    let mut file_raw: FxHashMap<&str, u32> = FxHashMap::default();
-    let mut file_attr: FxHashMap<&str, u64> = FxHashMap::default();
-    for (pos, (number, name)) in file_table.iter().enumerate() {
-        file_raw.entry(*name).or_insert(*number);
-        file_attr.entry(*name).or_insert(if config.version >= 5 {
-            u64::from(*number)
-        } else {
-            pos as u64 + 1
-        });
-    }
+    let (file_raw, file_attr) = index_file_table(config, file_table);
     let abstracts =
         inline_debug::emit_abstracts(&mut sink, unit, inline_index, abbrevs, &file_attr)?;
     let mut locals_by_fn: FxHashMap<&str, Vec<&crate::backend::elf::DwarfLocalVariable>> =

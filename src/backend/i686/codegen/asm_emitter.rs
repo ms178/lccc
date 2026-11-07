@@ -760,9 +760,17 @@ impl InlineAsmEmitter for I686Codegen {
         }
 
         // i686 code is never compiled with AVX in lccc: GCC's `%dN`
-        // duplicate modifier is the plain operand here.
-        let line_owned = crate::backend::x86::codegen::strip_duplicate_modifier(line);
-        let line = line_owned.as_str();
+        // duplicate modifier is the plain operand here. `contains` is a
+        // superset of the rewrite condition, so the guard can only skip work
+        // that would have been a no-op -- and it removes one allocation per
+        // template line, which is every asm line in a kernel TU.
+        let line_owned;
+        let line = if line.contains("%d") {
+            line_owned = crate::backend::x86::codegen::strip_duplicate_modifier(line);
+            line_owned.as_str()
+        } else {
+            line
+        };
         Self::substitute_i686_asm_operands(
             line,
             &op_regs,

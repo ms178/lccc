@@ -9372,7 +9372,10 @@ fn rewrite_folded_cond_store(
     // ── Validate the store block (the chain form's contract) ────────────
     let mut store_inst: Option<(Value, Operand, IrType)> = None; // (ptr, val, ty)
     let mut _store_gep: Option<Value> = None;
-    for inst in &func.blocks[store_block].instructions {
+    // The folded body implements THIS store, so it inherits this row's inline
+    // instance -- not the first row's, which may be plumbing from another one.
+    let mut store_at = 0usize;
+    for (inst_at, inst) in func.blocks[store_block].instructions.iter().enumerate() {
         match inst {
             Instruction::Store {
                 val,
@@ -9387,6 +9390,7 @@ fn rewrite_folded_cond_store(
                 // The stored value may be an SSA value (a computation over
                 // the load) or a CONSTANT (`if (...) p[i] = 0xFF;`).
                 store_inst = Some((*ptr, val.clone(), *ty));
+                store_at = inst_at;
             }
             Instruction::GetElementPtr { dest, .. } => {
                 if _store_gep.is_some() {
@@ -9596,27 +9600,7 @@ fn rewrite_folded_cond_store(
     {
         let store_label = func.blocks[store_block].label;
         let b = &mut func.blocks[store_block];
-        if b.spans_parallel() {
-            // The folded body implements the same source construct as the
-            // block it replaces: keep its inline context instead of escaping
-            // the instance that contained the original store.
-            let inline_id = if b.inline_ids_parallel() {
-                b.source_inline_ids
-                    .first()
-                    .copied()
-                    .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE)
-            } else {
-                crate::ir::instruction::NO_INLINE_INSTANCE
-            };
-            let n = new_insts.len();
-            b.replace_insts_inline(
-                new_insts,
-                vec![crate::common::source::Span::dummy(); n],
-                vec![inline_id; n],
-            );
-        } else {
-            b.replace_insts_synthesized(new_insts);
-        }
+        b.replace_insts_in_context_of(new_insts, store_at);
         b.terminator = Terminator::Branch(latch_label);
         let g = &mut func.blocks[guard_block];
         g.terminator = Terminator::Branch(store_label);

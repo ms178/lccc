@@ -415,6 +415,22 @@ predecessor list and prunes operands on edges it proves dead — deleted an indu
 variable's initialisation. See
 `../engineering/journal/2026-08.md`.
 
+When a violation names a stage, the *producer* is not always that stage: the
+pipeline tail after the last checkpoint (live-range splitting, entry-parameter
+prefix restoration, global location allocation) is not followed by another one,
+so the next compile stage inherits already-drifted IR and the report names an
+innocent consumer. `CCC_VERIFY_DUMP_BLOCK=1` prints the offending block on the
+violation path — one row per instruction with its span and inline-instance id —
+which identifies the producer directly:
+
+```bash
+CCC_VERIFY_IR=abort CCC_VERIFY_DUMP_BLOCK=1 ./target/fastbuild/lccc -O2 -g input.c -c
+```
+
+| Knob | What it shows |
+|---|---|
+| `CCC_VERIFY_DUMP_BLOCK=1` | The violating block's instruction/span/inline-id rows. Read only when a violation is already being reported, so it changes no decision and no emitted code; with `CCC_VERIFY_IR` unset it is never read at all. |
+
 Verification is off by default and costs one atomic load per pass when disabled.
 
 ## Debugging SCCP

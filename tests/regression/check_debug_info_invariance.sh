@@ -115,14 +115,19 @@ filter_self_test
         esac
     done < <(grep -v '^#' "$here/debug_invariance_sentinels.txt")
     index=0
-    for src in "$here"/*.c; do
+    # LC_ALL=C sort: bash expands a glob in collation order, so without this the
+    # 1-in-STRIDE sample depended on the host's locale and CI checked different
+    # sources than a developer did at the same stride. The sample must be a
+    # function of the tree alone. Reading line-wise also survives a source name
+    # containing whitespace.
+    while IFS= read -r src; do
         index=$((index + 1))
         [ $(((index - 1) % STRIDE)) -eq 0 ] || continue
         for level in $OPTS; do
             echo "$CCC $level $(basename "$src")"
             [ -x "$CCC_I686" ] && echo "$CCC_I686 $level $(basename "$src")"
         done
-    done
+    done < <(printf '%s\n' "$here"/*.c | LC_ALL=C sort)
 } | sort -u > "$work/jobs"
 
 check() {

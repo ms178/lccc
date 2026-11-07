@@ -1192,6 +1192,18 @@ gate "dwarf-inlining" fast \
         --lccc-riscv target/fastbuild/lccc-riscv \
         --gdb "${GDB:-gdb}" --gcc "${GCC16:-gcc-16}" \
         --json target/dwarf-inlining.json
+# -S -g accepts exactly what -S accepts (the range-sizing assemble must not
+# become an acceptance gate), -c still rejects unencodable inline asm, and
+# template text -- `%=` labels and non-ASCII bytes -- survives every target.
+gate "debug-acceptance-parity-selftest" fast \
+    python3 tests/regression/check_debug_acceptance_parity.py --self-test
+gate "debug-acceptance-parity" fast \
+    python3 tests/regression/check_debug_acceptance_parity.py \
+        --lccc "$LCCC" --lccc-i686 target/fastbuild/lccc-i686 \
+        --lccc-arm target/fastbuild/lccc-arm \
+        --lccc-riscv target/fastbuild/lccc-riscv \
+        --gcc "${GCC16:-gcc-16}" \
+        --json target/debug-acceptance-parity.json
 # RVC: .text and relocations byte-identical to GNU as on RV64 and RV32
 # (spelling-based compression, branch relaxation, `li`); SKIP without
 # riscv64 binutils.

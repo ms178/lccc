@@ -17,7 +17,36 @@ pub(super) fn append_debug_sections(
     debug: DwarfDebug,
     extra_args: &[String],
 ) -> Result<String, String> {
-    let object = target.assemble_bytes(assembly, extra_args, Some(debug))?;
+    let object = match target.assemble_bytes(assembly, extra_args, Some(debug)) {
+        Ok(object) => object,
+        Err(error) => {
+            // `-S` is a text pass-through, and `-g` must never make it stricter.
+            //
+            // Pre-rendering the DIEs assembles the generated text in memory, so
+            // a user inline-assembly template the target cannot encode used to
+            // reject `-S -g` while plain `-S` accepted it. GCC 16.2 accepts
+            // `-S -g` for such a unit and fails only when the text is actually
+            // assembled (`-c`), because it renders code addresses and sizes as
+            // symbolic expressions instead of assembling. lccc resolves them
+            // here, so it cannot describe a unit whose code it cannot measure.
+            //
+            // Attribute the failure by proof, not by pattern: re-assemble the
+            // code alone, then the code with every `#APP` body neutralized. If
+            // the first fails and the second succeeds, the compiler's own
+            // output is assemblable and the rejection belongs to the user's
+            // template. Anything else is a compiler defect and propagates.
+            if inline_asm_is_the_cause(target, assembly, extra_args) {
+                crate::common::cli_output::stderr_line(format_args!(
+                    "lccc: note: inline assembly is not assemblable for this target; \
+                     -S emits the template unchanged with .file/.loc rows, as `gcc -S` \
+                     does, and the assembler reports the error when it reads this text \
+                     ({error})"
+                ));
+                return Ok(assembly.to_string());
+            }
+            return Err(error);
+        }
+    };
     let elf = Elf::parse(&object)?;
     let mut out = assembly.to_string();
     if !out.ends_with('\n') {
@@ -141,6 +170,132 @@ pub(super) fn append_debug_sections(
         emit_bytes(&mut out, &section.data[cursor..]);
     }
     Ok(out)
+}
+
+/// Decide, by assembling twice, whether a failed `-S -g` assembly was rejected
+/// because of a user inline-assembly template rather than compiler output.
+///
+/// Both probes drop the debug model, so a defect in the DIE writer can never be
+/// blamed on the user: the first probe must FAIL (the code text itself is
+/// rejected) and the second must SUCCEED (neutralizing only the `#APP` bodies
+/// makes it assemblable). Every other combination returns `false`, which
+/// propagates the original error.
+fn inline_asm_is_the_cause(target: Target, assembly: &str, extra_args: &[String]) -> bool {
+    // The D6 range markers are zero-width labels whose meaning lives in the
+    // DWARF unit, and the probes deliberately drop that unit so a DIE-writer
+    // defect can never be blamed on the user. Removing the labels emits no
+    // bytes and nothing in the text references them (the prebuilt debug
+    // sections that do are appended after this function returns), so both
+    // probes describe exactly the code the compiler emitted.
+    let base = strip_inline_markers(assembly);
+    let Some(neutralized) = neutralize_inline_asm(&base) else {
+        return false;
+    };
+    target.assemble_bytes(&base, extra_args, None).is_err()
+        && target
+            .assemble_bytes(&neutralized, extra_args, None)
+            .is_ok()
+}
+
+/// Drop the zero-width D6 inline-range marker labels (`.Llccc_inline_b_*` /
+/// `.Llccc_inline_e_*`). They emit no bytes and are only resolved against the
+/// DWARF unit's instance table.
+fn strip_inline_markers(assembly: &str) -> String {
+    let mut out = String::with_capacity(assembly.len());
+    for line in assembly.lines() {
+        if is_inline_marker_label(line.trim()) {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// `\.Llccc_inline_[be]_<instance>_<serial>_<function>:` and nothing else on the
+/// line. The function name may not contain a colon or whitespace.
+fn is_inline_marker_label(trimmed: &str) -> bool {
+    let Some(rest) = trimmed.strip_prefix(".Llccc_inline_") else {
+        return false;
+    };
+    let Some(label) = rest.strip_suffix(':') else {
+        return false;
+    };
+    let mut parts = label.splitn(4, '_');
+    let Some(kind) = parts.next() else {
+        return false;
+    };
+    if !matches!(kind, "b" | "e") {
+        return false;
+    }
+    let Some(instance) = parts.next() else {
+        return false;
+    };
+    let Some(serial) = parts.next() else {
+        return false;
+    };
+    let Some(function) = parts.next() else {
+        return false;
+    };
+    !instance.is_empty()
+        && instance.bytes().all(|b| b.is_ascii_digit())
+        && !serial.is_empty()
+        && serial.bytes().all(|b| b.is_ascii_digit())
+        && !function.is_empty()
+        && !function
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b == b':')
+}
+
+/// Replace the instruction lines of every `#APP` … `#NO_APP` body with `nop`.
+///
+/// Labels and directives survive so cross-references, `.if`/`.endif` nesting and
+/// macro definitions keep their meaning; only the mnemonics whose encoding is
+/// target-dependent are neutralized. Sizes change, which is exactly why this
+/// text is used for an assemblability *probe* and never for the emitted object.
+/// Returns `None` when the text carries no inline assembly at all.
+fn neutralize_inline_asm(assembly: &str) -> Option<String> {
+    let mut out = String::with_capacity(assembly.len());
+    let mut in_app = false;
+    let mut found = false;
+    for line in assembly.lines() {
+        let trimmed = line.trim();
+        if trimmed == "#APP" {
+            in_app = true;
+            found = true;
+        } else if trimmed == "#NO_APP" {
+            in_app = false;
+        } else if in_app && !is_kept_asm_line(trimmed) {
+            out.push_str("\tnop\n");
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    found.then_some(out)
+}
+
+/// A body line the probe must not touch: empty, a comment, a label definition or
+/// an assembler directive. Everything else is an instruction.
+fn is_kept_asm_line(trimmed: &str) -> bool {
+    if trimmed.is_empty()
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("//")
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('@')
+        || trimmed.starts_with('.')
+    {
+        return true;
+    }
+    // `label:` — the name may not contain whitespace or a colon, and a comment
+    // may follow it.
+    let Some((name, _)) = trimmed.split_once(':') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$'))
 }
 
 fn assembly_identifier(name: &str) -> bool {
@@ -476,4 +631,136 @@ fn escape_path(path: &str) -> String {
         .replace('"', "\\\"")
         .replace('\n', "\\n")
         .replace('\r', "\\r")
+}
+
+#[cfg(test)]
+mod inline_asm_probe_tests {
+    use super::{
+        is_inline_marker_label, is_kept_asm_line, neutralize_inline_asm, strip_inline_markers,
+    };
+
+    #[test]
+    fn marker_labels_are_recognized_exactly() {
+        for marker in [
+            ".Llccc_inline_b_0_0_main:",
+            ".Llccc_inline_e_12_7_foo.bar:",
+            ".Llccc_inline_b_4294967295_1_a$b:",
+        ] {
+            assert!(is_inline_marker_label(marker), "should accept {marker:?}");
+        }
+        for other in [
+            ".Llccc_inline_b_0_0_main: nop", // emits a byte: not a bare marker
+            ".Llccc_inline_x_0_0_main:",     // unknown endpoint kind
+            ".Llccc_inline_b__0_main:",      // empty instance
+            ".Llccc_inline_b_0_x_main:",     // non-numeric serial
+            ".Llccc_inline_b_0_0:",          // empty function
+            ".Llccc_inline_b_0_0_:",         // empty function, trailing separator
+            ".Llccc_inline_e_0_0_a b:",      // whitespace in the function
+            ".Llccc_inline_b_0_0_main",      // not a label definition
+            ".Llccc_debug_alias_3:",
+            ".LBB0_1:",
+            "main:",
+            "",
+        ] {
+            assert!(!is_inline_marker_label(other), "should reject {other:?}");
+        }
+    }
+
+    #[test]
+    fn stripping_markers_keeps_every_other_line_and_all_code() {
+        let text = concat!(
+            "main:\n",
+            ".Llccc_inline_b_0_0_main:\n",
+            ".loc 1 12 5 prologue_end\n",
+            "\tmovl $41, %ecx\n",
+            "#APP\n",
+            "\taddq $1, %ecx\n",
+            "#NO_APP\n",
+            ".Llccc_inline_e_0_0_main:\n",
+            "\tret\n",
+        );
+        let stripped = strip_inline_markers(text);
+        assert!(!stripped.contains("Llccc_inline"));
+        assert_eq!(stripped.lines().count() + 2, text.lines().count());
+        assert!(stripped.contains("\tmovl $41, %ecx\n"));
+        assert!(stripped.contains("\taddq $1, %ecx\n"));
+        assert!(stripped.contains(".loc 1 12 5 prologue_end\n"));
+        // Idempotent: a second pass has nothing left to remove.
+        assert_eq!(strip_inline_markers(&stripped), stripped);
+    }
+
+    #[test]
+    fn text_without_inline_assembly_is_not_a_candidate() {
+        assert_eq!(neutralize_inline_asm("\t.text\nf:\n\tret\n"), None);
+    }
+
+    #[test]
+    fn only_instruction_lines_inside_the_markers_are_neutralized() {
+        let text = concat!(
+            "\tmovl $41, %ecx\n",
+            "#APP\n",
+            "  # a comment survives\n",
+            ".Luser_label:\n",
+            "\t.byte 1, 2, 3\n",
+            "\taddq $1, %ecx\n",
+            "#NO_APP\n",
+            "\tmovl %ecx, %eax\n",
+        );
+        let probe = neutralize_inline_asm(text).expect("has #APP");
+        // The compiler's own instructions are untouched: that is what makes the
+        // probe a proof about the USER's template rather than about our output.
+        assert!(probe.starts_with("\tmovl $41, %ecx\n#APP\n"));
+        assert!(probe.ends_with("#NO_APP\n\tmovl %ecx, %eax\n"));
+        assert!(probe.contains("  # a comment survives\n"));
+        assert!(probe.contains(".Luser_label:\n"));
+        assert!(probe.contains("\t.byte 1, 2, 3\n"));
+        assert!(!probe.contains("addq"));
+        assert!(probe.contains("\tnop\n"));
+        // One output line per input line: the probe never renumbers anything.
+        assert_eq!(probe.lines().count(), text.lines().count());
+    }
+
+    #[test]
+    fn several_regions_are_each_neutralized_and_nesting_is_not_assumed() {
+        let text = "#APP\n\tbogus %rax\n#NO_APP\n\tret\n#APP\n\talso_bogus\n#NO_APP\n";
+        let probe = neutralize_inline_asm(text).expect("has #APP");
+        assert!(!probe.contains("bogus"));
+        assert_eq!(probe.matches("\tnop").count(), 2);
+        assert!(probe.contains("\tret\n"));
+    }
+
+    #[test]
+    fn an_unterminated_region_neutralizes_to_the_end() {
+        // Fail-closed: a missing #NO_APP must not silently leave the rejected
+        // mnemonic in the probe, or the attribution would blame the compiler.
+        let probe = neutralize_inline_asm("#APP\n\tbogus\n").expect("has #APP");
+        assert_eq!(probe, "#APP\n\tnop\n");
+    }
+
+    #[test]
+    fn label_and_directive_recognition_is_exact() {
+        for kept in [
+            "",
+            "# comment",
+            "// comment",
+            "/* comment */",
+            "@ arm comment",
+            ".byte 1",
+            ".if 1",
+            ".Lx:",
+            "1:",
+            "_foo$bar: # trailing comment",
+        ] {
+            assert!(is_kept_asm_line(kept), "should keep {kept:?}");
+        }
+        for instruction in ["addq $1, %ecx", "nop", "bl some_function"] {
+            assert!(
+                !is_kept_asm_line(instruction),
+                "should replace {instruction:?}"
+            );
+        }
+        // A colon inside an operand does not make a line a label definition.
+        assert!(!is_kept_asm_line("movl %gs:0, %eax"));
+        assert!(!is_kept_asm_line("a b:"));
+    }
 }

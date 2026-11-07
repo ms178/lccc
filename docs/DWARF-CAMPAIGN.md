@@ -814,6 +814,92 @@ object's DIE tree equals the direct-`-c` object's tree (same tags, names, ranges
 the sections; the "continuing unit" path already handles the input that carries
 `.debug_*`, and D7 makes that path the normal one, so test both assemblers.
 
+#### D7a · **landed** — assembling for range sizes must not become an acceptance gate
+
+**Measured 2026-11-07.** D7's design has a consequence that was not priced in:
+`-S -g` runs the integrated assembler over the emitted text, so anything the
+assembler cannot encode becomes a `-g`-only *compile error*. The reproducer is
+`tests/regression/peephole_utf8_inline_asm.c`:
+
+```c
+long f(long y) { __asm__ volatile("addq $1, %0" : "+r"(y)); return y; }
+```
+
+`addq` is 64-bit-only. On i686 `%0` becomes `%ecx` and the encoder rejects it;
+AArch64 and RISC-V reject the mnemonic outright. Before the fix, `-S` succeeded
+and `-S -g` failed on three of four targets — adding a debug flag changed whether
+the program compiled.
+
+**The oracle.** GCC 16.2 `-m32 -O2 -S -g` **accepts** this file (exit 0) and
+`-m32 -O2 -c -g` **rejects** it (exit 1): `-S` never assembles, so template
+encodability is not `-S`'s business. Clang 23.1.5 rejects even `-m32 -S -g`.
+The two references disagree, so the binding requirement is LCCC's own
+self-consistency, resolved GCC-ward: **`-S -g` must accept exactly what `-S`
+accepts, and `-c` must still reject what it rejected.**
+
+**The fix** (`src/driver/debug_assembly.rs`). When the range-sizing assemble
+fails, the driver runs two attribution probes with `debug: None`:
+
+1. the same text with the zero-width D6 range markers stripped, and
+2. that text with `#APP` bodies neutralized line-for-line.
+
+Only "probe 1 fails **and** probe 2 succeeds" attributes the failure to the
+user's inline assembly. Then `-S -g` emits the original text unchanged with a
+note, exactly as `gcc -S` does:
+
+```
+lccc: note: inline assembly is not assemblable for this target; -S emits the
+template unchanged with .file/.loc rows, as gcc -S does, ...
+```
+
+Every other combination propagates the error, so a real DIE-writer defect can
+never be laundered into a user-facing note. Two details are load-bearing:
+
+* The probes must pass `debug: None` (they are asking "does the *text*
+  assemble?"), and therefore must **strip the D6 markers first** — otherwise the
+  writer rejects `.Llccc_inline_b_0_0_main` as naming an unknown instance and
+  both probes fail, so the fallback never fires. This was the actual bug behind
+  the first attempted fix.
+* Neutralizing `#APP` bodies is an **attribution probe only**. It is never a
+  valid way to emit an object: ULEB `high_pc` sizes and `.set` offsets would be
+  computed from `nop` sleds. The note path returns the *original* text.
+
+**Named debt.** The right long-term design is what GCC does: emit `.debug_info`
+ranges **symbolically** (`.set`/label differences resolved by GAS) so `-S -g`
+never has to assemble at all. Until then the fallback is a scoped, attributed
+escape hatch, not the architecture.
+
+**Gate.** `tests/regression/check_debug_acceptance_parity.py` — 10 fixtures × 4
+targets (40 rows), GCC 16.2 as oracle. It asserts return-code parity between
+`-S` and `-S -g`, **code identity** after debug rows are stripped (so the
+fallback cannot quietly change codegen), that `-c -g` still *rejects* an
+unencodable template, and that an encodable template keeps a full
+`.debug_info`. `--self-test` proves the debug-row filter can still see a
+one-byte code change. Wired into `ci.yml` (fast contracts, shard b) and
+`scripts/ci_local.sh`.
+
+Two neighbouring inline-asm defects surfaced by the same fixture are fixed
+here because they are text-fidelity bugs on the `-S -g` path:
+
+* **`%=` was not expanded.** GCC's unique-label operator now expands in the
+  shared emission loop from `CodegenState::next_label_id()`, one module-unique
+  id per emitted instance, allocated **only** when an unescaped `%=` is present
+  (so no other label is renumbered and the result stays `-g`-invariant). `%%=`
+  remains a literal `%=`. The gate pins uniqueness across three statements in
+  one function *and* across two inlined copies of a callee: 5 distinct labels,
+  and the object still assembles, on all four targets.
+* **i686 double-encoded non-ASCII template text.** `strip_duplicate_modifier`
+  copied bytes with `push(b[i] as char)`, which decodes each byte as Latin-1 and
+  re-encodes it: `café € 🦀` (`63 61 66 c3 a9 20 e2 82 ac 20 f0 9f a6 80`) came
+  out as `63 61 66 c3 83 c2 a9 20 c3 a2 c2 82 c2 ac 20 c3 b0 c2 9f c2 a6 c2 80`.
+  i686 called it on *every* template line, so any UTF-8 comment was corrupted.
+  The rewrite moves text as `&str` slices (`find('%')` returns ASCII boundaries,
+  so slicing is safe by construction) — correct **and** faster, one memcpy per
+  run instead of one push per byte. Both i686 and x86-64 callers are now guarded
+  by `line.contains("%d")`, which also removes a `String` allocation per line on
+  the common path. Verified by byte comparison, not by eye: a terminal renders
+  correctly-encoded UTF-8 as mojibake often enough that `cat` is not evidence.
+
 ### D8 · P2 · M — `-g3`: `.debug_macro`
 
 **Why.** `-g3` is accepted; `info macro` cannot work without `.debug_macro`.

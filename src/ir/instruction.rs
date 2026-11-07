@@ -371,6 +371,34 @@ impl BasicBlock {
         self.replace_insts_inline(insts, spans, Vec::new());
     }
 
+    /// Replace the body with `insts`, which implement the same source construct
+    /// that instruction `context_at` implemented.
+    ///
+    /// The rows are synthesized, so they claim no exact source range
+    /// ([`Span::dummy`]) rather than lying about one, but they stay inside the
+    /// inline instance `context_at` belonged to: a fold must never move code out
+    /// of the function it was inlined from. An untracked block stays untracked.
+    /// `context_at` is clamped like [`Self::inherited_inline_id`], so a fold that
+    /// removed the anchor instruction cannot panic on line-table metadata.
+    pub fn replace_insts_in_context_of(&mut self, insts: Vec<Instruction>, context_at: usize) {
+        if !self.spans_parallel() {
+            self.replace_insts_synthesized(insts);
+            return;
+        }
+        let last = self.instructions.len().saturating_sub(1);
+        let context = self.inline_id_at(context_at.min(last));
+        let n = insts.len();
+        // Outside an inline instance there is nothing to inherit: leave the id
+        // list sparse rather than allocating a row of `NO_INLINE_INSTANCE` per
+        // instruction. Both spellings answer `inline_id_at` identically.
+        let inline_ids = if context == NO_INLINE_INSTANCE {
+            Vec::new()
+        } else {
+            vec![context; n]
+        };
+        self.replace_insts_inline(insts, vec![Span::dummy(); n], inline_ids);
+    }
+
     /// [`Self::replace_insts`] with rebuilt inline provenance.
     pub fn replace_insts_inline(
         &mut self,
@@ -2150,6 +2178,74 @@ mod span_edit_tests {
         let mut u = block(&[1, 2], false);
         u.replace_insts_synthesized(vec![inst(5)]);
         assert!(u.source_spans.is_empty());
+    }
+
+    #[test]
+    fn in_context_replacement_keeps_the_instance_and_claims_no_exact_range() {
+        // Tracked, ids parallel: every synthesized row stays in instance 7 and
+        // claims no source range of its own.
+        let mut b = block(&[1, 2, 3], true);
+        b.source_inline_ids = vec![NO_INLINE_INSTANCE, 7, 7];
+        b.replace_insts_in_context_of(vec![inst(10), inst(11)], 1);
+        assert_eq!(ids(&b), vec![10, 11]);
+        assert_eq!(b.source_spans, vec![Span::dummy(); 2]);
+        assert_eq!(b.source_inline_ids, vec![7, 7]);
+        assert!(b.spans_parallel() && b.inline_ids_parallel());
+
+        // The last row is a valid anchor too.
+        let mut tail = block(&[1, 2], true);
+        tail.source_inline_ids = vec![3, 9];
+        tail.replace_insts_in_context_of(vec![inst(10)], 1);
+        assert_eq!(tail.source_inline_ids, vec![9]);
+    }
+
+    #[test]
+    fn in_context_replacement_outside_an_instance_leaves_ids_sparse() {
+        let mut b = block(&[1, 2], true);
+        b.replace_insts_in_context_of(vec![inst(10), inst(11), inst(12)], 0);
+        assert_eq!(b.source_spans, vec![Span::dummy(); 3]);
+        assert!(b.source_inline_ids.is_empty());
+        assert!(b.inline_ids_consistent());
+        for i in 0..3 {
+            assert_eq!(b.inline_id_at(i), NO_INLINE_INSTANCE);
+            assert_eq!(b.span_at(i), Span::dummy());
+        }
+        // An all-NO_INLINE_INSTANCE id list is accepted, but never invented.
+        let mut sparse = block(&[1, 2], true);
+        sparse.source_inline_ids = vec![NO_INLINE_INSTANCE, 4];
+        sparse.replace_insts_in_context_of(vec![inst(10)], 0);
+        assert!(sparse.source_inline_ids.is_empty());
+    }
+
+    #[test]
+    fn in_context_replacement_of_an_untracked_block_stays_untracked() {
+        let mut b = block(&[1, 2], false);
+        b.replace_insts_in_context_of(vec![inst(10)], 0);
+        assert_eq!(ids(&b), vec![10]);
+        assert!(b.source_spans.is_empty());
+        assert!(b.source_inline_ids.is_empty());
+        assert!(!b.spans_parallel());
+    }
+
+    #[test]
+    fn in_context_replacement_clamps_a_removed_anchor_instead_of_panicking() {
+        let mut b = block(&[1, 2], true);
+        b.source_inline_ids = vec![5, 6];
+        // A fold that dropped the anchor may pass an index past the old body.
+        b.replace_insts_in_context_of(vec![inst(10), inst(11)], usize::MAX);
+        assert_eq!(b.source_inline_ids, vec![6, 6]);
+        assert!(b.inline_ids_parallel());
+    }
+
+    #[test]
+    fn in_context_replacement_with_no_rows_never_leaves_a_drifted_array() {
+        let mut b = block(&[1, 2], true);
+        b.source_inline_ids = vec![7, 7];
+        b.replace_insts_in_context_of(Vec::new(), 0);
+        assert!(b.instructions.is_empty());
+        assert!(b.source_spans.is_empty());
+        assert!(b.source_inline_ids.is_empty());
+        assert!(b.inline_ids_consistent());
     }
 
     #[test]

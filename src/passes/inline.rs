@@ -3838,6 +3838,20 @@ fn extern_inline_admission(func: &IrFunction, ctx: &CalleeContext) -> bool {
     loop_analysis::merge_loops_by_header(raw).len() <= 1
 }
 
+/// Bytes reserved by aggregate-sized frame slots. The inline cost model counts
+/// these separately: mem2reg/SROA scalarizes the small ones, so only slots at or
+/// above `AGG_FRAME_SLOT_BYTES` survive as real frame traffic.
+fn aggregate_frame_bytes(func: &IrFunction) -> usize {
+    func.blocks
+        .iter()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|inst| match inst {
+            Instruction::Alloca { size, .. } if *size >= AGG_FRAME_SLOT_BYTES => Some(*size),
+            _ => None,
+        })
+        .sum()
+}
+
 fn callee_data_for(
     func: &IrFunction,
     module: &IrModule,
@@ -4268,15 +4282,7 @@ fn callee_data_for(
 
         // Frame bytes duplicated at every inline site. Only allocas large
         // enough to survive mem2reg/SROA count; the rest become registers.
-        let agg_frame_bytes: usize = func
-            .blocks
-            .iter()
-            .flat_map(|b| b.instructions.iter())
-            .filter_map(|inst| match inst {
-                Instruction::Alloca { size, .. } if *size >= AGG_FRAME_SLOT_BYTES => Some(*size),
-                _ => None,
-            })
-            .sum();
+        let agg_frame_bytes = aggregate_frame_bytes(func);
 
         Some(CalleeData {
             blocks: func.blocks.clone(),
@@ -5300,6 +5306,10 @@ fn elide_memcpy_alias_closure(
 /// keeps that local instead. The alias closure is computed to a fixpoint
 /// before anything is judged, because `BasicBlock` order is not dominance
 /// order after inlining.
+/// The debug row a reader lifted into the entry block must keep: its own source
+/// span and inline instance, when the block it came from tracked them.
+type ReaderDebug = (Option<crate::common::source::Span>, Option<u32>);
+
 fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
     let Some((candidates, src_of, mut disqualified, copy_at)) = elide_memcpy_candidates(blocks)
     else {
@@ -5460,14 +5470,7 @@ fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
     // Each moved reader keeps its own debug location when its block has a
     // parallel span vector (the line that names the field is the useful one
     // to step to); otherwise it takes the copy's.
-    let mut moved: FxHashMap<
-        usize,
-        Vec<(
-            u32,
-            Instruction,
-            (Option<crate::common::source::Span>, Option<u32>),
-        )>,
-    > = FxHashMap::default();
+    let mut moved: FxHashMap<usize, Vec<(u32, Instruction, ReaderDebug)>> = FxHashMap::default();
     // The entry block is rebuilt last: groups pulled from later blocks are
     // inserted into it. `None` marks a removed slot.
     let mut entry_slots: Vec<Option<Instruction>> = Vec::new();
@@ -5818,6 +5821,257 @@ fn ir_type_slot_size(ty: IrType) -> usize {
     may.max(8)
 }
 
+/// D6: append this call site's inline-instance subtree to the caller's table.
+///
+/// Returns the site's own (root) instance id and the callee-to-caller id map,
+/// or `None` when the subtree cannot be represented: an id that does not fit
+/// `u32`, or a callee instance whose parent does not name an already-remapped
+/// earlier instance. Falling back to the root in that second case silently
+/// re-parented a malformed table and fabricated nesting, so the caller must
+/// refuse the inline and truncate the table back to its entry length instead.
+fn append_inline_instances(
+    caller: &mut IrFunction,
+    callee: &CalleeData,
+    callee_name: &str,
+    call_span: crate::common::source::Span,
+    call_context: u32,
+) -> Option<(u32, Vec<u32>)> {
+    // Normalize the caller's per-instruction provenance before reading the call
+    // site's context. Blocks without spans stay untracked; tracked blocks get an
+    // explicit NO_INLINE_INSTANCE entry so later span-preserving edits keep the
+    // three arrays parallel.
+    for block in &mut caller.blocks {
+        if block.spans_parallel() {
+            if block.source_inline_ids.is_empty() {
+                block.source_inline_ids.resize(
+                    block.instructions.len(),
+                    crate::ir::instruction::NO_INLINE_INSTANCE,
+                );
+            } else if !block.inline_ids_parallel() {
+                block.source_inline_ids.clear();
+            }
+        } else {
+            block.source_inline_ids.clear();
+        }
+    }
+    let root_instance = u32::try_from(caller.debug_inline_instances.len()).ok()?;
+    caller
+        .debug_inline_instances
+        .push(crate::ir::module::DebugInlineInstance {
+            callee: callee_name.to_string(),
+            call_span,
+            decl_span: callee.decl_span,
+            parent: (call_context != crate::ir::instruction::NO_INLINE_INSTANCE)
+                .then_some(call_context),
+            declared_inline: callee.declared_inline,
+        });
+    let mut instance_map: Vec<u32> = Vec::with_capacity(callee.debug_inline_instances.len());
+    for instance in &callee.debug_inline_instances {
+        let parent = match instance.parent {
+            None => root_instance,
+            Some(p) => instance_map.get(p as usize).copied()?,
+        };
+        let id = u32::try_from(caller.debug_inline_instances.len()).ok()?;
+        let mut cloned = instance.clone();
+        cloned.parent = Some(parent);
+        caller.debug_inline_instances.push(cloned);
+        instance_map.push(id);
+    }
+    Some((root_instance, instance_map))
+}
+
+/// Clone the callee's blocks with remapped values, labels and inline
+/// provenance. A callee block only carries ids under `-g` and only when it
+/// tracks spans; a tracked block whose ids are sparse belongs to the site's
+/// root instance rather than to no instance at all.
+fn clone_callee_blocks(
+    callee: &CalleeData,
+    labels: &mut LabelMap,
+    value_offset: u32,
+    debug_enabled: bool,
+    root_instance: u32,
+    map_inline: impl Fn(u32) -> u32,
+) -> Vec<BasicBlock> {
+    let mut inlined_blocks: Vec<BasicBlock> = Vec::with_capacity(callee.blocks.len());
+    for callee_block in &callee.blocks {
+        let source_inline_ids = if debug_enabled && callee_block.spans_parallel() {
+            if callee_block.inline_ids_parallel() {
+                callee_block
+                    .source_inline_ids
+                    .iter()
+                    .copied()
+                    .map(&map_inline)
+                    .collect()
+            } else {
+                vec![root_instance; callee_block.instructions.len()]
+            }
+        } else {
+            Vec::new()
+        };
+        let mut new_block = BasicBlock {
+            label: labels.get(callee_block.label),
+            instructions: Vec::with_capacity(callee_block.instructions.len()),
+            source_spans: callee_block.source_spans.clone(),
+            source_inline_ids,
+            terminator: remap_terminator(&callee_block.terminator, value_offset, labels),
+        };
+        for inst in &callee_block.instructions {
+            new_block
+                .instructions
+                .push(remap_instruction(inst, value_offset, labels));
+        }
+        inlined_blocks.push(new_block);
+    }
+    inlined_blocks
+}
+
+/// Merge the callee's terminator statements with remapped labels and
+/// provenance. The shape check in `TerminatorSpans` drops a row whose
+/// terminator was rewritten; while the shape survives, the row still belongs
+/// to the inline instance.
+fn merge_callee_terminator_spans(
+    caller: &mut IrFunction,
+    callee: &CalleeData,
+    labels: &LabelMap,
+    map_inline: impl Fn(u32) -> u32,
+) {
+    for (label, span, id, shape) in callee.terminator_spans.iter() {
+        let Some(&new_label) = labels.map.get(&label.0) else {
+            continue;
+        };
+        let Some(new_shape) = shape.remapped(&|l| labels.map.get(&l.0).copied()) else {
+            continue;
+        };
+        caller
+            .terminator_spans
+            .insert_remapped(new_label, span, map_inline(id), new_shape);
+    }
+}
+
+/// The post-call merge block: the caller's tail plus one synthesized definition
+/// of the call result.
+///
+/// Built with the shared `BasicBlock` primitives instead of three hand-rolled
+/// vectors so the sparse-or-parallel law holds by construction: an untracked
+/// tail stays untracked (the hand-rolled version pushed a lone dummy span for
+/// the result and produced one span for 1+N instructions), and a tail with
+/// sparse ids does not get a one-element id list invented.
+fn build_inline_merge_block(
+    label: BlockId,
+    terminator: Terminator,
+    tail: (Vec<Instruction>, Vec<crate::common::source::Span>, Vec<u32>),
+    dest: Option<Value>,
+    phi_incoming: Vec<(Operand, BlockId)>,
+    return_type: IrType,
+    call_context: u32,
+) -> BasicBlock {
+    let mut merge_block = BasicBlock {
+        label,
+        instructions: Vec::new(),
+        source_spans: Vec::new(),
+        source_inline_ids: Vec::new(),
+        terminator,
+    };
+    merge_block.append_spanned_inline(tail.0, tail.1, tail.2);
+    let Some(call_dest) = dest else {
+        return merge_block;
+    };
+    let result_def = if phi_incoming.len() == 1 {
+        // Single return path: just copy the value directly (no phi needed).
+        Some(Instruction::Copy {
+            dest: call_dest,
+            src: phi_incoming[0].0,
+        })
+    } else if phi_incoming.len() > 1 {
+        // Multiple return paths: need a Phi node.
+        Some(Instruction::Phi {
+            dest: call_dest,
+            ty: return_type,
+            incoming: phi_incoming,
+        })
+    } else {
+        // The callee never returns a value (all paths noreturn/unreachable):
+        // call_dest stays undefined and unused.
+        None
+    };
+    if let Some(inst) = result_def {
+        merge_block.insert_inst_inline(0, inst, crate::common::source::Span::dummy(), call_context);
+    }
+    merge_block
+}
+
+/// Bind every remaining direct `ParamRef` use to the caller's argument value.
+///
+/// Covers instruction operands (including intrinsic argument lists), terminator
+/// operands, and the return-phi incomings that were collected *before* the
+/// callee's `Return`s became `Branch(merge)`: the block walk cannot see those,
+/// and a stale pre-substitution id there is an undefined value at codegen time
+/// (expat's `checkCharRefNumber` returned 0 for every character reference).
+/// Leaving even one remapped `ParamRef` unbound produces a backend value with
+/// no register and no stack home.
+fn bind_paramref_uses(
+    blocks: &mut [BasicBlock],
+    phi_incoming: &mut [(Operand, BlockId)],
+    subst: &FxInlineMap<u32, Operand>,
+    callee_name: &str,
+    debug: bool,
+) {
+    if subst.is_empty() {
+        return;
+    }
+    for block in blocks.iter_mut() {
+        for inst in &mut block.instructions {
+            inst.for_each_operand_mut(|op| {
+                if let Operand::Value(v) = op {
+                    if let Some(&replacement) = subst.get(&v.0) {
+                        *op = replacement;
+                    }
+                }
+            });
+            inst.for_each_value_use_mut(|value| {
+                if let Some(Operand::Value(replacement)) = subst.get(&value.0) {
+                    if debug {
+                        lccc::cli::stderr_line(format_args!(
+                            "[INLINE_PARAMREF] {} direct v{} -> v{}",
+                            callee_name, value.0, replacement.0
+                        ));
+                    }
+                    *value = *replacement;
+                }
+            });
+        }
+        block.terminator.for_each_operand_mut(|op| {
+            if let Operand::Value(v) = op {
+                if let Some(&replacement) = subst.get(&v.0) {
+                    *op = replacement;
+                }
+            }
+        });
+    }
+    // CRITICAL: phi_incoming was collected from the callee's Return
+    // terminators BEFORE this substitution ran (those Returns are
+    // already rewritten to Branch(merge), so the loop above cannot see
+    // their operands). A callee that returns its own parameter (e.g.
+    // expat's checkCharRefNumber: `return result` where result IS the
+    // ParamRef value after copy-prop) left the stale pre-substitution
+    // id in the merge phi — an undefined value at codegen time (the
+    // switch 'break' path returned 0 instead of result; char refs
+    // &#60; etc. all decoded to 0).
+    for (op, _) in phi_incoming.iter_mut() {
+        if let Operand::Value(v) = op {
+            if let Some(&replacement) = subst.get(&v.0) {
+                if debug {
+                    lccc::cli::stderr_line(format_args!(
+                        "[INLINE_PARAMREF] {} return-phi v{} -> {:?}",
+                        callee_name, v.0, replacement
+                    ));
+                }
+                *op = replacement;
+            }
+        }
+    }
+}
+
 fn inline_call_site(
     caller: &mut IrFunction,
     site: &InlineCallSite,
@@ -5880,58 +6134,10 @@ fn inline_call_site(
     let call_span = caller.blocks[site.block_idx].span_at(site.inst_idx);
     let call_context = caller.blocks[site.block_idx].inline_id_at(site.inst_idx);
     let (root_instance, instance_map) = if debug_enabled {
-        // Normalize the caller's per-instruction provenance before reading the
-        // call site's context. Blocks without spans stay untracked; tracked
-        // blocks get an explicit NO_INLINE_INSTANCE entry so later
-        // span-preserving edits keep the three arrays parallel.
-        for block in &mut caller.blocks {
-            if block.spans_parallel() {
-                if block.source_inline_ids.is_empty() {
-                    block.source_inline_ids.resize(
-                        block.instructions.len(),
-                        crate::ir::instruction::NO_INLINE_INSTANCE,
-                    );
-                } else if !block.inline_ids_parallel() {
-                    block.source_inline_ids.clear();
-                }
-            } else {
-                block.source_inline_ids.clear();
-            }
+        match append_inline_instances(caller, callee, &site.callee_name, call_span, call_context) {
+            Some(pair) => pair,
+            None => bail!(),
         }
-        let Some(root_instance) = u32::try_from(caller.debug_inline_instances.len()).ok() else {
-            bail!();
-        };
-        caller
-            .debug_inline_instances
-            .push(crate::ir::module::DebugInlineInstance {
-                callee: site.callee_name.clone(),
-                call_span,
-                decl_span: callee.decl_span,
-                parent: (call_context != crate::ir::instruction::NO_INLINE_INSTANCE)
-                    .then_some(call_context),
-                declared_inline: callee.declared_inline,
-            });
-        let mut instance_map: Vec<u32> = Vec::with_capacity(callee.debug_inline_instances.len());
-        for instance in &callee.debug_inline_instances {
-            let parent = match instance.parent {
-                None => root_instance,
-                // A callee instance must name an already-remapped earlier
-                // instance.  Falling back to the root silently re-parented a
-                // malformed table and fabricated nesting; refuse the inline.
-                Some(p) => match instance_map.get(p as usize).copied() {
-                    Some(mapped) => mapped,
-                    None => bail!(),
-                },
-            };
-            let Some(id) = u32::try_from(caller.debug_inline_instances.len()).ok() else {
-                bail!();
-            };
-            let mut cloned = instance.clone();
-            cloned.parent = Some(parent);
-            caller.debug_inline_instances.push(cloned);
-            instance_map.push(id);
-        }
-        (root_instance, instance_map)
     } else {
         (crate::ir::instruction::NO_INLINE_INSTANCE, Vec::new())
     };
@@ -5995,55 +6201,15 @@ fn inline_call_site(
         labels.assign(callee_block.label);
     }
 
-    let mut inlined_blocks: Vec<BasicBlock> = Vec::with_capacity(callee.blocks.len());
-
-    for callee_block in &callee.blocks {
-        let source_inline_ids = if debug_enabled && callee_block.spans_parallel() {
-            if callee_block.inline_ids_parallel() {
-                callee_block
-                    .source_inline_ids
-                    .iter()
-                    .copied()
-                    .map(map_inline)
-                    .collect()
-            } else {
-                vec![root_instance; callee_block.instructions.len()]
-            }
-        } else {
-            Vec::new()
-        };
-        let mut new_block = BasicBlock {
-            label: labels.get(callee_block.label),
-            instructions: Vec::with_capacity(callee_block.instructions.len()),
-            source_spans: callee_block.source_spans.clone(),
-            source_inline_ids,
-            terminator: remap_terminator(&callee_block.terminator, value_offset, &mut labels),
-        };
-
-        for inst in &callee_block.instructions {
-            new_block
-                .instructions
-                .push(remap_instruction(inst, value_offset, &mut labels));
-        }
-
-        inlined_blocks.push(new_block);
-    }
-
-    // Merge the callee's terminator statements with remapped labels and
-    // provenance. The shape check in TerminatorSpans drops a row whose
-    // terminator was rewritten; while the shape survives, the row still
-    // belongs to the inline instance.
-    for (label, span, id, shape) in callee.terminator_spans.iter() {
-        let Some(&new_label) = labels.map.get(&label.0) else {
-            continue;
-        };
-        let Some(new_shape) = shape.remapped(&|l| labels.map.get(&l.0).copied()) else {
-            continue;
-        };
-        caller
-            .terminator_spans
-            .insert_remapped(new_label, span, map_inline(id), new_shape);
-    }
+    let mut inlined_blocks = clone_callee_blocks(
+        callee,
+        &mut labels,
+        value_offset,
+        debug_enabled,
+        root_instance,
+        &map_inline,
+    );
+    merge_callee_terminator_spans(caller, callee, &labels, &map_inline);
 
     // ── S17: __builtin_va_arg_pack() forwarding ────────────────────────────
     // The wrapper's caller evaluated ALL its arguments (named + variadic)
@@ -6657,63 +6823,13 @@ fn inline_call_site(
         };
     }
     elide_readonly_local_memcpys(&mut inlined_blocks);
-    // Replace every direct ParamRef use after removing ParamRef instructions.
-    // This includes intrinsic arguments, phi incoming values, and terminators;
-    // leaving even one remapped ParamRef unbound produces an invalid backend
-    // value with no register or stack home.
-    if !paramref_subst.is_empty() {
-        for block in &mut inlined_blocks {
-            for inst in &mut block.instructions {
-                inst.for_each_operand_mut(|op| {
-                    if let Operand::Value(v) = op {
-                        if let Some(&replacement) = paramref_subst.get(&v.0) {
-                            *op = replacement;
-                        }
-                    }
-                });
-                inst.for_each_value_use_mut(|value| {
-                    if let Some(Operand::Value(replacement)) = paramref_subst.get(&value.0) {
-                        if paramref_debug {
-                            lccc::cli::stderr_line(format_args!(
-                                "[INLINE_PARAMREF] {} direct v{} -> v{}",
-                                site.callee_name, value.0, replacement.0
-                            ));
-                        }
-                        *value = *replacement;
-                    }
-                });
-            }
-            block.terminator.for_each_operand_mut(|op| {
-                if let Operand::Value(v) = op {
-                    if let Some(&replacement) = paramref_subst.get(&v.0) {
-                        *op = replacement;
-                    }
-                }
-            });
-        }
-        // CRITICAL: phi_incoming was collected from the callee's Return
-        // terminators BEFORE this substitution ran (those Returns are
-        // already rewritten to Branch(merge), so the loop above cannot see
-        // their operands). A callee that returns its own parameter (e.g.
-        // expat's checkCharRefNumber: `return result` where result IS the
-        // ParamRef value after copy-prop) left the stale pre-substitution
-        // id in the merge phi — an undefined value at codegen time (the
-        // switch 'break' path returned 0 instead of result; char refs
-        // &#60; etc. all decoded to 0).
-        for (op, _) in phi_incoming.iter_mut() {
-            if let Operand::Value(v) = op {
-                if let Some(&replacement) = paramref_subst.get(&v.0) {
-                    if paramref_debug {
-                        lccc::cli::stderr_line(format_args!(
-                            "[INLINE_PARAMREF] {} return-phi v{} -> {:?}",
-                            site.callee_name, v.0, replacement
-                        ));
-                    }
-                    *op = replacement;
-                }
-            }
-        }
-    }
+    bind_paramref_uses(
+        &mut inlined_blocks,
+        &mut phi_incoming,
+        &paramref_subst,
+        &site.callee_name,
+        paramref_debug,
+    );
 
     // Now split the caller's block at the call site:
     // Block before call -> instructions before the call + branch to callee entry
@@ -6820,52 +6936,19 @@ fn inline_call_site(
         }
     }
 
-    // The merge block is the post-call tail plus one synthesized def of the
-    // call result. Building it with the shared primitives instead of three
-    // hand-rolled vectors keeps the sparse-or-parallel law by construction:
-    // an untracked tail stays untracked (the old code pushed a lone dummy
-    // span for the result and produced 1 span for 1+N instructions), and a
-    // tail with sparse ids does not get a one-element id list invented.
-    let mut merge_block = BasicBlock {
-        label: merge_label,
-        instructions: Vec::new(),
-        source_spans: Vec::new(),
-        source_inline_ids: Vec::new(),
-        terminator: original_terminator,
-    };
-    merge_block.append_spanned_inline(
-        after_call_instructions,
-        after_call_spans,
-        after_call_inline_ids,
+    let merge_block = build_inline_merge_block(
+        merge_label,
+        original_terminator,
+        (
+            after_call_instructions,
+            after_call_spans,
+            after_call_inline_ids,
+        ),
+        site.dest,
+        phi_incoming,
+        callee.return_type,
+        call_context,
     );
-    if let Some(call_dest) = site.dest {
-        let result_def = if phi_incoming.len() == 1 {
-            // Single return path: just copy the value directly (no phi needed).
-            Some(Instruction::Copy {
-                dest: call_dest,
-                src: phi_incoming[0].0,
-            })
-        } else if phi_incoming.len() > 1 {
-            // Multiple return paths: need a Phi node.
-            Some(Instruction::Phi {
-                dest: call_dest,
-                ty: callee.return_type,
-                incoming: phi_incoming,
-            })
-        } else {
-            // The callee never returns a value (all paths noreturn/unreachable):
-            // call_dest stays undefined and unused.
-            None
-        };
-        if let Some(inst) = result_def {
-            merge_block.insert_inst_inline(
-                0,
-                inst,
-                crate::common::source::Span::dummy(),
-                call_context,
-            );
-        }
-    }
 
     // Insert the inlined blocks and merge block after the call block
     let insert_position = call_block_idx + 1;
