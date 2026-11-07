@@ -59,6 +59,12 @@ pub(super) fn unique_nonvolatile_allocas(func: &IrFunction) -> FxHashSet<u32> {
                 allocas.insert(dest.0);
             }
         }
+        // An asm output can name a memory home or an SSA definition after
+        // promotion, but dest() cannot express its multiple outputs. Without
+        // disambiguating those forms, neither proves a unique alloca value.
+        if let Instruction::InlineAsm { outputs, .. } = inst {
+            repeated.extend(outputs.iter().map(|(_, value, _)| value.0));
+        }
     }
     allocas.retain(|v| !repeated.contains(v));
     allocas
@@ -2612,6 +2618,46 @@ mod snapshot_forwarding_contract {
             ty: IrType::I64,
             seg_override: AddressSpace::Default,
             volatile: false,
+        }
+    }
+
+    #[test]
+    fn asm_outputs_do_not_prove_a_unique_alloca_root() {
+        // InlineAsm output slots are unusual: they can be pointer homes or
+        // SSA definitions after promotion, and Instruction::dest() omits them.
+        // A whole-function proof cannot simply ignore either interpretation.
+        for output in [0, 1, 2] {
+            let mut m = module(vec![], 0, 2, 64, None, vec![]);
+            m.functions[0].blocks[0].instructions.insert(
+                3,
+                Instruction::InlineAsm {
+                    template: String::new(),
+                    outputs: vec![("=r".into(), Value(output), None)],
+                    inputs: vec![],
+                    clobbers: vec![],
+                    operand_types: vec![IrType::Ptr],
+                    goto_labels: vec![],
+                    input_symbols: vec![],
+                    seg_overrides: vec![],
+                },
+            );
+            assert!(
+                !unique_nonvolatile_allocas(&m.functions[0]).contains(&output),
+                "asm output {output} must invalidate a unique-root proof"
+            );
+            for pass in [
+                forward_memcpy_chains as fn(&mut IrModule) -> usize,
+                crate::passes::aggregate_sroa::run,
+            ] {
+                let mut candidate = IrModule::new();
+                candidate.functions.push(m.functions[0].clone());
+                pass(&mut candidate);
+                assert_eq!(
+                    copies(&candidate).len(),
+                    2,
+                    "asm output {output}: {candidate:?}"
+                );
+            }
         }
     }
 
