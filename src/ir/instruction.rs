@@ -155,11 +155,16 @@ impl BasicBlock {
 
     #[inline]
     fn insert_inline_id(&mut self, at: usize, id: u32) {
-        if self.inline_ids_parallel()
-            || (!self.source_inline_ids.is_empty() && self.spans_parallel())
-        {
-            self.source_inline_ids.insert(at, id);
+        if self.source_inline_ids.is_empty() || !self.spans_parallel() {
+            return;
         }
+        // A pass may have drifted the id list before this edit; pad/truncate to
+        // the pre-insertion instruction count so the insertion index is always
+        // valid and the three arrays end parallel again.  Padding uses the
+        // concrete-function sentinel rather than inventing an inline instance.
+        let target = self.instructions.len().saturating_sub(1);
+        self.source_inline_ids.resize(target, NO_INLINE_INSTANCE);
+        self.source_inline_ids.insert(at, id);
     }
 
     /// Insert `inst` before position `at` (`at == len` appends).
@@ -199,7 +204,9 @@ impl BasicBlock {
             let added = self.instructions.len() - before;
             self.source_spans
                 .splice(at..at, std::iter::repeat_n(span, added));
-            if self.inline_ids_parallel() || !self.source_inline_ids.is_empty() {
+            if !self.source_inline_ids.is_empty() {
+                let target = self.instructions.len() - added;
+                self.source_inline_ids.resize(target, NO_INLINE_INSTANCE);
                 self.source_inline_ids
                     .splice(at..at, std::iter::repeat_n(id, added));
             }
@@ -221,7 +228,8 @@ impl BasicBlock {
         if tracked {
             let added = self.instructions.len() - before;
             self.source_spans.extend(std::iter::repeat_n(span, added));
-            if self.inline_ids_parallel() || !self.source_inline_ids.is_empty() {
+            if !self.source_inline_ids.is_empty() {
+                self.source_inline_ids.resize(before, NO_INLINE_INSTANCE);
                 self.source_inline_ids
                     .extend(std::iter::repeat_n(id, added));
             }

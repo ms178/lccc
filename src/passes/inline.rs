@@ -5971,7 +5971,7 @@ fn inline_call_site(
     let mut inlined_blocks: Vec<BasicBlock> = Vec::with_capacity(callee.blocks.len());
 
     for callee_block in &callee.blocks {
-        let source_inline_ids = if callee_block.spans_parallel() {
+        let source_inline_ids = if debug_enabled && callee_block.spans_parallel() {
             if callee_block.inline_ids_parallel() {
                 callee_block
                     .source_inline_ids
@@ -6422,7 +6422,9 @@ fn inline_call_site(
                 entry_block
                     .source_spans
                     .insert(at, crate::common::source::Span::dummy());
-                entry_block.source_inline_ids.insert(at, call_context);
+                if debug_enabled {
+                    entry_block.source_inline_ids.insert(at, call_context);
+                }
             }
         }
 
@@ -6498,9 +6500,11 @@ fn inline_call_site(
                     entry_block
                         .source_spans
                         .insert(materialize_pos, crate::common::source::Span::dummy());
-                    entry_block
-                        .source_inline_ids
-                        .insert(materialize_pos, call_context);
+                    if debug_enabled {
+                        entry_block
+                            .source_inline_ids
+                            .insert(materialize_pos, call_context);
+                    }
                 }
                 materialize_pos += 1;
                 loaded_per_param.insert(*param_idx, v);
@@ -6529,9 +6533,11 @@ fn inline_call_site(
                         entry_block
                             .source_spans
                             .insert(materialize_pos, crate::common::source::Span::dummy());
-                        entry_block
-                            .source_inline_ids
-                            .insert(materialize_pos, call_context);
+                        if debug_enabled {
+                            entry_block
+                                .source_inline_ids
+                                .insert(materialize_pos, call_context);
+                        }
                     }
                     materialize_pos += 1;
                     cast_per_param_ty.insert(key, cast);
@@ -6791,7 +6797,9 @@ fn inline_call_site(
                 src: phi_incoming[0].0,
             });
             merge_spans.push(crate::common::source::Span::dummy());
-            merge_inline_ids.push(call_context);
+            if debug_enabled {
+                merge_inline_ids.push(call_context);
+            }
         } else if phi_incoming.len() > 1 {
             // Multiple return paths: need a Phi node
             merge_instructions.push(Instruction::Phi {
@@ -6800,7 +6808,9 @@ fn inline_call_site(
                 incoming: phi_incoming,
             });
             merge_spans.push(crate::common::source::Span::dummy());
-            merge_inline_ids.push(call_context);
+            if debug_enabled {
+                merge_inline_ids.push(call_context);
+            }
         }
         // If phi_incoming is empty, the callee never returns a value (e.g., all paths
         // are noreturn/unreachable). The call_dest will be undefined, which is fine

@@ -1619,7 +1619,14 @@ fn place_pred_copies(block: &mut BasicBlock, copies: Vec<Instruction>) {
     }
     insts.extend(tail);
     new_spans.extend(tail_spans);
-    new_ids.extend(tail_ids);
+    if tracked {
+        new_ids.extend(tail_ids);
+    } else {
+        // Untracked blocks carry no debug arrays; handing replace_insts_inline
+        // a nonempty id list alongside empty spans would fail its pairing
+        // debug assertion (the phi-placement unit tests run with assertions on).
+        new_ids.clear();
+    }
     block.replace_insts_inline(insts, new_spans, new_ids);
 }
 
