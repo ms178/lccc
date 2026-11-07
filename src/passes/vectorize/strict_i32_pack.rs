@@ -215,6 +215,7 @@ mod tests {
                 .collect(),
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         }
     }
 

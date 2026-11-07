@@ -288,6 +288,7 @@ GDB_GATE_SCRIPTS = frozenset({
     "tests/regression/check_dwarf_delivery.py",
     "tests/regression/check_dwarf_parameters.py",
     "tests/regression/check_dwarf_locals.py",
+    "tests/regression/check_dwarf_inlining.py",
 })
 
 

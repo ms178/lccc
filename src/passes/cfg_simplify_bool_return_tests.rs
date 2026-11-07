@@ -22,6 +22,7 @@ fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> 
     BasicBlock {
         label: BlockId(label),
         source_spans: vec![Span::dummy(); instructions.len()],
+        source_inline_ids: Vec::new(),
         instructions,
         terminator,
     }

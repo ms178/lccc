@@ -1180,6 +1180,18 @@ gate "dwarf-versions" fast \
         --lccc-arm target/fastbuild/lccc-arm \
         --lccc-riscv target/fastbuild/lccc-riscv \
         --gcc "${GCC16:-gcc-16}"
+# D6: the inline tree is a debugger contract, not a DIE count -- abstract
+# origins, nested instances, call sites and ranges across every target/dialect,
+# GAS delivery, host negatives and GDB frames/breakpoint/step.
+gate "dwarf-inlining-selftest" fast \
+    python3 tests/regression/check_dwarf_inlining.py --lccc "$LCCC" --self-test
+gate "dwarf-inlining" fast \
+    python3 tests/regression/check_dwarf_inlining.py \
+        --lccc "$LCCC" --lccc-i686 target/fastbuild/lccc-i686 \
+        --lccc-arm target/fastbuild/lccc-arm \
+        --lccc-riscv target/fastbuild/lccc-riscv \
+        --gdb "${GDB:-gdb}" --gcc "${GCC16:-gcc-16}" \
+        --json target/dwarf-inlining.json
 # RVC: .text and relocations byte-identical to GNU as on RV64 and RV32
 # (spelling-based compression, branch relaxation, `li`); SKIP without
 # riscv64 binutils.

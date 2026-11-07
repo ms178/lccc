@@ -53,6 +53,10 @@ pub enum Operand {
     Const(IrConst),
 }
 
+/// Sentinel for [`BasicBlock::source_inline_ids`]: the instruction belongs to
+/// the concrete function itself, not to an inlined callee.
+pub const NO_INLINE_INSTANCE: u32 = u32::MAX;
+
 /// A basic block in the CFG.
 #[derive(Debug, Clone)]
 pub struct BasicBlock {
@@ -63,6 +67,14 @@ pub struct BasicBlock {
     /// Used by the backend to emit .file/.loc directives when compiling with -g.
     /// Empty when debug info is not being tracked (non-debug builds).
     pub source_spans: Vec<Span>,
+    /// Inline provenance for each instruction, parallel to `source_spans` and
+    /// `instructions` when present. Each entry is an index into
+    /// [`crate::ir::module::IrFunction::debug_inline_instances`], or
+    /// [`NO_INLINE_INSTANCE`] for the concrete function's own code. Empty when
+    /// no inline provenance is tracked (the common case: no `-g`, or no inlined
+    /// calls). The IR verifier checks the three-way pairing after every pass;
+    /// the span-preserving edit primitives below keep it intact.
+    pub source_inline_ids: Vec<u32>,
 }
 
 /// Span-preserving edits.
@@ -83,6 +95,23 @@ impl BasicBlock {
     #[inline]
     pub fn spans_parallel(&self) -> bool {
         !self.source_spans.is_empty() && self.source_spans.len() == self.instructions.len()
+    }
+
+    /// Inline provenance is tracked and parallel to the instructions/spans.
+    #[inline]
+    pub fn inline_ids_parallel(&self) -> bool {
+        !self.source_inline_ids.is_empty()
+            && self.source_inline_ids.len() == self.instructions.len()
+            && self.spans_parallel()
+    }
+
+    /// Provenance is well-formed: either empty (every instruction is concrete)
+    /// or a dense parallel array.  A pass that creates a fresh concrete block
+    /// need not materialize an all-sentinel array; only a nonempty drifted list
+    /// is malformed.
+    #[inline]
+    pub fn inline_ids_consistent(&self) -> bool {
+        self.source_inline_ids.is_empty() || self.inline_ids_parallel()
     }
 
     /// Whether an insertion carrying `span` keeps (or starts) the pairing: the
@@ -107,12 +136,56 @@ impl BasicBlock {
         }
     }
 
+    /// The inline instance of instruction `at`, or [`NO_INLINE_INSTANCE`].
+    #[inline]
+    pub fn inline_id_at(&self, at: usize) -> u32 {
+        if self.inline_ids_parallel() {
+            self.source_inline_ids[at]
+        } else {
+            NO_INLINE_INSTANCE
+        }
+    }
+
+    /// Provenance a synthesized instruction inherits when inserted at `at`:
+    /// the instruction it lands before, or the previous one at the end. A pass
+    /// that materializes part of an inlined statement stays inside that
+    /// instance; caller-side bridge code is inserted with an explicit id.
+    #[inline]
+    fn inherited_inline_id(&self, at: usize) -> u32 {
+        if !self.inline_ids_parallel() {
+            return NO_INLINE_INSTANCE;
+        }
+        let idx = at.min(self.source_inline_ids.len().saturating_sub(1));
+        self.source_inline_ids
+            .get(idx)
+            .copied()
+            .unwrap_or(NO_INLINE_INSTANCE)
+    }
+
     /// Insert `inst` before position `at` (`at == len` appends).
     pub fn insert_inst(&mut self, at: usize, inst: Instruction, span: Span) {
         let tracked = self.tracks_insertion(span);
+        let ids_valid = self.inline_ids_parallel();
+        let id = self.inherited_inline_id(at);
         self.instructions.insert(at, inst);
         if tracked {
             self.source_spans.insert(at, span);
+            if ids_valid {
+                self.source_inline_ids.insert(at, id);
+            }
+        }
+    }
+
+    /// Insert `inst` before position `at` with explicit inline provenance.
+    pub fn insert_inst_inline(&mut self, at: usize, inst: Instruction, span: Span, inline_id: u32) {
+        let tracked = self.tracks_insertion(span);
+        let ids_valid = self.inline_ids_parallel();
+        self.instructions.insert(at, inst);
+        if tracked {
+            self.source_spans.insert(at, span);
+            if ids_valid {
+                self.source_inline_ids.insert(at, inline_id);
+            }
         }
     }
 
@@ -125,12 +198,18 @@ impl BasicBlock {
         span: Span,
     ) {
         let tracked = self.tracks_insertion(span);
+        let ids_valid = self.inline_ids_parallel();
+        let id = self.inherited_inline_id(at);
         let before = self.instructions.len();
         self.instructions.splice(at..at, insts);
         if tracked {
             let added = self.instructions.len() - before;
             self.source_spans
                 .splice(at..at, std::iter::repeat_n(span, added));
+            if ids_valid {
+                self.source_inline_ids
+                    .splice(at..at, std::iter::repeat_n(id, added));
+            }
         }
     }
 
@@ -143,51 +222,74 @@ impl BasicBlock {
     /// Append every instruction of `insts`, each with `span`.
     pub fn extend_insts(&mut self, insts: impl IntoIterator<Item = Instruction>, span: Span) {
         let tracked = self.tracks_insertion(span);
+        let ids_valid = self.inline_ids_parallel();
+        let id = self.inherited_inline_id(self.instructions.len());
         let before = self.instructions.len();
         self.instructions.extend(insts);
         if tracked {
             let added = self.instructions.len() - before;
             self.source_spans.extend(std::iter::repeat_n(span, added));
+            if ids_valid {
+                self.source_inline_ids
+                    .extend(std::iter::repeat_n(id, added));
+            }
         }
     }
 
-    /// Remove and return instruction `at` (and its span).
+    /// Remove and return instruction `at` (and its span/provenance).
     pub fn remove_inst(&mut self, at: usize) -> Instruction {
+        let ids_valid = self.inline_ids_parallel();
         if self.spans_parallel() {
             self.source_spans.remove(at);
+            if ids_valid {
+                self.source_inline_ids.remove(at);
+            }
         }
         self.instructions.remove(at)
     }
 
     /// Replace instruction `at` by `insts`; each replacement inherits the
-    /// replaced instruction's span (they implement the same source construct).
+    /// replaced instruction's span and provenance (they implement the same
+    /// source construct).
     pub fn splice_inst(&mut self, at: usize, insts: Vec<Instruction>) {
         let tracked = self.spans_parallel();
+        let ids_valid = self.inline_ids_parallel();
         let span = self.span_at(at);
+        let id = self.inline_id_at(at);
         let n = insts.len();
         self.instructions.splice(at..=at, insts);
         if tracked {
             self.source_spans
                 .splice(at..=at, std::iter::repeat_n(span, n));
+            if ids_valid {
+                self.source_inline_ids
+                    .splice(at..=at, std::iter::repeat_n(id, n));
+            }
         }
     }
 
     /// Replace the whole body with synthesized instructions.  A tracked
     /// block stays tracked (every new instruction gets `Span::dummy()`, so
     /// it emits no `.loc` of its own); an untracked block stays untracked.
+    /// Synthesized code has no proven provenance, so inline ids are dropped.
     pub fn replace_insts_synthesized(&mut self, insts: Vec<Instruction>) {
         let tracked = !self.source_spans.is_empty();
         self.source_spans.clear();
+        self.source_inline_ids.clear();
         if tracked {
             self.source_spans.resize(insts.len(), Span::dummy());
         }
         self.instructions = insts;
     }
 
-    /// Remove the instructions in `range` (and their spans, when parallel).
+    /// Remove the instructions in `range` (and their spans/provenance).
     pub fn remove_insts(&mut self, range: std::ops::Range<usize>) {
+        let ids_valid = self.inline_ids_parallel();
         if self.spans_parallel() {
             self.source_spans.drain(range.clone());
+            if ids_valid {
+                self.source_inline_ids.drain(range.clone());
+            }
         }
         self.instructions.drain(range);
     }
@@ -197,46 +299,85 @@ impl BasicBlock {
     /// sides track; an untracked side contributes dummy spans to a tracked
     /// one, and an untracked non-empty `self` stays untracked.
     pub fn append_spanned(&mut self, insts: Vec<Instruction>, spans: Vec<Span>) {
+        self.append_spanned_inline(insts, spans, Vec::new());
+    }
+
+    /// [`Self::append_spanned`] with explicit incoming inline provenance.
+    pub fn append_spanned_inline(
+        &mut self,
+        insts: Vec<Instruction>,
+        spans: Vec<Span>,
+        inline_ids: Vec<u32>,
+    ) {
         let incoming_tracked = !spans.is_empty() && spans.len() == insts.len();
+        let incoming_inline = !inline_ids.is_empty() && inline_ids.len() == insts.len();
         let self_empty = self.instructions.is_empty() && self.source_spans.is_empty();
         if self.spans_parallel() || (self_empty && incoming_tracked) {
+            let self_inline = self.inline_ids_parallel();
             if incoming_tracked {
                 self.source_spans.extend(spans);
             } else {
                 self.source_spans
                     .extend(std::iter::repeat_n(Span::dummy(), insts.len()));
             }
+            if self_inline || (self_empty && incoming_inline) {
+                if incoming_inline {
+                    self.source_inline_ids.extend(inline_ids);
+                } else {
+                    self.source_inline_ids
+                        .extend(std::iter::repeat_n(NO_INLINE_INSTANCE, insts.len()));
+                }
+            }
         }
         self.instructions.extend(insts);
     }
 
-    /// Remove every instruction (and span).
+    /// Remove every instruction (and span/provenance).
     pub fn clear_insts(&mut self) {
         self.instructions.clear();
         self.source_spans.clear();
+        self.source_inline_ids.clear();
     }
 
-    /// Keep the instructions for which `keep` holds, with their spans.
+    /// Keep the instructions for which `keep` holds, with their spans and
+    /// provenance.
     pub fn retain_insts(&mut self, mut keep: impl FnMut(&Instruction) -> bool) {
         if !self.spans_parallel() {
             self.instructions.retain(keep);
             return;
         }
+        let ids_valid = self.inline_ids_parallel();
         let mut flags = Vec::with_capacity(self.instructions.len());
         self.instructions.retain(|inst| {
             let k = keep(inst);
             flags.push(k);
             k
         });
-        let mut it = flags.into_iter();
+        let mut it = flags.iter().copied();
         self.source_spans.retain(|_| it.next().unwrap_or(false));
+        if ids_valid {
+            let mut it = flags.into_iter();
+            self.source_inline_ids
+                .retain(|_| it.next().unwrap_or(false));
+        }
     }
 
     /// Replace the whole instruction list by `insts` with `spans` computed in
     /// parallel (empty when the block is untracked). Rebuilding passes take
     /// the old spans with [`BasicBlock::take_parallel_spans`], map them along
-    /// with the instructions, and hand both back here.
+    /// with the instructions, and hand both back here. Provenance is dropped
+    /// unless the caller uses [`Self::replace_insts_inline`].
     pub fn replace_insts(&mut self, insts: Vec<Instruction>, spans: Vec<Span>) {
+        self.replace_insts_inline(insts, spans, Vec::new());
+    }
+
+    /// [`Self::replace_insts`] with rebuilt inline provenance.
+    pub fn replace_insts_inline(
+        &mut self,
+        insts: Vec<Instruction>,
+        spans: Vec<Span>,
+        inline_ids: Vec<u32>,
+    ) {
         let paired = spans.is_empty() || spans.len() == insts.len();
         debug_assert!(
             paired,
@@ -244,10 +385,22 @@ impl BasicBlock {
             spans.len(),
             insts.len()
         );
+        let inline_paired = inline_ids.is_empty() || inline_ids.len() == insts.len();
+        debug_assert!(
+            inline_paired,
+            "replace_insts: {} inline ids for {} instructions",
+            inline_ids.len(),
+            insts.len()
+        );
         self.instructions = insts;
         // A caller bug must not become an ICE over line-table metadata: an
         // unpaired list degrades to untracked, which the verifier accepts.
         self.source_spans = if paired { spans } else { Vec::new() };
+        self.source_inline_ids = if paired && inline_paired && self.spans_parallel() {
+            inline_ids
+        } else {
+            Vec::new()
+        };
     }
 
     /// Take the spans for a rebuild: the parallel list, or empty when the
@@ -259,6 +412,39 @@ impl BasicBlock {
             std::mem::take(&mut self.source_spans)
         } else {
             self.source_spans.clear();
+            self.source_inline_ids.clear();
+            Vec::new()
+        }
+    }
+
+    /// Take BOTH parallel debug arrays for a rebuild, atomically.
+    ///
+    /// Calling [`Self::take_parallel_spans`] first would make
+    /// [`Self::inline_ids_parallel`] false (the spans are gone) and silently
+    /// discard provenance.  Rebuild passes must use this pair instead.
+    pub fn take_parallel_debug(&mut self) -> (Vec<Span>, Vec<u32>) {
+        if self.spans_parallel() {
+            let ids = if self.inline_ids_parallel() {
+                std::mem::take(&mut self.source_inline_ids)
+            } else {
+                self.source_inline_ids.clear();
+                Vec::new()
+            };
+            (std::mem::take(&mut self.source_spans), ids)
+        } else {
+            self.source_spans.clear();
+            self.source_inline_ids.clear();
+            (Vec::new(), Vec::new())
+        }
+    }
+
+    /// Take the inline provenance for a rebuild, alongside
+    /// [`Self::take_parallel_spans`].
+    pub fn take_parallel_inline_ids(&mut self) -> Vec<u32> {
+        if self.inline_ids_parallel() {
+            std::mem::take(&mut self.source_inline_ids)
+        } else {
+            self.source_inline_ids.clear();
             Vec::new()
         }
     }
@@ -1801,6 +1987,7 @@ mod span_edit_tests {
             } else {
                 Vec::new()
             },
+            source_inline_ids: Vec::new(),
             terminator: Terminator::Return(None),
         }
     }
@@ -1818,6 +2005,64 @@ mod span_edit_tests {
         let mut b = block(&[1], false);
         b.insert_insts(0, [inst(2), inst(3)], sp(2));
         assert!(b.source_spans.is_empty());
+    }
+
+    /// The exact shape the inliner's merge block is built from: an empty
+    /// block absorbs the post-call tail (`append_spanned_inline`) and then
+    /// gets one synthesized result def at the front (`insert_inst_inline`).
+    /// All three tracking states must survive it, because the old hand-rolled
+    /// three-vector build pushed a lone dummy span for the result and left
+    /// `1` span for `1 + N` instructions whenever the tail was untracked.
+    #[test]
+    fn merge_block_shape_keeps_the_sparse_or_parallel_law() {
+        const CTX: u32 = 7;
+        for tracked in [false, true] {
+            for dense_ids in [false, true] {
+                let tail = block(&[1, 2, 3], tracked);
+                let tail_ids: Vec<u32> = if tracked && dense_ids {
+                    vec![11, 12, 13]
+                } else {
+                    Vec::new()
+                };
+                let mut merge = BasicBlock {
+                    label: BlockId(9),
+                    instructions: Vec::new(),
+                    source_spans: Vec::new(),
+                    source_inline_ids: Vec::new(),
+                    terminator: Terminator::Return(None),
+                };
+                merge.append_spanned_inline(
+                    tail.instructions.clone(),
+                    tail.source_spans.clone(),
+                    tail_ids.clone(),
+                );
+                merge.insert_inst_inline(0, inst(0), Span::dummy(), CTX);
+                assert_eq!(ids(&merge), vec![0, 1, 2, 3]);
+                if tracked {
+                    assert!(
+                        merge.spans_parallel(),
+                        "spans drifted ({tracked}, {dense_ids})"
+                    );
+                    assert_eq!(merge.source_spans[0], Span::dummy());
+                    assert_eq!(&merge.source_spans[1..], &tail.source_spans[..]);
+                } else {
+                    assert!(
+                        merge.source_spans.is_empty(),
+                        "untracked tail became tracked"
+                    );
+                }
+                if tracked && dense_ids {
+                    assert!(merge.inline_ids_parallel());
+                    assert_eq!(merge.source_inline_ids, vec![CTX, 11, 12, 13]);
+                } else {
+                    assert!(
+                        merge.source_inline_ids.is_empty(),
+                        "sparse ids were densified"
+                    );
+                }
+                assert!(merge.inline_ids_consistent());
+            }
+        }
     }
 
     #[test]
@@ -1933,6 +2178,57 @@ mod span_edit_tests {
         b.replace_insts(vec![inst(1), inst(2)], vec![sp(1)]);
         assert_eq!(ids(&b), vec![1, 2]);
         assert!(b.source_spans.is_empty());
+    }
+
+    #[test]
+    fn inline_ids_follow_valid_edits_and_leave_drift_visible() {
+        let mut b = block(&[1, 2, 3], true);
+        b.source_inline_ids = vec![10, 11, 12];
+        b.insert_inst(1, inst(4), sp(4));
+        assert_eq!(b.source_inline_ids, vec![10, 11, 11, 12]);
+        b.insert_inst_inline(0, inst(5), sp(5), 99);
+        assert_eq!(b.source_inline_ids, vec![99, 10, 11, 11, 12]);
+        b.push_inst(inst(6), sp(6));
+        assert_eq!(b.source_inline_ids, vec![99, 10, 11, 11, 12, 12]);
+        b.splice_inst(2, vec![inst(7), inst(8)]);
+        assert_eq!(b.source_inline_ids, vec![99, 10, 11, 11, 11, 12, 12]);
+        b.remove_inst(1);
+        assert_eq!(b.source_inline_ids, vec![99, 11, 11, 11, 12, 12]);
+        b.retain_insts(|_| true);
+        b.remove_insts(0..2);
+        assert_eq!(b.source_inline_ids, vec![11, 11, 12, 12]);
+        b.extend_insts([inst(9)], sp(9));
+        assert_eq!(b.source_inline_ids, vec![11, 11, 12, 12, 12]);
+        b.insert_insts(1, [inst(10), inst(11)], sp(10));
+        assert_eq!(b.source_inline_ids, vec![11, 11, 11, 11, 12, 12, 12]);
+        assert!(b.inline_ids_parallel());
+
+        // A pre-existing drifted id array is not padded, truncated or cleared
+        // by a local edit.  The verifier must still see the producer's drift.
+        b.source_inline_ids.pop();
+        let drift = b.source_inline_ids.clone();
+        b.insert_inst(0, inst(12), sp(12));
+        b.push_inst(inst(13), sp(13));
+        b.insert_insts(0, [inst(14)], sp(14));
+        b.extend_insts([inst(15)], sp(15));
+        b.splice_inst(0, vec![inst(16)]);
+        b.remove_inst(0);
+        b.retain_insts(|i| i.dest() != Some(Value(15)));
+        b.remove_insts(0..1);
+        assert_eq!(b.source_inline_ids, drift);
+        assert!(!b.inline_ids_consistent());
+
+        // Sparse concrete provenance stays sparse; edits do not materialize an
+        // all-sentinel array.
+        let mut c = block(&[1, 2], true);
+        c.insert_inst(1, inst(3), sp(3));
+        c.push_inst(inst(4), sp(4));
+        c.splice_inst(0, vec![inst(5)]);
+        c.remove_inst(0);
+        c.retain_insts(|_| true);
+        c.extend_insts([inst(6)], sp(6));
+        assert!(c.source_inline_ids.is_empty());
+        assert!(c.inline_ids_consistent());
     }
 
     /// Seeded random edit sequences, checked after every step against a model

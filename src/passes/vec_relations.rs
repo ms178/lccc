@@ -475,9 +475,10 @@ fn run_function(func: &mut IrFunction, families: &[Family]) -> usize {
     let mut count = 0;
     for block in &mut func.blocks {
         let mut defs = FxHashMap::default();
+        let (spans, ids) = block.take_parallel_debug();
         let old = std::mem::take(&mut block.instructions);
-        let spans = std::mem::take(&mut block.source_spans);
-        let keep_spans = spans.len() == old.len();
+        let keep_spans = !spans.is_empty();
+        let keep_ids = !ids.is_empty();
         for (index, inst) in old.into_iter().enumerate() {
             let replacement = fold(&inst, &defs, &uses, families, Value(next));
             let emitted = if let Some(replacement) = replacement {
@@ -496,6 +497,9 @@ fn run_function(func: &mut IrFunction, families: &[Family]) -> usize {
                 block.instructions.push(inst);
                 if keep_spans {
                     block.source_spans.push(spans[index]);
+                }
+                if keep_ids {
+                    block.source_inline_ids.push(ids[index]);
                 }
             }
         }

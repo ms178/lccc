@@ -253,15 +253,15 @@ pub(crate) fn eliminate_dead_aggregate_field_stores(func: &mut IrFunction) -> us
     }
     let mut changes = 0;
     for block in &mut func.blocks {
+        let (old_spans, old_ids) = block.take_parallel_debug();
         let old = std::mem::take(&mut block.instructions);
-        let old_spans = std::mem::take(&mut block.source_spans);
-        // Spans are only trustworthy when they parallel the instruction list
-        // 1:1 (upstream convention, see dce.rs). Other passes may insert
-        // instructions without maintaining spans; indexing old_spans[ii]
-        // with a mismatched length was an out-of-bounds ICE.
-        let has_spans = old_spans.len() == old.len();
+        // Take both debug arrays atomically while the block is still intact:
+        // spans and inline ids are either parallel together or absent together.
+        let has_spans = !old_spans.is_empty();
+        let has_ids = !old_ids.is_empty();
         let mut kept = Vec::with_capacity(old.len());
         let mut spans = Vec::with_capacity(old_spans.len());
+        let mut ids = Vec::with_capacity(old_ids.len());
         for (ii, inst) in old.into_iter().enumerate() {
             let dead = if let Instruction::Store { ptr, ty, .. } = &inst {
                 if let Some((root, Some(off))) = root_suffix.get(&ptr.0) {
@@ -289,11 +289,11 @@ pub(crate) fn eliminate_dead_aggregate_field_stores(func: &mut IrFunction) -> us
             if has_spans {
                 spans.push(old_spans[ii]);
             }
+            if has_ids {
+                ids.push(old_ids[ii]);
+            }
         }
-        block.instructions = kept;
-        if has_spans {
-            block.source_spans = spans;
-        }
+        block.replace_insts_inline(kept, spans, ids);
     }
     changes
 }
@@ -876,13 +876,10 @@ fn forward_store_only_temporaries(
             // can reach this hoist with a partially populated span vector;
             // moving the IR is still valid, but indexing that vector would
             // turn a recoverable metadata mismatch into a compiler ICE.
-            let spans_parallel = block.source_spans.len() == block.instructions.len();
-            let inst = block.instructions.remove(gep_idx);
-            block.instructions.insert(insert_at, inst);
-            if spans_parallel {
-                let span = block.source_spans.remove(gep_idx);
-                block.source_spans.insert(insert_at, span);
-            }
+            let span = block.span_at(gep_idx);
+            let id = block.inline_id_at(gep_idx);
+            let inst = block.remove_inst(gep_idx);
+            block.insert_inst_inline(insert_at, inst, span, id);
             // Indices recorded in `copies`/`def_site` for this block are
             // now stale; count the hoist as a change and let the caller's
             // fixed-point loop re-run the analysis on fresh indices.
@@ -1078,12 +1075,7 @@ fn forward_store_only_temporaries(
     let mut removals: Vec<(usize, usize)> = copies.values().map(|(b, i, _)| (*b, *i)).collect();
     removals.sort_unstable_by(|a, b| b.cmp(a));
     for (bi, ii) in removals {
-        let block = &mut func.blocks[bi];
-        let spans_parallel = block.source_spans.len() == block.instructions.len();
-        block.instructions.remove(ii);
-        if spans_parallel {
-            block.source_spans.remove(ii);
-        }
+        func.blocks[bi].remove_inst(ii);
         changes += 1;
     }
     changes
@@ -1460,12 +1452,14 @@ fn run_impl(
     }
     let mut changes = 0;
     for bi in 0..func.blocks.len() {
-        let old = std::mem::take(&mut func.blocks[bi].instructions);
-        let old_spans = std::mem::take(&mut func.blocks[bi].source_spans);
-        // Same 1:1 length requirement as above (mismatch => drop spans, never index OOB).
-        let has_spans = old_spans.len() == old.len();
+        let block = &mut func.blocks[bi];
+        let (old_spans, old_ids) = block.take_parallel_debug();
+        let old = std::mem::take(&mut block.instructions);
+        let has_spans = !old_spans.is_empty();
+        let has_ids = !old_ids.is_empty();
         let mut out = Vec::with_capacity(old.len());
-        let mut spans = Vec::with_capacity(16);
+        let mut spans = Vec::with_capacity(old.len());
+        let mut ids = Vec::with_capacity(old.len());
         for (ii, mut inst) in old.into_iter().enumerate() {
             if let Instruction::Memcpy { dest, .. } = &inst {
                 if candidates
@@ -1506,6 +1500,9 @@ fn run_impl(
                         if has_spans {
                             spans.push(old_spans[ii]);
                         }
+                        if has_ids {
+                            ids.push(old_ids[ii]);
+                        }
                         base = dest;
                     }
                     *ptr = base;
@@ -1516,11 +1513,11 @@ fn run_impl(
             if has_spans {
                 spans.push(old_spans[ii]);
             }
+            if has_ids {
+                ids.push(old_ids[ii]);
+            }
         }
-        func.blocks[bi].instructions = out;
-        if has_spans {
-            func.blocks[bi].source_spans = spans;
-        }
+        block.replace_insts_inline(out, spans, ids);
     }
     changes + reverse_changes + eliminate_dead_aggregate_field_stores(func)
 }
@@ -1582,6 +1579,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
 
         assert_eq!(run(&mut func), 0);
@@ -1652,6 +1650,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
 
         assert_eq!(forward_store_only_temporaries(&mut func, None), 0);
@@ -1670,6 +1669,7 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
             instructions: vec![
                 Instruction::Alloca {
                     dest: Value(0),
@@ -1716,6 +1716,7 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
             instructions: vec![
                 Instruction::GlobalAddr {
                     dest: Value(1),
@@ -1751,6 +1752,7 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
             instructions: vec![
                 Instruction::GlobalAddr {
                     dest: Value(1),
@@ -1796,12 +1798,14 @@ mod tests {
             BasicBlock {
                 label: BlockId(0),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
                 instructions: vec![alloca(0, 4)],
                 terminator: Terminator::Branch(BlockId(2)),
             },
             BasicBlock {
                 label: BlockId(2),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
                 instructions: vec![Instruction::Copy {
                     dest: Value(2),
                     src: Operand::Value(Value(0)),
@@ -1811,6 +1815,7 @@ mod tests {
             BasicBlock {
                 label: BlockId(1),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
                 instructions: vec![
                     Instruction::GlobalAddr {
                         dest: Value(1),
@@ -1851,6 +1856,7 @@ mod tests {
             BasicBlock {
                 label: BlockId(0),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
                 instructions: vec![
                     Instruction::GlobalAddr {
                         dest: Value(1),
@@ -1863,6 +1869,7 @@ mod tests {
             BasicBlock {
                 label: BlockId(2),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
                 instructions: vec![Instruction::Copy {
                     dest: Value(2),
                     src: Operand::Value(Value(0)),
@@ -1872,6 +1879,7 @@ mod tests {
             BasicBlock {
                 label: BlockId(1),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
                 instructions: vec![
                     Instruction::Store {
                         volatile: false,
@@ -1919,6 +1927,7 @@ mod tests {
             func.blocks.push(BasicBlock {
                 label: BlockId(0),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
                 instructions: vec![
                     Instruction::GlobalAddr {
                         dest: Value(0),
@@ -2043,6 +2052,7 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
             instructions: vec![
                 alloca(0),
                 alloca(1),
@@ -2125,6 +2135,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
 
         assert_eq!(forward_store_only_temporaries(&mut func, None), 0);
@@ -2185,6 +2196,7 @@ mod tests {
             // Deliberately not one-to-one with instructions: this is the
             // shape observed in the kernel's execmem_init_missing function.
             source_spans: vec![crate::common::source::Span::dummy()],
+            source_inline_ids: Vec::new(),
         });
 
         assert_eq!(forward_store_only_temporaries(&mut func, None), 1);
@@ -2194,6 +2206,62 @@ mod tests {
             func.blocks[0].instructions[2],
             Instruction::GetElementPtr { dest: Value(2), .. }
         ));
+    }
+
+    #[test]
+    fn hoist_carries_inline_provenance_with_the_moved_gep() {
+        let mut func = IrFunction::new("parallel_spans".into(), IrType::I32, vec![], false);
+        func.next_value_id = 3;
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Const(IrConst::I32(7)),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(2),
+                    base: Value(1),
+                    offset: Operand::Const(IrConst::I64(0)),
+                    ty: IrType::I32,
+                },
+                Instruction::Memcpy {
+                    dest: Value(2),
+                    src: Value(0),
+                    size: 4,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            source_spans: vec![crate::common::source::Span::dummy(); 5],
+            source_inline_ids: vec![1, 2, 3, 4, 5],
+        });
+        assert_eq!(forward_store_only_temporaries(&mut func, None), 1);
+        let b = &func.blocks[0];
+        assert!(matches!(
+            b.instructions[2],
+            Instruction::GetElementPtr { dest: Value(2), .. }
+        ));
+        assert_eq!(b.source_inline_ids, vec![1, 2, 4, 3, 5]);
+        assert!(b.inline_ids_consistent());
     }
 
     /// `store tmp1; memcpy tmp2 <- tmp1; memcpy obj <- tmp2; load obj`:
@@ -2218,6 +2286,7 @@ mod tests {
             instructions: vec![alloca(0), alloca(1), alloca(2)],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -2249,6 +2318,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
 
         for _ in 0..8 {
@@ -2345,6 +2415,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
 
         assert_eq!(run(&mut func), 0);
@@ -2481,6 +2552,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(loaded)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
 
         assert!(run(&mut func) > 0);

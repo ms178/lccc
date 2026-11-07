@@ -250,12 +250,12 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     }
     for (header, phi) in additions {
         let b = &mut func.blocks[header];
-        let tracked = !b.source_spans.is_empty();
-        b.instructions.insert(0, phi);
-        if tracked {
-            b.source_spans
-                .insert(0, crate::common::source::Span::dummy());
-        }
+        b.insert_inst_inline(
+            0,
+            phi,
+            crate::common::source::Span::dummy(),
+            crate::ir::instruction::NO_INLINE_INSTANCE,
+        );
     }
     plans.len()
 }

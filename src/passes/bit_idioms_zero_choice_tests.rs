@@ -181,6 +181,7 @@ fn copy_chains_are_transparent_without_new_ssa_or_producer_edits() {
         label: BlockId(0),
         instructions: insts,
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
         terminator: Terminator::Return(Some(v(4))),
     });
     f.next_value_id = 8;

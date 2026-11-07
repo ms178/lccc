@@ -18,6 +18,7 @@ fn fixture(op: IrBinOp, ty: IrType, iv_ty: IrType, n: u64, seed: u64) -> IrFunct
             }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         },
         BasicBlock {
             label: BlockId(1),
@@ -52,6 +53,7 @@ fn fixture(op: IrBinOp, ty: IrType, iv_ty: IrType, n: u64, seed: u64) -> IrFunct
                 false_label: BlockId(3),
             },
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         },
         BasicBlock {
             label: BlockId(2),
@@ -80,12 +82,14 @@ fn fixture(op: IrBinOp, ty: IrType, iv_ty: IrType, n: u64, seed: u64) -> IrFunct
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         },
         BasicBlock {
             label: BlockId(3),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         },
     ];
     f.next_value_id = 7;
@@ -692,18 +696,21 @@ fn inner_loop_in_noneligible_outer_loop() {
             false_label: BlockId(5),
         },
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     });
     f.blocks.push(BasicBlock {
         label: BlockId(5),
         instructions: vec![],
         terminator: Terminator::Return(Some(Operand::Value(Value(8)))),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     });
     f.blocks.push(BasicBlock {
         label: BlockId(6),
         instructions: vec![],
         terminator: Terminator::Branch(BlockId(1)),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     });
     f.next_value_id = 11;
     f.next_label = 7;
@@ -893,6 +900,7 @@ fn upstream_block_budget_rejects_without_mutation() {
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Const(IrConst::from_i64(0, IrType::U64)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
     }
     f.next_label = f.blocks.len() as u32;

@@ -541,12 +541,12 @@ def check_target(name: str, compiler: str, machine: int, readelf: str,
 def check_oracle(gcc: str, source: Path, root: Path, lccc_elf, version: int) -> dict:
     """Each compiler must agree with its own DIE tree; shared names must match.
 
-    Comparing the two published sets directly would be wrong: at -O2 GCC keeps
-    a DIE for a fully-inlined static (`helper`) and lccc emits none, so the name
-    legitimately exists in only one of them.  The invariant that *is* universal
-    is "publish exactly the publishable names of your own tree", checked here
-    for both compilers, plus "every name both trees contain is published by
-    both".
+    The invariant is "publish exactly the publishable names of your own tree",
+    checked here for both compilers, plus "every name both trees contain is
+    published by both".  At -O2 both GCC and lccc keep an abstract DIE for the
+    fully-inlined static `helper` (D6), so the shared name set includes it; a
+    compiler that inlines a helper away entirely may legitimately publish fewer
+    names, which is why the direct set comparison is not the oracle.
     """
     out = root / f"gcc-{version}.o"
     proc = run([gcc, f"-gdwarf-{version}", "-g", "-gpubnames", "-O2",

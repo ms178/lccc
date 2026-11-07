@@ -5429,21 +5429,37 @@ fn build_and_emit_dwarf_file_table(
         table.insert(name.to_string(), 1);
         next_id = 2;
     }
+    let mut add_span = |span: crate::common::source::Span| {
+        if span.start == 0 && span.end == 0 {
+            return;
+        }
+        let loc = sm.resolve_span(span);
+        if let Entry::Vacant(e) = table.entry(loc.file) {
+            e.insert(next_id);
+            next_id += 1;
+        }
+    };
     for func in &module.functions {
         if func.is_declaration {
             continue;
         }
         for block in &func.blocks {
             for span in &block.source_spans {
-                if span.start == 0 && span.end == 0 {
-                    continue;
-                }
-                let loc = sm.resolve_span(*span);
-                if let Entry::Vacant(e) = table.entry(loc.file) {
-                    e.insert(next_id);
-                    next_id += 1;
-                }
+                add_span(*span);
             }
+        }
+        // Inline instances name a call file and a declarator file in
+        // `.debug_info` (`DW_AT_call_file` / abstract-origin `decl_file`).
+        // A system-header inline can survive with no instruction `.loc` in
+        // that header (every body row folded into the caller or became a
+        // builtin), so spans alone omit the file and the writer rightly
+        // refuses to emit a call-file index into a table that lacks it.
+        // GCC keeps the header in the line file table for the same reason.
+        add_span(func.decl_span);
+        add_span(func.body_span);
+        for instance in &func.debug_inline_instances {
+            add_span(instance.call_span);
+            add_span(instance.decl_span);
         }
     }
 
@@ -7029,6 +7045,8 @@ fn generate_function_body(
 
     let emit_debug = debug_rows_enabled(cg, source_mgr, file_table);
     let mut last_debug_row = EmittedRow::default();
+    let mut active_inline_markers: Vec<(u32, u32)> = Vec::new();
+    let mut inline_marker_serial = 0u32;
     cg.state().current_program_point = 0;
     // Blocks whose address is observable. Fall-through elision of an empty
     // one would make `&&label` compare equal to the next label. CFG merge
@@ -7521,6 +7539,13 @@ fn generate_function_body(
             }
 
             if emit_debug {
+                transition_inline_markers(
+                    cg,
+                    func,
+                    &mut active_inline_markers,
+                    &mut inline_marker_serial,
+                    block.inline_id_at(idx),
+                );
                 if let Some(span) = block.source_spans.get(idx) {
                     emit_loc_directive(
                         cg,
@@ -7904,6 +7929,14 @@ fn generate_function_body(
         let mut closing_row = None;
         if emit_debug {
             let sm = source_mgr.expect("debug mode requires source manager");
+            transition_inline_markers(
+                cg,
+                func,
+                &mut active_inline_markers,
+                &mut inline_marker_serial,
+                func.terminator_spans
+                    .inline_of(block.label, &block.terminator),
+            );
             if let Some(span) = func
                 .terminator_spans
                 .span_of(block.label, &block.terminator)
@@ -8010,6 +8043,15 @@ fn generate_function_body(
                 last_debug_row.span = None;
             }
         }
+        if emit_debug {
+            transition_inline_markers(
+                cg,
+                func,
+                &mut active_inline_markers,
+                &mut inline_marker_serial,
+                crate::ir::instruction::NO_INLINE_INSTANCE,
+            );
+        }
         cg.state().current_program_point += 1;
     }
 
@@ -8064,6 +8106,71 @@ struct EmittedRow {
     file: u32,
     line: u32,
     column: u32,
+}
+
+/// Zero-width marker label naming one end of an inline instance's concrete
+/// address range. The assembler records these as data for the DWARF writer;
+/// GAS treats them as ordinary local labels (the `.debug_info` payload is
+/// already present in `-S` output), so they emit no bytes and survive both
+/// delivery paths.
+fn inline_marker_label(begin: bool, function: &str, id: u32, serial: u32) -> String {
+    format!(
+        ".Llccc_inline_{}_{}_{}_{}",
+        if begin { 'b' } else { 'e' },
+        id,
+        serial,
+        function
+    )
+}
+
+/// The active inline stack for an instruction's provenance id, outermost first.
+fn inline_chain(func: &IrFunction, id: u32) -> Vec<u32> {
+    let mut chain = Vec::new();
+    let mut cur = id;
+    while cur != crate::ir::instruction::NO_INLINE_INSTANCE {
+        let Some(instance) = func.debug_inline_instances.get(cur as usize) else {
+            break;
+        };
+        chain.push(cur);
+        cur = instance
+            .parent
+            .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE);
+    }
+    chain.reverse();
+    chain
+}
+
+/// Emit begin/end markers when the innermost inline instance changes. Parents
+/// stay open across their children, so a nested instance's range lies inside
+/// its parent's range exactly as the DWARF tree nests.
+fn transition_inline_markers(
+    cg: &mut dyn ArchCodegen,
+    func: &IrFunction,
+    active: &mut Vec<(u32, u32)>,
+    serial: &mut u32,
+    target: u32,
+) {
+    if func.debug_inline_instances.is_empty() {
+        return;
+    }
+    let chain = inline_chain(func, target);
+    let common = active
+        .iter()
+        .zip(chain.iter())
+        .take_while(|((id, _), next)| id == *next)
+        .count();
+    for &(id, s) in active[common..].iter().rev() {
+        let label = inline_marker_label(false, &func.name, id, s);
+        cg.state().emit_fmt(format_args!("{label}:"));
+    }
+    active.truncate(common);
+    for &id in &chain[common..] {
+        let s = *serial;
+        *serial = serial.saturating_add(1);
+        let label = inline_marker_label(true, &func.name, id, s);
+        cg.state().emit_fmt(format_args!("{label}:"));
+        active.push((id, s));
+    }
 }
 
 fn emit_loc_directive(
@@ -9575,6 +9682,7 @@ mod conditional_increment_tests {
             instructions,
             terminator: Terminator::Unreachable,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         function.next_value_id = 8;
         function
@@ -9783,6 +9891,7 @@ mod indexed_gep_machinst_gate_tests {
                 ],
                 terminator: Terminator::Branch(crate::ir::reexports::BlockId(2)),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: crate::ir::reexports::BlockId(1),
@@ -9795,6 +9904,7 @@ mod indexed_gep_machinst_gate_tests {
                 }],
                 terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: crate::ir::reexports::BlockId(2),
@@ -9806,6 +9916,7 @@ mod indexed_gep_machinst_gate_tests {
                 }],
                 terminator: Terminator::Branch(crate::ir::reexports::BlockId(1)),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             },
         ];
         function.next_value_id = 5;
@@ -10002,6 +10113,7 @@ mod reg_offset_sym_map_tests {
             instructions,
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }];
         function.next_value_id = 4;
         function
@@ -10090,6 +10202,7 @@ mod remat_call_arg_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         function.next_value_id = 8;
         function
@@ -10230,6 +10343,7 @@ mod remat_call_arg_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         function.next_value_id = 8;
         let set = build_rematerializable_global_addr_set_for(&function, &global_addr_map());
@@ -10258,6 +10372,7 @@ mod remat_call_arg_tests {
             }],
             terminator: Terminator::Return(Some(Operand::Value(Value(0)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         function.next_value_id = 8;
         let set = build_rematerializable_global_addr_set_for(&function, &global_addr_map());
@@ -10323,6 +10438,7 @@ mod frame_addr_nohome_tests {
             instructions,
             terminator,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }];
         f.next_value_id = next;
         f
@@ -10542,6 +10658,7 @@ mod seg_fold_displacement_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 4;
         let set = collect_bitop_nonneg_values(&func);
@@ -10667,6 +10784,7 @@ mod indexed_offset_dead_tests {
         f.blocks.push(BasicBlock {
             label: BlockId(0),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
             instructions: vec![
                 Instruction::GlobalAddr {
                     dest: Value(0),
@@ -11001,6 +11119,7 @@ mod shifted_operand_fusion_tests {
             instructions,
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         }
     }
 

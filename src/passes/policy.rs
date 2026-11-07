@@ -73,6 +73,7 @@ mod tests {
             label: BlockId(0),
             instructions,
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
             terminator: Terminator::Return(result),
         });
         f.next_value_id = 32;

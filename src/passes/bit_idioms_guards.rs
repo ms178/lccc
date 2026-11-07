@@ -365,6 +365,7 @@ pub(super) fn cfg(func: &mut IrFunction) -> usize {
                 }
                 let (dest, ty, ct) = (*dest, *ty, *ct);
                 let span = b.source_spans.get(ii).copied();
+                let inline_id = b.inline_id_at(ii);
                 let compare = Instruction::Cmp {
                     dest: Value(next),
                     op: IrCmpOp::Ne,
@@ -383,14 +384,22 @@ pub(super) fn cfg(func: &mut IrFunction) -> usize {
                     && let Some(placed) = span.or_else(|| pred_block.source_spans.last().copied())
                 {
                     pred_block.source_spans.extend([placed; 2]);
+                    if !pred_block.source_inline_ids.is_empty()
+                        || inline_id != crate::ir::instruction::NO_INLINE_INSTANCE
+                    {
+                        if pred_block.source_inline_ids.is_empty() {
+                            pred_block.source_inline_ids.resize(
+                                pred_block.instructions.len(),
+                                crate::ir::instruction::NO_INLINE_INSTANCE,
+                            );
+                        }
+                        pred_block.source_inline_ids.extend([inline_id; 2]);
+                    }
                 }
                 pred_block.instructions.extend([compare, cast]);
                 let join = &mut func.blocks[bi];
-                join.instructions.remove(ii);
-                if !join.source_spans.is_empty() {
-                    join.source_spans.remove(ii);
-                }
-                join.instructions.insert(
+                join.remove_inst(ii);
+                join.insert_inst_inline(
                     prefix,
                     Instruction::Phi {
                         dest,
@@ -400,10 +409,9 @@ pub(super) fn cfg(func: &mut IrFunction) -> usize {
                             (Operand::Value(Value(next + 1)), from_pointer),
                         ],
                     },
+                    span.unwrap_or_else(crate::common::source::Span::dummy),
+                    inline_id,
                 );
-                if let Some(span) = span {
-                    join.source_spans.insert(prefix, span);
-                }
                 func.next_value_id = after;
                 return 1;
             }
@@ -424,6 +432,7 @@ mod cfg_tests {
         let block = |label, instructions: Vec<Instruction>, terminator| BasicBlock {
             label: BlockId(label),
             source_spans: vec![Span::dummy(); instructions.len()],
+            source_inline_ids: Vec::new(),
             instructions,
             terminator,
         };

@@ -260,6 +260,7 @@ fn owner_counts_bare_pointer_uses_before_charging_a_closed_dag() {
         function.blocks = vec![BasicBlock {
             label: BlockId(0),
             source_spans: vec![Span::dummy(); instructions.len()],
+            source_inline_ids: Vec::new(),
             instructions,
             terminator: Terminator::Return(Some(v(6))),
         }];
@@ -301,6 +302,7 @@ fn owner_skips_dead_networks_but_keeps_bare_effect_roots_live() {
             label: BlockId(0),
             instructions,
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
             terminator: Terminator::Return(None),
         });
         assert_eq!(super::super::run(&mut function), usize::from(effect_root));
@@ -380,6 +382,7 @@ fn owner_reserves_all_temporaries_for_multiple_three_operation_recipes() {
         label: BlockId(0),
         instructions: source.clone(),
         source_spans: vec![Span::dummy(); source.len()],
+        source_inline_ids: Vec::new(),
         terminator: Terminator::Return(Some(v(13))),
     });
     assert!(super::super::run(&mut function) >= 2);

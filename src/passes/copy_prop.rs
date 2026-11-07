@@ -146,10 +146,7 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
                 {
                     *copy_src = src;
                 }
-                block.instructions.remove(i);
-                if block.source_spans.len() > i {
-                    block.source_spans.remove(i);
-                }
+                drop(block.remove_inst(i));
                 total += 1;
             }
         }
@@ -315,12 +312,13 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
                             offset: Operand::Const(IrConst::I64(offset)),
                             ty,
                         };
-                        func.blocks[block_idx].instructions.insert(load_idx, gep);
-                        if func.blocks[block_idx].source_spans.len() >= load_idx {
-                            func.blocks[block_idx]
-                                .source_spans
-                                .insert(load_idx, crate::common::source::Span::dummy());
-                        }
+                        // The GEP implements the load it feeds: inherit that
+                        // load's span context and inline instance.
+                        func.blocks[block_idx].insert_inst(
+                            load_idx,
+                            gep,
+                            crate::common::source::Span::dummy(),
+                        );
                         // The load shifted by one; locate the first load at or
                         // after the insertion point with the old destination-rooted ptr.
                         for inst in &mut func.blocks[block_idx].instructions[load_idx + 1..] {
@@ -332,10 +330,7 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
                             }
                         }
                     }
-                    func.blocks[block_idx].instructions.remove(copy_idx);
-                    if func.blocks[block_idx].source_spans.len() > copy_idx {
-                        func.blocks[block_idx].source_spans.remove(copy_idx);
-                    }
+                    drop(func.blocks[block_idx].remove_inst(copy_idx));
                     total += 1;
                     continue 'restart;
                 }
@@ -1423,6 +1418,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // 1: header: reads d, branches to the two arms
         func.blocks.push(BasicBlock {
@@ -1434,6 +1430,7 @@ mod tests {
                 false_label: BlockId(3),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // 2 / 3: arms, each writing the join home `s` (12) and branching to the merge
         func.blocks.push(BasicBlock {
@@ -1447,6 +1444,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(4)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(3),
@@ -1459,6 +1457,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(4)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // 4: merge: d <- s (the hop), then the loop test
         func.blocks.push(BasicBlock {
@@ -1482,12 +1481,14 @@ mod tests {
                 false_label: BlockId(5),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(5),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Value(Value(10)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let folded = coalesce_forwarding_phi_copies(&mut func);
@@ -1547,6 +1548,7 @@ mod tests {
             instructions: inst,
             terminator: term,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         };
         // 0: entry, d(10) <- 0 ; -> 1 or -> 5
         func.blocks.push(blk(
@@ -1640,6 +1642,7 @@ mod tests {
                 instructions: insts,
                 terminator: term,
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             });
         };
         blk(
@@ -1724,12 +1727,14 @@ mod tests {
                 false_label: BlockId(1),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Value(Value(N)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let removed = propagate_copies_post_phi(&mut func);
@@ -1813,6 +1818,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let replacements = propagate_copies(&mut func);
@@ -1858,6 +1864,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let replacements = propagate_copies(&mut func);
@@ -1898,6 +1905,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let replacements = propagate_copies(&mut func);
@@ -1927,6 +1935,7 @@ mod tests {
             }],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let replacements = propagate_copies(&mut func);
@@ -1954,6 +1963,7 @@ mod tests {
             }],
             terminator: Terminator::Return(Some(Operand::Value(Value(0)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let replacements = propagate_copies(&mut func);
@@ -1999,6 +2009,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(val(7))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 8;
         func

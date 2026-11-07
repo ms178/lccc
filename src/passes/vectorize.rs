@@ -2679,6 +2679,7 @@ mod ordinary_reduction_accumulator_use_tests {
                 instructions: vec![],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(1),
@@ -2713,6 +2714,7 @@ mod ordinary_reduction_accumulator_use_tests {
                     false_label: BlockId(3),
                 },
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(2),
@@ -2740,12 +2742,14 @@ mod ordinary_reduction_accumulator_use_tests {
                 ],
                 terminator: Terminator::Branch(BlockId(4)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(3),
                 instructions: vec![],
                 terminator: Terminator::Return(None),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(4),
@@ -2758,6 +2762,7 @@ mod ordinary_reduction_accumulator_use_tests {
                 }],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
         ];
         let loop_blocks = [1, 2, 4].into_iter().collect();
@@ -3143,6 +3148,7 @@ mod minmax_reduction_legality_tests {
                 instructions: vec![],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(1),
@@ -3177,6 +3183,7 @@ mod minmax_reduction_legality_tests {
                     false_label: BlockId(4),
                 },
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(2),
@@ -3211,6 +3218,7 @@ mod minmax_reduction_legality_tests {
                 ],
                 terminator: Terminator::Branch(BlockId(3)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(3),
@@ -3223,12 +3231,14 @@ mod minmax_reduction_legality_tests {
                 }],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(4),
                 instructions: vec![],
                 terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
         ];
         let loop_blocks = [1, 2, 3].into_iter().collect();
@@ -4057,6 +4067,7 @@ mod masked_guard_splat_hoist_tests {
             instructions,
             terminator,
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -6363,7 +6374,7 @@ fn deduplicate_vector_loads(func: &mut IrFunction, loop_blocks: &FxHashSet<usize
         let mut next = idxs.iter().copied();
         let mut next_remove = next.next();
         let mut idx = 0usize;
-        block.instructions.retain(|_| {
+        block.retain_insts(|_| {
             let cur = idx;
             idx += 1;
             if Some(cur) == next_remove {
@@ -6373,21 +6384,6 @@ fn deduplicate_vector_loads(func: &mut IrFunction, loop_blocks: &FxHashSet<usize
                 true
             }
         });
-        if !block.source_spans.is_empty() {
-            let mut next2 = idxs.iter().copied();
-            let mut next_remove2 = next2.next();
-            let mut idx2 = 0usize;
-            block.source_spans.retain(|_| {
-                let cur = idx2;
-                idx2 += 1;
-                if Some(cur) == next_remove2 {
-                    next_remove2 = next2.next();
-                    false
-                } else {
-                    true
-                }
-            });
-        }
         total += idxs.len();
     }
     total
@@ -9600,7 +9596,27 @@ fn rewrite_folded_cond_store(
     {
         let store_label = func.blocks[store_block].label;
         let b = &mut func.blocks[store_block];
-        b.replace_insts_synthesized(new_insts);
+        if b.spans_parallel() {
+            // The folded body implements the same source construct as the
+            // block it replaces: keep its inline context instead of escaping
+            // the instance that contained the original store.
+            let inline_id = if b.inline_ids_parallel() {
+                b.source_inline_ids
+                    .first()
+                    .copied()
+                    .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE)
+            } else {
+                crate::ir::instruction::NO_INLINE_INSTANCE
+            };
+            let n = new_insts.len();
+            b.replace_insts_inline(
+                new_insts,
+                vec![crate::common::source::Span::dummy(); n],
+                vec![inline_id; n],
+            );
+        } else {
+            b.replace_insts_synthesized(new_insts);
+        }
         b.terminator = Terminator::Branch(latch_label);
         let g = &mut func.blocks[guard_block];
         g.terminator = Terminator::Branch(store_label);
@@ -11391,6 +11407,7 @@ mod byte_count_exit_shape_tests {
                 }],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(1),
@@ -11417,18 +11434,21 @@ mod byte_count_exit_shape_tests {
                     false_label,
                 },
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(2),
                 instructions: vec![],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(3),
                 instructions: vec![],
                 terminator: Terminator::Return(None),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
         ];
         func
@@ -12062,16 +12082,13 @@ fn transform_byte_count_reduction(func: &mut IrFunction, p: &ByteCountPattern) -
 /// inherits its predecessor's span (the block's first span at the front);
 /// an absent table (empty for a non-empty block) stays absent.
 fn spanned_insert(block: &mut BasicBlock, at: usize, inst: Instruction) {
-    if block.source_spans.len() == block.instructions.len() {
-        let fill = at
-            .checked_sub(1)
-            .and_then(|i| block.source_spans.get(i))
-            .or_else(|| block.source_spans.first())
-            .copied()
-            .unwrap_or_else(crate::common::source::Span::dummy);
-        block.source_spans.insert(at, fill);
-    }
-    block.instructions.insert(at, inst);
+    let fill = at
+        .checked_sub(1)
+        .and_then(|i| block.source_spans.get(i))
+        .or_else(|| block.source_spans.first())
+        .copied()
+        .unwrap_or_else(crate::common::source::Span::dummy);
+    block.insert_inst(at, inst, fill);
 }
 
 /// Append `inst`, keeping the span table in step (see `spanned_insert`).
@@ -13058,6 +13075,7 @@ fn transform_byte_count_reduction_inner(
         },
         terminator: Terminator::Branch(rem_header_label),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
     func.blocks.push(vec_exit_block);
     let vec_exit_idx = func.blocks.len() - 1;
@@ -13123,6 +13141,7 @@ fn transform_byte_count_reduction_inner(
         instructions: rem_header_insts,
         terminator: rem_header_term,
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
 
     // Remainder body: the pre-mutation-emitted scalar mirror (see the
@@ -13132,6 +13151,7 @@ fn transform_byte_count_reduction_inner(
         instructions: rem_body_insts,
         terminator: Terminator::Branch(rem_latch_label),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
 
     let mut rem_latch_insts = vec![Instruction::BinOp {
@@ -13156,6 +13176,7 @@ fn transform_byte_count_reduction_inner(
         instructions: rem_latch_insts,
         terminator: rem_latch_term,
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
     // An elided remainder (constant trip count, `limit % W == 0`) emits
     // none of its blocks: nothing branches to them.
@@ -14483,6 +14504,7 @@ fn transform_byte_compare_loop(
             instructions,
             terminator,
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
     }
     if debug {
@@ -15639,6 +15661,7 @@ fn transform_adler_loop_inner(
             false_label: vec_exit_label,
         },
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
     func.blocks.push(vec_header);
     changes += 1;
@@ -15752,6 +15775,7 @@ fn transform_adler_loop_inner(
         instructions: body_insts,
         terminator: Terminator::Branch(vec_header_label),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
     func.blocks.push(vec_body);
     changes += 1;
@@ -15823,6 +15847,7 @@ fn transform_adler_loop_inner(
         ],
         terminator: Terminator::Branch(header_label),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
     func.blocks.push(vec_exit);
     changes += 1;
@@ -19613,6 +19638,7 @@ fn build_stencil_remainder_loop(
         ],
         terminator: Terminator::Branch(rem_header_label),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
 
     // Remainder header: the ORIGINAL compare shape (iv + cmp_k) op limit.
@@ -19653,6 +19679,7 @@ fn build_stencil_remainder_loop(
             false_label: func.blocks[pattern.exit_idx].label,
         },
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
 
     // Remainder body: recompute the original expression from the taps.
@@ -19848,6 +19875,7 @@ fn build_stencil_remainder_loop(
         instructions: body_insts,
         terminator: Terminator::Branch(rem_latch_label),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
     let rem_latch_block = BasicBlock {
         label: rem_latch_label,
@@ -19860,6 +19888,7 @@ fn build_stencil_remainder_loop(
         }],
         terminator: Terminator::Branch(rem_header_label),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
 
     // The blocks are appended by `RemainderLoop::commit`; the final layout
@@ -20697,6 +20726,7 @@ mod map_offset_wrap_tests {
             instructions,
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         (func, iv, gep)
     }
@@ -22029,12 +22059,14 @@ fn transform_strict_computed_recip_reduction(
             false_label: func.blocks[pattern.header_idx].label,
         },
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
     let vector_body = BasicBlock {
         label: vector_body_label,
         instructions: vector_body_instructions,
         terminator: Terminator::Branch(vector_header_label),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
 
     let original_header_label = func.blocks[pattern.header_idx].label;
@@ -22504,6 +22536,7 @@ mod iv_init_const_tests {
             }],
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func
     }
@@ -22563,6 +22596,7 @@ mod iv_init_const_tests {
                 instructions: vec![],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(1),
@@ -22580,18 +22614,21 @@ mod iv_init_const_tests {
                     false_label: BlockId(3),
                 },
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(2),
                 instructions: vec![],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(3),
                 instructions: vec![],
                 terminator: Terminator::Return(None),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
         ];
         let loop_blocks: FxHashSet<usize> = [1, 2].into_iter().collect();
@@ -22843,6 +22880,7 @@ mod reduction_byte_iv_match_tests {
             }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -22856,6 +22894,7 @@ mod reduction_byte_iv_match_tests {
             }],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
@@ -22883,6 +22922,7 @@ mod reduction_byte_iv_match_tests {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         let mut loop_blocks = FxHashSet::default();
         loop_blocks.insert(1);
@@ -22898,6 +22938,7 @@ mod reduction_byte_iv_match_tests {
                 instructions: vec![],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(1),
@@ -22911,6 +22952,7 @@ mod reduction_byte_iv_match_tests {
                 }],
                 terminator: Terminator::Branch(BlockId(2)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(2),
@@ -22944,6 +22986,7 @@ mod reduction_byte_iv_match_tests {
                 ],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
         ];
         (func, [1, 2].into_iter().collect())
@@ -23407,6 +23450,7 @@ fn split_fma_entry_edge(
         instructions: Vec::new(),
         terminator: Terminator::Branch(header_label),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     });
     func.blocks.len() - 1
 }
@@ -23794,6 +23838,7 @@ fn insert_remainder_loop(
         },
         terminator: Terminator::Branch(remainder_header_label),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
 
     // Step 3: Create remainder_header block
@@ -23826,6 +23871,7 @@ fn insert_remainder_loop(
             false_label: func.blocks[pattern.exit_idx].label,
         },
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
 
     // Step 4: Create remainder_body block
@@ -23913,6 +23959,7 @@ fn insert_remainder_loop(
         ],
         terminator: Terminator::Branch(remainder_latch_label),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
 
     // Step 5: Create remainder_latch block
@@ -23928,6 +23975,7 @@ fn insert_remainder_loop(
         }],
         terminator: Terminator::Branch(remainder_header_label),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
 
     // Step 6: Add all new blocks to the function
@@ -26775,6 +26823,7 @@ mod reduction_exit_phi_tests {
                 instructions: vec![],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(1),
@@ -26785,12 +26834,14 @@ mod reduction_exit_phi_tests {
                     false_label: BlockId(3),
                 },
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(2),
                 instructions: vec![],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(3),
@@ -26804,12 +26855,14 @@ mod reduction_exit_phi_tests {
                 }],
                 terminator: Terminator::Return(Some(Operand::Value(Value(9)))),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(4),
                 instructions: vec![],
                 terminator: Terminator::Branch(BlockId(3)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
         ];
         let loop_blocks = [1, 2].into_iter().collect();
@@ -27016,6 +27069,7 @@ fn insert_reduction_remainder_loop(
             instructions,
             terminator: Terminator::Branch(exit_label),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         retarget_reduction_exit_phis(func, &pattern.loop_blocks, pattern.exit_idx, vec_exit_label);
 
@@ -27353,6 +27407,7 @@ fn insert_reduction_remainder_loop(
             instructions,
             terminator: Terminator::Branch(remainder_header_label),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         }
     };
 
@@ -27411,6 +27466,7 @@ fn insert_reduction_remainder_loop(
             false_label: func.blocks[pattern.exit_idx].label,
         },
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
 
     // Step 4: Create remainder_body block
@@ -27682,6 +27738,7 @@ fn insert_reduction_remainder_loop(
         instructions: remainder_body_instructions,
         terminator: Terminator::Branch(remainder_latch_label),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
 
     // Step 5: Create remainder_latch block
@@ -27696,6 +27753,7 @@ fn insert_reduction_remainder_loop(
         }],
         terminator: Terminator::Branch(remainder_header_label),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
 
     // Step 6: Add all new blocks to the function
@@ -27941,6 +27999,7 @@ mod map_integer_domain_tests {
                 instructions: vec![],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(1),
@@ -27951,6 +28010,7 @@ mod map_integer_domain_tests {
                 }],
                 terminator: Terminator::Branch(BlockId(2)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(2),
@@ -27963,6 +28023,7 @@ mod map_integer_domain_tests {
                 }],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
         ];
         (func, [1, 2].into_iter().collect())
@@ -28117,6 +28178,7 @@ mod map_integer_domain_tests {
                 instructions: vec![],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(1),
@@ -28130,6 +28192,7 @@ mod map_integer_domain_tests {
                 }],
                 terminator: Terminator::Branch(BlockId(2)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(2),
@@ -28150,6 +28213,7 @@ mod map_integer_domain_tests {
                 ],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
         ];
         let lossy_loop: FxHashSet<usize> = [1, 2].into_iter().collect();
@@ -28944,6 +29008,7 @@ mod reduction_bound_safety_tests {
                             }],
                             terminator: Terminator::Branch(BlockId(1)),
                             source_spans: vec![],
+                            source_inline_ids: Vec::new(),
                         },
                         BasicBlock {
                             label: BlockId(1),
@@ -28960,18 +29025,21 @@ mod reduction_bound_safety_tests {
                                 false_label: BlockId(3),
                             },
                             source_spans: vec![],
+                            source_inline_ids: Vec::new(),
                         },
                         BasicBlock {
                             label: BlockId(2),
                             instructions: vec![],
                             terminator: Terminator::Branch(BlockId(1)),
                             source_spans: vec![],
+                            source_inline_ids: Vec::new(),
                         },
                         BasicBlock {
                             label: BlockId(3),
                             instructions: vec![],
                             terminator: Terminator::Return(None),
                             source_spans: vec![],
+                            source_inline_ids: Vec::new(),
                         },
                     ];
                     let pattern = ReductionPattern {
@@ -29136,6 +29204,7 @@ mod reduction_bound_safety_tests {
             }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -29152,18 +29221,21 @@ mod reduction_bound_safety_tests {
                 false_label: BlockId(3),
             },
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(3),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
 
         let mut loop_blocks = FxHashSet::default();
@@ -34254,6 +34326,7 @@ fn emit_alias_guards(
                 instructions: Vec::new(),
                 terminator: Terminator::Branch(header_label),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             });
             cur_idx = func.blocks.len() - 1;
         }
@@ -34418,6 +34491,7 @@ fn build_map_remainder_loop(
             instructions: insts,
             terminator: Terminator::Branch(remainder_header_label),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         }
     };
 
@@ -34451,6 +34525,7 @@ fn build_map_remainder_loop(
             false_label: func.blocks[pattern.exit_idx].label,
         },
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
 
     let mut remainder_insts = Vec::new();
@@ -34511,6 +34586,7 @@ fn build_map_remainder_loop(
         instructions: remainder_insts,
         terminator: Terminator::Branch(remainder_latch_label),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
 
     let remainder_latch_block = BasicBlock {
@@ -34524,6 +34600,7 @@ fn build_map_remainder_loop(
         }],
         terminator: Terminator::Branch(remainder_header_label),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
 
     Some(RemainderLoop {
@@ -36114,6 +36191,7 @@ mod fixed_distance_slp_tests {
             instructions,
             terminator: Terminator::Return(Some(Operand::Value(root))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func
     }
@@ -36179,6 +36257,7 @@ mod cond_store_equiv_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I64(0)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         f
     }
@@ -36610,6 +36689,7 @@ mod map_fp_select_tests {
             instructions: insts,
             terminator: term,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -38345,6 +38425,7 @@ mod entry_edge_tests {
             instructions: Vec::new(),
             terminator: term,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -38484,6 +38565,7 @@ mod outside_rewrite_availability_tests {
             instructions,
             terminator,
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         }
     }
 

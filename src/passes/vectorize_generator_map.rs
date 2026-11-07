@@ -848,12 +848,14 @@ fn lower(
             false_label: header_label,
         },
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
     let vb = BasicBlock {
         label: vb_label,
         instructions: vb_insts,
         terminator: Terminator::Branch(vh_label),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
     Some(Lowered {
         viv,
@@ -872,16 +874,10 @@ fn commit(func: &mut IrFunction, plan: &Plan, low: Lowered) {
     let next_value = low.next_value;
     {
         let p = &mut func.blocks[plan.preheader];
-        let had_spans = !p.source_spans.is_empty();
-        let added = low.pre.len();
-        p.instructions.extend(low.pre);
-        if had_spans {
-            p.source_spans.extend((0..added).map(|_| Span {
-                start: 0,
-                end: 0,
-                file_id: 0,
-            }));
-        }
+        // Vectorizer setup implements the loop's source construct, so it
+        // inherits the preheader's inline instance (dummy span: it emits no
+        // `.loc` of its own). An untracked preheader stays untracked.
+        p.extend_insts(low.pre, Span::dummy());
         p.terminator = Terminator::Branch(vh_label);
     }
     // The scalar loop's header phi now receives the packed exit value from the

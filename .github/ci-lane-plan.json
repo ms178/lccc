@@ -376,7 +376,7 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 529.61,
+      "predicted_gate_seconds": 531.81,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
@@ -787,6 +787,14 @@
         {
           "measured_s": 5.71,
           "name": "python3 tests/regression/check_dwarf_versions.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv --gcc gcc-16"
+        },
+        {
+          "measured_s": 0.2,
+          "name": "python3 tests/regression/check_dwarf_inlining.py --lccc target/fastbuild/lccc --self-test"
+        },
+        {
+          "measured_s": 2.0,
+          "name": "python3 tests/regression/check_dwarf_inlining.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv --gdb gdb --gcc gcc-16 --json target/dwarf-inlining.json"
         },
         {
           "measured_s": 0.3,

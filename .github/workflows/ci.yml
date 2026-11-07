@@ -2465,7 +2465,7 @@ jobs:
     - name: Install the GCC 16.2 oracle
       run: bash scripts/ci_install_gcc_oracle.sh --version 16.2
     - name: Verify the lane's oracle toolchain
-      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5
+      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5 --require gcc,multilib,valgrind,pyyaml,gdb
     - name: Select GCC 16 for legacy oracle invocations
       run: |
         mkdir -p "$RUNNER_TEMP/lccc-oracles"
@@ -2892,7 +2892,7 @@ jobs:
     - name: Install the GCC 16.2 oracle
       run: bash scripts/ci_install_gcc_oracle.sh --version 16.2
     - name: Verify the lane's oracle toolchain
-      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5
+      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5 --require gcc,multilib,valgrind,pyyaml,gdb
     - name: Select GCC 16 for legacy oracle invocations
       run: |
         mkdir -p "$RUNNER_TEMP/lccc-oracles"
@@ -3280,6 +3280,8 @@ jobs:
         # each of which must be declared below with the reason it is absent.
         python3 tests/regression/check_dwarf_die_census.py --lccc target/fastbuild/lccc --gcc gcc-16 --clang clang-23
         python3 tests/regression/check_dwarf_versions.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv --gcc gcc-16
+        python3 tests/regression/check_dwarf_inlining.py --lccc target/fastbuild/lccc --self-test
+        python3 tests/regression/check_dwarf_inlining.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv --gdb gdb --gcc gcc-16 --json target/dwarf-inlining.json
         bash tests/regression/check_gla_backedge_no_trampoline.sh
         python3 scripts/edg_changes_mine.py verify-artifacts
         python3 tests/regression/check_count_observations.py --clang "${CLANG:-clang-23}"

@@ -16,18 +16,19 @@ it. Parameter/local homes are codegen-proven frame-pointer-relative location
 lists on x86-64, i686, AArch64 and RISC-V; x86-64/i686 values are GDB-gated, and
 AArch64/RISC-V homes are structurally gated through the same DWARF decoder.
 
+Inline stacks (`DW_TAG_inlined_subroutine`) are landed and GDB-gated (D6).
 What is still deliberately not claimed: optimized register/entry-value
-locations, inline stacks (`DW_TAG_inlined_subroutine`), VLA dynamic locations,
-over-aligned adjusted homes, `.debug_macro`, `-gz`, split DWARF and
-`.debug_names`. Those remain D6/D8/D9/D11/D12 and the optimized-location tail of
-D1b/D14. The historical census below is kept for provenance, but the current
+locations inside inline instances, lexical scopes inside inline instances, VLA
+dynamic locations, over-aligned adjusted homes, `.debug_macro`, `-gz`, split
+DWARF and `.debug_names`. Those remain D8/D9/D11/D12 and the optimized-location
+tail of D1b/D14. The historical census below is kept for provenance, but the current
 acceptance evidence is the dedicated gates: `check_dwarf_parameters.py` (32
 contracts), `check_dwarf_locals.py` (104 contracts including shadowing, GNU
 nested functions, block-scope and shadowed record tags, and AArch64/RISC-V
 structural legs),
 `check_dwarf_delivery.py` (56 contracts,
 including unsupported `-g3`/`-gz`/`-gsplit-dwarf` transport pins), and
-`check_dwarf_quality.py` (30 objects, 0 failures, 2 named optimized gaps).
+`check_dwarf_quality.py` (30 objects, 0 failures, 1 named optimized gap).
 
 ---
 
@@ -90,7 +91,7 @@ python3 tests/regression/check_dwarf_delivery.py --lccc target/fastbuild/lccc \
 ```
 
 Measured on 2026-11-06: parameters PASS 32, locals PASS 104, delivery PASS 52,
-quality 30 objects / 0 failures / 2 named optimized gaps. A missing-home mutation
+quality 30 objects / 0 failures / 1 named optimized gap. A missing-home mutation
 (disabling the driver's home maps) made the parameter and local gates fail with
 missing-location diagnostics before the implementation was restored.
 
@@ -287,9 +288,9 @@ policy removed more than the new DIEs cost.
 
 Ordered by value: D1–D4 and D13 are **landed** (see
 [§3.5](#35-what-the-campaign-has-landed-measured)), and what remains is the
-optimized-location tail of D1b/D14, D6 (inline instances),
-then the `.debug_macro`/compression/split-DWARF/name-index items. D7 (`-S -g`)
-and D15 (`-gpubnames`) are landed and measured below.
+optimized-location tail of D1b/D14, then the
+`.debug_macro`/compression/split-DWARF/name-index items. D6 (inline instances),
+D7 (`-S -g`) and D15 (`-gpubnames`) are landed and measured below.
 
 Format: **ID · class · evidence** — Why, Where, Plan (each step landable alone),
 Gate (what the regression gate must assert; every gate is mutation-verified by
@@ -722,48 +723,61 @@ it would rewrite a correct line program for no behavioural gain. The gate record
 the sequence/function ratio for both compilers and would flag a real divergence;
 it does not require a per-function split.
 
-### D6 · P1 · L — `DW_TAG_inlined_subroutine`
+### D6 · **landed** — `DW_TAG_inlined_subroutine`
 
-**User-visible damage, measured 2026-11-06.** Same source, `-O2 -g`, GDB 18.1:
+**Measured 2026-11-07** on `probe.c` (a `static inline` leaf called twice from a
+static middle, called twice from `main`), `-O2 -g`, GDB 18.1:
 
+```text
+$ gdb -batch -ex 'break leaf' -ex run -ex bt lccc.elf
+Breakpoint 1 at 0x4014fc: leaf. (4 locations)
+#0  leaf (x=<optimized out>) at probe.c:2
+#1  middle (x=<optimized out>) at probe.c:3
+#2  main () at probe.c:8
 ```
-$ gdb -batch -ex 'break callee' gcc.elf
-Breakpoint 1 at 0x401150: file main2.c, line 2.      # both inlined instances
-$ gdb -batch -ex 'break callee' lccc.elf
-Function "callee" not defined.                     # no inline DIE => no symbol
-```
 
-`readelf --debug-dump=info` on the two objects of the same probe: GCC emits
-**2 `DW_TAG_inlined_subroutine` + 1 abstract `DW_TAG_subprogram` with
-`DW_AT_inline`**; lccc emits **0**. lccc *does* inline the callee (the caller is
-three instructions) and its line rows carry the callee's lines 3 and 4 inside
-the caller, so the debugger attributes those addresses to a function whose
-source does not contain them. This is the highest-value remaining item.
+The writer emits one abstract `DW_TAG_subprogram` per fully inlined callee
+(`DW_AT_inline`: 1 for a non-`inline` static, 3 for a declared `inline` that was
+inlined — the binutils 2.47 / GCC 16.2 spelling), and one
+`DW_TAG_inlined_subroutine` per surviving instance with `DW_AT_abstract_origin`,
+`DW_AT_call_file`/`call_line`, concrete ranges and nested instances as children.
+The `inlining` quality gap is deleted; `check_dwarf_inlining.py` gates the tree
+across x86-64/i686/AArch64/RISC-V and DWARF 2..5, the O0 negative, GAS `-S`
+delivery, host negatives (noinline, optimized-away, void/K&R, `-g0`) and the
+GDB frames/breakpoint/step acceptance above.
 
-**Why.** At `-O2` a row inside `main` legitimately carries the inlined callee's
-line (the gate sees exactly this today); without an inlined-subroutine DIE the
-debugger shows the caller at a line that does not exist in the caller, and
-`step` jumps. The census cannot see this gap — it is a missing *tree*, not a
-missing tag count — which is why the gate records it as a named gap.
+Implementation notes that kept the tree honest:
 
-**Where.** Inlining happens in `src/passes/inline.rs`;
-`src/backend/elf/dwarf.rs` grows `DW_TAG_inlined_subroutine` children under the
-subprogram, each with `DW_AT_abstract_origin` (a declaration DIE for the callee),
-`DW_AT_call_file`/`call_line`, and `low_pc`/`high_pc` or `DW_AT_ranges`.
+* the inliner records an append-only instance table on the IR function and
+  truncates it to the pre-call length on every failure path, so a refused
+  inline cannot leave a stale instance; debug instance allocation is gated on
+  `-g`, and the environment switches are resolved once per translation unit;
+* provenance is carried in lockstep with instructions (`take_parallel_debug`
+  before draining a block, synthesized instructions intentionally carry none);
+* range endpoints are zero-width local assembler labels
+  (`.Llccc_inline_{b|e}_…`) referenced by `.debug_*` relocations.  Compiler-
+  emitted endpoints are hidden from every peephole phase exactly like `.loc`
+  rows and re-emitted in order before the next surviving instruction (trailing
+  endpoints survive too).  Rendering recognizes them by their current text,
+  not a pre-pass index bitmap, so a structural `insert_line` cannot drop or
+  misplace an endpoint; user `#APP` assembly stays opaque.  Thus `-g` cannot
+  change code by blocking copy coalescing, extension facts or CFI synthesis
+  (the dwarf-quality `code_unchanged` sentinel);
+* DWARF 2..4 `.debug_ranges` lists end with a pair of zero addresses, DWARF 5
+  `.debug_rnglists` with the single `DW_RLE_end_of_list` byte; the wrong width
+  made addr2line fail on `-ffunction-sections -gdwarf-2`;
+* abstract origins are published in `.debug_pubnames` when requested, matching
+  GCC's name set for fully inlined static helpers;
+* provenance is auxiliary metadata with a strict sparse-or-parallel invariant:
+  an empty id list is the sparse representation of concrete code,
+  `restore_phi_prefix` permutes ids exactly with spans, and the `BasicBlock`
+  edit primitives carry ids only when the pre-edit triple was parallel.  They
+  never pad, truncate or clear a drifted id array to hide a producer's defect;
+  the immutable pass-boundary verifier reports the first pass that broke the
+  pairing.
 
-**Plan.** Have the inliner record `(caller, callee, call site span, inlined
-regions)` as metadata on the function, carry it to the writer, emit one
-`DW_TAG_inlined_subroutine` per inlining instance with its concrete ranges, and
-nested instances as children. Emit `DW_TAG_subprogram` *declarations* for the
-abstract origins (`DW_AT_inline: DW_INL_inlined`).
-
-**Gate.** A probe with a `static inline` callee called from two sites at `-O2`;
-assert two inlined-subroutine DIEs whose ranges are inside the caller, each with a
-`call_line` matching the call site, and that the callee's module-level
-`DW_TAG_subprogram` carries `DW_AT_inline`. Delete the `inlining` gap.
-
-**Accept.** `bt` inside an inlined function shows both frames; `step` enters the
-callee's source range.
+Remaining tail (not claimed here): optimized parameter/local locations inside
+inline instances (D1b) and lexical blocks inside inline instances.
 
 ### D7 · **landed** — `-S -g` carries the DIE tree
 
@@ -969,11 +983,11 @@ validator is mutation-tested with 9 corruptions plus 3 scope filters.
 
 ## 6. What is explicitly *not* in this campaign
 
-* **gdb-script automation.** No `gdb` in the harness (checked: not in the
-  toolchain cache, not installable offline). Every acceptance test above is
-  expressed as a DWARF-structure assertion plus the program's own printed output,
-  which is stronger than a gdb transcript for the purpose of a CI gate — and it
-  is reproducible without a debugger.
+* **gdb as the only oracle.** The dedicated parameter/local/delivery/inline
+  gates now run GDB 18.1 where it is provisioned, but the quality gate remains a
+  DWARF-structure assertion plus the program's own printed output, with a
+  `--self-test` on hand-built bytes, so the instrument is validated even where a
+  debugger is absent.
 * **`llvm-dwarfdump --verify`.** Not available offline. The gate's own decoder
   plays the role, and every decoder path has a `--self-test` on hand-built bytes,
   so the instrument is validated without an external tool.
@@ -1023,7 +1037,8 @@ it at **GCC 16.2 instead of lccc**:
 With both in place, `--lccc "$(which gcc-16)"` — the gate run *on GCC 16.2* —
 reports **0 failures and 0 known gaps**. That is the claim worth having: the gap
 list is a statement about lccc, not about the checker. Run on lccc it reports 0
-failures and the six deficits D1–D4 and D6 name.
+failures; at the time of that measurement it named the D1–D4 and D6 deficits,
+all of which have since landed (the optimized-location tail remains).
 
 The gate runs in CI (`ci.yml`, job `frontend-b`) and locally
 (`scripts/ci_local.sh`, `dwarf-quality`); both pass `--gcc gcc-16` so the oracle

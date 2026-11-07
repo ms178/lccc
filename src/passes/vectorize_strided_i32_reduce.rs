@@ -2110,17 +2110,10 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> Option<usize
     let body_insts = std::mem::take(&mut ctx.body_insts);
     let final_next_val = ctx.next_val;
     let preheader = &mut func.blocks[p.preheader_idx];
-    if !preheader.instructions.is_empty()
-        && preheader.source_spans.len() == preheader.instructions.len()
-    {
-        // Keep a nonempty parallel-span block parallel.  Empty/empty means
-        // source spans were absent, not that dummy rows should be invented.
-        preheader.source_spans.extend(std::iter::repeat_n(
-            crate::common::source::Span::dummy(),
-            preheader_insts.len(),
-        ));
-    }
-    preheader.instructions.extend(preheader_insts);
+    // Keep a nonempty parallel-span block parallel (and its provenance with
+    // it); empty/empty means source spans were absent, not that dummy rows
+    // should be invented. One splice, not three parallel extends.
+    preheader.extend_insts(preheader_insts, crate::common::source::Span::dummy());
     preheader.terminator = Terminator::Branch(vec_header_label);
 
     let change_count = header_insts.len() + body_insts.len() + reduce_insts.len();
@@ -2133,18 +2126,21 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> Option<usize
             false_label: vec_reduce_label,
         },
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     });
     func.blocks.push(BasicBlock {
         label: vec_body_label,
         instructions: body_insts,
         terminator: Terminator::Branch(vec_header_label),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     });
     func.blocks.push(BasicBlock {
         label: vec_reduce_label,
         instructions: reduce_insts,
         terminator: Terminator::Branch(scalar_header_label),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     });
     func.next_value_id = final_next_val;
     func.next_label = next_lbl;
@@ -2169,12 +2165,14 @@ mod tests {
                 instructions: vec![],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             });
             func.blocks.push(BasicBlock {
                 label: BlockId(1),
                 instructions: vec![],
                 terminator: Terminator::Branch(BlockId(0)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             });
             if outside_load {
                 func.blocks.push(BasicBlock {
@@ -2188,6 +2186,7 @@ mod tests {
                     }],
                     terminator: Terminator::Return(None),
                     source_spans: vec![],
+                    source_inline_ids: Vec::new(),
                 });
             }
             let loop_info = loop_analysis::NaturalLoop {
@@ -2250,6 +2249,7 @@ mod tests {
                     instructions: vec![],
                     terminator: Terminator::Return(None),
                     source_spans: vec![],
+                    source_inline_ids: Vec::new(),
                 });
                 let la = loop_analysis::NaturalLoop {
                     header: 0,
@@ -2265,12 +2265,14 @@ mod tests {
                     instructions: vec![],
                     terminator: Terminator::Branch(BlockId(1)),
                     source_spans: vec![],
+                    source_inline_ids: Vec::new(),
                 });
                 fb.blocks.push(BasicBlock {
                     label: BlockId(1),
                     instructions: vec![],
                     terminator: Terminator::Branch(BlockId(0)),
                     source_spans: vec![],
+                    source_inline_ids: Vec::new(),
                 });
                 let lb = loop_analysis::NaturalLoop {
                     header: 0,
@@ -2287,6 +2289,7 @@ mod tests {
                     instructions: vec![],
                     terminator: Terminator::Branch(BlockId(1)),
                     source_spans: vec![],
+                    source_inline_ids: Vec::new(),
                 });
                 fc.blocks.push(BasicBlock {
                     label: BlockId(1),
@@ -2300,18 +2303,21 @@ mod tests {
                         false_label: BlockId(3),
                     },
                     source_spans: vec![],
+                    source_inline_ids: Vec::new(),
                 });
                 fc.blocks.push(BasicBlock {
                     label: BlockId(2),
                     instructions: vec![],
                     terminator: Terminator::Branch(BlockId(1)),
                     source_spans: vec![],
+                    source_inline_ids: Vec::new(),
                 });
                 fc.blocks.push(BasicBlock {
                     label: BlockId(3),
                     instructions: vec![],
                     terminator: Terminator::Return(None),
                     source_spans: vec![],
+                    source_inline_ids: Vec::new(),
                 });
                 let lc = loop_analysis::NaturalLoop {
                     header: 1,
@@ -2365,6 +2371,7 @@ mod tests {
             }],
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         let empty = facts(&[]);
         assert!(wide_load_proven(&f, Value(0), 128, &empty));
@@ -2608,6 +2615,7 @@ mod tests {
                 instructions: vec![],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(1),
@@ -2631,12 +2639,14 @@ mod tests {
                 ],
                 terminator: Terminator::Return(None),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(2),
                 instructions: vec![],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
         ];
         func

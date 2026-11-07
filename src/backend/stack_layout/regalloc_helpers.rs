@@ -1644,6 +1644,7 @@ mod static_chain_reservation_tests {
             instructions,
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }];
         f
     }
@@ -1898,6 +1899,7 @@ mod param_alloca_index_tests {
             instructions,
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }];
         f.param_alloca_values = homes.into_iter().map(Value).collect();
         f
@@ -2177,6 +2179,7 @@ mod param_alloca_index_tests {
             instructions: vec![alloca(1, IrType::I64)],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(ParamAllocaIndex::build(&two_blocks).get(0), None);
     }
@@ -2312,6 +2315,7 @@ mod param_alloca_index_tests {
             instructions: vec![alloca(1, IrType::I64)],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         cases.push(two);
         let mut none = function(vec![alloca(1, IrType::I32)], vec![1]);
