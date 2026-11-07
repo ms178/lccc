@@ -229,6 +229,52 @@ def self_test() -> int:
     return 0
 
 
+RUNTIME_SOURCE = ROOT / "tests/regression/asm_dialect_runtime.c"
+
+
+def check_runtime(host, gcc, directory, timeout, report):
+    """Compile, LINK and EXECUTE the runtime fixture, and require LCCC's
+    observable result to equal GCC 16.2's at every optimization level.
+
+    A text comparison cannot catch a `%=` label that is unique but branches to
+    the wrong place, or an inlined copy that binds to its sibling's loop. This
+    runs the program: the fixture sums 1..100 through a `%=` backward branch,
+    so a mis-bound label changes the answer.
+    """
+    failures = []
+    if not RUNTIME_SOURCE.is_file():
+        return [f"runtime fixture missing: {RUNTIME_SOURCE}"]
+    rows = []
+    for opt in ("-O0", "-O1", "-O2", "-O3", "-O2 -g"):
+        flags = opt.split()
+        row = {"opt": opt}
+        for label, compiler in (("lccc", [str(host)]),
+                                ("gcc", [gcc] if gcc else None)):
+            if compiler is None:
+                continue
+            exe = directory / f"runtime.{label}{opt.replace(' ', '')}"
+            built = run([*compiler, *flags, str(RUNTIME_SOURCE), "-o", str(exe)],
+                        timeout)
+            row[f"{label}_build_rc"] = built.returncode
+            if built.returncode != 0:
+                msg = built.stderr.decode(errors="replace").strip()[:200]
+                row[f"{label}_error"] = msg
+                failures.append(f"runtime/{label}/{opt}: build failed: {msg}")
+                continue
+            ran = run([str(exe)], timeout)
+            row[f"{label}_run_rc"] = ran.returncode
+            row[f"{label}_stdout"] = ran.stdout.decode(errors="replace").strip()
+            if ran.returncode != 0:
+                failures.append(f"runtime/{label}/{opt}: exit {ran.returncode}")
+        if "lccc_stdout" in row and "gcc_stdout" in row:
+            if row["lccc_stdout"] != row["gcc_stdout"]:
+                failures.append(f"runtime/{opt}: LCCC {row['lccc_stdout']!r} != "
+                                f"GCC {row['gcc_stdout']!r}")
+        rows.append(row)
+    report["runtime"] = rows
+    return failures
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--lccc", default=str(ROOT / "target/fastbuild/lccc"))
@@ -311,6 +357,8 @@ def main() -> int:
                             f"{oactual!r} != {[want]!r}")
                 report["rows"].append(orow | {"oracle": True})
 
+        failures += check_runtime(host, gcc, d, args.timeout, report)
+
     report["failures"] = failures
     report["correct"] = not failures
     if args.json:
@@ -323,7 +371,8 @@ def main() -> int:
         return 1
     print(f"PASS asm dialect alternatives: {len(report['rows'])} rows on "
           f"{', '.join(report['targets'])}; {len(report['rule_only'])} rule-only "
-          f"(no oracle syntax), {len(report['oracle_skipped'])} oracle rejections recorded")
+          f"(no oracle syntax), {len(report['oracle_skipped'])} oracle rejections; "
+          f"{len(report.get('runtime', []))} runtime profiles executed")
     return 0
 
 

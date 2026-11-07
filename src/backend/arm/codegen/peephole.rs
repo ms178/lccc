@@ -1555,7 +1555,21 @@ impl Liveness {
                     LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch | LineKind::Ret
                 )
             {
-                starts.push(k + 1);
+                // A leader must name a row that survives into the code.
+                // `hide_debug_rows` marks `.loc` rows and D6 inline endpoints
+                // `Nop`, and an endpoint routinely sits immediately after a
+                // transfer. Pushing it verbatim opens a spurious empty block
+                // and splits the real one, which changes the dataflow the
+                // passes compute -- so `-g` would change the code. Measured on
+                // i686 (120 -> 122 blocks, a lost join forward); the same
+                // construction applies to every backend that hides these rows.
+                if let Some(lead) =
+                    crate::backend::peephole_common::first_live_row(k + 1, end, |i| {
+                        kinds[i] == LineKind::Nop
+                    })
+                {
+                    starts.push(lead);
+                }
             }
         }
         starts.sort_unstable();
@@ -10824,6 +10838,52 @@ fn hoist_loop_invariant_remats_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// End-to-end smoke test: `-g` must not change the emitted code, and the
+    /// peephole must still optimize (the redundancy assertion).
+    ///
+    /// This test is deliberately NOT presented as pinning the leader rule. It
+    /// was measured to pass with that rule reverted: the phantom block a hidden
+    /// leader creates is EMPTY, and `Liveness` is a backward fixpoint that is
+    /// compositional along a straight line, so an extra boundary cannot change
+    /// its answer here. The rule itself is pinned by
+    /// `peephole_common::first_live_row_bounds_and_runs`, by the RISC-V
+    /// `hidden_debug_rows_do_not_add_blocks` structural test on the same shared
+    /// helper, and by the i686 join test where the split DOES reach a meet.
+    #[test]
+    fn hidden_debug_rows_do_not_change_the_code() {
+        let plain = "f:\n\tstr x1, [sp, #16]\n\tldr x2, [sp, #16]\n\tcmp x0, #0\n\tb.eq .L2\n\tb .L3\n.L2:\n\tmov x2, #1\n.L3:\n\tldr x3, [sp, #16]\n\tret\n";
+        let debug = "f:\n.Llccc_inline_b_0_0_f:\n.loc 1 1 0\n\tstr x1, [sp, #16]\n.loc 1 2 0\n\tldr x2, [sp, #16]\n\tcmp x0, #0\n\tb.eq .L2\n.Llccc_inline_e_0_0_f:\n\tb .L3\n.Llccc_inline_e_0_1_f:\n.loc 1 3 0\n.L2:\n.Llccc_inline_b_0_2_f:\n\tmov x2, #1\n.Llccc_inline_e_0_2_f:\n.L3:\n.Llccc_inline_b_0_3_f:\n.loc 1 4 0\n\tldr x3, [sp, #16]\n.Llccc_inline_e_0_3_f:\n\tret\n";
+        // Debug rows MUST survive into the assembly -- they are the line
+        // table and the inline ranges -- so the two texts can never be equal
+        // byte for byte. The property is that the CODE is equal once those
+        // rows are removed, which is exactly what the shipped gate compares.
+        fn code_rows(asm: &str) -> String {
+            asm.lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with(".loc")
+                        || t.starts_with(".file")
+                        || t.starts_with(".Llccc_inline_b_")
+                        || t.starts_with(".Llccc_inline_e_"))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        let a = peephole_optimize(plain.to_string());
+        let b = peephole_optimize(debug.to_string());
+        let (a, b) = (code_rows(&a), code_rows(&b));
+        assert_ne!(
+            a.trim(),
+            code_rows(plain).trim(),
+            "peephole did nothing; test is vacuous"
+        );
+        assert!(
+            b.contains(".L3:"),
+            "the debug variant lost its join label: {b}"
+        );
+        assert_eq!(a, b, "-g changed the generated code");
+    }
 
     /// Two system calls with register-variable operands, as nolibc and the
     /// kernel spell them: `svc 0` reads x8 and x0-x2 although no line after

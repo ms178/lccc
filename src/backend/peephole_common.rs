@@ -684,6 +684,36 @@ pub(crate) fn join_with_debug_rows(lines: &[String], kept: impl Fn(usize) -> boo
     result
 }
 
+/// The first row at or after `lead` that survives into the code, or `None`
+/// when every row to `end` is deleted.
+///
+/// A basic-block leader must name a live row. `-g` emits `.loc` rows and D6
+/// inline-range endpoints, which every backend's `hide_debug_rows` rewrites to
+/// a deleted kind, and an endpoint routinely lands immediately after a
+/// transfer. Naming that row as the fall-through leader opens a spurious empty
+/// block and splits the real one, so the CFG stops being a function of the live
+/// text and `-g` can change the code (measured on i686: 120 -> 122 blocks and a
+/// lost join forward).
+///
+/// This is one shared rule rather than three hand-written walks. Each backend
+/// has its own `LineKind`, so the deletion test arrives as a closure; the walk
+/// itself -- the part that was wrong -- exists once and is unit-tested here.
+///
+/// `lead` may equal `end`; the loop is bounded by `end`, so the result is always
+/// `None` or a valid index in `lead..end`. No arithmetic can overflow: `lead`
+/// only advances while `lead < end`, and `end` is a slice length.
+#[inline]
+pub(crate) fn first_live_row(
+    mut lead: usize,
+    end: usize,
+    mut deleted: impl FnMut(usize) -> bool,
+) -> Option<usize> {
+    while lead < end && deleted(lead) {
+        lead += 1;
+    }
+    if lead < end { Some(lead) } else { None }
+}
+
 /// A `-g` line-table row: `.loc` and its operands (blank-separated), not a
 /// lookalike such as `.location` or `.loc_mark_labels`.
 pub(crate) fn is_loc_directive(trimmed: &str) -> bool {
@@ -1269,6 +1299,37 @@ pub(crate) fn inline_asm_protected_ranges(lines: &[String]) -> Option<Vec<std::o
 
 #[cfg(test)]
 mod inert_directive_tests {
+    /// The shared leader walk: bounds, all-deleted, none-deleted, and the
+    /// interior run. These are the cases the three hand-written walks each had
+    /// to get right independently.
+    #[test]
+    fn first_live_row_bounds_and_runs() {
+        use super::first_live_row;
+        // Empty range, and lead == end: no row exists.
+        assert_eq!(first_live_row(0, 0, |_| false), None);
+        assert_eq!(first_live_row(3, 3, |_| false), None);
+        // lead > end must not run off the slice.
+        assert_eq!(first_live_row(5, 3, |_| true), None);
+        // Nothing deleted: the candidate itself is the answer.
+        assert_eq!(first_live_row(2, 6, |_| false), Some(2));
+        // Everything deleted: no leader.
+        assert_eq!(first_live_row(2, 6, |_| true), None);
+        // A run of deleted rows followed by a live one.
+        let deleted = [true, true, false, true];
+        assert_eq!(first_live_row(0, 4, |i| deleted[i]), Some(2));
+        // The live row is the last index -- the boundary that an off-by-one
+        // would turn into None.
+        assert_eq!(first_live_row(0, 4, |i| i != 3), Some(3));
+        // The closure must never be called at or past `end`.
+        let mut max_seen = 0usize;
+        let r = first_live_row(1, 4, |i| {
+            max_seen = max_seen.max(i);
+            true
+        });
+        assert_eq!(r, None);
+        assert_eq!(max_seen, 3, "probe read past the range");
+    }
+
     use super::*;
 
     #[test]

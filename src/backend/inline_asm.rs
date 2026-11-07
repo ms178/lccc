@@ -2408,6 +2408,57 @@ mod dialect_alternative_tests {
         );
     }
 
+    /// The pass only ever removes characters (`%{` -> `{`, braces dropped) or
+    /// copies them, so the output can never exceed the input. That makes the
+    /// single `with_capacity(template.len())` allocation exact: no growth, no
+    /// reallocation, one buffer for the whole template.
+    #[test]
+    fn output_never_exceeds_the_input_so_capacity_is_exact() {
+        let _g = TargetGuard::new(62);
+        const ALPHABET: [&str; 10] = ["%", "{", "}", "|", "a", "\t", "%%", "%{", "%}", "\u{1f980}"];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..5_000 {
+            let len = (next() % 32) as usize;
+            let mut text = String::new();
+            for _ in 0..len {
+                text.push_str(ALPHABET[(next() % ALPHABET.len() as u64) as usize]);
+            }
+            let out = expand_dialect_alternatives(&text, true);
+            assert!(out.len() <= text.len(), "{text:?} -> {out:?}");
+            if let std::borrow::Cow::Owned(ref buf) = out {
+                assert_eq!(buf.capacity(), text.len(), "reallocated for {text:?}");
+            }
+        }
+    }
+
+    /// An escaped brace is data, not a group opener: `%{a|b%}` must survive
+    /// whole, and the `|` inside it must not select an alternative.
+    #[test]
+    fn an_escaped_brace_does_not_open_a_group() {
+        let _g = TargetGuard::new(62);
+        assert_eq!(
+            expand_dialect_alternatives("%{a|b%}", true).as_ref(),
+            "{a|b}"
+        );
+        assert_eq!(
+            expand_dialect_alternatives("%{a|b%} {c|d}", true).as_ref(),
+            "{a|b} c"
+        );
+        // A lone trailing percent and a percent before a multi-byte character
+        // are copied, never sliced through.
+        assert_eq!(expand_dialect_alternatives("nop %", true).as_ref(), "nop %");
+        assert_eq!(
+            expand_dialect_alternatives("%\u{1f980}{a|b}", true).as_ref(),
+            "%\u{1f980}a"
+        );
+    }
+
     /// An independent, deliberately naive character-at-a-time transcription of
     /// GCC's `do_assembler_dialects` for dialect_number == 0, used only as a
     /// test oracle. Returns None for the shapes GCC diagnoses.

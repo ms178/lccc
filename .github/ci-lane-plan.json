@@ -376,7 +376,7 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 531.81,
+      "predicted_gate_seconds": 534.73,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
@@ -795,6 +795,22 @@
         {
           "measured_s": 2.0,
           "name": "python3 tests/regression/check_dwarf_inlining.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv --gdb gdb --gcc gcc-16 --json target/dwarf-inlining.json"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 tests/regression/check_debug_acceptance_parity.py --self-test"
+        },
+        {
+          "measured_s": 1.03,
+          "name": "python3 tests/regression/check_debug_acceptance_parity.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv --gcc gcc-16 --json target/debug-acceptance-parity.json"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 tests/regression/check_asm_dialect_alternatives.py --self-test"
+        },
+        {
+          "measured_s": 1.39,
+          "name": "python3 tests/regression/check_asm_dialect_alternatives.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv --gcc gcc-16 --clang clang-23 --json target/asm-dialect-alternatives.json"
         },
         {
           "measured_s": 0.3,
@@ -1851,7 +1867,7 @@
     "backend-contracts": {
       "costs": "/tmp/gates.tsv",
       "measured_seconds_total": 1064.77,
-      "source": "measured by scripts/ci_gate_costs.py; rootfs-write-policy gates measured locally (max of 3 runs)"
+      "source": "measured by scripts/ci_gate_costs.py; rootfs-write-policy gates measured locally (max of 3 runs); debug-acceptance-parity and asm-dialect-alternatives (4 commands) measured locally as max of 3 runs, floored at 0.25 s, +2.92 s"
     },
     "codegen": {
       "costs": "/home/user/.cache/tmp/codegen.tsv",
