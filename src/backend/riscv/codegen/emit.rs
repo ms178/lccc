@@ -187,9 +187,15 @@ pub struct RiscvCodegen {
     /// does not model, so the call is published unannotated and the
     /// peephole keeps assuming it reads every caller-saved register.
     pub(super) call_gp_reads: Option<u8>,
-    /// The suppressed call's `call_gp_reads`, for the annotation of the
-    /// sibling call's tail line (`emit_return_impl`).
-    pub(super) sibcall_reads: Option<u8>,
+    /// The suppressed call's annotation mask (`call_gp_reads`, plus
+    /// `CALL_READS_CHAIN`), for the sibling call's tail line
+    /// (`emit_return_impl`).
+    pub(super) sibcall_reads: Option<u16>,
+    /// A `SetStaticChain` wrote t2 for the next call (the IR places it
+    /// immediately before the call it serves); taken by
+    /// `emit_call_instruction_impl`, which publishes it as
+    /// `CALL_READS_CHAIN`.
+    pub(super) static_chain_armed: bool,
     /// Scratch register indices for inline asm allocation.
     pub(super) asm_gp_scratch_idx: usize,
     pub(super) asm_fp_scratch_idx: usize,
@@ -220,6 +226,12 @@ pub struct RiscvCodegen {
     /// A hidden TLS resolver call needs `ra` saved, but when there are no
     /// stack slots or callee-saved value homes it does not need an s0 frame.
     pub(super) ra_only_frame: bool,
+    /// No value slot, alloca or return buffer: the frame is the frame record
+    /// and the callee saves alone (set with the frame size).
+    pub(super) slot_free: bool,
+    /// The frame-pointer-free frame of `fp_less_frame_ok`: ra and the
+    /// callee-saved registers, sp-relative, no s0 setup.
+    pub(super) fp_less_frame: bool,
     /// The current function returns a flattened float struct in fa0/fa1/a0
     /// (`call_abi::hidden_fp_agg_return`): the s0-relative offset of the
     /// private buffer its hidden return pointer is homed as, and the class.
@@ -244,6 +256,7 @@ impl RiscvCodegen {
             is_variadic: false,
             call_gp_reads: None,
             sibcall_reads: None,
+            static_chain_armed: false,
             asm_gp_scratch_idx: 0,
             asm_fp_scratch_idx: 0,
             asm_borrowed_callee_saved: Vec::new(),
@@ -254,6 +267,8 @@ impl RiscvCodegen {
             frameless_leaf: false,
             tls_resolver_only: false,
             ra_only_frame: false,
+            slot_free: false,
+            fp_less_frame: false,
             fp_ret_buffer: None,
         }
     }
@@ -849,7 +864,8 @@ impl ArchCodegen for RiscvCodegen {
         // The ordinary prologue sets s0 (DWARF fp, register 8) to the top of
         // the frame and every stack slot is an s0-relative displacement.  The
         // frameless leaf and RA-only TLS frames never establish s0.
-        (!self.frameless_leaf && !self.ra_only_frame).then_some((8, slot.0))
+        (!self.frameless_leaf && !self.ra_only_frame && !self.fp_less_frame)
+            .then_some((8, slot.0))
     }
 
     /// Provenance markers for user inline-asm bodies: `#APP`/`#NO_APP`, as

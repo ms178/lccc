@@ -870,7 +870,17 @@ impl RiscvCodegen {
         _stack_arg_space: usize,
     ) {
         // Taken on every path: a stale set must never reach a later call.
-        let reads = self.call_gp_reads.take();
+        // The static chain armed by the `SetStaticChain` just before this
+        // call (its IR position) is t2, bit 8 of the annotation.
+        let chain = std::mem::take(&mut self.static_chain_armed);
+        let reads = self.call_gp_reads.take().map(|mask| {
+            u16::from(mask)
+                | if chain {
+                    super::peephole::CALL_READS_CHAIN as u16
+                } else {
+                    0
+                }
+        });
         // Sibling call: the argument setup ran unchanged; the call itself is
         // replaced by the block's `Return` emitting `<epilogue>; tail target`
         // (or `jr t2`: the epilogue touches only t0 and t6 besides the

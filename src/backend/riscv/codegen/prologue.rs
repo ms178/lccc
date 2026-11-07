@@ -476,10 +476,119 @@ impl RiscvCodegen {
             (-space, class)
         });
 
+        // No value slot, alloca or return buffer below the frame record:
+        // nothing in the body addresses the frame through s0 (one of the
+        // conditions of the frame-pointer-free frame, `fp_less_frame`).
+        self.slot_free = space == 16 && self.fp_ret_buffer.is_none();
+
         // Add space for saving callee-saved registers.
         // Each callee-saved register needs 8 bytes on the stack.
         let callee_save_space = (self.used_callee_saved.len() as i64) * 8;
         space + callee_save_space
+    }
+
+    /// The frame-pointer-free frame (`fp_less_frame`): ra above the
+    /// callee-saved registers, everything sp-relative, `size` bytes --
+    /// GCC's and Clang's -O2 shape.
+    ///
+    /// Requirements, each load-bearing:
+    /// * frame-pointer omission requested and possible (`omit_frame_pointer`:
+    ///   not `-fno-omit-frame-pointer`, no `__builtin_frame_address`, no
+    ///   dynamic alloca, no frame-pointer inline asm);
+    /// * no slot, alloca or return buffer (`slot_free`): the body never
+    ///   addresses the frame through s0;
+    /// * neither variadic (the save area sits above s0) nor sret, and no
+    ///   parameter on the stack (read s0-relative);
+    /// * the emitter-safe allowlist with plain scalar calls
+    ///   (`riscv_emitter_safe_ir`): no intrinsic, inline asm or nonlocal-goto
+    ///   plumbing reads s0;
+    /// * no call passes stack arguments: sp never moves inside the body, so
+    ///   the CFA stays `sp + size` at every call an unwinder may walk out of.
+    fn fp_less_frame_ok(&self, func: &IrFunction) -> bool {
+        use crate::ir::reexports::Instruction;
+        let config = self.call_abi_config_impl();
+        self.state.omit_frame_pointer
+            && self.slot_free
+            && !self.is_variadic
+            && !func.uses_sret
+            && !self.state.has_dyn_alloca
+            && Self::fits_imm12(self.fp_less_frame_size())
+            && !classify_params(func, &config).iter().any(|c| {
+                !matches!(c, ParamClass::IntReg { .. } | ParamClass::FloatReg { .. })
+            })
+            && self.riscv_emitter_safe_ir(func, true, true)
+            && func.blocks.iter().all(|block| {
+                block.instructions.iter().all(|inst| match inst {
+                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                        !crate::backend::call_abi::classify_call_args(
+                            &info.args,
+                            &info.arg_types,
+                            &info.struct_arg_sizes,
+                            &info.struct_arg_aligns,
+                            &info.struct_arg_classes,
+                            &info.struct_arg_fp_agg_classes,
+                            &info.struct_arg_is_f128_sse,
+                            info.is_variadic.then_some(info.num_fixed_args),
+                            &config,
+                        )
+                        .iter()
+                        .any(crate::backend::call_abi::CallArgClass::is_stack)
+                    }
+                    _ => true,
+                })
+            })
+    }
+
+    /// The `fp_less_frame` size: ra plus the callee-saved registers,
+    /// 16-byte aligned.
+    fn fp_less_frame_size(&self) -> i64 {
+        (8 + 8 * self.used_callee_saved.len() as i64 + 15) & !15
+    }
+
+    /// The `fp_less_frame` prologue: `addi sp, sp, -size`, ra at the top,
+    /// callee-saved registers from sp upward, each with its CFA row (the CFA
+    /// is `sp + size` throughout the body).
+    fn emit_fp_less_prologue(&mut self) {
+        let size = self.fp_less_frame_size();
+        self.state
+            .emit_fmt(format_args!("    addi sp, sp, -{}", size));
+        if self.state.emit_cfi {
+            self.state
+                .emit_fmt(format_args!("    .cfi_def_cfa_offset {}", size));
+        }
+        self.state
+            .emit_fmt(format_args!("    sd ra, {}(sp)", size - 8));
+        if self.state.emit_cfi {
+            self.state.emit("    .cfi_offset ra, -8");
+        }
+        let used_regs = self.used_callee_saved.clone();
+        for (i, &reg) in used_regs.iter().enumerate() {
+            let offset = i as i64 * 8;
+            let reg_name = callee_saved_name(reg);
+            self.state
+                .emit_fmt(format_args!("    sd {}, {}(sp)", reg_name, offset));
+            if self.state.emit_cfi {
+                self.state
+                    .emit_fmt(format_args!("    .cfi_offset {}, {}", reg_name, offset - size));
+            }
+        }
+    }
+
+    /// The `fp_less_frame` epilogue (no `ret`).
+    fn emit_fp_less_epilogue(&mut self) {
+        let size = self.fp_less_frame_size();
+        let used_regs = self.used_callee_saved.clone();
+        for (i, &reg) in used_regs.iter().enumerate() {
+            self.state.emit_fmt(format_args!(
+                "    ld {}, {}(sp)",
+                callee_saved_name(reg),
+                i as i64 * 8
+            ));
+        }
+        self.state
+            .emit_fmt(format_args!("    ld ra, {}(sp)", size - 8));
+        self.state
+            .emit_fmt(format_args!("    addi sp, sp, {}", size));
     }
 
     // ---- aligned_frame_size ----
@@ -575,7 +684,13 @@ impl RiscvCodegen {
             && !func.uses_sret
             && self.used_callee_saved.is_empty()
             && self.tls_resolver_only;
+        self.fp_less_frame =
+            !self.frameless_leaf && !self.ra_only_frame && self.fp_less_frame_ok(func);
         if self.frameless_leaf {
+            return;
+        }
+        if self.fp_less_frame {
+            self.emit_fp_less_prologue();
             return;
         }
         if self.ra_only_frame {
@@ -614,6 +729,10 @@ impl RiscvCodegen {
 
     pub(super) fn emit_epilogue_impl(&mut self, frame_size: i64) {
         if self.frameless_leaf {
+            return;
+        }
+        if self.fp_less_frame {
+            self.emit_fp_less_epilogue();
             return;
         }
         if self.ra_only_frame {
@@ -1352,6 +1471,11 @@ impl RiscvCodegen {
     pub(super) fn emit_epilogue_and_ret_impl(&mut self, frame_size: i64) {
         self.state.flush_epilogue_loc();
         if self.frameless_leaf {
+            self.state.emit("    ret");
+            return;
+        }
+        if self.fp_less_frame {
+            self.emit_fp_less_epilogue();
             self.state.emit("    ret");
             return;
         }

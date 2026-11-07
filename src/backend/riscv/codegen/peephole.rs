@@ -3745,6 +3745,52 @@ fn scratch_dead_after(
     true
 }
 
+/// The line before `i` when lines `i - 1` and `i` are an in-place shift
+/// pair -- `slli r, s, K` then `srli`/`srai r, r, K` (a zero or sign
+/// extension of the low `64 - K` bits of `s` into `r`) -- with `r` = `reg`.
+fn shift_pair_head(
+    lines: &[String],
+    kinds: &[LineKind],
+    fstart: usize,
+    i: usize,
+    reg: u8,
+) -> Option<usize> {
+    let shift = |line: &str, m: &[&str]| -> Option<(u8, u8, i64)> {
+        let (mnem, rest) = line.trim().split_once(char::is_whitespace)?;
+        if !m.contains(&mnem) {
+            return None;
+        }
+        let ops: Vec<&str> = rest.split(',').map(str::trim).collect();
+        let [d, s, k] = ops.as_slice() else {
+            return None;
+        };
+        Some((parse_reg(d), parse_reg(s), parse_asm_i64(k)?))
+    };
+    let (d2, s2, k2) = shift(&lines[i], &["srli", "srai"])?;
+    if d2 != reg || s2 != reg {
+        return None;
+    }
+    let h = previous_live_line(kinds, i).filter(|&h| h > fstart)?;
+    let (d1, s1, k1) = shift(&lines[h], &["slli"])?;
+    (d1 == reg && s1 != REG_NONE && k1 == k2).then_some(h)
+}
+
+/// `line` (`srli`/`srai d, s, K`) with its source operand `from` renamed
+/// `to`.
+fn rename_shift_source(line: &str, from: u8, to: u8) -> String {
+    let indent = &line[..line.len() - line.trim_start().len()];
+    let Some((mnem, rest)) = line.trim().split_once(char::is_whitespace) else {
+        return line.to_string();
+    };
+    let ops: Vec<&str> = rest.split(',').map(str::trim).collect();
+    match ops.as_slice() {
+        [d, s, k] if parse_reg(s) == from => {
+            format!("{indent}{mnem} {d}, {}, {k}", reg_name(to))
+        }
+        _ => line.to_string(),
+    }
+}
+
 /// Replace the first operand of a `mnemonic rd, ...` line with `new_dst`.
 fn retarget_first_operand(line: &str, new_dst: u8) -> Option<String> {
     let trimmed = line.trim();
@@ -3761,7 +3807,8 @@ fn retarget_dying_accumulator_moves(
     n: usize,
 ) -> bool {
     /// The destination this pass may rewrite: a single-destination producer of
-    /// a shape it understands, writing an accumulator.
+    /// a shape it understands, writing a temporary or a value home (never
+    /// s0, sp, ra or zero, which carry meaning of their own).
     fn producible_dest(line: &str, kind: LineKind) -> Option<u8> {
         let dst = match kind {
             LineKind::Move { dst, .. }
@@ -3781,7 +3828,8 @@ fn retarget_dying_accumulator_moves(
             })?,
             _ => return None,
         };
-        (dst <= REG_T6).then_some(dst)
+        (dst <= REG_T6 || (REG_S1..=REG_S11).contains(&dst) || (REG_A0..=REG_A7).contains(&dst))
+            .then_some(dst)
     }
     if n == 0 {
         return false;
@@ -3828,8 +3876,13 @@ fn retarget_dying_accumulator_moves(
             // The scratch must die at the move: the local scan settles
             // straight-line code, the function's liveness what lies past a
             // branch or a label (built once, on the first such question --
-            // each rewrite only shortens the scratch's live range).
-            let dead = scratch_dead_after(lines, kinds, j + 1, tmp, fend) || {
+            // each rewrite only shortens the scratch's live range).  A value
+            // home is judged by the liveness alone: `ret` reads a0/a1 and
+            // the callee-saved registers, which the local scan (written for
+            // scratch registers) takes as the end of every life.  (`srai a2,
+            // t0, 56; mv a0, a2; tail take_s8` is `srai a0, t0, 56`.)
+            let scratch = tmp <= REG_T6;
+            let dead = (scratch && scratch_dead_after(lines, kinds, j + 1, tmp, fend)) || {
                 if live.is_none() {
                     live = Some(RvLiveness::build(lines, kinds, fstart, fend));
                 }
@@ -3842,6 +3895,12 @@ fn retarget_dying_accumulator_moves(
                 continue;
             }
             let self_move = matches!(kinds[i], LineKind::Move { src, .. } if src == dst);
+            // The second shift of an in-place extension pair (`slli a0, a0,
+            // 32; srli a0, a0, 32`) moves with its first: retargeted alone it
+            // would leave `slli a0, a0, 32; srli t0, a0, 32`, a form the
+            // extension passes no longer read as one (the zero extension of
+            // an `unsigned` parameter then survived into a 16-bit use).
+            let pair_head = shift_pair_head(lines, kinds, fstart, i, tmp);
             if self_move {
                 kinds[i] = LineKind::Nop;
             } else {
@@ -3849,7 +3908,18 @@ fn retarget_dying_accumulator_moves(
                     i += 1;
                     continue;
                 };
-                lines[i] = new_line;
+                if let Some(h) = pair_head {
+                    let Some(head) = retarget_first_operand(&lines[h], dst) else {
+                        i += 1;
+                        continue;
+                    };
+                    lines[h] = head;
+                    kinds[h] = classify_line(&lines[h]);
+                    // The second shift now reads the first's new register.
+                    lines[i] = rename_shift_source(&new_line, tmp, dst);
+                } else {
+                    lines[i] = new_line;
+                }
                 kinds[i] = classify_line(&lines[i]);
             }
             kinds[j] = LineKind::Nop;
@@ -4287,8 +4357,20 @@ fn rv_annotated_call_reads(line: &str) -> Option<u64> {
         .next()?
         .parse()
         .ok()?;
-    Some(((mask & 0xff) << REG_A0) | rv_bit(REG_T2) | rv_bit(REG_SP))
+    // Bit 8: the call passes a nested function's static chain in t2
+    // (`CALL_READS_CHAIN`).
+    let chain = if mask & CALL_READS_CHAIN != 0 {
+        rv_bit(REG_T2)
+    } else {
+        0
+    };
+    Some(((mask & 0xff) << REG_A0) | chain | rv_bit(REG_SP))
 }
+
+/// The `CALL_READS_TAG` mask bit of a call that reads t2 as a nested
+/// function's static chain (`SetStaticChain` armed it); bits 0-7 are
+/// a0-a7.
+pub(super) const CALL_READS_CHAIN: u64 = 1 << 8;
 
 const RET_REGS_MARKER: &str = "# lccc-ret-regs";
 
@@ -7067,6 +7149,17 @@ fn propagate_copies_within_blocks(lines: &mut [String], kinds: &mut [LineKind], 
             }
             if lines[j] == OPAQUE_LINE {
                 break;
+            }
+            // `mv src, dst` after `mv dst, src`, neither written since: `src`
+            // already holds the value -- the call staging's round trip
+            // `mv t3, a0; mv t4, a1; mv a0, t3; mv a1, t4` for arguments that
+            // arrived where they are passed.  It writes nothing new, so the
+            // scan goes on.
+            if kinds[j] == (LineKind::Move { dst: src, src: dst }) {
+                kinds[j] = LineKind::Nop;
+                changed = true;
+                j += 1;
+                continue;
             }
             let (uses, _) = rv_uses_defs(&lines[j], kinds[j]);
             let writes = named_gp_dest(&lines[j], kinds[j]);
