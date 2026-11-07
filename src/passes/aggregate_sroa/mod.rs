@@ -893,12 +893,28 @@ fn run_function(func: &mut IrFunction) -> usize {
 
     // ── 2. Collapse copy-buffer allocas ────────────────────────────────────
     {
+        let nonvolatile_allocas: FxHashSet<u32> = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter_map(|inst| match inst {
+                Instruction::Alloca {
+                    dest,
+                    semantic_volatile: false,
+                    ..
+                } => Some(dest.0),
+                _ => None,
+            })
+            .collect();
         let uses = pointer_uses(func, &s.gep);
-        for (&r, &(mb, mi, w_src, _)) in &memcpy_writer {
+        for (&r, &(mb, mi, w_src, w_size)) in &memcpy_writer {
             if memcpy_writer_count.get(&r).copied().unwrap_or(0) != 1 {
                 continue;
             }
-            if store_target.contains(&r) || any_escape(&s.escapes, &s.gep, r) {
+            if store_target.contains(&r)
+                || any_escape(&s.escapes, &s.gep, r)
+                || !nonvolatile_allocas.contains(&r)
+            {
                 continue;
             }
             // pointer_uses() sees the PRE-plan stream: uses Transform 1 is
@@ -932,48 +948,40 @@ fn run_function(func: &mut IrFunction) -> usize {
             //     (no dominance information is available in this pass, and a
             //     cross-block reader may be reached without the writer), and
             //   * neither the buffer nor the source may be written in between.
-            let (w_src_root, _) = resolve(&s.gep, w_src);
             let mut rewired = 0;
             let mut unsafe_reader = false;
             let mut pending: Vec<(usize, usize)> = Vec::new();
             for (bi, block) in func.blocks.iter().enumerate() {
                 for (ii, inst) in block.instructions.iter().enumerate() {
-                    if let Instruction::Memcpy { src, .. } = inst {
+                    if let Instruction::Memcpy { dest, src, size } = inst {
                         let (sr, soff) = resolve(&s.gep, src.0);
                         if sr != r || soff != Some(0) {
                             continue;
                         }
-                        if bi != mb || ii <= mi {
-                            unsafe_reader = true; // not dominated by the writer
+                        // The replacement copy must have the same extent and
+                        // must not introduce overlap: only distinct direct
+                        // alloca roots prove disjoint here, without a separate
+                        // alias/escape analysis of both ranges.
+                        if bi != mb
+                            || ii <= mi
+                            || usize::try_from(w_size).ok() != Some(*size)
+                            || !nonvolatile_allocas.contains(&w_src)
+                            || !nonvolatile_allocas.contains(&dest.0)
+                            || w_src == dest.0
+                        {
+                            unsafe_reader = true;
                             break;
                         }
-                        let mut dirty = false;
-                        for k in (mi + 1)..ii {
-                            match block.instructions.get(k) {
-                                Some(Instruction::Store { ptr, .. }) => {
-                                    let (pr, _) = resolve(&s.gep, ptr.0);
-                                    if pr == w_src_root || pr == r {
-                                        dirty = true;
-                                        break;
-                                    }
-                                }
-                                Some(Instruction::Memcpy { dest, .. }) => {
-                                    let (pr, _) = resolve(&s.gep, dest.0);
-                                    if pr == w_src_root || pr == r {
-                                        dirty = true;
-                                        break;
-                                    }
-                                }
-                                // Anything that can write memory opaquely may
-                                // touch either pointer (calls, inline asm,
-                                // atomics, impure intrinsics, va machinery).
-                                Some(other) if is_opaque_memory_write(other) => {
-                                    dirty = true;
-                                    break;
-                                }
-                                _ => {}
-                            }
-                        }
+                        // Different pointer values may denote the same bytes.
+                        // A store through q can clobber p, just like a call or
+                        // an atomic; a root-identity check alone is not proof.
+                        let dirty = block.instructions[(mi + 1)..ii].iter().any(|other| {
+                            other.may_write_memory()
+                                || matches!(
+                                    other,
+                                    Instruction::Fence { .. } | Instruction::AtomicLoad { .. }
+                                )
+                        });
                         if dirty {
                             unsafe_reader = true;
                             break;
