@@ -2406,3 +2406,147 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod snapshot_forwarding_contract {
+    use super::*;
+    use crate::common::types::{AddressSpace, IrType};
+    use crate::ir::reexports::{BasicBlock, BlockId, CallInfo};
+
+    fn alloca(v: u32, semantic_volatile: bool) -> Instruction {
+        Instruction::Alloca {
+            dest: Value(v),
+            ty: IrType::Ptr,
+            size: 64,
+            align: 8,
+            volatile: false,
+            semantic_volatile,
+        }
+    }
+
+    fn module(
+        between: Vec<Instruction>,
+        src: u32,
+        dest: u32,
+        size: usize,
+        volatile: Option<u32>,
+        after: Vec<Instruction>,
+    ) -> IrModule {
+        let mut f = IrFunction::new("snapshot".into(), IrType::Void, vec![], false);
+        let mut instructions: Vec<_> = (0..3).map(|v| alloca(v, volatile == Some(v))).collect();
+        instructions.push(Instruction::Memcpy {
+            dest: Value(1),
+            src: Value(src),
+            size: 64,
+        });
+        instructions.extend(between);
+        instructions.push(Instruction::Memcpy {
+            dest: Value(dest),
+            src: Value(1),
+            size,
+        });
+        instructions.extend(after);
+        // Keep the destination live across repeated SROA rounds.
+        instructions.push(Instruction::Call {
+            func: "observe".into(),
+            info: CallInfo {
+                args: vec![Operand::Value(Value(dest))],
+                ..Default::default()
+            },
+        });
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        });
+        let mut m = IrModule::new();
+        m.functions.push(f);
+        m
+    }
+
+    fn copies(m: &IrModule) -> Vec<(Value, Value, usize)> {
+        m.functions[0].blocks[0]
+            .instructions
+            .iter()
+            .filter_map(|i| match i {
+                Instruction::Memcpy { dest, src, size } => Some((*dest, *src, *size)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn store(ptr: u32) -> Instruction {
+        Instruction::Store {
+            val: Operand::Const(IrConst::I64(7)),
+            ptr: Value(ptr),
+            ty: IrType::I64,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        }
+    }
+
+    #[test]
+    fn both_copy_buffer_transforms_refuse_unproven_forwarding() {
+        // A direct alloca-to-alloca copy is safe and should still optimize.
+        // Every other case invalidates at least one proof: opaque call, store
+        // through a derived alias, unknown src/dst, different lengths, or
+        // observable volatile storage.
+        for pass in [
+            forward_memcpy_chains as fn(&mut IrModule) -> usize,
+            crate::passes::aggregate_sroa::run,
+        ] {
+            let mut safe = module(vec![], 0, 2, 64, None, vec![]);
+            pass(&mut safe);
+            assert_eq!(copies(&safe), vec![(Value(2), Value(0), 64)]);
+            let mut cases = vec![
+                module(
+                    vec![Instruction::Call {
+                        func: "mutate".into(),
+                        info: CallInfo {
+                            args: vec![Operand::Value(Value(0))],
+                            ..Default::default()
+                        },
+                    }],
+                    0,
+                    2,
+                    64,
+                    None,
+                    vec![],
+                ),
+                module(
+                    vec![
+                        Instruction::Copy {
+                            dest: Value(3),
+                            src: Operand::Value(Value(0)),
+                        },
+                        store(3),
+                    ],
+                    0,
+                    2,
+                    64,
+                    None,
+                    vec![],
+                ),
+                module(vec![], 4, 2, 64, None, vec![]),
+                module(vec![], 0, 4, 64, None, vec![]),
+                module(vec![], 0, 2, 32, None, vec![]),
+                module(vec![], 0, 2, 64, Some(1), vec![]),
+                module(vec![], 0, 2, 64, Some(0), vec![]),
+                module(vec![], 0, 2, 64, Some(2), vec![]),
+            ];
+            for (i, m) in cases.iter_mut().enumerate() {
+                pass(m);
+                assert_eq!(
+                    copies(m).len(),
+                    2,
+                    "unsafe case {i}: {:?}",
+                    m.functions[0].blocks[0].instructions
+                );
+            }
+            let mut write_after = module(vec![], 0, 2, 64, None, vec![store(0)]);
+            pass(&mut write_after);
+            assert_eq!(copies(&write_after), vec![(Value(2), Value(0), 64)]);
+        }
+    }
+}
