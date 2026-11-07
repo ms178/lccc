@@ -6855,6 +6855,7 @@ fn split_errno_sqrt(func: &mut IrFunction, bi: usize, at: usize) {
             instructions: join_insts,
             terminator: old_term,
             source_spans: join_spans,
+            source_inline_ids: Vec::new(),
         },
     );
     func.blocks.push(BasicBlock {
@@ -6862,6 +6863,7 @@ fn split_errno_sqrt(func: &mut IrFunction, bi: usize, at: usize) {
         instructions: vec![Instruction::Call { func: callee, info }],
         terminator: Terminator::Branch(join_label),
         source_spans: slow_spans,
+        source_inline_ids: Vec::new(),
     });
 }
 
@@ -11324,6 +11326,7 @@ mod tests {
             instructions,
             terminator: Terminator::Return(Some(Operand::Value(Value(10)))),
             source_spans: spans,
+            source_inline_ids: Vec::new(),
         }];
         let mut module = IrModule::new();
         module.functions.push(func);
@@ -11780,6 +11783,7 @@ mod exact_product_half_tests {
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(6)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             });
             func.next_value_id = 7;
 
@@ -11882,6 +11886,7 @@ mod exact_product_half_tests {
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             });
             func.next_value_id = 5;
 
@@ -11973,6 +11978,7 @@ mod exact_product_half_tests {
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             });
             func.next_value_id = 3;
 
@@ -12129,6 +12135,7 @@ mod exact_product_half_tests {
                 instructions,
                 terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             });
             func.next_value_id = 3;
             simplify_function(&mut func);
@@ -12459,6 +12466,7 @@ mod exact_product_half_tests {
                                 instructions: body,
                                 terminator: Terminator::Return(Some(Operand::Value(Value(5)))),
                                 source_spans: Vec::new(),
+                                source_inline_ids: Vec::new(),
                             });
                             func.next_value_id = 6;
 
@@ -12624,6 +12632,7 @@ mod exact_product_half_tests {
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(5)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             });
             func.next_value_id = 6;
 
@@ -12730,6 +12739,7 @@ mod exact_product_half_tests {
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(6)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             });
             func.next_value_id = 7;
 
@@ -12799,6 +12809,7 @@ mod exact_product_half_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 5;
         func
@@ -12972,6 +12983,7 @@ mod exact_product_half_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(5)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 6;
         simplify_function(&mut func);
@@ -13019,6 +13031,7 @@ mod highbit_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         f.next_value_id = 4;
         f
@@ -13101,6 +13114,7 @@ mod highbit_tests {
             instructions,
             terminator: Terminator::Return(Some(Operand::Value(Value(ret)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         f.next_value_id = 4;
         f
@@ -13228,6 +13242,7 @@ mod pack_extract_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(8)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         f.next_value_id = 9;
         f
@@ -13390,6 +13405,7 @@ mod pack_extract_tests {
             ],
             terminator: Terminator::Return(Some(v(15))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         f.next_value_id = 18;
         simplify_function(&mut f);
@@ -13437,6 +13453,7 @@ mod pack_extract_tests {
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             });
             f.next_value_id = 3;
             simplify_function(&mut f);
@@ -13471,6 +13488,7 @@ mod pack_extract_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         f.next_value_id = 3;
         simplify_function(&mut f);
@@ -13505,6 +13523,7 @@ mod pack_extract_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         f.next_value_id = 3;
         simplify_function(&mut f);
@@ -13560,6 +13579,7 @@ mod pack_extract_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         f.next_value_id = 3;
         simplify_function(&mut f);
@@ -13657,6 +13677,7 @@ mod pack_extract_tests {
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             });
             f.next_value_id = 5;
             f
@@ -13716,6 +13737,7 @@ mod cast_narrowing_census_tests {
             instructions,
             terminator: term,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         for label in [1, 2] {
             f.blocks.push(BasicBlock {
@@ -13723,6 +13745,7 @@ mod cast_narrowing_census_tests {
                 instructions: Vec::new(),
                 terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(label as i32)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             });
         }
         f.next_value_id = 64;

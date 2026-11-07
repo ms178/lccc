@@ -71,6 +71,7 @@ impl Program {
         f.blocks.push(BasicBlock {
             label: BlockId(0),
             source_spans: vec![crate::common::source::Span::dummy(); self.instructions.len()],
+            source_inline_ids: Vec::new(),
             instructions: self.instructions,
             terminator: Terminator::Return(Some(result)),
         });

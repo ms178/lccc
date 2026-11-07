@@ -639,6 +639,7 @@ mod tests {
             // was right to reject those).
             terminator: Terminator::Return(Some(v(2))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = next_id;
         let mut module = IrModule::new();
@@ -920,12 +921,14 @@ mod tests {
             instructions: vec![neg(1, 0, IrType::F64)],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
             instructions: vec![fma(2, v(1), v(3), v(4), true)],
             terminator: Terminator::Return(Some(v(2))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 5;
         let mut module = IrModule::new();
@@ -1241,6 +1244,7 @@ mod tests {
                 crate::common::source::Span::new(30, 40, 0),
                 crate::common::source::Span::new(50, 60, 0),
             ],
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 6;
         let mut module = IrModule::new();

@@ -197,6 +197,7 @@ mod tests {
         f.blocks.push(BasicBlock {
             label: BlockId(0),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
             instructions: vec![
                 alloca(Value(9), IrType::I128, 16, 16),
                 Instruction::ParamRef {

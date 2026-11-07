@@ -343,6 +343,7 @@ fn fixture(shape: Shape, acc_ty: IrType, iv_ty: IrType, limit: Limit, seed: i64)
     let block = |id: u32, instructions: Vec<Instruction>, terminator| BasicBlock {
         label: BlockId(id),
         source_spans: vec![Span::dummy(); instructions.len()],
+        source_inline_ids: Vec::new(),
         instructions,
         terminator,
     };

@@ -980,6 +980,7 @@ mod tests {
             instructions: Vec::new(),
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // 1: header
         f.blocks.push(BasicBlock {
@@ -991,6 +992,7 @@ mod tests {
                 false_label: BlockId(3),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // 2: latch
         f.blocks.push(BasicBlock {
@@ -998,6 +1000,7 @@ mod tests {
             instructions: Vec::new(),
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // 3: exit
         f.blocks.push(BasicBlock {
@@ -1005,6 +1008,7 @@ mod tests {
             instructions: Vec::new(),
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         f
     }
@@ -1447,6 +1451,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         f.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -1477,6 +1482,7 @@ mod tests {
                 false_label: BlockId(0),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         f.next_value_id = 11;
         assert_eq!(

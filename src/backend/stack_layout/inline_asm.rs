@@ -531,6 +531,7 @@ mod tests {
             instructions: vec![inst],
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func
     }

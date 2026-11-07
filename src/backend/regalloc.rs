@@ -15490,6 +15490,7 @@ mod phi_coalesce_tests {
             instructions,
             terminator,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -17621,6 +17622,7 @@ mod map_collector_tests {
             instructions: insts,
             terminator: term,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }];
         f
     }
@@ -17719,6 +17721,7 @@ mod map_collector_tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         let addresses = frame_address_values(&f);
         for value in [1u32, 2, 3, 4] {
@@ -18025,6 +18028,7 @@ mod allocation_kernel_tests {
             instructions: Vec::new(),
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }];
         let mut liveness = compute_live_intervals(&func);
         liveness.intervals = intervals;
@@ -18097,6 +18101,7 @@ mod allocation_kernel_tests {
             instructions,
             terminator,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -19755,6 +19760,7 @@ mod sse_destructive_tests {
             instructions,
             terminator,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -20086,6 +20092,7 @@ mod scalar_lane_class_tests {
             instructions,
             terminator: Terminator::Return(Some(Operand::Value(Value(8)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         let non_gpr = collect_non_gpr_values(&f, false);
         let vectors = collect_vector_values(&f);
@@ -20129,6 +20136,7 @@ mod scalar_lane_class_tests {
             instructions,
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         let scalars = collect_f64_values(&f, true);
         let conservative = collect_f64_values(&f, false);
@@ -20168,6 +20176,7 @@ mod scalar_lane_class_tests {
             instructions,
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         };
         f.blocks.push(bb(
             0,
@@ -20225,6 +20234,7 @@ mod scalar_lane_class_tests {
             }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         f.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -20250,6 +20260,7 @@ mod scalar_lane_class_tests {
                 false_label: BlockId(4),
             },
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         f.blocks.push(BasicBlock {
             label: BlockId(2),
@@ -20266,6 +20277,7 @@ mod scalar_lane_class_tests {
                 false_label: BlockId(4),
             },
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         f.blocks.push(BasicBlock {
             label: BlockId(3),
@@ -20275,12 +20287,14 @@ mod scalar_lane_class_tests {
             }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         f.blocks.push(BasicBlock {
             label: BlockId(4),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Value(Value(11)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         f.next_value_id = 14;
         let liveness = compute_live_intervals(&f);
@@ -20315,6 +20329,7 @@ mod scalar_lane_class_tests {
             instructions,
             terminator,
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         };
         let mut middle = vec![Instruction::Store {
             val: Operand::Value(Value(11)),
@@ -20601,6 +20616,7 @@ mod phi_chain_shape_tests {
                 instructions: vec![],
                 terminator,
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             });
         }
         f
@@ -20625,18 +20641,21 @@ mod phi_chain_shape_tests {
                 false_label: BlockId(2),
             },
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         f.blocks.push(BasicBlock {
             label: BlockId(1),
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         f.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![],
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         f
     }
@@ -20693,6 +20712,7 @@ mod phi_chain_shape_tests {
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         let (preds, succs) = cfg_of(&f);
         assert_eq!(phi_update_region(&preds, &succs, 0, 2), None);
@@ -20734,6 +20754,7 @@ mod phi_chain_shape_tests {
                 false_label: BlockId(2),
             },
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         for i in 1..3u32 {
             f.blocks.push(BasicBlock {
@@ -20741,6 +20762,7 @@ mod phi_chain_shape_tests {
                 instructions: vec![],
                 terminator: Terminator::Branch(BlockId(3)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             });
         }
         f.blocks.push(BasicBlock {
@@ -20748,6 +20770,7 @@ mod phi_chain_shape_tests {
             instructions: vec![],
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         let (preds, succs) = cfg_of(&f);
         assert_eq!(preds.len(3), 2, "precondition: block 3 is a join");
@@ -20772,18 +20795,21 @@ mod phi_chain_shape_tests {
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         g.blocks.push(BasicBlock {
             label: BlockId(1),
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         g.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         let preds = preds_of(&g);
         assert_eq!(single_pred_chain(&preds, 0, 2), None);
@@ -20922,6 +20948,7 @@ mod call_sequence_policy_tests {
             instructions: insts,
             terminator: Terminator::Return(Some(v(acc))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }];
         f.next_value_id = 50;
         f
@@ -21103,6 +21130,7 @@ mod fold_defer_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(5)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }];
         f.next_value_id = 6;
         f
@@ -21315,6 +21343,7 @@ mod wide_hazard_tests {
             ],
             terminator: Terminator::Return(Some(v(9))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         f.next_value_id = 10;
         assert_eq!(

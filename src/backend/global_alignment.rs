@@ -253,6 +253,7 @@ mod tests {
         function.blocks.push(BasicBlock {
             label: BlockId(0),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
             terminator: Terminator::Return(None),
             instructions: vec![
                 Instruction::GlobalAddr {
@@ -467,6 +468,7 @@ mod tests {
         relay.blocks.push(BasicBlock {
             label: BlockId(0),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
             terminator: Terminator::Return(None),
             instructions: vec![
                 Instruction::ParamRef {
@@ -494,6 +496,7 @@ mod tests {
         caller.blocks.push(BasicBlock {
             label: BlockId(0),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
             terminator: Terminator::Return(None),
             instructions: vec![
                 Instruction::GlobalAddr {

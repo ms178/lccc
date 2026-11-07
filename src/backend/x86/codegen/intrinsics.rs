@@ -13132,6 +13132,7 @@ mod vector_address_contract_tests {
             f.blocks.push(BasicBlock {
                 label: BlockId(0),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
                 instructions: vec![Instruction::BinOp {
                     dest: Value(2),
                     op: IrBinOp::Add,

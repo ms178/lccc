@@ -295,6 +295,7 @@ mod tests {
                 label: BlockId(0),
                 instructions: vec![],
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
                 terminator: Terminator::Branch(BlockId(1)),
             },
             BasicBlock {
@@ -321,6 +322,7 @@ mod tests {
                     },
                 ],
                 source_spans: vec![crate::common::source::Span::dummy(); 3],
+                source_inline_ids: Vec::new(),
                 terminator: Terminator::CondBranch {
                     cond: v(3),
                     true_label: BlockId(2),
@@ -337,12 +339,14 @@ mod tests {
                     ty,
                 }],
                 source_spans: vec![crate::common::source::Span::dummy()],
+                source_inline_ids: Vec::new(),
                 terminator: Terminator::Branch(BlockId(1)),
             },
             BasicBlock {
                 label: BlockId(3),
                 instructions: vec![],
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
                 terminator: Terminator::Return(Some(v(1))),
             },
         ];

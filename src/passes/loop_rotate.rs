@@ -2669,6 +2669,7 @@ mod tests {
             instructions: insts,
             terminator: term,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -3796,6 +3797,7 @@ mod affine_value_bound_tests {
             instructions: insts,
             terminator: term,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 

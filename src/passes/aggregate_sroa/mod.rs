@@ -1555,6 +1555,7 @@ mod scalar_memcpy_tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(lower_non_alloca_scalar_memcpy(&mut func), 1);
         let instructions = &func.blocks[0].instructions;
@@ -1619,6 +1620,7 @@ mod scalar_memcpy_tests {
             instructions,
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(lower_non_alloca_scalar_memcpy(&mut func), 1);
     }
@@ -1663,6 +1665,7 @@ mod scalar_memcpy_tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(lower_non_alloca_scalar_memcpy(&mut func), 1);
         let instructions = &func.blocks[0].instructions;
@@ -1715,6 +1718,7 @@ mod scalar_memcpy_tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(lower_non_alloca_scalar_memcpy(&mut func), 0);
         assert!(matches!(
@@ -1749,6 +1753,7 @@ mod scalar_memcpy_tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(lower_non_alloca_scalar_memcpy(&mut func), 0);
         assert!(matches!(
@@ -1801,6 +1806,7 @@ mod member_copy_writer_tests {
             instructions,
             terminator: Terminator::Return(Some(Operand::Value(Value(6)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         f
     }

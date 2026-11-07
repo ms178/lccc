@@ -684,6 +684,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(v(Value(3)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 4;
         func
@@ -922,6 +923,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(v(Value(4)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 5;
         assert_eq!(run(&mut func), 1);

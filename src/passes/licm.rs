@@ -2207,6 +2207,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // Block 1 (header): phi for i, check i < n
@@ -2235,6 +2236,7 @@ mod tests {
                 false_label: BlockId(3),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // Block 2 (body): loop-invariant computation (n * 4), then i++
@@ -2260,6 +2262,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // Block 3 (exit)
@@ -2268,6 +2271,7 @@ mod tests {
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         func.next_value_id = 6;
@@ -2596,6 +2600,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // Block 1 (header): phi + load from alloca + compare
@@ -2631,6 +2636,7 @@ mod tests {
                 false_label: BlockId(3),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // Block 2 (body): i++
@@ -2645,6 +2651,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // Block 3 (exit)
@@ -2653,6 +2660,7 @@ mod tests {
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         func.next_value_id = 6;
@@ -2703,6 +2711,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // Block 1 (header): load from alloca
@@ -2730,6 +2739,7 @@ mod tests {
                 false_label: BlockId(3),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // Block 2 (body): store to same alloca (modifies it!)
@@ -2753,6 +2763,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // Block 3 (exit)
@@ -2761,6 +2772,7 @@ mod tests {
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         func.next_value_id = 4;
@@ -2814,6 +2826,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // Block 1 (loop body): inline asm that writes to the alloca
@@ -2831,6 +2844,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // Block 2 (cond): load succeeded, check if zero, branch back or exit
@@ -2858,6 +2872,7 @@ mod tests {
                 false_label: BlockId(3), // exit
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // Block 3 (exit)
@@ -2866,6 +2881,7 @@ mod tests {
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         func.next_value_id = 3;
@@ -2931,6 +2947,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // Block 1 (loop_header): phi + cmp + condbranch
@@ -2959,6 +2976,7 @@ mod tests {
                 false_label: BlockId(3), // exit
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // Block 2 (body): inline asm with promoted output + copy + increment
@@ -2993,6 +3011,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(1)), // back to header
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // Block 3 (exit)
@@ -3001,6 +3020,7 @@ mod tests {
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         func.next_value_id = 8;
@@ -3055,6 +3075,7 @@ mod tests {
                 false_label: BlockId(2),
             },
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         // Block 1: rotated single-block loop loading `__lccc_cpu_w0` and calling a pure fn.
         func.blocks.push(BasicBlock {
@@ -3107,12 +3128,14 @@ mod tests {
                 false_label: BlockId(2),
             },
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I64(0)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 8;
 

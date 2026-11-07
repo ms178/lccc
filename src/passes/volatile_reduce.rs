@@ -438,18 +438,21 @@ fn rewrite(func: &mut IrFunction, c: Candidate) -> Option<()> {
                 false_label: combine,
             },
             source_spans: h_spans,
+            source_inline_ids: Vec::new(),
         },
         BasicBlock {
             label: mb,
             instructions: b_insts,
             terminator: Terminator::Branch(mh),
             source_spans: b_spans,
+            source_inline_ids: Vec::new(),
         },
         BasicBlock {
             label: combine,
             instructions: combine_insts,
             terminator: Terminator::Branch(old_header),
             source_spans: vec![c.spans.reduction; LANES - 1],
+            source_inline_ids: Vec::new(),
         },
     ]);
     func.next_value_id = value_id;

@@ -1516,6 +1516,7 @@ fn apply_phi_transformations(func: &mut IrFunction, ctx: &mut PhiElimCtx) {
             label: trampoline.label,
             instructions: trampoline.copies,
             source_spans: vec![crate::common::source::Span::dummy(); num_copies],
+            source_inline_ids: Vec::new(),
             terminator: Terminator::Branch(trampoline.branch_target),
         });
     }
@@ -1570,18 +1571,26 @@ fn place_pred_copies(block: &mut BasicBlock, copies: Vec<Instruction>) {
         }
     }
     let in_chain = |i: usize| chain.binary_search(&i).is_ok();
-    let spans = block.take_parallel_spans();
+    let (spans, ids) = block.take_parallel_debug();
     let tracked = !spans.is_empty();
+    let inline_at = |i: usize| {
+        ids.get(i)
+            .copied()
+            .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE)
+    };
     let old = std::mem::take(&mut block.instructions);
     let mut insts = Vec::with_capacity(old.len() + num_copies);
     let mut new_spans = Vec::with_capacity(if tracked { insts.capacity() } else { 0 });
+    let mut new_ids = Vec::with_capacity(if tracked { insts.capacity() } else { 0 });
     let mut tail = Vec::with_capacity(chain.len());
     let mut tail_spans = Vec::with_capacity(if tracked { chain.len() } else { 0 });
+    let mut tail_ids = Vec::with_capacity(if tracked { chain.len() } else { 0 });
     for (i, mut inst) in old.into_iter().enumerate() {
         let span = spans.get(i).copied();
         if !in_chain(i) {
             insts.push(inst);
             new_spans.extend(span);
+            new_ids.push(inline_at(i));
             continue;
         }
         inst.for_each_operand_mut(|op| {
@@ -1598,14 +1607,20 @@ fn place_pred_copies(block: &mut BasicBlock, copies: Vec<Instruction>) {
         });
         tail.push(inst);
         tail_spans.extend(span);
+        tail_ids.push(inline_at(i));
     }
     insts.extend(copies);
     if tracked {
         new_spans.extend(std::iter::repeat_n(Span::dummy(), num_copies));
+        new_ids.extend(std::iter::repeat_n(
+            crate::ir::instruction::NO_INLINE_INSTANCE,
+            num_copies,
+        ));
     }
     insts.extend(tail);
     new_spans.extend(tail_spans);
-    block.replace_insts(insts, new_spans);
+    new_ids.extend(tail_ids);
+    block.replace_insts_inline(insts, new_spans, new_ids);
 }
 
 /// Ascending indices of the compare chain feeding `block`'s `CondBranch` when
@@ -1954,6 +1969,7 @@ mod tests {
             label: BlockId(label),
             instructions: insts,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
             terminator: term,
         }
     }

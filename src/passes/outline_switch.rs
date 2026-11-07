@@ -781,6 +781,7 @@ fn build_outlined_function(
         instructions: entry_instructions,
         terminator: Terminator::Branch(first_case_block),
         source_spans: Vec::new(),
+        source_inline_ids: Vec::new(),
     };
 
     // Build return blocks for each exit point.
@@ -803,6 +804,7 @@ fn build_outlined_function(
         instructions: vec![],
         terminator: ret0_terminator,
         source_spans: Vec::new(),
+        source_inline_ids: Vec::new(),
     };
 
     // Create return blocks for each exit target.
@@ -818,6 +820,7 @@ fn build_outlined_function(
                 crate::ir::constants::IrConst::I32((i + 1) as i32),
             ))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
     }
 
@@ -850,6 +853,7 @@ fn build_outlined_function(
             instructions: new_instructions,
             terminator: new_terminator,
             source_spans: orig_block.source_spans.clone(),
+            source_inline_ids: Vec::new(),
         });
     }
 
@@ -886,6 +890,7 @@ fn build_outlined_function(
         debug_param_indices: Vec::new(),
         debug_locals: Vec::new(),
         debug_scopes: Vec::new(),
+        debug_inline_instances: Vec::new(),
         pass_policy: func.pass_policy,
         name: name.to_string(),
         return_type,

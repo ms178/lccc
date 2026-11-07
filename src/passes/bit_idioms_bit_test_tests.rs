@@ -99,6 +99,7 @@ fn func(insts: Vec<Instruction>, ret: u32) -> IrFunction {
         instructions: all,
         terminator: Terminator::Return(Some(v(ret))),
         source_spans: Vec::new(),
+        source_inline_ids: Vec::new(),
     }];
     f.next_value_id = 64;
     f
@@ -464,6 +465,7 @@ fn a_sign_extended_one_hot_is_not_a_bit_test() {
         ],
         terminator: Terminator::Return(Some(v(6))),
         source_spans: Vec::new(),
+        source_inline_ids: Vec::new(),
     }];
     f.next_value_id = 64;
     fold_bit_tests(&mut f);

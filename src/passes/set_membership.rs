@@ -1100,6 +1100,7 @@ fn fold_round(func: &mut IrFunction) -> usize {
             instructions: b2,
             terminator: b2_term,
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.next_label = next_label;
         func.next_value_id = next_id;
@@ -1132,6 +1133,7 @@ mod tests {
                 false_label: BlockId(miss),
             },
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -1151,6 +1153,7 @@ mod tests {
                 false_label: BlockId(miss),
             },
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -1166,6 +1169,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(join)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -1218,6 +1222,7 @@ mod tests {
                 false_label: BlockId(miss),
             },
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -1231,6 +1236,7 @@ mod tests {
             }],
             terminator: Terminator::Return(Some(Operand::Value(phi))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -1240,6 +1246,7 @@ mod tests {
             instructions: vec![],
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -1672,6 +1679,7 @@ mod tests {
                 instructions: vec![],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
         ];
         f.next_value_id = 100;
@@ -1701,6 +1709,7 @@ mod tests {
                 instructions: vec![],
                 terminator: Terminator::Return(Some(Operand::Value(Value(72)))),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
         ];
         f.next_value_id = 100;
@@ -1751,12 +1760,14 @@ mod tests {
                 }],
                 terminator: Terminator::Return(Some(Operand::Value(Value(60)))),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(90),
                 instructions: vec![],
                 terminator: Terminator::Return(Some(Operand::Const(IrConst::I64(1)))),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
         ];
         f.next_value_id = 100;

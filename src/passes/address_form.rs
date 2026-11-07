@@ -405,6 +405,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         f.next_value_id = 4;
         f
@@ -516,6 +517,7 @@ mod tests {
                     Terminator::Return(Some(Operand::Value(Value(3))))
                 },
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             });
             f.next_value_id = 6;
             f

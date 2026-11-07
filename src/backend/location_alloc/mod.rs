@@ -272,6 +272,7 @@ mod tests {
             instructions,
             terminator: term,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
     fn bin(dest: u32, op: IrBinOp, a: u32, b: u32, ty: IrType) -> Instruction {

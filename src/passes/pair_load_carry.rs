@@ -390,6 +390,7 @@ mod tests {
                 instructions,
                 terminator,
                 source_spans,
+                source_inline_ids: Vec::new(),
             });
         }
         f.next_value_id = 10;

@@ -30,6 +30,7 @@ fn fixture(mut insts: Vec<Instruction>) -> IrFunction {
         instructions: insts,
         terminator: Terminator::Return(None),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     });
     f
 }

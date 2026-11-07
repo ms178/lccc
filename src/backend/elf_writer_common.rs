@@ -4433,6 +4433,16 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     })
                 })
                 .collect();
+            let mut inline_markers = Vec::new();
+            for (name, &(section_index, offset)) in &self.label_positions {
+                if let Some(marker) = elf_mod::DwarfInlineMarker::parse(name, section_index, offset)
+                {
+                    inline_markers.push(marker);
+                }
+            }
+            inline_markers.sort_by(|a, b| {
+                (a.section_index, a.offset, &a.label).cmp(&(b.section_index, b.offset, &b.label))
+            });
             let primary_file = mapped_files
                 .iter()
                 .find(|(number, _)| *number == 1)
@@ -4484,6 +4494,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 &self.debug_line_locations,
                 &section_info,
                 &functions,
+                &inline_markers,
                 primary_file,
                 &comp_dir,
                 concat!("LCCC ", env!("CARGO_PKG_VERSION")),
@@ -4509,6 +4520,24 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 sections.extend(debug_strings.into_section(".debug_str"));
             }
             for mut section in sections {
+                // GAS folds a local label referenced by debug data into a
+                // section-relative relocation; the shared symbol table omits
+                // unreferenced `.L` labels.  Inline markers are compiler-private
+                // local labels referenced only by `.debug_*`, so fold them here
+                // against their FINAL post-relaxation offsets, before REL
+                // addends are patched into the section bytes (i686).
+                if section.name.starts_with(".debug_") {
+                    for reloc in &mut section.relocs {
+                        if reloc.symbol_name.starts_with(".L")
+                            || reloc.symbol_name.starts_with(".l")
+                        {
+                            if let Some((label_section, offset)) = labels.get(&reloc.symbol_name) {
+                                reloc.addend += *offset as i64;
+                                reloc.symbol_name = label_section.clone();
+                            }
+                        }
+                    }
+                }
                 if A::uses_rel_format() {
                     fold_rel_addends(&mut section)?;
                 }

@@ -276,12 +276,14 @@ pub(crate) fn closed_form_tail_sum(func: &mut IrFunction) -> usize {
             false_label: formula_label,
         },
         source_spans: spans(3),
+        source_inline_ids: Vec::new(),
     };
     let base_block = BasicBlock {
         label: base_label,
         instructions: Vec::new(),
         terminator: Terminator::Return(Some(Operand::Value(acc_param))),
         source_spans: Vec::new(),
+        source_inline_ids: Vec::new(),
     };
     let formula_block = BasicBlock {
         label: formula_label,
@@ -323,6 +325,7 @@ pub(crate) fn closed_form_tail_sum(func: &mut IrFunction) -> usize {
         ],
         terminator: Terminator::Return(Some(Operand::Value(result))),
         source_spans: spans(5),
+        source_inline_ids: Vec::new(),
     };
     func.blocks = vec![entry_block, base_block, formula_block];
     func.next_value_id = next;
@@ -860,6 +863,7 @@ fn calls_to_loops(func: &mut IrFunction, accumulate: bool) -> usize {
         instructions: header_instructions,
         terminator: header_terminator,
         source_spans: header_source_spans,
+        source_inline_ids: Vec::new(),
     });
     // The header label was minted above max-live; keep the counter ahead of
     // it so later passes cannot collide (`.max()` never regresses a healthy
@@ -952,6 +956,7 @@ mod tests {
             instructions,
             terminator,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -1386,6 +1391,7 @@ mod tests {
                 false_label: BlockId(2),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // B1: base case — return acc
@@ -1394,6 +1400,7 @@ mod tests {
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // B2: recursive case — return sum(n-1, acc+n)
@@ -1449,6 +1456,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(6)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         func.next_value_id = 7;
@@ -1625,6 +1633,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 3;
 
@@ -1706,6 +1715,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -1748,6 +1758,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 3;
 

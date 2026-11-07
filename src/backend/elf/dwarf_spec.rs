@@ -428,6 +428,31 @@ pub(crate) struct DwarfLexicalScope {
     pub end_column: u32,
 }
 
+/// One inlined call instance, as the DWARF writer needs it: the concrete
+/// function that contains it, the callee it names, the call site, and the
+/// enclosing instance when the call was itself inlined. Address ranges are
+/// recovered from the zero-width inline markers codegen emits, not stored here.
+#[derive(Clone, Debug)]
+pub(crate) struct DwarfInlineInstance {
+    /// Symbol name of the concrete function containing this instance.
+    pub function: String,
+    /// Index within that function's inline instance table (the marker id).
+    pub id: u32,
+    /// Callee symbol name; the abstract origin's name.
+    pub callee: String,
+    /// Enclosing instance id within the same function, if any.
+    pub parent: Option<u32>,
+    pub call_file: Option<String>,
+    pub call_line: u32,
+    pub call_column: u32,
+    pub decl_file: Option<String>,
+    pub decl_line: u32,
+    pub decl_column: u32,
+    /// `DW_INL_declared_inlined` when the callee was spelled `inline`,
+    /// otherwise `DW_INL_inlined`.
+    pub declared_inline: bool,
+}
+
 /// Everything the writer needs to describe a translation unit's data.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DwarfUnitSpec {
@@ -435,12 +460,17 @@ pub(crate) struct DwarfUnitSpec {
     pub variables: Vec<DwarfVariable>,
     /// Return type of each function the unit defines, by symbol name.
     pub return_types: FxHashMap<String, u32>,
+    /// Whether each defined function has a visible prototype (C11 6.7.6.3p14).
+    /// A K&R identifier-list definition does not, even though sema keeps its
+    /// body parameter types; `DW_AT_prototyped` must not claim otherwise.
+    pub function_prototypes: FxHashMap<String, bool>,
     /// Parameter list of each function the unit defines, by symbol name.  A
     /// function with no parameters has no entry, so the writer knows it can
     /// describe the subprogram without children.
     pub parameters: FxHashMap<String, DwarfFunctionParameters>,
     pub local_variables: Vec<DwarfLocalVariable>,
     pub lexical_scopes: Vec<DwarfLexicalScope>,
+    pub inline_instances: Vec<DwarfInlineInstance>,
 }
 
 impl DwarfUnitSpec {
@@ -458,6 +488,14 @@ impl DwarfUnitSpec {
         for variable in &mut result.local_variables {
             if let Some(file) = &variable.decl_file {
                 variable.decl_file = Some(map.apply(file).into_owned());
+            }
+        }
+        for instance in &mut result.inline_instances {
+            if let Some(file) = &instance.call_file {
+                instance.call_file = Some(map.apply(file).into_owned());
+            }
+            if let Some(file) = &instance.decl_file {
+                instance.decl_file = Some(map.apply(file).into_owned());
             }
         }
         result
@@ -586,9 +624,11 @@ impl DwarfUnitSpec {
             types,
             variables,
             return_types,
+            function_prototypes: self.function_prototypes.clone(),
             parameters,
             local_variables,
             lexical_scopes: self.lexical_scopes.clone(),
+            inline_instances: self.inline_instances.clone(),
         }
     }
 
@@ -1606,9 +1646,11 @@ mod tests {
                 },
             ],
             return_types: FxHashMap::default(),
+            function_prototypes: FxHashMap::default(),
             parameters: FxHashMap::default(),
             local_variables: Vec::new(),
             lexical_scopes: Vec::new(),
+            inline_instances: Vec::new(),
         };
         let mut referenced = FxHashMap::default();
         referenced.insert("used".to_string(), ());

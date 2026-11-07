@@ -503,6 +503,7 @@ fn apply_insertions(func: &mut IrFunction, plans: &[Plan]) -> usize {
                 instructions: Vec::new(),
                 terminator: Terminator::Branch(plan.header_label),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             },
         );
         max_label = max_label.max(plan.new_label.0 + 1);

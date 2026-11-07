@@ -2311,6 +2311,7 @@ fn rewrite_guarded_copy_loop(
         label: fast_label,
         instructions: Vec::new(),
         source_spans: Vec::new(),
+        source_inline_ids: Vec::new(),
         terminator: Terminator::Branch(exit_label),
     };
     fast.instructions
@@ -4386,6 +4387,7 @@ mod tests {
             instructions,
             terminator,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
     fn ptr_param() -> IrParam {

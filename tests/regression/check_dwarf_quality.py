@@ -149,10 +149,6 @@ SHN_UNDEF = 0
 #: value says what a debugger cannot do yet and where the work item lives. A gap
 #: that stops reproducing is reported (once) and the entry should be deleted.
 KNOWN_GAPS: dict[str, str] = {
-    "inlining": (
-        "no DW_TAG_inlined_subroutine: an optimized frame shows the caller with "
-        "the callee's line, so a debugger cannot report the inline stack (D6)"
-    ),
     "optimized_parameter_locations": (
         "an optimized parameter DIE states its name and type but not where the "
         "value lives; entry-value/register tracking across optimized code is still "
@@ -1064,14 +1060,21 @@ def range_lists(elf: Elf, version: int) -> list[RangeList]:
                         length, cursor = _uleb(data, cursor)
                         ranges.append((start, start + length))
                         absolute_entries = True
-                    elif opcode == 0x06:  # DW_RLE_base_address
+                    elif opcode == 0x06:  # DW_RLE_start_end
+                        start = int.from_bytes(data[cursor : cursor + address_size], elf.order)
+                        cursor += address_size
+                        finish = int.from_bytes(data[cursor : cursor + address_size], elf.order)
+                        cursor += address_size
+                        ranges.append((start, finish))
+                        absolute_entries = True
+                    elif opcode == 0x05:  # DW_RLE_base_address
                         base = int.from_bytes(data[cursor : cursor + address_size], elf.order)
                         cursor += address_size
-                    elif opcode == 0x05:  # DW_RLE_offset_pair
+                    elif opcode == 0x04:  # DW_RLE_offset_pair
                         begin, cursor = _uleb(data, cursor)
                         finish, cursor = _uleb(data, cursor)
                         ranges.append((base + begin, base + finish))
-                    elif opcode in (0x02, 0x03, 0x04):  # the *_startx family
+                    elif opcode in (0x01, 0x02, 0x03):  # base_addressx / *_startx
                         raise ValueError("indexed range list opcodes are not emitted by lccc")
                     else:
                         raise ValueError(f"unknown range list opcode {opcode:#04x}")
@@ -2185,7 +2188,6 @@ def check_static_policy(report: Report, elf: Elf, label: str, tier: str) -> None
 
 def check_debug_payload(report: Report, elf: Elf, label: str, optimizing: bool) -> None:
     """The DIEs a debugger needs to name a value; absent ones are known gaps."""
-    _ = optimizing  # inlining is only meaningful where a tier inlines; see below
     try:
         parsed = units(elf)
     except ValueError as error:
@@ -2216,11 +2218,12 @@ def check_debug_payload(report: Report, elf: Elf, label: str, optimizing: bool) 
     present = [f"0x{tag:02x}={tags[tag]}" for tag in type_tags if tags.get(tag)]
     if not present:
         report.gap("types", f"{label}: no type DIEs")
-    # Only a tier that inlines has something to describe: at `-O0` GCC emits no
-    # inlined-subroutine DIE either, so the absence is not a gap there.
+    # D6 landed: an optimizing tier that folds callees must describe the inline
+    # stack.  At `-O0` GCC emits no inlined-subroutine DIE either, so the
+    # assertion only applies where the tier inlines.
     if optimizing and not tags.get(DW_TAG_INLINED_SUBROUTINE):
-        report.gap(
-            "inlining",
+        report.fail(
+            "debug_payload",
             f"{label}: no DW_TAG_inlined_subroutine DIEs although this tier folds callees "
             "into callers, so a frame cannot say which function a line came from",
         )
@@ -3717,6 +3720,31 @@ def self_test() -> int:
     try:
         location_lists(Elf(sections={".debug_loclists": bytes(truncated)}, order="little"), 5)
         failures.append("self-test unknown DW_LLE opcode was silently accepted")
+    except ValueError:
+        pass
+
+    # DWARF v5 range-list opcodes: start_end (0x06) is two addresses, not a
+    # base selection; base_address (0x05) + offset_pair (0x04) is relative.
+    # The old decoder swapped 0x05/0x06 and called 0x04 indexed, so every D6
+    # inline range list decoded as garbage or raised.
+    rng5 = bytearray()
+    rng5 += bytes(4) + (5).to_bytes(2, "little") + bytes([8, 0]) + (0).to_bytes(4, "little")
+    rng5 += bytes([0x06]) + (0x3000).to_bytes(8, "little") + (0x3010).to_bytes(8, "little")
+    rng5 += bytes([0x05]) + (0x4000).to_bytes(8, "little")
+    rng5 += bytes([0x04]) + _uleb_bytes(0x20) + _uleb_bytes(0x30)
+    rng5 += bytes([0x00])
+    rng5[:4] = (len(rng5) - 4).to_bytes(4, "little")
+    rng5_elf = Elf(sections={".debug_rnglists": bytes(rng5)}, order="little", address_size=8)
+    rng5_lists = range_lists(rng5_elf, 5)
+    expect(len(rng5_lists) == 1 and rng5_lists[0].ranges == [(0x3000, 0x3010), (0x4020, 0x4030)],
+           f"self-test v5 start_end/base_address/offset_pair decode {rng5_lists}")
+    expect(rng5_lists[0].absolute_entries,
+           "self-test v5 start_end must be marked absolute")
+    bad_rng5 = bytearray(rng5)
+    bad_rng5[12] = 0x02  # startx_endx where start_end was
+    try:
+        range_lists(Elf(sections={".debug_rnglists": bytes(bad_rng5)}, order="little"), 5)
+        failures.append("self-test indexed v5 range opcode was silently accepted")
     except ValueError:
         pass
 

@@ -1094,6 +1094,7 @@ mod memory_read_tests {
                     }],
                     terminator: Terminator::Return(None),
                     source_spans: vec![],
+                    source_inline_ids: Vec::new(),
                 });
                 assert_eq!(
                     analyze_function_purity(
@@ -1150,6 +1151,7 @@ mod memory_read_tests {
                     ],
                     terminator: Terminator::Return(None),
                     source_spans: vec![crate::common::source::Span::dummy(); 3],
+                    source_inline_ids: Vec::new(),
                 });
                 f.next_value_id = 2;
                 assert_eq!(
@@ -1222,6 +1224,7 @@ mod memory_read_tests {
                 ],
                 terminator: Terminator::Return(None),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             });
             // Analyze the pre-DCE IR; an unused nonvolatile reader may later
             // disappear, but it must not be classified as read-none while present.
@@ -1282,6 +1285,7 @@ mod memory_read_tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
 
         let summary = analyze_out_param_summary(
@@ -1344,6 +1348,7 @@ mod memory_read_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(
             analyze_function_purity_with_summaries(

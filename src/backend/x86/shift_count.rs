@@ -468,6 +468,7 @@ mod tests {
             instructions: insts,
             terminator: Terminator::Return(Some(v(ret))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         f
     }
@@ -894,6 +895,7 @@ mod tests {
             instructions: tail,
             terminator: Terminator::Return(Some(v(4))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         f.next_value_id = 5;
         f

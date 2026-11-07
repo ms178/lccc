@@ -2349,6 +2349,7 @@ fn try_complete_unroll_general(
             instructions: fg_insts,
             terminator: Terminator::Branch(exit_target),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         final_guard = Some(fg_label);
     }
@@ -2392,6 +2393,7 @@ fn try_complete_unroll_general(
                         .expect("body entry must be a body block"),
                 ),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             });
         }
 
@@ -2434,6 +2436,7 @@ fn try_complete_unroll_general(
                 instructions: insts,
                 terminator: term,
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             });
         }
     }
@@ -2860,6 +2863,7 @@ fn try_complete_unroll_two_block(
             instructions: new_insts,
             terminator: term,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
     }
     func.next_value_id = next_val;
@@ -3668,6 +3672,7 @@ fn try_partial_unroll_two_block(
         instructions: body_insts,
         terminator: Terminator::Branch(header_label),
         source_spans: Vec::new(),
+        source_inline_ids: Vec::new(),
     });
 
     let _ = exit_target;
@@ -4345,6 +4350,7 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
                 false_label: ec_false,
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // ── Build clone[j] (cloned body_work blocks) ──────────────────────
@@ -4426,6 +4432,7 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
                 instructions: new_insts,
                 terminator: new_term,
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             });
         }
     }
@@ -4919,6 +4926,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // B1: header — %1 = phi(0, %5); %3 = cmp %1 < const(n_val)
@@ -4948,6 +4956,7 @@ mod tests {
                 false_label: BlockId(4), // exit
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // B2: body — GEP + store. The GEP uses a constant offset (not the IV)
@@ -4972,6 +4981,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(3)), // → latch
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // B3: latch — %5 = %1 + 1; Branch B1
@@ -4986,6 +4996,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // B4: exit
@@ -4994,6 +5005,7 @@ mod tests {
             instructions: vec![],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         func.next_value_id = 11; // 0–10 used (10 = arr placeholder)
@@ -5047,6 +5059,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // B1: header — iv phi, X phi (back edge = the chosen IV shape), cmp
         func.blocks.push(BasicBlock {
@@ -5082,6 +5095,7 @@ mod tests {
                 false_label: BlockId(4),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // B2: latch — load src[iv], store arr[iv] = X + loaded, iv Add LAST
         func.blocks.push(BasicBlock {
@@ -5130,6 +5144,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // B4: exit — X is live out (its exactness is the contract)
         func.blocks.push(BasicBlock {
@@ -5151,6 +5166,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 16; // 0–15 used (10/12 = arr/src placeholders)
         func.next_label = 5;
@@ -5208,6 +5224,7 @@ mod tests {
             instructions: pre,
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // B1: header — iv phi, acc phis, exit cmp
         let mut header = vec![Instruction::Phi {
@@ -5244,6 +5261,7 @@ mod tests {
                 false_label: BlockId(4),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // B2: latch — load v[iv], one FAdd per accumulator, iv increment LAST
         let mut latch = vec![]; // GEP/load/fadds/iv add pushed below
@@ -5285,6 +5303,7 @@ mod tests {
             instructions: latch,
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // B4: exit — store the accumulator so it is live out.
         func.blocks.push(BasicBlock {
@@ -5298,6 +5317,7 @@ mod tests {
             }],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 64;
         func.next_label = 5;
@@ -5544,6 +5564,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // B1: header — iv phi, acc phi (back edge = the latch's work Add),
         // exit cmp
@@ -5580,6 +5601,7 @@ mod tests {
                 false_label: BlockId(4),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // B2: latch — the profile-dependent work, iv Add LAST
         let mut work: Vec<Instruction> = Vec::new();
@@ -5651,6 +5673,7 @@ mod tests {
             instructions: work,
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // B4: exit — acc is live out
         func.blocks.push(BasicBlock {
@@ -5672,6 +5695,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 16; // 0–15 used
         func.next_label = 5;
@@ -5912,6 +5936,7 @@ mod tests {
                 instructions: vec![],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             });
             func.blocks.push(BasicBlock {
                 label: BlockId(1),
@@ -5925,6 +5950,7 @@ mod tests {
                 }],
                 terminator: Terminator::Branch(BlockId(2)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             });
             func.blocks.push(BasicBlock {
                 label: BlockId(2),
@@ -5946,6 +5972,7 @@ mod tests {
                 ],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             });
             if bare_outside_use {
                 func.blocks.push(BasicBlock {
@@ -5959,6 +5986,7 @@ mod tests {
                     }],
                     terminator: Terminator::Return(None),
                     source_spans: vec![],
+                    source_inline_ids: Vec::new(),
                 });
             }
             (func, 1, 2, Value(21), 2)
@@ -6076,6 +6104,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // B1: header — the CONST-BACKED phi comes FIRST (the discovery
         // order mem2reg would mint for `int c = 7; ... c = 3;` declared
@@ -6113,6 +6142,7 @@ mod tests {
                 false_label: BlockId(4),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // B2: latch — load src[iv], store arr[iv] = C + loaded, iv Add LAST
         func.blocks.push(BasicBlock {
@@ -6161,6 +6191,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // B4: exit — C is live out (its post-loop value must be the const)
         func.blocks.push(BasicBlock {
@@ -6182,6 +6213,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 16;
         func.next_label = 5;
@@ -6305,6 +6337,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // B1: header — iv phi (STEP 2), acc phi (back edge = the work
         // Add below), exit cmp against the limit 8 (trip 4: 0,2,4,6)
@@ -6341,6 +6374,7 @@ mod tests {
                 false_label: BlockId(4),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // B2: latch — load src[iv], store arr[iv] = acc + loaded, iv
         // Add (STEP 2) LAST
@@ -6390,6 +6424,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // B4: exit — acc is live out
         func.blocks.push(BasicBlock {
@@ -6411,6 +6446,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 16; // 0–15 used
         func.next_label = 5;
@@ -6566,6 +6602,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(4)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // B4 (exit) gains the join phi.
@@ -7007,6 +7044,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // B1: outer header — %1 = phi(%0, %10); cmp %1 < 10
@@ -7035,6 +7073,7 @@ mod tests {
                 false_label: BlockId(6), // outer exit
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // B2: inner header — %3 = phi(%1, %7); cmp %3 < 10
@@ -7063,6 +7102,7 @@ mod tests {
                 false_label: BlockId(5), // outer latch (inner exit)
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // B2b (BlockId 20): inner body — a single Copy; branches to inner latch
@@ -7074,6 +7114,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(3)), // → inner latch
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // B3: inner latch — %7 = %3+1; back to inner header
@@ -7088,6 +7129,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(2)), // back to inner header
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // B5: outer latch — %10 = %1+1; back to outer header
@@ -7102,6 +7144,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(1)), // back to outer header
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // B6: outer exit
@@ -7110,6 +7153,7 @@ mod tests {
             instructions: vec![],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         func.next_value_id = 21;
@@ -7179,6 +7223,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -7205,6 +7250,7 @@ mod tests {
                 false_label: exit,
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
     }
 
@@ -7221,12 +7267,14 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(exit),
             instructions: vec![],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 32;
     }
@@ -7270,6 +7318,7 @@ mod tests {
                 false_label: BlockId(5),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(3),
@@ -7279,6 +7328,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(4)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(4),
@@ -7291,6 +7341,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         persist_gate_push_outer_suffix(&mut func, 5, 6);
         func
@@ -7398,6 +7449,7 @@ mod tests {
                 false_label: BlockId(5),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(3),
@@ -7407,6 +7459,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(4)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(4),
@@ -7430,6 +7483,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         persist_gate_push_outer_suffix(&mut func, 5, 6);
         func
@@ -7505,6 +7559,7 @@ mod tests {
                 false_label: BlockId(5),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(3),
@@ -7517,6 +7572,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(4),
@@ -7542,6 +7598,7 @@ mod tests {
                 false_label: BlockId(3),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         persist_gate_push_outer_suffix(&mut func, 5, 6);
         func
@@ -7574,6 +7631,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(3)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         persist_gate_push_outer_suffix(&mut func, 3, 4);
         func.blocks.push(BasicBlock {
@@ -7581,12 +7639,14 @@ mod tests {
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(6)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(6),
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(5)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         assert!(
             !persist_gate_verdict(&func, &[1, 2, 3], Value(1)),
@@ -7713,6 +7773,7 @@ mod tests {
                 false_label: BlockId(5),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(3),
@@ -7722,6 +7783,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(4)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(4),
@@ -7734,6 +7796,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         persist_gate_push_outer_suffix(&mut func, 5, 6);
         func
@@ -7787,6 +7850,7 @@ mod tests {
                 false_label: BlockId(5),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(3),
@@ -7796,6 +7860,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(4)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(4),
@@ -7808,6 +7873,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         persist_gate_push_outer_suffix(&mut func, 5, 6);
         // Syntactic-only second entry into the inner header.
@@ -7816,6 +7882,7 @@ mod tests {
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func
     }
@@ -7871,6 +7938,7 @@ mod tests {
                 false_label: BlockId(5),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(3),
@@ -7880,6 +7948,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(4)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(4),
@@ -7892,6 +7961,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         persist_gate_push_outer_suffix(&mut func, 5, 6);
         func
@@ -7959,6 +8029,7 @@ mod tests {
                 false_label: BlockId(5),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(3),
@@ -7968,6 +8039,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(4)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(4),
@@ -7980,6 +8052,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         persist_gate_push_outer_suffix(&mut func, 5, 6);
         if second_entry {
@@ -7988,6 +8061,7 @@ mod tests {
                 instructions: vec![],
                 terminator: Terminator::Branch(BlockId(2)),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             });
         }
         func
@@ -8640,6 +8714,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // B1: header — %1 = phi(%0, %5); %2 = %1 < i64::MAX
@@ -8668,6 +8743,7 @@ mod tests {
                 false_label: BlockId(6),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // B2: split — %3 = %1 >= 0; diamond to B3/B4
@@ -8686,6 +8762,7 @@ mod tests {
                 false_label: BlockId(4),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // B3/B4: arms
@@ -8697,6 +8774,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(5)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(4),
@@ -8706,6 +8784,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(5)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // B5: latch — %5 = %1 + 2^62; back to header
@@ -8720,6 +8799,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // B6: exit
@@ -8728,6 +8808,7 @@ mod tests {
             instructions: vec![],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         func.next_value_id = 7;

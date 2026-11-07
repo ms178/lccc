@@ -1491,6 +1491,22 @@ pub(super) fn debug_transparent(store: &LineStore, info: LineInfo, i: usize) -> 
         || (!info.pinned
             && info.is_steppable()
             && is_debug_marker_directive(info.trimmed(store.get(i))))
+        || (!info.pinned
+            && info.kind == LineKind::Label
+            && is_inline_marker_label(info.trimmed(store.get(i))))
+}
+
+/// D6 inline-range endpoints are zero-width, compiler-private labels.  They
+/// are never branch targets; only `.debug_*` relocations name them.  Treating
+/// them as opaque label barriers froze copy coalescing across an inline body
+/// and made `-g` emit two extra bytes (measured: dwarf-quality `code_unchanged`,
+/// `movslq` into `%rdi` + relay instead of `%rax`).  Like `.loc`, they are
+/// transparent to local instruction adjacency; the label itself is never
+/// edited or deleted, so the range endpoints survive the fold.
+fn is_inline_marker_label(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let before_comment = trimmed.split('#').next().unwrap_or(trimmed).trim_end();
+    before_comment.starts_with(".Llccc_inline_") && before_comment.ends_with(':')
 }
 
 pub(super) fn next_non_debug(
@@ -3624,6 +3640,29 @@ mod classify_directive_tests {
             assert_eq!(i.inert_dir, want, "inert flag for {text}");
             assert_eq!(i.is_steppable(), want, "steppable for {text}");
             assert_eq!(i.is_barrier(), !want, "barrier for {text}");
+        }
+    }
+
+    #[test]
+    fn inline_marker_labels_are_local_adjacency_transparent() {
+        for text in [
+            ".Llccc_inline_b_0_0_main:",
+            "  .Llccc_inline_e_12_34_pq_frame:  # endpoint",
+        ] {
+            let info = classify_line(text);
+            assert_eq!(info.kind, LineKind::Label, "{text}");
+            assert!(is_inline_marker_label(info.trimmed(text)), "{text}");
+        }
+        for text in [
+            "main:",
+            ".LBB6:",
+            ".Llccc_inline_not_a_label",
+            ".long .Llccc_inline_b_0_0_main:",
+        ] {
+            assert!(
+                !is_inline_marker_label(classify_line(text).trimmed(text)),
+                "{text}"
+            );
         }
     }
 

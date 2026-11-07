@@ -647,7 +647,7 @@ impl ElfWriterBase {
     ) -> Result<(), String> {
         let config = self.debug_config;
         use super::dwarf::{
-            DwarfFunction, DwarfLineLocation, DwarfSectionInfo, DwarfStrings,
+            DwarfFunction, DwarfInlineMarker, DwarfLineLocation, DwarfSectionInfo, DwarfStrings,
             build_dwarf_info_sections, build_dwarf_line_section,
         };
         // Rows alone describe an assembler input; a compiler also brings the
@@ -721,6 +721,17 @@ impl ElfWriterBase {
                 })
             })
             .collect();
+        let mut inline_markers = Vec::new();
+        for (name, (section, offset)) in &self.labels {
+            if let Some(&section_index) = index_of.get(section.as_str()) {
+                if let Some(marker) = DwarfInlineMarker::parse(name, section_index, *offset) {
+                    inline_markers.push(marker);
+                }
+            }
+        }
+        inline_markers.sort_by(|a, b| {
+            (a.section_index, a.offset, &a.label).cmp(&(b.section_index, b.offset, &b.label))
+        });
         let mapped_files: Vec<(u32, String)> = if self.debug_path_map.is_empty() {
             self.debug_files.clone()
         } else {
@@ -837,6 +848,7 @@ impl ElfWriterBase {
                 &locations,
                 &section_info,
                 &functions,
+                &inline_markers,
                 primary_file,
                 &comp_dir,
                 concat!("LCCC ", env!("CARGO_PKG_VERSION")),

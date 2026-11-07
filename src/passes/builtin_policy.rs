@@ -404,6 +404,7 @@ mod tests {
                     .collect(),
                 terminator: Terminator::Return(None),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             });
         }
         f
@@ -796,6 +797,7 @@ mod library_memcpy_tests {
             instructions: insts,
             terminator: Terminator::Return(None),
             source_spans: spans,
+            source_inline_ids: Vec::new(),
         });
         let mut m = IrModule::new();
         m.functions = vec![f];
@@ -882,6 +884,7 @@ mod library_memcpy_tests {
             instructions: vec![],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         m.functions.push(def);
         apply(&mut m, &BuiltinFlags::default());

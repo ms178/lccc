@@ -2105,6 +2105,7 @@ mod scalar_lane_slot_tests {
             instructions: ins,
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         f.next_value_id = 104;
         let mut state = crate::backend::state::CodegenState::new_with_ra_config(

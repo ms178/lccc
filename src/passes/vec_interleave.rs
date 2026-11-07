@@ -1189,6 +1189,7 @@ fn transform(func: &mut IrFunction, c: &Candidate, factor: u32, debug: bool) -> 
         instructions: np,
         terminator: Terminator::Branch(mh_label),
         source_spans: Vec::new(),
+        source_inline_ids: Vec::new(),
     });
     func.blocks.push(BasicBlock {
         label: mh_label,
@@ -1199,18 +1200,21 @@ fn transform(func: &mut IrFunction, c: &Candidate, factor: u32, debug: bool) -> 
             false_label: cb_label,
         },
         source_spans: Vec::new(),
+        source_inline_ids: Vec::new(),
     });
     func.blocks.push(BasicBlock {
         label: mb_label,
         instructions: mb,
         terminator: Terminator::Branch(mh_label),
         source_spans: Vec::new(),
+        source_inline_ids: Vec::new(),
     });
     func.blocks.push(BasicBlock {
         label: cb_label,
         instructions: cb,
         terminator: Terminator::Branch(h_label),
         source_spans: Vec::new(),
+        source_inline_ids: Vec::new(),
     });
     func.next_value_id = next_val.max(func.next_value_id);
     func.next_label = next_label.max(func.next_label);
@@ -1428,6 +1432,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(h),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         f.blocks.push(BasicBlock {
             label: h,
@@ -1466,6 +1471,7 @@ mod tests {
                 false_label: x,
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         f.blocks.push(BasicBlock {
             label: b,
@@ -1498,12 +1504,14 @@ mod tests {
             ],
             terminator: Terminator::Branch(h),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         f.blocks.push(BasicBlock {
             label: x,
             instructions: vec![],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         (f, vec![Value(1), Value(2), Value(3)])
     }
