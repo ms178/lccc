@@ -81,6 +81,8 @@ fn boolean_before(lines: &[String], kinds: &[LineKind], i: usize, reg: u8) -> bo
         }
         return match mnem {
             "seqz" | "snez" | "slt" | "sltu" | "slti" | "sltiu" => true,
+            // FP comparisons write 0 or 1 to their general destination.
+            "feq.s" | "feq.d" | "flt.s" | "flt.d" | "fle.s" | "fle.d" => true,
             "andi" => ops.get(2).and_then(|v| parse_asm_i64(v)) == Some(1),
             _ => false,
         };
@@ -119,6 +121,28 @@ pub(super) fn fold_boolean_negations(
         let Some((m2, ops2)) = mnemonic_operands(&lines[j]) else {
             continue;
         };
+        // `xori t, s, 1; b{eq,ne}z t, L` of a 0/1 `s` branches on `s`
+        // inverted when t dies: `feq.d t0, ft0, ft0; xori t0, t0, 1;
+        // bnez t0, slow` (the errno path of `sqrt`) is `beqz t0, slow`.
+        if let ("xori", [t, s, one], "beqz" | "bnez", [t2, target]) =
+            (m1, ops1.as_slice(), m2, ops2.as_slice())
+        {
+            let t_id = parse_reg(t);
+            if t == t2
+                && parse_asm_i64(one) == Some(1)
+                && t_id != REG_NONE
+                && boolean_before(lines, kinds, i, parse_reg(s))
+                && live.dead_after(lines, kinds, j, t_id)
+            {
+                let inverted = if m2 == "beqz" { "bnez" } else { "beqz" };
+                lines[j] = format!("    {inverted} {s}, {target}");
+                kinds[j] = classify_line(&lines[j]);
+                kinds[i] = LineKind::Nop;
+                live.invalidate();
+                changed = true;
+            }
+            continue;
+        }
         let folded = match (m1, ops1.as_slice(), m2, ops2.as_slice()) {
             ("seqz" | "snez", [t, x], "seqz" | "snez", [d, t2]) if t == t2 => {
                 let mnem = match (m1, m2) {

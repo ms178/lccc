@@ -190,6 +190,11 @@ impl RiscvCodegen {
                         }
                     }
                     Instruction::Fence { .. } => {}
+                    // Scalar FP intrinsics that lower inline on t0 and
+                    // ft0-ft2 (`fsqrt.d`, `fabs.d`, `fsgnj.d`, `fmadd.d`):
+                    // no call, no a-register.  The rounding family calls
+                    // libm and stays out.
+                    Instruction::Intrinsic { op, .. } if riscv_call_free_scalar_intrinsic(op) => {}
                     Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. }
                         if allow_calls
                             && !crate::backend::liveness::is_returns_twice_call(inst)
@@ -1679,4 +1684,25 @@ impl RiscvCodegen {
             self.state.emit("    mv s0, t0");
         }
     }
+}
+
+/// Scalar FP intrinsics whose RISC-V lowering (`intrinsics.rs`) is inline
+/// on t0 and ft0-ft2 -- the counterpart of AArch64's
+/// `arm_call_free_scalar_intrinsic` minus the rounding family, which RV64D
+/// routes through libm (`rint`, `floor`, ...).
+fn riscv_call_free_scalar_intrinsic(op: &crate::ir::reexports::IntrinsicOp) -> bool {
+    use crate::ir::reexports::IntrinsicOp;
+    matches!(
+        op,
+        IntrinsicOp::FabsF32
+            | IntrinsicOp::FabsF64
+            | IntrinsicOp::SqrtF32
+            | IntrinsicOp::SqrtF64
+            | IntrinsicOp::FmaScalarF32
+            | IntrinsicOp::FmaScalarF64
+            | IntrinsicOp::FmaScalarF32Signed(..)
+            | IntrinsicOp::FmaScalarF64Signed(..)
+            | IntrinsicOp::CopysignF32
+            | IntrinsicOp::CopysignF64
+    )
 }
