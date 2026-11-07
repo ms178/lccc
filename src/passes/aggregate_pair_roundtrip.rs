@@ -728,6 +728,9 @@ fn apply(func: &mut IrFunction, c: &Candidate) {
             );
         }
     }
+    if old_ids.is_empty() {
+        ids.clear();
+    }
     block.replace_insts_inline(rewritten, spans, ids);
 }
 

@@ -459,6 +459,9 @@ fn rewrite_sum2_chain(
             );
         }
     }
+    if old_ids.is_empty() {
+        new_ids.clear();
+    }
     block.replace_insts_inline(new_insts, new_spans, new_ids);
     func.next_value_id = next_id;
     true

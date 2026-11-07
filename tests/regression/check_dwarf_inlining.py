@@ -11,7 +11,9 @@ compiler claims, on every target binary supplied.
 Negative controls are part of the contract, not decoration: `-g0` states no
 DWARF, `-O0` does not inline the ordinary probe, a `noinline` callee keeps a
 concrete subprogram and no inline DIE, and a fully optimized-away body states no
-zero-width inline range.  `--self-test` runs those controls against the host
+zero-width inline range, and `CCC_VERIFY_IR=abort` proves the optimizing
+passes keep instruction/span/inline-id arrays parallel (and that no `-g` means
+no inline ids or DWARF).  `--self-test` runs those controls against the host
 compiler and exercises the range-list decoder mutations in the shared reader.
 
 Usage:
@@ -82,8 +84,8 @@ def require(condition: bool, message: str) -> None:
         raise Failure(message)
 
 
-def run(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, timeout=120)
+def run(cmd: list[str], cwd: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, timeout=120, env=env)
 
 
 def compile_source(lccc: str, src: Path, out: Path, cwd: Path, *flags: str) -> None:
@@ -255,6 +257,32 @@ def host_controls(args: argparse.Namespace, work: Path) -> list[dict]:
     compile_source(lccc, nested, g0, work, "-O2", "-g0", "-c")
     require(".debug_info" not in q.read_elf(g0).sections, "-g0 emitted .debug_info")
     rows.append({"kind": "g0-negative", "result": "no DWARF"})
+
+    # The IR verifier is the tripwire for provenance drift: every optimizing
+    # pass must keep instructions/spans/inline ids parallel, and without -g the
+    # inliner must not allocate ids at all.  Abort mode turns a drifted array
+    # into a compile failure instead of a silent debug-info degradation.
+    verify_env = dict(os.environ, CCC_VERIFY_IR="abort")
+    targets = [("x86-64", args.lccc)]
+    if args.lccc_i686:
+        targets.append(("i686", args.lccc_i686))
+    if args.lccc_arm:
+        targets.append(("aarch64", args.lccc_arm))
+    if args.lccc_riscv:
+        targets.append(("riscv64", args.lccc_riscv))
+    for name, compiler in targets:
+        for opt in ("-O1", "-O2"):
+            for debug in (False, True):
+                flags = [opt, "-c"] + (["-g"] if debug else [])
+                out = work / f"verify-{name}-{opt}-{'g' if debug else 'nog'}.o"
+                proc = run([compiler, "-std=c23", *flags, str(nested), "-o", str(out)], work, verify_env)
+                require(proc.returncode == 0,
+                        f"IR verifier aborted for {name} {opt} {'-g' if debug else 'no -g'}:\n{proc.stderr}")
+                if not debug:
+                    require(".debug_info" not in q.read_elf(out).sections,
+                            f"{name} {opt} without -g emitted .debug_info")
+        rows.append({"kind": "provenance-verifier", "target": name,
+                     "result": "O1/O2 with and without -g keep IR provenance parallel"})
 
     if args.gdb:
         exe = work / "nested.elf"

@@ -1573,6 +1573,7 @@ fn place_pred_copies(block: &mut BasicBlock, copies: Vec<Instruction>) {
     let in_chain = |i: usize| chain.binary_search(&i).is_ok();
     let (spans, ids) = block.take_parallel_debug();
     let tracked = !spans.is_empty();
+    let track_ids = !ids.is_empty();
     let inline_at = |i: usize| {
         ids.get(i)
             .copied()
@@ -1590,7 +1591,9 @@ fn place_pred_copies(block: &mut BasicBlock, copies: Vec<Instruction>) {
         if !in_chain(i) {
             insts.push(inst);
             new_spans.extend(span);
-            new_ids.push(inline_at(i));
+            if track_ids {
+                new_ids.push(inline_at(i));
+            }
             continue;
         }
         inst.for_each_operand_mut(|op| {
@@ -1607,11 +1610,15 @@ fn place_pred_copies(block: &mut BasicBlock, copies: Vec<Instruction>) {
         });
         tail.push(inst);
         tail_spans.extend(span);
-        tail_ids.push(inline_at(i));
+        if track_ids {
+            tail_ids.push(inline_at(i));
+        }
     }
     insts.extend(copies);
     if tracked {
         new_spans.extend(std::iter::repeat_n(Span::dummy(), num_copies));
+    }
+    if track_ids {
         new_ids.extend(std::iter::repeat_n(
             crate::ir::instruction::NO_INLINE_INSTANCE,
             num_copies,
@@ -1619,12 +1626,12 @@ fn place_pred_copies(block: &mut BasicBlock, copies: Vec<Instruction>) {
     }
     insts.extend(tail);
     new_spans.extend(tail_spans);
-    if tracked {
+    if track_ids {
         new_ids.extend(tail_ids);
     } else {
-        // Untracked blocks carry no debug arrays; handing replace_insts_inline
-        // a nonempty id list alongside empty spans would fail its pairing
-        // debug assertion (the phi-placement unit tests run with assertions on).
+        // Span-only blocks do not track inline provenance; handing
+        // replace_insts_inline a nonempty id list would turn tracking on for a
+        // non-debug build and drift the array on the next span-only edit.
         new_ids.clear();
     }
     block.replace_insts_inline(insts, new_spans, new_ids);

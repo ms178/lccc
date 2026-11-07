@@ -12090,7 +12090,9 @@ fn spanned_insert(block: &mut BasicBlock, at: usize, inst: Instruction) {
             .copied()
             .unwrap_or_else(crate::common::source::Span::dummy);
         block.source_spans.insert(at, fill);
-        if block.source_inline_ids.len() == block.instructions.len() {
+        if !block.source_inline_ids.is_empty()
+            && block.source_inline_ids.len() == block.instructions.len()
+        {
             let id_fill = at
                 .checked_sub(1)
                 .and_then(|i| block.source_inline_ids.get(i))
