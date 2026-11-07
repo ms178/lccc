@@ -409,21 +409,28 @@ fn const_store_bytes(c: IrConst, ty_size: usize) -> Option<Vec<u8>> {
 /// That check is not decoration.  LCCC spells unsigned sub-64-bit constants as
 /// zero-extended `IrConst::I64` (`IrConst::from_i64`, `constants.rs:640`) so
 /// `to_i64()` does not sign-extend them; a narrow `I8`/`I32` spelling would
-/// silently change `U8(255)` into `-1`.  `F128` (target-dependent 12/16-byte
-/// x87/binary128 with a lossy `f64` field) and `Ptr` (no `IrConst` encodes a
-/// BID decimal containers and `F128` (target-dependent 12/16-byte x87 or
-/// binary128 with a lossy `f64` field) and `Ptr` (no `IrConst` encodes a
-/// stack address) are refused outright.
+/// silently change `U8(255)` into `-1`.
+///
+/// Widths above 8 bytes are deliberately OUT of scope.  A measured CI
+/// regression (`sse34_encoding_emission`, rc=3) showed that folding a
+/// `Load I128` into `Copy { Const(I128) }` lets the late constant folder
+/// substitute that constant into an `InlineAsm` `"x"` input, which the x86
+/// backend materialises as ZERO (`movl $0,%eax; movq %rax,%xmm0`) instead of
+/// the 128-bit value.  The IR fold was correct; the backend path is not.
+/// Fail closed: only byte/word/dword/qword loads, which are proven in
+/// `fx6.c` and `loads.c`, are folded.  BID decimal containers (`D32`/`D64`),
+/// `F128` (target-dependent 12/16-byte x87 or binary128 with a lossy `f64`
+/// field) and `Ptr` (no `IrConst` encodes a stack address) are refused too.
 fn const_from_bytes(ty: IrType, bytes: &[u8]) -> Option<IrConst> {
     use IrType as T;
     let n = ty.size();
-    if n == 0 || n > 16 || bytes.len() != n {
+    // `> 8` is the fail-closed backend-materialisation boundary above.
+    if n == 0 || n > 8 || bytes.len() != n {
         return None;
     }
-    let mut buf = [0u8; 16];
+    let mut buf = [0u8; 8];
     buf[..n].copy_from_slice(bytes);
     let c = match ty {
-        T::I128 | T::U128 => IrConst::I128(i128::from_le_bytes(buf)),
         T::F32 => IrConst::F32(f32::from_bits(u32::from_le_bytes(
             buf[..4].try_into().ok()?,
         ))),
@@ -1487,6 +1494,11 @@ fn fold(facts: &Facts<'_>, inst: &Instruction, block: usize, index: usize) -> Op
             return None;
         }
         let width = ty.size();
+        // Do not even pay for an image proof on a width the backend cannot
+        // materialise as a `Copy { Const }` (see `const_from_bytes`).
+        if width == 0 || width > 8 {
+            return None;
+        }
         let image = facts.image_of(Operand::Value(*ptr), width, block, index)?;
         let c = const_from_bytes(*ty, &image)?;
         return Some(Instruction::Copy {
@@ -1607,20 +1619,7 @@ fn fold(facts: &Facts<'_>, inst: &Instruction, block: usize, index: usize) -> Op
 }
 
 pub(crate) fn run(module: &mut IrModule) -> usize {
-    let folded = module.for_each_function(run_function);
-    if folded > 0 {
-        // ORDERING FIX.  This hook runs at phase 11e-pre, AFTER every
-        // scheduled `constant_fold::run` in the pipeline.  A load folded
-        // here therefore creates a NEW `IrConst` that flows into casts and
-        // arithmetic which no later folder will see — measured on the
-        // all-on dword blend probe: `Cast { Const(F32(5.0)), F32 -> F64 }`
-        // survived into codegen as `movss .LCFP + cvtss2sd`, while GCC 16.2
-        // and Clang 23.1.5 emit one `movsd`.  Re-run the canonical local
-        // folder (idempotent, no new verify hooks) so the evidence
-        // consumer's output is fully simplified before `constarr`.
-        module.for_each_function(super::constant_fold::fold_function);
-    }
-    folded
+    module.for_each_function(run_function)
 }
 
 fn run_function(func: &mut IrFunction) -> usize {
@@ -1668,6 +1667,28 @@ fn run_function(func: &mut IrFunction) -> usize {
     }
     if count > 0 {
         prune_dead_private_writes(func);
+        // ORDERING FIX.  This hook runs at phase 11e-pre, AFTER every
+        // scheduled `constant_fold::run` in the pipeline.  A load folded
+        // here creates a NEW `IrConst` that flows into casts and arithmetic
+        // no later folder will see — measured on the all-on dword blend
+        // probe: `Cast { Const(F32(5.0)), F32 -> F64 }` survived into
+        // codegen as `movss .LCFP + cvtss2sd`, while GCC 16.2 and Clang
+        // 23.1.5 emit one `movsd`.  Re-run the canonical local folder so
+        // the evidence consumer's output is fully simplified.
+        //
+        // SCOPED to this function (not the whole module) and REFUSED when
+        // the function contains `InlineAsm`: inline asm is opaque to the
+        // optimizer, and propagating a late constant into an asm operand is
+        // a measured miscompile (`sse34_encoding_emission`).  No new verify
+        // hooks are introduced.
+        let opaque_asm = func.blocks.iter().any(|b| {
+            b.instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::InlineAsm { .. }))
+        });
+        if !opaque_asm {
+            super::constant_fold::fold_function(func);
+        }
     }
     count
 }

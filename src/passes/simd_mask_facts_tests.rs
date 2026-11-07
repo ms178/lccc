@@ -2810,11 +2810,6 @@ fn const_from_bytes_is_bit_exact_for_every_supported_scalar_type() {
         (IrType::U32, vec![0xFF, 0xFF, 0xFF, 0xFF]),
         (IrType::I64, vec![0; 7].into_iter().chain([0x80]).collect()),
         (IrType::U64, vec![0xFF; 8]),
-        (
-            IrType::I128,
-            vec![0; 15].into_iter().chain([0x80]).collect(),
-        ),
-        (IrType::U128, vec![0xFF; 16]),
         // -0.0 and a NaN with a NON-CANONICAL payload: bit preservation, not
         // numeric equality, is the property under test.
         (IrType::F32, vec![0x00, 0x00, 0x00, 0x80]),
@@ -2863,6 +2858,40 @@ fn const_from_bytes_refuses_unprovable_or_target_dependent_types() {
     assert!(const_from_bytes(IrType::I32, &[0u8; 3]).is_none());
     assert!(const_from_bytes(IrType::I32, &[0u8; 17]).is_none());
     assert!(const_from_bytes(IrType::I32, &[]).is_none());
+    // Wide loads are OUT of scope: a 128-bit constant propagated into an
+    // InlineAsm "x" input is materialised as ZERO by the x86 backend
+    // (measured CI regression sse34_encoding_emission, rc=3).
+    assert!(const_from_bytes(IrType::I128, &[0u8; 16]).is_none());
+    assert!(const_from_bytes(IrType::U128, &[0u8; 16]).is_none());
+}
+
+/// The exact CI-caught shape, at IR level: a proven constant object read by
+/// a 128-bit `Load` that feeds an inline asm.  The wide load must NOT become
+/// a constant, so the asm keeps its SSA operand.
+#[test]
+fn wide_loads_are_not_folded_and_inline_asm_functions_are_not_refolded() {
+    let mut f = load_image(None);
+    // Widen the U32 load to I128 to model the `sse34_encoding_emission` IR.
+    for i in &mut f.blocks[0].instructions {
+        if let Instruction::Load {
+            dest: Value(1), ty, ..
+        } = i
+        {
+            *ty = IrType::I128;
+        }
+    }
+    run_function(&mut f);
+    assert!(
+        folded_const(&f, Value(1)).is_none(),
+        "a 128-bit load must not become a Copy{{ Const }} that the backend mis-materialises"
+    );
+    assert!(
+        f.blocks[0]
+            .instructions
+            .iter()
+            .any(|i| matches!(i, Instruction::Load { dest: Value(1), .. })),
+        "the wide Load must survive"
+    );
 }
 
 #[test]

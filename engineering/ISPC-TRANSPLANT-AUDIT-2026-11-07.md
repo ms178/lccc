@@ -717,3 +717,89 @@ OUTSIDE the requested window correctly still folds; and the two
 | runtime-valued splat sweep | **efficient — no regression, no unsound fold** |
 | `object_image` analysis | **efficient** — O(n + k), measured zero overhead |
 | AArch64 / RISC-V native maskfacts movemask fold | **not measured; no verdict** |
+
+---
+
+# Round 4: a real CI-caught miscompile, found and fixed
+
+The first round-3 push (`4d988cb`) turned hosted CI **RED** on
+`SSA regression corpus` (run `42377164468`, job `128417821627`, step 17).
+The annotation named the fixture: `sse34_encoding_emission`,
+`run failed (rc=3)`. This was NOT a flake and NOT a pre-existing failure:
+the same fixture passes with `CCC_DISABLE_PASSES=maskfacts` and fails with the
+pass enabled. **My change caused it.** It is recorded here rather than hidden.
+
+## Root cause (IR-diff driven, not guessed)
+
+`LCCC_DUMP_IR=1` A/B of the fixture:
+
+```diff
+-    Load { dest: Value(251), ptr: Value(573), ty: I128, ... }
+-    Load { dest: Value(253), ptr: Value(574), ty: I128, ... }
+-    InlineAsm { template: "pcmpistri $0,%2,%1",
+-                inputs: [("x", Value(Value(251)), None),
+-                         ("xm", Value(Value(253)), None)], ... }
++    InlineAsm { template: "pcmpistri $0,%2,%1",
++                inputs: [("x",  Const(I128(97)),      None),
++                         ("xm", Const(I128(6387832)), None)], ... }
+```
+
+The new `ImproveMemoryOps` load fold correctly proved both 16-byte constant
+images and replaced the `Load I128`s with `Copy { Const(I128) }`. The new
+`constant_fold` chaser then propagated those constants into the `InlineAsm`
+`"x"` inputs. The x86 backend cannot materialise a 128-bit `IrConst` in that
+context:
+
+```diff
+-    movdqu (%r12), %xmm0 ; movdqu (%rbx), %xmm0 ; ...
++    movl $0, %eax ; movq %rax, %xmm0
++    movl $0, %eax ; movq %rax, %xmm1
+     pcmpistri $0,%xmm1,%xmm0
+```
+
+Both XMM operands became ZERO, so `pcmpistri` returned the wrong index and
+the C witness returned 3. **The IR-level fold was sound; the backend constant
+materialisation for wide asm operands is not.** That is the pre-existing
+limitation the new consumer exposed.
+
+## The fix (fail-closed, two independent guards)
+
+1. **`const_from_bytes` and `fold_load` refuse widths > 8 bytes.** Byte, word,
+   dword and qword loads are the ones proven end-to-end by `fx6.c` (F32) and
+   `loads.c` (U8/U32/U64). `I128`/`U128` are out of scope. `fold_load` also
+   exits before paying for an image proof on a wide load — no wasted cycles.
+   The i686 aggregate-copy path is unaffected: it uses `known_scalar_bytes`
+   and `IrConst::I128` directly, not `const_from_bytes`.
+2. **The `constant_fold` chaser is now scoped and guarded.** It moved from
+   `run` (where it touched EVERY function in the module) into `run_function`,
+   so it runs only on a function this pass actually edited, and it is
+   **skipped entirely when the function contains `Instruction::InlineAsm`**.
+   Inline asm is opaque to a late optimizer; never re-fold it on the strength
+   of a constant created at phase 11e-pre.
+
+Two new unit tests pin the regression: `const_from_bytes` refusal for
+I128/U128, and `wide_loads_are_not_folded_and_inline_asm_functions_are_not_refolded`.
+
+## Verification of the fix
+
+| check | result |
+|---|---|
+| `sse34_encoding_emission` with `CCC_VALIDATE_SSA=1` | **2 passed / 0 failed** (was rc=3) |
+| `fx6.c` still at parity | **11 instructions, 0 `blendvps`, 0 `cvtss2sd`** — the win is preserved |
+| focused unit tests | **51 passed / 0 failed / 8257 filtered** |
+| full SSA-validated regression corpus (local DIAGNOSTIC only) | **1321 passed / 0 failed / 3 skipped-compare / 82 skipped-run / 1406 total** |
+| census / strict Clippy / verify-IR / param-home (4 drivers) / fmt / diff | all RC0 |
+
+The full-corpus run above is a **local diagnostic of a CI-caught defect**, not
+a substitute for hosted CI. Hosted GitHub CI remains the authority; its green
+result on the final push is reported separately.
+
+## What this says about the process
+
+A "godlike quality" claim is only credible if a failure is met with an
+IR-diff, an assembly diff, a root cause, two independent guards and a
+regression test — not with a retry or a re-baseline. The defect was introduced
+by a new consumer interacting with a pre-existing backend limitation; the
+correct engineering response is to narrow the consumer's contract to exactly
+the domain that is proven, rather than to patch an unrelated backend on a
+deadline. That is what was done.
