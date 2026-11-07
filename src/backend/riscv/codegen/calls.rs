@@ -957,6 +957,13 @@ impl RiscvCodegen {
         }
     }
 
+    /// Load the float member `size` bytes wide at `offset(t0)` of a struct
+    /// argument into `freg`.  A half (no Zfh in the baseline) is NaN-boxed
+    /// through t1/t3: this runs after the GP staging, so the t3-t5 staging
+    /// temporaries are free, while t2 may hold the static chain a
+    /// `SetStaticChain` armed for this very call (bit 8 of its read
+    /// annotation) -- `lui t2, 0xffff0` here destroyed the chain of a direct
+    /// nested-function call passing a `struct { _Float16 h; float f; }`.
     fn emit_load_riscv_fp_field(&mut self, freg: &str, offset: usize, size: u8) {
         match size {
             8 => {
@@ -966,8 +973,8 @@ impl RiscvCodegen {
             2 => {
                 self.state
                     .emit_fmt(format_args!("    lhu t1, {}(t0)", offset));
-                self.state.emit("    lui t2, 0xffff0");
-                self.state.emit("    or t1, t1, t2");
+                self.state.emit("    lui t3, 0xffff0");
+                self.state.emit("    or t1, t1, t3");
                 self.state
                     .emit_fmt(format_args!("    fmv.w.x {}, t1", freg));
             }

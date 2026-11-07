@@ -1,5 +1,5 @@
 //! Return duplication into call blocks, so branch arms can end in a
-//! sibling call (x86-64).
+//! sibling call (x86-64, AArch64, RISC-V).
 //!
 //! The sibling-call conversion (`generation::sibcall_block_hint`, TODO-3 /
 //! §5b of the codegen-gaps ledger) recognises a call only when it is the
@@ -15,7 +15,10 @@
 //! block `R` = `[phi]* ; Return`, so neither call qualified, and LCCC
 //! emitted `subq $8, %rsp; ... call fast; jmp R; ... call slow; R: addq $8,
 //! %rsp; ret`. GCC 16.2, Clang 23.1.4 and ICX 2026.2 all emit
-//! `testb $32, G(%rip); je; jmp fast; jmp slow` (frameless, no `call`).
+//! `testb $32, G(%rip); je; jmp fast; jmp slow` (frameless, no `call`);
+//! on AArch64 and RISC-V Clang 23.1.5 likewise emits `cbz w0, .L; mov w0,
+//! w1; b g1; .L: mov w0, w1; b g2` and `beqz a0, .L; mv a0, a1; tail g1;
+//! .L: mv a0, a1; tail g2`.
 //!
 //! The rewrite is LLVM CodeGenPrepare's `dupRetToEnableTailCallOpts`,
 //! stated over this IR. For a block `R` whose instructions are all phis and
@@ -40,13 +43,14 @@
 //! guard (no live local alloca, no dynamic alloca, no inline asm), and per
 //! site a returns-twice callee, a variadic/sret/fastcall/regparm callee, or
 //! any argument that might not travel in a register. The argument test is a
-//! strict subset of `call_abi::classify_call_args`' register classes (at
-//! most six INTEGER and eight SSE scalars, no aggregates, no x87 or 128-bit
-//! float), so a site this pass rewrites is one the backend arms; a site it
-//! refuses keeps today's code. The cases the backend can still refuse after
-//! a rewrite (the kernel return-thunk build, `-fno-omit` style per-function
-//! state) cost one duplicated epilogue instead of a `jmp`, which is never
-//! slower.
+//! strict subset of `call_abi::classify_call_args`' register classes for
+//! the target ([`SiblingAbi`]: at most six INTEGER and eight SSE scalars on
+//! x86-64, eight GP and eight FP scalars on AArch64 and RISC-V, no
+//! aggregates, no x87 or 128-bit float), so a site this pass rewrites is
+//! one the backend arms; a site it refuses keeps today's code. The cases
+//! the backend can still refuse after a rewrite (the kernel return-thunk
+//! build, `-fno-omit` style per-function state) cost one duplicated
+//! epilogue instead of a branch, which is never slower.
 //!
 //! `-g` rows: `R`'s recorded return row moves with the return, so the
 //! duplicated terminator keeps a line, and `-g` never changes the rewrite.
@@ -55,20 +59,62 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::reexports::{BlockId, CallInfo, Instruction, IrFunction, Operand, Terminator};
 
-/// True when every argument of `info` is a scalar the SysV x86-64 call
-/// sequence passes in a register: at most six INTEGER-class values (an
-/// `i128` takes two) and eight SSE-class `float`/`double`s. Aggregates,
-/// `long double` / `_Float128` and decimal floats are refused outright --
-/// the backend's classifier decides those, and a refusal here only keeps
-/// the existing code.
-fn register_only_args(info: &CallInfo) -> bool {
+/// The register budget and IR-visible refusals of one target's sibling-call
+/// conversion (`sibcall_abi_admits` in each backend).
+#[derive(Clone, Copy)]
+pub(crate) struct SiblingAbi {
+    /// Integer argument registers (x86-64: rdi..r9; AArch64: x0-x7;
+    /// RISC-V: a0-a7).
+    max_gp: u32,
+    /// FP argument registers (xmm0-7, v0-v7, fa0-fa7).
+    max_fp: u32,
+    /// GP registers a 128-bit integer argument takes, or `None` when such
+    /// an argument is refused (AAPCS64 and the RISC-V psABI align the pair
+    /// to an even register, which a plain count does not model).
+    wide_int_gp: Option<u32>,
+    /// The backend refuses every sibling call of a variadic function or of
+    /// a function returning through a hidden buffer, and every callee
+    /// returning a `_Float128` carrier (`ret_is_f128_sse`): its return
+    /// sequence does work after the call.
+    strict_frame: bool,
+}
+
+impl SiblingAbi {
+    /// The budget of `target`, or `None` when the backend has no sibling
+    /// calls (i686).
+    pub(crate) fn for_target(target: crate::backend::Target) -> Option<Self> {
+        use crate::backend::Target;
+        match target {
+            Target::X86_64 => Some(Self {
+                max_gp: 6,
+                max_fp: 8,
+                wide_int_gp: Some(2),
+                strict_frame: false,
+            }),
+            Target::Aarch64 | Target::Riscv64 => Some(Self {
+                max_gp: 8,
+                max_fp: 8,
+                wide_int_gp: None,
+                strict_frame: true,
+            }),
+            Target::I686 => None,
+        }
+    }
+}
+
+/// True when every argument of `info` is a scalar the target's call
+/// sequence passes in a register (see [`SiblingAbi`]). Aggregates, `long
+/// double` / `_Float128` and decimal floats are refused outright -- the
+/// backend's classifier decides those, and a refusal here only keeps the
+/// existing code.
+fn register_only_args(info: &CallInfo, abi: SiblingAbi) -> bool {
     if info.struct_arg_sizes.iter().any(Option::is_some)
         || info.struct_arg_is_f128_sse.iter().any(|&f| f)
         || info.struct_arg_classes.iter().any(|c| !c.is_empty())
     {
         return false;
     }
-    let (mut gpr, mut sse) = (0u32, 0u32);
+    let (mut gpr, mut fpr) = (0u32, 0u32);
     for ty in &info.arg_types {
         match ty {
             IrType::I8
@@ -80,18 +126,21 @@ fn register_only_args(info: &CallInfo) -> bool {
             | IrType::U32
             | IrType::U64
             | IrType::Ptr => gpr += 1,
-            IrType::I128 | IrType::U128 => gpr += 2,
-            IrType::F32 | IrType::F64 => sse += 1,
+            IrType::I128 | IrType::U128 => match abi.wide_int_gp {
+                Some(n) => gpr += n,
+                None => return false,
+            },
+            IrType::F32 | IrType::F64 => fpr += 1,
             _ => return false,
         }
     }
-    gpr <= 6 && sse <= 8 && info.args.len() == info.arg_types.len()
+    gpr <= abi.max_gp && fpr <= abi.max_fp && info.args.len() == info.arg_types.len()
 }
 
 /// The backend's per-site refusals that the IR can see (see the module
 /// comment); `None` when the call at the end of a block cannot become a
 /// sibling call.
-fn tail_call_info(inst: &Instruction) -> Option<&CallInfo> {
+fn tail_call_info(inst: &Instruction, abi: SiblingAbi) -> Option<&CallInfo> {
     if crate::backend::liveness::is_returns_twice_call(inst) {
         return None;
     }
@@ -104,10 +153,11 @@ fn tail_call_info(inst: &Instruction) -> Option<&CallInfo> {
         || info.is_sret
         || info.is_fastcall
         || info.regparm.is_some()
+        || (abi.strict_frame && info.ret_is_f128_sse)
     {
         return None;
     }
-    register_only_args(info).then_some(info)
+    register_only_args(info, abi).then_some(info)
 }
 
 /// Whether `term` can transfer control to `label`.
@@ -191,10 +241,13 @@ fn duplicated_return(
     }
 }
 
-/// Run the rewrite on one function; returns the number of predecessors
-/// that took over a return.
-pub(crate) fn run(func: &mut IrFunction) -> usize {
-    if func.is_declaration || func.blocks.len() < 2 {
+/// Run the rewrite on one function for a target with the sibling-call
+/// budget `abi`; returns the number of predecessors that took over a return.
+pub(crate) fn run(func: &mut IrFunction, abi: SiblingAbi) -> usize {
+    if func.is_declaration
+        || func.blocks.len() < 2
+        || (abi.strict_frame && (func.is_variadic || func.uses_sret))
+    {
         return 0;
     }
     let counts = use_counts(func);
@@ -236,7 +289,11 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
             if p == r || !matches!(block.terminator, Terminator::Branch(t) if t == r_label) {
                 continue;
             }
-            let Some(info) = block.instructions.last().and_then(tail_call_info) else {
+            let Some(info) = block
+                .instructions
+                .last()
+                .and_then(|inst| tail_call_info(inst, abi))
+            else {
                 continue;
             };
             if let Some(term) = duplicated_return(

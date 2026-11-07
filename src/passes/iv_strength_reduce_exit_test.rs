@@ -327,61 +327,84 @@ fn users(func: &IrFunction) -> (FxHashMap<u32, Vec<(usize, usize)>>, FxHashSet<u
     (by_value, in_terminator)
 }
 
-/// Replace the counter-based exit test of a loop by a test of a dereferenced
-/// pointer recurrence (see the module docs).  Two shapes: the top-tested
-/// loop the frontend builds (`header: test i; latch: i + s, branch back`,
-/// two blocks) and the bottom-tested single block (`do ... while (i + s
-/// REL n)`).  Returns the number of rewrites (0 or 1).
-pub(super) fn replace_counter_exit_test(
-    func: &mut IrFunction,
-    natural_loop: &NaturalLoop,
-    preds: &crate::ir::analysis::FlatAdj,
+/// Everything `match_exit_test` established about one loop: the exit
+/// compare, the counter it tests, the pointer recurrence that replaces it
+/// and the instructions the rewrite deletes.
+struct ExitTestPlan {
+    header: usize,
     preheader: usize,
+    top_tested: bool,
+    continue_on_true: bool,
+    /// The old exit condition; the new compare reuses its value id.
+    cond: Value,
+    cmp_ty: IrType,
+    counter_ty: IrType,
+    counter_init: Operand,
+    counter_step: i64,
+    /// The counter relation, read as `counter REL bound` on continuation.
+    rel: IrCmpOp,
+    bound: Operand,
+    inclusive: bool,
+    clampable: bool,
+    /// The preheader guard (or constants) proves the first test passes.
+    proven: bool,
+    /// `q = phi(q0, q_next)`, `q_next = q + k`.
+    q: Value,
+    q0: Value,
+    q_next: Value,
+    k: i64,
+    /// Deleted instructions: the counter phi, its increment, the old
+    /// compare and every dead pure instruction reading one of them.
+    doomed: FxHashSet<(usize, usize)>,
+}
+
+/// Top-tested (`header: test; latch: branch back`, two blocks) or
+/// bottom-tested (one block); anything else is not a counted loop here.
+fn loop_shape(
+    func: &IrFunction,
+    natural_loop: &NaturalLoop,
     back_block: usize,
-    basic_ivs: &[BasicIV],
-    dbg: bool,
-) -> usize {
+) -> Result<bool, &'static str> {
     let header = natural_loop.header;
-    let bail = |why: &str| {
-        if dbg {
-            lccc::cli::stderr_line(format_args!("[IVSR-LFTR] header={header} keep: {why}"));
-        }
-        0
-    };
-    if crate::common::types::target_ptr_size() != 8 {
-        return bail("not an LP64 target");
-    }
-    // Top-tested: the header holds the exit test, the one body block is the
-    // latch and branches back unconditionally.  Bottom-tested: one block.
-    let top_tested = match natural_loop.body.len() {
-        1 if header == back_block => false,
+    match natural_loop.body.len() {
+        1 if header == back_block => Ok(false),
         2 if header != back_block
             && natural_loop.body.contains(&back_block)
             && matches!(func.blocks[back_block].terminator,
                 Terminator::Branch(t) if t == func.blocks[header].label) =>
         {
-            true
+            Ok(true)
         }
-        _ => return bail("not a one- or two-block counted loop"),
-    };
-    let header_label = func.blocks[header].label;
-    let latch_label = func.blocks[back_block].label;
-    let preheader_label = func.blocks[preheader].label;
-    let continue_label = if top_tested {
-        latch_label
-    } else {
-        header_label
-    };
-    let test = &func.blocks[header];
+        _ => Err("not a one- or two-block counted loop"),
+    }
+}
+
+/// The header's exit compare, its relation oriented to hold on
+/// continuation.
+struct ExitCompare {
+    cond: Value,
+    continue_on_true: bool,
+    cmp_idx: usize,
+    op: IrCmpOp,
+    lhs: Operand,
+    rhs: Operand,
+    ty: IrType,
+}
+
+fn exit_compare(
+    func: &IrFunction,
+    natural_loop: &NaturalLoop,
+    continue_label: BlockId,
+) -> Result<ExitCompare, &'static str> {
+    let test = &func.blocks[natural_loop.header];
     let Terminator::CondBranch {
         cond: Operand::Value(cond),
         true_label,
         false_label,
     } = &test.terminator
     else {
-        return bail("the exit test is not a conditional branch");
+        return Err("the exit test is not a conditional branch");
     };
-    let cond = *cond;
     let leaves = |l: &BlockId| {
         func.blocks
             .iter()
@@ -393,109 +416,101 @@ pub(super) fn replace_counter_exit_test(
     } else if *false_label == continue_label && leaves(true_label) {
         false
     } else {
-        return bail("the test does not separate the loop from its exit");
+        return Err("the test does not separate the loop from its exit");
     };
-    let Some((cmp_idx, op, lhs, rhs, cmp_ty)) = cmp_in(test, cond) else {
-        return bail("the exit condition is not a compare in the header");
+    let Some((cmp_idx, op, lhs, rhs, ty)) = cmp_in(test, *cond) else {
+        return Err("the exit condition is not a compare in the header");
     };
-    let op = if continue_on_true { op } else { op.inverse() };
+    Ok(ExitCompare {
+        cond: *cond,
+        continue_on_true,
+        cmp_idx,
+        op: if continue_on_true { op } else { op.inverse() },
+        lhs,
+        rhs,
+        ty,
+    })
+}
 
-    // The counter: a basic IV of step +-1, tested before (top) or after
-    // (bottom) its increment.
-    let phi_incoming = |phi: Value| {
-        func.blocks[header]
+/// The counter: a basic IV of a supported step, tested before (top) or
+/// after (bottom) its increment.  Returns it with its latch value, the
+/// relation and the bound.
+fn find_counter<'a>(
+    func: &IrFunction,
+    header: usize,
+    latch_label: BlockId,
+    top_tested: bool,
+    basic_ivs: &'a [BasicIV],
+    compare: (IrCmpOp, &Operand, &Operand, IrType),
+) -> Option<(&'a BasicIV, Value, IrCmpOp, Operand)> {
+    let (op, lhs, rhs, cmp_ty) = compare;
+    basic_ivs.iter().find_map(|iv| {
+        if !step_is_supported(iv.step) || iv.ty != cmp_ty || !iv.ty.is_integer() {
+            return None;
+        }
+        let next = func.blocks[header]
             .instructions
             .iter()
             .find_map(|inst| match inst {
-                Instruction::Phi { dest, incoming, .. } if *dest == phi => Some(incoming.clone()),
+                Instruction::Phi { dest, incoming, .. } if *dest == iv.phi_dest => {
+                    incoming.iter().find_map(|(o, l)| match o {
+                        Operand::Value(v) if *l == latch_label => Some(*v),
+                        _ => None,
+                    })
+                }
                 _ => None,
-            })
-    };
-    let mut found = None;
-    for iv in basic_ivs {
-        if !step_is_supported(iv.step) || iv.ty != cmp_ty || !iv.ty.is_integer() {
-            continue;
-        }
-        let Some(incoming) = phi_incoming(iv.phi_dest) else {
-            continue;
-        };
-        let Some(next) = incoming.iter().find_map(|(o, l)| match o {
-            Operand::Value(v) if *l == latch_label => Some(*v),
-            _ => None,
-        }) else {
-            continue;
-        };
+            })?;
         let tested = if top_tested { iv.phi_dest } else { next };
-        if let Some((rel, bound)) = relation_on(op, &lhs, &rhs, &Operand::Value(tested)) {
-            found = Some((iv, next, rel, bound));
-            break;
+        let (rel, bound) = relation_on(op, lhs, rhs, &Operand::Value(tested))?;
+        Some((iv, next, rel, bound))
+    })
+}
+
+/// `(inclusive, clampable)` for a counter of step direction `up` bounded by
+/// `rel`, or `None` when the relation does not bound it.
+fn bound_kind(up: bool, rel: IrCmpOp, ty: IrType, step: i64) -> Option<(bool, bool)> {
+    match (up, rel) {
+        (true, IrCmpOp::Slt | IrCmpOp::Ult) | (false, IrCmpOp::Sgt | IrCmpOp::Ugt) => {
+            Some((false, true))
         }
-    }
-    let Some((iv, i_next, rel, bound)) = found else {
-        return bail("no power-of-two-step counter in the exit test");
-    };
-    let up = iv.step > 0;
-    let (inclusive, clampable) = match (up, rel) {
-        (true, IrCmpOp::Slt | IrCmpOp::Ult) | (false, IrCmpOp::Sgt | IrCmpOp::Ugt) => (false, true),
-        (true, IrCmpOp::Sle | IrCmpOp::Ule) | (false, IrCmpOp::Sge | IrCmpOp::Uge) => (true, true),
+        (true, IrCmpOp::Sle | IrCmpOp::Ule) | (false, IrCmpOp::Sge | IrCmpOp::Uge) => {
+            Some((true, true))
+        }
         // `!=` counts modulo the counter's width: exact only for a unit
         // step at 64 bits, where `T = D` needs no clamp (D = 0 exactly when
         // the test fails on entry).
-        (_, IrCmpOp::Ne) if iv.ty.size() == 8 && iv.step.abs() == 1 => (false, false),
-        _ => return bail("relation does not bound the counter"),
-    };
-    match bound {
-        Operand::Const(_) => {}
-        Operand::Value(v) if is_loop_invariant(v.0, &natural_loop.body, func) => {}
-        _ => return bail("the bound is not loop-invariant"),
+        (_, IrCmpOp::Ne) if ty.size() == 8 && step.abs() == 1 => Some((false, false)),
+        _ => None,
     }
-    let latch = &func.blocks[back_block];
-    let Some(inc_idx) = latch
-        .instructions
-        .iter()
-        .position(|inst| inst.dest() == Some(i_next))
-    else {
-        return bail("the increment is not in the latch");
-    };
-    if !matches!(
-        &latch.instructions[inc_idx],
-        Instruction::BinOp {
-            op: IrBinOp::Add | IrBinOp::Sub,
-            ..
-        }
-    ) {
-        return bail("the increment is not an add");
-    }
-    // First iteration: proven (no clamp) by the preheader guard or by
-    // constants; otherwise the trip count is clamped below.
-    let proven = guard_proves(
-        func,
-        preds,
-        preheader,
-        header_label,
-        rel,
-        cmp_ty,
-        &iv.init,
-        &bound,
-    );
+}
 
-    // A dereferenced pointer recurrence q = phi(q0, q + k), k a constant.
+/// A dereferenced pointer recurrence `q = phi(q0, q + k)`, `k` a nonzero
+/// constant: `(q, q0, q_next, k)`.
+fn find_pointer_recurrence(
+    func: &IrFunction,
+    header: usize,
+    back_block: usize,
+    preheader: usize,
+    top_tested: bool,
+) -> Option<(Value, Value, Value, i64)> {
+    let latch = &func.blocks[back_block];
+    let latch_label = latch.label;
+    let preheader_label = func.blocks[preheader].label;
     let mut derefs = dereferenced_roots(&func.blocks[header]);
     if top_tested {
         derefs.extend(dereferenced_roots(latch));
     }
-    let mut pointer = None;
-    for inst in &func.blocks[header].instructions {
+    func.blocks[header].instructions.iter().find_map(|inst| {
         let Instruction::Phi {
             dest,
             ty: IrType::Ptr,
             incoming,
         } = inst
         else {
-            continue;
+            return None;
         };
         if incoming.len() != 2 || !derefs.contains(&dest.0) {
-            continue;
+            return None;
         }
         let init = incoming
             .iter()
@@ -505,9 +520,9 @@ pub(super) fn replace_counter_exit_test(
             _ => None,
         });
         let (Some(Operand::Value(q0)), Some(q_next)) = (init, next) else {
-            continue;
+            return None;
         };
-        let step = latch.instructions.iter().find_map(|i| match i {
+        let k = latch.instructions.iter().find_map(|i| match i {
             Instruction::GetElementPtr {
                 dest: d,
                 base,
@@ -515,30 +530,26 @@ pub(super) fn replace_counter_exit_test(
                 ..
             } if *d == q_next && *base == *dest => c.to_i64(),
             _ => None,
-        });
-        if let Some(k) = step.filter(|&k| k != 0) {
-            pointer = Some((*dest, q0, q_next, k));
-            break;
-        }
-    }
-    let Some((q, q0, q_next, k)) = pointer else {
-        return bail("no dereferenced pointer recurrence");
-    };
+        })?;
+        (k != 0).then_some((*dest, q0, q_next, k))
+    })
+}
 
-    // The counter must have no other live use: deadness-aware use counts.
-    // Deadness is only established inside the loop's blocks, where IVSR's
-    // own rewrite leaves the dead address arithmetic; a use anywhere else
-    // counts as live (fail closed), which also bounds this scan.
-    let (users, in_terminator) = users(func);
+/// Pure instructions of `loop_blocks` whose results only dead
+/// instructions read (transitively).  Deadness is only established inside
+/// the loop's blocks, where IVSR's own rewrite leaves the dead address
+/// arithmetic; a use anywhere else counts as live (fail closed), which also
+/// bounds this scan.
+fn dead_loop_instructions(
+    func: &IrFunction,
+    loop_blocks: &[usize],
+    users: &FxHashMap<u32, Vec<(usize, usize)>>,
+    in_terminator: &FxHashSet<u32>,
+) -> FxHashSet<(usize, usize)> {
     let mut dead: FxHashSet<(usize, usize)> = FxHashSet::default();
-    let loop_blocks: Vec<usize> = if top_tested {
-        vec![header, back_block]
-    } else {
-        vec![header]
-    };
     loop {
         let mut grew = false;
-        for &bi in &loop_blocks {
+        for &bi in loop_blocks {
             for (ii, inst) in func.blocks[bi].instructions.iter().enumerate() {
                 if dead.contains(&(bi, ii)) || !is_pure(inst) {
                     continue;
@@ -557,188 +568,24 @@ pub(super) fn replace_counter_exit_test(
             }
         }
         if !grew {
-            break;
+            return dead;
         }
     }
-    let live_users = |v: Value| -> Vec<(usize, usize)> {
-        let mut us: Vec<(usize, usize)> = users
-            .get(&v.0)
-            .map(|us| us.iter().copied().filter(|u| !dead.contains(u)).collect())
-            .unwrap_or_default();
-        us.sort_unstable();
-        us
-    };
-    let Some(phi_idx) = func.blocks[header]
-        .instructions
-        .iter()
-        .position(|inst| inst.dest() == Some(iv.phi_dest))
-    else {
-        return bail("the counter phi is missing");
-    };
-    let mut want_phi = vec![(back_block, inc_idx)];
-    let mut want_next = vec![(header, phi_idx)];
-    if top_tested {
-        want_phi.push((header, cmp_idx));
-    } else {
-        want_next.push((header, cmp_idx));
-    }
-    want_phi.sort_unstable();
-    want_next.sort_unstable();
-    if in_terminator.contains(&iv.phi_dest.0)
-        || in_terminator.contains(&i_next.0)
-        || live_users(iv.phi_dest) != want_phi
-        || live_users(i_next) != want_next
-        || !live_users(cond).is_empty()
-    {
-        return bail("the counter has other uses");
-    }
-    if dbg {
-        lccc::cli::stderr_line(format_args!(
-            "[IVSR-LFTR] header={header} pointer exit test (step {k} bytes, {}, {})",
-            if top_tested {
-                "top-tested"
-            } else {
-                "bottom-tested"
-            },
-            if proven { "guarded" } else { "clamped" }
-        ));
-    }
+}
 
-    // Preheader: T = (i0 REL n) ? D : floor, q_end = q0 + T * k.
-    let mut next_id = func.next_value_id;
-    let mut fresh = || {
-        let v = Value(next_id);
-        next_id += 1;
-        v
-    };
-    let mut pre: Vec<Instruction> = Vec::new();
-    let widen = |op: Operand, pre: &mut Vec<Instruction>, fresh: &mut dyn FnMut() -> Value| {
-        if iv.ty.size() == 8 {
-            return op;
-        }
-        let from_ty = if is_unsigned_rel(rel) {
-            iv.ty.to_unsigned()
-        } else {
-            match iv.ty {
-                IrType::U8 => IrType::I8,
-                IrType::U16 => IrType::I16,
-                IrType::U32 => IrType::I32,
-                t => t,
-            }
-        };
-        let d = fresh();
-        pre.push(Instruction::Cast {
-            dest: d,
-            src: op,
-            from_ty,
-            to_ty: IrType::I64,
-        });
-        Operand::Value(d)
-    };
-    let (hi, lo) = if up {
-        (bound, iv.init)
-    } else {
-        (iv.init, bound)
-    };
-    let hi = widen(hi, &mut pre, &mut fresh);
-    let lo = widen(lo, &mut pre, &mut fresh);
-    let mut trip = fresh();
-    pre.push(Instruction::BinOp {
-        dest: trip,
-        op: IrBinOp::Sub,
-        lhs: hi,
-        rhs: lo,
-        ty: IrType::I64,
-    });
-    // T = ceil(D / s) for an exclusive bound, floor(D / s) + 1 for an
-    // inclusive one: (D + adj) >> log2(s) with adj = s - 1 or s (s = |step|
-    // a power of two; D >= 0 whenever the clamp below keeps T).
-    let s_abs = iv.step.unsigned_abs();
-    let adj = (s_abs - 1 + u64::from(inclusive)) as i64;
-    if adj != 0 {
-        let t1 = fresh();
-        pre.push(Instruction::BinOp {
-            dest: t1,
-            op: IrBinOp::Add,
-            lhs: Operand::Value(trip),
-            rhs: Operand::Const(IrConst::I64(adj)),
-            ty: IrType::I64,
-        });
-        trip = t1;
-    }
-    if s_abs > 1 {
-        let t1 = fresh();
-        pre.push(Instruction::BinOp {
-            dest: t1,
-            op: IrBinOp::LShr,
-            lhs: Operand::Value(trip),
-            rhs: Operand::Const(IrConst::I64(i64::from(s_abs.trailing_zeros()))),
-            ty: IrType::I64,
-        });
-        trip = t1;
-    }
-    if clampable && !proven {
-        // Not entered (top) / entered once (bottom) when `i0 REL n` fails.
-        let c = fresh();
-        pre.push(Instruction::Cmp {
-            dest: c,
-            op: rel,
-            lhs: iv.init,
-            rhs: bound,
-            ty: cmp_ty,
-        });
-        let t1 = fresh();
-        pre.push(Instruction::Select {
-            dest: t1,
-            cond: Operand::Value(c),
-            true_val: Operand::Value(trip),
-            false_val: Operand::Const(IrConst::I64(i64::from(!top_tested))),
-            ty: IrType::I64,
-        });
-        trip = t1;
-    }
-    let bytes = if k == 1 {
-        trip
-    } else {
-        let b = fresh();
-        let inst = if k > 0 && (k as u64).is_power_of_two() {
-            Instruction::BinOp {
-                dest: b,
-                op: IrBinOp::Shl,
-                lhs: Operand::Value(trip),
-                rhs: Operand::Const(IrConst::I64(i64::from(k.trailing_zeros()))),
-                ty: IrType::I64,
-            }
-        } else {
-            Instruction::BinOp {
-                dest: b,
-                op: IrBinOp::Mul,
-                lhs: Operand::Value(trip),
-                rhs: Operand::Const(IrConst::I64(k)),
-                ty: IrType::I64,
-            }
-        };
-        pre.push(inst);
-        b
-    };
-    let q_end = fresh();
-    pre.push(Instruction::GetElementPtr {
-        dest: q_end,
-        base: q0,
-        offset: Operand::Value(bytes),
-        ty: IrType::I8,
-    });
-
-    // Doomed: the counter phi, its increment, the old compare, and every
-    // dead pure instruction reading one of them (transitively).
-    let mut doomed_vals: FxHashSet<u32> = [iv.phi_dest.0, i_next.0, cond.0].into_iter().collect();
-    let mut doomed: FxHashSet<(usize, usize)> =
-        [(header, phi_idx), (back_block, inc_idx), (header, cmp_idx)]
-            .into_iter()
-            .collect();
+/// The seeds plus every instruction of `dead` reading a doomed value
+/// (transitively).
+fn doomed_instructions(
+    func: &IrFunction,
+    dead: &FxHashSet<(usize, usize)>,
+    seeds: [(usize, usize); 3],
+    seed_values: [u32; 3],
+) -> FxHashSet<(usize, usize)> {
+    let mut doomed_vals: FxHashSet<u32> = seed_values.into_iter().collect();
+    let mut doomed: FxHashSet<(usize, usize)> = seeds.into_iter().collect();
     loop {
         let mut grew = false;
-        for &(bi, ii) in &dead {
+        for &(bi, ii) in dead {
             if doomed.contains(&(bi, ii)) {
                 continue;
             }
@@ -754,14 +601,278 @@ pub(super) fn replace_counter_exit_test(
             }
         }
         if !grew {
-            break;
+            return doomed;
         }
     }
+}
 
-    // Apply: delete doomed (highest index first per block), then add the
-    // preheader code and the new test at the end of the header.
+/// Match one loop against the rewrite's preconditions (module docs).
+fn match_exit_test(
+    func: &IrFunction,
+    natural_loop: &NaturalLoop,
+    preds: &crate::ir::analysis::FlatAdj,
+    preheader: usize,
+    back_block: usize,
+    basic_ivs: &[BasicIV],
+) -> Result<ExitTestPlan, &'static str> {
+    let header = natural_loop.header;
+    let top_tested = loop_shape(func, natural_loop, back_block)?;
+    let header_label = func.blocks[header].label;
+    let latch_label = func.blocks[back_block].label;
+    let continue_label = if top_tested {
+        latch_label
+    } else {
+        header_label
+    };
+    let ExitCompare {
+        cond,
+        continue_on_true,
+        cmp_idx,
+        op,
+        lhs,
+        rhs,
+        ty: cmp_ty,
+    } = exit_compare(func, natural_loop, continue_label)?;
+    let (iv, i_next, rel, bound) = find_counter(
+        func,
+        header,
+        latch_label,
+        top_tested,
+        basic_ivs,
+        (op, &lhs, &rhs, cmp_ty),
+    )
+    .ok_or("no power-of-two-step counter in the exit test")?;
+    let (inclusive, clampable) = bound_kind(iv.step > 0, rel, iv.ty, iv.step)
+        .ok_or("relation does not bound the counter")?;
+    match bound {
+        Operand::Const(_) => {}
+        Operand::Value(v) if is_loop_invariant(v.0, &natural_loop.body, func) => {}
+        _ => return Err("the bound is not loop-invariant"),
+    }
+    let latch = &func.blocks[back_block];
+    let inc_idx = latch
+        .instructions
+        .iter()
+        .position(|inst| inst.dest() == Some(i_next))
+        .ok_or("the increment is not in the latch")?;
+    if !matches!(
+        &latch.instructions[inc_idx],
+        Instruction::BinOp {
+            op: IrBinOp::Add | IrBinOp::Sub,
+            ..
+        }
+    ) {
+        return Err("the increment is not an add");
+    }
+    // First iteration: proven (no clamp) by the preheader guard or by
+    // constants; otherwise the trip count is clamped.
+    let proven = guard_proves(
+        func,
+        preds,
+        preheader,
+        header_label,
+        rel,
+        cmp_ty,
+        &iv.init,
+        &bound,
+    );
+    let (q, q0, q_next, k) =
+        find_pointer_recurrence(func, header, back_block, preheader, top_tested)
+            .ok_or("no dereferenced pointer recurrence")?;
+
+    // The counter must have no other live use: deadness-aware use counts.
+    let (users, in_terminator) = users(func);
+    let loop_blocks: Vec<usize> = if top_tested {
+        vec![header, back_block]
+    } else {
+        vec![header]
+    };
+    let dead = dead_loop_instructions(func, &loop_blocks, &users, &in_terminator);
+    let live_users = |v: Value| -> Vec<(usize, usize)> {
+        let mut us: Vec<(usize, usize)> = users
+            .get(&v.0)
+            .map(|us| us.iter().copied().filter(|u| !dead.contains(u)).collect())
+            .unwrap_or_default();
+        us.sort_unstable();
+        us
+    };
+    let phi_idx = func.blocks[header]
+        .instructions
+        .iter()
+        .position(|inst| inst.dest() == Some(iv.phi_dest))
+        .ok_or("the counter phi is missing")?;
+    let mut want_phi = vec![(back_block, inc_idx)];
+    let mut want_next = vec![(header, phi_idx)];
+    if top_tested {
+        want_phi.push((header, cmp_idx));
+    } else {
+        want_next.push((header, cmp_idx));
+    }
+    want_phi.sort_unstable();
+    want_next.sort_unstable();
+    if in_terminator.contains(&iv.phi_dest.0)
+        || in_terminator.contains(&i_next.0)
+        || live_users(iv.phi_dest) != want_phi
+        || live_users(i_next) != want_next
+        || !live_users(cond).is_empty()
+    {
+        return Err("the counter has other uses");
+    }
+    let doomed = doomed_instructions(
+        func,
+        &dead,
+        [(header, phi_idx), (back_block, inc_idx), (header, cmp_idx)],
+        [iv.phi_dest.0, i_next.0, cond.0],
+    );
+    Ok(ExitTestPlan {
+        header,
+        preheader,
+        top_tested,
+        continue_on_true,
+        cond,
+        cmp_ty,
+        counter_ty: iv.ty,
+        counter_init: iv.init,
+        counter_step: iv.step,
+        rel,
+        bound,
+        inclusive,
+        clampable,
+        proven,
+        q,
+        q0,
+        q_next,
+        k,
+        doomed,
+    })
+}
+
+/// Appends preheader instructions, allocating their value ids.
+struct PreheaderCode<'a> {
+    code: Vec<Instruction>,
+    next_id: &'a mut u32,
+}
+
+impl PreheaderCode<'_> {
+    fn push(&mut self, make: impl FnOnce(Value) -> Instruction) -> Value {
+        let dest = Value(*self.next_id);
+        *self.next_id += 1;
+        self.code.push(make(dest));
+        dest
+    }
+
+    fn binop(&mut self, op: IrBinOp, lhs: Operand, rhs: Operand) -> Value {
+        self.push(|dest| Instruction::BinOp {
+            dest,
+            op,
+            lhs,
+            rhs,
+            ty: IrType::I64,
+        })
+    }
+}
+
+/// The preheader code `T = (i0 REL n) ? D : floor; q_end = q0 + T * k`
+/// (module docs), allocating value ids from `next_id`.  Returns the code
+/// and `q_end`.
+fn trip_end_code(plan: &ExitTestPlan, next_id: &mut u32) -> (Vec<Instruction>, Value) {
+    let mut out = PreheaderCode {
+        code: Vec::new(),
+        next_id,
+    };
+    let ty = plan.counter_ty;
+    let from_ty = if is_unsigned_rel(plan.rel) {
+        ty.to_unsigned()
+    } else {
+        match ty {
+            IrType::U8 => IrType::I8,
+            IrType::U16 => IrType::I16,
+            IrType::U32 => IrType::I32,
+            t => t,
+        }
+    };
+    let widen = |out: &mut PreheaderCode, src: Operand| {
+        if ty.size() == 8 {
+            return src;
+        }
+        Operand::Value(out.push(|dest| Instruction::Cast {
+            dest,
+            src,
+            from_ty,
+            to_ty: IrType::I64,
+        }))
+    };
+    let (hi, lo) = if plan.counter_step > 0 {
+        (plan.bound, plan.counter_init)
+    } else {
+        (plan.counter_init, plan.bound)
+    };
+    let hi = widen(&mut out, hi);
+    let lo = widen(&mut out, lo);
+    let mut trip = out.binop(IrBinOp::Sub, hi, lo);
+    // T = ceil(D / s) for an exclusive bound, floor(D / s) + 1 for an
+    // inclusive one: (D + adj) >> log2(s) with adj = s - 1 or s (s = |step|
+    // a power of two; D >= 0 whenever the clamp below keeps T).
+    let s_abs = plan.counter_step.unsigned_abs();
+    let adj = (s_abs - 1 + u64::from(plan.inclusive)) as i64;
+    if adj != 0 {
+        let rhs = Operand::Const(IrConst::I64(adj));
+        trip = out.binop(IrBinOp::Add, Operand::Value(trip), rhs);
+    }
+    if s_abs > 1 {
+        let rhs = Operand::Const(IrConst::I64(i64::from(s_abs.trailing_zeros())));
+        trip = out.binop(IrBinOp::LShr, Operand::Value(trip), rhs);
+    }
+    if plan.clampable && !plan.proven {
+        // Not entered (top) / entered once (bottom) when `i0 REL n` fails.
+        let c = out.push(|dest| Instruction::Cmp {
+            dest,
+            op: plan.rel,
+            lhs: plan.counter_init,
+            rhs: plan.bound,
+            ty: plan.cmp_ty,
+        });
+        let floor = Operand::Const(IrConst::I64(i64::from(!plan.top_tested)));
+        trip = out.push(|dest| Instruction::Select {
+            dest,
+            cond: Operand::Value(c),
+            true_val: Operand::Value(trip),
+            false_val: floor,
+            ty: IrType::I64,
+        });
+    }
+    let k = plan.k;
+    let bytes = if k == 1 {
+        trip
+    } else if k > 0 && (k as u64).is_power_of_two() {
+        let rhs = Operand::Const(IrConst::I64(i64::from(k.trailing_zeros())));
+        out.binop(IrBinOp::Shl, Operand::Value(trip), rhs)
+    } else {
+        out.binop(
+            IrBinOp::Mul,
+            Operand::Value(trip),
+            Operand::Const(IrConst::I64(k)),
+        )
+    };
+    let q_end = out.push(|dest| Instruction::GetElementPtr {
+        dest,
+        base: plan.q0,
+        offset: Operand::Value(bytes),
+        ty: IrType::I8,
+    });
+    (out.code, q_end)
+}
+
+/// Delete the doomed instructions (highest index first per block), append
+/// the preheader code and the new pointer test at the end of the header.
+fn apply_exit_test(
+    func: &mut IrFunction,
+    plan: &ExitTestPlan,
+    pre: Vec<Instruction>,
+    q_end: Value,
+) {
     let mut by_block: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
-    for &(bi, ii) in &doomed {
+    for &(bi, ii) in &plan.doomed {
         by_block.entry(bi).or_default().push(ii);
     }
     for (bi, mut idxs) in by_block {
@@ -774,7 +885,7 @@ pub(super) fn replace_counter_exit_test(
             }
         }
     }
-    let ph = &mut func.blocks[preheader];
+    let ph = &mut func.blocks[plan.preheader];
     let ph_spans = !ph.source_spans.is_empty();
     for inst in pre {
         ph.instructions.push(inst);
@@ -782,11 +893,11 @@ pub(super) fn replace_counter_exit_test(
             ph.source_spans.push(Span::dummy());
         }
     }
-    let tested = if top_tested { q } else { q_next };
-    let block = &mut func.blocks[header];
+    let tested = if plan.top_tested { plan.q } else { plan.q_next };
+    let block = &mut func.blocks[plan.header];
     block.instructions.push(Instruction::Cmp {
-        dest: cond,
-        op: if continue_on_true {
+        dest: plan.cond,
+        op: if plan.continue_on_true {
             IrCmpOp::Ne
         } else {
             IrCmpOp::Eq
@@ -798,6 +909,52 @@ pub(super) fn replace_counter_exit_test(
     if !block.source_spans.is_empty() {
         block.source_spans.push(Span::dummy());
     }
+}
+
+/// Replace the counter-based exit test of a loop by a test of a dereferenced
+/// pointer recurrence (see the module docs).  Two shapes: the top-tested
+/// loop the frontend builds (`header: test i; latch: i + s, branch back`,
+/// two blocks) and the bottom-tested single block (`do ... while (i + s
+/// REL n)`).  Returns the number of rewrites (0 or 1).
+pub(super) fn replace_counter_exit_test(
+    func: &mut IrFunction,
+    natural_loop: &NaturalLoop,
+    preds: &crate::ir::analysis::FlatAdj,
+    preheader: usize,
+    back_block: usize,
+    basic_ivs: &[BasicIV],
+    dbg: bool,
+) -> usize {
+    let header = natural_loop.header;
+    let plan = if crate::common::types::target_ptr_size() != 8 {
+        Err("not an LP64 target")
+    } else {
+        match_exit_test(func, natural_loop, preds, preheader, back_block, basic_ivs)
+    };
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(why) => {
+            if dbg {
+                lccc::cli::stderr_line(format_args!("[IVSR-LFTR] header={header} keep: {why}"));
+            }
+            return 0;
+        }
+    };
+    if dbg {
+        lccc::cli::stderr_line(format_args!(
+            "[IVSR-LFTR] header={header} pointer exit test (step {} bytes, {}, {})",
+            plan.k,
+            if plan.top_tested {
+                "top-tested"
+            } else {
+                "bottom-tested"
+            },
+            if plan.proven { "guarded" } else { "clamped" }
+        ));
+    }
+    let mut next_id = func.next_value_id;
+    let (pre, q_end) = trip_end_code(&plan, &mut next_id);
+    apply_exit_test(func, &plan, pre, q_end);
     func.next_value_id = next_id;
     1
 }

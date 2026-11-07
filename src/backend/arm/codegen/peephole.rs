@@ -1807,10 +1807,9 @@ fn coalesce_one_entry_copy(
     fstart: usize,
     fend: usize,
 ) -> bool {
-    {
-        let mut eend = fend;
-        for k in fstart + 1..fend {
-            if matches!(
+    let eend = (fstart + 1..fend)
+        .find(|&k| {
+            matches!(
                 kinds[k],
                 LineKind::Label
                     | LineKind::Branch
@@ -1818,290 +1817,317 @@ fn coalesce_one_entry_copy(
                     | LineKind::CmpBranch
                     | LineKind::Call
                     | LineKind::Ret
-            ) {
-                eend = k;
-                break;
-            }
+            )
+        })
+        .unwrap_or(fend);
+    // Built once per function invocation: every candidate in the entry run
+    // sees the same text (a successful rename ends the scan), so nothing
+    // here needs recomputing per copy.
+    let Some(lv) = Liveness::build(lines, kinds, fstart, fend, false) else {
+        return false;
+    };
+    let mut lv_ret: Option<Liveness> = None;
+    let mut lv_x: Option<Option<Liveness>> = None;
+    for i in fstart + 1..eend {
+        let LineKind::Move { dst, src, is_32bit } = kinds[i] else {
+            continue;
+        };
+        if dst == src || dst >= 29 || src >= 29 {
+            continue;
         }
-        // Built once per function invocation: every candidate in the entry run
-        // sees the same text (a successful rename ends the scan), so nothing
-        // here needs recomputing per copy.
-        let lv = Liveness::build(lines, kinds, fstart, fend, false);
-        let mut lv_ret: Option<Liveness> = None;
-        let mut lv_x: Option<Option<Liveness>> = None;
-        let mut i = fstart + 1;
-        while i < eend {
-            i += 1;
-            let LineKind::Move { dst, src, is_32bit } = kinds[i - 1] else {
-                continue;
-            };
-            if dst == src || dst >= 29 || src >= 29 {
-                continue;
+        // A 32-bit copy (`mov w5, w0`, the entry copy of an `int`
+        // parameter) leaves dst = zext(src<31:0>), while src keeps
+        // whatever upper half the caller left (AAPCS64 leaves it
+        // unspecified). The two agree on every 32-bit view, so the rename
+        // is exact only when no later line reads or writes the 64-bit view
+        // of dst.
+        //
+        // One X-view reader is harmless: a copy `mov xD, xdst` whose
+        // destination's upper half nothing observes (`x_view_liveness`:
+        // the call staging's `mov x0, x5` for an `int` argument, which
+        // the callee reads through w0) produces every observable bit as
+        // `mov wD, wdst` -- the form it takes with the rename.
+        let narrowed = if is_32bit {
+            match narrowable_x_view_readers(lines, kinds, i, dst, fstart, fend, &mut lv_x) {
+                Some(narrowed) => narrowed,
+                None => continue,
             }
-            let i = i - 1;
-            // A 32-bit copy (`mov w5, w0`, the entry copy of an `int`
-            // parameter) leaves dst = zext(src<31:0>), while src keeps
-            // whatever upper half the caller left (AAPCS64 leaves it
-            // unspecified). The two agree on every 32-bit view, so the rename
-            // is exact only when no later line reads or writes the 64-bit view
-            // of dst.
-            //
-            // One X-view reader is harmless: a copy `mov xD, xdst` whose
-            // destination's upper half nothing observes (`x_view_liveness`:
-            // the call staging's `mov x0, x5` for an `int` argument, which
-            // the callee reads through w0) produces every observable bit as
-            // `mov wD, wdst` -- the form it takes with the rename.
-            let mut narrowed: Vec<usize> = Vec::new();
-            if is_32bit {
-                let dx = xreg_name(dst);
-                let mut x_view_later = false;
-                for k in i + 1..fend {
-                    if matches!(
-                        kinds[k],
-                        LineKind::Nop | LineKind::Directive | LineKind::Label
-                    ) || !lines[k]
-                        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                        .any(|tok| tok == dx)
-                    {
-                        continue;
-                    }
-                    if let LineKind::Move {
-                        dst: d2,
-                        src: s2,
-                        is_32bit: false,
-                    } = kinds[k]
-                        && s2 == dst
-                        && d2 != dst
-                        && d2 < 29
-                    {
-                        let xv =
-                            lv_x.get_or_insert_with(|| x_view_liveness(lines, kinds, fstart, fend));
-                        if xv.as_ref().and_then(|l| l.live_after(k, d2)) == Some(false) {
-                            narrowed.push(k);
-                            continue;
-                        }
-                    }
-                    x_view_later = true;
-                    break;
-                }
-                if x_view_later {
-                    continue;
-                }
-            }
-            // Rule 1 (ported from x86) once required the source to be DEAD
-            // immediately after the copy.  The rules below make a live source
-            // safe: after the copy `src` and `dst` hold one value, and the
-            // rename keeps it in `src` -- rule 2 refuses a write of `src`
-            // while `dst` is live, rule 3 a write of `dst` (now of `src`)
-            // while `src` is live, the call arm a caller-saved `src` across a
-            // call `dst` lives past; a read of `src` sees the value it always
-            // did.  Requiring a dead source kept `mov w6, w1` in `if (a > b)
-            // return f(a, b); return b - a;`, whose compare reads w1 after
-            // the copy.  Early mentions are harmless: the copy sits in the
-            // straight-line entry run, so every line before it executes
-            // exactly once.
-            let Some(lv) = lv.as_ref() else {
-                continue;
-            };
-            let mut ok = true;
-            // Rule 4: the rename rewrites every later mention of `dst` --
-            // including the epilogue restore of a callee-saved `dst` -- so
-            // `dst` is never written again and the caller gets back whatever
-            // it held just before the copy. That is the caller's own value
-            // exactly when nothing in the entry run wrote it first (the run is
-            // straight-line from the entry, so the textual scan is exact):
-            // `mov x21, x0 ... mov x21, x22` would otherwise return the
-            // parameter in x21.
-            if ok && A64_CALLEE_SAVED_GP & (1u64 << dst) != 0 {
-                ok = !(fstart + 1..i).any(|k| {
-                    !matches!(
-                        kinds[k],
-                        LineKind::Nop | LineKind::Directive | LineKind::Label
-                    ) && (gp_operands(&lines[k], kinds[k], false).1 | may_write_gp(&lines[k]))
-                        & (1u64 << dst)
-                        != 0
-                });
-            }
-            if ok {
-                for k in i + 1..fend {
-                    match kinds[k] {
-                        // Deleted lines keep their text: they must not vote.
-                        LineKind::Nop | LineKind::Directive | LineKind::Label => continue,
-                        // `MemOther` names every register it touches (a
-                        // pre/post-indexed base is written explicitly), so the
-                        // rename covers it. So does an `Other` line -- a
-                        // `csel`, `cset`, `ucvtf s16, w4`, `fmov d0, x5`:
-                        // AArch64 hides only the link register, a `ret`'s
-                        // target and a writeback base, which
-                        // `classify_implicit_operands_a64` reports below,
-                        // and `may_write_gp` answers rules 2 and 3 for any
-                        // mnemonic. The exceptions read registers they do not
-                        // name: an opaque inline-asm body and a supervisor
-                        // call (x0-x8). Refusing every `Other` line kept the
-                        // entry copies of any function with a select or an
-                        // FP conversion: `mov w4, w0; ucvtf s16, w4`.
-                        LineKind::Other => {
-                            let t = lines[k].trim();
-                            if t == OPAQUE_LINE || a64_traps_to_handler(t) {
-                                ok = false;
-                                break;
-                            }
-                        }
-                        // x0/x1 carry the result (a GP result never needs
-                        // more, see `A64_RET_GP`): an implicit read the
-                        // rename cannot reach.
-                        LineKind::Ret => {
-                            if A64_RET_GP & (1u64 << dst) != 0 {
-                                ok = false;
-                                break;
-                            }
-                        }
-                        // A sibling call's tail branch is a call and a
-                        // return at once: the callee reads its argument
-                        // registers, and our caller the callee-saved ones,
-                        // through a line that names neither -- the rename
-                        // cannot reach those reads.  (`mov x10, x0` coalesced
-                        // in `mov x0, x1; mov x1, x10; b take_two` became
-                        // `mov x0, x1; mov x1, x0`: both arguments b.)
-                        LineKind::Branch
-                            if tail_exit_reads(lines, kinds, k) & (1u64 << dst) != 0 =>
-                        {
-                            ok = false;
-                            break;
-                        }
-                        // A call is the one hazard the operand classifier
-                        // cannot describe: `classify_implicit_operands_a64`
-                        // reports a `bl` as writing only x30, but the callee
-                        // also clobbers x0-x17 and reads x0-x7 as its
-                        // arguments. Liveness answers both, where the old
-                        // test -- "is `dst` mentioned anywhere later?" --
-                        // rejected far more than it had to.
-                        LineKind::Call => {
-                            // After the rename the coalesced value lives in
-                            // `src`, and a caller-saved `src` is destroyed by
-                            // the call: safe only when `dst` is dead after it.
-                            if src < 19 && lv.live_after(k, dst) != Some(false) {
-                                ok = false;
-                                break;
-                            }
-                            // The callee may read any argument register
-                            // x0-x8 (x8: the indirect result location), and
-                            // that read cannot be renamed. Whatever `dst`
-                            // holds at the call -- the coalesced value, or an
-                            // argument a later line stages in it -- moves to
-                            // `src` with the rename, so the callee would read
-                            // a stale `dst`: `mov w5, w0; ...; mov w5, w20;
-                            // bl f` became `...; mov w0, w20; bl f` with f's
-                            // sixth argument never written. Without the
-                            // emitter's annotation every argument register
-                            // counts as read (`a64_call_reads`).
-                            if a64_call_reads(&lines[k]) & (1u64 << dst) != 0 {
-                                ok = false;
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                    let (ireads, iwrites) = classify_implicit_operands_a64(&lines[k]);
-                    // An implicit WRITE to `dst` -- the caller-saved registers
-                    // a `bl` clobbers -- destroys the coalesced value, so it
-                    // is harmless exactly when `dst` is dead afterwards. The
-                    // old test rejected such a line unconditionally, which
-                    // cost every function that contains a call.
-                    if iwrites & (1u64 << dst) != 0 {
-                        ok = false;
-                        break;
-                    }
-                    // An implicit READ of `dst` -- the argument registers a
-                    // `bl` consumes -- cannot be rewritten, so it must not
-                    // happen while the value is still live: after the rename
-                    // the value lives in `src`, not in `dst`.
-                    if ireads & (1u64 << dst) != 0 {
-                        ok = false;
-                        break;
-                    }
-                    // May-write, not the liveness kill set: a load or an
-                    // `ldp` restore writes registers `gp_operands` does not
-                    // define.
-                    let defs_k =
-                        gp_operands(&lines[k], kinds[k], false).1 | may_write_gp(&lines[k]);
-                    // A line writing both would write `src` twice after the
-                    // rename -- `ldp x21, x22` becoming `ldp x21, x21` is
-                    // CONSTRAINED UNPREDICTABLE -- and one of the two values
-                    // is lost either way.
-                    if defs_k & (1u64 << dst) != 0 && defs_k & (1u64 << src) != 0 {
-                        ok = false;
-                        break;
-                    }
-                    // Rule 2: an explicit WRITE to `src` clobbers the value
-                    // that now lives there -- harmless exactly when `dst` is
-                    // dead immediately afterwards. A read of `src` sees the
-                    // shared value (rule 1).
-                    if defs_k & (1u64 << src) != 0 && lv.live_after(k, dst) != Some(false) {
-                        ok = false;
-                        break;
-                    }
-                    // Rule 3: the rename rewrites every later mention of
-                    // `dst`, so a line that WRITES `dst` becomes a write to
-                    // `src` -- and it must not destroy a value that is still
-                    // live in `src` itself. The epilogue restore of a
-                    // callee-saved register is the case that bites: renaming
-                    // `ldr x21, [sp, #32]` to `ldr x0, [sp, #32]` overwrote
-                    // the return value sitting in x0.
-                    if defs_k & (1u64 << dst) != 0 {
-                        // Only reached for the handful of candidates that
-                        // survive rules 1 and 2, so the second analysis --
-                        // which models `ret` as reading x0-x7 -- is built
-                        // lazily.
-                        if lv_ret.is_none() {
-                            lv_ret = Liveness::build(lines, kinds, fstart, fend, true);
-                        }
-                        let live_here = lv_ret.as_ref().and_then(|l| l.live_before.get(k));
-                        match live_here {
-                            Some(m) if m & (1u64 << src) == 0 => {}
-                            // Unresolvable control flow, or `src` is still
-                            // live here: either way the write is unsafe.
-                            _ => {
-                                ok = false;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            if !ok {
-                continue;
-            }
-            for &k in &narrowed {
-                if let LineKind::Move { dst: d2, .. } = kinds[k] {
-                    let indent = &lines[k][..lines[k].len() - lines[k].trim_start().len()];
-                    lines[k] = format!("{indent}mov {}, {}", wreg_name(d2), wreg_name(dst));
-                    kinds[k] = classify_line(&lines[k]);
-                }
-            }
-            let dx = xreg_name(dst).to_string();
-            let sx = xreg_name(src).to_string();
-            let dw = wreg_name(dst).to_string();
-            let sw = wreg_name(src).to_string();
-            for k in i + 1..fend {
-                if kinds[k] == LineKind::Nop {
-                    continue;
-                }
-                let new = rename_register_operand(
-                    &rename_register_operand(&lines[k], &dx, &sx),
-                    &dw,
-                    &sw,
-                );
-                if new != lines[k] {
-                    lines[k] = new;
-                    kinds[k] = classify_line(&lines[k]);
-                }
-            }
-            kinds[i] = LineKind::Nop;
-            return true;
+        } else {
+            Vec::new()
+        };
+        if !entry_copy_rename_is_safe(
+            lines,
+            kinds,
+            i,
+            (dst, src),
+            (fstart, fend),
+            &lv,
+            &mut lv_ret,
+        ) {
+            continue;
         }
+        apply_entry_copy_rename(lines, kinds, i, (dst, src), fend, &narrowed);
+        return true;
     }
     false
+}
+
+/// The later X-view readers of `dst` (a 32-bit entry copy's destination)
+/// that take the W form with the rename, or `None` when another line reads
+/// or writes the 64-bit view of `dst`.
+fn narrowable_x_view_readers(
+    lines: &[String],
+    kinds: &[LineKind],
+    i: usize,
+    dst: u8,
+    fstart: usize,
+    fend: usize,
+    lv_x: &mut Option<Option<Liveness>>,
+) -> Option<Vec<usize>> {
+    let dx = xreg_name(dst);
+    let mut narrowed: Vec<usize> = Vec::new();
+    for k in i + 1..fend {
+        if matches!(
+            kinds[k],
+            LineKind::Nop | LineKind::Directive | LineKind::Label
+        ) || !lines[k]
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|tok| tok == dx)
+        {
+            continue;
+        }
+        if let LineKind::Move {
+            dst: d2,
+            src: s2,
+            is_32bit: false,
+        } = kinds[k]
+            && s2 == dst
+            && d2 != dst
+            && d2 < 29
+        {
+            let xv = lv_x.get_or_insert_with(|| x_view_liveness(lines, kinds, fstart, fend));
+            if xv.as_ref().and_then(|l| l.live_after(k, d2)) == Some(false) {
+                narrowed.push(k);
+                continue;
+            }
+        }
+        return None;
+    }
+    Some(narrowed)
+}
+
+/// Rules 1-4 of `coalesce_one_entry_copy` for the copy `dst <- src` at
+/// line `i`: whether renaming every later mention of `dst` to `src` keeps
+/// every observable value.
+fn entry_copy_rename_is_safe(
+    lines: &[String],
+    kinds: &[LineKind],
+    i: usize,
+    (dst, src): (u8, u8),
+    (fstart, fend): (usize, usize),
+    lv: &Liveness,
+    lv_ret: &mut Option<Liveness>,
+) -> bool {
+    // Rule 1 (ported from x86) once required the source to be DEAD
+    // immediately after the copy.  The rules below make a live source
+    // safe: after the copy `src` and `dst` hold one value, and the
+    // rename keeps it in `src` -- rule 2 refuses a write of `src`
+    // while `dst` is live, rule 3 a write of `dst` (now of `src`)
+    // while `src` is live, the call arm a caller-saved `src` across a
+    // call `dst` lives past; a read of `src` sees the value it always
+    // did.  Requiring a dead source kept `mov w6, w1` in `if (a > b)
+    // return f(a, b); return b - a;`, whose compare reads w1 after
+    // the copy.  Early mentions are harmless: the copy sits in the
+    // straight-line entry run, so every line before it executes
+    // exactly once.
+    //
+    // Rule 4: the rename rewrites every later mention of `dst` --
+    // including the epilogue restore of a callee-saved `dst` -- so
+    // `dst` is never written again and the caller gets back whatever
+    // it held just before the copy. That is the caller's own value
+    // exactly when nothing in the entry run wrote it first (the run is
+    // straight-line from the entry, so the textual scan is exact):
+    // `mov x21, x0 ... mov x21, x22` would otherwise return the
+    // parameter in x21.
+    if A64_CALLEE_SAVED_GP & (1u64 << dst) != 0
+        && (fstart + 1..i).any(|k| {
+            !matches!(
+                kinds[k],
+                LineKind::Nop | LineKind::Directive | LineKind::Label
+            ) && (gp_operands(&lines[k], kinds[k], false).1 | may_write_gp(&lines[k]))
+                & (1u64 << dst)
+                != 0
+        })
+    {
+        return false;
+    }
+    for k in i + 1..fend {
+        match kinds[k] {
+            // Deleted lines keep their text: they must not vote.
+            LineKind::Nop | LineKind::Directive | LineKind::Label => continue,
+            // `MemOther` names every register it touches (a
+            // pre/post-indexed base is written explicitly), so the
+            // rename covers it. So does an `Other` line -- a
+            // `csel`, `cset`, `ucvtf s16, w4`, `fmov d0, x5`:
+            // AArch64 hides only the link register, a `ret`'s
+            // target and a writeback base, which
+            // `classify_implicit_operands_a64` reports below,
+            // and `may_write_gp` answers rules 2 and 3 for any
+            // mnemonic. The exceptions read registers they do not
+            // name: an opaque inline-asm body and a supervisor
+            // call (x0-x8). Refusing every `Other` line kept the
+            // entry copies of any function with a select or an
+            // FP conversion: `mov w4, w0; ucvtf s16, w4`.
+            LineKind::Other => {
+                let t = lines[k].trim();
+                if t == OPAQUE_LINE || a64_traps_to_handler(t) {
+                    return false;
+                }
+            }
+            // x0/x1 carry the result (a GP result never needs
+            // more, see `A64_RET_GP`): an implicit read the
+            // rename cannot reach.
+            LineKind::Ret => {
+                if A64_RET_GP & (1u64 << dst) != 0 {
+                    return false;
+                }
+            }
+            // A sibling call's tail branch is a call and a
+            // return at once: the callee reads its argument
+            // registers, and our caller the callee-saved ones,
+            // through a line that names neither -- the rename
+            // cannot reach those reads.  (`mov x10, x0` coalesced
+            // in `mov x0, x1; mov x1, x10; b take_two` became
+            // `mov x0, x1; mov x1, x0`: both arguments b.)
+            LineKind::Branch if tail_exit_reads(lines, kinds, k) & (1u64 << dst) != 0 => {
+                return false;
+            }
+            // A call is the one hazard the operand classifier
+            // cannot describe: `classify_implicit_operands_a64`
+            // reports a `bl` as writing only x30, but the callee
+            // also clobbers x0-x17 and reads x0-x7 as its
+            // arguments. Liveness answers both, where the old
+            // test -- "is `dst` mentioned anywhere later?" --
+            // rejected far more than it had to.
+            LineKind::Call => {
+                // After the rename the coalesced value lives in
+                // `src`, and a caller-saved `src` is destroyed by
+                // the call: safe only when `dst` is dead after it.
+                if src < 19 && lv.live_after(k, dst) != Some(false) {
+                    return false;
+                }
+                // The callee may read any argument register
+                // x0-x8 (x8: the indirect result location), and
+                // that read cannot be renamed. Whatever `dst`
+                // holds at the call -- the coalesced value, or an
+                // argument a later line stages in it -- moves to
+                // `src` with the rename, so the callee would read
+                // a stale `dst`: `mov w5, w0; ...; mov w5, w20;
+                // bl f` became `...; mov w0, w20; bl f` with f's
+                // sixth argument never written. Without the
+                // emitter's annotation every argument register
+                // counts as read (`a64_call_reads`).
+                if a64_call_reads(&lines[k]) & (1u64 << dst) != 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        let (ireads, iwrites) = classify_implicit_operands_a64(&lines[k]);
+        // An implicit WRITE to `dst` -- the caller-saved registers
+        // a `bl` clobbers -- destroys the coalesced value, so it
+        // is harmless exactly when `dst` is dead afterwards. The
+        // old test rejected such a line unconditionally, which
+        // cost every function that contains a call.
+        if iwrites & (1u64 << dst) != 0 {
+            return false;
+        }
+        // An implicit READ of `dst` -- the argument registers a
+        // `bl` consumes -- cannot be rewritten, so it must not
+        // happen while the value is still live: after the rename
+        // the value lives in `src`, not in `dst`.
+        if ireads & (1u64 << dst) != 0 {
+            return false;
+        }
+        // May-write, not the liveness kill set: a load or an
+        // `ldp` restore writes registers `gp_operands` does not
+        // define.
+        let defs_k = gp_operands(&lines[k], kinds[k], false).1 | may_write_gp(&lines[k]);
+        // A line writing both would write `src` twice after the
+        // rename -- `ldp x21, x22` becoming `ldp x21, x21` is
+        // CONSTRAINED UNPREDICTABLE -- and one of the two values
+        // is lost either way.
+        if defs_k & (1u64 << dst) != 0 && defs_k & (1u64 << src) != 0 {
+            return false;
+        }
+        // Rule 2: an explicit WRITE to `src` clobbers the value
+        // that now lives there -- harmless exactly when `dst` is
+        // dead immediately afterwards. A read of `src` sees the
+        // shared value (rule 1).
+        if defs_k & (1u64 << src) != 0 && lv.live_after(k, dst) != Some(false) {
+            return false;
+        }
+        // Rule 3: the rename rewrites every later mention of
+        // `dst`, so a line that WRITES `dst` becomes a write to
+        // `src` -- and it must not destroy a value that is still
+        // live in `src` itself. The epilogue restore of a
+        // callee-saved register is the case that bites: renaming
+        // `ldr x21, [sp, #32]` to `ldr x0, [sp, #32]` overwrote
+        // the return value sitting in x0.
+        if defs_k & (1u64 << dst) != 0 {
+            // Only reached for the handful of candidates that
+            // survive rules 1 and 2, so the second analysis --
+            // which models `ret` as reading x0-x7 -- is built
+            // lazily.
+            if lv_ret.is_none() {
+                *lv_ret = Liveness::build(lines, kinds, fstart, fend, true);
+            }
+            let live_here = lv_ret.as_ref().and_then(|l| l.live_before.get(k));
+            match live_here {
+                Some(m) if m & (1u64 << src) == 0 => {}
+                // Unresolvable control flow, or `src` is still
+                // live here: either way the write is unsafe.
+                _ => {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Apply an entry-copy rename: narrow the X-view readers, rename every
+/// later mention of `dst` to `src` and delete the copy at line `i`.
+fn apply_entry_copy_rename(
+    lines: &mut [String],
+    kinds: &mut [LineKind],
+    i: usize,
+    (dst, src): (u8, u8),
+    fend: usize,
+    narrowed: &[usize],
+) {
+    for &k in narrowed {
+        if let LineKind::Move { dst: d2, .. } = kinds[k] {
+            let indent = &lines[k][..lines[k].len() - lines[k].trim_start().len()];
+            lines[k] = format!("{indent}mov {}, {}", wreg_name(d2), wreg_name(dst));
+            kinds[k] = classify_line(&lines[k]);
+        }
+    }
+    let dx = xreg_name(dst).to_string();
+    let sx = xreg_name(src).to_string();
+    let dw = wreg_name(dst).to_string();
+    let sw = wreg_name(src).to_string();
+    for k in i + 1..fend {
+        if kinds[k] == LineKind::Nop {
+            continue;
+        }
+        let new = rename_register_operand(&rename_register_operand(&lines[k], &dx, &sx), &dw, &sw);
+        if new != lines[k] {
+            lines[k] = new;
+            kinds[k] = classify_line(&lines[k]);
+        }
+    }
+    kinds[i] = LineKind::Nop;
 }
 
 /// Merge identical basic blocks.
