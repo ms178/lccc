@@ -28,21 +28,13 @@ pub fn run(module: &mut IrModule) -> usize {
     module.for_each_function(propagate_copies)
 }
 
-/// True when an intrinsic reads an argument naming a slot as a WHOLE vector of
-/// exactly `size` bytes, so that `memcpy tmp, src` feeding that argument can be
-/// folded by pointing the argument at `src` instead.
-///
-/// `vector_home_width() == size` is what makes the read whole-object: the op
-/// consumes vectors of that width, so it cannot be reading a prefix or a field
-/// of a wider aggregate.
-///
-/// `writes_memory_via_args` ops (the `VecStore*` family) are refused: folding
-/// an operand could turn a read into a write.
-fn memcpy_folds_into_intrinsic(op: &IntrinsicOp, size: usize) -> bool {
-    op.vector_home_width()
-        .and_then(|width| usize::try_from(width).ok())
-        == Some(size)
-        && !op.writes_memory_via_args()
+/// Only an explicitly classified vector-input position of exactly this width
+/// may be replaced. Result-home width alone says nothing about whether an
+/// argument is a scalar, an address, or a vector of a different width.
+/// Instructions that write through their arguments are never consumers.
+fn memcpy_folds_into_intrinsic(op: &IntrinsicOp, size: usize, index: usize) -> bool {
+    !op.writes_memory_via_args()
+        && super::vector_temp_promotion::pointer_vector_arg_width(*op, index) == Some(size)
 }
 
 /// Direct, nonvolatile alloca values with exactly one definition. After phi
@@ -173,11 +165,11 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
                         // the op writes through.
                         Instruction::Intrinsic {
                             op, args, dest_ptr, ..
-                        } if memcpy_folds_into_intrinsic(op, size)
-                            && *dest_ptr != Some(tmp)
-                            && args
-                                .iter()
-                                .any(|a| matches!(a, Operand::Value(v) if *v == tmp)) =>
+                        } if *dest_ptr != Some(tmp)
+                            && args.iter().enumerate().any(|(index, a)| {
+                                matches!(a, Operand::Value(v) if *v == tmp)
+                                    && memcpy_folds_into_intrinsic(op, size, index)
+                            }) =>
                         {
                             // Keep the source nonvolatile and, for a memory
                             // result, disjoint from the destination. Some
@@ -2459,13 +2451,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn intrinsic_forward_refuses_scalar_and_mixed_width_positions() {
+        for (op, size, args) in [
+            (
+                IntrinsicOp::SetEpi32_256,
+                32,
+                vec![Operand::Value(Value(1))],
+            ),
+            (
+                IntrinsicOp::Pinsrd128,
+                16,
+                vec![Operand::Value(Value(8)), Operand::Value(Value(1))],
+            ),
+            (
+                IntrinsicOp::Broadcast128to256,
+                32,
+                vec![Operand::Value(Value(1))],
+            ),
+        ] {
+            let inst = Instruction::Intrinsic {
+                dest: Some(Value(20)),
+                op,
+                dest_ptr: Some(Value(2)),
+                args,
+            };
+            let mut module = IrModule {
+                functions: vec![one_block(vec![
+                    alloca(1),
+                    alloca(2),
+                    alloca(7),
+                    memcpy(1, 7, size),
+                    inst,
+                ])],
+                ..IrModule::default()
+            };
+            assert_eq!(forward_memcpy_chains(&mut module), 0, "{op:?}");
+        }
+        assert!(memcpy_folds_into_intrinsic(&IntrinsicOp::MinPs256, 32, 0));
+        assert!(memcpy_folds_into_intrinsic(&IntrinsicOp::MinPs256, 32, 1));
+        assert!(!memcpy_folds_into_intrinsic(&IntrinsicOp::MinPs256, 32, 2));
+        assert!(!memcpy_folds_into_intrinsic(
+            &IntrinsicOp::SetEpi32_256,
+            32,
+            0
+        ));
+    }
+
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn vector_copy_width_must_not_truncate_to_32_bits() {
-        assert!(memcpy_folds_into_intrinsic(&IntrinsicOp::MinPs256, 32));
+        assert!(memcpy_folds_into_intrinsic(&IntrinsicOp::MinPs256, 32, 0));
         assert!(!memcpy_folds_into_intrinsic(
             &IntrinsicOp::MinPs256,
-            (1usize << 32) + 32
+            (1usize << 32) + 32,
+            0
         ));
     }
 
