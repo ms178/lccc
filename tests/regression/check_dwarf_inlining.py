@@ -284,6 +284,16 @@ def host_controls(args: argparse.Namespace, work: Path) -> list[dict]:
         rows.append({"kind": "provenance-verifier", "target": name,
                      "result": "O1/O2 with and without -g keep IR provenance parallel"})
 
+    # SLP/vectorization creates fresh concrete blocks while the function may
+    # still carry inline instances elsewhere.  Empty provenance is a valid
+    # sparse representation; the verifier must not demand an all-sentinel array.
+    slp = work / "slp.c"
+    slp.write_text("void add16(unsigned char *p) { for (int i = 0; i < 16; ++i) p[i] = (unsigned char)(p[i] + 1); }\n")
+    slp_obj = work / "slp.o"
+    proc = run([lccc, "-std=c23", "-O2", "-g", "-msse2", "-c", str(slp), "-o", str(slp_obj)], work, verify_env)
+    require(proc.returncode == 0, f"SLP provenance verifier aborted:\n{proc.stderr}")
+    rows.append({"kind": "slp-provenance", "result": "vectorized concrete blocks keep sparse provenance valid"})
+
     if args.gdb:
         exe = work / "nested.elf"
         compile_source(lccc, nested, exe, work, "-O2", "-g", "-fno-omit-frame-pointer", str(seed))
