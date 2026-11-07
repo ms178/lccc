@@ -173,6 +173,23 @@ impl RiscvCodegen {
                     | Instruction::LabelAddr { .. }
                     | Instruction::GetStaticChain { .. }
                     | Instruction::SetStaticChain { .. } => {}
+                    // Atomic loads and stores (any width but 16 bytes) and
+                    // word/doubleword AMOs and LR/SC loops write t0-t4 and
+                    // read their operands in place (`atomics.rs`); fences
+                    // touch no register.  The sub-word RMW/CAS loops write
+                    // a2-a5 and 16-byte atomics call libatomic: both keep
+                    // the callee-saved pool.
+                    Instruction::AtomicLoad { ty, .. } | Instruction::AtomicStore { ty, .. } => {
+                        if !scalar(ty) {
+                            return false;
+                        }
+                    }
+                    Instruction::AtomicRmw { ty, .. } | Instruction::AtomicCmpxchg { ty, .. } => {
+                        if !scalar(ty) || Self::is_subword_type(*ty) {
+                            return false;
+                        }
+                    }
+                    Instruction::Fence { .. } => {}
                     Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. }
                         if allow_calls
                             && !crate::backend::liveness::is_returns_twice_call(inst)
@@ -192,7 +209,8 @@ impl RiscvCodegen {
                             return false;
                         }
                     }
-                    // Everything else (calls, inline asm, memcpys, atomics,
+                    // Everything else (calls, inline asm, memcpys, sub-word
+                    // and 16-byte atomic RMW/CAS,
                     // intrinsics, varargs, F128/i128 carriers, non-local
                     // goto plumbing, dynamic allocas) keeps the pure
                     // callee-saved pool.

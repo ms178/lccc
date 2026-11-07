@@ -284,6 +284,22 @@ impl ArmCodegen {
                                 .emit_fmt(format_args!("    mov {}, {}", d32, s32));
                         }
                     }
+                    // An atomic's unsigned result is already zero-extended
+                    // (`atomic_zext_values`): a plain X copy at most, which
+                    // copy propagation can fold (a W copy would read as a
+                    // zero extension it cannot drop).
+                    (false, IrType::U8 | IrType::U16 | IrType::U32)
+                        if matches!(src, Operand::Value(v)
+                            if self.atomic_zext_values.contains(&v.0)) =>
+                    {
+                        if sp != dp {
+                            self.state.emit_fmt(format_args!(
+                                "    mov {}, {}",
+                                d64,
+                                callee_saved_name(sp)
+                            ));
+                        }
+                    }
                     (false, IrType::U8) => self
                         .state
                         .emit_fmt(format_args!("    and {}, {}, #0xff", d32, s32)),
@@ -389,6 +405,15 @@ impl ArmCodegen {
         if from_ty == IrType::I32
             && to_ty == IrType::I64
             && matches!(src, Operand::Value(v) if self.bitop_nonneg_values.contains(&v.0))
+        {
+            self.emit_load_operand(src);
+            self.store_x0_to_and_release(dest);
+            return;
+        }
+        // Likewise the zero extension of an atomic's unsigned result.
+        if matches!(classify_cast(from_ty, to_ty), CastKind::IntWiden { .. })
+            && matches!(from_ty, IrType::U8 | IrType::U16 | IrType::U32)
+            && matches!(src, Operand::Value(v) if self.atomic_zext_values.contains(&v.0))
         {
             self.emit_load_operand(src);
             self.store_x0_to_and_release(dest);

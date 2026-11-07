@@ -12143,21 +12143,36 @@ fn remove_ineligible_operands(
                     ty,
                     ..
                 } => {
-                    // x86-64's narrow atomic emitters read the address
-                    // register-aware (`atomic_address_reg`: in place from its
-                    // home, else via %rax/%rcx), and their only fixed scratch
-                    // is modelled (`x86_inst_fixed_scratch`; %rdx refuses any
-                    // value live into the point).  Excluding the pointer used
-                    // to force it through a slot or the accumulator -- a
-                    // reload per access for an atomic counter in a loop.
-                    // 128-bit forms stage libatomic arguments in
-                    // %rdi/%rsi/%rdx/%rcx before reading the pointer, and the
-                    // other backends' sequences are not audited for it: both
-                    // keep the exclusion.
-                    let x86_narrow = crate::common::types::target_elf_machine()
-                        == crate::backend::elf::EM_X86_64
-                        && !matches!(ty, IrType::I128 | IrType::U128);
-                    if !x86_narrow {
+                    // The narrow (8- to 64-bit) atomic emitters of x86-64,
+                    // AArch64 and RISC-V read the address register-aware, in
+                    // place from its home:
+                    //   x86-64  `atomic_address_reg` (else via %rax/%rcx);
+                    //           its only fixed scratch is modelled
+                    //           (`x86_inst_fixed_scratch`; %rdx refuses any
+                    //           value live into the point);
+                    //   AArch64 `atomic_operand_reg`: the sequences write
+                    //           x0-x3, never homes, and w4, which leaves the
+                    //           pool of every function with an RMW or a
+                    //           compare-exchange (`arm_pool_scratch`);
+                    //   RISC-V  `atomic_operand_reg`: t0-t5 only, plus
+                    //           a2-a5 in the sub-word RMW/CAS loops, whose
+                    //           functions never open the a-register pool
+                    //           (`riscv_emitter_safe_ir`).
+                    // Excluding the pointer forced it through a slot -- a
+                    // frame and a reload per access for every atomic leaf,
+                    // and per iteration for an atomic counter in a loop.
+                    // 128-bit forms keep the exclusion: x86-64 stages
+                    // libatomic arguments in %rdi/%rsi/%rdx/%rcx before
+                    // reading the pointer, RISC-V calls libatomic too, and
+                    // all of them are call points.  i686 is unaudited.
+                    let machine = crate::common::types::target_elf_machine();
+                    let narrow_register_aware = matches!(
+                        machine,
+                        crate::backend::elf::EM_X86_64
+                            | crate::backend::elf::EM_AARCH64
+                            | crate::backend::elf::EM_RISCV
+                    ) && !matches!(ty, IrType::I128 | IrType::U128);
+                    if !narrow_register_aware {
                         eligible.remove(&v.0);
                     }
                 }
