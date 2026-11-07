@@ -11,7 +11,13 @@ int global_load_snapshot = 1;
 __attribute__((noinline))
 static int capture_then_asm_write(int choose) {
     int before = global_load_snapshot;
+#ifdef __i386__
+    /* RIP-relative addressing does not exist in 32-bit mode.  Keep the
+     * memory clobber (rather than an output operand) in both variants. */
+    __asm__ volatile ("movl $2, global_load_snapshot" ::: "memory");
+#else
     __asm__ volatile ("movl $2, global_load_snapshot(%%rip)" ::: "memory");
+#endif
     if (choose)
         return before;
     return before + 0;
