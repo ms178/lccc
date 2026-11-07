@@ -12057,18 +12057,13 @@ impl X86Codegen {
             }
             match arg {
                 Operand::Value(v) => {
+                    // A pending deferred store is one more way the value can
+                    // be in a register rather than in its slot.
                     if this.state.vec_live_regs.contains_key(&v.0)
                         || (this.state.vec_last_store_reg
                             && this.state.vec_last_store_val == Some(v.0))
+                        || this.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0)
                     {
-                        return None;
-                    }
-                    // LAZY-FLUSH SOUNDNESS, as in `evex_arg_mem`: a deferred
-                    // store means the slot is not written yet. The peephole
-                    // check above usually covers this, but `vec_last_store_reg`
-                    // can be cleared by an intervening emission while the
-                    // pending store survives, so state it explicitly.
-                    if this.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
                         return None;
                     }
                     this.value_ptr_mem_operand(v.0)
