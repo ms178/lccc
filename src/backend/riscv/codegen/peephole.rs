@@ -831,6 +831,12 @@ pub fn peephole_optimize(asm: String) -> String {
         }
     }
 
+    // Homes the copy propagation above left unread go with their saves; the
+    // copies that fed them die in turn.
+    if eliminate_unread_callee_saved_homes(&lines, &mut kinds, n) {
+        eliminate_dead_defs_global(&lines, &mut kinds, n);
+        eliminate_self_moves(&mut kinds, n);
+    }
     drop_orphaned_save_rows(&lines, &mut kinds, n);
     // Last: only now is it known which frames the body no longer touches.
     eliminate_vestigial_frames(&lines, &mut kinds, n);
@@ -845,6 +851,12 @@ pub fn peephole_optimize(asm: String) -> String {
         };
         lines[i] = original;
     }
+    // The call annotations end with the passes that read them.
+    for line in lines.iter_mut() {
+        if let Some(at) = line.find(CALL_READS_TAG) {
+            line.truncate(at);
+        }
+    }
     let optimized = crate::backend::peephole_common::join_with_debug_rows(&lines[..n], |i| {
         kinds[i] != LineKind::Nop
     });
@@ -856,11 +868,22 @@ pub fn peephole_optimize(asm: String) -> String {
 /// for the passes.
 pub(crate) fn strip_internal_markers(asm: String) -> String {
     let asm = crate::backend::peephole_common::strip_volatile_markers(asm);
-    if !asm.contains(RET_REGS_MARKER) && !asm.contains(ARG_EXT_MARKER) {
+    if !asm.contains(RET_REGS_MARKER)
+        && !asm.contains(ARG_EXT_MARKER)
+        && !asm.contains(CALL_READS_TAG)
+    {
         return asm;
     }
     asm.split_inclusive('\n')
         .filter(|line| !is_internal_marker(line.trim_start()))
+        .map(|line| match line.find(CALL_READS_TAG) {
+            Some(at) => format!(
+                "{}{}",
+                &line[..at],
+                if line.ends_with('\n') { "\n" } else { "" }
+            ),
+            None => line.to_string(),
+        })
         .collect()
 }
 
@@ -1854,6 +1877,7 @@ fn eliminate_redundant_zext_byte(lines: &mut [String], kinds: &mut [LineKind], n
     }
 
     let mut widths = [0u8; NUM_REGS]; // 0 = unknown/full 64-bit
+    let mut live = RvLazyLiveness::new(lines, kinds, n);
     let mut changed = false;
     let mut i = 0;
     while i < n {
@@ -1931,20 +1955,26 @@ fn eliminate_redundant_zext_byte(lines: &mut [String], kinds: &mut [LineKind], n
                     .strip_prefix("srli ")
                     .map(|s| s.split(',').map(str::trim).collect())
                     .unwrap_or_default();
+                // `srli e, dst, K` into another register leaves `dst` holding
+                // the shifted value, which must then be dead (the pair is
+                // `slli t0, t0, 32; srli a2, t0, 32` after `srliw t0, t0, 7`).
+                let e = jops.first().map_or(REG_NONE, |o| parse_reg(o));
                 if jops.len() == 3
-                    && parse_reg(jops[0]) == dst
+                    && e != REG_NONE
                     && parse_reg(jops[1]) == dst
                     && parse_asm_i64(jops[2]) == Some(k)
+                    && (e == dst || live.dead_after(lines, kinds, j, dst))
                 {
-                    if dst == src {
+                    if e == src {
                         kinds[i] = LineKind::Nop;
                     } else {
-                        lines[i] = format!("    mv {}, {}", reg_name(dst), reg_name(src));
-                        kinds[i] = LineKind::Move { dst, src };
+                        lines[i] = format!("    mv {}, {}", reg_name(e), reg_name(src));
+                        kinds[i] = LineKind::Move { dst: e, src };
                     }
                     kinds[j] = LineKind::Nop;
                     let src_width = widths[src as usize];
-                    set_width(&mut widths, dst, src_width);
+                    set_width(&mut widths, e, src_width);
+                    live.invalidate();
                     changed = true;
                     i = j + 1;
                     continue;
@@ -2052,6 +2082,27 @@ fn eliminate_redundant_zext_byte(lines: &mut [String], kinds: &mut [LineKind], n
                         0
                     };
                     set_width(&mut widths, dst, w);
+                }
+            }
+            // `srliw d, s, K` (K >= 1) is the low word shifted right and
+            // sign-extended from a cleared bit 31: at most 32 - K low bits.
+            LineKind::Alu if mnem == "srliw" && ops.len() == 3 => {
+                let dst = parse_reg(ops[0]);
+                let src = parse_reg(ops[1]);
+                let sh = parse_asm_i64(ops[2]).filter(|v| (1..32).contains(v));
+                match (dst, src, sh) {
+                    (d, s, Some(sh)) if d != REG_NONE && s != REG_NONE => {
+                        let sw = widths[s as usize];
+                        let sh = sh as u8;
+                        let w = if sw == 0 || sw > 32 {
+                            32 - sh
+                        } else {
+                            sw.saturating_sub(sh).max(1)
+                        };
+                        set_width(&mut widths, d, w);
+                    }
+                    (d, _, _) if d != REG_NONE => set_width(&mut widths, d, 0),
+                    _ => widths.fill(0),
                 }
             }
             LineKind::Alu if mnem == "srli" && ops.len() == 3 => {
@@ -2569,6 +2620,20 @@ fn rv_produced_range(mnem: &str, imm: Option<i64>, src: RvRange) -> Option<RvRan
         "srai" => match imm.filter(|k| (0..64).contains(k)) {
             Some(k) => (src.0 >> k, src.1 >> k),
             None => RV_FULL,
+        },
+        // The low word shifted, then sign-extended from bit 31: a logical
+        // shift by K >= 1 clears that bit, so the result is the word's
+        // unsigned value shifted -- the source's range shifted when it is a
+        // non-negative word, else everything below 2^(32 - K).
+        "srliw" => match imm.filter(|k| (1..32).contains(k)) {
+            Some(k) if src.0 >= 0 && src.1 <= i64::from(i32::MAX) => (src.0 >> k, src.1 >> k),
+            Some(k) => rv_unsigned_range((32 - k) as u32),
+            None => RV_WORD,
+        },
+        "sraiw" => match imm.filter(|k| (0..32).contains(k)) {
+            Some(k) if rv_range_within(src, RV_WORD) => (src.0 >> k, src.1 >> k),
+            Some(k) => (i64::from(i32::MIN) >> k, i64::from(i32::MAX) >> k),
+            None => RV_WORD,
         },
         "addi" => imm.map_or(RV_FULL, |v| rv_offset_range(src, v)),
         // The low word plus `v`, sign-extended: the offset range itself when
@@ -4186,6 +4251,27 @@ fn eliminate_dead_reg_moves(lines: &[String], kinds: &mut [LineKind], n: usize) 
 /// The prologue's `# lccc-ret-regs a0 a1|a0|-` line: the general registers
 /// the function's `ret` hands back as its value.  An internal annotation, not
 /// a configuration knob: every exit of `peephole_optimize` removes it.
+/// Appended by the call emitter to a direct `call` of an IR call: the GP
+/// argument registers it reads (decimal mask, bit k = a_k).  The peephole
+/// charges an annotated call with exactly those, the static chain t2 and
+/// sp, instead of every caller-saved register; the annotation is stripped
+/// before the text leaves the backend.
+pub(super) const CALL_READS_TAG: &str = " # lccc-call-reads ";
+
+/// The registers (liveness bits) the call on `line` reads, when the emitter
+/// annotated it: its argument registers, t2 (a nested callee's static
+/// chain) and sp.
+fn rv_annotated_call_reads(line: &str) -> Option<u64> {
+    let mask: u64 = line
+        .split_once(CALL_READS_TAG)?
+        .1
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    Some(((mask & 0xff) << REG_A0) | rv_bit(REG_T2) | rv_bit(REG_SP))
+}
+
 const RET_REGS_MARKER: &str = "# lccc-ret-regs";
 
 /// The prologue's `# lccc-arg-ext a0 a1/z16 a2/s8 ...` line (see
@@ -4457,9 +4543,12 @@ fn rv_uses_defs(line: &str, kind: LineKind) -> (u64, u64) {
     match kind {
         // A call may read any argument or scratch register (t2 carries a
         // nested function's static chain; helper conventions use t-regs)
-        // and the stack, and clobbers every caller-saved register.
+        // and the stack, and clobbers every caller-saved register -- unless
+        // the emitter published exactly which argument registers it reads.
         LineKind::Call => (
-            (named & !rv_bit(REG_RA)) | RV_CALLER_SAVED & !rv_bit(REG_RA) | rv_bit(REG_SP),
+            (named & !rv_bit(REG_RA))
+                | rv_annotated_call_reads(line)
+                    .unwrap_or(RV_CALLER_SAVED & !rv_bit(REG_RA) | rv_bit(REG_SP)),
             RV_CALLER_SAVED,
         ),
         // The return value (a0/a1), the link register and every register
@@ -4829,6 +4918,117 @@ fn rv_function_ranges(lines: &[String], kinds: &[LineKind], n: usize) -> Vec<(us
         ranges.push((s, n));
     }
     ranges
+}
+
+// ── Callee-saved homes nobody reads ─────────────────────────────────────────
+//
+// In a function with calls the allocator homes values in s-registers; copy
+// propagation then forwards most of their reads to the argument registers
+// they came from (`int keep_none(int a, int b) { return take_two(a, b) * 2;
+// }` homed a, b and the result in s1, s7, s8 and read none of them), and
+// what is left is a write, a save and a restore per home.  When a function
+// never READS sN -- every mention is the prologue save, an epilogue restore
+// or a deletable definition -- sN keeps the caller's value throughout once
+// the definitions go, so the save and the restores go too (the unwind row
+// follows in `drop_orphaned_save_rows`).  Legality:
+//   * no line reads sN (the global operand model, `rv_uses_defs`, counts an
+//     unmodelled line as reading everything; a `ret`'s read of the callee-
+//     saved set is exactly the caller's expectation this keeps);
+//   * every other write is a pure single-destination definition or a load;
+//   * exactly one prologue save `sd sN, OFF(base)`, and its address text
+//     appears only there and in `ld sN` restores -- the slot serves nothing
+//     else;
+//   * the function holds no protected (inline assembly / volatile) text.
+fn eliminate_unread_callee_saved_homes(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for (start, end) in rv_function_ranges(lines, kinds, n) {
+        if (start..end).any(|k| lines[k] == OPAQUE_LINE) {
+            continue;
+        }
+        for reg in REG_S1..=REG_S11 {
+            let name = reg_name(reg);
+            let bit = rv_bit(reg);
+            let mem_of = |k: usize, m: &str| -> Option<String> {
+                let ops = rv_operands_of(&lines[k], m);
+                match ops.as_slice() {
+                    [r, addr]
+                        if r == name && (addr.ends_with("(s0)") || addr.ends_with("(sp)")) =>
+                    {
+                        Some(addr.clone())
+                    }
+                    _ => None,
+                }
+            };
+            let mut save: Option<(usize, String)> = None;
+            let mut restores: Vec<usize> = Vec::new();
+            let mut writes: Vec<usize> = Vec::new();
+            let mut ok = true;
+            for k in start..end {
+                if matches!(
+                    kinds[k],
+                    LineKind::Nop | LineKind::Label | LineKind::Directive
+                ) || kinds[k] == LineKind::Ret
+                {
+                    continue;
+                }
+                if let Some(addr) = mem_of(k, "sd") {
+                    if save.is_some() {
+                        ok = false;
+                        break;
+                    }
+                    save = Some((k, addr));
+                    continue;
+                }
+                if mem_of(k, "ld").is_some() {
+                    restores.push(k);
+                    continue;
+                }
+                let (uses, defs) = rv_uses_defs(&lines[k], kinds[k]);
+                if uses & bit != 0 {
+                    ok = false;
+                    break;
+                }
+                if defs & bit != 0 {
+                    let pure = match kinds[k] {
+                        LineKind::Move { .. }
+                        | LineKind::LoadImm { .. }
+                        | LineKind::LoadAddr { .. }
+                        | LineKind::SextW { .. }
+                        | LineKind::LoadS0 { .. } => true,
+                        LineKind::Alu => {
+                            rv_is_pure_int_op(lines[k].split_whitespace().next().unwrap_or(""))
+                                && parse_alu_dest(&lines[k]) == Some(reg)
+                        }
+                        LineKind::Other => rv_load_dest(&lines[k]) == Some(reg),
+                        _ => false,
+                    };
+                    if !pure {
+                        ok = false;
+                        break;
+                    }
+                    writes.push(k);
+                }
+            }
+            let Some((save_line, addr)) = save.filter(|_| ok) else {
+                continue;
+            };
+            // The slot serves the save and its restores only.
+            let elsewhere = (start..end).any(|k| {
+                k != save_line
+                    && !restores.contains(&k)
+                    && kinds[k] != LineKind::Nop
+                    && lines[k].contains(addr.as_str())
+            });
+            if elsewhere {
+                continue;
+            }
+            for k in std::iter::once(save_line).chain(restores).chain(writes) {
+                kinds[k] = LineKind::Nop;
+            }
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// Delete pure definitions of a temporary or argument register that no path

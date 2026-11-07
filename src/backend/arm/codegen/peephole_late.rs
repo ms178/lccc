@@ -14,6 +14,11 @@
 //!   bit above an argument's width unspecified, and every AAPCS64 callee
 //!   (LCCC's own `canonical_gp_param_move` included) extends it on entry.
 //!   GCC 16.2 and Clang 23.1.5 pass `f((signed char)x)` as a bare `bl f`.
+//! * [`rename_clobbering_defs`] -- a write of `s` after `mov c, s`, whose
+//!   value dies in the block while `c` is still read, moves to a free
+//!   register, so `s` keeps the copied value for the next pass
+//!   (`mov x5, x0; mov x0, #85; eor x0, x5, x0` is `mov x9, #85;
+//!   eor x0, x0, x9`).
 //! * [`forward_block_copies`] -- `mov d, s` then readers of `d` later in the
 //!   same block read `s` instead, so the copy dies (`sel_add4`'s
 //!   `mov w7, w1` three lines before the `csel` that reads it).
@@ -33,7 +38,8 @@
 use super::{
     A64_ALL_GP, CALL_READS_TAG, LineKind, Liveness, OPAQUE_LINE, a64_traps_to_handler,
     abi_liveness, classify_line, flag_operands, gp_operands, implicitly_writes_a64,
-    inert_directive, invert_condition, may_write_gp, renamable_def_dest, wreg_name, xreg_name,
+    inert_directive, invert_condition, may_write_gp, rename_def_dest, rename_gp_tokens,
+    renamable_def_dest, tail_marker_before, wreg_name, xreg_name,
 };
 use crate::backend::peephole_common::{replace_source_reg_in_instruction, replace_whole_word};
 
@@ -44,22 +50,27 @@ pub(super) const CALL_NARROW_KEY: &str = "narrow=";
 
 /// The significant width of each GP argument register x0-x7 at the call on
 /// `line` (0 = all 64 bits, or not annotated).
-fn call_narrow_widths(line: &str) -> [u8; 8] {
+pub(super) fn call_narrow_widths(line: &str) -> [u8; 8] {
+    line.split_once(CALL_READS_TAG)
+        .map_or([0; 8], |(_, tail)| narrow_widths(tail))
+}
+
+/// The widths of the `narrow=R:W,...` token in `text` -- a call's
+/// annotation after `CALL_READS_TAG`, or a sibling call's
+/// `TAIL_READS_MARKER` row: `W` for each listed `xR` (8, 16 or 32), 0 for
+/// every other register.  A malformed entry is skipped: 0 is the
+/// conservative answer (all 64 bits significant).
+pub(super) fn narrow_widths(text: &str) -> [u8; 8] {
     let mut widths = [0u8; 8];
-    let Some((_, tail)) = line.split_once(CALL_READS_TAG) else {
-        return widths;
-    };
-    let Some(list) = tail
+    let Some(list) = text
         .split_whitespace()
         .find_map(|tok| tok.strip_prefix(CALL_NARROW_KEY))
     else {
         return widths;
     };
     for entry in list.split(',') {
-        let Some((r, w)) = entry.split_once(':') else {
-            continue;
-        };
-        if let (Ok(r), Ok(w)) = (r.parse::<usize>(), w.parse::<u8>())
+        if let Some((r, w)) = entry.split_once(':')
+            && let (Ok(r), Ok(w)) = (r.parse::<usize>(), w.parse::<u8>())
             && r < 8
             && matches!(w, 8 | 16 | 32)
         {
@@ -165,8 +176,8 @@ fn set_line(lines: &mut [String], kinds: &mut [LineKind], k: usize, text: String
 
 /// How many low bits the extension on `line` copies unchanged from its
 /// source, and the destination and source registers: `sxtb`/`uxtb` keep 8,
-/// `sxth`/`uxth` 16, `sxtw` and a W `mov` 32, `and #0xff/#0xffff/
-/// #0xffffffff` 8/16/32, `ubfx`/`sbfx #0, #w` w.
+/// `sxth`/`uxth` 16, `sxtw` and a W `mov` 32, an X `mov` 64, `and #0xff/
+/// #0xffff/#0xffffffff` 8/16/32, `ubfx`/`sbfx #0, #w` w.
 fn low_bits_preserved(line: &str) -> Option<(u8, u8, u8)> {
     let (m, ops) = split_insn(line)?;
     let (d, _) = gpr(ops.first()?)?;
@@ -176,6 +187,11 @@ fn low_bits_preserved(line: &str) -> Option<(u8, u8, u8)> {
         ("sxth" | "uxth", [_, _]) if !s_x => 16,
         ("sxtw", [_, _]) if !s_x => 32,
         ("mov", [dst, _]) if dst.starts_with('w') => 32,
+        // `mov x0, x19` staging an `int` the callee reads as w0: the W copy
+        // (`mov w0, w19`) is all it needs, and once W it can meet the entry
+        // copy `mov w19, w0` it repeats (`forward_block_copies` then
+        // `eliminate_self_moves`).
+        ("mov", [dst, _]) if dst.starts_with('x') && s_x => 64,
         ("and", [_, _, imm]) => match imm.to_ascii_lowercase().as_str() {
             "#0xff" | "#255" => 8,
             "#0xffff" | "#65535" => 16,
@@ -201,7 +217,7 @@ fn low_bits_preserved(line: &str) -> Option<(u8, u8, u8)> {
 /// and nothing transfers control (the scan stays in the call's block).  The
 /// call is then the only reader, and it reads only the low `W` bits, which
 /// equal the source's.  The source register keeps its value: a different
-/// source becomes `mov xR, xS` (any upper bits will do).
+/// source becomes `mov wR, wS` (its low 32 bits cover any narrow width).
 pub(super) fn drop_narrow_call_arg_extensions(
     lines: &mut [String],
     kinds: &mut [LineKind],
@@ -212,10 +228,20 @@ pub(super) fn drop_narrow_call_arg_extensions(
         return false;
     }
     for c in 0..n {
-        if kinds[c] != LineKind::Call || !lines[c].contains(CALL_NARROW_KEY) {
+        let widths = if kinds[c] == LineKind::Call && lines[c].contains(CALL_NARROW_KEY) {
+            call_narrow_widths(&lines[c])
+        } else if kinds[c] == LineKind::Branch {
+            // A sibling call's `b target`: the marker row before it.
+            match tail_marker_before(lines, kinds, c) {
+                Some(marker) => narrow_widths(marker),
+                None => continue,
+            }
+        } else {
+            continue;
+        };
+        if widths == [0; 8] {
             continue;
         }
-        let widths = call_narrow_widths(&lines[c]);
         // Registers already read or written between a candidate and the call.
         let mut touched = 0u64;
         for k in (0..c).rev() {
@@ -236,13 +262,21 @@ pub(super) fn drop_narrow_call_arg_extensions(
                     // now, so an earlier extension of the same register is
                     // the call's only producer in turn.
                     kinds[k] = LineKind::Nop;
-                } else {
-                    let indent = &lines[k][..lines[k].len() - lines[k].trim_start().len()];
-                    let text = format!("{indent}mov {}, {}", xreg_name(d), xreg_name(s));
-                    set_line(lines, kinds, k, text);
-                    touched |= (1u64 << d) | (1u64 << s);
+                    changed = true;
+                    continue;
                 }
-                changed = true;
+                // The W copy: it keeps the low 32 bits -- at least the `W`
+                // the callee reads -- and, unlike `mov xD, xS`, leaves S's
+                // upper half unread, so an entry copy into S still
+                // coalesces (`coalesce_entry_copies` narrows such a copy
+                // the same way).  Already that copy: nothing to rewrite.
+                let indent = &lines[k][..lines[k].len() - lines[k].trim_start().len()];
+                let text = format!("{indent}mov {}, {}", wreg_name(d), wreg_name(s));
+                if lines[k] != text {
+                    set_line(lines, kinds, k, text);
+                    changed = true;
+                }
+                touched |= (1u64 << d) | (1u64 << s);
                 continue;
             }
             let (uses, defs) = gp_operands(&lines[k], kinds[k], false);
@@ -399,6 +433,219 @@ pub(super) fn forward_block_copies(lines: &mut [String], kinds: &mut [LineKind],
     changed
 }
 
+// ── Clobbering redefinitions ────────────────────────────────────────────────
+
+/// Caller-saved registers a renamed redefinition may move to, in order of
+/// preference: the emitter's call-staging temporaries first (no argument or
+/// result register is ever expected in them), then the argument registers.
+/// x16/x17 (veneer scratch), x18 (platform) and the callee-saved registers
+/// are never chosen.
+const RENAME_SCRATCH: [u8; 15] = [9, 10, 11, 12, 13, 14, 15, 8, 7, 6, 5, 4, 3, 2, 1];
+
+/// Move a write of a copied register out of the copy's way (see the module
+/// docs).
+///
+/// After `mov C, S`, a later write of `S` that `C`'s readers outlive keeps
+/// the copy: `mov x5, x0; mov x0, #85; eor x0, x5, x0` (`x ^ 0x55`: the
+/// emitter stages the constant in the accumulator) and `mov x5, x0; ldrsw
+/// x4, [x0]; add w0, w4, w1; str w0, [x5]` (`*p += v`).  When the new value
+/// of `S` dies in the block, a free register `F` can carry it: `S` keeps the
+/// copied value, `forward_block_copies` then reads `S` for `C`, and the copy
+/// dies -- `mov x9, #85; eor x0, x0, x9` and `add w4, w4, w1; str w4, [x0]`,
+/// Clang 23.1.5's three and four instructions.
+///
+/// Legality, for the write of `S` on line `j` (a single-destination
+/// producer, no writeback):
+/// * every line reading the new value -- up to the next write of `S`, which
+///   may itself read it (`eor x0, x5, x0`) -- is in `j`'s straight-line run
+///   and has every read of `S` renamed (`rename_reads`); a `movk` extending
+///   the value is renamed whole and continues it.  When the run ends first,
+///   the value must be dead after its last reader (`abi_liveness` charges a
+///   `ret`'s result and a call's arguments);
+/// * `F` is caller-saved scratch (`RENAME_SCRATCH`), dead after `j`
+///   (`j` itself may read it: `add w4, w4, w1`), and named by no line after
+///   `j` through the last reader.  The run ends at calls, so nothing
+///   clobbers `F` in between.
+///
+/// Only a write that a copy `mov C, S` earlier in the run reaches, and whose
+/// copy `C` is read after it, moves: elsewhere the rename buys nothing.
+pub(super) fn rename_clobbering_defs(
+    lines: &mut [String],
+    kinds: &mut [LineKind],
+    n: usize,
+) -> bool {
+    if has_opaque(lines, n) || !kinds[..n].iter().any(|k| matches!(k, LineKind::Move { .. })) {
+        return false;
+    }
+    let mut live: Option<Vec<u64>> = None;
+    let mut changed = false;
+    for j in 0..n {
+        if is_blank(lines, kinds, j) {
+            continue;
+        }
+        let Some((s, _)) = renamable_def_dest(&lines[j]) else {
+            continue;
+        };
+        if s >= 29 || !copy_outlives_write(lines, kinds, n, j, s) {
+            continue;
+        }
+        let Some((readers, run_ended)) = new_value_readers(lines, kinds, n, j, s) else {
+            continue;
+        };
+        let Some(&(last, _)) = readers.last() else {
+            continue;
+        };
+        // Built on first need, and again after each rewrite: the rewrites
+        // move values between registers.
+        if live.is_none() {
+            live = abi_liveness(lines, kinds, n);
+        }
+        let Some(lv) = live.as_deref() else {
+            return changed;
+        };
+        if run_ended && live_after(lv, last) & (1u64 << s) != 0 {
+            continue;
+        }
+        let (j_uses, _) = gp_operands(&lines[j], kinds[j], false);
+        let named = |f: u8| {
+            (j + 1..=last).any(|k| {
+                !is_blank(lines, kinds, k) && {
+                    let (u, d) = gp_operands(&lines[k], kinds[k], false);
+                    (u | d | may_write_gp(&lines[k])) & (1u64 << f) != 0
+                }
+            })
+        };
+        // A register `j` reads for the last time first: the rename then
+        // costs no register at all.
+        let Some(f) = RENAME_SCRATCH
+            .iter()
+            .copied()
+            .filter(|&f| f != s && live_after(lv, j) & (1u64 << f) == 0 && !named(f))
+            .min_by_key(|&f| j_uses & (1u64 << f) == 0)
+        else {
+            continue;
+        };
+        let mut texts = Vec::with_capacity(readers.len() + 1);
+        match rename_def_dest(&lines[j], f) {
+            Some(text) => texts.push((j, text)),
+            None => continue,
+        }
+        let mut exact = true;
+        for &(k, whole) in &readers {
+            let text = if whole {
+                Some(rename_gp_tokens(&lines[k], s, f))
+            } else {
+                rename_reads(&lines[k], s, f, true)
+            };
+            // Every read of the value must now name `F`.
+            match text {
+                Some(t) if whole || gp_operands(&t, classify_line(&t), false).0 & (1u64 << s) == 0 => {
+                    texts.push((k, t));
+                }
+                _ => {
+                    exact = false;
+                    break;
+                }
+            }
+        }
+        if !exact {
+            continue;
+        }
+        for (k, text) in texts {
+            set_line(lines, kinds, k, text);
+        }
+        live = None;
+        changed = true;
+    }
+    changed
+}
+
+/// Whether a copy `mov C, s` earlier in line `j`'s run still holds `s`'s
+/// value at `j` (neither register written in between) and `C` is read
+/// after `j`, before the run ends or `C` is written.
+fn copy_outlives_write(lines: &[String], kinds: &[LineKind], n: usize, j: usize, s: u8) -> bool {
+    let mut copies = 0u64;
+    let mut written = 0u64; // by the lines between the candidate and `j`
+    for k in (0..j).rev() {
+        if is_blank(lines, kinds, k) {
+            continue;
+        }
+        if ends_run(lines, kinds, k) {
+            break;
+        }
+        if let LineKind::Move { dst, src, .. } = kinds[k]
+            && src == s
+            && dst != s
+            && dst < 29
+            && written & (1u64 << dst) == 0
+        {
+            copies |= 1u64 << dst;
+        }
+        let writes = may_write_gp(&lines[k]) | gp_operands(&lines[k], kinds[k], false).1;
+        if writes & (1u64 << s) != 0 {
+            break;
+        }
+        written |= writes;
+    }
+    for k in j + 1..n {
+        if copies == 0 {
+            return false;
+        }
+        if is_blank(lines, kinds, k) {
+            continue;
+        }
+        if ends_run(lines, kinds, k) {
+            return false;
+        }
+        let (uses, defs) = gp_operands(&lines[k], kinds[k], false);
+        if uses & copies != 0 {
+            return true;
+        }
+        copies &= !(defs | may_write_gp(&lines[k]));
+    }
+    false
+}
+
+/// The lines after `j` that read the value line `j` writes into `s` --
+/// `(line, renamed whole)`, a `movk` extending the value renamed whole --
+/// and whether the run ended with the value possibly live (no later write
+/// of `s` in it).  `None` when the value meets a writeback of `s` or an
+/// explicit read by the line ending the run.
+fn new_value_readers(
+    lines: &[String],
+    kinds: &[LineKind],
+    n: usize,
+    j: usize,
+    s: u8,
+) -> Option<(Vec<(usize, bool)>, bool)> {
+    let bit = 1u64 << s;
+    let mut readers = Vec::new();
+    for k in j + 1..n {
+        if is_blank(lines, kinds, k) {
+            continue;
+        }
+        let (uses, defs) = gp_operands(&lines[k], kinds[k], false);
+        if ends_run(lines, kinds, k) {
+            return (uses & bit == 0).then_some((readers, true));
+        }
+        if implicitly_writes_a64(&lines[k], s) {
+            return None;
+        }
+        let writes = (defs | may_write_gp(&lines[k])) & bit != 0;
+        if uses & bit != 0 {
+            let movk = lines[k].trim_start().starts_with("movk ");
+            readers.push((k, movk));
+            if movk {
+                continue;
+            }
+        }
+        if writes {
+            return Some((readers, false));
+        }
+    }
+    Some((readers, true))
+}
+
 /// Side-effect-free single-destination ALU instructions: no memory access,
 /// no flag write, nothing written but the first operand.
 const PURE_ALU: &[&str] = &[
@@ -444,6 +691,205 @@ pub(super) fn eliminate_dead_pure_defs(
         {
             kinds[k] = LineKind::Nop;
             changed = true;
+        }
+    }
+    changed
+}
+
+// ── Callee-saved homes nobody reads ─────────────────────────────────────────
+
+/// A callee-saved save or restore row: `str|ldr xR, [base, #off]` or
+/// `stp|ldp xA, xB, [base, #off]` with base sp or x29 and no writeback.
+/// Returns (is_store, registers, base text, offset).
+fn frame_row(line: &str) -> Option<(bool, Vec<u8>, String, i64)> {
+    let (m, ops) = split_insn(line)?;
+    let (store, pair) = match m {
+        "str" => (true, false),
+        "ldr" => (false, false),
+        "stp" => (true, true),
+        "ldp" => (false, true),
+        _ => return None,
+    };
+    let want = if pair { 3 } else { 2 };
+    if ops.len() != want {
+        return None;
+    }
+    let mut regs = Vec::with_capacity(2);
+    for op in &ops[..want - 1] {
+        let (r, x) = gpr(op)?;
+        if !x {
+            return None;
+        }
+        regs.push(r);
+    }
+    let inner = ops[want - 1].strip_prefix('[')?.strip_suffix(']')?;
+    let (base, off) = match inner.split_once(',') {
+        Some((b, o)) => (b.trim(), o.trim().strip_prefix('#')?.parse::<i64>().ok()?),
+        None => (inner.trim(), 0),
+    };
+    if !matches!(base, "sp" | "x29") {
+        return None;
+    }
+    Some((store, regs, base.to_string(), off))
+}
+
+/// Delete the save, the restores and the dead definitions of every
+/// callee-saved register x19-x28 the function never reads (the AArch64
+/// form of the RISC-V `eliminate_unread_callee_saved_homes`): copy
+/// propagation forwards the reads of a home, and what remains is a write,
+/// a save and a restore -- `keep_none` saved and restored an x19 nothing
+/// touched.  Legality: no line reads the register (`gp_operands`; a `ret`'s
+/// hand-back of the callee-saved set is exactly what keeping the caller's
+/// value preserves); every write is a pure ALU definition or a plain load;
+/// exactly one save row, whose slot text appears only in it and in
+/// matching restore rows.  A pair row with one unread member becomes a
+/// single-register row of the other at its own slot.
+pub(super) fn drop_unread_callee_saved_homes(
+    lines: &mut [String],
+    kinds: &mut [LineKind],
+    n: usize,
+) -> bool {
+    if has_opaque(lines, n) {
+        return false;
+    }
+    let mut unread: Vec<(u8, Vec<usize>)> = Vec::new();
+    for reg in 19u8..=28 {
+        let bit = 1u64 << reg;
+        let mut writes = Vec::new();
+        let mut saves = 0usize;
+        let mut ok = true;
+        let mut mentioned = false;
+        for k in 0..n {
+            if is_blank(lines, kinds, k) || matches!(kinds[k], LineKind::Label | LineKind::Ret) {
+                continue;
+            }
+            if let Some((store, regs, _, _)) = frame_row(&lines[k])
+                && regs.contains(&reg)
+            {
+                mentioned = true;
+                saves += usize::from(store);
+                continue;
+            }
+            let (uses, _) = gp_operands(&lines[k], kinds[k], false);
+            if uses & bit != 0 {
+                ok = false;
+                break;
+            }
+            if may_write_gp(&lines[k]) & bit != 0 {
+                mentioned = true;
+                let m = lines[k].split_whitespace().next().unwrap_or("");
+                let pure = renamable_def_dest(&lines[k]).is_some_and(|(r, _)| r == reg)
+                    && (PURE_ALU.contains(&m)
+                        || matches!(
+                            m,
+                            "mov"
+                                | "movz"
+                                | "movn"
+                                | "ldr"
+                                | "ldrb"
+                                | "ldrh"
+                                | "ldrsb"
+                                | "ldrsh"
+                                | "ldrsw"
+                                | "ldur"
+                        ));
+                if !pure {
+                    ok = false;
+                    break;
+                }
+                writes.push(k);
+            }
+        }
+        if ok && mentioned && saves == 1 {
+            unread.push((reg, writes));
+        }
+    }
+    if unread.is_empty() {
+        return false;
+    }
+    let is_unread = |r: u8| unread.iter().any(|(u, _)| *u == r);
+    let mut changed = false;
+    // Rewrite the frame rows: per save row, its slot must serve only it and
+    // its restores.
+    let rows: Vec<(usize, bool, Vec<u8>, String, i64)> = (0..n)
+        .filter(|&k| !is_blank(lines, kinds, k))
+        .filter_map(|k| frame_row(&lines[k]).map(|(st, regs, b, o)| (k, st, regs, b, o)))
+        .collect();
+    let mut done: Vec<u8> = Vec::new();
+    for (k, store, regs, base, off) in &rows {
+        if !*store || !regs.iter().any(|&r| is_unread(r)) {
+            continue;
+        }
+        let matching: Vec<usize> = rows
+            .iter()
+            .filter(|(_, st, rr, b, o)| !*st && rr == regs && b == base && o == off)
+            .map(|(j, ..)| *j)
+            .collect();
+        // Every other row naming the same slot must be one of these.
+        let clash = rows.iter().any(|(j, _, rr, b, o)| {
+            j != k
+                && !matching.contains(j)
+                && b == base
+                && (*o == *off
+                    || rr.len() == 2 && *o + 8 == *off
+                    || regs.len() == 2 && *o == *off + 8)
+        });
+        if clash {
+            continue;
+        }
+        let indent = lines[*k][..lines[*k].len() - lines[*k].trim_start().len()].to_string();
+        match regs.as_slice() {
+            [r] => {
+                kinds[*k] = LineKind::Nop;
+                for &j in &matching {
+                    kinds[j] = LineKind::Nop;
+                }
+                done.push(*r);
+            }
+            [a, b] if is_unread(*a) && is_unread(*b) => {
+                kinds[*k] = LineKind::Nop;
+                for &j in &matching {
+                    kinds[j] = LineKind::Nop;
+                }
+                done.extend([*a, *b]);
+            }
+            [a, b] => {
+                let (keep, slot, gone) = if is_unread(*a) {
+                    (*b, *off + 8, *a)
+                } else {
+                    (*a, *off, *b)
+                };
+                let addr = if slot == 0 {
+                    format!("[{base}]")
+                } else {
+                    format!("[{base}, #{slot}]")
+                };
+                set_line(
+                    lines,
+                    kinds,
+                    *k,
+                    format!("{indent}str {}, {addr}", xreg_name(keep)),
+                );
+                for &j in &matching {
+                    let ind = lines[j][..lines[j].len() - lines[j].trim_start().len()].to_string();
+                    set_line(
+                        lines,
+                        kinds,
+                        j,
+                        format!("{ind}ldr {}, {addr}", xreg_name(keep)),
+                    );
+                }
+                done.push(gone);
+            }
+            _ => continue,
+        }
+        changed = true;
+    }
+    for (reg, writes) in &unread {
+        if done.contains(reg) {
+            for &w in writes {
+                kinds[w] = LineKind::Nop;
+            }
         }
     }
     changed

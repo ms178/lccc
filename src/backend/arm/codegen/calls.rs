@@ -65,7 +65,96 @@ pub(super) fn call_gp_narrow_widths(arg_classes: &[CallArgClass], arg_types: &[I
     widths
 }
 
+/// A type whose value travels in one GP or one FP/SIMD register and whose
+/// call setup and result handling never call a helper: the argument and
+/// result types a sibling call of a frameless function may have.
+pub(super) fn sibcall_scalar(ty: IrType) -> bool {
+    matches!(
+        ty,
+        IrType::I8
+            | IrType::I16
+            | IrType::I32
+            | IrType::I64
+            | IrType::U8
+            | IrType::U16
+            | IrType::U32
+            | IrType::U64
+            | IrType::F32
+            | IrType::F64
+            | IrType::Ptr
+    )
+}
+
 impl ArmCodegen {
+    /// The AAPCS64 sibling-call refusals of a call site (the x86-64 design
+    /// of `X86Codegen::sibcall_abi_admits`, ported): whether the site may
+    /// become `<epilogue>; b target`.  The arming below and the frameless
+    /// prediction (`every_call_is_sibling`) share it, so they can never
+    /// disagree.
+    ///
+    /// The soundness core is the zero-stack-argument guard: with every
+    /// argument in x0-x7/v0-v7 (the epilogue restores only x19-x30, d8-d15
+    /// and sp), the callee reads nothing of this frame, which the epilogue
+    /// releases.  The function-level guards of `sibcall_function_use_counts`
+    /// (no used local alloca -- its address could reach the callee -- no
+    /// dynamic stack, no inline asm) and the driver's block-tail shape
+    /// (`sibcall_block_hint`: the call is the block's last instruction, its
+    /// result is the block's `Return` operand or unused under a void return,
+    /// and the callee does not return twice) are the rest of the proof.
+    /// Refused besides: non-default calling conventions, variadic, sret,
+    /// fastcall/regparm callees; a function returning through a hidden
+    /// buffer or a `_Float128` carrier (its return sequence does work after
+    /// the call); and results other than the same scalar in the same
+    /// register as this function's own (x0/w0 or s0/d0).
+    pub(super) fn sibcall_abi_admits(&self, info: &crate::ir::reexports::CallInfo) -> bool {
+        use crate::common::types::CallingConvention;
+        if info.calling_convention != CallingConvention::Default
+            || self.state.func_calling_convention != CallingConvention::Default
+            || info.is_variadic
+            || info.is_sret
+            || info.is_fastcall
+            || info.regparm.is_some()
+            || info.ret_is_f128_sse
+            || self.state.uses_sret
+            || self.fp_ret_buffer.is_some()
+            || self.func_ret_is_f128_sse
+        {
+            return false;
+        }
+        let ours = self.current_return_type;
+        let result_ok = ours == IrType::Void
+            || (info.return_type == ours && (sibcall_scalar(ours) || is_i128_type(ours)));
+        if !result_ok {
+            return false;
+        }
+        let config = self.call_abi_config_impl();
+        let classes = crate::backend::call_abi::classify_call_args(
+            &info.args,
+            &info.arg_types,
+            &info.struct_arg_sizes,
+            &info.struct_arg_aligns,
+            &info.struct_arg_classes,
+            &info.struct_arg_fp_agg_classes,
+            &info.struct_arg_is_f128_sse,
+            None,
+            &config,
+        );
+        !classes.iter().any(CallArgClass::is_stack)
+    }
+
+    pub(super) fn arm_sibcall_candidate_impl(&mut self, info: &crate::ir::reexports::CallInfo) {
+        // One conversion in flight at a time; `emit_return_impl` consumes it
+        // before the next block begins.
+        if self.state.pending_sibcall.is_some() {
+            return;
+        }
+        if self.sibcall_abi_admits(info) {
+            self.state.pending_sibcall = Some(crate::backend::state::SibcallPending::Armed {
+                preserve_upper_vector_lanes: false,
+            });
+        }
+    }
+
     pub(super) fn call_abi_config_impl(&self) -> CallAbiConfig {
         CallAbiConfig::aapcs64()
     }
@@ -356,6 +445,74 @@ impl ArmCodegen {
         // Taken on every path: a stale set must never reach a later call.
         let reads = self.call_gp_reads.take();
         let narrow = std::mem::take(&mut self.call_gp_narrow);
+        // Sibling call: the argument setup ran unchanged; the `bl`/`blr` is
+        // replaced by the block's `Return` emitting `<epilogue>; b target`
+        // (or `br x17`: IP1 survives the epilogue, and a BR through x16/x17
+        // is the one indirect branch a BTI `bti c` landing pad admits).  The
+        // call's read annotation travels to the tail branch as a marker row.
+        if matches!(
+            self.state.pending_sibcall,
+            Some(crate::backend::state::SibcallPending::Armed { .. })
+        ) {
+            use crate::backend::state::{SibcallPending, SibcallTarget};
+            let target = if let Some(name) = direct_name {
+                Some(SibcallTarget::Direct(name.to_string()))
+            } else if indirect {
+                self.load_spilled_call_target(stack_arg_space as i64);
+                Some(SibcallTarget::Reg("x17"))
+            } else {
+                None
+            };
+            if let Some(target) = target {
+                self.state.sibcall_marker_lines = vec![format!(
+                    "    {}{}{}",
+                    super::peephole::TAIL_READS_MARKER,
+                    reads.map_or_else(|| "511".to_string(), |m| m.to_string()),
+                    super::peephole::late::format_call_narrow(&narrow)
+                )];
+                self.state.pending_sibcall = Some(SibcallPending::Ready {
+                    target,
+                    preserve_upper_vector_lanes: false,
+                });
+                return;
+            }
+            self.state.pending_sibcall = None;
+        }
+        // A frameless function was planned on the prediction that every
+        // call becomes a sibling call (`every_call_is_sibling`); should a
+        // call ever be emitted anyway, x30 is preserved around it rather
+        // than returning through a clobbered link register.
+        let guard_link = self.frameless_leaf;
+        if guard_link {
+            self.state.emit("    str x30, [sp, #-16]!");
+        }
+        self.emit_plain_call(direct_name, indirect, stack_arg_space, reads, &narrow);
+        if guard_link {
+            self.state.emit("    ldr x30, [sp], #16");
+        }
+    }
+
+    /// `ldr x17, <the Phase 0 spill of an indirect call's target>`.
+    fn load_spilled_call_target(&mut self, spill_offset: i64) {
+        if Self::is_valid_imm_offset(spill_offset, "ldr", "x17") {
+            self.state
+                .emit_fmt(format_args!("    ldr x17, [sp, #{}]", spill_offset));
+        } else {
+            self.load_large_imm("x17", spill_offset);
+            self.state.emit("    add x17, sp, x17");
+            self.state.emit("    ldr x17, [x17]");
+        }
+    }
+
+    /// The `bl`/`blr` of an ordinary call, annotated for the peephole.
+    fn emit_plain_call(
+        &mut self,
+        direct_name: Option<&str>,
+        indirect: bool,
+        stack_arg_space: usize,
+        reads: Option<u16>,
+        narrow: &[u8; 8],
+    ) {
         if let Some(name) = direct_name {
             match reads {
                 Some(mask) => self.state.emit_fmt(format_args!(
@@ -363,20 +520,12 @@ impl ArmCodegen {
                     name,
                     super::peephole::CALL_READS_TAG,
                     mask,
-                    super::peephole::late::format_call_narrow(&narrow)
+                    super::peephole::late::format_call_narrow(narrow)
                 )),
                 None => self.state.emit_fmt(format_args!("    bl {}", name)),
             }
         } else if indirect {
-            let spill_offset = stack_arg_space as i64;
-            if Self::is_valid_imm_offset(spill_offset, "ldr", "x17") {
-                self.state
-                    .emit_fmt(format_args!("    ldr x17, [sp, #{}]", spill_offset));
-            } else {
-                self.load_large_imm("x17", spill_offset);
-                self.state.emit("    add x17, sp, x17");
-                self.state.emit("    ldr x17, [x17]");
-            }
+            self.load_spilled_call_target(stack_arg_space as i64);
             self.state.emit("    blr x17");
         }
     }
@@ -407,6 +556,12 @@ impl ArmCodegen {
     /// full-precision f128 source. Everything else keeps the shared
     /// dispatch (I128 pair / long double / FP / integer).
     pub(super) fn emit_call_store_result_impl(&mut self, dest: &Value, return_type: IrType) {
+        // Sibling call: the result is never materialised -- the tail
+        // callee's exit is this function's, its result registers already
+        // hold what our `Return` hands over.
+        if self.state.pending_sibcall.is_some() {
+            return;
+        }
         if self.call_ret_is_f128_sse {
             if return_type == IrType::U16 {
                 self.state.emit("    fmov w0, s0");

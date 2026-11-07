@@ -6,6 +6,43 @@ use crate::backend::generation::is_i128_type;
 use crate::common::types::IrType;
 use crate::ir::reexports::{IrConst, Operand, Value};
 
+/// The psABI GP argument registers (bit k = a_k) a call with these argument
+/// classes passes values in, or `None` when a class could use a GP register
+/// this does not model -- the call is then published without the annotation
+/// and the peephole keeps assuming it reads every caller-saved register.
+/// Pairs (`__int128`, `long double`, a 9..16-byte struct) take two
+/// consecutive registers; a struct split across the last register and the
+/// stack takes that register.  FP-register, stack and zero-size classes name
+/// no GP register.
+pub(super) fn rv_call_gp_arg_reads(arg_classes: &[CallArgClass]) -> Option<u8> {
+    let mut mask = 0u16;
+    for class in arg_classes {
+        let (base, count) = match *class {
+            CallArgClass::IntReg { reg_idx } => (reg_idx, 1),
+            CallArgClass::I128RegPair { base_reg_idx } => (base_reg_idx, 2),
+            CallArgClass::F128Reg { reg_idx } => (reg_idx, 2),
+            CallArgClass::StructByValReg { base_reg_idx, size } => {
+                (base_reg_idx, size.div_ceil(8).clamp(1, 2))
+            }
+            CallArgClass::StructSplitRegStack { reg_idx, .. } => (reg_idx, 1),
+            CallArgClass::FloatReg { .. }
+            | CallArgClass::StructSseReg { .. }
+            | CallArgClass::Stack
+            | CallArgClass::F128Stack
+            | CallArgClass::I128Stack
+            | CallArgClass::StructByValStack { .. }
+            | CallArgClass::LargeStructStack { .. }
+            | CallArgClass::ZeroSizeSkip => continue,
+            _ => return None,
+        };
+        let end = base.checked_add(count).filter(|&end| end <= 8)?;
+        for reg in base..end {
+            mask |= 1 << reg;
+        }
+    }
+    u8::try_from(mask).ok()
+}
+
 impl RiscvCodegen {
     pub(super) fn call_abi_config_impl(&self) -> CallAbiConfig {
         CallAbiConfig::riscv_lp64d()
@@ -349,6 +386,7 @@ impl RiscvCodegen {
         struct_arg_fp_agg_classes: &[Option<crate::common::types::FpAggClass>],
     ) {
         let float_arg_regs = ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
+        self.call_gp_reads = rv_call_gp_arg_reads(arg_classes);
 
         // GP arg staging strategy: use only caller-saved temp registers (t3, t4, t5)
         // for staging, avoiding callee-saved s2-s6. This allows s2-s6 to be used
@@ -741,8 +779,18 @@ impl RiscvCodegen {
         _indirect: bool,
         _stack_arg_space: usize,
     ) {
+        // Taken on every path: a stale set must never reach a later call.
+        let reads = self.call_gp_reads.take();
         if let Some(name) = direct_name {
-            self.state.emit_fmt(format_args!("    call {}", name));
+            match reads {
+                Some(mask) => self.state.emit_fmt(format_args!(
+                    "    call {}{}{}",
+                    name,
+                    super::peephole::CALL_READS_TAG,
+                    mask
+                )),
+                None => self.state.emit_fmt(format_args!("    call {}", name)),
+            }
         } else if let Some(ptr) = func_ptr {
             self.operand_to_t0(ptr);
             self.state.emit("    mv t2, t0");

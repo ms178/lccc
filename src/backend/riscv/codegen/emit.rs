@@ -180,6 +180,13 @@ pub struct RiscvCodegen {
     pub(super) current_frame_size: i64,
     /// Whether the current function is variadic.
     pub(super) is_variadic: bool,
+    /// The GP argument registers (bit k = a_k) the call being emitted
+    /// passes values in, armed by `emit_call_reg_args_impl` from the
+    /// authoritative `CallArgClass` list and published on the call line as
+    /// the peephole's `CALL_READS_TAG` annotation.  `None`: a class this
+    /// does not model, so the call is published unannotated and the
+    /// peephole keeps assuming it reads every caller-saved register.
+    pub(super) call_gp_reads: Option<u8>,
     /// Scratch register indices for inline asm allocation.
     pub(super) asm_gp_scratch_idx: usize,
     pub(super) asm_fp_scratch_idx: usize,
@@ -232,6 +239,7 @@ impl RiscvCodegen {
             bitop_nonneg_values: FxHashSet::default(),
             current_frame_size: 0,
             is_variadic: false,
+            call_gp_reads: None,
             asm_gp_scratch_idx: 0,
             asm_fp_scratch_idx: 0,
             asm_borrowed_callee_saved: Vec::new(),

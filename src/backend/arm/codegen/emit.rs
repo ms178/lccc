@@ -3686,6 +3686,7 @@ impl ArchCodegen for ArmCodegen {
         fn emit_call_store_i128_result(&mut self, dest: &Value) => emit_call_store_i128_result_impl;
         fn emit_call_store_f128_result(&mut self, dest: &Value) => emit_call_store_f128_result_impl;
         fn emit_call_store_result(&mut self, dest: &Value, return_type: IrType) => emit_call_store_result_impl;
+        fn arm_sibcall_candidate(&mut self, info: &crate::ir::reexports::CallInfo) => arm_sibcall_candidate_impl;
         fn emit_call_store_fp_agg_return(&mut self, buffer: &Operand, class: crate::common::types::FpAggClass, dest: Option<&Value>) => emit_call_store_fp_agg_return_impl;
         fn set_call_ret_is_f128_sse(&mut self, is_f128: bool) => set_call_ret_is_f128_sse_impl;
         // globals

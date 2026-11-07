@@ -5935,7 +5935,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // only fills the holes the earlier waves left.
     if !config.param_volatile_pool.is_empty() && !ordered_param_homes {
         let pool = &config.param_volatile_pool;
-        let intervals: Vec<LiveInterval> = scan_ivs
+        let hazard_free = |v: u32| {
+            !pool
+                .iter()
+                .any(|&r| arg_reg_hazard(&later_arg_values, v, r, &config.call_arg_regs))
+        };
+        let (intervals, staged_late): (Vec<LiveInterval>, Vec<LiveInterval>) = scan_ivs
             .iter()
             .copied()
             .filter(|iv| {
@@ -5943,11 +5948,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     && !assignments.contains_key(&iv.value_id)
                     && !call_spanning.contains(&iv.value_id)
                     && !riscv_entry_guard.contains(&iv.value_id)
-                    && !pool.iter().any(|&r| {
-                        arg_reg_hazard(&later_arg_values, iv.value_id, r, &config.call_arg_regs)
-                    })
             })
-            .collect();
+            .partition(|iv| hazard_free(iv.value_id));
         if config.ra_config.debug_ra_intervals {
             let cands: Vec<u32> = intervals.iter().map(|iv| iv.value_id).collect();
             lccc::cli::stderr_line(format_args!(
@@ -6058,6 +6060,39 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 .copied()
                 .find(|&reg| unused(reg))
                 .or_else(|| pool.iter().copied().find(|&reg| !occupied(reg)));
+            if let Some(reg) = home {
+                assignments.insert(iv.value_id, reg);
+                caller_used_regs_set.insert(reg.0);
+            }
+        }
+        // A parameter some call stages late (a sixth GP argument on AArch64
+        // finds x13 written by the fifth's staging) keeps the pool registers
+        // its staging leaves alone, by the same exact first fit -- excluding
+        // it from the whole pool for one hazardous register sent it to x19
+        // and a frame record.
+        for iv in &staged_late {
+            let (start, end) = allocation_owner_bounds(iv.value_id, &merged_of, &iv_map)
+                .unwrap_or((iv.start, iv.end));
+            let occupied = |reg: PhysReg| {
+                assignments.iter().any(|(vid, r)| {
+                    *r == reg
+                        && allocation_owner_bounds(*vid, &merged_of, &iv_map)
+                            .is_none_or(|(s, e)| s <= end && start <= e)
+                })
+            };
+            let allowed: Vec<PhysReg> = pool
+                .iter()
+                .copied()
+                .filter(|&r| {
+                    !arg_reg_hazard(&later_arg_values, iv.value_id, r, &config.call_arg_regs)
+                })
+                .collect();
+            let unused = |reg: PhysReg| !assignments.values().any(|r| *r == reg);
+            let home = allowed
+                .iter()
+                .copied()
+                .find(|&reg| unused(reg))
+                .or_else(|| allowed.iter().copied().find(|&reg| !occupied(reg)));
             if let Some(reg) = home {
                 assignments.insert(iv.value_id, reg);
                 caller_used_regs_set.insert(reg.0);
@@ -9514,10 +9549,38 @@ fn propagate_copy_web(succs: &FxHashMap<u32, Vec<u32>>, seed: &mut FxHashSet<u32
 }
 
 /// Staging-hazard depth meaning "every argument register is clobbered before
-/// this value is read": the historical blanket rule, kept for indirect calls,
-/// non-x86-64 targets and every call shape whose staging the precise model
-/// below does not describe.
+/// this value is read": the historical blanket rule, kept for x86-64
+/// indirect calls, targets without a precise model (i686, RISC-V) and every
+/// call shape whose staging the precise models below do not describe.
 pub(crate) const ARG_HAZARD_ALL: u8 = u8::MAX;
+
+/// The staging slot of an allocatable home under the current target's
+/// precise model: the register is written by the staging of the argument
+/// that runs `slot`-th, so a value of depth `d` (read after the first `d`)
+/// may live there exactly when `slot >= d`.  `None`: no model covers the
+/// register, which stays a hazard at every non-zero depth.
+fn staging_slot(r: PhysReg) -> Option<u8> {
+    match crate::common::types::target_elf_machine() {
+        crate::backend::elf::EM_X86_64 => x86_64_sysv_arg_slot(r),
+        crate::backend::elf::EM_AARCH64 => aarch64_staging_slot(r),
+        _ => None,
+    }
+}
+
+/// AArch64 (see [`aarch64_call_staging_depths`]): GP argument `k` is staged
+/// into `ARM_TMP_REGS[k]` = x(9 + k), so x13 is written by the fifth GP
+/// argument's staging and x14 by the sixth.  x4-x8 are written only after
+/// every argument has been read (Phase 3 moves the temporaries into
+/// x0-x7; the sret pointer, outside the model, goes to x8 later still):
+/// slot 8, past every depth the model produces.
+fn aarch64_staging_slot(r: PhysReg) -> Option<u8> {
+    match r.0 {
+        4..=8 => Some(8),
+        13 => Some(4),
+        14 => Some(5),
+        _ => None,
+    }
+}
 
 /// SysV x86-64 GP argument slot of an allocatable home (`%rcx`, slot 3, is
 /// never an allocator home). Inverse of the slot mapping the emitter's
@@ -9558,7 +9621,7 @@ fn arg_reg_hazard(
 fn arg_reg_hazard_at_depth(d: u8, r: PhysReg, call_arg_regs: &[PhysReg]) -> bool {
     d != 0
         && call_arg_regs.contains(&r)
-        && (d == ARG_HAZARD_ALL || x86_64_sysv_arg_slot(r).is_none_or(|slot| slot < d))
+        && (d == ARG_HAZARD_ALL || staging_slot(r).is_none_or(|slot| slot < d))
 }
 
 /// One past the highest SysV GP argument slot a call argument's staging
@@ -9646,6 +9709,62 @@ pub(crate) fn x86_64_call_int_slots(
     Some(slots)
 }
 
+/// Per-argument staging-hazard depth of one AArch64 call, or `None` when
+/// the call's staging is outside the precise model.
+///
+/// `emit_call` stages an AAPCS64 call in fixed phases: an indirect target
+/// is spilled through x0 (`emit_call_spill_fptr`), then -- with no F128
+/// pre-conversion, no stack argument and no sret pointer, which the model
+/// refuses -- `emit_call_reg_args_impl` runs Phase 2a
+/// (`emit_call_gp_to_temps`: GP argument `k`, in argument order, is loaded
+/// into x0 and copied to x(9 + k)), Phase 2b (the FP arguments, into
+/// v0-v7) and Phase 3 (x(9 + k) to its argument register).  When GP
+/// argument `k` is read, exactly x0 and x9..x(8 + k) have been written:
+/// depth `k` over [`aarch64_staging_slot`].  An FP argument is read after
+/// every GP temporary: depth = the GP count.  A call with any other class
+/// (pairs, aggregates, F128, stack) keeps the blanket rule.
+fn aarch64_call_staging_depths(info: &crate::ir::reexports::CallInfo) -> Option<Vec<u8>> {
+    use crate::backend::call_abi::{CallAbiConfig, CallArgClass as C, classify_call_args};
+    if info.is_sret || info.is_fastcall || info.regparm.is_some() {
+        return None;
+    }
+    let classes = classify_call_args(
+        &info.args,
+        &info.arg_types,
+        &info.struct_arg_sizes,
+        &info.struct_arg_aligns,
+        &info.struct_arg_classes,
+        &info.struct_arg_fp_agg_classes,
+        &info.struct_arg_is_f128_sse,
+        info.is_variadic.then_some(info.num_fixed_args),
+        &CallAbiConfig::aapcs64(),
+    );
+    if classes.len() != info.args.len()
+        || !classes
+            .iter()
+            .all(|c| matches!(c, C::IntReg { .. } | C::FloatReg { .. }))
+    {
+        return None;
+    }
+    let gp_total = classes
+        .iter()
+        .filter(|c| matches!(c, C::IntReg { .. }))
+        .count();
+    // Eight GP argument registers: a ninth integer argument is `Stack`.
+    let gp_total = u8::try_from(gp_total).ok().filter(|&g| g <= 8)?;
+    let mut staged = 0u8;
+    let mut depths = Vec::with_capacity(classes.len());
+    for cls in &classes {
+        if matches!(cls, C::IntReg { .. }) {
+            depths.push(staged);
+            staged += 1;
+        } else {
+            depths.push(gp_total);
+        }
+    }
+    Some(depths)
+}
+
 /// `(skipped leading args, classes of the rest)` of a direct SysV x86-64
 /// call whose staging the precise model covers.
 fn x86_64_sysv_call_classes(
@@ -9693,9 +9812,10 @@ fn x86_64_sysv_call_classes(
 ///   is clobbered (`printf("%d %d", add(3,4), mul(3,4))` read the mul result
 ///   out of the format-string register). On x86-64 the hazard of a direct
 ///   call is the prefix of SysV GP slots written before the value's argument
-///   ([`x86_64_call_staging_depths`]); a value used by several calls (or
-///   several arguments of one) takes the deepest prefix. Everywhere else the
-///   depth is [`ARG_HAZARD_ALL`] for argument index >= 1.
+///   ([`x86_64_call_staging_depths`]), on AArch64 the GP temporaries
+///   written before it ([`aarch64_call_staging_depths`]); a value used by
+///   several calls (or several arguments of one) takes the deepest prefix.
+///   Everywhere else the depth is [`ARG_HAZARD_ALL`] for argument index >= 1.
 ///   [`arg_reg_hazard`] is the single query over this map.
 /// * `indirect` — values used as an argument of a `CallIndirect`, whose
 ///   staging additionally writes the indirect-target register (x86: `%r10`)
@@ -9712,6 +9832,8 @@ fn collect_call_arg_values(func: &IrFunction) -> (FxHashMap<u32, u8>, FxHashSet<
     let mut indirect = FxHashSet::default();
     let is_x86_64 = crate::common::types::target_elf_machine() == crate::backend::elf::EM_X86_64
         && crate::common::types::target_ptr_size() == 8;
+    let is_aarch64 =
+        crate::common::types::target_elf_machine() == crate::backend::elf::EM_AARCH64;
     for block in &func.blocks {
         for inst in &block.instructions {
             let (info, is_indirect) = match inst {
@@ -9734,8 +9856,12 @@ fn collect_call_arg_values(func: &IrFunction) -> (FxHashMap<u32, u8>, FxHashSet<
                 Instruction::CallIndirect { info, .. } => (info, true),
                 _ => continue,
             };
+            // AArch64 covers indirect calls too: the target's spill goes
+            // through x0, which is never an allocator home.
             let precise = if is_x86_64 && !is_indirect {
                 x86_64_call_staging_depths(info)
+            } else if is_aarch64 {
+                aarch64_call_staging_depths(info)
             } else {
                 None
             };

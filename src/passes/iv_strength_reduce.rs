@@ -6223,7 +6223,7 @@ mod dominance_snapshot_contract {
             let lp = &loops[0];
             let back = vec![1usize];
             let ivs = find_basic_ivs(f, lp.header, &lp.body, 0, &back);
-            find_derived_exprs(f, &ivs, &lp.body, false, lp, &back)
+            find_derived_exprs(f, &ivs, &lp.body, false, false, lp, &back)
                 .into_iter()
                 .map(|d| (d.stride, d.add_offset))
                 .collect()
