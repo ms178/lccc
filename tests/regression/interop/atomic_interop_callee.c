@@ -2,6 +2,10 @@
 
 u32 interop_add32(u32 *p, u32 value)
 {
+#ifdef ATOMIC_INTEROP_MUTANT
+    /* Negative control: the caller must observe this wrong update. */
+    value += 1;
+#endif
     return __atomic_fetch_add(p, value, __ATOMIC_SEQ_CST);
 }
 

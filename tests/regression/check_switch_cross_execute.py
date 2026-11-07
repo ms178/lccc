@@ -401,6 +401,29 @@ def main():
                               "-o", str(exe)],
                              [str(args.qemu_dir / f"qemu-{arch}"), str(exe)]]
                     count += attempt(f"{arch} {fixture} {label}", steps)
+                if fixture == "atomic_interop":
+                    # Prove the fixture catches an incorrect update. Build an
+                    # intentionally wrong Clang callee, then require the
+                    # expected check's exact exit status rather than accepting
+                    # a crash, link error or unrelated failure as a detection.
+                    mutant = work / "atomic-mutant.o"
+                    exe = work / "atomic-mutant"
+                    source = str(base) + "_callee.c"
+                    subprocess.run([args.clang, *clang_flags, "-DATOMIC_INTEROP_MUTANT",
+                                    "-c", source, "-o", str(mutant)], check=True, timeout=30)
+                    subprocess.run([*linker, "-m", emulation, "-static", "-e", "_start",
+                                    str(startup), str(mutant), str(units["caller", "clang"]),
+                                    "-o", str(exe)], check=True, timeout=30)
+                    status = subprocess.run([str(args.qemu_dir / f"qemu-{arch}"), str(exe)],
+                                            timeout=30).returncode
+                    if status != 2:
+                        failures.append(f"{arch} atomic_interop mutant: expected exit 2, got {status}")
+                        print(f"FAIL {failures[-1]}", flush=True)
+                        if not args.keep_going:
+                            raise SystemExit(1)
+                    else:
+                        count += 1
+                        print(f"PASS {arch} atomic_interop mutant detected (exit 2)", flush=True)
     if failures:
         print(f"{len(failures)} cross-target execution contract(s) FAILED, {count} passed:")
         for failure in failures:
