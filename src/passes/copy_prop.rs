@@ -36,12 +36,13 @@ pub fn run(module: &mut IrModule) -> usize {
 /// consumes vectors of that width, so it cannot be reading a prefix or a field
 /// of a wider aggregate.
 ///
-/// `writes_memory_via_args` ops (the `VecStore*` family) are refused: they carry
-/// their destination in `args[1]` rather than `dest_ptr`, so the scan below --
-/// which only recognises writes through `dest_ptr` -- cannot see them, and
-/// folding `src` into one of their operands would turn a read into a write.
+/// `writes_memory_via_args` ops (the `VecStore*` family) are refused: folding
+/// an operand could turn a read into a write.
 fn memcpy_folds_into_intrinsic(op: &IntrinsicOp, size: usize) -> bool {
-    op.vector_home_width() == Some(size as u32) && !op.writes_memory_via_args()
+    op.vector_home_width()
+        .and_then(|width| usize::try_from(width).ok())
+        == Some(size)
+        && !op.writes_memory_via_args()
 }
 
 /// Forward a purely intermediate memcpy source:
@@ -163,7 +164,15 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
                                 .iter()
                                 .any(|a| matches!(a, Operand::Value(v) if *v == tmp)) =>
                         {
-                            if consumer.is_some() {
+                            // Keep the source nonvolatile and, for a memory
+                            // result, disjoint from the destination. Some
+                            // backends may write a result before all source
+                            // chunks have been read; pointer inequality is
+                            // not a no-alias proof.
+                            if consumer.is_some()
+                                || !allocas.contains(&src.0)
+                                || dest_ptr.is_some_and(|dp| !allocas.contains(&dp.0) || dp == src)
+                            {
                                 safe = false;
                                 break;
                             }
@@ -2222,6 +2231,8 @@ mod tests {
         let mut module = IrModule {
             functions: vec![one_block(vec![
                 alloca(1),
+                alloca(7),
+                alloca(2),
                 memcpy(1, 7, 32),
                 minps256(2, 1, 8),
             ])],
@@ -2230,7 +2241,12 @@ mod tests {
         assert_eq!(forward_memcpy_chains(&mut module), 1, "one chain folded");
         assert_eq!(
             shape(&module.functions[0]),
-            vec!["Alloca".to_string(), "MinPs256(7,8)".to_string()],
+            vec![
+                "Alloca".to_string(),
+                "Alloca".to_string(),
+                "Alloca".to_string(),
+                "MinPs256(7,8)".to_string()
+            ],
             "the operand must be re-pointed at the memcpy source"
         );
     }
@@ -2387,6 +2403,57 @@ mod tests {
         assert_eq!(forward_memcpy_chains(&mut module), 0);
     }
 
+    #[test]
+    fn intrinsic_forward_refuses_unproved_result_disjointness_and_clobbers() {
+        use crate::ir::reexports::CallInfo;
+        // `dst == src` is the clearest overlap; a different opaque value is
+        // not proof of disjointness. Also exercise the clobber guard using
+        // otherwise eligible direct alloca roots, so it is not a vacuous test.
+        for (src, dst, middle) in [
+            (7, 7, vec![]),
+            (7, 9, vec![]),
+            (9, 2, vec![]),
+            (
+                7,
+                2,
+                vec![Instruction::Call {
+                    func: "mutate".into(),
+                    info: CallInfo::default(),
+                }],
+            ),
+            (
+                7,
+                2,
+                vec![Instruction::Store {
+                    val: Operand::Const(IrConst::I32(1)),
+                    ptr: Value(9),
+                    ty: IrType::I32,
+                    seg_override: Default::default(),
+                    volatile: false,
+                }],
+            ),
+        ] {
+            let mut inst = vec![alloca(1), alloca(2), alloca(7), memcpy(1, src, 32)];
+            inst.extend(middle);
+            inst.push(minps256(dst, 1, 8));
+            let mut module = IrModule {
+                functions: vec![one_block(inst)],
+                ..IrModule::default()
+            };
+            assert_eq!(forward_memcpy_chains(&mut module), 0, "src={src} dst={dst}");
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn vector_copy_width_must_not_truncate_to_32_bits() {
+        assert!(memcpy_folds_into_intrinsic(&IntrinsicOp::MinPs256, 32));
+        assert!(!memcpy_folds_into_intrinsic(
+            &IntrinsicOp::MinPs256,
+            (1usize << 32) + 32
+        ));
+    }
+
     /// The original memcpy-to-memcpy arm must still work — the new arm must
     /// not have displaced it.
     #[test]
@@ -2394,6 +2461,8 @@ mod tests {
         let mut module = IrModule {
             functions: vec![one_block(vec![
                 alloca(1),
+                alloca(7),
+                alloca(2),
                 memcpy(1, 7, 32),
                 memcpy(2, 1, 32),
             ])],
@@ -2402,7 +2471,12 @@ mod tests {
         assert_eq!(forward_memcpy_chains(&mut module), 1);
         assert_eq!(
             shape(&module.functions[0]),
-            vec!["Alloca".to_string(), "Memcpy(2<-7)".to_string()]
+            vec![
+                "Alloca".to_string(),
+                "Alloca".to_string(),
+                "Alloca".to_string(),
+                "Memcpy(2<-7)".to_string()
+            ]
         );
     }
 }
