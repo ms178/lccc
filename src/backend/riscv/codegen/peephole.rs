@@ -7639,7 +7639,10 @@ mod tests {
     #[test]
     fn near_jump_does_not_cross_space_or_alignment_directives() {
         for directive in [".space 1048576", ".p2align 21", ".balign 2097152"] {
-            let asm = format!("f:\n    jump .Ltarget, t6\n    {directive}\n.Ltarget:\n    ret\n");
+            // Not a bare exit, which the jump would take a copy of instead.
+            let asm = format!(
+                "f:\n    jump .Ltarget, t6\n    {directive}\n.Ltarget:\n    call g\n    ret\n"
+            );
             let out = peephole_optimize(asm);
             assert!(out.contains("    jump .Ltarget, t6"), "{directive}: {out}");
         }
@@ -9113,7 +9116,10 @@ mod jump_near_tests {
 
     #[test]
     fn near_jump_rewrite_same_function() {
-        let input = "f:\n    li t0, 5\n    jump .L1, t6\n    mv a0, t0\n.L1:\n    ret\n";
+        // The target block is no bare exit: a jump to one takes a copy of it
+        // instead (`duplicate_exit_tails`).
+        let input =
+            "f:\n    li t0, 5\n    jump .L1, t6\n    mv a0, t0\n.L1:\n    call g\n    ret\n";
         let out = peephole_optimize(input.to_string());
         assert!(
             out.contains("    j .L1") && !out.contains("jump .L1, t6"),

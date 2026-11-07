@@ -1431,6 +1431,22 @@ impl ArmCodegen {
     /// Load a 64-bit immediate value into a register using movz/movn + movk sequence.
     /// Uses MOVN (move-not) for values where most halfwords are 0xFFFF, which
     /// gives shorter sequences for negative numbers and large values.
+    /// `cmp acc, #value` -- or `cmn` for a negated 12-bit immediate, or
+    /// the value materialized in `scratch` -- as the switch compares need
+    /// (GCC 16.2 and Clang 23.1.5 use the immediate forms).
+    fn emit_cmp_imm_or_reg(&mut self, acc: &str, scratch: &str, value: i64) {
+        if (0..=4095).contains(&value) {
+            self.state.emit_fmt(format_args!("    cmp {acc}, #{value}"));
+        } else if (-4095..0).contains(&value) {
+            self.state
+                .emit_fmt(format_args!("    cmn {acc}, #{}", -value));
+        } else {
+            self.emit_load_imm64(scratch, value);
+            self.state
+                .emit_fmt(format_args!("    cmp {acc}, {scratch}"));
+        }
+    }
+
     pub(super) fn emit_load_imm64(&mut self, reg: &str, val: i64) {
         let bits = val as u64;
         if bits == 0 {
@@ -3135,6 +3151,80 @@ impl ArchCodegen for ArmCodegen {
         }
     }
 
+    fn supports_switch_tree(&self, ty: IrType) -> bool {
+        matches!(
+            ty,
+            IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64 | IrType::Ptr
+        )
+    }
+
+    fn emit_switch_tree_below(&mut self, pivot: i64, label: &str, ty: IrType) {
+        let word = matches!(ty, IrType::I32 | IrType::U32);
+        let (acc, scratch, value) = if word {
+            ("w0", "w1", i64::from(pivot as i32))
+        } else {
+            ("x0", "x1", pivot)
+        };
+        self.emit_cmp_imm_or_reg(acc, scratch, value);
+        // Inverted over an unconditional branch, like every switch compare
+        // here (reach); the peephole fuses the pair into `b.lt`/`b.lo`.
+        let unsigned = ty.is_unsigned() || ty == IrType::Ptr;
+        let skip = self.state.fresh_label("skip");
+        let cond = if unsigned { "hs" } else { "ge" };
+        self.state.emit_fmt(format_args!("    b.{cond} {skip}"));
+        self.state.emit_fmt(format_args!("    b {label}"));
+        self.state.emit_fmt(format_args!("{skip}:"));
+    }
+
+    fn emit_switch_tree_below_or_eq(&mut self, pivot: i64, below: &str, equal: &str, ty: IrType) {
+        // One `cmp`, read by both branches (the flags survive them).
+        self.emit_switch_tree_below(pivot, below, ty);
+        let skip = self.state.fresh_label("skip");
+        self.state.emit_fmt(format_args!("    b.ne {skip}"));
+        self.state.emit_fmt(format_args!("    b {equal}"));
+        self.state.emit_fmt(format_args!("{skip}:"));
+    }
+
+    fn emit_switch_tree_range(&mut self, lo: i64, hi: i64, label: &str, ty: IrType) {
+        // `lo <= x <= hi` as `(x - lo) <=u (hi - lo)` at the selector's
+        // width; x1/x2 are emitter scratch outside every allocator pool.
+        let word = matches!(ty, IrType::I32 | IrType::U32);
+        let (acc, diff, tmp) = if word {
+            ("w0", "w1", "w2")
+        } else {
+            ("x0", "x1", "x2")
+        };
+        let (lo, span) = if word {
+            (
+                i64::from(lo as i32),
+                i64::from((hi as i32).wrapping_sub(lo as i32) as u32),
+            )
+        } else {
+            (lo, hi.wrapping_sub(lo))
+        };
+        if (0..=4095).contains(&lo) {
+            self.state
+                .emit_fmt(format_args!("    sub {diff}, {acc}, #{lo}"));
+        } else if (-4095..0).contains(&lo) {
+            self.state
+                .emit_fmt(format_args!("    add {diff}, {acc}, #{}", -lo));
+        } else {
+            self.emit_load_imm64(tmp, lo);
+            self.state
+                .emit_fmt(format_args!("    sub {diff}, {acc}, {tmp}"));
+        }
+        if (0..=4095).contains(&span) {
+            self.state.emit_fmt(format_args!("    cmp {diff}, #{span}"));
+        } else {
+            self.emit_load_imm64(tmp, span);
+            self.state.emit_fmt(format_args!("    cmp {diff}, {tmp}"));
+        }
+        let skip = self.state.fresh_label("skip");
+        self.state.emit_fmt(format_args!("    b.hi {skip}"));
+        self.state.emit_fmt(format_args!("    b {label}"));
+        self.state.emit_fmt(format_args!("{skip}:"));
+    }
+
     fn emit_switch_case_branch(&mut self, case_val: i64, label: &str, ty: IrType) {
         let use_32bit = matches!(
             ty,
@@ -3150,16 +3240,7 @@ impl ArchCodegen for ArmCodegen {
         } else {
             ("x0", "x1", case_val)
         };
-        if (0..=4095).contains(&value) {
-            self.state.emit_fmt(format_args!("    cmp {acc}, #{value}"));
-        } else if (-4095..0).contains(&value) {
-            self.state
-                .emit_fmt(format_args!("    cmn {acc}, #{}", -value));
-        } else {
-            self.emit_load_imm64(scratch, value);
-            self.state
-                .emit_fmt(format_args!("    cmp {acc}, {scratch}"));
-        }
+        self.emit_cmp_imm_or_reg(acc, scratch, value);
         let skip = self.state.fresh_label("skip");
         self.state.emit_fmt(format_args!("    b.ne {}", skip));
         self.state.emit_fmt(format_args!("    b {}", label));

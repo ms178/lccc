@@ -397,6 +397,17 @@ impl RiscvCodegen {
     }
 
     /// Emit: load from `offset(s0)` into `reg`, handling large offsets via t6.
+    /// A switch-tree constant in the register form the tree compares: a
+    /// word sign-extended (what `li` of the 32-bit value builds), a
+    /// doubleword as is.
+    fn switch_tree_constant(value: i64, ty: IrType) -> i64 {
+        if matches!(ty, IrType::I32 | IrType::U32) {
+            i64::from(value as i32)
+        } else {
+            value
+        }
+    }
+
     pub(super) fn emit_load_from_s0(&mut self, reg: &str, offset: i64, load_instr: &str) {
         if Self::fits_imm12(offset) {
             self.state
@@ -1045,6 +1056,101 @@ impl ArchCodegen for RiscvCodegen {
         }
         self.state.emit_fmt(format_args!("    jump {}, t6", label));
         self.state.emit_fmt(format_args!("{}:", skip));
+    }
+
+    fn supports_switch_tree(&self, ty: IrType) -> bool {
+        matches!(
+            ty,
+            IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64 | IrType::Ptr
+        )
+    }
+
+    fn emit_switch_tree_load(&mut self, val: &Operand, ty: IrType) {
+        self.operand_to_t0(val);
+        if matches!(ty, IrType::I32 | IrType::U32) {
+            // Every compare reads the word sign-extended once, as `li`
+            // builds the case constants (a U32 value lives zero-extended;
+            // sign extension keeps equality and the unsigned order alike).
+            // The chain extends into t2 at every case instead.
+            self.state.emit("    sext.w t0, t0");
+            self.state.reg_cache.invalidate_acc();
+        }
+    }
+
+    fn emit_switch_tree_eq(&mut self, value: i64, label: &str, ty: IrType) {
+        let value = Self::switch_tree_constant(value, ty);
+        let skip = self.state.fresh_label("sw_skip");
+        if value == 0 {
+            self.state.emit_fmt(format_args!("    bnez t0, {skip}"));
+        } else {
+            self.state.emit_fmt(format_args!("    li t1, {value}"));
+            self.state.emit_fmt(format_args!("    bne t0, t1, {skip}"));
+        }
+        self.state.emit_fmt(format_args!("    jump {label}, t6"));
+        self.state.emit_fmt(format_args!("{skip}:"));
+    }
+
+    fn emit_switch_tree_below(&mut self, pivot: i64, label: &str, ty: IrType) {
+        let pivot = Self::switch_tree_constant(pivot, ty);
+        let unsigned = ty.is_unsigned() || ty == IrType::Ptr;
+        let skip = self.state.fresh_label("sw_skip");
+        if pivot == 0 && !unsigned {
+            self.state.emit_fmt(format_args!("    bgez t0, {skip}"));
+        } else {
+            let op = if unsigned { "bgeu" } else { "bge" };
+            self.state.emit_fmt(format_args!("    li t1, {pivot}"));
+            self.state.emit_fmt(format_args!("    {op} t0, t1, {skip}"));
+        }
+        self.state.emit_fmt(format_args!("    jump {label}, t6"));
+        self.state.emit_fmt(format_args!("{skip}:"));
+    }
+
+    fn emit_switch_tree_below_or_eq(&mut self, pivot: i64, below: &str, equal: &str, ty: IrType) {
+        // The pivot `below` loaded into t1 serves the equality test too.
+        let value = Self::switch_tree_constant(pivot, ty);
+        self.emit_switch_tree_below(pivot, below, ty);
+        let skip = self.state.fresh_label("sw_skip");
+        if value == 0 && !(ty.is_unsigned() || ty == IrType::Ptr) {
+            self.state.emit_fmt(format_args!("    bnez t0, {skip}"));
+        } else {
+            self.state.emit_fmt(format_args!("    bne t0, t1, {skip}"));
+        }
+        self.state.emit_fmt(format_args!("    jump {equal}, t6"));
+        self.state.emit_fmt(format_args!("{skip}:"));
+    }
+
+    fn emit_switch_tree_range(&mut self, lo: i64, hi: i64, label: &str, ty: IrType) {
+        // `lo <= x <= hi` as `(x - lo) <=u (hi - lo)`.  A word difference
+        // is the sign extension of the 32-bit one, which compares like it
+        // against a span below 2^31 (a cluster is a list of case values);
+        // a wider span zero-extends it first.
+        let word = matches!(ty, IrType::I32 | IrType::U32);
+        let (lo, hi) = (
+            Self::switch_tree_constant(lo, ty),
+            Self::switch_tree_constant(hi, ty),
+        );
+        let span = if word {
+            i64::from((hi as i32).wrapping_sub(lo as i32) as u32)
+        } else {
+            hi.wrapping_sub(lo)
+        };
+        let w = if word { "w" } else { "" };
+        match lo.checked_neg().filter(|d| (-2048..=2047).contains(d)) {
+            Some(d) => self.state.emit_fmt(format_args!("    addi{w} t2, t0, {d}")),
+            None => {
+                self.state.emit_fmt(format_args!("    li t2, {lo}"));
+                self.state.emit_fmt(format_args!("    sub{w} t2, t0, t2"));
+            }
+        }
+        if word && span > i64::from(i32::MAX) {
+            self.state.emit("    slli t2, t2, 32");
+            self.state.emit("    srli t2, t2, 32");
+        }
+        let skip = self.state.fresh_label("sw_skip");
+        self.state.emit_fmt(format_args!("    li t1, {span}"));
+        self.state.emit_fmt(format_args!("    bltu t1, t2, {skip}"));
+        self.state.emit_fmt(format_args!("    jump {label}, t6"));
+        self.state.emit_fmt(format_args!("{skip}:"));
     }
 
     fn emit_switch_jump_table(

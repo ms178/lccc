@@ -349,3 +349,192 @@ pub(crate) fn run(func: &mut IrFunction, abi: SiblingAbi) -> usize {
     }
     rewritten
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Target;
+    use crate::ir::reexports::{BasicBlock, IrConst, Value};
+
+    fn call(dest: u32, callee: &str, arg_types: &[IrType], ret: IrType) -> Instruction {
+        Instruction::Call {
+            func: callee.into(),
+            info: CallInfo {
+                dest: (ret != IrType::Void).then_some(Value(dest)),
+                args: (0..arg_types.len())
+                    .map(|i| Operand::Const(IrConst::I64(i as i64)))
+                    .collect(),
+                arg_types: arg_types.to_vec(),
+                return_type: ret,
+                num_fixed_args: arg_types.len(),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// `int sel(int c) { return c ? g1(..) : g2(..); }`: two call arms
+    /// branching to `R = phi; ret`.
+    fn dispatcher(arg_types: &[IrType], ret: IrType) -> IrFunction {
+        let mut f = IrFunction::new("sel".into(), ret, vec![], false);
+        f.next_value_id = 20;
+        let block =
+            |label: u32, instructions: Vec<Instruction>, terminator: Terminator| BasicBlock {
+                label: BlockId(label),
+                instructions,
+                terminator,
+                source_spans: vec![],
+            };
+        f.blocks.push(block(
+            0,
+            vec![],
+            Terminator::CondBranch {
+                cond: Operand::Value(Value(1)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+        ));
+        f.blocks.push(block(
+            1,
+            vec![call(10, "g1", arg_types, ret)],
+            Terminator::Branch(BlockId(3)),
+        ));
+        f.blocks.push(block(
+            2,
+            vec![call(11, "g2", arg_types, ret)],
+            Terminator::Branch(BlockId(3)),
+        ));
+        let (instructions, terminator) = if ret == IrType::Void {
+            (vec![], Terminator::Return(None))
+        } else {
+            (
+                vec![Instruction::Phi {
+                    dest: Value(12),
+                    ty: ret,
+                    incoming: vec![
+                        (Operand::Value(Value(10)), BlockId(1)),
+                        (Operand::Value(Value(11)), BlockId(2)),
+                    ],
+                }],
+                Terminator::Return(Some(Operand::Value(Value(12)))),
+            )
+        };
+        f.blocks.push(block(3, instructions, terminator));
+        f
+    }
+
+    fn abi(target: Target) -> SiblingAbi {
+        SiblingAbi::for_target(target).expect("a target with sibling calls")
+    }
+
+    const SIBLING_TARGETS: [Target; 3] = [Target::X86_64, Target::Aarch64, Target::Riscv64];
+
+    /// Both arms take the return on every target with sibling calls, and
+    /// the emptied return block goes; i686 has no budget at all.
+    #[test]
+    fn dispatcher_arms_take_the_return() {
+        for target in SIBLING_TARGETS {
+            for ret in [IrType::I32, IrType::Void] {
+                let mut f = dispatcher(&[IrType::I32, IrType::Ptr], ret);
+                assert_eq!(run(&mut f, abi(target)), 2, "{target:?} {ret:?}");
+                assert_eq!(f.blocks.len(), 3);
+                let want = |d: u32| {
+                    Terminator::Return((ret != IrType::Void).then_some(Operand::Value(Value(d))))
+                };
+                assert_eq!(
+                    format!("{:?}", f.blocks[1].terminator),
+                    format!("{:?}", want(10))
+                );
+                assert_eq!(
+                    format!("{:?}", f.blocks[2].terminator),
+                    format!("{:?}", want(11))
+                );
+            }
+        }
+        assert!(SiblingAbi::for_target(Target::I686).is_none());
+    }
+
+    /// The register budgets: seven integer arguments fit AArch64 and RISC-V
+    /// (x0-x7, a0-a7) but not x86-64 (six), nine fit none; a 128-bit
+    /// integer argument is two x86-64 registers and refused elsewhere (an
+    /// even-aligned pair); nine doubles fit none.
+    #[test]
+    fn register_budgets_follow_each_abi() {
+        let cases: [(Vec<IrType>, [bool; 3]); 4] = [
+            (vec![IrType::I64; 7], [false, true, true]),
+            (vec![IrType::I64; 9], [false, false, false]),
+            (vec![IrType::I128, IrType::I32], [true, false, false]),
+            (vec![IrType::F64; 9], [false, false, false]),
+        ];
+        for (args, admitted) in cases {
+            for (target, admit) in SIBLING_TARGETS.into_iter().zip(admitted) {
+                let mut f = dispatcher(&args, IrType::I64);
+                let expect = if admit { 2 } else { 0 };
+                assert_eq!(run(&mut f, abi(target)), expect, "{target:?} {args:?}");
+            }
+        }
+    }
+
+    /// AArch64 and RISC-V refuse every sibling call of a variadic function
+    /// or of one returning through a hidden buffer, and a callee returning a
+    /// `_Float128` carrier; x86-64 keeps its own rules for all three.
+    #[test]
+    fn strict_frames_refuse_what_the_backends_refuse() {
+        for target in SIBLING_TARGETS {
+            let strict = target != Target::X86_64;
+            let mut variadic = dispatcher(&[IrType::I32], IrType::I32);
+            variadic.is_variadic = true;
+            let mut sret = dispatcher(&[IrType::I32], IrType::I32);
+            sret.uses_sret = true;
+            let mut f128 = dispatcher(&[IrType::I32], IrType::I32);
+            for block in &mut f128.blocks {
+                for inst in &mut block.instructions {
+                    if let Instruction::Call { info, .. } = inst {
+                        info.ret_is_f128_sse = true;
+                    }
+                }
+            }
+            for (name, mut f) in [("variadic", variadic), ("sret", sret), ("f128", f128)] {
+                let expect = if strict { 0 } else { 2 };
+                assert_eq!(run(&mut f, abi(target)), expect, "{target:?} {name}");
+            }
+        }
+    }
+
+    /// A call result read anywhere but the phi, a live result under a void
+    /// return, and an arm that is not a call keep their branches; the
+    /// other arm still converts, and the return block's last phi becomes a
+    /// copy.
+    #[test]
+    fn shapes_that_keep_their_branch() {
+        let mut used_twice = dispatcher(&[IrType::I32], IrType::I32);
+        used_twice.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(13),
+            src: Operand::Value(Value(10)),
+        });
+        assert_eq!(run(&mut used_twice, abi(Target::Aarch64)), 1);
+        assert!(matches!(
+            used_twice.blocks[1].terminator,
+            Terminator::Branch(_)
+        ));
+        let r = used_twice
+            .blocks
+            .iter()
+            .find(|b| b.label == BlockId(3))
+            .expect("kept R");
+        assert!(matches!(r.instructions[0], Instruction::Copy { .. }));
+
+        let mut live_void = dispatcher(&[IrType::I32], IrType::Void);
+        if let Instruction::Call { info, .. } = &mut live_void.blocks[1].instructions[0] {
+            info.dest = Some(Value(10));
+        }
+        live_void.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(13),
+            src: Operand::Value(Value(10)),
+        });
+        assert_eq!(run(&mut live_void, abi(Target::Riscv64)), 1);
+        assert!(matches!(
+            live_void.blocks[1].terminator,
+            Terminator::Branch(_)
+        ));
+    }
+}

@@ -44,7 +44,7 @@ FIXTURES = (
     "param_home_shifted_cross", "param_home_wide_cross",
     # Sibling calls (incl. branch arms), RV64 branch-free selects, call
     # staging hazards and pointer exit tests: values computed by GCC 16.2.
-    "sibcall_select_staging_cross",
+    "sibcall_select_staging_cross", "switch_tree_cross",
 )
 ALL_LEVELS = ("-O0", "-O1", "-O2", "-Os")
 LEVELS = {
@@ -155,6 +155,10 @@ LEVELS = {
     # exits for trip counts -1/0/1/7/16; and a direct nested call passing
     # a half-precision struct (RV64 NaN-boxed it through t2, the chain).
     "sibcall_select_staging_cross": ALL_LEVELS + ("-O3",),
+    # AArch64/RV64 sparse switches through the balanced case-cluster tree:
+    # signed/unsigned 32- and 64-bit selectors, sign-boundary cases, range
+    # clusters spanning zero and 2^31, pivots that are cases of their own.
+    "switch_tree_cross": ALL_LEVELS + ("-O3",),
 }
 # Two-unit psABI fixtures under interop/: `<name>_callee.c` and
 # `<name>_caller.c`, linked LCCC-with-LCCC and LCCC-with-Clang in both
