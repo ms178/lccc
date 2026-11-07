@@ -17,6 +17,7 @@
 //! overhead and gives O(1) lookups with better cache locality.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::ir::intrinsics::IntrinsicOp;
 use crate::ir::reexports::{
     Instruction, IrConst, IrFunction, IrModule, Operand, Terminator, Value,
 };
@@ -25,6 +26,22 @@ use crate::ir::reexports::{
 /// Returns the number of operand replacements made.
 pub fn run(module: &mut IrModule) -> usize {
     module.for_each_function(propagate_copies)
+}
+
+/// True when an intrinsic reads an argument naming a slot as a WHOLE vector of
+/// exactly `size` bytes, so that `memcpy tmp, src` feeding that argument can be
+/// folded by pointing the argument at `src` instead.
+///
+/// `vector_home_width() == size` is what makes the read whole-object: the op
+/// consumes vectors of that width, so it cannot be reading a prefix or a field
+/// of a wider aggregate.
+///
+/// `writes_memory_via_args` ops (the `VecStore*` family) are refused: they carry
+/// their destination in `args[1]` rather than `dest_ptr`, so the scan below --
+/// which only recognises writes through `dest_ptr` -- cannot see them, and
+/// folding `src` into one of their operands would turn a read into a write.
+fn memcpy_folds_into_intrinsic(op: &IntrinsicOp, size: usize) -> bool {
+    op.vector_home_width() == Some(size as u32) && !op.writes_memory_via_args()
 }
 
 /// Forward a purely intermediate memcpy source:
@@ -37,6 +54,20 @@ pub fn run(module: &mut IrModule) -> usize {
 /// becomes `memcpy dst, src` when `tmp` has no other use. This is a local
 /// copy-chain rewrite; unlike general aggregate forwarding it does not remove
 /// the final copy or change any load/store aliasing.
+///
+/// The consumer may also be a vector INTRINSIC that reads `tmp` as a whole
+/// vector operand, in which case the argument is re-pointed at `src`:
+///
+/// ```text
+///     memcpy tmp, src
+///     vminps dst, [tmp], [hi]
+/// ```
+///
+/// becomes `vminps dst, [src], [hi]`. That second form is what removes the
+/// per-clamp slot round-trips in explicit-SIMD code: the vector lowering gives
+/// every temporary its own stack slot and moves the operands into it, so a
+/// kernel of eight `vminps`/`vmaxps` clamps emitted 42 allocas, 24 memcpys and
+/// 222 instructions where GCC emits 36 and Clang 37 (a 16.9x runtime loss).
 pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
     let mut total = 0;
     for func in &mut module.functions {
@@ -78,8 +109,8 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
         for block in &mut func.blocks {
             let mut i = 0;
             while i < block.instructions.len() {
-                let (tmp, src) = match block.instructions[i] {
-                    Instruction::Memcpy { dest, src, .. } if dest != src => (dest, src),
+                let (tmp, src, size) = match block.instructions[i] {
+                    Instruction::Memcpy { dest, src, size } if dest != src => (dest, src, size),
                     _ => {
                         i += 1;
                         continue;
@@ -97,6 +128,25 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
                     let inst = &block.instructions[j];
                     match inst {
                         Instruction::Memcpy { src: copy_src, .. } if *copy_src == tmp => {
+                            if consumer.is_some() {
+                                safe = false;
+                                break;
+                            }
+                            consumer = Some(j);
+                        }
+                        // A whole-vector read of `tmp` is a valid consumer too;
+                        // re-pointing the argument at `src` is exactly the
+                        // chain rewrite, one operand at a time. `tmp` is the
+                        // read operand, so it must not also be the destination
+                        // the op writes through.
+                        Instruction::Intrinsic {
+                            op, args, dest_ptr, ..
+                        } if memcpy_folds_into_intrinsic(op, size)
+                            && *dest_ptr != Some(tmp)
+                            && args
+                                .iter()
+                                .any(|a| matches!(a, Operand::Value(v) if *v == tmp)) =>
+                        {
                             if consumer.is_some() {
                                 safe = false;
                                 break;
@@ -142,9 +192,16 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
                     i += 1;
                     continue;
                 }
-                if let Instruction::Memcpy { src: copy_src, .. } = &mut block.instructions[consumer]
-                {
-                    *copy_src = src;
+                match &mut block.instructions[consumer] {
+                    Instruction::Memcpy { src: copy_src, .. } => *copy_src = src,
+                    Instruction::Intrinsic { args, .. } => {
+                        for arg in args.iter_mut() {
+                            if matches!(arg, Operand::Value(v) if *v == tmp) {
+                                *arg = Operand::Value(src);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 block.instructions.remove(i);
                 if block.source_spans.len() > i {
