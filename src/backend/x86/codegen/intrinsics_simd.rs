@@ -1854,8 +1854,24 @@ impl X86Codegen {
     /// 256-bit AVX FP op dispatch (all shapes).
     fn emit_avx_fp_256_op(&mut self, dest_ptr: &Value, op: &IntrinsicOp, args: &[Operand]) {
         use IntrinsicOp::*;
-        self.flush_pending_vec_store_impl();
-        self.state.invalidate_vec_peephole();
+        // Preserve a deferred vector result — and the register peephole that
+        // lets the operand load be elided — when THIS op is the pending
+        // value's cache-aware consumer. That is exactly the contract
+        // `compute_vector_defer_values` establishes for back-to-back op
+        // chains: the clamp idiom `vminps; vmaxps` must keep its intermediate
+        // in %ymm0, not round-trip it through a stack slot.
+        //
+        // Flushing and invalidating unconditionally here defeated that for
+        // every AVX FP 256-bit op, so `avx_fp_private` spent a store plus a
+        // reload on each of its eight clamp stages.
+        //
+        // Soundness: `avx_load_arg_to` clears `pending_vec_store` on every
+        // register path and flushes it before every memory path, so keeping
+        // the store pending can never expose an unwritten slot.
+        if !self.pending_vec_store_consumed_by(op, args) {
+            self.flush_pending_vec_store_impl();
+            self.state.invalidate_vec_peephole();
+        }
         // binary 3-op
         let binary = |this: &mut Self, inst: &str, commutative: bool| {
             this.emit_avx_binary_256(dest_ptr, args, inst, commutative);

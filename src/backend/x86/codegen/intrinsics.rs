@@ -1087,18 +1087,22 @@ impl X86Codegen {
         }
     }
 
-    /// Lazy-flush entry check for an intrinsic about to be emitted: if a
-    /// deferred vector result is pending and this instruction is NOT the
-    /// cache-aware consumer of that value, flush the store first — this
-    /// instruction may clobber the holding register or rely on slot contents.
-    fn service_pending_vec_store(&mut self, op: &IntrinsicOp, args: &[Operand]) {
+    /// True when a pending deferred vector result is read by THIS intrinsic as
+    /// a whole-vector operand, so the store may stay pending and the operand
+    /// load may be elided.
+    ///
+    /// Soundness rests on the lazy-flush discipline in `avx_load_arg_to`, which
+    /// every operand load goes through: a path that reads the value from a
+    /// register clears `pending_vec_store`, and every path that reads it from
+    /// MEMORY calls `flush_pending_vec_store_impl` first. So leaving the store
+    /// pending can never make a consumer observe an unwritten slot.
+    pub(super) fn pending_vec_store_consumed_by(&self, op: &IntrinsicOp, args: &[Operand]) -> bool {
         use crate::backend::stack_layout::copy_coalescing::is_raw_reader_intrinsic;
         let Some((pval, _, _)) = self.state.pending_vec_store else {
-            return;
+            return false;
         };
         use crate::ir::intrinsics::IntrinsicOp as O;
-        let consumed_here = args
-            .iter()
+        args.iter()
             .any(|a| matches!(a, Operand::Value(v) if v.0 == pval))
             && !is_raw_reader_intrinsic(op)
             && !matches!(
@@ -1111,8 +1115,15 @@ impl X86Codegen {
                     | O::Movntdq
                     | O::Movntpd
                     | O::Movntps
-            );
-        if !consumed_here {
+            )
+    }
+
+    /// Lazy-flush entry check for an intrinsic about to be emitted: if a
+    /// deferred vector result is pending and this instruction is NOT the
+    /// cache-aware consumer of that value, flush the store first — this
+    /// instruction may clobber the holding register or rely on slot contents.
+    fn service_pending_vec_store(&mut self, op: &IntrinsicOp, args: &[Operand]) {
+        if !self.pending_vec_store_consumed_by(op, args) {
             self.flush_pending_vec_store_impl();
         }
     }

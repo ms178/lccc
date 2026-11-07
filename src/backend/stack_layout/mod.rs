@@ -797,11 +797,15 @@ fn build_layout_context(
                         ));
                     }
                     other => {
+                        // Name the variant. `std::mem::discriminant` Debug
+                        // prints an opaque `Discriminant(N)` that identifies
+                        // nothing, which made this dump useless for finding
+                        // the instruction that blocks a deferral.
+                        let dumped = format!("{:?}", other);
+                        let name = dumped.split([' ', '(']).next().unwrap_or("?");
                         lccc::cli::stderr_line(format_args!(
-                            "[VDEFER-IR] b{} i{} {:?}",
-                            bi,
-                            ii,
-                            std::mem::discriminant(other)
+                            "[VDEFER-IR] b{} i{} {}",
+                            bi, ii, name
                         ));
                     }
                 }
