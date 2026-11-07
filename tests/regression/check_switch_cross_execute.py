@@ -47,10 +47,13 @@ FIXTURES = (
     "sibcall_select_staging_cross", "switch_tree_cross",
     # Every atomic builtin at every width (8..128 bits) and ordering, with
     # register-homed pointers and values live across the sequences.
-    "atomic_ops_cross",
+    "atomic_ops_cross", "memcpy_snapshot_alias",
 )
 ALL_LEVELS = ("-O0", "-O1", "-O2", "-Os")
 LEVELS = {
+    # A copied aggregate is a snapshot even when a later call or aliased store
+    # modifies its original source.
+    "memcpy_snapshot_alias": ALL_LEVELS + ("-O3",),
     # 128-bit selectors: the low half alone was compared (AArch64, RV64) and
     # wide case values were truncated to i64 (every target).
     "switch_i128_high_half": ALL_LEVELS,
@@ -175,8 +178,10 @@ LEVELS = {
 # directions.  A caller and a callee that merely agree with each other pass
 # the single-unit fixtures above while disagreeing with every other compiler.
 INTEROP = ("psabi_pair_interop", "psabi_float_interop", "psabi_hfa_interop", "psabi_wide_interop",
-           "psabi_byref_interop", "abi_dirty_upper_interop")
+           "psabi_byref_interop", "abi_dirty_upper_interop", "atomic_interop")
 INTEROP_LEVELS = ("-O0", "-O2")
+# Atomic register-homing and lowering change across optimization levels.
+INTEROP_LEVELS_BY_FIXTURE = {"atomic_interop": ALL_LEVELS + ("-O3",)}
 CLANG_FREESTANDING = ("-O2", "-ffreestanding", "-fno-builtin", "-fno-pic", "-fno-pie",
                       "-fno-stack-protector", "-nostdlibinc")
 CONTROL_PASSES = {
@@ -371,28 +376,63 @@ def main():
             clang_flags = [target, *CLANG_FREESTANDING, *include]
             for fixture in (f for f in INTEROP if f in selected):
                 base = ROOT / "tests/regression/interop" / fixture
+                levels = INTEROP_LEVELS_BY_FIXTURE.get(fixture, INTEROP_LEVELS)
+                # Clang distributions differ in their AArch64 outline-atomics
+                # default. This freestanding binary has no compiler-rt, so
+                # require inline LL/SC instead of unresolved __aarch64_* calls.
+                fixture_clang_flags = [*clang_flags]
+                if fixture == "atomic_interop" and arch == "aarch64":
+                    fixture_clang_flags.append("-mno-outline-atomics")
                 units = {}
                 for unit in ("callee", "caller"):
                     source = str(base) + f"_{unit}.c"
                     units[unit, "clang"] = work / f"{unit}-clang.o"
                     # Validates the fixture itself: Clang must accept it.
-                    subprocess.run([args.clang, *clang_flags, "-c", source, "-o", str(units[unit, "clang"])],
+                    subprocess.run([args.clang, *fixture_clang_flags, "-c", source, "-o", str(units[unit, "clang"])],
                                    check=True, timeout=30)
-                    for level in INTEROP_LEVELS:
+                    for level in levels:
                         units[unit, level] = work / f"{unit}-lccc{level}.o"
                         units[unit, level].unlink(missing_ok=True)
                         subprocess.run([str(args.lccc_dir / driver), level, *include, "-c", source,
                                         "-o", str(units[unit, level])], timeout=30)
-                for level in INTEROP_LEVELS:
-                    for callee, caller in (((level), (level)), ((level), "clang"), ("clang", (level))):
-                        exe = work / "interop"
-                        label = f"callee={'clang' if callee == 'clang' else 'lccc' + callee} " \
-                                f"caller={'clang' if caller == 'clang' else 'lccc' + caller}"
-                        steps = [[*linker, "-m", emulation, "-static", "-e", "_start", str(startup),
-                                  str(units["callee", callee]), str(units["caller", caller]),
-                                  "-o", str(exe)],
-                                 [str(args.qemu_dir / f"qemu-{arch}"), str(exe)]]
-                        count += attempt(f"{arch} {fixture} {label}", steps)
+                # Validate the fixture itself with the reference on both sides;
+                # cross combinations alone cannot distinguish a bad expected
+                # result from an LCCC bug.
+                pairs = [("clang", "clang")]
+                pairs.extend(pair for level in levels for pair in
+                             ((level, level), (level, "clang"), ("clang", level)))
+                for callee, caller in pairs:
+                    exe = work / "interop"
+                    label = f"callee={'clang' if callee == 'clang' else 'lccc' + callee} " \
+                            f"caller={'clang' if caller == 'clang' else 'lccc' + caller}"
+                    steps = [[*linker, "-m", emulation, "-static", "-e", "_start", str(startup),
+                              str(units["callee", callee]), str(units["caller", caller]),
+                              "-o", str(exe)],
+                             [str(args.qemu_dir / f"qemu-{arch}"), str(exe)]]
+                    count += attempt(f"{arch} {fixture} {label}", steps)
+                if fixture == "atomic_interop":
+                    # Prove the fixture catches an incorrect update. Build an
+                    # intentionally wrong Clang callee, then require the
+                    # expected check's exact exit status rather than accepting
+                    # a crash, link error or unrelated failure as a detection.
+                    mutant = work / "atomic-mutant.o"
+                    exe = work / "atomic-mutant"
+                    source = str(base) + "_callee.c"
+                    subprocess.run([args.clang, *fixture_clang_flags, "-DATOMIC_INTEROP_MUTANT",
+                                    "-c", source, "-o", str(mutant)], check=True, timeout=30)
+                    subprocess.run([*linker, "-m", emulation, "-static", "-e", "_start",
+                                    str(startup), str(mutant), str(units["caller", "clang"]),
+                                    "-o", str(exe)], check=True, timeout=30)
+                    status = subprocess.run([str(args.qemu_dir / f"qemu-{arch}"), str(exe)],
+                                            timeout=30).returncode
+                    if status != 2:
+                        failures.append(f"{arch} atomic_interop mutant: expected exit 2, got {status}")
+                        print(f"FAIL {failures[-1]}", flush=True)
+                        if not args.keep_going:
+                            raise SystemExit(1)
+                    else:
+                        count += 1
+                        print(f"PASS {arch} atomic_interop mutant detected (exit 2)", flush=True)
     if failures:
         print(f"{len(failures)} cross-target execution contract(s) FAILED, {count} passed:")
         for failure in failures:

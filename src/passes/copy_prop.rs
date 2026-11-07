@@ -28,20 +28,50 @@ pub fn run(module: &mut IrModule) -> usize {
     module.for_each_function(propagate_copies)
 }
 
-/// True when an intrinsic reads an argument naming a slot as a WHOLE vector of
-/// exactly `size` bytes, so that `memcpy tmp, src` feeding that argument can be
-/// folded by pointing the argument at `src` instead.
-///
-/// `vector_home_width() == size` is what makes the read whole-object: the op
-/// consumes vectors of that width, so it cannot be reading a prefix or a field
-/// of a wider aggregate.
-///
-/// `writes_memory_via_args` ops (the `VecStore*` family) are refused: they carry
-/// their destination in `args[1]` rather than `dest_ptr`, so the scan below --
-/// which only recognises writes through `dest_ptr` -- cannot see them, and
-/// folding `src` into one of their operands would turn a read into a write.
-fn memcpy_folds_into_intrinsic(op: &IntrinsicOp, size: usize) -> bool {
-    op.vector_home_width() == Some(size as u32) && !op.writes_memory_via_args()
+/// Only an explicitly classified vector-input position of exactly this width
+/// may be replaced. Result-home width alone says nothing about whether an
+/// argument is a scalar, an address, or a vector of a different width.
+/// Instructions that write through their arguments are never consumers.
+fn memcpy_folds_into_intrinsic(op: &IntrinsicOp, size: usize, index: usize) -> bool {
+    !op.writes_memory_via_args()
+        && super::vector_temp_promotion::pointer_vector_arg_width(*op, index) == Some(size)
+}
+
+/// Values whose single definition cannot be established, including the
+/// ambiguous memory-home/SSA-definition output slots of inline asm.
+fn nonunique_values(func: &IrFunction) -> FxHashSet<u32> {
+    let mut seen = FxHashSet::default();
+    let mut repeated = FxHashSet::default();
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let Some(dest) = inst.dest() {
+            if !seen.insert(dest.0) {
+                repeated.insert(dest.0);
+            }
+        }
+        if let Instruction::InlineAsm { outputs, .. } = inst {
+            repeated.extend(outputs.iter().map(|(_, value, _)| value.0));
+        }
+    }
+    repeated
+}
+
+/// Direct, nonvolatile alloca values with exactly one definition. After phi
+/// lowering a Value may be redefined; merely seeing an earlier Alloca with
+/// that number is not proof that a later pointer still names its stack slot.
+pub(super) fn unique_nonvolatile_allocas(func: &IrFunction) -> FxHashSet<u32> {
+    let repeated = nonunique_values(func);
+    func.blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .filter_map(|inst| match inst {
+            Instruction::Alloca {
+                dest,
+                semantic_volatile: false,
+                ..
+            } if !repeated.contains(&dest.0) => Some(dest.0),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Forward a purely intermediate memcpy source:
@@ -86,15 +116,7 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
         // miscompile: vs1's slot was never initialized/updated while the
         // wide/narrow loops kept reading it).
         let mut uses: FxHashMap<u32, u32> = FxHashMap::default();
-        let allocas: FxHashSet<u32> = func
-            .blocks
-            .iter()
-            .flat_map(|b| b.instructions.iter())
-            .filter_map(|i| match i {
-                Instruction::Alloca { dest, .. } => Some(dest.0),
-                _ => None,
-            })
-            .collect();
+        let allocas = unique_nonvolatile_allocas(func);
         for block in &func.blocks {
             for inst in &block.instructions {
                 for v in inst.used_values() {
@@ -127,8 +149,20 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
                 for j in (i + 1)..block.instructions.len() {
                     let inst = &block.instructions[j];
                     match inst {
-                        Instruction::Memcpy { src: copy_src, .. } if *copy_src == tmp => {
-                            if consumer.is_some() {
+                        Instruction::Memcpy {
+                            dest: copy_dest,
+                            src: copy_src,
+                            size: copy_size,
+                        } if *copy_src == tmp => {
+                            // The original second copy reads a fresh alloca;
+                            // forwarding must not turn it into an overlapping
+                            // copy. Two distinct alloca roots are disjoint.
+                            if consumer.is_some()
+                                || *copy_size != size
+                                || !allocas.contains(&src.0)
+                                || !allocas.contains(&copy_dest.0)
+                                || src == *copy_dest
+                            {
                                 safe = false;
                                 break;
                             }
@@ -141,13 +175,21 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
                         // the op writes through.
                         Instruction::Intrinsic {
                             op, args, dest_ptr, ..
-                        } if memcpy_folds_into_intrinsic(op, size)
-                            && *dest_ptr != Some(tmp)
-                            && args
-                                .iter()
-                                .any(|a| matches!(a, Operand::Value(v) if *v == tmp)) =>
+                        } if *dest_ptr != Some(tmp)
+                            && args.iter().enumerate().any(|(index, a)| {
+                                matches!(a, Operand::Value(v) if *v == tmp)
+                                    && memcpy_folds_into_intrinsic(op, size, index)
+                            }) =>
                         {
-                            if consumer.is_some() {
+                            // Keep the source nonvolatile and, for a memory
+                            // result, disjoint from the destination. Some
+                            // backends may write a result before all source
+                            // chunks have been read; pointer inequality is
+                            // not a no-alias proof.
+                            if consumer.is_some()
+                                || !allocas.contains(&src.0)
+                                || dest_ptr.is_some_and(|dp| !allocas.contains(&dp.0) || dp == src)
+                            {
                                 safe = false;
                                 break;
                             }
@@ -159,29 +201,20 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
                         }
                         _ => {}
                     }
-                    // SOUNDNESS: if the source location `src` is modified between
-                    // the two memcpys, forwarding would read stale data.  Check
-                    // for stores/memcpys/intrinsics that write to `src`.
-                    // Without this, zlib-ng's fold_1 pattern
-                    //   x_tmp3 = *c3; *c3 = *c0; ... *c2 = x_tmp3;
-                    // was miscompiled: x_tmp3 was forwarded to re-read *c3,
-                    // but *c3 had already been overwritten by *c0.
-                    match inst {
-                        Instruction::Store { ptr, .. } if *ptr == src => {
-                            safe = false;
-                            break;
-                        }
-                        Instruction::Memcpy { dest, .. } if *dest == src => {
-                            safe = false;
-                            break;
-                        }
-                        Instruction::Intrinsic {
-                            dest_ptr: Some(dp), ..
-                        } if *dp == src => {
-                            safe = false;
-                            break;
-                        }
-                        _ => {}
+                    // Without alias analysis, *any* intervening write can
+                    // modify src, including through another pointer, a call,
+                    // an atomic, or an intrinsic writing via its arguments.
+                    // Only instructions before the consumer matter; the
+                    // consumer itself writes the destination after its read.
+                    if consumer.is_none()
+                        && (inst.may_write_memory()
+                            || matches!(
+                                inst,
+                                Instruction::Fence { .. } | Instruction::AtomicLoad { .. }
+                            ))
+                    {
+                        safe = false;
+                        break;
                     }
                 }
                 let Some(consumer) = consumer else {
@@ -203,10 +236,7 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
                     }
                     _ => {}
                 }
-                block.instructions.remove(i);
-                if block.source_spans.len() > i {
-                    block.source_spans.remove(i);
-                }
+                block.remove_inst(i);
                 total += 1;
             }
         }
@@ -223,6 +253,10 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
         if func.is_declaration {
             continue;
         }
+        // The rewrite only adds fresh GEP definitions and removes memcpys, so
+        // these whole-function facts remain valid across its restart loop.
+        let allocas = unique_nonvolatile_allocas(func);
+        let nonunique = nonunique_values(func);
         'restart: loop {
             for block_idx in 0..func.blocks.len() {
                 for copy_idx in 0..func.blocks[block_idx].instructions.len() {
@@ -232,6 +266,8 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
                     };
                     if size < 128
                         || dest == src
+                        || !allocas.contains(&dest.0)
+                        || !allocas.contains(&src.0)
                         || !is_local_alloca(func, dest)
                         || !is_local_alloca(func, src)
                     {
@@ -239,6 +275,11 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
                     }
 
                     let dest_derived = collect_derived_pointers(func, dest);
+                    // A redefined GEP value need not still point into dest at
+                    // the load, even if one of its definitions does.
+                    if dest_derived.iter().any(|v| nonunique.contains(v)) {
+                        continue;
+                    }
                     let mut loads = Vec::with_capacity(16);
                     let mut safe = true;
                     for (bi, block) in func.blocks.iter().enumerate() {
@@ -256,12 +297,16 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
                             match inst {
                                 Instruction::GetElementPtr { base, .. }
                                     if dest_derived.contains(&base.0) => {}
-                                Instruction::Load { ptr, .. }
-                                    if dest_derived.contains(&ptr.0)
-                                        && bi == block_idx
-                                        && ii > copy_idx =>
+                                Instruction::Load {
+                                    ptr,
+                                    ty,
+                                    volatile: false,
+                                    ..
+                                } if dest_derived.contains(&ptr.0)
+                                    && bi == block_idx
+                                    && ii > copy_idx =>
                                 {
-                                    loads.push((bi, ii, *ptr));
+                                    loads.push((bi, ii, *ptr, *ty));
                                 }
                                 _ => {
                                     safe = false;
@@ -288,17 +333,16 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
 
                     // No source write, call, or opaque operation may occur
                     // between the copy and any forwarded load on this path.
-                    for &(_, load_idx, _) in &loads {
+                    for &(_, load_idx, _, _) in &loads {
                         for inst in &func.blocks[block_idx].instructions[copy_idx + 1..load_idx] {
-                            if matches!(
-                                inst,
-                                Instruction::Store { .. }
-                                    | Instruction::Memcpy { .. }
-                                    | Instruction::Call { .. }
-                                    | Instruction::CallIndirect { .. }
-                                    | Instruction::InlineAsm { .. }
-                                    | Instruction::Intrinsic { .. }
-                            ) {
+                            if inst.may_write_memory()
+                                || matches!(
+                                    inst,
+                                    Instruction::Fence { .. }
+                                        | Instruction::AtomicLoad { .. }
+                                        | Instruction::Load { volatile: true, .. }
+                                )
+                            {
                                 safe = false;
                                 break;
                             }
@@ -350,11 +394,27 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
                         }
                     };
                     let mut resolved = Vec::with_capacity(loads.len());
-                    for &(bi, ii, ptr) in &loads {
+                    for &(bi, ii, ptr, load_ty) in &loads {
                         let Some((offset, ty)) = resolve(ptr) else {
                             safe = false;
                             break;
                         };
+                        // The original load reads the destination object. It
+                        // may be replaced only when every possibly accessed
+                        // byte was copied from the corresponding source byte.
+                        let in_range = usize::try_from(offset)
+                            .ok()
+                            .zip(load_ty.access_extent())
+                            .and_then(|(start, (_, width))| {
+                                usize::try_from(width)
+                                    .ok()
+                                    .and_then(|width| start.checked_add(width))
+                            })
+                            .is_some_and(|end| end <= size);
+                        if !in_range {
+                            safe = false;
+                            break;
+                        }
                         resolved.push((bi, ii, offset, ty));
                     }
                     if !safe {
@@ -372,27 +432,16 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
                             offset: Operand::Const(IrConst::I64(offset)),
                             ty,
                         };
-                        func.blocks[block_idx].instructions.insert(load_idx, gep);
-                        if func.blocks[block_idx].source_spans.len() >= load_idx {
-                            func.blocks[block_idx]
-                                .source_spans
-                                .insert(load_idx, crate::common::source::Span::dummy());
-                        }
-                        // The load shifted by one; locate the first load at or
-                        // after the insertion point with the old destination-rooted ptr.
-                        for inst in &mut func.blocks[block_idx].instructions[load_idx + 1..] {
-                            if let Instruction::Load { ptr, .. } = inst {
-                                if dest_derived.contains(&ptr.0) {
-                                    *ptr = new_ptr;
-                                    break;
-                                }
-                            }
+                        let block = &mut func.blocks[block_idx];
+                        block.insert_inst(load_idx, gep, crate::common::source::Span::dummy());
+                        // This is the exact load validated above, shifted by the
+                        // one insertion; do not search for a different load.
+                        if let Instruction::Load { ptr, .. } = &mut block.instructions[load_idx + 1]
+                        {
+                            *ptr = new_ptr;
                         }
                     }
-                    func.blocks[block_idx].instructions.remove(copy_idx);
-                    if func.blocks[block_idx].source_spans.len() > copy_idx {
-                        func.blocks[block_idx].source_spans.remove(copy_idx);
-                    }
+                    func.blocks[block_idx].remove_inst(copy_idx);
                     total += 1;
                     continue 'restart;
                 }
@@ -2215,6 +2264,8 @@ mod tests {
         let mut module = IrModule {
             functions: vec![one_block(vec![
                 alloca(1),
+                alloca(7),
+                alloca(2),
                 memcpy(1, 7, 32),
                 minps256(2, 1, 8),
             ])],
@@ -2223,7 +2274,12 @@ mod tests {
         assert_eq!(forward_memcpy_chains(&mut module), 1, "one chain folded");
         assert_eq!(
             shape(&module.functions[0]),
-            vec!["Alloca".to_string(), "MinPs256(7,8)".to_string()],
+            vec![
+                "Alloca".to_string(),
+                "Alloca".to_string(),
+                "Alloca".to_string(),
+                "MinPs256(7,8)".to_string()
+            ],
             "the operand must be re-pointed at the memcpy source"
         );
     }
@@ -2380,6 +2436,105 @@ mod tests {
         assert_eq!(forward_memcpy_chains(&mut module), 0);
     }
 
+    #[test]
+    fn intrinsic_forward_refuses_unproved_result_disjointness_and_clobbers() {
+        use crate::ir::reexports::CallInfo;
+        // `dst == src` is the clearest overlap; a different opaque value is
+        // not proof of disjointness. Also exercise the clobber guard using
+        // otherwise eligible direct alloca roots, so it is not a vacuous test.
+        for (src, dst, middle) in [
+            (7, 7, vec![]),
+            (7, 9, vec![]),
+            (9, 2, vec![]),
+            (
+                7,
+                2,
+                vec![Instruction::Call {
+                    func: "mutate".into(),
+                    info: CallInfo::default(),
+                }],
+            ),
+            (
+                7,
+                2,
+                vec![Instruction::Store {
+                    val: Operand::Const(IrConst::I32(1)),
+                    ptr: Value(9),
+                    ty: IrType::I32,
+                    seg_override: Default::default(),
+                    volatile: false,
+                }],
+            ),
+        ] {
+            let mut inst = vec![alloca(1), alloca(2), alloca(7), memcpy(1, src, 32)];
+            inst.extend(middle);
+            inst.push(minps256(dst, 1, 8));
+            let mut module = IrModule {
+                functions: vec![one_block(inst)],
+                ..IrModule::default()
+            };
+            assert_eq!(forward_memcpy_chains(&mut module), 0, "src={src} dst={dst}");
+        }
+    }
+
+    #[test]
+    fn intrinsic_forward_refuses_scalar_and_mixed_width_positions() {
+        for (op, size, args) in [
+            (
+                IntrinsicOp::SetEpi32_256,
+                32,
+                vec![Operand::Value(Value(1))],
+            ),
+            (
+                IntrinsicOp::Pinsrd128,
+                16,
+                vec![Operand::Value(Value(8)), Operand::Value(Value(1))],
+            ),
+            (
+                IntrinsicOp::Broadcast128to256,
+                32,
+                vec![Operand::Value(Value(1))],
+            ),
+        ] {
+            let inst = Instruction::Intrinsic {
+                dest: Some(Value(20)),
+                op,
+                dest_ptr: Some(Value(2)),
+                args,
+            };
+            let mut module = IrModule {
+                functions: vec![one_block(vec![
+                    alloca(1),
+                    alloca(2),
+                    alloca(7),
+                    memcpy(1, 7, size),
+                    inst,
+                ])],
+                ..IrModule::default()
+            };
+            assert_eq!(forward_memcpy_chains(&mut module), 0, "{op:?}");
+        }
+        assert!(memcpy_folds_into_intrinsic(&IntrinsicOp::MinPs256, 32, 0));
+        assert!(memcpy_folds_into_intrinsic(&IntrinsicOp::MinPs256, 32, 1));
+        assert!(!memcpy_folds_into_intrinsic(&IntrinsicOp::MinPs256, 32, 2));
+        assert!(!memcpy_folds_into_intrinsic(
+            &IntrinsicOp::SetEpi32_256,
+            32,
+            0
+        ));
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn vector_copy_width_must_not_truncate_to_32_bits() {
+        assert!(memcpy_folds_into_intrinsic(&IntrinsicOp::MinPs256, 32, 0));
+        assert!(!memcpy_folds_into_intrinsic(
+            &IntrinsicOp::MinPs256,
+            (1usize << 32) + 32,
+            0
+        ));
+    }
+
     /// The original memcpy-to-memcpy arm must still work — the new arm must
     /// not have displaced it.
     #[test]
@@ -2387,6 +2542,8 @@ mod tests {
         let mut module = IrModule {
             functions: vec![one_block(vec![
                 alloca(1),
+                alloca(7),
+                alloca(2),
                 memcpy(1, 7, 32),
                 memcpy(2, 1, 32),
             ])],
@@ -2395,7 +2552,332 @@ mod tests {
         assert_eq!(forward_memcpy_chains(&mut module), 1);
         assert_eq!(
             shape(&module.functions[0]),
-            vec!["Alloca".to_string(), "Memcpy(2<-7)".to_string()]
+            vec![
+                "Alloca".to_string(),
+                "Alloca".to_string(),
+                "Alloca".to_string(),
+                "Memcpy(2<-7)".to_string()
+            ]
         );
+    }
+}
+
+#[cfg(test)]
+mod snapshot_forwarding_contract {
+    use super::*;
+    use crate::common::types::{AddressSpace, IrType};
+    use crate::ir::reexports::{BasicBlock, BlockId, CallInfo};
+
+    fn alloca(v: u32, semantic_volatile: bool) -> Instruction {
+        Instruction::Alloca {
+            dest: Value(v),
+            ty: IrType::Ptr,
+            size: 64,
+            align: 8,
+            volatile: false,
+            semantic_volatile,
+        }
+    }
+
+    fn module(
+        between: Vec<Instruction>,
+        src: u32,
+        dest: u32,
+        size: usize,
+        volatile: Option<u32>,
+        after: Vec<Instruction>,
+    ) -> IrModule {
+        let mut f = IrFunction::new("snapshot".into(), IrType::Void, vec![], false);
+        let mut instructions: Vec<_> = (0..3).map(|v| alloca(v, volatile == Some(v))).collect();
+        instructions.push(Instruction::Memcpy {
+            dest: Value(1),
+            src: Value(src),
+            size: 64,
+        });
+        instructions.extend(between);
+        instructions.push(Instruction::Memcpy {
+            dest: Value(dest),
+            src: Value(1),
+            size,
+        });
+        instructions.extend(after);
+        // Keep the destination live across repeated SROA rounds.
+        instructions.push(Instruction::Call {
+            func: "observe".into(),
+            info: CallInfo {
+                args: vec![Operand::Value(Value(dest))],
+                ..Default::default()
+            },
+        });
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        });
+        let mut m = IrModule::new();
+        m.functions.push(f);
+        m
+    }
+
+    fn copies(m: &IrModule) -> Vec<(Value, Value, usize)> {
+        m.functions[0].blocks[0]
+            .instructions
+            .iter()
+            .filter_map(|i| match i {
+                Instruction::Memcpy { dest, src, size } => Some((*dest, *src, *size)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn store(ptr: u32) -> Instruction {
+        Instruction::Store {
+            val: Operand::Const(IrConst::I64(7)),
+            ptr: Value(ptr),
+            ty: IrType::I64,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        }
+    }
+
+    fn large_load_module(between: Vec<Instruction>, load_ptr: u32, volatile: bool) -> IrModule {
+        let mut f = IrFunction::new("large_snapshot".into(), IrType::I32, vec![], false);
+        f.next_value_id = 20;
+        let mut instructions: Vec<_> = (0..2)
+            .map(|v| Instruction::Alloca {
+                dest: Value(v),
+                ty: IrType::Ptr,
+                size: 128,
+                align: 8,
+                volatile: false,
+                semantic_volatile: false,
+            })
+            .collect();
+        instructions.push(Instruction::Memcpy {
+            dest: Value(1),
+            src: Value(0),
+            size: 128,
+        });
+        instructions.extend(between);
+        instructions.push(Instruction::Load {
+            dest: Value(3),
+            ptr: Value(load_ptr),
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile,
+        });
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: vec![],
+        });
+        let mut m = IrModule::new();
+        m.functions.push(f);
+        m
+    }
+
+    #[test]
+    fn large_snapshot_forwarding_requires_stable_in_bounds_nonvolatile_inputs() {
+        use crate::ir::reexports::AtomicOrdering;
+        let gep = |offset| Instruction::GetElementPtr {
+            dest: Value(4),
+            base: Value(1),
+            offset: Operand::Const(IrConst::I64(offset)),
+            ty: IrType::U8,
+        };
+        let mut safe = large_load_module(vec![gep(124)], 4, false);
+        assert_eq!(forward_large_memcpy_loads(&mut safe), 1);
+        assert!(copies(&safe).is_empty());
+        let mut cases = vec![
+            large_load_module(
+                vec![Instruction::AtomicStore {
+                    ptr: Operand::Value(Value(0)),
+                    val: Operand::Const(IrConst::I32(2)),
+                    ty: IrType::I32,
+                    ordering: AtomicOrdering::Relaxed,
+                }],
+                1,
+                false,
+            ),
+            large_load_module(
+                vec![Instruction::Fence {
+                    ordering: AtomicOrdering::SeqCst,
+                }],
+                1,
+                false,
+            ),
+            large_load_module(vec![], 1, true),
+            large_load_module(vec![], 1, false),
+            large_load_module(vec![], 1, false),
+            large_load_module(
+                vec![Instruction::AtomicLoad {
+                    dest: Value(5),
+                    ptr: Operand::Value(Value(0)),
+                    ty: IrType::I32,
+                    ordering: AtomicOrdering::Acquire,
+                }],
+                1,
+                false,
+            ),
+            large_load_module(vec![gep(-1)], 4, false),
+            large_load_module(vec![gep(125)], 4, false),
+            large_load_module(
+                vec![
+                    gep(0),
+                    Instruction::Copy {
+                        dest: Value(4),
+                        src: Operand::Value(Value(0)),
+                    },
+                ],
+                4,
+                false,
+            ),
+        ];
+        if let Instruction::Alloca {
+            semantic_volatile, ..
+        } = &mut cases[3].functions[0].blocks[0].instructions[0]
+        {
+            *semantic_volatile = true;
+        }
+        if let Instruction::Alloca {
+            semantic_volatile, ..
+        } = &mut cases[4].functions[0].blocks[0].instructions[1]
+        {
+            *semantic_volatile = true;
+        }
+        for (i, m) in cases.iter_mut().enumerate() {
+            assert_eq!(forward_large_memcpy_loads(m), 0, "case {i}");
+            assert_eq!(copies(m).len(), 1, "case {i}");
+        }
+    }
+
+    #[test]
+    fn asm_outputs_do_not_prove_a_unique_alloca_root() {
+        // InlineAsm output slots are unusual: they can be pointer homes or
+        // SSA definitions after promotion, and Instruction::dest() omits them.
+        // A whole-function proof cannot simply ignore either interpretation.
+        for output in [0, 1, 2] {
+            let mut m = module(vec![], 0, 2, 64, None, vec![]);
+            m.functions[0].blocks[0].instructions.insert(
+                3,
+                Instruction::InlineAsm {
+                    template: String::new(),
+                    outputs: vec![("=r".into(), Value(output), None)],
+                    inputs: vec![],
+                    clobbers: vec![],
+                    operand_types: vec![IrType::Ptr],
+                    goto_labels: vec![],
+                    input_symbols: vec![],
+                    seg_overrides: vec![],
+                },
+            );
+            assert!(
+                !unique_nonvolatile_allocas(&m.functions[0]).contains(&output),
+                "asm output {output} must invalidate a unique-root proof"
+            );
+            for pass in [
+                forward_memcpy_chains as fn(&mut IrModule) -> usize,
+                crate::passes::aggregate_sroa::run,
+            ] {
+                let mut candidate = IrModule::new();
+                candidate.functions.push(m.functions[0].clone());
+                pass(&mut candidate);
+                assert_eq!(
+                    copies(&candidate).len(),
+                    2,
+                    "asm output {output}: {candidate:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn both_copy_buffer_transforms_refuse_unproven_forwarding() {
+        // A direct alloca-to-alloca copy is safe and should still optimize.
+        // Every other case invalidates at least one proof: opaque call, store
+        // through a derived alias, unknown src/dst, different lengths, or
+        // observable volatile storage.
+        for pass in [
+            forward_memcpy_chains as fn(&mut IrModule) -> usize,
+            crate::passes::aggregate_sroa::run,
+        ] {
+            let mut safe = module(vec![], 0, 2, 64, None, vec![]);
+            pass(&mut safe);
+            assert_eq!(copies(&safe), vec![(Value(2), Value(0), 64)]);
+            let mut cases = [
+                module(
+                    vec![Instruction::Call {
+                        func: "mutate".into(),
+                        info: CallInfo {
+                            args: vec![Operand::Value(Value(0))],
+                            ..Default::default()
+                        },
+                    }],
+                    0,
+                    2,
+                    64,
+                    None,
+                    vec![],
+                ),
+                module(
+                    vec![
+                        Instruction::Copy {
+                            dest: Value(3),
+                            src: Operand::Value(Value(0)),
+                        },
+                        store(3),
+                    ],
+                    0,
+                    2,
+                    64,
+                    None,
+                    vec![],
+                ),
+                module(vec![], 4, 2, 64, None, vec![]),
+                module(vec![], 0, 4, 64, None, vec![]),
+                module(vec![], 0, 2, 32, None, vec![]),
+                module(vec![], 0, 2, 64, Some(1), vec![]),
+                module(vec![], 0, 2, 64, Some(0), vec![]),
+                module(vec![], 0, 2, 64, Some(2), vec![]),
+            ];
+            for (i, m) in cases.iter_mut().enumerate() {
+                pass(m);
+                assert_eq!(
+                    copies(m).len(),
+                    2,
+                    "unsafe case {i}: {:?}",
+                    m.functions[0].blocks[0].instructions
+                );
+            }
+            // Post-SSA copy webs may redefine an alloca Value. Here the
+            // apparent source alloca is later a GEP into the destination:
+            // collapsing the copies would introduce overlapping ranges.
+            let mut redefined = module(vec![], 0, 2, 32, None, vec![]);
+            if let Instruction::Memcpy { size, .. } =
+                &mut redefined.functions[0].blocks[0].instructions[3]
+            {
+                *size = 32;
+            }
+            redefined.functions[0].blocks[0].instructions.insert(
+                3,
+                Instruction::GetElementPtr {
+                    dest: Value(0),
+                    base: Value(2),
+                    offset: Operand::Const(IrConst::I64(8)),
+                    ty: IrType::U8,
+                },
+            );
+            pass(&mut redefined);
+            assert_eq!(
+                copies(&redefined).len(),
+                2,
+                "redefined alloca is not a distinct root"
+            );
+            let mut write_after = module(vec![], 0, 2, 64, None, vec![store(0)]);
+            pass(&mut write_after);
+            assert_eq!(copies(&write_after), vec![(Value(2), Value(0), 64)]);
+        }
     }
 }
