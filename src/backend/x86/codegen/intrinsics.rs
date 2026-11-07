@@ -1105,6 +1105,15 @@ impl X86Codegen {
         args.iter()
             .any(|a| matches!(a, Operand::Value(v) if v.0 == pval))
             && !is_raw_reader_intrinsic(op)
+            // Ops that write memory through `args` carry their destination
+            // there rather than in `dest_ptr`, so nothing here can tell
+            // whether the pending value is the datum or the destination. Which
+            // arg is which is not knowable from the operand list alone, so the
+            // whole family is refused rather than guessed at. (The explicit
+            // legacy list below is the pre-existing policy; this is its
+            // args-side generalisation, the same rule `copy_prop` applies when
+            // folding a memcpy into an intrinsic.)
+            && !op.writes_memory_via_args()
             && !matches!(
                 op,
                 O::Pblendvb128
@@ -12052,6 +12061,14 @@ impl X86Codegen {
                         || (this.state.vec_last_store_reg
                             && this.state.vec_last_store_val == Some(v.0))
                     {
+                        return None;
+                    }
+                    // LAZY-FLUSH SOUNDNESS, as in `evex_arg_mem`: a deferred
+                    // store means the slot is not written yet. The peephole
+                    // check above usually covers this, but `vec_last_store_reg`
+                    // can be cleared by an intervening emission while the
+                    // pending store survives, so state it explicitly.
+                    if this.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
                         return None;
                     }
                     this.value_ptr_mem_operand(v.0)
