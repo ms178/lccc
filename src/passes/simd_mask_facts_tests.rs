@@ -2244,3 +2244,81 @@ fn ssa_form_byte_logic_propagates_without_memory_images() {
     assert_eq!(run_function(&mut g), 1, "SSA VecXorI32x4 must fold");
     assert_eq!(result_const(&g, Value(4)), Some(0x8888));
 }
+
+#[test]
+fn a_rejected_proof_never_poisons_a_later_independent_proof() {
+    // This is the invariant behind the ObjectMention refactor: when an early
+    // proof refuses, its cycle marker MUST be popped.  Put one unprovable
+    // movemask BEFORE the image's write (so `index > read_index` rejects it)
+    // and one provable movemask after it, both reading the SAME object.  If
+    // the first proof leaked `visiting`, the second would see
+    // `visiting.contains(base)` and refuse too.
+    let bytes = [
+        0xFF, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0xFF,
+        0xFF,
+    ];
+    let mut image = Image::new(&bytes);
+    let early = intrinsic(
+        Some(Value(9000)),
+        IntrinsicOp::Pmovmskb128,
+        None,
+        vec![Operand::Value(image.temp)],
+    );
+    image.insts.insert(1, early);
+    let result = image.result;
+    let mut f = IrFunction::new("poison".into(), IrType::I32, vec![], false);
+    f.blocks.push(block(
+        image.insts.clone(),
+        Terminator::Return(Some(Operand::Value(result))),
+        true,
+    ));
+    f.next_value_id = 9001;
+    assert_eq!(
+        run_function(&mut f),
+        1,
+        "a refused early proof must not veto the later valid proof"
+    );
+    assert_eq!(result_const(&f, result), Some(53069));
+    assert_eq!(
+        result_const(&f, Value(9000)),
+        None,
+        "the unprovable early movemask must not be folded"
+    );
+}
+
+#[test]
+fn a_live_legacy_intrinsic_result_is_never_reclaimed() {
+    // `Pand128` carries BOTH `dest_ptr` and an SSA `dest`.  If that result
+    // has a real user, deleting the intrinsic would leave an undefined
+    // value.  Keep the user live through the terminator so DCE cannot remove
+    // it between reclaimer rounds, then insist the intrinsic survives.
+    let a = [0x80u8; 16];
+    let b = [0xFFu8; 16];
+    let mut f = logic_image(
+        &a,
+        &b,
+        IntrinsicOp::Pand128,
+        Some(|insts| {
+            insts.push(copy(Value(70), Operand::Value(Value(52))));
+        }),
+    );
+    f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(70))));
+    assert_eq!(run_function(&mut f), 1, "the movemask fold is still sound");
+    assert!(
+        f.blocks[0].instructions.iter().any(|i| matches!(
+            i,
+            Instruction::Intrinsic { op, .. } if *op == IntrinsicOp::Pand128
+        )),
+        "the reclaimer deleted an intrinsic whose SSA result is still used"
+    );
+    assert!(
+        f.blocks[0].instructions.iter().any(|i| matches!(
+            i,
+            Instruction::Copy {
+                dest: Value(70),
+                ..
+            }
+        )),
+        "the live user of the intrinsic result disappeared"
+    );
+}
