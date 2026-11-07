@@ -293,6 +293,28 @@ impl ArmCodegen {
         // and W-register instructions zero the upper half of the X register.
         // Their I32→I64 widening casts therefore skip `sxtw`.
         self.bitop_nonneg_values = crate::backend::generation::collect_bitop_nonneg_values(func);
+        self.atomic_zext_values = func
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter_map(|inst| match inst {
+                Instruction::AtomicLoad { dest, ty, .. }
+                | Instruction::AtomicCmpxchg {
+                    dest,
+                    ty,
+                    returns_bool: false,
+                    ..
+                } => Some((dest.0, *ty)),
+                Instruction::AtomicRmw { dest, ty, op, .. }
+                    if !matches!(op, crate::ir::reexports::AtomicRmwOp::TestAndSet) =>
+                {
+                    Some((dest.0, *ty))
+                }
+                _ => None,
+            })
+            .filter(|(_, ty)| matches!(ty, IrType::U8 | IrType::U16 | IrType::U32))
+            .map(|(dest, _)| dest)
+            .collect();
 
         // Same-block div/rem pair fusion table: one sdiv/udiv serves a
         // div+rem couple with identical operands (the remainder comes from
@@ -826,6 +848,19 @@ impl ArmCodegen {
                     // `fmadd` family, copysign's bit merge in x0/x1): no
                     // call and no x29.  `fabs(x)` kept a frame record.
                     Instruction::Intrinsic { op, .. } if arm_call_free_scalar_intrinsic(op) => {}
+                    // Atomics are inline exclusive/acquire-release sequences
+                    // on x0-x4 and the operands' homes (`atomics.rs`) and
+                    // fences a bare `dmb`: no call, no x29.  A 16-byte one
+                    // has a 16-byte slot, which a 16-byte frame lacks.
+                    Instruction::AtomicLoad { ty, .. }
+                    | Instruction::AtomicStore { ty, .. }
+                    | Instruction::AtomicRmw { ty, .. }
+                    | Instruction::AtomicCmpxchg { ty, .. } => {
+                        if !scalar(ty) {
+                            return false;
+                        }
+                    }
+                    Instruction::Fence { .. } => {}
                     Instruction::GlobalAddr { name, .. } => {
                         if self.state.tls_symbols.contains(name)
                             && matches!(

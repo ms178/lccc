@@ -293,6 +293,13 @@ pub struct ArmCodegen {
     /// Per-definition, never propagated through derived arithmetic (the
     /// x86-64 backend's bitop_nonneg_values transfer).
     pub(super) bitop_nonneg_values: FxHashSet<u32>,
+    /// Unsigned 8/16/32-bit results of atomic loads, RMWs and compare-
+    /// exchanges: `atomics.rs` produces them with a W-register load-acquire
+    /// or load-exclusive, which zeroes bits 63..width, and canonicalizes
+    /// nothing for unsigned types.  Their zero-extending casts are the
+    /// identity (`u64 f(u32 *p) { return __sync_val_compare_and_swap(...); }`
+    /// paid a `mov w0, w0`).
+    pub(super) atomic_zext_values: FxHashSet<u32>,
     /// Same-block div/rem pair fusion (compute_i686_divrem_pairs with the
     /// AArch64 target): dest value-ids of TAIL instructions — they emit
     /// nothing because the HEAD's sdiv+msub dual-store wrote their result.
@@ -364,6 +371,7 @@ impl ArmCodegen {
             va_named_stack_bytes: 0,
             fp_ret_buffer: None,
             bitop_nonneg_values: FxHashSet::default(),
+            atomic_zext_values: FxHashSet::default(),
             divrem_tail_dests: FxHashSet::default(),
             divrem_head_partners: FxHashMap::default(),
             asm_scratch_idx: 0,

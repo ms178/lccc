@@ -45,6 +45,9 @@ FIXTURES = (
     # Sibling calls (incl. branch arms), RV64 branch-free selects, call
     # staging hazards and pointer exit tests: values computed by GCC 16.2.
     "sibcall_select_staging_cross", "switch_tree_cross",
+    # Every atomic builtin at every width (8..128 bits) and ordering, with
+    # register-homed pointers and values live across the sequences.
+    "atomic_ops_cross",
 )
 ALL_LEVELS = ("-O0", "-O1", "-O2", "-Os")
 LEVELS = {
@@ -159,6 +162,13 @@ LEVELS = {
     # signed/unsigned 32- and 64-bit selectors, sign-boundary cases, range
     # clusters spanning zero and 2^31, pivots that are cases of their own.
     "switch_tree_cross": ALL_LEVELS + ("-O3",),
+    # AArch64/RV64 atomics: the pointer of every atomic is a register-homed
+    # value (it used to be forced into a stack slot, so every atomic leaf
+    # built a frame); old values come back extended at the object's width;
+    # 128-bit operations read and write both halves -- AArch64 inline
+    # LDAXP/STLXP loops, RV64 libatomic calls (the AArch64 lowering used to
+    # touch the low doubleword only and return a stack slot as the high half).
+    "atomic_ops_cross": ALL_LEVELS + ("-O3",),
 }
 # Two-unit psABI fixtures under interop/: `<name>_callee.c` and
 # `<name>_caller.c`, linked LCCC-with-LCCC and LCCC-with-Clang in both

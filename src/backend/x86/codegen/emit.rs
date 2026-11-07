@@ -5163,11 +5163,16 @@ impl X86Codegen {
     }
 
     /// Get the type suffix for lock-prefixed instructions (b, w, l, q).
+    ///
+    /// The suffix is the access width and must agree with
+    /// [`Self::reg_for_type`]: a 4-byte `float` is `l` with `%eax` (it fell
+    /// into `q`, so a float exchange emitted the unassemblable
+    /// `xchgq %eax, (%rdi)`).
     pub(super) fn type_suffix(ty: IrType) -> &'static str {
         match ty {
             IrType::I8 | IrType::U8 => "b",
             IrType::I16 | IrType::U16 => "w",
-            IrType::I32 | IrType::U32 => "l",
+            IrType::I32 | IrType::U32 | IrType::F32 => "l",
             _ => "q",
         }
     }
