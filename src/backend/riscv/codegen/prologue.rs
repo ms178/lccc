@@ -51,6 +51,76 @@ impl RiscvCodegen {
     /// reject it outright; the TLS optimizations exist to serve precisely that
     /// one call and so permit it while still rejecting every other libcall.
     fn riscv_call_free_ir(&self, func: &IrFunction, allow_dynamic_tls: bool) -> bool {
+        self.riscv_emitter_safe_ir(func, allow_dynamic_tls, false)
+    }
+
+    /// The caller-saved (a0-a7) pool for a function WITH calls.
+    ///
+    /// Every call must be an ordinary direct or indirect call of scalar
+    /// arguments and result (`allow_calls` of `riscv_emitter_safe_ir`): the
+    /// allocator sees it as a call point, so a value live across it takes a
+    /// callee-saved home, and `collect_call_arg_values` gives each argument
+    /// the depth of the staging writes that precede its read (the indirect
+    /// target too: it is read after the staging), so no argument sits in an
+    /// a-register written before it.  Everything else is the call-free
+    /// allowlist: emitters that touch t- and s-registers only.  The
+    /// parameters must be read in the entry prefix, which the allocator's
+    /// entry guard takes as given.
+    fn riscv_call_pool_eligible(&self, func: &IrFunction) -> bool {
+        std::env::var_os("CCC_NO_RISCV_CALLER_POOL").is_none()
+            && self.riscv_emitter_safe_ir(func, false, true)
+            && crate::backend::regalloc::riscv_params_in_entry_prefix(func)
+    }
+
+    /// Whether every call of `func` will be emitted as a sibling call --
+    /// the block-tail shape the generation driver arms
+    /// (`sibcall_function_use_counts` + `sibcall_block_hint`, the exact
+    /// inputs it uses) and `sibcall_abi_admits` -- with scalar arguments and
+    /// result, so neither the argument setup nor the result path calls a
+    /// helper.  Such a function never needs ra saved: each tail is a bare
+    /// `tail`.  (`emit_call_instruction_impl` guards ra around any call
+    /// emitted after all.)
+    fn every_call_is_sibling(&self, func: &IrFunction) -> bool {
+        use crate::ir::reexports::Instruction;
+        let Some(counts) = crate::backend::generation::sibcall_function_use_counts(
+            func,
+            &self.state.incoming_byval_slots,
+        ) else {
+            return false;
+        };
+        for block in &func.blocks {
+            let hint = crate::backend::generation::sibcall_block_hint(block, &counts);
+            for (idx, inst) in block.instructions.iter().enumerate() {
+                let info = match inst {
+                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => info,
+                    _ => continue,
+                };
+                if hint.map(|h| h.instruction_index) != Some(idx)
+                    || !self.sibcall_abi_admits(info)
+                    || !info
+                        .arg_types
+                        .iter()
+                        .all(|&t| super::calls::rv_sibcall_scalar(t))
+                    || !(info.return_type == IrType::Void
+                        || super::calls::rv_sibcall_scalar(info.return_type))
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// The allowlist behind [`Self::riscv_call_free_ir`]; with `allow_calls`
+    /// it also admits ordinary calls of scalar arguments and result
+    /// (`riscv_call_pool_eligible`).  Calls returning twice stay out: their
+    /// second return resumes with whatever the a-registers hold.
+    fn riscv_emitter_safe_ir(
+        &self,
+        func: &IrFunction,
+        allow_dynamic_tls: bool,
+        allow_calls: bool,
+    ) -> bool {
         use crate::ir::reexports::{Instruction, IrConst, Operand};
         let scalar = |ty: &IrType| {
             matches!(
@@ -103,6 +173,13 @@ impl RiscvCodegen {
                     | Instruction::LabelAddr { .. }
                     | Instruction::GetStaticChain { .. }
                     | Instruction::SetStaticChain { .. } => {}
+                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. }
+                        if allow_calls
+                            && !crate::backend::liveness::is_returns_twice_call(inst)
+                            && !info.is_sret
+                            && info.arg_types.len() == info.args.len()
+                            && info.arg_types.iter().all(scalar)
+                            && (info.return_type == IrType::Void || scalar(&info.return_type)) => {}
                     Instruction::GlobalAddr { name, .. } => {
                         if !allow_dynamic_tls
                             && self.state.tls_symbols.contains(name)
@@ -213,19 +290,26 @@ impl RiscvCodegen {
         // a live value out from under a later argument.  t-regs stay reserved
         // as emitter scratch (t0 acc / t1 secondary / t2 static chain and
         // indirect-call target / t3–t5 call staging / t6 jump tables).
+        //
+        // A function with calls opens the same pool on the conditions of
+        // `riscv_call_pool_eligible`: the allocator keeps call-spanning
+        // values out of it, and the staging-hazard depths keep each argument
+        // out of the a-registers its staging writes first.
         let caller_saved_regs: Vec<crate::backend::regalloc::PhysReg> = if !self.state.disable_regalloc
                 && !self.is_variadic
                 && !func.uses_sret
-                && self.riscv_caller_pool_eligible(func)
-                // The entry-prefix write guard is computed from block 0
-                // alone; opening the pool is only sound when every ParamRef
-                // really sits in that entry prefix (generation's lowering
-                // contract).  Belt and suspenders: refuse the pool outright
-                // otherwise.  Also re-asserts call-freeness.
-                && crate::backend::regalloc::riscv_param_caller_homes_safe_with_config(
-                    func,
-                    &self.state.ra_config,
-                ) {
+                && ((self.riscv_caller_pool_eligible(func)
+                    // The entry-prefix write guard is computed from block 0
+                    // alone; opening the pool is only sound when every
+                    // ParamRef really sits in that entry prefix
+                    // (generation's lowering contract).  Belt and
+                    // suspenders: refuse the pool outright otherwise.  Also
+                    // re-asserts call-freeness.
+                    && crate::backend::regalloc::riscv_param_caller_homes_safe_with_config(
+                        func,
+                        &self.state.ra_config,
+                    ))
+                    || self.riscv_call_pool_eligible(func)) {
             (12..=19).map(crate::backend::regalloc::PhysReg).collect()
         } else {
             Vec::new()
@@ -454,8 +538,12 @@ impl RiscvCodegen {
             // already implies call-freeness.  That matters here: without a
             // prologue the return address stays in `ra`, so any call -- including
             // the hidden dynamic-TLS resolver -- would clobber it before the
-            // closing `ret`.
-            && self.riscv_caller_pool_eligible(func)
+            // closing `ret`.  The one exception: every call a sibling call
+            // (`every_call_is_sibling`), which leaves through `tail` with ra
+            // untouched.
+            && (self.riscv_caller_pool_eligible(func)
+                || (self.every_call_is_sibling(func)
+                    && self.riscv_emitter_safe_ir(func, false, true)))
             && {
                 let config = self.call_abi_config_impl();
                 let classes = crate::backend::call_abi::classify_params(func, &config);

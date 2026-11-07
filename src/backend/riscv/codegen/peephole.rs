@@ -233,7 +233,10 @@ fn classify_implicit_operands_rv(line: &str) -> (u64, u64) {
     }
     match mnem {
         "ret" => (RA, 0),
-        "call" | "tail" => (0, RA),
+        "call" => (0, RA),
+        // `tail sym` is `auipc t1, ...; jalr zero, t1, ...`: it links
+        // nothing, and the target address passes through t1.
+        "tail" => (0, 1 << REG_T1),
         // `jal target` — the rd defaults to ra.  With a comma the rd is
         // named (`jal ra, label` / `jal x0, label`) and nothing is implicit.
         "jal" if !rest.contains(',') => (0, RA),
@@ -297,6 +300,19 @@ fn is_call_line(trimmed: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// A sibling call's tail (`emit_return_impl`): `tail sym`, or the `jr` of
+/// an indirect one, which the emitter annotates with the call's
+/// `CALL_READS_TAG` (an unannotated `jr` is a computed jump).  It is
+/// classified as a call -- it reads the argument registers the annotation
+/// names and leaves the caller-saved ones undefined -- that also hands ra
+/// and the callee-saved registers to the callee, which returns through them
+/// to our caller, like a `ret` (`rv_uses_defs`, `rv_fp_uses_defs`), and it
+/// never falls through (`RvCfg::build`).
+fn rv_is_tail_line(trimmed: &str) -> bool {
+    trimmed.starts_with("tail ")
+        || (trimmed.starts_with("jr ") && trimmed.contains(CALL_READS_TAG))
 }
 
 /// True when the line implicitly writes register `id` (the write half of
@@ -428,8 +444,10 @@ fn classify_line(line: &str) -> LineKind {
         return LineKind::Ret;
     }
 
-    // call -- direct, or indirect through `jalr` (see `is_call_line`)
-    if is_call_line(trimmed) {
+    // call -- direct, or indirect through `jalr` (see `is_call_line`); a
+    // sibling call's tail is a call that never returns here
+    // (`rv_is_tail_line`).
+    if is_call_line(trimmed) || rv_is_tail_line(trimmed) {
         return LineKind::Call;
     }
 
@@ -4545,12 +4563,17 @@ fn rv_uses_defs(line: &str, kind: LineKind) -> (u64, u64) {
         // nested function's static chain; helper conventions use t-regs)
         // and the stack, and clobbers every caller-saved register -- unless
         // the emitter published exactly which argument registers it reads.
-        LineKind::Call => (
-            (named & !rv_bit(REG_RA))
+        // A sibling call's tail also reads ra and the callee-saved
+        // registers: the callee returns through them to our caller.
+        LineKind::Call => {
+            let mut uses = (named & !rv_bit(REG_RA))
                 | rv_annotated_call_reads(line)
-                    .unwrap_or(RV_CALLER_SAVED & !rv_bit(REG_RA) | rv_bit(REG_SP)),
-            RV_CALLER_SAVED,
-        ),
+                    .unwrap_or(RV_CALLER_SAVED & !rv_bit(REG_RA) | rv_bit(REG_SP));
+            if rv_is_tail_line(line.trim()) {
+                uses |= rv_bit(REG_RA) | RV_CALLEE_SAVED;
+            }
+            (uses, RV_CALLER_SAVED)
+        }
         // The return value (a0/a1), the link register and every register
         // the caller expects back.
         LineKind::Ret => (
@@ -4631,8 +4654,10 @@ impl RvCfg {
         if start >= end {
             return None;
         }
-        let transfers =
-            |k: usize| matches!(kinds[k], LineKind::Branch | LineKind::Jump | LineKind::Ret);
+        let tail = |k: usize| kinds[k] == LineKind::Call && rv_is_tail_line(lines[k].trim());
+        let transfers = |k: usize| {
+            matches!(kinds[k], LineKind::Branch | LineKind::Jump | LineKind::Ret) || tail(k)
+        };
         let mut starts: Vec<usize> = vec![start];
         for k in start..end {
             if kinds[k] == LineKind::Other && rv_is_unmodelled_transfer(&lines[k]) {
@@ -4681,7 +4706,8 @@ impl RvCfg {
             // that does not end in `ret` or an unconditional jump -- may
             // reach anything: assume the worst.
             if b + 1 == nb
-                && (t == starts[b] || !matches!(kinds[t - 1], LineKind::Ret | LineKind::Jump))
+                && (t == starts[b]
+                    || !(matches!(kinds[t - 1], LineKind::Ret | LineKind::Jump) || tail(t - 1)))
             {
                 exits[b] = true;
             }
@@ -4692,6 +4718,9 @@ impl RvCfg {
             let last = t - 1;
             match kinds[last] {
                 LineKind::Ret => succs.push(Vec::new()),
+                // A sibling call's tail leaves like a `ret`; its reads are
+                // the line's own (`rv_uses_defs`).
+                LineKind::Call if tail(last) => succs.push(Vec::new()),
                 LineKind::Jump => {
                     let Some(target) = jump_target(&lines[last]) else {
                         return None; // `jr` / an indirect jump
@@ -4964,10 +4993,13 @@ fn eliminate_unread_callee_saved_homes(lines: &[String], kinds: &mut [LineKind],
             let mut writes: Vec<usize> = Vec::new();
             let mut ok = true;
             for k in start..end {
+                // A `ret`'s or a sibling tail's read of the callee-saved set
+                // is the caller's expectation this keeps.
                 if matches!(
                     kinds[k],
                     LineKind::Nop | LineKind::Label | LineKind::Directive
                 ) || kinds[k] == LineKind::Ret
+                    || (kinds[k] == LineKind::Call && rv_is_tail_line(lines[k].trim()))
                 {
                     continue;
                 }
@@ -6006,7 +6038,12 @@ fn rv_fp_uses_defs(line: &str, kind: LineKind) -> (u32, u32) {
     match kind {
         LineKind::Nop | LineKind::Label | LineKind::Directive => (0, 0),
         // A callee may read every FP argument register and clobbers every
-        // caller-saved one.
+        // caller-saved one; a sibling callee also returns the callee-saved
+        // ones to our caller.
+        LineKind::Call if rv_is_tail_line(line.trim()) => (
+            RV_FP_ARGS | RV_FP_CALLEE_SAVED,
+            RV_FP_TEMPS | RV_FP_ARGS,
+        ),
         LineKind::Call => (RV_FP_ARGS, RV_FP_TEMPS | RV_FP_ARGS),
         // The FP results and every register the caller expects back.
         LineKind::Ret => (RV_FP_RET | RV_FP_CALLEE_SAVED, 0),

@@ -1735,7 +1735,9 @@ mod tests {
             ("    sxtb x0, w0\n", vec![]),
             ("    and w0, w0, #0xff\n", vec![]),
             ("    and x0, x0, #0xffff\n    mov w0, w0\n", vec![]),
-            ("    sxtb x0, w5\n", vec!["mov x0, x5"]),
+            ("    sxtb x0, w5\n", vec!["mov w0, w5"]),
+            // An X copy staged for a narrow argument reads only W views.
+            ("    mov x0, x19\n", vec!["mov w0, w19"]),
         ] {
             let narrow = if body.contains("0xffff") {
                 "0:16,1:32"
@@ -1772,6 +1774,10 @@ mod tests {
             format!("    sxtb x0, w0\n.L1:\n{}\n    ret\n", call("0:8")),
             // Not annotated.
             "    sxtb x0, w0\n    bl g\n    ret\n".to_string(),
+            // Already the W copy the rewrite would produce.
+            format!("    mov w0, w5\n{}\n    ret\n", call("0:32")),
+            // An X copy into a 64-bit argument.
+            format!("    mov x1, x19\n{}\n    ret\n", call("0:8")),
         ] {
             let (changed, _) = run(drop_narrow_call_arg_extensions, &body);
             assert!(!changed, "{body}");

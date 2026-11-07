@@ -599,16 +599,40 @@ fn tail_marker_before<'a>(lines: &'a [String], kinds: &[LineKind], at: usize) ->
     None
 }
 
-/// What line `k` reads as a sibling call's tail branch (`b sym`, an exit of
-/// the function): `tail_branch_reads` over its marker row.  0 for every
-/// other line.  The single source of these reads for every liveness model
-/// that treats the branch as an exit (`Liveness::build`, the X-view model,
-/// `abi_liveness`).
+/// The target register of an indirect sibling call's `br xN`: a `br` with
+/// a `TAIL_READS_MARKER` row before it.  A `br` without one is a jump-table
+/// or computed-goto branch inside the function, whose successors are
+/// unknown.
+fn sibling_br_target(lines: &[String], kinds: &[LineKind], k: usize) -> Option<u8> {
+    let reg = lines[k].trim().strip_prefix("br ")?.trim();
+    let r = parse_reg(reg);
+    (kinds[k] == LineKind::Branch && r <= 30 && tail_marker_before(lines, kinds, k).is_some())
+        .then_some(r)
+}
+
+/// Whether line `k` is a sibling call's tail -- `b sym`
+/// (`tail_branch_target`) or an indirect one's `br xN`
+/// (`sibling_br_target`) -- an exit of the function with no successor.
+fn is_sibling_exit(lines: &[String], kinds: &[LineKind], k: usize) -> bool {
+    kinds[k] == LineKind::Branch
+        && (tail_branch_target(&lines[k]).is_some() || sibling_br_target(lines, kinds, k).is_some())
+}
+
+/// What line `k` reads as a sibling call's tail (`is_sibling_exit`):
+/// `tail_branch_reads` over its marker row, and an indirect branch's target
+/// register.  0 for every other line.  The single source of these reads for
+/// every liveness model that treats the tail as an exit (`Liveness::build`,
+/// the X-view model, `abi_liveness`).
 fn tail_exit_reads(lines: &[String], kinds: &[LineKind], k: usize) -> u64 {
-    if kinds[k] == LineKind::Branch && tail_branch_target(&lines[k]).is_some() {
-        tail_branch_reads(tail_marker_before(lines, kinds, k))
-    } else {
-        0
+    if kinds[k] != LineKind::Branch {
+        return 0;
+    }
+    if tail_branch_target(&lines[k]).is_some() {
+        return tail_branch_reads(tail_marker_before(lines, kinds, k));
+    }
+    match sibling_br_target(lines, kinds, k) {
+        Some(r) => tail_branch_reads(tail_marker_before(lines, kinds, k)) | 1u64 << r,
+        None => 0,
     }
 }
 
@@ -1506,7 +1530,7 @@ impl Liveness {
     /// `build` over the (uses, defs) model `operands(k)` of line `k`: the
     /// liveness of whatever property of a register those sets track.
     ///
-    /// A sibling call's tail branch (`tail_branch_target`) is an exit with no
+    /// A sibling call's tail (`is_sibling_exit`) is an exit with no
     /// successor, like a `ret`: what it reads is the model's to charge in
     /// `operands` (`tail_exit_reads` for a register model; nothing for NZCV,
     /// which AAPCS64 leaves undefined at a public interface).
@@ -1560,9 +1584,9 @@ impl Liveness {
             let mut s = Vec::new();
             match kinds[last] {
                 LineKind::Ret => {}
-                // A sibling call's tail branch leaves the function; its
-                // reads come from `operands` (see the doc comment).
-                LineKind::Branch if tail_branch_target(&lines[last]).is_some() => {}
+                // A sibling call's tail leaves the function; its reads come
+                // from `operands` (see the doc comment).
+                LineKind::Branch if is_sibling_exit(lines, kinds, last) => {}
                 LineKind::Branch => {
                     let tgt = lines[last].trim().split_whitespace().next_back();
                     match tgt.and_then(|t| label_block.get(t).copied()) {
@@ -2226,8 +2250,8 @@ fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize
         let last = t - 1;
         match kinds[last] {
             LineKind::Ret => {}
-            // A sibling call's tail branch leaves the function like a `ret`.
-            LineKind::Branch if tail_branch_target(&lines[last]).is_some() => {}
+            // A sibling call's tail leaves the function like a `ret`.
+            LineKind::Branch if is_sibling_exit(lines, kinds, last) => {}
             LineKind::Branch => {
                 let text = lines[last].trim();
                 let tgt = text.split_whitespace().next_back();
@@ -4012,12 +4036,13 @@ fn narrow_arg_mask(widths: &[u8; 8]) -> u64 {
 /// other line): `tail_exit_reads` without the narrow arguments of its
 /// marker row.
 fn x_view_exit_reads(lines: &[String], kinds: &[LineKind], k: usize) -> u64 {
-    if kinds[k] != LineKind::Branch || tail_branch_target(&lines[k]).is_none() {
+    let reads = tail_exit_reads(lines, kinds, k);
+    if reads == 0 {
         return 0;
     }
-    let marker = tail_marker_before(lines, kinds, k);
-    let narrow = marker.map_or(0, |m| narrow_arg_mask(&late::narrow_widths(m)));
-    tail_branch_reads(marker) & !narrow
+    let narrow = tail_marker_before(lines, kinds, k)
+        .map_or(0, |m| narrow_arg_mask(&late::narrow_widths(m)));
+    reads & !narrow
 }
 
 /// The `RET_BITS_MARKER` width of the function `[start, end)`, if it
@@ -10016,7 +10041,7 @@ fn abi_liveness(lines: &[String], kinds: &[LineKind], n: usize) -> Option<Vec<u6
             Some(LineKind::Ret) => {}
             Some(LineKind::Branch) => {
                 let text = lines[t - 1].trim();
-                if text.starts_with("br ") {
+                if text.starts_with("br ") && sibling_br_target(lines, kinds, t - 1).is_none() {
                     return None;
                 }
                 let tgt = text.split_whitespace().next_back();
@@ -10060,7 +10085,7 @@ fn abi_liveness(lines: &[String], kinds: &[LineKind], n: usize) -> Option<Vec<u6
             LineKind::Branch => {
                 let tgt = text.split_whitespace().next_back();
                 if !tgt.is_some_and(|l| label_block.contains_key(l)) {
-                    if tail_branch_target(text).is_some() {
+                    if is_sibling_exit(lines, kinds, k) {
                         // Exactly what the suppressed call read: the marker
                         // row the sibling call left just before its branch.
                         u |= tail_exit_reads(lines, kinds, k);

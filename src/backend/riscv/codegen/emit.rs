@@ -187,6 +187,9 @@ pub struct RiscvCodegen {
     /// does not model, so the call is published unannotated and the
     /// peephole keeps assuming it reads every caller-saved register.
     pub(super) call_gp_reads: Option<u8>,
+    /// The suppressed call's `call_gp_reads`, for the annotation of the
+    /// sibling call's tail line (`emit_return_impl`).
+    pub(super) sibcall_reads: Option<u8>,
     /// Scratch register indices for inline asm allocation.
     pub(super) asm_gp_scratch_idx: usize,
     pub(super) asm_fp_scratch_idx: usize,
@@ -240,6 +243,7 @@ impl RiscvCodegen {
             current_frame_size: 0,
             is_variadic: false,
             call_gp_reads: None,
+            sibcall_reads: None,
             asm_gp_scratch_idx: 0,
             asm_fp_scratch_idx: 0,
             asm_borrowed_callee_saved: Vec::new(),
@@ -1315,6 +1319,7 @@ impl ArchCodegen for RiscvCodegen {
         fn emit_call_instruction(&mut self, direct_name: Option<&str>, func_ptr: Option<&Operand>, indirect: bool, stack_arg_space: usize) => emit_call_instruction_impl;
         fn emit_call_cleanup(&mut self, stack_arg_space: usize, f128_temp_space: usize, indirect: bool) => emit_call_cleanup_impl;
         fn emit_call_store_result(&mut self, dest: &Value, return_type: IrType) => emit_call_store_result_impl;
+        fn arm_sibcall_candidate(&mut self, info: &crate::ir::reexports::CallInfo) => riscv_sibcall_candidate_impl;
         fn emit_call_store_fp_agg_return(&mut self, buffer: &Operand, class: crate::common::types::FpAggClass, dest: Option<&Value>) => emit_call_store_fp_agg_return_impl;
         // globals
         fn emit_global_addr(&mut self, dest: &Value, name: &str) => emit_global_addr_impl;

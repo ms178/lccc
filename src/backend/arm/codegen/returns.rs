@@ -27,7 +27,14 @@ impl ArmCodegen {
                 crate::backend::state::SibcallTarget::Reg(reg) => {
                     self.state.emit_fmt(format_args!("    br {}", reg));
                 }
-                crate::backend::state::SibcallTarget::RipSlot(_) => {}
+                // The x86-64 `jmp *slot(%rip)` form: never armed by this
+                // backend (`emit_call_instruction_impl` builds `Direct` or
+                // `Reg` only).  Were it ever to reach here, the call it
+                // replaced is gone -- trap rather than fall off the end of
+                // the function.
+                crate::backend::state::SibcallTarget::RipSlot(_) => {
+                    self.state.emit("    brk #0");
+                }
             }
             return;
         }

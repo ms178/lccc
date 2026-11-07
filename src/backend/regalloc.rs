@@ -759,6 +759,14 @@ pub(crate) fn riscv_param_caller_homes_safe_with_config(
     }) {
         return false;
     }
+    riscv_params_in_entry_prefix(func)
+}
+
+/// Whether every `ParamRef` of `func` sits in the entry prefix: block 0,
+/// preceded only by allocas and other `ParamRef`s (the premise of the
+/// riscv64 entry guard, which protects the incoming argument registers only
+/// from values born before a still-unexecuted `ParamRef` of block 0).
+pub(crate) fn riscv_params_in_entry_prefix(func: &IrFunction) -> bool {
     for (bi, block) in func.blocks.iter().enumerate() {
         if bi != 0 {
             if block
@@ -9563,8 +9571,15 @@ fn staging_slot(r: PhysReg) -> Option<u8> {
     match crate::common::types::target_elf_machine() {
         crate::backend::elf::EM_X86_64 => x86_64_sysv_arg_slot(r),
         crate::backend::elf::EM_AARCH64 => aarch64_staging_slot(r),
+        crate::backend::elf::EM_RISCV => riscv_staging_slot(r),
         _ => None,
     }
+}
+
+/// riscv64 (see [`riscv_call_staging_depths`]): a_k (`PhysReg(12 + k)`) is
+/// written by the staging of GP argument `k` -- slot `k`.
+fn riscv_staging_slot(r: PhysReg) -> Option<u8> {
+    (12..=19).contains(&r.0).then(|| r.0 - 12)
 }
 
 /// AArch64 (see [`aarch64_call_staging_depths`]): GP argument `k` is staged
@@ -9765,6 +9780,53 @@ fn aarch64_call_staging_depths(info: &crate::ir::reexports::CallInfo) -> Option<
     Some(depths)
 }
 
+/// Per-argument staging-hazard depth of one riscv64 call, or `None` when the
+/// call's staging is outside the precise model.
+///
+/// `emit_call_reg_args_impl` stages a call of integer and FP register
+/// arguments in three phases: Phase 1 reads the first three GP arguments
+/// (into t3-t5) and every FP argument, before any a-register is written;
+/// Phase 2 moves t3-t5 into a0-a2; Phase 3 loads GP argument `k >= 3`
+/// straight into a_k, after a0..a_{k-1}.  So GP argument `k` has depth 0
+/// for `k < 3` and `k` beyond, over [`riscv_staging_slot`]; an FP argument
+/// depth 0.  (With only these classes the `k`-th GP argument is a_k: no
+/// pair or aggregate shifts the registers.)  Any other class -- pairs,
+/// aggregates, F128, stack -- is staged after Phase 2 and keeps the blanket
+/// rule, for argument 0 too.
+fn riscv_call_staging_depths(info: &crate::ir::reexports::CallInfo) -> Option<Vec<u8>> {
+    use crate::backend::call_abi::{CallAbiConfig, CallArgClass as C, classify_call_args};
+    if info.is_fastcall || info.regparm.is_some() {
+        return None;
+    }
+    let classes = classify_call_args(
+        &info.args,
+        &info.arg_types,
+        &info.struct_arg_sizes,
+        &info.struct_arg_aligns,
+        &info.struct_arg_classes,
+        &info.struct_arg_fp_agg_classes,
+        &info.struct_arg_is_f128_sse,
+        info.is_variadic.then_some(info.num_fixed_args),
+        &CallAbiConfig::riscv_lp64d(),
+    );
+    if classes.len() != info.args.len() {
+        return None;
+    }
+    let mut gp = 0u8;
+    let mut depths = Vec::with_capacity(classes.len());
+    for cls in &classes {
+        match *cls {
+            C::IntReg { reg_idx } if usize::from(gp) == reg_idx && gp < 8 => {
+                depths.push(if gp < 3 { 0 } else { gp });
+                gp += 1;
+            }
+            C::FloatReg { .. } => depths.push(0),
+            _ => return None,
+        }
+    }
+    Some(depths)
+}
+
 /// `(skipped leading args, classes of the rest)` of a direct SysV x86-64
 /// call whose staging the precise model covers.
 fn x86_64_sysv_call_classes(
@@ -9834,6 +9896,7 @@ fn collect_call_arg_values(func: &IrFunction) -> (FxHashMap<u32, u8>, FxHashSet<
         && crate::common::types::target_ptr_size() == 8;
     let is_aarch64 =
         crate::common::types::target_elf_machine() == crate::backend::elf::EM_AARCH64;
+    let is_riscv = crate::common::types::target_elf_machine() == crate::backend::elf::EM_RISCV;
     for block in &func.blocks {
         for inst in &block.instructions {
             let (info, is_indirect) = match inst {
@@ -9862,14 +9925,28 @@ fn collect_call_arg_values(func: &IrFunction) -> (FxHashMap<u32, u8>, FxHashSet<
                 x86_64_call_staging_depths(info)
             } else if is_aarch64 {
                 aarch64_call_staging_depths(info)
+            } else if is_riscv {
+                riscv_call_staging_depths(info)
             } else {
                 None
             };
+            // riscv64 reads an indirect target after the whole staging
+            // (`operand_to_t0(ptr); mv t2, t0` at the call), and outside
+            // the precise shapes every argument -- the first included: an
+            // aggregate or pair is loaded after Phase 2 wrote a0-a2.
+            if is_riscv
+                && let Instruction::CallIndirect {
+                    func_ptr: Operand::Value(v),
+                    ..
+                } = inst
+            {
+                later.insert(v.0, ARG_HAZARD_ALL);
+            }
             for (idx, arg) in info.args.iter().enumerate() {
                 if let Operand::Value(v) = arg {
                     let depth = match &precise {
                         Some(d) => d.get(idx).copied().unwrap_or(ARG_HAZARD_ALL),
-                        None if idx >= 1 => ARG_HAZARD_ALL,
+                        None if idx >= 1 || is_riscv => ARG_HAZARD_ALL,
                         None => 0,
                     };
                     if depth > 0 {
