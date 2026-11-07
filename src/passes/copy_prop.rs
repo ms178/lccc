@@ -45,6 +45,33 @@ fn memcpy_folds_into_intrinsic(op: &IntrinsicOp, size: usize) -> bool {
         && !op.writes_memory_via_args()
 }
 
+/// Direct, nonvolatile alloca values with exactly one definition. After phi
+/// lowering a Value may be redefined; merely seeing an earlier Alloca with
+/// that number is not proof that a later pointer still names its stack slot.
+pub(super) fn unique_nonvolatile_allocas(func: &IrFunction) -> FxHashSet<u32> {
+    let mut seen = FxHashSet::default();
+    let mut repeated = FxHashSet::default();
+    let mut allocas = FxHashSet::default();
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let Some(dest) = inst.dest() {
+            if !seen.insert(dest.0) {
+                repeated.insert(dest.0);
+            }
+            if matches!(
+                inst,
+                Instruction::Alloca {
+                    semantic_volatile: false,
+                    ..
+                }
+            ) {
+                allocas.insert(dest.0);
+            }
+        }
+    }
+    allocas.retain(|v| !repeated.contains(v));
+    allocas
+}
+
 /// Forward a purely intermediate memcpy source:
 ///
 /// ```text
@@ -87,19 +114,7 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
         // miscompile: vs1's slot was never initialized/updated while the
         // wide/narrow loops kept reading it).
         let mut uses: FxHashMap<u32, u32> = FxHashMap::default();
-        let allocas: FxHashSet<u32> = func
-            .blocks
-            .iter()
-            .flat_map(|b| b.instructions.iter())
-            .filter_map(|i| match i {
-                Instruction::Alloca {
-                    dest,
-                    semantic_volatile: false,
-                    ..
-                } => Some(dest.0),
-                _ => None,
-            })
-            .collect();
+        let allocas = unique_nonvolatile_allocas(func);
         for block in &func.blocks {
             for inst in &block.instructions {
                 for v in inst.used_values() {
@@ -2573,7 +2588,7 @@ mod snapshot_forwarding_contract {
             let mut safe = module(vec![], 0, 2, 64, None, vec![]);
             pass(&mut safe);
             assert_eq!(copies(&safe), vec![(Value(2), Value(0), 64)]);
-            let mut cases = vec![
+            let mut cases = [
                 module(
                     vec![Instruction::Call {
                         func: "mutate".into(),
@@ -2618,6 +2633,30 @@ mod snapshot_forwarding_contract {
                     m.functions[0].blocks[0].instructions
                 );
             }
+            // Post-SSA copy webs may redefine an alloca Value. Here the
+            // apparent source alloca is later a GEP into the destination:
+            // collapsing the copies would introduce overlapping ranges.
+            let mut redefined = module(vec![], 0, 2, 32, None, vec![]);
+            if let Instruction::Memcpy { size, .. } =
+                &mut redefined.functions[0].blocks[0].instructions[3]
+            {
+                *size = 32;
+            }
+            redefined.functions[0].blocks[0].instructions.insert(
+                3,
+                Instruction::GetElementPtr {
+                    dest: Value(0),
+                    base: Value(2),
+                    offset: Operand::Const(IrConst::I64(8)),
+                    ty: IrType::U8,
+                },
+            );
+            pass(&mut redefined);
+            assert_eq!(
+                copies(&redefined).len(),
+                2,
+                "redefined alloca is not a distinct root"
+            );
             let mut write_after = module(vec![], 0, 2, 64, None, vec![store(0)]);
             pass(&mut write_after);
             assert_eq!(copies(&write_after), vec![(Value(2), Value(0), 64)]);

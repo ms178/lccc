@@ -893,19 +893,7 @@ fn run_function(func: &mut IrFunction) -> usize {
 
     // ── 2. Collapse copy-buffer allocas ────────────────────────────────────
     {
-        let nonvolatile_allocas: FxHashSet<u32> = func
-            .blocks
-            .iter()
-            .flat_map(|b| &b.instructions)
-            .filter_map(|inst| match inst {
-                Instruction::Alloca {
-                    dest,
-                    semantic_volatile: false,
-                    ..
-                } => Some(dest.0),
-                _ => None,
-            })
-            .collect();
+        let nonvolatile_allocas = super::copy_prop::unique_nonvolatile_allocas(func);
         let uses = pointer_uses(func, &s.gep);
         for (&r, &(mb, mi, w_src, w_size)) in &memcpy_writer {
             if memcpy_writer_count.get(&r).copied().unwrap_or(0) != 1 {
