@@ -90,6 +90,7 @@ pub(crate) mod saturating_sub;
 pub(crate) mod sccp;
 pub(crate) mod set_membership;
 pub(crate) mod sign_magnitude;
+pub(crate) mod simd_mask_facts;
 pub(crate) mod simplify;
 pub(crate) mod slp_vectorizer;
 pub(crate) mod sret_copy_elision;
@@ -4520,6 +4521,23 @@ pub(crate) fn run_passes(
     // unaudited intrinsic positions retain their required alignment.
     if !pass_disabled(&disabled, "vecpromote") {
         vector_temp_promotion::downgrade_nonescaping_vector_align(module);
+    }
+
+    // Phase 11e-pre: Compile-time SIMD mask facts (ISPC mask lattice).  A
+    // movemask over a proven constant vector image, and a blend with a proven
+    // all-on/all-off mask, are exact constants.  The pass also reclaims the
+    // private constant image once the fold removes its last reader, so the
+    // backend emits no dead initialization traffic.
+    // ORDER: before `constarr`, which replaces the store image with a rodata
+    // global and would make the byte-level proof unrecoverable.  Evidence
+    // consumers run before evidence destroyers.  A DCE chaser removes the
+    // now-orphaned address derivations.
+    // Pass name for CCC_DISABLE_PASSES: "maskfacts".
+    if !pass_disabled(&disabled, "maskfacts") {
+        if simd_mask_facts::run(module) > 0 {
+            module.for_each_function(dce::eliminate_dead_code);
+        }
+        verify::verify_after_pass(module, "maskfacts");
     }
 
     // Phase 11e: Constant-array promotion. Local arrays whose surviving

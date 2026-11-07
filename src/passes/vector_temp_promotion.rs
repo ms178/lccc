@@ -544,7 +544,7 @@ fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<us
 /// alignment contract.  `VecStoreI32x4Pair` writes only the low 8 bytes of
 /// its 16-byte home and is answered as 8 so the exact-width gate below
 /// still rejects it as a whole-object writer.
-fn whole_vector_store_width(op: IntrinsicOp) -> Option<usize> {
+pub(crate) fn whole_vector_store_width(op: IntrinsicOp) -> Option<usize> {
     use IntrinsicOp as O;
     match op {
         O::VecStoreI32x4
@@ -568,7 +568,7 @@ fn whole_vector_store_width(op: IntrinsicOp) -> Option<usize> {
 /// 0]`).  The x86 emitter reads them with `vmovups`/`vmovdqu`/`movups`
 /// (the direct form) and folds them as memory operands only under VEX, whose
 /// encodings carry no alignment contract; no other backend implements them.
-fn whole_vector_load(op: IntrinsicOp) -> bool {
+pub(crate) fn whole_vector_load(op: IntrinsicOp) -> bool {
     use IntrinsicOp as O;
     matches!(
         op,
