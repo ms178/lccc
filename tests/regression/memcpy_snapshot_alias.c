@@ -30,6 +30,16 @@ __attribute__((noinline)) static void snapshot_local(record *out)
     *out = snapshot;
 }
 
+/* The large-copy forwarding path has its own memory-effect checks. */
+typedef struct { unsigned int value; unsigned char padding[124]; } large_record;
+__attribute__((noinline)) static unsigned int snapshot_atomic(void)
+{
+    large_record source = { .value = 1 }, snapshot;
+    __builtin_memcpy(&snapshot, &source, sizeof source);
+    __atomic_store_n(&source.value, 2, __ATOMIC_RELAXED);
+    return snapshot.value;
+}
+
 int main(void)
 {
     record x = {1, 2, 3, 4, 5, 6, 7, 8}, out = {0};
@@ -40,5 +50,6 @@ int main(void)
     if (out.a != 1 || out.b != 2 || x.a != 300) return 2;
     snapshot_local(&out);
     if (out.a != 1 || out.b != 2 || out.h != 8) return 3;
+    if (snapshot_atomic() != 1) return 4;
     return 0;
 }
