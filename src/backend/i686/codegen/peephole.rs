@@ -14781,7 +14781,9 @@ fn producer_touches_slots(lines: &[String], jcc_idx: usize, slots: &[String]) ->
 /// text, where rows are visible again, and must read them like blanks or
 /// `-g` changes what it hoists.
 fn is_row_or_blank(t: &str) -> bool {
-    t.is_empty() || crate::backend::peephole_common::is_loc_directive(t)
+    t.is_empty()
+        || crate::backend::peephole_common::is_loc_directive(t)
+        || crate::backend::peephole_common::is_inline_range_marker(t)
 }
 
 fn else_hoist_diamonds(asm: String) -> String {
@@ -15514,7 +15516,7 @@ pub fn peephole_optimize(asm: String) -> String {
     let mut clock = PeepClock::new(store.len());
     let mut infos = classify_all(&store);
     clock.mark("p00");
-    let debug_rows = hide_debug_rows(&store, &mut infos);
+    hide_debug_rows(&store, &mut infos);
     clock.mark("p01");
     pin_inline_asm_regions(&store, &mut infos);
 
@@ -15803,8 +15805,7 @@ pub fn peephole_optimize(asm: String) -> String {
     // passes shape the diamond (fusing the flag producer, folding prep)
     // that this pass needs to see.
     clock.mark("p21");
-    let hoisted =
-        else_hoist_diamonds(store.build_result_with_debug_rows(|i| infos[i].is_nop(), &debug_rows));
+    let hoisted = else_hoist_diamonds(store.build_result_with_debug_rows(|i| infos[i].is_nop()));
 
     // Phase 7 (terminal): cross-jump duplicate function epilogues.  Every
     // return site carries its own `addl/popl…/ret` copy; the 32 KiB setup
@@ -16954,7 +16955,7 @@ fn merge_duplicate_epilogues_terminal(asm: String) -> String {
     }
     let mut store = LineStore::new(asm.clone());
     let mut infos = classify_all(&store);
-    let debug_rows = hide_debug_rows(&store, &mut infos);
+    hide_debug_rows(&store, &mut infos);
     pin_inline_asm_regions(&store, &mut infos);
     if !merge_epilogue_tails_i686(&mut store, &mut infos) {
         // Return the caller's buffer untouched: rebuilding it here would make
@@ -16962,24 +16963,25 @@ fn merge_duplicate_epilogues_terminal(asm: String) -> String {
         // which is another pass's contract to keep.
         return asm;
     }
-    store.build_result_with_debug_rows(|i| infos[i].is_nop(), &debug_rows)
+    store.build_result_with_debug_rows(|i| infos[i].is_nop())
 }
 
-/// Hide every `-g` line row (`.loc`) from the passes by marking it deleted;
-/// `LineStore::build_result_with_debug_rows` re-emits each where it stood,
-/// so no window's adjacency assumption can make `-g` change the code (the
-/// x86-64 peephole does the same; see its `hide_debug_rows`).
-fn hide_debug_rows(store: &LineStore, infos: &mut [LineInfo]) -> Vec<bool> {
-    let mut rows = vec![false; infos.len()];
+/// Hide every `-g` metadata row (`.loc` and D6 inline-range endpoints) from
+/// the passes by marking it deleted; `LineStore::build_result_with_debug_rows`
+/// re-emits each where it stood, so no window's adjacency assumption can make
+/// `-g` change the code (the x86-64 peephole does the same; see its
+/// `hide_debug_rows`).
+fn hide_debug_rows(store: &LineStore, infos: &mut [LineInfo]) {
     for (i, info) in infos.iter_mut().enumerate() {
-        if info.kind == LineKind::Directive
-            && crate::backend::peephole_common::is_loc_directive(trimmed(store, info, i))
-        {
+        let text = trimmed(store, info, i);
+        let hidden = (info.kind == LineKind::Directive
+            && crate::backend::peephole_common::is_loc_directive(text))
+            || (info.kind == LineKind::Label
+                && crate::backend::peephole_common::is_inline_range_marker(text));
+        if hidden {
             info.kind = LineKind::Nop;
-            rows[i] = true;
         }
     }
-    rows
 }
 
 #[cfg(test)]

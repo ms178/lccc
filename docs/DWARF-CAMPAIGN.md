@@ -755,14 +755,26 @@ Implementation notes that kept the tree honest:
 * provenance is carried in lockstep with instructions (`take_parallel_debug`
   before draining a block, synthesized instructions intentionally carry none);
 * range endpoints are zero-width local assembler labels
-  (`.Llccc_inline_{b|e}_…`) referenced by `.debug_*` relocations. The peephole
-  law treats those markers as transparent so `-g` cannot change code by
-  blocking copy coalescing (the dwarf-quality `code_unchanged` sentinel);
+  (`.Llccc_inline_{b|e}_…`) referenced by `.debug_*` relocations.  Compiler-
+  emitted endpoints are hidden from every peephole phase exactly like `.loc`
+  rows and re-emitted in order before the next surviving instruction (trailing
+  endpoints survive too).  Rendering recognizes them by their current text,
+  not a pre-pass index bitmap, so a structural `insert_line` cannot drop or
+  misplace an endpoint; user `#APP` assembly stays opaque.  Thus `-g` cannot
+  change code by blocking copy coalescing, extension facts or CFI synthesis
+  (the dwarf-quality `code_unchanged` sentinel);
 * DWARF 2..4 `.debug_ranges` lists end with a pair of zero addresses, DWARF 5
   `.debug_rnglists` with the single `DW_RLE_end_of_list` byte; the wrong width
   made addr2line fail on `-ffunction-sections -gdwarf-2`;
 * abstract origins are published in `.debug_pubnames` when requested, matching
-  GCC's name set for fully inlined static helpers.
+  GCC's name set for fully inlined static helpers;
+* provenance is auxiliary metadata with a strict sparse-or-parallel invariant:
+  an empty id list is the sparse representation of concrete code,
+  `restore_phi_prefix` permutes ids exactly with spans, and the `BasicBlock`
+  edit primitives carry ids only when the pre-edit triple was parallel.  They
+  never pad, truncate or clear a drifted id array to hide a producer's defect;
+  the immutable pass-boundary verifier reports the first pass that broke the
+  pairing.
 
 Remaining tail (not claimed here): optimized parameter/local locations inside
 inline instances (D1b) and lexical blocks inside inline instances.

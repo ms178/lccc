@@ -478,6 +478,13 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
             continue;
         }
 
+        // D6 inline-range endpoints are zero-width debug metadata, not
+        // control-flow labels: register facts survive across them exactly as
+        // they survive across `.loc`.
+        if crate::backend::peephole_common::is_inline_range_marker(t) {
+            continue;
+        }
+
         // Labels FIRST, before the directive skip.
         //
         // PRE-EXISTING SOUNDNESS BUG: the directive test (`starts_with('.')`)

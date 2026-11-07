@@ -32,13 +32,16 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 # Strip only debug metadata.  A `.section .debug_*` block is skipped until the
-# next non-debug section directive; `.loc`, `.file` and the writer's
-# `.Llccc_debug_alias_*` absolute symbols are skipped line-wise.  Ordinary
-# `.set`, instructions, labels, CFI and data sections are preserved.
+# next non-debug section directive; `.loc`, `.file`, the writer's
+# `.Llccc_debug_alias_*` absolute symbols and D6 inline-range endpoint labels
+# are skipped line-wise.  Ordinary `.set`, instructions, labels, CFI and data
+# sections are preserved.  Endpoint labels emit no bytes; hiding them from the
+# peepholes is what keeps -g code identical, so the filter must ignore them too.
 strip_debug_rows() {
     awk '
         /^[[:space:]]*\.(loc|file)([[:space:]]|$)/ { next }
         /^[[:space:]]*\.set[[:space:]]+\.Llccc_debug_alias_/ { next }
+        /^[[:space:]]*\.Llccc_inline_[be]_[0-9]+_[0-9]+_[^[:space:]:]+:[[:space:]]*(#.*)?$/ { next }
         /^[[:space:]]*\.section[[:space:]]+\.debug_/ { indebug = 1; next }
         indebug {
             if ($0 ~ /^[[:space:]]*\.section[[:space:]]+/ && $0 !~ /^[[:space:]]*\.section[[:space:]]+\.debug_/) {
@@ -68,7 +71,9 @@ EOF
 	.text
 foo:
 	.loc	1 1 0
+.Llccc_inline_b_0_0_foo:
 	add	a0, a0, 1
+.Llccc_inline_e_0_0_foo:	# endpoint
 	ret
 	.section	.note.GNU-stack,"",@progbits
 	.set	.Llccc_debug_alias_1,.text+0
@@ -87,6 +92,13 @@ EOF
     strip_debug_rows "$d/changed.s" > "$d/c"
     if cmp -s "$d/a" "$d/c"; then
         echo "FAIL: debug-row filter self-test missed an instruction change" >&2
+        exit 1
+    fi
+    # A lookalike that is not an exact endpoint label must remain visible.
+    printf '.Llccc_inline_b_0_0_foo: nop\n' > "$d/lookalike.s"
+    strip_debug_rows "$d/lookalike.s" > "$d/lookalike.out"
+    if ! cmp -s "$d/lookalike.s" "$d/lookalike.out"; then
+        echo "FAIL: debug-row filter stripped a compound lookalike" >&2
         exit 1
     fi
 }

@@ -805,10 +805,11 @@ pub(super) fn fuse_late_compare_bool_spills(asm: &mut String) -> bool {
     super::pin_volatile_stack_slots(&store, &mut infos);
     super::pin_address_taken_stack_slots(&store, &mut infos);
     super::pin_param_abi_reads(&store, &mut infos);
+    super::hide_debug_rows(&store, &mut infos);
     if !fuse_compare_and_branch(&mut store, &mut infos) {
         return false;
     }
-    *asm = store.build_result(|i| infos[i].is_nop());
+    *asm = store.build_result_with_debug_rows(|i| infos[i].is_nop());
     true
 }
 

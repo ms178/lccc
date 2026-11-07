@@ -590,27 +590,30 @@ fn retire_dead_pure_writes(
     any
 }
 
-/// Hide every `-g` line row (`.loc`) from the passes by marking it deleted;
-/// `LineStore::build_result_with_debug_rows` puts each back where it stood.
+/// Hide every `-g` metadata row (`.loc` and D6 inline-range endpoints) from
+/// the passes by marking it deleted; `LineStore::build_result_with_debug_rows`
+/// puts each back where it stood.
 ///
-/// `.loc` emits no bytes, but a window that stops at it -- or only fuses
+/// These rows emit no bytes, but a window that stops at them -- or only fuses
 /// physically adjacent lines -- optimized `-g` code less: 36 of the 1162
 /// x86-64 regression sources compiled to different code with `-g` (a
 /// copy-coalesce `movl %eax, %r10d` / `op` split by a row, a dead spill a
-/// row kept alive). Teaching each of the hundreds of walkers the
-/// steppable-directive law would be a law every new pass must remember;
+/// row kept alive).  Inline endpoints are labels, so local adjacency
+/// transparency alone was not enough: memory-fold and copy windows still
+/// treated them as control-flow barriers.  Teaching each of the hundreds of
+/// walkers the steppable-row law would be a law every new pass must remember;
 /// hiding the rows makes the passes see the non-`-g` text by construction.
-fn hide_debug_rows(store: &LineStore, infos: &mut [LineInfo]) -> Vec<bool> {
-    let mut rows = vec![false; infos.len()];
+fn hide_debug_rows(store: &LineStore, infos: &mut [LineInfo]) {
     for (i, info) in infos.iter_mut().enumerate() {
-        if info.kind == LineKind::Directive
-            && crate::backend::peephole_common::is_loc_directive(info.trimmed(store.get(i)))
-        {
+        let text = info.trimmed(store.get(i));
+        let hidden = (info.kind == LineKind::Directive
+            && crate::backend::peephole_common::is_loc_directive(text))
+            || (info.kind == LineKind::Label
+                && crate::backend::peephole_common::is_inline_range_marker(text));
+        if hidden {
             mark_nop(info);
-            rows[i] = info.is_nop();
         }
     }
-    rows
 }
 
 fn peephole_optimize_inner(
@@ -675,7 +678,7 @@ fn peephole_optimize_inner(
     let mut infos: Vec<LineInfo> = (0..line_count)
         .map(|i| classify_line(store.get(i)))
         .collect();
-    let debug_rows = hide_debug_rows(&store, &mut infos);
+    hide_debug_rows(&store, &mut infos);
     pin_inline_asm_regions(&store, &mut infos);
     pin_volatile_access_regions(&store, &mut infos);
     pin_volatile_stack_slots(&store, &mut infos);
@@ -2461,9 +2464,9 @@ fn peephole_optimize_inner(
     // instructions — leaving windows that are now flag-neutral and safe to
     // strip. Same for redundant zero-extensions exposed by relay folding.
     if std::env::var("CCC_NO_PEEPHOLE_RERUN").is_ok() {
-        return store.build_result_with_debug_rows(|i| infos[i].is_nop(), &debug_rows);
+        return store.build_result_with_debug_rows(|i| infos[i].is_nop());
     }
-    let mut result = store.build_result_with_debug_rows(|i| infos[i].is_nop(), &debug_rows);
+    let mut result = store.build_result_with_debug_rows(|i| infos[i].is_nop());
     let _ = compare_branch::fuse_late_compare_bool_spills(&mut result);
     let _ = pushf_elim::eliminate_redundant_pushfq(&mut result);
     let _ = redundant_ext::eliminate_redundant_zero_extend(&mut result);
@@ -2512,7 +2515,11 @@ mod tests {
 
     fn code_of(asm: &str) -> String {
         asm.lines()
-            .filter(|l| !crate::backend::peephole_common::is_loc_directive(l.trim()))
+            .filter(|l| {
+                let t = l.trim();
+                !crate::backend::peephole_common::is_loc_directive(t)
+                    && !crate::backend::peephole_common::is_inline_range_marker(t)
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -2526,6 +2533,38 @@ mod tests {
         // A row whose lines were all deleted is superseded; some must stay.
         assert!(debug.contains(".loc 1 "), "rows were dropped:\n{debug}");
         plain
+    }
+
+    /// D6 endpoints must be invisible to the structured passes *and* to the
+    /// final text passes (redundant-extension / pushfq / late compare fusion).
+    /// A byte-extension fact interrupted by an endpoint label used to survive
+    /// only without `-g`, changing `movzbl` into `movl` under debug.
+    #[test]
+    fn inline_endpoints_are_transparent_to_every_peephole_phase() {
+        let body = [
+            "    movzbl %al, %eax",
+            "    movzbl %al, %edi",
+            "    movl %eax, %r10d",
+            "    movzbl %r10b, %r11d",
+            "    ret",
+        ];
+        let plain = peephole_optimize(in_function(&body));
+        let mut rows: Vec<&str> = Vec::new();
+        for line in body {
+            rows.push(".Llccc_inline_b_0_0_f:");
+            rows.push(line);
+            rows.push(".Llccc_inline_e_0_0_f:");
+        }
+        let debug = peephole_optimize(in_function(&rows));
+        assert_eq!(code_of(&debug), code_of(&plain), "-g changed the code");
+        assert!(
+            debug.contains(".Llccc_inline_b_0_0_f:"),
+            "begin endpoint dropped"
+        );
+        assert!(
+            debug.contains(".Llccc_inline_e_0_0_f:"),
+            "end endpoint dropped"
+        );
     }
 
     /// Dead-store elimination's window is 64 *live* lines: rows (or lines

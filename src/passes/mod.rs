@@ -885,6 +885,7 @@ pub(crate) fn restore_phi_prefix(block: &mut BasicBlock) -> bool {
     // have been observed to leave it desynchronised, so only touch it when the
     // lengths agree.
     let spans_valid = block.source_spans.len() == block.instructions.len();
+    let ids_valid = block.inline_ids_parallel();
 
     let n = block.instructions.len();
     let mut order: Vec<usize> = Vec::with_capacity(n);
@@ -901,6 +902,12 @@ pub(crate) fn restore_phi_prefix(block: &mut BasicBlock) -> bool {
     if spans_valid {
         let old_spans = std::mem::take(&mut block.source_spans);
         block.source_spans = order.iter().map(|&i| old_spans[i]).collect();
+    }
+    if ids_valid {
+        let old_ids = std::mem::take(&mut block.source_inline_ids);
+        block.source_inline_ids = order.iter().map(|&i| old_ids[i]).collect();
+    } else {
+        block.source_inline_ids.clear();
     }
     true
 }
