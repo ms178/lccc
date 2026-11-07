@@ -175,8 +175,10 @@ LEVELS = {
 # directions.  A caller and a callee that merely agree with each other pass
 # the single-unit fixtures above while disagreeing with every other compiler.
 INTEROP = ("psabi_pair_interop", "psabi_float_interop", "psabi_hfa_interop", "psabi_wide_interop",
-           "psabi_byref_interop", "abi_dirty_upper_interop")
+           "psabi_byref_interop", "abi_dirty_upper_interop", "atomic_interop")
 INTEROP_LEVELS = ("-O0", "-O2")
+# Atomic register-homing and lowering change across optimization levels.
+INTEROP_LEVELS_BY_FIXTURE = {"atomic_interop": ALL_LEVELS + ("-O3",)}
 CLANG_FREESTANDING = ("-O2", "-ffreestanding", "-fno-builtin", "-fno-pic", "-fno-pie",
                       "-fno-stack-protector", "-nostdlibinc")
 CONTROL_PASSES = {
@@ -371,6 +373,7 @@ def main():
             clang_flags = [target, *CLANG_FREESTANDING, *include]
             for fixture in (f for f in INTEROP if f in selected):
                 base = ROOT / "tests/regression/interop" / fixture
+                levels = INTEROP_LEVELS_BY_FIXTURE.get(fixture, INTEROP_LEVELS)
                 units = {}
                 for unit in ("callee", "caller"):
                     source = str(base) + f"_{unit}.c"
@@ -378,21 +381,26 @@ def main():
                     # Validates the fixture itself: Clang must accept it.
                     subprocess.run([args.clang, *clang_flags, "-c", source, "-o", str(units[unit, "clang"])],
                                    check=True, timeout=30)
-                    for level in INTEROP_LEVELS:
+                    for level in levels:
                         units[unit, level] = work / f"{unit}-lccc{level}.o"
                         units[unit, level].unlink(missing_ok=True)
                         subprocess.run([str(args.lccc_dir / driver), level, *include, "-c", source,
                                         "-o", str(units[unit, level])], timeout=30)
-                for level in INTEROP_LEVELS:
-                    for callee, caller in (((level), (level)), ((level), "clang"), ("clang", (level))):
-                        exe = work / "interop"
-                        label = f"callee={'clang' if callee == 'clang' else 'lccc' + callee} " \
-                                f"caller={'clang' if caller == 'clang' else 'lccc' + caller}"
-                        steps = [[*linker, "-m", emulation, "-static", "-e", "_start", str(startup),
-                                  str(units["callee", callee]), str(units["caller", caller]),
-                                  "-o", str(exe)],
-                                 [str(args.qemu_dir / f"qemu-{arch}"), str(exe)]]
-                        count += attempt(f"{arch} {fixture} {label}", steps)
+                # Validate the fixture itself with the reference on both sides;
+                # cross combinations alone cannot distinguish a bad expected
+                # result from an LCCC bug.
+                pairs = [("clang", "clang")]
+                pairs.extend(pair for level in levels for pair in
+                             ((level, level), (level, "clang"), ("clang", level)))
+                for callee, caller in pairs:
+                    exe = work / "interop"
+                    label = f"callee={'clang' if callee == 'clang' else 'lccc' + callee} " \
+                            f"caller={'clang' if caller == 'clang' else 'lccc' + caller}"
+                    steps = [[*linker, "-m", emulation, "-static", "-e", "_start", str(startup),
+                              str(units["callee", callee]), str(units["caller", caller]),
+                              "-o", str(exe)],
+                             [str(args.qemu_dir / f"qemu-{arch}"), str(exe)]]
+                    count += attempt(f"{arch} {fixture} {label}", steps)
     if failures:
         print(f"{len(failures)} cross-target execution contract(s) FAILED, {count} passed:")
         for failure in failures:
