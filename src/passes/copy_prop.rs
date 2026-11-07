@@ -37,37 +37,41 @@ fn memcpy_folds_into_intrinsic(op: &IntrinsicOp, size: usize, index: usize) -> b
         && super::vector_temp_promotion::pointer_vector_arg_width(*op, index) == Some(size)
 }
 
-/// Direct, nonvolatile alloca values with exactly one definition. After phi
-/// lowering a Value may be redefined; merely seeing an earlier Alloca with
-/// that number is not proof that a later pointer still names its stack slot.
-pub(super) fn unique_nonvolatile_allocas(func: &IrFunction) -> FxHashSet<u32> {
+/// Values whose single definition cannot be established, including the
+/// ambiguous memory-home/SSA-definition output slots of inline asm.
+fn nonunique_values(func: &IrFunction) -> FxHashSet<u32> {
     let mut seen = FxHashSet::default();
     let mut repeated = FxHashSet::default();
-    let mut allocas = FxHashSet::default();
     for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
         if let Some(dest) = inst.dest() {
             if !seen.insert(dest.0) {
                 repeated.insert(dest.0);
             }
-            if matches!(
-                inst,
-                Instruction::Alloca {
-                    semantic_volatile: false,
-                    ..
-                }
-            ) {
-                allocas.insert(dest.0);
-            }
         }
-        // An asm output can name a memory home or an SSA definition after
-        // promotion, but dest() cannot express its multiple outputs. Without
-        // disambiguating those forms, neither proves a unique alloca value.
         if let Instruction::InlineAsm { outputs, .. } = inst {
             repeated.extend(outputs.iter().map(|(_, value, _)| value.0));
         }
     }
-    allocas.retain(|v| !repeated.contains(v));
-    allocas
+    repeated
+}
+
+/// Direct, nonvolatile alloca values with exactly one definition. After phi
+/// lowering a Value may be redefined; merely seeing an earlier Alloca with
+/// that number is not proof that a later pointer still names its stack slot.
+pub(super) fn unique_nonvolatile_allocas(func: &IrFunction) -> FxHashSet<u32> {
+    let repeated = nonunique_values(func);
+    func.blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .filter_map(|inst| match inst {
+            Instruction::Alloca {
+                dest,
+                semantic_volatile: false,
+                ..
+            } if !repeated.contains(&dest.0) => Some(dest.0),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Forward a purely intermediate memcpy source:
@@ -232,10 +236,7 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
                     }
                     _ => {}
                 }
-                block.instructions.remove(i);
-                if block.source_spans.len() > i {
-                    block.source_spans.remove(i);
-                }
+                block.remove_inst(i);
                 total += 1;
             }
         }
@@ -252,6 +253,10 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
         if func.is_declaration {
             continue;
         }
+        // The rewrite only adds fresh GEP definitions and removes memcpys, so
+        // these whole-function facts remain valid across its restart loop.
+        let allocas = unique_nonvolatile_allocas(func);
+        let nonunique = nonunique_values(func);
         'restart: loop {
             for block_idx in 0..func.blocks.len() {
                 for copy_idx in 0..func.blocks[block_idx].instructions.len() {
@@ -261,6 +266,8 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
                     };
                     if size < 128
                         || dest == src
+                        || !allocas.contains(&dest.0)
+                        || !allocas.contains(&src.0)
                         || !is_local_alloca(func, dest)
                         || !is_local_alloca(func, src)
                     {
@@ -268,6 +275,11 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
                     }
 
                     let dest_derived = collect_derived_pointers(func, dest);
+                    // A redefined GEP value need not still point into dest at
+                    // the load, even if one of its definitions does.
+                    if dest_derived.iter().any(|v| nonunique.contains(v)) {
+                        continue;
+                    }
                     let mut loads = Vec::with_capacity(16);
                     let mut safe = true;
                     for (bi, block) in func.blocks.iter().enumerate() {
@@ -285,12 +297,16 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
                             match inst {
                                 Instruction::GetElementPtr { base, .. }
                                     if dest_derived.contains(&base.0) => {}
-                                Instruction::Load { ptr, .. }
-                                    if dest_derived.contains(&ptr.0)
-                                        && bi == block_idx
-                                        && ii > copy_idx =>
+                                Instruction::Load {
+                                    ptr,
+                                    ty,
+                                    volatile: false,
+                                    ..
+                                } if dest_derived.contains(&ptr.0)
+                                    && bi == block_idx
+                                    && ii > copy_idx =>
                                 {
-                                    loads.push((bi, ii, *ptr));
+                                    loads.push((bi, ii, *ptr, *ty));
                                 }
                                 _ => {
                                     safe = false;
@@ -317,17 +333,16 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
 
                     // No source write, call, or opaque operation may occur
                     // between the copy and any forwarded load on this path.
-                    for &(_, load_idx, _) in &loads {
+                    for &(_, load_idx, _, _) in &loads {
                         for inst in &func.blocks[block_idx].instructions[copy_idx + 1..load_idx] {
-                            if matches!(
-                                inst,
-                                Instruction::Store { .. }
-                                    | Instruction::Memcpy { .. }
-                                    | Instruction::Call { .. }
-                                    | Instruction::CallIndirect { .. }
-                                    | Instruction::InlineAsm { .. }
-                                    | Instruction::Intrinsic { .. }
-                            ) {
+                            if inst.may_write_memory()
+                                || matches!(
+                                    inst,
+                                    Instruction::Fence { .. }
+                                        | Instruction::AtomicLoad { .. }
+                                        | Instruction::Load { volatile: true, .. }
+                                )
+                            {
                                 safe = false;
                                 break;
                             }
@@ -379,11 +394,27 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
                         }
                     };
                     let mut resolved = Vec::with_capacity(loads.len());
-                    for &(bi, ii, ptr) in &loads {
+                    for &(bi, ii, ptr, load_ty) in &loads {
                         let Some((offset, ty)) = resolve(ptr) else {
                             safe = false;
                             break;
                         };
+                        // The original load reads the destination object. It
+                        // may be replaced only when every possibly accessed
+                        // byte was copied from the corresponding source byte.
+                        let in_range = usize::try_from(offset)
+                            .ok()
+                            .zip(load_ty.access_extent())
+                            .and_then(|(start, (_, width))| {
+                                usize::try_from(width)
+                                    .ok()
+                                    .and_then(|width| start.checked_add(width))
+                            })
+                            .is_some_and(|end| end <= size);
+                        if !in_range {
+                            safe = false;
+                            break;
+                        }
                         resolved.push((bi, ii, offset, ty));
                     }
                     if !safe {
@@ -401,27 +432,16 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
                             offset: Operand::Const(IrConst::I64(offset)),
                             ty,
                         };
-                        func.blocks[block_idx].instructions.insert(load_idx, gep);
-                        if func.blocks[block_idx].source_spans.len() >= load_idx {
-                            func.blocks[block_idx]
-                                .source_spans
-                                .insert(load_idx, crate::common::source::Span::dummy());
-                        }
-                        // The load shifted by one; locate the first load at or
-                        // after the insertion point with the old destination-rooted ptr.
-                        for inst in &mut func.blocks[block_idx].instructions[load_idx + 1..] {
-                            if let Instruction::Load { ptr, .. } = inst {
-                                if dest_derived.contains(&ptr.0) {
-                                    *ptr = new_ptr;
-                                    break;
-                                }
-                            }
+                        let block = &mut func.blocks[block_idx];
+                        block.insert_inst(load_idx, gep, crate::common::source::Span::dummy());
+                        // This is the exact load validated above, shifted by the
+                        // one insertion; do not search for a different load.
+                        if let Instruction::Load { ptr, .. } = &mut block.instructions[load_idx + 1]
+                        {
+                            *ptr = new_ptr;
                         }
                     }
-                    func.blocks[block_idx].instructions.remove(copy_idx);
-                    if func.blocks[block_idx].source_spans.len() > copy_idx {
-                        func.blocks[block_idx].source_spans.remove(copy_idx);
-                    }
+                    func.blocks[block_idx].remove_inst(copy_idx);
                     total += 1;
                     continue 'restart;
                 }
@@ -2618,6 +2638,118 @@ mod snapshot_forwarding_contract {
             ty: IrType::I64,
             seg_override: AddressSpace::Default,
             volatile: false,
+        }
+    }
+
+    fn large_load_module(between: Vec<Instruction>, load_ptr: u32, volatile: bool) -> IrModule {
+        let mut f = IrFunction::new("large_snapshot".into(), IrType::I32, vec![], false);
+        f.next_value_id = 20;
+        let mut instructions: Vec<_> = (0..2)
+            .map(|v| Instruction::Alloca {
+                dest: Value(v),
+                ty: IrType::Ptr,
+                size: 128,
+                align: 8,
+                volatile: false,
+                semantic_volatile: false,
+            })
+            .collect();
+        instructions.push(Instruction::Memcpy {
+            dest: Value(1),
+            src: Value(0),
+            size: 128,
+        });
+        instructions.extend(between);
+        instructions.push(Instruction::Load {
+            dest: Value(3),
+            ptr: Value(load_ptr),
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile,
+        });
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: vec![],
+        });
+        let mut m = IrModule::new();
+        m.functions.push(f);
+        m
+    }
+
+    #[test]
+    fn large_snapshot_forwarding_requires_stable_in_bounds_nonvolatile_inputs() {
+        use crate::ir::reexports::AtomicOrdering;
+        let gep = |offset| Instruction::GetElementPtr {
+            dest: Value(4),
+            base: Value(1),
+            offset: Operand::Const(IrConst::I64(offset)),
+            ty: IrType::U8,
+        };
+        let mut safe = large_load_module(vec![gep(124)], 4, false);
+        assert_eq!(forward_large_memcpy_loads(&mut safe), 1);
+        assert!(copies(&safe).is_empty());
+        let mut cases = vec![
+            large_load_module(
+                vec![Instruction::AtomicStore {
+                    ptr: Operand::Value(Value(0)),
+                    val: Operand::Const(IrConst::I32(2)),
+                    ty: IrType::I32,
+                    ordering: AtomicOrdering::Relaxed,
+                }],
+                1,
+                false,
+            ),
+            large_load_module(
+                vec![Instruction::Fence {
+                    ordering: AtomicOrdering::SeqCst,
+                }],
+                1,
+                false,
+            ),
+            large_load_module(vec![], 1, true),
+            large_load_module(vec![], 1, false),
+            large_load_module(vec![], 1, false),
+            large_load_module(
+                vec![Instruction::AtomicLoad {
+                    dest: Value(5),
+                    ptr: Operand::Value(Value(0)),
+                    ty: IrType::I32,
+                    ordering: AtomicOrdering::Acquire,
+                }],
+                1,
+                false,
+            ),
+            large_load_module(vec![gep(-1)], 4, false),
+            large_load_module(vec![gep(125)], 4, false),
+            large_load_module(
+                vec![
+                    gep(0),
+                    Instruction::Copy {
+                        dest: Value(4),
+                        src: Operand::Value(Value(0)),
+                    },
+                ],
+                4,
+                false,
+            ),
+        ];
+        if let Instruction::Alloca {
+            semantic_volatile, ..
+        } = &mut cases[3].functions[0].blocks[0].instructions[0]
+        {
+            *semantic_volatile = true;
+        }
+        if let Instruction::Alloca {
+            semantic_volatile, ..
+        } = &mut cases[4].functions[0].blocks[0].instructions[1]
+        {
+            *semantic_volatile = true;
+        }
+        for (i, m) in cases.iter_mut().enumerate() {
+            assert_eq!(forward_large_memcpy_loads(m), 0, "case {i}");
+            assert_eq!(copies(m).len(), 1, "case {i}");
         }
     }
 
