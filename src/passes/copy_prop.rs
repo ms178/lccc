@@ -2208,6 +2208,9 @@ mod tests {
             instructions: insts,
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            // Untracked fixture: no inline provenance (sparse-empty is the
+            // canonical spelling, not an all-NO_INLINE_INSTANCE array).
+            source_inline_ids: Vec::new(),
         });
         func
     }

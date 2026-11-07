@@ -3291,6 +3291,13 @@ jobs:
         # and byte-exact UTF-8 template text on all four targets.
         python3 tests/regression/check_debug_acceptance_parity.py --self-test
         python3 tests/regression/check_debug_acceptance_parity.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv --gcc gcc-16 --json target/debug-acceptance-parity.json
+        # Inline-asm dialect alternatives: GCC gates brace processing on
+        # ASSEMBLER_DIALECT (i386 only) AND on extended asm (ASM_OPERANDS vs
+        # ASM_INPUT). Measured to agree with BOTH GCC 16.2 and Clang 23.1.5.
+        # Pins pipeless `mov{l}`, `%{`/`%}` escapes, basic-asm passthrough, and
+        # literal AArch64/RISC-V register lists.
+        python3 tests/regression/check_asm_dialect_alternatives.py --self-test
+        python3 tests/regression/check_asm_dialect_alternatives.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv --gcc gcc-16 --clang clang-23 --json target/asm-dialect-alternatives.json
         bash tests/regression/check_gla_backedge_no_trampoline.sh
         python3 scripts/edg_changes_mine.py verify-artifacts
         python3 tests/regression/check_count_observations.py --clang "${CLANG:-clang-23}"

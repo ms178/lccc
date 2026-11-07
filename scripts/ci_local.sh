@@ -1204,6 +1204,17 @@ gate "debug-acceptance-parity" fast \
         --lccc-riscv target/fastbuild/lccc-riscv \
         --gcc "${GCC16:-gcc-16}" \
         --json target/debug-acceptance-parity.json
+# Dialect alternatives are gated on the target having assembler dialects AND
+# on the statement being extended asm; GCC 16.2 and Clang 23.1.5 agree.
+gate "asm-dialect-alternatives-selftest" fast \
+    python3 tests/regression/check_asm_dialect_alternatives.py --self-test
+gate "asm-dialect-alternatives" fast \
+    python3 tests/regression/check_asm_dialect_alternatives.py \
+        --lccc "$LCCC" --lccc-i686 target/fastbuild/lccc-i686 \
+        --lccc-arm target/fastbuild/lccc-arm \
+        --lccc-riscv target/fastbuild/lccc-riscv \
+        --gcc "${GCC16:-gcc-16}" --clang "${CLANG:-clang-23}" \
+        --json target/asm-dialect-alternatives.json
 # RVC: .text and relocations byte-identical to GNU as on RV64 and RV32
 # (spelling-based compression, branch relaxation, `li`); SKIP without
 # riscv64 binutils.

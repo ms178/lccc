@@ -1,112 +1,126 @@
-# FOLLOWUP 2026-11-07 — inline-asm dialect braces: a measured GCC divergence
+# RESOLVED 2026-11-07 — inline-asm dialect braces: one rule, one implementation
 
-**Status:** open, pre-existing, out of scope for the D6 `-S -g` acceptance work.
-**Found while:** making `expand_dialect_alternatives` allocation-free (one buffer
-and one `&str` memcpy per run instead of a `Vec<char>` plus a `String` per brace
-group). That rewrite is *equivalence-proved* against the previous implementation
-by a 20 000-case deterministic corpus (`dialect_equivalence_tests`), so it
-changed no behaviour — including the behaviour described here.
+**Status:** fixed, gated, and measured against **both** GCC 16.2 and Clang
+23.1.5. This file started as an open follow-up; the item is now closed. It is
+kept because the investigation corrected two plausible-but-wrong conclusions,
+and the reasoning is worth more than the diff.
 
-## The rule GCC 16.2 actually implements
+## The defect was bigger than the symptom
 
-Measured with `gcc-16 (GCC) 16.2.0`, x86-64, `-O2 -S`, default `-masm=att`.
-Whether braces are processed at all depends on how the statement is lowered:
+The visible symptom was that `mov{l}` behaved differently from GCC. The actual
+root cause was **two independent implementations of the same GCC rule**, in
+different layers, with different semantics:
 
-| statement shape | GCC lowering | `{...}` processing |
+| layer | file | behaviour |
 | --- | --- | --- |
-| no operands, no clobbers | `ASM_INPUT` | **none** — the template is emitted verbatim |
-| has operands **or** clobbers | `ASM_OPERANDS` → `output_asm_insn` | braces are **always** removed and the **first** alternative is kept |
+| shared emission | `backend/inline_asm.rs::expand_dialect_alternatives` | strip braces only when a depth-1 `\|` exists; otherwise preserve |
+| x86 operand substitution | `backend/x86_common.rs::resolve_dialect_alternatives` | strip braces **always**, ignore `%{`/`%}` |
 
-Repro (`dialect4.c`), which isolates the trigger:
+The second ran *after* the first, on every line, for x86-64 and i686. So the
+shared pass's decision was irrelevant on those targets, and the net behaviour
+was "always strip, no escapes". Measured consequences:
+
+* `__asm__("mov{l} %eax, %ebx")` — **basic** asm — was expanded to `movl`. GCC
+  emits basic asm verbatim.
+* `__asm__("nop # %{lit%}" : : "r"(a))` lost its escaped braces: the shared pass
+  turned `%{`/`%}` into `{`/`}`, then the second pass stripped them. GCC emits
+  `nop # {lit}`.
+* On AArch64/RISC-V the shared pass *did* strip `{a|b}`, destroying constructs
+  where braces are literal.
+
+**Fix:** delete `resolve_dialect_alternatives` entirely and make the shared
+pass authoritative. One rule, one implementation, applied once to the whole
+template before it is split into lines. `substitution_layering_tests` in
+`x86_common.rs` now fails if a brace-touching pass is ever reintroduced at that
+layer. Deleting the duplicate also removes a `Vec<char>` (4 bytes per input
+byte) plus a `String` allocation per brace-carrying asm line.
+
+## The rule, from GCC's source, not from inference
+
+`gcc/final.cc::output_asm_insn` (fetched from the GCC 16 release branch):
 
 ```c
-void g(void) {
-  __asm__ ("A nop {solo}");                    /* -> A nop {solo}   */
-  __asm__ volatile ("B nop {solo}");           /* -> B nop {solo}   */
-  __asm__ ("C nop {solo}" ::: "memory");       /* -> C nop solo     */
-  __asm__ volatile ("D nop {solo}" ::: "memory"); /* -> D nop solo  */
-  __asm__ ("E nop {a|b}");                     /* -> E nop {a|b}    */
-  __asm__ ("F nop {a|b}" ::: "memory");        /* -> F nop a        */
-}
+#ifdef ASSEMBLER_DIALECT
+      case '{':
+      case '}':
+      case '|':
+        p = do_assembler_dialects (p, &dialect);
+        break;
+#endif
 ```
 
-`volatile` is irrelevant; a clobber list alone is enough to switch paths. With
-operands present the removal is unconditional, including in places where the
-braces look structural:
+Two independent gates follow from this and from how asm is lowered:
 
-```c
-long g(long a) {
-  long r = a;
-  __asm__ ("mov{l} %1, %0"                 : "=r"(r) : "r"(a)); /* movl  %rdi, %rax */
-  __asm__ ("xchg{l|} %1, %0"               : "=r"(r) : "r"(a)); /* xchgl %rdi, %rax */
-  __asm__ ("nop {|} %0"                    : : "r"(a));         /* nop  %rdi        */
-  __asm__ ("# c {x|y} %0"                  : : "r"(a));         /* # c x %rdi       */
-  __asm__ ("vaddps {rn-sae}, %%zmm1, %%zmm2, %0" : : "r"(a));   /* vaddps rn-sae, … */
-  __asm__ ("ld1 {v0.4s}, [%0]"             : : "r"(a));         /* ld1 v0.4s, [%rdi]*/
-  __asm__ ("nop {solo}"                    : : "r"(a));         /* nop solo         */
-  return r;
-}
-```
+1. **Target.** `ASSEMBLER_DIALECT` is defined only by i386
+   (`#define ASSEMBLER_DIALECT (ix86_asm_dialect)` in `gcc/config/i386/i386.h`).
+   `gcc/config/aarch64/aarch64.h` and `gcc/config/riscv/riscv.h` contain **zero**
+   occurrences. On those targets `{`, `}` and `|` are ordinary characters —
+   which is exactly what makes `ld1 {v0.4s}, [x0]` work, and why GCC's own
+   AArch64 backend can emit register lists without escaping them.
+2. **Statement shape.** Operands, clobbers **or** goto labels lower to
+   `ASM_OPERANDS` and run through `output_asm_insn`. None of those lowers to
+   `ASM_INPUT`, which is emitted verbatim. `volatile` is irrelevant.
 
-Two consequences worth stating plainly, because they are easy to disbelieve:
+`do_assembler_dialects` is a **flat** state machine, not a recursive one: a `{`
+inside a group is a hard error ("nested assembly dialect alternatives") and a
+group without `}` is another ("unterminated assembly dialect alternative").
+With `dialect_number == 0` (AT&T) the first alternative is kept.
 
-* `#` does **not** protect braces. `# c {x|y} %0` becomes `# c x %rdi`. (A `#`
-  comment in a *no-operand* template is verbatim only because the whole template
-  is verbatim on that path.)
-* AVX-512 decorators and NEON register lists are **not** special-cased. GCC
-  strips `{rn-sae}` and `{v0.4s}` too; a user who wants literal braces must write
-  `%{` and `%}`, which is the documented escape.
+LCCC now implements that machine exactly. For the two malformed shapes it
+returns the template untouched, because the backend owns no diagnostic channel
+and fabricating half-expanded text would be worse than letting the assembler
+produce the error.
 
-## What LCCC does today
+## Two wrong conclusions this investigation corrected
 
-`src/backend/inline_asm.rs::expand_dialect_alternatives` is target-independent
-and operand-count-independent:
+**(1) "Clang disagrees with GCC."** It does not. The first measurement showed
+Clang rejecting `mov{l} %1, %0`, which looked like Clang preserving braces.
+It was actually Clang's integrated assembler rejecting `movl %rax, %rsi` — a
+32-bit mnemonic with 64-bit registers. Clang validates asm text even for `-S`;
+GCC does not. Re-measured with templates that are real instructions after
+expansion:
 
-* a group with a depth-1 `|` → first alternative, braces dropped (**agrees**);
-* a group with no `|` → braces and content preserved (**differs**);
-* the expansion runs even for a no-operand, no-clobber statement (**differs**).
-
-So, with operands:
-
-| template | GCC 16.2 | LCCC today | verdict |
+| target | shape | GCC 16.2 | Clang 23.1.5 |
 | --- | --- | --- | --- |
-| `mov{l} %1, %0` | `movl …` | `mov{l} …` | LCCC output does not assemble |
-| `ld1 {v0.4s}, [%0]` | `ld1 v0.4s, …` | `ld1 {v0.4s}, …` | LCCC is lenient, GCC is not |
-| `nop {a\|b}` (no operands/clobbers) | `nop {a\|b}` | `nop a` | LCCC expands where GCC does not |
+| x86-64 | extended `mov{l} %%eax, %%ebx` | `movl %eax, %ebx` | `movl %eax, %ebx` |
+| x86-64 | extended `no{p\|q}` | `nop` | `nop` |
+| x86-64 | extended `nop{\|}`, `nop{}` | `nop` | `nop` |
+| x86-64 | basic `mov{l} %eax, %ebx` | verbatim | verbatim (then as rejects it) |
+| aarch64 | extended `ld1 {v0.4s}, [x0]` | literal (no dialect) | `ld1 { v0.4s }, [x0]` |
+| aarch64 | extended `no{p\|q}` | literal → invalid | literal → **error** |
 
-`mov{l}` / `pushf{l|d}` / `pop{l}` are common idioms in kernel and libc sources,
-so the first row is the one with practical cost. The second row means LCCC
-currently accepts templates GCC rejects; tightening it is a deliberate
-compatibility decision, not a free win.
+They agree on every row. LCCC now matches both, which is a stronger result
+than picking a winner.
 
-## Why this was not fixed in the D6 PR
+**(2) "Pipeless braces must be preserved for NEON."** Only on targets without
+assembler dialects. On x86, GCC strips `{v0.4s}` too, and documents `%{`/`%}`
+as the way to write a literal brace. Preserving them everywhere was not
+"leniency", it was the wrong rule on x86 and the right rule on AArch64, applied
+uniformly.
 
-The D6 work is about `-S -g` acceptance parity and inline-instance provenance.
-Changing brace semantics touches every inline-asm template on all four targets,
-needs to become operand/clobber-aware at three call sites
-(`inline_asm.rs:792`, `:811`, `:913`), and needs its own oracle matrix
-(4 targets × {no operands, operands, clobbers only} × {pipe, no pipe, escaped}).
-Folding that into a debug-info PR would make both harder to review and to
-bisect. Nothing in `tests/` relies on the lenient behaviour today (checked), so
-the fix is not blocked by corpus debt.
+## Gates
 
-## Suggested plan
-
-1. Thread `has_operands_or_clobbers` into the expansion; return
-   `Cow::Borrowed(template)` when false, matching `ASM_INPUT`.
-2. When true, always drop the braces and keep the first alternative — including
-   the pipeless case — and keep honouring `%{` / `%}`.
-3. Gate it with a GCC-oracle table over the shapes above on all four targets,
-   plus the escaped-brace forms, and update
-   `dialect_equivalence_tests::a_pipeless_brace_group_is_preserved_today`
-   (deliberately labelled a characterization test) in the same commit.
-4. Re-run `check_debug_acceptance_parity.py` and `check_inline_asm_utf8.py`:
-   both compile templates with operands, so both see the new path.
+* `src/backend/inline_asm.rs::dialect_alternative_tests` — 8 tests: the
+  GCC-measured shape table, basic-asm passthrough, all three single-dialect
+  targets, malformed passthrough, `%%` layering, multi-byte safety, and a
+  **40 000-case** deterministic corpus comparing the byte-slice production
+  implementation against an independent char-at-a-time transcription of GCC's
+  algorithm.
+* `src/backend/x86_common.rs::substitution_layering_tests` — braces must reach
+  the substitutor's output untouched; `%%` and multi-byte text must still be
+  handled there.
+* `tests/regression/check_asm_dialect_alternatives.py` — 15 x86 shapes on
+  x86-64 **and** i686 against GCC 16.2 and Clang 23.1.5, 3 AArch64 shapes
+  against Clang cross, 3 RISC-V text-fidelity rows. RISC-V has no instruction
+  whose syntax contains braces, so no oracle can accept such a template there;
+  those rows are reported as rule-only rather than silently skipped.
+  `--self-test` covers fence extraction for GCC's `#APP` and Clang's `//APP`.
+  Wired into `ci.yml` (shard b) and `scripts/ci_local.sh`.
 
 ## Pointers
 
-* `src/backend/inline_asm.rs` — `expand_dialect_alternatives`,
-  `dialect_equivalence_tests` (equivalence corpus + characterization).
-* `tests/regression/check_debug_acceptance_parity.py` — the four-target
-  inline-asm acceptance/UTF-8/`%=` matrix this was found next to.
-* `docs/DWARF-CAMPAIGN.md` §D7 — why `-S -g` assembles the text at all.
+* `src/common/types.rs::target_has_assembler_dialects` — the target gate, with
+  the GCC source citation.
+* `src/backend/inline_asm.rs::expand_dialect_alternatives` — the one rule.
+* `docs/DWARF-CAMPAIGN.md` §D7a — the neighbouring `-S -g` acceptance work that
+  surfaced this.

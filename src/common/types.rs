@@ -210,6 +210,21 @@ pub fn target_arch_name() -> &'static str {
 pub fn target_elf_machine() -> u16 {
     TARGET_ELF_MACHINE.with(|c| c.get())
 }
+/// Whether the target's assembler has more than one dialect, i.e. whether
+/// `{att|intel}` alternatives in an inline-asm template mean anything.
+///
+/// This mirrors GCC exactly: `gcc/final.cc::output_asm_insn` handles `{`, `}`
+/// and `|` only under `#ifdef ASSEMBLER_DIALECT`, and the only in-tree target
+/// that defines it is i386 (`#define ASSEMBLER_DIALECT (ix86_asm_dialect)`).
+/// `gcc/config/aarch64/aarch64.h` and `gcc/config/riscv/riscv.h` define no
+/// dialect, so there those three characters are ordinary text -- which is
+/// precisely what makes `ld1 {v0.4s}, [%0]` and AVX-512-free brace syntax work
+/// on AArch64.  Treating braces as a dialect group on every target (as LCCC
+/// used to) silently destroyed AArch64/RISC-V register lists.
+pub fn target_has_assembler_dialects() -> bool {
+    // EM_386 (i686) and EM_X86_64 are the two dialect-carrying machines.
+    matches!(target_elf_machine(), 3 | 62)
+}
 
 /// Set whether the target uses IEEE binary128 for long double (AArch64/RISC-V).
 pub fn set_target_long_double_is_f128(is_f128: bool) {

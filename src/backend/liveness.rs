@@ -1065,6 +1065,7 @@ pub(crate) fn instruction_is_call_point(inst: &Instruction) -> bool {
                     .map(|(c, ..)| c.as_str())
                     .chain(inputs.iter().map(|(c, ..)| c.as_str())),
                 !goto_labels.is_empty(),
+                !clobbers.is_empty(),
             );
             !inert
                 && (!outputs.is_empty()

@@ -68,6 +68,9 @@ fn block(insts: Vec<Instruction>, terminator: Terminator, spans: bool) -> BasicB
         instructions: insts,
         terminator,
         source_spans,
+        // These fixtures model concrete (non-inlined) code, so provenance
+        // stays sparse-empty rather than a parallel array of sentinels.
+        source_inline_ids: Vec::new(),
     }
 }
 
@@ -527,6 +530,7 @@ fn a_write_in_a_different_block_is_refused() {
         ],
         terminator: Terminator::Return(None),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     });
     f.next_value_id = image.next + 1;
     assert_eq!(run_function(&mut f), 0);
