@@ -905,7 +905,9 @@ pub fn verify_after_func_pass(func: &IrFunction, stage: &str) {
 /// Pass-loop hook: a no-op unless `CCC_VERIFY_IR` is set.
 ///
 /// Deliberately checks the env var *before* touching the module so the
-/// disabled path costs one `getenv` per pass and allocates nothing.
+/// disabled path costs one `getenv` per pass and allocates nothing.  The hook
+/// is immutable: it reports the pass that broke an invariant instead of
+/// repairing auxiliary metadata and hiding the producer's defect.
 pub fn verify_after_pass(module: &IrModule, stage: &str) {
     let m = mode();
     if m == Mode::Off {

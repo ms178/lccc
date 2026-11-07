@@ -362,7 +362,7 @@ fn materialized_stack_adjustments(
         // A local label starts with '.' as well, so the branch-target test has to
         // come FIRST: crossing a label would let a constant observed on the
         // fallthrough path be applied to a block reached from elsewhere.
-        if t.ends_with(':') {
+        if t.ends_with(':') && !crate::backend::peephole_common::is_inline_range_marker(t) {
             prev = None;
             marker = None;
             continue;
@@ -1114,7 +1114,10 @@ pub(crate) fn synthesize(
             }
         }
         sections.apply(t);
-        if let Some(l) = t.strip_suffix(':') {
+        if crate::backend::peephole_common::is_inline_range_marker(t) {
+            // Zero-width debug metadata: neither a function label nor an
+            // instruction that ends the label's reach.
+        } else if let Some(l) = t.strip_suffix(':') {
             prev_label = Some(l);
         } else if !t.is_empty() {
             prev_label = None;
@@ -1325,6 +1328,7 @@ fn synthesize_function<'b>(
         .iter()
         .enumerate()
         .filter(|(k, _)| ctx[*k].in_fn && !ctx[*k].app)
+        .filter(|(_, l)| !crate::backend::peephole_common::is_inline_range_marker(l.trim()))
         .filter_map(|(_, l)| l.trim().strip_suffix(':'))
         .collect();
     let label_set: FxHashSet<&str> = labels.iter().copied().collect();
@@ -1358,6 +1362,9 @@ fn synthesize_function<'b>(
                             }
                         }
                     }
+                    continue;
+                }
+                if crate::backend::peephole_common::is_inline_range_marker(t) {
                     continue;
                 }
                 if let Some(lbl) = t.strip_suffix(':') {
@@ -1511,6 +1518,9 @@ fn synthesize_function<'b>(
                     cur = Some(f);
                 }
             }
+            continue;
+        }
+        if crate::backend::peephole_common::is_inline_range_marker(t) {
             continue;
         }
         if let Some(lbl) = t.strip_suffix(':') {

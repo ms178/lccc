@@ -777,13 +777,22 @@ fn check(shape: Shape, acc_ty: IrType, iv_ty: IrType, limit: Limit, seed: i64, a
         transform_byte_count_reduction(&mut rewritten, &pattern) > 0,
         "{ctx}: no rewrite"
     );
-    // Codegen reads line info by instruction index: every pre-existing
-    // block's span table stays in step; new blocks carry none or a full one.
+    // Codegen reads line info by instruction index: every block's span
+    // table is either absent or parallel.  Synthesized blocks may remain
+    // untracked rather than materializing a table of dummy spans; an empty
+    // table and an all-dummy table both emit no `.loc` of their own.  Inline
+    // ids obey the same sparse-or-parallel invariant.
     for (bi, b) in rewritten.blocks.iter().enumerate() {
         assert!(
-            b.source_spans.len() == b.instructions.len()
-                || (bi >= original.blocks.len() && b.source_spans.is_empty()),
+            b.source_spans.is_empty() || b.spans_parallel(),
             "{ctx}: block {bi} span table out of step ({} spans, {} instructions)",
+            b.source_spans.len(),
+            b.instructions.len()
+        );
+        assert!(
+            b.inline_ids_consistent(),
+            "{ctx}: block {bi} inline provenance out of step ({} ids, {} spans, {} instructions)",
+            b.source_inline_ids.len(),
             b.source_spans.len(),
             b.instructions.len()
         );

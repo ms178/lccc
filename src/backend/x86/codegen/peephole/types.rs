@@ -1497,17 +1497,11 @@ pub(super) fn debug_transparent(store: &LineStore, info: LineInfo, i: usize) -> 
 }
 
 /// D6 inline-range endpoints are zero-width, compiler-private labels.  They
-/// are never branch targets; only `.debug_*` relocations name them.  Treating
-/// them as opaque label barriers froze copy coalescing across an inline body
-/// and made `-g` emit two extra bytes (measured: dwarf-quality `code_unchanged`,
-/// `movslq` into `%rdi` + relay instead of `%rax`).  Like `.loc`, they are
-/// transparent to local instruction adjacency; the label itself is never
-/// edited or deleted, so the range endpoints survive the fold.
-fn is_inline_marker_label(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    let before_comment = trimmed.split('#').next().unwrap_or(trimmed).trim_end();
-    before_comment.starts_with(".Llccc_inline_") && before_comment.ends_with(':')
-}
+/// are never branch targets; only `.debug_*` relocations name them.  The
+/// shared parser is exact so lookalikes and compound statements stay opaque.
+/// `hide_debug_rows` removes endpoints from every pass's view; this predicate
+/// remains for callers that inspect pre-hiding text.
+pub(super) use crate::backend::peephole_common::is_inline_range_marker as is_inline_marker_label;
 
 pub(super) fn next_non_debug(
     store: &LineStore,

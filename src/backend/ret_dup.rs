@@ -383,6 +383,7 @@ mod tests {
                 instructions,
                 terminator,
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             };
         f.blocks.push(block(
             0,

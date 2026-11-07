@@ -162,38 +162,30 @@ impl BasicBlock {
             .unwrap_or(NO_INLINE_INSTANCE)
     }
 
-    #[inline]
-    fn insert_inline_id(&mut self, at: usize, id: u32) {
-        if self.source_inline_ids.is_empty() || !self.spans_parallel() {
-            return;
-        }
-        // A pass may have drifted the id list before this edit; pad/truncate to
-        // the pre-insertion instruction count so the insertion index is always
-        // valid and the three arrays end parallel again.  Padding uses the
-        // concrete-function sentinel rather than inventing an inline instance.
-        let target = self.instructions.len().saturating_sub(1);
-        self.source_inline_ids.resize(target, NO_INLINE_INSTANCE);
-        self.source_inline_ids.insert(at, id);
-    }
-
     /// Insert `inst` before position `at` (`at == len` appends).
     pub fn insert_inst(&mut self, at: usize, inst: Instruction, span: Span) {
         let tracked = self.tracks_insertion(span);
+        let ids_valid = self.inline_ids_parallel();
         let id = self.inherited_inline_id(at);
         self.instructions.insert(at, inst);
         if tracked {
             self.source_spans.insert(at, span);
-            self.insert_inline_id(at, id);
+            if ids_valid {
+                self.source_inline_ids.insert(at, id);
+            }
         }
     }
 
     /// Insert `inst` before position `at` with explicit inline provenance.
     pub fn insert_inst_inline(&mut self, at: usize, inst: Instruction, span: Span, inline_id: u32) {
         let tracked = self.tracks_insertion(span);
+        let ids_valid = self.inline_ids_parallel();
         self.instructions.insert(at, inst);
         if tracked {
             self.source_spans.insert(at, span);
-            self.insert_inline_id(at, inline_id);
+            if ids_valid {
+                self.source_inline_ids.insert(at, inline_id);
+            }
         }
     }
 
@@ -206,6 +198,7 @@ impl BasicBlock {
         span: Span,
     ) {
         let tracked = self.tracks_insertion(span);
+        let ids_valid = self.inline_ids_parallel();
         let id = self.inherited_inline_id(at);
         let before = self.instructions.len();
         self.instructions.splice(at..at, insts);
@@ -213,9 +206,7 @@ impl BasicBlock {
             let added = self.instructions.len() - before;
             self.source_spans
                 .splice(at..at, std::iter::repeat_n(span, added));
-            if !self.source_inline_ids.is_empty() {
-                let target = self.instructions.len() - added;
-                self.source_inline_ids.resize(target, NO_INLINE_INSTANCE);
+            if ids_valid {
                 self.source_inline_ids
                     .splice(at..at, std::iter::repeat_n(id, added));
             }
@@ -231,14 +222,14 @@ impl BasicBlock {
     /// Append every instruction of `insts`, each with `span`.
     pub fn extend_insts(&mut self, insts: impl IntoIterator<Item = Instruction>, span: Span) {
         let tracked = self.tracks_insertion(span);
+        let ids_valid = self.inline_ids_parallel();
         let id = self.inherited_inline_id(self.instructions.len());
         let before = self.instructions.len();
         self.instructions.extend(insts);
         if tracked {
             let added = self.instructions.len() - before;
             self.source_spans.extend(std::iter::repeat_n(span, added));
-            if !self.source_inline_ids.is_empty() {
-                self.source_inline_ids.resize(before, NO_INLINE_INSTANCE);
+            if ids_valid {
                 self.source_inline_ids
                     .extend(std::iter::repeat_n(id, added));
             }
@@ -247,9 +238,10 @@ impl BasicBlock {
 
     /// Remove and return instruction `at` (and its span/provenance).
     pub fn remove_inst(&mut self, at: usize) -> Instruction {
+        let ids_valid = self.inline_ids_parallel();
         if self.spans_parallel() {
             self.source_spans.remove(at);
-            if self.source_inline_ids.len() > at {
+            if ids_valid {
                 self.source_inline_ids.remove(at);
             }
         }
@@ -261,6 +253,7 @@ impl BasicBlock {
     /// source construct).
     pub fn splice_inst(&mut self, at: usize, insts: Vec<Instruction>) {
         let tracked = self.spans_parallel();
+        let ids_valid = self.inline_ids_parallel();
         let span = self.span_at(at);
         let id = self.inline_id_at(at);
         let n = insts.len();
@@ -268,7 +261,7 @@ impl BasicBlock {
         if tracked {
             self.source_spans
                 .splice(at..=at, std::iter::repeat_n(span, n));
-            if self.source_inline_ids.len() > at {
+            if ids_valid {
                 self.source_inline_ids
                     .splice(at..=at, std::iter::repeat_n(id, n));
             }
@@ -291,9 +284,10 @@ impl BasicBlock {
 
     /// Remove the instructions in `range` (and their spans/provenance).
     pub fn remove_insts(&mut self, range: std::ops::Range<usize>) {
+        let ids_valid = self.inline_ids_parallel();
         if self.spans_parallel() {
             self.source_spans.drain(range.clone());
-            if self.source_inline_ids.len() == self.instructions.len() {
+            if ids_valid {
                 self.source_inline_ids.drain(range.clone());
             }
         }
@@ -350,24 +344,21 @@ impl BasicBlock {
     pub fn retain_insts(&mut self, mut keep: impl FnMut(&Instruction) -> bool) {
         if !self.spans_parallel() {
             self.instructions.retain(keep);
-            self.source_inline_ids.clear();
             return;
         }
+        let ids_valid = self.inline_ids_parallel();
         let mut flags = Vec::with_capacity(self.instructions.len());
         self.instructions.retain(|inst| {
             let k = keep(inst);
             flags.push(k);
             k
         });
-        let keep_len = flags.len();
         let mut it = flags.iter().copied();
         self.source_spans.retain(|_| it.next().unwrap_or(false));
-        if self.source_inline_ids.len() == keep_len {
+        if ids_valid {
             let mut it = flags.into_iter();
             self.source_inline_ids
                 .retain(|_| it.next().unwrap_or(false));
-        } else {
-            self.source_inline_ids.clear();
         }
     }
 
@@ -2129,6 +2120,57 @@ mod span_edit_tests {
         b.replace_insts(vec![inst(1), inst(2)], vec![sp(1)]);
         assert_eq!(ids(&b), vec![1, 2]);
         assert!(b.source_spans.is_empty());
+    }
+
+    #[test]
+    fn inline_ids_follow_valid_edits_and_leave_drift_visible() {
+        let mut b = block(&[1, 2, 3], true);
+        b.source_inline_ids = vec![10, 11, 12];
+        b.insert_inst(1, inst(4), sp(4));
+        assert_eq!(b.source_inline_ids, vec![10, 11, 11, 12]);
+        b.insert_inst_inline(0, inst(5), sp(5), 99);
+        assert_eq!(b.source_inline_ids, vec![99, 10, 11, 11, 12]);
+        b.push_inst(inst(6), sp(6));
+        assert_eq!(b.source_inline_ids, vec![99, 10, 11, 11, 12, 12]);
+        b.splice_inst(2, vec![inst(7), inst(8)]);
+        assert_eq!(b.source_inline_ids, vec![99, 10, 11, 11, 11, 12, 12]);
+        b.remove_inst(1);
+        assert_eq!(b.source_inline_ids, vec![99, 11, 11, 11, 12, 12]);
+        b.retain_insts(|_| true);
+        b.remove_insts(0..2);
+        assert_eq!(b.source_inline_ids, vec![11, 11, 12, 12]);
+        b.extend_insts([inst(9)], sp(9));
+        assert_eq!(b.source_inline_ids, vec![11, 11, 12, 12, 12]);
+        b.insert_insts(1, [inst(10), inst(11)], sp(10));
+        assert_eq!(b.source_inline_ids, vec![11, 11, 11, 11, 12, 12, 12]);
+        assert!(b.inline_ids_parallel());
+
+        // A pre-existing drifted id array is not padded, truncated or cleared
+        // by a local edit.  The verifier must still see the producer's drift.
+        b.source_inline_ids.pop();
+        let drift = b.source_inline_ids.clone();
+        b.insert_inst(0, inst(12), sp(12));
+        b.push_inst(inst(13), sp(13));
+        b.insert_insts(0, [inst(14)], sp(14));
+        b.extend_insts([inst(15)], sp(15));
+        b.splice_inst(0, vec![inst(16)]);
+        b.remove_inst(0);
+        b.retain_insts(|i| i.dest() != Some(Value(15)));
+        b.remove_insts(0..1);
+        assert_eq!(b.source_inline_ids, drift);
+        assert!(!b.inline_ids_consistent());
+
+        // Sparse concrete provenance stays sparse; edits do not materialize an
+        // all-sentinel array.
+        let mut c = block(&[1, 2], true);
+        c.insert_inst(1, inst(3), sp(3));
+        c.push_inst(inst(4), sp(4));
+        c.splice_inst(0, vec![inst(5)]);
+        c.remove_inst(0);
+        c.retain_insts(|_| true);
+        c.extend_insts([inst(6)], sp(6));
+        assert!(c.source_inline_ids.is_empty());
+        assert!(c.inline_ids_consistent());
     }
 
     /// Seeded random edit sequences, checked after every step against a model
