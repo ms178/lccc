@@ -12082,27 +12082,13 @@ fn transform_byte_count_reduction(func: &mut IrFunction, p: &ByteCountPattern) -
 /// inherits its predecessor's span (the block's first span at the front);
 /// an absent table (empty for a non-empty block) stays absent.
 fn spanned_insert(block: &mut BasicBlock, at: usize, inst: Instruction) {
-    if block.source_spans.len() == block.instructions.len() {
-        let fill = at
-            .checked_sub(1)
-            .and_then(|i| block.source_spans.get(i))
-            .or_else(|| block.source_spans.first())
-            .copied()
-            .unwrap_or_else(crate::common::source::Span::dummy);
-        block.source_spans.insert(at, fill);
-        if !block.source_inline_ids.is_empty()
-            && block.source_inline_ids.len() == block.instructions.len()
-        {
-            let id_fill = at
-                .checked_sub(1)
-                .and_then(|i| block.source_inline_ids.get(i))
-                .or_else(|| block.source_inline_ids.first())
-                .copied()
-                .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE);
-            block.source_inline_ids.insert(at, id_fill);
-        }
-    }
-    block.instructions.insert(at, inst);
+    let fill = at
+        .checked_sub(1)
+        .and_then(|i| block.source_spans.get(i))
+        .or_else(|| block.source_spans.first())
+        .copied()
+        .unwrap_or_else(crate::common::source::Span::dummy);
+    block.insert_inst(at, inst, fill);
 }
 
 /// Append `inst`, keeping the span table in step (see `spanned_insert`).

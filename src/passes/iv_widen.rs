@@ -3741,36 +3741,27 @@ fn rewrite_latch(func: &mut IrFunction, plan: &WidenPlan, wide_step: Operand) {
 // ---------------------------------------------------------------------------
 
 fn push_inst(block: &mut BasicBlock, inst: Instruction) {
-    let fill = block.source_spans.last().copied();
-    block.instructions.push(inst);
-    if let Some(sp) = fill {
-        block.source_spans.push(sp);
-    }
+    let fill = block
+        .source_spans
+        .last()
+        .copied()
+        .unwrap_or_else(crate::common::source::Span::dummy);
+    block.push_inst(inst, fill);
 }
 
 fn insert_inst(block: &mut BasicBlock, at: usize, inst: Instruction) {
     let at = at.min(block.instructions.len());
-    block.instructions.insert(at, inst);
-    if block.source_spans.is_empty() {
-        return;
-    }
     let fill = block
         .source_spans
         .get(at.saturating_sub(1))
         .or_else(|| block.source_spans.last())
-        .copied();
-    if let Some(sp) = fill {
-        block
-            .source_spans
-            .insert(at.min(block.source_spans.len()), sp);
-    }
+        .copied()
+        .unwrap_or_else(crate::common::source::Span::dummy);
+    block.insert_inst(at, inst, fill);
 }
 
 fn remove_inst(block: &mut BasicBlock, ii: usize) {
-    block.instructions.remove(ii);
-    if ii < block.source_spans.len() {
-        block.source_spans.remove(ii);
-    }
+    block.remove_inst(ii);
 }
 
 fn find_def_idx(func: &IrFunction, v: Value) -> Option<(usize, usize)> {
