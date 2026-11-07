@@ -112,11 +112,17 @@ static int string_ops(void)
  * differential; this guards the shared encoder path from bit-rot. */
 extern const unsigned char sgdt_bytes[];
 extern const unsigned char sgdt_bytes_end[];
+/* The base register has the same ModR/M encoding in both x86 modes. */
+#ifdef __i386__
+#define GDT_BASE "%eax"
+#else
+#define GDT_BASE "%rax"
+#endif
 asm(".section .rodata\n"
     ".globl sgdt_bytes\n"
     "sgdt_bytes:\n"
-    "  sgdt (%rax)\n"        /* 0F 01 00 : mod=00 reg=/0 rm=000 */
-    "  lgdt (%rax)\n"        /* 0F 01 10 : mod=00 reg=/2 rm=000 */
+    "  sgdt (" GDT_BASE ")\n" /* 0F 01 00 : mod=00 reg=/0 rm=000 */
+    "  lgdt (" GDT_BASE ")\n" /* 0F 01 10 : mod=00 reg=/2 rm=000 */
     ".globl sgdt_bytes_end\n"
     "sgdt_bytes_end:\n"
     ".text\n");

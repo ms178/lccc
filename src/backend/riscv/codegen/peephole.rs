@@ -1566,6 +1566,15 @@ fn sext_producing_def(line: &str, kind: LineKind) -> Option<(u8, bool)> {
         // write 0 or 1 and `fclass` a 10-bit mask; the doubleword forms are
         // full 64-bit values.
         LineKind::Other => {
+            // A word LR or AMO sign-extends the word it loads (RV64); the
+            // doubleword forms and a store-conditional's status do not
+            // count.
+            if let Some(dst) = rv_load_dest(line).filter(|_| mnem.starts_with("lr.")) {
+                return Some((dst, mnem.starts_with("lr.w")));
+            }
+            if let Some((dst, word)) = rv_amo_sc_dest(line) {
+                return Some((dst, word && mnem.starts_with("amo")));
+            }
             let dst = rv_fp_gp_dest(line)?;
             let wide = match mnem.split('.').collect::<Vec<_>>()[..] {
                 ["fcvt", int, _] => matches!(int, "w" | "wu"),
@@ -1631,9 +1640,23 @@ fn rv_word_def(line: &str, kind: LineKind) -> WordDef {
         && let Some(dst) = rv_load_dest(line)
     {
         // `lw`/`lh`/`lb` sign-extend from bit 31 or below, `lhu`/`lbu`
-        // zero-extend fewer than 32 bits; `ld` and `lwu` do neither.
+        // zero-extend fewer than 32 bits, and `lr.w` sign-extends its word
+        // on RV64; `ld`, `lr.d` and `lwu` do neither.
         let mnemonic = line.trim().split_whitespace().next().unwrap_or("");
-        return if matches!(mnemonic, "lw" | "lh" | "lb" | "lhu" | "lbu") {
+        let word_lr = mnemonic.starts_with("lr.w");
+        return if word_lr || matches!(mnemonic, "lw" | "lh" | "lb" | "lhu" | "lbu") {
+            WordDef::Wide(dst)
+        } else {
+            WordDef::Clobbers(rv_bit(dst))
+        };
+    }
+    if kind == LineKind::Other
+        && let Some((dst, word)) = rv_amo_sc_dest(line)
+    {
+        // A word AMO's old value is sign-extended on RV64; a doubleword
+        // AMO's is whole, and a store-conditional's status is not modelled.
+        let amo = line.trim().starts_with("amo");
+        return if amo && word {
             WordDef::Wide(dst)
         } else {
             WordDef::Clobbers(rv_bit(dst))
@@ -3052,6 +3075,18 @@ fn has_unmodelled_effects(line: &str) -> bool {
         || m.starts_with("amo")
 }
 
+/// An unmodelled line whose register effects are nevertheless exactly its
+/// textual operands: a `fence` names none, and an LR, SC or AMO reads the
+/// address and data registers it names and writes its rd -- what it leaves
+/// unmodelled is memory and ordering, which renaming a register cannot
+/// change.  [`coalesce_entry_copies`] renames through such a line (an atomic
+/// leaf's `mv t2, a1` ahead of its LR/SC loop); every other pass keeps
+/// treating it as opaque.
+fn rv_rename_transparent(line: &str) -> bool {
+    let m = line.trim().split_whitespace().next().unwrap_or("");
+    rv_is_fence(line) || m.starts_with("lr.") || rv_word_atomic(m).is_some()
+}
+
 /// `sb`/`sh`/`sw`/`sd` and the FP stores: they read every register they name.
 fn is_gp_store(line: &str) -> bool {
     matches!(
@@ -3315,7 +3350,9 @@ fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize)
                         }
                         _ => {}
                     }
-                    if !ok || has_unmodelled_effects(&lines[k]) {
+                    if !ok
+                        || (has_unmodelled_effects(&lines[k]) && !rv_rename_transparent(&lines[k]))
+                    {
                         ok = false;
                         break;
                     }
@@ -4886,7 +4923,9 @@ fn rv_uses_defs(line: &str, kind: LineKind) -> (u64, u64) {
                 | LineKind::SextW { dst, .. } => Some(dst),
                 LineKind::LoadS0 { reg, .. } => Some(reg),
                 LineKind::Alu => parse_alu_dest(line),
-                LineKind::Other => rv_load_dest(line).or_else(|| rv_fp_gp_dest(line)),
+                LineKind::Other => rv_load_dest(line)
+                    .or_else(|| rv_fp_gp_dest(line))
+                    .or_else(|| rv_amo_sc_dest(line).map(|(d, _)| d)),
                 _ => None,
             };
             if let Some(d) = dest
@@ -5522,6 +5561,21 @@ fn rv_upper_roles(line: &str, kind: LineKind) -> Option<UpperRoles> {
             reg(b)?;
             roles(reg(d)?, 0, reg(a)?)
         }
+        // A word store-conditional or AMO reads its data's low word; the
+        // address is read in full and the destination (the status, or the
+        // sign-extended old word) depends on neither upper word.  The
+        // doubleword forms read their data in full.  Ordering suffixes
+        // (`.aq`, `.rl`, `.aqrl`) change nothing here.
+        (m, [d, data, addr]) if rv_word_atomic(m).is_some() => {
+            let base = addr.strip_prefix('(')?.strip_suffix(')')?.trim();
+            let data = reg(data)?;
+            let word = rv_word_atomic(m)?;
+            roles(reg(d)?, 0, reg(base)? | if word { 0 } else { data })
+        }
+        (m, [d, addr]) if m.starts_with("lr.") => {
+            let base = addr.strip_prefix('(')?.strip_suffix(')')?.trim();
+            roles(reg(d)?, 0, reg(base)?)
+        }
         // Integer-to-FP moves and conversions of a word read its low 32 bits;
         // the FP destination is not a tracked register.
         ("fmv.w.x" | "fcvt.s.w" | "fcvt.s.wu" | "fcvt.d.w" | "fcvt.d.wu", [fd, a, ..])
@@ -5530,6 +5584,37 @@ fn rv_upper_roles(line: &str, kind: LineKind) -> Option<UpperRoles> {
             reg(a)?;
             roles(0, 0, 0)
         }
+        _ => None,
+    }
+}
+
+/// The destination of an AMO or store-conditional (`amoadd.w.aqrl t0, a1,
+/// (a0)`, `sc.d.rl t4, a2, (a0)`) and whether the instruction is a word
+/// one.  An AMO's rd receives the old value (a word AMO sign-extends it on
+/// RV64), a store-conditional's its status.
+fn rv_amo_sc_dest(line: &str) -> Option<(u8, bool)> {
+    let (m, ops) = line.trim().split_once(|c: char| c.is_ascii_whitespace())?;
+    let word = rv_word_atomic(m)?;
+    let id = parse_reg(ops.split(',').next()?.trim());
+    (id != REG_NONE).then_some((id, word))
+}
+
+/// `Some(true)` for a word store-conditional or AMO mnemonic (`sc.w`,
+/// `amoadd.w.aqrl`, ...), `Some(false)` for a doubleword one, `None`
+/// otherwise.
+fn rv_word_atomic(m: &str) -> Option<bool> {
+    let mut parts = m.split('.');
+    let op = parts.next()?;
+    if op != "sc" && !op.starts_with("amo") {
+        return None;
+    }
+    let width = parts.next()?;
+    if !parts.all(|order| matches!(order, "aq" | "rl" | "aqrl")) {
+        return None;
+    }
+    match width {
+        "w" => Some(true),
+        "d" => Some(false),
         _ => None,
     }
 }
@@ -5796,7 +5881,18 @@ fn fold_into_memory_operands(lines: &mut [String], kinds: &mut [LineKind], n: us
                 changed = true;
                 continue;
             }
-            // l{w,h,b}[u] rT, off(rB) ; sext.w rD, rT
+            // l{w,h,b}[u] rT, off(rB) ; sext.w rD, rT -- with fences
+            // between allowed: they order memory accesses and read no
+            // general register, so the extension may move into the load
+            // across them (an acquire load is `lwu t0, 0(a0); fence r, rw;
+            // sext.w a0, t0` as staged).
+            let mut j = j;
+            while j < end && (kinds[j] == LineKind::Nop || rv_is_fence(&lines[j])) {
+                j += 1;
+            }
+            if j >= end || lines[j] == OPAQUE_LINE {
+                continue;
+            }
             if let LineKind::SextW { dst, src } = kinds[j]
                 && let Some(rt_id) = rv_load_dest(&lines[i])
                 && rt_id == src
@@ -5819,6 +5915,15 @@ fn fold_into_memory_operands(lines: &mut [String], kinds: &mut [LineKind], n: us
         }
     }
     changed
+}
+
+/// A `fence` (any predecessor/successor sets) or `fence.tso`: it orders
+/// memory accesses and reads or writes no general register.
+fn rv_is_fence(line: &str) -> bool {
+    matches!(
+        line.trim().split_whitespace().next(),
+        Some("fence" | "fence.tso")
+    )
 }
 
 /// An FP computation, FP load or FP move that names no general register
@@ -7182,11 +7287,16 @@ fn rv_vestigial_frame(
         format!("ld s0, {}(sp)", size - 16),
         format!("addi sp, sp, {size}"),
     ];
-    // Every return comes right after the three-line epilogue; the lines in
-    // between are the body, which may name neither sp, s0 nor ra.
+    // Every exit -- a `ret`, or a sibling call's `tail`/annotated `jr`,
+    // which leaves with ra, s0 and sp exactly as a `ret` would -- comes
+    // right after the three-line epilogue; the lines in between are the
+    // body, which may name neither sp, s0 nor ra.
+    let is_exit = |k: usize| {
+        kinds[k] == LineKind::Ret || (kinds[k] == LineKind::Call && rv_is_tail_line(text(k)))
+    };
     let mut epilogue_lines = Vec::new();
     for (idx, &k) in code.iter().enumerate().skip(pos) {
-        if kinds[k] == LineKind::Ret {
+        if is_exit(k) {
             let tail = code.get(idx.checked_sub(3)?..idx)?;
             if idx < pos + 3 || tail.iter().zip(&epilogue).any(|(&e, want)| text(e) != want) {
                 return None;
@@ -7196,7 +7306,7 @@ fn rv_vestigial_frame(
     }
     let frame_bits = rv_bit(REG_SP) | rv_bit(REG_S0) | rv_bit(REG_RA);
     for &k in &code[pos..] {
-        if epilogue_lines.binary_search(&k).is_ok() {
+        if epilogue_lines.binary_search(&k).is_ok() || is_exit(k) {
             continue;
         }
         match kinds[k] {
@@ -11082,5 +11192,214 @@ mod arg_extension_marker_tests {
         let asm = "f:\n    # lccc-arg-ext a0/z16\n    ret\n";
         assert!(!peephole_optimize(asm.into()).contains("lccc-arg-ext"));
         assert!(!strip_internal_markers(asm.into()).contains("lccc-arg-ext"));
+    }
+}
+
+/// LR/SC/AMO and fence modelling: the operand roles the atomic lowering
+/// relies on once it reads pointers and values in place (`atomics.rs`).
+#[cfg(test)]
+mod atomic_line_tests {
+    use super::*;
+
+    fn rows(asm: &str) -> Vec<String> {
+        peephole_optimize(asm.into())
+            .lines()
+            .map(str::trim)
+            .filter(|l| {
+                !l.is_empty() && !l.ends_with(':') && !l.starts_with('.') && !l.starts_with('#')
+            })
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn word_and_doubleword_atomic_mnemonics() {
+        for (m, want) in [
+            ("sc.w", Some(true)),
+            ("sc.w.rl", Some(true)),
+            ("sc.d.aqrl", Some(false)),
+            ("amoadd.w.aqrl", Some(true)),
+            ("amoswap.d", Some(false)),
+            ("amomaxu.w.aq", Some(true)),
+            ("lr.w", None),
+            ("add", None),
+            ("amoadd.q", None),
+            ("sc.w.xx", None),
+            ("scw", None),
+        ] {
+            assert_eq!(rv_word_atomic(m), want, "{m}");
+        }
+        assert_eq!(
+            rv_amo_sc_dest("    amoadd.w.aqrl t0, a1, (a0)"),
+            Some((REG_T0, true))
+        );
+        assert_eq!(
+            rv_amo_sc_dest("    sc.d.rl t4, a2, (a0)"),
+            Some((parse_reg("t4"), false))
+        );
+        assert_eq!(rv_amo_sc_dest("    lr.w t0, (a0)"), None);
+        assert!(rv_is_fence("    fence r, rw"));
+        assert!(rv_is_fence("    fence.tso"));
+        assert!(!rv_is_fence("    fence.i"));
+        assert!(rv_rename_transparent("    sc.w.rl t4, a2, (a0)"));
+        assert!(rv_rename_transparent("    lr.d.aq t0, (s1)"));
+        assert!(!rv_rename_transparent("    ecall"));
+        assert!(!rv_rename_transparent("    csrr t0, cycle"));
+    }
+
+    /// An acquire word load is staged as `lwu; fence r, rw; sext.w`: the
+    /// extension folds into the load across the fence (the fence orders
+    /// memory, not registers).
+    #[test]
+    fn sign_extension_folds_into_a_word_load_across_fences() {
+        let out = rows(
+            "f:\n    # lccc-ret-regs a0\n    fence rw, rw\n    lwu t0, 0(a0)\n    fence r, rw\n    sext.w a0, t0\n    ret\n",
+        );
+        assert_eq!(out, ["fence rw, rw", "lw a0, 0(a0)", "fence r, rw", "ret"]);
+    }
+
+    /// `sc.w` and word AMOs store the low word of their data register:
+    /// a zero extension feeding only them is undemanded.  The doubleword
+    /// forms store all 64 bits, so there it stays.
+    #[test]
+    fn word_store_conditional_data_demands_the_low_word_only() {
+        let word = "f:\n    # lccc-ret-regs a0\n    slli a2, a2, 32\n    srli a2, a2, 32\n.Lloop:\n    lr.w.aqrl t0, (a0)\n    bne t0, a1, .Lfail\n    sc.w.rl t4, a2, (a0)\n    bnez t4, .Lloop\n.Lfail:\n    mv a0, t0\n    ret\n";
+        let out = rows(word);
+        assert!(!out.iter().any(|l| l.starts_with("slli a2")), "{out:?}");
+        let double = word
+            .replace("lr.w.aqrl", "lr.d.aqrl")
+            .replace("sc.w.rl", "sc.d.rl");
+        let out = rows(&double);
+        assert!(out.iter().any(|l| l == "slli a2, a2, 32"), "{out:?}");
+        let amo = "f:\n    # lccc-ret-regs a0\n    slli a1, a1, 32\n    srli a1, a1, 32\n    amoadd.w.aqrl a0, a1, (a0)\n    ret\n";
+        let out = rows(amo);
+        assert_eq!(out, ["amoadd.w.aqrl a0, a1, (a0)", "ret"]);
+    }
+
+    /// LR.W and word AMOs sign-extend their result: the psABI extension of
+    /// an `unsigned` result read across the CAS loop's join is a copy.  A
+    /// doubleword LR is no such producer.
+    #[test]
+    fn word_lr_results_are_sign_extended_words() {
+        let asm = "f:\n    # lccc-ret-regs a0\n.Lloop:\n    lr.w.aqrl t0, (a0)\n    bne t0, a1, .Lfail\n    sc.w.rl t4, a2, (a0)\n    bnez t4, .Lloop\n.Lfail:\n    sext.w a0, t0\n    ret\n";
+        let out = rows(asm);
+        assert!(out.iter().any(|l| l == "mv a0, t0"), "{out:?}");
+        let out = rows(
+            &asm.replace("lr.w.aqrl", "lr.d.aqrl")
+                .replace("sc.w.rl", "sc.d.rl"),
+        );
+        assert!(out.iter().any(|l| l == "sext.w a0, t0"), "{out:?}");
+    }
+
+    /// The entry copy of the expected value renames through the LR/SC loop
+    /// (whose register effects are its textual operands); an `ecall` still
+    /// blocks it.
+    #[test]
+    fn entry_copies_rename_through_lr_sc_loops() {
+        let asm = "f:\n    # lccc-ret-regs a0\n    mv t2, a1\n.Lloop:\n    lr.w.aqrl t0, (a0)\n    bne t0, t2, .Lfail\n    sc.w.rl t4, a2, (a0)\n    bnez t4, .Lloop\n.Lfail:\n    mv a0, t0\n    ret\n";
+        let out = rows(asm);
+        assert!(!out.iter().any(|l| l.starts_with("mv t2")), "{out:?}");
+        assert!(out.iter().any(|l| l == "bne t0, a1, .Lfail"), "{out:?}");
+        let out = rows(&asm.replace("    mv a0, t0\n", "    ecall\n    mv a0, t0\n"));
+        assert!(out.iter().any(|l| l == "mv t2, a1"), "{out:?}");
+    }
+
+    /// An AMO writes its rd: the copy that preceded it into that register
+    /// is never propagated past it.  With a3 still read afterwards, the
+    /// copy can neither be coalesced (a3 must keep its value) nor forwarded
+    /// into the `add` (which reads the old memory value).
+    #[test]
+    fn amo_destinations_are_writes() {
+        let asm = "f:\n    # lccc-ret-regs a0\n    mv t0, a3\n    amoadd.d.aqrl t0, a1, (a0)\n    add a0, t0, a3\n    ret\n";
+        let out = rows(asm);
+        let amo = out
+            .iter()
+            .find(|l| l.starts_with("amoadd.d.aqrl"))
+            .expect("AMO kept");
+        let rd = amo["amoadd.d.aqrl ".len()..]
+            .split(',')
+            .next()
+            .unwrap_or("")
+            .trim();
+        assert_ne!(rd, "a3", "{out:?}");
+        assert!(out.contains(&format!("add a0, {rd}, a3")), "{out:?}");
+        // With a3 dead the copy coalesces onto it instead: the AMO then
+        // writes a3, and the result is read from there.
+        let out = rows(
+            "f:\n    # lccc-ret-regs a0\n    mv t0, a3\n    amoadd.d.aqrl t0, a1, (a0)\n    mv a0, t0\n    ret\n",
+        );
+        assert_eq!(out, ["amoadd.d.aqrl a3, a1, (a0)", "mv a0, a3", "ret"]);
+    }
+}
+
+/// Frames and branches of FP leaves whose only call is a sibling tail
+/// (`double f(double x) { return sqrt(x); }` under errno semantics).
+#[cfg(test)]
+mod tail_frame_tests {
+    use super::*;
+
+    fn rows(asm: &str) -> Vec<String> {
+        peephole_optimize(asm.into())
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with(".cfi"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// A frame nothing uses goes even when one exit is a sibling `tail`
+    /// (ra, s0 and sp are what a `ret` would leave), and the inverted FP
+    /// equality test branches on the compare itself.
+    #[test]
+    fn vestigial_frame_with_a_tail_exit_and_fp_compare_branch() {
+        let asm = "portable_sqrt:\n    addi sp, sp, -48\n    sd ra, 40(sp)\n    sd s0, 32(sp)\n    addi s0, sp, 48\n    fsqrt.d ft0, fa0\n    feq.d t0, ft0, ft0\n    xori t0, t0, 1\n    bnez t0, .LBB2\n.LBB1:\n    fmv.d fa0, ft0\n    ld ra, 40(sp)\n    ld s0, 32(sp)\n    addi sp, sp, 48\n    ret\n.LBB2:\n    ld ra, 40(sp)\n    ld s0, 32(sp)\n    addi sp, sp, 48\n    tail sqrt # lccc-call-reads 0\n";
+        assert_eq!(
+            rows(asm),
+            [
+                "portable_sqrt:",
+                "fsqrt.d ft0, fa0",
+                "feq.d t0, ft0, ft0",
+                "beqz t0, .LBB2",
+                ".LBB1:",
+                "fmv.d fa0, ft0",
+                "ret",
+                ".LBB2:",
+                "tail sqrt"
+            ]
+        );
+    }
+
+    /// A tail exit without the three-line epilogue in front (the frame is
+    /// still live there), a body naming s0, or an ordinary call keeps the
+    /// frame.
+    #[test]
+    fn frames_that_are_still_used_stay() {
+        let base = "f:\n    addi sp, sp, -16\n    sd ra, 8(sp)\n    sd s0, 0(sp)\n    addi s0, sp, 16\n    BODY\n    ld ra, 8(sp)\n    ld s0, 0(sp)\n    addi sp, sp, 16\n    tail g # lccc-call-reads 3\n";
+        for body in ["addi a1, s0, -8", "call h # lccc-call-reads 1", "mv a1, sp"] {
+            let out = rows(&base.replace("BODY", body));
+            assert!(
+                out.iter().any(|l| l == "addi sp, sp, -16"),
+                "{body}: {out:?}"
+            );
+        }
+        let out = rows(
+            "f:\n    addi sp, sp, -16\n    sd ra, 8(sp)\n    sd s0, 0(sp)\n    addi s0, sp, 16\n    tail g # lccc-call-reads 1\n",
+        );
+        assert!(out.iter().any(|l| l == "addi sp, sp, -16"), "{out:?}");
+    }
+
+    /// `xori t, s, 1; beqz/bnez t` folds only for a 0/1 `s` whose
+    /// inverted copy dies at the branch.
+    #[test]
+    fn inverted_boolean_branches() {
+        let asm = "f:\n    # lccc-ret-regs a0\n    flt.s t1, fa0, fa1\n    xori t1, t1, 1\n    beqz t1, .L1\n    li a0, 1\n    ret\n.L1:\n    li a0, 2\n    ret\n";
+        let out = rows(asm);
+        assert!(out.iter().any(|l| l == "bnez t1, .L1"), "{out:?}");
+        // Not a boolean: `fclass` writes a mask.
+        let out = rows(&asm.replace("flt.s t1, fa0, fa1", "fclass.s t1, fa0"));
+        assert!(out.iter().any(|l| l == "xori t1, t1, 1"), "{out:?}");
+        // The inverted value is still read after the branch.
+        let out = rows(&asm.replace("    li a0, 1\n", "    mv a0, t1\n"));
+        assert!(out.iter().any(|l| l == "xori t1, t1, 1"), "{out:?}");
     }
 }

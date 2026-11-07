@@ -293,6 +293,13 @@ pub struct ArmCodegen {
     /// Per-definition, never propagated through derived arithmetic (the
     /// x86-64 backend's bitop_nonneg_values transfer).
     pub(super) bitop_nonneg_values: FxHashSet<u32>,
+    /// Unsigned 8/16/32-bit results of atomic loads, RMWs and compare-
+    /// exchanges: `atomics.rs` produces them with a W-register load-acquire
+    /// or load-exclusive, which zeroes bits 63..width, and canonicalizes
+    /// nothing for unsigned types.  Their zero-extending casts are the
+    /// identity (`u64 f(u32 *p) { return __sync_val_compare_and_swap(...); }`
+    /// paid a `mov w0, w0`).
+    pub(super) atomic_zext_values: FxHashSet<u32>,
     /// Same-block div/rem pair fusion (compute_i686_divrem_pairs with the
     /// AArch64 target): dest value-ids of TAIL instructions — they emit
     /// nothing because the HEAD's sdiv+msub dual-store wrote their result.
@@ -364,6 +371,7 @@ impl ArmCodegen {
             va_named_stack_bytes: 0,
             fp_ret_buffer: None,
             bitop_nonneg_values: FxHashSet::default(),
+            atomic_zext_values: FxHashSet::default(),
             divrem_tail_dests: FxHashSet::default(),
             divrem_head_partners: FxHashMap::default(),
             asm_scratch_idx: 0,
@@ -2191,12 +2199,84 @@ impl ArmCodegen {
             } else {
                 None
             };
+            if self.emit_fp_arg_direct(
+                &args[arg_i],
+                arg_ty,
+                reg_i,
+                slot_adjust,
+                needs_adjusted_load,
+            ) {
+                continue;
+            }
             self.emit_load_arg_to_reg(&args[arg_i], "x0", slot_adjust, 0, needs_adjusted_load);
             if arg_ty == Some(IrType::F32) || arg_ty == Some(IrType::U16) {
                 self.state.emit_fmt(format_args!("    fmov s{}, w0", reg_i));
             } else {
                 self.state.emit_fmt(format_args!("    fmov d{}, x0", reg_i));
             }
+        }
+    }
+
+    /// Stage an `f32`/`f64` register argument straight into `d{reg}`/`s{reg}`
+    /// when its source allows: an FP home (`fmov d0, d16`), a general home
+    /// (`fmov d0, x5`), a frame slot (`ldr d0, [sp, #off]`) or +0.0
+    /// (`movi d0, #0`).  The generic path bounced every FP argument
+    /// through x0 (`ldr x0, [sp, #16]; fmov d0, x0`, `fmov x0, d17; fmov
+    /// d0, x0`).  No FP home is ever v0-v7 and x0 is not touched, so the
+    /// order of the FP argument writes cannot clobber a later source (the
+    /// GP arguments sit in their temporaries meanwhile).  `false` leaves
+    /// the argument to the generic path (constants, `_Float16`).
+    fn emit_fp_arg_direct(
+        &mut self,
+        arg: &Operand,
+        arg_ty: Option<IrType>,
+        reg: usize,
+        slot_adjust: i64,
+        needs_adjusted_load: bool,
+    ) -> bool {
+        let single = match arg_ty {
+            Some(IrType::F32) => true,
+            Some(IrType::F64) => false,
+            _ => return false,
+        };
+        let fp = if single { 's' } else { 'd' };
+        match arg {
+            Operand::Value(v) if !self.state.is_alloca(v.0) => {
+                if let Some(&home) = self.reg_assignments.get(&v.0) {
+                    if is_arm_fp_phys(home) {
+                        self.state
+                            .emit_fmt(format_args!("    fmov {fp}{reg}, {fp}{}", home.0 - 24));
+                    } else {
+                        let gpr = if single {
+                            callee_saved_name_32(home)
+                        } else {
+                            callee_saved_name(home)
+                        };
+                        self.state
+                            .emit_fmt(format_args!("    fmov {fp}{reg}, {gpr}"));
+                    }
+                    return true;
+                }
+                let Some(slot) = self.state.get_slot(v.0) else {
+                    return false;
+                };
+                let offset = if needs_adjusted_load {
+                    slot.0 + slot_adjust
+                } else {
+                    slot.0
+                };
+                self.emit_load_from_sp(&format!("{fp}{reg}"), offset, "ldr");
+                true
+            }
+            Operand::Const(IrConst::F64(c)) if !single && c.to_bits() == 0 => {
+                self.state.emit_fmt(format_args!("    movi d{reg}, #0"));
+                true
+            }
+            Operand::Const(IrConst::F32(c)) if single && c.to_bits() == 0 => {
+                self.state.emit_fmt(format_args!("    movi d{reg}, #0"));
+                true
+            }
+            _ => false,
         }
     }
 

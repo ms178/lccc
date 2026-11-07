@@ -6,6 +6,10 @@
 # fab848977, plus the one divergence a 1-in-3 sweep of tests/regression/*.c
 # found after those peepholes hid their rows).
 # Consumed by check_debug_info_invariance.sh.
+# These sources once embedded x86-64-only registers in the i686 sample: plain
+# -S accepted them, but -g -S assembled internally and rejected them.
+i686 -O2 code16_realmode_encoding.c
+i686 -O2 global_load_snapshot_inline_asm.c
 x86_64 -O0 aggregate_split_memset.c
 x86_64 -O0 c2y_stdbit_and_rotate.c
 x86_64 -O0 copysign_union_mem.c

@@ -9,9 +9,10 @@
 //! targets that lack the Zbb extension.
 
 use super::emit::RiscvCodegen;
+use super::emit::callee_saved_name;
 use crate::backend::state::CodegenState;
 use crate::common::types::IrType;
-use crate::ir::reexports::{AtomicOrdering, AtomicRmwOp, Operand, Value};
+use crate::ir::reexports::{AtomicOrdering, AtomicRmwOp, IrConst, Operand, Value};
 
 impl RiscvCodegen {
     /// Get the AMO ordering suffix.
@@ -28,8 +29,10 @@ impl RiscvCodegen {
     /// Get the AMO width suffix for word/doubleword operations.
     /// Sub-word types (I8/U8/I16/U16) should use the sub-word atomic helpers instead.
     pub(super) fn amo_width_suffix(ty: IrType) -> &'static str {
+        // The suffix IS the access width: a 4-byte `float` takes the word
+        // forms (it used to fall into `d`, an 8-byte AMO on a 4-byte object).
         match ty {
-            IrType::I32 | IrType::U32 => "w",
+            IrType::I32 | IrType::U32 | IrType::F32 => "w",
             _ => "d",
         }
     }
@@ -97,7 +100,13 @@ impl RiscvCodegen {
     ///   t0 = loaded word (old value)
     ///   t2 = shifted value operand
     ///   t3 = temporary, t4 = new word to store, t5 = SC result flag
-    pub(super) fn emit_subword_atomic_rmw(&mut self, op: AtomicRmwOp, ty: IrType, aq_rl: &str) {
+    pub(super) fn emit_subword_atomic_rmw(
+        &mut self,
+        op: AtomicRmwOp,
+        ty: IrType,
+        lr_order: &str,
+        sc_order: &str,
+    ) {
         let bits = Self::subword_bits(ty);
         let loop_label = self.state.fresh_label("sw_rmw_loop");
         let done_label = self.state.fresh_label("sw_rmw_done");
@@ -131,7 +140,7 @@ impl RiscvCodegen {
         // LR/SC loop
         self.state.emit_fmt(format_args!("{}:", loop_label));
         self.state
-            .emit_fmt(format_args!("    lr.w{} t0, (a2)", aq_rl));
+            .emit_fmt(format_args!("    lr.w{} t0, (a2)", lr_order));
 
         match op {
             AtomicRmwOp::Xchg | AtomicRmwOp::TestAndSet => {
@@ -192,7 +201,7 @@ impl RiscvCodegen {
 
         // SC: rd (t5) must differ from rs2 (t4) per RISC-V spec
         self.state
-            .emit_fmt(format_args!("    sc.w{} t5, t4, (a2)", aq_rl));
+            .emit_fmt(format_args!("    sc.w{} t5, t4, (a2)", sc_order));
         self.state
             .emit_fmt(format_args!("    bnez t5, {}", loop_label));
         self.state.emit_fmt(format_args!("{}:", done_label));
@@ -222,7 +231,8 @@ impl RiscvCodegen {
     pub(super) fn emit_subword_atomic_cmpxchg(
         &mut self,
         ty: IrType,
-        aq_rl: &str,
+        lr_order: &str,
+        sc_order: &str,
         returns_bool: bool,
     ) {
         let bits = Self::subword_bits(ty);
@@ -264,7 +274,7 @@ impl RiscvCodegen {
         // LR/SC loop
         self.state.emit_fmt(format_args!("{}:", loop_label));
         self.state
-            .emit_fmt(format_args!("    lr.w{} t0, (a2)", aq_rl));
+            .emit_fmt(format_args!("    lr.w{} t0, (a2)", lr_order));
         // Compare only the sub-word field
         self.state.emit("    and t4, t0, a4"); // t4 = current field
         self.state
@@ -274,7 +284,7 @@ impl RiscvCodegen {
         self.state.emit("    or t4, t4, t3");
         // SC: rd (t5) must differ from rs2 (t4) per RISC-V spec
         self.state
-            .emit_fmt(format_args!("    sc.w{} t5, t4, (a2)", aq_rl));
+            .emit_fmt(format_args!("    sc.w{} t5, t4, (a2)", sc_order));
         self.state
             .emit_fmt(format_args!("    bnez t5, {}", loop_label));
         // Success
@@ -575,6 +585,108 @@ impl RiscvCodegen {
     }
 
     // ---- Trait-level atomic operations (delegated from ArchCodegen) ----
+    //
+    // Register contract (shared with the allocator's atomic-pointer
+    // eligibility, `regalloc.rs`): the word/doubleword sequences write t0
+    // (old value), t2 (a negated, sign-extended or constant operand), t3
+    // (Nand's new value) and t4 (store-conditional status); the sub-word
+    // loops also write t1-t5 and a2-a5.  An operand's home (a0-a7, s1-s11;
+    // never a t-register) is read in place, and a function containing a
+    // sub-word RMW/CAS never opens the a-register pool
+    // (`riscv_emitter_safe_ir`), so nothing lives in a2-a5 across one.
+    // LR/SC orderings follow the RVWMO mapping of the unprivileged ISA
+    // (Table A.6): `lr.aq` for acquire, `lr.aqrl` for seq_cst, `sc.rl` for
+    // release/acq_rel/seq_cst -- never the `lr.rl`/`sc.aq` forms the spec
+    // says give no stronger ordering than plain ones.  16-byte operations
+    // call libatomic's `__atomic_*_16`, as GCC 16.2 and Clang 23.1.5 do.
+
+    /// LR suffix for a loop of ordering `ordering` (Table A.6).
+    fn lr_ordering(ordering: AtomicOrdering) -> &'static str {
+        match ordering {
+            AtomicOrdering::Relaxed | AtomicOrdering::Release => "",
+            AtomicOrdering::Acquire | AtomicOrdering::AcqRel => ".aq",
+            AtomicOrdering::SeqCst => ".aqrl",
+        }
+    }
+
+    /// SC suffix for a loop of ordering `ordering` (Table A.6).
+    fn sc_ordering(ordering: AtomicOrdering) -> &'static str {
+        match ordering {
+            AtomicOrdering::Relaxed | AtomicOrdering::Acquire => "",
+            AtomicOrdering::Release | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst => ".rl",
+        }
+    }
+
+    /// The home register of `op` (a0-a7 or s1-s11), if it has one.
+    fn atomic_home(&self, op: &Operand) -> Option<&'static str> {
+        let Operand::Value(v) = op else {
+            return None;
+        };
+        if self.state.is_alloca(v.0) {
+            return None;
+        }
+        self.reg_assignments
+            .get(&v.0)
+            .map(|&reg| callee_saved_name(reg))
+    }
+
+    /// A constant whose bits are all zero (never `-0.0`): `zero` supplies it.
+    fn atomic_zero_operand(op: &Operand) -> bool {
+        match op {
+            Operand::Const(c) => match c {
+                IrConst::I8(v) => *v == 0,
+                IrConst::I16(v) => *v == 0,
+                IrConst::I32(v) => *v == 0,
+                IrConst::I64(v) => *v == 0,
+                IrConst::F32(v) => v.to_bits() == 0,
+                IrConst::F64(v) => v.to_bits() == 0,
+                IrConst::Zero => true,
+                _ => false,
+            },
+            Operand::Value(_) => false,
+        }
+    }
+
+    /// The register an atomic sequence reads `op` from: its home, `zero`
+    /// for an all-zero constant when `allow_zero`, else `scratch` loaded
+    /// through t0.  Operands are fetched one at a time, so one staged
+    /// earlier must sit in a register other than t0.
+    fn atomic_operand_reg(
+        &mut self,
+        op: &Operand,
+        scratch: &'static str,
+        allow_zero: bool,
+    ) -> &'static str {
+        if allow_zero && Self::atomic_zero_operand(op) {
+            return "zero";
+        }
+        if let Some(home) = self.atomic_home(op) {
+            return home;
+        }
+        if let Some(value) = Self::atomic_int_const(op) {
+            // Straight into the scratch: through t0 the constant left a
+            // dead `li t0, c` that the AMO or LR overwrites.
+            if scratch == "t0" {
+                self.state.reg_cache.invalidate_acc();
+            }
+            self.state
+                .emit_fmt(format_args!("    li {scratch}, {value}"));
+            return scratch;
+        }
+        self.operand_to_t0(op);
+        if scratch != "t0" {
+            self.state.emit_fmt(format_args!("    mv {scratch}, t0"));
+        }
+        scratch
+    }
+
+    /// Copy `op` into `scratch` (the sub-word loops rewrite their inputs).
+    fn atomic_stage(&mut self, op: &Operand, scratch: &'static str) {
+        let reg = self.atomic_operand_reg(op, scratch, true);
+        if reg != scratch {
+            self.state.emit_fmt(format_args!("    mv {scratch}, {reg}"));
+        }
+    }
 
     pub(super) fn emit_atomic_rmw_impl(
         &mut self,
@@ -585,65 +697,104 @@ impl RiscvCodegen {
         ty: IrType,
         ordering: AtomicOrdering,
     ) {
-        // Load ptr into t1, val into t2
-        self.operand_to_t0(ptr);
-        self.state.emit("    mv t1, t0"); // t1 = ptr
-        self.operand_to_t0(val);
-        self.state.emit("    mv t2, t0"); // t2 = val
-
-        let aq_rl = Self::amo_ordering(ordering);
-
-        if Self::is_subword_type(ty) {
-            self.emit_subword_atomic_rmw(op, ty, aq_rl);
-        } else {
-            let suffix = Self::amo_width_suffix(ty);
-            match op {
-                AtomicRmwOp::Add => {
-                    self.state
-                        .emit_fmt(format_args!("    amoadd.{}{} t0, t2, (t1)", suffix, aq_rl));
-                }
-                AtomicRmwOp::Sub => {
-                    self.state.emit("    neg t2, t2");
-                    self.state
-                        .emit_fmt(format_args!("    amoadd.{}{} t0, t2, (t1)", suffix, aq_rl));
-                }
-                AtomicRmwOp::And => {
-                    self.state
-                        .emit_fmt(format_args!("    amoand.{}{} t0, t2, (t1)", suffix, aq_rl));
-                }
-                AtomicRmwOp::Or => {
-                    self.state
-                        .emit_fmt(format_args!("    amoor.{}{} t0, t2, (t1)", suffix, aq_rl));
-                }
-                AtomicRmwOp::Xor => {
-                    self.state
-                        .emit_fmt(format_args!("    amoxor.{}{} t0, t2, (t1)", suffix, aq_rl));
-                }
-                AtomicRmwOp::Xchg => {
-                    self.state
-                        .emit_fmt(format_args!("    amoswap.{}{} t0, t2, (t1)", suffix, aq_rl));
-                }
-                AtomicRmwOp::Nand => {
-                    let loop_label = self.state.fresh_label("atomic_nand");
-                    self.state.emit_fmt(format_args!("{}:", loop_label));
-                    self.state
-                        .emit_fmt(format_args!("    lr.{}{} t0, (t1)", suffix, aq_rl));
-                    self.state.emit("    and t3, t0, t2");
-                    self.state.emit("    not t3, t3");
-                    self.state
-                        .emit_fmt(format_args!("    sc.{}{} t4, t3, (t1)", suffix, aq_rl));
-                    self.state
-                        .emit_fmt(format_args!("    bnez t4, {}", loop_label));
-                }
-                AtomicRmwOp::TestAndSet => {
-                    self.state.emit("    li t2, 1");
-                    self.state
-                        .emit_fmt(format_args!("    amoswap.{}{} t0, t2, (t1)", suffix, aq_rl));
-                }
-            }
+        if matches!(ty, IrType::I128 | IrType::U128) {
+            self.emit_atomic_rmw_128(dest, op, ptr, val, ordering);
+            return;
         }
-        Self::sign_extend_riscv(&mut self.state, ty);
+        if Self::is_subword_type(ty) {
+            self.atomic_stage(val, "t2");
+            self.atomic_stage(ptr, "t1");
+            self.emit_subword_atomic_rmw(
+                op,
+                ty,
+                Self::lr_ordering(ordering),
+                Self::sc_ordering(ordering),
+            );
+            Self::sign_extend_riscv(&mut self.state, ty);
+            self.store_t0_to(dest);
+            return;
+        }
+        let aq_rl = Self::amo_ordering(ordering);
+        let suffix = Self::amo_width_suffix(ty);
+        // The AMO's rs2: the value's home in place, `zero`, or t2 (a
+        // negated subtrahend -- a constant one folded -- or a constant).
+        let val_reg = match op {
+            AtomicRmwOp::TestAndSet => {
+                self.state.emit("    li t2, 1");
+                "t2"
+            }
+            AtomicRmwOp::Sub => {
+                if let Some(c) = Self::atomic_int_const(val) {
+                    self.state
+                        .emit_fmt(format_args!("    li t2, {}", c.wrapping_neg()));
+                } else {
+                    let reg = self.atomic_operand_reg(val, "t2", true);
+                    self.state.emit_fmt(format_args!("    neg t2, {reg}"));
+                }
+                "t2"
+            }
+            _ => self.atomic_operand_reg(val, "t2", true),
+        };
+        let ptr_reg = self.atomic_operand_reg(ptr, "t1", false);
+        let amo = match op {
+            AtomicRmwOp::Add | AtomicRmwOp::Sub => Some("amoadd"),
+            AtomicRmwOp::And => Some("amoand"),
+            AtomicRmwOp::Or => Some("amoor"),
+            AtomicRmwOp::Xor => Some("amoxor"),
+            AtomicRmwOp::Xchg | AtomicRmwOp::TestAndSet => Some("amoswap"),
+            AtomicRmwOp::Nand => None,
+        };
+        if let Some(amo) = amo {
+            // A result that needs no extension (AMO.W sign-extends, which is
+            // the canonical `int`; doubleword results are whole) goes
+            // straight to its home: an AMO's rd may name its own address or
+            // data register, as Clang's `amoadd.d.aqrl a0, a1, (a0)` does.
+            let direct = if matches!(ty, IrType::I32 | IrType::I64 | IrType::U64 | IrType::Ptr) {
+                self.atomic_home(&Operand::Value(*dest))
+            } else {
+                None
+            };
+            let rd = direct.unwrap_or("t0");
+            self.state.emit_fmt(format_args!(
+                "    {amo}.{suffix}{aq_rl} {rd}, {val_reg}, ({ptr_reg})"
+            ));
+            if direct.is_some() {
+                self.state.reg_cache.invalidate_acc();
+                return;
+            }
+        } else {
+            let lr = Self::lr_ordering(ordering);
+            let sc = Self::sc_ordering(ordering);
+            let loop_label = self.state.fresh_label("atomic_nand");
+            self.state.emit_fmt(format_args!("{loop_label}:"));
+            self.state
+                .emit_fmt(format_args!("    lr.{suffix}{lr} t0, ({ptr_reg})"));
+            self.state
+                .emit_fmt(format_args!("    and t3, t0, {val_reg}"));
+            self.state.emit("    not t3, t3");
+            self.state
+                .emit_fmt(format_args!("    sc.{suffix}{sc} t4, t3, ({ptr_reg})"));
+            self.state
+                .emit_fmt(format_args!("    bnez t4, {loop_label}"));
+        }
+        // AMO.W and LR.W sign-extend their word on RV64: an `int` result is
+        // already canonical.
+        if ty != IrType::I32 {
+            Self::sign_extend_riscv(&mut self.state, ty);
+        }
         self.store_t0_to(dest);
+    }
+
+    /// An integer constant operand's value.
+    fn atomic_int_const(op: &Operand) -> Option<i64> {
+        match op {
+            Operand::Const(IrConst::I8(v)) => Some(i64::from(*v)),
+            Operand::Const(IrConst::I16(v)) => Some(i64::from(*v)),
+            Operand::Const(IrConst::I32(v)) => Some(i64::from(*v)),
+            Operand::Const(IrConst::I64(v)) => Some(*v),
+            Operand::Const(IrConst::Zero) => Some(0),
+            _ => None,
+        }
     }
 
     pub(super) fn emit_atomic_cmpxchg_impl(
@@ -654,52 +805,71 @@ impl RiscvCodegen {
         desired: &Operand,
         ty: IrType,
         ordering: AtomicOrdering,
-        _failure_ordering: AtomicOrdering,
+        failure_ordering: AtomicOrdering,
         returns_bool: bool,
     ) {
-        self.operand_to_t0(ptr);
-        self.state.emit("    mv t1, t0");
-        self.operand_to_t0(desired);
-        self.state.emit("    mv t3, t0");
-        self.operand_to_t0(expected);
-        self.state.emit("    mv t2, t0");
-
-        let aq_rl = Self::amo_ordering(ordering);
-
-        if Self::is_subword_type(ty) {
-            self.emit_subword_atomic_cmpxchg(ty, aq_rl, returns_bool);
-        } else {
-            let suffix = Self::amo_width_suffix(ty);
-            if matches!(ty, IrType::I32 | IrType::U32) {
-                // LR.W sign-extends on RV64. Compare the expected value in the
-                // same representation, including unsigned values >= 2^31.
-                self.state.emit("    sext.w t2, t2");
-            }
-
-            let loop_label = self.state.fresh_label("cas_loop");
-            let fail_label = self.state.fresh_label("cas_fail");
-            let done_label = self.state.fresh_label("cas_done");
-
-            self.state.emit_fmt(format_args!("{}:", loop_label));
-            self.state
-                .emit_fmt(format_args!("    lr.{}{} t0, (t1)", suffix, aq_rl));
-            self.state
-                .emit_fmt(format_args!("    bne t0, t2, {}", fail_label));
-            self.state
-                .emit_fmt(format_args!("    sc.{}{} t4, t3, (t1)", suffix, aq_rl));
-            self.state
-                .emit_fmt(format_args!("    bnez t4, {}", loop_label));
-            if returns_bool {
-                self.state.emit("    li t0, 1");
-            }
-            self.state.emit_fmt(format_args!("    j {}", done_label));
-            self.state.emit_fmt(format_args!("{}:", fail_label));
-            if returns_bool {
-                self.state.emit("    li t0, 0");
-            }
-            self.state.emit_fmt(format_args!("{}:", done_label));
+        if matches!(ty, IrType::I128 | IrType::U128) {
+            self.emit_atomic_cmpxchg_128(
+                dest,
+                ptr,
+                expected,
+                desired,
+                ordering,
+                failure_ordering,
+                returns_bool,
+            );
+            return;
         }
-        if !returns_bool {
+        let lr = Self::lr_ordering(ordering);
+        let sc = Self::sc_ordering(ordering);
+        if Self::is_subword_type(ty) {
+            self.atomic_stage(desired, "t3");
+            self.atomic_stage(expected, "t2");
+            self.atomic_stage(ptr, "t1");
+            self.emit_subword_atomic_cmpxchg(ty, lr, sc, returns_bool);
+            if !returns_bool {
+                Self::sign_extend_riscv(&mut self.state, ty);
+            }
+            self.store_t0_to(dest);
+            return;
+        }
+        let suffix = Self::amo_width_suffix(ty);
+        let desired_reg = self.atomic_operand_reg(desired, "t3", true);
+        // LR.W sign-extends on RV64: compare the expected value in the same
+        // representation, including unsigned values >= 2^31.
+        let expected_reg = if matches!(ty, IrType::I32 | IrType::U32 | IrType::F32) {
+            if Self::atomic_zero_operand(expected) {
+                "zero"
+            } else {
+                let reg = self.atomic_operand_reg(expected, "t2", true);
+                self.state.emit_fmt(format_args!("    sext.w t2, {reg}"));
+                "t2"
+            }
+        } else {
+            self.atomic_operand_reg(expected, "t2", true)
+        };
+        let ptr_reg = self.atomic_operand_reg(ptr, "t1", false);
+        let loop_label = self.state.fresh_label("cas_loop");
+        let fail_label = self.state.fresh_label("cas_fail");
+        self.state.emit_fmt(format_args!("{loop_label}:"));
+        self.state
+            .emit_fmt(format_args!("    lr.{suffix}{lr} t0, ({ptr_reg})"));
+        self.state
+            .emit_fmt(format_args!("    bne t0, {expected_reg}, {fail_label}"));
+        self.state.emit_fmt(format_args!(
+            "    sc.{suffix}{sc} t4, {desired_reg}, ({ptr_reg})"
+        ));
+        self.state
+            .emit_fmt(format_args!("    bnez t4, {loop_label}"));
+        self.state.emit_fmt(format_args!("{fail_label}:"));
+        if returns_bool {
+            // Both paths meet here: t0 equals the expected value exactly
+            // when the exchange happened.
+            self.state
+                .emit_fmt(format_args!("    sub t0, t0, {expected_reg}"));
+            self.state.emit("    seqz t0, t0");
+        } else if ty != IrType::I32 {
+            // LR.W already sign-extends an `int`.
             Self::sign_extend_riscv(&mut self.state, ty);
         }
         self.store_t0_to(dest);
@@ -712,42 +882,32 @@ impl RiscvCodegen {
         ty: IrType,
         ordering: AtomicOrdering,
     ) {
-        self.operand_to_t0(ptr);
-        if Self::is_subword_type(ty) {
-            if matches!(ordering, AtomicOrdering::SeqCst) {
-                self.state.emit("    fence rw, rw");
-            }
-            match ty {
-                IrType::I8 => self.state.emit("    lb t0, 0(t0)"),
-                IrType::U8 => self.state.emit("    lbu t0, 0(t0)"),
-                IrType::I16 => self.state.emit("    lh t0, 0(t0)"),
-                IrType::U16 => self.state.emit("    lhu t0, 0(t0)"),
-                _ => unreachable!("non-subword type in subword atomic load: {:?}", ty),
-            }
-            if matches!(
-                ordering,
-                AtomicOrdering::Acquire | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst
-            ) {
-                self.state.emit("    fence r, rw");
-            }
-        } else {
-            // Naturally aligned XLEN/word loads are already single-copy atomic.
-            // LR would unnecessarily create a reservation and is not required
-            // for an atomic load; fences supply the requested ordering.
-            if matches!(ordering, AtomicOrdering::SeqCst) {
-                self.state.emit("    fence rw, rw");
-            }
-            match ty {
-                IrType::I32 => self.state.emit("    lw t0, 0(t0)"),
-                IrType::U32 => self.state.emit("    lwu t0, 0(t0)"),
-                _ => self.state.emit("    ld t0, 0(t0)"),
-            }
-            if matches!(
-                ordering,
-                AtomicOrdering::Acquire | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst
-            ) {
-                self.state.emit("    fence r, rw");
-            }
+        if matches!(ty, IrType::I128 | IrType::U128) {
+            self.emit_atomic_load_128(dest, ptr, ordering);
+            return;
+        }
+        let ptr_reg = self.atomic_operand_reg(ptr, "t0", false);
+        // Naturally aligned loads are single-copy atomic; LR would only
+        // create a reservation.  The fences supply the ordering (Table A.6).
+        if matches!(ordering, AtomicOrdering::SeqCst) {
+            self.state.emit("    fence rw, rw");
+        }
+        let load = match ty {
+            IrType::I8 => "lb",
+            IrType::U8 => "lbu",
+            IrType::I16 => "lh",
+            IrType::U16 => "lhu",
+            IrType::I32 => "lw",
+            IrType::U32 | IrType::F32 => "lwu",
+            _ => "ld",
+        };
+        self.state
+            .emit_fmt(format_args!("    {load} t0, 0({ptr_reg})"));
+        if matches!(
+            ordering,
+            AtomicOrdering::Acquire | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst
+        ) {
+            self.state.emit("    fence r, rw");
         }
         self.store_t0_to(dest);
     }
@@ -759,42 +919,187 @@ impl RiscvCodegen {
         ty: IrType,
         ordering: AtomicOrdering,
     ) {
-        self.operand_to_t0(val);
-        self.state.emit("    mv t1, t0"); // t1 = val
+        if matches!(ty, IrType::I128 | IrType::U128) {
+            self.emit_atomic_store_128(ptr, val, ordering);
+            return;
+        }
+        let val_reg = self.atomic_operand_reg(val, "t1", true);
+        let ptr_reg = self.atomic_operand_reg(ptr, "t0", false);
+        // Naturally aligned stores are atomic: the RVWMO mapping, not an
+        // AMOSWAP whose old value is discarded.  The trailing fence of a
+        // seq_cst store is Clang 23.1.5's default, compatible with code
+        // built for either fence convention.
+        if matches!(
+            ordering,
+            AtomicOrdering::Release | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst
+        ) {
+            self.state.emit("    fence rw, w");
+        }
+        let store = match ty {
+            IrType::I8 | IrType::U8 => "sb",
+            IrType::I16 | IrType::U16 => "sh",
+            IrType::I32 | IrType::U32 | IrType::F32 => "sw",
+            _ => "sd",
+        };
+        self.state
+            .emit_fmt(format_args!("    {store} {val_reg}, 0({ptr_reg})"));
+        if matches!(ordering, AtomicOrdering::SeqCst) {
+            self.state.emit("    fence rw, rw");
+        }
+    }
+
+    // ---- 128-bit: libatomic calls ----
+    //
+    // A 16-byte atomic is a call point for the allocator
+    // (`liveness::instruction_is_call_point`) and keeps its function out of
+    // the a-register pool, the frameless and the fp-less frames
+    // (`riscv_emitter_safe_ir` admits no 16-byte atomic), so ra is saved
+    // and every a/t register is free once the operands are read.  Operands
+    // are read into t-registers first; the call arguments follow the psABI
+    // (a 2xXLEN scalar takes the next two argument registers, low half
+    // first).
+
+    /// libatomic's memory-model argument (`__ATOMIC_*`).
+    fn libatomic_model(ordering: AtomicOrdering) -> i64 {
+        match ordering {
+            AtomicOrdering::Relaxed => 0,
+            AtomicOrdering::Acquire => 2,
+            AtomicOrdering::Release => 3,
+            AtomicOrdering::AcqRel => 4,
+            AtomicOrdering::SeqCst => 5,
+        }
+    }
+
+    /// Call `name` and invalidate the cached register contents.
+    fn emit_libatomic_call(&mut self, name: &str) {
+        self.state.emit_fmt(format_args!("    call {name}"));
+        self.state.reg_cache.invalidate_all();
+    }
+
+    fn emit_atomic_load_128(&mut self, dest: &Value, ptr: &Operand, ordering: AtomicOrdering) {
+        // A load model may not release.
+        let model = match ordering {
+            AtomicOrdering::Release | AtomicOrdering::AcqRel => 5,
+            other => Self::libatomic_model(other),
+        };
         self.operand_to_t0(ptr);
-        if Self::is_subword_type(ty) {
-            if matches!(
-                ordering,
-                AtomicOrdering::Release | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst
-            ) {
-                self.state.emit("    fence rw, w");
-            }
-            match ty {
-                IrType::I8 | IrType::U8 => self.state.emit("    sb t1, 0(t0)"),
-                IrType::I16 | IrType::U16 => self.state.emit("    sh t1, 0(t0)"),
-                _ => unreachable!("non-subword type in subword atomic store: {:?}", ty),
-            }
-            if matches!(ordering, AtomicOrdering::SeqCst) {
-                self.state.emit("    fence rw, rw");
-            }
+        self.state.emit("    mv a0, t0");
+        self.state.emit_fmt(format_args!("    li a1, {model}"));
+        self.emit_libatomic_call("__atomic_load_16");
+        self.state.emit("    mv t0, a0");
+        self.state.emit("    mv t1, a1");
+        self.store_t0_t1_to(dest);
+    }
+
+    fn emit_atomic_store_128(&mut self, ptr: &Operand, val: &Operand, ordering: AtomicOrdering) {
+        // A store model may not acquire.
+        let model = match ordering {
+            AtomicOrdering::Acquire | AtomicOrdering::AcqRel => 5,
+            other => Self::libatomic_model(other),
+        };
+        self.operand_to_t0_t1(val);
+        self.state.emit("    mv t3, t0");
+        self.state.emit("    mv t4, t1");
+        self.operand_to_t0(ptr);
+        self.state.emit("    mv a0, t0");
+        self.state.emit("    mv a1, t3");
+        self.state.emit("    mv a2, t4");
+        self.state.emit_fmt(format_args!("    li a3, {model}"));
+        self.emit_libatomic_call("__atomic_store_16");
+    }
+
+    fn emit_atomic_rmw_128(
+        &mut self,
+        dest: &Value,
+        op: AtomicRmwOp,
+        ptr: &Operand,
+        val: &Operand,
+        ordering: AtomicOrdering,
+    ) {
+        let name = match op {
+            AtomicRmwOp::Add => "__atomic_fetch_add_16",
+            AtomicRmwOp::Sub => "__atomic_fetch_sub_16",
+            AtomicRmwOp::And => "__atomic_fetch_and_16",
+            AtomicRmwOp::Or => "__atomic_fetch_or_16",
+            AtomicRmwOp::Xor => "__atomic_fetch_xor_16",
+            AtomicRmwOp::Nand => "__atomic_fetch_nand_16",
+            AtomicRmwOp::Xchg | AtomicRmwOp::TestAndSet => "__atomic_exchange_16",
+        };
+        if matches!(op, AtomicRmwOp::TestAndSet) {
+            self.state.emit("    li t3, 1");
+            self.state.emit("    li t4, 0");
         } else {
-            // Naturally aligned word/doubleword stores are atomic. Match the
-            // standard RVWMO mapping instead of paying for an AMOSWAP whose
-            // old value is discarded.
-            if matches!(
-                ordering,
-                AtomicOrdering::Release | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst
-            ) {
-                self.state.emit("    fence rw, w");
-            }
-            if matches!(ty, IrType::I32 | IrType::U32) {
-                self.state.emit("    sw t1, 0(t0)");
-            } else {
-                self.state.emit("    sd t1, 0(t0)");
-            }
-            if matches!(ordering, AtomicOrdering::SeqCst) {
-                self.state.emit("    fence rw, rw");
-            }
+            self.operand_to_t0_t1(val);
+            self.state.emit("    mv t3, t0");
+            self.state.emit("    mv t4, t1");
+        }
+        self.operand_to_t0(ptr);
+        self.state.emit("    mv a0, t0");
+        self.state.emit("    mv a1, t3");
+        self.state.emit("    mv a2, t4");
+        self.state.emit_fmt(format_args!(
+            "    li a3, {}",
+            Self::libatomic_model(ordering)
+        ));
+        self.emit_libatomic_call(name);
+        self.state.emit("    mv t0, a0");
+        self.state.emit("    mv t1, a1");
+        self.store_t0_t1_to(dest);
+    }
+
+    /// `bool __atomic_compare_exchange_16(void *p, void *expected, U128
+    /// desired, int success, int failure)`: the expected pair goes through
+    /// a 16-byte area below sp, which then holds the old value either way
+    /// (libatomic writes it back on failure; on success it equals the
+    /// expected one).  No frame slot is addressed while sp is lowered:
+    /// every operand is read first.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_atomic_cmpxchg_128(
+        &mut self,
+        dest: &Value,
+        ptr: &Operand,
+        expected: &Operand,
+        desired: &Operand,
+        ordering: AtomicOrdering,
+        failure_ordering: AtomicOrdering,
+        returns_bool: bool,
+    ) {
+        // The failure model may neither release nor exceed the success one.
+        let failure = match failure_ordering {
+            AtomicOrdering::Release => AtomicOrdering::Relaxed,
+            AtomicOrdering::AcqRel => AtomicOrdering::Acquire,
+            other => other,
+        };
+        self.operand_to_t0_t1(expected);
+        self.state.emit("    mv t3, t0");
+        self.state.emit("    mv t4, t1");
+        self.operand_to_t0_t1(desired);
+        self.state.emit("    mv a2, t0");
+        self.state.emit("    mv a3, t1");
+        self.operand_to_t0(ptr);
+        self.state.emit("    mv a0, t0");
+        self.state.emit("    addi sp, sp, -16");
+        self.state.emit("    sd t3, 0(sp)");
+        self.state.emit("    sd t4, 8(sp)");
+        self.state.emit("    mv a1, sp");
+        self.state.emit_fmt(format_args!(
+            "    li a4, {}",
+            Self::libatomic_model(ordering)
+        ));
+        self.state.emit_fmt(format_args!(
+            "    li a5, {}",
+            Self::libatomic_model(failure)
+        ));
+        self.emit_libatomic_call("__atomic_compare_exchange_16");
+        if returns_bool {
+            self.state.emit("    mv t0, a0");
+            self.state.emit("    addi sp, sp, 16");
+            self.store_t0_to(dest);
+        } else {
+            self.state.emit("    ld t0, 0(sp)");
+            self.state.emit("    ld t1, 8(sp)");
+            self.state.emit("    addi sp, sp, 16");
+            self.store_t0_t1_to(dest);
         }
     }
 
