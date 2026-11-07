@@ -2633,6 +2633,7 @@ mod snapshot_forwarding_contract {
             instructions,
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: vec![],
         });
         let mut m = IrModule::new();
         m.functions.push(f);
@@ -2691,6 +2692,7 @@ mod snapshot_forwarding_contract {
             instructions,
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: vec![],
+            source_inline_ids: vec![],
         });
         let mut m = IrModule::new();
         m.functions.push(f);
