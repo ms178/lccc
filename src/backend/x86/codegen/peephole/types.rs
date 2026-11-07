@@ -1491,7 +1491,17 @@ pub(super) fn debug_transparent(store: &LineStore, info: LineInfo, i: usize) -> 
         || (!info.pinned
             && info.is_steppable()
             && is_debug_marker_directive(info.trimmed(store.get(i))))
+        || (!info.pinned
+            && info.kind == LineKind::Label
+            && is_inline_marker_label(info.trimmed(store.get(i))))
 }
+
+/// D6 inline-range endpoints are zero-width, compiler-private labels.  They
+/// are never branch targets; only `.debug_*` relocations name them.  The
+/// shared parser is exact so lookalikes and compound statements stay opaque.
+/// `hide_debug_rows` removes endpoints from every pass's view; this predicate
+/// remains for callers that inspect pre-hiding text.
+pub(super) use crate::backend::peephole_common::is_inline_range_marker as is_inline_marker_label;
 
 pub(super) fn next_non_debug(
     store: &LineStore,
@@ -3624,6 +3634,29 @@ mod classify_directive_tests {
             assert_eq!(i.inert_dir, want, "inert flag for {text}");
             assert_eq!(i.is_steppable(), want, "steppable for {text}");
             assert_eq!(i.is_barrier(), !want, "barrier for {text}");
+        }
+    }
+
+    #[test]
+    fn inline_marker_labels_are_local_adjacency_transparent() {
+        for text in [
+            ".Llccc_inline_b_0_0_main:",
+            "  .Llccc_inline_e_12_34_pq_frame:  # endpoint",
+        ] {
+            let info = classify_line(text);
+            assert_eq!(info.kind, LineKind::Label, "{text}");
+            assert!(is_inline_marker_label(info.trimmed(text)), "{text}");
+        }
+        for text in [
+            "main:",
+            ".LBB6:",
+            ".Llccc_inline_not_a_label",
+            ".long .Llccc_inline_b_0_0_main:",
+        ] {
+            assert!(
+                !is_inline_marker_label(classify_line(text).trimmed(text)),
+                "{text}"
+            );
         }
     }
 

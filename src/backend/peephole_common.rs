@@ -579,75 +579,139 @@ impl LineStore {
         result
     }
 
-    /// [`Self::build_result`] for a store whose `-g` line rows were hidden
-    /// from the passes (`rows[i]`: line `i` was a `.loc` the driver marked
-    /// deleted so no window could see it -- the only way `-g` cannot change
-    /// the code, whatever adjacency each pass assumes).
+    /// [`Self::build_result`] for a store whose `-g` metadata rows were hidden
+    /// from the passes (the driver marked every `.loc` and inline-range
+    /// endpoint deleted so no window could see it -- the only way `-g` cannot
+    /// change the code, whatever adjacency each pass assumes).
     ///
-    /// A hidden row is re-emitted where it stood: it is held and written
-    /// directly before the next line that survives. A later row reached
-    /// first supersedes it (both would describe the same address, where the
-    /// last row wins), which also retires the copy a deleted duplicate block
-    /// carried; a row with no surviving line after it is dropped. A slot a
-    /// pass overwrote is emitted as its new text through `skip`.
-    pub(crate) fn build_result_with_debug_rows(
-        &self,
-        skip: impl Fn(usize) -> bool,
-        rows: &[bool],
-    ) -> String {
+    /// Hidden rows are recognized by their text at render time, not by a
+    /// pre-pass index bitmap: structural passes may `insert_line`, and a
+    /// bitmap captured before the insertion would silently drop or misplace
+    /// every endpoint after the insertion point.  A skipped line whose text
+    /// is still metadata is held and written directly before the next line
+    /// that survives.  `.loc` rows describe the same address until the next
+    /// surviving instruction, so a later `.loc` supersedes an earlier held
+    /// one.  Inline-range endpoints are different: every begin/end pair is
+    /// load-bearing DWARF data, so they are all preserved in their original
+    /// order, including a trailing end marker whose following instructions
+    /// were all deleted.  A slot a pass overwrote with non-metadata text is
+    /// emitted (or dropped) through `skip` like any other line.
+    pub(crate) fn build_result_with_debug_rows(&self, skip: impl Fn(usize) -> bool) -> String {
         let mut result = String::with_capacity(self.original.len());
-        let mut held: Option<usize> = None;
+        let mut held: Vec<usize> = Vec::new();
         for i in 0..self.entries.len() {
             if !skip(i) {
-                if let Some(row) = held.take() {
+                for row in held.drain(..) {
                     result.push_str(self.get(row));
                     result.push('\n');
                 }
                 result.push_str(self.get(i));
                 result.push('\n');
-            } else if rows.get(i).copied().unwrap_or(false) && is_loc_directive(self.get(i).trim())
-            {
-                held = Some(i);
+            } else {
+                let text = self.get(i).trim();
+                if is_inline_range_marker(text) {
+                    held.push(i);
+                } else if is_loc_directive(text) {
+                    if let Some(pos) = held
+                        .iter()
+                        .rposition(|&row| is_loc_directive(self.get(row).trim()))
+                    {
+                        held.remove(pos);
+                    }
+                    held.push(i);
+                }
+            }
+        }
+        for row in held {
+            if is_inline_range_marker(self.get(row).trim()) {
+                result.push_str(self.get(row));
+                result.push('\n');
             }
         }
         result
     }
 }
 
-/// Hide every `-g` line row from a `Vec<String>` peephole (AArch64, RISC-V)
-/// by classifying it as deleted, so no window, adjacency test or line census
-/// can see it: `-g` must not change the code. [`join_with_debug_rows`] puts
-/// the rows back.
+/// Hide every `-g` metadata row from a `Vec<String>` peephole (AArch64,
+/// RISC-V) by classifying it as deleted, so no window, adjacency test or line
+/// census can see it: `-g` must not change the code. [`join_with_debug_rows`]
+/// puts the rows back.
 pub(crate) fn hide_debug_rows<K: Copy>(lines: &[String], kinds: &mut [K], deleted: K) {
     for (line, kind) in lines.iter().zip(kinds.iter_mut()) {
-        if is_loc_directive(line.trim()) {
+        let text = line.trim();
+        if is_loc_directive(text) || is_inline_range_marker(text) {
             *kind = deleted;
         }
     }
 }
 
 /// [`LineStore::build_result_with_debug_rows`] for the `Vec<String>`
-/// peepholes. A deleted line whose text is still a `.loc` is a hidden row
-/// (or a pass's copy of one; no pass saw rows as anything but deleted lines).
-/// It is held and written directly before the next kept line; a later row
-/// reached first supersedes it, and a row with no kept line after it is
-/// dropped.
+/// peepholes. A deleted line whose text is still a `.loc` or inline-range
+/// endpoint is a hidden row (or a pass's copy of one; no pass saw rows as
+/// anything but deleted lines).  Rows are held and written directly before
+/// the next kept line.  A later `.loc` supersedes an earlier held `.loc`;
+/// every inline-range endpoint is preserved in order, including trailing
+/// endpoints with no kept line after them.
 pub(crate) fn join_with_debug_rows(lines: &[String], kept: impl Fn(usize) -> bool) -> String {
     let mut result = String::with_capacity(lines.iter().map(|l| l.len() + 1).sum());
-    let mut held: Option<&str> = None;
+    let mut held: Vec<&str> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         if kept(i) {
-            if let Some(row) = held.take() {
+            for row in held.drain(..) {
                 result.push_str(row);
                 result.push('\n');
             }
             result.push_str(line);
             result.push('\n');
-        } else if is_loc_directive(line.trim()) {
-            held = Some(line);
+        } else {
+            let text = line.trim();
+            if is_inline_range_marker(text) {
+                held.push(line);
+            } else if is_loc_directive(text) {
+                if let Some(pos) = held.iter().rposition(|row| is_loc_directive(row.trim())) {
+                    held.remove(pos);
+                }
+                held.push(line);
+            }
+        }
+    }
+    for row in held {
+        if is_inline_range_marker(row.trim()) {
+            result.push_str(row);
+            result.push('\n');
         }
     }
     result
+}
+
+/// The first row at or after `lead` that survives into the code, or `None`
+/// when every row to `end` is deleted.
+///
+/// A basic-block leader must name a live row. `-g` emits `.loc` rows and D6
+/// inline-range endpoints, which every backend's `hide_debug_rows` rewrites to
+/// a deleted kind, and an endpoint routinely lands immediately after a
+/// transfer. Naming that row as the fall-through leader opens a spurious empty
+/// block and splits the real one, so the CFG stops being a function of the live
+/// text and `-g` can change the code (measured on i686: 120 -> 122 blocks and a
+/// lost join forward).
+///
+/// This is one shared rule rather than three hand-written walks. Each backend
+/// has its own `LineKind`, so the deletion test arrives as a closure; the walk
+/// itself -- the part that was wrong -- exists once and is unit-tested here.
+///
+/// `lead` may equal `end`; the loop is bounded by `end`, so the result is always
+/// `None` or a valid index in `lead..end`. No arithmetic can overflow: `lead`
+/// only advances while `lead < end`, and `end` is a slice length.
+#[inline]
+pub(crate) fn first_live_row(
+    mut lead: usize,
+    end: usize,
+    mut deleted: impl FnMut(usize) -> bool,
+) -> Option<usize> {
+    while lead < end && deleted(lead) {
+        lead += 1;
+    }
+    if lead < end { Some(lead) } else { None }
 }
 
 /// A `-g` line-table row: `.loc` and its operands (blank-separated), not a
@@ -656,6 +720,39 @@ pub(crate) fn is_loc_directive(trimmed: &str) -> bool {
     trimmed
         .strip_prefix(".loc")
         .is_some_and(|rest| rest.starts_with([' ', '\t']))
+}
+
+/// A D6 inline-range endpoint: `.Llccc_inline_{b,e}_<id>_<serial>_<function>:`.
+/// These are zero-width, compiler-private labels referenced only by DWARF
+/// relocations.  They must be invisible to peephole adjacency (like `.loc`)
+/// but every endpoint must survive verbatim and in order.  The parser is
+/// exact: lookalikes, compound statements and data directives are not rows.
+pub(crate) fn is_inline_range_marker(trimmed: &str) -> bool {
+    let Some(stmt) = single_asm_statement(trimmed) else {
+        return false;
+    };
+    let Some(label) = stmt.strip_suffix(':') else {
+        return false;
+    };
+    let Some(rest) = label.strip_prefix(".Llccc_inline_") else {
+        return false;
+    };
+    let Some((kind, rest)) = rest.split_once('_') else {
+        return false;
+    };
+    if kind != "b" && kind != "e" {
+        return false;
+    }
+    let mut parts = rest.splitn(3, '_');
+    let (Some(id), Some(serial), Some(function)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    !id.is_empty()
+        && id.bytes().all(|b| b.is_ascii_digit())
+        && !serial.is_empty()
+        && serial.bytes().all(|b| b.is_ascii_digit())
+        && !function.is_empty()
 }
 
 // ── Assembler-directive effects ────────────────────────────────────────────────
@@ -1202,6 +1299,37 @@ pub(crate) fn inline_asm_protected_ranges(lines: &[String]) -> Option<Vec<std::o
 
 #[cfg(test)]
 mod inert_directive_tests {
+    /// The shared leader walk: bounds, all-deleted, none-deleted, and the
+    /// interior run. These are the cases the three hand-written walks each had
+    /// to get right independently.
+    #[test]
+    fn first_live_row_bounds_and_runs() {
+        use super::first_live_row;
+        // Empty range, and lead == end: no row exists.
+        assert_eq!(first_live_row(0, 0, |_| false), None);
+        assert_eq!(first_live_row(3, 3, |_| false), None);
+        // lead > end must not run off the slice.
+        assert_eq!(first_live_row(5, 3, |_| true), None);
+        // Nothing deleted: the candidate itself is the answer.
+        assert_eq!(first_live_row(2, 6, |_| false), Some(2));
+        // Everything deleted: no leader.
+        assert_eq!(first_live_row(2, 6, |_| true), None);
+        // A run of deleted rows followed by a live one.
+        let deleted = [true, true, false, true];
+        assert_eq!(first_live_row(0, 4, |i| deleted[i]), Some(2));
+        // The live row is the last index -- the boundary that an off-by-one
+        // would turn into None.
+        assert_eq!(first_live_row(0, 4, |i| i != 3), Some(3));
+        // The closure must never be called at or past `end`.
+        let mut max_seen = 0usize;
+        let r = first_live_row(1, 4, |i| {
+            max_seen = max_seen.max(i);
+            true
+        });
+        assert_eq!(r, None);
+        assert_eq!(max_seen, 3, "probe read past the range");
+    }
+
     use super::*;
 
     #[test]
@@ -1873,7 +2001,7 @@ mod tests {
 
 #[cfg(test)]
 mod debug_row_tests {
-    use super::{LineStore, is_loc_directive};
+    use super::{LineStore, is_inline_range_marker, is_loc_directive, join_with_debug_rows};
 
     #[test]
     fn loc_lookalikes_are_not_rows() {
@@ -1886,6 +2014,31 @@ mod debug_row_tests {
             ".file 1 \"a.c\"",
         ] {
             assert!(!is_loc_directive(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn inline_range_marker_parser_is_exact() {
+        for t in [
+            ".Llccc_inline_b_0_0_main:",
+            ".Llccc_inline_e_12_34_pq_frame:  # endpoint",
+            "\t.Llccc_inline_b_7_9_foo.bar$baz:\r",
+        ] {
+            assert!(is_inline_range_marker(t.trim()), "{t}");
+        }
+        for t in [
+            "main:",
+            ".LBB6:",
+            ".Llccc_inline_not_a_label",
+            ".Llccc_inline_x_0_0_main:",
+            ".Llccc_inline_b__0_main:",
+            ".Llccc_inline_b_0__main:",
+            ".Llccc_inline_b_0_0_:",
+            ".long .Llccc_inline_b_0_0_main:",
+            ".Llccc_inline_b_0_0_main: nop",
+            ".Llccc_inline_b_0_0_main; nop:",
+        ] {
+            assert!(!is_inline_range_marker(t), "{t}");
         }
     }
 
@@ -1902,8 +2055,77 @@ mod debug_row_tests {
         store.replace(6, "planted".to_string());
         let deleted = |i: usize| (rows[i] && i != 6) || i == 3;
         assert_eq!(
-            store.build_result_with_debug_rows(deleted, &rows),
+            store.build_result_with_debug_rows(deleted),
             ".loc 1 1 0\na\n.loc 1 3 0\nb\nplanted\nc\n"
+        );
+    }
+
+    /// Inline endpoints are not superseded like `.loc`: every begin/end pair
+    /// survives in order, even when the instructions between them are deleted
+    /// and when the final end marker has no surviving instruction after it.
+    #[test]
+    fn hidden_inline_endpoints_survive_deletion_and_trailing_position() {
+        let text = concat!(
+            ".loc 1 1 0\n",
+            ".Llccc_inline_b_0_0_f:\n",
+            "dead_a\n",
+            ".loc 1 2 0\n",
+            ".Llccc_inline_e_0_0_f:\n",
+            ".Llccc_inline_b_1_1_f:\n",
+            "keep\n",
+            ".Llccc_inline_e_1_1_f:\n",
+            "dead_b\n",
+            ".Llccc_inline_b_2_2_f:\n",
+            ".Llccc_inline_e_2_2_f:\n",
+            ".loc 1 9 0\n",
+        );
+        let mut store = LineStore::new(text.to_string());
+        let rows = [
+            true, true, false, true, true, true, false, true, false, true, true, true,
+        ];
+        let deleted = |i: usize| rows[i] || i == 2 || i == 8;
+        assert_eq!(
+            store.build_result_with_debug_rows(deleted),
+            concat!(
+                ".Llccc_inline_b_0_0_f:\n",
+                ".loc 1 2 0\n",
+                ".Llccc_inline_e_0_0_f:\n",
+                ".Llccc_inline_b_1_1_f:\n",
+                "keep\n",
+                ".Llccc_inline_e_1_1_f:\n",
+                ".Llccc_inline_b_2_2_f:\n",
+                ".Llccc_inline_e_2_2_f:\n",
+            )
+        );
+
+        let lines: Vec<String> = text.lines().map(str::to_string).collect();
+        assert_eq!(
+            join_with_debug_rows(&lines, |i| !deleted(i)),
+            store.build_result_with_debug_rows(deleted)
+        );
+        // A pass overwriting a hidden endpoint slot emits the replacement,
+        // not the stale endpoint; the slot's current text decides.
+        store.replace(1, "planted".to_string());
+        let out = store.build_result_with_debug_rows(|i| rows[i] && i != 1 || i == 2 || i == 8);
+        assert!(out.starts_with(".loc 1 1 0\nplanted\n.loc 1 2 0\n.Llccc_inline_e_0_0_f:\n"));
+    }
+
+    /// A structural pass may insert a line after the driver hid the rows.
+    /// Rendering must follow the shifted text, not a stale index bitmap:
+    /// the endpoint after the insertion still survives, in order.
+    #[test]
+    fn hidden_endpoints_survive_structural_insertion() {
+        let mut store = LineStore::new(
+            ".loc 1 1 0\n.Llccc_inline_b_0_0_f:\ndead\nkeep\n.Llccc_inline_e_0_0_f:\n".to_string(),
+        );
+        // Hide rows 0, 1 and 4; delete row 2; keep row 3.  Then insert a
+        // surviving instruction before the begin endpoint, shifting it and
+        // the end endpoint one slot to the right.
+        store.insert_line(1, "planted".to_string());
+        let out = store.build_result_with_debug_rows(|i| i == 0 || i == 2 || i == 3 || i == 5);
+        assert_eq!(
+            out,
+            ".loc 1 1 0\nplanted\n.Llccc_inline_b_0_0_f:\nkeep\n.Llccc_inline_e_0_0_f:\n"
         );
     }
 }

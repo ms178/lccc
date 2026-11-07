@@ -1164,6 +1164,7 @@ impl Lowerer {
             debug_param_indices,
             debug_locals,
             debug_scopes,
+            debug_inline_instances: Vec::new(),
             pass_policy: Default::default(),
             name: nf.name.clone(),
             return_type,

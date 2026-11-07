@@ -2457,6 +2457,7 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
                 false_label: binit_label,
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // M block: call operands + exit reconstructions + the call + Branch -> E.
@@ -2494,6 +2495,7 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
             instructions: call_insts,
             terminator: Terminator::Branch(exit_label),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // Remove the header block (last: all indices above are pre-removal).
@@ -2566,6 +2568,7 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
                 false_label: exit_label,
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // M block: call operands + exit reconstructions + the call + Branch -> E.
@@ -2603,6 +2606,7 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
             instructions: call_insts,
             terminator: Terminator::Branch(exit_label),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // E phis: the header was E's only predecessor, so every existing phi
@@ -2737,6 +2741,7 @@ mod tests {
             instructions,
             terminator,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 

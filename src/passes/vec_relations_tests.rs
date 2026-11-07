@@ -10,6 +10,7 @@ fn function(code: Vec<Instruction>) -> IrFunction {
         label: BlockId(0),
         instructions: code,
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
         terminator: Terminator::Return(None),
     }];
     f

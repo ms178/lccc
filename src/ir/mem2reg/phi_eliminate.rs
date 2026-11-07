@@ -1459,33 +1459,13 @@ fn copies_equal(a: &[Instruction], b: &[Instruction]) -> bool {
 
 fn apply_phi_transformations(func: &mut IrFunction, ctx: &mut PhiElimCtx) {
     for (block_idx, block) in func.blocks.iter_mut().enumerate() {
-        // Remove phi instructions (and their spans)
-        if !block.source_spans.is_empty() {
-            let mut span_idx = 0;
-            block.source_spans.retain(|_| {
-                let keep = !matches!(
-                    block.instructions.get(span_idx),
-                    Some(Instruction::Phi { .. })
-                );
-                span_idx += 1;
-                keep
-            });
-        }
-        block
-            .instructions
-            .retain(|inst| !matches!(inst, Instruction::Phi { .. }));
+        // Remove phi instructions (and their spans/provenance) in one pass.
+        block.retain_insts(|inst| !matches!(inst, Instruction::Phi { .. }));
 
         // Prepend target copies (these go at the start, replacing the phis)
         if !ctx.target_copies[block_idx].is_empty() {
-            let num_copies = ctx.target_copies[block_idx].len();
-            let mut new_insts = ctx.target_copies[block_idx].clone();
-            new_insts.append(&mut block.instructions);
-            block.instructions = new_insts;
-            if !block.source_spans.is_empty() {
-                let mut new_spans = vec![crate::common::source::Span::dummy(); num_copies];
-                new_spans.append(&mut block.source_spans);
-                block.source_spans = new_spans;
-            }
+            let copies = ctx.target_copies[block_idx].clone();
+            block.insert_insts(0, copies, crate::common::source::Span::dummy());
         }
 
         // Insert predecessor copies before the terminator, ahead of the
@@ -1516,6 +1496,7 @@ fn apply_phi_transformations(func: &mut IrFunction, ctx: &mut PhiElimCtx) {
             label: trampoline.label,
             instructions: trampoline.copies,
             source_spans: vec![crate::common::source::Span::dummy(); num_copies],
+            source_inline_ids: Vec::new(),
             terminator: Terminator::Branch(trampoline.branch_target),
         });
     }
@@ -1570,18 +1551,29 @@ fn place_pred_copies(block: &mut BasicBlock, copies: Vec<Instruction>) {
         }
     }
     let in_chain = |i: usize| chain.binary_search(&i).is_ok();
-    let spans = block.take_parallel_spans();
+    let (spans, ids) = block.take_parallel_debug();
     let tracked = !spans.is_empty();
+    let track_ids = !ids.is_empty();
+    let inline_at = |i: usize| {
+        ids.get(i)
+            .copied()
+            .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE)
+    };
     let old = std::mem::take(&mut block.instructions);
     let mut insts = Vec::with_capacity(old.len() + num_copies);
     let mut new_spans = Vec::with_capacity(if tracked { insts.capacity() } else { 0 });
+    let mut new_ids = Vec::with_capacity(if tracked { insts.capacity() } else { 0 });
     let mut tail = Vec::with_capacity(chain.len());
     let mut tail_spans = Vec::with_capacity(if tracked { chain.len() } else { 0 });
+    let mut tail_ids = Vec::with_capacity(if tracked { chain.len() } else { 0 });
     for (i, mut inst) in old.into_iter().enumerate() {
         let span = spans.get(i).copied();
         if !in_chain(i) {
             insts.push(inst);
             new_spans.extend(span);
+            if track_ids {
+                new_ids.push(inline_at(i));
+            }
             continue;
         }
         inst.for_each_operand_mut(|op| {
@@ -1598,14 +1590,31 @@ fn place_pred_copies(block: &mut BasicBlock, copies: Vec<Instruction>) {
         });
         tail.push(inst);
         tail_spans.extend(span);
+        if track_ids {
+            tail_ids.push(inline_at(i));
+        }
     }
     insts.extend(copies);
     if tracked {
         new_spans.extend(std::iter::repeat_n(Span::dummy(), num_copies));
     }
+    if track_ids {
+        new_ids.extend(std::iter::repeat_n(
+            crate::ir::instruction::NO_INLINE_INSTANCE,
+            num_copies,
+        ));
+    }
     insts.extend(tail);
     new_spans.extend(tail_spans);
-    block.replace_insts(insts, new_spans);
+    if track_ids {
+        new_ids.extend(tail_ids);
+    } else {
+        // Span-only blocks do not track inline provenance; handing
+        // replace_insts_inline a nonempty id list would turn tracking on for a
+        // non-debug build and drift the array on the next span-only edit.
+        new_ids.clear();
+    }
+    block.replace_insts_inline(insts, new_spans, new_ids);
 }
 
 /// Ascending indices of the compare chain feeding `block`'s `CondBranch` when
@@ -1929,18 +1938,13 @@ fn fold_computed_phi_incomings(func: &mut IrFunction) {
             let block = &mut func.blocks[bi];
             // Position-only mutation: the definition (and the IR def set)
             // is unchanged; the sink merely relocates it.
-            let def_inst = block.instructions.remove(def_pos);
-            if !block.source_spans.is_empty() {
-                let span = block
-                    .source_spans
-                    .remove(def_pos.min(block.source_spans.len() - 1));
-                let at = (copy_pos - 1).min(block.source_spans.len());
-                block.source_spans.insert(at, span);
-            }
+            let span = block.span_at(def_pos);
+            let inline_id = block.inline_id_at(def_pos);
+            let def_inst = block.remove_inst(def_pos);
             // Definition removal shifted the copy down one slot; the
             // definition lands directly before it.
             let copy_pos = copy_pos - 1;
-            block.instructions.insert(copy_pos, def_inst);
+            block.insert_inst_inline(copy_pos, def_inst, span, inline_id);
         }
     }
 }
@@ -1954,6 +1958,7 @@ mod tests {
             label: BlockId(label),
             instructions: insts,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
             terminator: term,
         }
     }

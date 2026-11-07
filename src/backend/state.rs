@@ -1181,10 +1181,28 @@ impl CodegenState {
     /// ever costs one `fstp %st(0)`. Inert on every backend that never sets
     /// `x87_pending` (x86-64/ARM/RISC-V) and while `x87_suppress` is set
     /// (the binop's own controlled sequences).
+    ///
+    /// A D6 inline-range marker is a label, but it is NOT a merge point:
+    /// nothing ever branches to it, the peepholes delete it from their view,
+    /// and the DWARF writer only reads it as a range endpoint. Treating it as
+    /// a barrier flushed the pending copy whenever `-g` happened to place an
+    /// endpoint between a rounding store and its single consumer, so `-g`
+    /// emitted `fldl; fstp %st(0)` plus a reload where `-g0` kept the value in
+    /// st(0) -- debug info buying LESS optimization (measured on i686 -O1:
+    /// fp_die_at_birth.c, unroll_const4_f64_distance.c,
+    /// call_return_type_function_pointer_shadow.c). The exclusion uses the
+    /// same exact-match predicate the peepholes and the invariance filter use,
+    /// so a lookalike label that IS a real target still flushes.
+    ///
+    /// Cost: the marker probe runs only when a pending copy is live AND the
+    /// line ends with `:`, which is a label emitted inside an x87 deferral
+    /// window -- rare, and already off the hot path by the two guards above.
     fn x87_pre_emit(&mut self, s: &str) {
         if self.x87_pending.is_some() && !self.x87_suppress {
             let is_x87_line = s.len() >= 5 && s.starts_with("    f");
-            if is_x87_line || s.ends_with(':') {
+            let is_merge_point = s.ends_with(':')
+                && !crate::backend::peephole_common::is_inline_range_marker(s.trim());
+            if is_x87_line || is_merge_point {
                 self.x87_pending = None;
                 self.out.emit("    fstp %st(0)");
             }
@@ -2372,6 +2390,76 @@ mod block_address_identity_tests {
         state.begin_block_address_identity(true);
         state.reset_for_function();
         assert!(!state.fallthrough_would_alias_observable_label());
+    }
+
+    /// The x87 pending-copy flush gate must treat a D6 range endpoint as the
+    /// debug-only, never-targeted label it is, while every REAL merge point
+    /// still flushes. Getting this wrong in the permissive direction is a
+    /// miscompile (a branch could arrive with a stale st(0)); getting it wrong
+    /// in the strict direction is what `-g` used to do -- lose the deferral and
+    /// emit `fldl; fstp %st(0)` plus a reload.
+    #[test]
+    fn x87_flush_gate_excludes_only_exact_d6_markers() {
+        fn emit_with_pending(line: &str) -> (bool, bool) {
+            let mut state = CodegenState::new();
+            state.x87_pending = Some(7);
+            state.out.buf.clear();
+            state.emit(line);
+            (
+                state.out.buf.contains("fstp %st(0)"),
+                state.x87_pending.is_some(),
+            )
+        }
+        // Real labels are merge points: flush and drop the cache.
+        for real in [".Ltarget:", ".LBB12:", "foo:", ".Llccc_other:"] {
+            let (flushed, kept) = emit_with_pending(real);
+            assert!(flushed, "a real label must flush: {real}");
+            assert!(!kept, "the cache must be dropped after flushing: {real}");
+        }
+        // Exact D6 endpoints are not targets: keep the copy, emit no pop.
+        for marker in [
+            ".Llccc_inline_b_0_0_f:",
+            ".Llccc_inline_e_1_3_f:",
+            ".Llccc_inline_b_12_99_mod$name:",
+        ] {
+            let (flushed, kept) = emit_with_pending(marker);
+            assert!(!flushed, "a D6 endpoint must not flush: {marker}");
+            assert!(kept, "the copy must survive a D6 endpoint: {marker}");
+        }
+        // Lookalikes are NOT markers and must still flush -- the exclusion is
+        // an exact-match predicate, not a prefix test.
+        for lookalike in [
+            ".Llccc_inline_x_0_0_f:",   // bad kind
+            ".Llccc_inline_b__0_f:",    // missing id
+            ".Llccc_inline_b_0_0_:",    // empty function
+            ".Llccc_inline_b_0_0_foo:", // valid shape -> marker, handled below
+        ] {
+            let (flushed, _) = emit_with_pending(lookalike);
+            if lookalike == ".Llccc_inline_b_0_0_foo:" {
+                assert!(!flushed, "this IS a valid marker");
+            } else {
+                assert!(flushed, "a lookalike is a real label: {lookalike}");
+            }
+        }
+        // An x87 instruction always flushes.
+        let (flushed, _) = emit_with_pending("    fldl 8(%esp)");
+        assert!(flushed, "an x87 op must flush");
+        // A line-table row is inert.
+        let (flushed, kept) = emit_with_pending(".loc 1 2 0");
+        assert!(!flushed && kept, ".loc must be inert");
+        // No pending copy: nothing to flush, even at a real label.
+        let mut state = CodegenState::new();
+        state.out.buf.clear();
+        state.emit(".Ltarget:");
+        assert!(!state.out.buf.contains("fstp %st(0)"));
+        // Suppressed (the binop's own controlled sequence): never flush.
+        let mut state = CodegenState::new();
+        state.x87_pending = Some(7);
+        state.x87_suppress = true;
+        state.out.buf.clear();
+        state.emit("    fldl 8(%esp)");
+        assert!(!state.out.buf.contains("fstp %st(0)"));
+        assert!(state.x87_pending.is_some());
     }
 
     #[test]

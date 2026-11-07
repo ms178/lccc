@@ -272,6 +272,7 @@ mod tests {
             instructions,
             terminator: term,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
     fn bin(dest: u32, op: IrBinOp, a: u32, b: u32, ty: IrType) -> Instruction {
@@ -1705,6 +1706,7 @@ mod tests {
         f.blocks[0].source_spans = (0..n)
             .map(|i| crate::common::source::Span::new(100 + 10 * i as u32, 109 + 10 * i as u32, 7))
             .collect();
+        f.blocks[0].source_inline_ids = (0..n).map(|i| 7000 + i as u32).collect();
         let applied = run_with_policy(&mut f, conservative_policy(64));
         assert!(applied >= 1);
         let b = &f.blocks[0];
@@ -1712,6 +1714,11 @@ mod tests {
             b.source_spans.len(),
             b.instructions.len(),
             "spans and instructions must stay 1:1 after insertion"
+        );
+        assert_eq!(
+            b.source_inline_ids.len(),
+            b.instructions.len(),
+            "inline provenance and instructions must stay 1:1 after insertion"
         );
         // Original instructions (dest id < 900) retain their own span in
         // order; clones (fresh ids >= 900) borrow the following original's
@@ -1721,9 +1728,11 @@ mod tests {
             let id = inst.dest().map(|v| v.0).unwrap_or(0);
             if id < 900 {
                 assert_eq!(b.source_spans[ii].start, 100 + 10 * orig_idx as u32);
+                assert_eq!(b.source_inline_ids[ii], 7000 + orig_idx as u32);
                 orig_idx += 1;
             } else if ii + 1 < b.instructions.len() {
                 assert_eq!(b.source_spans[ii], b.source_spans[ii + 1]);
+                assert_eq!(b.source_inline_ids[ii], b.source_inline_ids[ii + 1]);
             }
         }
         assert_eq!(orig_idx, n, "every original instruction retained");

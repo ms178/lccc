@@ -66,6 +66,7 @@ impl P {
         f.blocks.push(BasicBlock {
             label: BlockId(0),
             source_spans: vec![crate::common::source::Span::dummy(); self.code.len()],
+            source_inline_ids: Vec::new(),
             instructions: self.code,
             terminator: Terminator::Return(Some(root)),
         });

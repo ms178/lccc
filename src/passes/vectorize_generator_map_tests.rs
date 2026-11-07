@@ -18,6 +18,7 @@ fn generator(start: u64, limit: u64, ty: IrType) -> IrFunction {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         },
         BasicBlock {
             label: BlockId(1),
@@ -44,6 +45,7 @@ fn generator(start: u64, limit: u64, ty: IrType) -> IrFunction {
                 false_label: BlockId(3),
             },
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         },
         BasicBlock {
             label: BlockId(2),
@@ -90,12 +92,14 @@ fn generator(start: u64, limit: u64, ty: IrType) -> IrFunction {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         },
         BasicBlock {
             label: BlockId(3),
             instructions: vec![],
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         },
     ];
     f.next_value_id = 32;

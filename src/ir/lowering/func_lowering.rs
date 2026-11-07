@@ -1192,6 +1192,7 @@ impl Lowerer {
             debug_param_indices,
             debug_locals: std::mem::take(&mut self.func_mut().debug_locals),
             debug_scopes: std::mem::take(&mut self.func_mut().debug_scopes),
+            debug_inline_instances: Vec::new(),
             pass_policy: Default::default(),
             // GCC __asm__("symbol") asm labels: a function DEFINITION must be
             // emitted under the asm label, not its C name. The declaration

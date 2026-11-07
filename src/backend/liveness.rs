@@ -1065,6 +1065,7 @@ pub(crate) fn instruction_is_call_point(inst: &Instruction) -> bool {
                     .map(|(c, ..)| c.as_str())
                     .chain(inputs.iter().map(|(c, ..)| c.as_str())),
                 !goto_labels.is_empty(),
+                !clobbers.is_empty(),
             );
             !inert
                 && (!outputs.is_empty()
@@ -2793,6 +2794,7 @@ mod tests {
                 false_label: BlockId(3),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -2802,12 +2804,14 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Value(Value(5)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         let mut info = empty_call_info(Some(Value(6)));
         info.args = vec![Operand::Value(Value(0))];
@@ -2827,6 +2831,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 7;
 
@@ -2875,6 +2880,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // B1 points: GEP = 3, Load (the access) = 4, latch copy = 5,
         // Cmp = 6, term = 7.
@@ -2912,12 +2918,14 @@ mod tests {
                 false_label: BlockId(2),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 5;
         // Forced precise: the assertion is the contract, independent of the
@@ -2961,6 +2969,7 @@ mod tests {
                 false_label: BlockId(2),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // B1 points: the first def of v5 = 2, term = 3.
         func.blocks.push(BasicBlock {
@@ -2971,6 +2980,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(3)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // B2 points: v6 = 4, local def of v5 = 5, GEP = 6, Load = 7, term = 8.
         func.blocks.push(BasicBlock {
@@ -3003,12 +3013,14 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(3)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(3),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Value(Value(5)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 9;
         let _pin =
@@ -3076,6 +3088,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // Loop body: folded GEPs (indices = the phis v4/v5), the accesses,
         // the decrements, and the latch Copies.
@@ -3138,12 +3151,14 @@ mod tests {
                 false_label: BlockId(2),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 12;
 
@@ -3269,6 +3284,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(7)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 8;
 
@@ -3372,6 +3388,7 @@ mod tests {
                 false_label: BlockId(3),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -3400,12 +3417,14 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Value(Value(6)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(3),
@@ -3418,6 +3437,7 @@ mod tests {
             }],
             terminator: Terminator::Return(Some(Operand::Value(Value(7)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 8;
 
@@ -3484,6 +3504,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(0)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 2;
 
@@ -3520,6 +3541,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(0)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 1;
 
@@ -3567,6 +3589,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 4;
 
@@ -3697,6 +3720,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(0)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 1;
 
@@ -3735,6 +3759,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 3;
 
@@ -3765,6 +3790,7 @@ mod tests {
             instructions,
             terminator,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         };
         func.blocks = vec![
             block(
@@ -3845,6 +3871,7 @@ mod tests {
             instructions: vec![],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 0;
         let result = compute_live_intervals(&func);
@@ -3966,6 +3993,7 @@ mod tests {
                     false_label: BlockId(1),
                 },
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(1),
@@ -3975,6 +4003,7 @@ mod tests {
                 }],
                 terminator: Terminator::Branch(BlockId(3)),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(2),
@@ -3987,12 +4016,14 @@ mod tests {
                 }],
                 terminator: Terminator::Branch(BlockId(3)),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(3),
                 instructions: vec![],
                 terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             },
         ];
         func.next_value_id = 4;
@@ -4057,6 +4088,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -4073,6 +4105,7 @@ mod tests {
                 false_label: BlockId(3),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
@@ -4099,12 +4132,14 @@ mod tests {
                 false_label: BlockId(3),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(3),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Value(Value(9)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 10;
 
@@ -4141,6 +4176,7 @@ mod tests {
             }],
             terminator: Terminator::Return(Some(Operand::Value(Value(0)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 1;
         let result = compute_live_intervals(&func);
@@ -4173,6 +4209,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -4215,12 +4252,14 @@ mod tests {
                 false_label: BlockId(2),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 6;
 

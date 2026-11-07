@@ -1225,6 +1225,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }]);
 
         let changes = narrow_function(&mut func);
@@ -1274,6 +1275,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }]);
 
         let changes = narrow_function(&mut func);
@@ -1320,6 +1322,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }]);
 
         narrow_function(&mut func);
@@ -1368,6 +1371,7 @@ mod tests {
             // Return %2 (I64 value), so %2 has two uses
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }]);
 
         let changes = narrow_function(&mut func);
@@ -1404,6 +1408,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }]);
 
         let changes = narrow_function(&mut func);
@@ -1459,6 +1464,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }]);
 
         let changes = narrow_function(&mut func);
@@ -1496,6 +1502,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }]);
 
         let changes = narrow_function(&mut func);
@@ -1545,6 +1552,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(5)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }]);
 
         narrow_function(&mut func);
@@ -1588,6 +1596,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }]);
 
         let changes = narrow_function(&mut func);
@@ -1639,6 +1648,7 @@ mod tests {
             instructions: insts,
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }])
     }
 
@@ -1721,6 +1731,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }]);
         narrow_function(&mut func);
         match &func.blocks[0].instructions[2] {

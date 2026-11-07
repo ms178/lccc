@@ -358,6 +358,11 @@ thread_local! {
     static SELF_RECURSION_CLONE_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// Compilation-scoped trace switch for parameter-reference remapping.
     static PARAMREF_DEBUG_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `-g`: only then does the inliner allocate inline-instance provenance.
+    /// Resolved once by the driver, never read from the environment per site.
+    static INLINE_DEBUG_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Verbose inline trace, resolved once per TU alongside the other switches.
+    static INLINE_DETAIL_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Functions `self_recursion::inline_self_recursion` already expanded in
     /// the module being compiled. Each self-recursive function is expanded by
     /// ONE mechanism: the clone skips these, so its level never compounds on
@@ -376,6 +381,17 @@ pub(crate) fn set_self_recursion_clone_enabled(enabled: bool) {
 /// Set the parameter-reference trace switch once for this compilation.
 pub(crate) fn set_paramref_debug_enabled(enabled: bool) {
     PARAMREF_DEBUG_ENABLED.with(|cell| cell.set(enabled));
+}
+
+/// Enable D6 inline-instance recording for this compilation (`-g`). Without
+/// it the inliner performs no provenance allocation and emits no markers.
+pub(crate) fn set_inline_debug_enabled(enabled: bool) {
+    INLINE_DEBUG_ENABLED.with(|cell| cell.set(enabled));
+}
+
+/// Resolve the verbose inline trace once per translation unit.
+pub(crate) fn set_inline_detail_enabled(enabled: bool) {
+    INLINE_DETAIL_ENABLED.with(|cell| cell.set(enabled));
 }
 
 /// Suspend or resume the clone within one module without forgetting its
@@ -1863,6 +1879,7 @@ fn inline_run_with(
                                             debug_param_indices: Vec::new(),
                                             debug_locals: Vec::new(),
                                             debug_scopes: Vec::new(),
+                                            debug_inline_instances: Vec::new(),
                                             pass_policy: Default::default(),
                                             name: callee_name.clone(),
                                             return_type: crate::common::types::IrType::I32,
@@ -2207,6 +2224,7 @@ fn inline_run_with(
                                             debug_param_indices: Vec::new(),
                                             debug_locals: Vec::new(),
                                             debug_scopes: Vec::new(),
+                                            debug_inline_instances: Vec::new(),
                                             pass_policy: Default::default(),
                                             name: callee_name.clone(),
                                             return_type: crate::common::types::IrType::I32,
@@ -2979,6 +2997,15 @@ fn analyze_va_arg_pack(func: &IrFunction) -> Option<VaArgPackPlan> {
 #[derive(Clone)]
 struct CalleeData {
     blocks: Vec<BasicBlock>,
+    /// `-g` inline instances already present in the callee body, remapped into
+    /// the caller when this body is cloned.
+    debug_inline_instances: Vec<crate::ir::module::DebugInlineInstance>,
+    /// Callee declarator span for the abstract origin.
+    decl_span: crate::common::source::Span,
+    /// Whether the callee was spelled `inline`.
+    declared_inline: bool,
+    /// Terminator statement spans/provenance to merge into the caller.
+    terminator_spans: crate::ir::module::TerminatorSpans,
     /// The callee's normalized `target("...")` feature set; see
     /// [`target_isa_allows_inline`].
     target_features: Vec<String>,
@@ -3811,6 +3838,20 @@ fn extern_inline_admission(func: &IrFunction, ctx: &CalleeContext) -> bool {
     loop_analysis::merge_loops_by_header(raw).len() <= 1
 }
 
+/// Bytes reserved by aggregate-sized frame slots. The inline cost model counts
+/// these separately: mem2reg/SROA scalarizes the small ones, so only slots at or
+/// above `AGG_FRAME_SLOT_BYTES` survive as real frame traffic.
+fn aggregate_frame_bytes(func: &IrFunction) -> usize {
+    func.blocks
+        .iter()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|inst| match inst {
+            Instruction::Alloca { size, .. } if *size >= AGG_FRAME_SLOT_BYTES => Some(*size),
+            _ => None,
+        })
+        .sum()
+}
+
 fn callee_data_for(
     func: &IrFunction,
     module: &IrModule,
@@ -4241,18 +4282,14 @@ fn callee_data_for(
 
         // Frame bytes duplicated at every inline site. Only allocas large
         // enough to survive mem2reg/SROA count; the rest become registers.
-        let agg_frame_bytes: usize = func
-            .blocks
-            .iter()
-            .flat_map(|b| b.instructions.iter())
-            .filter_map(|inst| match inst {
-                Instruction::Alloca { size, .. } if *size >= AGG_FRAME_SLOT_BYTES => Some(*size),
-                _ => None,
-            })
-            .sum();
+        let agg_frame_bytes = aggregate_frame_bytes(func);
 
         Some(CalleeData {
             blocks: func.blocks.clone(),
+            debug_inline_instances: func.debug_inline_instances.clone(),
+            decl_span: func.decl_span,
+            declared_inline: func.is_inline,
+            terminator_spans: func.terminator_spans.clone(),
             target_features: func.target_features.clone(),
             x86_isa_needs: func.x86_isa_needs.clone(),
             uses_fp_or_simd: body_uses_fp_or_simd(func),
@@ -5269,6 +5306,10 @@ fn elide_memcpy_alias_closure(
 /// keeps that local instead. The alias closure is computed to a fixpoint
 /// before anything is judged, because `BasicBlock` order is not dominance
 /// order after inlining.
+/// The debug row a reader lifted into the entry block must keep: its own source
+/// span and inline instance, when the block it came from tracked them.
+type ReaderDebug = (Option<crate::common::source::Span>, Option<u32>);
+
 fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
     let Some((candidates, src_of, mut disqualified, copy_at)) = elide_memcpy_candidates(blocks)
     else {
@@ -5429,17 +5470,20 @@ fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
     // Each moved reader keeps its own debug location when its block has a
     // parallel span vector (the line that names the field is the useful one
     // to step to); otherwise it takes the copy's.
-    let mut moved: FxHashMap<usize, Vec<(u32, Instruction, Option<crate::common::source::Span>)>> =
-        FxHashMap::default();
+    let mut moved: FxHashMap<usize, Vec<(u32, Instruction, ReaderDebug)>> = FxHashMap::default();
     // The entry block is rebuilt last: groups pulled from later blocks are
     // inserted into it. `None` marks a removed slot.
     let mut entry_slots: Vec<Option<Instruction>> = Vec::new();
     for (bi, block) in blocks.iter_mut().enumerate() {
         let parallel =
             !block.source_spans.is_empty() && block.source_spans.len() == block.instructions.len();
+        let ids_parallel = !block.source_inline_ids.is_empty()
+            && block.source_inline_ids.len() == block.instructions.len();
         let old_spans = std::mem::take(&mut block.source_spans);
+        let old_ids = std::mem::take(&mut block.source_inline_ids);
         let mut kept: Vec<Instruction> = Vec::with_capacity(block.instructions.len());
         let mut spans = Vec::with_capacity(old_spans.len());
+        let mut ids = Vec::with_capacity(old_ids.len());
         for (idx, mut inst) in block.instructions.drain(..).enumerate() {
             // Decide first, move afterwards: (drop, Some((root, used)) if moved).
             let (drop, mv) = match &mut inst {
@@ -5467,10 +5511,11 @@ fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
             };
             if let Some((root, used)) = mv {
                 let span = parallel.then(|| old_spans[idx]);
+                let id = ids_parallel.then(|| old_ids[idx]);
                 moved
                     .entry(plan[&root].1)
                     .or_default()
-                    .push((used, inst, span));
+                    .push((used, inst, (span, id)));
                 if bi == 0 {
                     entry_slots.push(None);
                 }
@@ -5487,9 +5532,13 @@ fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
             if parallel {
                 spans.push(old_spans[idx]);
             }
+            if ids_parallel {
+                ids.push(old_ids[idx]);
+            }
         }
         if bi == 0 {
             block.source_spans = old_spans;
+            block.source_inline_ids = old_ids;
             continue;
         }
         block.instructions = kept;
@@ -5497,24 +5546,35 @@ fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
         // instruction list is better left as-is than discarded (imprecise
         // debug locations beat none).
         block.source_spans = if parallel { spans } else { old_spans };
+        block.source_inline_ids = if ids_parallel { ids } else { old_ids };
     }
     let entry = &mut blocks[0];
     let parallel = !entry.source_spans.is_empty() && entry.source_spans.len() == entry_slots.len();
+    let ids_parallel =
+        !entry.source_inline_ids.is_empty() && entry.source_inline_ids.len() == entry_slots.len();
     let old_spans = std::mem::take(&mut entry.source_spans);
+    let old_ids = std::mem::take(&mut entry.source_inline_ids);
     let mut insts: Vec<Instruction> = Vec::with_capacity(entry_slots.len());
     let mut spans = Vec::with_capacity(old_spans.len());
+    let mut ids = Vec::with_capacity(old_ids.len());
     for (idx, slot) in entry_slots.into_iter().enumerate() {
         if let Some(inst) = slot {
             insts.push(inst);
             if parallel {
                 spans.push(old_spans[idx]);
             }
+            if ids_parallel {
+                ids.push(old_ids[idx]);
+            }
         }
         if let Some(group) = moved.remove(&idx) {
-            for (inst, span) in order_moved_readers(group, &plan) {
+            for (inst, (span, id)) in order_moved_readers(group, &plan) {
                 insts.push(inst);
                 if parallel {
                     spans.push(span.unwrap_or(old_spans[idx]));
+                }
+                if ids_parallel {
+                    ids.push(id.unwrap_or(old_ids[idx]));
                 }
             }
         }
@@ -5525,6 +5585,7 @@ fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
     );
     entry.instructions = insts;
     entry.source_spans = if parallel { spans } else { old_spans };
+    entry.source_inline_ids = if ids_parallel { ids } else { old_ids };
     // Machine-checked post-condition: nothing may still reference a local or
     // copy that no longer exists. Debug builds pay one linear scan; the
     // invariant is exactly what a future edit to this function could break.
@@ -5760,6 +5821,257 @@ fn ir_type_slot_size(ty: IrType) -> usize {
     may.max(8)
 }
 
+/// D6: append this call site's inline-instance subtree to the caller's table.
+///
+/// Returns the site's own (root) instance id and the callee-to-caller id map,
+/// or `None` when the subtree cannot be represented: an id that does not fit
+/// `u32`, or a callee instance whose parent does not name an already-remapped
+/// earlier instance. Falling back to the root in that second case silently
+/// re-parented a malformed table and fabricated nesting, so the caller must
+/// refuse the inline and truncate the table back to its entry length instead.
+fn append_inline_instances(
+    caller: &mut IrFunction,
+    callee: &CalleeData,
+    callee_name: &str,
+    call_span: crate::common::source::Span,
+    call_context: u32,
+) -> Option<(u32, Vec<u32>)> {
+    // Normalize the caller's per-instruction provenance before reading the call
+    // site's context. Blocks without spans stay untracked; tracked blocks get an
+    // explicit NO_INLINE_INSTANCE entry so later span-preserving edits keep the
+    // three arrays parallel.
+    for block in &mut caller.blocks {
+        if block.spans_parallel() {
+            if block.source_inline_ids.is_empty() {
+                block.source_inline_ids.resize(
+                    block.instructions.len(),
+                    crate::ir::instruction::NO_INLINE_INSTANCE,
+                );
+            } else if !block.inline_ids_parallel() {
+                block.source_inline_ids.clear();
+            }
+        } else {
+            block.source_inline_ids.clear();
+        }
+    }
+    let root_instance = u32::try_from(caller.debug_inline_instances.len()).ok()?;
+    caller
+        .debug_inline_instances
+        .push(crate::ir::module::DebugInlineInstance {
+            callee: callee_name.to_string(),
+            call_span,
+            decl_span: callee.decl_span,
+            parent: (call_context != crate::ir::instruction::NO_INLINE_INSTANCE)
+                .then_some(call_context),
+            declared_inline: callee.declared_inline,
+        });
+    let mut instance_map: Vec<u32> = Vec::with_capacity(callee.debug_inline_instances.len());
+    for instance in &callee.debug_inline_instances {
+        let parent = match instance.parent {
+            None => root_instance,
+            Some(p) => instance_map.get(p as usize).copied()?,
+        };
+        let id = u32::try_from(caller.debug_inline_instances.len()).ok()?;
+        let mut cloned = instance.clone();
+        cloned.parent = Some(parent);
+        caller.debug_inline_instances.push(cloned);
+        instance_map.push(id);
+    }
+    Some((root_instance, instance_map))
+}
+
+/// Clone the callee's blocks with remapped values, labels and inline
+/// provenance. A callee block only carries ids under `-g` and only when it
+/// tracks spans; a tracked block whose ids are sparse belongs to the site's
+/// root instance rather than to no instance at all.
+fn clone_callee_blocks(
+    callee: &CalleeData,
+    labels: &mut LabelMap,
+    value_offset: u32,
+    debug_enabled: bool,
+    root_instance: u32,
+    map_inline: impl Fn(u32) -> u32,
+) -> Vec<BasicBlock> {
+    let mut inlined_blocks: Vec<BasicBlock> = Vec::with_capacity(callee.blocks.len());
+    for callee_block in &callee.blocks {
+        let source_inline_ids = if debug_enabled && callee_block.spans_parallel() {
+            if callee_block.inline_ids_parallel() {
+                callee_block
+                    .source_inline_ids
+                    .iter()
+                    .copied()
+                    .map(&map_inline)
+                    .collect()
+            } else {
+                vec![root_instance; callee_block.instructions.len()]
+            }
+        } else {
+            Vec::new()
+        };
+        let mut new_block = BasicBlock {
+            label: labels.get(callee_block.label),
+            instructions: Vec::with_capacity(callee_block.instructions.len()),
+            source_spans: callee_block.source_spans.clone(),
+            source_inline_ids,
+            terminator: remap_terminator(&callee_block.terminator, value_offset, labels),
+        };
+        for inst in &callee_block.instructions {
+            new_block
+                .instructions
+                .push(remap_instruction(inst, value_offset, labels));
+        }
+        inlined_blocks.push(new_block);
+    }
+    inlined_blocks
+}
+
+/// Merge the callee's terminator statements with remapped labels and
+/// provenance. The shape check in `TerminatorSpans` drops a row whose
+/// terminator was rewritten; while the shape survives, the row still belongs
+/// to the inline instance.
+fn merge_callee_terminator_spans(
+    caller: &mut IrFunction,
+    callee: &CalleeData,
+    labels: &LabelMap,
+    map_inline: impl Fn(u32) -> u32,
+) {
+    for (label, span, id, shape) in callee.terminator_spans.iter() {
+        let Some(&new_label) = labels.map.get(&label.0) else {
+            continue;
+        };
+        let Some(new_shape) = shape.remapped(&|l| labels.map.get(&l.0).copied()) else {
+            continue;
+        };
+        caller
+            .terminator_spans
+            .insert_remapped(new_label, span, map_inline(id), new_shape);
+    }
+}
+
+/// The post-call merge block: the caller's tail plus one synthesized definition
+/// of the call result.
+///
+/// Built with the shared `BasicBlock` primitives instead of three hand-rolled
+/// vectors so the sparse-or-parallel law holds by construction: an untracked
+/// tail stays untracked (the hand-rolled version pushed a lone dummy span for
+/// the result and produced one span for 1+N instructions), and a tail with
+/// sparse ids does not get a one-element id list invented.
+fn build_inline_merge_block(
+    label: BlockId,
+    terminator: Terminator,
+    tail: (Vec<Instruction>, Vec<crate::common::source::Span>, Vec<u32>),
+    dest: Option<Value>,
+    phi_incoming: Vec<(Operand, BlockId)>,
+    return_type: IrType,
+    call_context: u32,
+) -> BasicBlock {
+    let mut merge_block = BasicBlock {
+        label,
+        instructions: Vec::new(),
+        source_spans: Vec::new(),
+        source_inline_ids: Vec::new(),
+        terminator,
+    };
+    merge_block.append_spanned_inline(tail.0, tail.1, tail.2);
+    let Some(call_dest) = dest else {
+        return merge_block;
+    };
+    let result_def = if phi_incoming.len() == 1 {
+        // Single return path: just copy the value directly (no phi needed).
+        Some(Instruction::Copy {
+            dest: call_dest,
+            src: phi_incoming[0].0,
+        })
+    } else if phi_incoming.len() > 1 {
+        // Multiple return paths: need a Phi node.
+        Some(Instruction::Phi {
+            dest: call_dest,
+            ty: return_type,
+            incoming: phi_incoming,
+        })
+    } else {
+        // The callee never returns a value (all paths noreturn/unreachable):
+        // call_dest stays undefined and unused.
+        None
+    };
+    if let Some(inst) = result_def {
+        merge_block.insert_inst_inline(0, inst, crate::common::source::Span::dummy(), call_context);
+    }
+    merge_block
+}
+
+/// Bind every remaining direct `ParamRef` use to the caller's argument value.
+///
+/// Covers instruction operands (including intrinsic argument lists), terminator
+/// operands, and the return-phi incomings that were collected *before* the
+/// callee's `Return`s became `Branch(merge)`: the block walk cannot see those,
+/// and a stale pre-substitution id there is an undefined value at codegen time
+/// (expat's `checkCharRefNumber` returned 0 for every character reference).
+/// Leaving even one remapped `ParamRef` unbound produces a backend value with
+/// no register and no stack home.
+fn bind_paramref_uses(
+    blocks: &mut [BasicBlock],
+    phi_incoming: &mut [(Operand, BlockId)],
+    subst: &FxInlineMap<u32, Operand>,
+    callee_name: &str,
+    debug: bool,
+) {
+    if subst.is_empty() {
+        return;
+    }
+    for block in blocks.iter_mut() {
+        for inst in &mut block.instructions {
+            inst.for_each_operand_mut(|op| {
+                if let Operand::Value(v) = op {
+                    if let Some(&replacement) = subst.get(&v.0) {
+                        *op = replacement;
+                    }
+                }
+            });
+            inst.for_each_value_use_mut(|value| {
+                if let Some(Operand::Value(replacement)) = subst.get(&value.0) {
+                    if debug {
+                        lccc::cli::stderr_line(format_args!(
+                            "[INLINE_PARAMREF] {} direct v{} -> v{}",
+                            callee_name, value.0, replacement.0
+                        ));
+                    }
+                    *value = *replacement;
+                }
+            });
+        }
+        block.terminator.for_each_operand_mut(|op| {
+            if let Operand::Value(v) = op {
+                if let Some(&replacement) = subst.get(&v.0) {
+                    *op = replacement;
+                }
+            }
+        });
+    }
+    // CRITICAL: phi_incoming was collected from the callee's Return
+    // terminators BEFORE this substitution ran (those Returns are
+    // already rewritten to Branch(merge), so the loop above cannot see
+    // their operands). A callee that returns its own parameter (e.g.
+    // expat's checkCharRefNumber: `return result` where result IS the
+    // ParamRef value after copy-prop) left the stale pre-substitution
+    // id in the merge phi — an undefined value at codegen time (the
+    // switch 'break' path returned 0 instead of result; char refs
+    // &#60; etc. all decoded to 0).
+    for (op, _) in phi_incoming.iter_mut() {
+        if let Operand::Value(v) = op {
+            if let Some(&replacement) = subst.get(&v.0) {
+                if debug {
+                    lccc::cli::stderr_line(format_args!(
+                        "[INLINE_PARAMREF] {} return-phi v{} -> {:?}",
+                        callee_name, v.0, replacement
+                    ));
+                }
+                *op = replacement;
+            }
+        }
+    }
+}
+
 fn inline_call_site(
     caller: &mut IrFunction,
     site: &InlineCallSite,
@@ -5806,7 +6118,45 @@ fn inline_call_site(
         return false;
     };
 
-    let debug_inline_detail = std::env::var("CCC_INLINE_DEBUG_DETAIL").is_ok();
+    // ── D6: inline provenance ────────────────────────────────────────────
+    // Only `-g` pays for instance tables and per-instruction ids.  The switch
+    // is resolved once per TU by the driver; a failed inline truncates the
+    // append-only table back to its entry length so retries cannot leak
+    // instances that no marker will ever name.
+    let debug_enabled = INLINE_DEBUG_ENABLED.with(std::cell::Cell::get);
+    let inline_table_start = caller.debug_inline_instances.len();
+    macro_rules! bail {
+        () => {{
+            caller.debug_inline_instances.truncate(inline_table_start);
+            return false;
+        }};
+    }
+    let call_span = caller.blocks[site.block_idx].span_at(site.inst_idx);
+    let call_context = caller.blocks[site.block_idx].inline_id_at(site.inst_idx);
+    let (root_instance, instance_map) = if debug_enabled {
+        match append_inline_instances(caller, callee, &site.callee_name, call_span, call_context) {
+            Some(pair) => pair,
+            None => bail!(),
+        }
+    } else {
+        (crate::ir::instruction::NO_INLINE_INSTANCE, Vec::new())
+    };
+    let map_inline = |id: u32| {
+        if !debug_enabled || id == crate::ir::instruction::NO_INLINE_INSTANCE {
+            if debug_enabled {
+                root_instance
+            } else {
+                crate::ir::instruction::NO_INLINE_INSTANCE
+            }
+        } else {
+            instance_map
+                .get(id as usize)
+                .copied()
+                .unwrap_or(root_instance)
+        }
+    };
+
+    let debug_inline_detail = INLINE_DETAIL_ENABLED.with(std::cell::Cell::get);
     if debug_inline_detail {
         lccc::cli::stderr_line(format_args!(
             "[INLINE_DETAIL] Inlining '{}' into '{}': value_offset={}, label_base={}, callee.next_value_id={}, caller.next_value_id={}",
@@ -5851,24 +6201,15 @@ fn inline_call_site(
         labels.assign(callee_block.label);
     }
 
-    let mut inlined_blocks: Vec<BasicBlock> = Vec::with_capacity(callee.blocks.len());
-
-    for callee_block in &callee.blocks {
-        let mut new_block = BasicBlock {
-            label: labels.get(callee_block.label),
-            instructions: Vec::with_capacity(callee_block.instructions.len()),
-            source_spans: callee_block.source_spans.clone(),
-            terminator: remap_terminator(&callee_block.terminator, value_offset, &mut labels),
-        };
-
-        for inst in &callee_block.instructions {
-            new_block
-                .instructions
-                .push(remap_instruction(inst, value_offset, &mut labels));
-        }
-
-        inlined_blocks.push(new_block);
-    }
+    let mut inlined_blocks = clone_callee_blocks(
+        callee,
+        &mut labels,
+        value_offset,
+        debug_enabled,
+        root_instance,
+        &map_inline,
+    );
+    merge_callee_terminator_spans(caller, callee, &labels, &map_inline);
 
     // ── S17: __builtin_va_arg_pack() forwarding ────────────────────────────
     // The wrapper's caller evaluated ALL its arguments (named + variadic)
@@ -6005,7 +6346,7 @@ fn inline_call_site(
     // synthesized with the ABI shape; dead parameters require no bridge.
     let Some(mut param_alloca_info) = inlined_param_homes(callee, &inlined_blocks, value_offset)
     else {
-        return false;
+        bail!();
     };
     let mut paramref_owner: FxHashMap<u32, (usize, IrType)> = FxHashMap::default();
     let mut clone_max = 0u32;
@@ -6033,7 +6374,7 @@ fn inline_call_site(
         .zip(value_offset.checked_add(callee.next_value_id))
         .map(|(actual, cached)| actual.max(cached))
     else {
-        return false;
+        bail!();
     };
     let mut next_fresh = next_fresh;
     let mut synthesized = Vec::new();
@@ -6049,7 +6390,7 @@ fn inline_call_site(
             continue;
         };
         if idx >= site.args.len() {
-            return false;
+            bail!();
         }
         let (ty, size, align) = callee.param_home_shapes.get(idx).copied().unwrap_or((
             param_ty,
@@ -6063,11 +6404,11 @@ fn inline_call_site(
             .flatten()
             .is_some_and(|n| n > size)
         {
-            return false;
+            bail!();
         }
         let dest = Value(next_fresh);
         let Some(next) = next_fresh.checked_add(1) else {
-            return false;
+            bail!();
         };
         next_fresh = next;
         synthesized.push((dest, ty, size, align));
@@ -6213,7 +6554,6 @@ fn inline_call_site(
         // constant argument: constants may replace the ParamRef directly, while
         // the home remains a valid ABI object for address-taken or later memory
         // uses.
-        let has_spans = !entry_block.source_spans.is_empty();
         let num_args_to_store = std::cmp::min(site.args.len(), param_alloca_info.len());
         let mut bridge: Vec<(usize, Instruction)> = Vec::new();
         for i in 0..num_args_to_store {
@@ -6232,7 +6572,7 @@ fn inline_call_site(
                 // We must copy the struct data from that pointer into the callee's param alloca.
                 let Operand::Value(src_ptr) = site.args[i] else {
                     // Struct arg should always be a Value (pointer), not a Const.
-                    return false;
+                    bail!();
                 };
                 bridge.push((
                     pos,
@@ -6269,12 +6609,16 @@ fn inline_call_site(
             if let Instruction::Store { ptr, .. } | Instruction::Memcpy { dest: ptr, .. } = &inst {
                 placed.push((ptr.0, at));
             }
-            entry_block.instructions.insert(at, inst);
-            if has_spans {
-                entry_block
-                    .source_spans
-                    .insert(at, crate::common::source::Span::dummy());
-            }
+            // The shared edit primitive applies the sparse-or-parallel law:
+            // a tracked entry block gets a dummy row plus the call's instance,
+            // an untracked one stays untracked, and a block whose ids are
+            // sparse does NOT get a one-element id list invented for it.
+            entry_block.insert_inst_inline(
+                at,
+                inst,
+                crate::common::source::Span::dummy(),
+                call_context,
+            );
         }
 
         // Ordering is a property of the FINAL instruction list, so it is checked
@@ -6288,7 +6632,7 @@ fn inline_call_site(
                     break;
                 }
                 if inst.used_values().contains(&home) {
-                    return false;
+                    bail!();
                 }
             }
         }
@@ -6310,7 +6654,7 @@ fn inline_call_site(
                         .then_some(entry_block.instructions.len())
                 });
             if first_use.is_some_and(|index| index < materialize_pos) {
-                return false;
+                bail!();
             }
         }
         // Deduplicate loads: one Load per distinct param_idx, and one Cast per
@@ -6322,11 +6666,11 @@ fn inline_call_site(
 
         for (paramref_dest, param_idx, param_ty) in &paramref_records {
             if *param_idx >= num_args_to_store || *param_idx >= param_alloca_info.len() {
-                return false;
+                bail!();
             }
 
             let Some((home, home_ty, _)) = param_alloca_info[*param_idx] else {
-                return false;
+                bail!();
             };
 
             // Reuse existing load for this param_idx if present
@@ -6335,7 +6679,7 @@ fn inline_call_site(
             } else {
                 let v = Value(paramref_next_value);
                 paramref_next_value += 1;
-                entry_block.instructions.insert(
+                entry_block.insert_inst_inline(
                     materialize_pos,
                     Instruction::Load {
                         volatile: false,
@@ -6344,12 +6688,9 @@ fn inline_call_site(
                         ty: home_ty,
                         seg_override: AddressSpace::Default,
                     },
+                    crate::common::source::Span::dummy(),
+                    call_context,
                 );
-                if has_spans {
-                    entry_block
-                        .source_spans
-                        .insert(materialize_pos, crate::common::source::Span::dummy());
-                }
                 materialize_pos += 1;
                 loaded_per_param.insert(*param_idx, v);
                 v
@@ -6364,7 +6705,7 @@ fn inline_call_site(
                 } else {
                     let cast = Value(paramref_next_value);
                     paramref_next_value += 1;
-                    entry_block.instructions.insert(
+                    entry_block.insert_inst_inline(
                         materialize_pos,
                         Instruction::Cast {
                             dest: cast,
@@ -6372,12 +6713,9 @@ fn inline_call_site(
                             from_ty: home_ty,
                             to_ty: *param_ty,
                         },
+                        crate::common::source::Span::dummy(),
+                        call_context,
                     );
-                    if has_spans {
-                        entry_block
-                            .source_spans
-                            .insert(materialize_pos, crate::common::source::Span::dummy());
-                    }
                     materialize_pos += 1;
                     cast_per_param_ty.insert(key, cast);
                     Operand::Value(cast)
@@ -6409,8 +6747,12 @@ fn inline_call_site(
         let has_spans =
             block.source_spans.len() == block.instructions.len() && !block.source_spans.is_empty();
         let old_spans = std::mem::take(&mut block.source_spans);
+        let old_inline_ids = std::mem::take(&mut block.source_inline_ids);
+        let has_inline_ids =
+            old_inline_ids.len() == block.instructions.len() && !old_inline_ids.is_empty();
         let mut new_insts = Vec::with_capacity(block.instructions.len());
         let mut new_spans = Vec::with_capacity(16);
+        let mut new_inline_ids = Vec::with_capacity(16);
         let mut paramref_dests: crate::common::fx_hash::FxHashSet<u32> =
             crate::common::fx_hash::FxHashSet::default();
         for (idx, inst) in block.instructions.drain(..).enumerate() {
@@ -6456,6 +6798,9 @@ fn inline_call_site(
                     if has_spans {
                         new_spans.push(old_spans[idx]);
                     }
+                    if has_inline_ids {
+                        new_inline_ids.push(old_inline_ids[idx]);
+                    }
                     continue;
                 }
             }
@@ -6463,70 +6808,28 @@ fn inline_call_site(
             if has_spans {
                 new_spans.push(old_spans[idx]);
             }
+            if has_inline_ids {
+                new_inline_ids.push(old_inline_ids[idx]);
+            }
         }
         block.instructions = new_insts;
         if has_spans {
             block.source_spans = new_spans;
         }
+        block.source_inline_ids = if has_inline_ids {
+            new_inline_ids
+        } else {
+            Vec::new()
+        };
     }
     elide_readonly_local_memcpys(&mut inlined_blocks);
-    // Replace every direct ParamRef use after removing ParamRef instructions.
-    // This includes intrinsic arguments, phi incoming values, and terminators;
-    // leaving even one remapped ParamRef unbound produces an invalid backend
-    // value with no register or stack home.
-    if !paramref_subst.is_empty() {
-        for block in &mut inlined_blocks {
-            for inst in &mut block.instructions {
-                inst.for_each_operand_mut(|op| {
-                    if let Operand::Value(v) = op {
-                        if let Some(&replacement) = paramref_subst.get(&v.0) {
-                            *op = replacement;
-                        }
-                    }
-                });
-                inst.for_each_value_use_mut(|value| {
-                    if let Some(Operand::Value(replacement)) = paramref_subst.get(&value.0) {
-                        if paramref_debug {
-                            lccc::cli::stderr_line(format_args!(
-                                "[INLINE_PARAMREF] {} direct v{} -> v{}",
-                                site.callee_name, value.0, replacement.0
-                            ));
-                        }
-                        *value = *replacement;
-                    }
-                });
-            }
-            block.terminator.for_each_operand_mut(|op| {
-                if let Operand::Value(v) = op {
-                    if let Some(&replacement) = paramref_subst.get(&v.0) {
-                        *op = replacement;
-                    }
-                }
-            });
-        }
-        // CRITICAL: phi_incoming was collected from the callee's Return
-        // terminators BEFORE this substitution ran (those Returns are
-        // already rewritten to Branch(merge), so the loop above cannot see
-        // their operands). A callee that returns its own parameter (e.g.
-        // expat's checkCharRefNumber: `return result` where result IS the
-        // ParamRef value after copy-prop) left the stale pre-substitution
-        // id in the merge phi — an undefined value at codegen time (the
-        // switch 'break' path returned 0 instead of result; char refs
-        // &#60; etc. all decoded to 0).
-        for (op, _) in phi_incoming.iter_mut() {
-            if let Operand::Value(v) = op {
-                if let Some(&replacement) = paramref_subst.get(&v.0) {
-                    if paramref_debug {
-                        lccc::cli::stderr_line(format_args!(
-                            "[INLINE_PARAMREF] {} return-phi v{} -> {:?}",
-                            site.callee_name, v.0, replacement
-                        ));
-                    }
-                    *op = replacement;
-                }
-            }
-        }
-    }
+    bind_paramref_uses(
+        &mut inlined_blocks,
+        &mut phi_incoming,
+        &paramref_subst,
+        &site.callee_name,
+        paramref_debug,
+    );
 
     // Now split the caller's block at the call site:
     // Block before call -> instructions before the call + branch to callee entry
@@ -6585,6 +6888,14 @@ fn inline_call_site(
             Vec::new()
         }
     };
+    let after_call_inline_ids: Vec<u32> = {
+        let ids = &mut caller.blocks[call_block_idx].source_inline_ids;
+        if ids.len() > call_inst_idx + 1 {
+            ids.split_off(call_inst_idx + 1)
+        } else {
+            Vec::new()
+        }
+    };
     let original_terminator = std::mem::replace(
         &mut caller.blocks[call_block_idx].terminator,
         Terminator::Branch(inlined_blocks[0].label),
@@ -6595,36 +6906,13 @@ fn inline_call_site(
     if !caller.blocks[call_block_idx].source_spans.is_empty() {
         caller.blocks[call_block_idx].source_spans.pop();
     }
+    if !caller.blocks[call_block_idx].source_inline_ids.is_empty() {
+        caller.blocks[call_block_idx].source_inline_ids.pop();
+    }
 
     // Create the merge block with the remaining instructions and original terminator.
     // If the callee had a non-void return, insert a Phi (or Copy for single-predecessor)
     // at the start of the merge block to define the call's result value.
-    let mut merge_instructions = Vec::with_capacity(16);
-    let mut merge_spans: Vec<crate::common::source::Span> = Vec::new();
-    if let Some(call_dest) = site.dest {
-        if phi_incoming.len() == 1 {
-            // Single return path: just copy the value directly (no phi needed)
-            merge_instructions.push(Instruction::Copy {
-                dest: call_dest,
-                src: phi_incoming[0].0,
-            });
-            merge_spans.push(crate::common::source::Span::dummy());
-        } else if phi_incoming.len() > 1 {
-            // Multiple return paths: need a Phi node
-            merge_instructions.push(Instruction::Phi {
-                dest: call_dest,
-                ty: callee.return_type,
-                incoming: phi_incoming,
-            });
-            merge_spans.push(crate::common::source::Span::dummy());
-        }
-        // If phi_incoming is empty, the callee never returns a value (e.g., all paths
-        // are noreturn/unreachable). The call_dest will be undefined, which is fine
-        // since it won't be used.
-    }
-    merge_instructions.extend(after_call_instructions);
-    merge_spans.extend(after_call_spans);
-
     // Label assignment per the privacy analysis above: private label =>
     // merge keeps it, pre-call remainder takes the fresh id; externally
     // referenced label => historical shape (merge takes the fresh id).
@@ -6648,12 +6936,19 @@ fn inline_call_site(
         }
     }
 
-    let merge_block = BasicBlock {
-        label: merge_label,
-        instructions: merge_instructions,
-        source_spans: merge_spans,
-        terminator: original_terminator,
-    };
+    let merge_block = build_inline_merge_block(
+        merge_label,
+        original_terminator,
+        (
+            after_call_instructions,
+            after_call_spans,
+            after_call_inline_ids,
+        ),
+        site.dest,
+        phi_incoming,
+        callee.return_type,
+        call_context,
+    );
 
     // Insert the inlined blocks and merge block after the call block
     let insert_position = call_block_idx + 1;
@@ -7591,6 +7886,10 @@ mod inline_limit_tests {
 
     fn wrapper_policy_data(block_count: usize) -> CalleeData {
         CalleeData {
+            debug_inline_instances: Vec::new(),
+            decl_span: crate::common::source::Span::dummy(),
+            declared_inline: false,
+            terminator_spans: Default::default(),
             target_features: Vec::new(),
             builtin_policy: Default::default(),
             ssp: Default::default(),
@@ -7600,6 +7899,7 @@ mod inline_limit_tests {
                     instructions: Vec::new(),
                     terminator: Terminator::Return(None),
                     source_spans: Vec::new(),
+                    source_inline_ids: Vec::new(),
                 })
                 .collect(),
             param_struct_sizes: Vec::new(),
@@ -7821,6 +8121,7 @@ mod value_reference_tests {
             debug_param_indices: Vec::new(),
             debug_locals: Vec::new(),
             debug_scopes: Vec::new(),
+            debug_inline_instances: Vec::new(),
             pass_policy: Default::default(),
             name: "user".into(),
             return_type: IrType::Void,
@@ -7830,6 +8131,7 @@ mod value_reference_tests {
                 instructions,
                 terminator: Terminator::Return(None),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             }],
             is_variadic: false,
             is_declaration: false,
@@ -8116,6 +8418,7 @@ mod phase0_drain_tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         let _ = replicator.next_value_id;
 
@@ -8140,6 +8443,7 @@ mod phase0_drain_tests {
             instructions: insts,
             terminator: Terminator::Return(Some(Operand::Value(Value(8)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let mut caller = IrFunction::new("f".to_string(), IrType::Void, vec![], false);
@@ -8155,6 +8459,7 @@ mod phase0_drain_tests {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         caller.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -8171,6 +8476,7 @@ mod phase0_drain_tests {
             }],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let mut module = IrModule::new();
@@ -8211,6 +8517,7 @@ mod phase0_drain_tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let mut fortify_like =
@@ -8232,6 +8539,7 @@ mod phase0_drain_tests {
             instructions: insts,
             terminator: Terminator::Return(Some(Operand::Value(Value(8)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let mut caller = IrFunction::new("f".to_string(), IrType::Void, vec![], false);
@@ -8254,6 +8562,7 @@ mod phase0_drain_tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let mut module = IrModule::new();
@@ -8300,6 +8609,7 @@ mod phase0_drain_tests {
                 false_label: BlockId(2),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         for lbl in [1u32, 2u32] {
             two_way.blocks.push(BasicBlock {
@@ -8307,6 +8617,7 @@ mod phase0_drain_tests {
                 instructions: vec![],
                 terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(7)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             });
         }
 
@@ -8334,6 +8645,7 @@ mod phase0_drain_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(9)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let mut module = IrModule::new();
@@ -8415,6 +8727,7 @@ mod const_trip_tests {
             instructions,
             terminator,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -8423,6 +8736,7 @@ mod const_trip_tests {
             debug_param_indices: Vec::new(),
             debug_locals: Vec::new(),
             debug_scopes: Vec::new(),
+            debug_inline_instances: Vec::new(),
             pass_policy: Default::default(),
             name: "callee".into(),
             return_type: IrType::Void,
@@ -8704,6 +9018,7 @@ mod devirtualization_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         f
     }
@@ -8745,6 +9060,7 @@ mod devirtualization_tests {
             instructions,
             terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         let mut module = IrModule::default();
         module.functions = vec![leaf(), caller];
@@ -8850,6 +9166,7 @@ mod devirtualization_tests {
                 instructions: Vec::new(),
                 terminator: term,
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             });
         }
         let cfg = crate::ir::analysis::CfgAnalysis::build(&f);
@@ -8938,6 +9255,7 @@ mod feature_switch_tests {
             instructions,
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         f
     }
@@ -9083,6 +9401,7 @@ mod feature_switch_tests {
             instructions,
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         helper.is_static = true;
         let mut other = function("other", 22, &[]);
@@ -9208,6 +9527,7 @@ mod extern_admission_tests {
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 2;
         func.next_label = 2;
@@ -9277,6 +9597,7 @@ mod extern_admission_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }];
         elide_readonly_local_memcpys(&mut blocks);
         assert!(
@@ -9337,6 +9658,7 @@ mod extern_admission_tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }];
         elide_readonly_local_memcpys(&mut blocks);
         assert!(
@@ -9386,6 +9708,7 @@ mod extern_admission_tests {
                 instructions: alloca_and_copy,
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             },
             // uses an alias defined only in block 2
             BasicBlock {
@@ -9399,6 +9722,7 @@ mod extern_admission_tests {
                 }],
                 terminator: Terminator::Branch(BlockId(2)),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             },
             // defines the alias
             BasicBlock {
@@ -9411,6 +9735,7 @@ mod extern_admission_tests {
                 }],
                 terminator: Terminator::Return(None),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             },
         ];
         elide_readonly_local_memcpys(&mut blocks);
@@ -9466,6 +9791,7 @@ mod extern_admission_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }];
         elide_readonly_local_memcpys(&mut blocks);
         assert!(
@@ -9536,6 +9862,7 @@ mod extern_admission_tests {
                 instructions: body(),
                 terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             });
             func
         };
@@ -9592,6 +9919,7 @@ mod extern_admission_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }];
         elide_readonly_local_memcpys(&mut blocks);
         assert!(
@@ -9654,6 +9982,7 @@ mod extern_admission_tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }];
         elide_readonly_local_memcpys(&mut blocks);
         assert!(
@@ -9737,6 +10066,7 @@ mod extern_admission_tests {
             instructions,
             terminator,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -9909,6 +10239,7 @@ mod extern_admission_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: vec![span(1), span(2), span(3)],
+            source_inline_ids: Vec::new(),
         }];
         elide_readonly_local_memcpys(&mut blocks);
         assert_eq!(blocks[0].instructions.len(), 1);
@@ -9928,6 +10259,7 @@ mod extern_admission_tests {
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // Callee `worker(fn_ptr)` calls `fn_ptr` indirectly and recurses with
@@ -10022,6 +10354,7 @@ mod extern_admission_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let mut caller = IrFunction::new("caller".to_string(), IrType::I32, vec![], false);
@@ -10055,6 +10388,7 @@ mod extern_admission_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let mut module = IrModule::new();
@@ -10127,6 +10461,7 @@ mod extern_admission_tests {
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let mut worker = IrFunction::new(
@@ -10181,6 +10516,7 @@ mod extern_admission_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let mut caller = IrFunction::new("caller".to_string(), IrType::I32, vec![], false);
@@ -10202,6 +10538,7 @@ mod extern_admission_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let mut module = IrModule::new();
@@ -10230,6 +10567,7 @@ mod extern_admission_tests {
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(1)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         let mut caller2 = IrFunction::new("caller2".to_string(), IrType::I32, vec![], false);
         caller2.blocks.push(BasicBlock {
@@ -10250,6 +10588,7 @@ mod extern_admission_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         module.functions.push(other);
         module.functions.push(caller2);
@@ -10322,6 +10661,7 @@ mod extern_admission_tests {
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(0)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         assert_not_devirtualized(&mut module);
     }
@@ -10372,6 +10712,7 @@ mod extern_admission_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         module.functions.push(mid);
         let rewritten = devirtualize_constant_indirect_calls(&mut module);
@@ -10555,6 +10896,7 @@ mod phase0_tests {
             instructions,
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         f.next_value_id = extra + 2;
         f.next_label = 2;
@@ -10775,6 +11117,7 @@ mod phase0_tests {
             }],
             terminator: Terminator::Return(Some(Operand::Value(Value(7)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         tail.next_value_id = 8;
         tail.next_label = 2;
@@ -10800,6 +11143,10 @@ mod sroa_unlock_tests {
     /// A straight-line internal helper of `instructions` instructions.
     fn helper(instructions: usize, declared_inline: bool) -> CalleeData {
         CalleeData {
+            debug_inline_instances: Vec::new(),
+            decl_span: crate::common::source::Span::dummy(),
+            declared_inline: false,
+            terminator_spans: Default::default(),
             target_features: Vec::new(),
             builtin_policy: Default::default(),
             ssp: Default::default(),
@@ -10813,6 +11160,7 @@ mod sroa_unlock_tests {
                     .collect(),
                 terminator: Terminator::Return(None),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             }],
             param_struct_sizes: Vec::new(),
             param_alloca_values: Vec::new(),
@@ -10888,6 +11236,7 @@ mod sroa_unlock_tests {
             instructions: insts,
             terminator: Terminator::Return(Some(Operand::Value(Value(100)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func
     }
@@ -11041,18 +11390,21 @@ mod sroa_unlock_tests {
                 ty: IrType::I32,
             },
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         f.blocks.push(BasicBlock {
             label: BlockId(1),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         f.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(1)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         let mask = const_branch_param_mask(&f);
         assert_eq!(mask, 1);
@@ -11131,6 +11483,7 @@ mod param_home_tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         f
     }
@@ -11141,6 +11494,7 @@ mod param_home_tests {
             instructions,
             terminator,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 

@@ -2465,7 +2465,7 @@ jobs:
     - name: Install the GCC 16.2 oracle
       run: bash scripts/ci_install_gcc_oracle.sh --version 16.2
     - name: Verify the lane's oracle toolchain
-      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5
+      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5 --require gcc,multilib,valgrind,pyyaml,gdb
     - name: Select GCC 16 for legacy oracle invocations
       run: |
         mkdir -p "$RUNNER_TEMP/lccc-oracles"
@@ -2892,7 +2892,7 @@ jobs:
     - name: Install the GCC 16.2 oracle
       run: bash scripts/ci_install_gcc_oracle.sh --version 16.2
     - name: Verify the lane's oracle toolchain
-      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5
+      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5 --require gcc,multilib,valgrind,pyyaml,gdb
     - name: Select GCC 16 for legacy oracle invocations
       run: |
         mkdir -p "$RUNNER_TEMP/lccc-oracles"
@@ -3280,6 +3280,24 @@ jobs:
         # each of which must be declared below with the reason it is absent.
         python3 tests/regression/check_dwarf_die_census.py --lccc target/fastbuild/lccc --gcc gcc-16 --clang clang-23
         python3 tests/regression/check_dwarf_versions.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv --gcc gcc-16
+        python3 tests/regression/check_dwarf_inlining.py --lccc target/fastbuild/lccc --self-test
+        python3 tests/regression/check_dwarf_inlining.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv --gdb gdb --gcc gcc-16 --json target/dwarf-inlining.json
+        # -S -g must accept exactly what -S accepts: `-S -g` assembles the text
+        # in memory to size its DWARF ranges, so an unencodable inline-asm
+        # template used to fail only when -g was added.  Pins rc parity, code
+        # identity after debug rows are stripped, that -c still REJECTS an
+        # unencodable template (the fallback is not a silent accept), GCC 16.2
+        # as the oracle, `%=` uniqueness per statement and per inlined copy,
+        # and byte-exact UTF-8 template text on all four targets.
+        python3 tests/regression/check_debug_acceptance_parity.py --self-test
+        python3 tests/regression/check_debug_acceptance_parity.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv --gcc gcc-16 --json target/debug-acceptance-parity.json
+        # Inline-asm dialect alternatives: GCC gates brace processing on
+        # ASSEMBLER_DIALECT (i386 only) AND on extended asm (ASM_OPERANDS vs
+        # ASM_INPUT). Measured to agree with BOTH GCC 16.2 and Clang 23.1.5.
+        # Pins pipeless `mov{l}`, `%{`/`%}` escapes, basic-asm passthrough, and
+        # literal AArch64/RISC-V register lists.
+        python3 tests/regression/check_asm_dialect_alternatives.py --self-test
+        python3 tests/regression/check_asm_dialect_alternatives.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv --gcc gcc-16 --clang clang-23 --json target/asm-dialect-alternatives.json
         bash tests/regression/check_gla_backedge_no_trampoline.sh
         python3 scripts/edg_changes_mine.py verify-artifacts
         python3 tests/regression/check_count_observations.py --clang "${CLANG:-clang-23}"

@@ -45,6 +45,11 @@ fn is_flag_neutral_line(m: &str) -> bool {
     if m.is_empty() || m.starts_with('#') || m.starts_with("//") || m.starts_with(';') {
         return true; // comment / blank
     }
+    // D6 inline-range endpoints are zero-width debug metadata, not branch
+    // targets; they neither clobber flags nor end the linear window.
+    if crate::backend::peephole_common::is_inline_range_marker(m) {
+        return true;
+    }
     // Rule 1: a label definition (optionally followed by nothing but the
     // terminator) is a control-flow boundary.
     if m.ends_with(':') {

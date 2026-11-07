@@ -130,6 +130,7 @@ mod tests {
         f.blocks.push(BasicBlock {
             label: BlockId(0),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
             instructions: vec![
                 Instruction::ParamRef {
                     dest: Value(1),

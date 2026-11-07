@@ -30,52 +30,6 @@ pub(super) fn is_packed_element_shift(mnemonic: &str) -> bool {
     )
 }
 
-/// Resolve GCC inline asm dialect alternatives in a template string.
-///
-/// GCC inline asm supports `{alt0|alt1}` syntax where `alt0` is the AT&T
-/// dialect version and `alt1` is the Intel dialect version. Since we always
-/// emit AT&T syntax, we select the first alternative and strip the braces.
-///
-/// Examples:
-///   `"rep; bsr{q %1, %0| %0, %1}"` -> `"rep; bsrq %1, %0"`
-///   `"bt{l} %[Bit],%[Base]"`       -> `"btl %[Bit],%[Base]"`
-///   `"{lock }cmpxchg %1, %2"`      -> `"lock cmpxchg %1, %2"`
-///
-/// The `%{` escape (literal brace) is not used in practice, so we don't
-/// handle it specially here.
-fn resolve_dialect_alternatives(line: &str) -> Cow<'_, str> {
-    if !line.contains('{') {
-        return Cow::Borrowed(line);
-    }
-    let mut result = String::with_capacity(line.len());
-    let chars: Vec<char> = line.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '{' {
-            // Collect the first alternative (AT&T) until '|' or '}'
-            i += 1; // skip '{'
-            while i < chars.len() && chars[i] != '|' && chars[i] != '}' {
-                result.push(chars[i]);
-                i += 1;
-            }
-            // Skip the second alternative (Intel) and closing '}'
-            if i < chars.len() && chars[i] == '|' {
-                i += 1; // skip '|'
-                while i < chars.len() && chars[i] != '}' {
-                    i += 1;
-                }
-            }
-            if i < chars.len() && chars[i] == '}' {
-                i += 1; // skip '}'
-            }
-        } else {
-            result.push(chars[i]);
-            i += 1;
-        }
-    }
-    Cow::Owned(result)
-}
-
 /// Map GCC inline asm condition code suffix to x86 SETcc/Jcc suffix.
 ///
 /// GCC's `=@cc<cond>` output constraint maps directly to x86 condition codes.
@@ -202,9 +156,14 @@ pub(crate) fn substitute_x86_asm_operands(
         op_imm_symbols: &[Option<String>],
     ),
 ) -> String {
-    // Pre-process GCC dialect alternatives: {att_syntax|intel_syntax}
-    // We always target AT&T syntax, so select the first alternative.
-    let line = resolve_dialect_alternatives(line);
+    // Dialect alternatives are NOT resolved here. `inline_asm::
+    // expand_dialect_alternatives` owns that, once, on the whole template
+    // before it is split into lines -- and it is the only place that knows
+    // whether the statement is extended asm and whether the target even has
+    // assembler dialects. A second resolver here used to run afterwards on
+    // every line and unconditionally strip braces, which silently undid both
+    // decisions: basic asm was expanded (GCC emits it verbatim) and `%{lit%}`
+    // lost its escaped braces. One rule, one implementation.
     let mut result = String::new();
     let chars: Vec<char> = line.chars().collect();
     let mut i = 0;
@@ -673,5 +632,77 @@ mod packed_shift_count_tests {
         for count in 0..=255 {
             assert_eq!(packed_shift_immediate(count), count);
         }
+    }
+}
+
+#[cfg(test)]
+mod substitution_layering_tests {
+    //! Dialect resolution belongs to `inline_asm::expand_dialect_alternatives`,
+    //! which alone knows whether the statement is extended asm and whether the
+    //! target has assembler dialects. A second resolver used to live in this
+    //! file and ran after it on every line, unconditionally stripping braces:
+    //! that undid both decisions, so basic asm was expanded (GCC emits it
+    //! verbatim) and `%{lit%}` lost its escaped braces. These tests fail if a
+    //! brace-touching pass is ever reintroduced at this layer.
+    use super::substitute_x86_asm_operands;
+    use crate::common::types::IrType;
+
+    fn noop_operand(
+        _result: &mut String,
+        _idx: usize,
+        _modifier: Option<char>,
+        _op_regs: &[String],
+        _op_is_memory: &[bool],
+        _op_mem_addrs: &[String],
+        _op_types: &[IrType],
+        _op_imm_values: &[Option<i64>],
+        _op_imm_symbols: &[Option<String>],
+    ) {
+    }
+
+    fn substitute(line: &str) -> String {
+        substitute_x86_asm_operands(
+            line,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            noop_operand,
+        )
+    }
+
+    #[test]
+    fn braces_reach_the_substitutor_output_untouched() {
+        for line in [
+            "mov{l} %eax, %ebx",
+            "no{p|q}",
+            "nop # {lit}",
+            "ld1 {v0.4s}, [x0]",
+            "nop {|}",
+            "nop {}",
+        ] {
+            assert_eq!(substitute(line), line, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn percent_substitution_still_happens_here() {
+        // `%%` is this layer's job, and must survive exactly once.
+        assert_eq!(substitute("mov %%eax, %%ebx"), "mov %eax, %ebx");
+        assert_eq!(substitute("nop # {a|b} %%ecx"), "nop # {a|b} %ecx");
+    }
+
+    #[test]
+    fn multibyte_text_survives_substitution() {
+        let line = "# caf\u{e9} \u{20ac} \u{1f980} {v0.4s} %%eax";
+        assert_eq!(
+            substitute(line),
+            "# caf\u{e9} \u{20ac} \u{1f980} {v0.4s} %eax"
+        );
     }
 }

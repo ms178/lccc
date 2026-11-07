@@ -383,18 +383,12 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         if block.instructions.get(ii).and_then(Instruction::dest) != Some(dest) {
             continue;
         }
-        if !block.source_spans.is_empty() {
-            let span = block
-                .source_spans
-                .get(ii)
-                .copied()
-                .unwrap_or_else(crate::common::source::Span::dummy);
-            block.source_spans.resize(block.instructions.len(), span);
-            block
-                .source_spans
-                .splice(ii..=ii, std::iter::repeat_n(span, replacement.len()));
+        let span = block.span_at(ii);
+        let id = block.inline_id_at(ii);
+        block.remove_inst(ii);
+        for inst in replacement.into_iter().rev() {
+            block.insert_inst_inline(ii, inst, span, id);
         }
-        block.instructions.splice(ii..=ii, replacement);
     }
     if fresh > func.next_value_id {
         func.next_value_id = fresh;
@@ -446,6 +440,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(v(Value(3)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 4;
         func
@@ -665,6 +660,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(v(Value(5)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 6;
         func
@@ -767,6 +763,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(v(Value(4)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 5;
         func
@@ -937,6 +934,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(v(Value(7)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 8;
         func

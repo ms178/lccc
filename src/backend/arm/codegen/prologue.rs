@@ -1373,6 +1373,7 @@ mod pool_scratch_tests {
             instructions: insts,
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }];
         f
     }

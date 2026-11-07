@@ -1343,28 +1343,32 @@ impl X86Codegen {
 /// `%dx`, `%dil` are left alone: only a modifier followed by a digit or `[`
 /// is an operand reference.
 pub(crate) fn strip_duplicate_modifier(line: &str) -> String {
-    let b = line.as_bytes();
     let mut out = String::with_capacity(line.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' {
-            if i + 1 < b.len() && b[i + 1] == b'%' {
-                out.push_str("%%");
-                i += 2;
-                continue;
-            }
-            if i + 2 < b.len()
-                && b[i + 1] == b'd'
-                && (b[i + 2].is_ascii_digit() || b[i + 2] == b'[')
-            {
-                out.push('%');
-                i += 2;
-                continue;
-            }
+    let mut rest = line;
+    while let Some(pos) = rest.find('%') {
+        // Copy the run before the '%' as a slice. `byte as char` would decode
+        // each UTF-8 continuation byte as Latin-1 and double-encode the text:
+        // i686 runs every template line through here, so that corrupted every
+        // non-ASCII inline-asm comment on that target.
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 1..];
+        if let Some(tail) = after.strip_prefix('%') {
+            out.push_str("%%");
+            rest = tail;
+        } else if let Some(tail) = after.strip_prefix('d')
+            && tail
+                .as_bytes()
+                .first()
+                .is_some_and(|b| b.is_ascii_digit() || *b == b'[')
+        {
+            out.push('%');
+            rest = tail;
+        } else {
+            out.push('%');
+            rest = after;
         }
-        out.push(b[i] as char);
-        i += 1;
     }
+    out.push_str(rest);
     out
 }
 
@@ -1378,6 +1382,34 @@ mod duplicate_modifier_tests {
         assert_eq!(strip_duplicate_modifier("# %d[x] %d12"), "# %[x] %12");
         assert_eq!(strip_duplicate_modifier("movb %dl, %%dl"), "movb %dl, %%dl");
         assert_eq!(strip_duplicate_modifier("%%d0 %dx"), "%%d0 %dx");
+    }
+
+    /// An inline-asm template is text. i686 passes EVERY line through this
+    /// function, so a byte-wise `byte as char` copy double-encoded every
+    /// non-ASCII comment (`café` became `cafÃ©`). Pin the exact bytes.
+    #[test]
+    fn multibyte_text_survives_the_rewrite() {
+        let line = "# caf\u{e9} \u{20ac} \u{1f980} %d0";
+        assert_eq!(
+            strip_duplicate_modifier(line),
+            "# caf\u{e9} \u{20ac} \u{1f980} %0"
+        );
+        let untouched = "# caf\u{e9} \u{20ac} \u{1f980} %0 %%d1 %dl";
+        assert_eq!(strip_duplicate_modifier(untouched), untouched);
+        // A code point whose continuation bytes spell '%' or 'd' as raw bytes
+        // must not be mistaken for a modifier: U+0025 cannot appear inside a
+        // multi-byte sequence, which is exactly why slicing is safe.
+        for c in ['\u{e9}', '\u{20ac}', '\u{1f980}', '\u{7f}', '\u{80}'] {
+            let text = format!("{c}%d1{c}");
+            assert_eq!(strip_duplicate_modifier(&text), format!("{c}%1{c}"));
+        }
+    }
+
+    #[test]
+    fn a_trailing_percent_or_d_is_preserved() {
+        for line in ["%", "%d", "abc%", "abc%d", "%%", "%%%"] {
+            assert_eq!(strip_duplicate_modifier(line), line, "line {line:?}");
+        }
     }
 }
 

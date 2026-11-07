@@ -1529,6 +1529,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // 1: header: reads d, branches to the two arms
         func.blocks.push(BasicBlock {
@@ -1540,6 +1541,7 @@ mod tests {
                 false_label: BlockId(3),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // 2 / 3: arms, each writing the join home `s` (12) and branching to the merge
         func.blocks.push(BasicBlock {
@@ -1553,6 +1555,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(4)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(3),
@@ -1565,6 +1568,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(4)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // 4: merge: d <- s (the hop), then the loop test
         func.blocks.push(BasicBlock {
@@ -1588,12 +1592,14 @@ mod tests {
                 false_label: BlockId(5),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(5),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Value(Value(10)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let folded = coalesce_forwarding_phi_copies(&mut func);
@@ -1653,6 +1659,7 @@ mod tests {
             instructions: inst,
             terminator: term,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         };
         // 0: entry, d(10) <- 0 ; -> 1 or -> 5
         func.blocks.push(blk(
@@ -1746,6 +1753,7 @@ mod tests {
                 instructions: insts,
                 terminator: term,
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             });
         };
         blk(
@@ -1830,12 +1838,14 @@ mod tests {
                 false_label: BlockId(1),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Value(Value(N)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let removed = propagate_copies_post_phi(&mut func);
@@ -1919,6 +1929,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let replacements = propagate_copies(&mut func);
@@ -1964,6 +1975,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let replacements = propagate_copies(&mut func);
@@ -2004,6 +2016,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let replacements = propagate_copies(&mut func);
@@ -2033,6 +2046,7 @@ mod tests {
             }],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let replacements = propagate_copies(&mut func);
@@ -2060,6 +2074,7 @@ mod tests {
             }],
             terminator: Terminator::Return(Some(Operand::Value(Value(0)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let replacements = propagate_copies(&mut func);
@@ -2105,6 +2120,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(val(7))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 8;
         func
@@ -2192,6 +2208,9 @@ mod tests {
             instructions: insts,
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            // Untracked fixture: no inline provenance (sparse-empty is the
+            // canonical spelling, not an all-NO_INLINE_INSTANCE array).
+            source_inline_ids: Vec::new(),
         });
         func
     }
@@ -2614,6 +2633,7 @@ mod snapshot_forwarding_contract {
             instructions,
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: vec![],
         });
         let mut m = IrModule::new();
         m.functions.push(f);
@@ -2672,6 +2692,7 @@ mod snapshot_forwarding_contract {
             instructions,
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: vec![],
+            source_inline_ids: vec![],
         });
         let mut m = IrModule::new();
         m.functions.push(f);

@@ -659,6 +659,7 @@ mod shared_mask_tests {
             instructions: insts,
             terminator: term,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }];
         f.next_value_id = 32;
         f
@@ -768,6 +769,7 @@ mod shared_mask_tests {
             ],
             terminator: Terminator::Return(Some(v(5))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(fold_bit_select_shared_for_test(&mut f), 2);
         assert_eq!(op_at(&f, 0), IrBinOp::Shl);

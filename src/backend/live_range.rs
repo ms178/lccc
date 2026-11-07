@@ -3531,6 +3531,7 @@ mod tests {
             instructions: vec![],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         f
     }
@@ -3756,6 +3757,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(v(10))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // meta_uses on the same dense numbering the classification walk
         // uses (one point per instruction, terminator after the block).
@@ -4334,6 +4336,7 @@ mod tests {
             instructions,
             terminator,
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         };
         let mut f = empty_fn();
         f.blocks = vec![
@@ -5594,6 +5597,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(v(20))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         let points: [(u32, u32); 12] = [
             (1, 0),

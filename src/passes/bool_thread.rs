@@ -205,10 +205,7 @@ fn remove_boolean_phi_branch_casts(func: &mut IrFunction) -> usize {
         if let Terminator::CondBranch { cond, .. } = &mut block.terminator {
             *cond = Operand::Value(source);
         }
-        block.instructions.remove(position);
-        if position < block.source_spans.len() {
-            block.source_spans.remove(position);
-        }
+        block.remove_inst(position);
         removed += 1;
     }
     removed
@@ -955,6 +952,7 @@ mod tests {
             instructions: Vec::new(),
             terminator: term,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -1033,6 +1031,7 @@ mod tests {
                 false_label: BlockId(2),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         };
         let arm = |label: u32, src: Value, target: BlockId| BasicBlock {
             label: BlockId(label),
@@ -1042,6 +1041,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(target),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         };
         let b1 = arm(1, va, BlockId(3));
         let b2 = arm(2, vb, BlockId(3));
@@ -1070,6 +1070,7 @@ mod tests {
                 false_label: BlockId(5),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         };
         let b4 = empty_block(4, Terminator::Branch(BlockId(5)));
         let b5 = BasicBlock {
@@ -1090,6 +1091,7 @@ mod tests {
                 Terminator::Return(Some(Operand::Value(vr)))
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         };
         f.blocks = vec![b0, b1, b2, b3, b4, b5];
         f

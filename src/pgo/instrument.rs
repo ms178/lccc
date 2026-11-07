@@ -564,6 +564,7 @@ pub fn instrument_module(
                     instructions: vec![],
                     terminator: Terminator::Branch(BlockId(e.dst)),
                     source_spans: vec![],
+                    source_inline_ids: Vec::new(),
                 });
             }
         }
@@ -700,6 +701,7 @@ pub fn instrument_module(
                         instructions: vec![],
                         terminator: Terminator::Branch(BlockId(e.dst)),
                         source_spans: vec![],
+                        source_inline_ids: Vec::new(),
                     });
                     s
                 };
@@ -724,13 +726,10 @@ pub fn instrument_module(
                 .iter()
                 .take_while(|i| matches!(i, Instruction::Phi { .. }))
                 .count();
-            for (k, x) in v.into_iter().enumerate() {
-                b.instructions.insert(pos + k, x);
-                if !b.source_spans.is_empty() {
-                    b.source_spans
-                        .insert(pos + k, crate::common::source::Span::dummy());
-                }
-            }
+            // One splice for the whole run (O(block) instead of O(counters *
+            // block)), and the counters inherit the surrounding inline
+            // instance so they do not chop one inline range into many.
+            b.insert_insts(pos, v, crate::common::source::Span::dummy());
         }
 
         // Edge list (without the virtual entry edge), tagged with slot.
@@ -797,32 +796,26 @@ pub fn instrument_module(
                         if !m.globals.iter().any(|x| x.name == g.name) {
                             m.globals.push(g);
                         }
-                        b.instructions.insert(
+                        b.insert_insts(
                             k,
-                            Instruction::GlobalAddr {
-                                dest: sa,
-                                name: site.clone(),
-                            },
+                            [
+                                Instruction::GlobalAddr {
+                                    dest: sa,
+                                    name: site.clone(),
+                                },
+                                Instruction::Call {
+                                    func: vp_recorder.clone(),
+                                    info: ci(
+                                        None,
+                                        vec![Operand::Value(sa), Operand::Value(fp)],
+                                        vec![IrType::Ptr, IrType::I64],
+                                        IrType::I32,
+                                        false,
+                                    ),
+                                },
+                            ],
+                            crate::common::source::Span::dummy(),
                         );
-                        b.instructions.insert(
-                            k + 1,
-                            Instruction::Call {
-                                func: vp_recorder.clone(),
-                                info: ci(
-                                    None,
-                                    vec![Operand::Value(sa), Operand::Value(fp)],
-                                    vec![IrType::Ptr, IrType::I64],
-                                    IrType::I32,
-                                    false,
-                                ),
-                            },
-                        );
-                        if !b.source_spans.is_empty() {
-                            b.source_spans
-                                .insert(k, crate::common::source::Span::dummy());
-                            b.source_spans
-                                .insert(k + 1, crate::common::source::Span::dummy());
-                        }
                         k += 2;
                         site_recs.push(SiteRec { ordinal, site, sig });
                         ordinal += 1;
@@ -1061,6 +1054,7 @@ fn dump_helper(
         instructions: is,
         terminator: term,
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
     let entry_block = mk(
         910000,
@@ -1097,6 +1091,7 @@ fn dump_helper(
         instructions: vec![],
         terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
 
     // The lock belongs to the open file description. fclose flushes BEFORE
@@ -1599,6 +1594,7 @@ fn dump_helper(
         debug_param_indices: Vec::new(),
         debug_locals: Vec::new(),
         debug_scopes: Vec::new(),
+        debug_inline_instances: Vec::new(),
         pass_policy: Default::default(),
         name: name.into(),
         return_type: IrType::I32,
@@ -1620,6 +1616,7 @@ fn dump_helper(
                         false_label: close_l,
                     },
                     source_spans: vec![],
+                    source_inline_ids: Vec::new(),
                 },
                 skip_block,
             ];
@@ -1677,6 +1674,7 @@ fn dump_helper(
                 debug_param_indices: Vec::new(),
                 debug_locals: Vec::new(),
                 debug_scopes: Vec::new(),
+                debug_inline_instances: Vec::new(),
                 pass_policy: Default::default(),
                 name: n.into(),
                 return_type: t,
@@ -1973,6 +1971,7 @@ fn push_helper_fn(
         debug_param_indices: Vec::new(),
         debug_locals: Vec::new(),
         debug_scopes: Vec::new(),
+        debug_inline_instances: Vec::new(),
         pass_policy: Default::default(),
         name: name.into(),
         return_type: IrType::I32,
@@ -2285,6 +2284,7 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
                 instructions: b.is,
                 terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             }],
             b.next,
             label_base,
@@ -2321,6 +2321,7 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
                 instructions: b.is,
                 terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             }],
             b.next,
             label_base,
@@ -2444,6 +2445,7 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
                 false_label: l1,
             },
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         };
         let mk_inc = |slot: usize, label: BlockId, next: u32| -> (BasicBlock, u32) {
             let mut b = VpBuilder::new(next);
@@ -2461,6 +2463,7 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
                     instructions: b.is,
                     terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
                     source_spans: vec![],
+                    source_inline_ids: Vec::new(),
                 },
                 b.next,
             )
@@ -2485,6 +2488,7 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
                     instructions: b.is,
                     terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
                     source_spans: vec![],
+                    source_inline_ids: Vec::new(),
                 },
                 b.next,
             )
@@ -2500,24 +2504,28 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
                 instructions: vec![],
                 terminator: mk_cb(eqs[1], li1, l2),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: l2,
                 instructions: vec![],
                 terminator: mk_cb(eqs[2], li2, l3),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: l3,
                 instructions: vec![],
                 terminator: mk_cb(eqs[3], li3, l4),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: l4,
                 instructions: vec![],
                 terminator: mk_cb(z0, ls0, le0),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             blk_li0,
             blk_li1,
@@ -2528,24 +2536,28 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
                 instructions: vec![],
                 terminator: mk_cb(z1, ls1, le1),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: le1,
                 instructions: vec![],
                 terminator: mk_cb(z2, ls2, le2),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: le2,
                 instructions: vec![],
                 terminator: mk_cb(z3, ls3, le3),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: le3,
                 instructions: vec![],
                 terminator: Terminator::Branch(lev),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             blk_ls0,
             blk_ls1,
@@ -2556,18 +2568,21 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
                 instructions: vec![],
                 terminator: mk_cb(q0, ls0, lq1),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: lq1,
                 instructions: vec![],
                 terminator: mk_cb(q1, ls1, lq2),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: lq2,
                 instructions: vec![],
                 terminator: mk_cb(q2, ls2, ls3),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             },
         ];
         push_helper_fn(
@@ -2615,6 +2630,7 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
             instructions: e.is,
             terminator: Terminator::Branch(lcond),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         };
         // lcond: if node0 != 0 -> body else done (node0 redefined in lnn)
         let mut c = VpBuilder::new(e.next);
@@ -2628,6 +2644,7 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
             instructions: c.is,
             terminator: mk_cb(nz, lbody, ldone),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         };
         // lbody: load next/table/count; icur = 0
         let mut b = VpBuilder::new(c.next);
@@ -2643,6 +2660,7 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
             instructions: b.is,
             terminator: Terminator::Branch(lpc),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         };
         // lpc: icur < count -> pb else nn
         let mut p = VpBuilder::new(b.next);
@@ -2656,6 +2674,7 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
             instructions: p.is,
             terminator: mk_cb(ic, lpb, lnn),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         };
         // lpb: ep = table + icur*16; a = load ep; a == addr -> found else pn
         let mut q = VpBuilder::new(p.next);
@@ -2672,6 +2691,7 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
             instructions: q.is,
             terminator: mk_cb(ae, lfound, lpn),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         };
         // lpn: icur += 1 (redefine the SAME value id)
         let mut r = VpBuilder::new(q.next);
@@ -2682,6 +2702,7 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
             instructions: r.is,
             terminator: Terminator::Branch(lpc),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         };
         // lnn: node0 = next (redefine the loop-carried value id)
         let mut s = VpBuilder::new(r.next);
@@ -2691,6 +2712,7 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
             instructions: s.is,
             terminator: Terminator::Branch(lcond),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         };
         // ldone: retv = &dummy (an empty slot must still yield a valid entry
         // pointer — the dump GEPs +8/+16 off the result; NULL would crash).
@@ -2713,6 +2735,7 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
             instructions: u.is,
             terminator: Terminator::Branch(lret),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         };
         // lfound: retv = ep (the matched {addr,name,flags} entry base); the
         // dump derives name = ep+8 and flags = ep+16.
@@ -2723,6 +2746,7 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
             instructions: w.is,
             terminator: Terminator::Branch(lret),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         };
         // lret: return the multi-def retv (NO redefinition — a copy here
         // would override the value set by ldone/lfound; the backend treats
@@ -2733,6 +2757,7 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
             instructions: x.is,
             terminator: Terminator::Return(Some(Operand::Value(retv))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         };
         push_helper_fn(
             m,
@@ -2825,6 +2850,65 @@ mod tests {
             "__unit_pgo_lookup",
         );
         crate::passes::validate_unique_defs(&module, "backend:pre-codegen");
+    }
+
+    /// `-fprofile-generate` inserts a counter run into tracked blocks. The
+    /// insertion must keep instructions/spans/ids parallel and must NOT chop
+    /// an inline instance into pieces: the counters inherit the surrounding
+    /// instance (they are not source code of their own).
+    #[test]
+    fn counters_keep_provenance_parallel_and_inherit_the_instance() {
+        use crate::ir::reexports::{BasicBlock, BlockId, IrFunction, Terminator};
+        let mut m = IrModule::new();
+        let mut f = IrFunction::new("counted".to_string(), IrType::I32, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(1)),
+            }],
+            terminator: Terminator::Return(Some(Operand::Value(Value(0)))),
+            source_spans: vec![crate::common::source::Span::new(10, 11, 0)],
+            source_inline_ids: vec![42],
+        });
+        f.next_value_id = 1;
+        f.next_label = 1;
+        m.functions.push(f);
+        let n = instrument_module(
+            &mut m,
+            "/tmp",
+            "unit",
+            None,
+            Target::X86_64,
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+        );
+        if n == 0 {
+            // Instrumentation is x86-64 only and honours LCCC_PGO_NO_COUNTERS.
+            return;
+        }
+        for func in &m.functions {
+            for block in &func.blocks {
+                assert!(
+                    block.inline_ids_consistent(),
+                    "{}:{:?} drifted",
+                    func.name,
+                    block.label
+                );
+                if !block.source_spans.is_empty() {
+                    assert_eq!(block.source_spans.len(), block.instructions.len());
+                }
+                // Every inserted counter sits in the instance it was inserted
+                // into, never in a fabricated concrete row.
+                for (i, inst) in block.instructions.iter().enumerate() {
+                    if matches!(inst, Instruction::PgoCounterInc { .. })
+                        && !block.source_inline_ids.is_empty()
+                    {
+                        assert_eq!(block.source_inline_ids[i], 42);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

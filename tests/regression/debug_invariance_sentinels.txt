@@ -278,3 +278,68 @@ riscv64 -O0 ../bench/k_utf8_validate.c
 riscv64 -O2 ../bench/k_utf8_validate.c
 riscv64 -O2 ../bench/k_varint.c
 aarch64 -O2 range_check_fold.c
+# -g must not change ACCEPTANCE either: `lccc -S -g` pre-renders the DIEs by
+# assembling the text in memory, so an inline-assembly template the target
+# cannot encode used to reject -S -g while plain -S accepted it. This source's
+# `addq $1, %0` is valid only in 64-bit mode; GCC 16.2 accepts -S -g on every
+# target and fails only when the text is assembled (-c). Pinned on all four.
+x86_64 -O2 peephole_utf8_inline_asm.c
+i686 -O2 peephole_utf8_inline_asm.c
+aarch64 -O2 peephole_utf8_inline_asm.c
+riscv64 -O2 peephole_utf8_inline_asm.c
+
+# Found by the exhaustive STRIDE=1 sweep, not by the 1-in-32 sample: i686
+# rows that a host without multilib headers silently SKIPs. Three lost the
+# x87 top-of-stack deferral under -g (a D6 endpoint was treated as a merge
+# point by the pending-copy flush gate); three were rejected only under
+# -g because the in-memory assembler cannot represent a .quad relocation
+# on a 32-bit target. Pinned at every level on both x86 targets so the
+# sample can never miss them again.
+i686 -O0 asm_goto_jump_table.c
+i686 -O0 asm_quad_pcrel_key.c
+i686 -O0 kernel_altinstr_layout.c
+i686 -O0 call_return_type_function_pointer_shadow.c
+i686 -O0 fp_die_at_birth.c
+i686 -O0 unroll_const4_f64_distance.c
+i686 -O1 asm_goto_jump_table.c
+i686 -O1 asm_quad_pcrel_key.c
+i686 -O1 kernel_altinstr_layout.c
+i686 -O1 call_return_type_function_pointer_shadow.c
+i686 -O1 fp_die_at_birth.c
+i686 -O1 unroll_const4_f64_distance.c
+i686 -O2 asm_goto_jump_table.c
+i686 -O2 asm_quad_pcrel_key.c
+i686 -O2 kernel_altinstr_layout.c
+i686 -O2 call_return_type_function_pointer_shadow.c
+i686 -O2 fp_die_at_birth.c
+i686 -O2 unroll_const4_f64_distance.c
+i686 -O3 asm_goto_jump_table.c
+i686 -O3 asm_quad_pcrel_key.c
+i686 -O3 kernel_altinstr_layout.c
+i686 -O3 call_return_type_function_pointer_shadow.c
+i686 -O3 fp_die_at_birth.c
+i686 -O3 unroll_const4_f64_distance.c
+x86_64 -O0 asm_goto_jump_table.c
+x86_64 -O0 asm_quad_pcrel_key.c
+x86_64 -O0 kernel_altinstr_layout.c
+x86_64 -O0 call_return_type_function_pointer_shadow.c
+x86_64 -O0 fp_die_at_birth.c
+x86_64 -O0 unroll_const4_f64_distance.c
+x86_64 -O1 asm_goto_jump_table.c
+x86_64 -O1 asm_quad_pcrel_key.c
+x86_64 -O1 kernel_altinstr_layout.c
+x86_64 -O1 call_return_type_function_pointer_shadow.c
+x86_64 -O1 fp_die_at_birth.c
+x86_64 -O1 unroll_const4_f64_distance.c
+x86_64 -O2 asm_goto_jump_table.c
+x86_64 -O2 asm_quad_pcrel_key.c
+x86_64 -O2 kernel_altinstr_layout.c
+x86_64 -O2 call_return_type_function_pointer_shadow.c
+x86_64 -O2 fp_die_at_birth.c
+x86_64 -O2 unroll_const4_f64_distance.c
+x86_64 -O3 asm_goto_jump_table.c
+x86_64 -O3 asm_quad_pcrel_key.c
+x86_64 -O3 kernel_altinstr_layout.c
+x86_64 -O3 call_return_type_function_pointer_shadow.c
+x86_64 -O3 fp_die_at_birth.c
+x86_64 -O3 unroll_const4_f64_distance.c

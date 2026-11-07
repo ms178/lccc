@@ -521,6 +521,23 @@ pub(crate) fn eliminate_dead_global_stores(module: &mut IrModule) {
             block.source_spans = kept_spans;
         } else if !block.source_spans.is_empty() && block.source_spans.len() != original_len {
             block.source_spans.clear();
+            block.source_inline_ids.clear();
+        }
+        if !block.source_inline_ids.is_empty() {
+            if block.source_inline_ids.len() == original_len {
+                let mut kept_ids = Vec::with_capacity(original_len - in_block.len());
+                let mut di = 0usize;
+                for (i, id) in block.source_inline_ids.drain(..).enumerate() {
+                    if di < in_block.len() && in_block[di] == i {
+                        di += 1;
+                    } else {
+                        kept_ids.push(id);
+                    }
+                }
+                block.source_inline_ids = kept_ids;
+            } else {
+                block.source_inline_ids.clear();
+            }
         }
         debug_assert_eq!(block.instructions.len(), original_len - in_block.len());
     }
@@ -1064,6 +1081,7 @@ mod tests {
             instructions: insts,
             terminator: term,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 

@@ -322,6 +322,7 @@ pub(crate) fn eliminate_dead_code(func: &mut IrFunction) -> usize {
         total += sweep_block(
             &mut block.instructions,
             &mut block.source_spans,
+            &mut block.source_inline_ids,
             &live[start..end],
         );
     }
@@ -421,6 +422,7 @@ fn is_dce_root(inst: &Instruction, preserve_allocas: bool) -> bool {
 fn sweep_block<S>(
     instructions: &mut Vec<Instruction>,
     source_spans: &mut Vec<S>,
+    source_inline_ids: &mut Vec<u32>,
     live: &[u8],
 ) -> usize {
     let original_len = instructions.len();
@@ -444,6 +446,7 @@ fn sweep_block<S>(
     }
 
     let has_spans = source_spans.len() == original_len && !source_spans.is_empty();
+    let has_inline_ids = source_inline_ids.len() == original_len && !source_inline_ids.is_empty();
     if has_spans {
         let mut i = 0usize;
         instructions.retain(|_| {
@@ -457,6 +460,16 @@ fn sweep_block<S>(
             i += 1;
             keep
         });
+        if has_inline_ids {
+            let mut i = 0usize;
+            source_inline_ids.retain(|_| {
+                let keep = live[i] != 0;
+                i += 1;
+                keep
+            });
+        } else {
+            source_inline_ids.clear();
+        }
     } else {
         // Restore the documented invariant: empty spans == "no debug info
         // for this block". A stale non-empty, wrong-length vector would
@@ -464,6 +477,7 @@ fn sweep_block<S>(
         if !source_spans.is_empty() && source_spans.len() != original_len {
             source_spans.clear();
         }
+        source_inline_ids.clear();
         let mut i = 0usize;
         instructions.retain(|_| {
             let keep = live[i] != 0;
@@ -654,6 +668,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func
     }
@@ -688,6 +703,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         eliminate_dead_code(&mut func);
         assert!(
@@ -717,6 +733,7 @@ mod tests {
             }],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         let removed = eliminate_dead_code(&mut func);
         assert_eq!(removed, 0);
@@ -739,6 +756,7 @@ mod tests {
             }],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(eliminate_dead_code(&mut func), 1);
         assert!(func.blocks[0].instructions.is_empty());
@@ -787,6 +805,7 @@ mod tests {
                     ],
                     terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
                     source_spans: vec![],
+                    source_inline_ids: Vec::new(),
                 });
                 eliminate_dead_code(&mut f);
                 assert!(f.blocks[0].instructions.iter().any(|i| matches!(
@@ -829,6 +848,7 @@ mod tests {
             }],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(eliminate_dead_code(&mut func), 0);
     }
@@ -853,6 +873,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(eliminate_dead_code(&mut func), 0);
         assert_eq!(func.blocks[0].instructions.len(), 2);
@@ -890,6 +911,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let removed = eliminate_dead_code(&mut func);
@@ -930,6 +952,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(eliminate_dead_code(&mut func), 0);
         assert!(matches!(
@@ -952,6 +975,7 @@ mod tests {
             instructions: vec![alloca(0, IrType::I64, 8, 8)],
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(eliminate_dead_code(&mut func), 1);
         assert!(func.blocks[0].instructions.is_empty());
@@ -969,12 +993,14 @@ mod tests {
             instructions: vec![alloca(0, IrType::I64, 8, 8)],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
             instructions: vec![],
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(eliminate_dead_code(&mut func), 0);
     }
@@ -989,6 +1015,7 @@ mod tests {
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -1006,18 +1033,21 @@ mod tests {
                 false_label: BlockId(3),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(3),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let removed = eliminate_dead_code(&mut func);
@@ -1038,6 +1068,7 @@ mod tests {
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -1051,6 +1082,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
@@ -1067,12 +1099,14 @@ mod tests {
                 false_label: BlockId(3),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(3),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let removed = eliminate_dead_code(&mut func);
@@ -1091,6 +1125,7 @@ mod tests {
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -1108,6 +1143,7 @@ mod tests {
                 false_label: BlockId(3),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
@@ -1120,12 +1156,14 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(3),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Value(Value(0)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let removed = eliminate_dead_code(&mut func);
@@ -1148,6 +1186,7 @@ mod tests {
                 false_label: BlockId(2),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -1161,6 +1200,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
@@ -1178,12 +1218,14 @@ mod tests {
                 false_label: BlockId(3),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(3),
             instructions: vec![],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let removed = eliminate_dead_code(&mut func);
@@ -1213,6 +1255,7 @@ mod tests {
                 false_label: BlockId(n_preds),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         for p in 1..=n_preds {
             func.blocks.push(BasicBlock {
@@ -1223,6 +1266,7 @@ mod tests {
                 }],
                 terminator: Terminator::Branch(join),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             });
         }
         func.blocks.push(BasicBlock {
@@ -1230,6 +1274,7 @@ mod tests {
             instructions: vec![],
             terminator: ret,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func
     }
@@ -1298,6 +1343,7 @@ mod tests {
                 false_label: BlockId(2),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -1310,12 +1356,14 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(0)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let removed = eliminate_dead_code(&mut func);
@@ -1355,6 +1403,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(HIGH)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(eliminate_dead_code(&mut func), 1);
         assert_eq!(func.blocks[0].instructions.len(), 1);
@@ -1388,6 +1437,7 @@ mod tests {
             }],
             terminator: Terminator::Return(Some(Operand::Value(Value(100_003)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(eliminate_dead_code(&mut func), 0);
         assert_eq!(func.blocks[0].instructions.len(), 1);
@@ -1405,6 +1455,7 @@ mod tests {
             }],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         let removed = eliminate_dead_code(&mut func);
         assert_eq!(removed, 0, "profile counter must never be deleted");
@@ -1425,12 +1476,14 @@ mod tests {
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
             instructions: vec![],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(eliminate_dead_code(&mut func), 0);
     }
@@ -1489,6 +1542,7 @@ mod tests {
             }],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         let removed = eliminate_dead_code(&mut func);
         assert_eq!(removed, 1);
@@ -1510,6 +1564,7 @@ mod tests {
             }],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         let removed = eliminate_dead_code(&mut func);
         assert_eq!(removed, 0);
@@ -1535,6 +1590,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(eliminate_dead_code(&mut func), 0);
         assert!(matches!(

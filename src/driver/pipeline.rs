@@ -2657,7 +2657,7 @@ impl Driver {
                 crate::backend::DebugHomeReport::default(),
             ))
         });
-        let asm = self.compile_ir_module_to_assembly(
+        let (asm, inline_instances) = self.compile_ir_module_to_assembly(
             module,
             source_manager.as_ref(),
             input_file,
@@ -2670,6 +2670,10 @@ impl Driver {
         )?;
         let mut debug_unit = debug_unit;
         if let Some(unit) = debug_unit.as_mut() {
+            // Inlining happens after lowering.  Collect its facts from the
+            // final IR, not from the pre-optimization module (where the table
+            // is necessarily empty).
+            unit.inline_instances = inline_instances;
             if let Some(homes) = debug_homes {
                 let homes = homes
                     .lock()
@@ -2802,6 +2806,7 @@ impl Driver {
         // function's parameter DIEs.  A key with no emitted definition simply
         // never matches a subprogram, which costs nothing.
         let mut return_types = crate::common::fx_hash::FxHashMap::default();
+        let mut function_prototypes = crate::common::fx_hash::FxHashMap::default();
 
         // A parameter's type is what a debugger prints for it, and an unnamed
         // parameter is a prototype's -- the attribute is simply absent, which is
@@ -2813,6 +2818,7 @@ impl Driver {
             if !info.is_defined {
                 continue;
             }
+            function_prototypes.insert(name.clone(), info.prototype.is_some());
             if !matches!(info.return_type, crate::common::types::CType::Void) {
                 return_types.insert(
                     name.clone(),
@@ -2910,14 +2916,62 @@ impl Driver {
             }
         }
 
+        // Inline instances are added after optimization by
+        // `collect_inline_instances`; they cannot be read from the lowerer's
+        // module because the inliner has not run yet.
+
         DwarfUnitSpec {
             types: graph.into_types(),
             variables,
             return_types,
+            function_prototypes,
             parameters: function_parameters,
             local_variables,
             lexical_scopes,
+            inline_instances: Vec::new(),
         }
+    }
+
+    /// Resolve post-optimization inline instances into assembler-facing data.
+    ///
+    /// This is deliberately separate from [`Self::build_dwarf_unit`]: type and
+    /// variable declarations come from sema before optimization, while inline
+    /// instances do not exist until the inliner and subsequent transforms have
+    /// finished.  Reading the pre-pass module here was a phase-ordering bug.
+    fn collect_inline_instances(
+        module: &crate::ir::module::IrModule,
+        sources: Option<&SourceManager>,
+    ) -> Vec<crate::backend::elf::DwarfInlineInstance> {
+        let mut inline_instances = Vec::new();
+        let resolve = |span: crate::common::source::Span| -> (Option<String>, u32, u32) {
+            match sources {
+                Some(sources) if span != crate::common::source::Span::dummy() => {
+                    let loc = sources.resolve_span(span);
+                    (Some(loc.file), loc.line, loc.column)
+                }
+                _ => (None, 0, 0),
+            }
+        };
+        for func in &module.functions {
+            for (id, instance) in func.debug_inline_instances.iter().enumerate() {
+                let (call_file, call_line, call_column) = resolve(instance.call_span);
+                let (decl_file, decl_line, decl_column) = resolve(instance.decl_span);
+                inline_instances.push(crate::backend::elf::DwarfInlineInstance {
+                    function: func.name.clone(),
+                    id: id as u32,
+                    callee: instance.callee.clone(),
+                    parent: instance.parent,
+                    call_file,
+                    call_line,
+                    call_column,
+                    decl_file,
+                    decl_line,
+                    decl_column,
+                    declared_inline: instance.declared_inline,
+                });
+            }
+        }
+        inline_instances
     }
 
     fn compile_whole_program_c_files(&self, input_files: &[&str]) -> Result<String, String> {
@@ -2933,6 +2987,9 @@ impl Driver {
         }
         let mut merged = crate::ir::whole_program::merge_modules(modules)?;
         crate::ir::whole_program::internalize_module(&mut merged, false);
+        // Whole-program assembly delivery has no per-TU DWARF unit yet.
+        // Keep its existing behavior rather than attributing merged inline
+        // instances to the first input's source manager.
         self.compile_ir_module_to_assembly(
             merged,
             None,
@@ -2944,6 +3001,7 @@ impl Driver {
             t0,
             None,
         )
+        .map(|(asm, _)| asm)
     }
 
     fn parse_and_analyze_c_tu(
@@ -3368,7 +3426,7 @@ impl Driver {
         time_phases: bool,
         t0: std::time::Instant,
         debug_homes: Option<crate::backend::DebugHomes>,
-    ) -> Result<String, String> {
+    ) -> Result<(String, Vec<crate::backend::elf::DwarfInlineInstance>), String> {
         let (module, pgo_unit) = self.optimize_ir_module(
             module,
             input_file,
@@ -3497,7 +3555,13 @@ impl Driver {
         let mut module = self.split_and_layout_blocks(module, time_phases);
         self.renumber_module_labels(&mut module);
         let module = self.finalize_module_for_codegen(module, &pgo_unit);
-        self.emit_target_assembly(
+        // Snapshot inline provenance AFTER optimization/final layout and
+        // BEFORE codegen consumes the module.  The labels emitted next use
+        // these same stable instance ids; resolving their source spans here
+        // keeps the assembler-facing channel independent of frontend IR.
+        let inline_instances =
+            Self::collect_inline_instances(&module, source_manager.map(|sm| sm.as_ref()));
+        let asm = self.emit_target_assembly(
             &module,
             source_manager,
             input_file,
@@ -3507,7 +3571,8 @@ impl Driver {
             time_phases,
             t0,
             debug_homes,
-        )
+        )?;
+        Ok((asm, inline_instances))
     }
 
     fn optimize_ir_module(
@@ -3620,6 +3685,9 @@ impl Driver {
         if self.instrument_functions {
             crate::passes::instrument::run(&mut module);
         }
+        // D6 inline provenance is a `-g` feature; without it the inliner must
+        // not allocate instance tables or per-instruction ids.
+        crate::passes::inline::set_inline_debug_enabled(self.debug_info);
         // If PGO use is active, run PGO layout before passes? Actually after, but we prepare
         run_passes(
             &mut module,
@@ -6306,6 +6374,7 @@ mod sse_reference_tests {
                     .collect(),
                 terminator: Terminator::Unreachable,
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             });
             f
         };

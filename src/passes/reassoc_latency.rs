@@ -961,11 +961,13 @@ fn rewrite_block(
     // topological and anchors are monotone along operands).
     let block = &mut func.blocks[bi];
     let old_spans = std::mem::take(&mut block.source_spans);
+    let old_ids = std::mem::take(&mut block.source_inline_ids);
     let mut old: Vec<Option<Instruction>> = std::mem::take(&mut block.instructions)
         .into_iter()
         .map(Some)
         .collect();
     let has_spans = old_spans.len() == old.len();
+    let has_ids = !old_ids.is_empty() && old_ids.len() == old.len();
     // Each group entry: (sunk leaf chains with their original indices, root
     // index for the span, new node).  Sunk instructions leave their slots.
     type Group = Vec<(Vec<(usize, Instruction)>, usize, Instruction)>;
@@ -983,23 +985,31 @@ fn rewrite_block(
     }
     let mut insts = Vec::with_capacity(old.len() + 1);
     let mut spans = Vec::with_capacity(if has_spans { old.len() + 1 } else { 0 });
+    let mut ids = Vec::with_capacity(if has_ids { old.len() + 1 } else { 0 });
     let emit = |group: Option<Group>,
                 insts: &mut Vec<Instruction>,
-                spans: &mut Vec<crate::common::source::Span>| {
+                spans: &mut Vec<crate::common::source::Span>,
+                ids: &mut Vec<u32>| {
         for (sunk, root, i) in group.into_iter().flatten() {
             for (si, s) in sunk {
                 if has_spans {
                     spans.push(old_spans[si]);
+                }
+                if has_ids {
+                    ids.push(old_ids[si]);
                 }
                 insts.push(s);
             }
             if has_spans {
                 spans.push(old_spans[root]);
             }
+            if has_ids {
+                ids.push(old_ids[root]);
+            }
             insts.push(i);
         }
     };
-    emit(by_anchor.remove(&-1), &mut insts, &mut spans);
+    emit(by_anchor.remove(&-1), &mut insts, &mut spans, &mut ids);
     for (ii, slot) in old.iter_mut().enumerate() {
         if let Some(inst) = slot.take() {
             if !deleted.contains(&ii) {
@@ -1007,15 +1017,20 @@ fn rewrite_block(
                 if has_spans {
                     spans.push(old_spans[ii]);
                 }
+                if has_ids {
+                    ids.push(old_ids[ii]);
+                }
             }
         }
-        emit(by_anchor.remove(&(ii as isize)), &mut insts, &mut spans);
+        emit(
+            by_anchor.remove(&(ii as isize)),
+            &mut insts,
+            &mut spans,
+            &mut ids,
+        );
     }
     debug_assert!(by_anchor.is_empty());
-    block.instructions = insts;
-    if has_spans {
-        block.source_spans = spans;
-    }
+    block.replace_insts_inline(insts, spans, ids);
     rewrites
 }
 
@@ -1405,9 +1420,13 @@ fn rewrite_terminal_add_return(func: &mut IrFunction) -> usize {
             continue;
         }
         let root_span = block.source_spans.get(root_index).copied();
+        let root_id = block.inline_id_at(root_index);
+        let has_ids = !block.source_inline_ids.is_empty();
         let node_set: FxHashSet<usize> = nodes.into_iter().collect();
         let mut replacement = Vec::with_capacity(block.instructions.len() + generated.len());
         let mut replacement_spans = Vec::with_capacity(block.source_spans.len() + generated.len());
+        let mut replacement_ids =
+            Vec::with_capacity(block.source_inline_ids.len() + generated.len());
         for (index, inst) in block.instructions.iter().enumerate() {
             if index == root_index {
                 for item in generated.iter().cloned() {
@@ -1415,12 +1434,18 @@ fn rewrite_terminal_add_return(func: &mut IrFunction) -> usize {
                     if let Some(span) = root_span {
                         replacement_spans.push(span);
                     }
+                    if has_ids {
+                        replacement_ids.push(root_id);
+                    }
                 }
             }
             if !node_set.contains(&index) {
                 replacement.push(inst.clone());
                 if !block.source_spans.is_empty() {
                     replacement_spans.push(block.source_spans[index]);
+                }
+                if has_ids {
+                    replacement_ids.push(block.source_inline_ids[index]);
                 }
             }
         }
@@ -1436,6 +1461,7 @@ fn rewrite_terminal_add_return(func: &mut IrFunction) -> usize {
         if !block.source_spans.is_empty() {
             block.source_spans = replacement_spans;
         }
+        block.source_inline_ids = replacement_ids;
         changed += 1;
     }
     if changed > 0 {
@@ -1455,6 +1481,7 @@ mod tests {
             instructions,
             terminator,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 

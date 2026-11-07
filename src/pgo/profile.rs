@@ -701,11 +701,13 @@ mod tests {
             instructions: is,
             terminator: term,
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         };
         IrFunction {
             debug_param_indices: Vec::new(),
             debug_locals: Vec::new(),
             debug_scopes: Vec::new(),
+            debug_inline_instances: Vec::new(),
             pass_policy: Default::default(),
             name: "loop_fn".into(),
             return_type: IrType::I32,

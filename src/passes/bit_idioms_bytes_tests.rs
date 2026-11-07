@@ -69,6 +69,7 @@ impl Graph {
         f.blocks.push(BasicBlock {
             label: BlockId(0),
             source_spans: vec![crate::common::source::Span::dummy(); self.insts.len()],
+            source_inline_ids: Vec::new(),
             instructions: self.insts,
             terminator: Terminator::Return(Some(result)),
         });

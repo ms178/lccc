@@ -885,6 +885,7 @@ pub(crate) fn restore_phi_prefix(block: &mut BasicBlock) -> bool {
     // have been observed to leave it desynchronised, so only touch it when the
     // lengths agree.
     let spans_valid = block.source_spans.len() == block.instructions.len();
+    let ids_valid = block.inline_ids_parallel();
 
     let n = block.instructions.len();
     let mut order: Vec<usize> = Vec::with_capacity(n);
@@ -901,6 +902,12 @@ pub(crate) fn restore_phi_prefix(block: &mut BasicBlock) -> bool {
     if spans_valid {
         let old_spans = std::mem::take(&mut block.source_spans);
         block.source_spans = order.iter().map(|&i| old_spans[i]).collect();
+    }
+    if ids_valid {
+        let old_ids = std::mem::take(&mut block.source_inline_ids);
+        block.source_inline_ids = order.iter().map(|&i| old_ids[i]).collect();
+    } else {
+        block.source_inline_ids.clear();
     }
     true
 }
@@ -1283,6 +1290,7 @@ mod inert_asm_tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: vec![Span::new(1, 2, 0), Span::new(3, 4, 0), Span::new(5, 6, 0)],
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(remove_inert_inline_asm(&mut func), 1);
         let block = &func.blocks[0];
@@ -1796,6 +1804,7 @@ pub(crate) fn run_passes(
     // other pass configuration, rather than rescanning the process environment
     // during parameter remapping.
     inline::set_paramref_debug_enabled(std::env::var_os("CCC_INLINE_PARAMREF_DEBUG").is_some());
+    inline::set_inline_detail_enabled(std::env::var_os("CCC_INLINE_DEBUG_DETAIL").is_some());
     loop_unroll::set_persist_gate_legacy(std::env::var("CCC_UNROLL_LEGACY_PERSIST_GATE").is_ok());
     loop_unroll::set_persist_gate_trace(std::env::var("CCC_UNROLL_GATE_TRACE").is_ok());
     // Every remaining pass switch, resolved here for the same reason.  No pass
@@ -4807,6 +4816,17 @@ pub(crate) fn restore_entry_param_prefix(module: &mut IrModule) {
             spans.sort_by_key(|(key, _)| *key);
             entry.source_spans = spans.into_iter().map(|(_, span)| span).collect();
         }
+        if entry.source_inline_ids.len() == keys.len() {
+            let mut ids: Vec<(u8, u32)> = keys
+                .iter()
+                .copied()
+                .zip(std::mem::take(&mut entry.source_inline_ids))
+                .collect();
+            ids.sort_by_key(|(key, _)| *key);
+            entry.source_inline_ids = ids.into_iter().map(|(_, id)| id).collect();
+        } else {
+            entry.source_inline_ids.clear();
+        }
     }
 }
 
@@ -4853,6 +4873,7 @@ mod inert_inline_asm_tests {
             }],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 8;
         func
@@ -4976,6 +4997,7 @@ mod ssa_validator_tests {
             instructions,
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -5074,6 +5096,7 @@ mod ssa_validator_tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         };
         let module = module_with_blocks(vec![entry(vec![]), dead], 2);
         validate_unique_defs(&module, "unit:strict");
@@ -5091,6 +5114,7 @@ mod ssa_validator_tests {
             }],
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -5103,6 +5127,7 @@ mod ssa_validator_tests {
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         };
         let entry_blk = BasicBlock {
             label: BlockId(0),
@@ -5116,6 +5141,7 @@ mod ssa_validator_tests {
                 false_label: BlockId(2),
             },
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         };
         module_with_blocks(vec![entry_blk, arm, phi_block], 4)
     }
@@ -5159,6 +5185,7 @@ mod ssa_validator_tests {
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         };
         if let Some(func) = module.functions.first_mut() {
             func.blocks.push(dead);
@@ -5214,6 +5241,7 @@ mod m16_size_policy_tests {
                 instructions,
                 terminator: Terminator::Return(None),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             }
         }
 
@@ -5399,6 +5427,7 @@ mod entry_param_prefix_tests {
             instructions: insts,
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans,
+            source_inline_ids: Vec::new(),
         }];
         let mut m = IrModule::new();
         m.functions = vec![f];
@@ -5433,6 +5462,9 @@ mod entry_param_prefix_tests {
                 vec![param(0, 0), ga(9), param(1, 1), cp(5), param(2, 2)],
                 spans,
             );
+            if spans {
+                m.functions[0].blocks[0].source_inline_ids = vec![10, 11, 12, 13, 14];
+            }
             restore_entry_param_prefix(&mut m);
             assert_eq!(shape(&m), ["p0", "p1", "p2", "g9", "c5"]);
             let got: Vec<u32> = m.functions[0].blocks[0]
@@ -5441,6 +5473,14 @@ mod entry_param_prefix_tests {
                 .map(|s| s.start)
                 .collect();
             assert_eq!(got, if spans { vec![0, 2, 4, 1, 3] } else { vec![] });
+            assert_eq!(
+                m.functions[0].blocks[0].source_inline_ids,
+                if spans {
+                    vec![10, 12, 14, 11, 13]
+                } else {
+                    vec![]
+                }
+            );
         }
     }
 

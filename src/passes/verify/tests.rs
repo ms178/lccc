@@ -39,6 +39,7 @@ fn blk(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> Ba
         instructions,
         terminator,
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     }
 }
 

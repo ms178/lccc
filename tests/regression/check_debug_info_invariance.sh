@@ -32,13 +32,16 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 # Strip only debug metadata.  A `.section .debug_*` block is skipped until the
-# next non-debug section directive; `.loc`, `.file` and the writer's
-# `.Llccc_debug_alias_*` absolute symbols are skipped line-wise.  Ordinary
-# `.set`, instructions, labels, CFI and data sections are preserved.
+# next non-debug section directive; `.loc`, `.file`, the writer's
+# `.Llccc_debug_alias_*` absolute symbols and D6 inline-range endpoint labels
+# are skipped line-wise.  Ordinary `.set`, instructions, labels, CFI and data
+# sections are preserved.  Endpoint labels emit no bytes; hiding them from the
+# peepholes is what keeps -g code identical, so the filter must ignore them too.
 strip_debug_rows() {
     awk '
         /^[[:space:]]*\.(loc|file)([[:space:]]|$)/ { next }
         /^[[:space:]]*\.set[[:space:]]+\.Llccc_debug_alias_/ { next }
+        /^[[:space:]]*\.Llccc_inline_[be]_[0-9]+_[0-9]+_[^[:space:]:]+:[[:space:]]*(#.*)?$/ { next }
         /^[[:space:]]*\.section[[:space:]]+\.debug_/ { indebug = 1; next }
         indebug {
             if ($0 ~ /^[[:space:]]*\.section[[:space:]]+/ && $0 !~ /^[[:space:]]*\.section[[:space:]]+\.debug_/) {
@@ -68,7 +71,9 @@ EOF
 	.text
 foo:
 	.loc	1 1 0
+.Llccc_inline_b_0_0_foo:
 	add	a0, a0, 1
+.Llccc_inline_e_0_0_foo:	# endpoint
 	ret
 	.section	.note.GNU-stack,"",@progbits
 	.set	.Llccc_debug_alias_1,.text+0
@@ -89,6 +94,13 @@ EOF
         echo "FAIL: debug-row filter self-test missed an instruction change" >&2
         exit 1
     fi
+    # A lookalike that is not an exact endpoint label must remain visible.
+    printf '.Llccc_inline_b_0_0_foo: nop\n' > "$d/lookalike.s"
+    strip_debug_rows "$d/lookalike.s" > "$d/lookalike.out"
+    if ! cmp -s "$d/lookalike.s" "$d/lookalike.out"; then
+        echo "FAIL: debug-row filter stripped a compound lookalike" >&2
+        exit 1
+    fi
 }
 filter_self_test
 
@@ -103,14 +115,19 @@ filter_self_test
         esac
     done < <(grep -v '^#' "$here/debug_invariance_sentinels.txt")
     index=0
-    for src in "$here"/*.c; do
+    # LC_ALL=C sort: bash expands a glob in collation order, so without this the
+    # 1-in-STRIDE sample depended on the host's locale and CI checked different
+    # sources than a developer did at the same stride. The sample must be a
+    # function of the tree alone. Reading line-wise also survives a source name
+    # containing whitespace.
+    while IFS= read -r src; do
         index=$((index + 1))
         [ $(((index - 1) % STRIDE)) -eq 0 ] || continue
         for level in $OPTS; do
             echo "$CCC $level $(basename "$src")"
             [ -x "$CCC_I686" ] && echo "$CCC_I686 $level $(basename "$src")"
         done
-    done
+    done < <(printf '%s\n' "$here"/*.c | LC_ALL=C sort)
 } | sort -u > "$work/jobs"
 
 check() {

@@ -1498,6 +1498,7 @@ mod tests {
             instructions,
             terminator: Terminator::Return(ret),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func
     }
@@ -1706,6 +1707,7 @@ mod copy_out_tests {
             instructions,
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         let mut module = IrModule::new();
         module.functions.push(f);
@@ -1929,6 +1931,7 @@ mod memset_tests {
             instructions,
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         let mut module = IrModule::new();
         module.functions.push(f);

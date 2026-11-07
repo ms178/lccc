@@ -374,6 +374,9 @@ pub(super) fn materialize(
 
     // ── Sweep every block in original coordinates ──
     for bi in 0..nblocks {
+        // Take BOTH debug arrays before the instructions: provenance is
+        // parallel to the same original coordinates as the line table.
+        let (old_spans, old_ids) = func.blocks[bi].take_parallel_debug();
         let old = std::mem::take(&mut func.blocks[bi].instructions);
         let n = old.len();
         // DWARF fidelity: when the block carried one source span per
@@ -381,15 +384,18 @@ pub(super) fn materialize(
         // (the split_ranges precedent in `insert_instruction`: clearing or
         // desynchronizing spans wiped/mis-attributed line info). Every
         // inserted event clones the span of the instruction it executes
-        // before (the last span for terminator-boundary events).
-        let spanful = func.blocks[bi].source_spans.len() == n && n > 0;
-        let old_spans: Vec<Span> = if spanful {
-            std::mem::take(&mut func.blocks[bi].source_spans)
+        // before (the last span for terminator-boundary events). Inline
+        // provenance rides the same coordinate: a reload/remat executed
+        // inside an inline instance stays in that instance.
+        let spanful = !old_spans.is_empty();
+        let idful = !old_ids.is_empty();
+        let mut out: Vec<Instruction> = Vec::with_capacity(old.len() + events[bi].len() + 2);
+        let mut out_spans: Vec<Span> = if spanful {
+            Vec::with_capacity(old.len() + events[bi].len() + 2)
         } else {
             Vec::new()
         };
-        let mut out: Vec<Instruction> = Vec::with_capacity(old.len() + events[bi].len() + 2);
-        let mut out_spans: Vec<Span> = if spanful {
+        let mut out_ids: Vec<u32> = if idful {
             Vec::with_capacity(old.len() + events[bi].len() + 2)
         } else {
             Vec::new()
@@ -398,29 +404,38 @@ pub(super) fn materialize(
         let mut ev_idx = 0usize;
 
         // Event point `p` precedes original instruction p; clone that
-        // instruction's span (the final span for the terminator point).
-        let span_for_event = |p: usize| -> Option<Span> {
+        // instruction's span/provenance (the final row for the terminator
+        // point). `added` keeps the arrays parallel even if an event ever
+        // expands to more than one instruction.
+        let emit_at = |out: &mut Vec<Instruction>,
+                       out_spans: &mut Vec<Span>,
+                       out_ids: &mut Vec<u32>,
+                       active: &mut FxHashMap<u32, u32>,
+                       ev: &Event,
+                       p: usize| {
+            let before = out.len();
+            emit_event(ev, out, &slot_of, all_types, templates, active);
+            let added = out.len() - before;
             if spanful {
                 let idx = p.min(n - 1);
-                Some(old_spans[idx].clone())
-            } else {
-                None
+                out_spans.extend(std::iter::repeat_n(old_spans[idx].clone(), added));
+            }
+            if idful {
+                let idx = p.min(n - 1);
+                out_ids.extend(std::iter::repeat_n(old_ids[idx], added));
             }
         };
 
         for (i, mut inst) in old.into_iter().enumerate() {
             while ev_idx < events[bi].len() && events[bi][ev_idx].0 == i {
-                emit_event(
-                    &events[bi][ev_idx].1,
+                emit_at(
                     &mut out,
-                    &slot_of,
-                    all_types,
-                    templates,
+                    &mut out_spans,
+                    &mut out_ids,
                     &mut active,
+                    &events[bi][ev_idx].1,
+                    i,
                 );
-                if let Some(sp) = span_for_event(i) {
-                    out_spans.push(sp);
-                }
                 ev_idx += 1;
             }
             if !matches!(inst, Instruction::Phi { .. }) && !active.is_empty() {
@@ -430,20 +445,20 @@ pub(super) fn materialize(
             if spanful {
                 out_spans.push(old_spans[i].clone());
             }
+            if idful {
+                out_ids.push(old_ids[i]);
+            }
         }
         // Trailing events at point n (before the terminator).
         while ev_idx < events[bi].len() && events[bi][ev_idx].0 == n {
-            emit_event(
-                &events[bi][ev_idx].1,
+            emit_at(
                 &mut out,
-                &slot_of,
-                all_types,
-                templates,
+                &mut out_spans,
+                &mut out_ids,
                 &mut active,
+                &events[bi][ev_idx].1,
+                n,
             );
-            if let Some(sp) = span_for_event(n) {
-                out_spans.push(sp);
-            }
             ev_idx += 1;
         }
         debug_assert_eq!(
@@ -456,6 +471,10 @@ pub(super) fn materialize(
             debug_assert_eq!(out_spans.len(), func.blocks[bi].instructions.len());
             func.blocks[bi].source_spans = out_spans;
         }
+        if idful {
+            debug_assert_eq!(out_ids.len(), func.blocks[bi].instructions.len());
+        }
+        func.blocks[bi].source_inline_ids = out_ids;
         if !active.is_empty() {
             replace_values_in_terminator_phi_aware(&mut func.blocks[bi].terminator, &active);
         }
@@ -512,6 +531,7 @@ pub(super) fn materialize(
             instructions: insts,
             terminator: Terminator::Branch(old_target),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         retarget_edge(&mut func.blocks[t.pred].terminator, old_target, new_label);
     }

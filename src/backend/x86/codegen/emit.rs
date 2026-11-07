@@ -12177,6 +12177,7 @@ mod def_matcher_tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         for vid in [0u32, 1, 2, 3] {
             assert!(
@@ -12215,6 +12216,7 @@ mod def_matcher_tests {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -12233,6 +12235,7 @@ mod def_matcher_tests {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 3;
         // The loop-carried copy has TWO defs: invisible to re-derivation.
@@ -12301,6 +12304,7 @@ mod def_matcher_tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         assert_index_matches_scan(&func, 9);
     }
@@ -12448,6 +12452,7 @@ mod switch_bound_emitter_tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 6;
 
