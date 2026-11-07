@@ -292,8 +292,13 @@ FETCH16(nand, ~(o & v))
  * the failing check of a group. */
 static unsigned long long h__ = 1469598103934665603ull;
 static int g__;
-#define CHECK(e) (h__ = (h__ ^ (unsigned long long)(long long)(e)) * 1099511628211ull, \
-                  TRACE_VALUE(e))
+/* Evaluate once: TRACE is a diagnostic view of the same execution, not a
+ * second atomic operation (many arguments have side effects). */
+#define CHECK(e) do {                                                             \
+    long long checked__ = (long long)(e);                                         \
+    h__ = (h__ ^ (unsigned long long)checked__) * 1099511628211ull;               \
+    TRACE_VALUE(checked__);                                                        \
+} while (0)
 #if defined(GEN) && defined(TRACE)
 #define TRACE_VALUE(e) printf("%d: %lld\n", g__, (long long)(e))
 #else
