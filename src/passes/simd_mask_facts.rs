@@ -173,8 +173,124 @@ fn zero_vector_width(op: IntrinsicOp) -> Option<usize> {
     Some(match op {
         O::VecZeroI32x4 | O::VecZeroI64x2 | O::VecZeroF32x4 | O::VecZeroF64x2 => 16,
         O::VecZeroI32x8 | O::VecZeroI64x4 | O::VecZeroF32x8 | O::VecZeroF64x4 => 32,
+        // The legacy `Setzero*` family is available in BOTH the write-through
+        // (`dest_ptr`) and the SSA (`dest`) form: `result_dest(dest,
+        // dest_ptr)` in the x86 emitter.  An SSA `Setzero*` is exactly the
+        // same `ConstantAggregateZero` ISPC folds, so include it here too.
+        // Width is checked against the consumer, as for `VecZero*`.
+        O::Setzero128 | O::SetzeroPs128 => 16,
+        O::Setzero256 => 32,
         _ => return None,
     })
+}
+
+/// Byte width written by a legacy write-through zero producer.  Kept
+/// separate from `zero_vector_width` because `object_image` must classify
+/// these as WRITES to an object, not as pure SSA values.  `pxor`/`xorps` +
+/// store (16 B) and `vpxor` + store (32 B) are exact on every backend that
+/// implements the family; an unrecognized width refuses.
+fn dest_ptr_zero_width(op: IntrinsicOp) -> Option<usize> {
+    use IntrinsicOp as O;
+    Some(match op {
+        O::Setzero128 | O::SetzeroPs128 => 16,
+        O::Setzero256 => 32,
+        _ => return None,
+    })
+}
+
+/// `(vector byte width, lane byte width)` for the SSA packed-integer
+/// `VecCmp*` family.  ISPC's `GetMaskFromValue` reaches these through LLVM's
+/// constant folding of a compare; LCCC has no constant vector node, so the
+/// mask image must be derived here.  Only the sign-INDEPENDENT predicates
+/// 0 (`eq`) and 4 (`ne`) are accepted: signed/unsigned `lt`/`le` need the
+/// lane's signedness and are deliberately left alone.  `args = [a, b, imm]`
+/// (pinned by `vectorize.rs:7653`), with `dest_ptr: None`.
+fn const_compare_shape(op: IntrinsicOp) -> Option<(usize, usize)> {
+    use IntrinsicOp as O;
+    Some(match op {
+        O::VecCmpI8x16 => (16, 1),
+        O::VecCmpI8x32 => (32, 1),
+        O::VecCmpI16x8 => (16, 2),
+        O::VecCmpI16x16 => (32, 2),
+        O::VecCmpI32x4 => (16, 4),
+        O::VecCmpI32x8 => (32, 4),
+        O::VecCmpI64x2 => (16, 8),
+        O::VecCmpI64x4 => (32, 8),
+        _ => return None,
+    })
+}
+
+/// Classification of a scalar `__mmaskN` constant.  This is a SECOND lattice,
+/// distinct from `MaskStatus`'s byte-image lattice: AVX-512 masked memory and
+/// mask-compare intrinsics carry their mask in a GPR (`k` register), not as a
+/// 16/32-byte vector of `0x00`/`0xFF` lanes.  ISPC's `IntrinsicsOpt` uses
+/// `GetMaskStatusFromValue` on LLVM constant vectors; LCCC needs this extra
+/// decision procedure for the scalar form.  `Unknown` is fail-closed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ScalarMask {
+    AllOff,
+    AllOn,
+    Mixed(u64),
+    Unknown,
+}
+
+/// Is this masked-memory op one of the shapes a consumer actually rewrites?
+/// Kept as the SAME cheap predicate used by `has_candidate`, so a function
+/// containing an unsupported masked op never pays for building `Facts`.
+/// 512-bit merge/zeroing LOADS are deliberately OUT of scope: `object_image`/
+/// `tile_image` prove at most 32 bytes and there is no 64-byte zero producer
+/// exposed to this pass, so an all-off `maskz_load512` cannot be rewritten
+/// without inventing a new opcode family.  Refusing is cheaper and sounder
+/// than emitting a partial zero vector.
+fn masked_fold_candidate(op: IntrinsicOp) -> bool {
+    use IntrinsicOp as O;
+    matches!(op, O::MaskzLoaduEpi8_128 | O::MaskzLoaduEpi8_256) || masked_store_shape(op).is_some()
+}
+
+/// Which masked-memory op is an all-off-ERASABLE store.  Erasing a store needs
+/// no width proof at all (masked-off lanes perform NO memory access), so the
+/// 512-bit store form is included here even though its load siblings are not.
+fn masked_store_shape(op: IntrinsicOp) -> Option<u32> {
+    use IntrinsicOp as O;
+    Some(match op {
+        O::MaskStoreuEpi8_128 => 16,
+        O::MaskStoreuEpi8_256 => 32,
+        O::MaskStoreuEpi8_512 => 64,
+        _ => return None,
+    })
+}
+
+/// `(vector byte width, lane byte width, lane count)` for the scalar-mask
+/// packed-integer compares.  Only the sign-INDEPENDENT predicates `0` (eq)
+/// and `4` (ne) are accepted by the consumer, exactly as in
+/// `const_compare_shape`; signed/unsigned ordering predicates need a lane
+/// signedness proof this module deliberately does not invent.  512-bit
+/// compares are excluded for the same 32-byte image-proof bound as above.
+fn mask_compare_shape(op: IntrinsicOp) -> Option<(usize, usize, u32)> {
+    use IntrinsicOp as O;
+    Some(match op {
+        O::CmpeqEpu8Mask128 | O::CmpEpi8Mask128 | O::CmpEpu8Mask128 => (16, 1, 16),
+        O::CmpeqEpu8Mask256 | O::CmpEpi8Mask256 | O::CmpEpu8Mask256 => (32, 1, 32),
+        O::CmpEpi16Mask128 | O::CmpEpu16Mask128 => (16, 2, 8),
+        O::CmpEpi16Mask256 | O::CmpEpu16Mask256 => (32, 2, 16),
+        O::CmpEpi32Mask128 | O::CmpEpu32Mask128 => (16, 4, 4),
+        O::CmpEpi32Mask256 | O::CmpEpu32Mask256 => (32, 4, 8),
+        O::CmpEpi64Mask128 | O::CmpEpu64Mask128 => (16, 8, 2),
+        O::CmpEpi64Mask256 | O::CmpEpu64Mask256 => (32, 8, 4),
+        _ => return None,
+    })
+}
+
+/// Bit mask covering exactly `lanes` lanes.  `lanes` is never 0 and never
+/// greater than 64 (checked by the shape tables above), so neither shift can
+/// overflow.
+fn lane_mask(lanes: u32) -> u64 {
+    debug_assert!((1..=64).contains(&lanes));
+    if lanes == 64 {
+        u64::MAX
+    } else {
+        (1u64 << lanes) - 1
+    }
 }
 
 /// `(byte width of the resulting vector, byte width of the splatted lane)`
@@ -214,7 +330,7 @@ fn splat_shape(op: IntrinsicOp) -> Option<(usize, usize)> {
 /// F64x2 produces the identical 16-byte result).  Non-commutative compares
 /// (`pcmpgtb`) and saturated arithmetic are NOT here: their operand order or
 /// saturation rule is backend-specific and would need a separate proof.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum ByteOp {
     And,
     Or,
@@ -232,6 +348,66 @@ impl ByteOp {
             Self::Xor => a ^ b,
             Self::Eq => (a == b) as u8 * 0xFF,
         }
+    }
+}
+
+/// Exact combination of two OPTIONAL byte images under a `ByteOp`.
+///
+/// ISPC's `InstructionSimplify` (`lSimplifyBoolVec`) and LLVM's
+/// `InstSimplify` both exploit algebraic identities that need no operand
+/// value at all.  LCCC's image lattice previously demanded BOTH operand
+/// images; a `movemask(xor(v, v))`, `movemask(cmpeq(v, v))`,
+/// `movemask(and(v, 0))` or `movemask(or(v, -1))` therefore kept a runtime
+/// `pmovmskb` (measured: 4 `pmovmskb` and ~40 instructions in `ident.c`,
+/// while GCC 16.2 and Clang 23.1.5 emit four immediates).  Three exact
+/// rules close that gap without weakening any proof:
+///
+/// 1. both images known -> element-wise `ByteOp::apply` (the original rule);
+/// 2. `same` (one PURE operand used twice) -> `x^x = 0`, `x==x = 0xFF`,
+///    `x&x = x|x = x` (one image at most);
+/// 3. one image known -> absorbing constants: `x&0 = 0`, `x|-1 = -1`.
+///
+/// `None` on either side is a first-class input, never a guess: a rule that
+/// cannot decide returns `None` and the caller refuses the fold.  Every rule
+/// is byte-local and lane-width independent, so it is exact on x86-64,
+/// i686, AArch64 and RISC-V alike.
+fn combine_byte_logic(
+    kind: ByteOp,
+    width: usize,
+    a: Option<Vec<u8>>,
+    b: Option<Vec<u8>>,
+    same: bool,
+) -> Option<Vec<u8>> {
+    if width == 0 || width > 32 {
+        return None;
+    }
+    if let (Some(x), Some(y)) = (a.as_deref(), b.as_deref()) {
+        if x.len() != width || y.len() != width {
+            return None;
+        }
+        return Some(
+            x.iter()
+                .copied()
+                .zip(y.iter().copied())
+                .map(|(p, q)| kind.apply(p, q))
+                .collect(),
+        );
+    }
+    if same {
+        return match kind {
+            ByteOp::Xor => Some(vec![0u8; width]),
+            ByteOp::Eq => Some(vec![0xFF; width]),
+            ByteOp::And | ByteOp::Or => a.filter(|v| v.len() == width),
+        };
+    }
+    let known = a.as_deref().or(b.as_deref())?;
+    if known.len() != width {
+        return None;
+    }
+    match kind {
+        ByteOp::And if known.iter().all(|v| *v == 0) => Some(vec![0u8; width]),
+        ByteOp::Or if known.iter().all(|v| *v == 0xFF) => Some(vec![0xFF; width]),
+        _ => None,
     }
 }
 
@@ -572,6 +748,8 @@ fn is_constant_write(inst: &Instruction) -> bool {
             whole_store_width(*op).is_some()
                 || byte_logic_shape(*op).is_some()
                 || dest_ptr_splat_shape(*op).is_some()
+                || dest_ptr_zero_width(*op).is_some()
+                || const_compare_shape(*op).is_some()
                 || legacy_blend_shape(*op).is_some()
         }
         _ => false,
@@ -620,6 +798,56 @@ fn build_mention_index(
         }
     }
     (mentions, escaping, constant_bases)
+}
+
+/// Intrinsics that produce an immutable SSA VALUE (an `dest` result with NO
+/// write-through home) and have no observable memory effect of their own.
+/// A whole-vector LOAD qualifies: once loaded, the SSA value cannot change
+/// between two uses, which is exactly what the algebraic identities need.
+/// `is_movemask` is deliberately excluded: it is a pure read of a vector
+/// value, but its result is a scalar mask, never a vector operand of a
+/// byte-logic/compare instruction.
+fn pure_ssa_intrinsic(op: IntrinsicOp) -> bool {
+    byte_logic_shape(op).is_some()
+        || const_compare_shape(op).is_some()
+        || zero_vector_width(op).is_some()
+        || splat_shape(op).is_some()
+        || whole_vector_load(op)
+}
+
+/// Positive proof that an instruction defines an immutable, non-address SSA
+/// value.  Used ONLY by `operand_is_pure` for the repeated-operand identities;
+/// it is intentionally narrower than `object_image`'s mention classification.
+/// Pointer producers (`Alloca`, `GetElementPtr`, `GlobalAddr`, `LabelAddr`,
+/// `Cast` to `Ptr`), write-through homes (`dest_ptr: Some(_)`), volatile and
+/// atomic memory operations, calls, inline asm, phis and unknown intrinsics
+/// all refuse.  A refused operand costs one fold; an accepted volatile
+/// address would be a miscompile.
+fn pure_ssa_definition(inst: &Instruction) -> bool {
+    match inst {
+        Instruction::Intrinsic {
+            dest: Some(_),
+            dest_ptr: None,
+            op,
+            ..
+        } => pure_ssa_intrinsic(*op),
+        Instruction::BinOp { .. }
+        | Instruction::UnaryOp { .. }
+        | Instruction::Cmp { .. }
+        | Instruction::Select { .. } => true,
+        // A cast to an integer/float/vector type is a value conversion; a
+        // cast TO a pointer can smuggle an address back into the operand.
+        Instruction::Cast {
+            to_ty: IrType::Ptr, ..
+        } => false,
+        Instruction::Cast { .. } => true,
+        Instruction::Load {
+            volatile: false,
+            ty,
+            ..
+        } => !matches!(ty, IrType::Ptr),
+        _ => false,
+    }
 }
 
 impl<'a> Facts<'a> {
@@ -697,6 +925,192 @@ impl<'a> Facts<'a> {
             Operand::Const(c) => c.to_i64(),
             Operand::Value(_) => None,
         }
+    }
+
+    /// Is `x op x` an exact identity for this operand?
+    ///
+    /// An SSA value used twice is bit-identical by construction.  A POINTER
+    /// operand is read twice BY THE INTRINSIC, so it is safe only when the
+    /// address resolves to a plain, non-volatile private `Alloca`: two reads
+    /// of the same non-volatile object with no intervening write yield the
+    /// same bytes.  A volatile or semantically-volatile object can change
+    /// between the reads (`x^x` would no longer be zero), and an address
+    /// whose provenance cannot be resolved might hide such an object, so
+    /// both refuse.  This is the guard that makes the identity rules
+    /// semantics-preserving rather than merely plausible.
+    /// Whether a repeated operand is provably ONE immutable bit pattern.
+    ///
+    /// `x ^ x = 0`, `x == x = all ones`, `x & x = x | x = x` all require the
+    /// two reads to see the same bits.  Three forms are positively proven:
+    ///
+    /// 1. an immediate;
+    /// 2. a pointer resolved to a plain, non-volatile `Alloca` — the legacy
+    ///    write-through stack-home form;
+    /// 3. an SSA value whose definition is a known pure value producer,
+    ///    reached through `Copy` links (`pure_ssa_definition`).
+    ///
+    /// Everything else refuses.  The historical `Some(_) => true` fallback
+    /// accepted ANY non-`Copy` definition, including `Cast` to a pointer,
+    /// `GlobalAddr`, a volatile `Load`, an atomic, or a call result.  An
+    /// externally mutable address smuggled in as an `Operand::Value` could
+    /// then make `x ^ x` read two different bit patterns; refusing is the
+    /// only defensible rule.  A starved budget or a `Copy` cycle also refuses.
+    fn operand_is_pure(&self, op: Operand, budget: &mut usize) -> bool {
+        let Operand::Value(v) = op else {
+            return true; // an immediate has one immutable value
+        };
+        let mut zero = 0i64;
+        if let Some(base) = self.resolve_pointer(v, &mut zero, budget) {
+            return matches!(
+                self.defs.get(&base),
+                Some(Instruction::Alloca {
+                    volatile: false,
+                    semantic_volatile: false,
+                    ..
+                })
+            );
+        }
+        let mut cur = v;
+        for _ in 0..MAX_DEPTH {
+            if *budget == 0 {
+                return false;
+            }
+            *budget -= 1;
+            let Some(inst) = self.defs.get(&cur) else {
+                return false; // argument / external value: no proof at all
+            };
+            match inst {
+                Instruction::Copy {
+                    src: Operand::Value(next),
+                    ..
+                } => cur = *next,
+                _ => return pure_ssa_definition(inst),
+            }
+        }
+        false
+    }
+
+    /// Prove the value of a scalar `__mmaskN` operand.  Only an immediate or
+    /// a bounded `Copy` chain ending in an immediate is accepted: a runtime
+    /// mask, a `Phi`, a `Cast`, a call result or a cycle is `Unknown`.
+    ///
+    /// Constants are interpreted as the low `lanes` bits of their two's
+    /// complement value, so `__mmask16(-1)` is `AllOn` and `0xFFFF0000` on a
+    /// 16-lane op is also `AllOn` (the upper bits the hardware ignores are
+    /// masked off).  A budget and a depth cap bound the walk; both refuse.
+    fn scalar_mask(&self, op: Operand, lanes: u32) -> ScalarMask {
+        if !(1..=64).contains(&lanes) {
+            return ScalarMask::Unknown;
+        }
+        let full = lane_mask(lanes);
+        let mut budget = MAX_WORK;
+        let mut cur = op;
+        for _ in 0..MAX_DEPTH {
+            if budget == 0 {
+                return ScalarMask::Unknown;
+            }
+            budget -= 1;
+            match cur {
+                Operand::Const(c) => {
+                    let Some(raw) = c.to_i64() else {
+                        return ScalarMask::Unknown; // FP/decimal constants are not masks
+                    };
+                    let k = (raw as u64) & full;
+                    return if k == 0 {
+                        ScalarMask::AllOff
+                    } else if k == full {
+                        ScalarMask::AllOn
+                    } else {
+                        ScalarMask::Mixed(k)
+                    };
+                }
+                Operand::Value(v) => match self.defs.get(&v) {
+                    Some(Instruction::Copy { src, .. }) => cur = *src,
+                    _ => return ScalarMask::Unknown,
+                },
+            }
+        }
+        ScalarMask::Unknown
+    }
+
+    /// Byte image of a `ByteOp` expression, using the shared recursion state
+    /// and the ONE `combine_byte_logic` decision procedure.  Both the legacy
+    /// write-through forms (`Pand128`, ...) and the SSA forms
+    /// (`VecAndI32x4`, ...) converge here, so there is a single place where
+    /// soundness is argued and a single place where a new identity is added.
+    #[allow(clippy::too_many_arguments)]
+    fn byte_logic_image(
+        &self,
+        kind: ByteOp,
+        width: usize,
+        args: &[Operand],
+        read_block: usize,
+        read_index: usize,
+        budget: &mut usize,
+        visiting: &mut Vec<Value>,
+    ) -> Option<Vec<u8>> {
+        if args.len() != 2 || width == 0 || width > 32 {
+            return None;
+        }
+        let same = args[0] == args[1] && self.operand_is_pure(args[0], budget);
+        if same {
+            // `x^x` and `x==x` need NO operand proof at all; `x&x`/`x|x`
+            // need at most one.  Never pay for a second, identical walk.
+            let a = match kind {
+                ByteOp::Xor | ByteOp::Eq => None,
+                ByteOp::And | ByteOp::Or => {
+                    self.operand_image(args[0], width, read_block, read_index, budget, visiting)
+                }
+            };
+            return combine_byte_logic(kind, width, a, None, true);
+        }
+        let a = self.operand_image(args[0], width, read_block, read_index, budget, visiting);
+        let b = self.operand_image(args[1], width, read_block, read_index, budget, visiting);
+        combine_byte_logic(kind, width, a, b, false)
+    }
+
+    /// Byte image of a constant packed-integer `VecCmp*` (predicate `eq` or
+    /// `ne`).  Each lane contributes `0xFF` bytes for a true comparison and
+    /// `0x00` for a false one — the exact `-1`/`0` mask the hardware emits,
+    /// and the exact input `MaskStatus::from_lanes` expects.  This is
+    /// target-neutral: integer equality is bit equality on every backend.
+    #[allow(clippy::too_many_arguments)]
+    fn compare_image(
+        &self,
+        op: IntrinsicOp,
+        args: &[Operand],
+        width: usize,
+        read_block: usize,
+        read_index: usize,
+        budget: &mut usize,
+        visiting: &mut Vec<Value>,
+    ) -> Option<Vec<u8>> {
+        let (vec_width, lane_bytes) = const_compare_shape(op)?;
+        if vec_width != width || args.len() != 3 || lane_bytes == 0 || width % lane_bytes != 0 {
+            return None;
+        }
+        let Operand::Const(pred) = args[2] else {
+            return None;
+        };
+        let invert = match pred.to_i64()? {
+            0 => false, // eq
+            4 => true,  // ne = logical negation of eq for integers
+            _ => return None,
+        };
+        let fill = |eq: bool| -> u8 { if eq ^ invert { 0xFF } else { 0x00 } };
+        if args[0] == args[1] && self.operand_is_pure(args[0], budget) {
+            // `x == x` is all ones and `x != x` is all zeros for integers;
+            // no operand image is needed, and no NaN can intrude.
+            return Some(vec![fill(true); width]);
+        }
+        let a = self.operand_image(args[0], width, read_block, read_index, budget, visiting)?;
+        let b = self.operand_image(args[1], width, read_block, read_index, budget, visiting)?;
+        let mut out = Vec::with_capacity(width);
+        for (x, y) in a.chunks_exact(lane_bytes).zip(b.chunks_exact(lane_bytes)) {
+            let byte = fill(x == y);
+            out.resize(out.len() + lane_bytes, byte);
+        }
+        (out.len() == width).then_some(out)
     }
 
     /// Which alloca, if any, this value is derived from — following `Copy`
@@ -860,22 +1274,20 @@ impl<'a> Facts<'a> {
                                 // `InstructionSimplify`'s constant-mask
                                 // derivation).  Both operands may be SSA
                                 // vector values OR pointers to proven
-                                // constant objects; `operand_image` handles
-                                // both with the SHARED recursion state.
-                                if vec_width != width || args.len() != 2 {
+                                // constant objects; `byte_logic_image`
+                                // additionally applies the exact algebraic
+                                // identities when an operand is runtime
+                                // valued.  ONE shared recursion state.
+                                if vec_width != width {
                                     return None;
                                 }
-                                let a = self.operand_image(
-                                    args[0], width, read_block, read_index, budget, visiting,
-                                )?;
-                                let b = self.operand_image(
-                                    args[1], width, read_block, read_index, budget, visiting,
-                                )?;
-                                return Some(
-                                    a.into_iter()
-                                        .zip(b)
-                                        .map(|(x, y)| kind.apply(x, y))
-                                        .collect(),
+                                return self.byte_logic_image(
+                                    kind, width, args, read_block, read_index, budget, visiting,
+                                );
+                            }
+                            if const_compare_shape(*op).is_some() {
+                                return self.compare_image(
+                                    *op, args, width, read_block, read_index, budget, visiting,
                                 );
                             }
                             if whole_vector_load(*op) && args.len() >= 2 {
@@ -909,12 +1321,14 @@ impl<'a> Facts<'a> {
     /// Prove a constant byte image for `[offset, offset+len)` inside one
     /// private `Alloca`.  This is the adaptation layer ISPC's LLVM-based
     /// analysis does not need.  The mention index classifies EVERY mention of
-
-    /// classification lives in `mention_of` / `memcpy_mention` /
-    /// `intrinsic_mention`, which return an `ObjectMention` value instead of
-    /// returning early.  That is deliberately structural: when they refuse,
-    /// control still reaches `visiting.pop()` below, so a rejected proof can
-    /// never poison a later one.
+    /// the object in program order, and the per-mention classification lives
+    /// in `mention_of` / `memcpy_mention` / `intrinsic_mention`, which return
+    /// an `ObjectMention` value instead of returning early.  That is
+    /// deliberately structural: when they refuse, control still reaches
+    /// `visiting.pop()` below, so a rejected proof can never poison a later
+    /// one.  A `Write` is order-sensitive (same block, at or before the read);
+    /// a proven `NoWrite` may appear anywhere because it cannot change the
+    /// image.
     fn object_image(
         &self,
         base: Value,
@@ -1321,6 +1735,26 @@ impl<'a> Facts<'a> {
             };
             return Write(d_off, image);
         }
+        if let Some(zero_width) = dest_ptr_zero_width(op) {
+            // ISPC's `ConstantAggregateZero` adaptation for the legacy
+            // write-through zero producers.  These have NO data operands,
+            // so there is nothing to prove except the destination: the
+            // emitted `pxor`/`xorps`/`vpxor` + store writes exactly
+            // `zero_width` zero bytes.  `tile_image` still checks that the
+            // window is inside the object, so a 32-byte producer into a
+            // 16-byte alloca is refused rather than truncated.
+            let Some(dp) = dest_ptr else {
+                return Reject;
+            };
+            let mut d_off = 0i64;
+            let Some(d_base) = self.resolve_pointer(dp, &mut d_off, budget) else {
+                return Reject;
+            };
+            if d_base != w.base {
+                return NoWrite; // writes another object; reads nothing
+            }
+            return Write(d_off, vec![0u8; zero_width]);
+        }
         if byte_logic_shape(op).is_some() || dest_ptr_splat_shape(op).is_some() {
             // Legacy SSE/AVX2 form: the intrinsic WRITES a computed constant
             // vector into the object named by `dest_ptr`.  Both source images
@@ -1349,12 +1783,10 @@ impl<'a> Facts<'a> {
                 return NoWrite;
             }
             let image = if let Some((vec_width, kind)) = byte_logic_shape(op) {
-                if args.len() != 2 || vec_width == 0 || vec_width > 32 {
-                    return Reject;
-                }
-                let Some(a) = self.operand_image(
-                    args[0],
+                let Some(img) = self.byte_logic_image(
+                    kind,
                     vec_width,
+                    args,
                     w.read_block,
                     w.read_index,
                     budget,
@@ -1362,20 +1794,7 @@ impl<'a> Facts<'a> {
                 ) else {
                     return Reject;
                 };
-                let Some(b) = self.operand_image(
-                    args[1],
-                    vec_width,
-                    w.read_block,
-                    w.read_index,
-                    budget,
-                    visiting,
-                ) else {
-                    return Reject;
-                };
-                a.into_iter()
-                    .zip(b)
-                    .map(|(x, y)| kind.apply(x, y))
-                    .collect::<Vec<u8>>()
+                img
             } else {
                 // Exact-width splat; refuse widened or non-constant operands
                 // (truncation of an `I64` into a dword lane is not provable).
@@ -1424,6 +1843,26 @@ impl<'a> Facts<'a> {
             let mut zero = 0i64;
             if self.resolve_pointer(*p, &mut zero, budget) != Some(w.base) {
                 return Reject;
+            }
+            return NoWrite;
+        }
+        if dest_ptr.is_none() && mask_compare_shape(op).is_some() {
+            // AVX-512 scalar-mask compares READ two vector operands and write
+            // only an SSA scalar `dest`; they cannot change any object's
+            // image.  Pin BOTH pointer operands to resolved stack objects so
+            // no derived-address access escapes the audit, exactly as the
+            // `Blendv*`/`Pand*` "reads a different object" arms do.  The
+            // third operand is the immediate predicate, not an address.
+            if args.len() != 3 {
+                return Reject;
+            }
+            for arg in args.iter().take(2) {
+                if let Operand::Value(p) = arg {
+                    let mut zero = 0i64;
+                    if self.resolve_pointer(*p, &mut zero, budget).is_none() {
+                        return Reject;
+                    }
+                }
             }
             return NoWrite;
         }
@@ -1562,6 +2001,156 @@ fn fold(facts: &Facts<'_>, inst: &Instruction, block: usize, index: usize) -> Op
         }
     }
 
+    // ---- ISPC `IntrinsicsOpt` transplant: scalar `__mmaskN` consumers ----
+    //
+    // (B) A packed-integer compare whose operands are a proven constant
+    // image, or the SAME pure operand, produces a scalar mask constant.
+    // `eq`(0) and `ne`(4) are the only sign-independent predicates; the
+    // image is the SAME byte-lattice proof used by `compare_image`, so there
+    // is one decision procedure for both encodings (byte lanes vs bits).
+    if let Instruction::Intrinsic {
+        op,
+        args,
+        dest: Some(d),
+        dest_ptr: None,
+        ..
+    } = inst
+    {
+        if let Some((width, lane_bytes, lanes)) = mask_compare_shape(*op) {
+            if args.len() != 3 || lane_bytes == 0 || width % lane_bytes != 0 {
+                return None;
+            }
+            let Operand::Const(pred) = args[2] else {
+                return None;
+            };
+            let invert = match pred.to_i64() {
+                Some(0) => false, // eq
+                Some(4) => true,  // ne
+                _ => return None,
+            };
+            let full = lane_mask(lanes);
+            let mut budget = MAX_WORK;
+            let bits = if args[0] == args[1] && facts.operand_is_pure(args[0], &mut budget) {
+                if invert { 0u64 } else { full }
+            } else {
+                let a = facts.image_of(args[0], width, block, index)?;
+                let b = facts.image_of(args[1], width, block, index)?;
+                if a.len() != width || b.len() != width {
+                    return None;
+                }
+                let lane_count = a.chunks_exact(lane_bytes).count();
+                if lane_count != lanes as usize || lane_count > 63 {
+                    return None;
+                }
+                let mut m = 0u64;
+                for (i, (x, y)) in a
+                    .chunks_exact(lane_bytes)
+                    .zip(b.chunks_exact(lane_bytes))
+                    .enumerate()
+                {
+                    if (x == y) ^ invert {
+                        m |= 1u64 << i;
+                    }
+                }
+                m
+            };
+            return Some(Instruction::Copy {
+                dest: *d,
+                src: Operand::Const(IrConst::I64(bits as i64)),
+            });
+        }
+    }
+
+    // (C) An all-off zeroing masked load performs NO memory access at all:
+    // EVEX mask k=0 faults on no lane and writes zeros to the destination.
+    // Replace it with the exact-width zero producer, which removes both the
+    // `kmov` and the masked load.  The destination window is bounds-proven,
+    // the SSA `dest` must be unused, and the 512-bit form refuses (no 64-byte
+    // zero producer in this pass's proven domain).
+    if let Instruction::Intrinsic {
+        op,
+        args,
+        dest,
+        dest_ptr: Some(dp),
+        ..
+    } = inst
+    {
+        if matches!(
+            *op,
+            IntrinsicOp::MaskzLoaduEpi8_128 | IntrinsicOp::MaskzLoaduEpi8_256
+        ) {
+            let width = if *op == IntrinsicOp::MaskzLoaduEpi8_128 {
+                16
+            } else {
+                32
+            };
+            if args.len() != 2 || dest.is_some_and(|d| facts.used.contains(&d.0)) {
+                return None;
+            }
+            let lanes = if width == 16 { 16 } else { 32 };
+            let status = facts.scalar_mask(args[0], lanes);
+            // All-off removes the load entirely.  All-on on the 128-bit form
+            // removes the `kmov` + EVEX mask by using the PROVEN `_mm_loadu_si128`
+            // lowering (`Loaddqu` with a raw pointer in `args[0]`).  The
+            // 256-bit all-on form is deliberately left alone: `Loadu256` uses
+            // `avx_load_arg`, whose operand may be a register-allocated vector
+            // VALUE rather than a raw byte pointer, so the substitution is not
+            // provably equivalent here.  Mixed/unknown masks refuse.
+            let all_on_load = status == ScalarMask::AllOn && width == 16;
+            if status != ScalarMask::AllOff && !all_on_load {
+                return None;
+            }
+            if all_on_load && !matches!(args[1], Operand::Value(_)) {
+                return None;
+            }
+            let mut budget = MAX_WORK;
+            let mut off = 0i64;
+            let Some(base) = facts.resolve_pointer(*dp, &mut off, &mut budget) else {
+                return None;
+            };
+            let Some(Instruction::Alloca {
+                size,
+                volatile: false,
+                semantic_volatile: false,
+                ..
+            }) = facts.defs.get(&base)
+            else {
+                return None;
+            };
+            if off < 0 {
+                return None;
+            }
+            let Ok(start) = usize::try_from(off) else {
+                return None;
+            };
+            let Some(end) = start.checked_add(width) else {
+                return None;
+            };
+            if end > *size {
+                return None;
+            }
+            if all_on_load {
+                return Some(Instruction::Intrinsic {
+                    dest: None,
+                    op: IntrinsicOp::Loaddqu,
+                    dest_ptr: Some(*dp),
+                    args: vec![args[1]],
+                });
+            }
+            let zero_op = if width == 16 {
+                IntrinsicOp::Setzero128
+            } else {
+                IntrinsicOp::Setzero256
+            };
+            return Some(Instruction::Intrinsic {
+                dest: None,
+                op: zero_op,
+                dest_ptr: Some(*dp),
+                args: Vec::new(),
+            });
+        }
+    }
+
     let Instruction::Intrinsic {
         dest,
         op,
@@ -1618,6 +2207,30 @@ fn fold(facts: &Facts<'_>, inst: &Instruction, block: usize, index: usize) -> Op
     })
 }
 
+/// ISPC `IntrinsicsOpt`'s masked-store arm: an all-off masked store performs
+/// NO memory access, so the whole instruction (including the `kmov` that
+/// would build the k mask) is dead.  Erasure needs a removal channel rather
+/// than a replacement, so it is decided separately from `fold` and applied
+/// through the span-safe `remove_instructions` helper.  Fail-closed: only the
+/// canonical `dest: None, dest_ptr: Some(_)` PtrStore form with exactly two
+/// arguments and a PROVEN all-off scalar mask is erasable.
+fn fold_removal(facts: &Facts<'_>, inst: &Instruction) -> bool {
+    let Instruction::Intrinsic {
+        op,
+        args,
+        dest: None,
+        dest_ptr: Some(_),
+        ..
+    } = inst
+    else {
+        return false;
+    };
+    let Some(lanes) = masked_store_shape(*op) else {
+        return false;
+    };
+    args.len() == 2 && facts.scalar_mask(args[0], lanes) == ScalarMask::AllOff
+}
+
 pub(crate) fn run(module: &mut IrModule) -> usize {
     module.for_each_function(run_function)
 }
@@ -1627,8 +2240,12 @@ fn run_function(func: &mut IrFunction) -> usize {
         block.instructions.iter().any(|inst| {
             if let Instruction::Intrinsic { op, dest_ptr, .. } = inst {
                 return match dest_ptr {
-                    None => is_movemask(*op) || blend_shape(*op).is_some(),
-                    Some(_) => legacy_blend_shape(*op).is_some(),
+                    None => {
+                        is_movemask(*op)
+                            || blend_shape(*op).is_some()
+                            || mask_compare_shape(*op).is_some()
+                    }
+                    Some(_) => legacy_blend_shape(*op).is_some() || masked_fold_candidate(*op),
                 };
             }
             // A non-volatile, default-address-space scalar load may be a
@@ -1649,21 +2266,31 @@ fn run_function(func: &mut IrFunction) -> usize {
     }
     // Two-phase: every decision is made against the same immutable snapshot,
     // and the `Facts` borrow of `func` ends before the first mutation.
-    let edits: Vec<(usize, usize, Instruction)> = {
+    let (edits, removals): (Vec<(usize, usize, Instruction)>, Vec<(usize, usize)>) = {
         let facts = Facts::new(func);
         let mut edits = Vec::new();
+        let mut removals = Vec::new();
         for (block_id, block) in func.blocks.iter().enumerate() {
             for (index, inst) in block.instructions.iter().enumerate() {
                 if let Some(replacement) = fold(&facts, inst, block_id, index) {
                     edits.push((block_id, index, replacement));
+                } else if fold_removal(&facts, inst) {
+                    removals.push((block_id, index));
                 }
             }
         }
-        edits
+        (edits, removals)
     };
-    let count = edits.len();
+    // Every decision above was made against the SAME immutable snapshot, so
+    // the indices here are original indices.  Replacements are applied first,
+    // then removals through the span-safe helper (which sorts/dedups per
+    // block and keeps `source_spans` parallel).  No index can drift.
+    let count = edits.len() + removals.len();
     for (block_id, index, replacement) in edits {
         func.blocks[block_id].instructions[index] = replacement;
+    }
+    if !removals.is_empty() {
+        remove_instructions(func, &removals);
     }
     if count > 0 {
         prune_dead_private_writes(func);
@@ -1838,6 +2465,7 @@ fn dead_private_writes(facts: &Facts<'_>) -> Vec<(usize, usize)> {
             {
                 if byte_logic_shape(*op).is_some()
                     || dest_ptr_splat_shape(*op).is_some()
+                    || dest_ptr_zero_width(*op).is_some()
                     || legacy_blend_shape(*op).is_some()
                 {
                     let d = facts

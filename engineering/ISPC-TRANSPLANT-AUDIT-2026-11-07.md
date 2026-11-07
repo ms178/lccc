@@ -803,3 +803,315 @@ by a new consumer interacting with a pre-existing backend limitation; the
 correct engineering response is to narrow the consumer's contract to exactly
 the domain that is proven, rather than to patch an unrelated backend on a
 deadline. That is what was done.
+
+---
+
+# Round 5–7 (new PR): algebraic lattice, purity proof, four-ISA helper, AVX-512 scalar-mask transplants
+
+This section documents the work that treats the merged patch as **untrusted**.
+Every change below was motivated by a measured gap, considered against at
+least two alternatives, implemented fail-closed, and pinned by a mutation
+test that must refuse the near-miss.
+
+## Design decision 1 — one byte-local algebraic decision procedure
+
+**Gap measured.** `/home/user/probes/ident.c` (`pxor`, `pcmpeqb`, `pand`,
+`por` on a runtime vector, four `pmovmskb`s): LCCC `-O2 -I include -msse2 -S`
+emitted `subq $328,%rsp`, a `call mk`, four `pmovmskb`, plus the four vector
+ops. GCC 16.2 and Clang 23.1.5 emitted immediates. All three binaries printed
+`0 65535 0 65535`.
+
+**Alternatives considered.**
+1. *Peephole each intrinsic separately* — 4 duplicated identity tables, and
+   the SSA (`VecAnd*`) and write-through (`Pand128`) forms would drift. Rejected.
+2. *A full bit-vector abstract interpreter* — more power, but needs a value
+   numbering for every IR opcode and would require a new proof per opcode.
+   Rejected as disproportionate: the four identities needed are byte-local.
+3. **Chosen:** one `combine_byte_logic(kind, width, a, b, same)` with
+   `Option<Vec<u8>>` inputs (`None` = unproven). Both the legacy and the SSA
+   forms converge on it. Fail-closed on every unproven byte; lane widths are
+   irrelevant because the identities are byte-local, so no signedness proof
+   is needed.
+
+**Measured after.** ON `pmovmskb=0 pxor=0 pcmpeqb=0 instructions=23`; OFF
+(`CCC_DISABLE_PASSES=maskfacts`) `pmovmskb=4`; ON/OFF runtime both
+`0 65535 0 65535`. Two new C fixtures (`runtime_identities`,
+`algebraic_refusals`) agree byte-for-byte with GCC 16.2 and Clang 23.1.5.
+
+**Red-team finding (a real soundness hole, fixed).** The first
+`operand_is_pure` accepted *any* non-`Copy` definition via `Some(_) => true`.
+A `Cast` to a pointer, `GlobalAddr`, a volatile `Load`, an atomic load, a
+phi, or an undefined external value was therefore classified as an immutable
+SSA vector. On a volatile address `x ^ x` can read two different bit
+patterns, so the identity is not provable. **Fix:** `operand_is_pure` now
+requires a POSITIVE proof — a plain non-volatile `Alloca` stack home, an
+immediate, or a `Copy` chain ending in a `pure_ssa_definition` (an allowlisted
+`dest_ptr: None` value producer, a non-pointer `Cast`, a non-volatile scalar
+`Load`, or scalar arithmetic). Ten adversarial shapes are pinned by
+`repeated_operand_refuses_every_pointer_and_observable_definition`, with a
+positive control proving the refusals are selective. Budget exhaustion and
+`Copy` cycles are pinned separately.
+`ssa_intrinsic_without_a_write_through_home_refuses_object_mentions` pins that
+`mention_of` stays `Reject` for an SSA intrinsic with `dest_ptr: None`: with
+no proven memory home, `Write` and `NoWrite` would both be guesses.
+
+## Design decision 2 — a target-neutral sign-bit extractor for ALL FOUR ISAs
+
+**Gap measured.** Before this round the four-ISA cross probe showed
+`maskfacts` firing only on x86-64/i686 (3 vs 30 / 3 vs 47 instructions);
+AArch64 and RISC-V already folded the trivial shape in *earlier* passes
+(3 instructions either way, 0 IR loads with the pass disabled). There was no
+measured `maskfacts` attribution on ARM/RISC-V, so "perfect AArch/RV" was an
+unproven claim. All `__lccc_simd*` helpers were hard-gated to x86 in
+`lower_lccc_simd`.
+
+**Alternatives considered.**
+1. *Relax the gate for every helper* — unsound: most ops have no ARM/RV
+   lowering (the `check_foreign_intrinsics.py` contract exists precisely
+   because they used to lower silently to zeros). Rejected.
+2. *Implement new NEON / RV movemask codegen* — the backends already have
+   `Pmovmskb128` (NEON reduction and RV software reduction). Duplicating it
+   would be technical debt. Rejected.
+3. **Chosen:** expose exactly ONE mnemonic, `pmovmskb128`, through a
+   `portable_simd_op()` allowlist. It is a Scalar, 1-real-operand helper whose
+   opcode is implemented on x86-64, i686, AArch64 and RISC-V64. On x86 the
+   SSE2 permission still applies; on non-x86 the x86 feature checks are
+   skipped (they are meaningless there) while every other helper keeps the
+   historical rejection. `portable_allowlist_is_fail_closed_for_unrelated_intrinsics`
+   and `pmovmskb128_is_the_only_portable_helper_and_is_exactly_scalar` pin
+   that the allowlist is ONE instruction wide. `check_foreign_intrinsics.py`
+   still passes: 635 registered x86-only builtins x 2 non-x86 backends.
+
+**Measured four-ISA EXECUTION proof** (`scripts/check_maskfacts_cross_arch.py`,
+`--self-test` proves every evidence rule rejects its mutation):
+
+| ISA | fixture | pass | exit | asm instructions |
+|---|---|---|---:|---:|
+| x86_64 | constant_mask | on / off | 255 / 255 | 3 / 27 |
+| i686 | constant_mask | on / off | 255 / 255 | 3 / 29 |
+| aarch64 | constant_mask | on / off | 255 / 255 | 3 / 49 |
+| riscv64 | constant_mask | on / off | 255 / 255 | 3 / 60 |
+| x86_64 | runtime_mask | on / off | 145 / 145 | 66 / 66 |
+| i686 | runtime_mask | on / off | 145 / 145 | 94 / 94 |
+| aarch64 | runtime_mask | on / off | 145 / 145 | 113 / 113 |
+| riscv64 | runtime_mask | on / off | 145 / 145 | 237 / 237 |
+
+Oracles are computed in Python (`0xFF` and `0x91`), not by the compiler.
+Each binary is assembled with Clang 23.1.5's integrated assembler, linked
+with mold 3.0.0 and a per-ISA `_start`, its ELF machine checked with
+`readelf -h`, then EXECUTED (natively on x86-64, under qemu-i386 /
+qemu-aarch64 / qemu-riscv64 11.1.3). The `runtime_mask` fixture uses a
+volatile-derived image so the AArch64 NEON reduction and the RISC-V software
+reduction run for real; ON and OFF are instruction-identical, so no
+over-eager fold is possible. The RISC-V magic-multiply reduction was also
+brute-forced against all 256 possible 8-byte sign-bit patterns: **0
+mismatches**.
+
+## Design decision 3 — a SECOND lattice for scalar `__mmaskN`
+
+**Gap measured.** `tests/regression/maskfacts_cross/avx512_mask_folds.c`
+compiled with `-O2 -mavx512f -mavx512bw -mavx512vl` on LCCC with the pass
+disabled emitted 83 instructions, 3 `vmovdqu8`, 4 `kmov` and 1 `vpcmpub`,
+despite every mask and one operand pair being compile-time constants.
+ISPC's `IntrinsicsOpt` folds these; LCCC did not, because its existing
+`MaskStatus` lattice describes a 16/32-BYTE vector image, while AVX-512
+carries the mask in a GPR as a scalar bitmask.
+
+**Alternatives considered.**
+1. *Reuse `MaskStatus::from_lanes` on a synthesised byte image* — loses the
+   distinction between a scalar `k` value and a vector, and would need a fake
+   object. Rejected.
+2. *Peephole in the x86 backend* — target-specific, unreachable from the
+   IR-level consumers, and untestable on ARM/RISC-V. Rejected.
+3. **Chosen:** `ScalarMask { AllOff, AllOn, Mixed(u64), Unknown }` with
+   `Facts::scalar_mask(op, lanes)`. Only an immediate or a bounded `Copy`
+   chain ending in an immediate is proven; FP/decimal constants, phis,
+   casts, calls, cycles and exhausted budgets refuse. Constants are masked
+   to exactly `lanes` bits, so `__mmask16(-1)` is `AllOn` and `0x1234FFFF`
+   is also `AllOn` on a 16-lane op. The `Mixed(k)` payload is kept
+   deliberately: it is the input the deferred true-prefix analysis needs,
+   and the enum is transient (never heap-allocated, never stored in `Facts`).
+   `rustc -Zprint-type-sizes`: `ScalarMask` 16 B / align 8, `ImageWindow`
+   32 B / 8, `ObjectMention` 32 B / 8, `MaskStatus` 8 B / 4, `ByteOp` 1 B / 1.
+
+**Three consumers, all fail-closed:**
+
+* **Constant mask compares** (`CmpeqEpu*/CmpEpi*/CmpEpu*Mask{128,256}`)
+  fold to `Copy { Const(I64(mask)) }`. Only predicates 0 (`eq`) and 4 (`ne`)
+  are accepted; the byte images come from the SAME `image_of` proof used by
+  `compare_image`, so there is one decision procedure for both encodings.
+  A self-compare of a pure operand needs no image. `mention_of` classifies
+  these as `NoWrite` (they read two vectors and write only an SSA scalar),
+  with BOTH pointer operands pinned to resolved stack objects.
+* **All-off zeroing masked loads** (`MaskzLoaduEpi8_{128,256}`) become the
+  exact-width `Setzero128`/`Setzero256` write-through. The destination is
+  bounds-proven against a plain non-volatile `Alloca`, the SSA `dest` must be
+  unused (no dangling SSA), and 512-bit forms refuse because the image proof
+  caps at 32 bytes and there is no 64-byte zero producer.
+* **All-on 128-bit zeroing masked loads** become `Loaddqu` with the raw
+  pointer — exactly the lowering measured for `_mm_loadu_si128`. This removes
+  the `kmov` and the EVEX `{k1}{z}` decorator. The 256-bit all-on form is
+  deliberately refused: `Loadu256` uses `avx_load_arg`, whose operand may be
+  a register-allocated vector VALUE rather than a raw byte pointer, so the
+  substitution is NOT provably equivalent here.
+* **All-off masked stores** (`MaskStoreuEpi8_{128,256,512}`) are ERASED. A
+  masked-off EVEX store performs no memory access at all. Erasure uses a
+  separate `fold_removal` decision and the existing span-safe
+  `remove_instructions` helper, so `source_spans` stays parallel.
+
+**Measured after** (same source, LCCC `-O2`, AVX-512 flags), host CPU is an
+AVX-512BW/VL Xeon:
+
+| configuration | instructions | `vmovdqu8` | `kmov` | `vpcmpub` | stdout |
+|---|---:|---:|---:|---:|---|
+| LCCC pass ON | 49 | 0 | 0 | 0 | `0 168231937 5555 197` |
+| LCCC pass OFF | 83 | 3 | 4 | 1 | `0 168231937 5555 197` |
+| GCC 16.2 | 36 | 0 | 1 | 1 | `0 168231937 5555 197` |
+| Clang 23.1.5 | 40 | 0 | 0 | 0 | `0 168231937 5555 197` |
+
+`const_compare` is now `movl $21845, %eax; ret` in LCCC (one instruction);
+GCC 16.2 still emits `vmovdqa` + `vpcmpub` + `kmovd` for it, Clang 23.1.5
+also folds it. `full_load` is `movdqu buf(%rip), %xmm0; movd %xmm0, %eax;
+ret`. `zero_load` is `pxor %xmm0,%xmm0; movd %xmm0,%eax; ret`. `zero_store`
+contains no store at all. GDB 18.1 single-hit on `const_compare` reports
+`eax = 0x5555` and the inferior exits normally with the correct stdout.
+
+**This is a NARROW, measured claim**: on this one AVX-512 kernel LCCC closes
+its own 83→49 instruction gap and matches Clang's constant-mask folding;
+GCC 16.2 and Clang 23.1.5 still produce fewer *whole-program* instructions
+(36 / 40), notably because Clang narrows `full_load` to a single 4-byte
+`movl`. No broad "LCCC beats GCC/Clang/ICX" claim is made.
+
+## Host-CPU runtime A/B (measured, this PR)
+
+`maskfact_bench.c`: 100M calls through a **volatile function pointer** (so no
+compiler can hoist the loop), alternating 6 runs per configuration. Both
+configurations print checksum `1108194560`.
+
+| pass | median (ms / 100M calls) | ns/call |
+|---|---:|---:|
+| ON | ~147 | ~1.47 |
+| OFF | ~865 | ~8.65 |
+
+~5.9x LCCC-with-pass vs LCCC-without-pass. ON kernel is
+`movl $43605, %eax; ret`; OFF kernel has 22 instructions including 16 byte
+stores, `movdqu` and `pmovmskb`. objdump 2.47 disassembly and GDB 18.1
+(`kernel eax = 0xaa55`, inferior exits normally) confirm.
+
+**Fair three-way comparison** (`maskfact_bench3.c`, the SAME portable SSE2
+`_mm_movemask_epi8` source, all three compilers emit the identical
+`movl $43605, %eax; ret`): median ms over 4 alternating runs —
+LCCC 148, GCC 16.2 155, Clang 23.1.5 146 (100M indirect calls, identical
+checksum `1108194560`). This is **parity within noise**, not a superiority
+claim. Clang's assembly needs Clang's own assembler (`.prefalign`/`.addrsig`
+are rejected by GNU as 2.40); that is a toolchain fact, not a defect.
+
+## Best-tools audit (only tools actually run are claimed)
+
+| tool | version | what it proved |
+|---|---|---|
+| GDB | 18.1 | `kernel eax = 0xaa55`; `const_compare eax = 0x5555`; normal exit |
+| objdump / readelf / nm | binutils 2.47 | per-function disassembly, ELF class/machine, symbol tables |
+| pyelftools + capstone | 0.33 / 5.0.7 | full `.text` decode: 0 undecodable bytes in all 5 binaries; ON 0 `pmovmskb`, OFF 1 |
+| Valgrind | 3.19.0 (extracted from the restored `debs` cache, no root needed) | memcheck on 4 static freestanding LCCC binaries (2 fixtures x 2 pass states): **0 errors, 0 leaks** in every case |
+| ASan + UBSan | system GCC 12.2.0 runtime | all 4 new C fixtures: compile 0, run 0, **0 sanitizer diagnostics**; the benchmark's signed-overflow UB was found and fixed this way |
+| Clang 23.1.5 integrated assembler | — | assembled x86-64, i686, AArch64, RISC-V64 and AVX-512 EVEX output |
+| mold | 3.0.0 | linked four ISAs (`elf_x86_64`, `elf_i386`, `aarch64linux`, `elf64lriscv`) |
+| qemu-user | 11.1.3 | executed i686, AArch64 and RISC-V64 binaries |
+| rustc `-Zprint-type-sizes` | 1.99.1 + `RUSTC_BOOTSTRAP=1` | exact enum/struct layouts (pahole-equivalent) |
+| Python brute force | — | RISC-V magic multiply exact for all 256 byte-mask patterns; scalar mask lattice exact for all 65,536 16-bit values |
+
+**Tools NOT available, explicitly not claimed:** `objtool`, `pahole`, `perf`,
+PMU/Callgrind, Miri, and a local ICX 2026.2. Valgrind on *dynamic* binaries
+fails at startup in this image (mandatory `ld-linux` `strlen` redirection;
+the restored `libc6-dbg` is glibc 2.36 and does not match the host loader),
+so the Valgrind claim is limited to the static freestanding binaries above.
+The Intel PPA is unreachable (`http=000`) and `intel/llvm` releases carry
+only SYCL tarballs, so no local ICX comparison exists; the hosted
+authenticated ICX 2026.2 lane is the only ICX reference. Hosted CI on the
+previous PR (`9129c09`, run `42370415640`) was GREEN including ICX job
+`128398075708`; the final pushed revision of THIS PR is a separate result.
+
+## Follow-up list: item-by-item disposition
+
+| item | disposition | evidence / reason |
+|---|---|---|
+| masked load/store all-off / all-on | **IMPLEMENTED** (all-off load→zero, all-on 128→`Loaddqu`, all-off store→erased) | 83→49 ins; 8 unit tests; three-way stdout parity |
+| AVX-512 `CmpeqEpu*Mask*` / `CmpEpi*Mask*` / `CmpEpu*Mask*` constant masks | **IMPLEMENTED** (128/256, eq/ne) | `movl $21845,%eax`; GDB `0x5555`; exhaustive 65,536-value lattice test |
+| constant true-prefix masks | **DEFERRED, justified** | `ScalarMask::Mixed(k)` deliberately retains the bit pattern so this can be added without a lattice rewrite. ISPC's `ReplaceMaskedMemOps::lCheckMask` replaces a true prefix with a narrower load; LCCC has no verified partial-width unmasked load with a raw pointer at 256 bits, and adding one needs a new 3-way encoding proof. Refusing avoids a partial-write miscompile. |
+| all-equal gather offsets | **DEFERRED, justified** | ISPC `GatherCoalescePass.cpp` coalesces LLVM gather calls; LCCC's gather family is lowered in the vectorizer with a different provenance model. No measured repro of a missed coalescing in this patchset, so adding a speculative pass would violate the "prove the gap first" rule. |
+| linear / negative-stride masked loads | **DEFERRED, justified** | Needs a stride lattice plus alias/fault proof for negative strides; the current pass proves only constant object images. No measured repro. |
+| coalescing gap budget | **DEFERRED, justified** | Same reason; `MAX_WORK`/`MAX_DEPTH` already bound every proof in this pass and are pinned by budget-exhaustion tests. |
+| widen-then-average | **DEFERRED, justified** | No `VecAvg*` constant-image consumer exists; adding one requires a rounding-mode proof (unsigned average rounds differently per backend). No measured repro. |
+| `MaskLoadu*` (merge form) all-off / all-on | **DEFERRED, justified** | The merge form's `args[2]` is a vector VALUE that must be forwarded to `dest_ptr`; `avx_load_arg`'s register-allocated-value semantics make that substitution unproven here. `masked_fold_candidate` deliberately excludes it so the pass pays nothing for it. |
+| `MaskzLoaduEpi8_512` / `MaskzLoaduEpi8_256` all-on | **DEFERRED, justified** | 512: image proof caps at 32 B and there is no 64-byte zero producer. 256 all-on: `Loadu256` uses `avx_load_arg` (vector-value), not a raw byte pointer. Both are pinned by refusing unit tests. |
+| `MaskzMaddubsEpi16_512`, `MaskzSet1Epi*`, `VecMaskedAdd*` families | **DEFERRED, justified** | These are masked ARITHMETIC, not masked memory. An all-off mask turns them into a zero vector; an all-on mask turns them into the unmasked op — but each needs an exact-width zero producer / unmasked-op mapping on all four backends, which does not exist for the 512-bit forms. A partial rewrite would be a miscompile. Reachable via `__lccc_simd*` (measured in `expr_builtins_lcccsimd.rs:213-221`); no measured win yet. |
+| GCC/Clang loop-hoisting parity | **NOT CLAIMED** | The 100M benchmark needs a volatile function pointer precisely because GCC/Clang can hoist the plain loop. |
+
+## Pass / fail table (direct gates, not local CI)
+
+| gate | result |
+|---|---|
+| `cargo fmt --all -- --check` | PASS |
+| `git diff --check` | PASS |
+| `cargo check --lib --profile fastbuild --locked` (`-D warnings`) | PASS |
+| `cargo test --lib --profile fastbuild --locked` (full unit suite) | **8323 passed / 0 failed / 10 ignored** |
+| focused `simd_mask_facts` tests | **74 passed / 0 failed** |
+| `cargo test ... portable_subset` | 2 passed / 0 failed |
+| `scripts/audit_census.py --check` | PASS (no metric grew) |
+| `scripts/check_clippy_policy.py` | PASS (76 lints, 0 unknown) |
+| `tests/regression/check_verify_ir_clean.sh` | PASS (79 files, 38 hooks) |
+| `tests/regression/check_param_home_contracts.py` (4 drivers) | PASS `[1a]`–`[13]` |
+| `scripts/check_foreign_intrinsics.py` | PASS (635 x 2 non-x86 backends) |
+| `scripts/gen_lcccsimd.py --check` | PASS (header matches generator) |
+| `scripts/check_ci_gate_parity.py` (PyYAML 6.0.3) | PASS (551 commands, 27 contracts) |
+| `run_regression.py --filter simd_mask_facts` | **11 passed / 0 failed** |
+| `scripts/check_maskfacts_cross_arch.py --self-test` | PASS (5 mutation rules) |
+| `scripts/check_maskfacts_cross_arch.py` (4 ISAs x 2 fixtures x 2 pass states) | PASS, oracle-identical |
+| three-way AVX-512 differential (LCCC / GCC 16.2 / Clang 23.1.5) | PASS, identical stdout |
+| Valgrind memcheck (4 static binaries) | PASS, 0 errors / 0 leaks |
+| ASan + UBSan (4 new C fixtures) | PASS, 0 diagnostics |
+| GDB 18.1 single-hit proofs (2 kernels) | PASS |
+| pyelftools + capstone `.text` decode (5 binaries) | PASS, 0 undecodable bytes |
+| hosted GitHub CI on the FINAL pushed revision of THIS PR | reported separately below |
+
+## Per-function efficiency verdict
+
+"Most efficient" here means: no redundant walk, no allocation on the hot
+path, fail-closed on every unproven shape, and a measured win on the repro.
+It does NOT mean "universally optimal" — see the deferral table.
+
+| function | verdict |
+|---|---|
+| `combine_byte_logic` | **Yes.** One byte-local decision for 4 ops x 2 widths; O(width), no allocation beyond the output image; exhaustive test over all 256 byte pairs x 4 ops. |
+| `byte_logic_image` / `compare_image` | **Yes.** Shared recursion state (one budget, one cycle set), single `operand_image` walk for the self-identity case, no second identical walk. |
+| `operand_is_pure` | **Yes, after the round-6 fix.** Positive proof only; bounded `MAX_DEPTH`/budget; every refused shape pinned. |
+| `pure_ssa_definition` / `pure_ssa_intrinsic` | **Yes.** Table lookup + one match; no walks. |
+| `Facts::scalar_mask` | **Yes.** O(MAX_DEPTH) with an early constant return; the 16-byte enum is transient and register-resident. Keeping `Mixed(u64)` is a deliberate forward-looking design choice, not waste. |
+| `mask_compare_shape` / `masked_store_shape` / `masked_fold_candidate` | **Yes.** Compile-time match tables; the candidate gate is the same predicate as the consumers, so unsupported ops cost zero. |
+| `fold_removal` | **Yes.** One shape check + one scalar-mask proof; erasure reuses the existing span-safe helper. |
+| `run_function` | **Yes.** Two-phase (one immutable `Facts` snapshot), replacements before removals, indices cannot drift; `constant_fold` chaser stays scoped to edited functions and skips `InlineAsm`. |
+| `Facts::new` / `build_mention_index` | **Yes.** O(n+k) provenance index, unchanged from the merged patch; no quadratic rescan. |
+| `portable_simd_op` | **Yes.** One `matches!`; widening it requires a new four-backend proof, pinned by test. |
+| `intrinsic_mention` (mask-compare `NoWrite` arm) | **Yes.** Pins both pointer args, refuses wrong arity and `dest_ptr: Some(_)`. |
+| RISC-V `emit_rv_pmovmskb` | **Correct but not minimal.** Brute-forced exact for all 256 patterns; 237 asm instructions for the runtime fixture is dominated by the fixture's 16 multiplies and two 64-bit constant materialisations, not by the reduction. No claim of optimality. |
+| `check_maskfacts_cross_arch.py` | **Yes.** 16 compile/assemble/link/execute paths, independent Python oracle, non-vacuity rules (fold must fire; runtime image must NOT fold), `--self-test` mutation proof, ELF-machine verification. |
+
+## Explicitly NOT claimed
+
+* No broad "LCCC beats GCC 16.2 / Clang 23.1.5 / ICX 2026.2" claim. The
+  narrow measured facts above are the whole claim.
+* No local ICX 2026.2 comparison (PPA unreachable, no standalone asset).
+* No `objtool`, `pahole`, `perf`, PMU/Callgrind, Miri result.
+* No Valgrind result for *dynamic* binaries (loader debuginfo mismatch).
+* No full cross-GCC C conformance suite on AArch64/RISC-V (no cross sysroots
+  in the sandbox); the four-ISA proof uses freestanding static binaries,
+  Clang's integrated assembler, mold and qemu-user.
+* No native ARM/RISC-V `maskfacts` movemask fold on *x86 builtin sources* —
+  those remain x86-only by contract. The four-ISA fold is through the new
+  target-neutral helper.
+* No claim that the deferred follow-up items are implemented; each is
+  listed with its exact blocker.
+* No claim of GCC/Clang loop-hoisting parity.
+* Local CI was NOT run; the hosted GitHub CI on the final pushed revision is
+  the authority and is reported separately.

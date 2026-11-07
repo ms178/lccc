@@ -291,6 +291,14 @@ pub(super) fn lccc_simd_lookup(
         "unpcklps128" => b(Vec128, UnpcklPs128),
         "unpckhps128" => b(Vec128, UnpckhPs128),
         "movmskps128" => s1(Scalar, MovemaskPs128),
+        // Portable 16-byte sign-bit extraction.  `Pmovmskb128` is one of the
+        // few vector instructions with a REAL lowering on all four backends
+        // (x86-64 `pmovmskb`, i686 `pmovmskb`, AArch64 NEON reduction,
+        // RISC-V software reduction), so it is exposed on every target by
+        // `portable_simd_op`.  On x86 it is still SSE2-gated like its
+        // siblings; on AArch64/RISC-V it is a target-neutral LCCC helper
+        // with exactly defined semantics (bit i = sign bit of byte i).
+        "pmovmskb128" => s1(Scalar, Pmovmskb128),
         "cvtps2dq128" => u(Vec128, CvtPs2Ep32_128),
         "cvtdq2ps128" => u(Vec128, CvtEp32ToPs128),
         "cvttps2dq128" => u(Vec128, CvttPs2Ep32_128),
@@ -411,6 +419,21 @@ pub(super) fn lccc_simd_lookup(
         "vfmadd231pd256" => m3(Vec256, FmaPd231v256),
         _ => None,
     }
+}
+
+/// Instructions that are implemented on ALL FOUR LCCC backends and may
+/// therefore be exposed as target-neutral helpers on AArch64/RISC-V.
+///
+/// This is an explicit allowlist, NOT a relaxation of the foreign-builtin
+/// contract: `check_foreign_intrinsics.py` still rejects every registered
+/// `BuiltinIntrinsic::X86*` name on a non-x86 target.  These ops carry a
+/// portable, target-independent semantic definition (bit i of the result is
+/// the sign bit of byte i of the 16-byte input) and each has a measured
+/// lowering in `src/backend/{x86,i686,arm,riscv}/codegen/intrinsics.rs`.
+/// Anything outside this set keeps the historical diagnostic, so no x86-only
+/// instruction can silently compile to zeros on another ISA.
+fn portable_simd_op(op: IntrinsicOp) -> bool {
+    matches!(op, IntrinsicOp::Pmovmskb128)
 }
 
 /// Legacy native helper permissions follow the encoded instruction, not the
@@ -706,48 +729,55 @@ impl Lowerer {
             LcccSimdClass::Vec512 => 64,
             _ => 0,
         };
-        if !matches!(
+        let x86_target = matches!(
             self.target,
             crate::backend::Target::X86_64 | crate::backend::Target::I686
-        ) {
+        );
+        if !x86_target && !portable_simd_op(op) {
             return self.reject_builtin_call(
                 format!("'{name}' is not available on {}", self.target.triple()),
                 args,
                 width.max(16),
             );
         }
-        let feature_requirements = simd_feature_requirements(canonical);
-        let uses_avx512 = feature_requirements.iter().any(|(feature, _)| {
-            matches!(
-                feature,
-                crate::common::x86_features::X86Feature::Avx512F
-                    | crate::common::x86_features::X86Feature::Avx512Bw
-                    | crate::common::x86_features::X86Feature::Avx512Dq
-                    | crate::common::x86_features::X86Feature::Avx512Vl
-                    | crate::common::x86_features::X86Feature::Avx512Vnni
-                    | crate::common::x86_features::X86Feature::Avx512BitAlg
-                    | crate::common::x86_features::X86Feature::Avx512Vpopcntdq
-                    | crate::common::x86_features::X86Feature::Avx512Cd
-                    | crate::common::x86_features::X86Feature::Avx512Ifma
-                    | crate::common::x86_features::X86Feature::Avx512Vbmi
-                    | crate::common::x86_features::X86Feature::Avx512Vbmi2
-                    | crate::common::x86_features::X86Feature::Avx512Bf16
-                    | crate::common::x86_features::X86Feature::Avx512Fp16
-                    | crate::common::x86_features::X86Feature::Avx512Bmm
-                    | crate::common::x86_features::X86Feature::Avx512Vp2intersect
-                    | crate::common::x86_features::X86Feature::Avx512Er
-                    | crate::common::x86_features::X86Feature::Avx512Pf
-            )
-        });
-        if self.target == crate::backend::Target::I686 && uses_avx512 {
-            return self.reject_builtin_call(
-                format!("'{name}' uses an AVX-512 encoding not implemented for i686"),
-                args,
-                width.max(16),
-            );
-        }
-        for (feature, flag) in feature_requirements {
-            self.check_x86_simd_feature(feature, flag, name, args);
+        // x86 ISA feature permissions are meaningless on AArch64/RISC-V: the
+        // portable subset has no x86 encoding to gate.  Keeping the checks
+        // x86-only also prevents `check_x86_simd_feature` from diagnosing a
+        // missing `-msse2` on a target that has no SSE2 at all.
+        if x86_target {
+            let feature_requirements = simd_feature_requirements(canonical);
+            let uses_avx512 = feature_requirements.iter().any(|(feature, _)| {
+                matches!(
+                    feature,
+                    crate::common::x86_features::X86Feature::Avx512F
+                        | crate::common::x86_features::X86Feature::Avx512Bw
+                        | crate::common::x86_features::X86Feature::Avx512Dq
+                        | crate::common::x86_features::X86Feature::Avx512Vl
+                        | crate::common::x86_features::X86Feature::Avx512Vnni
+                        | crate::common::x86_features::X86Feature::Avx512BitAlg
+                        | crate::common::x86_features::X86Feature::Avx512Vpopcntdq
+                        | crate::common::x86_features::X86Feature::Avx512Cd
+                        | crate::common::x86_features::X86Feature::Avx512Ifma
+                        | crate::common::x86_features::X86Feature::Avx512Vbmi
+                        | crate::common::x86_features::X86Feature::Avx512Vbmi2
+                        | crate::common::x86_features::X86Feature::Avx512Bf16
+                        | crate::common::x86_features::X86Feature::Avx512Fp16
+                        | crate::common::x86_features::X86Feature::Avx512Bmm
+                        | crate::common::x86_features::X86Feature::Avx512Vp2intersect
+                        | crate::common::x86_features::X86Feature::Avx512Er
+                        | crate::common::x86_features::X86Feature::Avx512Pf
+                )
+            });
+            if self.target == crate::backend::Target::I686 && uses_avx512 {
+                return self.reject_builtin_call(
+                    format!("'{name}' uses an AVX-512 encoding not implemented for i686"),
+                    args,
+                    width.max(16),
+                );
+            }
+            for (feature, flag) in feature_requirements {
+                self.check_x86_simd_feature(feature, flag, name, args);
+            }
         }
         if let Some(result) = self.try_native_packed_fp_helper(op, &args[1..]) {
             return Some(result);
@@ -937,5 +967,59 @@ mod legacy_permission_tests {
             assert_eq!(legacy_simd_feature(mnemonic).unwrap().0, feature);
         }
         assert!(legacy_simd_feature("vcvtpd2ps512").is_none());
+    }
+}
+
+#[cfg(test)]
+mod portable_subset_tests {
+    use super::{LcccSimdClass, lccc_simd_lookup, portable_simd_op, simd_feature_requirements};
+    use crate::ir::reexports::IntrinsicOp as O;
+
+    /// The allowlist is ONE instruction wide by design.  Adding a second op
+    /// requires a new proof that all four backends implement it; a silent
+    /// widening of the gate would let an x86-only encoding through to
+    /// AArch64/RISC-V as a no-op or a wrong answer.
+    #[test]
+    fn pmovmskb128_is_the_only_portable_helper_and_is_exactly_scalar() {
+        assert_eq!(
+            lccc_simd_lookup("pmovmskb128"),
+            Some((LcccSimdClass::Scalar, O::Pmovmskb128, false, 1))
+        );
+        assert!(portable_simd_op(O::Pmovmskb128));
+        // The x86 ISA permission is still required on x86-64/i686.
+        assert!(!simd_feature_requirements("pmovmskb128").is_empty());
+        // Near misses: same semantic family, different widths or encodings,
+        // plus a memory-writing blend.  None has a four-ISA lowering.
+        for op in [
+            O::MovemaskPs128,
+            O::MovemaskPd128,
+            O::MovemaskPs256,
+            O::Pmovmskb256,
+            O::BlendvPs128,
+            O::Setzero128,
+            O::Pand128,
+            O::VecCmpI8x16,
+        ] {
+            assert!(!portable_simd_op(op), "{op:?} must stay x86-only");
+        }
+    }
+
+    /// `portable_simd_op` is a PURE predicate over the op, so the target gate
+    /// cannot be widened by a target-dependent branch.  Probe a batch of
+    /// unrelated ops to make the "one instruction wide" claim non-vacuous.
+    #[test]
+    fn portable_allowlist_is_fail_closed_for_unrelated_intrinsics() {
+        for op in [
+            O::Aesenc128,
+            O::Crc32_64,
+            O::SqrtF64,
+            O::Pause,
+            O::VecLoadI32x4,
+            O::VecStoreI32x4,
+            O::LoadF64x2,
+            O::Storeldi128,
+        ] {
+            assert!(!portable_simd_op(op), "{op:?} must stay x86-only");
+        }
     }
 }
