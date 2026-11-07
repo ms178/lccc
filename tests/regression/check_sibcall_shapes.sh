@@ -595,8 +595,14 @@ if "$gcc" --version 2>/dev/null | grep -c "16\.2" >/dev/null; then
 fi
 echo "PASS: branch-arm sibling calls (shapes, refusals, alignment, runtime parity: $ref)"
 
-# The shared driver computes hints on every target, but only x86-64 implements
-# conversion. Other backends must not grow a silent partial tail-call path.
+# The shared driver computes hints on every target.  i686 implements no
+# conversion and must not grow a silent partial tail-call path: its code is
+# identical with and without the kill switch.  AArch64 and RISC-V convert
+# like x86-64 (`b target` / `tail target`, frameless), including the branch
+# arms `ret_dup` hands a return of their own -- Clang 23.1.5's `cbz w0, .L;
+# mov w0, w1; b target; .L: mov w0, w1; b other` and `beqz a0, .L; mv a0,
+# a1; tail target; .L: mv a0, a1; tail other` -- while CCC_NO_SIBCALL=1
+# restores ordinary calls that return.
 cat > "$tmp/cross.c" <<'C'
 extern int target(int), other(int);
 int forward(int x) { return target(x); }
@@ -610,12 +616,34 @@ for target_cc in lccc-i686 lccc-arm lccc-riscv; do
     }
     "$bindir/$target_cc" -O2 -S "$tmp/cross.c" -o "$tmp/$target_cc.on.s"
     CCC_NO_SIBCALL=1 "$bindir/$target_cc" -O2 -S "$tmp/cross.c" -o "$tmp/$target_cc.off.s"
-    cmp -s "$tmp/$target_cc.on.s" "$tmp/$target_cc.off.s" || {
-        echo "$target_cc: unsupported sibling-call path changed target assembly" >&2
-        diff -u "$tmp/$target_cc.off.s" "$tmp/$target_cc.on.s" >&2
-        exit 1
-    }
-    echo "PASS: $target_cc leaves sibling-call lowering disabled"
+    case $target_cc in
+        lccc-i686)
+            cmp -s "$tmp/$target_cc.on.s" "$tmp/$target_cc.off.s" || {
+                echo "$target_cc: unsupported sibling-call path changed target assembly" >&2
+                diff -u "$tmp/$target_cc.off.s" "$tmp/$target_cc.on.s" >&2
+                exit 1
+            }
+            echo "PASS: $target_cc leaves sibling-call lowering disabled"
+            continue ;;
+        lccc-arm) jump='b'; call='bl'; ret='ret' ;;
+        lccc-riscv) jump='tail'; call='call'; ret='ret' ;;
+    esac
+    for fn in forward arms; do
+        b=$(body "$tmp/$target_cc.on.s" "$fn")
+        has "$b" "^[[:space:]]*$jump target\$" || {
+            echo "$target_cc $fn: missing '$jump target':" >&2; echo "$b" >&2; exit 1; }
+        lacks "$b" "^[[:space:]]*$call " || { echo "$target_cc $fn: tail still calls" >&2; exit 1; }
+        lacks "$b" "^[[:space:]]*$ret\$" || { echo "$target_cc $fn: tail still returns" >&2; exit 1; }
+        c=$(body "$tmp/$target_cc.off.s" "$fn")
+        has "$c" "^[[:space:]]*$call target" || {
+            echo "$target_cc $fn (control): kill switch lost the call" >&2; echo "$c" >&2; exit 1; }
+        has "$c" "^[[:space:]]*$ret\$" || {
+            echo "$target_cc $fn (control): kill switch lost the return" >&2; exit 1; }
+    done
+    b=$(body "$tmp/$target_cc.on.s" arms)
+    has "$b" "^[[:space:]]*$jump other\$" || {
+        echo "$target_cc arms: the second arm is not a sibling call:" >&2; echo "$b" >&2; exit 1; }
+    echo "PASS: $target_cc converts straight-line and branch-arm sibling calls"
 done
 
 echo "sibcall-shapes gate OK"

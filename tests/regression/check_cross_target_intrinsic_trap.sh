@@ -184,9 +184,11 @@ for opt in -O0 -O2; do
     # something". Under the default -fmath-errno, `sqrt` of a negative input
     # must set errno, so a call to `sqrt` is part of every correct lowering:
     # the whole function at -O0 (GCC 16.2 emits exactly `bl sqrt`), the
-    # never-taken slow path behind the instruction at -O2. With
+    # never-taken slow path behind the instruction at -O2 -- an ordinary
+    # call, or the sibling call GCC 16.2 and Clang 23.1.5 make of it (`b
+    # sqrt` / `tail sqrt`: the result is returned as is). With
     # -fno-math-errno the instruction alone is the lowering at every level.
-    for spec in "AArch64:$ccc_arm:fsqrt:bl" "RISC-V:$ccc_riscv:fsqrt\\.d:call"; do
+    for spec in "AArch64:$ccc_arm:fsqrt:(bl|b)" "RISC-V:$ccc_riscv:fsqrt\\.d:(call|tail)"; do
         IFS=: read -r arch tool insn call <<<"$spec"
         body=$(function_body portable_sqrt "$tmp/portable-$(basename "$tool")$tag.s")
         grep -qE "^[[:space:]]+$call[[:space:]]+sqrt\$" <<<"$body" ||

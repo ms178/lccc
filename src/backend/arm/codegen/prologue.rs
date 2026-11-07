@@ -559,14 +559,20 @@ impl ArmCodegen {
         self.current_return_type = func.return_type;
         self.func_ret_is_f128_sse = func.ret_is_f128_sse;
         self.current_frame_size = frame_size;
-        // The width of a narrow integer result, for the peephole: AAPCS64
-        // leaves the bits of x0 above it unspecified (callers extend what
-        // they read), so an extension that only rewrites those bits on the
-        // way to `ret` is unobservable.  Never emitted: the peephole drops it.
+        // The GP width of the result, for the peephole (`ret_gp_reads`):
+        // AAPCS64 leaves the bits of x0 above a narrow integer unspecified
+        // (callers extend what they read), so an extension that only
+        // rewrites those bits on the way to `ret` is unobservable; a result
+        // in one GP register (64) leaves x1 unread at the `ret`, and a
+        // `void` or `float`/`double` result (0, returned in v0) leaves x0
+        // unread too.  Wider and aggregate results publish nothing (x0 and
+        // x1 both count as read).  Never emitted: the peephole drops it.
         let ret_bits = match func.return_type {
+            IrType::Void | IrType::F32 | IrType::F64 => Some(0),
             IrType::I8 | IrType::U8 => Some(8),
             IrType::I16 | IrType::U16 => Some(16),
             IrType::I32 | IrType::U32 => Some(32),
+            IrType::I64 | IrType::U64 | IrType::Ptr => Some(64),
             _ => None,
         };
         if let Some(bits) = ret_bits.filter(|_| !func.uses_sret) {
@@ -716,7 +722,45 @@ impl ArmCodegen {
                     )
                 })
             }
-            && self.arm_frameless_leaf_ir(func)
+            && self.arm_frameless_leaf_ir(func, self.every_call_is_sibling(func))
+    }
+
+    /// Whether every call of `func` will be emitted as a sibling call --
+    /// the block-tail shape the generation driver arms
+    /// (`sibcall_function_use_counts` + `sibcall_block_hint`, the exact
+    /// inputs it uses) and `sibcall_abi_admits` -- with scalar arguments and
+    /// result, so neither the argument setup nor the result path calls a
+    /// helper.  Such a function needs no frame record: x30 is never
+    /// clobbered, and each tail is a bare `b`.  (`emit_call_instruction_impl`
+    /// guards x30 around any call that is emitted after all.)
+    fn every_call_is_sibling(&self, func: &IrFunction) -> bool {
+        let Some(counts) = crate::backend::generation::sibcall_function_use_counts(
+            func,
+            &self.state.incoming_byval_slots,
+        ) else {
+            return false;
+        };
+        for block in &func.blocks {
+            let hint = crate::backend::generation::sibcall_block_hint(block, &counts);
+            for (idx, inst) in block.instructions.iter().enumerate() {
+                let info = match inst {
+                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => info,
+                    _ => continue,
+                };
+                if hint.map(|h| h.instruction_index) != Some(idx)
+                    || !self.sibcall_abi_admits(info)
+                    || !info
+                        .arg_types
+                        .iter()
+                        .all(|&t| super::calls::sibcall_scalar(t))
+                    || !(info.return_type == IrType::Void
+                        || super::calls::sibcall_scalar(info.return_type))
+                {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Instructions whose AArch64 emitters never call (no `bl`/`blr`: the
@@ -726,7 +770,7 @@ impl ArmCodegen {
     /// allowlist on purpose: an IR variant not proven call-free here keeps
     /// the frame, so a future lowering that emits a libcall closes the form
     /// instead of returning through a clobbered x30.
-    fn arm_frameless_leaf_ir(&self, func: &IrFunction) -> bool {
+    fn arm_frameless_leaf_ir(&self, func: &IrFunction, sibling_calls: bool) -> bool {
         use crate::common::tls::TlsModel;
         use crate::ir::reexports::IrConst;
         let scalar = |ty: &IrType| {
@@ -774,6 +818,9 @@ impl ArmCodegen {
                         }
                     }
                     Instruction::GetElementPtr { .. } | Instruction::LabelAddr { .. } => {}
+                    // Every call a tail branch (`every_call_is_sibling`).
+                    Instruction::Call { .. } | Instruction::CallIndirect { .. }
+                        if sibling_calls => {}
                     // Scalar FP intrinsics lower to inline instructions on
                     // caller-saved scratch (`fabs`, `fsqrt`, `frint*`, the
                     // `fmadd` family, copysign's bit merge in x0/x1): no

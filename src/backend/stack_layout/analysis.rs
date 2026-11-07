@@ -264,12 +264,23 @@ pub(super) fn find_dead_param_allocas(
                     //   writes the argument register straight into it (in
                     //   place when they are the same register).
                     let a64 = crate::common::types::target_elf_machine() == 183;
+                    // - on riscv64, an a-register (a0-a7 = 12..=19) in any
+                    //   function, on the same grounds: a parameter gets one
+                    //   only as a leaf's pinned incoming register (ordered
+                    //   parameter copies) or from Phase 2p (the
+                    //   `riscv_param_volatile_pool`, or its own argument
+                    //   register), and `emit_param_ref_impl` copies the
+                    //   argument register into it at the entry-prefix
+                    //   ParamRef.  The x86 id range above covered a0-a4 of
+                    //   a leaf only by accident of numbering.
+                    let rv = crate::common::types::target_elf_machine() == 243;
                     let has_stable_home = reg_assigned
                         .get(&dest_id)
                         .map(|phys| {
                             callee_saved_regs.contains(phys)
-                                || phys.0 >= 20
-                                || (leaf && is_leaf_caller_gpr(*phys))
+                                || (rv && (12..=19).contains(&phys.0))
+                                || (!rv && phys.0 >= 20)
+                                || (!rv && leaf && is_leaf_caller_gpr(*phys))
                                 || (a64 && (4..=15).contains(&phys.0))
                         })
                         .unwrap_or(false);

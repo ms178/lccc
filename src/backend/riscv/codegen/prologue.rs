@@ -51,6 +51,76 @@ impl RiscvCodegen {
     /// reject it outright; the TLS optimizations exist to serve precisely that
     /// one call and so permit it while still rejecting every other libcall.
     fn riscv_call_free_ir(&self, func: &IrFunction, allow_dynamic_tls: bool) -> bool {
+        self.riscv_emitter_safe_ir(func, allow_dynamic_tls, false)
+    }
+
+    /// The caller-saved (a0-a7) pool for a function WITH calls.
+    ///
+    /// Every call must be an ordinary direct or indirect call of scalar
+    /// arguments and result (`allow_calls` of `riscv_emitter_safe_ir`): the
+    /// allocator sees it as a call point, so a value live across it takes a
+    /// callee-saved home, and `collect_call_arg_values` gives each argument
+    /// the depth of the staging writes that precede its read (the indirect
+    /// target too: it is read after the staging), so no argument sits in an
+    /// a-register written before it.  Everything else is the call-free
+    /// allowlist: emitters that touch t- and s-registers only.  The
+    /// parameters must be read in the entry prefix, which the allocator's
+    /// entry guard takes as given.
+    fn riscv_call_pool_eligible(&self, func: &IrFunction) -> bool {
+        std::env::var_os("CCC_NO_RISCV_CALLER_POOL").is_none()
+            && self.riscv_emitter_safe_ir(func, false, true)
+            && crate::backend::regalloc::riscv_params_in_entry_prefix(func)
+    }
+
+    /// Whether every call of `func` will be emitted as a sibling call --
+    /// the block-tail shape the generation driver arms
+    /// (`sibcall_function_use_counts` + `sibcall_block_hint`, the exact
+    /// inputs it uses) and `sibcall_abi_admits` -- with scalar arguments and
+    /// result, so neither the argument setup nor the result path calls a
+    /// helper.  Such a function never needs ra saved: each tail is a bare
+    /// `tail`.  (`emit_call_instruction_impl` guards ra around any call
+    /// emitted after all.)
+    fn every_call_is_sibling(&self, func: &IrFunction) -> bool {
+        use crate::ir::reexports::Instruction;
+        let Some(counts) = crate::backend::generation::sibcall_function_use_counts(
+            func,
+            &self.state.incoming_byval_slots,
+        ) else {
+            return false;
+        };
+        for block in &func.blocks {
+            let hint = crate::backend::generation::sibcall_block_hint(block, &counts);
+            for (idx, inst) in block.instructions.iter().enumerate() {
+                let info = match inst {
+                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => info,
+                    _ => continue,
+                };
+                if hint.map(|h| h.instruction_index) != Some(idx)
+                    || !self.sibcall_abi_admits(info)
+                    || !info
+                        .arg_types
+                        .iter()
+                        .all(|&t| super::calls::rv_sibcall_scalar(t))
+                    || !(info.return_type == IrType::Void
+                        || super::calls::rv_sibcall_scalar(info.return_type))
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// The allowlist behind [`Self::riscv_call_free_ir`]; with `allow_calls`
+    /// it also admits ordinary calls of scalar arguments and result
+    /// (`riscv_call_pool_eligible`).  Calls returning twice stay out: their
+    /// second return resumes with whatever the a-registers hold.
+    fn riscv_emitter_safe_ir(
+        &self,
+        func: &IrFunction,
+        allow_dynamic_tls: bool,
+        allow_calls: bool,
+    ) -> bool {
         use crate::ir::reexports::{Instruction, IrConst, Operand};
         let scalar = |ty: &IrType| {
             matches!(
@@ -103,6 +173,13 @@ impl RiscvCodegen {
                     | Instruction::LabelAddr { .. }
                     | Instruction::GetStaticChain { .. }
                     | Instruction::SetStaticChain { .. } => {}
+                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. }
+                        if allow_calls
+                            && !crate::backend::liveness::is_returns_twice_call(inst)
+                            && !info.is_sret
+                            && info.arg_types.len() == info.args.len()
+                            && info.arg_types.iter().all(scalar)
+                            && (info.return_type == IrType::Void || scalar(&info.return_type)) => {}
                     Instruction::GlobalAddr { name, .. } => {
                         if !allow_dynamic_tls
                             && self.state.tls_symbols.contains(name)
@@ -213,23 +290,32 @@ impl RiscvCodegen {
         // a live value out from under a later argument.  t-regs stay reserved
         // as emitter scratch (t0 acc / t1 secondary / t2 static chain and
         // indirect-call target / t3–t5 call staging / t6 jump tables).
-        let caller_saved_regs: Vec<crate::backend::regalloc::PhysReg> = if !self.state.disable_regalloc
+        //
+        // A function with calls opens the same pool on the conditions of
+        // `riscv_call_pool_eligible`: the allocator keeps call-spanning
+        // values out of it, and the staging-hazard depths keep each argument
+        // out of the a-registers its staging writes first.
+        let caller_saved_regs: Vec<crate::backend::regalloc::PhysReg> =
+            if !self.state.disable_regalloc
                 && !self.is_variadic
                 && !func.uses_sret
-                && self.riscv_caller_pool_eligible(func)
-                // The entry-prefix write guard is computed from block 0
-                // alone; opening the pool is only sound when every ParamRef
-                // really sits in that entry prefix (generation's lowering
-                // contract).  Belt and suspenders: refuse the pool outright
-                // otherwise.  Also re-asserts call-freeness.
-                && crate::backend::regalloc::riscv_param_caller_homes_safe_with_config(
-                    func,
-                    &self.state.ra_config,
-                ) {
-            (12..=19).map(crate::backend::regalloc::PhysReg).collect()
-        } else {
-            Vec::new()
-        };
+                && ((self.riscv_caller_pool_eligible(func)
+                    // The entry-prefix write guard is computed from block 0
+                    // alone; opening the pool is only sound when every
+                    // ParamRef really sits in that entry prefix
+                    // (generation's lowering contract).  Belt and
+                    // suspenders: refuse the pool outright otherwise.  Also
+                    // re-asserts call-freeness.
+                    && crate::backend::regalloc::riscv_param_caller_homes_safe_with_config(
+                        func,
+                        &self.state.ra_config,
+                    ))
+                    || self.riscv_call_pool_eligible(func))
+            {
+                (12..=19).map(crate::backend::regalloc::PhysReg).collect()
+            } else {
+                Vec::new()
+            };
         let call_arg_regs = caller_saved_regs.clone();
         let (
             mut reg_assigned,
@@ -392,10 +478,122 @@ impl RiscvCodegen {
             (-space, class)
         });
 
+        // No value slot, alloca or return buffer below the frame record:
+        // nothing in the body addresses the frame through s0 (one of the
+        // conditions of the frame-pointer-free frame, `fp_less_frame`).
+        self.slot_free = space == 16 && self.fp_ret_buffer.is_none();
+
         // Add space for saving callee-saved registers.
         // Each callee-saved register needs 8 bytes on the stack.
         let callee_save_space = (self.used_callee_saved.len() as i64) * 8;
         space + callee_save_space
+    }
+
+    /// The frame-pointer-free frame (`fp_less_frame`): ra above the
+    /// callee-saved registers, everything sp-relative, `size` bytes --
+    /// GCC's and Clang's -O2 shape.
+    ///
+    /// Requirements, each load-bearing:
+    /// * frame-pointer omission requested and possible (`omit_frame_pointer`:
+    ///   not `-fno-omit-frame-pointer`, no `__builtin_frame_address`, no
+    ///   dynamic alloca, no frame-pointer inline asm);
+    /// * no slot, alloca or return buffer (`slot_free`): the body never
+    ///   addresses the frame through s0;
+    /// * neither variadic (the save area sits above s0) nor sret, and no
+    ///   parameter on the stack (read s0-relative);
+    /// * the emitter-safe allowlist with plain scalar calls
+    ///   (`riscv_emitter_safe_ir`): no intrinsic, inline asm or nonlocal-goto
+    ///   plumbing reads s0;
+    /// * no call passes stack arguments: sp never moves inside the body, so
+    ///   the CFA stays `sp + size` at every call an unwinder may walk out of.
+    fn fp_less_frame_ok(&self, func: &IrFunction) -> bool {
+        use crate::ir::reexports::Instruction;
+        let config = self.call_abi_config_impl();
+        self.state.omit_frame_pointer
+            && self.slot_free
+            && !self.is_variadic
+            && !func.uses_sret
+            && !self.state.has_dyn_alloca
+            && Self::fits_imm12(self.fp_less_frame_size())
+            && !classify_params(func, &config)
+                .iter()
+                .any(|c| !matches!(c, ParamClass::IntReg { .. } | ParamClass::FloatReg { .. }))
+            && self.riscv_emitter_safe_ir(func, true, true)
+            && func.blocks.iter().all(|block| {
+                block.instructions.iter().all(|inst| match inst {
+                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                        !crate::backend::call_abi::classify_call_args(
+                            &info.args,
+                            &info.arg_types,
+                            &info.struct_arg_sizes,
+                            &info.struct_arg_aligns,
+                            &info.struct_arg_classes,
+                            &info.struct_arg_fp_agg_classes,
+                            &info.struct_arg_is_f128_sse,
+                            info.is_variadic.then_some(info.num_fixed_args),
+                            &config,
+                        )
+                        .iter()
+                        .any(crate::backend::call_abi::CallArgClass::is_stack)
+                    }
+                    _ => true,
+                })
+            })
+    }
+
+    /// The `fp_less_frame` size: ra plus the callee-saved registers,
+    /// 16-byte aligned.
+    fn fp_less_frame_size(&self) -> i64 {
+        (8 + 8 * self.used_callee_saved.len() as i64 + 15) & !15
+    }
+
+    /// The `fp_less_frame` prologue: `addi sp, sp, -size`, ra at the top,
+    /// callee-saved registers from sp upward, each with its CFA row (the CFA
+    /// is `sp + size` throughout the body).
+    fn emit_fp_less_prologue(&mut self) {
+        let size = self.fp_less_frame_size();
+        self.state
+            .emit_fmt(format_args!("    addi sp, sp, -{}", size));
+        if self.state.emit_cfi {
+            self.state
+                .emit_fmt(format_args!("    .cfi_def_cfa_offset {}", size));
+        }
+        self.state
+            .emit_fmt(format_args!("    sd ra, {}(sp)", size - 8));
+        if self.state.emit_cfi {
+            self.state.emit("    .cfi_offset ra, -8");
+        }
+        let used_regs = self.used_callee_saved.clone();
+        for (i, &reg) in used_regs.iter().enumerate() {
+            let offset = i as i64 * 8;
+            let reg_name = callee_saved_name(reg);
+            self.state
+                .emit_fmt(format_args!("    sd {}, {}(sp)", reg_name, offset));
+            if self.state.emit_cfi {
+                self.state.emit_fmt(format_args!(
+                    "    .cfi_offset {}, {}",
+                    reg_name,
+                    offset - size
+                ));
+            }
+        }
+    }
+
+    /// The `fp_less_frame` epilogue (no `ret`).
+    fn emit_fp_less_epilogue(&mut self) {
+        let size = self.fp_less_frame_size();
+        let used_regs = self.used_callee_saved.clone();
+        for (i, &reg) in used_regs.iter().enumerate() {
+            self.state.emit_fmt(format_args!(
+                "    ld {}, {}(sp)",
+                callee_saved_name(reg),
+                i as i64 * 8
+            ));
+        }
+        self.state
+            .emit_fmt(format_args!("    ld ra, {}(sp)", size - 8));
+        self.state
+            .emit_fmt(format_args!("    addi sp, sp, {}", size));
     }
 
     // ---- aligned_frame_size ----
@@ -454,8 +652,12 @@ impl RiscvCodegen {
             // already implies call-freeness.  That matters here: without a
             // prologue the return address stays in `ra`, so any call -- including
             // the hidden dynamic-TLS resolver -- would clobber it before the
-            // closing `ret`.
-            && self.riscv_caller_pool_eligible(func)
+            // closing `ret`.  The one exception: every call a sibling call
+            // (`every_call_is_sibling`), which leaves through `tail` with ra
+            // untouched.
+            && (self.riscv_caller_pool_eligible(func)
+                || (self.every_call_is_sibling(func)
+                    && self.riscv_emitter_safe_ir(func, false, true)))
             && {
                 let config = self.call_abi_config_impl();
                 let classes = crate::backend::call_abi::classify_params(func, &config);
@@ -487,7 +689,13 @@ impl RiscvCodegen {
             && !func.uses_sret
             && self.used_callee_saved.is_empty()
             && self.tls_resolver_only;
+        self.fp_less_frame =
+            !self.frameless_leaf && !self.ra_only_frame && self.fp_less_frame_ok(func);
         if self.frameless_leaf {
+            return;
+        }
+        if self.fp_less_frame {
+            self.emit_fp_less_prologue();
             return;
         }
         if self.ra_only_frame {
@@ -526,6 +734,10 @@ impl RiscvCodegen {
 
     pub(super) fn emit_epilogue_impl(&mut self, frame_size: i64) {
         if self.frameless_leaf {
+            return;
+        }
+        if self.fp_less_frame {
+            self.emit_fp_less_epilogue();
             return;
         }
         if self.ra_only_frame {
@@ -1264,6 +1476,11 @@ impl RiscvCodegen {
     pub(super) fn emit_epilogue_and_ret_impl(&mut self, frame_size: i64) {
         self.state.flush_epilogue_loc();
         if self.frameless_leaf {
+            self.state.emit("    ret");
+            return;
+        }
+        if self.fp_less_frame {
+            self.emit_fp_less_epilogue();
             self.state.emit("    ret");
             return;
         }

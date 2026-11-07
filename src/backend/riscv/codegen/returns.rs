@@ -6,6 +6,39 @@ use crate::ir::reexports::{IrConst, Operand, Value};
 
 impl RiscvCodegen {
     pub(super) fn emit_return_impl(&mut self, val: Option<&Operand>, frame_size: i64) {
+        // Sibling call: the trailing call was suppressed; this `Return` is
+        // its tail.  Restore the frame and jump: ra holds our caller's
+        // return address again, every argument is in its register, and the
+        // callee's result is ours.  The tail line carries the call's read
+        // annotation (`# lccc-call-reads`), which the peephole consumes and
+        // strips like a call's.
+        if let Some(crate::backend::state::SibcallPending::Ready { target, .. }) =
+            self.state.pending_sibcall.take()
+        {
+            self.state.flush_epilogue_loc();
+            self.emit_epilogue_impl(frame_size);
+            let note = self.sibcall_reads.take().map_or_else(String::new, |mask| {
+                format!("{}{}", super::peephole::CALL_READS_TAG, mask)
+            });
+            match target {
+                crate::backend::state::SibcallTarget::Direct(name) => {
+                    self.state
+                        .emit_fmt(format_args!("    tail {}{}", name, note));
+                }
+                crate::backend::state::SibcallTarget::Reg(reg) => {
+                    self.state.emit_fmt(format_args!("    jr {}{}", reg, note));
+                }
+                // The x86-64 `jmp *slot(%rip)` form: never armed by this
+                // backend (`emit_call_instruction_impl` builds `Direct` or
+                // `Reg` only).  Were it ever to reach here, the call it
+                // replaced is gone -- trap rather than fall off the end of
+                // the function.
+                crate::backend::state::SibcallTarget::RipSlot(_) => {
+                    self.state.emit("    ebreak");
+                }
+            }
+            return;
+        }
         if let Some(val) = val {
             // Flattened float struct: the IR returns the hidden buffer
             // pointer; the psABI wants the members in fa0/fa1/a0.

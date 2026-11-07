@@ -29,6 +29,9 @@ __attribute__((noinline)) i8 cas8(i8 *p, i8 e, i8 d) {
 __attribute__((noinline)) u32 casu32(u32 *p, u32 e, u32 d) {
     return __sync_val_compare_and_swap(p, e, d);
 }
+__attribute__((noinline)) u64 casu32_wide(u32 *p, u32 e, u32 d) {
+    return __sync_val_compare_and_swap(p, e, d);
+}
 __attribute__((noinline)) u32 loadu32(u32 *p) {
     return __atomic_load_n(p, __ATOMIC_SEQ_CST);
 }
@@ -108,17 +111,26 @@ fi
 if [ -x "$riscv" ]; then
     "$riscv" -O2 -S "$td/probe.c" -o "$td/riscv.s"
     casu=$(body "$td/riscv.s" casu32)
+    casw=$(body "$td/riscv.s" casu32_wide)
     load=$(body "$td/riscv.s" loadu32)
     store=$(body "$td/riscv.s" storeu32)
-    grep -q 'sext.w t2' <<<"$casu"
-    # The u32 truncation of the atomic results is the two-shift idiom
-    # (`slli .., 32` then `srli .., 32`), never a mask or a `lwu`.  The second
-    # shift's destination is the value's home: the accumulator-retarget
-    # peephole folds the trailing copy into it (`srli s1, t0, 32` instead of
-    # `srli t0, t0, 32` + `mv s1, t0`), so the gate pins the idiom and the
-    # chained register, not the home.
-    grep -q 'slli t0, t0, 32' <<<"$casu"
-    grep -qE 'srli [a-z][a-z0-9]*, t0, 32' <<<"$casu"
+    # `lr.w` sign-extends the loaded word, so the expected value is compared
+    # in that form: an explicit `sext.w t2, ..`, or the argument itself -- a
+    # u32 argument arrives sign-extended under the psABI (`mv t2, a1`).
+    grep -qE '^[[:space:]]+(sext\.w t2, [a-z][a-z0-9]*|mv t2, a1)$' <<<"$casu"
+    # Returned as `unsigned`, the result's psABI form is the sign extension
+    # of the loaded word: the truncation to u32 and the return's
+    # re-extension collapse into one `sext.w`, never a mask or a `lwu`.
+    grep -q 'sext.w a0, t0' <<<"$casu"
+    ! grep -qE '^[[:space:]]+(andi|lwu) ' <<<"$casu" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
+    # Widened to u64, the u32 truncation is the two-shift idiom (`slli ..,
+    # 32` then `srli .., 32`), never a mask or a `lwu`.  The shifts' register
+    # is the value's home (the accumulator-retarget peephole folds the
+    # trailing copy into it), so the gate pins the idiom and the chained
+    # register, not the home.
+    grep -qE 'slli ([a-z][a-z0-9]*), t0, 32' <<<"$casw"
+    grep -qE 'srli ([a-z][a-z0-9]*), (\1|t0), 32' <<<"$casw"
+    ! grep -qE '^[[:space:]]+(andi|lwu) ' <<<"$casw" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
     grep -q 'lwu t0, 0(t0)' <<<"$load"
     ! grep -q 'lr.w' <<<"$load" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
     grep -q 'sw t1, 0(t0)' <<<"$store"

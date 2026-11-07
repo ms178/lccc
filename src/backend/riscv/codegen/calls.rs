@@ -6,9 +6,135 @@ use crate::backend::generation::is_i128_type;
 use crate::common::types::IrType;
 use crate::ir::reexports::{IrConst, Operand, Value};
 
+/// The psABI GP argument registers (bit k = a_k) a call with these argument
+/// classes passes values in, or `None` when a class could use a GP register
+/// this does not model -- the call is then published without the annotation
+/// and the peephole keeps assuming it reads every caller-saved register.
+/// Pairs (`__int128`, `long double`, a 9..16-byte struct) take two
+/// consecutive registers; a struct split across the last register and the
+/// stack takes that register.  FP-register, stack and zero-size classes name
+/// no GP register.
+pub(super) fn rv_call_gp_arg_reads(arg_classes: &[CallArgClass]) -> Option<u8> {
+    let mut mask = 0u16;
+    for class in arg_classes {
+        let (base, count) = match *class {
+            CallArgClass::IntReg { reg_idx } => (reg_idx, 1),
+            CallArgClass::I128RegPair { base_reg_idx } => (base_reg_idx, 2),
+            CallArgClass::F128Reg { reg_idx } => (reg_idx, 2),
+            CallArgClass::StructByValReg { base_reg_idx, size } => {
+                (base_reg_idx, size.div_ceil(8).clamp(1, 2))
+            }
+            CallArgClass::StructSplitRegStack { reg_idx, .. } => (reg_idx, 1),
+            CallArgClass::FloatReg { .. }
+            | CallArgClass::StructSseReg { .. }
+            | CallArgClass::Stack
+            | CallArgClass::F128Stack
+            | CallArgClass::I128Stack
+            | CallArgClass::StructByValStack { .. }
+            | CallArgClass::LargeStructStack { .. }
+            | CallArgClass::ZeroSizeSkip => continue,
+            _ => return None,
+        };
+        let end = base.checked_add(count).filter(|&end| end <= 8)?;
+        for reg in base..end {
+            mask |= 1 << reg;
+        }
+    }
+    u8::try_from(mask).ok()
+}
+
+/// A type whose value travels in one GP or one FP register and whose call
+/// setup and result handling never call a helper: the argument and result
+/// types a sibling call of a frameless function may have (the AArch64
+/// backend's `sibcall_scalar`).
+pub(super) fn rv_sibcall_scalar(ty: IrType) -> bool {
+    matches!(
+        ty,
+        IrType::I8
+            | IrType::I16
+            | IrType::I32
+            | IrType::I64
+            | IrType::U8
+            | IrType::U16
+            | IrType::U32
+            | IrType::U64
+            | IrType::F32
+            | IrType::F64
+            | IrType::Ptr
+    )
+}
+
 impl RiscvCodegen {
     pub(super) fn call_abi_config_impl(&self) -> CallAbiConfig {
         CallAbiConfig::riscv_lp64d()
+    }
+
+    /// The psABI sibling-call refusals of a call site (the AArch64 and
+    /// x86-64 `sibcall_abi_admits`, ported): whether the site may become
+    /// `<epilogue>; tail target`.  The arming below and the frameless
+    /// prediction (`every_call_is_sibling`) share it, so they never
+    /// disagree.
+    ///
+    /// The soundness core is the zero-stack-argument guard: with every
+    /// argument in a0-a7/fa0-fa7 (the epilogue restores only s0-s11, ra and
+    /// sp), the callee reads nothing of this frame, which the epilogue
+    /// releases.  The function-level guards of `sibcall_function_use_counts`
+    /// (no used local alloca, no dynamic stack, no inline asm) and the
+    /// driver's block-tail shape (`sibcall_block_hint`) are the rest of the
+    /// proof.  Refused besides: non-default calling conventions; variadic
+    /// callees (the unnamed FP arguments travel in GP registers) and a
+    /// variadic caller (its register save area sits above s0, against the
+    /// caller's own stack arguments); sret; a function returning through a
+    /// hidden buffer or a 16-bit FP carrier (its return sequence does work
+    /// after the call); and results other than the same scalar or 2xXLEN
+    /// value in the same registers as this function's own.
+    pub(super) fn sibcall_abi_admits(&self, info: &crate::ir::reexports::CallInfo) -> bool {
+        use crate::common::types::CallingConvention;
+        if info.calling_convention != CallingConvention::Default
+            || self.state.func_calling_convention != CallingConvention::Default
+            || info.is_variadic
+            || self.is_variadic
+            || info.is_sret
+            || info.is_fastcall
+            || info.regparm.is_some()
+            || info.ret_is_f128_sse
+            || self.state.uses_sret
+            || self.fp_ret_buffer.is_some()
+            || self.func_ret_is_f128_sse
+        {
+            return false;
+        }
+        let ours = self.current_return_type;
+        let result_ok = ours == IrType::Void
+            || (info.return_type == ours && (rv_sibcall_scalar(ours) || is_i128_type(ours)));
+        if !result_ok {
+            return false;
+        }
+        let classes = crate::backend::call_abi::classify_call_args(
+            &info.args,
+            &info.arg_types,
+            &info.struct_arg_sizes,
+            &info.struct_arg_aligns,
+            &info.struct_arg_classes,
+            &info.struct_arg_fp_agg_classes,
+            &info.struct_arg_is_f128_sse,
+            None,
+            &self.call_abi_config_impl(),
+        );
+        classes.len() == info.args.len() && !classes.iter().any(CallArgClass::is_stack)
+    }
+
+    pub(super) fn riscv_sibcall_candidate_impl(&mut self, info: &crate::ir::reexports::CallInfo) {
+        // One conversion in flight at a time; `emit_return_impl` consumes it
+        // before the next block begins.
+        if self.state.pending_sibcall.is_some() {
+            return;
+        }
+        if self.sibcall_abi_admits(info) {
+            self.state.pending_sibcall = Some(crate::backend::state::SibcallPending::Armed {
+                preserve_upper_vector_lanes: false,
+            });
+        }
     }
 
     pub(super) fn emit_call_compute_stack_space_impl(
@@ -349,6 +475,7 @@ impl RiscvCodegen {
         struct_arg_fp_agg_classes: &[Option<crate::common::types::FpAggClass>],
     ) {
         let float_arg_regs = ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
+        self.call_gp_reads = rv_call_gp_arg_reads(arg_classes);
 
         // GP arg staging strategy: use only caller-saved temp registers (t3, t4, t5)
         // for staging, avoiding callee-saved s2-s6. This allows s2-s6 to be used
@@ -358,9 +485,11 @@ impl RiscvCodegen {
         // Phase 2: Move staged values to target a-registers.
         // Phase 3: Load remaining GP args (4th+) directly into target a-registers.
         //
-        // Phase 3 is safe because operand_to_t0 only reads from stack slots or
-        // callee-saved registers (never from a-registers), so writing to a-registers
-        // in Phase 2 doesn't conflict with loading sources in Phase 3.
+        // Phase 3 reads its sources after Phase 2 (and the earlier Phase 3
+        // loads) wrote a0..a{k-1}: the allocator never homes such a source in
+        // one of those registers (`riscv_call_staging_depths` gives GP
+        // argument k >= 3 depth k; the first three, read in Phase 1 before
+        // any a-register is written, depth 0).
         let temp_regs = ["t3", "t4", "t5"];
         let mut staged_gp: Vec<(usize, &str)> = Vec::new(); // (target_reg_idx, temp_reg)
         let mut deferred_gp: Vec<(usize, usize)> = Vec::new(); // (target_reg_idx, arg_index)
@@ -435,9 +564,8 @@ impl RiscvCodegen {
             ));
         }
 
-        // Phase 3: Load deferred GP args directly into target a-registers.
-        // This is safe because operand_to_t0 reads from s0-relative stack slots
-        // or callee-saved s-registers, never from a-registers. Invalidate the
+        // Phase 3: Load deferred GP args directly into target a-registers
+        // (sound by the staging-hazard depths, see above). Invalidate the
         // accumulator cache first since Phase 2 emissions may have left stale
         // cache entries.
         if !deferred_gp.is_empty() {
@@ -741,12 +869,76 @@ impl RiscvCodegen {
         _indirect: bool,
         _stack_arg_space: usize,
     ) {
+        // Taken on every path: a stale set must never reach a later call.
+        // The static chain armed by the `SetStaticChain` just before this
+        // call (its IR position) is t2, bit 8 of the annotation.
+        let chain = std::mem::take(&mut self.static_chain_armed);
+        let reads = self.call_gp_reads.take().map(|mask| {
+            u16::from(mask)
+                | if chain {
+                    super::peephole::CALL_READS_CHAIN as u16
+                } else {
+                    0
+                }
+        });
+        // Sibling call: the argument setup ran unchanged; the call itself is
+        // replaced by the block's `Return` emitting `<epilogue>; tail target`
+        // (or `jr t2`: the epilogue touches only t0 and t6 besides the
+        // registers it restores).  The call's read annotation travels to the
+        // tail line.
+        if matches!(
+            self.state.pending_sibcall,
+            Some(crate::backend::state::SibcallPending::Armed { .. })
+        ) {
+            use crate::backend::state::{SibcallPending, SibcallTarget};
+            let target = if let Some(name) = direct_name {
+                Some(SibcallTarget::Direct(name.to_string()))
+            } else if let Some(ptr) = func_ptr {
+                self.operand_to_t0(ptr);
+                self.state.emit("    mv t2, t0");
+                Some(SibcallTarget::Reg("t2"))
+            } else {
+                None
+            };
+            if let Some(target) = target {
+                self.sibcall_reads = reads;
+                self.state.pending_sibcall = Some(SibcallPending::Ready {
+                    target,
+                    preserve_upper_vector_lanes: false,
+                });
+                return;
+            }
+            self.state.pending_sibcall = None;
+        }
+        // A frameless function was planned on the prediction that every
+        // call becomes a sibling call (`every_call_is_sibling`); should a
+        // call ever be emitted anyway, ra is preserved around it rather than
+        // returning through a clobbered link register.  (Such a call has no
+        // stack arguments -- `sibcall_abi_admits` passed it -- so moving sp
+        // by the 16 bytes the psABI alignment keeps cannot misplace any.)
+        let guard_link = self.frameless_leaf;
+        if guard_link {
+            self.state.emit("    addi sp, sp, -16");
+            self.state.emit("    sd ra, 8(sp)");
+        }
         if let Some(name) = direct_name {
-            self.state.emit_fmt(format_args!("    call {}", name));
+            match reads {
+                Some(mask) => self.state.emit_fmt(format_args!(
+                    "    call {}{}{}",
+                    name,
+                    super::peephole::CALL_READS_TAG,
+                    mask
+                )),
+                None => self.state.emit_fmt(format_args!("    call {}", name)),
+            }
         } else if let Some(ptr) = func_ptr {
             self.operand_to_t0(ptr);
             self.state.emit("    mv t2, t0");
             self.state.emit("    jalr ra, t2, 0");
+        }
+        if guard_link {
+            self.state.emit("    ld ra, 8(sp)");
+            self.state.emit("    addi sp, sp, 16");
         }
     }
 
@@ -765,6 +957,13 @@ impl RiscvCodegen {
         }
     }
 
+    /// Load the float member `size` bytes wide at `offset(t0)` of a struct
+    /// argument into `freg`.  A half (no Zfh in the baseline) is NaN-boxed
+    /// through t1/t3: this runs after the GP staging, so the t3-t5 staging
+    /// temporaries are free, while t2 may hold the static chain a
+    /// `SetStaticChain` armed for this very call (bit 8 of its read
+    /// annotation) -- `lui t2, 0xffff0` here destroyed the chain of a direct
+    /// nested-function call passing a `struct { _Float16 h; float f; }`.
     fn emit_load_riscv_fp_field(&mut self, freg: &str, offset: usize, size: u8) {
         match size {
             8 => {
@@ -774,8 +973,8 @@ impl RiscvCodegen {
             2 => {
                 self.state
                     .emit_fmt(format_args!("    lhu t1, {}(t0)", offset));
-                self.state.emit("    lui t2, 0xffff0");
-                self.state.emit("    or t1, t1, t2");
+                self.state.emit("    lui t3, 0xffff0");
+                self.state.emit("    or t1, t1, t3");
                 self.state
                     .emit_fmt(format_args!("    fmv.w.x {}, t1", freg));
             }
@@ -787,7 +986,10 @@ impl RiscvCodegen {
     }
 
     pub(super) fn emit_call_store_result_impl(&mut self, dest: &Value, return_type: IrType) {
-        if return_type == IrType::Void {
+        // Sibling call: the result is never materialised -- the tail
+        // callee's exit is this function's, its result registers already
+        // hold what our `Return` hands over.
+        if return_type == IrType::Void || self.state.pending_sibcall.is_some() {
             return;
         }
         if self.call_ret_is_f128_sse && return_type == IrType::U16 {

@@ -782,17 +782,23 @@ fn assign_program_points(
     let mut cold_call_results: Vec<Option<u32>> = Vec::new();
     let mut touches = BlockTouches::new(num_values);
 
+    let return_tail_exempt = return_tail_calls_exempt();
     for (block_idx, block) in func.blocks.iter().enumerate() {
         block_id_to_idx.insert(block.label.0, block_idx);
         block_start_points.push(point);
         let mut gen_set = BitSet::new(num_values);
         let mut kill = BitSet::new(num_values);
+        let tail_call = if return_tail_exempt {
+            return_tail_call_index(block)
+        } else {
+            None
+        };
 
-        for inst in &block.instructions {
+        for (inst_idx, inst) in block.instructions.iter().enumerate() {
             if is_returns_twice_call(inst) || matches!(inst, Instruction::NonlocalGotoSave { .. }) {
                 setjmp_points.push(point);
             }
-            if instruction_is_call_point(inst) {
+            if instruction_is_call_point(inst) && tail_call != Some(inst_idx) {
                 call_points.push(point);
                 if matches!(inst, Instruction::GlobalAddr { .. }) {
                     sequence_call_points.push(point);
@@ -973,6 +979,44 @@ fn assign_program_points(
         cold_call_results,
         num_points: point,
         touches,
+    }
+}
+
+/// Whether return-tail calls leave the call points (`return_tail_call_index`):
+/// AArch64 and RISC-V, whose sibling calls and allocators were measured with
+/// it.  x86 keeps its established spanning model.
+fn return_tail_calls_exempt() -> bool {
+    const EM_AARCH64: u16 = 183;
+    const EM_RISCV: u16 = 243;
+    matches!(
+        crate::common::types::target_elf_machine(),
+        EM_AARCH64 | EM_RISCV
+    )
+}
+
+/// The index of a call that ends `block` and is followed only by a `Return`
+/// of nothing, of a constant or of the call's own result.  No value is live
+/// across such a call on any path -- control leaves the function right after
+/// it, reading at most the result the call defines -- so it is not a point a
+/// live range can span: a value whose interval merely contains it (live in a
+/// later-laid-out block of another path, `cond_tail`'s `b`) needs no
+/// callee-saved home for it.  Exact whether or not the call becomes a
+/// sibling call.  A returns-twice callee is excluded: its second return
+/// re-enters with this frame's values.
+fn return_tail_call_index(block: &crate::ir::reexports::BasicBlock) -> Option<usize> {
+    let idx = block.instructions.len().checked_sub(1)?;
+    let last = &block.instructions[idx];
+    if is_returns_twice_call(last) {
+        return None;
+    }
+    let dest = match last {
+        Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => info.dest,
+        _ => return None,
+    };
+    match &block.terminator {
+        Terminator::Return(None) | Terminator::Return(Some(Operand::Const(_))) => Some(idx),
+        Terminator::Return(Some(Operand::Value(v))) if Some(*v) == dest => Some(idx),
+        _ => None,
     }
 }
 

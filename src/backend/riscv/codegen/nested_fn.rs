@@ -76,6 +76,8 @@ impl RiscvCodegen {
     pub(super) fn emit_set_static_chain_impl(&mut self, src: &Operand) {
         self.operand_to_t0(src);
         self.state.emit("    mv t2, t0");
+        // The next call reads t2 (its `CALL_READS_TAG` says so).
+        self.static_chain_armed = true;
     }
 
     /// `InitTrampoline`: write the 32-byte trampoline into `buffer`

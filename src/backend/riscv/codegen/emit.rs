@@ -180,6 +180,22 @@ pub struct RiscvCodegen {
     pub(super) current_frame_size: i64,
     /// Whether the current function is variadic.
     pub(super) is_variadic: bool,
+    /// The GP argument registers (bit k = a_k) the call being emitted
+    /// passes values in, armed by `emit_call_reg_args_impl` from the
+    /// authoritative `CallArgClass` list and published on the call line as
+    /// the peephole's `CALL_READS_TAG` annotation.  `None`: a class this
+    /// does not model, so the call is published unannotated and the
+    /// peephole keeps assuming it reads every caller-saved register.
+    pub(super) call_gp_reads: Option<u8>,
+    /// The suppressed call's annotation mask (`call_gp_reads`, plus
+    /// `CALL_READS_CHAIN`), for the sibling call's tail line
+    /// (`emit_return_impl`).
+    pub(super) sibcall_reads: Option<u16>,
+    /// A `SetStaticChain` wrote t2 for the next call (the IR places it
+    /// immediately before the call it serves); taken by
+    /// `emit_call_instruction_impl`, which publishes it as
+    /// `CALL_READS_CHAIN`.
+    pub(super) static_chain_armed: bool,
     /// Scratch register indices for inline asm allocation.
     pub(super) asm_gp_scratch_idx: usize,
     pub(super) asm_fp_scratch_idx: usize,
@@ -210,6 +226,12 @@ pub struct RiscvCodegen {
     /// A hidden TLS resolver call needs `ra` saved, but when there are no
     /// stack slots or callee-saved value homes it does not need an s0 frame.
     pub(super) ra_only_frame: bool,
+    /// No value slot, alloca or return buffer: the frame is the frame record
+    /// and the callee saves alone (set with the frame size).
+    pub(super) slot_free: bool,
+    /// The frame-pointer-free frame of `fp_less_frame_ok`: ra and the
+    /// callee-saved registers, sp-relative, no s0 setup.
+    pub(super) fp_less_frame: bool,
     /// The current function returns a flattened float struct in fa0/fa1/a0
     /// (`call_abi::hidden_fp_agg_return`): the s0-relative offset of the
     /// private buffer its hidden return pointer is homed as, and the class.
@@ -232,6 +254,9 @@ impl RiscvCodegen {
             bitop_nonneg_values: FxHashSet::default(),
             current_frame_size: 0,
             is_variadic: false,
+            call_gp_reads: None,
+            sibcall_reads: None,
+            static_chain_armed: false,
             asm_gp_scratch_idx: 0,
             asm_fp_scratch_idx: 0,
             asm_borrowed_callee_saved: Vec::new(),
@@ -242,6 +267,8 @@ impl RiscvCodegen {
             frameless_leaf: false,
             tls_resolver_only: false,
             ra_only_frame: false,
+            slot_free: false,
+            fp_less_frame: false,
             fp_ret_buffer: None,
         }
     }
@@ -370,6 +397,17 @@ impl RiscvCodegen {
     }
 
     /// Emit: load from `offset(s0)` into `reg`, handling large offsets via t6.
+    /// A switch-tree constant in the register form the tree compares: a
+    /// word sign-extended (what `li` of the 32-bit value builds), a
+    /// doubleword as is.
+    fn switch_tree_constant(value: i64, ty: IrType) -> i64 {
+        if matches!(ty, IrType::I32 | IrType::U32) {
+            i64::from(value as i32)
+        } else {
+            value
+        }
+    }
+
     pub(super) fn emit_load_from_s0(&mut self, reg: &str, offset: i64, load_instr: &str) {
         if Self::fits_imm12(offset) {
             self.state
@@ -837,7 +875,7 @@ impl ArchCodegen for RiscvCodegen {
         // The ordinary prologue sets s0 (DWARF fp, register 8) to the top of
         // the frame and every stack slot is an s0-relative displacement.  The
         // frameless leaf and RA-only TLS frames never establish s0.
-        (!self.frameless_leaf && !self.ra_only_frame).then_some((8, slot.0))
+        (!self.frameless_leaf && !self.ra_only_frame && !self.fp_less_frame).then_some((8, slot.0))
     }
 
     /// Provenance markers for user inline-asm bodies: `#APP`/`#NO_APP`, as
@@ -1018,6 +1056,101 @@ impl ArchCodegen for RiscvCodegen {
         }
         self.state.emit_fmt(format_args!("    jump {}, t6", label));
         self.state.emit_fmt(format_args!("{}:", skip));
+    }
+
+    fn supports_switch_tree(&self, ty: IrType) -> bool {
+        matches!(
+            ty,
+            IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64 | IrType::Ptr
+        )
+    }
+
+    fn emit_switch_tree_load(&mut self, val: &Operand, ty: IrType) {
+        self.operand_to_t0(val);
+        if matches!(ty, IrType::I32 | IrType::U32) {
+            // Every compare reads the word sign-extended once, as `li`
+            // builds the case constants (a U32 value lives zero-extended;
+            // sign extension keeps equality and the unsigned order alike).
+            // The chain extends into t2 at every case instead.
+            self.state.emit("    sext.w t0, t0");
+            self.state.reg_cache.invalidate_acc();
+        }
+    }
+
+    fn emit_switch_tree_eq(&mut self, value: i64, label: &str, ty: IrType) {
+        let value = Self::switch_tree_constant(value, ty);
+        let skip = self.state.fresh_label("sw_skip");
+        if value == 0 {
+            self.state.emit_fmt(format_args!("    bnez t0, {skip}"));
+        } else {
+            self.state.emit_fmt(format_args!("    li t1, {value}"));
+            self.state.emit_fmt(format_args!("    bne t0, t1, {skip}"));
+        }
+        self.state.emit_fmt(format_args!("    jump {label}, t6"));
+        self.state.emit_fmt(format_args!("{skip}:"));
+    }
+
+    fn emit_switch_tree_below(&mut self, pivot: i64, label: &str, ty: IrType) {
+        let pivot = Self::switch_tree_constant(pivot, ty);
+        let unsigned = ty.is_unsigned() || ty == IrType::Ptr;
+        let skip = self.state.fresh_label("sw_skip");
+        if pivot == 0 && !unsigned {
+            self.state.emit_fmt(format_args!("    bgez t0, {skip}"));
+        } else {
+            let op = if unsigned { "bgeu" } else { "bge" };
+            self.state.emit_fmt(format_args!("    li t1, {pivot}"));
+            self.state.emit_fmt(format_args!("    {op} t0, t1, {skip}"));
+        }
+        self.state.emit_fmt(format_args!("    jump {label}, t6"));
+        self.state.emit_fmt(format_args!("{skip}:"));
+    }
+
+    fn emit_switch_tree_below_or_eq(&mut self, pivot: i64, below: &str, equal: &str, ty: IrType) {
+        // The pivot `below` loaded into t1 serves the equality test too.
+        let value = Self::switch_tree_constant(pivot, ty);
+        self.emit_switch_tree_below(pivot, below, ty);
+        let skip = self.state.fresh_label("sw_skip");
+        if value == 0 && !(ty.is_unsigned() || ty == IrType::Ptr) {
+            self.state.emit_fmt(format_args!("    bnez t0, {skip}"));
+        } else {
+            self.state.emit_fmt(format_args!("    bne t0, t1, {skip}"));
+        }
+        self.state.emit_fmt(format_args!("    jump {equal}, t6"));
+        self.state.emit_fmt(format_args!("{skip}:"));
+    }
+
+    fn emit_switch_tree_range(&mut self, lo: i64, hi: i64, label: &str, ty: IrType) {
+        // `lo <= x <= hi` as `(x - lo) <=u (hi - lo)`.  A word difference
+        // is the sign extension of the 32-bit one, which compares like it
+        // against a span below 2^31 (a cluster is a list of case values);
+        // a wider span zero-extends it first.
+        let word = matches!(ty, IrType::I32 | IrType::U32);
+        let (lo, hi) = (
+            Self::switch_tree_constant(lo, ty),
+            Self::switch_tree_constant(hi, ty),
+        );
+        let span = if word {
+            i64::from((hi as i32).wrapping_sub(lo as i32) as u32)
+        } else {
+            hi.wrapping_sub(lo)
+        };
+        let w = if word { "w" } else { "" };
+        match lo.checked_neg().filter(|d| (-2048..=2047).contains(d)) {
+            Some(d) => self.state.emit_fmt(format_args!("    addi{w} t2, t0, {d}")),
+            None => {
+                self.state.emit_fmt(format_args!("    li t2, {lo}"));
+                self.state.emit_fmt(format_args!("    sub{w} t2, t0, t2"));
+            }
+        }
+        if word && span > i64::from(i32::MAX) {
+            self.state.emit("    slli t2, t2, 32");
+            self.state.emit("    srli t2, t2, 32");
+        }
+        let skip = self.state.fresh_label("sw_skip");
+        self.state.emit_fmt(format_args!("    li t1, {span}"));
+        self.state.emit_fmt(format_args!("    bltu t1, t2, {skip}"));
+        self.state.emit_fmt(format_args!("    jump {label}, t6"));
+        self.state.emit_fmt(format_args!("{skip}:"));
     }
 
     fn emit_switch_jump_table(
@@ -1307,6 +1440,7 @@ impl ArchCodegen for RiscvCodegen {
         fn emit_call_instruction(&mut self, direct_name: Option<&str>, func_ptr: Option<&Operand>, indirect: bool, stack_arg_space: usize) => emit_call_instruction_impl;
         fn emit_call_cleanup(&mut self, stack_arg_space: usize, f128_temp_space: usize, indirect: bool) => emit_call_cleanup_impl;
         fn emit_call_store_result(&mut self, dest: &Value, return_type: IrType) => emit_call_store_result_impl;
+        fn arm_sibcall_candidate(&mut self, info: &crate::ir::reexports::CallInfo) => riscv_sibcall_candidate_impl;
         fn emit_call_store_fp_agg_return(&mut self, buffer: &Operand, class: crate::common::types::FpAggClass, dest: Option<&Value>) => emit_call_store_fp_agg_return_impl;
         // globals
         fn emit_global_addr(&mut self, dest: &Value, name: &str) => emit_global_addr_impl;

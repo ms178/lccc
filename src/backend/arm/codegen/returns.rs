@@ -8,6 +8,36 @@ use crate::ir::reexports::{Operand, Value};
 
 impl ArmCodegen {
     pub(super) fn emit_return_impl(&mut self, val: Option<&Operand>, frame_size: i64) {
+        // Sibling call: the trailing call's `bl` was suppressed; this
+        // `Return` is its tail.  Restore the frame and branch: the link
+        // register holds our caller's return address again, every argument
+        // is in its register, and the callee's result is ours.
+        if let Some(crate::backend::state::SibcallPending::Ready { target, .. }) =
+            self.state.pending_sibcall.take()
+        {
+            self.state.flush_epilogue_loc();
+            self.emit_epilogue_impl(frame_size);
+            for line in std::mem::take(&mut self.state.sibcall_marker_lines) {
+                self.state.emit(&line);
+            }
+            match target {
+                crate::backend::state::SibcallTarget::Direct(name) => {
+                    self.state.emit_fmt(format_args!("    b {}", name));
+                }
+                crate::backend::state::SibcallTarget::Reg(reg) => {
+                    self.state.emit_fmt(format_args!("    br {}", reg));
+                }
+                // The x86-64 `jmp *slot(%rip)` form: never armed by this
+                // backend (`emit_call_instruction_impl` builds `Direct` or
+                // `Reg` only).  Were it ever to reach here, the call it
+                // replaced is gone -- trap rather than fall off the end of
+                // the function.
+                crate::backend::state::SibcallTarget::RipSlot(_) => {
+                    self.state.emit("    brk #0");
+                }
+            }
+            return;
+        }
         if let Some(val) = val {
             // HFA/HVA/short-vector result: the IR returns the hidden buffer
             // pointer; AAPCS64 wants the members in v0..v3.
