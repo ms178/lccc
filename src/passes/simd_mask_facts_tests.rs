@@ -3120,3 +3120,1572 @@ fn mention_index_sees_cross_block_writes() {
         "a write in a later block must be visible to the mention index"
     );
 }
+
+// ===========================================================================
+// Round 5: algebraic mask identities, legacy zero producers and constant
+// packed-integer compares.  Every positive rule has a paired mutation that
+// MUST refuse; every oracle is computed independently of the pass.
+// ===========================================================================
+
+const ALG_A: u32 = 200;
+const ALG_Z: u32 = 201;
+const ALG_D: u32 = 202;
+const ALG_RESULT: u32 = 203;
+const ALG_VEC: u32 = 204;
+const ALG_ZVEC: u32 = 205;
+
+/// `movemask(op(dest_ptr = ALG_D, args))` with three private objects.  `ALG_A`
+/// is deliberately left UNWRITTEN: it has no provable constant image, so any
+/// fold can only come from an algebraic identity or an absorbing constant.
+fn algebraic_function(
+    op: IntrinsicOp,
+    args: Vec<Operand>,
+    prologue: Vec<Instruction>,
+    a_volatile: bool,
+    object_size: usize,
+    movemask: IntrinsicOp,
+) -> IrFunction {
+    let mut insts = vec![
+        alloca(Value(ALG_A), object_size, a_volatile, false),
+        alloca(Value(ALG_Z), object_size, false, false),
+        alloca(Value(ALG_D), object_size, false, false),
+    ];
+    insts.extend(prologue);
+    insts.push(intrinsic(
+        Some(Value(ALG_VEC)),
+        op,
+        Some(Value(ALG_D)),
+        args,
+    ));
+    insts.push(intrinsic(
+        Some(Value(ALG_RESULT)),
+        movemask,
+        None,
+        vec![Operand::Value(Value(ALG_D))],
+    ));
+    let mut f = IrFunction::new("algebraic".into(), IrType::I32, vec![], false);
+    f.blocks.push(block(
+        insts,
+        Terminator::Return(Some(Operand::Value(Value(ALG_RESULT)))),
+        true,
+    ));
+    f.next_value_id = 300;
+    f
+}
+
+fn zero_producer(op: IntrinsicOp) -> Vec<Instruction> {
+    vec![intrinsic(
+        Some(Value(ALG_ZVEC)),
+        op,
+        Some(Value(ALG_Z)),
+        vec![],
+    )]
+}
+
+fn splat_producer(op: IntrinsicOp, byte: i8) -> Vec<Instruction> {
+    vec![intrinsic(
+        Some(Value(ALG_ZVEC)),
+        op,
+        Some(Value(ALG_Z)),
+        vec![Operand::Const(IrConst::I8(byte))],
+    )]
+}
+
+/// Independent oracle for `combine_byte_logic`'s element-wise rule.
+fn oracle_byte(op: ByteOp, x: u8, y: u8) -> u8 {
+    match op {
+        ByteOp::And => x & y,
+        ByteOp::Or => x | y,
+        ByteOp::Xor => x ^ y,
+        ByteOp::Eq => u8::from(x == y) * 0xFF,
+    }
+}
+
+fn pseudo_bytes(width: usize, seed: u32) -> Vec<u8> {
+    (0..width)
+        .map(|i| {
+            let h = seed
+                .wrapping_mul(0x9E37_79B9)
+                .wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
+            (h >> 24) as u8
+        })
+        .collect()
+}
+
+#[test]
+fn algebraic_lattice_is_exact_for_every_rule_and_every_byte_op() {
+    let ops = [ByteOp::And, ByteOp::Or, ByteOp::Xor, ByteOp::Eq];
+    for &width in &[16usize, 32usize] {
+        for &kind in &ops {
+            let a = pseudo_bytes(width, 0x1234_5678 ^ width as u32);
+            let b = pseudo_bytes(width, 0xDEAD_BEEF ^ width as u32);
+            // Rule 1: both images known -> exact element-wise function.
+            let expected: Vec<u8> = a
+                .iter()
+                .copied()
+                .zip(b.iter().copied())
+                .map(|(x, y)| oracle_byte(kind, x, y))
+                .collect();
+            assert_eq!(
+                combine_byte_logic(kind, width, Some(a.clone()), Some(b.clone()), false),
+                Some(expected.clone()),
+                "rule 1 (both known), {kind:?}, width {width}"
+            );
+            // `same` with both known must still be exact (no shortcut lies).
+            assert_eq!(
+                combine_byte_logic(kind, width, Some(a.clone()), Some(a.clone()), true),
+                Some(
+                    a.iter()
+                        .copied()
+                        .zip(a.iter().copied())
+                        .map(|(x, y)| oracle_byte(kind, x, y))
+                        .collect::<Vec<u8>>()
+                ),
+                "rule 1 wins over rule 2, {kind:?}, width {width}"
+            );
+            // Rule 2: one PURE operand used twice, no image at all.
+            let none = combine_byte_logic(kind, width, None, None, true);
+            match kind {
+                ByteOp::Xor => assert_eq!(none, Some(vec![0u8; width])),
+                ByteOp::Eq => assert_eq!(none, Some(vec![0xFF; width])),
+                ByteOp::And | ByteOp::Or => assert_eq!(none, None, "x&x/x|x need an image"),
+            }
+            // `x&x` and `x|x` return the single proven image unchanged.
+            let one = combine_byte_logic(kind, width, Some(a.clone()), None, true);
+            match kind {
+                ByteOp::Xor => assert_eq!(one, Some(vec![0u8; width])),
+                ByteOp::Eq => assert_eq!(one, Some(vec![0xFF; width])),
+                ByteOp::And | ByteOp::Or => assert_eq!(one, Some(a.clone())),
+            }
+            // Rule 3: absorbing constants, one image known.
+            let zeros = vec![0u8; width];
+            let ones = vec![0xFF; width];
+            let and_zero = combine_byte_logic(ByteOp::And, width, Some(zeros.clone()), None, false);
+            let or_one = combine_byte_logic(ByteOp::Or, width, None, Some(ones.clone()), false);
+            assert_eq!(and_zero, Some(zeros.clone()), "x&0 = 0");
+            assert_eq!(or_one, Some(ones.clone()), "x|-1 = -1");
+            // Non-absorbing combinations MUST refuse: an absorbing rule that
+            // fires on the wrong byte value would be a miscompile.
+            assert_eq!(
+                combine_byte_logic(ByteOp::And, width, Some(ones.clone()), None, false),
+                None,
+                "x&-1 is x, not a constant"
+            );
+            assert_eq!(
+                combine_byte_logic(ByteOp::Or, width, Some(zeros), None, false),
+                None,
+                "x|0 is x, not a constant"
+            );
+            assert_eq!(
+                combine_byte_logic(ByteOp::Xor, width, Some(a.clone()), None, false),
+                None,
+                "x^a needs a"
+            );
+            assert_eq!(
+                combine_byte_logic(ByteOp::Eq, width, Some(ones), None, false),
+                None,
+                "x==-1 needs x"
+            );
+            assert_eq!(
+                combine_byte_logic(kind, width, None, None, false),
+                None,
+                "no evidence, no fold, {kind:?}"
+            );
+        }
+    }
+    // Width and length guards: no out-of-bounds indexing, no silent truncate.
+    assert_eq!(combine_byte_logic(ByteOp::Xor, 0, None, None, true), None);
+    assert_eq!(combine_byte_logic(ByteOp::Xor, 33, None, None, true), None);
+    assert_eq!(
+        combine_byte_logic(ByteOp::And, 16, Some(vec![0; 8]), Some(vec![0; 8]), false),
+        None
+    );
+    assert_eq!(
+        combine_byte_logic(ByteOp::And, 16, Some(vec![0; 8]), None, false),
+        None
+    );
+}
+
+#[test]
+fn self_identities_fold_runtime_vectors_without_any_constant_image() {
+    // `x^x = 0` and `x==x = -1` need NO operand image.  Measured before this
+    // change: LCCC kept a `pmovmskb` for each, GCC 16.2 / Clang 23.1.5 folded
+    // all four to immediates.
+    let cases: [(IntrinsicOp, usize, IntrinsicOp, i32); 4] = [
+        (IntrinsicOp::Pxor128, 16, IntrinsicOp::Pmovmskb128, 0),
+        (
+            IntrinsicOp::Pcmpeqb128,
+            16,
+            IntrinsicOp::Pmovmskb128,
+            0xFFFF,
+        ),
+        (IntrinsicOp::Pxor256, 32, IntrinsicOp::Pmovmskb256, 0),
+        (
+            IntrinsicOp::Pcmpeqb256,
+            32,
+            IntrinsicOp::Pmovmskb256,
+            u32::MAX as i32,
+        ),
+    ];
+    for (op, width, movemask, expected) in cases {
+        let args = vec![Operand::Value(Value(ALG_A)), Operand::Value(Value(ALG_A))];
+        let mut f = algebraic_function(op, args, vec![], false, width, movemask);
+        assert_eq!(
+            movemask_result_after(&mut f, Value(ALG_RESULT)),
+            Some(expected),
+            "{op:?} self-identity must fold to {expected}"
+        );
+        assert!(
+            !f.blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Intrinsic { op: m, .. } if *m == movemask)),
+            "{op:?} must remove the runtime movemask"
+        );
+    }
+}
+
+#[test]
+fn self_identities_refuse_volatile_and_unproven_operands() {
+    // A volatile object can change between the intrinsic's two reads, so
+    // `x^x` is NOT provably zero.  This is the soundness guard, not a nicety.
+    let mut vol = algebraic_function(
+        IntrinsicOp::Pxor128,
+        vec![Operand::Value(Value(ALG_A)), Operand::Value(Value(ALG_A))],
+        vec![],
+        true,
+        16,
+        IntrinsicOp::Pmovmskb128,
+    );
+    assert_eq!(
+        movemask_result_after(&mut vol, Value(ALG_RESULT)),
+        None,
+        "volatile source must refuse the identity"
+    );
+
+    // An unresolved SSA value has no definition at all: neither an identity
+    // nor an image proof can be built from it.
+    let mut unresolved = algebraic_function(
+        IntrinsicOp::Pxor128,
+        vec![Operand::Value(Value(999)), Operand::Value(Value(999))],
+        vec![],
+        false,
+        16,
+        IntrinsicOp::Pmovmskb128,
+    );
+    assert_eq!(
+        movemask_result_after(&mut unresolved, Value(ALG_RESULT)),
+        None,
+        "unresolved value must refuse the identity"
+    );
+
+    // Different operands are not an identity: XOR has no absorbing rule.
+    let mut different = algebraic_function(
+        IntrinsicOp::Pxor128,
+        vec![Operand::Value(Value(ALG_A)), Operand::Value(Value(ALG_Z))],
+        vec![],
+        false,
+        16,
+        IntrinsicOp::Pmovmskb128,
+    );
+    assert_eq!(
+        movemask_result_after(&mut different, Value(ALG_RESULT)),
+        None,
+        "x^y with no evidence must refuse"
+    );
+}
+
+#[test]
+fn absorbing_constants_fold_runtime_vectors_and_refuse_the_complement() {
+    let positives: [(IntrinsicOp, Vec<Instruction>, i32); 2] = [
+        (
+            IntrinsicOp::Pand128,
+            zero_producer(IntrinsicOp::Setzero128),
+            0,
+        ),
+        (
+            IntrinsicOp::Por128,
+            splat_producer(IntrinsicOp::SetEpi8, -1),
+            0xFFFF,
+        ),
+    ];
+    for (op, prologue, expected) in positives {
+        let args = vec![Operand::Value(Value(ALG_A)), Operand::Value(Value(ALG_Z))];
+        let mut f = algebraic_function(op, args, prologue, false, 16, IntrinsicOp::Pmovmskb128);
+        assert_eq!(
+            movemask_result_after(&mut f, Value(ALG_RESULT)),
+            Some(expected),
+            "{op:?} absorbing constant must fold to {expected}"
+        );
+    }
+
+    // The complementary constants are IDENTITY elements, not absorbing ones.
+    let negatives: [(IntrinsicOp, Vec<Instruction>); 3] = [
+        (
+            IntrinsicOp::Pand128,
+            splat_producer(IntrinsicOp::SetEpi8, -1),
+        ),
+        (IntrinsicOp::Por128, splat_producer(IntrinsicOp::SetEpi8, 0)),
+        (IntrinsicOp::Pxor128, zero_producer(IntrinsicOp::Setzero128)),
+    ];
+    for (op, prologue) in negatives {
+        let args = vec![Operand::Value(Value(ALG_A)), Operand::Value(Value(ALG_Z))];
+        let mut f = algebraic_function(op, args, prologue, false, 16, IntrinsicOp::Pmovmskb128);
+        assert_eq!(
+            movemask_result_after(&mut f, Value(ALG_RESULT)),
+            None,
+            "{op:?} with an identity element must refuse"
+        );
+    }
+}
+
+#[test]
+fn legacy_zero_producers_respect_width_and_object_bounds() {
+    // `SetzeroPs128` is the FP spelling of the same 16-byte zero store.
+    let mut ps = algebraic_function(
+        IntrinsicOp::Pand128,
+        vec![Operand::Value(Value(ALG_A)), Operand::Value(Value(ALG_Z))],
+        zero_producer(IntrinsicOp::SetzeroPs128),
+        false,
+        16,
+        IntrinsicOp::Pmovmskb128,
+    );
+    assert_eq!(movemask_result_after(&mut ps, Value(ALG_RESULT)), Some(0));
+
+    // A 32-byte zero producer into a 16-byte object is a buffer overrun, not
+    // a value proof.  `tile_image` must reject rather than truncate.
+    let mut overrun = algebraic_function(
+        IntrinsicOp::Pand128,
+        vec![Operand::Value(Value(ALG_A)), Operand::Value(Value(ALG_Z))],
+        zero_producer(IntrinsicOp::Setzero256),
+        false,
+        16,
+        IntrinsicOp::Pmovmskb128,
+    );
+    assert_eq!(
+        movemask_result_after(&mut overrun, Value(ALG_RESULT)),
+        None,
+        "32-byte write into a 16-byte object must refuse"
+    );
+
+    // A 16-byte zero producer leaves half of a 32-bit image unproven: the
+    // exact-tiling gap must refuse (no silent zero fill).
+    let mut gap = algebraic_function(
+        IntrinsicOp::Pand256,
+        vec![Operand::Value(Value(ALG_A)), Operand::Value(Value(ALG_Z))],
+        zero_producer(IntrinsicOp::Setzero128),
+        false,
+        32,
+        IntrinsicOp::Pmovmskb256,
+    );
+    assert_eq!(
+        movemask_result_after(&mut gap, Value(ALG_RESULT)),
+        None,
+        "a partial image must refuse"
+    );
+
+    // The matching 32-bit pair does fold.
+    let mut exact = algebraic_function(
+        IntrinsicOp::Pand256,
+        vec![Operand::Value(Value(ALG_A)), Operand::Value(Value(ALG_Z))],
+        zero_producer(IntrinsicOp::Setzero256),
+        false,
+        32,
+        IntrinsicOp::Pmovmskb256,
+    );
+    assert_eq!(
+        movemask_result_after(&mut exact, Value(ALG_RESULT)),
+        Some(0)
+    );
+}
+
+#[test]
+fn ssa_zero_producers_are_all_off_images_with_an_exact_width() {
+    for (op, width, movemask) in [
+        (IntrinsicOp::Setzero128, 16, IntrinsicOp::Pmovmskb128),
+        (IntrinsicOp::SetzeroPs128, 16, IntrinsicOp::Pmovmskb128),
+        (IntrinsicOp::Setzero256, 32, IntrinsicOp::Pmovmskb256),
+    ] {
+        let insts = vec![
+            intrinsic(Some(Value(1)), op, None, vec![]),
+            intrinsic(
+                Some(Value(2)),
+                movemask,
+                None,
+                vec![Operand::Value(Value(1))],
+            ),
+        ];
+        let mut f = IrFunction::new("ssa_zero".into(), IrType::I32, vec![], false);
+        f.blocks.push(block(
+            insts,
+            Terminator::Return(Some(Operand::Value(Value(2)))),
+            true,
+        ));
+        f.next_value_id = 10;
+        assert_eq!(
+            movemask_result_after(&mut f, Value(2)),
+            Some(0),
+            "SSA {op:?} (width {width}) must be all-off"
+        );
+    }
+
+    // Width mismatch: a 16-byte zero cannot answer a 32-lane movemask.
+    let insts = vec![
+        intrinsic(Some(Value(1)), IntrinsicOp::Setzero128, None, vec![]),
+        intrinsic(
+            Some(Value(2)),
+            IntrinsicOp::Pmovmskb256,
+            None,
+            vec![Operand::Value(Value(1))],
+        ),
+    ];
+    let mut f = IrFunction::new("ssa_zero".into(), IrType::I32, vec![], false);
+    f.blocks.push(block(
+        insts,
+        Terminator::Return(Some(Operand::Value(Value(2)))),
+        true,
+    ));
+    f.next_value_id = 10;
+    assert_eq!(movemask_result_after(&mut f, Value(2)), None);
+}
+
+/// `movemask(VecCmp*(a, b, pred))` with SSA vector operands.  `splat_a` and
+/// `splat_b` may also be raw 16-byte `IrConst::I128` operands for a lane-wise
+/// mixed oracle (the pass treats a full-width constant as a vector image).
+fn compare_function(
+    cmp: IntrinsicOp,
+    a: Operand,
+    b: Operand,
+    pred: Operand,
+    movemask: IntrinsicOp,
+) -> IrFunction {
+    let insts = vec![
+        intrinsic(Some(Value(1)), cmp, None, vec![a, b, pred]),
+        intrinsic(
+            Some(Value(2)),
+            movemask,
+            None,
+            vec![Operand::Value(Value(1))],
+        ),
+    ];
+    let mut f = IrFunction::new("cmp".into(), IrType::I32, vec![], false);
+    f.blocks.push(block(
+        insts,
+        Terminator::Return(Some(Operand::Value(Value(2)))),
+        true,
+    ));
+    f.next_value_id = 10;
+    f
+}
+
+fn i128_const(dwords: [i32; 4]) -> Operand {
+    let mut bytes = [0u8; 16];
+    for (i, d) in dwords.iter().enumerate() {
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&d.to_le_bytes());
+    }
+    Operand::Const(IrConst::I128(i128::from_le_bytes(bytes)))
+}
+
+#[test]
+fn constant_integer_compares_fold_to_exact_lane_masks() {
+    // Equal / unequal byte splats, EQ and NE, at both vector widths.
+    let cases: [(IntrinsicOp, IntrinsicOp, i8, i8, i32, i32); 4] = [
+        (
+            IntrinsicOp::VecCmpI8x16,
+            IntrinsicOp::Pmovmskb128,
+            -128,
+            -128,
+            0xFFFF,
+            0,
+        ),
+        (
+            IntrinsicOp::VecCmpI8x16,
+            IntrinsicOp::Pmovmskb128,
+            -128,
+            127,
+            0,
+            0xFFFF,
+        ),
+        (
+            IntrinsicOp::VecCmpI8x32,
+            IntrinsicOp::Pmovmskb256,
+            1,
+            1,
+            u32::MAX as i32,
+            0,
+        ),
+        (
+            IntrinsicOp::VecCmpI8x32,
+            IntrinsicOp::Pmovmskb256,
+            1,
+            2,
+            0,
+            u32::MAX as i32,
+        ),
+    ];
+    for (cmp, mm, x, y, eq, ne) in cases {
+        let broadcast = if cmp == IntrinsicOp::VecCmpI8x32 {
+            (
+                IntrinsicOp::VecBroadcastI8x32,
+                IntrinsicOp::VecBroadcastI8x32,
+            )
+        } else {
+            (
+                IntrinsicOp::VecBroadcastI8x16,
+                IntrinsicOp::VecBroadcastI8x16,
+            )
+        };
+        // Wrap the two constant splats as SSA values, exactly as `vectorize`
+        // emits them, then feed the compare.
+        let build = |pred: i32| -> IrFunction {
+            let insts = vec![
+                intrinsic(
+                    Some(Value(1)),
+                    broadcast.0,
+                    None,
+                    vec![Operand::Const(IrConst::I8(x))],
+                ),
+                intrinsic(
+                    Some(Value(2)),
+                    broadcast.1,
+                    None,
+                    vec![Operand::Const(IrConst::I8(y))],
+                ),
+                intrinsic(
+                    Some(Value(3)),
+                    cmp,
+                    None,
+                    vec![
+                        Operand::Value(Value(1)),
+                        Operand::Value(Value(2)),
+                        Operand::Const(IrConst::I32(pred)),
+                    ],
+                ),
+                intrinsic(Some(Value(4)), mm, None, vec![Operand::Value(Value(3))]),
+            ];
+            let mut f = IrFunction::new("cmp".into(), IrType::I32, vec![], false);
+            f.blocks.push(block(
+                insts,
+                Terminator::Return(Some(Operand::Value(Value(4)))),
+                true,
+            ));
+            f.next_value_id = 10;
+            f
+        };
+        let mut f_eq = build(0);
+        assert_eq!(
+            movemask_result_after(&mut f_eq, Value(4)),
+            Some(eq),
+            "{cmp:?} eq"
+        );
+        let mut f_ne = build(4);
+        assert_eq!(
+            movemask_result_after(&mut f_ne, Value(4)),
+            Some(ne),
+            "{cmp:?} ne"
+        );
+    }
+
+    // Lane-wise mixed dword oracle: EQ true in lanes 0 and 2 -> 0x0F0F,
+    // NE true in lanes 1 and 3 -> 0xF0F0.
+    let a = i128_const([1, 2, 3, 4]);
+    let b = i128_const([1, 9, 3, 8]);
+    let mut eq = compare_function(
+        IntrinsicOp::VecCmpI32x4,
+        a.clone(),
+        b.clone(),
+        Operand::Const(IrConst::I32(0)),
+        IntrinsicOp::Pmovmskb128,
+    );
+    assert_eq!(movemask_result_after(&mut eq, Value(2)), Some(0x0F0F));
+    let mut ne = compare_function(
+        IntrinsicOp::VecCmpI32x4,
+        a,
+        b,
+        Operand::Const(IrConst::I32(4)),
+        IntrinsicOp::Pmovmskb128,
+    );
+    assert_eq!(movemask_result_after(&mut ne, Value(2)), Some(0xF0F0));
+
+    // The other integer lane widths use the very same lane equality proof.
+    for (cmp, a, b) in [
+        (
+            IntrinsicOp::VecCmpI16x8,
+            i128_const([1, 2, 3, 4]),
+            i128_const([1, 2, 9, 9]),
+        ),
+        (
+            IntrinsicOp::VecCmpI64x2,
+            i128_const([1, 2, 3, 4]),
+            i128_const([1, 2, 3, 9]),
+        ),
+    ] {
+        let mut f = compare_function(
+            cmp,
+            a,
+            b,
+            Operand::Const(IrConst::I32(0)),
+            IntrinsicOp::Pmovmskb128,
+        );
+        assert!(
+            movemask_result_after(&mut f, Value(2)).is_some(),
+            "{cmp:?} must fold a mixed constant compare"
+        );
+    }
+}
+
+#[test]
+fn compare_shape_and_predicate_guards_are_fail_closed() {
+    let a = Operand::Const(IrConst::I128(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10));
+    let b = a.clone();
+    // Only eq(0) and ne(4) are sign-independent; every other predicate
+    // needs signedness/ordering the pass has not proved.
+    for pred in [1i32, 2, 5, 6, 7, -1] {
+        let mut f = compare_function(
+            IntrinsicOp::VecCmpI32x4,
+            a.clone(),
+            b.clone(),
+            Operand::Const(IrConst::I32(pred)),
+            IntrinsicOp::Pmovmskb128,
+        );
+        assert_eq!(
+            movemask_result_after(&mut f, Value(2)),
+            None,
+            "predicate {pred} must refuse"
+        );
+    }
+    // A runtime predicate operand is not a proof.
+    let mut runtime_pred = compare_function(
+        IntrinsicOp::VecCmpI32x4,
+        a.clone(),
+        b.clone(),
+        Operand::Value(Value(9)),
+        IntrinsicOp::Pmovmskb128,
+    );
+    assert_eq!(movemask_result_after(&mut runtime_pred, Value(2)), None);
+    // A 16-byte compare cannot answer a 32-lane movemask.
+    let mut width = compare_function(
+        IntrinsicOp::VecCmpI32x4,
+        a.clone(),
+        b.clone(),
+        Operand::Const(IrConst::I32(0)),
+        IntrinsicOp::Pmovmskb256,
+    );
+    assert_eq!(movemask_result_after(&mut width, Value(2)), None);
+    // FP compares are deliberately out of scope (NaN / signed-zero rules).
+    let mut fp = compare_function(
+        IntrinsicOp::VecCmpF32x4,
+        a.clone(),
+        b.clone(),
+        Operand::Const(IrConst::I32(0)),
+        IntrinsicOp::Pmovmskb128,
+    );
+    assert_eq!(movemask_result_after(&mut fp, Value(2)), None);
+    // Wrong arity.
+    let insts = vec![
+        intrinsic(
+            Some(Value(1)),
+            IntrinsicOp::VecCmpI32x4,
+            None,
+            vec![a.clone(), b.clone()],
+        ),
+        intrinsic(
+            Some(Value(2)),
+            IntrinsicOp::Pmovmskb128,
+            None,
+            vec![Operand::Value(Value(1))],
+        ),
+    ];
+    let mut arity = IrFunction::new("cmp".into(), IrType::I32, vec![], false);
+    arity.blocks.push(block(
+        insts,
+        Terminator::Return(Some(Operand::Value(Value(2)))),
+        true,
+    ));
+    arity.next_value_id = 10;
+    assert_eq!(movemask_result_after(&mut arity, Value(2)), None);
+}
+
+#[test]
+fn compare_self_identity_folds_runtime_ssa_values() {
+    // `VecLoadI8x16` from an unwritten object produces a runtime SSA vector
+    // value.  Using it twice is bit-identical, so eq is all-on and ne all-off.
+    for (pred, expected) in [(0i32, 0xFFFF), (4, 0)] {
+        let insts = vec![
+            alloca(Value(0), 16, false, false),
+            intrinsic(
+                Some(Value(1)),
+                IntrinsicOp::VecLoadI8x16,
+                None,
+                vec![Operand::Value(Value(0)), Operand::Const(IrConst::I64(0))],
+            ),
+            intrinsic(
+                Some(Value(2)),
+                IntrinsicOp::VecCmpI8x16,
+                None,
+                vec![
+                    Operand::Value(Value(1)),
+                    Operand::Value(Value(1)),
+                    Operand::Const(IrConst::I32(pred)),
+                ],
+            ),
+            intrinsic(
+                Some(Value(3)),
+                IntrinsicOp::Pmovmskb128,
+                None,
+                vec![Operand::Value(Value(2))],
+            ),
+        ];
+        let mut f = IrFunction::new("cmp_self".into(), IrType::I32, vec![], false);
+        f.blocks.push(block(
+            insts,
+            Terminator::Return(Some(Operand::Value(Value(3)))),
+            true,
+        ));
+        f.next_value_id = 10;
+        assert_eq!(
+            movemask_result_after(&mut f, Value(3)),
+            Some(expected),
+            "self-compare predicate {pred}"
+        );
+    }
+}
+
+#[test]
+fn new_producers_are_reclaimed_and_leave_no_dangling_ssa() {
+    // The zero producer and the computed write must both be removable once
+    // the movemask is folded; `dce` must not leave an undefined SSA value.
+    let mut f = algebraic_function(
+        IntrinsicOp::Pxor128,
+        vec![Operand::Value(Value(ALG_A)), Operand::Value(Value(ALG_A))],
+        zero_producer(IntrinsicOp::Setzero128),
+        false,
+        16,
+        IntrinsicOp::Pmovmskb128,
+    );
+    assert_eq!(movemask_result_after(&mut f, Value(ALG_RESULT)), Some(0));
+    let defs: Vec<u32> = f.blocks[0]
+        .instructions
+        .iter()
+        .filter_map(|i| i.dest().map(|v| v.0))
+        .collect();
+    let uses: Vec<u32> = f.blocks[0]
+        .instructions
+        .iter()
+        .flat_map(|i| i.used_values())
+        .collect();
+    for u in &uses {
+        assert!(
+            defs.contains(u),
+            "dangling SSA reference to Value({u}) after reclamation"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Round 6: repeated-operand purity is a POSITIVE proof, not a fallback.
+// ---------------------------------------------------------------------------
+
+/// Build `Pxor128 { args: [v, v] } -> movemask` with one extra definition
+/// instruction in the prologue, and return the folded movemask constant.
+fn identity_with_definition(defs: Vec<Instruction>, v: Value) -> Option<i32> {
+    let mut f = algebraic_function(
+        IntrinsicOp::Pxor128,
+        vec![Operand::Value(v), Operand::Value(v)],
+        defs,
+        false,
+        16,
+        IntrinsicOp::Pmovmskb128,
+    );
+    movemask_result_after(&mut f, Value(ALG_RESULT))
+}
+
+fn purity_function(insts: Vec<Instruction>) -> crate::ir::reexports::IrFunction {
+    let mut f = crate::ir::reexports::IrFunction::new("purity".into(), IrType::I32, vec![], false);
+    f.blocks.push(block(
+        insts,
+        Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+        true,
+    ));
+    f.next_value_id = 1000;
+    f
+}
+
+#[test]
+fn repeated_operand_refuses_every_pointer_and_observable_definition() {
+    const V: Value = Value(999);
+    // A pointer materialised by a cast, a global address, a label address,
+    // a phi, a volatile load, a pointer-typed load, a write-through home,
+    // an atomic load, and an external value with no definition at all.
+    let definitions: Vec<(&str, Vec<Instruction>)> = vec![
+        (
+            "cast to pointer",
+            vec![Instruction::Cast {
+                dest: V,
+                src: Operand::Const(IrConst::I64(0)),
+                from_ty: IrType::I64,
+                to_ty: IrType::Ptr,
+            }],
+        ),
+        (
+            "global address",
+            vec![Instruction::GlobalAddr {
+                dest: V,
+                name: "extern_object".into(),
+            }],
+        ),
+        (
+            "label address",
+            vec![Instruction::LabelAddr {
+                dest: V,
+                label: BlockId(0),
+            }],
+        ),
+        (
+            "phi",
+            vec![Instruction::Phi {
+                dest: V,
+                ty: IrType::I128,
+                incoming: vec![(Operand::Const(IrConst::I64(0)), BlockId(0))],
+            }],
+        ),
+        (
+            "volatile load",
+            vec![Instruction::Load {
+                dest: V,
+                ptr: Value(ALG_A),
+                ty: IrType::I64,
+                seg_override: AddressSpace::Default,
+                volatile: true,
+            }],
+        ),
+        (
+            "pointer-typed load",
+            vec![Instruction::Load {
+                dest: V,
+                ptr: Value(ALG_A),
+                ty: IrType::Ptr,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            }],
+        ),
+        (
+            "write-through intrinsic home",
+            vec![intrinsic(
+                Some(V),
+                IntrinsicOp::Pxor128,
+                Some(Value(ALG_Z)),
+                vec![],
+            )],
+        ),
+        (
+            "atomic load",
+            vec![Instruction::AtomicLoad {
+                dest: V,
+                ptr: Operand::Value(Value(ALG_A)),
+                ty: IrType::I64,
+                ordering: crate::ir::ops::AtomicOrdering::SeqCst,
+            }],
+        ),
+        ("undefined external value", vec![]),
+        (
+            "copy cycle",
+            vec![
+                copy(V, Operand::Value(Value(998))),
+                copy(Value(998), Operand::Value(V)),
+            ],
+        ),
+        (
+            "copy to undefined value",
+            vec![copy(V, Operand::Value(Value(997)))],
+        ),
+    ];
+    for (label, defs) in definitions {
+        assert_eq!(
+            identity_with_definition(defs, V),
+            None,
+            "repeated operand defined by {label} must NOT be treated as pure"
+        );
+    }
+    // Control: a plain non-volatile stack home IS the legacy form and must
+    // still fold.  This proves the refusals above are selective, not a
+    // blanket disable of the identity.
+    assert_eq!(
+        identity_with_definition(vec![], Value(ALG_A)),
+        Some(0),
+        "a proven plain stack home must still fold"
+    );
+}
+
+#[test]
+fn repeated_operand_accepts_a_copy_chain_ending_in_a_pure_ssa_producer() {
+    const V: Value = Value(999);
+    let defs = vec![
+        intrinsic(
+            Some(Value(998)),
+            IntrinsicOp::VecBroadcastI8x16,
+            None,
+            vec![Operand::Const(IrConst::I8(-1))],
+        ),
+        copy(V, Operand::Value(Value(998))),
+    ];
+    assert_eq!(
+        identity_with_definition(defs, V),
+        Some(0),
+        "an SSA vector value reached through Copy is immutable"
+    );
+    // A whole-vector load is also an immutable SSA value after the load.
+    let loaded = vec![intrinsic(
+        Some(V),
+        IntrinsicOp::VecLoadI8x16,
+        None,
+        vec![
+            Operand::Value(Value(ALG_A)),
+            Operand::Const(IrConst::I64(0)),
+        ],
+    )];
+    assert_eq!(identity_with_definition(loaded, V), Some(0));
+}
+
+#[test]
+fn purity_refuses_on_budget_exhaustion_and_cycles() {
+    // Direct probe of the decision procedure: budget 0 must refuse even for
+    // the most obviously pure shape, and a Copy cycle must refuse regardless
+    // of the starting budget.  Pinning both prevents an unbounded walk from
+    // being reintroduced under a new identity rule.
+    let plain = purity_function(vec![
+        alloca(Value(ALG_A), 16, false, false),
+        copy(Value(999), Operand::Value(Value(ALG_A))),
+    ]);
+    let facts = Facts::new(&plain);
+    let mut zero_budget = 0usize;
+    assert!(!facts.operand_is_pure(Operand::Value(Value(999)), &mut zero_budget));
+    assert_eq!(zero_budget, 0);
+    let mut full_budget = MAX_WORK;
+    assert!(facts.operand_is_pure(Operand::Value(Value(ALG_A)), &mut full_budget));
+    assert!(
+        full_budget < MAX_WORK,
+        "the proof must charge the shared budget"
+    );
+
+    let cyclic = purity_function(vec![
+        copy(Value(999), Operand::Value(Value(998))),
+        copy(Value(998), Operand::Value(Value(999))),
+    ]);
+    let facts = Facts::new(&cyclic);
+    let mut budget = MAX_WORK;
+    assert!(!facts.operand_is_pure(Operand::Value(Value(999)), &mut budget));
+    assert!(
+        budget > 0,
+        "the cycle must terminate by depth, not by draining all work"
+    );
+}
+
+#[test]
+fn ssa_intrinsic_without_a_write_through_home_refuses_object_mentions() {
+    // `mention_of` must stay fail-closed for an SSA byte-logic intrinsic
+    // whose args happen to name an object: with `dest_ptr: None` there is no
+    // proven memory home, so classifying it as a WRITE or as harmless would
+    // both be guesses.  `Reject` is the only defensible verdict.
+    let inst = intrinsic(
+        Some(Value(1)),
+        IntrinsicOp::VecXorI32x4,
+        None,
+        vec![Operand::Value(Value(ALG_A)), Operand::Value(Value(ALG_A))],
+    );
+    let f = purity_function(vec![alloca(Value(ALG_A), 16, false, false), inst.clone()]);
+    let facts = Facts::new(&f);
+    let w = ImageWindow {
+        base: Value(ALG_A),
+        size: 16,
+        read_block: 0,
+        read_index: 0,
+    };
+    let mut budget = MAX_WORK;
+    let mut visiting = Vec::new();
+    assert!(matches!(
+        facts.mention_of(&inst, w, &mut budget, &mut visiting),
+        ObjectMention::Reject
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Round 7: ISPC `IntrinsicsOpt` scalar `__mmaskN` transplants.
+// ---------------------------------------------------------------------------
+
+const MC_A: u32 = 100;
+const MC_B: u32 = 200;
+const MC_RESULT: u32 = 1;
+
+/// A proven-constant stack image: one plain Alloca tiled by byte stores.
+fn mc_image(base: Value, bytes: &[u8], gep_start: u32) -> Vec<Instruction> {
+    let mut v = vec![alloca(base, bytes.len(), false, false)];
+    for (i, b) in bytes.iter().enumerate() {
+        let p = Value(gep_start + i as u32);
+        v.push(gep(p, base, Operand::Const(IrConst::I64(i as i64))));
+        v.push(byte_store(p, *b, false));
+    }
+    v
+}
+
+fn mc_function(cmp: IntrinsicOp, pred: Operand, a: &[u8], b: &[u8]) -> IrFunction {
+    let mut insts = mc_image(Value(MC_A), a, 400);
+    insts.extend(mc_image(Value(MC_B), b, 600));
+    insts.push(intrinsic(
+        Some(Value(MC_RESULT)),
+        cmp,
+        None,
+        vec![
+            Operand::Value(Value(MC_A)),
+            Operand::Value(Value(MC_B)),
+            pred,
+        ],
+    ));
+    let mut f = IrFunction::new("mcmp".into(), IrType::I32, vec![], false);
+    f.blocks.push(block(
+        insts,
+        Terminator::Return(Some(Operand::Value(Value(MC_RESULT)))),
+        true,
+    ));
+    f.next_value_id = 1000;
+    f
+}
+
+/// Independent oracle: bit i of the scalar mask is the equality of lane i.
+fn mc_oracle(a: &[u8], b: &[u8], lane_bytes: usize, lanes: u32, ne: bool) -> u64 {
+    let mut m = 0u64;
+    for i in 0..lanes as usize {
+        let x = &a[i * lane_bytes..(i + 1) * lane_bytes];
+        let y = &b[i * lane_bytes..(i + 1) * lane_bytes];
+        if (x == y) ^ ne {
+            m |= 1u64 << i;
+        }
+    }
+    m
+}
+
+fn mc_folded(func: &IrFunction) -> Option<i64> {
+    let facts = Facts::new(func);
+    // Find by DEST, not by shape: the negative cases deliberately use opcodes
+    // outside `mask_compare_shape` (512-bit and FP compares), which must be
+    // refused rather than skipped by the test harness.
+    let (index, inst) = func.blocks[0]
+        .instructions
+        .iter()
+        .enumerate()
+        .find(|(_, i)| matches!(i, Instruction::Intrinsic { dest: Some(d), .. } if *d == Value(MC_RESULT)))
+        .expect("mask compare present");
+    match fold(&facts, inst, 0, index)? {
+        Instruction::Copy {
+            src: Operand::Const(c),
+            ..
+        } => c.to_i64(),
+        _ => None,
+    }
+}
+
+#[test]
+fn scalar_mask_lattice_is_exact_over_all_16_bit_values() {
+    let f = purity_function(vec![]);
+    let facts = Facts::new(&f);
+    for k in 0u64..=0xFFFF {
+        let got = facts.scalar_mask(Operand::Const(IrConst::I64(k as i64)), 16);
+        let want = match k {
+            0 => ScalarMask::AllOff,
+            0xFFFF => ScalarMask::AllOn,
+            other => ScalarMask::Mixed(other),
+        };
+        assert_eq!(got, want, "16-lane scalar mask {k:#06x}");
+    }
+    // Signed -1 and over-wide constants are masked to the lane width.
+    assert_eq!(
+        facts.scalar_mask(Operand::Const(IrConst::I64(-1)), 16),
+        ScalarMask::AllOn
+    );
+    assert_eq!(
+        facts.scalar_mask(Operand::Const(IrConst::I64(0x1234_FFFF)), 16),
+        ScalarMask::AllOn
+    );
+    assert_eq!(
+        facts.scalar_mask(Operand::Const(IrConst::I64(0x1_0000)), 16),
+        ScalarMask::AllOff
+    );
+    // 64 lanes use the full u64 domain; 0 lanes / 65 lanes refuse.
+    assert_eq!(
+        facts.scalar_mask(Operand::Const(IrConst::I64(-1)), 64),
+        ScalarMask::AllOn
+    );
+    assert_eq!(
+        facts.scalar_mask(Operand::Const(IrConst::I64(0)), 0),
+        ScalarMask::Unknown
+    );
+    assert_eq!(
+        facts.scalar_mask(Operand::Const(IrConst::I64(0)), 65),
+        ScalarMask::Unknown
+    );
+    // A float constant is not a mask; neither is an undefined value.
+    assert_eq!(
+        facts.scalar_mask(Operand::Const(IrConst::F64(1.0)), 16),
+        ScalarMask::Unknown
+    );
+    assert_eq!(
+        facts.scalar_mask(Operand::Value(Value(999)), 16),
+        ScalarMask::Unknown
+    );
+    // Bounded Copy chains, cycles and non-Copy definitions.
+    let chained = purity_function(vec![
+        copy(Value(10), Operand::Const(IrConst::I64(0))),
+        copy(Value(11), Operand::Value(Value(10))),
+    ]);
+    assert_eq!(
+        Facts::new(&chained).scalar_mask(Operand::Value(Value(11)), 16),
+        ScalarMask::AllOff
+    );
+    let cyclic = purity_function(vec![
+        copy(Value(10), Operand::Value(Value(11))),
+        copy(Value(11), Operand::Value(Value(10))),
+    ]);
+    assert_eq!(
+        Facts::new(&cyclic).scalar_mask(Operand::Value(Value(10)), 16),
+        ScalarMask::Unknown
+    );
+    let noncopy = purity_function(vec![alloca(Value(10), 16, false, false)]);
+    assert_eq!(
+        Facts::new(&noncopy).scalar_mask(Operand::Value(Value(10)), 16),
+        ScalarMask::Unknown
+    );
+}
+
+#[test]
+fn constant_mask_compares_fold_to_exact_scalar_masks() {
+    // Four lane widths, two vector widths, two sign-independent predicates.
+    let cases: [(IntrinsicOp, usize, usize, u32, usize); 8] = [
+        (IntrinsicOp::CmpeqEpu8Mask128, 16, 1, 16, 16),
+        (IntrinsicOp::CmpEpi8Mask128, 16, 1, 16, 16),
+        (IntrinsicOp::CmpEpi16Mask128, 16, 2, 8, 16),
+        (IntrinsicOp::CmpEpi32Mask128, 16, 4, 4, 16),
+        (IntrinsicOp::CmpEpi64Mask128, 16, 8, 2, 16),
+        (IntrinsicOp::CmpeqEpu8Mask256, 32, 1, 32, 32),
+        (IntrinsicOp::CmpEpi32Mask256, 32, 4, 8, 32),
+        (IntrinsicOp::CmpEpu64Mask256, 32, 8, 4, 32),
+    ];
+    for (cmp, width, lane_bytes, lanes, _) in cases {
+        let a: Vec<u8> = (0..width)
+            .map(|i| ((i as u32 * 37 + 11) & 0xFF) as u8)
+            .collect();
+        let mut b = a.clone();
+        // Flip one byte in lanes 1 and 3 (and leave lanes 0, 2 equal).
+        b[lane_bytes] ^= 0x40;
+        if 3 * lane_bytes < width {
+            b[3 * lane_bytes] ^= 0x80;
+        }
+        for (pred, ne) in [(0i32, false), (4, true)] {
+            let f = mc_function(cmp, Operand::Const(IrConst::I32(pred)), &a, &b);
+            let want = mc_oracle(&a, &b, lane_bytes, lanes, ne);
+            assert_eq!(
+                mc_folded(&f),
+                Some(want as i64),
+                "{cmp:?} pred={pred} must fold to {want:#x}"
+            );
+        }
+    }
+    // All-equal and all-different images exercise the two extreme masks.
+    let a = vec![0x5Au8; 16];
+    let b = vec![0xA5u8; 16];
+    let eq = mc_function(
+        IntrinsicOp::CmpEpi8Mask128,
+        Operand::Const(IrConst::I32(0)),
+        &a,
+        &b,
+    );
+    assert_eq!(mc_folded(&eq), Some(0));
+    let same = mc_function(
+        IntrinsicOp::CmpEpi8Mask128,
+        Operand::Const(IrConst::I32(0)),
+        &a,
+        &a,
+    );
+    assert_eq!(mc_folded(&same), Some(0xFFFF));
+}
+
+#[test]
+fn mask_compare_guards_are_fail_closed() {
+    let a = vec![0x11u8; 16];
+    let b = vec![0x22u8; 16];
+    // Signed/unsigned ordering predicates have no lane-signedness proof.
+    for pred in [1i32, 2, 3, 5, 6, 7, -1] {
+        let f = mc_function(
+            IntrinsicOp::CmpEpi8Mask128,
+            Operand::Const(IrConst::I32(pred)),
+            &a,
+            &b,
+        );
+        assert_eq!(mc_folded(&f), None, "predicate {pred} must refuse");
+    }
+    // A runtime predicate is not a proof.
+    let runtime_pred = mc_function(
+        IntrinsicOp::CmpEpi8Mask128,
+        Operand::Value(Value(999)),
+        &a,
+        &b,
+    );
+    assert_eq!(mc_folded(&runtime_pred), None);
+    // 512-bit compares are outside the 32-byte image-proof domain.
+    let wide = mc_function(
+        IntrinsicOp::CmpeqEpu8Mask512,
+        Operand::Const(IrConst::I32(0)),
+        &a,
+        &b,
+    );
+    assert_eq!(mc_folded(&wide), None);
+    // An FP compare opcode is not in the integer mask-compare table.
+    let fp = mc_function(
+        IntrinsicOp::VecCmpF32x4,
+        Operand::Const(IrConst::I32(0)),
+        &a,
+        &b,
+    );
+    assert_eq!(mc_folded(&fp), None);
+    // Wrong arity: no predicate operand.
+    let mut f = mc_function(
+        IntrinsicOp::CmpEpi8Mask128,
+        Operand::Const(IrConst::I32(0)),
+        &a,
+        &b,
+    );
+    if let Instruction::Intrinsic { args, .. } = &mut f.blocks[0]
+        .instructions
+        .iter_mut()
+        .find(
+            |i| matches!(i, Instruction::Intrinsic { op, .. } if mask_compare_shape(*op).is_some()),
+        )
+        .expect("compare")
+    {
+        args.pop();
+    }
+    assert_eq!(mc_folded(&f), None);
+    // An unproven (volatile) operand image cannot be folded.
+    let mut vol = mc_function(
+        IntrinsicOp::CmpEpi8Mask128,
+        Operand::Const(IrConst::I32(0)),
+        &a,
+        &b,
+    );
+    for inst in &mut vol.blocks[0].instructions {
+        if let Instruction::Alloca { dest, volatile, .. } = inst {
+            if *dest == Value(MC_B) {
+                *volatile = true;
+            }
+        }
+    }
+    assert_eq!(mc_folded(&vol), None);
+}
+
+#[test]
+fn mask_compare_self_identity_needs_no_operand_image() {
+    for (pred, want) in [(0i32, 0xFFFFi64), (4, 0)] {
+        let insts = vec![
+            alloca(Value(MC_A), 16, false, false),
+            intrinsic(
+                Some(Value(MC_RESULT)),
+                IntrinsicOp::CmpEpi8Mask128,
+                None,
+                vec![
+                    Operand::Value(Value(MC_A)),
+                    Operand::Value(Value(MC_A)),
+                    Operand::Const(IrConst::I32(pred)),
+                ],
+            ),
+        ];
+        let mut f = IrFunction::new("mcself".into(), IrType::I32, vec![], false);
+        f.blocks.push(block(
+            insts,
+            Terminator::Return(Some(Operand::Value(Value(MC_RESULT)))),
+            true,
+        ));
+        f.next_value_id = 1000;
+        assert_eq!(mc_folded(&f), Some(want), "self-compare pred {pred}");
+    }
+}
+
+#[test]
+fn mask_compare_is_a_pure_read_for_object_images() {
+    // `mention_of` must classify a mask compare as NoWrite (a read cannot
+    // change an image) but refuse an unresolved pointer operand.
+    let inst = intrinsic(
+        Some(Value(MC_RESULT)),
+        IntrinsicOp::CmpEpi8Mask128,
+        None,
+        vec![
+            Operand::Value(Value(MC_A)),
+            Operand::Value(Value(MC_B)),
+            Operand::Const(IrConst::I32(0)),
+        ],
+    );
+    let f = purity_function(vec![
+        alloca(Value(MC_A), 16, false, false),
+        alloca(Value(MC_B), 16, false, false),
+        inst.clone(),
+    ]);
+    let facts = Facts::new(&f);
+    let w = ImageWindow {
+        base: Value(MC_A),
+        size: 16,
+        read_block: 0,
+        read_index: 0,
+    };
+    let mut budget = MAX_WORK;
+    let mut visiting = Vec::new();
+    assert!(matches!(
+        facts.mention_of(&inst, w, &mut budget, &mut visiting),
+        ObjectMention::NoWrite
+    ));
+    let unresolved = intrinsic(
+        Some(Value(MC_RESULT)),
+        IntrinsicOp::CmpEpi8Mask128,
+        None,
+        vec![
+            Operand::Value(Value(MC_A)),
+            Operand::Value(Value(999)),
+            Operand::Const(IrConst::I32(0)),
+        ],
+    );
+    assert!(matches!(
+        facts.mention_of(&unresolved, w, &mut budget, &mut visiting),
+        ObjectMention::Reject
+    ));
+}
+
+fn maskz_function(
+    op: IntrinsicOp,
+    mask: Operand,
+    size: usize,
+    dest_used: bool,
+    volatile: bool,
+) -> IrFunction {
+    let mut insts = vec![alloca(Value(MC_A), size, volatile, false)];
+    insts.push(intrinsic(
+        Some(Value(MC_RESULT)),
+        op,
+        Some(Value(MC_A)),
+        vec![mask, Operand::Value(Value(999))],
+    ));
+    if dest_used {
+        insts.push(copy(Value(2), Operand::Value(Value(MC_RESULT))));
+    }
+    let mut f = IrFunction::new("maskz".into(), IrType::I32, vec![], false);
+    f.blocks.push(block(
+        insts,
+        Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+        true,
+    ));
+    f.next_value_id = 1000;
+    f
+}
+
+fn maskz_folded(func: &IrFunction) -> Option<IntrinsicOp> {
+    let facts = Facts::new(func);
+    let (index, inst) = func.blocks[0]
+        .instructions
+        .iter()
+        .enumerate()
+        .find(|(_, i)| matches!(i, Instruction::Intrinsic { op, .. } if matches!(*op, IntrinsicOp::MaskzLoaduEpi8_128 | IntrinsicOp::MaskzLoaduEpi8_256 | IntrinsicOp::MaskzLoaduEpi8_512)))
+        .expect("maskz load present");
+    match fold(&facts, inst, 0, index)? {
+        Instruction::Intrinsic {
+            op,
+            dest: None,
+            dest_ptr: Some(_),
+            args,
+        } if args.is_empty() => Some(op),
+        _ => None,
+    }
+}
+
+#[test]
+fn all_off_maskz_load_becomes_an_exact_width_zero_producer() {
+    for (op, size, want) in [
+        (IntrinsicOp::MaskzLoaduEpi8_128, 16, IntrinsicOp::Setzero128),
+        (IntrinsicOp::MaskzLoaduEpi8_256, 32, IntrinsicOp::Setzero256),
+    ] {
+        let f = maskz_function(op, Operand::Const(IrConst::I64(0)), size, false, false);
+        assert_eq!(maskz_folded(&f), Some(want), "{op:?}");
+        // Signed -1 in the mask slot is NOT all-off.
+        let on = maskz_function(op, Operand::Const(IrConst::I64(-1)), size, false, false);
+        assert_eq!(maskz_folded(&on), None);
+        // A mixed mask is not all-off.
+        let mixed = maskz_function(op, Operand::Const(IrConst::I64(1)), size, false, false);
+        assert_eq!(maskz_folded(&mixed), None);
+        // A runtime mask is not a proof.
+        let runtime = maskz_function(op, Operand::Value(Value(999)), size, false, false);
+        assert_eq!(maskz_folded(&runtime), None);
+        // A used SSA dest cannot be dropped.
+        let used = maskz_function(op, Operand::Const(IrConst::I64(0)), size, true, false);
+        assert_eq!(maskz_folded(&used), None);
+        // A volatile destination is refused.
+        let vol = maskz_function(op, Operand::Const(IrConst::I64(0)), size, false, true);
+        assert_eq!(maskz_folded(&vol), None);
+        // A too-small alloca would be a stack overwrite; refuse.
+        let small = maskz_function(op, Operand::Const(IrConst::I64(0)), size / 2, false, false);
+        assert_eq!(maskz_folded(&small), None);
+        // 512-bit forms have no proven 64-byte zero producer.
+        let wide = maskz_function(
+            IntrinsicOp::MaskzLoaduEpi8_512,
+            Operand::Const(IrConst::I64(0)),
+            64,
+            false,
+            false,
+        );
+        assert_eq!(maskz_folded(&wide), None);
+    }
+}
+
+fn mask_store_function(op: IntrinsicOp, mask: Operand) -> IrFunction {
+    let insts = vec![
+        alloca(Value(MC_A), 16, false, false),
+        intrinsic(
+            None,
+            op,
+            Some(Value(MC_A)),
+            vec![mask, Operand::Const(IrConst::I64(7))],
+        ),
+    ];
+    let mut f = IrFunction::new("mstore".into(), IrType::I32, vec![], false);
+    f.blocks.push(block(
+        insts,
+        Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+        true,
+    ));
+    f.next_value_id = 1000;
+    f
+}
+
+#[test]
+fn all_on_128_bit_maskz_load_uses_the_proven_unmasked_load() {
+    // `Loaddqu` with a raw pointer is exactly what `_mm_loadu_si128` lowers
+    // to (measured in the x86 backend).  With every lane active the `{k1}{z}`
+    // decorator and its `kmov` are pure overhead.
+    let f = maskz_function(
+        IntrinsicOp::MaskzLoaduEpi8_128,
+        Operand::Const(IrConst::I64(0xFFFF)),
+        16,
+        false,
+        false,
+    );
+    let facts = Facts::new(&f);
+    let inst = &f.blocks[0].instructions[1];
+    match fold(&facts, inst, 0, 1).expect("all-on 128-bit maskz load must fold") {
+        Instruction::Intrinsic {
+            op,
+            dest: None,
+            dest_ptr: Some(dp),
+            args,
+        } => {
+            assert_eq!(op, IntrinsicOp::Loaddqu);
+            assert_eq!(dp, Value(MC_A));
+            assert_eq!(args.len(), 1, "the memory pointer must be preserved");
+            assert!(matches!(args[0], Operand::Value(_)));
+        }
+        other => panic!("expected Loaddqu, got {other:?}"),
+    }
+    // A 256-bit all-on load has no proven raw-pointer unmasked form here.
+    let wide = maskz_function(
+        IntrinsicOp::MaskzLoaduEpi8_256,
+        Operand::Const(IrConst::I64(0xFFFF_FFFF)),
+        32,
+        false,
+        false,
+    );
+    assert_eq!(maskz_folded(&wide), None);
+    // A 16-bit all-on constant with junk in the ignored upper bits is still
+    // all-on (the hardware masks to 16 lanes).
+    let masked = maskz_function(
+        IntrinsicOp::MaskzLoaduEpi8_128,
+        Operand::Const(IrConst::I64(0x1234_FFFF)),
+        16,
+        false,
+        false,
+    );
+    let facts = Facts::new(&masked);
+    assert!(fold(&facts, &masked.blocks[0].instructions[1], 0, 1).is_some());
+}
+
+#[test]
+fn all_off_masked_stores_are_erased_span_safely() {
+    for op in [
+        IntrinsicOp::MaskStoreuEpi8_128,
+        IntrinsicOp::MaskStoreuEpi8_256,
+        IntrinsicOp::MaskStoreuEpi8_512,
+    ] {
+        let mut f = mask_store_function(op, Operand::Const(IrConst::I64(0)));
+        let edits = run_function(&mut f);
+        assert!(edits >= 1, "{op:?} all-off store must be edited");
+        assert!(
+            !f.blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Intrinsic { op: o, .. } if *o == op)),
+            "{op:?} all-off store must be erased"
+        );
+        // `remove_instructions` must keep source_spans parallel.
+        let spans = f.blocks[0].source_spans.len();
+        let insts = f.blocks[0].instructions.len();
+        assert!(spans == 0 || spans == insts, "span drift after erasure");
+    }
+    // All-on, mixed, runtime masks and the value-form are NOT erasable.
+    for mask in [
+        Operand::Const(IrConst::I64(-1)),
+        Operand::Const(IrConst::I64(1)),
+        Operand::Value(Value(999)),
+    ] {
+        let mut f = mask_store_function(IntrinsicOp::MaskStoreuEpi8_128, mask);
+        run_function(&mut f);
+        assert!(
+            f.blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Intrinsic { op, .. } if *op == IntrinsicOp::MaskStoreuEpi8_128)),
+            "non-all-off store must survive"
+        );
+    }
+    // A wrong-arity or dest-form intrinsic is not the canonical PtrStore.
+    let mut wrong = mask_store_function(
+        IntrinsicOp::MaskStoreuEpi8_128,
+        Operand::Const(IrConst::I64(0)),
+    );
+    for inst in &mut wrong.blocks[0].instructions {
+        if let Instruction::Intrinsic { args, .. } = inst {
+            args.push(Operand::Const(IrConst::I64(0)));
+        }
+    }
+    let facts = Facts::new(&wrong);
+    assert!(!fold_removal(&facts, &wrong.blocks[0].instructions[1]));
+}
+
+#[test]
+fn masked_candidate_gate_pays_nothing_for_unsupported_ops() {
+    // `has_candidate` must accept exactly the shapes with a consumer.  A
+    // function containing only an unsupported 512-bit masked LOAD must not
+    // even build `Facts` (edit count 0), while a supported one must fold.
+    let unsupported = maskz_function(
+        IntrinsicOp::MaskzLoaduEpi8_512,
+        Operand::Const(IrConst::I64(0)),
+        64,
+        false,
+        false,
+    );
+    let mut u = unsupported;
+    assert_eq!(
+        run_function(&mut u),
+        0,
+        "unsupported op must not trigger the pass"
+    );
+    let mut supported = maskz_function(
+        IntrinsicOp::MaskzLoaduEpi8_128,
+        Operand::Const(IrConst::I64(0)),
+        16,
+        false,
+        false,
+    );
+    assert!(run_function(&mut supported) >= 1, "supported op must fold");
+}
