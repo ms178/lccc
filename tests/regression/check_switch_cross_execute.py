@@ -42,6 +42,9 @@ FIXTURES = (
     # one TU; `wide` pushes 48 mixed-width parameters through stack homes on
     # every ABI.  See check 13 in check_param_home_contracts.py.
     "param_home_shifted_cross", "param_home_wide_cross",
+    # Sibling calls (incl. branch arms), RV64 branch-free selects, call
+    # staging hazards and pointer exit tests: values computed by GCC 16.2.
+    "sibcall_select_staging_cross",
 )
 ALL_LEVELS = ("-O0", "-O1", "-O2", "-Os")
 LEVELS = {
@@ -144,6 +147,14 @@ LEVELS = {
     # a nonlocal goto kept a value in a callee-saved register its abandoned
     # epilogue never restored (AArch64 and RV64 -O1).
     "nested_fn_chain_goto_cross": ALL_LEVELS + ("-O3",),
+    # Sibling calls on AArch64/RV64 -- register-cycle argument rotations,
+    # 6/8 register arguments, indirect targets, branch arms (`ret_dup`),
+    # narrow arguments; RV64 branch-free selects at the imm12/shift edges
+    # and with the condition as the shared operand (the accumulator cache
+    # once read the mask back as `x`); call-staging hazards; LFTR pointer
+    # exits for trip counts -1/0/1/7/16; and a direct nested call passing
+    # a half-precision struct (RV64 NaN-boxed it through t2, the chain).
+    "sibcall_select_staging_cross": ALL_LEVELS + ("-O3",),
 }
 # Two-unit psABI fixtures under interop/: `<name>_callee.c` and
 # `<name>_caller.c`, linked LCCC-with-LCCC and LCCC-with-Clang in both

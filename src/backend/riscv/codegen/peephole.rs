@@ -765,6 +765,8 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= eliminate_redundant_zext_byte(&mut lines, &mut kinds, n);
         changed |= eliminate_redundant_sign_extensions(&mut lines, &mut kinds, n);
         changed |= fold_sign_masks(&mut lines, &mut kinds, n);
+        changed |= branch::fold_boolean_negations(&mut lines, &mut kinds, n);
+        changed |= branch::fuse_compare_branches(&mut lines, &mut kinds, n);
         changed |= eliminate_self_moves(&mut kinds, n);
         changed |= eliminate_redundant_mv_chain(&mut lines, &mut kinds, n);
         if merge_blocks {
@@ -802,6 +804,13 @@ pub fn peephole_optimize(asm: String) -> String {
     // Per function; a function with an opaque body is skipped whole.
     global_changed |= global_dead_store_elimination(&lines, &mut kinds, n);
 
+    // Short exit tails into the fall-through arms that reach them.  It
+    // inserts lines, so it runs between the fixed-length phases -- after the
+    // global copy propagation, which leaves the select's default as the line
+    // before its branch -- and the copies fold in phase 3, which it forces.
+    global_changed |= branch::duplicate_exit_tails(&mut lines, &mut kinds, &mut protected);
+    let n = lines.len();
+
     // Phase 3: Local cleanup after global passes (up to 4 rounds)
     if global_changed {
         let mut changed2 = true;
@@ -817,6 +826,8 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_redundant_zext_byte(&mut lines, &mut kinds, n);
             changed2 |= eliminate_redundant_sign_extensions(&mut lines, &mut kinds, n);
             changed2 |= fold_sign_masks(&mut lines, &mut kinds, n);
+            changed2 |= branch::fold_boolean_negations(&mut lines, &mut kinds, n);
+            changed2 |= branch::fuse_compare_branches(&mut lines, &mut kinds, n);
             changed2 |= eliminate_self_moves(&mut kinds, n);
             changed2 |= eliminate_redundant_mv_chain(&mut lines, &mut kinds, n);
             if merge_blocks {
@@ -2390,6 +2401,92 @@ fn rv_fold_extension_into_compare(
     Some(c)
 }
 
+/// Two 32-bit zero extensions feeding an unsigned or equality compare of the
+/// two results, of sources that are both sign-extended words: the compare
+/// reads the sources instead and the extensions go.  Sign extension maps the
+/// 32-bit values onto [0, 2^31) and [2^64 - 2^31, 2^64) in order, so it
+/// preserves equality and the unsigned order exactly as zero extension does
+/// (`unsigned a < b ? 3u : 11u` on two psABI-sign-extended arguments:
+/// Clang 23.1.5's lone `bltu a0, a1`, where the internal zero-extended form
+/// cost four shifts).  Both extension results must die at the compare.
+/// Returns the compare's line.
+fn rv_fold_paired_zero_extensions(
+    lines: &mut [String],
+    kinds: &mut [LineKind],
+    n: usize,
+    i: usize,
+    rng: &[RvRange; NUM_REGS],
+    live: &mut RvLazyLiveness,
+) -> Option<usize> {
+    let word =
+        |reg: u8| rv_range_within(rng.get(reg as usize).copied().unwrap_or(RV_FULL), RV_WORD);
+    let (t1, s1, bits1, last1) = rv_zero_extension(lines, kinds, n, i)?;
+    let j = rv_next_kept_line(kinds, last1 + 1, n);
+    if j >= n {
+        return None;
+    }
+    let (t2, s2, bits2, last2) = rv_zero_extension(lines, kinds, n, j)?;
+    // The second extension's source is read after the first one wrote t1.
+    if bits1 != 32 || bits2 != 32 || t1 == t2 || s2 == t1 || !word(s1) || !word(s2) {
+        return None;
+    }
+    let c = rv_next_kept_line(kinds, last2 + 1, n);
+    let ctext = lines.get(c)?.trim().to_owned();
+    let (cm, crest) = ctext.split_once(' ')?;
+    let cops: Vec<&str> = crest.split(',').map(str::trim).collect();
+    // Each operand names one extension's result, and they differ.
+    let swap_pair = |a: &str, b: &str| match (parse_reg(a), parse_reg(b)) {
+        (x, y) if x == t1 && y == t2 => Some((reg_name(s1), reg_name(s2))),
+        (x, y) if x == t2 && y == t1 => Some((reg_name(s2), reg_name(s1))),
+        _ => None,
+    };
+    let (replacement, dst) = match (cm, cops.as_slice()) {
+        ("bltu" | "bgeu" | "bgtu" | "bleu" | "beq" | "bne", [a, b, target]) => {
+            let (a, b) = swap_pair(a, b)?;
+            (format!("    {cm} {a}, {b}, {target}"), REG_NONE)
+        }
+        ("sltu", [d, a, b]) => {
+            let (a, b) = swap_pair(a, b)?;
+            (format!("    sltu {d}, {a}, {b}"), parse_reg(d))
+        }
+        // A difference that only a zero test reads (`sub; seqz`, `xor;
+        // bnez`): zero exactly when the operands are equal, in either form.
+        ("sub" | "xor", [d, a, b]) => {
+            let (a, b) = swap_pair(a, b)?;
+            let dreg = parse_reg(d);
+            let z = rv_next_kept_line(kinds, c + 1, n);
+            let (zm, zops) = lines.get(z)?.trim().split_once(' ')?;
+            let zops: Vec<&str> = zops.split(',').map(str::trim).collect();
+            let zero_test_only = match (zm, zops.as_slice()) {
+                ("seqz" | "snez", [e, x]) => {
+                    parse_reg(x) == dreg
+                        && (parse_reg(e) == dreg || live.dead_after(lines, kinds, z, dreg))
+                }
+                ("beqz" | "bnez", [x, _]) => {
+                    parse_reg(x) == dreg && live.dead_after(lines, kinds, z, dreg)
+                }
+                _ => false,
+            };
+            if dreg == REG_NONE || !zero_test_only {
+                return None;
+            }
+            (format!("    {cm} {d}, {a}, {b}"), dreg)
+        }
+        _ => return None,
+    };
+    for t in [t1, t2] {
+        if t != dst && !live.dead_after(lines, kinds, c, t) {
+            return None;
+        }
+    }
+    lines[c] = replacement;
+    kinds[c] = classify_line(&lines[c]);
+    kinds[i..=last1].fill(LineKind::Nop);
+    kinds[j..=last2].fill(LineKind::Nop);
+    live.invalidate();
+    Some(c)
+}
+
 /// How a line reads only the sign of register `t`: `slti d,t,0`,
 /// `slt d,t,zero` and `srli d,t,63` leave the sign bit in `d`; `bltz`/`bgez`
 /// (and their `blt`/`bge`/`bgt`/`ble` spellings against `zero`) branch on it.
@@ -2653,6 +2750,20 @@ fn rv_produced_range(mnem: &str, imm: Option<i64>, src: RvRange) -> Option<RvRan
             None => RV_WORD,
         },
         "addi" => imm.map_or(RV_FULL, |v| rv_offset_range(src, v)),
+        // Two non-negative operands keep every bit above the higher one's
+        // top bit clear: `xori t, s, 1` of a 0/1 `s` is 0/1 again (`x >= 0`
+        // as `slti; xori`), which a `sext.w` of it then cannot change.
+        "xori" | "ori" => match imm.filter(|v| *v >= 0) {
+            Some(v) if src.0 >= 0 => {
+                let bits = 64 - (src.1 | v).leading_zeros();
+                if bits >= 63 {
+                    RV_FULL
+                } else {
+                    (0, (1i64 << bits) - 1)
+                }
+            }
+            _ => RV_FULL,
+        },
         // The low word plus `v`, sign-extended: the offset range itself when
         // both it and the source are words.
         "addiw" => match imm.map(|v| rv_offset_range(src, v)) {
@@ -2715,6 +2826,11 @@ fn eliminate_redundant_sign_extensions(
         if let Some(c) = rv_fold_extension_into_compare(lines, kinds, n, i, &rng, &mut live) {
             // The compare is read next with its new source; the extension's
             // destination was never written, so its range stands.
+            changed = true;
+            i = c;
+            continue;
+        }
+        if let Some(c) = rv_fold_paired_zero_extensions(lines, kinds, n, i, &rng, &mut live) {
             changed = true;
             i = c;
             continue;
@@ -7284,6 +7400,9 @@ fn propagate_copies_within_blocks(lines: &mut [String], kinds: &mut [LineKind], 
 use crate::backend::peephole_common::replace_whole_word;
 use crate::backend::peephole_common::{has_whole_word, replace_source_reg_in_instruction};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+
+#[path = "peephole_branch.rs"]
+mod branch;
 
 // ── Global dead store elimination ────────────────────────────────────────────
 //

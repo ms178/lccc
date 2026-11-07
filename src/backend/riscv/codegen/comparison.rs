@@ -516,11 +516,18 @@ impl RiscvCodegen {
             }
             // Two constants a power of two apart: a shifted bit plus the
             // smaller one (an `addi` immediate).
+            let bit = |on_true: bool, s: u32| {
+                if s == 0 {
+                    Mask::Bool { on_true }
+                } else {
+                    Mask::Shift { on_true, s }
+                }
+            };
             if let Some(s) = pow2(a.wrapping_sub(b)).filter(|&s| s < 63)
                 && imm12(b)
             {
                 return Some(SelectPlan {
-                    mask: Mask::Shift { on_true: true, s },
+                    mask: bit(true, s),
                     base: Base::Imm(b),
                     boolean,
                 });
@@ -529,7 +536,7 @@ impl RiscvCodegen {
                 && imm12(a)
             {
                 return Some(SelectPlan {
-                    mask: Mask::Shift { on_true: false, s },
+                    mask: bit(false, s),
                     base: Base::Imm(a),
                     boolean,
                 });
@@ -634,6 +641,9 @@ impl RiscvCodegen {
                 }
             }
         }
+        // t0 no longer holds the condition the accumulator cache recorded:
+        // `c ? c + 4 : c` would otherwise read the mask back as `x`.
+        self.state.reg_cache.invalidate_acc();
         let w = if ty == IrType::I32 { "w" } else { "" };
         match plan.base {
             Base::Zero => {}
