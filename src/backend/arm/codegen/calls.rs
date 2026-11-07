@@ -576,6 +576,9 @@ impl ArmCodegen {
             self.emit_call_store_i128_result_impl(dest);
         } else if return_type.is_long_double() {
             self.emit_call_store_f128_result_impl(dest);
+        } else if matches!(return_type, IrType::F32 | IrType::F64)
+            && self.store_fp_call_result_direct(dest, return_type == IrType::F32)
+        {
         } else if return_type == IrType::F32 {
             self.state.emit("    fmov w0, s0");
             self.emit_store_result(dest);
@@ -585,6 +588,35 @@ impl ArmCodegen {
         } else {
             self.emit_store_result(dest);
         }
+    }
+
+    /// Store an `f32`/`f64` call result from s0/d0 straight into its home:
+    /// an FP register (`fmov d16, d0`), a general one (`fmov x5, d0`) or a
+    /// frame slot (`str d0, [sp, #off]`) -- the generic path bounced it
+    /// through x0 (`fmov x0, d0; str x0, [...]`).  x0 then holds whatever
+    /// the callee left, so the accumulator cache forgets it.  `false` when
+    /// `dest` has no home (the generic path keeps it in x0).
+    fn store_fp_call_result_direct(&mut self, dest: &Value, single: bool) -> bool {
+        let fp = if single { 's' } else { 'd' };
+        if let Some(&home) = self.reg_assignments.get(&dest.0) {
+            if is_arm_fp_phys(home) {
+                self.state
+                    .emit_fmt(format_args!("    fmov {fp}{}, {fp}0", home.0 - 24));
+            } else {
+                let gpr = if single {
+                    super::emit::callee_saved_name_32(home)
+                } else {
+                    super::emit::callee_saved_name(home)
+                };
+                self.state.emit_fmt(format_args!("    fmov {gpr}, {fp}0"));
+            }
+        } else if let Some(slot) = self.state.get_slot(dest.0) {
+            self.emit_store_to_sp(&format!("{fp}0"), slot.0, "str");
+        } else {
+            return false;
+        }
+        self.state.reg_cache.invalidate_acc();
+        true
     }
 
     pub(super) fn emit_call_store_f128_result_impl(&mut self, dest: &Value) {
