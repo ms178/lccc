@@ -47,10 +47,13 @@ FIXTURES = (
     "sibcall_select_staging_cross", "switch_tree_cross",
     # Every atomic builtin at every width (8..128 bits) and ordering, with
     # register-homed pointers and values live across the sequences.
-    "atomic_ops_cross",
+    "atomic_ops_cross", "memcpy_snapshot_alias",
 )
 ALL_LEVELS = ("-O0", "-O1", "-O2", "-Os")
 LEVELS = {
+    # A copied aggregate is a snapshot even when a later call or aliased store
+    # modifies its original source.
+    "memcpy_snapshot_alias": ALL_LEVELS + ("-O3",),
     # 128-bit selectors: the low half alone was compared (AArch64, RV64) and
     # wide case values were truncated to i64 (every target).
     "switch_i128_high_half": ALL_LEVELS,
