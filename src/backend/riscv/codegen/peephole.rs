@@ -3596,26 +3596,51 @@ fn eliminate_li_mv_chain(lines: &mut [String], kinds: &mut [LineKind], n: usize)
         if let LineKind::LoadImm { dst: imm_dst } = kinds[i] {
             // Only optimize when the immediate dest is a temp register (t0-t6)
             if imm_dst <= REG_T6 {
+                // Every copy of the temporary up to its next write, in the
+                // straight-line run: the call staging's `li t4, 7; mv a0,
+                // a2; mv a1, t4` copies the constant past another argument.
+                // Each copy becomes the `li` itself (as cheap as `mv`), and
+                // the original dies once none is left.
                 let mut j = i + 1;
-                while j < n && kinds[j] == LineKind::Nop {
-                    j += 1;
-                }
-                if j < n {
+                while j < n {
+                    match kinds[j] {
+                        LineKind::Nop | LineKind::Directive => {
+                            j += 1;
+                            continue;
+                        }
+                        LineKind::Label
+                        | LineKind::Branch
+                        | LineKind::Jump
+                        | LineKind::Call
+                        | LineKind::Ret => break,
+                        _ => {}
+                    }
+                    if lines[j] == OPAQUE_LINE || has_unmodelled_effects(&lines[j]) {
+                        break;
+                    }
                     if let LineKind::Move {
                         dst: mv_dst,
                         src: mv_src,
                     } = kinds[j]
+                        && mv_src == imm_dst
+                        && let Some(new_line) = retarget_li(lines[i].trim(), mv_dst)
                     {
-                        if mv_src == imm_dst {
-                            // Retarget the li to the move destination
-                            let trimmed = lines[i].trim();
-                            if let Some(new_line) = retarget_li(trimmed, mv_dst) {
-                                lines[j] = format!("    {}", new_line);
-                                kinds[j] = LineKind::LoadImm { dst: mv_dst };
-                                changed = true;
-                            }
+                        lines[j] = format!("    {}", new_line);
+                        kinds[j] = LineKind::LoadImm { dst: mv_dst };
+                        changed = true;
+                        if mv_dst == imm_dst {
+                            break;
                         }
+                        j += 1;
+                        continue;
                     }
+                    let (_, defs) = rv_uses_defs(&lines[j], kinds[j]);
+                    if defs & rv_bit(imm_dst) != 0
+                        || named_gp_dest(&lines[j], kinds[j]) == Some(imm_dst)
+                    {
+                        break;
+                    }
+                    j += 1;
                 }
             }
         }
@@ -3859,20 +3884,76 @@ fn retarget_dying_accumulator_moves(
                 i += 1;
                 continue;
             };
+            // The copy of the result may sit a few lines on, past lines that
+            // neither touch the result nor the copy's destination (`addw a2,
+            // a0, a1; li t4, 7; mv a0, a2`): the producer can write the
+            // destination there as well.  `between` collects what those
+            // lines read and write.
             let mut j = i + 1;
-            while j < fend && kinds[j] == LineKind::Nop {
+            let mut between = 0u64;
+            let mut window = 0;
+            let copy = loop {
+                while j < fend && kinds[j] == LineKind::Nop {
+                    j += 1;
+                }
+                let Some(kind) = kinds.get(j).copied().filter(|_| j < fend) else {
+                    break None;
+                };
+                if let LineKind::Move { src, .. } = kind
+                    && src == tmp
+                {
+                    break Some(kind);
+                }
+                window += 1;
+                if window > 8
+                    || matches!(
+                        kind,
+                        LineKind::Label
+                            | LineKind::Branch
+                            | LineKind::Jump
+                            | LineKind::Call
+                            | LineKind::Ret
+                            | LineKind::Directive
+                    )
+                    || lines[j] == OPAQUE_LINE
+                    || has_unmodelled_effects(&lines[j])
+                {
+                    break None;
+                }
+                let (uses, defs) = rv_uses_defs(&lines[j], kind);
+                let (ireads, iwrites) = classify_implicit_operands_rv(&lines[j]);
+                let touched = uses | defs | ireads | iwrites;
+                if touched & rv_bit(tmp) != 0 {
+                    break None;
+                }
+                between |= touched;
                 j += 1;
-            }
-            let Some(LineKind::Move { dst, src }) = kinds.get(j).copied() else {
+            };
+            let Some(LineKind::Move { dst, src }) = copy else {
                 i += 1;
                 continue;
             };
             // A value home is never a scratch, and `s0`, `sp` and `ra` carry
-            // meaning of their own: leave those consumers alone.
-            if src != tmp || dst == tmp || dst == REG_S0 || dst == REG_SP || dst == REG_RA {
+            // meaning of their own: leave those consumers alone.  The lines
+            // in between must neither read nor write the destination the
+            // producer now writes before them.
+            // A value home moves only into another home: into a scratch it
+            // frees nothing, costs the compressed encodings the a- and
+            // s-registers have, and turns `sext.w a0, a0; mv t0, a0; mv a0,
+            // t0` into `sext.w t0, a0; mv a0, t0` instead of letting the
+            // round trip fold away.
+            if src != tmp
+                || dst == tmp
+                || dst == REG_S0
+                || dst == REG_SP
+                || dst == REG_RA
+                || (tmp > REG_T6 && dst <= REG_T6)
+                || between & rv_bit(dst) != 0
+            {
                 i += 1;
                 continue;
             }
+
             // The scratch must die at the move: the local scan settles
             // straight-line code, the function's liveness what lies past a
             // branch or a label (built once, on the first such question --

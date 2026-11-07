@@ -4,6 +4,46 @@ use super::emit::RiscvCodegen;
 use crate::common::types::IrType;
 use crate::ir::reexports::{IrCmpOp, IrConst, Operand, Value};
 
+/// A mask of a select's condition (`branch_free_select`): set (to the
+/// value shown) when the condition is `on_true`, 0 otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mask {
+    /// 1: `snez` / `seqz`.
+    Bool { on_true: bool },
+    /// `1 << s`: then `slli`.
+    Shift { on_true: bool, s: u32 },
+    /// All ones: then `neg`.
+    Neg { on_true: bool },
+    /// `k` (12-bit): the opposite bit, `addi -1`, `andi k`.
+    And { on_true: bool, k: i64 },
+}
+
+/// What the mask combines with.
+#[derive(Clone, Debug, PartialEq)]
+enum Base {
+    /// Nothing: the mask is the result.
+    Zero,
+    /// `addi` of the other constant.
+    Imm(i64),
+    /// The shared operand of `c ? x op K : x`.
+    Value(Operand, BaseOp),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BaseOp {
+    Add,
+    Or,
+    Xor,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SelectPlan {
+    mask: Mask,
+    base: Base,
+    /// The condition is a compare's 0/1 result: `snez` is the identity.
+    boolean: bool,
+}
+
 /// An integer compare against a constant, as the I-type sequence that leaves
 /// the 0/1 result in `t0` from the extended register operand in `t1`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -369,8 +409,12 @@ impl RiscvCodegen {
         cond: &Operand,
         true_val: &Operand,
         false_val: &Operand,
-        _ty: IrType,
+        ty: IrType,
     ) {
+        if let Some(plan) = self.branch_free_select(cond, true_val, false_val, ty) {
+            self.emit_branch_free_select(dest, cond, plan, ty);
+            return;
+        }
         let label_id = self.state.next_label_id();
         let skip_label = format!(".Lsel_skip_{}", label_id);
 
@@ -394,6 +438,205 @@ impl RiscvCodegen {
 
         // Move result to t0 and store
         self.state.emit("    mv t0, t2");
+        self.state.reg_cache.invalidate_acc();
+        self.store_t0_to(dest);
+    }
+
+    /// The branch-free form of an integer select, when one beats the
+    /// branch (GCC 16.2's and Clang 23.1.5's RV64 shapes): a mask of the
+    /// condition -- `snez`/`seqz`, then a shift, a negation or `addi -1;
+    /// andi` -- alone (a constant against zero), plus a constant (two
+    /// constants a power of two apart), or applied to the shared operand of
+    /// `c ? x op K : x` (`op` add, sub, or, xor).  `None` for every other
+    /// select, and for types whose register form a mask cannot keep: only
+    /// `int` (sign-extended words) and the 64-bit types.
+    fn branch_free_select(
+        &self,
+        cond: &Operand,
+        true_val: &Operand,
+        false_val: &Operand,
+        ty: IrType,
+    ) -> Option<SelectPlan> {
+        use crate::ir::reexports::{Instruction, IrBinOp};
+        let word = match ty {
+            IrType::I32 => true,
+            IrType::I64 | IrType::U64 | IrType::Ptr => false,
+            _ => return None,
+        };
+        // The register value of a constant in the type's form.
+        let canon = |op: &Operand| -> Option<i64> {
+            let Operand::Const(c) = op else {
+                return None;
+            };
+            let v = c.to_i64()?;
+            Some(if word { i64::from(v as i32) } else { v })
+        };
+        let pow2 = |v: i64| (v > 0 && v.count_ones() == 1).then(|| v.trailing_zeros());
+        let imm12 = |v: i64| (-2048..2048).contains(&v);
+        let boolean = match cond {
+            Operand::Value(v) => matches!(
+                self.get_defining_instruction(v.0),
+                Some(Instruction::Cmp { .. })
+            ),
+            Operand::Const(_) => false,
+        };
+        // A mask that is `k` when the condition holds (`on_true`) or fails,
+        // 0 otherwise.
+        let mask = |k: i64, on_true: bool| -> Option<Mask> {
+            if k == 1 {
+                Some(Mask::Bool { on_true })
+            } else if let Some(s) = pow2(k).filter(|&s| s < 63) {
+                Some(Mask::Shift { on_true, s })
+            } else if k == -1 {
+                Some(Mask::Neg { on_true })
+            } else if imm12(k) {
+                Some(Mask::And { on_true, k })
+            } else {
+                None
+            }
+        };
+        if let (Some(a), Some(b)) = (canon(true_val), canon(false_val)) {
+            if a == b {
+                return None;
+            }
+            // Against zero: the mask is the result.
+            if b == 0 {
+                return Some(SelectPlan { mask: mask(a, true)?, base: Base::Zero, boolean });
+            }
+            if a == 0 {
+                return Some(SelectPlan { mask: mask(b, false)?, base: Base::Zero, boolean });
+            }
+            // Two constants a power of two apart: a shifted bit plus the
+            // smaller one (an `addi` immediate).
+            if let Some(s) = pow2(a.wrapping_sub(b)).filter(|&s| s < 63)
+                && imm12(b)
+            {
+                return Some(SelectPlan {
+                    mask: Mask::Shift { on_true: true, s },
+                    base: Base::Imm(b),
+                    boolean,
+                });
+            }
+            if let Some(s) = pow2(b.wrapping_sub(a)).filter(|&s| s < 63)
+                && imm12(a)
+            {
+                return Some(SelectPlan {
+                    mask: Mask::Shift { on_true: false, s },
+                    base: Base::Imm(a),
+                    boolean,
+                });
+            }
+            return None;
+        }
+        // `c ? x op K : x` (or the mirror): `x op (c ? K : 0)`.
+        let op_of = |v: &Operand, x: &Operand| -> Option<(BaseOp, i64)> {
+            let Operand::Value(v) = v else {
+                return None;
+            };
+            let Instruction::BinOp {
+                op,
+                lhs,
+                rhs,
+                ty: bty,
+                ..
+            } = self.get_defining_instruction(v.0)?
+            else {
+                return None;
+            };
+            if *bty != ty {
+                return None;
+            }
+            let same = |o: &Operand| match (o, x) {
+                (Operand::Value(a), Operand::Value(b)) => a.0 == b.0,
+                _ => false,
+            };
+            let (k, commuted) = if same(lhs) {
+                (canon(rhs)?, false)
+            } else if same(rhs) {
+                (canon(lhs)?, true)
+            } else {
+                return None;
+            };
+            match op {
+                IrBinOp::Add => Some((BaseOp::Add, k)),
+                IrBinOp::Sub if !commuted => {
+                    let neg = k.checked_neg()?;
+                    Some((BaseOp::Add, if word { i64::from(neg as i32) } else { neg }))
+                }
+                IrBinOp::Or => Some((BaseOp::Or, k)),
+                IrBinOp::Xor => Some((BaseOp::Xor, k)),
+                _ => None,
+            }
+        };
+        let (on_true, x, (op, k)) = if let Some(pk) = op_of(true_val, false_val) {
+            (true, false_val, pk)
+        } else if let Some(pk) = op_of(false_val, true_val) {
+            (false, true_val, pk)
+        } else {
+            return None;
+        };
+        if !matches!(x, Operand::Value(_)) || k == 0 {
+            return None;
+        }
+        // `-1` would need a negation where `addi -1` (the `And` form of a
+        // 12-bit K) is as short; keep the forms GCC and Clang emit.
+        let m = match mask(k, on_true)? {
+            Mask::Neg { on_true } => Mask::And { on_true, k: -1 },
+            m => m,
+        };
+        Some(SelectPlan {
+            mask: m,
+            base: Base::Value(x.clone(), op),
+            boolean,
+        })
+    }
+
+    /// Emit a `branch_free_select` plan into `dest`.
+    fn emit_branch_free_select(&mut self, dest: &Value, cond: &Operand, plan: SelectPlan, ty: IrType) {
+        self.operand_to_t0(cond);
+        // The condition as 0/1 for "the mask is set": `snez` when the mask
+        // follows the condition (skipped for a compare's 0/1 result),
+        // `seqz` when it follows its negation.  The `And` form builds
+        // `b - 1` from the opposite bit: 0 - 1 = all ones.
+        let set_on_true = match plan.mask {
+            Mask::Bool { on_true } | Mask::Shift { on_true, .. } | Mask::Neg { on_true } => on_true,
+            Mask::And { on_true, .. } => !on_true,
+        };
+        if !set_on_true {
+            self.state.emit("    seqz t0, t0");
+        } else if !plan.boolean {
+            self.state.emit("    snez t0, t0");
+        }
+        match plan.mask {
+            Mask::Bool { .. } => {}
+            Mask::Shift { s, .. } => {
+                self.state.emit_fmt(format_args!("    slli t0, t0, {}", s));
+            }
+            Mask::Neg { .. } => self.state.emit("    neg t0, t0"),
+            Mask::And { k, .. } => {
+                self.state.emit("    addi t0, t0, -1");
+                if k != -1 {
+                    self.state.emit_fmt(format_args!("    andi t0, t0, {}", k));
+                }
+            }
+        }
+        let w = if ty == IrType::I32 { "w" } else { "" };
+        match plan.base {
+            Base::Zero => {}
+            Base::Imm(b) => {
+                self.state.emit_fmt(format_args!("    addi{w} t0, t0, {}", b));
+            }
+            Base::Value(x, op) => {
+                self.state.emit("    mv t1, t0");
+                self.operand_to_t0(&x);
+                let m = match op {
+                    BaseOp::Add => format!("add{w}"),
+                    BaseOp::Or => "or".to_string(),
+                    BaseOp::Xor => "xor".to_string(),
+                };
+                self.state.emit_fmt(format_args!("    {m} t0, t0, t1"));
+            }
+        }
         self.state.reg_cache.invalidate_acc();
         self.store_t0_to(dest);
     }
