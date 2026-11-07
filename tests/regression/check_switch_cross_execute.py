@@ -377,12 +377,18 @@ def main():
             for fixture in (f for f in INTEROP if f in selected):
                 base = ROOT / "tests/regression/interop" / fixture
                 levels = INTEROP_LEVELS_BY_FIXTURE.get(fixture, INTEROP_LEVELS)
+                # Clang distributions differ in their AArch64 outline-atomics
+                # default. This freestanding binary has no compiler-rt, so
+                # require inline LL/SC instead of unresolved __aarch64_* calls.
+                fixture_clang_flags = [*clang_flags]
+                if fixture == "atomic_interop" and arch == "aarch64":
+                    fixture_clang_flags.append("-mno-outline-atomics")
                 units = {}
                 for unit in ("callee", "caller"):
                     source = str(base) + f"_{unit}.c"
                     units[unit, "clang"] = work / f"{unit}-clang.o"
                     # Validates the fixture itself: Clang must accept it.
-                    subprocess.run([args.clang, *clang_flags, "-c", source, "-o", str(units[unit, "clang"])],
+                    subprocess.run([args.clang, *fixture_clang_flags, "-c", source, "-o", str(units[unit, "clang"])],
                                    check=True, timeout=30)
                     for level in levels:
                         units[unit, level] = work / f"{unit}-lccc{level}.o"
@@ -412,7 +418,7 @@ def main():
                     mutant = work / "atomic-mutant.o"
                     exe = work / "atomic-mutant"
                     source = str(base) + "_callee.c"
-                    subprocess.run([args.clang, *clang_flags, "-DATOMIC_INTEROP_MUTANT",
+                    subprocess.run([args.clang, *fixture_clang_flags, "-DATOMIC_INTEROP_MUTANT",
                                     "-c", source, "-o", str(mutant)], check=True, timeout=30)
                     subprocess.run([*linker, "-m", emulation, "-static", "-e", "_start",
                                     str(startup), str(mutant), str(units["caller", "clang"]),
