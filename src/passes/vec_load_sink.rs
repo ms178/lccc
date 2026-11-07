@@ -266,12 +266,10 @@ pub(crate) fn sink_vector_loads(func: &mut IrFunction) -> usize {
                     consumer
                 ));
             }
-            let inst = block.instructions.remove(i);
-            block.instructions.insert(uj - 1, inst);
-            if block.source_spans.len() > uj - 1 {
-                let span = block.source_spans.remove(i);
-                block.source_spans.insert(uj - 1, span);
-            }
+            let span = block.span_at(i);
+            let inline_id = block.inline_id_at(i);
+            let inst = block.remove_inst(i);
+            block.insert_inst_inline(uj - 1, inst, span, inline_id);
             // The permutation `remove(i); insert(uj-1)` shifts every recorded
             // use site strictly inside (i, uj) down by one; sites at uj (the
             // moved load's own consumer) and outside the window are stable.

@@ -509,18 +509,19 @@ pub(crate) fn run_with_aliases_tls(
                 )
             })
             .count();
+        let (old_spans, old_ids) = block.take_parallel_debug();
         let old_insts = std::mem::take(&mut block.instructions);
         let old_len = old_insts.len();
-        let lockstep = block.source_spans.len() == old_len;
-        let old_spans = if lockstep {
-            std::mem::take(&mut block.source_spans)
-        } else {
-            block.source_spans.clear();
-            Vec::new()
-        };
+        let lockstep = !old_spans.is_empty();
+        let ids_parallel = !old_ids.is_empty();
         let mut new_insts = Vec::with_capacity(old_insts.len() + add.len());
         let mut new_spans = if lockstep {
             Vec::with_capacity(old_spans.len() + add.len())
+        } else {
+            Vec::new()
+        };
+        let mut new_ids = if ids_parallel {
+            Vec::with_capacity(old_ids.len() + add.len())
         } else {
             Vec::new()
         };
@@ -534,6 +535,9 @@ pub(crate) fn run_with_aliases_tls(
                     if lockstep {
                         new_spans.push(dummy);
                     }
+                    if ids_parallel {
+                        new_ids.push(crate::ir::instruction::NO_INLINE_INSTANCE);
+                    }
                 }
             }
             let remove = matches!(&inst, Instruction::GlobalAddr { dest, .. } if delete_ids.contains(&dest.0));
@@ -541,6 +545,9 @@ pub(crate) fn run_with_aliases_tls(
                 new_insts.push(inst);
                 if lockstep {
                     new_spans.push(old_spans[ii]);
+                }
+                if ids_parallel {
+                    new_ids.push(old_ids[ii]);
                 }
             }
         }
@@ -554,12 +561,12 @@ pub(crate) fn run_with_aliases_tls(
                 if lockstep {
                     new_spans.push(dummy);
                 }
+                if ids_parallel {
+                    new_ids.push(crate::ir::instruction::NO_INLINE_INSTANCE);
+                }
             }
         }
-        block.instructions = new_insts;
-        if lockstep {
-            block.source_spans = new_spans;
-        }
+        block.replace_insts_inline(new_insts, new_spans, new_ids);
     }
     func.next_value_id = next_id;
     let n = delete_ids.len();

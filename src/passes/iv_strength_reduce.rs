@@ -986,6 +986,9 @@ fn reduce_loop(
         let ph_has_spans = !func.blocks[preheader].source_spans.is_empty();
         let hdr_has_spans = !func.blocks[header].source_spans.is_empty();
         let bb_has_spans = !func.blocks[back_blocks[0]].source_spans.is_empty();
+        let ph_has_ids = !func.blocks[preheader].source_inline_ids.is_empty();
+        let hdr_has_ids = !func.blocks[header].source_inline_ids.is_empty();
+        let bb_has_ids = !func.blocks[back_blocks[0]].source_inline_ids.is_empty();
 
         // 1. Add init_ptr computation to end of preheader
         for inst in preheader_insts {
@@ -994,6 +997,11 @@ fn reduce_loop(
                 func.blocks[preheader]
                     .source_spans
                     .push(crate::common::source::Span::dummy());
+            }
+            if ph_has_ids {
+                func.blocks[preheader]
+                    .source_inline_ids
+                    .push(crate::ir::instruction::NO_INLINE_INSTANCE);
             }
         }
 
@@ -1011,6 +1019,11 @@ fn reduce_loop(
                 .source_spans
                 .insert(insert_pos, crate::common::source::Span::dummy());
         }
+        if hdr_has_ids {
+            func.blocks[header]
+                .source_inline_ids
+                .insert(insert_pos, crate::ir::instruction::NO_INLINE_INSTANCE);
+        }
         header_phi_insertions += 1;
 
         // 3. Add increment to end of back-edge block
@@ -1019,6 +1032,11 @@ fn reduce_loop(
             func.blocks[back_blocks[0]]
                 .source_spans
                 .push(crate::common::source::Span::dummy());
+        }
+        if bb_has_ids {
+            func.blocks[back_blocks[0]]
+                .source_inline_ids
+                .push(crate::ir::instruction::NO_INLINE_INSTANCE);
         }
 
         // 4. Replace every original address use in this semantic group with
@@ -1204,6 +1222,11 @@ fn reduce_loop(
                                 .source_spans
                                 .push(crate::common::source::Span::dummy());
                         }
+                        if !func.blocks[preheader].source_inline_ids.is_empty() {
+                            func.blocks[preheader]
+                                .source_inline_ids
+                                .push(crate::ir::instruction::NO_INLINE_INSTANCE);
+                        }
                         init_v = adjusted;
                     }
                     let j_init_val = Value(next_id);
@@ -1221,6 +1244,11 @@ fn reduce_loop(
                         func.blocks[preheader]
                             .source_spans
                             .push(crate::common::source::Span::dummy());
+                    }
+                    if !func.blocks[preheader].source_inline_ids.is_empty() {
+                        func.blocks[preheader]
+                            .source_inline_ids
+                            .push(crate::ir::instruction::NO_INLINE_INSTANCE);
                     }
                     Operand::Value(j_init_val)
                 }
@@ -1248,6 +1276,11 @@ fn reduce_loop(
                     .source_spans
                     .insert(insert_pos, crate::common::source::Span::dummy());
             }
+            if !func.blocks[header].source_inline_ids.is_empty() {
+                func.blocks[header]
+                    .source_inline_ids
+                    .insert(insert_pos, crate::ir::instruction::NO_INLINE_INSTANCE);
+            }
 
             // Latch: j_next = j + step*C  (same wraparound domain).
             let inc_inst = Instruction::BinOp {
@@ -1262,6 +1295,11 @@ fn reduce_loop(
                 func.blocks[back_blocks[0]]
                     .source_spans
                     .push(crate::common::source::Span::dummy());
+            }
+            if !func.blocks[back_blocks[0]].source_inline_ids.is_empty() {
+                func.blocks[back_blocks[0]]
+                    .source_inline_ids
+                    .push(crate::ir::instruction::NO_INLINE_INSTANCE);
             }
 
             // Rewrite every use of every grouped multiply to j.  Operands

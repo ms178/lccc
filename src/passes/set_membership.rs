@@ -733,6 +733,7 @@ fn fold_round(func: &mut IrFunction) -> usize {
                 new_insts.extend(insts);
                 func.blocks[early_bi].instructions = new_insts;
                 func.blocks[early_bi].source_spans.clear();
+                func.blocks[early_bi].source_inline_ids.clear();
                 func.blocks[early_bi].terminator = Terminator::CondBranch {
                     cond: Operand::Value(cmp_v),
                     true_label: join,
@@ -1088,6 +1089,7 @@ fn fold_round(func: &mut IrFunction) -> usize {
         head_insts.extend(b1);
         func.blocks[head_bi].instructions = head_insts;
         func.blocks[head_bi].source_spans.clear();
+        func.blocks[head_bi].source_inline_ids.clear();
         func.blocks[head_bi].terminator = Terminator::CondBranch {
             cond: Operand::Value(out_v),
             true_label: guard_miss,

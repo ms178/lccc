@@ -205,10 +205,7 @@ fn remove_boolean_phi_branch_casts(func: &mut IrFunction) -> usize {
         if let Terminator::CondBranch { cond, .. } = &mut block.terminator {
             *cond = Operand::Value(source);
         }
-        block.instructions.remove(position);
-        if position < block.source_spans.len() {
-            block.source_spans.remove(position);
-        }
+        block.remove_inst(position);
         removed += 1;
     }
     removed

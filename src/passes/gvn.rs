@@ -1973,6 +1973,8 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
     let instructions_len = func.blocks[block_idx].instructions.len();
     let mut new_spans = std::mem::take(&mut func.blocks[block_idx].source_spans);
     let spans_in_lockstep = new_spans.len() == instructions_len;
+    let mut new_ids = std::mem::take(&mut func.blocks[block_idx].source_inline_ids);
+    let ids_in_lockstep = new_ids.len() == instructions_len;
 
     for inst in func.blocks[block_idx].instructions.drain(..) {
         // Memory invalidation: true clobbers (calls, atomics, asm, ...) and
@@ -2338,6 +2340,9 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                         if spans_in_lockstep {
                             new_spans.remove(new_instructions.len());
                         }
+                        if ids_in_lockstep {
+                            new_ids.remove(new_instructions.len());
+                        }
                         eliminated += 1;
                         continue;
                     }
@@ -2488,8 +2493,16 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
         new_spans.len(),
         new_instructions.len()
     );
+    debug_assert!(
+        !ids_in_lockstep || new_ids.len() == new_instructions.len(),
+        "GVN inline-id bookkeeping desynced in block {}: {} ids for {} instructions",
+        block_idx,
+        new_ids.len(),
+        new_instructions.len()
+    );
     func.blocks[block_idx].instructions = new_instructions;
     func.blocks[block_idx].source_spans = new_spans;
+    func.blocks[block_idx].source_inline_ids = new_ids;
     eliminated
 }
 

@@ -1092,10 +1092,12 @@ impl Lowerer {
             let Some(entry) = self.func_state.as_mut().and_then(|s| s.blocks.first_mut()) else {
                 return;
             };
-            entry.instructions.insert(pos, Self::init_call(init_symbol));
-            if !entry.source_spans.is_empty() {
-                entry.source_spans.insert(pos, Span::dummy());
-            }
+            entry.insert_inst_inline(
+                pos,
+                Self::init_call(init_symbol),
+                Span::dummy(),
+                crate::ir::instruction::NO_INLINE_INSTANCE,
+            );
             return;
         }
 
@@ -1111,13 +1113,25 @@ impl Lowerer {
         let Some(entry) = f.blocks.first_mut() else {
             return;
         };
-        let tracked = !entry.source_spans.is_empty();
+        // Take BOTH debug arrays atomically before splitting: they are then
+        // either empty or exactly as long as the instruction list, so
+        // `split_off(pos)` cannot panic even on already-drifted input.
+        let (mut entry_spans, mut entry_ids) = entry.take_parallel_debug();
         let tail = entry.instructions.split_off(pos);
+        let tracked = !entry_spans.is_empty();
+        let tracked_ids = !entry_ids.is_empty();
         let tail_spans = if tracked {
-            entry.source_spans.split_off(pos)
+            entry_spans.split_off(pos)
         } else {
             Vec::new()
         };
+        let tail_ids = if tracked_ids {
+            entry_ids.split_off(pos)
+        } else {
+            Vec::new()
+        };
+        entry.source_spans = entry_spans;
+        entry.source_inline_ids = entry_ids;
         let old_terminator = std::mem::replace(
             &mut entry.terminator,
             Terminator::CondBranch {
@@ -1147,12 +1161,17 @@ impl Lowerer {
         if tracked {
             entry.source_spans.extend([Span::dummy(); 3]);
         }
+        if tracked_ids {
+            entry
+                .source_inline_ids
+                .extend([crate::ir::instruction::NO_INLINE_INSTANCE; 3]);
+        }
         f.blocks.push(BasicBlock {
             label: hot,
             instructions: tail,
             terminator: old_terminator,
             source_spans: tail_spans,
-            source_inline_ids: Vec::new(),
+            source_inline_ids: tail_ids,
         });
         f.blocks.push(BasicBlock {
             label: cold,
@@ -1163,7 +1182,11 @@ impl Lowerer {
             } else {
                 Vec::new()
             },
-            source_inline_ids: Vec::new(),
+            source_inline_ids: if tracked_ids {
+                vec![crate::ir::instruction::NO_INLINE_INSTANCE]
+            } else {
+                Vec::new()
+            },
         });
         // The edges that used to leave the entry block leave `hot` now, so phi
         // operands in the successor blocks must name `hot` instead of the

@@ -674,13 +674,15 @@ fn revert_pointer_iv(func: &mut IrFunction, ptr_iv: &IvsrPointerIV) -> bool {
         }
 
         let block = &mut func.blocks[block_idx];
-        let has_spans = !block.source_spans.is_empty();
+        let (old_spans, old_ids) = block.take_parallel_debug();
+        let has_spans = !old_spans.is_empty();
+        let has_ids = !old_ids.is_empty();
 
         let old_insts = std::mem::take(&mut block.instructions);
-        let old_spans = std::mem::take(&mut block.source_spans);
 
         let mut new_insts = Vec::with_capacity(old_insts.len() + 8);
         let mut new_spans = Vec::with_capacity(old_insts.len() + 8);
+        let mut new_ids = Vec::with_capacity(old_insts.len() + 8);
 
         // Per-block address cache:
         // - cached_scaled_index: Some(Value) if Shl was emitted in this block
@@ -697,77 +699,99 @@ fn revert_pointer_iv(func: &mut IrFunction, ptr_iv: &IvsrPointerIV) -> bool {
 
             if let Some(&offset) = use_map.get(&(block_idx, inst_idx)) {
                 // Step 1: Ensure base offset (index * stride) is available in this block
-                let (index_operand, is_scaled) = if ptr_iv.stride == 1 {
-                    (Operand::Value(ptr_iv.index_iv), false)
-                } else {
-                    let scaled_val = match cached_scaled_index {
-                        Some(val) => val,
-                        None => {
-                            let shift_amount = ptr_iv.stride.trailing_zeros();
-                            let val = Value(next_val_id);
-                            next_val_id += 1;
+                let (index_operand, is_scaled) =
+                    if ptr_iv.stride == 1 {
+                        (Operand::Value(ptr_iv.index_iv), false)
+                    } else {
+                        let scaled_val =
+                            match cached_scaled_index {
+                                Some(val) => val,
+                                None => {
+                                    let shift_amount = ptr_iv.stride.trailing_zeros();
+                                    let val = Value(next_val_id);
+                                    next_val_id += 1;
 
-                            new_insts.push(Instruction::BinOp {
-                                dest: val,
-                                op: IrBinOp::Shl,
-                                lhs: Operand::Value(ptr_iv.index_iv),
-                                rhs: Operand::Const(IrConst::I32(shift_amount as i32)),
-                                ty: IrType::I64,
-                            });
-                            if has_spans {
-                                new_spans.push(span);
-                            }
+                                    new_insts.push(Instruction::BinOp {
+                                        dest: val,
+                                        op: IrBinOp::Shl,
+                                        lhs: Operand::Value(ptr_iv.index_iv),
+                                        rhs: Operand::Const(IrConst::I32(shift_amount as i32)),
+                                        ty: IrType::I64,
+                                    });
+                                    if has_spans {
+                                        new_spans.push(span);
+                                        if has_ids {
+                                            new_ids.push(old_ids.get(inst_idx).copied().unwrap_or(
+                                                crate::ir::instruction::NO_INLINE_INSTANCE,
+                                            ));
+                                        }
+                                    }
 
-                            cached_scaled_index = Some(val);
-                            val
-                        }
+                                    cached_scaled_index = Some(val);
+                                    val
+                                }
+                            };
+                        (Operand::Value(scaled_val), true)
                     };
-                    (Operand::Value(scaled_val), true)
-                };
 
                 // Step 2: Ensure GEP for this specific offset is available in this block
-                let target_ptr_val = match cached_gep_for_offset.get(&offset) {
-                    Some(&cached_ptr) => cached_ptr,
-                    None => {
-                        let final_offset_operand = if offset != 0 {
-                            let adj_val = Value(next_val_id);
+                let target_ptr_val =
+                    match cached_gep_for_offset.get(&offset) {
+                        Some(&cached_ptr) => cached_ptr,
+                        None => {
+                            let final_offset_operand =
+                                if offset != 0 {
+                                    let adj_val = Value(next_val_id);
+                                    next_val_id += 1;
+
+                                    new_insts.push(Instruction::BinOp {
+                                        dest: adj_val,
+                                        op: IrBinOp::Add,
+                                        lhs: index_operand,
+                                        rhs: Operand::Const(IrConst::I64(offset)),
+                                        ty: IrType::I64,
+                                    });
+                                    if has_spans {
+                                        new_spans.push(span);
+                                        if has_ids {
+                                            new_ids.push(old_ids.get(inst_idx).copied().unwrap_or(
+                                                crate::ir::instruction::NO_INLINE_INSTANCE,
+                                            ));
+                                        }
+                                    }
+
+                                    Operand::Value(adj_val)
+                                } else if is_scaled {
+                                    index_operand
+                                } else {
+                                    index_operand
+                                };
+
+                            let new_ptr = Value(next_val_id);
                             next_val_id += 1;
 
-                            new_insts.push(Instruction::BinOp {
-                                dest: adj_val,
-                                op: IrBinOp::Add,
-                                lhs: index_operand,
-                                rhs: Operand::Const(IrConst::I64(offset)),
-                                ty: IrType::I64,
+                            new_insts.push(Instruction::GetElementPtr {
+                                dest: new_ptr,
+                                base: ptr_iv.base_ptr,
+                                offset: final_offset_operand,
+                                ty: IrType::Ptr,
                             });
                             if has_spans {
                                 new_spans.push(span);
+                                if has_ids {
+                                    new_ids.push(
+                                        old_ids
+                                            .get(inst_idx)
+                                            .copied()
+                                            .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE),
+                                    );
+                                }
                             }
 
-                            Operand::Value(adj_val)
-                        } else if is_scaled {
-                            index_operand
-                        } else {
-                            index_operand
-                        };
-
-                        let new_ptr = Value(next_val_id);
-                        next_val_id += 1;
-
-                        new_insts.push(Instruction::GetElementPtr {
-                            dest: new_ptr,
-                            base: ptr_iv.base_ptr,
-                            offset: final_offset_operand,
-                            ty: IrType::Ptr,
-                        });
-                        if has_spans {
-                            new_spans.push(span);
+                            cached_gep_for_offset.insert(offset, new_ptr);
+                            new_ptr
                         }
-
-                        cached_gep_for_offset.insert(offset, new_ptr);
-                        new_ptr
-                    }
-                };
+                    };
 
                 // Step 3: Rewrite Load/Store pointer to target_ptr_val
                 match &mut inst {
@@ -779,19 +803,32 @@ fn revert_pointer_iv(func: &mut IrFunction, ptr_iv: &IvsrPointerIV) -> bool {
                 new_insts.push(inst);
                 if has_spans {
                     new_spans.push(span);
+                    if has_ids {
+                        new_ids.push(
+                            old_ids
+                                .get(inst_idx)
+                                .copied()
+                                .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE),
+                        );
+                    }
                 }
             } else {
                 new_insts.push(inst);
                 if has_spans {
                     new_spans.push(span);
+                    if has_ids {
+                        new_ids.push(
+                            old_ids
+                                .get(inst_idx)
+                                .copied()
+                                .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE),
+                        );
+                    }
                 }
             }
         }
 
-        block.instructions = new_insts;
-        if has_spans {
-            block.source_spans = new_spans;
-        }
+        block.replace_insts_inline(new_insts, new_spans, new_ids);
     }
 
     func.next_value_id = next_val_id;

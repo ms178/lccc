@@ -363,6 +363,13 @@ fn contract_block(
                 !drop.contains(&(idx - 1))
             });
         }
+        if !block.source_inline_ids.is_empty() {
+            let mut idx = 0;
+            block.source_inline_ids.retain(|_| {
+                idx += 1;
+                !drop.contains(&(idx - 1))
+            });
+        }
     }
     fused
 }

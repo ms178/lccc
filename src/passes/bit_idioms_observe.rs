@@ -565,13 +565,17 @@ pub(super) fn run(func: &mut IrFunction, defs: &[Option<Instruction>]) -> usize 
         .saturating_add(1)
         .max(func.next_value_id);
     for block in &mut func.blocks {
+        let (spans, ids) = block.take_parallel_debug();
         let old = std::mem::take(&mut block.instructions);
-        let spans = std::mem::take(&mut block.source_spans);
         for (index, inst) in old.into_iter().enumerate() {
             let span = spans
                 .get(index)
                 .copied()
                 .unwrap_or_else(crate::common::source::Span::dummy);
+            let id = ids
+                .get(index)
+                .copied()
+                .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE);
             let mut replacement = conjugate(&inst, defs);
             let mut prefix = None;
             if let Instruction::Cmp {
@@ -641,6 +645,9 @@ pub(super) fn run(func: &mut IrFunction, defs: &[Option<Instruction>]) -> usize 
                                     if !spans.is_empty() {
                                         block.source_spans.push(span);
                                     }
+                                    if !ids.is_empty() {
+                                        block.source_inline_ids.push(id);
+                                    }
                                     changes += 1;
                                     continue;
                                 }
@@ -704,6 +711,9 @@ pub(super) fn run(func: &mut IrFunction, defs: &[Option<Instruction>]) -> usize 
                                     block.instructions.push(inst);
                                     if !spans.is_empty() {
                                         block.source_spans.push(span);
+                                    }
+                                    if !ids.is_empty() {
+                                        block.source_inline_ids.push(id);
                                     }
                                     continue;
                                 }
@@ -819,6 +829,9 @@ pub(super) fn run(func: &mut IrFunction, defs: &[Option<Instruction>]) -> usize 
             }
             if !spans.is_empty() {
                 block.source_spans.push(span);
+            }
+            if !ids.is_empty() {
+                block.source_inline_ids.push(id);
             }
         }
     }

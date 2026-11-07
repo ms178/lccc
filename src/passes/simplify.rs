@@ -2188,6 +2188,10 @@ fn rewrite_iabs_range_cmps(func: &mut IrFunction) -> usize {
                         let span = block.source_spans[i].clone();
                         block.source_spans.insert(i, span);
                     }
+                    if !block.source_inline_ids.is_empty() {
+                        let id = block.source_inline_ids[i];
+                        block.source_inline_ids.insert(i, id);
+                    }
                     block.instructions[i + 1] = Instruction::Cmp {
                         dest,
                         op: new_op,
@@ -2436,6 +2440,10 @@ fn rewrite_rotate_and_popcount_chains(func: &mut IrFunction) -> usize {
                                 if !block.source_spans.is_empty() {
                                     let span = block.source_spans[i].clone();
                                     block.source_spans.insert(i, span);
+                                }
+                                if !block.source_inline_ids.is_empty() {
+                                    let id = block.source_inline_ids[i];
+                                    block.source_inline_ids.insert(i, id);
                                 }
                                 block.instructions[i + 1] = Instruction::BinOp {
                                     dest,
@@ -6777,6 +6785,16 @@ fn split_errno_sqrt(func: &mut IrFunction, bi: usize, at: usize) {
             .pop()
             .map(|call_span| (call_span, rest_spans))
     };
+    let ids = if spans.is_some() && !block.source_inline_ids.is_empty() {
+        let rest_ids = block.source_inline_ids.split_off(at + 1);
+        block
+            .source_inline_ids
+            .pop()
+            .map(|call_id| (call_id, rest_ids))
+    } else {
+        block.source_inline_ids.clear();
+        None
+    };
     let (ty, op) = if callee == "sqrtf" {
         (IrType::F32, IntrinsicOp::SqrtF32)
     } else {
@@ -6826,15 +6844,23 @@ fn split_errno_sqrt(func: &mut IrFunction, bi: usize, at: usize) {
     join_insts.extend(rest);
     // Debug spans stay parallel to the instructions: every new instruction
     // takes the call's span.
-    let (slow_spans, join_spans) = match spans {
+    let (slow_spans, join_spans, slow_ids, join_ids) = match spans {
         Some((span, rest_spans)) => {
             block.source_spans.extend([span, span]);
+            let (slow_ids, join_ids) = if let Some((id, rest_ids)) = ids {
+                block.source_inline_ids.extend([id, id]);
+                (vec![id], std::iter::once(id).chain(rest_ids).collect())
+            } else {
+                (Vec::new(), Vec::new())
+            };
             (
                 vec![span],
                 std::iter::once(span).chain(rest_spans).collect(),
+                slow_ids,
+                join_ids,
             )
         }
-        None => (Vec::new(), Vec::new()),
+        None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
     };
     // B's old successors now come from J.
     for other in &mut func.blocks {
@@ -6855,7 +6881,7 @@ fn split_errno_sqrt(func: &mut IrFunction, bi: usize, at: usize) {
             instructions: join_insts,
             terminator: old_term,
             source_spans: join_spans,
-            source_inline_ids: Vec::new(),
+            source_inline_ids: join_ids,
         },
     );
     func.blocks.push(BasicBlock {
@@ -6863,7 +6889,7 @@ fn split_errno_sqrt(func: &mut IrFunction, bi: usize, at: usize) {
         instructions: vec![Instruction::Call { func: callee, info }],
         terminator: Terminator::Branch(join_label),
         source_spans: slow_spans,
-        source_inline_ids: Vec::new(),
+        source_inline_ids: slow_ids,
     });
 }
 

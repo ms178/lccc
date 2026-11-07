@@ -5429,21 +5429,37 @@ fn build_and_emit_dwarf_file_table(
         table.insert(name.to_string(), 1);
         next_id = 2;
     }
+    let mut add_span = |span: crate::common::source::Span| {
+        if span.start == 0 && span.end == 0 {
+            return;
+        }
+        let loc = sm.resolve_span(span);
+        if let Entry::Vacant(e) = table.entry(loc.file) {
+            e.insert(next_id);
+            next_id += 1;
+        }
+    };
     for func in &module.functions {
         if func.is_declaration {
             continue;
         }
         for block in &func.blocks {
             for span in &block.source_spans {
-                if span.start == 0 && span.end == 0 {
-                    continue;
-                }
-                let loc = sm.resolve_span(*span);
-                if let Entry::Vacant(e) = table.entry(loc.file) {
-                    e.insert(next_id);
-                    next_id += 1;
-                }
+                add_span(*span);
             }
+        }
+        // Inline instances name a call file and a declarator file in
+        // `.debug_info` (`DW_AT_call_file` / abstract-origin `decl_file`).
+        // A system-header inline can survive with no instruction `.loc` in
+        // that header (every body row folded into the caller or became a
+        // builtin), so spans alone omit the file and the writer rightly
+        // refuses to emit a call-file index into a table that lacks it.
+        // GCC keeps the header in the line file table for the same reason.
+        add_span(func.decl_span);
+        add_span(func.body_span);
+        for instance in &func.debug_inline_instances {
+            add_span(instance.call_span);
+            add_span(instance.decl_span);
         }
     }
 

@@ -577,6 +577,19 @@ fn peel_function(func: &mut IrFunction) -> usize {
             // stale non-empty vector that no longer matches the instruction
             // list would desynchronize later debug emission.
             block.source_spans.clear();
+            block.source_inline_ids.clear();
+        }
+        if !block.source_inline_ids.is_empty() {
+            if has_spans {
+                let mut idx = 0usize;
+                block.source_inline_ids.retain(|_| {
+                    let k = keep[idx];
+                    idx += 1;
+                    k
+                });
+            } else {
+                block.source_inline_ids.clear();
+            }
         }
     }
     removed

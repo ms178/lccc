@@ -2007,6 +2007,64 @@ mod span_edit_tests {
         assert!(b.source_spans.is_empty());
     }
 
+    /// The exact shape the inliner's merge block is built from: an empty
+    /// block absorbs the post-call tail (`append_spanned_inline`) and then
+    /// gets one synthesized result def at the front (`insert_inst_inline`).
+    /// All three tracking states must survive it, because the old hand-rolled
+    /// three-vector build pushed a lone dummy span for the result and left
+    /// `1` span for `1 + N` instructions whenever the tail was untracked.
+    #[test]
+    fn merge_block_shape_keeps_the_sparse_or_parallel_law() {
+        const CTX: u32 = 7;
+        for tracked in [false, true] {
+            for dense_ids in [false, true] {
+                let tail = block(&[1, 2, 3], tracked);
+                let tail_ids: Vec<u32> = if tracked && dense_ids {
+                    vec![11, 12, 13]
+                } else {
+                    Vec::new()
+                };
+                let mut merge = BasicBlock {
+                    label: BlockId(9),
+                    instructions: Vec::new(),
+                    source_spans: Vec::new(),
+                    source_inline_ids: Vec::new(),
+                    terminator: Terminator::Return(None),
+                };
+                merge.append_spanned_inline(
+                    tail.instructions.clone(),
+                    tail.source_spans.clone(),
+                    tail_ids.clone(),
+                );
+                merge.insert_inst_inline(0, inst(0), Span::dummy(), CTX);
+                assert_eq!(ids(&merge), vec![0, 1, 2, 3]);
+                if tracked {
+                    assert!(
+                        merge.spans_parallel(),
+                        "spans drifted ({tracked}, {dense_ids})"
+                    );
+                    assert_eq!(merge.source_spans[0], Span::dummy());
+                    assert_eq!(&merge.source_spans[1..], &tail.source_spans[..]);
+                } else {
+                    assert!(
+                        merge.source_spans.is_empty(),
+                        "untracked tail became tracked"
+                    );
+                }
+                if tracked && dense_ids {
+                    assert!(merge.inline_ids_parallel());
+                    assert_eq!(merge.source_inline_ids, vec![CTX, 11, 12, 13]);
+                } else {
+                    assert!(
+                        merge.source_inline_ids.is_empty(),
+                        "sparse ids were densified"
+                    );
+                }
+                assert!(merge.inline_ids_consistent());
+            }
+        }
+    }
+
     #[test]
     fn dummy_span_never_starts_tracking() {
         let mut b = block(&[], false);

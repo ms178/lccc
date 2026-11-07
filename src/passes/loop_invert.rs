@@ -482,20 +482,16 @@ fn apply(func: &mut IrFunction, plan: &Plan) {
     }
 
     let latch = &mut func.blocks[plan.latch];
-    // Keep source_spans parallel to instructions, or -g emits .loc against the
-    // wrong instruction. The duplicated test inherits the latch's last span
-    // when one is being tracked.
-    if latch.source_spans.len() == latch.instructions.len() {
-        let fill = latch.source_spans.last().copied();
-        if let Some(sp) = fill {
-            latch
-                .source_spans
-                .extend(std::iter::repeat_n(sp, cloned.len()));
-        } else {
-            latch.source_spans.clear();
-        }
-    }
-    latch.instructions.extend(cloned);
+    // Keep spans AND inline provenance parallel to instructions, or -g emits
+    // `.loc` against the wrong instruction and the duplicated test escapes its
+    // inline instance. The copy inherits the latch's last span/instance; an
+    // untracked latch stays untracked (one splice, not two extends).
+    let fill = latch
+        .source_spans
+        .last()
+        .copied()
+        .unwrap_or_else(crate::common::source::Span::dummy);
+    latch.extend_insts(cloned, fill);
     latch.terminator = term;
     func.next_value_id = func.next_value_id.max(next_id);
 }
@@ -797,17 +793,14 @@ fn fold_value_bound_after_invert(func: &mut IrFunction, plan: &Plan, debug: bool
         ty,
     };
     let guard = &mut func.blocks[h];
-    if guard.source_spans.len() == guard.instructions.len() {
-        if let Some(sp) = guard.source_spans.last().copied() {
-            guard.source_spans.push(sp);
-        }
-    }
-    guard.instructions.push(sub);
+    let guard_span = guard
+        .source_spans
+        .last()
+        .copied()
+        .unwrap_or_else(crate::common::source::Span::dummy);
+    guard.push_inst(sub, guard_span);
     let latch = &mut func.blocks[t];
-    if latch.source_spans.len() == latch.instructions.len() {
-        latch.source_spans.remove(iadd);
-    }
-    latch.instructions.remove(iadd);
+    latch.remove_inst(iadd);
     let icmp = icmp - 1; // the removed add preceded the compare
     if let Instruction::Cmp { lhs, op, rhs, .. } = &mut latch.instructions[icmp] {
         *lhs = Operand::Value(x0);
@@ -1033,11 +1026,9 @@ fn downcount_after_invert(func: &mut IrFunction, plan: &Plan, debug: bool) -> bo
         dest: iv,
         src: Operand::Const(limit_const),
     };
-    let guard = &mut func.blocks[h];
-    guard.instructions.clear();
-    // The matched guard is now empty, so this is the only parallel span
-    // representation whether debug tracking was enabled or not.
-    guard.source_spans.clear();
+    // The matched guard is now empty: clearing the instructions must clear
+    // BOTH debug arrays, or the ids outlive the code they described.
+    func.blocks[h].clear_insts();
     func.blocks[h].terminator = Terminator::Branch(body);
     if let Instruction::BinOp { op, .. } = &mut func.blocks[t].instructions[update] {
         *op = IrBinOp::Sub;
@@ -1426,6 +1417,57 @@ mod tests {
             blk(3, vec![add1(20, 20)], br(1)),
             blk(4, vec![], ret()),
         ])
+    }
+
+    /// `-g`: duplicating the header test into the latch must carry the
+    /// latch's span AND inline instance. A span-only extend left the id array
+    /// one row short, which the next structural verifier reported as
+    /// " keeps real source spans but lost inline provenance".
+    #[test]
+    fn inversion_keeps_spans_and_inline_ids_parallel() {
+        for dense_ids in [false, true] {
+            let mut f = counted_loop();
+            for (bi, block) in f.blocks.iter_mut().enumerate() {
+                let n = block.instructions.len();
+                block.source_spans = (0..n)
+                    .map(|i| {
+                        crate::common::source::Span::new(
+                            100 + 10 * bi as u32 + i as u32,
+                            101 + 10 * bi as u32 + i as u32,
+                            0,
+                        )
+                    })
+                    .collect();
+                if dense_ids {
+                    block.source_inline_ids = vec![500 + bi as u32; n];
+                }
+            }
+            // Blocks with no instructions carry no rows: empty stays sparse.
+            assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 1);
+            for block in &f.blocks {
+                assert!(
+                    block.inline_ids_consistent(),
+                    "block {:?} drifted",
+                    block.label
+                );
+                if !block.source_spans.is_empty() {
+                    assert_eq!(block.source_spans.len(), block.instructions.len());
+                }
+                if dense_ids && !block.instructions.is_empty() && !block.source_spans.is_empty() {
+                    assert_eq!(block.source_inline_ids.len(), block.instructions.len());
+                }
+            }
+            let latch = &f.blocks[3];
+            assert_eq!(latch.instructions.len(), 2, "increment + duplicated cmp");
+            if dense_ids {
+                assert_eq!(
+                    latch.source_inline_ids,
+                    vec![503, 503],
+                    "the copy stays in the latch's instance"
+                );
+                assert_eq!(latch.source_spans[0], latch.source_spans[1]);
+            }
+        }
     }
 
     #[test]

@@ -411,6 +411,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
             continue;
         }
         let spans_parallel = block.source_spans.len() == block.instructions.len();
+        let ids_parallel = block.source_inline_ids.len() == block.instructions.len();
         let mut idx = 0;
         block.instructions.retain(|_| {
             idx += 1;
@@ -419,6 +420,13 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         if spans_parallel {
             let mut idx = 0;
             block.source_spans.retain(|_| {
+                idx += 1;
+                keep[idx - 1]
+            });
+        }
+        if ids_parallel {
+            let mut idx = 0;
+            block.source_inline_ids.retain(|_| {
                 idx += 1;
                 keep[idx - 1]
             });

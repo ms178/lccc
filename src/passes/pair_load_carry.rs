@@ -257,13 +257,11 @@ fn apply(f: &mut IrFunction, h: usize, b: usize, pre: usize) -> bool {
         *dest = Some(init);
         args[0] = Operand::Value(initial_ptr);
     }
-    f.blocks[pre].instructions.push(init_load);
-    if !f.blocks[pre].source_spans.is_empty() {
-        f.blocks[pre]
-            .source_spans
-            .push(crate::common::source::Span::dummy());
-    }
-    f.blocks[h].instructions.insert(
+    let load_span = f.blocks[b].span_at(load_index);
+    let load_id = f.blocks[b].inline_id_at(load_index);
+    let pre_end = f.blocks[pre].instructions.len();
+    f.blocks[pre].insert_inst_inline(pre_end, init_load, load_span, load_id);
+    f.blocks[h].insert_inst_inline(
         0,
         Instruction::Phi {
             dest: load,
@@ -273,16 +271,10 @@ fn apply(f: &mut IrFunction, h: usize, b: usize, pre: usize) -> bool {
                 (Operand::Value(data), backlabel),
             ],
         },
+        crate::common::source::Span::dummy(),
+        crate::ir::instruction::NO_INLINE_INSTANCE,
     );
-    if !f.blocks[h].source_spans.is_empty() {
-        f.blocks[h]
-            .source_spans
-            .insert(0, crate::common::source::Span::dummy());
-    }
-    f.blocks[b].instructions.remove(load_index);
-    if !f.blocks[b].source_spans.is_empty() {
-        f.blocks[b].source_spans.remove(load_index);
-    }
+    f.blocks[b].remove_inst(load_index);
     true
 }
 

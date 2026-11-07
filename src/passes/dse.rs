@@ -647,41 +647,31 @@ pub(crate) fn eliminate_dead_private_slot_loads(func: &mut IrFunction) -> usize 
     // `mentions` counts operands only, so a value with no entry is unused.
     let mut removed = 0usize;
     for block in func.blocks.iter_mut() {
-        let before = block.instructions.len();
-        let span = std::mem::take(&mut block.source_spans);
-        let has_spans = span.len() == before && !span.is_empty();
-        let mut new_span: Vec<_> = Vec::with_capacity(before);
-        let mut keep: Vec<Instruction> = Vec::with_capacity(before);
-        for (i, inst) in block.instructions.drain(..).enumerate() {
-            let dead = match &inst {
+        let keep: Vec<bool> = block
+            .instructions
+            .iter()
+            .map(|inst| match inst {
                 Instruction::Intrinsic {
                     dest: Some(d),
                     op,
                     dest_ptr: Some(slot),
                     ..
                 } => {
-                    is_pure_slot_load(op)
+                    !(is_pure_slot_load(op)
                         && alloca_defs.contains(&slot.0)
                         && mentions.get(&slot.0).copied() == Some(1)
-                        && mentions.get(&d.0).copied().unwrap_or(0) == 0
+                        && mentions.get(&d.0).copied().unwrap_or(0) == 0)
                 }
-                _ => false,
-            };
-            if dead {
-                removed += 1;
-            } else {
-                if has_spans {
-                    new_span.push(span[i].clone());
-                }
-                keep.push(inst);
-            }
-        }
-        block.instructions = keep;
-        if has_spans {
-            block.source_spans = new_span;
-        } else {
-            block.source_spans = span;
-        }
+                _ => true,
+            })
+            .collect();
+        removed += keep.iter().filter(|&&k| !k).count();
+        let mut i = 0;
+        block.retain_insts(|_| {
+            let k = keep[i];
+            i += 1;
+            k
+        });
     }
     removed
 }
@@ -700,37 +690,21 @@ pub(crate) fn eliminate_dead_stores(func: &mut IrFunction) -> usize {
         }
         total += dead.len();
         // `dead` is ascending by construction (the scan runs in reverse).
-        // Remove those instruction indices in one stable pass.
+        // One stable retain keeps instructions, spans and inline ids in
+        // lockstep; cloning the instruction list here also duplicated every
+        // operand vector for no reason.
         let mut di = 0usize;
-        let mut span = std::mem::take(&mut block.source_spans);
-        block.instructions = block
-            .instructions
-            .iter()
-            .enumerate()
-            .filter_map(|(ii, inst)| {
-                let keep = if di < dead.len() && dead[di] == ii {
-                    di += 1;
-                    false
-                } else {
-                    true
-                };
-                keep.then(|| inst.clone())
-            })
-            .collect();
-        if span.len() >= dead.len() {
-            // Rebuild spans in parallel: drop the same positions.
-            let mut di = 0usize;
-            let mut new_span = Vec::with_capacity(span.len() - dead.len());
-            for (ii, s) in span.drain(..).enumerate() {
-                if di < dead.len() && dead[di] == ii {
-                    di += 1;
-                } else {
-                    new_span.push(s);
-                }
-            }
-            span = new_span;
-        }
-        block.source_spans = span;
+        let mut ii = 0usize;
+        block.retain_insts(|_| {
+            let keep = if di < dead.len() && dead[di] == ii {
+                di += 1;
+                false
+            } else {
+                true
+            };
+            ii += 1;
+            keep
+        });
     }
     total
 }

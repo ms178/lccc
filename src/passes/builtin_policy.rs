@@ -373,6 +373,10 @@ pub(crate) fn canonicalize_library_memcpy(module: &mut IrModule, max_len: i64) {
                         let span = block.source_spans[i - 1];
                         block.source_spans.insert(i, span);
                     }
+                    if !block.source_inline_ids.is_empty() {
+                        let id = block.source_inline_ids[i - 1];
+                        block.source_inline_ids.insert(i, id);
+                    }
                     i += 1;
                 }
             }

@@ -475,7 +475,9 @@ fn normalize(
         }
         let old = std::mem::take(&mut block.instructions);
         let spans = std::mem::take(&mut block.source_spans);
+        let ids = std::mem::take(&mut block.source_inline_ids);
         let mapped = spans.len() == old.len() && !spans.is_empty();
+        let mapped_ids = ids.len() == old.len() && !ids.is_empty();
         for (ii, inst) in old.into_iter().enumerate() {
             if (bi, ii) == add_site {
                 continue;
@@ -513,6 +515,12 @@ fn normalize(
                     block.instructions.len() - before,
                 ));
             }
+            if mapped_ids {
+                block.source_inline_ids.extend(std::iter::repeat_n(
+                    ids[ii],
+                    block.instructions.len() - before,
+                ));
+            }
         }
     }
     candidate.next_value_id = next;
@@ -532,6 +540,14 @@ fn push_preheader_inst(block: &mut BasicBlock, inst: Instruction) {
             .push(crate::common::source::Span::dummy());
     } else {
         block.source_spans.clear();
+        block.source_inline_ids.clear();
+    }
+    if block.source_inline_ids.len() == block.instructions.len() {
+        block
+            .source_inline_ids
+            .push(crate::ir::instruction::NO_INLINE_INSTANCE);
+    } else {
+        block.source_inline_ids.clear();
     }
     block.instructions.push(inst);
 }

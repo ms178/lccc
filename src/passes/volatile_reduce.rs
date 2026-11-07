@@ -401,22 +401,20 @@ fn rewrite(func: &mut IrFunction, c: Candidate) -> Option<()> {
         ty: c.acc_ty,
     })
     .to_vec();
-    // Empty input span vectors mean "unknown". Fill only those holes, never
-    // erase locations of untouched preheader instructions.
-    let preheader = &mut func.blocks[c.preheader];
-    preheader
-        .source_spans
-        .resize(preheader.instructions.len(), Span::dummy());
-    preheader.source_spans.push(c.spans.compare);
-    func.blocks[c.preheader]
-        .instructions
-        .push(Instruction::BinOp {
+    // The masked bound is materialized as part of the (possibly inlined)
+    // loop: one `push_inst` keeps the tracking state and inherits the
+    // preheader's inline instance. Resizing the debug arrays by hand instead
+    // would silently REPAIR a drifted block and hide its producer.
+    func.blocks[c.preheader].push_inst(
+        Instruction::BinOp {
             dest: bound,
             op: IrBinOp::And,
             lhs: c.limit,
             rhs: Operand::Const(IrConst::from_i64(-(LANES as i64), c.iv_ty)),
             ty: c.iv_ty,
-        });
+        },
+        c.spans.compare,
+    );
     func.blocks[c.preheader].terminator = Terminator::Branch(mh);
     for inst in &mut func.blocks[c.header].instructions {
         if let Instruction::Phi { dest, incoming, .. } = inst {

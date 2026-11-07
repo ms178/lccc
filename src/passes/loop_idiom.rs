@@ -2291,8 +2291,16 @@ fn rewrite_guarded_copy_loop(
             if pre.source_spans.len() == pre.instructions.len() {
                 pre.source_spans
                     .extend((0..pre_insts.len()).map(|_| crate::common::source::Span::dummy()));
+                if pre.source_inline_ids.len() == pre.instructions.len() {
+                    pre.source_inline_ids.extend(
+                        (0..pre_insts.len()).map(|_| crate::ir::instruction::NO_INLINE_INSTANCE),
+                    );
+                } else {
+                    pre.source_inline_ids.clear();
+                }
             } else {
                 pre.source_spans.clear();
+                pre.source_inline_ids.clear();
             }
         }
         pre.instructions.extend(pre_insts);
@@ -2404,8 +2412,17 @@ fn rewrite_guarded_copy_loop(
                     0..0,
                     (0..merge_phis.len()).map(|_| crate::common::source::Span::dummy()),
                 );
+                if exit.source_inline_ids.len() == exit.instructions.len() {
+                    exit.source_inline_ids.splice(
+                        0..0,
+                        (0..merge_phis.len()).map(|_| crate::ir::instruction::NO_INLINE_INSTANCE),
+                    );
+                } else {
+                    exit.source_inline_ids.clear();
+                }
             } else {
                 exit.source_spans.clear();
+                exit.source_inline_ids.clear();
             }
         }
         exit.instructions.splice(0..0, merge_phis);
@@ -3430,8 +3447,17 @@ fn rewrite_ctz_loop(func: &mut IrFunction, m: &CtzLoop, body: &FxHashSet<usize>)
                     pos..pos,
                     (0..extra.len()).map(|_| crate::common::source::Span::dummy()),
                 );
+                if block.source_inline_ids.len() == block.instructions.len() {
+                    block.source_inline_ids.splice(
+                        pos..pos,
+                        (0..extra.len()).map(|_| crate::ir::instruction::NO_INLINE_INSTANCE),
+                    );
+                } else {
+                    block.source_inline_ids.clear();
+                }
             } else {
                 block.source_spans.clear();
+                block.source_inline_ids.clear();
             }
         }
         block.instructions.splice(pos..pos, extra);
@@ -4280,8 +4306,17 @@ fn rewrite_popcount_loop(func: &mut IrFunction, m: &PopcountLoop, body: &FxHashS
                     pos..pos,
                     (0..extra.len()).map(|_| crate::common::source::Span::dummy()),
                 );
+                if block.source_inline_ids.len() == block.instructions.len() {
+                    block.source_inline_ids.splice(
+                        pos..pos,
+                        (0..extra.len()).map(|_| crate::ir::instruction::NO_INLINE_INSTANCE),
+                    );
+                } else {
+                    block.source_inline_ids.clear();
+                }
             } else {
                 block.source_spans.clear();
+                block.source_inline_ids.clear();
             }
         }
         block.instructions.splice(pos..pos, extra);

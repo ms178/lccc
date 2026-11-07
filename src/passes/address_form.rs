@@ -315,13 +315,18 @@ fn reassociate_const_base_indexed_geps(f: &mut IrFunction) -> usize {
     for (bi, mut block_rewrites) in rewrites_by_block {
         block_rewrites.sort_unstable_by_key(|r| r.0);
         let block = &mut f.blocks[bi];
-        let keep_spans =
-            block.source_spans.len() == block.instructions.len() && !block.source_spans.is_empty();
+        let (old_spans, old_ids) = block.take_parallel_debug();
+        let keep_spans = !old_spans.is_empty();
+        let keep_ids = !old_ids.is_empty();
         let old_insts = std::mem::take(&mut block.instructions);
-        let old_spans = std::mem::take(&mut block.source_spans);
         let mut new_insts = Vec::with_capacity(old_insts.len() + block_rewrites.len());
         let mut new_spans = Vec::with_capacity(if keep_spans {
             old_spans.len() + block_rewrites.len()
+        } else {
+            0
+        });
+        let mut new_ids = Vec::with_capacity(if keep_ids {
+            old_ids.len() + block_rewrites.len()
         } else {
             0
         });
@@ -350,18 +355,22 @@ fn reassociate_const_base_indexed_geps(f: &mut IrFunction) -> usize {
                     new_spans.push(sp);
                     new_spans.push(sp);
                 }
+                if keep_ids {
+                    new_ids.push(old_ids[idx]);
+                    new_ids.push(old_ids[idx]);
+                }
                 total_rewritten += 1;
             } else {
                 new_insts.push(inst);
                 if keep_spans {
                     new_spans.push(old_spans[idx]);
                 }
+                if keep_ids {
+                    new_ids.push(old_ids[idx]);
+                }
             }
         }
-        block.instructions = new_insts;
-        if keep_spans {
-            block.source_spans = new_spans;
-        }
+        block.replace_insts_inline(new_insts, new_spans, new_ids);
     }
     f.next_value_id = next_id;
     total_rewritten
