@@ -147,6 +147,16 @@ impl Image {
     }
 }
 
+/// Run the pass and report the MOVEMASK's folded constant.  `run_function`'s
+/// edit count is NOT a sound oracle for these tests: the load-of-constant
+/// consumer legitimately adds an edit of its own while leaving the mask
+/// verdict unchanged.  Asserting the semantic result is both stricter and
+/// immune to new consumers.
+fn movemask_result_after(func: &mut IrFunction, result: Value) -> Option<i32> {
+    run_function(func);
+    result_const(func, result)
+}
+
 fn result_const(func: &IrFunction, result: Value) -> Option<i32> {
     func.blocks[0]
         .instructions
@@ -223,19 +233,123 @@ fn lane_widths_read_only_the_sign_bit_of_each_lane() {
 
 #[test]
 fn byte_classification_is_independent_of_packed_lane_width() {
-    assert_eq!(MaskStatus::from_bytes(&[0x80; 16]), MaskStatus::AllOn);
-    assert_eq!(MaskStatus::from_bytes(&[0x01; 16]), MaskStatus::AllOff);
-    assert_eq!(MaskStatus::from_bytes(&[0xFF; 32]), MaskStatus::AllOn);
+    assert_eq!(MaskStatus::from_lanes(&[0x80; 16], 8), MaskStatus::AllOn);
+    assert_eq!(MaskStatus::from_lanes(&[0x01; 16], 8), MaskStatus::AllOff);
+    assert_eq!(MaskStatus::from_lanes(&[0xFF; 32], 8), MaskStatus::AllOn);
     let mut mixed = [0u8; 16];
     mixed[7] = 0x80;
-    assert_eq!(MaskStatus::from_bytes(&mixed), MaskStatus::Unknown);
-    assert_eq!(MaskStatus::from_bytes(&[]), MaskStatus::Unknown);
+    assert!(matches!(
+        MaskStatus::from_lanes(&mixed, 8),
+        MaskStatus::Mixed(_)
+    ));
+    assert_eq!(MaskStatus::from_lanes(&[], 8), MaskStatus::Unknown);
     // A mask whose *low* bits vary but whose sign bits agree is still exact.
     let mut low = [0u8; 16];
     for (i, b) in low.iter_mut().enumerate() {
         *b = 0x80 | i as u8;
     }
-    assert_eq!(MaskStatus::from_bytes(&low), MaskStatus::AllOn);
+    assert_eq!(MaskStatus::from_lanes(&low, 8), MaskStatus::AllOn);
+}
+
+/// A well-formed dword/qword selector mask has DON'T-CARE bytes in the low
+/// part of each lane.  `from_bytes` used to call such a mask `Unknown` and
+/// miss the fold; `blend_shape` + `from_lanes` must see AllOn/AllOff.  The
+/// byte-lane blends MUST still refuse the very same image, because
+/// `vpblendvb` reads bit 7 of every byte.
+#[test]
+fn blend_selector_lanes_are_classified_exactly_not_bytewise() {
+    // Build each selector image at the EXACT byte width of its blend, so
+    // the 32-byte ops are not silently tested with a truncated 16-byte mask.
+    let dword_image = |width: usize, on: bool| -> Vec<u8> {
+        (0..width)
+            .map(|i| {
+                let high_byte = i % 4 == 3;
+                let sign = if on { high_byte } else { !high_byte };
+                if sign { 0x80 } else { 0 }
+            })
+            .collect()
+    };
+    let qword_image = |width: usize, on: bool| -> Vec<u8> {
+        (0..width)
+            .map(|i| {
+                let high_byte = i % 8 == 7;
+                let sign = if on { high_byte } else { !high_byte };
+                if sign { 0x80 } else { 0 }
+            })
+            .collect()
+    };
+
+    for (op, width, lane_bits, qword) in [
+        (IntrinsicOp::VecBlendvF32x4, 16usize, 32usize, false),
+        (IntrinsicOp::VecBlendvI32x4, 16, 32, false),
+        (IntrinsicOp::VecBlendvF32x8, 32, 32, false),
+        (IntrinsicOp::VecBlendvI32x8, 32, 32, false),
+        (IntrinsicOp::VecBlendvF64x2, 16, 64, true),
+        (IntrinsicOp::VecBlendvF64x4, 32, 64, true),
+    ] {
+        let (shape_width, selector) = blend_shape(op).expect("blend op");
+        assert_eq!(shape_width, width, "{op:?} mask width");
+        assert_eq!(selector, lane_bits, "{op:?} selector width");
+        let image = if qword { qword_image } else { dword_image };
+        let on = image(width, true);
+        let off = image(width, false);
+        assert_eq!(on.len(), width, "{op:?} all-on image width");
+        assert_eq!(off.len(), width, "{op:?} all-off image width");
+        assert_eq!(
+            MaskStatus::from_lanes(&on, selector),
+            MaskStatus::AllOn,
+            "{op:?} well-formed all-on selector"
+        );
+        assert_eq!(
+            MaskStatus::from_lanes(&off, selector),
+            MaskStatus::AllOff,
+            "{op:?} well-formed all-off selector"
+        );
+        // The SAME image is NOT an all-on BYTE mask.
+        assert!(
+            !matches!(MaskStatus::from_lanes(&on, 8), MaskStatus::AllOn),
+            "{op:?} byte-lane agreement must be stronger"
+        );
+    }
+    // Byte/word blends must use the 8-bit selector, so their shape proves
+    // that a dword-style mask cannot be misclassified as AllOn.
+    for op in [
+        IntrinsicOp::VecBlendvI8x16,
+        IntrinsicOp::VecBlendvI16x8,
+        IntrinsicOp::VecBlendvI8x32,
+        IntrinsicOp::VecBlendvI16x16,
+    ] {
+        assert_eq!(blend_shape(op).expect("blend op").1, 8, "{op:?}");
+    }
+}
+
+/// End-to-end fold of the exact GCC/Clang case: a dword all-on selector with
+/// mixed payload bytes must select the true arm; the byte-lane blend with the
+/// same mask must NOT fold.
+#[test]
+fn dword_blend_with_dont_care_payload_bytes_folds_and_byte_blend_refuses() {
+    let f = Operand::Const(IrConst::I64(11));
+    let t = Operand::Const(IrConst::I64(22));
+    // I128 little-endian: bytes 0,1,2 = 0, byte 3 = 0x80, per dword.
+    let dword_all_on = Operand::Const(IrConst::I128(i128::from_le_bytes([
+        0, 0, 0, 0x80, 0, 0, 0, 0x80, 0, 0, 0, 0x80, 0, 0, 0, 0x80,
+    ])));
+    let mut d = blend_function(dword_all_on, f, t, IntrinsicOp::VecBlendvF32x4);
+    assert_eq!(run_function(&mut d), 1, "dword all-on selector must fold");
+    assert_copy(&d.blocks[0].instructions[0], Value(9), t, "dword blend");
+
+    let mut b = blend_function(dword_all_on, f, t, IntrinsicOp::VecBlendvI8x16);
+    assert_eq!(run_function(&mut b), 0, "byte-lane blend must refuse");
+
+    // A qword selector: sign bit only in bytes 7 and 15.
+    let qword_all_on = Operand::Const(IrConst::I128(i128::from_le_bytes([
+        0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, 0, 0, 0, 0, 0, 0x80,
+    ])));
+    let mut q = blend_function(qword_all_on, f, t, IntrinsicOp::VecBlendvF64x2);
+    assert_eq!(run_function(&mut q), 1, "qword all-on selector must fold");
+    assert_copy(&q.blocks[0].instructions[0], Value(9), t, "qword blend");
+    let mut qb = blend_function(qword_all_on, f, t, IntrinsicOp::VecBlendvI16x8);
+    assert_eq!(run_function(&mut qb), 0, "word-lane blend must refuse");
 }
 
 /// The measured repro: GCC 16.2 and Clang 23.1.5 both emit
@@ -990,7 +1104,11 @@ fn scalar_loads_and_arithmetic_mentions_veto_the_image() {
     let p = im.v();
     im.insts.insert(34, load(p, im.source));
     let mut f = im.function(false);
-    assert_eq!(run_function(&mut f), 1, "a pure scalar read must not veto");
+    assert_eq!(
+        movemask_result_after(&mut f, im.result),
+        Some(0xFFFF),
+        "a pure scalar read must not veto"
+    );
 
     // A VOLATILE scalar Load is an observable read: refuse.
     let mut im = Image::new(&[0x80u8; 16]);
@@ -1627,8 +1745,7 @@ fn i686_i128_aggregate_copy_is_a_proven_constant_image() {
         0xFF,
     ];
     let mut f = i686_aggregate_image(&bytes, None);
-    assert_eq!(run_function(&mut f), 1);
-    assert_eq!(result_const(&f, Value(13)), Some(53069));
+    assert_eq!(movemask_result_after(&mut f, Value(13)), Some(53069));
     assert_eq!(
         f.blocks[0].source_spans.len(),
         f.blocks[0].instructions.len(),
@@ -1645,11 +1762,9 @@ fn i686_i128_aggregate_copy_is_a_proven_constant_image() {
 
     // All-off / all-on boundaries through the same path.
     let mut off = i686_aggregate_image(&[0u8; 16], None);
-    assert_eq!(run_function(&mut off), 1);
-    assert_eq!(result_const(&off, Value(13)), Some(0));
+    assert_eq!(movemask_result_after(&mut off, Value(13)), Some(0));
     let mut on = i686_aggregate_image(&[0x80u8; 16], None);
-    assert_eq!(run_function(&mut on), 1);
-    assert_eq!(result_const(&on, Value(13)), Some(0xFFFF));
+    assert_eq!(movemask_result_after(&mut on, Value(13)), Some(0xFFFF));
 }
 
 #[test]
@@ -1657,7 +1772,11 @@ fn i686_aggregate_copy_refuses_unproven_or_mismatched_loads() {
     fn refuse(name: &str, mutate: fn(&mut Vec<Instruction>)) {
         let bytes = [0x80u8; 16];
         let mut f = i686_aggregate_image(&bytes, Some(mutate));
-        assert_eq!(run_function(&mut f), 0, "negative I128 case {name} folded");
+        assert_eq!(
+            movemask_result_after(&mut f, Value(13)),
+            None,
+            "negative I128 case {name} folded"
+        );
         assert!(
             f.blocks[0].instructions.iter().any(|i| matches!(
                 i,
@@ -1746,11 +1865,10 @@ fn scalar_value_copy_chains_are_followed_and_cycles_refused() {
         }),
     );
     assert_eq!(
-        run_function(&mut two),
-        1,
+        movemask_result_after(&mut two, Value(13)),
+        Some(0xFFFF),
         "a two-link Copy chain must resolve"
     );
-    assert_eq!(result_const(&two, Value(13)), Some(0xFFFF));
 
     // A Copy cycle cannot resolve to a Load: refuse.
     let mut cycle = i686_aggregate_image(
@@ -1759,7 +1877,11 @@ fn scalar_value_copy_chains_are_followed_and_cycles_refused() {
             insts.insert(8, copy(Value(14), Operand::Value(Value(14))));
         }),
     );
-    assert_eq!(run_function(&mut cycle), 0, "a self Copy cycle must refuse");
+    assert_eq!(
+        movemask_result_after(&mut cycle, Value(13)),
+        None,
+        "a self Copy cycle must refuse"
+    );
 
     // A Copy of a constant (not a Load) is not a proven object image.
     let mut konst = i686_aggregate_image(
@@ -1774,7 +1896,11 @@ fn scalar_value_copy_chains_are_followed_and_cycles_refused() {
             }
         }),
     );
-    assert_eq!(run_function(&mut konst), 0, "a constant Copy must refuse");
+    assert_eq!(
+        movemask_result_after(&mut konst, Value(13)),
+        None,
+        "a constant Copy must refuse"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2320,5 +2446,648 @@ fn a_live_legacy_intrinsic_result_is_never_reclaimed() {
             }
         )),
         "the live user of the intrinsic result disappeared"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Legacy `Blendv*128/256` intrinsics (the shape the C `_mm_blendv_ps/pd`
+// family actually emits): `args = [mask, false_arm, true_arm]`, result
+// written through `dest_ptr`.  Both the Memcpy rewrite and the object-image
+// proof are exercised, plus the SSA-liveness guard and mixed-mask refusal.
+// ---------------------------------------------------------------------------
+const LB_F: u32 = 201;
+const LB_T: u32 = 202;
+const LB_D: u32 = 203;
+const LB_R: u32 = 204;
+const LB_RESULT: u32 = 250;
+
+fn legacy_blend_image(
+    mask: Operand,
+    false_bytes: &[u8; 16],
+    true_bytes: &[u8; 16],
+    live_dest: bool,
+) -> IrFunction {
+    let mut insts = vec![
+        alloca(Value(LB_F), 16, false, false),
+        alloca(Value(LB_T), 16, false, false),
+        alloca(Value(LB_D), 16, false, false),
+        alloca(Value(LB_R), 16, false, false),
+    ];
+    insts.extend(tiled_bytes(Value(LB_F), false_bytes, 210));
+    insts.extend(tiled_bytes(Value(LB_T), true_bytes, 230));
+    insts.push(intrinsic(
+        Some(Value(90)),
+        IntrinsicOp::BlendvPs128,
+        Some(Value(LB_D)),
+        vec![
+            mask,
+            Operand::Value(Value(LB_F)),
+            Operand::Value(Value(LB_T)),
+        ],
+    ));
+    insts.push(intrinsic(
+        Some(Value(91)),
+        IntrinsicOp::VecLoadI8x16,
+        None,
+        vec![Operand::Value(Value(LB_D)), Operand::Const(IrConst::I64(0))],
+    ));
+    insts.push(intrinsic(
+        None,
+        IntrinsicOp::VecStoreI8x16,
+        Some(Value(LB_R)),
+        vec![
+            Operand::Value(Value(91)),
+            Operand::Value(Value(LB_R)),
+            Operand::Const(IrConst::I64(0)),
+        ],
+    ));
+    insts.push(intrinsic(
+        Some(Value(LB_RESULT)),
+        IntrinsicOp::MovemaskPs128,
+        None,
+        vec![Operand::Value(Value(LB_R))],
+    ));
+    if live_dest {
+        insts.push(copy(Value(92), Operand::Value(Value(90))));
+    }
+    let ret = if live_dest {
+        Value(92)
+    } else {
+        Value(LB_RESULT)
+    };
+    let mut f = IrFunction::new("legacy_blend".into(), IrType::I32, vec![], false);
+    f.blocks.push(block(
+        insts,
+        Terminator::Return(Some(Operand::Value(ret))),
+        true,
+    ));
+    f.next_value_id = 300;
+    f
+}
+
+fn dword_all_on_mask() -> Operand {
+    Operand::Const(IrConst::I128(i128::from_le_bytes([
+        0, 0, 0, 0x80, 0, 0, 0, 0x80, 0, 0, 0, 0x80, 0, 0, 0, 0x80,
+    ])))
+}
+
+#[test]
+fn legacy_blend_rewrites_to_memcpy_and_proves_its_image() {
+    // True arm has sign bits in dword lanes 0 and 3 -> movmskps == 0b1001.
+    let mut arm = [0u8; 16];
+    arm[3] = 0x80;
+    arm[15] = 0x80;
+    let zeros = [0u8; 16];
+
+    for (mask, want, label) in [
+        (dword_all_on_mask(), 9, "all-on"),
+        (Operand::Const(IrConst::I128(0)), 0, "all-off"),
+    ] {
+        let func = legacy_blend_image(mask, &zeros, &arm, false);
+        let facts = Facts::new(&func);
+        let (blend_index, blend_inst) = func.blocks[0]
+            .instructions
+            .iter()
+            .enumerate()
+            .find(|(_, i)| {
+                matches!(i, Instruction::Intrinsic { op, .. } if *op == IntrinsicOp::BlendvPs128)
+            })
+            .expect("blend present");
+        match fold(&facts, blend_inst, 0, blend_index).expect("blend must rewrite") {
+            Instruction::Memcpy { size, .. } => assert_eq!(size, 16, "{label}: copy width"),
+            other => panic!("{label}: expected Memcpy, got {other:?}"),
+        }
+
+        let mut f2 = legacy_blend_image(
+            if want == 9 {
+                dword_all_on_mask()
+            } else {
+                Operand::Const(IrConst::I128(0))
+            },
+            &zeros,
+            &arm,
+            false,
+        );
+        assert_eq!(run_function(&mut f2), 2, "{label}: rewrite + movemask fold");
+        assert_eq!(result_const(&f2, Value(LB_RESULT)), Some(want), "{label}");
+        assert!(
+            !f2.blocks[0].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::Intrinsic { op, .. } if *op == IntrinsicOp::BlendvPs128
+            )),
+            "{label}: the blendvps intrinsic survived"
+        );
+    }
+}
+
+#[test]
+fn legacy_blend_refuses_mixed_masks_and_live_ssa_results() {
+    let mut arm = [0u8; 16];
+    arm[3] = 0x80;
+    arm[15] = 0x80;
+    let zeros = [0u8; 16];
+
+    // Only dword 0 has its sign bit: Mixed -> neither arm is provable.
+    let mixed = Operand::Const(IrConst::I128(i128::from_le_bytes([
+        0, 0, 0, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ])));
+    let mut f = legacy_blend_image(mixed, &zeros, &arm, false);
+    assert_eq!(run_function(&mut f), 0, "a mixed selector must refuse");
+
+    // The SSA `dest` of the blend is live: the rewrite must NOT delete or
+    // replace it (that would leave an undefined value).  The movemask may
+    // still fold through the object-image proof.
+    let mut live = legacy_blend_image(dword_all_on_mask(), &zeros, &arm, true);
+    let facts = Facts::new(&live);
+    let (idx, inst) = live.blocks[0]
+        .instructions
+        .iter()
+        .enumerate()
+        .find(|(_, i)| {
+            matches!(i, Instruction::Intrinsic { op, .. } if *op == IntrinsicOp::BlendvPs128)
+        })
+        .expect("blend present");
+    assert!(
+        fold(&facts, inst, 0, idx).is_none(),
+        "a blend whose SSA result is used must not be rewritten"
+    );
+    // Exactly ONE edit is expected: the movemask fold.  The blend rewrite
+    // is refused (asserted above), and no other candidate exists.  The
+    // folded constant is then dead because the terminator returns the live
+    // blend result instead, so DCE removes it -- assert the edit count, not
+    // the surviving Copy.
+    assert_eq!(run_function(&mut live), 1, "movemask fold is still sound");
+    assert!(
+        live.blocks[0].instructions.iter().any(|i| matches!(
+            i,
+            Instruction::Intrinsic { op, .. } if *op == IntrinsicOp::BlendvPs128
+        )),
+        "the live blend must survive the reclaimer"
+    );
+}
+
+#[test]
+fn legacy_blend_shapes_are_exact_and_pblendvb_is_excluded() {
+    assert_eq!(legacy_blend_shape(IntrinsicOp::BlendvPs128), Some((16, 32)));
+    assert_eq!(legacy_blend_shape(IntrinsicOp::BlendvPd128), Some((16, 64)));
+    assert_eq!(legacy_blend_shape(IntrinsicOp::BlendvPs256), Some((32, 32)));
+    assert_eq!(legacy_blend_shape(IntrinsicOp::BlendvPd256), Some((32, 64)));
+    // Different argument order ([a, b, mask]) -> deliberately not included.
+    assert_eq!(legacy_blend_shape(IntrinsicOp::Pblendvb128), None);
+    assert_eq!(legacy_blend_shape(IntrinsicOp::Pand128), None);
+}
+
+/// Two movemasks sharing ONE constant source object, with the second
+/// computed-vector op AFTER the first movemask in program order.  The second
+/// op is a PROVEN pure read of the source, so it cannot change the image the
+/// first movemask sees.  Before the write-order fix the first fold was
+/// wrongly refused (`index > read_index`), so only one of the two folded.
+#[test]
+fn a_pure_read_after_the_movemask_does_not_invalidate_an_earlier_image() {
+    let bytes = [
+        0xFF, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0xFF,
+        0xFF,
+    ];
+    let src = Value(300);
+    let d1 = Value(301);
+    let d2 = Value(302);
+    let mut insts = vec![
+        alloca(src, 16, false, false),
+        alloca(d1, 16, false, false),
+        alloca(d2, 16, false, false),
+    ];
+    insts.extend(tiled_bytes(src, &bytes, 310));
+    // First computed op + first movemask.
+    insts.push(intrinsic(
+        Some(Value(90)),
+        IntrinsicOp::Pand128,
+        Some(d1),
+        vec![Operand::Value(src), Operand::Value(src)],
+    ));
+    insts.push(intrinsic(
+        Some(Value(91)),
+        IntrinsicOp::Pmovmskb128,
+        None,
+        vec![Operand::Value(d1)],
+    ));
+    // SECOND computed op reads the SAME source, AFTER the first movemask.
+    insts.push(intrinsic(
+        Some(Value(92)),
+        IntrinsicOp::Pcmpeqb128,
+        Some(d2),
+        vec![Operand::Value(src), Operand::Value(src)],
+    ));
+    insts.push(intrinsic(
+        Some(Value(93)),
+        IntrinsicOp::Pmovmskb128,
+        None,
+        vec![Operand::Value(d2)],
+    ));
+    insts.push(Instruction::BinOp {
+        dest: Value(94),
+        op: crate::ir::reexports::IrBinOp::Add,
+        lhs: Operand::Value(Value(91)),
+        rhs: Operand::Value(Value(93)),
+        ty: IrType::I32,
+    });
+    let mut f = IrFunction::new("two_masks".into(), IrType::I32, vec![], false);
+    f.blocks.push(block(
+        insts,
+        Terminator::Return(Some(Operand::Value(Value(94)))),
+        true,
+    ));
+    f.next_value_id = 400;
+    assert_eq!(run_function(&mut f), 2, "both movemasks must fold");
+    // AND(x,x) == x -> 53069; CMPEQ(x,x) is all-ones -> 0xFFFF.
+    assert_eq!(result_const(&f, Value(91)), Some(53069));
+    assert_eq!(result_const(&f, Value(93)), Some(0xFFFF));
+}
+
+// ---------------------------------------------------------------------------
+// Load-of-proven-constant (ISPC `ImproveMemoryOps`) + mention-index audit.
+// Every positive is paired with a refusal mutation; the byte-exactness of
+// the constant spelling is checked by round-tripping through
+// `const_store_bytes`, the very routine the image proof already trusts.
+// ---------------------------------------------------------------------------
+
+fn folded_const(func: &IrFunction, dest: Value) -> Option<IrConst> {
+    func.blocks[0].instructions.iter().find_map(|i| match i {
+        Instruction::Copy {
+            dest: d,
+            src: Operand::Const(c),
+        } if *d == dest => Some(*c),
+        _ => None,
+    })
+}
+
+fn scalar_load(
+    dest: Value,
+    ptr: Value,
+    ty: IrType,
+    volatile: bool,
+    seg: AddressSpace,
+) -> Instruction {
+    Instruction::Load {
+        dest,
+        ptr,
+        ty,
+        seg_override: seg,
+        volatile,
+    }
+}
+
+fn load_image(mutate: Option<fn(&mut Vec<Instruction>)>) -> IrFunction {
+    let bytes = [
+        0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x80, 0x01, 0x02, 0x03, 0x04, 0xF8, 0xFF, 0xFF,
+        0xFF,
+    ];
+    let mut insts = vec![alloca(Value(0), 16, false, false)];
+    insts.extend(tiled_bytes(Value(0), &bytes, 100));
+    insts.push(scalar_load(
+        Value(1),
+        Value(0),
+        IrType::U32,
+        false,
+        AddressSpace::Default,
+    ));
+    insts.push(scalar_load(
+        Value(2),
+        Value(0),
+        IrType::U8,
+        false,
+        AddressSpace::Default,
+    ));
+    insts.push(gep(Value(10), Value(0), Operand::Const(IrConst::I64(4))));
+    insts.push(scalar_load(
+        Value(3),
+        Value(10),
+        IrType::F32,
+        false,
+        AddressSpace::Default,
+    ));
+    insts.push(gep(Value(11), Value(0), Operand::Const(IrConst::I64(8))));
+    insts.push(scalar_load(
+        Value(4),
+        Value(11),
+        IrType::U64,
+        false,
+        AddressSpace::Default,
+    ));
+    // Keep ALL four load results live: `prune_dead_private_writes` runs DCE
+    // after any successful fold, so an unused load is (correctly) removed and
+    // would make `folded_const` return None for the wrong reason.
+    for (i, rhs) in [(20u32, 2u32), (21, 3), (22, 4)] {
+        let lhs = if i == 20 { Value(1) } else { Value(i - 1) };
+        insts.push(Instruction::BinOp {
+            dest: Value(i),
+            op: crate::ir::reexports::IrBinOp::Add,
+            lhs: Operand::Value(lhs),
+            rhs: Operand::Value(Value(rhs)),
+            ty: IrType::I32,
+        });
+    }
+    if let Some(m) = mutate {
+        m(&mut insts);
+    }
+    let mut f = IrFunction::new("loads".into(), IrType::I32, vec![], false);
+    f.blocks.push(block(
+        insts,
+        Terminator::Return(Some(Operand::Value(Value(22)))),
+        false,
+    ));
+    f.next_value_id = 300;
+    f
+}
+
+#[test]
+fn const_from_bytes_is_bit_exact_for_every_supported_scalar_type() {
+    let cases: &[(IrType, Vec<u8>)] = &[
+        (IrType::I8, vec![0x80]),
+        (IrType::U8, vec![0xFF]),
+        (IrType::I16, vec![0x01, 0x80]),
+        (IrType::U16, vec![0xFF, 0xFF]),
+        (IrType::I32, vec![0xFF, 0xFF, 0xFF, 0x7F]),
+        (IrType::U32, vec![0xFF, 0xFF, 0xFF, 0xFF]),
+        (IrType::I64, vec![0; 7].into_iter().chain([0x80]).collect()),
+        (IrType::U64, vec![0xFF; 8]),
+        (
+            IrType::I128,
+            vec![0; 15].into_iter().chain([0x80]).collect(),
+        ),
+        (IrType::U128, vec![0xFF; 16]),
+        // -0.0 and a NaN with a NON-CANONICAL payload: bit preservation, not
+        // numeric equality, is the property under test.
+        (IrType::F32, vec![0x00, 0x00, 0x00, 0x80]),
+        (IrType::F32, vec![0x01, 0x00, 0xC0, 0x7F]),
+        (
+            IrType::F64,
+            vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80],
+        ),
+        (
+            IrType::F64,
+            vec![0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF8, 0x7F],
+        ),
+    ];
+    for (ty, bytes) in cases {
+        let c = const_from_bytes(*ty, bytes)
+            .unwrap_or_else(|| panic!("{ty:?} must be constructible from {bytes:?}"));
+        assert_eq!(
+            const_store_bytes(c, ty.size()),
+            Some(bytes.clone()),
+            "{ty:?}: round-trip changed the bit image"
+        );
+    }
+    // Exhaustive unsigned byte domain: U8/U16/U32 are spelled as
+    // zero-extended I64, so a sign-extending mistake shows up immediately.
+    for b in 0u16..=255 {
+        let c = const_from_bytes(IrType::U8, &[b as u8]).unwrap();
+        assert_eq!(const_store_bytes(c, 1), Some(vec![b as u8]));
+    }
+    for v in [0u32, 1, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF] {
+        let bytes = v.to_le_bytes().to_vec();
+        let c = const_from_bytes(IrType::U32, &bytes).unwrap();
+        assert_eq!(const_store_bytes(c, 4), Some(bytes), "U32 {v:#x}");
+        assert_eq!(c.to_le_bytes(), IrConst::I64(v as i64).to_le_bytes());
+    }
+}
+
+#[test]
+fn const_from_bytes_refuses_unprovable_or_target_dependent_types() {
+    assert!(const_from_bytes(IrType::Ptr, &[0u8; 8]).is_none());
+    assert!(const_from_bytes(IrType::F128, &[0u8; 16]).is_none());
+    // BID decimal containers are deliberately OUT of scope: no proven
+    // `Copy { Const(D*) }` lowering for a load-folded value.
+    assert!(const_from_bytes(IrType::D32, &[0u8; 4]).is_none());
+    assert!(const_from_bytes(IrType::D64, &[0u8; 8]).is_none());
+    assert!(const_from_bytes(IrType::Void, &[]).is_none());
+    assert!(const_from_bytes(IrType::I32, &[0u8; 3]).is_none());
+    assert!(const_from_bytes(IrType::I32, &[0u8; 17]).is_none());
+    assert!(const_from_bytes(IrType::I32, &[]).is_none());
+}
+
+#[test]
+fn load_of_a_proven_constant_object_folds_to_typed_constants() {
+    let mut f = load_image(None);
+    run_function(&mut f);
+    // U32 is a zero-extended I64 spelling, NOT I32(-1).
+    assert_eq!(
+        folded_const(&f, Value(1)).map(|c| c.to_le_bytes()),
+        Some(IrConst::I64(0xFFFF_FFFFu32 as i64).to_le_bytes()),
+        "U32 load must preserve unsigned semantics"
+    );
+    assert_eq!(
+        folded_const(&f, Value(2)).map(|c| c.to_le_bytes()),
+        Some(IrConst::I64(255).to_le_bytes()),
+        "U8 load"
+    );
+    // -0.0 must keep its sign bit; numeric equality would miss that.
+    assert_eq!(
+        folded_const(&f, Value(3)).map(|c| c.to_le_bytes()),
+        Some(vec![0x00, 0x00, 0x00, 0x80]),
+        "F32 -0.0 bit pattern"
+    );
+    assert_eq!(
+        folded_const(&f, Value(4)).map(|c| c.to_le_bytes()),
+        // bytes [8..16) are 01 02 03 04 F8 FF FF FF, so the full 64-bit
+        // pattern (high bits set) is what must survive -- NOT a truncated
+        // 0x04030201.  This is the zero/sign-extension boundary.
+        Some(0xFFFF_FFF8_0403_0201u64.to_le_bytes().to_vec()),
+        "U64 load"
+    );
+}
+
+#[test]
+fn load_fold_refuses_every_unproven_shape() {
+    fn refuse(name: &str, m: fn(&mut Vec<Instruction>)) {
+        let mut f = load_image(Some(m));
+        run_function(&mut f);
+        assert!(
+            folded_const(&f, Value(1)).is_none(),
+            "{name}: U32 load was folded from an unproven object"
+        );
+    }
+    refuse("volatile load", |insts| {
+        for i in insts.iter_mut() {
+            if let Instruction::Load { volatile, .. } = i {
+                *volatile = true;
+            }
+        }
+    });
+    refuse("non-default address space", |insts| {
+        for i in insts.iter_mut() {
+            if let Instruction::Load { seg_override, .. } = i {
+                *seg_override = AddressSpace::SegFs;
+            }
+        }
+    });
+    refuse("runtime store into the object", |insts| {
+        insts.push(Instruction::Store {
+            val: Operand::Value(Value(999)),
+            ptr: Value(0),
+            ty: IrType::U8,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        });
+    });
+    refuse("volatile alloca", |insts| {
+        for i in insts.iter_mut() {
+            if let Instruction::Alloca { volatile, .. } = i {
+                *volatile = true;
+            }
+        }
+    });
+    refuse("out-of-bounds GEP derivation", |insts| {
+        insts.push(gep(Value(12), Value(0), Operand::Const(IrConst::I64(15))));
+        insts.push(scalar_load(
+            Value(13),
+            Value(12),
+            IrType::U64,
+            false,
+            AddressSpace::Default,
+        ));
+    });
+    // The terminator case needs its own function (the helper fixes Return);
+    // a stray `Copy` alone does NOT constitute an escape, so pretending it
+    // does would be a vacuous test.
+    let mut esc = load_image(None);
+    esc.blocks[0]
+        .instructions
+        .push(copy(Value(14), Operand::Value(Value(0))));
+    esc.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(14))));
+    run_function(&mut esc);
+    assert!(
+        folded_const(&esc, Value(1)).is_none(),
+        "an escaping address must veto the load fold"
+    );
+}
+
+#[test]
+fn load_fold_proves_only_the_requested_window() {
+    // `object_image` proves a WINDOW, not the whole object.  A gap at byte 9
+    // is irrelevant to a 4-byte read at byte 0, so the fold must still fire.
+    let mut outside = load_image(None);
+    outside.blocks[0].instructions.retain(|i| {
+        !matches!(
+            i,
+            Instruction::GetElementPtr {
+                dest: Value(109),
+                ..
+            }
+        ) && !matches!(
+            i,
+            Instruction::Store {
+                ptr: Value(109),
+                ..
+            }
+        )
+    });
+    run_function(&mut outside);
+    assert!(folded_const(&outside, Value(1)).is_some());
+
+    // A gap INSIDE the U32 window must refuse: the image is a value, not a
+    // guess, and one unproven byte makes the whole read unproven.
+    let mut inside = load_image(None);
+    inside.blocks[0].instructions.retain(|i| {
+        let d = match i {
+            Instruction::GetElementPtr { dest, .. } => dest.0,
+            Instruction::Store { ptr, .. } => ptr.0,
+            _ => return true,
+        };
+        !(100..=103).contains(&d)
+    });
+    run_function(&mut inside);
+    assert!(
+        folded_const(&inside, Value(1)).is_none(),
+        "an unproven byte inside the read window must veto the fold"
+    );
+}
+
+/// THE soundness regression for the legacy-blend `Memcpy` rewrite: the
+/// SELECTED ARM may be a live runtime value in an object SMALLER than 16
+/// bytes.  Emitting an unchecked 16-byte copy would read past the object.
+#[test]
+fn legacy_blend_memcpy_refuses_an_out_of_bounds_selected_arm() {
+    let all_on = Operand::Const(IrConst::I128(-1));
+    let mut f = legacy_blend_image(all_on, &[0u8; 16], &[0x80u8; 16], false);
+    for i in &mut f.blocks[0].instructions {
+        if let Instruction::Alloca { dest, size, .. } = i {
+            if *dest == Value(LB_T) {
+                *size = 8;
+            }
+        }
+    }
+    run_function(&mut f);
+    assert!(
+        !f.blocks[0]
+            .instructions
+            .iter()
+            .any(|i| matches!(i, Instruction::Memcpy { size: 16, .. })),
+        "a 16-byte Memcpy from an 8-byte object is a buffer over-read"
+    );
+}
+
+#[test]
+fn legacy_blend_memcpy_refuses_a_self_overlapping_copy() {
+    let all_on = Operand::Const(IrConst::I128(-1));
+    let mut f = legacy_blend_image(all_on, &[0u8; 16], &[0x80u8; 16], false);
+    for i in &mut f.blocks[0].instructions {
+        if let Instruction::Intrinsic {
+            op: IntrinsicOp::BlendvPs128,
+            dest_ptr,
+            args,
+            ..
+        } = i
+        {
+            *dest_ptr = Some(Value(LB_T));
+            args[1] = Operand::Value(Value(LB_F));
+            args[2] = Operand::Value(Value(LB_T));
+        }
+    }
+    run_function(&mut f);
+    assert!(
+        !f.blocks[0].instructions.iter().any(|i| matches!(
+            i,
+            Instruction::Memcpy {
+                dest: Value(LB_T),
+                src: Value(LB_T),
+                ..
+            }
+        )),
+        "memcpy with identical dest/src is not a value proof"
+    );
+}
+
+/// The precomputed mention index must see a mention in a LATER BLOCK, not
+/// just the read's block.  A write in block 1 invalidates a block-0 read.
+#[test]
+fn mention_index_sees_cross_block_writes() {
+    let bytes = [0x80u8; 16];
+    let mut f = load_image(None);
+    // Give the function a second block that writes to the same object.
+    let mut second: Vec<Instruction> = vec![Instruction::Store {
+        val: Operand::Const(IrConst::I8(0)),
+        ptr: Value(0),
+        ty: IrType::I8,
+        seg_override: AddressSpace::Default,
+        volatile: false,
+    }];
+    second.push(Instruction::Alloca {
+        dest: Value(400),
+        ty: IrType::Ptr,
+        size: 16,
+        align: 1,
+        volatile: false,
+        semantic_volatile: false,
+    });
+    f.blocks.push(block(
+        second,
+        Terminator::Return(Some(Operand::Value(Value(1)))),
+        false,
+    ));
+    let _ = bytes;
+    run_function(&mut f);
+    assert!(
+        folded_const(&f, Value(1)).is_none(),
+        "a write in a later block must be visible to the mention index"
     );
 }

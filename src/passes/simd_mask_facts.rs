@@ -15,20 +15,30 @@
 //! NEON sequence on AArch64, and a software reduction on RISC-V, where GCC 16.2
 //! and Clang 23.1.5 emit one `movl $mask, %eax`.
 //!
-//! This module supplies the lattice and three exact consumers:
+//! This module supplies the lattice and five exact consumers:
 //!
 //! 1. **Movemask fold** — `Pmovmskb128/256`, `MovemaskPs/Pd128/256` on a known
 //!    vector image become an `I32` constant (ISPC `InstructionSimplify`'s
 //!    `lSimplifyCall` / `IntrinsicsOpt`'s mask-instruction arm).
-//! 2. **Blend triviality** — a `VecBlendv*` with an all-on or all-off mask, or
-//!    with identical arms, becomes a `Copy` (ISPC `IntrinsicsOpt`'s blend arm
-//!    and `InstructionSimplify`'s `lSimplifySelect`).
-//! 3. **Private-image reclamation** — after (1) or (2) removes the last
-//!    reader of a private constant object, its initialization writes are
-//!    deleted.  Without this the fold saves the `pmovmskb`/NEON reduction but
-//!    leaves the whole constant image in the instruction stream, which is not
-//!    a win.  ISPC does not need it because LLVM constant vectors are SSA
-//!    values with no emitted initialization.
+//! 2. **Blend triviality** — a `VecBlendv*` with a lane-exact all-on/all-off
+//!    mask, or with identical arms, becomes a `Copy`; the legacy
+//!    `Blendv*128/256` `dest_ptr` forms emitted by the C frontend become a
+//!    bounds-proven `Memcpy` (ISPC `IntrinsicsOpt`'s blend arm and
+//!    `InstructionSimplify`'s `lSimplifySelect`).
+//! 3. **Load-of-constant** — a non-volatile scalar `Load` from a proven
+//!    constant window becomes a bit-exact `IrConst` (ISPC
+//!    `ImproveMemoryOps` / `InstructionSimplify`).  `run` re-runs the
+//!    canonical `constant_fold` afterwards, because this hook is scheduled
+//!    after every other folder in the pipeline.
+//! 4. **Computed-vector propagation** — byte-wise commutative `And`/`Or`/`Xor`
+//!    /`Eq` chains and exact-width splats are proved recursively, with one
+//!    shared work budget and cycle set.
+//! 5. **Private-image reclamation** — after (1)-(3) remove the last reader of
+//!    a private constant object, its initialization writes are deleted.
+//!    Without this the fold saves the `pmovmskb`/NEON reduction but leaves the
+//!    whole constant image in the instruction stream, which is not a win.
+//!    ISPC does not need it because LLVM constant vectors are SSA values with
+//!    no emitted initialization.
 //!
 //! ## Adapting the lattice to LCCC's IR
 //!
@@ -41,8 +51,10 @@
 //!
 //! * the object is a non-volatile, non-semantic-volatile `Alloca`;
 //! * every mention of its address (through `Copy` and `GEP` chains of ANY
-//!   length, including variable offsets — see `base_of_value`) is in the SAME
-//!   basic block as the read, at or before the read;
+//!   length, including variable offsets — see `root_of`) is found by a
+//!   once-per-function mention index; every proven WRITE must be in the SAME
+//!   basic block as the read and at or before it, while a proven pure read
+//!   may appear anywhere (a read cannot change the image);
 //! * a `Phi`/`Select`/`Cast`/call/inline-asm/atomic/scalar-load mention of the
 //!   address rejects the candidate, so provenance can never be lost and no
 //!   unknown pointer can alias the object;
@@ -58,6 +70,7 @@
 //! it deletes the software `pmovmskb` sequence entirely.  The
 //! `CCC_DISABLE_PASSES` name is `maskfacts`.
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::{AddressSpace, IrType};
 use crate::ir::reexports::{
     Instruction, IntrinsicOp, IrConst, IrFunction, IrModule, Operand, Value,
 };
@@ -120,30 +133,15 @@ impl MaskStatus {
         }
     }
 
-    /// Sound *all-on / all-off* classification that is independent of the
-    /// lane width: if every byte's sign bit agrees, every lane of every
-    /// packed width agrees too.  Used for blends, whose masks are consumed
-    /// byte-wise by `pblendvb`/`vpblendvb` and dword-wise by `vblendvps`.
-    /// A disagreement is `Unknown`, never a guess at a lane boundary.
-    ///
-    /// This is deliberately conservative: a well-formed dword mask such as
-    /// `0x80000000` per lane has mixed payload bytes and is reported
-    /// `Unknown`.  Failing closed is cheaper than maintaining a per-intrinsic
-    /// lane-granularity table for ten blend ops across four backends.
-    pub(crate) fn from_bytes(image: &[u8]) -> Self {
-        if image.is_empty() {
-            return Self::Unknown;
-        }
-        let any = image.iter().any(|b| b & 0x80 != 0);
-        let all = image.iter().all(|b| b & 0x80 != 0);
-        if all {
-            Self::AllOn
-        } else if !any {
-            Self::AllOff
-        } else {
-            Self::Unknown
-        }
-    }
+    // NOTE: there is deliberately ONE classification entry point.  A former
+    // `from_bytes` helper returned `Unknown` for a mixed mask while
+    // `from_lanes(_, 8)` returns `Mixed(bits)`; two verdict granularities for
+    // the same lattice were a design smell and made blend classification
+    // needlessly conservative.  `from_lanes(image, 8)` is exactly the old
+    // byte-wise test for AllOn/AllOff, and `from_lanes(image, 32/64)` is the
+    // exact dword/qword selector test.  Callers that only care about
+    // AllOn/AllOff treat `Mixed` as "no fold", so the behaviour is identical
+    // where it matters and strictly stronger where it can be proved.
 }
 
 /// `(number of lanes, lane width in bits)` for a movemask intrinsic.
@@ -295,20 +293,48 @@ fn dest_ptr_splat_shape(op: IntrinsicOp) -> Option<(usize, usize)> {
     })
 }
 
-/// `(is a blend, byte width of its mask)` for the `VecBlendv*` family.
-fn blend_width(op: IntrinsicOp) -> Option<usize> {
+/// `(mask byte width, selector lane bits)` for the LEGACY `Blendv*128/256`
+/// intrinsics emitted by the C `_mm_blendv_ps/pd` family.  Their argument
+/// order is `[mask, false_arm, true_arm]` — confirmed by the emitters
+/// (`intrinsics_simd.rs:1758` comment "operands (mask, a, b)"): AllOff keeps
+/// `a`, AllOn takes `b`.  `Pblendvb128` is deliberately NOT here: it uses a
+/// DIFFERENT order (`[a, b, mask]`, asserted at `intrinsics.rs:3322`) and
+/// would need a separate proof.
+fn legacy_blend_shape(op: IntrinsicOp) -> Option<(usize, usize)> {
     use IntrinsicOp as O;
     Some(match op {
-        O::VecBlendvF32x4
-        | O::VecBlendvF64x2
-        | O::VecBlendvI32x4
-        | O::VecBlendvI8x16
-        | O::VecBlendvI16x8 => 16,
-        O::VecBlendvF32x8
-        | O::VecBlendvF64x4
-        | O::VecBlendvI32x8
-        | O::VecBlendvI8x32
-        | O::VecBlendvI16x16 => 32,
+        O::BlendvPs128 => (16, 32),
+        O::BlendvPd128 => (16, 64),
+        O::BlendvPs256 => (32, 32),
+        O::BlendvPd256 => (32, 64),
+        _ => return None,
+    })
+}
+
+/// `(mask byte width, selector lane bits)` for the `VecBlendv*` family.
+///
+/// The selector lane width is NOT the payload lane width — it is the width of
+/// the mask field the hardware actually reads:
+///
+/// * `vblendvps` (F32x4/F32x8/I32x4/I32x8) keys on bit 31 of each DWORD, so
+///   the low three bytes of a dword mask are don't-cares.
+/// * `vblendvpd` (F64x2/F64x4) keys on bit 63 of each QWORD.
+/// * `vpblendvb` (I8x*/I16x*) keys on bit 7 of EVERY byte.  The I16 forms
+///   are `vpblendvb` too: the backend requires both bytes of a word to agree,
+///   so byte-granular classification is the exact sufficient condition.
+///
+/// Reading only the last byte of each selector lane is therefore exact in
+/// little-endian IR byte images (`IrConst::to_le_bytes`), and it folds masks
+/// like `_mm_set1_epi32(INT_MIN)` that a byte-wise test wrongly calls mixed.
+fn blend_shape(op: IntrinsicOp) -> Option<(usize, usize)> {
+    use IntrinsicOp as O;
+    Some(match op {
+        O::VecBlendvF32x4 | O::VecBlendvI32x4 => (16, 32),
+        O::VecBlendvF32x8 | O::VecBlendvI32x8 => (32, 32),
+        O::VecBlendvF64x2 => (16, 64),
+        O::VecBlendvF64x4 => (32, 64),
+        O::VecBlendvI8x16 | O::VecBlendvI16x8 => (16, 8),
+        O::VecBlendvI8x32 | O::VecBlendvI16x16 => (32, 8),
         _ => return None,
     })
 }
@@ -374,6 +400,76 @@ fn const_store_bytes(c: IrConst, ty_size: usize) -> Option<Vec<u8>> {
     Some(low.to_vec())
 }
 
+/// Rebuild an `IrConst` from the exact little-endian byte image of a proven
+/// constant object (ISPC `ImproveMemoryOps` / `InstructionSimplify`'s
+/// load-of-constant).  The constructed constant is VERIFIED by round-tripping
+/// it through `const_store_bytes` at the load's declared width: if the chosen
+/// spelling does not serialize back to EXACTLY `bytes`, the fold refuses.
+///
+/// That check is not decoration.  LCCC spells unsigned sub-64-bit constants as
+/// zero-extended `IrConst::I64` (`IrConst::from_i64`, `constants.rs:640`) so
+/// `to_i64()` does not sign-extend them; a narrow `I8`/`I32` spelling would
+/// silently change `U8(255)` into `-1`.  `F128` (target-dependent 12/16-byte
+/// x87/binary128 with a lossy `f64` field) and `Ptr` (no `IrConst` encodes a
+/// BID decimal containers and `F128` (target-dependent 12/16-byte x87 or
+/// binary128 with a lossy `f64` field) and `Ptr` (no `IrConst` encodes a
+/// stack address) are refused outright.
+fn const_from_bytes(ty: IrType, bytes: &[u8]) -> Option<IrConst> {
+    use IrType as T;
+    let n = ty.size();
+    if n == 0 || n > 16 || bytes.len() != n {
+        return None;
+    }
+    let mut buf = [0u8; 16];
+    buf[..n].copy_from_slice(bytes);
+    let c = match ty {
+        T::I128 | T::U128 => IrConst::I128(i128::from_le_bytes(buf)),
+        T::F32 => IrConst::F32(f32::from_bits(u32::from_le_bytes(
+            buf[..4].try_into().ok()?,
+        ))),
+        T::F64 => IrConst::F64(f64::from_bits(u64::from_le_bytes(
+            buf[..8].try_into().ok()?,
+        ))),
+        // D32/D64 (C23 BID decimal bit containers) and F128 are refused:
+        // their `Copy { Const }` lowering goes through target-specific helper
+        // paths that this pass has not proved.  Fail closed rather than
+        // assume a bit container is interchangeable with its bit pattern.
+        T::I8 | T::U8 | T::I16 | T::U16 | T::I32 | T::U32 | T::I64 | T::U64 => {
+            let mut low = [0u8; 8];
+            low[..n].copy_from_slice(&buf[..n]);
+            IrConst::from_i64(i64::from_le_bytes(low), ty)
+        }
+        // Ptr / F128 / Void: no exact, target-independent constant spelling.
+        _ => return None,
+    };
+    // Bit-exactness proof, not a guess: NaN payloads, -0.0, sign bits and
+    // unsigned zero-extension all have to survive the round trip.
+    (const_store_bytes(c, n) == Some(bytes.to_vec())).then_some(c)
+}
+
+/// Is `[off, off+len)` a fully in-bounds window of a plain `Alloca`?  Used to
+/// prove a `Memcpy` rewrite cannot read or write past an object.
+fn window_in_bounds(
+    defs: &FxHashMap<Value, &Instruction>,
+    base: Value,
+    off: i64,
+    len: usize,
+) -> bool {
+    let Ok(at) = usize::try_from(off) else {
+        return false;
+    };
+    let Some(Instruction::Alloca {
+        size,
+        volatile,
+        semantic_volatile,
+        ..
+    }) = defs.get(&base)
+    else {
+        return false;
+    };
+    !*volatile && !*semantic_volatile && at.checked_add(len).is_some_and(|end| end <= *size)
+}
+
 /// Pre-pass snapshot of the function's SSA definitions.  Kept immutable
 /// during the rewrite so a fold cannot change the evidence of another fold.
 /// Definitions are BORROWED, not cloned: `Facts::new` is O(instructions) with
@@ -382,6 +478,21 @@ fn const_store_bytes(c: IrConst, ty_size: usize) -> Option<Vec<u8>> {
 struct Facts<'a> {
     func: &'a IrFunction,
     defs: FxHashMap<Value, &'a Instruction>,
+    /// Every SSA value that is actually READ.  `for_each_used_value` excludes
+    /// destinations, so this is exactly the set that must be protected when
+    /// an instruction is deleted or replaced.  Built once per snapshot and
+    /// shared by `fold` and `dead_private_writes` — one source of truth.
+    used: FxHashSet<u32>,
+    /// `(block, index)` of every instruction that mentions a value derived
+    /// from each alloca, in program order.  Built ONCE.  `object_image` audits
+    /// only these mentions instead of rescanning the whole function for every
+    /// read: O(n + k) analysis instead of O(n^2).
+    mentions: FxHashMap<u32, Vec<(usize, usize)>>,
+    /// Allocas whose address appears in a terminator (i.e. escapes).
+    escaping: FxHashSet<u32>,
+    /// Allocas with at least one recognized constant write.  A cheap gate so
+    /// an ordinary scalar load never pays for a full image proof.
+    constant_bases: FxHashSet<u32>,
 }
 
 /// Verdict for ONE instruction that mentions a constant object under audit.
@@ -406,17 +517,135 @@ struct ImageWindow {
     read_index: usize,
 }
 
+/// Definition-graph root of an SSA value, following `Copy` and
+/// `GetElementPtr` (ANY offset, including variable) with an unbounded walk,
+/// memoization and cycle detection.  A free function so `Facts::new` can build
+/// the mention index before a `Facts` value exists.  Only these two opcodes
+/// preserve provenance: a phi, select, cast, load or call result deliberately
+/// does not, which is what makes the non-escape proof fail closed.
+fn root_of(
+    v: u32,
+    defs: &FxHashMap<Value, &Instruction>,
+    memo: &mut FxHashMap<u32, Option<u32>>,
+    visiting: &mut FxHashSet<u32>,
+) -> Option<u32> {
+    if let Some(cached) = memo.get(&v) {
+        return *cached;
+    }
+    if !visiting.insert(v) {
+        return None; // provenance cycle: refuse
+    }
+    let result = match defs.get(&Value(v)) {
+        Some(Instruction::Alloca { dest, .. }) => Some(dest.0),
+        Some(Instruction::Copy {
+            src: Operand::Value(next),
+            ..
+        }) => root_of(next.0, defs, memo, visiting),
+        Some(Instruction::GetElementPtr { base, .. }) => root_of(base.0, defs, memo, visiting),
+        _ => None,
+    };
+    visiting.remove(&v);
+    memo.insert(v, result);
+    result
+}
+
+/// Is this instruction a recognized CONSTANT producer that writes an object
+/// image?  Used only as a CHEAP PRE-FILTER for load folding; it is never
+/// trusted as a proof.  `object_image` still audits every mention and refuses
+/// any runtime write, out-of-bounds store or escape.
+fn is_constant_write(inst: &Instruction) -> bool {
+    match inst {
+        Instruction::Store {
+            val: Operand::Const(_),
+            volatile: false,
+            ..
+        }
+        | Instruction::Memcpy { .. } => true,
+        Instruction::Intrinsic { op, .. } => {
+            whole_store_width(*op).is_some()
+                || byte_logic_shape(*op).is_some()
+                || dest_ptr_splat_shape(*op).is_some()
+                || legacy_blend_shape(*op).is_some()
+        }
+        _ => false,
+    }
+}
+
+/// Build the per-alloca mention index, escape set and constant-write hint in
+/// ONE linear pass.  Every definition is classified exactly once; a deep or
+/// cyclic `Copy`/`GEP` chain cannot make a use invisible because `root_of`
+/// memoizes roots and refuses cycles.
+fn build_mention_index(
+    func: &IrFunction,
+    defs: &FxHashMap<Value, &Instruction>,
+) -> (
+    FxHashMap<u32, Vec<(usize, usize)>>,
+    FxHashSet<u32>,
+    FxHashSet<u32>,
+) {
+    let mut mentions: FxHashMap<u32, Vec<(usize, usize)>> = FxHashMap::default();
+    let mut escaping = FxHashSet::default();
+    let mut constant_bases = FxHashSet::default();
+    let mut memo: FxHashMap<u32, Option<u32>> = FxHashMap::default();
+    let mut cycle: FxHashSet<u32> = FxHashSet::default();
+    let mut touched: Vec<u32> = Vec::with_capacity(4);
+    for (block_id, block) in func.blocks.iter().enumerate() {
+        for (index, inst) in block.instructions.iter().enumerate() {
+            touched.clear();
+            for id in inst.used_values() {
+                if let Some(b) = root_of(id, defs, &mut memo, &mut cycle) {
+                    if !touched.contains(&b) {
+                        touched.push(b);
+                    }
+                }
+            }
+            for b in &touched {
+                mentions.entry(*b).or_default().push((block_id, index));
+                if is_constant_write(inst) {
+                    constant_bases.insert(*b);
+                }
+            }
+        }
+        for id in block.terminator.used_values() {
+            if let Some(b) = root_of(id, defs, &mut memo, &mut cycle) {
+                escaping.insert(b);
+            }
+        }
+    }
+    (mentions, escaping, constant_bases)
+}
+
 impl<'a> Facts<'a> {
     fn new(func: &'a IrFunction) -> Self {
         let mut defs = FxHashMap::default();
+        let mut used = FxHashSet::default();
         for block in &func.blocks {
             for inst in &block.instructions {
                 if let Some(dest) = inst.dest() {
                     defs.insert(dest, inst);
                 }
+                used.extend(inst.used_values());
             }
+            used.extend(block.terminator.used_values());
         }
-        Self { func, defs }
+        let (mentions, escaping, constant_bases) = build_mention_index(func, &defs);
+        Self {
+            func,
+            defs,
+            used,
+            mentions,
+            escaping,
+            constant_bases,
+        }
+    }
+
+    /// Cheap gate for load folding: does this pointer resolve to an object
+    /// that has at least one recognized constant write?  O(MAX_DEPTH).
+    fn maybe_constant_load(&self, ptr: Value) -> bool {
+        let mut off = 0i64;
+        let mut budget = MAX_DEPTH;
+        self.resolve_pointer(ptr, &mut off, &mut budget)
+            .is_some_and(|base| self.constant_bases.contains(&base.0))
     }
 
     /// Resolve an SSA value to a stack-object base plus a constant BYTE
@@ -474,26 +703,7 @@ impl<'a> Facts<'a> {
         memo: &mut FxHashMap<u32, Option<u32>>,
         visiting: &mut FxHashSet<u32>,
     ) -> Option<u32> {
-        if let Some(cached) = memo.get(&v) {
-            return *cached;
-        }
-        if !visiting.insert(v) {
-            return None; // provenance cycle: refuse
-        }
-        let result = match self.defs.get(&Value(v)) {
-            Some(Instruction::Alloca { dest, .. }) => Some(dest.0),
-            Some(Instruction::Copy {
-                src: Operand::Value(next),
-                ..
-            }) => self.base_of_value(next.0, memo, visiting),
-            Some(Instruction::GetElementPtr { base, .. }) => {
-                self.base_of_value(base.0, memo, visiting)
-            }
-            _ => None,
-        };
-        visiting.remove(&v);
-        memo.insert(v, result);
-        result
+        root_of(v, &self.defs, memo, visiting)
     }
 
     /// Byte image of a non-vector SSA value produced by a scalar `Load` from
@@ -689,12 +899,10 @@ impl<'a> Facts<'a> {
         }
     }
 
-    /// Prove that `base`'s byte window `[offset, offset + len)` is a
-    /// compile-time constant and return that image.  This is the adaptation
-    /// layer ISPC's LLVM-based analysis does not need.
-    #[allow(clippy::too_many_arguments)]
     /// Prove a constant byte image for `[offset, offset+len)` inside one
-    /// private `Alloca`.  The scan classifies EVERY mention of the object;
+    /// private `Alloca`.  This is the adaptation layer ISPC's LLVM-based
+    /// analysis does not need.  The mention index classifies EVERY mention of
+
     /// classification lives in `mention_of` / `memcpy_mention` /
     /// `intrinsic_mention`, which return an `ObjectMention` value instead of
     /// returning early.  That is deliberately structural: when they refuse,
@@ -737,57 +945,60 @@ impl<'a> Facts<'a> {
             read_index,
         };
 
-        // Reachability table for the WHOLE function.  Unlike
-        // `resolve_pointer`, this follows variable-offset GEPs and unbounded
-        // chains, so no address mention can hide from the escape audit.
-        let mut memo: FxHashMap<u32, Option<u32>> = FxHashMap::default();
-        let mut cycle: FxHashSet<u32> = FxHashSet::default();
+        // The mention index was built once in `Facts::new` from the same
+        // definition graph.  Auditing only THIS object's mentions removes the
+        // quadratic rescan: k mentions instead of every instruction of the
+        // function for every read.  No mention can hide, because `root_of`
+        // follows unbounded `Copy`/`GEP` chains and refuses cycles.
+        if self.escaping.contains(&base.0) {
+            visiting.pop();
+            return None;
+        }
 
         // (byte offset, bytes) writes, in program order.  Only the requested
         // window is materialized, but EVERY write to the object is audited.
         let mut writes: Vec<(i64, Vec<u8>)> = Vec::new();
         let mut rejected = false;
 
-        'scan: for (block_id, block) in self.func.blocks.iter().enumerate() {
-            for (index, inst) in block.instructions.iter().enumerate() {
+        if let Some(mentions) = self.mentions.get(&base.0) {
+            'scan: for &(block_id, index) in mentions {
                 if *budget == 0 {
                     rejected = true;
                     break 'scan;
                 }
                 *budget -= 1;
-
-                let mut touches = false;
-                for id in inst.used_values() {
-                    if self.base_of_value(Value(id).0, &mut memo, &mut cycle) == Some(base.0) {
-                        touches = true;
-                        break;
-                    }
-                }
-                if !touches {
-                    continue;
-                }
-                // Every mention of the address must be in the read's block
-                // and at or before the read; a later one could be a write.
-                if block_id != read_block || index > read_index {
+                let Some(inst) = self
+                    .func
+                    .blocks
+                    .get(block_id)
+                    .and_then(|b| b.instructions.get(index))
+                else {
                     rejected = true;
                     break 'scan;
-                }
-
+                };
+                // Only a WRITE is order-sensitive.  A proven `NoWrite`
+                // mention (a pure read or address derivation) cannot change
+                // the image, so it is harmless anywhere in the CFG -- and in
+                // particular AFTER the read.  Requiring every mention to be
+                // at-or-before the read was over-conservative: it refused
+                // `movemask(and(A,B)) + movemask(cmpeq(A,B))` because the
+                // second computed op reads A after the first movemask.
                 match self.mention_of(inst, w, budget, visiting) {
                     ObjectMention::NoWrite => {}
-                    ObjectMention::Write(off, bytes) => writes.push((off, bytes)),
+                    ObjectMention::Write(off, bytes) => {
+                        // A later write, or a write in another block whose
+                        // execution order is not proven, could change the
+                        // image at the read point.
+                        if block_id != read_block || index > read_index {
+                            rejected = true;
+                            break 'scan;
+                        }
+                        writes.push((off, bytes));
+                    }
                     ObjectMention::Reject => {
                         rejected = true;
                         break 'scan;
                     }
-                }
-            }
-            // Terminators are audited too: returning or branching on the
-            // address lets it escape.
-            for id in block.terminator.used_values() {
-                if self.base_of_value(Value(id).0, &mut memo, &mut cycle) == Some(base.0) {
-                    rejected = true;
-                    break 'scan;
                 }
             }
         }
@@ -1057,6 +1268,52 @@ impl<'a> Facts<'a> {
             };
             return Write(zero.saturating_add(byte_offset), image);
         }
+        if let Some((width, selector_bits)) = legacy_blend_shape(op) {
+            // A legacy `Blendv*128/256` writes its result through
+            // `dest_ptr`.  Prove the mask image, then prove the SELECTED arm
+            // image.  A mixed selector cannot be reduced to one constant
+            // image, so refuse (the fold rewrite handles the all-on/off
+            // cases by emitting a Memcpy instead).
+            let Some(dp) = dest_ptr else {
+                return Reject;
+            };
+            let mut d_off = 0i64;
+            let Some(d_base) = self.resolve_pointer(dp, &mut d_off, budget) else {
+                return Reject;
+            };
+            if d_base != w.base {
+                // It writes a different object and only reads this one
+                // through its three pointer args.  Pin every pointer arg.
+                for arg in args {
+                    if let Operand::Value(p) = arg {
+                        let mut zero = 0i64;
+                        if self.resolve_pointer(*p, &mut zero, budget).is_none() {
+                            return Reject;
+                        }
+                    }
+                }
+                return NoWrite;
+            }
+            if args.len() != 3 {
+                return Reject;
+            }
+            let Some(mask) =
+                self.operand_image(args[0], width, w.read_block, w.read_index, budget, visiting)
+            else {
+                return Reject;
+            };
+            let chosen = match MaskStatus::from_lanes(&mask, selector_bits) {
+                MaskStatus::AllOff => args[1],
+                MaskStatus::AllOn => args[2],
+                MaskStatus::Mixed(_) | MaskStatus::Unknown => return Reject,
+            };
+            let Some(image) =
+                self.operand_image(chosen, width, w.read_block, w.read_index, budget, visiting)
+            else {
+                return Reject;
+            };
+            return Write(d_off, image);
+        }
         if byte_logic_shape(op).is_some() || dest_ptr_splat_shape(op).is_some() {
             // Legacy SSE/AVX2 form: the intrinsic WRITES a computed constant
             // vector into the object named by `dest_ptr`.  Both source images
@@ -1214,6 +1471,85 @@ impl<'a> Facts<'a> {
 
 /// The rewrite for one instruction, or `None` when nothing is provable.
 fn fold(facts: &Facts<'_>, inst: &Instruction, block: usize, index: usize) -> Option<Instruction> {
+    // ISPC `ImproveMemoryOps`: a scalar `Load` from a proven private constant
+    // object is itself a constant.  `maybe_constant_load` is an O(MAX_DEPTH)
+    // gate, so ordinary functions pay nothing for this consumer.
+    if let Instruction::Load {
+        dest,
+        ptr,
+        ty,
+        volatile: false,
+        seg_override: AddressSpace::Default,
+        ..
+    } = inst
+    {
+        if !facts.maybe_constant_load(*ptr) {
+            return None;
+        }
+        let width = ty.size();
+        let image = facts.image_of(Operand::Value(*ptr), width, block, index)?;
+        let c = const_from_bytes(*ty, &image)?;
+        return Some(Instruction::Copy {
+            dest: *dest,
+            src: Operand::Const(c),
+        });
+    }
+
+    // Legacy `Blendv*128/256` intrinsics write their result THROUGH
+    // `dest_ptr`.  When the selector is provably all-off or all-on, the
+    // whole blend is exactly a 16/32-byte copy of one arm: replace it with
+    // `Memcpy`, which removes the blendvps/blendvpd/vblendv* instruction.
+    // The intrinsic's SSA `dest` is deliberately NOT replaced with a value —
+    // refuse whenever it has any user, so no dangling SSA reference can arise.
+    if let Instruction::Intrinsic {
+        op,
+        args,
+        dest_ptr: Some(dp),
+        dest,
+        ..
+    } = inst
+    {
+        if let Some((width, selector_bits)) = legacy_blend_shape(*op) {
+            if dest.is_some_and(|d| facts.used.contains(&d.0)) || args.len() != 3 {
+                return None;
+            }
+            let mask = facts.image_of(args[0], width, block, index)?;
+            let chosen = match MaskStatus::from_lanes(&mask, selector_bits) {
+                MaskStatus::AllOff => args[1],
+                MaskStatus::AllOn => args[2],
+                MaskStatus::Mixed(_) | MaskStatus::Unknown => return None,
+            };
+            let Operand::Value(src) = chosen else {
+                return None;
+            };
+            // A `Memcpy` is only sound when BOTH windows are in bounds and
+            // the objects are distinct (memcpy overlap is not a value proof).
+            // `image_of` above proved the MASK; it says nothing about the
+            // SELECTED ARM, which may be a runtime value in a smaller object.
+            // Emitting an unchecked copy would be a buffer over-read.
+            let mut budget = MAX_WORK;
+            let mut d_off = 0i64;
+            let mut s_off = 0i64;
+            let Some(d_base) = facts.resolve_pointer(*dp, &mut d_off, &mut budget) else {
+                return None;
+            };
+            let Some(s_base) = facts.resolve_pointer(src, &mut s_off, &mut budget) else {
+                return None;
+            };
+            if d_base == s_base
+                || !window_in_bounds(&facts.defs, d_base, d_off, width)
+                || !window_in_bounds(&facts.defs, s_base, s_off, width)
+            {
+                return None;
+            }
+            return Some(Instruction::Memcpy {
+                dest: *dp,
+                src,
+                size: width,
+            });
+        }
+    }
+
     let Instruction::Intrinsic {
         dest,
         op,
@@ -1226,7 +1562,7 @@ fn fold(facts: &Facts<'_>, inst: &Instruction, block: usize, index: usize) -> Op
     };
     let dest = (*dest)?;
 
-    if let Some(width) = blend_width(*op) {
+    if let Some((width, selector_bits)) = blend_shape(*op) {
         // args = [false_vec, true_vec, mask]; pinned by
         // `emit_sse_blendv_128`'s `assert!(args.len() == 3, "expects false,
         // true, mask")`.  ISPC's blend arm.
@@ -1237,7 +1573,9 @@ fn fold(facts: &Facts<'_>, inst: &Instruction, block: usize, index: usize) -> Op
             return Some(Instruction::Copy { dest, src: args[0] });
         }
         let image = facts.image_of(args[2], width, block, index)?;
-        return match MaskStatus::from_bytes(&image) {
+        // Classify by the selector lane the hardware actually reads, not by
+        // every byte: a `0x80000000` dword mask is ALL-ON, not mixed.
+        return match MaskStatus::from_lanes(&image, selector_bits) {
             MaskStatus::AllOff => Some(Instruction::Copy { dest, src: args[0] }),
             MaskStatus::AllOn => Some(Instruction::Copy { dest, src: args[1] }),
             MaskStatus::Mixed(_) | MaskStatus::Unknown => None,
@@ -1269,14 +1607,42 @@ fn fold(facts: &Facts<'_>, inst: &Instruction, block: usize, index: usize) -> Op
 }
 
 pub(crate) fn run(module: &mut IrModule) -> usize {
-    module.for_each_function(run_function)
+    let folded = module.for_each_function(run_function);
+    if folded > 0 {
+        // ORDERING FIX.  This hook runs at phase 11e-pre, AFTER every
+        // scheduled `constant_fold::run` in the pipeline.  A load folded
+        // here therefore creates a NEW `IrConst` that flows into casts and
+        // arithmetic which no later folder will see — measured on the
+        // all-on dword blend probe: `Cast { Const(F32(5.0)), F32 -> F64 }`
+        // survived into codegen as `movss .LCFP + cvtss2sd`, while GCC 16.2
+        // and Clang 23.1.5 emit one `movsd`.  Re-run the canonical local
+        // folder (idempotent, no new verify hooks) so the evidence
+        // consumer's output is fully simplified before `constarr`.
+        module.for_each_function(super::constant_fold::fold_function);
+    }
+    folded
 }
 
 fn run_function(func: &mut IrFunction) -> usize {
     let has_candidate = func.blocks.iter().any(|block| {
         block.instructions.iter().any(|inst| {
-            matches!(inst, Instruction::Intrinsic { op, dest_ptr: None, .. }
-                if is_movemask(*op) || blend_width(*op).is_some())
+            if let Instruction::Intrinsic { op, dest_ptr, .. } = inst {
+                return match dest_ptr {
+                    None => is_movemask(*op) || blend_shape(*op).is_some(),
+                    Some(_) => legacy_blend_shape(*op).is_some(),
+                };
+            }
+            // A non-volatile, default-address-space scalar load may be a
+            // load-of-constant.  `maybe_constant_load` gates the expensive
+            // proof; this gate only decides whether to build `Facts` at all.
+            matches!(
+                inst,
+                Instruction::Load {
+                    volatile: false,
+                    seg_override: AddressSpace::Default,
+                    ..
+                }
+            )
         })
     });
     if !has_candidate {
@@ -1345,7 +1711,13 @@ fn prune_dead_private_writes(func: &mut IrFunction) -> usize {
         if dead.is_empty() {
             break;
         }
-        total += remove_instructions(func, &dead);
+        let removed = remove_instructions(func, &dead);
+        total += removed;
+        if removed == 0 {
+            // No progress: do not spin for the remaining rounds.  This is the
+            // fixpoint's termination guarantee on top of MAX_DEPTH.
+            break;
+        }
         // Derivations whose only users were the deleted writes are now dead.
         super::dce::eliminate_dead_code(func);
     }
@@ -1377,15 +1749,9 @@ fn dead_private_writes(facts: &Facts<'_>) -> Vec<(usize, usize)> {
 
     // `remove_instructions` has no dangling-use check.  Legacy SSE/AVX2
     // intrinsics carry BOTH `dest_ptr` and an SSA `dest`, so deleting one
-    // whose `dest` still has a user would leave an undefined value.  Collect
-    // every true use (for_each_used_value excludes destinations) once.
-    let mut used_anywhere: FxHashSet<u32> = FxHashSet::default();
-    for block in &facts.func.blocks {
-        for inst in &block.instructions {
-            used_anywhere.extend(inst.used_values());
-        }
-        used_anywhere.extend(block.terminator.used_values());
-    }
+    // whose `dest` still has a user would leave an undefined value.  Use the
+    // shared `Facts::used` set (built once, excludes destinations).
+    let used_anywhere = &facts.used;
 
     let mut veto: FxHashSet<u32> = FxHashSet::default();
     // (block, index, base) for instructions that are legal to delete.  A
@@ -1393,12 +1759,14 @@ fn dead_private_writes(facts: &Facts<'_>) -> Vec<(usize, usize)> {
     let mut candidates: Vec<(usize, usize, u32)> = Vec::new();
     let mut work = MAX_WORK;
 
-    for (block_id, block) in facts.func.blocks.iter().enumerate() {
+    'outer: for (block_id, block) in facts.func.blocks.iter().enumerate() {
         for (index, inst) in block.instructions.iter().enumerate() {
             if work == 0 {
-                // Budget exhausted: refuse every candidate this round.
+                // Budget exhausted: refuse every candidate this round and
+                // stop walking the function (a bare `break` here used to
+                // resume the next block with zero work, burning cycles).
                 veto.extend(bases.iter().copied());
-                break;
+                break 'outer;
             }
             work -= 1;
 
@@ -1447,7 +1815,10 @@ fn dead_private_writes(facts: &Facts<'_>) -> Vec<(usize, usize)> {
                 ..
             } = inst
             {
-                if byte_logic_shape(*op).is_some() || dest_ptr_splat_shape(*op).is_some() {
+                if byte_logic_shape(*op).is_some()
+                    || dest_ptr_splat_shape(*op).is_some()
+                    || legacy_blend_shape(*op).is_some()
+                {
                     let d = facts
                         .base_of_value(dp.0, &mut memo, &mut cycle)
                         .filter(|b| bases.contains(b));
