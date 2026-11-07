@@ -207,6 +207,94 @@ fn splat_shape(op: IntrinsicOp) -> Option<(usize, usize)> {
     })
 }
 
+/// A byte-wise, COMMUTATIVE, lane-width-independent vector operation.
+///
+/// Deliberately restricted to operations whose result byte depends only on
+/// the two corresponding input bytes.  Commutativity removes every operand-
+/// order hazard (`pcmpeqb`, `pand`, `por`, `pxor` are symmetric); byte-wise
+/// semantics remove every lane-width hazard (a `pand` on I8x16, I32x4 or
+/// F64x2 produces the identical 16-byte result).  Non-commutative compares
+/// (`pcmpgtb`) and saturated arithmetic are NOT here: their operand order or
+/// saturation rule is backend-specific and would need a separate proof.
+#[derive(Clone, Copy)]
+enum ByteOp {
+    And,
+    Or,
+    Xor,
+    /// Byte equality -> 0xFF when equal, 0x00 otherwise (`pcmpeqb`).
+    Eq,
+}
+
+impl ByteOp {
+    #[inline]
+    fn apply(self, a: u8, b: u8) -> u8 {
+        match self {
+            Self::And => a & b,
+            Self::Or => a | b,
+            Self::Xor => a ^ b,
+            Self::Eq => (a == b) as u8 * 0xFF,
+        }
+    }
+}
+
+/// `(result byte width, operation)` for the constant-propagatable vector
+/// ops.  Both the legacy SSE `dest_ptr` forms (`Pand128`, ...) and the modern
+/// SSA forms (`VecAndI32x4`, ...) are included; the SAME byte function is
+/// exact on x86-64, i686, AArch64 and RISC-V because these are bitwise
+/// register operations.
+fn byte_logic_shape(op: IntrinsicOp) -> Option<(usize, ByteOp)> {
+    use IntrinsicOp as O;
+    Some(match op {
+        O::Pand128 | O::VecAndI8x16 | O::VecAndI16x8 | O::VecAndI32x4 | O::VecAndI64x2 => {
+            (16, ByteOp::And)
+        }
+        O::Por128 | O::VecOrI8x16 | O::VecOrI16x8 | O::VecOrI32x4 | O::VecOrI64x2 => {
+            (16, ByteOp::Or)
+        }
+        O::Pxor128
+        | O::VecXorI8x16
+        | O::VecXorI16x8
+        | O::VecXorI32x4
+        | O::VecXorI64x2
+        | O::VecXorF32x4
+        | O::VecXorF64x2 => (16, ByteOp::Xor),
+        O::Pcmpeqb128 => (16, ByteOp::Eq),
+        O::Pand256 | O::VecAndI8x32 | O::VecAndI16x16 | O::VecAndI32x8 | O::VecAndI64x4 => {
+            (32, ByteOp::And)
+        }
+        O::Por256 | O::VecOrI8x32 | O::VecOrI16x16 | O::VecOrI32x8 | O::VecOrI64x4 => {
+            (32, ByteOp::Or)
+        }
+        O::Pxor256
+        | O::VecXorI8x32
+        | O::VecXorI16x16
+        | O::VecXorI32x8
+        | O::VecXorI64x4
+        | O::VecXorF32x8
+        | O::VecXorF64x4 => (32, ByteOp::Xor),
+        O::Pcmpeqb256 => (32, ByteOp::Eq),
+        _ => return None,
+    })
+}
+
+/// Legacy `SetEpi*` splats that WRITE their result through `dest_ptr`.
+/// Kept separate from `splat_shape` (which also covers the SSA-value
+/// `VecBroadcast*` family): those do not write memory and must not be
+/// mistaken for a store by `object_image`.
+fn dest_ptr_splat_shape(op: IntrinsicOp) -> Option<(usize, usize)> {
+    use IntrinsicOp as O;
+    Some(match op {
+        O::SetEpi8 => (16, 1),
+        O::SetEpi16 => (16, 2),
+        O::SetEpi32 => (16, 4),
+        O::SetEpi8_256 => (32, 1),
+        O::SetEpi16_256 => (32, 2),
+        O::SetEpi32_256 => (32, 4),
+        O::SetEpi64x256 => (32, 8),
+        _ => return None,
+    })
+}
+
 /// `(is a blend, byte width of its mask)` for the `VecBlendv*` family.
 fn blend_width(op: IntrinsicOp) -> Option<usize> {
     use IntrinsicOp as O;
@@ -239,6 +327,51 @@ fn whole_store_width(op: IntrinsicOp) -> Option<usize> {
         return None;
     }
     whole_vector_store_width(op)
+}
+
+/// Bytes a scalar `Store` writes, given its declared `IrType` width.
+///
+/// LCCC's front end frequently spells a narrow byte store as
+/// `Store { val: Const(I64(255)), ty: U8 }` (measured in the 32-lane
+/// `_mm256_setr_epi8` lowering).  The x86 emitter's `direct_store_imm`
+/// documents the contract: for destinations narrower than 8 bytes the
+/// immediate is truncated to the destination's raw field.  Blindly taking
+/// all eight `to_le_bytes()` would claim an 8-byte write where the backend
+/// writes one byte and would leave 7/8 of the image unproven.
+///
+/// To stay backend-independent we accept a truncation ONLY when it is
+/// unambiguous: the bytes beyond `ty_size` must be the exact zero- or
+/// sign-extension of the retained low part.  Then every backend agrees on
+/// the value, and the retained bytes are its little-endian image.  Anything
+/// else (a float in an integer slot, `I128` narrowed to 8, a value whose
+/// high bytes are neither 0x00 nor 0xFF) refuses.
+fn const_store_bytes(c: IrConst, ty_size: usize) -> Option<Vec<u8>> {
+    if ty_size == 0 {
+        return None;
+    }
+    // `IrConst::Zero` is the width-independent zero of every integer width.
+    if matches!(c, IrConst::Zero) {
+        return Some(vec![0u8; ty_size]);
+    }
+    let bytes = c.to_le_bytes();
+    if bytes.len() == ty_size {
+        return Some(bytes);
+    }
+    if bytes.len() < ty_size || ty_size > 8 {
+        return None;
+    }
+    let low = &bytes[..ty_size];
+    // Both extension forms are exact: the front end emits `I64(255)` for a
+    // `U8` byte store (zero-extended) and `I64(-1)` for the same byte after
+    // a signed literal (sign-extended).  Both truncate to the low byte.
+    // A mixed high tail (e.g. `I64(0x1FF)`) has no single value at the
+    // narrowed width and is refused.
+    let zero_ext = bytes[ty_size..].iter().all(|b| *b == 0x00);
+    let sign_ext = bytes[ty_size..].iter().all(|b| *b == 0xFF);
+    if !zero_ext && !sign_ext {
+        return None;
+    }
+    Some(low.to_vec())
 }
 
 /// Pre-pass snapshot of the function's SSA definitions.  Kept immutable
@@ -341,6 +474,66 @@ impl<'a> Facts<'a> {
         result
     }
 
+    /// Byte image of a non-vector SSA value produced by a scalar `Load` from
+    /// a proven constant object.  This is the i686 aggregate-copy idiom:
+    /// `Load { ty: I128 }` from a 16-byte constant object, then
+    /// `Store { val: loaded, ty: I128 }` into the vector temporary.
+    ///
+    /// Only `Load`s of a whole scalar type are accepted; the width must equal
+    /// the store's declared width, the pointer must resolve to an `Alloca`,
+    /// and the source window must itself be provable.  A volatile load, a
+    /// computed value, or a source whose image is not constant refuses.
+    #[allow(clippy::too_many_arguments)]
+    fn known_scalar_bytes(
+        &self,
+        v: Value,
+        width: usize,
+        read_block: usize,
+        read_index: usize,
+        budget: &mut usize,
+        visiting: &mut Vec<Value>,
+    ) -> Option<Vec<u8>> {
+        if width == 0 || width > 32 {
+            return None;
+        }
+        // The i686 front end inserts a `Copy` between the `Load` and the
+        // storing `Store` (measured: `Copy v84 <- v214`).  Follow Copy links
+        // with a bounded, cycle-safe walk; anything else refuses.
+        let mut cur = v;
+        let (ptr, ty) = 'resolve: {
+            for _ in 0..MAX_DEPTH {
+                let inst = *self.defs.get(&cur)?;
+                match inst {
+                    Instruction::Copy {
+                        src: Operand::Value(next),
+                        ..
+                    } => {
+                        if *budget == 0 {
+                            return None;
+                        }
+                        *budget -= 1;
+                        cur = *next;
+                    }
+                    Instruction::Load {
+                        ptr,
+                        ty,
+                        volatile: false,
+                        ..
+                    } => break 'resolve (*ptr, *ty),
+                    _ => return None,
+                }
+            }
+            // A Copy cycle cannot resolve to a Load: refuse.
+            return None;
+        };
+        if ty.size() != width {
+            return None;
+        }
+        let mut zero = 0i64;
+        let base = self.resolve_pointer(ptr, &mut zero, budget)?;
+        self.object_image(base, zero, width, read_block, read_index, budget, visiting)
+    }
+
     /// Known byte image of an *SSA vector value* (not an address).
     #[allow(clippy::too_many_arguments)]
     fn known_vector(
@@ -422,6 +615,29 @@ impl<'a> Facts<'a> {
                                 }
                                 image.truncate(width);
                                 return Some(image);
+                            }
+                            if let Some((vec_width, kind)) = byte_logic_shape(*op) {
+                                // Vector constant propagation (ISPC
+                                // `InstructionSimplify`'s constant-mask
+                                // derivation).  Both operands may be SSA
+                                // vector values OR pointers to proven
+                                // constant objects; `operand_image` handles
+                                // both with the SHARED recursion state.
+                                if vec_width != width || args.len() != 2 {
+                                    return None;
+                                }
+                                let a = self.operand_image(
+                                    args[0], width, read_block, read_index, budget, visiting,
+                                )?;
+                                let b = self.operand_image(
+                                    args[1], width, read_block, read_index, budget, visiting,
+                                )?;
+                                return Some(
+                                    a.into_iter()
+                                        .zip(b)
+                                        .map(|(x, y)| kind.apply(x, y))
+                                        .collect(),
+                                );
                             }
                             if whole_vector_load(*op) && args.len() >= 2 {
                                 let byte_offset = Self::const_offset(&args[1])?;
@@ -533,6 +749,43 @@ impl<'a> Facts<'a> {
                     }
                     | Instruction::Copy { .. } => {}
                     Instruction::GetElementPtr { .. } => rejected = true,
+                    Instruction::Load {
+                        ptr,
+                        ty,
+                        volatile: false,
+                        ..
+                    } => {
+                        // A non-volatile scalar read cannot change the image.
+                        // It is sound to allow because NO `IrConst` can encode
+                        // a stack address: a value loaded from a constant
+                        // object cannot be turned back into a pointer that
+                        // aliases it.  Pin the pointer to THIS object and the
+                        // read window inside it, or refuse.  This is the
+                        // i686 `Load I128` aggregate-copy idiom.
+                        let mut zero = 0i64;
+                        let Some(p) = self.resolve_pointer(*ptr, &mut zero, budget) else {
+                            rejected = true;
+                            break 'scan;
+                        };
+                        if p != base {
+                            rejected = true;
+                            break 'scan;
+                        }
+                        let Ok(s) = usize::try_from(zero) else {
+                            rejected = true;
+                            break 'scan;
+                        };
+                        let Some(end) = s.checked_add(ty.size()) else {
+                            rejected = true;
+                            break 'scan;
+                        };
+                        if end > size {
+                            rejected = true;
+                            break 'scan;
+                        }
+                    }
+                    // A volatile scalar load is an observable read: refuse.
+                    Instruction::Load { .. } => rejected = true,
                     Instruction::Store {
                         val,
                         ptr,
@@ -544,10 +797,6 @@ impl<'a> Facts<'a> {
                             rejected = true;
                             break 'scan;
                         }
-                        let Operand::Const(c) = val else {
-                            rejected = true;
-                            break 'scan;
-                        };
                         let mut zero = 0i64;
                         let Some(p) = self.resolve_pointer(*ptr, &mut zero, budget) else {
                             rejected = true;
@@ -557,15 +806,90 @@ impl<'a> Facts<'a> {
                             rejected = true;
                             break 'scan;
                         }
-                        let bytes = c.to_le_bytes();
-                        // `IrConst::to_le_bytes` width must equal the store's
-                        // declared type width; otherwise the byte image is
-                        // not the bytes the backend would emit.
-                        if bytes.len() != ty.size() {
+                        let bytes = match val {
+                            Operand::Const(c) => const_store_bytes(*c, ty.size()),
+                            // i686's aggregate-copy lowering: the store's
+                            // value is a scalar Load from ANOTHER proven
+                            // constant object, not an `IrConst`.
+                            Operand::Value(v) => self.known_scalar_bytes(
+                                *v,
+                                ty.size(),
+                                read_block,
+                                read_index,
+                                budget,
+                                visiting,
+                            ),
+                        };
+                        let Some(bytes) = bytes else {
+                            rejected = true;
+                            break 'scan;
+                        };
+                        writes.push((zero, bytes));
+                    }
+                    Instruction::Memcpy {
+                        dest,
+                        src,
+                        size: copy_len,
+                    } => {
+                        // `vector_temp_promotion` and the aggregate-copy
+                        // lowering insert a whole-object `Memcpy` between a
+                        // vector temporary and the movemask's own stack slot
+                        // (measured for `_mm_movemask_ps` / `_mm_movemask_pd`).
+                        // Treat it as a PROVEN write or a pure read, never as
+                        // an unknown memory effect, and prove both ends.
+                        if *copy_len == 0 || *copy_len > 32 {
                             rejected = true;
                             break 'scan;
                         }
-                        writes.push((zero, bytes));
+                        let mut d_off = 0i64;
+                        let Some(d_base) = self.resolve_pointer(*dest, &mut d_off, budget) else {
+                            rejected = true;
+                            break 'scan;
+                        };
+                        let mut s_off = 0i64;
+                        let Some(s_base) = self.resolve_pointer(*src, &mut s_off, budget) else {
+                            rejected = true;
+                            break 'scan;
+                        };
+                        if d_base == base {
+                            // A write to this object.  A self/overlapping
+                            // copy is refused: memcpy byte ORDER over an
+                            // overlapping range is not a value proof.
+                            if s_base == base {
+                                rejected = true;
+                                break 'scan;
+                            }
+                            let Some(image) = self.object_image(
+                                s_base, s_off, *copy_len, read_block, read_index, budget, visiting,
+                            ) else {
+                                rejected = true;
+                                break 'scan;
+                            };
+                            writes.push((d_off, image));
+                        } else if s_base == base {
+                            // A pure read: it cannot change the image.  Pin
+                            // the read window inside the object, so an
+                            // out-of-bounds copy cannot become "harmless" by
+                            // silence.
+                            // NB: no early `return` inside this scan — the
+                            // `visiting.pop()` at the end must always run, or
+                            // a rejected proof poisons every later one.
+                            let Ok(s) = usize::try_from(s_off) else {
+                                rejected = true;
+                                break 'scan;
+                            };
+                            let Some(end) = s.checked_add(*copy_len) else {
+                                rejected = true;
+                                break 'scan;
+                            };
+                            if end > size {
+                                rejected = true;
+                                break 'scan;
+                            }
+                        } else {
+                            rejected = true;
+                            break 'scan;
+                        }
                     }
                     Instruction::Intrinsic {
                         op, args, dest_ptr, ..
@@ -612,6 +936,91 @@ impl<'a> Facts<'a> {
                                 break 'scan;
                             };
                             writes.push((zero.saturating_add(byte_offset), image));
+                        } else if byte_logic_shape(*op).is_some()
+                            || dest_ptr_splat_shape(*op).is_some()
+                        {
+                            // Legacy SSE/AVX2 form: the intrinsic WRITES a
+                            // computed constant vector into the object named
+                            // by `dest_ptr`.  Both source images must be
+                            // provable with the SHARED recursion state.
+                            let Some(dp) = *dest_ptr else {
+                                rejected = true;
+                                break 'scan;
+                            };
+                            let mut d_off = 0i64;
+                            let Some(d_base) = self.resolve_pointer(dp, &mut d_off, budget) else {
+                                rejected = true;
+                                break 'scan;
+                            };
+                            if d_base != base {
+                                // This intrinsic writes a DIFFERENT object
+                                // and merely READS this one through its
+                                // pointer arguments.  A read cannot change
+                                // this object's image; pin every pointer
+                                // argument to a resolved stack object so no
+                                // derived-address access escapes the audit.
+                                for arg in args {
+                                    if let Operand::Value(p) = arg {
+                                        let mut zero = 0i64;
+                                        if self.resolve_pointer(*p, &mut zero, budget).is_none() {
+                                            rejected = true;
+                                            break 'scan;
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                            let image = if let Some((vec_width, kind)) = byte_logic_shape(*op) {
+                                if args.len() != 2 || vec_width == 0 || vec_width > 32 {
+                                    rejected = true;
+                                    break 'scan;
+                                }
+                                let Some(a) = self.operand_image(
+                                    args[0], vec_width, read_block, read_index, budget, visiting,
+                                ) else {
+                                    rejected = true;
+                                    break 'scan;
+                                };
+                                let Some(b) = self.operand_image(
+                                    args[1], vec_width, read_block, read_index, budget, visiting,
+                                ) else {
+                                    rejected = true;
+                                    break 'scan;
+                                };
+                                a.into_iter()
+                                    .zip(b)
+                                    .map(|(x, y)| kind.apply(x, y))
+                                    .collect::<Vec<u8>>()
+                            } else {
+                                // Exact-width splat; refuse widened or
+                                // non-constant operands (truncation of an
+                                // `I64` into a dword lane is not provable).
+                                let Some((vec_width, lane_width)) = dest_ptr_splat_shape(*op)
+                                else {
+                                    rejected = true;
+                                    break 'scan;
+                                };
+                                if args.len() != 1 || vec_width > 32 {
+                                    rejected = true;
+                                    break 'scan;
+                                }
+                                let Operand::Const(c) = args[0] else {
+                                    rejected = true;
+                                    break 'scan;
+                                };
+                                let lane = c.to_le_bytes();
+                                if lane.len() != lane_width {
+                                    rejected = true;
+                                    break 'scan;
+                                }
+                                let mut img = Vec::with_capacity(vec_width);
+                                while img.len() < vec_width {
+                                    img.extend_from_slice(&lane);
+                                }
+                                img.truncate(vec_width);
+                                img
+                            };
+                            writes.push((d_off, image));
                         } else if whole_vector_load(*op) {
                             // A whole-register load is a pure read.  Pin its
                             // pointer to THIS object and its offset to a
@@ -676,6 +1085,17 @@ impl<'a> Facts<'a> {
             let Ok(w) = usize::try_from(write_offset) else {
                 return None;
             };
+            // A write that extends past the alloca's declared size is a
+            // buffer overrun, not a value proof.  Refuse it instead of
+            // silently truncating the trailing bytes away (this is what
+            // catches a 32-byte `SetEpi8_256` splat into a 16-byte object,
+            // and any mismatched `VecStore*` width).
+            let Some(write_end) = w.checked_add(bytes.len()) else {
+                return None;
+            };
+            if write_end > size {
+                return None;
+            }
             for (i, byte) in bytes.into_iter().enumerate() {
                 let Some(at) = w.checked_add(i) else {
                     return None;
@@ -706,21 +1126,7 @@ impl<'a> Facts<'a> {
     ) -> Option<Vec<u8>> {
         let mut budget = MAX_WORK;
         let mut visiting = Vec::with_capacity(MAX_DEPTH);
-        if let Operand::Value(v) = operand {
-            let mut zero = 0i64;
-            if let Some(base) = self.resolve_pointer(v, &mut zero, &mut budget) {
-                return self.object_image(
-                    base,
-                    zero,
-                    width,
-                    read_block,
-                    read_index,
-                    &mut budget,
-                    &mut visiting,
-                );
-            }
-        }
-        self.known_vector(
+        self.operand_image(
             operand,
             width,
             read_block,
@@ -728,6 +1134,29 @@ impl<'a> Facts<'a> {
             &mut budget,
             &mut visiting,
         )
+    }
+
+    /// `image_of` with SHARED recursion state, so a nested vector expression
+    /// cannot restart the work budget or lose the cycle set.  This is what
+    /// makes constant propagation through `Pand128`/`VecAnd*` chains sound.
+    #[allow(clippy::too_many_arguments)]
+    fn operand_image(
+        &self,
+        operand: Operand,
+        width: usize,
+        read_block: usize,
+        read_index: usize,
+        budget: &mut usize,
+        visiting: &mut Vec<Value>,
+    ) -> Option<Vec<u8>> {
+        if let Operand::Value(v) = operand {
+            let mut zero = 0i64;
+            if let Some(base) = self.resolve_pointer(v, &mut zero, budget) {
+                return self
+                    .object_image(base, zero, width, read_block, read_index, budget, visiting);
+            }
+        }
+        self.known_vector(operand, width, read_block, read_index, budget, visiting)
     }
 }
 
@@ -801,7 +1230,6 @@ fn run_function(func: &mut IrFunction) -> usize {
     if !has_candidate {
         return 0;
     }
-
     // Two-phase: every decision is made against the same immutable snapshot,
     // and the `Facts` borrow of `func` ends before the first mutation.
     let edits: Vec<(usize, usize, Instruction)> = {
@@ -909,6 +1337,71 @@ fn dead_private_writes(facts: &Facts<'_>) -> Vec<(usize, usize)> {
                 break;
             }
             work -= 1;
+
+            // `Memcpy` is BOTH a write to `dest` and a read of `src`, so it
+            // needs a two-sided verdict that the generic "one write to one
+            // object" classifier cannot express.  Deleting it is legal only
+            // when `dest`'s object has no reader; `src`'s object must keep
+            // its image until this copy is gone, hence the veto.  A
+            // bounded fixpoint then reclaims the source in a later round.
+            if let Instruction::Memcpy {
+                dest,
+                src,
+                size: copy_len,
+            } = inst
+            {
+                let d = facts
+                    .base_of_value(dest.0, &mut memo, &mut cycle)
+                    .filter(|b| bases.contains(b));
+                let s = facts
+                    .base_of_value(src.0, &mut memo, &mut cycle)
+                    .filter(|b| bases.contains(b));
+                if let Some(db) = d {
+                    if s == Some(db) || *copy_len == 0 || *copy_len > 32 {
+                        veto.insert(db); // self-copy or unaudited width
+                    } else {
+                        candidates.push((block_id, index, db));
+                    }
+                }
+                if let Some(sb) = s {
+                    veto.insert(sb); // the source is READ by this copy
+                }
+                continue;
+            }
+
+            // Legacy SSE/AVX2 intrinsics write a computed vector THROUGH
+            // `dest_ptr` and may read their source objects.  Like `Memcpy`
+            // this needs a two-sided verdict: the destination write is a
+            // deletion candidate, every pointer argument is a read that
+            // vetoes its object until this instruction is gone, and the
+            // bounded fixpoint reclaims the sources in a later round.
+            if let Instruction::Intrinsic {
+                op,
+                args,
+                dest_ptr: Some(dp),
+                ..
+            } = inst
+            {
+                if byte_logic_shape(*op).is_some() || dest_ptr_splat_shape(*op).is_some() {
+                    let d = facts
+                        .base_of_value(dp.0, &mut memo, &mut cycle)
+                        .filter(|b| bases.contains(b));
+                    if let Some(db) = d {
+                        candidates.push((block_id, index, db));
+                    }
+                    for arg in args {
+                        if let Operand::Value(v) = arg {
+                            if let Some(sb) = facts
+                                .base_of_value(v.0, &mut memo, &mut cycle)
+                                .filter(|b| bases.contains(b))
+                            {
+                                veto.insert(sb);
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
 
             let mut touched: Vec<u32> = Vec::with_capacity(2);
             for id in inst.used_values() {
