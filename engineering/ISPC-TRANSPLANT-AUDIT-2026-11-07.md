@@ -1192,7 +1192,7 @@ did not grow. No `unsafe`, no pointer arithmetic, no lifetime to audit.
 | `cargo fmt --all -- --check` | PASS |
 | `git diff --check` | PASS |
 | `cargo check --lib --profile fastbuild --locked` | PASS |
-| full unit suite | **8374 passed / 0 failed / 10 ignored** |
+| full unit suite | **8445 passed / 0 failed / 10 ignored** (post-rebase) |
 | focused `simd_mask_facts` | **97 passed / 0 failed** (8287 filtered) |
 | `scripts/audit_census.py --check` | PASS (`fns_over_300` at baseline 233) |
 | `scripts/check_clippy_policy.py` | PASS after fixing 2 `clippy::useless_vec` findings in the new test (**76 lints, 0 warnings**) |
@@ -1200,9 +1200,9 @@ did not grow. No `unsafe`, no pointer arithmetic, no lifetime to audit.
 | `check_param_home_contracts.py` (4 drivers) | PASS `PARAM_HOME_CONTRACTS_OK` |
 | `check_foreign_intrinsics.py` | PASS (635 x 2 non-x86 backends) |
 | `gen_lcccsimd.py --check` | PASS (1425 lines match) |
-| `check_ci_gate_parity.py` | PASS (551 commands / 27 contracts) |
+| `check_ci_gate_parity.py` | PASS (554 commands / 27 contracts, post-rebase) |
 | `run_regression.py --filter simd_mask_facts` | **11 passed / 0 failed** |
-| full corpus, `CCC_VALIDATE_SSA=1` | **1326 passed / 0 failed / 3 skipped-compare / 82 skipped-run / 1411 total** |
+| full corpus, `CCC_VALIDATE_SSA=1` | **1328 passed / 0 failed / 3 skipped-compare / 82 skipped-run / 1413 total** (post-rebase) |
 | `check_maskfacts_cross_arch.py` + `--self-test` | PASS: **4 ISAs x 2 fixtures x 2 pass states**, oracle-identical; self-test rejects every mutation |
 | three-way C differential, `avx512_stage2_folds.c` | PASS: LCCC / GCC 16.2 / Clang 23.1.5 identical 16-checksum stdout |
 | three-way C differential, `avx512_stage5_compare_folds.c` | PASS: identical 7-value stdout (`ffffffffffffffff ... 8000000000000002`) |
@@ -1232,3 +1232,31 @@ did not grow. No `unsafe`, no pointer arithmetic, no lifetime to audit.
   a separate DSE/copy-prop issue, measured and disclosed, not hidden.
 * No claim of zero defects beyond the gates and probes above; linear /
   negative-stride masked loads remain a measured, documented deferral.
+
+
+## Post-rebase verification (latest `ms178/lccc` main)
+
+Rebased onto `origin/main` = `9095b48c90f324399570a1e2aae68e010725dff3`
+(merge of #1126, plus #1133 and its 217-file / +10,277-line change set).
+`git rebase origin/main` completed with **zero conflicts**. The two files
+main and this PR both touched (`src/backend/x86/codegen/intrinsics.rs`,
+`src/passes/simd_mask_facts_tests.rs`) merged cleanly.
+
+* `scripts/build_lccc_fast.sh` (fastbuild, 4 GiB swap): RC0, 9m32s,
+  **0 warnings** — `/home/user/artifacts/build_rebased.log`.
+* `gates_final.sh rebased`: **GATES_RC=0**, all 17 direct gates printed 0 —
+  `/home/user/artifacts/gates_rebased.log`. The aggregate is a real
+  `exit "$FAILS"`, not an `echo`-masked status (an earlier harness printed
+  `GATES_RC=0` while clippy was 101; that wrapper was replaced and the
+  two `clippy::useless_vec` findings were fixed).
+* Post-rebase three-way C differentials, all RC0 and byte-identical stdout
+  for LCCC / GCC 16.2 / Clang 23.1.5: `avx512_stage2_folds.c` (16
+  checksums), `avx512_stage5_compare_folds.c` (7 values),
+  `avx512_stage5_shufb.c` (8 checksums), `simd_maskfacts_widen_average.c`
+  (`1b67dd2100eee383`) — `/home/user/artifacts/re_*_stdout.log`.
+* `check_maskfacts_cross_arch.py` + `--self-test`: PASS on the rebased tree.
+* `git diff --check`, `cargo fmt --all -- --check`: PASS.
+
+Hosted GitHub CI for THIS PR is reported in the PR itself after the push;
+it is the authority for the "CI green" requirement and was not simulated
+locally.
