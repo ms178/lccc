@@ -216,4 +216,19 @@ if [ -x "$riscv" ]; then
     fi
 fi
 
-echo 'cross-backend atomic code-generation contract: PASS'
+# TRACE must observe the same execution as GEN: CHECK expressions include
+# exchanges and compare-exchanges, so evaluating one twice changes the state
+# and corrupts every subsequent diagnostic. Compare all group hashes, not
+# just the first, and require actual trace rows to catch a vacuous pass.
+fixture=tests/regression/atomic_ops_cross.c
+"$x86" -O2 -DGEN "$fixture" -latomic -o "$td/gen"
+"$x86" -O2 -DGEN -DTRACE "$fixture" -latomic -o "$td/trace"
+"$td/gen" > "$td/gen.out"
+"$td/trace" > "$td/trace.out"
+grep -E '^    0x[0-9a-f]{16}ull,$' "$td/gen.out" > "$td/gen.hash"
+grep -E '^    0x[0-9a-f]{16}ull,$' "$td/trace.out" > "$td/trace.hash"
+grep -qE '^[0-9]+: -?[0-9]+$' "$td/trace.out"
+[ "$(wc -l < "$td/gen.hash")" -eq 38 ]
+cmp "$td/gen.hash" "$td/trace.hash"
+
+echo 'cross-backend atomic code-generation and trace contract: PASS'
