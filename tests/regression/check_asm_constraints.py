@@ -32,11 +32,24 @@ ROWS = (
     ("valid-input-register", '__asm__("movl %1, %0" : "=r"(o) : "r"(x));', None),
     ("valid-input-memory", '__asm__("movl %1, %0" : "=r"(o) : "m"(x));', None),
     ("valid-input-immediate", '__asm__("movl %1, %0" : "=r"(o) : "i"(2));', None),
-    # NOTE: GCC's `'%' constraint used with last operand` position rule and
-    # the alternative-count rule (`differ in number of alternatives`) are
-    # measured but deliberately not yet implemented; they stay GP-17's
-    # documented residual instead of a half-built check.
+    # GCC treats '%' anywhere in the last written operand's constraint as a
+    # commutative marker, even in the otherwise ignored '#' comment tail.
+    ("last-input-percent-prefix", '__asm__("" : "=r"(o) : "?%r"(x));',
+     "'%' constraint used with last operand"),
+    ("last-input-percent-suffix", '__asm__("" : "=r"(o) : "r%"(x));',
+     "'%' constraint used with last operand"),
+    ("last-input-percent-comment", '__asm__("" : "=r"(o) : "r#%"(x));',
+     "'%' constraint used with last operand"),
+    ("last-output-percent", '__asm__("" : "=%r"(o));',
+     "'%' constraint used with last operand"),
+    ("last-readwrite-percent", '__asm__("" : "+%r"(o));',
+     "'%' constraint used with last operand"),
+    ("alternatives-mismatch", '__asm__("" : "=r,r"(o) : "r"(x));',
+     "operand constraints for 'asm' differ in number of alternatives"),
     ("valid-output-alternatives", '__asm__("movl %1, %0" : "=rm"(o) : "r"(x));', None),
+    ("valid-multiple-alternatives", '__asm__("movl %1, %0" : "=r,r"(o) : "r,r"(x));', None),
+    ("valid-commutative-input", '__asm__("movl %1, %0" : "=r"(o) : "%r"(x), "r"(x));', None),
+    ("valid-commutative-output", '__asm__("movl %1, %0" : "=%r"(o) : "r"(x));', None),
     ("valid-output-plus", '__asm__("addl %1, %0" : "+r"(o) : "r"(x));', None),
     ("valid-output-earlyclobber", '__asm__("movl %1, %0" : "=&r"(o) : "r"(x));', None),
 )
