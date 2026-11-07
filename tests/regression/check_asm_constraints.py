@@ -76,39 +76,41 @@ def main() -> int:
 
     failures: list[str] = []
     with tempfile.TemporaryDirectory(prefix="lccc-asm-constraints-") as tmp:
-        for label, statement, expected in ROWS:
-            source = Path(tmp) / f"{label}.c"
-            source.write_text(
-                f"int probe(int x) {{ int o; {statement} return o; }}\n",
-                encoding="utf-8",
-            )
-            g_rc, g_err = compile_one(gcc, source)
-            l_rc, l_err = compile_one(lccc, source)
-            if expected is None:
-                if g_rc or l_rc:
-                    failures.append(
-                        f"{label}: both must accept (gcc rc={g_rc} lccc rc={l_rc}) "
-                        f"gcc={g_err.splitlines()[:1]} lccc={l_err.splitlines()[:1]}"
-                    )
-                    continue
-                print(f"asm constraints {label}: PASS (accepted)")
-                continue
-            g_hit = expected in g_err and g_rc != 0
-            l_hit = expected in l_err and l_rc != 0
-            if not g_hit:
-                failures.append(f"{label}: GCC no longer errors `{expected}`: {g_err[:200]!r}")
-            elif not l_hit:
-                failures.append(
-                    f"{label}: LCCC missing `{expected}` (rc={l_rc}): {l_err[:200]!r}"
+        for mode in ("-m64", "-m32"):
+            for label, statement, expected in ROWS:
+                label = f"{mode} {label}"
+                source = Path(tmp) / f"{label.replace(' ', '-')}.c"
+                source.write_text(
+                    f"int probe(int x) {{ int o; {statement} return o; }}\n",
+                    encoding="utf-8",
                 )
-            else:
-                print(f"asm constraints {label}: PASS (rejected, exact GCC message)")
+                g_rc, g_err = compile_one([*gcc, mode], source)
+                l_rc, l_err = compile_one([*lccc, mode], source)
+                if expected is None:
+                    if g_rc or l_rc:
+                        failures.append(
+                            f"{label}: both must accept (gcc rc={g_rc} lccc rc={l_rc}) "
+                            f"gcc={g_err.splitlines()[:1]} lccc={l_err.splitlines()[:1]}"
+                        )
+                        continue
+                    print(f"asm constraints {label}: PASS (accepted)")
+                    continue
+                g_hit = expected in g_err and g_rc != 0
+                l_hit = expected in l_err and l_rc != 0
+                if not g_hit:
+                    failures.append(f"{label}: GCC no longer errors `{expected}`: {g_err[:200]!r}")
+                elif not l_hit:
+                    failures.append(
+                        f"{label}: LCCC missing `{expected}` (rc={l_rc}): {l_err[:200]!r}"
+                    )
+                else:
+                    print(f"asm constraints {label}: PASS (rejected, exact GCC message)")
 
     if failures:
         for line in failures:
             print(f"ERROR: {line}", file=sys.stderr)
         return 1
-    print(f"asm constraints: PASS ({len(ROWS)} rows, GCC 16.2.0)")
+    print(f"asm constraints: PASS ({len(ROWS)} rows x 2 modes, GCC 16.2.0)")
     return 0
 
 
