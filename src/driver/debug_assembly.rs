@@ -20,31 +20,37 @@ pub(super) fn append_debug_sections(
     let object = match target.assemble_bytes(assembly, extra_args, Some(debug)) {
         Ok(object) => object,
         Err(error) => {
-            // `-S` is a text pass-through, and `-g` must never make it stricter.
+            // `-S` requests assembly TEXT. Assembling it in memory is only how
+            // this pass measures addresses for the line program; it is not part
+            // of what the user asked for. So `-g` must never make `-S` reject a
+            // unit that plain `-S` emits, whatever the assembler objects to.
+            // GCC 16.2 never assembles for `-S` at all and reports such errors
+            // only when the text is actually assembled (`-c`), which lccc still
+            // does on the `-c` and link paths -- this function is reached only
+            // from `run_assembly_only`.
             //
-            // Pre-rendering the DIEs assembles the generated text in memory, so
-            // a user inline-assembly template the target cannot encode used to
-            // reject `-S -g` while plain `-S` accepted it. GCC 16.2 accepts
-            // `-S -g` for such a unit and fails only when the text is actually
-            // assembled (`-c`), because it renders code addresses and sizes as
-            // symbolic expressions instead of assembling. lccc resolves them
-            // here, so it cannot describe a unit whose code it cannot measure.
-            //
-            // Attribute the failure by proof, not by pattern: re-assemble the
-            // code alone, then the code with every `#APP` body neutralized. If
-            // the first fails and the second succeeds, the compiler's own
-            // output is assemblable and the rejection belongs to the user's
-            // template. Anything else is a compiler defect and propagates.
-            if inline_asm_is_the_cause(target, assembly, extra_args) {
-                crate::common::cli_output::stderr_line(format_args!(
-                    "lccc: note: inline assembly is not assemblable for this target; \
-                     -S emits the template unchanged with .file/.loc rows, as `gcc -S` \
-                     does, and the assembler reports the error when it reads this text \
-                     ({error})"
-                ));
-                return Ok(assembly.to_string());
-            }
-            return Err(error);
+            // The first version of this fallback fired only when a proof said
+            // inline assembly was the cause. That proof neutralizes the
+            // INSTRUCTIONS inside `#APP` and deliberately keeps directives, so
+            // it could not attribute a failure caused by a directive:
+            // `.quad 791b` in a file-scope asm on i686 needs BFD_RELOC_64, the
+            // probe left it in place, still failed, and `-S -g` rejected a unit
+            // GCC accepts (kernel_altinstr_layout.c, measured). Attribution is
+            // a diagnostic nicety; it must not decide acceptance. It now only
+            // selects the wording, and the assembler's own error is always
+            // carried in the note so nothing is silently swallowed.
+            let cause = if inline_asm_is_the_cause(target, assembly, extra_args) {
+                "inline assembly is not assemblable for this target"
+            } else {
+                "this unit is not assemblable for this target"
+            };
+            crate::common::cli_output::stderr_line(format_args!(
+                "lccc: note: {cause}; \
+                 -S emits the text unchanged with .file/.loc rows, as `gcc -S` \
+                 does, and the assembler reports the error when it reads this text \
+                 ({error})"
+            ));
+            return Ok(assembly.to_string());
         }
     };
     let elf = Elf::parse(&object)?;
