@@ -25,6 +25,16 @@ prove a C memory-order mapping or real-hardware performance.
    that actual trace rows are present and all 38 group hashes match. The old
    implementation is a negative control: it fails this comparison. The normal
    generator's 38 hashes remain identical to the pre-fix output.
+3. With matching Debian i386 runtime and headers installed, the debug-invariance
+   gate reproduced two failures: `code16_realmode_encoding.c` used `%rax`, and
+   `global_load_snapshot_inline_asm.c` used `%rip`, in i686 mode. Plain `-S`
+   did not assemble the invalid instructions, but `-g -S` did. GCC 16.2's
+   i686 assembler independently rejected both original fixtures. Select `%eax`
+   for the identical ModR/M encoding in the first; use an absolute symbol in
+   i686 mode while preserving the memory clobber in the second. Added explicit
+   i686 sentinels so sample-position changes cannot lose these checks. This
+   explains the reproduced local failure, but the blocked hosted log prevents
+   independently confirming that the hosted failure contained the same cases.
 
 ## Measurements and validation
 
@@ -41,7 +51,8 @@ requests failed because its host is outside this sandbox's network allowlist.
 * `python3 tests/regression/check_switch_cross_execute.py --qemu-dir "$HOME/.cache/lccc/agent-toolchains/bin" --only atomic_ops_cross --keep-going`: **10/10 PASS**, both targets at the same five optimization levels, using LCCC's assembler. RV64 uses the fixture's sequential, non-atomic 16-byte helper stubs, not a real libatomic interoperability test.
 * `bash tests/regression/check_atomic_backends.sh`: **PASS**, including the generator/trace contract.
 * GCC 16.2 `-Wall -Wextra -Werror`: **PASS** on the fixture. Clang 23.1.5: **PASS** with `-Wno-atomic-alignment`; without it Clang correctly emits the explicit 16-byte non-lock-free performance warning, so this is not a blanket zero-warning claim.
-* `check_debug_info_invariance.sh`: **PASS** locally for 160 comparisons; 189 cases were skipped and are not passes. The old PR's hosted assembler/linker job failed this gate, but its log download was blocked by the sandbox and the failure was not reproduced locally. It remains unresolved pending a full hosted run with accessible diagnostics.
+* `check_debug_info_invariance.sh`: after provisioning i386 headers and fixing the two fixtures, **345 PASS**, 4 skipped. Before those fixes, the same environment failed on both i686 inputs. The previous 160-pass/189-skip result was not adequate coverage.
+* GCC 16.2 and LCCC executed both corrected fixtures in native 64-bit mode with and without `-g` at `-O2`; GCC did the same in 32-bit mode. LCCC's i686 binaries passed 20 runs (two fixtures, five optimization levels, with/without `-g`), with explicit `-L` paths to the verified cached GCC 16.2 32-bit `libgcc` and `libgcc_s`. The default host search did not locate these cached libraries.
 * `git diff --check origin/main HEAD`: **PASS** at the audited revision.
 
 No PMU counters, Raptor Lake timing, contention measurements, performance
@@ -52,10 +63,10 @@ local pinned tools, not the system default.
 
 ## Remaining high-priority work
 
-1. Investigate the original hosted `-g`-invariance failure with the job log or
-   a fully provisioned reproduction. Resolve the 189 local skips rather than
-   interpreting them as coverage. The new sidecar can change sampled inputs;
-   do not assume that explains the hosted failure without a reproducer.
+1. Verify the corrected `-g` gate on hosted CI. Four local cases are still
+   skipped and must not be interpreted as coverage. The old hosted job log
+   was inaccessible here, so the two locally reproduced invalid fixtures are
+   not by themselves proof of the exact hosted failure.
 2. Run the complete fast local gate on the *final unchanged tree*, then hosted
    CI, including the assertion-enabled and SSA regression corpora. A passing
    focused test is not a substitute. Treat missing toolchains and skipped
@@ -84,6 +95,6 @@ local pinned tools, not the system default.
    hashes. `-Watomic-alignment` is a useful Clang diagnostic and should not be
    silently disabled globally.
 
-Snapshots S01–S04 were published by `scripts/lccc-snapshot.sh` with an
+Session snapshots were published by `scripts/lccc-snapshot.sh` with an
 explicit `UNGATED` ledger entry. The patch applies cleanly to the recorded
 base, but this is not a CI or production-readiness attestation.
