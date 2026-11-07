@@ -220,11 +220,13 @@ fn lower_non_alloca_scalar_memcpy(func: &mut IrFunction) -> usize {
     let mut root_memo: FxHashMap<u32, Option<u32>> = FxHashMap::default();
     let mut changed = 0;
     for block in &mut func.blocks {
+        let (old_spans, old_ids) = block.take_parallel_debug();
         let old = std::mem::take(&mut block.instructions);
-        let old_spans = std::mem::take(&mut block.source_spans);
-        let has_spans = old_spans.len() == old.len() && !old_spans.is_empty();
+        let has_spans = !old_spans.is_empty();
+        let has_ids = !old_ids.is_empty();
         let mut out = Vec::with_capacity(old.len());
         let mut spans = Vec::with_capacity(old.len());
+        let mut ids = Vec::with_capacity(old.len());
         for (index, inst) in old.into_iter().enumerate() {
             let Some((dest, src, ty)) = (match &inst {
                 Instruction::Memcpy { dest, src, size } => {
@@ -260,6 +262,9 @@ fn lower_non_alloca_scalar_memcpy(func: &mut IrFunction) -> usize {
                 if has_spans {
                     spans.push(old_spans[index]);
                 }
+                if has_ids {
+                    ids.push(old_ids[index]);
+                }
                 continue;
             };
             // `next_value_id` is a u32 namespace. Refuse the rewrite rather
@@ -268,6 +273,9 @@ fn lower_non_alloca_scalar_memcpy(func: &mut IrFunction) -> usize {
                 out.push(inst);
                 if has_spans {
                     spans.push(old_spans[index]);
+                }
+                if has_ids {
+                    ids.push(old_ids[index]);
                 }
                 continue;
             }
@@ -291,12 +299,13 @@ fn lower_non_alloca_scalar_memcpy(func: &mut IrFunction) -> usize {
                 spans.push(old_spans[index]);
                 spans.push(old_spans[index]);
             }
+            if has_ids {
+                ids.push(old_ids[index]);
+                ids.push(old_ids[index]);
+            }
             changed += 1;
         }
-        block.instructions = out;
-        if has_spans {
-            block.source_spans = spans;
-        }
+        block.replace_insts_inline(out, spans, ids);
     }
     if changed > 0 {
         func.next_value_id = next;
@@ -1367,42 +1376,71 @@ fn run_function(func: &mut IrFunction) -> usize {
             let removes = rm_by_block.remove(&bi).unwrap_or_default();
 
             let block = &mut func.blocks[bi];
+            let (old_spans, old_ids) = block.take_parallel_debug();
             let old = std::mem::take(&mut block.instructions);
-            let old_spans = std::mem::take(&mut block.source_spans);
-            let has_spans = old_spans.len() == old.len() && !old_spans.is_empty();
+            let has_spans = !old_spans.is_empty();
+            let has_ids = !old_ids.is_empty();
             let fill = old_spans
                 .last()
                 .copied()
                 .unwrap_or_else(crate::common::source::Span::dummy);
+            let fill_id = old_ids
+                .last()
+                .copied()
+                .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE);
 
             let mut out = Vec::with_capacity(old.len() + inserts.len());
             let mut spans = Vec::with_capacity(out.capacity());
+            let mut ids = Vec::with_capacity(out.capacity());
             let mut next_ins = 0usize;
             for (i, inst) in old.into_iter().enumerate() {
                 while next_ins < inserts.len() && inserts[next_ins].0 <= i {
                     out.push(inserts[next_ins].1.clone());
-                    spans.push(if has_spans { old_spans[i] } else { fill });
+                    if has_spans {
+                        spans.push(old_spans[i]);
+                    }
+                    if has_ids {
+                        ids.push(old_ids[i]);
+                    }
                     next_ins += 1;
                 }
                 if !removes.contains(&i) {
                     out.push(inst);
-                    spans.push(if has_spans { old_spans[i] } else { fill });
+                    if has_spans {
+                        spans.push(old_spans[i]);
+                    }
+                    if has_ids {
+                        ids.push(old_ids[i]);
+                    }
                 }
             }
             // Anything anchored past the end appends in planner order.
             while next_ins < inserts.len() {
                 out.push(inserts[next_ins].1.clone());
-                spans.push(fill);
+                if has_spans {
+                    spans.push(fill);
+                }
+                if has_ids {
+                    ids.push(fill_id);
+                }
                 next_ins += 1;
             }
-            block.instructions = out;
-            block.source_spans = if has_spans { spans } else { Vec::new() };
+            block.replace_insts_inline(out, spans, ids);
         }
     }
     // Add scalar field allocas to the entry block.
     if !plan.new_allocas.is_empty() {
         for ins in plan.new_allocas.into_iter().rev() {
-            func.blocks[0].instructions.insert(0, ins);
+            // Hoisted field storage is artificial concrete code, not a source
+            // statement of whichever inline instance happens to start the
+            // entry block.  Keep the debug arrays parallel without extending
+            // an inline range over the new alloca.
+            func.blocks[0].insert_inst_inline(
+                0,
+                ins,
+                crate::common::source::Span::dummy(),
+                crate::ir::instruction::NO_INLINE_INSTANCE,
+            );
         }
     }
 
@@ -1458,35 +1496,12 @@ fn run_function(func: &mut IrFunction) -> usize {
                 .collect();
             if keep.iter().any(|&k| !k) {
                 let mut i = 0;
-                block.instructions.retain(|_| {
+                block.retain_insts(|_| {
                     let k = keep[i];
                     i += 1;
                     k
                 });
-                if block.source_spans.len() == keep.len() {
-                    let mut j = 0;
-                    block.source_spans.retain(|_| {
-                        let k = keep[j];
-                        j += 1;
-                        k
-                    });
-                }
             }
-        }
-    }
-
-    // Re-synchronize source spans: our edits keep instruction/spans parallel
-    // by construction, but any residual mismatch (inserts without spans) is
-    // repaired by padding with the trailing span so downstream passes that
-    // index `source_spans[inst_idx]` (mem2reg) never go out of bounds.
-    for block in &mut func.blocks {
-        if !block.source_spans.is_empty() && block.source_spans.len() != block.instructions.len() {
-            let last = block
-                .source_spans
-                .last()
-                .copied()
-                .unwrap_or_else(crate::common::source::Span::dummy);
-            block.source_spans.resize(block.instructions.len(), last);
         }
     }
 
@@ -1575,6 +1590,44 @@ mod scalar_memcpy_tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn scalar_memcpy_lowering_carries_inline_provenance() {
+        let mut func = IrFunction::new("small_copy_g".to_string(), IrType::Void, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "src".to_string(),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(1),
+                    name: "dst".to_string(),
+                },
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I64(4)),
+                    ty: IrType::I64,
+                },
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(2),
+                    size: 4,
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: vec![crate::common::source::Span::dummy(); 4],
+            source_inline_ids: vec![5, 5, 7, 7],
+        });
+        assert_eq!(lower_non_alloca_scalar_memcpy(&mut func), 1);
+        let b = &func.blocks[0];
+        assert_eq!(b.instructions.len(), 5);
+        assert_eq!(b.source_inline_ids, vec![5, 5, 7, 7, 7]);
+        assert!(b.inline_ids_consistent());
     }
 
     #[test]

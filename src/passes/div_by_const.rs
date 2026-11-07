@@ -281,9 +281,11 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
             }
         }
         let mut new_insts: Vec<Instruction> = Vec::new();
-        let has_spans = !block.source_spans.is_empty();
+        let (old_spans, old_ids) = block.take_parallel_debug();
+        let has_spans = !old_spans.is_empty();
+        let has_ids = !old_ids.is_empty();
         let mut new_spans: Vec<crate::common::source::Span> = Vec::new();
-        let old_spans = std::mem::take(&mut block.source_spans);
+        let mut new_ids: Vec<u32> = Vec::new();
 
         for (inst_idx, inst) in block.instructions.drain(..).enumerate() {
             let span = if has_spans && inst_idx < old_spans.len() {
@@ -601,6 +603,13 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
                                 let s = span.unwrap_or(crate::common::source::Span::new(0, 0, 0));
                                 for _ in 0..count {
                                     new_spans.push(s);
+                                    if has_ids {
+                                        new_ids.push(
+                                            old_ids.get(inst_idx).copied().unwrap_or(
+                                                crate::ir::instruction::NO_INLINE_INSTANCE,
+                                            ),
+                                        );
+                                    }
                                 }
                             }
                             changes += 1;
@@ -611,21 +620,34 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
                     new_insts.push(inst);
                     if has_spans {
                         new_spans.push(span.unwrap_or(crate::common::source::Span::new(0, 0, 0)));
+                        if has_ids {
+                            new_ids.push(
+                                old_ids
+                                    .get(inst_idx)
+                                    .copied()
+                                    .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE),
+                            );
+                        }
                     }
                 }
                 _ => {
                     new_insts.push(inst);
                     if has_spans {
                         new_spans.push(span.unwrap_or(crate::common::source::Span::new(0, 0, 0)));
+                        if has_ids {
+                            new_ids.push(
+                                old_ids
+                                    .get(inst_idx)
+                                    .copied()
+                                    .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE),
+                            );
+                        }
                     }
                 }
             }
         }
 
-        block.instructions = new_insts;
-        if has_spans {
-            block.source_spans = new_spans;
-        }
+        block.replace_insts_inline(new_insts, new_spans, new_ids);
     }
 
     if changes > 0 {

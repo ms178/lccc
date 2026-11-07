@@ -1059,12 +1059,7 @@ pub(super) fn run(func: &mut IrFunction) -> usize {
     }
     for (bi, ii, replacement) in plans.into_iter().rev() {
         let b = &mut func.blocks[bi];
-        if !b.source_spans.is_empty() {
-            let span = b.source_spans[ii];
-            b.source_spans
-                .splice(ii..=ii, std::iter::repeat_n(span, replacement.len()));
-        }
-        b.instructions.splice(ii..=ii, replacement);
+        b.splice_inst(ii, replacement);
     }
     func.next_value_id = next;
     changes + guards::cfg(func)

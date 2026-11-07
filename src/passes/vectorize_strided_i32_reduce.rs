@@ -2110,17 +2110,10 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> Option<usize
     let body_insts = std::mem::take(&mut ctx.body_insts);
     let final_next_val = ctx.next_val;
     let preheader = &mut func.blocks[p.preheader_idx];
-    if !preheader.instructions.is_empty()
-        && preheader.source_spans.len() == preheader.instructions.len()
-    {
-        // Keep a nonempty parallel-span block parallel.  Empty/empty means
-        // source spans were absent, not that dummy rows should be invented.
-        preheader.source_spans.extend(std::iter::repeat_n(
-            crate::common::source::Span::dummy(),
-            preheader_insts.len(),
-        ));
-    }
-    preheader.instructions.extend(preheader_insts);
+    // Keep a nonempty parallel-span block parallel (and its provenance with
+    // it); empty/empty means source spans were absent, not that dummy rows
+    // should be invented. One splice, not three parallel extends.
+    preheader.extend_insts(preheader_insts, crate::common::source::Span::dummy());
     preheader.terminator = Terminator::Branch(vec_header_label);
 
     let change_count = header_insts.len() + body_insts.len() + reduce_insts.len();

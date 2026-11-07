@@ -574,14 +574,13 @@ fn apply(func: &mut IrFunction, group: &Group) -> bool {
                 ty: IrType::Ptr,
             });
         }
-        let count = new.len();
         for (k, inst) in new.into_iter().enumerate() {
-            block.instructions.insert(at + k, inst);
-        }
-        if !block.source_spans.is_empty() {
-            for _ in 0..count {
-                block.source_spans.insert(at, span);
-            }
+            block.insert_inst_inline(
+                at + k,
+                inst,
+                span,
+                crate::ir::instruction::NO_INLINE_INSTANCE,
+            );
         }
         at
     };
@@ -640,23 +639,7 @@ fn remove_defs(
     block: &mut crate::ir::instruction::BasicBlock,
     pred: impl Fn(&Instruction) -> bool,
 ) {
-    let mut removed = Vec::new();
-    let mut idx = 0usize;
-    block.instructions.retain(|inst| {
-        let keep = !pred(inst);
-        if !keep {
-            removed.push(idx);
-        }
-        idx += 1;
-        keep
-    });
-    if !block.source_spans.is_empty() {
-        for i in removed.into_iter().rev() {
-            if i < block.source_spans.len() {
-                block.source_spans.remove(i);
-            }
-        }
-    }
+    block.retain_insts(|inst| !pred(inst));
 }
 
 fn max_value_id(func: &IrFunction) -> u32 {

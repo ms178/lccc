@@ -1459,33 +1459,13 @@ fn copies_equal(a: &[Instruction], b: &[Instruction]) -> bool {
 
 fn apply_phi_transformations(func: &mut IrFunction, ctx: &mut PhiElimCtx) {
     for (block_idx, block) in func.blocks.iter_mut().enumerate() {
-        // Remove phi instructions (and their spans)
-        if !block.source_spans.is_empty() {
-            let mut span_idx = 0;
-            block.source_spans.retain(|_| {
-                let keep = !matches!(
-                    block.instructions.get(span_idx),
-                    Some(Instruction::Phi { .. })
-                );
-                span_idx += 1;
-                keep
-            });
-        }
-        block
-            .instructions
-            .retain(|inst| !matches!(inst, Instruction::Phi { .. }));
+        // Remove phi instructions (and their spans/provenance) in one pass.
+        block.retain_insts(|inst| !matches!(inst, Instruction::Phi { .. }));
 
         // Prepend target copies (these go at the start, replacing the phis)
         if !ctx.target_copies[block_idx].is_empty() {
-            let num_copies = ctx.target_copies[block_idx].len();
-            let mut new_insts = ctx.target_copies[block_idx].clone();
-            new_insts.append(&mut block.instructions);
-            block.instructions = new_insts;
-            if !block.source_spans.is_empty() {
-                let mut new_spans = vec![crate::common::source::Span::dummy(); num_copies];
-                new_spans.append(&mut block.source_spans);
-                block.source_spans = new_spans;
-            }
+            let copies = ctx.target_copies[block_idx].clone();
+            block.insert_insts(0, copies, crate::common::source::Span::dummy());
         }
 
         // Insert predecessor copies before the terminator, ahead of the
@@ -1958,18 +1938,13 @@ fn fold_computed_phi_incomings(func: &mut IrFunction) {
             let block = &mut func.blocks[bi];
             // Position-only mutation: the definition (and the IR def set)
             // is unchanged; the sink merely relocates it.
-            let def_inst = block.instructions.remove(def_pos);
-            if !block.source_spans.is_empty() {
-                let span = block
-                    .source_spans
-                    .remove(def_pos.min(block.source_spans.len() - 1));
-                let at = (copy_pos - 1).min(block.source_spans.len());
-                block.source_spans.insert(at, span);
-            }
+            let span = block.span_at(def_pos);
+            let inline_id = block.inline_id_at(def_pos);
+            let def_inst = block.remove_inst(def_pos);
             // Definition removal shifted the copy down one slot; the
             // definition lands directly before it.
             let copy_pos = copy_pos - 1;
-            block.instructions.insert(copy_pos, def_inst);
+            block.insert_inst_inline(copy_pos, def_inst, span, inline_id);
         }
     }
 }

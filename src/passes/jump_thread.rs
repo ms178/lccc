@@ -622,8 +622,12 @@ fn apply(func: &mut IrFunction, t: &Thread) -> Option<()> {
         let block = func.blocks[bi].clone();
         let spans =
             (block.source_spans.len() == block.instructions.len()).then_some(&block.source_spans);
+        let inline_ids = (!block.source_inline_ids.is_empty()
+            && block.source_inline_ids.len() == block.instructions.len())
+        .then_some(&block.source_inline_ids);
         let mut insts = Vec::with_capacity(block.instructions.len());
         let mut out_spans = Vec::new();
+        let mut out_ids = Vec::new();
         // Phis read the values at the end of the path edge: map every arm
         // before this block's own renames take effect.
         let mut phi_renames = Vec::new();
@@ -636,6 +640,9 @@ fn apply(func: &mut IrFunction, t: &Thread) -> Option<()> {
                 insts.push(Instruction::Copy { dest: nd, src: arm });
                 if let Some(s) = spans {
                     out_spans.push(s[k]);
+                }
+                if let Some(ids) = inline_ids {
+                    out_ids.push(ids[k]);
                 }
             }
         }
@@ -661,6 +668,9 @@ fn apply(func: &mut IrFunction, t: &Thread) -> Option<()> {
             if let Some(s) = spans {
                 out_spans.push(s[k]);
             }
+            if let Some(ids) = inline_ids {
+                out_ids.push(ids[k]);
+            }
         }
         let terminator = if i + 1 < t.path.len() {
             let mut term = block.terminator.clone();
@@ -684,7 +694,7 @@ fn apply(func: &mut IrFunction, t: &Thread) -> Option<()> {
             instructions: insts,
             terminator,
             source_spans: out_spans,
-            source_inline_ids: Vec::new(),
+            source_inline_ids: out_ids,
         });
     }
 
@@ -943,10 +953,12 @@ fn repair_ssa(
         }
         for (z, phi) in new_phis {
             let block = &mut func.blocks[z];
-            block.instructions.insert(0, phi);
-            if !block.source_spans.is_empty() {
-                block.source_spans.insert(0, Span::dummy());
-            }
+            block.insert_inst_inline(
+                0,
+                phi,
+                Span::dummy(),
+                crate::ir::instruction::NO_INLINE_INSTANCE,
+            );
         }
     }
     Some(())

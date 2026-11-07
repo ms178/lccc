@@ -1294,11 +1294,8 @@ fn execute_fusions(func: &mut IrFunction, fusions: &[(usize, usize)]) {
 
         // Convert phi nodes to Copy (single-predecessor, so each Phi has one entry).
         let mut converted_instructions = Vec::with_capacity(succ_instructions.len());
-        let mut converted_spans = Vec::with_capacity(succ_spans.len());
-        let mut converted_ids = Vec::with_capacity(succ_ids.len());
-        let track_ids = !succ_ids.is_empty() || !func.blocks[pred_idx].source_inline_ids.is_empty();
 
-        for (i, inst) in succ_instructions.into_iter().enumerate() {
+        for inst in succ_instructions.into_iter() {
             if let Instruction::Phi { dest, incoming, .. } = &inst {
                 let src = incoming
                     .iter()
@@ -1320,61 +1317,63 @@ fn execute_fusions(func: &mut IrFunction, fusions: &[(usize, usize)]) {
             } else {
                 converted_instructions.push(inst);
             }
-            if i < succ_spans.len() {
-                converted_spans.push(succ_spans[i]);
-                if track_ids {
-                    converted_ids.push(
-                        succ_ids
-                            .get(i)
-                            .copied()
-                            .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE),
-                    );
-                }
-            }
         }
 
-        // Maintain the debug invariant: spans and inline ids are each either
-        // empty or parallel to instructions.  A fused block inherits the
-        // successor's provenance; synthesized padding is concrete (sentinel).
-        let pred_has_spans = !func.blocks[pred_idx].source_spans.is_empty();
-        let succ_has_spans = !converted_spans.is_empty();
-
-        if pred_has_spans && !succ_has_spans && !converted_instructions.is_empty() {
-            converted_spans.resize(
-                converted_instructions.len(),
-                crate::common::source::Span::dummy(),
-            );
-            if track_ids {
-                converted_ids.resize(
-                    converted_instructions.len(),
-                    crate::ir::instruction::NO_INLINE_INSTANCE,
-                );
-            }
-        } else if !pred_has_spans && succ_has_spans {
+        // Fuse the debug arrays by the same sparse-or-parallel law as
+        // `append_spanned_inline`, but first materialize the predecessor's
+        // side when only the successor tracks it.  Padding is concrete: an
+        // untracked side contributes dummy spans / NO_INLINE_INSTANCE, never
+        // an invented inline instance.  Recomputing from the taken successor
+        // arrays (instead of a `track_ids` guess) keeps ids parallel when one
+        // side is sparse and the other dense.
+        let converted_len = converted_instructions.len();
+        let pred_tracked = func.blocks[pred_idx].spans_parallel();
+        let pred_inline = func.blocks[pred_idx].inline_ids_parallel();
+        let final_tracked = pred_tracked || !succ_spans.is_empty();
+        let final_inline = pred_inline || !succ_ids.is_empty();
+        if final_tracked && !pred_tracked {
             let pred_inst_len = func.blocks[pred_idx].instructions.len();
             func.blocks[pred_idx]
                 .source_spans
                 .resize(pred_inst_len, crate::common::source::Span::dummy());
-            if track_ids {
-                func.blocks[pred_idx]
-                    .source_inline_ids
-                    .resize(pred_inst_len, crate::ir::instruction::NO_INLINE_INSTANCE);
+        }
+        if final_inline && !pred_inline {
+            let pred_inst_len = func.blocks[pred_idx].instructions.len();
+            func.blocks[pred_idx]
+                .source_inline_ids
+                .resize(pred_inst_len, crate::ir::instruction::NO_INLINE_INSTANCE);
+        }
+        let mut converted_spans = if final_tracked {
+            vec![crate::common::source::Span::dummy(); converted_len]
+        } else {
+            Vec::new()
+        };
+        if final_tracked {
+            for (i, span) in succ_spans.iter().enumerate().take(converted_len) {
+                converted_spans[i] = *span;
             }
         }
-
-        let converted_len = converted_instructions.len();
+        let mut converted_ids = if final_inline {
+            vec![crate::ir::instruction::NO_INLINE_INSTANCE; converted_len]
+        } else {
+            Vec::new()
+        };
+        if final_inline {
+            for (i, id) in succ_ids.iter().enumerate().take(converted_len) {
+                converted_ids[i] = *id;
+            }
+        }
         func.blocks[pred_idx]
             .instructions
             .extend(converted_instructions);
         func.blocks[pred_idx].terminator = succ_terminator;
-        if !converted_spans.is_empty() {
+        if final_tracked {
             func.blocks[pred_idx].source_spans.extend(converted_spans);
-            if track_ids {
-                converted_ids.resize(converted_len, crate::ir::instruction::NO_INLINE_INSTANCE);
-                func.blocks[pred_idx]
-                    .source_inline_ids
-                    .extend(converted_ids);
-            }
+        }
+        if final_inline {
+            func.blocks[pred_idx]
+                .source_inline_ids
+                .extend(converted_ids);
         }
         // The successor's terminator statement now ends the predecessor; move
         // its recorded span/provenance with it so the branch/return keeps its

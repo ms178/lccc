@@ -5460,17 +5460,27 @@ fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
     // Each moved reader keeps its own debug location when its block has a
     // parallel span vector (the line that names the field is the useful one
     // to step to); otherwise it takes the copy's.
-    let mut moved: FxHashMap<usize, Vec<(u32, Instruction, Option<crate::common::source::Span>)>> =
-        FxHashMap::default();
+    let mut moved: FxHashMap<
+        usize,
+        Vec<(
+            u32,
+            Instruction,
+            (Option<crate::common::source::Span>, Option<u32>),
+        )>,
+    > = FxHashMap::default();
     // The entry block is rebuilt last: groups pulled from later blocks are
     // inserted into it. `None` marks a removed slot.
     let mut entry_slots: Vec<Option<Instruction>> = Vec::new();
     for (bi, block) in blocks.iter_mut().enumerate() {
         let parallel =
             !block.source_spans.is_empty() && block.source_spans.len() == block.instructions.len();
+        let ids_parallel = !block.source_inline_ids.is_empty()
+            && block.source_inline_ids.len() == block.instructions.len();
         let old_spans = std::mem::take(&mut block.source_spans);
+        let old_ids = std::mem::take(&mut block.source_inline_ids);
         let mut kept: Vec<Instruction> = Vec::with_capacity(block.instructions.len());
         let mut spans = Vec::with_capacity(old_spans.len());
+        let mut ids = Vec::with_capacity(old_ids.len());
         for (idx, mut inst) in block.instructions.drain(..).enumerate() {
             // Decide first, move afterwards: (drop, Some((root, used)) if moved).
             let (drop, mv) = match &mut inst {
@@ -5498,10 +5508,11 @@ fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
             };
             if let Some((root, used)) = mv {
                 let span = parallel.then(|| old_spans[idx]);
+                let id = ids_parallel.then(|| old_ids[idx]);
                 moved
                     .entry(plan[&root].1)
                     .or_default()
-                    .push((used, inst, span));
+                    .push((used, inst, (span, id)));
                 if bi == 0 {
                     entry_slots.push(None);
                 }
@@ -5518,9 +5529,13 @@ fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
             if parallel {
                 spans.push(old_spans[idx]);
             }
+            if ids_parallel {
+                ids.push(old_ids[idx]);
+            }
         }
         if bi == 0 {
             block.source_spans = old_spans;
+            block.source_inline_ids = old_ids;
             continue;
         }
         block.instructions = kept;
@@ -5528,24 +5543,35 @@ fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
         // instruction list is better left as-is than discarded (imprecise
         // debug locations beat none).
         block.source_spans = if parallel { spans } else { old_spans };
+        block.source_inline_ids = if ids_parallel { ids } else { old_ids };
     }
     let entry = &mut blocks[0];
     let parallel = !entry.source_spans.is_empty() && entry.source_spans.len() == entry_slots.len();
+    let ids_parallel =
+        !entry.source_inline_ids.is_empty() && entry.source_inline_ids.len() == entry_slots.len();
     let old_spans = std::mem::take(&mut entry.source_spans);
+    let old_ids = std::mem::take(&mut entry.source_inline_ids);
     let mut insts: Vec<Instruction> = Vec::with_capacity(entry_slots.len());
     let mut spans = Vec::with_capacity(old_spans.len());
+    let mut ids = Vec::with_capacity(old_ids.len());
     for (idx, slot) in entry_slots.into_iter().enumerate() {
         if let Some(inst) = slot {
             insts.push(inst);
             if parallel {
                 spans.push(old_spans[idx]);
             }
+            if ids_parallel {
+                ids.push(old_ids[idx]);
+            }
         }
         if let Some(group) = moved.remove(&idx) {
-            for (inst, span) in order_moved_readers(group, &plan) {
+            for (inst, (span, id)) in order_moved_readers(group, &plan) {
                 insts.push(inst);
                 if parallel {
                     spans.push(span.unwrap_or(old_spans[idx]));
+                }
+                if ids_parallel {
+                    ids.push(id.unwrap_or(old_ids[idx]));
                 }
             }
         }
@@ -5556,6 +5582,7 @@ fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
     );
     entry.instructions = insts;
     entry.source_spans = if parallel { spans } else { old_spans };
+    entry.source_inline_ids = if ids_parallel { ids } else { old_ids };
     // Machine-checked post-condition: nothing may still reference a local or
     // copy that no longer exists. Debug builds pay one linear scan; the
     // invariant is exactly what a future edit to this function could break.
@@ -6361,7 +6388,6 @@ fn inline_call_site(
         // constant argument: constants may replace the ParamRef directly, while
         // the home remains a valid ABI object for address-taken or later memory
         // uses.
-        let has_spans = !entry_block.source_spans.is_empty();
         let num_args_to_store = std::cmp::min(site.args.len(), param_alloca_info.len());
         let mut bridge: Vec<(usize, Instruction)> = Vec::new();
         for i in 0..num_args_to_store {
@@ -6417,15 +6443,16 @@ fn inline_call_site(
             if let Instruction::Store { ptr, .. } | Instruction::Memcpy { dest: ptr, .. } = &inst {
                 placed.push((ptr.0, at));
             }
-            entry_block.instructions.insert(at, inst);
-            if has_spans {
-                entry_block
-                    .source_spans
-                    .insert(at, crate::common::source::Span::dummy());
-                if debug_enabled {
-                    entry_block.source_inline_ids.insert(at, call_context);
-                }
-            }
+            // The shared edit primitive applies the sparse-or-parallel law:
+            // a tracked entry block gets a dummy row plus the call's instance,
+            // an untracked one stays untracked, and a block whose ids are
+            // sparse does NOT get a one-element id list invented for it.
+            entry_block.insert_inst_inline(
+                at,
+                inst,
+                crate::common::source::Span::dummy(),
+                call_context,
+            );
         }
 
         // Ordering is a property of the FINAL instruction list, so it is checked
@@ -6486,7 +6513,7 @@ fn inline_call_site(
             } else {
                 let v = Value(paramref_next_value);
                 paramref_next_value += 1;
-                entry_block.instructions.insert(
+                entry_block.insert_inst_inline(
                     materialize_pos,
                     Instruction::Load {
                         volatile: false,
@@ -6495,17 +6522,9 @@ fn inline_call_site(
                         ty: home_ty,
                         seg_override: AddressSpace::Default,
                     },
+                    crate::common::source::Span::dummy(),
+                    call_context,
                 );
-                if has_spans {
-                    entry_block
-                        .source_spans
-                        .insert(materialize_pos, crate::common::source::Span::dummy());
-                    if debug_enabled {
-                        entry_block
-                            .source_inline_ids
-                            .insert(materialize_pos, call_context);
-                    }
-                }
                 materialize_pos += 1;
                 loaded_per_param.insert(*param_idx, v);
                 v
@@ -6520,7 +6539,7 @@ fn inline_call_site(
                 } else {
                     let cast = Value(paramref_next_value);
                     paramref_next_value += 1;
-                    entry_block.instructions.insert(
+                    entry_block.insert_inst_inline(
                         materialize_pos,
                         Instruction::Cast {
                             dest: cast,
@@ -6528,17 +6547,9 @@ fn inline_call_site(
                             from_ty: home_ty,
                             to_ty: *param_ty,
                         },
+                        crate::common::source::Span::dummy(),
+                        call_context,
                     );
-                    if has_spans {
-                        entry_block
-                            .source_spans
-                            .insert(materialize_pos, crate::common::source::Span::dummy());
-                        if debug_enabled {
-                            entry_block
-                                .source_inline_ids
-                                .insert(materialize_pos, call_context);
-                        }
-                    }
                     materialize_pos += 1;
                     cast_per_param_ty.insert(key, cast);
                     Operand::Value(cast)
@@ -6786,40 +6797,6 @@ fn inline_call_site(
     // Create the merge block with the remaining instructions and original terminator.
     // If the callee had a non-void return, insert a Phi (or Copy for single-predecessor)
     // at the start of the merge block to define the call's result value.
-    let mut merge_instructions = Vec::with_capacity(16);
-    let mut merge_spans: Vec<crate::common::source::Span> = Vec::new();
-    let mut merge_inline_ids: Vec<u32> = Vec::new();
-    if let Some(call_dest) = site.dest {
-        if phi_incoming.len() == 1 {
-            // Single return path: just copy the value directly (no phi needed)
-            merge_instructions.push(Instruction::Copy {
-                dest: call_dest,
-                src: phi_incoming[0].0,
-            });
-            merge_spans.push(crate::common::source::Span::dummy());
-            if debug_enabled {
-                merge_inline_ids.push(call_context);
-            }
-        } else if phi_incoming.len() > 1 {
-            // Multiple return paths: need a Phi node
-            merge_instructions.push(Instruction::Phi {
-                dest: call_dest,
-                ty: callee.return_type,
-                incoming: phi_incoming,
-            });
-            merge_spans.push(crate::common::source::Span::dummy());
-            if debug_enabled {
-                merge_inline_ids.push(call_context);
-            }
-        }
-        // If phi_incoming is empty, the callee never returns a value (e.g., all paths
-        // are noreturn/unreachable). The call_dest will be undefined, which is fine
-        // since it won't be used.
-    }
-    merge_instructions.extend(after_call_instructions);
-    merge_spans.extend(after_call_spans);
-    merge_inline_ids.extend(after_call_inline_ids);
-
     // Label assignment per the privacy analysis above: private label =>
     // merge keeps it, pre-call remainder takes the fresh id; externally
     // referenced label => historical shape (merge takes the fresh id).
@@ -6843,13 +6820,52 @@ fn inline_call_site(
         }
     }
 
-    let merge_block = BasicBlock {
+    // The merge block is the post-call tail plus one synthesized def of the
+    // call result. Building it with the shared primitives instead of three
+    // hand-rolled vectors keeps the sparse-or-parallel law by construction:
+    // an untracked tail stays untracked (the old code pushed a lone dummy
+    // span for the result and produced 1 span for 1+N instructions), and a
+    // tail with sparse ids does not get a one-element id list invented.
+    let mut merge_block = BasicBlock {
         label: merge_label,
-        instructions: merge_instructions,
-        source_spans: merge_spans,
-        source_inline_ids: merge_inline_ids,
+        instructions: Vec::new(),
+        source_spans: Vec::new(),
+        source_inline_ids: Vec::new(),
         terminator: original_terminator,
     };
+    merge_block.append_spanned_inline(
+        after_call_instructions,
+        after_call_spans,
+        after_call_inline_ids,
+    );
+    if let Some(call_dest) = site.dest {
+        let result_def = if phi_incoming.len() == 1 {
+            // Single return path: just copy the value directly (no phi needed).
+            Some(Instruction::Copy {
+                dest: call_dest,
+                src: phi_incoming[0].0,
+            })
+        } else if phi_incoming.len() > 1 {
+            // Multiple return paths: need a Phi node.
+            Some(Instruction::Phi {
+                dest: call_dest,
+                ty: callee.return_type,
+                incoming: phi_incoming,
+            })
+        } else {
+            // The callee never returns a value (all paths noreturn/unreachable):
+            // call_dest stays undefined and unused.
+            None
+        };
+        if let Some(inst) = result_def {
+            merge_block.insert_inst_inline(
+                0,
+                inst,
+                crate::common::source::Span::dummy(),
+                call_context,
+            );
+        }
+    }
 
     // Insert the inlined blocks and merge block after the call block
     let insert_position = call_block_idx + 1;

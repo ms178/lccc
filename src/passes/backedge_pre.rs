@@ -794,23 +794,23 @@ fn insert_inst(b: &mut BasicBlock, idx: usize, inst: Instruction, span: Option<S
             .or_else(|| b.source_spans.get(idx.saturating_sub(1)).copied())
             .or_else(|| b.source_spans.get(idx).copied())
             .unwrap_or_else(Span::dummy);
-        b.source_spans.insert(idx, s);
-    } else if !b.source_spans.is_empty() {
-        b.source_spans.clear();
-    }
-    b.instructions.insert(idx, inst);
-}
-
-fn remove_inst(b: &mut BasicBlock, idx: usize) -> (Instruction, Option<Span>) {
-    let span = if spans_synced(b) {
-        Some(b.source_spans.remove(idx))
+        b.insert_inst(idx, inst, s);
     } else {
         if !b.source_spans.is_empty() {
             b.source_spans.clear();
+            b.source_inline_ids.clear();
         }
-        None
-    };
-    (b.instructions.remove(idx), span)
+        b.instructions.insert(idx, inst);
+    }
+}
+
+fn remove_inst(b: &mut BasicBlock, idx: usize) -> (Instruction, Option<Span>) {
+    let span = spans_synced(b).then(|| b.span_at(idx));
+    if !spans_synced(b) && !b.source_spans.is_empty() {
+        b.source_spans.clear();
+        b.source_inline_ids.clear();
+    }
+    (b.remove_inst(idx), span)
 }
 
 fn span_of_def(b: &BasicBlock, v: Value) -> Option<Span> {

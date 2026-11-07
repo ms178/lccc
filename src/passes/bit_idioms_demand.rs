@@ -724,8 +724,8 @@ pub(super) fn run(f: &mut IrFunction) -> usize {
     let mut next = f.next_value_id.max(f.max_value_id().saturating_add(1));
     let mut changed = 0;
     for block in &mut f.blocks {
+        let (spans, ids) = block.take_parallel_debug();
         let old = std::mem::take(&mut block.instructions);
-        let spans = std::mem::take(&mut block.source_spans);
         for (index, i) in old.into_iter().enumerate() {
             let mut output = Vec::new();
             match &i {
@@ -936,13 +936,14 @@ pub(super) fn run(f: &mut IrFunction) -> usize {
                 }
             }
             if !spans.is_empty() {
-                let span = spans
-                    .get(index)
-                    .copied()
-                    .unwrap_or_else(crate::common::source::Span::dummy);
                 block
                     .source_spans
-                    .extend(std::iter::repeat_n(span, output.len()));
+                    .extend(std::iter::repeat_n(spans[index], output.len()));
+            }
+            if !ids.is_empty() {
+                block
+                    .source_inline_ids
+                    .extend(std::iter::repeat_n(ids[index], output.len()));
             }
             block.instructions.extend(output);
         }

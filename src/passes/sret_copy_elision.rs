@@ -355,12 +355,8 @@ fn retarget_sret_calls(func: &mut IrFunction, facts: &FxHashMap<u32, AllocaFact>
     for (bi, mut indices) in removals {
         indices.sort_unstable();
         let block = &mut func.blocks[bi];
-        let spans_parallel = block.source_spans.len() == block.instructions.len();
         for ii in indices.into_iter().rev() {
-            block.instructions.remove(ii);
-            if spans_parallel {
-                block.source_spans.remove(ii);
-            }
+            block.remove_inst(ii);
             removed += 1;
         }
     }
@@ -788,11 +784,13 @@ fn forward_dominated_copies(func: &mut IrFunction) -> usize {
     let mut removed = 0usize;
     for bi in 0..func.blocks.len() {
         let block = &mut func.blocks[bi];
-        let spans_parallel = block.source_spans.len() == block.instructions.len();
+        let (old_spans, old_ids) = block.take_parallel_debug();
         let old = std::mem::take(&mut block.instructions);
-        let old_spans = std::mem::take(&mut block.source_spans);
+        let spans_parallel = !old_spans.is_empty();
+        let ids_parallel = !old_ids.is_empty();
         let mut out: Vec<Instruction> = Vec::with_capacity(old.len());
         let mut spans: Vec<crate::common::source::Span> = Vec::with_capacity(old.len());
+        let mut ids: Vec<u32> = Vec::with_capacity(old.len());
         for (ii, inst) in old.into_iter().enumerate() {
             if removed_sites.contains(&(bi, ii)) {
                 removed += 1;
@@ -802,6 +800,9 @@ fn forward_dominated_copies(func: &mut IrFunction) -> usize {
                 out.push(inst);
                 if spans_parallel {
                     spans.push(old_spans[ii]);
+                }
+                if ids_parallel {
+                    ids.push(old_ids[ii]);
                 }
                 continue;
             };
@@ -818,6 +819,9 @@ fn forward_dominated_copies(func: &mut IrFunction) -> usize {
                 if spans_parallel {
                     spans.push(old_spans[ii]);
                 }
+                if ids_parallel {
+                    ids.push(old_ids[ii]);
+                }
                 base = dest;
             }
             let mut inst = inst;
@@ -828,11 +832,11 @@ fn forward_dominated_copies(func: &mut IrFunction) -> usize {
             if spans_parallel {
                 spans.push(old_spans[ii]);
             }
+            if ids_parallel {
+                ids.push(old_ids[ii]);
+            }
         }
-        func.blocks[bi].instructions = out;
-        if spans_parallel {
-            func.blocks[bi].source_spans = spans;
-        }
+        block.replace_insts_inline(out, spans, ids);
     }
     removed
 }

@@ -2254,11 +2254,12 @@ fn fold_loop_value_bound(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnaly
             ty,
         };
         let pre_block = &mut func.blocks[pre];
-        pre_block.instructions.push(sub);
-        if !pre_block.source_spans.is_empty() {
-            let span = *pre_block.source_spans.last().unwrap();
-            pre_block.source_spans.push(span);
-        }
+        let span = pre_block
+            .source_spans
+            .last()
+            .copied()
+            .unwrap_or_else(crate::common::source::Span::dummy);
+        pre_block.push_inst(sub, span);
         if let Instruction::Cmp { lhs, op, rhs, .. } = &mut func.blocks[cmp_bi].instructions[cmp_ii]
         {
             *lhs = Operand::Value(Value(anchor));

@@ -1158,6 +1158,8 @@ fn transform(func: &mut IrFunction, c: &Candidate, factor: u32, debug: bool) -> 
         let old = std::mem::take(&mut hb.instructions);
         let had_spans = old.len() == hb.source_spans.len() && !hb.source_spans.is_empty();
         let old_spans = std::mem::take(&mut hb.source_spans);
+        let had_ids = old.len() == hb.source_inline_ids.len() && !hb.source_inline_ids.is_empty();
+        let old_ids = std::mem::take(&mut hb.source_inline_ids);
         for (idx, inst) in old.into_iter().enumerate() {
             if hoist_set.contains(&idx) {
                 continue;
@@ -1165,6 +1167,9 @@ fn transform(func: &mut IrFunction, c: &Candidate, factor: u32, debug: bool) -> 
             hb.instructions.push(inst);
             if had_spans {
                 hb.source_spans.push(old_spans[idx]);
+            }
+            if had_ids {
+                hb.source_inline_ids.push(old_ids[idx]);
             }
         }
         for inst in hb.instructions.iter_mut() {

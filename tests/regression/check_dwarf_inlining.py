@@ -302,6 +302,78 @@ def host_controls(args: argparse.Namespace, work: Path) -> list[dict]:
     require(proc.returncode == 0, f"LICM provenance verifier aborted:\n{proc.stderr}")
     rows.append({"kind": "licm-provenance", "result": "hoisting keeps inline-id arrays well-formed"})
 
+    # Aggregate SROA/copy-forward rebuild blocks and hoist artificial allocas.
+    # A return-by-value inline helper plus a whole-object copy is the smallest
+    # portable shape that exercises those rebuilds on every target; the packed
+    # regressions below pin the x86 vector-relation producers that found the
+    # same drift in the Debian exact-oracle lane.
+    aggregate = work / "aggregate.c"
+    aggregate.write_text(
+        "struct P { long a, b, c, d; };\n"
+        "static inline struct P make(long x) { struct P p = {x, x + 1, x + 2, x + 3}; return p; }\n"
+        "static inline long sum(struct P p) { return p.a + p.b + p.c + p.d; }\n"
+        "long agg(long x) { struct P p = make(x); struct P q = p; return sum(q) + p.a; }\n"
+    )
+    for name, compiler in targets:
+        for opt in ("-O1", "-O2"):
+            out = work / f"aggregate-{name}-{opt}.o"
+            proc = run([compiler, "-std=c23", opt, "-g", "-c", str(aggregate), "-o", str(out)], work, verify_env)
+            require(proc.returncode == 0,
+                    f"aggregate provenance verifier aborted for {name} {opt}:\n{proc.stderr}")
+        rows.append({"kind": "aggregate-provenance", "target": name,
+                     "result": "SROA/copy-forward rebuilds keep inline ids parallel"})
+    regression = Path(__file__).resolve().parents[2] / "tests" / "regression"
+    packed_targets = [("x86-64", args.lccc)]
+    if args.lccc_i686:
+        packed_targets.append(("i686", args.lccc_i686))
+    for name, compiler in packed_targets:
+        mask_extra = ("-DONLY128",) + (("-DMASK_KERNELS_ONLY",) if name == "i686" else ())
+        shuffle_extra = ("-DSHUFFLE_KERNELS_ONLY",) if name == "i686" else ()
+        for source, extra in ((regression / "packed_mask_shifts.c", mask_extra),
+                              (regression / "shuffle_composition.c", shuffle_extra)):
+            out = work / f"{source.stem}-{name}.o"
+            proc = run([compiler, "-O2", "-g", "-msse2", *extra, "-c", str(source), "-o", str(out)], work, verify_env)
+            require(proc.returncode == 0,
+                    f"packed provenance verifier aborted for {name} {source.name}:\n{proc.stderr}")
+        rows.append({"kind": "packed-provenance", "target": name,
+                     "result": "packed mask/shuffle producers keep inline ids parallel"})
+
+    # One historical reproducer per IR producer that used to rebuild spans
+    # without inline ids.  The -g verifier lane is the point: without -g the
+    # id arrays are empty and every one of these bugs is invisible.
+    repo = regression.parents[1]
+    provenance_repros = [
+        ("tests/regression/accumulator_reassociation.c", "bit_idioms", ()),
+        ("tests/regression/bb_slp_redteam.c", "bit_observations_pre_div", ()),
+        ("tests/regression/byte_accessor_inline.c", "byte_load", ()),
+        ("tests/regression/add_overflow_roundtrip.c", "cfg_simplify1", ()),
+        ("tests/regression/simd_sse_float.c", "deadslotload", ("-msse3",)),
+        ("tests/regression/adler_inline_tail.c", "div_by_const", ()),
+        ("tests/regression/atomic_bitwise_operand_homes.c", "dse", ()),
+        ("tests/regression/aggregate_split_constant_fields.c", "global_addr_cse_post_unroll", ()),
+        ("tests/regression/cmp_replay_far.c", "gvn", ()),
+        ("tests/regression/alloca_address_truncation.c", "inline", ()),
+        ("tests/regression/affine_loop_fold.c", "ivsr", ()),
+        ("tests/regression/agg_copy_fwd_call_clobbers_source.c", "jump_thread", ()),
+        ("tests/regression/aggregate_split_memset.c", "libmemcpy", ()),
+        ("tests/regression/loop_memset_smear_phi.c", "loop_carried_forward", ()),
+        ("tests/regression/cross_pr_redteam.c", "math_intrinsic_fold", ()),
+        ("tests/regression/builtin_call_shadowed_by_function_pointer.c", "signmag", ()),
+        ("tests/regression/agg_copy_forward_subobject_chain.c", "sret_copy_elision", ()),
+        ("tests/regression/affine_map_vectorization.c", "univsr", ()),
+        ("tests/regression/pic_indexed_store_static_global.c", "address_form", ()),
+        ("tests/regression/vec_adler_epic.c", "pair_load_carry", ()),
+        ("tests/regression/bb_slp_v5.c", "location_alloc/phi_relay_fold", ()),
+        ("tests/regression/crc_fold_state1.c", "dwarf-inline-call-file", ("-msse4.2", "-mpclmul")),
+    ]
+    for rel, stage, extra in provenance_repros:
+        out = work / f"provenance-{Path(rel).stem}.o"
+        proc = run([args.lccc, "-O2", "-g", "-w", *extra, "-c", str(repo / rel), "-o", str(out)], work, verify_env)
+        require(proc.returncode == 0,
+                f"inline provenance reproducer {stage} ({rel}) failed:\n{proc.stderr}")
+    rows.append({"kind": "producer-provenance-sweep",
+                 "result": f"{len(provenance_repros)} historical span/inline-id producer reproducers compile under -g verifier"})
+
     if args.gdb:
         exe = work / "nested.elf"
         compile_source(lccc, nested, exe, work, "-O2", "-g", "-fno-omit-frame-pointer", str(seed))

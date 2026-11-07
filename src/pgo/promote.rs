@@ -249,7 +249,11 @@ pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
                 );
                 next_label += 3;
                 let old_term = block.terminator.clone();
+                let call_inline_id = block.inline_id_at(pl.inst_idx);
                 let mut old_spans = block.source_spans.clone();
+                let ids_parallel = !block.source_inline_ids.is_empty()
+                    && block.source_inline_ids.len() == block.instructions.len();
+                let mut old_ids = block.source_inline_ids.clone();
                 let mut has_f64_second = false;
                 let mut f64_dest = None;
                 // SSA-correct transform: everything AFTER the call (which may
@@ -259,9 +263,19 @@ pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
                 // stay in B (they do not depend on the result).
                 let mut post: Vec<Instruction> = block.instructions.split_off(pl.inst_idx + 1);
                 let mut post_spans: Vec<crate::common::source::Span> =
-                    old_spans.split_off(pl.inst_idx + 1);
+                    if old_spans.len() > pl.inst_idx + 1 {
+                        old_spans.split_off(pl.inst_idx + 1)
+                    } else {
+                        Vec::new()
+                    };
+                let mut post_ids: Vec<u32> = if ids_parallel && old_ids.len() > pl.inst_idx + 1 {
+                    old_ids.split_off(pl.inst_idx + 1)
+                } else {
+                    Vec::new()
+                };
                 let mut post2: Vec<Instruction> = Vec::new();
                 let mut post_spans2: Vec<crate::common::source::Span> = Vec::new();
+                let mut post_ids2: Vec<u32> = Vec::new();
                 for (k, inst) in post.into_iter().enumerate() {
                     if let Instruction::GetReturnF64Second { dest } = inst {
                         has_f64_second = true;
@@ -272,9 +286,13 @@ pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
                     if let Some(sp) = post_spans.get(k) {
                         post_spans2.push(*sp);
                     }
+                    if let Some(id) = post_ids.get(k) {
+                        post_ids2.push(*id);
+                    }
                 }
                 post = post2;
                 post_spans = post_spans2;
+                post_ids = post_ids2;
                 // Rewrite the call into: GlobalAddr + casts + cmp.
                 block.instructions[pl.inst_idx] = Instruction::GlobalAddr {
                     dest: ta,
@@ -320,6 +338,14 @@ pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
                             .push(crate::common::source::Span::dummy());
                     }
                 }
+                if ids_parallel {
+                    block.source_inline_ids.truncate(pl.inst_idx);
+                    block
+                        .source_inline_ids
+                        .extend(std::iter::repeat_n(call_inline_id, 4));
+                } else {
+                    block.source_inline_ids.clear();
+                }
                 block.terminator = Terminator::CondBranch {
                     cond: Operand::Value(cmpv),
                     true_label: lhot,
@@ -355,16 +381,17 @@ pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
                     block.instructions.get(pl.inst_idx + 4)
                 {
                     // Original trailing instruction: remove it (moved).
-                    let _ = block.instructions.remove(pl.inst_idx + 4);
+                    let _ = block.remove_inst(pl.inst_idx + 4);
                 }
-                let mut join_is: Vec<Instruction> = Vec::new();
-                if let (Some(d), Some(a), Some(b)) = (dest, r1, r2) {
-                    join_is.push(Instruction::Phi {
+                let join_phi = if let (Some(d), Some(a), Some(b)) = (dest, r1, r2) {
+                    Some(Instruction::Phi {
                         dest: d,
                         ty: ret_ty,
                         incoming: vec![(Operand::Value(a), lhot), (Operand::Value(b), lcold)],
-                    });
-                }
+                    })
+                } else {
+                    None
+                };
                 f.blocks.push(BasicBlock {
                     label: lhot,
                     instructions: hot_is,
@@ -379,17 +406,27 @@ pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
                     source_spans: vec![],
                     source_inline_ids: Vec::new(),
                 });
-                join_is.extend(post);
-                let mut join_spans: Vec<crate::common::source::Span> = Vec::new();
-                join_spans.push(crate::common::source::Span::dummy());
-                join_spans.extend(post_spans);
-                f.blocks.push(BasicBlock {
+                // Same shape as the inliner's merge block: post-call tail
+                // plus one synthesized result def. The primitives keep an
+                // untracked tail untracked (pushing a lone dummy span for the
+                // phi used to yield 1 span for 1+N instructions).
+                let mut join_block = BasicBlock {
                     label: ljoin,
-                    instructions: join_is,
-                    terminator: old_term,
-                    source_spans: join_spans,
+                    instructions: Vec::new(),
+                    source_spans: Vec::new(),
                     source_inline_ids: Vec::new(),
-                });
+                    terminator: old_term,
+                };
+                join_block.append_spanned_inline(post, post_spans, post_ids);
+                if let Some(phi) = join_phi {
+                    join_block.insert_inst_inline(
+                        0,
+                        phi,
+                        crate::common::source::Span::dummy(),
+                        call_inline_id,
+                    );
+                }
+                f.blocks.push(join_block);
                 // SSA-invariant fix: the original block B's terminator moved
                 // to the join, so ANY Phi anywhere that lists B as an
                 // incoming predecessor must now list the JOIN block — the

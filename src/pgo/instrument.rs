@@ -726,13 +726,10 @@ pub fn instrument_module(
                 .iter()
                 .take_while(|i| matches!(i, Instruction::Phi { .. }))
                 .count();
-            for (k, x) in v.into_iter().enumerate() {
-                b.instructions.insert(pos + k, x);
-                if !b.source_spans.is_empty() {
-                    b.source_spans
-                        .insert(pos + k, crate::common::source::Span::dummy());
-                }
-            }
+            // One splice for the whole run (O(block) instead of O(counters *
+            // block)), and the counters inherit the surrounding inline
+            // instance so they do not chop one inline range into many.
+            b.insert_insts(pos, v, crate::common::source::Span::dummy());
         }
 
         // Edge list (without the virtual entry edge), tagged with slot.
@@ -799,32 +796,26 @@ pub fn instrument_module(
                         if !m.globals.iter().any(|x| x.name == g.name) {
                             m.globals.push(g);
                         }
-                        b.instructions.insert(
+                        b.insert_insts(
                             k,
-                            Instruction::GlobalAddr {
-                                dest: sa,
-                                name: site.clone(),
-                            },
+                            [
+                                Instruction::GlobalAddr {
+                                    dest: sa,
+                                    name: site.clone(),
+                                },
+                                Instruction::Call {
+                                    func: vp_recorder.clone(),
+                                    info: ci(
+                                        None,
+                                        vec![Operand::Value(sa), Operand::Value(fp)],
+                                        vec![IrType::Ptr, IrType::I64],
+                                        IrType::I32,
+                                        false,
+                                    ),
+                                },
+                            ],
+                            crate::common::source::Span::dummy(),
                         );
-                        b.instructions.insert(
-                            k + 1,
-                            Instruction::Call {
-                                func: vp_recorder.clone(),
-                                info: ci(
-                                    None,
-                                    vec![Operand::Value(sa), Operand::Value(fp)],
-                                    vec![IrType::Ptr, IrType::I64],
-                                    IrType::I32,
-                                    false,
-                                ),
-                            },
-                        );
-                        if !b.source_spans.is_empty() {
-                            b.source_spans
-                                .insert(k, crate::common::source::Span::dummy());
-                            b.source_spans
-                                .insert(k + 1, crate::common::source::Span::dummy());
-                        }
                         k += 2;
                         site_recs.push(SiteRec { ordinal, site, sig });
                         ordinal += 1;
@@ -2859,6 +2850,65 @@ mod tests {
             "__unit_pgo_lookup",
         );
         crate::passes::validate_unique_defs(&module, "backend:pre-codegen");
+    }
+
+    /// `-fprofile-generate` inserts a counter run into tracked blocks. The
+    /// insertion must keep instructions/spans/ids parallel and must NOT chop
+    /// an inline instance into pieces: the counters inherit the surrounding
+    /// instance (they are not source code of their own).
+    #[test]
+    fn counters_keep_provenance_parallel_and_inherit_the_instance() {
+        use crate::ir::reexports::{BasicBlock, BlockId, IrFunction, Terminator};
+        let mut m = IrModule::new();
+        let mut f = IrFunction::new("counted".to_string(), IrType::I32, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(1)),
+            }],
+            terminator: Terminator::Return(Some(Operand::Value(Value(0)))),
+            source_spans: vec![crate::common::source::Span::new(10, 11, 0)],
+            source_inline_ids: vec![42],
+        });
+        f.next_value_id = 1;
+        f.next_label = 1;
+        m.functions.push(f);
+        let n = instrument_module(
+            &mut m,
+            "/tmp",
+            "unit",
+            None,
+            Target::X86_64,
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+        );
+        if n == 0 {
+            // Instrumentation is x86-64 only and honours LCCC_PGO_NO_COUNTERS.
+            return;
+        }
+        for func in &m.functions {
+            for block in &func.blocks {
+                assert!(
+                    block.inline_ids_consistent(),
+                    "{}:{:?} drifted",
+                    func.name,
+                    block.label
+                );
+                if !block.source_spans.is_empty() {
+                    assert_eq!(block.source_spans.len(), block.instructions.len());
+                }
+                // Every inserted counter sits in the instance it was inserted
+                // into, never in a fabricated concrete row.
+                for (i, inst) in block.instructions.iter().enumerate() {
+                    if matches!(inst, Instruction::PgoCounterInc { .. })
+                        && !block.source_inline_ids.is_empty()
+                    {
+                        assert_eq!(block.source_inline_ids[i], 42);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -331,6 +331,21 @@ fn run_impl(func: &mut IrFunction, ipa: Option<&super::ipa_pta::IpaPta>) -> usiz
                 }
             });
         }
+        if !func.blocks[bi].source_inline_ids.is_empty() {
+            let mut removed_iter3 = removed.iter().copied();
+            let mut next3 = removed_iter3.next();
+            let mut idx3 = 0usize;
+            func.blocks[bi].source_inline_ids.retain(|_| {
+                let cur = idx3;
+                idx3 += 1;
+                if Some(cur) == next3 {
+                    next3 = removed_iter3.next();
+                    false
+                } else {
+                    true
+                }
+            });
+        }
     }
 
     if !all_rewrites.is_empty() {

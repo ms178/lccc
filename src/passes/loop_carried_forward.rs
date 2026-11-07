@@ -973,27 +973,26 @@ fn alloc_value(func: &mut IrFunction) -> Value {
 }
 
 fn push_inst(func: &mut IrFunction, block: usize, inst: Instruction) {
-    let b = &mut func.blocks[block];
-    if !b.source_spans.is_empty() {
-        b.source_spans.push(Span::dummy());
-    }
-    b.instructions.push(inst);
+    let at = func.blocks[block].instructions.len();
+    func.blocks[block].insert_inst_inline(
+        at,
+        inst,
+        Span::dummy(),
+        crate::ir::instruction::NO_INLINE_INSTANCE,
+    );
 }
 
 fn insert_inst(func: &mut IrFunction, block: usize, at: usize, inst: Instruction) {
-    let b = &mut func.blocks[block];
-    if !b.source_spans.is_empty() {
-        b.source_spans.insert(at, Span::dummy());
-    }
-    b.instructions.insert(at, inst);
+    func.blocks[block].insert_inst_inline(
+        at,
+        inst,
+        Span::dummy(),
+        crate::ir::instruction::NO_INLINE_INSTANCE,
+    );
 }
 
 fn remove_inst(func: &mut IrFunction, block: usize, at: usize) {
-    let b = &mut func.blocks[block];
-    if !b.source_spans.is_empty() {
-        b.source_spans.remove(at);
-    }
-    b.instructions.remove(at);
+    func.blocks[block].remove_inst(at);
 }
 
 /// Build `root + Σ c_k·inv_k + base` at the end of `preheader`.

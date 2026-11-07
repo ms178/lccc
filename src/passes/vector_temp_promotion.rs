@@ -973,6 +973,13 @@ fn hoist_block_allocas(block: &mut BasicBlock) {
             .collect();
         block.source_spans = order.iter().filter_map(|&i| spans[i].take()).collect();
     }
+    if block.source_inline_ids.len() == order.len() {
+        let mut ids: Vec<Option<_>> = std::mem::take(&mut block.source_inline_ids)
+            .into_iter()
+            .map(Some)
+            .collect();
+        block.source_inline_ids = order.iter().filter_map(|&i| ids[i].take()).collect();
+    }
 }
 
 /// Remove instruction indices while maintaining BasicBlock's parallel source
@@ -992,9 +999,11 @@ fn remove_instructions(block: &mut BasicBlock, removed: &mut Vec<usize>) {
 
     let instruction_count = block.instructions.len();
     let spans_in_lockstep = block.source_spans.len() == instruction_count;
+    let ids_in_lockstep = block.source_inline_ids.len() == instruction_count;
     if !block.source_spans.is_empty() && !spans_in_lockstep {
         // Stale line mappings are worse than absent mappings.
         block.source_spans.clear();
+        block.source_inline_ids.clear();
     }
 
     let mut next_removed = 0usize;
@@ -1010,6 +1019,16 @@ fn remove_instructions(block: &mut BasicBlock, removed: &mut Vec<usize>) {
         let mut next_removed = 0usize;
         let mut index = 0usize;
         block.source_spans.retain(|_| {
+            let drop = removed.get(next_removed).copied() == Some(index);
+            next_removed += usize::from(drop);
+            index += 1;
+            !drop
+        });
+    }
+    if ids_in_lockstep {
+        let mut next_removed = 0usize;
+        let mut index = 0usize;
+        block.source_inline_ids.retain(|_| {
             let drop = removed.get(next_removed).copied() == Some(index);
             next_removed += usize::from(drop);
             index += 1;

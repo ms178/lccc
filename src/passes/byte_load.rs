@@ -922,18 +922,20 @@ fn apply_block(block: Option<&mut BasicBlock>, plans: &[&Plan]) -> usize {
             consumed.insert(v.0);
         }
     }
-    let keep_spans =
-        block.source_spans.len() == block.instructions.len() && !block.source_spans.is_empty();
+    let (old_spans, old_ids) = block.take_parallel_debug();
+    let keep_spans = !old_spans.is_empty();
+    let keep_ids = !old_ids.is_empty();
     let old = std::mem::take(&mut block.instructions);
     let old_len = old.len();
     let mut new_insns = Vec::with_capacity(old_len);
     let mut new_spans = Vec::with_capacity(if keep_spans { old_len } else { 0 });
+    let mut new_ids = Vec::with_capacity(if keep_ids { old_len } else { 0 });
     let mut applied = 0;
     for (idx, inst) in old.into_iter().enumerate() {
         let dest = inst.dest().map(|d| d.0);
         if let Some(plan) = dest.and_then(|d| replaced.get(&d)) {
             let span = if keep_spans {
-                Some(block.source_spans[idx])
+                Some(old_spans[idx])
             } else {
                 None
             };
@@ -947,6 +949,9 @@ fn apply_block(block: Option<&mut BasicBlock>, plans: &[&Plan]) -> usize {
             if let Some(span) = span {
                 new_spans.push(span);
             }
+            if keep_ids {
+                new_ids.push(old_ids[idx]);
+            }
             match plan.convert {
                 Some(Convert::Bswap) => {
                     new_insns.push(Instruction::UnaryOp {
@@ -957,6 +962,9 @@ fn apply_block(block: Option<&mut BasicBlock>, plans: &[&Plan]) -> usize {
                     });
                     if let Some(span) = span {
                         new_spans.push(span);
+                    }
+                    if keep_ids {
+                        new_ids.push(old_ids[idx]);
                     }
                 }
                 Some(Convert::BswapZext) => {
@@ -972,6 +980,9 @@ fn apply_block(block: Option<&mut BasicBlock>, plans: &[&Plan]) -> usize {
                     if let Some(span) = span {
                         new_spans.push(span);
                     }
+                    if keep_ids {
+                        new_ids.push(old_ids[idx]);
+                    }
                     new_insns.push(Instruction::Cast {
                         dest: plan.dest,
                         src: Operand::Value(swap_dest),
@@ -980,6 +991,9 @@ fn apply_block(block: Option<&mut BasicBlock>, plans: &[&Plan]) -> usize {
                     });
                     if let Some(span) = span {
                         new_spans.push(span);
+                    }
+                    if keep_ids {
+                        new_ids.push(old_ids[idx]);
                     }
                 }
                 Some(Convert::Zext) => {
@@ -992,6 +1006,9 @@ fn apply_block(block: Option<&mut BasicBlock>, plans: &[&Plan]) -> usize {
                     if let Some(span) = span {
                         new_spans.push(span);
                     }
+                    if keep_ids {
+                        new_ids.push(old_ids[idx]);
+                    }
                 }
                 None => {}
             }
@@ -1001,18 +1018,14 @@ fn apply_block(block: Option<&mut BasicBlock>, plans: &[&Plan]) -> usize {
         } else {
             new_insns.push(inst);
             if keep_spans {
-                new_spans.push(block.source_spans[idx]);
+                new_spans.push(old_spans[idx]);
+            }
+            if keep_ids {
+                new_ids.push(old_ids[idx]);
             }
         }
     }
-    block.instructions = new_insns;
-    // `source_spans` is a parallel array: keep it in lockstep when it started
-    // that way, otherwise drop it (the convention used by copy_prop/dce).
-    if keep_spans {
-        block.source_spans = new_spans;
-    } else if block.source_spans.len() != block.instructions.len() {
-        block.source_spans.clear();
-    }
+    block.replace_insts_inline(new_insns, new_spans, new_ids);
     applied
 }
 

@@ -225,6 +225,28 @@ pub fn verify_function(func: &IrFunction, stage: &str, out: &mut Vec<Violation>)
                     block.instructions.len()
                 ),
             );
+            // Opt-in forensic dump: the violation names the first consumer
+            // that noticed the drift, not necessarily the producer. Printing
+            // the offending block lets a developer align the extra/missing
+            // instruction with the pass dump without rerunning under gdb.
+            if std::env::var_os("CCC_VERIFY_DUMP_BLOCK").is_some() {
+                lccc::cli::stderr_line(format_args!(
+                    "[ir-verify-dump] {} block #{} {:?} ({} insts, {} spans, {} ids)",
+                    func.name,
+                    i,
+                    block.label,
+                    block.instructions.len(),
+                    block.source_spans.len(),
+                    block.source_inline_ids.len()
+                ));
+                for (j, inst) in block.instructions.iter().enumerate() {
+                    lccc::cli::stderr_line(format_args!(
+                        "  {j}: span={:?} id={:?} {inst:?}",
+                        block.source_spans.get(j),
+                        block.source_inline_ids.get(j)
+                    ));
+                }
+            }
         }
         if !block.source_inline_ids.is_empty() {
             if block.source_inline_ids.len() != block.instructions.len()

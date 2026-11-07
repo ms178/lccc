@@ -106,12 +106,14 @@ pub(crate) fn insert_instruction(block: &mut BasicBlock, idx: usize, inst: Instr
     let n_inst = block.instructions.len();
     let n_span = block.source_spans.len();
     let idx = idx.min(n_inst);
-    block.instructions.insert(idx, inst);
-    if n_span == n_inst && n_span > 0 {
-        let span_idx = idx.min(n_span - 1);
-        let span = block.source_spans[span_idx].clone();
-        block.source_spans.insert(idx.min(n_span), span);
-    }
+    let span = if n_span == n_inst && n_span > 0 {
+        block.source_spans[idx.min(n_span - 1)].clone()
+    } else {
+        crate::common::source::Span::dummy()
+    };
+    // One insertion keeps instructions, spans and inline provenance in
+    // lockstep; a bare span insert left the id array one row short.
+    block.insert_inst(idx, inst, span);
 }
 
 pub(crate) fn first_non_alloca(block: &BasicBlock) -> usize {
@@ -1297,6 +1299,41 @@ mod tests {
         );
         assert_eq!(b.instructions.len(), 2);
         assert!(b.source_spans.is_empty());
+    }
+
+    #[test]
+    fn insert_instruction_preserves_dense_inline_ids() {
+        let mut b = block(
+            0,
+            vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I32(1)),
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I32(2)),
+                },
+            ],
+            Terminator::Return(None),
+        );
+        b.source_spans = vec![
+            crate::common::source::Span::new(1, 2, 0),
+            crate::common::source::Span::new(3, 4, 0),
+        ];
+        b.source_inline_ids = vec![11, 22];
+        insert_instruction(
+            &mut b,
+            1,
+            Instruction::Copy {
+                dest: Value(2),
+                src: Operand::Const(IrConst::I32(3)),
+            },
+        );
+        assert_eq!(b.instructions.len(), 3);
+        assert_eq!(b.source_spans.len(), 3);
+        assert_eq!(b.source_inline_ids, vec![11, 22, 22]);
+        assert_eq!(b.source_spans[1], b.source_spans[2]);
     }
 
     fn plain_call(dest: Option<Value>) -> Instruction {

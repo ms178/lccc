@@ -4816,6 +4816,17 @@ pub(crate) fn restore_entry_param_prefix(module: &mut IrModule) {
             spans.sort_by_key(|(key, _)| *key);
             entry.source_spans = spans.into_iter().map(|(_, span)| span).collect();
         }
+        if entry.source_inline_ids.len() == keys.len() {
+            let mut ids: Vec<(u8, u32)> = keys
+                .iter()
+                .copied()
+                .zip(std::mem::take(&mut entry.source_inline_ids))
+                .collect();
+            ids.sort_by_key(|(key, _)| *key);
+            entry.source_inline_ids = ids.into_iter().map(|(_, id)| id).collect();
+        } else {
+            entry.source_inline_ids.clear();
+        }
     }
 }
 
@@ -5451,6 +5462,9 @@ mod entry_param_prefix_tests {
                 vec![param(0, 0), ga(9), param(1, 1), cp(5), param(2, 2)],
                 spans,
             );
+            if spans {
+                m.functions[0].blocks[0].source_inline_ids = vec![10, 11, 12, 13, 14];
+            }
             restore_entry_param_prefix(&mut m);
             assert_eq!(shape(&m), ["p0", "p1", "p2", "g9", "c5"]);
             let got: Vec<u32> = m.functions[0].blocks[0]
@@ -5459,6 +5473,14 @@ mod entry_param_prefix_tests {
                 .map(|s| s.start)
                 .collect();
             assert_eq!(got, if spans { vec![0, 2, 4, 1, 3] } else { vec![] });
+            assert_eq!(
+                m.functions[0].blocks[0].source_inline_ids,
+                if spans {
+                    vec![10, 12, 14, 11, 13]
+                } else {
+                    vec![]
+                }
+            );
         }
     }
 
