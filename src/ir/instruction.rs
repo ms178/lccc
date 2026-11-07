@@ -105,6 +105,15 @@ impl BasicBlock {
             && self.spans_parallel()
     }
 
+    /// Provenance is well-formed: either empty (every instruction is concrete)
+    /// or a dense parallel array.  A pass that creates a fresh concrete block
+    /// need not materialize an all-sentinel array; only a nonempty drifted list
+    /// is malformed.
+    #[inline]
+    pub fn inline_ids_consistent(&self) -> bool {
+        self.source_inline_ids.is_empty() || self.inline_ids_parallel()
+    }
+
     /// Whether an insertion carrying `span` keeps (or starts) the pairing: the
     /// spans are parallel, or the block is empty and `span` is a real
     /// location -- an instruction moved into a fresh block brings its line

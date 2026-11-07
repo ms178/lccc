@@ -213,7 +213,7 @@ pub fn verify_function(func: &IrFunction, stage: &str, out: &mut Vec<Violation>)
                 .source_spans
                 .iter()
                 .any(|span| *span != crate::common::source::Span::dummy())
-            && !block.inline_ids_parallel()
+            && !block.inline_ids_consistent()
         {
             push(
                 out,
