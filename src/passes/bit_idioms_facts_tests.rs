@@ -347,6 +347,7 @@ fn edge_facts_require_one_real_conditional_edge_and_preserve_spans() {
         let make = |label, instructions: Vec<Instruction>, terminator| BasicBlock {
             label: BlockId(label),
             source_spans: vec![Span::dummy(); instructions.len()],
+            source_inline_ids: Vec::new(),
             instructions,
             terminator,
         };
@@ -445,6 +446,7 @@ fn duplicate_ssa_and_exhausted_id_space_decline_without_mutation() {
         label: BlockId(0),
         instructions: b.insts.clone(),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
         terminator: Terminator::Return(Some(v(b.next - 1))),
     }];
     f.next_value_id = u32::MAX;

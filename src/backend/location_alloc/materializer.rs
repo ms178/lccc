@@ -512,6 +512,7 @@ pub(super) fn materialize(
             instructions: insts,
             terminator: Terminator::Branch(old_target),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         retarget_edge(&mut func.blocks[t.pred].terminator, old_target, new_label);
     }

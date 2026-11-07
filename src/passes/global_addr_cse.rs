@@ -780,6 +780,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         let n = run(&mut func);
         assert_eq!(n, 1);
@@ -801,6 +802,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -813,6 +815,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         let n = run(&mut func);
         assert_eq!(n, 1);
@@ -840,6 +843,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(run(&mut func), 0);
         assert_eq!(func.blocks[0].instructions.len(), 2);
@@ -892,6 +896,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(run(&mut func), 0);
         assert_eq!(func.blocks[0].instructions.len(), 4);
@@ -945,6 +950,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         let tls = FxHashSet::from_iter(["tls_g".to_string()]);
         assert_eq!(
@@ -987,6 +993,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         let n = run(&mut func);
         assert_eq!(n, 1);
@@ -1018,6 +1025,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: vec![dummy, dummy, dummy],
+            source_inline_ids: Vec::new(),
         });
         run(&mut func);
         assert_eq!(
@@ -1036,6 +1044,7 @@ mod tests {
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -1048,6 +1057,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(run(&mut func), 0);
         assert!(func.blocks[0].instructions.is_empty());
@@ -1065,6 +1075,7 @@ mod tests {
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -1075,6 +1086,7 @@ mod tests {
                 false_label: BlockId(3),
             },
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
@@ -1087,12 +1099,14 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(3),
             instructions: vec![],
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(run(&mut func), 1);
         let Instruction::GlobalAddr { dest, .. } = &func.blocks[0].instructions[0] else {
@@ -1111,6 +1125,7 @@ mod tests {
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -1121,6 +1136,7 @@ mod tests {
                 false_label: BlockId(3),
             },
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
@@ -1139,12 +1155,14 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(3),
             instructions: vec![],
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(run(&mut func), 0);
         assert!(func.blocks[0].instructions.is_empty());
@@ -1166,6 +1184,7 @@ mod tests {
                 false_label: BlockId(2),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -1178,6 +1197,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
@@ -1190,6 +1210,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         let n = run(&mut func);
         assert_eq!(n, 0);
@@ -1212,6 +1233,7 @@ mod tests {
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -1224,6 +1246,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
@@ -1236,6 +1259,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(run(&mut func), 1);
         assert!(
@@ -1261,6 +1285,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         let mut aliases = FxHashMap::default();
         aliases.insert("bar".to_string(), "foo".to_string());
@@ -1303,6 +1328,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // Two materializations of the same symbol feeding variable-index GEPs:
         // there is no single-use live range left to protect, only a duplicate
@@ -1345,6 +1371,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(run(&mut func), 0);
         assert_eq!(classify_site_local_indexed(&func).len(), 1);
@@ -1391,6 +1418,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(run(&mut func), 0);
         assert_eq!(classify_site_local_indexed(&func).len(), 2);
@@ -1406,6 +1434,7 @@ mod tests {
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -1448,6 +1477,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         let n = run(&mut func);
         assert_eq!(n, 0);

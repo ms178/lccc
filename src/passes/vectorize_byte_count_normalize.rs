@@ -566,6 +566,7 @@ mod tests {
         let block = |id, instructions: Vec<Instruction>, terminator| BasicBlock {
             label: BlockId(id),
             source_spans: vec![Span::dummy(); instructions.len()],
+            source_inline_ids: Vec::new(),
             instructions,
             terminator,
         };

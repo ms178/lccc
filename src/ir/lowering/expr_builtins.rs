@@ -1152,6 +1152,7 @@ impl Lowerer {
             instructions: tail,
             terminator: old_terminator,
             source_spans: tail_spans,
+            source_inline_ids: Vec::new(),
         });
         f.blocks.push(BasicBlock {
             label: cold,
@@ -1162,6 +1163,7 @@ impl Lowerer {
             } else {
                 Vec::new()
             },
+            source_inline_ids: Vec::new(),
         });
         // The edges that used to leave the entry block leave `hot` now, so phi
         // operands in the successor blocks must name `hot` instead of the

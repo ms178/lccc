@@ -684,6 +684,7 @@ fn apply(func: &mut IrFunction, t: &Thread) -> Option<()> {
             instructions: insts,
             terminator,
             source_spans: out_spans,
+            source_inline_ids: Vec::new(),
         });
     }
 
@@ -1262,6 +1263,7 @@ mod tests {
             instructions,
             terminator,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 

@@ -4172,6 +4172,7 @@ mod nested_remainder_tests {
             instructions: insts,
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }];
         f
     }
@@ -4394,12 +4395,14 @@ mod nested_remainder_tests {
                     false_label: BlockId(2),
                 },
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(1),
                 instructions: Vec::new(),
                 terminator: Terminator::Return(Some(Operand::Const(IrConst::I64(0)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(2),
@@ -4412,6 +4415,7 @@ mod nested_remainder_tests {
                 }],
                 terminator: Terminator::Return(Some(Operand::Value(rem))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             },
         ];
         div_by_const_function(&mut f);
@@ -4456,6 +4460,7 @@ mod nested_remainder_tests {
                 }],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(1),
@@ -4520,6 +4525,7 @@ mod nested_remainder_tests {
                 ],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             },
         ];
         div_by_const_function(&mut f);

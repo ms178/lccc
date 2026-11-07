@@ -2711,6 +2711,7 @@ mod tests {
             label: BlockId(label),
             instructions,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
             terminator: term,
         }
     }

@@ -48,6 +48,7 @@ fn fixture() -> IrFunction {
         ],
         terminator: Terminator::Return(None),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     });
     f.next_value_id = 4;
     f
@@ -173,6 +174,7 @@ fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> 
         instructions,
         terminator,
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     }
 }
 

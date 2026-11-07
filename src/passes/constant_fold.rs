@@ -2074,6 +2074,7 @@ mod observable_fp_oracle_tests {
                         label: BlockId(0),
                         instructions: vec![inst.clone()],
                         source_spans: vec![],
+                        source_inline_ids: Vec::new(),
                         terminator: Terminator::Return(Some(Operand::Value(value))),
                     });
                     let blocked =

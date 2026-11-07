@@ -589,15 +589,13 @@ fn rename_variables(
         }
         // Prepend phis to block instructions
         if !phi_instructions.is_empty() {
-            let num_phis = phi_instructions.len();
-            phi_instructions.append(&mut func.blocks[block_idx].instructions);
-            func.blocks[block_idx].instructions = phi_instructions;
-            // Prepend dummy spans for the phi instructions
-            if !func.blocks[block_idx].source_spans.is_empty() {
-                let mut new_spans = vec![crate::common::source::Span::dummy(); num_phis];
-                new_spans.append(&mut func.blocks[block_idx].source_spans);
-                func.blocks[block_idx].source_spans = new_spans;
-            }
+            // The primitive keeps spans AND inline provenance parallel; the
+            // phis are synthesized at the block's entry context.
+            func.blocks[block_idx].insert_insts(
+                0,
+                phi_instructions,
+                crate::common::source::Span::dummy(),
+            );
         }
     }
 
@@ -733,7 +731,17 @@ fn rename_blocks(
         // Map from goto-target BlockId to the def-stack snapshot at the goto point.
         // Each snapshot is a Vec<Operand> indexed by alloca_idx.
         let mut goto_label_snapshots: FxHashMap<BlockId, Vec<Operand>> = FxHashMap::default();
-        let old_spans = std::mem::take(&mut func.blocks[block_idx].source_spans);
+        let (old_spans, old_ids) = func.blocks[block_idx].take_parallel_debug();
+        let mut new_ids: Vec<u32> = Vec::new();
+        if has_spans {
+            new_ids.reserve(old_ids.len());
+        }
+        let inline_at = |i: usize| {
+            old_ids
+                .get(i)
+                .copied()
+                .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE)
+        };
         for (inst_idx, inst) in func.blocks[block_idx].instructions.drain(..).enumerate() {
             match inst {
                 Instruction::Load {
@@ -756,6 +764,7 @@ fn rename_blocks(
                         });
                         if has_spans {
                             new_spans.push(span_at(&old_spans, inst_idx));
+                            new_ids.push(inline_at(inst_idx));
                         }
                     } else {
                         new_instructions.push(Instruction::Load {
@@ -767,6 +776,7 @@ fn rename_blocks(
                         });
                         if has_spans {
                             new_spans.push(span_at(&old_spans, inst_idx));
+                            new_ids.push(inline_at(inst_idx));
                         }
                     }
                 }
@@ -804,6 +814,7 @@ fn rename_blocks(
                         });
                         if has_spans {
                             new_spans.push(span_at(&old_spans, inst_idx));
+                            new_ids.push(inline_at(inst_idx));
                         }
                     }
                 }
@@ -855,18 +866,21 @@ fn rename_blocks(
                     });
                     if has_spans {
                         new_spans.push(span_at(&old_spans, inst_idx));
+                        new_ids.push(inline_at(inst_idx));
                     }
                 }
                 other => {
                     new_instructions.push(other);
                     if has_spans {
                         new_spans.push(span_at(&old_spans, inst_idx));
+                        new_ids.push(inline_at(inst_idx));
                     }
                 }
             }
         }
         func.blocks[block_idx].instructions = new_instructions;
         func.blocks[block_idx].source_spans = new_spans;
+        func.blocks[block_idx].source_inline_ids = new_ids;
 
         // Also rewrite terminator operands if they reference promoted allocas
         // (this shouldn't normally happen, but let's be safe)
@@ -978,46 +992,14 @@ fn remove_promoted_instructions(func: &mut IrFunction, alloca_to_idx: &FxHashMap
         func.param_alloca_values.iter().map(|v| v.0).collect();
 
     for block in &mut func.blocks {
-        let has_spans = !block.source_spans.is_empty();
-        if has_spans {
-            let mut span_idx = 0;
-            let insts = &block.instructions;
-            block.source_spans.retain(|_| {
-                let keep = match &insts[span_idx] {
-                    Instruction::Alloca { dest, .. } => {
-                        !alloca_to_idx.contains_key(&dest.0)
-                            || param_alloca_values.contains(&dest.0)
-                    }
-                    Instruction::Store { ptr, .. } => !alloca_to_idx.contains_key(&ptr.0),
-                    Instruction::Load { ptr, .. } => !alloca_to_idx.contains_key(&ptr.0),
-                    _ => true,
-                };
-                span_idx += 1;
-                keep
-            });
-        }
-        block.instructions.retain(|inst| {
-            match inst {
-                Instruction::Alloca { dest, .. } => {
-                    // Keep parameter allocas, remove promoted non-parameter allocas
-                    if alloca_to_idx.contains_key(&dest.0) && !param_alloca_values.contains(&dest.0)
-                    {
-                        false // remove
-                    } else {
-                        true // keep
-                    }
-                }
-                Instruction::Store { ptr, .. } => {
-                    // Remove stores to promoted allocas
-                    !alloca_to_idx.contains_key(&ptr.0)
-                }
-                Instruction::Load { ptr, .. } => {
-                    // Loads to promoted allocas have already been replaced with Copy
-                    // But there shouldn't be any left; just in case, keep them
-                    !alloca_to_idx.contains_key(&ptr.0)
-                }
-                _ => true,
+        block.retain_insts(|inst| match inst {
+            Instruction::Alloca { dest, .. } => {
+                !alloca_to_idx.contains_key(&dest.0) || param_alloca_values.contains(&dest.0)
             }
+            Instruction::Store { ptr, .. } | Instruction::Load { ptr, .. } => {
+                !alloca_to_idx.contains_key(&ptr.0)
+            }
+            _ => true,
         });
     }
 }
@@ -1079,6 +1061,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func
     }
@@ -1146,6 +1129,7 @@ mod tests {
                 ],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             });
             // Block b: v(2b-1) = load x; v(2b) = v(2b-1) + 1; store v(2b).
             for b in 1..=N {
@@ -1164,6 +1148,7 @@ mod tests {
                     ],
                     terminator: Terminator::Branch(BlockId(b + 1)),
                     source_spans: Vec::new(),
+                    source_inline_ids: Vec::new(),
                 });
             }
             func.blocks.push(BasicBlock {
@@ -1171,6 +1156,7 @@ mod tests {
                 instructions: vec![ld(2 * N + 1)],
                 terminator: Terminator::Return(Some(Operand::Value(Value(2 * N + 1)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             });
             func.next_value_id = 2 * N + 2;
             let mut module = IrModule::new();
@@ -1291,6 +1277,7 @@ mod tests {
                 false_label: BlockId(2),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // then: store 1 to x, branch to merge
@@ -1305,6 +1292,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(3)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // else: store 2 to x, branch to merge
@@ -1319,6 +1307,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(3)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // merge: load x, return
@@ -1333,6 +1322,7 @@ mod tests {
             }],
             terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let mut module = IrModule::new();
@@ -1413,6 +1403,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let mut module = IrModule::new();
@@ -1470,6 +1461,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // loop_header: load i, cmp, cond branch
@@ -1497,6 +1489,7 @@ mod tests {
                 false_label: BlockId(3),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // loop_body: sum += i, i++, branch back
@@ -1548,6 +1541,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // exit: load sum, return
@@ -1562,6 +1556,7 @@ mod tests {
             }],
             terminator: Terminator::Return(Some(Operand::Value(Value(8)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let mut module = IrModule::new();
@@ -1613,6 +1608,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let mut module = IrModule::new();
@@ -1736,6 +1732,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 2;
 
@@ -1851,6 +1848,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 2;
 
@@ -1919,6 +1917,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 2;
 
@@ -1992,6 +1991,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 3;
 
@@ -2096,6 +2096,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(5)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         promote_function(&mut func, false);

@@ -1582,6 +1582,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
 
         assert_eq!(run(&mut func), 0);
@@ -1652,6 +1653,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
 
         assert_eq!(forward_store_only_temporaries(&mut func, None), 0);
@@ -1670,6 +1672,7 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
             instructions: vec![
                 Instruction::Alloca {
                     dest: Value(0),
@@ -1716,6 +1719,7 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
             instructions: vec![
                 Instruction::GlobalAddr {
                     dest: Value(1),
@@ -1751,6 +1755,7 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
             instructions: vec![
                 Instruction::GlobalAddr {
                     dest: Value(1),
@@ -1796,12 +1801,14 @@ mod tests {
             BasicBlock {
                 label: BlockId(0),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
                 instructions: vec![alloca(0, 4)],
                 terminator: Terminator::Branch(BlockId(2)),
             },
             BasicBlock {
                 label: BlockId(2),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
                 instructions: vec![Instruction::Copy {
                     dest: Value(2),
                     src: Operand::Value(Value(0)),
@@ -1811,6 +1818,7 @@ mod tests {
             BasicBlock {
                 label: BlockId(1),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
                 instructions: vec![
                     Instruction::GlobalAddr {
                         dest: Value(1),
@@ -1851,6 +1859,7 @@ mod tests {
             BasicBlock {
                 label: BlockId(0),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
                 instructions: vec![
                     Instruction::GlobalAddr {
                         dest: Value(1),
@@ -1863,6 +1872,7 @@ mod tests {
             BasicBlock {
                 label: BlockId(2),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
                 instructions: vec![Instruction::Copy {
                     dest: Value(2),
                     src: Operand::Value(Value(0)),
@@ -1872,6 +1882,7 @@ mod tests {
             BasicBlock {
                 label: BlockId(1),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
                 instructions: vec![
                     Instruction::Store {
                         volatile: false,
@@ -1919,6 +1930,7 @@ mod tests {
             func.blocks.push(BasicBlock {
                 label: BlockId(0),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
                 instructions: vec![
                     Instruction::GlobalAddr {
                         dest: Value(0),
@@ -2043,6 +2055,7 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
             instructions: vec![
                 alloca(0),
                 alloca(1),
@@ -2125,6 +2138,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
 
         assert_eq!(forward_store_only_temporaries(&mut func, None), 0);
@@ -2185,6 +2199,7 @@ mod tests {
             // Deliberately not one-to-one with instructions: this is the
             // shape observed in the kernel's execmem_init_missing function.
             source_spans: vec![crate::common::source::Span::dummy()],
+            source_inline_ids: Vec::new(),
         });
 
         assert_eq!(forward_store_only_temporaries(&mut func, None), 1);
@@ -2218,6 +2233,7 @@ mod tests {
             instructions: vec![alloca(0), alloca(1), alloca(2)],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -2249,6 +2265,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
 
         for _ in 0..8 {
@@ -2345,6 +2362,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
 
         assert_eq!(run(&mut func), 0);
@@ -2481,6 +2499,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(loaded)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
 
         assert!(run(&mut func) > 0);

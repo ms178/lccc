@@ -8,6 +8,7 @@ fn block(id: u32, instructions: Vec<Instruction>, terminator: Terminator) -> Bas
         instructions,
         terminator,
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     }
 }
 fn jump(id: u32) -> Terminator {

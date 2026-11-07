@@ -424,6 +424,7 @@ mod cfg_tests {
         let block = |label, instructions: Vec<Instruction>, terminator| BasicBlock {
             label: BlockId(label),
             source_spans: vec![Span::dummy(); instructions.len()],
+            source_inline_ids: Vec::new(),
             instructions,
             terminator,
         };

@@ -1264,10 +1264,11 @@ fn try_transform_loop(
         let block = &mut func.blocks[work];
         // Surviving scalar instructions keep their spans; the vector body and
         // the phis are synthesized (dummy spans, no `.loc`).
-        let spans = block.take_parallel_spans();
+        let (spans, ids) = block.take_parallel_debug();
         let tracked = !spans.is_empty();
         let mut kept: Vec<Instruction> = Vec::with_capacity(block.instructions.len());
         let mut kept_spans: Vec<Span> = Vec::with_capacity(spans.len());
+        let mut kept_ids: Vec<u32> = Vec::with_capacity(ids.len());
         for (i, inst) in block.instructions.iter().enumerate() {
             if body.consumed.contains(&i) {
                 continue;
@@ -1275,11 +1276,17 @@ fn try_transform_loop(
             kept.push(inst.clone());
             if tracked {
                 kept_spans.push(spans[i]);
+                kept_ids.push(
+                    ids.get(i)
+                        .copied()
+                        .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE),
+                );
             }
         }
         let mut new_insts: Vec<Instruction> =
             Vec::with_capacity(kept.len() + body_insts.len() + phi_insts.len());
         let mut new_spans: Vec<Span> = Vec::new();
+        let mut new_ids: Vec<u32> = Vec::new();
         let body_len = body_insts.len();
         let dummies = |n: usize| std::iter::repeat_n(Span::dummy(), n);
         if !self_loop {
@@ -1289,6 +1296,11 @@ fn try_transform_loop(
             if tracked {
                 new_spans.extend(kept_spans.iter().copied());
                 new_spans.extend(dummies(body_len));
+                new_ids.extend(kept_ids.iter().copied());
+                new_ids.extend(std::iter::repeat_n(
+                    crate::ir::instruction::NO_INLINE_INSTANCE,
+                    body_len,
+                ));
             }
         } else {
             new_insts.append(&mut phi_insts.clone());
@@ -1312,9 +1324,19 @@ fn try_transform_loop(
                 new_spans.extend(kept_spans[..iv_start].iter().copied());
                 new_spans.extend(dummies(body_len));
                 new_spans.extend(kept_spans[iv_start..].iter().copied());
+                new_ids.extend(std::iter::repeat_n(
+                    crate::ir::instruction::NO_INLINE_INSTANCE,
+                    phi_insts.len(),
+                ));
+                new_ids.extend(kept_ids[..iv_start].iter().copied());
+                new_ids.extend(std::iter::repeat_n(
+                    crate::ir::instruction::NO_INLINE_INSTANCE,
+                    body_len,
+                ));
+                new_ids.extend(kept_ids[iv_start..].iter().copied());
             }
         }
-        block.replace_insts(new_insts, new_spans);
+        block.replace_insts_inline(new_insts, new_spans, new_ids);
     }
     // Insert the header phis (2-block shape).
     if !self_loop {

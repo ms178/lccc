@@ -1922,6 +1922,7 @@ mod tests {
             instructions: insts,
             terminator: term,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -3053,6 +3054,7 @@ mod safe_clz_review_tests {
                     label: BlockId(n),
                     instructions: ins,
                     source_spans: vec![],
+                    source_inline_ids: Vec::new(),
                     terminator: term,
                 };
                 let body = |base| {

@@ -31,6 +31,7 @@ fn function(ty: IrType, mut code: Vec<Instruction>) -> IrFunction {
         instructions: code,
         terminator: Terminator::Return(Some(v(3))),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     });
     f.next_value_id = f.max_value_id() + 1;
     f

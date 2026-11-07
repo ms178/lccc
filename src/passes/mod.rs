@@ -1282,6 +1282,7 @@ mod inert_asm_tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: vec![Span::new(1, 2, 0), Span::new(3, 4, 0), Span::new(5, 6, 0)],
+            source_inline_ids: Vec::new(),
         });
         assert_eq!(remove_inert_inline_asm(&mut func), 1);
         let block = &func.blocks[0];
@@ -1795,6 +1796,7 @@ pub(crate) fn run_passes(
     // other pass configuration, rather than rescanning the process environment
     // during parameter remapping.
     inline::set_paramref_debug_enabled(std::env::var_os("CCC_INLINE_PARAMREF_DEBUG").is_some());
+    inline::set_inline_detail_enabled(std::env::var_os("CCC_INLINE_DEBUG_DETAIL").is_some());
     loop_unroll::set_persist_gate_legacy(std::env::var("CCC_UNROLL_LEGACY_PERSIST_GATE").is_ok());
     loop_unroll::set_persist_gate_trace(std::env::var("CCC_UNROLL_GATE_TRACE").is_ok());
     // Every remaining pass switch, resolved here for the same reason.  No pass
@@ -4835,6 +4837,7 @@ mod inert_inline_asm_tests {
             }],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 8;
         func
@@ -4958,6 +4961,7 @@ mod ssa_validator_tests {
             instructions,
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -5056,6 +5060,7 @@ mod ssa_validator_tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         };
         let module = module_with_blocks(vec![entry(vec![]), dead], 2);
         validate_unique_defs(&module, "unit:strict");
@@ -5073,6 +5078,7 @@ mod ssa_validator_tests {
             }],
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -5085,6 +5091,7 @@ mod ssa_validator_tests {
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         };
         let entry_blk = BasicBlock {
             label: BlockId(0),
@@ -5098,6 +5105,7 @@ mod ssa_validator_tests {
                 false_label: BlockId(2),
             },
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         };
         module_with_blocks(vec![entry_blk, arm, phi_block], 4)
     }
@@ -5141,6 +5149,7 @@ mod ssa_validator_tests {
             instructions: vec![],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         };
         if let Some(func) = module.functions.first_mut() {
             func.blocks.push(dead);
@@ -5196,6 +5205,7 @@ mod m16_size_policy_tests {
                 instructions,
                 terminator: Terminator::Return(None),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             }
         }
 
@@ -5381,6 +5391,7 @@ mod entry_param_prefix_tests {
             instructions: insts,
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans,
+            source_inline_ids: Vec::new(),
         }];
         let mut m = IrModule::new();
         m.functions = vec![f];

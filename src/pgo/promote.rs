@@ -370,12 +370,14 @@ pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
                     instructions: hot_is,
                     terminator: Terminator::Branch(ljoin),
                     source_spans: vec![],
+                    source_inline_ids: Vec::new(),
                 });
                 f.blocks.push(BasicBlock {
                     label: lcold,
                     instructions: cold_is,
                     terminator: Terminator::Branch(ljoin),
                     source_spans: vec![],
+                    source_inline_ids: Vec::new(),
                 });
                 join_is.extend(post);
                 let mut join_spans: Vec<crate::common::source::Span> = Vec::new();
@@ -386,6 +388,7 @@ pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
                     instructions: join_is,
                     terminator: old_term,
                     source_spans: join_spans,
+                    source_inline_ids: Vec::new(),
                 });
                 // SSA-invariant fix: the original block B's terminator moved
                 // to the join, so ANY Phi anywhere that lists B as an

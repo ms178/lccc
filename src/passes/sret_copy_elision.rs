@@ -944,6 +944,7 @@ mod tests {
             instructions,
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func
     }
@@ -1049,6 +1050,7 @@ mod tests {
             instructions,
             terminator,
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         };
         func.blocks.push(block(
             0,
@@ -1162,6 +1164,7 @@ mod tests {
                 instructions,
                 terminator: Terminator::Return(None),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             });
         }
         func
@@ -1344,6 +1347,7 @@ mod tests {
                     Terminator::Branch(BlockId(i as u32 + 1))
                 },
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             });
         }
         func
@@ -1395,6 +1399,7 @@ mod tests {
                 instructions,
                 terminator,
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
             });
         };
         push(

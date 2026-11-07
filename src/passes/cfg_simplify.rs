@@ -1281,17 +1281,21 @@ fn find_fusion_candidates(
 /// Execute fusions: move successor instructions/terminator into predecessor.
 fn execute_fusions(func: &mut IrFunction, fusions: &[(usize, usize)]) {
     for &(pred_idx, succ_idx) in fusions {
+        // Take the debug arrays BEFORE the instructions: `take_parallel_debug`
+        // validates against the instruction count still in place.
+        let (succ_spans, succ_ids) = func.blocks[succ_idx].take_parallel_debug();
         let succ_instructions = std::mem::take(&mut func.blocks[succ_idx].instructions);
         let succ_terminator = std::mem::replace(
             &mut func.blocks[succ_idx].terminator,
             Terminator::Unreachable,
         );
-        let succ_spans = std::mem::take(&mut func.blocks[succ_idx].source_spans);
         let pred_label = func.blocks[pred_idx].label;
+        let succ_label = func.blocks[succ_idx].label;
 
         // Convert phi nodes to Copy (single-predecessor, so each Phi has one entry).
         let mut converted_instructions = Vec::with_capacity(succ_instructions.len());
         let mut converted_spans = Vec::with_capacity(succ_spans.len());
+        let mut converted_ids = Vec::with_capacity(succ_ids.len());
 
         for (i, inst) in succ_instructions.into_iter().enumerate() {
             if let Instruction::Phi { dest, incoming, .. } = &inst {
@@ -1317,10 +1321,18 @@ fn execute_fusions(func: &mut IrFunction, fusions: &[(usize, usize)]) {
             }
             if i < succ_spans.len() {
                 converted_spans.push(succ_spans[i]);
+                converted_ids.push(
+                    succ_ids
+                        .get(i)
+                        .copied()
+                        .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE),
+                );
             }
         }
 
-        // Maintain source_spans invariant: either empty or parallel to instructions.
+        // Maintain the debug invariant: spans and inline ids are each either
+        // empty or parallel to instructions.  A fused block inherits the
+        // successor's provenance; synthesized padding is concrete (sentinel).
         let pred_has_spans = !func.blocks[pred_idx].source_spans.is_empty();
         let succ_has_spans = !converted_spans.is_empty();
 
@@ -1329,11 +1341,18 @@ fn execute_fusions(func: &mut IrFunction, fusions: &[(usize, usize)]) {
                 converted_instructions.len(),
                 crate::common::source::Span::dummy(),
             );
+            converted_ids.resize(
+                converted_instructions.len(),
+                crate::ir::instruction::NO_INLINE_INSTANCE,
+            );
         } else if !pred_has_spans && succ_has_spans {
             let pred_inst_len = func.blocks[pred_idx].instructions.len();
             func.blocks[pred_idx]
                 .source_spans
                 .resize(pred_inst_len, crate::common::source::Span::dummy());
+            func.blocks[pred_idx]
+                .source_inline_ids
+                .resize(pred_inst_len, crate::ir::instruction::NO_INLINE_INSTANCE);
         }
 
         func.blocks[pred_idx]
@@ -1342,6 +1361,26 @@ fn execute_fusions(func: &mut IrFunction, fusions: &[(usize, usize)]) {
         func.blocks[pred_idx].terminator = succ_terminator;
         if !converted_spans.is_empty() {
             func.blocks[pred_idx].source_spans.extend(converted_spans);
+            func.blocks[pred_idx]
+                .source_inline_ids
+                .extend(converted_ids);
+        }
+        // The successor's terminator statement now ends the predecessor; move
+        // its recorded span/provenance with it so the branch/return keeps its
+        // line and inline frame.
+        if let Some(span) = func
+            .terminator_spans
+            .span_of(succ_label, &func.blocks[pred_idx].terminator)
+        {
+            let inline_id = func
+                .terminator_spans
+                .inline_of(succ_label, &func.blocks[pred_idx].terminator);
+            func.terminator_spans.record_inline(
+                pred_label,
+                span,
+                inline_id,
+                &func.blocks[pred_idx].terminator,
+            );
         }
     }
 }
@@ -1626,6 +1665,7 @@ mod tests {
             instructions,
             terminator,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 

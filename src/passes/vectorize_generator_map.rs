@@ -848,12 +848,14 @@ fn lower(
             false_label: header_label,
         },
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
     let vb = BasicBlock {
         label: vb_label,
         instructions: vb_insts,
         terminator: Terminator::Branch(vh_label),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     };
     Some(Lowered {
         viv,

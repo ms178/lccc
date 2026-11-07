@@ -208,6 +208,67 @@ pub fn verify_function(func: &IrFunction, stage: &str, out: &mut Vec<Violation>)
                 ),
             );
         }
+        if !func.debug_inline_instances.is_empty()
+            && block
+                .source_spans
+                .iter()
+                .any(|span| *span != crate::common::source::Span::dummy())
+            && !block.inline_ids_parallel()
+        {
+            push(
+                out,
+                format!(
+                    "block #{} ({:?}) keeps real source spans but lost inline provenance ({} ids for {} instructions)",
+                    i,
+                    block.label,
+                    block.source_inline_ids.len(),
+                    block.instructions.len()
+                ),
+            );
+        }
+        if !block.source_inline_ids.is_empty() {
+            if block.source_inline_ids.len() != block.instructions.len()
+                || block.source_spans.len() != block.instructions.len()
+            {
+                push(
+                    out,
+                    format!(
+                        "block #{} ({:?}) has {} inline ids for {} instructions / {} source spans",
+                        i,
+                        block.label,
+                        block.source_inline_ids.len(),
+                        block.instructions.len(),
+                        block.source_spans.len()
+                    ),
+                );
+            }
+            for (j, &id) in block.source_inline_ids.iter().enumerate() {
+                if id != crate::ir::instruction::NO_INLINE_INSTANCE
+                    && id as usize >= func.debug_inline_instances.len()
+                {
+                    push(
+                        out,
+                        format!(
+                            "block #{} ({:?}) instruction {} names missing inline instance {}",
+                            i, block.label, j, id
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    for (i, instance) in func.debug_inline_instances.iter().enumerate() {
+        if let Some(parent) = instance.parent {
+            if parent as usize >= i {
+                push(
+                    out,
+                    format!(
+                        "inline instance {} has parent {} that is not an earlier instance",
+                        i, parent
+                    ),
+                );
+            }
+        }
     }
 
     // 1b. label-counter health: the documented `IrFunction::next_label`

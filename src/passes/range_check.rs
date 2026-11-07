@@ -2086,8 +2086,9 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
     for (block_idx, block) in func.blocks.iter_mut().enumerate() {
         let mut new_insts: Vec<Instruction> = Vec::with_capacity(block.instructions.len());
         // Replacements inherit the span of the instruction they fold.
-        let spans = block.take_parallel_spans();
+        let (spans, ids) = block.take_parallel_debug();
         let mut new_spans = Vec::with_capacity(spans.len());
+        let mut new_ids = Vec::with_capacity(ids.len());
         let known_pos = block_known_pos_i32[block_idx];
         for (i, inst) in block.instructions.drain(..).enumerate() {
             let span = spans.get(i).copied();
@@ -2159,10 +2160,17 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
                 new_insts.push(inst);
             }
             if let Some(span) = span {
-                new_spans.extend(std::iter::repeat_n(span, new_insts.len() - before));
+                let added = new_insts.len() - before;
+                new_spans.extend(std::iter::repeat_n(span, added));
+                new_ids.extend(std::iter::repeat_n(
+                    ids.get(i)
+                        .copied()
+                        .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE),
+                    added,
+                ));
             }
         }
-        block.replace_insts(new_insts, new_spans);
+        block.replace_insts_inline(new_insts, new_spans, new_ids);
     }
     func.next_value_id = next_id;
     total
@@ -2194,6 +2202,7 @@ mod tests {
             instructions: insts,
             terminator: term,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 

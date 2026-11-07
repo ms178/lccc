@@ -468,6 +468,7 @@ mod tests {
             instructions,
             terminator: Terminator::Return(Some(Operand::Value(Value(ret)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }];
         f
     }
@@ -703,6 +704,7 @@ mod tests {
                 instructions: vec![],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(1),
@@ -727,12 +729,14 @@ mod tests {
                     false_label: BlockId(2),
                 },
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(2),
                 instructions: vec![],
                 terminator: Terminator::Return(Some(Operand::Value(Value(5)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             },
         ];
         assert_eq!(contract_function(&mut f, FpContract::Fast), 1);
@@ -768,6 +772,7 @@ mod tests {
                 instructions: vec![],
                 terminator: Terminator::Branch(BlockId(1)),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(1),
@@ -789,12 +794,14 @@ mod tests {
                     false_label: BlockId(2),
                 },
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             },
             BasicBlock {
                 label: BlockId(2),
                 instructions: vec![],
                 terminator: Terminator::Return(Some(Operand::Value(Value(5)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             },
         ];
         assert_eq!(contract_function(&mut f, FpContract::Fast), 1);

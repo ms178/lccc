@@ -314,7 +314,7 @@ impl TerminatorShape {
     }
 
     /// The same shape after a relabelling; `None` if a target is gone.
-    fn remapped(self, map: &impl Fn(BlockId) -> Option<BlockId>) -> Option<Self> {
+    pub(crate) fn remapped(self, map: &impl Fn(BlockId) -> Option<BlockId>) -> Option<Self> {
         Some(match self {
             Self::Branch(t) => Self::Branch(map(t)?),
             Self::CondBranch(t, f) => Self::CondBranch(map(t)?, map(f)?),
@@ -329,12 +329,23 @@ impl TerminatorShape {
 /// with only instruction spans it got no line row: no breakpoint could land
 /// on it.
 #[derive(Debug, Clone, Default)]
-pub struct TerminatorSpans(FxHashMap<BlockId, (Span, TerminatorShape)>);
+pub struct TerminatorSpans(FxHashMap<BlockId, (Span, u32, TerminatorShape)>);
 
 impl TerminatorSpans {
     pub fn record(&mut self, label: BlockId, span: Span, term: &Terminator) {
+        self.record_inline(
+            label,
+            span,
+            crate::ir::instruction::NO_INLINE_INSTANCE,
+            term,
+        );
+    }
+
+    /// Record a terminator statement with the inline instance it belongs to.
+    pub fn record_inline(&mut self, label: BlockId, span: Span, inline_id: u32, term: &Terminator) {
         if span != Span::dummy() {
-            self.0.insert(label, (span, TerminatorShape::of(term)));
+            self.0
+                .insert(label, (span, inline_id, TerminatorShape::of(term)));
         }
     }
 
@@ -343,8 +354,38 @@ impl TerminatorSpans {
     pub fn span_of(&self, label: BlockId, term: &Terminator) -> Option<Span> {
         self.0
             .get(&label)
-            .filter(|(_, shape)| *shape == TerminatorShape::of(term))
-            .map(|(span, _)| *span)
+            .filter(|(_, _, shape)| *shape == TerminatorShape::of(term))
+            .map(|(span, _, _)| *span)
+    }
+
+    /// The inline instance of `label`'s terminator, while it still has the
+    /// recorded shape.
+    pub fn inline_of(&self, label: BlockId, term: &Terminator) -> u32 {
+        self.0
+            .get(&label)
+            .filter(|(_, _, shape)| *shape == TerminatorShape::of(term))
+            .map(|(_, id, _)| *id)
+            .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE)
+    }
+
+    /// Iterate `(label, span, inline id, shape)` records.
+    pub fn iter(&self) -> impl Iterator<Item = (BlockId, Span, u32, TerminatorShape)> + '_ {
+        self.0
+            .iter()
+            .map(|(label, (span, id, shape))| (*label, *span, *id, *shape))
+    }
+
+    /// Insert a remapped record (used by the inliner).
+    pub fn insert_remapped(
+        &mut self,
+        label: BlockId,
+        span: Span,
+        inline_id: u32,
+        shape: TerminatorShape,
+    ) {
+        if span != Span::dummy() {
+            self.0.insert(label, (span, inline_id, shape));
+        }
     }
 
     /// Follow a renumbering that adds `offset` to every label.
@@ -358,14 +399,16 @@ impl TerminatorSpans {
     pub fn remap(&mut self, map: impl Fn(BlockId) -> Option<BlockId>) {
         self.0 = std::mem::take(&mut self.0)
             .into_iter()
-            .filter_map(|(label, (span, shape))| Some((map(label)?, (span, shape.remapped(&map)?))))
+            .filter_map(|(label, (span, id, shape))| {
+                Some((map(label)?, (span, id, shape.remapped(&map)?)))
+            })
             .collect();
     }
 
     /// `label`'s terminator now goes to `new_target` where it went to
     /// `old_target` (an edge split): still the same statement's jump.
     pub fn retarget(&mut self, label: BlockId, old_target: BlockId, new_target: BlockId) {
-        if let Some((_, shape)) = self.0.get_mut(&label) {
+        if let Some((_, _, shape)) = self.0.get_mut(&label) {
             let swap = |t: BlockId| if t == old_target { new_target } else { t };
             *shape = match *shape {
                 TerminatorShape::Branch(t) => TerminatorShape::Branch(swap(t)),
@@ -378,6 +421,26 @@ impl TerminatorSpans {
             };
         }
     }
+}
+
+/// One inlining instance recorded by the inliner: a callee body cloned into a
+/// caller at a particular call site. `parent` is the enclosing instance when
+/// the call itself was already inside an inlined body, so the DWARF writer can
+/// nest `DW_TAG_inlined_subroutine` DIEs exactly as the inline stack nests.
+#[derive(Debug, Clone)]
+pub struct DebugInlineInstance {
+    /// Symbol name of the cloned callee (the abstract origin's name).
+    pub callee: String,
+    /// The call expression in the caller that triggered this clone.
+    pub call_span: Span,
+    /// The callee declarator's name token, for the abstract origin's
+    /// `DW_AT_decl_file`/`decl_line`/`decl_column`.
+    pub decl_span: Span,
+    /// Enclosing inline instance, or `None` for a call in the concrete body.
+    pub parent: Option<u32>,
+    /// Whether the callee was spelled `inline` (DWARF `DW_INL_declared_inlined`
+    /// rather than `DW_INL_inlined`).
+    pub declared_inline: bool,
 }
 
 /// An IR function.
@@ -446,6 +509,12 @@ pub struct IrFunction {
     /// `-g` local variables and lexical blocks (empty without debug info).
     pub debug_locals: Vec<DebugLocal>,
     pub debug_scopes: Vec<DebugScope>,
+    /// `-g` inline instances cloned into this function, indexed by
+    /// [`crate::ir::instruction::BasicBlock::source_inline_ids`]. Append-only:
+    /// an index never changes meaning, so provenance survives block splits,
+    /// renumbering and later optimization without a parallel region table that
+    /// could drift from the instructions it describes.
+    pub debug_inline_instances: Vec<DebugInlineInstance>,
     /// __attribute__((section("..."))) - place in specific ELF section.
     pub section: Option<String>,
     /// Normalized `__attribute__((target("...")))` features: lower-case,
@@ -774,6 +843,7 @@ impl IrFunction {
             debug_param_indices: Vec::new(),
             debug_locals: Vec::new(),
             debug_scopes: Vec::new(),
+            debug_inline_instances: Vec::new(),
         }
     }
 
@@ -876,6 +946,7 @@ mod value_id_tests {
             }],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }];
         f.next_value_id = 0; // force the scan fallback path
         assert_eq!(f.max_value_id(), 55, "fallback scan must see asm outputs");

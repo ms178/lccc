@@ -379,6 +379,7 @@ mod tests {
             debug_param_indices: Vec::new(),
             debug_locals: Vec::new(),
             debug_scopes: Vec::new(),
+            debug_inline_instances: Vec::new(),
             pass_policy: Default::default(),
             name: "vol".into(),
             return_type: crate::common::types::IrType::I32,
@@ -414,6 +415,7 @@ mod tests {
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             }],
             is_variadic: false,
             is_declaration: false,
@@ -499,18 +501,21 @@ mod tests {
                 possible_targets: vec![BlockId(2), BlockId(3)],
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(3),
             instructions: vec![],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let merged = run(&mut func);
@@ -566,6 +571,7 @@ mod stored_value_tests {
         f.blocks.push(BasicBlock {
             label: BlockId(0),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
             instructions: vec![
                 Instruction::ParamRef {
                     dest: Value(0),

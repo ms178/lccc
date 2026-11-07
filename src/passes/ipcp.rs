@@ -985,6 +985,7 @@ mod switch_eval_tests {
             |label: u32, instructions: Vec<Instruction>, terminator: Terminator| BasicBlock {
                 label: BlockId(label),
                 source_spans: vec![crate::common::source::Span::dummy(); instructions.len()],
+                source_inline_ids: Vec::new(),
                 instructions,
                 terminator,
             };
@@ -1145,6 +1146,7 @@ mod caller_exposure_tests {
             }],
             terminator: Terminator::Return(Some(Operand::Value(Value(0)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         let mut caller = IrFunction::new("caller".into(), IrType::Void, vec![], false);
         caller.next_label = 1;
@@ -1160,6 +1162,7 @@ mod caller_exposure_tests {
             }],
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         let mut module = IrModule::new();
         module.functions = vec![target, caller];

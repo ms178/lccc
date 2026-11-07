@@ -706,6 +706,7 @@ fn rewrite(func: &mut IrFunction, plan: &Plan) {
         instructions,
         terminator,
         source_spans: Vec::new(),
+        source_inline_ids: Vec::new(),
     };
     let new_blocks = [
         block(vp, pre, Terminator::Branch(vh)),
@@ -772,6 +773,7 @@ mod tests {
             instructions,
             terminator,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 

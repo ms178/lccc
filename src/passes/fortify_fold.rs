@@ -843,6 +843,7 @@ mod tests {
             instructions: insts,
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func
     }

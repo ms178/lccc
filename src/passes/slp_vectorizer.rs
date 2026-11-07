@@ -7057,6 +7057,7 @@ mod tests {
             instructions,
             terminator,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         };
         let branch = |target| Terminator::Branch(BlockId(target));
         let cond = |yes, no| Terminator::CondBranch {

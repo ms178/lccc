@@ -789,6 +789,7 @@ mod tests {
                     instructions,
                     terminator: Terminator::Return(None),
                     source_spans: vec![],
+                    source_inline_ids: Vec::new(),
                 });
                 assert_eq!(eliminate_dead_stores(&mut f), usize::from(!reader));
                 assert!(
@@ -866,6 +867,7 @@ mod tests {
                         instructions,
                         terminator: Terminator::Return(None),
                         source_spans: vec![],
+                        source_inline_ids: Vec::new(),
                     });
                     assert_eq!(
                         eliminate_dead_stores(&mut f),
@@ -904,6 +906,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         let n = eliminate_dead_stores(&mut f);
         assert_eq!(n, 2, "x=1 and x=2 are overwritten before the load");
@@ -941,6 +944,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         let n = eliminate_dead_stores(&mut f);
         assert_eq!(n, 0, "the load observes the first store");
@@ -1001,6 +1005,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         let n = eliminate_dead_stores(&mut f);
         assert_eq!(
@@ -1048,6 +1053,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         let n = eliminate_dead_stores(&mut f);
         assert_eq!(n, 1, "x=1 is overwritten by x=2 after the (non-goto) call");
@@ -1083,6 +1089,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         let n = eliminate_dead_stores(&mut f);
         assert_eq!(n, 1, "s->a=1 dies; s->a=2 and s->b=3 stay");
@@ -1131,6 +1138,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         let n = eliminate_dead_stores(&mut f);
         assert_eq!(
@@ -1164,6 +1172,7 @@ mod tests {
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         let n = eliminate_dead_stores(&mut f);
         assert_eq!(n, 1, "x=1 is overwritten by the volatile store");
@@ -1205,6 +1214,7 @@ mod displaced_alias_tests {
             instructions,
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         f
     }
@@ -1383,6 +1393,7 @@ mod displaced_alias_tests {
         escaped.blocks.push(BasicBlock {
             label: BlockId(1),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
             instructions: vec![Instruction::Copy {
                 dest: Value(8),
                 src: Operand::Value(Value(9)),
@@ -1392,6 +1403,7 @@ mod displaced_alias_tests {
         escaped.blocks.push(BasicBlock {
             label: BlockId(2),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
             instructions: vec![Instruction::Copy {
                 dest: Value(9),
                 src: Operand::Value(Value(0)),

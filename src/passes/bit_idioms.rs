@@ -4076,6 +4076,7 @@ mod tests {
             label: BlockId(0),
             instructions: insts,
             source_spans: spans,
+            source_inline_ids: Vec::new(),
             terminator: Terminator::Return(Some(outputs[1])),
         });
         assert_eq!(
@@ -6209,6 +6210,7 @@ mod tests {
                 instructions: insts,
                 terminator: Terminator::Return(None),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             };
             let fused = detect_and_not_fusions(&block, &fx.use_counts);
             let backend = fused.contains(&and_idx);
@@ -6302,6 +6304,7 @@ mod tests {
             instructions: insts,
             terminator: term,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 

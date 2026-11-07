@@ -1193,6 +1193,7 @@ mod tests {
             instructions: Vec::new(),
             terminator,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -1212,6 +1213,7 @@ mod tests {
                     ty: IrType::I32,
                 },
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             },
             block(1, Terminator::Branch(BlockId(if cycle { 2 } else { 5 }))),
             block(2, Terminator::Branch(BlockId(if cycle { 1 } else { 5 }))),
@@ -1516,6 +1518,7 @@ mod tests {
                     ty: IrType::I32,
                 },
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             },
             block(
                 1,

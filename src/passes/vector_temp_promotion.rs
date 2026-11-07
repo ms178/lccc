@@ -2354,6 +2354,7 @@ mod tests {
         BasicBlock {
             label: BlockId(label),
             source_spans: vec![Span::dummy(); instructions.len()],
+            source_inline_ids: Vec::new(),
             instructions,
             terminator: Terminator::Return(None),
         }

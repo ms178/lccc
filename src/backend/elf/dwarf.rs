@@ -96,6 +96,9 @@ use super::dwarf_spec::{
 use super::{ObjReloc, ObjSection, SHF_MERGE, SHF_STRINGS, SHT_PROGBITS, parse_string_literal};
 use crate::common::fx_hash::FxHashMap;
 
+#[path = "dwarf/inline_debug.rs"]
+mod inline_debug;
+
 /// Names the symbol at (section index, offset): see the module documentation.
 /// The callback's own lifetime `'f` is separate from the borrow `'a`, so one
 /// callback can be lent to several builders in turn.
@@ -419,6 +422,49 @@ pub(crate) struct DwarfFunction<'a> {
     pub offset: u64,
     pub size: u64,
     pub external: bool,
+}
+
+/// One end of an inline instance's concrete address range, recorded from the
+/// zero-width marker labels codegen emits (see `generation::inline_marker_label`).
+#[derive(Clone, Debug)]
+pub(crate) struct DwarfInlineMarker {
+    /// Exact assembly label, retained for a relocation that survives relaxation.
+    pub label: String,
+    pub section_index: usize,
+    pub offset: u64,
+    pub function: String,
+    pub instance: u32,
+    pub serial: u32,
+    pub begin: bool,
+}
+
+impl DwarfInlineMarker {
+    /// Parse a compiler-private inline marker label. Returns `None` for every
+    /// ordinary label, so user assembly cannot accidentally create one unless
+    /// it spells the reserved `.Llccc_inline_` prefix exactly.
+    pub(crate) fn parse(label: &str, section_index: usize, offset: u64) -> Option<Self> {
+        let rest = label.strip_prefix(".Llccc_inline_")?;
+        let (kind, rest) = rest.split_once('_')?;
+        let begin = match kind {
+            "b" => true,
+            "e" => false,
+            _ => return None,
+        };
+        let (id, rest) = rest.split_once('_')?;
+        let (serial, function) = rest.split_once('_')?;
+        if function.is_empty() {
+            return None;
+        }
+        Some(Self {
+            label: label.to_string(),
+            section_index,
+            offset,
+            function: function.to_string(),
+            instance: id.parse().ok()?,
+            serial: serial.parse().ok()?,
+            begin,
+        })
+    }
 }
 
 /// The final size/name of an assembler section, after branch relaxation.
@@ -1905,6 +1951,7 @@ pub(crate) fn build_dwarf_info_sections(
     locations: &[DwarfLineLocation],
     sections: &[DwarfSectionInfo<'_>],
     functions: &[DwarfFunction<'_>],
+    inline_markers: &[DwarfInlineMarker],
     primary_file: &str,
     comp_dir: &str,
     producer: &str,
@@ -1952,6 +1999,9 @@ pub(crate) fn build_dwarf_info_sections(
     };
 
     let (covered, code) = covered_code_sections(sections, code_sections, functions)?;
+    let inline_index = inline_debug::InlineIndex::new(unit, inline_markers, sections)?;
+    let mut range_lists =
+        inline_debug::RangeLists::for_code(config, &code, address_size, abs_addr)?;
     let has_code = !code.is_empty();
     // One range covers the unit exactly when its code is one contiguous
     // section; anything else needs a range list.
@@ -2114,6 +2164,8 @@ pub(crate) fn build_dwarf_info_sections(
             void_die,
             locations,
             &file_table,
+            &inline_index,
+            &mut range_lists,
         )?;
     }
     if !unit.types.is_empty() || !unit.variables.is_empty() {
@@ -2162,7 +2214,7 @@ pub(crate) fn build_dwarf_info_sections(
         info: debug_section(".debug_info", info, relocs),
         abbrev: debug_section(".debug_abbrev", dies.abbrev, Vec::new()),
         aranges: build_debug_aranges(start as u64, &code, address_size, abs32, abs_addr, labels)?,
-        ranges: build_debug_ranges(config, &code, address_size, abs_addr)?,
+        ranges: range_lists.finish()?,
         loc,
         loclists,
         pubnames,
@@ -2217,6 +2269,8 @@ fn emit_subprograms(
     void_die: u32,
     locations: &[DwarfLineLocation],
     file_table: &[(u32, &str)],
+    inline_index: &inline_debug::InlineIndex<'_>,
+    range_lists: &mut inline_debug::RangeLists,
 ) -> Result<(), String> {
     let config = sink.config;
     let forms = sink.forms;
@@ -2249,6 +2303,8 @@ fn emit_subprograms(
             pos as u64 + 1
         });
     }
+    let abstracts =
+        inline_debug::emit_abstracts(&mut sink, unit, inline_index, abbrevs, &file_attr)?;
     let mut locals_by_fn: FxHashMap<&str, Vec<&crate::backend::elf::DwarfLocalVariable>> =
         FxHashMap::default();
     for local in &unit.local_variables {
@@ -2382,8 +2438,11 @@ fn emit_subprograms(
             }
         }
 
-        let has_children =
-            parameters.is_some() || !root_locals.is_empty() || !root_children.is_empty();
+        let has_inline_children = inline_debug::has_live_roots(inline_index, function.name);
+        let has_children = parameters.is_some()
+            || !root_locals.is_empty()
+            || !root_children.is_empty()
+            || has_inline_children;
         let shape = if has_children {
             &abbrevs.subprogram_with_children
         } else {
@@ -2500,6 +2559,14 @@ fn emit_subprograms(
                 },
             )?;
         }
+        inline_debug::emit_children(
+            &mut sink,
+            function,
+            inline_index,
+            &abstracts,
+            &file_attr,
+            range_lists,
+        )?;
         if has_children {
             sink.info.push(0);
         }
@@ -2853,6 +2920,13 @@ enum AttrValue {
     /// A reference to a DIE in this unit's type table, patched once the table
     /// is laid out: a type may name a type that is written after it.
     TypeRef(u32),
+    /// A unit-relative reference to an already-written DIE (abstract origin).
+    DieRef(u32),
+    /// A relocatable code address. Keeping the symbol, rather than folding a
+    /// section offset, lets a later assembler/linker relax the code.
+    Address(String),
+    /// An offset into `.debug_ranges`/`.debug_rnglists`.
+    RangeOffset(u32),
     /// `DW_AT_location` of an object at a fixed address: `DW_OP_addr` and a
     /// relocation against the symbol the linker will place.
     LocationAddr(String),
@@ -2881,7 +2955,9 @@ impl Attr {
             AttrValue::MemberLocation(_) => DW_FORM_BLOCK1,
             AttrValue::Data1(_) => DW_FORM_DATA1,
             AttrValue::Sdata(_) => DW_FORM_SDATA,
-            AttrValue::TypeRef(_) => DW_FORM_REF4,
+            AttrValue::TypeRef(_) | AttrValue::DieRef(_) => DW_FORM_REF4,
+            AttrValue::Address(_) => DW_FORM_ADDR,
+            AttrValue::RangeOffset(_) => forms.ranges,
             AttrValue::LocationAddr(_) => {
                 if config.version >= 4 {
                     DW_FORM_EXPRLOC
@@ -3037,6 +3113,22 @@ impl DieContext<'_, '_> {
                 // cannot always be written in dependency order.
                 self.writer.patches.push((self.info.len(), *index));
                 self.info.extend_from_slice(&[0; 4]);
+                Ok(())
+            }
+            AttrValue::DieRef(offset) => {
+                self.info.extend_from_slice(&offset.to_le_bytes());
+                Ok(())
+            }
+            AttrValue::Address(symbol) => push_reloc(
+                self.info,
+                self.relocs,
+                self.abs_addr,
+                self.address_size,
+                symbol,
+                0,
+            ),
+            AttrValue::RangeOffset(offset) => {
+                self.info.extend_from_slice(&offset.to_le_bytes());
                 Ok(())
             }
             AttrValue::LocationAddr(symbol) => {
@@ -3809,64 +3901,7 @@ fn build_debug_ranges(
     address_size: usize,
     abs_addr: u32,
 ) -> Result<Option<ObjSection>, String> {
-    if code.len() < 2 {
-        return Ok(None);
-    }
-    let mut data = Vec::new();
-    let mut relocs = Vec::new();
-    if config.version >= 5 {
-        data.extend_from_slice(&[0; 4]); // unit_length, patched below
-        data.extend_from_slice(&5u16.to_le_bytes());
-        data.push(u8::try_from(address_size).map_err(|_| "DWARF address size")?);
-        data.push(0); // segment_selector_size
-        data.extend_from_slice(&0u32.to_le_bytes()); // offset_entry_count
-        for section in code {
-            if section.size == 0 {
-                continue;
-            }
-            data.push(DW_RLE_START_LENGTH);
-            push_reloc(
-                &mut data,
-                &mut relocs,
-                abs_addr,
-                address_size,
-                section.name,
-                0,
-            )?;
-            write_uleb128(section.size, &mut data);
-        }
-        data.push(DW_RLE_END_OF_LIST);
-        let length = u32::try_from(data.len() - 4)
-            .map_err(|_| "DWARF range list exceeds 32 bits".to_string())?;
-        data[..4].copy_from_slice(&length.to_le_bytes());
-        Ok(Some(debug_section(".debug_rnglists", data, relocs)))
-    } else {
-        for section in code {
-            if section.size == 0 {
-                continue;
-            }
-            // A base-address pair would cost a third relocation and buy
-            // nothing: the entries are absolute addresses either way.
-            push_reloc(
-                &mut data,
-                &mut relocs,
-                abs_addr,
-                address_size,
-                section.name,
-                0,
-            )?;
-            push_reloc(
-                &mut data,
-                &mut relocs,
-                abs_addr,
-                address_size,
-                section.name,
-                section.size,
-            )?;
-        }
-        data.resize(data.len() + 2 * address_size, 0); // terminating zero pair
-        Ok(Some(debug_section(".debug_ranges", data, relocs)))
-    }
+    inline_debug::RangeLists::for_code(config, code, address_size, abs_addr)?.finish()
 }
 
 /// The DWARF version the input's `.debug_info` declares, if it declares one.
@@ -3950,6 +3985,7 @@ const DW_TAG_FORMAL_PARAMETER: u64 = 0x05;
 const DW_TAG_UNSPECIFIED_PARAMETERS: u64 = 0x18;
 const DW_TAG_VARIABLE: u64 = 0x34;
 const DW_TAG_LEXICAL_BLOCK: u64 = 0x0b;
+const DW_TAG_INLINED_SUBROUTINE: u64 = 0x1d;
 const DW_AT_NAME: u64 = 0x03;
 const DW_AT_STMT_LIST: u64 = 0x10;
 const DW_AT_LOW_PC: u64 = 0x11;
@@ -3971,6 +4007,16 @@ const DW_AT_DECL_COLUMN: u64 = 0x39;
 const DW_AT_LANGUAGE_NAME: u64 = 0x90;
 const DW_AT_LANGUAGE_VERSION: u64 = 0x91;
 const DW_AT_LOCATION: u64 = 0x02;
+const DW_AT_INLINE: u64 = 0x20;
+const DW_AT_ABSTRACT_ORIGIN: u64 = 0x31;
+const DW_AT_CALL_COLUMN: u64 = 0x57;
+const DW_AT_CALL_FILE: u64 = 0x58;
+const DW_AT_CALL_LINE: u64 = 0x59;
+// Values verified against binutils 2.47 include/dwarf2.h and GCC/Clang
+// abstract-origin dumps: DW_INL_inlined = 1 (not spelled inline),
+// DW_INL_declared_not_inlined = 2, DW_INL_declared_inlined = 3.
+const DW_INL_INLINED: u8 = 1;
+const DW_INL_DECLARED_INLINED: u8 = 3;
 const DW_AT_BYTE_SIZE: u64 = 0x0b;
 const DW_AT_ENCODING: u64 = 0x3e;
 const DW_AT_DATA_MEMBER_LOCATION: u64 = 0x38;
@@ -4045,6 +4091,7 @@ const DW_LNCT_DIRECTORY_INDEX: u64 = 0x02;
 /// `DW_RLE_start_length` and `DW_RLE_end_of_list`: the two range-list entry
 /// kinds a unit with several code sections needs.
 const DW_RLE_START_LENGTH: u8 = 0x07;
+const DW_RLE_START_END: u8 = 0x06;
 const DW_RLE_END_OF_LIST: u8 = 0x00;
 /// Write a `DW_AT_high_pc` constant in the form the unit declared for it.
 fn push_high_pc(info: &mut Vec<u8>, form: u64, size: u64) {
@@ -4754,9 +4801,11 @@ mod tests {
             types,
             variables: Vec::new(),
             return_types: FxHashMap::default(),
+            function_prototypes: FxHashMap::default(),
             parameters,
             local_variables: Vec::new(),
             lexical_scopes: Vec::new(),
+            inline_instances: Vec::new(),
         };
         for version in 2..=5 {
             let config = DwarfConfig::for_c(version, None);
@@ -4783,6 +4832,7 @@ mod tests {
                 &rows,
                 &text_section(),
                 &functions,
+                &[],
                 "b.c",
                 "/src",
                 "p",
@@ -5130,6 +5180,7 @@ mod tests {
             &rows,
             &text_section(),
             &functions,
+            &[],
             "b.c",
             "/src",
             "LCCC test",
@@ -5368,6 +5419,7 @@ mod tests {
                 &rows,
                 &text_section(),
                 &[],
+                &[],
                 "b.c",
                 "/src",
                 "p",
@@ -5443,6 +5495,7 @@ mod tests {
                 &rows,
                 &text_section(),
                 &functions,
+                &[],
                 "b.c",
                 "/src",
                 "p",
@@ -5533,6 +5586,7 @@ mod tests {
                 &rows,
                 &text_section(),
                 &functions,
+                &[],
                 "b.c",
                 "/src",
                 "p",
@@ -5699,6 +5753,7 @@ mod tests {
                 &rows,
                 &sections,
                 &[],
+                &[],
                 "s.c",
                 "/src",
                 "p",
@@ -5808,6 +5863,7 @@ mod tests {
                 &[row(0, 1, 1)],
                 &one_section,
                 &[],
+                &[],
                 "s.c",
                 "/src",
                 "p",
@@ -5863,6 +5919,7 @@ mod tests {
             &files,
             &rows,
             &sections,
+            &[],
             &[],
             "s.c",
             "/src",
@@ -5966,6 +6023,7 @@ mod tests {
             &rows,
             &huge,
             &[],
+            &[],
             "b.c",
             "/src",
             "p",
@@ -6022,6 +6080,7 @@ mod tests {
             &files,
             &rows,
             &empty,
+            &[],
             &[],
             "b.c",
             "/src",
@@ -6498,6 +6557,7 @@ mod tests {
             &rows,
             &text_section(),
             &functions,
+            &[],
             "a.c",
             "/src",
             "p",
@@ -6546,6 +6606,7 @@ mod tests {
             &[],
             &[],
             &text_section(),
+            &[],
             &[],
             "start.S",
             "/",
@@ -6661,6 +6722,7 @@ mod tests {
             &rows,
             &text_section(),
             &functions,
+            &[],
             "r.c",
             "/",
             "p",

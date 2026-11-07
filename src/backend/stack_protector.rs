@@ -573,6 +573,7 @@ fn instrument_function(
             instructions: moved_insts,
             terminator: Terminator::Return(ret_operand),
             source_spans: moved_spans,
+            source_inline_ids: Vec::new(),
         });
     }
 
@@ -608,6 +609,7 @@ fn instrument_function(
             }],
             terminator: Terminator::Unreachable,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
     }
 
@@ -628,6 +630,7 @@ mod tests {
             instructions: Vec::new(),
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(42)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         f.next_label = 1;
         f.next_value_id = 1;
