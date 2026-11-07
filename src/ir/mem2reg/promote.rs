@@ -880,7 +880,11 @@ fn rename_blocks(
         }
         func.blocks[block_idx].instructions = new_instructions;
         func.blocks[block_idx].source_spans = new_spans;
-        func.blocks[block_idx].source_inline_ids = new_ids;
+        func.blocks[block_idx].source_inline_ids = if old_ids.is_empty() {
+            Vec::new()
+        } else {
+            new_ids
+        };
 
         // Also rewrite terminator operands if they reference promoted allocas
         // (this shouldn't normally happen, but let's be safe)

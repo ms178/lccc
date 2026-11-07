@@ -2170,6 +2170,9 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
                 ));
             }
         }
+        if ids.is_empty() {
+            new_ids.clear();
+        }
         block.replace_insts_inline(new_insts, new_spans, new_ids);
     }
     func.next_value_id = next_id;

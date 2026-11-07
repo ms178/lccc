@@ -1336,6 +1336,9 @@ fn try_transform_loop(
                 new_ids.extend(kept_ids[iv_start..].iter().copied());
             }
         }
+        if ids.is_empty() {
+            new_ids.clear();
+        }
         block.replace_insts_inline(new_insts, new_spans, new_ids);
     }
     // Insert the header phis (2-block shape).
