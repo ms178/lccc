@@ -7287,11 +7287,16 @@ fn rv_vestigial_frame(
         format!("ld s0, {}(sp)", size - 16),
         format!("addi sp, sp, {size}"),
     ];
-    // Every return comes right after the three-line epilogue; the lines in
-    // between are the body, which may name neither sp, s0 nor ra.
+    // Every exit -- a `ret`, or a sibling call's `tail`/annotated `jr`,
+    // which leaves with ra, s0 and sp exactly as a `ret` would -- comes
+    // right after the three-line epilogue; the lines in between are the
+    // body, which may name neither sp, s0 nor ra.
+    let is_exit = |k: usize| {
+        kinds[k] == LineKind::Ret || (kinds[k] == LineKind::Call && rv_is_tail_line(text(k)))
+    };
     let mut epilogue_lines = Vec::new();
     for (idx, &k) in code.iter().enumerate().skip(pos) {
-        if kinds[k] == LineKind::Ret {
+        if is_exit(k) {
             let tail = code.get(idx.checked_sub(3)?..idx)?;
             if idx < pos + 3 || tail.iter().zip(&epilogue).any(|(&e, want)| text(e) != want) {
                 return None;
@@ -7301,7 +7306,7 @@ fn rv_vestigial_frame(
     }
     let frame_bits = rv_bit(REG_SP) | rv_bit(REG_S0) | rv_bit(REG_RA);
     for &k in &code[pos..] {
-        if epilogue_lines.binary_search(&k).is_ok() {
+        if epilogue_lines.binary_search(&k).is_ok() || is_exit(k) {
             continue;
         }
         match kinds[k] {
@@ -11324,5 +11329,77 @@ mod atomic_line_tests {
             "f:\n    # lccc-ret-regs a0\n    mv t0, a3\n    amoadd.d.aqrl t0, a1, (a0)\n    mv a0, t0\n    ret\n",
         );
         assert_eq!(out, ["amoadd.d.aqrl a3, a1, (a0)", "mv a0, a3", "ret"]);
+    }
+}
+
+/// Frames and branches of FP leaves whose only call is a sibling tail
+/// (`double f(double x) { return sqrt(x); }` under errno semantics).
+#[cfg(test)]
+mod tail_frame_tests {
+    use super::*;
+
+    fn rows(asm: &str) -> Vec<String> {
+        peephole_optimize(asm.into())
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with(".cfi"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// A frame nothing uses goes even when one exit is a sibling `tail`
+    /// (ra, s0 and sp are what a `ret` would leave), and the inverted FP
+    /// equality test branches on the compare itself.
+    #[test]
+    fn vestigial_frame_with_a_tail_exit_and_fp_compare_branch() {
+        let asm = "portable_sqrt:\n    addi sp, sp, -48\n    sd ra, 40(sp)\n    sd s0, 32(sp)\n    addi s0, sp, 48\n    fsqrt.d ft0, fa0\n    feq.d t0, ft0, ft0\n    xori t0, t0, 1\n    bnez t0, .LBB2\n.LBB1:\n    fmv.d fa0, ft0\n    ld ra, 40(sp)\n    ld s0, 32(sp)\n    addi sp, sp, 48\n    ret\n.LBB2:\n    ld ra, 40(sp)\n    ld s0, 32(sp)\n    addi sp, sp, 48\n    tail sqrt # lccc-call-reads 0\n";
+        assert_eq!(
+            rows(asm),
+            [
+                "portable_sqrt:",
+                "fsqrt.d ft0, fa0",
+                "feq.d t0, ft0, ft0",
+                "beqz t0, .LBB2",
+                ".LBB1:",
+                "fmv.d fa0, ft0",
+                "ret",
+                ".LBB2:",
+                "tail sqrt"
+            ]
+        );
+    }
+
+    /// A tail exit without the three-line epilogue in front (the frame is
+    /// still live there), a body naming s0, or an ordinary call keeps the
+    /// frame.
+    #[test]
+    fn frames_that_are_still_used_stay() {
+        let base = "f:\n    addi sp, sp, -16\n    sd ra, 8(sp)\n    sd s0, 0(sp)\n    addi s0, sp, 16\n    BODY\n    ld ra, 8(sp)\n    ld s0, 0(sp)\n    addi sp, sp, 16\n    tail g # lccc-call-reads 3\n";
+        for body in ["addi a1, s0, -8", "call h # lccc-call-reads 1", "mv a1, sp"] {
+            let out = rows(&base.replace("BODY", body));
+            assert!(
+                out.iter().any(|l| l == "addi sp, sp, -16"),
+                "{body}: {out:?}"
+            );
+        }
+        let out = rows(
+            "f:\n    addi sp, sp, -16\n    sd ra, 8(sp)\n    sd s0, 0(sp)\n    addi s0, sp, 16\n    tail g # lccc-call-reads 1\n",
+        );
+        assert!(out.iter().any(|l| l == "addi sp, sp, -16"), "{out:?}");
+    }
+
+    /// `xori t, s, 1; beqz/bnez t` folds only for a 0/1 `s` whose
+    /// inverted copy dies at the branch.
+    #[test]
+    fn inverted_boolean_branches() {
+        let asm = "f:\n    # lccc-ret-regs a0\n    flt.s t1, fa0, fa1\n    xori t1, t1, 1\n    beqz t1, .L1\n    li a0, 1\n    ret\n.L1:\n    li a0, 2\n    ret\n";
+        let out = rows(asm);
+        assert!(out.iter().any(|l| l == "bnez t1, .L1"), "{out:?}");
+        // Not a boolean: `fclass` writes a mask.
+        let out = rows(&asm.replace("flt.s t1, fa0, fa1", "fclass.s t1, fa0"));
+        assert!(out.iter().any(|l| l == "xori t1, t1, 1"), "{out:?}");
+        // The inverted value is still read after the branch.
+        let out = rows(&asm.replace("    li a0, 1\n", "    mv a0, t1\n"));
+        assert!(out.iter().any(|l| l == "xori t1, t1, 1"), "{out:?}");
     }
 }
