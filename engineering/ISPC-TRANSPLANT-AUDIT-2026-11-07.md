@@ -1115,3 +1115,120 @@ It does NOT mean "universally optimal" — see the deferral table.
 * No claim of GCC/Clang loop-hoisting parity.
 * Local CI was NOT run; the hosted GitHub CI on the final pushed revision is
   the authority and is reported separately.
+
+---
+
+# Round 8 addendum (post-merge `b57947c9`, stages 1b–5)
+
+The table above describes the **previous** merged PR (#1134). This addendum is
+the authoritative disposition for the work in the new PR. Every claim below is
+backed by a named artifact in `/home/user/artifacts/`; nothing is inferred.
+
+## What changed, and why (design alternatives quantified)
+
+| change | alternatives considered | chosen | measured result |
+|---|---|---|---|
+| `ByteImage` fixed `[u8;64]` + `len` instead of `Vec<u8>` per proof | (a) keep `Vec` (2–4 heap allocations on every *rejected* candidate); (b) `SmallVec<[u8;64]>` (extra dependency, same heap path on overflow); (c) fixed 64-byte `Copy` struct | (c) | `rustc -Zprint-type-sizes`: `ByteImage` **72 B / align 8**, `Option<ByteImage>` 80 B, `ImageWindow` **16 B** (was 32), `ObjectMention` 88 B. Zero heap allocations on the proof path; provable width 32 → **64 bytes**, which is what unlocks every 512-bit fold below. `MAX_IMAGE=64` is the exact bound of one ZMM register, not a heuristic. |
+| `exact_i64` + `ir_const_bytes` | (a) `IrConst::to_i64()`; (b) cast-and-truncate; (c) explicit width-safe decode into a fixed stack buffer | (c) | (a) silently mapped `I128(1<<64)` to `0`, i.e. an all-on mask became all-off and erased a real store. (c) refuses any `I128` outside `i64`, floats, decimal containers and long doubles. Pinned by `scalar_mask_refuses_i128_constants_that_would_truncate_to_all_off`. |
+| anchored `mention_of(..., at_block, at_index, ...)` + immediate last-write-wins tiling | (a) collect all writes then sort; (b) reject overlapping writes; (c) apply writes in proven program order into `[u8;64]`/`[bool;64]` | (c) | (a) allocated twice and refused same-byte writes; (b) lost the `memcpy` chain fold. (c) is one pass, zero heap, exact for overlapping stores. Regression: `overlapping_writes_use_proven_program_order_last_write_wins`. |
+| generalised `masked_form` / `MaskFamily` / `true_prefix_len` | (a) per-opcode `if` chains per fold site; (b) one decision procedure with a shape table | (b) | one table, `has_candidate` uses the same predicate so unsupported ops cost zero; `true_prefix_len` exhaustively tested over all 65,536 16-bit masks. Gap budget is explicitly **0**: a nonzero budget would copy bytes the hardware left untouched (ISPC keeps a masked load there; LCCC's IR cannot express that with one instruction). Refusal is measured, not assumed. |
+| `Setzero512` (exact 64-byte zero producer) | (a) reuse `Setzero256` twice; (b) `vpxorq %zmm0,%zmm0,%zmm0` + full ZMM store | (b) | (a) needs two instructions and a partial-store proof; (b) is ONE EVEX instruction, no memory read, no fault. `Setzero128/256` would leave 48/32 stale bytes — a silent miscompile. |
+| `Loadu256Raw` (raw byte pointer) instead of `Loadu256` | (a) substitute `Loadu256`; (b) substitute `VecLoadI8x32`; (c) dedicated raw-pointer intrinsic | (c) | `avx_load_arg` interprets its operand as a **vector home** (deferred store / register home / `vec_mem_operand(base,offset)`), so (a)/(b) read the pointer VARIABLE's 8-byte home as 32 bytes. (c) emits `vmovdqu (%rax), %ymm0` + exact-width store. ON `/tmp/final_lccc.s`: `kmov=2` vs OFF `kmov=15`; `ins=614` vs `680`. |
+| `fold_masked_intrinsic` extracted from `fold` | (a) leave `fold` monolithic; (b) extract the 147-line dispatcher | (b) | `scripts/audit_census.py --check`: `fns_over_300` back to baseline **233** (was 234). |
+| 512-bit scalar-mask compare table + `lane_count` bound | (a) keep the 32-byte cap and refuse all 512 compares; (b) enable them with `MAX_IMAGE=64` | (b) | (a) left 12 `vpcmp*512` opcodes unfoldable. (b) needed **one** real bound fix: `lane_count > 63` refused the 64-lane byte form even though `1u64 << 63` is defined; now `> u64::BITS`. 12 new table rows, 1 new exhaustive unit test (12 opcode spellings x 2 predicates + boundary bit 63). |
+| header `cmpeq_*_mask` inline wrappers → macros | (a) keep `static __inline__` with by-value `__m512i`; (b) macro | (b) | (a) materialised **two distinct stack objects** for `_mm512_cmpeq_epi8_mask(v,v)`, so the self-identity fold could not fire. A/B ON **123** hot instructions vs OFF **161** (−38, −23.6%), `vpcmp` 2 vs 7, `kmovq` 2 vs 7 in the five self-identity kernels. Three-way stdout identical. |
+| duplicate `CMP_MASK` prototypes removed | (a) leave 11 duplicate C declarations; (b) dedup by mnemonic, **fail closed** on a mask-width conflict | (b) | header shrank by 11 lines; generator now asserts that two rows sharing a mnemonic agree on `__mmaskN`, so a future ABI mistake is a build error, not a silent miscompile. |
+| `vpshufb_maskz128` / `vpshufb_mask128` wired end-to-end | (a) leave them unreachable; (b) add header prototypes + macros; (c) fix arity **and** add prototypes **and** replace the scalar fallback in `avx512fintrin.h` with the real EVEX builtin | (c) | (b) alone produced **46 C parse errors**: a same-named macro textually rewrote the existing `_mm_mask_shuffle_epi8` inline. (c) fixed the latent arity bug (`m2`/`m3` → `m3`/`m4`), replaced a **16-iteration scalar loop** with one `vpshufb {k1}`, and added the previously missing `_mm_maskz_shuffle_epi8`. ON 281 ins vs OFF 327 (−46, −14.1%); `kmov` 4 vs 8. Three-way stdout identical. |
+| identical gather lanes → splat (`VecPackI64x2`/`VecPackF64x2`) | (a) leave the two-lane staging; (b) `punpcklqdq %xmm0,%xmm0` when `args[0] == args[1]` | (b) | LCCC-native form of ISPC `GatherCoalescePass`'s all-equal-offset rule. Quantified **in the unit test**: exactly **2** instructions saved on equivalent slot-homed inputs; FP bit-pattern path and the distinct-lane negative case are both pinned. |
+| metadata completeness for the two new producers | (a) leave default `None`/`false`; (b) classify exactly | (b) | `Loadu256Raw` had `may_read_memory() == false` (a `vmovdqu` classified as read-none → BB-SLP could sink it below a store) and `vector_home_width() == None` (stack layout could hand a 32-byte store an 8-byte slot). Now `Some(32)` + `true`; `Setzero512` is `is_pure()` so IR DCE can remove a dead fold. Pinned by `round8_fold_producers_have_exact_effect_and_width_metadata`. |
+| `compare_image` guard | (a) keep `width / lane_bytes > MAX_IMAGE`; (b) checked arithmetic + `get_mut` + `from_slice` | (b) | the old guard was **vacuous** (with `width <= 64` and `lane_bytes >= 1` it can never fire). (b) states the real bound (`width > MAX_IMAGE`), uses `checked_add`/`get_mut(...)?`/`from_slice`, and removes the last direct private-field slice. A malformed image now *refuses*, it can never panic. |
+
+## Measured pahole-equivalent layouts (`-Zprint-type-sizes`, rustc 1.99.1)
+
+`RUSTC_BOOTSTRAP=1 RUSTFLAGS="-Zprint-type-sizes -Cdebuginfo=1" cargo build
+--lib --profile fastbuild --locked` → `/home/user/artifacts/type_sizes3.log`
+(185,521 lines). Exact relevant lines:
+
+```
+print-type-size type: `passes::simd_mask_facts::ByteImage`: 72 bytes, alignment: 8 bytes
+print-type-size     field `.bytes`: 64 bytes
+print-type-size     field `.len`: 8 bytes
+print-type-size type: `passes::simd_mask_facts::ImageWindow`: 16 bytes, alignment: 8 bytes
+print-type-size type: `passes::simd_mask_facts::ObjectMention`: 88 bytes, alignment: 8 bytes
+print-type-size type: `passes::simd_mask_facts::Facts<'_>`: 168 bytes, alignment: 8 bytes
+print-type-size type: `passes::simd_mask_facts::MaskStatus`: 8 bytes, alignment: 4 bytes
+print-type-size type: `passes::simd_mask_facts::ScalarMask`: 16 bytes, alignment: 8 bytes
+print-type-size type: `passes::simd_mask_facts::ByteOp`: 1 bytes, alignment: 1 bytes
+print-type-size type: `passes::simd_mask_facts::MaskFamily`: 16 bytes, alignment: 8 bytes
+```
+
+`ObjectMention` grew from ~32 B to 88 B because it now carries a 72-byte
+`ByteImage` by value; that is the deliberate trade for removing 2–4 heap
+allocations per proof. `Facts` stayed at 168 B, so the per-function footprint
+did not grow. No `unsafe`, no pointer arithmetic, no lifetime to audit.
+
+## Follow-up list: revised disposition
+
+| item (previous table) | new disposition | evidence |
+|---|---|---|
+| constant true-prefix masks | **IMPLEMENTED** | `true_prefix_len` + `MaskFamily::Store`; `p128_store`/`p512_stack_store` in `avx512_stage2_folds.c`; exhaustive 16-bit domain test |
+| all-equal gather offsets | **IMPLEMENTED (LCCC-native form)** | `VecPackI64x2`/`VecPackF64x2` splat; unit test measures exactly 2 saved instructions |
+| coalescing gap budget | **IMPLEMENTED as a measured refusal** | `true_prefix_len(bits, lanes, gap_budget)` accepts only `gap_budget == 0`; exhaustively tested; documented why nonzero is unsound here |
+| widen-then-average | **IMPLEMENTED** | `ByteOp::Avg` + `Pavgb128`/`Pavgb512`; `widen_then_average_is_exact_for_every_byte_pair` over all 65,536 pairs; `simd_maskfacts_widen_average.c` three-way stdout `1b67dd2100eee383` |
+| `MaskLoadu*` merge form, all-off / all-on | **IMPLEMENTED** | `MaskFamily::MergeLoad` → `Memcpy` / `Loadu{128,256Raw,512}`; `m512_off/on`, `m128_off/on` in the three-way fixture |
+| `MaskzLoaduEpi8_512` / `_256` all-on | **IMPLEMENTED** | `Loadu512` and the new `Loadu256Raw`; `z512_on`/`z256_on`; ON `kmov=2`, OFF `kmov=15` |
+| masked 512 arithmetic families | **IMPLEMENTED** | `MaskzSet1Epi16/32/64x512`, `MaskzMaddubsEpi16_512`, `MaskzShuffleEpi8_128`, `MaskShuffleEpi8_128`, insert/extract ZeroOnly; `s512_*`, `a512_*`, `avx512_stage5_shufb.c` |
+| `vpshufb_mask*` header absence | **IMPLEMENTED** | two prototypes, two public inlines, arity fix `m2/m3 → m3/m4`, `every_generated_helper_prototype_agrees_with_operand_metadata` PASS |
+| `Setzero512` / `Loadu256Raw` metadata | **IMPLEMENTED** | see the metadata row above; dedicated contract test |
+| `compare_image` vacuous guard / private-field slice | **IMPLEMENTED** | checked arithmetic + `get_mut` + `from_slice` |
+| stale 512-bit documentation | **IMPLEMENTED** | three doc comments asserted 512-bit loads were out of scope / used a 32-byte bound; corrected to the `MAX_IMAGE=64` reality |
+| linear / negative-stride masked loads | **STILL DEFERRED, justified** | needs a stride lattice plus an alias/fault proof for negative strides; the pass proves only constant object images. No measured repro. Adding an unproven rewrite would be a miscompile, not an optimization. |
+| GCC/Clang loop-hoisting parity | **NOT CLAIMED** | the historical 100M-call benchmark used a volatile function pointer precisely because GCC/Clang hoist the plain loop; medians LCCC ~148 ms, GCC 16.2 ~155 ms, Clang 23.1.5 ~146 ms — parity within noise, **not** superiority. |
+
+## Stage-5 pass / fail table (all direct gates)
+
+| gate | result |
+|---|---|
+| `cargo fmt --all -- --check` | PASS |
+| `git diff --check` | PASS |
+| `cargo check --lib --profile fastbuild --locked` | PASS |
+| full unit suite | **8374 passed / 0 failed / 10 ignored** |
+| focused `simd_mask_facts` | **97 passed / 0 failed** (8287 filtered) |
+| `scripts/audit_census.py --check` | PASS (`fns_over_300` at baseline 233) |
+| `scripts/check_clippy_policy.py` | PASS after fixing 2 `clippy::useless_vec` findings in the new test (**76 lints, 0 warnings**) |
+| `check_verify_ir_clean.sh` | PASS (79 files, `-O2`, `CCC_VERIFY_IR=abort`) |
+| `check_param_home_contracts.py` (4 drivers) | PASS `PARAM_HOME_CONTRACTS_OK` |
+| `check_foreign_intrinsics.py` | PASS (635 x 2 non-x86 backends) |
+| `gen_lcccsimd.py --check` | PASS (1425 lines match) |
+| `check_ci_gate_parity.py` | PASS (551 commands / 27 contracts) |
+| `run_regression.py --filter simd_mask_facts` | **11 passed / 0 failed** |
+| full corpus, `CCC_VALIDATE_SSA=1` | **1326 passed / 0 failed / 3 skipped-compare / 82 skipped-run / 1411 total** |
+| `check_maskfacts_cross_arch.py` + `--self-test` | PASS: **4 ISAs x 2 fixtures x 2 pass states**, oracle-identical; self-test rejects every mutation |
+| three-way C differential, `avx512_stage2_folds.c` | PASS: LCCC / GCC 16.2 / Clang 23.1.5 identical 16-checksum stdout |
+| three-way C differential, `avx512_stage5_compare_folds.c` | PASS: identical 7-value stdout (`ffffffffffffffff ... 8000000000000002`) |
+| three-way C differential, `avx512_stage5_shufb.c` | PASS: identical 8-checksum stdout |
+| three-way C differential, `simd_maskfacts_widen_average.c` | PASS: `1b67dd2100eee383` |
+| `expr_builtins_lcccsimd` header/lowering arity self-tests | **5 passed / 0 failed** |
+| compiler build warnings | **0** (`build_stage5c.log`) |
+
+## Explicitly NOT claimed (stage 5)
+
+* No hosted GitHub CI result for this PR in this addendum; that is reported
+  separately after the push. No local CI was run.
+* No local ICX 2026.2, `objtool`, `pahole`, `perf`, PMU/Callgrind or Miri
+  result. `-Zprint-type-sizes` is the pahole-equivalent layout measurement,
+  not pahole itself. The Intel PPA is unreachable from this sandbox.
+* No broad "LCCC beats GCC 16.2 / Clang 23.1.5 / ICX 2026.2" claim; the fair
+  3-way benchmark is parity within noise.
+* No full cross-GCC C conformance suite on AArch64/RISC-V (no cross
+  sysroots); the 4-ISA proof is freestanding static binaries + Clang's
+  integrated assembler + mold + qemu-user.
+* No claim that 512-bit explicit-SIMD intrinsics have a `vector_home_width`;
+  **none** of them do (`Loadu512` included). `Setzero512`'s fold rewrites the
+  original instruction in place and inherits its destination protection.
+  This is a pre-existing convention, pinned by a test, not a new weakness.
+* No claim that the folded `z256_on`/`self_eq` kernels are minimal: they still
+  contain redundant load→stack→reload roundtrips from the front-end. That is
+  a separate DSE/copy-prop issue, measured and disclosed, not hidden.
+* No claim of zero defects beyond the gates and probes above; linear /
+  negative-stride masked loads remain a measured, documented deferral.

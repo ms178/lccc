@@ -556,76 +556,56 @@ void * __lccc_simd512_i_vinserti64x4_512(long, __m512i __a, __m256i __b);
 #define _mm512_inserti64x4(__a, __b, __imm) __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vinserti64x4_512(__imm, __a, __b))
 
 __mmask64 __lccc_simd512_i_vpcmpub512(long, __m512i __a, __m512i __b);
-__mmask64 __lccc_simd512_i_vpcmpub512(long, __m512i __a, __m512i __b);
-__mmask64 __lccc_simd512_i_vpcmpb512(long, __m512i __a, __m512i __b);
 __mmask64 __lccc_simd512_i_vpcmpb512(long, __m512i __a, __m512i __b);
 __mmask32 __lccc_simd512_i_vpcmpuw512(long, __m512i __a, __m512i __b);
-__mmask32 __lccc_simd512_i_vpcmpuw512(long, __m512i __a, __m512i __b);
-__mmask32 __lccc_simd512_i_vpcmpw512(long, __m512i __a, __m512i __b);
 __mmask32 __lccc_simd512_i_vpcmpw512(long, __m512i __a, __m512i __b);
 __mmask16 __lccc_simd512_i_vpcmpud512(long, __m512i __a, __m512i __b);
-__mmask16 __lccc_simd512_i_vpcmpud512(long, __m512i __a, __m512i __b);
-__mmask16 __lccc_simd512_i_vpcmpd512(long, __m512i __a, __m512i __b);
 __mmask16 __lccc_simd512_i_vpcmpd512(long, __m512i __a, __m512i __b);
 __mmask8 __lccc_simd512_i_vpcmpuq512(long, __m512i __a, __m512i __b);
-__mmask8 __lccc_simd512_i_vpcmpuq512(long, __m512i __a, __m512i __b);
 __mmask8 __lccc_simd512_i_vpcmpq512(long, __m512i __a, __m512i __b);
-__mmask8 __lccc_simd512_i_vpcmpq512(long, __m512i __a, __m512i __b);
-__mmask32 __lccc_simd512_i_vpcmpub256(long, __m256i __a, __m256i __b);
 __mmask32 __lccc_simd512_i_vpcmpub256(long, __m256i __a, __m256i __b);
 __mmask32 __lccc_simd512_i_vpcmpb256(long, __m256i __a, __m256i __b);
 __mmask16 __lccc_simd512_i_vpcmpub128(long, __m128i __a, __m128i __b);
-__mmask16 __lccc_simd512_i_vpcmpub128(long, __m128i __a, __m128i __b);
 __mmask16 __lccc_simd512_i_vpcmpb128(long, __m128i __a, __m128i __b);
-static __inline__ __attribute__((__always_inline__, __artificial__)) __mmask64 _mm512_cmpeq_epu8_mask(__m512i __a, __m512i __b)
-{ return (__mmask64)__lccc_simd512_i_vpcmpub512(0, __a, __b); }
+#define _mm512_cmpeq_epu8_mask(__a, __b) (__mmask64)__lccc_simd512_i_vpcmpub512(0, __a, __b)
 
 #define _mm512_cmp_epu8_mask(__a, __b, __imm) (__mmask64)__lccc_simd512_i_vpcmpub512(__imm, __a, __b)
 
-static __inline__ __attribute__((__always_inline__, __artificial__)) __mmask64 _mm512_cmpeq_epi8_mask(__m512i __a, __m512i __b)
-{ return (__mmask64)__lccc_simd512_i_vpcmpb512(0, __a, __b); }
+#define _mm512_cmpeq_epi8_mask(__a, __b) (__mmask64)__lccc_simd512_i_vpcmpb512(0, __a, __b)
 
 #define _mm512_cmp_epi8_mask(__a, __b, __imm) (__mmask64)__lccc_simd512_i_vpcmpb512(__imm, __a, __b)
 
-static __inline__ __attribute__((__always_inline__, __artificial__)) __mmask32 _mm512_cmpeq_epu16_mask(__m512i __a, __m512i __b)
-{ return (__mmask32)__lccc_simd512_i_vpcmpuw512(0, __a, __b); }
+#define _mm512_cmpeq_epu16_mask(__a, __b) (__mmask32)__lccc_simd512_i_vpcmpuw512(0, __a, __b)
 
 #define _mm512_cmp_epu16_mask(__a, __b, __imm) (__mmask32)__lccc_simd512_i_vpcmpuw512(__imm, __a, __b)
 
-static __inline__ __attribute__((__always_inline__, __artificial__)) __mmask32 _mm512_cmpeq_epi16_mask(__m512i __a, __m512i __b)
-{ return (__mmask32)__lccc_simd512_i_vpcmpw512(0, __a, __b); }
+#define _mm512_cmpeq_epi16_mask(__a, __b) (__mmask32)__lccc_simd512_i_vpcmpw512(0, __a, __b)
 
 #define _mm512_cmp_epi16_mask(__a, __b, __imm) (__mmask32)__lccc_simd512_i_vpcmpw512(__imm, __a, __b)
 
-static __inline__ __attribute__((__always_inline__, __artificial__)) __mmask16 _mm512_cmpeq_epu32_mask(__m512i __a, __m512i __b)
-{ return (__mmask16)__lccc_simd512_i_vpcmpud512(0, __a, __b); }
+#define _mm512_cmpeq_epu32_mask(__a, __b) (__mmask16)__lccc_simd512_i_vpcmpud512(0, __a, __b)
 
 #define _mm512_cmp_epu32_mask(__a, __b, __imm) (__mmask16)__lccc_simd512_i_vpcmpud512(__imm, __a, __b)
 
-static __inline__ __attribute__((__always_inline__, __artificial__)) __mmask16 _mm512_cmpeq_epi32_mask(__m512i __a, __m512i __b)
-{ return (__mmask16)__lccc_simd512_i_vpcmpd512(0, __a, __b); }
+#define _mm512_cmpeq_epi32_mask(__a, __b) (__mmask16)__lccc_simd512_i_vpcmpd512(0, __a, __b)
 
 #define _mm512_cmp_epi32_mask(__a, __b, __imm) (__mmask16)__lccc_simd512_i_vpcmpd512(__imm, __a, __b)
 
-static __inline__ __attribute__((__always_inline__, __artificial__)) __mmask8 _mm512_cmpeq_epu64_mask(__m512i __a, __m512i __b)
-{ return (__mmask8)__lccc_simd512_i_vpcmpuq512(0, __a, __b); }
+#define _mm512_cmpeq_epu64_mask(__a, __b) (__mmask8)__lccc_simd512_i_vpcmpuq512(0, __a, __b)
 
 #define _mm512_cmp_epu64_mask(__a, __b, __imm) (__mmask8)__lccc_simd512_i_vpcmpuq512(__imm, __a, __b)
 
-static __inline__ __attribute__((__always_inline__, __artificial__)) __mmask8 _mm512_cmpeq_epi64_mask(__m512i __a, __m512i __b)
-{ return (__mmask8)__lccc_simd512_i_vpcmpq512(0, __a, __b); }
+#define _mm512_cmpeq_epi64_mask(__a, __b) (__mmask8)__lccc_simd512_i_vpcmpq512(0, __a, __b)
 
 #define _mm512_cmp_epi64_mask(__a, __b, __imm) (__mmask8)__lccc_simd512_i_vpcmpq512(__imm, __a, __b)
 
-static __inline__ __attribute__((__always_inline__, __artificial__)) __mmask32 _mm256_cmpeq_epu8_mask(__m256i __a, __m256i __b)
-{ return (__mmask32)__lccc_simd512_i_vpcmpub256(0, __a, __b); }
+#define _mm256_cmpeq_epu8_mask(__a, __b) (__mmask32)__lccc_simd512_i_vpcmpub256(0, __a, __b)
 
 #define _mm256_cmp_epu8_mask(__a, __b, __imm) (__mmask32)__lccc_simd512_i_vpcmpub256(__imm, __a, __b)
 
 #define _mm256_cmp_epi8_mask(__a, __b, __imm) (__mmask32)__lccc_simd512_i_vpcmpb256(__imm, __a, __b)
 
-static __inline__ __attribute__((__always_inline__, __artificial__)) __mmask16 _mm_cmpeq_epu8_mask(__m128i __a, __m128i __b)
-{ return (__mmask16)__lccc_simd512_i_vpcmpub128(0, __a, __b); }
+#define _mm_cmpeq_epu8_mask(__a, __b) (__mmask16)__lccc_simd512_i_vpcmpub128(0, __a, __b)
 
 #define _mm_cmp_epu8_mask(__a, __b, __imm) (__mmask16)__lccc_simd512_i_vpcmpub128(__imm, __a, __b)
 
@@ -658,9 +638,11 @@ void __lccc_simd512_i_vmovdqu8_mask_store128(long, void *__p, __mmask16 __mask, 
 
 #define _mm_mask_storeu_epi8(__p, __mask, __a) __lccc_simd512_i_vmovdqu8_mask_store128(0, __p, __mask, __a)
 
-void * __lccc_simd512_i_vpmaddubsw_maskz512(long, __mmask64 __mask, __m512i __a, __m512i __b);
+void * __lccc_simd512_i_vpmaddubsw_maskz512(long, __mmask32 __mask, __m512i __a, __m512i __b);
 #define _mm512_maskz_maddubs_epi16(__mask, __a, __b) __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpmaddubsw_maskz512(0, __mask, __a, __b))
 
+void * __lccc_simd512_i_vpshufb_maskz128(long, __mmask16 __mask, __m128i __a, __m128i __b);
+void * __lccc_simd512_i_vpshufb_mask128(long, __mmask16 __mask, __m128i __src, __m128i __a, __m128i __b);
 void * __lccc_simd512_i_vpbroadcastw_maskz512(long, __mmask32 __mask, int __a);
 void * __lccc_simd512_i_vpbroadcastd_maskz512(long, __mmask16 __mask, int __a);
 void * __lccc_simd512_i_vpbroadcastq_maskz512(long, __mmask8 __mask, long long __a);
@@ -676,7 +658,7 @@ void * __lccc_simd512_i_vinserti32x4_maskz512(long, __mmask16 __mask, __m512i __
 
 #define _mm512_maskz_inserti32x4(__mask, __a, __b, __imm) __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vinserti32x4_maskz512(__imm, __mask, __a, __b))
 
-void * __lccc_simd512_i_vextracti32x4_maskz512(long, __mmask16 __mask, __m512i __a);
+void * __lccc_simd512_i_vextracti32x4_maskz512(long, __mmask8 __mask, __m512i __a);
 void * __lccc_simd512_i_vextracti64x4_maskz512(long, __mmask8 __mask, __m512i __a);
 void * __lccc_simd512_i_vextracti64x2_maskz512(long, __mmask8 __mask, __m512i __a);
 #define _mm512_maskz_extracti32x4_epi32(__mask, __a, __imm) __CCC_M128I_FROM_BUILTIN(__lccc_simd512_i_vextracti32x4_maskz512(__imm, __mask, __a))

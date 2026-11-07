@@ -45,6 +45,7 @@ pub(super) fn lccc_simd_lookup(
     let s1 = |c, o| Some((c, o, false, 1usize));
     let s1i = |c, o| Some((c, o, true, 1usize));
     let m2 = |c, o| Some((c, o, false, 2usize));
+    let m4 = |c, o| Some((c, o, false, 4usize));
     let m3 = |c, o| Some((c, o, false, 3usize));
     let m3i = |c, o| Some((c, o, true, 3usize));
     let m2i = |c, o| Some((c, o, true, 2usize));
@@ -229,8 +230,14 @@ pub(super) fn lccc_simd_lookup(
         "vextracti32x4_maskz512" => m2i(Vec128, MaskzExtractI32x4),
         "vextracti64x4_maskz512" => m2i(Vec256, MaskzExtractI64x4),
         "vextracti64x2_maskz512" => m2i(Vec128, MaskzExtractI64x2),
-        "vpshufb_maskz128" => m2(Vec128, MaskzShuffleEpi8_128),
-        "vpshufb_mask128" => m3(Vec128, MaskShuffleEpi8_128),
+        // Arity must match the x86 emitter and `masked_form`: zeroing
+        // reads [mask, a, b] (3), merge reads [mask, src, a, b] (4).
+        // The merged tree declared m2/m3, so these two builtins produced
+        // short argument lists that no emitter could consume. They were
+        // unreachable from C only because no header prototype existed;
+        // stage 5 adds the prototypes and fixes the arity together.
+        "vpshufb_maskz128" => m3(Vec128, MaskzShuffleEpi8_128),
+        "vpshufb_mask128" => m4(Vec128, MaskShuffleEpi8_128),
         "vreduce_add_epu32_512" => s1(Scalar, ReduceAddEpu32_512),
         // ---- AVX-VNNI 512 ----
         "vpdpbusd512" => m3(Vec512, Vpdpbusd512),
