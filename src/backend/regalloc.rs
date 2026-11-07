@@ -9894,8 +9894,7 @@ fn collect_call_arg_values(func: &IrFunction) -> (FxHashMap<u32, u8>, FxHashSet<
     let mut indirect = FxHashSet::default();
     let is_x86_64 = crate::common::types::target_elf_machine() == crate::backend::elf::EM_X86_64
         && crate::common::types::target_ptr_size() == 8;
-    let is_aarch64 =
-        crate::common::types::target_elf_machine() == crate::backend::elf::EM_AARCH64;
+    let is_aarch64 = crate::common::types::target_elf_machine() == crate::backend::elf::EM_AARCH64;
     let is_riscv = crate::common::types::target_elf_machine() == crate::backend::elf::EM_RISCV;
     for block in &func.blocks {
         for inst in &block.instructions {

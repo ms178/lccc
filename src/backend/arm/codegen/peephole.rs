@@ -1874,9 +1874,8 @@ fn coalesce_one_entry_copy(
                         && d2 != dst
                         && d2 < 29
                     {
-                        let xv = lv_x.get_or_insert_with(|| {
-                            x_view_liveness(lines, kinds, fstart, fend)
-                        });
+                        let xv =
+                            lv_x.get_or_insert_with(|| x_view_liveness(lines, kinds, fstart, fend));
                         if xv.as_ref().and_then(|l| l.live_after(k, d2)) == Some(false) {
                             narrowed.push(k);
                             continue;
@@ -1964,7 +1963,9 @@ fn coalesce_one_entry_copy(
                         // cannot reach those reads.  (`mov x10, x0` coalesced
                         // in `mov x0, x1; mov x1, x10; b take_two` became
                         // `mov x0, x1; mov x1, x0`: both arguments b.)
-                        LineKind::Branch if tail_exit_reads(lines, kinds, k) & (1u64 << dst) != 0 => {
+                        LineKind::Branch
+                            if tail_exit_reads(lines, kinds, k) & (1u64 << dst) != 0 =>
+                        {
                             ok = false;
                             break;
                         }
@@ -4040,8 +4041,8 @@ fn x_view_exit_reads(lines: &[String], kinds: &[LineKind], k: usize) -> u64 {
     if reads == 0 {
         return 0;
     }
-    let narrow = tail_marker_before(lines, kinds, k)
-        .map_or(0, |m| narrow_arg_mask(&late::narrow_widths(m)));
+    let narrow =
+        tail_marker_before(lines, kinds, k).map_or(0, |m| narrow_arg_mask(&late::narrow_widths(m)));
     reads & !narrow
 }
 
@@ -4073,7 +4074,6 @@ fn x_view_liveness(
         (uses | x_view_exit_reads(lines, kinds, k), defs)
     })
 }
-
 
 /// The registers whose X view `line` names other than as its written
 /// destination: every `xN` token, except the destination of a

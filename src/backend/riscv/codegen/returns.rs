@@ -22,7 +22,8 @@ impl RiscvCodegen {
             });
             match target {
                 crate::backend::state::SibcallTarget::Direct(name) => {
-                    self.state.emit_fmt(format_args!("    tail {}{}", name, note));
+                    self.state
+                        .emit_fmt(format_args!("    tail {}{}", name, note));
                 }
                 crate::backend::state::SibcallTarget::Reg(reg) => {
                     self.state.emit_fmt(format_args!("    jr {}{}", reg, note));

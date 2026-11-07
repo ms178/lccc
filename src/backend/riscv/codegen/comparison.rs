@@ -501,10 +501,18 @@ impl RiscvCodegen {
             }
             // Against zero: the mask is the result.
             if b == 0 {
-                return Some(SelectPlan { mask: mask(a, true)?, base: Base::Zero, boolean });
+                return Some(SelectPlan {
+                    mask: mask(a, true)?,
+                    base: Base::Zero,
+                    boolean,
+                });
             }
             if a == 0 {
-                return Some(SelectPlan { mask: mask(b, false)?, base: Base::Zero, boolean });
+                return Some(SelectPlan {
+                    mask: mask(b, false)?,
+                    base: Base::Zero,
+                    boolean,
+                });
             }
             // Two constants a power of two apart: a shifted bit plus the
             // smaller one (an `addi` immediate).
@@ -592,7 +600,13 @@ impl RiscvCodegen {
     }
 
     /// Emit a `branch_free_select` plan into `dest`.
-    fn emit_branch_free_select(&mut self, dest: &Value, cond: &Operand, plan: SelectPlan, ty: IrType) {
+    fn emit_branch_free_select(
+        &mut self,
+        dest: &Value,
+        cond: &Operand,
+        plan: SelectPlan,
+        ty: IrType,
+    ) {
         self.operand_to_t0(cond);
         // The condition as 0/1 for "the mask is set": `snez` when the mask
         // follows the condition (skipped for a compare's 0/1 result),
@@ -624,7 +638,8 @@ impl RiscvCodegen {
         match plan.base {
             Base::Zero => {}
             Base::Imm(b) => {
-                self.state.emit_fmt(format_args!("    addi{w} t0, t0, {}", b));
+                self.state
+                    .emit_fmt(format_args!("    addi{w} t0, t0, {}", b));
             }
             Base::Value(x, op) => {
                 self.state.emit("    mv t1, t0");

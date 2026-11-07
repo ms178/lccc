@@ -38,8 +38,8 @@
 use super::{
     A64_ALL_GP, CALL_READS_TAG, LineKind, Liveness, OPAQUE_LINE, a64_traps_to_handler,
     abi_liveness, classify_line, flag_operands, gp_operands, implicitly_writes_a64,
-    inert_directive, invert_condition, may_write_gp, rename_def_dest, rename_gp_tokens,
-    renamable_def_dest, tail_marker_before, wreg_name, xreg_name,
+    inert_directive, invert_condition, may_write_gp, renamable_def_dest, rename_def_dest,
+    rename_gp_tokens, tail_marker_before, wreg_name, xreg_name,
 };
 use crate::backend::peephole_common::{replace_source_reg_in_instruction, replace_whole_word};
 
@@ -474,7 +474,11 @@ pub(super) fn rename_clobbering_defs(
     kinds: &mut [LineKind],
     n: usize,
 ) -> bool {
-    if has_opaque(lines, n) || !kinds[..n].iter().any(|k| matches!(k, LineKind::Move { .. })) {
+    if has_opaque(lines, n)
+        || !kinds[..n]
+            .iter()
+            .any(|k| matches!(k, LineKind::Move { .. }))
+    {
         return false;
     }
     let mut live: Option<Vec<u64>> = None;
@@ -539,7 +543,9 @@ pub(super) fn rename_clobbering_defs(
             };
             // Every read of the value must now name `F`.
             match text {
-                Some(t) if whole || gp_operands(&t, classify_line(&t), false).0 & (1u64 << s) == 0 => {
+                Some(t)
+                    if whole || gp_operands(&t, classify_line(&t), false).0 & (1u64 << s) == 0 =>
+                {
                     texts.push((k, t));
                 }
                 _ => {

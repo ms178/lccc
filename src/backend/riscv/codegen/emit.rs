@@ -864,8 +864,7 @@ impl ArchCodegen for RiscvCodegen {
         // The ordinary prologue sets s0 (DWARF fp, register 8) to the top of
         // the frame and every stack slot is an s0-relative displacement.  The
         // frameless leaf and RA-only TLS frames never establish s0.
-        (!self.frameless_leaf && !self.ra_only_frame && !self.fp_less_frame)
-            .then_some((8, slot.0))
+        (!self.frameless_leaf && !self.ra_only_frame && !self.fp_less_frame).then_some((8, slot.0))
     }
 
     /// Provenance markers for user inline-asm bodies: `#APP`/`#NO_APP`, as

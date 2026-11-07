@@ -295,7 +295,8 @@ impl RiscvCodegen {
         // `riscv_call_pool_eligible`: the allocator keeps call-spanning
         // values out of it, and the staging-hazard depths keep each argument
         // out of the a-registers its staging writes first.
-        let caller_saved_regs: Vec<crate::backend::regalloc::PhysReg> = if !self.state.disable_regalloc
+        let caller_saved_regs: Vec<crate::backend::regalloc::PhysReg> =
+            if !self.state.disable_regalloc
                 && !self.is_variadic
                 && !func.uses_sret
                 && ((self.riscv_caller_pool_eligible(func)
@@ -309,11 +310,12 @@ impl RiscvCodegen {
                         func,
                         &self.state.ra_config,
                     ))
-                    || self.riscv_call_pool_eligible(func)) {
-            (12..=19).map(crate::backend::regalloc::PhysReg).collect()
-        } else {
-            Vec::new()
-        };
+                    || self.riscv_call_pool_eligible(func))
+            {
+                (12..=19).map(crate::backend::regalloc::PhysReg).collect()
+            } else {
+                Vec::new()
+            };
         let call_arg_regs = caller_saved_regs.clone();
         let (
             mut reg_assigned,
@@ -513,9 +515,9 @@ impl RiscvCodegen {
             && !func.uses_sret
             && !self.state.has_dyn_alloca
             && Self::fits_imm12(self.fp_less_frame_size())
-            && !classify_params(func, &config).iter().any(|c| {
-                !matches!(c, ParamClass::IntReg { .. } | ParamClass::FloatReg { .. })
-            })
+            && !classify_params(func, &config)
+                .iter()
+                .any(|c| !matches!(c, ParamClass::IntReg { .. } | ParamClass::FloatReg { .. }))
             && self.riscv_emitter_safe_ir(func, true, true)
             && func.blocks.iter().all(|block| {
                 block.instructions.iter().all(|inst| match inst {
@@ -568,8 +570,11 @@ impl RiscvCodegen {
             self.state
                 .emit_fmt(format_args!("    sd {}, {}(sp)", reg_name, offset));
             if self.state.emit_cfi {
-                self.state
-                    .emit_fmt(format_args!("    .cfi_offset {}, {}", reg_name, offset - size));
+                self.state.emit_fmt(format_args!(
+                    "    .cfi_offset {}, {}",
+                    reg_name,
+                    offset - size
+                ));
             }
         }
     }

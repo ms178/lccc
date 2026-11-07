@@ -311,8 +311,7 @@ fn is_call_line(trimmed: &str) -> bool {
 /// to our caller, like a `ret` (`rv_uses_defs`, `rv_fp_uses_defs`), and it
 /// never falls through (`RvCfg::build`).
 fn rv_is_tail_line(trimmed: &str) -> bool {
-    trimmed.starts_with("tail ")
-        || (trimmed.starts_with("jr ") && trimmed.contains(CALL_READS_TAG))
+    trimmed.starts_with("tail ") || (trimmed.starts_with("jr ") && trimmed.contains(CALL_READS_TAG))
 }
 
 /// True when the line implicitly writes register `id` (the write half of
@@ -6203,10 +6202,9 @@ fn rv_fp_uses_defs(line: &str, kind: LineKind) -> (u32, u32) {
         // A callee may read every FP argument register and clobbers every
         // caller-saved one; a sibling callee also returns the callee-saved
         // ones to our caller.
-        LineKind::Call if rv_is_tail_line(line.trim()) => (
-            RV_FP_ARGS | RV_FP_CALLEE_SAVED,
-            RV_FP_TEMPS | RV_FP_ARGS,
-        ),
+        LineKind::Call if rv_is_tail_line(line.trim()) => {
+            (RV_FP_ARGS | RV_FP_CALLEE_SAVED, RV_FP_TEMPS | RV_FP_ARGS)
+        }
         LineKind::Call => (RV_FP_ARGS, RV_FP_TEMPS | RV_FP_ARGS),
         // The FP results and every register the caller expects back.
         LineKind::Ret => (RV_FP_RET | RV_FP_CALLEE_SAVED, 0),
