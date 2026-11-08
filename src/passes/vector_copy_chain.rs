@@ -270,15 +270,12 @@ fn collapse_in_function(func: &mut IrFunction) -> usize {
             claimed.insert(final_home.0);
             // The scratch Alloca is dead after the rewrite: its only two
             // mentions were the load's dest_ptr and the VecLoad base.
-            let dead_alloca = func
-                .blocks
-                .iter()
-                .any(|b| {
-                    b.instructions.iter().any(|inst| {
-                        matches!(inst, Instruction::Alloca { dest, .. } if dest.0 == scratch.0)
-                    })
-                })
-                .then_some(scratch.0);
+            // `homes` ALREADY indexed every non-volatile Alloca by dest in
+            // one O(n) walk, so this is an O(1) lookup.  The old nested
+            // full-function scan was O(plans x instructions) -- quadratic
+            // on a function with many chains -- for a fact we had computed
+            // before the planning loop even started.
+            let dead_alloca = homes.contains_key(&scratch.0).then_some(scratch.0);
             plans[bi].push(Plan {
                 load: i,
                 vec_load: i + 1,

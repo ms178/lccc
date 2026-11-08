@@ -1994,7 +1994,7 @@ gate "llvm-word-counts" fast python3 tests/regression/check_llvm_word_counts.py
 # silently drops a gate.  The harnesses need GCC 16.2 / Clang 23.1.5 exactly;
 # the hosted job pins both names to the installed oracles.
 gate "maskfacts-vl-matrix" fast \
-    python3 scripts/check_maskfacts_vl_matrix.py --asm-dir target/maskfacts-receipts/asm --json target/maskfacts-receipts/matrix.json
+    python3 scripts/check_maskfacts_vl_matrix.py --asm-dir target/maskfacts-receipts/asm --require-code-size-parity --json target/maskfacts-receipts/matrix.json
 gate "maskfacts-function-census" fast \
     python3 scripts/maskfacts_function_census.py --asm-dir target/maskfacts-receipts/asm --require-runtime-avg 5.0 --require-no-roundtrip --json target/maskfacts-receipts/census.json
 gate "maskfacts-memory-safety" fast \

@@ -127,8 +127,9 @@ impl X86Codegen {
     /// about stack slots and would flush a deferred store): the operand must
     /// have a UNIQUE `GlobalAddr` definition (`get_defining_instruction`
     /// refuses multi-def phi residue), must not be TLS, must not be
-    /// register-held, and must not be the target of an uncommitted deferred
-    /// store.  Anything else takes the ordinary two-register path unchanged.
+    /// register-held, and it refuses while ANY deferred store/memfold is
+    /// still outstanding.  Anything else takes the ordinary two-register
+    /// path unchanged.
     /// A `GlobalAddr` is a pure ADDRESS computation; the forwarding pass that
     /// produced it already proved the object's bytes are readable at this
     /// program point, so reading them as src2 cannot introduce a fault.
@@ -142,9 +143,11 @@ impl X86Codegen {
         // A deferred store or memfold is an UNCOMMITTED write whose flush
         // could land between this instruction's two memory reads.  The IR
         // alias proof already excludes writes to this object, but a
-        // pending emitter-level write is not visible to that pass, so refuse
-        // the fold while ANY is outstanding.  Fail-closed, and measured to
-        // cost nothing on the 192 runtime mask-compare cases.
+        // pending emitter-level write is not visible to that pass.  The
+        // guard is deliberately COARSE (ANY pending write, not just one
+        // targeting this global): a per-object emitter alias map does not
+        // exist and would cost an extra lookup per compare.  Measured to
+        // cost nothing on the 192 runtime cases, so fail-closed wins.
         if self.state.pending_vec_store.is_some() || self.state.pending_vec_memfold.is_some() {
             return None;
         }
@@ -199,6 +202,41 @@ impl X86Codegen {
         }
         self.state.vec_evict_bank(reg);
         true
+    }
+
+    /// Narrowest `kmov*` for a `vpcmp*` result, chosen from the LANE COUNT.
+    ///
+    /// An EVEX mask write leaves the destination k register's bits above KL
+    /// zero, so a 4-byte VEX `kmovw` (KL <= 16) or `kmovd` (KL <= 32) returns
+    /// the bit-identical 64-bit integer that the 5-byte EVEX `kmovq %k1,
+    /// %rax` returns.  The x86-64 ISA zero-extends every 32-bit GPR write, so
+    /// `%eax` already holds the full result in `%rax` for `store_rax_to`.
+    /// The zeroing assumption is not taken on faith: all 485 cases agree with
+    /// GCC 16.2 (`kmovq`) and Clang 23.1.5 (narrow forms), and GDB 18.1 shows
+    /// identical `rax` for the 512/32 `kmovw` and 256/8 `kmovd` cases.
+    ///
+    /// GCC 16.2 always emits `kmovq`; Clang 23.1.5 emits the narrow forms.
+    /// On the 192 runtime compare functions this removes 176 bytes of EVEX
+    /// prefix: LCCC 5312 -> 5136 bytes vs GCC 5308 / Clang 5208 (-3.2% / -1.4%).
+    /// Unknown mnemonics or a missing width fail CLOSED to `kmovq`.
+    fn mask_compare_kmov(inst: &str, vector_bytes: usize) -> (&'static str, &'static str) {
+        let elem_bits = match inst {
+            "vpcmpub" | "vpcmpb" => 8,
+            "vpcmpuw" | "vpcmpw" => 16,
+            "vpcmpud" | "vpcmpd" => 32,
+            "vpcmpuq" | "vpcmpq" => 64,
+            _ => return ("kmovq", "rax"),
+        };
+        // 8 * bytes / bits: all callers pass 16/32/64, so this cannot divide
+        // by zero (elem_bits is a non-zero literal) and cannot overflow.
+        let lanes = (vector_bytes * 8) / elem_bits;
+        if lanes <= 16 {
+            ("kmovw", "eax")
+        } else if lanes <= 32 {
+            ("kmovd", "eax")
+        } else {
+            ("kmovq", "rax")
+        }
     }
 
     /// Immediate value of an operand (for $imm forms).
@@ -1689,7 +1727,7 @@ impl X86Codegen {
             | CmpeqEpu32Mask512 | CmpEpu32Mask128 | CmpEpu32Mask256 | CmpEpi32Mask512
             | CmpEpi32Mask128 | CmpEpi32Mask256 | CmpeqEpu64Mask512 | CmpEpu64Mask128
             | CmpEpu64Mask256 | CmpEpi64Mask512 | CmpEpi64Mask128 | CmpEpi64Mask256 => {
-                // args: (a, b, imm) — vpcmp* $imm, src2, src1, %k1; kmovq %k1, %rax
+                // args: (a, b, imm) — vpcmp* $imm, src2, src1, %k1; narrowest kmov*
                 //
                 // RED-TEAM, two rounds with OPPOSITE measured verdicts:
                 // * Round 10 folded B via the STACK-SLOT `evex_arg_mem` gate.
@@ -1735,7 +1773,10 @@ impl X86Codegen {
                         inst, imm, reg_b, reg_a
                     ));
                 }
-                self.state.emit("    kmovq %k1, %rax");
+                let (kmov, kmov_dst) =
+                    Self::mask_compare_kmov(inst, op.mask_compare_vector_width().unwrap_or(64));
+                self.state
+                    .emit_fmt(format_args!("    {} %k1, %{}", kmov, kmov_dst));
                 if let Some(d) = dest {
                     self.store_rax_to(d);
                 }
@@ -2746,5 +2787,122 @@ mod mask_cmp_global_mem_tests {
         state.vec_evict_bank("zmm0");
         assert_eq!(state.vec_live_regs.len(), 1, "u32::MAX must NOT survive");
         assert_eq!(state.vec_live_regs.get(&3), Some(&"zmm3"));
+    }
+}
+
+#[cfg(test)]
+mod mask_compare_kmov_tests {
+    use super::*;
+    use crate::ir::intrinsics::IntrinsicOp as O;
+
+    /// Exhaustive parity: every one of the 24 mask-compare opcodes at its
+    /// three widths must select the narrowest move that still covers KL, and
+    /// `mask_compare_vector_width` must agree with the emitter's register
+    /// class.  A wrong lane count would truncate the returned mask, which the
+    /// 485-case three-way oracle catches; this test pins the *reason*.
+    #[test]
+    fn every_opcode_and_width_selects_a_covering_kmov() {
+        let ops = [
+            O::CmpeqEpu8Mask128,
+            O::CmpEpi8Mask128,
+            O::CmpeqEpu8Mask256,
+            O::CmpEpi8Mask256,
+            O::CmpeqEpu8Mask512,
+            O::CmpEpi8Mask512,
+            O::CmpeqEpu16Mask512,
+            O::CmpEpu16Mask128,
+            O::CmpEpu16Mask256,
+            O::CmpEpi16Mask512,
+            O::CmpEpi16Mask128,
+            O::CmpEpi16Mask256,
+            O::CmpeqEpu32Mask512,
+            O::CmpEpu32Mask128,
+            O::CmpEpu32Mask256,
+            O::CmpEpi32Mask512,
+            O::CmpEpi32Mask128,
+            O::CmpEpi32Mask256,
+            O::CmpeqEpu64Mask512,
+            O::CmpEpu64Mask128,
+            O::CmpEpu64Mask256,
+            O::CmpEpi64Mask512,
+            O::CmpEpi64Mask128,
+            O::CmpEpi64Mask256,
+        ];
+        for op in ops {
+            let bytes = op
+                .mask_compare_vector_width()
+                .expect("every mask-compare opcode has a width");
+            // Independently derive the mnemonic from the emitter's own table.
+            let inst = match op {
+                O::CmpeqEpu8Mask128
+                | O::CmpeqEpu8Mask256
+                | O::CmpeqEpu8Mask512
+                | O::CmpEpu8Mask128
+                | O::CmpEpu8Mask256
+                | O::CmpEpu8Mask512 => "vpcmpub",
+                O::CmpEpi8Mask128 | O::CmpEpi8Mask256 | O::CmpEpi8Mask512 => "vpcmpb",
+                O::CmpeqEpu16Mask512 | O::CmpEpu16Mask128 | O::CmpEpu16Mask256 => "vpcmpuw",
+                O::CmpEpi16Mask512 | O::CmpEpi16Mask128 | O::CmpEpi16Mask256 => "vpcmpw",
+                O::CmpeqEpu32Mask512 | O::CmpEpu32Mask128 | O::CmpEpu32Mask256 => "vpcmpud",
+                O::CmpEpi32Mask512 | O::CmpEpi32Mask128 | O::CmpEpi32Mask256 => "vpcmpd",
+                O::CmpeqEpu64Mask512 | O::CmpEpu64Mask128 | O::CmpEpu64Mask256 => "vpcmpuq",
+                O::CmpEpi64Mask512 | O::CmpEpi64Mask128 | O::CmpEpi64Mask256 => "vpcmpq",
+                _ => unreachable!(),
+            };
+            let (kmov, dst) = X86Codegen::mask_compare_kmov(inst, bytes);
+            let elem_bits: usize = match inst {
+                "vpcmpub" | "vpcmpb" => 8,
+                "vpcmpuw" | "vpcmpw" => 16,
+                "vpcmpud" | "vpcmpd" => 32,
+                _ => 64,
+            };
+            let lanes = bytes * 8 / elem_bits;
+            let bits = match kmov {
+                "kmovw" => 16,
+                "kmovd" => 32,
+                "kmovq" => 64,
+                _ => panic!("unknown kmov {kmov}"),
+            };
+            assert!(bits >= lanes, "{op:?}: KL={lanes} does not fit in {kmov}");
+            // Minimality: stepping DOWN one size must under-cover KL.
+            assert!(
+                bits == 16 || (bits >> 1) < lanes,
+                "{op:?}: {kmov} is not the narrowest covering move"
+            );
+            assert_eq!(dst, if kmov == "kmovq" { "rax" } else { "eax" });
+        }
+    }
+
+    /// Fail-closed unknowns and the exact 512-bit/8-bit `kmovq` boundary.
+    #[test]
+    fn unknown_or_widest_shapes_keep_the_64_bit_move() {
+        assert_eq!(
+            X86Codegen::mask_compare_kmov("vpcmpb", 64),
+            ("kmovq", "rax")
+        );
+        assert_eq!(
+            X86Codegen::mask_compare_kmov("vpcmpeqb", 64),
+            ("kmovq", "rax")
+        );
+        assert_eq!(
+            X86Codegen::mask_compare_kmov("vpcmpw", 64),
+            ("kmovd", "eax")
+        );
+        assert_eq!(
+            X86Codegen::mask_compare_kmov("vpcmpd", 64),
+            ("kmovw", "eax")
+        );
+        assert_eq!(
+            X86Codegen::mask_compare_kmov("vpcmpq", 32),
+            ("kmovw", "eax")
+        );
+        assert_eq!(
+            X86Codegen::mask_compare_kmov("vpcmpb", 32),
+            ("kmovd", "eax")
+        );
+        assert_eq!(
+            X86Codegen::mask_compare_kmov("vpcmpb", 16),
+            ("kmovw", "eax")
+        );
     }
 }

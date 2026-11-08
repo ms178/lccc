@@ -21,6 +21,8 @@ cd "$ROOT"
 # must be as fatal as a real violation:
 #   1. The verify::verify_after_pass(module, ...) wiring in src/passes/mod.rs
 #      is pinned as a per-pass INVENTORY, not a bare integer: every literal
+#      (`veccopychain` was added with the phase-11b' copy-chain collapse pass;
+#      it is a new IR transform, so its post-pass verifier hook is mandatory)
 #      hook site is counted under its pass name, and the macro funnels (one
 #      source line each, expanding per pass) are pinned separately.  Adding
 #      or dropping a hook therefore fails with the pass name in the message,
@@ -60,6 +62,7 @@ WANT_LITERAL=$(sort -k2 <<'EOF'
 2 sret_copy_elision
 1 vec_interleave_late
 1 vecaddr
+1 veccopychain
 1 vecfma
 1 vecrelations
 1 vecssa
@@ -88,7 +91,7 @@ for funnel in iphase_dump o1_checkpoint preloop_dump timed_pass; do
     grep -q "macro_rules! $funnel" src/passes/mod.rs \
         || { echo "FAIL: hook funnel $funnel is gone from src/passes/mod.rs" >&2; exit 1; }
 done
-WANT_HOOKS=38
+WANT_HOOKS=39
 if [ "$HOOKS" -ne "$WANT_HOOKS" ]; then
     echo "FAIL: $HOOKS verify::verify_after_pass hooks in src/passes/mod.rs, pinned at $WANT_HOOKS." >&2
     echo "      If a pass hook was added/removed on purpose, update WANT_HOOKS in this same change." >&2

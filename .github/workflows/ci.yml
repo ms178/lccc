@@ -3619,6 +3619,7 @@ jobs:
         mkdir -p target/maskfacts-receipts
         python3 scripts/check_maskfacts_vl_matrix.py \
           --asm-dir target/maskfacts-receipts/asm \
+          --require-code-size-parity \
           --json target/maskfacts-receipts/matrix.json
         python3 scripts/maskfacts_function_census.py \
           --asm-dir target/maskfacts-receipts/asm \

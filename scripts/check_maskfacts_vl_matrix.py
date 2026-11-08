@@ -586,6 +586,36 @@ def check_immediate_diagnostics(tmp: Path, execute: bool = True) -> tuple[list[s
 BAD_GAS_MASK = re.compile(r"\{(?!%)k[0-7]\}")
 
 
+def runtime_code_sizes(obj: Path, names: list[str]) -> dict[str, int]:
+    """Per-function byte sizes from the ELF symtab, via binutils `nm -S`."""
+    cp = run(["nm", "-S", "--defined-only", str(obj)], timeout=120)
+    if cp.returncode != 0:
+        raise RuntimeError(f"nm -S failed on {obj}: {cp.stderr[-400:]}")
+    want = set(names)
+    sizes: dict[str, int] = {}
+    for line in cp.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[-1] in want:
+            try:
+                sizes[parts[-1]] = int(parts[1], 16)
+            except ValueError:
+                continue
+    return sizes
+
+
+def compare_code_sizes(totals: dict[str, int]) -> list[str]:
+    """Pure, self-testable ratchet: LCCC ON must not be larger than EITHER
+    pinned reference compiler on the runtime-compare functions."""
+    ours = totals.get("lccc_on")
+    if ours is None:
+        return ["lccc_on code size missing"]
+    bad = []
+    for ref in ("gcc16", "clang23"):
+        if ref in totals and ours > totals[ref]:
+            bad.append(f"lccc_on runtime bytes {ours} > {ref} {totals[ref]}")
+    return bad
+
+
 def check_gas_mask_syntax(asm: dict[str, Path], tmp: Path) -> tuple[list[str], list[str]]:
     """GNU as requires `{%kN}`; LCCC used to emit `{kN}` (assembler error).
 
@@ -697,6 +727,8 @@ def main() -> int:
                     help="mutation test: force maskfacts OFF for the ON build and require failure")
     ap.add_argument("--asm-dir", type=Path,
                     help="persist the four -S receipts for scripts/maskfacts_function_census.py")
+    ap.add_argument("--require-code-size-parity", action="store_true",
+                    help="fail if LCCC ON runtime-compare bytes exceed GCC 16.2 or Clang 23.1.5")
     ap.add_argument("--require-execution", action="store_true",
                     help="FAIL on a host lacking avx512f/bw/vl instead of skipping the executed leg")
     args = ap.parse_args()
@@ -746,6 +778,16 @@ def main() -> int:
                                           "gcc16": good_s, "clang23": good_s}, g)[0]
             assert dirty, "gate missed an invalid decorator"
         print("  GNU-as mask-syntax self-test PASS (reject {kN}, accept {%kN})")
+        # Code-size ratchet must reject every direction of regression.
+        assert compare_code_sizes({"lccc_on": 5136, "gcc16": 5308,
+                                   "clang23": 5208}) == []
+        assert compare_code_sizes({"lccc_on": 5309, "gcc16": 5308,
+                                   "clang23": 5208}), "GCC regression missed"
+        assert compare_code_sizes({"lccc_on": 5209, "gcc16": 5308,
+                                   "clang23": 5208}), "Clang regression missed"
+        assert compare_code_sizes({"gcc16": 5308, "clang23": 5208}), \
+            "missing lccc_on must fail closed"
+        print("  code-size ratchet self-test PASS (both oracles + fail-closed)")
         # The mutation is precisely the vacuous-harness failure: an ON build
         # that behaves like OFF must be REJECTED by evaluate().
         with tempfile.TemporaryDirectory(prefix="maskfacts_vl_selftest_") as td:
@@ -775,10 +817,43 @@ def main() -> int:
         )
         failures, notes = evaluate(res)
         gas_failures, gas_notes = check_gas_mask_syntax(res["asm"], tmp)
+        size_failures: list[str] = []
+        size_notes: list[str] = []
+        if args.require_code_size_parity and not gas_failures:
+            # Reuse the census's exact definition instead of a second parser.
+            from importlib.util import module_from_spec, spec_from_file_location
+            spec = spec_from_file_location(
+                "maskfacts_census_for_sizes",
+                str(ROOT / "scripts" / "maskfacts_function_census.py"))
+            census = module_from_spec(spec)
+            sys.modules[spec.name] = census
+            spec.loader.exec_module(census)
+            bodies, aliases = census.parse(res["asm"]["lccc_on"])
+            resolve = census.resolver(bodies, aliases)
+            names = [n for n in res["names"] if n.startswith("rt_")
+                     and any(m.startswith("vpcmp") for m in resolve(n))]
+            totals: dict[str, int] = {}
+            for label in ("lccc_on", "lccc_off", "gcc16", "clang23"):
+                sizes = runtime_code_sizes(tmp / f"{label}_gas.o", names)
+                if len(sizes) != len(names):
+                    size_failures.append(
+                        f"{label}: nm resolved {len(sizes)}/{len(names)} runtime functions"
+                    )
+                totals[label] = sum(sizes.values())
+            size_notes.append(
+                "runtime bytes: " + " ".join(f"{k}={v}" for k, v in sorted(totals.items()))
+            )
+            size_failures += compare_code_sizes(totals)
+            if not size_failures:
+                size_notes.append(
+                    f"PASS: lccc_on {totals['lccc_on']} bytes <= "
+                    f"gcc16 {totals['gcc16']} and clang23 {totals['clang23']}"
+                )
         diag_failures, diag_notes = check_immediate_diagnostics(tmp, execute=supported)
         sig_failures, sig_notes = check_public_set1_signature_parity()
-        failures += gas_failures + diag_failures + sig_failures
+        failures += gas_failures + size_failures + diag_failures + sig_failures
         notes += [f"assembler: {n}" for n in gas_notes]
+        notes += [f"code size: {n}" for n in size_notes]
         notes += [f"immediate: {n}" for n in diag_notes]
         notes += [f"signature: {n}" for n in sig_notes]
         if args.json:
@@ -792,6 +867,10 @@ def main() -> int:
                 },
                 "execution_skipped": res.get("execution_skipped", False),
                 "gas_mask_syntax": {"failures": gas_failures, "notes": gas_notes},
+                "runtime_code_size": {
+                    "required": bool(args.require_code_size_parity),
+                    "failures": size_failures, "notes": size_notes,
+                },
                 "immediate_diagnostics": {"failures": diag_failures, "notes": diag_notes},
                 "set1_signature_parity": {"failures": sig_failures, "notes": sig_notes},
                 "failures": failures,
