@@ -1312,7 +1312,8 @@ fn pointer_root_analysis(func: &IrFunction) -> PointerRootAnalysis {
                 | Instruction::Cast {
                     dest,
                     src: Operand::Value(source),
-                    ..
+                    from_ty: IrType::Ptr,
+                    to_ty: IrType::Ptr,
                 } => rules.push(RootRule::Unary {
                     dest: dest.0,
                     source: source.0,
@@ -1568,78 +1569,6 @@ fn roots_proven_distinct(lhs: PointerRoot, rhs: PointerRoot) -> bool {
     }
 }
 
-struct LocalAliasFacts {
-    /// Vector-sized allocas whose address cannot be recovered through memory or
-    /// opaque code.
-    nonescaping: FxHashSet<u32>,
-    /// Conservative address-influence relation: value -> possible alloca roots.
-    owners: FxHashMap<u32, Vec<u32>>,
-}
-
-fn local_alias_facts(
-    func: &IrFunction,
-    allocas: &FxHashMap<u32, AllocaInfo>,
-    conservative_graph: &FxHashMap<u32, Vec<u32>>,
-) -> LocalAliasFacts {
-    let roots: Vec<u32> = allocas
-        .iter()
-        .filter_map(|(&value, info)| matches!(info.size, 16 | 32 | 64).then_some(value))
-        .collect();
-    let mut nonescaping: FxHashSet<u32> = roots.iter().copied().collect();
-    let mut owners = FxHashMap::with_capacity_and_hasher(roots.len() * 2, Default::default());
-    for root in roots {
-        for alias in alias_closure(root, conservative_graph) {
-            owners.entry(alias).or_insert_with(Vec::new).push(root);
-        }
-    }
-
-    let escape_value =
-        |value: u32, nonescaping: &mut FxHashSet<u32>, owners: &FxHashMap<u32, Vec<u32>>| {
-            if let Some(roots) = owners.get(&value) {
-                for root in roots {
-                    nonescaping.remove(root);
-                }
-            }
-        };
-    let escape_operand =
-        |operand: &Operand, nonescaping: &mut FxHashSet<u32>, owners: &FxHashMap<u32, Vec<u32>>| {
-            if let Operand::Value(value) = operand {
-                escape_value(value.0, nonescaping, owners);
-            }
-        };
-
-    for block in &func.blocks {
-        for inst in &block.instructions {
-            match inst {
-                Instruction::Store { val, .. } => escape_operand(val, &mut nonescaping, &owners),
-                Instruction::AtomicStore { val, .. } | Instruction::AtomicRmw { val, .. } => {
-                    escape_operand(val, &mut nonescaping, &owners)
-                }
-                Instruction::AtomicCmpxchg {
-                    expected, desired, ..
-                } => {
-                    escape_operand(expected, &mut nonescaping, &owners);
-                    escape_operand(desired, &mut nonescaping, &owners);
-                }
-                Instruction::Call { .. }
-                | Instruction::CallIndirect { .. }
-                | Instruction::InlineAsm { .. }
-                | Instruction::StackRestore { .. } => {
-                    inst.for_each_used_value(|value| escape_value(value, &mut nonescaping, &owners))
-                }
-                _ => {}
-            }
-        }
-        block
-            .terminator
-            .for_each_used_value(|value| escape_value(value, &mut nonescaping, &owners));
-    }
-    LocalAliasFacts {
-        nonescaping,
-        owners,
-    }
-}
-
 #[derive(Clone, Copy)]
 struct AvailableLoad {
     source: Operand,
@@ -1647,33 +1576,17 @@ struct AvailableLoad {
     producer: (usize, usize),
 }
 
-/// Does a write through `pointer` possibly clobber the object identified by
-/// `target`?  `write_root` is the pointer's own object root when derivable.
-///
-/// A target alloca whose address has never escaped can only be reached by a
-/// pointer that is provably derived from it, so a write through an
-/// unrelated/externally-derived pointer cannot touch it.  That refinement
-/// keeps forwards alive across unrelated stores without ever assuming SSA
-/// value inequality proves no-alias.
+/// Unequal values are not a no-alias proof. In particular an unrooted
+/// integer-derived pointer may designate any object, including a local alloca;
+/// absence from an address-influence graph is not proof that it cannot.
 fn write_may_clobber(
-    pointer: Value,
     target: Value,
     write_root: Option<PointerRoot>,
     roots: &FxHashMap<u32, PointerRoot>,
-    local_aliases: &LocalAliasFacts,
 ) -> bool {
-    let target_root = roots.get(&target.0).copied();
-    match (target_root, write_root) {
+    match (roots.get(&target.0).copied(), write_root) {
         (Some(target_root), Some(write_root)) => !roots_proven_distinct(target_root, write_root),
-        (Some(target_root), None) => match target_root {
-            PointerRoot::Alloca(root) if local_aliases.nonescaping.contains(&root) => local_aliases
-                .owners
-                .get(&pointer.0)
-                .is_some_and(|owners| owners.contains(&root)),
-            _ => true,
-        },
-        // The target has no derivable root: fail closed.
-        (None, _) => true,
+        _ => true,
     }
 }
 
@@ -1686,19 +1599,16 @@ fn invalidate_for_value_write(
     available: &mut FxHashMap<u32, AvailableLoad>,
     pointer: Value,
     roots: &FxHashMap<u32, PointerRoot>,
-    local_aliases: &LocalAliasFacts,
 ) {
     let write_root = roots.get(&pointer.0).copied();
     available.retain(|slot, load| {
         // Slots are allocas, so roots[slot] is always Some; the check still
         // fails closed if that invariant ever breaks.
-        if write_may_clobber(pointer, Value(*slot), write_root, roots, local_aliases) {
+        if write_may_clobber(Value(*slot), write_root, roots) {
             return false;
         }
         match load.source {
-            Operand::Value(source) => {
-                !write_may_clobber(pointer, source, write_root, roots, local_aliases)
-            }
+            Operand::Value(source) => !write_may_clobber(source, write_root, roots),
             // A constant source denotes a fixed (absolute) address.  The only
             // write that PROVABLY cannot reach it is one confined to an
             // alloca-derived pointer: a fresh stack alloca can never equal a
@@ -1723,14 +1633,13 @@ fn invalidate_for_memory_effects(
     inst: &Instruction,
     available: &mut FxHashMap<u32, AvailableLoad>,
     roots: &FxHashMap<u32, PointerRoot>,
-    local_aliases: &LocalAliasFacts,
 ) {
     match inst {
         Instruction::Store { ptr, volatile, .. } => {
             if *volatile {
                 available.clear();
             } else {
-                invalidate_for_value_write(available, *ptr, roots, local_aliases);
+                invalidate_for_value_write(available, *ptr, roots);
             }
         }
         Instruction::Load { volatile: true, .. }
@@ -1741,24 +1650,22 @@ fn invalidate_for_memory_effects(
         Instruction::GetStaticChain { .. }
         | Instruction::SetStaticChain { .. }
         | Instruction::NonlocalGoto { .. } => {}
-        Instruction::Memcpy { dest, .. } => {
-            invalidate_for_value_write(available, *dest, roots, local_aliases)
-        }
+        Instruction::Memcpy { dest, .. } => invalidate_for_value_write(available, *dest, roots),
         Instruction::VaArg { va_list_ptr, .. }
         | Instruction::VaStart { va_list_ptr }
         | Instruction::VaEnd { va_list_ptr } => {
-            invalidate_for_value_write(available, *va_list_ptr, roots, local_aliases)
+            invalidate_for_value_write(available, *va_list_ptr, roots)
         }
         Instruction::VaCopy { dest_ptr, .. } => {
-            invalidate_for_value_write(available, *dest_ptr, roots, local_aliases)
+            invalidate_for_value_write(available, *dest_ptr, roots)
         }
         Instruction::VaArgStruct {
             dest_ptr,
             va_list_ptr,
             ..
         } => {
-            invalidate_for_value_write(available, *dest_ptr, roots, local_aliases);
-            invalidate_for_value_write(available, *va_list_ptr, roots, local_aliases);
+            invalidate_for_value_write(available, *dest_ptr, roots);
+            invalidate_for_value_write(available, *va_list_ptr, roots);
         }
         Instruction::AtomicRmw { .. }
         | Instruction::AtomicInc { .. }
@@ -1767,7 +1674,7 @@ fn invalidate_for_memory_effects(
         Instruction::Intrinsic {
             dest_ptr: Some(pointer),
             ..
-        } => invalidate_for_value_write(available, *pointer, roots, local_aliases),
+        } => invalidate_for_value_write(available, *pointer, roots),
         Instruction::Intrinsic {
             op, dest_ptr: None, ..
         } => {
@@ -1890,8 +1797,6 @@ fn fuse_in_function(func: &mut IrFunction) -> usize {
         roots,
         recurrence_derived,
     } = pointer_root_analysis(func);
-    let (_, conservative_graph) = build_alias_graphs(func);
-    let local_aliases = local_alias_facts(func, &allocas, &conservative_graph);
     let read_sites = single_read_sites(func, &allocas);
     let mut plans: Vec<Vec<LoadPatch>> = vec![Vec::new(); func.blocks.len()];
 
@@ -1936,7 +1841,7 @@ fn fuse_in_function(func: &mut IrFunction) -> usize {
                         available.remove(&value.0);
                     }
                 }
-                invalidate_for_value_write(&mut available, destination, &roots, &local_aliases);
+                invalidate_for_value_write(&mut available, destination, &roots);
 
                 if let Some(source) = effective_source {
                     if args.len() == 1
@@ -2005,7 +1910,7 @@ fn fuse_in_function(func: &mut IrFunction) -> usize {
                     available.remove(&value);
                 }),
             }
-            invalidate_for_memory_effects(inst, &mut available, &roots, &local_aliases);
+            invalidate_for_memory_effects(inst, &mut available, &roots);
         }
     }
 
@@ -3852,6 +3757,148 @@ mod tests {
                 index: 0,
                 noalias: false
             })
+        );
+    }
+
+    #[test]
+    fn pointer_root_casts_require_pointer_preserving_types() {
+        for (from_ty, to_ty, keeps_root) in [
+            (IrType::Ptr, IrType::Ptr, true),
+            (IrType::Ptr, IrType::U32, false),
+            (IrType::Ptr, IrType::U64, false),
+            (IrType::U32, IrType::Ptr, false),
+            (IrType::U64, IrType::Ptr, false),
+        ] {
+            let function = function(
+                "cast_root",
+                vec![block(
+                    0,
+                    vec![
+                        alloca(50, 4, 4),
+                        Instruction::Cast {
+                            dest: Value(51),
+                            src: Operand::Value(Value(50)),
+                            from_ty,
+                            to_ty,
+                        },
+                    ],
+                )],
+            );
+            assert_eq!(
+                pointer_root_analysis(&function).roots.get(&51).copied(),
+                keeps_root.then_some(PointerRoot::Alloca(50)),
+                "{from_ty:?} -> {to_ty:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn narrowing_pointer_cast_does_not_prove_an_alloca_root() {
+        let mut function = function(
+            "truncated_pointer_clobber",
+            vec![block(
+                0,
+                vec![
+                    alloca(0, 32, 32),
+                    alloca(50, 4, 4),
+                    Instruction::Cast {
+                        dest: Value(51),
+                        src: Operand::Value(Value(50)),
+                        from_ty: IrType::Ptr,
+                        to_ty: IrType::U32,
+                    },
+                    Instruction::Cast {
+                        dest: Value(52),
+                        src: Operand::Value(Value(51)),
+                        from_ty: IrType::U32,
+                        to_ty: IrType::Ptr,
+                    },
+                    intrinsic(
+                        Some(1),
+                        IntrinsicOp::Loadu256,
+                        Some(0),
+                        vec![Operand::Const(IrConst::I64(4096))],
+                    ),
+                    Instruction::Store {
+                        val: Operand::Const(IrConst::I32(1)),
+                        ptr: Value(52),
+                        ty: IrType::I32,
+                        seg_override: AddressSpace::Default,
+                        volatile: false,
+                    },
+                    intrinsic(
+                        Some(2),
+                        IntrinsicOp::Pcmpeqb256,
+                        Some(20),
+                        vec![Operand::Value(Value(0)), Operand::Value(Value(21))],
+                    ),
+                ],
+            )],
+        );
+        let roots = pointer_root_analysis(&function).roots;
+        assert_eq!(
+            fuse_in_function(&mut function),
+            0,
+            "unknown write must block forwarding"
+        );
+        assert!(
+            !roots.contains_key(&51),
+            "narrow integer cast is not pointer-preserving"
+        );
+        assert!(
+            !roots.contains_key(&52),
+            "integer-to-pointer cast may alias anything"
+        );
+    }
+
+    #[test]
+    fn unknown_integer_pointer_write_may_alias_local_vector_source() {
+        let mut function = function(
+            "integer_pointer_clobber",
+            vec![block(
+                0,
+                vec![
+                    alloca(0, 32, 32),
+                    alloca(10, 32, 32),
+                    alloca(50, 4, 4),
+                    Instruction::Cast {
+                        dest: Value(51),
+                        src: Operand::Value(Value(50)),
+                        from_ty: IrType::Ptr,
+                        to_ty: IrType::U32,
+                    },
+                    Instruction::Cast {
+                        dest: Value(52),
+                        src: Operand::Value(Value(51)),
+                        from_ty: IrType::U32,
+                        to_ty: IrType::Ptr,
+                    },
+                    intrinsic(
+                        Some(1),
+                        IntrinsicOp::Loadu256,
+                        Some(0),
+                        vec![Operand::Value(Value(10))],
+                    ),
+                    Instruction::Store {
+                        val: Operand::Const(IrConst::I32(1)),
+                        ptr: Value(52),
+                        ty: IrType::I32,
+                        seg_override: AddressSpace::Default,
+                        volatile: false,
+                    },
+                    intrinsic(
+                        Some(2),
+                        IntrinsicOp::Pcmpeqb256,
+                        Some(20),
+                        vec![Operand::Value(Value(0)), Operand::Value(Value(21))],
+                    ),
+                ],
+            )],
+        );
+        assert_eq!(
+            fuse_in_function(&mut function),
+            0,
+            "unknown write must block forwarding"
         );
     }
 
