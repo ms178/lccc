@@ -17,9 +17,9 @@
 //!    is 0 without `-fsanitize=address`, because the capability is absent from
 //!    the TU rather than merely non-standard.
 //! 3. **Standard in this dialect?**  The dialect gate applies to the *feature*
-//!    answer only.  `__has_feature(c_atomic)` is 0 in C99 while
-//!    `__has_extension(c_atomic)` is 1: the compiler still accepts `_Atomic`
-//!    there as an extension.  `-pedantic-errors` rejects extensions, so it
+//!    answer only.  `__has_feature(c_generic_selections)` is 0 in C99 while
+//!    `__has_extension(c_generic_selections)` is 1: the compiler still accepts
+//!    `_Generic` there as an extension.  `-pedantic-errors` rejects extensions, so it
 //!    collapses the extension answer onto the feature answer.
 //!    `-Werror=pedantic` alone does NOT: it upgrades diagnostics, it does not
 //!    withdraw the extension.
@@ -196,7 +196,7 @@ pub(super) fn resolve(name: &str, extension: bool, mode: FeatureMode) -> bool {
         Requires::Ubsan => {}
     }
     // `__has_extension` without -pedantic-errors asks only "is it available?",
-    // which is dialect-independent: C99 still accepts _Atomic as an extension.
+    // which is dialect-independent: C99 still accepts _Generic as an extension.
     if extension && !mode.pedantic_errors {
         return true;
     }
