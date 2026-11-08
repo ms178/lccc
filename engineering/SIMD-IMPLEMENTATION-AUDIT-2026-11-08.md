@@ -1131,3 +1131,282 @@ fetched (Intel's PPA and document hosts are outside the sandbox allowlist);
 the byte-exact executable oracles are the stronger authority for the
 specific encodings changed here, and the missing full-SDM consultation is
 recorded as a limitation rather than asserted.
+
+## 9c.10 SA burn-down round (2026-11-05 session, branch `arena/82457fca-lccc`)
+
+This section records what was **verified in code and changed** in this round.
+It also corrects two stale status claims in this document.  Nothing here is
+carried over from a previous session's notes: each row was re-read at the
+current `main` (`a7f2c9b`) before being acted on.
+
+### 9c.10.1 Status corrections — the header and §9c.7 were stale
+
+The document header and §9c.7 both assert that **SA-03 / SA-04 / SA-05 / SA-33
+"remain open as filed"**.  Re-reading the classifier shows the first two were
+already fixed by a later commit, each with a named ratchet row:
+
+| ID | Claim in §9c.7 | Verified state at `a7f2c9b` | Evidence |
+|----|----------------|------------------------------|----------|
+| SA-03 | open | **already fixed** | `expr_builtins_lcccsimd.rs:553` lists `vmovdqu64_load`/`vmovdqu64_store` in the `evex` predicate, with a comment naming SA-03 and recording the 354-key mechanical sweep; ratchet rows at `:1056-1057` expect `[Avx512F]` |
+| SA-04 | open | **already fixed** | `BW_EXACT` at `:633` carries `vpshuflw512`/`vpshufhw512` (exact names, not stems, because the legacy 128/256 spellings are *not* BW); ratchet rows at `:1059-1060` expect `[Avx512F, Avx512Bw]` |
+| SA-05 | open | **confirmed open, fixed this round** | `intrinsics_simd.rs` passed `commutative = true` for `Pmaddubsw512` |
+| SA-33 | open | **confirmed open, fixed this round** | `emit_simd_op` inferred the obligation from `format!("{:?}").contains("256"/"512")` |
+
+The rows live in `avx512_permissions_are_subset_and_encoding_specific`, so the
+two closed findings are gate-protected, not just edited.  §9c.7's sentence is
+left in place as the historical record and superseded here rather than rewritten.
+
+### 9c.10.2 SA-05 — fixed, and the whole 512-bit dispatcher audited
+
+`vpmaddubsw` reads **vvvv as UNSIGNED bytes and r/m as SIGNED bytes** (Intel SDM
+Vol. 2).  In AT&T order `vpmaddubsw src2, src1, dst` the register slot is src1,
+so IR `args[0]` must reach the register.  `commutative = true` selected the
+`(Some(m0), _)` arm whenever `args[0]` was foldable — the common
+`_mm512_maddubs_epi16(_mm512_loadu_si512(p), w)` shape — putting `args[1]` in
+vvvv and the unsigned stream in r/m, i.e. computing `u(args[1]) * s(args[0])`.
+Every lane product with a high bit set in either byte would be wrong.
+**Reachability matters and is measured below (§9c.10.8): this arm is currently
+unreachable from C, so SA-05 is a LATENT soundness defect, not a demonstrated
+active miscompile.**  The register's own `S` grade was right not to claim `R`.
+
+Rather than flip one boolean, **all 67 `emit_evex_binary_512` dispatch arms were
+extracted and classified** (39 `true`, 28 `false`).  Exactly one was
+asymmetric: `vpmaddubsw`.  The other 38 are genuinely symmetric — lane
+add/sub-free arithmetic, saturating add, bitwise, integer min/max, `pavg*`
+(`(a+b+1)>>1`), `pcmpeq*`, `pmaddwd`, the `pmul*` family and `psadbw` (`|a-b|`).
+The 128-bit allowlist already excluded `pmaddubsw` and the 256-bit twin already
+passed `false` with the hazard documented; only the 512-bit arm had drifted.
+
+Folding the **right** (signed) operand is still legal and still happens through
+the `(None, Some(m1))` arm, so the fix costs no instruction in the safe
+direction.  A unit control (`maddwd512_still_folds_the_left_operand_...`) pins
+that, so a blanket `false` cannot pass as a fix.
+
+### 9c.10.3 SA-36 — found by the new gate, not by reading
+
+The new cross-width gate immediately reported a **second** disagreement:
+`pmaddwd` was `true` at 512 but `false` at 256 and absent from the 128-bit
+allowlist.  The 256-bit comment justified it as "order-preserving … for the same
+discipline as maddubs" — a rationale copied from the neighbouring arm that does
+not apply: PMADDWD multiplies two **signed** word streams, so the products
+commute.  The conservative flag bought no safety and cost the left-operand
+memory fold.  Fixed at both 128 and 256.  This is a missed-optimization fix, not
+a correctness fix, and it is labelled as such.
+
+### 9c.10.4 SA-33 — fixed at the physical write, not by growing a name list
+
+`emit_simd_op` armed `dirty_upper_ymm` from `format!("{:?}", op)` and a
+`contains("256") || contains("512")` test.  Enumerating the dispatcher's 348
+distinct variants showed **130** whose names carry no width digit.  Most are
+128-bit SSE ops that correctly must not arm, but these write ymm/zmm and were
+silently missed: `InsertI32x8`, `InsertI64x4`, `ExtractI32x8`, `ExtractI64x4`,
+`PermutexvarEp32/64`, the four `Broadcast*` forms and the maskz insert/extract
+family.
+
+Adding those names to a list would reproduce the defect on the next variant.  **Also a latent defect, not a demonstrated C-observable one — see §9c.10.9.**
+Instead the obligation is now armed where the wide register is **actually
+written**, which is the discipline `avx_load_arg_to` already documents ("arm …
+once, here, so no path can forget it"):
+
+| choke point | covers | status |
+|---|---|---|
+| `avx_load_arg_to` | 256-bit scratch loads | pre-existing |
+| `avx_store_dest_from` | 256-bit results | pre-existing |
+| `evex_load_arg_to` | 256/512-bit scratch loads | **added** |
+| `vec_claim_live_reg` | any ymm/zmm result home (both backends) | **added** |
+
+Coverage was then argued **by helper, not by opcode**: every EVEX helper reached
+from the dispatcher either loads through `evex_load_arg_to`, stores through
+`evex_store_dest` (which claims `zmm0`), or claims its destination register
+directly — verified for `emit_evex_insert_512`, `emit_evex_extract_512`,
+`emit_evex_mem_broadcast_512`, `emit_evex_gpr_broadcast_512`,
+`emit_maskz_insert_512`, `emit_maskz_extract` and `emit_maskz_set1_512`.  With
+that, the `format!` proxy is redundant and was **deleted**, which also removes
+one heap allocation per intrinsic call from a hot emitter (a partial SA-46 win).
+
+The rule is exact, not conservative-by-name: an **xmm** claim writes only the
+low 128 bits (VEX/EVEX zeroes above) and must *not* arm, so
+`vextracti32x4` into xmm correctly stays unarmed.  `narrow_register_claims_do_not_arm_vzeroupper`
+pins both halves, so "arm on every claim" cannot pass either.
+
+### 9c.10.5 The class gate (SA-45 / SA-49)
+
+`tests/regression/check_simd_commutativity_agreement.py` parses all three
+commutativity authorities and checks three things:
+
+1. **54 asymmetric mnemonics** are never commutative at any width — the
+   correctness half, carrying an explicit Intel SDM reason per name.  Without
+   this a uniformly-wrong table would pass an agreement-only check.
+2. **Symmetric** mnemonics keep their permissive flag at every width — the
+   missed-optimization half, which makes the SA-36 fix permanent.
+3. Any **other** mnemonic that disagrees across widths is still reported, so a
+   newly added instruction cannot drift unnoticed.
+
+It is **fail-closed on parse**: a missing anchor or an empty allowlist exits 2,
+never PASS.  `test_check_simd_commutativity_agreement.py` adds 17 self-tests
+including four mutation tests that reintroduce real defects.
+
+**Non-vacuity, measured:** on a scratch copy with SA-05 reverted the gate reports
+`pmaddubsw (512-bit) … ASYMMETRIC` and exits 1; on the delivered tree it reports
+`PASS (86 operations, 139 width rows, 54 asymmetric + 2 symmetric pinned)`.
+Mutation tests also confirm a `vpsubd`→`true` edit and an unlisted `vpmulld`
+drift are both caught.
+
+Wired into `.github/workflows/ci.yml` (frontend-c), `scripts/ci_local.sh` and
+`.github/ci-lane-plan.json` (measured 0.041 s / 0.070 s, floored at 0.25 s each
+per the plan's convention).
+
+### 9c.10.6 Verification (all re-measured this round)
+
+| Check | Result |
+|---|---|
+| `scripts/build_lccc_fast.sh` (fastbuild, 4 GiB swap active) | **rc=0, 0 warnings** |
+| `cargo test --lib` strict (`debug-assertions` + `overflow-checks`) | **8526 passed, 0 failed, 10 ignored** |
+| the four new SIMD contracts, by name | **4 passed** |
+| `cargo clippy --all-targets -- -D warnings` | **rc=0, 0 warnings** |
+| `check_simd_commutativity_agreement.py` | **PASS** — 86 operations, 139 width rows |
+| its 17 self-tests | **OK** |
+| `audit_census.py --check` | **PASS**, no metric grew (255 undocumented knobs vs 261 baseline) |
+| `check_ci_lane_plan.py` | **PASS** (2958 s of gate cost, balance in tolerance) |
+| `check_ci_gate_parity.py` | **PASS** (564 commands) |
+| `check_ci_workflow_shell.py` | **PASS** (14 workflows) |
+| `check_ci_shard_partition.py` | **PASS** (86 + 120 gates, disjoint) |
+| `cargo fmt --all -- --check` | **rc=0, 0 diffs** |
+| audit pack vs built LCCC, AVX-512 host | **15/15 PASS**, 0 skipped |
+
+**Non-vacuity of the Rust contracts, measured.** With SA-05 and SA-33 reverted
+in the working tree (`vpmaddubsw` back to `true`, both new arming sites removed),
+the same four tests report **3 failed / 1 passed**:
+
+```
+maddubs512_never_folds_the_unsigned_stream_into_the_signed_slot ... FAILED
+digitless_wide_evex_ops_arm_vzeroupper .......................... FAILED
+narrow_register_claims_do_not_arm_vzeroupper .................... FAILED
+maddwd512_still_folds_the_left_operand_because_it_is_symmetric ... ok
+```
+
+The fourth is the **control** and is *expected* to stay green: `vpmaddwd` at
+512 bits was already `true`, so reverting SA-05/SA-33 must not disturb it.  A
+mutation run where all four fail would mean the tests are coupled to the
+fixture rather than to the defect.  The tree was restored from backup and the
+fixes re-verified afterwards.
+
+### 9c.10.7 SA-53 — why a `fixed` row did not protect SA-05 or SA-33
+
+Both findings already had a driver row tagged **`fixed`** (`sa05`, `sa33_asm`),
+and `sa33_asm` even asserts the exact property that was broken (a `vzeroupper`
+ordered after the insert).  They stayed broken anyway.  The reason is not a weak
+assertion:
+
+**`check_audit_2026-11-08.py` was never run against the built compiler.**
+`.github/workflows/ci.yml` ran `python3 -m unittest discover -s tests/simd`,
+which executes `test_audit_pack.py::test_01_drivers_self_test` — the driver's
+`--self-test` on *synthetic fixtures*.  So the pack validated **itself** on every
+CI run and validated **the compiler** on none.  A `fixed` tag therefore had no
+force at all, which is precisely the SA-53 finding ("no CI-wired intrinsic
+coverage") showing up as a false green rather than as a missing test.
+
+The driver is now invoked in the existing `codegen-a` SIMD step:
+
+```
+python3 tests/simd/check_audit_2026-11-08.py --lccc target/fastbuild/lccc --reference gcc-16
+```
+
+Measured cost **1.63 s** (max of 3), added to that step's `measured_s`
+(5.27 → 6.90) rather than creating a new step, so the shard structure is
+unchanged.  The asm/diag rows (`sa01_asm`, `sa03_asm`, `sa04_diag`, `sa13_asm`,
+`sa33_asm`) need no host ISA and run on any runner; the runtime rows SKIP with an
+explicit reason where AVX-512 is absent.  That SKIP behaviour is also why this
+must not be the *only* guard for SA-05 — the new emitter-level unit contract
+covers it on every host, including the ones where the runtime row skips.
+
+**Measured on this host** (Intel Xeon, `avx512f avx512bw avx512vl` present, so
+nothing skipped): **15/15 rows PASS**, `audit pack green (all controls and former
+findings green)`, exit 0 — including the `sa05` *runtime* differential and
+`sa33_asm`.
+
+### 9c.10.8 Reachability measured — SA-05 is latent, and the `sa05` row is vacuous
+
+The audit pack's `sa05` row is tagged `fixed` and runs a real AVX-512 runtime
+differential on this host.  It was run against **two compilers built from this
+tree**, differing only in the SA-05 boolean:
+
+| arm | `sa05` | `sa05_ctl` | `sa33_asm` | driver exit |
+|---|---|---|---|---|
+| SA-05 reverted (`commutative = true`) | **PASS** | PASS | PASS | 0 |
+| SA-05 fixed (`commutative = false`) | **PASS** | PASS | PASS | 0 |
+
+A `fixed` row that passes on the *broken* compiler is not protecting anything.
+The cause was then measured rather than assumed: **the guarded arm is never
+reached.**  Compiling the reproducer and eleven further kernel shapes with both
+compilers at `-O0`, `-O1` and `-O2` produced **byte-identical assembly** in every
+case, and no shape emitted a memory-folded `vpmaddubsw` at all:
+
+* load-then-consume in one block, `volatile` pointer source (the pack's shape);
+* load in each arm of a branch, consume after the merge;
+* load before a loop, consume inside (loop-carried);
+* `__m512i` array element and global source;
+* by-value `__m512i` parameter, and an eight-parameter spill shape.
+
+The mechanism is structural: `emit_evex_load_512` ends in `evex_store_dest`,
+which calls `vec_claim_live_reg(dest, "zmm0")`, and `evex_arg_mem` **refuses any
+register-held value** (its slot may be stale).  Every 512-bit producer claims
+`zmm0` the same way, so `evex_arg_mem(&args[0])` returns `None` throughout the
+current pipeline.  Confirmed with a positive control: even the genuinely
+commutative `_mm512_add_epi32` never emits a left-folded `vpaddd` from C — the
+whole `(Some(m0), …)` family is presently unreachable, not just this arm.
+
+**Conclusions, stated no stronger than the evidence:**
+
+1. SA-05 is a **latent** wrong-code defect.  The flag is objectively wrong and
+   disagrees with both twins, but no C input reaches it today.  It is fixed
+   because it is one carrier-frame change (SA-34) away from being live: the
+   moment 512-bit values stop being register-claimed, the fold becomes
+   reachable and the swapped roles become silent wrong code.
+2. The **unit contract is the effective guard**, not the C row.  It constructs
+   the slot-homed/unclaimed state directly, so it exercises the arm the
+   frontend cannot currently produce, and it was measured to go red when the
+   boolean is reverted (§9c.10.6).
+3. The `sa05` driver row is **vacuous for this defect** and is recorded as such
+   rather than counted as coverage.  This is an SA-53-class lesson: a runtime
+   row is only coverage if it is shown to fail on the broken compiler.  Wiring
+   the driver into CI (§9c.10.7) is still necessary — it makes the *other* rows
+   load-bearing — but it does not by itself cover SA-05.
+
+### 9c.10.9 SA-33 reachability measured — also masked in the tested C shapes
+
+A third compiler was built with **only** SA-33 reverted (the original
+`format!("{:?}")` proxy restored, both new arming sites removed) and compared
+against the delivered one on the digit-less shapes the finding names:
+
+| shape | before | after | asm |
+|---|---|---|---|
+| `_mm512_inserti32x4` on by-value `__m512i`/`__m128i` params (the pack's `SA33_TU`) | `vzeroupper` present | present | identical |
+| `_mm512_permutexvar_epi32` on by-value params | present | present | identical |
+| permutexvar on two `_mm512_loadu_si512` results, no vector params | present | present | identical |
+| permutexvar returning directly, no vector params | present | present | identical |
+
+`sa33_asm` reports **PASS on both compilers**.  So in these functions the
+obligation is already armed by another path before the epilogue is emitted —
+`dirty_upper_ymm` has eight further writers across `prologue.rs`, `memory.rs`,
+`calls.rs` and `intrinsics.rs` (wide parameter pre-store, inline memcpy/memset
+chunk loops, the 256-bit load/store helpers), and any function that materializes
+a 512-bit value has already passed through one of them.
+
+**Honest classification.** SA-33 is a real defect in the *rule* — a digit-less
+variant genuinely cannot arm the proxy, and the unit contract
+`digitless_wide_evex_ops_arm_vzeroupper` was measured **red** with the proxy
+restored (§9c.10.6) — but no C input tested here makes the missing arm observable,
+because a second writer covers it.  The fix removes the dependence on that
+coincidence: coverage now follows the register written, so it survives a change
+to any of the other eight writers.
+
+**Programme-level lesson (applies to SA-05 and SA-33 alike).** Both were filed as
+`P0 wrong code` / `P1` from source reading alone, and both turn out to be masked
+by a *different* invariant elsewhere in the backend.  That is exactly why §9c.0
+grades them `S` and demands a reproducer first.  Two of this round's most useful
+outputs are therefore negative results: the `sa05` and `sa33_asm` driver rows do
+**not** fail on their own broken compilers, so neither row is coverage for the
+finding it names.  The unit contracts are, and they are mutation-proven.  Any
+future SA row promoted to `R` must record a differential that actually goes red
+on the pre-fix compiler, not merely green on the post-fix one.

@@ -93,6 +93,9 @@ impl X86Codegen {
             // Integer/FP add and mul (wrapping/IEEE lane arithmetic).
             "paddb" | "paddw" | "paddd" | "paddq"
                 | "pmullw" | "pmulld"
+                // Two SIGNED word streams: products commute (SA-36).  NOT
+                // `pmaddubsw`, whose sources differ in signedness.
+                | "pmaddwd"
                 | "addps" | "addpd" | "mulps" | "mulpd"
                 // Bitwise (integer and FP domains alike — pure lane XOR).
                 | "pand" | "por" | "pxor" | "xorps" | "xorpd"
@@ -6646,10 +6649,21 @@ impl X86Codegen {
             IntrinsicOp::VecMaddwdI16x16 => {
                 // Word pair multiply-add (`vpmaddwd`): the Adler-32 epic
                 // sums the maddubs word products with an all-ones table
-                // into dword lanes.  Order-preserving (commutative=false)
-                // for the same discipline as maddubs.
+                // into dword lanes.
+                //
+                // COMMUTATIVE, unlike its `maddubs` neighbour above.  PMADDWD
+                // multiplies two SIGNED word streams and adds the adjacent
+                // products, so exchanging the sources cannot change a lane
+                // (SDM: tmp1 = src1.w0 * src2.w0, tmp2 = src1.w1 * src2.w1).
+                // This arm used to inherit `commutative = false` "for the same
+                // discipline as maddubs", but that discipline exists only
+                // because maddubs' two sources have DIFFERENT signedness.
+                // Here it bought nothing and cost the left-operand memory
+                // fold on every `pmaddwd` whose first source was foldable
+                // (SA-36).  The 512-bit twin already passed `true`; the new
+                // check_simd_commutativity_agreement gate pins all widths.
                 if let Some(d) = dest {
-                    self.emit_avx_binary_256(d, args, "vpmaddwd", false);
+                    self.emit_avx_binary_256(d, args, "vpmaddwd", true);
                 }
             }
             IntrinsicOp::VecConstI8x32 => {

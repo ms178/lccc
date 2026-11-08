@@ -1312,6 +1312,10 @@ jobs:
       run: python3 tests/regression/check_peephole_alloc_before_filter.py
     - name: Verify the allocate-before-filter ratchet contracts
       run: python3 tests/regression/test_check_peephole_alloc_before_filter.py
+    - name: SIMD commutativity must agree across the 128/256/512-bit layers
+      run: python3 tests/regression/check_simd_commutativity_agreement.py
+    - name: Verify the SIMD commutativity ratchet contracts
+      run: python3 tests/regression/test_check_simd_commutativity_agreement.py
     - name: Check builtin_cpu_supports runtime semantics
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_cpu_supports_runtime.sh
     - name: Host-clock macros against the zone database
@@ -1520,6 +1524,12 @@ jobs:
       run: |
         set -euo pipefail
         python3 -m unittest discover -s tests/simd -p 'test_*.py'
+        # SA-53: the audit pack's own self-tests ran here, but the driver was
+        # never run against the built compiler, so its `fixed` rows were
+        # decoration -- SA-05 and SA-33 stayed broken behind green CI.  The
+        # asm/diag rows need no host ISA; the runtime rows SKIP with an
+        # explicit reason where the runner lacks AVX-512.
+        python3 tests/simd/check_audit_2026-11-08.py --lccc target/fastbuild/lccc --reference gcc-16
         python3 tests/simd/check_scoreboard.py --check-clock-failure --lccc target/fastbuild/lccc --reference gcc-16
         python3 tests/simd/check_lightpixel.py --require-native --lccc target/fastbuild/lccc --reference gcc-16
         python3 tests/simd/check_joint_pixels.py --lccc target/fastbuild/lccc --reference gcc-16

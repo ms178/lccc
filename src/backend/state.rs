@@ -1495,6 +1495,22 @@ impl CodegenState {
     /// `reg`, so eviction at the claim is exactly the point where the
     /// previous content provably died.
     pub fn vec_claim_live_reg(&mut self, v: u32, reg: &'static str) {
+        // SA-33: claiming a YMM/ZMM home means the instruction just wrote
+        // bits above 128, so the epilogue/call `vzeroupper` obligation is
+        // armed HERE, at the physical write, rather than inferred from the
+        // opcode's spelling.  `avx_load_arg_to` already uses this discipline
+        // ("so no path can forget it"); the EVEX result path did not, and
+        // `emit_simd_op`'s `format!("{:?}").contains("512")` proxy missed every
+        // digit-less variant -- vinserti32x8, vinserti64x4, vextracti32x8,
+        // vextracti64x4, vpermd/vpermq, the four vbroadcasti* forms and the
+        // maskz insert/extract family all write ymm/zmm and never armed it.
+        //
+        // Keying on the register NAME is exact, not heuristic: an xmm claim
+        // writes only the low 128 bits (VEX/EVEX zeroes above), so it must
+        // NOT arm, and a `vextracti32x4` into xmm correctly stays unarmed.
+        if reg.starts_with("ymm") || reg.starts_with("zmm") {
+            self.dirty_upper_ymm = true;
+        }
         let bank = vector_reg_bank(reg);
         self.vec_live_regs
             .retain(|&other, &mut r| vector_reg_bank(r) != bank || other == v);

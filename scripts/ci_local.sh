@@ -669,6 +669,12 @@ gate "peephole-alloc-before-filter" fast \
 gate "peephole-alloc-before-filter-contracts" fast \
     python3 tests/regression/test_check_peephole_alloc_before_filter.py
 
+gate "simd-commutativity-agreement" fast \
+    python3 tests/regression/check_simd_commutativity_agreement.py
+
+gate "simd-commutativity-agreement-contracts" fast \
+    python3 tests/regression/test_check_simd_commutativity_agreement.py
+
 gate "benchmark-ranking-contracts" fast \
     python3 -m unittest discover -s scripts -p test_bench_rank.py
 

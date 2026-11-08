@@ -2025,6 +2025,16 @@ Section numbers `9c.0`–`9c.8` and all `SA-xx` IDs are stable across it.
 - Coverage (§9c.8): 9/54 findings have an executable row; the driver has
   15 rows (9 open + 6 controls); the shape matrix runs 29 bit-exact shapes
   over 12 optimization/ISA flag sets.
+- Burn-down (§9c.10, 2026-11-05): **SA-05, SA-33 and SA-36 fixed**; SA-03 and
+  SA-04 verified **already fixed** by a later commit (the §9c.7 "remain open"
+  sentence and the document header are stale and are superseded by §9c.10.1,
+  not rewritten).  All 67 `emit_evex_binary_512` arms were classified: exactly
+  one was asymmetric.  SA-33 is now armed at the four physical wide-register
+  write sites instead of a `format!("{:?}")` substring, which also deletes one
+  heap allocation per intrinsic call.  New class gate
+  `check_simd_commutativity_agreement.py` (+17 self-tests) pins all three width
+  layers against 54 asymmetric and 2 symmetric SDM-sourced mnemonics, so
+  SA-45/SA-49 drift is now mechanically caught rather than re-audited by hand.
 
 Edit the audit document, not a copy of the register here, and keep this
 pointer's counters in sync.
