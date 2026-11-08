@@ -27,7 +27,7 @@ CLANG23=${CLANG23:-clang-23}
 # leg is reported as a SKIP rather than faked with a surrogate compiler.
 ICX=${ICX:-icx}
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
-src=$root/tests/regression/cond_load_sink.c
+src=$root/tests/regression/cond_load_sink_cross/host.c
 tmp=${TMPDIR:-/tmp}/lccc-cond-load-sink.$$
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp"
@@ -55,6 +55,15 @@ off_shape_ok() {
     [[ $(printf '%s\n' "$body" | grep -cE '^[[:space:]]*j[a-z]+[[:space:]]') -ge 1 ]] || return 1
 }
 
+# SV-03 must NOT steal `a[i] < b[i] ? a[i] : b[i]` diamonds: their guard
+# already loads both addresses, so sinking would add a third load and break
+# the packed pminud/pmaxud/pminsd SLP idiom.  This predicate is the executable
+# contract for that profitability rule.
+slp_min_ok() {
+    local body=$1 mnemonic=$2
+    [[ $(printf '%s\n' "$body" | grep -cE "\\b(v?)$mnemonic\\b") -ge 1 ]] || return 1
+}
+
 if [[ ${1:-} == --self-test ]]; then
     good_on=$'pick:\n    testl %edx, %edx\n    cmovneq %rdi, %rsi\n    movss (%rsi), %xmm0\n    ret\n.size pick, .-pick'
     good_off=$'pick:\n    testl %edx, %edx\n    je .LBB2\n    movss (%rdi), %xmm2\n    jmp .LBB3\n    movss (%rsi), %xmm2\n    ret\n.size pick, .-pick'
@@ -65,7 +74,12 @@ if [[ ${1:-} == --self-test ]]; then
     ! on_shape_ok "$good_off" || { echo 'self-test: branchy OFF accepted as ON'; exit 1; }
     ! off_shape_ok "$good_on" || { echo 'self-test: cmov ON accepted as OFF'; exit 1; }
     ! off_shape_ok "${good_off/movss/movaps}" || { echo 'self-test: OFF with one load accepted'; exit 1; }
-    echo 'PASS cond-load-sink self-test (5 synthetic shape mutations rejected)'
+    # The SLP predicate must reject a scalarized body and accept a packed one.
+    slp_min_ok $'umin4:\n    pminud %xmm1, %xmm0\n    ret\n.size umin4, .-umin4' pminud \
+        || { echo 'self-test: valid packed min body rejected'; exit 1; }
+    ! slp_min_ok $'umin4:\n    cmovbl %eax, %edx\n    ret\n.size umin4, .-umin4' pminud \
+        || { echo 'self-test: scalarized min body accepted'; exit 1; }
+    echo 'PASS cond-load-sink self-test (7 synthetic shape mutations rejected)'
     exit 0
 fi
 
@@ -120,6 +134,33 @@ for mode in on off; do
             echo "FAIL: OFF $fn is not the branchy two-load diamond"; printf '%s\n' "$body"; exit 1
         fi
         echo "PASS $mode $fn shape"
+    done
+done
+
+# SLP profitability: with the pass ON, the unsigned/signed min kernels must
+# still be packed.  OFF is the control, proving the assertion is not vacuous
+# and that no other pass is responsible for the recovery.
+for mode in on off; do
+    if [[ $mode == off ]]; then extra=(CCC_NO_COND_LOAD_SINK=1); else extra=(); fi
+    env "${extra[@]}" "$CCC" -O2 -msse4.1 -mno-avx -S \
+        "$root/tests/simd/lightpixel_kernels.c" -o "$tmp/lightpixel_$mode.s"
+    # bb_slp_v6's packed signed-min contract is proven at -march=x86-64-v3
+    # (the same flags its own gate uses); SSE4.1-only lowers it as a packed
+    # blend, which is legal but is not the pminsd assertion being protected.
+    env "${extra[@]}" "$CCC" -O2 -march=x86-64-v3 -S \
+        "$root/tests/regression/bb_slp_v6.c" -o "$tmp/bb_slp_v6_$mode.s"
+    for spec in 'lightpixel_kernels umin4 pminud' 'lightpixel_kernels umax4 pmaxud' \
+                'bb_slp_v6 v6_imin_lt pminsd'; do
+        read -r _ fn mnemonic <<<"$spec"
+        local_suffix=$([[ ${spec%% *} == bb_slp_v6 ]] && echo bb_slp_v6 || echo lightpixel)
+        body=$(fn_body "$fn" "$tmp/${local_suffix}_$mode.s")
+        [[ -n $body ]] || { echo "FAIL: $mode $fn has no assembly body"; exit 1; }
+        if ! slp_min_ok "$body" "$mnemonic"; then
+            echo "FAIL: $mode $fn lost $mnemonic (SV-03 stole a min/max diamond)"
+            printf '%s\n' "$body"
+            exit 1
+        fi
+        echo "PASS $mode $fn keeps $mnemonic"
     done
 done
 

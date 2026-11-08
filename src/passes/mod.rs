@@ -195,6 +195,17 @@ pub(crate) fn debug_agg_byval() -> bool {
     *ENABLED
 }
 
+/// `CCC_NO_COND_LOAD_SINK` — A/B kill switch for SV-03 conditional-load
+/// sinking.  Resolved ONCE here, beside the other pipeline-owned knobs: an
+/// `env::var` inside `if_convert.rs` would be counted by the env-read ratchet
+/// in `tests/regression/check_env_test_hygiene.sh` (a pass body runs once per
+/// function), and that ratchet is deliberately never raised for a new switch.
+pub(crate) fn cond_load_sink_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_NO_COND_LOAD_SINK").is_none());
+    *ENABLED
+}
+
 /// `LCCC_IFCONV_ARM_BUDGET=<n|off>` — A/B lever and kill switch for the
 /// loop-resident arm budget of `if_convert`, resolved once per process.
 ///

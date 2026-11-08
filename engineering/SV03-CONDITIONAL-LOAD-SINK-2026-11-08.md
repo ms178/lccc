@@ -206,9 +206,13 @@ i686/select/peephole/phi gates.
 
 `CCC_NO_COND_LOAD_SINK` disables ONLY this transform; the rest of
 `if_convert_function` (store sinking, diamond/triangle conversion) is
-unaffected. It is a `var().is_ok()` kill switch, consistent with the other
-`CCC_NO_*` switches in this pass, and is the mutation control for every
-differential gate above. Without it a green A/B gate proves nothing.
+unaffected. It is resolved ONCE per process by `passes::cond_load_sink_enabled()`
+(`std::env::var_os(..).is_none()` in `src/passes/mod.rs`), matching the
+other pipeline-owned knobs, and is the mutation control for every
+differential gate above.  Doing the read in `if_convert.rs` instead cost
+one extra per-function `environ` scan and tripped the env-read ratchet in
+`check_env_test_hygiene.sh` (149 > 148); the ratchet is never raised for a
+new switch. Without it a green A/B gate proves nothing.
 
 `scripts/audit_census.py` ratchets distinct `CCC_*`/`LCCC_*` literals in
 `src/`. This change deliberately adds exactly one (`CCC_NO_COND_LOAD_SINK`),
@@ -228,3 +232,35 @@ No other ratcheted metric moves: panics, unsafe, ignored tests and the
   open.
 * ICX evidence is hosted-only in this sandbox (documented in §6).
 * `pahole`/`objtool` are unavailable/not applicable (documented in §6).
+
+
+## 10. Hosted-CI red team: six real regressions found and fixed (PR #1153)
+
+The first hosted run of the PR (`42532255016`) was **7 fail / 16 pass / 3
+skipping**.  `Test Suite` is only the lane-result aggregator; its assertion
+listed `debug, corpus, codegen-a, backend, backend-contracts-b, icx-oracle`,
+so there were six independent root causes.  Logs were read through the
+authenticated signed-blob endpoint because `gh api .../jobs/<id>/logs`
+redirects to a host the sandbox cannot reach.  The earlier "41/41 local
+gates" batch did NOT contain three of these gates; a green subset is not a
+green CI.
+
+| # | Hosted symptom | Root cause | Fix |
+|---|---|---|---|
+| 1,2 | `FAIL cond_load_sink_cross (compile:fail)`, `undefined reference to 'main'` in both corpus jobs (1410 passed / 1 failed / 1416 total) | `run_regression.py` globs `tests/regression/*.c` **non-recursively** and compiles each standalone.  The freestanding four-ISA fixture defines `lccc_main` + a linked `_start`, not `main`. | Moved both gate fixtures into `tests/regression/cond_load_sink_cross/` (`host.c`, `cross.c`) — exactly the layout the runner's own diagnostic prescribes — and rewired the shell gate and Python harness.  No fake host `main` was added.  Local `CCC_VALIDATE_SSA=1` corpus: **1329 passed, 0 failed, 3 skipped-compare, 82 skipped-run, 1414 total**. |
+| 3 | `FAIL pass-pipeline environment reads grew: 149 > budget 148` and `FAIL environment-mutating tests run behind env_isolate` in `Fast local contracts (shard b)` | The SV-03 kill switch was read inside `if_convert.rs`, and its transactional unit test mutated the process environment without `env_isolate`. | Moved the one-time resolution to `src/passes/mod.rs` (the file the ratchet deliberately excludes) and wrapped the test in `test_support::env_isolate`.  Ratchet back to **148/148**. |
+| 4,5,6 | `FAIL sse41 -O2 umin4: missing unsigned native pminud` (also sse41/-O3, avx2/-O2, avx2/-O3) in `codegen-a` and authenticated ICX 2026.2, plus `FAIL: v6_imin_lt not pminsd` in `Assembler and linker contracts` | SV-03 stole `a[i] < b[i] ? a[i] : b[i]` diamonds.  Their guard **already loads both arm addresses unconditionally**, so sinking produced a pointer `Select` plus a THIRD load (`cmovbq` + `movl (%r11)`) where the original `Cmp` + value-`Select` costs two loads and SLP-packs to one `pminud`.  The A/B proof: `CCC_NO_COND_LOAD_SINK=1` restored all six legs; the pass was the cause, not the rebase. | Added a **profitability proof**, not a heuristic: walk the guard's transitive def chain and refuse the sink if any `Load` in it reads an address structurally equal to either arm's load pointer.  Address keys fold `GEP`/`Cast`/`Copy` chains and normalize `base+0` to `base`, so separately materialized `a[i]` GEPs compare equal; opaque/unknown expressions get unique keys (fail closed on equality).  Refusing only declines a rewrite, so it cannot break soundness.  A guard loaded from an unrelated address (`if (*flag) x = *p; else x = *q;`) still sinks. |
+
+Three new mutation-tested unit tests cover the identical-pointer case, the
+separately-materialized-GEP case and the unrelated-guard-load positive
+control (`14 passed` in the SV-03 test module).  The executable
+`check_cond_load_sink.sh` gate now also asserts, ON **and** OFF, that
+`umin4` keeps `pminud`, `umax4` keeps `pmaxud` and `v6_imin_lt` keeps
+`pminsd`; its `--self-test` grew from 5 to 7 rejected synthetic mutations.
+OFF is the non-vacuous control proving no other pass is responsible.
+
+Measured after the fix (local, cached GCC 16.2 / Clang 23.1.5, fastbuild):
+`check_lightpixel.py --require-native` 6/6 PASS, `check_bb_slp_v6_codegen.sh`
+PASS, `check_env_test_hygiene.sh` PASS, `check_cond_load_sink.sh` PASS,
+four-ISA execution proof PASS (8 binaries, oracle 28).  Hosted re-run is the
+accepting authority and is polled separately.

@@ -41,7 +41,8 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::analysis;
 use crate::ir::reexports::{
-    BasicBlock, BlockId, Instruction, IrBinOp, IrCmpOp, IrFunction, Operand, Terminator, Value,
+    BasicBlock, BlockId, Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Terminator,
+    Value,
 };
 
 /// Run if-conversion on a single function.
@@ -1453,6 +1454,102 @@ struct CondLoadPlan {
     extra_phis: Vec<CondLoadPhi>,
 }
 
+/// Structural identity for an address expression, independent of SSA id.
+///
+/// A guard that reads `a[i]` and the arm that reloads `a[i]` frequently carry
+/// DIFFERENT `GetElementPtr` destinations (the frontend materializes the
+/// address twice, and `load_forward` only merges some of them before
+/// if-conversion runs).  Comparing `Value` ids would miss exactly the cases
+/// where sinking is a pessimization, so fold GEP/Cast/Copy chains into a
+/// canonical key.  The element type is deliberately NOT part of the key: the
+/// address is `base + offset` in bytes regardless of the loaded type.  Recursion
+/// is bounded; anything unrecognised falls back to an opaque, unique key so the
+/// comparison never claims two unknown addresses are equal.
+fn cond_load_offset_is_zero(offset: &Operand) -> bool {
+    match offset {
+        Operand::Const(IrConst::I8(v)) => *v == 0,
+        Operand::Const(IrConst::I16(v)) => *v == 0,
+        Operand::Const(IrConst::I32(v)) => *v == 0,
+        Operand::Const(IrConst::I64(v)) => *v == 0,
+        Operand::Const(IrConst::I128(v)) => *v == 0,
+        Operand::Const(IrConst::Zero) => true,
+        _ => false,
+    }
+}
+
+fn cond_load_ptr_key(v: Value, defs: &FxHashMap<u32, &Instruction>, depth: usize) -> String {
+    if depth > 8 {
+        return format!("opaque:{}", v.0);
+    }
+    let Some(inst) = defs.get(&v.0) else {
+        return format!("opaque:{}", v.0);
+    };
+    match inst {
+        Instruction::GetElementPtr { base, offset, .. } => {
+            // `base + 0` IS `base`: the frontend materializes a zero-offset
+            // GEP for `a[0]` while the guard may load straight from `a`.
+            // Folding it keeps the two spellings of one address comparable.
+            if cond_load_offset_is_zero(offset) {
+                return cond_load_ptr_key(*base, defs, depth + 1);
+            }
+            format!(
+                "gep({},{:?})",
+                cond_load_ptr_key(*base, defs, depth + 1),
+                offset
+            )
+        }
+        Instruction::Copy { src, .. } | Instruction::Cast { src, .. } => match src {
+            Operand::Value(sv) => {
+                format!("alias({})", cond_load_ptr_key(*sv, defs, depth + 1))
+            }
+            Operand::Const(c) => format!("const({c:?})"),
+        },
+        Instruction::GlobalAddr { name, .. } => format!("global({name})"),
+        Instruction::ParamRef { param_idx, .. } => format!("param({param_idx})"),
+        _ => format!("opaque:{}", v.0),
+    }
+}
+
+/// Profitability proof for the `a[i] < b[i] ? a[i] : b[i]` family.
+///
+/// When the branch predicate is data-dependent on a load from either arm's
+/// address, BOTH addresses have already been dereferenced unconditionally by
+/// the guard.  There is therefore no untaken-path fault to avoid and no second
+/// load to eliminate: the existing `Cmp` + value-`Select` form costs two loads
+/// and vectorizes to `pminud`/`pmaxud`/`pminsd`, whereas sinking would emit a
+/// pointer `Select` plus a THIRD load through it and break the SLP min/max
+/// idiom.  Refusing is always sound (it only declines a rewrite); the walk is
+/// over the guard's transitive def chain, so a guard loaded from an unrelated
+/// address (`if (*flag) x = *p; else x = *q;`) still sinks.
+fn cond_load_guard_reads_arm_address(
+    cond: Operand,
+    t_key: &str,
+    f_key: &str,
+    defs: &FxHashMap<u32, &Instruction>,
+) -> bool {
+    let Operand::Value(root) = cond else {
+        return false;
+    };
+    let mut seen: FxHashSet<u32> = FxHashSet::default();
+    let mut work = vec![root.0];
+    while let Some(id) = work.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let Some(inst) = defs.get(&id) else {
+            continue;
+        };
+        if let Instruction::Load { ptr, .. } = inst {
+            let key = cond_load_ptr_key(*ptr, defs, 0);
+            if key == t_key || key == f_key {
+                return true;
+            }
+        }
+        inst.for_each_used_value(|u| work.push(u));
+    }
+    false
+}
+
 /// Collect every sound `cond ? *p : *q` diamond in the function.  Nothing is
 /// mutated here; the caller applies non-overlapping plans.
 fn plan_cond_load_sinks(func: &IrFunction) -> Vec<CondLoadPlan> {
@@ -1467,10 +1564,15 @@ fn plan_cond_load_sinks(func: &IrFunction) -> Vec<CondLoadPlan> {
     // Where every SSA value is defined.  A value with no entry is treated as
     // unavailable (fail closed) by the availability proof below.
     let mut def_block: FxHashMap<u32, usize> = FxHashMap::default();
+    // Definition instruction for each SSA id, used by the guard-dependence
+    // profitability proof below.  A duplicate id keeps the first definition;
+    // the SSA verifier rejects real duplicates, so this cannot mask a bug.
+    let mut def_inst: FxHashMap<u32, &Instruction> = FxHashMap::default();
     for (bi, block) in func.blocks.iter().enumerate() {
         for inst in &block.instructions {
             if let Some(d) = inst.dest() {
                 def_block.insert(d.0, bi);
+                def_inst.entry(d.0).or_insert(inst);
             }
         }
     }
@@ -1543,6 +1645,14 @@ fn plan_cond_load_sinks(func: &IrFunction) -> Vec<CondLoadPlan> {
             continue;
         }
         if !cond_load_type_supported(t_arm.ty) {
+            continue;
+        }
+        // Do not steal a min/max/select idiom whose guard already loads the
+        // two arm addresses: sinking would add a third load and destroy the
+        // packed pminud/pmaxud/pminsd form (hosted CI shards, 2026-11-08).
+        let t_key = cond_load_ptr_key(t_arm.load_ptr, &def_inst, 0);
+        let f_key = cond_load_ptr_key(f_arm.load_ptr, &def_inst, 0);
+        if cond_load_guard_reads_arm_address(cond, &t_key, &f_key, &def_inst) {
             continue;
         }
         if !cond_load_arm_available(
@@ -1741,7 +1851,7 @@ fn apply_cond_load_sink(func: &mut IrFunction, p: &CondLoadPlan) -> bool {
 }
 
 fn sink_conditional_loads(func: &mut IrFunction) -> usize {
-    if std::env::var("CCC_NO_COND_LOAD_SINK").is_ok() {
+    if !super::cond_load_sink_enabled() {
         return 0;
     }
     let plans = plan_cond_load_sinks(func);
@@ -5651,7 +5761,131 @@ mod cond_load_sink_tests {
     }
 
     #[test]
+    fn cond_load_sink_refuses_when_the_guard_reads_an_arm_address() {
+        // `a[0] < b[0] ? a[0] : b[0]`: the guard already dereferences BOTH
+        // arm addresses unconditionally.  Its address expressions are
+        // separately materialized GEPs (different SSA ids, same base+offset),
+        // which is exactly what the structural key exists to catch.
+        let mut f = cond_load_diamond();
+        let pred = &mut f.blocks[1];
+        pred.instructions.clear();
+        pred.instructions.push(Instruction::GetElementPtr {
+            dest: Value(50),
+            base: Value(0),
+            offset: Operand::Const(IrConst::I64(0)),
+            ty: IrType::I32,
+        });
+        pred.instructions.push(Instruction::Load {
+            dest: Value(51),
+            ptr: Value(50),
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        });
+        pred.instructions.push(Instruction::GetElementPtr {
+            dest: Value(52),
+            base: Value(1),
+            offset: Operand::Const(IrConst::I64(0)),
+            ty: IrType::I32,
+        });
+        pred.instructions.push(Instruction::Load {
+            dest: Value(53),
+            ptr: Value(52),
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        });
+        pred.instructions.push(Instruction::Cmp {
+            dest: Value(54),
+            op: IrCmpOp::Slt,
+            lhs: Operand::Value(Value(51)),
+            rhs: Operand::Value(Value(53)),
+            ty: IrType::I32,
+        });
+        pred.terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(54)),
+            true_label: BlockId(2),
+            false_label: BlockId(3),
+        };
+        f.next_value_id = 60;
+        assert_eq!(sink_conditional_loads(&mut f), 0);
+    }
+
+    #[test]
+    fn cond_load_sink_refuses_when_the_guard_uses_the_identical_pointer() {
+        // SSA-identical variant: the guard loads straight from the very same
+        // two arm pointers, so even a plain Value comparison must refuse.
+        let mut f = cond_load_diamond();
+        let pred = &mut f.blocks[1];
+        pred.instructions.clear();
+        pred.instructions.push(Instruction::Load {
+            dest: Value(50),
+            ptr: Value(0),
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        });
+        pred.instructions.push(Instruction::Load {
+            dest: Value(51),
+            ptr: Value(1),
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        });
+        pred.instructions.push(Instruction::Cmp {
+            dest: Value(52),
+            op: IrCmpOp::Slt,
+            lhs: Operand::Value(Value(50)),
+            rhs: Operand::Value(Value(51)),
+            ty: IrType::I32,
+        });
+        pred.terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(52)),
+            true_label: BlockId(2),
+            false_label: BlockId(3),
+        };
+        f.next_value_id = 60;
+        assert_eq!(sink_conditional_loads(&mut f), 0);
+    }
+
+    #[test]
+    fn cond_load_sink_accepts_when_the_guard_loads_an_unrelated_address() {
+        // `if (*flag) x = *p; else x = *q;` — the guard's load is from a
+        // THIRD address.  Neither arm value is already in a register, so the
+        // pointer Select + single Load remains the right transformation.
+        let mut f = cond_load_diamond();
+        let pred = &mut f.blocks[1];
+        pred.instructions.clear();
+        pred.instructions.push(Instruction::Load {
+            dest: Value(50),
+            ptr: Value(3),
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        });
+        pred.instructions.push(Instruction::Cmp {
+            dest: Value(51),
+            op: IrCmpOp::Ne,
+            lhs: Operand::Value(Value(50)),
+            rhs: Operand::Const(IrConst::I32(0)),
+            ty: IrType::I32,
+        });
+        pred.terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(51)),
+            true_label: BlockId(2),
+            false_label: BlockId(3),
+        };
+        f.next_value_id = 60;
+        assert_eq!(sink_conditional_loads(&mut f), 1);
+    }
+
+    #[test]
     fn cond_load_sink_kill_switch_is_transactional() {
+        if !crate::test_support::env_isolate(
+            "passes::if_convert::cond_load_sink_tests::cond_load_sink_kill_switch_is_transactional",
+        ) {
+            return;
+        }
         use crate::test_support::EnvGuard;
         let mut f = cond_load_diamond();
         let before = format!("{f:?}");

@@ -39,7 +39,12 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-FIXTURE = ROOT / "tests" / "regression" / "cond_load_sink_cross.c"
+# Gate fixtures live in a SUBDIRECTORY: run_regression.py globs
+# tests/regression/*.c non-recursively and requires every hit to define main.
+# The freestanding cross-ISA fixture defines lccc_main + a linked _start, so
+# putting it in the glob root makes the corpus fail with "undefined reference
+# to `main'".  This is the layout the runner's own diagnostic prescribes.
+FIXTURE = ROOT / "tests" / "regression" / "cond_load_sink_cross" / "cross.c"
 CACHE_BIN = Path(
     os.environ.get("LCCC_AGENT_CACHE_PREFIX", str(Path.home() / ".cache/lccc/agent-toolchains"))
 ) / "bin"
