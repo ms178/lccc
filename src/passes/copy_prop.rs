@@ -38,6 +38,36 @@ fn memcpy_folds_into_intrinsic(op: &IntrinsicOp, size: usize, index: usize) -> b
         && super::vector_temp_promotion::pointer_vector_arg_width(*op, index) == Some(size)
 }
 
+/// Walk `GetElementPtr` chains back to a non-derived pointer and ask the root
+/// analysis which object THAT pointer names.
+///
+/// `pointer_root_analysis` deliberately refuses a non-identity GEP: it answers
+/// "which address is this?", and a nonzero offset (with no in-bounds flag) does
+/// not prove the address is unchanged. The forwarding rules here ask a weaker
+/// question -- "which object is this pointer inside?" -- and for that a GEP is
+/// transparent: adding an offset keeps the pointer within its base's object
+/// (in bounds, or one past the end), so it can never name a *different* object.
+///
+/// Integer arithmetic is NOT followed. `BinOp` on a pointer can forge an
+/// arbitrary address and legitimately lands in another object, which is why the
+/// root analysis marks those non-identity too and why this helper stops at them.
+///
+/// The walk is bounded so a malformed self-referential GEP cannot spin.
+fn object_root_of(
+    gep_base: &FxHashMap<u32, u32>,
+    roots: &super::vector_temp_promotion::PointerRootAnalysis,
+    value: u32,
+) -> Option<PointerRoot> {
+    let mut current = value;
+    for _ in 0..64 {
+        match gep_base.get(&current) {
+            Some(&base) if base != current => current = base,
+            _ => break,
+        }
+    }
+    roots.root_of(current)
+}
+
 /// Count how many times `value` appears as an operand of `inst`.
 fn operand_count(inst: &Instruction, value: u32) -> usize {
     let mut count = 0usize;
@@ -242,6 +272,14 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
             FxHashSet::default()
         };
         let roots = super::vector_temp_promotion::pointer_root_analysis(func);
+        let mut gep_base: FxHashMap<u32, u32> = FxHashMap::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::GetElementPtr { dest, base, .. } = inst {
+                    gep_base.insert(dest.0, base.0);
+                }
+            }
+        }
 
         for block in &mut func.blocks {
             let mut i = 0;
@@ -322,7 +360,7 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
                                         // the address was published, and a
                                         // different alloca is a different
                                         // object.
-                                        && match roots.root_of(src.0) {
+                                        && match object_root_of(&gep_base, &roots, src.0) {
                                             Some(PointerRoot::Alloca(root)) => root != dp.0,
                                             Some(PointerRoot::Global)
                                             | Some(PointerRoot::Param { .. }) => {
@@ -370,7 +408,7 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
                         if !allocas.contains(&target) || target == src.0 {
                             return None;
                         }
-                        match roots.root_of(src.0) {
+                        match object_root_of(&gep_base, &roots, src.0) {
                             // A different alloca: disjoint objects in the
                             // frame, so writing one cannot touch the other.
                             Some(PointerRoot::Alloca(root)) => (root != target).then_some(()),
@@ -2777,7 +2815,7 @@ mod snapshot_forwarding_contract {
     use super::*;
     use crate::common::types::{AddressSpace, IrType};
     use crate::ir::reexports::{
-        BasicBlock, BlockId, CallInfo, IrConst, IrParam,
+        BasicBlock, BlockId, CallInfo, IrBinOp, IrConst, IrParam,
     };
 
     fn alloca(v: u32, semantic_volatile: bool) -> Instruction {
@@ -3434,6 +3472,107 @@ mod snapshot_forwarding_contract {
         assert_eq!(
             applied, 0,
             "a GEP into the written alloca must block the forward"
+        );
+    }
+
+
+    /// 6: the source is a GEP with a NONZERO offset off a parameter. The root
+    /// analysis refuses non-identity GEPs (it answers "same address?"), but
+    /// object disjointness only needs "same object?", which a GEP preserves.
+    /// This is what makes every clamp after the first forward in
+    /// `avx_fp_private`, where the input is `in + 32`, `in + 64`, ...
+    #[test]
+    fn forward_accepts_a_gep_derived_parameter_source() {
+        let func = func_with(
+            1,
+            vec![
+                Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(6),
+                    base: Value(1),
+                    offset: Operand::Const(IrConst::I64(32)),
+                    ty: IrType::U8,
+                },
+                alloca_at(2, 32),
+                alloca_at(3, 32),
+                alloca_at(4, 32),
+                memcpy(2, 6, 32),
+                intr(Some(10), IntrinsicOp::MinPs256, Some(3), vec![2, 4]),
+            ],
+        );
+        let applied = forward_memcpy_chains(&mut module_of(func));
+        assert_eq!(applied, 1, "a nonzero-offset GEP off a parameter is forwardable");
+    }
+
+    /// 7: the walk must follow a GEP CHAIN, not just one hop.
+    #[test]
+    fn forward_follows_a_multi_hop_gep_chain() {
+        let func = func_with(
+            1,
+            vec![
+                Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(6),
+                    base: Value(1),
+                    offset: Operand::Const(IrConst::I64(32)),
+                    ty: IrType::U8,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(7),
+                    base: Value(6),
+                    offset: Operand::Const(IrConst::I64(32)),
+                    ty: IrType::U8,
+                },
+                alloca_at(2, 32),
+                alloca_at(3, 32),
+                alloca_at(4, 32),
+                memcpy(2, 7, 32),
+                intr(Some(10), IntrinsicOp::MinPs256, Some(3), vec![2, 4]),
+            ],
+        );
+        let applied = forward_memcpy_chains(&mut module_of(func));
+        assert_eq!(applied, 1, "a multi-hop GEP chain must be followed to its base");
+    }
+
+    /// 8 (soundness): integer arithmetic on a pointer can forge an arbitrary
+    /// address, so it must NOT be followed. The root is unknown and the
+    /// forward is refused.
+    #[test]
+    fn forward_refuses_an_integer_derived_pointer_source() {
+        let func = func_with(
+            1,
+            vec![
+                Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                Instruction::BinOp {
+                    dest: Value(6),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I64(32)),
+                    ty: IrType::I64,
+                },
+                alloca_at(2, 32),
+                alloca_at(3, 32),
+                alloca_at(4, 32),
+                memcpy(2, 6, 32),
+                intr(Some(10), IntrinsicOp::MinPs256, Some(3), vec![2, 4]),
+            ],
+        );
+        let applied = forward_memcpy_chains(&mut module_of(func));
+        assert_eq!(
+            applied, 0,
+            "integer pointer arithmetic must not be treated as an object root"
         );
     }
 
