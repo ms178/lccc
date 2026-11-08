@@ -3234,7 +3234,44 @@ showed `rax=0x6db6` identical for LCCC/GCC/Clang on `rt_eq_w128_epi8` and
 harness executed x86-64 natively and i686/AArch64/RISC-V64 under QEMU 11.1.3
 (4 ISAs x 2 fixtures x 2 pass states, oracle-identical).
 
-**Non-claims:** no local ICX 2026.2, objtool, pahole or perf evidence; the
+### Vendor cross-check: why `kmovw` and not `kmovb` (Round 12)
+
+`scripts/check_maskfacts_vendor_matrix.py` adds the fourth-compiler leg in the
+authenticated ICX 2026.2 lane: it compiles the SAME 485-case fixture with LCCC,
+GCC 16.2, Clang 23.1.5 and ICX 2026.2, compares all four stdouts byte-for-byte,
+and then reads the four ELF objects with `readelf`/`objdump` (an objtool-style
+full-decode + leaf/stack-discipline proof and a pahole-style global-layout
+proof; both kernel tools themselves need kernel/BTF metadata that a
+freestanding user-space `.o` does not carry).  The local mirror runs the same
+contract three-way and adds ICX only when the authenticated binary exists.
+
+Measured ELF facts on the 192 runtime functions:
+
+| producer | bytes | instructions | `kmov` mix | redundant scalar mask extensions |
+|---|---:|---:|---|---:|
+| **LCCC** | **5136** | **896** | `kmovw` 144 / `kmovd` 32 / `kmovq` 16 | **0** |
+| GCC 16.2 | 5308 | 896 | `kmovq` 192 | 0 |
+| Clang 23.1.5 | 5208 | 944 | `kmovw` 96 / `kmovd` 80 / `kmovq` 16 | **48** |
+
+Clang's 48 extra instructions are exactly `movzbl %al,%eax` after `kmovd` in
+the eight-lane cases: `kmovd %k,%eax` already zero-extends and EVEX already
+zeroes k above KL, so the byte extension is a no-op.  LCCC's `kmovw` returns
+the identical 64-bit value with no extra instruction (GDB 18.1 confirms
+`rax=0` for 512/32 and `rax=0xb6db6db6` for 256/8).  This is why LCCC is
+48 instructions better than Clang while matching GCC's instruction count, and
+176 bytes smaller than the old unconditional `kmovq`.
+
+`kmovb` would be the literal narrowest form for eight lanes, but it is
+**AVX512DQ**, whereas `vpcmpb` on a 128-bit vector needs only
+AVX512F+BW+VL.  `kmovb` and `kmovw` are both 4-byte VEX encodings, so
+`kmovw` is byte-optimal WITHOUT widening the ISA contract; using `kmovb`
+would introduce SIGILLs on F+BW+VL hosts that lack DQ.  Widening the ISA
+requirement for zero bytes of gain is a regression, not an optimisation.
+
+**Non-claims:** no LOCAL ICX 2026.2 binary, objtool, pahole or perf evidence
+(the four-way ICX comparison is executed only in the hosted authenticated ICX
+lane; locally the same contract runs three-way with two surrogate fourth-label
+exercises that validate the code path but are NOT ICX evidence); the
 executed stdout leg is explicitly skipped on any runner lacking
 `avx512f`/`bw`/`vl` (the hosted pool is heterogeneous); "beats GCC/Clang"
 refers ONLY to the measured 192 runtime-compare functions above, not to

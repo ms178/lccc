@@ -215,7 +215,14 @@ impl X86Codegen {
     /// GCC 16.2 (`kmovq`) and Clang 23.1.5 (narrow forms), and GDB 18.1 shows
     /// identical `rax` for the 512/32 `kmovw` and 256/8 `kmovd` cases.
     ///
-    /// GCC 16.2 always emits `kmovq`; Clang 23.1.5 emits the narrow forms.
+    /// GCC 16.2 always emits `kmovq`; Clang 23.1.5 emits the narrow forms but
+    /// then adds a redundant `movzbl %al,%eax` in the 48 eight-lane cases
+    /// (measured: LCCC 896 instructions / 0 scalar extensions vs Clang 944 / 48).
+    /// `kmovb` is deliberately NOT used even for 8 lanes: it is AVX512DQ,
+    /// while `vpcmpb` needs only AVX512F+BW+VL.  `kmovw` is AVX512F and has
+    /// the same 4-byte VEX encoding as `kmovb`, so it is byte-optimal without
+    /// widening the ISA contract.  An EVEX mask write already zeroes k above
+    /// KL, so reading 16 bits for an 8-lane mask is bit-identical.
     /// On the 192 runtime compare functions this removes 176 bytes of EVEX
     /// prefix: LCCC 5312 -> 5136 bytes vs GCC 5308 / Clang 5208 (-3.2% / -1.4%).
     /// Unknown mnemonics or a missing width fail CLOSED to `kmovq`.

@@ -43,7 +43,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 # Lanes that restore the artifact instead of compiling their own compiler.
 CONSUMERS = {
-    'corpus', 'unit', 'backend',
+    'corpus', 'unit', 'backend', 'maskfacts-oracles',
     'frontend-a', 'frontend-b', 'frontend-c',
     'codegen-a', 'codegen-b',
     'backend-contracts-a', 'backend-contracts-b',

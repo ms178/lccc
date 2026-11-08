@@ -3708,6 +3708,19 @@ jobs:
             echo "PASS $compiler $level"
           done
         done
+    - name: AVX-512VL mask-compare four-compiler ELF and stdout ratchet
+      env:
+        CCC: target/fastbuild/lccc
+        GCC16: gcc-16
+      run: |
+        set -euo pipefail
+        trap 'status=$?; if [ "$status" -ne 0 ]; then python3 scripts/ci_annotate_log.py --title "AVX-512VL mask-compare four-compiler ratchet" intel-evidence/maskcmp-vendor.log; fi; exit "$status"' EXIT
+        python3 scripts/check_maskfacts_vendor_matrix.py --self-test
+        python3 scripts/check_maskfacts_vendor_matrix.py \
+          --lccc "$CCC" --gcc "$GCC16" --clang "${CLANG:-clang-23}" \
+          --icx "$LCCC_ICX_BIN" --require-icx \
+          --json intel-evidence/maskcmp-vendor.json \
+          2>&1 | tee intel-evidence/maskcmp-vendor.log
     - name: Numeric -O and -Ofast parity against ICX 2026.2, GCC 16.2 and Clang 23.1.5
       env:
         CCC: target/fastbuild/lccc
@@ -3900,6 +3913,7 @@ jobs:
     - clippy
     - benchmark
     - icx-oracle
+    - maskfacts-oracles
     if: always()
     steps:
     - name: Require every independent lane to pass
