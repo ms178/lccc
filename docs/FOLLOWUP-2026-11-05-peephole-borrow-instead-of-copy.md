@@ -191,9 +191,19 @@ byte-identical and the count reproduces exactly):
 | allocator bytes | 555,926,729 | 547,474,410 | −8,452,319 |
 | assembly | — | — | **byte-identical, 21/21** |
 
+The i686 half of the patch, measured separately on the dedicated
+`tests/regression/alloc_cost/i686_peephole_corpus.c` fixture with `-O2 -m32 -S`
+(2,202 `movl`/`xorl` lines confirm the staging path is actually reached, so this
+is not a vacuous zero):
+
+| metric | before | after | delta |
+| --- | --- | --- | --- |
+| allocations | 973,853 | 961,991 | **−11,862 (−1.218 %)** |
+| assembly | — | — | byte-identical |
+
 For comparison, the merged predecessor rounds measured −9.456 % (x86-64) and
 −0.050 % (i686). Choosing the target by ablation instead of by reading source
-roughly doubled the result.
+roughly doubled the x86-64 result.
 
 Paired wall time on the profiled 200-function TU, measured **after** the build
 and both test lanes finished, A/B interleaved, n=11 each:
