@@ -16,9 +16,9 @@
 //! FxHashMap, since Value IDs are dense sequential u32s. This eliminates hashing
 //! overhead and gives O(1) lookups with better cache locality.
 
+use super::vector_temp_promotion::PointerRoot;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::intrinsics::IntrinsicOp;
-use super::vector_temp_promotion::PointerRoot;
 use crate::ir::reexports::{
     Instruction, IrConst, IrFunction, IrModule, Operand, Terminator, Value,
 };
@@ -115,9 +115,7 @@ fn escaping_allocas(func: &IrFunction, allocas: &FxHashSet<u32>) -> FxHashSet<u3
                     // storing the address as data (`Store { ptr: A, val: A }`).
                     Instruction::Load { ptr, .. }
                     | Instruction::Store { ptr, .. }
-                    | Instruction::GetElementPtr { base: ptr, .. } => {
-                        ptr.0 == *alloca && uses == 1
-                    }
+                    | Instruction::GetElementPtr { base: ptr, .. } => ptr.0 == *alloca && uses == 1,
                     // Whole-object copy: every position is a memory operand.
                     Instruction::Memcpy { .. } => true,
                     // Vector intrinsics read and write through their pointer
@@ -172,15 +170,16 @@ fn exact_alloca_write_target(inst: &Instruction) -> Option<u32> {
                     | IntrinsicOp::BuiltinLongjmp
                     | IntrinsicOp::DoBuiltinApply
                     | IntrinsicOp::RestoreApplyResult
-            ) => Some(ptr.0),
+            ) =>
+        {
+            Some(ptr.0)
+        }
         Instruction::Memcpy { dest, .. } => Some(dest.0),
         // A segment-relative store addresses a DIFFERENT linear address than
         // its numeric pointer names: the FS/GS base can land inside an
         // unrelated object. Refuse rather than claim a target we cannot name.
         Instruction::Store {
-            ptr,
-            seg_override,
-            ..
+            ptr, seg_override, ..
         } if *seg_override == crate::common::types::AddressSpace::Default => Some(ptr.0),
         _ => None,
     }
@@ -281,9 +280,9 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
         // alloca, so skip the sweep entirely for the overwhelming majority of
         // functions whose copies are all alloca-to-alloca.
         let escaping = if func.blocks.iter().any(|block| {
-            block.instructions.iter().any(|inst| {
-                matches!(inst, Instruction::Memcpy { src, .. } if !allocas.contains(&src.0))
-            })
+            block.instructions.iter().any(
+                |inst| matches!(inst, Instruction::Memcpy { src, .. } if !allocas.contains(&src.0)),
+            )
         }) {
             escaping_allocas(func, &allocas)
         } else {
@@ -433,8 +432,7 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
                             // A parameter or a global, or something derived
                             // only from those: outside the frame entirely
                             // unless the alloca's address was published.
-                            Some(PointerRoot::Global)
-                            | Some(PointerRoot::Param { .. }) => {
+                            Some(PointerRoot::Global) | Some(PointerRoot::Param { .. }) => {
                                 (!escaping.contains(&target)).then_some(())
                             }
                             // Unknown provenance: fail closed.
@@ -2832,9 +2830,7 @@ mod tests {
 mod snapshot_forwarding_contract {
     use super::*;
     use crate::common::types::{AddressSpace, IrType};
-    use crate::ir::reexports::{
-        BasicBlock, BlockId, CallInfo, IrBinOp, IrConst, IrParam,
-    };
+    use crate::ir::reexports::{BasicBlock, BlockId, CallInfo, IrBinOp, IrConst, IrParam};
 
     fn alloca(v: u32, semantic_volatile: bool) -> Instruction {
         Instruction::Alloca {
@@ -3347,7 +3343,12 @@ mod snapshot_forwarding_contract {
         }
     }
 
-    fn intr(dest: Option<u32>, op: IntrinsicOp, dest_ptr: Option<u32>, args: Vec<u32>) -> Instruction {
+    fn intr(
+        dest: Option<u32>,
+        op: IntrinsicOp,
+        dest_ptr: Option<u32>,
+        args: Vec<u32>,
+    ) -> Instruction {
         Instruction::Intrinsic {
             dest: dest.map(Value),
             op,
@@ -3493,7 +3494,6 @@ mod snapshot_forwarding_contract {
         );
     }
 
-
     /// 6: the source is a GEP with a NONZERO offset off a parameter. The root
     /// analysis refuses non-identity GEPs (it answers "same address?"), but
     /// object disjointness only needs "same object?", which a GEP preserves.
@@ -3523,7 +3523,10 @@ mod snapshot_forwarding_contract {
             ],
         );
         let applied = forward_memcpy_chains(&mut module_of(func));
-        assert_eq!(applied, 1, "a nonzero-offset GEP off a parameter is forwardable");
+        assert_eq!(
+            applied, 1,
+            "a nonzero-offset GEP off a parameter is forwardable"
+        );
     }
 
     /// 7: the walk must follow a GEP CHAIN, not just one hop.
@@ -3557,7 +3560,10 @@ mod snapshot_forwarding_contract {
             ],
         );
         let applied = forward_memcpy_chains(&mut module_of(func));
-        assert_eq!(applied, 1, "a multi-hop GEP chain must be followed to its base");
+        assert_eq!(
+            applied, 1,
+            "a multi-hop GEP chain must be followed to its base"
+        );
     }
 
     /// 8 (soundness): integer arithmetic on a pointer can forge an arbitrary
@@ -3593,7 +3599,6 @@ mod snapshot_forwarding_contract {
             "integer pointer arithmetic must not be treated as an object root"
         );
     }
-
 
     /// 9 (soundness): an FS/GS-relative store names a DIFFERENT linear address
     /// than its numeric pointer, because the segment base can move it into an
@@ -3661,5 +3666,4 @@ mod snapshot_forwarding_contract {
             "a default-space store to a distinct alloca must not block the forward"
         );
     }
-
 }
