@@ -8986,11 +8986,15 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 i = div_idx + 1;
                 continue;
             }
-            let div_text = trimmed(store, &infos[div_idx], div_idx).to_string();
-            let Some(divisor) = div_reg(&div_text) else {
+            // `div_reg` yields a Copy RegId, so the filter runs on borrowed
+            // text and the owned copy is made only for a candidate (the site
+            // record below stores it). No second parse is needed.
+            let div_line = trimmed(store, &infos[div_idx], div_idx);
+            let Some(divisor) = div_reg(div_line) else {
                 i = div_idx + 1;
                 continue;
             };
+            let div_text = div_line.to_string();
             match collect_staging(store, infos, i, divisor) {
                 Some((staging, mut read_regs, read_slots)) => {
                     // DIV overwrites EAX/EDX, and the staging itself may
@@ -15241,8 +15245,10 @@ fn try_fold_select_diamond(
     if infos[a].kind != LineKind::CondJmp {
         return false;
     }
-    let jcc = trimmed(store, &infos[a], a).to_string();
-    let Some((cc, true_label)) = parse_condjmp(&jcc) else {
+    // The parsed condition and label borrow this line only until the `format!`
+    // that builds the cmov, which runs before `store.replace`, so no owned copy
+    // is needed.
+    let Some((cc, true_label)) = parse_condjmp(trimmed(store, &infos[a], a)) else {
         return false;
     };
     if !FLAG_CONDS.contains(&cc) {
@@ -15283,8 +15289,8 @@ fn try_fold_select_diamond(
     if b >= fend || infos[b].kind == LineKind::InlineAsm {
         return false;
     }
-    let false_text = trimmed(store, &infos[b], b).to_string();
-    let Some((fs, fd, size)) = parse_select_arm_mov(&false_text) else {
+    // `parse_select_arm_mov` yields only Copy fields; no owned copy is needed.
+    let Some((fs, fd, size)) = parse_select_arm_mov(trimmed(store, &infos[b], b)) else {
         return false;
     };
     // %esp is never a select destination (a conditional stack-pointer write is
@@ -15301,8 +15307,9 @@ fn try_fold_select_diamond(
     if c >= fend || infos[c].kind != LineKind::Jmp {
         return false;
     }
-    let jmp_text = trimmed(store, &infos[c], c).to_string();
-    let Some(end_label) = parse_jmp_target(&jmp_text) else {
+    // The borrow is converted to an owned label on the next line, so the line
+    // itself never needed a copy.
+    let Some(end_label) = parse_jmp_target(trimmed(store, &infos[c], c)) else {
         return false;
     };
     let end_label = end_label.trim().to_string();
@@ -15324,8 +15331,8 @@ fn try_fold_select_diamond(
     if e >= fend || infos[e].kind == LineKind::InlineAsm {
         return false;
     }
-    let true_text = trimmed(store, &infos[e], e).to_string();
-    let Some((ts, td, tsize)) = parse_select_arm_mov(&true_text) else {
+    // `parse_select_arm_mov` yields only Copy fields; no owned copy is needed.
+    let Some((ts, td, tsize)) = parse_select_arm_mov(trimmed(store, &infos[e], e)) else {
         return false;
     };
     if td != fd || tsize != size || ts == fd {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ratchet: the x86 peephole must not allocate a line before a filter rejects it.
+"""Ratchet: no backend peephole may allocate a line before a filter rejects it.
 
 MB-20 step 3 removed 25 sites of the form
 
@@ -30,15 +30,23 @@ import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-PEEPHOLE = ROOT / "src/backend/x86/codegen/peephole"
+# Every backend, not just x86-64: the defect class is not architecture-specific,
+# and an x86-only default made the gate vacuous for i686.
+PEEPHOLE = ROOT / "src/backend"
 
 # `let NAME = <expr>.trimmed(store.get(..)).to_string();`
 # NOTE: `.*` and not `[^)]*` -- the argument is `store.get(i)`, which nests
 # parentheses. A `[^)]*` here silently matched nothing and made this whole
 # ratchet vacuous (it passed on the pre-fix tree); both directions are now
 # pinned by tests/regression/test_check_peephole_alloc_before_filter.py.
+# Both idioms must match:
+#   x86-64: `infos[i].trimmed(store.get(i)).to_string()`      (method)
+#   i686:   `trimmed(store, &infos[i], i).to_string()`        (free function)
+# The original pattern required a literal `.trimmed(`, so it silently reported
+# PASS for i686 while five real allocate-then-reject sites sat there. `\b` before
+# `trimmed` matches after `.` as well as at the start of a call expression.
 ALLOC = re.compile(
-    r"^\s*let\s+(\w+)\s*=\s*.*\.trimmed\(.*\)\.to_string\(\);\s*$"
+    r"^\s*let\s+(\w+)\s*=\s*.*\btrimmed\(.*\)\.to_string\(\);\s*$"
 )
 # `let Some(..) = parser(&NAME) else {`  /  `if !parser(&NAME) {`
 REJECT_LET = re.compile(r"^\s*let\s+Some\(.*\)\s*=\s*(\w+)\(&(\w+)\)\s+else\s*\{")
@@ -73,7 +81,7 @@ def violations(text: str) -> list[tuple[int, str, str]]:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--root", type=Path, default=PEEPHOLE,
-                    help="directory to scan (default: the x86 peephole)")
+                    help="directory to scan (default: every backend under src/backend)")
     args = ap.parse_args()
     if not args.root.is_dir():
         print(f"FAIL: not a directory: {args.root}", file=sys.stderr)
