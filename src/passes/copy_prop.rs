@@ -161,9 +161,27 @@ fn exact_alloca_write_target(inst: &Instruction) -> Option<u32> {
             dest_ptr: Some(ptr),
             op,
             ..
-        } if !op.writes_memory_via_args() => Some(ptr.0),
+        } if !op.writes_memory_via_args()
+            // Mirrors the four ops `may_write_memory` calls out by name: they
+            // write through their arguments (a jump buffer, an apply area), so
+            // `dest_ptr` is not their only effect even though
+            // `writes_memory_via_args` does not list them.
+            && !matches!(
+                op,
+                IntrinsicOp::BuiltinSetjmp
+                    | IntrinsicOp::BuiltinLongjmp
+                    | IntrinsicOp::DoBuiltinApply
+                    | IntrinsicOp::RestoreApplyResult
+            ) => Some(ptr.0),
         Instruction::Memcpy { dest, .. } => Some(dest.0),
-        Instruction::Store { ptr, .. } => Some(ptr.0),
+        // A segment-relative store addresses a DIFFERENT linear address than
+        // its numeric pointer names: the FS/GS base can land inside an
+        // unrelated object. Refuse rather than claim a target we cannot name.
+        Instruction::Store {
+            ptr,
+            seg_override,
+            ..
+        } if *seg_override == crate::common::types::AddressSpace::Default => Some(ptr.0),
         _ => None,
     }
 }
@@ -3573,6 +3591,74 @@ mod snapshot_forwarding_contract {
         assert_eq!(
             applied, 0,
             "integer pointer arithmetic must not be treated as an object root"
+        );
+    }
+
+
+    /// 9 (soundness): an FS/GS-relative store names a DIFFERENT linear address
+    /// than its numeric pointer, because the segment base can move it into an
+    /// unrelated object. Claiming "writes exactly alloca N" for such a store
+    /// would let a forward cross a barrier it must not cross.
+    #[test]
+    fn forward_refuses_a_segment_relative_store_as_a_known_target() {
+        for seg in [
+            crate::common::types::AddressSpace::SegFs,
+            crate::common::types::AddressSpace::SegGs,
+        ] {
+            let func = func_with(
+                0,
+                vec![
+                    alloca_at(1, 32),
+                    alloca_at(2, 32),
+                    alloca_at(3, 32),
+                    alloca_at(5, 32),
+                    memcpy(2, 1, 32),
+                    // Writes "alloca 5" numerically, but through a segment
+                    // base -- the real target is unknown.
+                    Instruction::Store {
+                        ptr: Value(5),
+                        val: Operand::Value(Value(1)),
+                        ty: IrType::Ptr,
+                        seg_override: seg,
+                        volatile: false,
+                    },
+                    intr(Some(10), IntrinsicOp::MinPs256, Some(3), vec![2, 1]),
+                ],
+            );
+            let applied = forward_memcpy_chains(&mut module_of(func));
+            assert_eq!(
+                applied, 0,
+                "a segment-relative store must not be treated as a known write target (seg={seg:?})"
+            );
+        }
+    }
+
+    /// 10 (positive control for #9): the same shape with an ordinary
+    /// default-address-space store IS a known target, and the forward fires.
+    #[test]
+    fn forward_allows_a_default_space_store_to_a_distinct_alloca() {
+        let func = func_with(
+            0,
+            vec![
+                alloca_at(1, 32),
+                alloca_at(2, 32),
+                alloca_at(3, 32),
+                alloca_at(5, 32),
+                memcpy(2, 1, 32),
+                Instruction::Store {
+                    ptr: Value(5),
+                    val: Operand::Value(Value(1)),
+                    ty: IrType::Ptr,
+                    seg_override: crate::common::types::AddressSpace::Default,
+                    volatile: false,
+                },
+                intr(Some(10), IntrinsicOp::MinPs256, Some(3), vec![2, 1]),
+            ],
+        );
+        let applied = forward_memcpy_chains(&mut module_of(func));
+        assert_eq!(
+            applied, 1,
+            "a default-space store to a distinct alloca must not block the forward"
         );
     }
 
