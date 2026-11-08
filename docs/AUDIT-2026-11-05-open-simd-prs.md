@@ -197,3 +197,107 @@ version (`ci_install_gcc_oracle.sh --version 16.2`, the "Debian exact-version
 oracle" workflow). The distro lanes test distro parity; the exact-version lane
 tests upstream 16.2. Local work uses the tag-cache 16.2.0 as required. Changing the
 distro lanes to 16.2.0 would destroy the parity coverage they exist for.
+
+
+---
+
+# Second pass, after rebasing onto `35a1e23`
+
+Main advanced while #1146 was in CI: **#1144 was merged** (`35a1e23`), #1141 and
+#1145 were force-updated, and **#1147 / #1148** were opened. Everything below was
+re-measured on the new heads, not carried over.
+
+## #1144 — MERGED
+
+The whitelist rewrite of `destination_unobserved_between` landed as reviewed
+above (`+543/−90` in `vector_temp_promotion.rs`). #1146 rebases onto it cleanly and
+its ratchet, census and both test lanes were re-run on the merged base.
+
+## #1141 — the formatting defect was fixed. **REPRODUCED FIXED.**
+
+Re-fetched head `9074e79` (force-updated; retitled "SIMD perfection: audited
+correctness fixes, red-team soundness proofs, 117 driver self-tests"):
+
+```
+$ cargo fmt --all -- --check    # /var/tmp/pr1141 @ 9074e79
+PR1141_FMT_RC=0
+0
+```
+
+Zero diffs, and `gh pr checks 1141` now reports **no failing checks**. The finding
+was acted on. The 117 self-tests themselves are **not verified here**.
+
+## #1147 — the identical defect, one PR later. **REPRODUCED.**
+
+`+412/−6` in 2 files. Merge state **UNSTABLE**; Clippy, "Rust 1.99 relocation
+value contracts" and the Test Suite aggregator all fail.
+
+```
+$ cargo fmt --all -- --check    # /var/tmp/pr1147 @ 9497b59
+PR1147_FMT_RC=1
+7
+Diff in src/passes/copy_prop.rs:16
+Diff in src/passes/copy_prop.rs:85
+Diff in src/passes/copy_prop.rs:233
+Diff in src/passes/copy_prop.rs:377
+Diff in src/passes/copy_prop.rs:2776
+...
+```
+
+The relocation lane's annotation carries **the same rustfmt diff**, so all three
+failures have one root cause. **Fix: `cargo fmt --all`.**
+
+**This is not a gate gap.** Both gates already exist and both fire correctly:
+
+* `.github/workflows/ci.yml`, Clippy lane: `run: cargo fmt --all -- --check`
+* `scripts/ci_local.sh:3637`: `gate "rustfmt" fast cargo fmt --all -- --check`
+
+The formatter is the *first* thing the Clippy lane does, which is why it fails in
+29 s. Two consecutive PRs pushed without running a gate that is present in both
+CI and the local suite. The lesson is the one #1146's own CI failure taught the
+hard way (see below): **run the cheap gates before pushing, not after**.
+
+## #1145 / #1148 — no failing checks at re-check
+
+`gh pr checks` reports no failures on either. #1145's `index < 2` operand guard
+and the #1144 interaction analysis above still stand; now that #1144 is merged,
+#1145's 7403 → 4523 claim should be re-measured against `35a1e23` rather than its
+old base. **Not verified here.**
+
+---
+
+# The defect CI found in #1146 itself
+
+Recorded because the same standard applies to my own work, and because it changed
+the design for the better.
+
+The first revision of `staging_line_text` used `.expect(...)` to make the
+"every reader is guarded by an `s` parser" invariant loud. Two CI lanes failed:
+
+* `Fast local contracts (shard b)` — `audit_census.py --check`
+* `Assembler and linker contracts` — step 88, `check_param_home_contracts.py`,
+  whose row **[12]** embeds the same census ratchet
+
+Root cause, reproduced locally:
+
+```
+FAIL: audit census grew:
+  panic_sites: 863 -> 864 (+1)
+```
+
+The census counts `.expect(` and `.unwrap(` as panic sites. Both lanes were green
+on the base commit, so this was mine.
+
+**Re-baselining would have been the lazy answer.** The `expect` guarded an
+already-inert value: all eleven readers were audited individually and every one
+returns `None` (or `""`) when handed `""` — ten start with
+`strip_prefix("<mnem> ")?` / `split_once(' ')?`, and `imm_of` maps a missing
+separator to `""` through `unwrap_or`. A pattern given `""` cannot match, so it
+does not fire. A future unguarded reader therefore costs a **missed optimization,
+never a miscompile**.
+
+`unwrap_or("")` is strictly better: identical safety, no panic site, one fewer
+branch in release. Verified after the change: census **PASS**, ratchet **PASS**,
+34 contracts **OK**, `check_param_home_contracts.py` **13/13 rows PASS**, and CI
+went **fully green** — `Assembler and linker contracts` and `Fast local contracts
+(shard b)` both SUCCESS on the fixed head.
