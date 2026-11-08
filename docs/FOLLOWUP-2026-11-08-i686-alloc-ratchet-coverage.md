@@ -123,5 +123,10 @@ different directories produces spurious `-g` diffs.
 * `cargo test --lib`: **8446 passed, 0 failed, 10 ignored**.
 * Same with `debug-assertions` **and** `overflow-checks`: **8460 passed, 0 failed,
   10 ignored**.
+
+Re-verified after rebasing onto `3be2663` (#1139, which added tests): fastbuild
+exit 0 / 0 warnings, clippy rc=0, and the strict lane **8471 passed, 0 failed,
+10 ignored**. The allocation A/B was repeated against the post-rebase binary and
+is unchanged: 974,342 -> 973,850, byte-identical.
 * Ratchet: **PASS, 372 files**.
 * Ratchet contracts: **17 passed**.
