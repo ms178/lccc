@@ -253,6 +253,16 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
         if func.is_declaration {
             continue;
         }
+        // Avoid allocating whole-function proof sets when this transform has
+        // no large-copy candidate.
+        if !func.blocks.iter().any(|block| {
+            block
+                .instructions
+                .iter()
+                .any(|inst| matches!(inst, Instruction::Memcpy { size, .. } if *size >= 128))
+        }) {
+            continue;
+        }
         // The rewrite only adds fresh GEP definitions and removes memcpys, so
         // these whole-function facts remain valid across its restart loop.
         let allocas = unique_nonvolatile_allocas(func);
@@ -301,6 +311,7 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
                                     ptr,
                                     ty,
                                     volatile: false,
+                                    seg_override: crate::common::types::AddressSpace::Default,
                                     ..
                                 } if dest_derived.contains(&ptr.0)
                                     && bi == block_idx
@@ -2709,8 +2720,16 @@ mod snapshot_forwarding_contract {
             ty: IrType::U8,
         };
         let mut safe = large_load_module(vec![gep(124)], 4, false);
+        let block = &mut safe.functions[0].blocks[0];
+        block.source_spans = (0..block.instructions.len())
+            .map(|i| crate::common::source::Span::new(i as u32 + 1, i as u32 + 2, 1))
+            .collect();
+        let original_load_span = block.source_spans.last().copied();
         assert_eq!(forward_large_memcpy_loads(&mut safe), 1);
         assert!(copies(&safe).is_empty());
+        let block = &safe.functions[0].blocks[0];
+        assert_eq!(block.instructions.len(), block.source_spans.len());
+        assert_eq!(block.source_spans.last().copied(), original_load_span);
         let mut cases = vec![
             large_load_module(
                 vec![Instruction::AtomicStore {
@@ -2742,8 +2761,40 @@ mod snapshot_forwarding_contract {
                 1,
                 false,
             ),
+            large_load_module(
+                vec![Instruction::Load {
+                    dest: Value(5),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: true,
+                }],
+                1,
+                false,
+            ),
+            large_load_module(
+                vec![Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Value(Value(9)),
+                }],
+                1,
+                false,
+            ),
             large_load_module(vec![gep(-1)], 4, false),
             large_load_module(vec![gep(125)], 4, false),
+            large_load_module(
+                vec![
+                    gep(i64::MAX),
+                    Instruction::GetElementPtr {
+                        dest: Value(5),
+                        base: Value(4),
+                        offset: Operand::Const(IrConst::I64(1)),
+                        ty: IrType::U8,
+                    },
+                ],
+                5,
+                false,
+            ),
             large_load_module(
                 vec![
                     gep(0),
@@ -2771,6 +2822,20 @@ mod snapshot_forwarding_contract {
         for (i, m) in cases.iter_mut().enumerate() {
             assert_eq!(forward_large_memcpy_loads(m), 0, "case {i}");
             assert_eq!(copies(m).len(), 1, "case {i}");
+        }
+    }
+
+    #[test]
+    fn large_snapshot_does_not_forward_segment_relative_loads() {
+        for space in [AddressSpace::SegFs, AddressSpace::SegGs] {
+            let mut m = large_load_module(vec![], 1, false);
+            if let Some(Instruction::Load { seg_override, .. }) =
+                m.functions[0].blocks[0].instructions.last_mut()
+            {
+                *seg_override = space;
+            }
+            assert_eq!(forward_large_memcpy_loads(&mut m), 0, "{space:?}");
+            assert_eq!(copies(&m).len(), 1, "{space:?}");
         }
     }
 

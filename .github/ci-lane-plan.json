@@ -1181,7 +1181,7 @@
     "frontend-a": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 365.57,
+      "predicted_gate_seconds": 367.57,
       "shards": 3,
       "steps": [
         {
@@ -1295,6 +1295,10 @@
         {
           "measured_s": 0.46,
           "name": "GNU retain section flags and linker garbage collection"
+        },
+        {
+          "measured_s": 2.0,
+          "name": "GNU object-placement declarator scopes"
         },
         {
           "measured_s": 1.0,
@@ -1876,8 +1880,8 @@
     },
     "frontend": {
       "costs": "/home/user/checkpoints/ci-main-union-costs.tsv",
-      "measured_seconds_total": 1056.94,
-      "source": "Union with main 662b771c0; retain both sides coverage and previously measured diagnostic gate costs. Four 2026-11-04 GCC-16.2 follow-up gates added to frontend-a with locally measured worst-of-3 wall times (scripts/ci_local.sh toolchain, fastbuild binaries): asm-constraints 1.65 s, vectorizer-openmp 0.93 s, gnu-declaration-corners 0.55 s, parser-depth-limits 0.34 s (worst-of-3 remeasured after the 64-spelling red-team differential gate landed)."
+      "measured_seconds_total": 1058.94,
+      "source": "Union with main 662b771c0; retain both sides coverage and previously measured diagnostic gate costs. Four 2026-11-04 GCC-16.2 follow-up gates added to frontend-a with locally measured worst-of-3 wall times (scripts/ci_local.sh toolchain, fastbuild binaries): asm-constraints 1.65 s, vectorizer-openmp 0.93 s, gnu-declaration-corners 0.55 s, parser-depth-limits 0.34 s (worst-of-3 remeasured after the 64-spelling red-team differential gate landed). GNU object-placement declarator scopes added to frontend-a (local worst of three 2.00 s; fastbuild and GCC 16.2)."
     }
   }
 }

@@ -68,7 +68,9 @@ pub(super) fn coalesce_register_copies(store: &mut LineStore, infos: &mut [LineI
             i += 1;
             continue;
         }
-        let line = infos[i].trimmed(store.get(i)).to_string();
+        // Most lines are not copy candidates. Borrow the store's text while
+        // classifying them instead of allocating a String for every line.
+        let line = infos[i].trimmed(store.get(i));
         // Rule 4: only the full 64-bit copy.
         let Some(rest) = line.strip_prefix("movq ") else {
             i += 1;

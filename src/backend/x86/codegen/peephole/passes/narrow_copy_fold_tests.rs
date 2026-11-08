@@ -1517,3 +1517,41 @@ fn an_inplace_zext_whose_cleared_bits_are_read_stays() {
         assert_eq!(count(&out, ext), 1, "{body}:\n{out}");
     }
 }
+
+#[test]
+fn copyback_borrowed_producer_preserves_both_commit_paths() {
+    use super::{classify_line, fold_induction_copyback};
+    use crate::backend::peephole_common::LineStore;
+
+    // Drive this pass directly, so a later peephole cannot repair or mask a
+    // broken edit. In the first case the old base is observed before the copy,
+    // so the LEA must be materialized at the copy site, not the producer site.
+    for (body, expected) in [
+        (
+            "    leaq 4(%rax), %r10\n    movl (%rax), %ecx\n    movl %ecx, (%rsi)\n    movq %r10, %rax\n    ret",
+            "leaq 4(%rax), %rax",
+        ),
+        (
+            "    leaq 8(%rdi), %r10\n    movq %r10, %rax\n    ret",
+            "leaq 8(%rdi), %rax",
+        ),
+    ] {
+        let asm = f(&format!("# ä: unrelated input remains intact\n{body}"));
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(fold_induction_copyback(&mut store, &mut infos), "{body}");
+        let out = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(out.contains(expected), "expected {expected}:\n{out}");
+        assert!(
+            !out.contains("%r10"),
+            "copy and old producer must go:\n{out}"
+        );
+        assert!(out.contains("# ä: unrelated input remains intact"), "{out}");
+    }
+}

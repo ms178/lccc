@@ -1321,8 +1321,10 @@ pub(super) fn fold_induction_copyback(store: &mut LineStore, infos: &mut [LineIn
         if infos[i].is_nop() || infos[i].is_barrier() || infos[i].pinned {
             continue;
         }
-        let producer_line = infos[i].trimmed(store.get(i)).to_string();
-        let Some((producer, t_fam)) = parse_copyback_producer(&producer_line) else {
+        // The parsed operands can borrow the store until the commit. Avoid
+        // copying every non-candidate line on each peephole invocation.
+        let producer_line = infos[i].trimmed(store.get(i));
+        let Some((producer, t_fam)) = parse_copyback_producer(producer_line) else {
             continue;
         };
 
@@ -1384,8 +1386,8 @@ pub(super) fn fold_induction_copyback(store: &mut LineStore, infos: &mut [LineIn
         let (Some(c), Some(d_fam)) = (c, d_fam_opt) else {
             continue;
         };
-        let copy_line = infos[c].trimmed(store.get(c)).to_string();
-        let Some((_, cs, cd)) = parse_reg_to_reg_mov(&copy_line) else {
+        let copy_line = infos[c].trimmed(store.get(c));
+        let Some((_, cs, cd)) = parse_reg_to_reg_mov(copy_line) else {
             continue;
         };
         if cs != t_fam || cd != d_fam || is_frame_family(cs) {
@@ -1579,14 +1581,12 @@ pub(super) fn fold_induction_copyback(store: &mut LineStore, infos: &mut [LineIn
             let CopybackProducer::Lea { disp, .. } = &producer else {
                 continue;
             };
-            mark_nop(&mut infos[i]);
             let d64 = REG_NAMES[W64][d_fam as usize];
-            replace_line(
-                store,
-                &mut infos[c],
-                c,
-                format!("    leaq {disp}({d64}), {d64}"),
-            );
+            // Own the replacement before mutating the store: `disp` borrows
+            // the original producer line, which the edit must not invalidate.
+            let replacement = format!("    leaq {disp}({d64}), {d64}");
+            mark_nop(&mut infos[i]);
+            replace_line(store, &mut infos[c], c, replacement);
         } else {
             replace_line(store, &mut infos[i], i, new_producer);
             mark_nop(&mut infos[c]);
