@@ -3258,10 +3258,6 @@ pub(crate) fn recognize_function(
                         ..
                     }) = xor
                     {
-                        let a = a;
-                        let b = b;
-                        let op = op;
-                        let x_ty = x_ty;
                         if x_ty == ty {
                             let a_fits = fits_low_bits(
                                 Operand::Value(a),

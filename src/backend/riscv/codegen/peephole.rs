@@ -5895,7 +5895,6 @@ fn fold_into_memory_operands(lines: &mut [String], kinds: &mut [LineKind], n: us
             // general register, so the extension may move into the load
             // across them (an acquire load is `lwu t0, 0(a0); fence r, rw;
             // sext.w a0, t0` as staged).
-            let mut j = j;
             while j < end && (kinds[j] == LineKind::Nop || rv_is_fence(&lines[j])) {
                 j += 1;
             }
