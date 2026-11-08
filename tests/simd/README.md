@@ -132,3 +132,83 @@ See `engineering/LIGHTPIXEL-AUDIT-2026-11-01.md` and its raw JSON receipts.
 The native U32 min/max component improves, but lccc's exact three-channel
 RGB/alpha graph remains scalar. Do not describe this gate as proof that the
 LLVM PR227303 profitability optimization is implemented.
+
+## Implementation-audit reproducer pack (2026-11-08)
+
+Evidence and fix plans: `engineering/SIMD-IMPLEMENTATION-AUDIT-2026-11-08.md`
+(§9c).  Six files, all additive, no compiler sources touched.
+
+| File | Role |
+|------|------|
+| `audit_repro_2026-11-08.c` | C99 entry-point library; `list` enumerates all eight |
+| `probe_utils.py` | shared process/CPUID/diagnostic layer, no side effects |
+| `check_audit_2026-11-08.py` | 15-row finding driver (9 open + 6 controls) |
+| `simd_shape_matrix.c` | 29 bit-exact differential shapes, three tiers |
+| `check_simd_shape_matrix.py` | 12 optimization/ISA flag sets, sanitizer + bench legs |
+| `test_audit_pack.py` | 16 unittest cases, wired by the existing CI discovery step |
+
+### Finding driver
+
+```sh
+python3 tests/simd/check_audit_2026-11-08.py --list-rows
+python3 tests/simd/check_audit_2026-11-08.py --self-test
+python3 tests/simd/check_audit_2026-11-08.py --lccc target/fastbuild/lccc --reference gcc-16
+python3 tests/simd/check_audit_2026-11-08.py --lccc target/fastbuild/lccc --strict
+python3 tests/simd/check_audit_2026-11-08.py --lccc "$(which gcc)" --strict  # harness oracle
+```
+
+Rows tagged `open` are expected to fail and print `OPEN-CONFIRMED` (a report,
+not a failure).  Rows tagged `pass` are **controls** and must print `PASS`;
+a failing control is `REGRESSION` and is hard in both modes.  A passing open
+row is `STALE-OPEN` (hard in default mode: reconcile §9c or flip the row tag).
+`ERROR` is infrastructure and always hard; `SKIP` means the host lacks the
+CPUID feature needed to execute the compiled probe and is never hard.
+`--strict` inverts the open rows into required passes for post-fix validation.
+A compiler without the findings (GCC) is strict-green — that is the harness's
+own end-to-end check.  `--json` writes a schema-1 receipt and creates parent
+directories; `--compile-timeout` / `--run-timeout` bound every child process.
+
+Compile-only rows classify a failed compile as a pass **only** when stderr is
+a real diagnostic.  An ICE, a timeout, an empty stderr or a missing toolchain
+is `ERROR`.  Asm rows prove the kernel was emitted (function label plus a
+multiply) before asserting that an instruction is absent; `sa33_asm` also
+requires `vzeroupper` after `vinserti32x4`.  Runtime rows gate on host CPUID,
+not on target predefined macros, and `-ffp-contract` is pinned for SA-02 with
+an `=off` control.
+
+The driver is **not** a hard CI gate.  54/54 findings are source-anchored
+(S-evidence) and none is reproduced yet, so a candidate that does not exhibit
+an open finding would report `STALE-OPEN` and could turn CI red for want of
+runtime confirmation.  It becomes a gate after the S→R promotions land.
+What is gated today is the harness itself, through `test_audit_pack.py`.
+
+### Shape matrix
+
+```sh
+python3 tests/simd/check_simd_shape_matrix.py --candidate gcc --reference gcc --sanitize --bench
+python3 tests/simd/check_simd_shape_matrix.py --candidate target/fastbuild/lccc --quick
+```
+
+Every shape has a vectorizable `fast()` and a de-optimized `ref()` oracle
+(volatile induction variable).  For each of the 12 flag sets the driver checks
+that the two digests agree within the build and that both match a shared
+`-O0` reference build.  Any compiler diagnostic is an infrastructure error —
+zero warnings is a hard requirement.  `--sanitize` adds an ASan+UBSan leg;
+`--bench` reports median ns/iteration per shape on the host CPU without
+polluting the compared stdout stream.  Shapes come from `tests/bench/k_*.c`,
+`tests/benchmark/kernel_corpus/k*.c`, the C sources in `tests/simd/`, and the
+ms178/archpkgbuilds packages (zlib-ng, gzip, zstd, SQLite, expat, curl,
+glibc, Linux jhash, LightPixel, simdjson, Chromium/Skia, FFmpeg,
+libjpeg-turbo); `list` prints each shape's provenance.  The corpus is C99 and
+portable to x86-64, i686, AArch64 and RISC-V: no POSIX calls, no `_Alignas`,
+no strict-aliasing puns, AVX-512 behind predefined macros with scalar
+fallbacks.
+
+### CI integration
+
+`test_audit_pack.py` is discovered by the existing
+`python3 -m unittest discover -s tests/simd -p 'test_*.py'` gate step.  Adding
+a test file changes **no workflow text**, so `.github/ci-lane-plan.json`
+stays byte-identical and `tests/regression/check_ci_lane_plan.py` stays green.
+Adding a step to a sharded lane would instead require regenerating the whole
+plan — deliberately avoided.

@@ -1551,6 +1551,18 @@ fn byte_ranges_overlap(off1: i64, size1: i64, off2: i64, size2: i64) -> bool {
 // Pack graph
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Fused multiply-add/subtract form produced by SLP contraction.
+/// Result = (np ? −1 : +1)·(a·b) + (na ? −1 : +1)·acc.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PackedFmaForm {
+    /// `acc + a·b` — vfmadd / VecMadd*.
+    Add,
+    /// `acc − a·b` — vfnmadd / VecMadd*Signed(true, false).
+    SubProduct,
+    /// `a·b − acc` — vfmsub / VecMadd*Signed(false, true).
+    SubAcc,
+}
+
 #[derive(Clone, Debug)]
 enum PackKind {
     /// N consecutive-address loads → one vector load. `ptrs[i]` is the
@@ -1596,9 +1608,15 @@ enum PackKind {
     /// build; the FP contract is threaded from the driver (Fast for C,
     /// exactly the scalar contraction's policy).
     Fma {
-        /// false: dest = acc + a·b (vfmadd); true: dest = acc − a·b
-        /// (vfnmadd).
-        negate: bool,
+        /// The algebraic form.  A single `negate` bit CANNOT represent the
+        /// four fused shapes: `x*k - z` (product on the LHS of a Sub) is
+        /// `a·b − acc` (vfmsub), while `z - x*k` (product on the RHS) is
+        /// `acc − a·b` (vfnmadd).  SA-02 measured the old bit conflating
+        /// them, producing −3 where the source demanded 3.  The backend
+        /// already has all four families (`VecFma/VecFnma/VecFms/VecFnms`
+        /// at 128 bits, `VecMadd*Signed(np, na)` at 256 bits), so this is a
+        /// pure classification fix with no new codegen.
+        form: PackedFmaForm,
         acc: usize,
         a: usize,
         b: usize,
@@ -4581,7 +4599,20 @@ fn build_pack(
                                     let idx = packs.len();
                                     packs.push(Pack {
                                         kind: PackKind::Fma {
-                                            negate: op == IrBinOp::Sub,
+                                            // orientation == Some(true):
+                                            // multiplication is the LHS of
+                                            // the add/sub, so `Sub` means
+                                            // (a·b) − acc.  Some(false):
+                                            // acc − (a·b).  `Add` is
+                                            // commutative and always fma.
+                                            form: match (op, orientation) {
+                                                (IrBinOp::Add, _) => PackedFmaForm::Add,
+                                                (IrBinOp::Sub, Some(true)) =>
+                                                    PackedFmaForm::SubAcc,
+                                                (IrBinOp::Sub, _) =>
+                                                    PackedFmaForm::SubProduct,
+                                                _ => unreachable!("Fma pack from non-add/sub"),
+                                            },
                                             acc: acc_p,
                                             a: a_p,
                                             b: b_p,
@@ -6341,7 +6372,7 @@ fn apply_plan(
             // No instruction: the pack's vector IS the forwarded value.
             // (No extracts ride with it either — `lane_vals` is empty.)
             PackKind::Forward { .. } => continue,
-            PackKind::Fma { negate, acc, a, b } => Instruction::Intrinsic {
+            PackKind::Fma { form, acc, a, b } => Instruction::Intrinsic {
                 dest: Some(dest),
                 // WIDTH-EXACT op selection. The pack's lane count must
                 // match the intrinsic's register width: a width-4 F64
@@ -6361,15 +6392,23 @@ fn apply_plan(
                 // true, false) = −(a·b) + acc. Rounding parity holds for
                 // both widths: one fused mul-add per lane, the same
                 // single rounding the scalar gap-fused contraction takes.
-                op: match (*negate, cand.ty, cand.width) {
-                    (false, IrType::F64, 2) => IntrinsicOp::VecFmaF64x2,
-                    (true, IrType::F64, 2) => IntrinsicOp::VecFnmaF64x2,
-                    (false, IrType::F64, 4) => IntrinsicOp::VecMaddF64x4,
-                    (true, IrType::F64, 4) => IntrinsicOp::VecMaddF64x4Signed(true, false),
-                    (false, IrType::F32, 4) => IntrinsicOp::VecFmaF32x4,
-                    (true, IrType::F32, 4) => IntrinsicOp::VecFnmaF32x4,
-                    (false, IrType::F32, 8) => IntrinsicOp::VecMaddF32x8,
-                    (true, IrType::F32, 8) => IntrinsicOp::VecMaddF32x8Signed(true, false),
+                op: match (*form, cand.ty, cand.width) {
+                    (PackedFmaForm::Add, IrType::F64, 2) => IntrinsicOp::VecFmaF64x2,
+                    (PackedFmaForm::SubProduct, IrType::F64, 2) => IntrinsicOp::VecFnmaF64x2,
+                    (PackedFmaForm::SubAcc, IrType::F64, 2) => IntrinsicOp::VecFmsF64x2,
+                    (PackedFmaForm::Add, IrType::F64, 4) => IntrinsicOp::VecMaddF64x4,
+                    (PackedFmaForm::SubProduct, IrType::F64, 4) =>
+                        IntrinsicOp::VecMaddF64x4Signed(true, false),
+                    (PackedFmaForm::SubAcc, IrType::F64, 4) =>
+                        IntrinsicOp::VecMaddF64x4Signed(false, true),
+                    (PackedFmaForm::Add, IrType::F32, 4) => IntrinsicOp::VecFmaF32x4,
+                    (PackedFmaForm::SubProduct, IrType::F32, 4) => IntrinsicOp::VecFnmaF32x4,
+                    (PackedFmaForm::SubAcc, IrType::F32, 4) => IntrinsicOp::VecFmsF32x4,
+                    (PackedFmaForm::Add, IrType::F32, 8) => IntrinsicOp::VecMaddF32x8,
+                    (PackedFmaForm::SubProduct, IrType::F32, 8) =>
+                        IntrinsicOp::VecMaddF32x8Signed(true, false),
+                    (PackedFmaForm::SubAcc, IrType::F32, 8) =>
+                        IntrinsicOp::VecMaddF32x8Signed(false, true),
                     // The pack builder only creates Fma packs for F64/F32
                     // lanes at the family widths `family_for` admits
                     // (F64: 2 and 4-under-AVX2; F32: 4 and 8-under-AVX2).
@@ -6741,14 +6780,8 @@ fn apply_plan(
                         .join(",")
                 ),
                 PackKind::Forward { val } => format!("Forward(v{})", val.0),
-                PackKind::Fma { negate, acc, a, b } => {
-                    format!(
-                        "Fma({} acc{} a{} b{})",
-                        if *negate { "-" } else { "+" },
-                        acc,
-                        a,
-                        b
-                    )
+                PackKind::Fma { form, acc, a, b } => {
+                    format!("Fma({:?} acc{} a{} b{})", form, acc, a, b)
                 }
                 PackKind::BinOp { op, lhs, rhs, .. } => {
                     format!("BinOp({:?} l{} r{})@{}", op, lhs, rhs, p.sched)

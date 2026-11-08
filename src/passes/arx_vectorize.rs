@@ -1028,6 +1028,18 @@ fn analyze_arx_loop(
                 return None;
             }
         }
+        // Terminators carry operands too (notably `return state[j]`).
+        // All operand-bearing terminators are rewritable by
+        // rewrite_terminator_operands(), so this is a completeness check,
+        // not a bail: it keeps the fail-closed invariant auditable.
+        if terminator_uses_any(&blk.terminator, &xs_phis) {
+            // No further restriction needed: every variant with an operand
+            // is rewritten below.  Assert the invariant stays true if the
+            // Terminator enum ever grows a non-rewritable operand.
+            debug_assert!(matches!(&blk.terminator,
+                Terminator::Return(Some(_)) | Terminator::CondBranch { .. }
+                | Terminator::IndirectBranch { .. } | Terminator::Switch { .. }));
+        }
     }
 
     // The counter's backedge value (its defining add is retained by the
@@ -1054,6 +1066,35 @@ fn analyze_arx_loop(
         shape_kc: shape.kc,
         shape_kd: shape.kd,
     })
+}
+
+/// Rewrite operands carried by a block TERMINATOR.  `Return(value)` is not
+/// an Instruction: SA-07's `return j;` referenced a loop word-phi through
+/// the terminator, and the old outside-use rewrite (which only walked
+/// `block.instructions`) left it dangling after the word phis were deleted.
+/// The backend then hit its hard "cannot be materialised" gate and panicked.
+/// Every Terminator variant with an operand is handled; Branch/Unreachable
+/// have none.
+fn rewrite_terminator_operands(t: &mut Terminator, f: &mut dyn FnMut(&mut Operand)) {
+    match t {
+        Terminator::Return(Some(op)) => f(op),
+        Terminator::CondBranch { cond, .. } => f(cond),
+        Terminator::IndirectBranch { target, .. } => f(target),
+        Terminator::Switch { val, .. } => f(val),
+        Terminator::Return(None) | Terminator::Branch(_) | Terminator::Unreachable => {}
+    }
+}
+
+/// Does a terminator reference any of the given values?
+fn terminator_uses_any(t: &Terminator, vals: &[Value; 16]) -> bool {
+    let hit = |op: &Operand| matches!(op, Operand::Value(v) if vals.contains(v));
+    match t {
+        Terminator::Return(Some(op)) => hit(op),
+        Terminator::CondBranch { cond, .. } => hit(cond),
+        Terminator::IndirectBranch { target, .. } => hit(target),
+        Terminator::Switch { val, .. } => hit(val),
+        Terminator::Return(None) | Terminator::Branch(_) | Terminator::Unreachable => false,
+    }
 }
 
 /// Does this instruction reference any of the given values as an operand?
@@ -1678,6 +1719,13 @@ fn transform_arx_loop(
                 }
             });
         }
+        rewrite_terminator_operands(&mut blk.terminator, &mut |op: &mut Operand| {
+            if let Operand::Value(v) = op {
+                if let Some(xk) = arx.word_phis.iter().position(|&p| p == *v) {
+                    *op = Operand::Value(x_extract[xk]);
+                }
+            }
+        });
     }
 
     // ---- Delete the dead word phis from the header. ----

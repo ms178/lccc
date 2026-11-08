@@ -2005,6 +2005,30 @@ AoS probe compilation now denies warnings and process timeouts kill compiler
 descendants as well as their parent. The complete audit and its measured limits
 are in `engineering/SIMD-ADDRESS-FOLD-AUDIT-2026-10-31.md`.
 
+## 9c. SIMD implementation deep audit (2026-11-08)
+
+The implementation-level follow-up to §9b lives in
+`engineering/SIMD-IMPLEMENTATION-AUDIT-2026-11-08.md`.  The split is
+deliberate: this file is the programme index (§9a / §9b / §9c / §10), the
+audit document holds the evidence, the 70 source anchors and the fix plans.
+Section numbers `9c.0`–`9c.8` and all `SA-xx` IDs are stable across it.
+
+- 54 findings (SA-01…SA-54), 35 classes: 6 P0 / 19 P1 / 20 P2 / 9 P3.
+- Evidence grade: 54/54 **S** (source-anchored), 0/54 **R** (reproduced).
+  This is a defect register, not a confirmed-bug list; §9c.0 says to run the
+  reproducers before relying on any claim.
+- Anchors re-verified against `3be2663`; five were re-anchored after the four
+  post-audit upstream commits.  §9c.7 reconciles SV-01…SV-12 with that code.
+- Artifacts (§9c.6): `tests/simd/audit_repro_2026-11-08.c`,
+  `check_audit_2026-11-08.py`, `probe_utils.py`, `simd_shape_matrix.c`,
+  `check_simd_shape_matrix.py` and `test_audit_pack.py`.
+- Coverage (§9c.8): 9/54 findings have an executable row; the driver has
+  15 rows (9 open + 6 controls); the shape matrix runs 29 bit-exact shapes
+  over 12 optimization/ISA flag sets.
+
+Edit the audit document, not a copy of the register here, and keep this
+pointer's counters in sync.
+
 ## 10. Carried over from the superseded live queue (full text in the archives)
 
 Everything open in the 478-line queue that this file replaces is listed here with

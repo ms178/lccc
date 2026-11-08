@@ -1098,8 +1098,23 @@ fn try_transform_loop(
     if exits.is_empty() {
         return 0;
     }
-    // Every exit target's OTHER predecessors must be dominated by the
-    // preheader (V_init live on those edges).
+    // Soundness of exit re-materialization (SA-06).  The transform inserts
+    // `VecStoreI32x4` of the packed state at the TOP of each exit block, so
+    // those stores must execute EXACTLY ONCE per path reaching the exit.
+    // Two CFG shapes break that invariant:
+    //   (a) an exit block that is itself a loop header: the stores re-run on
+    //       every iteration of that outer/feed-forward loop, and the
+    //       synthesized phi's backedge incoming would be V_init (the PRE-
+    //       round state), clobbering x[] mid-accumulation;
+    //   (b) a predecessor that is not the loop or its preheader (an early
+    //       `goto out` bypass): that path's own writes to x[] happen AFTER
+    //       V_init was loaded in the preheader, so storing V_init back
+    //       discards them, and V_init does not even dominate that edge.
+    // Dominance of the preheader alone is NOT sufficient for either.
+    // Fail closed: accept only exit targets whose predecessors are loop
+    // blocks or the preheader itself, and which are not loop headers.
+    // The ordinary ChaCha shape (one exit edge into straight-line code) is
+    // unaffected; only these ambiguous CFGs decline.
     for &(src, target) in &exits {
         let _ = src;
         let exit_idx = match func.blocks.iter().position(|b| b.label.0 == target) {
@@ -1107,11 +1122,19 @@ fn try_transform_loop(
             None => return 0,
         };
         for (bi, b) in func.blocks.iter().enumerate() {
-            if bi == exit_idx || loop_labels.contains(&b.label.0) {
+            if bi == exit_idx || !terminator_targets(&b.terminator).contains(&target) {
                 continue;
             }
-            if terminator_targets(&b.terminator).contains(&target) && !dom.dominates(preheader, bi)
-            {
+            // (a) exit dominates a predecessor ⇒ predecessor→exit is a
+            //     backedge, so the exit block is a loop header.
+            if dom.dominates(exit_idx, bi) {
+                return 0;
+            }
+            if loop_labels.contains(&b.label.0) {
+                continue;
+            }
+            // (b) only the preheader may supply V_init to an outside edge.
+            if bi != preheader {
                 return 0;
             }
         }
