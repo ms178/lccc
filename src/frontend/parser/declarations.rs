@@ -38,6 +38,10 @@ struct DeclContext {
     spec_tls_model: Option<crate::common::tls::TlsModel>,
     spec_noinline: bool,
     spec_calling_convention: Option<crate::common::types::CallingConvention>,
+    spec_retain: bool,
+    spec_noinit: bool,
+    spec_persistent: bool,
+    spec_nocommon: bool,
 }
 
 /// Parser-side mirror of `common::type_builder::apply_declaration_address_space`
@@ -211,6 +215,12 @@ impl Parser {
 
         // Handle post-type storage class specifiers (C allows "struct S typedef name;")
         self.consume_post_type_qualifiers();
+        // Snapshot before parsing the first declarator: specifier attributes
+        // apply to every sibling, but an attribute on one declarator does not.
+        let spec_retain = self.attrs.parsing_retain();
+        let spec_noinit = self.attrs.parsing_noinit();
+        let spec_persistent = self.attrs.parsing_persistent();
+        let spec_nocommon = self.attrs.parsing_nocommon();
         // Specifier-position applicability records are settled here, before
         // the declarator (parameters, post-declarator attributes) can add
         // unrelated entries to the pool.
@@ -425,6 +435,10 @@ impl Parser {
                 spec_tls_model,
                 spec_noinline,
                 spec_calling_convention,
+                spec_retain,
+                spec_noinit,
+                spec_persistent,
+                spec_nocommon,
             };
             self.parse_declaration_rest(type_spec, name, derived, start, ctx)
         }
@@ -1046,6 +1060,10 @@ impl Parser {
         self.attrs.set_weak(false);
         self.attrs.first_attr_span = None;
         self.attrs.set_noplt(false);
+        self.attrs.set_retain(false);
+        self.attrs.set_noinit(false);
+        self.attrs.set_persistent(false);
+        self.attrs.set_nocommon(false);
         self.attrs.parsing_alias_target = None;
         self.attrs.parsing_ifunc_target = None;
         self.attrs.parsing_target_clones = None;
@@ -1288,6 +1306,14 @@ impl Parser {
             let d_cleanup_fn = self.attrs.parsing_cleanup_fn.take();
             let d_used = self.attrs.parsing_used();
             let d_maybe_unused = self.attrs.parsing_maybe_unused();
+            let d_retain = ctx.spec_retain || self.attrs.parsing_retain();
+            let d_noinit = ctx.spec_noinit || self.attrs.parsing_noinit();
+            let d_persistent = ctx.spec_persistent || self.attrs.parsing_persistent();
+            let d_nocommon = ctx.spec_nocommon || self.attrs.parsing_nocommon();
+            self.attrs.set_retain(false);
+            self.attrs.set_noinit(false);
+            self.attrs.set_persistent(false);
+            self.attrs.set_nocommon(false);
             let d_noreturn = self.attrs.parsing_noreturn();
             let d_pure = self.attrs.parsing_pure();
             let d_const_attr = self.attrs.parsing_const_attr();
@@ -1307,6 +1333,12 @@ impl Parser {
             } else {
                 None
             };
+            // Attributes seen inside an initializer belong to nested syntax,
+            // not this object or the next sibling.
+            self.attrs.set_retain(false);
+            self.attrs.set_noinit(false);
+            self.attrs.set_persistent(false);
+            self.attrs.set_nocommon(false);
             let d_fastcall = self.attrs.parsing_fastcall();
             let d_regparm = self.attrs.parsing_regparm;
             declarators.push(InitDeclarator {
@@ -1325,6 +1357,10 @@ impl Parser {
                     da.set_const_attr(d_const_attr);
                     da.set_used(d_used);
                     da.set_maybe_unused(d_maybe_unused || spec_maybe_unused);
+                    da.set_retain(d_retain);
+                    da.set_noinit(d_noinit);
+                    da.set_persistent(d_persistent);
+                    da.set_nocommon(d_nocommon);
                     da.set_noplt(spec_noplt);
                     da.set_fastcall(d_fastcall);
                     da.regparm = d_regparm;
@@ -1352,6 +1388,22 @@ impl Parser {
             if self.attrs.parsing_maybe_unused() {
                 last_decl.attrs.set_maybe_unused(true);
                 self.attrs.set_maybe_unused(false);
+            }
+            if self.attrs.parsing_retain() {
+                last_decl.attrs.set_retain(true);
+                self.attrs.set_retain(false);
+            }
+            if self.attrs.parsing_noinit() {
+                last_decl.attrs.set_noinit(true);
+                self.attrs.set_noinit(false);
+            }
+            if self.attrs.parsing_persistent() {
+                last_decl.attrs.set_persistent(true);
+                self.attrs.set_persistent(false);
+            }
+            if self.attrs.parsing_nocommon() {
+                last_decl.attrs.set_nocommon(true);
+                self.attrs.set_nocommon(false);
             }
             if let Some(cleanup) = self.attrs.parsing_cleanup_fn.take() {
                 last_decl.attrs.cleanup_fn = Some(cleanup);
