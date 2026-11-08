@@ -199,6 +199,24 @@ showed +4.7 %, contradicting the allocation result; `ps` then showed
 only meaningful when the box is idle — which is why the numbers above were taken
 after every lane exited.
 
+## Output identity across both changed backends
+
+The patch touches only x86-64 (51 sites) and i686 (11 sites); arm and riscv have
+zero changes, so those two backends cover 100 % of it. A/B over **1,349 sources**
+(`tests/bench/k_*.c`, `tests/regression/*.c`, `tests/regression/alloc_cost/*.c`)
+× 7 option sets — `-O1`, `-O2`, `-O2 -g`, `-O3`, `-O2 -m32`, `-O1 -m32`,
+`-O2 -m32 -g` — = **9,443 compiles per arm**:
+
+| | |
+| --- | --- |
+| byte-identical | **6,375** |
+| **differing** | **0** |
+| rejected identically by both arms | 3,068 |
+
+Both arms are invoked at identical directory depth, because LCCC embeds include
+paths derived from its own location into DWARF; comparing binaries in different
+directories produces spurious `-g` diffs.
+
 ## Verification
 
 | check | result |
