@@ -906,8 +906,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Identity is captured before the matrix, never inferred later from a
     # possibly rebuilt binary or a rebased checkout. Paths alone are not pins.
     is_32 = args.arch in ("i686", "i386")
-    identity = run_identity(args, sources, args.suite, is_32)
-    fatal = reference_preflight(args, runner_cmd)
+    # Even an identity-capture fault needs a partial report and an
+    # infrastructure exit, rather than an uncaught exception (exit 1 is also
+    # used for completed candidate failures by advisory wrappers).
+    identity = {"arch": args.arch, "mode": args.mode}
+    fatal = None
 
     def save(complete: bool) -> None:
         if args.json:
@@ -926,6 +929,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     results, key=lambda r: (r.test, flags.index(r.flags)))],
             })
 
+    try:
+        identity = run_identity(args, sources, args.suite, is_32)
+        fatal = reference_preflight(args, runner_cmd)
+    except Exception as exc:  # noqa: BLE001 - infrastructure fault, not a candidate result
+        fatal = f"identity/reference preflight fault: {type(exc).__name__}: {exc}"
     save(False)
     if fatal:
         print("error: " + fatal, file=sys.stderr)
@@ -1006,7 +1014,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     elapsed = time.monotonic() - started
     if not counts["pass"] and all(status in QUIET_STATUSES for status in counts):
         fatal = "no eligible case passed; an all-skipped run is not validation"
-    drifted = identity_drift(args, sources, identity, args.suite, is_32)
+    try:
+        drifted = identity_drift(args, sources, identity, args.suite, is_32)
+    except Exception as exc:  # noqa: BLE001 - failure to verify is not a completed run
+        fatal = (fatal or "") + ("; " if fatal else "") + (
+            f"cannot verify run identity after execution: {type(exc).__name__}: {exc}")
+        save(False)
+        print(f"error: {fatal}", file=sys.stderr)
+        return 2
     if drifted:
         # The pre-run identity stands (it is what the cases actually ran
         # against); what the drift invalidates is the run's claim to be

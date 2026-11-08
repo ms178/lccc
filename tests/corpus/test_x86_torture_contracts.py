@@ -375,6 +375,29 @@ class RunnerContract(unittest.TestCase):
             drift = torture.identity_drift(args, [self.source], identity, self.suite, False)
         self.assertIn("dependency_digest", drift)
 
+    def test_identity_preflight_fault_is_incomplete_infrastructure_failure(self):
+        with mock.patch.object(torture, "run_identity", side_effect=OSError("unreadable oracle")):
+            self.assertEqual(self.invoke(), 2)
+        report = json.loads(self.report.read_text())
+        self.assertFalse(report["complete"])
+        self.assertIn("identity/reference preflight fault", report["fatal"])
+        self.assertIn("unreadable oracle", report["fatal"])
+        self.assertEqual(report["completed_cases"], 0)
+
+    def test_disappearing_source_during_run_is_infrastructure_failure(self):
+        def remove_source(case, **kwargs):
+            case.source.unlink()
+            return self.result(case)
+        with mock.patch.object(torture, "reference_preflight", return_value=None), \
+             mock.patch.object(torture, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")), \
+             mock.patch.object(torture, "compile_case", side_effect=remove_source):
+            self.assertEqual(self.invoke(["--gcc", sys.executable]), 2)
+        report = json.loads(self.report.read_text())
+        self.assertFalse(report["complete"])
+        self.assertIn("cannot verify run identity after execution", report["fatal"])
+        self.assertIn("FileNotFoundError", report["fatal"])
+        self.assertEqual(report["completed_cases"], 1)
+
     def test_mid_run_top_level_source_change_invalidates_report(self):
         # The selected source digest is nested inside selection, not a
         # top-level report key. A header-free source exposes a comparison that
