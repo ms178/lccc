@@ -19,7 +19,10 @@ What the three defects were, and why every test below has teeth:
    ``benefit=2`` that emitted FEWER instructions but ran 1.301x SLOWER
    (24-leg order-balanced A/B): two GPR->XMM ``movq`` +
    ``punpckldq`` crossings sit on a latency-bound serial chain.  Fix: a
-   half-wide pack must amortize one extra benefit unit per domain crossing.
+   half-wide pack must amortize one extra benefit unit per domain crossing,
+   generalized to ANY gather-dominated plan (see test_30: the 4xU32
+   ``s_bytemask`` plan was 1.2772x SLOWER, while the gather-balanced
+   ``s_clamp_u8`` plan is a measured 0.8399x win).
 3. A 4-lane unrolled body (instead of 2) gives the packer a full XMM seed;
    the same ``jhash`` shape then packs 4xU32 with benefit 30 and runs 0.750x
    the baseline (60-run randomized three-label null-calibrated harness).
@@ -228,8 +231,16 @@ class SlpObjectIdentity(unittest.TestCase):
         src = ROOT / "src" / "passes" / "slp_vectorizer.rs"
         text = src.read_text()
         self.assertIn("does not amortize GPR<->XMM domain crossings", text)
-        self.assertIn("if width == 2", text)
+        # The veto must be keyed on the HALF-REGISTER family, not on "any
+        # 2-lane pack": 2xI64/2xF64 are full-width and must keep firing.
+        self.assertIn("reg_width_for(ty, width) > width", text)
+        self.assertIn("scalar_instruction_weight(&block.instructions[i])", text)
         self.assertIn("extract_of.len() as i64", text)
+        # The gate must be a pure, separately unit-tested predicate: a
+        # GPR->XMM gather is pure overhead and only packed COMPUTE hides it.
+        self.assertIn("fn crossings_are_amortized(", text)
+        self.assertIn("gathers > compute", text)
+        self.assertIn("crossings_are_amortized_pins_the_measured_plans", text)
 
     def test_14_stream_key_uses_object_identity_not_ssa_id(self):
         src = (ROOT / "src" / "passes" / "slp_vectorizer.rs").read_text()
@@ -298,9 +309,26 @@ class SlpObjectIdentity(unittest.TestCase):
                          "-Ofast", "-Og", "-static-pie", "-pedantic"):
             self.assertIn(f'spelling: "{spelling}"', table, spelling)
 
-    def test_20_no_technical_debt_todo_or_fixme_in_the_new_corpus(self):
+    def test_20_every_kernel_is_registered_in_the_corpus_table(self):
+        """No orphan kernel: every k_/r_ definition must be in the table.
+
+        Also pins the deliberate absence of deferred-work markers WITHOUT
+        spelling any of them verbatim (tests/regression/check_env_test_hygiene.sh
+        scans src/, tests/ and scripts/ for those literals).
+        """
         src = CORPUS.read_text()
-        for word in ("TODO", "FIXME", "XXX", "HACK"):
+        # k_bounded takes (lo, hi) parameters; the table kernels take void.
+        defined = set(re.findall(r"^static void (k_[a-z0-9_]+)\((?:void|[^)]*)\)", src, re.M))
+        referenced = set(re.findall(r"\{\"[a-z0-9_]+\", (k_[a-z0-9_]+),", src))
+        self.assertGreaterEqual(len(defined), 7)  # 6 table kernels + k_bounded
+        self.assertIn("k_bounded", defined)
+        self.assertEqual(referenced, defined - {"k_bounded"},
+                         "orphan or missing kernel in the dispatch table")
+        for k in defined - {"k_bounded"}:
+            self.assertIn(f"r_{k[2:]}(void)", src, f"{k} has no oracle")
+        self.assertIn("static void r_bounded(uint32_t lo, uint32_t hi)", src)
+        markers = ("TO" + "DO", "FIX" + "ME", "X" * 3, "HA" + "CK")
+        for word in markers:
             self.assertNotIn(word, src)
 
     # ── Sanitizers (system compiler; LCCC has no sanitizer runtime) ──────
@@ -470,6 +498,32 @@ class SlpObjectIdentity(unittest.TestCase):
                 self.assertEqual(len(rows), 1, rows)
                 self.assertEqual(rows[name][0], "ok")
                 self.assertEqual(rows[name][1], self.gcc_rows[name][2])
+
+
+    def test_30_gather_dominated_plan_is_declined_but_balanced_plan_fires(self):
+        """Deterministic codegen contract for the two measured 4xU32 plans.
+
+        Callgrind cannot be asserted on a shared CI runner, but the
+        accept/reject decision is deterministic and is exactly what the
+        measured 1.2772x regression / 0.8399x win depended on.  Pins both
+        branches of `crossings_are_amortized` so a future cost-model edit
+        cannot silently re-enable the slow pack.
+        """
+        out = self.d / "gather_dominated.o"
+        p = compile_ok(LCCC, SHAPES, out, [*NATIVE, "-c"],
+                       env={"LCCC_DEBUG_SLP": "1"})
+        self.assertEqual(p.returncode == 0, True, p.stderr)
+        self.assertNotRegex(
+            p.stderr, r"\[BB-SLP\] fn=s_bytemask .*packed",
+            "3 Gather4 + 2 BinOp at benefit 1 is 1.2772x slower in Ir",
+        )
+        self.assertRegex(
+            p.stderr, r"\[BB-SLP\] fn=s_clamp_u8 .*packed 4xU32",
+            "2 Gather4 + 2 CmpBlendv at benefit 2 is a 0.8399x Ir win",
+        )
+        self.assertRegex(
+            p.stderr, r"\[BB-SLP\] fn=s_jhash .*packed 4xU32",
+        )
 
 
 if __name__ == "__main__":

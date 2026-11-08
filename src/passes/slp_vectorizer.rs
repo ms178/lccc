@@ -1784,6 +1784,71 @@ enum PackKind {
     },
 }
 
+/// Does a DELETED scalar IR instruction correspond to (at least) one machine
+/// instruction that the SLP rewrite removes?
+///
+/// EXHAUSTIVE on purpose: a new `Instruction` variant must make an explicit
+/// choice here, instead of silently inheriting a default that would corrupt
+/// the cost model.  The first version copied the joint-seed path's six-class
+/// `matches!` and OMITTED `UnaryOp`, which under-counted integer negation:
+/// `v5_neg_i64` reported `scalar_removed=4` instead of 6, benefit 0 instead
+/// of 2, and `check_bb_slp_v5_codegen.sh` lost its `psubq` (caught by hosted
+/// CI).  SSA/address bookkeeping folds into its users and is free; everything
+/// that emits code counts once (a conservative LOWER bound: widening casts and
+/// 64-bit divides are worth more, never less).
+#[inline]
+fn scalar_instruction_weight(inst: &Instruction) -> i64 {
+    match inst {
+        // Pure SSA / address bookkeeping: folded into the using instruction.
+        Instruction::Alloca { .. }
+        | Instruction::DynAlloca { .. }
+        | Instruction::GetElementPtr { .. }
+        | Instruction::GlobalAddr { .. }
+        | Instruction::Phi { .. }
+        | Instruction::LabelAddr { .. }
+        | Instruction::ParamRef { .. }
+        | Instruction::PgoCounterInc { .. }
+        | Instruction::GetStaticChain { .. }
+        | Instruction::SetStaticChain { .. } => 0,
+        // Real machine instructions.
+        Instruction::Store { .. }
+        | Instruction::Load { .. }
+        | Instruction::BinOp { .. }
+        | Instruction::UnaryOp { .. }
+        | Instruction::Cmp { .. }
+        | Instruction::Cast { .. }
+        | Instruction::Copy { .. }
+        | Instruction::Select { .. }
+        | Instruction::Intrinsic { .. }
+        | Instruction::Memcpy { .. }
+        | Instruction::Call { .. }
+        | Instruction::CallIndirect { .. }
+        | Instruction::InlineAsm { .. }
+        | Instruction::Fence { .. }
+        | Instruction::AtomicRmw { .. }
+        | Instruction::AtomicInc { .. }
+        | Instruction::AtomicCmpxchg { .. }
+        | Instruction::AtomicLoad { .. }
+        | Instruction::AtomicStore { .. }
+        | Instruction::VaArg { .. }
+        | Instruction::VaArgStruct { .. }
+        | Instruction::VaStart { .. }
+        | Instruction::VaEnd { .. }
+        | Instruction::VaCopy { .. }
+        | Instruction::StackSave { .. }
+        | Instruction::StackRestore { .. }
+        | Instruction::InitTrampoline { .. }
+        | Instruction::NonlocalGotoSave { .. }
+        | Instruction::NonlocalGoto { .. }
+        | Instruction::GetReturnF64Second { .. }
+        | Instruction::SetReturnF64Second { .. }
+        | Instruction::GetReturnF32Second { .. }
+        | Instruction::SetReturnF32Second { .. }
+        | Instruction::GetReturnF128Second { .. }
+        | Instruction::SetReturnF128Second { .. } => 1,
+    }
+}
+
 /// Machine-instruction cost of emitting one pack, measured from `apply_plan`'s
 /// lowering.  EXHAUSTIVE on purpose: adding a `PackKind` variant must force an
 /// explicit cost decision here (and a row in `pack_vector_cost_is_total`), not
@@ -2416,6 +2481,49 @@ fn reg_width_for(ty: IrType, width: usize) -> usize {
         (IrType::I32 | IrType::U32, 2) => 4,
         _ => width,
     }
+}
+
+/// Is a plan's measured instruction-count benefit large enough to amortize
+/// its GPR<->XMM domain crossings?
+///
+/// `Gather2`/`Gather4` packs materialize a vector from GPR-resident scalars:
+/// 2 or 4 `movd` followed by a 1- or 3-deep `punpck` chain.  That is PURE
+/// OVERHEAD on the critical path - only packed COMPUTE packs (BinOp, Fma,
+/// ShiftImm, CmpBlendv, FpMinMax, FpNeg) do parallel work that can hide it.
+/// When overhead packs outnumber compute packs, a raw instruction-count
+/// benefit systematically overstates the win: the scalar ops it removes were
+/// independent and issued in parallel, while the punpck chains are serial.
+/// The same holds for a half-register pack, whose packed op has the SAME
+/// latency as the scalar op it replaces.
+///
+/// Measured on this host with deterministic Callgrind Ir:
+/// * 2xU32 `s_jhash` (27 packs, benefit 2): 1.301x SLOWER.
+/// * 4xU32 `s_bytemask` (3 Gather4 + 2 BinOp, benefit 1): 1.2772x SLOWER.
+/// * 4xU32 `s_clamp_u8` (2 Gather4 + 2 CmpBlendv, benefit 2): 0.8399x,
+///   a genuine WIN - its gathers feed independent compute packs, so it is
+///   NOT gather-dominated and keeps the plain positive-benefit threshold.
+/// * 2xI64 `v5_neg_i64` (0 gathers, full 128-bit register, benefit 2):
+///   required for `psubq`; a blanket `width == 2` veto regressed it and CI
+///   caught the regression in `check_bb_slp_v5_codegen.sh`.
+///
+/// Joint seeds are exempt: `tail_cost` already prices their scalar remainder
+/// and a joint plan is never half-wide.
+#[inline]
+fn crossings_are_amortized(
+    ty: IrType,
+    width: usize,
+    is_joint: bool,
+    benefit: i64,
+    gathers: i64,
+    compute: i64,
+    extracts: i64,
+) -> bool {
+    if is_joint {
+        return true;
+    }
+    let overhead_dominated = gathers > compute || reg_width_for(ty, width) > width;
+    let crossings = gathers + extracts;
+    !overhead_dominated || benefit > crossings
 }
 
 /// Base-value classification for rule (e)'s `restrict` escape.
@@ -6141,9 +6249,8 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
     //
     // * `scalar_removed` is the fixpoint closure of scalar instructions the
     //   rewrite deletes, built above from the pack lane values plus every
-    //   instruction whose uses are all removed.  Only count instruction
-    //   classes that really become machine instructions: phis, GEPs and
-    //   address materialization are folded into their users.
+    //   instruction whose uses are all removed, weighted by the EXHAUSTIVE
+    //   `scalar_instruction_weight` classifier below.
     // * `vector_cost` is the number of machine instructions `apply_plan`
     //   emits for each pack kind, read off the lowering: a Gather4 tree is
     //   four `movd` + three unpacks (7), ByteFields is a 4-instruction
@@ -6159,20 +6266,10 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
     // the delta.  An "accept every legal plan" ablation (29/29 correct) was
     // 1.0374x WORSE in deterministic Callgrind Ir with six shapes regressing
     // 11-30%, which validates keeping a strict positive threshold.
-    let scalar_removed = removed
+    let scalar_removed: i64 = removed
         .iter()
-        .filter(|&&i| {
-            matches!(
-                block.instructions[i],
-                Instruction::BinOp { .. }
-                    | Instruction::Cmp { .. }
-                    | Instruction::Select { .. }
-                    | Instruction::Cast { .. }
-                    | Instruction::Load { .. }
-                    | Instruction::Store { .. }
-            )
-        })
-        .count() as i64;
+        .map(|&i| scalar_instruction_weight(&block.instructions[i]))
+        .sum();
     let vector_cost: i64 = packs.iter().map(|p| pack_vector_cost(&p.kind)).sum();
     let is_256 = fam.size * width as u64 == 32;
     let half_lanes = width / 2;
@@ -6183,31 +6280,42 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
     let tail_cost = cand.joint.as_ref().map_or(0, |t| t.cost());
     let benefit = scalar_removed - vector_cost - extract_cost - tail_cost;
 
-    // Half-wide dword packs (width == 2) run TWO lanes in the low 64 bits of
-    // an XMM register.  Every packed op saves exactly ONE scalar uop and has
-    // the SAME latency as the scalar op it replaces - there is no throughput
-    // win from a wider register.  Each Gather2/Extract instead adds a
-    // GPR<->XMM domain crossing ON THE CRITICAL PATH (`movq`/`vmovd` +
-    // `punpckldq`, measured in the disassembly).  On a latency-bound serial
-    // chain those crossings dominate the uop saving: the 27-pack, 2xU32
-    // `s_jhash` seed with benefit=2 emitted 52 instructions instead of 64 but
-    // ran 1.301x SLOWER (24-leg order-balanced A/B, 1024 iters, 29/29
-    // correctness in both binaries).  Require one extra unit of measured
-    // benefit per crossing so a half-wide pack fires only when its packed
-    // subgraph is deep enough to amortize the moves.  Full-width seeds keep
-    // the plain threshold.  Joint seeds are excluded: `tail_cost` already
-    // models their scalar remainder, and a joint plan is never width 2.
-    if width == 2 && cand.joint.is_none() {
-        let crossings = packs
-            .iter()
-            .filter(|p| matches!(p.kind, PackKind::Gather2 { .. } | PackKind::Gather4 { .. }))
-            .count() as i64
-            + extract_of.len() as i64;
-        if benefit <= crossings {
-            return slp_decline(
-                "cost model: half-wide pack does not amortize GPR<->XMM domain crossings",
-            );
-        }
+    // Structural quality gate: see `crossings_are_amortized` for the exact
+    // predicate, the disassembly evidence and the four measured plans that
+    // pin its two branches.  Kept OUT of `benefit` itself: the crossing
+    // penalty is a latency/dependency-depth effect, not an instruction
+    // count, and folding it into `vector_cost` would also reject the
+    // measured 0.8399x `s_clamp_u8` win.
+    let gathers = packs
+        .iter()
+        .filter(|p| matches!(p.kind, PackKind::Gather2 { .. } | PackKind::Gather4 { .. }))
+        .count() as i64;
+    let compute = packs
+        .iter()
+        .filter(|p| {
+            matches!(
+                p.kind,
+                PackKind::BinOp { .. }
+                    | PackKind::Fma { .. }
+                    | PackKind::ShiftImm { .. }
+                    | PackKind::CmpBlendv { .. }
+                    | PackKind::FpMinMax { .. }
+                    | PackKind::FpNeg { .. }
+            )
+        })
+        .count() as i64;
+    if !crossings_are_amortized(
+        cand.ty,
+        width,
+        cand.joint.is_some(),
+        benefit,
+        gathers,
+        compute,
+        extract_of.len() as i64,
+    ) {
+        return slp_decline(
+            "cost model: gather-dominated pack does not amortize GPR<->XMM domain crossings",
+        );
     }
     if ctx.debug {
         let mut hist = std::collections::BTreeMap::<&'static str, usize>::new();
@@ -7730,5 +7838,67 @@ mod tests {
         for (kind, want) in cases {
             assert_eq!(pack_vector_cost(&kind), want, "{kind:?}");
         }
+    }
+
+    #[test]
+    fn scalar_instruction_weight_is_exhaustive_and_pins_negation() {
+        // The regression this pins: integer negation is `UnaryOp`, and the
+        // six-class filter that preceded the exhaustive classifier omitted
+        // it, under-counting `v5_neg_i64` by 2 and losing its `psubq`.
+        assert_eq!(
+            scalar_instruction_weight(&Instruction::UnaryOp {
+                dest: Value(1),
+                op: crate::ir::reexports::IrUnaryOp::Neg,
+                src: Operand::Value(Value(2)),
+                ty: IrType::I64,
+            }),
+            1
+        );
+        assert_eq!(
+            scalar_instruction_weight(&Instruction::Load {
+                dest: Value(1),
+                ptr: Value(2),
+                ty: IrType::I64,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            }),
+            1
+        );
+        assert_eq!(
+            scalar_instruction_weight(&Instruction::GlobalAddr {
+                dest: Value(1),
+                name: "g".into(),
+            }),
+            0
+        );
+        assert_eq!(
+            scalar_instruction_weight(&Instruction::GetElementPtr {
+                dest: Value(1),
+                base: Value(2),
+                offset: Operand::Const(IrConst::I64(0)),
+                ty: IrType::Ptr,
+            }),
+            0
+        );
+    }
+
+    #[test]
+    fn crossings_are_amortized_pins_the_measured_plans() {
+        // 2xU32 jhash: 27 packs, benefit 2, 1.301x SLOWER -> decline.
+        assert!(!crossings_are_amortized(IrType::U32, 2, false, 2, 2, 20, 0));
+        // 4xU32 bytemask: 3 Gather4 + 2 BinOp, benefit 1, 1.2772x SLOWER.
+        assert!(!crossings_are_amortized(IrType::U32, 4, false, 1, 3, 2, 0));
+        // 4xU32 clamp_u8: 2 Gather4 + 2 CmpBlendv, benefit 2, 0.8399x WIN.
+        assert!(crossings_are_amortized(IrType::U32, 4, false, 2, 2, 2, 0));
+        // 2xI64 v5_neg_i64: full 128-bit register, 0 gathers, benefit 2.
+        assert!(crossings_are_amortized(IrType::I64, 2, false, 2, 0, 2, 0));
+        // crc32_braid8: Splat/MemLoad only, benefit 6/15, no crossings.
+        assert!(crossings_are_amortized(IrType::U32, 8, false, 6, 0, 0, 0));
+        // 4xU32 jhash: 2 Gather4 + 21 compute, benefit 55.
+        assert!(crossings_are_amortized(IrType::U32, 4, false, 55, 2, 21, 0));
+        // Extracts are crossings too; a marginal extract-heavy plan declines.
+        assert!(!crossings_are_amortized(IrType::I32, 2, false, 1, 0, 1, 1));
+        // Joint seeds are priced by tail_cost and are exempt.
+        assert!(crossings_are_amortized(IrType::U32, 2, true, 0, 4, 0, 2));
     }
 }
