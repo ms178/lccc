@@ -740,13 +740,13 @@ static __inline__ __attribute__((__always_inline__, __artificial__)) void _mm512
 { __lccc_simd512_i_vmovdqu64_store(0, __p, __a); }
 
 void * __lccc_simd512_i_vpbroadcastb512(long, char __a);
-void * __lccc_simd512_i_vpbroadcastw512(long, int __a);
+void * __lccc_simd512_i_vpbroadcastw512(long, short __a);
 void * __lccc_simd512_i_vpbroadcastd512(long, int __a);
 void * __lccc_simd512_i_vpbroadcastq512(long, long long __a);
 static __inline__ __attribute__((__always_inline__, __artificial__)) __m512i _mm512_set1_epi8(char __a)
 { return __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpbroadcastb512(0, __a)); }
 
-static __inline__ __attribute__((__always_inline__, __artificial__)) __m512i _mm512_set1_epi16(int __a)
+static __inline__ __attribute__((__always_inline__, __artificial__)) __m512i _mm512_set1_epi16(short __a)
 { return __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpbroadcastw512(0, __a)); }
 
 static __inline__ __attribute__((__always_inline__, __artificial__)) __m512i _mm512_set1_epi32(int __a)

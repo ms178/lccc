@@ -31,15 +31,111 @@ __attribute__((noinline)) static unsigned long long rt_ne_w128_epi8(void) {
 }
 
 __attribute__((noinline)) static unsigned long long c_eq_w128_epi8(void) {
-    __m128i a = _mm_set1_epi8((char)17);
-    __m128i b = _mm_set1_epi8((char)17);
+    __m128i a = _mm_set1_epi8((char)0x11);
+    __m128i b = _mm_set1_epi8((char)0x11);
     return (unsigned long long)((__mmask16)_mm_cmpeq_epi8_mask(a, b));
 }
 
 __attribute__((noinline)) static unsigned long long c_ne_w128_epi8(void) {
-    __m128i a = _mm_set1_epi8((char)17);
-    __m128i b = _mm_set1_epi8((char)34);
+    __m128i a = _mm_set1_epi8((char)0x11);
+    __m128i b = _mm_set1_epi8((char)0x22);
     return (unsigned long long)((__mmask16)_mm_cmpeq_epi8_mask(a, b));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p0_w128_epi8(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm_cmp_epi8_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long c_p0_w128_epi8(void) {
+    __m128i a = _mm_set1_epi8((char)0x11);
+    __m128i b = _mm_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask16)_mm_cmp_epi8_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p1_w128_epi8(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm_cmp_epi8_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long c_p1_w128_epi8(void) {
+    __m128i a = _mm_set1_epi8((char)0x11);
+    __m128i b = _mm_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask16)_mm_cmp_epi8_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p2_w128_epi8(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm_cmp_epi8_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long c_p2_w128_epi8(void) {
+    __m128i a = _mm_set1_epi8((char)0x11);
+    __m128i b = _mm_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask16)_mm_cmp_epi8_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p3_w128_epi8(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm_cmp_epi8_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long c_p3_w128_epi8(void) {
+    __m128i a = _mm_set1_epi8((char)0x11);
+    __m128i b = _mm_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask16)_mm_cmp_epi8_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p4_w128_epi8(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm_cmp_epi8_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long c_p4_w128_epi8(void) {
+    __m128i a = _mm_set1_epi8((char)0x11);
+    __m128i b = _mm_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask16)_mm_cmp_epi8_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p5_w128_epi8(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm_cmp_epi8_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long c_p5_w128_epi8(void) {
+    __m128i a = _mm_set1_epi8((char)0x11);
+    __m128i b = _mm_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask16)_mm_cmp_epi8_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p6_w128_epi8(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm_cmp_epi8_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long c_p6_w128_epi8(void) {
+    __m128i a = _mm_set1_epi8((char)0x11);
+    __m128i b = _mm_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask16)_mm_cmp_epi8_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p7_w128_epi8(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm_cmp_epi8_mask(a, b, 7));
+}
+
+__attribute__((noinline)) static unsigned long long c_p7_w128_epi8(void) {
+    __m128i a = _mm_set1_epi8((char)0x11);
+    __m128i b = _mm_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask16)_mm_cmp_epi8_mask(a, b, 7));
 }
 
 __attribute__((noinline)) static unsigned long long rt_eq_w128_epu8(void) {
@@ -55,15 +151,111 @@ __attribute__((noinline)) static unsigned long long rt_ne_w128_epu8(void) {
 }
 
 __attribute__((noinline)) static unsigned long long c_eq_w128_epu8(void) {
-    __m128i a = _mm_set1_epi8((char)17);
-    __m128i b = _mm_set1_epi8((char)17);
+    __m128i a = _mm_set1_epi8((char)0x11);
+    __m128i b = _mm_set1_epi8((char)0x11);
     return (unsigned long long)((__mmask16)_mm_cmpeq_epu8_mask(a, b));
 }
 
 __attribute__((noinline)) static unsigned long long c_ne_w128_epu8(void) {
-    __m128i a = _mm_set1_epi8((char)17);
-    __m128i b = _mm_set1_epi8((char)34);
+    __m128i a = _mm_set1_epi8((char)0x11);
+    __m128i b = _mm_set1_epi8((char)0x22);
     return (unsigned long long)((__mmask16)_mm_cmpeq_epu8_mask(a, b));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p0_w128_epu8(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm_cmp_epu8_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long c_p0_w128_epu8(void) {
+    __m128i a = _mm_set1_epi8((char)0x11);
+    __m128i b = _mm_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask16)_mm_cmp_epu8_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p1_w128_epu8(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm_cmp_epu8_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long c_p1_w128_epu8(void) {
+    __m128i a = _mm_set1_epi8((char)0x11);
+    __m128i b = _mm_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask16)_mm_cmp_epu8_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p2_w128_epu8(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm_cmp_epu8_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long c_p2_w128_epu8(void) {
+    __m128i a = _mm_set1_epi8((char)0x11);
+    __m128i b = _mm_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask16)_mm_cmp_epu8_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p3_w128_epu8(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm_cmp_epu8_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long c_p3_w128_epu8(void) {
+    __m128i a = _mm_set1_epi8((char)0x11);
+    __m128i b = _mm_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask16)_mm_cmp_epu8_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p4_w128_epu8(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm_cmp_epu8_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long c_p4_w128_epu8(void) {
+    __m128i a = _mm_set1_epi8((char)0x11);
+    __m128i b = _mm_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask16)_mm_cmp_epu8_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p5_w128_epu8(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm_cmp_epu8_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long c_p5_w128_epu8(void) {
+    __m128i a = _mm_set1_epi8((char)0x11);
+    __m128i b = _mm_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask16)_mm_cmp_epu8_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p6_w128_epu8(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm_cmp_epu8_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long c_p6_w128_epu8(void) {
+    __m128i a = _mm_set1_epi8((char)0x11);
+    __m128i b = _mm_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask16)_mm_cmp_epu8_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p7_w128_epu8(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm_cmp_epu8_mask(a, b, 7));
+}
+
+__attribute__((noinline)) static unsigned long long c_p7_w128_epu8(void) {
+    __m128i a = _mm_set1_epi8((char)0x11);
+    __m128i b = _mm_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask16)_mm_cmp_epu8_mask(a, b, 7));
 }
 
 __attribute__((noinline)) static unsigned long long rt_eq_w128_epi16(void) {
@@ -79,15 +271,111 @@ __attribute__((noinline)) static unsigned long long rt_ne_w128_epi16(void) {
 }
 
 __attribute__((noinline)) static unsigned long long c_eq_w128_epi16(void) {
-    __m128i a = _mm_set1_epi16((int)17);
-    __m128i b = _mm_set1_epi16((int)17);
+    __m128i a = _mm_set1_epi16((short)0x11u);
+    __m128i b = _mm_set1_epi16((short)0x11u);
     return (unsigned long long)((__mmask8)_mm_cmpeq_epi16_mask(a, b));
 }
 
 __attribute__((noinline)) static unsigned long long c_ne_w128_epi16(void) {
-    __m128i a = _mm_set1_epi16((int)17);
-    __m128i b = _mm_set1_epi16((int)34);
+    __m128i a = _mm_set1_epi16((short)0x11u);
+    __m128i b = _mm_set1_epi16((short)0x22u);
     return (unsigned long long)((__mmask8)_mm_cmpeq_epi16_mask(a, b));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p0_w128_epi16(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi16_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long c_p0_w128_epi16(void) {
+    __m128i a = _mm_set1_epi16((short)0x11u);
+    __m128i b = _mm_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi16_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p1_w128_epi16(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi16_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long c_p1_w128_epi16(void) {
+    __m128i a = _mm_set1_epi16((short)0x11u);
+    __m128i b = _mm_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi16_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p2_w128_epi16(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi16_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long c_p2_w128_epi16(void) {
+    __m128i a = _mm_set1_epi16((short)0x11u);
+    __m128i b = _mm_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi16_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p3_w128_epi16(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi16_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long c_p3_w128_epi16(void) {
+    __m128i a = _mm_set1_epi16((short)0x11u);
+    __m128i b = _mm_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi16_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p4_w128_epi16(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi16_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long c_p4_w128_epi16(void) {
+    __m128i a = _mm_set1_epi16((short)0x11u);
+    __m128i b = _mm_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi16_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p5_w128_epi16(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi16_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long c_p5_w128_epi16(void) {
+    __m128i a = _mm_set1_epi16((short)0x11u);
+    __m128i b = _mm_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi16_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p6_w128_epi16(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi16_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long c_p6_w128_epi16(void) {
+    __m128i a = _mm_set1_epi16((short)0x11u);
+    __m128i b = _mm_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi16_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p7_w128_epi16(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi16_mask(a, b, 7));
+}
+
+__attribute__((noinline)) static unsigned long long c_p7_w128_epi16(void) {
+    __m128i a = _mm_set1_epi16((short)0x11u);
+    __m128i b = _mm_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi16_mask(a, b, 7));
 }
 
 __attribute__((noinline)) static unsigned long long rt_eq_w128_epu16(void) {
@@ -103,15 +391,111 @@ __attribute__((noinline)) static unsigned long long rt_ne_w128_epu16(void) {
 }
 
 __attribute__((noinline)) static unsigned long long c_eq_w128_epu16(void) {
-    __m128i a = _mm_set1_epi16((int)17);
-    __m128i b = _mm_set1_epi16((int)17);
+    __m128i a = _mm_set1_epi16((short)0x11u);
+    __m128i b = _mm_set1_epi16((short)0x11u);
     return (unsigned long long)((__mmask8)_mm_cmpeq_epu16_mask(a, b));
 }
 
 __attribute__((noinline)) static unsigned long long c_ne_w128_epu16(void) {
-    __m128i a = _mm_set1_epi16((int)17);
-    __m128i b = _mm_set1_epi16((int)34);
+    __m128i a = _mm_set1_epi16((short)0x11u);
+    __m128i b = _mm_set1_epi16((short)0x22u);
     return (unsigned long long)((__mmask8)_mm_cmpeq_epu16_mask(a, b));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p0_w128_epu16(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu16_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long c_p0_w128_epu16(void) {
+    __m128i a = _mm_set1_epi16((short)0x11u);
+    __m128i b = _mm_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu16_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p1_w128_epu16(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu16_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long c_p1_w128_epu16(void) {
+    __m128i a = _mm_set1_epi16((short)0x11u);
+    __m128i b = _mm_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu16_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p2_w128_epu16(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu16_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long c_p2_w128_epu16(void) {
+    __m128i a = _mm_set1_epi16((short)0x11u);
+    __m128i b = _mm_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu16_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p3_w128_epu16(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu16_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long c_p3_w128_epu16(void) {
+    __m128i a = _mm_set1_epi16((short)0x11u);
+    __m128i b = _mm_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu16_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p4_w128_epu16(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu16_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long c_p4_w128_epu16(void) {
+    __m128i a = _mm_set1_epi16((short)0x11u);
+    __m128i b = _mm_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu16_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p5_w128_epu16(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu16_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long c_p5_w128_epu16(void) {
+    __m128i a = _mm_set1_epi16((short)0x11u);
+    __m128i b = _mm_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu16_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p6_w128_epu16(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu16_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long c_p6_w128_epu16(void) {
+    __m128i a = _mm_set1_epi16((short)0x11u);
+    __m128i b = _mm_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu16_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p7_w128_epu16(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu16_mask(a, b, 7));
+}
+
+__attribute__((noinline)) static unsigned long long c_p7_w128_epu16(void) {
+    __m128i a = _mm_set1_epi16((short)0x11u);
+    __m128i b = _mm_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu16_mask(a, b, 7));
 }
 
 __attribute__((noinline)) static unsigned long long rt_eq_w128_epi32(void) {
@@ -127,15 +511,111 @@ __attribute__((noinline)) static unsigned long long rt_ne_w128_epi32(void) {
 }
 
 __attribute__((noinline)) static unsigned long long c_eq_w128_epi32(void) {
-    __m128i a = _mm_set1_epi32((int)17);
-    __m128i b = _mm_set1_epi32((int)17);
+    __m128i a = _mm_set1_epi32((int)0x11u);
+    __m128i b = _mm_set1_epi32((int)0x11u);
     return (unsigned long long)((__mmask8)_mm_cmpeq_epi32_mask(a, b));
 }
 
 __attribute__((noinline)) static unsigned long long c_ne_w128_epi32(void) {
-    __m128i a = _mm_set1_epi32((int)17);
-    __m128i b = _mm_set1_epi32((int)34);
+    __m128i a = _mm_set1_epi32((int)0x11u);
+    __m128i b = _mm_set1_epi32((int)0x22u);
     return (unsigned long long)((__mmask8)_mm_cmpeq_epi32_mask(a, b));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p0_w128_epi32(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi32_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long c_p0_w128_epi32(void) {
+    __m128i a = _mm_set1_epi32((int)0x11u);
+    __m128i b = _mm_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi32_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p1_w128_epi32(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi32_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long c_p1_w128_epi32(void) {
+    __m128i a = _mm_set1_epi32((int)0x11u);
+    __m128i b = _mm_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi32_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p2_w128_epi32(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi32_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long c_p2_w128_epi32(void) {
+    __m128i a = _mm_set1_epi32((int)0x11u);
+    __m128i b = _mm_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi32_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p3_w128_epi32(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi32_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long c_p3_w128_epi32(void) {
+    __m128i a = _mm_set1_epi32((int)0x11u);
+    __m128i b = _mm_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi32_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p4_w128_epi32(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi32_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long c_p4_w128_epi32(void) {
+    __m128i a = _mm_set1_epi32((int)0x11u);
+    __m128i b = _mm_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi32_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p5_w128_epi32(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi32_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long c_p5_w128_epi32(void) {
+    __m128i a = _mm_set1_epi32((int)0x11u);
+    __m128i b = _mm_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi32_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p6_w128_epi32(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi32_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long c_p6_w128_epi32(void) {
+    __m128i a = _mm_set1_epi32((int)0x11u);
+    __m128i b = _mm_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi32_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p7_w128_epi32(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi32_mask(a, b, 7));
+}
+
+__attribute__((noinline)) static unsigned long long c_p7_w128_epi32(void) {
+    __m128i a = _mm_set1_epi32((int)0x11u);
+    __m128i b = _mm_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi32_mask(a, b, 7));
 }
 
 __attribute__((noinline)) static unsigned long long rt_eq_w128_epu32(void) {
@@ -151,15 +631,111 @@ __attribute__((noinline)) static unsigned long long rt_ne_w128_epu32(void) {
 }
 
 __attribute__((noinline)) static unsigned long long c_eq_w128_epu32(void) {
-    __m128i a = _mm_set1_epi32((int)17);
-    __m128i b = _mm_set1_epi32((int)17);
+    __m128i a = _mm_set1_epi32((int)0x11u);
+    __m128i b = _mm_set1_epi32((int)0x11u);
     return (unsigned long long)((__mmask8)_mm_cmpeq_epu32_mask(a, b));
 }
 
 __attribute__((noinline)) static unsigned long long c_ne_w128_epu32(void) {
-    __m128i a = _mm_set1_epi32((int)17);
-    __m128i b = _mm_set1_epi32((int)34);
+    __m128i a = _mm_set1_epi32((int)0x11u);
+    __m128i b = _mm_set1_epi32((int)0x22u);
     return (unsigned long long)((__mmask8)_mm_cmpeq_epu32_mask(a, b));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p0_w128_epu32(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu32_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long c_p0_w128_epu32(void) {
+    __m128i a = _mm_set1_epi32((int)0x11u);
+    __m128i b = _mm_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu32_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p1_w128_epu32(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu32_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long c_p1_w128_epu32(void) {
+    __m128i a = _mm_set1_epi32((int)0x11u);
+    __m128i b = _mm_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu32_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p2_w128_epu32(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu32_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long c_p2_w128_epu32(void) {
+    __m128i a = _mm_set1_epi32((int)0x11u);
+    __m128i b = _mm_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu32_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p3_w128_epu32(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu32_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long c_p3_w128_epu32(void) {
+    __m128i a = _mm_set1_epi32((int)0x11u);
+    __m128i b = _mm_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu32_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p4_w128_epu32(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu32_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long c_p4_w128_epu32(void) {
+    __m128i a = _mm_set1_epi32((int)0x11u);
+    __m128i b = _mm_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu32_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p5_w128_epu32(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu32_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long c_p5_w128_epu32(void) {
+    __m128i a = _mm_set1_epi32((int)0x11u);
+    __m128i b = _mm_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu32_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p6_w128_epu32(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu32_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long c_p6_w128_epu32(void) {
+    __m128i a = _mm_set1_epi32((int)0x11u);
+    __m128i b = _mm_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu32_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p7_w128_epu32(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu32_mask(a, b, 7));
+}
+
+__attribute__((noinline)) static unsigned long long c_p7_w128_epu32(void) {
+    __m128i a = _mm_set1_epi32((int)0x11u);
+    __m128i b = _mm_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu32_mask(a, b, 7));
 }
 
 __attribute__((noinline)) static unsigned long long rt_eq_w128_epi64(void) {
@@ -175,15 +751,111 @@ __attribute__((noinline)) static unsigned long long rt_ne_w128_epi64(void) {
 }
 
 __attribute__((noinline)) static unsigned long long c_eq_w128_epi64(void) {
-    __m128i a = _mm_set1_epi64x((long long)17);
-    __m128i b = _mm_set1_epi64x((long long)17);
+    __m128i a = _mm_set1_epi64x((long long)0x11ull);
+    __m128i b = _mm_set1_epi64x((long long)0x11ull);
     return (unsigned long long)((__mmask8)_mm_cmpeq_epi64_mask(a, b));
 }
 
 __attribute__((noinline)) static unsigned long long c_ne_w128_epi64(void) {
-    __m128i a = _mm_set1_epi64x((long long)17);
-    __m128i b = _mm_set1_epi64x((long long)34);
+    __m128i a = _mm_set1_epi64x((long long)0x11ull);
+    __m128i b = _mm_set1_epi64x((long long)0x22ull);
     return (unsigned long long)((__mmask8)_mm_cmpeq_epi64_mask(a, b));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p0_w128_epi64(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi64_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long c_p0_w128_epi64(void) {
+    __m128i a = _mm_set1_epi64x((long long)0x11ull);
+    __m128i b = _mm_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi64_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p1_w128_epi64(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi64_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long c_p1_w128_epi64(void) {
+    __m128i a = _mm_set1_epi64x((long long)0x11ull);
+    __m128i b = _mm_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi64_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p2_w128_epi64(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi64_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long c_p2_w128_epi64(void) {
+    __m128i a = _mm_set1_epi64x((long long)0x11ull);
+    __m128i b = _mm_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi64_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p3_w128_epi64(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi64_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long c_p3_w128_epi64(void) {
+    __m128i a = _mm_set1_epi64x((long long)0x11ull);
+    __m128i b = _mm_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi64_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p4_w128_epi64(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi64_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long c_p4_w128_epi64(void) {
+    __m128i a = _mm_set1_epi64x((long long)0x11ull);
+    __m128i b = _mm_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi64_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p5_w128_epi64(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi64_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long c_p5_w128_epi64(void) {
+    __m128i a = _mm_set1_epi64x((long long)0x11ull);
+    __m128i b = _mm_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi64_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p6_w128_epi64(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi64_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long c_p6_w128_epi64(void) {
+    __m128i a = _mm_set1_epi64x((long long)0x11ull);
+    __m128i b = _mm_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi64_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p7_w128_epi64(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi64_mask(a, b, 7));
+}
+
+__attribute__((noinline)) static unsigned long long c_p7_w128_epi64(void) {
+    __m128i a = _mm_set1_epi64x((long long)0x11ull);
+    __m128i b = _mm_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm_cmp_epi64_mask(a, b, 7));
 }
 
 __attribute__((noinline)) static unsigned long long rt_eq_w128_epu64(void) {
@@ -199,15 +871,111 @@ __attribute__((noinline)) static unsigned long long rt_ne_w128_epu64(void) {
 }
 
 __attribute__((noinline)) static unsigned long long c_eq_w128_epu64(void) {
-    __m128i a = _mm_set1_epi64x((long long)17);
-    __m128i b = _mm_set1_epi64x((long long)17);
+    __m128i a = _mm_set1_epi64x((long long)0x11ull);
+    __m128i b = _mm_set1_epi64x((long long)0x11ull);
     return (unsigned long long)((__mmask8)_mm_cmpeq_epu64_mask(a, b));
 }
 
 __attribute__((noinline)) static unsigned long long c_ne_w128_epu64(void) {
-    __m128i a = _mm_set1_epi64x((long long)17);
-    __m128i b = _mm_set1_epi64x((long long)34);
+    __m128i a = _mm_set1_epi64x((long long)0x11ull);
+    __m128i b = _mm_set1_epi64x((long long)0x22ull);
     return (unsigned long long)((__mmask8)_mm_cmpeq_epu64_mask(a, b));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p0_w128_epu64(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu64_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long c_p0_w128_epu64(void) {
+    __m128i a = _mm_set1_epi64x((long long)0x11ull);
+    __m128i b = _mm_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu64_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p1_w128_epu64(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu64_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long c_p1_w128_epu64(void) {
+    __m128i a = _mm_set1_epi64x((long long)0x11ull);
+    __m128i b = _mm_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu64_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p2_w128_epu64(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu64_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long c_p2_w128_epu64(void) {
+    __m128i a = _mm_set1_epi64x((long long)0x11ull);
+    __m128i b = _mm_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu64_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p3_w128_epu64(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu64_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long c_p3_w128_epu64(void) {
+    __m128i a = _mm_set1_epi64x((long long)0x11ull);
+    __m128i b = _mm_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu64_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p4_w128_epu64(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu64_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long c_p4_w128_epu64(void) {
+    __m128i a = _mm_set1_epi64x((long long)0x11ull);
+    __m128i b = _mm_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu64_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p5_w128_epu64(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu64_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long c_p5_w128_epu64(void) {
+    __m128i a = _mm_set1_epi64x((long long)0x11ull);
+    __m128i b = _mm_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu64_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p6_w128_epu64(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu64_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long c_p6_w128_epu64(void) {
+    __m128i a = _mm_set1_epi64x((long long)0x11ull);
+    __m128i b = _mm_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu64_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p7_w128_epu64(void) {
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu64_mask(a, b, 7));
+}
+
+__attribute__((noinline)) static unsigned long long c_p7_w128_epu64(void) {
+    __m128i a = _mm_set1_epi64x((long long)0x11ull);
+    __m128i b = _mm_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm_cmp_epu64_mask(a, b, 7));
 }
 
 __attribute__((noinline)) static unsigned long long rt_eq_w256_epi8(void) {
@@ -223,15 +991,111 @@ __attribute__((noinline)) static unsigned long long rt_ne_w256_epi8(void) {
 }
 
 __attribute__((noinline)) static unsigned long long c_eq_w256_epi8(void) {
-    __m256i a = _mm256_set1_epi8((char)17);
-    __m256i b = _mm256_set1_epi8((char)17);
+    __m256i a = _mm256_set1_epi8((char)0x11);
+    __m256i b = _mm256_set1_epi8((char)0x11);
     return (unsigned long long)((__mmask32)_mm256_cmpeq_epi8_mask(a, b));
 }
 
 __attribute__((noinline)) static unsigned long long c_ne_w256_epi8(void) {
-    __m256i a = _mm256_set1_epi8((char)17);
-    __m256i b = _mm256_set1_epi8((char)34);
+    __m256i a = _mm256_set1_epi8((char)0x11);
+    __m256i b = _mm256_set1_epi8((char)0x22);
     return (unsigned long long)((__mmask32)_mm256_cmpeq_epi8_mask(a, b));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p0_w256_epi8(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epi8_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long c_p0_w256_epi8(void) {
+    __m256i a = _mm256_set1_epi8((char)0x11);
+    __m256i b = _mm256_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epi8_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p1_w256_epi8(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epi8_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long c_p1_w256_epi8(void) {
+    __m256i a = _mm256_set1_epi8((char)0x11);
+    __m256i b = _mm256_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epi8_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p2_w256_epi8(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epi8_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long c_p2_w256_epi8(void) {
+    __m256i a = _mm256_set1_epi8((char)0x11);
+    __m256i b = _mm256_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epi8_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p3_w256_epi8(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epi8_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long c_p3_w256_epi8(void) {
+    __m256i a = _mm256_set1_epi8((char)0x11);
+    __m256i b = _mm256_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epi8_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p4_w256_epi8(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epi8_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long c_p4_w256_epi8(void) {
+    __m256i a = _mm256_set1_epi8((char)0x11);
+    __m256i b = _mm256_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epi8_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p5_w256_epi8(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epi8_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long c_p5_w256_epi8(void) {
+    __m256i a = _mm256_set1_epi8((char)0x11);
+    __m256i b = _mm256_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epi8_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p6_w256_epi8(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epi8_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long c_p6_w256_epi8(void) {
+    __m256i a = _mm256_set1_epi8((char)0x11);
+    __m256i b = _mm256_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epi8_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p7_w256_epi8(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epi8_mask(a, b, 7));
+}
+
+__attribute__((noinline)) static unsigned long long c_p7_w256_epi8(void) {
+    __m256i a = _mm256_set1_epi8((char)0x11);
+    __m256i b = _mm256_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epi8_mask(a, b, 7));
 }
 
 __attribute__((noinline)) static unsigned long long rt_eq_w256_epu8(void) {
@@ -247,15 +1111,111 @@ __attribute__((noinline)) static unsigned long long rt_ne_w256_epu8(void) {
 }
 
 __attribute__((noinline)) static unsigned long long c_eq_w256_epu8(void) {
-    __m256i a = _mm256_set1_epi8((char)17);
-    __m256i b = _mm256_set1_epi8((char)17);
+    __m256i a = _mm256_set1_epi8((char)0x11);
+    __m256i b = _mm256_set1_epi8((char)0x11);
     return (unsigned long long)((__mmask32)_mm256_cmpeq_epu8_mask(a, b));
 }
 
 __attribute__((noinline)) static unsigned long long c_ne_w256_epu8(void) {
-    __m256i a = _mm256_set1_epi8((char)17);
-    __m256i b = _mm256_set1_epi8((char)34);
+    __m256i a = _mm256_set1_epi8((char)0x11);
+    __m256i b = _mm256_set1_epi8((char)0x22);
     return (unsigned long long)((__mmask32)_mm256_cmpeq_epu8_mask(a, b));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p0_w256_epu8(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epu8_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long c_p0_w256_epu8(void) {
+    __m256i a = _mm256_set1_epi8((char)0x11);
+    __m256i b = _mm256_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epu8_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p1_w256_epu8(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epu8_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long c_p1_w256_epu8(void) {
+    __m256i a = _mm256_set1_epi8((char)0x11);
+    __m256i b = _mm256_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epu8_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p2_w256_epu8(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epu8_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long c_p2_w256_epu8(void) {
+    __m256i a = _mm256_set1_epi8((char)0x11);
+    __m256i b = _mm256_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epu8_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p3_w256_epu8(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epu8_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long c_p3_w256_epu8(void) {
+    __m256i a = _mm256_set1_epi8((char)0x11);
+    __m256i b = _mm256_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epu8_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p4_w256_epu8(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epu8_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long c_p4_w256_epu8(void) {
+    __m256i a = _mm256_set1_epi8((char)0x11);
+    __m256i b = _mm256_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epu8_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p5_w256_epu8(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epu8_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long c_p5_w256_epu8(void) {
+    __m256i a = _mm256_set1_epi8((char)0x11);
+    __m256i b = _mm256_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epu8_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p6_w256_epu8(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epu8_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long c_p6_w256_epu8(void) {
+    __m256i a = _mm256_set1_epi8((char)0x11);
+    __m256i b = _mm256_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epu8_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p7_w256_epu8(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epu8_mask(a, b, 7));
+}
+
+__attribute__((noinline)) static unsigned long long c_p7_w256_epu8(void) {
+    __m256i a = _mm256_set1_epi8((char)0x11);
+    __m256i b = _mm256_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask32)_mm256_cmp_epu8_mask(a, b, 7));
 }
 
 __attribute__((noinline)) static unsigned long long rt_eq_w256_epi16(void) {
@@ -271,15 +1231,111 @@ __attribute__((noinline)) static unsigned long long rt_ne_w256_epi16(void) {
 }
 
 __attribute__((noinline)) static unsigned long long c_eq_w256_epi16(void) {
-    __m256i a = _mm256_set1_epi16((int)17);
-    __m256i b = _mm256_set1_epi16((int)17);
+    __m256i a = _mm256_set1_epi16((short)0x11u);
+    __m256i b = _mm256_set1_epi16((short)0x11u);
     return (unsigned long long)((__mmask16)_mm256_cmpeq_epi16_mask(a, b));
 }
 
 __attribute__((noinline)) static unsigned long long c_ne_w256_epi16(void) {
-    __m256i a = _mm256_set1_epi16((int)17);
-    __m256i b = _mm256_set1_epi16((int)34);
+    __m256i a = _mm256_set1_epi16((short)0x11u);
+    __m256i b = _mm256_set1_epi16((short)0x22u);
     return (unsigned long long)((__mmask16)_mm256_cmpeq_epi16_mask(a, b));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p0_w256_epi16(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epi16_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long c_p0_w256_epi16(void) {
+    __m256i a = _mm256_set1_epi16((short)0x11u);
+    __m256i b = _mm256_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epi16_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p1_w256_epi16(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epi16_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long c_p1_w256_epi16(void) {
+    __m256i a = _mm256_set1_epi16((short)0x11u);
+    __m256i b = _mm256_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epi16_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p2_w256_epi16(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epi16_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long c_p2_w256_epi16(void) {
+    __m256i a = _mm256_set1_epi16((short)0x11u);
+    __m256i b = _mm256_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epi16_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p3_w256_epi16(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epi16_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long c_p3_w256_epi16(void) {
+    __m256i a = _mm256_set1_epi16((short)0x11u);
+    __m256i b = _mm256_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epi16_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p4_w256_epi16(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epi16_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long c_p4_w256_epi16(void) {
+    __m256i a = _mm256_set1_epi16((short)0x11u);
+    __m256i b = _mm256_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epi16_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p5_w256_epi16(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epi16_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long c_p5_w256_epi16(void) {
+    __m256i a = _mm256_set1_epi16((short)0x11u);
+    __m256i b = _mm256_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epi16_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p6_w256_epi16(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epi16_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long c_p6_w256_epi16(void) {
+    __m256i a = _mm256_set1_epi16((short)0x11u);
+    __m256i b = _mm256_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epi16_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p7_w256_epi16(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epi16_mask(a, b, 7));
+}
+
+__attribute__((noinline)) static unsigned long long c_p7_w256_epi16(void) {
+    __m256i a = _mm256_set1_epi16((short)0x11u);
+    __m256i b = _mm256_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epi16_mask(a, b, 7));
 }
 
 __attribute__((noinline)) static unsigned long long rt_eq_w256_epu16(void) {
@@ -295,15 +1351,111 @@ __attribute__((noinline)) static unsigned long long rt_ne_w256_epu16(void) {
 }
 
 __attribute__((noinline)) static unsigned long long c_eq_w256_epu16(void) {
-    __m256i a = _mm256_set1_epi16((int)17);
-    __m256i b = _mm256_set1_epi16((int)17);
+    __m256i a = _mm256_set1_epi16((short)0x11u);
+    __m256i b = _mm256_set1_epi16((short)0x11u);
     return (unsigned long long)((__mmask16)_mm256_cmpeq_epu16_mask(a, b));
 }
 
 __attribute__((noinline)) static unsigned long long c_ne_w256_epu16(void) {
-    __m256i a = _mm256_set1_epi16((int)17);
-    __m256i b = _mm256_set1_epi16((int)34);
+    __m256i a = _mm256_set1_epi16((short)0x11u);
+    __m256i b = _mm256_set1_epi16((short)0x22u);
     return (unsigned long long)((__mmask16)_mm256_cmpeq_epu16_mask(a, b));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p0_w256_epu16(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epu16_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long c_p0_w256_epu16(void) {
+    __m256i a = _mm256_set1_epi16((short)0x11u);
+    __m256i b = _mm256_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epu16_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p1_w256_epu16(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epu16_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long c_p1_w256_epu16(void) {
+    __m256i a = _mm256_set1_epi16((short)0x11u);
+    __m256i b = _mm256_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epu16_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p2_w256_epu16(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epu16_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long c_p2_w256_epu16(void) {
+    __m256i a = _mm256_set1_epi16((short)0x11u);
+    __m256i b = _mm256_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epu16_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p3_w256_epu16(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epu16_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long c_p3_w256_epu16(void) {
+    __m256i a = _mm256_set1_epi16((short)0x11u);
+    __m256i b = _mm256_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epu16_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p4_w256_epu16(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epu16_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long c_p4_w256_epu16(void) {
+    __m256i a = _mm256_set1_epi16((short)0x11u);
+    __m256i b = _mm256_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epu16_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p5_w256_epu16(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epu16_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long c_p5_w256_epu16(void) {
+    __m256i a = _mm256_set1_epi16((short)0x11u);
+    __m256i b = _mm256_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epu16_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p6_w256_epu16(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epu16_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long c_p6_w256_epu16(void) {
+    __m256i a = _mm256_set1_epi16((short)0x11u);
+    __m256i b = _mm256_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epu16_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p7_w256_epu16(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epu16_mask(a, b, 7));
+}
+
+__attribute__((noinline)) static unsigned long long c_p7_w256_epu16(void) {
+    __m256i a = _mm256_set1_epi16((short)0x11u);
+    __m256i b = _mm256_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask16)_mm256_cmp_epu16_mask(a, b, 7));
 }
 
 __attribute__((noinline)) static unsigned long long rt_eq_w256_epi32(void) {
@@ -319,15 +1471,111 @@ __attribute__((noinline)) static unsigned long long rt_ne_w256_epi32(void) {
 }
 
 __attribute__((noinline)) static unsigned long long c_eq_w256_epi32(void) {
-    __m256i a = _mm256_set1_epi32((int)17);
-    __m256i b = _mm256_set1_epi32((int)17);
+    __m256i a = _mm256_set1_epi32((int)0x11u);
+    __m256i b = _mm256_set1_epi32((int)0x11u);
     return (unsigned long long)((__mmask8)_mm256_cmpeq_epi32_mask(a, b));
 }
 
 __attribute__((noinline)) static unsigned long long c_ne_w256_epi32(void) {
-    __m256i a = _mm256_set1_epi32((int)17);
-    __m256i b = _mm256_set1_epi32((int)34);
+    __m256i a = _mm256_set1_epi32((int)0x11u);
+    __m256i b = _mm256_set1_epi32((int)0x22u);
     return (unsigned long long)((__mmask8)_mm256_cmpeq_epi32_mask(a, b));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p0_w256_epi32(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi32_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long c_p0_w256_epi32(void) {
+    __m256i a = _mm256_set1_epi32((int)0x11u);
+    __m256i b = _mm256_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi32_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p1_w256_epi32(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi32_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long c_p1_w256_epi32(void) {
+    __m256i a = _mm256_set1_epi32((int)0x11u);
+    __m256i b = _mm256_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi32_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p2_w256_epi32(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi32_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long c_p2_w256_epi32(void) {
+    __m256i a = _mm256_set1_epi32((int)0x11u);
+    __m256i b = _mm256_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi32_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p3_w256_epi32(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi32_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long c_p3_w256_epi32(void) {
+    __m256i a = _mm256_set1_epi32((int)0x11u);
+    __m256i b = _mm256_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi32_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p4_w256_epi32(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi32_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long c_p4_w256_epi32(void) {
+    __m256i a = _mm256_set1_epi32((int)0x11u);
+    __m256i b = _mm256_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi32_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p5_w256_epi32(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi32_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long c_p5_w256_epi32(void) {
+    __m256i a = _mm256_set1_epi32((int)0x11u);
+    __m256i b = _mm256_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi32_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p6_w256_epi32(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi32_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long c_p6_w256_epi32(void) {
+    __m256i a = _mm256_set1_epi32((int)0x11u);
+    __m256i b = _mm256_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi32_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p7_w256_epi32(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi32_mask(a, b, 7));
+}
+
+__attribute__((noinline)) static unsigned long long c_p7_w256_epi32(void) {
+    __m256i a = _mm256_set1_epi32((int)0x11u);
+    __m256i b = _mm256_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi32_mask(a, b, 7));
 }
 
 __attribute__((noinline)) static unsigned long long rt_eq_w256_epu32(void) {
@@ -343,15 +1591,111 @@ __attribute__((noinline)) static unsigned long long rt_ne_w256_epu32(void) {
 }
 
 __attribute__((noinline)) static unsigned long long c_eq_w256_epu32(void) {
-    __m256i a = _mm256_set1_epi32((int)17);
-    __m256i b = _mm256_set1_epi32((int)17);
+    __m256i a = _mm256_set1_epi32((int)0x11u);
+    __m256i b = _mm256_set1_epi32((int)0x11u);
     return (unsigned long long)((__mmask8)_mm256_cmpeq_epu32_mask(a, b));
 }
 
 __attribute__((noinline)) static unsigned long long c_ne_w256_epu32(void) {
-    __m256i a = _mm256_set1_epi32((int)17);
-    __m256i b = _mm256_set1_epi32((int)34);
+    __m256i a = _mm256_set1_epi32((int)0x11u);
+    __m256i b = _mm256_set1_epi32((int)0x22u);
     return (unsigned long long)((__mmask8)_mm256_cmpeq_epu32_mask(a, b));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p0_w256_epu32(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu32_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long c_p0_w256_epu32(void) {
+    __m256i a = _mm256_set1_epi32((int)0x11u);
+    __m256i b = _mm256_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu32_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p1_w256_epu32(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu32_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long c_p1_w256_epu32(void) {
+    __m256i a = _mm256_set1_epi32((int)0x11u);
+    __m256i b = _mm256_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu32_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p2_w256_epu32(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu32_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long c_p2_w256_epu32(void) {
+    __m256i a = _mm256_set1_epi32((int)0x11u);
+    __m256i b = _mm256_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu32_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p3_w256_epu32(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu32_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long c_p3_w256_epu32(void) {
+    __m256i a = _mm256_set1_epi32((int)0x11u);
+    __m256i b = _mm256_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu32_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p4_w256_epu32(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu32_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long c_p4_w256_epu32(void) {
+    __m256i a = _mm256_set1_epi32((int)0x11u);
+    __m256i b = _mm256_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu32_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p5_w256_epu32(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu32_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long c_p5_w256_epu32(void) {
+    __m256i a = _mm256_set1_epi32((int)0x11u);
+    __m256i b = _mm256_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu32_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p6_w256_epu32(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu32_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long c_p6_w256_epu32(void) {
+    __m256i a = _mm256_set1_epi32((int)0x11u);
+    __m256i b = _mm256_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu32_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p7_w256_epu32(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu32_mask(a, b, 7));
+}
+
+__attribute__((noinline)) static unsigned long long c_p7_w256_epu32(void) {
+    __m256i a = _mm256_set1_epi32((int)0x11u);
+    __m256i b = _mm256_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu32_mask(a, b, 7));
 }
 
 __attribute__((noinline)) static unsigned long long rt_eq_w256_epi64(void) {
@@ -367,15 +1711,111 @@ __attribute__((noinline)) static unsigned long long rt_ne_w256_epi64(void) {
 }
 
 __attribute__((noinline)) static unsigned long long c_eq_w256_epi64(void) {
-    __m256i a = _mm256_set1_epi64x((long long)17);
-    __m256i b = _mm256_set1_epi64x((long long)17);
+    __m256i a = _mm256_set1_epi64x((long long)0x11ull);
+    __m256i b = _mm256_set1_epi64x((long long)0x11ull);
     return (unsigned long long)((__mmask8)_mm256_cmpeq_epi64_mask(a, b));
 }
 
 __attribute__((noinline)) static unsigned long long c_ne_w256_epi64(void) {
-    __m256i a = _mm256_set1_epi64x((long long)17);
-    __m256i b = _mm256_set1_epi64x((long long)34);
+    __m256i a = _mm256_set1_epi64x((long long)0x11ull);
+    __m256i b = _mm256_set1_epi64x((long long)0x22ull);
     return (unsigned long long)((__mmask8)_mm256_cmpeq_epi64_mask(a, b));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p0_w256_epi64(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi64_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long c_p0_w256_epi64(void) {
+    __m256i a = _mm256_set1_epi64x((long long)0x11ull);
+    __m256i b = _mm256_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi64_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p1_w256_epi64(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi64_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long c_p1_w256_epi64(void) {
+    __m256i a = _mm256_set1_epi64x((long long)0x11ull);
+    __m256i b = _mm256_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi64_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p2_w256_epi64(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi64_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long c_p2_w256_epi64(void) {
+    __m256i a = _mm256_set1_epi64x((long long)0x11ull);
+    __m256i b = _mm256_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi64_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p3_w256_epi64(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi64_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long c_p3_w256_epi64(void) {
+    __m256i a = _mm256_set1_epi64x((long long)0x11ull);
+    __m256i b = _mm256_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi64_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p4_w256_epi64(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi64_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long c_p4_w256_epi64(void) {
+    __m256i a = _mm256_set1_epi64x((long long)0x11ull);
+    __m256i b = _mm256_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi64_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p5_w256_epi64(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi64_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long c_p5_w256_epi64(void) {
+    __m256i a = _mm256_set1_epi64x((long long)0x11ull);
+    __m256i b = _mm256_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi64_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p6_w256_epi64(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi64_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long c_p6_w256_epi64(void) {
+    __m256i a = _mm256_set1_epi64x((long long)0x11ull);
+    __m256i b = _mm256_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi64_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p7_w256_epi64(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi64_mask(a, b, 7));
+}
+
+__attribute__((noinline)) static unsigned long long c_p7_w256_epi64(void) {
+    __m256i a = _mm256_set1_epi64x((long long)0x11ull);
+    __m256i b = _mm256_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epi64_mask(a, b, 7));
 }
 
 __attribute__((noinline)) static unsigned long long rt_eq_w256_epu64(void) {
@@ -391,15 +1831,111 @@ __attribute__((noinline)) static unsigned long long rt_ne_w256_epu64(void) {
 }
 
 __attribute__((noinline)) static unsigned long long c_eq_w256_epu64(void) {
-    __m256i a = _mm256_set1_epi64x((long long)17);
-    __m256i b = _mm256_set1_epi64x((long long)17);
+    __m256i a = _mm256_set1_epi64x((long long)0x11ull);
+    __m256i b = _mm256_set1_epi64x((long long)0x11ull);
     return (unsigned long long)((__mmask8)_mm256_cmpeq_epu64_mask(a, b));
 }
 
 __attribute__((noinline)) static unsigned long long c_ne_w256_epu64(void) {
-    __m256i a = _mm256_set1_epi64x((long long)17);
-    __m256i b = _mm256_set1_epi64x((long long)34);
+    __m256i a = _mm256_set1_epi64x((long long)0x11ull);
+    __m256i b = _mm256_set1_epi64x((long long)0x22ull);
     return (unsigned long long)((__mmask8)_mm256_cmpeq_epu64_mask(a, b));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p0_w256_epu64(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu64_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long c_p0_w256_epu64(void) {
+    __m256i a = _mm256_set1_epi64x((long long)0x11ull);
+    __m256i b = _mm256_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu64_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p1_w256_epu64(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu64_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long c_p1_w256_epu64(void) {
+    __m256i a = _mm256_set1_epi64x((long long)0x11ull);
+    __m256i b = _mm256_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu64_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p2_w256_epu64(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu64_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long c_p2_w256_epu64(void) {
+    __m256i a = _mm256_set1_epi64x((long long)0x11ull);
+    __m256i b = _mm256_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu64_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p3_w256_epu64(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu64_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long c_p3_w256_epu64(void) {
+    __m256i a = _mm256_set1_epi64x((long long)0x11ull);
+    __m256i b = _mm256_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu64_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p4_w256_epu64(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu64_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long c_p4_w256_epu64(void) {
+    __m256i a = _mm256_set1_epi64x((long long)0x11ull);
+    __m256i b = _mm256_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu64_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p5_w256_epu64(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu64_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long c_p5_w256_epu64(void) {
+    __m256i a = _mm256_set1_epi64x((long long)0x11ull);
+    __m256i b = _mm256_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu64_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p6_w256_epu64(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu64_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long c_p6_w256_epu64(void) {
+    __m256i a = _mm256_set1_epi64x((long long)0x11ull);
+    __m256i b = _mm256_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu64_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p7_w256_epu64(void) {
+    __m256i a = _mm256_loadu_si256((const __m256i_u *)(const void *)A);
+    __m256i b = _mm256_loadu_si256((const __m256i_u *)(const void *)B);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu64_mask(a, b, 7));
+}
+
+__attribute__((noinline)) static unsigned long long c_p7_w256_epu64(void) {
+    __m256i a = _mm256_set1_epi64x((long long)0x11ull);
+    __m256i b = _mm256_set1_epi64x((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm256_cmp_epu64_mask(a, b, 7));
 }
 
 __attribute__((noinline)) static unsigned long long rt_eq_w512_epi8(void) {
@@ -415,15 +1951,111 @@ __attribute__((noinline)) static unsigned long long rt_ne_w512_epi8(void) {
 }
 
 __attribute__((noinline)) static unsigned long long c_eq_w512_epi8(void) {
-    __m512i a = _mm512_set1_epi8((char)17);
-    __m512i b = _mm512_set1_epi8((char)17);
+    __m512i a = _mm512_set1_epi8((char)0x11);
+    __m512i b = _mm512_set1_epi8((char)0x11);
     return (unsigned long long)((__mmask64)_mm512_cmpeq_epi8_mask(a, b));
 }
 
 __attribute__((noinline)) static unsigned long long c_ne_w512_epi8(void) {
-    __m512i a = _mm512_set1_epi8((char)17);
-    __m512i b = _mm512_set1_epi8((char)34);
+    __m512i a = _mm512_set1_epi8((char)0x11);
+    __m512i b = _mm512_set1_epi8((char)0x22);
     return (unsigned long long)((__mmask64)_mm512_cmpeq_epi8_mask(a, b));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p0_w512_epi8(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epi8_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long c_p0_w512_epi8(void) {
+    __m512i a = _mm512_set1_epi8((char)0x11);
+    __m512i b = _mm512_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epi8_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p1_w512_epi8(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epi8_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long c_p1_w512_epi8(void) {
+    __m512i a = _mm512_set1_epi8((char)0x11);
+    __m512i b = _mm512_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epi8_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p2_w512_epi8(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epi8_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long c_p2_w512_epi8(void) {
+    __m512i a = _mm512_set1_epi8((char)0x11);
+    __m512i b = _mm512_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epi8_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p3_w512_epi8(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epi8_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long c_p3_w512_epi8(void) {
+    __m512i a = _mm512_set1_epi8((char)0x11);
+    __m512i b = _mm512_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epi8_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p4_w512_epi8(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epi8_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long c_p4_w512_epi8(void) {
+    __m512i a = _mm512_set1_epi8((char)0x11);
+    __m512i b = _mm512_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epi8_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p5_w512_epi8(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epi8_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long c_p5_w512_epi8(void) {
+    __m512i a = _mm512_set1_epi8((char)0x11);
+    __m512i b = _mm512_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epi8_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p6_w512_epi8(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epi8_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long c_p6_w512_epi8(void) {
+    __m512i a = _mm512_set1_epi8((char)0x11);
+    __m512i b = _mm512_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epi8_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p7_w512_epi8(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epi8_mask(a, b, 7));
+}
+
+__attribute__((noinline)) static unsigned long long c_p7_w512_epi8(void) {
+    __m512i a = _mm512_set1_epi8((char)0x11);
+    __m512i b = _mm512_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epi8_mask(a, b, 7));
 }
 
 __attribute__((noinline)) static unsigned long long rt_eq_w512_epu8(void) {
@@ -439,15 +2071,111 @@ __attribute__((noinline)) static unsigned long long rt_ne_w512_epu8(void) {
 }
 
 __attribute__((noinline)) static unsigned long long c_eq_w512_epu8(void) {
-    __m512i a = _mm512_set1_epi8((char)17);
-    __m512i b = _mm512_set1_epi8((char)17);
+    __m512i a = _mm512_set1_epi8((char)0x11);
+    __m512i b = _mm512_set1_epi8((char)0x11);
     return (unsigned long long)((__mmask64)_mm512_cmpeq_epu8_mask(a, b));
 }
 
 __attribute__((noinline)) static unsigned long long c_ne_w512_epu8(void) {
-    __m512i a = _mm512_set1_epi8((char)17);
-    __m512i b = _mm512_set1_epi8((char)34);
+    __m512i a = _mm512_set1_epi8((char)0x11);
+    __m512i b = _mm512_set1_epi8((char)0x22);
     return (unsigned long long)((__mmask64)_mm512_cmpeq_epu8_mask(a, b));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p0_w512_epu8(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epu8_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long c_p0_w512_epu8(void) {
+    __m512i a = _mm512_set1_epi8((char)0x11);
+    __m512i b = _mm512_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epu8_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p1_w512_epu8(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epu8_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long c_p1_w512_epu8(void) {
+    __m512i a = _mm512_set1_epi8((char)0x11);
+    __m512i b = _mm512_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epu8_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p2_w512_epu8(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epu8_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long c_p2_w512_epu8(void) {
+    __m512i a = _mm512_set1_epi8((char)0x11);
+    __m512i b = _mm512_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epu8_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p3_w512_epu8(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epu8_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long c_p3_w512_epu8(void) {
+    __m512i a = _mm512_set1_epi8((char)0x11);
+    __m512i b = _mm512_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epu8_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p4_w512_epu8(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epu8_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long c_p4_w512_epu8(void) {
+    __m512i a = _mm512_set1_epi8((char)0x11);
+    __m512i b = _mm512_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epu8_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p5_w512_epu8(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epu8_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long c_p5_w512_epu8(void) {
+    __m512i a = _mm512_set1_epi8((char)0x11);
+    __m512i b = _mm512_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epu8_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p6_w512_epu8(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epu8_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long c_p6_w512_epu8(void) {
+    __m512i a = _mm512_set1_epi8((char)0x11);
+    __m512i b = _mm512_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epu8_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p7_w512_epu8(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epu8_mask(a, b, 7));
+}
+
+__attribute__((noinline)) static unsigned long long c_p7_w512_epu8(void) {
+    __m512i a = _mm512_set1_epi8((char)0x11);
+    __m512i b = _mm512_set1_epi8((char)0x91);
+    return (unsigned long long)((__mmask64)_mm512_cmp_epu8_mask(a, b, 7));
 }
 
 __attribute__((noinline)) static unsigned long long rt_eq_w512_epi16(void) {
@@ -463,15 +2191,111 @@ __attribute__((noinline)) static unsigned long long rt_ne_w512_epi16(void) {
 }
 
 __attribute__((noinline)) static unsigned long long c_eq_w512_epi16(void) {
-    __m512i a = _mm512_set1_epi16((int)17);
-    __m512i b = _mm512_set1_epi16((int)17);
+    __m512i a = _mm512_set1_epi16((short)0x11u);
+    __m512i b = _mm512_set1_epi16((short)0x11u);
     return (unsigned long long)((__mmask32)_mm512_cmpeq_epi16_mask(a, b));
 }
 
 __attribute__((noinline)) static unsigned long long c_ne_w512_epi16(void) {
-    __m512i a = _mm512_set1_epi16((int)17);
-    __m512i b = _mm512_set1_epi16((int)34);
+    __m512i a = _mm512_set1_epi16((short)0x11u);
+    __m512i b = _mm512_set1_epi16((short)0x22u);
     return (unsigned long long)((__mmask32)_mm512_cmpeq_epi16_mask(a, b));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p0_w512_epi16(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epi16_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long c_p0_w512_epi16(void) {
+    __m512i a = _mm512_set1_epi16((short)0x11u);
+    __m512i b = _mm512_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epi16_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p1_w512_epi16(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epi16_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long c_p1_w512_epi16(void) {
+    __m512i a = _mm512_set1_epi16((short)0x11u);
+    __m512i b = _mm512_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epi16_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p2_w512_epi16(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epi16_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long c_p2_w512_epi16(void) {
+    __m512i a = _mm512_set1_epi16((short)0x11u);
+    __m512i b = _mm512_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epi16_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p3_w512_epi16(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epi16_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long c_p3_w512_epi16(void) {
+    __m512i a = _mm512_set1_epi16((short)0x11u);
+    __m512i b = _mm512_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epi16_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p4_w512_epi16(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epi16_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long c_p4_w512_epi16(void) {
+    __m512i a = _mm512_set1_epi16((short)0x11u);
+    __m512i b = _mm512_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epi16_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p5_w512_epi16(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epi16_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long c_p5_w512_epi16(void) {
+    __m512i a = _mm512_set1_epi16((short)0x11u);
+    __m512i b = _mm512_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epi16_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p6_w512_epi16(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epi16_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long c_p6_w512_epi16(void) {
+    __m512i a = _mm512_set1_epi16((short)0x11u);
+    __m512i b = _mm512_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epi16_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p7_w512_epi16(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epi16_mask(a, b, 7));
+}
+
+__attribute__((noinline)) static unsigned long long c_p7_w512_epi16(void) {
+    __m512i a = _mm512_set1_epi16((short)0x11u);
+    __m512i b = _mm512_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epi16_mask(a, b, 7));
 }
 
 __attribute__((noinline)) static unsigned long long rt_eq_w512_epu16(void) {
@@ -487,15 +2311,111 @@ __attribute__((noinline)) static unsigned long long rt_ne_w512_epu16(void) {
 }
 
 __attribute__((noinline)) static unsigned long long c_eq_w512_epu16(void) {
-    __m512i a = _mm512_set1_epi16((int)17);
-    __m512i b = _mm512_set1_epi16((int)17);
+    __m512i a = _mm512_set1_epi16((short)0x11u);
+    __m512i b = _mm512_set1_epi16((short)0x11u);
     return (unsigned long long)((__mmask32)_mm512_cmpeq_epu16_mask(a, b));
 }
 
 __attribute__((noinline)) static unsigned long long c_ne_w512_epu16(void) {
-    __m512i a = _mm512_set1_epi16((int)17);
-    __m512i b = _mm512_set1_epi16((int)34);
+    __m512i a = _mm512_set1_epi16((short)0x11u);
+    __m512i b = _mm512_set1_epi16((short)0x22u);
     return (unsigned long long)((__mmask32)_mm512_cmpeq_epu16_mask(a, b));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p0_w512_epu16(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epu16_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long c_p0_w512_epu16(void) {
+    __m512i a = _mm512_set1_epi16((short)0x11u);
+    __m512i b = _mm512_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epu16_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p1_w512_epu16(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epu16_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long c_p1_w512_epu16(void) {
+    __m512i a = _mm512_set1_epi16((short)0x11u);
+    __m512i b = _mm512_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epu16_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p2_w512_epu16(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epu16_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long c_p2_w512_epu16(void) {
+    __m512i a = _mm512_set1_epi16((short)0x11u);
+    __m512i b = _mm512_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epu16_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p3_w512_epu16(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epu16_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long c_p3_w512_epu16(void) {
+    __m512i a = _mm512_set1_epi16((short)0x11u);
+    __m512i b = _mm512_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epu16_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p4_w512_epu16(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epu16_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long c_p4_w512_epu16(void) {
+    __m512i a = _mm512_set1_epi16((short)0x11u);
+    __m512i b = _mm512_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epu16_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p5_w512_epu16(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epu16_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long c_p5_w512_epu16(void) {
+    __m512i a = _mm512_set1_epi16((short)0x11u);
+    __m512i b = _mm512_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epu16_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p6_w512_epu16(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epu16_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long c_p6_w512_epu16(void) {
+    __m512i a = _mm512_set1_epi16((short)0x11u);
+    __m512i b = _mm512_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epu16_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p7_w512_epu16(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epu16_mask(a, b, 7));
+}
+
+__attribute__((noinline)) static unsigned long long c_p7_w512_epu16(void) {
+    __m512i a = _mm512_set1_epi16((short)0x11u);
+    __m512i b = _mm512_set1_epi16((short)0x8091u);
+    return (unsigned long long)((__mmask32)_mm512_cmp_epu16_mask(a, b, 7));
 }
 
 __attribute__((noinline)) static unsigned long long rt_eq_w512_epi32(void) {
@@ -511,15 +2431,111 @@ __attribute__((noinline)) static unsigned long long rt_ne_w512_epi32(void) {
 }
 
 __attribute__((noinline)) static unsigned long long c_eq_w512_epi32(void) {
-    __m512i a = _mm512_set1_epi32((int)17);
-    __m512i b = _mm512_set1_epi32((int)17);
+    __m512i a = _mm512_set1_epi32((int)0x11u);
+    __m512i b = _mm512_set1_epi32((int)0x11u);
     return (unsigned long long)((__mmask16)_mm512_cmpeq_epi32_mask(a, b));
 }
 
 __attribute__((noinline)) static unsigned long long c_ne_w512_epi32(void) {
-    __m512i a = _mm512_set1_epi32((int)17);
-    __m512i b = _mm512_set1_epi32((int)34);
+    __m512i a = _mm512_set1_epi32((int)0x11u);
+    __m512i b = _mm512_set1_epi32((int)0x22u);
     return (unsigned long long)((__mmask16)_mm512_cmpeq_epi32_mask(a, b));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p0_w512_epi32(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epi32_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long c_p0_w512_epi32(void) {
+    __m512i a = _mm512_set1_epi32((int)0x11u);
+    __m512i b = _mm512_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epi32_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p1_w512_epi32(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epi32_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long c_p1_w512_epi32(void) {
+    __m512i a = _mm512_set1_epi32((int)0x11u);
+    __m512i b = _mm512_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epi32_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p2_w512_epi32(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epi32_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long c_p2_w512_epi32(void) {
+    __m512i a = _mm512_set1_epi32((int)0x11u);
+    __m512i b = _mm512_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epi32_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p3_w512_epi32(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epi32_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long c_p3_w512_epi32(void) {
+    __m512i a = _mm512_set1_epi32((int)0x11u);
+    __m512i b = _mm512_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epi32_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p4_w512_epi32(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epi32_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long c_p4_w512_epi32(void) {
+    __m512i a = _mm512_set1_epi32((int)0x11u);
+    __m512i b = _mm512_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epi32_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p5_w512_epi32(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epi32_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long c_p5_w512_epi32(void) {
+    __m512i a = _mm512_set1_epi32((int)0x11u);
+    __m512i b = _mm512_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epi32_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p6_w512_epi32(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epi32_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long c_p6_w512_epi32(void) {
+    __m512i a = _mm512_set1_epi32((int)0x11u);
+    __m512i b = _mm512_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epi32_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p7_w512_epi32(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epi32_mask(a, b, 7));
+}
+
+__attribute__((noinline)) static unsigned long long c_p7_w512_epi32(void) {
+    __m512i a = _mm512_set1_epi32((int)0x11u);
+    __m512i b = _mm512_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epi32_mask(a, b, 7));
 }
 
 __attribute__((noinline)) static unsigned long long rt_eq_w512_epu32(void) {
@@ -535,15 +2551,111 @@ __attribute__((noinline)) static unsigned long long rt_ne_w512_epu32(void) {
 }
 
 __attribute__((noinline)) static unsigned long long c_eq_w512_epu32(void) {
-    __m512i a = _mm512_set1_epi32((int)17);
-    __m512i b = _mm512_set1_epi32((int)17);
+    __m512i a = _mm512_set1_epi32((int)0x11u);
+    __m512i b = _mm512_set1_epi32((int)0x11u);
     return (unsigned long long)((__mmask16)_mm512_cmpeq_epu32_mask(a, b));
 }
 
 __attribute__((noinline)) static unsigned long long c_ne_w512_epu32(void) {
-    __m512i a = _mm512_set1_epi32((int)17);
-    __m512i b = _mm512_set1_epi32((int)34);
+    __m512i a = _mm512_set1_epi32((int)0x11u);
+    __m512i b = _mm512_set1_epi32((int)0x22u);
     return (unsigned long long)((__mmask16)_mm512_cmpeq_epu32_mask(a, b));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p0_w512_epu32(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epu32_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long c_p0_w512_epu32(void) {
+    __m512i a = _mm512_set1_epi32((int)0x11u);
+    __m512i b = _mm512_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epu32_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p1_w512_epu32(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epu32_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long c_p1_w512_epu32(void) {
+    __m512i a = _mm512_set1_epi32((int)0x11u);
+    __m512i b = _mm512_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epu32_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p2_w512_epu32(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epu32_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long c_p2_w512_epu32(void) {
+    __m512i a = _mm512_set1_epi32((int)0x11u);
+    __m512i b = _mm512_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epu32_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p3_w512_epu32(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epu32_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long c_p3_w512_epu32(void) {
+    __m512i a = _mm512_set1_epi32((int)0x11u);
+    __m512i b = _mm512_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epu32_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p4_w512_epu32(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epu32_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long c_p4_w512_epu32(void) {
+    __m512i a = _mm512_set1_epi32((int)0x11u);
+    __m512i b = _mm512_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epu32_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p5_w512_epu32(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epu32_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long c_p5_w512_epu32(void) {
+    __m512i a = _mm512_set1_epi32((int)0x11u);
+    __m512i b = _mm512_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epu32_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p6_w512_epu32(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epu32_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long c_p6_w512_epu32(void) {
+    __m512i a = _mm512_set1_epi32((int)0x11u);
+    __m512i b = _mm512_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epu32_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p7_w512_epu32(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epu32_mask(a, b, 7));
+}
+
+__attribute__((noinline)) static unsigned long long c_p7_w512_epu32(void) {
+    __m512i a = _mm512_set1_epi32((int)0x11u);
+    __m512i b = _mm512_set1_epi32((int)0x80910011u);
+    return (unsigned long long)((__mmask16)_mm512_cmp_epu32_mask(a, b, 7));
 }
 
 __attribute__((noinline)) static unsigned long long rt_eq_w512_epi64(void) {
@@ -559,15 +2671,111 @@ __attribute__((noinline)) static unsigned long long rt_ne_w512_epi64(void) {
 }
 
 __attribute__((noinline)) static unsigned long long c_eq_w512_epi64(void) {
-    __m512i a = _mm512_set1_epi64((int)17);
-    __m512i b = _mm512_set1_epi64((int)17);
+    __m512i a = _mm512_set1_epi64((long long)0x11ull);
+    __m512i b = _mm512_set1_epi64((long long)0x11ull);
     return (unsigned long long)((__mmask8)_mm512_cmpeq_epi64_mask(a, b));
 }
 
 __attribute__((noinline)) static unsigned long long c_ne_w512_epi64(void) {
-    __m512i a = _mm512_set1_epi64((int)17);
-    __m512i b = _mm512_set1_epi64((int)34);
+    __m512i a = _mm512_set1_epi64((long long)0x11ull);
+    __m512i b = _mm512_set1_epi64((long long)0x22ull);
     return (unsigned long long)((__mmask8)_mm512_cmpeq_epi64_mask(a, b));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p0_w512_epi64(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epi64_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long c_p0_w512_epi64(void) {
+    __m512i a = _mm512_set1_epi64((long long)0x11ull);
+    __m512i b = _mm512_set1_epi64((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epi64_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p1_w512_epi64(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epi64_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long c_p1_w512_epi64(void) {
+    __m512i a = _mm512_set1_epi64((long long)0x11ull);
+    __m512i b = _mm512_set1_epi64((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epi64_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p2_w512_epi64(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epi64_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long c_p2_w512_epi64(void) {
+    __m512i a = _mm512_set1_epi64((long long)0x11ull);
+    __m512i b = _mm512_set1_epi64((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epi64_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p3_w512_epi64(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epi64_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long c_p3_w512_epi64(void) {
+    __m512i a = _mm512_set1_epi64((long long)0x11ull);
+    __m512i b = _mm512_set1_epi64((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epi64_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p4_w512_epi64(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epi64_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long c_p4_w512_epi64(void) {
+    __m512i a = _mm512_set1_epi64((long long)0x11ull);
+    __m512i b = _mm512_set1_epi64((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epi64_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p5_w512_epi64(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epi64_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long c_p5_w512_epi64(void) {
+    __m512i a = _mm512_set1_epi64((long long)0x11ull);
+    __m512i b = _mm512_set1_epi64((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epi64_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p6_w512_epi64(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epi64_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long c_p6_w512_epi64(void) {
+    __m512i a = _mm512_set1_epi64((long long)0x11ull);
+    __m512i b = _mm512_set1_epi64((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epi64_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p7_w512_epi64(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epi64_mask(a, b, 7));
+}
+
+__attribute__((noinline)) static unsigned long long c_p7_w512_epi64(void) {
+    __m512i a = _mm512_set1_epi64((long long)0x11ull);
+    __m512i b = _mm512_set1_epi64((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epi64_mask(a, b, 7));
 }
 
 __attribute__((noinline)) static unsigned long long rt_eq_w512_epu64(void) {
@@ -583,43 +2791,139 @@ __attribute__((noinline)) static unsigned long long rt_ne_w512_epu64(void) {
 }
 
 __attribute__((noinline)) static unsigned long long c_eq_w512_epu64(void) {
-    __m512i a = _mm512_set1_epi64((int)17);
-    __m512i b = _mm512_set1_epi64((int)17);
+    __m512i a = _mm512_set1_epi64((long long)0x11ull);
+    __m512i b = _mm512_set1_epi64((long long)0x11ull);
     return (unsigned long long)((__mmask8)_mm512_cmpeq_epu64_mask(a, b));
 }
 
 __attribute__((noinline)) static unsigned long long c_ne_w512_epu64(void) {
-    __m512i a = _mm512_set1_epi64((int)17);
-    __m512i b = _mm512_set1_epi64((int)34);
+    __m512i a = _mm512_set1_epi64((long long)0x11ull);
+    __m512i b = _mm512_set1_epi64((long long)0x22ull);
     return (unsigned long long)((__mmask8)_mm512_cmpeq_epu64_mask(a, b));
 }
 
+__attribute__((noinline)) static unsigned long long rt_p0_w512_epu64(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epu64_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long c_p0_w512_epu64(void) {
+    __m512i a = _mm512_set1_epi64((long long)0x11ull);
+    __m512i b = _mm512_set1_epi64((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epu64_mask(a, b, 0));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p1_w512_epu64(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epu64_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long c_p1_w512_epu64(void) {
+    __m512i a = _mm512_set1_epi64((long long)0x11ull);
+    __m512i b = _mm512_set1_epi64((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epu64_mask(a, b, 1));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p2_w512_epu64(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epu64_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long c_p2_w512_epu64(void) {
+    __m512i a = _mm512_set1_epi64((long long)0x11ull);
+    __m512i b = _mm512_set1_epi64((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epu64_mask(a, b, 2));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p3_w512_epu64(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epu64_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long c_p3_w512_epu64(void) {
+    __m512i a = _mm512_set1_epi64((long long)0x11ull);
+    __m512i b = _mm512_set1_epi64((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epu64_mask(a, b, 3));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p4_w512_epu64(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epu64_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long c_p4_w512_epu64(void) {
+    __m512i a = _mm512_set1_epi64((long long)0x11ull);
+    __m512i b = _mm512_set1_epi64((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epu64_mask(a, b, 4));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p5_w512_epu64(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epu64_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long c_p5_w512_epu64(void) {
+    __m512i a = _mm512_set1_epi64((long long)0x11ull);
+    __m512i b = _mm512_set1_epi64((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epu64_mask(a, b, 5));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p6_w512_epu64(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epu64_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long c_p6_w512_epu64(void) {
+    __m512i a = _mm512_set1_epi64((long long)0x11ull);
+    __m512i b = _mm512_set1_epi64((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epu64_mask(a, b, 6));
+}
+
+__attribute__((noinline)) static unsigned long long rt_p7_w512_epu64(void) {
+    __m512i a = _mm512_loadu_si512(A);
+    __m512i b = _mm512_loadu_si512(B);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epu64_mask(a, b, 7));
+}
+
+__attribute__((noinline)) static unsigned long long c_p7_w512_epu64(void) {
+    __m512i a = _mm512_set1_epi64((long long)0x11ull);
+    __m512i b = _mm512_set1_epi64((long long)0x8091001122334455ull);
+    return (unsigned long long)((__mmask8)_mm512_cmp_epu64_mask(a, b, 7));
+}
+
 __attribute__((noinline)) static unsigned long long s128_on(void) {
-    __m128i v = _mm_set1_epi8((char)90);
+    __m128i v = _mm_set1_epi8((char)0x5a);
     _mm_mask_storeu_epi8(G + 0, (__mmask16)0xFFFF, v);
     return h(G + 0, 16);
 }
 
 __attribute__((noinline)) static unsigned long long s256_on(void) {
-    __m256i v = _mm256_set1_epi8((char)90);
+    __m256i v = _mm256_set1_epi8((char)0x5a);
     _mm256_mask_storeu_epi8(G + 32, (__mmask32)0xFFFFFFFFu, v);
     return h(G + 32, 32);
 }
 
 __attribute__((noinline)) static unsigned long long s512_on(void) {
-    __m512i v = _mm512_set1_epi8((char)90);
+    __m512i v = _mm512_set1_epi8((char)0x5a);
     _mm512_mask_storeu_epi8(G + 64, (__mmask64)0xFFFFFFFFFFFFFFFFull, v);
     return h(G + 64, 64);
 }
 
 __attribute__((noinline)) static unsigned long long s128_off(void) {
-    __m128i v = _mm_set1_epi8((char)90);
+    __m128i v = _mm_set1_epi8((char)0x5a);
     _mm_mask_storeu_epi8(G + 128, (__mmask16)0x0000, v);
     return h(G + 128, 16);
 }
 
 __attribute__((noinline)) static unsigned long long s128_prefix(void) {
-    __m128i v = _mm_set1_epi8((char)90);
+    __m128i v = _mm_set1_epi8((char)0x5a);
     _mm_mask_storeu_epi8(G + 160, (__mmask16)0x00FF, v);
     return h(G + 160, 16);
 }
@@ -635,98 +2939,482 @@ int main(int argc, char **argv) {
     printf("%s %016llx\n", "rt_ne_w128_epi8", rt_ne_w128_epi8());
     printf("%s %016llx\n", "c_eq_w128_epi8", c_eq_w128_epi8());
     printf("%s %016llx\n", "c_ne_w128_epi8", c_ne_w128_epi8());
+    printf("%s %016llx\n", "rt_p0_w128_epi8", rt_p0_w128_epi8());
+    printf("%s %016llx\n", "c_p0_w128_epi8", c_p0_w128_epi8());
+    printf("%s %016llx\n", "rt_p1_w128_epi8", rt_p1_w128_epi8());
+    printf("%s %016llx\n", "c_p1_w128_epi8", c_p1_w128_epi8());
+    printf("%s %016llx\n", "rt_p2_w128_epi8", rt_p2_w128_epi8());
+    printf("%s %016llx\n", "c_p2_w128_epi8", c_p2_w128_epi8());
+    printf("%s %016llx\n", "rt_p3_w128_epi8", rt_p3_w128_epi8());
+    printf("%s %016llx\n", "c_p3_w128_epi8", c_p3_w128_epi8());
+    printf("%s %016llx\n", "rt_p4_w128_epi8", rt_p4_w128_epi8());
+    printf("%s %016llx\n", "c_p4_w128_epi8", c_p4_w128_epi8());
+    printf("%s %016llx\n", "rt_p5_w128_epi8", rt_p5_w128_epi8());
+    printf("%s %016llx\n", "c_p5_w128_epi8", c_p5_w128_epi8());
+    printf("%s %016llx\n", "rt_p6_w128_epi8", rt_p6_w128_epi8());
+    printf("%s %016llx\n", "c_p6_w128_epi8", c_p6_w128_epi8());
+    printf("%s %016llx\n", "rt_p7_w128_epi8", rt_p7_w128_epi8());
+    printf("%s %016llx\n", "c_p7_w128_epi8", c_p7_w128_epi8());
     printf("%s %016llx\n", "rt_eq_w128_epu8", rt_eq_w128_epu8());
     printf("%s %016llx\n", "rt_ne_w128_epu8", rt_ne_w128_epu8());
     printf("%s %016llx\n", "c_eq_w128_epu8", c_eq_w128_epu8());
     printf("%s %016llx\n", "c_ne_w128_epu8", c_ne_w128_epu8());
+    printf("%s %016llx\n", "rt_p0_w128_epu8", rt_p0_w128_epu8());
+    printf("%s %016llx\n", "c_p0_w128_epu8", c_p0_w128_epu8());
+    printf("%s %016llx\n", "rt_p1_w128_epu8", rt_p1_w128_epu8());
+    printf("%s %016llx\n", "c_p1_w128_epu8", c_p1_w128_epu8());
+    printf("%s %016llx\n", "rt_p2_w128_epu8", rt_p2_w128_epu8());
+    printf("%s %016llx\n", "c_p2_w128_epu8", c_p2_w128_epu8());
+    printf("%s %016llx\n", "rt_p3_w128_epu8", rt_p3_w128_epu8());
+    printf("%s %016llx\n", "c_p3_w128_epu8", c_p3_w128_epu8());
+    printf("%s %016llx\n", "rt_p4_w128_epu8", rt_p4_w128_epu8());
+    printf("%s %016llx\n", "c_p4_w128_epu8", c_p4_w128_epu8());
+    printf("%s %016llx\n", "rt_p5_w128_epu8", rt_p5_w128_epu8());
+    printf("%s %016llx\n", "c_p5_w128_epu8", c_p5_w128_epu8());
+    printf("%s %016llx\n", "rt_p6_w128_epu8", rt_p6_w128_epu8());
+    printf("%s %016llx\n", "c_p6_w128_epu8", c_p6_w128_epu8());
+    printf("%s %016llx\n", "rt_p7_w128_epu8", rt_p7_w128_epu8());
+    printf("%s %016llx\n", "c_p7_w128_epu8", c_p7_w128_epu8());
     printf("%s %016llx\n", "rt_eq_w128_epi16", rt_eq_w128_epi16());
     printf("%s %016llx\n", "rt_ne_w128_epi16", rt_ne_w128_epi16());
     printf("%s %016llx\n", "c_eq_w128_epi16", c_eq_w128_epi16());
     printf("%s %016llx\n", "c_ne_w128_epi16", c_ne_w128_epi16());
+    printf("%s %016llx\n", "rt_p0_w128_epi16", rt_p0_w128_epi16());
+    printf("%s %016llx\n", "c_p0_w128_epi16", c_p0_w128_epi16());
+    printf("%s %016llx\n", "rt_p1_w128_epi16", rt_p1_w128_epi16());
+    printf("%s %016llx\n", "c_p1_w128_epi16", c_p1_w128_epi16());
+    printf("%s %016llx\n", "rt_p2_w128_epi16", rt_p2_w128_epi16());
+    printf("%s %016llx\n", "c_p2_w128_epi16", c_p2_w128_epi16());
+    printf("%s %016llx\n", "rt_p3_w128_epi16", rt_p3_w128_epi16());
+    printf("%s %016llx\n", "c_p3_w128_epi16", c_p3_w128_epi16());
+    printf("%s %016llx\n", "rt_p4_w128_epi16", rt_p4_w128_epi16());
+    printf("%s %016llx\n", "c_p4_w128_epi16", c_p4_w128_epi16());
+    printf("%s %016llx\n", "rt_p5_w128_epi16", rt_p5_w128_epi16());
+    printf("%s %016llx\n", "c_p5_w128_epi16", c_p5_w128_epi16());
+    printf("%s %016llx\n", "rt_p6_w128_epi16", rt_p6_w128_epi16());
+    printf("%s %016llx\n", "c_p6_w128_epi16", c_p6_w128_epi16());
+    printf("%s %016llx\n", "rt_p7_w128_epi16", rt_p7_w128_epi16());
+    printf("%s %016llx\n", "c_p7_w128_epi16", c_p7_w128_epi16());
     printf("%s %016llx\n", "rt_eq_w128_epu16", rt_eq_w128_epu16());
     printf("%s %016llx\n", "rt_ne_w128_epu16", rt_ne_w128_epu16());
     printf("%s %016llx\n", "c_eq_w128_epu16", c_eq_w128_epu16());
     printf("%s %016llx\n", "c_ne_w128_epu16", c_ne_w128_epu16());
+    printf("%s %016llx\n", "rt_p0_w128_epu16", rt_p0_w128_epu16());
+    printf("%s %016llx\n", "c_p0_w128_epu16", c_p0_w128_epu16());
+    printf("%s %016llx\n", "rt_p1_w128_epu16", rt_p1_w128_epu16());
+    printf("%s %016llx\n", "c_p1_w128_epu16", c_p1_w128_epu16());
+    printf("%s %016llx\n", "rt_p2_w128_epu16", rt_p2_w128_epu16());
+    printf("%s %016llx\n", "c_p2_w128_epu16", c_p2_w128_epu16());
+    printf("%s %016llx\n", "rt_p3_w128_epu16", rt_p3_w128_epu16());
+    printf("%s %016llx\n", "c_p3_w128_epu16", c_p3_w128_epu16());
+    printf("%s %016llx\n", "rt_p4_w128_epu16", rt_p4_w128_epu16());
+    printf("%s %016llx\n", "c_p4_w128_epu16", c_p4_w128_epu16());
+    printf("%s %016llx\n", "rt_p5_w128_epu16", rt_p5_w128_epu16());
+    printf("%s %016llx\n", "c_p5_w128_epu16", c_p5_w128_epu16());
+    printf("%s %016llx\n", "rt_p6_w128_epu16", rt_p6_w128_epu16());
+    printf("%s %016llx\n", "c_p6_w128_epu16", c_p6_w128_epu16());
+    printf("%s %016llx\n", "rt_p7_w128_epu16", rt_p7_w128_epu16());
+    printf("%s %016llx\n", "c_p7_w128_epu16", c_p7_w128_epu16());
     printf("%s %016llx\n", "rt_eq_w128_epi32", rt_eq_w128_epi32());
     printf("%s %016llx\n", "rt_ne_w128_epi32", rt_ne_w128_epi32());
     printf("%s %016llx\n", "c_eq_w128_epi32", c_eq_w128_epi32());
     printf("%s %016llx\n", "c_ne_w128_epi32", c_ne_w128_epi32());
+    printf("%s %016llx\n", "rt_p0_w128_epi32", rt_p0_w128_epi32());
+    printf("%s %016llx\n", "c_p0_w128_epi32", c_p0_w128_epi32());
+    printf("%s %016llx\n", "rt_p1_w128_epi32", rt_p1_w128_epi32());
+    printf("%s %016llx\n", "c_p1_w128_epi32", c_p1_w128_epi32());
+    printf("%s %016llx\n", "rt_p2_w128_epi32", rt_p2_w128_epi32());
+    printf("%s %016llx\n", "c_p2_w128_epi32", c_p2_w128_epi32());
+    printf("%s %016llx\n", "rt_p3_w128_epi32", rt_p3_w128_epi32());
+    printf("%s %016llx\n", "c_p3_w128_epi32", c_p3_w128_epi32());
+    printf("%s %016llx\n", "rt_p4_w128_epi32", rt_p4_w128_epi32());
+    printf("%s %016llx\n", "c_p4_w128_epi32", c_p4_w128_epi32());
+    printf("%s %016llx\n", "rt_p5_w128_epi32", rt_p5_w128_epi32());
+    printf("%s %016llx\n", "c_p5_w128_epi32", c_p5_w128_epi32());
+    printf("%s %016llx\n", "rt_p6_w128_epi32", rt_p6_w128_epi32());
+    printf("%s %016llx\n", "c_p6_w128_epi32", c_p6_w128_epi32());
+    printf("%s %016llx\n", "rt_p7_w128_epi32", rt_p7_w128_epi32());
+    printf("%s %016llx\n", "c_p7_w128_epi32", c_p7_w128_epi32());
     printf("%s %016llx\n", "rt_eq_w128_epu32", rt_eq_w128_epu32());
     printf("%s %016llx\n", "rt_ne_w128_epu32", rt_ne_w128_epu32());
     printf("%s %016llx\n", "c_eq_w128_epu32", c_eq_w128_epu32());
     printf("%s %016llx\n", "c_ne_w128_epu32", c_ne_w128_epu32());
+    printf("%s %016llx\n", "rt_p0_w128_epu32", rt_p0_w128_epu32());
+    printf("%s %016llx\n", "c_p0_w128_epu32", c_p0_w128_epu32());
+    printf("%s %016llx\n", "rt_p1_w128_epu32", rt_p1_w128_epu32());
+    printf("%s %016llx\n", "c_p1_w128_epu32", c_p1_w128_epu32());
+    printf("%s %016llx\n", "rt_p2_w128_epu32", rt_p2_w128_epu32());
+    printf("%s %016llx\n", "c_p2_w128_epu32", c_p2_w128_epu32());
+    printf("%s %016llx\n", "rt_p3_w128_epu32", rt_p3_w128_epu32());
+    printf("%s %016llx\n", "c_p3_w128_epu32", c_p3_w128_epu32());
+    printf("%s %016llx\n", "rt_p4_w128_epu32", rt_p4_w128_epu32());
+    printf("%s %016llx\n", "c_p4_w128_epu32", c_p4_w128_epu32());
+    printf("%s %016llx\n", "rt_p5_w128_epu32", rt_p5_w128_epu32());
+    printf("%s %016llx\n", "c_p5_w128_epu32", c_p5_w128_epu32());
+    printf("%s %016llx\n", "rt_p6_w128_epu32", rt_p6_w128_epu32());
+    printf("%s %016llx\n", "c_p6_w128_epu32", c_p6_w128_epu32());
+    printf("%s %016llx\n", "rt_p7_w128_epu32", rt_p7_w128_epu32());
+    printf("%s %016llx\n", "c_p7_w128_epu32", c_p7_w128_epu32());
     printf("%s %016llx\n", "rt_eq_w128_epi64", rt_eq_w128_epi64());
     printf("%s %016llx\n", "rt_ne_w128_epi64", rt_ne_w128_epi64());
     printf("%s %016llx\n", "c_eq_w128_epi64", c_eq_w128_epi64());
     printf("%s %016llx\n", "c_ne_w128_epi64", c_ne_w128_epi64());
+    printf("%s %016llx\n", "rt_p0_w128_epi64", rt_p0_w128_epi64());
+    printf("%s %016llx\n", "c_p0_w128_epi64", c_p0_w128_epi64());
+    printf("%s %016llx\n", "rt_p1_w128_epi64", rt_p1_w128_epi64());
+    printf("%s %016llx\n", "c_p1_w128_epi64", c_p1_w128_epi64());
+    printf("%s %016llx\n", "rt_p2_w128_epi64", rt_p2_w128_epi64());
+    printf("%s %016llx\n", "c_p2_w128_epi64", c_p2_w128_epi64());
+    printf("%s %016llx\n", "rt_p3_w128_epi64", rt_p3_w128_epi64());
+    printf("%s %016llx\n", "c_p3_w128_epi64", c_p3_w128_epi64());
+    printf("%s %016llx\n", "rt_p4_w128_epi64", rt_p4_w128_epi64());
+    printf("%s %016llx\n", "c_p4_w128_epi64", c_p4_w128_epi64());
+    printf("%s %016llx\n", "rt_p5_w128_epi64", rt_p5_w128_epi64());
+    printf("%s %016llx\n", "c_p5_w128_epi64", c_p5_w128_epi64());
+    printf("%s %016llx\n", "rt_p6_w128_epi64", rt_p6_w128_epi64());
+    printf("%s %016llx\n", "c_p6_w128_epi64", c_p6_w128_epi64());
+    printf("%s %016llx\n", "rt_p7_w128_epi64", rt_p7_w128_epi64());
+    printf("%s %016llx\n", "c_p7_w128_epi64", c_p7_w128_epi64());
     printf("%s %016llx\n", "rt_eq_w128_epu64", rt_eq_w128_epu64());
     printf("%s %016llx\n", "rt_ne_w128_epu64", rt_ne_w128_epu64());
     printf("%s %016llx\n", "c_eq_w128_epu64", c_eq_w128_epu64());
     printf("%s %016llx\n", "c_ne_w128_epu64", c_ne_w128_epu64());
+    printf("%s %016llx\n", "rt_p0_w128_epu64", rt_p0_w128_epu64());
+    printf("%s %016llx\n", "c_p0_w128_epu64", c_p0_w128_epu64());
+    printf("%s %016llx\n", "rt_p1_w128_epu64", rt_p1_w128_epu64());
+    printf("%s %016llx\n", "c_p1_w128_epu64", c_p1_w128_epu64());
+    printf("%s %016llx\n", "rt_p2_w128_epu64", rt_p2_w128_epu64());
+    printf("%s %016llx\n", "c_p2_w128_epu64", c_p2_w128_epu64());
+    printf("%s %016llx\n", "rt_p3_w128_epu64", rt_p3_w128_epu64());
+    printf("%s %016llx\n", "c_p3_w128_epu64", c_p3_w128_epu64());
+    printf("%s %016llx\n", "rt_p4_w128_epu64", rt_p4_w128_epu64());
+    printf("%s %016llx\n", "c_p4_w128_epu64", c_p4_w128_epu64());
+    printf("%s %016llx\n", "rt_p5_w128_epu64", rt_p5_w128_epu64());
+    printf("%s %016llx\n", "c_p5_w128_epu64", c_p5_w128_epu64());
+    printf("%s %016llx\n", "rt_p6_w128_epu64", rt_p6_w128_epu64());
+    printf("%s %016llx\n", "c_p6_w128_epu64", c_p6_w128_epu64());
+    printf("%s %016llx\n", "rt_p7_w128_epu64", rt_p7_w128_epu64());
+    printf("%s %016llx\n", "c_p7_w128_epu64", c_p7_w128_epu64());
     printf("%s %016llx\n", "rt_eq_w256_epi8", rt_eq_w256_epi8());
     printf("%s %016llx\n", "rt_ne_w256_epi8", rt_ne_w256_epi8());
     printf("%s %016llx\n", "c_eq_w256_epi8", c_eq_w256_epi8());
     printf("%s %016llx\n", "c_ne_w256_epi8", c_ne_w256_epi8());
+    printf("%s %016llx\n", "rt_p0_w256_epi8", rt_p0_w256_epi8());
+    printf("%s %016llx\n", "c_p0_w256_epi8", c_p0_w256_epi8());
+    printf("%s %016llx\n", "rt_p1_w256_epi8", rt_p1_w256_epi8());
+    printf("%s %016llx\n", "c_p1_w256_epi8", c_p1_w256_epi8());
+    printf("%s %016llx\n", "rt_p2_w256_epi8", rt_p2_w256_epi8());
+    printf("%s %016llx\n", "c_p2_w256_epi8", c_p2_w256_epi8());
+    printf("%s %016llx\n", "rt_p3_w256_epi8", rt_p3_w256_epi8());
+    printf("%s %016llx\n", "c_p3_w256_epi8", c_p3_w256_epi8());
+    printf("%s %016llx\n", "rt_p4_w256_epi8", rt_p4_w256_epi8());
+    printf("%s %016llx\n", "c_p4_w256_epi8", c_p4_w256_epi8());
+    printf("%s %016llx\n", "rt_p5_w256_epi8", rt_p5_w256_epi8());
+    printf("%s %016llx\n", "c_p5_w256_epi8", c_p5_w256_epi8());
+    printf("%s %016llx\n", "rt_p6_w256_epi8", rt_p6_w256_epi8());
+    printf("%s %016llx\n", "c_p6_w256_epi8", c_p6_w256_epi8());
+    printf("%s %016llx\n", "rt_p7_w256_epi8", rt_p7_w256_epi8());
+    printf("%s %016llx\n", "c_p7_w256_epi8", c_p7_w256_epi8());
     printf("%s %016llx\n", "rt_eq_w256_epu8", rt_eq_w256_epu8());
     printf("%s %016llx\n", "rt_ne_w256_epu8", rt_ne_w256_epu8());
     printf("%s %016llx\n", "c_eq_w256_epu8", c_eq_w256_epu8());
     printf("%s %016llx\n", "c_ne_w256_epu8", c_ne_w256_epu8());
+    printf("%s %016llx\n", "rt_p0_w256_epu8", rt_p0_w256_epu8());
+    printf("%s %016llx\n", "c_p0_w256_epu8", c_p0_w256_epu8());
+    printf("%s %016llx\n", "rt_p1_w256_epu8", rt_p1_w256_epu8());
+    printf("%s %016llx\n", "c_p1_w256_epu8", c_p1_w256_epu8());
+    printf("%s %016llx\n", "rt_p2_w256_epu8", rt_p2_w256_epu8());
+    printf("%s %016llx\n", "c_p2_w256_epu8", c_p2_w256_epu8());
+    printf("%s %016llx\n", "rt_p3_w256_epu8", rt_p3_w256_epu8());
+    printf("%s %016llx\n", "c_p3_w256_epu8", c_p3_w256_epu8());
+    printf("%s %016llx\n", "rt_p4_w256_epu8", rt_p4_w256_epu8());
+    printf("%s %016llx\n", "c_p4_w256_epu8", c_p4_w256_epu8());
+    printf("%s %016llx\n", "rt_p5_w256_epu8", rt_p5_w256_epu8());
+    printf("%s %016llx\n", "c_p5_w256_epu8", c_p5_w256_epu8());
+    printf("%s %016llx\n", "rt_p6_w256_epu8", rt_p6_w256_epu8());
+    printf("%s %016llx\n", "c_p6_w256_epu8", c_p6_w256_epu8());
+    printf("%s %016llx\n", "rt_p7_w256_epu8", rt_p7_w256_epu8());
+    printf("%s %016llx\n", "c_p7_w256_epu8", c_p7_w256_epu8());
     printf("%s %016llx\n", "rt_eq_w256_epi16", rt_eq_w256_epi16());
     printf("%s %016llx\n", "rt_ne_w256_epi16", rt_ne_w256_epi16());
     printf("%s %016llx\n", "c_eq_w256_epi16", c_eq_w256_epi16());
     printf("%s %016llx\n", "c_ne_w256_epi16", c_ne_w256_epi16());
+    printf("%s %016llx\n", "rt_p0_w256_epi16", rt_p0_w256_epi16());
+    printf("%s %016llx\n", "c_p0_w256_epi16", c_p0_w256_epi16());
+    printf("%s %016llx\n", "rt_p1_w256_epi16", rt_p1_w256_epi16());
+    printf("%s %016llx\n", "c_p1_w256_epi16", c_p1_w256_epi16());
+    printf("%s %016llx\n", "rt_p2_w256_epi16", rt_p2_w256_epi16());
+    printf("%s %016llx\n", "c_p2_w256_epi16", c_p2_w256_epi16());
+    printf("%s %016llx\n", "rt_p3_w256_epi16", rt_p3_w256_epi16());
+    printf("%s %016llx\n", "c_p3_w256_epi16", c_p3_w256_epi16());
+    printf("%s %016llx\n", "rt_p4_w256_epi16", rt_p4_w256_epi16());
+    printf("%s %016llx\n", "c_p4_w256_epi16", c_p4_w256_epi16());
+    printf("%s %016llx\n", "rt_p5_w256_epi16", rt_p5_w256_epi16());
+    printf("%s %016llx\n", "c_p5_w256_epi16", c_p5_w256_epi16());
+    printf("%s %016llx\n", "rt_p6_w256_epi16", rt_p6_w256_epi16());
+    printf("%s %016llx\n", "c_p6_w256_epi16", c_p6_w256_epi16());
+    printf("%s %016llx\n", "rt_p7_w256_epi16", rt_p7_w256_epi16());
+    printf("%s %016llx\n", "c_p7_w256_epi16", c_p7_w256_epi16());
     printf("%s %016llx\n", "rt_eq_w256_epu16", rt_eq_w256_epu16());
     printf("%s %016llx\n", "rt_ne_w256_epu16", rt_ne_w256_epu16());
     printf("%s %016llx\n", "c_eq_w256_epu16", c_eq_w256_epu16());
     printf("%s %016llx\n", "c_ne_w256_epu16", c_ne_w256_epu16());
+    printf("%s %016llx\n", "rt_p0_w256_epu16", rt_p0_w256_epu16());
+    printf("%s %016llx\n", "c_p0_w256_epu16", c_p0_w256_epu16());
+    printf("%s %016llx\n", "rt_p1_w256_epu16", rt_p1_w256_epu16());
+    printf("%s %016llx\n", "c_p1_w256_epu16", c_p1_w256_epu16());
+    printf("%s %016llx\n", "rt_p2_w256_epu16", rt_p2_w256_epu16());
+    printf("%s %016llx\n", "c_p2_w256_epu16", c_p2_w256_epu16());
+    printf("%s %016llx\n", "rt_p3_w256_epu16", rt_p3_w256_epu16());
+    printf("%s %016llx\n", "c_p3_w256_epu16", c_p3_w256_epu16());
+    printf("%s %016llx\n", "rt_p4_w256_epu16", rt_p4_w256_epu16());
+    printf("%s %016llx\n", "c_p4_w256_epu16", c_p4_w256_epu16());
+    printf("%s %016llx\n", "rt_p5_w256_epu16", rt_p5_w256_epu16());
+    printf("%s %016llx\n", "c_p5_w256_epu16", c_p5_w256_epu16());
+    printf("%s %016llx\n", "rt_p6_w256_epu16", rt_p6_w256_epu16());
+    printf("%s %016llx\n", "c_p6_w256_epu16", c_p6_w256_epu16());
+    printf("%s %016llx\n", "rt_p7_w256_epu16", rt_p7_w256_epu16());
+    printf("%s %016llx\n", "c_p7_w256_epu16", c_p7_w256_epu16());
     printf("%s %016llx\n", "rt_eq_w256_epi32", rt_eq_w256_epi32());
     printf("%s %016llx\n", "rt_ne_w256_epi32", rt_ne_w256_epi32());
     printf("%s %016llx\n", "c_eq_w256_epi32", c_eq_w256_epi32());
     printf("%s %016llx\n", "c_ne_w256_epi32", c_ne_w256_epi32());
+    printf("%s %016llx\n", "rt_p0_w256_epi32", rt_p0_w256_epi32());
+    printf("%s %016llx\n", "c_p0_w256_epi32", c_p0_w256_epi32());
+    printf("%s %016llx\n", "rt_p1_w256_epi32", rt_p1_w256_epi32());
+    printf("%s %016llx\n", "c_p1_w256_epi32", c_p1_w256_epi32());
+    printf("%s %016llx\n", "rt_p2_w256_epi32", rt_p2_w256_epi32());
+    printf("%s %016llx\n", "c_p2_w256_epi32", c_p2_w256_epi32());
+    printf("%s %016llx\n", "rt_p3_w256_epi32", rt_p3_w256_epi32());
+    printf("%s %016llx\n", "c_p3_w256_epi32", c_p3_w256_epi32());
+    printf("%s %016llx\n", "rt_p4_w256_epi32", rt_p4_w256_epi32());
+    printf("%s %016llx\n", "c_p4_w256_epi32", c_p4_w256_epi32());
+    printf("%s %016llx\n", "rt_p5_w256_epi32", rt_p5_w256_epi32());
+    printf("%s %016llx\n", "c_p5_w256_epi32", c_p5_w256_epi32());
+    printf("%s %016llx\n", "rt_p6_w256_epi32", rt_p6_w256_epi32());
+    printf("%s %016llx\n", "c_p6_w256_epi32", c_p6_w256_epi32());
+    printf("%s %016llx\n", "rt_p7_w256_epi32", rt_p7_w256_epi32());
+    printf("%s %016llx\n", "c_p7_w256_epi32", c_p7_w256_epi32());
     printf("%s %016llx\n", "rt_eq_w256_epu32", rt_eq_w256_epu32());
     printf("%s %016llx\n", "rt_ne_w256_epu32", rt_ne_w256_epu32());
     printf("%s %016llx\n", "c_eq_w256_epu32", c_eq_w256_epu32());
     printf("%s %016llx\n", "c_ne_w256_epu32", c_ne_w256_epu32());
+    printf("%s %016llx\n", "rt_p0_w256_epu32", rt_p0_w256_epu32());
+    printf("%s %016llx\n", "c_p0_w256_epu32", c_p0_w256_epu32());
+    printf("%s %016llx\n", "rt_p1_w256_epu32", rt_p1_w256_epu32());
+    printf("%s %016llx\n", "c_p1_w256_epu32", c_p1_w256_epu32());
+    printf("%s %016llx\n", "rt_p2_w256_epu32", rt_p2_w256_epu32());
+    printf("%s %016llx\n", "c_p2_w256_epu32", c_p2_w256_epu32());
+    printf("%s %016llx\n", "rt_p3_w256_epu32", rt_p3_w256_epu32());
+    printf("%s %016llx\n", "c_p3_w256_epu32", c_p3_w256_epu32());
+    printf("%s %016llx\n", "rt_p4_w256_epu32", rt_p4_w256_epu32());
+    printf("%s %016llx\n", "c_p4_w256_epu32", c_p4_w256_epu32());
+    printf("%s %016llx\n", "rt_p5_w256_epu32", rt_p5_w256_epu32());
+    printf("%s %016llx\n", "c_p5_w256_epu32", c_p5_w256_epu32());
+    printf("%s %016llx\n", "rt_p6_w256_epu32", rt_p6_w256_epu32());
+    printf("%s %016llx\n", "c_p6_w256_epu32", c_p6_w256_epu32());
+    printf("%s %016llx\n", "rt_p7_w256_epu32", rt_p7_w256_epu32());
+    printf("%s %016llx\n", "c_p7_w256_epu32", c_p7_w256_epu32());
     printf("%s %016llx\n", "rt_eq_w256_epi64", rt_eq_w256_epi64());
     printf("%s %016llx\n", "rt_ne_w256_epi64", rt_ne_w256_epi64());
     printf("%s %016llx\n", "c_eq_w256_epi64", c_eq_w256_epi64());
     printf("%s %016llx\n", "c_ne_w256_epi64", c_ne_w256_epi64());
+    printf("%s %016llx\n", "rt_p0_w256_epi64", rt_p0_w256_epi64());
+    printf("%s %016llx\n", "c_p0_w256_epi64", c_p0_w256_epi64());
+    printf("%s %016llx\n", "rt_p1_w256_epi64", rt_p1_w256_epi64());
+    printf("%s %016llx\n", "c_p1_w256_epi64", c_p1_w256_epi64());
+    printf("%s %016llx\n", "rt_p2_w256_epi64", rt_p2_w256_epi64());
+    printf("%s %016llx\n", "c_p2_w256_epi64", c_p2_w256_epi64());
+    printf("%s %016llx\n", "rt_p3_w256_epi64", rt_p3_w256_epi64());
+    printf("%s %016llx\n", "c_p3_w256_epi64", c_p3_w256_epi64());
+    printf("%s %016llx\n", "rt_p4_w256_epi64", rt_p4_w256_epi64());
+    printf("%s %016llx\n", "c_p4_w256_epi64", c_p4_w256_epi64());
+    printf("%s %016llx\n", "rt_p5_w256_epi64", rt_p5_w256_epi64());
+    printf("%s %016llx\n", "c_p5_w256_epi64", c_p5_w256_epi64());
+    printf("%s %016llx\n", "rt_p6_w256_epi64", rt_p6_w256_epi64());
+    printf("%s %016llx\n", "c_p6_w256_epi64", c_p6_w256_epi64());
+    printf("%s %016llx\n", "rt_p7_w256_epi64", rt_p7_w256_epi64());
+    printf("%s %016llx\n", "c_p7_w256_epi64", c_p7_w256_epi64());
     printf("%s %016llx\n", "rt_eq_w256_epu64", rt_eq_w256_epu64());
     printf("%s %016llx\n", "rt_ne_w256_epu64", rt_ne_w256_epu64());
     printf("%s %016llx\n", "c_eq_w256_epu64", c_eq_w256_epu64());
     printf("%s %016llx\n", "c_ne_w256_epu64", c_ne_w256_epu64());
+    printf("%s %016llx\n", "rt_p0_w256_epu64", rt_p0_w256_epu64());
+    printf("%s %016llx\n", "c_p0_w256_epu64", c_p0_w256_epu64());
+    printf("%s %016llx\n", "rt_p1_w256_epu64", rt_p1_w256_epu64());
+    printf("%s %016llx\n", "c_p1_w256_epu64", c_p1_w256_epu64());
+    printf("%s %016llx\n", "rt_p2_w256_epu64", rt_p2_w256_epu64());
+    printf("%s %016llx\n", "c_p2_w256_epu64", c_p2_w256_epu64());
+    printf("%s %016llx\n", "rt_p3_w256_epu64", rt_p3_w256_epu64());
+    printf("%s %016llx\n", "c_p3_w256_epu64", c_p3_w256_epu64());
+    printf("%s %016llx\n", "rt_p4_w256_epu64", rt_p4_w256_epu64());
+    printf("%s %016llx\n", "c_p4_w256_epu64", c_p4_w256_epu64());
+    printf("%s %016llx\n", "rt_p5_w256_epu64", rt_p5_w256_epu64());
+    printf("%s %016llx\n", "c_p5_w256_epu64", c_p5_w256_epu64());
+    printf("%s %016llx\n", "rt_p6_w256_epu64", rt_p6_w256_epu64());
+    printf("%s %016llx\n", "c_p6_w256_epu64", c_p6_w256_epu64());
+    printf("%s %016llx\n", "rt_p7_w256_epu64", rt_p7_w256_epu64());
+    printf("%s %016llx\n", "c_p7_w256_epu64", c_p7_w256_epu64());
     printf("%s %016llx\n", "rt_eq_w512_epi8", rt_eq_w512_epi8());
     printf("%s %016llx\n", "rt_ne_w512_epi8", rt_ne_w512_epi8());
     printf("%s %016llx\n", "c_eq_w512_epi8", c_eq_w512_epi8());
     printf("%s %016llx\n", "c_ne_w512_epi8", c_ne_w512_epi8());
+    printf("%s %016llx\n", "rt_p0_w512_epi8", rt_p0_w512_epi8());
+    printf("%s %016llx\n", "c_p0_w512_epi8", c_p0_w512_epi8());
+    printf("%s %016llx\n", "rt_p1_w512_epi8", rt_p1_w512_epi8());
+    printf("%s %016llx\n", "c_p1_w512_epi8", c_p1_w512_epi8());
+    printf("%s %016llx\n", "rt_p2_w512_epi8", rt_p2_w512_epi8());
+    printf("%s %016llx\n", "c_p2_w512_epi8", c_p2_w512_epi8());
+    printf("%s %016llx\n", "rt_p3_w512_epi8", rt_p3_w512_epi8());
+    printf("%s %016llx\n", "c_p3_w512_epi8", c_p3_w512_epi8());
+    printf("%s %016llx\n", "rt_p4_w512_epi8", rt_p4_w512_epi8());
+    printf("%s %016llx\n", "c_p4_w512_epi8", c_p4_w512_epi8());
+    printf("%s %016llx\n", "rt_p5_w512_epi8", rt_p5_w512_epi8());
+    printf("%s %016llx\n", "c_p5_w512_epi8", c_p5_w512_epi8());
+    printf("%s %016llx\n", "rt_p6_w512_epi8", rt_p6_w512_epi8());
+    printf("%s %016llx\n", "c_p6_w512_epi8", c_p6_w512_epi8());
+    printf("%s %016llx\n", "rt_p7_w512_epi8", rt_p7_w512_epi8());
+    printf("%s %016llx\n", "c_p7_w512_epi8", c_p7_w512_epi8());
     printf("%s %016llx\n", "rt_eq_w512_epu8", rt_eq_w512_epu8());
     printf("%s %016llx\n", "rt_ne_w512_epu8", rt_ne_w512_epu8());
     printf("%s %016llx\n", "c_eq_w512_epu8", c_eq_w512_epu8());
     printf("%s %016llx\n", "c_ne_w512_epu8", c_ne_w512_epu8());
+    printf("%s %016llx\n", "rt_p0_w512_epu8", rt_p0_w512_epu8());
+    printf("%s %016llx\n", "c_p0_w512_epu8", c_p0_w512_epu8());
+    printf("%s %016llx\n", "rt_p1_w512_epu8", rt_p1_w512_epu8());
+    printf("%s %016llx\n", "c_p1_w512_epu8", c_p1_w512_epu8());
+    printf("%s %016llx\n", "rt_p2_w512_epu8", rt_p2_w512_epu8());
+    printf("%s %016llx\n", "c_p2_w512_epu8", c_p2_w512_epu8());
+    printf("%s %016llx\n", "rt_p3_w512_epu8", rt_p3_w512_epu8());
+    printf("%s %016llx\n", "c_p3_w512_epu8", c_p3_w512_epu8());
+    printf("%s %016llx\n", "rt_p4_w512_epu8", rt_p4_w512_epu8());
+    printf("%s %016llx\n", "c_p4_w512_epu8", c_p4_w512_epu8());
+    printf("%s %016llx\n", "rt_p5_w512_epu8", rt_p5_w512_epu8());
+    printf("%s %016llx\n", "c_p5_w512_epu8", c_p5_w512_epu8());
+    printf("%s %016llx\n", "rt_p6_w512_epu8", rt_p6_w512_epu8());
+    printf("%s %016llx\n", "c_p6_w512_epu8", c_p6_w512_epu8());
+    printf("%s %016llx\n", "rt_p7_w512_epu8", rt_p7_w512_epu8());
+    printf("%s %016llx\n", "c_p7_w512_epu8", c_p7_w512_epu8());
     printf("%s %016llx\n", "rt_eq_w512_epi16", rt_eq_w512_epi16());
     printf("%s %016llx\n", "rt_ne_w512_epi16", rt_ne_w512_epi16());
     printf("%s %016llx\n", "c_eq_w512_epi16", c_eq_w512_epi16());
     printf("%s %016llx\n", "c_ne_w512_epi16", c_ne_w512_epi16());
+    printf("%s %016llx\n", "rt_p0_w512_epi16", rt_p0_w512_epi16());
+    printf("%s %016llx\n", "c_p0_w512_epi16", c_p0_w512_epi16());
+    printf("%s %016llx\n", "rt_p1_w512_epi16", rt_p1_w512_epi16());
+    printf("%s %016llx\n", "c_p1_w512_epi16", c_p1_w512_epi16());
+    printf("%s %016llx\n", "rt_p2_w512_epi16", rt_p2_w512_epi16());
+    printf("%s %016llx\n", "c_p2_w512_epi16", c_p2_w512_epi16());
+    printf("%s %016llx\n", "rt_p3_w512_epi16", rt_p3_w512_epi16());
+    printf("%s %016llx\n", "c_p3_w512_epi16", c_p3_w512_epi16());
+    printf("%s %016llx\n", "rt_p4_w512_epi16", rt_p4_w512_epi16());
+    printf("%s %016llx\n", "c_p4_w512_epi16", c_p4_w512_epi16());
+    printf("%s %016llx\n", "rt_p5_w512_epi16", rt_p5_w512_epi16());
+    printf("%s %016llx\n", "c_p5_w512_epi16", c_p5_w512_epi16());
+    printf("%s %016llx\n", "rt_p6_w512_epi16", rt_p6_w512_epi16());
+    printf("%s %016llx\n", "c_p6_w512_epi16", c_p6_w512_epi16());
+    printf("%s %016llx\n", "rt_p7_w512_epi16", rt_p7_w512_epi16());
+    printf("%s %016llx\n", "c_p7_w512_epi16", c_p7_w512_epi16());
     printf("%s %016llx\n", "rt_eq_w512_epu16", rt_eq_w512_epu16());
     printf("%s %016llx\n", "rt_ne_w512_epu16", rt_ne_w512_epu16());
     printf("%s %016llx\n", "c_eq_w512_epu16", c_eq_w512_epu16());
     printf("%s %016llx\n", "c_ne_w512_epu16", c_ne_w512_epu16());
+    printf("%s %016llx\n", "rt_p0_w512_epu16", rt_p0_w512_epu16());
+    printf("%s %016llx\n", "c_p0_w512_epu16", c_p0_w512_epu16());
+    printf("%s %016llx\n", "rt_p1_w512_epu16", rt_p1_w512_epu16());
+    printf("%s %016llx\n", "c_p1_w512_epu16", c_p1_w512_epu16());
+    printf("%s %016llx\n", "rt_p2_w512_epu16", rt_p2_w512_epu16());
+    printf("%s %016llx\n", "c_p2_w512_epu16", c_p2_w512_epu16());
+    printf("%s %016llx\n", "rt_p3_w512_epu16", rt_p3_w512_epu16());
+    printf("%s %016llx\n", "c_p3_w512_epu16", c_p3_w512_epu16());
+    printf("%s %016llx\n", "rt_p4_w512_epu16", rt_p4_w512_epu16());
+    printf("%s %016llx\n", "c_p4_w512_epu16", c_p4_w512_epu16());
+    printf("%s %016llx\n", "rt_p5_w512_epu16", rt_p5_w512_epu16());
+    printf("%s %016llx\n", "c_p5_w512_epu16", c_p5_w512_epu16());
+    printf("%s %016llx\n", "rt_p6_w512_epu16", rt_p6_w512_epu16());
+    printf("%s %016llx\n", "c_p6_w512_epu16", c_p6_w512_epu16());
+    printf("%s %016llx\n", "rt_p7_w512_epu16", rt_p7_w512_epu16());
+    printf("%s %016llx\n", "c_p7_w512_epu16", c_p7_w512_epu16());
     printf("%s %016llx\n", "rt_eq_w512_epi32", rt_eq_w512_epi32());
     printf("%s %016llx\n", "rt_ne_w512_epi32", rt_ne_w512_epi32());
     printf("%s %016llx\n", "c_eq_w512_epi32", c_eq_w512_epi32());
     printf("%s %016llx\n", "c_ne_w512_epi32", c_ne_w512_epi32());
+    printf("%s %016llx\n", "rt_p0_w512_epi32", rt_p0_w512_epi32());
+    printf("%s %016llx\n", "c_p0_w512_epi32", c_p0_w512_epi32());
+    printf("%s %016llx\n", "rt_p1_w512_epi32", rt_p1_w512_epi32());
+    printf("%s %016llx\n", "c_p1_w512_epi32", c_p1_w512_epi32());
+    printf("%s %016llx\n", "rt_p2_w512_epi32", rt_p2_w512_epi32());
+    printf("%s %016llx\n", "c_p2_w512_epi32", c_p2_w512_epi32());
+    printf("%s %016llx\n", "rt_p3_w512_epi32", rt_p3_w512_epi32());
+    printf("%s %016llx\n", "c_p3_w512_epi32", c_p3_w512_epi32());
+    printf("%s %016llx\n", "rt_p4_w512_epi32", rt_p4_w512_epi32());
+    printf("%s %016llx\n", "c_p4_w512_epi32", c_p4_w512_epi32());
+    printf("%s %016llx\n", "rt_p5_w512_epi32", rt_p5_w512_epi32());
+    printf("%s %016llx\n", "c_p5_w512_epi32", c_p5_w512_epi32());
+    printf("%s %016llx\n", "rt_p6_w512_epi32", rt_p6_w512_epi32());
+    printf("%s %016llx\n", "c_p6_w512_epi32", c_p6_w512_epi32());
+    printf("%s %016llx\n", "rt_p7_w512_epi32", rt_p7_w512_epi32());
+    printf("%s %016llx\n", "c_p7_w512_epi32", c_p7_w512_epi32());
     printf("%s %016llx\n", "rt_eq_w512_epu32", rt_eq_w512_epu32());
     printf("%s %016llx\n", "rt_ne_w512_epu32", rt_ne_w512_epu32());
     printf("%s %016llx\n", "c_eq_w512_epu32", c_eq_w512_epu32());
     printf("%s %016llx\n", "c_ne_w512_epu32", c_ne_w512_epu32());
+    printf("%s %016llx\n", "rt_p0_w512_epu32", rt_p0_w512_epu32());
+    printf("%s %016llx\n", "c_p0_w512_epu32", c_p0_w512_epu32());
+    printf("%s %016llx\n", "rt_p1_w512_epu32", rt_p1_w512_epu32());
+    printf("%s %016llx\n", "c_p1_w512_epu32", c_p1_w512_epu32());
+    printf("%s %016llx\n", "rt_p2_w512_epu32", rt_p2_w512_epu32());
+    printf("%s %016llx\n", "c_p2_w512_epu32", c_p2_w512_epu32());
+    printf("%s %016llx\n", "rt_p3_w512_epu32", rt_p3_w512_epu32());
+    printf("%s %016llx\n", "c_p3_w512_epu32", c_p3_w512_epu32());
+    printf("%s %016llx\n", "rt_p4_w512_epu32", rt_p4_w512_epu32());
+    printf("%s %016llx\n", "c_p4_w512_epu32", c_p4_w512_epu32());
+    printf("%s %016llx\n", "rt_p5_w512_epu32", rt_p5_w512_epu32());
+    printf("%s %016llx\n", "c_p5_w512_epu32", c_p5_w512_epu32());
+    printf("%s %016llx\n", "rt_p6_w512_epu32", rt_p6_w512_epu32());
+    printf("%s %016llx\n", "c_p6_w512_epu32", c_p6_w512_epu32());
+    printf("%s %016llx\n", "rt_p7_w512_epu32", rt_p7_w512_epu32());
+    printf("%s %016llx\n", "c_p7_w512_epu32", c_p7_w512_epu32());
     printf("%s %016llx\n", "rt_eq_w512_epi64", rt_eq_w512_epi64());
     printf("%s %016llx\n", "rt_ne_w512_epi64", rt_ne_w512_epi64());
     printf("%s %016llx\n", "c_eq_w512_epi64", c_eq_w512_epi64());
     printf("%s %016llx\n", "c_ne_w512_epi64", c_ne_w512_epi64());
+    printf("%s %016llx\n", "rt_p0_w512_epi64", rt_p0_w512_epi64());
+    printf("%s %016llx\n", "c_p0_w512_epi64", c_p0_w512_epi64());
+    printf("%s %016llx\n", "rt_p1_w512_epi64", rt_p1_w512_epi64());
+    printf("%s %016llx\n", "c_p1_w512_epi64", c_p1_w512_epi64());
+    printf("%s %016llx\n", "rt_p2_w512_epi64", rt_p2_w512_epi64());
+    printf("%s %016llx\n", "c_p2_w512_epi64", c_p2_w512_epi64());
+    printf("%s %016llx\n", "rt_p3_w512_epi64", rt_p3_w512_epi64());
+    printf("%s %016llx\n", "c_p3_w512_epi64", c_p3_w512_epi64());
+    printf("%s %016llx\n", "rt_p4_w512_epi64", rt_p4_w512_epi64());
+    printf("%s %016llx\n", "c_p4_w512_epi64", c_p4_w512_epi64());
+    printf("%s %016llx\n", "rt_p5_w512_epi64", rt_p5_w512_epi64());
+    printf("%s %016llx\n", "c_p5_w512_epi64", c_p5_w512_epi64());
+    printf("%s %016llx\n", "rt_p6_w512_epi64", rt_p6_w512_epi64());
+    printf("%s %016llx\n", "c_p6_w512_epi64", c_p6_w512_epi64());
+    printf("%s %016llx\n", "rt_p7_w512_epi64", rt_p7_w512_epi64());
+    printf("%s %016llx\n", "c_p7_w512_epi64", c_p7_w512_epi64());
     printf("%s %016llx\n", "rt_eq_w512_epu64", rt_eq_w512_epu64());
     printf("%s %016llx\n", "rt_ne_w512_epu64", rt_ne_w512_epu64());
     printf("%s %016llx\n", "c_eq_w512_epu64", c_eq_w512_epu64());
     printf("%s %016llx\n", "c_ne_w512_epu64", c_ne_w512_epu64());
+    printf("%s %016llx\n", "rt_p0_w512_epu64", rt_p0_w512_epu64());
+    printf("%s %016llx\n", "c_p0_w512_epu64", c_p0_w512_epu64());
+    printf("%s %016llx\n", "rt_p1_w512_epu64", rt_p1_w512_epu64());
+    printf("%s %016llx\n", "c_p1_w512_epu64", c_p1_w512_epu64());
+    printf("%s %016llx\n", "rt_p2_w512_epu64", rt_p2_w512_epu64());
+    printf("%s %016llx\n", "c_p2_w512_epu64", c_p2_w512_epu64());
+    printf("%s %016llx\n", "rt_p3_w512_epu64", rt_p3_w512_epu64());
+    printf("%s %016llx\n", "c_p3_w512_epu64", c_p3_w512_epu64());
+    printf("%s %016llx\n", "rt_p4_w512_epu64", rt_p4_w512_epu64());
+    printf("%s %016llx\n", "c_p4_w512_epu64", c_p4_w512_epu64());
+    printf("%s %016llx\n", "rt_p5_w512_epu64", rt_p5_w512_epu64());
+    printf("%s %016llx\n", "c_p5_w512_epu64", c_p5_w512_epu64());
+    printf("%s %016llx\n", "rt_p6_w512_epu64", rt_p6_w512_epu64());
+    printf("%s %016llx\n", "c_p6_w512_epu64", c_p6_w512_epu64());
+    printf("%s %016llx\n", "rt_p7_w512_epu64", rt_p7_w512_epu64());
+    printf("%s %016llx\n", "c_p7_w512_epu64", c_p7_w512_epu64());
     printf("%s %016llx\n", "s128_on", s128_on());
     printf("%s %016llx\n", "s256_on", s256_on());
     printf("%s %016llx\n", "s512_on", s512_on());

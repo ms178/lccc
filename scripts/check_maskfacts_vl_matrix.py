@@ -10,14 +10,22 @@ width, predicate plumbing or constant-fold consumer is correct.  Before this
 harness, 26 GCC 16.2 / Clang 23.1.5 public names were absent from LCCC even
 though the IR ops, the x86 emitter and `mask_compare_shape` already existed.
 
-This harness GENERATES the C matrix (no hand-maintained case list), compiles
-it with LCCC (maskfacts ON and OFF), GCC 16.2 and Clang 23.1.5, EXECUTES all
-four binaries and compares stdout byte-for-byte.  It also requires the ON
-build to prove the optimization fired: strictly fewer `vpcmp` instructions
-in the constant-image cases and strictly fewer `kmovq` instructions in the
-all-on masked-store cases.  A harness that accepted two identical builds
-would be vacuous, so `--self-test` injects exactly that mutation (forces
-maskfacts off for the ON build) and requires a non-zero verdict.
+This harness GENERATES 485 cases (no hand-maintained case list): all three
+vector widths (128/256/512) x all eight lane types (epi/epu x 8/16/32/64),
+each with runtime eq/ne, constant eq/ne, an ALL EIGHT-predicate runtime sweep
+and an ALL EIGHT-predicate constant sweep, plus five masked-store cases.  The
+constant pair sets `b`'s sign bit, so signed and unsigned LT/LE/GE/GT must
+DISAGREE: a wrong opcode-signedness bit cannot pass the oracle.  It compiles
+the same source with LCCC (maskfacts ON and OFF), GCC 16.2 and Clang 23.1.5,
+EXECUTES all four binaries and compares stdout byte-for-byte.  It also
+requires the ON build to prove the optimization fired: strictly fewer `vpcmp`
+instructions in the constant-image cases, strictly fewer `kmovq` in the
+all-on masked-store cases, and strictly fewer total instructions.  A harness
+that accepted two identical builds would be vacuous, so `--self-test` injects
+exactly that mutation (forces maskfacts off for the ON build) and requires a
+non-zero verdict.  Broadcast casts are exact and explicit, so the generated
+fixture compiles with `-Wall -Wextra -Werror` and ZERO warnings under both
+reference compilers.
 
 The generated fixture is also written to
 tests/regression/maskfacts_cross/avx512vl_cmp_matrix.c so the exact source
@@ -90,11 +98,39 @@ def load_expr(width: int, ptr: str) -> str:
 
 
 def set1_expr(width: int, lane: str, value: int) -> str:
+    """A literal broadcast with an EXACT, non-truncating C cast.
+
+    A 64-bit lane needs `long long`, not `int`: casting 0x8091...4455 to
+    `int` would silently truncate and turn the signed/unsigned boundary case
+    into an ordinary small positive value, hiding the very distinction the
+    predicate sweep is designed to test.
+    """
     bits = lane_bits(lane)
     fn = SET1[(width, bits)]
-    if bits == 64 and width != 512:
-        return f"{fn}((long long){value})"
-    return f"{fn}((char){value})" if bits == 8 else f"{fn}((int){value})"
+    if bits == 8:
+        return f"{fn}((char)0x{value & 0xFF:x})"
+    if bits == 16:
+        # An explicit `short` cast (not `int`) is required: Clang's default
+        # `-Wconstant-conversion` warns on the implicit int -> short narrowing
+        # of 0x8091, and a checked-in regression fixture must compile with
+        # ZERO warnings under GCC 16.2 and Clang 23.1.5 alike.
+        return f"{fn}((short)0x{value & 0xFFFF:x}u)"
+    if bits == 32:
+        return f"{fn}((int)0x{value & 0xFFFFFFFF:x}u)"
+    return f"{fn}((long long)0x{value & 0xFFFFFFFFFFFFFFFF:x}ull)"
+
+
+# A pair whose interpretation DIFFERS between signed and unsigned compares:
+# `b` has its sign bit set, `a` is a small positive.  For predicate 1 (LT),
+# signed says `b < a` while unsigned says `b > a`.  A compiler that used the
+# wrong signedness for one lane width cannot pass the three-way oracle.
+CONST_PAIR = {
+    8: (0x11, 0x91),
+    16: (0x0011, 0x8091),
+    32: (0x00000011, 0x80910011),
+    64: (0x0000000000000011, 0x8091001122334455),
+}
+PREDICATES = tuple(range(8))
 
 
 def generate_source() -> tuple[str, list[str]]:
@@ -164,6 +200,23 @@ def generate_source() -> tuple[str, list[str]]:
                 f"{ty} b = {set1_expr(width, lane, 0x22)};",
                 f"({mt}){p}cmpeq_{lane}_mask(a, b)",
             )
+            # Predicate sweep over ALL eight AVX-512 vpcmp predicates, on
+            # runtime AND on compile-time-constant images.  The constant pair
+            # has the sign bit set in `b`, so signed and unsigned LT/LE/GE/GT
+            # disagree; GCC 16.2 and Clang 23.1.5 are the oracle for the
+            # predicate numbering AND for LCCC's constant fold.
+            lo, hi = CONST_PAIR[bits]
+            for pred in PREDICATES:
+                emit_case(
+                    f"rt_p{pred}_{t}", rt_load,
+                    f"({mt}){p}cmp_{lane}_mask(a, b, {pred})",
+                )
+                emit_case(
+                    f"c_p{pred}_{t}",
+                    f"{ty} a = {set1_expr(width, lane, lo)};\n"
+                    f"{ty} b = {set1_expr(width, lane, hi)};",
+                    f"({mt}){p}cmp_{lane}_mask(a, b, {pred})",
+                )
 
     # ---- all-on / all-off / true-prefix masked stores to a GLOBAL ----
     store_cases = [

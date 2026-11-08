@@ -220,7 +220,11 @@ LOAD512 = [("loadu_si512", "vmovdqu64_load", "M512I")]
 STORE512 = [("storeu_si512", "vmovdqu64_store", "M512I")]
 SET1 = [
     ("set1_epi8", "vpbroadcastb512", "char"),
-    ("set1_epi16", "vpbroadcastw512", "int"),
+    # GCC 16.2 / Clang 23.1.5 both declare `_mm512_set1_epi16(short)`; an
+    # `int` parameter was an API deviation AND it widened every literal to an
+    # IR I32, so `simd_mask_facts::dest_ptr_splat_shape` could not prove the
+    # exact 16-bit lane of a 64-byte broadcast image.  `short` fixes both.
+    ("set1_epi16", "vpbroadcastw512", "short"),
     ("set1_epi32", "vpbroadcastd512", "int"),
     ("set1_epi64", "vpbroadcastq512", "long long"),
 ]

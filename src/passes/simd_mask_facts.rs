@@ -576,33 +576,96 @@ fn masked_store_shape(op: IntrinsicOp) -> Option<u32> {
     })
 }
 
-/// `(vector byte width, lane byte width, lane count)` for the scalar-mask
-/// packed-integer compares.  Only the sign-INDEPENDENT predicates `0` (eq)
-/// and `4` (ne) are accepted by the consumer, exactly as in
-/// `const_compare_shape`; signed/unsigned ordering predicates need a lane
-/// signedness proof this module deliberately does not invent.
+/// `(vector byte width, lane byte width, lane count, unsigned)` for the
+/// scalar-mask packed-integer compares.
+///
+/// The `unsigned` bit is the ONE fact that makes all eight AVX-512 `vpcmp`
+/// predicates foldable: the opcode already encodes the lane signedness
+/// (`vpcmpb`/`vpcmpw`/`vpcmpd`/`vpcmpq` are signed, `vpcmpu*` unsigned), and
+/// the byte image supplies the exact lane value.  Nothing is inferred from the
+/// C carrier or from a host CPU.  The predicate numbering itself is pinned by
+/// the 485-case three-way GCC 16.2 / Clang 23.1.5 / LCCC differential in
+/// `scripts/check_maskfacts_vl_matrix.py`, not assumed from a manual.
 ///
 /// Round 8: the 512-bit forms are NOW included. `MAX_IMAGE = 64` proves a
 /// whole ZMM constant object, and `ScalarMask::Mixed(u64)` plus `lane_mask`
 /// already cover exactly 64 lanes, so a constant `vpcmp*b512` can be folded
 /// to its 64-bit `kmovq` result with no new opcode family. Excluding them
 /// was correct only while the image engine was capped at 32 bytes.
-fn mask_compare_shape(op: IntrinsicOp) -> Option<(usize, usize, u32)> {
+fn mask_compare_shape(op: IntrinsicOp) -> Option<(usize, usize, u32, bool)> {
     use IntrinsicOp as O;
     Some(match op {
-        O::CmpeqEpu8Mask128 | O::CmpEpi8Mask128 | O::CmpEpu8Mask128 => (16, 1, 16),
-        O::CmpeqEpu8Mask256 | O::CmpEpi8Mask256 | O::CmpEpu8Mask256 => (32, 1, 32),
-        O::CmpEpi16Mask128 | O::CmpEpu16Mask128 => (16, 2, 8),
-        O::CmpEpi16Mask256 | O::CmpEpu16Mask256 => (32, 2, 16),
-        O::CmpEpi32Mask128 | O::CmpEpu32Mask128 => (16, 4, 4),
-        O::CmpEpi32Mask256 | O::CmpEpu32Mask256 => (32, 4, 8),
-        O::CmpEpi64Mask128 | O::CmpEpu64Mask128 => (16, 8, 2),
-        O::CmpEpi64Mask256 | O::CmpEpu64Mask256 => (32, 8, 4),
+        O::CmpeqEpu8Mask128 | O::CmpEpu8Mask128 => (16, 1, 16, true),
+        O::CmpEpi8Mask128 => (16, 1, 16, false),
+        O::CmpeqEpu8Mask256 | O::CmpEpu8Mask256 => (32, 1, 32, true),
+        O::CmpEpi8Mask256 => (32, 1, 32, false),
+        O::CmpEpu16Mask128 => (16, 2, 8, true),
+        O::CmpEpi16Mask128 => (16, 2, 8, false),
+        O::CmpEpu16Mask256 => (32, 2, 16, true),
+        O::CmpEpi16Mask256 => (32, 2, 16, false),
+        O::CmpEpu32Mask128 => (16, 4, 4, true),
+        O::CmpEpi32Mask128 => (16, 4, 4, false),
+        O::CmpEpu32Mask256 => (32, 4, 8, true),
+        O::CmpEpi32Mask256 => (32, 4, 8, false),
+        O::CmpEpu64Mask128 => (16, 8, 2, true),
+        O::CmpEpi64Mask128 => (16, 8, 2, false),
+        O::CmpEpu64Mask256 => (32, 8, 4, true),
+        O::CmpEpi64Mask256 => (32, 8, 4, false),
         // AVX-512: 64 bytes / 64 lanes is the exact u64 mask domain.
-        O::CmpeqEpu8Mask512 | O::CmpEpi8Mask512 | O::CmpEpu8Mask512 => (64, 1, 64),
-        O::CmpeqEpu16Mask512 | O::CmpEpi16Mask512 | O::CmpEpu16Mask512 => (64, 2, 32),
-        O::CmpeqEpu32Mask512 | O::CmpEpi32Mask512 | O::CmpEpu32Mask512 => (64, 4, 16),
-        O::CmpeqEpu64Mask512 | O::CmpEpi64Mask512 | O::CmpEpu64Mask512 => (64, 8, 8),
+        O::CmpeqEpu8Mask512 | O::CmpEpu8Mask512 => (64, 1, 64, true),
+        O::CmpEpi8Mask512 => (64, 1, 64, false),
+        O::CmpeqEpu16Mask512 | O::CmpEpu16Mask512 => (64, 2, 32, true),
+        O::CmpEpi16Mask512 => (64, 2, 32, false),
+        O::CmpeqEpu32Mask512 | O::CmpEpu32Mask512 => (64, 4, 16, true),
+        O::CmpEpi32Mask512 => (64, 4, 16, false),
+        O::CmpeqEpu64Mask512 | O::CmpEpu64Mask512 => (64, 8, 8, true),
+        O::CmpEpi64Mask512 => (64, 8, 8, false),
+        _ => return None,
+    })
+}
+
+/// Decode ONE little-endian lane (1/2/4/8 bytes) into `i128`, sign- or
+/// zero-extended according to the opcode's signedness.  `i128` is wide enough
+/// for every supported lane, so no comparison can wrap and no sign extension
+/// can overflow.  A lane longer than 8 bytes is refused instead of guessed.
+#[inline]
+fn lane_as_i128(lane: &[u8], unsigned: bool) -> Option<i128> {
+    if lane.is_empty() || lane.len() > 8 {
+        return None;
+    }
+    let mut value = 0u128;
+    for (i, byte) in lane.iter().enumerate() {
+        value |= u128::from(*byte) << (8 * i);
+    }
+    if unsigned {
+        return Some(value as i128);
+    }
+    let bits = lane.len() * 8;
+    let sign = 1u128 << (bits - 1);
+    Some(if value & sign != 0 {
+        (value as i128) - (1i128 << bits)
+    } else {
+        value as i128
+    })
+}
+
+/// The eight AVX-512 `vpcmp` predicates (immediate 0..7).  The numbering is
+/// pinned by the generated 485-case three-way differential against GCC 16.2
+/// and Clang 23.1.5, including a sign-bit boundary pair that makes signed and
+/// unsigned LT/LE/GE/GT disagree.  Anything outside 0..7 refuses.
+#[inline]
+fn compare_predicate(pred: i64, unsigned: bool, a: &[u8], b: &[u8]) -> Option<bool> {
+    let x = lane_as_i128(a, unsigned)?;
+    let y = lane_as_i128(b, unsigned)?;
+    Some(match pred {
+        0 => x == y, // EQ
+        1 => x < y,  // LT
+        2 => x <= y, // LE
+        3 => false,  // FALSE
+        4 => x != y, // NEQ
+        5 => x >= y, // NLT / GE
+        6 => x > y,  // NLE / GT
+        7 => true,   // TRUE
         _ => return None,
     })
 }
@@ -798,6 +861,18 @@ fn dest_ptr_splat_shape(op: IntrinsicOp) -> Option<(usize, usize)> {
         O::SetEpi16_256 => (32, 2),
         O::SetEpi32_256 => (32, 4),
         O::SetEpi64x256 => (32, 8),
+        // Round 9: the four 512-bit GPR broadcasts write a whole 64-byte
+        // `Alloca` (lowering: `LcccSimdClass::Vec512` -> `dest_ptr`).  They
+        // were the ONLY reason the 64 constant 512-bit `vpcmp` cases could
+        // not be folded: `MAX_IMAGE = 64` is already wide enough, but the
+        // write was unclassified so `object_image` refused.  The x86 emitter
+        // broadcasts the LOW 8/16/32/64 bits of `%eax`/`%rax`, which is why
+        // `object_image` still demands an EXACT-width constant: a widened
+        // scalar is never silently truncated here.
+        O::SetEpi8_512 => (64, 1),
+        O::SetEpi16_512 => (64, 2),
+        O::SetEpi32_512 => (64, 4),
+        O::SetEpi64x512 => (64, 8),
         _ => return None,
     })
 }
@@ -1261,21 +1336,16 @@ impl<'a> Facts<'a> {
         }
     }
 
-    /// Is `x op x` an exact identity for this operand?
+    /// Whether an operand is provably ONE immutable bit pattern.
     ///
-    /// An SSA value used twice is bit-identical by construction.  A POINTER
-    /// operand is read twice BY THE INTRINSIC, so it is safe only when the
+    /// `x ^ x = 0`, `x == x = all ones`, `x & x = x | x = x` and the
+    /// operand-independent `vpcmp` predicates 3/7 all require that dropping
+    /// the two reads cannot discard a volatile load, a call or an externally
+    /// mutable object.  An SSA value is bit-identical by construction; a
+    /// POINTER operand is read BY THE INTRINSIC, so it is safe only when the
     /// address resolves to a plain, non-volatile private `Alloca`: two reads
     /// of the same non-volatile object with no intervening write yield the
-    /// same bytes.  A volatile or semantically-volatile object can change
-    /// between the reads (`x^x` would no longer be zero), and an address
-    /// whose provenance cannot be resolved might hide such an object, so
-    /// both refuse.  This is the guard that makes the identity rules
-    /// semantics-preserving rather than merely plausible.
-    /// Whether a repeated operand is provably ONE immutable bit pattern.
-    ///
-    /// `x ^ x = 0`, `x == x = all ones`, `x & x = x | x = x` all require the
-    /// two reads to see the same bits.  Three forms are positively proven:
+    /// same bytes.  Three forms are positively proven:
     ///
     /// 1. an immediate;
     /// 2. a pointer resolved to a plain, non-volatile `Alloca` — the legacy
@@ -2587,22 +2657,47 @@ fn fold(facts: &Facts<'_>, inst: &Instruction, block: usize, index: usize) -> Op
         ..
     } = inst
     {
-        if let Some((width, lane_bytes, lanes)) = mask_compare_shape(*op) {
-            if args.len() != 3 || lane_bytes == 0 || width % lane_bytes != 0 {
+        if let Some((width, lane_bytes, lanes, unsigned)) = mask_compare_shape(*op) {
+            if args.len() != 3 || lane_bytes == 0 || lane_bytes > 8 || width % lane_bytes != 0 {
                 return None;
             }
             let Operand::Const(pred) = args[2] else {
                 return None;
             };
-            let invert = match exact_i64(pred) {
-                Some(0) => false, // eq
-                Some(4) => true,  // ne
-                _ => return None,
-            };
+            // Round 9: ALL eight `vpcmp` predicates are foldable, not just
+            // eq/ne.  The opcode's `unsigned` bit plus the exact byte image
+            // supplies the lane signedness; nothing is inferred.  Reject an
+            // out-of-range immediate before walking any image or def chain.
+            let pred = exact_i64(pred)?;
+            if !(0..=7).contains(&pred) {
+                return None;
+            }
             let full = lane_mask(lanes);
             let mut budget = MAX_WORK;
-            let bits = if args[0] == args[1] && facts.operand_is_pure(args[0], &mut budget) {
-                if invert { 0u64 } else { full }
+            let bits = if matches!(pred, 3 | 7)
+                && facts.operand_is_pure(args[0], &mut budget)
+                && facts.operand_is_pure(args[1], &mut budget)
+            {
+                // `FALSE` (3) and `TRUE` (7) are operand-independent: the
+                // hardware ignores both vector inputs.  GCC 16.2 still emits
+                // 48 + 48 redundant `vpcmp $3/$7` + `kmovq` pairs in the
+                // 485-case matrix, while Clang 23.1.5 folds all of them.
+                // Requiring a purity proof for BOTH operands guarantees that
+                // eliminating the compare cannot discard a volatile load, a
+                // call or a semantically-volatile object: the exact same
+                // proof the `x op x` identity below already demands.
+                if pred == 3 { 0 } else { full }
+            } else if args[0] == args[1] && facts.operand_is_pure(args[0], &mut budget) {
+                // `x op x` is lane-independent: evaluate the predicate once
+                // on two identical zero lanes.  This also rejects an invalid
+                // predicate instead of silently producing a mask.
+                let equal = [0u8; 8];
+                let lane = &equal[..lane_bytes];
+                if compare_predicate(pred, unsigned, lane, lane)? {
+                    full
+                } else {
+                    0
+                }
             } else {
                 let a = facts.image_of(args[0], width, block, index)?;
                 let b = facts.image_of(args[1], width, block, index)?;
@@ -2623,7 +2718,7 @@ fn fold(facts: &Facts<'_>, inst: &Instruction, block: usize, index: usize) -> Op
                     .zip(b.chunks_exact(lane_bytes))
                     .enumerate()
                 {
-                    if (x == y) ^ invert {
+                    if compare_predicate(pred, unsigned, x, y)? {
                         m |= 1u64 << i;
                     }
                 }
