@@ -338,7 +338,7 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
                             break;
                         }
                     }
-                    if !safe || loads.is_empty() {
+                    if !safe {
                         continue;
                     }
 
@@ -347,7 +347,9 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
                     // union of their copy-to-load intervals is therefore the
                     // interval ending just before the last load. Scan it once
                     // rather than rescanning the prefix for every load.
-                    let last_load_idx = loads.last().unwrap().1;
+                    let Some(&(_, last_load_idx, _, _)) = loads.last() else {
+                        continue;
+                    };
                     if func.blocks[block_idx].instructions[copy_idx + 1..last_load_idx]
                         .iter()
                         .any(|inst| {

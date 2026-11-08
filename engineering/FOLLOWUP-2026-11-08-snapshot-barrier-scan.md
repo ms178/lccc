@@ -10,8 +10,8 @@ same barrier decision as scanning every interval. The barrier predicate is
 unchanged: writes, calls and opaque writes (`may_write_memory`), fences,
 atomic loads and volatile loads block the rewrite. In particular, a barrier
 between two loads must still block it, whereas one after the last load need
-not. Loads are nonempty before `last().unwrap()`; the result is never used
-when collection rejected another block or an earlier load.
+not. An empty load list is rejected by a checked `last()` match; the result
+is never used when collection rejected another block or an earlier load.
 
 This removes repeated scans, not all quadratic work in the pass: derived
 pointer discovery and instruction insertion have separate costs. It does not
@@ -40,7 +40,9 @@ round-trip regression, or claim program-runtime improvements.
 
 Environment: KVM virtualized Intel Xeon 2.60 GHz, two vCPUs, 3.8 GiB RAM,
 4 GiB swap; Valgrind/Callgrind 3.19.0, Rust 1.99.1 fastbuild (`-O1`, no LTO,
-debug info disabled). GCC and Clang came from the SHA-verified
+debug info disabled). These measurements used the first implementation
+(`03386e5`), before replacing its `unwrap` with a checked match; they are not
+measurements of the later binary. GCC and Clang came from the SHA-verified
 `harness-cache-8`. A local Intel ICX provisioning attempt failed at TLS because
 its Intel host is outside this sandbox's allowed network destinations.
 
