@@ -182,21 +182,56 @@ class AuditPackTests(unittest.TestCase):
                     self.assertEqual(proc.stderr, '',
                                      f'{src.name}: compiler diagnostics')
 
-    def test_07_c_corpora_sanitizers(self):
-        """ASan+UBSan must be clean, on ANY host.
+    @staticmethod
+    def _evex_probe(flags: tuple[str, ...]) -> tuple[bool, str]:
+        """Compile AND EXECUTE one EVEX store with exactly `flags`.
 
-        The original version always compiled and EXECUTED an `-mavx512f
-        -mavx512bw` binary.  That is unsound on a runner without AVX-512:
-        `_mm512_storeu_si512` faults (hosted CI 2026-11-08: ASan SEGV at
-        avx512fintrin.h:9481).  Compile BOTH variants (so the AVX-512
-        header path stays warning-free on every runner), always execute
-        the portable variant, and execute the AVX-512 variant only when
-        /proc/cpuinfo advertises the required features.  The gate is
-        reported, never silently treated as a pass.
+        CPUID advertisement is not proof of executability: the 2026-11-08
+        hosted runner advertises avx512f/avx512bw in /proc/cpuinfo, yet
+        gcc-16 16.0.1 + ASan produces a faulting `_mm512_storeu_si512`.
+        The only sound oracle is the instruction itself, compiled with the
+        same toolchain and the same flags as the corpus leg it guards.
         """
-        import probe_utils as pu
-        host = pu.host_cpu_flags()
-        can_run_avx512 = 'avx512f' in host and 'avx512bw' in host
+        work = AuditPackTests.work
+        src = work / 'evex_probe.c'
+        if not src.exists():
+            src.write_text(
+                '#include <immintrin.h>\n'
+                'int main(void) {\n'
+                '  __m512i v = _mm512_set1_epi32(7);\n'
+                '  unsigned lanes[16];\n'
+                '  _mm512_storeu_si512((void *)lanes, v);\n'
+                '  return lanes[0] == 7u ? 0 : 1;\n'
+                '}\n', encoding='utf-8')
+        tag = 'san' if any('sanitize' in f for f in flags) else 'plain'
+        exe = work / f'evex_probe_{tag}.bin'
+        try:
+            proc = run([GCC, *flags, '-mavx512f', '-mavx512bw',
+                        str(src), '-o', str(exe)])
+            if proc.returncode != 0:
+                return False, (f'probe compile rc={proc.returncode}: '
+                               f'{proc.stderr.strip()[:200]}')
+            res = run([str(exe)], timeout=15)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, f'probe infrastructure failure: {exc}'
+        if res.returncode != 0:
+            return False, (f'probe run rc={res.returncode}: '
+                           f'{(res.stdout + res.stderr).strip()[:200]}')
+        return True, 'EVEX store executed'
+
+    def test_07_c_corpora_sanitizers(self):
+        """ASan+UBSan clean on ANY host, with an executable ISA gate.
+
+        Both variants are COMPILED on every runner (so the AVX-512 header
+        path stays warning-free under -Werror).  The portable variant is
+        always EXECUTED.  The AVX-512 variant is executed under sanitizers
+        only when a tiny EVEX probe built with the identical flags really
+        executes; otherwise the skip is printed with its reason and a
+        non-sanitized AVX-512 build is executed as hard correctness
+        evidence.  Nothing is silently downgraded to a pass.
+        """
+        san_ok, san_reason = self._evex_probe(SAN_FLAGS)
+        plain_ok, plain_reason = self._evex_probe(('-std=c99', '-O1'))
         for src in (REPRO_C, SHAPE_C):
             modes = (('all',),) if src is REPRO_C else (('all',), ('selftest',))
             for label, extra in (('portable', ()),
@@ -205,17 +240,42 @@ class AuditPackTests(unittest.TestCase):
                     exe = self.work / f'{src.stem}_{label}_san.bin'
                     proc = run([GCC, *SAN_FLAGS, *extra, str(src), '-o', str(exe)])
                     self.assertEqual(proc.returncode, 0, proc.stderr)
-                    if label == 'avx512' and not can_run_avx512:
-                        # Compile-only evidence on this host.  The portable
-                        # leg below still exercises every shape at runtime.
+                    if label != 'avx512' or san_ok:
+                        for mode in modes:
+                            with self.subTest(mode=mode):
+                                run_proc = run([str(exe), *mode], timeout=60)
+                                self.assertEqual(run_proc.returncode, 0,
+                                                 run_proc.stdout + run_proc.stderr)
+                                self.assertNotIn('AddressSanitizer', run_proc.stderr)
+                                self.assertNotIn('runtime error:', run_proc.stderr)
                         continue
+                    print(f'SKIP  {src.name} AVX-512 ASan runtime: {san_reason}',
+                          flush=True)
+                    if not plain_ok:
+                        print(f'SKIP  {src.name} AVX-512 plain runtime: '
+                              f'{plain_reason}', flush=True)
+                        continue
+                    plain_exe = self.work / f'{src.stem}_{label}_plain.bin'
+                    plain = run([GCC, '-std=c99', '-O1', *extra, str(src),
+                                 '-o', str(plain_exe)])
+                    self.assertEqual(plain.returncode, 0, plain.stderr)
                     for mode in modes:
-                        with self.subTest(mode=mode):
-                            run_proc = run([str(exe), *mode], timeout=60)
+                        with self.subTest(mode=mode, evidence='plain'):
+                            run_proc = run([str(plain_exe), *mode], timeout=60)
                             self.assertEqual(run_proc.returncode, 0,
                                              run_proc.stdout + run_proc.stderr)
-                            self.assertNotIn('AddressSanitizer', run_proc.stderr)
-                            self.assertNotIn('runtime error:', run_proc.stderr)
+
+    def test_07b_evex_probe_gate_fails_closed(self):
+        """The executable gate must report (False, reason) on a broken
+        toolchain instead of silently advertising AVX-512 support."""
+        from unittest import mock
+        with mock.patch.object(sys.modules[__name__], 'GCC',
+                               '/definitely/not/a/compiler'):
+            ok, reason = self._evex_probe(SAN_FLAGS)
+        self.assertFalse(ok)
+        self.assertTrue(reason.startswith(('probe compile',
+                                           'probe infrastructure failure')),
+                        reason)
 
     # --- end-to-end harness checks --------------------------------------
 

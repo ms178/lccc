@@ -941,7 +941,7 @@ those diagnostics.
 | `cargo fmt --all -- --check` | clean |
 | `scripts/audit_census.py --check` | PASS, no metric grew (863 panic sites, 255 undocumented knobs vs baseline 261) |
 | `scripts/gen_lcccsimd.py --check` / `gen_x86_builtin_types.py --check` | both clean |
-| `python3 -m unittest discover -s tests/simd -p 'test_*.py'` | 38 tests OK (1 skipped: PyYAML optional), 7 driver self-tests wired |
+| `python3 -m unittest discover -s tests/simd -p 'test_*.py'` | 39 tests OK (1 skipped: PyYAML optional), 7 driver self-tests wired |
 | seven driver `--self-test` totals | 117/117 (39/15/16/5/13/18/11) |
 | `check_audit_2026-11-08.py --strict` (built LCCC) | 15/15 PASS, 0 problems |
 | `check_assembler_widths.py --require-gas-247` | 16 cases, 8 byte-identical encodings, 0 problems |
@@ -1024,7 +1024,23 @@ The second is a **test design defect**, not a compiler defect: the corpus's
 AVX-512 path is guarded by target predefined macros, so passing `-mavx512*`
 legitimately compiles EVEX code that cannot execute on that host.  The
 pack's own docstring claimed "green on any runner with a C compiler"; it now
-states the CPUID gate explicitly.
+states the gate explicitly.
+
+A naive CPUID-only gate (`avx512f`+`avx512bw` in `/proc/cpuinfo`) was then
+tried and **also failed on hosted CI**: the runner advertises both bits, yet
+`gcc-16` **16.0.1** + `-fsanitize=address,undefined` produced a faulting
+`_mm512_storeu_si512` (identical ASan `SEGV` stack, hosted log
+`42504876438/job/128806233757`, step 16).  Advertising an ISA is not proof
+that the exact compiler/flag/host combination can execute it.  The final gate
+is therefore **executable**: `test_07b` compiles and runs a six-line EVEX
+store probe with the identical flags; only a probe that returns 0 authorises
+executing the AVX-512 sanitizer leg.  On a failing combination the test
+prints an explicit `SKIP <src> AVX-512 ASan runtime: <reason>`, still
+compiles the AVX-512 variant under `-Werror`, always executes the portable
+sanitizer variant across every shape, and (when the plain EVEX probe works)
+executes a **non-sanitized AVX-512 build** as hard correctness evidence.
+`test_07b_evex_probe_gate_fails_closed` permanently pins the failure path
+with a mocked missing compiler.  No leg is silently downgraded to PASS.
 
 ### 9c.9.7 Three-way host runtime measurement (honest, not a victory claim)
 
