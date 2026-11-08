@@ -1661,7 +1661,7 @@
     "frontend-c": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 352.27,
+      "predicted_gate_seconds": 353.02,
       "shards": 3,
       "steps": [
         {
@@ -1743,6 +1743,18 @@
         {
           "measured_s": 0.25,
           "name": "Verify label-reference cost experiment contracts"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify peephole allocation-cost experiment contracts"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Peephole must not allocate before a rejecting filter"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify the allocate-before-filter ratchet contracts"
         },
         {
           "measured_s": 1.0,

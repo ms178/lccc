@@ -965,7 +965,35 @@ mask or `qemu -cpu`; `readelf -sW` shows `IFUNC`; static-binary variant works.
 are implemented; pinned branch-rewrite commits are guarded. Evidence and
 mutation results: [label-reference journal](engineering/journal/2026-10-24-label-reference-cost.md).
 The new 40-function profile puts `LabelRefs::build` at 1.77%, but the peephole
-still costs 73.46%; allocation/decode/fixpoint work remains open. Deferring
+still costs 73.46%; decode/fixpoint work remains open.
+
+**Step 3 (allocation before filter) is DONE for the allocate-then-reject shape.**
+26 sites allocated an owned line and immediately handed it to a filter that
+usually rejects it. They are now split by the parser's signature: **14 allocate
+nothing at all** (the parser returns no borrow of its input — `parse_reg_copy`,
+`parse_reg_reg_alu`, `parse_lea_add`, `parse_reg_reg_cmp`, `parse_reg_to_reg_mov`,
+`parse_vec_copy`, `is_full_flag_clobber` — or, for `parse_cmov`, the operands die
+before the rewrite), and **12 probe on borrowed text and allocate only for
+candidates**, because their parsed operands are `&str` slices that stay live
+across the `store` mutations further down (verified in `load_op_fuse.rs`, where
+`mem` is passed to helpers that take `store` mutably).
+Measured with the new allocation-count ratchet
+(`scripts/measure_peephole_alloc_cost.py`, 21 `tests/bench/k_*.c` inputs, `-O1 -S`,
+2 repeats): **1,934,076 → 1,748,966 allocations (−9.571 %)**, assembly byte-identical on
+every input. Independently,
+2,652 x86-64 compiles (1,326 regression sources × `-O1`/`-O2`) produced
+**2,540 identical outputs, 0 differing**, 112 rejected identically by both arms.
+The remaining 56 `to_string()` sites are not allocate-then-reject: they either
+need the owned text unconditionally or feed a mutation, so they are left alone
+rather than converted on spec. A source ratchet
+(`tests/regression/check_peephole_alloc_before_filter.py`) now fails CI if the
+pattern returns; it reports 26 violations on the pre-fix tree and 0 on the fixed
+tree, so it is proven non-vacuous. The signature split also fixed a size-ratchet
+regression the uniform pre-filter caused: `fns_over_300` is back to its 233
+baseline. Steps 4–5 remain open, and the ≤35 % peephole
+criterion is **not** established by this step. Evidence and the three
+measurement traps that had to be fixed before any number was trustworthy:
+[allocation-before-filter follow-up](docs/FOLLOWUP-2026-11-08-peephole-allocation-before-filter.md). Deferring
 copy-mask liveness construction preserves all 94 assembly outputs but saves
 only 0.247% of simulated instructions on the same input, not a major latency
 win (see the journal follow-up). The historical
@@ -1019,8 +1047,12 @@ callgrind_annotate --inclusive=yes cg.out | grep -E 'LabelRefs::build|combined_l
    any other "one-shot" helper whose doc says "whole-file scan per call" — apply the
    same fix; add a debug-assertion counter (tests only) that fails when
    `LabelRefs::build` runs more than once per pass invocation.
-3. **Allocation before filter (S).** For each of the 80 `trimmed(..).to_string()`
-   sites test the opcode on `&str` first; prioritise by Callgrind inclusive cost.
+3. **Allocation before filter (S) — DONE for the allocate-then-reject shape.**
+   For each of the 80 `trimmed(..).to_string()` sites test the opcode on `&str`
+   first; prioritise by Callgrind inclusive cost. 26 sites were classified by
+   parser signature: 14 now allocate nothing, 12 probe before allocating
+   (−9.571 % allocations, output byte-identical; see Progress above). The other
+   56 need the owned text unconditionally and were left alone.
 4. **Decode once (M).** Extend `LineInfo` with an interned opcode id and operand
    kinds computed on creation/edit so the `starts_with` ladders become table lookups.
 5. **Per-function dirty bits (M).** Re-run only functions changed in the previous

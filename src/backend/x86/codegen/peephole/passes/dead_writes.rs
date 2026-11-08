@@ -534,7 +534,13 @@ fn reuse_redundant_loads_with(
             i += 1;
             continue;
         }
-        let first = infos[i].trimmed(store.get(i)).to_string();
+        // MB-20: reject on borrowed text; only candidates need an owned line.
+        let first = infos[i].trimmed(store.get(i));
+        if load_operand(first).is_none() {
+            i += 1;
+            continue;
+        }
+        let first = first.to_string();
         let Some((op, mem, dst, addr_fams)) = load_operand(&first) else {
             i += 1;
             continue;

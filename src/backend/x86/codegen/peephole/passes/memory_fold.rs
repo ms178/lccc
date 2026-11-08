@@ -5082,7 +5082,13 @@ pub(super) fn fold_memory_rmw(store: &mut LineStore, infos: &mut [LineInfo]) -> 
             i += 1;
             continue;
         }
-        let li = infos[i].trimmed(store.get(i)).to_string();
+        // MB-20: reject on borrowed text; only candidates need an owned line.
+        let li = infos[i].trimmed(store.get(i));
+        if parse_load_mem_to_reg(li).is_none() {
+            i += 1;
+            continue;
+        }
+        let li = li.to_string();
         let Some((mem_width, reg_width, mem, loaded_reg)) = parse_load_mem_to_reg(&li) else {
             i += 1;
             continue;
@@ -5186,7 +5192,13 @@ pub(super) fn fold_memory_rmw(store: &mut LineStore, infos: &mut [LineInfo]) -> 
                 i += 1;
                 continue;
             }
-            let lk2 = infos[k2].trimmed(store.get(k2)).to_string();
+            // MB-20: reject on borrowed text; only candidates need an owned line.
+            let lk2 = infos[k2].trimmed(store.get(k2));
+            if parse_store_reg_to_mem(lk2).is_none() {
+                i += 1;
+                continue;
+            }
+            let lk2 = lk2.to_string();
             let Some((w2, reg2, _)) = parse_store_reg_to_mem(&lk2) else {
                 i += 1;
                 continue;
@@ -5208,7 +5220,13 @@ pub(super) fn fold_memory_rmw(store: &mut LineStore, infos: &mut [LineInfo]) -> 
         // store's own register spelling is compared by FAMILY, not text: a byte
         // store of the widened temporary names `%r8b` where the increment wrote
         // `%r8d`.
-        let store_line = infos[store_idx].trimmed(store.get(store_idx)).to_string();
+        // MB-20: reject on borrowed text; only candidates need an owned line.
+        let store_line = infos[store_idx].trimmed(store.get(store_idx));
+        if parse_store_reg_to_mem(store_line).is_none() {
+            i += 1;
+            continue;
+        }
+        let store_line = store_line.to_string();
         let Some((store_width, _stored_reg, mem2)) = parse_store_reg_to_mem(&store_line) else {
             i += 1;
             continue;
