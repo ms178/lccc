@@ -90,7 +90,11 @@ let Some((load_q, mem, t_fam)) = parse_memory_load(&load) else {
   no benefit.
 * **Candidates are parsed twice.** That is the deliberate trade: candidates are
   rare next to rejected lines. It was measured, not assumed; had it not paid,
-  the change would have been reverted.
+  the change would have been reverted. Double-invocation is only safe if the
+  parsers are pure, so all 17 involved were extracted by function span and
+  audited for global state, interior mutability, atomics, `unsafe`, environment
+  reads and I/O: **all 17 are pure functions of their input**. The only `mut`
+  bindings are function-local `Vec`/array accumulators.
 
 **(3) Leave alone — 56 sites.** The remaining `trimmed(..).to_string()` calls
 either need owned text unconditionally or feed a mutation. Converting them on
@@ -176,6 +180,13 @@ and it does not establish MB-20's ≤35 % peephole criterion; steps 4–5 remain
   (those backends never reference `backend::x86::codegen::peephole`; i686 shares
   only the assembler/encoder) into an empirical one. Both arms are the same
   multi-target driver invoked under an arch-specific `argv[0]`.
+
+* **With `-g`, all four architectures:** the plain sweep does not exercise the
+  peephole's debug-row paths (`.loc`, D6 inline-range markers, hidden rows), and
+  #1126 established that debug rows must not perturb optimization. Re-running the
+  A/B with `-g` at `-O1` and `-O2` over the same 1,326 sources × 4 targets =
+  **10,608 compiles** gives **4,920 identical, 0 differing**, 5,688 rejected
+  identically (x86-64 2,540; i686 788; aarch64 796; riscv64 796).
 
 ## Gates added
 
