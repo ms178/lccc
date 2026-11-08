@@ -171,8 +171,27 @@ def run(command: Sequence[str], timeout: float, *, cwd: Path | None = None) -> s
 
 
 def detail_of(proc: subprocess.CompletedProcess[bytes], limit: int = 6000) -> str:
-    data = proc.stdout + proc.stderr
-    return data.decode("utf-8", "replace")[-limit:]
+    """Preserve the first diagnostic and final status within a bounded excerpt.
+
+    Source snippets and macro-expansion notes can exceed the limit, and a
+    tail-only excerpt loses the actual error. Prefer the start of stderr when
+    present, but retain the combined output's tail (including harness timeout
+    information). Short output remains byte-for-byte compatible after decoding.
+    """
+    if limit < 0:
+        raise ValueError("detail limit must be non-negative")
+    if limit == 0:
+        return ""
+    text = (proc.stdout + proc.stderr).decode("utf-8", "replace")
+    if len(text) <= limit:
+        return text
+    marker = "\n... [diagnostic truncated] ...\n"
+    if limit <= len(marker):
+        return text[-limit:]
+    leading = proc.stderr.decode("utf-8", "replace") if proc.stderr else text
+    budget = limit - len(marker)
+    front = budget // 2
+    return leading[:front] + marker + text[-(budget - front):]
 
 
 def native_directive_flags(source: Path) -> tuple[str, ...]:

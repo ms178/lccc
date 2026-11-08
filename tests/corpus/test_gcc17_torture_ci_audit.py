@@ -156,7 +156,8 @@ class Inventory(unittest.TestCase):
         self.assertIn("%25", output.getvalue())
 
     def test_failure_tails_distinguish_oracle_and_candidate(self):
-        self.rows[1].update(phase="lccc-compile", returncode=1, detail="a" * 500 + "\nerror: candidate")
+        self.rows[1].update(phase="lccc-compile", returncode=1,
+                            detail="error: primary\n" + "a" * 500 + "\nerror: candidate")
         self.rows[2].update(phase="reference-compile", returncode=124, detail="timeout")
         self.write()
         data = summary.validated_report(self.path)
@@ -166,6 +167,7 @@ class Inventory(unittest.TestCase):
         self.assertEqual(result["failures_omitted"], 0)
         self.assertEqual([row[0] for row in result["failures"]], ["bad.c", "oracle.c"])
         self.assertTrue(result["failures"][0][-1])
+        self.assertIn("error: primary", result["failures"][0][-2])
         self.assertIn("error: candidate", result["failures"][0][-2])
         self.assertEqual(result["failures"][1][2:5], ["reference-fail", "reference-compile", 124])
         self.assertFalse(result["failures"][1][-1])

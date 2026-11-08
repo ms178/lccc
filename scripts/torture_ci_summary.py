@@ -74,23 +74,27 @@ def annotation_payload(result: dict) -> str:
 
 
 def failure_payload(data: dict) -> str:
-    """Bounded diagnostic tails for actual failures, not unsupported/skips.
+    """Bounded diagnostic excerpts for actual failures, not unsupported/skips.
 
-    This is a triage aid, not a complete error log: the artifact retains the
-    full details, and both per-detail truncation and omitted rows are explicit.
+    This is a triage aid, not a complete error log: report details may already
+    be truncated by the runner; per-excerpt truncation and omissions are explicit.
     """
     failures = []
     for row in data["results"]:
         if row["status"] not in ("compile-fail", "link-fail", "run-fail", "reference-fail"):
             continue
         detail = row.get("detail", "")
+        # Most compiler diagnostics start with the actual error and follow it
+        # with potentially enormous source lines and macro expansion notes.
+        # Keep both ends rather than discarding the primary diagnostic.
+        excerpt = detail if len(detail) <= 384 else detail[:192] + detail[-192:]
         failures.append([row["test"], row["flags"], row["status"], row.get("phase"),
-                         row.get("returncode"), detail[-384:], len(detail) > 384])
+                         row.get("returncode"), excerpt, len(detail) > 384])
     failures.sort(key=lambda r: (r[0], r[1], r[2]))
 
     def encode(count: int) -> str:
         result = {"arch": data["arch"], "mode": data["mode"],
-                  "fields": ["test", "flags", "status", "phase", "returncode", "detail_tail", "detail_truncated"],
+                  "fields": ["test", "flags", "status", "phase", "returncode", "detail_excerpt", "detail_truncated"],
                   "failures": failures[:count], "failures_omitted": len(failures) - count}
         return (json.dumps(result, separators=(",", ":"), ensure_ascii=True)
                 .replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))

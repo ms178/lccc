@@ -52,6 +52,22 @@ class RunnerContract(unittest.TestCase):
     def result(case, **kwargs):
         return torture.Result(case.source.name, case.opt_flags, [], "pass", "complete", 0, 0.01)
 
+    def test_bounded_details_keep_primary_error_and_harness_tail(self):
+        proc = subprocess.CompletedProcess([], 1, b"stdout\n",
+            b"file.c:1: error: primary diagnostic\n" + b"x" * 10000 + b"\nHARNESS timeout")
+        detail = torture.detail_of(proc)
+        self.assertLessEqual(len(detail), 6000)
+        self.assertIn("error: primary diagnostic", detail)
+        self.assertIn("HARNESS timeout", detail)
+        self.assertIn("[diagnostic truncated]", detail)
+        self.assertEqual(torture.detail_of(proc, 0), "")
+        self.assertEqual(len(torture.detail_of(proc, 5)), 5)
+        short = subprocess.CompletedProcess([], 1, b"out", b"err")
+        self.assertEqual(torture.detail_of(short), "outerr")
+        stdout_only = subprocess.CompletedProcess([], 1, b"prefix" + b"x" * 10000 + b"suffix", b"")
+        self.assertTrue(torture.detail_of(stdout_only).startswith("prefix"))
+        self.assertTrue(torture.detail_of(stdout_only).endswith("suffix"))
+
     def test_missing_gcc_is_fatal_not_green_skips(self):
         self.assertEqual(self.invoke(["--gcc=/does/not/exist/gcc"]), 2)
         report = json.loads(self.report.read_text())
