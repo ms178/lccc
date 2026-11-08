@@ -48,6 +48,8 @@ on:
       - 'tests/**'
       - 'scripts/ci_gcc17_torture.sh'
       - 'scripts/torture_ci_summary.py'
+      - 'scripts/torture_evidence.py'
+      - 'tools/corpus/**'
       - 'scripts/measure_decl_scaling.py'
       - 'scripts/ensure_gcc_torture_git.py'
       - 'scripts/x86_gcc_torture.py'

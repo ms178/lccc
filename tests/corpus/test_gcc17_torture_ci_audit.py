@@ -55,6 +55,9 @@ class PreflightEvidence(unittest.TestCase):
         path.write_text("#!/bin/sh\nexit 0\n")
         path.chmod(0o644)
         self.expect_error(["x86_64"], "not executable")
+        path.unlink()
+        path.mkdir()
+        self.expect_error(["x86_64"], "not a regular file")
 
     def test_missing_linker_and_oracle(self):
         self.env["LCCC_LD"] = str(self.root / "missing-linker")
@@ -113,6 +116,20 @@ class Inventory(unittest.TestCase):
                 summary.inventory(self.path)
             self.report = saved
 
+    def test_refuses_malformed_rows_without_crashing_and_missing_identity(self):
+        for mutation in (lambda d: d["results"][0].pop("status"),
+                         lambda d: d["results"][0].update(status=[]),
+                         lambda d: d["results"][0].update(flags=[]),
+                         lambda d: d.update(arch=None),
+                         lambda d: d.update(gcc_checkout_head="unknown"),
+                         lambda d: d.pop("counts")):
+            saved = json.loads(json.dumps(self.report))
+            mutation(self.report)
+            self.write()
+            with self.assertRaises(ValueError):
+                summary.inventory(self.path)
+            self.report = saved
+
     def test_missing_report_is_not_a_pass(self):
         with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
             self.assertEqual(summary.main([str(self.path)]), 2)
@@ -140,7 +157,10 @@ class ScalingProbe(unittest.TestCase):
     def test_success_records_both_shapes_and_alternates_order(self):
         with tempfile.TemporaryDirectory() as td:
             compiler = Path(td) / "compiler"
-            compiler.write_text("#!/bin/sh\nif [ -n \"$CCC_TIME_PHASES\" ]; then echo '[TIME] sema: 0.125s' >&2; fi\n")
+            compiler.write_text("#!/usr/bin/env python3\n"
+                                "import os, pathlib, sys\n"
+                                "pathlib.Path(sys.argv[-1]).write_bytes(bytes.fromhex('7f454c46020101' + '00' * 9 + '01003e00'))\n"
+                                "if os.getenv('CCC_TIME_PHASES'): print('[TIME] sema: 0.125s', file=sys.stderr)\n")
             compiler.chmod(0o755)
             out = Path(td) / "report.json"
             proc = subprocess.run(
@@ -155,6 +175,9 @@ class ScalingProbe(unittest.TestCase):
                              ["block"] * 4 + ["external"] * 4)
             self.assertEqual([r["sema_s"] for r in report["results"] if r["compiler"] == "lccc"],
                              [0.125] * 4)
+            self.assertTrue(all(r["returncode"] == 0 and len(r["input_sha256"]) == 64
+                                and len(r["object_sha256"]) == 64
+                                and r["command"][-2] == "-o" for r in report["results"]))
             self.assertIn("::notice title=Declaration scaling measurement::", proc.stdout)
 
     def test_failed_compiler_cannot_publish_a_measurement(self):
@@ -168,12 +191,59 @@ class ScalingProbe(unittest.TestCase):
             self.assertIn("exited", proc.stderr)
             self.assertFalse(out.exists())
 
-    def test_missing_phase_timer_is_not_a_valid_measurement(self):
+    def test_success_exit_without_object_removes_stale_report(self):
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "report.json"
+            out.write_text('{"old": true}')
             proc = subprocess.run(
                 [sys.executable, str(ROOT / "scripts/measure_decl_scaling.py"),
                  "--lccc", "/bin/true", "--gcc", "/bin/true", "--sizes", "1",
+                 "--rounds", "1", "--json", str(out)], capture_output=True, text=True, timeout=5)
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn("did not produce an object", proc.stderr)
+            self.assertFalse(out.exists())
+
+    def test_wrong_object_header_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            compiler = Path(td) / "compiler"
+            compiler.write_text("#!/usr/bin/env python3\n"
+                                "import pathlib, sys\n"
+                                "pathlib.Path(sys.argv[-1]).write_bytes(b'not an ELF object')\n")
+            compiler.chmod(0o755)
+            out = Path(td) / "report.json"
+            proc = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/measure_decl_scaling.py"),
+                 "--lccc", str(compiler), "--gcc", str(compiler), "--sizes", "1",
+                 "--rounds", "1", "--json", str(out)], capture_output=True, text=True, timeout=5)
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn("did not produce x86-64 ELF relocatable", proc.stderr)
+            self.assertFalse(out.exists())
+
+    def test_report_must_not_overwrite_compiler(self):
+        with tempfile.TemporaryDirectory() as td:
+            compiler = Path(td) / "compiler"
+            compiler.write_text("compiler contents")
+            out = Path(td) / "report.json"
+            os.link(compiler, out)
+            proc = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/measure_decl_scaling.py"),
+                 "--lccc", str(compiler), "--gcc", "/bin/true", "--sizes", "1",
+                 "--rounds", "1", "--json", str(out)], capture_output=True, text=True, timeout=5)
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn("report path names a compiler binary", proc.stderr)
+            self.assertEqual(compiler.read_text(), "compiler contents")
+
+    def test_missing_phase_timer_is_not_a_valid_measurement(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "report.json"
+            compiler = Path(td) / "compiler"
+            compiler.write_text("#!/usr/bin/env python3\n"
+                                "import pathlib, sys\n"
+                                "pathlib.Path(sys.argv[-1]).write_bytes(bytes.fromhex('7f454c46020101' + '00' * 9 + '01003e00'))\n")
+            compiler.chmod(0o755)
+            proc = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/measure_decl_scaling.py"),
+                 "--lccc", str(compiler), "--gcc", str(compiler), "--sizes", "1",
                  "--rounds", "1", "--json", str(out)], capture_output=True, text=True, timeout=5)
             self.assertEqual(proc.returncode, 1)
             self.assertIn("phase timer missing", proc.stderr)

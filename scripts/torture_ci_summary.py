@@ -21,6 +21,14 @@ def inventory(path: Path) -> dict:
     errors = validate(data)
     if not isinstance(data, dict) or data.get("schema") != CURRENT_SCHEMA:
         errors.append("current schema required")
+    else:
+        if data.get("arch") not in ("x86_64", "i686"):
+            errors.append("x86_64 or i686 architecture required")
+        corpus = data.get("gcc_checkout_head")
+        if not isinstance(corpus, str) or not schema.SHA1.fullmatch(corpus):
+            errors.append("full GCC corpus commit required")
+        if not isinstance(data.get("counts"), dict):
+            errors.append("counts required")
     if errors:
         raise ValueError("; ".join(errors))
     return {

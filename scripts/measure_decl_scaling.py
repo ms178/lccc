@@ -2,8 +2,10 @@
 """Measure wide declaration scaling on a host, without claiming a root cause.
 
 Runs one compiler at a time; alternate LCCC/GCC order between rounds. Records
-wall time and LCCC phase timings, exact commands, binary hashes and return
-codes. A failed or timed-out run is not a timing sample. This is a diagnostic
+wall time and LCCC phase timings, exact commands, binary and generated-input
+hashes, object hashes and return codes. Every successful compile must produce a
+fresh object with an x86-64 ELF relocatable header. A failed or timed-out run
+is not a timing sample. This is a diagnostic
 measurement, not a noisy wall-clock CI threshold or a proof of asymptotics.
 """
 from __future__ import annotations
@@ -45,6 +47,13 @@ def main() -> int:
     p.add_argument("--timeout", type=float, default=180)
     args = p.parse_args()
     try:
+        # A failed retry must not leave an earlier success report looking current.
+        # Never allow a report path to overwrite a compiler (including hardlinks).
+        if args.json.exists() or args.json.is_symlink():
+            if args.json.exists() and any(path.exists() and os.path.samefile(args.json, path)
+                                          for path in (args.lccc, args.gcc)):
+                raise ValueError("report path names a compiler binary")
+            args.json.unlink()
         sizes = [int(n) for n in args.sizes.split(",")]
         if not sizes or any(n < 1 or n > 100000 for n in sizes) or len(set(sizes)) != len(sizes):
             raise ValueError("sizes must be distinct integers in 1..100000")
@@ -59,9 +68,12 @@ def main() -> int:
                 for n in sizes:
                     inp = root / f"{kind}-{n}.c"
                     inp.write_text(source(kind, n), encoding="utf-8")
+                    input_sha256 = digest(inp)
                     for r in range(args.rounds):
                         for name in (("lccc", "gcc") if r % 2 == 0 else ("gcc", "lccc")):
-                            cmd = [str(compilers[name]), "-O0", "-w", "-c", str(inp), "-o", str(root / "out.o")]
+                            obj = root / "out.o"
+                            obj.unlink(missing_ok=True)
+                            cmd = [str(compilers[name]), "-O0", "-w", "-c", str(inp), "-o", str(obj)]
                             env = {k: v for k, v in os.environ.items()
                                    if not k.startswith(("CCC_", "LCCC_"))}
                             if name == "lccc":
@@ -72,10 +84,19 @@ def main() -> int:
                             elapsed = time.monotonic() - start
                             if proc.returncode:
                                 raise RuntimeError(f"{kind}/{n}/{name} exited {proc.returncode}: {proc.stderr[-2000:]}")
+                            if not obj.is_file():
+                                raise RuntimeError(f"{kind}/{n}/{name} did not produce an object")
+                            with obj.open("rb") as stream:
+                                header = stream.read(20)
+                            if (len(header) != 20 or header[:7] != b"\x7fELF\x02\x01\x01"
+                                    or header[16:20] != b"\x01\x00\x3e\x00"):
+                                raise RuntimeError(f"{kind}/{n}/{name} did not produce x86-64 ELF relocatable")
                             match = re.search(r"\[TIME\] sema: ([0-9.]+)s", proc.stderr)
                             if name == "lccc" and match is None:
                                 raise RuntimeError(f"{kind}/{n}: LCCC phase timer missing")
                             results.append({"shape": kind, "n": n, "round": r, "compiler": name,
+                                            "command": cmd, "returncode": proc.returncode,
+                                            "input_sha256": input_sha256, "object_sha256": digest(obj),
                                             "wall_s": round(elapsed, 6),
                                             "sema_s": float(match.group(1)) if match else None})
         output = {"compilers": identities, "flags": ["-O0", "-w", "-c"], "results": results,

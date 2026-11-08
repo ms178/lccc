@@ -76,8 +76,8 @@ require_executable() {
     if [[ ! -e $path ]]; then
         die "$what not found: $path (was the fastbuild artifact downloaded?)"
     fi
-    if [[ ! -x $path ]]; then
-        die "$what is not executable: $path (artifact uploads store content only; restore executable mode)"
+    if [[ ! -f $path || ! -x $path ]]; then
+        die "$what is not executable or not a regular file: $path (artifact uploads store content only; restore executable mode)"
     fi
 }
 require_executable compiler "$compiler"
