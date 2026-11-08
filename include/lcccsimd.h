@@ -707,7 +707,7 @@ void * __lccc_simd512_i_vpmaddubsw_maskz512(long, __mmask32 __mask, __m512i __a,
 
 void * __lccc_simd512_i_vpshufb_maskz128(long, __mmask16 __mask, __m128i __a, __m128i __b);
 void * __lccc_simd512_i_vpshufb_mask128(long, __mmask16 __mask, __m128i __src, __m128i __a, __m128i __b);
-void * __lccc_simd512_i_vpbroadcastw_maskz512(long, __mmask32 __mask, int __a);
+void * __lccc_simd512_i_vpbroadcastw_maskz512(long, __mmask32 __mask, short __a);
 void * __lccc_simd512_i_vpbroadcastd_maskz512(long, __mmask16 __mask, int __a);
 void * __lccc_simd512_i_vpbroadcastq_maskz512(long, __mmask8 __mask, long long __a);
 #define _mm512_maskz_set1_epi16(__mask, __a) __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpbroadcastw_maskz512(0, __mask, __a))

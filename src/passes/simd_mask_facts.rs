@@ -2556,8 +2556,62 @@ fn fold_masked_intrinsic(facts: &Facts<'_>, inst: &Instruction) -> Option<Instru
     }
 }
 
+/// Bit width of an integer IR type.  FP, decimal, pointer, vector and void
+/// types refuse: a mask-compare result is an integer bit pattern only.
+#[inline]
+fn integer_bits(ty: IrType) -> Option<usize> {
+    Some(match ty {
+        IrType::I8 | IrType::U8 => 8,
+        IrType::I16 | IrType::U16 => 16,
+        IrType::I32 | IrType::U32 => 32,
+        IrType::I64 | IrType::U64 => 64,
+        IrType::I128 | IrType::U128 => 128,
+        _ => return None,
+    })
+}
+
 /// The rewrite for one instruction, or `None` when nothing is provable.
 fn fold(facts: &Facts<'_>, inst: &Instruction, block: usize, index: usize) -> Option<Instruction> {
+    // A scalar `vpcmp` result has EXACTLY `lanes` significant bits: EVEX
+    // zeroes every upper `k` bit and `kmov* %k1, %rax` zero-extends into rax.
+    // A following U8/U16/U32 -> at-least-as-wide integer cast is therefore a
+    // bit-identical no-op, but codegen materialises it as `movzwl %ax, %eax`
+    // on EVERY runtime mask compare.  Rewriting it to a Copy removes that
+    // roundtrip without inventing a single fact.  Refuse anything narrower
+    // than `lanes` (that would be a real truncation), any non-integer type,
+    // and any source that is not the DIRECT dest of a mask-compare intrinsic.
+    if let Instruction::Cast {
+        dest,
+        src,
+        from_ty,
+        to_ty,
+    } = inst
+    {
+        let (Some(from_bits), Some(to_bits)) = (integer_bits(*from_ty), integer_bits(*to_ty))
+        else {
+            return None;
+        };
+        if to_bits < from_bits {
+            return None;
+        }
+        let Operand::Value(v) = src else {
+            return None;
+        };
+        let Some(def) = facts.defs.get(v) else {
+            return None;
+        };
+        let Instruction::Intrinsic { op, .. } = **def else {
+            return None;
+        };
+        let (_, _, lanes, _) = mask_compare_shape(op)?;
+        if lanes as usize > from_bits {
+            return None;
+        }
+        return Some(Instruction::Copy {
+            dest: *dest,
+            src: *src,
+        });
+    }
     // ISPC `ImproveMemoryOps`: a scalar `Load` from a proven private constant
     // object is itself a constant.  `maybe_constant_load` is an O(MAX_DEPTH)
     // gate, so ordinary functions pay nothing for this consumer.

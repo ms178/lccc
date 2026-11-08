@@ -18,23 +18,39 @@ impl X86Codegen {
     /// Load a 512-bit operand into a ZMM register.
     /// Honors vec_live_regs (register-held values) and direct slot addressing.
     fn evex_load_arg_to(&mut self, arg: &Operand, zmm: &'static str) {
+        let value_id = match arg {
+            Operand::Value(v) => Some(v.0),
+            Operand::Const(_) => None,
+        };
         if let Operand::Value(v) = arg {
             if let Some(&held) = self.state.vec_live_regs.get(&v.0) {
                 if held != zmm {
                     self.state
                         .emit_fmt(format_args!("    vmovdqa64 %{}, %{}", held, zmm));
+                    // The move-aside overwrote `zmm`: every OTHER value's
+                    // claim on that bank just died. `sse_load_arg` and
+                    // `avx_load_arg_to` already do this; the EVEX loader did
+                    // not, which let a stale `%zmm0` claim survive a fresh
+                    // load and made `vpcmp* zmm` read operand A as operand B.
+                    self.state.vec_evict_bank_except(zmm, v.0);
                 }
                 return;
             }
             if let Some(mem) = self.value_ptr_mem_operand(v.0) {
                 self.state
                     .emit_fmt(format_args!("    vmovdqu64 {}, %{}", mem, zmm));
+                self.state.vec_evict_bank_except(zmm, v.0);
                 return;
             }
         }
         self.operand_to_reg(arg, "rax");
         self.state
             .emit_fmt(format_args!("    vmovdqu64 (%rax), %{}", zmm));
+        // A fresh load into `zmm` clobbers that bank. Evict every OTHER
+        // value's stale claim, exactly as `vec_evict_bank_except`'s contract
+        // requires (see backend/state.rs). Keep `arg`'s own claim, if any.
+        self.state
+            .vec_evict_bank_except(zmm, value_id.unwrap_or(u32::MAX));
     }
 
     fn evex_load_arg(&mut self, arg: &Operand) {
@@ -1542,6 +1558,17 @@ impl X86Codegen {
         args: &[Operand],
     ) -> bool {
         use IntrinsicOp::*;
+        // RED-TEAM, two measured rounds (pinned so neither is retried blindly):
+        // 1. Skipping `invalidate_vec_peephole()` for `vpcmp*` alone was a
+        //    MISCOMPILE (`rt_eq_w512_epi8` returned all-ones): `evex_load_arg_to`
+        //    did not evict a stale `vec_live_regs` claim when it clobbered
+        //    `%zmm0`, so operand B was copied from the clobbered register.
+        // 2. After fixing that eviction (below), skipping the invalidation is
+        //    CORRECT (485-case three-way oracle green) but yields NO win:
+        //    7579 -> 7579 instructions. The roundtrip is a property of the
+        //    vector write-through HOME representation, not of this peephole.
+        // A risk with zero measured benefit is not worth taking: keep the
+        // unconditional invalidation, keep the eviction fix.
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();
         let (inst, w, opcode_ok) = match op {
@@ -1576,6 +1603,12 @@ impl X86Codegen {
             | CmpEpi32Mask128 | CmpEpi32Mask256 | CmpeqEpu64Mask512 | CmpEpu64Mask128
             | CmpEpu64Mask256 | CmpEpi64Mask512 | CmpEpi64Mask128 | CmpEpi64Mask256 => {
                 // args: (a, b, imm) — vpcmp* $imm, %zmm_b, %zmm_a, %k1; kmovq %k1, %rax
+                // RED-TEAM: folding B as a MEMORY src2 via `evex_arg_mem` was
+                // measured on the 485-case matrix and REJECTED. It is correct
+                // (three-way stdout identical) but net-NEGATIVE: 7579 -> 7963
+                // instructions, because the gate flushes deferred stores that
+                // the register path elides. Do not reintroduce it without a
+                // store-elision-aware gate.
                 let (reg_a, reg_b) = match op {
                     CmpeqEpu8Mask512 | CmpEpi8Mask512 | CmpeqEpu16Mask512 | CmpEpi16Mask512
                     | CmpeqEpu32Mask512 | CmpEpi32Mask512 | CmpeqEpu64Mask512 | CmpEpi64Mask512 => {
@@ -2137,6 +2170,7 @@ mod avx_fp_order_tests {
     use super::*;
     use crate::backend::regalloc::PhysReg;
     use crate::backend::state::PendingVecMemfold;
+    use crate::ir::reexports::IrConst;
 
     #[test]
     fn avx_minmax_never_commute_left_memory_but_keep_right_memory_folding() {
@@ -2378,6 +2412,41 @@ mod avx_fp_order_tests {
             out.contains("vcvtps2pd %xmm0, %ymm0"),
             "the convert must read the deferred value from the register, \
              not from its never-written slot: {out}"
+        );
+    }
+    /// A fresh load into a ZMM bank MUST evict every OTHER value's stale
+    /// `vec_live_regs` claim.  Regression measured on the 485-case three-way
+    /// matrix: `rt_eq_w512_epi8` returned all-ones because operand B's
+    /// `%zmm0` claim survived the load of operand A into `%zmm0`, so the
+    /// second resolver copied the clobbered register as operand B.
+    /// `sse_load_arg`/`avx_load_arg_to` already did this; the EVEX loader did
+    /// not.  Both load paths (direct slot and `(%rax)` fallback) are pinned.
+    #[test]
+    fn evex_load_arg_to_evicts_stale_bank_claims() {
+        for stale_bank in ["zmm0", "ymm0", "xmm0"] {
+            let mut cg = X86Codegen::new();
+            cg.state.vec_live_regs.insert(7, stale_bank);
+            cg.evex_load_arg_to(&Operand::Const(IrConst::I64(0)), "zmm0");
+            let out = cg.state.out.buf.clone();
+            assert!(
+                !cg.state.vec_live_regs.contains_key(&7),
+                "a stale {stale_bank} claim survived a fresh %zmm0 load: {:?}\n{out}",
+                cg.state.vec_live_regs
+            );
+            assert!(
+                out.contains("vmovdqu64 (%rax), %zmm0"),
+                "the fallback load must still be emitted: {out}"
+            );
+        }
+        // A claim on a DIFFERENT physical bank must survive: `vector_reg_bank`
+        // keys on the register NUMBER, so xmm0/ymm0/zmm0 share bank 0 and
+        // zmm3 is bank 3.
+        let mut cg = X86Codegen::new();
+        cg.state.vec_live_regs.insert(7, "zmm3");
+        cg.evex_load_arg_to(&Operand::Const(IrConst::I64(0)), "zmm0");
+        assert!(
+            cg.state.vec_live_regs.get(&7) == Some(&"zmm3"),
+            "an unrelated bank must not be evicted"
         );
     }
 }

@@ -203,7 +203,10 @@ M_SHUFB128 = [
     ("mask_shuffle_epi8", "vpshufb_mask128", "__m128i", "__mmask16", "M128I"),
 ]
 MZ_SET1 = [
-    ("maskz_set1_epi16", "vpbroadcastw_maskz512", "__m512i", "__mmask32", "int"),
+    # GCC 16.2 / Clang 23.1.5 declare `_mm512_maskz_set1_epi16(..., short)`;
+    # `int` was an API deviation (vpbroadcastw reads only the low 16 bits).
+    # Pinned by the harness's three-way signature-parity gate.
+    ("maskz_set1_epi16", "vpbroadcastw_maskz512", "__m512i", "__mmask32", "short"),
     ("maskz_set1_epi32", "vpbroadcastd_maskz512", "__m512i", "__mmask16", "int"),
     ("maskz_set1_epi64", "vpbroadcastq_maskz512", "__m512i", "__mmask8", "long long"),
 ]
