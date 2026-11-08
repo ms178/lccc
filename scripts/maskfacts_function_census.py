@@ -22,7 +22,13 @@ made reproducible and self-testing:
   is comparable with the historical 3.19 / 3.25 numbers in section 14;
 * `--require-runtime-avg N` turns the acceptance criterion into a hard gate,
   and `--self-test` feeds synthetic assembly through the SAME parser to
-  detect a vacuous or drifted census.
+  detect a vacuous or drifted census;
+* `--require-no-roundtrip` adds a CPU-INDEPENDENT structural ratchet: every
+  runtime-compare case in the ON build must consist ONLY of one vector load,
+  one `vpcmp*`, one `kmov*`, one `ret` (plus an optional `vzeroupper`).  A
+  reintroduced HOME/stack/literal-pool roundtrip (`leaq`, `subq`, `pushq`,
+  `call`, ...) is rejected even on a runner that cannot EXECUTE AVX-512BW/VL.
+  This is what makes the hosted gate non-vacuous without hardware.
 
 Usage:
     scripts/maskfacts_function_census.py \
@@ -153,6 +159,46 @@ def census(asm_dir: Path, labels: list[str], fixture: Path):
     }
 
 
+LOADS = frozenset({
+    "movdqu", "vmovdqu", "vmovdqu64", "vmovdqu8", "vmovdqu16", "vmovdqu32",
+    "movdqa", "vmovdqa", "vmovdqa64",
+})
+KMASK = frozenset({"kmovq", "kmovd", "kmovw", "kmovb"})
+RET = frozenset({"ret", "retq"})
+# Any of these in a runtime-compare body means the mask/operand took a detour
+# through a literal pool, the stack, or a helper -- the exact regression this
+# patchset removes.  The list is deliberately broad: it is a fail-closed gate.
+ROUNDTRIP_MNEMONICS = frozenset({
+    "leaq", "leal", "pushq", "pushl", "popq", "popl", "subq", "subl",
+    "addq", "addl", "call", "callq", "jmp", "jmpq", "movq", "movl",
+    "movabsq", "movb", "movw", "xorl", "xorq", "andq", "andl", "orq",
+    "orl", "negq", "negl", "notq", "notl", "sarq", "shlq", "shrq",
+})
+
+
+def no_roundtrip_failures(resolved, vp: list[str], label: str) -> list[str]:
+    """Prove, from assembly alone, that no runtime compare roundtrips HOME."""
+    failures: list[str] = []
+    for n in vp:
+        body = resolved(n)
+        bad = sorted(ROUNDTRIP_MNEMONICS.intersection(body))
+        if bad:
+            failures.append(f"{label}:{n} reintroduced a roundtrip: {','.join(bad)}")
+            continue
+        nload = sum(m in LOADS for m in body)
+        ncmp = sum(m.startswith("vpcmp") for m in body)
+        nmask = sum(m in KMASK for m in body)
+        nret = sum(m in RET for m in body)
+        nzero = sum(m == "vzeroupper" for m in body)
+        extra = len(body) - (nload + ncmp + nmask + nret + nzero)
+        if (nload, ncmp, nmask, nret, extra) != (1, 1, 1, 1, 0) or nzero > 1:
+            failures.append(
+                f"{label}:{n} body is not a pure load/compare/mask/ret "
+                f"(instructions={body})"
+            )
+    return failures
+
+
 def self_test() -> int:
     """The parser itself must be tested: a census that reports the same
     number for every compiler, or that misses `.set` aliases, is vacuous."""
@@ -198,7 +244,35 @@ def self_test() -> int:
         )
         res2 = census(tmp, ["a", "b"], fx)
         assert res2["groups"]["runtime_vpcmp"]["b"] == 2, res2
-    print("self-test PASS: aliases, groups, ret counting and cycles verified")
+
+        # Structural ratchet: clean bodies pass; every corruption is caught.
+        bodies, aliases = parse(tmp / "a.s")
+        rv = resolver(bodies, aliases)
+        clean = ["rt_a", "rt_b"]
+        assert no_roundtrip_failures(rv, clean, "a") == [], \
+            no_roundtrip_failures(rv, clean, "a")
+        text = (tmp / "a.s").read_text()
+        for mutation in (
+            "\tleaq A(%rip), %rax\n",
+            "\tsubq $8, %rsp\n",
+            "\tmovq %rax, %rcx\n",
+            "\tcall helper\n",
+            "\tpushq %rbx\n",
+        ):
+            (tmp / "a.s").write_text(text.replace(
+                "\tvpcmpb $0, %xmm1, %xmm0, %k1\n",
+                mutation + "\tvpcmpb $0, %xmm1, %xmm0, %k1\n", 1))
+            bodies, aliases = parse(tmp / "a.s")
+            bad = no_roundtrip_failures(resolver(bodies, aliases), clean, "a")
+            assert bad, f"ratchet missed mutation {mutation!r}"
+        # A missing compare is also a defect, not a pass.
+        (tmp / "a.s").write_text(text.replace(
+            "\tvpcmpb $0, %xmm1, %xmm0, %k1\n", "", 1))
+        bodies, aliases = parse(tmp / "a.s")
+        assert no_roundtrip_failures(resolver(bodies, aliases), clean, "a"), \
+            "ratchet accepted a body without vpcmp"
+    print("self-test PASS: aliases, groups, ret counting, cycles and "
+          "no-roundtrip mutation rejection verified")
     return 0
 
 
@@ -209,6 +283,9 @@ def main() -> int:
     ap.add_argument("--fixture", type=Path, default=FIXTURE)
     ap.add_argument("--json", type=Path)
     ap.add_argument("--require-runtime-avg", type=float)
+    ap.add_argument("--require-no-roundtrip", action="store_true",
+                    help="fail-closed structural proof that no runtime compare "
+                         "roundtrips through HOME/stack (no AVX-512 execution needed)")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
     if args.self_test:
@@ -228,6 +305,22 @@ def main() -> int:
             f"excluding_ret={a['excluding_ret']:.3f} "
             f"min={a['min']} max={a['max']}"
         )
+    if args.require_no_roundtrip:
+        bodies, aliases = parse(args.asm_dir / f"{args.labels[0]}.s")
+        resolved = resolver(bodies, aliases)
+        names = case_names(args.fixture)
+        vp = [n for n in names
+              if n.startswith("rt_") and any(m.startswith("vpcmp") for m in resolved(n))]
+        if not vp:
+            print("FAIL: --require-no-roundtrip found no runtime compares", file=sys.stderr)
+            return 1
+        bad = no_roundtrip_failures(resolved, vp, args.labels[0])
+        if bad:
+            for f in bad[:10]:
+                print("FAIL: " + f, file=sys.stderr)
+            return 1
+        print(f"PASS: {len(vp)} runtime compares are pure "
+              "load/compare/mask/ret; no HOME/stack roundtrip")
     if args.require_runtime_avg is not None:
         got = res["runtime_vpcmp_average"][args.labels[0]]["with_ret"]
         if got > args.require_runtime_avg:

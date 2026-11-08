@@ -1426,7 +1426,7 @@ impl X86Codegen {
         self.simd_gpr_to_k1(&args[0]);
         self.operand_to_reg(&args[1], "rax");
         self.state
-            .emit_fmt(format_args!("    vmovdqu8 (%rax), %{}{{k1}}{{z}}", reg));
+            .emit_fmt(format_args!("    vmovdqu8 (%rax), %{}{{%k1}}{{z}}", reg));
         self.state.vec_claim_live_reg(dest_ptr.0, reg);
         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
             self.state.emit_fmt(format_args!(
@@ -1451,7 +1451,7 @@ impl X86Codegen {
         self.simd_gpr_to_k1(&args[0]);
         self.operand_to_reg(&args[1], "rax");
         self.state
-            .emit_fmt(format_args!("    vmovdqu8 (%rax), %{}{{k1}}", reg));
+            .emit_fmt(format_args!("    vmovdqu8 (%rax), %{}{{%k1}}", reg));
         self.state.vec_claim_live_reg(dest_ptr.0, reg);
         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
             self.state.emit_fmt(format_args!(
@@ -1477,7 +1477,7 @@ impl X86Codegen {
         self.simd_load_arg_to(&args[1], reg);
         self.value_to_reg(ptr, "rax");
         self.state
-            .emit_fmt(format_args!("    vmovdqu8 %{}, (%rax){{k1}}", reg));
+            .emit_fmt(format_args!("    vmovdqu8 %{}, (%rax){{%k1}}", reg));
     }
 
     /// Masked zeroing maddubs: vpmaddubsw %zmm_b, %zmm_a, %zmm0{%k1}{z}.
@@ -1504,7 +1504,7 @@ impl X86Codegen {
             "eax"
         };
         self.state
-            .emit_fmt(format_args!("    {} %{}, %zmm0{{k1}}{{z}}", inst, reg));
+            .emit_fmt(format_args!("    {} %{}, %zmm0{{%k1}}{{z}}", inst, reg));
         self.evex_store_dest(dest_ptr);
     }
 
@@ -1522,7 +1522,7 @@ impl X86Codegen {
         };
         self.simd_load_arg_to(&args[2], src_reg); // inserted src (b)
         self.state.emit_fmt(format_args!(
-            "    {} ${}, %{}, %zmm1, %zmm0{{k1}}{{z}}",
+            "    {} ${}, %{}, %zmm1, %zmm0{{%k1}}{{z}}",
             inst, imm, src_reg
         ));
         self.evex_store_dest(dest_ptr);
@@ -1542,7 +1542,7 @@ impl X86Codegen {
         self.simd_gpr_to_k1(&args[0]);
         self.simd_load_arg_to(&args[1], "zmm0");
         self.state.emit_fmt(format_args!(
-            "    {} ${}, %zmm0, %{}{{k1}}{{z}}",
+            "    {} ${}, %zmm0, %{}{{%k1}}{{z}}",
             inst, imm, dst_reg
         ));
         self.state.vec_claim_live_reg(dest_ptr.0, dst_reg);
@@ -1575,7 +1575,7 @@ impl X86Codegen {
             self.evex_load_arg_to(&args[1], "xmm1");
             self.evex_load_arg_to(&args[2], "xmm2");
             self.state.emit_fmt(format_args!(
-                "    vpshufb %xmm2, %xmm1, %xmm0{{k1}}{}",
+                "    vpshufb %xmm2, %xmm1, %xmm0{{%k1}}{}",
                 zsuf
             ));
         } else {
@@ -1585,7 +1585,7 @@ impl X86Codegen {
             self.evex_load_arg_to(&args[2], "xmm1"); // a
             self.evex_load_arg_to(&args[3], "xmm2"); // b
             self.state
-                .emit_fmt(format_args!("    vpshufb %xmm2, %xmm1, %xmm0{{k1}}"));
+                .emit_fmt(format_args!("    vpshufb %xmm2, %xmm1, %xmm0{{%k1}}"));
         }
         self.state.vec_claim_live_reg(dest_ptr.0, "xmm0");
         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {

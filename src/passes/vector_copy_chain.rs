@@ -55,10 +55,15 @@
 //!   remaining mentions, with `retain_insts` keeping `-g` spans in lockstep.
 //!
 //! Pass name for `CCC_DISABLE_PASSES`: `veccopychain`.
-//! Explainability: `CCC_DEBUG_VEC_COPY_CHAIN=1` prints every applied rewrite
-//! AND every refusal reason, so each `continue` path is traceable.  The flag
-//! is read ONCE per pass invocation into a cached `OnceLock`; the hot path
-//! pays only one inlined boolean check, never an environment lookup.
+//! Explainability is STRUCTURAL, not an environment switch: every refusal
+//! below carries its reason in a source comment and is exercised by
+//! `tests::refuses_when_widths_offsets_or_shapes_are_wrong` /
+//! `tests::rejects_same_home_semantic_volatile_and_cross_block_shapes`.
+//! A compiler pass must not read the process environment on its hot path
+//! (`check_env_test_hygiene.sh` ratchets that count down) and shipped sources
+//! may not contain `eprintln!` (`check_param_home_contracts.py` check 8), so
+//! there is deliberately NO debug trace here: it would cost a branch per
+//! candidate and weaken both invariants for a developer convenience.
 
 use crate::backend::liveness::{
     for_each_operand_in_instruction, for_each_value_use_in_instruction,
@@ -75,6 +80,12 @@ use super::vector_temp_promotion::{
 /// reads an unaligned-safe whole register; this table supplies the exact
 /// byte count so a 32-byte load feeding a 16-byte store refuses.
 fn vec_load_width(op: IntrinsicOp) -> Option<usize> {
+    // An explicit guard (rather than `Some(match ...).filter(...)`) keeps the
+    // width table the ONLY source of byte counts and makes the fail-closed
+    // order obvious: no shape proof => no width, no eager match evaluation.
+    if !whole_vector_load(op) {
+        return None;
+    }
     use IntrinsicOp as O;
     Some(match op {
         O::VecLoadI32x4
@@ -91,7 +102,6 @@ fn vec_load_width(op: IntrinsicOp) -> Option<usize> {
         | O::VecLoadI16x16 => 32,
         _ => return None,
     })
-    .filter(|_| whole_vector_load(op))
 }
 
 /// Count every MENTION of each value: intrinsic `args`, `dest_ptr`,
@@ -141,35 +151,6 @@ fn zero_const(op: &Operand) -> bool {
     matches!(op, Operand::Const(IrConst::I64(0)))
 }
 
-/// Developer-only explainability trace.  Read ONCE per pass invocation, not
-/// per instruction: `CCC_DEBUG_VEC_COPY_CHAIN=1` prints every applied rewrite
-/// and every refusal reason, so each `continue` path below is traceable.
-struct Trace {
-    enabled: bool,
-}
-
-impl Trace {
-    #[inline]
-    fn enabled() -> Self {
-        static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        Self {
-            enabled: *FLAG.get_or_init(|| std::env::var_os("CCC_DEBUG_VEC_COPY_CHAIN").is_some()),
-        }
-    }
-    #[inline]
-    fn reject(&self, reason: &str) {
-        if self.enabled {
-            eprintln!("[veccopychain] refuse: {reason}");
-        }
-    }
-    #[inline]
-    fn collapse(&self, block: usize, index: usize, width: usize, scratch: u32, home: u32) {
-        if self.enabled {
-            eprintln!("[veccopychain] b{block} i{index}: collapse w{width} %{scratch} -> %{home}");
-        }
-    }
-}
-
 struct Plan {
     load: usize,
     vec_load: usize,
@@ -188,13 +169,6 @@ pub(crate) fn collapse_vector_copy_chains(module: &mut IrModule) -> usize {
 }
 
 fn collapse_in_function(func: &mut IrFunction) -> usize {
-    let trace = Trace::enabled();
-    macro_rules! reject {
-        ($reason:expr) => {{
-            trace.reject($reason);
-            continue;
-        }};
-    }
     let homes = homes(func);
     if homes.is_empty() {
         return 0;
@@ -206,7 +180,8 @@ fn collapse_in_function(func: &mut IrFunction) -> usize {
     for (bi, block) in func.blocks.iter().enumerate() {
         let insts = &block.instructions;
         if insts.len() < 3 {
-            reject!("block has fewer than three instructions");
+            // refuse: block has fewer than three instructions
+            continue;
         }
         for i in 0..insts.len() - 2 {
             let (
@@ -232,32 +207,39 @@ fn collapse_in_function(func: &mut IrFunction) -> usize {
                 },
             ) = (&insts[i], &insts[i + 1], &insts[i + 2])
             else {
-                reject!("triple is not load/VecLoad/VecStore with the right dests");
+                // refuse: triple is not load/VecLoad/VecStore with the right dests
+                continue;
             };
             // A single source pointer: no offset, mask or width-changing load.
             if load_args.len() != 1 {
-                reject!("load has more than one source argument");
+                // refuse: load has more than one source argument
+                continue;
             }
             let Some(width) = direct_vector_load_width(*load_op) else {
-                reject!("load is not a direct full-width vector load");
+                // refuse: load is not a direct full-width vector load
+                continue;
             };
             if vec_load_width(*load_vec_op) != Some(width)
                 || whole_vector_store_width(*store_vec_op) != Some(width)
             {
-                reject!("VecLoad/VecStore widths or whole-register shape mismatch");
+                // refuse: VecLoad/VecStore widths or whole-register shape mismatch
+                continue;
             }
             if homes.get(&scratch.0) != Some(&width) || homes.get(&final_home.0) != Some(&width) {
-                reject!("homes are missing, volatile or not exactly the load width");
+                // refuse: homes are missing, volatile or not exactly the load width
+                continue;
             }
             if scratch.0 == final_home.0 {
-                reject!("scratch and final home are the same alloca");
+                // refuse: scratch and final home are the same alloca
+                continue;
             }
             // Unique-def / unique-use guards: a value id defined or read by
             // anything else must not be rewired.
             if counts.get(&scratch.0).copied() != Some(2)
                 || counts.get(&vec_val.0).copied() != Some(1)
             {
-                reject!("scratch/SSA value has a non-unique mention count");
+                // refuse: scratch/SSA value has a non-unique mention count
+                continue;
             }
             // Exact whole-object, offset-0 copy.  `VecLoad*` args are
             // [base, byte-offset]; `VecStore*` args are [value, ptr, offset]
@@ -266,20 +248,23 @@ fn collapse_in_function(func: &mut IrFunction) -> usize {
                 || !matches!(&vl_args[0], Operand::Value(v) if v.0 == scratch.0)
                 || !zero_const(&vl_args[1])
             {
-                reject!("VecLoad base/arity/offset is not an exact offset-0 read");
+                // refuse: VecLoad base/arity/offset is not an exact offset-0 read
+                continue;
             }
             if vs_args.len() != 3
                 || !matches!(&vs_args[0], Operand::Value(v) if v.0 == vec_val.0)
                 || !matches!(&vs_args[1], Operand::Value(v) if v.0 == final_home.0)
                 || !zero_const(&vs_args[2])
             {
-                reject!("VecStore value/ptr/offset is not an exact offset-0 write");
+                // refuse: VecStore value/ptr/offset is not an exact offset-0 write
+                continue;
             }
             // Do not let two plans share a home (a scratch of one plan can
             // never be the final home of another because of the mention
             // counts, but the guard makes that invariant explicit).
             if claimed.contains(&scratch.0) || claimed.contains(&final_home.0) {
-                reject!("a home is already claimed by another plan");
+                // refuse: a home is already claimed by another plan
+                continue;
             }
             claimed.insert(scratch.0);
             claimed.insert(final_home.0);
@@ -301,7 +286,6 @@ fn collapse_in_function(func: &mut IrFunction) -> usize {
                 new_dest_ptr: *final_home,
                 dead_alloca,
             });
-            trace.collapse(bi, i, width, scratch.0, final_home.0);
         }
     }
 

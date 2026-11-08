@@ -3599,6 +3599,14 @@ jobs:
         ln -s "$(command -v gcc-16)" "$RUNNER_TEMP/lccc-modern-oracles/gcc-16"
         ln -s "$CLANG" "$RUNNER_TEMP/lccc-modern-oracles/clang-23"
         echo "$RUNNER_TEMP/lccc-modern-oracles" >> "$GITHUB_PATH"
+    - name: Report AVX-512 host capability (execution is capability-gated)
+      run: |
+        set -euo pipefail
+        # A host with no AVX-512 at all must still report an honest result,
+        # not fail the job because grep found no matches under pipefail.
+        flags="$(grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' \
+          | grep -E '^avx512(f|bw|vl|dq|cd)$' | sort | tr '\n' ' ' || true)"
+        printf 'AVX-512 host capability: %s\n' "${flags:-none}"
     - name: Mask-compare harness self-tests (mutation rejection)
       run: |
         set -euo pipefail
@@ -3615,6 +3623,7 @@ jobs:
         python3 scripts/maskfacts_function_census.py \
           --asm-dir target/maskfacts-receipts/asm \
           --require-runtime-avg 5.0 \
+          --require-no-roundtrip \
           --json target/maskfacts-receipts/census.json
         python3 scripts/check_maskfacts_memory_safety.py \
           --json target/maskfacts-receipts/safety.json
