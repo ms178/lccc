@@ -7,7 +7,7 @@ byte-identical assembly for every input, and refuses to trust a count unless it
 reproduces exactly on a repeat run.
 
 The proxy is the number of heap allocations performed by the compiler, counted
-by interposing glibc's allocator (tests/regression/alloc_count_shim.c). That is
+by interposing glibc's allocator (tests/regression/alloc_cost/alloc_count_shim.c). That is
 the quantity an "allocate before filtering" change removes, it needs no
 profiler, and it is deterministic -- unlike wall time on a shared host.
 
@@ -39,7 +39,11 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-SHIM_SRC = ROOT / "tests/regression/alloc_count_shim.c"
+# NOTE: the shim lives in a SUBDIRECTORY on purpose. tests/regression/*.c is
+# globbed non-recursively by the SSA corpus runner and every match is compiled
+# as a standalone program; a shared-library interposer has no main() and calls
+# __libc_* internals, so placing it at the top level broke that corpus.
+SHIM_SRC = ROOT / "tests/regression/alloc_cost/alloc_count_shim.c"
 FIELDS = ("malloc", "calloc", "realloc", "free", "aligned", "bytes", "total")
 
 

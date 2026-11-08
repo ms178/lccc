@@ -131,7 +131,7 @@ Callgrind is not in the agent toolchain cache and wall time on this 3.9 GiB
 shared host cannot resolve a few percent. For an allocation optimization the
 allocation count *is* the quantity removed, so the new ratchet counts heap
 allocations by interposing glibc's allocator
-(`tests/regression/alloc_count_shim.c`).
+(`tests/regression/alloc_cost/alloc_count_shim.c`).
 
 Getting a trustworthy number required fixing three measurement bugs. Each
 produced a plausible-looking but wrong result, which is worse than no result:
@@ -210,7 +210,7 @@ and it does not establish MB-20's ≤35 % peephole criterion; steps 4–5 remain
 * `scripts/test_measure_peephole_alloc_cost.py` — 14 compiler-free contracts
   pinning the three traps and the verdict logic (a cost win that changes
   assembly **fails**).
-* `tests/regression/alloc_count_shim.c` — the interposer, built `-Wall -Wextra
+* `tests/regression/alloc_cost/alloc_count_shim.c` — the interposer, built `-Wall -Wextra
   -Werror`.
 
 All four are wired into `.github/workflows/ci.yml`, `scripts/ci_local.sh` and
