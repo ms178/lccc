@@ -294,10 +294,13 @@ class AuditPackTests(unittest.TestCase):
         objdump = shutil.which('objdump')
         if objdump is None:
             self.skipTest('objdump not installed')
-        ok, _ = self._evex_probe(('-std=c99', '-O1'))
-        if not ok:
-            self.skipTest('host cannot execute EVEX; gate is already closed')
-        dis = run([objdump, '-d', str(self.work / 'evex_probe_plain.bin')])
+        _, reason = self._evex_probe(('-std=c99', '-O1'))
+        exe = self.work / 'evex_probe_plain.bin'
+        if not exe.is_file():
+            self.skipTest(f'probe did not compile: {reason}')
+        # Disassemble even when the host rejects EVEX: the point of this test
+        # is that the instruction EXISTS, not that this CPU can execute it.
+        dis = run([objdump, '-d', str(exe)])
         self.assertEqual(dis.returncode, 0, dis.stderr)
         self.assertRegex(dis.stdout, r'vmovdqu64\s+.*%zmm')
 
