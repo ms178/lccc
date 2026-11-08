@@ -1,6 +1,7 @@
 pub(crate) mod builtin_macros;
 pub(crate) mod conditionals;
 mod expr_eval;
+mod feature_queries;
 mod includes;
 pub(crate) mod macro_defs;
 pub(crate) mod pipeline;

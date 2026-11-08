@@ -1,0 +1,899 @@
+{
+  "aggregate_lccc_over_reference": {
+    "clang": {
+      "geometric_mean_paired_median_ratio": 1.0364819701631358,
+      "lccc_faster_cases": 4,
+      "lccc_slower_cases": 8,
+      "n": 12
+    },
+    "gcc": {
+      "geometric_mean_paired_median_ratio": 1.019246973593187,
+      "lccc_faster_cases": 5,
+      "lccc_slower_cases": 7,
+      "n": 12
+    },
+    "rucc": {
+      "geometric_mean_paired_median_ratio": 0.9910815395826884,
+      "lccc_faster_cases": 5,
+      "lccc_slower_cases": 7,
+      "n": 12
+    }
+  },
+  "benchmarks": [
+    {
+      "correct": true,
+      "median_ci95_bootstrap_s": {
+        "clang": [
+          0.168214713,
+          0.175193248
+        ],
+        "gcc": [
+          0.168587571,
+          0.170780431
+        ],
+        "lccc": [
+          0.152726227,
+          0.154375509
+        ],
+        "rucc": [
+          0.167900014,
+          0.172809984
+        ]
+      },
+      "median_wall_s": {
+        "clang": 0.170329403,
+        "gcc": 0.169208519,
+        "lccc": 0.153620018,
+        "rucc": 0.169270767
+      },
+      "name": "gzip_crc32",
+      "paired_lccc_over_reference": {
+        "clang": {
+          "ci95_bootstrap": [
+            0.87138907417202,
+            0.9200243456561101
+          ],
+          "median": 0.8966521593456181
+        },
+        "gcc": {
+          "ci95_bootstrap": [
+            0.902591831088599,
+            0.9156992302831151
+          ],
+          "median": 0.9037106127235135
+        },
+        "rucc": {
+          "ci95_bootstrap": [
+            0.8876822674070316,
+            0.9089328287218374
+          ],
+          "median": 0.9022599100056066
+        }
+      },
+      "quality_warning_count": 2,
+      "source": "tests/benchmark/programs/gzip_crc32.c",
+      "source_sha256": "9f9acac042ab580ce2137a9fb653a5b3db5e7015dbb49254944195ef5eb98f6a",
+      "tags": [
+        "workload",
+        "gzip",
+        "checksum",
+        "memory"
+      ]
+    },
+    {
+      "correct": true,
+      "median_ci95_bootstrap_s": {
+        "clang": [
+          0.037534392,
+          0.037819076
+        ],
+        "gcc": [
+          0.039520706,
+          0.039979323
+        ],
+        "lccc": [
+          0.039839681,
+          0.040468686
+        ],
+        "rucc": [
+          0.041799385,
+          0.042115426
+        ]
+      },
+      "median_wall_s": {
+        "clang": 0.037733118,
+        "gcc": 0.039809455,
+        "lccc": 0.040145096,
+        "rucc": 0.041976871
+      },
+      "name": "zlib_ng_adler32",
+      "paired_lccc_over_reference": {
+        "clang": {
+          "ci95_bootstrap": [
+            1.0577256106898925,
+            1.0785254950438183
+          ],
+          "median": 1.0625415861561505
+        },
+        "gcc": {
+          "ci95_bootstrap": [
+            1.0007592668626084,
+            1.0233824822385407
+          ],
+          "median": 1.0139069291005867
+        },
+        "rucc": {
+          "ci95_bootstrap": [
+            0.9500368654932807,
+            0.9640710476014279
+          ],
+          "median": 0.955566690753943
+        }
+      },
+      "quality_warning_count": 4,
+      "source": "tests/benchmark/programs/zlib_ng_adler32.c",
+      "source_sha256": "bca7938ef542270a06d734bf814b3f1806ab1796e8f53d5c53d1b5ccd6b08486",
+      "tags": [
+        "workload",
+        "zlib-ng",
+        "checksum",
+        "loop"
+      ]
+    },
+    {
+      "correct": true,
+      "median_ci95_bootstrap_s": {
+        "clang": [
+          0.03921569,
+          0.042433821
+        ],
+        "gcc": [
+          0.04174007,
+          0.045045012
+        ],
+        "lccc": [
+          0.045195859,
+          0.04622477
+        ],
+        "rucc": [
+          0.040251574,
+          0.045469549
+        ]
+      },
+      "median_wall_s": {
+        "clang": 0.040396788,
+        "gcc": 0.043050596,
+        "lccc": 0.045687745,
+        "rucc": 0.041989642
+      },
+      "name": "expat_xml_scan",
+      "paired_lccc_over_reference": {
+        "clang": {
+          "ci95_bootstrap": [
+            1.0766823237530272,
+            1.1593157229157052
+          ],
+          "median": 1.1425082608052897
+        },
+        "gcc": {
+          "ci95_bootstrap": [
+            1.003348805856684,
+            1.1074435189016214
+          ],
+          "median": 1.0830051795591626
+        },
+        "rucc": {
+          "ci95_bootstrap": [
+            1.0150455637903952,
+            1.1255355464349257
+          ],
+          "median": 1.1174933320899119
+        }
+      },
+      "quality_warning_count": 3,
+      "source": "tests/benchmark/programs/expat_xml_scan.c",
+      "source_sha256": "a076b1823869765011658d56ec090b22102e2ba7a5bbdf4cd0b6bdd0d774cf35",
+      "tags": [
+        "workload",
+        "expat",
+        "parser",
+        "branch"
+      ]
+    },
+    {
+      "correct": true,
+      "median_ci95_bootstrap_s": {
+        "clang": [
+          0.264682594,
+          0.287658817
+        ],
+        "gcc": [
+          0.300594221,
+          0.304434871
+        ],
+        "lccc": [
+          0.262068475,
+          0.268284853
+        ],
+        "rucc": [
+          0.332029754,
+          0.346086698
+        ]
+      },
+      "median_wall_s": {
+        "clang": 0.280664329,
+        "gcc": 0.301664702,
+        "lccc": 0.264702774,
+        "rucc": 0.333964691
+      },
+      "name": "expat_siphash24",
+      "paired_lccc_over_reference": {
+        "clang": {
+          "ci95_bootstrap": [
+            0.9110392573157249,
+            0.9971530888792094
+          ],
+          "median": 0.9812542621084528
+        },
+        "gcc": {
+          "ci95_bootstrap": [
+            0.8613325101589115,
+            0.8906578125965964
+          ],
+          "median": 0.8694890080446795
+        },
+        "rucc": {
+          "ci95_bootstrap": [
+            0.7826801266503371,
+            0.7926070663560059
+          ],
+          "median": 0.7838743803920952
+        }
+      },
+      "quality_warning_count": 3,
+      "source": "tests/benchmark/programs/expat_siphash24.c",
+      "source_sha256": "59c5dfbdf3f0d2e149a3681925c46b7b0aeb195f179c285f3b64a2daaf1fb663",
+      "tags": [
+        "workload",
+        "expat",
+        "hash",
+        "arx",
+        "integer"
+      ]
+    },
+    {
+      "correct": true,
+      "median_ci95_bootstrap_s": {
+        "clang": [
+          0.02720602,
+          0.030183083
+        ],
+        "gcc": [
+          0.02706786,
+          0.027795084
+        ],
+        "lccc": [
+          0.028618207,
+          0.031359698
+        ],
+        "rucc": [
+          0.026994788,
+          0.030714118
+        ]
+      },
+      "median_wall_s": {
+        "clang": 0.028164718,
+        "gcc": 0.027328655,
+        "lccc": 0.029611219,
+        "rucc": 0.027758519
+      },
+      "name": "sqlite_varint",
+      "paired_lccc_over_reference": {
+        "clang": {
+          "ci95_bootstrap": [
+            0.948153871491524,
+            1.09746768552148
+          ],
+          "median": 1.0624585404222693
+        },
+        "gcc": {
+          "ci95_bootstrap": [
+            1.0418597185000957,
+            1.1670707087409693
+          ],
+          "median": 1.083522734653425
+        },
+        "rucc": {
+          "ci95_bootstrap": [
+            1.0159372335390084,
+            1.1343083607967928
+          ],
+          "median": 1.0210189984944382
+        }
+      },
+      "quality_warning_count": 5,
+      "source": "tests/benchmark/programs/sqlite_varint.c",
+      "source_sha256": "11c7e09b1507659fe44e678848c5e489268e4dd4aa385d3a542453caa400e1af",
+      "tags": [
+        "workload",
+        "sqlite",
+        "branch",
+        "integer"
+      ]
+    },
+    {
+      "correct": true,
+      "median_ci95_bootstrap_s": {
+        "clang": [
+          0.015002931,
+          0.015286474
+        ],
+        "gcc": [
+          0.015119202,
+          0.015633508
+        ],
+        "lccc": [
+          0.016399537,
+          0.016875313
+        ],
+        "rucc": [
+          0.014725367,
+          0.01528629
+        ]
+      },
+      "median_wall_s": {
+        "clang": 0.015097729,
+        "gcc": 0.015385679,
+        "lccc": 0.016470306,
+        "rucc": 0.01501796
+      },
+      "name": "linux_find_bit",
+      "paired_lccc_over_reference": {
+        "clang": {
+          "ci95_bootstrap": [
+            1.0792000116656233,
+            1.118797295656873
+          ],
+          "median": 1.0908611124053027
+        },
+        "gcc": {
+          "ci95_bootstrap": [
+            1.0489991753610257,
+            1.0970369075805353
+          ],
+          "median": 1.0673397644653837
+        },
+        "rucc": {
+          "ci95_bootstrap": [
+            1.0845008828172173,
+            1.1236754525914305
+          ],
+          "median": 1.1136929218809961
+        }
+      },
+      "quality_warning_count": 7,
+      "source": "tests/benchmark/programs/linux_find_bit.c",
+      "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+      "tags": [
+        "workload",
+        "linux",
+        "bitmap",
+        "bit"
+      ]
+    },
+    {
+      "correct": true,
+      "median_ci95_bootstrap_s": {
+        "clang": [
+          0.009780204,
+          0.012400845
+        ],
+        "gcc": [
+          0.010805636,
+          0.011719436
+        ],
+        "lccc": [
+          0.011011924,
+          0.011515464
+        ],
+        "rucc": [
+          0.010050346,
+          0.011555591
+        ]
+      },
+      "median_wall_s": {
+        "clang": 0.010923319,
+        "gcc": 0.010913544,
+        "lccc": 0.011254167,
+        "rucc": 0.010529474
+      },
+      "name": "glibc_memcmp",
+      "paired_lccc_over_reference": {
+        "clang": {
+          "ci95_bootstrap": [
+            0.9567004958405385,
+            1.153231510624318
+          ],
+          "median": 1.030288230161547
+        },
+        "gcc": {
+          "ci95_bootstrap": [
+            1.0127991612392961,
+            1.0332281612645717
+          ],
+          "median": 1.0257907292358617
+        },
+        "rucc": {
+          "ci95_bootstrap": [
+            0.9535044666005866,
+            1.102998941528978
+          ],
+          "median": 1.0915620934307075
+        }
+      },
+      "quality_warning_count": 11,
+      "source": "tests/benchmark/programs/glibc_memcmp.c",
+      "source_sha256": "6fcec75ff20c60106d78db2013a646579ab4262750fe64eee99387f3c16b0870",
+      "tags": [
+        "workload",
+        "glibc",
+        "memory",
+        "branch"
+      ]
+    },
+    {
+      "correct": true,
+      "median_ci95_bootstrap_s": {
+        "clang": [
+          0.318085109,
+          0.368445789
+        ],
+        "gcc": [
+          0.297645298,
+          0.325198888
+        ],
+        "lccc": [
+          0.279206682,
+          0.505589414
+        ],
+        "rucc": [
+          0.366146962,
+          0.450066781
+        ]
+      },
+      "median_wall_s": {
+        "clang": 0.349428804,
+        "gcc": 0.313388614,
+        "lccc": 0.296124053,
+        "rucc": 0.420544428
+      },
+      "name": "sha256_transform",
+      "paired_lccc_over_reference": {
+        "clang": {
+          "ci95_bootstrap": [
+            0.8450118439577752,
+            1.4345183817530345
+          ],
+          "median": 0.9308642220113098
+        },
+        "gcc": {
+          "ci95_bootstrap": [
+            0.9079719792891787,
+            1.6132986056730192
+          ],
+          "median": 0.9948890675907804
+        },
+        "rucc": {
+          "ci95_bootstrap": [
+            0.6711533270433849,
+            1.2568048030349839
+          ],
+          "median": 0.8119029675413382
+        }
+      },
+      "quality_warning_count": 7,
+      "source": "tests/benchmark/programs/sha256_transform.c",
+      "source_sha256": "6f55a89cfd9d59eb9a8e115eef968295ec775fa63d0545dd33517c2fdf06bf5e",
+      "tags": [
+        "workload",
+        "crypto",
+        "sha256",
+        "integer"
+      ]
+    },
+    {
+      "correct": true,
+      "median_ci95_bootstrap_s": {
+        "clang": [
+          0.0162214,
+          0.018192861
+        ],
+        "gcc": [
+          0.016594587,
+          0.017148958
+        ],
+        "lccc": [
+          0.016221131,
+          0.019337389
+        ],
+        "rucc": [
+          0.016142258,
+          0.016358246
+        ]
+      },
+      "median_wall_s": {
+        "clang": 0.016444306,
+        "gcc": 0.016659523,
+        "lccc": 0.016858916,
+        "rucc": 0.01631919
+      },
+      "name": "linux_rbtree",
+      "paired_lccc_over_reference": {
+        "clang": {
+          "ci95_bootstrap": [
+            0.9901643507958623,
+            1.062910830792364
+          ],
+          "median": 1.0013027756869033
+        },
+        "gcc": {
+          "ci95_bootstrap": [
+            0.976554361333591,
+            1.122777722121659
+          ],
+          "median": 0.9814923986960326
+        },
+        "rucc": {
+          "ci95_bootstrap": [
+            0.9916179888724012,
+            1.1829196735581755
+          ],
+          "median": 1.0443963911368535
+        }
+      },
+      "quality_warning_count": 11,
+      "source": "tests/benchmark/programs/linux_rbtree.c",
+      "source_sha256": "7c9c5ada20d8e32116ccbc1ca68690e92470ef7348b51842e49ffa2fa0480253",
+      "tags": [
+        "workload",
+        "linux",
+        "rbtree",
+        "tree",
+        "memory"
+      ]
+    },
+    {
+      "correct": true,
+      "median_ci95_bootstrap_s": {
+        "clang": [
+          4.481975307,
+          4.551827199
+        ],
+        "gcc": [
+          4.219523415,
+          4.253136595
+        ],
+        "lccc": [
+          4.214761224,
+          4.244202109
+        ],
+        "rucc": [
+          4.5069682,
+          4.551492699
+        ]
+      },
+      "median_wall_s": {
+        "clang": 4.507571364,
+        "gcc": 4.234684439,
+        "lccc": 4.227530172,
+        "rucc": 4.522506727
+      },
+      "name": "glibc_strstr",
+      "paired_lccc_over_reference": {
+        "clang": {
+          "ci95_bootstrap": [
+            0.9311656756144194,
+            0.9423817541642814
+          ],
+          "median": 0.9349940342237546
+        },
+        "gcc": {
+          "ci95_bootstrap": [
+            0.9852782486592085,
+            1.0023732128398892
+          ],
+          "median": 0.9983105548706035
+        },
+        "rucc": {
+          "ci95_bootstrap": [
+            0.9280804758183164,
+            0.9354940299595854
+          ],
+          "median": 0.9324857557021866
+        }
+      },
+      "quality_warning_count": 4,
+      "source": "tests/benchmark/programs/glibc_strstr.c",
+      "source_sha256": "17dcd48414c9eb254cc910905113b7ed8a3cedac3c0d41216305484a5a7cd344",
+      "tags": [
+        "workload",
+        "glibc",
+        "string",
+        "search"
+      ]
+    },
+    {
+      "correct": true,
+      "median_ci95_bootstrap_s": {
+        "clang": [
+          0.141883936,
+          0.153746128
+        ],
+        "gcc": [
+          0.153445308,
+          0.163435437
+        ],
+        "lccc": [
+          0.15948479,
+          0.163689948
+        ],
+        "rucc": [
+          0.155948794,
+          0.160558679
+        ]
+      },
+      "median_wall_s": {
+        "clang": 0.144370004,
+        "gcc": 0.154612889,
+        "lccc": 0.159682494,
+        "rucc": 0.157577111
+      },
+      "name": "gzip_longest_match",
+      "paired_lccc_over_reference": {
+        "clang": {
+          "ci95_bootstrap": [
+            1.0596857307521916,
+            1.131206352867875
+          ],
+          "median": 1.1221191846581278
+        },
+        "gcc": {
+          "ci95_bootstrap": [
+            0.976514206034766,
+            1.0632228423952788
+          ],
+          "median": 1.0315103160642707
+        },
+        "rucc": {
+          "ci95_bootstrap": [
+            0.9989221391715369,
+            1.0452277760485187
+          ],
+          "median": 1.0189568250203973
+        }
+      },
+      "quality_warning_count": 3,
+      "source": "tests/benchmark/programs/gzip_longest_match.c",
+      "source_sha256": "18a7a1d5dc782cbfe623ded7eb4d20bebcf75f3613b301f3306c3ec968a8db2b",
+      "tags": [
+        "workload",
+        "gzip",
+        "compression",
+        "branch"
+      ]
+    },
+    {
+      "correct": true,
+      "median_ci95_bootstrap_s": {
+        "clang": [
+          0.017444715,
+          0.017552408
+        ],
+        "gcc": [
+          0.01757398,
+          0.018230315
+        ],
+        "lccc": [
+          0.021173927,
+          0.021773308
+        ],
+        "rucc": [
+          0.01811813,
+          0.018473688
+        ]
+      },
+      "median_wall_s": {
+        "clang": 0.017512821,
+        "gcc": 0.017766842,
+        "lccc": 0.02156919,
+        "rucc": 0.018273946
+      },
+      "name": "sqlite_vdbe_serial",
+      "paired_lccc_over_reference": {
+        "clang": {
+          "ci95_bootstrap": [
+            1.2006202714060348,
+            1.2456092289269272
+          ],
+          "median": 1.2325098690870893
+        },
+        "gcc": {
+          "ci95_bootstrap": [
+            1.1815924322654228,
+            1.2463257294019152
+          ],
+          "median": 1.2213235704148975
+        },
+        "rucc": {
+          "ci95_bootstrap": [
+            1.1589505407891862,
+            1.2017414600734182
+          ],
+          "median": 1.1890862542769909
+        }
+      },
+      "quality_warning_count": 5,
+      "source": "tests/benchmark/programs/sqlite_vdbe_serial.c",
+      "source_sha256": "716c4164550d809dd2ca8af7c37897fe8e66296f28972e890326228931affc17",
+      "tags": [
+        "workload",
+        "sqlite",
+        "database",
+        "switch",
+        "endian"
+      ]
+    }
+  ],
+  "compiler_versions": {
+    "clang": "clang version 23.1.5 (https://github.com/llvm/llvm-project 392dfff97d29b59d77e5cac6d4b6ef2585fe7117)",
+    "gcc": "gcc-16 (GCC) 16.2.0",
+    "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0",
+    "rucc": "rucc 0.30.15"
+  },
+  "compilers": [
+    {
+      "binary_sha256": "0533534bbc592c9c05066ffdff3b297f7a149da06e3a4e914149137c3ad79405",
+      "executable": "/home/user/lccc/target/fastbuild/lccc",
+      "flags": [
+        "-I/home/user/.cache/lccc/agent-toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "-O2"
+      ],
+      "key": "lccc",
+      "label": "LCCC"
+    },
+    {
+      "binary_sha256": "89691354b8082a95cd13f7e9bb5822024bbd841aeef69ad28882105654ad2ffd",
+      "executable": "/home/user/.cache/lccc/agent-toolchains/bin/gcc-16",
+      "flags": [
+        "-O2"
+      ],
+      "key": "gcc",
+      "label": "GCC"
+    },
+    {
+      "binary_sha256": "2e38b1a65a38f3d5ba80b58d6404b1dec2c94bbfe44c12163e6cb322fe07d3e2",
+      "executable": "/home/user/.cache/lccc/agent-toolchains/bin/clang",
+      "flags": [
+        "-O2"
+      ],
+      "key": "clang",
+      "label": "Clang"
+    },
+    {
+      "binary_sha256": "177e44eb84769d685d3d5a7682f313e0bc20f8c2f25ca347627db9e670633db6",
+      "executable": "/home/user/rucc-audit-bin/rucc-4f9f5d85",
+      "flags": [
+        "-I/home/user/.cache/lccc/agent-toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "-O2"
+      ],
+      "key": "rucc",
+      "label": "LCCC candidate: rucc"
+    }
+  ],
+  "host": {
+    "cpu_models": [
+      "Intel(R) Xeon(R) Processor @ 2.60GHz"
+    ],
+    "hypervisor_detected": true,
+    "pinning": {
+      "allowed_cpus": [
+        0,
+        1
+      ],
+      "applied": true,
+      "cpu": 0,
+      "reason": "taskset pinning",
+      "requested": "0"
+    },
+    "platform": "Linux-6.1.158+-x86_64-with-glibc2.36",
+    "swap_active": true
+  },
+  "limitations": [
+    "Two vCPU Xeon virtual host, not the target Raptor Lake part.",
+    "No hardware PMU counters; wall-clock and child CPU time only.",
+    "Short cases (<20 ms median) carry launch/scheduler noise; outliers retained.",
+    "ICX/ICC, lld, clang++ and Compiler Explorer were unavailable in this sandbox.",
+    "Rucc was built from pinned GitHub dependency sources, not the official release asset or crates.io checksums.",
+    "Twelve workload-derived kernels are not a whole-application benchmark score."
+  ],
+  "measurement_class": "VM screening; PMU not probed; no physical i7-14700KF evidence",
+  "metric": "generated-code wall-clock screening; NOT a hardware PMU or whole-application ranking",
+  "raw_artifacts": {
+    "artifact_dir": {
+      "committed": false,
+      "workspace_path": "/home/user/rucc-timed-artifacts"
+    },
+    "timed_json": {
+      "bytes": 676555,
+      "committed": false,
+      "reason": "exceeds 100 KiB bulk-evidence threshold; summary retained instead",
+      "sha256": "f1b6ea8c34d2827c365204c07758a4d5bc43cedf354f135f4a22441c9f970d3e",
+      "workspace_path": "/home/user/rucc-timed.json"
+    },
+    "timed_markdown": {
+      "sha256": "6828cb9ab197875c9d6ac025d965a6c3684350f18ac1d4e5c3aae6efe85882d1",
+      "workspace_path": "/home/user/rucc-timed.md"
+    }
+  },
+  "revisions": {
+    "lccc": "dcd1822c4c9f07ed4284eb96d0347a6bf97e03c1",
+    "rucc": "4f9f5d857349ffd8ddfdcdbd79d6dadb87dc50e9",
+    "toolchain_cache_tag": "harness-cache-8",
+    "toolchain_cache_tag_sha": "d66c5ac881e2168790b8e228dd548f025ab83e59"
+  },
+  "rucc_build": {
+    "codegen_units": 256,
+    "debug": 0,
+    "dependency_pins_file": "/home/user/rucc-deps/PINS.txt",
+    "dependency_source": "GitHub tags/branches matching all 13 locked crate versions; crates.io unavailable; not byte-identical crate archives",
+    "incremental": true,
+    "jobs": 2,
+    "linker": "mold",
+    "lto": "off",
+    "opt_level": 1,
+    "profile": "release"
+  },
+  "runner_aggregate_lccc_vs_best_reference": {
+    "arithmetic_mean_ratio": 1.0642514615918326,
+    "best": {
+      "benchmark": "gzip_crc32",
+      "ratio": 0.9037106127235135,
+      "reference": "gcc"
+    },
+    "geometric_mean_ratio": 1.0609630755569421,
+    "interpretation": "LCCC / fastest available reference paired median; <1 means LCCC faster",
+    "n_correct_benchmarks": 12,
+    "worst": {
+      "benchmark": "sqlite_vdbe_serial",
+      "ratio": 1.2325098690870893,
+      "reference": "clang"
+    }
+  },
+  "runner_aggregate_lccc_vs_gcc": {
+    "arithmetic_mean_ratio": 1.0228575721182664,
+    "best": {
+      "benchmark": "expat_siphash24",
+      "ratio": 0.8694890080446795
+    },
+    "geometric_mean_ratio": 1.019246973593187,
+    "interpretation": "LCCC/GCC paired median ratios; <1 means LCCC faster",
+    "n_correct_benchmarks": 12,
+    "worst": {
+      "benchmark": "sqlite_vdbe_serial",
+      "ratio": 1.2213235704148975
+    }
+  },
+  "schema": "lccc-rucc-audit-summary/1",
+  "settings": {
+    "common_cflags": [],
+    "compiler_order_policy": "randomized balanced two-round blocks for two compilers; independent shuffle otherwise",
+    "opt": "-O2",
+    "outlier_policy": "MAD outliers counted and reported; none are removed",
+    "reps": 7,
+    "seed": 20260810,
+    "skip_perf": false,
+    "timer": "time.perf_counter_ns wall-clock plus resource.RUSAGE_CHILDREN CPU time",
+    "warmup": 2
+  },
+  "timestamp_utc": "2026-11-08T22:41:47.533364+00:00"
+}

@@ -2435,6 +2435,24 @@ impl Driver {
         // `-D`s so an explicit `-D__STDC_VERSION__=...` still wins.
         preprocessor.set_c23(self.c23_dialect());
         preprocessor.set_gnu_extensions(self.gnu_extensions);
+        // Feature queries answer for the selected dialect, not for a
+        // user-redefined __STDC_VERSION__ macro.  C89/C90 have no macro value.
+        let stdc = self
+            .stdc_version
+            .flatten()
+            .and_then(|v| v.trim_end_matches('L').parse::<u32>().ok())
+            .unwrap_or(0);
+        let pedantic_errors = self
+            .effective_warning_config()
+            .is_dialect_error(crate::common::error::WarningKind::Pedantic);
+        let ubsan = !self
+            .sanitize_enabled
+            .intersection(
+                crate::ir::lowering::ubsan::UbsanFlags::UNDEFINED_GROUP
+                    .union(crate::ir::lowering::ubsan::UbsanFlags::BOUNDS_STRICT),
+            )
+            .is_empty();
+        preprocessor.set_feature_query_mode(stdc >= 201112, stdc >= 202311, pedantic_errors, ubsan);
         if let Some(v) = self.stdc_version {
             match v {
                 Some(val) => preprocessor.define_macro("__STDC_VERSION__", val),

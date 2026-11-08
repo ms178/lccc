@@ -789,6 +789,13 @@ impl WarningConfig {
         self.not_errors.insert(kind);
     }
 
+    /// Whether `kind` is a dialect default error (`-pedantic-errors` and the
+    /// GCC C99 default-error class), as opposed to a user `-Werror=` promotion.
+    /// `__has_extension` collapses to `__has_feature` only for the former.
+    pub fn is_dialect_error(&self, kind: WarningKind) -> bool {
+        self.default_errors.contains(&kind) && !self.not_errors.contains(&kind)
+    }
+
     /// GCC 16.2 expands `-Werror=<group>` to error classifications for each
     /// leaf as well as enabling the group. Unlike enablement specificity,
     /// these explicit classifications replace earlier per-leaf demotions.

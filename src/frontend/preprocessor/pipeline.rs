@@ -193,6 +193,8 @@ pub struct Preprocessor {
     pub(super) dep_files: Vec<(PathBuf, bool)>,
     /// Dedup set for dep_files (first-open order preserved by the Vec).
     pub(super) dep_seen: FxHashSet<PathBuf>,
+    /// Mode for `__has_feature` / `__has_extension` capability queries.
+    pub(super) feature_mode: super::feature_queries::FeatureMode,
 }
 
 impl Preprocessor {
@@ -233,6 +235,7 @@ impl Preprocessor {
             weak_pragmas: Vec::new(),
             fenv_access_requested: false,
             redefine_extname_pragmas: Vec::new(),
+            feature_mode: super::feature_queries::FeatureMode::default(),
             force_include_output: String::new(),
             include_resolve_cache: FxHashMap::default(),
             include_guard_macros: FxHashMap::default(),
@@ -1087,6 +1090,26 @@ impl Preprocessor {
     /// what GCC 16.2 does in `-std=c17`.
     pub fn set_gnu_extensions(&mut self, gnu: bool) {
         super::utils::set_gnu_dialect(gnu);
+    }
+
+    /// Select the mode used by `__has_feature` / `__has_extension`.
+    ///
+    /// This is independent of the user-overridable `__STDC_VERSION__` macro:
+    /// the query answers for the dialect the driver selected, not for a macro
+    /// the translation unit happened to redefine.
+    pub fn set_feature_query_mode(
+        &mut self,
+        c11: bool,
+        c23: bool,
+        pedantic_errors: bool,
+        ubsan: bool,
+    ) {
+        self.feature_mode = super::feature_queries::FeatureMode {
+            c11,
+            c23,
+            pedantic_errors,
+            ubsan,
+        };
     }
 
     /// Set the filename for __FILE__ and __BASE_FILE__ macros and set as the base include directory.

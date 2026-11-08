@@ -499,5 +499,251 @@ deny_diag ".S #pragma message" "pm-S"
 run_diag -c -Werror "$tmp/pwarn.S" -o "$tmp/pwarn.o"
 [ "$rc" -ne 0 ] || fail "-Werror promotes a .S warning" "exit 0"
 
+# --- 10. __has_feature / __has_extension capability queries -----------------
+# GCC 16.2 mode rules, gated on LCCC's implemented capabilities.  Three
+# independent gates are pinned here because conflating them is the defect this
+# section exists to prevent:
+#   * implemented here?  unimplemented rows answer 0 in EVERY mode;
+#   * available in this TU?  a sanitizer row gates BOTH operators;
+#   * standard in this dialect?  gates the FEATURE answer only -- C99 still
+#     accepts _Atomic as an extension, so __has_extension(c_atomic) is 1 there.
+# -pedantic-errors collapses the extension answer onto the feature answer;
+# -Werror=pedantic does not.  GCC macro-expands the operand (Clang does not);
+# LCCC follows its GCC persona.  Expected values were measured against
+# gcc-16.2 and clang-23.1.5 and are retained in
+# engineering/evidence/2026-11-08-rucc-audit/feature-query-oracle.json.
+cat >"$tmp/feature.c" <<'C'
+#define FEAT c_atomic
+#define CHAIN FEAT
+#define ARMOURED __c_atomic__
+int hf_c_alignas = __has_feature(c_alignas);
+int he_c_alignas = __has_extension(c_alignas);
+int hf_c_alignof = __has_feature(c_alignof);
+int he_c_alignof = __has_extension(c_alignof);
+int hf_c_atomic = __has_feature(c_atomic);
+int he_c_atomic = __has_extension(c_atomic);
+int hf_c_generic = __has_feature(c_generic_selections);
+int he_c_generic = __has_extension(c_generic_selections);
+int hf_c_static_assert = __has_feature(c_static_assert);
+int he_c_static_assert = __has_extension(c_static_assert);
+int hf_c_thread_local = __has_feature(c_thread_local);
+int he_c_thread_local = __has_extension(c_thread_local);
+int hf_binlit = __has_feature(cxx_binary_literals);
+int he_binlit = __has_extension(cxx_binary_literals);
+int hf_tls = __has_feature(tls);
+int he_tls = __has_extension(tls);
+int hf_asmgoto = __has_feature(gnu_asm_goto_with_outputs);
+int he_asmgoto = __has_extension(gnu_asm_goto_with_outputs);
+int hf_asmgoto_full = __has_feature(gnu_asm_goto_with_outputs_full);
+int he_asmgoto_full = __has_extension(gnu_asm_goto_with_outputs_full);
+int hf_ubsan = __has_feature(undefined_behavior_sanitizer);
+int he_ubsan = __has_extension(undefined_behavior_sanitizer);
+int hf_asan = __has_feature(address_sanitizer);
+int he_asan = __has_extension(address_sanitizer);
+int hf_hwasan = __has_feature(hwaddress_sanitizer);
+int hf_lsan = __has_feature(leak_sanitizer);
+int hf_tsan = __has_feature(thread_sanitizer);
+int hf_depmsg = __has_feature(attribute_deprecated_with_message);
+int he_depmsg = __has_extension(attribute_deprecated_with_message);
+int hf_unavailmsg = __has_feature(attribute_unavailable_with_message);
+int hf_enumattr = __has_feature(enumerator_attributes);
+int he_enumattr = __has_extension(enumerator_attributes);
+int hf_unknown = __has_feature(modules);
+int he_unknown = __has_extension(modules);
+int hf_armoured = __has_feature(__c_atomic__);
+int he_armoured = __has_extension(__c_atomic__);
+int hf_half_armour = __has_feature(__c_atomic);
+int he_half_armour = __has_extension(c_atomic__);
+int hf_macro = __has_feature(FEAT);
+int he_macro = __has_extension(FEAT);
+int hf_chain = __has_feature(CHAIN);
+int hf_armoured_macro = __has_feature(ARMOURED);
+#define QUERY(name) __has_feature(name)
+int hf_alias = QUERY(c_atomic);
+#define OP __has_feature
+int hf_op_alias = OP(FEAT);
+#if __has_feature(c_atomic)
+int if_c_atomic = 1;
+#else
+int if_c_atomic = 0;
+#endif
+#if __has_extension(c_atomic)
+int if_ext_c_atomic = 1;
+#else
+int if_ext_c_atomic = 0;
+#endif
+#if __has_feature(FEAT)
+int if_macro = 1;
+#else
+int if_macro = 0;
+#endif
+#if __has_feature(cxx_binary_literals)
+int if_binlit = 1;
+#else
+int if_binlit = 0;
+#endif
+#ifdef __has_feature
+int ifdef_op = 1;
+#else
+int ifdef_op = 0;
+#endif
+C
+
+# Per-key assertion: order-independent and precise about which row diverged.
+# A contiguous-fragment match would silently depend on declaration order.
+expect_feature() {
+    local label=$1 want=$2
+    shift 2
+    local got kv key val
+    got=$("$CCC" -E "$tmp/feature.c" "$@" 2>/dev/null | grep -v '^#' | compact)
+    for kv in $want; do
+        key=${kv%%=*}
+        val=${kv#*=}
+        if ! grep -qE "(^|;)int${key}=${val};" <<<"$got"; then
+            fail "$label [$key]" "got: $got" "want: int${key}=${val};"
+        fi
+    done
+}
+
+# Expectation sets are DATA measured from gcc-16.2, not recomputed from the
+# implementation's own logic (that would mirror the bug it is meant to catch).
+# Pre-C11: the C11/C23 rows are extensions only.
+F_PRE11='hf_c_alignas=0 he_c_alignas=1 hf_c_alignof=0 he_c_alignof=1 hf_c_atomic=0 he_c_atomic=1 hf_c_generic=0 he_c_generic=1 hf_c_static_assert=0 he_c_static_assert=1 hf_c_thread_local=0 he_c_thread_local=1 hf_binlit=0 he_binlit=1 hf_tls=1 he_tls=1 hf_asmgoto=0 he_asmgoto=1 hf_asmgoto_full=0 he_asmgoto_full=1 hf_armoured=0 he_armoured=1 hf_macro=0 he_macro=1 hf_chain=0 hf_armoured_macro=0 if_c_atomic=0 if_ext_c_atomic=1 if_macro=0 if_binlit=0'
+F_PRE11_PE='hf_c_alignas=0 he_c_alignas=0 hf_c_alignof=0 he_c_alignof=0 hf_c_atomic=0 he_c_atomic=0 hf_c_generic=0 he_c_generic=0 hf_c_static_assert=0 he_c_static_assert=0 hf_c_thread_local=0 he_c_thread_local=0 hf_binlit=0 he_binlit=0 hf_tls=1 he_tls=1 hf_asmgoto=0 he_asmgoto=0 hf_asmgoto_full=0 he_asmgoto_full=0 hf_armoured=0 he_armoured=0 hf_macro=0 he_macro=0 if_c_atomic=0 if_ext_c_atomic=0 if_macro=0 if_binlit=0'
+# C11..C17: the C11 rows are features; binary literals are still an extension.
+F_C11='hf_c_alignas=1 he_c_alignas=1 hf_c_alignof=1 he_c_alignof=1 hf_c_atomic=1 he_c_atomic=1 hf_c_generic=1 he_c_generic=1 hf_c_static_assert=1 he_c_static_assert=1 hf_c_thread_local=1 he_c_thread_local=1 hf_binlit=0 he_binlit=1 hf_tls=1 he_tls=1 hf_asmgoto=0 he_asmgoto=1 hf_asmgoto_full=0 he_asmgoto_full=1 hf_armoured=1 he_armoured=1 hf_macro=1 he_macro=1 hf_chain=1 hf_armoured_macro=1 if_c_atomic=1 if_ext_c_atomic=1 if_macro=1 if_binlit=0'
+F_C11_PE='hf_c_alignas=1 he_c_alignas=1 hf_c_alignof=1 he_c_alignof=1 hf_c_atomic=1 he_c_atomic=1 hf_c_generic=1 he_c_generic=1 hf_c_static_assert=1 he_c_static_assert=1 hf_c_thread_local=1 he_c_thread_local=1 hf_binlit=0 he_binlit=0 hf_tls=1 he_tls=1 hf_asmgoto=0 he_asmgoto=0 hf_asmgoto_full=0 he_asmgoto_full=0 hf_armoured=1 he_armoured=1 hf_macro=1 he_macro=1 if_c_atomic=1 if_ext_c_atomic=1 if_macro=1 if_binlit=0'
+# C23: binary literals become a feature too.
+F_C23='hf_c_alignas=1 he_c_alignas=1 hf_c_alignof=1 he_c_alignof=1 hf_c_atomic=1 he_c_atomic=1 hf_c_generic=1 he_c_generic=1 hf_c_static_assert=1 he_c_static_assert=1 hf_c_thread_local=1 he_c_thread_local=1 hf_binlit=1 he_binlit=1 hf_tls=1 he_tls=1 hf_asmgoto=0 he_asmgoto=1 hf_asmgoto_full=0 he_asmgoto_full=1 hf_armoured=1 he_armoured=1 hf_macro=1 he_macro=1 hf_chain=1 hf_armoured_macro=1 if_c_atomic=1 if_ext_c_atomic=1 if_macro=1 if_binlit=1'
+F_C23_PE='hf_c_alignas=1 he_c_alignas=1 hf_c_alignof=1 he_c_alignof=1 hf_c_atomic=1 he_c_atomic=1 hf_c_generic=1 he_c_generic=1 hf_c_static_assert=1 he_c_static_assert=1 hf_c_thread_local=1 he_c_thread_local=1 hf_binlit=1 he_binlit=1 hf_tls=1 he_tls=1 hf_asmgoto=0 he_asmgoto=0 hf_asmgoto_full=0 he_asmgoto_full=0 hf_armoured=1 he_armoured=1 hf_macro=1 he_macro=1 if_c_atomic=1 if_ext_c_atomic=1 if_macro=1 if_binlit=1'
+# Rows that must stay 0 in every mode until LCCC implements the capability.
+F_ZEROS='hf_ubsan=0 he_ubsan=0 hf_asan=0 he_asan=0 hf_hwasan=0 hf_lsan=0 hf_tsan=0 hf_depmsg=0 he_depmsg=0 hf_unavailmsg=0 hf_enumattr=0 he_enumattr=0 hf_unknown=0 he_unknown=0 hf_half_armour=0 he_half_armour=0 hf_alias=0 hf_op_alias=0 ifdef_op=1'
+
+for std in c89 gnu89 c99 gnu99; do
+    expect_feature "feature $std" "$F_PRE11" "-std=$std"
+    expect_feature "feature $std -pedantic-errors" "$F_PRE11_PE" "-std=$std" -pedantic-errors
+done
+for std in c11 gnu11 c17 gnu17; do
+    expect_feature "feature $std" "$F_C11" "-std=$std"
+    expect_feature "feature $std -pedantic-errors" "$F_C11_PE" "-std=$std" -pedantic-errors
+done
+for std in c23 gnu23; do
+    expect_feature "feature $std" "$F_C23" "-std=$std"
+    expect_feature "feature $std -pedantic-errors" "$F_C23_PE" "-std=$std" -pedantic-errors
+done
+# The default dialect is gnu23, and a user -D__STDC_VERSION__ must not move it.
+expect_feature "feature default dialect" "$F_C23"
+expect_feature "feature ignores -D__STDC_VERSION__" "$F_C23" -D__STDC_VERSION__=199901L
+# -Werror=pedantic upgrades diagnostics; it does not withdraw extensions.
+expect_feature "feature -Werror=pedantic keeps extensions" "$F_C11" -std=gnu11 -Werror=pedantic
+expect_feature "feature -Werror=pedantic c99 keeps extensions" "$F_PRE11" -std=c99 -Werror=pedantic
+# Truthful zeros hold in every dialect class and under -pedantic-errors.
+for std in c89 gnu11 gnu23; do
+    zeros=${F_ZEROS/hf_alias=0/hf_alias=1}
+    zeros=${zeros/hf_op_alias=0/hf_op_alias=1}
+    if [ "$std" = c89 ]; then
+        zeros=${zeros/hf_alias=1/hf_alias=0}
+        zeros=${zeros/hf_op_alias=1/hf_op_alias=0}
+    fi
+    expect_feature "feature $std truthful zeros" "$zeros" "-std=$std"
+    expect_feature "feature $std truthful zeros -pedantic-errors" "$zeros" "-std=$std" -pedantic-errors
+done
+# Sanitizer rows: the undefined-behavior group and its members gate BOTH
+# operators; float-divide-by-zero alone is not that row in GCC 16.2.  LCCC
+# implements UBSan in TRAP mode only (no libubsan runtime), so the active
+# sanitizer is spelled with -fsanitize-trap; without it the driver rejects the
+# flag, which is the truthful answer for an unavailable runtime.
+expect_feature "feature ubsan group" 'hf_ubsan=1 he_ubsan=1' -fsanitize=undefined -fsanitize-trap=all
+expect_feature "feature ubsan member" 'hf_ubsan=1 he_ubsan=1' -fsanitize=signed-integer-overflow -fsanitize-trap=all
+expect_feature "feature ubsan bounds-strict" 'hf_ubsan=1 he_ubsan=1' -fsanitize=bounds-strict -fsanitize-trap=all
+expect_feature "feature ubsan survives -pedantic-errors" 'hf_ubsan=1 he_ubsan=1' -fsanitize=undefined -fsanitize-trap=all -pedantic-errors
+expect_feature "feature ubsan legacy trap flag" 'hf_ubsan=1 he_ubsan=1' -fsanitize=undefined -fsanitize-undefined-trap-on-error
+expect_feature "feature float-divide-by-zero is not the ubsan row" 'hf_ubsan=0 he_ubsan=0' -fsanitize=float-divide-by-zero -fsanitize-trap=all
+expect_feature "feature no sanitizer means no ubsan row" 'hf_ubsan=0 he_ubsan=0' -fsanitize-trap=all
+# An unavailable sanitizer runtime is rejected, never silently advertised.
+run_diag -E -fsanitize=undefined "$tmp/feature.c"
+[ "$rc" -ne 0 ] || fail "ubsan without trap mode must be rejected" "exit 0"
+want_diag "ubsan runtime is unavailable" "requires trap mode"
+run_diag -E -fsanitize=address "$tmp/feature.c"
+[ "$rc" -ne 0 ] || fail "address sanitizer must be rejected" "exit 0"
+want_diag "address sanitizer is unavailable" "is not supported"
+# A string literal is not an operator invocation.
+if ! "$CCC" -E -std=gnu23 "$tmp/feature.c" 2>/dev/null | grep -qF 'int hf_c_atomic = 1;'; then
+    fail "feature code-line expansion" "expected 'int hf_c_atomic = 1;' in -E output"
+fi
+cat >"$tmp/feature_literal.c" <<'C'
+const char *s = "__has_feature(c_atomic) __has_extension(tls)";
+int c = '__has_feature';
+C
+if ! "$CCC" -E -std=gnu23 "$tmp/feature_literal.c" 2>/dev/null \
+    | grep -qF '"__has_feature(c_atomic) __has_extension(tls)"'; then
+    fail "feature literals untouched" "string literal was rewritten"
+fi
+
+# Malformed operands are constraint violations: GCC errors and answers 0.
+# Recovery must consume the whole balanced operand (no stray ')' downstream).
+cat >"$tmp/feature_bad.c" <<'C'
+int a = __has_feature();
+int b = __has_feature(123);
+int c = __has_feature((c_atomic));
+int d = __has_feature c_atomic;
+int e = __has_feature(c_atomic tls);
+int g = __has_extension();
+int after = 1;
+int f = __has_feature(c_atomic;
+C
+run_diag -E -std=gnu23 "$tmp/feature_bad.c"
+[ "$rc" -ne 0 ] || fail "feature malformed operands are errors" "exit 0"
+want_diag "feature empty operand" "macro '__has_feature' requires an identifier"
+want_diag "feature numeric operand" "macro '__has_feature' requires an identifier"
+want_diag "feature nested operand" "macro '__has_feature' requires an identifier"
+want_diag "feature missing paren" "missing '(' after '__has_feature'"
+want_diag "feature two names" "expected ')' after 'c_atomic'"
+want_diag "feature missing close" "expected ')' after 'c_atomic'"
+want_diag "extension empty operand" "macro '__has_extension' requires an identifier"
+
+# GCC macro-expands __has_builtin / __has_attribute operands too (measured);
+# the #if path must agree with the code-line path.
+cat >"$tmp/has_macro_arg.c" <<'C'
+#define BUILTIN memcpy
+#define ATTR deprecated
+#define SCOPED gnu::deprecated
+int b_code = __has_builtin(BUILTIN);
+int b_unprefixed = __has_builtin(memcpy);
+int b_prefixed = __has_builtin(__builtin_memcpy);
+int b_unknown = __has_builtin(not_a_builtin);
+int a_code = __has_attribute(ATTR);
+int s_code = __has_attribute(SCOPED);
+#if __has_builtin(BUILTIN)
+int b_if = 1;
+#else
+int b_if = 0;
+#endif
+#if __has_attribute(ATTR)
+int a_if = 1;
+#else
+int a_if = 0;
+#endif
+#if __has_attribute(SCOPED)
+int s_if = 1;
+#else
+int s_if = 0;
+#endif
+C
+got=$("$CCC" -E -std=gnu23 "$tmp/has_macro_arg.c" 2>/dev/null | grep -v '^#' | compact)
+for kv in b_code=1 b_if=1 b_unprefixed=1 b_prefixed=1 b_unknown=0 a_if=1 s_code=1 s_if=1; do
+    key=${kv%%=*}; val=${kv#*=}
+    grep -qE "(^|;)int${key}=${val};" <<<"$got" \
+        || fail "has_* macro operand [$key]" "got: $got" "want: int${key}=${val};"
+done
+
+# Data-driven differential against the committed GCC 16.2 oracle matrix:
+# every implemented row must match GCC, every unimplemented row must be 0,
+# and the #if path must agree with the code-line path in all 18 modes.
+here=$(cd "$(dirname "$0")" && pwd)
+if ! python3 "$here/check_feature_query_oracle.py" --lccc "$CCC"; then
+    status=1
+fi
+
 [ "$status" -eq 0 ] && echo "frontend-preprocessor: ok"
 exit "$status"

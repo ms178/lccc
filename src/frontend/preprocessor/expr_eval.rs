@@ -69,9 +69,15 @@ impl Preprocessor {
                         let val = self.resolve_has_attribute_call_bytes(bytes, &mut i, true);
                         result.push_str(val);
                     }
-                    "__has_feature" | "__has_extension" => {
-                        self.skip_paren_arg_bytes(bytes, &mut i);
-                        result.push('0');
+                    "__has_feature" => {
+                        let val =
+                            self.resolve_has_feature_call_bytes(bytes, &mut i, false, diag_line);
+                        result.push_str(val);
+                    }
+                    "__has_extension" => {
+                        let val =
+                            self.resolve_has_feature_call_bytes(bytes, &mut i, true, diag_line);
+                        result.push_str(val);
                     }
                     "__has_warning" => {
                         let val = self.resolve_has_warning_call_bytes(bytes, &mut i, diag_line);
@@ -296,9 +302,12 @@ impl Preprocessor {
                 } else if ident == "__has_c_attribute" {
                     let val = self.resolve_has_attribute_call_bytes(bytes, &mut i, true);
                     result.push_str(val);
-                } else if ident == "__has_feature" || ident == "__has_extension" {
-                    self.skip_paren_arg_bytes(bytes, &mut i);
-                    result.push('0');
+                } else if ident == "__has_feature" {
+                    let val = self.resolve_has_feature_call_bytes(bytes, &mut i, false, diag_line);
+                    result.push_str(val);
+                } else if ident == "__has_extension" {
+                    let val = self.resolve_has_feature_call_bytes(bytes, &mut i, true, diag_line);
+                    result.push_str(val);
                 } else if ident == "__has_include" {
                     let val = self.resolve_has_include_call_bytes(bytes, &mut i, false);
                     result.push_str(val);
@@ -340,27 +349,131 @@ impl Preprocessor {
         while *i < len && is_ident_cont_byte(bytes[*i]) {
             *i += 1;
         }
-        let name = bytes_to_str(bytes, start, *i);
+        let raw = bytes_to_str(bytes, start, *i);
         while *i < len && bytes[*i] != b')' {
             *i += 1;
         }
         if *i < len {
             *i += 1;
         }
+        // GCC 16.2 macro-expands the operand (measured: `#define B memcpy`
+        // makes `__has_builtin(B)` answer 1, in `#if` and in code alike).
+        let Some(name) = self.expand_query_identifier(raw) else {
+            return "0";
+        };
+        // GCC 16.2 also answers 1 for the unprefixed library spelling
+        // (`__has_builtin(memcpy)` == `__has_builtin(__builtin_memcpy)`).
+        // Canonicalize through LCCC's own registry so the claim stays
+        // truthful: a name LCCC does not implement still answers 0.
+        let name = Self::canonical_builtin_name(&name);
         // GCC 16.2 conditions many GNU x86 builtins on a target flag
         // (measured: `__has_builtin(__builtin_ia32_maxps256)` is 0 at
         // default and 1 under -mavx, while the call itself already errors
         // without the extension). The availability table mirrors that
         // sweep; the feature macros it names are defined by exactly the
         // same flags GCC uses to answer, implication chain included.
-        if Self::is_supported_builtin(name)
-            && crate::common::x86_builtin_availability::x86_builtin_feature_macro(name)
+        if Self::is_supported_builtin(&name)
+            && crate::common::x86_builtin_availability::x86_builtin_feature_macro(&name)
                 .is_none_or(|feature_macro| self.macros.is_defined(feature_macro))
         {
             "1"
         } else {
             "0"
         }
+    }
+
+    /// Parse `(name)` after `__has_feature` / `__has_extension` and answer
+    /// from the capability table in the driver-selected mode.
+    ///
+    /// GCC 16.2 macro-expands the operand before interpreting it (Clang does
+    /// not), so `#define FEAT c_atomic` makes `__has_feature(FEAT)` answer 1.
+    /// A malformed operand is an error and yields 0; recovery consumes the
+    /// whole balanced operand so no stray token reaches the expression parser.
+    fn resolve_has_feature_call_bytes(
+        &mut self,
+        bytes: &[u8],
+        i: &mut usize,
+        extension: bool,
+        diag_line: usize,
+    ) -> &'static str {
+        let op = if extension {
+            "__has_extension"
+        } else {
+            "__has_feature"
+        };
+        let len = bytes.len();
+        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+            *i += 1;
+        }
+        if *i >= len || bytes[*i] != b'(' {
+            self.query_diag(format!("missing '(' after '{op}'"), diag_line);
+            return "0";
+        }
+        *i += 1;
+        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+            *i += 1;
+        }
+        let start = *i;
+        if *i >= len || !is_ident_start_byte(bytes[*i]) {
+            self.skip_open_paren_arg_bytes(bytes, i);
+            self.query_diag(format!("macro '{op}' requires an identifier"), diag_line);
+            return "0";
+        }
+        while *i < len && is_ident_cont_byte(bytes[*i]) {
+            *i += 1;
+        }
+        let raw = bytes_to_str(bytes, start, *i);
+        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+            *i += 1;
+        }
+        if *i >= len || bytes[*i] != b')' {
+            self.skip_open_paren_arg_bytes(bytes, i);
+            self.query_diag(format!("expected ')' after '{raw}'"), diag_line);
+            return "0";
+        }
+        *i += 1;
+        let Some(name) = self.expand_query_identifier(raw) else {
+            // The operand expanded to something that is not one identifier
+            // (GCC: "expected ')' after ...").  Answer 0, never a guess.
+            self.query_diag(format!("expected ')' after '{raw}'"), diag_line);
+            return "0";
+        };
+        if super::feature_queries::resolve(&name, extension, self.feature_mode) {
+            "1"
+        } else {
+            "0"
+        }
+    }
+
+    /// Push a GCC-worded error for a malformed `__has_*` operand.  These are
+    /// constraint violations: GCC and Clang both reject the translation unit.
+    fn query_diag(&mut self, message: String, diag_line: usize) {
+        self.errors.push(super::pipeline::PreprocessorDiagnostic {
+            kind: crate::common::error::WarningKind::Cpp,
+            file: self.current_file(),
+            line: diag_line,
+            col: 0,
+            message,
+        });
+    }
+
+    /// Macro-expand a `__has_*` identifier operand the way GCC 16.2 does.
+    ///
+    /// The code-line path expands the whole line before resolving operators,
+    /// so this helper is what makes `#if __has_feature(FEAT)` agree with
+    /// `int x = __has_feature(FEAT);`.  Returns `None` when the expansion is
+    /// not exactly one identifier.  A non-macro operand is returned borrowed:
+    /// the common case allocates nothing.
+    fn expand_query_identifier<'a>(&self, name: &'a str) -> Option<std::borrow::Cow<'a, str>> {
+        if self.macros.get(name).is_none() {
+            return is_query_identifier(name).then_some(std::borrow::Cow::Borrowed(name));
+        }
+        let expanded = self.macros.expand_line(name);
+        let trimmed = expanded.trim();
+        if !is_query_identifier(trimmed) {
+            return None;
+        }
+        Some(std::borrow::Cow::Owned(trimmed.to_string()))
     }
 
     /// Parse `(attribute-token)` after `__has_attribute` (`c_syntax` false)
@@ -413,6 +526,30 @@ impl Preprocessor {
         if *i < len {
             *i += 1;
         }
+        // GCC 16.2 macro-expands the operand (measured: `#define ATTR
+        // deprecated` answers 202311 and `#define SCOPED gnu::deprecated`
+        // answers 1).  An unscoped macro may expand to a scoped token, so the
+        // expansion is re-split on '::'; anything else is not an attribute
+        // token and answers 0.
+        let expanded = match (scope, self.macros.get(name)) {
+            (None, Some(_)) => Some(self.macros.expand_line(name)),
+            _ => None,
+        };
+        let (scope, name) = match expanded.as_deref() {
+            Some(text) => {
+                let text = text.trim();
+                match text.split_once("::") {
+                    Some((s, n))
+                        if is_query_identifier(s.trim()) && is_query_identifier(n.trim()) =>
+                    {
+                        (Some(s.trim()), n.trim())
+                    }
+                    _ if is_query_identifier(text) => (None, text),
+                    _ => return "0",
+                }
+            }
+            None => (scope, name),
+        };
         attribute_token_value(scope, name, c_syntax)
     }
 
@@ -545,23 +682,49 @@ impl Preprocessor {
         (self.probe_embed(inner, diag_line) as i64).to_string()
     }
 
-    /// Skip a parenthesized argument (byte-oriented).
-    fn skip_paren_arg_bytes(&self, bytes: &[u8], i: &mut usize) {
+    /// Consume the remainder of an already-opened, malformed `__has_*`
+    /// operand through its *matching* ')' (byte-oriented).  The opening '('
+    /// has already been consumed by the caller; a missing ')' consumes to
+    /// EOL.  Nesting is tracked and string/char literals are skipped whole so
+    /// recovery cannot leave a stray ')' behind or let a quote swallow the
+    /// rest of the line.  The loop is bounded by the slice length: `depth`
+    /// only decrements on ')' and returns at zero, so it cannot underflow.
+    fn skip_open_paren_arg_bytes(&self, bytes: &[u8], i: &mut usize) {
         let len = bytes.len();
-        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+        let mut depth = 1usize;
+        while *i < len {
+            match bytes[*i] {
+                b'"' | b'\'' => {
+                    *i = skip_literal_bytes(bytes, *i, bytes[*i]).min(len);
+                    continue;
+                }
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        *i += 1;
+                        return;
+                    }
+                }
+                _ => {}
+            }
             *i += 1;
         }
-        if *i < len && bytes[*i] == b'(' {
-            *i += 1;
-            let mut depth = 1;
-            while *i < len && depth > 0 {
-                if bytes[*i] == b'(' {
-                    depth += 1;
-                } else if bytes[*i] == b')' {
-                    depth -= 1;
-                }
-                *i += 1;
-            }
+    }
+
+    /// Map an unprefixed library builtin spelling to its `__builtin_` form
+    /// when (and only when) LCCC implements that builtin.  Already-prefixed
+    /// and directly-registered names are returned borrowed: no allocation on
+    /// the common path.
+    fn canonical_builtin_name<'a>(name: &'a str) -> std::borrow::Cow<'a, str> {
+        if name.starts_with("__builtin_") || crate::frontend::sema::builtins::is_builtin(name) {
+            return std::borrow::Cow::Borrowed(name);
+        }
+        let prefixed = format!("__builtin_{name}");
+        if crate::frontend::sema::builtins::is_builtin(&prefixed) {
+            std::borrow::Cow::Owned(prefixed)
+        } else {
+            std::borrow::Cow::Borrowed(name)
         }
     }
 
@@ -754,6 +917,13 @@ fn attribute_base_name(name: &str) -> &str {
         .and_then(|n| n.strip_suffix("__"))
         .filter(|n| !n.is_empty())
         .unwrap_or(name)
+}
+
+/// Is `text` exactly one C identifier (no spaces, operators or punctuation)?
+/// `__has_*` operands must be a single identifier after macro expansion.
+fn is_query_identifier(text: &str) -> bool {
+    let b = text.as_bytes();
+    !b.is_empty() && is_ident_start_byte(b[0]) && b.iter().all(|&c| is_ident_cont_byte(c))
 }
 
 /// The value of `__has_attribute` / `__has_c_attribute` for one attribute

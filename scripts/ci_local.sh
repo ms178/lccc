@@ -67,6 +67,10 @@ export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 export PATH="$CARGO_HOME/bin:$PATH"
 export CARGO_BUILD_JOBS=2
+# Research policy: the fastbuild wrapper must not silently drop to one job on
+# this low-RAM host. ensure_swap.sh installs the OOM backstop; the explicit
+# override keeps the requested two-job REACT cycle.
+export LCCC_BUILD_JOBS=2
 # Same fingerprints for build, normal unit tests and clippy. Debug assertions
 # have their own target directory and explicitly disable incremental state.
 export CARGO_PROFILE_FASTBUILD_DEBUG="${CARGO_PROFILE_FASTBUILD_DEBUG:-0}"

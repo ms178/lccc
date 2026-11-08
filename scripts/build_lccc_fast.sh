@@ -39,9 +39,13 @@ lccc_select_rust_toolchain "$repo_root"
 # count from MemTotal instead of a constant keeps the 2-job policy on any host
 # that can actually hold two compilers and degrades to 1 where it cannot.
 # Swap is deliberately NOT counted: it prevents an OOM kill, it does not make a
-# second resident compiler fast. LCCC_BUILD_JOBS is the explicit override.
+# second resident compiler fast. LCCC_BUILD_JOBS is an EXPLICIT override: when
+# the caller sets it, the memory heuristic must not silently reduce it (the
+# research policy asks for exactly -j2 plus an installed swap backstop). The
+# default remains memory-bounded for unattended hosts.
 lccc_build_jobs() {
-    local requested=${LCCC_BUILD_JOBS:-2} mem_kib per_job_kib fits
+    local requested=${LCCC_BUILD_JOBS:-2} mem_kib per_job_kib fits explicit=0
+    [[ -n ${LCCC_BUILD_JOBS:-} ]] && explicit=1
     case $requested in
         ''|*[!0-9]*) requested=2 ;;
     esac
@@ -49,6 +53,13 @@ lccc_build_jobs() {
     ((requested <= 2)) || requested=2
     mem_kib=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)
     case $mem_kib in ''|*[!0-9]*) mem_kib=0 ;; esac
+    if ((explicit)); then
+        if ((requested == 2 && mem_kib > 0 && mem_kib < 7000 * 1024)); then
+            printf '%s\n' "note: explicit LCCC_BUILD_JOBS=2 on a small host; swap is the OOM backstop, not a speed claim" >&2
+        fi
+        printf '%s' "$requested"
+        return 0
+    fi
     # 3.5 GiB per resident rustc, measured on this crate.
     per_job_kib=$((3500 * 1024))
     if ((mem_kib > 0)); then
