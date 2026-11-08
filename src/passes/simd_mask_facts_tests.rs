@@ -5915,7 +5915,11 @@ fn constant_true_prefix_masked_stores_narrow_to_an_unmasked_copy() {
         // Non-prefix mixed masks refuse (the hardware leaves those bytes
         // untouched, so an unmasked copy would clobber them).
         for hole in [1u32, 3, 7] {
-            let k = ((1u64 << width) - 1) & !(1u64 << hole);
+            // Use the production helper rather than re-deriving the mask:
+            // `1u64 << width` overflows at width == 64. With overflow-checks it
+            // panics; in release it wraps to `1 << 0`, so the mask became 0 and
+            // the "must refuse" assertion below passed for the wrong reason.
+            let k = lane_mask(width as u32) & !(1u64 << hole);
             let f = masked_family_function(
                 op,
                 vec![

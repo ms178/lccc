@@ -2,9 +2,18 @@
 
 **Status:** implemented and measured. x86-64 peephole only.
 
+**Rebase note.** This work started on `9095b48`, where the shape appeared at 26
+sites. While it was in review, main advanced to `b19f76f` (#1135/#1136), which
+independently fixed the two `narrow_copy_fold.rs` sites — and fixed them better,
+by dropping the copy outright rather than probing. Those two conflicts were
+resolved **in favour of upstream**; its version strictly dominates (no
+allocation and no second parse). This PR therefore carries the remaining **24
+sites** across 6 files. The original 26-site measurement is retained below only
+where explicitly labelled.
+
 ## The defect
 
-26 sites in `src/backend/x86/codegen/peephole/passes/` had this shape:
+26 sites (24 after the rebase) in `src/backend/x86/codegen/peephole/passes/` had this shape:
 
 ```rust
 let load = infos[i].trimmed(store.get(i)).to_string();   // heap copy of EVERY line
@@ -41,7 +50,7 @@ classified:
 
 That yields three treatments, best first:
 
-**(1) Delete the allocation entirely — 14 sites.** For the seven parsers that
+**(1) Delete the allocation entirely — 13 sites (14 before the rebase).** For the seven parsers that
 return no borrow of their input, the `.to_string()` was *never* needed. This is a
 pre-existing missed optimization, not just a deferred cost:
 
@@ -61,7 +70,7 @@ therefore permits parsing the borrowed text directly. `is_full_flag_clobber`
 returns `bool` and its argument had no other use, so the copy is simply inlined
 away.
 
-**(2) Probe, then allocate only for candidates — 12 sites.** Here the copy is
+**(2) Probe, then allocate only for candidates — 11 sites (12 before the rebase).** Here the copy is
 genuinely load-bearing. In `load_op_fuse.rs`, `mem` is passed to helpers that
 take `store` mutably and into `format!` rewrites far below the parse, so
 borrowing straight from `store` would hold an immutable borrow across those
@@ -96,12 +105,12 @@ let Some((load_q, mem, t_fam)) = parse_memory_load(&load) else {
   reads and I/O: **all 17 are pure functions of their input**. The only `mut`
   bindings are function-local `Vec`/array accumulators.
 
-**(3) Leave alone — 56 sites.** The remaining `trimmed(..).to_string()` calls
+**(3) Leave alone — 55 sites.** The remaining `trimmed(..).to_string()` calls
 either need owned text unconditionally or feed a mutation. Converting them on
 spec would be churn, not an optimization.
 
-Sites touched: `load_op_fuse.rs` (13), `vector_copy.rs` (5), `memory_fold.rs` (3),
-`narrow_copy_fold.rs` (2), `dead_writes.rs` (1), `flag_peepholes.rs` (1),
+Sites touched after the rebase: `load_op_fuse.rs` (13), `vector_copy.rs` (5),
+`memory_fold.rs` (3), `dead_writes.rs` (1), `flag_peepholes.rs` (1),
 `relay_and_lea.rs` (1). The borrow checker is the proof for category (1):
 `cargo check` passes with the copies removed, which is only possible if no
 result borrows the deleted `String`.
@@ -215,6 +224,78 @@ and it does not establish MB-20's ≤35 % peephole criterion; steps 4–5 remain
 
 All four are wired into `.github/workflows/ci.yml`, `scripts/ci_local.sh` and
 `.github/ci-lane-plan.json`.
+
+## Two defects the red CI exposed (both fixed here)
+
+### 1. `alloc_count_shim.c` must not live in `tests/regression/*.c`
+
+`run_regression.py` globs that directory **non-recursively** and compiles every
+match as a standalone program. The interposer is a shared library: no `main()`,
+and it calls `__libc_*` internals, so the SSA corpus failed to link it. Moved to
+`tests/regression/alloc_cost/`, which is outside the glob by construction —
+exactly what the runner's own diagnostic prescribes. Verified: the top-level glob
+no longer matches it, the A/B harness still passes, and its 14 contracts pass.
+
+### 2. `ci_test_report.py` counted leaked C diagnostics as rustc build errors
+
+The assertion lane failed with `57 build error(s) ... (exit 0)` while cargo exited
+0 and all 8431 tests passed. Root cause: the state machine treated every `error:`
+line as a build error until it saw a `---- name stdout ----` section — and that
+header is printed **only when a test fails**. On an all-green run the guard never
+tripped.
+
+Seven **pre-existing** frontend tests deliberately compile invalid C
+(`named_space_target_contract`, five `kr_prototype_tests`,
+`reporting_is_deduplicated`). lccc emits those diagnostics through
+`std::io::stderr()`, which bypasses the harness's `print!`/`eprint!` capture, so
+they land in the cargo log. The old rule labelled them build errors. The count
+was not even stable: **57** with the default parallel harness, **45** with
+`--test-threads=1` on the same binary — so the job's verdict depended on
+interleaving, which is why main had passed by luck.
+
+Fix: end the build phase at cargo's own boundary — `Finished`, `Running` or
+`Doc-tests`. After that, `error:` lines are output from the program under test.
+A genuine rustc failure has no such marker before it, so real build errors are
+still caught, error codes included.
+
+Four self-test cases pin this and are **non-vacuous**: reverting just the guard
+makes the self-test FAIL on exactly those four assertions. The self-test already
+runs in `ci.yml` and `ci_local.sh`. Re-running the report on the real 8431-test
+log now gives **rc=0 and zero build errors**.
+
+### 3. A pre-existing shift overflow that made a SIMD assertion vacuous
+
+The stricter local lane (`debug-assertions` **and** `overflow-checks`) failed
+`simd_mask_facts::tests::constant_true_prefix_masked_stores_narrow_to_an_unmasked_copy`
+after the rebase, in a file this PR does not otherwise touch. Isolated by config:
+CI's own setting (`debug-assertions` only) **passes**; adding `overflow-checks`
+**panics** with `attempt to shift left with overflow` at
+`src/passes/simd_mask_facts_tests.rs:5918`.
+
+The line open-coded a lane mask:
+
+```rust
+let k = ((1u64 << width) - 1) & !(1u64 << hole);   // width can be 64
+```
+
+At `width == 64` this shifts by the full bit width. With overflow-checks it
+panics. **In release it wraps** to `1 << 0`, so `(1 - 1) == 0` and the mask became
+0 — the following "a mask with a hole must refuse" assertion then passed because
+the mask was empty, not because a hole was rejected. The width-64 case was
+therefore vacuous in the shipped build.
+
+The production module already has the one correct implementation,
+`simd_mask_facts::lane_mask`, which special-cases 64 and is already used by two
+sibling tests. The fix reuses it instead of maintaining a second, wrong copy:
+
+```rust
+let k = lane_mask(width as u32) & !(1u64 << hole);
+```
+
+This removes the panic **and** restores the width-64 case to testing a genuinely
+full mask with a hole. The rest of the file was swept for the same class:
+the other `1u64 << n` sites are bounded by `1..width` (max 63) or `1..16`, and
+`mc_oracle`'s `1u64 << i` maxes at bit 63, so this was the only offender.
 
 ## Verification
 
