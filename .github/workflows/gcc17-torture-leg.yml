@@ -25,6 +25,11 @@ on:
         required: false
         default: 'x86_64'
         type: string
+      audit_scaling:
+        description: 'Measure declaration scaling against GCC 16.2'
+        required: false
+        default: false
+        type: boolean
       flags:
         description: 'Comma-separated optimization configurations'
         required: false
@@ -139,6 +144,14 @@ jobs:
           set -euo pipefail
           test "$(cat target/fastbuild/ci-build.commit)" = "$(git rev-parse HEAD)"
           sha256sum -c target/fastbuild/ci-build.sha256
+      - name: Measure declaration scaling against GCC 16.2
+        if: ${{ inputs.audit_scaling && inputs.arch == 'x86_64' }}
+        env:
+          RESULTS_DIR: ${{ runner.temp }}/gcc17-torture/${{ inputs.arch }}
+        run: |
+          python3 scripts/measure_decl_scaling.py \
+            --lccc target/fastbuild/lccc --gcc "$(command -v gcc-16)" \
+            --json "$RESULTS_DIR/declaration-scaling.json"
       - name: Run full GCC 17 compile + execute corpus
         id: campaign
         env:

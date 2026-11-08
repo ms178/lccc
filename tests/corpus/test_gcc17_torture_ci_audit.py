@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT))
 import torture_ci_summary as summary  # noqa: E402
+import measure_decl_scaling as scaling  # noqa: E402
 from tools.corpus.evidence import case_set_digest  # noqa: E402
 
 
@@ -126,6 +127,57 @@ class Inventory(unittest.TestCase):
             self.assertEqual(summary.main([str(self.path)]), 0)
         self.assertEqual(len(output.getvalue().splitlines()), 1)
         self.assertIn("%25", output.getvalue())
+
+
+class ScalingProbe(unittest.TestCase):
+    def test_generated_declarations_are_distinct_and_well_scoped(self):
+        block = scaling.source("block", 3)
+        self.assertEqual(block, "void f(void) {\nint v0;\nint v1;\nint v2;\n}\n")
+        self.assertEqual(scaling.source("external", 2), "extern int v0;\nextern int v1;\n")
+        with self.assertRaises(ValueError):
+            scaling.source("unknown", 1)
+
+    def test_success_records_both_shapes_and_alternates_order(self):
+        with tempfile.TemporaryDirectory() as td:
+            compiler = Path(td) / "compiler"
+            compiler.write_text("#!/bin/sh\nif [ -n \"$CCC_TIME_PHASES\" ]; then echo '[TIME] sema: 0.125s' >&2; fi\n")
+            compiler.chmod(0o755)
+            out = Path(td) / "report.json"
+            proc = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/measure_decl_scaling.py"),
+                 "--lccc", str(compiler), "--gcc", str(compiler), "--sizes", "1",
+                 "--rounds", "2", "--json", str(out)], capture_output=True, text=True, timeout=5)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            report = json.loads(out.read_text())
+            self.assertEqual([r["compiler"] for r in report["results"]],
+                             ["lccc", "gcc", "gcc", "lccc"] * 2)
+            self.assertEqual([r["shape"] for r in report["results"]],
+                             ["block"] * 4 + ["external"] * 4)
+            self.assertEqual([r["sema_s"] for r in report["results"] if r["compiler"] == "lccc"],
+                             [0.125] * 4)
+            self.assertIn("::notice title=Declaration scaling measurement::", proc.stdout)
+
+    def test_failed_compiler_cannot_publish_a_measurement(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "report.json"
+            proc = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/measure_decl_scaling.py"),
+                 "--lccc", "/bin/false", "--gcc", "/bin/true", "--sizes", "1",
+                 "--rounds", "1", "--json", str(out)], capture_output=True, text=True, timeout=5)
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn("exited", proc.stderr)
+            self.assertFalse(out.exists())
+
+    def test_missing_phase_timer_is_not_a_valid_measurement(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "report.json"
+            proc = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/measure_decl_scaling.py"),
+                 "--lccc", "/bin/true", "--gcc", "/bin/true", "--sizes", "1",
+                 "--rounds", "1", "--json", str(out)], capture_output=True, text=True, timeout=5)
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn("phase timer missing", proc.stderr)
+            self.assertFalse(out.exists())
 
 
 if __name__ == "__main__":
