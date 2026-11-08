@@ -1,5 +1,6 @@
 """A green compiler PR must not silently omit kernel validation."""
 import fnmatch
+import re
 from pathlib import Path
 import unittest
 
@@ -102,3 +103,56 @@ class KernelJobIsOnDemandOrWeekly(unittest.TestCase):
         # Regression guard for the visible-skip property: a compiler-only PR
         # must still trigger the workflow, otherwise the skip would be silent.
         self.assertTrue(self.events["pull_request"]["paths"])
+
+
+class KernelVersionPinsAgree(unittest.TestCase):
+    """The three places the pinned kernel release is spelled must agree.
+
+    `scripts/kernel_version.sh` exports the shell fallback, `scripts/
+    lccc_paths.py` the Python one, and the hermetic kernel workflow pins the
+    release it actually builds. The two fallbacks name the SAME tree — the
+    Python one documents itself as mirroring `LCCC_KERNEL_FALLBACK_KVER`, and
+    every boot/bisect harness resolves a tree through one or the other — so a
+    divergence silently points half the tooling at a directory that either
+    does not exist or, worse, holds a DIFFERENT release's sources.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.sh = (ROOT / "scripts/kernel_version.sh").read_text()
+        cls.py = (ROOT / "scripts/lccc_paths.py").read_text()
+        cls.workflow = (
+            ROOT / ".github/workflows/kernel-61858.yml"
+        ).read_text()
+
+    def _sh_fallback(self):
+        match = re.search(r"^LCCC_KERNEL_FALLBACK_KVER=([0-9.]+)$", self.sh, re.M)
+        self.assertIsNotNone(match, "the shell fallback pin must exist")
+        return match.group(1)
+
+    def _py_fallback(self):
+        match = re.search(r'^\s+return "([0-9.]+)"', self.py, re.M)
+        self.assertIsNotNone(match, "the Python fallback pin must exist")
+        return match.group(1)
+
+    def test_shell_and_python_fallbacks_are_identical(self):
+        self.assertEqual(
+            self._sh_fallback(),
+            self._py_fallback(),
+            "the two fallback pins must name the same kernel tree",
+        )
+
+    def test_python_documents_the_shell_fallback_as_its_source(self):
+        # A future edit must not be able to change one pin and leave the
+        # other's documentation claiming it mirrors it.
+        self.assertIn("LCCC_KERNEL_FALLBACK_KVER", self.py)
+
+    def test_fallback_matches_the_release_the_workflow_pins(self):
+        match = re.search(r"^\s+KVER:\s*([0-9.]+)$", self.workflow, re.M)
+        self.assertIsNotNone(match, "the workflow must pin KVER explicitly")
+        self.assertEqual(
+            self._sh_fallback(),
+            match.group(1),
+            "the fallback only names a directory; it must not drift from the "
+            "release the kernel lane actually builds",
+        )

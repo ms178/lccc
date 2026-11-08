@@ -87,13 +87,30 @@ fi
 # that contains vpmaddubsw and the label that follows it, there must be NO
 # 32-byte spill of a YMM register (the accumulator/weights/ones homes are
 # registers — a slot round trip per iteration is the homing bug class).
+#
+# BOTH spellings are checked. The 256-bit result-homing sink emits
+# `vmovups` (frame-aware, and it does not imply the 32-byte alignment a
+# `vmovdqu` mnemonic would); the register-home copy and the reload paths
+# keep `vmovdqu`/`vmovdqa`. Grepping only the SSE2 spelling let a real
+# per-iteration spill through, so the gate matches the whole family and
+# both frame anchors.
 loop_body=$(awk '
     /vpmaddubsw/ {inloop=1}
     inloop {print}
     inloop && /jae|jb |jmp/ && NR>1 {count++; if (count>=1 && /jae|jb /) exit}
 ' "$td/do8fn.s")
-if echo "$loop_body" | grep -cE 'vmovdqu[[:space:]]+%ymm[0-9]+,[[:space:]]*[0-9]+\(%rsp\)' >/dev/null; then
+# Matches every 32-byte store form the backend can emit into a frame slot:
+# vmovups/vmovupd (the frame-aware homing sink), vmovdqu/vmovdqa (register-home
+# copy and reload paths), vmovaps/vmovapd (aligned SSE-domain forms). The
+# destination must be `%ymmN` and the target a `disp(%rsp)`/`disp(%rbp)` slot,
+# so loads, register-to-register copies and 128-bit spills do not match.
+# NOTE the literal `[(]`/`[)]`: under this grep's ERE dialect `\(` opens a
+# group, so the previous `\(%rsp\)` spelling could never match and the check
+# was vacuous.
+YMM_SLOT_STORE='vmov(up|dq|dqa|dqu|ap)(s|d|pd|ps)?[[:space:]]+%ymm[0-9]+,[[:space:]]*[-0-9]+[(]%r(sp|bp)[)]'
+if echo "$loop_body" | grep -qE "$YMM_SLOT_STORE"; then
     echo "FAIL: vec_adler_epic contract — YMM slot store inside the vector loop (homing bug)"
+    echo "$loop_body" | grep -E "$YMM_SLOT_STORE"
     exit 1
 fi
 
