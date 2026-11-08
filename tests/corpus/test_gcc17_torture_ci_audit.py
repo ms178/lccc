@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT))
 import torture_ci_summary as summary  # noqa: E402
+import torture_ci_provenance as provenance  # noqa: E402
 import measure_decl_scaling as scaling  # noqa: E402
 from tools.corpus.evidence import case_set_digest  # noqa: E402
 
@@ -129,6 +130,36 @@ class Inventory(unittest.TestCase):
             with self.assertRaises(ValueError):
                 summary.inventory(self.path)
             self.report = saved
+
+    def test_provenance_demands_complete_unfiltered_identity(self):
+        self.report.update(
+            selection={"tests": [], "filter": "", "from_list": None, "sources": 4,
+                       "selected_sources_sha256": "a" * 64, "dependency_files": 0,
+                       "dependency_digest_truncated": False},
+            dependency_digest="b" * 64, corpus_stamp_sha256="c" * 64,
+            runner_sha256="d" * 64, oracle_environment_sha256="e" * 64,
+            host_image={"os": "ubuntu24", "version": "20261101.1"}, host="Linux-test",
+            tools={"gcc": {"sha256": "f" * 64, "version_returncode": 0},
+                   "lccc": {"sha256": "1" * 64}},
+            link_mode="lccc-ld", append="", runner="", expensive=False,
+            compile_timeout=180, run_timeout=10, jobs=2, environment={})
+        self.write()
+        data = summary.validated_report(self.path)
+        result = provenance.provenance(data)
+        self.assertEqual(result["candidate_sha256"], "1" * 64)
+        self.assertNotIn("candidate_sha256", result["comparison"])
+        for mutation in (
+            lambda d: d["selection"].update(filter="limited"),
+            lambda d: d["selection"].update(dependency_digest_truncated=True),
+            lambda d: d["selection"].update(selected_sources_sha256=None),
+            lambda d: d["host_image"].update(version=None),
+            lambda d: d["tools"]["gcc"].update(sha256=None),
+            lambda d: d.update(oracle_environment_sha256=None),
+        ):
+            bad = json.loads(json.dumps(data))
+            mutation(bad)
+            with self.assertRaises(ValueError):
+                provenance.provenance(bad)
 
     def test_missing_report_is_not_a_pass(self):
         with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
