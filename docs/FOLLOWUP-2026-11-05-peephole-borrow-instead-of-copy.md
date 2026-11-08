@@ -187,8 +187,8 @@ byte-identical and the count reproduces exactly):
 
 | metric | before | after | delta |
 | --- | --- | --- | --- |
-| allocations | 3,154,424 | 2,615,612 | **−538,812 (−17.081 %)** |
-| allocator bytes | 555,926,729 | 547,474,410 | −8,452,319 |
+| allocations | 3,154,424 | 2,616,001 | **−538,423 (−17.069 %)** |
+| allocator bytes | 555,926,414 | 547,496,932 | −8,429,482 |
 | assembly | — | — | **byte-identical, 21/21** |
 
 The i686 half of the patch, measured separately on the dedicated
@@ -200,6 +200,11 @@ is not a vacuous zero):
 | --- | --- | --- | --- |
 | allocations | 973,853 | 961,991 | **−11,862 (−1.218 %)** |
 | assembly | — | — | byte-identical |
+
+Both figures are against the **delivered** tree, rebased on `35a1e23` (which
+merged #1144). Before that rebase the x86-64 figure was −17.081 %; #1144 adds 389
+allocations to the after arm, so the honest number for what ships is **−17.069 %**.
+The 0.012 pp difference is reported rather than rounded away.
 
 For comparison, the merged predecessor rounds measured −9.456 % (x86-64) and
 −0.050 % (i686). Choosing the target by ablation instead of by reading source
@@ -251,7 +256,7 @@ directories produces spurious `-g` diffs.
 | `cargo check` | rc=0, **0 errors / 0 warnings** |
 | `cargo clippy --all-targets -- -D warnings` | **rc=0** |
 | `cargo test --lib` | **8471 passed, 0 failed, 10 ignored** |
-| same + `debug-assertions` + `overflow-checks` | **8485 passed, 0 failed, 10 ignored** |
+| same + `debug-assertions` + `overflow-checks` | **8493 passed, 0 failed, 10 ignored** (post-rebase; main added 8 tests) |
 | ratchet on this tree | **PASS, 372 files** |
 | ratchet on unmodified `782b9f4` | **39 violations** (non-vacuity proof) |
 | ratchet contracts | **34 passed** |
