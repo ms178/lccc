@@ -31,6 +31,39 @@ class DetectionTests(unittest.TestCase):
         self.assertEqual(got[0][1], "load")
         self.assertEqual(got[0][2], "parse_memory_load")
 
+    def test_free_function_idiom_is_matched(self):
+        # i686 uses a free function, not a method. The original regex required a
+        # literal `.trimmed(`, so this whole architecture was scanned vacuously
+        # while five real sites sat in it. This fixture is the real i686 shape.
+        src = (
+            "    let jcc = trimmed(store, &infos[a], a).to_string();\n"
+            "    let Some((cc, true_label)) = parse_condjmp(&jcc) else {\n"
+            "        return false;\n"
+            "    };\n"
+        )
+        got = gate.violations(src)
+        self.assertEqual(len(got), 1, "the i686 free-function shape must be detected")
+        self.assertEqual(got[0][1], "jcc")
+        self.assertEqual(got[0][2], "parse_condjmp")
+
+    def test_free_function_compliant_shape_is_accepted(self):
+        src = (
+            "    let Some((cc, true_label)) = parse_condjmp(trimmed(store, &infos[a], a)) else {\n"
+            "        return false;\n"
+            "    };\n"
+        )
+        self.assertEqual(gate.violations(src), [])
+
+    def test_default_root_covers_every_backend(self):
+        # An x86-only default is what made the gate vacuous for i686.
+        self.assertEqual(gate.PEEPHOLE, gate.ROOT / "src/backend")
+        # The four codegen backends: x86-64, i686, arm/aarch64, riscv.
+        for arch in ("x86", "i686", "arm", "riscv"):
+            self.assertTrue(
+                (gate.PEEPHOLE / arch / "codegen").is_dir(),
+                f"{arch}/codegen must be inside the default scan root",
+            )
+
     def test_indexed_receiver_is_matched(self):
         src = (
             "let t = infos[cmov_i].trimmed(store.get(cmov_i)).to_string();\n"
