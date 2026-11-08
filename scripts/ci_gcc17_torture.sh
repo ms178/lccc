@@ -19,8 +19,8 @@
 #     distribution's rolling `gcc-16` is 16.0.1 on the runner image and would
 #     silently re-base every per-test identity on a version no document claims.
 #
-# Verdict policy. `x86_gcc_torture.py` exits 0 clean, 1 on candidate failures and
-# 2 when the RUN is not evidence (all-skipped, reference preflight, mid-flight
+# Verdict policy. `x86_gcc_torture.py` exits 0 clean, 1 on candidate OR
+# reference failures and 2 when the RUN is not evidence (all-skipped, reference preflight, mid-flight
 # input drift). A full corpus has candidate failures today -- the campaign record
 # inventories 49 x86-64 / 48 i686 compile-leg gaps and known gap 1 says the
 # per-test list, not a collapsed bucket, is the deliverable -- so exit 1 is not
@@ -34,7 +34,21 @@ set -Eeuo pipefail
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_root"
 
-arch=${1:?usage: ci_gcc17_torture.sh x86_64|i686}
+arch=${1:-}
+# Create the artifact directory before the first preflight check. Clear old
+# evidence for this invocation so a retry that dies early cannot upload a
+# previous run's successful reports as if they belonged to the current run.
+case "$arch" in x86_64|i686) result_arch=$arch ;; *) result_arch=unknown ;; esac
+results=${GCC_TORTURE_RESULTS_DIR:-$repo_root/artifacts/gcc17-torture/$result_arch}
+mkdir -p "$results"
+rm -f "$results/preflight-failure.txt"
+die() {
+    local message="ci_gcc17_torture: $*"
+    printf '%s\n' "$message" >&2
+    printf '%s\n' "$message" > "$results/preflight-failure.txt"
+    exit 2
+}
+[[ -n $arch ]] || die 'usage: ci_gcc17_torture.sh x86_64|i686'
 case "$arch" in
     x86_64)
         compiler=${LCCC_X86_64:-$repo_root/target/fastbuild/lccc}
@@ -43,10 +57,11 @@ case "$arch" in
         compiler=${LCCC_I686:-$repo_root/target/fastbuild/lccc-i686}
         ;;
     *)
-        echo "ci_gcc17_torture: unsupported architecture '$arch' (choose x86_64 or i686)" >&2
-        exit 2
+        die "unsupported architecture '$arch' (choose x86_64 or i686)"
         ;;
 esac
+rm -f "$results/$arch-execute.json" "$results/$arch-compile.json" \
+    "$results/$arch-execute.failures.txt" "$results/$arch-compile.failures.txt"
 linker=${LCCC_LD:-$repo_root/target/fastbuild/lccc-ld}
 
 # A downloaded artifact arrives at mode 0644: actions/upload-artifact stores
@@ -59,13 +74,10 @@ linker=${LCCC_LD:-$repo_root/target/fastbuild/lccc-ld}
 require_executable() {
     local what=$1 path=$2
     if [[ ! -e $path ]]; then
-        echo "ci_gcc17_torture: $what not found: $path (was the fastbuild artifact downloaded?)" >&2
-        exit 2
+        die "$what not found: $path (was the fastbuild artifact downloaded?)"
     fi
     if [[ ! -x $path ]]; then
-        echo "ci_gcc17_torture: $what is not executable: $path" >&2
-        echo "ci_gcc17_torture: artifact uploads store content only; the consuming job must chmod +x it" >&2
-        exit 2
+        die "$what is not executable: $path (artifact uploads store content only; restore executable mode)"
     fi
 }
 require_executable compiler "$compiler"
@@ -75,21 +87,13 @@ require_executable "standalone linker" "$linker"
 # per-leg reports name the binary that actually ran rather than a PATH entry.
 gcc_requested=${GCC_BIN:-gcc-16}
 gcc=$(command -v "$gcc_requested" 2>/dev/null || true)
-[[ -n $gcc ]] || {
-    echo "ci_gcc17_torture: reference compiler '$gcc_requested' not found on PATH" >&2
-    exit 2
-}
+[[ -n $gcc ]] || die "reference compiler '$gcc_requested' not found on PATH"
 gcc_version=$("$gcc" -dumpfullversion 2>/dev/null || true)
 if [[ -n ${GCC_TORTURE_GCC_VERSION:-} ]]; then
     case $gcc_version in
         "$GCC_TORTURE_GCC_VERSION" | "$GCC_TORTURE_GCC_VERSION".*) ;;
         *)
-            echo "ci_gcc17_torture: reference compiler $gcc reports '${gcc_version:-no version}'," \
-                "but this lane pins GCC $GCC_TORTURE_GCC_VERSION" >&2
-            echo "ci_gcc17_torture: install the exact release from the tag cache" \
-                "(scripts/ci_install_gcc_oracle.sh --version $GCC_TORTURE_GCC_VERSION) instead of" \
-                "relying on the distribution's rolling gcc-16" >&2
-            exit 2
+            die "reference compiler $gcc reports '${gcc_version:-no version}', but this lane pins GCC $GCC_TORTURE_GCC_VERSION; install it with scripts/ci_install_gcc_oracle.sh"
             ;;
     esac
 fi
@@ -99,31 +103,26 @@ fi
 corpus_ref=${GCC17_TORTURE_REF:-c94b688a83fc84015c6fab8ab0ff142051598fc8}
 
 suite_root=${GCC17_TORTURE_ROOT:-$HOME/.cache/lccc-gcc17}
-results=${GCC_TORTURE_RESULTS_DIR:-$repo_root/artifacts/gcc17-torture/$arch}
 flags=${GCC_TORTURE_FLAGS:--O2}
 jobs=${GCC_TORTURE_JOBS:-2}
 compile_timeout=${GCC_TORTURE_COMPILE_TIMEOUT:-180}
 run_timeout=${GCC_TORTURE_RUN_TIMEOUT:-10}
 filter=${GCC_TORTURE_FILTER:-}
-[[ $jobs =~ ^[1-9][0-9]*$ ]] || { echo "ci_gcc17_torture: invalid GCC_TORTURE_JOBS '$jobs'" >&2; exit 2; }
-[[ $compile_timeout =~ ^[1-9][0-9]*$ ]] || { echo "ci_gcc17_torture: invalid GCC_TORTURE_COMPILE_TIMEOUT '$compile_timeout'" >&2; exit 2; }
-[[ $run_timeout =~ ^[1-9][0-9]*$ ]] || { echo "ci_gcc17_torture: invalid GCC_TORTURE_RUN_TIMEOUT '$run_timeout'" >&2; exit 2; }
-mkdir -p "$results"
+[[ $jobs =~ ^[1-9][0-9]*$ ]] || die "invalid GCC_TORTURE_JOBS '$jobs'"
+[[ $compile_timeout =~ ^[1-9][0-9]*$ ]] || die "invalid GCC_TORTURE_COMPILE_TIMEOUT '$compile_timeout'"
+[[ $run_timeout =~ ^[1-9][0-9]*$ ]] || die "invalid GCC_TORTURE_RUN_TIMEOUT '$run_timeout'"
 
 provision=(python3 "$repo_root/scripts/ensure_gcc_torture_git.py"
     --dest "$suite_root" --ref "$corpus_ref")
-"${provision[@]}"
+"${provision[@]}" || die "corpus provisioning failed for ref '$corpus_ref'; see job log for details"
 
 suite_base="$suite_root/gcc/testsuite/gcc.c-torture"
 execute_suite="$suite_base/execute"
 compile_suite="$suite_base/compile"
-[[ -d $execute_suite && -d $compile_suite ]] || {
-    echo "ci_gcc17_torture: provisioned checkout lacks execute/compile suites" >&2
-    exit 2
-}
+[[ -d $execute_suite && -d $compile_suite ]] || die 'provisioned checkout lacks execute/compile suites'
 
 advisory=${GCC_TORTURE_ADVISORY_FAILURES:-0}
-[[ $advisory =~ ^[01]$ ]] || { echo "ci_gcc17_torture: invalid GCC_TORTURE_ADVISORY_FAILURES '$advisory'" >&2; exit 2; }
+[[ $advisory =~ ^[01]$ ]] || die "invalid GCC_TORTURE_ADVISORY_FAILURES '$advisory'"
 status=0
 run_leg() {
     local mode=$1 suite=$2 report=$3 failure_log=$4
@@ -146,10 +145,10 @@ run_leg() {
         rc=$?
     fi
     if (( rc == 1 )) && [[ $advisory == 1 ]]; then
-        # Exit 1 is "candidate failures", i.e. cases LCCC fails that the
-        # reference accepts. Those are inventoried, not hidden: both files below
-        # are uploaded as the lane's artifact.
-        local note="GCC 17 torture $arch/$mode: candidate failures (runner exit 1);"\
+        # The runner's exit 1 also includes reference-fail: a GCC ICE or
+        # timeout is not proof of an LCCC defect. Do not label every exit 1 as
+        # a candidate failure; consult the per-case report for attribution.
+        local note="GCC 17 torture $arch/$mode: candidate and/or reference failures (runner exit 1);"\
 " inventory in $report and $failure_log; the lane reports them until a"\
 " checked-in baseline makes them blocking"
         echo "ci_gcc17_torture: $note" >&2

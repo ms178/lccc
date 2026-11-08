@@ -140,9 +140,18 @@ jobs:
           test "$(cat target/fastbuild/ci-build.commit)" = "$(git rev-parse HEAD)"
           sha256sum -c target/fastbuild/ci-build.sha256
       - name: Run full GCC 17 compile + execute corpus
+        id: campaign
         env:
           GCC_TORTURE_RESULTS_DIR: ${{ runner.temp }}/gcc17-torture/${{ inputs.arch }}
         run: bash scripts/ci_gcc17_torture.sh "${{ inputs.arch }}"
+      - name: Publish validated case inventory to check annotations
+        if: ${{ steps.campaign.outcome == 'success' }}
+        env:
+          RESULTS_DIR: ${{ runner.temp }}/gcc17-torture/${{ inputs.arch }}
+          ARCH: ${{ inputs.arch }}
+        run: |
+          python3 scripts/torture_ci_summary.py \
+            "$RESULTS_DIR/$ARCH-execute.json" "$RESULTS_DIR/$ARCH-compile.json"
       - name: Publish machine-readable reports and failures
         if: always()
         uses: actions/upload-artifact@v7

@@ -42,6 +42,7 @@ on:
       - 'include/**'
       - 'tests/**'
       - 'scripts/ci_gcc17_torture.sh'
+      - 'scripts/torture_ci_summary.py'
       - 'scripts/ensure_gcc_torture_git.py'
       - 'scripts/x86_gcc_torture.py'
       - 'scripts/x86_gcc_torture_i686.py'
