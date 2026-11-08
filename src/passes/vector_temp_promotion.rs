@@ -29,7 +29,7 @@
 //! optimization rather than changing the program.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::common::types::IrType;
+use crate::common::types::{AddressSpace, IrType};
 use crate::ir::instruction::Instruction;
 use crate::ir::intrinsics::IntrinsicOp;
 use crate::ir::reexports::{BasicBlock, IrFunction, IrModule, Operand, Value};
@@ -889,6 +889,8 @@ fn destination_unobserved_between(
     from: usize,
     to: usize,
     facts: &DestinationFacts,
+    destination: u32,
+    allocas: &FxHashMap<u32, AllocaInfo>,
 ) -> bool {
     if facts.escaped {
         return false;
@@ -898,15 +900,47 @@ fn destination_unobserved_between(
     }
     let end = to.min(instructions.len());
     for inst in &instructions[from..end] {
-        if instruction_uses_any(inst, &facts.aliases)
-            || matches!(
-                inst,
-                Instruction::Call { .. }
-                    | Instruction::CallIndirect { .. }
-                    | Instruction::InlineAsm { .. }
-                    | Instruction::StackRestore { .. }
-            )
-        {
+        if instruction_uses_any(inst, &facts.aliases) {
+            return false;
+        }
+        let safe = match inst {
+            // These instructions neither access memory nor trap. Unknown
+            // instructions fail closed instead of relying on pointer-ID
+            // inequality or a missing address-influence edge.
+            Instruction::Alloca { .. }
+            | Instruction::Copy { .. }
+            | Instruction::GetElementPtr { .. }
+            | Instruction::GlobalAddr { .. }
+            | Instruction::LabelAddr { .. }
+            | Instruction::Phi { .. }
+            | Instruction::Select { .. }
+            | Instruction::ParamRef { .. } => true,
+            Instruction::BinOp { op, ty, .. } => !op.can_trap() && ty.is_integer(),
+            Instruction::Load {
+                ptr,
+                ty,
+                volatile: false,
+                seg_override: AddressSpace::Default,
+                ..
+            }
+            | Instruction::Store {
+                ptr,
+                ty,
+                volatile: false,
+                seg_override: AddressSpace::Default,
+                ..
+            } => {
+                // An in-bounds scalar access to a different, direct alloca
+                // is disjoint; derived and segment-relative pointers are not.
+                ptr.0 != destination
+                    && ty.size() != 0
+                    && allocas
+                        .get(&ptr.0)
+                        .is_some_and(|info| ty.size() <= info.size)
+            }
+            _ => false,
+        };
+        if !safe {
             return false;
         }
     }
@@ -1133,6 +1167,8 @@ fn promote_in_function(func: &mut IrFunction) -> usize {
                         producer + 1,
                         instruction_idx,
                         facts,
+                        dest.0,
+                        &allocas,
                     ) {
                         promotions.push(Promotion {
                             block: block_idx,
@@ -1657,8 +1693,15 @@ fn invalidate_for_memory_effects(
     roots: &FxHashMap<u32, PointerRoot>,
 ) {
     match inst {
-        Instruction::Store { ptr, volatile, .. } => {
-            if *volatile {
+        Instruction::Store {
+            ptr,
+            volatile,
+            seg_override,
+            ..
+        } => {
+            if *volatile || *seg_override != AddressSpace::Default {
+                // An FS/GS base changes the effective address independently
+                // of the numeric pointer's object root.
                 available.clear();
             } else {
                 invalidate_for_value_write(available, *ptr, roots);
@@ -2669,6 +2712,108 @@ mod tests {
     }
 
     #[test]
+    fn promotion_cannot_cross_a_potentially_aliasing_memory_access() {
+        let mut rewrites = Vec::new();
+        for write in [false, true] {
+            let access = if write {
+                Instruction::Store {
+                    val: Operand::Const(IrConst::I32(1)),
+                    ptr: Value(5),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                }
+            } else {
+                Instruction::Load {
+                    dest: Value(6),
+                    ptr: Value(5),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                }
+            };
+            let mut function = function(
+                "unknown_destination_observation",
+                vec![block(
+                    0,
+                    vec![
+                        alloca(0, 32, 32),
+                        alloca(1, 32, 32),
+                        Instruction::Copy {
+                            dest: Value(5),
+                            src: Operand::Const(IrConst::I64(4096)),
+                        },
+                        intrinsic(
+                            Some(2),
+                            IntrinsicOp::Pcmpeqb256,
+                            Some(0),
+                            vec![Operand::Value(Value(3)), Operand::Value(Value(4))],
+                        ),
+                        access,
+                        Instruction::Memcpy {
+                            dest: Value(1),
+                            src: Value(0),
+                            size: 32,
+                        },
+                    ],
+                )],
+            );
+            rewrites.push(promote_in_function(&mut function));
+        }
+        assert_eq!(
+            rewrites,
+            [0, 0],
+            "unknown reads and writes can address the destination"
+        );
+    }
+
+    #[test]
+    fn promotion_allows_only_bounded_direct_distinct_scalar_accesses() {
+        for (size, space, volatile, expected) in [
+            (4, AddressSpace::Default, false, 1),
+            (3, AddressSpace::Default, false, 0),
+            (4, AddressSpace::SegFs, false, 0),
+            (4, AddressSpace::SegGs, false, 0),
+            (4, AddressSpace::Default, true, 0),
+        ] {
+            let mut function = function(
+                "bounded_other_alloca",
+                vec![block(
+                    0,
+                    vec![
+                        alloca(0, 32, 32),
+                        alloca(1, 32, 32),
+                        alloca(5, size, 4),
+                        intrinsic(
+                            Some(2),
+                            IntrinsicOp::Pcmpeqb256,
+                            Some(0),
+                            vec![Operand::Value(Value(3)), Operand::Value(Value(4))],
+                        ),
+                        Instruction::Store {
+                            val: Operand::Const(IrConst::I32(1)),
+                            ptr: Value(5),
+                            ty: IrType::I32,
+                            seg_override: space,
+                            volatile,
+                        },
+                        Instruction::Memcpy {
+                            dest: Value(1),
+                            src: Value(0),
+                            size: 32,
+                        },
+                    ],
+                )],
+            );
+            assert_eq!(
+                promote_in_function(&mut function),
+                expected,
+                "{size} {space:?} {volatile}"
+            );
+        }
+    }
+
+    #[test]
     fn read_modify_write_result_is_not_promoted() {
         let mut function = function(
             "rmw_result",
@@ -2911,6 +3056,49 @@ mod tests {
             )],
         );
         assert_eq!(fuse_in_function(&mut function), 0);
+    }
+
+    #[test]
+    fn segment_relative_writes_may_alias_either_vector_object() {
+        let mut rewrites = Vec::new();
+        for space in [AddressSpace::SegFs, AddressSpace::SegGs] {
+            let mut function = function(
+                "segment_clobber",
+                vec![block(
+                    0,
+                    vec![
+                        alloca(0, 32, 32),
+                        alloca(10, 32, 32),
+                        alloca(11, 4, 4),
+                        intrinsic(
+                            Some(1),
+                            IntrinsicOp::Loadu256,
+                            Some(0),
+                            vec![Operand::Value(Value(10))],
+                        ),
+                        Instruction::Store {
+                            val: Operand::Const(IrConst::I32(1)),
+                            ptr: Value(11),
+                            ty: IrType::I32,
+                            seg_override: space,
+                            volatile: false,
+                        },
+                        intrinsic(
+                            Some(2),
+                            IntrinsicOp::Pcmpeqb256,
+                            Some(20),
+                            vec![Operand::Value(Value(0)), Operand::Value(Value(21))],
+                        ),
+                    ],
+                )],
+            );
+            rewrites.push(fuse_in_function(&mut function));
+        }
+        assert_eq!(
+            rewrites,
+            [0, 0],
+            "segment bases can change the effective address"
+        );
     }
 
     #[test]
