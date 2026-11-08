@@ -27,6 +27,22 @@ pub(super) enum LcccSimdClass {
 }
 
 /// mnemonic -> (class, IntrinsicOp)
+/// Is this operand an EXACT compile-time integer immediate?
+///
+/// `operand_to_imm_i64` in the x86 backend has a catch-all arm that returns
+/// `0` for floats, decimal containers, `I128` and any SSA `Operand::Value`.
+/// Accepting one of those as an immediate would silently emit `$0` instead of
+/// a diagnostic -- a wrong-code bug with no warning.  GCC 16.2 says "the last
+/// argument must be an 8-bit immediate" and Clang 23.1.5 says "must be a
+/// constant integer"; this predicate is the exact, target-independent gate.
+/// `I128` is admitted ONLY when it fits in `i64`; no truncation is implied.
+fn exact_immediate_operand(op: &Operand) -> bool {
+    match op {
+        Operand::Const(c) => c.to_i128().and_then(|v| i64::try_from(v).ok()).is_some(),
+        Operand::Value(_) => false,
+    }
+}
+
 pub(super) fn lccc_simd_lookup(
     mnemonic: &str,
 ) -> Option<(LcccSimdClass, IntrinsicOp, bool, usize)> {
@@ -816,6 +832,33 @@ impl Lowerer {
         if let Some(result) = self.try_native_packed_fp_helper(op, &args[1..]) {
             return Some(result);
         }
+        // A compile-time immediate is a HARD REQUIREMENT, not a preference.
+        // GCC 16.2 says "the last argument must be an 8-bit immediate" and
+        // Clang 23.1.5 says "argument ... must be a constant integer"; the
+        // x86 backend's `operand_to_imm_i64` silently returns 0 for an SSA
+        // `Operand::Value`, so a runtime `vpcmp` predicate used to compile to
+        // an EQ compare with NO diagnostic -- a silent miscompile.  Validate
+        // the immediate BEFORE evaluating any other operand, so a rejected
+        // call cannot leave half-lowered expressions behind.  Constant
+        // expressions and enum constants already lower to `Operand::Const`,
+        // so only genuinely runtime values are refused.
+        let imm_op = if has_imm {
+            let op = self.lower_expr(&args[0]);
+            // `Operand::Const` alone is not enough: a float, a decimal
+            // container or an out-of-i64-range I128 also reaches
+            // `operand_to_imm_i64`, whose catch-all arm would silently emit
+            // `$0`.  Require an EXACT integer immediate in the i64 domain.
+            if !exact_immediate_operand(&op) {
+                return self.reject_builtin_call(
+                    format!("the last argument to '{name}' must be a constant integer immediate"),
+                    args,
+                    width.max(16),
+                );
+            }
+            Some(op)
+        } else {
+            None
+        };
         // Drop the leading dummy/imm argument; keep exactly nargs real
         // operands; re-append the immediate (if any) as the LAST operand.
         let mut arg_ops: Vec<Operand> = args
@@ -825,10 +868,8 @@ impl Lowerer {
             .take(nargs)
             .map(|(index, arg)| self.lower_typed_x86_builtin_argument(name, arg, index))
             .collect();
-        if has_imm {
-            if let Some(imm_expr) = args.first() {
-                arg_ops.push(self.lower_expr(imm_expr));
-            }
+        if let Some(op) = imm_op {
+            arg_ops.push(op);
         }
         match class {
             LcccSimdClass::Vec128 | LcccSimdClass::Vec256 | LcccSimdClass::Vec512 => {
@@ -1064,6 +1105,85 @@ mod portable_subset_tests {
             O::Storeldi128,
         ] {
             assert!(!portable_simd_op(op), "{op:?} must stay x86-only");
+        }
+    }
+}
+
+#[cfg(test)]
+mod immediate_diagnostic_tests {
+    use super::exact_immediate_operand;
+    use crate::ir::reexports::{IrConst as C, Operand, Value};
+
+    /// GCC 16.2 / Clang 23.1.5 hard-error on a runtime `vpcmp` predicate;
+    /// LCCC used to emit `$0` with no diagnostic.  The gate must accept every
+    /// EXACT integer immediate and refuse every value that the x86 backend's
+    /// `operand_to_imm_i64` would silently turn into zero.
+    #[test]
+    fn exact_immediate_operand_accepts_only_exact_integers() {
+        for c in [
+            C::I8(-1),
+            C::I8(7),
+            C::I16(-128),
+            C::I16(32767),
+            C::I32(i32::MIN),
+            C::I32(i32::MAX),
+            C::I64(i64::MIN),
+            C::I64(i64::MAX),
+            C::I128(i64::MIN as i128),
+            C::I128(i64::MAX as i128),
+            C::Zero,
+        ] {
+            assert!(
+                exact_immediate_operand(&Operand::Const(c)),
+                "{c:?} is an exact i64 immediate"
+            );
+        }
+        for c in [
+            C::I128(i128::from(i64::MAX) + 1),
+            C::I128(i128::from(i64::MIN) - 1),
+            C::F32(0.0),
+            C::F64(0.0),
+            C::D32(0),
+            C::D64(0),
+            C::LongDouble(0.0, [0u8; 16]),
+        ] {
+            assert!(
+                !exact_immediate_operand(&Operand::Const(c)),
+                "{c:?} must NOT become a silent $0"
+            );
+        }
+        assert!(!exact_immediate_operand(&Operand::Value(Value(0))));
+        assert!(!exact_immediate_operand(&Operand::Value(Value(u32::MAX))));
+    }
+
+    /// Every lookup row that declares `has_imm` must have its leading control
+    /// argument checked.  A row added later without the flag would bypass the
+    /// diagnostic; pin the mask-compare predicate family explicitly.
+    #[test]
+    fn mask_compare_predicates_are_declared_as_immediates() {
+        use super::lccc_simd_lookup;
+        for mnemonic in [
+            "vpcmpb128",
+            "vpcmpub256",
+            "vpcmpw128",
+            "vpcmpuw256",
+            "vpcmpd128",
+            "vpcmpud256",
+            "vpcmpq128",
+            "vpcmpuq256",
+            "vpcmpb512",
+            "vpcmpub512",
+            "vpcmpw512",
+            "vpcmpuw512",
+            "vpcmpd512",
+            "vpcmpud512",
+            "vpcmpq512",
+            "vpcmpuq512",
+        ] {
+            let (_, _, has_imm, nargs) = lccc_simd_lookup(mnemonic)
+                .unwrap_or_else(|| panic!("{mnemonic} must be in the dispatch table"));
+            assert!(has_imm, "{mnemonic} predicate must be a checked immediate");
+            assert_eq!(nargs, 2, "{mnemonic} takes exactly a and b");
         }
     }
 }

@@ -254,6 +254,48 @@ def generate_source() -> tuple[str, list[str]]:
     return "\n".join(out), names
 
 
+# A runtime `vpcmp` predicate is a SILENT MISCOMPILE if a compiler substitutes
+# an immediate instead of diagnosing it.  GCC 16.2 and Clang 23.1.5 both hard
+# -error; LCCC's backend helper used to return 0 for an SSA Operand::Value, so
+# `_mm_cmp_epi8_mask(a, b, runtime_p)` compiled to an EQ compare.  These two
+# generated sources are the negative diagnostic and the positive control
+# (constant-expression and enum immediates MUST still be accepted).
+IMM_NEGATIVE = """/* GENERATED negative diagnostic case -- DO NOT EDIT. */
+#include <stdio.h>
+#include <immintrin.h>
+int main(int argc, char **argv) {
+    (void)argv;
+    __m128i a = _mm_set1_epi8((char)(argc + 1));
+    __m128i b = _mm_set1_epi8((char)(argc + 2));
+    int runtime_p = argc & 7;
+    unsigned r = (unsigned)_mm_cmp_epi8_mask(a, b, runtime_p);
+    printf("%08x\\n", r);
+    return 0;
+}
+"""
+
+IMM_POSITIVE = """/* GENERATED positive immediate control -- DO NOT EDIT. */
+#include <stdio.h>
+#include <immintrin.h>
+enum { P_GE = 5, P_GT = 6 };
+static unsigned char A[16], B[16];
+int main(int argc, char **argv) {
+    (void)argv;
+    for (int i = 0; i < 16; i++) {
+        A[i] = (unsigned char)(i * 7 + argc * 3 + 11);
+        B[i] = (unsigned char)((i % 3) ? A[i] : (A[i] ^ 0x5A));
+    }
+    __m128i a = _mm_loadu_si128((const __m128i_u *)(const void *)A);
+    __m128i b = _mm_loadu_si128((const __m128i_u *)(const void *)B);
+    unsigned le = (unsigned)_mm_cmp_epi8_mask(a, b, 1 + 1);
+    unsigned ge = (unsigned)_mm_cmp_epi8_mask(a, b, P_GE);
+    unsigned gt = (unsigned)_mm_cmp_epi8_mask(a, b, P_GT);
+    printf("le=%08x ge=%08x gt=%08x\\n", le, ge, gt);
+    return 0;
+}
+"""
+
+
 def run(cmd: list[str], env: dict | None = None, timeout: int = 300) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout)
 
@@ -340,6 +382,61 @@ def execute_matrix(tmp: Path, mutate: bool) -> dict:
     }
 
 
+def check_immediate_diagnostics(tmp: Path) -> tuple[list[str], list[str]]:
+    """Negative diagnostic parity + positive constant-immediate control.
+
+    Three compilers x two generated sources, EXECUTED for the positive case.
+    A compiler that accepts a runtime predicate has a silent wrong-code bug,
+    and a compiler that rejects `1+1` or an enum constant has over-corrected.
+    """
+    failures: list[str] = []
+    notes: list[str] = []
+    neg, pos = tmp / "imm_negative.c", tmp / "imm_positive.c"
+    neg.write_text(IMM_NEGATIVE)
+    pos.write_text(IMM_POSITIVE)
+    lccc = str(ROOT / "target" / "fastbuild" / "lccc")
+    specs = [
+        ("lccc", [lccc] + FLAGS + ["-I", "include"]),
+        ("gcc16", [tool("gcc-16")] + FLAGS),
+        ("clang23", [tool("clang-23")] + FLAGS),
+    ]
+    for label, cmd in specs:
+        cp = run(cmd + [str(neg), "-o", str(tmp / f"{label}_neg")])
+        if cp.returncode == 0:
+            failures.append(
+                f"{label} accepted a RUNTIME vpcmp predicate (silent miscompile)"
+            )
+        else:
+            notes.append(f"{label}: runtime predicate rejected rc={cp.returncode}")
+    lccc_msg = run(specs[0][1] + [str(neg), "-o", str(tmp / "lccc_neg2")]).stderr
+    if "constant integer immediate" not in lccc_msg:
+        failures.append("lccc runtime-predicate diagnostic lacks the required wording")
+    # Positive control: constant expressions and enum constants are legal
+    # immediates.  Force maskfacts OFF for LCCC so the emitted `vpcmp $2/$5/$6`
+    # instructions really execute instead of being folded away.
+    envs = {
+        "lccc": {**os.environ, "CCC_DISABLE_PASSES": "maskfacts"},
+        "gcc16": os.environ.copy(),
+        "clang23": os.environ.copy(),
+    }
+    outs: dict[str, str] = {}
+    for label, cmd in specs:
+        cp = run(cmd + [str(pos), "-o", str(tmp / f"{label}_pos")], env=envs[label])
+        if cp.returncode != 0:
+            failures.append(f"{label} rejected a constant-expression immediate: {cp.stderr[-400:]}")
+            continue
+        rp = run([str(tmp / f"{label}_pos")], env=envs[label])
+        if rp.returncode != 0:
+            failures.append(f"{label} positive immediate binary rc={rp.returncode}")
+            continue
+        outs[label] = rp.stdout
+    if len(outs) == 3 and len(set(outs.values())) == 1:
+        notes.append("constant-expression/enum immediates: 3-way stdout identical")
+    elif len(outs) == 3:
+        failures.append(f"positive immediate control disagrees: {outs}")
+    return failures, notes
+
+
 def evaluate(res: dict) -> tuple[list[str], list[str]]:
     """Return (failures, notes). Real checks, not a printed status."""
     failures: list[str] = []
@@ -421,8 +518,12 @@ def main() -> int:
         return 1
 
     with tempfile.TemporaryDirectory(prefix="maskfacts_vl_") as td:
-        res = execute_matrix(Path(td), mutate=os.environ.get("LCCC_MATRIX_MUTATE") == "1")
+        tmp = Path(td)
+        res = execute_matrix(tmp, mutate=os.environ.get("LCCC_MATRIX_MUTATE") == "1")
         failures, notes = evaluate(res)
+        diag_failures, diag_notes = check_immediate_diagnostics(tmp)
+        failures += diag_failures
+        notes += [f"immediate: {n}" for n in diag_notes]
         if args.json:
             args.json.write_text(json.dumps({
                 "source_sha256": res["source_sha256"],
@@ -432,6 +533,7 @@ def main() -> int:
                     k: __import__("hashlib").sha256(v["stdout"].encode()).hexdigest()
                     for k, v in res["builds"].items()
                 },
+                "immediate_diagnostics": {"failures": diag_failures, "notes": diag_notes},
                 "failures": failures,
                 "notes": notes,
             }, indent=2) + "\n")
