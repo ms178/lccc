@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "tool": "YARPGen 2.0 (PLDI'23 loop-oriented generator)",
+  "repository": "https://github.com/intel/yarpgen.git",
+  "commit": "1adb290f453505838f3aa33dc571f292b0c1810f",
+  "resolved_head": "1adb290f453505838f3aa33dc571f292b0c1810f",
+  "build": {
+    "compiler": "g++ (Debian 12.2.0-14+deb12u1) 12.2.0",
+    "standard": "c++17",
+    "optimization": "-O2",
+    "warnings": [
+      "-Wall",
+      "-Wpedantic"
+    ],
+    "translation_units": [
+      "context.cpp",
+      "data.cpp",
+      "emit_policy.cpp",
+      "expr.cpp",
+      "gen_policy.cpp",
+      "hash.cpp",
+      "ir_value.cpp",
+      "main.cpp",
+      "options.cpp",
+      "program.cpp",
+      "statistics.cpp",
+      "stmt.cpp",
+      "type.cpp",
+      "utils.cpp"
+    ],
+    "cmake_required": false
+  },
+  "source_tree_sha256": "f0377ebec1c0b9010bda2743bc4f6538e56c085bbabf51e3ed6b9f2969971d39",
+  "binary_sha256": "063f50242b3c02bc88ca156b7547c5db34f609c1bb932eeeb2bdcbe117807a39",
+  "version_string": "yarpgen version 2.0 (build intel-main on 2026-11-08)",
+  "invocation": "yarpgen -s <seed> --std=c --max-array-dims=3 -o <dir>",
+  "notes": [
+    "Seeded, UB-free C programs; the decimal global hash is the oracle.",
+    "--max-array-dims=3 keeps .bss inside the supported small code model (2 GiB); larger images make 32-bit PC-relative relocations overflow for GCC, Clang and lccc alike.",
+    "The upstream 'v1' branch is the older OOPSLA'20 generator and is NOT used here."
+  ]
+}

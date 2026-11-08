@@ -132,3 +132,161 @@ See `engineering/LIGHTPIXEL-AUDIT-2026-11-01.md` and its raw JSON receipts.
 The native U32 min/max component improves, but lccc's exact three-channel
 RGB/alpha graph remains scalar. Do not describe this gate as proof that the
 LLVM PR227303 profitability optimization is implemented.
+
+## Implementation-audit reproducer pack (2026-11-08)
+
+Evidence and fix plans: `engineering/SIMD-IMPLEMENTATION-AUDIT-2026-11-08.md`
+(§9c); measured outcomes and the red-team re-audit in §9c.9.  The pack grew
+from six additive files to fifteen: the original corpus, six independent
+drivers, three oracles/goldens, a provenance record and a unittest pack.
+
+| File | Role |
+|------|------|
+| `audit_repro_2026-11-08.c` | C99 entry-point library; `list` enumerates all eight |
+| `probe_utils.py` | shared process/CPUID/diagnostic layer, no side effects |
+| `check_audit_2026-11-08.py` | 15-row driver: 9 hardened `fixed` controls + 6 controls |
+| `simd_shape_matrix.c` | 29 bit-exact differential shapes, three tiers |
+| `check_simd_shape_matrix.py` | 12 optimization/ISA flag sets, sanitizer + bench legs |
+| `simd_isa_matrix.c` | 42 shapes across x86 tiers, NEON, SVE and RVV |
+| `check_simd_isa_matrix.py` | 12 host flag sets + 7 QEMU cross legs, sanitizer + bench |
+| `gen_isa_permissions.py` / `isa_permissions_gcc16.json` | GCC16-derived feature-permission golden (97 wrappers) |
+| `check_isa_permissions.py` | permission-table consistency gate |
+| `check_assembler_widths.py` | GNU as 2.47 byte-exact VEX.L=1 width parity (16 cases) |
+| `check_yarpgen.py` | seeded UB-free YARPGen 2.0 differential fuzz, 10 legs |
+| `check_lccc_capability.py` / `lccc_capability_gaps.json` | pinned LCCC capability-debt ratchet |
+| `test_audit_pack.py` | unittest pack wired by the existing CI discovery step |
+
+All seven drivers have a pure `--self-test`; `test_audit_pack.py` runs every
+one of them in CI.  Combined self-test count: **117 checks** (39 + 15 + 16 +
+5 + 13 + 18 + 11).
+
+### Finding driver
+
+```sh
+python3 tests/simd/check_audit_2026-11-08.py --list-rows
+python3 tests/simd/check_audit_2026-11-08.py --self-test
+python3 tests/simd/check_audit_2026-11-08.py --lccc target/fastbuild/lccc --reference gcc-16
+python3 tests/simd/check_audit_2026-11-08.py --lccc target/fastbuild/lccc --strict
+python3 tests/simd/check_audit_2026-11-08.py --lccc "$(which gcc)" --strict  # harness oracle
+```
+
+Nine rows were reproduced at runtime (SA-01/02/03/04/05/06/07/13/33), the
+corresponding compiler defects were fixed, and each row was promoted from
+`open` to `fixed` — a hard control that must print `PASS`.  A failing control
+is `REGRESSION` in both modes; an injected compiler ICE is also `REGRESSION`,
+never an expected `OPEN-CONFIRMED`.  Rows tagged `open` (none remain) would
+print `OPEN-CONFIRMED`; a passing open row is `STALE-OPEN`.
+`ERROR` is infrastructure and always hard; `SKIP` means the host lacks the
+CPUID feature needed to execute the compiled probe and is never hard.
+`--strict` inverts the open rows into required passes for post-fix validation.
+A compiler without the findings (GCC) is strict-green — that is the harness's
+own end-to-end check.  `--json` writes a schema-1 receipt and creates parent
+directories; `--compile-timeout` / `--run-timeout` bound every child process.
+
+Compile-only rows classify a failed compile as a pass **only** when stderr is
+a real diagnostic.  An ICE, a timeout, an empty stderr or a missing toolchain
+is `ERROR`.  Asm rows prove the kernel was emitted (function label plus a
+multiply) before asserting that an instruction is absent; `sa33_asm` also
+requires `vzeroupper` after `vinserti32x4`.  Runtime rows gate on host CPUID,
+not on target predefined macros, and `-ffp-contract` is pinned for SA-02 with
+an `=off` control.
+
+The lccc-dependent driver is still **not** a hard CI gate: hosted CI builds
+the compiler in a separate lane, so a red compiler build would otherwise be
+indistinguishable from a red harness.  What CI *does* gate is the harness
+itself through `test_audit_pack.py` (41 tests, including permanent injected
+wrong-code mutations and all seven driver self-tests).  Locally the full
+driver is strict-green against the fastbuild binary: 15/15 rows `PASS`.
+
+### Shape matrix
+
+```sh
+python3 tests/simd/check_simd_shape_matrix.py --candidate gcc --reference gcc --sanitize --bench
+python3 tests/simd/check_simd_shape_matrix.py --candidate target/fastbuild/lccc --quick
+```
+
+Every shape has a vectorizable `fast()` and a de-optimized `ref()` oracle
+(volatile induction variable).  For each of the 12 flag sets the driver checks
+that the two digests agree within the build and that both match a shared
+`-O0` reference build.  Any compiler diagnostic is an infrastructure error —
+zero warnings is a hard requirement.  `--sanitize` adds an ASan+UBSan leg;
+`--bench` reports median ns/iteration per shape on the host CPU without
+polluting the compared stdout stream.  Shapes come from `tests/bench/k_*.c`,
+`tests/benchmark/kernel_corpus/k*.c`, the C sources in `tests/simd/`, and the
+ms178/archpkgbuilds packages (zlib-ng, gzip, zstd, SQLite, expat, curl,
+glibc, Linux jhash, LightPixel, simdjson, Chromium/Skia, FFmpeg,
+libjpeg-turbo); `list` prints each shape's provenance.  The corpus is C99 and
+portable to x86-64, i686, AArch64 and RISC-V: no POSIX calls, no `_Alignas`,
+no strict-aliasing puns, AVX-512 behind predefined macros with scalar
+fallbacks.
+
+### CI integration
+
+`test_audit_pack.py` is discovered by the existing
+`python3 -m unittest discover -s tests/simd -p 'test_*.py'` gate step.  Adding
+a test file changes **no workflow text**, so `.github/ci-lane-plan.json`
+stays byte-identical and `tests/regression/check_ci_lane_plan.py` stays green.
+Adding a step to a sharded lane would instead require regenerating the whole
+plan — deliberately avoided.
+
+
+## Full-ISA shape matrix (2026-11-08)
+
+```sh
+python3 tests/simd/check_simd_isa_matrix.py --candidate gcc-16 --reference gcc-16 --sanitize --bench
+python3 tests/simd/check_simd_isa_matrix.py --candidate clang-23 --reference gcc-16 --sanitize --bench
+python3 tests/simd/check_simd_isa_matrix.py --candidate gcc-16 --reference gcc-16 --cross
+python3 tests/simd/check_isa_permissions.py
+python3 tests/simd/check_assembler_widths.py --require-gas-247
+python3 tests/simd/check_yarpgen.py --seeds 48 --json /tmp/yarpgen.json
+python3 tests/simd/check_lccc_capability.py
+```
+
+Measured on the host (Xeon family 6 model 106, AVX-512 F/DQ/BW/VL/VNNI,
+GCC 16.2.0, Clang 23.1.5, GNU as 2.47.20260726, QEMU 11.1.3): GCC16 12/12
+configurations x 42 shapes, Clang23 12/12 x 42 shapes (both with an ASan/
+UBSan leg and a median-ns bench leg), and 11/11 QEMU cross legs covering
+AArch64 NEON, AArch64 SVE, RVV at VLEN 128/256/512/1024 and i686 SSE2 —
+**0 problems**.  `available=` reporting prevents a disabled ISA from being
+counted as exercised; missing tools are SKIP, never PASS.
+
+`check_lccc_capability.py` compiles the same strict 42-shape corpus against
+`target/fastbuild/lccc` and ratchets the exact pre-existing capability debt
+(4 GCC warning groups with no LCCC implementation, 3 absent intrinsics).
+A NEW gap is a regression; a gap that disappears is a hard failure until the
+golden is reviewed.  No diagnostic is filtered as SKIP.  This is why the
+reference gate above is described as a *reference-toolchain* gate rather than
+as evidence that LCCC implements the whole corpus.
+
+## YARPGen differential fuzzing
+
+Provenance: `engineering/toolchains/yarpgen-provenance.json`; provision with
+`python3 scripts/provision_yarpgen.py` (pinned commit, github.com only).
+`-s <seed> --std=c --max-array-dims=3` keeps generated images inside the
+supported small code model; an oversized image is classified SKIP **only**
+when every leg fails with the same 32-bit relocation overflow.  A partial
+failure is a hard FAIL.  The default 240 s per-child timeout is ratcheted
+against the measured 151 s worst case (seed 1029, GCC 16.2 `-O3
+-march=native -funroll-loops`); a 90 s default previously produced a bogus
+compiler failure whose reason was truncated out of the receipt.  `-mcmodel=large` is now refused with an actionable
+diagnostic instead of silently degrading to the small model and failing at
+link time with advice the user had already followed.
+
+## Measured red-team evidence (§9c.9)
+
+* Fastbuild `cargo build --profile fastbuild --locked -j 1 -D warnings`:
+  clean; `cargo test --profile fastbuild --lib`: 8477 passed / 0 failed /
+  10 ignored.
+* `check_audit_2026-11-08.py --strict`: 15/15 `PASS`.
+* `check_assembler_widths.py --require-gas-247`: 16 cases, 8 byte-identical
+  encodings, 0 problems.
+* GDB 18.1 on the LCCC `-O2 -g` binary: SA-06 returns 0x480bac99 /
+  0x8d833099 and SA-07 returns 0xf29489f3, byte-identical to GCC 16.2 `-O0`;
+  no ICE.  `objdump` of the vectorized kernel shows 8 `paddd`, 7 `pshufd`,
+  6 `pslld`, 6 `psrld`, 6 `por`, 8 `pxor` — the fix keeps SIMD, it does not
+  disable vectorization.
+* Valgrind 3.19 on static binaries: 14 glibc `__libc_cleanup_*` false
+  positives in BOTH the LCCC and the GCC16 reference build, 0 heap bytes in
+  use at exit, 0 diagnostic frames reaching the kernels in the LCCC build.
+* YARPGen 2.0 quick: 24/24 seeds x 4 legs, 0 problems; code-model probe
+  PASS.

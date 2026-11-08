@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "measured_on": "2026-11-08",
+  "compiler": "target/fastbuild/lccc (LCCC 16.2.0, fastbuild profile)",
+  "reference": "GCC 16.2.0 / Clang 23.1.5 / GNU as 2.47.20260726",
+  "policy": "A new gap is a hard regression; a resolved gap is a hard failure until this golden is reviewed and re-baselined. Nothing is filtered as SKIP.",
+  "unsupported_options": [
+    "-Wcast-qual",
+    "-Wconversion",
+    "-Wshadow",
+    "-Wwrite-strings"
+  ],
+  "missing_intrinsics": [
+    "_mm512_mask_add_epi32",
+    "_mm512_mullo_epi64",
+    "_mm_mask_add_epi32"
+  ],
+  "followups": [
+    "Implement the four GCC warning groups (or register them in the GP-22 option-effect ledger with a real effect); LCCC currently warns by name because accepting an inert option is explicitly a ledger failure state.",
+    "Add EVEX masked vpaddd (512/VL) and vpmullq (512) lowering plus header wrappers under scripts/gen_lcccsimd.py, with feature gates and differential tests."
+  ]
+}

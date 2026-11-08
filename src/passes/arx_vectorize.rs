@@ -59,7 +59,7 @@
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
-use crate::ir::analysis::CfgAnalysis;
+use crate::ir::analysis::{CfgAnalysis, DominanceChecker};
 use crate::ir::instruction::{BlockId, Instruction, Operand, Terminator, Value};
 use crate::ir::intrinsics::IntrinsicOp;
 use crate::ir::ops::IrBinOp;
@@ -1028,6 +1028,14 @@ fn analyze_arx_loop(
                 return None;
             }
         }
+        // Terminators carry operands too (notably `return state[j]`).
+        // `terminator_uses_any` and `rewrite_terminator_operands` match the
+        // Terminator enum EXHAUSTIVELY (no wildcard arm), so adding a new
+        // operand-bearing variant is a compile error, not a silent
+        // release-build miscompile.  That is strictly stronger than a
+        // `debug_assert!` completeness check: the invariant is enforced on
+        // every build, at zero runtime cost.  `transform_arx_loop` proves
+        // separately that each such use is dominated by the extract block.
     }
 
     // The counter's backedge value (its defining add is retained by the
@@ -1054,6 +1062,35 @@ fn analyze_arx_loop(
         shape_kc: shape.kc,
         shape_kd: shape.kd,
     })
+}
+
+/// Rewrite operands carried by a block TERMINATOR.  `Return(value)` is not
+/// an Instruction: SA-07's `return j;` referenced a loop word-phi through
+/// the terminator, and the old outside-use rewrite (which only walked
+/// `block.instructions`) left it dangling after the word phis were deleted.
+/// The backend then hit its hard "cannot be materialised" gate and panicked.
+/// Every Terminator variant with an operand is handled; Branch/Unreachable
+/// have none.
+fn rewrite_terminator_operands(t: &mut Terminator, f: &mut dyn FnMut(&mut Operand)) {
+    match t {
+        Terminator::Return(Some(op)) => f(op),
+        Terminator::CondBranch { cond, .. } => f(cond),
+        Terminator::IndirectBranch { target, .. } => f(target),
+        Terminator::Switch { val, .. } => f(val),
+        Terminator::Return(None) | Terminator::Branch(_) | Terminator::Unreachable => {}
+    }
+}
+
+/// Does a terminator reference any of the given values?
+fn terminator_uses_any(t: &Terminator, vals: &[Value; 16]) -> bool {
+    let hit = |op: &Operand| matches!(op, Operand::Value(v) if vals.contains(v));
+    match t {
+        Terminator::Return(Some(op)) => hit(op),
+        Terminator::CondBranch { cond, .. } => hit(cond),
+        Terminator::IndirectBranch { target, .. } => hit(target),
+        Terminator::Switch { val, .. } => hit(val),
+        Terminator::Return(None) | Terminator::Branch(_) | Terminator::Unreachable => false,
+    }
 }
 
 /// Does this instruction reference any of the given values as an operand?
@@ -1237,6 +1274,52 @@ fn transform_arx_loop(
         }
         exit_idx
     };
+
+    // ---- Dominance proof for the exit extracts (SA-07 red-team follow-up).
+    //      `x_extract[k]` is materialised at the TOP of the exit block
+    //      (immediately after its phis), so every OUTSIDE use of a deleted
+    //      word phi -- in an instruction OR in a terminator -- must be
+    //      dominated by that definition.  The pre-scan in
+    //      analyze_arx_loop only proved the uses are *rewritable*; without
+    //      this check a use on a sibling branch, in an unreachable block,
+    //      or inside an exit-block PHI (which precedes the inserted
+    //      extracts) would be rewritten to a value that does not dominate
+    //      it.  That is invalid SSA and reproduces the backend's
+    //      "cannot be materialised" panic by another route.  Bail BEFORE
+    //      the first mutation. ----
+    {
+        let dom = DominanceChecker::new(cfg.num_blocks, &cfg.idom);
+        for (bi, blk) in func.blocks.iter().enumerate() {
+            if arx.body.contains(&bi) {
+                continue;
+            }
+            let uses_in_inst = |inst: &Instruction| instruction_uses_any(inst, &arx.word_phis);
+            if bi == exit_idx {
+                // Phis are the only instructions before the extract insert
+                // point.  Rewriting one of their operands to x_extract
+                // would create a same-block use-before-def (and a phi that
+                // does not read from its incoming edge).
+                let phi_end = blk
+                    .instructions
+                    .iter()
+                    .position(|i| !matches!(i, Instruction::Phi { .. }))
+                    .unwrap_or(blk.instructions.len());
+                if blk.instructions[..phi_end].iter().any(uses_in_inst) {
+                    arx_dbg("exit-block phi uses a word phi before the extracts");
+                    return 0;
+                }
+                // Non-phi instructions and the terminator in the exit block
+                // are after the extracts; no dominance question remains.
+                continue;
+            }
+            let uses = blk.instructions.iter().any(uses_in_inst)
+                || terminator_uses_any(&blk.terminator, &arx.word_phis);
+            if uses && !dom.dominates(exit_idx, bi) {
+                arx_dbg("outside word-phi use not dominated by the exit block");
+                return 0;
+            }
+        }
+    }
 
     // The main ARX body block: the one holding the most instructions.
     let main_block = *arx
@@ -1678,6 +1761,13 @@ fn transform_arx_loop(
                 }
             });
         }
+        rewrite_terminator_operands(&mut blk.terminator, &mut |op: &mut Operand| {
+            if let Operand::Value(v) = op {
+                if let Some(xk) = arx.word_phis.iter().position(|&p| p == *v) {
+                    *op = Operand::Value(x_extract[xk]);
+                }
+            }
+        });
     }
 
     // ---- Delete the dead word phis from the header. ----
@@ -1749,4 +1839,119 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         }
     }
     changed
+}
+
+#[cfg(test)]
+mod terminator_rewrite_tests {
+    use super::*;
+
+    fn vals() -> [Value; 16] {
+        let mut v = [Value(0); 16];
+        v[0] = Value(41);
+        v[15] = Value(99);
+        v
+    }
+
+    fn remap(op: &mut Operand) {
+        if let Operand::Value(v) = op {
+            if *v == Value(41) {
+                *op = Operand::Value(Value(7777));
+            }
+        }
+    }
+
+    #[test]
+    fn every_terminator_variant_is_visited_exactly_once() {
+        let v = vals();
+        let make = || -> Vec<Terminator> {
+            vec![
+                Terminator::Return(Some(Operand::Value(Value(41)))),
+                Terminator::Return(None),
+                Terminator::Branch(BlockId(3)),
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(41)),
+                    true_label: BlockId(3),
+                    false_label: BlockId(4),
+                },
+                Terminator::IndirectBranch {
+                    target: Operand::Value(Value(41)),
+                    possible_targets: vec![BlockId(3), BlockId(4)],
+                },
+                Terminator::Switch {
+                    val: Operand::Value(Value(41)),
+                    cases: vec![(1, BlockId(3)), (2, BlockId(4))],
+                    default: BlockId(5),
+                    ty: IrType::I32,
+                },
+                Terminator::Unreachable,
+            ]
+        };
+        for (i, mut t) in make().into_iter().enumerate() {
+            let expected_hit = matches!(
+                t,
+                Terminator::Return(Some(_))
+                    | Terminator::CondBranch { .. }
+                    | Terminator::IndirectBranch { .. }
+                    | Terminator::Switch { .. }
+            );
+            assert_eq!(terminator_uses_any(&t, &v), expected_hit, "variant {i}");
+            let mut calls = 0usize;
+            rewrite_terminator_operands(&mut t, &mut |op| {
+                calls += 1;
+                remap(op);
+            });
+            assert_eq!(calls, usize::from(expected_hit), "visits for variant {i}");
+            if expected_hit {
+                // The rewrite must have reached the operand itself.
+                let got = match &t {
+                    Terminator::Return(Some(op)) => op,
+                    Terminator::CondBranch { cond, .. } => cond,
+                    Terminator::IndirectBranch { target, .. } => target,
+                    Terminator::Switch { val, .. } => val,
+                    _ => unreachable!(),
+                };
+                assert_eq!(*got, Operand::Value(Value(7777)), "variant {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn unrelated_values_and_constants_are_never_touched() {
+        let v = vals();
+        let mut t = Terminator::CondBranch {
+            cond: Operand::Const(IrConst::I32(1)),
+            true_label: BlockId(1),
+            false_label: BlockId(2),
+        };
+        assert!(!terminator_uses_any(&t, &v));
+        // The visitor IS invoked for the operand SLOT (a CondBranch always
+        // has a cond); `remap` must simply leave a constant/unrelated value
+        // alone.  This is the type-safety guarantee, not "no visit".
+        let mut visits = 0usize;
+        rewrite_terminator_operands(&mut t, &mut |op| {
+            visits += 1;
+            remap(op);
+        });
+        assert_eq!(visits, 1);
+        assert!(matches!(
+            &t,
+            Terminator::CondBranch {
+                cond: Operand::Const(IrConst::I32(1)),
+                ..
+            }
+        ));
+        let mut t2 = Terminator::Return(Some(Operand::Value(Value(1234))));
+        assert!(!terminator_uses_any(&t2, &v));
+        assert!(terminator_uses_any(
+            &Terminator::Return(Some(Operand::Value(Value(99)))),
+            &v
+        ));
+        rewrite_terminator_operands(&mut t2, &mut remap);
+        // Terminator has no PartialEq derive (deliberately: it is an IR
+        // node, not a value type).  Pattern-match instead of comparing.
+        assert!(matches!(
+            &t2,
+            Terminator::Return(Some(Operand::Value(Value(1234))))
+        ));
+    }
 }

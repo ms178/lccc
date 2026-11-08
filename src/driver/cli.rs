@@ -3019,8 +3019,24 @@ impl Driver {
                 | "-mno-xsavec" => {}
                 "-m3dnow" => return Err("3DNow! is unsupported".to_string()),
                 "-mcmodel=kernel" => self.code_model_kernel = true,
-                "-mcmodel=small" | "-mcmodel=medlow" | "-mcmodel=medium" | "-mcmodel=medany"
-                | "-mcmodel=large" => {
+                // SA-YG-1: `-mcmodel=large` used to be silently folded into
+                // the SMALL model (`code_model_kernel = false`).  Every
+                // global address was then still emitted as `leaq sym(%rip)`
+                // / `movq sym@GOTPCREL(%rip)`, whose 32-bit PC-relative
+                // relocation overflows once .bss exceeds 2 GiB.  The user
+                // had followed the linker's advice, yet lccc failed with
+                // "recompile with -mcmodel=large" — a silent lie, not a
+                // code-model implementation.  Fail early with an honest
+                // diagnostic instead of emitting unlinkable objects.
+                "-mcmodel=large" => {
+                    return Err(
+                        "-mcmodel=large: the x86-64 large code model is not implemented; \
+                         keep the image below 2 GiB or use -mcmodel=kernel \
+                         (lccc supports the small and kernel models)"
+                            .to_string(),
+                    );
+                }
+                "-mcmodel=small" | "-mcmodel=medlow" | "-mcmodel=medium" | "-mcmodel=medany" => {
                     self.code_model_kernel = false;
                 }
                 arg if arg.starts_with("-mabi=") => {
@@ -8772,5 +8788,55 @@ mod x86_macro_gate_tests {
         let err = d.parse_cli_args(&args).unwrap_err();
         assert!(err.contains("unrecognized argument in option"), "{err}");
         assert!(err.contains("128 256 512 none"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod code_model_tests {
+    use crate::driver::Driver;
+
+    fn parse(flags: &[&str]) -> Result<Driver, String> {
+        let mut d = Driver::new();
+        let args: Vec<String> = std::iter::once("ccc")
+            .chain(flags.iter().copied())
+            .chain(std::iter::once("x.c"))
+            .map(str::to_string)
+            .collect();
+        d.parse_cli_args(&args)?;
+        Ok(d)
+    }
+
+    /// SA-YG-1: silently folding `-mcmodel=large` into the SMALL model
+    /// produced `leaq sym(%rip)` / GOTPCREL loads whose 32-bit PC-relative
+    /// relocation overflows above 2 GiB .bss.  The linker then advised the
+    /// user to recompile with exactly the flag they had already used.
+    /// Fail closed with an actionable diagnostic instead.
+    #[test]
+    fn large_code_model_is_not_silently_accepted() {
+        // `Driver` deliberately has no `Debug` impl (it owns a whole
+        // compilation pipeline); `.err()` avoids unwrap_err's Debug bound.
+        let err = parse(&["-mcmodel=large"])
+            .err()
+            .expect("-mcmodel=large must be refused");
+        assert!(err.contains("-mcmodel=large"), "{err}");
+        assert!(err.contains("not implemented"), "{err}");
+        assert!(err.contains("small"), "{err}");
+    }
+
+    #[test]
+    fn supported_code_models_are_still_accepted() {
+        for flag in [
+            "-mcmodel=small",
+            "-mcmodel=medlow",
+            "-mcmodel=medium",
+            "-mcmodel=medany",
+            "-mcmodel=kernel",
+        ] {
+            assert!(parse(&[flag]).is_ok(), "{flag}");
+        }
+        assert!(
+            parse(&["-mcmodel=large", "-mcmodel=small"]).is_err(),
+            "the large arm must fire before a later flag rescues it"
+        );
     }
 }

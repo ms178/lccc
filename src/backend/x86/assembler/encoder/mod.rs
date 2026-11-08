@@ -5246,10 +5246,22 @@ impl InstructionEncoder {
             "vpalignr" => self.encode_avx_3op_3a_imm8(ops, 0x0F, true),
             "vblendps" => self.encode_avx_3op_3a_imm8(ops, 0x0C, true),
             "vblendpd" => self.encode_avx_3op_3a_imm8(ops, 0x0D, true),
-            "vinserti128" => self.encode_avx_3op_3a_imm8(ops, 0x38, true),
-            "vextracti128" => self.encode_avx_extract_imm8(ops, 0x39, true),
-            "vinsertf128" => self.encode_avx_3op_3a_imm8(ops, 0x18, true),
-            "vextractf128" => self.encode_avx_extract_imm8(ops, 0x19, true),
+            "vinserti128" => {
+                Self::check_vex_half_width("vinserti128", ops, avx::VexHalfKind::Insert)
+                    .and_then(|()| self.encode_avx_3op_3a_imm8(ops, 0x38, true))
+            }
+            "vextracti128" => {
+                Self::check_vex_half_width("vextracti128", ops, avx::VexHalfKind::Extract)
+                    .and_then(|()| self.encode_avx_extract_imm8(ops, 0x39, true))
+            }
+            "vinsertf128" => {
+                Self::check_vex_half_width("vinsertf128", ops, avx::VexHalfKind::Insert)
+                    .and_then(|()| self.encode_avx_3op_3a_imm8(ops, 0x18, true))
+            }
+            "vextractf128" => {
+                Self::check_vex_half_width("vextractf128", ops, avx::VexHalfKind::Extract)
+                    .and_then(|()| self.encode_avx_extract_imm8(ops, 0x19, true))
+            }
             "vpsignb" => self.encode_avx_3op_38(ops, 0x08, true),
             "vpsignw" => self.encode_avx_3op_38(ops, 0x09, true),
             "vpsignd" => self.encode_avx_3op_38(ops, 0x0A, true),
@@ -5355,8 +5367,10 @@ impl InstructionEncoder {
             }
 
             // AVX2 permute
-            "vperm2i128" => self.encode_avx_3op_3a_imm8(ops, 0x46, true),
-            "vperm2f128" => self.encode_avx_3op_3a_imm8(ops, 0x06, true),
+            "vperm2i128" => Self::check_vex_half_width("vperm2i128", ops, avx::VexHalfKind::Perm2)
+                .and_then(|()| self.encode_avx_3op_3a_imm8(ops, 0x46, true)),
+            "vperm2f128" => Self::check_vex_half_width("vperm2f128", ops, avx::VexHalfKind::Perm2)
+                .and_then(|()| self.encode_avx_3op_3a_imm8(ops, 0x06, true)),
             "vpermd" => self.encode_avx_3op_38(ops, 0x36, true),
             "vpermps" => self.encode_avx_3op_38(ops, 0x16, true),
             // vpermq/vpermpd: the $imm form is VEX (0F3A 00/01 ib); the

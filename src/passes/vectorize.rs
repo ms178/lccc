@@ -1238,7 +1238,7 @@ fn vectorize_with_analysis_mode(
                         "[VEC] Reduction pattern matched! Transforming to AVX2 4-wide"
                     ));
                 }
-                total_changes += transform_reduction_avx2(func, &red_pattern, fp_contract);
+                total_changes += transform_reduction_avx2(func, &red_pattern, fp_contract, neon);
             }
         } else if !no_map_vec() {
             // AUD-4: the late scope deliberately does NOT gate the map
@@ -29425,6 +29425,7 @@ fn transform_reduction_avx2(
     func: &mut IrFunction,
     pattern: &ReductionPattern,
     fp_contract: crate::common::fp_contract::FpContract,
+    neon: bool,
 ) -> usize {
     // DOMINANCE PRECONDITION -- checked BEFORE any IR is touched. The
     // scalar remainder references values whose definitions must dominate
@@ -30508,8 +30509,13 @@ fn transform_reduction_avx2(
                 };
                 let body_block = &mut func.blocks[pattern.body_idx];
 
-                if fp_contract == FpContract::Fast
-                    && x86_fma_enabled()
+                // SA-01: ONE gate for every FMA producer in this function.
+                // The multi-accumulator arm below used to admit fusion on the
+                // language contract alone, emitting vfmadd231ps under
+                // `-mavx2 -mno-fma -ffast-math` (illegal instruction on
+                // pre-Haswell).  `-ffp-contract=fast` grants permission to
+                // change rounding; it does NOT conjure an FMA3 unit.
+                if fma_transform_allowed(neon, fp_contract)
                     && matches!(pattern.element_type, IrType::F32 | IrType::F64)
                 {
                     let fma_inst = Instruction::Intrinsic {
@@ -30643,7 +30649,7 @@ fn transform_reduction_avx2(
                     IntrinsicOp::VecAddF64x4,
                     IntrinsicOp::VecZeroF64x4,
                     Some(IntrinsicOp::VecFmaF64x4),
-                    fp_contract == FpContract::Fast,
+                    fma_transform_allowed(neon, fp_contract),
                 ),
                 (ReductionKind::DotProduct, IrType::F32) => (
                     IntrinsicOp::VecLoadF32x8,
@@ -30651,7 +30657,7 @@ fn transform_reduction_avx2(
                     IntrinsicOp::VecAddF32x8,
                     IntrinsicOp::VecZeroF32x8,
                     Some(IntrinsicOp::VecFmaF32x8),
-                    fp_contract == FpContract::Fast,
+                    fma_transform_allowed(neon, fp_contract),
                 ),
                 (ReductionKind::DotProduct, IrType::I32) => (
                     IntrinsicOp::VecLoadI32x8,

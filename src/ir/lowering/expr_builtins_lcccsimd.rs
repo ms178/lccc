@@ -543,6 +543,14 @@ fn simd_feature_requirements(mnemonic: &str) -> Vec<SimdFeatureRequirement> {
         || matches!(
             mnemonic,
             "vpshufb_maskz128" | "vpshufb_mask128" | "vcastsi512_256"
+                // The 512-bit unaligned load/store helpers are generated with
+                // digit-less mnemonics (scripts/gen_lcccsimd.py LOAD512 /
+                // STORE512), so `is_512` does not recognise them.  Before this
+                // clause they fell through to `legacy_simd_feature` and were
+                // classified as plain AVX, letting emit_evex_load_512 emit a
+                // zmm move under `-mavx` (SA-03).  A mechanical sweep over all
+                // 354 `lccc_simd_lookup` keys found exactly these two.
+                | "vmovdqu64_load" | "vmovdqu64_store"
         );
     if evex {
         push_feature(&mut req, F::Avx512F, "-mavx512f");
@@ -618,13 +626,37 @@ fn simd_feature_requirements(mnemonic: &str) -> Vec<SimdFeatureRequirement> {
         "vmovdqu8_mask",
         "vpshufb_mask",
     ];
-    if bw.iter().any(|stem| mnemonic.starts_with(stem)) {
+    // Exact names, not stems: `vpshuflw`/`vpshufhw` also exist as legacy
+    // VEX 128/256 forms that need only AVX, so a prefix rule would
+    // over-constrain them.  GCC 16.2 puts `_mm512_shufflelo_epi16` and
+    // `_mm512_shufflehi_epi16` in avx512bwintrin.h (SA-04).
+    const BW_EXACT: &[&str] = &["vpshuflw512", "vpshufhw512"];
+    if bw.iter().any(|stem| mnemonic.starts_with(stem)) || BW_EXACT.contains(&mnemonic) {
         push_feature(&mut req, F::Avx512Bw, "-mavx512bw");
     }
 
-    // The qword absolute/min/max operations exposed here are AVX512F (the
-    // `q` describes lane width, not the AVX512DQ subset). Keep DQ distinct
-    // for future helpers whose instruction pages actually require that bit.
+    // The 256-bit insert/extract halves of a zmm are AVX512DQ encodings, not
+    // plain F: GCC 16.2 declares them in avx512dqintrin.h.  A GCC-16.2 header
+    // sweep over the generated intrinsic wrappers found exactly these six
+    // missing DQ requirements; the names are pinned here rather than matched
+    // by prefix so unrelated `vinsert*`/`vextract*` helpers cannot inherit a
+    // feature they do not need.
+    const DQ_EXACT: &[&str] = &[
+        "vextracti32x8_512",
+        "vextracti64x2_512",
+        "vextracti64x2_maskz512",
+        "vinserti32x8_512",
+        "vinserti64x2_512",
+        "vinserti64x2_maskz512",
+    ];
+    if DQ_EXACT.contains(&mnemonic) {
+        push_feature(&mut req, F::Avx512Dq, "-mavx512dq");
+    }
+
+    // The qword absolute/min/max operations are AVX512F (the `q` describes
+    // lane width, not the AVX512DQ subset); only the six insert/extract
+    // helpers above actually carry the DQ bit.  Any further DQ encoding must
+    // be added to DQ_EXACT with a GCC/SDM citation, not inferred from a name.
 
     if mnemonic.starts_with("vpopcntb") || mnemonic.starts_with("vpopcntw") {
         push_feature(&mut req, F::Avx512BitAlg, "-mavx512bitalg");
@@ -1020,6 +1052,20 @@ mod legacy_permission_tests {
             ("vpdpbusd512", &[F::Avx512F, F::Avx512Vnni]),
             ("vfmadd231ps512", &[F::Avx512F]),
             ("vcastsi512_256", &[F::Avx512F]),
+            // SA-03: digit-less EVEX loads/stores must not answer F::Avx.
+            ("vmovdqu64_load", &[F::Avx512F]),
+            ("vmovdqu64_store", &[F::Avx512F]),
+            // SA-04: GCC 16.2 avx512bwintrin.h owns the shuffle twins.
+            ("vpshuflw512", &[F::Avx512F, F::Avx512Bw]),
+            ("vpshufhw512", &[F::Avx512F, F::Avx512Bw]),
+            // GCC 16.2 avx512dqintrin.h owns the zmm half insert/extract
+            // forms; the mechanical header sweep found exactly six.
+            ("vextracti32x8_512", &[F::Avx512F, F::Avx512Dq]),
+            ("vextracti64x2_512", &[F::Avx512F, F::Avx512Dq]),
+            ("vextracti64x2_maskz512", &[F::Avx512F, F::Avx512Dq]),
+            ("vinserti32x8_512", &[F::Avx512F, F::Avx512Dq]),
+            ("vinserti64x2_512", &[F::Avx512F, F::Avx512Dq]),
+            ("vinserti64x2_maskz512", &[F::Avx512F, F::Avx512Dq]),
             ("vfmadd231ps256", &[F::Fma]),
             ("vfmsub231ps256", &[F::Fma]),
             ("vfnmadd231pd256", &[F::Fma]),
