@@ -1670,8 +1670,11 @@ impl Parser {
         self.attrs.set_typedef_object_volatile(false);
         self.attrs.set_pointer_const(false);
         // A containing function or previous declaration must not donate its
-        // retain attribute to a new block-scope declaration.
+        // object-placement attributes to a new block-scope declaration.
         self.attrs.set_retain(false);
+        self.attrs.set_noinit(false);
+        self.attrs.set_persistent(false);
+        self.attrs.set_nocommon(false);
         self.attrs.parsing_address_space = AddressSpace::Default;
         let type_spec = self.parse_type_specifier()?;
         let spec_maybe_unused = self.attrs.parsing_maybe_unused();
@@ -1696,7 +1699,13 @@ impl Parser {
         // attributes apply only to that sibling. Consume the parser bit before
         // an initializer can introduce attributes of its own.
         let spec_retain = self.attrs.parsing_retain();
+        let spec_noinit = self.attrs.parsing_noinit();
+        let spec_persistent = self.attrs.parsing_persistent();
+        let spec_nocommon = self.attrs.parsing_nocommon();
         self.attrs.set_retain(false);
+        self.attrs.set_noinit(false);
+        self.attrs.set_persistent(false);
+        self.attrs.set_nocommon(false);
         let spec_noplt = self.attrs.parsing_noplt();
         self.attrs.set_noplt(false);
 
@@ -1749,7 +1758,13 @@ impl Parser {
             let local_uninitialized = spec_uninitialized || self.attrs.parsing_uninitialized();
             self.attrs.set_uninitialized(false);
             let local_retain = spec_retain || self.attrs.parsing_retain();
+            let local_noinit = spec_noinit || self.attrs.parsing_noinit();
+            let local_persistent = spec_persistent || self.attrs.parsing_persistent();
+            let local_nocommon = spec_nocommon || self.attrs.parsing_nocommon();
             self.attrs.set_retain(false);
+            self.attrs.set_noinit(false);
+            self.attrs.set_persistent(false);
+            self.attrs.set_nocommon(false);
             let local_cleanup_fn = self.attrs.parsing_cleanup_fn.take();
             let local_section = self.attrs.parsing_section.take();
             let local_visibility = self
@@ -1784,6 +1799,9 @@ impl Parser {
             // Attributes parsed inside an initializer belong to that nested
             // construct, not to this declarator or the next comma sibling.
             self.attrs.set_retain(false);
+            self.attrs.set_noinit(false);
+            self.attrs.set_persistent(false);
+            self.attrs.set_nocommon(false);
             declarators.push(InitDeclarator {
                 name: name.unwrap_or_default(),
                 derived,
@@ -1803,6 +1821,9 @@ impl Parser {
                     da.set_uninitialized(local_uninitialized);
                     da.set_used(self.attrs.parsing_used());
                     da.set_retain(local_retain);
+                    da.set_noinit(local_noinit);
+                    da.set_persistent(local_persistent);
+                    da.set_nocommon(local_nocommon);
                     da.set_maybe_unused(local_maybe_unused);
                     da.set_nested_fn(self.attrs.parsing_nested_fn());
                     da.set_noreturn(self.attrs.parsing_noreturn());
@@ -1840,6 +1861,18 @@ impl Parser {
             if self.attrs.parsing_retain() {
                 last_decl.attrs.set_retain(true);
                 self.attrs.set_retain(false);
+            }
+            if self.attrs.parsing_noinit() {
+                last_decl.attrs.set_noinit(true);
+                self.attrs.set_noinit(false);
+            }
+            if self.attrs.parsing_persistent() {
+                last_decl.attrs.set_persistent(true);
+                self.attrs.set_persistent(false);
+            }
+            if self.attrs.parsing_nocommon() {
+                last_decl.attrs.set_nocommon(true);
+                self.attrs.set_nocommon(false);
             }
             if self.attrs.parsing_noplt() {
                 last_decl.attrs.set_noplt(true);

@@ -28,6 +28,25 @@ int cfirst, csecond __attribute__((nocommon)), cthird;
 int rfirst=1, rsecond __attribute__((retain))=2, rthird=3;
 void _start(void) { }
 '''
+LOCAL_SOURCE = r'''
+int locals(void) {
+    static __attribute__((noinit)) int na, nb;
+    static int nc __attribute__((noinit)), nd;
+    static __attribute__((persistent)) int pa=1, pb=2;
+    static int pc __attribute__((persistent))=3, pd=4;
+    static __attribute__((retain)) int ra=1, rb=2;
+    static int rc __attribute__((retain))=3, rd=4;
+    return na+nb+nc+nd+pa+pb+pc+pd+ra+rb+rc+rd;
+}
+'''
+LOCAL_EXPECTED = {
+    'na': ('.noinit', 8, False), 'nb': ('.noinit', 8, False),
+    'nc': ('.noinit', 8, False), 'nd': ('.bss', 8, False),
+    'pa': ('.persistent', 1, False), 'pb': ('.persistent', 1, False),
+    'pc': ('.persistent', 1, False), 'pd': ('.data', 1, False),
+    'ra': ('retained', 1, True), 'rb': ('retained', 1, True),
+    'rc': ('retained', 1, True), 'rd': ('.data', 1, False),
+}
 EXPECTED = {
     'na': ('.noinit', 8, False), 'nb': ('.noinit', 8, False),
     'nc': ('.noinit', 8, False), 'nd': ('COMMON', None, False),
@@ -68,6 +87,20 @@ def check(obj):
             raise RuntimeError(f'{obj}: {name}: expected {(section, kind, retained)!r}, got {got!r}')
 
 
+def check_locals(obj):
+    sections, symbols = elf(obj)
+    for stem, (expected_section, kind, retained) in LOCAL_EXPECTED.items():
+        matches = [index for name, index in symbols.items()
+                   if len(name.split('.')) >= 2 and name.split('.')[-2] == stem]
+        if len(matches) != 1 or not 0 < matches[0] < len(sections):
+            raise RuntimeError(f'{obj}: local {stem}: ambiguous/missing: {matches!r}')
+        section, got_kind, flags = sections[matches[0]]
+        got_section = 'retained' if retained and section.startswith('.data.') else section
+        got = (got_section, got_kind, bool(flags & R))
+        if got != (expected_section, kind, retained):
+            raise RuntimeError(f'{obj}: local {stem}: expected {(expected_section, kind, retained)!r}, got {got!r}')
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--lccc', default='target/fastbuild/lccc')
@@ -78,6 +111,8 @@ def main():
         td = Path(temp)
         source = td / 'placement.c'
         source.write_text(SOURCE, encoding='utf-8')
+        local_source = td / 'placement_local.c'
+        local_source.write_text(LOCAL_SOURCE, encoding='utf-8')
         compilers = [
             ('gcc-m64', args.gcc, ['-m64']), ('gcc-m32', args.gcc, ['-m32']),
             ('lccc-m64', args.lccc, ['-m64']), ('lccc-m32', args.lccc, ['-m32']),
@@ -89,6 +124,10 @@ def main():
             run([compiler, *flags, '-fcommon', '-c', source, '-o', obj])
             check(obj)
             print(f'{label}: symbol placement PASS ({len(EXPECTED)} objects)')
+            local_obj = td / (label + '-local.o')
+            run([compiler, *flags, '-O0', '-c', local_source, '-o', local_obj])
+            check_locals(local_obj)
+            print(f'{label}: static-local placement PASS ({len(LOCAL_EXPECTED)} objects)')
             if label in ('gcc-m64', 'lccc-m64'):
                 exe = td / (label + '.elf')
                 run(['ld', '--gc-sections', '-e', '_start', obj, '-o', exe])
