@@ -1156,7 +1156,6 @@ pub(crate) fn allocate_window(
     };
 
     // Earlier live ranges claim their preferred registers first.
-    let mut reg_needed = reg_needed;
     reg_needed.sort_by_key(|(_, e)| e.first);
 
     // The scratch is live from the reload (just before the first reference)

@@ -234,7 +234,6 @@ pub(crate) fn closed_form_tail_sum(func: &mut IrFunction) -> usize {
     }
 
     let formula_label = rec_label;
-    let base_label = base_label;
     let mut next = func.next_value_id;
     let fresh = |next: &mut u32| {
         let value = Value(*next);

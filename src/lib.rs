@@ -97,7 +97,6 @@
     clippy::redundant_closure,
     clippy::redundant_closure_call,
     clippy::redundant_guards,
-    clippy::redundant_locals,
     clippy::redundant_slicing,
     clippy::single_match,
     clippy::slow_vector_initialization,

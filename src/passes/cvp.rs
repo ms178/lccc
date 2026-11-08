@@ -1141,7 +1141,6 @@ fn promote_guarded_counts(func: &mut IrFunction) -> usize {
 }
 
 pub fn run_function_with_symbols(func: &mut IrFunction, defined_syms: &FxHashSet<String>) -> usize {
-    let defined_syms = defined_syms;
     // Straight-line functions have no predicates to propagate, but the
     // definition-based zero-guard proof below needs no CFG at all: run it first
     // so single-block leaves get the branch-free count lowering too.

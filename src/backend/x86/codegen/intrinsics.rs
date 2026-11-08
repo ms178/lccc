@@ -2042,11 +2042,16 @@ impl X86Codegen {
         self.state.vec_last_store_reg_name = Some(src);
     }
 
-    /// Memory operand for a vector arg, unless the value is still provably in a
-    /// register (last-stored/deferred or vec_live) — its slot contents may be
-    /// stale under the deferred-store optimization. Returns None then, so
-    /// the caller routes through the register cache instead of reading memory.
-    fn vec_arg_mem(&self, arg: &Operand) -> Option<String> {
+    /// Memory operand for a vector arg, or `None` when the value is provably
+    /// still in a register (`vec_live_regs`, or the `vec_last_store_*` /
+    /// `sse_last_store_*` peepholes) so the caller routes through the register
+    /// cache instead of reading a slot that the deferred-store optimization
+    /// may have left stale.
+    ///
+    /// A still-pending deferred store (`pending_vec_store`) is NOT in that set:
+    /// it is committed here and the fold still happens, because the slot is
+    /// then valid and the memory operand remains the cheaper form.
+    fn vec_arg_mem(&mut self, arg: &Operand) -> Option<String> {
         // A VLFOLD-elided value's SOURCE operand is its only materialisation;
         // its home slot was never written, so hand back the recorded source
         // rather than the slot.  (The caller that consumes it is responsible
@@ -2062,6 +2067,25 @@ impl X86Codegen {
                     || (self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0))
                 {
                     return None;
+                }
+                // LAZY-FLUSH SOUNDNESS, the `evex_arg_mem` discipline applied
+                // here. The three tests above cover a value held in a register
+                // that the state itself tracks. A deferred store is a fourth
+                // way for the slot to be stale, and it is tracked in a
+                // separate field that those tests never consult: a pending
+                // store means the register is written and the SLOT IS NOT.
+                // `vec_last_store_reg` can be cleared afterwards by an
+                // unrelated load (`avx_load_arg_to` does exactly that on
+                // paths whose flush is register-keyed and so may not name
+                // this value), which would leave the pending store as the
+                // only record that the slot is unwritten. Fold it here and
+                // the consumer reads memory that was never stored.
+                //
+                // Commit first rather than refusing the fold: the slot is
+                // then valid and the memory operand is still the cheaper
+                // form, exactly the trade `evex_arg_mem` measured.
+                if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
+                    self.flush_pending_vec_store_impl();
                 }
                 self.operand_ptr_mem_operand(arg)
             }
@@ -14033,6 +14057,144 @@ mod avx_homed_fast_path_tests {
                 assert!(!cg.state.dirty_upper_ymm);
                 assert_eq!(cg.state.vec_last_store_val, None);
             }
+        }
+    }
+}
+
+/// `vec_arg_mem` is the 256-bit path's memory-operand fold. Staleness of a
+/// value's home slot is recorded in three separate places, and this helper
+/// must consult all of them: `vec_live_regs`, `vec_last_store_*`, and
+/// `pending_vec_store`.
+#[cfg(test)]
+mod vec_arg_mem_pending_store_tests {
+    use super::*;
+
+    /// Home value `id` to a plain (non-over-aligned) alloca slot so
+    /// `operand_ptr_mem_operand` really can produce a memory operand for it —
+    /// the fold must be live, or these tests would pass vacuously.
+    fn slot_homed_alloca(cg: &mut X86Codegen, id: u32) {
+        cg.state.value_locations.insert(id, StackSlot(-32));
+        cg.state.alloca_values.insert(id);
+        cg.state.vector_values.insert(id);
+    }
+
+    fn fresh() -> X86Codegen {
+        let mut cg = X86Codegen::new();
+        slot_homed_alloca(&mut cg, 0);
+        cg
+    }
+
+    /// The fold must actually be reachable in this fixture, otherwise every
+    /// assertion below is vacuous.
+    #[test]
+    fn fixture_really_folds_a_memory_operand() {
+        let mut cg = fresh();
+        let mem = cg.vec_arg_mem(&Operand::Value(Value(0)));
+        assert!(
+            mem.is_some(),
+            "fixture is broken: no memory operand for a slot-homed alloca"
+        );
+        assert!(
+            cg.state.pending_vec_store.is_none(),
+            "no pending store, so nothing should have been flushed"
+        );
+    }
+
+    /// The regression itself. A pending store means the register holds the
+    /// value and the slot has NOT been written. `vec_last_store_reg` can be
+    /// false at the same time (an intervening `avx_load_arg_to` clears it on
+    /// paths whose flush is keyed by register and so may not name this value),
+    /// which leaves the pending store as the only surviving record. Folding
+    /// the slot then reads memory that was never stored.
+    #[test]
+    fn vec_arg_mem_commits_a_pending_store_before_folding_it() {
+        let mut cg = fresh();
+        cg.state.pending_vec_store = Some((0, "ymm0", true));
+        // The state after an intervening load cleared the register peephole.
+        cg.state.vec_last_store_reg = false;
+        cg.state.sse_last_store_reg = false;
+
+        let mem = cg.vec_arg_mem(&Operand::Value(Value(0)));
+        assert!(
+            mem.is_some(),
+            "the fold must still happen after the commit: it is the cheaper form"
+        );
+        assert!(
+            cg.state.pending_vec_store.is_none(),
+            "a pending store means the slot was never written; it must be \
+             committed before that slot can be read as a memory operand"
+        );
+        assert!(
+            cg.state.out.buf.contains("vmovdqu %ymm0"),
+            "the committed value must actually be written: {}",
+            cg.state.out.buf
+        );
+    }
+
+    /// The guard is value-specific: a pending store for an UNRELATED value must
+    /// not be flushed by this fold, or the deferred-store optimization would
+    /// collapse to "always flush" and lose its win.
+    #[test]
+    fn vec_arg_mem_leaves_an_unrelated_pending_store_alone() {
+        let mut cg = fresh();
+        cg.state.pending_vec_store = Some((7, "ymm0", true));
+        let _ = cg.vec_arg_mem(&Operand::Value(Value(0)));
+        assert!(
+            cg.state.pending_vec_store.is_some(),
+            "an unrelated value must not trigger the flush"
+        );
+        assert!(
+            !cg.state.out.buf.contains("vmovdqu %ymm0"),
+            "an unrelated value must not be written: {}",
+            cg.state.out.buf
+        );
+    }
+
+    /// The two ORIGINAL guards must still fire: a value provably in a register
+    /// is folded to None, not to a stale slot read.
+    #[test]
+    fn vec_arg_mem_still_refuses_register_held_values() {
+        let mut cg = fresh();
+        // (a) block-local live register.
+        cg.state.vec_live_regs.insert(0, "ymm1");
+        assert!(cg.vec_arg_mem(&Operand::Value(Value(0))).is_none());
+
+        // (b) the vector peephole: the last store wrote this value to a reg.
+        let mut cg = fresh();
+        cg.state.vec_last_store_val = Some(0);
+        cg.state.vec_last_store_reg = true;
+        assert!(cg.vec_arg_mem(&Operand::Value(Value(0))).is_none());
+
+        // (c) the SSE peephole.
+        let mut cg = fresh();
+        cg.state.sse_last_store_val = Some(0);
+        cg.state.sse_last_store_reg = true;
+        assert!(cg.vec_arg_mem(&Operand::Value(Value(0))).is_none());
+
+        // None of these is a pending store, so nothing may be emitted.
+        assert!(!cg.state.out.buf.contains("vmovdqu %ymm0"));
+    }
+
+    /// End-to-end: the deferred 256-bit store must reach the slot before any
+    /// consumer folds that slot, for each of the four call sites of
+    /// `vec_arg_mem`.
+    #[test]
+    fn a_deferred_256_bit_result_reaches_its_slot_before_a_fold() {
+        for pending_reg in ["ymm0", "ymm1"] {
+            let mut cg = fresh();
+            cg.state.pending_vec_store = Some((0, pending_reg, true));
+            cg.state.vec_last_store_reg = false;
+            cg.state.sse_last_store_reg = false;
+            let _ = cg.vec_arg_mem(&Operand::Value(Value(0)));
+            assert!(
+                cg.state.pending_vec_store.is_none(),
+                "pending in {pending_reg} must still be committed"
+            );
+            assert!(
+                cg.state.out.buf.contains("vmovdqu"),
+                "the store must be emitted for {pending_reg}: {}",
+                cg.state.out.buf
+            );
         }
     }
 }

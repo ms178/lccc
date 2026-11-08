@@ -693,9 +693,6 @@ fn peephole_optimize_inner(
     // the whole global peephole for files like gzip's deflate.c (longest_match
     // uses pushfq), leaving 28+ store→load→deref round-trips per hot loop
     // unoptimized.
-    let skip_phase1 = skip_phase1;
-    let skip_phase2 = skip_phase2;
-    let skip_phase3 = skip_phase3;
     let max_phase1_iters = MAX_LOCAL_PASS_ITERATIONS;
     // CCC_TIME_PEEPHOLE=1: per-iteration/per-phase wall-time trace on stderr.
     // The optimizer is text-based, so pathological generated files (e.g. the
