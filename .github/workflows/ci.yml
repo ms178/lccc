@@ -699,6 +699,8 @@ jobs:
       run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_typedef_volatile_codegen.sh
     - name: GNU retain section flags and linker garbage collection
       run: python3 tests/regression/check_gnu_retain_sections.py --lccc target/fastbuild/lccc --gcc gcc-16
+    - name: GNU object-placement declarator scopes
+      run: python3 tests/regression/check_placement_declarators.py --lccc target/fastbuild/lccc --gcc gcc-16
     - name: RISC-V shared-binding relocation algebra
       run: python3 tests/linker/check_riscv_shared_binding.py --lccc target/fastbuild/lccc-riscv
     - name: Volatile member code generation
