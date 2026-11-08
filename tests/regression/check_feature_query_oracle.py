@@ -43,8 +43,9 @@ DEFAULT_ORACLE = ROOT / "engineering/evidence/2026-11-08-rucc-audit/feature-quer
 IMPLEMENTED = {
     "c_alignas",
     "c_alignof",
-    "c_atomic",
-    "__c_atomic__",  # armoured spelling of c_atomic
+    # c_atomic / __c_atomic__ are deliberately NOT here: `_Atomic` is parsed
+    # but its RMW and seq_cst store semantics are not lowered (measured
+    # miscompiles), so the truthful answer is 0 even though GCC answers 1.
     "c_generic_selections",
     "c_static_assert",
     "c_thread_local",

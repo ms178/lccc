@@ -76,8 +76,85 @@ Also fixed the fastbuild wrapper's explicit job override: `LCCC_BUILD_JOBS=2` is
 
 ## Reproduction pointers
 
-- Cache restore: `python3 scripts/restore_agent_toolchain_cache.py --restore` (lock: `engineering/toolchains/agent-cache-lock.json`).
+- Cache restore: `python3 scripts/restore_agent_toolchain_cache.py --tag harness-cache-8` (lock: `engineering/toolchains/agent-cache-lock.json`). There is no `--restore` flag.
 - LCCC build: `source /home/user/.cache/lccc/agent-toolchains/env.sh && LCCC_BUILD_JOBS=2 ./scripts/build_lccc_fast.sh`.
 - Correctness/timing: `tests/benchmark/run_benchmarks.py --candidate rucc=/home/user/rucc-audit-bin/rucc-4f9f5d85 --compilers lccc,gcc,clang,rucc --reps 7 --warmup 2 --cpu 0 --no-pmu-probe ...`.
 - Feature gate: `CCC=target/fastbuild/lccc bash tests/regression/check_frontend_preprocessor_rules.sh`.
 - Local CI mirror: `./scripts/ci_local.sh --fast`; snapshot: `scripts/lccc-snapshot.sh` into `/home/user/ms178-1.patch`.
+
+## 2026-11-08 continuation: defects found by red-teaming the first patch
+
+The first feature-query revision built but **failed its own regression gate**.
+Line-by-line audit of `resolve()` found a real design error, not a test typo:
+
+1. **Extension answers were dialect-gated.** `resolve(name, extension=true, mode)`
+   reused the *feature* availability expression, so `__has_extension(c_atomic)`
+   answered 0 in C99 even though LCCC accepts `_Atomic` there as an extension
+   (GCC 16.2 answers 1). The gates are now separate and documented: implemented
+   here → available in this TU (sanitizer) → standard in this dialect. The
+   dialect gate applies to the feature answer only; `-pedantic-errors` collapses
+   the extension answer onto it. A linear `ROWS.iter().find()` was replaced by a
+   `match` on `&str` (length switch + memcmp, no second name list to drift).
+2. **Contiguous-fragment assertions were order-dependent.** Four "failures" were
+   the test matching a fragment that spanned unrelated declarations. The gate now
+   asserts each `key=value` independently and reports exactly which row diverged.
+3. **Operand macro expansion was missing in `#if`.** Measured: GCC 16.2 expands
+   the operand of `__has_feature`, `__has_extension`, `__has_builtin`,
+   `__has_attribute` and `__has_c_attribute` (`#define FEAT c_atomic` ⇒ 1, chained
+   macros and `gnu::deprecated` included); Clang does not for feature/builtin.
+   LCCC's code-line path expanded the whole line first but its `#if` path resolved
+   before expansion, so the two paths disagreed with each other and with GCC.
+   Both now share `expand_query_identifier` / the attribute-token re-split.
+4. **Malformed operands were silently accepted.** GCC and Clang both error.
+   `__has_feature()`/`(123)`/`((x))`/missing `(`/junk after the name now produce
+   GCC-worded errors and answer 0, and recovery consumes the *balanced* operand
+   (literal-aware) so no stray `)` reaches the expression parser.
+5. **Pre-existing `__has_builtin` gap:** GCC answers 1 for the unprefixed library
+   spelling (`memcpy`, `strlen`); LCCC answered 0. Canonicalization now maps an
+   unprefixed name through LCCC's own builtin registry, so the claim stays
+   truthful (unknown names still answer 0) and the x86 target-flag gate is applied
+   to the canonical name.
+6. **UBSan truthfulness nuance:** LCCC implements UBSan in trap mode only and
+   *rejects* `-fsanitize=undefined` without `-fsanitize-trap`; the first test
+   revision asserted a query value for a mode the driver refuses. The gate now
+   pins the rejection and replays sanitizer modes with the trap flag. The oracle
+   differential asserts that `-fsanitize=address`/`kernel-address` are rejected
+   rather than advertised.
+
+### New data-driven gate
+
+`tests/regression/check_feature_query_oracle.py` replays the committed GCC 16.2
+matrix (21 names × 18 modes) against LCCC, requires GCC parity for implemented
+rows, truthful zeros for the rest, and `#if`/code-line agreement: **1346 checks,
+all passing**. It runs inside the existing `frontend-preprocessor-rules` gate, so
+both CI mirrors execute it without new parity contracts. The shell gate adds the
+full c89..gnu23 × ±`-pedantic-errors` matrix, `-Werror=pedantic`, user
+`-D__STDC_VERSION__`, sanitizer modes, armour/half-armour, macro operands,
+literals, and malformed-operand diagnostics.
+
+### Linker oracle (follow-up item 6) — implemented
+
+`scripts/ensure_mold_300_binary.sh` reuses the hash-verified agent-cache mold
+3.0.0 (the same digest `ci_install_mold_oracle.sh` pins for the official upstream
+release asset) and **proves** the x86 target set functionally: it links a trivial
+object for `elf_i386` and `elf_x86_64` and checks ELF class/machine with readelf.
+`--self-test` includes offline negative probes (missing binary, wrong version,
+right version that cannot link) — all pass. Both `tools/linker/setup_oracles.sh`
+and `tests/linker/setup_oracles.sh` now prefer that verified binary
+(`MOLD_PREFER=cache`, seconds instead of ~40 min) and fall back to the source
+build. The source preset was aligned to upstream v3.0.0 `cli/Cargo.toml`:
+`--no-default-features --features x86_64,i386,system-allocator` (the `tools`
+variant previously omitted `system-allocator`, i.e. it built a *different*
+allocator oracle than the `tests` variant). `MOLD_PREFER=source` remains the
+choice for link-timing research (`-C target-cpu=native`, system allocator).
+
+### Harness wipe
+
+The sandbox was recreated mid-session: everything outside the repo (toolchain
+cache, swap, baseline binaries, raw rucc artifacts) was lost. The committed
+evidence copies under `engineering/evidence/2026-11-08-rucc-audit/` survived and
+are the reason the oracle matrix is still available. Swap was re-ensured at
+exactly 4 GiB and the cache re-restored from `harness-cache-8` (12 files verified).
+`/home/user/ms178-1.patch` is refreshed by `scripts/lccc-snapshot.sh` after each
+validated landing.
+

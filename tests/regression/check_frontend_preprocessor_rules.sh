@@ -513,9 +513,9 @@ run_diag -c -Werror "$tmp/pwarn.S" -o "$tmp/pwarn.o"
 # gcc-16.2 and clang-23.1.5 and are retained in
 # engineering/evidence/2026-11-08-rucc-audit/feature-query-oracle.json.
 cat >"$tmp/feature.c" <<'C'
-#define FEAT c_atomic
+#define FEAT c_generic_selections
 #define CHAIN FEAT
-#define ARMOURED __c_atomic__
+#define ARMOURED __c_generic_selections__
 int hf_c_alignas = __has_feature(c_alignas);
 int he_c_alignas = __has_extension(c_alignas);
 int hf_c_alignof = __has_feature(c_alignof);
@@ -550,8 +550,8 @@ int hf_enumattr = __has_feature(enumerator_attributes);
 int he_enumattr = __has_extension(enumerator_attributes);
 int hf_unknown = __has_feature(modules);
 int he_unknown = __has_extension(modules);
-int hf_armoured = __has_feature(__c_atomic__);
-int he_armoured = __has_extension(__c_atomic__);
+int hf_armoured = __has_feature(__c_generic_selections__);
+int he_armoured = __has_extension(__c_generic_selections__);
 int hf_half_armour = __has_feature(__c_atomic);
 int he_half_armour = __has_extension(c_atomic__);
 int hf_macro = __has_feature(FEAT);
@@ -559,7 +559,7 @@ int he_macro = __has_extension(FEAT);
 int hf_chain = __has_feature(CHAIN);
 int hf_armoured_macro = __has_feature(ARMOURED);
 #define QUERY(name) __has_feature(name)
-int hf_alias = QUERY(c_atomic);
+int hf_alias = QUERY(c_generic_selections);
 #define OP __has_feature
 int hf_op_alias = OP(FEAT);
 #if __has_feature(c_atomic)
@@ -571,6 +571,16 @@ int if_c_atomic = 0;
 int if_ext_c_atomic = 1;
 #else
 int if_ext_c_atomic = 0;
+#endif
+#if __has_feature(c_generic_selections)
+int if_generic = 1;
+#else
+int if_generic = 0;
+#endif
+#if __has_extension(c_generic_selections)
+int if_ext_generic = 1;
+#else
+int if_ext_generic = 0;
 #endif
 #if __has_feature(FEAT)
 int if_macro = 1;
@@ -608,16 +618,16 @@ expect_feature() {
 # Expectation sets are DATA measured from gcc-16.2, not recomputed from the
 # implementation's own logic (that would mirror the bug it is meant to catch).
 # Pre-C11: the C11/C23 rows are extensions only.
-F_PRE11='hf_c_alignas=0 he_c_alignas=1 hf_c_alignof=0 he_c_alignof=1 hf_c_atomic=0 he_c_atomic=1 hf_c_generic=0 he_c_generic=1 hf_c_static_assert=0 he_c_static_assert=1 hf_c_thread_local=0 he_c_thread_local=1 hf_binlit=0 he_binlit=1 hf_tls=1 he_tls=1 hf_asmgoto=0 he_asmgoto=1 hf_asmgoto_full=0 he_asmgoto_full=1 hf_armoured=0 he_armoured=1 hf_macro=0 he_macro=1 hf_chain=0 hf_armoured_macro=0 if_c_atomic=0 if_ext_c_atomic=1 if_macro=0 if_binlit=0'
-F_PRE11_PE='hf_c_alignas=0 he_c_alignas=0 hf_c_alignof=0 he_c_alignof=0 hf_c_atomic=0 he_c_atomic=0 hf_c_generic=0 he_c_generic=0 hf_c_static_assert=0 he_c_static_assert=0 hf_c_thread_local=0 he_c_thread_local=0 hf_binlit=0 he_binlit=0 hf_tls=1 he_tls=1 hf_asmgoto=0 he_asmgoto=0 hf_asmgoto_full=0 he_asmgoto_full=0 hf_armoured=0 he_armoured=0 hf_macro=0 he_macro=0 if_c_atomic=0 if_ext_c_atomic=0 if_macro=0 if_binlit=0'
+F_PRE11='hf_c_alignas=0 he_c_alignas=1 hf_c_alignof=0 he_c_alignof=1 hf_c_atomic=0 he_c_atomic=0 hf_c_generic=0 he_c_generic=1 hf_c_static_assert=0 he_c_static_assert=1 hf_c_thread_local=0 he_c_thread_local=1 hf_binlit=0 he_binlit=1 hf_tls=1 he_tls=1 hf_asmgoto=0 he_asmgoto=1 hf_asmgoto_full=0 he_asmgoto_full=1 hf_armoured=0 he_armoured=1 hf_macro=0 he_macro=1 hf_chain=0 hf_armoured_macro=0 if_c_atomic=0 if_ext_c_atomic=0 if_generic=0 if_ext_generic=1 if_macro=0 if_binlit=0 hf_half_armour=0 he_half_armour=0 hf_alias=0 hf_op_alias=0 ifdef_op=1'
+F_PRE11_PE='hf_c_alignas=0 he_c_alignas=0 hf_c_alignof=0 he_c_alignof=0 hf_c_atomic=0 he_c_atomic=0 hf_c_generic=0 he_c_generic=0 hf_c_static_assert=0 he_c_static_assert=0 hf_c_thread_local=0 he_c_thread_local=0 hf_binlit=0 he_binlit=0 hf_tls=1 he_tls=1 hf_asmgoto=0 he_asmgoto=0 hf_asmgoto_full=0 he_asmgoto_full=0 hf_armoured=0 he_armoured=0 hf_macro=0 he_macro=0 hf_chain=0 hf_armoured_macro=0 if_c_atomic=0 if_ext_c_atomic=0 if_generic=0 if_ext_generic=0 if_macro=0 if_binlit=0 hf_half_armour=0 he_half_armour=0 hf_alias=0 hf_op_alias=0 ifdef_op=1'
 # C11..C17: the C11 rows are features; binary literals are still an extension.
-F_C11='hf_c_alignas=1 he_c_alignas=1 hf_c_alignof=1 he_c_alignof=1 hf_c_atomic=1 he_c_atomic=1 hf_c_generic=1 he_c_generic=1 hf_c_static_assert=1 he_c_static_assert=1 hf_c_thread_local=1 he_c_thread_local=1 hf_binlit=0 he_binlit=1 hf_tls=1 he_tls=1 hf_asmgoto=0 he_asmgoto=1 hf_asmgoto_full=0 he_asmgoto_full=1 hf_armoured=1 he_armoured=1 hf_macro=1 he_macro=1 hf_chain=1 hf_armoured_macro=1 if_c_atomic=1 if_ext_c_atomic=1 if_macro=1 if_binlit=0'
-F_C11_PE='hf_c_alignas=1 he_c_alignas=1 hf_c_alignof=1 he_c_alignof=1 hf_c_atomic=1 he_c_atomic=1 hf_c_generic=1 he_c_generic=1 hf_c_static_assert=1 he_c_static_assert=1 hf_c_thread_local=1 he_c_thread_local=1 hf_binlit=0 he_binlit=0 hf_tls=1 he_tls=1 hf_asmgoto=0 he_asmgoto=0 hf_asmgoto_full=0 he_asmgoto_full=0 hf_armoured=1 he_armoured=1 hf_macro=1 he_macro=1 if_c_atomic=1 if_ext_c_atomic=1 if_macro=1 if_binlit=0'
+F_C11='hf_c_alignas=1 he_c_alignas=1 hf_c_alignof=1 he_c_alignof=1 hf_c_atomic=0 he_c_atomic=0 hf_c_generic=1 he_c_generic=1 hf_c_static_assert=1 he_c_static_assert=1 hf_c_thread_local=1 he_c_thread_local=1 hf_binlit=0 he_binlit=1 hf_tls=1 he_tls=1 hf_asmgoto=0 he_asmgoto=1 hf_asmgoto_full=0 he_asmgoto_full=1 hf_armoured=1 he_armoured=1 hf_macro=1 he_macro=1 hf_chain=1 hf_armoured_macro=1 if_c_atomic=0 if_ext_c_atomic=0 if_generic=1 if_ext_generic=1 if_macro=1 if_binlit=0 hf_half_armour=0 he_half_armour=0 hf_alias=1 hf_op_alias=1 ifdef_op=1'
+F_C11_PE='hf_c_alignas=1 he_c_alignas=1 hf_c_alignof=1 he_c_alignof=1 hf_c_atomic=0 he_c_atomic=0 hf_c_generic=1 he_c_generic=1 hf_c_static_assert=1 he_c_static_assert=1 hf_c_thread_local=1 he_c_thread_local=1 hf_binlit=0 he_binlit=0 hf_tls=1 he_tls=1 hf_asmgoto=0 he_asmgoto=0 hf_asmgoto_full=0 he_asmgoto_full=0 hf_armoured=1 he_armoured=1 hf_macro=1 he_macro=1 hf_chain=1 hf_armoured_macro=1 if_c_atomic=0 if_ext_c_atomic=0 if_generic=1 if_ext_generic=1 if_macro=1 if_binlit=0 hf_half_armour=0 he_half_armour=0 hf_alias=1 hf_op_alias=1 ifdef_op=1'
 # C23: binary literals become a feature too.
-F_C23='hf_c_alignas=1 he_c_alignas=1 hf_c_alignof=1 he_c_alignof=1 hf_c_atomic=1 he_c_atomic=1 hf_c_generic=1 he_c_generic=1 hf_c_static_assert=1 he_c_static_assert=1 hf_c_thread_local=1 he_c_thread_local=1 hf_binlit=1 he_binlit=1 hf_tls=1 he_tls=1 hf_asmgoto=0 he_asmgoto=1 hf_asmgoto_full=0 he_asmgoto_full=1 hf_armoured=1 he_armoured=1 hf_macro=1 he_macro=1 hf_chain=1 hf_armoured_macro=1 if_c_atomic=1 if_ext_c_atomic=1 if_macro=1 if_binlit=1'
-F_C23_PE='hf_c_alignas=1 he_c_alignas=1 hf_c_alignof=1 he_c_alignof=1 hf_c_atomic=1 he_c_atomic=1 hf_c_generic=1 he_c_generic=1 hf_c_static_assert=1 he_c_static_assert=1 hf_c_thread_local=1 he_c_thread_local=1 hf_binlit=1 he_binlit=1 hf_tls=1 he_tls=1 hf_asmgoto=0 he_asmgoto=0 hf_asmgoto_full=0 he_asmgoto_full=0 hf_armoured=1 he_armoured=1 hf_macro=1 he_macro=1 if_c_atomic=1 if_ext_c_atomic=1 if_macro=1 if_binlit=1'
+F_C23='hf_c_alignas=1 he_c_alignas=1 hf_c_alignof=1 he_c_alignof=1 hf_c_atomic=0 he_c_atomic=0 hf_c_generic=1 he_c_generic=1 hf_c_static_assert=1 he_c_static_assert=1 hf_c_thread_local=1 he_c_thread_local=1 hf_binlit=1 he_binlit=1 hf_tls=1 he_tls=1 hf_asmgoto=0 he_asmgoto=1 hf_asmgoto_full=0 he_asmgoto_full=1 hf_armoured=1 he_armoured=1 hf_macro=1 he_macro=1 hf_chain=1 hf_armoured_macro=1 if_c_atomic=0 if_ext_c_atomic=0 if_generic=1 if_ext_generic=1 if_macro=1 if_binlit=1 hf_half_armour=0 he_half_armour=0 hf_alias=1 hf_op_alias=1 ifdef_op=1'
+F_C23_PE='hf_c_alignas=1 he_c_alignas=1 hf_c_alignof=1 he_c_alignof=1 hf_c_atomic=0 he_c_atomic=0 hf_c_generic=1 he_c_generic=1 hf_c_static_assert=1 he_c_static_assert=1 hf_c_thread_local=1 he_c_thread_local=1 hf_binlit=1 he_binlit=1 hf_tls=1 he_tls=1 hf_asmgoto=0 he_asmgoto=0 hf_asmgoto_full=0 he_asmgoto_full=0 hf_armoured=1 he_armoured=1 hf_macro=1 he_macro=1 hf_chain=1 hf_armoured_macro=1 if_c_atomic=0 if_ext_c_atomic=0 if_generic=1 if_ext_generic=1 if_macro=1 if_binlit=1 hf_half_armour=0 he_half_armour=0 hf_alias=1 hf_op_alias=1 ifdef_op=1'
 # Rows that must stay 0 in every mode until LCCC implements the capability.
-F_ZEROS='hf_ubsan=0 he_ubsan=0 hf_asan=0 he_asan=0 hf_hwasan=0 hf_lsan=0 hf_tsan=0 hf_depmsg=0 he_depmsg=0 hf_unavailmsg=0 hf_enumattr=0 he_enumattr=0 hf_unknown=0 he_unknown=0 hf_half_armour=0 he_half_armour=0 hf_alias=0 hf_op_alias=0 ifdef_op=1'
+F_ZEROS='hf_ubsan=0 he_ubsan=0 hf_asan=0 he_asan=0 hf_hwasan=0 hf_lsan=0 hf_tsan=0 hf_depmsg=0 he_depmsg=0 hf_unavailmsg=0 hf_enumattr=0 he_enumattr=0 hf_unknown=0 he_unknown=0'
 
 for std in c89 gnu89 c99 gnu99; do
     expect_feature "feature $std" "$F_PRE11" "-std=$std"
@@ -639,14 +649,8 @@ expect_feature "feature -Werror=pedantic keeps extensions" "$F_C11" -std=gnu11 -
 expect_feature "feature -Werror=pedantic c99 keeps extensions" "$F_PRE11" -std=c99 -Werror=pedantic
 # Truthful zeros hold in every dialect class and under -pedantic-errors.
 for std in c89 gnu11 gnu23; do
-    zeros=${F_ZEROS/hf_alias=0/hf_alias=1}
-    zeros=${zeros/hf_op_alias=0/hf_op_alias=1}
-    if [ "$std" = c89 ]; then
-        zeros=${zeros/hf_alias=1/hf_alias=0}
-        zeros=${zeros/hf_op_alias=1/hf_op_alias=0}
-    fi
-    expect_feature "feature $std truthful zeros" "$zeros" "-std=$std"
-    expect_feature "feature $std truthful zeros -pedantic-errors" "$zeros" "-std=$std" -pedantic-errors
+    expect_feature "feature $std truthful zeros" "$F_ZEROS" "-std=$std"
+    expect_feature "feature $std truthful zeros -pedantic-errors" "$F_ZEROS" "-std=$std" -pedantic-errors
 done
 # Sanitizer rows: the undefined-behavior group and its members gate BOTH
 # operators; float-divide-by-zero alone is not that row in GCC 16.2.  LCCC
@@ -668,8 +672,8 @@ run_diag -E -fsanitize=address "$tmp/feature.c"
 [ "$rc" -ne 0 ] || fail "address sanitizer must be rejected" "exit 0"
 want_diag "address sanitizer is unavailable" "is not supported"
 # A string literal is not an operator invocation.
-if ! "$CCC" -E -std=gnu23 "$tmp/feature.c" 2>/dev/null | grep -qF 'int hf_c_atomic = 1;'; then
-    fail "feature code-line expansion" "expected 'int hf_c_atomic = 1;' in -E output"
+if ! "$CCC" -E -std=gnu23 "$tmp/feature.c" 2>/dev/null | grep -qF 'int hf_c_generic = 1;'; then
+    fail "feature code-line expansion" "expected 'int hf_c_generic = 1;' in -E output"
 fi
 cat >"$tmp/feature_literal.c" <<'C'
 const char *s = "__has_feature(c_atomic) __has_extension(tls)";
@@ -742,6 +746,10 @@ done
 # and the #if path must agree with the code-line path in all 18 modes.
 here=$(cd "$(dirname "$0")" && pwd)
 if ! python3 "$here/check_feature_query_oracle.py" --lccc "$CCC"; then
+    status=1
+fi
+# Capability truthfulness: every row that answers 1 must work end to end.
+if ! env CCC="$CCC" bash "$here/check_feature_capabilities.sh"; then
     status=1
 fi
 

@@ -131,11 +131,21 @@ const fn sanitized(implemented: bool) -> Row {
 ///     false capability claim.
 ///   * `address_sanitizer`, `hwaddress_sanitizer`, `leak_sanitizer`,
 ///     `thread_sanitizer`: LCCC does not implement these sanitizers.
+///   * `c_atomic`: `_Atomic` is parsed but its RMW/seq_cst semantics are not
+///     lowered (measured miscompiles; see the row comment).
 fn lookup(name: &str) -> Option<Row> {
     Some(match name {
         "c_alignas" => feature(true, Dialect::C11),
         "c_alignof" => feature(true, Dialect::C11),
-        "c_atomic" => feature(true, Dialect::C11),
+        // TRUTHFUL ZERO (measured 2026-11-08): LCCC parses `_Atomic` but does
+        // not implement C11 atomic semantics.  `_Atomic int a; a += 2;` lowers
+        // to a non-atomic load/add/store (GCC: `lock addl`), and a seq_cst
+        // store `flag = 1` lowers to a plain `movl` (GCC: `xchgl`), breaking
+        // StoreLoad ordering.  The parser explicitly does not track
+        // atomic-ness in the type system (parser/types.rs), so the qualifier
+        // never reaches IR lowering.  Claiming 1 would make headers select
+        // this broken path; see engineering/FOLLOWUP-2026-11-08-rucc-redteam.md.
+        "c_atomic" => feature(false, Dialect::C11),
         "c_generic_selections" => feature(true, Dialect::C11),
         "c_static_assert" => feature(true, Dialect::C11),
         "c_thread_local" => feature(true, Dialect::C11),
@@ -156,8 +166,9 @@ fn lookup(name: &str) -> Option<Row> {
     })
 }
 
-/// GCC accepts the armoured spelling of a feature name (`__c_atomic__`).
-/// Half armour (`__c_atomic`, `c_atomic__`) is a different, unknown identifier.
+/// GCC accepts the armoured spelling of a feature name
+/// (`__c_generic_selections__`).  Half armour (`__c_atomic`, `c_atomic__`) is a
+/// different, unknown identifier.
 fn unarmour(name: &str) -> &str {
     name.strip_prefix("__")
         .and_then(|n| n.strip_suffix("__"))
@@ -208,13 +219,14 @@ mod tests {
     const C11_NAMES: &[&str] = &[
         "c_alignas",
         "c_alignof",
-        "c_atomic",
         "c_generic_selections",
         "c_static_assert",
         "c_thread_local",
     ];
 
     const UNIMPLEMENTED: &[&str] = &[
+        // `_Atomic` is parsed but not lowered to atomic RMW / seq_cst stores.
+        "c_atomic",
         "address_sanitizer",
         "hwaddress_sanitizer",
         "leak_sanitizer",
@@ -357,7 +369,7 @@ mod tests {
             assert!(!resolve(name, true, m), "{name:?} extension");
         }
         // Triple armour leaves one layer behind, which is not a known name.
-        assert!(!resolve("___c_atomic___", false, m));
+        assert!(!resolve("___c_generic_selections___", false, m));
     }
 
     #[test]
