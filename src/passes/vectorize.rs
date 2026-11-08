@@ -1238,12 +1238,7 @@ fn vectorize_with_analysis_mode(
                         "[VEC] Reduction pattern matched! Transforming to AVX2 4-wide"
                     ));
                 }
-                total_changes += transform_reduction_avx2(
-                    func,
-                    &red_pattern,
-                    fp_contract,
-                    neon,
-                );
+                total_changes += transform_reduction_avx2(func, &red_pattern, fp_contract, neon);
             }
         } else if !no_map_vec() {
             // AUD-4: the late scope deliberately does NOT gate the map

@@ -853,3 +853,207 @@ compiler that has none of the findings, independent fast/ref oracles in the
 shape corpus, and two permanent mutation tests that inject real wrong-code
 bugs into both C corpora and require the harness to go red.  A checker that
 cannot fail is decoration; this one cannot stay green under mutation.
+
+## 9c.9 Post-rebase red-team re-audit, measured outcomes (2026-11-08)
+
+Everything below was executed in the recovered workspace against
+`origin/main` `782b9f4` with the tag-cache toolchain
+(`harness-cache-8`, `d66c5ac881e2`), the fastbuild preset, `-D warnings` and
+an active 4 GiB swap file.  Claims from the pre-wipe session are **not**
+carried over: every number here was re-measured.
+
+### 9c.9.1 Rebase conflict resolution audit
+
+The harness wipe recreated the branch from a shallow `1df02c0`; the surviving
+31 working-tree edits were recovered, unshallowed, rebased onto `782b9f4`
+and force-pushed.  Two files conflicted and were resolved to the `main`
+side.  A three-way check against the old branch tip `3c25c8c7` proves no
+unique patch-side edit was lost:
+
+| File | old bytes | HEAD bytes | diff vs old | patch-only lines removed |
+|------|-----------|------------|-------------|--------------------------|
+| `scripts/check_maskfacts_vl_matrix.py` | 23,435 | 27,749 | +102 / −1 | 1 (`failures += diag_failures`, generalized in main to `+= diag_failures + sig_failures`) |
+| `src/passes/simd_mask_facts_tests.rs` | 237,034 | 242,820 | +179 / −0 | 0 |
+
+`main` is a strict superset: it already contains the set1-signature parity
+check and 179 extra mask-facts tests from the earlier merged PR.  The five
+auto-merged overlap files (`include/lcccsimd.h`, `scripts/gen_lcccsimd.py`,
+`src/frontend/sema/intrinsic_arity.rs`, `src/passes/simd_mask_facts.rs`,
+`tests/regression/maskfacts_cross/avx512vl_cmp_matrix.c`) have **zero** diff
+against `origin/main`, i.e. their patch-side edits were already merged.
+
+### 9c.9.2 Red-team findings in the NEW logic, and the fixes
+
+Four additional soundness gaps were found by tracing each new code path.
+Each is a fail-closed change with a unit test; none relaxes a gate.
+
+1. **ARX exit-extract dominance (SA-07 follow-up).**  The outside-use rewrite
+   walked every block outside the loop and replaced a deleted word phi with
+   an extract materialized at the top of the exit block.  The pre-scan proved
+   only that the use was *rewritable*, not that the extract *dominated* it.
+   A sibling-branch, unreachable-block, or exit-block-`Phi` use would become
+   invalid SSA (use-before-def in the same block, or a phi reading a value
+   from the wrong edge) — a second route to the backend's "cannot be
+   materialised" panic.  `transform_arx_loop` now builds a
+   `DominanceChecker`, rejects exit-block phi uses, and requires every other
+   outside use (instruction **or** terminator) to be dominated by the exit
+   block, **before the first mutation**.
+2. **Compile-time totality instead of `debug_assert!`.**  The original
+   terminator completeness check relied on a debug-only assertion.  Both
+   `terminator_uses_any` and `rewrite_terminator_operands` now match the
+   `Terminator` enum exhaustively with no wildcard arm: adding an
+   operand-bearing variant is a compile error on *every* build, at zero
+   runtime cost.  This also removes one `panic_sites` census entry
+   (`unreachable!("Fma pack from non-add/sub")` in the SLP packed-FMA form
+   was replaced by a total `if/else` chain that degrades to the generic
+   path), restoring the ratchet to its 863 baseline.
+3. **Computed-goto CFG edges (SA-06 follow-up).**  `terminator_targets()`
+   had `_ => Vec::new()`, which hid `IndirectBranch.possible_targets` from
+   the exit-predecessor proof.  An indirect bypass into the exit block could
+   therefore be clobbered by the inserted `VecStoreI32x4`.  The function is
+   now exhaustive and returns the computed-goto targets.  The proof also no
+   longer skips `bi == exit_idx`: because `dominates` is reflexive, a
+   one-block self-loop exit (whose stores would re-execute) is caught.
+4. **`-mcmodel=large` was a silent lie.**  The CLI folded it into the small
+   model; the linker then failed above 2 GiB `.bss` with "recompile with
+   -mcmodel=large", advice the user had already followed.  It now fails
+   early with an actionable diagnostic.  The unbounded YARPGen generator is
+   constrained to `--max-array-dims=3` so the fuzz campaign stays inside the
+   *supported* code model; an image that still exceeds 2 GiB is classified
+   SKIP only when **every** leg fails with the same 32-bit relocation
+   overflow (a partial failure stays a hard FAIL).  A true large code model
+   — absolute 64-bit symbol addressing plus GOT-safe PIC — is recorded as a
+   scoped follow-up, not faked.
+
+The SLP packed-FMA form, the unified FMA ISA gate, the EVEX/BW/DQ permission
+rows and the VEX.L=1 width guard were re-read line by line: all operand
+orders, arities and `LIG`/immediate-first delegation rules match the GNU as
+2.47 authority.  `check_vex_half_width` deliberately returns `Ok(())` for
+wrong arity or a symbolic immediate so the encoder — not the guard — owns
+those diagnostics.
+
+### 9c.9.3 Measured test outcomes
+
+| Gate | Result |
+|------|--------|
+| `cargo build --profile fastbuild --locked -j1 -D warnings` | clean (23 s incremental, 13 m 36 s cold) |
+| `cargo test --profile fastbuild --lib` | 8477 passed, 0 failed, 10 ignored |
+| `cargo fmt --all -- --check` | clean |
+| `scripts/audit_census.py --check` | PASS, no metric grew (863 panic sites, 255 undocumented knobs vs baseline 261) |
+| `scripts/gen_lcccsimd.py --check` / `gen_x86_builtin_types.py --check` | both clean |
+| `python3 -m unittest discover -s tests/simd -p 'test_*.py'` | 38 tests OK (1 skipped: PyYAML optional), 7 driver self-tests wired |
+| seven driver `--self-test` totals | 117/117 (39/15/16/5/13/18/11) |
+| `check_audit_2026-11-08.py --strict` (built LCCC) | 15/15 PASS, 0 problems |
+| `check_assembler_widths.py --require-gas-247` | 16 cases, 8 byte-identical encodings, 0 problems |
+| `check_isa_permissions.py` | 97 wrappers, 65 enforced, 32 open, 0 problems |
+| GCC 16.2 full ISA matrix + sanitize + bench | 12/12 configurations, 42 shapes, 0 problems |
+| Clang 23.1.5 full ISA matrix + sanitize + bench | 12/12 configurations, 42 shapes, 0 problems |
+| QEMU cross legs (NEON, SVE, RVV x4 VLEN, i686) | 11/11 configurations, 42 shapes, 0 problems |
+| YARPGen 2.0 quick (24 seeds x 4 legs) | 24/24 seeds, 0 problems, 0 SKIP, code-model probe PASS |
+| `check_lccc_capability.py` | PASS: 4 pinned option gaps, 3 pinned intrinsics, 0 unclassified diagnostics |
+
+### 9c.9.4 Runtime/hardware evidence (GDB, objdump, Valgrind)
+
+* **GDB 18.1** on `target/fastbuild/lccc -std=c99 -O2 -g`: a breakpoint in
+  the ChaCha-shaped bypass kernel is hit twice; `finish` returns
+  `0x480bac99` and `0x8d833099`, and the terminator-word kernel returns
+  `0xf29489f3`.  GCC 16.2.0 `-O0` prints the same three values.  No ICE,
+  no signal, normal exit.
+* **objdump** of the same `-O2` binary: the vectorized kernel contains
+  8 `paddd`, 7 `pshufd`, 6 `pslld`, 6 `psrld`, 6 `por`, 8 `pxor`.  The
+  correctness fixes did **not** take the lazy route of disabling
+  vectorization; the packed SSE2 quarter-round schedule survives.
+* **Valgrind 3.19** (extracted from the tag-cache Debian package, static
+  link to avoid the stripped `ld.so` redirection failure): 14 conditional-
+  jump / `set_robust_list` reports, **identical in count and class** for the
+  LCCC and GCC 16.2 static binaries, all in glibc `__libc_cleanup_*`,
+  `_IO_*` and `__tls_init_tp`; 0 heap bytes in use at exit; **0** diagnostic
+  frames reaching the audit kernels in the LCCC build (4 in the GCC build,
+  all reached through `printf`).  These are toolchain false positives, not
+  codegen memory errors.
+* `pahole`, `objtool`, `perf`, `icx`/`icpx`, GDB-based remote oracles: not
+  present in the tag cache and the Intel PPA is outside the allowed hosts
+  (`SSL_ERROR_SYSCALL`, http=000).  The hosted
+  `Authenticated Intel ICX 2026.2 integration` CI lane passes; that is the
+  only ICX evidence and it is not claimed as locally executed.  Structure
+  layout was checked with `readelf`/`objdump` DWARF instead of `pahole`, and
+  stack/CFI metadata with `objdump -dr` instead of `objtool`.  No claim is
+  made that the unavailable tools were run.
+
+### 9c.9.5 Honest remaining capability debt (ratcheted, not hidden)
+
+Running the 42-shape strict corpus against `target/fastbuild/lccc` (rather
+than a reference compiler) yields 4 tolerated-option warnings
+(`-Wconversion`, `-Wshadow`, `-Wcast-qual`, `-Wwrite-strings`) and 3
+missing intrinsics (`_mm512_mask_add_epi32`, `_mm512_mullo_epi64`,
+`_mm_mask_add_epi32`).  The option warnings are *deliberate*: the GP-22
+option-effect ledger treats an accepted-but-inert option as a failure state,
+so LCCC warns by name.  Silently accepting them would violate that design
+contract, so the debt is pinned in `lccc_capability_gaps.json` and enforced
+in both directions by `check_lccc_capability.py`.  A future change that
+implements any of the seven capabilities will turn the ratchet red until its
+golden is reviewed with a differential test — improvements cannot be
+credited without evidence.
+
+### 9c.9.6 CI failure analysis and resolutions
+
+The first post-rebase CI run reported seven red jobs.  Root causes were
+identified from check-run annotations (the log blob host is outside the
+network allowlist) and fixed at the source:
+
+| Job | Root cause | Fix |
+|-----|------------|-----|
+| Clippy / Rust 1.99 relocation value contracts | `cargo fmt --all -- --check` diff in 7 hunks of the new encoder/pass code | `cargo fmt --all`; check clean |
+| Fast local contracts (shard b) / Assembler and linker contracts | `audit_census.py --check` grew `panic_sites` 863→864 (the SLP `unreachable!`) | total `if/else` form chain; census back to 863 |
+| Codegen and runtime contracts (shard a) | `test_15` still expected `OPEN-CONFIRMED` for an injected ICE after SA-07 became a fixed control | test now requires `REGRESSION` + `compiler crash`, and forbids `OPEN-CONFIRMED` |
+| Test Suite | aggregate lane requiring every independent lane to pass | resolves with the above |
+
+`tests/regression/check_param_home_contracts.py` invokes the same census
+ratchet internally, which is why the single extra panic site reddened two
+otherwise unrelated lanes.
+
+### 9c.9.7 Three-way host runtime measurement (honest, not a victory claim)
+
+The user requirement is to beat GCC 16.2, Clang 23.1.5 and ICX 2026.2.
+That is **not yet achieved** and is not claimed here.  A controlled
+same-host measurement (`-std=c99 -O2 -march=native`, 29 shapes, 7 batches x
+256 iterations, median ns per shape, identical `all`-mode checksum gate with
+29/29 `ok` before timing, 2 vCPU Xeon family 6 model 106) gives:
+
+| Compiler | median ns per shape |
+|----------|---------------------|
+| GCC 16.2.0 | 127.3 |
+| Clang 23.1.5 | 114.4 |
+| LCCC (fastbuild) | 184.4 |
+
+Geometric mean of `LCCC / min(GCC,Clang)` across the 29 shapes: **2.79x**
+slower.  Worst outliers: `vzeroupper_trans` 11.01x, `fir4` 10.21x,
+`bytemask` 9.17x, `utf8_classify` 9.15x, `clamp_u8` 8.42x.  One shape is
+genuinely faster (`dot2_multi_acc` 0.61x, i.e. 1.64x faster than the best
+reference) because LCCC keeps the two accumulators separate where Clang
+fuses them.  Scalar-bound shapes (`adler32`, `fnv1a`, `horspool`,
+`memchr_scan`, `base64_decode`) are within 1.0–1.1x, confirming the gap is
+in **vector code generation**, not in the harness or the scalar baseline.
+
+This measurement is the quantified baseline for the remaining performance
+work; the fixes in this PR are correctness/legality fixes that must not
+regress it.  `objdump` confirms the ARX kernel is still vectorized after the
+fail-closed proofs (§9c.9.4), so correctness was not bought by disabling
+optimization.  Timing is exploratory: 2 vCPU virtual host, no affinity or
+frequency control, no order-balanced repeated kernels.
+
+### 9c.9.8 Vendor specification authority
+
+VEX.L=1 half-width operand forms, EVEX/BW/DQ feature requirements and the
+GCC 16.2 intrinsic header rows were checked against the repository's
+`engineering/isa/` ledger (`intel-sdm-093-compiler-audit.md`,
+`intel-sdm-093-section-ledger.json`, `gcc16-sse-avx-reference.json`,
+`sse-avx-public-api.json`, `gnu-x86-builtin-types.tsv`) and against the
+authority executable GNU as 2.47.20260726 for every byte-level encoding.
+The Arm 2026-09 ISA XML from `harness-cache-8` backs the AArch64 NEON/SVE
+cross legs; RVV VLEN 128/256/512/1024 coverage is exercised through QEMU
+11.1.3 rather than assumed from the specification.  No 2026 vendor PDF was
+fetched (Intel's PPA and document hosts are outside the sandbox allowlist);
+the byte-exact executable oracles are the stronger authority for the
+specific encodings changed here, and the missing full-SDM consultation is
+recorded as a limitation rather than asserted.

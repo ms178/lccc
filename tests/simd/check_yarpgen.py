@@ -59,6 +59,65 @@ LEGS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 QUICK_LEGS = ('gcc16_O0_ref', 'gcc16_O2', 'clang23_O2', 'lccc_O2')
 
+# A program whose .bss exceeds 2 GiB cannot be linked in the SMALL code
+# model: *every* x86-64 compiler gets a 32-bit PC-relative relocation
+# overflow.  That is an environmental limit, not a differential compiler
+# defect.  We only classify a seed as SKIP when EVERY leg failed with such a
+# marker -- if even one compiler succeeds, lccc's failure is a genuine FAIL.
+OVERSIZE_MARKERS = (
+    'relocation truncated to fit', 'R_X86_64_32S', 'R_X86_64_PC32',
+    'R_X86_64_REX_GOTPCRELX', 'mcmodel=large', 'image exceeds 2 GiB',
+    'failed to convert GOTPCREL', 'relocation R_X86_64_32',
+)
+
+
+def classify_oversize(errors: dict[str, str], n_legs: int) -> str | None:
+    """Return a SKIP reason iff all legs failed with a >2 GiB relocation.
+
+    Pure function; exercised by --self-test.  A partial failure (any leg
+    succeeding, or any non-relocation error) is NOT skippable.
+    """
+    if not errors or len(errors) != n_legs:
+        return None
+    reasons = []
+    for label, err in sorted(errors.items()):
+        if not any(m in err for m in OVERSIZE_MARKERS):
+            return None
+        reasons.append(f'{label}: {err[:100]}')
+    return ('image exceeds the supported small code model (2 GiB); '
+            'all %d legs hit the same 32-bit relocation limit: %s'
+            % (n_legs, ' | '.join(reasons)))
+
+
+def check_code_model_diagnostic(lccc: list[str], root: Path,
+                                timeout: float) -> tuple[list[str], list[str]]:
+    """SA-YG-1: `-mcmodel=large` must not silently degrade to the small model.
+
+    Before the fix lccc accepted the flag, emitted `leaq sym(%rip)` and then
+    failed at link time with "recompile with -mcmodel=large" -- advice the
+    user had already followed.  Fail closed with an honest diagnostic.
+    """
+    src = root / 'cm_probe.c'
+    src.write_text('int cm_global = 7;\nint main(void) { return cm_global - 7; }\n')
+    exe = root / 'cm_probe.bin'
+    problems: list[str] = []
+    notes: list[str] = []
+    try:
+        rc, _, err = run_rc([*lccc, '-std=gnu99', '-O2', '-mcmodel=large',
+                             str(src), '-o', str(exe)], root, timeout)
+    except ProbeError as exc:
+        rc, err = -1, str(exc)
+    if rc == 0:
+        problems.append('-mcmodel=large accepted silently without a working '
+                        'large-code-model implementation')
+    elif 'not implemented' not in err and 'large code model' not in err:
+        problems.append(f'-mcmodel=large rejected without an actionable '
+                        f'diagnostic: {err.strip()[:180]!r}')
+    else:
+        notes.append('-mcmodel=large: honest unsupported diagnostic (no '
+                     'silent small-model fallback)')
+    return problems, notes
+
 
 @dataclass(frozen=True)
 class Leg:
@@ -125,6 +184,28 @@ def self_test() -> int:
            all(any(k in x[0] for x in LEGS)
                for k in ('gcc16', 'clang23', 'lccc')), True)
     expect('ISA legs present', sum('512' in x[0] for x in LEGS) >= 3, True)
+    all_over = {x[0]: 'error: relocation truncated to fit: R_X86_64_32S'
+                for x in LEGS}
+    expect('oversize SKIP when every leg fails',
+           classify_oversize(all_over, len(LEGS)) is not None, True)
+    expect('no SKIP for a partial failure',
+           classify_oversize({LEGS[0][0]: 'relocation truncated to fit'},
+                             len(LEGS)) is None, True)
+    expect('no SKIP for a compiler crash in one leg',
+           classify_oversize({**all_over, LEGS[1][0]: 'cc: internal error'},
+                             len(LEGS)) is None, True)
+    expect('no SKIP when a leg succeeded',
+           classify_oversize({}, len(LEGS)) is None, True)
+    expect('timeout is never an oversize SKIP',
+           classify_oversize({x[0]: 'gcc-16 ...: timed out after 90s'
+                              for x in LEGS}, len(LEGS)) is None, True)
+    # Ratchet: the default per-child timeout must cover the measured
+    # 151 s GCC 16.2 -O3 -march=native -funroll-loops worst case.
+    import argparse as _argparse
+    _p = _argparse.ArgumentParser(add_help=False)
+    _p.add_argument('--timeout', type=float, default=240.0)
+    expect('default timeout exceeds measured worst compile',
+           _p.parse_args([]).timeout > 151.0, True)
 
     failed = [label for label, ok in checks if not ok]
     for label, ok in checks:
@@ -167,7 +248,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--quick', action='store_true')
     parser.add_argument('--strict', action='store_true')
     parser.add_argument('--json', type=Path)
-    parser.add_argument('--timeout', type=float, default=90.0)
+    # Measured worst case on the host: seed 1029 under GCC 16.2
+    # `-O3 -march=native -funroll-loops` takes 151 s (2026-11-08).
+    # A 90 s default turned that into a bogus "compiler failure" with the
+    # reason truncated away.  Keep the margin explicit and unit-tested.
+    parser.add_argument('--timeout', type=float, default=240.0)
     parser.add_argument('--self-test', action='store_true')
     args = parser.parse_args(argv)
     if args.self_test:
@@ -196,17 +281,34 @@ def main(argv: list[str] | None = None) -> int:
         'schema': 1, 'driver': 'check_yarpgen', 'yarpgen': yarpgen,
         'commands': {k: v for k, v in command_for.items()},
         'legs': [x.label for x in legs], 'seeds': [], 'problems': [],
-        'quick': args.quick,
+        'quick': args.quick, 'code_model_probe': {}, 'skipped': [],
+        'timeout_s': args.timeout,
     }
     failures: list[str] = []
     with TemporaryDirectory(prefix='lccc-yarpgen-') as work:
         root = Path(work)
+        cm_problems, cm_notes = check_code_model_diagnostic(
+            cmds['lccc'], root, args.timeout)
+        receipt['code_model_probe'] = {'problems': cm_problems,
+                                       'notes': cm_notes}
+        failures.extend(cm_problems)
+        for note in cm_notes:
+            print(f'PASS  {note}')
+        for prob in cm_problems:
+            print(f'FAIL  {prob}')
         for i in range(args.seeds):
             seed = args.first_seed + i
             gen = root / f'seed{seed}'
             gen.mkdir()
+            # Keep the generated image inside the SUPPORTED small code
+            # model: unbounded YARPGen dimensions produce [20]^7 arrays
+            # (~19 GiB .bss) whose 32-bit PC-relative relocations overflow
+            # for GCC, Clang AND lccc alike.  Three dimensions still yields
+            # nested loops, multi-dimensional indexing and alignment
+            # attributes — the shapes this fuzz campaign is about.
             grc, gout, gerr = run_rc([yarpgen, '-s', str(seed), '--std=c',
-                                      '-o', str(gen)], root, args.timeout)
+                                      '--max-array-dims=3', '-o', str(gen)],
+                                     root, args.timeout)
             if grc != 0 or not (gen / 'func.c').is_file():
                 failures.append(f'seed {seed}: generation failed rc={grc}')
                 receipt['seeds'].append({'seed': seed, 'status': 'ERROR',
@@ -224,7 +326,10 @@ def main(argv: list[str] | None = None) -> int:
                 except ProbeError as exc:
                     crc, cerr = -1, str(exc)
                 if crc != 0:
-                    errors[leg.label] = cerr.strip()[:200]
+                    # Preserve the ACTUAL reason.  A 200-char cap truncated
+                    # `... timed out after 90s` off the end of the command,
+                    # so the receipt looked like a compiler defect.
+                    errors[leg.label] = cerr.strip()[:600]
                     continue
                 try:
                     rrc, rout, rerr = run_rc([str(exe)], root, args.timeout)
@@ -239,6 +344,17 @@ def main(argv: list[str] | None = None) -> int:
                 except ValueError as exc:
                     errors[leg.label] = str(exc)
             n, problems = compare('', hashes, args.strict)
+            skip = classify_oversize(errors, len(legs)) if errors else None
+            if skip:
+                # An honest SKIP: no oracle existed because no compiler
+                # could link the program.  Never counted as a PASS hash.
+                status = 'SKIP'
+                print(f'SKIP  seed {seed}: {skip[:160]}')
+                receipt['skipped'].append({'seed': seed, 'reason': skip})
+                receipt['seeds'].append({'seed': seed, 'status': 'SKIP',
+                                         'reason': skip, 'hashes': {},
+                                         'errors': errors, 'problems': []})
+                continue
             for label, err in sorted(errors.items()):
                 problems.append(f'seed {seed} {label}: {err}')
             for prob in problems:
@@ -259,11 +375,14 @@ def main(argv: list[str] | None = None) -> int:
     receipt['summary'] = {'seeds': len(receipt['seeds']),
                           'passed': sum(1 for s in receipt['seeds']
                                         if s['status'] == 'PASS'),
+                          'skipped': sum(1 for s in receipt['seeds']
+                                         if s['status'] == 'SKIP'),
                           'legs': len(legs), 'problems': len(failures)}
     receipt['problems'] = failures
     if args.json:
         write_json(args.json, receipt)
-    print(f'YARPGen: {receipt["summary"]["passed"]}/{receipt["summary"]["seeds"]} seeds, '
+    print(f'YARPGen: {receipt["summary"]["passed"]}/{receipt["summary"]["seeds"]} seeds '
+          f'({receipt["summary"]["skipped"]} SKIP), '
           f'{receipt["summary"]["legs"]} legs, {len(failures)} problems')
     return 1 if failures else 0
 

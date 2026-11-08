@@ -4030,70 +4030,66 @@ impl super::InstructionEncoder {
         Ok(())
     }
 
-/// VEX.L=1 half-width operand discipline for the 128-bit insert/extract
-/// and 2-source permute families (Intel SDM Vol. 2; byte-probed against
-/// GNU as 2.47.20260726).  SA-13: the integrated assembler used to accept
-/// `vinserti128 $1, %xmm1, %xmm2, %xmm3`, silently encoding VEX.L=0 bytes
-/// that no real CPU decodes as VINSERTI128.  GAS rejects that spelling with
-/// `operand size mismatch for `vinserti128'`.
-///
-///   Insert  : `$imm, xmm|m128 src, ymm vvvv, ymm dst`
-///   Extract : `$imm, ymm src, xmm|m128 dst`
-///   Perm2   : `$imm, ymm src, ymm vvvv, ymm dst`
-///
-/// Arity errors are deliberately delegated to the encoder (which has its
-/// own, byte-probed diagnostics); this check only refuses *wrong-width*
-/// spellings so it cannot change any other error text.
-pub(crate) fn check_vex_half_width(
-    mnemonic: &str,
-    ops: &[Operand],
-    kind: VexHalfKind,
-) -> Result<(), String> {
-    let is_reg = |op: &Operand, want_ymm: bool| match op {
-        Operand::Register(r) => {
-            if want_ymm {
-                is_ymm(&r.name)
-            } else {
-                is_xmm(&r.name)
+    /// VEX.L=1 half-width operand discipline for the 128-bit insert/extract
+    /// and 2-source permute families (Intel SDM Vol. 2; byte-probed against
+    /// GNU as 2.47.20260726).  SA-13: the integrated assembler used to accept
+    /// `vinserti128 $1, %xmm1, %xmm2, %xmm3`, silently encoding VEX.L=0 bytes
+    /// that no real CPU decodes as VINSERTI128.  GAS rejects that spelling with
+    /// `operand size mismatch for `vinserti128'`.
+    ///
+    ///   Insert  : `$imm, xmm|m128 src, ymm vvvv, ymm dst`
+    ///   Extract : `$imm, ymm src, xmm|m128 dst`
+    ///   Perm2   : `$imm, ymm src, ymm vvvv, ymm dst`
+    ///
+    /// Arity errors are deliberately delegated to the encoder (which has its
+    /// own, byte-probed diagnostics); this check only refuses *wrong-width*
+    /// spellings so it cannot change any other error text.
+    pub(crate) fn check_vex_half_width(
+        mnemonic: &str,
+        ops: &[Operand],
+        kind: VexHalfKind,
+    ) -> Result<(), String> {
+        let is_reg = |op: &Operand, want_ymm: bool| match op {
+            Operand::Register(r) => {
+                if want_ymm {
+                    is_ymm(&r.name)
+                } else {
+                    is_xmm(&r.name)
+                }
             }
+            _ => false,
+        };
+        let mem_or = |op: &Operand, want_ymm: bool| match op {
+            Operand::Memory(_) => true,
+            _ => is_reg(op, want_ymm),
+        };
+        let imm_first = matches!(
+            ops.first(),
+            Some(Operand::Immediate(ImmediateValue::Integer(_)))
+        );
+        // Delegate arity and immediate-type errors to the encoder.
+        let arity = match kind {
+            VexHalfKind::Insert | VexHalfKind::Perm2 => 4,
+            VexHalfKind::Extract => 3,
+        };
+        if !imm_first || ops.len() != arity {
+            return Ok(());
         }
-        _ => false,
-    };
-    let mem_or = |op: &Operand, want_ymm: bool| match op {
-        Operand::Memory(_) => true,
-        _ => is_reg(op, want_ymm),
-    };
-    let imm_first = matches!(
-        ops.first(),
-        Some(Operand::Immediate(ImmediateValue::Integer(_)))
-    );
-    // Delegate arity and immediate-type errors to the encoder.
-    let arity = match kind {
-        VexHalfKind::Insert | VexHalfKind::Perm2 => 4,
-        VexHalfKind::Extract => 3,
-    };
-    if !imm_first || ops.len() != arity {
-        return Ok(());
+        let ok = match kind {
+            VexHalfKind::Insert => {
+                mem_or(&ops[1], false) && is_reg(&ops[2], true) && is_reg(&ops[3], true)
+            }
+            VexHalfKind::Extract => is_reg(&ops[1], true) && mem_or(&ops[2], false),
+            VexHalfKind::Perm2 => {
+                is_reg(&ops[1], true) && is_reg(&ops[2], true) && is_reg(&ops[3], true)
+            }
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(format!("operand size mismatch for `{mnemonic}'"))
+        }
     }
-    let ok = match kind {
-        VexHalfKind::Insert => {
-            mem_or(&ops[1], false)
-                && is_reg(&ops[2], true)
-                && is_reg(&ops[3], true)
-        }
-        VexHalfKind::Extract => {
-            is_reg(&ops[1], true) && mem_or(&ops[2], false)
-        }
-        VexHalfKind::Perm2 => {
-            is_reg(&ops[1], true) && is_reg(&ops[2], true) && is_reg(&ops[3], true)
-        }
-    };
-    if ok {
-        Ok(())
-    } else {
-        Err(format!("operand size mismatch for `{mnemonic}'"))
-    }
-}
 
     pub(crate) fn encode_avx_scalar_3op(
         &mut self,
@@ -7112,5 +7108,72 @@ mod tests {
         let ops = [reg("ymm1"), reg("zmm2"), reg("xmm3")];
         assert!(check_evex_vector_widths(&ops, false).is_err());
         assert!(check_evex_vector_widths(&ops, true).is_ok());
+    }
+
+    /// SA-13 white-box proof.  The six VEX.L=1 insert/extract/perm2 families
+    /// have exactly ONE legal register spelling each; everything else must
+    /// be rejected `before` the encoder invents VEX.L=0 bytes.  This mirrors
+    /// the byte-probed GNU as 2.47 table in
+    /// tests/simd/check_assembler_widths.py, but runs in-process so a
+    /// regression is caught by `cargo test` without a toolchain.
+    #[test]
+    fn vex_half_width_discipline_is_fail_closed() {
+        use super::super::InstructionEncoder;
+        use crate::backend::x86::assembler::parser::ImmediateValue;
+
+        let imm = || Operand::Immediate(ImmediateValue::Integer(1));
+        let check = |ops: Vec<Operand>, kind: VexHalfKind| {
+            InstructionEncoder::check_vex_half_width("vinserti128", &ops, kind)
+        };
+        // Legal insert: imm8, xmm/m128 src, ymm vvvv, ymm dst.
+        let good_insert = vec![imm(), reg("xmm1"), reg("ymm2"), reg("ymm3")];
+        assert!(check(good_insert.clone(), VexHalfKind::Insert).is_ok());
+        // The exact spelling GNU as rejects with "operand size mismatch".
+        let all_xmm = vec![imm(), reg("xmm1"), reg("xmm2"), reg("xmm3")];
+        let err = check(all_xmm, VexHalfKind::Insert).unwrap_err();
+        assert!(err.contains("operand size mismatch"), "{err}");
+        // Wrong width in each of the three register positions.
+        for bad in [
+            vec![imm(), reg("ymm1"), reg("ymm2"), reg("ymm3")],
+            vec![imm(), reg("xmm1"), reg("xmm2"), reg("ymm3")],
+            vec![imm(), reg("xmm1"), reg("ymm2"), reg("xmm3")],
+        ] {
+            assert!(check(bad, VexHalfKind::Insert).is_err());
+        }
+        // Legal extract: imm8, ymm src, xmm/m128 dst.
+        let good_extract = vec![imm(), reg("ymm1"), reg("xmm2")];
+        assert!(check(good_extract.clone(), VexHalfKind::Extract).is_ok());
+        assert!(check(vec![imm(), reg("xmm1"), reg("xmm2")], VexHalfKind::Extract).is_err());
+        assert!(check(vec![imm(), reg("ymm1"), reg("ymm2")], VexHalfKind::Extract).is_err());
+        // perm2 needs three ymm registers (no half-width form at all).
+        assert!(
+            check(
+                vec![imm(), reg("ymm1"), reg("ymm2"), reg("ymm3")],
+                VexHalfKind::Perm2
+            )
+            .is_ok()
+        );
+        assert!(
+            check(
+                vec![imm(), reg("xmm1"), reg("ymm2"), reg("ymm3")],
+                VexHalfKind::Perm2
+            )
+            .is_err()
+        );
+        // Arity / immediate-type errors are DELEGATED to the encoder: this
+        // guard must never reject a spelling it does not fully understand.
+        assert!(check(vec![reg("xmm1"), reg("ymm2")], VexHalfKind::Insert).is_ok());
+        assert!(
+            check(
+                vec![
+                    Operand::Immediate(ImmediateValue::Symbol("sym".into())),
+                    reg("xmm1"),
+                    reg("xmm2"),
+                    reg("xmm3"),
+                ],
+                VexHalfKind::Insert
+            )
+            .is_ok()
+        );
     }
 }

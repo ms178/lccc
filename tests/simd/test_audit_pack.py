@@ -83,8 +83,18 @@ class AuditPackTests(unittest.TestCase):
     def test_01_drivers_self_test(self):
         """The checkers must be able to fail; a green checker that cannot
         detect its own breakage is decoration."""
-        for script in (DRIVER, MATRIX):
+        # Every driver in this pack must be able to fail.  Adding a new
+        # checker without wiring its --self-test here would leave an
+        # unvalidated oracle in CI; enumerate them explicitly.
+        drivers = (DRIVER, MATRIX,
+                   HERE / 'check_simd_isa_matrix.py',
+                   HERE / 'check_isa_permissions.py',
+                   HERE / 'check_assembler_widths.py',
+                   HERE / 'check_yarpgen.py',
+                   HERE / 'check_lccc_capability.py')
+        for script in drivers:
             with self.subTest(script=script.name):
+                self.assertTrue(script.is_file(), f'missing driver {script}')
                 proc = run([PY, str(script), '--self-test'])
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertIn('checks passed', proc.stdout)
@@ -290,8 +300,14 @@ class AuditPackTests(unittest.TestCase):
         self.assertEqual(sum('MISMATCH' in line for line in lines), 1)
 
     def test_15_crash_oracle_is_not_fooled_by_diagnostics(self):
-        """SA-07 counts only a genuine compiler crash as evidence.  A feature
-        diagnostic from a broken toolchain must stay a hard ERROR."""
+        """A genuine crash and a feature diagnostic must be distinguished.
+
+        SA-07 is now a *fixed* hard control (the ARX terminator bug was
+        repaired), so a real ICE is REGRESSION evidence -- never a silent
+        PASS and never an expected OPEN-CONFIRMED.  A feature diagnostic
+        from a broken toolchain must stay a hard ERROR.  Both are hard
+        failures; only the classification differs.
+        """
         scripts = {
             'ice': 'echo "lccc: internal compiler error: in expand_expr" >&2\nexit 1\n',
             'diag': ("echo \"lccc: error: unrecognized command-line option "
@@ -310,12 +326,16 @@ class AuditPackTests(unittest.TestCase):
                         if len(line.split()) >= 2 and line.split()[1] == 'sa07']
                 self.assertEqual(len(sa07), 1, proc.stdout)
                 if name == 'ice':
-                    self.assertIn('OPEN-CONFIRMED', sa07[0],
-                                  'a real ICE must be SA-07 evidence')
+                    self.assertIn('REGRESSION', sa07[0],
+                                  'a real ICE must fail a fixed control hard')
                     self.assertIn('compiler crash', sa07[0])
+                    self.assertNotIn('OPEN-CONFIRMED', sa07[0],
+                                     'SA-07 is fixed; an ICE is no longer '
+                                     'expected evidence')
                 else:
                     self.assertIn('ERROR', sa07[0],
                                   'a feature diagnostic must not be ICE evidence')
+                    self.assertNotIn('compiler crash', sa07[0])
                 self.assertNotEqual(proc.returncode, 0)
 
     @unittest.skipUnless(importlib.util.find_spec('yaml') is not None,

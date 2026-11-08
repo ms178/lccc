@@ -4605,13 +4605,20 @@ fn build_pack(
                                             // (a·b) − acc.  Some(false):
                                             // acc − (a·b).  `Add` is
                                             // commutative and always fma.
-                                            form: match (op, orientation) {
-                                                (IrBinOp::Add, _) => PackedFmaForm::Add,
-                                                (IrBinOp::Sub, Some(true)) =>
-                                                    PackedFmaForm::SubAcc,
-                                                (IrBinOp::Sub, _) =>
-                                                    PackedFmaForm::SubProduct,
-                                                _ => unreachable!("Fma pack from non-add/sub"),
+                                            // `op` is Add|Sub by the enclosing
+                                            // legality gate, so this chain is
+                                            // total.  Deliberately no
+                                            // `unreachable!()`: a future new
+                                            // binop must degrade to the
+                                            // generic path, not panic in a
+                                            // release compiler (audit-census
+                                            // ratchets every panic site).
+                                            form: if op == IrBinOp::Add {
+                                                PackedFmaForm::Add
+                                            } else if orientation == Some(true) {
+                                                PackedFmaForm::SubAcc
+                                            } else {
+                                                PackedFmaForm::SubProduct
                                             },
                                             acc: acc_p,
                                             a: a_p,
@@ -6397,18 +6404,22 @@ fn apply_plan(
                     (PackedFmaForm::SubProduct, IrType::F64, 2) => IntrinsicOp::VecFnmaF64x2,
                     (PackedFmaForm::SubAcc, IrType::F64, 2) => IntrinsicOp::VecFmsF64x2,
                     (PackedFmaForm::Add, IrType::F64, 4) => IntrinsicOp::VecMaddF64x4,
-                    (PackedFmaForm::SubProduct, IrType::F64, 4) =>
-                        IntrinsicOp::VecMaddF64x4Signed(true, false),
-                    (PackedFmaForm::SubAcc, IrType::F64, 4) =>
-                        IntrinsicOp::VecMaddF64x4Signed(false, true),
+                    (PackedFmaForm::SubProduct, IrType::F64, 4) => {
+                        IntrinsicOp::VecMaddF64x4Signed(true, false)
+                    }
+                    (PackedFmaForm::SubAcc, IrType::F64, 4) => {
+                        IntrinsicOp::VecMaddF64x4Signed(false, true)
+                    }
                     (PackedFmaForm::Add, IrType::F32, 4) => IntrinsicOp::VecFmaF32x4,
                     (PackedFmaForm::SubProduct, IrType::F32, 4) => IntrinsicOp::VecFnmaF32x4,
                     (PackedFmaForm::SubAcc, IrType::F32, 4) => IntrinsicOp::VecFmsF32x4,
                     (PackedFmaForm::Add, IrType::F32, 8) => IntrinsicOp::VecMaddF32x8,
-                    (PackedFmaForm::SubProduct, IrType::F32, 8) =>
-                        IntrinsicOp::VecMaddF32x8Signed(true, false),
-                    (PackedFmaForm::SubAcc, IrType::F32, 8) =>
-                        IntrinsicOp::VecMaddF32x8Signed(false, true),
+                    (PackedFmaForm::SubProduct, IrType::F32, 8) => {
+                        IntrinsicOp::VecMaddF32x8Signed(true, false)
+                    }
+                    (PackedFmaForm::SubAcc, IrType::F32, 8) => {
+                        IntrinsicOp::VecMaddF32x8Signed(false, true)
+                    }
                     // The pack builder only creates Fma packs for F64/F32
                     // lanes at the family widths `family_for` admits
                     // (F64: 2 and 4-under-AVX2; F32: 4 and 8-under-AVX2).

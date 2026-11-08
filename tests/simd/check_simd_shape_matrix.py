@@ -134,6 +134,21 @@ def classify(rows: dict[str, ShapeRow], reference: dict[str, ShapeRow],
     return len(problems), problems
 
 
+def is_runtime_missing(diagnostic: str) -> bool:
+    """Recognise a *missing sanitizer runtime*, not a source defect.
+
+    The staged GCC 16.2 / Clang 23.1.5 oracle bundles ship no ASan/UBSan
+    runtime (measured: `cannot find libasan_preinit.o`, `cannot find
+    -lasan/-lubsan`).  System gcc does.  Keep this a pure predicate so the
+    fallback decision is unit-testable and cannot absorb a real diagnostic.
+    """
+    markers = ('libasan_preinit.o', 'libasan', 'libubsan',
+               'libclang_rt.asan', 'libclang_rt.ubsan',
+               'cannot find -lasan', 'cannot find -lubsan')
+    low = diagnostic.lower()
+    return any(m.lower() in low for m in markers)
+
+
 def self_test() -> int:
     checks: list[tuple[str, bool]] = []
 
@@ -166,6 +181,14 @@ def self_test() -> int:
            {'a': 12.5, 'b': 7.0})
     expect('sets unique', len({f[0] for f in FLAG_SETS}), len(FLAG_SETS))
     expect('quick subset valid', set(QUICK_SETS) <= {f[0] for f in FLAG_SETS}, True)
+    expect('missing asan runtime recognised',
+           is_runtime_missing('ld: cannot find libasan_preinit.o: No such file'), True)
+    expect('missing ubsan runtime recognised',
+           is_runtime_missing('ld: cannot find -lubsan'), True)
+    expect('real sanitizer diagnostic is NOT a missing runtime',
+           is_runtime_missing('runtime error: signed integer overflow'), False)
+    expect('compiler diagnostic is NOT a missing runtime',
+           is_runtime_missing('x.c:1:1: error: unknown type name'), False)
 
     failed = [label for label, ok in checks if not ok]
     for label, ok in checks:
@@ -305,7 +328,22 @@ def main(argv: list[str] | None = None) -> int:
             san_flags = ('-O1', '-g', '-fno-omit-frame-pointer',
                          '-fsanitize=address,undefined',
                          '-fno-sanitize-recover=all')
-            rc, err = build(cand, san_flags, san_exe)
+            san_cc = cand
+            rc, err = build(san_cc, san_flags, san_exe)
+            if rc != 0 and is_runtime_missing(err):
+                # Only the INFRASTRUCTURE is missing.  Retry with the system
+                # compiler that carries the runtimes, and print the fallback
+                # so the receipt can never be mistaken for an oracle run.
+                try:
+                    fallback = compiler('gcc')
+                except ValueError:
+                    fallback = None
+                if fallback and fallback != san_cc:
+                    rc2, err2 = build(fallback, san_flags, san_exe)
+                    if rc2 == 0:
+                        san_cc, rc, err = fallback, rc2, err2
+                        print(f'NOTE  sanitizer runtime absent from {cand[0]}; '
+                              f'using system {fallback[0]} for this leg only')
             if rc != 0:
                 failures.append(f'sanitizer build rc={rc}: {err.strip()[:160]}')
                 print('ERROR sanitizer build')
@@ -318,7 +356,9 @@ def main(argv: list[str] | None = None) -> int:
                     print('FAIL  sanitizer leg')
                 else:
                     print('PASS  sanitizer leg (ASan+UBSan, selftest + all)')
-                receipt['sanitizer'] = {'rc': rc, 'clean': rc == 0}
+                receipt['sanitizer'] = {'rc': rc, 'clean': rc == 0,
+                                        'compiler': san_cc,
+                                        'fallback': san_cc != cand}
 
         if args.bench:
             bench_exe = root / 'bench'

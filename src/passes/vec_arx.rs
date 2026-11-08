@@ -1122,11 +1122,14 @@ fn try_transform_loop(
             None => return 0,
         };
         for (bi, b) in func.blocks.iter().enumerate() {
-            if bi == exit_idx || !terminator_targets(&b.terminator).contains(&target) {
+            if !terminator_targets(&b.terminator).contains(&target) {
                 continue;
             }
             // (a) exit dominates a predecessor ⇒ predecessor→exit is a
-            //     backedge, so the exit block is a loop header.
+            //     backedge, so the exit block is a loop header.  Do NOT
+            //     skip `bi == exit_idx`: a self-edge is a one-block loop
+            //     whose stores would re-execute on every iteration, and
+            //     `dominates` is reflexive, so it is caught here too.
             if dom.dominates(exit_idx, bi) {
                 return 0;
             }
@@ -1502,6 +1505,9 @@ fn install_exit_materialization(
 }
 
 fn terminator_targets(t: &Terminator) -> Vec<u32> {
+    // Exhaustive on purpose (no wildcard arm): a new CFG-bearing variant
+    // must be handled here or the crate stops compiling.  A wildcard would
+    // silently hide a computed-goto edge from the exit-CFG proof below.
     match t {
         Terminator::Branch(b) => vec![b.0],
         Terminator::CondBranch {
@@ -1514,7 +1520,15 @@ fn terminator_targets(t: &Terminator) -> Vec<u32> {
             v.push(default.0);
             v
         }
-        _ => Vec::new(),
+        // SA-06 red-team: `goto *ptr` (computed goto) can reach every label
+        // registered in `possible_targets`.  Those ARE real CFG edges; the
+        // old `_ => Vec::new()` made them invisible to the exit-predecessor
+        // proof, so a bypass through an indirect branch could be
+        // clobbered by the inserted VecStoreI32x4.  List them explicitly.
+        Terminator::IndirectBranch {
+            possible_targets, ..
+        } => possible_targets.iter().map(|b| b.0).collect(),
+        Terminator::Return(_) | Terminator::Unreachable => Vec::new(),
     }
 }
 
@@ -1643,5 +1657,41 @@ mod tests {
                 assert_eq!(sel(bwd, mid), l, "roundtrip r={}", r);
             }
         }
+    }
+
+    /// SA-06 red-team: every real CFG edge must be visible to the exit
+    /// predecessor proof.  A wildcard `_ => Vec::new()` used to hide
+    /// computed-goto targets, so an indirect bypass into the exit block
+    /// could be clobbered by the inserted state stores.
+    #[test]
+    fn terminator_targets_cover_every_cfg_edge() {
+        let b = |n: u32| BlockId(n);
+        assert_eq!(terminator_targets(&Terminator::Branch(b(7))), vec![7]);
+        assert_eq!(
+            terminator_targets(&Terminator::CondBranch {
+                cond: Operand::Const(IrConst::I32(0)),
+                true_label: b(1),
+                false_label: b(2),
+            }),
+            vec![1, 2]
+        );
+        assert_eq!(
+            terminator_targets(&Terminator::Switch {
+                val: Operand::Const(IrConst::I32(0)),
+                cases: vec![(0, b(3)), (1, b(4))],
+                default: b(5),
+                ty: IrType::I32,
+            }),
+            vec![3, 4, 5]
+        );
+        assert_eq!(
+            terminator_targets(&Terminator::IndirectBranch {
+                target: Operand::Value(Value(9)),
+                possible_targets: vec![b(6), b(7), b(8)],
+            }),
+            vec![6, 7, 8]
+        );
+        assert!(terminator_targets(&Terminator::Return(None)).is_empty());
+        assert!(terminator_targets(&Terminator::Unreachable).is_empty());
     }
 }
