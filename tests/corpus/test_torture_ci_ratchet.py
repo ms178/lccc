@@ -96,6 +96,15 @@ class Ratchet(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ratchet.compare(self.data, bad)
 
+    def test_error_annotation_bounds_and_escapes_untrusted_names(self):
+        payload = ratchet.error_annotation(["case%\n::error::" + "x" * 100] * 100)
+        self.assertLessEqual(len(payload.encode()), 3800)
+        self.assertNotIn("\n", payload)
+        self.assertIn("%25", payload)
+        decoded = json.loads(payload.replace("%25", "%"))
+        self.assertGreater(decoded["omitted"], 0)
+        self.assertEqual(len(decoded["problems"]) + decoded["omitted"], 100)
+
     def test_cli_rejects_incomplete_duplicate_and_new_failure(self):
         with tempfile.TemporaryDirectory() as temp:
             report, baseline = Path(temp) / "report.json", Path(temp) / "baseline.json"

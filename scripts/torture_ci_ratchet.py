@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections import Counter
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -76,6 +77,22 @@ def compare(data: dict, baseline: object) -> list[str]:
     return problems
 
 
+def error_annotation(problems: list[str]) -> str:
+    """Compact, escaped failure summary; full detail remains in job logs."""
+    def encode(count: int) -> str:
+        payload = json.dumps({"problems": problems[:count], "omitted": len(problems) - count},
+                             ensure_ascii=True, separators=(",", ":"))
+        return payload.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    low, high = 0, len(problems)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(encode(middle).encode("utf-8")) <= 3800:
+            low = middle
+        else:
+            high = middle - 1
+    return encode(low)
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print("usage: torture_ci_ratchet.py REPORT BASELINE", file=sys.stderr)
@@ -85,9 +102,14 @@ def main(argv: list[str]) -> int:
         baseline = schema.loads(Path(argv[1]).read_text(encoding="utf-8"))
         problems = compare(data, baseline)
     except (OSError, ValueError, schema.SchemaError) as exc:
-        print(f"invalid torture ratchet input: {exc}", file=sys.stderr)
+        message = f"invalid torture ratchet input: {exc}"
+        print(message, file=sys.stderr)
+        if os.environ.get("GITHUB_ACTIONS"):
+            print(f"::error title=GCC torture ratchet::{error_annotation([message])}")
         return 2
     if problems:
+        if os.environ.get("GITHUB_ACTIONS"):
+            print(f"::error title=GCC torture ratchet::{error_annotation(problems)}")
         print("torture ratchet: comparison refused or outcomes changed:", file=sys.stderr)
         for problem in problems:
             print("  " + problem, file=sys.stderr)
