@@ -158,3 +158,111 @@ exactly 4 GiB and the cache re-restored from `harness-cache-8` (12 files verifie
 `/home/user/ms178-1.patch` is refreshed by `scripts/lccc-snapshot.sh` after each
 validated landing.
 
+## Deeper rucc audit (second pass, source re-cloned after the wipe)
+
+The pinned rucc commit `4f9f5d85` is itself titled *"Answer __has_feature and
+__has_extension as gcc 14 does (#4107)"* — the direct analogue of this PR. That
+makes it the highest-value comparison available, so it was audited line by line.
+
+### Independent confirmation of the corrected design
+
+`crates/rucc-gnu/src/lib.rs` splits exactly the two gates the first LCCC revision
+conflated:
+
+* `Mode::has(when)` — availability. Returns `true` for `Always | C11 | C23`
+  (availability is **dialect-free**) and consults the sanitizer flags otherwise.
+* `Mode::is_feature(when)` — the dialect gate, applied to the feature answer only.
+* `has_extension()` — under `-pedantic-errors` it delegates to `has_feature()`;
+  otherwise it answers from the extension table, falling back to the feature row
+  gated by `has()` (availability), **not** `is_feature()`.
+
+That is behaviourally identical to the corrected LCCC `resolve()`, arrived at
+independently (LCCC's was derived from the GCC 16.2 measurement matrix). Two
+independent derivations agreeing is stronger evidence than either alone.
+LCCC's lookup is a `match` on `&str`; rucc range-checks an interned symbol then
+linearly scans eight operators — LCCC's dispatch is at least as cheap.
+
+### Differences that are deliberate, not defects
+
+| Aspect | rucc | LCCC | Why |
+|---|---|---|---|
+| Operator existence | gated on persona `__GNUC__ >= 14`; older personas leave them plain names so FreeBSD `sys/cdefs.h` can define them | always present | LCCC has a single GCC 16.2 persona and no `-fgnuc-version` (verified: GCC 16.2 itself rejects that flag — it is Clang's). **If LCCC ever grows persona selection, the operators must be gated at >= 14.** |
+| `address_sanitizer` | 1 when `-fsanitize=address` is on | 0 always | LCCC has no ASan; the driver rejects the flag. Advertising it would be a false claim. |
+| Row set | GCC's eleven names | 18 rows, including explicit `implemented: false` rows | LCCC documents its zeros in the table instead of omitting them, so a future implementer flips one flag rather than rediscovering the name. |
+| Operand macro expansion | (not exercised by its matrix) | GCC 16.2 parity, both paths | Measured directly on gcc-16.2; Clang differs. |
+
+### rucc's attribute discipline, checked against LCCC
+
+`rucc-gnu`'s `Answer::{Warn, Error}` encodes a rule worth keeping: ignoring `hot`
+costs speed, but ignoring `packed`, `aligned`, `section`, `no_sanitize` or `naked`
+produces **wrong code**, so those must be refused rather than warned about.
+LCCC was probed against GCC 16.2 on that contract:
+
+* `struct S { char c; int i; } __attribute__((packed))` → `sizeof == 5` on both.
+* `struct A { int x; } __attribute__((aligned(64)))` → `_Alignof == 64` on both.
+* unknown attribute → `'…' attribute directive ignored [-Wattributes]` on both.
+
+No defect found here; the discipline is already honoured.
+
+### Pass inventory (99 rucc-opt modules vs 166 LCCC pass modules)
+
+Named capabilities present in rucc with no same-named LCCC counterpart:
+`ipasra` (IPA scalar replacement of aggregates), `ipvrp` (interprocedural value
+range propagation), `header_copy` (loop header copying), `pressure` (explicit
+register-pressure model), `memssa`, `gcm` (global code motion), `reload`.
+LCCC covers much of the same ground under different names (`ipa_pta`, `ipcp`,
+`live_range_shrinkage`, `web_congruence`, `expr_sink`, `licm`, `loop_preheader`,
+`loop_rotate`, `load_forward`, `redundant_loads`) and has far broader bit-idiom
+and vector coverage. **No wholesale port is justified**: rucc's e-graph is
+opt-in, and nine of its rules are proved only at 4/8 bits (`docs/UNVERIFIED.md`).
+
+### The measured performance gap, and why the obvious fix would REGRESS
+
+Regenerated the worst workload from the timed run (`sqlite_vdbe_serial`, LCCC
+1.221x GCC). Static instruction counts at -O2: `scan_all_records` LCCC 99 / GCC 84
+/ Clang 116; `vdbe_serial_get` LCCC 81 / GCC 87 / Clang 76.
+
+The outer loop's induction variable lives in a **stack slot** in LCCC:
+
+```
+.LBB30:  addq $1, 16(%rsp)          # r++ in memory
+         movq 16(%rsp), %rax        # reload for the exit test
+         jb   .LBB23
+.LBB23:  movq 16(%rsp), %r10        # reload AGAIN for the indexed access
+         leaq rec_offsets(%rip), %r8
+         movl (%r8,%r10,4), %r9d
+```
+
+GCC strength-reduces the same array walk to a marching pointer
+(`movq $rec_offsets, 8(%rsp)` then `movq 8(%rsp), %rax; movl (%rax), %edx`), so it
+never materialises the index. The obvious LCCC fix — let IVSR reduce this group —
+is **already implemented and deliberately disabled**, with measurements recorded
+in `src/passes/iv_strength_reduce.rs`:
+
+* the `sib_scaled` skip fires because stride-4 indexing is a "free" scaled SIB;
+* the comment above the derived-recurrence knob records that enabling it
+  regressed five golden workloads (gzip_crc32 +6.2% insns, glibc_memcmp +6.4%
+  insns/+23.5% stackmem, expat_xml_scan +23.5% stackmem, stencil5 +7.5%,
+  zlib_ng_adler32 +6.2% stackmem — **CI RED on PR #602**) and an 11-rep
+  interleaved A/B found runtime losses (expat_xml_scan +3.9..4.5%, glibc_strstr
+  +4.3%, linux_find_bit +1.8%, linux_rbtree +1.2%) with **zero confirmed wins**;
+* the stated root cause is the allocator's *latch phi-web parking*: every added
+  loop-carried web materialises to a slot home at the latch. GCC keeps
+  recurrences in callee-saved registers across calls. The file says to revisit
+  the knob **after** the allocator work.
+
+The independent measurement here reproduces exactly that blocker. **Conclusion:
+the highest-value performance work is the register allocator's loop-carried
+value placement, not IVSR.** Flipping the IVSR knob without the allocator fix is
+known-regressing and must not be shipped. This is recorded rather than
+"fixed" precisely because the data says the naive fix is a regression.
+
+### Path-consistency defect found and fixed in this pass
+
+`#define NOTIDENT c_generic_selections tls` + `__has_feature(NOTIDENT)`:
+the code-line path diagnosed `expected ')' after 'c_generic_selections'` (GCC's
+text, because it expands the line first) while the `#if` path diagnosed
+`expected ')' after 'NOTIDENT'`. `expand_query_identifier` now returns the
+expansion on failure so both paths quote GCC's first expanded token; a
+regression asserts both paths print the identical diagnostic.
+

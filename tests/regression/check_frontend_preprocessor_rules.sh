@@ -705,6 +705,26 @@ want_diag "feature missing paren" "missing '(' after '__has_feature'"
 want_diag "feature two names" "expected ')' after 'c_atomic'"
 want_diag "feature missing close" "expected ')' after 'c_atomic'"
 want_diag "extension empty operand" "macro '__has_extension' requires an identifier"
+# A macro operand that expands to junk is diagnosed with the FIRST EXPANDED
+# token (GCC), and the #if path must print the same text as the code-line path.
+cat >"$tmp/feature_junk.c" <<'C'
+#define NOTIDENT c_generic_selections tls
+int f = __has_feature(NOTIDENT);
+C
+run_diag -E -std=gnu23 "$tmp/feature_junk.c"
+[ "$rc" -ne 0 ] || fail "junk macro operand is an error (code line)" "exit 0"
+want_diag "junk macro operand names the expanded token" "expected ')' after 'c_generic_selections'"
+cat >"$tmp/feature_junk_if.c" <<'C'
+#define NOTIDENT c_generic_selections tls
+#if __has_feature(NOTIDENT)
+int x = 1;
+#else
+int x = 0;
+#endif
+C
+run_diag -E -std=gnu23 "$tmp/feature_junk_if.c"
+[ "$rc" -ne 0 ] || fail "junk macro operand is an error (#if)" "exit 0"
+want_diag "junk macro operand: #if agrees with code line" "expected ')' after 'c_generic_selections'"
 
 # GCC macro-expands __has_builtin / __has_attribute operands too (measured);
 # the #if path must agree with the code-line path.

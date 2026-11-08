@@ -133,12 +133,17 @@ int main(int argc, char **argv) {
 C
 if "$CCC" -std=gnu23 -O2 -fsanitize=undefined -fsanitize-trap=all "$tmp/ub.c" -o "$tmp/ub" \
         >"$tmp/ub.build" 2>&1; then
-    rc=0
-    # Subshell + redirect: bash otherwise prints its own "Illegal instruction"
-    # job message for the (expected) trap, which is noise, not a failure.
-    ( "$tmp/ub" >"$tmp/ub.run" 2>&1 ) 2>/dev/null || rc=$?
-    # SIGILL (4) is the trap instruction; the shell reports 128+signal.
-    [ "$rc" -eq 132 ] || fail "ubsan must trap on signed overflow" "exit $rc (want 132/SIGILL)"
+    # Run under Python so the expected SIGILL is observed as a signal, not
+    # announced by the shell as an "Illegal instruction" job message: the trap
+    # is the PASS condition here, and the log must not look like a crash.
+    # A normal exit (even 0) means the check was never instrumented.
+    if ! python3 -c '
+import subprocess, sys
+p = subprocess.run([sys.argv[1]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+sys.exit(0 if p.returncode == -4 else 1)
+' "$tmp/ub"; then
+        fail "ubsan must trap on signed overflow" "expected SIGILL from the instrumented binary"
+    fi
 else
     fail "ubsan trap mode must compile" "$(cat "$tmp/ub.build")"
 fi

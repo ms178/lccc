@@ -358,7 +358,7 @@ impl Preprocessor {
         }
         // GCC 16.2 macro-expands the operand (measured: `#define B memcpy`
         // makes `__has_builtin(B)` answer 1, in `#if` and in code alike).
-        let Some(name) = self.expand_query_identifier(raw) else {
+        let Ok(name) = self.expand_query_identifier(raw) else {
             return "0";
         };
         // GCC 16.2 also answers 1 for the unprefixed library spelling
@@ -432,11 +432,18 @@ impl Preprocessor {
             return "0";
         }
         *i += 1;
-        let Some(name) = self.expand_query_identifier(raw) else {
-            // The operand expanded to something that is not one identifier
-            // (GCC: "expected ')' after ...").  Answer 0, never a guess.
-            self.query_diag(format!("expected ')' after '{raw}'"), diag_line);
-            return "0";
+        let name = match self.expand_query_identifier(raw) {
+            Ok(name) => name,
+            // The operand expanded to something that is not one identifier.
+            // GCC names the FIRST EXPANDED token, not the macro spelling
+            // (measured: `#define NOTIDENT c_atomic tls` diagnoses 'c_atomic'),
+            // which is also what the code-line path already prints because it
+            // expands the whole line first.  The two paths must agree.
+            Err(expanded) => {
+                let first = expanded.split_whitespace().next().unwrap_or(raw);
+                self.query_diag(format!("expected ')' after '{first}'"), diag_line);
+                return "0";
+            }
         };
         if super::feature_queries::resolve(&name, extension, self.feature_mode) {
             "1"
@@ -461,19 +468,27 @@ impl Preprocessor {
     ///
     /// The code-line path expands the whole line before resolving operators,
     /// so this helper is what makes `#if __has_feature(FEAT)` agree with
-    /// `int x = __has_feature(FEAT);`.  Returns `None` when the expansion is
-    /// not exactly one identifier.  A non-macro operand is returned borrowed:
-    /// the common case allocates nothing.
-    fn expand_query_identifier<'a>(&self, name: &'a str) -> Option<std::borrow::Cow<'a, str>> {
+    /// `int x = __has_feature(FEAT);`.  `Err` carries the expansion that was
+    /// not a single identifier so the caller can quote GCC's token in its
+    /// diagnostic.  A non-macro operand is returned borrowed: the common case
+    /// allocates nothing.
+    fn expand_query_identifier<'a>(
+        &self,
+        name: &'a str,
+    ) -> Result<std::borrow::Cow<'a, str>, String> {
         if self.macros.get(name).is_none() {
-            return is_query_identifier(name).then_some(std::borrow::Cow::Borrowed(name));
+            return if is_query_identifier(name) {
+                Ok(std::borrow::Cow::Borrowed(name))
+            } else {
+                Err(name.to_string())
+            };
         }
         let expanded = self.macros.expand_line(name);
         let trimmed = expanded.trim();
         if !is_query_identifier(trimmed) {
-            return None;
+            return Err(expanded);
         }
-        Some(std::borrow::Cow::Owned(trimmed.to_string()))
+        Ok(std::borrow::Cow::Owned(trimmed.to_string()))
     }
 
     /// Parse `(attribute-token)` after `__has_attribute` (`c_syntax` false)
