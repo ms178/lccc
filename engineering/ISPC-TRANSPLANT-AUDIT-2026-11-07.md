@@ -1260,3 +1260,58 @@ main and this PR both touched (`src/backend/x86/codegen/intrinsics.rs`,
 Hosted GitHub CI for THIS PR is reported in the PR itself after the push;
 it is the authority for the "CI green" requirement and was not simulated
 locally.
+
+## Hosted CI round 1: failure, root cause, and the fix (PR #1136)
+
+The first hosted run on `4c44835` was **RED** in exactly three jobs; all
+other 14 jobs (including `Authenticated Intel ICX 2026.2 integration`,
+`Unit tests (release-profile flags)`, `SSA regression corpus`, both benchmark
+shards, both codegen shards, Clippy, build/package, assembler/linker) were
+GREEN. `Test Suite` is the `needs:` aggregator and failed *because* two
+frontend lanes failed — it is not an independent defect.
+
+| failing job / step | root cause | fix |
+|---|---|---|
+| `Frontend and ABI contracts (shard b)` — *Intrinsic arity table matches the headers* | `src/frontend/sema/intrinsic_arity.rs` is a **checked-in derivation** of every `__lccc_simd*` prototype in `include/*.h`. Adding the two `vpshufb_mask*` prototypes without regenerating it left 2 entries missing: `headers say __lccc_simd512_i_vpshufb_mask128(5 args); table says None` and `...maskz128(4 args); table says None`. | `scripts/check_intrinsic_arity.py --write` → exactly **2 lines added**; `--self-test` (871 intrinsics across 25 headers) and `--check` both RC0. The front end now diagnoses wrong-arity calls to these builtins instead of letting them reach backend operand indexing. |
+| `Frontend and ABI contracts (shard c)` — *SSE AVX public API inventory and parser controls* | `engineering/isa/sse-avx-public-api.json` is a **reviewed inventory** of all public `_mm*` wrappers. My header work changed 11 `cmpeq_*_mask` wrappers from `function` to `macro`, changed `_mm_mask_shuffle_epi8`'s helper dependency, and **added** `_mm_maskz_shuffle_epi8`. `--check` correctly rejected the drift. | `scripts/audit_sse_avx_public_api.py --write` → reviewed diff: 837 → **838** entries, 11 `forms` changes, 1 `generic_helpers` change, 1 new entry, **zero removals**. `--self-test` and `--check` RC0. |
+
+**Why the local suite missed this (and the permanent fix):** the local
+`gates_final.sh` did not run these two `--check` gates, even though
+`check_ci_gate_parity.py` proved they were wired into hosted CI. Gate *parity*
+is not gate *execution*. Both gates were added to `gates_final.sh`, which now
+runs **19** direct gates with a real aggregate `exit "$FAILS"` (an earlier
+wrapper printed a misleading `GATES_RC=0` while Clippy was 101; it was
+replaced). `/home/user/artifacts/gates_cifix.log` records **GATES_RC=0** with
+every gate printing `0`.
+
+**A measured side benefit of the fix:** the GCC 16.2 public-API reference
+tracks names LCCC does not yet expose. `missing_reference_names` went from
+**5362 → 5361**; the single removed name is exactly
+`_mm_maskz_shuffle_epi8`, and **no** new gap was introduced. Wiring the
+masked byte-shuffle builtins therefore closes a real GCC-16.2 API gap rather
+than merely satisfying an inventory gate.
+
+**Post-fix local re-validation** (all on the rebuilt fastbuild compiler,
+0 build warnings in `/home/user/artifacts/build_ci_fix.log`):
+
+* full unit suite **8445 passed / 0 failed / 10 ignored**;
+* focused `simd_mask_facts` **97 / 0**; lowering/header arity self-tests **5 / 0**;
+* census (no metric grew; `knobs_undocumented` improved 261 → 258),
+  Clippy (76 lints, 0 warnings), `verify_ir`, `param_home`, `foreign` (635 × 2),
+  `gen_lcccsimd`, gate parity (554 commands / 27 contracts), regression filter
+  (11 / 0), 4-ISA cross harness + mutation self-test, and full corpus
+  **1328 passed / 0 failed / 1413 total** — all RC0;
+* LCCC / GCC 16.2 / Clang 23.1.5 byte-identical stdout on all four
+  three-way C differentials again (the regenerated arity table accepts the
+  new 3-arg and 4-arg wrappers): 16 checksums, 7 values, 8 checksums,
+  `1b67dd2100eee383`.
+
+A harness wipe between the two CI rounds removed `/home/user/.cache`,
+`/home/user/artifacts`, the tools venv and the flattened working tree. The
+PR commits survived on `origin/arena/5a7843f5-lccc`; the exact PR tree was
+restored with `git reset --hard origin/arena/5a7843f5-lccc`, the
+`harness-cache-8` toolchain bundle (`d66c5ac881e2`) was restored with
+`scripts/restore_agent_toolchain_cache.py`, the 4 GiB swap was re-ensured,
+and the PyYAML/pyelftools/Capstone venv was recreated before any gate ran.
+The working-tree flattening was backed up to
+`/home/user/artifacts/wipe_backup_worktree.patch` first.
