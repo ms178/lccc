@@ -57,6 +57,7 @@ on:
       - 'scripts/build_lccc_fast.sh'
       - 'scripts/ci_install_gcc16.sh'
       - 'scripts/ci_install_gcc_oracle.sh'
+      - 'scripts/gcc_oracle_tree.py'
       - 'scripts/ci_toolchain_bundle.sh'
       - 'scripts/ci_provision_toolchain.sh'
       - 'scripts/ci_verify_oracles.sh'

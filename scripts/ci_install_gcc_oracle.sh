@@ -53,6 +53,11 @@ VERSION=16.2
 REF=harness-cache-1
 ASSET=gcc-16-bookworm-x86_64.tar.xz
 SHA256=4fa6af4f6b29991e31631af18d83964a69caa9daf3f78546d4dc30f39880cd8a
+# Derived with gcc_oracle_tree.py --archive from the archive above *after*
+# verifying SHA256. Covers regular-file bytes/modes, directories and symlinks;
+# does not pin host headers, binutils, CRT or libraries outside the prefix.
+TREE_SHA256=0242cc2c6dc2e356e2421da01e565b1dd06983a2716dc76d31ff20a4a8eacbb9
+TREE_TOOL=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/gcc_oracle_tree.py
 URL="https://raw.githubusercontent.com/ms178/lccc/$REF/$ASSET.part00"
 SELF_SCRIPT=$0
 
@@ -60,10 +65,10 @@ prefix=${LCCC_GCC_ORACLE_PREFIX:-${XDG_CACHE_HOME:-$HOME/.cache}/lccc/gcc-oracle
 print_bin=0
 source_archive=""
 source_url=$URL
-# Only the self-test sets this: a synthetic archive cannot share the digest the
-# tag cache publishes, and a digest that could be overridden by the environment
-# in a real lane would not be a contract.
+# Explicit overrides support synthetic/self-test archives. Hosted production
+# invocations must not set them; environment variables cannot override pins.
 expect_sha256=""
+expect_tree_sha256=""
 self_test=0
 while [ $# -gt 0 ]; do
     case $1 in
@@ -76,12 +81,22 @@ while [ $# -gt 0 ]; do
         --from) source_archive=${2:?--from needs a value}; shift 2 ;;
         --url) source_url=${2:?--url needs a value}; shift 2 ;;
         --expect-sha256) expect_sha256=${2:?--expect-sha256 needs a value}; shift 2 ;;
+        --expect-tree-sha256) expect_tree_sha256=${2:?--expect-tree-sha256 needs a value}; shift 2 ;;
         --print-bin) print_bin=1; shift ;;
         --self-test) self_test=1; shift ;;
         -h|--help) sed -n '2,52p' "$0"; exit 0 ;;
         *) echo "ci_install_gcc_oracle: unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+# Custom digest overrides are for controlled test/offline archives only, and
+# must be supplied together; an untrusted cached manifest is never an anchor.
+if [[ -n $expect_sha256 || -n $expect_tree_sha256 ]]; then
+    if [[ ! $expect_sha256 =~ ^[0-9a-f]{64}$ || ! $expect_tree_sha256 =~ ^[0-9a-f]{64}$ ]]; then
+        echo 'ci_install_gcc_oracle: custom archive and tree SHA-256 values are both required' >&2
+        exit 2
+    fi
+    TREE_SHA256=$expect_tree_sha256
+fi
 
 log() { printf '[gcc-oracle] %s\n' "$*" >&2; }
 
@@ -179,7 +194,10 @@ self_test() {
     # compiler that is not 16.2.  A mock compiler script keeps probes real
     # enough to fail: it answers -dumpfullversion, writes an executable for
     # `-o`, and the executable prints ok.
-    local root status
+    local root status digest tree_digest
+    # Synthetic prefixes are deleted at the end and must not pollute the
+    # caller's actual GitHub Actions PATH for subsequent steps.
+    local GITHUB_PATH=
     root=$(mktemp -d "${TMPDIR:-/tmp}/gcc-oracle-test.XXXXXX")
     mkdir -p "$root/tree/gcc-16/bin"
     cat >"$root/tree/gcc-16/bin/gcc-16" <<'MOCK'
@@ -197,13 +215,14 @@ MOCK
     cp "$root/good.tar.xz" "$root/doctored.tar.xz"
     printf 'garbage' >>"$root/doctored.tar.xz"
     digest=$(sha256sum "$root/good.tar.xz" | cut -d' ' -f1)
+    tree_digest=$(python3 "$TREE_TOOL" --archive "$root/good.tar.xz")
 
     # 1. A verified archive lands in the private prefix, and $GITHUB_PATH gets it.
     status=0
     : >"$root/path"
     GITHUB_PATH=$root/path \
         bash "$SELF_SCRIPT" --from "$root/good.tar.xz" --prefix "$root/installed" \
-        --expect-sha256 "$digest" >"$root/out" 2>"$root/err" || status=$?
+        --expect-sha256 "$digest" --expect-tree-sha256 "$tree_digest" >"$root/out" 2>"$root/err" || status=$?
     if (( status == 0 )) && [ -x "$root/installed/bin/gcc-16" ] \
             && grep -qx "$root/installed/bin" "$root/path"; then
         echo "  ok   verified archive installed and exported through GITHUB_PATH"
@@ -212,11 +231,46 @@ MOCK
         rm -rf "$root"; return 1
     fi
 
+    # A warm, intact cache works even if the archive is unavailable.
+    status=0
+    bash "$SELF_SCRIPT" --from "$root/missing.tar.xz" --prefix "$root/installed" \
+        --expect-sha256 "$digest" --expect-tree-sha256 "$tree_digest" >"$root/out" 2>"$root/err" || status=$?
+    if (( status != 0 )); then
+        echo "  FAIL valid warm cache: $(sed -n '1,5p' "$root/err")" >&2
+        rm -rf "$root"; return 1
+    fi
+    echo "  ok   intact warm cache verified before use"
+
+    # Change an auxiliary compiler that the version and C probes never execute.
+    # It must force reinstallation instead of passing as a valid cache.
+    printf '\n# altered auxiliary compiler\n' >>"$root/installed/bin/g++-16"
+    status=0
+    bash "$SELF_SCRIPT" --from "$root/good.tar.xz" --prefix "$root/installed" \
+        --expect-sha256 "$digest" --expect-tree-sha256 "$tree_digest" >"$root/out" 2>"$root/err" || status=$?
+    if (( status != 0 )) || grep -q 'altered auxiliary compiler' "$root/installed/bin/g++-16"; then
+        echo "  FAIL mutated cached auxiliary file: $(sed -n '1,8p' "$root/err")" >&2
+        rm -rf "$root"; return 1
+    fi
+    echo "  ok   mutated auxiliary compiler rejected and reinstalled"
+
+    # A malicious cached driver must not even be executed for -dumpfullversion.
+    { printf '#!/bin/sh\nprintf executed > "$POISON_MARKER"\n'; tail -n +2 "$root/installed/bin/gcc-16"; } >"$root/poison"
+    cp "$root/poison" "$root/installed/bin/gcc-16"
+    chmod +x "$root/installed/bin/gcc-16"
+    status=0
+    POISON_MARKER="$root/executed" bash "$SELF_SCRIPT" --from "$root/good.tar.xz" --prefix "$root/installed" \
+        --expect-sha256 "$digest" --expect-tree-sha256 "$tree_digest" >"$root/out" 2>"$root/err" || status=$?
+    if (( status != 0 )) || [ -e "$root/executed" ]; then
+        echo "  FAIL unverified driver execution: $(sed -n '1,8p' "$root/err")" >&2
+        rm -rf "$root"; return 1
+    fi
+    echo "  ok   poisoned cached driver rejected before execution"
+
     # 2. The same archive is refused when its digest does not match, and the
     #    message names the asset rather than "exit 1".
     status=0
     bash "$SELF_SCRIPT" --from "$root/doctored.tar.xz" --prefix "$root/refused" \
-        --expect-sha256 "$digest" >"$root/out" 2>"$root/err" || status=$?
+        --expect-sha256 "$digest" --expect-tree-sha256 "$tree_digest" >"$root/out" 2>"$root/err" || status=$?
     if (( status != 0 )) && grep -q 'does not match' "$root/err"; then
         echo "  ok   a doctored archive is refused by digest"
     else
@@ -228,7 +282,7 @@ MOCK
     #    spends time on a gate that would have judged it.
     status=0
     MOCK_VERSION=16.0.1 bash "$SELF_SCRIPT" --from "$root/good.tar.xz" --prefix "$root/wrongver" \
-        --expect-sha256 "$digest" >"$root/out" 2>"$root/err" || status=$?
+        --expect-sha256 "$digest" --expect-tree-sha256 "$tree_digest" >"$root/out" 2>"$root/err" || status=$?
     if (( status != 0 )) && grep -q 'expected 16.2' "$root/err"; then
         echo "  ok   a 16.0.1 compiler is refused, naming the pinned version"
     else
@@ -246,7 +300,7 @@ MOCK
         rm -rf "$root"; return 1
     fi
 
-    echo "  self-test: 4/4 cases pass"
+    echo "  self-test: 7/7 cases pass"
     rm -rf "$root"
     return 0
 }
@@ -256,10 +310,17 @@ if (( self_test )); then
     exit $?
 fi
 
-already=$(installed_version || true)
-case $already in
-    "$VERSION"|"$VERSION".*) finish; exit ;;
-esac
+# Never execute even the version probe from an unverified cache. A valid
+# version banner and a few successful probes do not establish cc1's contents.
+# The expectation comes from the verified archive, not a mutable cache file.
+command -v python3 >/dev/null 2>&1 || fail 'python3 is required to verify the oracle tree'
+if [ -e "$prefix" ] || [ -L "$prefix" ]; then
+    if python3 "$TREE_TOOL" --directory "$prefix" --expect "$TREE_SHA256" >/dev/null; then
+        finish
+        exit
+    fi
+    log "cached oracle tree failed integrity check; reinstalling without executing it"
+fi
 
 for tool in tar xz sha256sum; do
     command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"
@@ -290,5 +351,8 @@ fi
 log "extracting into $prefix"
 rm -rf "$prefix"
 mkdir -p "$prefix"
-tar -xJf "$archive" -C "$prefix" --strip-components=1 2>>"$errlog"
+tar -xJpf "$archive" -C "$prefix" --strip-components=1 2>>"$errlog"
+if ! python3 "$TREE_TOOL" --directory "$prefix" --expect "$TREE_SHA256" >>"$errlog" 2>&1; then
+    fail "extracted oracle tree does not match its pinned content identity"
+fi
 finish
