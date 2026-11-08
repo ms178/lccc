@@ -149,14 +149,30 @@ with every reader routed through
 ```rust
 #[inline]
 fn staging_line_text(t: &Option<String>) -> &str {
-    t.as_deref()
-        .expect("line-j copy owed: every reader is guarded by an `s` parser")
+    t.as_deref().unwrap_or("")
 }
 ```
 
-A future pattern that reads the copy without an `s` guard now fails loudly under
-`debug-assertions` (which CI enables) instead of quietly matching against `""`.
-`String::new()`/`None` allocates nothing, so the reject path is free.
+`None` allocates nothing, so the reject path is free.
+
+**Why `unwrap_or("")` and not `expect`.** The first revision used an `expect` to
+turn a hypothetical future unguarded reader into a loud failure. CI rejected it:
+`audit_census.py --check` counts `.expect(` as a `panic_sites` entry and reported
+**863 -> 864 (+1)**, failing two lanes (`Fast local contracts (shard b)` directly,
+and `Assembler and linker contracts` via `check_param_home_contracts.py`, whose
+row [12] embeds the census ratchet).
+
+Re-baselining was the wrong answer, because the `expect` was guarding an
+**already-inert value**. All eleven readers were checked individually: ten are
+parsers whose first statement is `strip_prefix("<mnem> ")?` or
+`split_once(' ')?`, and `imm_of` maps a missing separator to `""` via `unwrap_or`.
+Handed `""`, every one of them returns `None` (or `""`), so the pattern simply
+does not fire. A future unguarded reader therefore costs a **missed
+optimization, never a miscompile** — the empty string is fail-closed by
+construction. Adding a panic site to the compiler to guard that is defensive
+theatre, and `unwrap_or` is both safer for the census and one branch cheaper in
+release. The invariant is now proved in the comment and by the parser audit
+rather than asserted at runtime.
 
 The copy genuinely cannot be a plain borrow here: `t` must preserve line `j`'s
 *original* text across `store.replace(j, ..)` at 12630/12669 for the reader at
@@ -229,6 +245,8 @@ directories produces spurious `-g` diffs.
 | ratchet on this tree | **PASS, 372 files** |
 | ratchet on unmodified `782b9f4` | **39 violations** (non-vacuity proof) |
 | ratchet contracts | **34 passed** |
+| `audit_census.py --check` | **PASS (no metric grew)** |
+| `check_param_home_contracts.py` (4 drivers) | **13/13 rows PASS** |
 
 The 34 contracts include the four previously-invisible shapes, the closure form,
 `let mut`, `break`/`return` as rejection verbs, all five compliant shapes

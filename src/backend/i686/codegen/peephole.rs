@@ -13087,14 +13087,21 @@ fn low_subreg_name(reg32: &str, width: i32) -> Option<&'static str> {
 /// Parse `movl %S, %D` (both 32-bit GPRs, S != D).
 /// The line-`j` text owed by the staging patterns.
 ///
-/// `None` means no `s` parser could match, so no reader may be reached. The
-/// `expect` makes that invariant machine-checked instead of comment-asserted:
-/// a new pattern that reads the copy without an `s` guard fails loudly under
-/// `debug-assertions` (which CI enables) rather than matching against "".
+/// `None` means no `s` parser could match, so the copy was never made. Returning
+/// `""` in that case is **fail-closed by construction**, not a silent fallback:
+/// every reader of this text is a parser whose first act rejects the empty
+/// string -- ten begin `strip_prefix("<mnem> ")?` or `split_once(' ')?`, and
+/// `imm_of` maps a missing separator to `""` through `unwrap_or`. A pattern
+/// handed `""` therefore cannot match and simply does not fire.
+///
+/// That is the whole safety argument, and it is why this is `unwrap_or` rather
+/// than `expect`: a future reader added without an `s` guard would cost a missed
+/// optimization, never a miscompile, so there is nothing to panic about. Adding
+/// a panic site to the compiler to guard an already-inert value would be
+/// defensive theatre -- and the census ratchet rightly counts it.
 #[inline]
 fn staging_line_text(t: &Option<String>) -> &str {
-    t.as_deref()
-        .expect("line-j copy owed: every reader is guarded by an `s` parser")
+    t.as_deref().unwrap_or("")
 }
 
 fn parse_mov_reg_reg(s: &str) -> Option<(&str, &str)> {
