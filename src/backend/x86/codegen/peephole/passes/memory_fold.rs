@@ -5113,7 +5113,7 @@ pub(super) fn fold_memory_rmw(store: &mut LineStore, infos: &mut [LineInfo]) -> 
             i += 1;
             continue;
         }
-        let mut lj = infos[j].trimmed(store.get(j)).to_string();
+        let mut lj = infos[j].trimmed(store.get(j));
         // Owned copies of the increment's register and immediate: the
         // copy parse borrows `lj`, which the copy arm then replaces with
         // the increment's own line text.
@@ -5132,7 +5132,7 @@ pub(super) fn fold_memory_rmw(store: &mut LineStore, infos: &mut [LineInfo]) -> 
                         i += 1;
                         continue;
                     }
-                    lj = infos[j].trimmed(store.get(j)).to_string();
+                    lj = infos[j].trimmed(store.get(j));
                     let Some((reg, imm, op)) = parse_const_increment(&lj, reg_width, &copy_dest)
                     else {
                         i += 1;
@@ -5166,7 +5166,7 @@ pub(super) fn fold_memory_rmw(store: &mut LineStore, infos: &mut [LineInfo]) -> 
         // high bits into a value the fused `addb` never computes.  The copy's
         // destination carries its own deadness obligation, because the fold
         // deletes its definition too.
-        let lk = infos[k].trimmed(store.get(k)).to_string();
+        let lk = infos[k].trimmed(store.get(k));
         let mut owned_vec: Vec<usize> = vec![i, j, k];
         if let Some(copy_line) = copy_idx {
             owned_vec.push(copy_line);

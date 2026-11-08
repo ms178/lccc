@@ -704,7 +704,7 @@ fn try_fuse_commuted_unary_load_pair(
     {
         return None;
     }
-    let k0_text = infos[k0].trimmed(store.get(k0)).to_string();
+    let k0_text = infos[k0].trimmed(store.get(k0));
     let (ld2_q, mem2, s_fam) = parse_memory_load(&k0_text)?;
     if ld2_q != load_q
         || s_fam == t_fam
@@ -740,7 +740,7 @@ fn try_fuse_commuted_unary_load_pair(
         return None;
     }
     if unary_indices.is_empty() {
-        let cons_text = infos[k].trimmed(store.get(k)).to_string();
+        let cons_text = infos[k].trimmed(store.get(k));
         let (andn_q, rm_fam, vvvv_fam, dst_fam) = parse_andn_reg_reg_reg(&cons_text)?;
         if andn_q != load_q
             || rm_fam != t_fam
@@ -816,7 +816,7 @@ fn try_fuse_commuted_unary_load_pair(
             }
         }
     }
-    let cons_text = infos[k].trimmed(store.get(k)).to_string();
+    let cons_text = infos[k].trimmed(store.get(k));
     let (op, op_q, src, dst) = parse_reg_reg_alu(&cons_text)?;
     if op_q != load_q || src != s_fam || dst != d_fam || !COMMUTATIVE_OPS.contains(&op) {
         return None;
@@ -1285,7 +1285,7 @@ fn try_fuse_copy_bridged_load(
     if gap2 != 0 && super::relay_and_lea::segment_prefix_len(mem).is_some() {
         return None;
     }
-    let op_text = infos[k].trimmed(store.get(k)).to_string();
+    let op_text = infos[k].trimmed(store.get(k));
     let (op, op_q, c_fam, dst) = parse_reg_reg_alu(&op_text)?;
     if op_q != load_q
         || dst != b_fam
@@ -1757,7 +1757,7 @@ pub(super) fn fuse_load_into_lea_add(store: &mut LineStore, infos: &mut [LineInf
             if n >= len || infos[n].pinned || !is_window_kind(infos[n].kind) {
                 break None;
             }
-            let text = infos[n].trimmed(store.get(n)).to_string();
+            let text = infos[n].trimmed(store.get(n));
             let written = may_write_families(&text, &infos[n]);
             if written == ALL_GPR {
                 break None;
@@ -2300,7 +2300,7 @@ pub(super) fn fold_copy_into_dying_operand(store: &mut LineStore, infos: &mut [L
         }
         let b_bit = 1u16 << b_fam;
         let c_bit = 1u16 << c_fam;
-        let reader = infos[k].trimmed(store.get(k)).to_string();
+        let reader = infos[k].trimmed(store.get(k));
         if infos[k].reg_refs & b_bit == 0
             || (infos[k].reg_refs & c_bit != 0 && !kills_family_only(&reader, c_fam))
         {

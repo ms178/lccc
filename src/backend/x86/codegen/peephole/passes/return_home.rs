@@ -483,7 +483,7 @@ fn try_fold_at_ret(store: &mut LineStore, infos: &mut [LineInfo], r: usize) -> b
     if root_raw.contains('#') {
         return false;
     }
-    let root_text = infos[root].trimmed(root_raw).to_string();
+    let root_text = infos[root].trimmed(root_raw);
     let Some(new_root) = reissue_root(&root_text, d_fam, force_32) else {
         return false;
     };
@@ -512,7 +512,7 @@ fn try_fold_at_ret(store: &mut LineStore, infos: &mut [LineInfo], r: usize) -> b
         if infos[m].reg_refs & d_mask == 0 {
             continue;
         }
-        let before = infos[m].trimmed(store.get(m)).to_string();
+        let before = infos[m].trimmed(store.get(m));
         let after = replace_reg_family(&before, d_fam, 0);
         if after != before {
             replace_line(store, &mut infos[m], m, format!("    {after}"));

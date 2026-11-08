@@ -1,26 +1,46 @@
 #!/usr/bin/env python3
-"""Ratchet: no backend peephole may allocate a line before a filter rejects it.
+"""Ratchet: no backend peephole may heap-copy a line before a filter rejects it.
 
-MB-20 step 3 removed 25 sites of the form
+MB-20 step 3 removed sites of the form
 
     let text = infos[i].trimmed(store.get(i)).to_string();   // heap copy
     let Some(..) = parse_x(&text) else { i += 1; continue; }; // ...usually rejected
 
 These are per-line loops inside a fixpoint pass, so the wasted allocation is
-multiplied by line count and iteration count. The measured cost of the class was
-185,110 allocations (9.571%) over 21 benchmark inputs.
+multiplied by line count and iteration count.
 
-Two compliant shapes exist, and the ratchet accepts both:
+WHY THIS IS STATEMENT-AWARE AND NOT A PAIR OF REGEXES
+----------------------------------------------------
+The first version recognised exactly two filter shapes -- `let Some(..) =
+freefn(&var) else {` and `if !freefn(&var) {`. That left 23 of the 66 real sites
+invisible, including `fold_copy_into_lea_base`, which ablation measured at
+**30.4% of the whole peephole** and which copied every non-barrier line before
+testing `strip_prefix("leaq ")`. The shapes it could not see:
 
-  * the parser yields no borrow of its input (`parse_reg_copy`, `parse_vec_copy`,
-    ...): parse the borrowed text directly, no owned copy at all;
-  * the parser's result borrows the text and outlives a `store` mutation
-    (`parse_memory_load`, ...): probe on borrowed text first, then allocate and
-    re-parse only for candidates.
+    let (rest, w) = if let Some(r) = text.strip_prefix("leaq ") { .. }
+                    else { continue };          # if-let / else chain
+    if has_implicit_reg_usage(&text) { continue; }   # POSITIVE guard
+    let Some(..) = text.strip_prefix(..) else { .. } # method, not free function
+    if !text.starts_with(..) { continue; }           # method on the variable
 
-What must never come back is allocating first and filtering second. This is a
-source contract rather than a timing gate: it is deterministic, needs no
-profiler, and pins the exact defect instead of a machine-dependent number.
+So the contract is now expressed the way it actually reads: **the first
+statement after the copy must not be able to reject the line based on that
+copy's contents.** The scanner walks that one statement with a bracket-depth
+counter (so an if-let/else chain is one statement, not five lines) and flags it
+when it both mentions the variable and contains a `continue`/`break`/`return`.
+
+Two compliant shapes remain, and both are accepted:
+
+  * the filter yields no borrow of its input: parse the borrowed text directly
+    and keep no owned copy at all (56 of 66 sites turned out to be this case --
+    `LineStore` has no interior mutability and its API is `get(&self)` /
+    `replace(&mut self)`, so a copy that the borrow checker lets you delete
+    provably never observes a mutation, and the bytes are identical);
+  * the filter's result borrows the text and outlives a `store` mutation: probe
+    on borrowed text first, then allocate and re-parse only for candidates.
+
+This is a source contract rather than a timing gate: deterministic, no profiler,
+and it pins the defect instead of a machine-dependent number.
 """
 from __future__ import annotations
 
@@ -34,35 +54,71 @@ ROOT = Path(__file__).resolve().parents[2]
 # and an x86-only default made the gate vacuous for i686.
 PEEPHOLE = ROOT / "src/backend"
 
-# `let NAME = <expr>.trimmed(store.get(..)).to_string();`
+# `let NAME = <expr>.trimmed(...).to_string();`
 # NOTE: `.*` and not `[^)]*` -- the argument is `store.get(i)`, which nests
 # parentheses. A `[^)]*` here silently matched nothing and made this whole
-# ratchet vacuous (it passed on the pre-fix tree); both directions are now
-# pinned by tests/regression/test_check_peephole_alloc_before_filter.py.
-# Both idioms must match:
-#   x86-64: `infos[i].trimmed(store.get(i)).to_string()`      (method)
-#   i686:   `trimmed(store, &infos[i], i).to_string()`        (free function)
-# The original pattern required a literal `.trimmed(`, so it silently reported
-# PASS for i686 while five real allocate-then-reject sites sat there. `\b` before
-# `trimmed` matches after `.` as well as at the start of a call expression.
+# ratchet vacuous. Both idioms must match:
+#   x86-64: `infos[i].trimmed(store.get(i))`   (method)
+#   i686:   `trimmed(store, &infos[i], i)`     (free function)
+# `\b` before `trimmed` matches after `.` as well as at the start of a call.
 ALLOC = re.compile(
-    r"^\s*let\s+(\w+)\s*=\s*.*\btrimmed\(.*\)\.to_string\(\);\s*$"
+    r"^\s*let\s+(?:mut\s+)?(\w+)\s*=\s*.*\btrimmed\(.*\)\.to_string\(\);\s*$"
 )
-# `let Some(..) = parser(&NAME) else {`  /  `if !parser(&NAME) {`
-REJECT_LET = re.compile(r"^\s*let\s+Some\(.*\)\s*=\s*(\w+)\(&(\w+)\)\s+else\s*\{")
-REJECT_IF = re.compile(r"^\s*if\s+!(\w+)\(&(\w+)\)\s*\{")
+# A closure form used by the window matchers: `let text = |k| ....to_string();`
+# Every call of it copies, so it is the same defect with the copy hidden behind
+# a name. Flagged only when a rejecting statement calls it.
+ALLOC_CLOSURE = re.compile(
+    r"^\s*let\s+(\w+)\s*=\s*\|[^|]*\|\s*.*\btrimmed\(.*\)\.to_string\(\);\s*$"
+)
+REJECT = re.compile(r"\b(continue|break|return)\b")
+# How far one statement may run. The longest real shape is the 8-line
+# `let (w, rest) = if let ... else if let ... else { continue };` chain.
+MAX_STATEMENT_LINES = 24
+
+
+def _statement(lines: list[str], start: int) -> str:
+    """The single statement beginning at `start`, joined into one string.
+
+    Stops at the first `;` or `}` that closes back to bracket depth zero, so an
+    if-let/else chain is consumed whole. Comments and blank lines are skipped
+    without ending the statement.
+    """
+    depth = 0
+    out: list[str] = []
+    i = start
+    while i < len(lines) and i - start < MAX_STATEMENT_LINES:
+        raw = lines[i]
+        stripped = raw.strip()
+        i += 1
+        if not stripped or stripped.startswith("//"):
+            continue
+        # Strip a trailing line comment so a `// continue` cannot trigger.
+        code = raw.split("//", 1)[0]
+        out.append(code)
+        depth += code.count("(") + code.count("[") + code.count("{")
+        depth -= code.count(")") + code.count("]") + code.count("}")
+        tail = code.rstrip()
+        if depth <= 0 and (tail.endswith(";") or tail.endswith("}")):
+            break
+    return "\n".join(out)
+
+
+def _uses(stmt: str, var: str) -> bool:
+    """Does the statement read `var` (as a value, a borrow, or a call)?"""
+    return re.search(r"\b" + re.escape(var) + r"\b", stmt) is not None
 
 
 def violations(text: str) -> list[tuple[int, str, str]]:
-    """Return (1-based line, variable, parser) for every allocate-then-reject site."""
+    """Return (1-based line, variable, reason) for every allocate-then-reject site."""
     lines = text.split("\n")
     found = []
     for idx, line in enumerate(lines):
-        m = ALLOC.match(line)
+        m = ALLOC.match(line) or ALLOC_CLOSURE.match(line)
         if not m:
             continue
         var = m.group(1)
-        # The filter is the next non-blank, non-comment statement.
+        # The filter must be the FIRST statement after the copy. A copy that is
+        # stored, returned or otherwise unconditionally consumed is legitimate.
         nxt = idx + 1
         while nxt < len(lines) and (
             not lines[nxt].strip() or lines[nxt].lstrip().startswith("//")
@@ -70,11 +126,21 @@ def violations(text: str) -> list[tuple[int, str, str]]:
             nxt += 1
         if nxt >= len(lines):
             continue
-        for pat in (REJECT_LET, REJECT_IF):
-            g = pat.match(lines[nxt])
-            if g and g.group(2) == var:
-                found.append((idx + 1, var, g.group(1)))
-                break
+        stmt = _statement(lines, nxt)
+        if not _uses(stmt, var):
+            continue
+        if not REJECT.search(stmt):
+            continue
+        # Name the filter for the message: the first call or method in it.
+        call = re.search(r"(\w+)\s*\(\s*&?" + re.escape(var) + r"\b", stmt)
+        meth = re.search(re.escape(var) + r"\.(\w+)\s*\(", stmt)
+        if call:
+            why = call.group(1)
+        elif meth:
+            why = f"{var}.{meth.group(1)}"
+        else:
+            why = "a rejecting filter"
+        found.append((idx + 1, var, why))
     return found
 
 
@@ -92,11 +158,12 @@ def main() -> int:
         return 2
     total = 0
     for path in files:
-        for line, var, parser in violations(path.read_text()):
+        for line, var, why in violations(path.read_text()):
             rel = path.relative_to(ROOT) if path.is_relative_to(ROOT) else path
-            print(f"FAIL: {rel}:{line}: `{var}` is heap-copied before `{parser}` "
-                  f"can reject it; probe on borrowed text first "
-                  f"(or drop the copy if `{parser}` does not borrow its input)")
+            print(f"FAIL: {rel}:{line}: `{var}` is heap-copied before `{why}` "
+                  f"can reject it; filter on borrowed text first "
+                  f"(and drop the copy entirely unless a `store` mutation "
+                  f"outlives the borrow)")
             total += 1
     if total:
         print(f"check_peephole_alloc_before_filter: {total} violation(s)")

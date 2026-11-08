@@ -500,7 +500,7 @@ pub(super) fn eliminate_loop_trampolines(store: &mut LineStore, infos: &mut [Lin
         }
 
         for &(mod_idx, old_fam, new_fam) in &coalesce_actions {
-            let old_line = infos[mod_idx].trimmed(store.get(mod_idx)).to_string();
+            let old_line = infos[mod_idx].trimmed(store.get(mod_idx));
             if let Some(new_line) = rewrite_instruction_register(&old_line, old_fam, new_fam) {
                 replace_line(
                     store,
@@ -524,7 +524,7 @@ pub(super) fn eliminate_loop_trampolines(store: &mut LineStore, infos: &mut [Lin
             }
             mark_nop(&mut infos[tramp_label_idx]);
 
-            let branch_trimmed = infos[branch_idx].trimmed(store.get(branch_idx)).to_string();
+            let branch_trimmed = infos[branch_idx].trimmed(store.get(branch_idx));
             if let Some(space_pos) = branch_trimmed.find(' ') {
                 let cc = &branch_trimmed[..space_pos];
                 let target_label = format!(".LBB{}", target_num);

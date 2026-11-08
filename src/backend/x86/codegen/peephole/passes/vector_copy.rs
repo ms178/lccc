@@ -708,7 +708,7 @@ pub(super) fn coalesce_vector_brackets(store: &mut LineStore, infos: &mut [LineI
             if infos[n].is_nop() {
                 continue;
             }
-            let t = infos[n].trimmed(store.get(n)).to_string();
+            let t = infos[n].trimmed(store.get(n));
             if !mentions_family(t.as_bytes(), dst_fam) {
                 continue;
             }
@@ -874,7 +874,7 @@ fn propagate_vector_copies_impl<const EAGER: bool>(
                 j += 1;
                 continue;
             }
-            let t = infos[j].trimmed(store.get(j)).to_string();
+            let t = infos[j].trimmed(store.get(j));
             if is_barrier(&infos[j], &t) {
                 break;
             }
@@ -923,7 +923,7 @@ fn propagate_vector_copies_impl<const EAGER: bool>(
                     }
                 }
             }
-            let t_after = infos[j].trimmed(store.get(j)).to_string();
+            let t_after = infos[j].trimmed(store.get(j));
             if writes_vec(&t_after, copy.src) || touches_src {
                 break;
             }
@@ -1845,7 +1845,7 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
             j += 1;
             continue;
         }
-        let t_op = infos[j].trimmed(store.get(j)).to_string();
+        let t_op = infos[j].trimmed(store.get(j));
         let (mn, operands) = split_mn(&t_op);
         let is_vex_load = full_width_load_zeroes_above(mn);
         let is_legacy_load = legacy_full_width_load(mn);
@@ -2071,7 +2071,7 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
             format!("    {mn} {}", new_ops.join(", ")),
         );
         for &n in &interior {
-            let tn = infos[n].trimmed(store.get(n)).to_string();
+            let tn = infos[n].trimmed(store.get(n));
             let renamed = replace_vec_reg(&tn, t, d);
             if renamed != tn {
                 replace_line(store, &mut infos[n], n, format!("    {renamed}"));
