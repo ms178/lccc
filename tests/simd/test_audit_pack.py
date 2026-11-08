@@ -184,30 +184,39 @@ class AuditPackTests(unittest.TestCase):
 
     @staticmethod
     def _evex_probe(flags: tuple[str, ...]) -> tuple[bool, str]:
-        """Compile AND EXECUTE one EVEX store with exactly `flags`.
+        """Return whether `flags` can compile AND EXECUTE a real zmm store.
 
         CPUID advertisement is not proof of executability: the 2026-11-08
-        hosted runner advertises avx512f/avx512bw in /proc/cpuinfo, yet its
+        hosted runner advertises avx512f/avx512bw in /proc/cpuinfo yet its
         vCPU rejects EVEX with SIGILL (hosted log
-        `42506426020/job/128810582710`: `probe run rc=-4`).  The only sound
-        oracle is the instruction itself, built with the same toolchain and
-        the same flags as the corpus leg it guards.
+        `42506426020/job/128810582710`: `probe run rc=-4`).  Two earlier
+        probes were themselves unsound and were caught by hosted CI:
 
-        The store is an `asm volatile` with a memory clobber: a plain
-        `_mm512_storeu_si512()` of a compile-time constant is folded away at
-        -O1, which previously produced a FALSE POSITIVE "EVEX works" verdict
-        on that same runner.  An opaque asm template cannot be deleted.
+        * a constant `_mm512_storeu_si512` was constant-folded away at -O1,
+          so it reported success on a CPU with no EVEX support;
+        * an `asm volatile` with an `"x"` constraint was allowed by gcc-16
+          16.0.1 to use a non-zmm register, so it also reported success
+          without ever executing an EVEX instruction.
+
+        The gate is therefore two-part and fails closed:
+        (1) the probe's disassembly MUST contain a `%zmm` operand, and
+        (2) the probe MUST exit 0.  The source uses a `volatile` input plus
+        an opaque memory-clobber barrier so the store cannot be folded, and
+        it uses the SAME `_mm512_storeu_si512` intrinsic as the corpus.
         """
+        import shutil
         work = AuditPackTests.work
         src = work / 'evex_probe.c'
         src.write_text(
             '#include <immintrin.h>\n'
+            'static volatile int evex_input = 7;\n'
             'int main(void) {\n'
             '  unsigned lanes[16];\n'
-            '  __m512i v = _mm512_set1_epi32(7);\n'
-            '  __asm__ volatile ("vmovdqu64 %1, %0"\n'
-            '                   : "=m" (lanes) : "x" (v) : "memory");\n'
-            '  return lanes[0] == 7u ? 0 : 1;\n'
+            '  int seed = evex_input;\n'
+            '  __m512i v = _mm512_set1_epi32(seed);\n'
+            '  _mm512_storeu_si512((void *)lanes, v);\n'
+            '  __asm__ volatile ("" : : "r" (lanes) : "memory");\n'
+            '  return lanes[0] == (unsigned)seed ? 0 : 1;\n'
             '}\n', encoding='utf-8')
         tag = 'san' if any('sanitize' in f for f in flags) else 'plain'
         exe = work / f'evex_probe_{tag}.bin'
@@ -217,13 +226,23 @@ class AuditPackTests(unittest.TestCase):
             if proc.returncode != 0:
                 return False, (f'probe compile rc={proc.returncode}: '
                                f'{proc.stderr.strip()[:200]}')
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, f'probe infrastructure failure: {exc}'
+        objdump = shutil.which('objdump')
+        if objdump is None:
+            return False, 'objdump unavailable: cannot prove the probe is EVEX'
+        dis = run([objdump, '-d', str(exe)])
+        if dis.returncode != 0 or not re.search(r'%zmm', dis.stdout):
+            return False, ('probe emitted no %zmm store: the compiler '
+                           'narrowed the vector and the gate must close')
+        try:
             res = run([str(exe)], timeout=15)
         except (OSError, subprocess.SubprocessError) as exc:
             return False, f'probe infrastructure failure: {exc}'
         if res.returncode != 0:
             return False, (f'probe run rc={res.returncode}: '
                            f'{(res.stdout + res.stderr).strip()[:200]}')
-        return True, 'EVEX store executed'
+        return True, 'real EVEX zmm store executed'
 
     def test_07_c_corpora_sanitizers(self):
         """ASan+UBSan clean on ANY host, with an executable ISA gate.
@@ -284,25 +303,53 @@ class AuditPackTests(unittest.TestCase):
                         reason)
 
     def test_07c_evex_probe_is_not_optimized_away(self):
-        """The ISA gate must contain a REAL zmm store in the binary.
+        """The ISA gate must prove a real zmm store or close explicitly.
 
         A constant `_mm512_storeu_si512` can be constant-folded to nothing,
-        which would make the probe report success on a CPU that cannot
-        execute EVEX at all.  Pin the disassembly instead of trusting source.
+        and an `"x"` asm constraint can be narrowed to ymm/xmm.  Either case
+        must make the gate report `(False, <reason>)`, never a false success.
         """
         import shutil
         objdump = shutil.which('objdump')
         if objdump is None:
             self.skipTest('objdump not installed')
-        _, reason = self._evex_probe(('-std=c99', '-O1'))
-        exe = self.work / 'evex_probe_plain.bin'
-        if not exe.is_file():
-            self.skipTest(f'probe did not compile: {reason}')
-        # Disassemble even when the host rejects EVEX: the point of this test
-        # is that the instruction EXISTS, not that this CPU can execute it.
-        dis = run([objdump, '-d', str(exe)])
-        self.assertEqual(dis.returncode, 0, dis.stderr)
-        self.assertRegex(dis.stdout, r'vmovdqu64\s+.*%zmm')
+        for flags, name in ((SAN_FLAGS, 'evex_probe_san.bin'),
+                            (('-std=c99', '-O1'), 'evex_probe_plain.bin')):
+            with self.subTest(probe=name):
+                ok, reason = self._evex_probe(flags)
+                exe = self.work / name
+                self.assertTrue(exe.is_file(), f'{name} was not compiled')
+                dis = run([objdump, '-d', str(exe)])
+                self.assertEqual(dis.returncode, 0, dis.stderr)
+                if re.search(r'%zmm', dis.stdout):
+                    self.assertNotIn('no %zmm store', reason)
+                else:
+                    self.assertFalse(ok, 'gate opened without a zmm store')
+                    self.assertIn('no %zmm store', reason)
+
+    def test_07d_evex_gate_rejects_narrowed_disassembly(self):
+        """A compiler that narrows the probe to ymm must close the gate.
+
+        This is the deterministic control for the gcc-16 16.0.1 behaviour on
+        hosted CI; it does not depend on the host CPU or compiler version.
+        """
+        import shutil
+        from unittest import mock
+        if shutil.which('objdump') is None:
+            self.skipTest('objdump not installed')
+        real_run = run
+
+        def fake(cmd, timeout=120.0):
+            if Path(cmd[0]).name == 'objdump':
+                return subprocess.CompletedProcess(
+                    cmd, 0, 'vmovdqu  %ymm0,(%rsp)\n', '')
+            return real_run(cmd, timeout=timeout)
+
+        with mock.patch.object(sys.modules[__name__], 'run',
+                               side_effect=fake):
+            ok, reason = self._evex_probe(('-std=c99', '-O1'))
+        self.assertFalse(ok)
+        self.assertIn('no %zmm store', reason)
 
     # --- end-to-end harness checks --------------------------------------
 

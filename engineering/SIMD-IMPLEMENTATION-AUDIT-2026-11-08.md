@@ -941,7 +941,7 @@ those diagnostics.
 | `cargo fmt --all -- --check` | clean |
 | `scripts/audit_census.py --check` | PASS, no metric grew (863 panic sites, 255 undocumented knobs vs baseline 261) |
 | `scripts/gen_lcccsimd.py --check` / `gen_x86_builtin_types.py --check` | both clean |
-| `python3 -m unittest discover -s tests/simd -p 'test_*.py'` | 40 tests OK (1 skipped: PyYAML optional), 7 driver self-tests wired |
+| `python3 -m unittest discover -s tests/simd -p 'test_*.py'` | 41 tests OK (1 skipped: PyYAML optional), 7 driver self-tests wired |
 | seven driver `--self-test` totals | 117/117 (39/15/16/5/13/18/11) |
 | `check_audit_2026-11-08.py --strict` (built LCCC) | 15/15 PASS, 0 problems |
 | `check_assembler_widths.py --require-gas-247` | 16 cases, 8 byte-identical encodings, 0 problems |
@@ -1060,11 +1060,31 @@ hosted runner, the AVX-512 runtime legs are skipped **with printed reasons**,
 the portable sanitizer leg still executes every shape, and the AVX-512
 headers are still compiled under `-Werror`.
 
-Definitive root cause of the three shard-a failures: **the hosted Azure vCPU
+A fourth hosted CI run (`42507888931/job/128815895842`) showed the
+`asm volatile` gate was ALSO too weak: gcc-16 16.0.1 is free to satisfy an
+`"x"` constraint with a non-`zmm` register, so the probe executed a VEX
+instruction and reported success while the real `_mm512_storeu_si512` in the
+corpus still faulted with SIGILL.  The final gate is two-part and **fails
+closed**: the probe uses the corpus's own intrinsic with a `volatile` input
+plus an opaque memory-clobber barrier (so it cannot be folded), and
+`objdump -d` must show a literal `%zmm` operand before the probe is even
+executed.  A compiler that narrows the vector closes the gate with the
+explicit reason `probe emitted no %zmm store`; a CPU that rejects EVEX
+closes it with `probe run rc=-4`.  `test_07c` pins the real-zmm/declined
+contract on both probe variants; `test_07d` deterministically mocks a ymm
+disassembly and requires the gate to refuse it.  Local `objdump` of both
+probes shows `62 f2 7d 48 7c c0 vpbroadcastd %eax,%zmm0` and
+`62 f1 fe 48 7f 81 ... vmovdqu64 %zmm0,...`, and both probes exit 0.
+
+Definitive root cause of the four shard-a failures: **the hosted Azure vCPU
 advertises `avx512f`/`avx512bw` in `/proc/cpuinfo` but rejects EVEX with
 SIGILL** (SIGILL = `rc=-4`; the earlier ASan `DEADLYSIGNAL/SEGV` report was
 ASan's signal handler classifying that fault).  Neither the corpus nor LCCC
-is at fault; the original test assumed an advertised feature was executable.
+is at fault; the original test assumed an advertised feature was executable,
+and each successive gate was tightened only after reading the full hosted
+job log.  No leg is silently downgraded to PASS: skips are printed with
+their measured reason, the portable sanitizer leg still executes all 29
+shapes, and the AVX-512 headers still compile under `-Werror`.
 
 ### 9c.9.7 Three-way host runtime measurement (honest, not a victory claim)
 
