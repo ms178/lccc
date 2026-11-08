@@ -3609,6 +3609,21 @@ jobs:
         "$binary" --version | tee intel-evidence/version.txt
         "$binary" -E -dM -x c /dev/null > intel-evidence/macros.txt
         sha256sum "$binary" > intel-evidence/binary.sha256
+    - name: Vector integer-address snapshot against four compilers
+      run: |
+        set -euo pipefail
+        if ! grep -qw avx2 /proc/cpuinfo; then
+          echo '::notice::AVX2 unavailable; vector integer-address execution not measured'
+          exit 0
+        fi
+        source=tests/regression/vector_integer_address_snapshot.c
+        for compiler in target/fastbuild/lccc "$GCC16" "$CLANG" "$LCCC_ICX_BIN"; do
+          for level in -O0 -O1 -O2 -O3 -Os; do
+            "$compiler" "$level" -mavx2 -Wall -Wextra -Werror "$source" -o intel-evidence/vector-integer-snapshot
+            intel-evidence/vector-integer-snapshot
+            echo "PASS $compiler $level"
+          done
+        done
     - name: Numeric -O and -Ofast parity against ICX 2026.2, GCC 16.2 and Clang 23.1.5
       env:
         CCC: target/fastbuild/lccc
