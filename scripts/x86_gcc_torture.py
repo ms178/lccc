@@ -608,6 +608,20 @@ def public_environment() -> dict[str, str]:
                 marker in k.upper() for marker in ("TOKEN", "SECRET", "PASSWORD", "KEY", "AUTH"))}
 
 
+def oracle_environment_digest() -> str:
+    """Fingerprint selected search/injection knobs without publishing values.
+
+    This is not a complete machine identity: headers, CRT, binutils and shared
+    libraries remain external inputs. Missing and empty values are distinct.
+    """
+    keys = ("PATH", "GCC_EXEC_PREFIX", "COMPILER_PATH", "CPATH", "C_INCLUDE_PATH",
+            "CPLUS_INCLUDE_PATH", "OBJC_INCLUDE_PATH", "LIBRARY_PATH", "LD_LIBRARY_PATH",
+            "LD_PRELOAD", "LD_AUDIT", "SOURCE_DATE_EPOCH", "SDKROOT")
+    return hashlib.sha256(json.dumps({k: os.environ.get(k) for k in keys},
+                                     sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=True).encode("ascii")).hexdigest()
+
+
 _INCLUDE_RE = re.compile(rb'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"', re.M)
 # A torture case pulls in at most a handful of local headers; the bound is
 # there so a pathological (or cyclic) include graph cannot make identity
@@ -692,8 +706,8 @@ def identity_drift(args: argparse.Namespace, sources: list[Path],
     pin stands, and the run is marked unusable.
     """
     now = run_identity(args, sources, suite, is_32)
-    changed = [key for key in ("selected_sources_sha256", "dependency_digest",
-                               "tools", "gcc_checkout_head", "runner_sha256")
+    changed = [key for key in ("selection", "dependency_digest", "tools", "gcc_checkout_head",
+                               "runner_sha256", "oracle_environment_sha256", "host_image")
                if now.get(key) != identity.get(key)]
     return changed
 
@@ -733,6 +747,8 @@ def run_identity(args: argparse.Namespace, sources: list[Path],
         "append": args.append, "runner": args.runner, "expensive": args.expensive,
         "compile_timeout": args.compile_timeout, "run_timeout": args.run_timeout,
         "jobs": args.jobs, "host": platform.platform(),
+        "host_image": {"os": os.environ.get("ImageOS"), "version": os.environ.get("ImageVersion")},
+        "oracle_environment_sha256": oracle_environment_digest(),
         "environment": public_environment(),
         # The boundary is stated, not implied: quoted (project-local) includes
         # are pinned; system headers reached through <...> are not, because

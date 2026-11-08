@@ -375,6 +375,31 @@ class RunnerContract(unittest.TestCase):
             drift = torture.identity_drift(args, [self.source], identity, self.suite, False)
         self.assertIn("dependency_digest", drift)
 
+    def test_mid_run_top_level_source_change_invalidates_report(self):
+        # The selected source digest is nested inside selection, not a
+        # top-level report key. A header-free source exposes a comparison that
+        # accidentally looks at a missing top-level field on both sides.
+        def mutate(case, **kwargs):
+            case.source.write_text("int f(void) { return 1; }\n")
+            return self.result(case)
+
+        with mock.patch.object(torture, "reference_preflight", return_value=None), \
+             mock.patch.object(torture, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")), \
+             mock.patch.object(torture, "compile_case", side_effect=mutate):
+            self.assertEqual(self.invoke(["--gcc", sys.executable]), 2)
+        report = json.loads(self.report.read_text())
+        self.assertIn("run inputs changed mid-flight", report["fatal"])
+        self.assertIn("selection", report["fatal"])
+
+    def test_search_environment_fingerprint_is_sensitive_and_private(self):
+        with mock.patch.dict("os.environ", {"CPATH": "/secret/path-one"}):
+            a = torture.oracle_environment_digest()
+        with mock.patch.dict("os.environ", {"CPATH": "/secret/path-two"}):
+            b = torture.oracle_environment_digest()
+        self.assertNotEqual(a, b)
+        self.assertEqual(len(a), 64)
+        self.assertNotIn("secret", a)
+
     @staticmethod
     def good(results, **extra):
         keys = [f"{r['test']}[{r['flags']}]" for r in results]
