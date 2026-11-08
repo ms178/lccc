@@ -1312,7 +1312,8 @@ fn pointer_root_analysis(func: &IrFunction) -> PointerRootAnalysis {
                 | Instruction::Cast {
                     dest,
                     src: Operand::Value(source),
-                    ..
+                    from_ty: IrType::Ptr,
+                    to_ty: IrType::Ptr,
                 } => rules.push(RootRule::Unary {
                     dest: dest.0,
                     source: source.0,
@@ -3852,6 +3853,97 @@ mod tests {
                 index: 0,
                 noalias: false
             })
+        );
+    }
+
+    #[test]
+    fn pointer_root_casts_require_pointer_preserving_types() {
+        for (from_ty, to_ty, keeps_root) in [
+            (IrType::Ptr, IrType::Ptr, true),
+            (IrType::Ptr, IrType::U32, false),
+            (IrType::Ptr, IrType::U64, false),
+            (IrType::U32, IrType::Ptr, false),
+            (IrType::U64, IrType::Ptr, false),
+        ] {
+            let function = function(
+                "cast_root",
+                vec![block(
+                    0,
+                    vec![
+                        alloca(50, 4, 4),
+                        Instruction::Cast {
+                            dest: Value(51),
+                            src: Operand::Value(Value(50)),
+                            from_ty,
+                            to_ty,
+                        },
+                    ],
+                )],
+            );
+            assert_eq!(
+                pointer_root_analysis(&function).roots.get(&51).copied(),
+                keeps_root.then_some(PointerRoot::Alloca(50)),
+                "{from_ty:?} -> {to_ty:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn narrowing_pointer_cast_does_not_prove_an_alloca_root() {
+        let mut function = function(
+            "truncated_pointer_clobber",
+            vec![block(
+                0,
+                vec![
+                    alloca(0, 32, 32),
+                    alloca(50, 4, 4),
+                    Instruction::Cast {
+                        dest: Value(51),
+                        src: Operand::Value(Value(50)),
+                        from_ty: IrType::Ptr,
+                        to_ty: IrType::U32,
+                    },
+                    Instruction::Cast {
+                        dest: Value(52),
+                        src: Operand::Value(Value(51)),
+                        from_ty: IrType::U32,
+                        to_ty: IrType::Ptr,
+                    },
+                    intrinsic(
+                        Some(1),
+                        IntrinsicOp::Loadu256,
+                        Some(0),
+                        vec![Operand::Const(IrConst::I64(4096))],
+                    ),
+                    Instruction::Store {
+                        val: Operand::Const(IrConst::I32(1)),
+                        ptr: Value(52),
+                        ty: IrType::I32,
+                        seg_override: AddressSpace::Default,
+                        volatile: false,
+                    },
+                    intrinsic(
+                        Some(2),
+                        IntrinsicOp::Pcmpeqb256,
+                        Some(20),
+                        vec![Operand::Value(Value(0)), Operand::Value(Value(21))],
+                    ),
+                ],
+            )],
+        );
+        let roots = pointer_root_analysis(&function).roots;
+        assert_eq!(
+            fuse_in_function(&mut function),
+            0,
+            "unknown write must block forwarding"
+        );
+        assert!(
+            !roots.contains_key(&51),
+            "narrow integer cast is not pointer-preserving"
+        );
+        assert!(
+            !roots.contains_key(&52),
+            "integer-to-pointer cast may alias anything"
         );
     }
 
