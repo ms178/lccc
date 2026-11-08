@@ -13084,7 +13084,6 @@ fn low_subreg_name(reg32: &str, width: i32) -> Option<&'static str> {
     }
 }
 
-/// Parse `movl %S, %D` (both 32-bit GPRs, S != D).
 /// The line-`j` text owed by the staging patterns.
 ///
 /// `None` means no `s` parser could match, so the copy was never made. Returning
@@ -13104,6 +13103,7 @@ fn staging_line_text(t: &Option<String>) -> &str {
     t.as_deref().unwrap_or("")
 }
 
+/// Parse `movl %S, %D` (both 32-bit GPRs, S != D).
 fn parse_mov_reg_reg(s: &str) -> Option<(&str, &str)> {
     let rest = s.strip_prefix("movl ")?;
     let (src, dst) = rest.split_once(',')?;
@@ -17088,6 +17088,83 @@ fn hide_debug_rows(store: &LineStore, infos: &mut [LineInfo]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The staging copy is made only when `s` starts `movl ` or `xorl `, and
+    /// `staging_line_text` hands `""` to a reader in every other case. That is
+    /// safe ONLY because no reader can match the empty string. This test is the
+    /// executable form of that audit: it pins all eleven readers, so a parser
+    /// that grows an empty-input path fails here instead of silently letting a
+    /// pattern fire against a line that was never copied.
+    #[test]
+    fn staging_line_text_is_fail_closed_for_every_reader() {
+        // The accessor itself: None yields "", Some yields the text verbatim.
+        assert_eq!(staging_line_text(&None), "");
+        let owned = Some("movl %eax, %ecx".to_string());
+        assert_eq!(staging_line_text(&owned), "movl %eax, %ecx");
+
+        // Every reader of the copy, called exactly as the pass calls it with
+        // the empty text. Ten return Option and must be None; `imm_of` returns
+        // a &str and must be "".
+        assert!(parse_mov_from("%eax", "").is_none());
+        assert!(parse_test_pair("").is_none());
+        assert!(parse_alu_reg_reg("").is_none());
+        assert!(parse_store_from_reg("").is_none());
+        assert!(parse_mov_reg_reg("").is_none());
+        assert!(parse_cmp_test_imm("").is_none());
+        assert!(parse_cmp_test_reg_reg("").is_none());
+        assert!(parse_andl_imm_reg("", "%ecx").is_none());
+        assert!(parse_widened_slot_load("", 0).is_none());
+        assert!(parse_addl_reg_reg("").is_none());
+        assert_eq!(imm_of(""), "");
+    }
+
+    /// The other half of the precondition: the copy is skipped exactly when no
+    /// `s` parser could have matched. If a fifth `s` parser ever accepts a
+    /// mnemonic outside {movl, xorl}, the guard at the allocation site becomes
+    /// unsound and this test names it.
+    #[test]
+    fn staging_copy_precondition_covers_every_s_parser() {
+        // Representative non-movl/xorl lines the pass really sees. None of the
+        // five `s` parsers may accept any of them, which is what makes the
+        // skipped copy unobservable.
+        for s in [
+            "",
+            "addl $1, %eax",
+            "subl %ecx, %edx",
+            "andl $7, %ebx",
+            "testl %eax, %eax",
+            "cmpl $0, %esi",
+            "leal 4(%esp), %eax",
+            "pushl %ebp",
+            "popl %ebp",
+            "ret",
+            "movzbl 4(%esp), %eax",
+            "movw %ax, 2(%esp)",
+            "movl",
+            "xorl",
+            "MOVL %eax, %ecx",
+        ] {
+            assert!(
+                !s.starts_with("movl ") && !s.starts_with("xorl "),
+                "fixture {s:?} would take the copying path"
+            );
+            assert!(parse_mov_imm_reg(s).is_none(), "mov_imm_reg accepted {s:?}");
+            assert!(
+                parse_mov_imm_value(s).is_none(),
+                "mov_imm_value accepted {s:?}"
+            );
+            assert!(parse_mov_reg_reg(s).is_none(), "mov_reg_reg accepted {s:?}");
+            assert!(
+                parse_store_from_reg(s).is_none(),
+                "store_from_reg accepted {s:?}"
+            );
+            assert!(parse_xor_self(s).is_none(), "xor_self accepted {s:?}");
+        }
+        // Positive control: the guard must NOT skip lines the parsers do accept,
+        // otherwise the pass would stop firing altogether.
+        assert!(parse_mov_reg_reg("movl %eax, %ecx").is_some());
+        assert!(parse_xor_self("xorl %eax, %eax").is_some());
+    }
 
     #[test]
     fn div_fusion_checks_setup_inputs_and_flag_liveness() {
