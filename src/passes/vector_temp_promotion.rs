@@ -1182,7 +1182,7 @@ fn promote_in_function(func: &mut IrFunction) -> usize {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PointerRoot {
+pub(crate) enum PointerRoot {
     Alloca(u32),
     Global,
     Param { index: usize, noalias: bool },
@@ -1258,7 +1258,7 @@ fn strongly_connected_components(edges: &[Vec<usize>]) -> Vec<usize> {
     component
 }
 
-struct PointerRootAnalysis {
+pub(crate) struct PointerRootAnalysis {
     roots: FxHashMap<u32, PointerRoot>,
     /// Values whose pointer depends on a loop-carried pointer recurrence.
     recurrence_derived: FxHashSet<u32>,
@@ -1271,7 +1271,18 @@ struct PointerRootAnalysis {
 /// never degrades into the repeated full-function fixpoint scan.  Loop phis
 /// are handled through the single-seed cycle shortcut; multi-seed pointer
 /// cycles stay unknown.
-fn pointer_root_analysis(func: &IrFunction) -> PointerRootAnalysis {
+impl PointerRootAnalysis {
+    /// The object root `value` points into, when the analysis could name one.
+    /// `None` means "unknown": a merged pointer, a value loaded from memory,
+    /// or a loop-carried recurrence. Callers must fail closed on `None`.
+    pub(crate) fn root_of(&self, value: u32) -> Option<PointerRoot> {
+        // Copied rather than referenced so callers cannot accidentally rely on
+        // the map outliving the analysis.
+        self.roots.get(&value).copied()
+    }
+}
+
+pub(crate) fn pointer_root_analysis(func: &IrFunction) -> PointerRootAnalysis {
     let estimate = map_capacity(func);
     let mut roots = FxHashMap::with_capacity_and_hasher(estimate, Default::default());
     let mut rules = Vec::new();

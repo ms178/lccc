@@ -18,6 +18,7 @@
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::intrinsics::IntrinsicOp;
+use super::vector_temp_promotion::PointerRoot;
 use crate::ir::reexports::{
     Instruction, IrConst, IrFunction, IrModule, Operand, Terminator, Value,
 };
@@ -35,6 +36,106 @@ pub fn run(module: &mut IrModule) -> usize {
 fn memcpy_folds_into_intrinsic(op: &IntrinsicOp, size: usize, index: usize) -> bool {
     !op.writes_memory_via_args()
         && super::vector_temp_promotion::pointer_vector_arg_width(*op, index) == Some(size)
+}
+
+/// Count how many times `value` appears as an operand of `inst`.
+fn operand_count(inst: &Instruction, value: u32) -> usize {
+    let mut count = 0usize;
+    inst.for_each_used_value(|used| {
+        if used == value {
+            count += 1;
+        }
+    });
+    count
+}
+
+/// The subset of `allocas` whose address may be reachable through some pointer
+/// the function did not create, so an external pointer (a parameter, a global,
+/// a value loaded from memory) could alias it.
+///
+/// Two distinct allocas are always disjoint objects, but that argument says
+/// nothing about an *outside* pointer.  Accepting a non-alloca memcpy source
+/// needs the destination alloca to be one nobody else can name.
+///
+/// Only ways the address can leave as DATA matter: being stored, passed to a
+/// call or to inline asm, merged in a select/phi, or escaping through the
+/// terminator.  Reads and writes *through* the pointer are fine — they use the
+/// address, they do not publish it.
+///
+/// Computed for the whole function in one sweep because the rewrite loop holds
+/// a mutable borrow of `func.blocks`.
+fn escaping_allocas(func: &IrFunction, allocas: &FxHashSet<u32>) -> FxHashSet<u32> {
+    let mut escaping = FxHashSet::default();
+    let mut used_here: Vec<u32> = Vec::new();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            used_here.clear();
+            inst.for_each_used_value(|value| {
+                if allocas.contains(&value) {
+                    used_here.push(value);
+                }
+            });
+            for alloca in &used_here {
+                let uses = operand_count(inst, *alloca);
+                let safe = match inst {
+                    // The definition itself publishes nothing.
+                    Instruction::Alloca { dest, .. } => dest.0 == *alloca,
+                    // Direct object access through the pointer position only,
+                    // and exactly once, so the same instruction is not also
+                    // storing the address as data (`Store { ptr: A, val: A }`).
+                    Instruction::Load { ptr, .. }
+                    | Instruction::Store { ptr, .. }
+                    | Instruction::GetElementPtr { base: ptr, .. } => {
+                        ptr.0 == *alloca && uses == 1
+                    }
+                    // Whole-object copy: every position is a memory operand.
+                    Instruction::Memcpy { .. } => true,
+                    // Vector intrinsics read and write through their pointer
+                    // operands; none of them materializes an address as data.
+                    Instruction::Intrinsic { .. } => true,
+                    _ => false,
+                };
+                if !safe {
+                    escaping.insert(*alloca);
+                }
+            }
+        }
+        for value in block.terminator.used_values() {
+            if allocas.contains(&value) {
+                escaping.insert(value);
+            }
+        }
+    }
+    escaping
+}
+
+/// The single alloca root an instruction writes, when that target is known
+/// exactly and the instruction writes nothing else.
+///
+/// `may_write_memory()` is a whole-program "touches memory" bit; it is true for
+/// every `Intrinsic` carrying a `dest_ptr`, including pure vector ALU ops like
+/// `MinPs256` that write nothing but their own destination slot.  A chain
+/// forward only needs to know whether the *source* bytes can change, so callers
+/// use this to keep scanning past writes that provably land somewhere else.
+///
+/// Returns `None` whenever the write set is not a single, directly-named alloca
+/// — unknown pointers, GEP-derived addresses, calls, atomics, inline asm and
+/// intrinsics that also write through their arguments all stay conservative.
+fn exact_alloca_write_target(inst: &Instruction) -> Option<u32> {
+    match inst {
+        // The construction-site contract for memory-writing intrinsics is that
+        // the destination is carried in `dest_ptr` (see `may_write_memory`);
+        // `writes_memory_via_args()` covers the handful that also scribble
+        // through an operand, and those are deliberately not claimed here.
+        Instruction::Intrinsic {
+            dest_ptr: Some(ptr),
+            op,
+            ..
+        } if !op.writes_memory_via_args() => Some(ptr.0),
+        Instruction::Memcpy { dest, .. } => Some(dest.0),
+        Instruction::Store { ptr, .. } => Some(ptr.0),
+        _ => None,
+    }
 }
 
 /// Values whose single definition cannot be established, including the
@@ -128,6 +229,20 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
             }
         }
 
+        // Escape facts are only consulted when a memcpy source is NOT an
+        // alloca, so skip the sweep entirely for the overwhelming majority of
+        // functions whose copies are all alloca-to-alloca.
+        let escaping = if func.blocks.iter().any(|block| {
+            block.instructions.iter().any(|inst| {
+                matches!(inst, Instruction::Memcpy { src, .. } if !allocas.contains(&src.0))
+            })
+        }) {
+            escaping_allocas(func, &allocas)
+        } else {
+            FxHashSet::default()
+        };
+        let roots = super::vector_temp_promotion::pointer_root_analysis(func);
+
         for block in &mut func.blocks {
             let mut i = 0;
             while i < block.instructions.len() {
@@ -186,8 +301,40 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
                             // backends may write a result before all source
                             // chunks have been read; pointer inequality is
                             // not a no-alias proof.
+                            //
+                            // A non-alloca source (a parameter, a global, a
+                            // GEP of either) is accepted when the destination
+                            // is a local alloca whose address never escapes:
+                            // freshly allocated frame storage cannot be named
+                            // by a pointer the caller already held, so the two
+                            // are disjoint.  Requiring an alloca source here
+                            // kept the per-iteration staging copy of a
+                            // loop-invariant input alive — `avx_fp_private`
+                            // copied `in[i]` and the constant vector into
+                            // fresh slots eight times per call because the
+                            // sources were a parameter and a GEP.
+                            let source_is_disjoint_destination = match dest_ptr {
+                                Some(dp) => {
+                                    allocas.contains(&dp.0)
+                                        && *dp != src
+                                        // `dp` is fresh frame storage: an
+                                        // external root can only reach it if
+                                        // the address was published, and a
+                                        // different alloca is a different
+                                        // object.
+                                        && match roots.root_of(src.0) {
+                                            Some(PointerRoot::Alloca(root)) => root != dp.0,
+                                            Some(PointerRoot::Global)
+                                            | Some(PointerRoot::Param { .. }) => {
+                                                !escaping.contains(&dp.0)
+                                            }
+                                            None => false,
+                                        }
+                                }
+                                None => false,
+                            };
                             if consumer.is_some()
-                                || !allocas.contains(&src.0)
+                                || (!allocas.contains(&src.0) && !source_is_disjoint_destination)
                                 || dest_ptr.is_some_and(|dp| !allocas.contains(&dp.0) || dp == src)
                             {
                                 safe = false;
@@ -206,7 +353,41 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
                     // an atomic, or an intrinsic writing via its arguments.
                     // Only instructions before the consumer matter; the
                     // consumer itself writes the destination after its read.
+                    //
+                    // The exception is a write whose target is a single,
+                    // directly-named alloca: two distinct allocas occupy
+                    // disjoint byte ranges of the frame, so storing to one
+                    // cannot change the other.  That covers the intrinsic
+                    // temporaries that otherwise abort every forward in a
+                    // chain of vector ops — `MinPs256` writing its own
+                    // `dest_ptr` slot must not stop the copy feeding the
+                    // following `MaxPs256` from being forwarded.
+                    let write_is_disjoint = (|| {
+                        let target = exact_alloca_write_target(inst)?;
+                        // The write must land on a well-behaved alloca
+                        // (`unique_nonvolatile_allocas`), or pointer identity
+                        // says nothing about the object it names.
+                        if !allocas.contains(&target) || target == src.0 {
+                            return None;
+                        }
+                        match roots.root_of(src.0) {
+                            // A different alloca: disjoint objects in the
+                            // frame, so writing one cannot touch the other.
+                            Some(PointerRoot::Alloca(root)) => (root != target).then_some(()),
+                            // A parameter or a global, or something derived
+                            // only from those: outside the frame entirely
+                            // unless the alloca's address was published.
+                            Some(PointerRoot::Global)
+                            | Some(PointerRoot::Param { .. }) => {
+                                (!escaping.contains(&target)).then_some(())
+                            }
+                            // Unknown provenance: fail closed.
+                            None => None,
+                        }
+                    })()
+                    .is_some();
                     if consumer.is_none()
+                        && !write_is_disjoint
                         && (inst.may_write_memory()
                             || matches!(
                                 inst,
