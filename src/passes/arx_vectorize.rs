@@ -1942,10 +1942,10 @@ mod terminator_rewrite_tests {
         ));
         let mut t2 = Terminator::Return(Some(Operand::Value(Value(1234))));
         assert!(!terminator_uses_any(&t2, &v));
-        assert_eq!(
-            terminator_uses_any(&Terminator::Return(Some(Operand::Value(Value(99)))), &v),
-            true
-        );
+        assert!(terminator_uses_any(
+            &Terminator::Return(Some(Operand::Value(Value(99)))),
+            &v
+        ));
         rewrite_terminator_operands(&mut t2, &mut remap);
         // Terminator has no PartialEq derive (deliberately: it is an IR
         // node, not a value type).  Pattern-match instead of comparing.
