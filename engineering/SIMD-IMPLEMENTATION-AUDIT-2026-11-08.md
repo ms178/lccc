@@ -1147,10 +1147,10 @@ already fixed by a later commit, each with a named ratchet row:
 
 | ID | Claim in §9c.7 | Verified state at `a7f2c9b` | Evidence |
 |----|----------------|------------------------------|----------|
-| SA-03 | open | **already fixed** | `expr_builtins_lcccsimd.rs:553` lists `vmovdqu64_load`/`vmovdqu64_store` in the `evex` predicate, with a comment naming SA-03 and recording the 354-key mechanical sweep; ratchet rows at `:1056-1057` expect `[Avx512F]` |
-| SA-04 | open | **already fixed** | `BW_EXACT` at `:633` carries `vpshuflw512`/`vpshufhw512` (exact names, not stems, because the legacy 128/256 spellings are *not* BW); ratchet rows at `:1059-1060` expect `[Avx512F, Avx512Bw]` |
-| SA-05 | open | **confirmed open, fixed this round** | `intrinsics_simd.rs` passed `commutative = true` for `Pmaddubsw512` |
-| SA-33 | open | **confirmed open, fixed this round** | `emit_simd_op` inferred the obligation from `format!("{:?}").contains("256"/"512")` |
+| **SA-03** | open | **already fixed** | `expr_builtins_lcccsimd.rs:553` lists `vmovdqu64_load`/`vmovdqu64_store` in the `evex` predicate, with a comment naming SA-03 and recording the 354-key mechanical sweep; ratchet rows at `:1056-1057` expect `[Avx512F]` |
+| **SA-04** | open | **already fixed** | `BW_EXACT` at `:633` carries `vpshuflw512`/`vpshufhw512` (exact names, not stems, because the legacy 128/256 spellings are *not* BW); ratchet rows at `:1059-1060` expect `[Avx512F, Avx512Bw]` |
+| **SA-05** | open | **confirmed open, fixed this round** | `intrinsics_simd.rs` passed `commutative = true` for `Pmaddubsw512` |
+| **SA-33** | open | **confirmed open, fixed this round** | `emit_simd_op` inferred the obligation from `format!("{:?}").contains("256"/"512")` |
 
 The rows live in `avx512_permissions_are_subset_and_encoding_specific`, so the
 two closed findings are gate-protected, not just edited.  §9c.7's sentence is
@@ -1410,3 +1410,48 @@ outputs are therefore negative results: the `sa05` and `sa33_asm` driver rows do
 finding it names.  The unit contracts are, and they are mutation-proven.  Any
 future SA row promoted to `R` must record a differential that actually goes red
 on the pre-fix compiler, not merely green on the post-fix one.
+
+### 9c.10.10 CI red-team: the first run found a real regression I introduced
+
+Run `42529363629` reported two red jobs.  Both were diagnosed to the exact step
+with `gh api …/actions/jobs/<id> --jq '.steps[]|select(.conclusion!="success")'`
+and reproduced locally before being touched.
+
+**(1) `Frontend (shard a)` step 80, `check_sse2_i32_product.py` — a genuine bug in
+my own fix.**  `deny-then-sse1: SSE2 denial escaped: set()`.  The empty set is the
+tell: the assertion is `simd_ops - allowed or re.search(r'\b[vyz]mm\d+\b|^\s+v[a-z0-9]+\s', …)`,
+so the *second* clause fired.  The matched text was **`vzeroupper`**, in a
+`-mno-sse2 -msse` translation unit that contains no `%ymm`/`%zmm` at all.
+Confirmed by A/B: the SA-33-reverted compiler emits **0**, the delivered one
+**1**.
+
+Root cause: arming was deliberately made broad ("any ymm/zmm claim or scratch
+load, so no writer can forget it"), but `dirty_upper_ymm` was consumed as if it
+were also a *permission*.  It is only an **obligation**.  Emitting `vzeroupper`
+without AVX is an illegal instruction, not a slow one.
+
+Fix at the correct boundary — the three flag-gated **emission** sites now require
+`self.isa.avx` as well (`prologue.rs` epilogue, `calls.rs` before-call,
+`returns.rs` sibcall).  `state.rs` is backend-agnostic and has no ISA view, so
+guarding the arming there was not possible; guarding emission is also the
+fail-closed choice, because it holds no matter which of the ten writers armed the
+flag.  `memory.rs`'s site is inside an explicit `vex` YMM copy and needed no
+change.  Gate now **rc=0**, all six denial arms PASS.
+
+**(2) `Codegen (shard a)` step 16, the SIMD block — three `test_audit_pack.py`
+failures, all consequences of the fixes, plus one pre-existing race.**
+
+| failure | cause | resolution |
+|---|---|---|
+| `test_11_source_claims_still_true` (`format!("{:?}", op)`) | the test pinned SA-33's **defect** as S-evidence; fixing SA-33 deletes it | replaced with the post-fix invariants (both arming sites) **plus** `assertNotIn` on the old proxy and on `"vpmaddubsw", false`, so a revert now fails instead of passing |
+| `test_12_register_is_complete` (`58 != 54`) | my §9c.10.1 status table used `\| SA-03 \|` cells, which match the register-row grammar `^\| (SA-\d\d) \|` | bolded the four IDs in the *status* table; register rows back to exactly 54 unique |
+| `test_real_timeout_terminates_pipe_inheriting_descendant` (`'R' != 'Z'`) | **pre-existing race**, unrelated to this work: it read `/proc/<pid>/stat` once, immediately after `run()` returned, and required `Z`. SIGKILL is asynchronous, so under load the victim is legitimately still `R` | poll to a 10 s deadline and accept either terminal outcome (reaped → entry gone, or `Z`). The contract is "did not survive", not "is a zombie this instant" |
+
+The third one is exactly the class of pre-existing defect this programme is
+supposed to burn down: a gate that fails on machine load rather than on a
+compiler defect.  It reproduced deterministically while a build was running and
+passes after the fix under the same load.
+
+After the fixes: **41/41 SIMD python tests OK**, audit pack **15/15 PASS**,
+commutativity gate **PASS** + **17** self-tests OK, `check_sse2_i32_product.py`
+**rc=0**, fastbuild **rc=0 / 0 warnings**.

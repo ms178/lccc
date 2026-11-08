@@ -1598,7 +1598,7 @@ impl X86Codegen {
     /// bypasses this call return dirty; the epilogue `vzeroupper` that may
     /// follow is cheap and never wrong.
     fn emit_vzeroupper_before_call(&mut self) {
-        if self.state.dirty_upper_ymm && !self.state.call_passes_wide_vector {
+        if self.isa.avx && self.state.dirty_upper_ymm && !self.state.call_passes_wide_vector {
             self.state.emit("    vzeroupper");
         }
     }
