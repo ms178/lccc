@@ -1691,7 +1691,7 @@ fn copy_single_map(dest: Value, src: Operand) -> Vec<Option<Operand>> {
 mod tests {
     use super::*;
     use crate::common::types::IrType;
-    use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, IrConst};
+    use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, IrConst, IrParam};
 
     /// A conditional update of a loop-carried variable leaves two phi levels:
     /// a join phi (home `s`) and the loop header's phi (home `d`), so the loop
@@ -2776,7 +2776,9 @@ mod tests {
 mod snapshot_forwarding_contract {
     use super::*;
     use crate::common::types::{AddressSpace, IrType};
-    use crate::ir::reexports::{BasicBlock, BlockId, CallInfo};
+    use crate::ir::reexports::{
+        BasicBlock, BlockId, CallInfo, IrConst, IrParam,
+    };
 
     fn alloca(v: u32, semantic_volatile: bool) -> Instruction {
         Instruction::Alloca {
@@ -3223,4 +3225,216 @@ mod snapshot_forwarding_contract {
             assert_eq!(copies(&write_after), vec![(Value(2), Value(0), 64)]);
         }
     }
+
+    // ---- Regression tests for disjoint-write memcpy forwarding ------------
+    //
+    // `forward_memcpy_chains` used to abandon ANY forward once an intervening
+    // instruction wrote memory, and required the copy's source to be an
+    // alloca.  Both rules are far too weak for chains of vector intrinsics,
+    // where every op carries a `dest_ptr` and therefore "writes memory".
+
+    fn bb(instructions: Vec<Instruction>) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(0),
+            source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
+            instructions,
+            terminator: Terminator::Return(None),
+        }
+    }
+
+    fn func_with(params: usize, instructions: Vec<Instruction>) -> IrFunction {
+        let mut function = IrFunction::new(
+            "test".to_string(),
+            IrType::Void,
+            vec![
+                IrParam {
+                    ty: IrType::Ptr,
+                    noalias: false,
+                    struct_size: None,
+                    struct_align: None,
+                    param_align: None,
+                    struct_eightbyte_classes: vec![],
+                    is_f128_sse: false,
+                    fp_agg_class: None,
+                };
+                params
+            ],
+            false,
+        );
+        function.blocks = vec![bb(instructions)];
+        function
+    }
+
+    fn module_of(function: IrFunction) -> IrModule {
+        let mut module = IrModule::default();
+        module.functions = vec![function];
+        module
+    }
+
+    fn alloca_at(dest: u32, size: usize) -> Instruction {
+        Instruction::Alloca {
+            dest: Value(dest),
+            ty: IrType::Ptr,
+            size,
+            align: 32,
+            volatile: false,
+            semantic_volatile: false,
+        }
+    }
+
+    fn memcpy(dest: u32, src: u32, size: usize) -> Instruction {
+        Instruction::Memcpy {
+            dest: Value(dest),
+            src: Value(src),
+            size,
+        }
+    }
+
+    fn intr(dest: Option<u32>, op: IntrinsicOp, dest_ptr: Option<u32>, args: Vec<u32>) -> Instruction {
+        Instruction::Intrinsic {
+            dest: dest.map(Value),
+            op,
+            dest_ptr: dest_ptr.map(Value),
+            args: args.into_iter().map(|a| Operand::Value(Value(a))).collect(),
+        }
+    }
+
+    /// 1: a 32-byte vector op writes its own `dest_ptr` between the copy and
+    /// its consumer.  The old code saw `may_write_memory()` and bailed, so the
+    /// copy feeding the second op was never forwarded.
+    ///    memcpy t, src ; MinPs256 -> h ; MaxPs256(h, t)
+    #[test]
+    fn forward_survives_an_intervening_disjoint_vector_write() {
+        // 1 = src alloca, 2 = t, 3 = h (MinPs dest home), 4 = MaxPs dest home,
+        // 5 = a second constant alloca
+        let func = func_with(
+            0,
+            vec![
+                alloca_at(1, 32),
+                alloca_at(2, 32),
+                alloca_at(3, 32),
+                alloca_at(4, 32),
+                alloca_at(5, 32),
+                memcpy(2, 1, 32),
+                intr(Some(10), IntrinsicOp::MinPs256, Some(3), vec![1, 5]),
+                intr(Some(11), IntrinsicOp::MaxPs256, Some(4), vec![3, 2]),
+            ],
+        );
+        let applied = forward_memcpy_chains(&mut module_of(func));
+        assert_eq!(applied, 1, "the copy must be forwarded past MinPs256");
+    }
+
+    /// 2: the copy's source is a PARAM, not an alloca.  The destination is a
+    /// local alloca whose address is never published, so the two are disjoint.
+    #[test]
+    fn forward_accepts_a_parameter_source() {
+        let func = func_with(
+            1,
+            vec![
+                Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                alloca_at(2, 32),
+                alloca_at(3, 32),
+                alloca_at(4, 32),
+                memcpy(2, 1, 32),
+                intr(Some(10), IntrinsicOp::MinPs256, Some(3), vec![2, 4]),
+            ],
+        );
+        let applied = forward_memcpy_chains(&mut module_of(func));
+        assert_eq!(applied, 1, "a parameter source must be forwardable");
+    }
+
+    /// 3 (soundness): the destination alloca's address IS published, so the
+    /// external source may alias it.  The forward must be refused.
+    #[test]
+    fn forward_refuses_when_the_destination_address_escapes() {
+        let func = func_with(
+            1,
+            vec![
+                Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                alloca_at(2, 32),
+                alloca_at(3, 32),
+                alloca_at(5, 32),
+                // Publish &3 into alloca 5: now `1` could point at 3.
+                Instruction::Store {
+                    ptr: Value(5),
+                    val: Operand::Value(Value(3)),
+                    ty: IrType::Ptr,
+                    seg_override: crate::common::types::AddressSpace::default(),
+                    volatile: false,
+                },
+                memcpy(2, 1, 32),
+                intr(Some(10), IntrinsicOp::MinPs256, Some(3), vec![2, 4]),
+            ],
+        );
+        let applied = forward_memcpy_chains(&mut module_of(func));
+        assert_eq!(
+            applied, 0,
+            "an escaping destination must block the parameter-source forward"
+        );
+    }
+
+    /// 4 (soundness): an intervening write targets the SAME alloca the copy
+    /// reads from.  The bytes can change, so the forward must be refused.
+    #[test]
+    fn forward_refuses_when_an_intervening_write_hits_the_source() {
+        let func = func_with(
+            0,
+            vec![
+                alloca_at(1, 32),
+                alloca_at(2, 32),
+                alloca_at(3, 32),
+                alloca_at(4, 32),
+                memcpy(2, 1, 32),
+                // Overwrites alloca 1 -- exactly what the copy read.
+                memcpy(1, 4, 32),
+                intr(Some(10), IntrinsicOp::MinPs256, Some(3), vec![1, 2]),
+            ],
+        );
+        let applied = forward_memcpy_chains(&mut module_of(func));
+        assert_eq!(
+            applied, 0,
+            "a write to the copy's source must block the forward"
+        );
+    }
+
+    /// 5 (soundness): the source is a GEP derived from the SAME alloca the
+    /// intervening write targets.  Pointer inequality is not a disjointness
+    /// proof; the root analysis must reject it.
+    #[test]
+    fn forward_refuses_a_gep_source_aliasing_the_written_alloca() {
+        let func = func_with(
+            0,
+            vec![
+                alloca_at(1, 64),
+                alloca_at(2, 32),
+                alloca_at(3, 32),
+                alloca_at(4, 32),
+                Instruction::GetElementPtr {
+                    dest: Value(5),
+                    base: Value(1),
+                    offset: Operand::Const(IrConst::I64(32)),
+                    ty: IrType::U8,
+                },
+                memcpy(2, 5, 32),
+                // Writes alloca 1, which the GEP source selects into.
+                memcpy(1, 4, 32),
+                intr(Some(10), IntrinsicOp::MinPs256, Some(3), vec![2, 4]),
+            ],
+        );
+        let applied = forward_memcpy_chains(&mut module_of(func));
+        assert_eq!(
+            applied, 0,
+            "a GEP into the written alloca must block the forward"
+        );
+    }
+
 }
