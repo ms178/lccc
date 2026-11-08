@@ -29,7 +29,7 @@
 //! optimization rather than changing the program.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::common::types::IrType;
+use crate::common::types::{AddressSpace, IrType};
 use crate::ir::instruction::Instruction;
 use crate::ir::intrinsics::IntrinsicOp;
 use crate::ir::reexports::{BasicBlock, IrFunction, IrModule, Operand, Value};
@@ -908,6 +908,8 @@ fn destination_unobserved_between(
     from: usize,
     to: usize,
     facts: &DestinationFacts,
+    destination: u32,
+    allocas: &FxHashMap<u32, AllocaInfo>,
 ) -> bool {
     if facts.escaped {
         return false;
@@ -917,15 +919,52 @@ fn destination_unobserved_between(
     }
     let end = to.min(instructions.len());
     for inst in &instructions[from..end] {
-        if instruction_uses_any(inst, &facts.aliases)
-            || matches!(
-                inst,
-                Instruction::Call { .. }
-                    | Instruction::CallIndirect { .. }
-                    | Instruction::InlineAsm { .. }
-                    | Instruction::StackRestore { .. }
-            )
-        {
+        if instruction_uses_any(inst, &facts.aliases) {
+            return false;
+        }
+        let safe = match inst {
+            // These instructions neither access memory nor trap. Unknown
+            // instructions fail closed instead of relying on pointer-ID
+            // inequality or a missing address-influence edge.
+            Instruction::Alloca { .. }
+            | Instruction::Copy { .. }
+            | Instruction::GetElementPtr { .. }
+            | Instruction::GlobalAddr { .. }
+            | Instruction::LabelAddr { .. }
+            | Instruction::Phi { .. }
+            | Instruction::Select { .. }
+            | Instruction::ParamRef { .. } => true,
+            Instruction::BinOp { op, ty, .. } => !op.can_trap() && ty.is_integer(),
+            Instruction::Load {
+                ptr,
+                ty,
+                volatile: false,
+                seg_override: AddressSpace::Default,
+                ..
+            }
+            | Instruction::Store {
+                ptr,
+                ty,
+                volatile: false,
+                seg_override: AddressSpace::Default,
+                ..
+            } => {
+                // An in-bounds scalar access to a different, direct alloca
+                // is disjoint; derived and segment-relative pointers are not.
+                // Check the possibly accessed extent rather than the object
+                // size: on i686 an F128 constant store may touch 16 bytes even
+                // though a long-double object has size 12.
+                ptr.0 != destination
+                    && ty.access_extent().is_some_and(|(_, may)| {
+                        may > 0
+                            && allocas.get(&ptr.0).is_some_and(|info| {
+                                !info.semantic_volatile && (may as u64) <= info.size as u64
+                            })
+                    })
+            }
+            _ => false,
+        };
+        if !safe {
             return false;
         }
     }
@@ -1152,6 +1191,8 @@ fn promote_in_function(func: &mut IrFunction) -> usize {
                         producer + 1,
                         instruction_idx,
                         facts,
+                        dest.0,
+                        &allocas,
                     ) {
                         promotions.push(Promotion {
                             block: block_idx,
@@ -1220,7 +1261,7 @@ enum RootRule {
         dest: u32,
         lhs: Option<u32>,
         rhs: Option<u32>,
-        subtract: bool,
+        identity: bool,
     },
 }
 
@@ -1277,6 +1318,53 @@ fn strongly_connected_components(edges: &[Vec<usize>]) -> Vec<usize> {
     component
 }
 
+/// Find SCC seeds only when every rule in the SCC preserves its address.
+fn cyclic_root_seeds(
+    rules: &[RootRule],
+    rule_sources: &[Vec<u32>],
+    dense: &FxHashMap<u32, usize>,
+    component: &[usize],
+) -> Vec<Option<u32>> {
+    let count = component.iter().copied().max().unwrap_or(0) + 1;
+    let mut external: Vec<FxHashSet<u32>> = (0..count)
+        .map(|_| FxHashSet::with_capacity_and_hasher(2, Default::default()))
+        .collect();
+    let mut opaque = vec![false; count];
+    for (rule, sources) in rules.iter().zip(rule_sources) {
+        let dest = match rule {
+            RootRule::Unary { dest, .. }
+            | RootRule::Merge { dest, .. }
+            | RootRule::Offset { dest, .. } => *dest,
+        };
+        let id = component[dense[&dest]];
+        if matches!(
+            rule,
+            RootRule::Offset {
+                identity: false,
+                ..
+            }
+        ) {
+            opaque[id] = true;
+        }
+        for &source in sources {
+            if component[dense[&source]] != id {
+                external[id].insert(source);
+            }
+        }
+    }
+    external
+        .iter()
+        .enumerate()
+        .map(|(id, sources)| {
+            if sources.len() == 1 && !opaque[id] {
+                sources.iter().next().copied()
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 struct PointerRootAnalysis {
     roots: FxHashMap<u32, PointerRoot>,
     /// Values whose pointer depends on a loop-carried pointer recurrence.
@@ -1320,9 +1408,18 @@ fn pointer_root_analysis(func: &IrFunction) -> PointerRootAnalysis {
                         },
                     );
                 }
-                Instruction::GetElementPtr { dest, base, .. } => rules.push(RootRule::Unary {
+                Instruction::GetElementPtr {
+                    dest, base, offset, ..
+                } => rules.push(RootRule::Offset {
                     dest: dest.0,
-                    source: base.0,
+                    lhs: Some(base.0),
+                    rhs: match offset {
+                        Operand::Value(value) => Some(value.0),
+                        Operand::Const(_) => None,
+                    },
+                    // GEP has no in-bounds flag. Only adding a literal zero
+                    // proves the resulting address is still the same one.
+                    identity: matches!(offset, Operand::Const(c) if c.to_i128() == Some(0)),
                 }),
                 Instruction::Copy {
                     dest,
@@ -1354,7 +1451,9 @@ fn pointer_root_analysis(func: &IrFunction) -> PointerRootAnalysis {
                             Operand::Value(value) => Some(value.0),
                             Operand::Const(_) => None,
                         },
-                        subtract: matches!(op, crate::ir::reexports::IrBinOp::Sub),
+                        // Integer arithmetic may reconstruct an arbitrary
+                        // address, even when one input has a known root.
+                        identity: false,
                     })
                 }
                 Instruction::Select {
@@ -1406,10 +1505,10 @@ fn pointer_root_analysis(func: &IrFunction) -> PointerRootAnalysis {
     };
 
     // Collapse pointer-recurrence SCCs conceptually.  A component with exactly
-    // one external dependency has a unique seed (for example
-    // `p = phi(param, p + 64)`) and may use that seed before its backedge root
-    // has been materialized.  Components with multiple external dependencies
-    // remain unknown, avoiding the unsound optimistic-phi shortcut.
+    // one external dependency and only identity-preserving rules has a
+    // unique seed (for example `p = phi(param, copy(p))`) and may use that
+    // seed before its backedge root has been materialized. Components with
+    // multiple external dependencies or opaque arithmetic remain unknown.
     //
     // Dense renumbering first: `func.max_value_id()` is the MODULE-wide
     // counter, so sizing the adjacency/component arrays by it would allocate
@@ -1447,27 +1546,8 @@ fn pointer_root_analysis(func: &IrFunction) -> PointerRootAnalysis {
     }
     let component = strongly_connected_components(&edges);
     let component_count = component.iter().copied().max().unwrap_or(0) + 1;
-    let mut external: Vec<FxHashSet<u32>> = (0..component_count)
-        .map(|_| FxHashSet::with_capacity_and_hasher(2, Default::default()))
-        .collect();
-    for (rule, sources) in rules.iter().zip(&rule_sources) {
-        let dest_component = component[dense[&rule_dest(rule)]];
-        for &source in sources {
-            if component[dense[&source]] != dest_component {
-                external[dest_component].insert(source);
-            }
-        }
-    }
-    let cyclic_seed: Vec<Option<u32>> = external
-        .iter()
-        .map(|sources| {
-            if sources.len() == 1 {
-                sources.iter().next().copied()
-            } else {
-                None
-            }
-        })
-        .collect();
+    // Opaque arithmetic inside a cycle forbids the optimistic seed shortcut.
+    let cyclic_seed = cyclic_root_seeds(&rules, &rule_sources, &dense, &component);
 
     let mut dependents: FxHashMap<u32, Vec<usize>> =
         FxHashMap::with_capacity_and_hasher(rules.len(), Default::default());
@@ -1512,24 +1592,16 @@ fn pointer_root_analysis(func: &IrFunction) -> PointerRootAnalysis {
                 RootRule::Offset {
                     dest,
                     lhs,
-                    rhs,
-                    subtract,
-                } => {
-                    let lhs_root = lhs.and_then(|value| roots.get(&value));
-                    let rhs_root = rhs.and_then(|value| roots.get(&value));
-                    let root = if *subtract {
-                        // Pointer - integer preserves the object root. Pointer
-                        // subtraction produces an integer and is deliberately
-                        // left unknown.
-                        lhs_root.filter(|_| rhs_root.is_none()).copied()
+                    identity,
+                    ..
+                } => (
+                    *dest,
+                    if *identity {
+                        lhs.and_then(|value| roots.get(&value)).copied()
                     } else {
-                        match (lhs_root, rhs_root) {
-                            (Some(root), None) | (None, Some(root)) => Some(*root),
-                            _ => None,
-                        }
-                    };
-                    (*dest, root)
-                }
+                        None
+                    },
+                ),
             };
             if !roots.contains_key(&dest) {
                 if let Some(root) = derived {
@@ -1628,20 +1700,11 @@ fn invalidate_for_value_write(
         }
         match load.source {
             Operand::Value(source) => !write_may_clobber(source, write_root, roots),
-            // A constant source denotes a fixed (absolute) address.  The only
-            // write that PROVABLY cannot reach it is one confined to an
-            // alloca-derived pointer: a fresh stack alloca can never equal a
-            // compile-time address, and a write through a pointer derived
-            // from one stays inside that alloca.  A plain parameter, a global
-            // symbol, or an opaque pointer may legally target the absolute
-            // address (the caller can pass it, a linker script can place a
-            // symbol there, a load result is unknown), so those must
-            // invalidate the forward — otherwise a promoted consumer
-            // re-reads the address after an intervening store and observes
-            // the wrong value.  (Audit revision: an unconditional `false`
-            // would be sound but strictly coarser; the alloca-confined
-            // exemption carries a symbolic-object proof for the WRITE side.)
-            Operand::Const(_) => matches!(write_root, Some(PointerRoot::Alloca(_))),
+            // A numeric address can designate stack storage too: neither a
+            // fixed stack mapping nor an integer-to-pointer conversion makes
+            // an alloca disjoint from that address. Without a concrete range
+            // proof every write must invalidate an absolute-address source.
+            Operand::Const(_) => false,
         }
     });
 }
@@ -1654,8 +1717,15 @@ fn invalidate_for_memory_effects(
     roots: &FxHashMap<u32, PointerRoot>,
 ) {
     match inst {
-        Instruction::Store { ptr, volatile, .. } => {
-            if *volatile {
+        Instruction::Store {
+            ptr,
+            volatile,
+            seg_override,
+            ..
+        } => {
+            if *volatile || *seg_override != AddressSpace::Default {
+                // An FS/GS base changes the effective address independently
+                // of the numeric pointer's object root.
                 available.clear();
             } else {
                 invalidate_for_value_write(available, *ptr, roots);
@@ -2666,6 +2736,210 @@ mod tests {
     }
 
     #[test]
+    fn promotion_cannot_cross_a_potentially_aliasing_memory_access() {
+        let mut rewrites = Vec::new();
+        for write in [false, true] {
+            let access = if write {
+                Instruction::Store {
+                    val: Operand::Const(IrConst::I32(1)),
+                    ptr: Value(5),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                }
+            } else {
+                Instruction::Load {
+                    dest: Value(6),
+                    ptr: Value(5),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                }
+            };
+            let mut function = function(
+                "unknown_destination_observation",
+                vec![block(
+                    0,
+                    vec![
+                        alloca(0, 32, 32),
+                        alloca(1, 32, 32),
+                        Instruction::Copy {
+                            dest: Value(5),
+                            src: Operand::Const(IrConst::I64(4096)),
+                        },
+                        intrinsic(
+                            Some(2),
+                            IntrinsicOp::Pcmpeqb256,
+                            Some(0),
+                            vec![Operand::Value(Value(3)), Operand::Value(Value(4))],
+                        ),
+                        access,
+                        Instruction::Memcpy {
+                            dest: Value(1),
+                            src: Value(0),
+                            size: 32,
+                        },
+                    ],
+                )],
+            );
+            rewrites.push(promote_in_function(&mut function));
+        }
+        assert_eq!(
+            rewrites,
+            [0, 0],
+            "unknown reads and writes can address the destination"
+        );
+    }
+
+    #[test]
+    fn promotion_allows_only_bounded_direct_distinct_scalar_accesses() {
+        for (size, space, volatile, expected) in [
+            (4, AddressSpace::Default, false, 1),
+            (3, AddressSpace::Default, false, 0),
+            (4, AddressSpace::SegFs, false, 0),
+            (4, AddressSpace::SegGs, false, 0),
+            (4, AddressSpace::Default, true, 0),
+        ] {
+            let mut function = function(
+                "bounded_other_alloca",
+                vec![block(
+                    0,
+                    vec![
+                        alloca(0, 32, 32),
+                        alloca(1, 32, 32),
+                        alloca(5, size, 4),
+                        intrinsic(
+                            Some(2),
+                            IntrinsicOp::Pcmpeqb256,
+                            Some(0),
+                            vec![Operand::Value(Value(3)), Operand::Value(Value(4))],
+                        ),
+                        Instruction::Store {
+                            val: Operand::Const(IrConst::I32(1)),
+                            ptr: Value(5),
+                            ty: IrType::I32,
+                            seg_override: space,
+                            volatile,
+                        },
+                        Instruction::Memcpy {
+                            dest: Value(1),
+                            src: Value(0),
+                            size: 32,
+                        },
+                    ],
+                )],
+            );
+            assert_eq!(
+                promote_in_function(&mut function),
+                expected,
+                "{size} {space:?} {volatile}"
+            );
+        }
+    }
+
+    #[test]
+    fn promotion_rejects_i686_long_double_access_exceeding_alloca() {
+        use crate::common::types::{
+            set_target_long_double_is_f128, set_target_ptr_size, target_long_double_is_f128,
+            target_ptr_size,
+        };
+        struct TargetGuard(usize, bool);
+        impl Drop for TargetGuard {
+            fn drop(&mut self) {
+                set_target_ptr_size(self.0);
+                set_target_long_double_is_f128(self.1);
+            }
+        }
+        let _guard = TargetGuard(target_ptr_size(), target_long_double_is_f128());
+        set_target_ptr_size(4);
+        set_target_long_double_is_f128(false);
+        assert_eq!(IrType::F128.size(), 12);
+        assert_eq!(IrType::F128.access_extent(), Some((10, 16)));
+        for (size, expected) in [(12, 0), (16, 1)] {
+            let mut f = function(
+                "i686_long_double_extent",
+                vec![block(
+                    0,
+                    vec![
+                        alloca(0, 32, 32),
+                        alloca(1, 32, 32),
+                        alloca(5, size, 4),
+                        intrinsic(
+                            Some(2),
+                            IntrinsicOp::Pcmpeqb256,
+                            Some(0),
+                            vec![Operand::Value(Value(3)), Operand::Value(Value(4))],
+                        ),
+                        Instruction::Store {
+                            ptr: Value(5),
+                            val: Operand::Const(IrConst::LongDouble(0.0, [0; 16])),
+                            ty: IrType::F128,
+                            seg_override: AddressSpace::Default,
+                            volatile: false,
+                        },
+                        Instruction::Memcpy {
+                            dest: Value(1),
+                            src: Value(0),
+                            size: 32,
+                        },
+                    ],
+                )],
+            );
+            assert_eq!(promote_in_function(&mut f), expected, "alloca size {size}");
+        }
+    }
+
+    #[test]
+    fn promotion_does_not_cross_access_to_semantically_volatile_alloca() {
+        for (semantic, expected) in [(true, 0), (false, 1)] {
+            let mut other = alloca(5, 4, 4);
+            if let Instruction::Alloca {
+                volatile,
+                semantic_volatile,
+                ..
+            } = &mut other
+            {
+                *volatile = true;
+                *semantic_volatile = semantic;
+            }
+            let mut function = function(
+                "volatile_other_alloca",
+                vec![block(
+                    0,
+                    vec![
+                        alloca(0, 32, 32),
+                        alloca(1, 32, 32),
+                        other,
+                        intrinsic(
+                            Some(2),
+                            IntrinsicOp::Pcmpeqb256,
+                            Some(0),
+                            vec![Operand::Value(Value(3)), Operand::Value(Value(4))],
+                        ),
+                        Instruction::Load {
+                            dest: Value(6),
+                            ptr: Value(5),
+                            ty: IrType::I32,
+                            seg_override: AddressSpace::Default,
+                            volatile: false,
+                        },
+                        Instruction::Memcpy {
+                            dest: Value(1),
+                            src: Value(0),
+                            size: 32,
+                        },
+                    ],
+                )],
+            );
+            assert_eq!(
+                promote_in_function(&mut function),
+                expected,
+                "semantic={semantic}"
+            );
+        }
+    }
+
+    #[test]
     fn read_modify_write_result_is_not_promoted() {
         let mut function = function(
             "rmw_result",
@@ -2911,6 +3185,49 @@ mod tests {
     }
 
     #[test]
+    fn segment_relative_writes_may_alias_either_vector_object() {
+        let mut rewrites = Vec::new();
+        for space in [AddressSpace::SegFs, AddressSpace::SegGs] {
+            let mut function = function(
+                "segment_clobber",
+                vec![block(
+                    0,
+                    vec![
+                        alloca(0, 32, 32),
+                        alloca(10, 32, 32),
+                        alloca(11, 4, 4),
+                        intrinsic(
+                            Some(1),
+                            IntrinsicOp::Loadu256,
+                            Some(0),
+                            vec![Operand::Value(Value(10))],
+                        ),
+                        Instruction::Store {
+                            val: Operand::Const(IrConst::I32(1)),
+                            ptr: Value(11),
+                            ty: IrType::I32,
+                            seg_override: space,
+                            volatile: false,
+                        },
+                        intrinsic(
+                            Some(2),
+                            IntrinsicOp::Pcmpeqb256,
+                            Some(20),
+                            vec![Operand::Value(Value(0)), Operand::Value(Value(21))],
+                        ),
+                    ],
+                )],
+            );
+            rewrites.push(fuse_in_function(&mut function));
+        }
+        assert_eq!(
+            rewrites,
+            [0, 0],
+            "segment bases can change the effective address"
+        );
+    }
+
+    #[test]
     fn load_forwarding_keeps_candidates_across_proven_distinct_writes() {
         let mut function = function(
             "distinct",
@@ -3010,10 +3327,10 @@ mod tests {
     }
 
     #[test]
-    fn constant_address_source_survives_alloca_confined_write() {
-        // The one write that provably cannot reach an absolute address is a
-        // write through a pointer derived from a stack alloca.  That forward
-        // is the legitimate optimization and must survive.
+    fn constant_address_source_may_alias_an_alloca_write() {
+        // A fixed address can denote stack storage (for example on a target
+        // with a fixed stack mapping). An alloca is not disjoint merely
+        // because its address is computed dynamically.
         let mut function = function(
             "const_src_alloca",
             vec![block(
@@ -3043,14 +3360,14 @@ mod tests {
                 ],
             )],
         );
-        assert_eq!(fuse_in_function(&mut function), 1);
+        assert_eq!(fuse_in_function(&mut function), 0);
         let Instruction::Intrinsic { args, .. } = function.blocks[0].instructions.last().unwrap()
         else {
             panic!("expected consumer");
         };
         assert!(
-            matches!(args[0], Operand::Const(IrConst::I64(4096))),
-            "alloca-confined write must keep the constant-address forward"
+            matches!(args[0], Operand::Value(Value(0))),
+            "an absolute address can alias stack storage"
         );
     }
 
@@ -3179,7 +3496,7 @@ mod tests {
     }
 
     #[test]
-    fn pointer_arithmetic_between_load_and_consumer_does_not_block_forwarding() {
+    fn pointer_arithmetic_source_cannot_be_assumed_alloca_confined() {
         let mut function = function(
             "address_arithmetic",
             vec![block(
@@ -3222,12 +3539,14 @@ mod tests {
                 ],
             )],
         );
-        assert_eq!(fuse_in_function(&mut function), 1);
+        // Even a source formed by integer arithmetic from an alloca is not
+        // proven disjoint from the result-slot write between load and use.
+        assert_eq!(fuse_in_function(&mut function), 0);
         let Instruction::Intrinsic { args, .. } = function.blocks[0].instructions.last().unwrap()
         else {
             panic!("expected consumer");
         };
-        assert!(matches!(args[0], Operand::Value(Value(18))));
+        assert!(matches!(args[0], Operand::Value(Value(14))));
     }
 
     #[test]
@@ -3735,7 +4054,73 @@ mod tests {
     }
 
     #[test]
-    fn pointer_root_survives_lowered_integer_width_offset_arithmetic() {
+    fn integer_address_arithmetic_may_reach_another_alloca() {
+        // Integer arithmetic can reconstruct B from A + (B - A).  The
+        // frontend sometimes erases pointer/integer casts, so the integer
+        // subtraction need not retain explicit casts in IR.
+        let mut rewrites = Vec::new();
+        for use_gep in [false, true] {
+            let mut instructions = vec![
+                alloca(0, 32, 32),
+                alloca(10, 32, 32),
+                alloca(50, 32, 32),
+                Instruction::BinOp {
+                    dest: Value(51),
+                    op: IrBinOp::Sub,
+                    lhs: Operand::Value(Value(10)),
+                    rhs: Operand::Value(Value(50)),
+                    ty: IrType::U64,
+                },
+            ];
+            instructions.push(if use_gep {
+                Instruction::GetElementPtr {
+                    dest: Value(52),
+                    base: Value(50),
+                    offset: Operand::Value(Value(51)),
+                    ty: IrType::Ptr,
+                }
+            } else {
+                Instruction::BinOp {
+                    dest: Value(52),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(50)),
+                    rhs: Operand::Value(Value(51)),
+                    ty: IrType::U64,
+                }
+            });
+            instructions.extend([
+                intrinsic(
+                    Some(1),
+                    IntrinsicOp::Loadu256,
+                    Some(0),
+                    vec![Operand::Value(Value(10))],
+                ),
+                Instruction::Store {
+                    val: Operand::Const(IrConst::I32(1)),
+                    ptr: Value(52),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                intrinsic(
+                    Some(2),
+                    IntrinsicOp::Pcmpeqb256,
+                    Some(20),
+                    vec![Operand::Value(Value(0)), Operand::Value(Value(21))],
+                ),
+            ]);
+            let mut function = function("integer_address_alias", vec![block(0, instructions)]);
+            rewrites.push(fuse_in_function(&mut function));
+        }
+        assert_eq!(
+            rewrites,
+            [0, 0],
+            "integer add and GEP must not prove disjointness"
+        );
+    }
+
+    #[test]
+    fn pointer_root_rejects_lowered_integer_width_offset_arithmetic() {
         let param = IrParam {
             ty: IrType::Ptr,
             noalias: false,
@@ -3770,13 +4155,49 @@ mod tests {
                 },
             ],
         ));
-        assert_eq!(
-            pointer_root_analysis(&function).roots.get(&3),
-            Some(&PointerRoot::Param {
-                index: 0,
-                noalias: false
-            })
+        assert!(!pointer_root_analysis(&function).roots.contains_key(&3));
+    }
+
+    #[test]
+    fn pointer_root_gep_only_preserves_a_literal_zero_offset() {
+        let function = function(
+            "gep_roots",
+            vec![block(
+                0,
+                vec![
+                    alloca(0, 32, 32),
+                    Instruction::GetElementPtr {
+                        dest: Value(1),
+                        base: Value(0),
+                        offset: Operand::Const(IrConst::I64(0)),
+                        ty: IrType::Ptr,
+                    },
+                    Instruction::GetElementPtr {
+                        dest: Value(2),
+                        base: Value(0),
+                        offset: Operand::Const(IrConst::I64(1)),
+                        ty: IrType::Ptr,
+                    },
+                    Instruction::GetElementPtr {
+                        dest: Value(3),
+                        base: Value(0),
+                        offset: Operand::Value(Value(4)),
+                        ty: IrType::Ptr,
+                    },
+                    Instruction::GetElementPtr {
+                        dest: Value(5),
+                        base: Value(0),
+                        offset: Operand::Const(IrConst::I128(1_i128 << 64)),
+                        ty: IrType::Ptr,
+                    },
+                ],
+            )],
         );
+        let roots = pointer_root_analysis(&function).roots;
+        assert_eq!(roots.get(&1), Some(&PointerRoot::Alloca(0)));
+        assert!(!roots.contains_key(&2));
+        assert!(!roots.contains_key(&3));
+        assert!(!roots.contains_key(&5));
     }
 
     #[test]
@@ -3922,7 +4343,7 @@ mod tests {
     }
 
     #[test]
-    fn pointer_root_solves_single_seed_loop_phi() {
+    fn pointer_root_rejects_arithmetic_single_seed_loop_phi() {
         let function = function(
             "single_seed_phi",
             vec![block(
@@ -3943,6 +4364,38 @@ mod tests {
                         lhs: Operand::Value(Value(1)),
                         rhs: Operand::Const(IrConst::I64(32)),
                         ty: IrType::I64,
+                    },
+                ],
+            )],
+        );
+        let analysis = pointer_root_analysis(&function);
+        assert!(!analysis.roots.contains_key(&1));
+        assert!(!analysis.roots.contains_key(&2));
+        assert!(analysis.recurrence_derived.contains(&1));
+        assert!(analysis.recurrence_derived.contains(&2));
+    }
+
+    #[test]
+    fn pointer_root_solves_identity_single_seed_loop_phi() {
+        let function = function(
+            "identity_seed_phi",
+            vec![block(
+                0,
+                vec![
+                    alloca(0, 32, 32),
+                    Instruction::Phi {
+                        dest: Value(1),
+                        ty: IrType::Ptr,
+                        incoming: vec![
+                            (Operand::Value(Value(0)), BlockId(0)),
+                            (Operand::Value(Value(2)), BlockId(1)),
+                        ],
+                    },
+                    Instruction::GetElementPtr {
+                        dest: Value(2),
+                        base: Value(1),
+                        offset: Operand::Const(IrConst::I64(0)),
+                        ty: IrType::Ptr,
                     },
                 ],
             )],
