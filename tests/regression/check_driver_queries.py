@@ -161,8 +161,8 @@ def main() -> int:
         for subdir in bases.values():
             directory = root / subdir
             directory.mkdir(parents=True, exist_ok=True)
-            (directory / "crtbegin.o").write_bytes(b"marker")
-            (directory / "libgcc.a").write_bytes(b"marker")
+            for name in ("crtbegin.o", "crtbeginS.o", "crtend.o", "libgcc.a", "libgcc_eh.a"):
+                (directory / name).write_bytes(b"marker")
         env = {**os.environ, "LCCC_SYSROOT": str(root)}
         binary_dir = Path(args.lccc).resolve().parent
         cases = [
@@ -173,8 +173,19 @@ def main() -> int:
             ("riscv64", [str(binary_dir / "lccc-riscv")]),
         ]
         for target, command in cases:
-            expected = str(root / bases[target] / "libgcc.a") + "\n"
-            for flag in ("-print-libgcc-file-name", "-print-file-name=libgcc.a"):
+            queries = (
+                ("-print-libgcc-file-name", "libgcc.a"),
+                ("--print-libgcc-file-name", "libgcc.a"),
+                ("-print-file-name=libgcc.a", "libgcc.a"),
+                ("--print-file-name=libgcc.a", "libgcc.a"),
+                ("-print-file-name=libgcc_eh.a", "libgcc_eh.a"),
+                ("-print-file-name=crtbegin.o", "crtbegin.o"),
+                ("--print-file-name=crtbeginS.o", "crtbeginS.o"),
+                ("-print-file-name=crtend.o", "crtend.o"),
+                ("-print-file-name=crtendS.o", None),
+            )
+            for flag, name in queries:
+                expected = (str(root / bases[target] / name) if name else "crtendS.o") + "\n"
                 p = subprocess.run([*command, flag], cwd=ROOT, env=env,
                                    text=True, capture_output=True, timeout=30)
                 if p.returncode or p.stdout != expected or p.stderr:
