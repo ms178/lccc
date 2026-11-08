@@ -2093,7 +2093,13 @@ pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo]) 
             i += 1;
             continue;
         }
-        let lea = infos[i].trimmed(store.get(i)).to_string();
+        // MB-20: reject on borrowed text; only candidates need an owned line.
+        let lea = infos[i].trimmed(store.get(i));
+        if parse_lea_address(lea).is_none() {
+            i += 1;
+            continue;
+        }
+        let lea = lea.to_string();
         let Some((addr_text, dst_text, addr_fams)) = parse_lea_address(&lea) else {
             i += 1;
             continue;

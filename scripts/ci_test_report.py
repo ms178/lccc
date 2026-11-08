@@ -111,6 +111,21 @@ PROPERTY_LIMIT = 200
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
+# Cargo's own phase boundary. `Finished` ends the compilation phase; `Running`
+# and `Doc-tests` start test execution. Everything after them is program output,
+# not compiler diagnostics.
+#
+# This matters because the test harness only captures Rust's print!/eprint!
+# macros. lccc writes diagnostics through std::io::stderr(), which bypasses that
+# capture, so tests that deliberately compile invalid C leak lines like
+# `error: named address spaces require an x86 target` into the cargo log even
+# when every test passes. The old rule ("a build error is any `error:` line seen
+# before the first `---- name stdout ----` section") only stopped counting once a
+# test FAILED, so an all-green run classified those leaked C diagnostics as
+# rustc build errors and failed the job. The count was even unstable under
+# parallel interleaving (45 serial vs 57 parallel on the same commit).
+CARGO_BUILD_DONE = re.compile(r"^\s*(?:Finished|Running|Doc-tests)\b")
+
 TEST_SECTION = re.compile(r"^---- (?P<name>.+?) stdout ----$")
 TEST_MARK = re.compile(r"^test (?P<name>\S.*?) \.\.\. (?P<verdict>FAILED|ok|ignored)\b")
 FAILURES_HEADER = re.compile(r"^failures:$")
@@ -238,6 +253,7 @@ class Scanner:
         self._await_message: Failure | None = None
         self._pending_error: BuildError | None = None
         self._in_failure_list = False
+        self._build_phase = True
         self._carry = b""
 
     # -- feeding -----------------------------------------------------------
@@ -273,6 +289,8 @@ class Scanner:
 
     # -- the state machine -------------------------------------------------
     def _scan(self, line: str) -> None:
+        if self._build_phase and CARGO_BUILD_DONE.match(line) is not None:
+            self._build_phase = False
         section = TEST_SECTION.match(line)
         if section is not None:
             self._current_test = section.group("name")
@@ -330,10 +348,12 @@ class Scanner:
             self._await_message = failure
             return
 
-        # Rustc diagnostics are the build phase's output.  Inside a test
-        # section they belong to that test (the harness compiles C code), so
-        # only the phase before the first section may raise a build error.
-        if self._current_test is None:
+        # Rustc diagnostics are the build phase's output. Once cargo reports
+        # `Finished`/`Running`/`Doc-tests`, compilation is over and any `error:`
+        # line is output from the program under test -- lccc's own C diagnostics
+        # bypass the harness's macro capture, so they appear here even on an
+        # all-green run. Only the compilation phase may raise a build error.
+        if self._build_phase and self._current_test is None:
             error = RUSTC_ERROR.match(line)
             if error is not None:
                 if not ROLLUP.match(error.group("message")):
@@ -828,6 +848,72 @@ def self_test(annotate: str = "auto") -> int:
     long_command = "cargo test " + " ".join(f"--flag{i}" for i in range(40))
     _check(_short_command(long_command).endswith("…") and len(_short_command(long_command)) <= 120, "a long command must be shortened for annotations", problems)
     _check(_exit_phrase(None) == "an unknown exit status", "an unknown exit status must not be invented", problems)
+
+    # -- build phase vs test output ------------------------------------------
+    # Regression: seven frontend tests deliberately compile invalid C. lccc
+    # writes those diagnostics via std::io::stderr(), which the harness does not
+    # capture, so they leak into the cargo log on an all-green run. The previous
+    # rule counted them as rustc build errors and failed the job.
+    leaked = (
+        "    Finished `fastbuild` profile [optimized + debuginfo] target(s) in 0.01s\n"
+        "     Running unittests src/lib.rs (target/fastbuild/deps/lccc-abc)\n"
+        "\n"
+        "running 2 tests\n"
+        "error: named address spaces require an x86 target\n"
+        "error: assignment of read-only location '*<expr>'\n"
+        "test frontend::sema::analysis::kr_prototype_tests::t ... ok\n"
+        "test frontend::parser::parse::named_space_target_tests::u ... ok\n"
+        "\n"
+        "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n"
+    )
+    leaked_report = parse_log(leaked, tail_lines=500)
+    _check(
+        not leaked_report.build_errors,
+        "C diagnostics leaked by passing tests must not be counted as build errors",
+        problems,
+    )
+    _check(leaked_report.empty(), "an all-green run with leaked diagnostics must stay green", problems)
+
+    real_build_error = (
+        "   Compiling lccc v0.1.0 (/repo)\n"
+        "error[E0308]: mismatched types\n"
+        "  --> src/lib.rs:10:5\n"
+        "   |\n"
+        "10 |     1\n"
+        "   |     ^ expected bool, found integer\n"
+        "error: could not compile `lccc` (lib) due to 1 previous error\n"
+    )
+    build_report = parse_log(real_build_error, tail_lines=500)
+    _check(
+        len(build_report.build_errors) == 1,
+        f"a genuine rustc error before Finished must be a build error, got {len(build_report.build_errors)}",
+        problems,
+    )
+    _check(not build_report.empty(), "a genuine build failure must not be reported as clean", problems)
+    if build_report.build_errors:
+        _check(
+            build_report.build_errors[0].code == "E0308",
+            "the rustc error code must still be captured",
+            problems,
+        )
+
+    # `Running` alone (no Finished, e.g. a cached build) must also end the phase.
+    running_only = (
+        "     Running unittests src/lib.rs (target/fastbuild/deps/lccc-abc)\n"
+        "error: expected ';' after expression before 'value'\n"
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n"
+    )
+    _check(
+        not parse_log(running_only, tail_lines=500).build_errors,
+        "Running alone must end the build phase even without a Finished line",
+        problems,
+    )
+    # Doc-tests are execution too.
+    _check(
+        not parse_log("   Doc-tests lccc\nerror: some doctest output\n", tail_lines=500).build_errors,
+        "Doc-tests output must not be a build error",
+        problems,
+    )
 
     # -- the real-world shape -------------------------------------------------
     report = parse_log(FIXTURE_TESTS, tail_lines=500)

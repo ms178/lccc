@@ -1306,6 +1306,12 @@ jobs:
           tee "$RUNNER_TEMP/ext-vector-varargs-abi.log"
     - name: Verify label-reference cost experiment contracts
       run: python3 scripts/test_measure_label_ref_cost.py
+    - name: Verify peephole allocation-cost experiment contracts
+      run: python3 scripts/test_measure_peephole_alloc_cost.py
+    - name: Peephole must not allocate before a rejecting filter
+      run: python3 tests/regression/check_peephole_alloc_before_filter.py
+    - name: Verify the allocate-before-filter ratchet contracts
+      run: python3 tests/regression/test_check_peephole_alloc_before_filter.py
     - name: Check builtin_cpu_supports runtime semantics
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_cpu_supports_runtime.sh
     - name: Host-clock macros against the zone database

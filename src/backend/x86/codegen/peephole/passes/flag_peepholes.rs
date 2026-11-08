@@ -1703,8 +1703,8 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
             i += 1;
             continue;
         };
-        let cmov_line = infos[cmov_i].trimmed(store.get(cmov_i)).to_string();
-        let Some((cmov_cc, width, src, dst)) = parse_cmov(&cmov_line) else {
+        let cmov_text = infos[cmov_i].trimmed(store.get(cmov_i)); // MB-20: no owned copy needed.
+        let Some((cmov_cc, width, src, dst)) = parse_cmov(cmov_text) else {
             i += 1;
             continue;
         };

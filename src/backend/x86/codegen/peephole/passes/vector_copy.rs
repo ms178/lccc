@@ -608,8 +608,9 @@ pub(super) fn coalesce_vector_brackets(store: &mut LineStore, infos: &mut [LineI
             i += 1;
             continue;
         }
-        let text = infos[i].trimmed(store.get(i)).to_string();
-        let Some(copy_in) = parse_vec_copy(&text) else {
+        // MB-20: `parse_vec_copy` yields no borrow of its input; no owned copy is needed.
+        let text = infos[i].trimmed(store.get(i));
+        let Some(copy_in) = parse_vec_copy(text) else {
             i += 1;
             continue;
         };
@@ -860,8 +861,9 @@ fn propagate_vector_copies_impl<const EAGER: bool>(
             i += 1;
             continue;
         }
-        let text = infos[i].trimmed(store.get(i)).to_string();
-        let Some(copy) = parse_vec_copy(&text) else {
+        // MB-20: `parse_vec_copy` yields no borrow of its input; no owned copy is needed.
+        let text = infos[i].trimmed(store.get(i));
+        let Some(copy) = parse_vec_copy(text) else {
             i += 1;
             continue;
         };
@@ -961,8 +963,9 @@ pub(super) fn widen_private_vector_copies(store: &mut LineStore, infos: &mut [Li
         if infos[i].is_nop() || infos[i].pinned {
             continue;
         }
-        let text = infos[i].trimmed(store.get(i)).to_string();
-        let Some(copy) = parse_vec_copy(&text) else {
+        // MB-20: `parse_vec_copy` yields no borrow of its input; no owned copy is needed.
+        let text = infos[i].trimmed(store.get(i));
+        let Some(copy) = parse_vec_copy(text) else {
             continue;
         };
         if copy.zeroes_above || copy.width >= W128 {
@@ -1500,7 +1503,13 @@ pub(super) fn reassociate_fma_accumulator(store: &mut LineStore, infos: &mut [Li
             j += 1;
             continue;
         }
-        let t_fma = infos[j].trimmed(store.get(j)).to_string();
+        // MB-20: reject on borrowed text; only candidates need an owned line.
+        let t_fma = infos[j].trimmed(store.get(j));
+        if parse_scalar_fma(t_fma).is_none() {
+            j += 1;
+            continue;
+        }
+        let t_fma = t_fma.to_string();
         let Some(fma) = parse_scalar_fma(&t_fma) else {
             j += 1;
             continue;
@@ -1960,8 +1969,9 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
             j += 1;
             continue;
         };
-        let t_out = infos[k].trimmed(store.get(k)).to_string();
-        let Some(copy_out) = parse_vec_copy(&t_out) else {
+        // MB-20: `parse_vec_copy` yields no borrow of its input; no owned copy is needed.
+        let t_out = infos[k].trimmed(store.get(k));
+        let Some(copy_out) = parse_vec_copy(t_out) else {
             j += 1;
             continue;
         };

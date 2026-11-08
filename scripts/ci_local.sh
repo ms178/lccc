@@ -660,6 +660,15 @@ gate "zlib-compare256-correctness" fast \
 gate "label-reference-cost-contracts" fast \
     python3 scripts/test_measure_label_ref_cost.py
 
+gate "peephole-alloc-cost-contracts" fast \
+    python3 scripts/test_measure_peephole_alloc_cost.py
+
+gate "peephole-alloc-before-filter" fast \
+    python3 tests/regression/check_peephole_alloc_before_filter.py
+
+gate "peephole-alloc-before-filter-contracts" fast \
+    python3 tests/regression/test_check_peephole_alloc_before_filter.py
+
 gate "benchmark-ranking-contracts" fast \
     python3 -m unittest discover -s scripts -p test_bench_rank.py
 

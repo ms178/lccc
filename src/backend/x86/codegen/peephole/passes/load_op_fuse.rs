@@ -1021,7 +1021,13 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
             i += 1;
             continue;
         }
-        let load = infos[i].trimmed(store.get(i)).to_string();
+        // MB-20: reject on borrowed text; only candidates need an owned line.
+        let load = infos[i].trimmed(store.get(i));
+        if parse_memory_load(load).is_none() {
+            i += 1;
+            continue;
+        }
+        let load = load.to_string();
         let Some((load_q, mem, t_fam)) = parse_memory_load(&load) else {
             i += 1;
             continue;
@@ -1414,8 +1420,8 @@ pub(super) fn fold_recurrence_update(store: &mut LineStore, infos: &mut [LineInf
             i += 1;
             continue;
         }
-        let copy1 = infos[i].trimmed(store.get(i)).to_string();
-        let Some((c1_q, a_fam, tm_fam)) = parse_reg_copy(&copy1) else {
+        // MB-20: `parse_reg_copy` yields no borrow of its input; parse the line in place.
+        let Some((c1_q, a_fam, tm_fam)) = parse_reg_copy(infos[i].trimmed(store.get(i))) else {
             i += 1;
             continue;
         };
@@ -1429,7 +1435,13 @@ pub(super) fn fold_recurrence_update(store: &mut LineStore, infos: &mut [LineInf
             i += 1;
             continue;
         }
-        let op1 = infos[j].trimmed(store.get(j)).to_string();
+        // MB-20: reject on borrowed text; only candidates need an owned line.
+        let op1 = infos[j].trimmed(store.get(j));
+        if parse_inplace_op(op1).is_none() {
+            i += 1;
+            continue;
+        }
+        let op1 = op1.to_string();
         let Some((op_q, op1_dst, op1_src, unary)) = parse_inplace_op(&op1) else {
             i += 1;
             continue;
@@ -1477,8 +1489,8 @@ pub(super) fn fold_recurrence_update(store: &mut LineStore, infos: &mut [LineInf
             i += 1;
             continue;
         };
-        let copy2_text = infos[k].trimmed(store.get(k)).to_string();
-        let Some((c2_q, x_fam, c2_dst)) = parse_reg_copy(&copy2_text) else {
+        // MB-20: `parse_reg_copy` yields no borrow of its input; parse the line in place.
+        let Some((c2_q, x_fam, c2_dst)) = parse_reg_copy(infos[k].trimmed(store.get(k))) else {
             i += 1;
             continue;
         };
@@ -1497,8 +1509,10 @@ pub(super) fn fold_recurrence_update(store: &mut LineStore, infos: &mut [LineInf
             i += 1;
             continue;
         }
-        let op2 = infos[m].trimmed(store.get(m)).to_string();
-        let Some((op2_name, op2_q, op2_src, op2_dst)) = parse_reg_reg_alu(&op2) else {
+        // MB-20: `parse_reg_reg_alu` yields no borrow of its input; parse the line in place.
+        let Some((op2_name, op2_q, op2_src, op2_dst)) =
+            parse_reg_reg_alu(infos[m].trimmed(store.get(m)))
+        else {
             i += 1;
             continue;
         };
@@ -1667,7 +1681,13 @@ pub(super) fn fuse_load_into_lea_add(store: &mut LineStore, infos: &mut [LineInf
             i += 1;
             continue;
         }
-        let load = infos[i].trimmed(store.get(i)).to_string();
+        // MB-20: reject on borrowed text; only candidates need an owned line.
+        let load = infos[i].trimmed(store.get(i));
+        if parse_memory_load(load).is_none() {
+            i += 1;
+            continue;
+        }
+        let load = load.to_string();
         let Some((load_q, mem, t_fam)) = parse_memory_load(&load) else {
             i += 1;
             continue;
@@ -1677,8 +1697,9 @@ pub(super) fn fuse_load_into_lea_add(store: &mut LineStore, infos: &mut [LineInf
             i += 1;
             continue;
         }
-        let cons = infos[j].trimmed(store.get(j)).to_string();
-        let Some((lea_q, base_fam, idx_fam, dst_fam)) = parse_lea_add(&cons) else {
+        // MB-20: `parse_lea_add` yields no borrow of its input; no owned copy is needed.
+        let cons = infos[j].trimmed(store.get(j));
+        let Some((lea_q, base_fam, idx_fam, dst_fam)) = parse_lea_add(cons) else {
             i += 1;
             continue;
         };
@@ -1723,8 +1744,8 @@ pub(super) fn fuse_load_into_lea_add(store: &mut LineStore, infos: &mut [LineInf
             i += 1;
             continue;
         }
-        let k_text = infos[k].trimmed(store.get(k)).to_string();
-        if !is_full_flag_clobber(&k_text) {
+        // MB-20: `is_full_flag_clobber` only reads the text; no owned copy needed.
+        if !is_full_flag_clobber(infos[k].trimmed(store.get(k))) {
             i += 1;
             continue;
         }
@@ -2238,8 +2259,9 @@ pub(super) fn fold_copy_into_dying_operand(store: &mut LineStore, infos: &mut [L
             i += 1;
             continue;
         }
-        let copy = infos[i].trimmed(store.get(i)).to_string();
-        let Some((c_q, a_fam, b_fam)) = parse_reg_copy(&copy) else {
+        // MB-20: `parse_reg_copy` yields no borrow of its input; no owned copy is needed.
+        let copy = infos[i].trimmed(store.get(i));
+        let Some((c_q, a_fam, b_fam)) = parse_reg_copy(copy) else {
             i += 1;
             continue;
         };
@@ -2252,8 +2274,9 @@ pub(super) fn fold_copy_into_dying_operand(store: &mut LineStore, infos: &mut [L
             i += 1;
             continue;
         }
-        let op = infos[j].trimmed(store.get(j)).to_string();
-        let Some((op_name, op_q, c_fam, dst)) = parse_reg_reg_alu(&op) else {
+        // MB-20: `parse_reg_reg_alu` yields no borrow of its input; no owned copy is needed.
+        let op = infos[j].trimmed(store.get(j));
+        let Some((op_name, op_q, c_fam, dst)) = parse_reg_reg_alu(op) else {
             i += 1;
             continue;
         };
@@ -3792,7 +3815,13 @@ pub(super) fn fuse_zero_ext_cmp(store: &mut LineStore, infos: &mut [LineInfo]) -
             i += 1;
             continue;
         }
-        let first = infos[i].trimmed(store.get(i)).to_string();
+        // MB-20: reject on borrowed text; only candidates need an owned line.
+        let first = infos[i].trimmed(store.get(i));
+        if parse_zero_ext_load(first).is_none() {
+            i += 1;
+            continue;
+        }
+        let first = first.to_string();
         let Some((suf_a, _mem_a, fam_a, wide_a)) = parse_zero_ext_load(&first) else {
             i += 1;
             continue;
@@ -3802,7 +3831,13 @@ pub(super) fn fuse_zero_ext_cmp(store: &mut LineStore, infos: &mut [LineInfo]) -
             i += 1;
             continue;
         }
-        let second = infos[j].trimmed(store.get(j)).to_string();
+        // MB-20: reject on borrowed text; only candidates need an owned line.
+        let second = infos[j].trimmed(store.get(j));
+        if parse_zero_ext_load(second).is_none() {
+            i += 1;
+            continue;
+        }
+        let second = second.to_string();
         let Some((suf_b, mem_b, fam_b, wide_b)) = parse_zero_ext_load(&second) else {
             i += 1;
             continue;
@@ -3821,8 +3856,9 @@ pub(super) fn fuse_zero_ext_cmp(store: &mut LineStore, infos: &mut [LineInfo]) -
             i += 1;
             continue;
         }
-        let cons = infos[k].trimmed(store.get(k)).to_string();
-        let Some((is_q, src_fam, dst_fam)) = parse_reg_reg_cmp(&cons) else {
+        // MB-20: `parse_reg_reg_cmp` yields no borrow of its input; parse the line in place.
+        let Some((is_q, src_fam, dst_fam)) = parse_reg_reg_cmp(infos[k].trimmed(store.get(k)))
+        else {
             i += 1;
             continue;
         };
