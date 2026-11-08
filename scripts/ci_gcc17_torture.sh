@@ -25,10 +25,9 @@
 # inventories 49 x86-64 / 48 i686 compile-leg gaps and known gap 1 says the
 # per-test list, not a collapsed bucket, is the deliverable -- so exit 1 is not
 # automatically a regression, while exit 2 always is. GCC_TORTURE_ADVISORY_FAILURES=1
-# (what the hosted lane sets) therefore publishes the inventory and keeps the
-# lane green on exit 1, and stays fatal on exit 2. Local runs are strict by
-# default. Flip the lane to strict once a baseline inventory is checked in; that
-# is the follow-up recorded in the campaign document.
+# lets the hosted wrapper retain both reports on runner exit 1; its separate
+# whole-corpus per-case ratchet then enforces a reviewed baseline. Filtered runs
+# are explicitly advisory. Local runs are strict by default.
 set -Eeuo pipefail
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -149,8 +148,8 @@ run_leg() {
         # timeout is not proof of an LCCC defect. Do not label every exit 1 as
         # a candidate failure; consult the per-case report for attribution.
         local note="GCC 17 torture $arch/$mode: candidate and/or reference failures (runner exit 1);"\
-" inventory in $report and $failure_log; the lane reports them until a"\
-" checked-in baseline makes them blocking"
+" inventory in $report and $failure_log; runner exit is advisory here;"\
+" see the hosted per-case ratchet for whole-corpus enforcement"
         echo "ci_gcc17_torture: $note" >&2
         if [[ -n ${GITHUB_ACTIONS:-} ]]; then
             printf '::warning title=%s::%s\n' "GCC 17 torture $arch/$mode" "$note"

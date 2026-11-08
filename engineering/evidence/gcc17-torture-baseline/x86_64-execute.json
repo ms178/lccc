@@ -1,0 +1,91 @@
+{
+  "comparison": {
+    "append": "",
+    "arch": "x86_64",
+    "case_set_sha256": "ccc5af0a1f3a5a72c1be8a1558201fd666d4209e1ef77a64c33cd1d9d3f2945d",
+    "compile_timeout": 180.0,
+    "corpus": "c94b688a83fc84015c6fab8ab0ff142051598fc8",
+    "corpus_stamp_sha256": "1d4793530187d3aeb9414596c478a53f74f9d8ed823872c04227a0c168bf61d9",
+    "dependency_digest": "df8e1c301c00045c494532a78025991ee5ac5afb9e959b1f60cafc9b2417c8ae",
+    "environment": {
+      "LCCC_CI_APT_ARCHIVE_DIR": "/home/runner/.cache/lccc-apt"
+    },
+    "expected_cases": 1700,
+    "expensive": false,
+    "flags": [
+      "-O2"
+    ],
+    "harness_dependency_sha256": "8f48f763e9f49ab9c84fbb2eff774aa24c037e3a4f93d13bd34687b08b5b7ffd",
+    "host": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
+    "host_image": {
+      "os": "ubuntu24",
+      "version": "20261101.360.1"
+    },
+    "jobs": 2,
+    "link_mode": "lccc-ld",
+    "mode": "execute",
+    "oracle_environment_sha256": "96367560ae966618a22eed17b9d6241ae541f145967f37d1ca566eb034303ff1",
+    "oracle_sha256": "67ed99639f746b8e83e4e685a7189ae1172fb9c23a3e83aa9b09a1d68f3fb1c2",
+    "run_timeout": 10.0,
+    "runner": "",
+    "runner_sha256": "e29584f37f90371a7fd591dd2a553d681334729c3b263118d33b44603f5b3f62",
+    "selection": {
+      "dependency_digest_truncated": false,
+      "dependency_files": 21,
+      "filter": "",
+      "from_list": null,
+      "selected_sources_sha256": "fc28f0117a49f3953a6b07b3b78d8bbd4b75aec7d980cc952510ff839726a895",
+      "sources": 1700,
+      "tests": []
+    }
+  },
+  "counts": {
+    "pass": 1695,
+    "unsupported": 5
+  },
+  "outcomes": [
+    [
+      "memclr.c",
+      "-O2",
+      "unsupported",
+      "run_expensive_tests",
+      0,
+      "309310a5490a69f1087ea6b8486df85a7ec8f7fe9ceb6bf243bc660cb4f95f7e"
+    ],
+    [
+      "memcpy-a1.c",
+      "-O2",
+      "unsupported",
+      "run_expensive_tests",
+      0,
+      "309310a5490a69f1087ea6b8486df85a7ec8f7fe9ceb6bf243bc660cb4f95f7e"
+    ],
+    [
+      "memcpy-a2.c",
+      "-O2",
+      "unsupported",
+      "run_expensive_tests",
+      0,
+      "309310a5490a69f1087ea6b8486df85a7ec8f7fe9ceb6bf243bc660cb4f95f7e"
+    ],
+    [
+      "memcpy-a4.c",
+      "-O2",
+      "unsupported",
+      "run_expensive_tests",
+      0,
+      "309310a5490a69f1087ea6b8486df85a7ec8f7fe9ceb6bf243bc660cb4f95f7e"
+    ],
+    [
+      "memcpy-a8.c",
+      "-O2",
+      "unsupported",
+      "run_expensive_tests",
+      0,
+      "309310a5490a69f1087ea6b8486df85a7ec8f7fe9ceb6bf243bc660cb4f95f7e"
+    ]
+  ],
+  "schema": 1,
+  "source_head": "3d168f0fe76561b7bb96d23214814c3e1b1d8d3e",
+  "source_run": 42533647855
+}
