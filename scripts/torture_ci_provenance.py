@@ -41,6 +41,7 @@ def provenance(data: dict) -> dict:
     digest(data.get("dependency_digest"), "dependency digest")
     digest(data.get("corpus_stamp_sha256"), "corpus stamp digest")
     digest(data.get("runner_sha256"), "runner digest")
+    digest(data.get("harness_dependency_sha256"), "harness dependency digest")
     digest(data.get("oracle_environment_sha256"), "oracle environment digest")
     image = data.get("host_image")
     if not isinstance(image, dict) or not all(isinstance(image.get(k), str) and image[k] for k in ("os", "version")):
@@ -75,7 +76,8 @@ def provenance(data: dict) -> dict:
         "expected_cases": data["expected_cases"], "selection": selection,
         "dependency_digest": data["dependency_digest"],
         "corpus_stamp_sha256": data["corpus_stamp_sha256"],
-        "runner_sha256": data["runner_sha256"], "oracle_sha256": oracle["sha256"],
+        "runner_sha256": data["runner_sha256"], "harness_dependency_sha256": data["harness_dependency_sha256"],
+        "oracle_sha256": oracle["sha256"],
         "oracle_environment_sha256": data["oracle_environment_sha256"],
         "host_image": image, "host": host, "environment": env,
         "link_mode": data["link_mode"], "append": data["append"],

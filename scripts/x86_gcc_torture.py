@@ -608,6 +608,16 @@ def public_environment() -> dict[str, str]:
                 marker in k.upper() for marker in ("TOKEN", "SECRET", "PASSWORD", "KEY", "AUTH"))}
 
 
+def harness_dependency_digest() -> str:
+    """Hash the runner's repository-local support modules, with their names."""
+    digest = hashlib.sha256()
+    for name in ("tools/corpus/__init__.py", "tools/corpus/process.py",
+                 "tools/corpus/publication.py", "tools/corpus/evidence.py",
+                 "tools/corpus/dejagnu.py"):
+        digest.update(name.encode() + b"\0" + (REPO / name).read_bytes() + b"\0")
+    return digest.hexdigest()
+
+
 def oracle_environment_digest() -> str:
     """Fingerprint selected search/injection knobs without publishing values.
 
@@ -707,7 +717,8 @@ def identity_drift(args: argparse.Namespace, sources: list[Path],
     """
     now = run_identity(args, sources, suite, is_32)
     changed = [key for key in ("selection", "dependency_digest", "tools", "gcc_checkout_head",
-                               "runner_sha256", "oracle_environment_sha256", "host_image")
+                               "runner_sha256", "harness_dependency_sha256",
+                               "oracle_environment_sha256", "host_image")
                if now.get(key) != identity.get(key)]
     return changed
 
@@ -734,6 +745,7 @@ def run_identity(args: argparse.Namespace, sources: list[Path],
         "lccc": str(args.lccc), "lccc_ld": str(args.lccc_ld), "gcc": args.gcc,
         "lccc_head": revision(REPO), "link_mode": args.link_mode,
         "runner_sha256": file_sha256(Path(__file__)),
+        "harness_dependency_sha256": harness_dependency_digest(),
         "gcc_checkout_head": revision(args.suite),
         "gcc_testsuite": _testsuite_version(args.suite),
         "corpus_stamp_sha256": file_sha256(stamp), "tools": tools,

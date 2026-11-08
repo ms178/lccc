@@ -137,7 +137,7 @@ class Inventory(unittest.TestCase):
                        "selected_sources_sha256": "a" * 64, "dependency_files": 0,
                        "dependency_digest_truncated": False},
             dependency_digest="b" * 64, corpus_stamp_sha256="c" * 64,
-            runner_sha256="d" * 64, oracle_environment_sha256="e" * 64,
+            runner_sha256="d" * 64, harness_dependency_sha256="2" * 64, oracle_environment_sha256="e" * 64,
             host_image={"os": "ubuntu24", "version": "20261101.1"}, host="Linux-test",
             tools={"gcc": {"sha256": "f" * 64, "version_returncode": 0},
                    "lccc": {"sha256": "1" * 64}},

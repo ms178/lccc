@@ -391,6 +391,15 @@ class RunnerContract(unittest.TestCase):
         self.assertIn("run inputs changed mid-flight", report["fatal"])
         self.assertIn("selection", report["fatal"])
 
+    def test_mid_run_harness_dependency_change_invalidates_report(self):
+        with mock.patch.object(torture, "reference_preflight", return_value=None), \
+             mock.patch.object(torture, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")), \
+             mock.patch.object(torture, "compile_case", side_effect=self.result), \
+             mock.patch.object(torture, "harness_dependency_digest", side_effect=["a" * 64, "b" * 64]):
+            self.assertEqual(self.invoke(["--gcc", sys.executable]), 2)
+        report = json.loads(self.report.read_text())
+        self.assertIn("harness_dependency_sha256", report["fatal"])
+
     def test_search_environment_fingerprint_is_sensitive_and_private(self):
         with mock.patch.dict("os.environ", {"CPATH": "/secret/path-one"}):
             a = torture.oracle_environment_digest()
