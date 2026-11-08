@@ -7565,9 +7565,28 @@
       "forms": [
         "function"
       ],
-      "generic_helpers": [],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpshufb_mask128"
+      ],
       "header": "avx512fintrin.h",
       "name": "_mm_mask_shuffle_epi8",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpshufb_maskz128"
+      ],
+      "header": "avx512fintrin.h",
+      "name": "_mm_maskz_shuffle_epi8",
       "raw_builtins": [],
       "wrapper_dependencies": []
     },
@@ -7731,7 +7750,7 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [
         "__lccc_simd512_i_vpcmpub256"
@@ -9430,7 +9449,7 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [
         "__lccc_simd512_i_vpcmpw512"
@@ -9464,7 +9483,7 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [
         "__lccc_simd512_i_vpcmpd512"
@@ -9498,7 +9517,7 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [
         "__lccc_simd512_i_vpcmpq512"
@@ -9532,7 +9551,7 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [
         "__lccc_simd512_i_vpcmpb512"
@@ -9549,7 +9568,7 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [
         "__lccc_simd512_i_vpcmpuw512"
@@ -9566,7 +9585,7 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [
         "__lccc_simd512_i_vpcmpud512"
@@ -9583,7 +9602,7 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [
         "__lccc_simd512_i_vpcmpuq512"
@@ -9600,7 +9619,7 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [
         "__lccc_simd512_i_vpcmpub512"
@@ -11997,7 +12016,7 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [
         "__lccc_simd512_i_vpcmpub128"
@@ -13694,7 +13713,7 @@
     "_mm_malloc",
     "_mm_movddup"
   ],
-  "declarations": 837,
+  "declarations": 838,
   "missing_reference_names": [
     "_mm128_bitrev_epi8",
     "_mm128_mask_bitrev_epi8",
@@ -18733,7 +18752,6 @@
     "_mm_maskz_shrdv_epi32",
     "_mm_maskz_shrdv_epi64",
     "_mm_maskz_shuffle_epi32",
-    "_mm_maskz_shuffle_epi8",
     "_mm_maskz_shuffle_pd",
     "_mm_maskz_shuffle_ps",
     "_mm_maskz_shufflehi_epi16",
@@ -19077,5 +19095,5 @@
     "lcccsimd.h"
   ],
   "status": "inventory-only; no instruction/manual/runtime sign-off implied",
-  "unique_names": 837
+  "unique_names": 838
 }

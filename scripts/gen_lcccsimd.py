@@ -156,7 +156,18 @@ M_STORE = [
     ("mask_storeu_epi8", "vmovdqu8_mask_store128", "__m128i", "__mmask16", "M128I"),
 ]
 MZ_BIN = [
-    ("maskz_maddubs_epi16", "vpmaddubsw_maskz512", "__m512i", "__mmask64", "M512I"),
+    ("maskz_maddubs_epi16", "vpmaddubsw_maskz512", "__m512i", "__mmask32", "M512I"),
+]
+# AVX-512VL/BW masked byte shuffles. The lowering and x86 emitter for these
+# two mnemonics existed in the merged tree, but NO header prototype exposed
+# them to C and their declared arity was one/two operands short of what the
+# emitter reads. Stage 5 wires both ends: m3 = [mask,a,b], m4 =
+# [mask,src,a,b]; the macro reorders GCC's (src,k,a,b) spelling to that IR.
+MZ_SHUFB128 = [
+    ("maskz_shuffle_epi8", "vpshufb_maskz128", "__m128i", "__mmask16", "M128I"),
+]
+M_SHUFB128 = [
+    ("mask_shuffle_epi8", "vpshufb_mask128", "__m128i", "__mmask16", "M128I"),
 ]
 MZ_SET1 = [
     ("maskz_set1_epi16", "vpbroadcastw_maskz512", "__m512i", "__mmask32", "int"),
@@ -168,7 +179,7 @@ MZ_INSERT = [
     ("maskz_inserti32x4", "vinserti32x4_maskz512", "__m512i", "__mmask16", "__m128i"),
 ]
 MZ_EXTRACT = [
-    ("maskz_extracti32x4_epi32", "vextracti32x4_maskz512", "__m128i", "__mmask16", "M128I"),
+    ("maskz_extracti32x4_epi32", "vextracti32x4_maskz512", "__m128i", "__mmask8", "M128I"),
     ("maskz_extracti64x4_epi64", "vextracti64x4_maskz512", "__m256i", "__mmask8", "M256I"),
     ("maskz_extracti64x2_epi64", "vextracti64x2_maskz512", "__m128i", "__mmask8", "M128I"),
 ]
@@ -511,18 +522,40 @@ for name, mn, srcty in INSERT512:
     macro(f"_mm512_{name}(__a, __b, __imm)",
           f"__CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_{mn}(__imm, __a, __b))")
 # ---- mask compares ----
+# `cmpeq_*` and `cmp_*` share ONE builtin mnemonic (the predicate arrives
+# through the leading `long` immediate).  Emitting a prototype per TABLE
+# ROW produced 11 duplicate C declarations in the merged tree.  C tolerates
+# identical redeclarations, but a generated header must be canonical: dedup
+# by mnemonic and FAIL CLOSED if two rows ever disagree on the mask width
+# (that disagreement would be a real ABI bug, not harmless noise).
+_cmp_proto_seen = {}
 for name, mn, mty, has_imm in CMP_MASK:
+    if mn in _cmp_proto_seen:
+        assert _cmp_proto_seen[mn] == mty, (
+            f"{mn}: conflicting mask types {_cmp_proto_seen[mn]} vs {mty}"
+        )
+        continue
+    _cmp_proto_seen[mn] = mty
     vty = "__m512i" if mn.endswith("512") else ("__m256i" if mn.endswith("256") else "__m128i")
     w(f"{mty} __lccc_simd512_i_{mn}(long, {vty} __a, {vty} __b);")
 for name, mn, mty, has_imm in CMP_MASK:
     pfx, vty = ("_mm512_", "__m512i") if mn.endswith("512") else (
         ("_mm256_", "__m256i") if mn.endswith("256") else ("_mm_", "__m128i"))
+    # BOTH spellings are macros.  A `static __inline__` wrapper takes its
+    # `__m512i` parameters BY VALUE, so `_mm512_cmpeq_epi8_mask(v, v)`
+    # materialised TWO distinct stack objects and the compiler's
+    # repeated-operand identity (`x == x` is all-ones) could not fire --
+    # measured: 25 extra instructions and 5 `vpcmp` + 5 `kmovq` pairs in
+    # the stage-5 differential fixture.  A macro forwards each argument
+    # exactly once to the builtin, so the two operands stay the SAME SSA
+    # value and the fold reduces the whole call to an immediate.  GCC 16.2
+    # and Clang 23.1.5 use their own headers and are unaffected.
     if has_imm:
         macro(f"{pfx}{name}(__a, __b, __imm)",
               f"({mty})__lccc_simd512_i_{mn}(__imm, __a, __b)")
     else:
-        wrap(f"{mty} {pfx}{name}({vty} __a, {vty} __b)",
-             f"{{ return ({mty})__lccc_simd512_i_{mn}(0, __a, __b); }}")
+        macro(f"{pfx}{name}(__a, __b)",
+              f"({mty})__lccc_simd512_i_{mn}(0, __a, __b)")
 # ---- masked loads/stores ----
 for name, mn, vty, mty, m in MZ_LOAD:
     proto(f"512_i_{mn}", "m512i", ["long", mty + " __mask", "const void *__p"])
@@ -548,6 +581,18 @@ for name, mn, vty, mty, m in MZ_BIN:
 for name, mn, vty, mty, m in MZ_BIN:
     macro(f"_mm512_{name}(__mask, __a, __b)",
           f"__CCC_{m}_FROM_BUILTIN(__lccc_simd512_i_{mn}(0, __mask, __a, __b))")
+# ---- AVX-512VL/BW masked byte shuffles (128-bit) ----
+for name, mn, vty, mty, m in MZ_SHUFB128:
+    proto(f"512_i_{mn}", "m512i",
+          ["long", mty + " __mask", vty + " __a", vty + " __b"])
+for name, mn, vty, mty, m in M_SHUFB128:
+    proto(f"512_i_{mn}", "m512i",
+          ["long", mty + " __mask", vty + " __src", vty + " __a", vty + " __b"])
+# The PUBLIC `_mm_mask*_shuffle_epi8` wrappers live in
+# `include/avx512fintrin.h` (hand-maintained, matching GCC's API). Defining
+# a same-named macro HERE would textually rewrite that header's inline
+# definition into garbage -- measured: 46 parse errors in a clean
+# three-way build. Only the builtin prototypes belong in lcccsimd.h.
 for name, mn, vty, mty, gty in MZ_SET1:
     proto(f"512_i_{mn}", "m512i", ["long", mty + " __mask", gty + " __a"])
 for name, mn, vty, mty, gty in MZ_SET1:

@@ -307,19 +307,29 @@ _mm512_mask_storeu_epi16(void *__p, __mmask32 __k, __m512i __a)
 
 /* AVX2 masked helpers */
 
-/* 128 masked */
+/* 128 masked byte shuffles (AVX-512VL + AVX-512BW).
+ *
+ * The merged tree implemented `_mm_mask_shuffle_epi8` as a 16-iteration
+ * SCALAR loop and had no `_mm_maskz_shuffle_epi8` at all, even though the
+ * compiler already had a lowering entry, an EVEX `vpshufb {k1}` emitter
+ * and a constant-mask fold for both. Wiring the wrappers to the builtins
+ * replaces ~16 scalar branches/stores with ONE instruction and makes
+ * `_mm_maskz_shuffle_epi8` available for the first time. The IR argument
+ * order is (mask, src, a, b); the macro-free inline reorders the public
+ * GCC/Clang spelling (src, k, a, b) explicitly.
+ */
+static __inline__ __m128i __attribute__((__always_inline__))
+_mm_maskz_shuffle_epi8(__mmask16 __k, __m128i __a, __m128i __b)
+{
+    return __CCC_M128I_FROM_BUILTIN(
+        __lccc_simd512_i_vpshufb_maskz128(0, __k, __a, __b));
+}
+
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_mask_shuffle_epi8(__m128i __src, __mmask16 __k, __m128i __a, __m128i __b)
 {
-    unsigned char *__pa=(unsigned char*)&__a, *__pb=(unsigned char*)&__b, *__ps=(unsigned char*)&__src;
-    unsigned char *__pr; __m128i __r; __pr=(unsigned char*)&__r;
-    for(int __i=0;__i<16;__i++){
-        if((__k>>__i)&1) {
-            signed char __idx=(signed char)__pb[__i];
-            __pr[__i]= (__idx<0)?0:__pa[__idx &15];
-        } else __pr[__i]=__ps[__i];
-    }
-    return __r;
+    return __CCC_M128I_FROM_BUILTIN(
+        __lccc_simd512_i_vpshufb_mask128(0, __k, __src, __a, __b));
 }
 
 /* === Additional AVX-512BW completeness === */
