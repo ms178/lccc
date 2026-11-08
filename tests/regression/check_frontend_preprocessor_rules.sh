@@ -772,6 +772,12 @@ fi
 if ! env CCC="$CCC" bash "$here/check_feature_capabilities.sh"; then
     status=1
 fi
+# Robustness: the __has_* scanners walk raw bytes with manual indices, so the
+# failure modes that matter are panics, hangs and non-progressing recovery.
+# Seeded corpus; malformed input erroring out is a PASS.
+if ! python3 "$here/fuzz_has_queries.py" --lccc "$CCC"; then
+    status=1
+fi
 
 [ "$status" -eq 0 ] && echo "frontend-preprocessor: ok"
 exit "$status"
