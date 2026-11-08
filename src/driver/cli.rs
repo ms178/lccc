@@ -4841,7 +4841,6 @@ fn x86_isa_flag_cancelled_later(args: &[String], i: usize) -> bool {
 
 #[cfg(test)]
 mod cli_tests {
-    use super::cmp_version;
     use crate::backend::Target;
     use crate::common::fp_contract::FpContract;
     use crate::driver::pipeline::Driver;
