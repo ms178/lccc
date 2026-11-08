@@ -12,7 +12,7 @@
 //!   register that never survives an intrinsic (kmov in -> use -> kmov out).
 
 use super::emit::X86Codegen;
-use crate::ir::reexports::{IntrinsicOp, IrConst, Operand, Value};
+use crate::ir::reexports::{Instruction, IntrinsicOp, IrConst, Operand, Value};
 
 impl X86Codegen {
     /// Load a 512-bit operand into a ZMM register.
@@ -112,6 +112,93 @@ impl X86Codegen {
             }
             _ => None,
         }
+    }
+
+    /// RIP-relative memory operand for the SECOND source of a `vpcmp*`
+    /// mask compare, when that source is a plain `GlobalAddr`.
+    ///
+    /// Every EVEX `VPCMP{B,W,D,Q}` / `VPCMPU{B,W,D,Q}` form accepts an
+    /// unaligned `m128/m256/m512` src2 — this is exactly what GCC 16.2 emits
+    /// (`vpcmpb $0, B(%rip), %xmm0, %k0`) and why EVEX memory operands need
+    /// no alignment contract.  Folding it removes the `leaq B(%rip),%rax`
+    /// plus `vmovdqu (%rax),%reg_b` pair from every runtime mask compare.
+    ///
+    /// Fail-closed, and deliberately NARROWER than `evex_arg_mem` (which is
+    /// about stack slots and would flush a deferred store): the operand must
+    /// have a UNIQUE `GlobalAddr` definition (`get_defining_instruction`
+    /// refuses multi-def phi residue), must not be TLS, must not be
+    /// register-held, and must not be the target of an uncommitted deferred
+    /// store.  Anything else takes the ordinary two-register path unchanged.
+    /// A `GlobalAddr` is a pure ADDRESS computation; the forwarding pass that
+    /// produced it already proved the object's bytes are readable at this
+    /// program point, so reading them as src2 cannot introduce a fault.
+    fn mask_cmp_global_mem(&self, arg: &Operand) -> Option<String> {
+        let Operand::Value(v) = arg else {
+            return None;
+        };
+        if self.state.vec_live_regs.contains_key(&v.0) {
+            return None;
+        }
+        // A deferred store or memfold is an UNCOMMITTED write whose flush
+        // could land between this instruction's two memory reads.  The IR
+        // alias proof already excludes writes to this object, but a
+        // pending emitter-level write is not visible to that pass, so refuse
+        // the fold while ANY is outstanding.  Fail-closed, and measured to
+        // cost nothing on the 192 runtime mask-compare cases.
+        if self.state.pending_vec_store.is_some() || self.state.pending_vec_memfold.is_some() {
+            return None;
+        }
+        let Instruction::GlobalAddr { name, .. } = self.get_defining_instruction(v.0)? else {
+            return None;
+        };
+        if self.state.tls_symbols.contains(name) {
+            return None;
+        }
+        // `emit_global_addr_impl` routes PIC / weak-extern / shared-library
+        // data through `sym@GOTPCREL(%rip)` (a POINTER load), which cannot be
+        // used as an EVEX memory src2.  Versioned symbol names carry an `@`
+        // suffix that the plain emitter would emit verbatim.  Both shapes
+        // take the ordinary two-register path instead of mis-assembling.
+        if self.state.needs_got_for_addr(name) || name.contains('@') {
+            return None;
+        }
+        Some(format!("{}(%rip)", name))
+    }
+
+    /// Emit a width-exact UNALIGNED load of a proven plain `GlobalAddr`
+    /// directly into the mask-compare's first-operand register.  Without
+    /// this, `simd_load_arg_to` materialises the address into `%rax` first
+    /// (`leaq A(%rip),%rax; movdqu (%rax),%xmm0`), which is one instruction
+    /// more than GCC 16.2 / Clang 23.1.5.  Returns `false` WITHOUT emitting
+    /// anything when the operand is not a proven plain global address, so
+    /// the ordinary loader stays the fallback for every other shape.
+    ///
+    /// The mnemonic is chosen from the TARGET REGISTER, never from the
+    /// opcode: a 512-bit operand must use `vmovdqu64` (64-byte access), a
+    /// 256-bit one `vmovdqu`, a 128-bit one the SSE2 `movdqu`.  Loading a
+    /// 64-byte value through a 16-byte mnemonic would silently truncate.
+    /// 256/512-bit loads dirty the upper YMM halves, so the epilogue's
+    /// `vzeroupper` obligation is armed here exactly as `avx_load_arg_to`
+    /// does.  The load overwrites the register's physical bank, so every
+    /// other value's claim on it is evicted (the stale-claim contract).
+    fn emit_mask_cmp_global_load(&mut self, arg: &Operand, reg: &'static str) -> bool {
+        let Some(mem) = self.mask_cmp_global_mem(arg) else {
+            return false;
+        };
+        let mnemonic = if reg.starts_with("zmm") {
+            "vmovdqu64"
+        } else if reg.starts_with("ymm") {
+            "vmovdqu"
+        } else {
+            self.xmm_move(false)
+        };
+        self.state
+            .emit_fmt(format_args!("    {} {}, %{}", mnemonic, mem, reg));
+        if !reg.starts_with("xmm") {
+            self.state.dirty_upper_ymm = true;
+        }
+        self.state.vec_evict_bank(reg);
+        true
     }
 
     /// Immediate value of an operand (for $imm forms).
@@ -1602,13 +1689,21 @@ impl X86Codegen {
             | CmpeqEpu32Mask512 | CmpEpu32Mask128 | CmpEpu32Mask256 | CmpEpi32Mask512
             | CmpEpi32Mask128 | CmpEpi32Mask256 | CmpeqEpu64Mask512 | CmpEpu64Mask128
             | CmpEpu64Mask256 | CmpEpi64Mask512 | CmpEpi64Mask128 | CmpEpi64Mask256 => {
-                // args: (a, b, imm) — vpcmp* $imm, %zmm_b, %zmm_a, %k1; kmovq %k1, %rax
-                // RED-TEAM: folding B as a MEMORY src2 via `evex_arg_mem` was
-                // measured on the 485-case matrix and REJECTED. It is correct
-                // (three-way stdout identical) but net-NEGATIVE: 7579 -> 7963
-                // instructions, because the gate flushes deferred stores that
-                // the register path elides. Do not reintroduce it without a
-                // store-elision-aware gate.
+                // args: (a, b, imm) — vpcmp* $imm, src2, src1, %k1; kmovq %k1, %rax
+                //
+                // RED-TEAM, two rounds with OPPOSITE measured verdicts:
+                // * Round 10 folded B via the STACK-SLOT `evex_arg_mem` gate.
+                //   Correct but NET-NEGATIVE (7579 -> 7963): that gate flushes
+                //   deferred stores the register path elides, and over-aligned
+                //   512-bit homes did not resolve at all.  REJECTED.
+                // * Round 11 removed the HOME from the IR instead (copy-chain
+                //   collapse + the audited `fuse_vector_loads` alias proof
+                //   forward the load's original `GlobalAddr` into B).  There
+                //   is now no home and no deferred store to flush, so the
+                //   dedicated `mask_cmp_global_mem` gate below IS profitable:
+                //   it deletes `leaq B(%rip),%rax` + `vmovdqu (%rax),%reg_b`
+                //   from EVERY runtime mask compare.  The rejected slot gate
+                //   stays untouched for all other intrinsic families.
                 let (reg_a, reg_b) = match op {
                     CmpeqEpu8Mask512 | CmpEpi8Mask512 | CmpeqEpu16Mask512 | CmpEpi16Mask512
                     | CmpeqEpu32Mask512 | CmpEpi32Mask512 | CmpeqEpu64Mask512 | CmpEpi64Mask512 => {
@@ -1620,17 +1715,26 @@ impl X86Codegen {
                     }
                     _ => ("xmm0", "xmm1"),
                 };
-                self.simd_load_arg_to(&args[0], reg_a);
-                self.simd_load_arg_to(&args[1], reg_b);
+                if !self.emit_mask_cmp_global_load(&args[0], reg_a) {
+                    self.simd_load_arg_to(&args[0], reg_a);
+                }
                 let imm = if args.len() > 2 {
                     self.simd_imm(&args[2])
                 } else {
                     0
                 };
-                self.state.emit_fmt(format_args!(
-                    "    {} ${}, %{}, %{}, %k1",
-                    inst, imm, reg_b, reg_a
-                ));
+                if let Some(mem) = self.mask_cmp_global_mem(&args[1]) {
+                    self.state.emit_fmt(format_args!(
+                        "    {} ${}, {}, %{}, %k1",
+                        inst, imm, mem, reg_a
+                    ));
+                } else {
+                    self.simd_load_arg_to(&args[1], reg_b);
+                    self.state.emit_fmt(format_args!(
+                        "    {} ${}, %{}, %{}, %k1",
+                        inst, imm, reg_b, reg_a
+                    ));
+                }
                 self.state.emit("    kmovq %k1, %rax");
                 if let Some(d) = dest {
                     self.store_rax_to(d);

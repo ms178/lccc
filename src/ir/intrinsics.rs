@@ -2121,6 +2121,44 @@ impl IntrinsicOp {
         })
     }
 
+    /// Byte width of the TWO pointer-backed vector operands of an AVX-512
+    /// / AVX-512VL `vpcmp*` mask-compare intrinsic, or `None` for every other
+    /// opcode. The third operand (when present) is a scalar predicate
+    /// immediate, never a vector; callers MUST still gate on the argument
+    /// index (`index < 2`).
+    ///
+    /// The single authoritative EVEX-width table for every IR consumer:
+    /// `fuse_vector_loads` forwarding, the argument-alignment relaxation
+    /// predicate and the x86 emitter's memory-operand gate.  The
+    /// constant-image folder keeps a SEPARATE lane-shape table (it needs
+    /// lane bytes, lane count and signedness, not just the EVEX width);
+    /// `mask_compare_width_table_covers_every_enum_variant_and_the_folder_shape_table`
+    /// below parses both op lists out of the source and pins them to the
+    /// enum, so a new opcode cannot be known to one and unknown to another.
+    /// Before this table existed, the forwarding table omitted all 30 mask
+    /// compares — which is why a runtime `_mm_cmpeq_epi8_mask` paid an
+    /// 18-instruction home roundtrip while the references paid 4.
+    ///
+    /// Widths are the EVEX vector widths (16/32/64), NOT the scalar mask
+    /// width: a `w128_epi64` compare reads 16 bytes and produces 2 mask bits.
+    /// Every EVEX memory form is alignment-safe, which is why the alignment
+    /// relaxation table may treat these argument positions as `Some(0)`.
+    pub fn mask_compare_vector_width(self) -> Option<usize> {
+        use IntrinsicOp::*;
+        Some(match self {
+            CmpeqEpu8Mask128 | CmpEpu8Mask128 | CmpEpi8Mask128 | CmpEpu16Mask128
+            | CmpEpi16Mask128 | CmpEpu32Mask128 | CmpEpi32Mask128 | CmpEpu64Mask128
+            | CmpEpi64Mask128 => 16,
+            CmpeqEpu8Mask256 | CmpEpu8Mask256 | CmpEpi8Mask256 | CmpEpu16Mask256
+            | CmpEpi16Mask256 | CmpEpu32Mask256 | CmpEpi32Mask256 | CmpEpu64Mask256
+            | CmpEpi64Mask256 => 32,
+            CmpeqEpu8Mask512 | CmpEpu8Mask512 | CmpEpi8Mask512 | CmpeqEpu16Mask512
+            | CmpEpu16Mask512 | CmpEpi16Mask512 | CmpeqEpu32Mask512 | CmpEpu32Mask512
+            | CmpEpi32Mask512 | CmpeqEpu64Mask512 | CmpEpu64Mask512 | CmpEpi64Mask512 => 64,
+            _ => return None,
+        })
+    }
+
     /// Width of an actual SIMD result (including explicit-SIMD result homes).
     /// An opcode property, not a claim that an instruction has a live `dest`:
     /// callers must check the instruction's destination separately. Stores

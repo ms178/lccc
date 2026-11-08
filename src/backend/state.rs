@@ -1510,6 +1510,16 @@ impl CodegenState {
     /// simd_vecreg loopcarry shape: the accumulator's claim on xmm0
     /// outlived both the streamed reload and the shift that redefined
     /// xmm0; the xor then consumed `(v>>1) ^ (v>>1)`).
+    /// Drop EVERY claim on `reg`'s physical bank.  A raw load into that bank
+    /// overwrites all 16/32/64 bytes, so no other value may keep a claim on
+    /// `xmmN`/`ymmN`/`zmmN`.  Using a dedicated `Option`-free method avoids
+    /// the `u32::MAX` "impossible SSA id" sentinel that `vec_evict_bank_except`
+    /// would otherwise need here.
+    pub fn vec_evict_bank(&mut self, reg: &str) {
+        let bank = vector_reg_bank(reg);
+        self.vec_live_regs.retain(|_, r| vector_reg_bank(r) != bank);
+    }
+
     pub fn vec_evict_bank_except(&mut self, reg: &str, keep: u32) {
         let bank = vector_reg_bank(reg);
         self.vec_live_regs

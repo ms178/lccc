@@ -106,6 +106,7 @@ pub(crate) mod vec_interleave;
 pub(crate) mod vec_load_sink;
 mod vec_relations;
 pub(crate) mod vec_ssa;
+pub(crate) mod vector_copy_chain;
 pub(crate) mod vector_fill;
 pub(crate) mod vector_temp_promotion;
 pub(crate) mod vectorize;
@@ -4500,6 +4501,17 @@ pub(crate) fn run_passes(
     // slot and enabling the backend's memory-operand folding.
     if !pass_disabled(&disabled, "vecpromote") {
         vector_temp_promotion::promote_vector_temps(module);
+    }
+
+    // Phase 11b': Collapse the 16/32-byte aggregate-load -> VecLoad ->
+    // VecStore HOME copy chain BEFORE the load forwarder runs.  `fuse_vector_loads`
+    // can only forward a load written DIRECTLY to the final home; the middle
+    // pair hid it behind a scratch home and cost four register copies plus a
+    // `leaq` on every 128/256-bit runtime mask compare.  The pass itself has
+    // its own gate (`veccopychain`) so the win is A/B measurable.
+    if !pass_disabled(&disabled, "veccopychain") {
+        vector_copy_chain::collapse_vector_copy_chains(module);
+        verify::verify_after_pass(module, "veccopychain");
     }
 
     // Phase 11c: Forward direct vector loads into compatible consumers while
