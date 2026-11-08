@@ -1060,16 +1060,38 @@ fn resolve_builtin_link_setup(
     }
 }
 
-/// The driver reports the SAME target-specific search paths as the linker.
 #[cfg(not(feature = "gcc_linker"))]
-pub(crate) fn builtin_library_paths(target: super::Target) -> Vec<String> {
-    let arch = match target {
+fn direct_ld_arch(target: super::Target) -> &'static DirectLdArchConfig {
+    match target {
         super::Target::X86_64 => &DIRECT_LD_X86_64,
         super::Target::I686 => &DIRECT_LD_I686,
         super::Target::Aarch64 => &DIRECT_LD_AARCH64,
         super::Target::Riscv64 => &DIRECT_LD_RISCV64,
-    };
-    resolve_builtin_link_setup(arch, &[], true, false).lib_paths
+    }
+}
+
+/// Report a GCC support file only from the directory the built-in driver
+/// actually selected for this target, using the same sysroot and multilib
+/// discovery as its linker. A directory containing just libgcc_s does not
+/// establish that the static archive exists.
+#[cfg(not(feature = "gcc_linker"))]
+pub(crate) fn builtin_gcc_support_file(target: super::Target, name: &str) -> Option<String> {
+    let dir = find_gcc_lib_dir(direct_ld_arch(target))?;
+    let path = std::path::Path::new(&dir).join(name);
+    path.is_file().then(|| path.to_string_lossy().into_owned())
+}
+
+/// External GCC controls runtime selection in this optional configuration;
+/// don't invent a path based on the built-in linker's unrelated policy.
+#[cfg(feature = "gcc_linker")]
+pub(crate) fn builtin_gcc_support_file(_target: super::Target, _name: &str) -> Option<String> {
+    None
+}
+
+/// The driver reports the SAME target-specific search paths as the linker.
+#[cfg(not(feature = "gcc_linker"))]
+pub(crate) fn builtin_library_paths(target: super::Target) -> Vec<String> {
+    resolve_builtin_link_setup(direct_ld_arch(target), &[], true, false).lib_paths
 }
 
 /// Add architecture-specific extra libraries after "gcc" in the needed libs list.

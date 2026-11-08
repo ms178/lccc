@@ -22,9 +22,11 @@ path) is a documented driver contract, pinned here as such.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -142,6 +144,55 @@ def main() -> int:
         failures.append(f"sysroot contract: refusal wording changed: {lc.stderr!r}")
     else:
         print("driver queries sysroot refusal (documented): PASS")
+
+    # --- selected target's real linker runtime, including multilib ----------
+    # No host files are modified. Different synthetic roots distinguish all
+    # four architectures and make an x86-64 path returned for i686 fail.
+    # The marker files are intentionally not linked; this checks discovery,
+    # not archive contents or cross-compiler runtime ABI.
+    with tempfile.TemporaryDirectory(prefix="lccc-query-sysroot-") as tmp:
+        root = Path(tmp)
+        bases = {
+            "x86-64": "usr/lib/gcc/x86_64-linux-gnu/99.0",
+            "i686": "usr/lib/gcc-cross/i686-linux-gnu/99.0",
+            "aarch64": "usr/lib/gcc-cross/aarch64-linux-gnu/99.0",
+            "riscv64": "usr/lib/gcc-cross/riscv64-linux-gnu/99.0",
+        }
+        for subdir in bases.values():
+            directory = root / subdir
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "crtbegin.o").write_bytes(b"marker")
+            (directory / "libgcc.a").write_bytes(b"marker")
+        env = {**os.environ, "LCCC_SYSROOT": str(root)}
+        binary_dir = Path(args.lccc).resolve().parent
+        cases = [
+            ("x86-64", [args.lccc]),
+            ("i686", [args.lccc, "-m32"]),
+            ("i686", [str(binary_dir / "lccc-i686")]),
+            ("aarch64", [str(binary_dir / "lccc-arm")]),
+            ("riscv64", [str(binary_dir / "lccc-riscv")]),
+        ]
+        for target, command in cases:
+            expected = str(root / bases[target] / "libgcc.a") + "\n"
+            for flag in ("-print-libgcc-file-name", "-print-file-name=libgcc.a"):
+                p = subprocess.run([*command, flag], cwd=ROOT, env=env,
+                                   text=True, capture_output=True, timeout=30)
+                if p.returncode or p.stdout != expected or p.stderr:
+                    failures.append(f"{target} {flag}: expected {expected!r}, "
+                                    f"got rc={p.returncode} {p.stdout!r} {p.stderr!r}")
+                else:
+                    print(f"driver queries {target} {flag}: PASS (target sysroot)")
+        # A shared-only installation does not make the static archive exist.
+        (root / bases["x86-64"] / "libgcc.a").unlink()
+        (root / bases["x86-64"] / "libgcc_s.so").write_bytes(b"marker")
+        for flag in ("-print-libgcc-file-name", "-print-file-name=libgcc.a"):
+            p = subprocess.run([args.lccc, flag], cwd=ROOT, env=env,
+                               text=True, capture_output=True, timeout=30)
+            if p.returncode or p.stdout != "libgcc.a\n" or p.stderr:
+                failures.append(f"missing static archive {flag}: rc={p.returncode} "
+                                f"stdout={p.stdout!r} stderr={p.stderr!r}")
+            else:
+                print(f"driver queries {flag}: PASS (missing static archive)")
 
     # --- documented known divergence ----------------------------------------
     gdm = run(gcc, "-dumpmachine").stdout.strip()

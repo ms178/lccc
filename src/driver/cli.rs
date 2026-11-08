@@ -160,32 +160,6 @@ fn try_parse_ssp_param(ssp_buffer_size: &mut usize, kv: &str) -> Result<bool, St
     }
 }
 
-/// Compare dotted version strings numerically ("16.1.1" > "9.5.0").
-///
-/// A lexical sort orders "9.5.0" AFTER "16.1.1"/"12", so
-/// `-print-libgcc-file-name` would probe the OLDEST GCC directory first
-/// instead of the newest. Version directories are dotted decimal, so a
-/// component-wise numeric comparison is the correct order.
-fn cmp_version(a: &str, b: &str) -> std::cmp::Ordering {
-    let mut ai = a.split('.');
-    let mut bi = b.split('.');
-    loop {
-        match (ai.next(), bi.next()) {
-            (None, None) => return std::cmp::Ordering::Equal,
-            (None, Some(_)) => return std::cmp::Ordering::Less,
-            (Some(_), None) => return std::cmp::Ordering::Greater,
-            (Some(x), Some(y)) => match x
-                .parse::<u64>()
-                .unwrap_or(0)
-                .cmp(&y.parse::<u64>().unwrap_or(0))
-            {
-                std::cmp::Ordering::Equal => continue,
-                ord => return ord,
-            },
-        }
-    }
-}
-
 /// The path of a `-fprofile-*=PATH` option; GCC 16.2 rejects an empty one
 /// with this wording instead of falling back to the current directory.
 fn profile_path_arg(arg: &str, prefix: &str) -> Result<String, String> {
@@ -1978,46 +1952,13 @@ impl Driver {
                     return Ok(true);
                 }
                 "-print-libgcc-file-name" | "--print-libgcc-file-name" => {
-                    // GCC query used by configure scripts (e.g. glibc's "usable
-                    // compiler runtime library" probe) to decide between a
-                    // libgcc and a compiler-rt runtime. Probe the same GCC lib
-                    // directories the built-in linker searches; fall back to a
-                    // bare name (glibc only inspects the basename).
-                    let triples = [
-                        "x86_64-linux-gnu",
-                        "x86_64-pc-linux-gnu",
-                        "x86_64-redhat-linux",
-                        "x86_64-linux",
-                    ];
-                    let mut printed = false;
-                    for triple in triples {
-                        let dir = format!("/usr/lib/gcc/{}", triple);
-                        if let Ok(entries) = std::fs::read_dir(&dir) {
-                            let mut vers: Vec<String> = entries
-                                .filter_map(|e| e.ok())
-                                .filter_map(|e| e.file_name().into_string().ok())
-                                .filter(|n| n.chars().all(|c| c.is_ascii_digit() || c == '.'))
-                                .collect();
-                            vers.sort_by(|a, b| cmp_version(b, a));
-                            for v in vers.iter() {
-                                let a = format!("{}/{}/libgcc.a", dir, v);
-                                let s = format!("{}/{}/libgcc_s.so", dir, v);
-                                if std::path::Path::new(&a).exists()
-                                    || std::path::Path::new(&s).exists()
-                                {
-                                    lccc::cli::stdout_line(format_args!("{}", a));
-                                    printed = true;
-                                    break;
-                                }
-                            }
-                            if printed {
-                                break;
-                            }
-                        }
-                    }
-                    if !printed {
-                        lccc::cli::stdout_line(format_args!("libgcc.a"));
-                    }
+                    // Ask the same target/sysroot/multilib selector used by
+                    // the built-in linker, not an unconditional x86-64 scan.
+                    // A nonexistent static archive must not be advertised.
+                    lccc::cli::stdout_line(format_args!(
+                        "{}",
+                        Self::print_file_name("libgcc.a", target)
+                    ));
                     return Ok(true);
                 }
                 _ if arg.starts_with("-print-file-name=")
@@ -2334,6 +2275,23 @@ impl Driver {
             {
                 return bundled.display().to_string();
             }
+        }
+        // GCC support files must come from the exact directory selected by
+        // the active linker, not an unrelated host/architecture or a fixed
+        // GCC version. Preserve GCC's bare-name convention if unavailable.
+        if matches!(
+            name,
+            "libgcc.a"
+                | "libgcc_eh.a"
+                | "libgcc_s.so"
+                | "crtbegin.o"
+                | "crtbeginS.o"
+                | "crtbeginT.o"
+                | "crtend.o"
+                | "crtendS.o"
+        ) {
+            return crate::backend::common::builtin_gcc_support_file(*target, name)
+                .unwrap_or_else(|| name.to_string());
         }
         let triple = target.triple();
         let search_dirs = [
@@ -6614,26 +6572,6 @@ mod cli_tests {
             assert_eq!(driver.fp_rounding_math, rounding, "{args:?}");
             assert_eq!(driver.fp_trapping_math, trapping, "{args:?}");
         }
-    }
-
-    #[test]
-    fn version_compare_is_numeric() {
-        // Lexical sort would order "9.5.0" after "16.1.1"; numeric must not.
-        assert!(cmp_version("16.1.1", "9.5.0") == std::cmp::Ordering::Greater);
-        assert!(cmp_version("12", "9.5.0") == std::cmp::Ordering::Greater);
-        assert!(cmp_version("16.1.1", "16.1.1") == std::cmp::Ordering::Equal);
-        assert!(cmp_version("16.2.0", "16.1.1") == std::cmp::Ordering::Greater);
-        assert!(cmp_version("10.2.0", "11.4.0") == std::cmp::Ordering::Less);
-        assert!(cmp_version("4.9", "4.10") == std::cmp::Ordering::Less);
-        // Newest-first sort used by -print-libgcc-file-name.
-        let mut v = vec![
-            "10.2.0".to_string(),
-            "9.5.0".to_string(),
-            "16.1.1".to_string(),
-            "12".to_string(),
-        ];
-        v.sort_by(|a, b| cmp_version(b, a));
-        assert_eq!(v, vec!["16.1.1", "12", "10.2.0", "9.5.0"]);
     }
 
     #[test]
