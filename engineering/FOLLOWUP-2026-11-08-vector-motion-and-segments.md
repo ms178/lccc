@@ -73,10 +73,26 @@ That example did not trigger the LCCC IR counterexample; its address-space
 semantics and Clang divergence need further independent investigation, so it is
 not used as a three-way correctness oracle or a claimed fixed C regression.
 
-## Remaining work
+## Integration and remaining work
 
-Hosted checks for this head, a same-tree local full fast run and matching gated
-snapshot remain necessary. Hardware-vendor expert approval, general freedom
-from defects, and global optimality have not been established. The broader
-backlog, segment and provenance audit, dynamic memory/concurrency interop on
-physical AArch64/RV64, and the large AVX roundtrip performance gap remain open.
+The previously tested code tree `4526de986e058df34ef2ebe1bc763109d2f65171`
+passed all executed hosted checks at commit `c566734`; three optional jobs were
+skipped. Its commit messages were subsequently rewritten without changing that
+code tree, so the rewritten head requires its own hosted CI result. In line
+with the current request, no new local CI run is required or authorized; the
+interrupted local runs are not counted as passes. The snapshot publisher's
+local-gate policy means the saved patch is explicitly **UNGATED**, not a
+same-tree locally gated delivery.
+
+PR #1145 independently addresses the measured AVX-512 mask-compare HOME
+roundtrip and also modifies `vector_temp_promotion.rs` and the CI workflow.
+A `git merge-tree` check of its head `8430e1a4` with the rewritten head
+`039abb4d` was conflict-free. This checks text integration only: the combined
+code and performance still need CI and independent verification after either
+PR lands. PR #1146 covers peephole allocations and #1141 covers a separate SIMD
+audit; neither shares a changed file with this patch at the inspected heads.
+
+Hardware-vendor expert approval, general freedom from defects, and global
+optimality have not been established. The broader backlog, segment and
+provenance audit, dynamic memory/concurrency interop on physical AArch64/RV64,
+and workload-specific performance gap remain open.
