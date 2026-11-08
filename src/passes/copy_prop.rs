@@ -342,27 +342,24 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
                         continue;
                     }
 
-                    // No source write, call, or opaque operation may occur
-                    // between the copy and any forwarded load on this path.
-                    for &(_, load_idx, _, _) in &loads {
-                        for inst in &func.blocks[block_idx].instructions[copy_idx + 1..load_idx] {
-                            if inst.may_write_memory()
+                    // All accepted loads are in this block, strictly after
+                    // the copy, and were collected in instruction order. The
+                    // union of their copy-to-load intervals is therefore the
+                    // interval ending just before the last load. Scan it once
+                    // rather than rescanning the prefix for every load.
+                    let last_load_idx = loads.last().unwrap().1;
+                    if func.blocks[block_idx].instructions[copy_idx + 1..last_load_idx]
+                        .iter()
+                        .any(|inst| {
+                            inst.may_write_memory()
                                 || matches!(
                                     inst,
                                     Instruction::Fence { .. }
                                         | Instruction::AtomicLoad { .. }
                                         | Instruction::Load { volatile: true, .. }
                                 )
-                            {
-                                safe = false;
-                                break;
-                            }
-                        }
-                        if !safe {
-                            break;
-                        }
-                    }
-                    if !safe {
+                        })
+                    {
                         continue;
                     }
 
@@ -2822,6 +2819,83 @@ mod snapshot_forwarding_contract {
         for (i, m) in cases.iter_mut().enumerate() {
             assert_eq!(forward_large_memcpy_loads(m), 0, "case {i}");
             assert_eq!(copies(m).len(), 1, "case {i}");
+        }
+    }
+
+    #[test]
+    fn large_snapshot_multiple_loads_respect_barrier_interval() {
+        // Inserting a write before the copy or after all loads is harmless;
+        // placing it before either load must prevent forwarding the snapshot.
+        // The early load in the between-loads case makes an accidental scan
+        // ending at the first load observable.
+        use crate::ir::reexports::AtomicOrdering;
+        let barriers = [
+            store(0),
+            Instruction::Call {
+                func: "opaque".into(),
+                info: CallInfo::default(),
+            },
+            Instruction::Fence {
+                ordering: AtomicOrdering::SeqCst,
+            },
+            Instruction::AtomicLoad {
+                dest: Value(5),
+                ptr: Operand::Value(Value(0)),
+                ty: IrType::I32,
+                ordering: AtomicOrdering::Acquire,
+            },
+            Instruction::Load {
+                dest: Value(5),
+                ptr: Value(0),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+                volatile: true,
+            },
+        ];
+        for barrier in barriers {
+            for (position, expected) in [(2, 1), (3, 0), (4, 0), (5, 1)] {
+                let mut m = large_load_module(vec![], 1, false);
+                let instructions = &mut m.functions[0].blocks[0].instructions;
+                instructions.insert(
+                    3,
+                    Instruction::Load {
+                        dest: Value(4),
+                        ptr: Value(1),
+                        ty: IrType::I32,
+                        seg_override: AddressSpace::Default,
+                        volatile: false,
+                    },
+                );
+                instructions.insert(position, barrier.clone());
+                assert_eq!(
+                    forward_large_memcpy_loads(&mut m),
+                    expected,
+                    "position {position}, {barrier:?}"
+                );
+                assert_eq!(
+                    copies(&m).len(),
+                    usize::from(expected == 0),
+                    "position {position}"
+                );
+                let load_ptrs: Vec<_> = m.functions[0].blocks[0]
+                    .instructions
+                    .iter()
+                    .filter_map(|inst| match inst {
+                        Instruction::Load {
+                            dest: Value(3 | 4),
+                            ptr,
+                            ..
+                        } => Some(*ptr),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(load_ptrs.len(), 2);
+                assert!(
+                    load_ptrs
+                        .iter()
+                        .all(|ptr| (*ptr != Value(1)) == (expected == 1))
+                );
+            }
         }
     }
 
