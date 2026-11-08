@@ -71,16 +71,16 @@ pub use object_writer::{ElfConfig, ObjReloc, ObjSection, write_relocatable_objec
 // DWARF debug information
 pub(crate) use dwarf::{
     DWARF_DEFAULT_VERSION, DWARF_MAX_VERSION, DWARF_MIN_VERSION, DwarfConfig, DwarfFunction,
-    DwarfInfoBuild, DwarfLineBuild, DwarfLineLocation, DwarfLocOptions, DwarfSectionInfo,
-    DwarfStrings, build_dwarf_info_sections, build_dwarf_line_section, parse_file_directive,
-    parse_loc_directive, place_line_build, unit_version,
+    DwarfInfoBuild, DwarfInlineMarker, DwarfLineBuild, DwarfLineLocation, DwarfLocOptions,
+    DwarfSectionInfo, DwarfStrings, build_dwarf_info_sections, build_dwarf_line_section,
+    parse_file_directive, parse_loc_directive, place_line_build, unit_version,
 };
 
 // The model a compiler hands the writer: types and file-scope objects.
 #[expect(unused_imports)]
 pub(crate) use dwarf_spec::{
-    DwarfDebug, DwarfFunctionParameters, DwarfHome, DwarfLexicalScope, DwarfLocalVariable,
-    DwarfParameter, DwarfType, DwarfUnitSpec, DwarfVariable, TypeGraph,
+    DwarfDebug, DwarfFunctionParameters, DwarfHome, DwarfInlineInstance, DwarfLexicalScope,
+    DwarfLocalVariable, DwarfParameter, DwarfType, DwarfUnitSpec, DwarfVariable, TypeGraph,
 };
 
 // numeric_labels

@@ -376,7 +376,7 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 529.61,
+      "predicted_gate_seconds": 534.73,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
@@ -789,6 +789,30 @@
           "name": "python3 tests/regression/check_dwarf_versions.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv --gcc gcc-16"
         },
         {
+          "measured_s": 0.2,
+          "name": "python3 tests/regression/check_dwarf_inlining.py --lccc target/fastbuild/lccc --self-test"
+        },
+        {
+          "measured_s": 2.0,
+          "name": "python3 tests/regression/check_dwarf_inlining.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv --gdb gdb --gcc gcc-16 --json target/dwarf-inlining.json"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 tests/regression/check_debug_acceptance_parity.py --self-test"
+        },
+        {
+          "measured_s": 1.03,
+          "name": "python3 tests/regression/check_debug_acceptance_parity.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv --gcc gcc-16 --json target/debug-acceptance-parity.json"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 tests/regression/check_asm_dialect_alternatives.py --self-test"
+        },
+        {
+          "measured_s": 1.39,
+          "name": "python3 tests/regression/check_asm_dialect_alternatives.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv --gcc gcc-16 --clang clang-23 --json target/asm-dialect-alternatives.json"
+        },
+        {
           "measured_s": 0.3,
           "name": "bash tests/regression/check_gla_backedge_no_trampoline.sh"
         },
@@ -1157,7 +1181,7 @@
     "frontend-a": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 365.57,
+      "predicted_gate_seconds": 367.57,
       "shards": 3,
       "steps": [
         {
@@ -1271,6 +1295,10 @@
         {
           "measured_s": 0.46,
           "name": "GNU retain section flags and linker garbage collection"
+        },
+        {
+          "measured_s": 2.0,
+          "name": "GNU object-placement declarator scopes"
         },
         {
           "measured_s": 1.0,
@@ -1843,7 +1871,7 @@
     "backend-contracts": {
       "costs": "/tmp/gates.tsv",
       "measured_seconds_total": 1064.77,
-      "source": "measured by scripts/ci_gate_costs.py; rootfs-write-policy gates measured locally (max of 3 runs)"
+      "source": "measured by scripts/ci_gate_costs.py; rootfs-write-policy gates measured locally (max of 3 runs); debug-acceptance-parity and asm-dialect-alternatives (4 commands) measured locally as max of 3 runs, floored at 0.25 s, +2.92 s"
     },
     "codegen": {
       "costs": "/home/user/.cache/tmp/codegen.tsv",
@@ -1852,8 +1880,8 @@
     },
     "frontend": {
       "costs": "/home/user/checkpoints/ci-main-union-costs.tsv",
-      "measured_seconds_total": 1056.94,
-      "source": "Union with main 662b771c0; retain both sides coverage and previously measured diagnostic gate costs. Four 2026-11-04 GCC-16.2 follow-up gates added to frontend-a with locally measured worst-of-3 wall times (scripts/ci_local.sh toolchain, fastbuild binaries): asm-constraints 1.65 s, vectorizer-openmp 0.93 s, gnu-declaration-corners 0.55 s, parser-depth-limits 0.34 s (worst-of-3 remeasured after the 64-spelling red-team differential gate landed)."
+      "measured_seconds_total": 1058.94,
+      "source": "Union with main 662b771c0; retain both sides coverage and previously measured diagnostic gate costs. Four 2026-11-04 GCC-16.2 follow-up gates added to frontend-a with locally measured worst-of-3 wall times (scripts/ci_local.sh toolchain, fastbuild binaries): asm-constraints 1.65 s, vectorizer-openmp 0.93 s, gnu-declaration-corners 0.55 s, parser-depth-limits 0.34 s (worst-of-3 remeasured after the 64-spelling red-team differential gate landed). GNU object-placement declarator scopes added to frontend-a (local worst of three 2.00 s; fastbuild and GCC 16.2)."
     }
   }
 }

@@ -5975,6 +5975,25 @@ impl X86Codegen {
                     }
                     this.state.emit("    movq %rax, %xmm0");
                 };
+                // ISPC GatherCoalescePass analogue: when CSE proves both
+                // gather lanes are the SAME operand (two loads of one
+                // address, or one constant used twice), the pack is a
+                // splat. `punpcklqdq %xmm0, %xmm0` duplicates the low
+                // qword into both lanes, so the second lane never needs
+                // %rax/%xmm1 staging and never re-reads memory. The
+                // comparison is `Operand: PartialEq`: an F64 bit pattern
+                // and an integer zero are NOT equal, so no FP lane is
+                // ever coerced through the integer path (the historical
+                // VecPackF64x2 const-lane miscompile stays fixed).
+                if args[0] == args[1] {
+                    load_lane_to_xmm0(self, &args[0]);
+                    self.state.emit("    punpcklqdq %xmm0, %xmm0");
+                    if let Some(d) = dest {
+                        self.state.vector_values.insert(d.0);
+                        self.sse_store_dest(d, "xmm0");
+                    }
+                    return;
+                }
                 load_lane_to_xmm0(self, &args[0]);
                 // Second lane: stage through %rax/%xmm1 (never clobbers
                 // xmm0). Constant lanes take the bit-pattern path (see
@@ -13156,6 +13175,7 @@ mod vector_address_contract_tests {
             f.blocks.push(BasicBlock {
                 label: BlockId(0),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
                 instructions: vec![Instruction::BinOp {
                     dest: Value(2),
                     op: IrBinOp::Add,
@@ -13552,6 +13572,208 @@ mod intrinsic_destination_contract_tests {
                 "{op:?} both-spelling form regressed: {both}"
             );
         }
+    }
+
+    /// Round 8: the AVX-512 masked-memory folds need an EXACT 64-byte zero
+    /// producer.  `Setzero128/256` write 16/32 bytes, so using either for a
+    /// 512-bit all-off mask would leave stale upper bytes -- a silent
+    /// miscompile.  Pin the new emitter: one EVEX XOR (no memory READ, no
+    /// `kmov`), one full-width ZMM store, and the 256/512 upper-half marker.
+    #[test]
+    fn setzero512_emits_an_exact_64_byte_zero_without_a_memory_read() {
+        let mut cg = X86Codegen::new();
+        slot_homed(&mut cg, 3);
+        // `CodegenState::value_use_counts` is a dense Vec indexed by value id
+        // (the emitter's dead-dest skip reads `.get(id)`), not a map.  Mark
+        // value 3 as live so the dead-dest skip does not elide the emission.
+        cg.state.value_use_counts = vec![0; 4];
+        cg.state.value_use_counts[3] = 1;
+        cg.emit_intrinsic_impl(&None, &IntrinsicOp::Setzero512, &Some(Value(3)), &[]);
+        let out = cg.state.out.buf.clone();
+        assert!(
+            out.contains("vpxorq %zmm0, %zmm0, %zmm0"),
+            "Setzero512 must zero all 64 bytes in ONE EVEX instruction: {out}"
+        );
+        assert!(
+            out.contains("vmovdqu64 %zmm0"),
+            "Setzero512 must store the full ZMM: {out}"
+        );
+        assert!(
+            !out.contains("kmov"),
+            "a zero producer cannot need a k mask: {out}"
+        );
+        assert!(
+            !out.contains("vpxor %xmm0"),
+            "a 128-bit zero producer is NOT a 512-bit zero producer: {out}"
+        );
+        assert!(
+            !out.contains("(%rax), %zmm") && !out.contains("(%rdi), %zmm"),
+            "an all-off masked load must not introduce a memory read: {out}"
+        );
+        assert!(
+            cg.state.dirty_upper_ymm,
+            "a 512-bit op must request the vzeroupper epilogue"
+        );
+    }
+
+    /// Round 8: `Loadu256Raw` is the ONLY 256-bit load the all-on masked fold
+    /// may emit.  It MUST dereference a raw pointer; `Loadu256` would route
+    /// through `avx_load_arg` and treat the address as a vector HOME.  Pin
+    /// the exact two-instruction shape (no `kmov`, no EVEX mask, no
+    /// deferred-store or register-home shortcut).
+    #[test]
+    fn loadu256raw_dereferences_the_pointer_and_never_uses_avx_load_arg() {
+        let mut cg = X86Codegen::new();
+        for id in [0u32, 3] {
+            slot_homed(&mut cg, id);
+        }
+        cg.state.value_use_counts = vec![0; 4];
+        cg.state.value_use_counts[3] = 1;
+        cg.emit_intrinsic_impl(
+            &None,
+            &IntrinsicOp::Loadu256Raw,
+            &Some(Value(3)),
+            &[Operand::Value(Value(0))],
+        );
+        let out = cg.state.out.buf.clone();
+        assert!(
+            out.contains("vmovdqu (%rax), %ymm0"),
+            "Loadu256Raw must DEREFERENCE the raw pointer: {out}"
+        );
+        assert!(!out.contains("kmov"), "no k mask is needed: {out}");
+        assert!(!out.contains("vmovdqu8"), "no EVEX masked load: {out}");
+        assert!(
+            !out.contains("vmovdqa %ymm"),
+            "a register-home shortcut would read the wrong bytes: {out}"
+        );
+        assert!(
+            cg.state.dirty_upper_ymm,
+            "a 256-bit op must request the vzeroupper epilogue"
+        );
+    }
+
+    /// Round 8: identical gather lanes are a splat, not a two-lane gather.
+    /// This is the LCCC-native form of ISPC's `GatherCoalescePass` (all-equal
+    /// offsets): CSE hands `VecPackI64x2(v, v)` / `VecPackF64x2(c, c)` when
+    /// both lanes read the same address or the same constant. Pin the exact
+    /// code, the FP bit-pattern path, AND the negative case (distinct lanes
+    /// must still stage through %xmm1).
+    #[test]
+    fn identical_gather_lanes_splat_without_second_lane_staging() {
+        use crate::ir::constants::IrConst;
+
+        let mut cg = X86Codegen::new();
+        for id in [0u32, 3] {
+            slot_homed(&mut cg, id);
+        }
+        cg.state.value_use_counts = vec![0; 4];
+        cg.state.value_use_counts[3] = 1;
+        let same = Operand::Value(Value(0));
+        cg.emit_intrinsic_impl(
+            &None,
+            &IntrinsicOp::VecPackI64x2,
+            &Some(Value(3)),
+            &[same, same],
+        );
+        let out = cg.state.out.buf.clone();
+        assert!(
+            out.contains("punpcklqdq %xmm0, %xmm0"),
+            "identical integer lanes must be a self-splat: {out}"
+        );
+        assert!(
+            !out.contains("%xmm1"),
+            "the second lane must not be staged at all: {out}"
+        );
+        // Count emitted instruction lines (4-space indent, mnemonic first;
+        // never a label, a directive, or a blank line). Counting ALL
+        // instructions rather than only `movq` also catches the `leaq`
+        // address-of form a vector-homed lane takes through operand_to_reg.
+        let count_pack_ins = |s: &str| {
+            s.lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    l.starts_with("    ")
+                        && t.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+                        && !t.starts_with('.')
+                        && !t.ends_with(':')
+                })
+                .count()
+        };
+        let splat_out = out.clone();
+        let splat_ins = count_pack_ins(&out);
+
+        // FP constants must keep their BIT PATTERN (never the integer-zero
+        // catch-all) on the splat path too.
+        let mut cg = X86Codegen::new();
+        slot_homed(&mut cg, 3);
+        cg.state.value_use_counts = vec![0; 4];
+        cg.state.value_use_counts[3] = 1;
+        let bits = 1.5f64.to_bits();
+        let same = Operand::Const(IrConst::F64(1.5));
+        cg.emit_intrinsic_impl(
+            &None,
+            &IntrinsicOp::VecPackF64x2,
+            &Some(Value(3)),
+            &[same, same],
+        );
+        let out = cg.state.out.buf.clone();
+        assert!(
+            out.contains(&format!("movabsq ${}, %rax", bits)),
+            "an FP constant lane must move through its bits: {out}"
+        );
+        assert!(
+            out.contains("punpcklqdq %xmm0, %xmm0"),
+            "identical FP lanes must be a self-splat: {out}"
+        );
+        assert!(
+            !out.contains("%xmm1"),
+            "the FP second lane must not be staged at all: {out}"
+        );
+
+        // Negative: distinct operands keep the two-lane gather. An F64 and
+        // an integer 0 are NOT PartialEq-equal even when their bits could
+        // be confused by a sloppy numeric comparison.
+        let mut cg = X86Codegen::new();
+        for id in [0u32, 1, 3] {
+            slot_homed(&mut cg, id);
+        }
+        cg.state.value_use_counts = vec![0; 4];
+        cg.state.value_use_counts[3] = 1;
+        cg.emit_intrinsic_impl(
+            &None,
+            &IntrinsicOp::VecPackI64x2,
+            &Some(Value(3)),
+            &[Operand::Value(Value(0)), Operand::Value(Value(1))],
+        );
+        let out = cg.state.out.buf.clone();
+        assert!(
+            out.contains("punpcklqdq %xmm1, %xmm0"),
+            "distinct lanes must keep the two-lane gather: {out}"
+        );
+        // Quantified comparison on equivalent slot-homed inputs: coalescing
+        // removes the second `movq slot,%rax`, `movq %rax,%xmm1` pair
+        // (2 instructions). Both paths still pay the one `movq` for lane 0,
+        // the one `punpcklqdq`, and the destination store.
+        let gather_ins = count_pack_ins(&out);
+        assert_eq!(
+            gather_ins - splat_ins,
+            2,
+            "coalescing must save exactly 2 lane-staging instructions: \
+             splat={splat_ins} gather={gather_ins}\nsplat:\n{splat_out}\ngather:\n{out}"
+        );
+    }
+
+    /// The dead-dest skip in `emit_simd_op` must not ICE on a location-less
+    /// result, and must still be silent (no spurious ZMM store).
+    #[test]
+    fn setzero512_dead_dest_is_skipped_without_emission() {
+        let mut cg = X86Codegen::new();
+        cg.emit_intrinsic_impl(&None, &IntrinsicOp::Setzero512, &Some(Value(3)), &[]);
+        assert!(
+            !cg.state.out.buf.contains("zmm"),
+            "a dead vector result must emit nothing: {}",
+            cg.state.out.buf
+        );
     }
 
     #[test]

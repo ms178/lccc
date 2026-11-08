@@ -435,6 +435,7 @@ mod tests {
             f.blocks = vec![BasicBlock {
                 label: BlockId(0),
                 source_spans: vec![],
+                source_inline_ids: Vec::new(),
                 instructions: vec![
                     Instruction::BinOp {
                         dest: Value(1),
@@ -566,6 +567,7 @@ mod tests {
             instructions,
             terminator,
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         };
         let mut func = IrFunction::new("conditional_recurrence".into(), IrType::U64, vec![], false);
         func.blocks = vec![

@@ -182,6 +182,7 @@ fn crc(duplicate: Option<u32>, cast_form: bool, bounded_last: bool) -> IrFunctio
         instructions: insts,
         terminator: crate::ir::reexports::Terminator::Return(Some(v(6))),
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
     });
     f.next_value_id = 7;
     f.next_label = 1;
@@ -249,6 +250,7 @@ fn signed_narrow_load_cast_is_retyped_only_when_nonvolatile_and_single_use() {
                     instructions,
                     terminator: Terminator::Return(Some(v(2))),
                     source_spans: vec![],
+                    source_inline_ids: Vec::new(),
                 });
                 let changes = canonicalize_narrow_crc_casts(&mut f);
                 let should_fold = !volatile && !extra_use;

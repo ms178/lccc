@@ -276,12 +276,14 @@ pub(crate) fn closed_form_tail_sum(func: &mut IrFunction) -> usize {
             false_label: formula_label,
         },
         source_spans: spans(3),
+        source_inline_ids: Vec::new(),
     };
     let base_block = BasicBlock {
         label: base_label,
         instructions: Vec::new(),
         terminator: Terminator::Return(Some(Operand::Value(acc_param))),
         source_spans: Vec::new(),
+        source_inline_ids: Vec::new(),
     };
     let formula_block = BasicBlock {
         label: formula_label,
@@ -323,6 +325,7 @@ pub(crate) fn closed_form_tail_sum(func: &mut IrFunction) -> usize {
         ],
         terminator: Terminator::Return(Some(Operand::Value(result))),
         source_spans: spans(5),
+        source_inline_ids: Vec::new(),
     };
     func.blocks = vec![entry_block, base_block, formula_block];
     func.next_value_id = next;
@@ -702,12 +705,16 @@ fn calls_to_loops(func: &mut IrFunction, accumulate: bool) -> usize {
     // each "iteration" with updated phi values.
     let entry_block = &mut func.blocks[0];
     let old_spans = std::mem::take(&mut entry_block.source_spans);
+    let old_ids = std::mem::take(&mut entry_block.source_inline_ids);
     let has_spans = !old_spans.is_empty() && old_spans.len() == entry_block.instructions.len();
+    let has_ids = !old_ids.is_empty() && old_ids.len() == entry_block.instructions.len();
 
     let mut keep_in_entry: Vec<Instruction> = Vec::new();
     let mut move_to_header: Vec<Instruction> = Vec::new();
     let mut keep_spans: Vec<crate::common::source::Span> = Vec::new();
     let mut header_spans: Vec<crate::common::source::Span> = Vec::new();
+    let mut keep_ids: Vec<u32> = Vec::new();
+    let mut header_ids: Vec<u32> = Vec::new();
 
     for (i, inst) in entry_block.instructions.drain(..).enumerate() {
         let is_anchor = matches!(
@@ -721,10 +728,16 @@ fn calls_to_loops(func: &mut IrFunction, accumulate: bool) -> usize {
             if has_spans {
                 keep_spans.push(old_spans[i]);
             }
+            if has_ids {
+                keep_ids.push(old_ids[i]);
+            }
         } else {
             move_to_header.push(inst);
             if has_spans {
                 header_spans.push(old_spans[i]);
+            }
+            if has_ids {
+                header_ids.push(old_ids[i]);
             }
         }
     }
@@ -732,6 +745,7 @@ fn calls_to_loops(func: &mut IrFunction, accumulate: bool) -> usize {
     if has_spans {
         entry_block.source_spans = keep_spans;
     }
+    entry_block.source_inline_ids = keep_ids;
 
     // ── 7. Redirect entry block terminator → loop header ───────────────────
     let entry_original_terminator = std::mem::replace(
@@ -748,7 +762,9 @@ fn calls_to_loops(func: &mut IrFunction, accumulate: bool) -> usize {
             // operands into the accumulator.
             block.instructions.truncate(tc.call_inst_idx);
             let spans = !block.source_spans.is_empty();
+            let ids = !block.source_inline_ids.is_empty();
             block.source_spans.truncate(tc.call_inst_idx);
+            block.source_inline_ids.truncate(tc.call_inst_idx);
             let mut acc = phi;
             for &o in &tc.acc_operands {
                 let next = Value(func.next_value_id);
@@ -765,15 +781,17 @@ fn calls_to_loops(func: &mut IrFunction, accumulate: bool) -> usize {
                         .source_spans
                         .push(crate::common::source::Span::dummy());
                 }
+                if ids {
+                    block
+                        .source_inline_ids
+                        .push(crate::ir::instruction::NO_INLINE_INSTANCE);
+                }
                 acc = next;
             }
             acc_incoming.push((Operand::Value(acc), tc.block_label));
         } else {
             // Remove the Call instruction (call result is now dead; DCE will clean up).
-            block.instructions.remove(tc.call_inst_idx);
-            if has_spans && tc.call_inst_idx < block.source_spans.len() {
-                block.source_spans.remove(tc.call_inst_idx);
-            }
+            block.remove_inst(tc.call_inst_idx);
         }
         block.terminator = Terminator::Branch(loop_header_label);
     }
@@ -854,12 +872,23 @@ fn calls_to_loops(func: &mut IrFunction, accumulate: bool) -> usize {
     } else {
         Vec::new()
     };
+    let header_source_ids: Vec<u32> = if has_ids {
+        let phis = phi_vals.len() + usize::from(acc_phi.is_some());
+        let mut ids: Vec<_> = (0..phis)
+            .map(|_| crate::ir::instruction::NO_INLINE_INSTANCE)
+            .collect();
+        ids.extend(header_ids);
+        ids
+    } else {
+        Vec::new()
+    };
 
     func.blocks.push(BasicBlock {
         label: loop_header_label,
         instructions: header_instructions,
         terminator: header_terminator,
         source_spans: header_source_spans,
+        source_inline_ids: header_source_ids,
     });
     // The header label was minted above max-live; keep the counter ahead of
     // it so later passes cannot collide (`.max()` never regresses a healthy
@@ -874,18 +903,16 @@ fn calls_to_loops(func: &mut IrFunction, accumulate: bool) -> usize {
             };
             let total = Value(func.next_value_id);
             func.next_value_id += 1;
-            block.instructions.push(Instruction::BinOp {
-                dest: total,
-                op,
-                lhs: Operand::Value(phi),
-                rhs: x,
-                ty: ret_ty,
-            });
-            if !block.source_spans.is_empty() {
-                block
-                    .source_spans
-                    .push(crate::common::source::Span::dummy());
-            }
+            block.push_inst(
+                Instruction::BinOp {
+                    dest: total,
+                    op,
+                    lhs: Operand::Value(phi),
+                    rhs: x,
+                    ty: ret_ty,
+                },
+                crate::common::source::Span::dummy(),
+            );
             block.terminator = Terminator::Return(Some(Operand::Value(total)));
         }
     }
@@ -952,6 +979,7 @@ mod tests {
             instructions,
             terminator,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -1386,6 +1414,7 @@ mod tests {
                 false_label: BlockId(2),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // B1: base case — return acc
@@ -1394,6 +1423,7 @@ mod tests {
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // B2: recursive case — return sum(n-1, acc+n)
@@ -1449,6 +1479,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(6)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         func.next_value_id = 7;
@@ -1625,6 +1656,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 3;
 
@@ -1706,6 +1738,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
@@ -1748,6 +1781,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 3;
 

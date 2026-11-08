@@ -30,9 +30,38 @@ source "$repo_root/scripts/rust_toolchain.sh"
 lccc_select_rust_toolchain "$repo_root"
 # Compiler builds are deliberately bounded to two jobs on the constrained
 # research host; do not silently inherit an oversubscribing Cargo setting.
-export CARGO_BUILD_JOBS=2
+#
+# The bound is memory, not cores: one rustc process on this crate measures
+# ~3.4 GiB RSS, and the lib and test/bin units are separate processes. On a
+# 3.9 GiB host two of them do not fit in RAM, so the second is swapped out
+# wholesale and the build thrashes (measured: 2.6 GiB of swap in use, a trivial
+# `free` taking 57 s, and no forward progress after 16 minutes). Sizing the job
+# count from MemTotal instead of a constant keeps the 2-job policy on any host
+# that can actually hold two compilers and degrades to 1 where it cannot.
+# Swap is deliberately NOT counted: it prevents an OOM kill, it does not make a
+# second resident compiler fast. LCCC_BUILD_JOBS is the explicit override.
+lccc_build_jobs() {
+    local requested=${LCCC_BUILD_JOBS:-2} mem_kib per_job_kib fits
+    case $requested in
+        ''|*[!0-9]*) requested=2 ;;
+    esac
+    ((requested >= 1)) || requested=1
+    ((requested <= 2)) || requested=2
+    mem_kib=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)
+    case $mem_kib in ''|*[!0-9]*) mem_kib=0 ;; esac
+    # 3.5 GiB per resident rustc, measured on this crate.
+    per_job_kib=$((3500 * 1024))
+    if ((mem_kib > 0)); then
+        fits=$((mem_kib / per_job_kib))
+        ((fits >= 1)) || fits=1
+        ((requested <= fits)) || requested=$fits
+    fi
+    printf '%s' "$requested"
+}
+export CARGO_BUILD_JOBS
+CARGO_BUILD_JOBS=$(lccc_build_jobs)
 printf '%s\n' "Rust toolchain: $LCCC_SELECTED_RUST_TOOLCHAIN ($(rustc --version))"
-printf '%s\n' "Cargo jobs: $CARGO_BUILD_JOBS (fixed research policy)"
+printf '%s\n' "Cargo jobs: $CARGO_BUILD_JOBS (memory-bounded policy; MemTotal $(awk '/^MemTotal:/ {printf "%.1f GiB", $2/1048576}' /proc/meminfo 2>/dev/null || echo unknown))"
 
 # Link with mold when -- and only when -- a driver on this host can actually
 # link through it.  `.cargo/config.toml` deliberately leaves the default at

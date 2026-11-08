@@ -314,8 +314,14 @@ fn reduce_loop(func: &mut IrFunction, lp: &loop_analysis::NaturalLoop, cfg: &Cfg
         let pre = &mut func.blocks[preheader];
         // Parallel spans for every instruction appended below.
         if !pre.source_spans.is_empty() {
-            for _ in 0..(4 + tail_invs.len()) {
+            for _ in 0..(5 + tail_invs.len()) {
                 pre.source_spans.push(crate::common::source::Span::dummy());
+            }
+        }
+        if !pre.source_inline_ids.is_empty() {
+            for _ in 0..(5 + tail_invs.len()) {
+                pre.source_inline_ids
+                    .push(crate::ir::instruction::NO_INLINE_INSTANCE);
             }
         }
         // a0 = inv_val (a = j + inv_val, j=0). If a had the invariant on the
@@ -385,6 +391,16 @@ fn reduce_loop(func: &mut IrFunction, lp: &loop_analysis::NaturalLoop, cfg: &Cfg
             .source_spans
             .insert(insert_pos.min(header_block.source_spans.len()), dummy);
     }
+    if !header_block.source_inline_ids.is_empty() {
+        header_block.source_inline_ids.insert(
+            insert_pos.min(header_block.source_inline_ids.len()),
+            crate::ir::instruction::NO_INLINE_INSTANCE,
+        );
+        header_block.source_inline_ids.insert(
+            insert_pos.min(header_block.source_inline_ids.len()),
+            crate::ir::instruction::NO_INLINE_INSTANCE,
+        );
+    }
     header_block.instructions.insert(
         insert_pos,
         Instruction::Phi {
@@ -418,6 +434,14 @@ fn reduce_loop(func: &mut IrFunction, lp: &loop_analysis::NaturalLoop, cfg: &Cfg
             latch_block
                 .source_spans
                 .push(crate::common::source::Span::dummy());
+        }
+        if !latch_block.source_inline_ids.is_empty() {
+            latch_block
+                .source_inline_ids
+                .push(crate::ir::instruction::NO_INLINE_INSTANCE);
+            latch_block
+                .source_inline_ids
+                .push(crate::ir::instruction::NO_INLINE_INSTANCE);
         }
         latch_block.instructions.push(Instruction::BinOp {
             dest: idx_next,

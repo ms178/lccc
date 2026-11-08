@@ -121,6 +121,7 @@ impl Graph {
             label: BlockId(0),
             instructions: self.insts,
             source_spans,
+            source_inline_ids: Vec::new(),
             terminator: Terminator::Return(Some(result)),
         });
         f.next_value_id = self.next;
@@ -600,6 +601,7 @@ fn review_cross_block_mask_pair_survives_expanding_consumer_block() {
         label: BlockId(1),
         instructions,
         source_spans,
+        source_inline_ids: Vec::new(),
         terminator,
     });
     let original = f.clone();

@@ -431,6 +431,7 @@ fn terminal_rewrite_keeps_edges_and_refuses_joins_or_identical_successors() {
         label: BlockId(n),
         instructions,
         source_spans: vec![],
+        source_inline_ids: Vec::new(),
         terminator,
     };
     for mode in 0..3 {

@@ -172,8 +172,11 @@ pub fn run(module: &mut IrModule) -> usize {
             }
             for block in &mut func.blocks {
                 let has_spans = !block.source_spans.is_empty();
+                let old_ids = std::mem::take(&mut block.source_inline_ids);
+                let has_ids = !old_ids.is_empty();
                 let mut new_insts = Vec::with_capacity(block.instructions.len());
                 let mut new_spans = Vec::with_capacity(16);
+                let mut new_ids = Vec::with_capacity(16);
                 for (idx, inst) in block.instructions.drain(..).enumerate() {
                     let is_dead = match &inst {
                         Instruction::Call { func, .. } => dead_calls.contains(func.as_str()),
@@ -184,6 +187,9 @@ pub fn run(module: &mut IrModule) -> usize {
                         if has_spans && idx < block.source_spans.len() {
                             new_spans.push(block.source_spans[idx]);
                         }
+                        if has_ids && idx < old_ids.len() {
+                            new_ids.push(old_ids[idx]);
+                        }
                     } else {
                         total_changes += 1;
                     }
@@ -192,6 +198,7 @@ pub fn run(module: &mut IrModule) -> usize {
                 if has_spans {
                     block.source_spans = new_spans;
                 }
+                block.source_inline_ids = new_ids;
             }
         }
     }
@@ -985,6 +992,7 @@ mod switch_eval_tests {
             |label: u32, instructions: Vec<Instruction>, terminator: Terminator| BasicBlock {
                 label: BlockId(label),
                 source_spans: vec![crate::common::source::Span::dummy(); instructions.len()],
+                source_inline_ids: Vec::new(),
                 instructions,
                 terminator,
             };
@@ -1145,6 +1153,7 @@ mod caller_exposure_tests {
             }],
             terminator: Terminator::Return(Some(Operand::Value(Value(0)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         let mut caller = IrFunction::new("caller".into(), IrType::Void, vec![], false);
         caller.next_label = 1;
@@ -1160,6 +1169,7 @@ mod caller_exposure_tests {
             }],
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         let mut module = IrModule::new();
         module.functions = vec![target, caller];

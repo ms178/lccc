@@ -106,12 +106,14 @@ pub(crate) fn insert_instruction(block: &mut BasicBlock, idx: usize, inst: Instr
     let n_inst = block.instructions.len();
     let n_span = block.source_spans.len();
     let idx = idx.min(n_inst);
-    block.instructions.insert(idx, inst);
-    if n_span == n_inst && n_span > 0 {
-        let span_idx = idx.min(n_span - 1);
-        let span = block.source_spans[span_idx].clone();
-        block.source_spans.insert(idx.min(n_span), span);
-    }
+    let span = if n_span == n_inst && n_span > 0 {
+        block.source_spans[idx.min(n_span - 1)].clone()
+    } else {
+        crate::common::source::Span::dummy()
+    };
+    // One insertion keeps instructions, spans and inline provenance in
+    // lockstep; a bare span insert left the id array one row short.
+    block.insert_inst(idx, inst, span);
 }
 
 pub(crate) fn first_non_alloca(block: &BasicBlock) -> usize {
@@ -1114,6 +1116,7 @@ mod tests {
             instructions,
             terminator,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -1298,6 +1301,41 @@ mod tests {
         assert!(b.source_spans.is_empty());
     }
 
+    #[test]
+    fn insert_instruction_preserves_dense_inline_ids() {
+        let mut b = block(
+            0,
+            vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I32(1)),
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I32(2)),
+                },
+            ],
+            Terminator::Return(None),
+        );
+        b.source_spans = vec![
+            crate::common::source::Span::new(1, 2, 0),
+            crate::common::source::Span::new(3, 4, 0),
+        ];
+        b.source_inline_ids = vec![11, 22];
+        insert_instruction(
+            &mut b,
+            1,
+            Instruction::Copy {
+                dest: Value(2),
+                src: Operand::Const(IrConst::I32(3)),
+            },
+        );
+        assert_eq!(b.instructions.len(), 3);
+        assert_eq!(b.source_spans.len(), 3);
+        assert_eq!(b.source_inline_ids, vec![11, 22, 22]);
+        assert_eq!(b.source_spans[1], b.source_spans[2]);
+    }
+
     fn plain_call(dest: Option<Value>) -> Instruction {
         Instruction::Call {
             func: "clobber".to_string(),
@@ -1455,6 +1493,7 @@ mod edge_layout_tests {
             instructions,
             terminator,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -1989,13 +2028,22 @@ fn apply_block_splits(
     // Rename map per ORIGINAL instruction index: an instruction at original
     // index `i` reads the reloaded name of every split whose reload sits at
     // or before `i`.
-    let old_spans = func.blocks[bi].take_parallel_spans();
+    let (old_spans, old_ids) = func.blocks[bi].take_parallel_debug();
     let tracked = !old_spans.is_empty();
+    let inline_at = |i: usize| {
+        old_ids
+            .get(i)
+            .copied()
+            .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE)
+    };
     let old = std::mem::take(&mut func.blocks[bi].instructions);
     let mut out: Vec<Instruction> = Vec::with_capacity(old.len() + 2 * mats.len());
     // Spill stores and reloads are synthesized (dummy span); every original
-    // instruction keeps its own.  `out_spans` is pushed in lockstep below.
+    // instruction keeps its own.  `out_spans`/`out_ids` are pushed in lockstep
+    // below; a spill/reload implements the source construct it surrounds, so it
+    // inherits that instruction's inline instance rather than escaping it.
     let mut out_spans = Vec::with_capacity(if tracked { out.capacity() } else { 0 });
+    let mut out_ids = Vec::with_capacity(if tracked { out.capacity() } else { 0 });
     let dummy = crate::common::source::Span::dummy();
     let mut active: FxHashMap<u32, u32> = FxHashMap::default();
 
@@ -2030,6 +2078,8 @@ fn apply_block_splits(
         if tracked {
             out_spans.resize(out.len() - 1, dummy);
             out_spans.push(old_spans[i]);
+            out_ids.resize(out.len() - 1, inline_at(i));
+            out_ids.push(inline_at(i));
         }
     }
     // Trailing stores/reloads that belong just before the terminator.
@@ -2054,8 +2104,9 @@ fn apply_block_splits(
     }
     if tracked {
         out_spans.resize(out.len(), dummy);
+        out_ids.resize(out.len(), inline_at(n.saturating_sub(1)));
     }
-    func.blocks[bi].replace_insts(out, out_spans);
+    func.blocks[bi].replace_insts_inline(out, out_spans, out_ids);
     if !active.is_empty() {
         replace_values_in_terminator_phi_aware(&mut func.blocks[bi].terminator, &active);
     }
@@ -2196,6 +2247,7 @@ mod pressure_split_tests {
             instructions,
             terminator: term,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
     fn add(dest: u32, a: u32, b: u32) -> Instruction {

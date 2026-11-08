@@ -3887,18 +3887,7 @@ pub(crate) fn recognize_function(
         if block.instructions.get(ii).and_then(Instruction::dest) != Some(dest) {
             continue;
         }
-        if !block.source_spans.is_empty() {
-            let span = block
-                .source_spans
-                .get(ii)
-                .copied()
-                .unwrap_or_else(crate::common::source::Span::dummy);
-            block.source_spans.resize(block.instructions.len(), span);
-            block
-                .source_spans
-                .splice(ii..=ii, std::iter::repeat_n(span, replacement.len()));
-        }
-        block.instructions.splice(ii..=ii, replacement);
+        block.splice_inst(ii, replacement);
     }
     // The demand-driven consumer sweep runs after all coordinate-based
     // producer edits/expansions. Reuse the existing allocations, but rebuild
@@ -4076,6 +4065,7 @@ mod tests {
             label: BlockId(0),
             instructions: insts,
             source_spans: spans,
+            source_inline_ids: Vec::new(),
             terminator: Terminator::Return(Some(outputs[1])),
         });
         assert_eq!(
@@ -6209,6 +6199,7 @@ mod tests {
                 instructions: insts,
                 terminator: Terminator::Return(None),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             };
             let fused = detect_and_not_fusions(&block, &fx.use_counts);
             let backend = fused.contains(&and_idx);
@@ -6302,6 +6293,7 @@ mod tests {
             instructions: insts,
             terminator: term,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 

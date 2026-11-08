@@ -253,6 +253,16 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
         if func.is_declaration {
             continue;
         }
+        // Avoid allocating whole-function proof sets when this transform has
+        // no large-copy candidate.
+        if !func.blocks.iter().any(|block| {
+            block
+                .instructions
+                .iter()
+                .any(|inst| matches!(inst, Instruction::Memcpy { size, .. } if *size >= 128))
+        }) {
+            continue;
+        }
         // The rewrite only adds fresh GEP definitions and removes memcpys, so
         // these whole-function facts remain valid across its restart loop.
         let allocas = unique_nonvolatile_allocas(func);
@@ -301,6 +311,7 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
                                     ptr,
                                     ty,
                                     volatile: false,
+                                    seg_override: crate::common::types::AddressSpace::Default,
                                     ..
                                 } if dest_derived.contains(&ptr.0)
                                     && bi == block_idx
@@ -1529,6 +1540,7 @@ mod tests {
             }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // 1: header: reads d, branches to the two arms
         func.blocks.push(BasicBlock {
@@ -1540,6 +1552,7 @@ mod tests {
                 false_label: BlockId(3),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // 2 / 3: arms, each writing the join home `s` (12) and branching to the merge
         func.blocks.push(BasicBlock {
@@ -1553,6 +1566,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(4)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(3),
@@ -1565,6 +1579,7 @@ mod tests {
             ],
             terminator: Terminator::Branch(BlockId(4)),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // 4: merge: d <- s (the hop), then the loop test
         func.blocks.push(BasicBlock {
@@ -1588,12 +1603,14 @@ mod tests {
                 false_label: BlockId(5),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(5),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Value(Value(10)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let folded = coalesce_forwarding_phi_copies(&mut func);
@@ -1653,6 +1670,7 @@ mod tests {
             instructions: inst,
             terminator: term,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         };
         // 0: entry, d(10) <- 0 ; -> 1 or -> 5
         func.blocks.push(blk(
@@ -1746,6 +1764,7 @@ mod tests {
                 instructions: insts,
                 terminator: term,
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             });
         };
         blk(
@@ -1830,12 +1849,14 @@ mod tests {
                 false_label: BlockId(1),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
             instructions: vec![],
             terminator: Terminator::Return(Some(Operand::Value(Value(N)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let removed = propagate_copies_post_phi(&mut func);
@@ -1919,6 +1940,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let replacements = propagate_copies(&mut func);
@@ -1964,6 +1986,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let replacements = propagate_copies(&mut func);
@@ -2004,6 +2027,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let replacements = propagate_copies(&mut func);
@@ -2033,6 +2057,7 @@ mod tests {
             }],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let replacements = propagate_copies(&mut func);
@@ -2060,6 +2085,7 @@ mod tests {
             }],
             terminator: Terminator::Return(Some(Operand::Value(Value(0)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let replacements = propagate_copies(&mut func);
@@ -2105,6 +2131,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(val(7))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 8;
         func
@@ -2192,6 +2219,9 @@ mod tests {
             instructions: insts,
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            // Untracked fixture: no inline provenance (sparse-empty is the
+            // canonical spelling, not an all-NO_INLINE_INSTANCE array).
+            source_inline_ids: Vec::new(),
         });
         func
     }
@@ -2614,6 +2644,7 @@ mod snapshot_forwarding_contract {
             instructions,
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: vec![],
         });
         let mut m = IrModule::new();
         m.functions.push(f);
@@ -2672,6 +2703,7 @@ mod snapshot_forwarding_contract {
             instructions,
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: vec![],
+            source_inline_ids: vec![],
         });
         let mut m = IrModule::new();
         m.functions.push(f);
@@ -2688,8 +2720,16 @@ mod snapshot_forwarding_contract {
             ty: IrType::U8,
         };
         let mut safe = large_load_module(vec![gep(124)], 4, false);
+        let block = &mut safe.functions[0].blocks[0];
+        block.source_spans = (0..block.instructions.len())
+            .map(|i| crate::common::source::Span::new(i as u32 + 1, i as u32 + 2, 1))
+            .collect();
+        let original_load_span = block.source_spans.last().copied();
         assert_eq!(forward_large_memcpy_loads(&mut safe), 1);
         assert!(copies(&safe).is_empty());
+        let block = &safe.functions[0].blocks[0];
+        assert_eq!(block.instructions.len(), block.source_spans.len());
+        assert_eq!(block.source_spans.last().copied(), original_load_span);
         let mut cases = vec![
             large_load_module(
                 vec![Instruction::AtomicStore {
@@ -2721,8 +2761,40 @@ mod snapshot_forwarding_contract {
                 1,
                 false,
             ),
+            large_load_module(
+                vec![Instruction::Load {
+                    dest: Value(5),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: true,
+                }],
+                1,
+                false,
+            ),
+            large_load_module(
+                vec![Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Value(Value(9)),
+                }],
+                1,
+                false,
+            ),
             large_load_module(vec![gep(-1)], 4, false),
             large_load_module(vec![gep(125)], 4, false),
+            large_load_module(
+                vec![
+                    gep(i64::MAX),
+                    Instruction::GetElementPtr {
+                        dest: Value(5),
+                        base: Value(4),
+                        offset: Operand::Const(IrConst::I64(1)),
+                        ty: IrType::U8,
+                    },
+                ],
+                5,
+                false,
+            ),
             large_load_module(
                 vec![
                     gep(0),
@@ -2750,6 +2822,20 @@ mod snapshot_forwarding_contract {
         for (i, m) in cases.iter_mut().enumerate() {
             assert_eq!(forward_large_memcpy_loads(m), 0, "case {i}");
             assert_eq!(copies(m).len(), 1, "case {i}");
+        }
+    }
+
+    #[test]
+    fn large_snapshot_does_not_forward_segment_relative_loads() {
+        for space in [AddressSpace::SegFs, AddressSpace::SegGs] {
+            let mut m = large_load_module(vec![], 1, false);
+            if let Some(Instruction::Load { seg_override, .. }) =
+                m.functions[0].blocks[0].instructions.last_mut()
+            {
+                *seg_override = space;
+            }
+            assert_eq!(forward_large_memcpy_loads(&mut m), 0, "{space:?}");
+            assert_eq!(copies(&m).len(), 1, "{space:?}");
         }
     }
 

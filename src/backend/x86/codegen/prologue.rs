@@ -5141,6 +5141,7 @@ mod signed_home_demand_tests {
         f.blocks.push(BasicBlock {
             label: BlockId(0),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
             instructions: vec![
                 Instruction::BinOp {
                     dest: Value(0),
@@ -5328,6 +5329,7 @@ mod incoming_byval_tests {
         f.blocks.push(BasicBlock {
             label: BlockId(0),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
             instructions: vec![
                 Instruction::Alloca {
                     dest: Value(1),
@@ -5719,6 +5721,7 @@ mod narrow_call_arg_sign_cast_tests {
         f.blocks.push(BasicBlock {
             label: BlockId(0),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
             instructions,
             terminator: term,
         });

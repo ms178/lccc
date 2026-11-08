@@ -1717,6 +1717,23 @@ pub enum IntrinsicOp {
     CmpEpu16Mask512,
     Loadu512,
     Storeu512,
+    /// Unaligned 256-bit load from a RAW BYTE POINTER (`args[0]`), writing
+    /// exactly 32 bytes to `dest_ptr`.  Unlike `Loadu256` (which routes
+    /// through `avx_load_arg`'s vector-HOME heuristics: deferred stores,
+    /// register homes, direct slots, `value_ptr_mem_operand`), this form MUST
+    /// dereference the pointer.  The AVX-512 all-on masked-load fold needs it:
+    /// `MaskzLoaduEpi8_256`'s `args[1]` is an address, not a vector value,
+    /// so substituting `Loadu256` there would read the pointer VARIABLE's
+    /// 8-byte home as 32 bytes of vector data.  AVX (`vmovdqu`) suffices; no
+    /// EVEX mask, no `kmov`.
+    Loadu256Raw,
+    /// Exact 64-byte all-zero vector, in BOTH the write-through (`dest_ptr`)
+    /// and SSA (`dest`) spellings.  The AVX-512 masked-memory folds need a
+    /// full-width zero producer: `Setzero128/256` write only 16/32 bytes, so
+    /// using either for a 512-bit all-off mask would leave 48/32 bytes of
+    /// stale destination data -- a silent miscompile.  Emitted as
+    /// `vpxorq %zmm0,%zmm0,%zmm0` (AVX-512F, no memory read, no fault).
+    Setzero512,
     MaskzLoaduEpi8_128,
     MaskzLoaduEpi8_256,
     MaskzLoaduEpi8_512,
@@ -2141,7 +2158,12 @@ impl IntrinsicOp {
         use IntrinsicOp::*;
         match self {
             // ---- 256-bit AVX/AVX2 results ----
-            Loadu256 | Load256
+            // `Loadu256Raw` is the raw-pointer twin of `Loadu256`: its
+            // argument is an ADDRESS (not a vector home), but its RESULT is
+            // still exactly 32 vector bytes, so stack layout must protect
+            // the destination slot exactly like `Loadu256`. Without this,
+            // a 32-byte `vmovdqu` store could target an 8-byte slot.
+            Loadu256Raw | Loadu256 | Load256
             | Paddb256 | Paddw256 | Paddd256 | Psubb256 | Psubw256 | Psubusw256
             | Psadbw256 | Pmaddubsw256 | Pmaddwd256 | Pcmpeqb256 | Pcmpgtb256
             | Pshufb256 | Pabsb256 | Pabsw256 | Pmaxub256
@@ -2385,6 +2407,10 @@ impl IntrinsicOp {
             IntrinsicOp::F128Fabs | IntrinsicOp::F128Neg | IntrinsicOp::F128Copysign |
             IntrinsicOp::F16ToF32 | IntrinsicOp::F32ToF16 |
             IntrinsicOp::UsubSat32 |
+            // `Setzero512` is one EVEX `vpxorq`: no memory operand, no
+            // input dependence. Classifying it pure lets IR DCE remove a
+            // dead all-off masked-load replacement instead of rooting it.
+            IntrinsicOp::Setzero512 |
             IntrinsicOp::Pdep32 | IntrinsicOp::Pdep64 |
             IntrinsicOp::Pext32 | IntrinsicOp::Pext64 |
             IntrinsicOp::VecWidenAddI32x4ToI64x4
@@ -2596,6 +2622,7 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecLoadI16x8
                 | IntrinsicOp::VecLoadI8x16
                 | IntrinsicOp::VecLoadI16x16
+                | IntrinsicOp::Loadu256Raw
                 | IntrinsicOp::Loadu256
                 | IntrinsicOp::Load256
                 | IntrinsicOp::LoaduPs256
@@ -3686,6 +3713,7 @@ mod memory_classification_tests {
             O::VecLoadI16x16,
             O::VecLoadI32x4Pair,
             O::VecLoadWidenI32ToI64x2,
+            O::Loadu256Raw,
             O::Loadu256,
             O::Load256,
             O::LoadF64x4,
@@ -3703,6 +3731,45 @@ mod memory_classification_tests {
                 "{op:?} is a load, not a memory writer"
             );
         }
+    }
+
+    /// Round 8 metadata contract for the two new masked-fold producers.
+    ///
+    /// `Loadu256Raw` emits `vmovdqu (%rax), %ymm0` + a 32-byte destination
+    /// store, so it MUST be classified as a memory reader (otherwise BB-SLP
+    /// store-interval legality may sink it below a store to the same
+    /// address) and MUST have a 32-byte result home (otherwise stack layout
+    /// can hand it an 8-byte slot that the store overflows). Its argument
+    /// is a raw ADDRESS, not a vector home -- that distinction lives in the
+    /// x86 emitter, which deliberately never calls `avx_load_arg`.
+    ///
+    /// `Setzero512` is one `vpxorq %zmm0,%zmm0,%zmm0`: a pure zero producer
+    /// with NO memory operand, so an all-off mask fold can never introduce
+    /// a fault. It has no vector home width because NO 512-bit explicit-SIMD
+    /// intrinsic has one (the existing convention shared with
+    /// `Loadu512`/`MaskzLoaduEpi8_512`). The mask-facts fold rewrites the
+    /// original instruction IN PLACE and therefore inherits whatever
+    /// destination protection the original masked load already had; this
+    /// is not a new weakness introduced by the fold.
+    #[test]
+    fn round8_fold_producers_have_exact_effect_and_width_metadata() {
+        let raw = O::Loadu256Raw;
+        assert_eq!(raw.vector_home_width(), Some(32), "32-byte result home");
+        assert_eq!(raw.vector_result_width(), Some(32), "32-byte result");
+        assert!(raw.may_read_memory(), "vmovdqu is a memory read");
+        assert!(raw.reads_pointer_arg(), "raw pointer is read-only");
+        assert!(!raw.writes_memory_via_args(), "writes only via dest_ptr");
+        assert!(!raw.is_pure(), "a load is not a pure function");
+
+        let zero = O::Setzero512;
+        assert!(zero.is_pure(), "a constant zero producer is DCE-eligible");
+        assert!(!zero.may_read_memory(), "vpxorq has no memory operand");
+        assert!(!zero.writes_memory_via_args(), "writes only via dest_ptr");
+        assert!(!zero.reads_pointer_arg(), "Setzero512 has no args at all");
+        // Pin the pre-existing 512-bit convention explicitly: no 512-bit
+        // explicit-SIMD op claims a vector home width today.
+        assert_eq!(O::Loadu512.vector_home_width(), None);
+        assert_eq!(zero.vector_home_width(), None);
     }
 
     #[test]

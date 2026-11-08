@@ -4984,7 +4984,16 @@ impl RvCfg {
                 starts.push(k);
             }
             if k + 1 < end && transfers(k) {
-                starts.push(k + 1);
+                // See the AArch64 builder: a leader must name a live row, or a
+                // hidden `-g` endpoint immediately after a transfer opens a
+                // spurious empty block and makes `-g` change the code.
+                if let Some(lead) =
+                    crate::backend::peephole_common::first_live_row(k + 1, end, |i| {
+                        kinds[i] == LineKind::Nop
+                    })
+                {
+                    starts.push(lead);
+                }
             }
         }
         starts.sort_unstable();
@@ -7690,6 +7699,79 @@ fn extract_s0_offset_from_line(line: &str) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The leader rule, observed where the defect actually lives.
+    ///
+    /// The end-to-end test below cannot pin this: an extra leader names a
+    /// deleted row, so the phantom block is EMPTY, and a backward liveness
+    /// fixpoint is compositional along a straight line -- splitting a block in
+    /// two does not change its answer. That test was measured to pass with the
+    /// fix reverted, i.e. it was vacuous. The block COUNT is the observable
+    /// that does move, and it is what broke the join meet on i686.
+    #[test]
+    fn hidden_debug_rows_do_not_add_blocks() {
+        fn blocks(text: &str) -> usize {
+            let lines: Vec<String> = text.lines().map(str::to_string).collect();
+            let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+            crate::backend::peephole_common::hide_debug_rows(&lines, &mut kinds, LineKind::Nop);
+            RvCfg::build(&lines, &kinds, 0, lines.len())
+                .map(|c| c.starts.len())
+                .unwrap_or(0)
+        }
+        let plain = "f:\n\tbeqz a0, .L2\n\tj .L3\n.L2:\n\tli t0, 1\n.L3:\n\tret\n";
+        // An endpoint immediately after each transfer -- the shape that used to
+        // become a leader -- plus `.loc` rows in the same positions.
+        let debug = "f:\n\tbeqz a0, .L2\n.Llccc_inline_e_0_0_f:\n\tj .L3\n.Llccc_inline_e_0_1_f:\n.loc 1 3 0\n.L2:\n\tli t0, 1\n.Llccc_inline_e_0_2_f:\n.L3:\n.loc 1 4 0\n\tret\n";
+        let n = blocks(plain);
+        assert!(
+            n >= 3,
+            "fixture has no real control flow; test is vacuous: {n}"
+        );
+        assert_eq!(
+            n,
+            blocks(debug),
+            "hidden -g rows created phantom basic blocks"
+        );
+    }
+
+    /// End-to-end smoke test: `-g` must not change the emitted code. This is a
+    /// real property but it is NOT sensitive to the leader rule (see
+    /// `hidden_debug_rows_do_not_add_blocks` for why, and for the test that
+    /// is); it guards the pipeline as a whole.
+    #[test]
+    fn hidden_debug_rows_do_not_change_the_code() {
+        let plain = "f:\n\tsd ra, 16(s0)\n\tld t1, 16(s0)\n\tbeqz a0, .L2\n\tj .L3\n.L2:\n\tli t0, 1\n.L3:\n\tld t2, 16(s0)\n\tret\n";
+        let debug = "f:\n.Llccc_inline_b_0_0_f:\n.loc 1 1 0\n\tsd ra, 16(s0)\n.loc 1 2 0\n\tld t1, 16(s0)\n\tbeqz a0, .L2\n.Llccc_inline_e_0_0_f:\n\tj .L3\n.Llccc_inline_e_0_1_f:\n.loc 1 3 0\n.L2:\n.Llccc_inline_b_0_2_f:\n\tli t0, 1\n.Llccc_inline_e_0_2_f:\n.L3:\n.Llccc_inline_b_0_3_f:\n.loc 1 4 0\n\tld t2, 16(s0)\n.Llccc_inline_e_0_3_f:\n\tret\n";
+        // Debug rows MUST survive into the assembly -- they are the line
+        // table and the inline ranges -- so the two texts can never be equal
+        // byte for byte. The property is that the CODE is equal once those
+        // rows are removed, which is exactly what the shipped gate compares.
+        fn code_rows(asm: &str) -> String {
+            asm.lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with(".loc")
+                        || t.starts_with(".file")
+                        || t.starts_with(".Llccc_inline_b_")
+                        || t.starts_with(".Llccc_inline_e_"))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        let a = peephole_optimize(plain.to_string());
+        let b = peephole_optimize(debug.to_string());
+        let (a, b) = (code_rows(&a), code_rows(&b));
+        assert_ne!(
+            a.trim(),
+            code_rows(plain).trim(),
+            "peephole did nothing; test is vacuous"
+        );
+        assert!(
+            b.contains(".L3:"),
+            "the debug variant lost its join label: {b}"
+        );
+        assert_eq!(a, b, "-g changed the generated code");
+    }
 
     #[test]
     fn volatile_function_quarantine_preserves_code_rows_and_label_references() {

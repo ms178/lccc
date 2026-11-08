@@ -1973,6 +1973,8 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
     let instructions_len = func.blocks[block_idx].instructions.len();
     let mut new_spans = std::mem::take(&mut func.blocks[block_idx].source_spans);
     let spans_in_lockstep = new_spans.len() == instructions_len;
+    let mut new_ids = std::mem::take(&mut func.blocks[block_idx].source_inline_ids);
+    let ids_in_lockstep = new_ids.len() == instructions_len;
 
     for inst in func.blocks[block_idx].instructions.drain(..) {
         // Memory invalidation: true clobbers (calls, atomics, asm, ...) and
@@ -2338,6 +2340,9 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                         if spans_in_lockstep {
                             new_spans.remove(new_instructions.len());
                         }
+                        if ids_in_lockstep {
+                            new_ids.remove(new_instructions.len());
+                        }
                         eliminated += 1;
                         continue;
                     }
@@ -2488,8 +2493,16 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
         new_spans.len(),
         new_instructions.len()
     );
+    debug_assert!(
+        !ids_in_lockstep || new_ids.len() == new_instructions.len(),
+        "GVN inline-id bookkeeping desynced in block {}: {} ids for {} instructions",
+        block_idx,
+        new_ids.len(),
+        new_instructions.len()
+    );
     func.blocks[block_idx].instructions = new_instructions;
     func.blocks[block_idx].source_spans = new_spans;
+    func.blocks[block_idx].source_inline_ids = new_ids;
     eliminated
 }
 
@@ -2550,12 +2563,14 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         };
 
         let func = IrFunction {
             debug_param_indices: Vec::new(),
             debug_locals: Vec::new(),
             debug_scopes: Vec::new(),
+            debug_inline_instances: Vec::new(),
             pass_policy: Default::default(),
             name: "test".to_string(),
             params: vec![],
@@ -2638,6 +2653,7 @@ mod tests {
             debug_param_indices: Vec::new(),
             debug_locals: Vec::new(),
             debug_scopes: Vec::new(),
+            debug_inline_instances: Vec::new(),
             pass_policy: Default::default(),
             name: "test".to_string(),
             params: vec![],
@@ -2662,6 +2678,7 @@ mod tests {
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             }],
             is_variadic: false,
             calling_convention: crate::common::types::CallingConvention::Default,
@@ -2728,6 +2745,7 @@ mod tests {
             debug_param_indices: Vec::new(),
             debug_locals: Vec::new(),
             debug_scopes: Vec::new(),
+            debug_inline_instances: Vec::new(),
             pass_policy: Default::default(),
             name: "test".to_string(),
             params: vec![],
@@ -2752,6 +2770,7 @@ mod tests {
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             }],
             is_variadic: false,
             calling_convention: crate::common::types::CallingConvention::Default,
@@ -2826,6 +2845,7 @@ mod tests {
             debug_param_indices: Vec::new(),
             debug_locals: Vec::new(),
             debug_scopes: Vec::new(),
+            debug_inline_instances: Vec::new(),
             pass_policy: Default::default(),
             name: "test".to_string(),
             params: vec![],
@@ -2848,6 +2868,7 @@ mod tests {
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             }],
             is_variadic: false,
             calling_convention: crate::common::types::CallingConvention::Default,
@@ -2926,6 +2947,7 @@ mod tests {
             debug_param_indices: Vec::new(),
             debug_locals: Vec::new(),
             debug_scopes: Vec::new(),
+            debug_inline_instances: Vec::new(),
             pass_policy: Default::default(),
             name: "test".to_string(),
             params: vec![],
@@ -2948,6 +2970,7 @@ mod tests {
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             }],
             is_variadic: false,
             calling_convention: crate::common::types::CallingConvention::Default,
@@ -3018,6 +3041,7 @@ mod tests {
             debug_param_indices: Vec::new(),
             debug_locals: Vec::new(),
             debug_scopes: Vec::new(),
+            debug_inline_instances: Vec::new(),
             pass_policy: Default::default(),
             name: "test".to_string(),
             params: vec![],
@@ -3034,6 +3058,7 @@ mod tests {
                     }],
                     terminator: Terminator::Branch(BlockId(1)),
                     source_spans: Vec::new(),
+                    source_inline_ids: Vec::new(),
                 },
                 BasicBlock {
                     label: BlockId(1),
@@ -3060,6 +3085,7 @@ mod tests {
                     ],
                     terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
                     source_spans: Vec::new(),
+                    source_inline_ids: Vec::new(),
                 },
             ],
             is_variadic: false,
@@ -3143,6 +3169,7 @@ mod tests {
             debug_param_indices: Vec::new(),
             debug_locals: Vec::new(),
             debug_scopes: Vec::new(),
+            debug_inline_instances: Vec::new(),
             pass_policy: Default::default(),
             name: name.to_string(),
             params: vec![],
@@ -3226,6 +3253,7 @@ mod tests {
             instructions,
             terminator,
             source_spans: spans,
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -3959,6 +3987,7 @@ mod tests {
             debug_param_indices: Vec::new(),
             debug_locals: Vec::new(),
             debug_scopes: Vec::new(),
+            debug_inline_instances: Vec::new(),
             pass_policy: Default::default(),
             name: "test".to_string(),
             params: vec![],
@@ -3974,6 +4003,7 @@ mod tests {
                         false_label: BlockId(2),
                     },
                     source_spans: Vec::new(),
+                    source_inline_ids: Vec::new(),
                 },
                 // block1: compute add (only reached via true branch)
                 BasicBlock {
@@ -3987,6 +4017,7 @@ mod tests {
                     }],
                     terminator: Terminator::Branch(BlockId(3)),
                     source_spans: Vec::new(),
+                    source_inline_ids: Vec::new(),
                 },
                 // block2: compute same add (only reached via false branch)
                 BasicBlock {
@@ -4000,6 +4031,7 @@ mod tests {
                     }],
                     terminator: Terminator::Branch(BlockId(3)),
                     source_spans: Vec::new(),
+                    source_inline_ids: Vec::new(),
                 },
                 // block3: merge
                 BasicBlock {
@@ -4007,6 +4039,7 @@ mod tests {
                     instructions: vec![],
                     terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
                     source_spans: Vec::new(),
+                    source_inline_ids: Vec::new(),
                 },
             ],
             is_variadic: false,
@@ -4090,6 +4123,7 @@ mod tests {
             debug_param_indices: Vec::new(),
             debug_locals: Vec::new(),
             debug_scopes: Vec::new(),
+            debug_inline_instances: Vec::new(),
             pass_policy: Default::default(),
             name: "test".to_string(),
             params: vec![],
@@ -4176,6 +4210,7 @@ mod tests {
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             }],
             3,
         );
@@ -4228,6 +4263,7 @@ mod tests {
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             }],
             3,
         );
@@ -4289,6 +4325,7 @@ mod tests {
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             }],
             4,
         );
@@ -4315,6 +4352,7 @@ mod tests {
                     }],
                     terminator: Terminator::Branch(BlockId(1)),
                     source_spans: Vec::new(),
+                    source_inline_ids: Vec::new(),
                 },
                 BasicBlock {
                     label: BlockId(1),
@@ -4327,6 +4365,7 @@ mod tests {
                     }],
                     terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
                     source_spans: Vec::new(),
+                    source_inline_ids: Vec::new(),
                 },
             ],
             3,
@@ -4367,6 +4406,7 @@ mod tests {
                         false_label: BlockId(2),
                     },
                     source_spans: Vec::new(),
+                    source_inline_ids: Vec::new(),
                 },
                 // block1: stores to memory
                 BasicBlock {
@@ -4380,6 +4420,7 @@ mod tests {
                     }],
                     terminator: Terminator::Branch(BlockId(3)),
                     source_spans: Vec::new(),
+                    source_inline_ids: Vec::new(),
                 },
                 // block2: no memory modification
                 BasicBlock {
@@ -4387,6 +4428,7 @@ mod tests {
                     instructions: vec![],
                     terminator: Terminator::Branch(BlockId(3)),
                     source_spans: Vec::new(),
+                    source_inline_ids: Vec::new(),
                 },
                 // block3: merge point - loads from same pointer
                 BasicBlock {
@@ -4400,6 +4442,7 @@ mod tests {
                     }],
                     terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
                     source_spans: Vec::new(),
+                    source_inline_ids: Vec::new(),
                 },
             ],
             4,
@@ -4442,6 +4485,7 @@ mod tests {
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             }],
             2,
         );
@@ -4486,6 +4530,7 @@ mod tests {
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             }],
             3,
         );
@@ -4556,6 +4601,7 @@ mod tests {
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             }],
             3,
         );
@@ -4597,6 +4643,7 @@ mod tests {
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             }],
             3,
         );
@@ -4640,6 +4687,7 @@ mod tests {
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             }],
             2,
         );
@@ -4687,6 +4735,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         };
         let mut module = make_module(make_func(vec![block], 4));
         let eliminated = module.for_each_function(run_gvn_function);
@@ -4750,6 +4799,7 @@ mod tests {
                 ],
                 terminator: Terminator::Return(None),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             }],
             4,
         );
@@ -4808,6 +4858,7 @@ mod tests {
                 ],
                 terminator: Terminator::Return(None),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             }],
             10,
         );
@@ -4890,6 +4941,7 @@ mod tests {
                 ],
                 terminator: Terminator::Return(None),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             }],
             10,
         );

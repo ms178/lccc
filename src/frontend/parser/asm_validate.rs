@@ -875,17 +875,23 @@ pub fn validate(
     // `matching constraint references invalid operand number`; the old
     // digit-start early return accepted `"0"(x)` with no outputs silently.
     let total_operands = outputs.len() + inputs.len();
+    // GCC examines the entire last written constraint, including modifiers
+    // after the class and even the normally ignored '#' comment tail. An
+    // output can itself be last when there are no inputs. Clang 23 accepts
+    // some of these forms; this is the GCC-compatibility rule, not a claim of
+    // cross-compiler diagnostic parity.
+    let last_has_commutative = inputs
+        .last()
+        .or_else(|| outputs.last())
+        .is_some_and(|op| op.constraint.contains('%'));
+    if last_has_commutative {
+        problems.push(Diagnostic::error(
+            "'%' constraint used with last operand",
+            Some(total_operands - 1),
+        ));
+    }
     for (i, op) in inputs.iter().enumerate() {
-        // `%` declares this operand commutative with the FOLLOWING operand;
-        // gcc 16.2 refuses it on the last one with
-        // "'%' constraint used with last operand". Measured with `"%"`,
-        // `"%r"` and `"%0,0"` as the only input; pr35318.c's `%0,0` has a
-        // following `"m,r"` operand and stays legal.
-        if op.constraint.starts_with('%') && outputs.len() + i + 1 == total_operands {
-            problems.push(Diagnostic::error(
-                "'%' constraint used with last operand",
-                Some(outputs.len() + i),
-            ));
+        if last_has_commutative && outputs.len() + i + 1 == total_operands {
             continue;
         }
         let body = op
@@ -1967,6 +1973,32 @@ mod tests {
                 ["'%' constraint used with last operand"],
                 "\"{c}\""
             );
+        }
+        // A modifier in the middle, end, or '#' tail is still scanned by
+        // GCC, and the last written operand can be an output with no inputs.
+        for target in [AsmTarget::X86, AsmTarget::Aarch64, AsmTarget::Other] {
+            for c in ["?%r", "r%", "r#%"] {
+                let p = validate(
+                    "",
+                    &[op("=r", Constness::Unknown)],
+                    &[op(c, Constness::Unknown)],
+                    0,
+                    target,
+                );
+                assert!(
+                    p.iter()
+                        .any(|d| d.message == "'%' constraint used with last operand"),
+                    "{target:?} {c}: {p:?}"
+                );
+            }
+            for c in ["=%r", "+%r", "=&%r"] {
+                let p = validate("", &[op(c, Constness::Unknown)], &[], 0, target);
+                assert!(
+                    p.iter()
+                        .any(|d| d.message == "'%' constraint used with last operand"),
+                    "{target:?} {c}: {p:?}"
+                );
+            }
         }
         // With a following operand the `%` tie is legal (pr35318.c shape).
         let p = validate(

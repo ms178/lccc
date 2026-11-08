@@ -879,19 +879,18 @@ fn apply_exit_test(
         idxs.sort_unstable_by(|a, b| b.cmp(a));
         let block = &mut func.blocks[bi];
         for ii in idxs {
-            block.instructions.remove(ii);
-            if !block.source_spans.is_empty() && ii < block.source_spans.len() {
-                block.source_spans.remove(ii);
-            }
+            block.remove_inst(ii);
         }
     }
     let ph = &mut func.blocks[plan.preheader];
-    let ph_spans = !ph.source_spans.is_empty();
     for inst in pre {
-        ph.instructions.push(inst);
-        if ph_spans {
-            ph.source_spans.push(Span::dummy());
-        }
+        let at = ph.instructions.len();
+        ph.insert_inst_inline(
+            at,
+            inst,
+            Span::dummy(),
+            crate::ir::instruction::NO_INLINE_INSTANCE,
+        );
     }
     let tested = if plan.top_tested { plan.q } else { plan.q_next };
     let block = &mut func.blocks[plan.header];
@@ -908,6 +907,11 @@ fn apply_exit_test(
     });
     if !block.source_spans.is_empty() {
         block.source_spans.push(Span::dummy());
+    }
+    if !block.source_inline_ids.is_empty() {
+        block
+            .source_inline_ids
+            .push(crate::ir::instruction::NO_INLINE_INSTANCE);
     }
 }
 

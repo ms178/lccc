@@ -208,6 +208,89 @@ pub fn verify_function(func: &IrFunction, stage: &str, out: &mut Vec<Violation>)
                 ),
             );
         }
+        if !func.debug_inline_instances.is_empty()
+            && block
+                .source_spans
+                .iter()
+                .any(|span| *span != crate::common::source::Span::dummy())
+            && !block.inline_ids_consistent()
+        {
+            push(
+                out,
+                format!(
+                    "block #{} ({:?}) keeps real source spans but lost inline provenance ({} ids for {} instructions)",
+                    i,
+                    block.label,
+                    block.source_inline_ids.len(),
+                    block.instructions.len()
+                ),
+            );
+            // Opt-in forensic dump: the violation names the first consumer
+            // that noticed the drift, not necessarily the producer. Printing
+            // the offending block lets a developer align the extra/missing
+            // instruction with the pass dump without rerunning under gdb.
+            if std::env::var_os("CCC_VERIFY_DUMP_BLOCK").is_some() {
+                lccc::cli::stderr_line(format_args!(
+                    "[ir-verify-dump] {} block #{} {:?} ({} insts, {} spans, {} ids)",
+                    func.name,
+                    i,
+                    block.label,
+                    block.instructions.len(),
+                    block.source_spans.len(),
+                    block.source_inline_ids.len()
+                ));
+                for (j, inst) in block.instructions.iter().enumerate() {
+                    lccc::cli::stderr_line(format_args!(
+                        "  {j}: span={:?} id={:?} {inst:?}",
+                        block.source_spans.get(j),
+                        block.source_inline_ids.get(j)
+                    ));
+                }
+            }
+        }
+        if !block.source_inline_ids.is_empty() {
+            if block.source_inline_ids.len() != block.instructions.len()
+                || block.source_spans.len() != block.instructions.len()
+            {
+                push(
+                    out,
+                    format!(
+                        "block #{} ({:?}) has {} inline ids for {} instructions / {} source spans",
+                        i,
+                        block.label,
+                        block.source_inline_ids.len(),
+                        block.instructions.len(),
+                        block.source_spans.len()
+                    ),
+                );
+            }
+            for (j, &id) in block.source_inline_ids.iter().enumerate() {
+                if id != crate::ir::instruction::NO_INLINE_INSTANCE
+                    && id as usize >= func.debug_inline_instances.len()
+                {
+                    push(
+                        out,
+                        format!(
+                            "block #{} ({:?}) instruction {} names missing inline instance {}",
+                            i, block.label, j, id
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    for (i, instance) in func.debug_inline_instances.iter().enumerate() {
+        if let Some(parent) = instance.parent {
+            if parent as usize >= i {
+                push(
+                    out,
+                    format!(
+                        "inline instance {} has parent {} that is not an earlier instance",
+                        i, parent
+                    ),
+                );
+            }
+        }
     }
 
     // 1b. label-counter health: the documented `IrFunction::next_label`
@@ -844,7 +927,9 @@ pub fn verify_after_func_pass(func: &IrFunction, stage: &str) {
 /// Pass-loop hook: a no-op unless `CCC_VERIFY_IR` is set.
 ///
 /// Deliberately checks the env var *before* touching the module so the
-/// disabled path costs one `getenv` per pass and allocates nothing.
+/// disabled path costs one `getenv` per pass and allocates nothing.  The hook
+/// is immutable: it reports the pass that broke an invariant instead of
+/// repairing auxiliary metadata and hiding the producer's defect.
 pub fn verify_after_pass(module: &IrModule, stage: &str) {
     let m = mode();
     if m == Mode::Off {

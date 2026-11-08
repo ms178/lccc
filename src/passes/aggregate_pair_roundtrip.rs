@@ -688,15 +688,22 @@ fn apply(func: &mut IrFunction, c: &Candidate) {
     //
     // A `Memcpy` here would be correct but opaque to that forwarding.
     let block = &mut func.blocks[c.block];
-    let old_spans = block.take_parallel_spans();
+    let (old_spans, old_ids) = block.take_parallel_debug();
     let tracked = !old_spans.is_empty();
     let mut rewritten = Vec::with_capacity(block.instructions.len());
     let mut spans = Vec::with_capacity(if tracked { rewritten.capacity() } else { 0 });
+    let mut ids = Vec::with_capacity(if tracked { rewritten.capacity() } else { 0 });
     for (ii, inst) in block.instructions.iter().enumerate() {
         if ii == c.insert_at {
             if tracked {
                 // The vector load stands in for the pair it replaces.
                 spans.push(old_spans[ii]);
+                ids.push(
+                    old_ids
+                        .get(ii)
+                        .copied()
+                        .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE),
+                );
             }
             rewritten.push(Instruction::Intrinsic {
                 // `Loaddqu` writes the vector to `dest_ptr`; it has no SSA
@@ -713,9 +720,18 @@ fn apply(func: &mut IrFunction, c: &Candidate) {
         rewritten.push(inst.clone());
         if tracked {
             spans.push(old_spans[ii]);
+            ids.push(
+                old_ids
+                    .get(ii)
+                    .copied()
+                    .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE),
+            );
         }
     }
-    block.replace_insts(rewritten, spans);
+    if old_ids.is_empty() {
+        ids.clear();
+    }
+    block.replace_insts_inline(rewritten, spans, ids);
 }
 
 #[cfg(test)]
@@ -744,6 +760,7 @@ mod tests {
             instructions: insts,
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }];
         f
     }

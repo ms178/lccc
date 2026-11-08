@@ -424,6 +424,7 @@ fn instrument_function(
         let entry = &mut func.blocks[0];
         let track_spans =
             !entry.source_spans.is_empty() && entry.source_spans.len() == entry.instructions.len();
+        let track_ids = track_spans && entry.source_inline_ids.len() == entry.instructions.len();
         let entry_span = entry
             .source_spans
             .first()
@@ -437,6 +438,7 @@ fn instrument_function(
 
         let mut prologue_insts = Vec::with_capacity(4);
         let mut prologue_spans = Vec::with_capacity(4);
+        let mut prologue_ids = Vec::with_capacity(4);
         prologue_insts.push(Instruction::Alloca {
             dest: canary_alloca,
             ty: word_ty,
@@ -468,9 +470,20 @@ fn instrument_function(
             prologue_spans.push(entry_span);
         }
 
+        if track_ids {
+            prologue_ids.resize(
+                prologue_insts.len(),
+                crate::ir::instruction::NO_INLINE_INSTANCE,
+            );
+        }
         entry.instructions.splice(0..0, prologue_insts.drain(..1));
         if track_spans {
             entry.source_spans.splice(0..0, prologue_spans.drain(..1));
+        }
+        if track_ids {
+            entry
+                .source_inline_ids
+                .splice(0..0, prologue_ids.drain(..1));
         }
         let store_pos = insert_pos + 1;
         entry
@@ -480,6 +493,11 @@ fn instrument_function(
             entry
                 .source_spans
                 .splice(store_pos..store_pos, prologue_spans);
+        }
+        if track_ids {
+            entry
+                .source_inline_ids
+                .splice(store_pos..store_pos, prologue_ids);
         }
     }
 
@@ -504,11 +522,13 @@ fn instrument_function(
         let blk = &mut func.blocks[bi];
         let track_spans =
             !blk.source_spans.is_empty() && blk.source_spans.len() == blk.instructions.len();
+        let track_ids = track_spans && blk.source_inline_ids.len() == blk.instructions.len();
         let tail_span = blk.source_spans.last().copied().unwrap_or_else(Span::dummy);
 
         // Keep trailing SetReturn*Second instructions paired with Return in ret_block.
         let mut moved_insts = Vec::new();
         let mut moved_spans = Vec::new();
+        let mut moved_ids = Vec::new();
         while blk.instructions.last().is_some_and(|inst| {
             matches!(
                 inst,
@@ -525,9 +545,15 @@ fn instrument_function(
                     moved_spans.push(sp);
                 }
             }
+            if track_ids {
+                if let Some(id) = blk.source_inline_ids.pop() {
+                    moved_ids.push(id);
+                }
+            }
         }
         moved_insts.reverse();
         moved_spans.reverse();
+        moved_ids.reverse();
 
         let saved_val = Value(next_val);
         next_val += 1;
@@ -541,6 +567,11 @@ fn instrument_function(
         if track_spans {
             blk.source_spans.push(tail_span);
         }
+        if track_ids {
+            blk.source_inline_ids
+                .push(crate::ir::instruction::NO_INLINE_INSTANCE);
+        }
+        let guard_start = blk.instructions.len();
         let expected_val = emit_guard_load(
             &mut blk.instructions,
             &mut blk.source_spans,
@@ -550,6 +581,13 @@ fn instrument_function(
             effective,
             word_ty,
         );
+        if track_ids {
+            let added = blk.instructions.len() - guard_start;
+            blk.source_inline_ids.extend(std::iter::repeat_n(
+                crate::ir::instruction::NO_INLINE_INSTANCE,
+                added,
+            ));
+        }
         let cmp_val = Value(next_val);
         next_val += 1;
         blk.instructions.push(Instruction::Cmp {
@@ -562,6 +600,10 @@ fn instrument_function(
         if track_spans {
             blk.source_spans.push(tail_span);
         }
+        if track_ids {
+            blk.source_inline_ids
+                .push(crate::ir::instruction::NO_INLINE_INSTANCE);
+        }
         blk.terminator = Terminator::CondBranch {
             cond: Operand::Value(cmp_val),
             true_label: fail_lbl,
@@ -573,6 +615,7 @@ fn instrument_function(
             instructions: moved_insts,
             terminator: Terminator::Return(ret_operand),
             source_spans: moved_spans,
+            source_inline_ids: moved_ids,
         });
     }
 
@@ -608,6 +651,7 @@ fn instrument_function(
             }],
             terminator: Terminator::Unreachable,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
     }
 
@@ -628,10 +672,59 @@ mod tests {
             instructions: Vec::new(),
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(42)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         f.next_label = 1;
         f.next_value_id = 1;
         f
+    }
+
+    #[test]
+    fn canary_instrumentation_keeps_inline_ids_parallel() {
+        let mut f = sample_func();
+        f.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(0),
+            src: Operand::Const(IrConst::I32(42)),
+        });
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(0))));
+        f.blocks[0].source_spans = vec![crate::common::source::Span::new(10, 11, 0)];
+        f.blocks[0].source_inline_ids = vec![77];
+        let mut next_blk = 10;
+        instrument_function(
+            &mut f,
+            &EffectiveStackGuard::Global {
+                symbol: "__stack_chk_guard".to_string(),
+            },
+            8,
+            IrType::U64,
+            &mut next_blk,
+        );
+        for b in &f.blocks {
+            assert!(
+                b.inline_ids_consistent(),
+                "block {:?} lost provenance shape",
+                b.label
+            );
+            if !b.source_spans.is_empty() {
+                assert_eq!(b.source_spans.len(), b.instructions.len());
+            }
+        }
+        let entry = &f.blocks[0];
+        assert!(entry.inline_ids_parallel());
+        assert_eq!(
+            entry
+                .source_inline_ids
+                .iter()
+                .filter(|&&id| id == 77)
+                .count(),
+            1
+        );
+        assert!(
+            entry
+                .source_inline_ids
+                .iter()
+                .all(|&id| id == 77 || id == crate::ir::instruction::NO_INLINE_INSTANCE)
+        );
     }
 
     #[test]

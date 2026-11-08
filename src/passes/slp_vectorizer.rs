@@ -6640,9 +6640,12 @@ fn apply_plan(
     // Rebuild the instruction list (and the parallel span list).
     let old = std::mem::take(&mut func.blocks[block_idx].instructions);
     let old_spans = std::mem::take(&mut func.blocks[block_idx].source_spans);
+    let old_ids = std::mem::take(&mut func.blocks[block_idx].source_inline_ids);
     let has_spans = !old_spans.is_empty();
+    let has_ids = !old_ids.is_empty();
     let mut new_insts: Vec<Instruction> = Vec::with_capacity(old.len());
     let mut new_spans: Vec<Span> = Vec::new();
+    let mut new_ids: Vec<u32> = Vec::new();
     let mut next_insert = 0usize;
     for (i, inst) in old.into_iter().enumerate() {
         while next_insert < inserts.len() && inserts[next_insert].0 == i {
@@ -6650,6 +6653,14 @@ fn apply_plan(
             new_insts.push(ins);
             if has_spans {
                 new_spans.push(*old_spans.get(i).unwrap_or(&Span::new(0, 0, 0)));
+            }
+            if has_ids {
+                new_ids.push(
+                    old_ids
+                        .get(i)
+                        .copied()
+                        .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE),
+                );
             }
             next_insert += 1;
         }
@@ -6663,6 +6674,14 @@ fn apply_plan(
             // skew); never index blindly (ICE: vec_arx_scalar_spelling_sse2).
             new_spans.push(*old_spans.get(i).unwrap_or(&Span::new(0, 0, 0)));
         }
+        if has_ids {
+            new_ids.push(
+                old_ids
+                    .get(i)
+                    .copied()
+                    .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE),
+            );
+        }
     }
     // A pack's sched is always < the seed store's slot < n, so any
     // trailing inserts here would be a scheduling bug — append them
@@ -6673,10 +6692,14 @@ fn apply_plan(
         if has_spans {
             new_spans.push(Span::new(0, 0, 0));
         }
+        if has_ids {
+            new_ids.push(crate::ir::instruction::NO_INLINE_INSTANCE);
+        }
         next_insert += 1;
     }
     func.blocks[block_idx].instructions = new_insts;
     func.blocks[block_idx].source_spans = new_spans;
+    func.blocks[block_idx].source_inline_ids = new_ids;
 
     // Cross-block use rewrite (rule (b)'s v6 relaxation): the extracts
     // live in THIS block and dominate every external use (see the proof
@@ -7057,6 +7080,7 @@ mod tests {
             instructions,
             terminator,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         };
         let branch = |target| Terminator::Branch(BlockId(target));
         let cond = |yes, no| Terminator::CondBranch {

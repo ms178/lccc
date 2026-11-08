@@ -1284,6 +1284,26 @@ fn is_debug_location(store: &LineStore, infos: &[LineInfo], idx: usize) -> bool 
         && syntax_of(store, infos, idx).split_whitespace().next() == Some(".loc")
 }
 
+/// True when a row carries no dataflow work: it was deleted or is blank, or it
+/// is a source-location directive.
+///
+/// Every place that must agree on "does this row do work?" calls this one
+/// predicate: the analysis budget, the block-leader walk, the apply-phase
+/// budget, and the dead-store walk. They drifted once already -- the leader
+/// walk skipped only deleted rows while the budget also skipped `.loc`, so a
+/// caller that had not run `hide_debug_rows` would still have made a `.loc` a
+/// block leader and split a join. `-g` changing the code is the failure that
+/// produced, and a rule with four spellings is how it came back.
+///
+/// `hide_debug_rows` rewrites `.loc` and D6 endpoints to `Nop`, so in production
+/// the first test answers and the string probe is never reached; it stays for
+/// callers that analyse unhidden text, and costs nothing on the hot path
+/// because `&&` short-circuits on the two integer tests.
+#[inline]
+fn row_does_no_work(store: &LineStore, infos: &[LineInfo], j: usize) -> bool {
+    infos[j].is_nop() || infos[j].kind == LineKind::Empty || is_debug_location(store, infos, j)
+}
+
 /// How one instruction touches EFLAGS, for the forward liveness scan.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FlagUse {
@@ -3804,13 +3824,21 @@ fn slot_fwd_block(
         if *budget == 0 {
             return changed;
         }
+        // Charge the budget for WORK, never for a row that does none. `-g`
+        // inserts `.loc` rows and D6 endpoints, which `hide_debug_rows` marks
+        // deleted; paying for them made the analysis a function of the debug
+        // row count, so the same function exhausted the budget under `-g` and
+        // kept every forward without it. That is a code difference caused by
+        // debug info (i686 -O1 crc32_index_narrowing_variants.c: the join in
+        // `.LBB52` reloads `12(%esp)` instead of copying `%eax`), and it also
+        // silently bought less optimization for exactly the translation units
+        // people debug. Skipping is two integer tests, so the real work bound
+        // is unchanged: debug rows are O(instructions), and the fixpoint's
+        // iteration count is still capped by the lattice and this budget.
+        if row_does_no_work(store, infos, j) {
+            continue;
+        }
         *budget -= 1;
-        if infos[j].is_nop() || infos[j].kind == LineKind::Empty {
-            continue;
-        }
-        if is_debug_location(store, infos, j) {
-            continue;
-        }
         let kind = infos[j].kind;
         let mut forward: Option<(RegId, RegId, MoveSize)> = None;
         {
@@ -4080,8 +4108,22 @@ fn forward_slot_loads_cfg_range(
         if !is_edge {
             continue;
         }
-        if j + 1 < fe {
-            starts.push(j + 1);
+        // The row after an edge heads the fall-through block -- but only if it
+        // survives into the code. `hide_debug_rows` marks `.loc` rows and D6
+        // endpoints deleted, and an endpoint routinely sits exactly here
+        // (`.Llccc_inline_e_1_14_main:` right after `jmp .LBB52`). Pushing that
+        // row verbatim made it a leader, so the real `.LBB52:` label after it
+        // opened a SECOND block: the pass analysed a spurious empty block and a
+        // split join. That is a code difference caused purely by debug info --
+        // i686 -O1 crc32_index_narrowing_variants.c grew 120 -> 122 blocks under
+        // `-g` and lost the `%eax` forward at the join, reloading `12(%esp)`
+        // instead. A leader must name a live row, so skip rows that emit
+        // nothing; a real label stops the walk and dedups with the leader its
+        // own arm already pushed.
+        if let Some(lead) = crate::backend::peephole_common::first_live_row(j + 1, fe, |i| {
+            row_does_no_work(store, infos, i)
+        }) {
+            starts.push(lead);
         }
         if matches!(infos[j].kind, LineKind::Jmp | LineKind::CondJmp) {
             if let Some(target) = direct_jump_target(trimmed(store, &infos[j], j))
@@ -4422,7 +4464,16 @@ fn forward_slot_loads_cfg_range(
     // One visit per block, in any order: IN is final, so nothing here depends on
     // the order in which blocks are rewritten.
     let mut changed = false;
-    let mut apply_budget = fe - fs + nb;
+    // One visit per block covers every row exactly once, and `slot_fwd_block`
+    // now charges only rows it actually processes -- so the exact bound is the
+    // number of those rows, plus one slack per block. Sizing it from `fe - fs`
+    // instead would put the debug row count back into the pass, even though a
+    // generous bound never binds; the invariant worth keeping is that NO
+    // quantity here depends on `-g`.
+    let mut apply_budget = (fs..fe)
+        .filter(|&j| !row_does_no_work(store, infos, j))
+        .count()
+        + nb;
     for &b in &rpo {
         let mut st = inn[b].clone();
         changed |= slot_fwd_block(
@@ -5344,15 +5395,18 @@ fn slot_pair_dead_on_all_paths(
             if budget == 0 {
                 return false;
             }
-            budget -= 1;
             if pos >= fe {
                 // Off the end of the function: nothing can read the slot again.
                 break;
             }
-            if infos[pos].is_nop() || infos[pos].kind == LineKind::Empty {
+            if row_does_no_work(store, infos, pos) {
                 pos += 1;
                 continue;
             }
+            // See `slot_fwd_block`: the budget bounds work, so a hidden `-g`
+            // row must not spend it. Charging here made dead-store proof depth
+            // depend on the debug row count.
+            budget -= 1;
             let t = trimmed(store, &infos[pos], pos);
             // %esp movement renames every slot; track it instead of giving up.
             // `subl $8, %esp` moves the tracked bytes to `slot + 8`.
@@ -14781,7 +14835,9 @@ fn producer_touches_slots(lines: &[String], jcc_idx: usize, slots: &[String]) ->
 /// text, where rows are visible again, and must read them like blanks or
 /// `-g` changes what it hoists.
 fn is_row_or_blank(t: &str) -> bool {
-    t.is_empty() || crate::backend::peephole_common::is_loc_directive(t)
+    t.is_empty()
+        || crate::backend::peephole_common::is_loc_directive(t)
+        || crate::backend::peephole_common::is_inline_range_marker(t)
 }
 
 fn else_hoist_diamonds(asm: String) -> String {
@@ -15514,7 +15570,7 @@ pub fn peephole_optimize(asm: String) -> String {
     let mut clock = PeepClock::new(store.len());
     let mut infos = classify_all(&store);
     clock.mark("p00");
-    let debug_rows = hide_debug_rows(&store, &mut infos);
+    hide_debug_rows(&store, &mut infos);
     clock.mark("p01");
     pin_inline_asm_regions(&store, &mut infos);
 
@@ -15803,8 +15859,7 @@ pub fn peephole_optimize(asm: String) -> String {
     // passes shape the diamond (fusing the flag producer, folding prep)
     // that this pass needs to see.
     clock.mark("p21");
-    let hoisted =
-        else_hoist_diamonds(store.build_result_with_debug_rows(|i| infos[i].is_nop(), &debug_rows));
+    let hoisted = else_hoist_diamonds(store.build_result_with_debug_rows(|i| infos[i].is_nop()));
 
     // Phase 7 (terminal): cross-jump duplicate function epilogues.  Every
     // return site carries its own `addl/popl…/ret` copy; the 32 KiB setup
@@ -16954,7 +17009,7 @@ fn merge_duplicate_epilogues_terminal(asm: String) -> String {
     }
     let mut store = LineStore::new(asm.clone());
     let mut infos = classify_all(&store);
-    let debug_rows = hide_debug_rows(&store, &mut infos);
+    hide_debug_rows(&store, &mut infos);
     pin_inline_asm_regions(&store, &mut infos);
     if !merge_epilogue_tails_i686(&mut store, &mut infos) {
         // Return the caller's buffer untouched: rebuilding it here would make
@@ -16962,24 +17017,25 @@ fn merge_duplicate_epilogues_terminal(asm: String) -> String {
         // which is another pass's contract to keep.
         return asm;
     }
-    store.build_result_with_debug_rows(|i| infos[i].is_nop(), &debug_rows)
+    store.build_result_with_debug_rows(|i| infos[i].is_nop())
 }
 
-/// Hide every `-g` line row (`.loc`) from the passes by marking it deleted;
-/// `LineStore::build_result_with_debug_rows` re-emits each where it stood,
-/// so no window's adjacency assumption can make `-g` change the code (the
-/// x86-64 peephole does the same; see its `hide_debug_rows`).
-fn hide_debug_rows(store: &LineStore, infos: &mut [LineInfo]) -> Vec<bool> {
-    let mut rows = vec![false; infos.len()];
+/// Hide every `-g` metadata row (`.loc` and D6 inline-range endpoints) from
+/// the passes by marking it deleted; `LineStore::build_result_with_debug_rows`
+/// re-emits each where it stood, so no window's adjacency assumption can make
+/// `-g` change the code (the x86-64 peephole does the same; see its
+/// `hide_debug_rows`).
+fn hide_debug_rows(store: &LineStore, infos: &mut [LineInfo]) {
     for (i, info) in infos.iter_mut().enumerate() {
-        if info.kind == LineKind::Directive
-            && crate::backend::peephole_common::is_loc_directive(trimmed(store, info, i))
-        {
+        let text = trimmed(store, info, i);
+        let hidden = (info.kind == LineKind::Directive
+            && crate::backend::peephole_common::is_loc_directive(text))
+            || (info.kind == LineKind::Label
+                && crate::backend::peephole_common::is_inline_range_marker(text));
+        if hidden {
             info.kind = LineKind::Nop;
-            rows[i] = true;
         }
     }
-    rows
 }
 
 #[cfg(test)]
@@ -22912,6 +22968,178 @@ f:
         assert!(
             !out.contains("movl 12(%esp), %edx"),
             "redundant reload survived: {out}"
+        );
+    }
+
+    /// Run the CFG slot forwarder exactly as production does: classify with the
+    /// frame proof, hide the `-g` rows, then build. Hidden rows are dropped from
+    /// the result, so two texts that differ only in debug rows must produce
+    /// byte-identical code.
+    fn run_cfg_slot_fwd_production(lines: &[&str]) -> String {
+        let asm = lines.join("\n") + "\n";
+        let mut store = LineStore::new(asm);
+        let mut infos = classify_all(&store);
+        hide_debug_rows(&store, &mut infos);
+        pin_inline_asm_regions(&store, &mut infos);
+        forward_slot_loads_cfg(&mut store, &mut infos);
+        store.build_result(|i| infos[i].is_nop())
+    }
+
+    /// `-g` must not change the code, and must not buy LESS optimization.
+    ///
+    /// A D6 endpoint emitted immediately after a transfer used to become a
+    /// basic-block leader: `starts.push(j + 1)` named the hidden row, so the
+    /// real label after it opened a second block and the join was analysed as
+    /// a spurious empty block plus a split. The forward was lost under `-g`
+    /// only. Both variants must forward here -- asserting equality alone would
+    /// pass just as well if the optimization stopped firing in BOTH, which is
+    /// why the register copy is asserted positively in each.
+    #[test]
+    fn cfg_fwd_hidden_debug_rows_do_not_split_the_join() {
+        let plain = [
+            "f:",
+            "    movl %ebx, 16(%esp)",
+            "    cmpl $0, %eax",
+            "    je .L2",
+            "    jmp .L3",
+            ".L2:",
+            "    movl $1, %edx",
+            ".L3:",
+            "    movl 16(%esp), %ecx",
+            "    ret",
+        ];
+        // The same code with `.loc` rows and D6 endpoints interleaved, including
+        // an endpoint DIRECTLY after each transfer -- the exact shape that used
+        // to create the phantom block.
+        let debug = [
+            "f:",
+            ".Llccc_inline_b_0_0_f:",
+            ".loc 1 1 0",
+            "    movl %ebx, 16(%esp)",
+            ".loc 1 2 0",
+            "    cmpl $0, %eax",
+            "    je .L2",
+            ".Llccc_inline_e_0_0_f:",
+            "    jmp .L3",
+            ".Llccc_inline_e_0_1_f:",
+            ".loc 1 3 0",
+            ".L2:",
+            ".Llccc_inline_b_0_2_f:",
+            "    movl $1, %edx",
+            ".Llccc_inline_e_0_2_f:",
+            ".L3:",
+            ".Llccc_inline_b_0_3_f:",
+            ".loc 1 4 0",
+            "    movl 16(%esp), %ecx",
+            ".Llccc_inline_e_0_3_f:",
+            "    ret",
+        ];
+        let a = run_cfg_slot_fwd_production(&plain);
+        let b = run_cfg_slot_fwd_production(&debug);
+        assert!(
+            a.contains("movl %ebx, %ecx"),
+            "the plain text did not forward, so this test proves nothing: {a}"
+        );
+        assert!(
+            b.contains("movl %ebx, %ecx"),
+            "hidden debug rows cost the forward (phantom block leader): {b}"
+        );
+        assert_eq!(a, b, "-g changed the generated code");
+    }
+
+    /// The `-g` invariant must not depend on the caller remembering to run
+    /// `hide_debug_rows`. Production always hides, which turns `.loc` and D6
+    /// endpoints into `Nop`; but the leader walk and the budget used to spell
+    /// the "no work" rule differently, so an unhidden `.loc` was invisible to
+    /// the budget and still became a block leader. One shared predicate means
+    /// both agree either way. This drives the pass on PURPOSE-unhidden text.
+    #[test]
+    fn cfg_fwd_is_debug_invariant_even_without_hiding() {
+        fn run_unhidden(lines: &[&str]) -> String {
+            let asm = lines.join("\n") + "\n";
+            let mut store = LineStore::new(asm);
+            let mut infos = classify_all(&store);
+            // Deliberately no `hide_debug_rows`.
+            pin_inline_asm_regions(&store, &mut infos);
+            forward_slot_loads_cfg(&mut store, &mut infos);
+            store.build_result(|i| infos[i].is_nop())
+        }
+        let plain = [
+            "f:",
+            "    movl %ebx, 16(%esp)",
+            "    cmpl $0, %eax",
+            "    je .L2",
+            "    jmp .L3",
+            ".L2:",
+            "    movl $1, %edx",
+            ".L3:",
+            "    movl 16(%esp), %ecx",
+            "    ret",
+        ];
+        // `.loc` directly after each transfer: invisible to the budget, and it
+        // must be invisible to the leader walk too.
+        let debug = [
+            "f:",
+            "    movl %ebx, 16(%esp)",
+            "    cmpl $0, %eax",
+            "    je .L2",
+            ".loc 1 2 0",
+            "    jmp .L3",
+            ".loc 1 3 0",
+            ".L2:",
+            "    movl $1, %edx",
+            ".L3:",
+            ".loc 1 4 0",
+            "    movl 16(%esp), %ecx",
+            "    ret",
+        ];
+        let a = run_unhidden(&plain);
+        let b = run_unhidden(&debug);
+        assert!(
+            a.contains("movl %ebx, %ecx"),
+            "plain text did not forward; test is vacuous: {a}"
+        );
+        // The `.loc` rows survive into the output here (nothing hid them), so
+        // compare the code with those rows filtered, not the raw text.
+        let code = |t: &str| {
+            t.lines()
+                .filter(|l| !l.trim_start().starts_with(".loc"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(code(&a), code(&b), "an unhidden .loc split the join");
+        assert!(
+            b.contains("movl %ebx, %ecx"),
+            "an unhidden .loc cost the forward: {b}"
+        );
+    }
+
+    /// The budget bounds WORK. A function padded with far more hidden `-g` rows
+    /// than the whole analysis budget must still be optimized: charging the
+    /// budget for rows that are skipped made `-g` abandon the pass outright.
+    #[test]
+    fn cfg_fwd_debug_rows_do_not_spend_the_analysis_budget() {
+        let mut lines: Vec<String> = vec![
+            "f:".to_string(),
+            "    movl %ebx, 16(%esp)".to_string(),
+            "    cmpl $0, %eax".to_string(),
+            "    je .L2".to_string(),
+            "    jmp .L3".to_string(),
+            ".L2:".to_string(),
+            "    movl $1, %edx".to_string(),
+            ".L3:".to_string(),
+        ];
+        // Well past the 40_000-work budget, all of it rows that do no work.
+        for i in 0..45_000 {
+            lines.push(format!(".loc 1 {} 0", 1 + i % 9_000));
+        }
+        lines.push("    movl 16(%esp), %ecx".to_string());
+        lines.push("    ret".to_string());
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let out = run_cfg_slot_fwd_production(&refs);
+        assert!(
+            out.contains("movl %ebx, %ecx"),
+            "45000 hidden rows exhausted the budget and killed the forward"
         );
     }
 

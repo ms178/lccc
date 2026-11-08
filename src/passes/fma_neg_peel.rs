@@ -577,6 +577,19 @@ fn peel_function(func: &mut IrFunction) -> usize {
             // stale non-empty vector that no longer matches the instruction
             // list would desynchronize later debug emission.
             block.source_spans.clear();
+            block.source_inline_ids.clear();
+        }
+        if !block.source_inline_ids.is_empty() {
+            if has_spans {
+                let mut idx = 0usize;
+                block.source_inline_ids.retain(|_| {
+                    let k = keep[idx];
+                    idx += 1;
+                    k
+                });
+            } else {
+                block.source_inline_ids.clear();
+            }
         }
     }
     removed
@@ -639,6 +652,7 @@ mod tests {
             // was right to reject those).
             terminator: Terminator::Return(Some(v(2))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = next_id;
         let mut module = IrModule::new();
@@ -920,12 +934,14 @@ mod tests {
             instructions: vec![neg(1, 0, IrType::F64)],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
             instructions: vec![fma(2, v(1), v(3), v(4), true)],
             terminator: Terminator::Return(Some(v(2))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 5;
         let mut module = IrModule::new();
@@ -1241,6 +1257,7 @@ mod tests {
                 crate::common::source::Span::new(30, 40, 0),
                 crate::common::source::Span::new(50, 60, 0),
             ],
+            source_inline_ids: Vec::new(),
         });
         func.next_value_id = 6;
         let mut module = IrModule::new();

@@ -54,6 +54,41 @@ fn is_vector_object_or_array_of_vectors(ctype: &CType) -> bool {
 }
 
 impl Lowerer {
+    /// Resolve the same object-placement policy for file-scope objects and
+    /// function-scope statics; explicit sections take precedence. Misuse is
+    /// diagnosed rather than silently choosing a section.
+    pub(super) fn object_placement_section(
+        &self,
+        declarator: &InitDeclarator,
+        init: &GlobalInit,
+    ) -> Option<String> {
+        let is_zero_init = matches!(init, GlobalInit::Zero);
+        let mut section = declarator.attrs.section.clone();
+        if section.is_none() && declarator.attrs.is_noinit() {
+            if is_zero_init {
+                section = Some(".noinit".to_string());
+            } else {
+                self.diagnostics.borrow_mut().warning_with_kind(
+                    "ignoring 'noinit' attribute set on initialized variable",
+                    declarator.span,
+                    crate::common::error::WarningKind::Attributes,
+                );
+            }
+        }
+        if section.is_none() && declarator.attrs.is_persistent() {
+            if is_zero_init {
+                self.diagnostics.borrow_mut().warning_with_kind(
+                    "ignoring 'persistent' attribute set on uninitialized variable",
+                    declarator.span,
+                    crate::common::error::WarningKind::Attributes,
+                );
+            } else {
+                section = Some(".persistent".to_string());
+            }
+        }
+        section
+    }
+
     // --- Global declaration lowering ---
 
     pub(super) fn lower_global_decl(&mut self, decl: &Declaration) {
@@ -870,43 +905,7 @@ impl Lowerer {
                 }
             }
         }
-        // Object-placement attributes (GCC 16.2). Measured on `gcc-16 -c`:
-        //   `__attribute__((noinit))` on a zero-initialized object -> `.noinit`
-        //       (SHT_NOBITS); on an initialized one GCC warns
-        //       "ignoring 'noinit' attribute set on initialized variable".
-        //   `__attribute__((persistent))` on an initialized object -> `.persistent`
-        //       (PROGBITS); on a zero-initialized one GCC warns
-        //       "ignoring 'persistent' attribute set on uninitialized variable".
-        //   `__attribute__((retain))` keeps the object's *default* section and
-        //       adds SHF_GNU_RETAIN, in a section of its own
-        //       (`.data.<name>` / `.bss.<name>`) — handled by the backend,
-        //       which is the only place that knows the default section.
-        // An explicit `section(...)` wins over all three, as in GCC.
-        let explicit_section = declarator.attrs.section.clone();
-        let is_zero_init = matches!(init, GlobalInit::Zero);
-        let mut section = explicit_section;
-        if section.is_none() && declarator.attrs.is_noinit() {
-            if is_zero_init {
-                section = Some(".noinit".to_string());
-            } else {
-                self.diagnostics.borrow_mut().warning_with_kind(
-                    "ignoring 'noinit' attribute set on initialized variable",
-                    declarator.span,
-                    crate::common::error::WarningKind::Attributes,
-                );
-            }
-        }
-        if section.is_none() && declarator.attrs.is_persistent() {
-            if is_zero_init {
-                self.diagnostics.borrow_mut().warning_with_kind(
-                    "ignoring 'persistent' attribute set on uninitialized variable",
-                    declarator.span,
-                    crate::common::error::WarningKind::Attributes,
-                );
-            } else {
-                section = Some(".persistent".to_string());
-            }
-        }
+        let section = self.object_placement_section(declarator, &init);
         self.module.globals.push(IrGlobal {
             name: emit_name,
             ty: global_ty,

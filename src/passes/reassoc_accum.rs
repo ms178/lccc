@@ -417,8 +417,13 @@ fn rewrite_sum2_chain(
     }
 
     let block = &mut func.blocks[bi];
-    let old_spans = block.take_parallel_spans();
+    let (old_spans, old_ids) = block.take_parallel_debug();
     let mut new_insts: Vec<Instruction> = Vec::with_capacity(block.instructions.len() + seq.len());
+    let mut new_ids: Vec<u32> = Vec::with_capacity(if old_spans.is_empty() {
+        0
+    } else {
+        new_insts.capacity()
+    });
     let mut new_spans = Vec::with_capacity(if old_spans.is_empty() {
         0
     } else {
@@ -434,14 +439,30 @@ fn rewrite_sum2_chain(
                         .into_iter()
                         .flatten(),
                 );
+                new_ids.extend(std::iter::repeat_n(
+                    old_ids
+                        .get(idx)
+                        .copied()
+                        .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE),
+                    seq.len(),
+                ));
             }
             // else: an intermediate sum2 add — drop it (now dead).
         } else {
             new_insts.push(inst);
             new_spans.extend(span);
+            new_ids.push(
+                old_ids
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(crate::ir::instruction::NO_INLINE_INSTANCE),
+            );
         }
     }
-    block.replace_insts(new_insts, new_spans);
+    if old_ids.is_empty() {
+        new_ids.clear();
+    }
+    block.replace_insts_inline(new_insts, new_spans, new_ids);
     func.next_value_id = next_id;
     true
 }

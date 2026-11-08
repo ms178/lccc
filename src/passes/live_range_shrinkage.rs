@@ -766,6 +766,7 @@ mod tests {
             source_spans: (0..instructions.len())
                 .map(|i| Span::new(i as u32, i as u32 + 1, 0))
                 .collect(),
+            source_inline_ids: Vec::new(),
             instructions,
             terminator: Terminator::Return(Some(Operand::Value(Value(result)))),
         });

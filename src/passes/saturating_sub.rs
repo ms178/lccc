@@ -321,6 +321,7 @@ mod tests {
             instructions: insts,
             terminator: Terminator::Return(Some(Operand::Value(Value(6)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func
     }

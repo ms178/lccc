@@ -224,6 +224,31 @@ PY
 #   -Wl,-rpath,<libdirs>           The staged loader resolves libc/libgcc at run
 #                                  time with no LD_LIBRARY_PATH, so `./probe`
 #                                  executes directly and execute coverage is kept.
+# Print the staged 32-bit multilib directories matching $2 (a glob relative to
+# the sysroot, no spaces), directories only, in a deterministic order that puts
+# the ones belonging to the driver's own GCC major version first.  Pairing a
+# GCC 12 `bits/c++config.h` with a GCC 16 driver is a silent ABI mismatch, so
+# version agreement outranks discovery order; the rest are still emitted as a
+# fallback because refusing to link is worse than a best-effort match.
+# LC_ALL=C makes a multi-version staging reproducible across hosts.
+staged_multilib_dirs() {
+    local sysroot=$1 pattern=$2 cc=$3 major dir
+    major=$("$cc" -dumpversion 2>/dev/null || true)
+    major=${major%%.*}
+    local -a ordered=() rest=()
+    while IFS= read -r dir; do
+        [[ -d $dir ]] || continue
+        if [[ -n $major && $dir == */"$major"/32 ]]; then
+            ordered+=("$dir")
+        else
+            rest+=("$dir")
+        fi
+    done < <(printf '%s\n' "$sysroot"/$pattern | LC_ALL=C sort)
+    ordered+=(${rest[@]+"${rest[@]}"})
+    ((${#ordered[@]})) || return 0
+    printf '%s\n' "${ordered[@]}"
+}
+
 m32_sysroot_flags() {
     local sysroot=$1 cc=${2:-gcc}
     local interp="" candidate
@@ -239,8 +264,43 @@ m32_sysroot_flags() {
         printf '%s\n' "-idirafter" "/usr/include/$multiarch"
     fi
     printf '%s\n' "-B$sysroot/usr/lib32" "-B$sysroot/lib32" \
-        "-L$sysroot/usr/lib32" "-L$sysroot/lib32" \
+        "-L$sysroot/usr/lib32" "-L$sysroot/lib32"
+    # `lib32stdc++-<V>-dev` puts the multilib-specific C++ configuration
+    # (bits/c++config.h, bits/atomic_word.h, ...) in
+    # /usr/include/<multiarch>/c++/<V>/32.  The driver only adds that directory
+    # when the *host* has the 32-bit multilib, which is exactly what a rootless
+    # sysroot lacks: measured, `<cstdio>` was found and then failed on
+    # `bits/c++config.h`.  -I, not -idirafter, so the 32-bit configuration wins
+    # over a 64-bit one the host might already put on the path.  The directory
+    # holds only C++ config headers, so this is a no-op for the C wrapper.
+    local cxx32
+    while IFS= read -r cxx32; do
+        printf '%s\n' "-I$cxx32"
+    done < <(staged_multilib_dirs "$sysroot" "usr/include/$multiarch/c++/*/32" "$cc")
+    # `lib32gcc-<V>-dev` installs libgcc.a, libgcc_eh.a and the 32-bit
+    # crtbegin/crtend into the GCC *multilib* directory, not into lib32.  The
+    # driver's own multilib search points at the live host prefix, where a
+    # rootless install has no 32-bit subdir, so without these the staged
+    # sysroot links libc fine and then dies on `cannot find -lgcc`.  -B is
+    # required as well as -L: it is what redirects the driver's
+    # crtbegin.o/crtend.o lookup, which would otherwise pick the host's 64-bit
+    # objects and be reported only as "skipping incompatible".
+    local gcc32
+    while IFS= read -r gcc32; do
+        printf '%s\n' "-B$gcc32" "-L$gcc32"
+    done < <(staged_multilib_dirs "$sysroot" 'usr/lib/gcc/*/*/32' "$cc")
+    # DT_RPATH, not DT_RUNPATH.  Modern linkers default to --enable-new-dtags,
+    # and RUNPATH is consulted ONLY for the object's own direct dependencies:
+    # it is not inherited down the dependency chain.  libstdc++.so.6 NEEDs
+    # libm.so.6 and carries no search path of its own, so with RUNPATH the
+    # executable linked and then died at startup on `libm.so.6: cannot open
+    # shared object file` -- measured, and the reason the C probe passed while
+    # the C++ probe failed.  DT_RPATH is inherited, which is exactly the
+    # "the rpath recipe must stand on its own, no LD_LIBRARY_PATH" contract
+    # probe_m32 states.
+    printf '%s\n' \
         "-Wl,--sysroot=$sysroot" "-Wl,--dynamic-linker=$interp" \
+        "-Wl,--disable-new-dtags" \
         "-Wl,-rpath,$sysroot/lib32:$sysroot/usr/lib32"
 }
 
@@ -625,6 +685,49 @@ EOF
     [[ $(readlink "$tmp/sr/usr/lib32/dangling.so") == /nonexistent-lccc-probe ]] \
         || { rm -rf "$tmp"; die "self-test failed: dangling link was rewritten"; }
 
+    # 9a. A staged GCC 32-bit multilib directory must reach the wrapper, or the
+    #     sysroot links libc and then fails on `cannot find -lgcc`.  Two
+    #     versions are staged so the ordering is checked too, and a matching
+    #     *file* (not a directory) must be ignored rather than passed as -B.
+    mkdir -p "$tmp/sr/usr/lib/gcc/x86_64-linux-gnu/12/32" \
+        "$tmp/sr/usr/lib/gcc/x86_64-linux-gnu/11/32"
+    : >"$tmp/sr/usr/lib/gcc/x86_64-linux-gnu/12/32/libgcc.a"
+    : >"$tmp/sr/usr/lib/gcc/x86_64-linux-gnu/11/32/libgcc.a"
+    mkdir -p "$tmp/sr/usr/lib/gcc/x86_64-linux-gnu/9"
+    : >"$tmp/sr/usr/lib/gcc/x86_64-linux-gnu/9/32"
+    local m32_flags
+    m32_flags=$(m32_sysroot_flags "$tmp/sr" /usr/bin/true)
+    [[ $(printf '%s\n' "$m32_flags" | grep -c '/usr/lib/gcc/.*/32$') == 4 ]] \
+        || { rm -rf "$tmp"; die "self-test failed: staged GCC multilib dirs not on the search path"; }
+    [[ $m32_flags != *"/9/32"* ]] \
+        || { rm -rf "$tmp"; die "self-test failed: a non-directory multilib entry was accepted"; }
+    [[ $(printf '%s\n' "$m32_flags" | grep '/usr/lib/gcc/.*/32$' | head -1) == */11/32 ]] \
+        || { rm -rf "$tmp"; die "self-test failed: multilib order is not deterministic"; }
+
+    # 9b. libstdc++'s 32-bit config headers must be reachable too, and the
+    #     driver's own GCC major version must outrank discovery order: a
+    #     GCC 12 c++config.h paired with a GCC 16 driver is a silent ABI
+    #     mismatch, so `-dumpversion` decides, not the sort.
+    mkdir -p "$tmp/sr/usr/include/x86_64-linux-gnu/c++/12/32" \
+        "$tmp/sr/usr/include/x86_64-linux-gnu/c++/11/32"
+    cat >"$tmp/fake-cc" <<'FAKE'
+#!/usr/bin/env bash
+case "${1:-}" in
+    -dumpversion) echo 12.2.0 ;;
+    -print-multiarch) echo x86_64-linux-gnu ;;
+    *) exit 0 ;;
+esac
+FAKE
+    chmod +x "$tmp/fake-cc"
+    local matched
+    matched=$(m32_sysroot_flags "$tmp/sr" "$tmp/fake-cc")
+    [[ $(printf '%s\n' "$matched" | grep -c '^-I.*/c++/.*/32$') == 2 ]] \
+        || { rm -rf "$tmp"; die "self-test failed: staged 32-bit libstdc++ config headers not on the include path"; }
+    [[ $(printf '%s\n' "$matched" | grep '^-I.*/c++/.*/32$' | head -1) == */12/32 ]] \
+        || { rm -rf "$tmp"; die "self-test failed: driver version did not outrank discovery order (includes)"; }
+    [[ $(printf '%s\n' "$matched" | grep '/usr/lib/gcc/.*/32$' | head -1) == */12/32 ]] \
+        || { rm -rf "$tmp"; die "self-test failed: driver version did not outrank discovery order (libraries)"; }
+
     # 9. The generated wrapper carries the three load-bearing linker flags.
     write_m32_wrappers "$tmp/sr" /usr/bin/true /usr/bin/true
     local wrapper
@@ -633,7 +736,10 @@ EOF
     # flag names rather than an incidental quoting detail.
     [[ $(sed -n '4p' "$tmp/sr/bin/m32-cc") == exec\ /* ]] \
         || { rm -rf "$tmp"; die "self-test failed: wrapper does not exec an absolute driver path"; }
-    for needle in '-m32' '--sysroot=' '--dynamic-linker=' 'rpath'; do
+    # --disable-new-dtags is load-bearing: without it the tag is RUNPATH and
+    # libstdc++'s transitive libm.so.6 is not found at startup.
+    for needle in '-m32' '--sysroot=' '--dynamic-linker=' 'rpath' '/usr/lib/gcc/' \
+        '--disable-new-dtags'; do
         [[ $wrapper == *"$needle"* ]] \
             || { rm -rf "$tmp"; die "self-test failed: wrapper lost $needle"; }
     done

@@ -301,6 +301,7 @@ fn early_portable_ladder_recognition_preserves_exact_masks() {
             label: BlockId(0),
             instructions: code,
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
             terminator: Terminator::Return(Some(v(next + 2))),
         }];
         assert_eq!(

@@ -781,25 +781,18 @@ fn first_non_phi(block: &BasicBlock) -> usize {
 }
 
 fn insert_inst(block: &mut BasicBlock, idx: usize, inst: Instruction) {
-    let n_inst = block.instructions.len();
-    let n_span = block.source_spans.len();
-    let idx = idx.min(n_inst);
-    block.instructions.insert(idx, inst);
-    if n_span == n_inst && n_span > 0 {
-        let span = block.source_spans[idx.min(n_span - 1)].clone();
-        block.source_spans.insert(idx.min(n_span), span);
-    }
+    let idx = idx.min(block.instructions.len());
+    let span = if block.spans_parallel() {
+        block.source_spans[idx.min(block.instructions.len().saturating_sub(1))]
+    } else {
+        crate::common::source::Span::dummy()
+    };
+    block.insert_inst(idx, inst, span);
 }
 
 fn remove_inst(block: &mut BasicBlock, idx: usize) {
-    if idx >= block.instructions.len() {
-        return;
-    }
-    let n_span = block.source_spans.len();
-    let n_inst = block.instructions.len();
-    block.instructions.remove(idx);
-    if n_span == n_inst && idx < n_span {
-        block.source_spans.remove(idx);
+    if idx < block.instructions.len() {
+        block.remove_inst(idx);
     }
 }
 
@@ -1286,6 +1279,7 @@ mod tests {
             instructions: insts,
             terminator: term,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 

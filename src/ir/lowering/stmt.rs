@@ -794,6 +794,7 @@ impl Lowerer {
             && !da.is_array_of_func_ptrs)
             || (decl.is_pointer_const() && da.is_pointer);
 
+        let section = self.object_placement_section(declarator, &init);
         self.emitted_global_names.insert(static_name.clone());
         self.module.globals.push(IrGlobal {
             name: static_name.clone(),
@@ -804,7 +805,7 @@ impl Lowerer {
             is_static: true,
             is_extern: false,
             is_common: false,
-            section: declarator.attrs.section.clone(),
+            section,
             is_weak: false,
             visibility: None,
             has_explicit_align,

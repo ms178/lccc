@@ -228,6 +228,7 @@ mod tests {
             instructions: insts,
             terminator: Terminator::Return(Some(php(Value(3)))),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         func
     }

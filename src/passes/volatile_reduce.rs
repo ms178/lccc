@@ -401,22 +401,20 @@ fn rewrite(func: &mut IrFunction, c: Candidate) -> Option<()> {
         ty: c.acc_ty,
     })
     .to_vec();
-    // Empty input span vectors mean "unknown". Fill only those holes, never
-    // erase locations of untouched preheader instructions.
-    let preheader = &mut func.blocks[c.preheader];
-    preheader
-        .source_spans
-        .resize(preheader.instructions.len(), Span::dummy());
-    preheader.source_spans.push(c.spans.compare);
-    func.blocks[c.preheader]
-        .instructions
-        .push(Instruction::BinOp {
+    // The masked bound is materialized as part of the (possibly inlined)
+    // loop: one `push_inst` keeps the tracking state and inherits the
+    // preheader's inline instance. Resizing the debug arrays by hand instead
+    // would silently REPAIR a drifted block and hide its producer.
+    func.blocks[c.preheader].push_inst(
+        Instruction::BinOp {
             dest: bound,
             op: IrBinOp::And,
             lhs: c.limit,
             rhs: Operand::Const(IrConst::from_i64(-(LANES as i64), c.iv_ty)),
             ty: c.iv_ty,
-        });
+        },
+        c.spans.compare,
+    );
     func.blocks[c.preheader].terminator = Terminator::Branch(mh);
     for inst in &mut func.blocks[c.header].instructions {
         if let Instruction::Phi { dest, incoming, .. } = inst {
@@ -438,18 +436,21 @@ fn rewrite(func: &mut IrFunction, c: Candidate) -> Option<()> {
                 false_label: combine,
             },
             source_spans: h_spans,
+            source_inline_ids: Vec::new(),
         },
         BasicBlock {
             label: mb,
             instructions: b_insts,
             terminator: Terminator::Branch(mh),
             source_spans: b_spans,
+            source_inline_ids: Vec::new(),
         },
         BasicBlock {
             label: combine,
             instructions: combine_insts,
             terminator: Terminator::Branch(old_header),
             source_spans: vec![c.spans.reduction; LANES - 1],
+            source_inline_ids: Vec::new(),
         },
     ]);
     func.next_value_id = value_id;

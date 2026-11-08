@@ -303,39 +303,27 @@ fn retain_instructions(block: &mut BasicBlock, drop: &FxHashSet<usize>) {
     if drop.is_empty() {
         return;
     }
-    let synced = block.source_spans.len() == block.instructions.len();
     let mut idx = 0usize;
-    block.instructions.retain(|_| {
+    block.retain_insts(|_| {
         let keep = !drop.contains(&idx);
         idx += 1;
         keep
     });
-    if synced {
-        let mut idx = 0usize;
-        block.source_spans.retain(|_| {
-            let keep = !drop.contains(&idx);
-            idx += 1;
-            keep
-        });
-    } else if !block.source_spans.is_empty() {
-        block.source_spans.clear();
-    }
 }
 
 /// Insert `inst` at `idx` of `block`, keeping `source_spans` parallel.
 fn insert_instruction(block: &mut BasicBlock, idx: usize, inst: Instruction) {
-    if block.source_spans.len() == block.instructions.len() {
-        let span = block
-            .source_spans
-            .get(idx.saturating_sub(1))
-            .or_else(|| block.source_spans.get(idx))
-            .copied()
-            .unwrap_or_else(crate::common::source::Span::dummy);
-        block.source_spans.insert(idx, span);
-    } else if !block.source_spans.is_empty() {
+    if !block.source_spans.is_empty() && !block.spans_parallel() {
         block.source_spans.clear();
+        block.source_inline_ids.clear();
     }
-    block.instructions.insert(idx, inst);
+    let span = block
+        .source_spans
+        .get(idx.saturating_sub(1))
+        .or_else(|| block.source_spans.get(idx))
+        .copied()
+        .unwrap_or_else(crate::common::source::Span::dummy);
+    block.insert_inst(idx, inst, span);
 }
 
 /// Index just past the leading `Alloca`/`ParamRef`/`Phi` prefix of the
@@ -1210,6 +1198,7 @@ mod tests {
             instructions,
             terminator,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 

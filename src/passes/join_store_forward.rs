@@ -191,28 +191,24 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     let count = rewrites.len();
     for rewrite in rewrites {
         let block = &mut func.blocks[rewrite.block];
-        let keep_spans =
-            !block.source_spans.is_empty() && block.source_spans.len() == block.instructions.len();
-        let span = keep_spans.then(|| block.source_spans.remove(rewrite.load));
-        block.instructions.remove(rewrite.load);
+        let span = block.span_at(rewrite.load);
+        let inline_id = block.inline_id_at(rewrite.load);
+        block.remove_inst(rewrite.load);
         let phi_end = block
             .instructions
             .iter()
             .take_while(|inst| matches!(inst, Instruction::Phi { .. }))
             .count();
-        block.instructions.insert(
+        block.insert_inst_inline(
             phi_end,
             Instruction::Phi {
                 dest: rewrite.dest,
                 ty: IrType::Ptr,
                 incoming: rewrite.incoming,
             },
+            span,
+            inline_id,
         );
-        if let Some(span) = span {
-            block.source_spans.insert(phi_end, span);
-        } else {
-            block.source_spans.clear();
-        }
     }
     count
 }
@@ -229,6 +225,7 @@ mod tests {
             instructions,
             terminator,
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         }
     }
 

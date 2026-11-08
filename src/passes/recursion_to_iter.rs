@@ -279,6 +279,7 @@ pub(crate) fn recursion_to_iteration(func: &mut IrFunction) -> usize {
             false_label: preheader_label,
         },
         source_spans: Vec::new(),
+        source_inline_ids: Vec::new(),
     });
 
     // Base case: return n
@@ -287,6 +288,7 @@ pub(crate) fn recursion_to_iteration(func: &mut IrFunction) -> usize {
         instructions: Vec::new(),
         terminator: Terminator::Return(Some(Operand::Value(n_val))),
         source_spans: Vec::new(),
+        source_inline_ids: Vec::new(),
     });
 
     // Loop preheader: set initial values
@@ -295,6 +297,7 @@ pub(crate) fn recursion_to_iteration(func: &mut IrFunction) -> usize {
         instructions: Vec::new(),
         terminator: Terminator::Branch(header_label),
         source_spans: Vec::new(),
+        source_inline_ids: Vec::new(),
     });
 
     // Loop header: phi nodes + exit check
@@ -355,6 +358,7 @@ pub(crate) fn recursion_to_iteration(func: &mut IrFunction) -> usize {
             false_label: exit_label,
         },
         source_spans: Vec::new(),
+        source_inline_ids: Vec::new(),
     });
 
     // Loop body: t = a + b; i_next = i + 1
@@ -378,6 +382,7 @@ pub(crate) fn recursion_to_iteration(func: &mut IrFunction) -> usize {
         ],
         terminator: Terminator::Branch(header_label),
         source_spans: Vec::new(),
+        source_inline_ids: Vec::new(),
     });
 
     // Exit: return b
@@ -386,6 +391,7 @@ pub(crate) fn recursion_to_iteration(func: &mut IrFunction) -> usize {
         instructions: Vec::new(),
         terminator: Terminator::Return(Some(Operand::Value(loop_b))),
         source_spans: Vec::new(),
+        source_inline_ids: Vec::new(),
     });
 
     func.next_value_id = next_id;
@@ -574,6 +580,7 @@ mod tests {
                 false_label: BlockId(2),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // Block 1 (base case): return n
@@ -582,6 +589,7 @@ mod tests {
             instructions: Vec::new(),
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         // Block 2 (recursive):
@@ -684,6 +692,7 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(11)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         func
@@ -792,12 +801,14 @@ mod tests {
                 false_label: BlockId(2),
             },
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
             instructions: Vec::new(),
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I64(1)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         // Only one recursive call — should not match
         func.blocks.push(BasicBlock {
@@ -830,6 +841,7 @@ mod tests {
             }],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
 
         let transformed = recursion_to_iteration(&mut func);
@@ -895,6 +907,7 @@ mod tests {
             instructions: Vec::new(),
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         let transformed = recursion_to_iteration(&mut func);
         assert_eq!(

@@ -1451,6 +1451,7 @@ mod tests {
             instructions: Vec::new(),
             terminator: term,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 
@@ -1752,6 +1753,7 @@ mod chain_tests {
             instructions: Vec::new(),
             terminator: term,
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         }
     }
 

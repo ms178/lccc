@@ -3285,6 +3285,7 @@ impl Lowerer {
             label: self.func_mut().current_label,
             instructions: std::mem::take(&mut self.func_mut().instrs),
             source_spans: std::mem::take(&mut self.func_mut().instr_spans),
+            source_inline_ids: Vec::new(),
             terminator: term,
         };
         self.func_mut().blocks.push(block);
@@ -3570,6 +3571,7 @@ impl Lowerer {
                 label,
                 instructions: Vec::new(),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
                 terminator: Terminator::Return(ret_op.clone()),
             });
         }

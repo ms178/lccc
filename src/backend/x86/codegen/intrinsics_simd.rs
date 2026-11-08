@@ -861,6 +861,30 @@ impl X86Codegen {
                 self.emit_evex_load_512(dptr, args);
                 true
             }
+            Loadu256Raw => {
+                // Raw-pointer load: NO avx_load_arg heuristics.  Every one of
+                // those shortcuts interprets the operand as a vector VALUE
+                // (deferred store, register home, direct slot); applying them
+                // to an ADDRESS reads the pointer variable's 8-byte home as
+                // 32 bytes.  One VEX load + one exact-width store is both
+                // minimal and provably equivalent to an all-on EVEX load.
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                self.operand_to_reg(&args[0], "rax");
+                self.state.emit("    vmovdqu (%rax), %ymm0");
+                self.avx_store_dest(dptr);
+                true
+            }
+            Setzero512 => {
+                // One EVEX instruction zeroes all 64 bytes with NO memory
+                // operand, so an all-off masked load/store can be rewritten
+                // without introducing a fault the original did not have.
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                self.state.emit("    vpxorq %zmm0, %zmm0, %zmm0");
+                self.evex_store_dest(dptr);
+                true
+            }
             Storeu512 => {
                 self.emit_evex_store_512(dest_ptr, args);
                 true

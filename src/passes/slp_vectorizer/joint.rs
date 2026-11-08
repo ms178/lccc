@@ -615,6 +615,7 @@ mod tests {
                     instructions,
                     terminator: Terminator::Return(None),
                     source_spans: vec![],
+                    source_inline_ids: Vec::new(),
                 };
                 let ctx = BlockCtx {
                     block: &block,

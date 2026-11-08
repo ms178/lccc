@@ -265,6 +265,7 @@ mod strict_packed_dag_tests {
             instructions,
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         });
         f
     }
@@ -323,6 +324,7 @@ mod strict_packed_dag_tests {
                 .collect(),
             terminator: Terminator::Return(None),
             source_spans: vec![],
+            source_inline_ids: Vec::new(),
         }
     }
 

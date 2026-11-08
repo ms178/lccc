@@ -373,6 +373,10 @@ pub(crate) fn canonicalize_library_memcpy(module: &mut IrModule, max_len: i64) {
                         let span = block.source_spans[i - 1];
                         block.source_spans.insert(i, span);
                     }
+                    if !block.source_inline_ids.is_empty() {
+                        let id = block.source_inline_ids[i - 1];
+                        block.source_inline_ids.insert(i, id);
+                    }
                     i += 1;
                 }
             }
@@ -404,6 +408,7 @@ mod tests {
                     .collect(),
                 terminator: Terminator::Return(None),
                 source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
             });
         }
         f
@@ -796,6 +801,7 @@ mod library_memcpy_tests {
             instructions: insts,
             terminator: Terminator::Return(None),
             source_spans: spans,
+            source_inline_ids: Vec::new(),
         });
         let mut m = IrModule::new();
         m.functions = vec![f];
@@ -882,6 +888,7 @@ mod library_memcpy_tests {
             instructions: vec![],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
         });
         m.functions.push(def);
         apply(&mut m, &BuiltinFlags::default());

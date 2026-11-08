@@ -63,6 +63,7 @@ impl Graph {
             label: BlockId(0),
             instructions: self.insts,
             source_spans,
+            source_inline_ids: Vec::new(),
             terminator: Terminator::Return(Some(result)),
         });
         f.next_value_id = self.next;
