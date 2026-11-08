@@ -152,8 +152,34 @@ class Inventory(unittest.TestCase):
         output = io.StringIO()
         with redirect_stdout(output):
             self.assertEqual(summary.main([str(self.path)]), 0)
-        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertEqual(len(output.getvalue().splitlines()), 2)
         self.assertIn("%25", output.getvalue())
+
+    def test_failure_tails_distinguish_oracle_and_candidate(self):
+        self.rows[1].update(phase="lccc-compile", returncode=1, detail="a" * 500 + "\nerror: candidate")
+        self.rows[2].update(phase="reference-compile", returncode=124, detail="timeout")
+        self.write()
+        data = summary.validated_report(self.path)
+        payload = summary.failure_payload(data)
+        self.assertLessEqual(len(payload.encode()), 3800)
+        result = json.loads(payload)
+        self.assertEqual(result["failures_omitted"], 0)
+        self.assertEqual([row[0] for row in result["failures"]], ["bad.c", "oracle.c"])
+        self.assertTrue(result["failures"][0][-1])
+        self.assertIn("error: candidate", result["failures"][0][-2])
+        self.assertEqual(result["failures"][1][2:5], ["reference-fail", "reference-compile", 124])
+        self.assertFalse(result["failures"][1][-1])
+
+    def test_failure_annotation_signals_omitted_rows(self):
+        self.write()
+        data = summary.validated_report(self.path)
+        data["results"] = [{"test": f"case-{i}", "flags": "-O2", "status": "compile-fail",
+                            "detail": "x" * 500} for i in range(100)]
+        payload = summary.failure_payload(data)
+        result = json.loads(payload)
+        self.assertLessEqual(len(payload.encode()), 3800)
+        self.assertGreater(result["failures_omitted"], 0)
+        self.assertEqual(len(result["failures"]) + result["failures_omitted"], 100)
 
 
 class ScalingProbe(unittest.TestCase):
