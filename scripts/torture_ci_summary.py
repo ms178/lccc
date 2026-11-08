@@ -5,6 +5,8 @@ The original reports and failure logs remain the detailed artifacts. This
 summary separates candidate and oracle outcomes and is useful even when an
 artifact download is inaccessible. It is not a baseline or a regression gate.
 Incomplete, malformed and legacy reports cannot become completion claims.
+Long inventories explicitly count omitted annotation entries; the full report
+remains the artifact and must be consulted for the complete list.
 """
 from __future__ import annotations
 
@@ -41,6 +43,28 @@ def inventory(path: Path) -> dict:
     }
 
 
+def annotation_payload(result: dict) -> str:
+    """Bound check-run annotation size and report any omitted identities."""
+    nonpass = result["nonpass"]
+
+    def encode(count: int) -> str:
+        bounded = {**result, "nonpass": nonpass[:count],
+                   "nonpass_omitted": len(nonpass) - count}
+        return (json.dumps(bounded, separators=(",", ":"), ensure_ascii=True)
+                .replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
+
+    if len(encode(0).encode("utf-8")) > 3800:
+        raise ValueError("inventory annotation metadata exceeds safe limit")
+    low, high = 0, len(nonpass)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(encode(middle).encode("utf-8")) <= 3800:
+            low = middle
+        else:
+            high = middle - 1
+    return encode(low)
+
+
 def main(argv: list[str]) -> int:
     if not argv:
         print("usage: torture_ci_summary.py REPORT...", file=sys.stderr)
@@ -55,11 +79,12 @@ def main(argv: list[str]) -> int:
         except (OSError, ValueError, schema.SchemaError) as exc:
             print(f"Invalid report {path}: {exc}", file=sys.stderr)
             return 2
-        payload = json.dumps(result, separators=(",", ":"), ensure_ascii=True)
-        # Escape workflow-command metacharacters rather than letting a case
-        # name or future metadata inject another annotation or break a line.
-        escaped = payload.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-        print(f"::notice title=GCC torture inventory::{escaped}")
+        try:
+            payload = annotation_payload(result)
+        except ValueError as exc:
+            print(f"Cannot publish inventory {path}: {exc}", file=sys.stderr)
+            return 2
+        print(f"::notice title=GCC torture inventory::{payload}")
     return 0
 
 

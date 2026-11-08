@@ -37,6 +37,33 @@ def digest(path: Path) -> str:
     return h.hexdigest()
 
 
+def annotation_payload(output: dict) -> str:
+    """Keep the GitHub annotation below the check-run message limit.
+
+    Full commands and per-object identities remain in the JSON artifact. If a
+    custom campaign has too many samples for one annotation, say exactly how
+    many were omitted rather than publishing a truncated JSON string.
+    """
+    samples = [[r["shape"], r["n"], r["round"], r["compiler"], r["wall_s"], r["sema_s"]]
+               for r in output["results"]]
+    def encode(count: int) -> str:
+        summary = {"compiler_sha256": {k: v["sha256"] for k, v in output["compilers"].items()},
+                   "flags": output["flags"], "samples": samples[:count], "total_samples": len(samples),
+                   "omitted_samples": len(samples) - count, "full_report": "declaration-scaling.json"}
+        return json.dumps(summary, separators=(",", ":"), ensure_ascii=True).replace("%", "%25")
+
+    if len(encode(0).encode("utf-8")) > 3800:
+        raise ValueError("measurement annotation metadata exceeds safe limit")
+    low, high = 0, len(samples)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(encode(middle).encode("utf-8")) <= 3800:
+            low = middle
+        else:
+            high = middle - 1
+    return encode(low)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--lccc", type=Path, required=True)
@@ -103,8 +130,7 @@ def main() -> int:
                   "scope": "one hosted machine; no contention control; timings are not a performance guarantee"}
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
-        payload = json.dumps(output, separators=(",", ":"), ensure_ascii=True).replace("%", "%25")
-        print(f"::notice title=Declaration scaling measurement::{payload}")
+        print(f"::notice title=Declaration scaling measurement::{annotation_payload(output)}")
         return 0
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
         print(f"declaration scaling failed: {exc}", file=__import__("sys").stderr)

@@ -134,6 +134,16 @@ class Inventory(unittest.TestCase):
         with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
             self.assertEqual(summary.main([str(self.path)]), 2)
 
+    def test_oversized_inventory_is_valid_json_and_reports_omissions(self):
+        self.write()
+        result = summary.inventory(self.path)
+        result["nonpass"] = [[f"case-{i}.c", "-O2", "compile-fail"] for i in range(1000)]
+        payload = summary.annotation_payload(result)
+        parsed = json.loads(payload)
+        self.assertLessEqual(len(payload.encode()), 3800)
+        self.assertGreater(parsed["nonpass_omitted"], 0)
+        self.assertEqual(len(parsed["nonpass"]) + parsed["nonpass_omitted"], 1000)
+
     def test_annotation_escapes_workflow_metacharacters(self):
         self.rows[1]["test"] = "a%\n::warning::.c"
         self.report["case_set_sha256"] = case_set_digest(
@@ -178,7 +188,24 @@ class ScalingProbe(unittest.TestCase):
             self.assertTrue(all(r["returncode"] == 0 and len(r["input_sha256"]) == 64
                                 and len(r["object_sha256"]) == 64
                                 and r["command"][-2] == "-o" for r in report["results"]))
-            self.assertIn("::notice title=Declaration scaling measurement::", proc.stdout)
+            prefix = "::notice title=Declaration scaling measurement::"
+            self.assertTrue(proc.stdout.startswith(prefix))
+            notice = json.loads(proc.stdout[len(prefix):])
+            self.assertEqual(notice["total_samples"], 8)
+            self.assertEqual(notice["omitted_samples"], 0)
+            self.assertEqual(len(notice["samples"]), 8)
+
+    def test_large_measurement_annotation_remains_complete_json(self):
+        row = {"shape": "block", "n": 40000, "round": 0, "compiler": "lccc",
+               "wall_s": 1.0, "sema_s": 0.5}
+        output = {"compilers": {"lccc": {"sha256": "a" * 64}, "gcc": {"sha256": "b" * 64}},
+                  "flags": ["-O0"], "results": [row] * 1000}
+        payload = scaling.annotation_payload(output)
+        parsed = json.loads(payload)
+        self.assertLessEqual(len(payload.encode()), 3800)
+        self.assertGreater(parsed["omitted_samples"], 0)
+        self.assertEqual(parsed["total_samples"], 1000)
+        self.assertEqual(len(parsed["samples"]) + parsed["omitted_samples"], 1000)
 
     def test_failed_compiler_cannot_publish_a_measurement(self):
         with tempfile.TemporaryDirectory() as td:
