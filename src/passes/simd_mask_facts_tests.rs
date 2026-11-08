@@ -4503,8 +4503,9 @@ fn avx512_constant_compares_fold_to_exact_64_bit_scalar_masks() {
     );
     assert_eq!(mc_folded(&none), Some(0));
 
-    // Refusal: an ordering predicate has no lane-signedness proof even at
-    // 512 bits, and a 32-byte image cannot prove a 64-byte compare.
+    // Round 9: the opcode's signedness plus the exact byte image makes ALL
+    // eight predicates decidable at 512 bits.  They must fold to the value an
+    // independent native-integer oracle computes, not refuse.
     for pred in [1i32, 2, 3, 5, 6, 7] {
         let f = mc_function(
             IntrinsicOp::CmpEpi8Mask512,
@@ -4512,24 +4513,64 @@ fn avx512_constant_compares_fold_to_exact_64_bit_scalar_masks() {
             &a,
             &b,
         );
-        assert_eq!(mc_folded(&f), None, "predicate {pred} must refuse");
+        let mut want = 0u64;
+        for lane in 0..64 {
+            if predicate_oracle(
+                &a[lane..lane + 1],
+                &b[lane..lane + 1],
+                1,
+                pred as i64,
+                false,
+            ) {
+                want |= 1u64 << lane;
+            }
+        }
+        assert_eq!(mc_folded(&f), Some(want as i64), "512-bit predicate {pred}");
     }
+    // An INVALID predicate still refuses; the wider domain did not weaken it.
+    let bad = mc_function(
+        IntrinsicOp::CmpEpi8Mask512,
+        Operand::Const(IrConst::I32(-1)),
+        &a,
+        &b,
+    );
+    assert_eq!(mc_folded(&bad), None);
 }
 
 #[test]
 fn mask_compare_guards_are_fail_closed() {
     let a = vec![0x11u8; 16];
     let b = vec![0x22u8; 16];
-    // Signed/unsigned ordering predicates have no lane-signedness proof.
-    for pred in [1i32, 2, 3, 5, 6, 7, -1] {
+    // Round 9: signed/unsigned ordering predicates ARE now provable.  The
+    // guard that must remain is the INVALID predicate (-1), not the family.
+    for pred in [1i32, 2, 3, 5, 6, 7] {
         let f = mc_function(
             IntrinsicOp::CmpEpi8Mask128,
             Operand::Const(IrConst::I32(pred)),
             &a,
             &b,
         );
-        assert_eq!(mc_folded(&f), None, "predicate {pred} must refuse");
+        let mut want = 0u64;
+        for lane in 0..16 {
+            if predicate_oracle(
+                &a[lane..lane + 1],
+                &b[lane..lane + 1],
+                1,
+                pred as i64,
+                false,
+            ) {
+                want |= 1u64 << lane;
+            }
+        }
+        assert_eq!(mc_folded(&f), Some(want as i64), "predicate {pred}");
     }
+    let bad = mc_function(
+        IntrinsicOp::CmpEpi8Mask128,
+        Operand::Const(IrConst::I32(-1)),
+        &a,
+        &b,
+    );
+    assert_eq!(mc_folded(&bad), None, "an invalid predicate must refuse");
     // A runtime predicate is not a proof.
     let runtime_pred = mc_function(
         IntrinsicOp::CmpEpi8Mask128,
@@ -4864,21 +4905,42 @@ fn all_off_masked_stores_are_erased_span_safely() {
         let insts = f.blocks[0].instructions.len();
         assert!(spans == 0 || spans == insts, "span drift after erasure");
     }
-    // All-on, mixed, runtime masks and the value-form are NOT erasable.
-    for mask in [
-        Operand::Const(IrConst::I64(-1)),
-        Operand::Const(IrConst::I64(1)),
-        Operand::Value(Value(999)),
+    // All-on, mixed and runtime masks are NOT erasable.  An all-on store is
+    // now REWRITTEN to the exact unmasked store intrinsic (it still performs
+    // the write), while a mixed/runtime mask keeps the masked instruction.
+    // Assert on the WRITE, not on one opcode spelling: pinning the masked
+    // opcode here would forbid the measured all-on optimization.
+    for (mask, expect_unmasked) in [
+        (Operand::Const(IrConst::I64(-1)), true),
+        (Operand::Const(IrConst::I64(1)), false),
+        (Operand::Value(Value(999)), false),
     ] {
         let mut f = mask_store_function(IntrinsicOp::MaskStoreuEpi8_128, mask);
         run_function(&mut f);
-        assert!(
-            f.blocks[0]
-                .instructions
-                .iter()
-                .any(|i| matches!(i, Instruction::Intrinsic { op, .. } if *op == IntrinsicOp::MaskStoreuEpi8_128)),
-            "non-all-off store must survive"
-        );
+        let stores: Vec<_> = f.blocks[0]
+            .instructions
+            .iter()
+            .filter(|i| {
+                matches!(i, Instruction::Intrinsic { op, dest_ptr: Some(_), .. }
+                if matches!(*op, IntrinsicOp::MaskStoreuEpi8_128 | IntrinsicOp::Storedqu))
+            })
+            .collect();
+        assert_eq!(stores.len(), 1, "exactly one store must survive");
+        match stores[0] {
+            Instruction::Intrinsic {
+                op: IntrinsicOp::Storedqu,
+                ..
+            } => {
+                assert!(expect_unmasked, "only an all-on store may drop its mask");
+            }
+            Instruction::Intrinsic {
+                op: IntrinsicOp::MaskStoreuEpi8_128,
+                ..
+            } => {
+                assert!(!expect_unmasked, "an all-on store must be rewritten");
+            }
+            other => panic!("unexpected store instruction: {other:?}"),
+        }
     }
     // A wrong-arity or dest-form intrinsic is not the canonical PtrStore.
     let mut wrong = mask_store_function(
@@ -6143,5 +6205,599 @@ fn average_shape_table_is_byte_local_only() {
         IntrinsicOp::Pmaddubsw128,
     ] {
         assert_eq!(byte_logic_shape(op), None, "{op:?} must not be byte-local");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Round 9: all-on masked stores to ANY destination pointer.
+//
+// The merged decision procedure resolved `dest_ptr` to an `Alloca` BEFORE any
+// rewrite.  A masked STORE's `dest_ptr` is the USER'S address (a global, a
+// heap pointer, a parameter), so every all-on store to a non-stack object was
+// refused: ON/OFF assembly byte-identical, `kmovq` + `{k1}` left in the hot
+// path.  These tests pin the fix and, crucially, pin that a PARTIAL mask can
+// NEVER fall back to the full-width unmasked store (that would corrupt the
+// inactive lanes).
+// ---------------------------------------------------------------------------
+
+fn unresolvable_store(op: IntrinsicOp, mask: Operand) -> IrFunction {
+    // `Value(777)` has NO definition: it stands for an external/global/heap
+    // pointer.  `args[1]` is a constant so `memcpy_from` cannot fire either;
+    // only the register-based unmasked store rewrite is admissible.
+    let insts = vec![
+        alloca(Value(MC_A), 16, false, false),
+        intrinsic(
+            None,
+            op,
+            Some(Value(777)),
+            vec![mask, Operand::Const(IrConst::I64(7))],
+        ),
+    ];
+    let mut f = IrFunction::new("extstore".into(), IrType::I32, vec![], false);
+    f.blocks.push(block(
+        insts,
+        Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+        true,
+    ));
+    f.next_value_id = 1000;
+    f
+}
+
+#[test]
+fn all_on_masked_store_folds_for_every_unresolvable_destination() {
+    for (op, want, exact_mask) in [
+        (
+            IntrinsicOp::MaskStoreuEpi8_128,
+            IntrinsicOp::Storedqu,
+            0xFFFFu64,
+        ),
+        (
+            IntrinsicOp::MaskStoreuEpi8_256,
+            IntrinsicOp::Storeu256,
+            0xFFFF_FFFF,
+        ),
+        (
+            IntrinsicOp::MaskStoreuEpi8_512,
+            IntrinsicOp::Storeu512,
+            u64::MAX,
+        ),
+    ] {
+        // `scalar_mask` truncates to the op's exact lane count: 0xFFFF is
+        // AllOn for 16 lanes but only a true PREFIX for 32/64 lanes, where it
+        // must NOT produce a full-width store.  Pin that distinction here.
+        for mask in [
+            Operand::Const(IrConst::I64(-1)),
+            Operand::Const(IrConst::I64(exact_mask as i64)),
+            Operand::Const(IrConst::I64(u64::MAX as i64)),
+        ] {
+            let f = unresolvable_store(op, mask);
+            let facts = Facts::new(&f);
+            let replacement = fold(&facts, &f.blocks[0].instructions[1], 0, 1)
+                .unwrap_or_else(|| panic!("{op:?} all-on store must fold for mask {mask:?}"));
+            match replacement {
+                Instruction::Intrinsic {
+                    op: got,
+                    dest: None,
+                    dest_ptr: Some(dp),
+                    args,
+                } => {
+                    assert_eq!(got, want, "{op:?} must use the exact unmasked store");
+                    assert_eq!(
+                        dp,
+                        Value(777),
+                        "the user's address must be preserved verbatim"
+                    );
+                    assert_eq!(args, vec![Operand::Const(IrConst::I64(7))]);
+                }
+                other => panic!("{op:?} produced {other:?}"),
+            }
+        }
+        // 0xFFFF is AllOn only at 128 bits.  At 32/64 lanes it is a TRUE
+        // PREFIX: the rewrite must refuse rather than write the full width.
+        if exact_mask != 0xFFFF {
+            let f = unresolvable_store(op, Operand::Const(IrConst::I64(0xFFFF)));
+            let facts = Facts::new(&f);
+            assert!(
+                fold(&facts, &f.blocks[0].instructions[1], 0, 1).is_none(),
+                "{op:?} must not widen a 16-lane prefix mask"
+            );
+        }
+    }
+}
+
+#[test]
+fn partial_mask_never_falls_back_to_a_full_width_store() {
+    // Exhaustive over the WHOLE 16-bit mask domain.  A partial (true-prefix)
+    // mask may produce a narrower Memcpy of exactly n bytes, and nothing else
+    // may produce any write at all from the unresolvable-destination shape.
+    for bits in 0u64..=0xFFFF {
+        let f = unresolvable_store(
+            IntrinsicOp::MaskStoreuEpi8_128,
+            Operand::Const(IrConst::I64(bits as i64)),
+        );
+        let facts = Facts::new(&f);
+        let inst = &f.blocks[0].instructions[1];
+        let replacement = fold(&facts, inst, 0, 1);
+        let erasable = fold_removal(&facts, inst);
+        match replacement {
+            None => {
+                if bits == 0 {
+                    assert!(erasable, "all-off store must be erased by fold_removal");
+                }
+            }
+            Some(Instruction::Intrinsic {
+                op: IntrinsicOp::Storedqu,
+                ..
+            }) => assert_eq!(
+                bits, 0xFFFF,
+                "full-width store from a partial mask at {bits:#06x}"
+            ),
+            Some(Instruction::Memcpy { size, .. }) => {
+                assert!(size < 16, "a prefix copy must be strictly narrower");
+                assert_eq!(true_prefix_len(bits, 16, 0), Some(size));
+            }
+            Some(other) => panic!("unexpected rewrite at {bits:#06x}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn all_on_store_prefers_bounds_proven_copy_and_handles_overlap() {
+    // A resolvable stack DEST with a distinct, bounds-proven stack SOURCE keeps
+    // the old Memcpy rewrite (no regression in the proven path).
+    let two_objects = |dest: Value, src: Operand| -> IrFunction {
+        let insts = vec![
+            alloca(dest, 16, false, false),
+            alloca(Value(900), 16, false, false),
+            intrinsic(
+                None,
+                IntrinsicOp::MaskStoreuEpi8_128,
+                Some(dest),
+                vec![Operand::Const(IrConst::I64(-1)), src],
+            ),
+        ];
+        let mut f = IrFunction::new("twostore".into(), IrType::I32, vec![], false);
+        f.blocks.push(block(
+            insts,
+            Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            true,
+        ));
+        f.next_value_id = 1000;
+        f
+    };
+    let distinct = two_objects(Value(MC_A), Operand::Value(Value(900)));
+    let facts = Facts::new(&distinct);
+    match fold(&facts, &distinct.blocks[0].instructions[2], 0, 2) {
+        Some(Instruction::Memcpy { dest, src, size }) => {
+            assert_eq!(dest, Value(MC_A));
+            assert_eq!(src, Value(900));
+            assert_eq!(size, 16);
+        }
+        other => panic!("distinct bounds-proven homes must keep Memcpy, got {other:?}"),
+    }
+    // Self-overlap is UB for Memcpy but SOUND for a register store: the emitter
+    // loads the vector into a register BEFORE the store.  The old code refused
+    // the fold entirely; the new one must still perform the write.
+    let overlap = two_objects(Value(MC_A), Operand::Value(Value(MC_A)));
+    let facts = Facts::new(&overlap);
+    match fold(&facts, &overlap.blocks[0].instructions[2], 0, 2) {
+        Some(Instruction::Intrinsic {
+            op: IntrinsicOp::Storedqu,
+            dest_ptr: Some(dp),
+            args,
+            ..
+        }) => {
+            assert_eq!(dp, Value(MC_A));
+            assert_eq!(args, vec![Operand::Value(Value(MC_A))]);
+        }
+        other => panic!("overlapping homes must use the register store, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Round 9: all eight AVX-512 `vpcmp` predicates, with exact lane signedness.
+//
+// The merged pass accepted ONLY predicates 0 (eq) and 4 (ne), on the stated
+// grounds that ordering predicates "need a lane signedness proof this module
+// deliberately does not invent".  That proof already exists in the OPCODE:
+// `vpcmpb/w/d/q` are signed, `vpcmpu*` are unsigned.  With `ByteImage` the
+// lane bytes are exact, so all eight predicates are decidable.  These tests
+// use an INDEPENDENT decoding oracle (Rust's native `iN::from_le_bytes`) so
+// they cannot pass by sharing a bug with `lane_as_i128`.
+// ---------------------------------------------------------------------------
+
+/// Independent oracle: decode with Rust's native little-endian signed/unsigned
+/// integer types, NOT with `lane_as_i128`'s manual sign extension.
+fn predicate_oracle(x: &[u8], y: &[u8], lane_bytes: usize, pred: i64, unsigned: bool) -> bool {
+    let decode = |lane: &[u8]| -> i128 {
+        match (lane_bytes, unsigned) {
+            (1, false) => i8::from_le_bytes([lane[0]]) as i128,
+            (1, true) => u8::from_le_bytes([lane[0]]) as i128,
+            (2, false) => i16::from_le_bytes([lane[0], lane[1]]) as i128,
+            (2, true) => u16::from_le_bytes([lane[0], lane[1]]) as i128,
+            (4, false) => i32::from_le_bytes([lane[0], lane[1], lane[2], lane[3]]) as i128,
+            (4, true) => u32::from_le_bytes([lane[0], lane[1], lane[2], lane[3]]) as i128,
+            (8, false) => i64::from_le_bytes(lane[..8].try_into().unwrap()) as i128,
+            (8, true) => u64::from_le_bytes(lane[..8].try_into().unwrap()) as i128,
+            _ => unreachable!("unsupported lane width in the oracle"),
+        }
+    };
+    let a = decode(x);
+    let b = decode(y);
+    match pred {
+        0 => a == b,
+        1 => a < b,
+        2 => a <= b,
+        3 => false,
+        4 => a != b,
+        5 => a >= b,
+        6 => a > b,
+        7 => true,
+        _ => panic!("oracle called with an invalid predicate"),
+    }
+}
+
+#[test]
+fn lane_as_i128_matches_native_integer_decoding() {
+    for lane_bytes in [1usize, 2, 4, 8] {
+        for pattern in [0x00u8, 0x01, 0x7F, 0x80, 0x81, 0xFE, 0xFF] {
+            let lane = vec![pattern; lane_bytes];
+            for unsigned in [false, true] {
+                let got = lane_as_i128(&lane, unsigned).expect("lane width is supported");
+                // The oracle decodes through Rust's native integer types.
+                let want = match (lane_bytes, unsigned) {
+                    (1, false) => i8::from_le_bytes([pattern]) as i128,
+                    (1, true) => u8::from_le_bytes([pattern]) as i128,
+                    (2, false) => i16::from_le_bytes([pattern; 2]) as i128,
+                    (2, true) => u16::from_le_bytes([pattern; 2]) as i128,
+                    (4, false) => i32::from_le_bytes([pattern; 4]) as i128,
+                    (4, true) => u32::from_le_bytes([pattern; 4]) as i128,
+                    (8, false) => i64::from_le_bytes([pattern; 8]) as i128,
+                    (8, true) => u64::from_le_bytes([pattern; 8]) as i128,
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    got, want,
+                    "lane_bytes={lane_bytes} pattern={pattern:#04x} unsigned={unsigned}"
+                );
+            }
+        }
+    }
+    assert_eq!(lane_as_i128(&[], false), None);
+    assert_eq!(lane_as_i128(&[0u8; 9], false), None);
+    assert_eq!(compare_predicate(8, false, &[0], &[0]), None);
+    assert_eq!(compare_predicate(-1, true, &[0], &[0]), None);
+}
+
+#[test]
+fn mask_compare_shape_signedness_is_exact_for_every_opcode() {
+    use IntrinsicOp as O;
+    for (op, want) in [
+        (O::CmpeqEpu8Mask128, true),
+        (O::CmpEpu8Mask128, true),
+        (O::CmpeqEpu8Mask256, true),
+        (O::CmpEpu8Mask256, true),
+        (O::CmpeqEpu8Mask512, true),
+        (O::CmpEpu8Mask512, true),
+        (O::CmpeqEpu16Mask512, true),
+        (O::CmpEpu16Mask512, true),
+        (O::CmpeqEpu32Mask512, true),
+        (O::CmpEpu32Mask512, true),
+        (O::CmpeqEpu64Mask512, true),
+        (O::CmpEpu64Mask512, true),
+        (O::CmpEpu16Mask128, true),
+        (O::CmpEpu16Mask256, true),
+        (O::CmpEpu32Mask128, true),
+        (O::CmpEpu32Mask256, true),
+        (O::CmpEpu64Mask128, true),
+        (O::CmpEpu64Mask256, true),
+        (O::CmpEpi8Mask128, false),
+        (O::CmpEpi8Mask256, false),
+        (O::CmpEpi8Mask512, false),
+        (O::CmpEpi16Mask128, false),
+        (O::CmpEpi16Mask256, false),
+        (O::CmpEpi16Mask512, false),
+        (O::CmpEpi32Mask128, false),
+        (O::CmpEpi32Mask256, false),
+        (O::CmpEpi32Mask512, false),
+        (O::CmpEpi64Mask128, false),
+        (O::CmpEpi64Mask256, false),
+        (O::CmpEpi64Mask512, false),
+    ] {
+        let (_, _, _, got) =
+            mask_compare_shape(op).unwrap_or_else(|| panic!("{op:?} has no shape"));
+        assert_eq!(got, want, "{op:?} signedness");
+    }
+    // An opcode outside the family must not acquire a shape by accident.
+    assert_eq!(mask_compare_shape(O::Pcmpeqb128), None);
+}
+
+#[test]
+fn all_eight_predicates_fold_with_exact_signedness_over_all_widths() {
+    use IntrinsicOp as O;
+    // Every lane width at both low widths and at 512 bits, signed and
+    // unsigned. 24 opcodes x 8 predicates = 192 independent proofs.
+    let ops: [O; 24] = [
+        O::CmpeqEpu8Mask128,
+        O::CmpEpi8Mask128,
+        O::CmpeqEpu8Mask256,
+        O::CmpEpi8Mask256,
+        O::CmpeqEpu8Mask512,
+        O::CmpEpi8Mask512,
+        O::CmpEpu16Mask128,
+        O::CmpEpi16Mask128,
+        O::CmpEpu16Mask256,
+        O::CmpEpi16Mask256,
+        O::CmpeqEpu16Mask512,
+        O::CmpEpi16Mask512,
+        O::CmpEpu32Mask128,
+        O::CmpEpi32Mask128,
+        O::CmpEpu32Mask256,
+        O::CmpEpi32Mask256,
+        O::CmpeqEpu32Mask512,
+        O::CmpEpi32Mask512,
+        O::CmpEpu64Mask128,
+        O::CmpEpi64Mask128,
+        O::CmpEpu64Mask256,
+        O::CmpEpi64Mask256,
+        O::CmpeqEpu64Mask512,
+        O::CmpEpi64Mask512,
+    ];
+    for op in ops {
+        let (width, lane_bytes, lanes, unsigned) =
+            mask_compare_shape(op).unwrap_or_else(|| panic!("{op:?} has no shape"));
+        // Mixed image: lane i is a deterministic byte pattern. `b` differs
+        // from `a` in the LAST byte of selected lanes, including values with
+        // the sign bit set, so signed and unsigned ordering DISAGREE.
+        let a: Vec<u8> = (0..width)
+            .map(|i| ((i as u32 * 53 + 7) & 0xFF) as u8)
+            .collect();
+        let mut b = a.clone();
+        for lane in 0..lanes as usize {
+            if lane % 3 != 0 {
+                let at = lane * lane_bytes + lane_bytes - 1;
+                b[at] = (a[at] ^ 0x91) | 0x80; // sign bit set, unequal
+            }
+        }
+        for pred in 0i32..8 {
+            let f = mc_function(op, Operand::Const(IrConst::I32(pred)), &a, &b);
+            let mut want = 0u64;
+            for lane in 0..lanes as usize {
+                let x = &a[lane * lane_bytes..(lane + 1) * lane_bytes];
+                let y = &b[lane * lane_bytes..(lane + 1) * lane_bytes];
+                if predicate_oracle(x, y, lane_bytes, pred as i64, unsigned) {
+                    want |= 1u64 << lane;
+                }
+            }
+            assert_eq!(
+                mc_folded(&f),
+                Some(want as i64),
+                "{op:?} pred={pred} width={width} lane_bytes={lane_bytes} unsigned={unsigned}"
+            );
+        }
+        // Out-of-range and non-integer predicates must REFUSE, never guess.
+        for bad in [
+            Operand::Const(IrConst::I32(8)),
+            Operand::Const(IrConst::I32(-1)),
+            Operand::Const(IrConst::I64(1i64 << 40)),
+            Operand::Const(IrConst::I128(1i128 << 100)),
+            Operand::Const(IrConst::F64(0.0)),
+            Operand::Value(Value(9999)),
+        ] {
+            let f = mc_function(op, bad, &a, &b);
+            assert_eq!(mc_folded(&f), None, "{op:?} must refuse predicate {bad:?}");
+        }
+    }
+}
+
+/// Two WHOLE-VECTOR loads from unwritten objects: pure SSA runtime values
+/// with NO provable byte image.  `impure` replaces operand B with an undefined
+/// external value, which `operand_is_pure` must refuse.
+fn mc_runtime_function(cmp: IntrinsicOp, pred: i32, impure: bool) -> IrFunction {
+    let load = |object: u32, dest: u32| {
+        vec![
+            alloca(Value(object), 16, false, false),
+            intrinsic(
+                Some(Value(dest)),
+                IntrinsicOp::VecLoadI8x16,
+                None,
+                vec![
+                    Operand::Value(Value(object)),
+                    Operand::Const(IrConst::I64(0)),
+                ],
+            ),
+        ]
+    };
+    let mut insts = load(10, 11);
+    insts.extend(load(20, 21));
+    let b = if impure {
+        Operand::Value(Value(9999)) // external / unresolved: no purity proof
+    } else {
+        Operand::Value(Value(21))
+    };
+    insts.push(intrinsic(
+        Some(Value(MC_RESULT)),
+        cmp,
+        None,
+        vec![
+            Operand::Value(Value(11)),
+            b,
+            Operand::Const(IrConst::I32(pred)),
+        ],
+    ));
+    let mut f = IrFunction::new("mcmp_rt".into(), IrType::I32, vec![], false);
+    f.blocks.push(block(
+        insts,
+        Terminator::Return(Some(Operand::Value(Value(MC_RESULT)))),
+        true,
+    ));
+    f.next_value_id = 1000;
+    f
+}
+
+#[test]
+fn operand_independent_predicates_fold_runtime_vectors_with_a_purity_proof() {
+    use IntrinsicOp as O;
+    // 16 / 32 / 64 lanes: `full` must be the EXACT mask width, never a
+    // blanket 0xFFFF (a bug that would silently under-mask a 512-bit op).
+    for (op, lanes) in [
+        (O::CmpEpi8Mask128, 16u32),
+        (O::CmpEpu8Mask256, 32),
+        (O::CmpeqEpu8Mask512, 64),
+    ] {
+        let full = lane_mask(lanes);
+        for (pred, want) in [(3i32, 0u64), (7, full)] {
+            let f = mc_runtime_function(op, pred, false);
+            assert_eq!(
+                mc_folded(&f),
+                Some(want as i64),
+                "{op:?} pred={pred} must fold runtime vectors to {want:#x}"
+            );
+        }
+        // Without a purity proof for BOTH operands, no byte image exists and
+        // the fold must REFUSE rather than drop a possibly-volatile load.
+        for pred in [3i32, 7] {
+            let f = mc_runtime_function(op, pred, true);
+            assert_eq!(
+                mc_folded(&f),
+                None,
+                "{op:?} pred={pred} must refuse an impure operand"
+            );
+        }
+        // An out-of-range immediate never becomes a mask, even with pure
+        // runtime operands that would otherwise take the fast path.
+        for bad in [8i32, -1, 9] {
+            let f = mc_runtime_function(op, bad, false);
+            assert_eq!(mc_folded(&f), None, "{op:?} must refuse predicate {bad}");
+        }
+    }
+}
+
+/// One 64-byte `Alloca` written by a legacy write-through 512-bit GPR
+/// broadcast.  This is exactly what `LcccSimdClass::Vec512` lowering emits.
+fn splat512(object: Value, dest: Value, op: IntrinsicOp, scalar: IrConst) -> Vec<Instruction> {
+    vec![
+        alloca(object, 64, false, false),
+        intrinsic(Some(dest), op, Some(object), vec![Operand::Const(scalar)]),
+    ]
+}
+
+#[test]
+fn dest_ptr_splat_shape_512_is_exact_and_refuses_widened_lanes() {
+    use IntrinsicOp as O;
+    for (op, lane_width) in [
+        (O::SetEpi8_512, 1usize),
+        (O::SetEpi16_512, 2),
+        (O::SetEpi32_512, 4),
+        (O::SetEpi64x512, 8),
+    ] {
+        assert_eq!(dest_ptr_splat_shape(op), Some((64, lane_width)), "{op:?}");
+    }
+    assert_eq!(dest_ptr_splat_shape(O::Setzero512), None);
+    assert_eq!(dest_ptr_splat_shape(O::SetEpi8), Some((16, 1)));
+}
+
+#[test]
+fn constant_512_bit_broadcasts_fold_all_eight_predicates() {
+    use IntrinsicOp as O;
+    // One compare opcode per 512-bit lane width, both signed and unsigned.
+    let cases: [(O, O, usize, usize, bool); 4] = [
+        (O::SetEpi8_512, O::CmpeqEpu8Mask512, 1, 64, true),
+        (O::SetEpi16_512, O::CmpEpi16Mask512, 2, 32, false),
+        (O::SetEpi32_512, O::CmpeqEpu32Mask512, 4, 16, true),
+        (O::SetEpi64x512, O::CmpEpi64Mask512, 8, 8, false),
+    ];
+    for (splat, cmp, lane_bytes, lanes, unsigned) in cases {
+        // `a` and `b` are DIFFERENT allocas with DIFFERENT exact-width
+        // scalars, so no repeated-operand identity can hide a broken image.
+        let a_scalar = match lane_bytes {
+            1 => IrConst::I8(0x11),
+            2 => IrConst::I16(0x0011),
+            4 => IrConst::I32(0x00000011),
+            _ => IrConst::I64(0x0000000000000011),
+        };
+        let b_scalar = match lane_bytes {
+            1 => IrConst::I8(-0x6F_i8), // 0x91: sign bit set
+            2 => IrConst::I16(i16::from_le_bytes([0x91, 0x80])),
+            4 => IrConst::I32(i32::from_le_bytes([0x11, 0x00, 0x91, 0x80])),
+            _ => IrConst::I64(i64::from_le_bytes([
+                0x55, 0x44, 0x33, 0x22, 0x11, 0x00, 0x91, 0x80,
+            ])),
+        };
+        let bytes = |c: IrConst| -> Vec<u8> {
+            match c {
+                IrConst::I8(v) => vec![v as u8],
+                IrConst::I16(v) => v.to_le_bytes().to_vec(),
+                IrConst::I32(v) => v.to_le_bytes().to_vec(),
+                IrConst::I64(v) => v.to_le_bytes().to_vec(),
+                _ => unreachable!(),
+            }
+        };
+        let x = bytes(a_scalar);
+        let y = bytes(b_scalar);
+        for pred in 0i32..8 {
+            let mut insts = splat512(Value(10), Value(11), splat, a_scalar);
+            insts.extend(splat512(Value(20), Value(21), splat, b_scalar));
+            insts.push(intrinsic(
+                Some(Value(MC_RESULT)),
+                cmp,
+                None,
+                vec![
+                    Operand::Value(Value(10)),
+                    Operand::Value(Value(20)),
+                    Operand::Const(IrConst::I32(pred)),
+                ],
+            ));
+            let mut f = IrFunction::new("mcmp512".into(), IrType::I32, vec![], false);
+            f.blocks.push(block(
+                insts,
+                Terminator::Return(Some(Operand::Value(Value(MC_RESULT)))),
+                true,
+            ));
+            f.next_value_id = 1000;
+            let mut want = 0u64;
+            for lane in 0..lanes {
+                if predicate_oracle(&x, &y, lane_bytes, pred as i64, unsigned) {
+                    want |= 1u64 << lane;
+                }
+            }
+            assert_eq!(
+                mc_folded(&f),
+                Some(want as i64),
+                "{cmp:?} pred={pred} 64-byte splat must fold to {want:#x}"
+            );
+        }
+        // A WIDENED scalar is not an exact 64-byte image: the pass must
+        // refuse rather than guess how the backend would truncate it.  A
+        // qword lane needs an I128 to be genuinely wider than 8 bytes.
+        let widened = if lane_bytes == 8 {
+            IrConst::I128(1)
+        } else {
+            IrConst::I64(0x1122334455667788)
+        };
+        let mut insts = splat512(Value(10), Value(11), splat, a_scalar);
+        insts.extend(splat512(Value(20), Value(21), splat, widened));
+        insts.push(intrinsic(
+            Some(Value(MC_RESULT)),
+            cmp,
+            None,
+            vec![
+                Operand::Value(Value(10)),
+                Operand::Value(Value(20)),
+                Operand::Const(IrConst::I32(0)),
+            ],
+        ));
+        let mut f = IrFunction::new("mcmp512bad".into(), IrType::I32, vec![], false);
+        f.blocks.push(block(
+            insts,
+            Terminator::Return(Some(Operand::Value(Value(MC_RESULT)))),
+            true,
+        ));
+        f.next_value_id = 1000;
+        assert_eq!(
+            mc_folded(&f),
+            None,
+            "{cmp:?} must refuse a widened splat scalar"
+        );
     }
 }

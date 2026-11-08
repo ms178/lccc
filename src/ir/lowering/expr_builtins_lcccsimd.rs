@@ -27,6 +27,22 @@ pub(super) enum LcccSimdClass {
 }
 
 /// mnemonic -> (class, IntrinsicOp)
+/// Is this operand an EXACT compile-time integer immediate?
+///
+/// `operand_to_imm_i64` in the x86 backend has a catch-all arm that returns
+/// `0` for floats, decimal containers, `I128` and any SSA `Operand::Value`.
+/// Accepting one of those as an immediate would silently emit `$0` instead of
+/// a diagnostic -- a wrong-code bug with no warning.  GCC 16.2 says "the last
+/// argument must be an 8-bit immediate" and Clang 23.1.5 says "must be a
+/// constant integer"; this predicate is the exact, target-independent gate.
+/// `I128` is admitted ONLY when it fits in `i64`; no truncation is implied.
+fn exact_immediate_operand(op: &Operand) -> bool {
+    match op {
+        Operand::Const(c) => c.to_i128().and_then(|v| i64::try_from(v).ok()).is_some(),
+        Operand::Value(_) => false,
+    }
+}
+
 pub(super) fn lccc_simd_lookup(
     mnemonic: &str,
 ) -> Option<(LcccSimdClass, IntrinsicOp, bool, usize)> {
@@ -210,6 +226,25 @@ pub(super) fn lccc_simd_lookup(
         "vpcmpb256" => s2(Scalar, CmpEpi8Mask256),
         "vpcmpub128" => s2(Scalar, CmpeqEpu8Mask128),
         "vpcmpb128" => s2(Scalar, CmpEpi8Mask128),
+        // AVX-512VL 128/256-bit word/dword/qword mask compares.  The IR ops,
+        // the x86 emitter and `simd_mask_facts::mask_compare_shape` already
+        // implemented every one of these; only the builtin dispatch was
+        // missing, so 26 GCC 16.2 public names were unreachable and their
+        // constant-image folds could never fire from C.  The `cmpeq_*` and
+        // `cmp_*` public spellings share ONE mnemonic: the predicate reaches
+        // the emitter as `args[2]` through the leading `long` immediate.
+        "vpcmpuw256" => s2(Scalar, CmpEpu16Mask256),
+        "vpcmpw256" => s2(Scalar, CmpEpi16Mask256),
+        "vpcmpud256" => s2(Scalar, CmpEpu32Mask256),
+        "vpcmpd256" => s2(Scalar, CmpEpi32Mask256),
+        "vpcmpuq256" => s2(Scalar, CmpEpu64Mask256),
+        "vpcmpq256" => s2(Scalar, CmpEpi64Mask256),
+        "vpcmpuw128" => s2(Scalar, CmpEpu16Mask128),
+        "vpcmpw128" => s2(Scalar, CmpEpi16Mask128),
+        "vpcmpud128" => s2(Scalar, CmpEpu32Mask128),
+        "vpcmpd128" => s2(Scalar, CmpEpi32Mask128),
+        "vpcmpuq128" => s2(Scalar, CmpEpu64Mask128),
+        "vpcmpq128" => s2(Scalar, CmpEpi64Mask128),
         // ---- masked loads/stores ----
         "vmovdqu8_maskz_load512" => m2(Vec512, MaskzLoaduEpi8_512),
         "vmovdqu8_maskz_load256" => m2(Vec256, MaskzLoaduEpi8_256),
@@ -489,10 +524,21 @@ fn simd_feature_requirements(mnemonic: &str) -> Vec<SimdFeatureRequirement> {
     let is_512 = mnemonic.ends_with("512") || mnemonic.ends_with("_512");
     let mut req = Vec::new();
 
+    // EVERY `vpcmp*128`/`vpcmp*256` helper in this family is an EVEX
+    // mask-compare encoding.  Before the AVX-512VL completion only the byte
+    // forms existed here, and the evex predicate named just `vpcmpb`/`vpcmpub`;
+    // a newly added `vpcmpd128` would therefore have fallen through to
+    // `legacy_simd_feature`, which answers `F::Avx` for any `v*` mnemonic --
+    // emitting an AVX-512VL instruction on a plain AVX target.  Recognising
+    // the whole 128/256 family by width is the only fail-closed rule: the
+    // 512 forms are already covered by `is_512`, and no legacy (non-EVEX)
+    // `vpcmp*128/256` helper exists in `lccc_simd_lookup`.
+    let mask_cmp_low =
+        mnemonic.starts_with("vpcmp") && (mnemonic.ends_with("128") || mnemonic.ends_with("256"));
+
     let evex = is_512
+        || mask_cmp_low
         || mnemonic.starts_with("vpternlog")
-        || mnemonic.starts_with("vpcmpb")
-        || mnemonic.starts_with("vpcmpub")
         || mnemonic.starts_with("vmovdqu8_mask")
         || matches!(
             mnemonic,
@@ -590,10 +636,7 @@ fn simd_feature_requirements(mnemonic: &str) -> Vec<SimdFeatureRequirement> {
         push_feature(&mut req, F::Avx512Vnni, "-mavx512vnni");
     }
     if mnemonic.starts_with("vpternlog")
-        || mnemonic.starts_with("vpcmpb")
-        || mnemonic.starts_with("vpcmpub")
-        || mnemonic.starts_with("vpcmpw")
-        || mnemonic.starts_with("vpcmpuw")
+        || mnemonic.starts_with("vpcmp")
         || mnemonic.starts_with("vmovdqu8_mask")
         || matches!(mnemonic, "vpshufb_maskz128" | "vpshufb_mask128")
     {
@@ -789,6 +832,33 @@ impl Lowerer {
         if let Some(result) = self.try_native_packed_fp_helper(op, &args[1..]) {
             return Some(result);
         }
+        // A compile-time immediate is a HARD REQUIREMENT, not a preference.
+        // GCC 16.2 says "the last argument must be an 8-bit immediate" and
+        // Clang 23.1.5 says "argument ... must be a constant integer"; the
+        // x86 backend's `operand_to_imm_i64` silently returns 0 for an SSA
+        // `Operand::Value`, so a runtime `vpcmp` predicate used to compile to
+        // an EQ compare with NO diagnostic -- a silent miscompile.  Validate
+        // the immediate BEFORE evaluating any other operand, so a rejected
+        // call cannot leave half-lowered expressions behind.  Constant
+        // expressions and enum constants already lower to `Operand::Const`,
+        // so only genuinely runtime values are refused.
+        let imm_op = if has_imm {
+            let op = self.lower_expr(&args[0]);
+            // `Operand::Const` alone is not enough: a float, a decimal
+            // container or an out-of-i64-range I128 also reaches
+            // `operand_to_imm_i64`, whose catch-all arm would silently emit
+            // `$0`.  Require an EXACT integer immediate in the i64 domain.
+            if !exact_immediate_operand(&op) {
+                return self.reject_builtin_call(
+                    format!("the last argument to '{name}' must be a constant integer immediate"),
+                    args,
+                    width.max(16),
+                );
+            }
+            Some(op)
+        } else {
+            None
+        };
         // Drop the leading dummy/imm argument; keep exactly nargs real
         // operands; re-append the immediate (if any) as the LAST operand.
         let mut arg_ops: Vec<Operand> = args
@@ -798,10 +868,8 @@ impl Lowerer {
             .take(nargs)
             .map(|(index, arg)| self.lower_typed_x86_builtin_argument(name, arg, index))
             .collect();
-        if has_imm {
-            if let Some(imm_expr) = args.first() {
-                arg_ops.push(self.lower_expr(imm_expr));
-            }
+        if let Some(op) = imm_op {
+            arg_ops.push(op);
         }
         match class {
             LcccSimdClass::Vec128 | LcccSimdClass::Vec256 | LcccSimdClass::Vec512 => {
@@ -924,6 +992,16 @@ mod legacy_permission_tests {
         use crate::common::x86_features::X86Feature as F;
         let cases: &[(&str, &[F])] = &[
             ("vpcmpub128", &[F::Avx512F, F::Avx512Bw, F::Avx512Vl]),
+            // AVX-512VL completion: word forms need BW, dword/qword forms do
+            // NOT, and every 128/256 EVEX form needs VL. A regression that
+            // fell back to `legacy_simd_feature` would answer only `F::Avx`.
+            ("vpcmpuw128", &[F::Avx512F, F::Avx512Bw, F::Avx512Vl]),
+            ("vpcmpw256", &[F::Avx512F, F::Avx512Bw, F::Avx512Vl]),
+            ("vpcmpud128", &[F::Avx512F, F::Avx512Vl]),
+            ("vpcmpd256", &[F::Avx512F, F::Avx512Vl]),
+            ("vpcmpuq128", &[F::Avx512F, F::Avx512Vl]),
+            ("vpcmpq256", &[F::Avx512F, F::Avx512Vl]),
+            ("vpcmpud512", &[F::Avx512F]),
             ("vpternlogq256", &[F::Avx512F, F::Avx512Vl]),
             ("vpternlogd512", &[F::Avx512F]),
             (
@@ -1027,6 +1105,85 @@ mod portable_subset_tests {
             O::Storeldi128,
         ] {
             assert!(!portable_simd_op(op), "{op:?} must stay x86-only");
+        }
+    }
+}
+
+#[cfg(test)]
+mod immediate_diagnostic_tests {
+    use super::exact_immediate_operand;
+    use crate::ir::reexports::{IrConst as C, Operand, Value};
+
+    /// GCC 16.2 / Clang 23.1.5 hard-error on a runtime `vpcmp` predicate;
+    /// LCCC used to emit `$0` with no diagnostic.  The gate must accept every
+    /// EXACT integer immediate and refuse every value that the x86 backend's
+    /// `operand_to_imm_i64` would silently turn into zero.
+    #[test]
+    fn exact_immediate_operand_accepts_only_exact_integers() {
+        for c in [
+            C::I8(-1),
+            C::I8(7),
+            C::I16(-128),
+            C::I16(32767),
+            C::I32(i32::MIN),
+            C::I32(i32::MAX),
+            C::I64(i64::MIN),
+            C::I64(i64::MAX),
+            C::I128(i64::MIN as i128),
+            C::I128(i64::MAX as i128),
+            C::Zero,
+        ] {
+            assert!(
+                exact_immediate_operand(&Operand::Const(c)),
+                "{c:?} is an exact i64 immediate"
+            );
+        }
+        for c in [
+            C::I128(i128::from(i64::MAX) + 1),
+            C::I128(i128::from(i64::MIN) - 1),
+            C::F32(0.0),
+            C::F64(0.0),
+            C::D32(0),
+            C::D64(0),
+            C::LongDouble(0.0, [0u8; 16]),
+        ] {
+            assert!(
+                !exact_immediate_operand(&Operand::Const(c)),
+                "{c:?} must NOT become a silent $0"
+            );
+        }
+        assert!(!exact_immediate_operand(&Operand::Value(Value(0))));
+        assert!(!exact_immediate_operand(&Operand::Value(Value(u32::MAX))));
+    }
+
+    /// Every lookup row that declares `has_imm` must have its leading control
+    /// argument checked.  A row added later without the flag would bypass the
+    /// diagnostic; pin the mask-compare predicate family explicitly.
+    #[test]
+    fn mask_compare_predicates_are_declared_as_immediates() {
+        use super::lccc_simd_lookup;
+        for mnemonic in [
+            "vpcmpb128",
+            "vpcmpub256",
+            "vpcmpw128",
+            "vpcmpuw256",
+            "vpcmpd128",
+            "vpcmpud256",
+            "vpcmpq128",
+            "vpcmpuq256",
+            "vpcmpb512",
+            "vpcmpub512",
+            "vpcmpw512",
+            "vpcmpuw512",
+            "vpcmpd512",
+            "vpcmpud512",
+            "vpcmpq512",
+            "vpcmpuq512",
+        ] {
+            let (_, _, has_imm, nargs) = lccc_simd_lookup(mnemonic)
+                .unwrap_or_else(|| panic!("{mnemonic} must be in the dispatch table"));
+            assert!(has_imm, "{mnemonic} predicate must be a checked immediate");
+            assert_eq!(nargs, 2, "{mnemonic} takes exactly a and b");
         }
     }
 }
