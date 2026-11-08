@@ -4864,21 +4864,42 @@ fn all_off_masked_stores_are_erased_span_safely() {
         let insts = f.blocks[0].instructions.len();
         assert!(spans == 0 || spans == insts, "span drift after erasure");
     }
-    // All-on, mixed, runtime masks and the value-form are NOT erasable.
-    for mask in [
-        Operand::Const(IrConst::I64(-1)),
-        Operand::Const(IrConst::I64(1)),
-        Operand::Value(Value(999)),
+    // All-on, mixed and runtime masks are NOT erasable.  An all-on store is
+    // now REWRITTEN to the exact unmasked store intrinsic (it still performs
+    // the write), while a mixed/runtime mask keeps the masked instruction.
+    // Assert on the WRITE, not on one opcode spelling: pinning the masked
+    // opcode here would forbid the measured all-on optimization.
+    for (mask, expect_unmasked) in [
+        (Operand::Const(IrConst::I64(-1)), true),
+        (Operand::Const(IrConst::I64(1)), false),
+        (Operand::Value(Value(999)), false),
     ] {
         let mut f = mask_store_function(IntrinsicOp::MaskStoreuEpi8_128, mask);
         run_function(&mut f);
-        assert!(
-            f.blocks[0]
-                .instructions
-                .iter()
-                .any(|i| matches!(i, Instruction::Intrinsic { op, .. } if *op == IntrinsicOp::MaskStoreuEpi8_128)),
-            "non-all-off store must survive"
-        );
+        let stores: Vec<_> = f.blocks[0]
+            .instructions
+            .iter()
+            .filter(|i| {
+                matches!(i, Instruction::Intrinsic { op, dest_ptr: Some(_), .. }
+                if matches!(*op, IntrinsicOp::MaskStoreuEpi8_128 | IntrinsicOp::Storedqu))
+            })
+            .collect();
+        assert_eq!(stores.len(), 1, "exactly one store must survive");
+        match stores[0] {
+            Instruction::Intrinsic {
+                op: IntrinsicOp::Storedqu,
+                ..
+            } => {
+                assert!(expect_unmasked, "only an all-on store may drop its mask");
+            }
+            Instruction::Intrinsic {
+                op: IntrinsicOp::MaskStoreuEpi8_128,
+                ..
+            } => {
+                assert!(!expect_unmasked, "an all-on store must be rewritten");
+            }
+            other => panic!("unexpected store instruction: {other:?}"),
+        }
     }
     // A wrong-arity or dest-form intrinsic is not the canonical PtrStore.
     let mut wrong = mask_store_function(
@@ -6139,5 +6160,191 @@ fn average_shape_table_is_byte_local_only() {
         IntrinsicOp::Pmaddubsw128,
     ] {
         assert_eq!(byte_logic_shape(op), None, "{op:?} must not be byte-local");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Round 9: all-on masked stores to ANY destination pointer.
+//
+// The merged decision procedure resolved `dest_ptr` to an `Alloca` BEFORE any
+// rewrite.  A masked STORE's `dest_ptr` is the USER'S address (a global, a
+// heap pointer, a parameter), so every all-on store to a non-stack object was
+// refused: ON/OFF assembly byte-identical, `kmovq` + `{k1}` left in the hot
+// path.  These tests pin the fix and, crucially, pin that a PARTIAL mask can
+// NEVER fall back to the full-width unmasked store (that would corrupt the
+// inactive lanes).
+// ---------------------------------------------------------------------------
+
+fn unresolvable_store(op: IntrinsicOp, mask: Operand) -> IrFunction {
+    // `Value(777)` has NO definition: it stands for an external/global/heap
+    // pointer.  `args[1]` is a constant so `memcpy_from` cannot fire either;
+    // only the register-based unmasked store rewrite is admissible.
+    let insts = vec![
+        alloca(Value(MC_A), 16, false, false),
+        intrinsic(
+            None,
+            op,
+            Some(Value(777)),
+            vec![mask, Operand::Const(IrConst::I64(7))],
+        ),
+    ];
+    let mut f = IrFunction::new("extstore".into(), IrType::I32, vec![], false);
+    f.blocks.push(block(
+        insts,
+        Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+        true,
+    ));
+    f.next_value_id = 1000;
+    f
+}
+
+#[test]
+fn all_on_masked_store_folds_for_every_unresolvable_destination() {
+    for (op, want, exact_mask) in [
+        (
+            IntrinsicOp::MaskStoreuEpi8_128,
+            IntrinsicOp::Storedqu,
+            0xFFFFu64,
+        ),
+        (
+            IntrinsicOp::MaskStoreuEpi8_256,
+            IntrinsicOp::Storeu256,
+            0xFFFF_FFFF,
+        ),
+        (
+            IntrinsicOp::MaskStoreuEpi8_512,
+            IntrinsicOp::Storeu512,
+            u64::MAX,
+        ),
+    ] {
+        // `scalar_mask` truncates to the op's exact lane count: 0xFFFF is
+        // AllOn for 16 lanes but only a true PREFIX for 32/64 lanes, where it
+        // must NOT produce a full-width store.  Pin that distinction here.
+        for mask in [
+            Operand::Const(IrConst::I64(-1)),
+            Operand::Const(IrConst::I64(exact_mask as i64)),
+            Operand::Const(IrConst::I64(u64::MAX as i64)),
+        ] {
+            let f = unresolvable_store(op, mask);
+            let facts = Facts::new(&f);
+            let replacement = fold(&facts, &f.blocks[0].instructions[1], 0, 1)
+                .unwrap_or_else(|| panic!("{op:?} all-on store must fold for mask {mask:?}"));
+            match replacement {
+                Instruction::Intrinsic {
+                    op: got,
+                    dest: None,
+                    dest_ptr: Some(dp),
+                    args,
+                } => {
+                    assert_eq!(got, want, "{op:?} must use the exact unmasked store");
+                    assert_eq!(
+                        dp,
+                        Value(777),
+                        "the user's address must be preserved verbatim"
+                    );
+                    assert_eq!(args, vec![Operand::Const(IrConst::I64(7))]);
+                }
+                other => panic!("{op:?} produced {other:?}"),
+            }
+        }
+        // 0xFFFF is AllOn only at 128 bits.  At 32/64 lanes it is a TRUE
+        // PREFIX: the rewrite must refuse rather than write the full width.
+        if exact_mask != 0xFFFF {
+            let f = unresolvable_store(op, Operand::Const(IrConst::I64(0xFFFF)));
+            let facts = Facts::new(&f);
+            assert!(
+                fold(&facts, &f.blocks[0].instructions[1], 0, 1).is_none(),
+                "{op:?} must not widen a 16-lane prefix mask"
+            );
+        }
+    }
+}
+
+#[test]
+fn partial_mask_never_falls_back_to_a_full_width_store() {
+    // Exhaustive over the WHOLE 16-bit mask domain.  A partial (true-prefix)
+    // mask may produce a narrower Memcpy of exactly n bytes, and nothing else
+    // may produce any write at all from the unresolvable-destination shape.
+    for bits in 0u64..=0xFFFF {
+        let f = unresolvable_store(
+            IntrinsicOp::MaskStoreuEpi8_128,
+            Operand::Const(IrConst::I64(bits as i64)),
+        );
+        let facts = Facts::new(&f);
+        let inst = &f.blocks[0].instructions[1];
+        let replacement = fold(&facts, inst, 0, 1);
+        let erasable = fold_removal(&facts, inst);
+        match replacement {
+            None => {
+                if bits == 0 {
+                    assert!(erasable, "all-off store must be erased by fold_removal");
+                }
+            }
+            Some(Instruction::Intrinsic {
+                op: IntrinsicOp::Storedqu,
+                ..
+            }) => assert_eq!(
+                bits, 0xFFFF,
+                "full-width store from a partial mask at {bits:#06x}"
+            ),
+            Some(Instruction::Memcpy { size, .. }) => {
+                assert!(size < 16, "a prefix copy must be strictly narrower");
+                assert_eq!(true_prefix_len(bits, 16, 0), Some(size));
+            }
+            Some(other) => panic!("unexpected rewrite at {bits:#06x}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn all_on_store_prefers_bounds_proven_copy_and_handles_overlap() {
+    // A resolvable stack DEST with a distinct, bounds-proven stack SOURCE keeps
+    // the old Memcpy rewrite (no regression in the proven path).
+    let two_objects = |dest: Value, src: Operand| -> IrFunction {
+        let insts = vec![
+            alloca(dest, 16, false, false),
+            alloca(Value(900), 16, false, false),
+            intrinsic(
+                None,
+                IntrinsicOp::MaskStoreuEpi8_128,
+                Some(dest),
+                vec![Operand::Const(IrConst::I64(-1)), src],
+            ),
+        ];
+        let mut f = IrFunction::new("twostore".into(), IrType::I32, vec![], false);
+        f.blocks.push(block(
+            insts,
+            Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            true,
+        ));
+        f.next_value_id = 1000;
+        f
+    };
+    let distinct = two_objects(Value(MC_A), Operand::Value(Value(900)));
+    let facts = Facts::new(&distinct);
+    match fold(&facts, &distinct.blocks[0].instructions[2], 0, 2) {
+        Some(Instruction::Memcpy { dest, src, size }) => {
+            assert_eq!(dest, Value(MC_A));
+            assert_eq!(src, Value(900));
+            assert_eq!(size, 16);
+        }
+        other => panic!("distinct bounds-proven homes must keep Memcpy, got {other:?}"),
+    }
+    // Self-overlap is UB for Memcpy but SOUND for a register store: the emitter
+    // loads the vector into a register BEFORE the store.  The old code refused
+    // the fold entirely; the new one must still perform the write.
+    let overlap = two_objects(Value(MC_A), Operand::Value(Value(MC_A)));
+    let facts = Facts::new(&overlap);
+    match fold(&facts, &overlap.blocks[0].instructions[2], 0, 2) {
+        Some(Instruction::Intrinsic {
+            op: IntrinsicOp::Storedqu,
+            dest_ptr: Some(dp),
+            args,
+            ..
+        }) => {
+            assert_eq!(dp, Value(MC_A));
+            assert_eq!(args, vec![Operand::Value(Value(MC_A))]);
+        }
+        other => panic!("overlapping homes must use the register store, got {other:?}"),
     }
 }

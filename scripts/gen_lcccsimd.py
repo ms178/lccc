@@ -133,12 +133,45 @@ CMP_MASK = [
     ("cmp_epu64_mask", "vpcmpuq512", "__mmask8", True),
     ("cmpeq_epi64_mask", "vpcmpq512", "__mmask8", False),
     ("cmp_epi64_mask", "vpcmpq512", "__mmask8", True),
+    # 256-bit VL forms. GCC 16.2 and Clang 23.1.5 return exactly these mask
+    # widths (measured with `sizeof` on both compilers): byte 4, word 2,
+    # dword/qword 1.  The signed/unsigned EQ spellings share ONE mnemonic;
+    # the predicate arrives through the leading `long` immediate, so both
+    # `cmpeq_*` (no imm) and `cmp_*` (imm) rows are generated from it.
     ("cmpeq_epu8_mask", "vpcmpub256", "__mmask32", False),
     ("cmp_epu8_mask", "vpcmpub256", "__mmask32", True),
+    ("cmpeq_epi8_mask", "vpcmpb256", "__mmask32", False),
     ("cmp_epi8_mask", "vpcmpb256", "__mmask32", True),
+    ("cmpeq_epu16_mask", "vpcmpuw256", "__mmask16", False),
+    ("cmp_epu16_mask", "vpcmpuw256", "__mmask16", True),
+    ("cmpeq_epi16_mask", "vpcmpw256", "__mmask16", False),
+    ("cmp_epi16_mask", "vpcmpw256", "__mmask16", True),
+    ("cmpeq_epu32_mask", "vpcmpud256", "__mmask8", False),
+    ("cmp_epu32_mask", "vpcmpud256", "__mmask8", True),
+    ("cmpeq_epi32_mask", "vpcmpd256", "__mmask8", False),
+    ("cmp_epi32_mask", "vpcmpd256", "__mmask8", True),
+    ("cmpeq_epu64_mask", "vpcmpuq256", "__mmask8", False),
+    ("cmp_epu64_mask", "vpcmpuq256", "__mmask8", True),
+    ("cmpeq_epi64_mask", "vpcmpq256", "__mmask8", False),
+    ("cmp_epi64_mask", "vpcmpq256", "__mmask8", True),
+    # 128-bit VL forms. Same mnemonics with the 128 suffix; GCC/Clang return
+    # `__mmask16` for byte lanes and `__mmask8` for word/dword/qword lanes.
     ("cmpeq_epu8_mask", "vpcmpub128", "__mmask16", False),
     ("cmp_epu8_mask", "vpcmpub128", "__mmask16", True),
+    ("cmpeq_epi8_mask", "vpcmpb128", "__mmask16", False),
     ("cmp_epi8_mask", "vpcmpb128", "__mmask16", True),
+    ("cmpeq_epu16_mask", "vpcmpuw128", "__mmask8", False),
+    ("cmp_epu16_mask", "vpcmpuw128", "__mmask8", True),
+    ("cmpeq_epi16_mask", "vpcmpw128", "__mmask8", False),
+    ("cmp_epi16_mask", "vpcmpw128", "__mmask8", True),
+    ("cmpeq_epu32_mask", "vpcmpud128", "__mmask8", False),
+    ("cmp_epu32_mask", "vpcmpud128", "__mmask8", True),
+    ("cmpeq_epi32_mask", "vpcmpd128", "__mmask8", False),
+    ("cmp_epi32_mask", "vpcmpd128", "__mmask8", True),
+    ("cmpeq_epu64_mask", "vpcmpuq128", "__mmask8", False),
+    ("cmp_epu64_mask", "vpcmpuq128", "__mmask8", True),
+    ("cmpeq_epi64_mask", "vpcmpq128", "__mmask8", False),
+    ("cmp_epi64_mask", "vpcmpq128", "__mmask8", True),
 ]
 MZ_LOAD = [
     ("maskz_loadu_epi8", "vmovdqu8_maskz_load512", "__m512i", "__mmask64", "M512I"),

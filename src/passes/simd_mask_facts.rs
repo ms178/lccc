@@ -2313,10 +2313,21 @@ fn fold_masked_intrinsic(facts: &Facts<'_>, inst: &Instruction) -> Option<Instru
     }
     let status = facts.scalar_mask(args[mask_arg], lanes);
 
-    let mut budget = MAX_WORK;
-    let mut d_off = 0i64;
-    let Some(d_base) = facts.resolve_pointer(*dp, &mut d_off, &mut budget) else {
-        return None;
+    // A masked LOAD/arith rewrite writes a VECTOR HOME through `dest_ptr`, so
+    // it needs the home's bounds proof.  A masked STORE's `dest_ptr` is the
+    // USER'S MEMORY ADDRESS (see `LcccSimdClass::PtrStore`): it can be a
+    // global, a heap pointer or a parameter, and none of those resolve to an
+    // `Alloca`.  Resolving it unconditionally and bailing out used to refuse
+    // every all-on masked store to a non-stack object (measured: ON and OFF
+    // assembly byte-identical, `kmovq %rax,%k1` + `vmovdqu8 ...{k1}` left in
+    // the hot path).  Make the proof LAZY so `unmasked_store` below -- which
+    // needs no object proof at all -- can still fire.
+    let dest_home: Option<(Value, i64)> = {
+        let mut budget = MAX_WORK;
+        let mut d_off = 0i64;
+        facts
+            .resolve_pointer(*dp, &mut d_off, &mut budget)
+            .map(|d_base| (d_base, d_off))
     };
 
     // The ONLY memory-write rewrite in this pass other than erasure.
@@ -2324,6 +2335,7 @@ fn fold_masked_intrinsic(facts: &Facts<'_>, inst: &Instruction) -> Option<Instru
     // (`memcpy` overlap is UB), so no out-of-bounds read or write can
     // be introduced.  `size` is the exact active byte count.
     let memcpy_from = |src: Operand, size: usize| -> Option<Instruction> {
+        let (d_base, d_off) = dest_home?;
         if size == 0 || size > MAX_IMAGE || !window_in_bounds(&facts.defs, d_base, d_off, size) {
             return None;
         }
@@ -2343,6 +2355,7 @@ fn fold_masked_intrinsic(facts: &Facts<'_>, inst: &Instruction) -> Option<Instru
         })
     };
     let zero_here = || -> Option<Instruction> {
+        let (d_base, d_off) = dest_home?;
         if !window_in_bounds(&facts.defs, d_base, d_off, width) {
             return None;
         }
@@ -2359,6 +2372,7 @@ fn fold_masked_intrinsic(facts: &Facts<'_>, inst: &Instruction) -> Option<Instru
     // The ordinary `Loadu256` does NOT: it routes through `avx_load_arg`'s
     // vector-HOME heuristics, so it is deliberately never emitted here.
     let unmasked_load = || -> Option<Instruction> {
+        let (d_base, d_off) = dest_home?;
         let load = match *op {
             IntrinsicOp::MaskzLoaduEpi8_128 | IntrinsicOp::MaskLoaduEpi8_128 => {
                 IntrinsicOp::Loaddqu
@@ -2389,6 +2403,7 @@ fn fold_masked_intrinsic(facts: &Facts<'_>, inst: &Instruction) -> Option<Instru
     // `emit_maskz_shuffle_epi8_128`, `emit_evex_binary_512`,
     // `emit_sse_binary_128`).
     let unmasked_arith = || -> Option<Instruction> {
+        let (d_base, d_off) = dest_home?;
         use IntrinsicOp as O;
         let (new_op, new_args) = match *op {
             O::MaskzSet1Epi16_512 => (O::SetEpi16_512, vec![args[1]]),
@@ -2410,6 +2425,31 @@ fn fold_masked_intrinsic(facts: &Facts<'_>, inst: &Instruction) -> Option<Instru
         })
     };
 
+    // All-on masked STORE -> the exact unmasked store intrinsic.  This is
+    // the only rewrite that needs NO object proof: the original instruction
+    // already performed a FULL-WIDTH write through `dp` with the same value
+    // operand, so dropping the all-on `k` mask cannot introduce a fault,
+    // change an alias or widen an access.  The emitter loads the vector into
+    // a register BEFORE storing (verified for `Storedqu`, `Storeu256` and
+    // `Storeu512`), so it is also correct when `dp` overlaps the value's
+    // stack home -- a case `Memcpy` must refuse as UB.  `Storedqu`/`Storeu256`/
+    // `Storeu512` are the same PtrStore shapes `_mm*_storeu_si*` already use
+    // with global, heap and parameter pointers (measured three-way probe).
+    let unmasked_store = |value: Operand| -> Option<Instruction> {
+        let store = match *op {
+            IntrinsicOp::MaskStoreuEpi8_128 => IntrinsicOp::Storedqu,
+            IntrinsicOp::MaskStoreuEpi8_256 => IntrinsicOp::Storeu256,
+            IntrinsicOp::MaskStoreuEpi8_512 => IntrinsicOp::Storeu512,
+            _ => return None,
+        };
+        Some(Instruction::Intrinsic {
+            dest: None,
+            op: store,
+            dest_ptr: Some(*dp),
+            args: vec![value],
+        })
+    };
+
     match status {
         ScalarMask::AllOff => match family {
             // `fold_removal` erases all-off stores; returning None
@@ -2421,7 +2461,13 @@ fn fold_masked_intrinsic(facts: &Facts<'_>, inst: &Instruction) -> Option<Instru
             MaskFamily::ZeroLoad | MaskFamily::ZeroArith | MaskFamily::ZeroOnly => zero_here(),
         },
         ScalarMask::AllOn => match family {
-            MaskFamily::Store(value) => memcpy_from(args[value], width),
+            // Prefer the existing bounds-proven copy for a stack home; fall
+            // back to the register store for every other destination.  NEVER
+            // fall back for a partial (`Mixed` prefix) mask: that would write
+            // the full width and corrupt the inactive lanes.
+            MaskFamily::Store(value) => {
+                memcpy_from(args[value], width).or_else(|| unmasked_store(args[value]))
+            }
             MaskFamily::ZeroLoad | MaskFamily::MergeLoad(_) => unmasked_load(),
             MaskFamily::ZeroArith | MaskFamily::MergeArith(_) => unmasked_arith(),
             MaskFamily::ZeroOnly => None,

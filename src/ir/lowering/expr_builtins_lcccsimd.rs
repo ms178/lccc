@@ -210,6 +210,25 @@ pub(super) fn lccc_simd_lookup(
         "vpcmpb256" => s2(Scalar, CmpEpi8Mask256),
         "vpcmpub128" => s2(Scalar, CmpeqEpu8Mask128),
         "vpcmpb128" => s2(Scalar, CmpEpi8Mask128),
+        // AVX-512VL 128/256-bit word/dword/qword mask compares.  The IR ops,
+        // the x86 emitter and `simd_mask_facts::mask_compare_shape` already
+        // implemented every one of these; only the builtin dispatch was
+        // missing, so 26 GCC 16.2 public names were unreachable and their
+        // constant-image folds could never fire from C.  The `cmpeq_*` and
+        // `cmp_*` public spellings share ONE mnemonic: the predicate reaches
+        // the emitter as `args[2]` through the leading `long` immediate.
+        "vpcmpuw256" => s2(Scalar, CmpEpu16Mask256),
+        "vpcmpw256" => s2(Scalar, CmpEpi16Mask256),
+        "vpcmpud256" => s2(Scalar, CmpEpu32Mask256),
+        "vpcmpd256" => s2(Scalar, CmpEpi32Mask256),
+        "vpcmpuq256" => s2(Scalar, CmpEpu64Mask256),
+        "vpcmpq256" => s2(Scalar, CmpEpi64Mask256),
+        "vpcmpuw128" => s2(Scalar, CmpEpu16Mask128),
+        "vpcmpw128" => s2(Scalar, CmpEpi16Mask128),
+        "vpcmpud128" => s2(Scalar, CmpEpu32Mask128),
+        "vpcmpd128" => s2(Scalar, CmpEpi32Mask128),
+        "vpcmpuq128" => s2(Scalar, CmpEpu64Mask128),
+        "vpcmpq128" => s2(Scalar, CmpEpi64Mask128),
         // ---- masked loads/stores ----
         "vmovdqu8_maskz_load512" => m2(Vec512, MaskzLoaduEpi8_512),
         "vmovdqu8_maskz_load256" => m2(Vec256, MaskzLoaduEpi8_256),
@@ -489,10 +508,21 @@ fn simd_feature_requirements(mnemonic: &str) -> Vec<SimdFeatureRequirement> {
     let is_512 = mnemonic.ends_with("512") || mnemonic.ends_with("_512");
     let mut req = Vec::new();
 
+    // EVERY `vpcmp*128`/`vpcmp*256` helper in this family is an EVEX
+    // mask-compare encoding.  Before the AVX-512VL completion only the byte
+    // forms existed here, and the evex predicate named just `vpcmpb`/`vpcmpub`;
+    // a newly added `vpcmpd128` would therefore have fallen through to
+    // `legacy_simd_feature`, which answers `F::Avx` for any `v*` mnemonic --
+    // emitting an AVX-512VL instruction on a plain AVX target.  Recognising
+    // the whole 128/256 family by width is the only fail-closed rule: the
+    // 512 forms are already covered by `is_512`, and no legacy (non-EVEX)
+    // `vpcmp*128/256` helper exists in `lccc_simd_lookup`.
+    let mask_cmp_low =
+        mnemonic.starts_with("vpcmp") && (mnemonic.ends_with("128") || mnemonic.ends_with("256"));
+
     let evex = is_512
+        || mask_cmp_low
         || mnemonic.starts_with("vpternlog")
-        || mnemonic.starts_with("vpcmpb")
-        || mnemonic.starts_with("vpcmpub")
         || mnemonic.starts_with("vmovdqu8_mask")
         || matches!(
             mnemonic,
@@ -590,10 +620,7 @@ fn simd_feature_requirements(mnemonic: &str) -> Vec<SimdFeatureRequirement> {
         push_feature(&mut req, F::Avx512Vnni, "-mavx512vnni");
     }
     if mnemonic.starts_with("vpternlog")
-        || mnemonic.starts_with("vpcmpb")
-        || mnemonic.starts_with("vpcmpub")
-        || mnemonic.starts_with("vpcmpw")
-        || mnemonic.starts_with("vpcmpuw")
+        || mnemonic.starts_with("vpcmp")
         || mnemonic.starts_with("vmovdqu8_mask")
         || matches!(mnemonic, "vpshufb_maskz128" | "vpshufb_mask128")
     {
@@ -924,6 +951,16 @@ mod legacy_permission_tests {
         use crate::common::x86_features::X86Feature as F;
         let cases: &[(&str, &[F])] = &[
             ("vpcmpub128", &[F::Avx512F, F::Avx512Bw, F::Avx512Vl]),
+            // AVX-512VL completion: word forms need BW, dword/qword forms do
+            // NOT, and every 128/256 EVEX form needs VL. A regression that
+            // fell back to `legacy_simd_feature` would answer only `F::Avx`.
+            ("vpcmpuw128", &[F::Avx512F, F::Avx512Bw, F::Avx512Vl]),
+            ("vpcmpw256", &[F::Avx512F, F::Avx512Bw, F::Avx512Vl]),
+            ("vpcmpud128", &[F::Avx512F, F::Avx512Vl]),
+            ("vpcmpd256", &[F::Avx512F, F::Avx512Vl]),
+            ("vpcmpuq128", &[F::Avx512F, F::Avx512Vl]),
+            ("vpcmpq256", &[F::Avx512F, F::Avx512Vl]),
+            ("vpcmpud512", &[F::Avx512F]),
             ("vpternlogq256", &[F::Avx512F, F::Avx512Vl]),
             ("vpternlogd512", &[F::Avx512F]),
             (
