@@ -296,6 +296,87 @@ int main(int argc, char **argv) {
 """
 
 
+# Public set1 signatures must match BOTH reference compilers.  `_mm512_set1_
+# epi16` was `int` here while GCC 16.2 / Clang 23.1.5 declare `short`; the
+# merged PR fixed it, and `_mm512_maskz_set1_epi16` had the same deviation.
+# Pin all four typed wrappers and the three maskz helper prototypes so the
+# exact-width lane-image proof cannot silently regress.
+SET1_TYPES = {
+    "_mm512_set1_epi8": "char",
+    "_mm512_set1_epi16": "short",
+    "_mm512_set1_epi32": "int",
+    "_mm512_set1_epi64": "long long",
+}
+
+
+def _typed_param(text: str, name: str) -> str | None:
+    pat = re.compile(
+        r"\b" + re.escape(name) + r"\s*\(\s*([A-Za-z_][A-Za-z0-9_ ]*?)\s+__\w+\s*\)"
+    )
+    m = pat.search(text)
+    return " ".join(m.group(1).split()) if m else None
+
+
+def check_public_set1_signature_parity() -> tuple[list[str], list[str]]:
+    failures: list[str] = []
+    notes: list[str] = []
+    ours = (ROOT / "include" / "lcccsimd.h").read_text()
+    refs: dict[str, str] = {}
+    for label, cc in (("gcc16", tool("gcc-16")), ("clang23", tool("clang-23"))):
+        cp = run([cc, "-print-file-name=include"])
+        if cp.returncode != 0:
+            failures.append(f"{label}: cannot locate its intrinsic headers")
+            continue
+        hdr = Path(cp.stdout.strip()) / "avx512fintrin.h"
+        if not hdr.exists():
+            failures.append(f"{label}: missing {hdr}")
+            continue
+        refs[label] = hdr.read_text()
+    for name, want in SET1_TYPES.items():
+        got = _typed_param(ours, name)
+        if got != want:
+            failures.append(f"lccc {name} parameter is {got!r}, expected {want!r}")
+        for label, text in refs.items():
+            ref = _typed_param(text, name)
+            if ref != want:
+                failures.append(f"{label} {name} parameter is {ref!r}, expected {want!r}")
+        notes.append(f"{name}: {want} (LCCC + GCC 16.2 + Clang 23.1.5 agree)")
+    for suffix, want in (("vpbroadcastw_maskz512", "short"),
+                         ("vpbroadcastd_maskz512", "int"),
+                         ("vpbroadcastq_maskz512", "long long")):
+        pat = re.compile(
+            r"__lccc_simd512_i_" + re.escape(suffix) +
+            r"\(long, __mmask\d+ __mask, ([A-Za-z_][A-Za-z0-9_ ]*?) __a\)"
+        )
+        m = pat.search(ours)
+        got = " ".join(m.group(1).split()) if m else None
+        if got != want:
+            failures.append(f"helper {suffix} scalar is {got!r}, expected {want!r}")
+    return failures, notes
+
+
+# Executed control for the corrected `short` scalar of the maskz set1
+# wrapper: a widened/truncated broadcast would change the stored bytes.
+MASKZ_SET1 = """/* GENERATED maskz set1 signature control -- DO NOT EDIT. */
+#include <stdio.h>
+#include <immintrin.h>
+static unsigned char OUT[64];
+static unsigned long long h(const unsigned char *p, int n) {
+    unsigned long long x = 1469598103934665603ull;
+    for (int i = 0; i < n; i++) { x ^= p[i]; x *= 1099511628211ull; }
+    return x;
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    __mmask32 k = (__mmask32)(0xAAAA5555u | (unsigned)(argc & 1));
+    __m512i z = _mm512_maskz_set1_epi16(k, (short)0x8091);
+    _mm512_storeu_si512((void *)OUT, z);
+    printf("%016llx\\n", h(OUT, 64));
+    return 0;
+}
+"""
+
+
 def run(cmd: list[str], env: dict | None = None, timeout: int = 300) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout)
 
@@ -434,6 +515,23 @@ def check_immediate_diagnostics(tmp: Path) -> tuple[list[str], list[str]]:
         notes.append("constant-expression/enum immediates: 3-way stdout identical")
     elif len(outs) == 3:
         failures.append(f"positive immediate control disagrees: {outs}")
+    mz = tmp / "maskz_set1.c"
+    mz.write_text(MASKZ_SET1)
+    mz_outs: dict[str, str] = {}
+    for label, cmd in specs:
+        cp = run(cmd + [str(mz), "-o", str(tmp / f"{label}_mz")], env=envs[label])
+        if cp.returncode != 0:
+            failures.append(f"{label} maskz set1 compile rc={cp.returncode}: {cp.stderr[-400:]}")
+            continue
+        rp = run([str(tmp / f"{label}_mz")], env=envs[label])
+        if rp.returncode != 0:
+            failures.append(f"{label} maskz set1 run rc={rp.returncode}")
+            continue
+        mz_outs[label] = rp.stdout
+    if len(mz_outs) == 3 and len(set(mz_outs.values())) == 1:
+        notes.append("_mm512_maskz_set1_epi16(short): 3-way stored-byte hash identical")
+    elif len(mz_outs) == 3:
+        failures.append(f"maskz set1 stored bytes disagree: {mz_outs}")
     return failures, notes
 
 
@@ -522,8 +620,10 @@ def main() -> int:
         res = execute_matrix(tmp, mutate=os.environ.get("LCCC_MATRIX_MUTATE") == "1")
         failures, notes = evaluate(res)
         diag_failures, diag_notes = check_immediate_diagnostics(tmp)
-        failures += diag_failures
+        sig_failures, sig_notes = check_public_set1_signature_parity()
+        failures += diag_failures + sig_failures
         notes += [f"immediate: {n}" for n in diag_notes]
+        notes += [f"signature: {n}" for n in sig_notes]
         if args.json:
             args.json.write_text(json.dumps({
                 "source_sha256": res["source_sha256"],
@@ -534,6 +634,7 @@ def main() -> int:
                     for k, v in res["builds"].items()
                 },
                 "immediate_diagnostics": {"failures": diag_failures, "notes": diag_notes},
+                "set1_signature_parity": {"failures": sig_failures, "notes": sig_notes},
                 "failures": failures,
                 "notes": notes,
             }, indent=2) + "\n")

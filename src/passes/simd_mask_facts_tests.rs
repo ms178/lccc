@@ -6801,3 +6801,182 @@ fn constant_512_bit_broadcasts_fold_all_eight_predicates() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Round 10: a mask-compare result is already zero-extended; the following
+// U8/U16/U32 -> wider integer cast is a bit-identical no-op.  Codegen used to
+// materialise it as `movzwl %ax, %eax` on EVERY runtime mask compare.
+// ---------------------------------------------------------------------------
+
+fn mask_cast_function(
+    cmp: IntrinsicOp,
+    from_ty: IrType,
+    to_ty: IrType,
+    src: Operand,
+) -> IrFunction {
+    let insts = vec![
+        intrinsic(
+            Some(Value(1)),
+            cmp,
+            None,
+            vec![
+                Operand::Value(Value(10)),
+                Operand::Value(Value(20)),
+                Operand::Const(IrConst::I32(0)),
+            ],
+        ),
+        Instruction::Cast {
+            dest: Value(2),
+            src,
+            from_ty,
+            to_ty,
+        },
+    ];
+    let mut f = IrFunction::new("mask_cast".into(), IrType::I32, vec![], false);
+    f.blocks.push(block(
+        insts,
+        Terminator::Return(Some(Operand::Value(Value(2)))),
+        true,
+    ));
+    f.next_value_id = 1000;
+    f
+}
+
+fn cast_rewrite(func: &IrFunction) -> Option<Instruction> {
+    let facts = Facts::new(func);
+    let (index, inst) = func.blocks[0]
+        .instructions
+        .iter()
+        .enumerate()
+        .find(|(_, i)| matches!(i, Instruction::Cast { .. }))?;
+    fold(&facts, inst, 0, index)
+}
+
+#[test]
+fn integer_bits_is_exact_and_refuses_every_non_integer_type() {
+    use IrType as T;
+    for (ty, want) in [
+        (T::I8, 8),
+        (T::U8, 8),
+        (T::I16, 16),
+        (T::U16, 16),
+        (T::I32, 32),
+        (T::U32, 32),
+        (T::I64, 64),
+        (T::U64, 64),
+        (T::I128, 128),
+        (T::U128, 128),
+    ] {
+        assert_eq!(integer_bits(ty), Some(want), "{ty:?}");
+    }
+    for ty in [T::F32, T::F64, T::D32, T::D64, T::F128, T::Ptr, T::Void] {
+        assert_eq!(integer_bits(ty), None, "{ty:?} must refuse");
+    }
+}
+
+#[test]
+fn mask_compare_zero_extending_casts_become_copies() {
+    use IntrinsicOp as O;
+    use IrType as T;
+    // lanes <= from_bits: the cast cannot have discarded a mask bit.
+    for (cmp, from_ty, to_ty) in [
+        (O::CmpEpi8Mask128, T::U16, T::U64),   // 16 lanes, __mmask16
+        (O::CmpEpi64Mask128, T::U8, T::U64),   // 2 lanes, __mmask8
+        (O::CmpEpu8Mask256, T::U32, T::U64),   // 32 lanes, __mmask32
+        (O::CmpeqEpu8Mask512, T::U64, T::U64), // 64 lanes
+        (O::CmpEpi16Mask256, T::U16, T::I64),  // signed destination is fine
+        (O::CmpEpi32Mask128, T::U16, T::U32),  // narrower-than-64 extension
+    ] {
+        let f = mask_cast_function(cmp, from_ty, to_ty, Operand::Value(Value(1)));
+        assert!(
+            matches!(cast_rewrite(&f), Some(Instruction::Copy { .. })),
+            "{cmp:?} {from_ty:?}->{to_ty:?} must fold to a Copy"
+        );
+    }
+}
+
+#[test]
+fn mask_compare_cast_fold_is_fail_closed() {
+    use IntrinsicOp as O;
+    use IrType as T;
+    // (a) from_bits < lanes: the cast is a REAL truncation, not a no-op.
+    let f = mask_cast_function(O::CmpEpu8Mask256, T::U16, T::U64, Operand::Value(Value(1)));
+    assert!(
+        cast_rewrite(&f).is_none(),
+        "32 lanes into 16 bits must refuse"
+    );
+    // (b) narrowing destination.
+    let f = mask_cast_function(O::CmpEpi8Mask128, T::U32, T::U16, Operand::Value(Value(1)));
+    assert!(cast_rewrite(&f).is_none(), "U32->U16 must refuse");
+    // (c) non-integer types on either side.
+    for (from_ty, to_ty) in [(T::F32, T::F64), (T::U16, T::F64), (T::Ptr, T::U64)] {
+        let f = mask_cast_function(O::CmpEpi8Mask128, from_ty, to_ty, Operand::Value(Value(1)));
+        assert!(
+            cast_rewrite(&f).is_none(),
+            "{from_ty:?}->{to_ty:?} must refuse"
+        );
+    }
+    // (d) a constant source has no producer proof.
+    let f = mask_cast_function(
+        O::CmpEpi8Mask128,
+        T::U16,
+        T::U64,
+        Operand::Const(IrConst::I64(0)),
+    );
+    assert!(cast_rewrite(&f).is_none(), "constant source must refuse");
+    // (e) an undefined external value has no producer proof.
+    let f = mask_cast_function(
+        O::CmpEpi8Mask128,
+        T::U16,
+        T::U64,
+        Operand::Value(Value(999)),
+    );
+    assert!(cast_rewrite(&f).is_none(), "unresolved source must refuse");
+    // (f) the producer is NOT a mask compare.
+    let mut insts = vec![intrinsic(
+        Some(Value(1)),
+        O::Pcmpeqb128,
+        None,
+        vec![Operand::Value(Value(10)), Operand::Value(Value(20))],
+    )];
+    insts.push(Instruction::Cast {
+        dest: Value(2),
+        src: Operand::Value(Value(1)),
+        from_ty: T::U16,
+        to_ty: T::U64,
+    });
+    let mut f = IrFunction::new("not_mask_cast".into(), IrType::I32, vec![], false);
+    f.blocks.push(block(
+        insts,
+        Terminator::Return(Some(Operand::Value(Value(2)))),
+        true,
+    ));
+    f.next_value_id = 1000;
+    assert!(
+        cast_rewrite(&f).is_none(),
+        "a non-mask producer must refuse"
+    );
+}
+
+#[test]
+fn mask_compare_cast_fold_is_applied_by_run_function() {
+    use IntrinsicOp as O;
+    use IrType as T;
+    let mut f = mask_cast_function(O::CmpEpi8Mask128, T::U16, T::U64, Operand::Value(Value(1)));
+    let n = super::run_function(&mut f);
+    assert!(n >= 1, "the pass must report the cast rewrite");
+    assert!(
+        f.blocks[0]
+            .instructions
+            .iter()
+            .any(|i| matches!(i, Instruction::Copy { dest: Value(2), .. })),
+        "the Cast must actually be replaced by a Copy"
+    );
+    assert!(
+        !f.blocks[0]
+            .instructions
+            .iter()
+            .any(|i| matches!(i, Instruction::Cast { .. })),
+        "no redundant cast may survive"
+    );
+}

@@ -3075,3 +3075,85 @@ are the polish that makes the artifact GCC-shaped rather than merely valid.
 Standing constraints from §1's item format apply unchanged: `fastbuild`, `-j2`,
 `scripts/ci_local.sh --fast` before declaring done, mutation-verified gates
 (revert the fix, watch the gate fail), no reproducer removed to close an item.
+
+---
+
+## 14. `vpcmp*` runtime-compare roundtrip: measured, red-teamed, still open (2026-11-08)
+
+**Status: OPEN, quantified.** This is the largest remaining code-quality gap in
+the `simd_mask_facts` / AVX-512VL mask-compare feature scope. It is recorded
+here with the exact measurement so it is not "closed" by a narrative claim.
+
+### Measurement (fastbuild, `scripts/check_maskfacts_vl_matrix.py`, 485 generated cases)
+
+Per-function instruction census of the emitted `-S` output, grouped by the
+generated case name. All four binaries execute; all 485 stdout lines are
+byte-identical to the GCC 16.2 oracle.
+
+| group | LCCC ON | GCC 16.2 | Clang 23.1.5 | LCCC per case |
+|---|---:|---:|---:|---:|
+| runtime compares (192 cases) | 3648 | 612 | 624 | **19.0** |
+| constant compares (240 cases, folded) | 240 | 1794 | 192 | 1.0 |
+| masked stores (5 cases) | 69 | 58 | 165 | — |
+| `main` (485 `printf` calls) | 2959 | 2957 | 2833 | — |
+| **total** | **7403** | **6445** | **4335** | — |
+
+`main` is at parity. The constant-compare and store groups are already at or
+better than both references (LCCC + Clang fold all 240 constant compares to one
+immediate; GCC leaves 7.5 instructions per case). **All of the remaining gap is
+the 192 runtime compare functions: 19.0 vs 3.19 (GCC) / 3.25 (Clang).**
+
+Representative `rt_eq_w128_epi8` body, LCCC ON:
+
+```asm
+movdqu A(%rip), %xmm0      ; Loaddqu -> scratch home
+movdqu %xmm0, %xmm2        ; VecLoadI64x2 -> SSA vector value
+leaq   B(%rip), %rax       ; address materialisation
+movdqu (%rax), %xmm0       ; Loaddqu -> scratch home
+movdqu %xmm0, %xmm3        ; VecLoadI64x2 -> SSA vector value
+movdqu %xmm2, %xmm0        ; fixed-scratch copy for src1
+movdqu %xmm3, %xmm1        ; fixed-scratch copy for src2
+vpcmpb $0, %xmm1, %xmm0, %k1
+kmovq  %k1, %rax
+ret
+```
+
+GCC 16.2 / Clang 23.1.5 emit three instructions (`vmovdqa A, %xmm0`,
+`vpcmpb $0, B, %xmm0, %k0`, `kmovq/k.movw`, `ret`).
+
+### Root cause
+
+`_mm_loadu_si128` is `return *__p;` on a 16-byte aggregate. LCCC lowers that
+aggregate lvalue through `Loaddqu` (raw load into a scratch `Alloca`) ->
+`VecLoadI64x2` (SSA vector value) -> `VecStoreI64x2` (write through to the
+result `Alloca`). The mask-compare consumer receives the two **home pointers**,
+not register-held values. `emit_simd_scalar` invalidates the vector peephole
+state and both operands are reloaded into fixed scratch registers. This is a
+property of the vector write-through HOME representation, not of the mask-facts
+pass. Closing it requires a roundtrip-free vector value representation (SROA /
+mem2reg for 16/32/64-byte vector allocas, or a raw-pointer compare intrinsic
+with an alias/fault proof), not a peephole.
+
+### Red-teamed alternatives, all measured and rejected or fixed
+
+| # | proposal | measured verdict |
+|---|---|---|
+| 1 | Skip `emit_simd_scalar`'s `invalidate_vec_peephole()` for `vpcmp*` (it reads sources, writes only `%k1`) | **MISCOMPILE.** `rt_eq_w512_epi8` returned `ffffffffffffffff` instead of `6db6db6db6db6db6`: `evex_load_arg_to` did not evict a stale `vec_live_regs` claim when it clobbered `%zmm0`, so operand B was copied from the clobbered register. The 485-case three-way oracle caught it on the first run. |
+| 2 | Fix that eviction (`vec_evict_bank_except` in `evex_load_arg_to`, matching `sse_load_arg`/`avx_load_arg_to`), then retry (1) | **LANDED as a defect fix** (unit test `evex_load_arg_to_evicts_stale_bank_claims`). Retrying (1) is then CORRECT (485/485 identical) but yields **no win: 7579 -> 7579**. A risk with zero benefit was reverted. |
+| 3 | Fold operand B as a MEMORY `vpcmp*` src2 via the existing `evex_arg_mem` gate | **CORRECT BUT NET-NEGATIVE: 7579 -> 7963.** The gate flushes deferred stores that the register path elides; the 512-bit over-aligned homes do not resolve to a direct memory operand at all. Rejected with a pinned comment in `emit_simd_scalar`. |
+| 4 | Remove the redundant `Cast U16/U32 -> wider` after a mask compare (EVEX zeroes upper `k` bits, `kmov*` zero-extends) | **LANDED.** `simd_mask_facts::fold` rewrites it to a `Copy` with a fail-closed proof (`lanes <= from_bits`, integer types only, direct mask-compare producer). Removes every `movzwl %ax, %eax`: **7579 -> 7403 instructions (-176, -2.3%)**, 485/485 stdout identical. |
+
+### Acceptance criteria for closing this item
+
+1. A generated 485-case three-way matrix stays byte-identical (current sha256
+   `0b88d4ad470030e6f3c48d77b36553137aebcf5af57ea1a644014586368955f7`).
+2. Runtime-compare average <= 4.0 emitted instructions per case (from 19.0),
+   measured by the same per-function census, with GCC 16.2 and Clang 23.1.5 as
+   oracles.
+3. `--self-test` still detects the forced-pass-off mutation; every new proof
+   has a paired negative unit test (truncation, non-integer type, indirect
+   producer, runtime/constant operand, stale register claim).
+4. No `vec_live_regs` claim survives a clobber of its physical bank; pinned by
+   the EVEX eviction unit test and by the 512-bit runtime cases in the matrix.
+5. No long local CI runs: per the standing instruction, validation is
+   fastbuild + short targeted gates only; hosted CI is the full gate.
