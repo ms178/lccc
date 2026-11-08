@@ -2554,3 +2554,197 @@ mod avx_fp_order_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod mask_cmp_global_mem_tests {
+    use super::*;
+    use crate::backend::state::{CodegenState, PendingVecMemfold};
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrFunction, Terminator};
+
+    /// A function whose Value(0) has exactly one `GlobalAddr` definition.
+    /// `current_func` is a raw pointer kept alive by the returned IrFunction,
+    /// so the fixture must outlive every use of the codegen object.
+    fn func_with_global(name: &str, duplicate: bool) -> IrFunction {
+        let mut f = IrFunction::new("g".into(), IrType::I64, vec![], false);
+        let mut insts = vec![Instruction::GlobalAddr {
+            dest: Value(0),
+            name: name.into(),
+        }];
+        if duplicate {
+            insts.push(Instruction::GlobalAddr {
+                dest: Value(0),
+                name: name.into(),
+            });
+        }
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        f.next_value_id = 4;
+        f
+    }
+
+    fn cg_with(func: &IrFunction) -> X86Codegen {
+        let mut cg = X86Codegen::new();
+        cg.current_func = Some(func as *const IrFunction);
+        cg
+    }
+
+    fn arg() -> Operand {
+        Operand::Value(Value(0))
+    }
+
+    fn pending_memfold() -> PendingVecMemfold {
+        PendingVecMemfold {
+            val: 3,
+            mem: "(%rdi)".into(),
+            mnemonic: "vmovdqu",
+            width: 32,
+        }
+    }
+
+    #[test]
+    fn accepts_only_a_unique_plain_global_address() {
+        let f = func_with_global("A", false);
+        let cg = cg_with(&f);
+        assert_eq!(cg.mask_cmp_global_mem(&arg()), Some("A(%rip)".into()));
+        // A constant operand has no address proof at all.
+        assert_eq!(
+            cg.mask_cmp_global_mem(&Operand::Const(IrConst::I64(0))),
+            None
+        );
+    }
+
+    /// Every gate below is a NEGATIVE test paired with the positive above.
+    /// Each one corresponds to a way a compiler engineer could turn the
+    /// optimization into a miscompile or a broken assembly operand.
+    #[test]
+    fn refuses_every_unsafe_or_uncommitted_shape() {
+        // TLS is addressed through a descriptor, not a plain RIP-relative
+        // data symbol; `A(%rip)` would read the wrong object.
+        let f = func_with_global("A", false);
+        let mut cg = cg_with(&f);
+        cg.state.tls_symbols.insert("A".into());
+        assert_eq!(cg.mask_cmp_global_mem(&arg()), None, "TLS");
+
+        // Full PIC / weak-extern data goes through the GOT.  A GOTPCREL
+        // operand is a POINTER, not the object's bytes, so it cannot be an
+        // EVEX src2.
+        let mut cg = cg_with(&f);
+        cg.state.pic_mode = true;
+        assert_eq!(cg.mask_cmp_global_mem(&arg()), None, "PIC/GOT");
+        let mut cg = cg_with(&f);
+        cg.state.pie_mode = true;
+        cg.state.weak_extern_symbols.insert("A".into());
+        assert_eq!(cg.mask_cmp_global_mem(&arg()), None, "PIE weak extern");
+
+        // Versioned symbol names carry an `@` that must not be emitted raw.
+        let vf = func_with_global("A@GLIBC_2.2.5", false);
+        let cg = cg_with(&vf);
+        assert_eq!(cg.mask_cmp_global_mem(&arg()), None, "versioned symbol");
+
+        // Register-held values must go through the ordinary register path.
+        let mut cg = cg_with(&f);
+        cg.state.vec_live_regs.insert(0, "xmm0");
+        assert_eq!(cg.mask_cmp_global_mem(&arg()), None, "register-held");
+
+        // ANY outstanding deferred write is invisible to the IR alias proof.
+        let mut cg = cg_with(&f);
+        cg.state.pending_vec_store = Some((3, "ymm0", true));
+        assert_eq!(cg.mask_cmp_global_mem(&arg()), None, "pending store");
+        let mut cg = cg_with(&f);
+        cg.state.pending_vec_memfold = Some(pending_memfold());
+        assert_eq!(cg.mask_cmp_global_mem(&arg()), None, "pending memfold");
+
+        // An ambiguous (multi-def) value has no unique producer proof.
+        let dup = func_with_global("A", true);
+        let cg = cg_with(&dup);
+        assert_eq!(cg.mask_cmp_global_mem(&arg()), None, "ambiguous definition");
+
+        // A value that is not a GlobalAddr at all.
+        let mut other = IrFunction::new("g".into(), IrType::I64, vec![], false);
+        other.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I64(0)),
+            }],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        other.next_value_id = 4;
+        let cg = cg_with(&other);
+        assert_eq!(
+            cg.mask_cmp_global_mem(&arg()),
+            None,
+            "non-global definition"
+        );
+    }
+
+    /// Width-exact UNALIGNED mnemonics: a 64-byte operand loaded through a
+    /// 16-byte mnemonic would silently truncate.  `vzeroupper` obligation is
+    /// armed only for 256/512, matching `avx_load_arg_to`.
+    #[test]
+    fn global_load_uses_width_exact_mnemonics_and_evicts_the_whole_bank() {
+        for (reg, mnemonic, dirty) in [
+            ("xmm0", "movdqu", false),
+            ("ymm0", "vmovdqu", true),
+            ("zmm0", "vmovdqu64", true),
+        ] {
+            let f = func_with_global("A", false);
+            let mut cg = cg_with(&f);
+            // Two stale claims on bank 0 and one unrelated claim on bank 3.
+            cg.state.vec_live_regs.insert(1, "xmm0");
+            cg.state.vec_live_regs.insert(2, "ymm0");
+            cg.state.vec_live_regs.insert(3, "zmm3");
+            assert!(cg.emit_mask_cmp_global_load(&arg(), reg), "{reg}");
+            let out = &cg.state.out.buf;
+            assert!(
+                out.contains(&format!("{mnemonic} A(%rip), %{reg}")),
+                "{reg}: {out}"
+            );
+            assert_eq!(cg.state.dirty_upper_ymm, dirty, "{reg} dirty_upper_ymm");
+            assert_eq!(
+                cg.state.vec_live_regs.len(),
+                1,
+                "{reg}: stale bank-0 claims survived the clobber"
+            );
+            assert_eq!(
+                cg.state.vec_live_regs.get(&3),
+                Some(&"zmm3"),
+                "{reg}: unrelated bank was evicted"
+            );
+        }
+    }
+
+    /// The loader must be a pure predicate: on refusal it emits NOTHING, so
+    /// the ordinary `simd_load_arg_to` fallback owns the register.
+    #[test]
+    fn global_load_refusal_emits_nothing() {
+        let f = func_with_global("A", false);
+        let mut cg = cg_with(&f);
+        cg.state.tls_symbols.insert("A".into());
+        assert!(!cg.emit_mask_cmp_global_load(&arg(), "xmm0"));
+        assert!(cg.state.out.buf.is_empty(), "{}", cg.state.out.buf);
+        assert!(!cg.state.dirty_upper_ymm);
+    }
+
+    /// `vec_evict_bank` must drop EVERY claim on the register's physical
+    /// bank, and only that bank (no `u32::MAX` sentinel needed).
+    #[test]
+    fn bank_eviction_is_exact_and_needs_no_sentinel() {
+        let mut state = CodegenState::new();
+        state.vec_live_regs.insert(u32::MAX, "xmm0");
+        state.vec_live_regs.insert(1, "ymm0");
+        state.vec_live_regs.insert(2, "zmm0");
+        state.vec_live_regs.insert(3, "zmm3");
+        state.vec_evict_bank("zmm0");
+        assert_eq!(state.vec_live_regs.len(), 1, "u32::MAX must NOT survive");
+        assert_eq!(state.vec_live_regs.get(&3), Some(&"zmm3"));
+    }
+}

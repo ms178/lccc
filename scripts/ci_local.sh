@@ -3634,6 +3634,17 @@ gate "codegen-quality-gate" fast \
 # hard CI failure, not a slow-oracle nicety: skipping it in the pre-push
 # configuration is how a red PR gets pushed.  A clippy run is ~90 s against
 # the two multi-minute oracles `--fast` exists to skip.
+# Round 11: the AVX-512VL mask-compare differential is a hosted gate too
+# (.github/workflows/ci.yml, maskfacts-oracles job).  These registrations are
+# the local mirror's record so check_ci_gate_parity.py can prove neither side
+# silently drops a gate.  The harnesses need GCC 16.2 / Clang 23.1.5 exactly;
+# the hosted job pins both names to the installed oracles.
+gate "maskfacts-vl-matrix" fast \
+    python3 scripts/check_maskfacts_vl_matrix.py --asm-dir target/maskfacts-receipts/asm --json target/maskfacts-receipts/matrix.json
+gate "maskfacts-function-census" fast \
+    python3 scripts/maskfacts_function_census.py --asm-dir target/maskfacts-receipts/asm --require-runtime-avg 5.0 --json target/maskfacts-receipts/census.json
+gate "maskfacts-memory-safety" fast \
+    python3 scripts/check_maskfacts_memory_safety.py --json target/maskfacts-receipts/safety.json
 gate "rustfmt" fast cargo fmt --all -- --check
 
 

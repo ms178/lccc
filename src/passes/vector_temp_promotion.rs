@@ -4042,3 +4042,54 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod mask_compare_forwarding_tests {
+    use super::*;
+
+    /// The forwarding table is the load-bearing piece of the roundtrip fix:
+    /// args[0]/args[1] must be classified as vector bytes at the EXACT EVEX
+    /// width, while args[2] is a scalar predicate immediate.  Forwarding a
+    /// load into args[2] would replace `$imm` with an address and miscompile
+    /// every `_mm_cmp_epi*_mask`.
+    #[test]
+    fn mask_compare_operands_are_width_classified_but_the_predicate_is_not() {
+        for (op, w) in [
+            (IntrinsicOp::CmpEpi8Mask128, 16),
+            (IntrinsicOp::CmpeqEpu8Mask128, 16),
+            (IntrinsicOp::CmpEpi64Mask128, 16),
+            (IntrinsicOp::CmpEpu16Mask256, 32),
+            (IntrinsicOp::CmpEpi32Mask256, 32),
+            (IntrinsicOp::CmpeqEpu8Mask256, 32),
+            (IntrinsicOp::CmpEpi8Mask512, 64),
+            (IntrinsicOp::CmpeqEpu16Mask512, 64),
+            (IntrinsicOp::CmpEpu64Mask512, 64),
+        ] {
+            assert_eq!(pointer_vector_arg_width(op, 0), Some(w), "{op:?} arg0");
+            assert_eq!(pointer_vector_arg_width(op, 1), Some(w), "{op:?} arg1");
+            for index in [2, 3, 8] {
+                assert_eq!(
+                    pointer_vector_arg_width(op, index),
+                    None,
+                    "{op:?} arg{index} is not a vector byte window"
+                );
+            }
+        }
+    }
+
+    /// A lookalike intrinsic (name contains `Mask`) must NOT inherit the
+    /// mask-compare classification: masked loads/stores have a mask operand
+    /// and a pointer, not two symmetric vector byte windows.
+    #[test]
+    fn mask_lookalikes_are_not_classified_as_mask_compares() {
+        for op in [
+            IntrinsicOp::MaskzLoaduEpi8_128,
+            IntrinsicOp::MaskStoreuEpi8_256,
+            IntrinsicOp::MaskzSet1Epi16_512,
+            IntrinsicOp::Pdep32,
+            IntrinsicOp::VecLoadI64x2,
+        ] {
+            assert_eq!(op.mask_compare_vector_width(), None, "{op:?}");
+        }
+    }
+}

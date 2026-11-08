@@ -55,8 +55,10 @@
 //!   remaining mentions, with `retain_insts` keeping `-g` spans in lockstep.
 //!
 //! Pass name for `CCC_DISABLE_PASSES`: `veccopychain`.
-//! Trace: `CCC_DEBUG_VEC_COPY_CHAIN=1` (disabled by default; the pass reads
-//! no environment variable on its hot path).
+//! Explainability: `CCC_DEBUG_VEC_COPY_CHAIN=1` prints every applied rewrite
+//! AND every refusal reason, so each `continue` path is traceable.  The flag
+//! is read ONCE per pass invocation into a cached `OnceLock`; the hot path
+//! pays only one inlined boolean check, never an environment lookup.
 
 use crate::backend::liveness::{
     for_each_operand_in_instruction, for_each_value_use_in_instruction,
@@ -139,6 +141,35 @@ fn zero_const(op: &Operand) -> bool {
     matches!(op, Operand::Const(IrConst::I64(0)))
 }
 
+/// Developer-only explainability trace.  Read ONCE per pass invocation, not
+/// per instruction: `CCC_DEBUG_VEC_COPY_CHAIN=1` prints every applied rewrite
+/// and every refusal reason, so each `continue` path below is traceable.
+struct Trace {
+    enabled: bool,
+}
+
+impl Trace {
+    #[inline]
+    fn enabled() -> Self {
+        static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        Self {
+            enabled: *FLAG.get_or_init(|| std::env::var_os("CCC_DEBUG_VEC_COPY_CHAIN").is_some()),
+        }
+    }
+    #[inline]
+    fn reject(&self, reason: &str) {
+        if self.enabled {
+            eprintln!("[veccopychain] refuse: {reason}");
+        }
+    }
+    #[inline]
+    fn collapse(&self, block: usize, index: usize, width: usize, scratch: u32, home: u32) {
+        if self.enabled {
+            eprintln!("[veccopychain] b{block} i{index}: collapse w{width} %{scratch} -> %{home}");
+        }
+    }
+}
+
 struct Plan {
     load: usize,
     vec_load: usize,
@@ -157,6 +188,13 @@ pub(crate) fn collapse_vector_copy_chains(module: &mut IrModule) -> usize {
 }
 
 fn collapse_in_function(func: &mut IrFunction) -> usize {
+    let trace = Trace::enabled();
+    macro_rules! reject {
+        ($reason:expr) => {{
+            trace.reject($reason);
+            continue;
+        }};
+    }
     let homes = homes(func);
     if homes.is_empty() {
         return 0;
@@ -168,7 +206,7 @@ fn collapse_in_function(func: &mut IrFunction) -> usize {
     for (bi, block) in func.blocks.iter().enumerate() {
         let insts = &block.instructions;
         if insts.len() < 3 {
-            continue;
+            reject!("block has fewer than three instructions");
         }
         for i in 0..insts.len() - 2 {
             let (
@@ -194,32 +232,32 @@ fn collapse_in_function(func: &mut IrFunction) -> usize {
                 },
             ) = (&insts[i], &insts[i + 1], &insts[i + 2])
             else {
-                continue;
+                reject!("triple is not load/VecLoad/VecStore with the right dests");
             };
             // A single source pointer: no offset, mask or width-changing load.
             if load_args.len() != 1 {
-                continue;
+                reject!("load has more than one source argument");
             }
             let Some(width) = direct_vector_load_width(*load_op) else {
-                continue;
+                reject!("load is not a direct full-width vector load");
             };
             if vec_load_width(*load_vec_op) != Some(width)
                 || whole_vector_store_width(*store_vec_op) != Some(width)
             {
-                continue;
+                reject!("VecLoad/VecStore widths or whole-register shape mismatch");
             }
             if homes.get(&scratch.0) != Some(&width) || homes.get(&final_home.0) != Some(&width) {
-                continue;
+                reject!("homes are missing, volatile or not exactly the load width");
             }
             if scratch.0 == final_home.0 {
-                continue;
+                reject!("scratch and final home are the same alloca");
             }
             // Unique-def / unique-use guards: a value id defined or read by
             // anything else must not be rewired.
             if counts.get(&scratch.0).copied() != Some(2)
                 || counts.get(&vec_val.0).copied() != Some(1)
             {
-                continue;
+                reject!("scratch/SSA value has a non-unique mention count");
             }
             // Exact whole-object, offset-0 copy.  `VecLoad*` args are
             // [base, byte-offset]; `VecStore*` args are [value, ptr, offset]
@@ -228,20 +266,20 @@ fn collapse_in_function(func: &mut IrFunction) -> usize {
                 || !matches!(&vl_args[0], Operand::Value(v) if v.0 == scratch.0)
                 || !zero_const(&vl_args[1])
             {
-                continue;
+                reject!("VecLoad base/arity/offset is not an exact offset-0 read");
             }
             if vs_args.len() != 3
                 || !matches!(&vs_args[0], Operand::Value(v) if v.0 == vec_val.0)
                 || !matches!(&vs_args[1], Operand::Value(v) if v.0 == final_home.0)
                 || !zero_const(&vs_args[2])
             {
-                continue;
+                reject!("VecStore value/ptr/offset is not an exact offset-0 write");
             }
             // Do not let two plans share a home (a scratch of one plan can
             // never be the final home of another because of the mention
             // counts, but the guard makes that invariant explicit).
             if claimed.contains(&scratch.0) || claimed.contains(&final_home.0) {
-                continue;
+                reject!("a home is already claimed by another plan");
             }
             claimed.insert(scratch.0);
             claimed.insert(final_home.0);
@@ -263,6 +301,7 @@ fn collapse_in_function(func: &mut IrFunction) -> usize {
                 new_dest_ptr: *final_home,
                 dead_alloca,
             });
+            trace.collapse(bi, i, width, scratch.0, final_home.0);
         }
     }
 
@@ -548,6 +587,184 @@ mod tests {
         }
         let mut m = IrModule::new();
         m.functions.push(func_with(insts));
+        assert_eq!(collapse_vector_copy_chains(&mut m), 0);
+    }
+
+    #[test]
+    fn rejects_same_home_semantic_volatile_and_cross_block_shapes() {
+        use IntrinsicOp as O;
+        let good = shape(16, O::Loaddqu, O::VecLoadI64x2, O::VecStoreI64x2);
+
+        // Scratch and final home are the SAME alloca: the middle pair is not
+        // a copy, it is a read-modify-write of one object.
+        let mut v = good.clone();
+        if let Instruction::Intrinsic { dest_ptr, .. } = &mut v[5] {
+            *dest_ptr = Some(Value(2));
+        }
+        if let Instruction::Intrinsic { args, .. } = &mut v[5] {
+            args[1] = Operand::Value(Value(2));
+        }
+        let mut m = IrModule::new();
+        m.functions.push(func_with(v));
+        assert_eq!(collapse_vector_copy_chains(&mut m), 0, "same home");
+
+        // A `semantic_volatile` alloca is observable even when its `volatile`
+        // flag is false (e.g. a VLA / setjmp-visible home).
+        let mut v = good.clone();
+        if let Instruction::Alloca {
+            semantic_volatile, ..
+        } = &mut v[0]
+        {
+            *semantic_volatile = true;
+        }
+        let mut m = IrModule::new();
+        m.functions.push(func_with(v));
+        assert_eq!(collapse_vector_copy_chains(&mut m), 0, "semantic volatile");
+
+        // The three instructions are split across two basic blocks: the pass
+        // requires STRICT contiguity and must not hoist the store.
+        let mut f = IrFunction::new("t".into(), IrType::Void, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: good[..5].to_vec(),
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        f.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: good[5..].to_vec(),
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        let mut m = IrModule::new();
+        m.functions.push(f);
+        assert_eq!(collapse_vector_copy_chains(&mut m), 0, "cross block");
+    }
+
+    #[test]
+    fn two_independent_chains_both_collapse_but_shared_homes_are_claimed_once() {
+        use IntrinsicOp as O;
+        // Two fully disjoint chains: both plans must apply.
+        let mut disjoint = shape(16, O::Loaddqu, O::VecLoadI64x2, O::VecStoreI64x2);
+        let mut second = shape(16, O::Loaddqu, O::VecLoadI64x2, O::VecStoreI64x2);
+        // Rebase the second chain's value ids so nothing is shared.
+        let rebase = |insts: &mut Vec<Instruction>| {
+            for i in insts.iter_mut() {
+                match i {
+                    Instruction::Alloca { dest, .. } | Instruction::GlobalAddr { dest, .. } => {
+                        dest.0 += 20
+                    }
+                    Instruction::Intrinsic {
+                        dest,
+                        dest_ptr,
+                        args,
+                        ..
+                    } => {
+                        if let Some(d) = dest {
+                            d.0 += 20;
+                        }
+                        if let Some(d) = dest_ptr {
+                            d.0 += 20;
+                        }
+                        for a in args.iter_mut() {
+                            if let Operand::Value(x) = a {
+                                x.0 += 20;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        };
+        rebase(&mut second);
+        disjoint.extend(second);
+        let mut m = IrModule::new();
+        m.functions.push(func_with(disjoint));
+        assert_eq!(collapse_vector_copy_chains(&mut m), 2, "disjoint chains");
+
+        // Two chains that share the FINAL home: the `claimed` guard must
+        // allow exactly one, never two conflicting `dest_ptr` rewrites.
+        let mut shared = shape(16, O::Loaddqu, O::VecLoadI64x2, O::VecStoreI64x2);
+        let mut second = shape(16, O::Loaddqu, O::VecLoadI64x2, O::VecStoreI64x2);
+        for i in second.iter_mut() {
+            match i {
+                Instruction::Alloca { dest, .. } if dest.0 == 1 => dest.0 = 1, // shared final
+                Instruction::Alloca { dest, .. } | Instruction::GlobalAddr { dest, .. } => {
+                    dest.0 += 20
+                }
+                Instruction::Intrinsic {
+                    dest,
+                    dest_ptr,
+                    args,
+                    ..
+                } => {
+                    if let Some(d) = dest {
+                        d.0 += 20;
+                    }
+                    if let Some(d) = dest_ptr {
+                        if d.0 != 1 {
+                            d.0 += 20;
+                        }
+                    }
+                    for a in args.iter_mut() {
+                        if let Operand::Value(x) = a {
+                            if x.0 != 1 {
+                                x.0 += 20;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        shared.extend(second);
+        let mut m = IrModule::new();
+        m.functions.push(func_with(shared));
+        let n = collapse_vector_copy_chains(&mut m);
+        assert!(n <= 1, "shared final home must not produce two plans: {n}");
+    }
+
+    #[test]
+    fn rewrite_keeps_debug_spans_and_inline_ids_in_lockstep() {
+        use crate::common::source::Span;
+        use IntrinsicOp as O;
+        let insts = shape(16, O::Loaddqu, O::VecLoadI64x2, O::VecStoreI64x2);
+        let n = insts.len();
+        let mut f = IrFunction::new("t".into(), IrType::Void, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            terminator: Terminator::Return(None),
+            source_spans: vec![Span::dummy(); n],
+            source_inline_ids: vec![0; n],
+        });
+        let mut m = IrModule::new();
+        m.functions.push(f);
+        assert_eq!(collapse_vector_copy_chains(&mut m), 1);
+        let b = &m.functions[0].blocks[0];
+        assert_eq!(b.source_spans.len(), b.instructions.len(), "spans");
+        assert_eq!(
+            b.source_inline_ids.len(),
+            b.instructions.len(),
+            "inline ids"
+        );
+        assert_eq!(
+            b.instructions.len(),
+            n - 3,
+            "two intrinsics + dead alloca removed"
+        );
+    }
+
+    #[test]
+    fn empty_and_declaration_functions_are_noops() {
+        let mut m = IrModule::new();
+        let mut empty = IrFunction::new("e".into(), IrType::Void, vec![], false);
+        empty.is_declaration = true;
+        m.functions.push(empty);
+        m.functions
+            .push(IrFunction::new("b".into(), IrType::Void, vec![], false));
         assert_eq!(collapse_vector_copy_chains(&mut m), 0);
     }
 }

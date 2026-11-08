@@ -400,7 +400,7 @@ def count_ins(path: Path) -> int:
     return len(pat.findall(path.read_text())) if path.exists() else 0
 
 
-def execute_matrix(tmp: Path, mutate: bool) -> dict:
+def execute_matrix(tmp: Path, mutate: bool, asm_dir: Path | None = None) -> dict:
     src, names = generate_source()
     cpath = tmp / "matrix.c"
     cpath.write_text(src)
@@ -437,13 +437,23 @@ def execute_matrix(tmp: Path, mutate: bool) -> dict:
             raise RuntimeError(f"{label} run rc={rp.returncode}\n{rp.stderr[-2000:]}")
         builds[label] = {"stdout": rp.stdout, "returncode": rp.returncode}
 
-    # Assembly receipts for LCCC ON/OFF.
+    # Assembly receipts for ALL FOUR binaries.  The census needs the two
+    # reference compilers too; emitting them here keeps the CI wiring to one
+    # command instead of a second, drift-prone compile of a different source.
+    # `--asm-dir` persists them outside the temp dir for the per-function
+    # census and for elf/decoder audits.
     asm: dict[str, Path] = {}
-    for label, cmd, env in specs[:2]:
+    if asm_dir is not None:
+        asm_dir.mkdir(parents=True, exist_ok=True)
+    for label, cmd, env in specs:
         path = tmp / f"{label}.s"
         cp = run(cmd + ["-S", str(cpath), "-o", str(path)], env=env)
         if cp.returncode != 0:
             raise RuntimeError(f"{label} -S rc={cp.returncode}\n{cp.stderr[-1000:]}")
+        if asm_dir is not None:
+            persistent = asm_dir / f"{label}.s"
+            shutil.copyfile(path, persistent)
+            path = persistent
         asm[label] = path
 
     return {
@@ -594,6 +604,8 @@ def main() -> int:
     ap.add_argument("--json", type=Path, help="write a machine-readable receipt")
     ap.add_argument("--self-test", action="store_true",
                     help="mutation test: force maskfacts OFF for the ON build and require failure")
+    ap.add_argument("--asm-dir", type=Path,
+                    help="persist the four -S receipts for scripts/maskfacts_function_census.py")
     args = ap.parse_args()
 
     if args.write_fixture:
@@ -617,7 +629,11 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="maskfacts_vl_") as td:
         tmp = Path(td)
-        res = execute_matrix(tmp, mutate=os.environ.get("LCCC_MATRIX_MUTATE") == "1")
+        res = execute_matrix(
+            tmp,
+            mutate=os.environ.get("LCCC_MATRIX_MUTATE") == "1",
+            asm_dir=args.asm_dir,
+        )
         failures, notes = evaluate(res)
         diag_failures, diag_notes = check_immediate_diagnostics(tmp)
         sig_failures, sig_notes = check_public_set1_signature_parity()
