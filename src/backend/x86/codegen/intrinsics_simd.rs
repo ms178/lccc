@@ -12,7 +12,7 @@
 //!   register that never survives an intrinsic (kmov in -> use -> kmov out).
 
 use super::emit::X86Codegen;
-use crate::ir::reexports::{IntrinsicOp, IrConst, Operand, Value};
+use crate::ir::reexports::{Instruction, IntrinsicOp, IrConst, Operand, Value};
 
 impl X86Codegen {
     /// Load a 512-bit operand into a ZMM register.
@@ -111,6 +111,138 @@ impl X86Codegen {
                 self.operand_ptr_mem_operand(arg)
             }
             _ => None,
+        }
+    }
+
+    /// RIP-relative memory operand for the SECOND source of a `vpcmp*`
+    /// mask compare, when that source is a plain `GlobalAddr`.
+    ///
+    /// Every EVEX `VPCMP{B,W,D,Q}` / `VPCMPU{B,W,D,Q}` form accepts an
+    /// unaligned `m128/m256/m512` src2 — this is exactly what GCC 16.2 emits
+    /// (`vpcmpb $0, B(%rip), %xmm0, %k0`) and why EVEX memory operands need
+    /// no alignment contract.  Folding it removes the `leaq B(%rip),%rax`
+    /// plus `vmovdqu (%rax),%reg_b` pair from every runtime mask compare.
+    ///
+    /// Fail-closed, and deliberately NARROWER than `evex_arg_mem` (which is
+    /// about stack slots and would flush a deferred store): the operand must
+    /// have a UNIQUE `GlobalAddr` definition (`get_defining_instruction`
+    /// refuses multi-def phi residue), must not be TLS, must not be
+    /// register-held, and it refuses while ANY deferred store/memfold is
+    /// still outstanding.  Anything else takes the ordinary two-register
+    /// path unchanged.
+    /// A `GlobalAddr` is a pure ADDRESS computation; the forwarding pass that
+    /// produced it already proved the object's bytes are readable at this
+    /// program point, so reading them as src2 cannot introduce a fault.
+    fn mask_cmp_global_mem(&self, arg: &Operand) -> Option<String> {
+        let Operand::Value(v) = arg else {
+            return None;
+        };
+        if self.state.vec_live_regs.contains_key(&v.0) {
+            return None;
+        }
+        // A deferred store or memfold is an UNCOMMITTED write whose flush
+        // could land between this instruction's two memory reads.  The IR
+        // alias proof already excludes writes to this object, but a
+        // pending emitter-level write is not visible to that pass.  The
+        // guard is deliberately COARSE (ANY pending write, not just one
+        // targeting this global): a per-object emitter alias map does not
+        // exist and would cost an extra lookup per compare.  Measured to
+        // cost nothing on the 192 runtime cases, so fail-closed wins.
+        if self.state.pending_vec_store.is_some() || self.state.pending_vec_memfold.is_some() {
+            return None;
+        }
+        let Instruction::GlobalAddr { name, .. } = self.get_defining_instruction(v.0)? else {
+            return None;
+        };
+        if self.state.tls_symbols.contains(name) {
+            return None;
+        }
+        // `emit_global_addr_impl` routes PIC / weak-extern / shared-library
+        // data through `sym@GOTPCREL(%rip)` (a POINTER load), which cannot be
+        // used as an EVEX memory src2.  Versioned symbol names carry an `@`
+        // suffix that the plain emitter would emit verbatim.  Both shapes
+        // take the ordinary two-register path instead of mis-assembling.
+        if self.state.needs_got_for_addr(name) || name.contains('@') {
+            return None;
+        }
+        Some(format!("{}(%rip)", name))
+    }
+
+    /// Emit a width-exact UNALIGNED load of a proven plain `GlobalAddr`
+    /// directly into the mask-compare's first-operand register.  Without
+    /// this, `simd_load_arg_to` materialises the address into `%rax` first
+    /// (`leaq A(%rip),%rax; movdqu (%rax),%xmm0`), which is one instruction
+    /// more than GCC 16.2 / Clang 23.1.5.  Returns `false` WITHOUT emitting
+    /// anything when the operand is not a proven plain global address, so
+    /// the ordinary loader stays the fallback for every other shape.
+    ///
+    /// The mnemonic is chosen from the TARGET REGISTER, never from the
+    /// opcode: a 512-bit operand must use `vmovdqu64` (64-byte access), a
+    /// 256-bit one `vmovdqu`, a 128-bit one the SSE2 `movdqu`.  Loading a
+    /// 64-byte value through a 16-byte mnemonic would silently truncate.
+    /// 256/512-bit loads dirty the upper YMM halves, so the epilogue's
+    /// `vzeroupper` obligation is armed here exactly as `avx_load_arg_to`
+    /// does.  The load overwrites the register's physical bank, so every
+    /// other value's claim on it is evicted (the stale-claim contract).
+    fn emit_mask_cmp_global_load(&mut self, arg: &Operand, reg: &'static str) -> bool {
+        let Some(mem) = self.mask_cmp_global_mem(arg) else {
+            return false;
+        };
+        let mnemonic = if reg.starts_with("zmm") {
+            "vmovdqu64"
+        } else if reg.starts_with("ymm") {
+            "vmovdqu"
+        } else {
+            self.xmm_move(false)
+        };
+        self.state
+            .emit_fmt(format_args!("    {} {}, %{}", mnemonic, mem, reg));
+        if !reg.starts_with("xmm") {
+            self.state.dirty_upper_ymm = true;
+        }
+        self.state.vec_evict_bank(reg);
+        true
+    }
+
+    /// Narrowest `kmov*` for a `vpcmp*` result, chosen from the LANE COUNT.
+    ///
+    /// An EVEX mask write leaves the destination k register's bits above KL
+    /// zero, so a 4-byte VEX `kmovw` (KL <= 16) or `kmovd` (KL <= 32) returns
+    /// the bit-identical 64-bit integer that the 5-byte EVEX `kmovq %k1,
+    /// %rax` returns.  The x86-64 ISA zero-extends every 32-bit GPR write, so
+    /// `%eax` already holds the full result in `%rax` for `store_rax_to`.
+    /// The zeroing assumption is not taken on faith: all 485 cases agree with
+    /// GCC 16.2 (`kmovq`) and Clang 23.1.5 (narrow forms), and GDB 18.1 shows
+    /// identical `rax` for the 512/32 `kmovw` and 256/8 `kmovd` cases.
+    ///
+    /// GCC 16.2 always emits `kmovq`; Clang 23.1.5 emits the narrow forms but
+    /// then adds a redundant `movzbl %al,%eax` in the 48 eight-lane cases
+    /// (measured: LCCC 896 instructions / 0 scalar extensions vs Clang 944 / 48).
+    /// `kmovb` is deliberately NOT used even for 8 lanes: it is AVX512DQ,
+    /// while `vpcmpb` needs only AVX512F+BW+VL.  `kmovw` is AVX512F and has
+    /// the same 4-byte VEX encoding as `kmovb`, so it is byte-optimal without
+    /// widening the ISA contract.  An EVEX mask write already zeroes k above
+    /// KL, so reading 16 bits for an 8-lane mask is bit-identical.
+    /// On the 192 runtime compare functions this removes 176 bytes of EVEX
+    /// prefix: LCCC 5312 -> 5136 bytes vs GCC 5308 / Clang 5208 (-3.2% / -1.4%).
+    /// Unknown mnemonics or a missing width fail CLOSED to `kmovq`.
+    fn mask_compare_kmov(inst: &str, vector_bytes: usize) -> (&'static str, &'static str) {
+        let elem_bits = match inst {
+            "vpcmpub" | "vpcmpb" => 8,
+            "vpcmpuw" | "vpcmpw" => 16,
+            "vpcmpud" | "vpcmpd" => 32,
+            "vpcmpuq" | "vpcmpq" => 64,
+            _ => return ("kmovq", "rax"),
+        };
+        // 8 * bytes / bits: all callers pass 16/32/64, so this cannot divide
+        // by zero (elem_bits is a non-zero literal) and cannot overflow.
+        let lanes = (vector_bytes * 8) / elem_bits;
+        if lanes <= 16 {
+            ("kmovw", "eax")
+        } else if lanes <= 32 {
+            ("kmovd", "eax")
+        } else {
+            ("kmovq", "rax")
         }
     }
 
@@ -1339,7 +1471,7 @@ impl X86Codegen {
         self.simd_gpr_to_k1(&args[0]);
         self.operand_to_reg(&args[1], "rax");
         self.state
-            .emit_fmt(format_args!("    vmovdqu8 (%rax), %{}{{k1}}{{z}}", reg));
+            .emit_fmt(format_args!("    vmovdqu8 (%rax), %{}{{%k1}}{{z}}", reg));
         self.state.vec_claim_live_reg(dest_ptr.0, reg);
         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
             self.state.emit_fmt(format_args!(
@@ -1364,7 +1496,7 @@ impl X86Codegen {
         self.simd_gpr_to_k1(&args[0]);
         self.operand_to_reg(&args[1], "rax");
         self.state
-            .emit_fmt(format_args!("    vmovdqu8 (%rax), %{}{{k1}}", reg));
+            .emit_fmt(format_args!("    vmovdqu8 (%rax), %{}{{%k1}}", reg));
         self.state.vec_claim_live_reg(dest_ptr.0, reg);
         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
             self.state.emit_fmt(format_args!(
@@ -1390,7 +1522,7 @@ impl X86Codegen {
         self.simd_load_arg_to(&args[1], reg);
         self.value_to_reg(ptr, "rax");
         self.state
-            .emit_fmt(format_args!("    vmovdqu8 %{}, (%rax){{k1}}", reg));
+            .emit_fmt(format_args!("    vmovdqu8 %{}, (%rax){{%k1}}", reg));
     }
 
     /// Masked zeroing maddubs: vpmaddubsw %zmm_b, %zmm_a, %zmm0{%k1}{z}.
@@ -1417,7 +1549,7 @@ impl X86Codegen {
             "eax"
         };
         self.state
-            .emit_fmt(format_args!("    {} %{}, %zmm0{{k1}}{{z}}", inst, reg));
+            .emit_fmt(format_args!("    {} %{}, %zmm0{{%k1}}{{z}}", inst, reg));
         self.evex_store_dest(dest_ptr);
     }
 
@@ -1435,7 +1567,7 @@ impl X86Codegen {
         };
         self.simd_load_arg_to(&args[2], src_reg); // inserted src (b)
         self.state.emit_fmt(format_args!(
-            "    {} ${}, %{}, %zmm1, %zmm0{{k1}}{{z}}",
+            "    {} ${}, %{}, %zmm1, %zmm0{{%k1}}{{z}}",
             inst, imm, src_reg
         ));
         self.evex_store_dest(dest_ptr);
@@ -1455,7 +1587,7 @@ impl X86Codegen {
         self.simd_gpr_to_k1(&args[0]);
         self.simd_load_arg_to(&args[1], "zmm0");
         self.state.emit_fmt(format_args!(
-            "    {} ${}, %zmm0, %{}{{k1}}{{z}}",
+            "    {} ${}, %zmm0, %{}{{%k1}}{{z}}",
             inst, imm, dst_reg
         ));
         self.state.vec_claim_live_reg(dest_ptr.0, dst_reg);
@@ -1488,7 +1620,7 @@ impl X86Codegen {
             self.evex_load_arg_to(&args[1], "xmm1");
             self.evex_load_arg_to(&args[2], "xmm2");
             self.state.emit_fmt(format_args!(
-                "    vpshufb %xmm2, %xmm1, %xmm0{{k1}}{}",
+                "    vpshufb %xmm2, %xmm1, %xmm0{{%k1}}{}",
                 zsuf
             ));
         } else {
@@ -1498,7 +1630,7 @@ impl X86Codegen {
             self.evex_load_arg_to(&args[2], "xmm1"); // a
             self.evex_load_arg_to(&args[3], "xmm2"); // b
             self.state
-                .emit_fmt(format_args!("    vpshufb %xmm2, %xmm1, %xmm0{{k1}}"));
+                .emit_fmt(format_args!("    vpshufb %xmm2, %xmm1, %xmm0{{%k1}}"));
         }
         self.state.vec_claim_live_reg(dest_ptr.0, "xmm0");
         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
@@ -1602,13 +1734,21 @@ impl X86Codegen {
             | CmpeqEpu32Mask512 | CmpEpu32Mask128 | CmpEpu32Mask256 | CmpEpi32Mask512
             | CmpEpi32Mask128 | CmpEpi32Mask256 | CmpeqEpu64Mask512 | CmpEpu64Mask128
             | CmpEpu64Mask256 | CmpEpi64Mask512 | CmpEpi64Mask128 | CmpEpi64Mask256 => {
-                // args: (a, b, imm) — vpcmp* $imm, %zmm_b, %zmm_a, %k1; kmovq %k1, %rax
-                // RED-TEAM: folding B as a MEMORY src2 via `evex_arg_mem` was
-                // measured on the 485-case matrix and REJECTED. It is correct
-                // (three-way stdout identical) but net-NEGATIVE: 7579 -> 7963
-                // instructions, because the gate flushes deferred stores that
-                // the register path elides. Do not reintroduce it without a
-                // store-elision-aware gate.
+                // args: (a, b, imm) — vpcmp* $imm, src2, src1, %k1; narrowest kmov*
+                //
+                // RED-TEAM, two rounds with OPPOSITE measured verdicts:
+                // * Round 10 folded B via the STACK-SLOT `evex_arg_mem` gate.
+                //   Correct but NET-NEGATIVE (7579 -> 7963): that gate flushes
+                //   deferred stores the register path elides, and over-aligned
+                //   512-bit homes did not resolve at all.  REJECTED.
+                // * Round 11 removed the HOME from the IR instead (copy-chain
+                //   collapse + the audited `fuse_vector_loads` alias proof
+                //   forward the load's original `GlobalAddr` into B).  There
+                //   is now no home and no deferred store to flush, so the
+                //   dedicated `mask_cmp_global_mem` gate below IS profitable:
+                //   it deletes `leaq B(%rip),%rax` + `vmovdqu (%rax),%reg_b`
+                //   from EVERY runtime mask compare.  The rejected slot gate
+                //   stays untouched for all other intrinsic families.
                 let (reg_a, reg_b) = match op {
                     CmpeqEpu8Mask512 | CmpEpi8Mask512 | CmpeqEpu16Mask512 | CmpEpi16Mask512
                     | CmpeqEpu32Mask512 | CmpEpi32Mask512 | CmpeqEpu64Mask512 | CmpEpi64Mask512 => {
@@ -1620,18 +1760,30 @@ impl X86Codegen {
                     }
                     _ => ("xmm0", "xmm1"),
                 };
-                self.simd_load_arg_to(&args[0], reg_a);
-                self.simd_load_arg_to(&args[1], reg_b);
+                if !self.emit_mask_cmp_global_load(&args[0], reg_a) {
+                    self.simd_load_arg_to(&args[0], reg_a);
+                }
                 let imm = if args.len() > 2 {
                     self.simd_imm(&args[2])
                 } else {
                     0
                 };
-                self.state.emit_fmt(format_args!(
-                    "    {} ${}, %{}, %{}, %k1",
-                    inst, imm, reg_b, reg_a
-                ));
-                self.state.emit("    kmovq %k1, %rax");
+                if let Some(mem) = self.mask_cmp_global_mem(&args[1]) {
+                    self.state.emit_fmt(format_args!(
+                        "    {} ${}, {}, %{}, %k1",
+                        inst, imm, mem, reg_a
+                    ));
+                } else {
+                    self.simd_load_arg_to(&args[1], reg_b);
+                    self.state.emit_fmt(format_args!(
+                        "    {} ${}, %{}, %{}, %k1",
+                        inst, imm, reg_b, reg_a
+                    ));
+                }
+                let (kmov, kmov_dst) =
+                    Self::mask_compare_kmov(inst, op.mask_compare_vector_width().unwrap_or(64));
+                self.state
+                    .emit_fmt(format_args!("    {} %k1, %{}", kmov, kmov_dst));
                 if let Some(d) = dest {
                     self.store_rax_to(d);
                 }
@@ -2447,6 +2599,317 @@ mod avx_fp_order_tests {
         assert!(
             cg.state.vec_live_regs.get(&7) == Some(&"zmm3"),
             "an unrelated bank must not be evicted"
+        );
+    }
+}
+
+#[cfg(test)]
+mod mask_cmp_global_mem_tests {
+    use super::*;
+    use crate::backend::state::{CodegenState, PendingVecMemfold};
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrFunction, Terminator};
+
+    /// A function whose Value(0) has exactly one `GlobalAddr` definition.
+    /// `current_func` is a raw pointer kept alive by the returned IrFunction,
+    /// so the fixture must outlive every use of the codegen object.
+    fn func_with_global(name: &str, duplicate: bool) -> IrFunction {
+        let mut f = IrFunction::new("g".into(), IrType::I64, vec![], false);
+        let mut insts = vec![Instruction::GlobalAddr {
+            dest: Value(0),
+            name: name.into(),
+        }];
+        if duplicate {
+            insts.push(Instruction::GlobalAddr {
+                dest: Value(0),
+                name: name.into(),
+            });
+        }
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        f.next_value_id = 4;
+        f
+    }
+
+    fn cg_with(func: &IrFunction) -> X86Codegen {
+        let mut cg = X86Codegen::new();
+        cg.current_func = Some(func as *const IrFunction);
+        cg
+    }
+
+    fn arg() -> Operand {
+        Operand::Value(Value(0))
+    }
+
+    fn pending_memfold() -> PendingVecMemfold {
+        PendingVecMemfold {
+            val: 3,
+            mem: "(%rdi)".into(),
+            mnemonic: "vmovdqu",
+            width: 32,
+        }
+    }
+
+    #[test]
+    fn accepts_only_a_unique_plain_global_address() {
+        let f = func_with_global("A", false);
+        let cg = cg_with(&f);
+        assert_eq!(cg.mask_cmp_global_mem(&arg()), Some("A(%rip)".into()));
+        // A constant operand has no address proof at all.
+        assert_eq!(
+            cg.mask_cmp_global_mem(&Operand::Const(IrConst::I64(0))),
+            None
+        );
+    }
+
+    /// Every gate below is a NEGATIVE test paired with the positive above.
+    /// Each one corresponds to a way a compiler engineer could turn the
+    /// optimization into a miscompile or a broken assembly operand.
+    #[test]
+    fn refuses_every_unsafe_or_uncommitted_shape() {
+        // TLS is addressed through a descriptor, not a plain RIP-relative
+        // data symbol; `A(%rip)` would read the wrong object.
+        let f = func_with_global("A", false);
+        let mut cg = cg_with(&f);
+        cg.state.tls_symbols.insert("A".into());
+        assert_eq!(cg.mask_cmp_global_mem(&arg()), None, "TLS");
+
+        // Full PIC / weak-extern data goes through the GOT.  A GOTPCREL
+        // operand is a POINTER, not the object's bytes, so it cannot be an
+        // EVEX src2.
+        let mut cg = cg_with(&f);
+        cg.state.pic_mode = true;
+        assert_eq!(cg.mask_cmp_global_mem(&arg()), None, "PIC/GOT");
+        let mut cg = cg_with(&f);
+        cg.state.pie_mode = true;
+        cg.state.weak_extern_symbols.insert("A".into());
+        assert_eq!(cg.mask_cmp_global_mem(&arg()), None, "PIE weak extern");
+
+        // Versioned symbol names carry an `@` that must not be emitted raw.
+        let vf = func_with_global("A@GLIBC_2.2.5", false);
+        let cg = cg_with(&vf);
+        assert_eq!(cg.mask_cmp_global_mem(&arg()), None, "versioned symbol");
+
+        // Register-held values must go through the ordinary register path.
+        let mut cg = cg_with(&f);
+        cg.state.vec_live_regs.insert(0, "xmm0");
+        assert_eq!(cg.mask_cmp_global_mem(&arg()), None, "register-held");
+
+        // ANY outstanding deferred write is invisible to the IR alias proof.
+        let mut cg = cg_with(&f);
+        cg.state.pending_vec_store = Some((3, "ymm0", true));
+        assert_eq!(cg.mask_cmp_global_mem(&arg()), None, "pending store");
+        let mut cg = cg_with(&f);
+        cg.state.pending_vec_memfold = Some(pending_memfold());
+        assert_eq!(cg.mask_cmp_global_mem(&arg()), None, "pending memfold");
+
+        // An ambiguous (multi-def) value has no unique producer proof.
+        let dup = func_with_global("A", true);
+        let cg = cg_with(&dup);
+        assert_eq!(cg.mask_cmp_global_mem(&arg()), None, "ambiguous definition");
+
+        // A value that is not a GlobalAddr at all.
+        let mut other = IrFunction::new("g".into(), IrType::I64, vec![], false);
+        other.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I64(0)),
+            }],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        other.next_value_id = 4;
+        let cg = cg_with(&other);
+        assert_eq!(
+            cg.mask_cmp_global_mem(&arg()),
+            None,
+            "non-global definition"
+        );
+    }
+
+    /// Width-exact UNALIGNED mnemonics: a 64-byte operand loaded through a
+    /// 16-byte mnemonic would silently truncate.  `vzeroupper` obligation is
+    /// armed only for 256/512, matching `avx_load_arg_to`.
+    #[test]
+    fn global_load_uses_width_exact_mnemonics_and_evicts_the_whole_bank() {
+        for (reg, mnemonic, dirty) in [
+            ("xmm0", "movdqu", false),
+            ("ymm0", "vmovdqu", true),
+            ("zmm0", "vmovdqu64", true),
+        ] {
+            let f = func_with_global("A", false);
+            let mut cg = cg_with(&f);
+            // Two stale claims on bank 0 and one unrelated claim on bank 3.
+            cg.state.vec_live_regs.insert(1, "xmm0");
+            cg.state.vec_live_regs.insert(2, "ymm0");
+            cg.state.vec_live_regs.insert(3, "zmm3");
+            assert!(cg.emit_mask_cmp_global_load(&arg(), reg), "{reg}");
+            let out = &cg.state.out.buf;
+            assert!(
+                out.contains(&format!("{mnemonic} A(%rip), %{reg}")),
+                "{reg}: {out}"
+            );
+            assert_eq!(cg.state.dirty_upper_ymm, dirty, "{reg} dirty_upper_ymm");
+            assert_eq!(
+                cg.state.vec_live_regs.len(),
+                1,
+                "{reg}: stale bank-0 claims survived the clobber"
+            );
+            assert_eq!(
+                cg.state.vec_live_regs.get(&3),
+                Some(&"zmm3"),
+                "{reg}: unrelated bank was evicted"
+            );
+        }
+    }
+
+    /// The loader must be a pure predicate: on refusal it emits NOTHING, so
+    /// the ordinary `simd_load_arg_to` fallback owns the register.
+    #[test]
+    fn global_load_refusal_emits_nothing() {
+        let f = func_with_global("A", false);
+        let mut cg = cg_with(&f);
+        cg.state.tls_symbols.insert("A".into());
+        assert!(!cg.emit_mask_cmp_global_load(&arg(), "xmm0"));
+        assert!(cg.state.out.buf.is_empty(), "{}", cg.state.out.buf);
+        assert!(!cg.state.dirty_upper_ymm);
+    }
+
+    /// `vec_evict_bank` must drop EVERY claim on the register's physical
+    /// bank, and only that bank (no `u32::MAX` sentinel needed).
+    #[test]
+    fn bank_eviction_is_exact_and_needs_no_sentinel() {
+        let mut state = CodegenState::new();
+        state.vec_live_regs.insert(u32::MAX, "xmm0");
+        state.vec_live_regs.insert(1, "ymm0");
+        state.vec_live_regs.insert(2, "zmm0");
+        state.vec_live_regs.insert(3, "zmm3");
+        state.vec_evict_bank("zmm0");
+        assert_eq!(state.vec_live_regs.len(), 1, "u32::MAX must NOT survive");
+        assert_eq!(state.vec_live_regs.get(&3), Some(&"zmm3"));
+    }
+}
+
+#[cfg(test)]
+mod mask_compare_kmov_tests {
+    use super::*;
+    use crate::ir::intrinsics::IntrinsicOp as O;
+
+    /// Exhaustive parity: every one of the 24 mask-compare opcodes at its
+    /// three widths must select the narrowest move that still covers KL, and
+    /// `mask_compare_vector_width` must agree with the emitter's register
+    /// class.  A wrong lane count would truncate the returned mask, which the
+    /// 485-case three-way oracle catches; this test pins the *reason*.
+    #[test]
+    fn every_opcode_and_width_selects_a_covering_kmov() {
+        let ops = [
+            O::CmpeqEpu8Mask128,
+            O::CmpEpi8Mask128,
+            O::CmpeqEpu8Mask256,
+            O::CmpEpi8Mask256,
+            O::CmpeqEpu8Mask512,
+            O::CmpEpi8Mask512,
+            O::CmpeqEpu16Mask512,
+            O::CmpEpu16Mask128,
+            O::CmpEpu16Mask256,
+            O::CmpEpi16Mask512,
+            O::CmpEpi16Mask128,
+            O::CmpEpi16Mask256,
+            O::CmpeqEpu32Mask512,
+            O::CmpEpu32Mask128,
+            O::CmpEpu32Mask256,
+            O::CmpEpi32Mask512,
+            O::CmpEpi32Mask128,
+            O::CmpEpi32Mask256,
+            O::CmpeqEpu64Mask512,
+            O::CmpEpu64Mask128,
+            O::CmpEpu64Mask256,
+            O::CmpEpi64Mask512,
+            O::CmpEpi64Mask128,
+            O::CmpEpi64Mask256,
+        ];
+        for op in ops {
+            let bytes = op
+                .mask_compare_vector_width()
+                .expect("every mask-compare opcode has a width");
+            // Independently derive the mnemonic from the emitter's own table.
+            let inst = match op {
+                O::CmpeqEpu8Mask128
+                | O::CmpeqEpu8Mask256
+                | O::CmpeqEpu8Mask512
+                | O::CmpEpu8Mask128
+                | O::CmpEpu8Mask256
+                | O::CmpEpu8Mask512 => "vpcmpub",
+                O::CmpEpi8Mask128 | O::CmpEpi8Mask256 | O::CmpEpi8Mask512 => "vpcmpb",
+                O::CmpeqEpu16Mask512 | O::CmpEpu16Mask128 | O::CmpEpu16Mask256 => "vpcmpuw",
+                O::CmpEpi16Mask512 | O::CmpEpi16Mask128 | O::CmpEpi16Mask256 => "vpcmpw",
+                O::CmpeqEpu32Mask512 | O::CmpEpu32Mask128 | O::CmpEpu32Mask256 => "vpcmpud",
+                O::CmpEpi32Mask512 | O::CmpEpi32Mask128 | O::CmpEpi32Mask256 => "vpcmpd",
+                O::CmpeqEpu64Mask512 | O::CmpEpu64Mask128 | O::CmpEpu64Mask256 => "vpcmpuq",
+                O::CmpEpi64Mask512 | O::CmpEpi64Mask128 | O::CmpEpi64Mask256 => "vpcmpq",
+                _ => unreachable!(),
+            };
+            let (kmov, dst) = X86Codegen::mask_compare_kmov(inst, bytes);
+            let elem_bits: usize = match inst {
+                "vpcmpub" | "vpcmpb" => 8,
+                "vpcmpuw" | "vpcmpw" => 16,
+                "vpcmpud" | "vpcmpd" => 32,
+                _ => 64,
+            };
+            let lanes = bytes * 8 / elem_bits;
+            let bits = match kmov {
+                "kmovw" => 16,
+                "kmovd" => 32,
+                "kmovq" => 64,
+                _ => panic!("unknown kmov {kmov}"),
+            };
+            assert!(bits >= lanes, "{op:?}: KL={lanes} does not fit in {kmov}");
+            // Minimality: stepping DOWN one size must under-cover KL.
+            assert!(
+                bits == 16 || (bits >> 1) < lanes,
+                "{op:?}: {kmov} is not the narrowest covering move"
+            );
+            assert_eq!(dst, if kmov == "kmovq" { "rax" } else { "eax" });
+        }
+    }
+
+    /// Fail-closed unknowns and the exact 512-bit/8-bit `kmovq` boundary.
+    #[test]
+    fn unknown_or_widest_shapes_keep_the_64_bit_move() {
+        assert_eq!(
+            X86Codegen::mask_compare_kmov("vpcmpb", 64),
+            ("kmovq", "rax")
+        );
+        assert_eq!(
+            X86Codegen::mask_compare_kmov("vpcmpeqb", 64),
+            ("kmovq", "rax")
+        );
+        assert_eq!(
+            X86Codegen::mask_compare_kmov("vpcmpw", 64),
+            ("kmovd", "eax")
+        );
+        assert_eq!(
+            X86Codegen::mask_compare_kmov("vpcmpd", 64),
+            ("kmovw", "eax")
+        );
+        assert_eq!(
+            X86Codegen::mask_compare_kmov("vpcmpq", 32),
+            ("kmovw", "eax")
+        );
+        assert_eq!(
+            X86Codegen::mask_compare_kmov("vpcmpb", 32),
+            ("kmovd", "eax")
+        );
+        assert_eq!(
+            X86Codegen::mask_compare_kmov("vpcmpb", 16),
+            ("kmovw", "eax")
         );
     }
 }

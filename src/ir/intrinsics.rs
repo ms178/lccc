@@ -2121,6 +2121,44 @@ impl IntrinsicOp {
         })
     }
 
+    /// Byte width of the TWO pointer-backed vector operands of an AVX-512
+    /// / AVX-512VL `vpcmp*` mask-compare intrinsic, or `None` for every other
+    /// opcode. The third operand (when present) is a scalar predicate
+    /// immediate, never a vector; callers MUST still gate on the argument
+    /// index (`index < 2`).
+    ///
+    /// The single authoritative EVEX-width table for every IR consumer:
+    /// `fuse_vector_loads` forwarding, the argument-alignment relaxation
+    /// predicate and the x86 emitter's memory-operand gate.  The
+    /// constant-image folder keeps a SEPARATE lane-shape table (it needs
+    /// lane bytes, lane count and signedness, not just the EVEX width);
+    /// `mask_compare_width_table_covers_every_enum_variant_and_the_folder_shape_table`
+    /// below parses both op lists out of the source and pins them to the
+    /// enum, so a new opcode cannot be known to one and unknown to another.
+    /// Before this table existed, the forwarding table omitted all 30 mask
+    /// compares — which is why a runtime `_mm_cmpeq_epi8_mask` paid an
+    /// 18-instruction home roundtrip while the references paid 4.
+    ///
+    /// Widths are the EVEX vector widths (16/32/64), NOT the scalar mask
+    /// width: a `w128_epi64` compare reads 16 bytes and produces 2 mask bits.
+    /// Every EVEX memory form is alignment-safe, which is why the alignment
+    /// relaxation table may treat these argument positions as `Some(0)`.
+    pub fn mask_compare_vector_width(self) -> Option<usize> {
+        use IntrinsicOp::*;
+        Some(match self {
+            CmpeqEpu8Mask128 | CmpEpu8Mask128 | CmpEpi8Mask128 | CmpEpu16Mask128
+            | CmpEpi16Mask128 | CmpEpu32Mask128 | CmpEpi32Mask128 | CmpEpu64Mask128
+            | CmpEpi64Mask128 => 16,
+            CmpeqEpu8Mask256 | CmpEpu8Mask256 | CmpEpi8Mask256 | CmpEpu16Mask256
+            | CmpEpi16Mask256 | CmpEpu32Mask256 | CmpEpi32Mask256 | CmpEpu64Mask256
+            | CmpEpi64Mask256 => 32,
+            CmpeqEpu8Mask512 | CmpEpu8Mask512 | CmpEpi8Mask512 | CmpeqEpu16Mask512
+            | CmpEpu16Mask512 | CmpEpi16Mask512 | CmpeqEpu32Mask512 | CmpEpu32Mask512
+            | CmpEpi32Mask512 | CmpeqEpu64Mask512 | CmpEpu64Mask512 | CmpEpi64Mask512 => 64,
+            _ => return None,
+        })
+    }
+
     /// Width of an actual SIMD result (including explicit-SIMD result homes).
     /// An opcode property, not a claim that an instruction has a live `dest`:
     /// callers must check the instruction's destination separately. Stores
@@ -3984,6 +4022,172 @@ mod unsigned_dword_minmax_contract_tests {
             );
             assert!(!op.writes_memory_via_args());
             assert!(!op.may_read_memory());
+        }
+    }
+}
+
+#[cfg(test)]
+mod mask_compare_width_parity_tests {
+    use super::IntrinsicOp;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const ENUM_SRC: &str = include_str!("intrinsics.rs");
+    /// The constant-image folder keeps a SEPARATE lane-shape table.  Pinned
+    /// here at source level so a new mask-compare opcode cannot be known to
+    /// the width/forwarding table and unknown to the folder (or vice versa).
+    const FOLDER_SRC: &str = include_str!("../passes/simd_mask_facts.rs");
+
+    fn is_mask_name(t: &str) -> bool {
+        (t.starts_with("Cmp") || t.starts_with("Cmpeq"))
+            && (t.ends_with("Mask128") || t.ends_with("Mask256") || t.ends_with("Mask512"))
+            && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
+    /// Extract the set of mask-compare variant names from a source region.
+    fn names(src: &str, start: &str, end: &str) -> BTreeSet<String> {
+        let body = region(src, start, end);
+        let mut out = BTreeSet::new();
+        for line in body.lines() {
+            let t = line.trim();
+            if t.starts_with("//") || t.starts_with("*") {
+                continue;
+            }
+            for tok in t.split([',', '|']) {
+                let tok = tok
+                    .trim()
+                    .trim_start_matches("O::")
+                    .trim_start_matches("IntrinsicOp::");
+                if is_mask_name(tok) {
+                    out.insert(tok.to_owned());
+                }
+            }
+        }
+        out
+    }
+
+    fn region<'a>(src: &'a str, start: &str, end: &str) -> &'a str {
+        let s = src.find(start).unwrap_or_else(|| panic!("missing {start}"));
+        let body = &src[s..];
+        let e = body
+            .find(end)
+            .unwrap_or_else(|| panic!("unterminated {start}"));
+        &body[..e]
+    }
+
+    /// Extract (variant -> width) from a `match` table.  Both tables put the
+    /// width AFTER the names (`=> 16,` or `=> (16, 1, 16, true),`), and arms
+    /// wrap over several lines, so pending names are drained when the arm's
+    /// width token arrives.
+    fn widths(src: &str, start: &str, end: &str) -> BTreeMap<String, usize> {
+        let body = region(src, start, end);
+        let mut pending: Vec<String> = Vec::new();
+        let mut out = BTreeMap::new();
+        for line in body.lines() {
+            let t = line.trim();
+            if t.starts_with("//") || t.starts_with("*") {
+                continue;
+            }
+            let (lhs, rhs) = match t.split_once("=>") {
+                Some(pair) => pair,
+                None => (t, ""),
+            };
+            for tok in lhs.split([',', '|']) {
+                let tok = tok
+                    .trim()
+                    .trim_start_matches("O::")
+                    .trim_start_matches("IntrinsicOp::");
+                if is_mask_name(tok) {
+                    pending.push(tok.to_owned());
+                }
+            }
+            let rhs = rhs.trim().trim_start_matches('(');
+            let digits: String = rhs.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(width) = digits.parse::<usize>() {
+                for name in pending.drain(..) {
+                    out.insert(name, width);
+                }
+            }
+        }
+        out
+    }
+
+    fn suffix_width(name: &str) -> usize {
+        if name.ends_with("Mask128") {
+            16
+        } else if name.ends_with("Mask256") {
+            32
+        } else {
+            64
+        }
+    }
+
+    /// THE parity invariant.  A new `Cmp*Mask*` enum variant that is not
+    /// added to BOTH tables fails this test at compile/test time instead of
+    /// silently costing an 18-instruction HOME roundtrip in one pass while
+    /// being folded in another.
+    #[test]
+    fn every_mask_compare_variant_is_classified_by_both_tables_at_the_exact_width() {
+        let enum_set = names(ENUM_SRC, "pub enum IntrinsicOp", "\n}\n");
+        let width_map = widths(
+            ENUM_SRC,
+            "pub fn mask_compare_vector_width",
+            "\n        })\n",
+        );
+        let folder_map = widths(FOLDER_SRC, "fn mask_compare_shape", "\n    })\n");
+
+        assert_eq!(
+            enum_set.len(),
+            30,
+            "a mask-compare opcode was added or removed: update BOTH tables and re-measure"
+        );
+        assert_eq!(
+            BTreeSet::from_iter(width_map.keys().cloned()),
+            enum_set,
+            "width table and enum disagree: {:?}",
+            enum_set.symmetric_difference(&BTreeSet::from_iter(width_map.keys().cloned()))
+        );
+        assert_eq!(
+            BTreeSet::from_iter(folder_map.keys().cloned()),
+            enum_set,
+            "folder shape table and enum disagree: {:?}",
+            enum_set.symmetric_difference(&BTreeSet::from_iter(folder_map.keys().cloned()))
+        );
+        for name in &enum_set {
+            let expected = suffix_width(name);
+            assert_eq!(width_map.get(name), Some(&expected), "{name} width table");
+            assert_eq!(folder_map.get(name), Some(&expected), "{name} folder table");
+        }
+    }
+
+    /// Runtime (not source-level) spot check: the method really returns the
+    /// parsed width for a representative of each vector size and refuses
+    /// non-mask-compare intrinsics, including the `MaskzLoadu*` family whose
+    /// name also contains `Mask`.
+    #[test]
+    fn width_method_agrees_with_source_and_refuses_lookalikes() {
+        use IntrinsicOp as O;
+        for (op, w) in [
+            (O::CmpEpi8Mask128, 16),
+            (O::CmpeqEpu8Mask128, 16),
+            (O::CmpEpi64Mask128, 16),
+            (O::CmpEpu16Mask256, 32),
+            (O::CmpEpi32Mask256, 32),
+            (O::CmpeqEpu8Mask256, 32),
+            (O::CmpEpi8Mask512, 64),
+            (O::CmpeqEpu64Mask512, 64),
+            (O::CmpEpu16Mask512, 64),
+        ] {
+            assert_eq!(op.mask_compare_vector_width(), Some(w), "{op:?}");
+        }
+        for op in [
+            O::MaskzLoaduEpi8_128,
+            O::MaskStoreuEpi8_256,
+            O::MaskzSet1Epi16_512,
+            O::Pcmpeqb128,
+            O::VecLoadI64x2,
+            O::MovemaskPs128,
+        ] {
+            assert_eq!(op.mask_compare_vector_width(), None, "{op:?}");
         }
     }
 }

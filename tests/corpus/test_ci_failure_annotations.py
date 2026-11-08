@@ -188,7 +188,12 @@ class FailureAnnotationContracts(unittest.TestCase):
         self.assertEqual(sorted(lanes), sorted([
             "build", "debug", "corpus",
             "frontend-a", "frontend-b", "frontend-c", "codegen-a", "codegen-b",
-            "backend", "backend-contracts-a", "backend-contracts-b", "icx-oracle", "unit"]))
+            "backend", "backend-contracts-a", "backend-contracts-b", "icx-oracle",
+            # PR #1145: the AVX-512VL mask-compare differential restores the
+            # same pinned GCC 16.2 / Clang 23.1.5 bundle and therefore pays its
+            # own provisioner call.  It is listed exactly so a lane that
+            # silently stops provisioning is caught here.
+            "maskfacts-oracles", "unit"]))
 
 
 if __name__ == "__main__":

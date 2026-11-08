@@ -56,6 +56,27 @@ CACHE_BIN = Path(
     os.environ.get("LCCC_AGENT_CACHE_PREFIX", str(Path.home() / ".cache/lccc/agent-toolchains"))
 ) / "bin"
 FLAGS = ["-O2", "-mavx512f", "-mavx512bw", "-mavx512vl"]
+# Executing the generated binaries needs ALL three features on EVERY CPU.
+# `check_avx512_scalar_witness.py` establishes this repository's precedent:
+# AVX512F alone is not enough (vpcmpb is BW+VL), a host that lacks a feature
+# gets an explicit SKIP, and a silent pass is never acceptable.
+REQUIRED_ISA = ("avx512f", "avx512bw", "avx512vl")
+
+
+def host_supports_required_isa(cpuinfo: Path = Path("/proc/cpuinfo")):
+    """Return (supported, detail).  Never guesses from the toolchain."""
+    try:
+        rows = [
+            line.split(":", 1)[1].split()
+            for line in Path(cpuinfo).read_text().splitlines()
+            if line.startswith("flags") and ":" in line
+        ]
+    except OSError as exc:
+        return False, f"/proc/cpuinfo unreadable: {exc}"
+    if not rows:
+        return False, "no CPU flags reported"
+    missing = sorted({f for f in REQUIRED_ISA for row in rows if f not in row})
+    return not missing, ("missing " + ",".join(missing)) if missing else "all present"
 
 LOAD = {128: "_mm_loadu_si128", 256: "_mm256_loadu_si256", 512: "_mm512_loadu_si512"}
 LOAD_TY = {128: "__m128i_u", 256: "__m256i_u", 512: "void"}
@@ -400,7 +421,7 @@ def count_ins(path: Path) -> int:
     return len(pat.findall(path.read_text())) if path.exists() else 0
 
 
-def execute_matrix(tmp: Path, mutate: bool) -> dict:
+def execute_matrix(tmp: Path, mutate: bool, asm_dir: Path | None = None, execute: bool = True) -> dict:
     src, names = generate_source()
     cpath = tmp / "matrix.c"
     cpath.write_text(src)
@@ -432,23 +453,41 @@ def execute_matrix(tmp: Path, mutate: bool) -> dict:
         cp = run(cmd + [str(cpath), "-o", str(exe)], env=env)
         if cp.returncode != 0:
             raise RuntimeError(f"{label} compile rc={cp.returncode}\n{cp.stderr[-2000:]}")
-        rp = run([str(exe)], env=env, timeout=180)
-        if rp.returncode != 0:
-            raise RuntimeError(f"{label} run rc={rp.returncode}\n{rp.stderr[-2000:]}")
-        builds[label] = {"stdout": rp.stdout, "returncode": rp.returncode}
+        if execute:
+            rp = run([str(exe)], env=env, timeout=180)
+            if rp.returncode != 0:
+                raise RuntimeError(
+                    f"{label} run rc={rp.returncode}\n{rp.stderr[-2000:]}\n"
+                    "SIGILL (-4) on a runner usually means avx512bw/avx512vl "
+                    "are absent; use --require-execution on a capable host"
+                )
+            builds[label] = {"stdout": rp.stdout, "returncode": rp.returncode}
+        else:
+            builds[label] = {"stdout": None, "returncode": None}
 
-    # Assembly receipts for LCCC ON/OFF.
+    # Assembly receipts for ALL FOUR binaries.  The census needs the two
+    # reference compilers too; emitting them here keeps the CI wiring to one
+    # command instead of a second, drift-prone compile of a different source.
+    # `--asm-dir` persists them outside the temp dir for the per-function
+    # census and for elf/decoder audits.
     asm: dict[str, Path] = {}
-    for label, cmd, env in specs[:2]:
+    if asm_dir is not None:
+        asm_dir.mkdir(parents=True, exist_ok=True)
+    for label, cmd, env in specs:
         path = tmp / f"{label}.s"
         cp = run(cmd + ["-S", str(cpath), "-o", str(path)], env=env)
         if cp.returncode != 0:
             raise RuntimeError(f"{label} -S rc={cp.returncode}\n{cp.stderr[-1000:]}")
+        if asm_dir is not None:
+            persistent = asm_dir / f"{label}.s"
+            shutil.copyfile(path, persistent)
+            path = persistent
         asm[label] = path
 
     return {
         "names": names,
         "builds": builds,
+        "execution_skipped": not execute,
         "asm": asm,
         "counts": {
             label: {
@@ -463,7 +502,7 @@ def execute_matrix(tmp: Path, mutate: bool) -> dict:
     }
 
 
-def check_immediate_diagnostics(tmp: Path) -> tuple[list[str], list[str]]:
+def check_immediate_diagnostics(tmp: Path, execute: bool = True) -> tuple[list[str], list[str]]:
     """Negative diagnostic parity + positive constant-immediate control.
 
     Three compilers x two generated sources, EXECUTED for the positive case.
@@ -506,12 +545,17 @@ def check_immediate_diagnostics(tmp: Path) -> tuple[list[str], list[str]]:
         if cp.returncode != 0:
             failures.append(f"{label} rejected a constant-expression immediate: {cp.stderr[-400:]}")
             continue
+        if not execute:
+            continue  # compiled with -Werror; deliberately NOT executed
         rp = run([str(tmp / f"{label}_pos")], env=envs[label])
         if rp.returncode != 0:
             failures.append(f"{label} positive immediate binary rc={rp.returncode}")
             continue
         outs[label] = rp.stdout
-    if len(outs) == 3 and len(set(outs.values())) == 1:
+    if not execute:
+        notes.append("SKIP (positive-immediate execution): host lacks AVX-512BW/VL; "
+                     "compile/diagnostic controls still gate")
+    elif len(outs) == 3 and len(set(outs.values())) == 1:
         notes.append("constant-expression/enum immediates: 3-way stdout identical")
     elif len(outs) == 3:
         failures.append(f"positive immediate control disagrees: {outs}")
@@ -523,15 +567,92 @@ def check_immediate_diagnostics(tmp: Path) -> tuple[list[str], list[str]]:
         if cp.returncode != 0:
             failures.append(f"{label} maskz set1 compile rc={cp.returncode}: {cp.stderr[-400:]}")
             continue
+        if not execute:
+            continue  # compiled; deliberately NOT executed
         rp = run([str(tmp / f"{label}_mz")], env=envs[label])
         if rp.returncode != 0:
             failures.append(f"{label} maskz set1 run rc={rp.returncode}")
             continue
         mz_outs[label] = rp.stdout
-    if len(mz_outs) == 3 and len(set(mz_outs.values())) == 1:
+    if not execute:
+        notes.append("SKIP (maskz-set1 execution): host lacks AVX-512BW/VL")
+    elif len(mz_outs) == 3 and len(set(mz_outs.values())) == 1:
         notes.append("_mm512_maskz_set1_epi16(short): 3-way stored-byte hash identical")
     elif len(mz_outs) == 3:
         failures.append(f"maskz set1 stored bytes disagree: {mz_outs}")
+    return failures, notes
+
+
+BAD_GAS_MASK = re.compile(r"\{(?!%)k[0-7]\}")
+
+
+def runtime_code_sizes(obj: Path, names: list[str]) -> dict[str, int]:
+    """Per-function byte sizes from the ELF symtab, via binutils `nm -S`."""
+    cp = run(["nm", "-S", "--defined-only", str(obj)], timeout=120)
+    if cp.returncode != 0:
+        raise RuntimeError(f"nm -S failed on {obj}: {cp.stderr[-400:]}")
+    want = set(names)
+    sizes: dict[str, int] = {}
+    for line in cp.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[-1] in want:
+            try:
+                sizes[parts[-1]] = int(parts[1], 16)
+            except ValueError:
+                continue
+    return sizes
+
+
+def compare_code_sizes(totals: dict[str, int]) -> list[str]:
+    """Pure, self-testable ratchet: LCCC ON must not be larger than EITHER
+    pinned reference compiler on the runtime-compare functions."""
+    ours = totals.get("lccc_on")
+    if ours is None:
+        return ["lccc_on code size missing"]
+    bad = []
+    for ref in ("gcc16", "clang23"):
+        if ref in totals and ours > totals[ref]:
+            bad.append(f"lccc_on runtime bytes {ours} > {ref} {totals[ref]}")
+    return bad
+
+
+def check_gas_mask_syntax(asm: dict[str, Path], tmp: Path) -> tuple[list[str], list[str]]:
+    """GNU as requires `{%kN}`; LCCC used to emit `{kN}` (assembler error).
+
+    This is a REAL assembler check, not a string assertion: every `-S` receipt
+    is assembled with its producer's assembler, so an invalid EVEX decorator,
+    a bad RIP-relative operand or a broken relocation is caught even on a
+    runner that cannot EXECUTE AVX-512BW/VL.
+    """
+    failures: list[str] = []
+    notes: list[str] = []
+    for label, path in asm.items():
+        bad = BAD_GAS_MASK.findall(path.read_text())
+        if bad:
+            failures.append(
+                f"{label}: {len(bad)} GNU-as-invalid mask decorator(s) "
+                f"{sorted(set(bad))} (must be {{%kN}})"
+            )
+    for label in ("lccc_on", "lccc_off"):
+        if "{%k1}" not in asm[label].read_text():
+            failures.append(
+                f"{label}: no masked EVEX instruction in the receipt; gate is vacuous"
+            )
+    for label, path in asm.items():
+        cc = tool("clang-23") if label == "clang23" else tool("gcc-16")
+        obj = tmp / f"{label}_gas.o"
+        cp = run([cc, "-c", str(path), "-o", str(obj)], timeout=180)
+        if cp.returncode != 0:
+            failures.append(
+                f"{label}: assembler rejected the -S receipt rc={cp.returncode}: "
+                f"{cp.stderr[-400:]}"
+            )
+        elif not obj.exists() or obj.stat().st_size == 0:
+            failures.append(f"{label}: assembler produced no ELF object")
+        else:
+            notes.append(
+                f"{label}: {obj.stat().st_size} byte ELF object from {Path(cc).name}"
+            )
     return failures, notes
 
 
@@ -540,22 +661,32 @@ def evaluate(res: dict) -> tuple[list[str], list[str]]:
     failures: list[str] = []
     notes: list[str] = []
     builds = res["builds"]
-    oracle = builds["gcc16"]["stdout"]
-    for label in ("lccc_on", "lccc_off", "clang23"):
-        if builds[label]["stdout"] != oracle:
-            a, b = oracle.splitlines(), builds[label]["stdout"].splitlines()
-            diff = next(
-                (f"line {i+1}: gcc={x!r} {label}={y!r}"
-                 for i, (x, y) in enumerate(zip(a, b)) if x != y),
-                f"length gcc={len(a)} {label}={len(b)}",
-            )
-            failures.append(f"{label} stdout differs from GCC 16.2 ({diff})")
-        else:
-            notes.append(f"{label}: {len(oracle.splitlines())} lines byte-identical to GCC 16.2")
-    if builds["lccc_on"]["stdout"] != builds["lccc_off"]["stdout"]:
-        failures.append("maskfacts ON/OFF stdout differs (semantic miscompile)")
+    if res.get("execution_skipped"):
+        notes.append(
+            "SKIP (executed stdout leg): host lacks one of "
+            + ",".join(REQUIRED_ISA)
+            + "; all four binaries still COMPILE, LINK and emit -S, and every "
+              "static count/structural check below still gates"
+        )
     else:
-        notes.append("maskfacts ON/OFF stdout byte-identical")
+        oracle = builds["gcc16"]["stdout"]
+        for label in ("lccc_on", "lccc_off", "clang23"):
+            if builds[label]["stdout"] != oracle:
+                a, b = oracle.splitlines(), builds[label]["stdout"].splitlines()
+                diff = next(
+                    (f"line {i+1}: gcc={x!r} {label}={y!r}"
+                     for i, (x, y) in enumerate(zip(a, b)) if x != y),
+                    f"length gcc={len(a)} {label}={len(b)}",
+                )
+                failures.append(f"{label} stdout differs from GCC 16.2 ({diff})")
+            else:
+                notes.append(
+                    f"{label}: {len(oracle.splitlines())} lines byte-identical to GCC 16.2"
+                )
+        if builds["lccc_on"]["stdout"] != builds["lccc_off"]["stdout"]:
+            failures.append("maskfacts ON/OFF stdout differs (semantic miscompile)")
+        else:
+            notes.append("maskfacts ON/OFF stdout byte-identical")
 
     on, off = res["counts"]["lccc_on"], res["counts"]["lccc_off"]
     notes.append(
@@ -594,6 +725,12 @@ def main() -> int:
     ap.add_argument("--json", type=Path, help="write a machine-readable receipt")
     ap.add_argument("--self-test", action="store_true",
                     help="mutation test: force maskfacts OFF for the ON build and require failure")
+    ap.add_argument("--asm-dir", type=Path,
+                    help="persist the four -S receipts for scripts/maskfacts_function_census.py")
+    ap.add_argument("--require-code-size-parity", action="store_true",
+                    help="fail if LCCC ON runtime-compare bytes exceed GCC 16.2 or Clang 23.1.5")
+    ap.add_argument("--require-execution", action="store_true",
+                    help="FAIL on a host lacking avx512f/bw/vl instead of skipping the executed leg")
     args = ap.parse_args()
 
     if args.write_fixture:
@@ -603,10 +740,59 @@ def main() -> int:
         print(f"wrote {FIXTURE} ({len(src.splitlines())} lines)")
 
     if args.self_test:
+        with tempfile.TemporaryDirectory(prefix="maskfacts_cpu_") as cd:
+            cpu = Path(cd)
+            (cpu / "full").write_text(
+                "flags\t: fpu avx512f avx512bw avx512vl\n")
+            (cpu / "partial").write_text(
+                "flags\t: fpu avx512f avx512dq\n")
+            (cpu / "empty").write_text("")
+            assert host_supports_required_isa(cpu / "full") == (True, "all present")
+            assert host_supports_required_isa(cpu / "partial") == (
+                False, "missing avx512bw,avx512vl")
+            assert host_supports_required_isa(cpu / "empty") == (
+                False, "no CPU flags reported")
+            assert host_supports_required_isa(cpu / "absent")[0] is False
+        print("  capability gate self-test PASS (4 branches)")
+        with tempfile.TemporaryDirectory(prefix="maskfacts_gas_") as gd:
+            g = Path(gd)
+            bad_s = g / "bad.s"
+            good_s = g / "good.s"
+            for path, mask in ((bad_s, "{k1}"), (good_s, "{%k1}")):
+                path.write_text(
+                    ".text\n.globl f\n.type f, @function\nf:\n"
+                    f"    vmovdqu8 %xmm0, (%rdi){mask}\n"
+                    "    ret\n.size f, .-f\n"
+                )
+            as_bad = run([tool("gcc-16"), "-c", str(bad_s), "-o", str(g / "bad.o")])
+            as_good = run([tool("gcc-16"), "-c", str(good_s), "-o", str(g / "good.o")])
+            assert as_bad.returncode != 0, "GNU as ACCEPTED the invalid {k1} decorator"
+            assert as_good.returncode == 0, \
+                f"GNU as rejected the valid {{%k1}} decorator: {as_good.stderr}"
+            assert BAD_GAS_MASK.findall(bad_s.read_text()) == ["{k1}"]
+            assert BAD_GAS_MASK.findall(good_s.read_text()) == []
+            assert check_gas_mask_syntax(
+                {"lccc_on": good_s, "lccc_off": good_s,
+                 "gcc16": good_s, "clang23": good_s}, g)[0] == []
+            dirty = check_gas_mask_syntax({"lccc_on": bad_s, "lccc_off": good_s,
+                                          "gcc16": good_s, "clang23": good_s}, g)[0]
+            assert dirty, "gate missed an invalid decorator"
+        print("  GNU-as mask-syntax self-test PASS (reject {kN}, accept {%kN})")
+        # Code-size ratchet must reject every direction of regression.
+        assert compare_code_sizes({"lccc_on": 5136, "gcc16": 5308,
+                                   "clang23": 5208}) == []
+        assert compare_code_sizes({"lccc_on": 5309, "gcc16": 5308,
+                                   "clang23": 5208}), "GCC regression missed"
+        assert compare_code_sizes({"lccc_on": 5209, "gcc16": 5308,
+                                   "clang23": 5208}), "Clang regression missed"
+        assert compare_code_sizes({"gcc16": 5308, "clang23": 5208}), \
+            "missing lccc_on must fail closed"
+        print("  code-size ratchet self-test PASS (both oracles + fail-closed)")
         # The mutation is precisely the vacuous-harness failure: an ON build
         # that behaves like OFF must be REJECTED by evaluate().
         with tempfile.TemporaryDirectory(prefix="maskfacts_vl_selftest_") as td:
-            res = execute_matrix(Path(td), mutate=True)
+            ok, _ = host_supports_required_isa()
+            res = execute_matrix(Path(td), mutate=True, execute=ok)
             failures, _ = evaluate(res)
         if failures:
             print("self-test PASS: forcing maskfacts off is detected -> "
@@ -615,13 +801,59 @@ def main() -> int:
         print("self-test FAIL: a build with maskfacts disabled was ACCEPTED", file=sys.stderr)
         return 1
 
+    supported, detail = host_supports_required_isa()
+    if not supported and args.require_execution:
+        print(f"FAIL: host cannot execute the AVX-512VL matrix ({detail})", file=sys.stderr)
+        return 1
+    if supported:
+        print(f"  CPU capability: {detail}; executed stdout leg ENABLED")
     with tempfile.TemporaryDirectory(prefix="maskfacts_vl_") as td:
         tmp = Path(td)
-        res = execute_matrix(tmp, mutate=os.environ.get("LCCC_MATRIX_MUTATE") == "1")
+        res = execute_matrix(
+            tmp,
+            mutate=os.environ.get("LCCC_MATRIX_MUTATE") == "1",
+            asm_dir=args.asm_dir,
+            execute=supported,
+        )
         failures, notes = evaluate(res)
-        diag_failures, diag_notes = check_immediate_diagnostics(tmp)
+        gas_failures, gas_notes = check_gas_mask_syntax(res["asm"], tmp)
+        size_failures: list[str] = []
+        size_notes: list[str] = []
+        if args.require_code_size_parity and not gas_failures:
+            # Reuse the census's exact definition instead of a second parser.
+            from importlib.util import module_from_spec, spec_from_file_location
+            spec = spec_from_file_location(
+                "maskfacts_census_for_sizes",
+                str(ROOT / "scripts" / "maskfacts_function_census.py"))
+            census = module_from_spec(spec)
+            sys.modules[spec.name] = census
+            spec.loader.exec_module(census)
+            bodies, aliases = census.parse(res["asm"]["lccc_on"])
+            resolve = census.resolver(bodies, aliases)
+            names = [n for n in res["names"] if n.startswith("rt_")
+                     and any(m.startswith("vpcmp") for m in resolve(n))]
+            totals: dict[str, int] = {}
+            for label in ("lccc_on", "lccc_off", "gcc16", "clang23"):
+                sizes = runtime_code_sizes(tmp / f"{label}_gas.o", names)
+                if len(sizes) != len(names):
+                    size_failures.append(
+                        f"{label}: nm resolved {len(sizes)}/{len(names)} runtime functions"
+                    )
+                totals[label] = sum(sizes.values())
+            size_notes.append(
+                "runtime bytes: " + " ".join(f"{k}={v}" for k, v in sorted(totals.items()))
+            )
+            size_failures += compare_code_sizes(totals)
+            if not size_failures:
+                size_notes.append(
+                    f"PASS: lccc_on {totals['lccc_on']} bytes <= "
+                    f"gcc16 {totals['gcc16']} and clang23 {totals['clang23']}"
+                )
+        diag_failures, diag_notes = check_immediate_diagnostics(tmp, execute=supported)
         sig_failures, sig_notes = check_public_set1_signature_parity()
-        failures += diag_failures + sig_failures
+        failures += gas_failures + size_failures + diag_failures + sig_failures
+        notes += [f"assembler: {n}" for n in gas_notes]
+        notes += [f"code size: {n}" for n in size_notes]
         notes += [f"immediate: {n}" for n in diag_notes]
         notes += [f"signature: {n}" for n in sig_notes]
         if args.json:
@@ -631,7 +863,13 @@ def main() -> int:
                 "counts": res["counts"],
                 "stdout_sha256": {
                     k: __import__("hashlib").sha256(v["stdout"].encode()).hexdigest()
-                    for k, v in res["builds"].items()
+                    for k, v in res["builds"].items() if v["stdout"] is not None
+                },
+                "execution_skipped": res.get("execution_skipped", False),
+                "gas_mask_syntax": {"failures": gas_failures, "notes": gas_notes},
+                "runtime_code_size": {
+                    "required": bool(args.require_code_size_parity),
+                    "failures": size_failures, "notes": size_notes,
                 },
                 "immediate_diagnostics": {"failures": diag_failures, "notes": diag_notes},
                 "set1_signature_parity": {"failures": sig_failures, "notes": sig_notes},
@@ -644,7 +882,11 @@ def main() -> int:
         for f in failures:
             print("FAIL: " + f, file=sys.stderr)
         return 1
-    print(f"PASS: {len(res['names'])} generated cases, 4 binaries, three-way stdout identical")
+    print(
+        f"PASS: {len(res['names'])} generated cases, 4 binaries, "
+        + ("three-way stdout identical" if supported
+           else "static controls only (executed stdout leg SKIPPED: " + detail + ")")
+    )
     return 0
 
 

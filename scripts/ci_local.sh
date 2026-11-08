@@ -1987,6 +1987,36 @@ gate "llvm-bit-demand" fast python3 tests/regression/check_llvm_bit_demand.py
 gate "llvm-scalar-facts" fast python3 tests/regression/check_llvm_scalar_facts.py
 gate "llvm-guarded-folds" fast python3 tests/regression/check_llvm_guarded_folds.py
 gate "llvm-word-counts" fast python3 tests/regression/check_llvm_word_counts.py
+
+# Round 11: the AVX-512VL mask-compare differential is a hosted gate too
+# (.github/workflows/ci.yml, maskfacts-oracles job).  These registrations are
+# the local mirror's record so check_ci_gate_parity.py can prove neither side
+# silently drops a gate.  The harnesses need GCC 16.2 / Clang 23.1.5 exactly;
+# the hosted job pins both names to the installed oracles.
+gate "maskfacts-vl-matrix" fast \
+    python3 scripts/check_maskfacts_vl_matrix.py --asm-dir target/maskfacts-receipts/asm --require-code-size-parity --json target/maskfacts-receipts/matrix.json
+gate "maskfacts-function-census" fast \
+    python3 scripts/maskfacts_function_census.py --asm-dir target/maskfacts-receipts/asm --require-runtime-avg 5.0 --require-no-roundtrip --json target/maskfacts-receipts/census.json
+gate "maskfacts-memory-safety" fast \
+    python3 scripts/check_maskfacts_memory_safety.py --json target/maskfacts-receipts/safety.json
+
+# Round 12: the fourth-compiler (ICX 2026.2) leg.  The hosted ICX lane has the
+# authenticated Intel binary; the local mirror runs the identical contract
+# with GCC 16.2 / Clang 23.1.5 and adds ICX only when one is installed, so the
+# gate is never vacuous locally and never depends on an unavailable vendor
+# download.  ELF-level full-decode, leaf, no-roundtrip, global-layout and
+# narrowest-kmov ratchets run on EVERY host, even when execution is gated off.
+maskfacts_vendor_matrix() {
+    local -a icx_args=()
+    if [ -n "${LCCC_ICX_BIN:-}" ] && [ -x "$LCCC_ICX_BIN" ]; then
+        icx_args=(--icx "$LCCC_ICX_BIN" --require-icx)
+    fi
+    python3 scripts/check_maskfacts_vendor_matrix.py --self-test
+    python3 scripts/check_maskfacts_vendor_matrix.py \
+        --lccc target/fastbuild/lccc --gcc gcc-16 --clang clang-23 \
+        "${icx_args[@]}" --json target/maskfacts-receipts/vendor.json
+}
+gate "maskfacts-vendor-matrix" fast maskfacts_vendor_matrix
 gate "count-observations" fast python3 tests/regression/check_count_observations.py --clang "${CLANG:-clang-23}"
 gate "llvm-scalar-logic" fast python3 tests/regression/check_llvm_scalar_logic.py
 gate "llvm-ring-identities" fast python3 tests/regression/check_llvm_ring_identities.py

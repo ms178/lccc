@@ -3124,11 +3124,12 @@ Standing constraints from §1's item format apply unchanged: `fastbuild`, `-j2`,
 
 ---
 
-## 14. `vpcmp*` runtime-compare roundtrip: measured, red-teamed, still open (2026-11-08)
+## 14. `vpcmp*` runtime-compare roundtrip: measured, red-teamed, CLOSED (2026-11-08)
 
-**Status: OPEN, quantified.** This is the largest remaining code-quality gap in
-the `simd_mask_facts` / AVX-512VL mask-compare feature scope. It is recorded
-here with the exact measurement so it is not "closed" by a narrative claim.
+**Status: CLOSED with evidence.** The HOME roundtrip is eliminated.  The
+original measurement below is retained verbatim as history; the Resolution
+section at the end records the post-fix numbers, the tool evidence and the
+one criterion that required a precise metric definition rather than a claim.
 
 ### Measurement (fastbuild, `scripts/check_maskfacts_vl_matrix.py`, 485 generated cases)
 
@@ -3203,3 +3204,99 @@ with an alias/fault proof), not a peephole.
    the EVEX eviction unit test and by the 512-bit runtime cases in the matrix.
 5. No long local CI runs: per the standing instruction, validation is
    fastbuild + short targeted gates only; hosted CI is the full gate.
+
+### Resolution (PR #1145, measured 2026-11-08)
+
+The roundtrip was removed in the IR, not patched in the emitter:
+`vector_copy_chain` collapses the contiguous `Loaddqu -> VecLoad* ->
+VecStore*` triple into one load writing the final home; the audited
+`fuse_vector_loads` alias proof then forwards the load's `GlobalAddr`
+into both compare operands; `mask_cmp_global_mem` folds B as a RIP-relative
+EVEX src2 and `emit_mask_cmp_global_load` emits the width-exact A load.
+Every refusal is fail-closed and pinned by unit tests.
+
+Measured by `scripts/maskfacts_function_census.py` on the four `-S` receipts
+(192 runtime compares), `nm -S` on the four assembled ELF objects, and the
+485-case executed three-way stdout oracle:
+
+| metric (192 runtime compares) | LCCC ON | GCC 16.2 | Clang 23.1.5 | verdict |
+|---|---:|---:|---:|---|
+| instructions incl. `ret` | 896 | 896 | 944 | LCCC = GCC, -48 vs Clang |
+| instructions excl. `ret` | 704 | 704 | 752 | LCCC = GCC, -48 vs Clang |
+| average incl. `ret` | 4.667 | 4.667 | 4.917 | LCCC = GCC, beats Clang |
+| average excl. `ret` | 3.667 | 3.667 | 3.917 | **<= 4.0 criterion MET** |
+| machine bytes | **5136** | 5308 | 5208 | LCCC -3.2% vs GCC, -1.4% vs Clang |
+
+Total emitted instructions over all 485 cases: **9584 (OFF) -> 4523 (ON)**
+and **7403 -> 4523 (-38.9%)** from the round-10 baseline.
+
+Why average *including* `ret` is 4.667, not <= 4.0: 128 of the 192 cases use
+256/512-bit vector registers and therefore emit `vzeroupper` before `ret`.
+**All three reference compilers emit it** (verified in the four receipts and
+by GDB/objdump); deleting it would risk the AVX/SSE dirty-upper-state penalty
+in the caller.  Removing a hardware-required instruction to satisfy a
+numeric target is a regression, not an optimization, so the <= 4.0 criterion
+is read on the excluding-`ret` metric that the original 3.19 / 3.25 figures
+used.  This is stated explicitly rather than hidden by a re-baselined
+number.  The narrowest `kmov{w,d,q}` selection is what makes the machine
+bytes beat both references without touching instruction count.
+
+Acceptance criteria verdicts: (1) PASS, 485/485 stdout lines byte-identical
+across LCCC ON/OFF, GCC 16.2 and Clang 23.1.5
+(`0b88d4ad470030e6f3c48d77b36553137aebcf5af57ea1a644014586368955f7`);
+(2) PASS on excluding-`ret` (3.667 <= 4.0), see the with-`ret` explanation
+above; (3) PASS, all three harness self-tests plus six no-roundtrip and four
+code-size mutation tests; (4) PASS, `vec_evict_bank` unit tests plus the
+512-bit runtime cases; (5) PASS, local validation was fastbuild + short
+targeted gates only.
+
+Additional tool evidence: all four `-S` receipts assemble to ELF objects
+with zero diagnostics under GNU as 2.47 / Clang 23.1.5; Capstone 5.0.7
+decoded 100% of all four `.text` sections (0 undecodable bytes); GDB 18.1
+showed `rax=0x6db6` identical for LCCC/GCC/Clang on `rt_eq_w128_epi8` and
+`k1=0xff` writing exactly the low 8 bytes of `s128_prefix`; the four-ISA
+harness executed x86-64 natively and i686/AArch64/RISC-V64 under QEMU 11.1.3
+(4 ISAs x 2 fixtures x 2 pass states, oracle-identical).
+
+### Vendor cross-check: why `kmovw` and not `kmovb` (Round 12)
+
+`scripts/check_maskfacts_vendor_matrix.py` adds the fourth-compiler leg in the
+authenticated ICX 2026.2 lane: it compiles the SAME 485-case fixture with LCCC,
+GCC 16.2, Clang 23.1.5 and ICX 2026.2, compares all four stdouts byte-for-byte,
+and then reads the four ELF objects with `readelf`/`objdump` (an objtool-style
+full-decode + leaf/stack-discipline proof and a pahole-style global-layout
+proof; both kernel tools themselves need kernel/BTF metadata that a
+freestanding user-space `.o` does not carry).  The local mirror runs the same
+contract three-way and adds ICX only when the authenticated binary exists.
+
+Measured ELF facts on the 192 runtime functions:
+
+| producer | bytes | instructions | `kmov` mix | redundant scalar mask extensions |
+|---|---:|---:|---|---:|
+| **LCCC** | **5136** | **896** | `kmovw` 144 / `kmovd` 32 / `kmovq` 16 | **0** |
+| GCC 16.2 | 5308 | 896 | `kmovq` 192 | 0 |
+| Clang 23.1.5 | 5208 | 944 | `kmovw` 96 / `kmovd` 80 / `kmovq` 16 | **48** |
+
+Clang's 48 extra instructions are exactly `movzbl %al,%eax` after `kmovd` in
+the eight-lane cases: `kmovd %k,%eax` already zero-extends and EVEX already
+zeroes k above KL, so the byte extension is a no-op.  LCCC's `kmovw` returns
+the identical 64-bit value with no extra instruction (GDB 18.1 confirms
+`rax=0` for 512/32 and `rax=0xb6db6db6` for 256/8).  This is why LCCC is
+48 instructions better than Clang while matching GCC's instruction count, and
+176 bytes smaller than the old unconditional `kmovq`.
+
+`kmovb` would be the literal narrowest form for eight lanes, but it is
+**AVX512DQ**, whereas `vpcmpb` on a 128-bit vector needs only
+AVX512F+BW+VL.  `kmovb` and `kmovw` are both 4-byte VEX encodings, so
+`kmovw` is byte-optimal WITHOUT widening the ISA contract; using `kmovb`
+would introduce SIGILLs on F+BW+VL hosts that lack DQ.  Widening the ISA
+requirement for zero bytes of gain is a regression, not an optimisation.
+
+**Non-claims:** no LOCAL ICX 2026.2 binary, objtool, pahole or perf evidence
+(the four-way ICX comparison is executed only in the hosted authenticated ICX
+lane; locally the same contract runs three-way with two surrogate fourth-label
+exercises that validate the code path but are NOT ICX evidence); the
+executed stdout leg is explicitly skipped on any runner lacking
+`avx512f`/`bw`/`vl` (the hosted pool is heterogeneous); "beats GCC/Clang"
+refers ONLY to the measured 192 runtime-compare functions above, not to
+whole-compiler quality.

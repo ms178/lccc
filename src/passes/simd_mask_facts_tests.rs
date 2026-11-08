@@ -8,6 +8,7 @@ use super::*;
 use crate::common::source::Span;
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::reexports::{BasicBlock, BlockId, IrUnaryOp, Terminator};
+use crate::ir::reexports::{GlobalInit, IrGlobal, IrModule};
 
 fn alloca(dest: Value, size: usize, volatile: bool, semantic_volatile: bool) -> Instruction {
     Instruction::Alloca {
@@ -6979,4 +6980,226 @@ fn mask_compare_cast_fold_is_applied_by_run_function() {
             .any(|i| matches!(i, Instruction::Cast { .. })),
         "no redundant cast may survive"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Round 11: the forwarded `GlobalAddr` purity proof.  Every positive case is
+// paired with a mutation that MUST refuse, because the proof is what allows
+// the folder to delete a runtime read (`x op x`, predicates 3 and 7).
+// ---------------------------------------------------------------------------
+
+fn plain_global(name: &str) -> IrGlobal {
+    IrGlobal {
+        name: name.into(),
+        ty: IrType::I8,
+        size: 64,
+        align: 16,
+        init: GlobalInit::Zero,
+        is_static: true,
+        is_extern: false,
+        is_common: false,
+        section: None,
+        is_weak: false,
+        visibility: None,
+        has_explicit_align: false,
+        is_const: false,
+        is_used: false,
+        is_retain: false,
+        is_nocommon: false,
+        is_thread_local: false,
+    }
+}
+
+#[test]
+fn unobservable_global_addrs_refuses_every_interposable_or_special_global() {
+    let mut m = IrModule::new();
+    m.globals.push(plain_global("plain_ok"));
+    m.globals.push(plain_global("const_rodata_ok"));
+    m.globals.last_mut().unwrap().is_const = true;
+    for (name, field) in [
+        ("extern_obj", "is_extern"),
+        ("weak_obj", "is_weak"),
+        ("common_obj", "is_common"),
+        ("tls_obj", "is_thread_local"),
+        ("section_obj", "section"),
+        ("zero_size", "size"),
+    ] {
+        let mut g = plain_global(name);
+        match field {
+            "is_extern" => g.is_extern = true,
+            "is_weak" => g.is_weak = true,
+            "is_common" => g.is_common = true,
+            "is_thread_local" => g.is_thread_local = true,
+            "section" => g.section = Some(".custom".into()),
+            "size" => g.size = 0,
+            _ => unreachable!(),
+        }
+        m.globals.push(g);
+    }
+    // Redirected by an alias (both the alias name AND its target are
+    // excluded), by a weak symbol attribute, by an ifunc and by an asm label.
+    m.globals.push(plain_global("alias_name"));
+    m.globals.push(plain_global("alias_target"));
+    m.globals.push(plain_global("weak_attr"));
+    m.globals.push(plain_global("ifunc_obj"));
+    m.globals.push(plain_global("asm_label_obj"));
+    m.aliases
+        .push(("alias_name".into(), "alias_target".into(), false));
+    m.symbol_attrs.push(("weak_attr".into(), true, None));
+    m.ifuncs
+        .push(("ifunc_obj".into(), "resolver".into(), false, None));
+    m.asm_labels
+        .insert("asm_label_obj".into(), "asm_target".into());
+
+    let set = super::unobservable_global_addrs(&m);
+    assert!(
+        set.contains("plain_ok"),
+        "an ordinary defined data object must be provable"
+    );
+    assert!(
+        set.contains("const_rodata_ok"),
+        "const qualification does NOT make reads observable"
+    );
+    for rejected in [
+        "extern_obj",
+        "weak_obj",
+        "common_obj",
+        "tls_obj",
+        "section_obj",
+        "zero_size",
+        "alias_name",
+        "alias_target",
+        "weak_attr",
+        "ifunc_obj",
+        "asm_label_obj",
+    ] {
+        assert!(!set.contains(rejected), "{rejected} must be refused");
+    }
+}
+
+/// A minimal function: `%10 = GlobalAddr(name)`, then a mask compare reading
+/// that SAME value twice (the `x op x` identity needs `operand_is_pure`).
+fn global_operand_function(name: &str, volatile_load: bool) -> IrFunction {
+    use IntrinsicOp as O;
+    let mut insts = vec![
+        Instruction::GlobalAddr {
+            dest: Value(10),
+            name: name.into(),
+        },
+        intrinsic(
+            Some(Value(1)),
+            O::CmpEpi8Mask128,
+            None,
+            vec![
+                Operand::Value(Value(10)),
+                Operand::Value(Value(10)),
+                Operand::Const(IrConst::I32(0)),
+            ],
+        ),
+    ];
+    if volatile_load {
+        insts.push(Instruction::Load {
+            dest: Value(11),
+            ptr: Value(10),
+            ty: IrType::I8,
+            volatile: true,
+            seg_override: AddressSpace::Default,
+        });
+    }
+    let mut f = IrFunction::new("global_operand".into(), IrType::I32, vec![], false);
+    f.blocks.push(block(
+        insts,
+        Terminator::Return(Some(Operand::Value(Value(1)))),
+        true,
+    ));
+    f.next_value_id = 100;
+    f
+}
+
+fn global_operand_is_pure(f: &IrFunction, globals: Option<&FxHashSet<String>>) -> bool {
+    let facts = Facts::with_globals(f, globals);
+    facts.operand_is_pure(Operand::Value(Value(10)), &mut 128)
+}
+
+#[test]
+fn forwarded_global_operand_purity_is_fail_closed() {
+    let mut known: FxHashSet<String> = FxHashSet::default();
+    known.insert("A".into());
+
+    // POSITIVE: ordinary defined global + module facts -> pure.
+    let f = global_operand_function("A", false);
+    assert!(global_operand_is_pure(&f, Some(&known)));
+
+    // NEGATIVE 1: no module facts (the ~200 legacy IR tests run this way).
+    // `run_function` must stay conservative; only `run(module)` opens the gate.
+    assert!(!global_operand_is_pure(&f, None));
+
+    // NEGATIVE 2: an unknown / interposable global is never accepted.
+    let f = global_operand_function("not_in_module", false);
+    assert!(!global_operand_is_pure(&f, Some(&known)));
+
+    // NEGATIVE 3: an empty module fact set accepts nothing.
+    let f = global_operand_function("A", false);
+    assert!(!global_operand_is_pure(&f, Some(&FxHashSet::default())));
+
+    // NEGATIVE 4: the IR has no per-global volatile flag.  A volatile ACCESS
+    // anywhere in the function vetoes the whole proof, because that access
+    // may target the very object whose bytes the fold would stop reading.
+    let f = global_operand_function("A", true);
+    assert!(!global_operand_is_pure(&f, Some(&known)));
+
+    // NEGATIVE 5: a value with no definition at all has no proof.
+    let mut f = global_operand_function("A", false);
+    f.blocks[0].instructions[0] = Instruction::GlobalAddr {
+        dest: Value(12),
+        name: "A".into(),
+    };
+    assert!(!global_operand_is_pure(&f, Some(&known)));
+}
+
+#[test]
+fn volatile_fence_atomic_and_inline_asm_all_veto_the_global_operand_proof() {
+    let mut known: FxHashSet<String> = FxHashSet::default();
+    known.insert("A".into());
+    let base = global_operand_function("A", false);
+    // Use the real IR shapes so the test pins the same matcher as `Facts`.
+    let effects: Vec<(&str, Instruction)> = vec![
+        (
+            "volatile store",
+            Instruction::Store {
+                val: Operand::Const(IrConst::I8(1)),
+                ptr: Value(10),
+                ty: IrType::I8,
+                seg_override: AddressSpace::Default,
+                volatile: true,
+            },
+        ),
+        (
+            "fence",
+            Instruction::Fence {
+                ordering: crate::ir::reexports::AtomicOrdering::SeqCst,
+            },
+        ),
+        (
+            "inline asm",
+            Instruction::InlineAsm {
+                template: "".into(),
+                outputs: vec![],
+                inputs: vec![],
+                clobbers: vec![],
+                operand_types: vec![],
+                goto_labels: vec![],
+                input_symbols: vec![],
+                seg_overrides: vec![],
+            },
+        ),
+    ];
+    for (label, inst) in effects {
+        let mut f = base.clone();
+        f.blocks[0].instructions.push(inst);
+        assert!(
+            !global_operand_is_pure(&f, Some(&known)),
+            "{label} must veto the global purity proof"
+        );
+    }
 }

@@ -104,7 +104,7 @@ fn temp_result_width(op: IntrinsicOp) -> Option<usize> {
 
 /// Direct, full-width loads for which `args[0]` denotes exactly the bytes
 /// written to `dest_ptr`.  Offset, masked and partial loads are excluded.
-fn direct_vector_load_width(op: IntrinsicOp) -> Option<usize> {
+pub(super) fn direct_vector_load_width(op: IntrinsicOp) -> Option<usize> {
     match op {
         IntrinsicOp::Loaddqu => Some(16),
         IntrinsicOp::Loadu512 => Some(64),
@@ -208,6 +208,25 @@ pub(super) fn pointer_vector_arg_width(op: IntrinsicOp, index: usize) -> Option<
 /// Width table for consumer operands, separate from the source-width cases above.
 fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<usize> {
     use IntrinsicOp as O;
+    // AVX-512 / AVX-512VL `vpcmp*` mask compares.  args[0] and args[1] are
+    // the two pointer-backed vector operands; args[2] is a scalar predicate
+    // immediate and MUST NOT be classified as vector bytes (forwarding a
+    // load into it would replace `$imm` with an address).  The single
+    // `IntrinsicOp::mask_compare_vector_width` table is shared with the
+    // alignment-relaxation predicate and the x86 emitter; the mask-facts
+    // constant-image folder has its own lane-shape table that a source-level
+    // parity unit test pins to this same opcode set.
+    //
+    // Classifying these positions is what lets the audited
+    // `fuse_vector_loads` alias proof forward a `_mm_loadu_si128` /
+    // `_mm256_loadu_si256` / `_mm512_loadu_si512` source directly into the
+    // consumer, removing the vector HOME roundtrip for every runtime mask
+    // compare.  EVEX memory operands carry NO alignment contract, so
+    // `intrinsic_arg_required_alignment` also correctly reports `Some(0)`
+    // for them.
+    if let Some(width) = op.mask_compare_vector_width() {
+        return (index < 2).then_some(width);
+    }
     let width = match op {
         // 128-bit FP destructive two-operand consumers (add/sub/mul/div/min/max
         // in ps/pd/sd/ss): both operands are 16-byte vector slots.  Shared
@@ -4474,5 +4493,56 @@ mod tests {
                 noalias: false,
             },
         ));
+    }
+}
+
+#[cfg(test)]
+mod mask_compare_forwarding_tests {
+    use super::*;
+
+    /// The forwarding table is the load-bearing piece of the roundtrip fix:
+    /// args[0]/args[1] must be classified as vector bytes at the EXACT EVEX
+    /// width, while args[2] is a scalar predicate immediate.  Forwarding a
+    /// load into args[2] would replace `$imm` with an address and miscompile
+    /// every `_mm_cmp_epi*_mask`.
+    #[test]
+    fn mask_compare_operands_are_width_classified_but_the_predicate_is_not() {
+        for (op, w) in [
+            (IntrinsicOp::CmpEpi8Mask128, 16),
+            (IntrinsicOp::CmpeqEpu8Mask128, 16),
+            (IntrinsicOp::CmpEpi64Mask128, 16),
+            (IntrinsicOp::CmpEpu16Mask256, 32),
+            (IntrinsicOp::CmpEpi32Mask256, 32),
+            (IntrinsicOp::CmpeqEpu8Mask256, 32),
+            (IntrinsicOp::CmpEpi8Mask512, 64),
+            (IntrinsicOp::CmpeqEpu16Mask512, 64),
+            (IntrinsicOp::CmpEpu64Mask512, 64),
+        ] {
+            assert_eq!(pointer_vector_arg_width(op, 0), Some(w), "{op:?} arg0");
+            assert_eq!(pointer_vector_arg_width(op, 1), Some(w), "{op:?} arg1");
+            for index in [2, 3, 8] {
+                assert_eq!(
+                    pointer_vector_arg_width(op, index),
+                    None,
+                    "{op:?} arg{index} is not a vector byte window"
+                );
+            }
+        }
+    }
+
+    /// A lookalike intrinsic (name contains `Mask`) must NOT inherit the
+    /// mask-compare classification: masked loads/stores have a mask operand
+    /// and a pointer, not two symmetric vector byte windows.
+    #[test]
+    fn mask_lookalikes_are_not_classified_as_mask_compares() {
+        for op in [
+            IntrinsicOp::MaskzLoaduEpi8_128,
+            IntrinsicOp::MaskStoreuEpi8_256,
+            IntrinsicOp::MaskzSet1Epi16_512,
+            IntrinsicOp::Pdep32,
+            IntrinsicOp::VecLoadI64x2,
+        ] {
+            assert_eq!(op.mask_compare_vector_width(), None, "{op:?}");
+        }
     }
 }

@@ -1086,6 +1086,19 @@ struct Facts<'a> {
     /// Allocas with at least one recognized constant write.  A cheap gate so
     /// an ordinary scalar load never pays for a full image proof.
     constant_bases: FxHashSet<u32>,
+    /// Names of module-level data objects whose bytes may be read without an
+    /// observable side effect (see `unobservable_global_addrs`).  `None` for
+    /// analysis-only snapshots that have no module to prove them: those
+    /// snapshots refuse `GlobalAddr` operands, which is the fail-closed
+    /// behaviour every unit test constructed before this field existed.
+    unobservable_globals: Option<&'a FxHashSet<String>>,
+    /// Coarse but SOUND gate for the `GlobalAddr` purity proof: if the
+    /// function contains ANY volatile/atomic/fence/asm/call memory effect,
+    /// refuse every global operand.  A `volatile`-qualified object has no
+    /// per-global flag in `IrGlobal`, so the only fail-closed proof is that
+    /// no volatile ACCESS exists anywhere in the function.  Refusing in an
+    /// unrelated function is harmless; accepting one volatile read is not.
+    volatile_effects: bool,
 }
 
 /// Verdict for ONE instruction that mentions a constant object under audit.
@@ -1260,7 +1273,20 @@ fn pure_ssa_definition(inst: &Instruction) -> bool {
 }
 
 impl<'a> Facts<'a> {
+    /// Analysis-only snapshot with NO module facts: every `GlobalAddr`
+    /// operand is refused by `operand_is_pure`.  Used by the dead-private-
+    /// write fixpoint and by the unit tests, which deliberately exercise the
+    /// narrowest (most conservative) proof set.
     fn new(func: &'a IrFunction) -> Self {
+        Self::with_globals(func, None)
+    }
+
+    /// Full pipeline snapshot, with the module's positively proven plain
+    /// data objects.  Only `run` constructs this.
+    fn with_globals(
+        func: &'a IrFunction,
+        unobservable_globals: Option<&'a FxHashSet<String>>,
+    ) -> Self {
         let mut defs = FxHashMap::default();
         let mut used = FxHashSet::default();
         for block in &func.blocks {
@@ -1273,6 +1299,22 @@ impl<'a> Facts<'a> {
             used.extend(block.terminator.used_values());
         }
         let (mentions, escaping, constant_bases) = build_mention_index(func, &defs);
+        let volatile_effects = func.blocks.iter().any(|block| {
+            block.instructions.iter().any(|inst| {
+                matches!(
+                    inst,
+                    Instruction::Load { volatile: true, .. }
+                        | Instruction::Store { volatile: true, .. }
+                        | Instruction::AtomicLoad { .. }
+                        | Instruction::AtomicStore { .. }
+                        | Instruction::AtomicRmw { .. }
+                        | Instruction::AtomicInc { .. }
+                        | Instruction::AtomicCmpxchg { .. }
+                        | Instruction::Fence { .. }
+                        | Instruction::InlineAsm { .. }
+                )
+            })
+        });
         Self {
             func,
             defs,
@@ -1280,6 +1322,8 @@ impl<'a> Facts<'a> {
             mentions,
             escaping,
             constant_bases,
+            unobservable_globals,
+            volatile_effects,
         }
     }
 
@@ -1351,7 +1395,18 @@ impl<'a> Facts<'a> {
     /// 2. a pointer resolved to a plain, non-volatile `Alloca` — the legacy
     ///    write-through stack-home form;
     /// 3. an SSA value whose definition is a known pure value producer,
-    ///    reached through `Copy` links (`pure_ssa_definition`).
+    ///    reached through `Copy` links (`pure_ssa_definition`);
+    /// 4. a `GlobalAddr` naming a positively proven plain data object from
+    ///    `unobservable_global_addrs` (a defined, non-weak, non-TLS,
+    ///    non-alias object of known non-zero size).  This form appears when
+    ///    `fuse_vector_loads` has forwarded a `_mm*_loadu_si*` source into
+    ///    the consumer: the private `Alloca` home is gone and the operand is
+    ///    the object's address instead.  Dropping a NON-VOLATILE read of a
+    ///    defined, mapped object is unobservable and can only REMOVE a fault,
+    ///    never introduce one; two reads of the SAME SSA address within one
+    ///    instruction cannot differ because no instruction can interleave a
+    ///    write between them.  A weak/TLS/extern/alias/redirected symbol, an
+    ///    unknown name, or a snapshot without module facts refuses outright.
     ///
     /// Everything else refuses.  The historical `Some(_) => true` fallback
     /// accepted ANY non-`Copy` definition, including `Cast` to a pointer,
@@ -1388,6 +1443,12 @@ impl<'a> Facts<'a> {
                     src: Operand::Value(next),
                     ..
                 } => cur = *next,
+                Instruction::GlobalAddr { name, .. } => {
+                    return !self.volatile_effects
+                        && self
+                            .unobservable_globals
+                            .is_some_and(|globals| globals.contains(name));
+                }
                 _ => return pure_ssa_definition(inst),
             }
         }
@@ -2880,11 +2941,75 @@ fn fold_removal(facts: &Facts<'_>, inst: &Instruction) -> bool {
     args.len() == 2 && facts.scalar_mask(args[0], lanes) == ScalarMask::AllOff
 }
 
-pub(crate) fn run(module: &mut IrModule) -> usize {
-    module.for_each_function(run_function)
+/// Positively proven plain module-level data objects.  An address of one of
+/// these may be read without an observable side effect, which lets the
+/// operand-independent `vpcmp` predicates 3/7 and the `x op x` identity fold
+/// even AFTER `fuse_vector_loads` replaced a private `Alloca` home with the
+/// load's source `GlobalAddr`.
+///
+/// Fail-closed, deliberately narrower than `licm::speculation_safe_globals`:
+/// * only objects DEFINED in this translation unit (`!is_extern`) with a
+///   known non-zero size, so the address is a real, mapped object;
+/// * no weak/common symbols (a weak definition may resolve to address 0);
+/// * no thread-local objects (TLS access is not a plain read);
+/// * no alias/ifunc/asm-label/symbol-attribute redirects (the size and
+///   volatility facts belong to a different object);
+/// * no special section (a custom section can be memory-mapped I/O).
+///
+/// LCCC's IR has no per-global volatile flag: volatility is carried on the
+/// `Load`/`Store` instruction and on `Alloca`'s `volatile`/`semantic_volatile`
+/// fields.  A `GlobalAddr` that feeds a vector-load intrinsic therefore
+/// carries no volatile read by construction; the intrinsic op has no volatile
+/// variant.  This is stated explicitly rather than claimed away: the proof is
+/// "no volatile ACCESS exists at this operand", not "the object is immutable".
+/// Dropping such an access cannot introduce a fault, and no write can be
+/// interleaved between two reads of the same SSA address inside one
+/// instruction, so both consuming identities remain exact.
+fn unobservable_global_addrs(module: &IrModule) -> FxHashSet<String> {
+    let redirected: FxHashSet<&str> = module
+        .aliases
+        .iter()
+        .flat_map(|(name, target, _)| [name.as_str(), target.as_str()])
+        .chain(
+            module
+                .symbol_attrs
+                .iter()
+                .filter(|(_, weak, _)| *weak)
+                .map(|(name, _, _)| name.as_str()),
+        )
+        .chain(module.ifuncs.iter().map(|(name, ..)| name.as_str()))
+        .chain(module.asm_labels.keys().map(String::as_str))
+        .collect();
+    module
+        .globals
+        .iter()
+        .filter(|g| {
+            !g.is_extern
+                && !g.is_weak
+                && !g.is_common
+                && !g.is_thread_local
+                && g.section.is_none()
+                && g.size > 0
+                && !redirected.contains(g.name.as_str())
+        })
+        .map(|g| g.name.clone())
+        .collect()
 }
 
+pub(crate) fn run(module: &mut IrModule) -> usize {
+    let globals = unobservable_global_addrs(module);
+    module.for_each_function(|func| run_function_with_globals(func, Some(&globals)))
+}
+
+/// Analyse-only entry point used by the unit tests: NO module facts, so every
+/// `GlobalAddr` operand is refused.  Keeping the one-argument signature means
+/// the ~200 existing IR-level regression tests exercise the narrowest proof
+/// set and cannot be silently weakened by a module-level change.
 fn run_function(func: &mut IrFunction) -> usize {
+    run_function_with_globals(func, None)
+}
+
+fn run_function_with_globals(func: &mut IrFunction, globals: Option<&FxHashSet<String>>) -> usize {
     let has_candidate = func.blocks.iter().any(|block| {
         block.instructions.iter().any(|inst| {
             if let Instruction::Intrinsic { op, dest_ptr, .. } = inst {
@@ -2916,7 +3041,7 @@ fn run_function(func: &mut IrFunction) -> usize {
     // Two-phase: every decision is made against the same immutable snapshot,
     // and the `Facts` borrow of `func` ends before the first mutation.
     let (edits, removals): (Vec<(usize, usize, Instruction)>, Vec<(usize, usize)>) = {
-        let facts = Facts::new(func);
+        let facts = Facts::with_globals(func, globals);
         let mut edits = Vec::new();
         let mut removals = Vec::new();
         for (block_id, block) in func.blocks.iter().enumerate() {

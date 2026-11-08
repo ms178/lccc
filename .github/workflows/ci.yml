@@ -3544,6 +3544,90 @@ jobs:
             bench-results.json
             bench-summary.md
             bench-terminal.txt
+  maskfacts-oracles:
+    name: AVX-512VL mask-compare oracle differential
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: recursive
+    - name: Enable temporary CI swap file
+      run: bash scripts/ci_enable_swap.sh
+    - uses: actions/download-artifact@v8
+      with:
+        name: lccc-fast-${{ github.sha }}
+    - name: Verify immutable compiler artifact
+      run: |
+        set -euo pipefail
+        tar -xzf lccc-fast.tar.gz
+        test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
+        sha256sum -c target/ci-build.sha256
+    - name: Cache the provisioned oracle toolchain
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc-toolchain
+        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+    - name: Provision oracle toolchain (cached bundle, else apt)
+      run: bash scripts/ci_provision_toolchain.sh --multilib
+    - name: Cache the GCC 16.2 oracle
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc/gcc-oracle
+        key: lccc-gcc-oracle-${{ runner.os }}-16.2-${{ hashFiles('scripts/ci_install_gcc_oracle.sh') }}
+    - name: Install the GCC 16.2 oracle
+      run: bash scripts/ci_install_gcc_oracle.sh --version 16.2
+    - name: Cache the Clang 23.1.5 oracle
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc/clang-oracle
+        key: lccc-clang-oracle-${{ runner.os }}-${{ hashFiles('scripts/ci_install_clang_oracle.sh') }}
+    - name: Install the Clang 23.1.5 oracle
+      run: bash scripts/ci_install_clang_oracle.sh
+    - name: Verify the lane's oracle toolchain
+      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.5
+    # The harnesses resolve `gcc-16` / `clang-23` by NAME.  Pin both names
+    # to the exact installed oracles instead of relying on the runner image's
+    # (several releases older) default clang or rolling-major gcc-16.
+    - name: Select exact modern oracles for the mask-compare differential
+      run: |
+        set -euo pipefail
+        test "$(gcc-16 -dumpfullversion)" = 16.2.0
+        test "$("$CLANG" -dumpversion)" = 23.1.5
+        mkdir -p "$RUNNER_TEMP/lccc-modern-oracles"
+        ln -s "$(command -v gcc-16)" "$RUNNER_TEMP/lccc-modern-oracles/gcc-16"
+        ln -s "$CLANG" "$RUNNER_TEMP/lccc-modern-oracles/clang-23"
+        echo "$RUNNER_TEMP/lccc-modern-oracles" >> "$GITHUB_PATH"
+    - name: Report AVX-512 host capability (execution is capability-gated)
+      run: |
+        set -euo pipefail
+        # A host with no AVX-512 at all must still report an honest result,
+        # not fail the job because grep found no matches under pipefail.
+        flags="$(grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' \
+          | grep -E '^avx512(f|bw|vl|dq|cd)$' | sort | tr '\n' ' ' || true)"
+        printf 'AVX-512 host capability: %s\n' "${flags:-none}"
+    - name: Mask-compare harness self-tests (mutation rejection)
+      run: |
+        set -euo pipefail
+        python3 scripts/check_maskfacts_vl_matrix.py --self-test
+        python3 scripts/maskfacts_function_census.py --self-test
+        python3 scripts/check_maskfacts_memory_safety.py --self-test
+    - name: 485-case matrix, per-function census and 26-case adversarial differential
+      run: |
+        set -euo pipefail
+        mkdir -p target/maskfacts-receipts
+        python3 scripts/check_maskfacts_vl_matrix.py \
+          --asm-dir target/maskfacts-receipts/asm \
+          --require-code-size-parity \
+          --json target/maskfacts-receipts/matrix.json
+        python3 scripts/maskfacts_function_census.py \
+          --asm-dir target/maskfacts-receipts/asm \
+          --require-runtime-avg 5.0 \
+          --require-no-roundtrip \
+          --json target/maskfacts-receipts/census.json
+        python3 scripts/check_maskfacts_memory_safety.py \
+          --json target/maskfacts-receipts/safety.json
   icx-oracle:
     name: Authenticated Intel ICX 2026.2 integration
     needs: [build]
@@ -3624,6 +3708,19 @@ jobs:
             echo "PASS $compiler $level"
           done
         done
+    - name: AVX-512VL mask-compare four-compiler ELF and stdout ratchet
+      env:
+        CCC: target/fastbuild/lccc
+        GCC16: gcc-16
+      run: |
+        set -euo pipefail
+        trap 'status=$?; if [ "$status" -ne 0 ]; then python3 scripts/ci_annotate_log.py --title "AVX-512VL mask-compare four-compiler ratchet" intel-evidence/maskcmp-vendor.log; fi; exit "$status"' EXIT
+        python3 scripts/check_maskfacts_vendor_matrix.py --self-test
+        python3 scripts/check_maskfacts_vendor_matrix.py \
+          --lccc "$CCC" --gcc "$GCC16" --clang "${CLANG:-clang-23}" \
+          --icx "$LCCC_ICX_BIN" --require-icx \
+          --json intel-evidence/maskcmp-vendor.json \
+          2>&1 | tee intel-evidence/maskcmp-vendor.log
     - name: Numeric -O and -Ofast parity against ICX 2026.2, GCC 16.2 and Clang 23.1.5
       env:
         CCC: target/fastbuild/lccc
@@ -3816,6 +3913,7 @@ jobs:
     - clippy
     - benchmark
     - icx-oracle
+    - maskfacts-oracles
     if: always()
     steps:
     - name: Require every independent lane to pass
