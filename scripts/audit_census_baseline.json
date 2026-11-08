@@ -3,7 +3,7 @@
   "fns_over_300": 233,
   "fns_over_500": 97,
   "ignored_tests": 10,
-  "knob_literals": 564,
+  "knob_literals": 565,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -192,6 +192,7 @@
     "CCC_NO_COLD_CALL_SPLIT",
     "CCC_NO_COMMUTED_ACC",
     "CCC_NO_COMPARE_DOMINANCE",
+    "CCC_NO_COND_LOAD_SINK",
     "CCC_NO_CONST_STACK_ARG",
     "CCC_NO_COPY_NARROW_EXT_FOLD",
     "CCC_NO_COPY_SUBREG_EXTEND_FOLD",
@@ -570,7 +571,7 @@
     "LCCC_VOLATILE_SLOT",
     "LCCC_WHY_NOT_VECTORIZE"
   ],
-  "knobs_undocumented": 261,
+  "knobs_undocumented": 255,
   "panic_sites": 863,
   "panic_sites_hot": 94,
   "unsafe_sites": 27

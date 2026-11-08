@@ -15902,6 +15902,30 @@ pub fn peephole_optimize(asm: String) -> String {
 
     let _ = materialize_return_bool_i686(&mut store, &mut infos);
 
+    // Terminal select-diamond → cmov convergence.  Phase 2/3 already runs the
+    // fold inside its fixpoint, but the shape it needs (ONE register→register
+    // move per arm) is frequently produced only by the LAST copy-propagation
+    // iteration: the raw emitter stages each arm as
+    // `movl SRC,%eax; movl %eax,%D`, and `propagate_reg_copies` collapses that
+    // pair after the fold has already run in that iteration.  The fixpoint then
+    // converges and exits, leaving a branchy diamond whose arms are now single
+    // moves — a cmov was measurable and free, and was left behind.
+    //
+    // Re-run the fold to convergence on the FINAL structured text.  It is
+    // monotone (each success removes a jCC, a label and a move), so the bounded
+    // loop terminates.  No cleanup passes are needed: the fold nops the lines
+    // it replaces and `build_result` drops them.
+    clock.mark("p20b");
+    {
+        let mut guard = 0usize;
+        while guard < MAX_POST_GLOBAL_ITERATIONS {
+            guard += 1;
+            if !fold_select_diamond_cmov(&mut store, &mut infos) {
+                break;
+            }
+        }
+    }
+
     // Phase 6: select-diamond else-hoist runs on the FINAL text — earlier
     // passes shape the diamond (fusing the flag producer, folding prep)
     // that this pass needs to see.
@@ -17369,6 +17393,29 @@ mod tests {
         assert!(!out.contains("movl %ebx, %eax\n.Lsel_end"), "{out}");
         // The join label survives (other paths may target it).
         assert!(out.contains(".Lsel_end_2:"), "{out}");
+    }
+
+    /// Regression: the raw i686 emitter stages BOTH select arms through %eax
+    /// (`movl SRC,%eax; movl %eax,%D`).  `propagate_reg_copies` collapses that
+    /// pair, but can do so only on the last fixpoint iteration — after the
+    /// in-loop cmov fold has already run.  The whole pipeline used to ship the
+    /// branchy diamond anyway.  This is the exact shape SV-03's pointer Select
+    /// produced on i686; the terminal convergence sweep must reclaim it.
+    #[test]
+    fn select_diamond_exposed_by_late_copy_propagation_still_folds() {
+        let staged = "pick:\n.cfi_startproc\n    pushl %ebx\n    testl %ebp, %ebp\n    jne .Lsel_true_0\n    movl %ecx, %eax\n    movl %eax, %esi\n    jmp .Lsel_end_0\n.Lsel_true_0:\n    movl %edx, %eax\n    movl %eax, %esi\n.Lsel_end_0:\n    movl (%esi), %eax\n    popl %ebx\n    ret\n.cfi_endproc\n.size pick, .-pick\n";
+        let out = peephole_optimize(staged.to_string());
+        assert!(out.contains("cmovnel %edx, %esi"), "no cmov: {out}");
+        assert!(!out.contains("jne .Lsel_true_0"), "branch survived: {out}");
+        assert!(!out.contains(".Lsel_true_0:"), "true label survived: {out}");
+        assert!(
+            out.contains(".Lsel_end_0:"),
+            "join label must survive: {out}"
+        );
+        assert!(
+            out.contains("movl (%esi), %eax"),
+            "the single load must survive: {out}"
+        );
     }
 
     #[test]

@@ -39,7 +39,10 @@ trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp"
 
 cat >"$tmp/runtime.c" <<'C'
-#include <stdio.h>
+/* Header-free: this fixture is also compiled -m32 on hosts without
+ * libc6-dev-i386.  <stdio.h> would drag in glibc's multiarch bits/ tree and
+ * turn a label-reference regression into an environment failure. */
+extern int printf(const char *, ...);
 
 static int fails;
 #define CHECK(e) do { if (!(e)) { printf("FAIL %d: %s\n", __LINE__, #e); ++fails; } } while (0)
@@ -178,16 +181,32 @@ expect_error() {
     echo "$label/$file: rejected ($want)"
 }
 
+# A real 32-bit CRT/libc/libgcc capability probe (header-free).  Static
+# assembler/label contracts below run unconditionally; only the executable
+# leg depends on the host having a 32-bit runtime.
+m32_link_available() {
+    local gcc=$1
+    printf 'int main(void){return 0;}\n' >"$tmp/probe.c"
+    "$CCC_I686" -m32 -c "$tmp/probe.c" -o "$tmp/probe.o" >/dev/null 2>&1 &&
+        "$gcc" -m32 "$tmp/probe.o" -o "$tmp/probe" >/dev/null 2>&1
+}
+
 run_target() {
     local label=$1 compiler=$2 mflag=${3:-}
-    local opt
+    local opt run_ok=1
+    if [[ -n $mflag ]] && ! m32_link_available "$GCC"; then
+        run_ok=0
+        echo "SKIP-RUN: $label no 32-bit C runtime (all assembler/label contracts still run)"
+    fi
     for opt in -O0 -O2; do
         "$compiler" $mflag "$opt" -c "$tmp/runtime.c" -o "$tmp/runtime.o"
-        "$GCC" $mflag "$tmp/runtime.o" -o "$tmp/runtime"
-        local out rc=0
-        out=$("$tmp/runtime") || rc=$?
-        [ "$out" = "PASS 0" ] || { echo "$label $opt runtime mismatch: rc=$rc out='$out'"; return 1; }
-        echo "$label $opt runtime: $out"
+        if (( run_ok )); then
+            "$GCC" $mflag "$tmp/runtime.o" -o "$tmp/runtime"
+            local out rc=0
+            out=$("$tmp/runtime") || rc=$?
+            [ "$out" = "PASS 0" ] || { echo "$label $opt runtime mismatch: rc=$rc out='$out'"; return 1; }
+            echo "$label $opt runtime: $out"
+        fi
 
         "$compiler" $mflag "$opt" -S "$tmp/runtime.c" -o "$tmp/runtime.s"
         python3 "$tmp/check_asm.py" "$tmp/runtime.s" || return 1

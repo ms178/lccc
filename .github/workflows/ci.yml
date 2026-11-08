@@ -2979,6 +2979,9 @@ jobs:
         python3 tests/regression/check_riscv_rvc_parity.py --lccc target/fastbuild/lccc-riscv
         bash tests/regression/check_gla_cross_reach_band.sh
         bash tests/regression/check_asm_goto_phi_edge.sh
+        # SV-03: address-only speculation must leave exactly one load, with
+        # a PROT_NONE untaken pointer as the trapping-load canary.
+        bash tests/regression/check_cond_load_sink.sh
         python3 scripts/edg_corpus_mine.py selftest
         # IPA-RA must not summarize weak/interposable bodies: a strong
         # override linked from another TU clobbers %r8-%r11 (was 55, not 79)
@@ -3693,6 +3696,17 @@ jobs:
         "$binary" --version | tee intel-evidence/version.txt
         "$binary" -E -dM -x c /dev/null > intel-evidence/macros.txt
         sha256sum "$binary" > intel-evidence/binary.sha256
+    - name: SV-03 conditional-load sink four-compiler execution proof
+      env:
+        CCC: target/fastbuild/lccc
+        GCC16: gcc-16
+      run: |
+        set -euo pipefail
+        mkdir -p intel-evidence
+        export CLANG23="${CLANG:-clang-23}"
+        export ICX="$LCCC_ICX_BIN"
+        bash tests/regression/check_cond_load_sink.sh --self-test
+        bash tests/regression/check_cond_load_sink.sh 2>&1 | tee intel-evidence/cond-load-sink.log
     - name: Vector integer-address snapshot against four compilers
       run: |
         set -euo pipefail
