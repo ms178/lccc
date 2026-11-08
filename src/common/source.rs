@@ -424,34 +424,30 @@ impl SourceManager {
 
         let entry = &self.line_map[idx];
 
-        // Count how many newlines are between entry.pp_offset and offset
-        // to determine the line offset within this mapped region.
-        let mut lines_past = 0u32;
         let entry_filename = &self.line_map_filenames[entry.filename_idx as usize];
-        let file_content = if !self.files.is_empty() {
-            self.files[0].content.as_bytes()
-        } else {
+        let Some(file) = self.files.first() else {
             return SourceLocation {
                 file: entry_filename.clone(),
                 line: entry.orig_line,
                 column: 1,
             };
         };
-
-        let start = entry.pp_offset as usize;
-        let end = offset as usize;
-        if end <= file_content.len() && start <= end {
-            for &b in &file_content[start..end] {
-                if b == b'\n' {
-                    lines_past += 1;
-                }
-            }
-        }
+        // Each recorded line start after a newline at byte p is p + 1.
+        // Counting starts in (entry.pp_offset, offset] is exactly the old
+        // byte-scan count over [entry.pp_offset, offset), including when
+        // either endpoint is itself at a line boundary. Resolving many spans
+        // within one marker region must not rescan its growing prefix.
+        let line_offsets = &file.line_offsets;
+        let lines_past = if offset as usize <= file.content.len() && entry.pp_offset <= offset {
+            let end = line_offsets.partition_point(|&pos| pos <= offset);
+            let start = line_offsets.partition_point(|&pos| pos <= entry.pp_offset);
+            (end - start) as u32
+        } else {
+            0
+        };
 
         // Compute column: distance from the start of the current line.
-        // Uses files[0].line_offsets (computed once during add_file) instead of
-        // maintaining a separate pp_line_offsets copy.
-        let line_offsets = &self.files[0].line_offsets;
+        // Uses the same offsets computed once during add_file.
         let col = if !line_offsets.is_empty() {
             let pp_line = match line_offsets.binary_search(&offset) {
                 Ok(i) => i,
@@ -660,4 +656,45 @@ fn parse_u32_from_digits(bytes: &[u8]) -> Option<u32> {
         result = result.checked_mul(10)?.checked_add((b - b'0') as u32)?;
     }
     Some(result)
+}
+
+#[cfg(test)]
+mod line_map_count_tests {
+    use super::{LineMapEntry, SourceManager, Span};
+
+    #[test]
+    fn marker_offsets_match_byte_scan_at_every_boundary() {
+        for content in ["", "first\n\nlast", "a\r\nb\nc\n", "one line", "é\n水\n"] {
+            let mut sm = SourceManager::new();
+            sm.add_file("preprocessed".into(), content.into());
+            sm.line_map_filenames.push("original.c".into());
+            for start in 0..=content.len() {
+                sm.line_map = vec![LineMapEntry {
+                    pp_offset: start as u32,
+                    filename_idx: 0,
+                    orig_line: 123,
+                }];
+                // Also probe out-of-range and before-marker offsets, for which
+                // the prior implementation deliberately counted no newlines.
+                for end in 0..=content.len() + 1 {
+                    let location = sm.resolve_span(Span::new(end as u32, end as u32, 0));
+                    let count = if start <= end && end <= content.len() {
+                        content.as_bytes()[start..end]
+                            .iter()
+                            .filter(|&&c| c == b'\n')
+                            .count() as u32
+                    } else {
+                        0
+                    };
+                    let line_start = content.as_bytes()[..end.min(content.len())]
+                        .iter()
+                        .rposition(|&c| c == b'\n')
+                        .map_or(0, |i| i + 1);
+                    assert_eq!(location.file, "original.c");
+                    assert_eq!(location.line, 123 + count, "start={start} end={end}");
+                    assert_eq!(location.column, (end - line_start + 1) as u32);
+                }
+            }
+        }
+    }
 }
