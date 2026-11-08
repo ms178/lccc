@@ -993,7 +993,29 @@ regression the uniform pre-filter caused: `fns_over_300` is back to its 233
 baseline. Steps 4–5 remain open, and the ≤35 % peephole
 criterion is **not** established by this step. Evidence and the three
 measurement traps that had to be fixed before any number was trustworthy:
-[allocation-before-filter follow-up](docs/FOLLOWUP-2026-11-08-peephole-allocation-before-filter.md). Deferring
+[allocation-before-filter follow-up](docs/FOLLOWUP-2026-11-08-peephole-allocation-before-filter.md).
+
+**That ratchet was itself defective, and the follow-up fixed it.** Its regex
+required a literal `.trimmed(` (x86-64's method idiom) while i686 calls a free
+function `trimmed(store, &infos[a], a)`, and its default root was x86-only — so it
+reported PASS for i686, arm and riscv without looking at them. Widening it to
+`src/backend` and matching both idioms exposed **5 real violations in i686**: four
+copies deleted outright (`parse_select_arm_mov` returns only Copy fields;
+`parse_jmp_target`'s borrow ends at the next statement, which already owns the
+label; `parse_condjmp`'s operands are last used in the `format!` before
+`store.replace`) and one `div_reg` probe that **keeps** its Copy `RegId` and owns
+the text only for a candidate, needing no second parse. `cargo check` passing with
+the copies removed is the borrow proof. Measured on a purpose-built,
+density-verified fixture (`tests/regression/alloc_cost/i686_peephole_corpus.c`;
+120 `cmov` + 80 `div` confirmed in the baseline output): **974,342 → 973,850
+allocations (−492, −0.050 %)**, assembly byte-identical; i686 identity sweep 5,308
+compiles, 0 differing. A small win, reported as one — the durable value is that
+the ratchet now protects four backends instead of one. Three contracts added
+(17 total), including one asserting the default root covers every backend, which
+is what would have caught the original gap. Evidence:
+[i686 ratchet-coverage follow-up](docs/FOLLOWUP-2026-11-08-i686-alloc-ratchet-coverage.md).
+
+Deferring
 copy-mask liveness construction preserves all 94 assembly outputs but saves
 only 0.247% of simulated instructions on the same input, not a major latency
 win (see the journal follow-up). The historical
