@@ -23,6 +23,18 @@ accesses block it. The bounded direct-alloca positive case and oversize,
 segment and volatile negative cases are tested. These are IR proof gaps; no
 LCCC C-level misscompile is claimed.
 
+Two further edge cases in the motion allowlist need conservative treatment.
+An alloca marked `semantic_volatile` may be externally observable even when
+an individual load or store does not carry its own volatile flag; an IR test
+saw one promotion before the alloca-level guard, instead of zero. A distinct
+alloca marked only internally `volatile`, but not `semantic_volatile`, is a
+positive control. Also, an i686 x87 long-double access can potentially touch
+16 bytes although `F128.size()` is 12. The 12-byte-allocation test likewise
+saw one promotion instead of zero before replacing the size comparison with
+`access_extent`'s possible-access bound; a 16-byte allocation is the positive
+control. These are conservative IR-level checks, not demonstrated C-level
+miscompilations.
+
 ## Evidence and trade-offs
 
 On `cb89d48`, fastbuild, census and diff checks passed, as did the vector-temp
@@ -30,8 +42,9 @@ suite (53 tests), three targeted large-snapshot tests, the 485-case mask-facts
 three-way LCCC/GCC 16.2/Clang 23.1.5 matrix and its pass-off mutation, 72 AVX
 FP build/runtime/frame contracts, and ten AArch64/RV64 QEMU snapshot executions.
 The new C integer-address fixture passed the regression runner and its A/B
-mode. ICX 2026.2 integration on hosted CI passed; it does not constitute a
-specific differential run of these IR cases.
+mode. The authenticated hosted ICX 2026.2 lane on `2020ab8` also passed its
+new four-compiler AVX2 C-fixture comparison (step 15 succeeded, with no AVX2
+skip annotation); that is not a differential execution of the IR-only cases.
 
 A before/after `-O2` census reported the same instruction, register-move,
 stack-reference, push and accumulator counts in 316/316 measured functions

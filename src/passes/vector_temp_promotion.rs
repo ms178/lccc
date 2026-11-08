@@ -932,11 +932,16 @@ fn destination_unobserved_between(
             } => {
                 // An in-bounds scalar access to a different, direct alloca
                 // is disjoint; derived and segment-relative pointers are not.
+                // Check the possibly accessed extent rather than the object
+                // size: on i686 an F128 constant store may touch 16 bytes even
+                // though a long-double object has size 12.
                 ptr.0 != destination
-                    && ty.size() != 0
-                    && allocas
-                        .get(&ptr.0)
-                        .is_some_and(|info| !info.semantic_volatile && ty.size() <= info.size)
+                    && ty.access_extent().is_some_and(|(_, may)| {
+                        may > 0
+                            && allocas.get(&ptr.0).is_some_and(|info| {
+                                !info.semantic_volatile && (may as u64) <= info.size as u64
+                            })
+                    })
             }
             _ => false,
         };
@@ -2810,6 +2815,58 @@ mod tests {
                 expected,
                 "{size} {space:?} {volatile}"
             );
+        }
+    }
+
+    #[test]
+    fn promotion_rejects_i686_long_double_access_exceeding_alloca() {
+        use crate::common::types::{
+            set_target_long_double_is_f128, set_target_ptr_size, target_long_double_is_f128,
+            target_ptr_size,
+        };
+        struct TargetGuard(usize, bool);
+        impl Drop for TargetGuard {
+            fn drop(&mut self) {
+                set_target_ptr_size(self.0);
+                set_target_long_double_is_f128(self.1);
+            }
+        }
+        let _guard = TargetGuard(target_ptr_size(), target_long_double_is_f128());
+        set_target_ptr_size(4);
+        set_target_long_double_is_f128(false);
+        assert_eq!(IrType::F128.size(), 12);
+        assert_eq!(IrType::F128.access_extent(), Some((10, 16)));
+        for (size, expected) in [(12, 0), (16, 1)] {
+            let mut f = function(
+                "i686_long_double_extent",
+                vec![block(
+                    0,
+                    vec![
+                        alloca(0, 32, 32),
+                        alloca(1, 32, 32),
+                        alloca(5, size, 4),
+                        intrinsic(
+                            Some(2),
+                            IntrinsicOp::Pcmpeqb256,
+                            Some(0),
+                            vec![Operand::Value(Value(3)), Operand::Value(Value(4))],
+                        ),
+                        Instruction::Store {
+                            ptr: Value(5),
+                            val: Operand::Const(IrConst::LongDouble(0.0, [0; 16])),
+                            ty: IrType::F128,
+                            seg_override: AddressSpace::Default,
+                            volatile: false,
+                        },
+                        Instruction::Memcpy {
+                            dest: Value(1),
+                            src: Value(0),
+                            size: 32,
+                        },
+                    ],
+                )],
+            );
+            assert_eq!(promote_in_function(&mut f), expected, "alloca size {size}");
         }
     }
 
