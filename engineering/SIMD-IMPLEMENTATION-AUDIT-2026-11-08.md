@@ -1012,6 +1012,20 @@ network allowlist) and fixed at the source:
 ratchet internally, which is why the single extra panic site reddened two
 otherwise unrelated lanes.
 
+Two further red jobs appeared on the first GitHub CI run of the fixed head
+and were diagnosed from the full hosted job log (not inferred):
+
+| Job | Root cause | Fix |
+|-----|------------|-----|
+| Clippy | strict `clippy::bool_assert_comparison` on a new white-box unit test (`assert_eq!(bool, true)`) | `assert!(...)`; `python3 scripts/check_clippy_policy.py` PASS (75 lint names probed) |
+| Codegen and runtime contracts (shard a) | `test_07_c_corpora_sanitizers` compiled **and executed** an `-mavx512f -mavx512bw` binary on a hosted runner with no AVX-512; ASan reported `SEGV in _mm512_storeu_si512` at `avx512fintrin.h:9481` | compile both variants on every runner (compile-time coverage preserved), always execute the portable variant, execute the AVX-512 variant only when `/proc/cpuinfo` advertises `avx512f`+`avx512bw`; the restriction is reported, never a silent PASS |
+
+The second is a **test design defect**, not a compiler defect: the corpus's
+AVX-512 path is guarded by target predefined macros, so passing `-mavx512*`
+legitimately compiles EVEX code that cannot execute on that host.  The
+pack's own docstring claimed "green on any runner with a C compiler"; it now
+states the CPUID gate explicitly.
+
 ### 9c.9.7 Three-way host runtime measurement (honest, not a victory claim)
 
 The user requirement is to beat GCC 16.2, Clang 23.1.5 and ICX 2026.2.

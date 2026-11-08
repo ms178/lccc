@@ -11,6 +11,9 @@ to a sharded lane (which would require regenerating the whole plan).
 
 Every test uses the reference compiler only.  No lccc build is needed, which
 makes these tests deterministic and green on any runner with a C compiler.
+ISA-gated runtime legs key off /proc/cpuinfo (never off target predefined
+macros), so a runner without AVX-512 still proves compile-time cleanliness
+and executes the portable path rather than faulting or silently passing.
 The lccc-dependent driver remains a developer/CI-artifact tool until the
 register's open findings are resolved; it is deliberately not a hard gate.
 """
@@ -180,20 +183,39 @@ class AuditPackTests(unittest.TestCase):
                                      f'{src.name}: compiler diagnostics')
 
     def test_07_c_corpora_sanitizers(self):
+        """ASan+UBSan must be clean, on ANY host.
+
+        The original version always compiled and EXECUTED an `-mavx512f
+        -mavx512bw` binary.  That is unsound on a runner without AVX-512:
+        `_mm512_storeu_si512` faults (hosted CI 2026-11-08: ASan SEGV at
+        avx512fintrin.h:9481).  Compile BOTH variants (so the AVX-512
+        header path stays warning-free on every runner), always execute
+        the portable variant, and execute the AVX-512 variant only when
+        /proc/cpuinfo advertises the required features.  The gate is
+        reported, never silently treated as a pass.
+        """
+        import probe_utils as pu
+        host = pu.host_cpu_flags()
+        can_run_avx512 = 'avx512f' in host and 'avx512bw' in host
         for src in (REPRO_C, SHAPE_C):
-            with self.subTest(src=src.name):
-                exe = self.work / f'{src.stem}_san.bin'
-                proc = run([GCC, *SAN_FLAGS, '-mavx512f', '-mavx512bw',
-                            str(src), '-o', str(exe)])
-                self.assertEqual(proc.returncode, 0, proc.stderr)
-                modes = (('all',),) if src is REPRO_C else (('all',), ('selftest',))
-                for mode in modes:
-                    with self.subTest(mode=mode):
-                        run_proc = run([str(exe), *mode], timeout=60)
-                        self.assertEqual(run_proc.returncode, 0,
-                                         run_proc.stdout + run_proc.stderr)
-                        self.assertNotIn('AddressSanitizer', run_proc.stderr)
-                        self.assertNotIn('runtime error:', run_proc.stderr)
+            modes = (('all',),) if src is REPRO_C else (('all',), ('selftest',))
+            for label, extra in (('portable', ()),
+                                 ('avx512', ('-mavx512f', '-mavx512bw'))):
+                with self.subTest(src=src.name, isa=label):
+                    exe = self.work / f'{src.stem}_{label}_san.bin'
+                    proc = run([GCC, *SAN_FLAGS, *extra, str(src), '-o', str(exe)])
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    if label == 'avx512' and not can_run_avx512:
+                        # Compile-only evidence on this host.  The portable
+                        # leg below still exercises every shape at runtime.
+                        continue
+                    for mode in modes:
+                        with self.subTest(mode=mode):
+                            run_proc = run([str(exe), *mode], timeout=60)
+                            self.assertEqual(run_proc.returncode, 0,
+                                             run_proc.stdout + run_proc.stderr)
+                            self.assertNotIn('AddressSanitizer', run_proc.stderr)
+                            self.assertNotIn('runtime error:', run_proc.stderr)
 
     # --- end-to-end harness checks --------------------------------------
 
