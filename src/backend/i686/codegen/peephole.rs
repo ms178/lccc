@@ -1786,12 +1786,12 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 && c_reg != REG_EBP
                 && infos[j].kind == LineKind::Cmp
             {
-                let s0 = trimmed(store, &infos[i], i).to_string();
+                let s0 = trimmed(store, &infos[i], i);
                 if s0.starts_with("movl $") && !s0.contains('(') {
                     let cn = reg32_name(c_reg);
                     if s0.ends_with(cn) {
                         let imm = s0[5..].split(',').next().unwrap_or("").trim().to_string();
-                        let s1 = trimmed(store, &infos[j], j).to_string();
+                        let s1 = trimmed(store, &infos[j], j);
                         let pref = format!("cmpl {}, ", cn);
                         if let Some(rhs) = s1.strip_prefix(&pref) {
                             let rhs = rhs.trim();
@@ -1930,7 +1930,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         // (j is the immediate next instruction, so no gap).
                         // Rewrite the consumer to read %SRC directly and
                         // drop the copy.
-                        let consumer = trimmed(store, &infos[j], j).to_string();
+                        let consumer = trimmed(store, &infos[j], j);
                         let old_reg = reg32_name(t_reg);
                         let new_reg = reg32_name(s_reg);
                         // Only whole-register 32-bit forms are rewritten;
@@ -2013,7 +2013,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     }
                     if dead {
                         // Rebuild using the ORIGINAL memory operand text.
-                        let orig = trimmed(store, &infos[i], i).to_string();
+                        let orig = trimmed(store, &infos[i], i);
                         if let Some(comma) = orig.find(',') {
                             let memop = &orig[..comma]; // e.g. "movl 84(%esp)"
                             let fused = format!("    {}, {}", memop, reg32_name(mdst));
@@ -2365,7 +2365,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 // find op line j, then store line at k
                 if let LineKind::Other { dest_reg: op_dst } = infos[j].kind {
                     if op_dst == REG_EAX {
-                        let op_s = trimmed(store, &infos[j], j).to_string();
+                        let op_s = trimmed(store, &infos[j], j);
                         let is_imm_alu = (op_s.starts_with("addl $")
                             || op_s.starts_with("subl $")
                             || op_s.starts_with("andl $")
@@ -9697,7 +9697,7 @@ fn fold_load_copy_relay_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> b
         }
 
         // Retarget the load's destination to %D and delete the copy.
-        let load_text = trimmed(store, &infos[i], i).to_string();
+        let load_text = trimmed(store, &infos[i], i);
         let Some(comma) =
             crate::backend::peephole_common::last_top_level_comma(load_text.as_bytes())
         else {
@@ -12498,11 +12498,22 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 i += 1;
                 continue;
             }
-            let t = trimmed(store, &infos[j], j).to_string();
+            // Line `j`'s text is read ONLY inside arms guarded by one of the
+            // five `s` parsers used below (`parse_xor_self`, `parse_mov_reg_reg`,
+            // `parse_mov_imm_reg`, `parse_mov_imm_value`, `parse_store_from_reg`).
+            // All five begin with `strip_prefix("movl ")` or `("xorl ")`, checked
+            // exhaustively, so for any other `s` the copy would be dead. Make it
+            // only when it can be observed.
+            //
+            // This must NOT be an early `continue`: Pattern 8 (adjacent block
+            // tail-merge) further down dispatches on the block shape, not on `s`,
+            // and still has to run for these lines.
+            let t: Option<String> = (s.starts_with("movl ") || s.starts_with("xorl "))
+                .then(|| trimmed(store, &infos[j], j).to_string());
 
             // Pattern 2: zero through the copy (`xorl %X,%X; movl %X,%Y`).
             if let Some(x) = parse_xor_self(&s) {
-                if let Some(y) = parse_mov_from(x, &t) {
+                if let Some(y) = parse_mov_from(x, staging_line_text(&t)) {
                     if y != x {
                         let new_xor = format!("    xorl {}, {}", y, y);
                         store.replace(j, new_xor);
@@ -12518,7 +12529,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
 
             // Patterns 1/3: staging move into a test or immediate ALU.
             if let Some((op_src, op_dst)) = parse_mov_reg_reg(&s) {
-                if let Some(src2) = parse_test_pair(&t) {
+                if let Some(src2) = parse_test_pair(staging_line_text(&t)) {
                     if (src2 == (op_src, op_dst)) || (src2 == (op_dst, op_src)) {
                         let new_test = format!("    testl {}, {}", op_src, op_src);
                         store.replace(j, new_test);
@@ -12530,7 +12541,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 }
             }
             if let Some((imm_text, c)) = parse_mov_imm_reg(&s) {
-                if let Some((mnem, other)) = parse_alu_reg_reg(&t) {
+                if let Some((mnem, other)) = parse_alu_reg_reg(staging_line_text(&t)) {
                     if c == other.0 {
                         // `movl $imm,%C; andl %C,%X` -> `andl $imm,%X`
                         let new_alu = format!("    {} ${}, {}", mnem, imm_text, other.1);
@@ -12553,7 +12564,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             // deletion unconditionally invisible AND guarantees the dead-move
             // cleanup reclaims it — a guaranteed -5 bytes per site.
             if let Some((imm_text, b)) = parse_mov_imm_value(&s) {
-                if let Some((src_reg, disp)) = parse_store_from_reg(&t) {
+                if let Some((src_reg, disp)) = parse_store_from_reg(staging_line_text(&t)) {
                     if src_reg == b
                         && (-128..=127).contains(&disp)
                         && census_reg_reads(
@@ -12586,7 +12597,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             // reader without the definition dying would trade a 2-byte
             // reg-reg copy for a 5-byte immediate mov — a net loss.)
             if let Some((val_text, b)) = parse_mov_imm_value(&s) {
-                if let Some((src_reg, c)) = parse_mov_reg_reg(&t) {
+                if let Some((src_reg, c)) = parse_mov_reg_reg(staging_line_text(&t)) {
                     if src_reg == b
                         && census_reg_reads(
                             store,
@@ -12615,7 +12626,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             // flags.  The staging move is deleted under the dominance proof.
             if let Some((op_src, op_dst)) = parse_mov_reg_reg(&s) {
                 let mut handled = false;
-                if let Some((mnem, dst)) = parse_cmp_test_imm(&t) {
+                if let Some((mnem, dst)) = parse_cmp_test_imm(staging_line_text(&t)) {
                     if dst == op_dst
                         && staging_reads_safe(
                             store,
@@ -12626,7 +12637,12 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                             &[i, j],
                         )
                     {
-                        let new_cmp = format!("    {} ${}, {}", mnem, imm_of(&t), op_src);
+                        let new_cmp = format!(
+                            "    {} ${}, {}",
+                            mnem,
+                            imm_of(staging_line_text(&t)),
+                            op_src
+                        );
                         store.replace(j, new_cmp);
                         infos[j] = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
                         infos[i].kind = LineKind::Nop;
@@ -12634,7 +12650,9 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         i = j + 1;
                         handled = true;
                     }
-                } else if let Some((mnem, other, dst)) = parse_cmp_test_reg_reg(&t) {
+                } else if let Some((mnem, other, dst)) =
+                    parse_cmp_test_reg_reg(staging_line_text(&t))
+                {
                     if dst == op_dst
                         && other != op_src
                         && staging_reads_safe(
@@ -12760,7 +12778,8 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 // re-fixpoint; see updates/followup for the analysis.
                 let i1 = next_non_nop(infos, i + 1);
                 if i1 < fend && is_cond_jcc(trimmed(store, &infos[i1], i1)) {
-                    let imm = parse_andl_imm_reg(&t, &op_dst).map(|s| s.to_string());
+                    let imm =
+                        parse_andl_imm_reg(staging_line_text(&t), &op_dst).map(|s| s.to_string());
                     if imm.is_some()
                         && staging_reads_safe(
                             store,
@@ -12790,7 +12809,9 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             // which bounds the match.  Pure rewrite: value, flags and both
             // lines' register effects are identical.
             if let Some((src_reg, disp)) = parse_store_from_reg(&s) {
-                if let Some((mnem, width, dst)) = parse_widened_slot_load(&t, disp) {
+                if let Some((mnem, width, dst)) =
+                    parse_widened_slot_load(staging_line_text(&t), disp)
+                {
                     if let Some(sub) = low_subreg_name(src_reg, width) {
                         let new_load = format!("    {} {}, {}", mnem, sub, dst);
                         store.replace(j, new_load);
@@ -12807,7 +12828,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             // sum and flags are identical; %Y is deleted under the dominance
             // proof.
             if let Some((x, y)) = parse_mov_reg_reg(&s) {
-                if let Some((add_src, add_dst)) = parse_addl_reg_reg(&t) {
+                if let Some((add_src, add_dst)) = parse_addl_reg_reg(staging_line_text(&t)) {
                     if add_src == y
                         && add_dst == x
                         && staging_reads_safe(
@@ -13064,6 +13085,18 @@ fn low_subreg_name(reg32: &str, width: i32) -> Option<&'static str> {
 }
 
 /// Parse `movl %S, %D` (both 32-bit GPRs, S != D).
+/// The line-`j` text owed by the staging patterns.
+///
+/// `None` means no `s` parser could match, so no reader may be reached. The
+/// `expect` makes that invariant machine-checked instead of comment-asserted:
+/// a new pattern that reads the copy without an `s` guard fails loudly under
+/// `debug-assertions` (which CI enables) rather than matching against "".
+#[inline]
+fn staging_line_text(t: &Option<String>) -> &str {
+    t.as_deref()
+        .expect("line-j copy owed: every reader is guarded by an `s` parser")
+}
+
 fn parse_mov_reg_reg(s: &str) -> Option<(&str, &str)> {
     let rest = s.strip_prefix("movl ")?;
     let (src, dst) = rest.split_once(',')?;
@@ -16087,7 +16120,7 @@ fn eliminate_redundant_zext_i686(store: &mut LineStore, infos: &mut [LineInfo]) 
             i += 1;
             continue;
         }
-        let t = trimmed(store, &infos[i], i).to_string();
+        let t = trimmed(store, &infos[i], i);
 
         // movzbl SRC, %DST
         if let Some(rest) = t.strip_prefix("movzbl ") {
@@ -16282,7 +16315,7 @@ fn fold_copy_narrow_ext_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> 
             i += 1;
             continue;
         }
-        let t = trimmed(store, &infos[j], j).to_string();
+        let t = trimmed(store, &infos[j], j);
         let mut fused = false;
         for (prefix, width) in NARROW_EXT_TO_32 {
             let Some(rest) = t.strip_prefix(prefix) else {
@@ -16358,7 +16391,7 @@ fn eliminate_redundant_sign_ext_i686(store: &mut LineStore, infos: &mut [LineInf
             i += 1;
             continue;
         }
-        let t = trimmed(store, &infos[i], i).to_string();
+        let t = trimmed(store, &infos[i], i);
 
         // movsbl SRC, %DST
         if let Some(rest) = t.strip_prefix("movsbl ") {
@@ -16684,7 +16717,7 @@ fn optimize_tail_calls_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
         }
 
         if let Some(ridx) = ret_idx {
-            let call_t = trimmed(store, &infos[i], i).to_string();
+            let call_t = trimmed(store, &infos[i], i);
             let jmp_text = if let Some(target) = call_t.strip_prefix("call ") {
                 let target = target.trim();
                 if let Some(reg) = target.strip_prefix("*%") {

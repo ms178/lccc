@@ -883,7 +883,7 @@ pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]
 
         let mut any = false;
         for &j in &uses {
-            let line = infos[j].trimmed(store.get(j)).to_string();
+            let line = infos[j].trimmed(store.get(j));
             let rewritten = rename_within(&line, dfam, sfam, rule_width);
             if rewritten != line {
                 replace_line(store, &mut infos[j], j, format!("    {}", rewritten));
@@ -1620,7 +1620,7 @@ mod inline_asm_tests {
             .collect();
         let mut in_asm = false;
         for i in 0..infos.len() {
-            let t = infos[i].trimmed(store.get(i)).to_string();
+            let t = infos[i].trimmed(store.get(i));
             if t == "#APP" {
                 in_asm = true;
                 continue;

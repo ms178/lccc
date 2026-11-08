@@ -2380,7 +2380,7 @@ pub(super) fn cse_symbol_lea(store: &mut LineStore, infos: &mut [LineInfo]) -> b
             homes.clear();
             continue;
         }
-        let t = infos[i].trimmed(store.get(i)).to_string();
+        let t = infos[i].trimmed(store.get(i));
         if let Some((sym, dst_fam)) = parse_rip_symbol_lea(&t) {
             // The LEA writes %R: any other symbol's home in %R dies first.
             homes.retain(|(s, f)| *f != dst_fam || *s == sym);
@@ -2619,7 +2619,7 @@ fn retarget_producer_into_copy_impl(
             i += 1;
             continue;
         }
-        let prod = infos[i].trimmed(store.get(i)).to_string();
+        let prod = infos[i].trimmed(store.get(i));
         let Some((op, prod_src, prod_dst)) = PURE_PRODUCERS
             .iter()
             .find(|p| prod.starts_with(**p))
@@ -2697,7 +2697,7 @@ fn retarget_producer_into_copy_impl(
             i += 1;
             continue;
         }
-        let copy = infos[j].trimmed(store.get(j)).to_string();
+        let copy = infos[j].trimmed(store.get(j));
         let (copy_w, crest) = if let Some(r) = copy.strip_prefix("movq ") {
             (64u8, r)
         } else if let Some(r) = copy.strip_prefix("movl ") {
@@ -3203,7 +3203,7 @@ pub(super) fn fold_copy_into_lea_base(store: &mut LineStore, infos: &mut [LineIn
         if infos[li].is_nop() || infos[li].pinned || infos[li].is_barrier() {
             continue;
         }
-        let lea = infos[li].trimmed(store.get(li)).to_string();
+        let lea = infos[li].trimmed(store.get(li));
         let (lea_rest, prod_w) = if let Some(r) = lea.strip_prefix("leaq ") {
             (r, 64u8)
         } else if let Some(r) = lea.strip_prefix("leal ") {
@@ -3264,7 +3264,7 @@ pub(super) fn fold_copy_into_lea_base(store: &mut LineStore, infos: &mut [LineIn
         if j >= len || infos[j].pinned || infos[j].is_barrier() {
             continue;
         }
-        let copy = infos[j].trimmed(store.get(j)).to_string();
+        let copy = infos[j].trimmed(store.get(j));
         let (copy_w, copy_rest) = if let Some(r) = copy.strip_prefix("movq ") {
             (64u8, r)
         } else if let Some(r) = copy.strip_prefix("movl ") {
@@ -3330,7 +3330,7 @@ pub(super) fn fold_copy_into_lea_base(store: &mut LineStore, infos: &mut [LineIn
             if infos[k].is_barrier() {
                 break; // downstream paths are the deadness proof's job
             }
-            let t = infos[k].trimmed(store.get(k)).to_string();
+            let t = infos[k].trimmed(store.get(k));
             if infos[k].reg_refs & b_mask == 0 {
                 // A write of %rA closes the window (its value diverges from
                 // %rB's); a later %rB read then fails the deadness proof and
@@ -4511,7 +4511,7 @@ pub(super) fn coalesce_copy_into_rmw(store: &mut LineStore, infos: &mut [LineInf
         if infos[li].is_nop() || infos[li].pinned || infos[li].is_barrier() {
             continue;
         }
-        let mov = infos[li].trimmed(store.get(li)).to_string();
+        let mov = infos[li].trimmed(store.get(li));
         // A plain copy (`movl`/`movq`), or a zero/sign-extending copy whose
         // extension garbage the consumer's mask provably kills: `movzbl %dl,
         // %r11d; andl $127, %r11d` ≡ `movl %edx, %r11d; andl $127, %r11d`,
@@ -4560,7 +4560,7 @@ pub(super) fn coalesce_copy_into_rmw(store: &mut LineStore, infos: &mut [LineInf
         let Some(j) = rmw_consumer_line(infos, li, s_fam, d_fam) else {
             continue;
         };
-        let cons = infos[j].trimmed(store.get(j)).to_string();
+        let cons = infos[j].trimmed(store.get(j));
         if has_implicit_reg_usage(&cons) {
             continue;
         }
@@ -4674,7 +4674,7 @@ pub(super) fn coalesce_copy_into_rmw(store: &mut LineStore, infos: &mut [LineInf
             if infos[k].is_barrier() {
                 break; // downstream paths are the deadness proof's job
             }
-            let t = infos[k].trimmed(store.get(k)).to_string();
+            let t = infos[k].trimmed(store.get(k));
             // The copy BACK into the source (`movl %D, %S` / `movq %D, %S`;
             // the call-result relay `movl %eax,%r11d; addl M,%r11d; movl
             // %r11d,%eax`): %S already holds %D's full value, so the qword

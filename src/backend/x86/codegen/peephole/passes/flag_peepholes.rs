@@ -3255,7 +3255,7 @@ pub(super) fn narrow_dead_sign_extension(store: &mut LineStore, infos: &mut [Lin
             i += 1;
             continue;
         }
-        let t = infos[i].trimmed(store.get(i)).to_string();
+        let t = infos[i].trimmed(store.get(i));
         let Some(rest) = t.strip_prefix("movslq ") else {
             i += 1;
             continue;

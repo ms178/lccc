@@ -3830,7 +3830,7 @@ mod tests {
     fn straight_effect_memo_key_covers_kind_and_reg_refs() {
         let store = LineStore::new("    movq %rdi, %rax\n".to_string());
         let mut infos = vec![classify_line(store.get(0))];
-        let t = infos[0].trimmed(store.get(0)).to_string();
+        let t = infos[0].trimmed(store.get(0));
         assert!(matches!(infos[0].kind, LineKind::Other { dest_reg: 0 }));
         let typed = FileLiveness::straight_effect(&infos, 0, &t);
         assert_eq!(typed.writes, RAX, "`movq %rdi, %rax` kills %rax");

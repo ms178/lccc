@@ -625,7 +625,7 @@ pub(super) fn fold_highbit_subs(store: &mut LineStore, infos: &mut [LineInfo]) -
         if lines[4] >= len || lines[4] == i {
             continue;
         }
-        let text = |k: usize| infos[lines[k]].trimmed(store.get(lines[k])).to_string();
+        let text = |k: usize| infos[lines[k]].trimmed(store.get(lines[k]));
         let Some(rewrite) = match_highbit_sub(&[text(0), text(1), text(2), text(3), text(4)])
         else {
             continue;
@@ -696,7 +696,7 @@ pub(super) fn fold_guarded_scan_selects(store: &mut LineStore, infos: &mut [Line
         if lines[3] >= len || lines[3] == i {
             continue;
         }
-        let text = |k: usize| infos[lines[k]].trimmed(store.get(lines[k])).to_string();
+        let text = |k: usize| infos[lines[k]].trimmed(store.get(lines[k]));
         let Some(m) = match_guarded_scan_select(&[text(0), text(1), text(2), text(3)]) else {
             continue;
         };
@@ -776,7 +776,7 @@ pub(super) fn retarget_preloaded_scan_copies(
             continue;
         }
         let lines = [i, l1, l2];
-        let text = |k: usize| infos[k].trimmed(store.get(k)).to_string();
+        let text = |k: usize| infos[k].trimmed(store.get(k));
         let Some(m) = match_preloaded_scan_copy(&[text(i), text(l1), text(l2)]) else {
             continue;
         };
@@ -793,7 +793,7 @@ pub(super) fn retarget_preloaded_scan_copies(
 }
 
 /// Pure matcher for [`retarget_preloaded_scan_copies`].
-fn match_preloaded_scan_copy(t: &[String; 3]) -> Option<GuardedScanRewrite> {
+fn match_preloaded_scan_copy(t: &[&str; 3]) -> Option<GuardedScanRewrite> {
     let (mn, q, scan_ops) = [("bsf", false), ("bsf", true), ("bsr", false), ("bsr", true)]
         .into_iter()
         .find_map(|(mn, q)| {
@@ -889,7 +889,7 @@ fn is_imm_move_to(t: &str, fam: RegId) -> bool {
 
 /// Pure matcher for [`fold_guarded_scan_selects`]: `t` is the scan, then the
 /// test and the constant move in either order, then the cmov.
-fn match_guarded_scan_select(t: &[String; 4]) -> Option<GuardedScanRewrite> {
+fn match_guarded_scan_select(t: &[&str; 4]) -> Option<GuardedScanRewrite> {
     let (mn, q, scan_ops) = [("bsf", false), ("bsf", true), ("bsr", false), ("bsr", true)]
         .into_iter()
         .find_map(|(mn, q)| {
@@ -970,7 +970,7 @@ struct HighbitSubRewrite {
 }
 
 /// Pure matcher for [`fold_highbit_subs`]; see there for the contract.
-fn match_highbit_sub(t: &[String; 5]) -> Option<HighbitSubRewrite> {
+fn match_highbit_sub(t: &[&str; 5]) -> Option<HighbitSubRewrite> {
     let (scan_q, mask, preload_imm) = if t[1].starts_with("bsrq ") {
         (true, 63u32, 127u32)
     } else if t[1].starts_with("bsrl ") {
@@ -6851,7 +6851,7 @@ pub(super) fn hoist_loop_invariant_gpr_load(
             continue;
         }
         // Match both unconditional (jmp) and conditional (jle, jl, jne, etc.) back-edges
-        let jmp_text = infos[i].trimmed(store.get(i)).to_string();
+        let jmp_text = infos[i].trimmed(store.get(i));
         let target = if jmp_text.starts_with("jmp ") {
             jmp_text[4..].to_string()
         } else if jmp_text.starts_with("jl ") {
@@ -9336,7 +9336,7 @@ fn vex_self_move_zeroes_live_upper(
     infos: &[LineInfo],
     idx: usize,
     reg: &str,
-    wider_mentions: &WiderMentions,
+    wider_mentions: &mut Option<WiderMentions>,
 ) -> bool {
     let (wider1, wider2) = if let Some(num) = reg.strip_prefix("%xmm") {
         (format!("%ymm{num}"), Some(format!("%zmm{num}")))
@@ -9372,7 +9372,13 @@ fn vex_self_move_zeroes_live_upper(
             return false;
         }
         if infos[j].is_barrier() {
-            return wider_mentions.any_for(reg);
+            // Built here, on the first barrier that actually needs a
+            // whole-file answer. Lines this pass already NOPed are skipped
+            // by `scan`, which is exactly what `note_deleted` accounted for
+            // in the eager version, so the answer is unchanged.
+            return wider_mentions
+                .get_or_insert_with(|| WiderMentions::scan(store, infos))
+                .any_for(reg);
         }
         if tj.starts_with('v') {
             if let Some((_, dst)) = tj.rsplit_once(',') {
@@ -9388,7 +9394,9 @@ fn vex_self_move_zeroes_live_upper(
 
 pub(super) fn eliminate_vector_self_moves(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
-    let mut wider_mentions = WiderMentions::scan(store, infos);
+    // Lazy: a whole-file scan is only owed once a barrier fallback asks for
+    // it. Integer-only and legacy-SSE files never ask, so the scan vanishes.
+    let mut wider_mentions: Option<WiderMentions> = None;
     let mut changed = false;
     for i in 0..len {
         if infos[i].is_nop() || infos[i].pinned {
@@ -9433,10 +9441,12 @@ pub(super) fn eliminate_vector_self_moves(store: &mut LineStore, infos: &mut [Li
             && all_same
             && arity_ok
             && !(t.starts_with('v')
-                && vex_self_move_zeroes_live_upper(store, infos, i, first, &wider_mentions))
+                && vex_self_move_zeroes_live_upper(store, infos, i, first, &mut wider_mentions))
         {
             mark_nop(&mut infos[i]);
-            wider_mentions.note_deleted(first);
+            if let Some(wm) = wider_mentions.as_mut() {
+                wm.note_deleted(first);
+            }
             changed = true;
         }
     }
@@ -9514,7 +9524,7 @@ pub(super) fn fuse_staged_add_and_relay(store: &mut LineStore, infos: &mut [Line
             i += 1;
             continue;
         }
-        let stage_t = infos[i].trimmed(store.get(i)).to_string();
+        let stage_t = infos[i].trimmed(store.get(i));
 
         // Staging: full-width or zero-extending 32-bit reg-to-reg move only.
         // Memory sources are `retarget_producer_into_copy`'s domain; this
@@ -9553,7 +9563,7 @@ pub(super) fn fuse_staged_add_and_relay(store: &mut LineStore, infos: &mut [Line
             i += 1;
             continue;
         }
-        let add_t = infos[j].trimmed(store.get(j)).to_string();
+        let add_t = infos[j].trimmed(store.get(j));
         // A subtract of an immediate is the add of its negation (`movl %esi,
         // %r10d; subl $1, %r10d` -> `leal -1(%rsi), %r10d`, GCC 16.2's and
         // Clang 23.1.4's spelling of dav1d's `sby - 1` index); a subtract of
@@ -9854,7 +9864,7 @@ pub(super) fn fuse_load_lea_add(store: &mut LineStore, infos: &mut [LineInfo]) -
             i += 1;
             continue;
         }
-        let load_t = infos[i].trimmed(store.get(i)).to_string();
+        let load_t = infos[i].trimmed(store.get(i));
         // Staged load: `movl MEM, %X` / `movq MEM, %X` with a memory source
         // and a plain GP destination.
         let (w, lrest) = if let Some(r) = load_t.strip_prefix("movl ") {
@@ -9886,7 +9896,7 @@ pub(super) fn fuse_load_lea_add(store: &mut LineStore, infos: &mut [LineInfo]) -
             i += 1;
             continue;
         }
-        let lea_t = infos[j].trimmed(store.get(j)).to_string();
+        let lea_t = infos[j].trimmed(store.get(j));
         let (lea_w, lrrest) = if let Some(r) = lea_t.strip_prefix("leal ") {
             (32u8, r)
         } else if let Some(r) = lea_t.strip_prefix("leaq ") {
@@ -9976,7 +9986,7 @@ pub(super) fn fuse_load_lea_add(store: &mut LineStore, infos: &mut [LineInfo]) -
             i += 1;
             continue;
         }
-        let add_t = infos[k].trimmed(store.get(k)).to_string();
+        let add_t = infos[k].trimmed(store.get(k));
         let add_op = if w == 32 { "addl " } else { "addq " };
         let Some(arest) = add_t.strip_prefix(add_op) else {
             i += 1;
@@ -10261,7 +10271,7 @@ pub(super) fn fuse_load_lea_into_base(store: &mut LineStore, infos: &mut [LineIn
             i += 1;
             continue;
         }
-        let load_t = infos[i].trimmed(store.get(i)).to_string();
+        let load_t = infos[i].trimmed(store.get(i));
         let (w, lrest) = if let Some(r) = load_t.strip_prefix("movl ") {
             (32u8, r)
         } else if let Some(r) = load_t.strip_prefix("movq ") {
@@ -10291,7 +10301,7 @@ pub(super) fn fuse_load_lea_into_base(store: &mut LineStore, infos: &mut [LineIn
             i += 1;
             continue;
         }
-        let lea_t = infos[j].trimmed(store.get(j)).to_string();
+        let lea_t = infos[j].trimmed(store.get(j));
         let (lea_w, lrrest) = if let Some(r) = lea_t.strip_prefix("leal ") {
             (32u8, r)
         } else if let Some(r) = lea_t.strip_prefix("leaq ") {
@@ -10371,7 +10381,7 @@ pub(super) fn fuse_load_lea_into_base(store: &mut LineStore, infos: &mut [LineIn
             i += 1;
             continue;
         }
-        let use_t = infos[k].trimmed(store.get(k)).to_string();
+        let use_t = infos[k].trimmed(store.get(k));
         if !line_refs_gp_family(&use_t, d_fam as u8) {
             i += 1;
             continue;
@@ -14966,7 +14976,7 @@ pub(super) fn fold_shift_into_sib(store: &mut LineStore, infos: &mut [LineInfo])
             i += 1;
             continue;
         }
-        let ti = infos[i].trimmed(store.get(i)).to_string();
+        let ti = infos[i].trimmed(store.get(i));
         // Form A: `shlq $K, %R` (K = 1..3, the encodable SIB scales).
         // Form B: `addq %R, %R` -- a doubling, i.e. a shift by one.
         let (shifted_reg, scale) = match parse_shift_imm(&ti) {

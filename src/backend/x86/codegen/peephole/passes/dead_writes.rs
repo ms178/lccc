@@ -1261,7 +1261,7 @@ pub(super) fn fold_load_test_into_cmp(store: &mut LineStore, infos: &mut [LineIn
             i += 1;
             continue;
         }
-        let load = infos[i].trimmed(store.get(i)).to_string();
+        let load = infos[i].trimmed(store.get(i));
         let entry = SIGNED
             .iter()
             .chain(UNSIGNED.iter())
@@ -1331,7 +1331,7 @@ pub(super) fn fold_load_test_into_cmp(store: &mut LineStore, infos: &mut [LineIn
             i += 1;
             continue;
         }
-        let test = infos[j].trimmed(store.get(j)).to_string();
+        let test = infos[j].trimmed(store.get(j));
         let Some((width, args)) = test
             .strip_prefix("testq ")
             .map(|r| ('q', r))
@@ -1455,7 +1455,7 @@ pub(super) fn fold_accumulator_roundtrip(store: &mut LineStore, infos: &mut [Lin
             i += 1;
             continue;
         }
-        let first = infos[i].trimmed(store.get(i)).to_string();
+        let first = infos[i].trimmed(store.get(i));
         // Both widths.  The 32-bit form is the one a *value* takes when it has
         // to transit %rax: every call result and every return value lives
         // there, and the allocator cannot keep a general range in %rax, so
@@ -1497,7 +1497,7 @@ pub(super) fn fold_accumulator_roundtrip(store: &mut LineStore, infos: &mut [Lin
             i += 1;
             continue;
         };
-        let op_line = infos[j].trimmed(store.get(j)).to_string();
+        let op_line = infos[j].trimmed(store.get(j));
         let Some(op) = RMW_OPS.iter().find(|p| op_line.starts_with(**p)) else {
             i += 1;
             continue;
@@ -1561,7 +1561,7 @@ pub(super) fn fold_accumulator_roundtrip(store: &mut LineStore, infos: &mut [Lin
             i += 1;
             continue;
         };
-        let back = infos[k].trimmed(store.get(k)).to_string();
+        let back = infos[k].trimmed(store.get(k));
         if infos[j].pinned || infos[k].pinned {
             i += 1;
             continue;

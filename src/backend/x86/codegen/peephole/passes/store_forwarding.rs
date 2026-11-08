@@ -1793,7 +1793,7 @@ mod tests {
             .collect();
         let mut in_asm = false;
         for i in 0..infos.len() {
-            let t = infos[i].trimmed(store.get(i)).to_string();
+            let t = infos[i].trimmed(store.get(i));
             if t == "#APP" {
                 in_asm = true;
                 continue;

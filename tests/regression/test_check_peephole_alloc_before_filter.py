@@ -177,5 +177,195 @@ class MainTests(unittest.TestCase):
             sys.argv = old
 
 
+class PreviouslyInvisibleShapes(unittest.TestCase):
+    """The four filter shapes the two-regex version could not see.
+
+    Together these hid 23 of the 66 real sites, including the pass ablation
+    measured at 30.4% of the whole peephole. Each fixture is the real shape from
+    the tree, not an invented one.
+    """
+
+    def test_if_let_else_chain_is_detected(self):
+        # relay_and_lea.rs::fold_copy_into_lea_base -- the 30.4% pass.
+        src = (
+            '        let lea = infos[li].trimmed(store.get(li)).to_string();\n'
+            '        let (lea_rest, prod_w) = if let Some(r) = lea.strip_prefix("leaq ") {\n'
+            '            (r, 64u8)\n'
+            '        } else if let Some(r) = lea.strip_prefix("leal ") {\n'
+            '            (r, 32u8)\n'
+            '        } else {\n'
+            '            continue;\n'
+            '        };\n'
+        )
+        got = gate.violations(src)
+        self.assertEqual(len(got), 1, "the if-let/else chain must be one statement")
+        self.assertEqual(got[0][1], "lea")
+
+    def test_positive_guard_is_detected(self):
+        # `if pred(&t) { continue; }` -- the old gate only knew `if !pred(&t)`.
+        src = (
+            '    let lea = infos[i].trimmed(store.get(i)).to_string();\n'
+            '    if has_implicit_reg_usage(&lea) {\n'
+            '        continue;\n'
+            '    }\n'
+        )
+        got = gate.violations(src)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0][2], "has_implicit_reg_usage")
+
+    def test_let_else_method_is_detected(self):
+        src = (
+            '    let t = infos[i].trimmed(store.get(i)).to_string();\n'
+            '    let Some(rest) = t.strip_prefix("movzbl ") else {\n'
+            '        continue;\n'
+            '    };\n'
+        )
+        self.assertEqual(len(gate.violations(src)), 1)
+
+    def test_negated_method_is_detected(self):
+        src = (
+            '    let t = infos[i].trimmed(store.get(i)).to_string();\n'
+            '    if !t.starts_with("movl ") {\n'
+            '        continue;\n'
+            '    }\n'
+        )
+        got = gate.violations(src)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0][2], "t.starts_with")
+
+    def test_closure_copy_is_detected(self):
+        # The window matchers hid the copy behind a closure name: every call
+        # copies, so five Strings were built before one selective matcher.
+        src = (
+            '    let text = |k: usize| infos[k].trimmed(store.get(k)).to_string();\n'
+            '    let Some(m) = match_highbit_sub(&[text(0), text(1), text(2)]) else {\n'
+            '        continue;\n'
+            '    };\n'
+        )
+        got = gate.violations(src)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0][1], "text")
+
+    def test_mut_binding_is_detected(self):
+        src = (
+            '    let mut lj = infos[j].trimmed(store.get(j)).to_string();\n'
+            '    let Some(x) = parse_const_increment(&lj) else {\n'
+            '        continue;\n'
+            '    };\n'
+        )
+        self.assertEqual(len(gate.violations(src)), 1)
+
+    def test_break_and_return_count_as_rejection(self):
+        for verb in ("break", "return false"):
+            src = (
+                '    let t = infos[i].trimmed(store.get(i)).to_string();\n'
+                f'    if t.is_empty() {{ {verb}; }}\n'
+            )
+            self.assertEqual(len(gate.violations(src)), 1, verb)
+
+
+class CompliantShapesStillAccepted(unittest.TestCase):
+    """The gate must not push authors back toward a copy to silence it."""
+
+    def test_borrowed_text_is_accepted(self):
+        src = (
+            '    let lea = infos[li].trimmed(store.get(li));\n'
+            '    let Some(r) = lea.strip_prefix("leaq ") else { continue; };\n'
+        )
+        self.assertEqual(gate.violations(src), [])
+
+    def test_probe_then_allocate_is_accepted(self):
+        # Filter on the borrow, own it only for a candidate.
+        src = (
+            '    let probe = infos[i].trimmed(store.get(i));\n'
+            '    if parse_memory_load(probe).is_none() { continue; }\n'
+            '    let load = infos[i].trimmed(store.get(i)).to_string();\n'
+            '    store.replace(i, load);\n'
+        )
+        self.assertEqual(gate.violations(src), [])
+
+    def test_conditional_copy_is_accepted(self):
+        # The i686 staging shape: the copy is made only when an `s` parser can
+        # match, so the reject path allocates nothing.
+        src = (
+            '    let t: Option<String> = (s.starts_with("movl ")\n'
+            '        || s.starts_with("xorl "))\n'
+            '        .then(|| trimmed(store, &infos[j], j).to_string());\n'
+            '    if let Some(x) = parse_xor_self(&s) { continue; }\n'
+        )
+        self.assertEqual(gate.violations(src), [])
+
+    def test_unconditional_consumption_is_accepted(self):
+        src = (
+            '    let t = infos[i].trimmed(store.get(i)).to_string();\n'
+            '    store.replace(i, t);\n'
+        )
+        self.assertEqual(gate.violations(src), [])
+
+    def test_copy_stored_in_a_record_is_accepted(self):
+        src = (
+            '    let t = infos[i].trimmed(store.get(i)).to_string();\n'
+            '    parts.push(t);\n'
+        )
+        self.assertEqual(gate.violations(src), [])
+
+    def test_rejection_word_in_a_comment_does_not_trigger(self):
+        src = (
+            '    let t = infos[i].trimmed(store.get(i)).to_string();\n'
+            '    store.replace(i, t); // continue with the next line\n'
+        )
+        self.assertEqual(gate.violations(src), [])
+
+    def test_comment_line_between_copy_and_use_is_skipped(self):
+        src = (
+            '    let t = infos[i].trimmed(store.get(i)).to_string();\n'
+            '\n'
+            '    // consume unconditionally\n'
+            '    parts.push(t);\n'
+        )
+        self.assertEqual(gate.violations(src), [])
+
+
+class ScopeBoundary(unittest.TestCase):
+    """Pin the deliberate limit: the filter must be the FIRST statement.
+
+    A copy consumed by an intervening binding and rejected afterwards is not
+    flagged. That is a known, documented scope choice -- widening it would flag
+    legitimate multi-step consumers -- and this test exists so the boundary is a
+    decision rather than an accident.
+    """
+
+    def test_rejection_in_a_later_statement_is_out_of_scope(self):
+        src = (
+            '    let t = infos[i].trimmed(store.get(i)).to_string();\n'
+            '    let n = t.len();\n'
+            '    if n == 0 { continue; }\n'
+        )
+        self.assertEqual(gate.violations(src), [])
+
+    def test_comments_cannot_hide_the_filter(self):
+        # Comment and blank lines between the copy and its filter are skipped
+        # without bound: padding a defect with prose must not silence the gate.
+        src = (
+            '    let t = infos[i].trimmed(store.get(i)).to_string();\n'
+            + '    // filler\n' * (gate.MAX_STATEMENT_LINES + 5)
+            + '    if t.is_empty() { continue; }\n'
+        )
+        self.assertEqual(len(gate.violations(src)), 1)
+
+    def test_statement_scanner_is_bounded_on_code(self):
+        # The bound applies to statement lines, so a very long first statement
+        # that merely consumes the copy is not chased into a later rejection.
+        src = (
+            '    let t = infos[i].trimmed(store.get(i)).to_string();\n'
+            '    let n = foo(\n'
+            + '        arg,\n' * (gate.MAX_STATEMENT_LINES + 5)
+            + '        t,\n'
+            '    );\n'
+            '    if n == 0 { continue; }\n'
+        )
+        self.assertEqual(gate.violations(src), [])
+
+
 if __name__ == "__main__":
     unittest.main()
