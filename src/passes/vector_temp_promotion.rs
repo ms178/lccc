@@ -936,7 +936,7 @@ fn destination_unobserved_between(
                     && ty.size() != 0
                     && allocas
                         .get(&ptr.0)
-                        .is_some_and(|info| ty.size() <= info.size)
+                        .is_some_and(|info| !info.semantic_volatile && ty.size() <= info.size)
             }
             _ => false,
         };
@@ -2809,6 +2809,56 @@ mod tests {
                 promote_in_function(&mut function),
                 expected,
                 "{size} {space:?} {volatile}"
+            );
+        }
+    }
+
+    #[test]
+    fn promotion_does_not_cross_access_to_semantically_volatile_alloca() {
+        for (semantic, expected) in [(true, 0), (false, 1)] {
+            let mut other = alloca(5, 4, 4);
+            if let Instruction::Alloca {
+                volatile,
+                semantic_volatile,
+                ..
+            } = &mut other
+            {
+                *volatile = true;
+                *semantic_volatile = semantic;
+            }
+            let mut function = function(
+                "volatile_other_alloca",
+                vec![block(
+                    0,
+                    vec![
+                        alloca(0, 32, 32),
+                        alloca(1, 32, 32),
+                        other,
+                        intrinsic(
+                            Some(2),
+                            IntrinsicOp::Pcmpeqb256,
+                            Some(0),
+                            vec![Operand::Value(Value(3)), Operand::Value(Value(4))],
+                        ),
+                        Instruction::Load {
+                            dest: Value(6),
+                            ptr: Value(5),
+                            ty: IrType::I32,
+                            seg_override: AddressSpace::Default,
+                            volatile: false,
+                        },
+                        Instruction::Memcpy {
+                            dest: Value(1),
+                            src: Value(0),
+                            size: 32,
+                        },
+                    ],
+                )],
+            );
+            assert_eq!(
+                promote_in_function(&mut function),
+                expected,
+                "semantic={semantic}"
             );
         }
     }
