@@ -161,6 +161,29 @@ class Inventory(unittest.TestCase):
             with self.assertRaises(ValueError):
                 provenance.provenance(bad)
 
+    def test_outcome_evidence_captures_changed_diagnostics_and_chunks(self):
+        for row in self.rows:
+            row.update(phase="compile", returncode=1, detail="example diagnostic")
+        self.write()
+        data = summary.validated_report(self.path)
+        before = provenance.outcome_evidence(data)
+        data["results"][2]["detail"] = "different oracle failure"
+        self.assertNotEqual(before, provenance.outcome_evidence(data))
+        self.assertEqual(len(before), 3)
+        data["results"] = [{"test": f"case-{i}.c", "flags": "-O2", "status": "compile-fail",
+                            "phase": "compile", "returncode": 1, "detail": "failure"}
+                           for i in range(100)]
+        payloads = provenance.outcome_payloads(data)
+        self.assertGreater(len(payloads), 1)
+        parts = [json.loads(payload) for payload in payloads]
+        self.assertTrue(all(len(payload.encode()) <= 3800 for payload in payloads))
+        self.assertEqual([part["part"] for part in parts], list(range(1, len(parts) + 1)))
+        self.assertTrue(all(part["parts"] == len(parts) for part in parts))
+        self.assertEqual(sum(len(part["rows"]) for part in parts), 100)
+        data["results"][0].pop("detail")
+        with self.assertRaises(ValueError):
+            provenance.outcome_payloads(data)
+
     def test_missing_report_is_not_a_pass(self):
         with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
             self.assertEqual(summary.main([str(self.path)]), 2)

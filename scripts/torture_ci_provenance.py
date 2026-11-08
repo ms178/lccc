@@ -9,6 +9,7 @@ not comparison keys: comparing compiler revisions is the point of a ratchet.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -88,13 +89,62 @@ def provenance(data: dict) -> dict:
     return {"comparison": comparison, "candidate_sha256": tools["lccc"]["sha256"]}
 
 
+def outcome_evidence(data: dict) -> list[list]:
+    """Hash bounded runner details too, so changed skip/failure causes surface.
+
+    The runner's detail is itself bounded and can contain transient paths; a
+    changed digest demands review, not a claim that the cause is a regression.
+    """
+    rows = []
+    for row in data["results"]:
+        if row["status"] == "pass":
+            continue
+        if (not isinstance(row.get("phase"), str) or not row["phase"] or
+                type(row.get("returncode")) is not int or not isinstance(row.get("detail"), str)):
+            raise ValueError("non-pass phase, return code and detail are required")
+        digest = hashlib.sha256(row["detail"].encode("utf-8")).hexdigest()
+        rows.append([row["test"], row["flags"], row["status"], row["phase"], row["returncode"], digest])
+    return sorted(rows)
+
+
+def outcome_payloads(data: dict) -> list[str]:
+    rows = outcome_evidence(data)
+    chunks: list[list] = [[]]
+    # Reserve space for part numbers and escaping; 3000 leaves a substantial
+    # margin under GitHub's 4096-byte annotation limit.
+    for row in rows:
+        candidate = chunks[-1] + [row]
+        if len(json.dumps(candidate, ensure_ascii=True).replace("%", "%25").encode()) > 3000:
+            if not chunks[-1]:
+                raise ValueError("one outcome identity exceeds annotation limit")
+            chunks.append([row])
+            if len(json.dumps(chunks[-1], ensure_ascii=True).replace("%", "%25").encode()) > 3000:
+                raise ValueError("one outcome identity exceeds annotation limit")
+        else:
+            chunks[-1] = candidate
+    if len(chunks) > 40:
+        raise ValueError("too many outcome annotation chunks")
+    payloads = []
+    for index, chunk in enumerate(chunks):
+        obj = {"arch": data["arch"], "mode": data["mode"], "part": index + 1,
+               "parts": len(chunks), "rows": chunk}
+        payload = (json.dumps(obj, separators=(",", ":"), ensure_ascii=True)
+                   .replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
+        if len(payload.encode()) > 3800:
+            raise ValueError("outcome annotation exceeds safe limit")
+        payloads.append(payload)
+    return payloads
+
+
 def main(argv: list[str]) -> int:
     if not argv:
         print("usage: torture_ci_provenance.py REPORT...", file=sys.stderr)
         return 2
     for name in argv:
         try:
-            result = provenance(validated_report(Path(name)))
+            data = validated_report(Path(name))
+            result = provenance(data)
+            outcomes = outcome_payloads(data)
             payload = (json.dumps(result, separators=(",", ":"), ensure_ascii=True)
                        .replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
             if len(payload.encode("utf-8")) > 3800:
@@ -103,6 +153,8 @@ def main(argv: list[str]) -> int:
             print(f"Invalid provenance {name}: {exc}", file=sys.stderr)
             return 2
         print(f"::notice title=GCC torture provenance::{payload}")
+        for outcome in outcomes:
+            print(f"::notice title=GCC torture outcome evidence::{outcome}")
     return 0
 
 
