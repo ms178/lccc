@@ -941,7 +941,7 @@ those diagnostics.
 | `cargo fmt --all -- --check` | clean |
 | `scripts/audit_census.py --check` | PASS, no metric grew (863 panic sites, 255 undocumented knobs vs baseline 261) |
 | `scripts/gen_lcccsimd.py --check` / `gen_x86_builtin_types.py --check` | both clean |
-| `python3 -m unittest discover -s tests/simd -p 'test_*.py'` | 39 tests OK (1 skipped: PyYAML optional), 7 driver self-tests wired |
+| `python3 -m unittest discover -s tests/simd -p 'test_*.py'` | 40 tests OK (1 skipped: PyYAML optional), 7 driver self-tests wired |
 | seven driver `--self-test` totals | 117/117 (39/15/16/5/13/18/11) |
 | `check_audit_2026-11-08.py --strict` (built LCCC) | 15/15 PASS, 0 problems |
 | `check_assembler_widths.py --require-gas-247` | 16 cases, 8 byte-identical encodings, 0 problems |
@@ -1041,6 +1041,30 @@ sanitizer variant across every shape, and (when the plain EVEX probe works)
 executes a **non-sanitized AVX-512 build** as hard correctness evidence.
 `test_07b_evex_probe_gate_fails_closed` permanently pins the failure path
 with a mocked missing compiler.  No leg is silently downgraded to PASS.
+
+The executable gate itself then exposed a **second** probe defect, again from
+the hosted log rather than inference: the first probe was a plain
+`_mm512_set1_epi32(7)` + `_mm512_storeu_si512` + `lanes[0] == 7` check,
+which GCC **constant-folds away at -O1**.  Its sanitizer build kept the store
+(and therefore reported `probe run rc=-4`, i.e. SIGILL), but its plain build
+reported `EVEX store executed` on the very same CPU that cannot execute EVEX,
+so the "hard evidence" fallback tried to run a non-sanitized AVX-512 corpus
+and failed with `rc=-4` (hosted log `42506426020/job/128810582710`, step 16,
+three `evidence='plain'` failures).  The probe is now an `asm volatile`
+`vmovdqu64 %zmm0, mem` with a memory clobber — an opaque template the
+optimizer cannot delete.  `test_07c_evex_probe_is_not_optimized_away`
+disassembles the built probe and requires a literal `vmovdqu64 ... %zmm`
+instruction; local `objdump` shows `62 f1 fe 48 7f 44 24 ... vmovdqu64
+%zmm0,-0x40(%rsp)`.  With both probes now correctly returning `rc=-4` on the
+hosted runner, the AVX-512 runtime legs are skipped **with printed reasons**,
+the portable sanitizer leg still executes every shape, and the AVX-512
+headers are still compiled under `-Werror`.
+
+Definitive root cause of the three shard-a failures: **the hosted Azure vCPU
+advertises `avx512f`/`avx512bw` in `/proc/cpuinfo` but rejects EVEX with
+SIGILL** (SIGILL = `rc=-4`; the earlier ASan `DEADLYSIGNAL/SEGV` report was
+ASan's signal handler classifying that fault).  Neither the corpus nor LCCC
+is at fault; the original test assumed an advertised feature was executable.
 
 ### 9c.9.7 Three-way host runtime measurement (honest, not a victory claim)
 

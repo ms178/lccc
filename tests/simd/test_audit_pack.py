@@ -187,22 +187,28 @@ class AuditPackTests(unittest.TestCase):
         """Compile AND EXECUTE one EVEX store with exactly `flags`.
 
         CPUID advertisement is not proof of executability: the 2026-11-08
-        hosted runner advertises avx512f/avx512bw in /proc/cpuinfo, yet
-        gcc-16 16.0.1 + ASan produces a faulting `_mm512_storeu_si512`.
-        The only sound oracle is the instruction itself, compiled with the
-        same toolchain and the same flags as the corpus leg it guards.
+        hosted runner advertises avx512f/avx512bw in /proc/cpuinfo, yet its
+        vCPU rejects EVEX with SIGILL (hosted log
+        `42506426020/job/128810582710`: `probe run rc=-4`).  The only sound
+        oracle is the instruction itself, built with the same toolchain and
+        the same flags as the corpus leg it guards.
+
+        The store is an `asm volatile` with a memory clobber: a plain
+        `_mm512_storeu_si512()` of a compile-time constant is folded away at
+        -O1, which previously produced a FALSE POSITIVE "EVEX works" verdict
+        on that same runner.  An opaque asm template cannot be deleted.
         """
         work = AuditPackTests.work
         src = work / 'evex_probe.c'
-        if not src.exists():
-            src.write_text(
-                '#include <immintrin.h>\n'
-                'int main(void) {\n'
-                '  __m512i v = _mm512_set1_epi32(7);\n'
-                '  unsigned lanes[16];\n'
-                '  _mm512_storeu_si512((void *)lanes, v);\n'
-                '  return lanes[0] == 7u ? 0 : 1;\n'
-                '}\n', encoding='utf-8')
+        src.write_text(
+            '#include <immintrin.h>\n'
+            'int main(void) {\n'
+            '  unsigned lanes[16];\n'
+            '  __m512i v = _mm512_set1_epi32(7);\n'
+            '  __asm__ volatile ("vmovdqu64 %1, %0"\n'
+            '                   : "=m" (lanes) : "x" (v) : "memory");\n'
+            '  return lanes[0] == 7u ? 0 : 1;\n'
+            '}\n', encoding='utf-8')
         tag = 'san' if any('sanitize' in f for f in flags) else 'plain'
         exe = work / f'evex_probe_{tag}.bin'
         try:
@@ -276,6 +282,24 @@ class AuditPackTests(unittest.TestCase):
         self.assertTrue(reason.startswith(('probe compile',
                                            'probe infrastructure failure')),
                         reason)
+
+    def test_07c_evex_probe_is_not_optimized_away(self):
+        """The ISA gate must contain a REAL zmm store in the binary.
+
+        A constant `_mm512_storeu_si512` can be constant-folded to nothing,
+        which would make the probe report success on a CPU that cannot
+        execute EVEX at all.  Pin the disassembly instead of trusting source.
+        """
+        import shutil
+        objdump = shutil.which('objdump')
+        if objdump is None:
+            self.skipTest('objdump not installed')
+        ok, _ = self._evex_probe(('-std=c99', '-O1'))
+        if not ok:
+            self.skipTest('host cannot execute EVEX; gate is already closed')
+        dis = run([objdump, '-d', str(self.work / 'evex_probe_plain.bin')])
+        self.assertEqual(dis.returncode, 0, dis.stderr)
+        self.assertRegex(dis.stdout, r'vmovdqu64\s+.*%zmm')
 
     # --- end-to-end harness checks --------------------------------------
 

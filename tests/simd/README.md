@@ -194,7 +194,7 @@ an `=off` control.
 The lccc-dependent driver is still **not** a hard CI gate: hosted CI builds
 the compiler in a separate lane, so a red compiler build would otherwise be
 indistinguishable from a red harness.  What CI *does* gate is the harness
-itself through `test_audit_pack.py` (39 tests, including permanent injected
+itself through `test_audit_pack.py` (40 tests, including permanent injected
 wrong-code mutations and all seven driver self-tests).  Locally the full
 driver is strict-green against the fastbuild binary: 15/15 rows `PASS`.
 
