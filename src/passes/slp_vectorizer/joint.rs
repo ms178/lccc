@@ -2,7 +2,7 @@
 //! the ordinary SLP graph builder, scheduler, external-use and alias proofs.
 use super::*;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct Tail {
     pub alpha: usize,
     pub four_inputs: bool,
