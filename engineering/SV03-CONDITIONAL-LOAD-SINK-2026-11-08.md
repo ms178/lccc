@@ -268,12 +268,17 @@ accepting authority and is polled separately.
 
 ## 11. Post-#1153 perfection pass: sound range-gated signedness folding
 
+> Historical measurement record.  Section 12 supersedes the counts, base
+> commit, tool versions and CI verdicts below with the final remeasurement on
+> `origin/main = 7ad9f30161ddc4bc1ebdea00ddb4ec54f6865498`.  The proof
+> invariants in 11.1–11.3 remain the design authority.
+
 This section records a second, independent red team of the uncommitted
-follow-up work on the NEW active branch `arena/4058527f-lccc`, based on
-`origin/main = 5e9a06a2fab2edd2ee87f9286a2cdf7595acbc66` after the final
+follow-up work on the NEW active branch `arena/4058527f-lccc`, based at that
+time on `origin/main = 5e9a06a2fab2edd2ee87f9286a2cdf7595acbc66` after a clean
 rebase (PR #1160 changed only four preprocessor/test/doc files, with no
 overlap).  PR #1153 is merged and untouched.  Every number below was
-remeasured on the rebased tree; the earlier base was `6efad731`.
+remeasured on that tree; the earlier base was `6efad731`.
 
 ### 11.1 The unsafe shortcut and why it was rejected
 
@@ -364,7 +369,9 @@ representation, not an input.  No allocation in the proof: def maps are flat
 
 The pinned `harness-cache-8` release-tag cache (`d66c5ac881e2`) supplied
 Rust 1.99.1, GCC 16.2.0, Clang 23.1.5, GDB 18.1, binutils 2.47, mold 3.0.0,
-QEMU 11.1.3, Valgrind 3.19.0 and PyYAML 6.0; a 4 GiB `/swapfile` was active.
+QEMU 11.1.3 and the Valgrind 3.19.0 Debian package; a 4 GiB `/swapfile` was
+active.  PyYAML 6.0.3 was installed as a PyPI wheel because the cached
+`python3-yaml` Debian package needs `libyaml-0-2`, which is not in the cache.
 `objtool`, `pahole` and `perf` are NOT installed and were NOT faked:
 `apt-get download dwarves linux-tools-common` reported "Unable to locate
 package"; `git ls-remote https://github.com/acmel/dwarves.git HEAD` succeeded
@@ -395,3 +402,139 @@ The new harnesses are deterministic and mutation-tested.  Technical debt
 closed: stale performance comment, missing Select/Phi/constant-join proof,
 missing full-width sign-set and opaque-Load negatives, unwired four-ISA SV-03
 harness, missing GDB/QEMU/mold lane probes, and missing invocation contracts.
+
+
+## 12. Third pass: rebase, ratchet repair, hosted toolchain pinning and fail-fast evidence
+
+### 12.1 Final base and reconstruction
+
+The final branch is one squashed commit on
+`origin/main = 7ad9f30161ddc4bc1ebdea00ddb4ec54f6865498`; that main includes
+PRs #1161, #1165 and #1166 (vector-store/query-operator fixes, GCC17 torture
+CI and last-20-PR red-team repairs).  The rebase preserves every upstream gate,
+including `scripts/check_vec_store_contracts.py --self-test` and its normal
+run, and adds the PR's four-ISA cross, same-width cast-range, best-tools and
+matrix gates.  The lane plan's `predicted_gate_seconds` is recomputed from the
+exact `measured_s` sum: shard A `539.32 s`, shard B `558.20 s`, total
+`2990 s`.  Static parity reports `571 commands / 42 invocation contracts`,
+shard partition `a=88, b=124`, lane self-test `19 rules / 30 fixtures`.
+
+### 12.2 Hosted-red root causes closed without weakening a ratchet
+
+The first hosted run `42617961252` failed four real lanes plus the aggregator:
+three hidden `clang-23` alias failures and one audit-census ratchet failure.
+The alias failures came from two harnesses that hard-coded `tool("clang-23")`
+and one missing `--clang "$CLANG" \\` in the lane-plan step, while the hosted
+runner publishes Clang only as
+`/home/runner/.cache/lccc/clang-oracle/23.1.5/bin/clang`.  The fix is a shared,
+version-verified resolver (`scripts/sv03_toolchain_identity.py`), explicit
+`--clang` arguments and 42 parity contracts that pin `CLANG`/`CLANG23` as
+hidden invocation channels.  No unpinned PATH fallback is permitted.
+
+The census grew `panic_sites 863 -> 867`, `fns_over_300 233 -> 234` and
+`fns_over_500 97 -> 98`.  Rebaselining would have hidden three real code-quality
+defects, so they were removed instead:
+
+| Defect | Root cause | Total replacement | Measured result |
+|---|---|---|---|
+| 4 new panic sites | `CondAddrExpr::key()` used `unreachable!` + `unwrap()`, and the apply phase re-matched a cloned `Instruction` with `unwrap()`/`unreachable!` | exhaustive `match` for all four key shapes; typed `CondLoadCastTail { dest, from_ty, to_ty }` emitted as a Cast with no variant re-match | `panic_sites = 863`, unchanged baseline |
+| `simplify_function_with_config` 498 -> 513 | 69-line use-count census inline | `compute_reassociation_use_counts` plus a bounds-checked, saturating `bump_use_count` | `fns_over_500 = 97`, unchanged baseline |
+| `simplify_cast` 298 -> 338 | range proof and Cast-chain rewrites inline | independent `cast_sign_range_fold` and `simplify_cast_chain`; each decision is total over its own def maps | `fns_over_300 = 233`, unchanged baseline |
+
+The saturating increment also removes a theoretical `u32` debug-build overflow
+abort without changing the profitability verdict: every count above one is
+already the refusing case.  New unit tests cover all four address-key shape
+classes, typed-tail parsing, saturating use counts, and the extracted range
+fold's width/signedness/proof guards.  `git apply`-reconstructed rebase and
+all static CI checkers pass.
+
+### 12.3 Local best-tools failure found and fixed
+
+A harness wipe removed the cached toolchains, Valgrind, `/swapfile` and
+`target/`.  The `harness-cache-8` tag (`d66c5ac881e2`) restored Rust 1.99.1,
+GCC 16.2.0, Clang 23.1.5, GDB 18.1, binutils 2.47, mold 3.0.0 and QEMU
+11.1.3; Valgrind 3.19.0 and `libc6-dbg` were installed from the cache's Debian
+packages, and a 4 GiB `/swapfile` was reactivated.  The first restored gate
+then exposed a real harness defect: a missing Valgrind produced a bare
+`assert`, whose empty message became `error = ""`, followed by
+`KeyError: 'objdump'` while the script printed unearned `PASS` lines.
+
+`check_cond_load_sink_best_tools.py` now uses one executable-aware
+`discover_tool`, names each missing required tool with a `RuntimeError`, and
+routes all printing through `report_evidence`.  An incomplete report prints
+the cause and all problems to stderr and returns 1; a complete report prints
+the same PASS evidence as before.  `--self-test` grew from 12 to 13 rejected
+verdict mutations (adding missing Valgrind), and directly proves both report
+paths plus `main()`'s missing-tool preflight.  Simulating the old failure
+returns rc 1, empty stdout, `verdict=FAIL` and the named cause; no exception
+escapes.
+
+### 12.4 Hosted-like no-alias execution proof
+
+A sanitized PATH was constructed with `clang-23 = MISSING`; compilers were
+passed as pinned absolute paths and verified as GCC 16.2.0 / Clang 23.1.5.
+This reproduces the exact condition that broke hosted shard A, shard B and the
+ICX lane.
+
+| Harness | Result | Quantified evidence |
+|---|---|---|
+| `check_cond_load_sink_cross_arch.py` | PASS | 8 freestanding binaries, four ISAs, oracle 51; AArch64 117/126, i686 188/192, RISC-V64 298/316, x86-64 93/96 instructions ON/OFF |
+| `check_same_width_cast_range.py` | PASS | 3 host compilers, 28 IR sections (5 folded / 17 guard Casts kept), four ISAs exit 5; x86-64 525, i686 924, AArch64 607, RISC-V64 1538 instructions |
+| `check_cond_load_sink_best_tools.py` | PASS | GDB PROT_NONE ON/OFF `5a/5a` no SIGSEGV; objdump `pick8/pick16` ON 4 / OFF 7 / GCC16 4 / Clang23 4; IR ON 0 / OFF 1; readelf `.text`+`.eh_frame`, 5 FDEs; Callgrind below |
+| `check_cond_load_sink_matrix.py` | PASS | 82 deterministic shapes, 12 compile+run pairs, receipt `5d7bed2a19deb1f4`, pointer-select census 53/53, ICX oracle skipped locally |
+
+### 12.5 Host-CPU performance, measured not asserted
+
+Host CPU: `Intel(R) Xeon(R) Processor @ 2.60GHz` (x86-64, SSE4.2/AVX2/FMA
+available).  Callgrind counts deterministic instruction references over
+100,000 iterations, not wall-clock time, so VM frequency scaling cannot turn
+a codegen difference into a false win.  With the restored Valgrind 3.19.0:
+
+| Binary / state | Ir refs | Delta vs LCCC ON |
+|---|---:|---:|
+| LCCC fold ON | 2,616,224 | — |
+| LCCC fold OFF (`cast_sign_range` kill switch) | 2,716,200 | +99,976 (0.99976 / iteration) |
+| LCCC volatile control ON | 2,016,216 | — |
+| LCCC volatile control OFF | 2,016,202 | 14 layout refs |
+| GCC 16.2.0 fold shape | 2,516,773 | LCCC +99,451 (3.952% more refs) |
+| Clang 23.1.5 fold shape | 2,518,797 | LCCC +97,427 (3.868% more refs) |
+
+The fold removes one instruction per iteration on the proven join shape; the
+opaque volatile-Load control changes by only 14 refs, so the proof refuses
+what it cannot prove.  GCC and Clang still emit fewer refs on this synthetic
+loop.  ICX 2026.2 is available only in the hosted authenticated lane; no local
+ICX result or broad compiler-superiority claim is made.
+
+### 12.6 Final local validation table
+
+| Check | Result |
+|---|---|
+| `cargo build --profile fastbuild --locked --bins` | PASS, 0 warnings |
+| `cargo test --profile fastbuild --locked --lib` | PASS, 8681 passed / 0 failed / 10 ignored |
+| `cargo clippy --profile fastbuild --locked --all-targets -- -D warnings` | PASS |
+| `cargo fmt --check`, `git diff --check`, Python/shell syntax | PASS |
+| `audit_census.py --check` | PASS: 863/94/27/10/233/97/26/565/254 vs baselines 863/94/27/10/233/97/26/565/255 |
+| static CI: workflow shell / parity / shard / lane plan + self-test | PASS: 14 files, 571 commands / 42 contracts, a=88 b=124, 2990 s |
+| 11 targeted `ci_local.sh --only` groups | PASS: 21 selected gates, 0 failed; 7 optional toolchain gates skipped per invocation |
+| four hosted-like no-alias harnesses | PASS, evidence in `/tmp/recovery/evidence/*.json` |
+
+### 12.7 Tool honesty and efficiency verdict
+
+`objtool`, `pahole` and `perf` remain unavailable in this sandbox; the JSON
+evidence records `null` for each and performs the applicable user-space
+equivalents with `readelf`, `objdump` and Callgrind.  No result from those three
+tools is claimed.  GDB 18.1, objdump/readelf 2.47 and Valgrind/Callgrind 3.19
+actually ran.  The new helper functions are O(1) per visited definition,
+allocate nothing in the range proof, use flat indexed def maps, and fail closed
+on unknown IR.  A compiler engineer can approve the information boundary and
+the measured one-instruction win, but **cannot honestly call every function
+globally optimal**: no exhaustive superoptimizer proof was run, LCCC is still
+slower than GCC/Clang on the synthetic loop, and ICX 2026.2 is hosted-only.
+This document therefore claims correctness, zero new audit debt, zero warnings
+and a measured shape-local improvement, not godlike universal efficiency.
+
+### 12.8 Hosted acceptance
+
+The hosted run is the accepting authority.  This section is written before the
+final push; the PR body carries the final run ID and check verdict.  No
+production-ready claim is made before every required hosted check is green.

@@ -145,14 +145,27 @@ IR_SECTION = re.compile(r"^=== IR (\S+) ===\s*$", re.M)
 JOIN_CAST = re.compile(r"from_ty:\s*U32,\s*to_ty:\s*I32")
 
 
-def tool(name: str) -> str:
+def discover_tool(name: str) -> str | None:
+    """One discovery rule for both the report and the commands that run it.
+
+    PATH is searched first, then the pinned cache binary, and only an actually
+    executable file counts.  Using this in preflight prevents a stale file in
+    the cache from being reported as available while the command fails later.
+    """
     found = shutil.which(name)
     if found:
         return found
     candidate = CACHE_BIN / name
     if candidate.is_file() and os.access(candidate, os.X_OK):
         return str(candidate)
-    raise RuntimeError(f"required tool {name!r} is unavailable")
+    return None
+
+
+def tool(name: str) -> str:
+    found = discover_tool(name)
+    if found is None:
+        raise RuntimeError(f"required tool {name!r} is unavailable")
+    return found
 
 
 def run(cmd: list[str], *, env: dict[str, str] | None = None, timeout: int = 300):
@@ -320,6 +333,46 @@ def evaluate(report: dict) -> list[str]:
     return bad
 
 
+def report_evidence(report: dict) -> int:
+    """Print evidence only when the whole instrument chain succeeded.
+
+    A preflight failure leaves the measured sections absent.  The previous
+    unconditional `report["objdump"]` access raised KeyError before the real
+    problems could be printed, so a red gate produced no actionable diagnosis.
+    This function is total over an incomplete report and is exercised directly
+    by `--self-test`.
+    """
+    problems = report.get("problems") or []
+    if report.get("verdict") != "PASS" or problems:
+        cause = report.get("error") or "incomplete evidence"
+        print(f"FAIL best-tool evidence: {cause}", file=sys.stderr)
+        missing = [k for k, v in (report.get("tools") or {}).items() if not v]
+        print(f"NOTE optional tools unavailable (not faked): {missing}", file=sys.stderr)
+        for problem in problems:
+            print(f"FAIL {problem}", file=sys.stderr)
+        return 1
+
+    static = report.get("objdump") or {}
+    for fn in ("pick8", "pick16"):
+        print(f"PASS objdump {fn}: on={static.get(f'lccc_on:{fn}')} "
+              f"off={static.get(f'lccc_off:{fn}')} "
+              f"gcc16={static.get(f'gcc16:{fn}')} "
+              f"clang23={static.get(f'clang23:{fn}')}")
+    gdb = report.get("gdb") or {}
+    for state in ("on", "off"):
+        g = gdb.get(state) or {}
+        print(f"PASS gdb {state}: no_sigsegv={g.get('no_sigsegv')} returns={g.get('returns')}")
+    print(f"PASS IR join census: {report.get('ir_join_census')}")
+    print(f"PASS Callgrind refs: {(report.get('callgrind') or {}).get('refs')}")
+    print(f"PASS ELF structure: {report.get('structural')}")
+    missing = [k for k, v in (report.get("tools") or {}).items() if not v]
+    print(f"NOTE optional tools unavailable (not faked): {missing}")
+    icx_suffix = "/ICX" if "icx2026" in (report.get("compilers") or {}) else ""
+    print("PASS best-tool evidence (GDB/objdump/readelf/Callgrind, GCC16/Clang23"
+          + icx_suffix + ")")
+    return 0
+
+
 def self_test() -> int:
     identity_failures = identity.self_test()
     if identity_failures:
@@ -356,6 +409,8 @@ def self_test() -> int:
         ("volatile control drift", lambda r: r["callgrind"]["refs"].update(volatile_off=2_140_434), "volatile control changed"),
         ("checksum drift", lambda r: r["callgrind"]["checksums"].update(b="Y"), "checksums disagree"),
         ("missing GDB", lambda r: r["tools"].update(gdb=None), "required tool gdb missing"),
+        ("missing Valgrind", lambda r: r["tools"].update(valgrind=None),
+         "required tool valgrind missing"),
         ("missing FDE table", lambda r: r["structural"].update(fde_count=0), "FDE structural check"),
         ("absent required ICX", lambda r: r.update(require_icx=True), "ICX required"),
     ]
@@ -366,8 +421,60 @@ def self_test() -> int:
         if not any(want in b for b in bad):
             print(f"self-test FAIL: '{name}' not detected: {bad}", file=sys.stderr)
             return 1
+
+    # Regression: a missing Valgrind used to produce an empty AssertionError,
+    # then `report["objdump"]` raised KeyError while printing unearned PASS
+    # lines.  A complete report still prints identically; an incomplete one
+    # must return 1 with the named cause, never raise.
+    import contextlib
+    import io
+    good = copy.deepcopy(base)
+    good["verdict"], good["problems"] = "PASS", []
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        good_rc = report_evidence(good)
+    if good_rc != 0 or "PASS best-tool evidence" not in out.getvalue():
+        print("self-test FAIL: complete report was not accepted", file=sys.stderr)
+        return 1
+    broken = copy.deepcopy(good)
+    broken["tools"]["valgrind"] = None
+    broken["verdict"] = "FAIL"
+    broken["error"] = "required tool 'valgrind' is unavailable"
+    broken.pop("objdump")
+    broken["problems"] = evaluate(broken)
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        bad_rc = report_evidence(broken)
+    if bad_rc != 1 or broken["error"] not in err.getvalue() or out.getvalue():
+        print("self-test FAIL: incomplete report did not fail cleanly", file=sys.stderr)
+        return 1
+
+    # Integration of the actual preflight: prove `main()` itself returns 1
+    # with a named cause when Valgrind is absent, without invoking a compiler
+    # or printing an unearned PASS.  The mocked compiler resolver is confined
+    # to this self-test; the real gate always verifies exact GCC/Clang/ICX
+    # versions through `sv03_toolchain_identity`.
+    import unittest.mock
+    fake_rows = {name: {"path": "/bin/true"} for name in ("gcc16", "clang23")}
+    with tempfile.TemporaryDirectory(prefix="lccc-best-tools-selftest-") as td:
+        evidence = Path(td) / "evidence.json"
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(
+            identity, "require_compiler_versions", return_value=fake_rows
+        ), unittest.mock.patch.object(
+            sys.modules[__name__], "discover_tool",
+            side_effect=lambda name: None if name == "valgrind" else "/bin/true",
+        ), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            preflight_rc = main(["--json", str(evidence)])
+        if preflight_rc != 1 or out.getvalue() or "valgrind" not in err.getvalue():
+            print("self-test FAIL: main() preflight did not fail cleanly", file=sys.stderr)
+            return 1
+        recorded = json.loads(evidence.read_text())
+        if recorded.get("verdict") != "FAIL" or "valgrind" not in recorded.get("error", ""):
+            print("self-test FAIL: preflight evidence was not recorded", file=sys.stderr)
+            return 1
     print(f"PASS best-tools self-test ({len(mutations)} verdict mutations "
-          f"rejected, toolchain identity pinned)")
+          f"rejected, fail-fast report paths proven, toolchain identity pinned)")
     return 0
 
 
@@ -404,13 +511,17 @@ def main(argv: list[str]) -> int:
         pinned = {name: row["path"] for name, row in toolchain.items()}
         pinned["lccc"] = args.lccc
         for name in ("gdb", "objdump", "readelf", "valgrind", "objtool", "pahole", "perf"):
-            report["tools"][name] = shutil.which(name) or (
-                str(CACHE_BIN / name) if (CACHE_BIN / name).is_file() else None
-            )
-        # `command -v valgrind` / `command -v gdb`: the lane-plan audit reads
-        # these idioms to require the pinned toolchain provisioning.
-        assert shutil.which("valgrind") or (CACHE_BIN / "valgrind").is_file()
-        assert shutil.which("gdb") or (CACHE_BIN / "gdb").is_file()
+            report["tools"][name] = discover_tool(name)
+        # The lane-plan audit reads the `command -v valgrind` / `gdb` idioms to
+        # require provisioning.  Fail with a named cause instead of a bare
+        # assert: an empty exception string and a later KeyError once hid the
+        # real missing-tool failure behind an unearned success banner.
+        for required in ("gdb", "objdump", "readelf", "valgrind"):
+            if report["tools"].get(required) is None:
+                raise RuntimeError(
+                    f"required tool {required!r} is unavailable; provision it "
+                    "before running the best-tool gate"
+                )
 
         with tempfile.TemporaryDirectory(prefix="lccc-best-tools-") as td:
             work = Path(td)
@@ -487,26 +598,7 @@ def main(argv: list[str]) -> int:
     if args.json:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(report, indent=2, sort_keys=True, default=str) + "\n")
-    for fn in ("pick8", "pick16"):
-        print(f"PASS objdump {fn}: on={report['objdump'].get(f'lccc_on:{fn}')} "
-              f"off={report['objdump'].get(f'lccc_off:{fn}')} "
-              f"gcc16={report['objdump'].get(f'gcc16:{fn}')} "
-              f"clang23={report['objdump'].get(f'clang23:{fn}')}")
-    for state in ("on", "off"):
-        g = report.get("gdb", {}).get(state, {})
-        print(f"PASS gdb {state}: no_sigsegv={g.get('no_sigsegv')} returns={g.get('returns')}")
-    print(f"PASS IR join census: {report.get('ir_join_census')}")
-    print(f"PASS Callgrind refs: {report.get('callgrind', {}).get('refs')}")
-    print(f"PASS ELF structure: {report.get('structural')}")
-    missing = [k for k, v in report.get("tools", {}).items() if not v]
-    print(f"NOTE optional tools unavailable (not faked): {missing}")
-    if report["problems"]:
-        for b in report["problems"]:
-            print(f"FAIL {b}", file=sys.stderr)
-        return 1
-    print("PASS best-tool evidence (GDB/objdump/readelf/Callgrind, GCC16/Clang23"
-          + ("/ICX" if args.icx else "") + ")")
-    return 0
+    return report_evidence(report)
 
 
 if __name__ == "__main__":
