@@ -108,14 +108,55 @@ The conservative threshold is a feature, not a bug.
 
 ## 3. The four production changes
 
-### 3.1 Object-identity stream keys (`slp_vectorizer.rs`)
+### 3.1 Two-tier store-stream keys (`slp_vectorizer.rs`)
 
-`StreamBase::{Global(u32), Param(usize), Value(u32)}` plus `SymbolRoots`, built
-with one O(function) scan.  `Global` holds an **interned `u32` symbol id**, not
-a `String`: the first implementation cloned the symbol name on every store in
-every block in every fixpoint round (O(stores) allocations).  `build` uses
-`get`-then-`insert` so only distinct names allocate, and
-`u32::try_from(len)` fail-closes instead of silently truncating.
+`StreamBase::{Global(usize), Param(usize), Value(u32)}` plus `SymbolRoots`,
+built with one O(function) scan.  `Global` holds an **interned `usize` symbol
+id**, not a `String`: the first implementation cloned the symbol name on every
+store in every block in every fixpoint round (O(stores) allocations).  `build`
+uses `get`-then-`insert` so only distinct names allocate.  The id IS
+`symbol_ids.len()`, so the conversion is the identity on every host: no
+`try_from`, no `expect`, no saturation, no truncation, and **no new panic
+site** (`scripts/audit_census.py --check` pins `panic_sites` at 863).
+
+**Two seed tiers, one cost model.**  The first revision of this PR REPLACED
+the SSA-value stream key with the object-identity key.  Hosted CI then found
+that this silently DELETED the 2-store runs that were the half-wide dword-pair
+family's only seeds (`check_slp_loop_carried_recurrence.sh`: "the half-wide
+dword-pair family stopped firing (movq/vmovq pair ops=0)").  The final design
+ADDS object identity as a second tier and keeps the original SSA-base tier:
+
+* object tier — `(StreamBase, var, mult, ty)`; merges the site-local
+  `GlobalAddr` webs and unlocks the 4xU32 `s_jhash` pack (benefit 55);
+* site tier — `(addr.base.0, var, mult, ty)`; the original grouping and the
+  only source of 2-lane `movq`-loaded XMM pairs.  It is populated only for
+  roots the object tier actually merges (`Global`/`Param`), so ordinary SSA
+  bases are not duplicated; a final `retain` dedup on
+  `(ty, width, store_idx, joint, value_sink)` collapses any remaining
+  identical seed (a single-web global produces the same run in both tiers).
+
+Both tiers feed the SAME `build_plan` legality proofs and the SAME
+`crossings_are_amortized` cost gate, each over its OWN store-index span.
+This is the decisive advantage over the rejected "narrow fallback windows
+inside one long run" design (see R19): every candidate remains a genuine,
+independently checked run, so no narrow window can inherit an illegal wide
+plan's permission.  It is also strictly more comprehensive than either tier
+alone.  Joint U8 seeds are emitted once (object tier only).
+
+**Compile-time refinement.**  For a root designated by exactly ONE SSA base
+the two tiers are byte-identical, so the site tier would build a second
+`FxHashMap` group, emit a second identical `SeedCandidate`, and then have
+the dedup pass discard it.  `SymbolRoots` records `merged_roots` (roots with
+>= 2 distinct `GlobalAddr`/`ParamRef` bases) in the same O(function) scan;
+`needs_site_tier` gates the site tier to those roots only.  The final
+`(ty, width, store_idx, joint, value_sink)` dedup remains as defence in
+depth.  A six-root unit test pins the classification, and `StreamBase` is
+`Copy` so the hot loop no longer clones the enum per store.  This removes
+REDUNDANT MAP/GROUP WORK, not `build_plan` calls: the pre-existing dedup
+already ran before any plan was priced.  Alternating-order A/B on two
+120-object synthetic TUs (15 runs each) produced byte-identical `.o` files
+and median compile-time ratios 0.9893 / 0.9589 — a 1-4% improvement that is
+within noise, so NO wall-clock speedup is claimed.
 
 **Soundness.** C11 6.2.6.1p1: every `GlobalAddr` for one symbol designates the
 same object; two `ParamRef`s of one parameter index carry the same argument.
@@ -239,7 +280,13 @@ guards all remain.  `work_len == 0` is rejected before this point.
 | R14 | **hosted CI**: `width == 2` half-wide veto also rejected full-width 2xI64, losing `psubq` in `v5_neg_i64` | narrowed to `reg_width_for(ty, width) > width`; `check_bb_slp_v5_codegen.sh` PASS |
 | R15 | six-class `scalar_removed` filter omitted `UnaryOp` (integer negation), under-counting `v5_neg_i64` | exhaustive `scalar_instruction_weight` over all 45 IR variants + unit test |
 | R16 | the wider classifier newly accepted `s_bytemask` (3 Gather4 + 2 BinOp, benefit 1), measured **1.2772x SLOWER** | structural `crossings_are_amortized` gate; `test_30` pins both branches; `s_clamp_u8`'s measured 0.8399x win preserved |
-| R17 | two new Python assertions were coupled to the OLD source text / a `void`-only regex | updated to the extracted predicate; `k_bounded(uint32_t, uint32_t)` now matched; 70 tests OK |
+| R17 | two new Python assertions were coupled to the OLD source text / a `void`-only regex | updated to the extracted predicate; `k_bounded(uint32_t, uint32_t)` now matched |
+| R18 | **hosted CI**: `scripts/audit_census.py --check` rejected `panic_sites 863 -> 864` from `u32::try_from(len).expect(...)` | ids are now `usize` = `len()` (identity conversion): exact by construction, zero panics, census PASS at 863 |
+| R19 | **hosted CI**: object-identity keys REPLACED the SSA-base tier, so the 2-lane dword-pair family became unreachable (`movq/vmovq pair ops=0`) | two-tier seed collection (§3.1); `check_slp_loop_carried_recurrence.sh` step 4 restored |
+| R20 | my first fix for R19 (2-lane fallback windows inside a long run) bypassed THREE vetos because legality is evaluated per candidate store-index span: `v5_rot_interleaved_write` gained an illegal `vpslld`, SHA-256 gained five `movq -N(%rsi),%xmm` reloads (12-15.6% slower), `d4_schedule_pairs` regressed | **reverted**; replaced by the two-tier design, where every narrow candidate is still an independent, fully checked run. `test_32` pins both previously broken contracts |
+| R21 | `Test Suite` aggregate failed with `{'backend': 'failure', 'backend-contracts-b': 'failure'}` | pure roll-up of the two lanes; no code change, resolves when both are green |
+| R22 | `check_layout_tie_rule.sh` failed locally because the post-wipe toolchain restore left valgrind off `PATH` | restored valgrind 3.19.0 + `VALGRIND_LIB` from the cached Debian package; gate re-run PASS (`tie=13 historical=13`, 96,397,664 vs 96,973,245 taken transfers) |
+| R23 | Azure shard-b log showed an earlier `FAIL contract: output mismatch` plus `identity: error: choose explicit regression/benchmark roots` and `cannot summarise ... expected_cases is 0` | full log chunks 28-30 prove these are DELIBERATE negative-control/self-test strings (`MISMATCH contract`, `COMPILE-FAIL-LCCC contract`, `COMPILE-FAIL-GCC contract`, argument-validation tests) from gate self-tests. The only real shard-b failure is the census growth in R18 — no source change needed for those lines |
 
 `Test Suite` (the aggregate gate) failed with
 `{'backend': 'failure', 'backend-contracts-b': 'failure'}` — it is a pure
@@ -470,3 +517,77 @@ all six BB-SLP/constants codegen gates PASS, hygiene PASS, lane-plan PASS,
 option-ledger PASS, 29/29 shapes and 19/19 object-identity rows
 bit-identical across LCCC / GCC 16.2 / Clang 23.1.5.  **Hosted CI remains
 the gate; this section is not a green-CI claim.**
+
+### 10.2 Second hosted run — two NEW independent failures (`42534556447`)
+
+At pushed head `ef2cd6537` (workflow `42534556447`, 23:30:42Z) the first
+iteration's fixes held, but the aggregate was `pass 17, skipping 5, fail 2,
+pending 5`.  The two red jobs were INDEPENDENT; reading only one log would
+have produced a false "all fixed" claim:
+
+| Check / job | Exact hosted failure | Root cause | Fix |
+|---|---|---|---|
+| `Assembler and linker contracts` / `128896872669` | after v7/v8 PASS: `FAIL: the half-wide dword-pair family stopped firing (movq/vmovq pair ops=0)` (`check_slp_loop_carried_recurrence.sh` step 4) | object-identity keys REPLACED the raw SSA-base keys.  For a root with several site-local `GlobalAddr` webs the object tier merged them into one long run, deleting the 2-store runs that were the half-wide `2xU32` pair family's ONLY seeds | two-tier seed collection (§3.1): `object_streams` + `site_streams`, deduplicated; `test_31` pins the pair family against GCC/Clang |
+| `Fast local contracts (shard b)` / `128896872661` | final lines: `FAIL: audit census grew: panic_sites: 863 -> 864 (+1)`, `::error title=Fast contract failed::python3 scripts/audit_census.py --check (exit 1)` | `u32::try_from(symbol_ids.len()).expect("symbol id space exhausted")` added ONE panic site | `Global(usize)` ids ARE `len()`: identity conversion, no `try_from`, no `expect`, no new panic.  Census stays at 863 WITHOUT re-baselining |
+| `Test Suite` / `128900897110` | `AssertionError: failed or missing CI lanes: {'backend': 'failure', 'backend-contracts-b': 'failure'}` | pure roll-up of the two lanes | no code change; resolves when both are green |
+
+Azure job `128896872661` chunks 28-30 were fetched in full to classify the
+earlier `FAIL contract: output mismatch`, `identity: error: choose explicit
+regression/benchmark roots`, `cannot summarise ... flags is empty` and
+`expected_cases is 0` strings: they are DELIBERATE negative controls emitted
+by gate self-tests (`MISMATCH contract`, `COMPILE-FAIL-LCCC contract`,
+`COMPILE-FAIL-GCC contract`, CLI validation) and are followed by
+`Ran 7 tests ... OK`, `Ran 13 tests ... OK` etc.  They are NOT independent
+CI failures.  The `Authenticated Intel ICX 2026.2 integration` job
+`128896872694` was green at this head; that is a HOSTED ICX result, not a
+local ICX run (local `icx`/`icpx` remain unavailable, §1.1).
+
+**Rejected first fix (R20).**  A 128->64->2 "fallback ladder" inside each
+long object-identity run was built and measured.  It restored the pair
+count but let each narrower candidate use its OWN smaller store-index span,
+bypassing THREE vetos: `check_slp_loop_carried_recurrence.sh` reported
+`FAIL: BB-SLP packed a loop-carried store->load recurrence
+(sha256_transform)` with five `movq -N(%rsi),%xmm` reloads (12-15.6%
+slower), `bg_07` reported `v5_rot_interleaved_write: unexpected 'vpslld'`,
+and `bg_13` reported `d4_schedule_pairs packs a loop-carried store->load
+round trip (7)`.  The ladder was REVERTED; no recurrence-aware patch was
+kept.  `test_32` now pins BOTH regressions (SHA-256 output equality with
+`CCC_NO_BB_SLP=1` AND zero recurrence reloads).  The two-tier design keeps
+every narrow candidate as an independent, fully checked run instead.
+
+### 10.3 Third iteration — local evidence before the next push
+
+The `usize` census fix, two-tier seed collection, `merged_roots`
+compile-time refinement, `test_31`/`test_32` and the repaired Rust width
+unit test were LOCAL until the next commit/push; hosted CI had NOT seen
+them.  A full strict rebuild with `RUSTFLAGS="-D warnings"` finished
+`BUILD_OK 2026-11-09T01:14:01Z` (binary sha
+`4f4e436b6d298d4cfc2e96a45fccdce65a3e7b851c2ae63c6880f869705bf5fe`).
+Targeted receipts on that binary:
+
+* `cargo fmt --all -- --check` FMT_OK; strict `cargo check --tests` CHECK_OK;
+* census / census-selftest / hygiene / lane-plan self-test + audit /
+  option-ledger / layout-tie-rule / BB-SLP base, v3, v4, v5, v6, v7, v8 /
+  dword constants / **loop-carried recurrence** — **16/16 PASS**;
+  `check_slp_loop_carried_recurrence.sh` (the job-669 failure) is GREEN;
+* Python SIMD **73 tests OK (skipped=1)**, including `test_31` (pair-family
+  reachable) and `test_32` (no SHA recurrence reload / output equality);
+* three-way `-O2 -mavx2` correctness: LCCC / GCC 16.2 / Clang 23.1.5 all
+  **29/29 shapes digest `fcedb168a26eb508`** and **19/19 object-identity
+  rows digest `986058a3ede52098`**.  The earlier `shapes=0` line was a grep
+  bug (`' ok '` instead of `' ok$'`), NOT a miscompile; corrected above.
+  `-march=native` is deliberately NOT used: those binaries SIGILL on this
+  host and print nothing; all three compilers did so identically;
+* `CCC_NO_BB_SLP=1` Callgrind ablation: `shapes=29 geomean=0.9765`,
+  `s_jhash 0.5852`, `s_clamp_u8 0.8399`, `s_crc32_braid8 0.9941`,
+  `s_fnv1a 1.0013`, `s_memchr_scan 1.0250` (alignment NOP only); 24
+  unchanged, 3 improved, 2 perturbations;
+* compile-time A/B: two 120-object synthetic TUs, 15 alternating runs each,
+  byte-identical `.o`; median ratios 0.9893 / 0.9589 (1-4%, within noise).
+
+Full Rust unit tests, the 51 backend gates and the 219 contract gates are
+re-run in the final sweep; the local environment still lacks a pinned RISC-V
+BFD 2.47 ld, i686/AArch64 multiarch glibc headers and a 32-bit linker, so
+those local gate failures are toolchain-only and are NOT claimed as green.
+Hosted CI has those tools and remains the acceptance gate.  **This section
+is NOT a green-CI claim.**

@@ -526,5 +526,98 @@ class SlpObjectIdentity(unittest.TestCase):
         )
 
 
+    def test_31_site_tier_keeps_the_half_wide_pair_family_reachable(self):
+        """Object identity must ADD a seed tier, not REPLACE the SSA-base one.
+
+        Hosted CI caught the capability loss when the PR replaced the key:
+        check_slp_loop_carried_recurrence.sh, "the half-wide dword-pair
+        family stopped firing (movq/vmovq pair ops=0)".  Pin all four
+        properties: the 2xU32 plan fires, the lowering emits XMM `movq`
+        pairs, the result is bit-exact against both oracle compilers, and
+        the wide 4xU32 seed is still offered (so the new tier did not
+        replace the old cost-model path).
+        """
+        src = self.d / "pair_fallback.c"
+        src.write_text(r"""
+#include <stdio.h>
+#include <stdint.h>
+#define N 2048
+static uint32_t a[2 * N], b[2 * N], o[2 * N];
+int main(void) {
+    for (int i = 0; i < 2 * N; i++) {
+        a[i] = (uint32_t)i * 2654435761u;
+        b[i] = (uint32_t)i ^ 0x9e3779b9u;
+    }
+    for (int i = 0; i < 2 * N; i += 2) {
+        o[i] = a[i] + b[i];
+        o[i + 1] = a[i + 1] + b[i + 1];
+    }
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < 2 * N; i++) h = (h ^ o[i]) * 16777619u;
+    printf("%08x\n", h);
+    return 0;
+}
+""")
+        # x86-64-v3, NOT -march=native: the pair family is a 128-bit shape;
+        # an AVX-512 runner would offer wider plans and make the `movq`
+        # contract host-dependent.
+        flags = ["-O2", "-march=x86-64-v3"]
+        out = self.d / "pair_fallback"
+        p = compile_ok(LCCC, src, out, flags)
+        self.assertEqual(p.returncode == 0, True, p.stderr)
+        want = run([out], self.d).stdout.strip()
+        self.assertRegex(want, r"^[0-9a-f]{8}$")
+        for oracle in (GCC, os.environ.get("LCCC_TEST_CLANG", "clang-23")):
+            if not shutil.which(oracle.split()[0]):
+                continue
+            with self.subTest(oracle=oracle):
+                ref = self.d / ("ref_" + Path(oracle.split()[0]).name)
+                q = compile_ok(oracle, src, ref, flags)
+                self.assertEqual(q.returncode == 0, True, q.stderr)
+                self.assertEqual(run([ref], self.d).stdout.strip(), want)
+
+        asm = self.d / "pair_fallback.s"
+        a = compile_ok(LCCC, src, asm, [*flags, "-S"],
+                       env={"LCCC_DEBUG_SLP": "1"})
+        self.assertEqual(a.returncode == 0, True, a.stderr)
+        pairs = len(re.findall(r"^\s+v?movq\s+.*%xmm", asm.read_text(), re.M))
+        self.assertGreaterEqual(pairs, 2,
+                                "site-tier 2-lane seeds must lower to movq XMM pairs")
+        self.assertRegex(a.stderr, r"\[BB-SLP\] .*packed 2xU32",
+                         "the half-wide dword-pair plan must actually fire")
+
+    def test_32_narrow_seed_tier_does_not_evade_recurrence_or_legality(self):
+        """The rejected 2-lane-fallback design regressed THREE vetos.
+
+        Adding narrower sub-windows to a long run let each candidate use its
+        own (smaller) store-index span, so an interleaved write and a
+        loop-carried store->load round trip fell outside the legality and
+        profitability checks.  The two-tier design keeps every candidate a
+        genuine, independently checked run.  Pin both previously broken
+        contracts here as well as in the hosted gates.
+        """
+        sha = ROOT / "tests" / "benchmark" / "programs" / "sha256_transform.c"
+        self.assertTrue(sha.is_file(), sha)
+        out = self.d / "sha_on"
+        off = self.d / "sha_off"
+        for exe, env in ((out, None),
+                         (off, {"CCC_NO_BB_SLP": "1"})):
+            p = compile_ok(LCCC, sha, exe, ["-O2"], env=env)
+            self.assertEqual(p.returncode == 0, True, p.stderr)
+        self.assertEqual(run([out], self.d).stdout,
+                         run([off], self.d).stdout,
+                         "SLP-on and SLP-off must agree on sha256_transform")
+        asm = self.d / "sha_on.s"
+        p = compile_ok(LCCC, sha, asm, ["-O2", "-S"])
+        self.assertEqual(p.returncode == 0, True, p.stderr)
+        self.assertEqual(
+            len(re.findall(
+                r"^\s+movq\s+-[0-9]+\(%r[a-z0-9]+\),\s*%xmm",
+                asm.read_text(), re.M)),
+            0,
+            "BB-SLP must not pack the loop-carried store->load recurrence",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

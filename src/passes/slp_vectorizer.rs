@@ -125,14 +125,14 @@ struct SymAddr {
 /// fall back to `RestrictBases::disjoint`, which answers "may alias" for two
 /// roots of one symbol - so this widens the *seed* set without weakening any
 /// alias proof.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum StreamBase {
     /// Interned symbol id.  A `String` here would clone the global's name on
     /// EVERY store in EVERY block in EVERY fixpoint round - O(stores)
     /// allocations in the seed-collection hot path for a value that is
-    /// constant for the whole function.  Ids are dense, `u32`, and compare
-    /// with a single integer instruction in the `FxHashMap` key.
-    Global(u32),
+    /// constant for the whole function.  Ids are dense machine words, so
+    /// hashing/equality is a single integer operation with no conversion.
+    Global(usize),
     Param(usize),
     Value(u32),
 }
@@ -142,46 +142,74 @@ enum StreamBase {
 #[derive(Default)]
 struct SymbolRoots {
     /// name -> dense id; one allocation per DISTINCT symbol, not per use.
-    symbol_ids: FxHashMap<String, u32>,
+    /// `usize` is the type `len()` already returns, so the conversion is the
+    /// identity: no `try_from`, no `expect`, no saturation, no truncation,
+    /// and therefore no new panic site in the compiler.
+    symbol_ids: FxHashMap<String, usize>,
     /// SSA `GlobalAddr` dest -> dense id.
-    globals: FxHashMap<u32, u32>,
+    globals: FxHashMap<u32, usize>,
     /// SSA `ParamRef` dest -> parameter index.
     params: FxHashMap<u32, usize>,
+    /// Roots designated by MORE THAN ONE distinct SSA address base.  Only
+    /// these can yield a site-tier stream different from the object tier;
+    /// for a single-base root the two tiers are identical, so paying for the
+    /// second `build_plan` would be pure waste.  Built once per fixpoint
+    /// round and shared by every block.
+    merged_roots: FxHashSet<StreamBase>,
 }
 
 impl SymbolRoots {
     fn build(func: &IrFunction) -> Self {
         let mut out = Self::default();
+        // root -> first distinct SSA base seen; a second, different base
+        // marks the root as merged.  O(1) per GlobalAddr/ParamRef.
+        let mut first_base: FxHashMap<StreamBase, u32> = FxHashMap::default();
+        let mut note_base = |root: StreamBase, base: u32, out: &mut Self| {
+            if let Some(&prev) = first_base.get(&root) {
+                if prev != base {
+                    out.merged_roots.insert(root);
+                }
+            } else {
+                first_base.insert(root, base);
+            }
+        };
         for block in &func.blocks {
             for inst in &block.instructions {
                 match inst {
                     Instruction::GlobalAddr { dest, name } => {
                         // `get` first: `entry(name.clone())` would clone even
-                        // when the symbol is already interned.  `try_from`
-                        // fails closed instead of truncating an id for a
-                        // (physically impossible) function with >= 2^32
-                        // distinct symbols.
+                        // when the symbol is already interned.  The id IS
+                        // `len()`, so it is exact for ANY representable map
+                        // size on this host - there is no overflow case to
+                        // guard and no panic to add.
                         let id = match out.symbol_ids.get(name) {
                             Some(&id) => id,
                             None => {
-                                let id = u32::try_from(out.symbol_ids.len())
-                                    .expect("symbol id space exhausted");
+                                let id = out.symbol_ids.len();
                                 out.symbol_ids.insert(name.clone(), id);
                                 id
                             }
                         };
                         out.globals.insert(dest.0, id);
+                        note_base(StreamBase::Global(id), dest.0, &mut out);
                     }
                     Instruction::ParamRef {
                         dest, param_idx, ..
                     } => {
                         out.params.insert(dest.0, *param_idx);
+                        note_base(StreamBase::Param(*param_idx), dest.0, &mut out);
                     }
                     _ => {}
                 }
             }
         }
         out
+    }
+
+    /// Only merged roots need a site-tier stream (see `merged_roots`).
+    #[inline]
+    fn needs_site_tier(&self, root: &StreamBase) -> bool {
+        !matches!(root, StreamBase::Value(_)) && self.merged_roots.contains(root)
     }
 
     #[inline]
@@ -2280,9 +2308,33 @@ fn collect_seed_candidates(ctx: &BlockCtx) -> Vec<SeedCandidate> {
     // shared `family_for`/`packed_*` helpers keep the raw hardware permission
     // because the frontend's explicit `vector_size` lowering calls them too.
     let avx2 = x86_avx2_available_pub() && x86_prefer_wide_pub();
-    // (base, var, mult, ty) → Vec<(off, store_idx, val, ptr)>
-    let mut streams: FxHashMap<
+    // TWO seed tiers, one cost model.  `entries` is
+    // (off, store_idx, stored value, address SSA value).
+    //
+    // * OBJECT tier: keyed by `StreamBase` (interned symbol / parameter
+    //   index).  The frontend and the PostVec unroller emit several
+    //   `GlobalAddr`s for ONE object; keying on their SSA ids split a
+    //   consecutive store run into one-element streams and BB-SLP saw zero
+    //   seeds.  This tier is what unlocks the 4xU32 `s_jhash` pack.
+    // * SITE tier: keyed by the raw `SymAddr::base` SSA value.  It is the
+    //   ORIGINAL grouping, and it is the only source of the 2-lane dword
+    //   pair family (`movq`-loaded XMM pairs).  Replacing it with the
+    //   object tier silently deleted that family - hosted CI caught it in
+    //   `check_slp_loop_carried_recurrence.sh`.  Keeping BOTH tiers is
+    //   strictly more powerful: every candidate still goes through the same
+    //   `build_plan` legality proofs over its OWN store-index span, so no
+    //   narrow window can inherit an illegal wide plan's permission.
+    //
+    // Only roots that the object tier actually MERGES (globals/params with
+    // more than one SSA base) can produce a distinct site-tier group, so
+    // ordinary SSA bases are not duplicated.  A final dedup pass removes
+    // any remaining identical seeds (e.g. a single-web global).
+    let mut object_streams: FxHashMap<
         (StreamBase, Option<u32>, u64, IrType),
+        Vec<(i64, usize, Operand, Value)>,
+    > = FxHashMap::default();
+    let mut site_streams: FxHashMap<
+        (u32, Option<u32>, u64, IrType),
         Vec<(i64, usize, Operand, Value)>,
     > = FxHashMap::default();
     for (i, inst) in block.instructions.iter().enumerate() {
@@ -2302,23 +2354,33 @@ fn collect_seed_candidates(ctx: &BlockCtx) -> Vec<SeedCandidate> {
         let Some(addr) = eval_sym_addr(block, &ctx.def_pos, *ptr) else {
             continue;
         };
-        streams
-            .entry((
-                ctx.roots.stream_base(addr.base),
-                addr.var.map(|v| v.0),
-                addr.mult,
-                *ty,
-            ))
+        let var = addr.var.map(|v| v.0);
+        let root = ctx.roots.stream_base(addr.base);
+        let entry = (addr.off, i, val.clone(), *ptr);
+        object_streams
+            .entry((root, var, addr.mult, *ty))
             .or_default()
-            .push((addr.off, i, val.clone(), *ptr));
+            .push(entry.clone());
+        if ctx.roots.needs_site_tier(&root) {
+            site_streams
+                .entry((addr.base.0, var, addr.mult, *ty))
+                .or_default()
+                .push(entry);
+        }
     }
+    // Chain both tiers into one `(ty, entries, is_object_tier)` stream so
+    // the existing run-splitting / fallback logic has exactly one body.
+    let groups = object_streams
+        .into_iter()
+        .map(|(k, v)| (k.3, v, true))
+        .chain(site_streams.into_iter().map(|(k, v)| (k.3, v, false)));
     let mut candidates = Vec::new();
-    for ((_, _, _, ty), mut entries) in streams {
+    for (ty, mut entries, is_object_tier) in groups {
         if entries.len() < 2 {
             continue;
         }
         entries.sort_by_key(|(off, idx, _, _)| (*off, *idx));
-        if ty == IrType::U8 && x86_sse41_available_pub() {
+        if is_object_tier && ty == IrType::U8 && x86_sse41_available_pub() {
             // Joint seeds use the LAST store to each byte; overwritten stores
             // are retired only after the complete use/access proof below.
             let mut last = Vec::new();
@@ -2429,6 +2491,19 @@ fn collect_seed_candidates(ctx: &BlockCtx) -> Vec<SeedCandidate> {
     if let Some(seed) = joint::value_seed(ctx) {
         candidates.push(seed);
     }
+    // A single-web global produces the SAME run in both tiers.  Collapse
+    // identical seeds so the cost model and `apply_plan` are not paid twice;
+    // `store_idx` determines `anchor_ptr`, so this key is exact.
+    let mut seen: FxHashSet<(IrType, usize, Vec<usize>, bool, bool)> = FxHashSet::default();
+    candidates.retain(|c| {
+        seen.insert((
+            c.ty,
+            c.width,
+            c.store_idx.clone(),
+            c.joint.is_some(),
+            c.value_sink.is_some(),
+        ))
+    });
     // Longest chains first; ties by earliest position.
     candidates.sort_by(|a, b| {
         b.lane_ops
@@ -7900,5 +7975,49 @@ mod tests {
         assert!(!crossings_are_amortized(IrType::I32, 2, false, 1, 0, 1, 1));
         // Joint seeds are priced by tail_cost and are exempt.
         assert!(crossings_are_amortized(IrType::U32, 2, true, 0, 4, 0, 2));
+    }
+
+    #[test]
+    fn preferred_width_covers_all_three_register_classes() {
+        // `family_for` asks the per-TU ISA gate, NOT the `avx2` argument of
+        // `preferred_width`, so pin the gate for the 8xU32 assertion and
+        // restore it: libtest runs several tests on the same OS thread.
+        use crate::passes::vectorize as v;
+        let saved = (
+            v::x86_simd_available_pub(),
+            v::x86_avx2_available_pub(),
+            v::x86_sse41_available_pub(),
+            v::x86_avx512vl_available_pub(),
+        );
+        v::set_x86_simd_isa(true, true, true, false);
+        assert_eq!(preferred_width(8, 4, IrType::U32, true), Some(8));
+        assert_eq!(preferred_width(4, 4, IrType::U32, false), Some(4));
+        assert_eq!(preferred_width(2, 4, IrType::U32, false), Some(2));
+        // 2xI64 fills a whole XMM register (check_bb_slp_v5_codegen.sh/psubq).
+        assert_eq!(preferred_width(2, 8, IrType::I64, false), Some(2));
+        assert_eq!(preferred_width(2, 1, IrType::U8, false), None);
+        assert_eq!(preferred_width(1, 4, IrType::U32, false), None);
+        v::set_x86_simd_isa(saved.0, saved.1, saved.2, saved.3);
+    }
+
+    #[test]
+    fn symbol_roots_only_needs_site_tier_for_truly_merged_roots() {
+        let roots = SymbolRoots::build(&roots_fixture());
+        let g_out = roots.stream_base(Value(1));
+        let g_other = roots.stream_base(Value(3));
+        let p0 = roots.stream_base(Value(4));
+        let p1 = roots.stream_base(Value(6));
+        // g_out has two GlobalAddr webs, parameter 0 two ParamRef webs.
+        assert!(roots.needs_site_tier(&g_out));
+        assert!(roots.needs_site_tier(&p0));
+        // Single-web roots do NOT need a duplicate site-tier stream.
+        assert!(!roots.needs_site_tier(&g_other));
+        assert!(!roots.needs_site_tier(&p1));
+        // An unknown SSA base is already keyed by its raw id.
+        assert!(!roots.needs_site_tier(&StreamBase::Value(99)));
+        // Exactly the two merged roots are recorded.
+        assert_eq!(roots.merged_roots.len(), 2);
+        assert!(roots.merged_roots.contains(&g_out));
+        assert!(roots.merged_roots.contains(&p0));
     }
 }
