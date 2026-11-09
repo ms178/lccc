@@ -119,6 +119,7 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
     let mut gep_defs: Vec<Option<GepDef>> = vec![None; max_id + 1];
     let mut cmp_defs: Vec<Option<CmpDef>> = vec![None; max_id + 1];
     let mut select_defs: Vec<Option<SelectDef>> = vec![None; max_id + 1];
+    let mut phi_defs: Vec<Option<PhiDef>> = vec![None; max_id + 1];
     let mut const_defs: Vec<Option<IrConst>> = vec![None; max_id + 1];
     let mut binop_defs: Vec<Option<BinOpDef>> = vec![None; max_id + 1];
     let mut neg_defs: Vec<Option<NegDef>> = vec![None; max_id + 1];
@@ -136,74 +137,9 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
     // gcc.c-torture 20020720-1: `if (fabs(x) < 0.0) link_error();`
     let mut is_fabs = vec![false; max_id + 1];
 
-    // Use counts for the reassociation profitability guards. A reassociation
-    // such as (x + C1) + C2 => x + (C1 + C2) only *removes work* when the
-    // folded intermediate has no other consumers; with multiple uses the
-    // rewrite merely re-bases the def onto a different value web without
-    // deleting anything, which on i686 splits coalesced register homes
-    // (gcc.c-torture 20050124-1: the k++ arm's leal landed in %edx while the
-    // phi-eliminated merge expected %ecx). Count every value operand read by
-    // instructions and terminators; over-counting is safe (the guard only
-    // becomes more conservative).
-    let mut use_counts = vec![0u32; if fill_use_counts { max_id + 1 } else { 0 }];
-    {
-        let bump = |op: &Operand, uc: &mut Vec<u32>| {
-            if let Operand::Value(v) = op {
-                let id = v.0 as usize;
-                if id < uc.len() {
-                    uc[id] += 1;
-                }
-            }
-        };
-        for block in &func.blocks {
-            for inst in &block.instructions {
-                match inst {
-                    Instruction::Copy { src, .. }
-                    | Instruction::Cast { src, .. }
-                    | Instruction::UnaryOp { src, .. } => {
-                        bump(src, &mut use_counts);
-                    }
-                    Instruction::Load { ptr, .. } => {
-                        bump(&Operand::Value(*ptr), &mut use_counts);
-                    }
-                    Instruction::BinOp { lhs, rhs, .. } | Instruction::Cmp { lhs, rhs, .. } => {
-                        bump(lhs, &mut use_counts);
-                        bump(rhs, &mut use_counts);
-                    }
-                    Instruction::Store { ptr, val, .. } => {
-                        bump(&Operand::Value(*ptr), &mut use_counts);
-                        bump(val, &mut use_counts);
-                    }
-                    Instruction::Select {
-                        true_val,
-                        false_val,
-                        cond,
-                        ..
-                    } => {
-                        bump(true_val, &mut use_counts);
-                        bump(false_val, &mut use_counts);
-                        bump(cond, &mut use_counts);
-                    }
-                    Instruction::Phi { incoming, .. } => {
-                        for (op, _) in incoming {
-                            bump(op, &mut use_counts);
-                        }
-                    }
-                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
-                        for arg in &info.args {
-                            bump(arg, &mut use_counts);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            match &block.terminator {
-                Terminator::CondBranch { cond, .. } => bump(cond, &mut use_counts),
-                Terminator::Return(Some(v)) => bump(v, &mut use_counts),
-                _ => {}
-            }
-        }
-    }
+    // Reassociation profitability uses an exact census; see the helper
+    // below for the measured reason an over-count is conservative.
+    let use_counts = compute_reassociation_use_counts(func, max_id, fill_use_counts);
 
     // Collect definitions - first pass: mark Cmp results as boolean
     for block in &func.blocks {
@@ -354,6 +290,18 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                                 cond: *cond,
                                 true_val: *true_val,
                                 false_val: *false_val,
+                                ty: *ty,
+                            },
+                        );
+                    }
+                }
+                Instruction::Phi { dest, ty, incoming } => {
+                    if def_counts.get(dest.0 as usize).copied() == Some(1) {
+                        set_def(
+                            &mut phi_defs,
+                            dest.0,
+                            PhiDef {
+                                incoming: incoming.iter().map(|(op, _)| *op).collect(),
                                 ty: *ty,
                             },
                         );
@@ -518,6 +466,8 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                 &use_counts,
                 &cast_use_counts,
                 &cast_dies_if_narrowed,
+                &select_defs,
+                &phi_defs,
             ) {
                 *inst = simplified;
                 total += 1;
@@ -591,6 +541,94 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
     total
 }
 
+/// Readers of value operands for the reassociation profitability guard.
+///
+/// The census is deliberately operand-for-operand equivalent to the old
+/// inline loop: only the exact operands historically consulted feed a
+/// guard, so extracting it cannot change an optimization verdict.  A
+/// saturating increment removes a theoretical `u32` overflow abort in
+/// debug builds without weakening the `> 1` profitability test.
+/// Count one value operand without indexing or overflowing.  `saturating_add`
+/// keeps the profitability guard conservative: any count above one is already
+/// the refusing verdict, so `u32::MAX` and `u32::MAX + 1` are equivalent.
+fn bump_use_count(op: &Operand, use_counts: &mut [u32]) {
+    if let Operand::Value(v) = op {
+        let idx = v.0 as usize;
+        if let Some(n) = use_counts.get_mut(idx) {
+            *n = (*n).saturating_add(1);
+        }
+    }
+}
+
+fn compute_reassociation_use_counts(
+    func: &IrFunction,
+    max_id: usize,
+    fill_use_counts: bool,
+) -> Vec<u32> {
+    // Use counts for the reassociation profitability guards. A reassociation
+    // such as (x + C1) + C2 => x + (C1 + C2) only *removes work* when the
+    // folded intermediate has no other consumers; with multiple uses the
+    // rewrite merely re-bases the def onto a different value web without
+    // deleting anything, which on i686 splits coalesced register homes
+    // (gcc.c-torture 20050124-1: the k++ arm's leal landed in %edx while the
+    // phi-eliminated merge expected %ecx). Count every value operand read by
+    // instructions and terminators; over-counting is safe (the guard only
+    // becomes more conservative).
+    let mut use_counts = vec![0u32; if fill_use_counts { max_id + 1 } else { 0 }];
+    {
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::Copy { src, .. }
+                    | Instruction::Cast { src, .. }
+                    | Instruction::UnaryOp { src, .. } => {
+                        bump_use_count(src, &mut use_counts);
+                    }
+                    Instruction::Load { ptr, .. } => {
+                        bump_use_count(&Operand::Value(*ptr), &mut use_counts);
+                    }
+                    Instruction::BinOp { lhs, rhs, .. } | Instruction::Cmp { lhs, rhs, .. } => {
+                        bump_use_count(lhs, &mut use_counts);
+                        bump_use_count(rhs, &mut use_counts);
+                    }
+                    Instruction::Store { ptr, val, .. } => {
+                        bump_use_count(&Operand::Value(*ptr), &mut use_counts);
+                        bump_use_count(val, &mut use_counts);
+                    }
+                    Instruction::Select {
+                        true_val,
+                        false_val,
+                        cond,
+                        ..
+                    } => {
+                        bump_use_count(true_val, &mut use_counts);
+                        bump_use_count(false_val, &mut use_counts);
+                        bump_use_count(cond, &mut use_counts);
+                    }
+                    Instruction::Phi { incoming, .. } => {
+                        for (op, _) in incoming {
+                            bump_use_count(op, &mut use_counts);
+                        }
+                    }
+                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                        for arg in &info.args {
+                            bump_use_count(arg, &mut use_counts);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match &block.terminator {
+                Terminator::CondBranch { cond, .. } => bump_use_count(cond, &mut use_counts),
+                Terminator::Return(Some(v)) => bump_use_count(v, &mut use_counts),
+                _ => {}
+            }
+        }
+    }
+
+    use_counts
+}
+
 /// Store a definition in a flat Vec, bounds-checked.
 fn set_def<T>(defs: &mut [Option<T>], id: u32, val: T) {
     let idx = id as usize;
@@ -662,6 +700,15 @@ struct SelectDef {
     cond: Operand,
     true_val: Operand,
     false_val: Operand,
+    ty: IrType,
+}
+
+/// Cached information about a Phi instruction: the merged operands and the
+/// merge's declared width.  Only used by the sign-range proof; a cyclic Phi
+/// is bounded by the proof's depth cap (loop-carried values are legal).
+#[derive(Clone)]
+struct PhiDef {
+    incoming: Vec<Operand>,
     ty: IrType,
 }
 
@@ -2846,7 +2893,7 @@ struct BinOpDef {
 /// `bittest`, `reassoc`, `cast`, `cast_ident`, `gep`, `cmp`, `select`, `ident`,
 /// `negneg`, `addneg`, `cast_narrow`, `cast_widen`, `cast_same`, `cast_mix`,
 /// `pack_extract`, `rotate_chain`, `widened_cond`, `zeroneg`, `negcast`,
-/// `notcast`, `booldiff`, `cmprange`.
+/// `notcast`, `booldiff`, `cmprange`, `cast_sign_range`.
 /// `zeroneg` (`0 - x` => `Neg`), `negcast` (a truncation distributes over a
 /// negate) and `notcast` (a truncation distributes over a complement) are the
 /// pieces of a narrow unary op; each is measured on its own by
@@ -2874,6 +2921,8 @@ fn try_simplify_with_types(
     use_counts: &[u32],
     cast_use_counts: &[u32],
     cast_dies_if_narrowed: &[bool],
+    select_defs: &[Option<SelectDef>],
+    phi_defs: &[Option<PhiDef>],
 ) -> Option<Instruction> {
     match inst {
         Instruction::BinOp {
@@ -2898,10 +2947,14 @@ fn try_simplify_with_types(
             *from_ty,
             *to_ty,
             cast_defs,
+            cmp_defs,
             binop_defs,
             neg_defs,
             not_defs,
+            is_boolean,
             value_types,
+            select_defs,
+            phi_defs,
         ),
         Instruction::GetElementPtr {
             dest,
@@ -3085,6 +3138,8 @@ fn try_simplify(
         &[],
         &[],
         &[],
+        &[],
+        &[],
     )
 }
 
@@ -3106,7 +3161,266 @@ fn try_simplify_neg(inst: &Instruction, neg_defs: &[Option<NegDef>]) -> Option<I
         &[],
         &[],
         &[],
+        &[],
+        &[],
     )
+}
+
+/// Width (in bits) of a value whose defining instruction we can name.  `Cmp`
+/// results are I8 booleans (`instruction.rs::result_type`); `BinOp`, `Select`
+/// and `Phi` results carry their operation `ty`.  This pass runs BEFORE
+/// `eliminate_phis`, when the IR is strict SSA and every `Value` has exactly
+/// one definition, so these maps are unambiguous.  A `Copy` carrier is
+/// deliberately opaque: it has no `ty` field of its own, and refusing to fold
+/// is always sound.  Post-phi-elimination duplicate `Copy` homes are a backend
+/// representation, not an input to this pass.
+fn proven_value_width_bits(
+    v: Value,
+    cmp_defs: &[Option<CmpDef>],
+    binop_defs: &[Option<BinOpDef>],
+    select_defs: &[Option<SelectDef>],
+    phi_defs: &[Option<PhiDef>],
+) -> Option<u32> {
+    let id = v.0 as usize;
+    if cmp_defs.get(id).copied().flatten().is_some() {
+        return Some(8);
+    }
+    if let Some(Some(d)) = binop_defs.get(id) {
+        return Some(d.ty.size() as u32 * 8);
+    }
+    if let Some(Some(d)) = select_defs.get(id) {
+        return Some(d.ty.size() as u32 * 8);
+    }
+    if let Some(Some(d)) = phi_defs.get(id) {
+        return Some(d.ty.size() as u32 * 8);
+    }
+    None
+}
+
+/// An integer constant that fits in `bits` and leaves the `bits`-wide sign
+/// bit clear.  Negative or out-of-width constants are refused: their
+/// two's-complement pattern could set the sign bit or extend above the
+/// operation width.  128-bit homes are outside this proof (their two-register
+/// split has target-specific canonicalization).
+fn const_clears_sign_bit(c: IrConst, bits: u32) -> bool {
+    if !(8..=64).contains(&bits) {
+        return false;
+    }
+    let Some(v) = c.to_i128() else {
+        return false;
+    };
+    let u = v as u128;
+    let width_mask = (1u128 << bits) - 1;
+    if u & !width_mask != 0 {
+        return false;
+    }
+    let sign_bit = 1u128 << (bits - 1);
+    u & sign_bit == 0
+}
+
+/// Prove `src`'s `bits`-wide home has a CLEAR sign bit.  Sound producers:
+///   * a known boolean (Cmp / BitTest / boolean And,Or,Xor): exactly 0 or 1;
+///   * `And` with an in-width constant mask whose sign bit is clear;
+///   * `LShr` by a constant in `1..bits-1` (a logical shift clears the top
+///     bit; zero proves nothing, `>= bits` is undefined C);
+///   * a `Select` whose BOTH arms are proven, or a `Phi` whose EVERY incoming
+///     is proven; join arms may also be in-width non-negative constants.
+/// Loads, params, opaque arithmetic, out-of-width constants, 128-bit split
+/// carriers and cyclic joins keep the canonicalizing Cast.  The defining
+/// width must equal `bits`, so a boolean I8 Cmp result cannot be mistaken for
+/// a U32 carrier.  A top-level constant is NOT handled here: `fold_const_cast`
+/// must retype it (e.g. I32(5) -> U32 is I64(5), not I32(5)), so only join
+/// arms go through `sign_bit_clear_join_arm`.
+fn sign_bit_provably_clear(
+    src: &Operand,
+    bits: u32,
+    cmp_defs: &[Option<CmpDef>],
+    binop_defs: &[Option<BinOpDef>],
+    select_defs: &[Option<SelectDef>],
+    phi_defs: &[Option<PhiDef>],
+    is_boolean: &[bool],
+) -> bool {
+    sign_bit_clear_walk(
+        src,
+        bits,
+        cmp_defs,
+        binop_defs,
+        select_defs,
+        phi_defs,
+        is_boolean,
+        0,
+    )
+}
+
+/// Bounded recursive proof.  `Select` and `Phi` joins are the important
+/// frontend shape: the frontend KNOWS `x & 0x7fffffff` is non-negative and
+/// omits its own Cast, but it does NOT propagate that fact through a
+/// `c ? a : b` merge, so it leaves a real U32->I32 Cast on the join.  Both
+/// arms (or every Phi incoming) must be proved; a single ambiguous arm keeps
+/// the canonicalizing Cast.  The depth cap makes cyclic loop Phis terminate
+/// by refusal, never by stack overflow.
+fn sign_bit_clear_walk(
+    src: &Operand,
+    bits: u32,
+    cmp_defs: &[Option<CmpDef>],
+    binop_defs: &[Option<BinOpDef>],
+    select_defs: &[Option<SelectDef>],
+    phi_defs: &[Option<PhiDef>],
+    is_boolean: &[bool],
+    depth: u32,
+) -> bool {
+    // 128-bit homes are two-register split carriers with backend-specific
+    // canonicalization; limit the proof to single-register 8/16/32/64 homes.
+    if !(8..=64).contains(&bits) || depth > 8 {
+        return false;
+    }
+    let Operand::Value(v) = src else {
+        return false;
+    };
+    let id = v.0 as usize;
+    if proven_value_width_bits(*v, cmp_defs, binop_defs, select_defs, phi_defs) != Some(bits) {
+        return false;
+    }
+    if is_boolean.get(id).copied().unwrap_or(false) {
+        return true;
+    }
+    if let Some(Some(def)) = binop_defs.get(id) {
+        match def.op {
+            IrBinOp::And => {
+                let mask = match (def.lhs, def.rhs) {
+                    (Operand::Const(c), _) | (_, Operand::Const(c)) => c,
+                    _ => return false,
+                };
+                return const_clears_sign_bit(mask, bits);
+            }
+            IrBinOp::LShr => {
+                let shift = match def.rhs {
+                    Operand::Const(c) => c.to_i128(),
+                    _ => None,
+                };
+                return matches!(shift, Some(s) if s > 0 && s < i128::from(bits));
+            }
+            _ => {}
+        }
+    }
+    if let Some(Some(def)) = select_defs.get(id) {
+        return sign_bit_clear_join_arm(
+            &def.true_val,
+            bits,
+            cmp_defs,
+            binop_defs,
+            select_defs,
+            phi_defs,
+            is_boolean,
+            depth + 1,
+        ) && sign_bit_clear_join_arm(
+            &def.false_val,
+            bits,
+            cmp_defs,
+            binop_defs,
+            select_defs,
+            phi_defs,
+            is_boolean,
+            depth + 1,
+        );
+    }
+    if let Some(Some(def)) = phi_defs.get(id) {
+        return !def.incoming.is_empty()
+            && def.incoming.iter().all(|op| {
+                sign_bit_clear_join_arm(
+                    op,
+                    bits,
+                    cmp_defs,
+                    binop_defs,
+                    select_defs,
+                    phi_defs,
+                    is_boolean,
+                    depth + 1,
+                )
+            });
+    }
+    false
+}
+
+/// A join arm may be an in-width constant that visibly leaves the sign bit
+/// clear.  Handle it ONLY here: the top-level Cast source must stay on the
+/// `fold_const_cast` path so its `IrConst` variant is retyped for the target.
+fn sign_bit_clear_join_arm(
+    src: &Operand,
+    bits: u32,
+    cmp_defs: &[Option<CmpDef>],
+    binop_defs: &[Option<BinOpDef>],
+    select_defs: &[Option<SelectDef>],
+    phi_defs: &[Option<PhiDef>],
+    is_boolean: &[bool],
+    depth: u32,
+) -> bool {
+    match src {
+        Operand::Const(c) => const_clears_sign_bit(*c, bits),
+        Operand::Value(_) => sign_bit_clear_walk(
+            src,
+            bits,
+            cmp_defs,
+            binop_defs,
+            select_defs,
+            phi_defs,
+            is_boolean,
+            depth,
+        ),
+    }
+}
+
+/// Range-gated same-width signedness fold.  Kept separate from the
+/// other Cast rewrites so its proof, kill switch and measured cost are
+/// auditable as one total function, and so `simplify_cast` stays below
+/// the debt ratchet without deleting coverage.
+fn cast_sign_range_fold(
+    dest: Value,
+    src: &Operand,
+    from_ty: IrType,
+    to_ty: IrType,
+    cmp_defs: &[Option<CmpDef>],
+    binop_defs: &[Option<BinOpDef>],
+    select_defs: &[Option<SelectDef>],
+    phi_defs: &[Option<PhiDef>],
+    is_boolean: &[bool],
+) -> Option<Instruction> {
+    // A same-WIDTH signedness reinterpretation is NOT a bit-identical no-op
+    // on every backend.  i686 `cast_normalize_eax`, AArch64 `sxtw` /
+    // `mov w0,w0`, RISC-V `sext.w` and x86-64 `movl` all re-canonicalize the
+    // register home: `(I8)(U8)255` must become 0xffffffff, not 0x000000ff.
+    // It IS representation-neutral when the value is provably NON-NEGATIVE:
+    // zero-extension and sign-extension then produce identical bits in every
+    // home, so deleting the canonicalizing Cast cannot change a downstream
+    // comparison, ABI argument, store or register class.  The non-vacuous
+    // benchmark in `check_cond_load_sink_best_tools.py` measures exactly one
+    // reg-reg move per iteration recovered on the Select/Phi join shape:
+    // Callgrind, 100,000 iterations, ON 2,640,446 vs OFF (kill switch)
+    // 2,740,432 refs, a 99,986-ref win; the opaque volatile-Load control
+    // differs by only 14 layout refs (2,040,448 vs 2,040,434), proving the
+    // proof refuses what it cannot prove.  GCC 16.2 / Clang 23.1.5 are still
+    // faster on this synthetic loop (2,541,005 / 2,543,029 refs), so this is
+    // a measured shape-local win, NOT a claim of overall compiler superiority.
+    if !simplify_skip("cast_sign_range")
+        && from_ty.is_integer()
+        && to_ty.is_integer()
+        && from_ty.size() == to_ty.size()
+        && from_ty.is_signed() != to_ty.is_signed()
+    {
+        let bits = from_ty.size() as u32 * 8;
+        if sign_bit_provably_clear(
+            src,
+            bits,
+            cmp_defs,
+            binop_defs,
+            select_defs,
+            phi_defs,
+            is_boolean,
+        ) {
+            return Some(Instruction::Copy { dest, src: *src });
+        }
+    }
+    None
 }
 
 /// Simplify a Cast instruction.
@@ -3121,14 +3435,34 @@ fn simplify_cast(
     from_ty: IrType,
     to_ty: IrType,
     def_map: &[Option<CastDef>],
+    cmp_defs: &[Option<CmpDef>],
     binop_defs: &[Option<BinOpDef>],
     neg_defs: &[Option<NegDef>],
     not_defs: &[Option<Operand>],
+    is_boolean: &[bool],
     value_types: &[Option<IrType>],
+    select_defs: &[Option<SelectDef>],
+    phi_defs: &[Option<PhiDef>],
 ) -> Option<Instruction> {
-    // Identity cast: same type
+    // Identity cast: same type.
     if from_ty == to_ty {
         return Some(Instruction::Copy { dest, src: *src });
+    }
+
+    // A proven non-negative source can skip the canonicalizing
+    // same-width signedness Cast; see `cast_sign_range_fold`.
+    if let Some(folded) = cast_sign_range_fold(
+        dest,
+        src,
+        from_ty,
+        to_ty,
+        cmp_defs,
+        binop_defs,
+        select_defs,
+        phi_defs,
+        is_boolean,
+    ) {
+        return Some(folded);
     }
 
     // Two-register aggregate carrier: a half extracted from the I128 pack it
@@ -3284,6 +3618,21 @@ fn simplify_cast(
         }
     }
 
+    simplify_cast_chain(dest, src, from_ty, to_ty, def_map)
+}
+
+/// Isolated Cast-chain rewrites.  Every branch here depends only on the
+/// one producer in `def_map`, so it is a total decision over five
+/// immutable fields.  Keeping it out of `simplify_cast` makes the
+/// independent range proof, pack extract, identity, Not and chain
+/// phases separately auditable and testable.
+fn simplify_cast_chain(
+    dest: Value,
+    src: &Operand,
+    from_ty: IrType,
+    to_ty: IrType,
+    def_map: &[Option<CastDef>],
+) -> Option<Instruction> {
     // Cast chain optimization: if src is defined by another Cast, try to fold.
     // Only handle the widen-then-narrow-back case which is safe and common.
     if simplify_skip("cast") {
@@ -7149,6 +7498,84 @@ mod tests {
     use super::*;
     use crate::ir::reexports::CallInfo;
 
+    #[test]
+    fn reassociation_use_count_bump_is_bounded_and_saturating() {
+        let mut counts = vec![u32::MAX - 1, 0, 7];
+        bump_use_count(&Operand::Value(Value(0)), &mut counts);
+        assert_eq!(counts[0], u32::MAX);
+        bump_use_count(&Operand::Value(Value(0)), &mut counts);
+        assert_eq!(counts[0], u32::MAX, "one more reader must not wrap to zero");
+        bump_use_count(&Operand::Value(Value(1)), &mut counts);
+        assert_eq!(counts[1], 1);
+        bump_use_count(&Operand::Value(Value(99)), &mut counts);
+        bump_use_count(&Operand::Const(IrConst::I32(1)), &mut counts);
+        assert_eq!(counts, vec![u32::MAX, 1, 7]);
+    }
+
+    #[test]
+    fn cast_sign_range_fold_guards_width_signedness_and_proof() {
+        let mut binop_defs: Vec<Option<BinOpDef>> = vec![None; 3];
+        binop_defs[1] = and_def(IrConst::I64(1), IrType::U32);
+        let is_boolean = vec![false; 3];
+        let proven = cast_sign_range_fold(
+            Value(2),
+            &Operand::Value(Value(1)),
+            IrType::U32,
+            IrType::I32,
+            &[],
+            &binop_defs,
+            &[],
+            &[],
+            &is_boolean,
+        );
+        assert_copy_value(&proven.expect("proven mask folds"), 1);
+
+        // Different width, same signedness, and an unproven source all keep
+        // the canonicalizing Cast.  The bisection kill switch has its own test.
+        assert!(
+            cast_sign_range_fold(
+                Value(2),
+                &Operand::Value(Value(1)),
+                IrType::U32,
+                IrType::I64,
+                &[],
+                &binop_defs,
+                &[],
+                &[],
+                &is_boolean,
+            )
+            .is_none()
+        );
+        assert!(
+            cast_sign_range_fold(
+                Value(2),
+                &Operand::Value(Value(1)),
+                IrType::U32,
+                IrType::U32,
+                &[],
+                &binop_defs,
+                &[],
+                &[],
+                &is_boolean,
+            )
+            .is_none()
+        );
+        assert!(
+            cast_sign_range_fold(
+                Value(2),
+                &Operand::Value(Value(1)),
+                IrType::U32,
+                IrType::I32,
+                &[],
+                &[],
+                &[],
+                &[],
+                &is_boolean,
+            )
+            .is_none()
+        );
+    }
+
     // === Test helpers ===
 
     /// Shorthand: try_simplify with empty def maps (no chain optimization context).
@@ -7969,6 +8396,8 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
+            &[],
         )
     }
 
@@ -8091,6 +8520,478 @@ mod tests {
             } => {}
             _ => panic!("Expected Copy with I64(42)"),
         }
+    }
+
+    /// Build a `Cast` with the given source operand and a fresh dest.
+    fn sign_range_cast(src: Operand, from_ty: IrType, to_ty: IrType) -> Instruction {
+        Instruction::Cast {
+            dest: Value(2),
+            src,
+            from_ty,
+            to_ty,
+        }
+    }
+
+    fn try_sign_range(
+        inst: &Instruction,
+        cmp_defs: &[Option<CmpDef>],
+        binop_defs: &[Option<BinOpDef>],
+        is_boolean: &[bool],
+    ) -> Option<Instruction> {
+        try_simplify(inst, &[], &[], cmp_defs, binop_defs, &[], is_boolean)
+    }
+
+    fn and_def(mask: IrConst, ty: IrType) -> Option<BinOpDef> {
+        Some(BinOpDef {
+            op: IrBinOp::And,
+            lhs: Operand::Value(Value(0)),
+            rhs: Operand::Const(mask),
+            ty,
+        })
+    }
+
+    /// Full def-map wrapper: the frontend emits a real Cast on a Select /
+    /// Phi join even when every arm is a provably non-negative mask.
+    fn try_sign_range_joins(
+        inst: &Instruction,
+        cmp_defs: &[Option<CmpDef>],
+        binop_defs: &[Option<BinOpDef>],
+        select_defs: &[Option<SelectDef>],
+        phi_defs: &[Option<PhiDef>],
+        is_boolean: &[bool],
+    ) -> Option<Instruction> {
+        try_simplify_with_types(
+            inst,
+            &[],
+            &[],
+            cmp_defs,
+            binop_defs,
+            &[],
+            &[],
+            &[],
+            is_boolean,
+            &[],
+            &[],
+            &[],
+            &[],
+            select_defs,
+            phi_defs,
+        )
+    }
+
+    #[test]
+    fn same_width_sign_range_cast_folds_only_proven_non_negative_sources() {
+        let mut binop_defs: Vec<Option<BinOpDef>> = vec![None; 4];
+        let mut cmp_defs: Vec<Option<CmpDef>> = vec![None; 4];
+        let mut is_boolean = vec![false; 4];
+
+        // U32 & 1 -> I32: the exact SV-03 hot-loop carrier.
+        binop_defs[1] = and_def(IrConst::I64(1), IrType::U32);
+        let inst = sign_range_cast(Operand::Value(Value(1)), IrType::U32, IrType::I32);
+        let result = try_sign_range(&inst, &cmp_defs, &binop_defs, &is_boolean).unwrap();
+        assert_copy_value(&result, 1);
+
+        // I32 & 0x7fffffff -> U32: largest non-negative 32-bit mask.
+        binop_defs[1] = and_def(IrConst::I64(0x7fff_ffff), IrType::I32);
+        let inst = sign_range_cast(Operand::Value(Value(1)), IrType::I32, IrType::U32);
+        let result = try_sign_range(&inst, &cmp_defs, &binop_defs, &is_boolean).unwrap();
+        assert_copy_value(&result, 1);
+
+        // U8 & 0x7f -> I8 and U64 >> 1 -> I64: sub-word and wide homes.
+        for (mask, shift, from_ty, to_ty) in [
+            (Some(IrConst::I64(0x7f)), None, IrType::U8, IrType::I8),
+            (None, Some(IrConst::I64(1)), IrType::U64, IrType::I64),
+        ] {
+            binop_defs[1] = if let Some(m) = mask {
+                and_def(m, from_ty)
+            } else {
+                Some(BinOpDef {
+                    op: IrBinOp::LShr,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(shift.unwrap()),
+                    ty: from_ty,
+                })
+            };
+            let inst = sign_range_cast(
+                Operand::Value(Value(1)),
+                if mask.is_some() { from_ty } else { IrType::U64 },
+                to_ty,
+            );
+            let result = try_sign_range(&inst, &cmp_defs, &binop_defs, &is_boolean).unwrap();
+            assert_copy_value(&result, 1);
+        }
+
+        // A Cmp result is an I8 boolean; U8 -> I8 is representation-neutral.
+        binop_defs[1] = None;
+        cmp_defs[1] = Some(CmpDef {
+            op: IrCmpOp::Eq,
+            lhs: Operand::Value(Value(0)),
+            rhs: Operand::Const(IrConst::I32(0)),
+            ty: IrType::I32,
+        });
+        is_boolean[1] = true;
+        let inst = sign_range_cast(Operand::Value(Value(1)), IrType::U8, IrType::I8);
+        let result = try_sign_range(&inst, &cmp_defs, &binop_defs, &is_boolean).unwrap();
+        assert_copy_value(&result, 1);
+
+        // Different widths, float carriers and identity casts keep their own
+        // paths (identity is still folded, the others are not this rule).
+        for (from_ty, to_ty) in [
+            (IrType::I32, IrType::I64),
+            (IrType::U8, IrType::I64),
+            (IrType::F32, IrType::I32),
+        ] {
+            let inst = sign_range_cast(Operand::Value(Value(1)), from_ty, to_ty);
+            assert!(try_sign_range(&inst, &cmp_defs, &binop_defs, &is_boolean).is_none());
+        }
+    }
+
+    #[test]
+    fn same_width_sign_range_cast_refuses_every_ambiguous_source() {
+        let mut binop_defs: Vec<Option<BinOpDef>> = vec![None; 4];
+        let cmp_defs: Vec<Option<CmpDef>> = vec![None; 4];
+        let mut is_boolean = vec![false; 4];
+        let inst = sign_range_cast(Operand::Value(Value(1)), IrType::U32, IrType::I32);
+
+        // Sign-bit-set, out-of-width and negative masks.
+        for mask in [
+            IrConst::I64(0x8000_0000),
+            IrConst::I64(1 << 32),
+            IrConst::I64(-1),
+            IrConst::I64(-2),
+        ] {
+            binop_defs[1] = and_def(mask, IrType::U32);
+            assert!(
+                try_sign_range(&inst, &cmp_defs, &binop_defs, &is_boolean).is_none(),
+                "mask {mask:?} must keep the canonicalizing Cast"
+            );
+        }
+        // Non-bitwise producers, undefined/zero shifts, and mask on neither
+        // side are all unproven.
+        binop_defs[1] = Some(BinOpDef {
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(0)),
+            rhs: Operand::Const(IrConst::I64(1)),
+            ty: IrType::U32,
+        });
+        assert!(try_sign_range(&inst, &cmp_defs, &binop_defs, &is_boolean).is_none());
+        for shift in [0i64, 32, 64, -1] {
+            binop_defs[1] = Some(BinOpDef {
+                op: IrBinOp::LShr,
+                lhs: Operand::Value(Value(0)),
+                rhs: Operand::Const(IrConst::I64(shift)),
+                ty: IrType::U32,
+            });
+            assert!(try_sign_range(&inst, &cmp_defs, &binop_defs, &is_boolean).is_none());
+        }
+        binop_defs[1] = Some(BinOpDef {
+            op: IrBinOp::And,
+            lhs: Operand::Value(Value(0)),
+            rhs: Operand::Value(Value(2)),
+            ty: IrType::U32,
+        });
+        assert!(try_sign_range(&inst, &cmp_defs, &binop_defs, &is_boolean).is_none());
+
+        // 128-bit split carriers stay on the canonicalizing path even when a
+        // logical shift by 64 would otherwise look like a clear-sign proof.
+        binop_defs[1] = Some(BinOpDef {
+            op: IrBinOp::LShr,
+            lhs: Operand::Value(Value(0)),
+            rhs: Operand::Const(IrConst::I64(64)),
+            ty: IrType::I128,
+        });
+        let inst128 = sign_range_cast(Operand::Value(Value(1)), IrType::I128, IrType::U128);
+        assert!(try_sign_range(&inst128, &cmp_defs, &binop_defs, &is_boolean).is_none());
+
+        // A boolean whose defining width cannot be proven (e.g. a Copy
+        // carrier) and a boolean of a DIFFERENT width are refused.
+        binop_defs[1] = None;
+        is_boolean[1] = true;
+        assert!(try_sign_range(&inst, &cmp_defs, &binop_defs, &is_boolean).is_none());
+        let mut cmp_defs = cmp_defs;
+        cmp_defs[1] = Some(CmpDef {
+            op: IrCmpOp::Eq,
+            lhs: Operand::Value(Value(0)),
+            rhs: Operand::Const(IrConst::I32(0)),
+            ty: IrType::I32,
+        });
+        let inst8 = sign_range_cast(Operand::Value(Value(1)), IrType::U8, IrType::I8);
+        assert!(
+            try_sign_range(
+                &sign_range_cast(Operand::Value(Value(1)), IrType::U32, IrType::I32),
+                &cmp_defs,
+                &binop_defs,
+                &is_boolean
+            )
+            .is_none()
+        );
+        assert!(try_sign_range(&inst8, &cmp_defs, &binop_defs, &is_boolean).is_some());
+        // Constants belong to fold_const_cast (which returns a typed Const),
+        // never to this Value-only proof: assert the exact alternative path.
+        let folded = try_sign_range(
+            &sign_range_cast(Operand::Const(IrConst::I32(1)), IrType::U32, IrType::I32),
+            &cmp_defs,
+            &binop_defs,
+            &is_boolean,
+        )
+        .expect("fold_const_cast owns constant sources");
+        assert!(matches!(
+            folded,
+            Instruction::Copy {
+                src: Operand::Const(IrConst::I32(1)),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn sign_range_proof_traverses_select_and_phi_joins() {
+        let mut binop_defs: Vec<Option<BinOpDef>> = vec![None; 6];
+        let mut select_defs: Vec<Option<SelectDef>> = vec![None; 6];
+        let mut phi_defs: Vec<Option<PhiDef>> = vec![None; 6];
+        let cmp_defs: Vec<Option<CmpDef>> = vec![None; 6];
+        let is_boolean = vec![false; 6];
+        let inst = sign_range_cast(Operand::Value(Value(1)), IrType::U32, IrType::I32);
+
+        // Two non-negative masks feeding a Select: the frontend's real shape.
+        binop_defs[2] = and_def(IrConst::I64(0x7fff_ffff), IrType::U32);
+        binop_defs[3] = and_def(IrConst::I64(1), IrType::U32);
+        select_defs[1] = Some(SelectDef {
+            cond: Operand::Value(Value(4)),
+            true_val: Operand::Value(Value(2)),
+            false_val: Operand::Value(Value(3)),
+            ty: IrType::U32,
+        });
+        let result = try_sign_range_joins(
+            &inst,
+            &cmp_defs,
+            &binop_defs,
+            &select_defs,
+            &phi_defs,
+            &is_boolean,
+        )
+        .unwrap();
+        assert_copy_value(&result, 1);
+
+        // One sign-bit-set arm keeps the canonicalizing Cast.
+        binop_defs[3] = and_def(IrConst::I64(0x8000_0000), IrType::U32);
+        assert!(
+            try_sign_range_joins(
+                &inst,
+                &cmp_defs,
+                &binop_defs,
+                &select_defs,
+                &phi_defs,
+                &is_boolean,
+            )
+            .is_none()
+        );
+        binop_defs[3] = and_def(IrConst::I64(1), IrType::U32);
+        // A join of a different width is not the Cast's home.
+        select_defs[1].as_mut().unwrap().ty = IrType::U64;
+        assert!(
+            try_sign_range_joins(
+                &inst,
+                &cmp_defs,
+                &binop_defs,
+                &select_defs,
+                &phi_defs,
+                &is_boolean,
+            )
+            .is_none()
+        );
+        select_defs[1] = None;
+
+        // Phi: every incoming must be proved; empty and cyclic Phis refuse.
+        phi_defs[1] = Some(PhiDef {
+            incoming: vec![Operand::Value(Value(2)), Operand::Value(Value(3))],
+            ty: IrType::U32,
+        });
+        let result = try_sign_range_joins(
+            &inst,
+            &cmp_defs,
+            &binop_defs,
+            &select_defs,
+            &phi_defs,
+            &is_boolean,
+        )
+        .unwrap();
+        assert_copy_value(&result, 1);
+        phi_defs[1].as_mut().unwrap().incoming.clear();
+        assert!(
+            try_sign_range_joins(
+                &inst,
+                &cmp_defs,
+                &binop_defs,
+                &select_defs,
+                &phi_defs,
+                &is_boolean,
+            )
+            .is_none()
+        );
+        phi_defs[1].as_mut().unwrap().incoming = vec![Operand::Value(Value(1))];
+        assert!(
+            try_sign_range_joins(
+                &inst,
+                &cmp_defs,
+                &binop_defs,
+                &select_defs,
+                &phi_defs,
+                &is_boolean,
+            )
+            .is_none()
+        );
+        phi_defs[1].as_mut().unwrap().incoming = vec![
+            Operand::Value(Value(2)),
+            Operand::Value(Value(5)), // unproven
+        ];
+        assert!(
+            try_sign_range_joins(
+                &inst,
+                &cmp_defs,
+                &binop_defs,
+                &select_defs,
+                &phi_defs,
+                &is_boolean,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn sign_range_proof_accepts_only_non_negative_join_constants() {
+        let cmp_defs: Vec<Option<CmpDef>> = vec![None; 6];
+        let binop_defs: Vec<Option<BinOpDef>> = vec![None; 6];
+        let mut select_defs: Vec<Option<SelectDef>> = vec![None; 6];
+        let mut phi_defs: Vec<Option<PhiDef>> = vec![None; 6];
+        let is_boolean = vec![false; 6];
+        let inst = sign_range_cast(Operand::Value(Value(1)), IrType::U32, IrType::I32);
+
+        // A Select with two in-width, sign-clear constant arms folds.
+        select_defs[1] = Some(SelectDef {
+            cond: Operand::Value(Value(4)),
+            true_val: Operand::Const(IrConst::I64(0x7fff_ffff)),
+            false_val: Operand::Const(IrConst::I64(1)),
+            ty: IrType::U32,
+        });
+        let result = try_sign_range_joins(
+            &inst,
+            &cmp_defs,
+            &binop_defs,
+            &select_defs,
+            &phi_defs,
+            &is_boolean,
+        )
+        .unwrap();
+        assert_copy_value(&result, 1);
+
+        // Negative, out-of-width and sign-bit-set constants all refuse.
+        for bad in [
+            IrConst::I32(-1),
+            IrConst::I64(1 << 32),
+            IrConst::I64(0x8000_0000),
+        ] {
+            select_defs[1].as_mut().unwrap().false_val = Operand::Const(bad);
+            assert!(
+                try_sign_range_joins(
+                    &inst,
+                    &cmp_defs,
+                    &binop_defs,
+                    &select_defs,
+                    &phi_defs,
+                    &is_boolean,
+                )
+                .is_none(),
+                "bad join constant {bad:?} must keep the Cast"
+            );
+        }
+        select_defs[1] = None;
+
+        // The same rule for Phi incoming operands.
+        phi_defs[1] = Some(PhiDef {
+            incoming: vec![
+                Operand::Const(IrConst::I64(0x7fff_ffff)),
+                Operand::Const(IrConst::I64(1)),
+            ],
+            ty: IrType::U32,
+        });
+        let result = try_sign_range_joins(
+            &inst,
+            &cmp_defs,
+            &binop_defs,
+            &select_defs,
+            &phi_defs,
+            &is_boolean,
+        )
+        .unwrap();
+        assert_copy_value(&result, 1);
+        phi_defs[1].as_mut().unwrap().incoming[1] = Operand::Const(IrConst::I32(-1));
+        assert!(
+            try_sign_range_joins(
+                &inst,
+                &cmp_defs,
+                &binop_defs,
+                &select_defs,
+                &phi_defs,
+                &is_boolean,
+            )
+            .is_none()
+        );
+
+        // A TOP-LEVEL constant never enters the range proof: fold_const_cast
+        // must retype it.  I32(5) -> U32 is I64(5); U32 0x80000005 -> I32 is
+        // the signed I32(-2147483643), not an untyped I64 bit pattern.
+        let folded = try_sign_range_joins(
+            &sign_range_cast(Operand::Const(IrConst::I32(5)), IrType::I32, IrType::U32),
+            &cmp_defs,
+            &binop_defs,
+            &select_defs,
+            &phi_defs,
+            &is_boolean,
+        )
+        .expect("fold_const_cast owns top-level constants");
+        assert!(matches!(
+            folded,
+            Instruction::Copy {
+                src: Operand::Const(IrConst::I64(5)),
+                ..
+            }
+        ));
+        let folded = try_sign_range_joins(
+            &sign_range_cast(
+                Operand::Const(IrConst::I64(0x8000_0005)),
+                IrType::U32,
+                IrType::I32,
+            ),
+            &cmp_defs,
+            &binop_defs,
+            &select_defs,
+            &phi_defs,
+            &is_boolean,
+        )
+        .expect("fold_const_cast canonicalizes sign-bit-set constants");
+        assert!(matches!(
+            folded,
+            Instruction::Copy {
+                src: Operand::Const(IrConst::I32(v)),
+                ..
+            } if v == 0x8000_0005u32 as i32
+        ));
+    }
+
+    #[test]
+    fn cast_sign_range_fold_honors_the_bisection_kill_switch() {
+        if !crate::test_support::env_isolate(
+            "passes::simplify::tests::cast_sign_range_fold_honors_the_bisection_kill_switch",
+        ) {
+            return;
+        }
+        use crate::test_support::EnvGuard;
+        let _guard = EnvGuard::set("CCC_SIMPLIFY_SKIP", "cast_sign_range");
+        let mut binop_defs: Vec<Option<BinOpDef>> = vec![None; 4];
+        binop_defs[1] = and_def(IrConst::I64(1), IrType::U32);
+        let inst = sign_range_cast(Operand::Value(Value(1)), IrType::U32, IrType::I32);
+        assert!(try_sign_range(&inst, &[], &binop_defs, &[]).is_none());
     }
 
     #[test]
@@ -10216,6 +11117,8 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
+            &[],
         )
         .expect("the truncated negate of an extension must fold");
         assert!(
@@ -10260,6 +11163,8 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
+                &[],
             )
             .is_none(),
             "widening the negate must not fold to a narrow negate"
@@ -10295,6 +11200,8 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
+                &[],
             )
             .is_none(),
             "the 32 -> 16 shape must stay put"
@@ -10322,6 +11229,8 @@ mod tests {
                 &[],
                 &[],
                 &neg_defs,
+                &[],
+                &[],
                 &[],
                 &[],
                 &[],
@@ -10379,6 +11288,8 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
+            &[],
         )
         .expect("the truncated complement of an extension must fold");
         assert!(
@@ -10424,6 +11335,8 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
+                &[],
             )
             .is_none(),
             "a widening cast must keep the wide complement"
@@ -10459,6 +11372,8 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
+                &[],
             )
             .is_none(),
             "an extension from a different width must stay put"
@@ -10487,6 +11402,8 @@ mod tests {
             &direct_not,
             &[],
             &wide,
+            &[],
+            &[],
             &[],
             &[],
             &[],

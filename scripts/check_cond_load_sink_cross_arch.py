@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Four-ISA EXECUTION proof for the SV-03 conditional-load sinking pass.
+"""Four-ISA EXECUTION proof for the SV-03 conditional-load sinking pass,
+including narrow integer loads whose C promotion casts form a tail after
+the sunk load.
 
 WHY THIS EXISTS
 ---------------
@@ -37,6 +39,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+
+import sv03_toolchain_identity as identity
 
 ROOT = Path(__file__).resolve().parents[1]
 # Gate fixtures live in a SUBDIRECTORY: run_regression.py globs
@@ -100,8 +104,10 @@ _start:
 """,
 }
 
-# Independent oracle: x = A[2] = 33, y = B[2] = 77.
-ORACLE = (33 * 3 + 77 * 7) % 61
+# Independent oracle: x = A[2] = 33, y = B[2] = 77; the narrow I8/U16
+# promotion-tail shapes contribute -3, 7, 300 and 700.  The offset keeps
+# every intermediate addition non-negative, so C and Python `%` agree.
+ORACLE = (33 * 3 + 77 * 7 + (-3) * 11 + 7 * 17 + 300 * 13 + 700 * 19) % 61
 DIRECTIVE = re.compile(r"^\s*(?:[.#]|//|$)")
 
 
@@ -128,7 +134,7 @@ def run(cmd: list[str], *, env: dict[str, str] | None = None,
 
 
 def build_and_execute(target: dict, enabled: bool, work: Path,
-                      fastbuild: Path) -> dict:
+                      fastbuild: Path, clang: str) -> dict:
     tag = f"{target['isa']}_{'on' if enabled else 'off'}"
     asm, combined = work / f"{tag}.s", work / f"{tag}.combined.s"
     obj, exe = work / f"{tag}.o", work / f"{tag}.elf"
@@ -146,7 +152,7 @@ def build_and_execute(target: dict, enabled: bool, work: Path,
     asm_text = asm.read_text()
     combined.write_text(asm_text + "\n" + START_ASM[target["isa"]])
 
-    assembled = run([tool("clang-23"), f"--target={target['triple']}", "-c",
+    assembled = run([clang, f"--target={target['triple']}", "-c",
                      str(combined), "-o", str(obj)])
     if assembled.returncode != 0:
         raise RuntimeError(f"{tag}: assembler failed: {assembled.stderr.strip()[:400]}")
@@ -212,7 +218,8 @@ def self_test() -> int:
             print(f"self-test FAIL: '{name}' was not detected: {bad}")
             return 1
     print(f"PASS cond-load-sink cross-arch self-test "
-          f"({len(mutations)} synthetic mutations rejected, oracle={ORACLE})")
+          f"({len(mutations)} synthetic verdict mutations rejected, "
+          f"toolchain identity pinned, oracle={ORACLE})")
     return 0
 
 
@@ -221,24 +228,32 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--json", type=Path)
     ap.add_argument("--fastbuild", type=Path, default=ROOT / "target" / "fastbuild")
+    ap.add_argument("--clang", default=os.environ.get("CLANG23", os.environ.get("CLANG", "clang-23")))
     args = ap.parse_args(argv)
     if args.self_test:
         return self_test()
 
     results: list[dict] = []
     try:
+        toolchain = identity.require_version(
+            "clang23", args.clang, search_paths=(CACHE_BIN, QEMU_PREFIX)
+        )
         with tempfile.TemporaryDirectory(prefix="lccc-cond-load-cross-") as tmp:
             work = Path(tmp)
             for target in TARGETS:
                 for enabled in (True, False):
-                    results.append(build_and_execute(target, enabled, work, args.fastbuild))
+                    results.append(build_and_execute(
+                        target, enabled, work, args.fastbuild, toolchain["path"]
+                    ))
     except (RuntimeError, subprocess.TimeoutExpired) as exc:
         print(f"FAIL cond-load-sink cross-arch: {exc}", file=sys.stderr)
         return 1
     bad, table = evaluate(results)
     if args.json:
+        args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps({"oracle": ORACLE, "results": results,
-                                         "table": table, "problems": bad},
+                                         "table": table, "problems": bad,
+                                         "toolchain": toolchain},
                                         indent=2, sort_keys=True) + "\n")
     for r in sorted(results, key=lambda x: (x["isa"], not x["enabled"])):
         print(f"PASS {r['isa']:8} {'on ' if r['enabled'] else 'off'} "

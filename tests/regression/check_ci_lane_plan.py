@@ -217,6 +217,11 @@ VALGRIND_IDIOMS = ("which('valgrind')", 'which("valgrind")', "command -v valgrin
                    "check_hex_float_oracles", "check_signed_mask_oracles")
 # The hexadecimal oracle compares against Clang as well as GCC.
 CLANG_ALSO = ("check_hex_float_oracles", "check_signed_mask_oracles")
+# The four-ISA execution harnesses resolve a multi-target linker and qemu-user
+# by name; a lane that runs them must prove those probes, not just install the
+# packages (R9).  The idioms are the actual `tool(...)` calls, not comments.
+MOLD_IDIOMS = ('tool("mold")',)
+QEMU_IDIOMS = ('tool(target["qemu"])',)
 
 _closure_cache: dict[str, frozenset[str]] = {}
 
@@ -258,6 +263,10 @@ def _gate_tools(relative: str, seen: frozenset[str] = frozenset()) -> frozenset[
         tools.add("valgrind")
     if any(idiom in text for idiom in CLANG_ALSO):
         tools.add("clang")
+    if any(idiom in text for idiom in MOLD_IDIOMS):
+        tools.add("mold")
+    if any(idiom in text for idiom in QEMU_IDIOMS):
+        tools.add("qemu")
     if not tools:
         for match in GATE_CALL.finditer(text):
             tools |= set(_gate_tools(match.group(1), seen | {relative}))
@@ -279,7 +288,9 @@ DEFAULT_REQUIRE = {"gcc", "multilib", "valgrind", "pyyaml"}
 KNOWN_PROBES = DEFAULT_REQUIRE | {"mold", "lld", "qemu", "gdb"}
 # Gate tool -> the probe that proves it.  `clang` is not here on purpose: it is
 # proven by the --clang-version assertion (R1/R4), which is an exact release.
-PROBE_FOR_TOOL = {"valgrind": "valgrind", "gdb": "gdb"}
+PROBE_FOR_TOOL = {
+    "valgrind": "valgrind", "gdb": "gdb", "qemu": "qemu", "mold": "mold",
+}
 # Gates whose oracle is a live debugger, not a structural decoder.  The
 # parameter/delivery gates refuse to run without GDB unless the caller
 # explicitly asks for structural-only mode; a hosted lane must not take
@@ -289,6 +300,9 @@ GDB_GATE_SCRIPTS = frozenset({
     "tests/regression/check_dwarf_parameters.py",
     "tests/regression/check_dwarf_locals.py",
     "tests/regression/check_dwarf_inlining.py",
+    # SV-03 / cast-range best-tool evidence runs a live GDB PROT_NONE canary;
+    # a lane that runs it must prove the gdb probe, not merely install it.
+    "scripts/check_cond_load_sink_best_tools.py",
 })
 
 
@@ -786,13 +800,34 @@ def self_test() -> None:
         step("Run", "python3 tests/regression/check_dwarf_parameters.py --lccc out/lccc --allow-missing-gdb"),
     ]}}}
     assert not any("GDB-backed" in p for p in oracle_provisioning(gdb_structural))
+    # The SV-03 best-tool harness is a GDB gate too: the lane must prove gdb.
+    gdb_best_tools = {"jobs": {"debug": {"steps": [
+        step("Checkout"),
+        step("Provision", "bash scripts/ci_provision_toolchain.sh --multilib"),
+        step(VERIFY_STEP, "bash scripts/ci_verify_oracles.sh --require gcc,multilib,valgrind,pyyaml"),
+        step("Run", "python3 scripts/check_cond_load_sink_best_tools.py --lccc out/lccc"),
+    ]}}}
+    problems = oracle_provisioning(gdb_best_tools)
+    assert any("does not require the 'gdb' probe" in p for p in problems), problems
+
+    # R9 extension: a four-ISA harness without qemu/mold probes is a false
+    # green -- the runner may have the packages but no executables on PATH.
+    qemu_mold_bare = {"jobs": {"debug": {"steps": [
+        step("Checkout"),
+        step("Provision", "bash scripts/ci_provision_toolchain.sh --multilib"),
+        step(VERIFY_STEP, "bash scripts/ci_verify_oracles.sh --require gcc,multilib,valgrind,pyyaml"),
+        step("Run", "python3 scripts/check_same_width_cast_range.py --lccc out/lccc"),
+    ]}}}
+    problems = oracle_provisioning(qemu_mold_bare)
+    assert any("does not require the 'qemu' probe" in p for p in problems), problems
+    assert any("does not require the 'mold' probe" in p for p in problems), problems
 
     # R5: the package set is what every bundle is built from.
     assert provisioning_extras_problems('EXTRAS="qemu-user mold lld"') != []
     assert provisioning_extras_problems('EXTRAS="qemu-user valgrind libc6-dbg gdb"') == []
     assert provisioning_extras_problems("PACKAGES=qemu") != []
 
-    print("check_ci_lane_plan: self-test PASS (19 rules, 28 fixtures)")
+    print("check_ci_lane_plan: self-test PASS (19 rules, 30 fixtures)")
 
 
 def main(argv: list[str] | None = None) -> int:
