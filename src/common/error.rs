@@ -2356,6 +2356,10 @@ mod dialect_severity_redteam_tests {
             // `-Wpragmas` likewise: a malformed `#pragma message` warns with
             // no flag, `-Wno-pragmas` silences it (measured).
             "pragmas",
+            // `-Wdeprecated` is on by default in GCC 16.2: `#if #cpu(x86_64)`
+            // warns `assertions are a deprecated extension [-Wdeprecated]`
+            // with no flag at all, `-Wno-deprecated` silences it (measured).
+            "deprecated",
             "undeclared",
         ];
         expected_defaults.sort_unstable();

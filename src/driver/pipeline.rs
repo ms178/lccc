@@ -2472,15 +2472,25 @@ impl Driver {
         if self.freestanding {
             preprocessor.define_macro("__STDC_HOSTED__", "0");
         }
+        self.apply_command_line_macro_state(preprocessor);
+        self.configure_include_paths(preprocessor)
+    }
+
+    /// Apply the user's `-D` definitions and `-A` assertion specs, then the
+    /// mandatory `_FORTIFY_SOURCE` undefine.  Runs after target selection so
+    /// `-A-pred=ans` can cancel a predefined answer, and after the dialect
+    /// macros so an explicit `-D` still wins.
+    fn apply_command_line_macro_state(&self, preprocessor: &mut Preprocessor) {
         for def in &self.defines {
             preprocessor.define_macro(&def.name, &def.value);
         }
-        // GNU assertions after target selection so -A can cancel predefined
-        // answers. GCC reports a malformed spec against <command-line> and
-        // keeps compiling (witnessed: `-Afoo` prints the error, exit 0).
+        // GNU assertions: GCC reports a malformed spec against <command-line>
+        // and keeps compiling (witnessed: `-Afoo` prints the error, exit 0).
         for spec in &self.assertions {
             if let Err(message) = preprocessor.apply_cli_assertion(spec) {
-                eprintln!("<command-line>: error: {message}");
+                crate::common::cli_output::stderr_line(format_args!(
+                    "<command-line>: error: {message}"
+                ));
             }
         }
         // Disable _FORTIFY_SOURCE: glibc's fortification headers define extern
@@ -2491,7 +2501,6 @@ impl Driver {
         // (infinite recursion or wrong control flow). Undefining _FORTIFY_SOURCE
         // prevents these wrappers from being emitted.
         preprocessor.undefine_macro("_FORTIFY_SOURCE");
-        self.configure_include_paths(preprocessor)
     }
 
     /// Install explicit search paths and report invocation-level path errors.
