@@ -9362,19 +9362,52 @@ mod feature_switch_tests {
         module
     }
 
-    /// The structural inlining limit is a SHAPE test, not a size test, and it
-    /// must never be able to break a mandatory inline.
+    /// `per_block` copies in each of `blocks` blocks, terminated by a return.
     ///
-    /// * A macro-collapsed wrapper (more blocks than instructions — the
-    ///   kernel's `__CHECK_OBJECT_SIZE` family, 78 blocks over 49
-    ///   instructions) is refused: cloning it adds IR structure and no code,
-    ///   which is what OOM-killed `init/do_mounts.c`.
-    /// * A dense body of the same block count is NOT refused: the ratio, not
-    ///   the count, is the signal.
-    /// * A gnu_inline definition is NEVER refused, whatever its shape: it has
-    ///   no out-of-line copy, so a refused site is an undefined symbol at link
-    ///   time. This is the invariant that makes the limit safe to apply at
-    ///   every admission point.
+    /// The linkage shape is a parameter because it changes which size gates
+    /// apply BEFORE the structural limit is consulted: a plain `static` body is
+    /// bounded by the small/medium windows, a `static inline` body by the
+    /// relaxed ones, and an `always_inline` body not at all (only the 4096-block
+    /// sanity guard). Use `always_inline` when the block count itself is the
+    /// variable, so the measurement cannot be confounded by a size window.
+    fn fixture(
+        name: &str,
+        blocks: usize,
+        per_block: usize,
+        is_inline: bool,
+        is_always_inline: bool,
+    ) -> IrFunction {
+        let mut f = IrFunction::new(name.to_string(), IrType::Void, vec![], false);
+        f.is_static = true;
+        f.is_inline = is_inline;
+        f.is_always_inline = is_always_inline;
+        f.next_value_id = 2;
+        for label in 0..blocks as u32 {
+            let instructions = (0..per_block)
+                .map(|_| Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I32(0)),
+                })
+                .collect();
+            f.blocks.push(BasicBlock {
+                label: BlockId(label),
+                instructions,
+                terminator: Terminator::Return(None),
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            });
+        }
+        f
+    }
+
+    fn body(name: &str, blocks: usize, per_block: usize) -> IrFunction {
+        fixture(name, blocks, per_block, false, false)
+    }
+
+    fn always_body(name: &str, blocks: usize, per_block: usize) -> IrFunction {
+        fixture(name, blocks, per_block, false, true)
+    }
+
     /// The structural inlining limit is a SHAPE test, not a size test, and it
     /// must never be able to break a mandatory inline.
     ///
@@ -9395,58 +9428,59 @@ mod feature_switch_tests {
         let callee = |f: &IrFunction| {
             callee_data_for(f, &module, &ctx).expect("fixture must be an admissible callee shape")
         };
-        let body = |name: &str, blocks: usize, per_block: usize| -> IrFunction {
-            let mut f = IrFunction::new(name.to_string(), IrType::Void, vec![], false);
-            f.is_static = true;
-            f.next_value_id = 2;
-            for label in 0..blocks as u32 {
-                let instructions = (0..per_block)
-                    .map(|_| Instruction::Copy {
-                        dest: Value(1),
-                        src: Operand::Const(IrConst::I32(0)),
-                    })
-                    .collect();
-                f.blocks.push(BasicBlock {
-                    label: BlockId(label),
-                    instructions,
-                    terminator: Terminator::Return(None),
-                    source_spans: Vec::new(),
-                    source_inline_ids: Vec::new(),
-                });
-            }
-            f
-        };
 
-        // `sized_strscpy`'s measured shape: 78 blocks over 49 instructions.
-        let collapsed = body("collapsed", 78, 0);
+        // `sized_strscpy`'s measured shape, scaled down to the size window so
+        // that the density limb is the only thing that can refuse it.
+        let collapsed = callee(&body("collapsed", 8, 0));
         assert!(
-            should_skip_complex_callee(&callee(&collapsed)),
-            "a wrapper with more blocks than instructions must be refused"
+            !collapsed.exceeds_normal_limits,
+            "fixture is broken: the density limb must not ride on a size gate"
+        );
+        assert!(
+            should_skip_complex_callee(&collapsed),
+            "a body with more blocks than instructions must be refused"
         );
 
-        // The same block count with one instruction in every block is an
-        // ordinary body and must be admitted.
-        let dense = body("dense", 78, 1);
+        // The control: identical block count, one instruction per block.
+        let dense = callee(&body("dense", 8, 8));
         assert!(
-            !should_skip_complex_callee(&callee(&dense)),
+            !dense.exceeds_normal_limits,
+            "control must be admissible for the comparison to mean anything"
+        );
+        assert!(
+            !should_skip_complex_callee(&dense),
             "a dense body is not a macro-collapsed wrapper"
         );
 
-        // The absolute ceiling still bounds a dense but enormous body.
-        let huge = body("huge", MAX_STRUCTURAL_INLINE_BLOCKS + 1, 1);
+        // The absolute ceiling, on a body that is otherwise admissible and
+        // dense. `always_inline` is the only shape whose admission is not
+        // gated by a block-count window (it has the 4096-block sanity guard
+        // instead), so the block count is genuinely the only variable here.
+        let at_limit = callee(&always_body("at_limit", MAX_STRUCTURAL_INLINE_BLOCKS, 1));
         assert!(
-            should_skip_complex_callee(&callee(&huge)),
+            !should_skip_complex_callee(&at_limit),
+            "the ceiling is a strict upper bound"
+        );
+        let over = callee(&always_body("over", MAX_STRUCTURAL_INLINE_BLOCKS + 1, 1));
+        assert!(
+            should_skip_complex_callee(&over),
             "the absolute block ceiling must still bind"
         );
 
-        // SOUNDNESS: that same huge, instruction-free shape is refused above,
-        // but as a gnu_inline definition it must be admitted — there is no
-        // out-of-line body, so refusing it leaves an undefined symbol.
-        let mut data = callee(&huge);
-        data.is_gnu_inline_def = true;
+        // SOUNDNESS: neither limb may refuse a body that has no out-of-line
+        // copy. A gnu_inline definition is mandatory at every call site, so
+        // skipping it leaves an undefined symbol at link time.
+        let mut gnu_over = over.clone();
+        gnu_over.is_gnu_inline_def = true;
         assert!(
-            !should_skip_complex_callee(&data),
-            "a mandatory inline must never be refused: no out-of-line copy exists"
+            !should_skip_complex_callee(&gnu_over),
+            "the ceiling must never refuse a mandatory inline"
+        );
+        let mut gnu_collapsed = collapsed.clone();
+        gnu_collapsed.is_gnu_inline_def = true;
+        assert!(
+            !should_skip_complex_callee(&gnu_collapsed),
+            "the density limb must never refuse a mandatory inline"
         );
     }
 
