@@ -14686,22 +14686,47 @@ mod vec_store_source_identity_tests {
     fn a_memory_store_keeps_allocator_claims() {
         let mut cg = fresh();
         cg.state.vec_claim_live_reg(7, "ymm7");
-        cg.state.pending_vec_store = Some((FRESH, "ymm0", true));
         cg.state.invalidate_vec_scratch_peephole();
         assert_eq!(
             cg.state.vec_live_ymm(7),
             Some("ymm7"),
             "a memory store writes no allocator bank: the claim must survive"
         );
-        assert!(
-            cg.state.pending_vec_store.is_none(),
-            "the pending store is committed or consumed by the store path"
-        );
-        // The contrast: the WIDE invalidation drops it, which is why the two
-        // are not interchangeable.
-        cg.state.vec_claim_live_reg(7, "ymm7");
+        // The contrast, so the two scopes cannot be silently interchanged: the
+        // WIDE invalidation drops the claim.
         cg.state.invalidate_vec_peephole();
-        assert_eq!(cg.state.vec_live_ymm(7), None);
+        assert_eq!(
+            cg.state.vec_live_ymm(7),
+            None,
+            "the wide invalidation must drop allocator claims, or it is not wide"
+        );
+    }
+
+    /// The scratch invalidation must NOT drop a pending deferred store.
+    ///
+    /// A `pending_vec_store` is a value whose slot has not been written yet:
+    /// retiring the record without emitting the store would lose the value
+    /// entirely (the slot stays stale and the flush never happens). It is
+    /// retired only by `vec_consume` (a consumer took it from the register) or
+    /// by the flush itself, so the scratch scope must leave it alone.
+    #[test]
+    fn the_scratch_scope_never_drops_a_deferred_store() {
+        let mut cg = fresh();
+        cg.state.pending_vec_store = Some((FRESH, "ymm0", true));
+        cg.state.invalidate_vec_scratch_peephole();
+        assert_eq!(
+            cg.state.pending_vec_store,
+            Some((FRESH, "ymm0", true)),
+            "dropping the record would strand the value: its slot is unwritten"
+        );
+        // Only an explicit consume retires it, and only for ITS value.
+        cg.state.vec_consume(FRESH + 1);
+        assert!(
+            cg.state.pending_vec_store.is_some(),
+            "a consume must be value-exact"
+        );
+        cg.state.vec_consume(FRESH);
+        assert!(cg.state.pending_vec_store.is_none());
     }
 
     /// The reserved scratch pair is never claimable: a claim there would
