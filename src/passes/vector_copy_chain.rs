@@ -146,6 +146,35 @@ fn homes(func: &IrFunction) -> FxHashMap<u32, usize> {
     out
 }
 
+/// `(block, instruction index)` of every non-volatile Alloca definition.
+///
+/// The collapse below rewrites a load's `dest_ptr` to `final_home`, which
+/// MOVES a use of that home two instructions earlier. SSA requires the
+/// home's definition to dominate the rewritten use. Allocas are usually
+/// hoisted to the entry block, but a function whose allocas sit interleaved
+/// with their first use (a shape the vector home passes can leave behind
+/// after retiring neighbours) can place `final_home`'s Alloca between the
+/// load and the store. Rewiring then produced
+/// "v8 does not dominate its use" and aborted the compile, so the site is
+/// checked explicitly rather than assumed.
+fn home_def_sites(func: &IrFunction) -> FxHashMap<u32, (usize, usize)> {
+    let mut out = FxHashMap::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Instruction::Alloca {
+                dest,
+                volatile: false,
+                semantic_volatile: false,
+                ..
+            } = inst
+            {
+                out.insert(dest.0, (bi, ii));
+            }
+        }
+    }
+    out
+}
+
 #[inline]
 fn zero_const(op: &Operand) -> bool {
     matches!(op, Operand::Const(IrConst::I64(0)))
@@ -173,6 +202,7 @@ fn collapse_in_function(func: &mut IrFunction) -> usize {
     if homes.is_empty() {
         return 0;
     }
+    let def_sites = home_def_sites(func);
     let counts = mention_counts(func);
     let mut plans: Vec<Vec<Plan>> = (0..func.blocks.len()).map(|_| Vec::new()).collect();
     let mut claimed: FxHashSet<u32> = FxHashSet::default();
@@ -264,6 +294,15 @@ fn collapse_in_function(func: &mut IrFunction) -> usize {
             // counts, but the guard makes that invariant explicit).
             if claimed.contains(&scratch.0) || claimed.contains(&final_home.0) {
                 // refuse: a home is already claimed by another plan
+                continue;
+            }
+            // Dominance: the rewrite moves `final_home`'s use from i+2 up to
+            // i, so the Alloca defining it must strictly precede i in this
+            // same block. Anything else (a later Alloca, or one in another
+            // block whose dominance this pass does not prove) is refused --
+            // a missed collapse costs a copy, a bad one costs a compile.
+            if !matches!(def_sites.get(&final_home.0), Some(&(hb, hi)) if hb == bi && hi < i) {
+                // refuse: final home's Alloca does not dominate the load site
                 continue;
             }
             claimed.insert(scratch.0);
