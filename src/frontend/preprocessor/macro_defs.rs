@@ -685,7 +685,7 @@ impl MacroTable {
         // following tokens normally; their resolver absorbs one *expanded*
         // token (`__has_feature M(1)` with `#define M foo bar` -> `0 bar(1)`).
         if Self::query_missing_paren_raw(ident) && j < len {
-            let end = j + pp_token_len(bytes, j);
+            let end = j + pp_token_len(bytes, j, true);
             result.push_str(ident);
             result.push_str(&text[i..end]);
             return Some(end);
@@ -1080,7 +1080,7 @@ impl MacroTable {
                         continue;
                     }
                     if Self::query_missing_paren_raw(trail_ident) && k < len {
-                        let end = k + pp_token_len(bytes, k);
+                        let end = k + pp_token_len(bytes, k, true);
                         expanded.push_str(bytes_to_str(bytes, i, end));
                         i = end;
                         // The absorbed token belongs to the failed query, not
@@ -1169,7 +1169,7 @@ impl MacroTable {
                 return Some((out, end));
             }
             if Self::query_missing_paren_raw(expanded_trimmed) && j < len {
-                let end = j + pp_token_len(bytes, j);
+                let end = j + pp_token_len(bytes, j, true);
                 let mut out = expanded.to_string();
                 out.push_str(bytes_to_str(bytes, i, end));
                 return Some((out, end));

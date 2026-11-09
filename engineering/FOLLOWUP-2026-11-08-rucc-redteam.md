@@ -367,7 +367,7 @@ by object-like aliases and argument prescan. `__building_module(M)` with
 missing-`(` recovery follows the measured compiler persona instead of leaving
 stray tokens (see the next section).
 The lifetime gate now compiles the real Clang `stddef.h` through all four
-target drivers and pins the raw-operand macro contexts (244 checks with the
+target drivers and pins the raw-operand macro contexts (367 checks with the
 oracle present), and the fuzz corpus covers the tenth operator (1088 cases/seed
 at count 800).
 
@@ -422,7 +422,16 @@ maximal-munch `pp_token_len` helpers (including prefixed literals, digraphs,
 `%:%:`, and C23 digit separators), uses them in every missing-`(` resolver and
 in the balanced-argument scanners, and keeps the GCC/Clang persona split in all
 three macro-expansion paths. Five Rust units pin the tokenizer/recovery
-contracts; the lifetime gate grew from 227 to **244 checks** with direct
+contracts; the lifetime gate grew from 227 to **367 checks** with direct
 GCC/Clang parity cases. Fastbuild is warning-free; the frontend gate, 3264
-seeded fuzz cases, Clippy `-D warnings`, rustfmt, and **125 preprocessor units**
+seeded fuzz cases, Clippy `-D warnings`, rustfmt, and **131 preprocessor units**
 are green.
+
+The last-20-merged-PR red-team pass
+([`AUDIT-2026-11-08-last20-merged-prs.md`](AUDIT-2026-11-08-last20-merged-prs.md))
+then found and fixed the next layer: compiler-owned query operands now pend
+across newlines/blank lines/comments, every resolver skip is trivia-aware,
+`::` recovery boundaries carry the compiler persona explicitly, C23 digit
+separators cannot hide a trailing query candidate, and token-length scanning
+dispatches by first byte with bounded UTF-8 validation instead of a linear
+prefix table plus whole-tail validation.

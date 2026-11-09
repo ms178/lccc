@@ -9,8 +9,8 @@
 
 use super::pipeline::Preprocessor;
 use super::utils::{
-    bytes_to_str, is_digit_separator, is_ident_cont_byte, is_ident_start_byte, pp_token_len,
-    push_char_at, skip_blanks_and_comments, skip_literal_bytes,
+    bytes_to_str, c23_dialect, is_digit_separator, is_ident_cont_byte, is_ident_start_byte,
+    pp_token_len, push_char_at, skip_blanks_and_comments, skip_literal_bytes,
 };
 
 impl Preprocessor {
@@ -186,18 +186,14 @@ impl Preprocessor {
             };
         }
         let len = bytes.len();
-        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
-            *i += 1;
-        }
+        *i = skip_blanks_and_comments(bytes, *i);
         if *i >= len || bytes[*i] != b'(' {
             diag!("missing '(' after '__has_warning'".to_string());
-            Self::absorb_missing_paren_token(bytes, i);
+            Self::absorb_missing_paren_token(bytes, i, true);
             return "0".to_string();
         }
         *i += 1;
-        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
-            *i += 1;
-        }
+        *i = skip_blanks_and_comments(bytes, *i);
         if *i < len && bytes[*i] == b')' {
             *i += 1;
             diag!("too few arguments to function call, expected 1, have 0".to_string());
@@ -242,9 +238,7 @@ impl Preprocessor {
                 terminated = false;
                 break;
             }
-            while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
-                *i += 1;
-            }
+            *i = skip_blanks_and_comments(bytes, *i);
         }
         if !terminated {
             diag!("unterminated string literal in '__has_warning'".to_string());
@@ -396,18 +390,14 @@ impl Preprocessor {
         diag_line: usize,
     ) -> &'static str {
         let len = bytes.len();
-        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
-            *i += 1;
-        }
+        *i = skip_blanks_and_comments(bytes, *i);
         if *i >= len || bytes[*i] != b'(' {
             self.query_diag("missing '(' after '__has_builtin'".to_string(), diag_line);
-            Self::absorb_missing_paren_token(bytes, i);
+            Self::absorb_missing_paren_token(bytes, i, c23_dialect());
             return "0";
         }
         *i += 1;
-        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
-            *i += 1;
-        }
+        *i = skip_blanks_and_comments(bytes, *i);
         if *i >= len || !is_ident_start_byte(bytes[*i]) {
             self.skip_open_paren_arg_bytes(bytes, i);
             self.query_diag(
@@ -428,9 +418,7 @@ impl Preprocessor {
             Ok(name) => name.as_ref(),
             Err(text) => text.split_whitespace().next().unwrap_or(raw),
         };
-        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
-            *i += 1;
-        }
+        *i = skip_blanks_and_comments(bytes, *i);
         if *i >= len || bytes[*i] != b')' {
             self.skip_open_paren_arg_bytes(bytes, i);
             self.query_diag(format!("expected ')' after '{first}'"), diag_line);
@@ -485,18 +473,14 @@ impl Preprocessor {
             "__has_feature"
         };
         let len = bytes.len();
-        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
-            *i += 1;
-        }
+        *i = skip_blanks_and_comments(bytes, *i);
         if *i >= len || bytes[*i] != b'(' {
             self.query_diag(format!("missing '(' after '{op}'"), diag_line);
-            Self::absorb_missing_paren_token(bytes, i);
+            Self::absorb_missing_paren_token(bytes, i, c23_dialect());
             return "0";
         }
         *i += 1;
-        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
-            *i += 1;
-        }
+        *i = skip_blanks_and_comments(bytes, *i);
         let start = *i;
         if *i >= len || !is_ident_start_byte(bytes[*i]) {
             self.skip_open_paren_arg_bytes(bytes, i);
@@ -507,9 +491,7 @@ impl Preprocessor {
             *i += 1;
         }
         let raw = bytes_to_str(bytes, start, *i);
-        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
-            *i += 1;
-        }
+        *i = skip_blanks_and_comments(bytes, *i);
         if *i >= len || bytes[*i] != b')' {
             self.skip_open_paren_arg_bytes(bytes, i);
             self.query_diag(format!("expected ')' after '{raw}'"), diag_line);
@@ -555,18 +537,14 @@ impl Preprocessor {
     ) -> &'static str {
         let op = "__building_module";
         let len = bytes.len();
-        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
-            *i += 1;
-        }
+        *i = skip_blanks_and_comments(bytes, *i);
         if *i >= len || bytes[*i] != b'(' {
             self.query_diag(format!("missing '(' after '{op}'"), diag_line);
-            Self::absorb_missing_paren_token(bytes, i);
+            Self::absorb_missing_paren_token(bytes, i, true);
             return "0";
         }
         *i += 1;
-        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
-            *i += 1;
-        }
+        *i = skip_blanks_and_comments(bytes, *i);
         if *i < len && bytes[*i] == b')' {
             *i += 1;
             self.query_diag(
@@ -596,9 +574,7 @@ impl Preprocessor {
             *i += 1;
         }
         let raw = bytes_to_str(bytes, start, *i);
-        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
-            *i += 1;
-        }
+        *i = skip_blanks_and_comments(bytes, *i);
         if *i >= len {
             // Clang's wording when the invocation never closes (measured on
             // 23.1.5 in `#if`); recovery is already at end of line.
@@ -630,10 +606,10 @@ impl Preprocessor {
     /// literal, pp-number, or maximal-munch punctuator).  Comments are trivia.
     /// The token is already macro-expanded for GCC-persona queries and raw for
     /// Clang-persona queries; this resolver only consumes the resulting token.
-    fn absorb_missing_paren_token(bytes: &[u8], i: &mut usize) {
+    fn absorb_missing_paren_token(bytes: &[u8], i: &mut usize, scoped_colon: bool) {
         let j = skip_blanks_and_comments(bytes, *i);
         *i = if j < bytes.len() {
-            j + pp_token_len(bytes, j)
+            j + pp_token_len(bytes, j, scoped_colon)
         } else {
             j
         };
@@ -702,9 +678,7 @@ impl Preprocessor {
     ) -> &'static str {
         let len = bytes.len();
         let skip_blanks = |i: &mut usize| {
-            while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
-                *i += 1;
-            }
+            *i = skip_blanks_and_comments(bytes, *i);
         };
         let ident = |i: &mut usize| {
             let start = *i;
@@ -716,7 +690,7 @@ impl Preprocessor {
         skip_blanks(i);
         if *i >= len || bytes[*i] != b'(' {
             self.query_diag("missing '(' after '__has_attribute'".to_string(), diag_line);
-            Self::absorb_missing_paren_token(bytes, i);
+            Self::absorb_missing_paren_token(bytes, i, c23_dialect());
             return "0";
         }
         *i += 1;
@@ -803,18 +777,14 @@ impl Preprocessor {
         };
         let len = bytes.len();
         // Skip whitespace
-        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
-            *i += 1;
-        }
+        *i = skip_blanks_and_comments(bytes, *i);
         if *i >= len || bytes[*i] != b'(' {
             self.query_diag(format!("missing '(' before '{op}' operand"), diag_line);
             return "0";
         }
         *i += 1; // skip '('
         // Skip whitespace
-        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
-            *i += 1;
-        }
+        *i = skip_blanks_and_comments(bytes, *i);
 
         // Determine if system include (<...>) or quoted ("...")
         let (header_name, is_system) = if *i < len && bytes[*i] == b'<' {
@@ -883,9 +853,7 @@ impl Preprocessor {
         diag_line: usize,
     ) -> String {
         let len = bytes.len();
-        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
-            *i += 1;
-        }
+        *i = skip_blanks_and_comments(bytes, *i);
         if *i >= len || bytes[*i] != b'(' {
             // Malformed operand; the #if evaluator treats it as absent.
             return "0".to_string();

@@ -296,6 +296,7 @@ pub(super) fn is_digit_separator(bytes: &[u8], i: usize) -> bool {
 /// Skip ASCII whitespace and C comments, returning the offset of the next
 /// preprocessing token (or `bytes.len()`).  Bounded and progress-making: an
 /// unterminated comment consumes to EOL exactly like the resolver's recovery.
+#[inline]
 pub(super) fn skip_blanks_and_comments(bytes: &[u8], mut i: usize) -> usize {
     let len = bytes.len();
     while i < len {
@@ -324,22 +325,32 @@ pub(super) fn skip_blanks_and_comments(bytes: &[u8], mut i: usize) -> usize {
 /// escape-aware literals, C23 pp-numbers, and prefixed string/char literals.
 /// Returns 0 at EOL.  Non-ASCII unknown bytes consume one whole UTF-8 scalar
 /// so callers never slice through a code point.
-pub(super) fn pp_token_len(bytes: &[u8], i: usize) -> usize {
+///
+/// `scoped_colon` selects the `::` token: C23 and Clang's extension lex it as
+/// one punctuator, while GCC's pre-C23 C lexer sees two `:` tokens.  The query
+/// resolvers pass the persona/dialect fact explicitly instead of letting a
+/// malformed operand's token boundary depend on the operator's spelling.
+pub(super) fn pp_token_len(bytes: &[u8], i: usize, scoped_colon: bool) -> usize {
     let len = bytes.len();
     if i >= len {
         return 0;
     }
     let rest = &bytes[i..];
+    let b = rest[0];
     // Prefixed literals are one token (`u8"x"`, `L'c'`), not identifier+literal.
-    for prefix in [&b"u8"[..], &b"L"[..], &b"u"[..], &b"U"[..]] {
-        if rest.starts_with(prefix) {
-            let q = i + prefix.len();
-            if q < len && (bytes[q] == b'"' || bytes[q] == b'\'') {
-                return skip_literal_bytes(bytes, q, bytes[q]).min(len) - i;
-            }
+    // Dispatch on the first byte so the ordinary identifier path does not run
+    // four `starts_with` probes.
+    let prefix_len = match b {
+        b'u' if rest.starts_with(b"u8") => 2,
+        b'L' | b'u' | b'U' => 1,
+        _ => 0,
+    };
+    if prefix_len != 0 {
+        let q = i + prefix_len;
+        if q < len && (bytes[q] == b'"' || bytes[q] == b'\'') {
+            return skip_literal_bytes(bytes, q, bytes[q]) - i;
         }
     }
-    let b = bytes[i];
     if is_ident_start_byte(b) {
         let mut j = i + 1;
         while j < len && is_ident_cont_byte(bytes[j]) {
@@ -351,26 +362,69 @@ pub(super) fn pp_token_len(bytes: &[u8], i: usize) -> usize {
         return ppnumber_end(bytes, i) - i;
     }
     if b == b'"' || (b == b'\'' && !is_digit_separator(bytes, i)) {
-        return skip_literal_bytes(bytes, i, b).min(len) - i;
+        return skip_literal_bytes(bytes, i, b) - i;
     }
-    const PUNCTUATORS: &[&[u8]] = &[
-        b"%:%:", b"...", b"<<=", b">>=", b"->", b"++", b"--", b"<<", b">>", b"<=", b">=", b"==",
-        b"!=", b"&&", b"||", b"+=", b"-=", b"*=", b"/=", b"%=", b"&=", b"^=", b"|=", b"##", b"::",
-        b"<:", b":>", b"<%", b"%>", b"%:",
-    ];
-    for p in PUNCTUATORS {
-        if rest.starts_with(p) {
-            return p.len();
+    // First-byte dispatch replaces a 29-entry longest-prefix table.  The
+    // shared digraph helpers keep `<%:`, `%:%:` and `##` maximal munch in one
+    // place; every arm below is O(1) in the length of the remaining input.
+    match b {
+        b'<' => {
+            let n = less_punctuator_len(rest);
+            if n != 0 { n } else { 1 }
         }
-    }
-    if b < 0x80 {
-        1
-    } else {
-        std::str::from_utf8(rest)
-            .ok()
-            .and_then(|s| s.chars().next())
-            .map(|c| c.len_utf8())
-            .unwrap_or(1)
+        b'%' => {
+            let n = paste_token_len(rest);
+            if n != 0 {
+                n
+            } else if matches!(rest.get(1), Some(b':' | b'>' | b'=')) {
+                2
+            } else {
+                1
+            }
+        }
+        b'#' => {
+            if paste_token_len(rest) != 0 {
+                2
+            } else {
+                1
+            }
+        }
+        b'.' if rest.starts_with(b"...") => 3,
+        b':' => match rest.get(1) {
+            Some(b':') if scoped_colon => 2,
+            Some(b'>') => 2,
+            _ => 1,
+        },
+        b'>' => match rest {
+            [b'>', b'>', b'=', ..] => 3,
+            [b'>', b'>' | b'=', ..] => 2,
+            _ => 1,
+        },
+        b'-' if matches!(rest.get(1), Some(b'>' | b'-' | b'=')) => 2,
+        b'+' if matches!(rest.get(1), Some(b'+' | b'=')) => 2,
+        b'=' | b'!' if matches!(rest.get(1), Some(b'=')) => 2,
+        b'&' if matches!(rest.get(1), Some(b'&' | b'=')) => 2,
+        b'|' if matches!(rest.get(1), Some(b'|' | b'=')) => 2,
+        b'*' | b'/' | b'^' if matches!(rest.get(1), Some(b'=')) => 2,
+        _ if b < 0x80 => 1,
+        _ => {
+            // Validate at most four bytes, never the whole remaining line.
+            // The previous `from_utf8(rest)` made a run of unknown non-ASCII
+            // tokens quadratic; this keeps each token O(1) and still refuses
+            // to slice through a valid scalar or accept an invalid sequence.
+            let width = match b {
+                0xc2..=0xdf => 2,
+                0xe0..=0xef => 3,
+                0xf0..=0xf4 => 4,
+                _ => 1,
+            }
+            .min(rest.len());
+            if std::str::from_utf8(&rest[..width]).is_ok() {
+                width
+            } else {
+                1
+            }
+        }
     }
 }
 
@@ -398,6 +452,22 @@ mod digraph_token_tests {
     }
 }
 
+/// Test-only dialect switch with panic-safe restore.  Rust's default harness
+/// gives each test a thread, but a custom harness may run several on one
+/// thread; leaking C23 state would make tokenization tests order-dependent.
+#[cfg(test)]
+pub(super) fn with_c23<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_c23_dialect(self.0);
+        }
+    }
+    let _guard = Restore(c23_dialect());
+    set_c23_dialect(on);
+    f()
+}
+
 #[cfg(test)]
 mod pp_token_tests {
     use super::*;
@@ -409,6 +479,20 @@ mod pp_token_tests {
         assert_eq!(skip_blanks_and_comments(b"/* unterminated", 0), 15);
         assert_eq!(skip_blanks_and_comments(b"x", 0), 0);
         assert_eq!(skip_blanks_and_comments(b"", 0), 0);
+
+        // Every suffix offset is bounded, idempotent, and either lands on a
+        // non-trivia byte or at EOL.  This pins the manual index arithmetic
+        // without relying on one hand-picked comment shape.
+        let s = b" \t/* ) \" */ x // c\n y /* open";
+        for i in 0..=s.len() {
+            let j = skip_blanks_and_comments(s, i);
+            assert!((i..=s.len()).contains(&j), "offset {i} -> {j}");
+            assert_eq!(skip_blanks_and_comments(s, j), j);
+            if j < s.len() {
+                assert!(!s[j].is_ascii_whitespace());
+                assert!(!(s[j] == b'/' && matches!(s.get(j + 1), Some(b'*' | b'/'))));
+            }
+        }
     }
 
     #[test]
@@ -422,40 +506,123 @@ mod pp_token_tests {
             (b"'\\''x", 4),
             (b"u8\"x\"y", 5),
             (b"L'c'z", 4),
-            (b"::x", 2),
+            (b"u'c'z", 4),
+            (b"U'c'z", 4),
             (b"->x", 2),
             (b"...x", 3),
             (b"<<=x", 3),
+            (b">>=x", 3),
             (b"%:%:x", 4),
+            (b"##x", 2),
+            (b"<%:x", 2),
+            (b":>x", 2),
             (b"+x", 1),
             (b"", 0),
         ] {
-            assert_eq!(pp_token_len(input, 0), want, "{input:?}");
+            assert_eq!(pp_token_len(input, 0, true), want, "{input:?}");
         }
         // A non-ASCII unknown token consumes one scalar, never half a code point.
-        assert_eq!(pp_token_len("éx".as_bytes(), 0), 2);
+        assert_eq!(pp_token_len("éx".as_bytes(), 0, true), 2);
+        assert_eq!(pp_token_len("€x".as_bytes(), 0, true), 3);
+        assert_eq!(pp_token_len("𐀀x".as_bytes(), 0, true), 4);
+    }
+
+    #[test]
+    fn punctuator_dispatch_covers_every_c_token_and_near_miss() {
+        // Expected lengths are independent of the implementation's dispatch
+        // table: all C punctuators, digraphs, and the prefixes most likely to
+        // be mis-munched.  `::` is tested under both lexer contracts.
+        for (input, scoped, want) in [
+            (&b"..."[..], true, 3),
+            (b"..", true, 1),
+            (b"<<=", true, 3),
+            (b">>=", true, 3),
+            (b"->", true, 2),
+            (b"++", true, 2),
+            (b"--", true, 2),
+            (b"<<", true, 2),
+            (b">>", true, 2),
+            (b"<=", true, 2),
+            (b">=", true, 2),
+            (b"==", true, 2),
+            (b"!=", true, 2),
+            (b"&&", true, 2),
+            (b"||", true, 2),
+            (b"+=", true, 2),
+            (b"-=", true, 2),
+            (b"*=", true, 2),
+            (b"/=", true, 2),
+            (b"%=", true, 2),
+            (b"&=", true, 2),
+            (b"^=", true, 2),
+            (b"|=", true, 2),
+            (b"##", true, 2),
+            (b"%:%:", true, 4),
+            (b"%:", true, 2),
+            (b"%>", true, 2),
+            (b"<:", true, 2),
+            (b":>", true, 2),
+            (b"<%", true, 2),
+            (b"::", true, 2),
+            (b"::", false, 1),
+            (b":::", true, 2),
+            (b":::", false, 1),
+            (b":", true, 1),
+            (b";", true, 1),
+            (b"=", true, 1),
+            (b"!", true, 1),
+            (b"&", true, 1),
+            (b"|", true, 1),
+            (b"^", true, 1),
+            (b"?", true, 1),
+            (b"@", true, 1),
+            (b"\\", true, 1),
+        ] {
+            assert_eq!(
+                pp_token_len(input, 0, scoped),
+                want,
+                "{input:?} scoped={scoped}"
+            );
+        }
     }
 
     #[test]
     fn c23_digit_separators_stay_inside_the_pp_number() {
-        set_c23_dialect(true);
-        assert_eq!(pp_token_len(b"1'000+2", 0), 5);
-        assert_eq!(pp_token_len(b"0x1p-3'0f)", 0), 9);
-        set_c23_dialect(false);
-        assert_eq!(pp_token_len(b"1'000+2", 0), 1);
+        with_c23(true, || {
+            assert_eq!(pp_token_len(b"1'000+2", 0, true), 5);
+            assert_eq!(pp_token_len(b"0x1p-3'0f)", 0, true), 9);
+        });
+        with_c23(false, || {
+            assert_eq!(pp_token_len(b"1'000+2", 0, true), 1);
+        });
+    }
+
+    #[test]
+    fn token_lengths_are_positive_bounded_and_respect_utf8_boundaries() {
+        let s = "a$9 .5 u8\"é\" 'x' :: >>= %:%: € 𐀀 \\";
+        let bytes = s.as_bytes();
+        for i in 0..bytes.len() {
+            if !s.is_char_boundary(i) {
+                continue;
+            }
+            let j = skip_blanks_and_comments(bytes, i);
+            if j == bytes.len() {
+                assert_eq!(pp_token_len(bytes, j, true), 0);
+                continue;
+            }
+            let n = pp_token_len(bytes, j, true);
+            assert!(n > 0 && j + n <= bytes.len(), "offset {j} length {n}");
+            assert!(
+                s.is_char_boundary(j + n),
+                "offset {j} length {n} split a scalar"
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod digit_separator_tests {
     use super::*;
-
-    fn with_c23<R>(on: bool, f: impl FnOnce() -> R) -> R {
-        set_c23_dialect(on);
-        let r = f();
-        set_c23_dialect(false);
-        r
-    }
 
     #[test]
     fn separators_are_recognised_only_inside_c23_pp_numbers() {

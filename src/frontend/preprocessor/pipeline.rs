@@ -19,7 +19,7 @@ use super::text_processing::{
 };
 use super::utils::{
     hash_token_len, is_digit_separator, is_ident_cont, is_ident_start, less_punctuator_len,
-    paste_token_len,
+    paste_token_len, ppnumber_end, skip_literal_bytes,
 };
 
 /// Deduplicate a list of macro names, preserving order (first occurrence wins).
@@ -967,13 +967,15 @@ impl Preprocessor {
                     }
                 }
             } else {
-                // Was accumulating for trailing function-like macro name.
-                // Now we have the next line joined. Check if parens are balanced.
-                if Self::has_unbalanced_parens(pending_line)
+                // Was accumulating for a trailing function-like macro or query
+                // operator.  Keep accumulating while an argument list is open,
+                // or while only trivia follows the candidate: C whitespace
+                // includes blank lines and comments before the operand token.
+                if (Self::has_unbalanced_parens(pending_line)
+                    || self.ends_with_funclike_macro(pending_line))
                     && *pending_newlines <= MAX_PENDING_NEWLINES
                 {
-                    // The joined text has unbalanced parens (macro args span more lines)
-                    // Keep accumulating.
+                    // The operand has not arrived yet (or its parens are open).
                 } else {
                     // Parens balanced or next line didn't start with '(' - expand now.
                     // Accumulated text spans several physical lines: expand
@@ -1041,35 +1043,99 @@ impl Preprocessor {
         output.extend(std::iter::repeat_n('\n', lines.saturating_sub(kept).max(1)));
     }
 
-    /// Check if a line ends with an identifier that is a defined function-like macro.
-    /// This is used to detect cases where the macro arguments '(' might be on the next line.
+    /// Check if a line ends with a token that can consume a following source
+    /// operand: a defined function-like macro or an active compiler-owned
+    /// query operator.  This is used to detect cases where the operand's '('
+    /// (or malformed-recovery token) might be on a later physical line.
+    ///
+    /// Only the last physical line's trailing code is inspected; a `//`
+    /// comment on an earlier accumulated line must not hide a later token.
+    /// The candidate is validated outside literals/comments before any full
+    /// prefix scan, so ordinary lines keep the cheap backward identifier walk.
     fn ends_with_funclike_macro(&self, line: &str) -> bool {
         let trimmed = line.trim_end();
-        if trimmed.is_empty() {
+        let last_line = trimmed.rsplit('\n').next().unwrap_or(trimmed);
+        let bytes = last_line.as_bytes();
+        if bytes.is_empty() || !is_ident_cont(bytes[bytes.len() - 1] as char) {
             return false;
         }
-        // Extract the last identifier from the line
+        // Lines ending in a punctuator/quote cannot end in a macro token.  For
+        // identifier-shaped tails, a fast `//` probe decides whether comment
+        // stripping is needed before the backward identifier walk.
+        let code = if last_line.contains("//") {
+            strip_line_comment(last_line)
+        } else {
+            std::borrow::Cow::Borrowed(last_line)
+        };
+        let trimmed = code.trim_end();
         let bytes = trimmed.as_bytes();
-        let end = bytes.len();
-        // Walk backwards to find end of last identifier
-        if !is_ident_cont(bytes[end - 1] as char) {
+        if bytes.is_empty() || !is_ident_cont(bytes[bytes.len() - 1] as char) {
             return false;
         }
+        let end = bytes.len();
         let mut start = end - 1;
         while start > 0 && is_ident_cont(bytes[start - 1] as char) {
             start -= 1;
         }
-        // Check that the identifier starts with a valid start character
         if !is_ident_start(bytes[start] as char) {
             return false;
         }
         let ident = &trimmed[start..end];
-        // Check if this identifier is a defined function-like macro
-        if let Some(mac) = self.macros.get(ident) {
-            mac.is_function_like
-        } else {
-            false
+        let candidate = self
+            .macros
+            .get(ident)
+            .is_some_and(|mac| mac.is_function_like)
+            || self.macros.query_operator_active(ident);
+        candidate && Self::ident_is_code_token(trimmed, start)
+    }
+
+    /// Whether `pos` is outside a literal/comment in `line`.  Called only for
+    /// a trailing macro/query candidate, not for every source line.
+    fn ident_is_code_token(line: &str, pos: usize) -> bool {
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < pos {
+            match bytes[i] {
+                // A C23 digit separator is part of the pp-number, not the
+                // opening quote of a character literal.  Skip the whole
+                // number once; probing each separator backwards would make
+                // a long separated number quadratic.
+                b if b.is_ascii_digit()
+                    || (b == b'.' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit)) =>
+                {
+                    let end = ppnumber_end(bytes, i);
+                    if end > pos {
+                        return false;
+                    }
+                    i = end;
+                }
+                quote @ (b'"' | b'\'') => {
+                    let end = skip_literal_bytes(bytes, i, quote);
+                    if end > pos {
+                        return false;
+                    }
+                    i = end;
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                    let mut j = i + 2;
+                    while j + 1 < bytes.len() && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
+                        j += 1;
+                    }
+                    let end = if j + 1 < bytes.len() {
+                        j + 2
+                    } else {
+                        bytes.len()
+                    };
+                    if end > pos {
+                        return false;
+                    }
+                    i = end;
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'/') => return false,
+                _ => i += 1,
+            }
         }
+        true
     }
 
     /// Enable assembly preprocessing mode. In this mode, '$' is not treated
@@ -1980,6 +2046,64 @@ impl Preprocessor {
 impl Default for Preprocessor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod pending_query_operand_tests {
+    use super::Preprocessor;
+
+    #[test]
+    fn trailing_candidate_detection_ignores_trivia_but_not_literals() {
+        let mut pp = Preprocessor::new();
+        pp.define_macro("F(x)", "x");
+        assert!(pp.ends_with_funclike_macro("F"));
+        assert!(pp.ends_with_funclike_macro("int x=F // comment"));
+        assert!(pp.ends_with_funclike_macro("F\n\n"));
+        assert!(pp.ends_with_funclike_macro("__has_feature"));
+        assert!(!pp.ends_with_funclike_macro("F // c\n(1);"));
+        assert!(!pp.ends_with_funclike_macro("\"F"));
+        assert!(!pp.ends_with_funclike_macro("/* F"));
+        pp.preprocess("#undef __has_feature\n");
+        assert!(!pp.ends_with_funclike_macro("__has_feature"));
+    }
+
+    #[test]
+    fn c23_digit_separators_do_not_hide_a_trailing_query_candidate() {
+        super::super::utils::with_c23(true, || {
+            let mut pp = Preprocessor::new();
+            pp.set_c23(true);
+            assert!(pp.ends_with_funclike_macro("int x=1'000 + __has_feature"));
+            assert!(pp.ends_with_funclike_macro("int x=0x1p+2'0 + __has_builtin"));
+            assert!(!pp.ends_with_funclike_macro("int x=1'000__has_feature"));
+            let out = pp.preprocess("int x=1'000 + __has_feature\n(tls);\n");
+            assert!(pp.errors().is_empty(), "{:?}", pp.errors());
+            assert!(!out.contains("__has_feature"), "{out}");
+        });
+    }
+
+    #[test]
+    fn query_operands_may_follow_newlines_blank_lines_and_comments() {
+        let mut pp = Preprocessor::new();
+        let out = pp.preprocess(
+            "int a=__has_feature\n(tls);\n\
+             int b=__has_feature\n\n(tls);\n\
+             int c=__has_feature // c\n(tls);\n\
+             #define Q() __has_builtin\n\
+             int d=Q()\n(memcpy);\n",
+        );
+        assert!(pp.errors().is_empty(), "{:?}", pp.errors());
+        assert!(!out.contains("__has_feature"), "{out}");
+        assert!(!out.contains("__has_builtin"), "{out}");
+    }
+
+    #[test]
+    fn clang_missing_paren_recovery_absorbs_the_next_lines_raw_token() {
+        let mut pp = Preprocessor::new();
+        let out = pp.preprocess("#define W \"-Wcpp\"\nint a=__has_warning\nW;\n");
+        assert_eq!(pp.errors().len(), 1, "{:?}", pp.errors());
+        assert_eq!(pp.errors()[0].message, "missing '(' after '__has_warning'");
+        assert!(!out.contains("\"-Wcpp\""), "{out}");
     }
 }
 
