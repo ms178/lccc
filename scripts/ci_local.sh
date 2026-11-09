@@ -2051,7 +2051,7 @@ pragma_pack_underflow() {
         --lccc target/fastbuild/lccc-arm --lccc target/fastbuild/lccc-riscv \
         --reference gcc-16 --reference "${CLANG:-clang-23}" \
         --reference32 gcc-16 --reference32 "${CLANG:-clang-23}" \
-        "${icx_args[@]}"
+        --clang-placement "${CLANG:-clang-23}" "${icx_args[@]}"
 }
 gate "pragma-pack-underflow" fast pragma_pack_underflow
 gate "count-observations" fast python3 tests/regression/check_count_observations.py --clang "${CLANG:-clang-23}"

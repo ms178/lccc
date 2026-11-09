@@ -62,6 +62,14 @@ void f(void) {
     _Static_assert(sizeof(struct F) == 8, "block operator pop");
 }
 '''
+# Clang's PR28094 accepts an operator between the record and semicolon;
+# GCC 16.2 rejects this placement. Test it as an LCCC/Clang extension, not
+# as a shared four-vendor contract.
+CLANG_PLACEMENT_SOURCE = r'''_Pragma("pack(push, 1)") struct G { char c; int i; } _Pragma("pack(pop)");
+struct H { char c; int i; };
+_Static_assert(sizeof(struct G) == 5, "completed record changed packing");
+_Static_assert(sizeof(struct H) == 8, "pop must affect later records");
+'''
 MESSAGE = "'#pragma pack (pop)' encountered without matching '#pragma pack (push)'"
 
 
@@ -81,6 +89,7 @@ def main():
     parser.add_argument('--lccc', action='append', default=[], help='LCCC target executable; repeat for each target')
     parser.add_argument('--reference', action='append', default=[], help='reference compiler; repeat')
     parser.add_argument('--reference32', action='append', default=[], help='reference compiler with -m32; repeat')
+    parser.add_argument('--clang-placement', help='Clang for its distinct PR28094 placement extension')
     args = parser.parse_args()
     if not args.lccc and not args.reference and not args.reference32:
         parser.error('at least one compiler is required')
@@ -89,6 +98,8 @@ def main():
         source.write_text(SOURCE, encoding='utf-8')
         operator = Path(tmp) / 'operator.c'
         operator.write_text(OPERATOR_SOURCE, encoding='utf-8')
+        clang_placement = Path(tmp) / 'clang-placement.c'
+        clang_placement.write_text(CLANG_PLACEMENT_SOURCE, encoding='utf-8')
         for compiler, flags in ([(compiler, []) for compiler in args.reference] +
                                 [(compiler, ['-m32']) for compiler in args.reference32]):
             # This is a layout/stack comparison, not a diagnostic parity claim.
@@ -97,6 +108,11 @@ def main():
                 result = run(command)
                 require(result[0] == 0, 'reference layout', command, result)
             print(f'PASS reference layout: {compiler} {flags}', flush=True)
+        if args.clang_placement:
+            command = [args.clang_placement, '-w', '-fsyntax-only', str(clang_placement)]
+            result = run(command)
+            require(result[0] == 0, 'Clang-specific operator placement', command, result)
+            print(f'PASS Clang-specific operator placement: {args.clang_placement}', flush=True)
         # Replace the first unmatched pop with a reset. This models the old
         # state transition at the fixture boundary, not a mutated compiler.
         mutant = Path(tmp) / 'mutated.c'
@@ -123,6 +139,9 @@ def main():
             command = [compiler, '-fsyntax-only', '-Werror', str(operator)]
             result = run(command)
             require(result[0] == 0, 'operator layout', command, result)
+            command = [compiler, '-fsyntax-only', '-Werror', str(clang_placement)]
+            result = run(command)
+            require(result[0] == 0, 'Clang-style operator placement', command, result)
             command = [compiler, '-E', str(operator)]
             result = run(command)
             require(result[0] == 0 and '__ccc_pack_' not in result[1],

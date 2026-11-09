@@ -1610,6 +1610,14 @@ impl Parser {
     /// the error points at the previous token's end position and suggests inserting
     /// the missing token, which matches GCC's behavior.
     pub(super) fn expect_after(&mut self, expected: &TokenKind, context: &str) -> Span {
+        // `_Pragma` is permitted between a complete declaration and its
+        // semicolon (Clang PR28094). Its synthetic marker carries its own
+        // semicolon; consume that one before looking for the source delimiter.
+        if matches!(expected, TokenKind::Semicolon) {
+            while self.handle_pragma_pack_token() {
+                self.consume_if(&TokenKind::Semicolon);
+            }
+        }
         if std::mem::discriminant(self.peek()) == std::mem::discriminant(expected) {
             let span = self.peek_span();
             self.advance();
