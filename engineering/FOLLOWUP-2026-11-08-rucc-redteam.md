@@ -353,15 +353,22 @@ no Clang modules. The resolver mirrors Clang 23.1.5's measured diagnostics
 (too few/many arguments, nested parentheses, module-name grammar, unterminated
 invocation, missing-`(` recovery that absorbs the operand identifier).
 
-Differential probe: 14 shapes, LCCC vs Clang 23.1.5 — 11 exact matches
-including every diagnostic wording; the three differences are the two
+Differential probe: 14 shapes, LCCC vs Clang 23.1.5 — 12 exact matches
+including every diagnostic wording; the two remaining differences are the
 Clang-only `-Wbuiltin-macro-redefined` directive warnings (LCCC's documented
 persona emits none for its Clang-compatible extensions, exactly as for
-`__has_warning`) and a macro operand expanded by the code-line pass before the
-resolver sees it (the `#if` path, which the headers use, matches exactly).
+`__has_warning`). The former macro-operand divergence is fixed: the macro
+expander now preserves the RAW operand of active query operators whose
+resolver owns the operand-expansion rule (`__building_module`, `__has_warning`,
+and the GCC feature/builtin/attribute queries), including operators produced
+by object-like aliases and argument prescan. `__building_module(M)` with
+`#define M foo bar` answers 0 instead of erroring, `__has_warning(W)` with
+`#define W "-Wcpp"` requires a literal exactly as Clang does, and
+missing-`(` recovery absorbs one raw identifier without leaving a stray token.
 The lifetime gate now compiles the real Clang `stddef.h` through all four
-target drivers (205 checks with the oracle present), and the fuzz corpus
-covers the tenth operator (1088 cases/seed at count 800).
+target drivers and pins the raw-operand macro contexts (227 checks with the
+oracle present), and the fuzz corpus covers the tenth operator (1088 cases/seed
+at count 800).
 
 Two more CI-only defects found and fixed in the same pass:
 
@@ -371,3 +378,19 @@ Two more CI-only defects found and fixed in the same pass:
   Registered with its measured worst-of-3 cost (0.63 s) and provenance.
 * This follow-up cited rucc's own docs/UNVERIFIED.md inventory as a backtick path, which
   the doc-link gate resolves against THIS repo; the citation is now prose.
+
+### Host biarch include fallback (found by the local fast mirror)
+
+The rootless i386 sysroot staged by `scripts/ensure_i386_multilib_safe.sh`
+ships the 32-bit glibc stubs and crt/libgcc but deliberately not the
+arch-independent `bits/*.h`; the wrapper recipe supplies those with
+`-idirafter /usr/include/x86_64-linux-gnu`. The i686 driver's
+`LCCC_SYSROOT` overlay admitted the sysroot's `gnu/stubs-32.h` marker but
+not the host `bits/` tree, so `<stdio.h>` resolved from the host and every
+`bits/*` include failed. `apply_i686_target` now admits the host multiarch
+directory as a late fallback when the sysroot supplies the 32-bit marker and
+the host actually carries `bits/libc-header-start.h`; the sysroot stubs still
+win for `gnu/stubs-*`. With the verified Bookworm biarch packages installed
+(no live libc upgrade; exact `2.36-9+deb12u14` match), the previously failing
+local gates pass: gcc17-builtin-semantics, trapv-boundary-matrix-m32 (910
+expected traps), and builtin-floor-float-narrowing.

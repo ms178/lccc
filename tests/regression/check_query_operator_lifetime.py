@@ -275,6 +275,59 @@ def main(argv: list[str] | None = None) -> int:
                         capture_output=True, text=True, timeout=30)
                     check(f"clang-resource/{driver}", r.returncode == 0, r.stderr)
 
+        # 12b. Macro expansion must not destroy the operator-specific operand
+        #      rule. Clang's __building_module / __has_warning take the RAW
+        #      operand; GCC's feature/builtin/attribute queries expand it in the
+        #      resolver. The old expand-whole-line-first pass expanded M before
+        #      the resolver saw it (`__building_module(M)` -> stray 'bar' error,
+        #      `__has_warning(W)` -> silent 1 where Clang requires a literal).
+        raw_operand_cases = [
+            ("bm-direct", "#define M foo bar\nint x=__building_module(M);\n",
+             0, "int x=0;", ""),
+            ("bm-alias", "#define M foo bar\n#define BM __building_module\nint x=BM(M);\n",
+             0, "int x=0;", ""),
+            ("bm-prescan", "#define M foo bar\n#define ID(x) x\nint x=ID(__building_module(M));\n",
+             0, "int x=0;", ""),
+            ("bm-missing-paren", "#define M foo bar\nint x=__building_module M;\n",
+             1, "int x=0;", "missing '(' after '__building_module'"),
+            ("hw-macro-operand", '#define W "-Wcpp"\nint x=__has_warning(W);\n',
+             1, "int x=0;", "expected string literal in '__has_warning'"),
+            ("hw-alias-macro-operand", '#define W "-Wcpp"\n#define HW __has_warning\nint x=HW(W);\n',
+             1, "int x=0;", "expected string literal in '__has_warning'"),
+            ("hw-literal", 'int x=__has_warning("-Wcpp");\n', 0, "int x=1;", ""),
+            ("hw-alias-literal", '#define HW __has_warning\nint x=HW("-Wcpp");\n',
+             0, "int x=1;", ""),
+            ("bm-stringify", "#define M foo bar\n#define STR(x) #x\nconst char *s=STR(__building_module(M));\n",
+             0, '"__building_module(M)"', ""),
+            ("unused-malformed", "#define IGN(x) 7\nint x=IGN(__has_feature(bad junk));\n",
+             0, "int x=7;", ""),
+            ("feature-operand-expands", "#define FEAT tls\nint x=__has_feature(FEAT);\n",
+             0, "int x=1;", ""),
+            ("builtin-operand-expands", "#define B memcpy\nint x=__has_builtin(B);\n",
+             0, "int x=1;", ""),
+            ("attribute-operand-expands", "#define NAME deprecated\nint x=__has_attribute(gnu::NAME);\n",
+             0, "int x=1;", ""),
+        ]
+        for name, text, want_rc, want_out, want_diag in raw_operand_cases:
+            src.write_text(text)
+            r = run(args.lccc, src)
+            diag_ok = (want_diag in r.stderr) if want_diag else (r.stderr.strip() == "")
+            check(f"raw-operand/{name}",
+                  r.returncode == want_rc and want_out in r.stdout and diag_ok,
+                  r.stdout + r.stderr)
+        if clang:
+            for name, text, want_rc, want_out, want_diag in raw_operand_cases:
+                if not any(op in text for op in ("__building_module", "__has_warning")):
+                    continue
+                src.write_text(text)
+                c = run(clang, src)
+                l = run(args.lccc, src)
+                check(f"raw-operand/clang-parity/{name}",
+                      c.returncode == l.returncode == want_rc
+                      and want_out in c.stdout and want_out in l.stdout
+                      and ((want_diag in c.stderr) if want_diag else True),
+                      f"clang={c.stdout + c.stderr}\nlccc={l.stdout + l.stderr}")
+
         # 13. Extra tokens after #undef are diagnosed, repeated #undef still warns.
         src.write_text("#undef __has_feature junk\n#undef __has_feature\n")
         r = run(args.lccc, src)
