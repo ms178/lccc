@@ -150,7 +150,28 @@ VLA_SOURCE = r'''int run(int n) {
   if (sizeof u != ((n+7)&~3)+1) return 7;
   return 0;
 }
-int main(void) { for (int n=1; n<=20; n++) { int e=run(n); if (e) return e; } return 0; }
+int unions(int n, int m) {
+    union U { char a[n]; unsigned long long x; } u;
+    union __attribute__((packed)) P { char a[n]; unsigned long long x; } p;
+    union __attribute__((aligned(16))) A { char a[n]; unsigned long long x; } a;
+    union M { char a[n]; char b[m]; int x; } v;
+    int ue = ((n > 8 ? n : 8) + 7) & ~7;
+    int pe = n > 8 ? n : 8;
+    int ae = ((n > 8 ? n : 8) + 15) & ~15;
+    int me = n > m ? n : m; if (me < 4) me = 4; me = (me+3)&~3;
+    if (sizeof u != ue) return 8;
+    if (sizeof p != pe) return 9;
+    if (sizeof a != ae) return 10;
+    if (sizeof v != me) return 11;
+    return 0;
+}
+int main(void) {
+    for (int n=1; n<=20; n++) {
+        int e=run(n); if (e) return e;
+        for (int m=1; m<=20; m++) { e=unions(n,m); if (e) return e; }
+    }
+    return 0;
+}
 '''
 
 MESSAGE = "'#pragma pack (pop)' encountered without matching '#pragma pack (push)'"

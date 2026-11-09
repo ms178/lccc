@@ -10,7 +10,7 @@ use crate::frontend::parser::ast::{
 };
 use crate::frontend::sema::type_context::extract_fptr_typedef_info;
 use crate::ir::reexports::{
-    GlobalInit, Instruction, IrBinOp, IrConst, IrGlobal, Operand, Terminator, Value,
+    GlobalInit, Instruction, IrBinOp, IrCmpOp, IrConst, IrGlobal, Operand, Terminator, Value,
 };
 
 impl Lowerer {
@@ -2284,26 +2284,60 @@ impl Lowerer {
             .position(|f| f.bit_width.is_none() && self.field_vla_runtime_size_probe(f));
         let Some(vla_idx) = vla_idx else { return None };
 
-        // Union size is the max of members, not the sum. The VLA member is
-        // typically the largest; returning it is correct for a single VLA
-        // field (the only form the torture suite uses). Bitfield members
-        // never grow a union past its VLA member here.
+        let max_field_align = if is_packed { Some(1) } else { pragma_pack };
+        let mut layout = self.compute_struct_union_layout_packed(
+            fields,
+            is_union,
+            max_field_align,
+            pragma_pack,
+            reverse_sso,
+        );
+        layout.apply_struct_aligned(struct_aligned);
         if is_union {
-            let f = &fields[vla_idx];
-            return self.field_vla_runtime_size(f);
+            // Union size is the aligned maximum of *all* members, including
+            // fixed-size members and every dynamic member. Evaluate dynamic
+            // bounds in declaration order rather than assuming the first VLA
+            // is necessarily the largest.
+            let mut largest = Operand::Const(IrConst::ptr_int(layout.size as i64));
+            for field in fields {
+                if field.bit_width.is_some() || !self.field_vla_runtime_size_probe(field) {
+                    continue;
+                }
+                let size = self.field_vla_runtime_size(field)?;
+                let cmp = self.emit_cmp_val(
+                    IrCmpOp::Ugt,
+                    Operand::Value(size),
+                    largest.clone(),
+                    ptr_int_ty,
+                );
+                largest = Operand::Value(self.emit_select_val(
+                    Operand::Value(cmp),
+                    Operand::Value(size),
+                    largest,
+                    ptr_int_ty,
+                ));
+            }
+            if layout.align > 1 {
+                let mask = (layout.align - 1) as i64;
+                let added = self.emit_binop_val(
+                    IrBinOp::Add,
+                    largest,
+                    Operand::Const(IrConst::ptr_int(mask)),
+                    ptr_int_ty,
+                );
+                return Some(self.emit_binop_val(
+                    IrBinOp::And,
+                    Operand::Value(added),
+                    Operand::Const(IrConst::ptr_int(!mask)),
+                    ptr_int_ty,
+                ));
+            }
+            return Some(self.operand_to_value(largest));
         }
 
         // Seed the cursor with the VLA member's STATIC offset: everything
         // before it is fixed-size and its exact offset (including any
         // pre-VLA bitfield units) is already in the static layout.
-        let max_field_align = if is_packed { Some(1) } else { pragma_pack };
-        let layout = self.compute_struct_union_layout_packed(
-            fields,
-            false,
-            max_field_align,
-            pragma_pack,
-            reverse_sso,
-        );
         let vla_member_static_offset = self.static_vla_member_offset(fields, vla_idx, &layout)?;
 
         let mut cursor = VlaDynCursor::new(vla_member_static_offset, is_packed);
