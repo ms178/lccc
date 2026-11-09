@@ -128,6 +128,62 @@ class MutationTests(unittest.TestCase):
         self.assertTrue(any("disagrees across widths" in p and "pmulld" in p for p in problems), problems)
 
 
+COALESCING = (ROOT / "src/backend/stack_layout/copy_coalescing.rs").read_text()
+
+
+class CrossLayerTests(unittest.TestCase):
+    """The IR admission table is the fourth authority; it must agree too."""
+
+    def test_brace_matching_does_not_pair_an_arm_with_a_later_emit(self):
+        emitter = gate.parse_emitter_op_flags(INTRINSICS)
+        # A greedy regex mapped LoadI32x4 -> vaddpd. Loads/stores never reach
+        # emit_avx_binary_256, so any such mapping means the scan is broken.
+        for op, (mnemonic, _) in emitter.items():
+            self.assertFalse(
+                op.startswith(("Load", "Store")),
+                f"{op} was paired with {mnemonic}: brace matching is broken",
+            )
+        self.assertGreater(len(emitter), 40)
+
+    def test_grouped_admission_arms_are_all_recorded(self):
+        table = gate.parse_admission(COALESCING, "memfold_consumer_256")
+        # VecAndI64x4 | VecOrI64x4 | VecXorI64x4 => Some(true) is one arm.
+        for op in ("VecAndI64x4", "VecOrI64x4", "VecXorI64x4"):
+            self.assertIs(table.get(op), True, op)
+        self.assertIs(table.get("VecSubI64x4"), False)
+
+    def test_real_tree_cross_layer_is_clean(self):
+        emitter = gate.parse_emitter_op_flags(INTRINSICS)
+        admissions = {
+            f: gate.parse_admission(COALESCING, f)
+            for f in ("memfold_consumer_128", "memfold_consumer_256")
+        }
+        self.assertEqual(gate.check_cross_layer(emitter, admissions), [])
+
+    def test_maddwd_admission_matches_the_emitter(self):
+        table = gate.parse_admission(COALESCING, "memfold_consumer_256")
+        self.assertIs(table["VecMaddwdI16x16"], True, "symmetric: both slots fold")
+        self.assertIs(table["VecMaddubsU8x32"], False, "mixed signedness: src2 only")
+
+    def test_reverting_the_admission_fix_is_detected(self):
+        mutated = COALESCING.replace(
+            "O::VecMaddwdI16x16 => Some(true),", "O::VecMaddwdI16x16 => Some(false),"
+        )
+        self.assertTrue(mutated != COALESCING, "mutation anchor did not match")
+        emitter = gate.parse_emitter_op_flags(INTRINSICS)
+        admissions = {"memfold_consumer_256": gate.parse_admission(mutated, "memfold_consumer_256")}
+        problems = gate.check_cross_layer(emitter, admissions)
+        self.assertTrue(
+            any("VecMaddwdI16x16" in p and "admission" in p.lower() or
+                "VecMaddwdI16x16" in p and "memfold_consumer_256" in p for p in problems),
+            problems,
+        )
+
+    def test_missing_admission_table_is_fail_closed(self):
+        with self.assertRaises(gate.ParseError):
+            gate.parse_admission("no such function", "memfold_consumer_256")
+
+
 class AuthorityTests(unittest.TestCase):
     def test_asymmetric_and_symmetric_sets_are_disjoint(self):
         self.assertEqual(set(gate.ASYMMETRIC) & set(gate.SYMMETRIC), set())
@@ -140,6 +196,52 @@ class AuthorityTests(unittest.TestCase):
         for name, reason in list(gate.ASYMMETRIC.items()) + list(gate.SYMMETRIC.items()):
             self.assertTrue(reason.strip(), name)
             self.assertGreater(len(reason), 15, f"{name}: reason is too terse to audit")
+
+
+class ScanIntegrityTests(unittest.TestCase):
+    """The brace scan must refuse to report a mis-paired table.
+
+    `_brace_arms` counts braces without lexing strings or comments, so the
+    parser carries an invariant on the real file: a pure data-movement op can
+    never map to an arithmetic mnemonic.  These tests prove the invariant is
+    not decoration.
+    """
+
+    def test_historical_mispairing_is_refused(self):
+        # The exact shape the old greedy regex produced.
+        bad = (
+            'IntrinsicOp::LoadI32x4 => { '
+            'emit_avx_binary_256(a, args, "vaddpd", true) }'
+        )
+        with self.assertRaises(gate.ParseError) as cm:
+            gate.parse_emitter_op_flags(bad)
+        self.assertIn("mis-paired", str(cm.exception))
+
+    def test_store_and_const_mispairings_are_refused(self):
+        for op in ("StoreI32x4", "VecConstI8x32"):
+            for mnem in ("vpaddd", "vmulps", "vpmaddwd", "vxorpd"):
+                bad = (
+                    f'IntrinsicOp::{op} => {{ '
+                    f'emit_avx_binary_256(a, args, "{mnem}", true) }}'
+                )
+                with self.assertRaises(gate.ParseError, msg=f"{op}/{mnem}"):
+                    gate.parse_emitter_op_flags(bad)
+
+    def test_a_legitimate_load_mnemonic_is_accepted(self):
+        good = (
+            'IntrinsicOp::LoadI32x4 => { '
+            'emit_avx_binary_256(a, args, "vmovdqu", true) }'
+        )
+        self.assertEqual(
+            gate.parse_emitter_op_flags(good), {"LoadI32x4": ("vmovdqu", True)}
+        )
+
+    def test_real_tree_has_no_data_movement_op_on_an_arithmetic_mnemonic(self):
+        src = (ROOT / "src/backend/x86/codegen/intrinsics.rs").read_text()
+        table = gate.parse_emitter_op_flags(src)
+        for op, (mnem, _f) in table.items():
+            if "Load" in op or "Store" in op or "Const" in op:
+                self.fail(f"{op} -> {mnem}: scan mis-paired the real source")
 
 
 if __name__ == "__main__":

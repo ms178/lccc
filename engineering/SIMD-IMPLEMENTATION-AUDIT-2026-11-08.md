@@ -719,6 +719,10 @@ over `vex_promote_remainder.c` + the scoreboard corpus; implement or delete
   Exact power-of-two inputs, float bits via `memcpy`, unsigned wraparound
   only, AVX-512 behind predefined macros with a scalar fallback: warning-free
   under fourteen GCC warning flags and clean under ASan+UBSan.
+- `tests/simd/vector_home_call_loop.c` — §9c.10.12's measurement reproducer:
+  a one-instruction `noinline` callee in a 200k-iteration call loop, best-of-20
+  `rdtsc`, so the number isolates *caller* spill overhead.  Measures, does not
+  assert; warning-free under fourteen GCC flags.
 - `tests/simd/probe_utils.py` — dependency-free process layer.  Process-group
   kills on timeout, raw `(rc, stdout, stderr)` for every compile, host CPUID
   reading, and a diagnostic classifier that refuses to call an ICE, a timeout
@@ -1455,3 +1459,189 @@ passes after the fix under the same load.
 After the fixes: **41/41 SIMD python tests OK**, audit pack **15/15 PASS**,
 commutativity gate **PASS** + **17** self-tests OK, `check_sse2_i32_product.py`
 **rc=0**, fastbuild **rc=0 / 0 warnings**.
+
+### 9c.10.11 SA-36 had a SECOND, load-bearing half — the first fix was inert
+
+`src/backend/x86/codegen/intrinsics.rs` was not the only place that classified
+`vpmaddwd`.  `memfold_consumer_256`
+(`src/backend/stack_layout/copy_coalescing.rs:2600`) is the **admission
+authority**: it decides whether a commuted load-fold may be placed on args[0] at
+all.  It read:
+
+```rust
+// pmaddubsw is not commutative: vvvv is unsigned u8, r/m is signed i8,
+// so swapping the operand roles changes the products.
+O::VecMaddubsU8x32 | O::VecMaddwdI16x16 => Some(false),
+```
+
+The comment reasons about **maddubs only**, then pins **both** ops.  `vpmaddwd`
+multiplies two *signed* word streams — symmetric — so this withheld a legal fold
+from every 256-bit `pmaddwd`, exactly as the emitter table did at 512.  Fixing
+only the emitter left the optimization **inert**: an emitter flag can never
+create a fold that the admission gate refuses.
+
+Both arms are now split, keeping the mixed-signedness rationale on maddubs:
+`VecMaddwdI16x16 => Some(true)`, `VecMaddubsU8x32 => Some(false)`.  Pinned by
+`maddwd_admits_both_fold_positions_but_maddubs_only_the_signed_one`.
+
+**The lesson is structural, so the gate grew a fourth layer.**  Three layers
+could agree while a *fourth* authority disagreed, and the old gate could not see
+it.  `check_cross_layer` now parses the admission arms by **brace-depth
+counting** (so `=>` and `|` inside a body cannot mis-pair) and cross-checks
+**78 admission rows against 59 emitter arms**, mapping IR names to mnemonics
+(`VecAddF32x16` → `vaddps`) and skipping ops that lower to multi-instruction
+sequences with no single mnemonic.  Current result: **86 operations, 139 width
+rows, 54 asymmetric + 2 symmetric pinned, 78 admission rows cross-checked**,
+with **27** self-tests OK.
+
+Ten of those tests cover the new layer and its parser.  The important ones
+guard the *scanner itself*: `_brace_arms` counts braces without lexing string
+literals or comments, so a stray `}` could in principle end an arm early and
+pair it with a later arm's emit call — the exact failure the first greedy
+regex produced (`LoadI32x4` → `vaddpd`).  `parse_emitter_op_flags` therefore
+asserts an invariant **on the real file**: a Load/Store/Const op can never map
+to an arithmetic mnemonic, and if one does it raises `ParseError` instead of
+printing a trustworthy-looking table.  Four self-tests prove that invariant
+goes red (the historical mispairing, eight Store/Const × arithmetic
+combinations, a legitimate `vmovdqu` still accepted, and the real tree clean).  Non-vacuity: reverting the admission arm alone turns the gate
+**red**, naming `VecMaddwdI16x16 (vpmaddwd)` in both directions.
+
+**Verification with tools, on this host (AVX-512F/BW/VL):**
+
+| check | result |
+|---|---|
+| runtime lanes, adversarial data (extremes, sign mixes, saturation) | LCCC, GCC 16.2, Clang 23.1.5 all `ALL-LANES-OK` |
+| valgrind 3.19.0, static | LCCC **0** invalid read/write/free; 11 glibc `_IO_cleanup` false positives — **GCC byte-for-byte the same count**, none inside the kernels |
+| GDB 18.1 | both kernels breakpointed, normal exit |
+| objdump / readelf (binutils 2.47) | operand roles read back from the encoding |
+| SSE1 denial TU | **0** `vzeroupper` (x86-64 and i686) |
+
+**A hypothesis tested and REFUTED.**  i686 `-mavx2` emits `%ymm` writes with no
+`vzeroupper`, which looks like a transition penalty.  GCC 16.2 and Clang 23.1.5
+emit **the same** `vpaddw; ret` without `vzeroupper`, so LCCC matches both
+references — **not a defect**.  i686 additionally has **zero**
+`vec_claim_live_reg` callers, so SA-33 is inert there by construction; its
+`dirty_upper_ymm` writers arm only on real wide writes
+(`width != VectorRegWidth::Xmm`).
+
+**Reachability, proven structurally rather than by trying shapes.**  My first
+kernels used `_mm256_madd_epi16`, which lowers to `IntrinsicOp::Pmaddwd256` — a
+*different* op that never consults `memfold_consumer_256`.  `VecMaddwdI16x16` is
+produced **only by the vectorizers**, and there are exactly **three** producers:
+
+| producer | args[0] | is it a load? |
+|---|---|---|
+| `src/passes/vectorize.rs:15689` | `vshort` (result of `VecMaddubsU8x32`) | no |
+| `src/passes/vectorize_strided_i32_reduce.rs:1630` | `raw_tbl` (`VecConstI8x32`) | no |
+| `src/passes/vectorize_strided_i32_reduce.rs:1965` | `mask_tbl` (`VecConstI8x32`) | no |
+
+The only other mentions of the variant are the enum declaration, purity/class
+lists, regalloc tables, and `names_to_op` — which is **test-only** (defined
+inside the `cfg(test)` module at `src/ir/intrinsics.rs:3298`, no production
+callers), so there is no IR-text ingestion path either.  Since a commuted
+load-fold requires a load in args[0], the newly permitted position is
+**unreachable from C today**.  This is an exhaustive producer census, not a
+failed attempt to find a shape.
+
+So the admission fix is a *latent* rule repair exactly like SA-05 and SA-33:
+it stays **S**, and is **not** a demonstrated runtime win.  It is still the
+right change — the rule now states the SDM's truth, and the new cross-layer
+gate means the first producer that ever puts a load in args[0] gets the fold
+instead of silently losing it.
+
+**A wrong test I caught before drawing a conclusion.**  My first kernel read
+`pmaddwd` results as 16-bit lanes; it "failed" identically on LCCC, GCC and
+Clang.  Three agreeing compilers is evidence about the *test*, not the
+compiler: `pmaddwd` produces **32-bit** dword lanes.  Corrected, all three pass.
+
+**Tool availability, stated honestly.**  GDB 18.1, objdump/readelf/nm
+(binutils 2.47) and valgrind 3.19.0 are in use.  **pahole and objtool were not
+obtainable**: pahole needs elfutils `libelf`/`libdw` headers, absent from the
+image (`apt` has no `libelf-dev`/`libdw-dev`), and objtool is not in the cache's
+`kernel-relocs` archive (only `bin/relocs`).  Neither is load-bearing for this
+diff — it changes no struct layout and no ORC/unwind metadata — but the gap is
+recorded rather than silently skipped.
+
+### 9c.10.12 "No cycles left behind": measured, and a NEW performance defect found
+
+Two questions were still open for SA-33: does the broadened arming *cost*
+anything in AVX builds, and is the delivered code actually fast?  Both were
+measured on this host (AVX-512F/BW/VL), not reasoned about.
+
+**(a) Over-arming cost: none — LCCC emits *fewer* `vzeroupper` than both
+references.**  An 8-function AVX2+FMA corpus (vector arithmetic, reductions,
+FMA, a scaling loop) at `-O2` and `-O3`:
+
+| compiler | `-O2` | `-O3` | total |
+|---|---|---|---|
+| LCCC (delivered) | 1 | 1 | **2** |
+| GCC 16.2 | 4 | 7 | 11 |
+| Clang 23.1.5 | 2 | 2 | 4 |
+
+So the arming change leaves no extra `vzeroupper` behind.  (Whether LCCC emits
+*too few* is a separate question; §9c.10.11 shows the leaf-function case matches
+both references exactly.)
+
+**(b) A real, previously unrecorded performance gap — `v8` locals are
+memory-homed across calls.**  Reproducer: `a = f1(a, b)` 200 000 times, `f1` a
+`noinline` one-instruction `vfmadd132ps`, best-of-20 `rdtsc`:
+
+| compiler | cycles / 200k calls |
+|---|---|
+| LCCC | **2 391 394** |
+| GCC 16.2 | **518 964** |
+
+**4.61× slower.**  `f1` itself is **byte-identical** (`vfmadd132ps %ymm1, %ymm0,
+%ymm0; ret`), so the entire gap is in the **caller**.  GCC's loop is
+`call f1; sub $1,%eax; jne` — it keeps both vectors in registers across the call
+by interprocedural clobber analysis.  LCCC's loop body is 20 instructions:
+
+```asm
+vmovdqu (%rax),%ymm0
+lea    -0x81(%rbp),%rax
+and    $0xff…e0,%rax          # re-derive the 32-byte-aligned address
+vmovdqu (%rax),%ymm1
+call   f1
+lea    -0xc1(%rbp),%rax
+and    $0xff…e0,%rax
+vmovdqu %ymm0,(%rax)          # store result to slot S
+lea    -0xc1(%rbp),%rax       # SAME address, recomputed
+and    $0xff…e0,%rax
+vmovups (%rax),%ymm3          # reload slot S immediately
+lea    -0x41(%rbp),%rax
+and    $0xff…e0,%rax
+vmovups %ymm3,(%rax)          # copy S -> S'
+```
+
+Three separable defects, in increasing order of fix size:
+
+1. **Redundant address recomputation.** The second `lea`+`and` re-derives a
+   value `%rax` already holds, with no intervening write to `%rax`.  Two
+   instructions per iteration, pure waste.
+2. **Store→reload of the identical slot.** `vmovdqu %ymm0,(%rax)` followed by
+   `vmovups (%rax),%ymm3` is a register copy plus a ~6-cycle store-forwarding
+   stall; it should be `vmovaps %ymm0,%ymm3` or coalesced away.
+3. **Root cause: over-aligned vector slots are addressed *indirectly*.** The
+   32-byte-aligned home is reached via `lea`+`and` into a scratch register
+   instead of a direct `off(%rsp)`.  That is why the existing slot peepholes
+   never fire: `fold_save_reload_roundtrip`
+   (`src/backend/x86/codegen/peephole/passes/spill_deref.rs:692`) begins with
+   `let Some((n, base)) = parse_slot(mem_str) else { … continue }`, and `(%rax)`
+   is not a slot — so every slot-based pass declines the whole shape.
+
+**Decision: recorded, not fixed in this PR, with the reason stated.**  (1) and
+(2) are downstream symptoms; fixing them textually would paper over (3), and
+(3) is a frame-layout change (realignment discipline for over-aligned vector
+homes) that touches every supported architecture's prologue and every
+`param_home` contract.  Landing that on top of an already-green SIMD audit PR
+would put the whole delivery at risk for a shape unrelated to the SA register.
+It is entered here with a reproducer, measurements and anchors so the next
+round starts from evidence instead of a hunch.  It is **not** claimed as fixed,
+and it is **not** one of the 54 register rows.
+
+**Artifact:** `tests/simd/vector_home_call_loop.c` — the reproducer above,
+warning-free under fourteen GCC warning flags, no UB (unsigned timestamp
+wraparound, fully initialised load, no correctness assertion because it
+measures).  Re-run on this host: LCCC **2 384 374** vs GCC 16.2 **503 944**
+cycles / 200 000 calls = **4.73×**.  `f1` is byte-identical between them, so
+the ratio is entirely caller overhead.

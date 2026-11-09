@@ -202,6 +202,112 @@ def parse_tables(intrinsics: str, intrinsics_simd: str) -> dict[str, dict[str, s
     return table
 
 
+def _brace_arms(src: str, header: re.Pattern[str]):
+    """Yield (capture, arm_body) with real brace matching.
+
+    A greedy `\\{(.{0,N}?)emit_...\\}` regex silently pairs an arm with a
+    LATER arm's emit call (it matched `LoadI32x4` to `vaddpd`), which would
+    make this gate report fiction.  Depth counting is the only correct scan.
+    """
+    for m in header.finditer(src):
+        start = m.end() - 1
+        depth = 0
+        for k in range(start, len(src)):
+            if src[k] == "{":
+                depth += 1
+            elif src[k] == "}":
+                depth -= 1
+                if depth == 0:
+                    yield m.group(1), src[start : k + 1]
+                    break
+
+
+def parse_emitter_op_flags(intrinsics: str) -> dict[str, tuple[str, bool]]:
+    """{IntrinsicOp variant: (mnemonic, commutative)} from the 256-bit arms."""
+    out: dict[str, tuple[str, bool]] = {}
+    header = re.compile(r"IntrinsicOp::(\w+)\s*=>\s*\{")
+    call = re.compile(
+        r'emit_avx_binary_256\(\s*\w+,\s*args,\s*"([^"]+)",\s*(true|false)'
+    )
+    for op, body in _brace_arms(intrinsics, header):
+        m = call.search(body)
+        if m:
+            out[op] = (m.group(1), m.group(2) == "true")
+    if not out:
+        raise ParseError("no IntrinsicOp -> emit_avx_binary_256 arms recovered")
+    # Scan-integrity invariant on the REAL file, not just on synthetic input.
+    # `_brace_arms` counts braces without lexing string literals or comments,
+    # so a stray `}` in a comment could in principle end an arm early and pair
+    # it with a later arm's emit call.  That failure has a unmistakable
+    # signature: a pure data-movement op mapped to an arithmetic mnemonic
+    # (the greedy-regex bug mapped `LoadI32x4` -> `vaddpd`).  A load, store or
+    # constant materialisation can never emit an arithmetic opcode, so if one
+    # ever does, the scan is broken and every number this gate prints would be
+    # fiction.  Fail loudly instead of reporting it.
+    arithmetic = re.compile(
+        r"^v(?:p?(?:add|sub|mul|madd|maddubs|min|max|and|or|xor|sad|avg)"
+        r"|add|sub|mul|div|min|max|and|or|xor)"
+    )
+    for op, (mnemonic, _flag) in sorted(out.items()):
+        if ("Load" in op or "Store" in op or "Const" in op) and arithmetic.match(
+            mnemonic
+        ):
+            raise ParseError(
+                f"{op} mapped to arithmetic mnemonic {mnemonic!r}: the brace "
+                f"scan mis-paired a match arm, so the whole table is untrustworthy"
+            )
+    return out
+
+
+def parse_admission(coalescing: str, fname: str) -> dict[str, bool]:
+    """{IntrinsicOp variant: commutative} from a memfold_consumer_* table.
+
+    Handles grouped arms (`A | B | C => Some(true)`), which is how these
+    tables are written.
+    """
+    i = coalescing.find(f"pub(crate) fn {fname}(")
+    if i < 0:
+        raise ParseError(f"{fname} not found in copy_coalescing.rs")
+    j = coalescing.find("\n}\n", i)
+    if j < 0:
+        raise ParseError(f"{fname} body not terminated")
+    body = coalescing[i:j]
+    out: dict[str, bool] = {}
+    pat = re.compile(r"((?:O::\w+\s*\|\s*)*O::\w+)\s*=>\s*Some\((true|false)\)")
+    for m in pat.finditer(body):
+        for op in re.findall(r"O::(\w+)", m.group(1)):
+            out[op] = m.group(2) == "true"
+    if not out:
+        raise ParseError(f"{fname} parsed empty")
+    return out
+
+
+def check_cross_layer(
+    emitter: dict[str, tuple[str, bool]], admissions: dict[str, dict[str, bool]]
+) -> list[str]:
+    """The IR admission gate and the emitter must agree on the SAME op.
+
+    This is the fourth authority.  `memfold_consumer_256` withheld the
+    `VecMaddwdI16x16` fold under a comment that reasoned about `maddubs`'
+    mixed signedness, while the 512-bit emitter already said `true`.  Fixing
+    only the emitter would have left the optimization inert: the analysis
+    decides whether args[0] is marked foldable at all.
+    """
+    problems: list[str] = []
+    for op, (mnemonic, emit_flag) in sorted(emitter.items()):
+        for fname, table in sorted(admissions.items()):
+            if op not in table:
+                continue
+            if table[op] != emit_flag:
+                problems.append(
+                    f"{op} ({mnemonic}): emitter says commutative={emit_flag} "
+                    f"but {fname} says {table[op]}. The analysis is the "
+                    f"admission authority, so the emitter flag alone cannot "
+                    f"gain or protect a fold -- they must agree."
+                )
+    return problems
+
+
 def check(table: dict[str, dict[str, set[bool]]]) -> list[str]:
     problems: list[str] = []
     for name in sorted(table):
@@ -255,6 +361,20 @@ def run(root: Path) -> int:
         return 2
 
     problems = check(table)
+    try:
+        coalescing = (
+            root / "src/backend/stack_layout/copy_coalescing.rs"
+        ).read_text()
+        emitter = parse_emitter_op_flags(intrinsics)
+        admissions = {
+            f: parse_admission(coalescing, f)
+            for f in ("memfold_consumer_128", "memfold_consumer_256")
+        }
+    except (OSError, ParseError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    cross = check_cross_layer(emitter, admissions)
+    problems += cross
     widths = sum(len(v) for v in table.values())
     if problems:
         print(f"check_simd_commutativity_agreement: FAIL ({len(problems)} problems)")
@@ -264,7 +384,9 @@ def run(root: Path) -> int:
     print(
         f"check_simd_commutativity_agreement: PASS "
         f"({len(table)} operations, {widths} width rows, "
-        f"{len(ASYMMETRIC)} asymmetric + {len(SYMMETRIC)} symmetric pinned)"
+        f"{len(ASYMMETRIC)} asymmetric + {len(SYMMETRIC)} symmetric pinned, "
+        f"{sum(len(v) for v in admissions.values())} IR admission rows "
+        f"cross-checked against {len(emitter)} emitter arms)"
     )
     return 0
 
