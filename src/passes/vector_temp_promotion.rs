@@ -1316,6 +1316,37 @@ fn count_uses(func: &IrFunction, value: u32) -> FxHashMap<(usize, usize), usize>
     uses
 }
 
+/// Width of the vector REGISTER carried at intrinsic argument position
+/// `index`, or `None` when that position does not hold a whole vector
+/// register.
+///
+/// This is the dual of [`intrinsic_arg_required_alignment`]. That table is
+/// the audited list of argument positions that name an ADDRESS; every
+/// position it claims must keep an address, because the backend dereferences
+/// it. Substituting a forwarded register there hands the emitter the vector's
+/// own bit pattern as a pointer.
+///
+/// That is not hypothetical. `AddSs128`/`SubSs128`/`AddSd128`/`SubSd128` are
+/// `is_sse_fp_128_destructive_binary`, so both of their operands are
+/// addresses of 16-byte slots, not registers. Forwarding a spill into one of
+/// them made `_mm_cvtss_si64` dereference `0x4b000000` -- the 8388608.0f
+/// round-trip constant -- and fault on i686.
+///
+/// The table therefore fails closed: a position is forwardable only when it
+/// is positively known to carry a register of exactly the home's width.
+fn vector_register_arg_width(op: IntrinsicOp, index: usize) -> Option<usize> {
+    // Anything the alignment table claims is an address, never a register.
+    if intrinsic_arg_required_alignment(op, index).is_some() {
+        return None;
+    }
+    // `VecStore*`: args[0] is the stored register, args[1] the destination
+    // address, args[2] the byte offset.
+    if let Some(width) = whole_vector_store_width(op) {
+        return (index == 0).then_some(width);
+    }
+    None
+}
+
 /// The stored register value of a whole-register `VecStore*` that writes
 /// exactly `width` bytes to `home`.
 fn as_whole_vector_store(inst: &Instruction, width: usize, home: u32) -> Option<u32> {
@@ -1539,10 +1570,11 @@ fn plan_home_forwards(func: &IrFunction, allocas: &FxHashMap<u32, AllocaInfo>) -
                                 if v.0 != home {
                                     continue;
                                 }
-                                let is_data_read = pointer_vector_arg_width(*r_op, idx)
-                                    == Some(width)
-                                    || (idx == 0 && whole_vector_store_width(*r_op) == Some(width));
-                                if !is_data_read {
+                                // The read must consume the home's bytes as
+                                // a whole vector REGISTER. A position that
+                                // names an address is refused: see
+                                // `vector_register_arg_width`.
+                                if vector_register_arg_width(*r_op, idx) != Some(width) {
                                     aborted = true;
                                     break;
                                 }
@@ -5072,13 +5104,23 @@ mod tests {
         );
     }
 
+    /// A position the backend may dereference must keep an address.
+    ///
+    /// `MinPs256`/`MaxPs256` are `pointer_vector_arg_width` entries: the x86
+    /// emitter (`sse_load_arg`, `intrinsics.rs`) uses the operand as a
+    /// register only when it is already XMM-resident, and otherwise
+    /// reinterprets its low bits as an ADDRESS -- documented there as the
+    /// cause of a `simd_movnt` SIGSEGV. Forwarding a spilled register into
+    /// such a slot is therefore unsound: it happens to work under low
+    /// register pressure on x86-64 and faults on i686, where
+    /// `sse_cvt_si64_rounding_i686` dereferenced 0x4b000000 (the 8388608.0f
+    /// round-trip constant). The pass must refuse.
     #[test]
-    fn spill_forwards_the_stored_register_to_every_reader() {
-        // %1 = alloca 32  ; VecZeroF32x8 dest=%2 ; VecStoreF32x8 dest_ptr=%1 [%2,%1,0]
-        // MinPs256 args=[%0, %1]  (read)   MaxPs256 args=[%0, %1] (read)
-        // -> both readers take %2 and the store vanishes.
+    fn spill_refuses_to_forward_into_an_address_operand() {
+        // %1 = alloca 32 ; VecZeroF32x8 dest=%2 ; VecStoreF32x8 dest_ptr=%1
+        // MinPs256 args=[%0, %1] (address-capable read) -- must stay %1.
         let mut func = single_block(
-            "spill",
+            "spill_addr",
             vec![
                 alloca(1, 32, 32),
                 intrinsic(Some(2), IntrinsicOp::VecZeroF32x8, None, vec![]),
@@ -5098,35 +5140,81 @@ mod tests {
                     Some(9),
                     vec![Operand::Value(Value(0)), Operand::Value(Value(1))],
                 ),
-                intrinsic(
-                    Some(4),
-                    IntrinsicOp::MaxPs256,
-                    Some(9),
-                    vec![Operand::Value(Value(0)), Operand::Value(Value(1))],
-                ),
             ],
         );
-        assert_eq!(forward_vector_home_results(&mut func), 1);
-        for idx in 0..func.blocks[0].instructions.len() {
-            if let Instruction::Intrinsic { op, args, .. } = &func.blocks[0].instructions[idx] {
-                if matches!(op, IntrinsicOp::MinPs256 | IntrinsicOp::MaxPs256) {
-                    assert_eq!(
-                        args[1],
-                        Operand::Value(Value(2)),
-                        "reader must consume the register, not the home"
-                    );
-                }
-            }
-        }
+        assert_eq!(
+            forward_vector_home_results(&mut func),
+            0,
+            "an address-capable operand must never receive a forwarded register"
+        );
         assert!(
-            !func.blocks[0].instructions.iter().any(|i| matches!(
+            func.blocks[0].instructions.iter().any(|i| matches!(
                 i,
                 Instruction::Intrinsic {
                     op: IntrinsicOp::VecStoreF32x8,
                     ..
                 }
             )),
-            "the dead spill store must be deleted"
+            "the spill store must be kept: the home is still read through its address"
+        );
+    }
+
+    #[test]
+    fn spill_forwards_the_stored_register_to_a_register_operand() {
+        // The forwardable case: `VecStore*` args[0] is the stored REGISTER
+        // (args[1] is the address), so the home's bytes can be handed to a
+        // later store without ever becoming an address.
+        // %1 = alloca 32 ; VecZeroF32x8 dest=%2 ; VecStoreF32x8 dest_ptr=%1 [%2,%1,0]
+        // VecStoreF32x8 dest_ptr=%9 [%1, %9, 0]  -> takes %2 instead.
+        let mut func = single_block(
+            "spill",
+            vec![
+                alloca(1, 32, 32),
+                intrinsic(Some(2), IntrinsicOp::VecZeroF32x8, None, vec![]),
+                intrinsic(
+                    None,
+                    IntrinsicOp::VecStoreF32x8,
+                    Some(1),
+                    vec![
+                        Operand::Value(Value(2)),
+                        Operand::Value(Value(1)),
+                        Operand::Const(IrConst::I64(0)),
+                    ],
+                ),
+                intrinsic(
+                    None,
+                    IntrinsicOp::VecStoreF32x8,
+                    Some(9),
+                    vec![
+                        Operand::Value(Value(1)),
+                        Operand::Value(Value(9)),
+                        Operand::Const(IrConst::I64(0)),
+                    ],
+                ),
+            ],
+        );
+        assert_eq!(forward_vector_home_results(&mut func), 1);
+        let stores: Vec<_> = func.blocks[0]
+            .instructions
+            .iter()
+            .filter_map(|i| match i {
+                Instruction::Intrinsic {
+                    op: IntrinsicOp::VecStoreF32x8,
+                    args,
+                    ..
+                } => Some(args.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stores.len(),
+            1,
+            "the dead spill store must be deleted, leaving the reader's own store"
+        );
+        assert_eq!(
+            stores[0][0],
+            Operand::Value(Value(2)),
+            "the surviving store must take the register, not the retired home"
         );
     }
 
