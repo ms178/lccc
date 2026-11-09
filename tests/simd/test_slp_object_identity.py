@@ -709,5 +709,171 @@ int main(void) {
 
 
 
+    # ── One-map seed streams: structural + deterministic regression ─────
+    def test_35_one_map_seed_streams_are_exact_linear_and_output_preserving(self):
+        """Red-team regression for the seed-collection rewrite.
+
+        The previous design built TWO HashMaps (object + site tier), cloned
+        every store into both, sorted and priced duplicate seeds, then paid
+        for an owned ``FxHashSet<SeedKey>`` (one ``Vec<usize>`` allocation per
+        candidate) to remove them.  The new design inserts each store ONCE,
+        derives the site tier as a partition, and dedups by a stable hash
+        with exact equality inside each bucket.  These asserts have teeth:
+        they pin the algorithmic invariants that a "simplification" can
+        silently destroy (quadratic site partition, lossy boolean identity,
+        value-collapsed LaneKey), and they pin bit-exact output.
+        """
+        src = ROOT / "engineering" / "verification" / "bench" / "site_subsets_stress.c"
+        self.assertTrue(src.is_file(), src)
+        self.assertEqual(src.read_text().count("  g["), 320,
+                         "the 320-store one-object stress must stay intact")
+        flags = ["-O2", "-march=x86-64-v3", "-S"]
+        env = {"LCCC_DEBUG_SLP": "1", "CCC_DISABLE_PASSES": "gaddrcse"}
+        on = self.d / "one_map_on.s"
+        a = compile_ok(LCCC, src, on, flags, env=env)
+        self.assertEqual(a.returncode, 0, a.stderr)
+        self.assertNotIn("panicked", a.stderr)
+        self.assertNotIn("warning:", a.stderr.lower())
+        m = re.search(r":\s*(\d+) candidates", a.stderr)
+        self.assertIsNotNone(m, "missing [SLP-SEEDS] debug line")
+        self.assertEqual(int(m.group(1)), 81,
+                         "the one-map partition must emit the exact seed set")
+        self.assertLessEqual(len(re.findall(r"\[SLP-COST\]", a.stderr)), 81,
+                             "no duplicate tier may price a duplicate plan")
+        off = self.d / "one_map_off.s"
+        b = compile_ok(LCCC, src, off, flags,
+                       env={"CCC_NO_BB_SLP": "1",
+                            "CCC_DISABLE_PASSES": "gaddrcse"})
+        self.assertEqual(b.returncode, 0, b.stderr)
+        self.assertEqual(hashlib.sha256(on.read_bytes()).hexdigest(),
+                         hashlib.sha256(off.read_bytes()).hexdigest(),
+                         "every plan declines; SLP-on/off asm must be bit-exact")
+        # Structural invariants: mutation-sensitive, not decorative.
+        code = (ROOT / "src" / "passes" / "slp_vectorizer.rs").read_text()
+        joint = (ROOT / "src" / "passes" / "slp_vectorizer" / "joint.rs").read_text()
+        self.assertIn("pub(super) type StreamEntry", code)
+        self.assertIn("fn site_subsets(", code)
+        self.assertIn("if entries.iter().all(|e| e.4 == only_base)", code,
+                      "zero-allocation single-web fast path must survive")
+        self.assertIn("buckets.entry(e.4).or_default().push(e.clone())", code,
+                      "O(n) single-pass bucket build must survive")
+        self.assertNotIn("entries.iter().filter(|e| e.4 == base)", code,
+                         "the O(n*b) quadratic site partition must not return")
+        self.assertIn("fn seed_hash(", code)
+        self.assertIn("fn seed_fields_eq(", code)
+        self.assertIn("enum SeedReps", code)
+        self.assertIn("fn dedup_seed_candidates(", code)
+        self.assertIn("enum SeedOperandKey", code)
+        self.assertIn("fn seed_operand_key(", code)
+        self.assertIn("#[cfg(test)]\ntype SeedKey", code,
+                      "the owned SeedKey oracle must be TEST-ONLY")
+        self.assertIn("#[cfg(test)]\nfn seed_dedup_key", code)
+        self.assertNotIn("candidates.retain(|c| seen.insert", code,
+                         "production must not allocate one Vec per candidate")
+        self.assertNotIn("let mut site_streams:", code,
+                         "the second per-store HashMap must stay gone")
+        self.assertIn("pub alpha: u8", joint)
+        self.assertIn("i32::from(self.alpha)", joint)
+        self.assertIn("for alpha in 0u8..4", joint)
+        # LaneKey value-equivalence is load-bearing for s_clamp_u8 (test_30).
+        self.assertIn("enum LaneKey", code)
+        self.assertIn("I8(0)", code)
+        self.assertIn("0.8399x", code,
+                      "the measured cost-model rationale must stay documented")
+
+    def test_36_all_supported_backends_are_bit_exact_and_warning_free(self):
+        """The seed pass is shared IR, but its ISA gates are x86-only.
+
+        Every shipped binary must compile the same store-stream corpus with
+        zero diagnostics, deterministic output, and bit-exact parity to the
+        ``CCC_NO_BB_SLP=1`` ablation (all plans in this corpus decline).  A
+        non-x86 backend must never accidentally take the SSE4.1 joint path.
+        """
+        src = self.d / "cross_matrix.c"
+        src.write_text(r"""
+#include <stdint.h>
+uint32_t g[16];
+int main(int argc, char **argv) {
+    (void)argv; uint32_t s = (uint32_t)argc;
+    for (int i = 0; i < 16; i++) g[i] = s + (uint32_t)i;
+    return (int)(s & 0xffu);
+}
+""")
+        flags = ["-O2", "-Wall", "-Wextra", "-Werror", "-Wpedantic", "-S"]
+        bins = ["lccc", "lccc-i686", "lccc-arm", "lccc-riscv", "lccc-x86"]
+        for name in bins:
+            binary = ROOT / "target" / "fastbuild" / name
+            if not binary.is_file():
+                self.skipTest(f"fastbuild binary absent: {name}")
+            with self.subTest(backend=name):
+                first = self.d / f"{name}_on.s"
+                second = self.d / f"{name}_repeat.s"
+                off = self.d / f"{name}_off.s"
+                a = compile_ok(binary, src, first, flags)
+                self.assertEqual(a.returncode, 0, a.stderr)
+                self.assertEqual(a.stderr.strip(), "",
+                                 f"{name} emitted diagnostics")
+                self.assertNotIn("panicked", a.stderr)
+                c = compile_ok(binary, src, second, flags)
+                self.assertEqual(c.returncode, 0, c.stderr)
+                self.assertEqual(first.read_bytes(), second.read_bytes(),
+                                 f"{name} codegen is nondeterministic")
+                d = compile_ok(binary, src, off, flags,
+                               env={"CCC_NO_BB_SLP": "1"})
+                self.assertEqual(d.returncode, 0, d.stderr)
+                self.assertEqual(first.read_bytes(), off.read_bytes(),
+                                 f"{name} SLP-on/off parity regressed")
+
+
+    def test_37_slp_ablation_is_bit_exact_and_never_costs_instructions(self):
+        """Runtime correctness + instruction-count ablation, soundly measured.
+
+        Valgrind 3.19's VEX emulates FMA3 with different bits than the host
+        CPU: GCC 16.2 (no contraction), Clang 23.1.5 (contraction) and LCCC
+        all produce byte-identical digests NATIVELY, while Clang and LCCC both
+        shift to ``c322b9845f160f83`` under VEX.  With the default contraction
+        LCCC contracts only the ``volatile`` reference arm, so a VEX run
+        reports a *spurious* ``fma_orientation`` mismatch.  That is a tool
+        limitation, not a codegen defect; ``-ffp-contract=off`` removes every
+        FMA from all three compilers and makes the measurement valid.
+        """
+        flags = ["-O2", "-march=x86-64-v3", "-ffp-contract=off"]
+        on = self.d / "ablation_on"
+        off = self.d / "ablation_off"
+        a = compile_ok(LCCC, SHAPES, on, flags)
+        self.assertEqual(a.returncode, 0, a.stderr)
+        b = compile_ok(LCCC, SHAPES, off, flags,
+                       env={"CCC_NO_BB_SLP": "1"})
+        self.assertEqual(b.returncode, 0, b.stderr)
+        r_on = run([on, "all"], self.d)
+        r_off = run([off, "all"], self.d)
+        self.assertEqual(r_on.returncode, 0, r_on.stdout)
+        self.assertEqual(r_off.returncode, 0, r_off.stdout)
+        self.assertEqual(r_on.stdout, r_off.stdout,
+                         "SLP-on/off digests must be bit-identical")
+        self.assertNotIn("MISMATCH", r_on.stdout)
+        self.assertEqual(len(r_on.stdout.splitlines()), 29)
+        if shutil.which("valgrind") is None:
+            self.skipTest("valgrind absent; native parity already proven")
+        cg_on = self.d / "cg_on.out"
+        cg_off = self.d / "cg_off.out"
+        v_on = run(["valgrind", "--tool=callgrind",
+                    f"--callgrind-out-file={cg_on}", on, "all"], self.d)
+        v_off = run(["valgrind", "--tool=callgrind",
+                     f"--callgrind-out-file={cg_off}", off, "all"], self.d)
+        self.assertEqual(v_on.returncode, 0, v_on.stderr)
+        self.assertEqual(v_off.returncode, 0, v_off.stderr)
+        self.assertEqual(v_on.stdout, v_off.stdout,
+                         "VEX must not change the SLP-on/off verdict")
+        self.assertNotIn("MISMATCH", v_on.stdout)
+        def ir(path):
+            for line in path.read_text().splitlines():
+                if line.startswith("summary: "):
+                    return int(line.split()[1])
+            self.fail(f"missing callgrind summary in {path}")
+        self.assertLessEqual(ir(cg_on), ir(cg_off),
+                             f"SLP must not cost instructions: {ir(cg_on)} vs {ir(cg_off)}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
