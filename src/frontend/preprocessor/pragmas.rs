@@ -555,7 +555,7 @@ impl Preprocessor {
         self.push_pragma_diagnostic(PragmaDiagnostic {
             severity: PragmaSeverity::PragmasWarning,
             diagnostic: PreprocessorDiagnostic {
-                kind: crate::common::error::WarningKind::Pragmas,
+                kind: Some(crate::common::error::WarningKind::Pragmas),
                 file: self.current_file(),
                 line,
                 col,
