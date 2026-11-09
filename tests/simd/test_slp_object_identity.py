@@ -39,6 +39,7 @@ the absence of the known-bad half-wide pack.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -617,6 +618,95 @@ int main(void) {
             0,
             "BB-SLP must not pack the loop-carried store->load recurrence",
         )
+
+
+    def test_33_two_tier_dedup_is_exact_and_output_preserving(self):
+        """Both tiers may emit one run twice; dedup must remove exactly ONE.
+
+        Regression for the hosted pair-family fix: object identity must ADD
+        a tier, not replace it.  A single-`GlobalAddr` object produces the
+        same run in both tiers.  Dedup must collapse it to ONE candidate
+        before `build_plan` is priced, and the emitted object must be
+        byte-identical to `CCC_NO_BB_SLP=1` (every plan here is declined).
+        """
+        n = 32
+        src = self.d / "two_tier_dedup.c"
+        with src.open("w") as f:
+            f.write("#include <stdint.h>\n")
+            for i in range(n):
+                f.write(f"uint32_t g{i}[4];\n")
+            f.write("int main(int argc, char **argv) {\n")
+            f.write("  (void)argv; uint32_t s = (uint32_t)argc;\n")
+            for i in range(n):
+                for j in range(4):
+                    f.write(f"  g{i}[{j}] = s + {i * 4 + j}u;\n")
+            f.write("  return (int)(s & 0xffu);\n}\n")
+        flags = ["-O2", "-march=x86-64-v3", "-c"]
+        on = self.d / "dedup_on.o"
+        off = self.d / "dedup_off.o"
+        a = compile_ok(LCCC, src, on, flags, env={"LCCC_DEBUG_SLP": "1"})
+        self.assertEqual(a.returncode, 0, a.stderr)
+        self.assertNotIn("panicked", a.stderr)
+        m = re.search(r":\s*(\d+) candidates", a.stderr)
+        self.assertIsNotNone(m, "missing [SLP-SEEDS] debug line")
+        self.assertEqual(int(m.group(1)), n,
+                         "exact dedup must leave ONE seed per single-web object")
+        costs = len(re.findall(r"\[SLP-COST\]", a.stderr))
+        self.assertLessEqual(costs, n,
+                             "a duplicate tier must not price a duplicate plan")
+        b = compile_ok(LCCC, src, off, flags, env={"CCC_NO_BB_SLP": "1"})
+        self.assertEqual(b.returncode, 0, b.stderr)
+        self.assertEqual(hashlib.sha256(on.read_bytes()).hexdigest(),
+                         hashlib.sha256(off.read_bytes()).hexdigest(),
+                         "SLP-on/off objects must match when every plan declines")
+        exe = self.d / "dedup_exe"
+        c = compile_ok(LCCC, src, exe, ["-O2", "-march=x86-64-v3"])
+        self.assertEqual(c.returncode, 0, c.stderr)
+        want = run([exe], self.d).returncode
+        self.assertEqual(want, 1 & 0xff)
+        for oracle in (GCC, os.environ.get("LCCC_TEST_CLANG", "clang-23")):
+            if not shutil.which(oracle.split()[0]):
+                continue
+            with self.subTest(oracle=oracle):
+                ref = self.d / ("dedup_" + Path(oracle.split()[0]).name)
+                q = compile_ok(oracle, src, ref, ["-O2", "-march=x86-64-v3"])
+                self.assertEqual(q.returncode, 0, q.stderr)
+                self.assertEqual(run([ref], self.d).returncode, want)
+
+    def test_34_symbol_id_space_is_exact_for_thousands_of_globals(self):
+        """`usize` interning must stay panic-free and bit-exact at scale.
+
+        The rejected `u32::try_from(len).expect(...)` grew the audit census
+        by one panic site.  A 2000-distinct-global TU exercises the interner
+        far beyond any real function without relying on a static census.
+        """
+        n = 2000
+        src = self.d / "id_space_stress.c"
+        with src.open("w") as f:
+            f.write("#include <stdint.h>\n")
+            for i in range(n):
+                f.write(f"uint32_t g{i};\n")
+            f.write("int main(int argc, char **argv) {\n")
+            f.write("  (void)argv; uint32_t s = (uint32_t)argc;\n")
+            for i in range(n):
+                f.write(f"  g{i} = s + {i}u;\n")
+            f.write(f"  return (int)((s + {n - 1}u) & 0xffu);\n}}\n")
+        flags = ["-O2", "-march=x86-64-v3", "-Wall", "-Wextra", "-Werror", "-Wpedantic"]
+        exe = self.d / "id_space_lccc"
+        a = compile_ok(LCCC, src, exe, flags, env={"LCCC_DEBUG_SLP": "1"})
+        self.assertEqual(a.returncode, 0, a.stderr)
+        self.assertNotIn("panicked", a.stderr)
+        want = run([exe], self.d).returncode
+        self.assertEqual(want, (1 + n - 1) & 0xff)
+        for oracle in (GCC, os.environ.get("LCCC_TEST_CLANG", "clang-23")):
+            if not shutil.which(oracle.split()[0]):
+                continue
+            with self.subTest(oracle=oracle):
+                ref = self.d / ("id_" + Path(oracle.split()[0]).name)
+                q = compile_ok(oracle, src, ref, flags)
+                self.assertEqual(q.returncode, 0, q.stderr)
+                self.assertEqual(run([ref], self.d).returncode, want)
+
 
 
 if __name__ == "__main__":

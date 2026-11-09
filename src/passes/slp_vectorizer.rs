@@ -150,29 +150,11 @@ struct SymbolRoots {
     globals: FxHashMap<u32, usize>,
     /// SSA `ParamRef` dest -> parameter index.
     params: FxHashMap<u32, usize>,
-    /// Roots designated by MORE THAN ONE distinct SSA address base.  Only
-    /// these can yield a site-tier stream different from the object tier;
-    /// for a single-base root the two tiers are identical, so paying for the
-    /// second `build_plan` would be pure waste.  Built once per fixpoint
-    /// round and shared by every block.
-    merged_roots: FxHashSet<StreamBase>,
 }
 
 impl SymbolRoots {
     fn build(func: &IrFunction) -> Self {
         let mut out = Self::default();
-        // root -> first distinct SSA base seen; a second, different base
-        // marks the root as merged.  O(1) per GlobalAddr/ParamRef.
-        let mut first_base: FxHashMap<StreamBase, u32> = FxHashMap::default();
-        let mut note_base = |root: StreamBase, base: u32, out: &mut Self| {
-            if let Some(&prev) = first_base.get(&root) {
-                if prev != base {
-                    out.merged_roots.insert(root);
-                }
-            } else {
-                first_base.insert(root, base);
-            }
-        };
         for block in &func.blocks {
             for inst in &block.instructions {
                 match inst {
@@ -191,25 +173,17 @@ impl SymbolRoots {
                             }
                         };
                         out.globals.insert(dest.0, id);
-                        note_base(StreamBase::Global(id), dest.0, &mut out);
                     }
                     Instruction::ParamRef {
                         dest, param_idx, ..
                     } => {
                         out.params.insert(dest.0, *param_idx);
-                        note_base(StreamBase::Param(*param_idx), dest.0, &mut out);
                     }
                     _ => {}
                 }
             }
         }
         out
-    }
-
-    /// Only merged roots need a site-tier stream (see `merged_roots`).
-    #[inline]
-    fn needs_site_tier(&self, root: &StreamBase) -> bool {
-        !matches!(root, StreamBase::Value(_)) && self.merged_roots.contains(root)
     }
 
     #[inline]
@@ -1930,6 +1904,31 @@ struct SeedCandidate {
     value_sink: Option<Value>,
 }
 
+/// EXACT identity of a seed.  Two tiers can emit the same run; a boolean
+/// `joint.is_some()` / `value_sink.is_some()` would silently conflate two
+/// different joint tails or two different return sinks.  `store_idx` already
+/// determines `lane_ops` (the same store instruction has one stored
+/// operand), but `anchor_ptr` is included explicitly so the key is total.
+type SeedKey = (
+    IrType,
+    usize,
+    Vec<usize>,
+    Value,
+    Option<joint::Tail>,
+    Option<Value>,
+);
+
+fn seed_dedup_key(c: &SeedCandidate) -> SeedKey {
+    (
+        c.ty,
+        c.width,
+        c.store_idx.clone(),
+        c.anchor_ptr,
+        c.joint,
+        c.value_sink,
+    )
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // The pass
 // ─────────────────────────────────────────────────────────────────────────
@@ -2325,10 +2324,11 @@ fn collect_seed_candidates(ctx: &BlockCtx) -> Vec<SeedCandidate> {
     //   `build_plan` legality proofs over its OWN store-index span, so no
     //   narrow window can inherit an illegal wide plan's permission.
     //
-    // Only roots that the object tier actually MERGES (globals/params with
-    // more than one SSA base) can produce a distinct site-tier group, so
-    // ordinary SSA bases are not duplicated.  A final dedup pass removes
-    // any remaining identical seeds (e.g. a single-web global).
+    // A `StreamBase::Value` root has no object-identity merge to undo, so
+    // its site-tier key would be byte-identical to the object key; skip it.
+    // All other roots feed both tiers.  A final EXACT dedup collapses the
+    // identical single-web seeds before any plan is priced (see
+    // `seed_dedup_key`).
     let mut object_streams: FxHashMap<
         (StreamBase, Option<u32>, u64, IrType),
         Vec<(i64, usize, Operand, Value)>,
@@ -2361,7 +2361,7 @@ fn collect_seed_candidates(ctx: &BlockCtx) -> Vec<SeedCandidate> {
             .entry((root, var, addr.mult, *ty))
             .or_default()
             .push(entry.clone());
-        if ctx.roots.needs_site_tier(&root) {
+        if !matches!(root, StreamBase::Value(_)) {
             site_streams
                 .entry((addr.base.0, var, addr.mult, *ty))
                 .or_default()
@@ -2492,18 +2492,10 @@ fn collect_seed_candidates(ctx: &BlockCtx) -> Vec<SeedCandidate> {
         candidates.push(seed);
     }
     // A single-web global produces the SAME run in both tiers.  Collapse
-    // identical seeds so the cost model and `apply_plan` are not paid twice;
-    // `store_idx` determines `anchor_ptr`, so this key is exact.
-    let mut seen: FxHashSet<(IrType, usize, Vec<usize>, bool, bool)> = FxHashSet::default();
-    candidates.retain(|c| {
-        seen.insert((
-            c.ty,
-            c.width,
-            c.store_idx.clone(),
-            c.joint.is_some(),
-            c.value_sink.is_some(),
-        ))
-    });
+    // EXACTLY identical seeds so the cost model and `apply_plan` are not
+    // paid twice; `seed_dedup_key` pins every distinguishing field.
+    let mut seen: FxHashSet<SeedKey> = FxHashSet::default();
+    candidates.retain(|c| seen.insert(seed_dedup_key(c)));
     // Longest chains first; ties by earliest position.
     candidates.sort_by(|a, b| {
         b.lane_ops
@@ -8001,23 +7993,94 @@ mod tests {
     }
 
     #[test]
-    fn symbol_roots_only_needs_site_tier_for_truly_merged_roots() {
-        let roots = SymbolRoots::build(&roots_fixture());
-        let g_out = roots.stream_base(Value(1));
-        let g_other = roots.stream_base(Value(3));
-        let p0 = roots.stream_base(Value(4));
-        let p1 = roots.stream_base(Value(6));
-        // g_out has two GlobalAddr webs, parameter 0 two ParamRef webs.
-        assert!(roots.needs_site_tier(&g_out));
-        assert!(roots.needs_site_tier(&p0));
-        // Single-web roots do NOT need a duplicate site-tier stream.
-        assert!(!roots.needs_site_tier(&g_other));
-        assert!(!roots.needs_site_tier(&p1));
-        // An unknown SSA base is already keyed by its raw id.
-        assert!(!roots.needs_site_tier(&StreamBase::Value(99)));
-        // Exactly the two merged roots are recorded.
-        assert_eq!(roots.merged_roots.len(), 2);
-        assert!(roots.merged_roots.contains(&g_out));
-        assert!(roots.merged_roots.contains(&p0));
+    fn symbol_ids_are_exact_machine_word_dense_ids() {
+        // The old `u32::try_from(len).expect(...)` added a panic site and
+        // was still a lossy conversion on principle.  `usize == len()` is
+        // the identity: no conversion, no saturation, no panic.  Stress the
+        // interner with far more distinct symbols than any real TU.
+        const N: usize = 300;
+        let mut f = IrFunction::new("id_space".into(), IrType::Void, vec![], false);
+        let insts: Vec<Instruction> = (0..N)
+            .map(|i| Instruction::GlobalAddr {
+                dest: Value((i + 1) as u32),
+                name: format!("g{i}"),
+            })
+            .collect();
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        let roots = SymbolRoots::build(&f);
+        assert_eq!(roots.symbol_ids.len(), N);
+        assert_eq!(roots.globals.len(), N);
+        let ids: FxHashSet<usize> = roots.symbol_ids.values().copied().collect();
+        assert_eq!(ids.len(), N, "ids must be dense and unique");
+        assert!(ids.iter().all(|&id| id < N));
+        assert!(roots.globals.values().all(|&id| id < N));
+        // The next id IS len(): identity conversion, exact on every host.
+        let next: usize = roots.symbol_ids.len();
+        assert_eq!(next, N);
+    }
+
+    #[test]
+    fn seed_dedup_key_distinguishes_every_payload_not_just_its_presence() {
+        use super::joint::Tail;
+        let make = |joint: Option<Tail>, sink: Option<Value>| SeedCandidate {
+            store_idx: vec![7, 8, 9, 10],
+            lane_ops: vec![Operand::Value(Value(1)); 4],
+            ty: IrType::U32,
+            anchor_ptr: Value(42),
+            width: 4,
+            joint,
+            value_sink: sink,
+        };
+        let a = make(
+            Some(Tail {
+                alpha: 0,
+                four_inputs: false,
+            }),
+            None,
+        );
+        let b = make(
+            Some(Tail {
+                alpha: 1,
+                four_inputs: false,
+            }),
+            None,
+        );
+        let c = make(
+            Some(Tail {
+                alpha: 0,
+                four_inputs: true,
+            }),
+            None,
+        );
+        let d = make(None, None);
+        let e = make(None, Some(Value(99)));
+        let f = make(None, Some(Value(100)));
+        assert_eq!(
+            seed_dedup_key(&a),
+            seed_dedup_key(&make(
+                Some(Tail {
+                    alpha: 0,
+                    four_inputs: false
+                }),
+                None
+            ))
+        );
+        for (x, y) in [(&a, &b), (&a, &c), (&a, &d), (&d, &e), (&e, &f)] {
+            assert_ne!(
+                seed_dedup_key(x),
+                seed_dedup_key(y),
+                "distinct tail/sink payloads must never be deduplicated"
+            );
+        }
+        // anchor_ptr is part of the key too.
+        let mut g = make(None, None);
+        g.anchor_ptr = Value(43);
+        assert_ne!(seed_dedup_key(&d), seed_dedup_key(&g));
     }
 }
