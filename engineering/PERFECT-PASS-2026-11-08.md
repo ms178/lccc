@@ -143,20 +143,30 @@ independently checked run, so no narrow window can inherit an illegal wide
 plan's permission.  It is also strictly more comprehensive than either tier
 alone.  Joint U8 seeds are emitted once (object tier only).
 
-**Compile-time refinement.**  For a root designated by exactly ONE SSA base
-the two tiers are byte-identical, so the site tier would build a second
-`FxHashMap` group, emit a second identical `SeedCandidate`, and then have
-the dedup pass discard it.  `SymbolRoots` records `merged_roots` (roots with
->= 2 distinct `GlobalAddr`/`ParamRef` bases) in the same O(function) scan;
-`needs_site_tier` gates the site tier to those roots only.  The final
-`(ty, width, store_idx, joint, value_sink)` dedup remains as defence in
-depth.  A six-root unit test pins the classification, and `StreamBase` is
-`Copy` so the hot loop no longer clones the enum per store.  This removes
-REDUNDANT MAP/GROUP WORK, not `build_plan` calls: the pre-existing dedup
-already ran before any plan was priced.  Alternating-order A/B on two
-120-object synthetic TUs (15 runs each) produced byte-identical `.o` files
-and median compile-time ratios 0.9893 / 0.9589 — a 1-4% improvement that is
-within noise, so NO wall-clock speedup is claimed.
+**Exact dedup is the only cross-tier work eliminator.**  A single-web
+global produces the SAME run in both tiers.  `seed_dedup_key` collapses it
+BEFORE any `build_plan` is priced, using an EXACT key:
+`(ty, width, store_idx, anchor_ptr, Option<joint::Tail>, Option<Value>)`.
+The first draft keyed on `joint.is_some()` / `value_sink.is_some()`
+BOOLEANS; that would silently conflate two different joint tails or two
+different return sinks.  `joint::Tail` now derives `Eq + Hash`, and
+`seed_dedup_key_distinguishes_every_payload_not_just_its_presence` pins
+all six cases.  `store_idx` determines `lane_ops` (one stored operand per
+store instruction); `anchor_ptr` is included explicitly so the key is
+total.  `StreamBase` is `Copy` (machine-word payloads only), so the hot
+loop does not clone the enum per store.
+
+**Rejected compile-time refinement (measured, not guessed).**  A
+`merged_roots` gate was prototyped to emit the site tier only for roots
+with >= 2 distinct SSA bases.  Callgrind ON THE COMPILER ITSELF
+(120-object / 960-store TU) measured
+`pre 862,129,272 Ir` vs `post 862,637,627 Ir` (**+0.059 %**), with
+`build_plan` identical at `4,244,435 Ir` in both — the pre-existing dedup
+already removed the duplicate candidate before it could be priced, so the
+gate only ADDED one `FxHashSet` lookup per store.  Alternating-order
+wall-clock medians were 0.9893 / 0.9589 (1-4 %, within noise).  The gate
+was therefore REVERTED: simpler code, no measured pessimisation, no
+unproven optimisation claim (R24).
 
 **Soundness.** C11 6.2.6.1p1: every `GlobalAddr` for one symbol designates the
 same object; two `ParamRef`s of one parameter index carry the same argument.
@@ -287,6 +297,10 @@ guards all remain.  `work_len == 0` is rejected before this point.
 | R21 | `Test Suite` aggregate failed with `{'backend': 'failure', 'backend-contracts-b': 'failure'}` | pure roll-up of the two lanes; no code change, resolves when both are green |
 | R22 | `check_layout_tie_rule.sh` failed locally because the post-wipe toolchain restore left valgrind off `PATH` | restored valgrind 3.19.0 + `VALGRIND_LIB` from the cached Debian package; gate re-run PASS (`tie=13 historical=13`, 96,397,664 vs 96,973,245 taken transfers) |
 | R23 | Azure shard-b log showed an earlier `FAIL contract: output mismatch` plus `identity: error: choose explicit regression/benchmark roots` and `cannot summarise ... expected_cases is 0` | full log chunks 28-30 prove these are DELIBERATE negative-control/self-test strings (`MISMATCH contract`, `COMPILE-FAIL-LCCC contract`, `COMPILE-FAIL-GCC contract`, argument-validation tests) from gate self-tests. The only real shard-b failure is the census growth in R18 — no source change needed for those lines |
+| R24 | `merged_roots` site-tier gate was proposed as a compile-time win | **measured and REJECTED**: Callgrind on the compiler +0.059 % total Ir, `build_plan` unchanged, wall-clock within noise; reverted (§3.1). Data beats intuition |
+| R25 | dedup key used `joint.is_some()` / `value_sink.is_some()` booleans — a latent conflation of distinct tail/sink payloads | exact `SeedKey` with full `Tail`/`Value`/`anchor_ptr`; Rust unit test pins 6 distinct payload cases |
+| R26 | three-way correctness script used `grep -c ' ok '` for the 29-shape matrix, reporting `shapes=0` | shape rows end in `' ok'`, object-identity rows contain `' ok '`; both greps corrected. LCCC/GCC16.2/Clang23.1.5 all 29/29 + 19/19 bit-identical |
+| R27 | `-march=native` binaries SIGILL on this host and print nothing for all three compilers | use `-O2 -mavx2` for host-CPU correctness/Callgrind; no false "0 shapes" claim |
 
 `Test Suite` (the aggregate gate) failed with
 `{'backend': 'failure', 'backend-contracts-b': 'failure'}` — it is a pure
@@ -467,13 +481,18 @@ with an explicit deferral reason.  Nothing is marked CLOSED without a receipt.
 - [x] `cargo fmt --all -- --check`
 - [x] `RUSTFLAGS="-D warnings" cargo check … --tests` — 0 warnings
 - [x] strict `fastbuild` build of `lccc` + `lccc-ld` with 4 GiB swap
-- [x] full Rust unit suite + 70 Python unittest cases
+- [x] full Rust unit suite + 75 Python unittest cases (final count below)
 - [x] GCC 16.2 / Clang 23.1.5 differential, `-Werror`, 29/29 + 19/19
 - [x] GDB, objdump, readelf, Callgrind, Memcheck receipts
 - [x] snapshot auto-saved to `/home/user/ms178-1.patch` and a mirror
 - [x] rebase onto latest `origin/main` (`dcd1822c4`, clean, 23 upstream commits)
 - [x] push to `arena/9546a706-lccc`, open PR #1151
-- [ ] iterate `gh pr checks` / REST check-runs + annotations / full hosted logs
+- [x] PR #1151 head `be0c3d1` reached 24 pass / 5 skip / 0 fail in hosted CI;
+      the user merged it into `main` as `9f8883ec3d61308e9ccfe26643887a7d27a2cd5e`
+      at 2026-11-09T01:48:31Z.  The one research job was still running at the
+      moment of the merge; its log is fetched below for the ICX receipt.
+- [ ] follow-up PR #1158 (head `9b63061`, exact dedup + red-team regressions):
+      iterate `gh pr checks` / REST check-runs + annotations / full hosted logs
       until GitHub CI is green — **this is the acceptance gate; local runs are
       diagnosis/evidence only**
 
@@ -555,12 +574,16 @@ kept.  `test_32` now pins BOTH regressions (SHA-256 output equality with
 `CCC_NO_BB_SLP=1` AND zero recurrence reloads).  The two-tier design keeps
 every narrow candidate as an independent, fully checked run instead.
 
-### 10.3 Third iteration — local evidence before the next push
+### 10.3 Third iteration — local evidence, then merge
 
-The `usize` census fix, two-tier seed collection, `merged_roots`
-compile-time refinement, `test_31`/`test_32` and the repaired Rust width
-unit test were LOCAL until the next commit/push; hosted CI had NOT seen
-them.  A full strict rebuild with `RUSTFLAGS="-D warnings"` finished
+The `usize` census fix, two-tier seed collection, the (later REVERTED)
+`merged_roots` prototype, `test_31`/`test_32` and the repaired Rust width
+unit test were LOCAL until the commit/push of `be0c3d1`.  Hosted CI then
+judged that head (workflow `42545827845`): `Assembler and linker contracts`
+and both `Fast local contracts` shards went green, the aggregate was
+`24 pass / 5 skip / 0 fail` with one `Targeted compiler research` job still
+running; the user merged PR #1151 at 01:48:31Z.  A full strict rebuild with
+`RUSTFLAGS="-D warnings"` finished
 `BUILD_OK 2026-11-09T01:14:01Z` (binary sha
 `4f4e436b6d298d4cfc2e96a45fccdce65a3e7b851c2ae63c6880f869705bf5fe`).
 Targeted receipts on that binary:
@@ -584,6 +607,8 @@ Targeted receipts on that binary:
   unchanged, 3 improved, 2 perturbations;
 * compile-time A/B: two 120-object synthetic TUs, 15 alternating runs each,
   byte-identical `.o`; median ratios 0.9893 / 0.9589 (1-4%, within noise).
+  Callgrind on the compiler showed the `merged_roots` prototype was actually
+  +0.059 % Ir, so it was REVERTED (R24).  No wall-clock win is claimed.
 
 Full Rust unit tests, the 51 backend gates and the 219 contract gates are
 re-run in the final sweep; the local environment still lacks a pinned RISC-V
@@ -591,3 +616,104 @@ BFD 2.47 ld, i686/AArch64 multiarch glibc headers and a 32-bit linker, so
 those local gate failures are toolchain-only and are NOT claimed as green.
 Hosted CI has those tools and remains the acceptance gate.  **This section
 is NOT a green-CI claim.**
+
+## 11. Final red-team audit of the two-tier patch (line by line)
+
+This is the audit the merged head did NOT yet have.  Every claim below is
+backed by a command in §10 / §13 or a unit test in the patch; where a
+proposed "optimisation" lost, it was REVERTED rather than documented as a
+win.
+
+### 11.1 Design alternatives, quantified
+
+| Alternative | Measurement / proof | Verdict |
+|---|---|---|
+| `Global(u32)` + `u32::try_from(len).expect(...)` | hosted `audit_census.py`: `panic_sites 863 -> 864`; conversion is lossy on principle | REJECTED. `Global(usize)`, id = `len()` identity, census stays 863 |
+| REPLACE SSA-base streams with object identity | hosted job `128896872669`: `movq/vmovq pair ops=0` | REJECTED. Two tiers (§3.1) |
+| 2-lane fallback windows inside a long run | SHA-256 recurrence reloads (12-15.6 % slower), illegal `vpslld`, `d4_schedule_pairs` regression | REJECTED, reverted (R20) |
+| weaken the CI pair-family gate | would hide a real capability loss, not a defect in the gate | REJECTED |
+| accept every legal plan (`cost floor -100000`) | 29/29 correct but Callgrind `1.0374x` WORSE | REJECTED |
+| fold crossing penalty into `vector_cost` | kills measured `s_clamp_u8` 0.8399x win | REJECTED; pure `crossings_are_amortized` gate |
+| `merged_roots` site-tier gate | Callgrind ON THE COMPILER: `862,129,272 -> 862,637,627 Ir` (+0.059 %), `build_plan` unchanged `4,244,435`, wall-clock ratios 0.9893/0.9589 (noise) | REJECTED, reverted (R24) |
+| boolean `joint.is_some()`/`value_sink.is_some()` dedup | latent conflation of distinct `Tail`/`Value` payloads | REJECTED; exact `SeedKey` (R25) |
+
+### 11.2 Line-by-line invariants of the final code
+
+* `StreamBase` derives `Copy`; all payloads are machine words.  No clone in
+  the per-store hot loop, no allocation, no panic.
+* `SymbolRoots::build` is ONE O(function) scan per fixpoint round.
+  `get(name)` precedes `insert(name.clone(), len())`, so only distinct
+  symbols allocate.  `usize == len()` is the identity conversion: no
+  `try_from`, `expect`, saturation, truncation, overflow or new panic site.
+  A 300-symbol Rust test and a 2000-global C stress test pin density,
+  uniqueness and panic-free interning.
+* `stream_base` maps `GlobalAddr`/`ParamRef` dests to their object id and
+  everything else to `Value(v.0)`.  Legality still uses the RAW
+  `SymAddr::base` + `RestrictBases::disjoint`; object identity widens the
+  SEED set only and never weakens an alias proof.
+* `collect_seed_candidates` builds `object_streams` and `site_streams` in
+  one pass.  `StreamBase::Value` roots skip the site tier because their
+  site key would be byte-identical to the object key.  Joint U8 seeds are
+  emitted ONCE (object tier only), so no duplicated tail analysis.
+* Entries are sorted by `(off, store_idx)`; offset deltas use
+  `checked_sub` (no debug-build i64 overflow panic); `size <= 0` fails
+  closed; `preferred_width` fails closed; duplicate offsets end a run.
+* `seed_dedup_key` is TOTAL: `(ty, width, store_idx, anchor_ptr,
+  Option<Tail>, Option<Value>)`.  It runs BEFORE `build_plan`, so a
+  single-web global is priced exactly once.  `Tail` derives `Eq + Hash`;
+  a Rust test distinguishes six different tail/sink/anchor payloads.
+* `build_plan` is UNCHANGED: the same cross-block use map, the same
+  store-interval legality rules, the same loop-carried recurrence veto,
+  the same exhaustive `scalar_instruction_weight` / `pack_vector_cost` and
+  the same measured `crossings_are_amortized` gate.  No env knobs, no
+  unsafe, no mutex/spinlock, no raw pointer, no null dereference, no
+  use-after-free, no arithmetic overflow in the new code.
+* `candidates.sort_by` is longest-first with earliest-position tie-break,
+  preserving the original "longest chains first" contract after dedup.
+
+### 11.3 Tools used, and tools deliberately NOT used
+
+* GDB 18.1 (`break s_jhash`, `info registers rip`), `objdump --disassemble`,
+  `readelf`, Valgrind Memcheck (0 errors) and Callgrind (Ir, deterministic)
+  on the host CPU; `-O2 -mavx2`, never `-march=native` (SIGILL on this host).
+* GCC 16.2 and Clang 23.1.5 from the restored `harness-cache-8` tag; 4 GiB
+  `/home/user/.cache/lccc-swap.img` active; `fastbuild` preset;
+  `RUSTFLAGS="-D warnings"` throughout.
+* ICX 2026.2: NOT installed locally.  Intel PPA `Packages` by-hash fetch
+  returned `AccessDenied`, PyPI `dpcpp-cpp-rt 2026.2.0` is runtime-only,
+  no GitHub release carries a compiler; the HOSTED `Authenticated Intel
+  ICX 2026.2 integration` job is the only ICX evidence and is explicitly
+  not claimed as a local run.
+* `objtool` validates Linux kernel ORC/unwind metadata and `pahole`
+  inspects DWARF struct layouts.  Neither applies to this userspace SLP IR
+  pass: there is no kernel object file and no new C struct.  `readelf` and
+  Rust `size_of`/`Copy` assertions cover the relevant layout questions;
+  this is a scope decision, not a skipped check.
+
+### 11.4 Honest limits (no handwaving)
+
+* The 29-shape three-way Callgrind comparison still shows LCCC/best Ir
+  `3.3727x` and only 1/29 shape wins.  "Beat all C compilers" is NOT met.
+* The `CCC_NO_BB_SLP=1` ablation geomean is `0.9765` (2.35 % Ir better),
+  with 24 shapes unchanged, 3 improved, 2 sub-3 % perturbations.  That is
+  NOT a wall-clock claim: the null-calibrated A/B was `1.0100` with CI
+  `[0.9761, 1.0418]`.
+* No per-function "most efficient implementation exceeding godlike quality"
+  verdict is possible from one PR.  The measured claims are limited to the
+  exact plans listed in §3.3 / §10 and the gates that pin them.
+* Pre-existing debt is preserved, not hidden: `knobs_undocumented 254` vs
+  baseline 261, MB-01..MB-45, SV-01..SV-12, GP-01..GP-24, UP-1..UP-9,
+  F1..F7, large-model/LTO/DWARF `.debug_info`/full ISA matrix/48-seed
+  YARPGen remain open.
+
+## 12. Follow-up PR #1158
+
+PR #1151 was MERGED at `be0c3d1` (main `9f8883e`).  The red-team findings
+R24-R27 and the exact-dedup hardening could not be added to a merged PR,
+so follow-up PR **#1158** was opened from the same fixed session branch
+`arena/9546a706-lccc` with head `9b63061` (single commit on top of
+`9f8883e`).  Snapshots: `/home/user/ms178-1.patch`,
+`/home/user/ms178-1-9b63061-exact-dedup.patch`, and the two mirrors under
+`engineering/snapshots/` (all sha `5c0b217161069385b189d60eecabdfa4c3466e0c274807b8dbc582389433ea03`,
+reverse-apply verified).  Hosted CI for #1158 is the acceptance gate; the
+final receipts are recorded in §13 once every job is green.
