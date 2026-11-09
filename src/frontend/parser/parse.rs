@@ -4152,9 +4152,16 @@ impl Parser {
                     // guessed alignment that would corrupt later constant folds.
                     let fields = fields.as_ref()?;
                     if struct_aligned.is_some()
-                        || fields
-                            .iter()
-                            .any(|f| f.alignment.is_some() || f.alignas_type.is_some())
+                        || fields.iter().any(|f| {
+                            f.alignment.is_some()
+                                || f.alignas_type.is_some()
+                                // On AArch64 even an unnamed zero-width
+                                // bitfield can raise a packed record's
+                                // alignment; an unevaluated width is not safe
+                                // to guess at parser time.
+                                || (crate::common::types::target_elf_machine() == 183
+                                    && f.bit_width.is_some())
+                        })
                     {
                         return None;
                     }
@@ -4237,6 +4244,28 @@ mod named_space_target_tests {
         assert_eq!(parser.struct_tag_alignments.get("Plain"), Some(&1));
         assert!(!parser.struct_tag_alignments.contains_key("Member"));
         assert!(!parser.struct_tag_alignments.contains_key("Record"));
+    }
+
+    #[test]
+    fn packed_zero_width_bitfield_is_not_cached_as_one_on_aarch64() {
+        struct RestoreTarget(u16);
+        impl Drop for RestoreTarget {
+            fn drop(&mut self) {
+                set_target_elf_machine(self.0);
+            }
+        }
+        let _restore = RestoreTarget(target_elf_machine());
+        let source = "struct __attribute__((packed)) Z { char c; unsigned :0; char x; };";
+        for machine in [3, 62, 183, 243] {
+            set_target_elf_machine(machine);
+            let mut parser = Parser::new(Lexer::new(source, 0).tokenize());
+            parser.parse();
+            assert_eq!(parser.error_count, 0);
+            assert_eq!(
+                parser.struct_tag_alignments.get("Z"),
+                if machine == 183 { None } else { Some(&1) }
+            );
+        }
     }
 
     #[test]
