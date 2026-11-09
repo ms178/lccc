@@ -3155,9 +3155,16 @@ mod simd_operand_role_and_upper_state_tests {
     /// A slot-homed vector value: the shape `vec_arg_mem` folds and every
     /// loader can reload from. `-32(%rbp)` is the same fixture the fold tests
     /// use, so these cases drive the real emitter rather than a stub.
+    ///
+    /// `value_use_counts` must cover BOTH ids: the dispatcher treats a
+    /// destination with zero uses as dead code and emits nothing, which would
+    /// make every assertion below vacuous (an empty `out`), and the loader
+    /// needs a materialised operand. Ids 0 (source) and 9 (destination) are
+    /// the ones these tests use.
     fn slot_vector(cg: &mut X86Codegen, id: u32) {
         cg.state.value_locations.insert(id, StackSlot(-32));
         cg.state.vector_values.insert(id);
+        cg.state.value_use_counts = vec![1; 10];
     }
 
     /// `vec_live_regs` is WIDTH-POLYGLOT: one map, three spellings (`%xmmN`
