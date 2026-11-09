@@ -24,6 +24,47 @@ link() { # link TARGET LINK_NAME
   sudo mkdir -p -- "$(dirname "$name")"
   sudo ln -s -- "$target" "$name"
 }
+# The restore script unpacks the pinned Debian archive as a directory of
+# .deb files, but agent-env.sh and the 32-bit/GDB/Valgrind gates need an
+# EXTRACTED root.  Rebuild it from the SAME immutable tag bytes, verify the
+# archive against MANIFEST.sha256, and extract every .deb with dpkg-deb -x.
+materialise_debs_root() {
+  local ROOT TAG want got tmp deb
+  ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+  TAG=${LCCC_AGENT_CACHE_TAG:-harness-cache-8}
+  if [[ -x "$D/usr/bin/valgrind" && -d "$D/usr/lib/debug/.build-id" ]]; then
+    return 0
+  fi
+  if ! git -C "$ROOT" cat-file -e "$TAG:MANIFEST.sha256.part00" 2>/dev/null; then
+    git -C "$ROOT" fetch origin tag "$TAG" --quiet || true
+  fi
+  want=$(git -C "$ROOT" cat-file blob "$TAG:MANIFEST.sha256.part00" |
+    awk '$2 == "debs-bookworm.tar.xz" { print $1; exit }')
+  [[ -n $want ]] || { echo "prepare_local_env.sh: debs-bookworm pin missing" >&2; return 1; }
+  tmp=$(mktemp -d)
+  trap 'rm -rf -- "$tmp"' RETURN
+  git -C "$ROOT" cat-file blob "$TAG:debs-bookworm.tar.xz.part00" >"$tmp/debs.tar.xz"
+  got=$(sha256sum "$tmp/debs.tar.xz" | awk '{print $1}')
+  [[ $got == "$want" ]] || { echo "prepare_local_env.sh: debs archive digest mismatch" >&2; return 1; }
+  # Reject absolute or parent-traversing members before extracting trusted bytes.
+  if tar -tJf "$tmp/debs.tar.xz" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
+    echo "prepare_local_env.sh: unsafe member in debs archive" >&2
+    return 1
+  fi
+  tar -xJf "$tmp/debs.tar.xz" -C "$tmp"
+  mkdir -p -- "$D"
+  while IFS= read -r -d '' deb; do
+    dpkg-deb -x "$deb" "$D"
+  done < <(find "$tmp/debs" -maxdepth 1 -type f -name '*.deb' -print0)
+  rm -rf -- "$tmp"
+  trap - RETURN
+  if [[ ! -L "$P/pyyaml-root" && ! -e "$P/pyyaml-root" ]]; then
+    ln -s -- "$D/usr/lib/python3/dist-packages" "$P/pyyaml-root"
+  fi
+  echo "DEBS_ROOT_OK valgrind=$D/usr/bin/valgrind debug=$D/usr/lib/debug/.build-id"
+}
+materialise_debs_root
+
 # Valgrind needs ld.so's strlen redirection; publish libc6-dbg's build-id tree.
 link "$D/usr/lib/debug" /usr/lib/debug
 # glibc multiarch headers.  /usr/include/bits was the first symptom; the
@@ -52,4 +93,70 @@ if [[ ! -L $G ]]; then
   mkdir -p -- "$(dirname "$G")"
   ln -s -- "$(dirname "$B")" "$G"
 fi
+
+# ─── Offline pinned-oracle adoption ───────────────────────────────────────
+# The pinned GAS/A64-XML/kernel-relocs provisioners accept a pre-placed
+# tarball/sources in $HOME/.cache/dl and re-verify its SHA-256 against their
+# own pins.  A sandbox with no route to ftp.gnu.org, developer.arm.com or
+# git.kernel.org otherwise fails those gates even though the exact immutable
+# bytes are in the harness-cache-8 tag.  Adopt them from the Git object store
+# (the ONLY network host this script may ever contact is the Git remote used
+# to fetch the tag), never from an unpinned mirror, and re-check every digest.
+adopt_offline_oracles() {
+  local ROOT TAG DL manifest name part dest want got tmp prefix src
+  ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+  TAG=${LCCC_AGENT_CACHE_TAG:-harness-cache-8}
+  DL=${GAS_DL_DIR:-${ARM_XML_DL_DIR:-$HOME/.cache/dl}}
+  mkdir -p -- "$DL"
+  if ! git -C "$ROOT" cat-file -e "$TAG:MANIFEST.sha256.part00" 2>/dev/null; then
+    git -C "$ROOT" fetch origin tag "$TAG" --quiet || true
+  fi
+  manifest_digest() {
+    git -C "$ROOT" cat-file blob "$TAG:MANIFEST.sha256.part00" |
+      awk -v n="$1" '$2 == n { print $1; exit }'
+  }
+  adopt_blob() {
+    local part dest name want got tmp
+    part=$1; dest=$2; name=$3
+    want=$(manifest_digest "$name")
+    [[ -n $want ]] || { echo "prepare_local_env.sh: no manifest pin for $name" >&2; return 1; }
+    if [[ -f $dest ]] && [[ $(sha256sum "$dest" | awk '{print $1}') == "$want" ]]; then
+      return 0
+    fi
+    tmp="$dest.tmp.$$"
+    git -C "$ROOT" cat-file blob "$TAG:$part" >"$tmp" || { rm -f -- "$tmp"; return 1; }
+    got=$(sha256sum "$tmp" | awk '{print $1}')
+    if [[ $got != "$want" ]]; then
+      rm -f -- "$tmp"
+      echo "prepare_local_env.sh: $name digest mismatch (got $got, want $want)" >&2
+      return 1
+    fi
+    mv -f -- "$tmp" "$dest"
+  }
+  # Names are exactly what scripts/ensure_gas_247.sh and
+  # scripts/ensure_arm_a64_xml.sh look for before they try a mirror.
+  adopt_blob "binutils-2.47-source.tar.xz.part00" \
+             "$DL/binutils-2.47.tar.xz" "binutils-2.47-source.tar.xz"
+  adopt_blob "ISA_A64_xml_A_profile-2026-09_md.tar.gz.part00" \
+             "$DL/ISA_A64_xml_A_profile-2026-09_md.tar.gz" \
+             "ISA_A64_xml_A_profile-2026-09_md.tar.gz"
+  # tests/linker/setup_kernel_tools.sh adopts pre-placed SOURCES, not the
+  # prebuilt relocs binary, and re-checks all six per-file pins itself.
+  prefix="$HOME/.cache/lccc-kernel-tools/kernel-tools"
+  mkdir -p -- "$prefix/tools"
+  tmp=$(mktemp -d)
+  trap 'rm -rf -- "$tmp"' RETURN
+  adopt_blob "kernel-relocs-v7.3.1-x86_64.tar.xz.part00" \
+             "$tmp/kernel-relocs.tar.xz" "kernel-relocs-v7.3.1-x86_64.tar.xz"
+  tar -xJf "$tmp/kernel-relocs.tar.xz" -C "$tmp"
+  src="$tmp/kernel-relocs-v7.3.1-x86_64/src"
+  for name in relocs.c relocs.h relocs_common.c relocs_32.c relocs_64.c; do
+    cp -f -- "$src/$name" "$prefix/$name"
+  done
+  cp -f -- "$src/tools/le_byteshift.h" "$prefix/tools/le_byteshift.h"
+  rm -rf -- "$tmp"
+  trap - RETURN
+  echo "OFFLINE_ORACLES_OK dl=$DL kernel=$prefix tag=$TAG"
+}
+adopt_offline_oracles
 echo "PREPARE_LOCAL_ENV_OK debug=$(readlink -f /usr/lib/debug) sys=$(readlink -f /usr/include/sys) gas=$G/bin/as"
