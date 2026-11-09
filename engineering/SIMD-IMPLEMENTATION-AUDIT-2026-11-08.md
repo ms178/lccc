@@ -1720,6 +1720,46 @@ as a `&'static str` from the table rather than copied, and the only
 allocation is the one `format!` that builds a replacement that has already
 passed every filter.  `check_peephole_alloc_before_filter.py` **PASS**.
 
+**Placement was itself measured and corrected.**  The first version ran the
+fold in phase 2, which left the register copy it creates unpropagated: the
+post-global cleanup loop re-runs the GP passes but *not*
+`propagate_vector_copies` / `eliminate_dead_vector_copies` — those live in the
+phase-1 fixpoint (`passes/mod.rs:1412`, `:1421`).  Moving the fold into that
+fixpoint immediately before `vector_copy_prop` makes the existing propagator
+rewrite the consumer in the same iteration (`vmovups %ymm3, (%rax)` becomes
+`vmovups %ymm0, (%rax)`), with **zero new pass invocations**.  The alternative
+— duplicating vector cleanup into phase 2b — was rejected: the source records
+that an earlier *ungated* re-run there caused interaction miscompiles.
+
+**Final measurement, shipped placement.**  Single binary, toggling only
+`CCC_PEEPHOLE_SKIP=aligned_vec_reload`, six **interleaved** rounds so machine
+drift cannot bias one arm:
+
+| statistic | pass off | pass on | delta |
+|---|---|---|---|
+| best-of-6 | 2 803 904 | 1 728 838 | **−38.3%** |
+| median | 2 869 782 | 1 780 395 | **−38.0%** |
+
+The two statistics agreeing within 0.3 points is the reason to trust this
+number: a single timed run of this loop drifted between 2.37 M and 2.87 M
+cycles across the session, so any one-shot percentage quoted from it would
+have been noise.
+
+**Remaining headroom, priced but not claimed.**  After propagation the loop
+still carries a dead `vmovups %ymm0, %ymm3` and the now-orphaned spill store.
+Hand-removing both gives 1 695 212 cycles against 1 807 036 for the same
+assembly at that time (**−6.2%** further).  They survive because
+`eliminate_dead_stores` keys on a literal slot offset and this store is
+indirect `(%rax)` — the same root cause as §9c.10.12 defect 3.  That is a
+frame-layout question, recorded rather than forced.
+
+**GitHub CI on the delivered head: all green** — 23 successful check-runs,
+3 skipped, **0 failures**; the `CI` workflow 19/19.  The steps that exercise
+this change all passed: *Build and package compiler*, *Clippy*,
+*Assertion-enabled units and corpus* (the 42 unit tests under debug
+assertions and overflow checks), *Codegen and runtime contracts (shard b)*
+including both new gate steps.
+
 **Tests.**  42 Rust unit tests in the pass module (every refusal, both
 encoding classes, all three widths, narrowing, self-reload, two readers,
 `i64::MIN` mask, 20-digit displacement, unbalanced parens, idempotence, empty
