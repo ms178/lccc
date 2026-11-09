@@ -52,3 +52,21 @@ pragma grammar. It does not establish cross-architecture vendor equivalence,
 all possible pragma placement semantics, performance parity, or universal
 compiler correctness. The earlier audit's nesting and `-fgimple` failures and
 other follow-ups remain open. No external expert approval is asserted.
+
+## In-progress ABI and switch-index work
+
+GCC 16.2 x86-64 and i686 probes distinguish an explicit member alignment in
+an attribute-packed record (it may exceed one) from the same member under
+`#pragma pack(2)` (it is capped at two), including packed records and unions.
+The new hosted fixture also covers `_Alignas`, typedef alignment, an ordinary
+member of a packed record under a pragma, and object emission. This is not
+`-fpack-struct` support; current-head hosted results are still required.
+
+The switch-lowering duplicate check now indexes covered intervals instead of
+scanning every previous label. Empty ranges remain empty and overlapping
+erroneous ranges are unioned for subsequent diagnostics. A deterministic
+unit test compares the index with a linear reference and a 30,000-case test
+exercises the scaling path. This only removes one quadratic component of the
+case-label problem; it does not remove the recursive AST/parser/lowering
+limits or establish a performance measurement for a complete translation
+unit. The 50,000-operation local Python model check is not an LCCC test.
