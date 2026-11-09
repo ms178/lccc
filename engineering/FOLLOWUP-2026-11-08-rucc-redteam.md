@@ -48,7 +48,7 @@ Also fixed the fastbuild wrapper's explicit job override: `LCCC_BUILD_JOBS=2` is
 
 ## Rucc ideas worth keeping / not worth wholesale porting
 
-- Worth adopting as discipline: capability queries must be truth-gated; rewrite rules should carry proof status and a solver-required CI lane; unverified/bounded-width rules must be inventoried separately. Rucc's verifier CI installs Z3 5.1.0, sets `RUCC_REQUIRE_SOLVER=1`, and checks rule directories against `docs/UNVERIFIED.md`; nine rules are proved only at 4/8 bits. Its build scripts generate matchers but do not prove rules.
+- Worth adopting as discipline: capability queries must be truth-gated; rewrite rules should carry proof status and a solver-required CI lane; unverified/bounded-width rules must be inventoried separately. Rucc's verifier CI installs Z3 5.1.0, sets `RUCC_REQUIRE_SOLVER=1`, and checks rule directories against its own docs/UNVERIFIED.md inventory; nine rules are proved only at 4/8 bits. Its build scripts generate matchers but do not prove rules.
 - LCCC already has extensive proof, differential, fuzz, peephole-invariance and benchmark-output infrastructure. Wholesale porting rucc's optimizer/e-graph/register allocator is not justified by this evidence and would be high-risk. Targeted transplants should be driven by a reproducer and an A/B measurement.
 - Rucc's optional e-graph rewriter is not the default pipeline; default selection is driven by `-Zrewriter=` and the level pipeline. Do not describe rucc as "e-graph optimized by default" without tracing the selected arm.
 - Rucc's safety monitor and litmus/replay harnesses are interesting correctness assets, but they depend on rucc IR/runtime conventions; port the *test shapes* first, not the monitor wholesale.
@@ -214,7 +214,7 @@ LCCC covers much of the same ground under different names (`ipa_pta`, `ipcp`,
 `live_range_shrinkage`, `web_congruence`, `expr_sink`, `licm`, `loop_preheader`,
 `loop_rotate`, `load_forward`, `redundant_loads`) and has far broader bit-idiom
 and vector coverage. **No wholesale port is justified**: rucc's e-graph is
-opt-in, and nine of its rules are proved only at 4/8 bits (`docs/UNVERIFIED.md`).
+opt-in, and nine of its rules are proved only at 4/8 bits (rucc docs/UNVERIFIED.md).
 
 ### The measured performance gap, and why the obvious fix would REGRESS
 
@@ -336,3 +336,38 @@ A Rust unit pins the three reproducer shapes. The expanded fuzz corpus
 (**3168 cases across three seeds**, now 1056 per seed) and the 187-check
 lifetime gate are clean; Clippy `-D warnings`, rustfmt and the preprocessor
 units remain green.
+
+### CI red-team: the strict `#if` check meets the Clang resource headers
+
+The trailing-token rejection added for withdrawn operators (`#if FOO(1)` must
+diagnose, GCC 16.2 parity) turned a previously silent gap into a hard error in
+Clang 23.1.5's own resource headers: `__stddef_size_t.h`, `__stddef_null.h` and
+seven siblings guard their textual fallback with
+`(__has_feature(modules) && !__building_module(_Builtin_stddef))`, and
+`xmmintrin.h` does the same for `_Builtin_intrinsics`. GCC does not define
+`__building_module`, so it rejects those headers too; Clang defines it as a
+builtin. LCCC consumes the Clang resource headers on every target, so the
+operator is now a first-class Clang-compatible query (same `#undef`/`#define`/
+push-pop lifetime as `__has_warning`) that truthfully answers **0** — LCCC has
+no Clang modules. The resolver mirrors Clang 23.1.5's measured diagnostics
+(too few/many arguments, nested parentheses, module-name grammar, unterminated
+invocation, missing-`(` recovery that absorbs the operand identifier).
+
+Differential probe: 14 shapes, LCCC vs Clang 23.1.5 — 11 exact matches
+including every diagnostic wording; the three differences are the two
+Clang-only `-Wbuiltin-macro-redefined` directive warnings (LCCC's documented
+persona emits none for its Clang-compatible extensions, exactly as for
+`__has_warning`) and a macro operand expanded by the code-line pass before the
+resolver sees it (the `#if` path, which the headers use, matches exactly).
+The lifetime gate now compiles the real Clang `stddef.h` through all four
+target drivers (205 checks with the oracle present), and the fuzz corpus
+covers the tenth operator (1088 cases/seed at count 800).
+
+Two more CI-only defects found and fixed in the same pass:
+
+* The new `Feature capability truthfulness` step was added to `frontend-b`
+  without registering it in `.github/ci-lane-plan.json`; the lane-plan audit
+  (and the SIMD pack's `test_13`) correctly rejected the hand-added gate.
+  Registered with its measured worst-of-3 cost (0.63 s) and provenance.
+* This follow-up cited rucc's own docs/UNVERIFIED.md inventory as a backtick path, which
+  the doc-link gate resolves against THIS repo; the citation is now prose.

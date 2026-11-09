@@ -32,8 +32,8 @@ impl Preprocessor {
     /// produced here (`__has_warning` contract violations) must point at
     /// the line the programmer wrote.
     pub(super) fn resolve_has_macros_in_code(&mut self, line: &str, diag_line: usize) -> String {
-        // Fast path: the overwhelming majority of lines have no __has_ token.
-        if !line.contains("__has_") {
+        // Fast path: the overwhelming majority of lines have no query token.
+        if !line.contains("__has_") && !line.contains("__building_module") {
             return line.to_string();
         }
         let mut result = String::with_capacity(64);
@@ -92,6 +92,10 @@ impl Preprocessor {
                     "__has_warning" => {
                         let val = self.resolve_has_warning_call_bytes(bytes, &mut i, diag_line);
                         result.push_str(&val);
+                    }
+                    "__building_module" => {
+                        let val = self.resolve_building_module_call_bytes(bytes, &mut i, diag_line);
+                        result.push_str(val);
                     }
                     "__has_include" | "__has_include_next" | "__has_embed" => {
                         // GCC 16.2 rejects these outside a directive but still
@@ -366,6 +370,9 @@ impl Preprocessor {
                 } else if ident == "__has_warning" {
                     let val = self.resolve_has_warning_call_bytes(bytes, &mut i, diag_line);
                     result.push_str(&val);
+                } else if ident == "__building_module" {
+                    let val = self.resolve_building_module_call_bytes(bytes, &mut i, diag_line);
+                    result.push_str(val);
                 } else {
                     result.push_str(ident);
                 }
@@ -545,6 +552,105 @@ impl Preprocessor {
         } else {
             "0"
         }
+    }
+
+    /// Parse `(module-name)` after Clang's `__building_module` and answer 0.
+    ///
+    /// LCCC has no Clang modules, so no module is ever being built. The
+    /// operator is still defined (and withdrawable/replaceable) because the
+    /// Clang resource headers LCCC consumes guard their textual fallbacks
+    /// with `!__building_module(_Builtin_stddef)`. Without it, the strict
+    /// trailing-token check in `evaluate_condition` rejects those headers at
+    /// the stray argument list, exactly as GCC rejects an unknown function-like
+    /// macro in `#if`. The operand is a module name, not a capability query;
+    /// its spelling cannot change the answer, so a macro operand is accepted
+    /// without expanding it into the parser.
+    fn resolve_building_module_call_bytes(
+        &mut self,
+        bytes: &[u8],
+        i: &mut usize,
+        diag_line: usize,
+    ) -> &'static str {
+        let op = "__building_module";
+        let len = bytes.len();
+        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+            *i += 1;
+        }
+        if *i >= len || bytes[*i] != b'(' {
+            self.query_diag(format!("missing '(' after '{op}'"), diag_line);
+            // Clang absorbs a following identifier operand in this recovery
+            // (measured: `__building_module foo` -> `0`, not `0foo`).
+            while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+                *i += 1;
+            }
+            if *i < len && is_ident_start_byte(bytes[*i]) {
+                *i += 1;
+                while *i < len && is_ident_cont_byte(bytes[*i]) {
+                    *i += 1;
+                }
+            }
+            return "0";
+        }
+        *i += 1;
+        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+            *i += 1;
+        }
+        if *i < len && bytes[*i] == b')' {
+            *i += 1;
+            self.query_diag(
+                "too few arguments provided to function-like macro invocation".to_string(),
+                diag_line,
+            );
+            return "0";
+        }
+        if *i < len && bytes[*i] == b'(' {
+            self.skip_open_paren_arg_bytes(bytes, i);
+            self.query_diag(
+                format!("nested parentheses not permitted in '{op}'"),
+                diag_line,
+            );
+            return "0";
+        }
+        if *i >= len || !is_ident_start_byte(bytes[*i]) {
+            self.skip_open_paren_arg_bytes(bytes, i);
+            self.query_diag(
+                format!("expected a module name in '{op}' expression"),
+                diag_line,
+            );
+            return "0";
+        }
+        let start = *i;
+        while *i < len && is_ident_cont_byte(bytes[*i]) {
+            *i += 1;
+        }
+        let raw = bytes_to_str(bytes, start, *i);
+        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+            *i += 1;
+        }
+        if *i >= len {
+            // Clang's wording when the invocation never closes (measured on
+            // 23.1.5 in `#if`); recovery is already at end of line.
+            self.query_diag(
+                "unterminated function-like macro invocation".to_string(),
+                diag_line,
+            );
+            return "0";
+        }
+        if bytes[*i] == b',' {
+            self.skip_open_paren_arg_bytes(bytes, i);
+            self.query_diag(
+                "too many arguments provided to function-like macro invocation".to_string(),
+                diag_line,
+            );
+            return "0";
+        }
+        if bytes[*i] != b')' {
+            self.skip_open_paren_arg_bytes(bytes, i);
+            self.query_diag(format!("missing ')' after '{raw}'"), diag_line);
+            return "0";
+        }
+        *i += 1;
+        "0"
     }
 
     /// Push a GCC-worded error for a malformed `__has_*` operand.  These are

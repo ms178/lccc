@@ -398,16 +398,19 @@ pub(super) fn is_dynamic_builtin(name: &str) -> bool {
 /// The special preprocessor query operators. They have no MacroDef entry,
 /// but GCC and Clang both let `#undef` withdraw them and `#define` replace
 /// them. Keep one list so existence, suppression and evaluation cannot drift.
-/// `__has_warning` is LCCC's documented Clang-compatible extension; GCC does
-/// not define it, but LCCC's existing corpus requires it to remain available.
+/// `__has_warning` and `__building_module` are LCCC's documented
+/// Clang-compatible extensions; GCC does not define them, but LCCC's corpus
+/// and the Clang resource headers it consumes require them to remain
+/// available. `__building_module` always answers 0: LCCC has no Clang modules.
 #[inline]
 pub(super) fn is_query_operator(name: &str) -> bool {
-    is_gcc_query_operator(name) || name == "__has_warning"
+    is_gcc_query_operator(name) || matches!(name, "__has_warning" | "__building_module")
 }
 
-/// The subset GCC 16.2 itself defines. `__has_warning` is LCCC's
-/// Clang-compatible extension: it has the same #undef/#define lifetime, but
-/// GCC emits no builtin-macro directive warnings for it.
+/// The subset GCC 16.2 itself defines. `__has_warning` and
+/// `__building_module` are LCCC's Clang-compatible extensions: they have the
+/// same #undef/#define lifetime, but GCC emits no builtin-macro directive
+/// warnings for them.
 #[inline]
 pub(super) fn is_gcc_query_operator(name: &str) -> bool {
     matches!(
@@ -3209,6 +3212,7 @@ mod query_operator_lifetime_tests {
             "__has_include_next",
             "__has_embed",
             "__has_warning",
+            "__building_module",
         ] {
             let mut t = MacroTable::new();
             assert!(t.is_defined(name), "{name} initially defined");

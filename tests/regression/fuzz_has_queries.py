@@ -32,6 +32,7 @@ OPS = (
     "__has_include",
     "__has_include_next",
     "__has_embed",
+    "__building_module",
 )
 ATOMS = [
     "c_atomic", "c_generic_selections", "tls", "cxx_binary_literals",

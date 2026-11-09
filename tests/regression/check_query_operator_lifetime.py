@@ -9,13 +9,17 @@ code), and its `#if` path evaluated the builtin before a user macro could
 expand.  This gate pins the corrected lifetime for every operator and the
 unclassified directive-warning controls measured on gcc-16.2.
 
-`__has_warning` is LCCC's Clang-compatible extension: it has the same
-lifetime, but GCC does not define it and emits no builtin directive warnings
-for it, so its warning expectations differ.
+`__has_warning` and `__building_module` are LCCC's Clang-compatible
+extensions: they have the same lifetime, but GCC does not define them and
+emits no builtin directive warnings for them, so their warning expectations
+differ. `__building_module` always answers 0 (LCCC has no Clang modules); it
+exists so the Clang resource headers' `!__building_module(_Builtin_stddef)`
+textual-fallback guards preprocess instead of dying on a stray argument list.
 """
 from __future__ import annotations
 
 import argparse
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -39,12 +43,14 @@ GCC_OPS = {
 CODE_OPS = {
     "__has_feature", "__has_extension", "__has_builtin",
     "__has_attribute", "__has_c_attribute", "__has_warning",
+    "__building_module",
 }
-ALL_OPS = dict(GCC_OPS, __has_warning='"-Wcpp"')
+ALL_OPS = dict(GCC_OPS, __has_warning='"-Wcpp"', __building_module="_Builtin_stddef")
 # Expected live answer for the operand above (GCC 16.2 / LCCC registry).
 LIVE_VALUE = {
     "__has_feature": "1", "__has_extension": "1", "__has_builtin": "1",
     "__has_attribute": "1", "__has_c_attribute": "202311", "__has_warning": "1",
+    "__building_module": "0",
 }
 
 
@@ -242,7 +248,34 @@ def main(argv: list[str] | None = None) -> int:
             check(f"attr-macro/{want}", r.returncode == 0 and want in r.stdout
                   and "int x=0;" not in r.stdout, r.stdout + r.stderr)
 
-        # 12. Extra tokens after #undef are diagnosed, repeated #undef still warns.
+        # 12. Clang resource headers must preprocess: their textual-fallback
+        #     guards spell `!__building_module(_Builtin_stddef)`, and the strict
+        #     trailing-token #if check rejects an unknown function-like name.
+        #     This is the exact shape that broke the AArch64/RV64 cross gate.
+        clang = shutil.which("clang-23")
+        if clang:
+            res = subprocess.run([clang, "-print-resource-dir"], capture_output=True,
+                                 text=True, timeout=20)
+            if res.returncode == 0:
+                inc = Path(res.stdout.strip()) / "include"
+                hdr = Path(tmp) / "clang_resource.c"
+                hdr.write_text(
+                    "#include <stddef.h>\n"
+                    "size_t x;\n"
+                    "int m=__building_module(_Builtin_stddef);\n"
+                    "#if __has_feature(modules) && !__building_module(_Builtin_stddef)\n"
+                    "int textual=1;\n#endif\n"
+                )
+                for driver in ("lccc", "lccc-i686", "lccc-arm", "lccc-riscv"):
+                    cc = Path(args.lccc).parent / driver
+                    if not cc.exists():
+                        continue
+                    r = subprocess.run(
+                        [str(cc), "-isystem", str(inc), "-fsyntax-only", str(hdr)],
+                        capture_output=True, text=True, timeout=30)
+                    check(f"clang-resource/{driver}", r.returncode == 0, r.stderr)
+
+        # 13. Extra tokens after #undef are diagnosed, repeated #undef still warns.
         src.write_text("#undef __has_feature junk\n#undef __has_feature\n")
         r = run(args.lccc, src)
         check("undef/extra-tokens", "extra tokens at end of '#undef' directive" in r.stderr, r.stderr)
