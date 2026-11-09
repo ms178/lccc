@@ -5651,7 +5651,8 @@ mod conditional_type_tests {
             counted_by: None,
             pointer_quals: Vec::new(),
         }];
-        let l2 = super::StructLayout::for_struct_with_packing(&pack2_bf, Some(2), None, &ctx, false);
+        let l2 =
+            super::StructLayout::for_struct_with_packing(&pack2_bf, Some(2), None, &ctx, false);
         assert_eq!(l2.align, 2);
         assert_eq!(l2.size, 2);
     }
@@ -5704,7 +5705,8 @@ mod conditional_type_tests {
             field("c", CType::Char, None),
             field("x", CType::LongLong, None),
         ];
-        let mut p = super::StructLayout::for_struct_with_packing(&packed, Some(1), None, &ctx, false);
+        let mut p =
+            super::StructLayout::for_struct_with_packing(&packed, Some(1), None, &ctx, false);
         p.apply_struct_aligned(Some(4));
         assert_eq!((p.size, p.align, p.member_align), (12, 4, 1));
 
