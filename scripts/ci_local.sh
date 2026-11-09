@@ -2038,6 +2038,22 @@ maskfacts_vendor_matrix() {
         "${icx_args[@]}" --json target/maskfacts-receipts/vendor.json
 }
 gate "maskfacts-vendor-matrix" fast maskfacts_vendor_matrix
+
+# Mirror the hosted pack-stack contract; ICX is an additional reference when
+# its authenticated snapshot is available, not a reason to skip local checks.
+pragma_pack_underflow() {
+    local -a icx_args=()
+    if [ -n "${LCCC_ICX_BIN:-}" ] && [ -x "$LCCC_ICX_BIN" ]; then
+        icx_args=(--reference "$LCCC_ICX_BIN")
+    fi
+    python3 tests/regression/check_pragma_pack_underflow.py \
+        --lccc target/fastbuild/lccc --lccc target/fastbuild/lccc-i686 \
+        --lccc target/fastbuild/lccc-arm --lccc target/fastbuild/lccc-riscv \
+        --reference gcc-16 --reference "${CLANG:-clang-23}" \
+        --reference32 gcc-16 --reference32 "${CLANG:-clang-23}" \
+        "${icx_args[@]}"
+}
+gate "pragma-pack-underflow" fast pragma_pack_underflow
 gate "count-observations" fast python3 tests/regression/check_count_observations.py --clang "${CLANG:-clang-23}"
 gate "llvm-scalar-logic" fast python3 tests/regression/check_llvm_scalar_logic.py
 gate "llvm-ring-identities" fast python3 tests/regression/check_llvm_ring_identities.py
