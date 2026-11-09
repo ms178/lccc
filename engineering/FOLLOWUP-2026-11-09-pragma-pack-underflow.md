@@ -110,5 +110,10 @@ member. The follow-up excludes dynamic members from the fixed-size maximum;
 the focused local witness passes for lengths 1–20, including unions containing
 only dynamic members, at `-O0` and `-O2`, and generates code for all four LCCC
 targets. That result is not a full VLA-union proof. Trailing dynamic bitfield
-member accesses and side-effectful bounds require further audit; independent
-size, stride, and offset walks may reevaluate side effects.
+member accesses and side-effectful bounds require further audit. A focused
+x86-64 `-O0` probe using `int i=10; struct S { int prefix; char a[i++];
+int tail; } s[2];` and then reading `i`, `sizeof s`, and the offset of
+`s[1].tail` prints `11 40 36` with GCC 16.2 but `13 40 36` with LCCC: the
+bound is evaluated more than once. Independent size, stride, and offset walks
+must instead share the captured dimensions, including when distinct macro
+expansions share source locations. This remains an open correctness defect.
