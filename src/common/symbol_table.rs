@@ -50,8 +50,11 @@ struct Scope {
     /// Block-scope or parameter objects without linkage and without `static`
     /// (C11 6.2.4p5): their address is not a link-time constant.
     automatic: FxHashSet<String>,
-    /// Block-scope object declarations, in source order, for unused warnings.
+    /// Object declarations in source order, for deterministic unused warnings.
     local_objects: Vec<LocalObject>,
+    /// Position of each tracked object in `local_objects`, local to this scope.
+    /// Keep the vector for warning order and the index for declaration/use lookup.
+    local_object_indices: FxHashMap<String, usize>,
     /// Names of local objects whose visible binding was referenced.
     used_local_objects: FxHashSet<String>,
     /// Per-level value reads: level 2 excludes discarded ++/--, level 3
@@ -141,6 +144,7 @@ impl Scope {
             linked: FxHashSet::default(),
             automatic: FxHashSet::default(),
             local_objects: Vec::new(),
+            local_object_indices: FxHashMap::default(),
             used_local_objects: FxHashSet::default(),
             local_value_reads: FxHashMap::default(),
             written_local_objects: FxHashSet::default(),
@@ -244,9 +248,12 @@ impl SymbolTable {
     /// compatible declaration in the same scope keeps one warning record.
     pub fn mark_local_object(&mut self, name: &str, span: Span, suppress_warning: bool) {
         if let Some(scope) = self.scopes.last_mut() {
-            if let Some(object) = scope.local_objects.iter_mut().find(|o| o.name == name) {
-                object.suppress_warning |= suppress_warning;
+            if let Some(&index) = scope.local_object_indices.get(name) {
+                scope.local_objects[index].suppress_warning |= suppress_warning;
             } else {
+                scope
+                    .local_object_indices
+                    .insert(name.to_string(), scope.local_objects.len());
                 scope.local_objects.push(LocalObject {
                     name: name.to_string(),
                     span,
@@ -261,7 +268,7 @@ impl SymbolTable {
     pub fn mark_used(&mut self, name: &str) {
         for scope in self.scopes.iter_mut().rev() {
             if scope.symbols.contains_key(name) {
-                if scope.local_objects.iter().any(|object| object.name == name) {
+                if scope.local_object_indices.contains_key(name) {
                     scope.used_local_objects.insert(name.to_string());
                     for count in scope.local_value_reads.entry(name.to_string()).or_default() {
                         *count += 1;
@@ -283,7 +290,7 @@ impl SymbolTable {
             if !scope.symbols.contains_key(name) {
                 continue;
             }
-            if index != 0 && scope.local_objects.iter().any(|o| o.name == name) {
+            if index != 0 && scope.local_object_indices.contains_key(name) {
                 scope.written_local_objects.insert(name.to_string());
                 if let Some(reads) = scope.local_value_reads.get_mut(name) {
                     for count in &mut reads[usize::from(minimum_level - 1)..] {
@@ -642,6 +649,7 @@ impl Default for SymbolTable {
 #[cfg(test)]
 mod binding_depth_tests {
     use super::{Symbol, SymbolTable};
+    use crate::common::source::Span;
     use crate::common::types::{AddressSpace, CType, FunctionType};
 
     fn fn_sym(name: &str) -> Symbol {
@@ -690,6 +698,55 @@ mod binding_depth_tests {
             Some(0),
             "and it stops at the scope end"
         );
+    }
+
+    #[test]
+    fn tracked_objects_keep_order_first_span_and_scope_local_index() {
+        let mut table = SymbolTable::new();
+        table.push_scope();
+        for (name, offset) in [("alpha", 10), ("beta", 20), ("gamma", 30)] {
+            table.declare(fn_sym(name));
+            table.mark_local_object(name, Span::new(offset, offset + 1, 0), false);
+        }
+        // A redeclaration must not change the original span or order; warning
+        // suppression is cumulative even if a later declaration omits it.
+        table.mark_local_object("beta", Span::new(99, 100, 0), true);
+        table.mark_local_object("beta", Span::new(101, 102, 0), false);
+        let scope = table.scopes.last().unwrap();
+        assert_eq!(scope.local_object_indices.len(), 3);
+        for (index, object) in scope.local_objects.iter().enumerate() {
+            assert_eq!(scope.local_object_indices.get(&object.name), Some(&index));
+        }
+        assert_eq!(
+            table.unused_local_objects(),
+            vec![
+                ("alpha".into(), Span::new(10, 11, 0), None),
+                ("gamma".into(), Span::new(30, 31, 0), None),
+            ]
+        );
+        table.push_scope();
+        table.declare(fn_sym("alpha"));
+        table.mark_local_object("alpha", Span::new(40, 41, 0), false);
+        table.mark_used("alpha");
+        table.mark_write_only("alpha", 2);
+        assert_eq!(
+            table.unused_local_objects(),
+            vec![("alpha".into(), Span::new(40, 41, 0), Some(2))]
+        );
+        table.pop_scope();
+        assert_eq!(
+            table.unused_local_objects(),
+            vec![
+                ("alpha".into(), Span::new(10, 11, 0), None),
+                ("gamma".into(), Span::new(30, 31, 0), None),
+            ]
+        );
+        // A visible untracked inner binding must not mark the outer one used.
+        table.push_scope();
+        table.declare(fn_sym("alpha"));
+        table.mark_used("alpha");
+        table.pop_scope();
+        assert_eq!(table.unused_local_objects()[0].0, "alpha");
     }
 
     #[test]

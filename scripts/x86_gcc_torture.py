@@ -171,8 +171,27 @@ def run(command: Sequence[str], timeout: float, *, cwd: Path | None = None) -> s
 
 
 def detail_of(proc: subprocess.CompletedProcess[bytes], limit: int = 6000) -> str:
-    data = proc.stdout + proc.stderr
-    return data.decode("utf-8", "replace")[-limit:]
+    """Preserve the first diagnostic and final status within a bounded excerpt.
+
+    Source snippets and macro-expansion notes can exceed the limit, and a
+    tail-only excerpt loses the actual error. Prefer the start of stderr when
+    present, but retain the combined output's tail (including harness timeout
+    information). Short output remains byte-for-byte compatible after decoding.
+    """
+    if limit < 0:
+        raise ValueError("detail limit must be non-negative")
+    if limit == 0:
+        return ""
+    text = (proc.stdout + proc.stderr).decode("utf-8", "replace")
+    if len(text) <= limit:
+        return text
+    marker = "\n... [diagnostic truncated] ...\n"
+    if limit <= len(marker):
+        return text[-limit:]
+    leading = proc.stderr.decode("utf-8", "replace") if proc.stderr else text
+    budget = limit - len(marker)
+    front = budget // 2
+    return leading[:front] + marker + text[-(budget - front):]
 
 
 def native_directive_flags(source: Path) -> tuple[str, ...]:
@@ -589,6 +608,30 @@ def public_environment() -> dict[str, str]:
                 marker in k.upper() for marker in ("TOKEN", "SECRET", "PASSWORD", "KEY", "AUTH"))}
 
 
+def harness_dependency_digest() -> str:
+    """Hash the runner's repository-local support modules, with their names."""
+    digest = hashlib.sha256()
+    for name in ("tools/corpus/__init__.py", "tools/corpus/process.py",
+                 "tools/corpus/publication.py", "tools/corpus/evidence.py",
+                 "tools/corpus/dejagnu.py"):
+        digest.update(name.encode() + b"\0" + (REPO / name).read_bytes() + b"\0")
+    return digest.hexdigest()
+
+
+def oracle_environment_digest() -> str:
+    """Fingerprint selected search/injection knobs without publishing values.
+
+    This is not a complete machine identity: headers, CRT, binutils and shared
+    libraries remain external inputs. Missing and empty values are distinct.
+    """
+    keys = ("PATH", "GCC_EXEC_PREFIX", "COMPILER_PATH", "CPATH", "C_INCLUDE_PATH",
+            "CPLUS_INCLUDE_PATH", "OBJC_INCLUDE_PATH", "LIBRARY_PATH", "LD_LIBRARY_PATH",
+            "LD_PRELOAD", "LD_AUDIT", "SOURCE_DATE_EPOCH", "SDKROOT")
+    return hashlib.sha256(json.dumps({k: os.environ.get(k) for k in keys},
+                                     sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=True).encode("ascii")).hexdigest()
+
+
 _INCLUDE_RE = re.compile(rb'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"', re.M)
 # A torture case pulls in at most a handful of local headers; the bound is
 # there so a pathological (or cyclic) include graph cannot make identity
@@ -673,8 +716,9 @@ def identity_drift(args: argparse.Namespace, sources: list[Path],
     pin stands, and the run is marked unusable.
     """
     now = run_identity(args, sources, suite, is_32)
-    changed = [key for key in ("selected_sources_sha256", "dependency_digest",
-                               "tools", "gcc_checkout_head", "runner_sha256")
+    changed = [key for key in ("selection", "dependency_digest", "tools", "gcc_checkout_head",
+                               "runner_sha256", "harness_dependency_sha256",
+                               "oracle_environment_sha256", "host_image")
                if now.get(key) != identity.get(key)]
     return changed
 
@@ -701,6 +745,7 @@ def run_identity(args: argparse.Namespace, sources: list[Path],
         "lccc": str(args.lccc), "lccc_ld": str(args.lccc_ld), "gcc": args.gcc,
         "lccc_head": revision(REPO), "link_mode": args.link_mode,
         "runner_sha256": file_sha256(Path(__file__)),
+        "harness_dependency_sha256": harness_dependency_digest(),
         "gcc_checkout_head": revision(args.suite),
         "gcc_testsuite": _testsuite_version(args.suite),
         "corpus_stamp_sha256": file_sha256(stamp), "tools": tools,
@@ -714,6 +759,8 @@ def run_identity(args: argparse.Namespace, sources: list[Path],
         "append": args.append, "runner": args.runner, "expensive": args.expensive,
         "compile_timeout": args.compile_timeout, "run_timeout": args.run_timeout,
         "jobs": args.jobs, "host": platform.platform(),
+        "host_image": {"os": os.environ.get("ImageOS"), "version": os.environ.get("ImageVersion")},
+        "oracle_environment_sha256": oracle_environment_digest(),
         "environment": public_environment(),
         # The boundary is stated, not implied: quoted (project-local) includes
         # are pinned; system headers reached through <...> are not, because
@@ -859,8 +906,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Identity is captured before the matrix, never inferred later from a
     # possibly rebuilt binary or a rebased checkout. Paths alone are not pins.
     is_32 = args.arch in ("i686", "i386")
-    identity = run_identity(args, sources, args.suite, is_32)
-    fatal = reference_preflight(args, runner_cmd)
+    # Even an identity-capture fault needs a partial report and an
+    # infrastructure exit, rather than an uncaught exception (exit 1 is also
+    # used for completed candidate failures by advisory wrappers).
+    identity = {"arch": args.arch, "mode": args.mode}
+    fatal = None
 
     def save(complete: bool) -> None:
         if args.json:
@@ -879,6 +929,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     results, key=lambda r: (r.test, flags.index(r.flags)))],
             })
 
+    try:
+        identity = run_identity(args, sources, args.suite, is_32)
+        fatal = reference_preflight(args, runner_cmd)
+    except Exception as exc:  # noqa: BLE001 - infrastructure fault, not a candidate result
+        fatal = f"identity/reference preflight fault: {type(exc).__name__}: {exc}"
     save(False)
     if fatal:
         print("error: " + fatal, file=sys.stderr)
@@ -959,7 +1014,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     elapsed = time.monotonic() - started
     if not counts["pass"] and all(status in QUIET_STATUSES for status in counts):
         fatal = "no eligible case passed; an all-skipped run is not validation"
-    drifted = identity_drift(args, sources, identity, args.suite, is_32)
+    try:
+        drifted = identity_drift(args, sources, identity, args.suite, is_32)
+    except Exception as exc:  # noqa: BLE001 - failure to verify is not a completed run
+        fatal = (fatal or "") + ("; " if fatal else "") + (
+            f"cannot verify run identity after execution: {type(exc).__name__}: {exc}")
+        save(False)
+        print(f"error: {fatal}", file=sys.stderr)
+        return 2
     if drifted:
         # The pre-run identity stands (it is what the cases actually ran
         # against); what the drift invalidates is the run's claim to be

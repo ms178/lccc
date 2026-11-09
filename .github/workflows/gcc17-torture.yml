@@ -26,9 +26,14 @@ on:
         required: false
         default: ''
       ref:
-        description: 'GCC trunk commit to pin (empty: resolve current master)'
+        description: 'GCC trunk commit to pin (empty: use the pinned corpus revision)'
         required: false
         default: ''
+      audit_scaling:
+        description: 'Also measure x86_64 declaration scaling against GCC 16.2'
+        type: boolean
+        required: false
+        default: false
   schedule:
     - cron: '17 3 * * 1'
   push:
@@ -42,12 +47,20 @@ on:
       - 'include/**'
       - 'tests/**'
       - 'scripts/ci_gcc17_torture.sh'
+      - 'scripts/torture_ci_summary.py'
+      - 'scripts/torture_ci_provenance.py'
+      - 'scripts/torture_ci_ratchet.py'
+      - 'engineering/evidence/gcc17-torture-baseline/**'
+      - 'scripts/torture_evidence.py'
+      - 'tools/corpus/**'
+      - 'scripts/measure_decl_scaling.py'
       - 'scripts/ensure_gcc_torture_git.py'
       - 'scripts/x86_gcc_torture.py'
       - 'scripts/x86_gcc_torture_i686.py'
       - 'scripts/build_lccc_fast.sh'
       - 'scripts/ci_install_gcc16.sh'
       - 'scripts/ci_install_gcc_oracle.sh'
+      - 'scripts/gcc_oracle_tree.py'
       - 'scripts/ci_toolchain_bundle.sh'
       - 'scripts/ci_provision_toolchain.sh'
       - 'scripts/ci_verify_oracles.sh'
@@ -127,6 +140,7 @@ jobs:
     uses: ./.github/workflows/gcc17-torture-leg.yml
     with:
       arch: x86_64
+      audit_scaling: ${{ inputs.audit_scaling || false }}
       flags: ${{ inputs.flags || '-O2' }}
       filter: ${{ inputs.filter || '' }}
       ref: ${{ inputs.ref || '' }}

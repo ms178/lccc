@@ -180,6 +180,37 @@ C
 out=$("$tmp/pack_size")
 [ "$out" = "5 8" ] || fail "#pragma pack changed meaning: got '$out', want '5 8'"
 
+# Invalid numeric pack operands are ignored, not fed to the power-of-two
+# layout machinery. An invalid push must not create a stack entry either.
+cat >"$tmp/pack_invalid.c" <<'C'
+#pragma pack(2)
+#pragma pack(3)
+struct A { char c; int i; };
+_Static_assert(sizeof(struct A) == 6, "invalid set changed packing");
+#pragma pack(32)
+struct B { char c; int i; };
+_Static_assert(sizeof(struct B) == 6, "out-of-range set changed packing");
+#pragma pack(push, 4)
+#pragma pack(push, 3)
+#pragma pack(pop)
+struct C { char c; int i; };
+_Static_assert(sizeof(struct C) == 6, "invalid push changed the stack");
+#pragma pack(0)
+struct D { char c; int i; };
+_Static_assert(sizeof(struct D) == 8, "zero did not reset packing");
+C
+"$CCC" -fsyntax-only "$tmp/pack_invalid.c" >"$tmp/pack_invalid.log" 2>&1 || fail "invalid pack operands failed without -Werror" "$(cat "$tmp/pack_invalid.log")"
+[ "$(grep -c 'alignment must be a small power of two' "$tmp/pack_invalid.log" || true)" -eq 3 ] || fail "invalid pack operands did not each warn" "$(cat "$tmp/pack_invalid.log")"
+if "$CCC" -fsyntax-only -Werror=pragmas "$tmp/pack_invalid.c" >"$tmp/pack_error.log" 2>&1; then
+    fail "-Werror=pragmas did not reject invalid pack operands"
+fi
+"$CCC" -fsyntax-only -Werror -Wno-pragmas "$tmp/pack_invalid.c" >"$tmp/pack_suppressed.log" 2>&1 || fail "-Wno-pragmas did not suppress pack warnings" "$(cat "$tmp/pack_suppressed.log")"
+"$CCC" -E "$tmp/pack_invalid.c" >"$tmp/pack_invalid.out" 2>"$tmp/pack_invalid_e.log" || fail "preprocessing invalid pack operands failed"
+[ ! -s "$tmp/pack_invalid_e.log" ] || fail "-E unexpectedly diagnosed frontend pack warnings" "$(cat "$tmp/pack_invalid_e.log")"
+for want in '#pragma pack(3)' '#pragma pack(32)' '#pragma pack(push, 3)'; do
+    grep -qxF "$want" "$tmp/pack_invalid.out" || fail "-E lost invalid pack directive: $want"
+done
+
 # --- 5. character constants in #if ----------------------------------------
 bindir=$(dirname "$CCC")
 CCC_I686=${CCC_I686:-$bindir/lccc-i686}
