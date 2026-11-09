@@ -2298,7 +2298,24 @@ impl Lowerer {
             // fixed-size members and every dynamic member. Evaluate dynamic
             // bounds in declaration order rather than assuming the first VLA
             // is necessarily the largest.
-            let mut largest = Operand::Const(IrConst::ptr_int(layout.size as i64));
+            // The ordinary static layout represents an unknown array bound as
+            // an incomplete array, whose generic size is a pointer-sized
+            // placeholder. That placeholder is not a real union member size.
+            // Keep the full layout for its alignment, but derive the fixed
+            // maximum from only the members that have no runtime size.
+            let fixed_fields: Vec<_> = fields
+                .iter()
+                .filter(|field| !self.field_vla_runtime_size_probe(field))
+                .cloned()
+                .collect();
+            let fixed_layout = self.compute_struct_union_layout_packed(
+                &fixed_fields,
+                true,
+                max_field_align,
+                pragma_pack,
+                reverse_sso,
+            );
+            let mut largest = Operand::Const(IrConst::ptr_int(fixed_layout.size as i64));
             for field in fields {
                 if field.bit_width.is_some() || !self.field_vla_runtime_size_probe(field) {
                     continue;

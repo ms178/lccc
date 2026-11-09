@@ -44,8 +44,9 @@ Locally, GCC 16.2 (verified against the repository's pinned archive SHA-256)
 accepted the layout assertions in syntax-only mode for both `-m64` and `-m32`.
 It emitted warnings for the unsuppressed underflows, promoted them under
 `-Werror=pragmas`, suppressed them under `-Wno-pragmas`, and emitted none in
-`-E` mode. No local compiler build or local CI was run. Hosted results must be
-read from this revision's CI, not inferred from these probes.
+`-E` mode. A local warning-denying fastbuild and the focused regression were
+subsequently run; local CI was not. Hosted results must be read from the
+matching revision's CI, not inferred from these probes.
 
 This change does not implement `-fpack-struct`, named pack stacks, or the full
 pragma grammar. It does not establish cross-architecture vendor equivalence,
@@ -102,5 +103,12 @@ Neither variant is implemented yet.
 The dynamic VLA-record walk has separately been changed to seed from the
 actual VLA member's static offset rather than the first preceding field. GCC's
 VLA-member extension is rejected by Clang 23.1.5, so its runtime witness uses
-GCC only, and is not a four-vendor comparison. VLA unions, trailing dynamic
-bitfield member accesses, and side-effectful bounds require further audit.
+GCC only, and is not a four-vendor comparison. The first multiple-VLA union
+implementation failed hosted CI (run 42616648387): with both lengths one, it
+used an eight-byte incomplete-array placeholder instead of the four-byte fixed
+member. The follow-up excludes dynamic members from the fixed-size maximum;
+the focused local witness passes for lengths 1–20, including unions containing
+only dynamic members, at `-O0` and `-O2`, and generates code for all four LCCC
+targets. That result is not a full VLA-union proof. Trailing dynamic bitfield
+member accesses and side-effectful bounds require further audit; independent
+size, stride, and offset walks may reevaluate side effects.

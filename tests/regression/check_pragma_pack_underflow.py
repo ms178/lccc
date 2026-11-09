@@ -156,6 +156,8 @@ int unions(int n, int m) {
     union __attribute__((packed)) P { char a[n]; unsigned long long x; } p;
     union __attribute__((aligned(16))) A { char a[n]; unsigned long long x; } a;
     union M { char a[n]; char b[m]; int x; } v;
+    union D { char a[n]; char b[m]; } d;
+    union S { char a[n]; } s;
     int ue = ((n > 8 ? n : 8) + 7) & ~7;
     int pe = n > 8 ? n : 8;
     int ae = ((n > 8 ? n : 8) + 15) & ~15;
@@ -166,6 +168,12 @@ int unions(int n, int m) {
     if (sizeof v != me) {
         printf("multiple VLA union n=%d m=%d got=%d expected=%d\n", n, m, (int)sizeof v, me);
         return 11;
+    }
+    int de = n > m ? n : m;
+    if (sizeof d != de || sizeof s != n) {
+        printf("dynamic-only VLA union n=%d m=%d got=%d/%d expected=%d/%d\n",
+               n, m, (int)sizeof d, (int)sizeof s, de, n);
+        return 12;
     }
     return 0;
 }
