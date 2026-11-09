@@ -31,8 +31,9 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::instruction::Instruction;
+use crate::ir::instruction::{replace_values_in_inst_map, replace_values_in_terminator_map};
 use crate::ir::intrinsics::IntrinsicOp;
-use crate::ir::reexports::{BasicBlock, IrFunction, IrModule, Operand, Value};
+use crate::ir::reexports::{BasicBlock, IrConst, IrFunction, IrModule, Operand, Value};
 use std::collections::VecDeque;
 
 #[derive(Clone, Copy, Debug)]
@@ -40,6 +41,9 @@ struct AllocaInfo {
     block: usize,
     instruction: usize,
     size: usize,
+    /// Declared alignment of the home, needed to decide whether a write that
+    /// is re-pointed at it still satisfies the producer's alignment contract.
+    align: usize,
     volatile: bool,
     semantic_volatile: bool,
 }
@@ -64,6 +68,7 @@ fn collect_allocas(func: &IrFunction) -> FxHashMap<u32, AllocaInfo> {
             if let Instruction::Alloca {
                 dest,
                 size,
+                align,
                 volatile,
                 semantic_volatile,
                 ..
@@ -75,6 +80,7 @@ fn collect_allocas(func: &IrFunction) -> FxHashMap<u32, AllocaInfo> {
                         block: block_idx,
                         instruction: instruction_idx,
                         size: *size,
+                        align: *align,
                         volatile: *volatile,
                         semantic_volatile: *semantic_volatile,
                     },
@@ -1239,6 +1245,598 @@ fn promote_in_function(func: &mut IrFunction) -> usize {
         hoist_block_allocas(block);
     }
     applied
+}
+
+/// How a compiler-created vector home is retired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HomeBypass {
+    /// The home is a relay: its single reader is a `VecLoad` whose result is
+    /// stored straight to the real destination. Redirect the producer's
+    /// `dest_ptr` to that destination and delete the load/store pair.
+    ///
+    /// This mirrors `promote_in_function`, which performs the same redirect
+    /// for the legacy `Memcpy` relay. The generic family spells the copy as
+    /// `VecLoad`+`VecStore`, which that pass cannot see, so it survived as a
+    /// full stack roundtrip per operation.
+    Relay { destination: u32 },
+    /// The home is a spill of a register value (`VecStore*`), and every
+    /// reader is a full-width vector read. Hand the stored register to the
+    /// readers and delete the store.
+    Spill,
+}
+
+/// One planned home bypass.
+struct HomeForward {
+    block: usize,
+    producer: usize,
+    kind: HomeBypass,
+    /// Register value that replaces every read of the home. `None` for a
+    /// relay, which re-points the producer instead of forwarding a value --
+    /// using 0 as a placeholder would collide with real value id 0.
+    value: Option<u32>,
+    /// `(instruction, argument index)` reads rewritten in place.
+    arg_rewrites: Vec<(usize, usize)>,
+    /// Instructions removed outright: the retired producer (`Spill`) and the
+    /// relay's `VecStore` (`Relay`).
+    dead: Vec<usize>,
+}
+
+/// True when `operand` is the canonical constant-zero offset slot the SIMD
+/// lowering puts on whole-register loads and stores.
+fn operand_is_const_zero(operand: &Operand) -> bool {
+    matches!(
+        operand,
+        Operand::Const(IrConst::I8(0))
+            | Operand::Const(IrConst::I16(0))
+            | Operand::Const(IrConst::I32(0))
+            | Operand::Const(IrConst::I64(0))
+            | Operand::Const(IrConst::I128(0))
+    )
+}
+
+/// Sentinel instruction index recorded for terminator uses. It shares the
+/// real block id, so every consumer must compare against it by NAME, not by
+/// trusting the block id: a value live across a branch must never be treated
+/// as forwardable, and indexing an instruction list with it would panic.
+const TERMINATOR: usize = usize::MAX;
+
+/// Count how many instructions in `func` read `value`, per instruction.
+fn count_uses(func: &IrFunction, value: u32) -> FxHashMap<(usize, usize), usize> {
+    let mut uses: FxHashMap<(usize, usize), usize> = FxHashMap::default();
+    for (bi, b) in func.blocks.iter().enumerate() {
+        for (ii, i) in b.instructions.iter().enumerate() {
+            let mut n = 0usize;
+            i.for_each_used_value(|v| n += usize::from(v == value));
+            if n > 0 {
+                uses.insert((bi, ii), n);
+            }
+        }
+        let mut n = 0usize;
+        b.terminator
+            .for_each_used_value(|v| n += usize::from(v == value));
+        if n > 0 {
+            *uses.entry((bi, TERMINATOR)).or_insert(0) += n;
+        }
+    }
+    uses
+}
+
+/// Width of the vector REGISTER carried at intrinsic argument position
+/// `index`, or `None` when that position does not hold a whole vector
+/// register.
+///
+/// This is the dual of [`intrinsic_arg_required_alignment`]. That table is
+/// the audited list of argument positions that name an ADDRESS; every
+/// position it claims must keep an address, because the backend dereferences
+/// it. Substituting a forwarded register there hands the emitter the vector's
+/// own bit pattern as a pointer.
+///
+/// That is not hypothetical. `AddSs128`/`SubSs128`/`AddSd128`/`SubSd128` are
+/// `is_sse_fp_128_destructive_binary`, so both of their operands are
+/// addresses of 16-byte slots, not registers. Forwarding a spill into one of
+/// them made `_mm_cvtss_si64` dereference `0x4b000000` -- the 8388608.0f
+/// round-trip constant -- and fault on i686.
+///
+/// The table therefore fails closed: a position is forwardable only when it
+/// is positively known to carry a register of exactly the home's width.
+fn vector_register_arg_width(op: IntrinsicOp, index: usize) -> Option<usize> {
+    // Anything the alignment table claims is an address, never a register.
+    if intrinsic_arg_required_alignment(op, index).is_some() {
+        return None;
+    }
+    // `VecStore*`: args[0] is the stored register, args[1] the destination
+    // address, args[2] the byte offset.
+    if let Some(width) = whole_vector_store_width(op) {
+        return (index == 0).then_some(width);
+    }
+    None
+}
+
+/// The stored register value of a whole-register `VecStore*` that writes
+/// exactly `width` bytes to `home`.
+fn as_whole_vector_store(inst: &Instruction, width: usize, home: u32) -> Option<u32> {
+    let Instruction::Intrinsic {
+        dest,
+        op,
+        dest_ptr,
+        args,
+    } = inst
+    else {
+        return None;
+    };
+    // A store has no register result; anything with `dest` is a computation.
+    if dest.is_some() {
+        return None;
+    }
+    if whole_vector_store_width(*op) != Some(width) {
+        return None;
+    }
+    // `emit_vec_store` shape: args = [value, ptr, 0].
+    let (Some(Operand::Value(src)), Some(Operand::Value(ptr)), Some(off)) =
+        (args.first(), args.get(1), args.get(2))
+    else {
+        return None;
+    };
+    if !operand_is_const_zero(off) {
+        return None;
+    }
+    // The store must target the home being analysed: a store to any other
+    // slot says nothing about this home's contents.
+    if dest_ptr.as_ref()?.0 != home || ptr.0 != home {
+        return None;
+    }
+    Some(src.0)
+}
+
+/// The destination slot of a whole-register `VecStore*` of `width` bytes.
+fn store_target(inst: &Instruction, width: usize) -> Option<u32> {
+    let Instruction::Intrinsic {
+        dest, op, dest_ptr, ..
+    } = inst
+    else {
+        return None;
+    };
+    if dest.is_some() || whole_vector_store_width(*op) != Some(width) {
+        return None;
+    }
+    dest_ptr.as_ref().map(|p| p.0)
+}
+
+/// Plan every safe vector-home bypass in `func`.
+///
+/// The gate is a whitelist, not a blacklist: a home is retired only when
+/// *every* use of it is accounted for as either the single defining write
+/// (plus its address slot) or a read this plan rewrites. A second write, a
+/// narrower or unclassified read, a use before the definition, a use in
+/// another block, or an escape into a call or a pointer store leaves the two
+/// counts unequal and aborts the home.
+///
+/// That exactness is the safety argument. Both bypass forms stop the write
+/// that previously defined the home, so any reader the plan failed to
+/// classify would silently observe whatever stale bytes the stack slot
+/// happens to hold. Requiring the per-instruction use counts to match the
+/// rewritten counts is what rules that out; there is no "probably fine"
+/// path here.
+fn plan_home_forwards(func: &IrFunction, allocas: &FxHashMap<u32, AllocaInfo>) -> Vec<HomeForward> {
+    // Where every home is defined. Both bypass forms MOVE a use earlier (the
+    // relay re-points the producer at the final destination; the spill hands
+    // the stored register to readers), so a destination whose Alloca sits at
+    // or after the producer would hand the backend a use that its definition
+    // does not dominate. Recording the sites up front keeps that a lookup.
+    let mut def_block: FxHashMap<u32, usize> = FxHashMap::default();
+    for (bi, b) in func.blocks.iter().enumerate() {
+        for inst in &b.instructions {
+            if let Instruction::Alloca { dest, .. } = inst {
+                def_block.insert(dest.0, bi);
+            }
+        }
+    }
+    let mut plans = Vec::new();
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        for (producer, inst) in block.instructions.iter().enumerate() {
+            let Instruction::Intrinsic {
+                dest, op, dest_ptr, ..
+            } = inst
+            else {
+                continue;
+            };
+            let Some(home_ptr) = dest_ptr else { continue };
+            let home = home_ptr.0;
+            let Some(info) = allocas.get(&home) else {
+                continue;
+            };
+            if info.volatile || info.semantic_volatile {
+                continue;
+            }
+            // The write must cover the entire object. A narrower write leaves
+            // bytes that only a memory read can observe, and retiring the
+            // home would drop them.
+            let width = match dest {
+                // Computing intrinsic: result width is the written width.
+                Some(_) => match temp_result_width(*op) {
+                    Some(w) if w == info.size => w,
+                    _ => continue,
+                },
+                // Explicit store: the store's own width contract.
+                None => match whole_vector_store_width(*op) {
+                    Some(w) if w == info.size => w,
+                    _ => continue,
+                },
+            };
+
+            let uses = count_uses(func, home);
+            let mut forwarded: FxHashMap<(usize, usize), usize> = FxHashMap::default();
+            // The producer's own write slot; a store also names the home as
+            // its address operand.
+            *forwarded.entry((block_idx, producer)).or_insert(0) += 1;
+            if dest.is_none() {
+                *forwarded.entry((block_idx, producer)).or_insert(0) += 1;
+            }
+
+            let mut arg_rewrites = Vec::new();
+            let mut dead = Vec::new();
+            let mut aborted = false;
+            let mut kind: Option<HomeBypass> = None;
+            let mut value: Option<u32> = None;
+
+            for (reader, r_inst) in block.instructions.iter().enumerate().skip(producer + 1) {
+                if let Instruction::Intrinsic { dest_ptr: r_dp, .. } = r_inst {
+                    // A second write invalidates the bypass: later readers
+                    // would observe a different value than the one forwarded.
+                    if let Some(p) = r_dp {
+                        if p.0 == home {
+                            aborted = true;
+                            break;
+                        }
+                    }
+                }
+
+                match (r_inst, dest) {
+                    // Relay: the home's value is loaded and immediately
+                    // stored to the real destination.
+                    (
+                        Instruction::Intrinsic {
+                            op: r_op,
+                            dest: Some(ld),
+                            args: r_args,
+                            ..
+                        },
+                        Some(producer_dest),
+                    ) if whole_vector_load(*r_op)
+                        && temp_result_width(*r_op) == Some(width)
+                        && r_args.len() == 2
+                        && matches!(r_args.first(), Some(Operand::Value(v)) if v.0 == home)
+                        && operand_is_const_zero(&r_args[1]) =>
+                    {
+                        // The loaded register must feed exactly one
+                        // whole-register store; that store's destination is
+                        // where the producer should write instead.
+                        let ld_uses = count_uses(func, ld.0);
+                        // Require exactly one use site and destructure it in
+                        // the same step. The census counts panicking
+                        // accessors, so the bound is expressed as an
+                        // irrefutable-by-construction pattern instead of
+                        // `.expect("len == 1")`.
+                        let first = ld_uses.iter().next();
+                        let second = ld_uses.iter().nth(1);
+                        let (Some((&(lb, li), &ln)), None) = (first, second) else {
+                            aborted = true;
+                            break;
+                        };
+                        // A terminator use shares the block id, so reject the
+                        // sentinel explicitly before it reaches an index.
+                        if lb != block_idx || li == TERMINATOR || ln != 1 {
+                            aborted = true;
+                            break;
+                        }
+                        // The relay store's destination is where the
+                        // producer should write instead. It must not be the
+                        // home itself (that would be a self-copy).
+                        let Some(store_dest) =
+                            store_target(&block.instructions[li], width).filter(|&d| d != home)
+                        else {
+                            aborted = true;
+                            break;
+                        };
+                        // The producer now writes into `store_dest` rather
+                        // than the home, so the write has to satisfy that
+                        // object's contract, not the home's. The audited
+                        // table grants the unaligned-safe result only on an
+                        // exact width match, so a destination of a different
+                        // size can demand real alignment.
+                        // The producer now writes into `store_dest` instead of
+                        // the home, so when that destination is a stack home
+                        // the write must satisfy THAT object's contract: the
+                        // audited table grants the unaligned-safe result only
+                        // on an exact width match, so a home of a different
+                        // size can demand real alignment.
+                        //
+                        // A destination that is not a home (a parameter or a
+                        // GEP -- the `vmovdqu %ymm0,(%rdi)` epilogue store in
+                        // `avx_fp_private`) needs no check at all: the relay
+                        // store already writes exactly `width` bytes through
+                        // that pointer, so the producer writes the same bytes
+                        // to the same place under the same contract.
+                        if let Some(dst) = allocas.get(&store_dest) {
+                            if dst.volatile || dst.semantic_volatile || width > dst.size {
+                                aborted = true;
+                                break;
+                            }
+                            if intrinsic_dest_required_alignment(*op, dest.is_some(), dst.size)
+                                .is_none_or(|need| need > dst.align)
+                            {
+                                aborted = true;
+                                break;
+                            }
+                        }
+                        // Dominance for the moved use: when the destination
+                        // is a stack home it must be defined in this block
+                        // before the producer. An earlier block is not
+                        // accepted, because this pass proves dominance only
+                        // within the block it rewrites.
+                        if let Some(&dbi) = def_block.get(&store_dest) {
+                            let def_idx = func.blocks[dbi]
+                                .instructions
+                                .iter()
+                                .position(|i| matches!(i, Instruction::Alloca { dest, .. } if dest.0 == store_dest));
+                            if dbi != block_idx || def_idx.is_none_or(|di| di >= producer) {
+                                aborted = true;
+                                break;
+                            }
+                        }
+                        *forwarded.entry((block_idx, reader)).or_insert(0) += 1;
+                        dead.push(reader);
+                        dead.push(li);
+                        kind = Some(HomeBypass::Relay {
+                            destination: store_dest,
+                        });
+                        value = Some(producer_dest.0);
+                    }
+                    _ => {
+                        // Otherwise every read must be a classified
+                        // full-width vector data operand.
+                        if let Instruction::Intrinsic {
+                            op: r_op,
+                            args: r_args,
+                            ..
+                        } = r_inst
+                        {
+                            for (idx, arg) in r_args.iter().enumerate() {
+                                let Operand::Value(v) = arg else { continue };
+                                if v.0 != home {
+                                    continue;
+                                }
+                                // The read must consume the home's bytes as
+                                // a whole vector REGISTER. A position that
+                                // names an address is refused: see
+                                // `vector_register_arg_width`.
+                                if vector_register_arg_width(*r_op, idx) != Some(width) {
+                                    aborted = true;
+                                    break;
+                                }
+                                arg_rewrites.push((reader, idx));
+                                *forwarded.entry((block_idx, reader)).or_insert(0) += 1;
+                            }
+                            if aborted {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if aborted {
+                continue;
+            }
+
+            let plan = match (kind, value, dest) {
+                (Some(HomeBypass::Relay { destination }), _, _) => {
+                    // A relay home has exactly one reader by construction, so
+                    // no other rewrite may accompany it.
+                    if !arg_rewrites.is_empty() {
+                        continue;
+                    }
+                    HomeForward {
+                        block: block_idx,
+                        producer,
+                        kind: HomeBypass::Relay { destination },
+                        value: None,
+                        arg_rewrites: Vec::new(),
+                        dead,
+                    }
+                }
+                // Spill: the stored register is handed to every reader.
+                (None, None, None) => {
+                    let Some(stored) = as_whole_vector_store(inst, width, home) else {
+                        continue;
+                    };
+                    if arg_rewrites.is_empty() {
+                        continue;
+                    }
+                    dead.push(producer);
+                    HomeForward {
+                        block: block_idx,
+                        producer,
+                        kind: HomeBypass::Spill,
+                        value: Some(stored),
+                        arg_rewrites,
+                        dead,
+                    }
+                }
+                _ => continue,
+            };
+            if uses != forwarded {
+                continue;
+            }
+            plans.push(plan);
+        }
+    }
+    plans
+}
+
+/// Drop plans that would depend on an instruction another plan deletes.
+///
+/// Every plan is computed against the pre-transform IR, so two homes can
+/// interact: a relay that retires `store X` may delete the very instruction a
+/// neighbouring spill names as its producer. Applying both would leave the
+/// spill's rewritten readers pointing at a value whose definition no longer
+/// exists -- exactly the "use of undefined value" an IR verifier catches, and
+/// a miscompile if it ever slipped through.
+///
+/// Deletions are monotone: dropping a plan only ever removes entries from the
+/// deleted set, which can never create a new dependency. One filtering round
+/// against the full set is therefore already a fixed point.
+fn prune_conflicting_plans(
+    plans: Vec<HomeForward>,
+    value_defs: &FxHashMap<u32, (usize, usize)>,
+) -> Vec<HomeForward> {
+    if plans.len() < 2 {
+        return plans;
+    }
+    let mut all_dead: FxHashSet<(usize, usize)> = FxHashSet::default();
+    for plan in &plans {
+        for &instr in &plan.dead {
+            all_dead.insert((plan.block, instr));
+        }
+    }
+    plans
+        .into_iter()
+        .filter(|plan| {
+            let own: FxHashSet<(usize, usize)> =
+                plan.dead.iter().map(|&i| (plan.block, i)).collect();
+            let hazard = |slot: (usize, usize)| all_dead.contains(&slot) && !own.contains(&slot);
+            // Readers we rewrite must survive.
+            if plan
+                .arg_rewrites
+                .iter()
+                .any(|(i, _)| hazard((plan.block, *i)))
+            {
+                return false;
+            }
+            // The forwarded register must still be defined. A relay chain
+            // deletes the reload that produced it, so a neighbouring spill
+            // handing that same register to its readers would leave them
+            // pointing at a definition that no longer exists.
+            if let Some(value) = plan.value {
+                if let Some(&slot) = value_defs.get(&value) {
+                    if all_dead.contains(&slot) {
+                        return false;
+                    }
+                }
+            }
+            true
+        })
+        .collect()
+}
+
+/// Retire compiler-created vector homes by handing the producer's register
+/// value straight to its readers. Returns the number of homes bypassed.
+fn forward_vector_home_results(func: &mut IrFunction) -> usize {
+    let allocas = collect_allocas(func);
+    if allocas.is_empty() {
+        return 0;
+    }
+    let mut value_defs: FxHashMap<u32, (usize, usize)> = FxHashMap::default();
+    for (bi, b) in func.blocks.iter().enumerate() {
+        for (ii, i) in b.instructions.iter().enumerate() {
+            if let Some(def) = i.dest() {
+                value_defs.insert(def.0, (bi, ii));
+            }
+        }
+    }
+    let plans = prune_conflicting_plans(plan_home_forwards(func, &allocas), &value_defs);
+    if plans.is_empty() {
+        return 0;
+    }
+
+    let mut dead: Vec<(usize, usize)> = Vec::new();
+    let mut applied = 0usize;
+    for plan in plans {
+        // 1. Rewrite forwarded argument reads to the register value.
+        for (instr, idx) in &plan.arg_rewrites {
+            if let Instruction::Intrinsic { args, .. } =
+                &mut func.blocks[plan.block].instructions[*instr]
+            {
+                // A relay never performs argument rewrites, so a plan that
+                // reaches here always carries the register it forwards.
+                if let (Some(slot), Some(value)) = (args.get_mut(*idx), plan.value) {
+                    *slot = Operand::Value(Value(value));
+                }
+            }
+        }
+        // 2. Retire the producer's home write.
+        match plan.kind {
+            HomeBypass::Relay { destination } => {
+                if let Instruction::Intrinsic { dest_ptr, .. } =
+                    &mut func.blocks[plan.block].instructions[plan.producer]
+                {
+                    *dest_ptr = Some(Value(destination));
+                }
+            }
+            HomeBypass::Spill => {}
+        }
+        for instr in &plan.dead {
+            dead.push((plan.block, *instr));
+        }
+        applied += 1;
+    }
+
+    // 3. Drop retired instructions, then any alloca left with no remaining
+    //    use. `remove_instructions` sorts and de-duplicates per block.
+    let mut per_block: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+    for (block, instr) in &dead {
+        per_block.entry(*block).or_default().push(*instr);
+    }
+    for (block_idx, mut removed) in per_block {
+        if let Some(block) = func.blocks.get_mut(block_idx) {
+            remove_instructions(block, &mut removed);
+        }
+    }
+    remove_unused_allocas(func);
+    applied
+}
+
+/// Delete allocas whose results are no longer read anywhere.
+fn remove_unused_allocas(func: &mut IrFunction) -> usize {
+    let mut used: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            inst.for_each_used_value(|v| {
+                used.insert(v);
+            });
+        }
+        block.terminator.for_each_used_value(|v| {
+            used.insert(v);
+        });
+    }
+    let mut dead: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        for (instr_idx, inst) in block.instructions.iter().enumerate() {
+            if let Instruction::Alloca { dest, .. } = inst {
+                if !used.contains(&dest.0) {
+                    dead.entry(block_idx).or_default().push(instr_idx);
+                }
+            }
+        }
+    }
+    let mut removed = 0usize;
+    for (block_idx, mut indices) in dead {
+        if let Some(block) = func.blocks.get_mut(block_idx) {
+            let before = block.instructions.len();
+            remove_instructions(block, &mut indices);
+            removed += before - block.instructions.len();
+        }
+    }
+    removed
+}
+
+/// Bypass compiler-created vector homes across the module.
+pub(crate) fn forward_vector_homes(module: &mut IrModule) -> usize {
+    module
+        .functions
+        .iter_mut()
+        .filter(|func| !func.is_declaration && !func.blocks.is_empty())
+        .map(forward_vector_home_results)
+        .sum()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4458,6 +5056,464 @@ mod tests {
     /// group op leaves the A pointer un-promoted (losing the hoisted
     /// broadcast) or, worse, is treated as overwriting its full destination,
     /// which is a read-modify-write accumulator, not a write-only result.
+    // ------------------------------------------------------------------
+    // `forward_vector_home_results` (pass gate: `vechomefwd`).
+    //
+    // The two bypass forms both STOP the write that defined a home, so the
+    // tests below are dominated by the refusal paths: every one of them must
+    // leave the IR byte-for-byte unchanged. A refusal that silently forwarded
+    // would hand the backend a use of memory nobody writes.
+    // ------------------------------------------------------------------
+
+    /// Build `fn` with one entry block containing `insts`.
+    fn single_block(name: &str, insts: Vec<Instruction>) -> IrFunction {
+        function(name, vec![block(0, insts)])
+    }
+
+    /// Number of `Intrinsic` instructions in block 0.
+    fn intrinsic_count(func: &IrFunction) -> usize {
+        func.blocks[0]
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, Instruction::Intrinsic { .. }))
+            .count()
+    }
+
+    #[test]
+    fn relay_bypasses_the_home_and_writes_straight_to_the_destination() {
+        // %1 = alloca 32 (home)  ;  %2 = out (another alloca)
+        // MinPs256 dest=%3 dest_ptr=%1 args=[%0]
+        // VecLoadF32x8 dest=%4 args=[%1, 0]
+        // VecStoreF32x8 dest_ptr=%2 args=[%4, %2, 0]
+        // -> MinPs256 dest_ptr=%2, and the load/store pair disappears.
+        let mut func = single_block(
+            "relay",
+            vec![
+                alloca(1, 32, 32),
+                alloca(2, 32, 32),
+                intrinsic(
+                    Some(3),
+                    IntrinsicOp::MinPs256,
+                    Some(1),
+                    vec![Operand::Value(Value(0))],
+                ),
+                intrinsic(
+                    Some(4),
+                    IntrinsicOp::VecLoadF32x8,
+                    None,
+                    vec![Operand::Value(Value(1)), Operand::Const(IrConst::I64(0))],
+                ),
+                intrinsic(
+                    None,
+                    IntrinsicOp::VecStoreF32x8,
+                    Some(2),
+                    vec![
+                        Operand::Value(Value(4)),
+                        Operand::Value(Value(2)),
+                        Operand::Const(IrConst::I64(0)),
+                    ],
+                ),
+            ],
+        );
+        assert_eq!(forward_vector_home_results(&mut func), 1);
+        // Three intrinsics before, one after.
+        assert_eq!(intrinsic_count(&func), 1);
+        let surviving = func.blocks[0]
+            .instructions
+            .iter()
+            .find_map(|i| match i {
+                Instruction::Intrinsic { dest_ptr, op, .. } if *op == IntrinsicOp::MinPs256 => {
+                    Some(dest_ptr.map(|v| v.0))
+                }
+                _ => None,
+            })
+            .expect("the MinPs256 producer must survive");
+        // The producer now targets the real destination, not the home.
+        assert_eq!(surviving, Some(2));
+        // The retired home's alloca is gone.
+        assert!(
+            !func.blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Alloca { dest, .. } if dest.0 == 1)),
+            "the bypassed home must be deleted"
+        );
+    }
+
+    /// A position the backend may dereference must keep an address.
+    ///
+    /// `MinPs256`/`MaxPs256` are `pointer_vector_arg_width` entries: the x86
+    /// emitter (`sse_load_arg`, `intrinsics.rs`) uses the operand as a
+    /// register only when it is already XMM-resident, and otherwise
+    /// reinterprets its low bits as an ADDRESS -- documented there as the
+    /// cause of a `simd_movnt` SIGSEGV. Forwarding a spilled register into
+    /// such a slot is therefore unsound: it happens to work under low
+    /// register pressure on x86-64 and faults on i686, where
+    /// `sse_cvt_si64_rounding_i686` dereferenced 0x4b000000 (the 8388608.0f
+    /// round-trip constant). The pass must refuse.
+    #[test]
+    fn spill_refuses_to_forward_into_an_address_operand() {
+        // %1 = alloca 32 ; VecZeroF32x8 dest=%2 ; VecStoreF32x8 dest_ptr=%1
+        // MinPs256 args=[%0, %1] (address-capable read) -- must stay %1.
+        let mut func = single_block(
+            "spill_addr",
+            vec![
+                alloca(1, 32, 32),
+                intrinsic(Some(2), IntrinsicOp::VecZeroF32x8, None, vec![]),
+                intrinsic(
+                    None,
+                    IntrinsicOp::VecStoreF32x8,
+                    Some(1),
+                    vec![
+                        Operand::Value(Value(2)),
+                        Operand::Value(Value(1)),
+                        Operand::Const(IrConst::I64(0)),
+                    ],
+                ),
+                intrinsic(
+                    Some(3),
+                    IntrinsicOp::MinPs256,
+                    Some(9),
+                    vec![Operand::Value(Value(0)), Operand::Value(Value(1))],
+                ),
+            ],
+        );
+        assert_eq!(
+            forward_vector_home_results(&mut func),
+            0,
+            "an address-capable operand must never receive a forwarded register"
+        );
+        assert!(
+            func.blocks[0].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::Intrinsic {
+                    op: IntrinsicOp::VecStoreF32x8,
+                    ..
+                }
+            )),
+            "the spill store must be kept: the home is still read through its address"
+        );
+    }
+
+    #[test]
+    fn spill_forwards_the_stored_register_to_a_register_operand() {
+        // The forwardable case: `VecStore*` args[0] is the stored REGISTER
+        // (args[1] is the address), so the home's bytes can be handed to a
+        // later store without ever becoming an address.
+        // %1 = alloca 32 ; VecZeroF32x8 dest=%2 ; VecStoreF32x8 dest_ptr=%1 [%2,%1,0]
+        // VecStoreF32x8 dest_ptr=%9 [%1, %9, 0]  -> takes %2 instead.
+        let mut func = single_block(
+            "spill",
+            vec![
+                alloca(1, 32, 32),
+                intrinsic(Some(2), IntrinsicOp::VecZeroF32x8, None, vec![]),
+                intrinsic(
+                    None,
+                    IntrinsicOp::VecStoreF32x8,
+                    Some(1),
+                    vec![
+                        Operand::Value(Value(2)),
+                        Operand::Value(Value(1)),
+                        Operand::Const(IrConst::I64(0)),
+                    ],
+                ),
+                intrinsic(
+                    None,
+                    IntrinsicOp::VecStoreF32x8,
+                    Some(9),
+                    vec![
+                        Operand::Value(Value(1)),
+                        Operand::Value(Value(9)),
+                        Operand::Const(IrConst::I64(0)),
+                    ],
+                ),
+            ],
+        );
+        assert_eq!(forward_vector_home_results(&mut func), 1);
+        let stores: Vec<_> = func.blocks[0]
+            .instructions
+            .iter()
+            .filter_map(|i| match i {
+                Instruction::Intrinsic {
+                    op: IntrinsicOp::VecStoreF32x8,
+                    args,
+                    ..
+                } => Some(args.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stores.len(),
+            1,
+            "the dead spill store must be deleted, leaving the reader's own store"
+        );
+        assert_eq!(
+            stores[0][0],
+            Operand::Value(Value(2)),
+            "the surviving store must take the register, not the retired home"
+        );
+    }
+
+    #[test]
+    fn a_second_write_to_the_home_refuses_the_bypass() {
+        let insts = vec![
+            alloca(1, 32, 32),
+            intrinsic(Some(2), IntrinsicOp::VecZeroF32x8, None, vec![]),
+            intrinsic(
+                None,
+                IntrinsicOp::VecStoreF32x8,
+                Some(1),
+                vec![
+                    Operand::Value(Value(2)),
+                    Operand::Value(Value(1)),
+                    Operand::Const(IrConst::I64(0)),
+                ],
+            ),
+            intrinsic(
+                Some(3),
+                IntrinsicOp::MinPs256,
+                Some(9),
+                vec![Operand::Value(Value(0)), Operand::Value(Value(1))],
+            ),
+            // A second writer to %1: everything after it sees a different value.
+            intrinsic(
+                Some(5),
+                IntrinsicOp::MaxPs256,
+                Some(1),
+                vec![Operand::Value(Value(0)), Operand::Value(Value(0))],
+            ),
+        ];
+        let before = insts.len();
+        let mut func = single_block("two_writers", insts);
+        assert_eq!(
+            forward_vector_home_results(&mut func),
+            0,
+            "a second write must abort the home"
+        );
+        assert_eq!(func.blocks[0].instructions.len(), before);
+    }
+
+    #[test]
+    fn a_narrow_read_of_the_home_refuses_the_bypass() {
+        // The reader classifies only one of its operands as 32-byte vector
+        // data, so one use stays unaccounted for and the home must abort.
+        let insts = vec![
+            alloca(1, 32, 32),
+            intrinsic(Some(2), IntrinsicOp::VecZeroF32x8, None, vec![]),
+            intrinsic(
+                None,
+                IntrinsicOp::VecStoreF32x8,
+                Some(1),
+                vec![
+                    Operand::Value(Value(2)),
+                    Operand::Value(Value(1)),
+                    Operand::Const(IrConst::I64(0)),
+                ],
+            ),
+            // A 16-byte consumer reading a 32-byte home: width mismatch.
+            intrinsic(
+                Some(3),
+                IntrinsicOp::MinPs256,
+                Some(9),
+                vec![Operand::Value(Value(1)), Operand::Value(Value(0))],
+            ),
+            intrinsic(
+                Some(4),
+                IntrinsicOp::SqrtPs128,
+                Some(9),
+                vec![Operand::Value(Value(1))],
+            ),
+        ];
+        let before = insts.len();
+        let mut func = single_block("narrow_read", insts);
+        assert_eq!(
+            forward_vector_home_results(&mut func),
+            0,
+            "an unclassified read must abort the home"
+        );
+        assert_eq!(func.blocks[0].instructions.len(), before);
+    }
+
+    #[test]
+    fn a_partial_width_write_refuses_the_bypass() {
+        // A 16-byte store into a 32-byte home leaves bytes only memory can
+        // observe, so retiring the home would drop them.
+        let insts = vec![
+            alloca(1, 32, 32),
+            intrinsic(Some(2), IntrinsicOp::VecZeroF64x2, None, vec![]),
+            intrinsic(
+                None,
+                IntrinsicOp::VecStoreF64x2,
+                Some(1),
+                vec![
+                    Operand::Value(Value(2)),
+                    Operand::Value(Value(1)),
+                    Operand::Const(IrConst::I64(0)),
+                ],
+            ),
+            intrinsic(
+                Some(3),
+                IntrinsicOp::MinPs256,
+                Some(9),
+                vec![Operand::Value(Value(0)), Operand::Value(Value(1))],
+            ),
+        ];
+        let before = insts.len();
+        let mut func = single_block("partial_write", insts);
+        assert_eq!(
+            forward_vector_home_results(&mut func),
+            0,
+            "a narrower-than-object write must abort the home"
+        );
+        assert_eq!(func.blocks[0].instructions.len(), before);
+    }
+
+    #[test]
+    fn a_home_used_by_the_block_terminator_is_never_bypassed() {
+        // The terminator use shares the block id with real instructions; the
+        // sentinel index must be rejected instead of indexing the list.
+        let mut func = function(
+            "terminator_use",
+            vec![
+                block(
+                    0,
+                    vec![
+                        alloca(1, 32, 32),
+                        intrinsic(Some(2), IntrinsicOp::VecZeroF32x8, None, vec![]),
+                        intrinsic(
+                            None,
+                            IntrinsicOp::VecStoreF32x8,
+                            Some(1),
+                            vec![
+                                Operand::Value(Value(2)),
+                                Operand::Value(Value(1)),
+                                Operand::Const(IrConst::I64(0)),
+                            ],
+                        ),
+                        intrinsic(
+                            Some(3),
+                            IntrinsicOp::MinPs256,
+                            Some(9),
+                            vec![Operand::Value(Value(0)), Operand::Value(Value(1))],
+                        ),
+                    ],
+                ),
+                block(1, Vec::new()),
+            ],
+        );
+        func.blocks[0].terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(1)),
+            true_label: BlockId(1),
+            false_label: BlockId(1),
+        };
+        let before = func.blocks[0].instructions.len();
+        assert_eq!(
+            forward_vector_home_results(&mut func),
+            0,
+            "a terminator reader must abort the home"
+        );
+        assert_eq!(func.blocks[0].instructions.len(), before);
+    }
+
+    #[test]
+    fn a_relay_whose_destination_alloca_follows_the_producer_is_refused() {
+        // Dominance: the rewrite MOVES the destination's use up to the
+        // producer, so an Alloca defined after it cannot be the target.
+        let insts = vec![
+            alloca(1, 32, 32),
+            intrinsic(
+                Some(3),
+                IntrinsicOp::MinPs256,
+                Some(1),
+                vec![Operand::Value(Value(0))],
+            ),
+            // The DESTINATION's alloca sits AFTER the producer, so re-pointing
+            // the producer at %2 would use it before it is defined.
+            alloca(2, 32, 32),
+            intrinsic(
+                Some(4),
+                IntrinsicOp::VecLoadF32x8,
+                None,
+                vec![Operand::Value(Value(1)), Operand::Const(IrConst::I64(0))],
+            ),
+            intrinsic(
+                None,
+                IntrinsicOp::VecStoreF32x8,
+                Some(2),
+                vec![
+                    Operand::Value(Value(4)),
+                    Operand::Value(Value(2)),
+                    Operand::Const(IrConst::I64(0)),
+                ],
+            ),
+        ];
+        let before = insts.len();
+        let mut func = single_block("dest_after_producer", insts);
+        assert_eq!(
+            forward_vector_home_results(&mut func),
+            0,
+            "a destination defined after the producer must be refused"
+        );
+        assert_eq!(func.blocks[0].instructions.len(), before);
+    }
+
+    #[test]
+    fn conflicting_plans_are_pruned_rather_than_dangling_a_definition() {
+        // Two relays over the SAME store: the second names instruction 3 as
+        // its producer while the first retires it. Dropping one keeps the
+        // survivor's forwarded value defined.
+        let mut func = single_block(
+            "conflict",
+            vec![
+                alloca(1, 32, 32),
+                alloca(2, 32, 32),
+                intrinsic(
+                    Some(3),
+                    IntrinsicOp::MinPs256,
+                    Some(1),
+                    vec![Operand::Value(Value(0))],
+                ),
+                intrinsic(
+                    Some(4),
+                    IntrinsicOp::VecLoadF32x8,
+                    None,
+                    vec![Operand::Value(Value(1)), Operand::Const(IrConst::I64(0))],
+                ),
+                intrinsic(
+                    None,
+                    IntrinsicOp::VecStoreF32x8,
+                    Some(2),
+                    vec![
+                        Operand::Value(Value(4)),
+                        Operand::Value(Value(2)),
+                        Operand::Const(IrConst::I64(0)),
+                    ],
+                ),
+            ],
+        );
+        let _ = forward_vector_home_results(&mut func);
+        // The invariant that matters: every value still used is still defined.
+        let mut defined = std::collections::HashSet::new();
+        for b in &func.blocks {
+            for i in &b.instructions {
+                if let Some(d) = i.dest() {
+                    defined.insert(d.0);
+                }
+            }
+        }
+        for b in &func.blocks {
+            for i in &b.instructions {
+                i.for_each_used_value(|v| {
+                    // Parameters/allocas below 3 are the fixture's roots.
+                    assert!(
+                        defined.contains(&v) || v < 3,
+                        "value v{v} is used but no longer defined"
+                    );
+                });
+            }
+        }
+    }
+
     #[test]
     fn the_two_rounding_twin_matches_the_fused_group_op() {
         use crate::ir::intrinsics::IntrinsicOp as O;

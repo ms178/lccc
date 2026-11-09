@@ -4514,6 +4514,15 @@ pub(crate) fn run_passes(
         vector_temp_promotion::promote_vector_temps(module);
     }
 
+    // Phase 11a'': the generic `VecLoad`/`VecStore`/`MinPs256` family reaches
+    // late IR as store-to-home then read-home pairs that `promote_vector_temps`
+    // cannot see (it only understands the legacy `Memcpy` relay). Bypass the
+    // home by handing the producer's register result straight to its readers.
+    // Runs before `fuse_vector_loads` so that pass sees the shortened chains.
+    if !pass_disabled(&disabled, "vechomefwd") {
+        vector_temp_promotion::forward_vector_homes(module);
+    }
+
     // Phase 11b': Collapse the 16/32-byte aggregate-load -> VecLoad ->
     // VecStore HOME copy chain BEFORE the load forwarder runs.  `fuse_vector_loads`
     // can only forward a load written DIRECTLY to the final home; the middle
