@@ -1390,6 +1390,25 @@ fn peephole_optimize_inner(
                 changed |= c;
             }
         }
+        // Full-width vector reloads of a just-stored over-aligned frame
+        // address (the `lea K(%rbp); and $-A; store; ...; reload` copy-out
+        // shape the codegen emits for an over-aligned home).
+        //
+        // Placed in the phase-1 fixpoint IMMEDIATELY BEFORE the vector copy
+        // propagator, not in phase 2: the reload becomes a register copy, and
+        // `propagate_vector_copies` + `eliminate_dead_vector_copies` below then
+        // retire that copy in the SAME iteration, after which the phase-2
+        // dead-store pass can drop the orphaned spill.  Running it in phase 2
+        // instead left the copy unpropagated, because the post-global cleanup
+        // loop re-runs the GP passes but not the vector ones — measured 17 loop
+        // instructions instead of 10, and 1 807 036 cycles instead of
+        // 1 695 212 on tests/simd/vector_home_call_loop.c.  This ordering buys
+        // that difference without adding a single new pass invocation.
+        if !sk("aligned_vec_reload") {
+            let c = aligned_vector_reload::forward_aligned_vector_reload(&mut store, &mut infos);
+            trace("aligned_vec_reload", pass_count, c, &store, &infos);
+            changed |= c;
+        }
         if !sk("vector_copy_prop") {
             {
                 let c = vector_copy::propagate_vector_copies(&mut store, &mut infos);
@@ -1801,16 +1820,6 @@ fn peephole_optimize_inner(
         // the frame slot, freeing the slot and the spill store entirely.
         if !sk("savreload") {
             global_changed |= spill_deref::fold_save_reload_roundtrip(&mut store, &mut infos);
-        }
-        // Full-width vector reloads of a just-stored over-aligned frame
-        // address (the `lea K(%rbp); and $-A; store; ...; reload` copy-out
-        // shape).  Runs before copy propagation so the register copy it
-        // creates lets the existing passes retire the now-dead spill in the
-        // same round: measured -40.0% from the forwarding alone, -43.6% with
-        // the spill retired, on tests/simd/vector_home_call_loop.c.
-        if !sk("aligned_vec_reload") {
-            global_changed |=
-                aligned_vector_reload::forward_aligned_vector_reload(&mut store, &mut infos);
         }
         if !sk("private_spill_cycle") {
             global_changed |= spill_deref::fold_private_spill_cycle(&mut store, &mut infos);
