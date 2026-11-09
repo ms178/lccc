@@ -351,7 +351,7 @@ operator is now a first-class Clang-compatible query (same `#undef`/`#define`/
 push-pop lifetime as `__has_warning`) that truthfully answers **0** — LCCC has
 no Clang modules. The resolver mirrors Clang 23.1.5's measured diagnostics
 (too few/many arguments, nested parentheses, module-name grammar, unterminated
-invocation, missing-`(` recovery that absorbs the operand identifier).
+invocation, missing-`(` recovery that absorbs exactly one following preprocessing token).
 
 Differential probe: 14 shapes, LCCC vs Clang 23.1.5 — 12 exact matches
 including every diagnostic wording; the two remaining differences are the
@@ -364,9 +364,10 @@ and the GCC feature/builtin/attribute queries), including operators produced
 by object-like aliases and argument prescan. `__building_module(M)` with
 `#define M foo bar` answers 0 instead of erroring, `__has_warning(W)` with
 `#define W "-Wcpp"` requires a literal exactly as Clang does, and
-missing-`(` recovery absorbs one raw identifier without leaving a stray token.
+missing-`(` recovery follows the measured compiler persona instead of leaving
+stray tokens (see the next section).
 The lifetime gate now compiles the real Clang `stddef.h` through all four
-target drivers and pins the raw-operand macro contexts (227 checks with the
+target drivers and pins the raw-operand macro contexts (244 checks with the
 oracle present), and the fuzz corpus covers the tenth operator (1088 cases/seed
 at count 800).
 
@@ -394,3 +395,34 @@ win for `gnu/stubs-*`. With the verified Bookworm biarch packages installed
 (no live libc upgrade; exact `2.36-9+deb12u14` match), the previously failing
 local gates pass: gcc17-builtin-semantics, trapv-boundary-matrix-m32 (910
 expected traps), and builtin-floor-float-narrowing.
+
+### Missing-`(` recovery: one token, two compiler personas
+
+A follow-up oracle matrix (`/tmp/mp.c`, `/tmp/mp2.c`, `/tmp/mp3.c`,
+`/tmp/mp4.c`; GCC 16.2 and Clang 23.1.5, `-std=gnu23 -E -P`) exposed three
+recovery defects in the raw-operand shield:
+
+* Missing-`(` recovery absorbed only identifiers. Both compilers absorb exactly
+  one preprocessing token of **any** kind (string, number, character, or
+  punctuator) and then emit `missing '(' after '<op>'` with value `0`.
+* Clang-persona operators (`__has_warning`, `__building_module`) must shield the
+  raw next token: `F(1)` with `#define F(x) 99` yields `0(1)`, not `099`.
+  GCC-persona feature/builtin/attribute operators instead expand normally and
+  let the resolver absorb one expanded token: `M(1)` with `#define M foo bar`
+  yields `0 bar(1)`, and `F(1)` yields `0`.
+* A function-like macro whose replacement list ends in an active query operator
+  (`#define Q() __building_module`) bypassed the trailing resolver because the
+  operator is compiler-owned rather than a user `MacroDef`. `Q() F(1)` therefore
+  expanded `F` before recovery. The trailing-resolution predicate now includes
+  active raw-operand query operators, and Clang-persona absorption stops the
+  rescan so the absorbed token cannot be expanded a second time.
+
+The implementation adds bounded, literal-aware `skip_blanks_and_comments` and
+maximal-munch `pp_token_len` helpers (including prefixed literals, digraphs,
+`%:%:`, and C23 digit separators), uses them in every missing-`(` resolver and
+in the balanced-argument scanners, and keeps the GCC/Clang persona split in all
+three macro-expansion paths. Five Rust units pin the tokenizer/recovery
+contracts; the lifetime gate grew from 227 to **244 checks** with direct
+GCC/Clang parity cases. Fastbuild is warning-free; the frontend gate, 3264
+seeded fuzz cases, Clippy `-D warnings`, rustfmt, and **125 preprocessor units**
+are green.
