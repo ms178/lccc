@@ -4,8 +4,10 @@
 Tools actually used (all pinned/verified by the CI lane):
   * GDB 18.1       -- PROT_NONE untaken-pointer proof, exact return values
   * objdump 2.47   -- static instruction census of four load widths
-  * readelf 2.47   -- ELF section, machine and .eh_frame FDE-table structural
-                      proof (objtool stand-in for user-space objects)
+  * readelf 2.40+  -- ELF section and decoded .eh_frame FDE-record structural
+                      proof (objtool stand-in for user-space objects).  The
+                      decoder is version-independent: 2.40 prints `FDE cie=`
+                      rows, 2.47 additionally prints `fde=[` search-table rows.
   * Callgrind      -- dynamic instruction refs on the host CPU (perf stand-in)
   * GCC 16.2 / Clang 23.1.5 / ICX 2026.2 (optional) -- differential oracles
   * QEMU 11.1.3    -- used by the companion four-ISA execution gate
@@ -260,22 +262,52 @@ def gdb_prot_none(lccc: str, work: Path) -> dict:
     return results
 
 
+def decode_fde_count(frames_stdout: str) -> dict:
+    """Count decoded FDE records without depending on the binutils version.
+
+    GNU readelf 2.40-2.42 prints only decoded `.eh_frame` records such as
+    `00000018 ... FDE cie=00000000 ...`.  Readelf 2.47 additionally prints an
+    `.eh_frame_hdr` binary search table whose rows contain `fde=[ ... ]`.
+    Counting only `fde=[` made the gate report zero FDEs on the hosted Ubuntu
+    24.04 runner even though the ELF had a valid unwind table.  The decoded
+    records are the authoritative, version-independent signal; the search
+    table is retained as corroborating evidence.
+    """
+    decoded = len(re.findall(r"\bFDE cie=", frames_stdout))
+    hdr_entries = len(re.findall(r"fde=\[", frames_stdout))
+    return {
+        "fde_count": decoded,
+        "frame_hdr_entries": hdr_entries,
+        "frame_output": "hdr_table+decoded" if hdr_entries else "decoded_only",
+    }
+
+
+def readelf_version(path: str) -> str:
+    cp = run([path, "--version"])
+    if cp.returncode != 0:
+        return "unknown"
+    return next((line.strip() for line in cp.stdout.splitlines() if line.strip()),
+                "unknown")
+
+
 def structural_readelf(exe: Path) -> dict:
-    cp = run([tool("readelf"), "-S", str(exe)])
+    readelf = tool("readelf")
+    cp = run([readelf, "-S", str(exe)])
     if cp.returncode != 0:
         raise RuntimeError(f"readelf -S: {cp.stderr}")
     sections = set(re.findall(r"\[\s*\d+\]\s+(\S+)", cp.stdout))
-    # `-wf` decodes .eh_frame_hdr's binary search table.  An object with no
-    # FDE entries cannot unwind through the calls the GDB canary exercises;
-    # this is the user-space equivalent of objtool's ORC table sanity check.
-    frames = run([tool("readelf"), "-wf", str(exe)])
+    # `--debug-dump=frames` decodes .eh_frame (and, when available, the
+    # .eh_frame_hdr search table).  An object with no decoded FDE records
+    # cannot unwind through the calls the GDB canary exercises; this is the
+    # user-space equivalent of objtool's ORC table sanity check.
+    frames = run([readelf, "--debug-dump=frames", str(exe)])
     if frames.returncode != 0:
-        raise RuntimeError(f"readelf -wf: {frames.stderr}")
-    fde_count = len(re.findall(r"fde=\[", frames.stdout))
+        raise RuntimeError(f"readelf --debug-dump=frames: {frames.stderr}")
     return {
         "has_text": ".text" in sections,
         "has_eh_frame": ".eh_frame" in sections,
-        "fde_count": fde_count,
+        "readelf_version": readelf_version(readelf),
+        **decode_fde_count(frames.stdout),
     }
 
 
@@ -392,11 +424,50 @@ def self_test() -> int:
                       "refs": {"fold_on": 2_640_446, "fold_off": 2_740_432,
                                "volatile_on": 2_040_448,
                                "volatile_off": 2_040_434}},
-        "structural": {"has_text": True, "has_eh_frame": True, "fde_count": 1},
+        "structural": {"has_text": True, "has_eh_frame": True, "fde_count": 1,
+                      "frame_hdr_entries": 0, "frame_output": "decoded_only",
+                      "readelf_version": "GNU readelf 2.40"},
         "compilers": {"lccc": "lccc", "gcc16": "gcc", "clang23": "clang"},
         "require_icx": False,
     }
     assert not evaluate(base), f"self-test baseline not clean: {evaluate(base)}"
+    # Regression for hosted Ubuntu 24.04: readelf 2.40 has no `fde=[` search
+    # table rows; the old parser counted zero FDEs and failed a valid ELF.
+    # Both real output dialects must decode the same two FDE records, and a
+    # CIE-only dump must not be mistaken for unwind coverage.
+    frame_samples = {
+        "readelf 2.40 decoded-only": (
+            "Contents of the .eh_frame section:\n"
+            "00000000 0000000000000014 00000000 CIE\n"
+            "00000018 0000000000000010 0000001c FDE cie=00000000 pc=1..2\n"
+            "0000002c 0000000000000014 00000000 CIE\n"
+            "00000044 0000000000000010 00000018 FDE cie=0000002c pc=3..4\n"
+        ),
+        "readelf 2.47 hdr+decoded": (
+            "Contents of the .eh_frame_hdr section:\n"
+            "Entries in search table: 0x2\n"
+            "0x1 -> 0x2 fde=[    18]\n"
+            "0x3 -> 0x4 fde=[    44]\n"
+            "Contents of the .eh_frame section:\n"
+            "00000018 0000000000000010 0000001c FDE cie=00000000 pc=1..2\n"
+            "00000044 0000000000000010 00000018 FDE cie=0000002c pc=3..4\n"
+        ),
+        "CIE-only is not coverage": (
+            "Contents of the .eh_frame section:\n"
+            "00000000 0000000000000014 00000000 CIE\n"
+        ),
+    }
+    expected_fdes = {"readelf 2.40 decoded-only": 2,
+                     "readelf 2.47 hdr+decoded": 2,
+                     "CIE-only is not coverage": 0}
+    for name, sample in frame_samples.items():
+        decoded = decode_fde_count(sample)
+        if decoded["fde_count"] != expected_fdes[name]:
+            print(f"self-test FAIL: {name} decoded {decoded}", file=sys.stderr)
+            return 1
+        if decoded["frame_hdr_entries"] not in (0, 2):
+            print(f"self-test FAIL: {name} header count {decoded}", file=sys.stderr)
+            return 1
     import copy
     mutations = [
         ("wrong static count", lambda r: r["objdump"].update(**{"lccc_on:pick8": 5}), "not 4 instructions"),
@@ -412,6 +483,10 @@ def self_test() -> int:
         ("missing Valgrind", lambda r: r["tools"].update(valgrind=None),
          "required tool valgrind missing"),
         ("missing FDE table", lambda r: r["structural"].update(fde_count=0), "FDE structural check"),
+        ("search table but no decoded FDEs",
+         lambda r: r["structural"].update(fde_count=0, frame_hdr_entries=2,
+                                          frame_output="hdr_table+decoded"),
+         "FDE structural check"),
         ("absent required ICX", lambda r: r.update(require_icx=True), "ICX required"),
     ]
     for name, mutate, want in mutations:
@@ -474,7 +549,8 @@ def self_test() -> int:
             print("self-test FAIL: preflight evidence was not recorded", file=sys.stderr)
             return 1
     print(f"PASS best-tools self-test ({len(mutations)} verdict mutations "
-          f"rejected, fail-fast report paths proven, toolchain identity pinned)")
+          f"rejected, {len(frame_samples)} readelf frame dialects decoded, "
+          "fail-fast report paths proven, toolchain identity pinned)")
     return 0
 
 
@@ -595,6 +671,13 @@ def main(argv: list[str]) -> int:
         report["verdict"] = "FAIL"
 
     report["problems"] = evaluate(report)
+    # A problem discovered by the verdict predicate (for example a zero-FDE
+    # structural check) must not leave a contradictory `verdict=PASS` in the
+    # JSON evidence.  `report_evidence` already fails on `problems`; recording
+    # the same decision here makes machine consumers equally fail-closed.
+    if report.get("verdict") == "PASS" and report["problems"]:
+        report["verdict"] = "FAIL"
+        report["error"] = report.get("error") or "; ".join(report["problems"])
     if args.json:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(report, indent=2, sort_keys=True, default=str) + "\n")

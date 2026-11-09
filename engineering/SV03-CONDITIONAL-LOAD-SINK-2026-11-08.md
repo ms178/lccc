@@ -408,7 +408,7 @@ harness, missing GDB/QEMU/mold lane probes, and missing invocation contracts.
 
 ### 12.1 Final base and reconstruction
 
-The final branch is one squashed commit on
+The final branch is a small rebased commit series on
 `origin/main = 7ad9f30161ddc4bc1ebdea00ddb4ec54f6865498`; that main includes
 PRs #1161, #1165 and #1166 (vector-store/query-operator fixes, GCC17 torture
 CI and last-20-PR red-team repairs).  The rebase preserves every upstream gate,
@@ -446,7 +446,9 @@ abort without changing the profitability verdict: every count above one is
 already the refusing case.  New unit tests cover all four address-key shape
 classes, typed-tail parsing, saturating use counts, and the extracted range
 fold's width/signedness/proof guards.  `git apply`-reconstructed rebase and
-all static CI checkers pass.
+all static CI checkers pass.  A later hosted run exposed one more independent
+harness defect, the binutils-output parser documented in 12.3; it is not a
+compiler or ratchet regression.
 
 ### 12.3 Local best-tools failure found and fixed
 
@@ -469,6 +471,26 @@ paths plus `main()`'s missing-tool preflight.  Simulating the old failure
 returns rc 1, empty stdout, `verdict=FAIL` and the named cause; no exception
 escapes.
 
+Hosted run `42652939283` then exposed a second, independent defect in the same
+gate: every compiler, GDB, objdump, IR census and Callgrind leg passed in both
+shard B and the authenticated ICX 2026.2 lane, but the ELF/FDE check failed.
+Ubuntu 24.04's system readelf 2.40 prints only decoded
+`00000018 ... FDE cie=00000000 ...` records; the local cache's readelf 2.47
+additionally prints an `.eh_frame_hdr` search table with `fde=[ ... ]` rows.
+The old parser counted only `fde=[`, so it reported `fde_count = 0` on hosted
+while the same executable had five decoded FDE records.  This was reproduced
+locally with system readelf 2.40 and pinned GDB 18.1.
+
+`decode_fde_count()` now counts decoded `FDE cie=` records as the
+version-independent authority and retains the optional search-table row count
+and readelf version as corroborating evidence.  `structural_readelf()` uses
+`--debug-dump=frames`; `evaluate()` still requires a positive decoded FDE
+count, and a report with a search table but no decoded records is a mutation
+case.  The self-test now rejects 14 verdict mutations, decodes three readelf
+frame dialects (2.40-only, 2.47 header+decoded, and CIE-only), and records
+`verdict=FAIL` whenever any problem is present.  Both readelf 2.40 and 2.47
+produce PASS locally with five FDE records.
+
 ### 12.4 Hosted-like no-alias execution proof
 
 A sanitized PATH was constructed with `clang-23 = MISSING`; compilers were
@@ -480,8 +502,14 @@ ICX lane.
 |---|---|---|
 | `check_cond_load_sink_cross_arch.py` | PASS | 8 freestanding binaries, four ISAs, oracle 51; AArch64 117/126, i686 188/192, RISC-V64 298/316, x86-64 93/96 instructions ON/OFF |
 | `check_same_width_cast_range.py` | PASS | 3 host compilers, 28 IR sections (5 folded / 17 guard Casts kept), four ISAs exit 5; x86-64 525, i686 924, AArch64 607, RISC-V64 1538 instructions |
-| `check_cond_load_sink_best_tools.py` | PASS | GDB PROT_NONE ON/OFF `5a/5a` no SIGSEGV; objdump `pick8/pick16` ON 4 / OFF 7 / GCC16 4 / Clang23 4; IR ON 0 / OFF 1; readelf `.text`+`.eh_frame`, 5 FDEs; Callgrind below |
+| `check_cond_load_sink_best_tools.py` | PASS | GDB PROT_NONE ON/OFF `5a/5a` no SIGSEGV; objdump `pick8/pick16` ON 4 / OFF 7 / GCC16 4 / Clang23 4; IR ON 0 / OFF 1; readelf 2.40 and 2.47 both decode 5 FDE records; Callgrind below |
 | `check_cond_load_sink_matrix.py` | PASS | 82 deterministic shapes, 12 compile+run pairs, receipt `5d7bed2a19deb1f4`, pointer-select census 53/53, ICX oracle skipped locally |
+
+Hosted run `42652939283` independently extended the matrix to 15 compile+run
+pairs with the authenticated ICX 2026.2 oracle and extended the cast-range gate
+to four host compilers; both reported PASS before the best-tools parser failed.
+The local no-alias proof therefore matches the hosted compiler identities, with
+ICX intentionally exercised only in the authenticated lane.
 
 ### 12.5 Host-CPU performance, measured not asserted
 
@@ -492,18 +520,24 @@ a codegen difference into a false win.  With the restored Valgrind 3.19.0:
 
 | Binary / state | Ir refs | Delta vs LCCC ON |
 |---|---:|---:|
-| LCCC fold ON | 2,616,224 | — |
-| LCCC fold OFF (`cast_sign_range` kill switch) | 2,716,200 | +99,976 (0.99976 / iteration) |
-| LCCC volatile control ON | 2,016,216 | — |
-| LCCC volatile control OFF | 2,016,202 | 14 layout refs |
-| GCC 16.2.0 fold shape | 2,516,773 | LCCC +99,451 (3.952% more refs) |
-| Clang 23.1.5 fold shape | 2,518,797 | LCCC +97,427 (3.868% more refs) |
+| LCCC fold ON | 2,640,550 | — |
+| LCCC fold OFF (`cast_sign_range` kill switch) | 2,740,536 | +99,986 (0.99986 / iteration) |
+| LCCC volatile control ON | 2,040,552 | — |
+| LCCC volatile control OFF | 2,040,538 | 14 layout refs |
+| GCC 16.2.0 fold shape | 2,541,109 | LCCC +99,441 (3.913% more refs) |
+| Clang 23.1.5 fold shape | 2,543,133 | LCCC +97,417 (3.831% more refs) |
 
-The fold removes one instruction per iteration on the proven join shape; the
-opaque volatile-Load control changes by only 14 refs, so the proof refuses
-what it cannot prove.  GCC and Clang still emit fewer refs on this synthetic
-loop.  ICX 2026.2 is available only in the hosted authenticated lane; no local
-ICX result or broad compiler-superiority claim is made.
+The table is from the final normal-environment evidence
+(`/tmp/recovery/evidence/best_tools_after_247.json`); the independent
+system-readelf 2.40 run produced 2,641,051 / 2,741,051 refs and a 100,000-ref
+delta.  Absolute counts vary slightly with the assembler/linker resolved from
+PATH, but the ~one-instruction-per-iteration delta, the 14-ref volatile control
+and the GCC/Clang ordering do not.  The fold removes one instruction per
+iteration on the proven join shape; the opaque volatile-Load control changes by
+only 14 refs, so the proof refuses what it cannot prove.  GCC and Clang still
+emit fewer refs on this synthetic loop.  ICX 2026.2 is available only in the
+hosted authenticated lane; no local ICX result or broad compiler-superiority
+claim is made.
 
 ### 12.6 Final local validation table
 
@@ -515,7 +549,9 @@ ICX result or broad compiler-superiority claim is made.
 | `cargo fmt --check`, `git diff --check`, Python/shell syntax | PASS |
 | `audit_census.py --check` | PASS: 863/94/27/10/233/97/26/565/254 vs baselines 863/94/27/10/233/97/26/565/255 |
 | static CI: workflow shell / parity / shard / lane plan + self-test | PASS: 14 files, 571 commands / 42 contracts, a=88 b=124, 2990 s |
-| 11 targeted `ci_local.sh --only` groups | PASS: 21 selected gates, 0 failed; 7 optional toolchain gates skipped per invocation |
+| 13 targeted `ci_local.sh --only` selector invocations | PASS: 21 unique selected gates, 0 failed; 7 optional toolchain gates skipped per invocation |
+| `check_cond_load_sink_best_tools.py --self-test` | PASS: 14 verdict mutations rejected, 3 readelf frame dialects decoded, fail-fast report paths proven |
+| best-tools with system readelf 2.40 + pinned GDB 18.1 | PASS: 5 decoded FDE records, 0 search-table rows, complete GDB/objdump/IR/Callgrind evidence |
 | four hosted-like no-alias harnesses | PASS, evidence in `/tmp/recovery/evidence/*.json` |
 
 ### 12.7 Tool honesty and efficiency verdict
@@ -523,8 +559,10 @@ ICX result or broad compiler-superiority claim is made.
 `objtool`, `pahole` and `perf` remain unavailable in this sandbox; the JSON
 evidence records `null` for each and performs the applicable user-space
 equivalents with `readelf`, `objdump` and Callgrind.  No result from those three
-tools is claimed.  GDB 18.1, objdump/readelf 2.47 and Valgrind/Callgrind 3.19
-actually ran.  The new helper functions are O(1) per visited definition,
+tools is claimed.  GDB 18.1, objdump 2.47, readelf 2.40 and 2.47, and
+Valgrind/Callgrind 3.19 actually ran locally; hosted run `42652939283`
+additionally exercised GDB 15.1, Valgrind 3.22.0 and ICX 2026.2.  The new
+helper functions are O(1) per visited definition,
 allocate nothing in the range proof, use flat indexed def maps, and fail closed
 on unknown IR.  A compiler engineer can approve the information boundary and
 the measured one-instruction win, but **cannot honestly call every function
@@ -535,6 +573,19 @@ and a measured shape-local improvement, not godlike universal efficiency.
 
 ### 12.8 Hosted acceptance
 
-The hosted run is the accepting authority.  This section is written before the
-final push; the PR body carries the final run ID and check verdict.  No
-production-ready claim is made before every required hosted check is green.
+The hosted run is the accepting authority.  Run `42652939283` on merge commit
+`404adc9dbd730a3ffbdebd60118c51b6685832ea` was RED in two real lanes —
+`Fast local contracts (shard b)` job `129286215568` and `Authenticated Intel
+ICX 2026.2 integration` job `129286216011` — plus the `Test Suite` aggregator
+job `129292331382`.  Every other required lane passed, including the full
+build, release-profile unit tests, assertion-enabled units and corpus, all
+frontend/codegen shards, assembler/linker, benchmarks, Clippy and the Debian
+exact-version contracts.  The uploaded ICX evidence proves the authenticated
+compiler ran: matrix `82 shapes / 15 pairs / icx2026`, cast-range `4 host
+compilers / 28 IR sections / 4 ISAs`, plus GDB/objdump/IR/Callgrind legs.
+The only failing verdict was `ELF .text/.eh_frame/FDE structural check failed`
+caused by the readelf 2.40 output dialect, not by a missing unwind table.
+
+This fix is pushed and a fresh hosted run is required before acceptance.  The
+PR body carries the final run ID and check verdict.  No production-ready claim
+is made before every required hosted check is green.
