@@ -974,6 +974,10 @@ jobs:
       run: python3 tests/linker/test_pr826_redteam.py
     - name: Preprocessor rescanning, conditional comma, character constants, wchar_t and pragma rendering
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_frontend_preprocessor_rules.sh
+    - name: GNU assertion semantics, pinned and differential against GCC 16.2
+      run: |
+        python3 tests/regression/check_gnu_assertions.py --self-test
+        python3 tests/regression/check_gnu_assertions.py --lccc target/fastbuild/lccc --gcc gcc-16 --gcc32 gcc-16
     - name: Feature capability truthfulness
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_feature_capabilities.sh
     - name: RISC-V shared-binding mutation controls

@@ -304,6 +304,11 @@ gate "frontend-ternary-common-type" fast \
     env CCC="$LCCC" bash tests/regression/check_frontend_ternary_common_type.sh
 gate "frontend-preprocessor-rules" fast \
     env CCC="$LCCC" bash tests/regression/check_frontend_preprocessor_rules.sh
+gate "gnu-assertions-self-test" fast \
+    python3 tests/regression/check_gnu_assertions.py --lccc "$LCCC" --self-test
+gate "gnu-assertions" fast \
+    python3 tests/regression/check_gnu_assertions.py --lccc "$LCCC" \
+    --gcc "${GCC16:-gcc-16}" --gcc32 "${GCC16:-gcc-16}"
 gate "feature-capabilities" fast \
     env CCC="$LCCC" bash tests/regression/check_feature_capabilities.sh
 gate "frontend-duplicate-definition" fast \

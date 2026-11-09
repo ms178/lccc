@@ -1457,7 +1457,7 @@
     "frontend-b": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 352.92,
+      "predicted_gate_seconds": 353.18,
       "shards": 3,
       "steps": [
         {
@@ -1587,6 +1587,10 @@
         {
           "measured_s": 5.0,
           "name": "Preprocessor rescanning, conditional comma, character constants, wchar_t and pragma rendering"
+        },
+        {
+          "measured_s": 0.26,
+          "name": "GNU assertion semantics, pinned and differential against GCC 16.2"
         },
         {
           "measured_s": 0.63,
