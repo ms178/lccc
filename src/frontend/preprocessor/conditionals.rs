@@ -135,6 +135,7 @@ pub fn evaluate_condition(expr: &str, macros: &MacroTable) -> (bool, Vec<String>
 fn expr_token_text(token: &ExprToken) -> String {
     match token {
         ExprToken::Num(n, _) => n.to_string(),
+        ExprToken::Assertion(_) => "#".to_string(),
         ExprToken::Ident(name) => name.clone(),
         ExprToken::Op(op) => (*op).to_string(),
         ExprToken::LParen => "(".to_string(),
@@ -328,6 +329,12 @@ fn eval_const_expr_with(expr: &str, model: CharModel) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 enum ExprToken {
     Num(i64, bool),
+    /// A resolved GNU assertion test (`#pred(answer)` / `#pred`): the
+    /// marker byte `assertions::ASSERTION_MARKER` + `'0'`/`'1'` spliced
+    /// in by `resolve_assertions`.
+    /// Kept distinct from `Num` so GCC's "missing binary operator before
+    /// token '#'" diagnostic can name the token the user wrote.
+    Assertion(bool),
     Ident(String),
     Op(&'static str),
     LParen,
@@ -491,6 +498,17 @@ fn tokenize_expr(expr: &str, model: CharModel) -> Vec<ExprToken> {
         // Skip whitespace
         if b.is_ascii_whitespace() {
             i += 1;
+            continue;
+        }
+
+        // Resolved assertion marker (see assertions::resolve_assertions).
+        if b == super::assertions::ASSERTION_MARKER {
+            if let Some(&v @ (b'0' | b'1')) = bytes.get(i + 1) {
+                tokens.push(ExprToken::Assertion(v == b'1'));
+                i += 2;
+                continue;
+            }
+            i += 1; // stray control byte: skip like any unknown byte
             continue;
         }
 
@@ -987,6 +1005,10 @@ impl<'a> ExprParser<'a> {
             Some(ExprToken::Num(n, u)) => {
                 self.advance();
                 (n, u)
+            }
+            Some(ExprToken::Assertion(v)) => {
+                self.advance();
+                (i64::from(v), false)
             }
             Some(ExprToken::LParen) => {
                 self.advance();

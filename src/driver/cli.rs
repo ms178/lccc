@@ -2095,6 +2095,7 @@ impl Driver {
         matches!(
             arg,
             "-o" | "-e"
+                | "-A"
                 | "-D"
                 | "-U"
                 | "-I"
@@ -2173,6 +2174,7 @@ impl Driver {
                         | "-MF"
                         | "-MT"
                         | "-MQ"
+                        | "-A"
                         | "-D"
                         | "-U"
                         | "-I"
@@ -2779,6 +2781,22 @@ impl Driver {
                     }
                 }
                 arg if arg.starts_with("-D") => self.add_define(&arg[2..], strict_options)?,
+
+                // GNU preprocessor assertions: -A pred=answer asserts,
+                // -A -pred=answer cancels. Collected in order; validation
+                // happens when the preprocessor is configured, where a
+                // malformed spec is GCC's non-fatal <command-line> error.
+                "-A" => {
+                    i += 1;
+                    if i < args.len() {
+                        self.assertions.push(args[i].clone());
+                    } else {
+                        return Err("-A requires an argument".to_string());
+                    }
+                }
+                arg if arg.starts_with("-A") && arg.len() > 2 => {
+                    self.assertions.push(arg[2..].to_string());
+                }
 
                 // Normally rejected before early queries; retain a defensive
                 // error here rather than reintroducing a silently ignored root.

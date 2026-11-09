@@ -1346,6 +1346,10 @@ impl Preprocessor {
 
     pub fn set_target(&mut self, target: &str) {
         self.invalidate_include_search();
+        // Predefined GNU assertions are a target property (GCC's
+        // config/{linux.h,i386/i386-c.cc}); command-line -A options are
+        // applied after target selection, so reseeding here cannot lose them.
+        self.assertions = super::assertions::AssertionTable::for_target(target);
         match target {
             "aarch64" => {
                 self.undefine_x86_baseline_macros();

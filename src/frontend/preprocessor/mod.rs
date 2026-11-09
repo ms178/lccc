@@ -1,3 +1,4 @@
+pub(crate) mod assertions;
 pub(crate) mod builtin_macros;
 pub(crate) mod conditionals;
 mod expr_eval;

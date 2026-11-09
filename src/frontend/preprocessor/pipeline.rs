@@ -97,6 +97,9 @@ pub enum PreprocessorDiagnosticIndex {
 
 pub struct Preprocessor {
     pub(super) macros: MacroTable,
+    /// GNU `#assert` predicate/answer table, seeded with the target's
+    /// predefined assertions (GCC target sources) by `set_target`.
+    pub(super) assertions: super::assertions::AssertionTable,
     conditionals: ConditionalStack,
     pub(super) includes: Vec<String>,
     pub(super) filename: String,
@@ -208,6 +211,9 @@ impl Preprocessor {
         super::utils::set_gnu_dialect(true);
         let mut pp = Self {
             macros: MacroTable::new(),
+            // Default arch mirrors the predefined-macro default; set_target
+            // replaces the table for other targets.
+            assertions: super::assertions::AssertionTable::for_target("x86_64"),
             conditionals: ConditionalStack::new(),
             includes: Vec::new(),
             filename: String::new(),
@@ -1596,6 +1602,8 @@ impl Preprocessor {
             }
             "define" => self.handle_define(rest, line_num, col),
             "undef" => self.handle_undef(rest, line_num),
+            "assert" => self.handle_assert(rest, line_num),
+            "unassert" => self.handle_unassert(rest, line_num),
             "ifdef" => self.handle_ifdef(rest, false),
             "ifndef" => self.handle_ifdef(rest, true),
             "if" => self.handle_if(rest, line_num),
@@ -1913,6 +1921,184 @@ impl Preprocessor {
         }
     }
 
+    /// Substitute GNU assertion tests in a conditional expression and emit
+    /// their diagnostics (deprecation warnings and GCC-spelling syntax
+    /// errors). Returns the expression with each test replaced by a marker
+    /// token. Hot path: lines without '#' return immediately.
+    fn resolve_assertions_in_expr(&mut self, expr: &str, line: usize) -> String {
+        if !expr.as_bytes().contains(&b'#') {
+            return expr.to_string();
+        }
+        let (resolved, incidents) = super::assertions::resolve_assertions(expr, &self.assertions);
+        for incident in incidents {
+            let diagnostic = PreprocessorDiagnostic {
+                kind: Some(if incident.deprecated {
+                    crate::common::error::WarningKind::Deprecated
+                } else {
+                    crate::common::error::WarningKind::Cpp
+                }),
+                file: self.current_file(),
+                line,
+                col: incident.col,
+                message: incident.message,
+            };
+            if incident.is_error {
+                self.errors.push(diagnostic);
+            } else {
+                self.push_warning(diagnostic);
+            }
+        }
+        resolved
+    }
+
+    /// `#assert predicate(answer)` (GNU extension, GCC 16.2 semantics:
+    /// deprecation warning, then the answer tokens up to the FIRST ')').
+    fn handle_assert(&mut self, rest: &str, line_num: usize) {
+        self.warn_deprecated_directive("#assert", line_num);
+        let Some((predicate, after)) = Self::parse_assertion_predicate(rest) else {
+            self.push_assertion_error("assertion without predicate", line_num);
+            return;
+        };
+        let after_trim = after.trim_start();
+        let Some(answer_on) = after_trim.strip_prefix('(') else {
+            self.push_assertion_error("missing '(' after predicate", line_num);
+            return;
+        };
+        let Some(close) = answer_on.find(')') else {
+            self.push_assertion_error("missing ')' to complete answer", line_num);
+            return;
+        };
+        let Some(answer) = super::assertions::canonicalize_answer(&answer_on[..close]) else {
+            self.push_assertion_error("predicate's answer is empty", line_num);
+            return;
+        };
+        if !answer_on[close + 1..].trim().is_empty() {
+            self.push_warning(PreprocessorDiagnostic {
+                kind: Some(crate::common::error::WarningKind::Cpp),
+                file: self.current_file(),
+                line: line_num,
+                col: 1,
+                message: "extra tokens at end of '#assert' directive".to_string(),
+            });
+        }
+        self.assertions.assert_answer(&predicate, &answer);
+    }
+
+    /// `#unassert predicate` drops every answer, `#unassert predicate(answer)`
+    /// drops one; unknown predicates/answers are silent (GCC 16.2).
+    fn handle_unassert(&mut self, rest: &str, line_num: usize) {
+        self.warn_deprecated_directive("#unassert", line_num);
+        let Some((predicate, after)) = Self::parse_assertion_predicate(rest) else {
+            self.push_assertion_error("assertion without predicate", line_num);
+            return;
+        };
+        let after_trim = after.trim_start();
+        let Some(answer_on) = after_trim.strip_prefix('(') else {
+            if !after_trim.is_empty() {
+                self.push_warning(PreprocessorDiagnostic {
+                    kind: Some(crate::common::error::WarningKind::Cpp),
+                    file: self.current_file(),
+                    line: line_num,
+                    col: 1,
+                    message: "extra tokens at end of '#unassert' directive".to_string(),
+                });
+            }
+            self.assertions.unassert_all(&predicate);
+            return;
+        };
+        let Some(close) = answer_on.find(')') else {
+            self.push_assertion_error("missing ')' to complete answer", line_num);
+            return;
+        };
+        let Some(answer) = super::assertions::canonicalize_answer(&answer_on[..close]) else {
+            self.push_assertion_error("predicate's answer is empty", line_num);
+            return;
+        };
+        if !answer_on[close + 1..].trim().is_empty() {
+            self.push_warning(PreprocessorDiagnostic {
+                kind: Some(crate::common::error::WarningKind::Cpp),
+                file: self.current_file(),
+                line: line_num,
+                col: 1,
+                message: "extra tokens at end of '#unassert' directive".to_string(),
+            });
+        }
+        self.assertions.unassert_answer(&predicate, &answer);
+    }
+
+    /// Split the leading predicate identifier off an `#assert`/`#unassert`
+    /// operand. Returns `(predicate, remainder)`.
+    fn parse_assertion_predicate(rest: &str) -> Option<(String, &str)> {
+        let trimmed = rest.trim_start();
+        let bytes = trimmed.as_bytes();
+        if bytes
+            .first()
+            .copied()
+            .is_none_or(|b| !super::utils::is_ident_start_byte(b))
+        {
+            return None;
+        }
+        let end = bytes
+            .iter()
+            .position(|&b| !super::utils::is_ident_cont_byte(b))
+            .unwrap_or(bytes.len());
+        Some((trimmed[..end].to_string(), &trimmed[end..]))
+    }
+
+    fn warn_deprecated_directive(&mut self, directive: &str, line_num: usize) {
+        self.push_warning(PreprocessorDiagnostic {
+            kind: Some(crate::common::error::WarningKind::Deprecated),
+            file: self.current_file(),
+            line: line_num,
+            col: 2,
+            message: format!("'{directive}' is a deprecated GCC extension"),
+        });
+    }
+
+    fn push_assertion_error(&mut self, message: &str, line_num: usize) {
+        self.errors.push(PreprocessorDiagnostic {
+            kind: Some(crate::common::error::WarningKind::Cpp),
+            file: self.current_file(),
+            line: line_num,
+            col: 1,
+            message: message.to_string(),
+        });
+    }
+
+    /// Apply one command-line `-A` option. `-A pred=answer` asserts,
+    /// `-A -pred=answer` cancels exactly that answer (GCC 16.2). A spec
+    /// without '=' is GCC's "missing '(' after predicate"; GCC prints the
+    /// error against `<command-line>` and continues, so the caller treats
+    /// the returned message as a non-fatal diagnostic.
+    pub fn apply_cli_assertion(&mut self, spec: &str) -> Result<(), String> {
+        let (negate, body) = match spec.strip_prefix('-') {
+            Some(body) => (true, body),
+            None => (false, spec),
+        };
+        let Some((predicate, answer)) = body.split_once('=') else {
+            return Err("missing '(' after predicate".to_string());
+        };
+        let predicate = predicate.trim();
+        if predicate.is_empty()
+            || !predicate
+                .bytes()
+                .next()
+                .is_some_and(super::utils::is_ident_start_byte)
+            || !predicate.bytes().all(super::utils::is_ident_cont_byte)
+        {
+            return Err("assertion without predicate".to_string());
+        }
+        let Some(answer) = super::assertions::canonicalize_answer(answer) else {
+            return Err("predicate's answer is empty".to_string());
+        };
+        if negate {
+            self.assertions.unassert_answer(predicate, &answer);
+        } else {
+            self.assertions.assert_answer(predicate, &answer);
+        }
+        Ok(())
+    }
+
     fn handle_ifdef(&mut self, rest: &str, negate: bool) {
         let name = rest.split_whitespace().next().unwrap_or("");
         let defined = self.macros.is_defined(name);
@@ -1944,8 +2130,13 @@ impl Preprocessor {
     }
 
     fn handle_if(&mut self, expr: &str, diag_line: usize) {
-        // First resolve `defined(X)` and `__has_*()` before macro expansion
-        let resolved = self.resolve_defined_in_expr(expr, diag_line);
+        // GNU assertions (`#pred(answer)`) resolve BEFORE anything else:
+        // their predicates and answers are never macro-expanded, while the
+        // rest of the line still is (gcc.c-torture 950919-1.c:
+        // `#if empty#cpu(m68k)` with an empty object macro).
+        let resolved = self.resolve_assertions_in_expr(expr, diag_line);
+        // Resolve `defined(X)` and `__has_*()` before macro expansion
+        let resolved = self.resolve_defined_in_expr(&resolved, diag_line);
         // Expand macros in the resolved expression (reuse directive_expanding set)
         let expanded = self
             .macros
@@ -1953,6 +2144,8 @@ impl Preprocessor {
         // Resolve again after macro expansion, in case macros expanded to
         // __has_attribute(), __has_builtin(), __has_include(), etc.
         let expanded = self.resolve_defined_in_expr(&expanded, diag_line);
+        // ... or to an assertion test (GCC evaluates those too).
+        let expanded = self.resolve_assertions_in_expr(&expanded, diag_line);
         // Replace any remaining identifiers with 0 (standard C behavior for #if)
         let condition = self.evaluate_pp_condition(&expanded, diag_line);
         self.conditionals.push_if(condition);
@@ -1972,12 +2165,14 @@ impl Preprocessor {
             self.conditionals.handle_elif(false);
             return;
         }
-        let resolved = self.resolve_defined_in_expr(expr, diag_line);
+        let resolved = self.resolve_assertions_in_expr(expr, diag_line);
+        let resolved = self.resolve_defined_in_expr(&resolved, diag_line);
         let expanded = self
             .macros
             .expand_line_reuse(&resolved, &mut self.directive_expanding);
         // Resolve again after macro expansion (same reason as handle_if)
         let expanded = self.resolve_defined_in_expr(&expanded, diag_line);
+        let expanded = self.resolve_assertions_in_expr(&expanded, diag_line);
         let condition = self.evaluate_pp_condition(&expanded, diag_line);
         self.conditionals.handle_elif(condition);
     }

@@ -229,6 +229,13 @@ pub enum WarningKind {
     /// measured: `-Wno-pragmas` silences it, `-Werror=pragmas` promotes it,
     /// `-Wall`/`-Wextra` do not re-enable it after `-Wno-pragmas`).
     Pragmas,
+    /// A deprecated language extension was used (GNU preprocessor
+    /// assertions: `#assert`, `#unassert`, `#pred(answer)` in `#if`).
+    ///
+    /// GCC flag: -Wdeprecated, on by default and in no group (GCC 16.2,
+    /// measured: emitted without any -W option, `-Wno-deprecated`
+    /// silences it).
+    Deprecated,
 }
 
 /// Supported warning groups. `-Wall` and `-Wextra` are broad groups;
@@ -596,6 +603,14 @@ pub const WARNING_REGISTRY: &[WarningDescriptor] = &[
         [],
         false,
         "malformed recognised pragma"
+    ),
+    warning!(
+        Deprecated,
+        "deprecated",
+        true,
+        [],
+        false,
+        "use of a deprecated extension (GNU preprocessor assertions)"
     ),
 ];
 
@@ -2225,6 +2240,7 @@ mod dialect_severity_redteam_tests {
             WarningKind::Multichar,
             WarningKind::ReturnLocalAddr,
             WarningKind::Pragmas,
+            WarningKind::Deprecated,
         ];
         let expected: HashSet<_> = kinds.into_iter().collect();
         assert_eq!(

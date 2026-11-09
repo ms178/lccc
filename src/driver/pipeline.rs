@@ -239,6 +239,9 @@ pub struct Driver {
     pub(super) debug_prefix_map: crate::common::path_map::PathPrefixMap,
     pub(super) macro_prefix_map: crate::common::path_map::PathPrefixMap,
     pub(super) defines: Vec<CliDefine>,
+    /// Command-line `-A` assertion specs, in option order (`pred=answer`
+    /// asserts, `-pred=answer` cancels that answer).
+    pub(super) assertions: Vec<String>,
     pub(super) include_paths: Vec<String>,
     /// Quote-only include paths (from -iquote flags).
     /// Searched only for `#include "file"` (quoted includes), after the current
@@ -839,6 +842,7 @@ impl Driver {
             debug_prefix_map: Default::default(),
             macro_prefix_map: Default::default(),
             defines: Vec::new(),
+            assertions: Vec::new(),
             include_paths: Vec::new(),
             quote_include_paths: Vec::new(),
             isystem_include_paths: Vec::new(),
@@ -2470,6 +2474,14 @@ impl Driver {
         }
         for def in &self.defines {
             preprocessor.define_macro(&def.name, &def.value);
+        }
+        // GNU assertions after target selection so -A can cancel predefined
+        // answers. GCC reports a malformed spec against <command-line> and
+        // keeps compiling (witnessed: `-Afoo` prints the error, exit 0).
+        for spec in &self.assertions {
+            if let Err(message) = preprocessor.apply_cli_assertion(spec) {
+                eprintln!("<command-line>: error: {message}");
+            }
         }
         // Disable _FORTIFY_SOURCE: glibc's fortification headers define extern
         // always_inline wrapper functions that use __builtin_va_arg_pack() and
