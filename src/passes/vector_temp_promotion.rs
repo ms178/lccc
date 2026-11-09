@@ -1265,8 +1265,10 @@ struct HomeForward {
     block: usize,
     producer: usize,
     kind: HomeBypass,
-    /// Register value that replaces every read of the home.
-    value: u32,
+    /// Register value that replaces every read of the home. `None` for a
+    /// relay, which re-points the producer instead of forwarding a value --
+    /// using 0 as a placeholder would collide with real value id 0.
+    value: Option<u32>,
     /// `(instruction, argument index)` reads rewritten in place.
     arg_rewrites: Vec<(usize, usize)>,
     /// Instructions removed outright: the retired producer (`Spill`) and the
@@ -1474,11 +1476,17 @@ fn plan_home_forwards(func: &IrFunction, allocas: &FxHashMap<u32, AllocaInfo>) -
                         // whole-register store; that store's destination is
                         // where the producer should write instead.
                         let ld_uses = count_uses(func, ld.0);
-                        if ld_uses.len() != 1 {
+                        // Require exactly one use site and destructure it in
+                        // the same step. The census counts panicking
+                        // accessors, so the bound is expressed as an
+                        // irrefutable-by-construction pattern instead of
+                        // `.expect("len == 1")`.
+                        let first = ld_uses.iter().next();
+                        let second = ld_uses.iter().nth(1);
+                        let (Some((&(lb, li), &ln)), None) = (first, second) else {
                             aborted = true;
                             break;
-                        }
-                        let (&(lb, li), &ln) = ld_uses.iter().next().expect("len == 1");
+                        };
                         // A terminator use shares the block id, so reject the
                         // sentinel explicitly before it reaches an index.
                         if lb != block_idx || li == TERMINATOR || ln != 1 {
@@ -1563,7 +1571,7 @@ fn plan_home_forwards(func: &IrFunction, allocas: &FxHashMap<u32, AllocaInfo>) -
                         block: block_idx,
                         producer,
                         kind: HomeBypass::Relay { destination },
-                        value: 0,
+                        value: None,
                         arg_rewrites: Vec::new(),
                         dead,
                     }
@@ -1581,7 +1589,7 @@ fn plan_home_forwards(func: &IrFunction, allocas: &FxHashMap<u32, AllocaInfo>) -
                         block: block_idx,
                         producer,
                         kind: HomeBypass::Spill,
-                        value: stored,
+                        value: Some(stored),
                         arg_rewrites,
                         dead,
                     }
@@ -1640,9 +1648,11 @@ fn prune_conflicting_plans(
             // deletes the reload that produced it, so a neighbouring spill
             // handing that same register to its readers would leave them
             // pointing at a definition that no longer exists.
-            if let Some(&slot) = value_defs.get(&plan.value) {
-                if all_dead.contains(&slot) {
-                    return false;
+            if let Some(value) = plan.value {
+                if let Some(&slot) = value_defs.get(&value) {
+                    if all_dead.contains(&slot) {
+                        return false;
+                    }
                 }
             }
             true
@@ -1678,8 +1688,10 @@ fn forward_vector_home_results(func: &mut IrFunction) -> usize {
             if let Instruction::Intrinsic { args, .. } =
                 &mut func.blocks[plan.block].instructions[*instr]
             {
-                if let Some(slot) = args.get_mut(*idx) {
-                    *slot = Operand::Value(Value(plan.value));
+                // A relay never performs argument rewrites, so a plan that
+                // reaches here always carries the register it forwards.
+                if let (Some(slot), Some(value)) = (args.get_mut(*idx), plan.value) {
+                    *slot = Operand::Value(Value(value));
                 }
             }
         }
