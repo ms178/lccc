@@ -36,6 +36,12 @@
 #      where the ISA has them (`btsl`/`btrl` on i686, `bic` on AArch64),
 #   6. -O0, -O1, -O2, -O3, -Os, the kill switch and GCC agree bit for bit on a
 #      checksum over every width, both edges and 64-bit operands,
+#   8. the range-gated same-width Cast fold keeps `loop_count`'s U32 induction
+#      in 32 bits (16 instructions); `CCC_SIMPLIFY_SKIP=cast_sign_range`
+#      restores the conservative U64 induction (17 instructions).  LCCC,
+#      GCC 16.2 and Clang 23.1.5 must all produce the same runtime checksum.
+#      The proof is in check_same_width_cast_range.py's induction section.
+#
 #   7. the Chromium/Firefox-derived consumers of the test fold to the shapes
 #      Clang 23.1.5 / GCC 16.2 emit or better: test-and-modify of one word
 #      (`bt` + `btr`/`bts`, one load and one store), the branch forms
@@ -248,6 +254,12 @@ C
 "$CCC" -O2 -S "$tmp/rows.c" -o "$tmp/rows-on.s"
 CCC_NO_BIT_SELECT=1 "$CCC" -O2 -S "$tmp/rows.c" -o "$tmp/rows-off.s"
 CCC_NO_BT_ADC_FUSION=1 "$CCC" -O2 -S "$tmp/rows.c" -o "$tmp/rows-noadc.s"
+# The range-fold kill switch is the provenance control for the U32 induction
+# win.  It must restore BOTH the 17-instruction loop and the 19-instruction
+# no-ADC variant; a bare count update without this control would be a rebaseline.
+CCC_SIMPLIFY_SKIP=cast_sign_range "$CCC" -O2 -S "$tmp/rows.c" -o "$tmp/rows-nofold.s"
+CCC_SIMPLIFY_SKIP=cast_sign_range CCC_NO_BT_ADC_FUSION=1 \
+    "$CCC" -O2 -S "$tmp/rows.c" -o "$tmp/rows-nofold-noadc.s"
 # label on off: the folded count and the kill-switch count.
 while read -r label on off; do
     expect "$label" "$on" rows-on.s
@@ -283,8 +295,80 @@ want rows-on.s sub_bit 'sbb[lq][[:space:]]'
 expect count_bit 5 rows-noadc.s
 expect sub_bit 6 rows-noadc.s
 refuse rows-noadc.s count_bit 'adc[lq][[:space:]]' "CCC_NO_BT_ADC_FUSION must remove the adc"
-expect loop_count 17 rows-on.s
-expect loop_count 19 rows-noadc.s
+# The sound range fold removes one prologue instruction by keeping the
+# U32 loop bound/induction in U32.  i starts at 0, increments only while i<n,
+# and stops at n<=UINT32_MAX, so the increment never wraps.  See section 13 of
+# engineering/SV03-CONDITIONAL-LOAD-SINK-2026-11-08.md for the measured proof.
+expect loop_count 16 rows-on.s
+expect loop_count 18 rows-noadc.s
+expect loop_count 17 rows-nofold.s
+expect loop_count 19 rows-nofold-noadc.s
+
+# ── 4b. Host runtime differential for the 32-bit induction proof ──────────
+# Counts alone can hide a miscompile.  Compile a checksum over n=0..4096 with
+# LCCC, GCC 16.2 and Clang 23.1.5 and compare all three to an independent
+# Python oracle.  `argc` seeds the bitmap so no compiler can fold the data.
+cat > "$tmp/induction.c" <<'C'
+#include <stdio.h>
+#include <stdint.h>
+typedef uint32_t u32;
+typedef uint64_t u64;
+void hit(u32 x) { (void)x; }
+__attribute__((noinline)) u32 loop_count(const unsigned char *b, u32 n) {
+    u32 s = 0;
+    for (u32 i = 0; i < n; i++) s += (b[i >> 3] >> (i & 7)) & 1;
+    return s;
+}
+static unsigned char bits[4096];
+int main(int argc, char **argv) {
+    volatile unsigned seed = (unsigned)argc + 1u;
+    for (unsigned i = 0; i < sizeof(bits); i++) {
+        seed = seed * 1664525u + 1013904223u;
+        bits[i] = (unsigned char)(seed >> 24);
+    }
+    u64 h = 1469598103934665603ULL;
+    for (u32 n = 0; n <= 4096; n++) { h ^= loop_count(bits, n); h *= 1099511628211ULL; }
+    printf("%016llx\n", (unsigned long long)h);
+    (void)argv;
+    return 0;
+}
+C
+python3 - "$tmp/induction_oracle.txt" <<'PYORACLE'
+import sys
+seed = 2  # argc=1 for this fixture
+bits = bytearray(4096)
+for i in range(len(bits)):
+    seed = (seed * 1664525 + 1013904223) & 0xffffffff
+    bits[i] = (seed >> 24) & 0xff
+h = 1469598103934665603
+for n in range(4097):
+    s = 0
+    for i in range(n):
+        s = (s + ((bits[i >> 3] >> (i & 7)) & 1)) & 0xffffffff
+    h = ((h ^ s) * 1099511628211) & 0xffffffffffffffff
+open(sys.argv[1], "w").write(f"{h:016x}\n")
+PYORACLE
+oracle=$(cat "$tmp/induction_oracle.txt")
+GCC16=${GCC16:-gcc-16}
+CLANG23=${CLANG23:-${CLANG:-clang-23}}
+for cc_name in lccc gcc16 clang23; do
+    case "$cc_name" in
+        lccc) cc="$CCC" ;;
+        gcc16) cc="$GCC16" ;;
+        clang23) cc="$CLANG23" ;;
+    esac
+    if ! command -v "$cc" >/dev/null 2>&1; then
+        echo "induction oracle $cc_name unavailable: $cc" >&2
+        exit 1
+    fi
+    "$cc" -O2 -Wall -Wextra -Werror "$tmp/induction.c" -o "$tmp/induction_$cc_name" || exit 1
+    got=$("$tmp/induction_$cc_name")
+    if [ "$got" != "$oracle" ]; then
+        echo "induction runtime $cc_name checksum $got != oracle $oracle" >&2
+        exit 1
+    fi
+done
+echo "PASS induction runtime oracle $oracle (LCCC/GCC16/Clang23)"
 
 # ── 5. The other backends never get longer ────────────────────────────────
 # Every function of the corpus, compiled by both builds of each cross target:

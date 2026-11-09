@@ -392,7 +392,7 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 558.2,
+      "predicted_gate_seconds": 557.52,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
@@ -569,7 +569,7 @@
           "name": "bash tests/regression/check_unsigned_reduction_codegen.sh"
         },
         {
-          "measured_s": 1.63,
+          "measured_s": 3.59,
           "name": "bash tests/regression/check_bit_select_fold.sh"
         },
         {
@@ -921,11 +921,11 @@
           "name": "python3 tests/regression/check_cond_load_sink_matrix.py --self-test"
         },
         {
-          "measured_s": 4.1,
+          "measured_s": 1.44,
           "name": "python3 scripts/check_same_width_cast_range.py \\ --lccc target/fastbuild/lccc --gcc gcc-16 --clang \"$CLANG\" \\ --json target/same-width-cast-range.json"
         },
         {
-          "measured_s": 0.04,
+          "measured_s": 0.06,
           "name": "python3 scripts/check_same_width_cast_range.py --self-test"
         },
         {
@@ -1950,8 +1950,8 @@
   "provenance": {
     "backend-contracts": {
       "costs": "/tmp/gates.tsv",
-      "measured_seconds_total": 1097.52,
-      "source": "measured by scripts/ci_gate_costs.py; rootfs-write-policy gates measured locally (max of 3 runs); debug-acceptance-parity and asm-dialect-alternatives (4 commands) measured locally as max of 3 runs, floored at 0.25 s, +2.92 s; SV-03 cond-load-sink gate measured locally as max of 3 runs (0.30 s); vec-store-contracts and its self-test measured locally as worst-of-5 (1.36 s each; static scan, no compiler); SV-03 four-ISA cross, same-width cast-range, best-tool and matrix gates remeasured locally with the pinned cache toolchain (cross full 0.41 s / self-test 0.04 s, cast full 1.07 s / self-test 0.04 s, best-tools full 2.13 s / self-test 0.04 s, matrix full 16.63 s / self-test 0.04 s); hosted Clang path is pinned on the command line"
+      "measured_seconds_total": 1096.84,
+      "source": "measured by scripts/ci_gate_costs.py; rootfs-write-policy gates measured locally (max of 3 runs); debug-acceptance-parity and asm-dialect-alternatives (4 commands) measured locally as max of 3 runs, floored at 0.25 s, +2.92 s; SV-03 cond-load-sink gate measured locally as max of 3 runs (0.30 s); vec-store-contracts and its self-test measured locally as worst-of-5 (1.36 s each; static scan, no compiler); SV-03 four-ISA cross, same-width cast-range, best-tool and matrix gates remeasured locally with the pinned cache toolchain (cross full 0.41 s / self-test 0.04 s, cast full 1.44 s / self-test 0.06 s (32-bit induction proof, worst-of-3), best-tools full 2.13 s / self-test 0.04 s, matrix full 16.63 s / self-test 0.04 s; bit-select fold remeasured worst-of-3 at 3.59 s after the induction runtime oracle); hosted Clang path is pinned on the command line"
     },
     "codegen": {
       "costs": "/home/user/.cache/tmp/codegen.tsv",

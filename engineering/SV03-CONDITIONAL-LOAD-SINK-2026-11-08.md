@@ -418,6 +418,8 @@ matrix gates.  The lane plan's `predicted_gate_seconds` is recomputed from the
 exact `measured_s` sum: shard A `539.32 s`, shard B `558.20 s`, total
 `2990 s`.  Static parity reports `571 commands / 42 invocation contracts`,
 shard partition `a=88, b=124`, lane self-test `19 rules / 30 fixtures`.
+  After the induction-proof additions in section 13 the measured plan is
+  `2989 s` (backend A `539.32 s`, backend B `557.52 s`).
 
 ### 12.2 Hosted-red root causes closed without weakening a ratchet
 
@@ -548,7 +550,7 @@ claim is made.
 | `cargo clippy --profile fastbuild --locked --all-targets -- -D warnings` | PASS |
 | `cargo fmt --check`, `git diff --check`, Python/shell syntax | PASS |
 | `audit_census.py --check` | PASS: 863/94/27/10/233/97/26/565/254 vs baselines 863/94/27/10/233/97/26/565/255 |
-| static CI: workflow shell / parity / shard / lane plan + self-test | PASS: 14 files, 571 commands / 42 contracts, a=88 b=124, 2990 s |
+| static CI: workflow shell / parity / shard / lane plan + self-test | PASS: 14 files, 571 commands / 42 contracts, a=88 b=124, 2989 s |
 | 13 targeted `ci_local.sh --only` selector invocations | PASS: 21 unique selected gates, 0 failed; 7 optional toolchain gates skipped per invocation |
 | `check_cond_load_sink_best_tools.py --self-test` | PASS: 14 verdict mutations rejected, 3 readelf frame dialects decoded, fail-fast report paths proven |
 | best-tools with system readelf 2.40 + pinned GDB 18.1 | PASS: 5 decoded FDE records, 0 search-table rows, complete GDB/objdump/IR/Callgrind evidence |
@@ -561,8 +563,11 @@ evidence records `null` for each and performs the applicable user-space
 equivalents with `readelf`, `objdump` and Callgrind.  No result from those three
 tools is claimed.  GDB 18.1, objdump 2.47, readelf 2.40 and 2.47, and
 Valgrind/Callgrind 3.19 actually ran locally; hosted run `42652939283`
-additionally exercised GDB 15.1, Valgrind 3.22.0 and ICX 2026.2.  The new
-helper functions are O(1) per visited definition,
+additionally exercised GDB 15.1, Valgrind 3.22.0 and ICX 2026.2.  Section 13
+adds GDB `ptype /o`, independent pyelftools DWARF layout checks, Capstone
+instruction decoding and an objtool-equivalent CFI/stack audit.  Standalone
+`pahole`/`objtool`/`perf` binaries are unavailable in this sandbox and are
+never claimed to have run.  The new helper functions are O(1) per visited definition,
 allocate nothing in the range proof, use flat indexed def maps, and fail closed
 on unknown IR.  A compiler engineer can approve the information boundary and
 the measured one-instruction win, but **cannot honestly call every function
@@ -586,6 +591,136 @@ compilers / 28 IR sections / 4 ISAs`, plus GDB/objdump/IR/Callgrind legs.
 The only failing verdict was `ELF .text/.eh_frame/FDE structural check failed`
 caused by the readelf 2.40 output dialect, not by a missing unwind table.
 
-This fix is pushed and a fresh hosted run is required before acceptance.  The
-PR body carries the final run ID and check verdict.  No production-ready claim
-is made before every required hosted check is green.
+The FDE decoder fix made run `42657814376` green in the authenticated ICX lane
+and in every other lane except `Fast local contracts (shard b)` job
+`129303132681`.  That lane then reached the next gate and reported
+`loop_count costs 16 instructions in rows-on.s, expected 17`: a real one-
+instruction improvement from the same range proof, not a compiler regression.
+Section 13 red-teams that improvement, adds regression teeth and updates the
+pinned count.  The PR body carries the final run ID and check verdict.  No
+production-ready claim is made before every required hosted check is green.
+
+
+## 13. Final red-team: 32-bit induction win, tool-heavy proof and per-function audit
+
+### 13.1 Hosted-red root cause and decision
+
+After the FDE-parser fix, hosted run `42657814376` was green in the
+authenticated ICX 2026.2 lane and all other lanes except shard B.  Shard B
+failed `check_bit_select_fold.sh`: LCCC emitted 16 instructions for
+`loop_count` while the script pinned 17, and 18 with `CCC_NO_BT_ADC_FUSION=1`
+while it pinned 19.  The first instinct — restoring 17 instructions — would
+have deleted a sound optimization.  The second — changing two integers without
+evidence — would have been a rebaseline.  Neither is acceptable.
+
+A clean `origin/main = cdd5def2` fastbuild binary was built in a detached
+worktree with the same Rust/GCC/Clang cache, 4 GiB swap and `fastbuild`
+preset.  Main emits 17/19; this PR emits 16/18.  `CCC_SIMPLIFY_SKIP=
+cast_sign_range` restores 17/19 and the U64 induction ops, isolating the cause
+to the range proof.  Final IR proves the PR has no `U32 -> U64` widening Cast,
+no U64 `Cmp`, and two U32 `Cmp`s; main has a U64 induction with `cmpq/addq/
+movq/shrq`.
+
+The C loop is `for (u32 i = 0; i < n; i++)` with `n` a U32 parameter.
+Starting from zero, `i` increments by one only while `i < n` and stops at
+`i = n <= UINT32_MAX`; therefore `i + 1` never wraps to zero.  The U32
+induction is not merely smaller, it is the exact C abstract machine width.
+The U64 version was a conservative workaround, not a correctness requirement.
+The proof is structural (IR), differential (runtime) and dynamic (Callgrind),
+not a guess from an instruction count.
+
+### 13.2 Best-tool evidence on the host CPU
+
+Host CPU: `Intel(R) Xeon(R) Processor @ 2.60GHz`, x86-64.  Tools actually
+used: GDB 18.1, GNU objdump/readelf 2.47, Valgrind/Callgrind/Memcheck 3.19.0,
+pyelftools 0.33, Capstone 5, GCC 16.2.0, Clang 23.1.5, Rust 1.99.1.  The
+standalone `pahole`, `objtool` and `perf` binaries are not installed in this
+sandbox; GDB `ptype /o` is used as the pahole-style DWARF layout view, and
+readelf/objdump/Capstone as the objtool-equivalent CFI/stack/encoding check.
+ICX 2026.2 is available only in the hosted authenticated lane.  No result is
+claimed for a tool that did not run.
+
+Evidence: `/home/user/artifacts/redteam/induction_evidence.json` and
+`/home/user/artifacts/redteam/induction_redteam.log`.  Verdict **PASS**.
+
+| Probe | LCCC PR | LCCC main | GCC 16.2 | Clang 23.1.5 |
+|---|---:|---:|---:|---:|
+| Static `loop_count` instructions | **16** | 17 | 19 | 73 (vectorized) |
+| 64-bit induction ops | **none** | `addq,cmpq,movq,shrq` | `movq` | `movq` |
+| Callgrind Ir refs, 1000 varied calls | **41,208,254** | 41,209,254 | 45,297,780 | 24,315,280 |
+| Wall-clock median, 7 runs pinned CPU 0 | 0.005333 s | 0.005301 s | 0.006330 s | 0.005375 s |
+| Memcheck errors | 0 | 0 | 0 | 0 |
+| Runtime checksum | `e05a0b25418af6d6` | same | same | same |
+
+The deterministic Callgrind delta is exactly 1,000 fewer references for 1,000
+calls: one prologue instruction per invocation, not one per loop iteration.
+Wall-clock is within run-to-run noise (PR median 0.005333 s vs main 0.005301
+s), so no dishonest wall-clock speedup is claimed.  GCC uses more references;
+Clang vectorizes the bitmap loop and uses fewer, so no broad compiler
+superiority is claimed.  The claim is narrower and measured: on this shape the
+range proof removes one instruction and one dynamic reference per call without
+changing the checksum.
+
+GDB stepped 24 instructions through `loop_count` for `n = 8` with no SIGSEGV
+and returned `4`, matching the independent Python oracle.  Capstone decoded all
+102 bytes / 21 instructions of the PR `loop_count` symbol with zero errors; the
+`bt` operand is `r9d, r11d` (32-bit registers), not an invalid register field.
+`readelf --debug-dump=frames` reports 4 decoded FDE records and 4 header rows;
+`objdump` shows a leaf function with balanced push/pop and `rsp` adjustments.
+GDB `ptype /o struct Probe` and an independent pyelftools DWARF walk both
+report `size=24`, holes `(1,7)` and `(19,5)` — a pahole-style ABI check, not a
+claim that the standalone `pahole` binary ran.
+
+### 13.3 Regression teeth added, not a bare count update
+
+* `tests/regression/same_width_cast_range/induction.c` is a new fixture.
+* `scripts/check_same_width_cast_range.py` now proves the final IR has U32
+  compares, no U64 compare and no `U32 -> U64` Cast; compiles ON/kill-switch/
+  GCC16/Clang23 assembly; checks ON=16, kill-switch=17 and the presence/
+  absence of 64-bit induction ops; and compares a checksum over `n = 0..4096`
+  against an independent Python oracle.  ICX 2026.2 is included automatically
+  in the hosted authenticated lane.  `--self-test` grew from 33 to **44**
+  rejected verdict mutations, including induction IR, counts, kill-switch and
+  runtime-checksum mutations.
+* `tests/regression/check_bit_select_fold.sh` now pins 16/18, compiles two
+  explicit `CCC_SIMPLIFY_SKIP=cast_sign_range` controls that must restore
+  17/19, and compares LCCC/GCC16/Clang23 runtime checksums to a Python oracle.
+  A reviewer who deletes the proof cannot keep the gate green by editing two
+  integers.
+* The lane plan is remeasured worst-of-three with the pinned cache: bit-select
+  fold 3.59 s, cast-range full 1.44 s, cast-range self-test 0.06 s; total
+  `2989 s` (A 539.32 s, B 557.52 s).  Parity remains 571 commands / 42
+  contracts; shard partition remains a=88, b=124.
+
+### 13.4 Line-by-line function audit and efficiency verdict
+
+| Function / type | Audit | Complexity / allocation | Decision |
+|---|---|---|---|
+| `compute_reassociation_use_counts` | Operand-for-operand equivalent to the old inline census; only `fill_use_counts` allocates | O(total IR operands), one `Vec<u32>` | Extracted to remove a 69-line function; no verdict drift |
+| `bump_use_count` | Bounds-checked index; `u32::saturating_add` removes a theoretical debug overflow abort | O(1), no allocation | Any count > 1 is already the refusing verdict, so saturation is conservative and cannot strengthen a rewrite |
+| `cast_sign_range_fold` | Total over def maps; width/sign/128-bit/volatile/Phi/Select guards; exact `fold_const_cast` | O(1) per Cast, flat `Vec<Option<T>>` lookups, no allocation in the proof | Keeps all 17 guard Casts; refuse beats an unsafe 99,986-ref saving |
+| `simplify_cast_chain` | Independent helper with explicit width/sign range; no `unwrap`/`unreachable` | O(chain length), bounded | Removes the 298→338-line growth without rebaselining |
+| `CondLoadCastTail` | POD `{dest,from_ty,to_ty}`; emitted directly as a Cast | O(1), `Copy` | Apply phase cannot re-match a cloned variant or panic |
+| `CondAddrExpr::key` | Exhaustive match; sorted atoms; `i128::checked_add`; opaque unique keys on ambiguity | O(a log a) for the bounded atom multiset, one `String` per key | False positives can only decline a rewrite; recursion bounded at 8 |
+| `parse_cond_load_arm` | Linear tail parser; identical type chains required; rejects truncation/float/pointer/volatile | O(block instructions), `Vec` + `FxHashSet` only for a real plan | No SSA id is defined twice; no trapping load is speculated |
+| `decode_fde_count` (Python) | Counts decoded `FDE cie=` records, retains `fde=[` header rows as evidence | O(readelf output size) | Version-independent for binutils 2.40–2.47; 3-dialect self-test |
+| `report_evidence` (Python) | Total over incomplete reports; prints PASS only on zero-problem PASS | O(problems) | Missing Valgrind can no longer produce unearned PASS lines |
+
+No unsafe block, mutex/spinlock, null dereference, use-after-free, buffer
+arithmetic, unchecked index, invalid register field or new environment-read
+budget was introduced by this pass.  `cargo clippy --all-targets -D warnings`,
+`cargo fmt --check`, `git diff --check`, `audit_census.py --check` and all
+targeted gates are re-run after the rebase below.  A superoptimizer proof of
+global optimality was NOT run; LCCC is still behind Clang's vectorized loop on
+this host, and ICX is hosted-only.  Therefore the honest verdict is: **zero
+new warnings, zero new audit debt, zero measured defects in scope, and a proven
+shape-local one-instruction win** — not "every function is godlike-optimal".
+Casey Muratori's standard is honored by measuring, refusing unsound shortcuts,
+and saying exactly what was and was not proven.
+
+### 13.5 Rebase and final hosted authority
+
+The branch is rebased onto the latest `origin/main` before delivery.  Hosted CI
+remains the accepting authority; the PR body records the final run ID and
+per-check verdict.  No production-ready claim is made until every required
+hosted check is green.

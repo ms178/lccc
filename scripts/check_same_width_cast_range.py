@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -109,6 +110,14 @@ KEPT = (
     "u32_unproven", "i32_unproven", "u64_unproven", "i64_unproven",
 )
 VERIFY_ENV = {"CCC_VERIFY_IR": "abort", "CCC_VALIDATE_SSA": "1"}
+INDUCTION_FIXTURE = ROOT / "tests" / "regression" / "same_width_cast_range" / "induction.c"
+# FNV-1a over loop_count(bits, n) for n=0..4096, argc=1 (seed=2).
+INDUCTION_ORACLE = 0xE05A0B25418AF6D6
+INDUCTION_IR_CAST = re.compile(r"Cast \{[^}]*from_ty:\s*U32,\s*to_ty:\s*U64")
+INDUCTION_U64_CMP = re.compile(r"Cmp \{[^}]*ty:\s*U64")
+INDUCTION_U32_CMP = re.compile(r"Cmp \{[^}]*ty:\s*U32")
+INDUCTION_U64_OPS = re.compile(r"\b(?:cmpq|addq|movq|shrq|shlq)\b")
+INDUCTION_U32_OPS = re.compile(r"\b(?:cmpl|addl|movl|shrl|shll)\b")
 CAST_RE = {
     "masked": re.compile(r"from_ty:\s*U32,\s*to_ty:\s*I32"),
     "signbit": re.compile(r"from_ty:\s*U32,\s*to_ty:\s*I32"),
@@ -197,6 +206,112 @@ def host_execution(compilers: dict[str, str], src: Path, work: Path) -> list[dic
             {"compiler": name, "exit": got.returncode, "stdout": got.stdout.strip()}
         )
     return results
+
+
+def induction_ir(lccc: Path, work: Path) -> dict:
+    """Final-IR census for the U32 induction loop (no tool output dialect)."""
+    asm = work / "induction_ir.s"
+    env = dict(os.environ)
+    env["LCCC_DUMP_IR"] = "1"
+    env.update(VERIFY_ENV)
+    cp = subprocess.run(
+        [str(lccc), "-O2", "-S", str(INDUCTION_FIXTURE), "-o", str(asm)],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=120,
+    )
+    if cp.returncode != 0:
+        raise RuntimeError(f"induction IR compile failed: {cp.stderr[-500:]}")
+    matches = list(IR_SECTION.finditer(cp.stderr))
+    section = ""
+    for i, m in enumerate(matches):
+        if m.group(1) == "loop_count":
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(cp.stderr)
+            section = cp.stderr[m.end():end]
+            break
+    if len(section) < 100:
+        raise RuntimeError("final IR has no loop_count section")
+    return {
+        "ir_bytes": len(section),
+        "sha256": hashlib.sha256(section.encode()).hexdigest(),
+        "u32_to_u64_cast": len(INDUCTION_IR_CAST.findall(section)),
+        "u64_cmp": len(INDUCTION_U64_CMP.findall(section)),
+        "u32_cmp": len(INDUCTION_U32_CMP.findall(section)),
+    }
+
+
+def induction_asm(cc: str, work: Path, tag: str, extra_env: dict | None = None) -> dict:
+    """Count loop_count instructions and the width of its induction ops."""
+    asm = work / f"induction_{tag}.s"
+    env = dict(os.environ)
+    env.update(extra_env or {})
+    cp = run([cc, "-O2", "-Wall", "-Wextra", "-Werror", "-S",
+              str(INDUCTION_FIXTURE), "-o", str(asm)], env=env, timeout=120)
+    if cp.returncode != 0:
+        raise RuntimeError(f"induction {tag} assembly failed: {cp.stderr[-400:]}")
+    text = asm.read_text()
+    body: list[str] = []
+    active = False
+    for line in text.splitlines():
+        if line.startswith("loop_count:"):
+            active = True
+            body.append(line)
+            continue
+        if active:
+            body.append(line)
+            if re.match(r"^\s*(ret|retq)\b", line):
+                break
+    if not active:
+        raise RuntimeError(f"induction {tag}: no loop_count label")
+    joined = "\n".join(body)
+    return {
+        "instruction_count": sum(1 for l in body if re.match(r"^\s+[a-z]", l)),
+        "u64_ops": sorted(set(INDUCTION_U64_OPS.findall(joined))),
+        "u32_ops": sorted(set(INDUCTION_U32_OPS.findall(joined))),
+        "body_sha256": hashlib.sha256(joined.encode()).hexdigest(),
+    }
+
+
+def induction_runtime(compilers: dict[str, str], work: Path) -> list[dict]:
+    """End-to-end checksum over all n; GCC/Clang/ICX are independent oracles."""
+    results = []
+    for name, cc in compilers.items():
+        exe = work / f"induction_{name}"
+        env = dict(os.environ)
+        if name == "lccc":
+            env.update(VERIFY_ENV)
+        cp = run([cc, "-O2", "-Wall", "-Wextra", "-Werror",
+                  str(INDUCTION_FIXTURE), "-o", str(exe)], env=env, timeout=180)
+        if cp.returncode != 0:
+            raise RuntimeError(f"induction {name} compile failed: {cp.stderr[-400:]}")
+        got = run([str(exe)], timeout=60)
+        results.append({"compiler": name, "rc": got.returncode,
+                        "stdout": got.stdout.strip()})
+    return results
+
+
+def induction_evidence(pinned: dict[str, str], lccc: str, work: Path) -> dict:
+    compilers = {"lccc": lccc, "gcc16": pinned["gcc16"], "clang23": pinned["clang23"]}
+    if "icx2026" in pinned:
+        compilers["icx2026"] = pinned["icx2026"]
+    return {
+        "oracle": INDUCTION_ORACLE,
+        "expected_hosts": sorted(compilers),
+        "source_sha256": hashlib.sha256(INDUCTION_FIXTURE.read_bytes()).hexdigest(),
+        "ir": induction_ir(Path(lccc), work),
+        "assembly": {
+            "lccc_on": induction_asm(lccc, work, "on"),
+            "lccc_off": induction_asm(
+                lccc, work, "off", {"CCC_SIMPLIFY_SKIP": "cast_sign_range"}
+            ),
+            "gcc16": induction_asm(compilers["gcc16"], work, "gcc16"),
+            "clang23": induction_asm(compilers["clang23"], work, "clang23"),
+        },
+        "runtime": induction_runtime(compilers, work),
+    }
 
 
 def build_and_execute(target: dict, work: Path, fastbuild: Path, clang: str) -> dict:
@@ -288,6 +403,37 @@ def evaluate(report: dict) -> list[str]:
             bad.append(f"{r['isa']}: ELF machine mismatch")
         if r["instructions"] <= 0:
             bad.append(f"{r['isa']}: empty assembly")
+    ind = report.get("induction") or {}
+    if ind.get("oracle") != INDUCTION_ORACLE:
+        bad.append("induction oracle drift")
+    iri = ind.get("ir") or {}
+    if iri.get("ir_bytes", 0) < 100:
+        bad.append("induction IR section is empty")
+    if iri.get("u32_to_u64_cast", -1) != 0:
+        bad.append("induction U32->U64 widening Cast returned")
+    if iri.get("u64_cmp", -1) != 0:
+        bad.append("induction U64 compare returned")
+    if iri.get("u32_cmp", 0) < 1:
+        bad.append("induction U32 compare is missing")
+    asm = ind.get("assembly") or {}
+    on, off = asm.get("lccc_on") or {}, asm.get("lccc_off") or {}
+    if on.get("instruction_count") != 16:
+        bad.append(f"induction ON has {on.get('instruction_count')} instructions, expected 16")
+    if off.get("instruction_count") != 17:
+        bad.append(f"induction kill switch has {off.get('instruction_count')} instructions, expected 17")
+    if on.get("u64_ops"):
+        bad.append(f"induction ON still has 64-bit ops {on.get('u64_ops')}")
+    if not off.get("u64_ops"):
+        bad.append("induction kill switch did not restore 64-bit induction ops")
+    runtime = ind.get("runtime") or []
+    seen = {r["compiler"] for r in runtime}
+    if seen != set(ind.get("expected_hosts") or []):
+        bad.append(f"induction runtime compiler set {sorted(seen)} is incomplete")
+    expected = f"{INDUCTION_ORACLE:016x}"
+    for r in runtime:
+        if r["rc"] != 0 or r["stdout"] != expected:
+            bad.append(f"induction runtime {r['compiler']}: rc={r['rc']} "
+                       f"checksum={r['stdout']!r} != {expected}")
     return bad
 
 
@@ -315,6 +461,32 @@ def self_test() -> int:
             {"isa": t["isa"], "exit": ORACLE, "elf_machine_ok": True, "instructions": 50}
             for t in TARGETS
         ],
+        "induction": {
+            "oracle": INDUCTION_ORACLE,
+            "expected_hosts": ["clang23", "gcc16", "lccc"],
+            "source_sha256": "x" * 64,
+            "ir": {"ir_bytes": 1000, "sha256": "y" * 64,
+                   "u32_to_u64_cast": 0, "u64_cmp": 0, "u32_cmp": 2},
+            "assembly": {
+                "lccc_on": {"instruction_count": 16, "u64_ops": [],
+                            "u32_ops": ["addl", "cmpl", "movl", "shrl"],
+                            "body_sha256": "a" * 64},
+                "lccc_off": {"instruction_count": 17,
+                             "u64_ops": ["addq", "cmpq", "movq", "shrq"],
+                             "u32_ops": ["movl"], "body_sha256": "b" * 64},
+                "gcc16": {"instruction_count": 19, "u64_ops": ["movq"],
+                          "u32_ops": ["addl", "cmpl", "movl", "shrl"],
+                          "body_sha256": "c" * 64},
+                "clang23": {"instruction_count": 73, "u64_ops": ["movq"],
+                            "u32_ops": ["addl", "cmpl", "movl"],
+                            "body_sha256": "d" * 64},
+            },
+            "runtime": [
+                {"compiler": "lccc", "rc": 0, "stdout": f"{INDUCTION_ORACLE:016x}"},
+                {"compiler": "gcc16", "rc": 0, "stdout": f"{INDUCTION_ORACLE:016x}"},
+                {"compiler": "clang23", "rc": 0, "stdout": f"{INDUCTION_ORACLE:016x}"},
+            ],
+        },
     }
     assert not evaluate(base), f"self-test baseline is not clean: {evaluate(base)}"
     mutations = [
@@ -342,6 +514,41 @@ def self_test() -> int:
             lambda r, fn=fn: r["ir"]["cast_counts"].update({fn: 0}),
             f"{fn}: required guard Cast was lost",
         ))
+    mutations.extend([
+        ("induction oracle drift",
+         lambda r: r["induction"].update(oracle=INDUCTION_ORACLE + 1),
+         "induction oracle drift"),
+        ("induction IR empty",
+         lambda r: r["induction"]["ir"].update(ir_bytes=10),
+         "induction IR section is empty"),
+        ("induction widening cast returned",
+         lambda r: r["induction"]["ir"].update(u32_to_u64_cast=1),
+         "U32->U64 widening Cast returned"),
+        ("induction U64 compare returned",
+         lambda r: r["induction"]["ir"].update(u64_cmp=1),
+         "U64 compare returned"),
+        ("induction U32 compare lost",
+         lambda r: r["induction"]["ir"].update(u32_cmp=0),
+         "U32 compare is missing"),
+        ("induction ON count drift",
+         lambda r: r["induction"]["assembly"]["lccc_on"].update(instruction_count=17),
+         "induction ON has 17 instructions"),
+        ("induction kill-switch count drift",
+         lambda r: r["induction"]["assembly"]["lccc_off"].update(instruction_count=16),
+         "induction kill switch has 16 instructions"),
+        ("induction ON 64-bit ops",
+         lambda r: r["induction"]["assembly"]["lccc_on"].update(u64_ops=["cmpq"]),
+         "induction ON still has 64-bit ops"),
+        ("induction kill switch weak",
+         lambda r: r["induction"]["assembly"]["lccc_off"].update(u64_ops=[]),
+         "kill switch did not restore 64-bit induction ops"),
+        ("induction runtime missing compiler",
+         lambda r: r["induction"]["runtime"].pop(),
+         "runtime compiler set"),
+        ("induction runtime checksum drift",
+         lambda r: r["induction"]["runtime"][0].update(stdout="deadbeef"),
+         "induction runtime lccc"),
+    ])
     for name, mutate, want in mutations:
         sample = copy.deepcopy(base)
         mutate(sample)
@@ -350,7 +557,8 @@ def self_test() -> int:
             print(f"self-test FAIL: '{name}' was not detected: {bad}", file=sys.stderr)
             return 1
     print(f"PASS same-width-cast-range self-test ({len(mutations)} verdict "
-          f"mutations rejected, toolchain identity pinned, oracle={ORACLE})")
+          f"mutations rejected, induction width/kill-switch/runtime pinned, "
+          f"toolchain identity pinned, oracle={ORACLE})")
     return 0
 
 
@@ -403,6 +611,7 @@ def main(argv: list[str]) -> int:
                 build_and_execute(t, work, args.fastbuild, pinned["clang23"])
                 for t in TARGETS
             ]
+            report["induction"] = induction_evidence(pinned, args.lccc, work)
     except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
         report["error"] = str(exc)
         bad = [str(exc)]
@@ -418,13 +627,26 @@ def main(argv: list[str]) -> int:
         print(f"PASS IR {fn:20} casts={report.get('ir', {}).get('cast_counts', {}).get(fn)}")
     for r in report.get("cross", []):
         print(f"PASS {r['isa']:8} exit={r['exit']:3} instructions={r['instructions']}")
+    ind = report.get("induction") or {}
+    if ind:
+        iri = ind.get("ir") or {}
+        on = (ind.get("assembly") or {}).get("lccc_on") or {}
+        off = (ind.get("assembly") or {}).get("lccc_off") or {}
+        print(f"PASS induction IR: U32 cmp={iri.get('u32_cmp')} "
+              f"U64 cmp={iri.get('u64_cmp')} U32->U64 cast={iri.get('u32_to_u64_cast')}")
+        print(f"PASS induction asm: ON={on.get('instruction_count')} "
+              f"OFF={off.get('instruction_count')} "
+              f"kill-switch 64-bit ops={off.get('u64_ops')}")
+        for r in ind.get("runtime", []):
+            print(f"PASS induction runtime {r['compiler']:10} checksum={r['stdout']}")
     if bad:
         for b in bad:
             print(f"FAIL {b}", file=sys.stderr)
         return 1
     print(
         f"PASS same-width-cast-range ({len(report['hosts'])} host compilers, "
-        f"{len(report['ir']['sections'])} IR sections, 4 ISAs, oracle={ORACLE})"
+        f"{len(report['ir']['sections'])} IR sections, 4 ISAs, "
+        f"32-bit induction proof, oracle={ORACLE})"
     )
     return 0
 
