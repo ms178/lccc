@@ -5971,6 +5971,416 @@ mod tests {
         }
     }
 
+    fn home_relay_fixture(destination: u32) -> IrFunction {
+        single_block(
+            "relay_audit",
+            vec![
+                alloca(1, 32, 32),
+                alloca(destination, 32, 32),
+                intrinsic(
+                    Some(3),
+                    IntrinsicOp::MinPs256,
+                    Some(1),
+                    vec![Operand::Value(Value(0)), Operand::Value(Value(0))],
+                ),
+                intrinsic(
+                    Some(4),
+                    IntrinsicOp::VecLoadF32x8,
+                    None,
+                    vec![Operand::Value(Value(1)), Operand::Const(IrConst::I64(0))],
+                ),
+                intrinsic(
+                    None,
+                    IntrinsicOp::VecStoreF32x8,
+                    Some(destination),
+                    vec![
+                        Operand::Value(Value(4)),
+                        Operand::Value(Value(destination)),
+                        Operand::Const(IrConst::I64(0)),
+                    ],
+                ),
+            ],
+        )
+    }
+
+    fn home_spill_fixture(barrier: Instruction, destination: u32) -> IrFunction {
+        single_block(
+            "spill_audit",
+            vec![
+                alloca(1, 32, 32),
+                alloca(2, 32, 32),
+                alloca(destination, 32, 32),
+                intrinsic(Some(3), IntrinsicOp::VecZeroF32x8, None, vec![]),
+                intrinsic(
+                    None,
+                    IntrinsicOp::VecStoreF32x8,
+                    Some(1),
+                    vec![
+                        Operand::Value(Value(3)),
+                        Operand::Value(Value(1)),
+                        Operand::Const(IrConst::I64(0)),
+                    ],
+                ),
+                barrier,
+                intrinsic(
+                    None,
+                    IntrinsicOp::VecStoreF32x8,
+                    Some(destination),
+                    vec![
+                        Operand::Value(Value(1)),
+                        Operand::Value(Value(destination)),
+                        Operand::Const(IrConst::I64(0)),
+                    ],
+                ),
+            ],
+        )
+    }
+
+    #[test]
+    fn relay_refuses_intervening_clobbers_in_either_gap() {
+        let barriers = [
+            Instruction::Store {
+                val: Operand::Const(IrConst::I32(7)),
+                ptr: Value(2),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+            Instruction::Load {
+                dest: Value(8),
+                ptr: Value(2),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+            Instruction::Memcpy {
+                dest: Value(2),
+                src: Value(0),
+                size: 32,
+            },
+            Instruction::Fence {
+                ordering: AtomicOrdering::SeqCst,
+            },
+            Instruction::InlineAsm {
+                template: String::new(),
+                outputs: Vec::new(),
+                inputs: Vec::new(),
+                clobbers: vec!["memory".into()],
+                operand_types: Vec::new(),
+                goto_labels: Vec::new(),
+                input_symbols: Vec::new(),
+                seg_overrides: Vec::new(),
+            },
+        ];
+        for barrier in barriers {
+            for gap in [3, 4] {
+                let mut func = home_relay_fixture(9);
+                func.blocks[0].instructions.insert(gap, barrier.clone());
+                let before = func.blocks[0].instructions.clone();
+                assert_eq!(
+                    forward_vector_home_results(&mut func),
+                    0,
+                    "gap {gap}: {barrier:?}"
+                );
+                assert_eq!(
+                    format!("{:?}", func.blocks[0].instructions),
+                    format!("{before:?}")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn relay_refuses_read_modify_write_producers() {
+        for op in [
+            IntrinsicOp::FmaF64x4,
+            IntrinsicOp::FmaF64x4Hoisted,
+            IntrinsicOp::FmaF64x4SIB,
+            IntrinsicOp::FmaF64x4HoistedSIB,
+            IntrinsicOp::MulAddF64x4HoistedSIB,
+        ] {
+            let mut func = home_relay_fixture(9);
+            let Instruction::Intrinsic { op: slot, args, .. } = &mut func.blocks[0].instructions[2]
+            else {
+                unreachable!()
+            };
+            *slot = op;
+            args.resize(5, Operand::Value(Value(0)));
+            let before = func.blocks[0].instructions.clone();
+            assert_eq!(forward_vector_home_results(&mut func), 0, "{op:?}");
+            assert_eq!(
+                format!("{:?}", func.blocks[0].instructions),
+                format!("{before:?}")
+            );
+        }
+    }
+
+    #[test]
+    fn relay_refuses_malformed_reader_and_store_shapes() {
+        // Each mutation changes exactly one part of the load/store contract.
+        for case in 0..10 {
+            let mut func = home_relay_fixture(9);
+            {
+                let Instruction::Intrinsic {
+                    op, dest_ptr, args, ..
+                } = &mut func.blocks[0].instructions[3]
+                else {
+                    unreachable!()
+                };
+                match case {
+                    0 => *op = IntrinsicOp::VecLoadF64x2,
+                    1 => *dest_ptr = Some(Value(1)),
+                    2 => args[0] = Operand::Value(Value(0)),
+                    3 => args[1] = Operand::Const(IrConst::I64(1)),
+                    4 => args.push(Operand::Const(IrConst::I64(0))),
+                    _ => {}
+                }
+            }
+            if case >= 5 {
+                let Instruction::Intrinsic {
+                    dest,
+                    dest_ptr,
+                    args,
+                    ..
+                } = &mut func.blocks[0].instructions[4]
+                else {
+                    unreachable!()
+                };
+                match case {
+                    5 => *dest = Some(Value(8)),
+                    6 => args[0] = Operand::Value(Value(3)),
+                    7 => args[1] = Operand::Value(Value(0)),
+                    8 => args[2] = Operand::Const(IrConst::I64(1)),
+                    9 => *dest_ptr = Some(Value(0)),
+                    _ => unreachable!(),
+                }
+            }
+            let before = func.blocks[0].instructions.clone();
+            assert_eq!(forward_vector_home_results(&mut func), 0, "case {case}");
+            assert_eq!(
+                format!("{:?}", func.blocks[0].instructions),
+                format!("{before:?}")
+            );
+        }
+    }
+
+    #[test]
+    fn relay_refuses_unrooted_and_out_of_object_destination() {
+        for case in 0..5 {
+            let mut func = home_relay_fixture(2);
+            let offset = match case {
+                0 => Operand::Const(IrConst::I64(1)), // 32-byte write exceeds object
+                1 => Operand::Const(IrConst::I64(-1)),
+                2 => Operand::Value(Value(0)),
+                3 => Operand::Const(IrConst::I128(-1)),
+                _ => Operand::Const(IrConst::I128(1_i128 << 64)),
+            };
+            func.blocks[0].instructions.insert(
+                2,
+                Instruction::GetElementPtr {
+                    dest: Value(9),
+                    base: Value(2),
+                    offset,
+                    ty: IrType::Ptr,
+                },
+            );
+            let Instruction::Intrinsic { dest_ptr, args, .. } = &mut func.blocks[0].instructions[5]
+            else {
+                unreachable!()
+            };
+            *dest_ptr = Some(Value(9));
+            args[1] = Operand::Value(Value(9));
+            let before = func.blocks[0].instructions.clone();
+            assert_eq!(forward_vector_home_results(&mut func), 0, "case {case}");
+            assert_eq!(
+                format!("{:?}", func.blocks[0].instructions),
+                format!("{before:?}")
+            );
+        }
+    }
+
+    #[test]
+    fn relay_destination_object_root_follows_only_bounded_constant_geps() {
+        let mut func = home_relay_fixture(2);
+        if let Instruction::Alloca { size, .. } = &mut func.blocks[0].instructions[1] {
+            *size = 128;
+        }
+        // Parameter <- GEP(32) <- GEP(32): a bounded object-root walk.
+        func.blocks[0].instructions.insert(
+            0,
+            Instruction::ParamRef {
+                dest: Value(20),
+                param_idx: 0,
+                ty: IrType::Ptr,
+            },
+        );
+        for (dest, base, offset) in [
+            (21, 20, Operand::Const(IrConst::I64(32))),
+            (22, 21, Operand::Const(IrConst::I64(32))),
+            (23, 2, Operand::Const(IrConst::I64(32))),
+            (24, 2, Operand::Value(Value(0))),
+            (25, 2, Operand::Const(IrConst::I64(-1))),
+            (26, 2, Operand::Const(IrConst::I64(97))),
+        ] {
+            func.blocks[0].instructions.insert(
+                2,
+                Instruction::GetElementPtr {
+                    dest: Value(dest),
+                    base: Value(base),
+                    offset,
+                    ty: IrType::Ptr,
+                },
+            );
+        }
+        let allocas = collect_allocas(&func);
+        let mut defs = FxHashMap::default();
+        for (bi, block) in func.blocks.iter().enumerate() {
+            for (ii, inst) in block.instructions.iter().enumerate() {
+                if let Some(dest) = inst.dest() {
+                    defs.insert(dest.0, (bi, ii));
+                }
+            }
+        }
+        let roots = pointer_root_analysis(&func).roots;
+        for value in [21, 22] {
+            assert_eq!(
+                relay_destination_object_root(value, &func, &defs, &roots, &allocas, 32),
+                Some(PointerRoot::Param {
+                    index: 0,
+                    noalias: false
+                })
+            );
+        }
+        assert_eq!(
+            relay_destination_object_root(23, &func, &defs, &roots, &allocas, 32),
+            Some(PointerRoot::Alloca(2))
+        );
+        for value in [24, 25, 26] {
+            assert_eq!(
+                relay_destination_object_root(value, &func, &defs, &roots, &allocas, 32),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn spill_refuses_unknown_root_clobbers_but_keeps_distinct_alloca_access() {
+        let distinct = Instruction::Store {
+            val: Operand::Const(IrConst::I32(7)),
+            ptr: Value(2),
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        };
+        let mut func = home_spill_fixture(distinct.clone(), 9);
+        assert_eq!(forward_vector_home_results(&mut func), 1);
+        let barriers = [
+            Instruction::Store {
+                val: Operand::Const(IrConst::I32(7)),
+                ptr: Value(8),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+            Instruction::Load {
+                dest: Value(7),
+                ptr: Value(8),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+            Instruction::Store {
+                val: Operand::Const(IrConst::I32(7)),
+                ptr: Value(2),
+                ty: IrType::I32,
+                seg_override: AddressSpace::SegGs,
+                volatile: false,
+            },
+            Instruction::Load {
+                dest: Value(7),
+                ptr: Value(2),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+                volatile: true,
+            },
+            Instruction::Memcpy {
+                dest: Value(8),
+                src: Value(0),
+                size: 32,
+            },
+            Instruction::Fence {
+                ordering: AtomicOrdering::SeqCst,
+            },
+            Instruction::AtomicLoad {
+                dest: Value(7),
+                ptr: Operand::Value(Value(2)),
+                ty: IrType::I32,
+                ordering: AtomicOrdering::SeqCst,
+            },
+            Instruction::StackRestore { ptr: Value(8) },
+            intrinsic(
+                Some(7),
+                IntrinsicOp::Loadu256,
+                None,
+                vec![Operand::Value(Value(8))],
+            ),
+            intrinsic(
+                Some(7),
+                IntrinsicOp::Loadu256,
+                None,
+                vec![Operand::Const(IrConst::I64(4096))],
+            ),
+        ];
+        for barrier in barriers {
+            let mut func = home_spill_fixture(barrier.clone(), 9);
+            let before = func.blocks[0].instructions.clone();
+            assert_eq!(forward_vector_home_results(&mut func), 0, "{barrier:?}");
+            assert_eq!(
+                format!("{:?}", func.blocks[0].instructions),
+                format!("{before:?}")
+            );
+        }
+    }
+
+    #[test]
+    fn spill_earlier_reader_write_must_be_disjoint_from_home() {
+        for (destination, expected) in [(1, 0), (9, 1)] {
+            let mut func = home_spill_fixture(
+                intrinsic(
+                    None,
+                    IntrinsicOp::VecStoreF32x8,
+                    Some(destination),
+                    vec![
+                        Operand::Value(Value(1)),
+                        Operand::Value(Value(destination)),
+                        Operand::Const(IrConst::I64(0)),
+                    ],
+                ),
+                9,
+            );
+            // The barrier is an earlier reader of home %1. Its destination
+            // write is inside the union interval ending at the final reader.
+            assert_eq!(forward_vector_home_results(&mut func), expected);
+        }
+    }
+
+    #[test]
+    fn semantic_volatile_unused_alloca_is_not_deleted() {
+        let mut func = single_block(
+            "semantic_volatile",
+            vec![Instruction::Alloca {
+                dest: Value(1),
+                ty: IrType::Ptr,
+                size: 32,
+                align: 32,
+                volatile: false,
+                semantic_volatile: true,
+            }],
+        );
+        assert_eq!(remove_unused_allocas(&mut func), 0);
+        assert_eq!(func.blocks[0].instructions.len(), 1);
+    }
+
     #[test]
     fn the_two_rounding_twin_matches_the_fused_group_op() {
         use crate::ir::intrinsics::IntrinsicOp as O;
