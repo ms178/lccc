@@ -137,7 +137,8 @@ _Static_assert(sizeof(struct S) == 4 && _Alignof(struct S) == 2 && __builtin_off
 '''
 
 # GCC-only VLA members are rejected by Clang/ICX; this is not a vendor parity claim.
-VLA_SOURCE = r'''int run(int n) {
+VLA_SOURCE = r'''extern int printf(const char *, ...);
+int run(int n) {
   struct S { int prefix; char a[n]; int tail; } s;
   if ((char *)&s.a - (char *)&s != 4) return 1;
   if ((char *)&s.tail - (char *)&s != ((n+7)&~3)) return 2;
@@ -162,7 +163,10 @@ int unions(int n, int m) {
     if (sizeof u != ue) return 8;
     if (sizeof p != pe) return 9;
     if (sizeof a != ae) return 10;
-    if (sizeof v != me) return 11;
+    if (sizeof v != me) {
+        printf("multiple VLA union n=%d m=%d got=%d expected=%d\n", n, m, (int)sizeof v, me);
+        return 11;
+    }
     return 0;
 }
 int main(void) {
