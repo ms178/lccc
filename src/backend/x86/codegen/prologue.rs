@@ -4782,7 +4782,15 @@ impl X86Codegen {
         // Intel). GCC/Clang emit the same vzeroupper-before-ret. The other
         // two placements are sibcalls (`returns.rs`) and ordinary calls
         // (`calls.rs`, `emit_vzeroupper_before_call`).
-        if self.state.dirty_upper_ymm {
+        // `dirty_upper_ymm` is an obligation, not a permission: it records that
+        // some path wrote bits above 128, but only AVX supplies `vzeroupper`.
+        // Arming is deliberately broad (any ymm/zmm claim or scratch load, so
+        // no writer can forget it), which means a stale or over-eager arm must
+        // never be able to emit an instruction the target cannot execute.
+        // `-mno-sse2 -msse` really does reach here with the flag set, and
+        // emitting `vzeroupper` there is an illegal instruction, not a slow
+        // one -- caught by check_sse2_i32_product.py's SSE1 denial arm.
+        if self.isa.avx && self.state.dirty_upper_ymm {
             self.state.emit("    vzeroupper");
         }
         self.emit_epilogue_impl(frame_size);

@@ -18,6 +18,18 @@ impl X86Codegen {
     /// Load a 512-bit operand into a ZMM register.
     /// Honors vec_live_regs (register-held values) and direct slot addressing.
     fn evex_load_arg_to(&mut self, arg: &Operand, zmm: &'static str) {
+        // SA-33: every path below writes the named register at its full
+        // width.  A zmm/ymm target therefore dirties the upper state even
+        // when the op's RESULT is narrow or scalar (a 512-bit source read by
+        // `vextract*`, a mask compare, a movemask), which is exactly the case
+        // a result-width or opcode-name rule cannot see.  Armed here for the
+        // same reason `avx_load_arg_to` arms there: one choke point, so no
+        // caller can forget.  Conservative by design -- re-arming an already
+        // dirty state costs one store to a bool, while missing it costs an
+        // AVX->SSE transition penalty on every legacy-SSE callee.
+        if zmm.starts_with("ymm") || zmm.starts_with("zmm") {
+            self.state.dirty_upper_ymm = true;
+        }
         let value_id = match arg {
             Operand::Value(v) => Some(v.0),
             Operand::Const(_) => None,
@@ -462,14 +474,19 @@ impl X86Codegen {
         args: &[Operand],
     ) -> bool {
         use IntrinsicOp::*;
-        // IS-20: 256/512-bit vector ops dirty the upper YMM halves; the
-        // epilogue will emit vzeroupper before ret.
-        {
-            let name = format!("{:?}", op);
-            if name.contains("256") || name.contains("512") || name.ends_with("Si256") {
-                self.state.dirty_upper_ymm = true;
-            }
-        }
+        // IS-20 / SA-33: the `vzeroupper` obligation is armed at the physical
+        // wide-register WRITE, not inferred from the opcode's spelling.  This
+        // used to be `format!("{:?}").contains("256" | "512")`, which both
+        // allocated a String per intrinsic call and MISSED every digit-less
+        // wide variant (vinserti32x8, vextracti64x4, vpermd/vpermq, the
+        // vbroadcasti* family, maskz insert/extract).  The four choke points
+        // that actually write ymm/zmm now arm it unconditionally:
+        //   * `avx_load_arg_to`      -- 256-bit scratch loads
+        //   * `avx_store_dest_from`  -- 256-bit results
+        //   * `evex_load_arg_to`     -- 256/512-bit scratch loads
+        //   * `vec_claim_live_reg`   -- any ymm/zmm result home
+        // so coverage follows the emitted register, and a new variant cannot
+        // silently opt out by being named without a width digit.
         let Some(dptr) = dest_ptr else {
             // Scalar-result ops use `dest` (lowering already produced the
             // real operands: dummy/imm dropped, imm re-appended last).
@@ -665,7 +682,27 @@ impl X86Codegen {
                 true
             }
             Pmaddubsw512 => {
-                self.emit_evex_binary_512(dptr, args, "vpmaddubsw", true);
+                // Unsigned x signed byte-pair multiply-add: NON-commutative.
+                // Intel SDM VPMADDUBSW reads src1 (EVEX.vvvv) as UNSIGNED
+                // bytes and src2 (r/m) as SIGNED bytes.  In AT&T order
+                // `vpmaddubsw src2, src1, dst` the register slot is src1, so
+                // IR args[0] (the unsigned stream) must reach the REGISTER
+                // and args[1] (the signed weights) may reach r/m.
+                //
+                // `commutative = true` took the `(Some(m0), _)` arm whenever
+                // args[0] was foldable -- the common
+                // `_mm512_maddubs_epi16(_mm512_loadu_si512(p), w)` shape --
+                // which put args[1] in vvvv and the UNSIGNED stream in r/m,
+                // computing u(args[1]) * s(args[0]).  Every product with a
+                // high bit set in either byte was wrong (SA-05).
+                //
+                // The 128-bit table (`sse128_mnemonic_commutative`) excludes
+                // `pmaddubsw` and the 256-bit twin passes `false`
+                // (`VecMaddubsU8x32`); only this arm had drifted.  Keeping
+                // `false` still folds the RIGHT operand from memory through
+                // the `(None, Some(m1))` arm, so this costs no instruction
+                // in the safe direction.
+                self.emit_evex_binary_512(dptr, args, "vpmaddubsw", false);
                 true
             }
             Pmaddwd512 => {
@@ -2911,5 +2948,185 @@ mod mask_compare_kmov_tests {
             X86Codegen::mask_compare_kmov("vpcmpb", 16),
             ("kmovw", "eax")
         );
+    }
+}
+
+/// SA-05 / SA-33: operand-role and upper-state contracts for the generic-SIMD
+/// (512-bit EVEX) dispatcher.
+///
+/// Both defects were *table drift*, not algorithm bugs: the 512-bit arm
+/// disagreed with its 128/256-bit twins about commutativity, and the
+/// `vzeroupper` obligation was inferred from a `format!("{:?}")` substring
+/// instead of the register actually written.  The tests below pin the emitted
+/// assembly, so a future re-broadening of either rule fails here rather than
+/// in a user's `vpmaddubsw` result or in an AVX->SSE transition penalty.
+#[cfg(test)]
+mod simd_operand_role_and_upper_state_tests {
+    use super::*;
+    use crate::backend::state::StackSlot;
+    use crate::ir::reexports::IrConst;
+
+    /// Values 0/1 are 512-bit vector values with real frame slots; `folded`
+    /// selects which one is memory-foldable.  The other is claimed in a ZMM
+    /// live register, which is exactly what makes `evex_arg_mem` refuse to
+    /// fold it (its slot may be stale).  This drives the real fold decision,
+    /// not a mocked predicate.
+    fn codegen_with_one_foldable_arg(folded: u32) -> X86Codegen {
+        let mut cg = X86Codegen::new();
+        cg.state.vector_values.extend([0, 1, 2]);
+        // The dispatcher skips a destination with zero uses as dead code, so
+        // the fixture must give the result a real use or every assertion below
+        // would be vacuous (empty output, nothing emitted).
+        cg.state.value_use_counts = vec![1; 3];
+        cg.state.value_locations.insert(0, StackSlot(-64));
+        cg.state.value_locations.insert(1, StackSlot(-128));
+        cg.state.value_locations.insert(2, StackSlot(-192));
+        let reg_only = if folded == 0 { 1 } else { 0 };
+        cg.state.vec_claim_live_reg(reg_only, "zmm5");
+        // The claim itself arms the upper state; clear it so each assertion
+        // observes only what the emitted op does.
+        cg.state.dirty_upper_ymm = false;
+        cg
+    }
+
+    /// `vpmaddubsw` reads vvvv as UNSIGNED bytes and r/m as SIGNED bytes, so
+    /// IR args[0] must reach the register and only args[1] may be folded.
+    ///
+    /// With `commutative = true` the `(Some(m0), _)` arm fired for a foldable
+    /// args[0] -- the ubiquitous
+    /// `_mm512_maddubs_epi16(_mm512_loadu_si512(p), w)` shape -- and emitted
+    /// `vpmaddubsw <a>, %zmm1, %zmm0`, feeding the unsigned stream to the
+    /// signed multiplier.  Every lane product with a high bit set was wrong.
+    #[test]
+    fn maddubs512_never_folds_the_unsigned_stream_into_the_signed_slot() {
+        for folded in [0u32, 1u32] {
+            let mut cg = codegen_with_one_foldable_arg(folded);
+            let mem0 = cg.slot_ref(-64);
+            let mem1 = cg.slot_ref(-128);
+            assert!(
+                cg.emit_simd_op(
+                    &None,
+                    &IntrinsicOp::Pmaddubsw512,
+                    &Some(Value(2)),
+                    &[Operand::Value(Value(0)), Operand::Value(Value(1))],
+                ),
+                "Pmaddubsw512 must be handled by the SIMD dispatcher"
+            );
+            let out = cg.state.out.buf.clone();
+            assert!(out.contains("vpmaddubsw"), "op not emitted: {out}");
+            if folded == 0 {
+                // args[0] (unsigned) MUST be materialized into the register.
+                assert!(
+                    !out.contains(&format!("vpmaddubsw {mem0},")),
+                    "unsigned stream was folded into the SIGNED r/m slot: {out}"
+                );
+                assert!(
+                    out.contains(&format!("vmovdqu64 {mem0}, %zmm0")),
+                    "args[0] must be loaded into the vvvv register: {out}"
+                );
+            } else {
+                // Folding the RIGHT (signed) operand is legal and must survive
+                // -- the fix may not cost an instruction in the safe direction.
+                assert!(
+                    out.contains(&format!("vpmaddubsw {mem1}, %zmm0, %zmm0")),
+                    "safe right-operand memory fold was lost: {out}"
+                );
+            }
+        }
+    }
+
+    /// The commutative twin must KEEP folding both sides: `vpmaddwd` has two
+    /// signed word sources, so the roles are symmetric.  Without this control
+    /// a blanket `commutative = false` would pass the test above while
+    /// pessimizing every genuinely commutative 512-bit op.
+    #[test]
+    fn maddwd512_still_folds_the_left_operand_because_it_is_symmetric() {
+        let mut cg = codegen_with_one_foldable_arg(0);
+        let mem0 = cg.slot_ref(-64);
+        assert!(cg.emit_simd_op(
+            &None,
+            &IntrinsicOp::Pmaddwd512,
+            &Some(Value(2)),
+            &[Operand::Value(Value(0)), Operand::Value(Value(1))],
+        ));
+        let out = &cg.state.out.buf;
+        assert!(
+            out.contains(&format!("vpmaddwd {mem0}, %zmm1, %zmm0")),
+            "a symmetric op must keep its left memory fold: {out}"
+        );
+    }
+
+    /// SA-33: the digit-less wide EVEX ops write ymm/zmm and MUST arm the
+    /// `vzeroupper` obligation.  Every one of these was missed by the old
+    /// `format!("{:?}").contains("256" | "512")` proxy.
+    #[test]
+    fn digitless_wide_evex_ops_arm_vzeroupper() {
+        let cases: &[(IntrinsicOp, &[Operand])] = &[
+            (
+                IntrinsicOp::InsertI32x8,
+                &[
+                    Operand::Value(Value(0)),
+                    Operand::Value(Value(1)),
+                    Operand::Const(IrConst::I64(1)),
+                ],
+            ),
+            (
+                IntrinsicOp::InsertI64x4,
+                &[
+                    Operand::Value(Value(0)),
+                    Operand::Value(Value(1)),
+                    Operand::Const(IrConst::I64(1)),
+                ],
+            ),
+            (
+                IntrinsicOp::PermutexvarEp32,
+                &[Operand::Value(Value(0)), Operand::Value(Value(1))],
+            ),
+            (
+                IntrinsicOp::PermutexvarEp64,
+                &[Operand::Value(Value(0)), Operand::Value(Value(1))],
+            ),
+            (
+                IntrinsicOp::ExtractI32x8,
+                &[Operand::Value(Value(0)), Operand::Const(IrConst::I64(1))],
+            ),
+            (
+                IntrinsicOp::ExtractI64x4,
+                &[Operand::Value(Value(0)), Operand::Const(IrConst::I64(1))],
+            ),
+        ];
+        for (op, args) in cases {
+            let mut cg = codegen_with_one_foldable_arg(1);
+            assert!(
+                cg.emit_simd_op(&None, op, &Some(Value(2)), args),
+                "{op:?} must be handled by the SIMD dispatcher"
+            );
+            assert!(
+                cg.state.dirty_upper_ymm,
+                "{op:?} writes a wide register but did not arm vzeroupper: {}",
+                cg.state.out.buf
+            );
+        }
+    }
+
+    /// The rule must stay EXACT, not conservative-by-name: an xmm claim writes
+    /// only the low 128 bits (VEX/EVEX zeroes above), so it must NOT arm.
+    /// Arming on every claim would emit a pointless `vzeroupper` in pure-SSE
+    /// functions and hide the real regression above.
+    #[test]
+    fn narrow_register_claims_do_not_arm_vzeroupper() {
+        let mut cg = X86Codegen::new();
+        assert!(!cg.state.dirty_upper_ymm);
+        cg.state.vec_claim_live_reg(0, "xmm3");
+        assert!(
+            !cg.state.dirty_upper_ymm,
+            "an xmm home cannot dirty bits above 128"
+        );
+        // ... while the ymm and zmm views of the SAME bank must.
+        for wide in ["ymm3", "zmm3"] {
+            cg.state.dirty_upper_ymm = false;
+            cg.state.vec_claim_live_reg(0, wide);
+            assert!(cg.state.dirty_upper_ymm, "{wide} must arm vzeroupper");
+        }
     }
 }

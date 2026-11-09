@@ -397,8 +397,16 @@ class AuditPackTests(unittest.TestCase):
         """Spot-check headline claims that the register asserts as S-evidence.
         Snippets, not line numbers: line anchors drift, prose does not."""
         claims = (
+            # SA-33 is FIXED (§9c.10.4): the obligation is armed at the
+            # physical wide-register write, so the old opcode-name proxy is
+            # gone.  Pin the replacement invariant instead of the defect, and
+            # assert below that the proxy really was removed -- otherwise a
+            # revert would restore the snippet and silently satisfy a test
+            # that was only ever checking the bug still existed.
             ('src/backend/x86/codegen/intrinsics_simd.rs',
-             'format!("{:?}", op)'),
+             'zmm.starts_with("ymm") || zmm.starts_with("zmm")'),
+            ('src/backend/state.rs',
+             'reg.starts_with("ymm") || reg.starts_with("zmm")'),
             ('src/passes/vectorize.rs', 'debug_assert!(false'),
             ('scripts/gen_lcccsimd.py', '"vmovdqu64_load"'),
             ('scripts/gen_lcccsimd.py', '"vpshuflw512"'),
@@ -410,6 +418,14 @@ class AuditPackTests(unittest.TestCase):
                 self.assertTrue(path.is_file(), f'missing {rel}')
                 self.assertIn(snippet, path.read_text(errors='replace'),
                               f'{rel}: claim {snippet!r} no longer holds')
+        # The retired SA-33 proxy must NOT come back.
+        self.assertNotIn('format!("{:?}", op)',
+                         (ROOT / 'src/backend/x86/codegen/intrinsics_simd.rs').read_text(),
+                         'SA-33 regressed: the opcode-name vzeroupper proxy is back')
+        # SA-05 must stay non-commutative at 512 bits.
+        self.assertIn('"vpmaddubsw", false',
+                      (ROOT / 'src/backend/x86/codegen/intrinsics_simd.rs').read_text(),
+                      'SA-05 regressed: vpmaddubsw is commutative again')
 
     def test_12_register_is_complete(self):
         text = DOC.read_text()

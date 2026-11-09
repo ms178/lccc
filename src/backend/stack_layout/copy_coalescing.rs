@@ -2579,14 +2579,26 @@ pub(crate) fn memfold_consumer_256(op: &crate::ir::intrinsics::IntrinsicOp) -> O
         O::VecSadbwU8x32 | O::VecAddI64x4 => Some(true),
         O::VecAndI64x4 | O::VecOrI64x4 | O::VecXorI64x4 => Some(true),
         O::VecSubI64x4 => Some(false),
-        // Adler-32 epic multiply-adds: `vpmaddubsw`/`vpmaddwd` are
-        // strictly order-sensitive in the ISA encoding (the signed and
-        // unsigned operand roles differ for maddubs), so a fold is only
-        // order-safe in the args[1] (src2/r/m) position — the weights
-        // slot.  The byte-stream load sits in args[0] (the register
-        // source) and is never foldable, which the Some(false) gate
-        // enforces exactly.
-        O::VecMaddubsU8x32 | O::VecMaddwdI16x16 => Some(false),
+        // Adler-32 epic multiply-adds.  The two instructions look alike
+        // and are NOT alike:
+        //
+        // * `vpmaddubsw` reads vvvv as UNSIGNED bytes and r/m as SIGNED
+        //   bytes, so only args[1] (the weights, src2/r/m) may be folded.
+        //   The unsigned byte stream in args[0] must stay in the register.
+        //   `Some(false)` enforces exactly that.
+        // * `vpmaddwd` multiplies two SIGNED word streams and sums the
+        //   adjacent products (SDM: tmp1 = src1.w0 * src2.w0,
+        //   tmp2 = src1.w1 * src2.w1).  Exchanging the sources cannot
+        //   change a lane, so BOTH positions are foldable.
+        //
+        // Both used to share `Some(false)` under a comment that reasoned
+        // only about maddubs' mixed signedness.  That is the IR-admission
+        // twin of SA-36: the emitter table said `true` at 512 bits while
+        // this gate silently withheld the fold at 256.  Splitting them
+        // makes the analysis and the emitter agree, which is what the
+        // check_simd_commutativity_agreement ratchet now pins.
+        O::VecMaddubsU8x32 => Some(false),
+        O::VecMaddwdI16x16 => Some(true),
         O::VecAddI16x16
         | O::VecMulI16x16
         | O::VecMinI16x16
@@ -3285,6 +3297,31 @@ mod cfg_copy_coalesce_tests {
         use crate::ir::intrinsics::IntrinsicOp as O;
         assert_eq!(memfold_consumer_128(&O::VecSubSatU16x8), Some(false));
         assert_eq!(memfold_consumer_256(&O::VecSubSatU16x16), Some(false));
+    }
+
+    /// SA-36, IR-admission half.  `vpmaddwd` multiplies two SIGNED word
+    /// streams, so both source positions are foldable; `vpmaddubsw` reads
+    /// vvvv unsigned and r/m signed, so only args[1] is.  They used to share
+    /// `Some(false)` under a comment that reasoned only about maddubs, which
+    /// silently withheld a legal fold from every 256-bit `pmaddwd`.
+    ///
+    /// This is the ADMISSION authority: the emitter's `commutative` flag
+    /// alone cannot create the fold, so pinning only the emitter (as the
+    /// first SA-36 fix did) would have left the optimization inert.
+    #[test]
+    fn maddwd_admits_both_fold_positions_but_maddubs_only_the_signed_one() {
+        use crate::ir::intrinsics::IntrinsicOp as O;
+        assert_eq!(
+            memfold_consumer_256(&O::VecMaddwdI16x16),
+            Some(true),
+            "two signed word streams commute: args[0] must be foldable too"
+        );
+        assert_eq!(
+            memfold_consumer_256(&O::VecMaddubsU8x32),
+            Some(false),
+            "mixed signedness: folding args[0] would feed the unsigned \
+             stream to the signed multiplier"
+        );
     }
 
     /// Every register-resident `VecLoad*` family reads its pointer's bytes
