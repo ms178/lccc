@@ -64,6 +64,13 @@ def cases(seed: int, count: int) -> list[str]:
             line = f"#if {op}{body}\nint x = 1;\n#else\nint x = 0;\n#endif\n"
         if rng.random() < 0.2:
             line = f"#define M {op}{body}\nint v = M;\n"
+        # Exercise the lifetime states as well as the live operator: a
+        # withdrawn operator is an ordinary name, a user macro takes over.
+        r = rng.random()
+        if r < 0.2:
+            line = f"#undef {op}\n" + line
+        elif r < 0.35:
+            line = f"#define {op}(x) 7\n" + line
         out.append(line)
     return out
 

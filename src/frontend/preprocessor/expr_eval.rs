@@ -66,15 +66,17 @@ impl Preprocessor {
                 }
                 match ident {
                     "__has_builtin" => {
-                        let val = self.resolve_has_builtin_call_bytes(bytes, &mut i);
+                        let val = self.resolve_has_builtin_call_bytes(bytes, &mut i, diag_line);
                         result.push_str(val);
                     }
                     "__has_attribute" => {
-                        let val = self.resolve_has_attribute_call_bytes(bytes, &mut i, false);
+                        let val =
+                            self.resolve_has_attribute_call_bytes(bytes, &mut i, false, diag_line);
                         result.push_str(val);
                     }
                     "__has_c_attribute" => {
-                        let val = self.resolve_has_attribute_call_bytes(bytes, &mut i, true);
+                        let val =
+                            self.resolve_has_attribute_call_bytes(bytes, &mut i, true, diag_line);
                         result.push_str(val);
                     }
                     "__has_feature" => {
@@ -313,13 +315,14 @@ impl Preprocessor {
                     let is_def = self.macros.is_defined(name);
                     result.push_str(if is_def { "1" } else { "0" });
                 } else if ident == "__has_builtin" {
-                    let val = self.resolve_has_builtin_call_bytes(bytes, &mut i);
+                    let val = self.resolve_has_builtin_call_bytes(bytes, &mut i, diag_line);
                     result.push_str(val);
                 } else if ident == "__has_attribute" {
-                    let val = self.resolve_has_attribute_call_bytes(bytes, &mut i, false);
+                    let val =
+                        self.resolve_has_attribute_call_bytes(bytes, &mut i, false, diag_line);
                     result.push_str(val);
                 } else if ident == "__has_c_attribute" {
-                    let val = self.resolve_has_attribute_call_bytes(bytes, &mut i, true);
+                    let val = self.resolve_has_attribute_call_bytes(bytes, &mut i, true, diag_line);
                     result.push_str(val);
                 } else if ident == "__has_feature" {
                     let val = self.resolve_has_feature_call_bytes(bytes, &mut i, false, diag_line);
@@ -352,33 +355,71 @@ impl Preprocessor {
     }
 
     /// Parse `(name)` after `__has_builtin` and return "1" or "0" (byte-oriented).
-    fn resolve_has_builtin_call_bytes(&self, bytes: &[u8], i: &mut usize) -> &'static str {
+    /// Malformed operands are GCC-worded errors, not silent zeros; recovery
+    /// consumes the balanced argument so no stray token reaches the parser.
+    fn resolve_has_builtin_call_bytes(
+        &mut self,
+        bytes: &[u8],
+        i: &mut usize,
+        diag_line: usize,
+    ) -> &'static str {
         let len = bytes.len();
         while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
             *i += 1;
         }
         if *i >= len || bytes[*i] != b'(' {
+            self.query_diag("missing '(' after '__has_builtin'".to_string(), diag_line);
+            // GCC absorbs a following identifier operand in this recovery.
+            while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+                *i += 1;
+            }
+            if *i < len && is_ident_start_byte(bytes[*i]) {
+                *i += 1;
+                while *i < len && is_ident_cont_byte(bytes[*i]) {
+                    *i += 1;
+                }
+            }
             return "0";
         }
         *i += 1;
         while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
             *i += 1;
         }
+        if *i >= len || !is_ident_start_byte(bytes[*i]) {
+            self.skip_open_paren_arg_bytes(bytes, i);
+            self.query_diag(
+                "macro '__has_builtin' requires an identifier".to_string(),
+                diag_line,
+            );
+            return "0";
+        }
         let start = *i;
         while *i < len && is_ident_cont_byte(bytes[*i]) {
             *i += 1;
         }
         let raw = bytes_to_str(bytes, start, *i);
-        while *i < len && bytes[*i] != b')' {
+        // GCC expands the operand before judging the token sequence; a macro
+        // expanding to several tokens diagnoses the FIRST expanded token.
+        let expanded = self.expand_query_identifier(raw);
+        let first = match &expanded {
+            Ok(name) => name.as_ref(),
+            Err(text) => text.split_whitespace().next().unwrap_or(raw),
+        };
+        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
             *i += 1;
         }
-        if *i < len {
-            *i += 1;
-        }
-        // GCC 16.2 macro-expands the operand (measured: `#define B memcpy`
-        // makes `__has_builtin(B)` answer 1, in `#if` and in code alike).
-        let Ok(name) = self.expand_query_identifier(raw) else {
+        if *i >= len || bytes[*i] != b')' {
+            self.skip_open_paren_arg_bytes(bytes, i);
+            self.query_diag(format!("expected ')' after '{first}'"), diag_line);
             return "0";
+        }
+        *i += 1;
+        let name = match expanded {
+            Ok(name) => name,
+            Err(_) => {
+                self.query_diag(format!("expected ')' after '{first}'"), diag_line);
+                return "0";
+            }
         };
         // GCC 16.2 also answers 1 for the unprefixed library spelling
         // (`__has_builtin(memcpy)` == `__has_builtin(__builtin_memcpy)`).
@@ -519,11 +560,18 @@ impl Preprocessor {
     ///   GNU attribute, and any other vendor scope is 0;
     /// * an unscoped GNU attribute is 1 under `__has_attribute` but 0 under
     ///   `__has_c_attribute` (the `[[...]]` syntax spells it `gnu::name`).
+    ///
+    /// GCC macro-expands the scope and name identifiers (measured:
+    /// `#define SCOPE gnu` / `#define NAME deprecated` both answer 1), and an
+    /// unscoped macro may expand to a whole scoped token. Malformed operands
+    /// are errors; GCC's diagnostic spelling is `__has_attribute` for BOTH
+    /// operators (measured on gcc-16.2, including `__has_c_attribute()`).
     fn resolve_has_attribute_call_bytes(
-        &self,
+        &mut self,
         bytes: &[u8],
         i: &mut usize,
         c_syntax: bool,
+        diag_line: usize,
     ) -> &'static str {
         let len = bytes.len();
         let skip_blanks = |i: &mut usize| {
@@ -540,51 +588,79 @@ impl Preprocessor {
         };
         skip_blanks(i);
         if *i >= len || bytes[*i] != b'(' {
+            self.query_diag("missing '(' after '__has_attribute'".to_string(), diag_line);
+            skip_blanks(i);
+            if *i < len && is_ident_start_byte(bytes[*i]) {
+                ident(i);
+            }
             return "0";
         }
         *i += 1;
         skip_blanks(i);
+        if *i >= len || !is_ident_start_byte(bytes[*i]) {
+            self.skip_open_paren_arg_bytes(bytes, i);
+            self.query_diag(
+                "macro '__has_attribute' requires an identifier".to_string(),
+                diag_line,
+            );
+            return "0";
+        }
         let first = ident(i);
         skip_blanks(i);
         let scoped = *i + 1 < len && bytes[*i] == b':' && bytes[*i + 1] == b':';
         let (scope, name) = if scoped {
             *i += 2;
             skip_blanks(i);
+            if *i >= len || !is_ident_start_byte(bytes[*i]) {
+                self.skip_open_paren_arg_bytes(bytes, i);
+                self.query_diag(
+                    "attribute identifier required after scope".to_string(),
+                    diag_line,
+                );
+                return "0";
+            }
             (Some(first), ident(i))
         } else {
             (None, first)
         };
-        while *i < len && bytes[*i] != b')' {
-            *i += 1;
+        skip_blanks(i);
+        if *i >= len || bytes[*i] != b')' {
+            self.skip_open_paren_arg_bytes(bytes, i);
+            self.query_diag("missing ')' after '__has_attribute'".to_string(), diag_line);
+            return "0";
         }
-        if *i < len {
-            *i += 1;
-        }
-        // GCC 16.2 macro-expands the operand (measured: `#define ATTR
-        // deprecated` answers 202311 and `#define SCOPED gnu::deprecated`
-        // answers 1).  An unscoped macro may expand to a scoped token, so the
-        // expansion is re-split on '::'; anything else is not an attribute
-        // token and answers 0.
-        let expanded = match (scope, self.macros.get(name)) {
-            (None, Some(_)) => Some(self.macros.expand_line(name)),
-            _ => None,
-        };
-        let (scope, name) = match expanded.as_deref() {
-            Some(text) => {
-                let text = text.trim();
-                match text.split_once("::") {
-                    Some((s, n))
-                        if is_query_identifier(s.trim()) && is_query_identifier(n.trim()) =>
-                    {
-                        (Some(s.trim()), n.trim())
-                    }
-                    _ if is_query_identifier(text) => (None, text),
-                    _ => return "0",
+        *i += 1;
+        // Expand the identifiers the way GCC does. A failed expansion is not
+        // an attribute token; answer 0 rather than advertising a capability.
+        let (scope, name) = if let Some(scope_raw) = scope {
+            let Ok(s) = self.expand_query_identifier(scope_raw) else {
+                return "0";
+            };
+            let Ok(n) = self.expand_query_identifier(name) else {
+                return "0";
+            };
+            (Some(s.into_owned()), n.into_owned())
+        } else {
+            // An unscoped operand may expand to a WHOLE scoped token
+            // (`#define SCOPED gnu::deprecated`), so this cannot use the
+            // single-identifier query helper; re-split the expansion.
+            let expanded = if self.macros.get(name).is_some() {
+                self.macros.expand_line(name)
+            } else {
+                name.to_string()
+            };
+            let text = expanded.trim();
+            match text.split_once("::") {
+                Some((sc, n))
+                    if is_query_identifier(sc.trim()) && is_query_identifier(n.trim()) =>
+                {
+                    (Some(sc.trim().to_string()), n.trim().to_string())
                 }
+                _ if is_query_identifier(text) => (None, text.to_string()),
+                _ => return "0",
             }
-            None => (scope, name),
         };
-        attribute_token_value(scope, name, c_syntax)
+        attribute_token_value(scope.as_deref(), &name, c_syntax)
     }
 
     /// Parse `(<header.h>)` or `("header.h")` after `__has_include` / `__has_include_next`

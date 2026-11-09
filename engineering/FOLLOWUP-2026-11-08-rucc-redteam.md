@@ -301,3 +301,19 @@ correctly rejects as orphaned), and two `grep -q` early-exit consumers in the
 frontend gate were converted to `grep -c >/dev/null` so a compiler crash cannot
 be masked as SIGPIPE under `pipefail`. `check_pipefail_sigpipe.py` and
 `check_ci_gate_parity.py` now pass locally.
+
+### Operand-diagnostic parity for `__has_builtin` / `__has_attribute`
+
+The same red-team pass found that malformed `__has_builtin` and
+`__has_attribute`/`__has_c_attribute` operands were silent zeros (or left stray
+tokens), while GCC 16.2 rejects them. Both resolvers now share the feature
+query's diagnostic/recovery discipline: GCC-worded errors, balanced
+literal-aware operand consumption, and macro expansion before judging the token
+sequence. Attribute scope/name identifiers macro-expand (`SCOPE::deprecated`,
+`gnu::NAME`, and a whole `SCOPED` token), matching GCC in both `#if` and code.
+`__has_c_attribute` deliberately uses GCC's measured `__has_attribute`
+diagnostic spelling. The lifetime gate grew to **181 checks**; the seeded fuzz
+now also exercises withdrawn and user-owned operator states (**2880 cases across
+three seeds**, zero panics/hangs/signals). The capability gate now asserts the
+query answers are identical on the i686/AArch64/RISC-V sibling drivers, not just
+x86-64. Preprocessor units remain green; Clippy `-D warnings` and rustfmt clean.

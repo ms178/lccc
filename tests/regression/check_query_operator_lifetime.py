@@ -178,7 +178,49 @@ def main(argv: list[str] | None = None) -> int:
             check(f"{op}/pedantic-after-undef", r.returncode == 0
                   and f"'{op}' defined" in r.stderr, r.stderr)
 
-        # 10. Extra tokens after #undef are diagnosed, repeated #undef still warns.
+        # 10. Malformed operands are GCC-worded errors, never silent zeros.
+        malformed = [
+            ("__has_builtin()", "macro '__has_builtin' requires an identifier"),
+            ("__has_builtin(123)", "macro '__has_builtin' requires an identifier"),
+            ("__has_builtin(memcpy strlen)", "expected ')' after 'memcpy'"),
+            ("__has_builtin memcpy", "missing '(' after '__has_builtin'"),
+            ("__has_attribute()", "macro '__has_attribute' requires an identifier"),
+            ("__has_attribute(packed aligned)", "missing ')' after '__has_attribute'"),
+            ("__has_attribute(gnu::)", "attribute identifier required after scope"),
+            ("__has_attribute packed", "missing '(' after '__has_attribute'"),
+            ("__has_c_attribute()", "macro '__has_attribute' requires an identifier"),
+            ("__has_c_attribute(deprecated fallback)", "missing ')' after '__has_attribute'"),
+        ]
+        for expr, msg in malformed:
+            for ctx, text in [
+                ("code", f"int x={expr};\n"),
+                ("if", f"#if {expr}\nint x=1;\n#endif\n"),
+            ]:
+                src_path = Path(tmp) / "malformed.c"
+                src_path.write_text(text)
+                r = run(args.lccc, src_path)
+                check(f"malformed/{expr}/{ctx}", r.returncode != 0 and msg in r.stderr,
+                      f"rc={r.returncode} {r.stderr}")
+        # A macro operand expanding to several tokens quotes the first token.
+        src.write_text("#define B memcpy strlen\nint x=__has_builtin(B);\n")
+        r = run(args.lccc, src)
+        check("malformed/macro-junk", r.returncode != 0 and "expected ')' after 'memcpy'" in r.stderr,
+              r.stderr)
+
+        # 11. GCC expands attribute scope/name identifiers and whole scoped tokens.
+        for src_text, want in [
+            ("#define SCOPE gnu\nint x=__has_attribute(SCOPE::deprecated);\n", "int x=1;"),
+            ("#define NAME deprecated\nint x=__has_attribute(gnu::NAME);\n", "int x=1;"),
+            ("#define SCOPED gnu::deprecated\nint x=__has_attribute(SCOPED);\n", "int x=1;"),
+            ("#define SCOPED gnu::deprecated\n#if __has_attribute(SCOPED)\nint x=1;\n#else\nint x=0;\n#endif\n", "int x=1;"),
+            ("#define SCOPE gnu\n#if __has_attribute(SCOPE::deprecated)\nint x=1;\n#else\nint x=0;\n#endif\n", "int x=1;"),
+        ]:
+            src.write_text(src_text)
+            r = run(args.lccc, src)
+            check(f"attr-macro/{want}", r.returncode == 0 and want in r.stdout
+                  and "int x=0;" not in r.stdout, r.stdout + r.stderr)
+
+        # 12. Extra tokens after #undef are diagnosed, repeated #undef still warns.
         src.write_text("#undef __has_feature junk\n#undef __has_feature\n")
         r = run(args.lccc, src)
         check("undef/extra-tokens", "extra tokens at end of '#undef' directive" in r.stderr, r.stderr)

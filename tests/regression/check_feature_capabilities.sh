@@ -187,6 +187,16 @@ check_sibling() {  # <driver> <asm-goto source>
             >>"$tmp/sib.log" 2>&1; then
         fail "$(basename "$driver"): asm goto with outputs must codegen" "$(cat "$tmp/sib.log")"
     fi
+    # The capability rows are target-independent claims: every sibling driver
+    # must answer exactly as the host does (no -E sysroot is needed here).
+    local sib_got kv key val
+    sib_got=$("$driver" -std=gnu23 -E "$tmp/answers.c" 2>/dev/null | grep -v '^#' | tr -d ' \n\t')
+    for kv in alignas=1 alignof=1 generic=1 sassert=1 threadlocal=1 tls=1 binlit=1 asmgoto_out=1 \
+              atomic=0 atomic_ext=0; do
+        key=${kv%%=*}; val=${kv#*=}
+        grep -qE "(^|;)int${key}=${val};" <<<"$sib_got" \
+            || fail "$(basename "$driver"): query answer [$key]" "got: $sib_got" "want int${key}=${val};"
+    done
 }
 here=$(cd "$(dirname "$0")/../.." && pwd)
 check_sibling "${CCC_I686:-$here/target/fastbuild/lccc-i686}" "$tmp/ago_x86.c"
