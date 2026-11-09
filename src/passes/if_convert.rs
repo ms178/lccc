@@ -41,7 +41,8 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::analysis;
 use crate::ir::reexports::{
-    BasicBlock, BlockId, Instruction, IrBinOp, IrCmpOp, IrFunction, Operand, Terminator, Value,
+    BasicBlock, BlockId, Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Terminator,
+    Value,
 };
 
 /// Run if-conversion on a single function.
@@ -60,13 +61,22 @@ pub(crate) fn if_convert_function(func: &mut IrFunction) -> usize {
     // Store sinking runs in the same fixpoint: each round it turns
     // store-in-arm decision trees into phi-driven single stores, which the
     // diamond/triangle converters then fold into Selects.
+    //
+    // Conditional-load sinking runs BETWEEN those two: the store sink exposes
+    // the `Phi [load_t, T], [load_f, F]` that this transform keys on, and the
+    // resulting pointer Select is then a legal input to the diamond converter.
+    // It turns `cond ? *p : *q` diamonds (which the ordinary converter must
+    // refuse, because speculating a LOAD can trap) into a pointer Select plus
+    // ONE load, without adding any memory access.  The pred's CondBranch is
+    // gone afterwards, so this pass cannot re-fire on its own output.
     loop {
         let sunk = sink_conditional_stores(func);
+        let loads = sink_conditional_loads(func);
         let converted = if_convert_once(func);
-        if sunk == 0 && converted == 0 {
+        if sunk == 0 && loads == 0 && converted == 0 {
             break;
         }
-        total += converted;
+        total += converted + loads;
     }
 
     total
@@ -1241,6 +1251,628 @@ fn apply_if_combine(func: &mut IrFunction, c: &IfCombine, next_val: &mut u32) ->
 
 fn build_label_map_once(func: &IrFunction) -> FxHashMap<BlockId, usize> {
     analysis::build_label_map(func)
+}
+
+// ── Conditional-load sinking: speculate the ADDRESS, never the LOAD ────────
+//
+// §9b/SV-03's sharpest datum is `select_f32`: a 35x slowdown because the loop
+// stays a scalar branch diamond (`ucomiss`/`jbe`) on unpredictable data.  The
+// ordinary diamond converter declines it: hoisting both arms into the pred
+// would speculate BOTH loads, and a load can trap.  `arm_load_speculation_ok`
+// only accepts an arm load when a covering access dominates every path, which
+// two DISTINCT arrays (`fb[i]` / `fd[i]`) can never provide.
+//
+// The sound alternative is to speculate the ADDRESS and keep exactly ONE
+// memory read:
+//
+//   pred:  <pure address chains from both arms, hoisted>   (no memory ops)
+//          %sel = select %cond, %p_true, %p_false          (Ptr, cmov)
+//          branch merge                                   (unconditional)
+//   merge: %r = load %sel                                 (replaces the Phi)
+//
+// `%sel` is EXACTLY the address the original program dereferenced, so there
+// is no new fault, no new observable memory access and no aliasing change.
+// Computing an address (GEP / integer arithmetic / Cast / Copy / Cmp /
+// GlobalAddr / Select) cannot trap; Div/Rem (`can_trap`), volatile loads,
+// mismatched load types and every other arm instruction are rejected.  Both
+// arm chains must be available at the pred (no cross-arm or post-merge SSA
+// use), and each load result must have exactly one use: the merge Phi.
+//
+// `CCC_NO_COND_LOAD_SINK` is the A/B kill switch for the differential gates.
+
+/// Pure, trap-free address/value computation that can be hoisted above the
+/// diamond's guard.  Mirrors [`is_side_effect_free`] minus the memory ops.
+fn cond_load_hoistable(inst: &Instruction) -> bool {
+    match inst {
+        Instruction::BinOp { op, .. } if op.can_trap() => false,
+        Instruction::BinOp { .. }
+        | Instruction::UnaryOp { .. }
+        | Instruction::Cmp { .. }
+        | Instruction::Cast { .. }
+        | Instruction::Copy { .. }
+        | Instruction::GetElementPtr { .. }
+        | Instruction::GlobalAddr { .. }
+        | Instruction::Select { .. } => true,
+        _ => false,
+    }
+}
+
+struct CondLoadArm {
+    /// Every instruction except the single load, in original order.
+    pure_insts: Vec<Instruction>,
+    load_dest: Value,
+    load_ptr: Value,
+    ty: IrType,
+    seg: AddressSpace,
+    /// All destination ids defined anywhere in this arm.
+    defined: FxHashSet<u32>,
+}
+
+fn parse_cond_load_arm(block: &BasicBlock) -> Option<CondLoadArm> {
+    let mut pure_insts = Vec::with_capacity(block.instructions.len());
+    let mut defined = FxHashSet::default();
+    let mut load: Option<(Value, Value, IrType, AddressSpace)> = None;
+    for inst in &block.instructions {
+        if let Some(d) = inst.dest() {
+            defined.insert(d.0);
+        }
+        match inst {
+            Instruction::Load {
+                dest,
+                ptr,
+                ty,
+                seg_override,
+                volatile,
+            } => {
+                // Volatile reads are observable; atomics are a different
+                // instruction kind and never match here.  Exactly ONE load is
+                // the whole point: two loads would need two selects.
+                if *volatile || load.is_some() {
+                    return None;
+                }
+                load = Some((*dest, *ptr, *ty, *seg_override));
+            }
+            other if cond_load_hoistable(other) => pure_insts.push(other.clone()),
+            _ => return None,
+        }
+    }
+    let (load_dest, load_ptr, ty, seg) = load?;
+    Some(CondLoadArm {
+        pure_insts,
+        load_dest,
+        load_ptr,
+        ty,
+        seg,
+        defined,
+    })
+}
+
+/// Every value used by the arm must be available AFTER hoisting the arm's
+/// instruction chain into the branch predecessor.  Three cases:
+///   * defined EARLIER in this same arm → the hoisted order still defines it;
+///   * defined in the OTHER arm → the other chain is hoisted too, but at a
+///     LATER position than the arm currently executing, so it is NOT a valid
+///     SSA use; refuse (cross-arm dataflow is not what this transform models);
+///   * defined anywhere else → that block must DOMINATE the pred.  "Not in an
+///     arm" alone is NOT enough: a definition in the merge block sits AFTER
+///     the arms and cannot dominate the pred, so hoisting would create a
+///     use-before-def.  This is a real gap the first revision had.
+fn cond_load_arm_available(
+    insts: &[Instruction],
+    own_defined: &FxHashSet<u32>,
+    other_defined: &FxHashSet<u32>,
+    def_block: &FxHashMap<u32, usize>,
+    dom: &analysis::DominanceChecker,
+    pred: usize,
+) -> bool {
+    let mut seen: FxHashSet<u32> = FxHashSet::default();
+    for inst in insts {
+        let mut ok = true;
+        inst.for_each_used_value(|v| {
+            if other_defined.contains(&v) {
+                ok = false;
+            } else if own_defined.contains(&v) {
+                if !seen.contains(&v) {
+                    ok = false;
+                }
+            } else {
+                // Fail closed on an unknown defining block (an unmaterialized
+                // value, or IR the def census did not see).
+                ok &= def_block.get(&v).is_some_and(|&b| dom.dominates(b, pred));
+            }
+        });
+        if !ok {
+            return false;
+        }
+        if let Some(d) = inst.dest() {
+            seen.insert(d.0);
+        }
+    }
+    true
+}
+
+/// Load types this transform may carry.  Everything here is a single GPR or
+/// SSE-scalar load; 128-bit integers, `long double` and `Void` need aggregate
+/// or multi-register paths the pointer Select does not model.
+fn cond_load_type_supported(ty: IrType) -> bool {
+    matches!(
+        ty,
+        IrType::I8
+            | IrType::U8
+            | IrType::I16
+            | IrType::U16
+            | IrType::I32
+            | IrType::U32
+            | IrType::I64
+            | IrType::U64
+            | IrType::F32
+            | IrType::F64
+            | IrType::D32
+            | IrType::D64
+            | IrType::Ptr
+    )
+}
+
+/// Types the backend's `Select` lowering carries without an aggregate path.
+/// Narrow integers have no `cmov` form and D32/D64 are decimal carriers that
+/// take the FP-blend path; refuse those for auxiliary phis (fail closed).
+fn cond_load_phi_selectable(ty: IrType) -> bool {
+    matches!(
+        ty,
+        IrType::I32
+            | IrType::U32
+            | IrType::I64
+            | IrType::U64
+            | IrType::F32
+            | IrType::F64
+            | IrType::Ptr
+    )
+}
+
+/// A merge Phi OTHER than the load-result phi.  Once the arms disappear, M has
+/// a single predecessor, so these phis must become Selects in the pred with
+/// their original destinations (then be removed from M).
+struct CondLoadPhi {
+    idx: usize,
+    dest: Value,
+    ty: IrType,
+    tv: Operand,
+    fv: Operand,
+}
+
+struct CondLoadPlan {
+    pred: usize,
+    t: usize,
+    f: usize,
+    merge: usize,
+    merge_label: BlockId,
+    cond: Operand,
+    t_arm: CondLoadArm,
+    f_arm: CondLoadArm,
+    phi_idx: usize,
+    phi_dest: Value,
+    extra_phis: Vec<CondLoadPhi>,
+}
+
+/// Structural identity for an address expression, independent of SSA id.
+///
+/// A guard that reads `a[i]` and the arm that reloads `a[i]` frequently carry
+/// DIFFERENT `GetElementPtr` destinations (the frontend materializes the
+/// address twice, and `load_forward` only merges some of them before
+/// if-conversion runs).  Comparing `Value` ids would miss exactly the cases
+/// where sinking is a pessimization, so fold GEP/Cast/Copy chains into a
+/// canonical key.  The element type is deliberately NOT part of the key: the
+/// address is `base + offset` in bytes regardless of the loaded type.  Recursion
+/// is bounded; anything unrecognised falls back to an opaque, unique key so the
+/// comparison never claims two unknown addresses are equal.
+fn cond_load_offset_is_zero(offset: &Operand) -> bool {
+    match offset {
+        Operand::Const(IrConst::I8(v)) => *v == 0,
+        Operand::Const(IrConst::I16(v)) => *v == 0,
+        Operand::Const(IrConst::I32(v)) => *v == 0,
+        Operand::Const(IrConst::I64(v)) => *v == 0,
+        Operand::Const(IrConst::I128(v)) => *v == 0,
+        Operand::Const(IrConst::Zero) => true,
+        _ => false,
+    }
+}
+
+fn cond_load_ptr_key(v: Value, defs: &FxHashMap<u32, &Instruction>, depth: usize) -> String {
+    if depth > 8 {
+        return format!("opaque:{}", v.0);
+    }
+    let Some(inst) = defs.get(&v.0) else {
+        return format!("opaque:{}", v.0);
+    };
+    match inst {
+        Instruction::GetElementPtr { base, offset, .. } => {
+            // `base + 0` IS `base`: the frontend materializes a zero-offset
+            // GEP for `a[0]` while the guard may load straight from `a`.
+            // Folding it keeps the two spellings of one address comparable.
+            if cond_load_offset_is_zero(offset) {
+                return cond_load_ptr_key(*base, defs, depth + 1);
+            }
+            format!(
+                "gep({},{:?})",
+                cond_load_ptr_key(*base, defs, depth + 1),
+                offset
+            )
+        }
+        Instruction::Copy { src, .. } | Instruction::Cast { src, .. } => match src {
+            Operand::Value(sv) => {
+                format!("alias({})", cond_load_ptr_key(*sv, defs, depth + 1))
+            }
+            Operand::Const(c) => format!("const({c:?})"),
+        },
+        Instruction::GlobalAddr { name, .. } => format!("global({name})"),
+        Instruction::ParamRef { param_idx, .. } => format!("param({param_idx})"),
+        _ => format!("opaque:{}", v.0),
+    }
+}
+
+/// Profitability proof for the `a[i] < b[i] ? a[i] : b[i]` family.
+///
+/// When the branch predicate is data-dependent on a load from either arm's
+/// address, BOTH addresses have already been dereferenced unconditionally by
+/// the guard.  There is therefore no untaken-path fault to avoid and no second
+/// load to eliminate: the existing `Cmp` + value-`Select` form costs two loads
+/// and vectorizes to `pminud`/`pmaxud`/`pminsd`, whereas sinking would emit a
+/// pointer `Select` plus a THIRD load through it and break the SLP min/max
+/// idiom.  Refusing is always sound (it only declines a rewrite); the walk is
+/// over the guard's transitive def chain, so a guard loaded from an unrelated
+/// address (`if (*flag) x = *p; else x = *q;`) still sinks.
+fn cond_load_guard_reads_arm_address(
+    cond: Operand,
+    t_key: &str,
+    f_key: &str,
+    defs: &FxHashMap<u32, &Instruction>,
+) -> bool {
+    let Operand::Value(root) = cond else {
+        return false;
+    };
+    let mut seen: FxHashSet<u32> = FxHashSet::default();
+    let mut work = vec![root.0];
+    while let Some(id) = work.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let Some(inst) = defs.get(&id) else {
+            continue;
+        };
+        if let Instruction::Load { ptr, .. } = inst {
+            let key = cond_load_ptr_key(*ptr, defs, 0);
+            if key == t_key || key == f_key {
+                return true;
+            }
+        }
+        inst.for_each_used_value(|u| work.push(u));
+    }
+    false
+}
+
+/// Collect every sound `cond ? *p : *q` diamond in the function.  Nothing is
+/// mutated here; the caller applies non-overlapping plans.
+fn plan_cond_load_sinks(func: &IrFunction) -> Vec<CondLoadPlan> {
+    let num_blocks = func.blocks.len();
+    if num_blocks < 4 {
+        return Vec::new();
+    }
+    let label_to_idx = analysis::build_label_map(func);
+    let (preds, succs) = analysis::build_cfg(func, &label_to_idx);
+    let idom = analysis::compute_dominators(num_blocks, &preds, &succs);
+    let dom = analysis::DominanceChecker::new(num_blocks, &idom);
+    // Where every SSA value is defined.  A value with no entry is treated as
+    // unavailable (fail closed) by the availability proof below.
+    let mut def_block: FxHashMap<u32, usize> = FxHashMap::default();
+    // Definition instruction for each SSA id, used by the guard-dependence
+    // profitability proof below.  A duplicate id keeps the first definition;
+    // the SSA verifier rejects real duplicates, so this cannot mask a bug.
+    let mut def_inst: FxHashMap<u32, &Instruction> = FxHashMap::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            if let Some(d) = inst.dest() {
+                def_block.insert(d.0, bi);
+                def_inst.entry(d.0).or_insert(inst);
+            }
+        }
+    }
+
+    // One global pass instead of an O(n^2) rescan per candidate.
+    let mut use_counts: FxHashMap<u32, usize> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            inst.for_each_used_value(|v| *use_counts.entry(v).or_insert(0) += 1);
+        }
+        block
+            .terminator
+            .for_each_used_value(|v| *use_counts.entry(v).or_insert(0) += 1);
+    }
+
+    let mut plans = Vec::new();
+    for p in 0..num_blocks {
+        let (cond, tl, fl) = match &func.blocks[p].terminator {
+            Terminator::CondBranch {
+                cond,
+                true_label,
+                false_label,
+            } if true_label != false_label => (*cond, *true_label, *false_label),
+            _ => continue,
+        };
+        let (Some(&t), Some(&f)) = (label_to_idx.get(&tl), label_to_idx.get(&fl)) else {
+            continue;
+        };
+        if t == p || f == p || t == f {
+            continue;
+        }
+        // Single-predecessor arms: the branch pred owns them exclusively.
+        if preds.len(t) != 1 || preds.row(t)[0] as usize != p {
+            continue;
+        }
+        if preds.len(f) != 1 || preds.row(f)[0] as usize != p {
+            continue;
+        }
+        let (Terminator::Branch(t_merge), Terminator::Branch(f_merge)) =
+            (&func.blocks[t].terminator, &func.blocks[f].terminator)
+        else {
+            continue;
+        };
+        if t_merge != f_merge {
+            continue;
+        }
+        let Some(&m) = label_to_idx.get(t_merge) else {
+            continue;
+        };
+        if m == p || m == t || m == f {
+            continue;
+        }
+        // FULL merge only: after the rewrite the pred is its sole predecessor.
+        if preds.len(m) != 2 {
+            continue;
+        }
+        let mp: FxHashSet<u32> = preds.row(m).iter().copied().collect();
+        if !mp.contains(&(t as u32)) || !mp.contains(&(f as u32)) {
+            continue;
+        }
+
+        let Some(t_arm) = parse_cond_load_arm(&func.blocks[t]) else {
+            continue;
+        };
+        let Some(f_arm) = parse_cond_load_arm(&func.blocks[f]) else {
+            continue;
+        };
+        // The single merged load must have one unambiguous type/segment.
+        if t_arm.ty != f_arm.ty || t_arm.seg != f_arm.seg {
+            continue;
+        }
+        if !cond_load_type_supported(t_arm.ty) {
+            continue;
+        }
+        // Do not steal a min/max/select idiom whose guard already loads the
+        // two arm addresses: sinking would add a third load and destroy the
+        // packed pminud/pmaxud/pminsd form (hosted CI shards, 2026-11-08).
+        let t_key = cond_load_ptr_key(t_arm.load_ptr, &def_inst, 0);
+        let f_key = cond_load_ptr_key(f_arm.load_ptr, &def_inst, 0);
+        if cond_load_guard_reads_arm_address(cond, &t_key, &f_key, &def_inst) {
+            continue;
+        }
+        if !cond_load_arm_available(
+            &func.blocks[t].instructions,
+            &t_arm.defined,
+            &f_arm.defined,
+            &def_block,
+            &dom,
+            p,
+        ) || !cond_load_arm_available(
+            &func.blocks[f].instructions,
+            &f_arm.defined,
+            &t_arm.defined,
+            &def_block,
+            &dom,
+            p,
+        ) {
+            continue;
+        }
+        // Each load result must be used ONLY by the merge Phi; otherwise the
+        // hoist would leave a dangling SSA use after the arms are emptied.
+        if use_counts.get(&t_arm.load_dest.0).copied().unwrap_or(0) != 1
+            || use_counts.get(&f_arm.load_dest.0).copied().unwrap_or(0) != 1
+        {
+            continue;
+        }
+        let t_label = func.blocks[t].label;
+        let f_label = func.blocks[f].label;
+        // EVERY Phi in the merge must be accounted for.  Once the arms are
+        // gone M has one predecessor, so a surviving Phi would name edges
+        // that no longer exist (invalid SSA, and a backend ICE in the worst
+        // case).  The load-result Phi becomes a Load; all others become
+        // Selects in the pred with their original destinations.
+        let mut phi = None;
+        let mut extra_phis: Vec<CondLoadPhi> = Vec::new();
+        let mut bad_phi = false;
+        for (idx, inst) in func.blocks[m].instructions.iter().enumerate() {
+            let Instruction::Phi { dest, ty, incoming } = inst else {
+                continue;
+            };
+            if incoming.len() != 2 || !cond_load_type_supported(*ty) {
+                bad_phi = true;
+                break;
+            }
+            let (mut tv, mut fv, mut extra) = (None, None, false);
+            for (op, lbl) in incoming {
+                if *lbl == t_label {
+                    tv = Some(*op);
+                } else if *lbl == f_label {
+                    fv = Some(*op);
+                } else {
+                    extra = true;
+                }
+            }
+            if extra {
+                bad_phi = true;
+                break;
+            }
+            let (Some(tv), Some(fv)) = (tv, fv) else {
+                bad_phi = true;
+                break;
+            };
+            let is_target = matches!(
+                (tv, fv),
+                (Operand::Value(a), Operand::Value(b))
+                    if a.0 == t_arm.load_dest.0 && b.0 == f_arm.load_dest.0
+            );
+            if is_target {
+                if phi.is_some() || *ty != t_arm.ty {
+                    bad_phi = true;
+                    break;
+                }
+                phi = Some((idx, *dest));
+                continue;
+            }
+            // A different Phi becomes a Select: it needs a Select-able type,
+            // must not consume either doomed load result, and both of its
+            // incomings must be available at the pred.
+            let mut incoming_ok = cond_load_phi_selectable(*ty);
+            for op in [tv, fv] {
+                if let Operand::Value(v) = op {
+                    if v.0 == t_arm.load_dest.0 || v.0 == f_arm.load_dest.0 {
+                        incoming_ok = false;
+                    } else if !t_arm.defined.contains(&v.0) && !f_arm.defined.contains(&v.0) {
+                        incoming_ok &= def_block.get(&v.0).is_some_and(|&b| dom.dominates(b, p));
+                    }
+                }
+            }
+            if !incoming_ok {
+                bad_phi = true;
+                break;
+            }
+            extra_phis.push(CondLoadPhi {
+                idx,
+                dest: *dest,
+                ty: *ty,
+                tv,
+                fv,
+            });
+        }
+        if bad_phi {
+            continue;
+        }
+        let Some((phi_idx, phi_dest)) = phi else {
+            continue;
+        };
+        plans.push(CondLoadPlan {
+            pred: p,
+            t,
+            f,
+            merge: m,
+            merge_label: func.blocks[m].label,
+            cond,
+            t_arm,
+            f_arm,
+            phi_idx,
+            phi_dest,
+            extra_phis,
+        });
+    }
+    plans
+}
+
+fn apply_cond_load_sink(func: &mut IrFunction, p: &CondLoadPlan) -> bool {
+    if p.pred >= func.blocks.len()
+        || p.t >= func.blocks.len()
+        || p.f >= func.blocks.len()
+        || p.merge >= func.blocks.len()
+        || p.phi_idx >= func.blocks[p.merge].instructions.len()
+    {
+        return false;
+    }
+    let fresh = Value(func.sound_next_value_id());
+    func.next_value_id = fresh.0.saturating_add(1);
+    let dummy = crate::common::source::Span::dummy();
+    {
+        let pred = &mut func.blocks[p.pred];
+        // Hoist the pure address chains with their ORIGINAL SSA ids, so every
+        // surviving use (including the merge store) stays valid.
+        for inst in &p.t_arm.pure_insts {
+            pred.push_inst(inst.clone(), dummy);
+        }
+        for inst in &p.f_arm.pure_insts {
+            pred.push_inst(inst.clone(), dummy);
+        }
+        // Any OTHER merge Phi becomes a Select with the SAME destination;
+        // the Phi itself is removed below so there is exactly one definition.
+        for x in &p.extra_phis {
+            pred.push_inst(
+                Instruction::Select {
+                    dest: x.dest,
+                    cond: p.cond,
+                    true_val: x.tv,
+                    false_val: x.fv,
+                    ty: x.ty,
+                },
+                dummy,
+            );
+        }
+        pred.push_inst(
+            Instruction::Select {
+                dest: fresh,
+                cond: p.cond,
+                true_val: Operand::Value(p.t_arm.load_ptr),
+                false_val: Operand::Value(p.f_arm.load_ptr),
+                ty: IrType::Ptr,
+            },
+            dummy,
+        );
+        pred.terminator = Terminator::Branch(p.merge_label);
+    }
+    // Replace the load-result Phi IN PLACE: the destination (and therefore
+    // every use of it) is unchanged, and the parallel span/provenance arrays
+    // stay aligned because the instruction count does not change.
+    func.blocks[p.merge].instructions[p.phi_idx] = Instruction::Load {
+        dest: p.phi_dest,
+        ptr: fresh,
+        ty: p.t_arm.ty,
+        seg_override: p.t_arm.seg,
+        volatile: false,
+    };
+    // Remove the other phis (their values now come from the pred's Selects).
+    // retain_insts keeps spans/inline ids in lockstep.
+    if !p.extra_phis.is_empty() {
+        let gone: FxHashSet<u32> = p.extra_phis.iter().map(|x| x.dest.0).collect();
+        func.blocks[p.merge].retain_insts(
+            |inst| !matches!(inst, Instruction::Phi { dest, .. } if gone.contains(&dest.0)),
+        );
+    }
+    // The arms are unreachable now.  Clear them so no second definition of a
+    // hoisted destination (or a dangling load result) survives for the SSA
+    // verifier; CFG simplification deletes the empty blocks afterwards.
+    func.blocks[p.t].clear_insts();
+    func.blocks[p.f].clear_insts();
+    true
+}
+
+fn sink_conditional_loads(func: &mut IrFunction) -> usize {
+    if !super::cond_load_sink_enabled() {
+        return 0;
+    }
+    let plans = plan_cond_load_sinks(func);
+    if plans.is_empty() {
+        return 0;
+    }
+    let mut modified: FxHashSet<usize> = FxHashSet::default();
+    let mut converted = 0usize;
+    for plan in &plans {
+        if [plan.pred, plan.t, plan.f, plan.merge]
+            .iter()
+            .any(|b| modified.contains(b))
+        {
+            continue;
+        }
+        if apply_cond_load_sink(func, plan) {
+            modified.extend([plan.pred, plan.t, plan.f, plan.merge]);
+            converted += 1;
+        }
+    }
+    converted
 }
 
 fn if_convert_once(func: &mut IrFunction) -> usize {
@@ -4804,5 +5436,461 @@ mod shared_arm_transaction_tests {
             crate::passes::verify::verify_function(&f, "shared_arm_transaction", &mut violations);
             assert!(violations.is_empty(), "{violations:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod cond_load_sink_tests {
+    use super::*;
+    use crate::common::types::AddressSpace;
+    use crate::ir::reexports::IrConst;
+
+    fn block(label: u32, insts: Vec<Instruction>, term: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions: insts,
+            terminator: term,
+            source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
+        }
+    }
+
+    // ── conditional-load sinking (SV-03) ────────────────────────────────
+    //
+    // Canonical `r = cond ? *p : *q` diamond with FOUR blocks.  Every test
+    // mutates one invariant and asserts the transform refuses it, so a
+    // relaxed legality check cannot land silently.
+
+    fn cond_load_diamond() -> IrFunction {
+        let mut f = IrFunction::new("cond_load".into(), IrType::Void, vec![], false);
+        f.blocks.push(block(
+            0,
+            vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 1,
+                    ty: IrType::Ptr,
+                },
+                Instruction::ParamRef {
+                    dest: Value(2),
+                    param_idx: 2,
+                    ty: IrType::I32,
+                },
+                Instruction::ParamRef {
+                    dest: Value(3),
+                    param_idx: 3,
+                    ty: IrType::Ptr,
+                },
+            ],
+            Terminator::Branch(BlockId(1)),
+        ));
+        f.blocks.push(block(
+            1,
+            vec![Instruction::Cmp {
+                dest: Value(4),
+                op: IrCmpOp::Ne,
+                lhs: Operand::Value(Value(2)),
+                rhs: Operand::Const(IrConst::I32(0)),
+                ty: IrType::I32,
+            }],
+            Terminator::CondBranch {
+                cond: Operand::Value(Value(4)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+        ));
+        for (label, base, gep, loaded) in [(2u32, 0u32, 10u32, 11u32), (3, 1, 20, 21)] {
+            f.blocks.push(block(
+                label,
+                vec![
+                    Instruction::GetElementPtr {
+                        dest: Value(gep),
+                        base: Value(base),
+                        offset: Operand::Const(IrConst::I64(0)),
+                        ty: IrType::F32,
+                    },
+                    Instruction::Load {
+                        dest: Value(loaded),
+                        ptr: Value(gep),
+                        ty: IrType::F32,
+                        seg_override: AddressSpace::Default,
+                        volatile: false,
+                    },
+                ],
+                Terminator::Branch(BlockId(4)),
+            ));
+        }
+        f.blocks.push(block(
+            4,
+            vec![
+                Instruction::Phi {
+                    dest: Value(30),
+                    ty: IrType::F32,
+                    incoming: vec![
+                        (Operand::Value(Value(11)), BlockId(2)),
+                        (Operand::Value(Value(21)), BlockId(3)),
+                    ],
+                },
+                Instruction::Store {
+                    val: Operand::Value(Value(30)),
+                    ptr: Value(3),
+                    ty: IrType::F32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+            ],
+            Terminator::Return(None),
+        ));
+        // Leave headroom: sound_next_value_id() must not collide with the
+        // auxiliary Phi (V(31)) some tests insert.
+        f.next_value_id = 41;
+        f.next_label = 5;
+        f
+    }
+
+    #[test]
+    fn cond_load_sink_selects_the_address_and_keeps_one_load() {
+        let mut f = cond_load_diamond();
+        assert_eq!(sink_conditional_loads(&mut f), 1);
+        // pred: hoisted GEP from each arm, then ONE pointer Select.
+        let pred = &f.blocks[1].instructions;
+        assert_eq!(pred.len(), 4, "{pred:?}");
+        assert!(matches!(pred[0], Instruction::Cmp { .. }));
+        assert!(matches!(pred[1], Instruction::GetElementPtr { .. }));
+        assert!(matches!(pred[2], Instruction::GetElementPtr { .. }));
+        let sel = match &pred[3] {
+            Instruction::Select {
+                dest,
+                ty,
+                true_val,
+                false_val,
+                ..
+            } => {
+                assert_eq!(*ty, IrType::Ptr);
+                assert_eq!(*true_val, Operand::Value(Value(10)));
+                assert_eq!(*false_val, Operand::Value(Value(20)));
+                *dest
+            }
+            other => panic!("expected pointer Select, got {other:?}"),
+        };
+        assert!(matches!(
+            f.blocks[1].terminator,
+            Terminator::Branch(BlockId(4))
+        ));
+        // merge: the Phi became a Load from the selected pointer, same dest.
+        match &f.blocks[4].instructions[0] {
+            Instruction::Load {
+                dest,
+                ptr,
+                ty,
+                volatile,
+                ..
+            } => {
+                assert_eq!(*dest, Value(30));
+                assert_eq!(*ptr, sel);
+                assert_eq!(*ty, IrType::F32);
+                assert!(!*volatile);
+            }
+            other => panic!("expected merged Load, got {other:?}"),
+        }
+        // arms emptied: no second definition of a hoisted destination.
+        assert!(f.blocks[2].instructions.is_empty());
+        assert!(f.blocks[3].instructions.is_empty());
+        // Exactly ONE load remains in the whole function.
+        assert_eq!(
+            f.blocks
+                .iter()
+                .flat_map(|b| &b.instructions)
+                .filter(|i| matches!(i, Instruction::Load { .. }))
+                .count(),
+            1
+        );
+        let mut violations = Vec::new();
+        crate::passes::verify::verify_function(&f, "cond_load_sink", &mut violations);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn cond_load_sink_refuses_a_volatile_load() {
+        let mut f = cond_load_diamond();
+        if let Instruction::Load { volatile, .. } = &mut f.blocks[2].instructions[1] {
+            *volatile = true;
+        }
+        assert_eq!(sink_conditional_loads(&mut f), 0);
+    }
+
+    #[test]
+    fn cond_load_sink_refuses_two_loads_in_one_arm() {
+        let mut f = cond_load_diamond();
+        f.blocks[2].instructions.push(Instruction::Load {
+            dest: Value(12),
+            ptr: Value(10),
+            ty: IrType::F32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        });
+        assert_eq!(sink_conditional_loads(&mut f), 0);
+    }
+
+    #[test]
+    fn cond_load_sink_refuses_a_second_use_of_the_load_result() {
+        let mut f = cond_load_diamond();
+        f.blocks[2].instructions.push(Instruction::Copy {
+            dest: Value(13),
+            src: Operand::Value(Value(11)),
+        });
+        assert_eq!(sink_conditional_loads(&mut f), 0);
+    }
+
+    #[test]
+    fn cond_load_sink_refuses_a_cross_arm_operand() {
+        let mut f = cond_load_diamond();
+        // T's GEP offset is defined in F: hoisting would invert SSA order.
+        if let Instruction::GetElementPtr { offset, .. } = &mut f.blocks[2].instructions[0] {
+            *offset = Operand::Value(Value(20));
+        }
+        assert_eq!(sink_conditional_loads(&mut f), 0);
+    }
+
+    #[test]
+    fn cond_load_sink_refuses_a_value_defined_in_the_merge() {
+        let mut f = cond_load_diamond();
+        // V(40) is defined AFTER the arms; it cannot dominate the pred.
+        f.blocks[4].instructions.insert(
+            0,
+            Instruction::Copy {
+                dest: Value(40),
+                src: Operand::Const(IrConst::I64(0)),
+            },
+        );
+        if let Instruction::GetElementPtr { offset, .. } = &mut f.blocks[2].instructions[0] {
+            *offset = Operand::Value(Value(40));
+        }
+        assert_eq!(sink_conditional_loads(&mut f), 0);
+    }
+
+    #[test]
+    fn cond_load_sink_converts_an_auxiliary_phi_to_a_select() {
+        let mut f = cond_load_diamond();
+        f.blocks[4].instructions.insert(
+            1,
+            Instruction::Phi {
+                dest: Value(31),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Const(IrConst::I32(7)), BlockId(2)),
+                    (Operand::Const(IrConst::I32(9)), BlockId(3)),
+                ],
+            },
+        );
+        assert_eq!(sink_conditional_loads(&mut f), 1);
+        let selects: Vec<_> = f.blocks[1]
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, Instruction::Select { .. }))
+            .collect();
+        assert_eq!(selects.len(), 2, "{selects:?}");
+        assert!(selects.iter().any(|i| matches!(
+            i,
+            Instruction::Select {
+                dest: Value(31),
+                ty: IrType::I32,
+                ..
+            }
+        )));
+        assert_eq!(
+            f.blocks[4]
+                .instructions
+                .iter()
+                .filter(|i| matches!(i, Instruction::Phi { .. }))
+                .count(),
+            0
+        );
+        let mut violations = Vec::new();
+        crate::passes::verify::verify_function(&f, "cond_load_sink_aux_phi", &mut violations);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn cond_load_sink_refuses_mismatched_load_types_and_wide_types() {
+        let mut f = cond_load_diamond();
+        if let Instruction::Load { ty, .. } = &mut f.blocks[3].instructions[1] {
+            *ty = IrType::F64;
+        }
+        assert_eq!(sink_conditional_loads(&mut f), 0);
+
+        let mut g = cond_load_diamond();
+        for b in [2usize, 3] {
+            if let Instruction::Load { ty, .. } = &mut g.blocks[b].instructions[1] {
+                *ty = IrType::I128;
+            }
+        }
+        assert_eq!(sink_conditional_loads(&mut g), 0);
+    }
+
+    #[test]
+    fn cond_load_sink_refuses_a_trapping_division_in_an_arm() {
+        let mut f = cond_load_diamond();
+        f.blocks[2].instructions.insert(
+            0,
+            Instruction::BinOp {
+                dest: Value(14),
+                op: IrBinOp::SDiv,
+                lhs: Operand::Value(Value(2)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            },
+        );
+        assert_eq!(sink_conditional_loads(&mut f), 0);
+    }
+
+    #[test]
+    fn cond_load_sink_refuses_a_partial_merge_and_a_non_diamond() {
+        let mut f = cond_load_diamond();
+        // A third predecessor edge into the merge (a computed-goto target).
+        f.blocks[0].terminator = Terminator::IndirectBranch {
+            target: Operand::Value(Value(3)),
+            possible_targets: vec![BlockId(1), BlockId(4)],
+        };
+        assert_eq!(sink_conditional_loads(&mut f), 0);
+    }
+
+    #[test]
+    fn cond_load_sink_refuses_when_the_guard_reads_an_arm_address() {
+        // `a[0] < b[0] ? a[0] : b[0]`: the guard already dereferences BOTH
+        // arm addresses unconditionally.  Its address expressions are
+        // separately materialized GEPs (different SSA ids, same base+offset),
+        // which is exactly what the structural key exists to catch.
+        let mut f = cond_load_diamond();
+        let pred = &mut f.blocks[1];
+        pred.instructions.clear();
+        pred.instructions.push(Instruction::GetElementPtr {
+            dest: Value(50),
+            base: Value(0),
+            offset: Operand::Const(IrConst::I64(0)),
+            ty: IrType::I32,
+        });
+        pred.instructions.push(Instruction::Load {
+            dest: Value(51),
+            ptr: Value(50),
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        });
+        pred.instructions.push(Instruction::GetElementPtr {
+            dest: Value(52),
+            base: Value(1),
+            offset: Operand::Const(IrConst::I64(0)),
+            ty: IrType::I32,
+        });
+        pred.instructions.push(Instruction::Load {
+            dest: Value(53),
+            ptr: Value(52),
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        });
+        pred.instructions.push(Instruction::Cmp {
+            dest: Value(54),
+            op: IrCmpOp::Slt,
+            lhs: Operand::Value(Value(51)),
+            rhs: Operand::Value(Value(53)),
+            ty: IrType::I32,
+        });
+        pred.terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(54)),
+            true_label: BlockId(2),
+            false_label: BlockId(3),
+        };
+        f.next_value_id = 60;
+        assert_eq!(sink_conditional_loads(&mut f), 0);
+    }
+
+    #[test]
+    fn cond_load_sink_refuses_when_the_guard_uses_the_identical_pointer() {
+        // SSA-identical variant: the guard loads straight from the very same
+        // two arm pointers, so even a plain Value comparison must refuse.
+        let mut f = cond_load_diamond();
+        let pred = &mut f.blocks[1];
+        pred.instructions.clear();
+        pred.instructions.push(Instruction::Load {
+            dest: Value(50),
+            ptr: Value(0),
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        });
+        pred.instructions.push(Instruction::Load {
+            dest: Value(51),
+            ptr: Value(1),
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        });
+        pred.instructions.push(Instruction::Cmp {
+            dest: Value(52),
+            op: IrCmpOp::Slt,
+            lhs: Operand::Value(Value(50)),
+            rhs: Operand::Value(Value(51)),
+            ty: IrType::I32,
+        });
+        pred.terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(52)),
+            true_label: BlockId(2),
+            false_label: BlockId(3),
+        };
+        f.next_value_id = 60;
+        assert_eq!(sink_conditional_loads(&mut f), 0);
+    }
+
+    #[test]
+    fn cond_load_sink_accepts_when_the_guard_loads_an_unrelated_address() {
+        // `if (*flag) x = *p; else x = *q;` — the guard's load is from a
+        // THIRD address.  Neither arm value is already in a register, so the
+        // pointer Select + single Load remains the right transformation.
+        let mut f = cond_load_diamond();
+        let pred = &mut f.blocks[1];
+        pred.instructions.clear();
+        pred.instructions.push(Instruction::Load {
+            dest: Value(50),
+            ptr: Value(3),
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        });
+        pred.instructions.push(Instruction::Cmp {
+            dest: Value(51),
+            op: IrCmpOp::Ne,
+            lhs: Operand::Value(Value(50)),
+            rhs: Operand::Const(IrConst::I32(0)),
+            ty: IrType::I32,
+        });
+        pred.terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(51)),
+            true_label: BlockId(2),
+            false_label: BlockId(3),
+        };
+        f.next_value_id = 60;
+        assert_eq!(sink_conditional_loads(&mut f), 1);
+    }
+
+    #[test]
+    fn cond_load_sink_kill_switch_is_transactional() {
+        if !crate::test_support::env_isolate(
+            "passes::if_convert::cond_load_sink_tests::cond_load_sink_kill_switch_is_transactional",
+        ) {
+            return;
+        }
+        use crate::test_support::EnvGuard;
+        let mut f = cond_load_diamond();
+        let before = format!("{f:?}");
+        let _guard = EnvGuard::set("CCC_NO_COND_LOAD_SINK", "1");
+        assert_eq!(sink_conditional_loads(&mut f), 0);
+        assert_eq!(format!("{f:?}"), before);
     }
 }

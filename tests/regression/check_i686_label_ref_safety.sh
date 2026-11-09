@@ -14,9 +14,18 @@ trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp"
 python3 "$root/scripts/check_asm_local_labels.py" --selftest
 
+# A real 32-bit CRT/libc/libgcc capability probe.  Header-free, so a missing
+# libc6-dev-i386 cannot be mistaken for a compiler bug.  `LCCC_SYSROOT` and
+# the staged offline i686 sysroot are honoured by the driver automatically.
+m32_link_available() {
+    printf 'int main(void){return 0;}\n' >"$tmp/probe.c"
+    "$CCC" -m32 -x c "$tmp/probe.c" -o "$tmp/probe" >/dev/null 2>&1
+}
+
 run_one() {
     local opt=$1
-    "$CCC" -m32 -O"$opt" -Wall -Wextra -Werror "$src" -o "$tmp/t"
+    # The regression is an ASSEMBLER-SHAPE invariant: label references and
+    # short-branch relays.  Assert it on every host, before any link.
     "$CCC" -m32 -O"$opt" -S "$src" -o "$tmp/t.s"
     python3 "$root/scripts/check_asm_local_labels.py" "$tmp/t.s"
     python3 - "$tmp/t.s" <<'PY'
@@ -33,6 +42,14 @@ for insn, relay in (
     if f"{relay}:" not in asm:
         sys.exit(f"missing relay {relay}")
 PY
+    # Full link+run only when the host actually has a 32-bit C runtime.
+    # When the probe PASSES but this link fails, it is a compiler defect and
+    # must still fail the gate (no blanket suppression of real errors).
+    if ! m32_link_available; then
+        echo "SKIP-RUN: -m32 -O$opt no 32-bit C runtime (assembler-shape gates passed)"
+        return
+    fi
+    "$CCC" -m32 -O"$opt" -Wall -Wextra -Werror "$src" -o "$tmp/t"
     local interp
     interp=$(readelf -l "$tmp/t" | sed -n 's/.*Requesting program interpreter: \([^]]*\)].*/\1/p')
     if [[ -n $interp && ! -e $interp ]]; then

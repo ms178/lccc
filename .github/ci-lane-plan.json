@@ -376,7 +376,7 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 534.73,
+      "predicted_gate_seconds": 535.03,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
@@ -399,6 +399,10 @@
         {
           "measured_s": 0.25,
           "name": "bash tests/regression/check_asm_goto_phi_edge.sh"
+        },
+        {
+          "measured_s": 0.3,
+          "name": "bash tests/regression/check_cond_load_sink.sh"
         },
         {
           "measured_s": 0.25,
@@ -1890,8 +1894,8 @@
   "provenance": {
     "backend-contracts": {
       "costs": "/tmp/gates.tsv",
-      "measured_seconds_total": 1064.77,
-      "source": "measured by scripts/ci_gate_costs.py; rootfs-write-policy gates measured locally (max of 3 runs); debug-acceptance-parity and asm-dialect-alternatives (4 commands) measured locally as max of 3 runs, floored at 0.25 s, +2.92 s"
+      "measured_seconds_total": 1065.07,
+      "source": "measured by scripts/ci_gate_costs.py; rootfs-write-policy gates measured locally (max of 3 runs); debug-acceptance-parity and asm-dialect-alternatives (4 commands) measured locally as max of 3 runs, floored at 0.25 s, +2.92 s; SV-03 cond-load-sink gate measured locally as max of 3 runs (0.30 s)"
     },
     "codegen": {
       "costs": "/home/user/.cache/tmp/codegen.tsv",

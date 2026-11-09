@@ -2732,6 +2732,11 @@ gate "i686-boot-asm" fast \
 
 gate "asm-goto-phi-edge" fast \
     bash tests/regression/check_asm_goto_phi_edge.sh
+# SV-03: `cond ? *p : *q` must become a pointer Select + ONE load, never a
+# speculated load.  The untaken pointer is a PROT_NONE page, so speculation
+# faults; the OFF leg is a mutation control that must stay branchy.
+gate "cond-load-sink" fast \
+    bash tests/regression/check_cond_load_sink.sh
 gate "asm-goto-outputs" fast \
     bash tests/regression/check_asm_goto_outputs.sh
 gate "i686-label-ref-safety" fast \
@@ -3051,6 +3056,13 @@ gate "range-fold-branch" fast \
 # controls in the same gate keep the sign-extended rule honest.
 gate "cmp-imm32-pattern" fast \
     bash tests/regression/check_cmp_imm32_pattern.sh
+
+# Registered as its own gate.  It used to be a dangling line directly below
+# the previous `gate` invocation: no backslash continuation, so it ran
+# unconditionally on EVERY ci_local.sh invocation (including --only), its
+# non-zero exit was never attributed to a gate, and its stderr polluted the
+# summary.  The hosted workflow already has a dedicated step for it.
+gate "scratch-save-elimination" fast \
     bash tests/regression/check_scratch_save_elimination.sh
 
 # The in-place byte-mask rewrite changes which instruction produces EFLAGS, so

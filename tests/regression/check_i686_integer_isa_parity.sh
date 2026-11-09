@@ -33,25 +33,40 @@ C
 has() { grep -qE "$2" "$1"; }
 asm() { "$CCC" -O2 "$@" -S "$tmp/t.c" -o "$tmp/out.s"; }
 
+# A real 32-bit CRT/libc/libgcc capability probe (header-free).  Every
+# assembly, veto and macro assertion in this gate still runs when the host
+# cannot link a 32-bit executable; only the two execution legs are gated.
+m32_link_available() {
+    printf 'int main(void){return 0;}\n' >"$tmp/probe.c"
+    "$CCC" -m32 "$tmp/probe.c" -o "$tmp/probe" >/dev/null 2>&1
+}
+M32_LINK_OK=1
+if ! m32_link_available; then
+    M32_LINK_OK=0
+    echo "SKIP-RUN: no 32-bit C runtime (assembly/veto/macro checks continue)"
+fi
+
 # 1. All three granted on i686: every form is used and computes correctly.
 asm -m32 -mbmi -mlzcnt -mpopcnt
 has "$tmp/out.s" 'tzcntl' || fail "-m32 -mbmi: no tzcntl"
 has "$tmp/out.s" 'lzcntl' || fail "-m32 -mlzcnt: no lzcntl"
 has "$tmp/out.s" 'popcntl' || fail "-m32 -mpopcnt: no popcntl"
-"$CCC" -O2 -m32 -mbmi -mlzcnt -mpopcnt "$tmp/t.c" -o "$tmp/on"
-# Some developer hosts can *build* an i686 ELF but cannot run it (no 32-bit
-# interpreter). Assembly, veto and macro checks continue; CI with an
-# interpreter still requires the exit code.
-interp=$(readelf -l "$tmp/on" | sed -n 's/.*Requesting program interpreter: \([^]]*\)].*/\1/p')
-if [[ -n "$interp" && ! -e "$interp" ]]; then
-    echo "SKIP-RUN: i686 binary requires missing $interp; assembly/macro checks continue"
-else
-    set +e
-    "$tmp/on"
-    st=$?
-    set -e
-    # ctz(8) + clz(1) + pop(7) == 3 + 31 + 3
-    [ "$st" -eq 37 ] || fail "runtime result $st != 37"
+if (( M32_LINK_OK )); then
+    "$CCC" -O2 -m32 -mbmi -mlzcnt -mpopcnt "$tmp/t.c" -o "$tmp/on"
+    # Some developer hosts can *build* an i686 ELF but cannot run it (no
+    # 32-bit interpreter). Assembly, veto and macro checks continue; CI with
+    # an interpreter still requires the exit code.
+    interp=$(readelf -l "$tmp/on" | sed -n 's/.*Requesting program interpreter: \([^]]*\)].*/\1/p')
+    if [[ -n "$interp" && ! -e "$interp" ]]; then
+        echo "SKIP-RUN: i686 binary requires missing $interp; assembly/macro checks continue"
+    else
+        set +e
+        "$tmp/on"
+        st=$?
+        set -e
+        # ctz(8) + clz(1) + pop(7) == 3 + 31 + 3
+        [ "$st" -eq 37 ] || fail "runtime result $st != 37"
+    fi
 fi
 
 # 2. Ownership: LZCNT alone never grants TZCNT, BMI1 alone never grants LZCNT.
@@ -109,12 +124,16 @@ int main(void)
     return 0;
 }
 EOF
-for opt in -O0 -O2; do
-    "$CCC" $opt -m32 -mbmi "$tmp/bmi.c" -o "$tmp/bmi"
-    got=$("$tmp/bmi")
-    [ "$got" = "f005a57 f0f0a5a0 f0f0a5a0 8 f 3 3 a5a 5a 20 3" ] \
-        || fail "i686 -mbmi $opt intrinsics differ from GCC 16.2: $got"
-done
+# Macro/assembler assertions for this block always run; only the executable
+# intrinsic cross-check needs the 32-bit runtime.
+if (( M32_LINK_OK )); then
+    for opt in -O0 -O2; do
+        "$CCC" $opt -m32 -mbmi "$tmp/bmi.c" -o "$tmp/bmi"
+        got=$("$tmp/bmi")
+        [ "$got" = "f005a57 f0f0a5a0 f0f0a5a0 8 f 3 3 a5a 5a 20 3" ] \
+            || fail "i686 -mbmi $opt intrinsics differ from GCC 16.2: $got"
+    done
+fi
 "$CCC" -O2 -m32 -S "$tmp/m.c" -o "$tmp/m2.s"
 has "$tmp/m2.s" 'lz_m|pc_m|bmi_m' && fail "baseline -m32 defines an integer-ISA macro"
 "$CCC" -O2 -mbmi -S "$tmp/m.c" -o "$tmp/m3.s"
