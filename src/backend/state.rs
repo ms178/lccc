@@ -1495,7 +1495,46 @@ impl CodegenState {
     /// `reg`, so eviction at the claim is exactly the point where the
     /// previous content provably died.
     pub fn vec_claim_live_reg(&mut self, v: u32, reg: &'static str) {
+        // SA-33: claiming a YMM/ZMM home means the instruction just wrote
+        // bits above 128, so the epilogue/call `vzeroupper` obligation is
+        // armed HERE, at the physical write, rather than inferred from the
+        // opcode's spelling.  `avx_load_arg_to` already uses this discipline
+        // ("so no path can forget it"); the EVEX result path did not, and
+        // `emit_simd_op`'s `format!("{:?}").contains("512")` proxy missed every
+        // digit-less variant -- vinserti32x8, vinserti64x4, vextracti32x8,
+        // vextracti64x4, vpermd/vpermq, the four vbroadcasti* forms and the
+        // maskz insert/extract family all write ymm/zmm and never armed it.
+        //
+        // Keying on the register NAME is exact, not heuristic: an xmm claim
+        // writes only the low 128 bits (VEX/EVEX zeroes above), so it must
+        // NOT arm, and a `vextracti32x4` into xmm correctly stays unarmed.
+        if reg.starts_with("ymm") || reg.starts_with("zmm") {
+            self.dirty_upper_ymm = true;
+        }
         let bank = vector_reg_bank(reg);
+        // The RESERVED SCRATCH PAIR (banks 0 and 1) is never claimable.
+        //
+        // A claim asserts a value survives in that bank until an explicit
+        // eviction. For an allocator-owned bank that holds: only the value's
+        // own producer writes it, and every writer evicts. `%xmm0/%xmm1` are
+        // different — they are the backend's universal scratch, overwritten by
+        // any 1XX/2XX emitter at any time, and
+        // `invalidate_vec_scratch_peephole` deliberately clears ONLY the
+        // *_last_store_* peepholes so allocator claims survive it. A claim on
+        // the scratch pair would therefore survive every clobber of its own
+        // bank, and `vec_arg_register_held` would then assert "already in a
+        // register" indefinitely while `avx_load_arg_to` skipped the reload —
+        // a use-after-clobber.
+        //
+        // Scratch-resident values are already described, exactly, by
+        // `vec_last_store_*` and `pending_vec_store`, which the scratch
+        // invalidation DOES clear. So the refusal here is not a lost
+        // optimisation; it is the invariant that makes scratch-only
+        // invalidation sound (`VecZero*`/`VecBroadcast*` rely on it).
+        if bank < 2 {
+            self.vec_live_regs.remove(&v);
+            return;
+        }
         self.vec_live_regs
             .retain(|&other, &mut r| vector_reg_bank(r) != bank || other == v);
         self.vec_live_regs.insert(v, reg);
@@ -1524,6 +1563,108 @@ impl CodegenState {
         let bank = vector_reg_bank(reg);
         self.vec_live_regs
             .retain(|&other, &mut r| vector_reg_bank(r) != bank || other == keep);
+    }
+
+    /// `vec_live_regs` lookup with the operand-WIDTH contract enforced.
+    ///
+    /// A claim records only the register NAME, so a value homed in a 128-bit
+    /// (`xmm`) register and a value claimed as 256 bits word the identical map
+    /// entry. A 256-bit consumer naming an `%xmmN` operand is then rejected by
+    /// the internal assembler (correctly), and — worse — reading it through the
+    /// narrower view silently truncates the upper lane. Every 256-bit reader
+    /// therefore asks here: a claim that cannot supply a `%ymm` name is
+    /// reported ABSENT and the caller reloads from the slot, which is always a
+    /// correct conservative answer. `zmm` is deliberately excluded (an EVEX
+    /// register name is illegal in a VEX.256 operand), and the reserved
+    /// scratch pair is covered by the `ymm` prefix like any other bank.
+    ///
+    /// The vec-register state itself is a value property: lowering, stack
+    /// layout and register allocation all decide it BEFORE codegen, so a stale
+    /// claim can only ever cost a redundant reload. This is therefore a pure
+    /// widening guard and not a `vector_values`-keyed probe — consulting that
+    /// set from an `&self` reader was a `&mut self` borrow conflict at every
+    /// call site, and the two are consistent here by construction.
+    pub fn vec_live_ymm(&self, v: u32) -> Option<&'static str> {
+        self.vec_live_regs
+            .get(&v)
+            .copied()
+            .filter(|reg| reg.starts_with("ymm"))
+    }
+
+    /// The 128-bit twin of [`Self::vec_live_ymm`]: a claim may only feed a
+    /// legacy SSE / VEX.128 operand when it names an `%xmm` register. The
+    /// 256-bit emitters book `%ymm`-named entries in the same map, and
+    /// splicing one into `addps %src, %dst` is an illegal mixed-width
+    /// encoding; a claim that cannot supply `%xmm` is reported absent so the
+    /// caller reloads from the slot.
+    pub fn vec_live_xmm(&self, v: u32) -> Option<&'static str> {
+        self.vec_live_regs
+            .get(&v)
+            .copied()
+            .filter(|reg| reg.starts_with("xmm"))
+    }
+
+    /// Is `v` provably sitting in the STAGING register (`%ymm0` / `%xmm0`)
+    /// right now, so a consumer may read that register instead of reloading
+    /// the value's slot?
+    ///
+    /// Two records describe that register, and neither is sufficient alone:
+    ///
+    /// * `pending_vec_store` — a DEFERRED result. It names the register the
+    ///   value really sits in (`ymm0` or `ymm1`) and survives intervening
+    ///   loads; it is the ONLY record of a value that a load-elision
+    ///   (`pending_vec_memfold`) or a deferred `VecLoad*` left in the
+    ///   register without any store ever being issued.
+    /// * `*_last_store_*` — the register the last store moved FROM. It says
+    ///   which VALUE was stored but not, on its own, which register the
+    ///   consumer is about to read: a record naming an allocator bank
+    ///   (`%xmm3`, a `pblendvb` result) does not license reading `%xmm0`.
+    ///   The register name must therefore be compared, not assumed.
+    ///
+    /// Returns false when neither record proves it; the caller then reloads
+    /// from the slot, which is always correct (a wasted load, never a wrong
+    /// read).
+    pub fn vec_holds_staging_reg(&self, v: u32, wide: bool) -> bool {
+        let (reg, last_used, last_val, last_name) = if wide {
+            (
+                "ymm0",
+                self.vec_last_store_reg,
+                self.vec_last_store_val,
+                self.vec_last_store_reg_name,
+            )
+        } else {
+            (
+                "xmm0",
+                self.sse_last_store_reg,
+                self.sse_last_store_val,
+                self.sse_last_store_reg_name,
+            )
+        };
+        if last_used && last_val == Some(v) && last_name == Some(reg) {
+            return true;
+        }
+        matches!(
+            self.pending_vec_store,
+            Some((p, pending_reg, pending_wide)) if p == v && pending_wide == wide && pending_reg == reg
+        )
+    }
+
+    /// Retire a value's DEFERRED result store now that a consumer has taken it
+    /// from its register.
+    ///
+    /// `pending_vec_store` must never outlive the register it names: if a
+    /// later flush fires it reinterprets that register name as a byte
+    /// displacement and emits `vmovdqu %ymm0, 0ymm0(%rbp)` (an assembler
+    /// error at best, silently mismeasured addressing at worst), and if the
+    /// bank is reused in between it spills the OTHER value's contents over
+    /// this one's home. Every emitter that consumes an operand out of a
+    /// register therefore goes through here; idempotent and value-exact, so
+    /// `pending_vec_store` for an unrelated value is untouched (the deferral
+    /// would otherwise collapse into "always flush").
+    pub fn vec_consume(&mut self, v: u32) {
+        if self.pending_vec_store.map(|(p, _, _)| p) == Some(v) {
+            self.pending_vec_store = None;
+        }
     }
 
     /// Get the over-alignment requirement for an alloca (> 16 bytes), or None.

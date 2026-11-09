@@ -67,6 +67,10 @@ export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 export PATH="$CARGO_HOME/bin:$PATH"
 export CARGO_BUILD_JOBS=2
+# Research policy: the fastbuild wrapper must not silently drop to one job on
+# this low-RAM host. ensure_swap.sh installs the OOM backstop; the explicit
+# override keeps the requested two-job REACT cycle.
+export LCCC_BUILD_JOBS=2
 # Same fingerprints for build, normal unit tests and clippy. Debug assertions
 # have their own target directory and explicitly disable incremental state.
 export CARGO_PROFILE_FASTBUILD_DEBUG="${CARGO_PROFILE_FASTBUILD_DEBUG:-0}"
@@ -300,6 +304,8 @@ gate "frontend-ternary-common-type" fast \
     env CCC="$LCCC" bash tests/regression/check_frontend_ternary_common_type.sh
 gate "frontend-preprocessor-rules" fast \
     env CCC="$LCCC" bash tests/regression/check_frontend_preprocessor_rules.sh
+gate "feature-capabilities" fast \
+    env CCC="$LCCC" bash tests/regression/check_feature_capabilities.sh
 gate "frontend-duplicate-definition" fast \
     env CCC="$LCCC" bash tests/regression/check_frontend_duplicate_definition.sh
 gate "frontend-differential-family" fast \
@@ -668,6 +674,12 @@ gate "peephole-alloc-before-filter" fast \
 
 gate "peephole-alloc-before-filter-contracts" fast \
     python3 tests/regression/test_check_peephole_alloc_before_filter.py
+
+gate "simd-commutativity-agreement" fast \
+    python3 tests/regression/check_simd_commutativity_agreement.py
+
+gate "simd-commutativity-agreement-contracts" fast \
+    python3 tests/regression/test_check_simd_commutativity_agreement.py
 
 gate "benchmark-ranking-contracts" fast \
     python3 -m unittest discover -s scripts -p test_bench_rank.py
@@ -1894,6 +1906,15 @@ gate "seg-conversion-parity" fast \
 
 gate "chroot-bind" fast bash tests/regression/check_chroot_bind.sh
 
+# A vector stored to an over-aligned frame home and read straight back must
+# become a register copy: the reload puts a store-forwarding stall on the
+# loop-carried chain (measured -36.8% on vector_home_call_loop.c).
+gate "aligned-vector-reload" fast \
+    python3 tests/simd/check_aligned_vector_reload.py --lccc target/fastbuild/lccc
+
+gate "aligned-vector-reload-contracts" fast \
+    python3 tests/simd/test_check_aligned_vector_reload.py
+
 gate "kernel-tree-clear" fast bash tests/regression/check_kernel_tree_clear.sh
 # The shared mount-table helper and the chroot/kernel-tree root guards.
 gate "destructive-path-guards" fast bash tests/regression/check_destructive_guards.sh
@@ -2726,6 +2747,11 @@ gate "i686-boot-asm" fast \
 
 gate "asm-goto-phi-edge" fast \
     bash tests/regression/check_asm_goto_phi_edge.sh
+# SV-03: `cond ? *p : *q` must become a pointer Select + ONE load, never a
+# speculated load.  The untaken pointer is a PROT_NONE page, so speculation
+# faults; the OFF leg is a mutation control that must stay branchy.
+gate "cond-load-sink" fast \
+    bash tests/regression/check_cond_load_sink.sh
 gate "asm-goto-outputs" fast \
     bash tests/regression/check_asm_goto_outputs.sh
 gate "i686-label-ref-safety" fast \
@@ -3045,6 +3071,13 @@ gate "range-fold-branch" fast \
 # controls in the same gate keep the sign-extended rule honest.
 gate "cmp-imm32-pattern" fast \
     bash tests/regression/check_cmp_imm32_pattern.sh
+
+# Registered as its own gate.  It used to be a dangling line directly below
+# the previous `gate` invocation: no backslash continuation, so it ran
+# unconditionally on EVERY ci_local.sh invocation (including --only), its
+# non-zero exit was never attributed to a gate, and its stderr polluted the
+# summary.  The hosted workflow already has a dedicated step for it.
+gate "scratch-save-elimination" fast \
     bash tests/regression/check_scratch_save_elimination.sh
 
 # The in-place byte-mask rewrite changes which instruction produces EFLAGS, so

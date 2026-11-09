@@ -2,7 +2,7 @@
 //! the ordinary SLP graph builder, scheduler, external-use and alias proofs.
 use super::*;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct Tail {
     pub alpha: usize,
     pub four_inputs: bool,
@@ -617,7 +617,15 @@ mod tests {
                     source_spans: vec![],
                     source_inline_ids: Vec::new(),
                 };
+                // Mirror the real pipeline: this fixture's ParamRef makes
+                // Value(1) a parameter root, so the object-identity map is
+                // populated exactly as SymbolRoots::build would populate it.
+                // removed_stores_preserve_loads does not consult `roots`, but
+                // a default-constructed map here would hide a future use.
+                let mut roots = SymbolRoots::default();
+                roots.params.insert(ptr.0, 0);
                 let ctx = BlockCtx {
+                    roots: &roots,
                     block: &block,
                     def_pos: block
                         .instructions

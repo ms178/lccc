@@ -52,6 +52,22 @@ class RunnerContract(unittest.TestCase):
     def result(case, **kwargs):
         return torture.Result(case.source.name, case.opt_flags, [], "pass", "complete", 0, 0.01)
 
+    def test_bounded_details_keep_primary_error_and_harness_tail(self):
+        proc = subprocess.CompletedProcess([], 1, b"stdout\n",
+            b"file.c:1: error: primary diagnostic\n" + b"x" * 10000 + b"\nHARNESS timeout")
+        detail = torture.detail_of(proc)
+        self.assertLessEqual(len(detail), 6000)
+        self.assertIn("error: primary diagnostic", detail)
+        self.assertIn("HARNESS timeout", detail)
+        self.assertIn("[diagnostic truncated]", detail)
+        self.assertEqual(torture.detail_of(proc, 0), "")
+        self.assertEqual(len(torture.detail_of(proc, 5)), 5)
+        short = subprocess.CompletedProcess([], 1, b"out", b"err")
+        self.assertEqual(torture.detail_of(short), "outerr")
+        stdout_only = subprocess.CompletedProcess([], 1, b"prefix" + b"x" * 10000 + b"suffix", b"")
+        self.assertTrue(torture.detail_of(stdout_only).startswith("prefix"))
+        self.assertTrue(torture.detail_of(stdout_only).endswith("suffix"))
+
     def test_missing_gcc_is_fatal_not_green_skips(self):
         self.assertEqual(self.invoke(["--gcc=/does/not/exist/gcc"]), 2)
         report = json.loads(self.report.read_text())
@@ -358,6 +374,63 @@ class RunnerContract(unittest.TestCase):
         with mock.patch.object(torture, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")):
             drift = torture.identity_drift(args, [self.source], identity, self.suite, False)
         self.assertIn("dependency_digest", drift)
+
+    def test_identity_preflight_fault_is_incomplete_infrastructure_failure(self):
+        with mock.patch.object(torture, "run_identity", side_effect=OSError("unreadable oracle")):
+            self.assertEqual(self.invoke(), 2)
+        report = json.loads(self.report.read_text())
+        self.assertFalse(report["complete"])
+        self.assertIn("identity/reference preflight fault", report["fatal"])
+        self.assertIn("unreadable oracle", report["fatal"])
+        self.assertEqual(report["completed_cases"], 0)
+
+    def test_disappearing_source_during_run_is_infrastructure_failure(self):
+        def remove_source(case, **kwargs):
+            case.source.unlink()
+            return self.result(case)
+        with mock.patch.object(torture, "reference_preflight", return_value=None), \
+             mock.patch.object(torture, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")), \
+             mock.patch.object(torture, "compile_case", side_effect=remove_source):
+            self.assertEqual(self.invoke(["--gcc", sys.executable]), 2)
+        report = json.loads(self.report.read_text())
+        self.assertFalse(report["complete"])
+        self.assertIn("cannot verify run identity after execution", report["fatal"])
+        self.assertIn("FileNotFoundError", report["fatal"])
+        self.assertEqual(report["completed_cases"], 1)
+
+    def test_mid_run_top_level_source_change_invalidates_report(self):
+        # The selected source digest is nested inside selection, not a
+        # top-level report key. A header-free source exposes a comparison that
+        # accidentally looks at a missing top-level field on both sides.
+        def mutate(case, **kwargs):
+            case.source.write_text("int f(void) { return 1; }\n")
+            return self.result(case)
+
+        with mock.patch.object(torture, "reference_preflight", return_value=None), \
+             mock.patch.object(torture, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")), \
+             mock.patch.object(torture, "compile_case", side_effect=mutate):
+            self.assertEqual(self.invoke(["--gcc", sys.executable]), 2)
+        report = json.loads(self.report.read_text())
+        self.assertIn("run inputs changed mid-flight", report["fatal"])
+        self.assertIn("selection", report["fatal"])
+
+    def test_mid_run_harness_dependency_change_invalidates_report(self):
+        with mock.patch.object(torture, "reference_preflight", return_value=None), \
+             mock.patch.object(torture, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")), \
+             mock.patch.object(torture, "compile_case", side_effect=self.result), \
+             mock.patch.object(torture, "harness_dependency_digest", side_effect=["a" * 64, "b" * 64]):
+            self.assertEqual(self.invoke(["--gcc", sys.executable]), 2)
+        report = json.loads(self.report.read_text())
+        self.assertIn("harness_dependency_sha256", report["fatal"])
+
+    def test_search_environment_fingerprint_is_sensitive_and_private(self):
+        with mock.patch.dict("os.environ", {"CPATH": "/secret/path-one"}):
+            a = torture.oracle_environment_digest()
+        with mock.patch.dict("os.environ", {"CPATH": "/secret/path-two"}):
+            b = torture.oracle_environment_digest()
+        self.assertNotEqual(a, b)
+        self.assertEqual(len(a), 64)
+        self.assertNotIn("secret", a)
 
     @staticmethod
     def good(results, **extra):

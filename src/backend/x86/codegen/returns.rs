@@ -29,7 +29,7 @@ impl X86Codegen {
             // argument is the exception: vzeroupper would destroy the value
             // being handed over. Such a callee uses the AVX ABI and owns the
             // eventual cleanup before it returns to our caller.
-            if self.state.dirty_upper_ymm && !preserve_upper_vector_lanes {
+            if self.isa.avx && self.state.dirty_upper_ymm && !preserve_upper_vector_lanes {
                 self.state.emit("    vzeroupper");
             }
             self.emit_epilogue_impl(frame_size);

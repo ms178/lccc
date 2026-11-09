@@ -1,0 +1,229 @@
+{
+  "comparison": {
+    "append": "",
+    "arch": "x86_64",
+    "case_set_sha256": "778310b94ef16e273770f39c2d2074c3063645ba23eb818f9e9db98eb0a84aea",
+    "compile_timeout": 180.0,
+    "corpus": "c94b688a83fc84015c6fab8ab0ff142051598fc8",
+    "corpus_stamp_sha256": "1d4793530187d3aeb9414596c478a53f74f9d8ed823872c04227a0c168bf61d9",
+    "dependency_digest": "071a13826a907b4ac72668f12f28095d73ab8b4e236e60ab3b6d13632bf30a87",
+    "environment": {
+      "LCCC_CI_APT_ARCHIVE_DIR": "/home/runner/.cache/lccc-apt"
+    },
+    "expected_cases": 2016,
+    "expensive": false,
+    "flags": [
+      "-O2"
+    ],
+    "harness_dependency_sha256": "8f48f763e9f49ab9c84fbb2eff774aa24c037e3a4f93d13bd34687b08b5b7ffd",
+    "host": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
+    "host_image": {
+      "os": "ubuntu24",
+      "version": "20261101.360.1"
+    },
+    "jobs": 2,
+    "link_mode": "lccc-ld",
+    "mode": "compile",
+    "oracle_environment_sha256": "96367560ae966618a22eed17b9d6241ae541f145967f37d1ca566eb034303ff1",
+    "oracle_sha256": "67ed99639f746b8e83e4e685a7189ae1172fb9c23a3e83aa9b09a1d68f3fb1c2",
+    "run_timeout": 10.0,
+    "runner": "",
+    "runner_sha256": "a5e35a5ac7cad2cdd05e6514fd13bd4a8d2c677cb090eb5261f41d56ade9bd59",
+    "selection": {
+      "dependency_digest_truncated": false,
+      "dependency_files": 11,
+      "filter": "",
+      "from_list": null,
+      "selected_sources_sha256": "bc69e52dd1a45c535ce79630792317fbdbe909a6b62ec8fafa1caba2fa02a844",
+      "sources": 2016,
+      "tests": []
+    }
+  },
+  "counts": {
+    "compile-fail": 6,
+    "pass": 1994,
+    "reference-compile-skip": 15,
+    "unsupported": 1
+  },
+  "outcomes": [
+    [
+      "20030305-1.c",
+      "-O2",
+      "reference-compile-skip",
+      "reference-compile",
+      1,
+      "40f083f26157ffedfc7d8b77b9c2fdd2ba341043afddd1b326b73387c80979b7"
+    ],
+    [
+      "20111209-1.c",
+      "-O2",
+      "reference-compile-skip",
+      "reference-compile",
+      1,
+      "e4b4158ad37e42e04e239374d9b19a8bc304648b60bf30a07156f65c10ee0459"
+    ],
+    [
+      "920520-1.c",
+      "-O2",
+      "reference-compile-skip",
+      "reference-compile",
+      1,
+      "25872f2b414825e1391663598426644f66c0d9c55a837f287fe08b44bf82657f"
+    ],
+    [
+      "920521-1.c",
+      "-O2",
+      "reference-compile-skip",
+      "reference-compile",
+      1,
+      "012e147676201b94cc0a56a80dabc631f5cb882bc15fdeef9670448976e3b5de"
+    ],
+    [
+      "dll.c",
+      "-O2",
+      "reference-compile-skip",
+      "reference-compile",
+      1,
+      "94295e8540fb2060f52c6f07755d83866a3899b4c9a91ec5fdc877d2866f8ddd"
+    ],
+    [
+      "limits-caselabels.c",
+      "-O2",
+      "compile-fail",
+      "lccc-compile",
+      1,
+      "e983572fb4ec125e7729eba94f8b4ef7c854a3b7736ea648d916c35563eb3679"
+    ],
+    [
+      "limits-exprparen.c",
+      "-O2",
+      "compile-fail",
+      "lccc-compile",
+      1,
+      "f0caeaa1a3fa9537a1b4edbfd248d04e820e1d6f56cd2ef8d1e29be7580bd5e5"
+    ],
+    [
+      "limits-fnargs.c",
+      "-O2",
+      "unsupported",
+      "run_expensive_tests",
+      0,
+      "309310a5490a69f1087ea6b8486df85a7ec8f7fe9ceb6bf243bc660cb4f95f7e"
+    ],
+    [
+      "limits-structnest.c",
+      "-O2",
+      "compile-fail",
+      "lccc-compile",
+      1,
+      "7a2608a3dcc73c195f722360c9305a4eab63046f0cfe1809c4407d5eb2c70db6"
+    ],
+    [
+      "mipscop-1.c",
+      "-O2",
+      "reference-compile-skip",
+      "reference-compile",
+      1,
+      "927bcb0fd948de4ba3c2d46bb30e9f78cada0a673f935713c7f0d7125d34e04a"
+    ],
+    [
+      "mipscop-2.c",
+      "-O2",
+      "reference-compile-skip",
+      "reference-compile",
+      1,
+      "69d557e23d641dd970991744a5c29e97ed14d3116feefaa7e8ea5ee5a6db5984"
+    ],
+    [
+      "mipscop-3.c",
+      "-O2",
+      "reference-compile-skip",
+      "reference-compile",
+      1,
+      "ea772c21eb7f52ffd80405d18adc08bc87dac0d0fbb4b87021f5a311dd5764fb"
+    ],
+    [
+      "mipscop-4.c",
+      "-O2",
+      "reference-compile-skip",
+      "reference-compile",
+      1,
+      "6bff34248047140ccdbb70a26d2a5d48fc5c10c2f6d8aa0fcf6971437c1a9adb"
+    ],
+    [
+      "pr115143-2.c",
+      "-O2",
+      "compile-fail",
+      "lccc-compile",
+      1,
+      "b44c233d1dd912139d1a103a58bf18bd82a4550ed0e68314e779479bd666d72c"
+    ],
+    [
+      "pr115143-3.c",
+      "-O2",
+      "compile-fail",
+      "lccc-compile",
+      1,
+      "829f5ac3187480543fe19e257919e5b0bd122d2abaf4e13ab4d4cd72349921e2"
+    ],
+    [
+      "pr28865.c",
+      "-O2",
+      "reference-compile-skip",
+      "reference-compile",
+      1,
+      "0ad83098a0bae3b22961cd044f80a821af676dee2a86b5622f369ce061c7a1f8"
+    ],
+    [
+      "pr29201.c",
+      "-O2",
+      "reference-compile-skip",
+      "reference-compile",
+      1,
+      "3ef1d893136f2fe428ae4b86cccd5031f8cb1d3912ad9f0470b562fbda340dfc"
+    ],
+    [
+      "pr48767.c",
+      "-O2",
+      "reference-compile-skip",
+      "reference-compile",
+      1,
+      "1e55b4fe92e5c89903979ee67ab57a4d7c85f5b9fcaf335fc1350f09d7c00804"
+    ],
+    [
+      "pr67106.c",
+      "-O2",
+      "compile-fail",
+      "lccc-compile",
+      1,
+      "d0276f0d082979cc0a0e9aec4b1602bacc428d91a26882f346209f4e9262005f"
+    ],
+    [
+      "pr83547.c",
+      "-O2",
+      "reference-compile-skip",
+      "reference-compile",
+      1,
+      "fa2cafc06af01ee58a936c48c3bc8cd40f1aa79d204e57f0064b42865c4c9c6c"
+    ],
+    [
+      "pr86637-2.c",
+      "-O2",
+      "reference-compile-skip",
+      "reference-compile",
+      1,
+      "b72579d6e70e50fbcb5811a7503978ffb1119c5766a2655fe08437404f4ac7e6"
+    ],
+    [
+      "pr88347.c",
+      "-O2",
+      "reference-compile-skip",
+      "reference-compile",
+      1,
+      "734fcf68fc286727bef4e53c29c7fdb04b9be9b75c8ef89e4c7e32c440a96ff5"
+    ]
+  ],
+  "schema": 1,
+  "source_head": "47135d2db1e93a6b0e28ce81b1076e0a832792e2",
+  "source_run": 42535980102
+}

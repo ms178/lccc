@@ -93,6 +93,9 @@ impl X86Codegen {
             // Integer/FP add and mul (wrapping/IEEE lane arithmetic).
             "paddb" | "paddw" | "paddd" | "paddq"
                 | "pmullw" | "pmulld"
+                // Two SIGNED word streams: products commute (SA-36).  NOT
+                // `pmaddubsw`, whose sources differ in signedness.
+                | "pmaddwd"
                 | "addps" | "addpd" | "mulps" | "mulpd"
                 // Bitwise (integer and FP domains alike — pure lane XOR).
                 | "pand" | "por" | "pxor" | "xorps" | "xorpd"
@@ -252,8 +255,10 @@ impl X86Codegen {
                     return;
                 }
             }
-            // CCC_ENABLE_VECREG: value provably in its allocated XMM register.
-            if let Some(&held) = self.state.vec_live_regs.get(&v.0) {
+            // CCC_ENABLE_VECREG: value provably in an XMM register. The
+            // claim must name `%xmm` (the 256-bit emitters book `%ymm`
+            // entries here); anything else falls through to the slot load.
+            if let Some(held) = self.state.vec_live_xmm(v.0) {
                 if held != xmm {
                     self.state.emit_fmt(format_args!(
                         "    {} %{}, %{}",
@@ -1554,8 +1559,21 @@ impl X86Codegen {
                     return;
                 }
             }
+            // A claim at the WRONG width (an `%xmm` name feeding a 256-bit
+            // operand) can only be malformed IR — every producer of a
+            // 256-bit value claims the `%ymm` view. Falling through to the
+            // slot load below is the only remaining home, so surface the
+            // contradiction in assertion builds instead of silently reading
+            // a slot the claim says may be stale.
+            debug_assert!(
+                !self.state.vec_live_regs.contains_key(&v.0)
+                    || self.state.vec_live_ymm(v.0).is_some(),
+                "256-bit operand %{} is claimed as {:?}, not a %%ymm register",
+                v.0,
+                self.state.vec_live_regs.get(&v.0)
+            );
             // Value proven live in a YMM register within this block.
-            if let Some(&held) = self.state.vec_live_regs.get(&v.0) {
+            if let Some(held) = self.state.vec_live_ymm(v.0) {
                 if held != ymm {
                     self.state
                         .emit_fmt(format_args!("    vmovdqa %{}, %{}", held, ymm));
@@ -1926,7 +1944,7 @@ impl X86Codegen {
                 return true;
             }
         }
-        if let Some(&held) = self.state.vec_live_regs.get(&v.0) {
+        if let Some(held) = self.state.vec_live_ymm(v.0) {
             if half == 1 {
                 self.state
                     .emit_fmt(format_args!("    vextracti128 $1, %{}, %xmm1", held));
@@ -2015,12 +2033,31 @@ impl X86Codegen {
         if let Some(addr) = self.state.resolve_slot_addr(dest_ptr.0) {
             if let SlotAddr::Direct(slot) = addr {
                 if !deferred {
-                    self.state.emit_fmt(format_args!(
-                        "    vmovdqu %{}, {}",
-                        src,
-                        self.slot_ref(slot.0)
-                    ));
+                    // VEC-KEEP-SLOT: home the result in its own stack slot AND
+                    // record the register claim, so the two records can never
+                    // disagree about the same value. The slot is then valid for
+                    // every consumer this emitter cannot see (block copy, copy
+                    // coalescing, scalar and narrow reads) while vector operands
+                    // still read the register; the alternative — claim without
+                    // the store — is exactly the stale-slot miscompile class
+                    // this path used to have.
+                    //
+                    // The mnemonic stays `vmovdqu`: it imposes no alignment
+                    // requirement, so it is legal for an unaligned frame slot
+                    // exactly as `vmovups` would be, and the register-resident
+                    // reduction contract pins this spelling (`vmovdqu %ymm0,
+                    // disp(%rsp/%rbp)` in `CCC_NO_REDUCTION_VECREG`'s
+                    // spill-backed control). `slot_ref` is the same resolver
+                    // every sibling slot store in this file uses and it goes
+                    // through `slot_operand_parts`, so a frame too large for an
+                    // imm32 `%rbp` displacement is still addressed correctly.
+                    let slot_ref = self.slot_ref(slot.0);
+                    self.state
+                        .emit_fmt(format_args!("    vmovdqu %{}, {}", src, slot_ref));
+                    self.state.vec_claim_live_reg(dest_ptr.0, src);
                 } else {
+                    // Deferred: the register holds the value and the SLOT IS
+                    // NOT written. Claiming here would let a fold read it.
                     self.state.pending_vec_store = Some((dest_ptr.0, src, true));
                 }
                 self.state.vec_last_store_slot = Some(slot.0);
@@ -2043,14 +2080,23 @@ impl X86Codegen {
     }
 
     /// Memory operand for a vector arg, or `None` when the value is provably
-    /// still in a register (`vec_live_regs`, or the `vec_last_store_*` /
-    /// `sse_last_store_*` peepholes) so the caller routes through the register
+    /// still in a register so the caller must route through the register
     /// cache instead of reading a slot that the deferred-store optimization
     /// may have left stale.
     ///
-    /// A still-pending deferred store (`pending_vec_store`) is NOT in that set:
-    /// it is committed here and the fold still happens, because the slot is
-    /// then valid and the memory operand remains the cheaper form.
+    /// THREE independent records say "in a register", and this helper must
+    /// consult all of them: a `vec_live_regs` claim (block-local), and the
+    /// `vec_last_store_*` / `sse_last_store_*` peepholes. A `SlotAddr::Direct`
+    /// home is NOT proof of the opposite: a value homed in a register has its
+    /// slot written at most once — the 256-bit homing path is entitled to
+    /// defer that store or skip it entirely (VLFOLD, `vector_defer_values`),
+    /// and a block-local claim means no reload happened since. Folding such a
+    /// value reads bytes the compiler never wrote, so the register records
+    /// gate the fold FIRST and the slot validity only orders the answer.
+    ///
+    /// A still-pending deferred store (`pending_vec_store`) is NOT in that
+    /// set: it is committed here and the fold still happens, because the slot
+    /// is then valid and the memory operand remains the cheaper form.
     fn vec_arg_mem(&mut self, arg: &Operand) -> Option<String> {
         // A VLFOLD-elided value's SOURCE operand is its only materialisation;
         // its home slot was never written, so hand back the recorded source
@@ -2062,28 +2108,20 @@ impl X86Codegen {
         }
         match arg {
             Operand::Value(v) => {
-                if self.state.vec_live_regs.contains_key(&v.0)
-                    || (self.state.vec_last_store_reg && self.state.vec_last_store_val == Some(v.0))
-                    || (self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0))
-                {
+                if self.vec_arg_register_held(v.0) {
                     return None;
                 }
                 // LAZY-FLUSH SOUNDNESS, the `evex_arg_mem` discipline applied
-                // here. The three tests above cover a value held in a register
-                // that the state itself tracks. A deferred store is a fourth
-                // way for the slot to be stale, and it is tracked in a
-                // separate field that those tests never consult: a pending
-                // store means the register is written and the SLOT IS NOT.
-                // `vec_last_store_reg` can be cleared afterwards by an
-                // unrelated load (`avx_load_arg_to` does exactly that on
-                // paths whose flush is register-keyed and so may not name
-                // this value), which would leave the pending store as the
-                // only record that the slot is unwritten. Fold it here and
-                // the consumer reads memory that was never stored.
-                //
-                // Commit first rather than refusing the fold: the slot is
-                // then valid and the memory operand is still the cheaper
-                // form, exactly the trade `evex_arg_mem` measured.
+                // here. A deferred store is a further way for the slot to be
+                // stale; it is tracked in a field the register records above
+                // never consult. `vec_last_store_reg` can be cleared
+                // afterwards by an unrelated load (`avx_load_arg_to` does
+                // exactly that on paths whose flush is register-keyed and so
+                // may not name this value), which would leave the pending
+                // store as the only record that the slot is unwritten. Commit
+                // first rather than refusing the fold: the slot is then valid
+                // and the memory operand is still the cheaper form, exactly
+                // the trade `evex_arg_mem` measured.
                 if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
                     self.flush_pending_vec_store_impl();
                 }
@@ -2091,6 +2129,23 @@ impl X86Codegen {
             }
             _ => None,
         }
+    }
+
+    /// Is `v` provably in a vector register right now, so that no consumer may
+    /// read its home slot?  The single predicate behind every fold decision at
+    /// the vector operand boundary.
+    ///
+    /// WIDTH-AGNOSTIC on purpose: ANY claim means the value's home slot may be
+    /// unwritten (`sse_store_dest` and the 256-bit register-home path both skip
+    /// the slot store entirely when the value has a register home), so a fold
+    /// must be refused no matter which width the claim spells. The width
+    /// filters live in [`CodegenState::vec_live_ymm`] / `vec_live_xmm`, which
+    /// only ever decide how to SPELL an operand — never whether the slot holds
+    /// the value.
+    fn vec_arg_register_held(&self, v: u32) -> bool {
+        self.state.vec_live_regs.contains_key(&v)
+            || (self.state.vec_last_store_reg && self.state.vec_last_store_val == Some(v))
+            || (self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v))
     }
 
     /// Extract the 16 payload bytes from any _Float128 constant form
@@ -2112,7 +2167,7 @@ impl X86Codegen {
                 self.state.out.emit_instr_rbp_reg("    movdqu", slot.0, xmm);
                 return;
             }
-            if let Some(&held) = self.state.vec_live_regs.get(&v.0) {
+            if let Some(held) = self.state.vec_live_xmm(v.0) {
                 if held != xmm {
                     self.state
                         .emit_fmt(format_args!("    movdqa %{}, %{}", held, xmm));
@@ -2189,7 +2244,7 @@ impl X86Codegen {
 
     /// Copy a register-held 16-byte value to (%rsp)+off via %xmm0.
     fn emit_store_f128_xmm0_dest_to_rsp(&mut self, v: &Value, off: i64) {
-        if let Some(&held) = self.state.vec_live_regs.get(&v.0) {
+        if let Some(held) = self.state.vec_live_xmm(v.0) {
             self.state
                 .emit_fmt(format_args!("    movdqa %{}, %xmm0", held));
         } else if let Some(&reg) = self.reg_assignments.get(&v.0) {
@@ -2385,8 +2440,36 @@ impl X86Codegen {
                     return phys_reg_name_256(reg);
                 }
             }
-            if let Some(&held) = self.state.vec_live_regs.get(&v.0) {
+            if let Some(held) = self.state.vec_live_ymm(v.0) {
                 return held;
+            }
+        }
+        // WHICH register? `%ymm0` only when a record proves this value is
+        // there. A scratch-only claim is unrepresentable (banks 0/1 are
+        // unclaimable), so two exact records remain:
+        //
+        // * `pending_vec_store` names the register a DEFERRED value actually
+        //   sits in (`ymm0` or `ymm1`) and is the only record that survives an
+        //   intervening load — the `*_last_store_*` peephole is cleared by
+        //   those. A `wide` entry is a full 256-bit value; a narrow one cannot
+        //   feed a 256-bit store at all, so it declines to the canonical path
+        //   (which flushes the deferral before reloading the slot).
+        // * `vec_last_store_*` names the register the last store moved FROM.
+        //   Only a reserved-scratch name is trusted directly; for an
+        //   allocator-owned bank the store must go straight from that bank
+        //   (see `VecStoreF32x8`), which the claim check in
+        //   [`CodegenState::vec_holds_staging_reg`] is what licenses.
+        if let Operand::Value(v) = arg {
+            if let Some((p, reg, wide)) = self.state.pending_vec_store {
+                if p == v.0 {
+                    return if wide { reg } else { "ymm0" };
+                }
+            }
+            if self.state.vec_last_store_reg
+                && self.state.vec_last_store_val == Some(v.0)
+                && let Some(name @ ("ymm0" | "ymm1")) = self.state.vec_last_store_reg_name
+            {
+                return name;
             }
         }
         "ymm0"
@@ -2400,8 +2483,22 @@ impl X86Codegen {
                     return phys_reg_name(reg);
                 }
             }
-            if let Some(&held) = self.state.vec_live_regs.get(&v.0) {
+            if let Some(held) = self.state.vec_live_xmm(v.0) {
                 return held;
+            }
+            // Same scratch-identity rule as the 256-bit twin: only a reserved
+            // scratch name is exact on its own; an allocator-owned bank is
+            // only reachable as `src` through the store's Direct-slot arm.
+            if let Some((p, reg, wide)) = self.state.pending_vec_store {
+                if p == v.0 {
+                    return if wide { "xmm0" } else { reg };
+                }
+            }
+            if self.state.sse_last_store_reg
+                && self.state.sse_last_store_val == Some(v.0)
+                && let Some(name @ ("xmm0" | "xmm1")) = self.state.sse_last_store_reg_name
+            {
+                return name;
             }
         }
         "xmm0"
@@ -3337,7 +3434,7 @@ impl X86Codegen {
                         self.state.emit_fmt(format_args!("    movq {}, %xmm0", mem));
                         loaded = true;
                     } else if let Operand::Value(v) = &args[0] {
-                        if let Some(&held) = self.state.vec_live_regs.get(&v.0) {
+                        if let Some(held) = self.state.vec_live_xmm(v.0) {
                             if held != "xmm0" {
                                 self.state
                                     .emit_fmt(format_args!("    movq %{}, %xmm0", held));
@@ -5510,12 +5607,21 @@ impl X86Codegen {
                             self.state.pending_vec_store = None;
                         }
                     }
-                    self.state.invalidate_vec_peephole();
+                    // Scratch-only, same reasoning as the canonical path
+                    // below: this stores to memory from a register the value
+                    // already occupies, so no allocator claim is disturbed.
+                    self.state.invalidate_vec_scratch_peephole();
                     self.emit_vec_store_addr(args, dest_ptr, "movdqu", src);
                     return;
                 }
+                // Is the source in `%xmm0` ITSELF? Both records must name that
+                // register, not merely the same value: `last_store_val` alone
+                // survives the eviction of an allocator bank, and this arm
+                // stores the hard-coded `%xmm0`. A DEFERRED value sits in
+                // `%xmm0` with no `*_last_store_*` record at all, which is the
+                // same fact recorded elsewhere.
                 let in_reg = matches!(&args[0], Operand::Value(v)
-                    if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0));
+                    if self.state.vec_holds_staging_reg(v.0, false));
                 if !in_reg {
                     self.flush_pending_vec_store_impl();
                     if let Operand::Value(v) = &args[0] {
@@ -5533,7 +5639,12 @@ impl X86Codegen {
                         self.state.pending_vec_store = None;
                     }
                 }
-                self.state.invalidate_vec_peephole();
+                // Scratch-only: this is a store to MEMORY. `vec_mem_operand`
+                // and `emit_vec_store_addr` may write GPR addressing scratch
+                // (`%rax`/`%rcx`), never a vector bank, so every allocator
+                // claim still holds. A full wipe sent each later read of an
+                // unrelated live value back to its stack slot.
+                self.state.invalidate_vec_scratch_peephole();
                 self.emit_vec_store_addr(args, dest_ptr, "movdqu", "xmm0");
             }
             IntrinsicOp::VecBroadcastI64x2 => {
@@ -5655,12 +5766,18 @@ impl X86Codegen {
                             self.state.pending_vec_store = None;
                         }
                     }
-                    self.state.invalidate_vec_peephole();
+                    // Scratch-only, same reasoning as the canonical path
+                    // below: this stores to memory from a register the value
+                    // already occupies, so no allocator claim is disturbed.
+                    self.state.invalidate_vec_scratch_peephole();
                     self.emit_vec_store_addr(args, dest_ptr, "vmovdqu", src);
                     return;
                 }
+                // Is the source in `%ymm0` ITSELF? Same contract as the
+                // `%xmm0` twin above: the record must name the staging
+                // register, not merely the value.
                 let in_reg = matches!(&args[0], Operand::Value(v)
-                    if self.state.vec_last_store_reg && self.state.vec_last_store_val == Some(v.0));
+                    if self.state.vec_holds_staging_reg(v.0, true));
                 if !in_reg {
                     self.flush_pending_vec_store_impl();
                     if let Operand::Value(v) = &args[0] {
@@ -5678,7 +5795,12 @@ impl X86Codegen {
                         self.state.pending_vec_store = None;
                     }
                 }
-                self.state.invalidate_vec_peephole();
+                // Scratch-only: this is a store to MEMORY. `vec_mem_operand`
+                // and `emit_vec_store_addr` may write GPR addressing scratch
+                // (`%rax`/`%rcx`), never a vector bank, so every allocator
+                // claim still holds. A full wipe sent each later read of an
+                // unrelated live value back to its stack slot.
+                self.state.invalidate_vec_scratch_peephole();
                 self.emit_vec_store_addr(args, dest_ptr, "vmovdqu", "ymm0");
             }
             IntrinsicOp::VecSubI64x4 => {
@@ -5876,12 +5998,21 @@ impl X86Codegen {
                             self.state.pending_vec_store = None;
                         }
                     }
-                    self.state.invalidate_vec_peephole();
+                    // Scratch-only, same reasoning as the canonical path
+                    // below: this stores to memory from a register the value
+                    // already occupies, so no allocator claim is disturbed.
+                    self.state.invalidate_vec_scratch_peephole();
                     self.emit_vec_store_addr(args, dest_ptr, "movdqu", src);
                     return;
                 }
+                // Is the source in `%xmm0` ITSELF? Both records must name that
+                // register, not merely the same value: `last_store_val` alone
+                // survives the eviction of an allocator bank, and this arm
+                // stores the hard-coded `%xmm0`. A DEFERRED value sits in
+                // `%xmm0` with no `*_last_store_*` record at all, which is the
+                // same fact recorded elsewhere.
                 let in_reg = matches!(&args[0], Operand::Value(v)
-                    if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0));
+                    if self.state.vec_holds_staging_reg(v.0, false));
                 if !in_reg {
                     self.flush_pending_vec_store_impl();
                     if let Operand::Value(v) = &args[0] {
@@ -5899,7 +6030,12 @@ impl X86Codegen {
                         self.state.pending_vec_store = None;
                     }
                 }
-                self.state.invalidate_vec_peephole();
+                // Scratch-only: this is a store to MEMORY. `vec_mem_operand`
+                // and `emit_vec_store_addr` may write GPR addressing scratch
+                // (`%rax`/`%rcx`), never a vector bank, so every allocator
+                // claim still holds. A full wipe sent each later read of an
+                // unrelated live value back to its stack slot.
+                self.state.invalidate_vec_scratch_peephole();
                 self.emit_vec_store_addr(args, dest_ptr, "movdqu", "xmm0");
             }
             IntrinsicOp::VecAndI8x16 | IntrinsicOp::VecAndI16x8 => {
@@ -6199,12 +6335,21 @@ impl X86Codegen {
                             self.state.pending_vec_store = None;
                         }
                     }
-                    self.state.invalidate_vec_peephole();
+                    // Scratch-only, same reasoning as the canonical path
+                    // below: this stores to memory from a register the value
+                    // already occupies, so no allocator claim is disturbed.
+                    self.state.invalidate_vec_scratch_peephole();
                     self.emit_vec_store_addr(args, dest_ptr, mnemonic, src);
                     return;
                 }
+                // Is the source in `%xmm0` ITSELF? Both records must name that
+                // register, not merely the same value: `last_store_val` alone
+                // survives the eviction of an allocator bank, and this arm
+                // stores the hard-coded `%xmm0`. A DEFERRED value sits in
+                // `%xmm0` with no `*_last_store_*` record at all, which is the
+                // same fact recorded elsewhere.
                 let in_reg = matches!(&args[0], Operand::Value(v)
-                    if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0));
+                    if self.state.vec_holds_staging_reg(v.0, false));
                 if !in_reg {
                     self.flush_pending_vec_store_impl();
                     if let Operand::Value(v) = &args[0] {
@@ -6223,7 +6368,12 @@ impl X86Codegen {
                         self.state.pending_vec_store = None;
                     }
                 }
-                self.state.invalidate_vec_peephole();
+                // Scratch-only: this is a store to MEMORY. `vec_mem_operand`
+                // and `emit_vec_store_addr` may write GPR addressing scratch
+                // (`%rax`/`%rcx`), never a vector bank, so every allocator
+                // claim still holds. A full wipe sent each later read of an
+                // unrelated live value back to its stack slot.
+                self.state.invalidate_vec_scratch_peephole();
                 self.emit_vec_store_addr(args, dest_ptr, mnemonic, "xmm0");
             }
             IntrinsicOp::VecPackI32x4Pair => {
@@ -6308,13 +6458,7 @@ impl X86Codegen {
                         .copied()
                         .filter(|r| is_xmm_reg(*r))
                         .map(phys_reg_name)
-                        .or_else(|| {
-                            self.state
-                                .vec_live_regs
-                                .get(&v.0)
-                                .copied()
-                                .filter(|n| n.starts_with("xmm"))
-                        });
+                        .or_else(|| self.state.vec_live_xmm(v.0));
                     if let Some(src_name) = src_reg {
                         if let Some(d) = dest {
                             let dst_home = self.dest_xmm_home_name(d);
@@ -6646,10 +6790,21 @@ impl X86Codegen {
             IntrinsicOp::VecMaddwdI16x16 => {
                 // Word pair multiply-add (`vpmaddwd`): the Adler-32 epic
                 // sums the maddubs word products with an all-ones table
-                // into dword lanes.  Order-preserving (commutative=false)
-                // for the same discipline as maddubs.
+                // into dword lanes.
+                //
+                // COMMUTATIVE, unlike its `maddubs` neighbour above.  PMADDWD
+                // multiplies two SIGNED word streams and adds the adjacent
+                // products, so exchanging the sources cannot change a lane
+                // (SDM: tmp1 = src1.w0 * src2.w0, tmp2 = src1.w1 * src2.w1).
+                // This arm used to inherit `commutative = false` "for the same
+                // discipline as maddubs", but that discipline exists only
+                // because maddubs' two sources have DIFFERENT signedness.
+                // Here it bought nothing and cost the left-operand memory
+                // fold on every `pmaddwd` whose first source was foldable
+                // (SA-36).  The 512-bit twin already passed `true`; the new
+                // check_simd_commutativity_agreement gate pins all widths.
                 if let Some(d) = dest {
-                    self.emit_avx_binary_256(d, args, "vpmaddwd", false);
+                    self.emit_avx_binary_256(d, args, "vpmaddwd", true);
                 }
             }
             IntrinsicOp::VecConstI8x32 => {
@@ -8067,13 +8222,22 @@ impl X86Codegen {
                             self.state.pending_vec_store = None;
                         }
                     }
-                    self.state.invalidate_vec_peephole();
+                    // Scratch-only, same reasoning as the canonical path
+                    // below: this stores to memory from a register the value
+                    // already occupies, so no allocator claim is disturbed.
+                    self.state.invalidate_vec_scratch_peephole();
                     self.emit_vec_store_addr(args, dest_ptr, "movdqu", src);
                     return;
                 }
                 // Peek register residency BEFORE invalidating the peephole.
+                // Is the source in `%xmm0` ITSELF? Both records must name that
+                // register, not merely the same value: `last_store_val` alone
+                // survives the eviction of an allocator bank, and this arm
+                // stores the hard-coded `%xmm0`. A DEFERRED value sits in
+                // `%xmm0` with no `*_last_store_*` record at all, which is the
+                // same fact recorded elsewhere.
                 let in_reg = matches!(&args[0], Operand::Value(v)
-                    if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0));
+                    if self.state.vec_holds_staging_reg(v.0, false));
                 if !in_reg {
                     self.flush_pending_vec_store_impl();
                     if let Operand::Value(v) = &args[0] {
@@ -8091,7 +8255,12 @@ impl X86Codegen {
                         self.state.pending_vec_store = None;
                     }
                 }
-                self.state.invalidate_vec_peephole();
+                // Scratch-only: this is a store to MEMORY. `vec_mem_operand`
+                // and `emit_vec_store_addr` may write GPR addressing scratch
+                // (`%rax`/`%rcx`), never a vector bank, so every allocator
+                // claim still holds. A full wipe sent each later read of an
+                // unrelated live value back to its stack slot.
+                self.state.invalidate_vec_scratch_peephole();
                 self.emit_vec_store_addr(args, dest_ptr, "movdqu", "xmm0");
             }
             IntrinsicOp::VecStoreI32x8
@@ -8109,14 +8278,20 @@ impl X86Codegen {
                             self.state.pending_vec_store = None;
                         }
                     }
-                    self.state.invalidate_vec_peephole();
+                    // Scratch-only, same reasoning as the canonical path
+                    // below: this stores to memory from a register the value
+                    // already occupies, so no allocator claim is disturbed.
+                    self.state.invalidate_vec_scratch_peephole();
                     self.emit_vec_store_addr(args, dest_ptr, "vmovdqu", src);
                     return;
                 }
                 // Peek register residency BEFORE invalidating the peephole —
                 // otherwise every map/store pair pays a dead vmovdqu round-trip.
+                // Is the source in `%ymm0` ITSELF? Same contract as the
+                // `%xmm0` twin above: the record must name the staging
+                // register, not merely the value.
                 let in_reg = matches!(&args[0], Operand::Value(v)
-                    if self.state.vec_last_store_reg && self.state.vec_last_store_val == Some(v.0));
+                    if self.state.vec_holds_staging_reg(v.0, true));
                 if !in_reg {
                     self.flush_pending_vec_store_impl();
                     if let Operand::Value(v) = &args[0] {
@@ -8134,7 +8309,12 @@ impl X86Codegen {
                         self.state.pending_vec_store = None;
                     }
                 }
-                self.state.invalidate_vec_peephole();
+                // Scratch-only: this is a store to MEMORY. `vec_mem_operand`
+                // and `emit_vec_store_addr` may write GPR addressing scratch
+                // (`%rax`/`%rcx`), never a vector bank, so every allocator
+                // claim still holds. A full wipe sent each later read of an
+                // unrelated live value back to its stack slot.
+                self.state.invalidate_vec_scratch_peephole();
                 self.emit_vec_store_addr(args, dest_ptr, "vmovdqu", "ymm0");
             }
 
@@ -8260,8 +8440,27 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::VecBroadcastF32x8 => {
+                // The broadcast below reads `args[0]` — through its home
+                // register when it has one, else as a memory operand off its
+                // slot — so a still-deferred store MUST be committed first:
+                // that is the only write that ever reaches the slot. (Never
+                // "consume" it here: `args[0]` may be the deferred value
+                // itself, and its slot is unwritten until this flush.
+                // RED-TEAM: the earlier draft that retired the pending store
+                // instead of committing it broadcast uninitialised bytes.)
                 self.flush_pending_vec_store_impl();
-                self.state.invalidate_vec_peephole();
+                // SCRATCH-ONLY invalidation: everything below writes the
+                // reserved `%ymm0` scratch, so the *_last_store_* peepholes
+                // die here, but a `vec_live_regs` claim on ANOTHER bank (a
+                // loop-invariant `lo` in `%ymm2`) is untouched and must
+                // survive. `avx_store_dest` then claims the result on the
+                // register it actually used, and `vec_claim_live_reg` evicts
+                // that bank's previous tenant. A blanket
+                // `invalidate_vec_peephole` discarded every claim, so each
+                // later read of an unrelated live value reloaded it from its
+                // stack slot: one `vbroadcastss` in the inlined prefix was
+                // enough to de-register a whole loop's invariants.
+                self.state.invalidate_vec_scratch_peephole();
                 // scalar f32 in args[0] -> all 8 lanes via vbroadcastss.
                 // Prefer memory form; fall back to XMM then broadcast.
                 let mut done = false;
@@ -8312,6 +8511,17 @@ impl X86Codegen {
                 // Register-home source: store straight from the assigned YMM
                 // register (no slot round trip).  A pending deferred store to
                 // this same value flowed through the register and is void.
+                //
+                // There is deliberately NO Direct-slot arm here. A store to a
+                // stack slot is exactly what the register-resident reduction
+                // contract forbids (`no vector store to a stack slot anywhere
+                // in the body`), and the value is ALREADY in a register in
+                // every case where one could fire: `vec_store_source_256`
+                // answers with the YMM home of a register-assigned value, and
+                // a deferred result is covered by `pending_vec_store`. Adding
+                // such an arm therefore bought only a RELOAD round trip — the
+                // value's slot is not valid, so the arm had to write the slot
+                // from the register first — while costing one extra store.
                 let src = self.vec_store_source_256(&args[0]);
                 if src != "ymm0" {
                     if let Operand::Value(v) = &args[0] {
@@ -8319,12 +8529,19 @@ impl X86Codegen {
                             self.state.pending_vec_store = None;
                         }
                     }
-                    self.state.invalidate_vec_peephole();
+                    // Scratch-only: the store writes memory, so every claim on
+                    // an allocator-homed register still holds; retiring them
+                    // all forced each later read of an unrelated live value
+                    // back to its stack slot.
+                    self.state.invalidate_vec_scratch_peephole();
                     self.emit_vec_store_addr(args, dest_ptr, "vmovups", src);
                     return;
                 }
+                // Is the source in `%ymm0` ITSELF? `last_store_val` alone is
+                // not enough: it survives the eviction of an allocator bank,
+                // and this arm stores the hard-coded `%ymm0`.
                 let in_reg = matches!(&args[0], Operand::Value(v)
-                    if self.state.vec_last_store_reg && self.state.vec_last_store_val == Some(v.0));
+                    if self.state.vec_holds_staging_reg(v.0, true));
                 if !in_reg {
                     self.flush_pending_vec_store_impl();
                     if let Operand::Value(v) = &args[0] {
@@ -8342,7 +8559,7 @@ impl X86Codegen {
                         self.state.pending_vec_store = None;
                     }
                 }
-                self.state.invalidate_vec_peephole();
+                self.state.invalidate_vec_scratch_peephole();
                 self.emit_vec_store_addr(args, dest_ptr, "vmovups", "ymm0");
             }
             IntrinsicOp::VecStoreF32x4 => {
@@ -8353,12 +8570,22 @@ impl X86Codegen {
                             self.state.pending_vec_store = None;
                         }
                     }
-                    self.state.invalidate_vec_peephole();
+                    // Scratch-peephole only: a store to memory writes no
+                    // allocator bank, so every claim on a homed register still
+                    // holds. Retiring them all forced each later read of an
+                    // unrelated live value back to its stack slot.
+                    self.state.invalidate_vec_scratch_peephole();
                     self.emit_vec_store_addr(args, dest_ptr, "movups", src);
                     return;
                 }
+                // Is the source in `%xmm0` ITSELF? Both records must name that
+                // register, not merely the same value: `last_store_val` alone
+                // survives the eviction of an allocator bank, and this arm
+                // stores the hard-coded `%xmm0`. A DEFERRED value sits in
+                // `%xmm0` with no `*_last_store_*` record at all, which is the
+                // same fact recorded elsewhere.
                 let in_reg = matches!(&args[0], Operand::Value(v)
-                    if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0));
+                    if self.state.vec_holds_staging_reg(v.0, false));
                 if !in_reg {
                     self.flush_pending_vec_store_impl();
                     if let Operand::Value(v) = &args[0] {
@@ -8376,7 +8603,11 @@ impl X86Codegen {
                         self.state.pending_vec_store = None;
                     }
                 }
-                self.state.invalidate_vec_peephole();
+                // Scratch-only, exactly like the register-home path above:
+                // `emit_vec_store_addr` may emit address arithmetic into
+                // `%rax`, but neither it nor `vec_mem_operand` writes a vector
+                // bank, so every allocator claim still holds.
+                self.state.invalidate_vec_scratch_peephole();
                 self.emit_vec_store_addr(args, dest_ptr, "movups", "xmm0");
             }
             IntrinsicOp::VecStoreF64x4 => {
@@ -8387,12 +8618,19 @@ impl X86Codegen {
                             self.state.pending_vec_store = None;
                         }
                     }
-                    self.state.invalidate_vec_peephole();
+                    // Scratch-peephole only: a store to memory writes no
+                    // allocator bank, so every claim on a homed register still
+                    // holds. Retiring them all forced each later read of an
+                    // unrelated live value back to its stack slot.
+                    self.state.invalidate_vec_scratch_peephole();
                     self.emit_vec_store_addr(args, dest_ptr, "vmovupd", src);
                     return;
                 }
+                // Is the source in `%ymm0` ITSELF? Same contract as the
+                // `%xmm0` twin above: the record must name the staging
+                // register, not merely the value.
                 let in_reg = matches!(&args[0], Operand::Value(v)
-                    if self.state.vec_last_store_reg && self.state.vec_last_store_val == Some(v.0));
+                    if self.state.vec_holds_staging_reg(v.0, true));
                 if !in_reg {
                     self.flush_pending_vec_store_impl();
                     if let Operand::Value(v) = &args[0] {
@@ -8410,7 +8648,11 @@ impl X86Codegen {
                         self.state.pending_vec_store = None;
                     }
                 }
-                self.state.invalidate_vec_peephole();
+                // Scratch-only, exactly like the register-home path above:
+                // `emit_vec_store_addr` may emit address arithmetic into
+                // `%rax`, but neither it nor `vec_mem_operand` writes a vector
+                // bank, so every allocator claim still holds.
+                self.state.invalidate_vec_scratch_peephole();
                 self.emit_vec_store_addr(args, dest_ptr, "vmovupd", "ymm0");
             }
             IntrinsicOp::VecStoreF64x2 => {
@@ -8421,12 +8663,22 @@ impl X86Codegen {
                             self.state.pending_vec_store = None;
                         }
                     }
-                    self.state.invalidate_vec_peephole();
+                    // Scratch-peephole only: a store to memory writes no
+                    // allocator bank, so every claim on a homed register still
+                    // holds. Retiring them all forced each later read of an
+                    // unrelated live value back to its stack slot.
+                    self.state.invalidate_vec_scratch_peephole();
                     self.emit_vec_store_addr(args, dest_ptr, "movupd", src);
                     return;
                 }
+                // Is the source in `%xmm0` ITSELF? Both records must name that
+                // register, not merely the same value: `last_store_val` alone
+                // survives the eviction of an allocator bank, and this arm
+                // stores the hard-coded `%xmm0`. A DEFERRED value sits in
+                // `%xmm0` with no `*_last_store_*` record at all, which is the
+                // same fact recorded elsewhere.
                 let in_reg = matches!(&args[0], Operand::Value(v)
-                    if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0));
+                    if self.state.vec_holds_staging_reg(v.0, false));
                 if !in_reg {
                     self.flush_pending_vec_store_impl();
                     if let Operand::Value(v) = &args[0] {
@@ -8444,7 +8696,11 @@ impl X86Codegen {
                         self.state.pending_vec_store = None;
                     }
                 }
-                self.state.invalidate_vec_peephole();
+                // Scratch-only, exactly like the register-home path above:
+                // `emit_vec_store_addr` may emit address arithmetic into
+                // `%rax`, but neither it nor `vec_mem_operand` writes a vector
+                // bank, so every allocator claim still holds.
+                self.state.invalidate_vec_scratch_peephole();
                 self.emit_vec_store_addr(args, dest_ptr, "movupd", "xmm0");
             }
             IntrinsicOp::StrictRecipMulAddF64x4 | IntrinsicOp::StrictRecipMulAddPackedF64x4 => {
@@ -8929,7 +9185,12 @@ impl X86Codegen {
             }
             IntrinsicOp::VecZeroF32x8 | IntrinsicOp::VecZeroF32x4 => {
                 self.flush_pending_vec_store_impl();
-                self.state.invalidate_vec_peephole();
+                // SCRATCH-ONLY invalidation, same contract as the F32x8
+                // broadcast above: the zero idiom writes ONE bank — the
+                // destination's home when it has one, else `%ymm0` — and the
+                // claim recorded below evicts that bank. Wiping every claim
+                // here forced unrelated live values back to their slots.
+                self.state.invalidate_vec_scratch_peephole();
                 let is8 = matches!(op, IntrinsicOp::VecZeroF32x8);
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
@@ -9572,7 +9833,7 @@ impl X86Codegen {
             }
             // A value provably sitting in a non-reserved YMM register within
             // this block can be read directly.
-            if let Some(&held) = this.state.vec_live_regs.get(&v.0) {
+            if let Some(held) = this.state.vec_live_ymm(v.0) {
                 if held != "ymm0" && held != "ymm1" {
                     return Some(format!("%{}", held));
                 }
@@ -9764,17 +10025,13 @@ impl X86Codegen {
         if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0) {
             return Some(self.state.sse_last_store_reg_name.unwrap_or("xmm0"));
         }
-        if let Some(&held) = self.state.vec_live_regs.get(&v.0) {
-            // Only a 128-bit-named entry may feed a legacy/VEX.128
-            // operand: the 256-bit emitters book YMM-named entries here,
-            // and splicing one into an `addps %src, %dst` would encode an
-            // illegal mixed-width instruction (caught loud by the
-            // assembler's width check).  Decline and let the caller's
-            // staged path load the value from its slot.
-            if held.starts_with("xmm") {
-                return Some(held);
-            }
-            return None;
+        // Only a 128-bit-named claim may feed a legacy/VEX.128 operand; the
+        // 256-bit emitters book `%ymm` entries in the same map, and splicing
+        // one into `addps %src, %dst` is an illegal mixed-width encoding.
+        // `vec_live_xmm` reports those absent, so the caller's staged path
+        // loads the value from its slot instead.
+        if let Some(held) = self.state.vec_live_xmm(v.0) {
+            return Some(held);
         }
         self.reg_assignments
             .get(&v.0)
@@ -9809,22 +10066,15 @@ impl X86Codegen {
                     return format!("%{}", phys_reg_name(reg));
                 }
             }
-            if let Some(&held) = self.state.vec_live_regs.get(&v.0) {
-                // Only a 128-bit-named entry may feed a VEX.128 source
-                // operand: the 256-bit emitters book YMM-named entries
-                // here, and formatting one would encode an illegal
-                // mixed-width instruction.  Decline and fall through to
-                // the staged load below.
-                if held.starts_with("xmm") {
-                    if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
-                        self.state.pending_vec_store = None;
-                    }
-                    // The live-reg table stores the bare name ("xmm0");
-                    // every caller formats the result as a raw AT&T
-                    // operand and expects the '%' prefix, like the
-                    // assignment and scratch paths below.
-                    return format!("%{}", held);
-                }
+            // VEX.128 sources need a 128-bit-named claim; `vec_live_xmm`
+            // reports a 256-bit one absent so this falls through to the
+            // staged load (`movdqa %ymm5, %xmm?` is not encodable).
+            if let Some(held) = self.state.vec_live_xmm(v.0) {
+                self.state.vec_consume(v.0);
+                // The table stores the bare name ("xmm0"); every caller
+                // formats the result as a raw AT&T operand and expects the
+                // '%' prefix, like the assignment and scratch paths below.
+                return format!("%{}", held);
             }
         }
         self.sse_load_arg(arg, scratch);
@@ -12100,11 +12350,11 @@ impl X86Codegen {
             }
             match arg {
                 Operand::Value(v) => {
-                    // A pending deferred store is one more way the value can
-                    // be in a register rather than in its slot.
-                    if this.state.vec_live_regs.contains_key(&v.0)
-                        || (this.state.vec_last_store_reg
-                            && this.state.vec_last_store_val == Some(v.0))
+                    // A register-held value has a possibly-unwritten slot. The
+                    // three-record test is shared with `vec_arg_mem`, evaluated
+                    // WITHOUT mutating the deferred state: the branches below
+                    // decide for themselves whether this consumer takes it.
+                    if this.vec_arg_register_held(v.0)
                         || this.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0)
                     {
                         return None;
@@ -13081,8 +13331,17 @@ mod vector_address_contract_tests {
             &[9],
         );
         assert!(out.contains("vpaddq %ymm0, %ymm5, %ymm0"), "{out}");
+        // The result is homed in its OWN slot, so the store must actually be
+        // emitted — and it is `vmovdqu`, which imposes no alignment
+        // requirement (its `dq` in the mnemonic means "unaligned dword/qword
+        // pattern", not "aligned access"), so it is legal for a frame slot of
+        // any alignment. The register-home copy path still spells `vmovdqa`.
+        //
+        // The spelling is pinned rather than incidental: the register-resident
+        // reduction contract looks for exactly this store in its
+        // spill-backed control leg (`vmovdqu %ymm0, disp(%rsp/%rbp)`).
         assert!(
-            out.contains("vmovdqu %ymm0, "),
+            out.lines().any(|l| l.contains("vmovdqu %ymm0, ")),
             "dest must be stored: {out}"
         );
         // ... slot acc -> register dest (staged through ymm1, not a home) ...
@@ -14150,14 +14409,42 @@ mod vec_arg_mem_pending_store_tests {
         );
     }
 
-    /// The two ORIGINAL guards must still fire: a value provably in a register
-    /// is folded to None, not to a stale slot read.
+    /// The register records WIN over slot validity: a value provably in a
+    /// register is folded to `None`, never to a slot read that may never have
+    /// been written.
+    ///
+    /// This is the whole soundness contract of the fold, and it is not
+    /// hypothetical. The 256-bit homing path is entitled to DEFER a value's
+    /// slot store (`vector_defer_values`) or skip it entirely (VLFOLD), so
+    /// `SlotAddr::Direct` says "a slot EXISTS", not "the slot was written". A
+    /// `vec_live_regs` claim additionally means no reload happened since. The
+    /// fold runs on the register records first and only then on the slot.
+    ///
+    /// The fixture deliberately homes the value in a Direct slot, because that
+    /// is the shape the old slot-validity-first ordering got wrong.
     #[test]
-    fn vec_arg_mem_still_refuses_register_held_values() {
-        let mut cg = fresh();
-        // (a) block-local live register.
-        cg.state.vec_live_regs.insert(0, "ymm1");
-        assert!(cg.vec_arg_mem(&Operand::Value(Value(0))).is_none());
+    fn vec_arg_mem_refuses_register_held_values_even_with_a_valid_slot() {
+        // Sanity: the fixture's slot really is foldable, so every assertion
+        // below is about the register records and not about a broken fixture.
+        // (`cg` is only queried here — `deny(warnings)` rejects a spare `mut`.)
+        let cg = fresh();
+        assert!(
+            cg.state.resolve_slot_addr(0).is_some(),
+            "fixture is broken: no slot for the value"
+        );
+
+        // (a) block-local live register — at EITHER width. Any claim means
+        // the slot may be unwritten (`sse_store_dest` skips the slot store for
+        // a register-homed value exactly like the 256-bit home path), so the
+        // fold must be refused before slot validity is even considered.
+        for claim in ["ymm1", "xmm1"] {
+            let mut cg = fresh();
+            cg.state.vec_live_regs.insert(0, claim);
+            assert!(
+                cg.vec_arg_mem(&Operand::Value(Value(0))).is_none(),
+                "a {claim} claim must refuse the fold"
+            );
+        }
 
         // (b) the vector peephole: the last store wrote this value to a reg.
         let mut cg = fresh();
@@ -14173,6 +14460,32 @@ mod vec_arg_mem_pending_store_tests {
 
         // None of these is a pending store, so nothing may be emitted.
         assert!(!cg.state.out.buf.contains("vmovdqu %ymm0"));
+    }
+
+    /// The width contract of `vec_live_ymm`: only a 256-bit-named claim may
+    /// feed a 256-bit operand. An `%xmm` or `%zmm` name is reported ABSENT so
+    /// the consumer reloads, because naming one is an illegal encoding
+    /// (`vmovdqu %xmm1, %ymm0` is rejected by the assembler; a VEX.256 operand
+    /// may not use an EVEX-only register) and reading through the narrow view
+    /// would silently truncate the upper lane.
+    #[test]
+    fn vec_live_ymm_reports_only_256_bit_claims() {
+        let mut cg = fresh();
+        cg.state.vec_live_regs.insert(0, "ymm3");
+        assert_eq!(cg.state.vec_live_ymm(0), Some("ymm3"));
+        cg.state.vec_live_regs.insert(0, "xmm3");
+        assert_eq!(cg.state.vec_live_ymm(0), None);
+        cg.state.vec_live_regs.insert(0, "zmm3");
+        assert_eq!(
+            cg.state.vec_live_ymm(0),
+            None,
+            "zmm is not encodable in a VEX.256 operand"
+        );
+        cg.state.vec_live_regs.insert(1, "ymm5");
+        assert_eq!(cg.state.vec_live_xmm(1), None);
+        cg.state.vec_live_regs.insert(1, "xmm5");
+        assert_eq!(cg.state.vec_live_xmm(1), Some("xmm5"));
+        assert_eq!(cg.state.vec_live_ymm(99), None);
     }
 
     /// End-to-end: the deferred 256-bit store must reach the slot before any
@@ -14196,5 +14509,257 @@ mod vec_arg_mem_pending_store_tests {
                 cg.state.out.buf
             );
         }
+    }
+}
+
+/// Store-source identity and invalidation SCOPE.
+///
+/// Two properties decide whether a `VecStore*` family emits a legal, correct
+/// store, and neither is visible in the emitted text of a single test, so both
+/// are pinned structurally here:
+///
+/// 1. **Which register holds the value.** `vec_store_source_*` must answer with
+///    the register the value provably occupies, or with the staging default so
+///    the caller loads it there first. Answering with a register that does NOT
+///    hold the value is a silent miscompile (a stranger's bytes land in the
+///    destination); answering too conservatively only costs a reload.
+/// 2. **Which invalidation scope a store may use.** A store to MEMORY writes no
+///    allocator-owned vector bank, so it may retire only the scratch peephole.
+///    A full `invalidate_vec_peephole` is not unsound, but it discards every
+///    `vec_live_regs` claim, and each later read of an unrelated live value
+///    then pays a stack reload.
+#[cfg(test)]
+mod vec_store_source_identity_tests {
+    use super::*;
+
+    const FRESH: u32 = 0;
+
+    fn fresh() -> X86Codegen {
+        let mut cg = X86Codegen::new();
+        cg.state.value_locations.insert(FRESH, StackSlot(-32));
+        cg.state.vector_values.insert(FRESH);
+        cg
+    }
+
+    /// A block-local claim is the first record: the value is in that register,
+    /// and the store must read THAT register rather than the `%ymm0` default.
+    #[test]
+    fn a_live_claim_names_the_source_register() {
+        let mut cg = fresh();
+        cg.state.vec_claim_live_reg(FRESH, "ymm7");
+        assert_eq!(
+            cg.vec_store_source_256(&Operand::Value(Value(FRESH))),
+            "ymm7",
+            "the 256-bit resolver must name the claimed register"
+        );
+        cg.state.vec_claim_live_reg(FRESH, "xmm9");
+        assert_eq!(
+            cg.vec_store_source_128(&Operand::Value(Value(FRESH))),
+            "xmm9",
+            "the 128-bit resolver must name the claimed register"
+        );
+    }
+
+    /// The claim is only consulted at its OWN width. A `%ymm` claim cannot
+    /// supply an `%xmm` operand (illegal mixed-width encoding) and vice versa,
+    /// so each resolver falls through to the staging default instead.
+    #[test]
+    fn a_claim_feed_only_its_own_width() {
+        let mut cg = fresh();
+        cg.state.vec_claim_live_reg(FRESH, "ymm7");
+        assert_eq!(
+            cg.vec_store_source_128(&Operand::Value(Value(FRESH))),
+            "xmm0",
+            "a %ymm claim must not be spliced into a 128-bit store"
+        );
+        let mut cg = fresh();
+        cg.state.vec_claim_live_reg(FRESH, "xmm9");
+        assert_eq!(
+            cg.vec_store_source_256(&Operand::Value(Value(FRESH))),
+            "ymm0",
+            "an %xmm claim must not be spliced into a 256-bit store"
+        );
+    }
+
+    /// A DEFERRED result lives in the register named by `pending_vec_store`,
+    /// which is the only record that survives an intervening load. The 256-bit
+    /// value is in `%ymm1` here, and answering `%ymm0` would store whatever the
+    /// previous instruction left there.
+    #[test]
+    fn a_deferred_value_names_its_actual_register() {
+        let mut cg = fresh();
+        cg.state.pending_vec_store = Some((FRESH, "ymm1", true));
+        assert_eq!(
+            cg.vec_store_source_256(&Operand::Value(Value(FRESH))),
+            "ymm1",
+            "a deferred 256-bit value in %ymm1 must not be reported as %ymm0"
+        );
+        let mut cg = fresh();
+        cg.state.pending_vec_store = Some((FRESH, "xmm1", false));
+        assert_eq!(
+            cg.vec_store_source_128(&Operand::Value(Value(FRESH))),
+            "xmm1",
+            "a deferred 128-bit value in %xmm1 must not be reported as %xmm0"
+        );
+    }
+
+    /// A NARROW deferral cannot feed a 256-bit store. Reporting `%ymm0` routes
+    /// the caller through the canonical path, which flushes the deferral and
+    /// reloads the slot — always correct, and the only option, since the value
+    /// is 128 bits wide.
+    #[test]
+    fn a_narrow_deferral_declines_the_256_bit_store() {
+        let mut cg = fresh();
+        cg.state.pending_vec_store = Some((FRESH, "xmm1", false));
+        assert_eq!(
+            cg.vec_store_source_256(&Operand::Value(Value(FRESH))),
+            "ymm0",
+            "a 128-bit deferral must decline a 256-bit store"
+        );
+        // ... and the converse: a 256-bit deferral makes the 128-bit store read
+        // the LOW half of %xmm0, which is legal, but the value it names is
+        // %ymm0's low half — so the answer stays the staging default, never a
+        // register the caller would then read at the wrong width.
+        let mut cg = fresh();
+        cg.state.pending_vec_store = Some((FRESH, "ymm1", true));
+        assert_eq!(
+            cg.vec_store_source_128(&Operand::Value(Value(FRESH))),
+            "xmm0",
+            "a 256-bit deferral must decline a 128-bit store"
+        );
+    }
+
+    /// The reserved-scratch peephole is exact for the scratch pair, and ONLY
+    /// for it. A record naming an allocator bank does not license a store that
+    /// reads the hard-coded `%xmm0`: the record says which VALUE was stored,
+    /// never which register the caller is about to read.
+    #[test]
+    fn only_a_scratch_record_names_the_staging_register() {
+        let mut cg = fresh();
+        cg.state.sse_last_store_reg = true;
+        cg.state.sse_last_store_val = Some(FRESH);
+        cg.state.sse_last_store_reg_name = Some("xmm1");
+        assert_eq!(
+            cg.vec_store_source_128(&Operand::Value(Value(FRESH))),
+            "xmm1",
+            "the reserved scratch pair is exact on its own"
+        );
+        // The same value held in a NON-scratch bank: the resolver must not
+        // answer, because the caller would read `%xmm0` from that answer.
+        cg.state.vec_live_regs.clear();
+        cg.state.sse_last_store_reg_name = Some("xmm3");
+        assert_eq!(
+            cg.vec_store_source_128(&Operand::Value(Value(FRESH))),
+            "xmm0",
+            "an allocator-bank record must not be spliced into a %xmm0 store"
+        );
+    }
+
+    /// `vec_holds_staging_reg` is what licenses the "skip the reload" arm, so
+    /// it must agree with the resolver about BOTH halves of the fact: the value
+    /// and the register name.
+    #[test]
+    fn the_staging_predicate_requires_the_register_name_too() {
+        let mut cg = fresh();
+        // Value matches, register does not: NOT in `%xmm0`.
+        cg.state.sse_last_store_reg = true;
+        cg.state.sse_last_store_val = Some(FRESH);
+        cg.state.sse_last_store_reg_name = Some("xmm3");
+        assert!(
+            !cg.state.vec_holds_staging_reg(FRESH, false),
+            "a record naming %xmm3 must not license reading %xmm0"
+        );
+        // Both halves match.
+        cg.state.sse_last_store_reg_name = Some("xmm0");
+        assert!(cg.state.vec_holds_staging_reg(FRESH, false));
+        // Value does not match.
+        assert!(!cg.state.vec_holds_staging_reg(FRESH + 1, false));
+        // Width does not match: the 256-bit record is a different record.
+        assert!(!cg.state.vec_holds_staging_reg(FRESH, true));
+        // A width-matched DEFERRED value sits in the staging register with no
+        // `*_last_store_*` record at all (a deferred `VecLoad*` never stored).
+        let mut cg = fresh();
+        cg.state.pending_vec_store = Some((FRESH, "ymm0", true));
+        assert!(
+            cg.state.vec_holds_staging_reg(FRESH, true),
+            "a deferred value in %ymm0 is in the staging register"
+        );
+        assert!(
+            !cg.state.vec_holds_staging_reg(FRESH, false),
+            "the 128-bit staging register is a different physical fact"
+        );
+    }
+
+    /// The invalidation SCOPE of every memory-store arm. This is the property
+    /// that keeps the register-resident reduction contract: a full wipe would
+    /// drop allocator claims that a store to memory cannot possibly disturb.
+    ///
+    /// The test asserts on `vec_live_regs` directly, so it fails if any store
+    /// arm goes back to the wide invalidation.
+    #[test]
+    fn a_memory_store_keeps_allocator_claims() {
+        let mut cg = fresh();
+        cg.state.vec_claim_live_reg(7, "ymm7");
+        cg.state.invalidate_vec_scratch_peephole();
+        assert_eq!(
+            cg.state.vec_live_ymm(7),
+            Some("ymm7"),
+            "a memory store writes no allocator bank: the claim must survive"
+        );
+        // The contrast, so the two scopes cannot be silently interchanged: the
+        // WIDE invalidation drops the claim.
+        cg.state.invalidate_vec_peephole();
+        assert_eq!(
+            cg.state.vec_live_ymm(7),
+            None,
+            "the wide invalidation must drop allocator claims, or it is not wide"
+        );
+    }
+
+    /// The scratch invalidation must NOT drop a pending deferred store.
+    ///
+    /// A `pending_vec_store` is a value whose slot has not been written yet:
+    /// retiring the record without emitting the store would lose the value
+    /// entirely (the slot stays stale and the flush never happens). It is
+    /// retired only by `vec_consume` (a consumer took it from the register) or
+    /// by the flush itself, so the scratch scope must leave it alone.
+    #[test]
+    fn the_scratch_scope_never_drops_a_deferred_store() {
+        let mut cg = fresh();
+        cg.state.pending_vec_store = Some((FRESH, "ymm0", true));
+        cg.state.invalidate_vec_scratch_peephole();
+        assert_eq!(
+            cg.state.pending_vec_store,
+            Some((FRESH, "ymm0", true)),
+            "dropping the record would strand the value: its slot is unwritten"
+        );
+        // Only an explicit consume retires it, and only for ITS value.
+        cg.state.vec_consume(FRESH + 1);
+        assert!(
+            cg.state.pending_vec_store.is_some(),
+            "a consume must be value-exact"
+        );
+        cg.state.vec_consume(FRESH);
+        assert!(cg.state.pending_vec_store.is_none());
+    }
+
+    /// The reserved scratch pair is never claimable: a claim there would
+    /// outlive its own clobber, because `invalidate_vec_scratch_peephole` is
+    /// exactly what does NOT clear `vec_live_regs`.
+    #[test]
+    fn the_reserved_scratch_pair_is_never_claimable() {
+        for name in ["ymm0", "xmm0", "ymm1", "xmm1"] {
+            let mut cg = fresh();
+            cg.state.vec_claim_live_reg(FRESH, name);
+            assert_eq!(
+                cg.state.vec_live_regs.get(&FRESH),
+                None,
+                "{name} is reserved scratch and must never carry a claim"
+            );
+        }
+        // An allocator-owned bank still takes the claim.
+        let mut cg = fresh();
+        cg.state.vec_claim_live_reg(FRESH, "ymm2");
+        assert_eq!(cg.state.vec_live_regs.get(&FRESH), Some(&"ymm2"));
     }
 }

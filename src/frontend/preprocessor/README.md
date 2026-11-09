@@ -468,7 +468,10 @@ in `#if` expressions by `resolve_defined_in_expr`:
 
 - `__has_builtin(X)` -- returns `1` for supported compiler builtins.
 - `__has_attribute(X)` -- returns `1` for supported GCC attributes.
-- `__has_feature(X)` / `__has_extension(X)` -- always `0`.
+- `__has_feature(X)` / `__has_extension(X)` -- answer from the GCC 16.2
+  capability table in `feature_queries.rs`, gated on the selected dialect,
+  `-pedantic-errors`, and active UBSan checks.  Unimplemented capabilities
+  answer `0` rather than making a false claim.
 - `__has_include(X)` / `__has_include_next(X)` -- probes the include path
   resolution machinery and returns `1` if the header exists.
 
@@ -606,8 +609,11 @@ i686, and i386.
 
 ## Known Limitations
 
-- **`__has_feature` and `__has_extension` always return `0`** -- no Clang
-  feature set is modeled.
+- **`__has_feature` / `__has_extension` model GCC's C capability names, not
+  Clang's full feature set.**  `attribute_deprecated_with_message`,
+  `attribute_unavailable_with_message`, and `enumerator_attributes` answer `0`
+  until sema implements the corresponding diagnostics; the address/hwaddress/
+  leak/thread sanitizer rows answer `0` because those sanitizers are absent.
 - **No trigraph processing** -- trigraphs (`??=`, `??/`, etc.) are not
   translated. Digraph tokens, directive introducers and macro `#`/`##`
   spellings are recognized while retaining their spelling for stringification;

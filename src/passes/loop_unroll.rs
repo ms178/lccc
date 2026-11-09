@@ -138,6 +138,28 @@ fn choose_unroll_factor(body_inst_count: usize) -> u32 {
     }
 }
 
+/// Post-vectorize unroll factor for the BB-SLP feedstock ONLY.
+///
+/// The general `choose_unroll_factor` balances scalar code size for EVERY
+/// loop; the two-block partial unroll is entered exclusively from the
+/// `UnrollPhase::PostVec` arm (`unroll_loops`, `phase == PostVec` guard), on
+/// loops the loop vectorizer already declined.  Four consecutive scalar stores
+/// are the minimum seed for one full 128-bit dword pack; the generic factor of
+/// 2 for a 21..=60-instruction body leaves only a half-wide pair, whose
+/// GPR<->XMM crossings the SLP cost model correctly declines for
+/// expression-heavy shapes.  Express the change as a DELTA on the existing
+/// policy so every other band keeps byte-identical behaviour and there is a
+/// single source of truth for the size thresholds.  `work_len == 0` is already
+/// rejected by the caller, and `k <= 4` / `work * k <= 512` guards still apply.
+fn post_vec_slp_unroll_factor(work_len: usize) -> u32 {
+    let base = choose_unroll_factor(work_len).min(4);
+    if (21..=60).contains(&work_len) {
+        4
+    } else {
+        base
+    }
+}
+
 /// All information needed to perform the unrolling transformation.
 struct UnrollCandidate {
     /// Block index of the loop header (has the phi + condition check).
@@ -3365,7 +3387,12 @@ fn try_partial_unroll_two_block(
     let k_pref = if reduction.is_some() || carried_acc {
         4
     } else {
-        choose_unroll_factor(work_len).min(4) as usize
+        // BB-SLP needs >= 4 consecutive dword stores for one full XMM pack.
+        // The generic factor of 2 for a 21..=60-work body leaves only a
+        // half-wide pair, which the half-wide cost model correctly declines
+        // for expression-heavy shapes.  Give the SLP feedstock a 4-lane run;
+        // `choose_unroll_factor` still governs every OTHER loop in the TU.
+        post_vec_slp_unroll_factor(work_len) as usize
     };
     let mut k: usize = 1;
     let mut cand_k = k_pref;
@@ -8911,5 +8938,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn post_vec_slp_unroll_factor_is_a_surgical_delta_on_the_base_policy() {
+        // Every band EXCEPT 21..=60 keeps the historical factor exactly.
+        for work in [1usize, 2, 4, 5, 8, 9, 20, 61, 80, 200] {
+            assert_eq!(
+                post_vec_slp_unroll_factor(work),
+                choose_unroll_factor(work).min(4),
+                "unexpected change at work_len={work}"
+            );
+        }
+        // The 21..=60 band is the ONLY one bumped 2 -> 4, to give BB-SLP a
+        // full 128-bit dword seed instead of a half-wide pair.
+        for work in [21usize, 30, 45, 60] {
+            assert_eq!(choose_unroll_factor(work), 2);
+            assert_eq!(
+                post_vec_slp_unroll_factor(work),
+                4,
+                "work_len={work} lost its 4-lane SLP feedstock"
+            );
+        }
+        assert_eq!(post_vec_slp_unroll_factor(61), 1);
     }
 }

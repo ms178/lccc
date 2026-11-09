@@ -3741,13 +3741,20 @@ impl Parser {
             TokenKind::PragmaPackSet(n) => {
                 let n = *n;
                 self.advance();
-                // pack(0) means reset to default (natural alignment)
-                self.pragma_pack_align = if n == 0 { None } else { Some(n) };
+                // Invalid operands must not affect layout (nor reach align_up,
+                // which assumes a power of two). The preprocessor records the
+                // frontend diagnostic and retains the marker for -E output.
+                if crate::common::types::valid_pragma_pack_alignment(n) {
+                    self.pragma_pack_align = if n == 0 { None } else { Some(n) };
+                }
                 true
             }
             TokenKind::PragmaPackPush(n) => {
                 let n = *n;
                 self.advance();
+                if !crate::common::types::valid_pragma_pack_alignment(n) {
+                    return true;
+                }
                 // Push current alignment onto stack
                 self.pragma_pack_stack.push(self.pragma_pack_align);
                 // pack(push, 0) means push and reset to default (natural alignment)

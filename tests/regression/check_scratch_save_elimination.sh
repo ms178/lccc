@@ -49,7 +49,11 @@ body() { # <function> <asm file> -> that function's body
 }
 
 cat > "$work/scratch.c" <<'EOF'
-#include <stdio.h>
+/* Header-free on purpose: this fixture is also compiled with -m32 -S on hosts
+ * without libc6-dev-i386.  <stdio.h> would pull in glibc's multiarch bits/
+ * tree and turn an ASSEMBLER-SHAPE gate into an environment failure.  The
+ * printf prototype is identical on LP64 and ILP32. */
+extern int printf(const char *, ...);
 
 #define NOINLINE __attribute__((noinline))
 

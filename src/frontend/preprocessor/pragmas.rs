@@ -130,7 +130,7 @@ impl Preprocessor {
         let rest = rest.trim();
         if let Some(message) = crate::common::diagnostic_pragma::threshold_error(rest) {
             self.errors.push(super::pipeline::PreprocessorDiagnostic {
-                kind: crate::common::error::WarningKind::Cpp,
+                kind: Some(crate::common::error::WarningKind::Cpp),
                 file: self.current_file(),
                 line: line_num,
                 col,
@@ -163,7 +163,7 @@ impl Preprocessor {
             if self.macros.asm_mode {
                 return None;
             }
-            return self.handle_pragma_pack(pack_content.trim());
+            return self.handle_pragma_pack(pack_content.trim(), line_num, col);
         }
 
         // Handle #pragma push_macro("name") / pop_macro("name")
@@ -247,7 +247,7 @@ impl Preprocessor {
                 Some(end) => (r[..end].to_string(), false, &r[end + 1..]),
                 None => {
                     self.errors.push(super::pipeline::PreprocessorDiagnostic {
-                        kind: crate::common::error::WarningKind::Cpp,
+                        kind: Some(crate::common::error::WarningKind::Cpp),
                         file: self.current_file(),
                         line: line_num,
                         col,
@@ -261,7 +261,7 @@ impl Preprocessor {
                 Some(end) => (r[..end].to_string(), true, &r[end + 1..]),
                 None => {
                     self.errors.push(super::pipeline::PreprocessorDiagnostic {
-                        kind: crate::common::error::WarningKind::Cpp,
+                        kind: Some(crate::common::error::WarningKind::Cpp),
                         file: self.current_file(),
                         line: line_num,
                         col,
@@ -272,7 +272,7 @@ impl Preprocessor {
             }
         } else {
             self.errors.push(super::pipeline::PreprocessorDiagnostic {
-                kind: crate::common::error::WarningKind::Cpp,
+                kind: Some(crate::common::error::WarningKind::Cpp),
                 file: self.current_file(),
                 line: line_num,
                 col,
@@ -282,7 +282,7 @@ impl Preprocessor {
         };
         let Some(resolved) = self.resolve_include_path(&filename, is_system) else {
             self.errors.push(super::pipeline::PreprocessorDiagnostic {
-                kind: crate::common::error::WarningKind::Cpp,
+                kind: Some(crate::common::error::WarningKind::Cpp),
                 file: self.current_file(),
                 line: line_num,
                 col,
@@ -311,7 +311,7 @@ impl Preprocessor {
                 )
             };
             self.push_warning(super::pipeline::PreprocessorDiagnostic {
-                kind: crate::common::error::WarningKind::Cpp,
+                kind: Some(crate::common::error::WarningKind::Cpp),
                 file: self.current_file(),
                 line: line_num,
                 col,
@@ -341,7 +341,7 @@ impl Preprocessor {
             None => (format!("invalid '#pragma GCC {keyword}' directive"), true),
         };
         let diagnostic = PreprocessorDiagnostic {
-            kind: crate::common::error::WarningKind::Pragmas,
+            kind: Some(crate::common::error::WarningKind::Pragmas),
             file: self.current_file(),
             line: line_num,
             col,
@@ -372,7 +372,7 @@ impl Preprocessor {
                 warning_config: matches!(severity, PragmaSeverity::PragmasWarning)
                     .then(|| Box::new(self.diagnostic_pragmas.current.clone())),
                 diagnostic: PreprocessorDiagnostic {
-                    kind: crate::common::error::WarningKind::Pragmas,
+                    kind: Some(crate::common::error::WarningKind::Pragmas),
                     file: file.clone(),
                     line: line_num,
                     col,
@@ -505,7 +505,7 @@ impl Preprocessor {
     ///   #pragma pack(push, N)  - push current and set to N
     ///   #pragma pack(push)     - push current (no change)
     ///   #pragma pack(pop)      - restore previous alignment
-    fn handle_pragma_pack(&mut self, content: &str) -> Option<String> {
+    fn handle_pragma_pack(&mut self, content: &str, line_num: usize, col: usize) -> Option<String> {
         let content = content.trim();
         // Must start with '('
         if !content.starts_with('(') {
@@ -531,6 +531,7 @@ impl Preprocessor {
             }
             // #pragma pack(push, N) - push current and set to N (0 means default)
             if let Ok(n) = rest.parse::<usize>() {
+                self.warn_invalid_pack_alignment(n, line_num, col);
                 return Some(format!("__ccc_pack_push_{} ;\n", n));
             }
             return None;
@@ -538,10 +539,30 @@ impl Preprocessor {
 
         // #pragma pack(N) - set alignment
         if let Ok(n) = inner.parse::<usize>() {
+            self.warn_invalid_pack_alignment(n, line_num, col);
             return Some(format!("__ccc_pack_set_{} ;\n", n));
         }
 
         None
+    }
+
+    fn warn_invalid_pack_alignment(&mut self, n: usize, line: usize, col: usize) {
+        if crate::common::types::valid_pragma_pack_alignment(n) {
+            return;
+        }
+        // Retain the marker for -E, but the parser ignores it, including any
+        // attempted push. GCC diagnoses this in the C frontend, not under -E.
+        self.push_pragma_diagnostic(PragmaDiagnostic {
+            severity: PragmaSeverity::PragmasWarning,
+            diagnostic: PreprocessorDiagnostic {
+                kind: Some(crate::common::error::WarningKind::Pragmas),
+                file: self.current_file(),
+                line,
+                col,
+                message: format!("alignment must be a small power of two, not {n}"),
+            },
+            warning_config: Some(Box::new(self.diagnostic_pragmas.current.clone())),
+        });
     }
 }
 

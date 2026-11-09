@@ -75,6 +75,8 @@ jobs:
     - name: Verify retained evidence hashes
       run: python3 scripts/verify_evidence_hashes.py
     - name: Build
+      env:
+        LCCC_BUILD_JOBS: "2"
       run: |
         set +e
         ./scripts/build_lccc_fast.sh 2>&1 | tee "$RUNNER_TEMP/lccc-build.log"
@@ -972,6 +974,8 @@ jobs:
       run: python3 tests/linker/test_pr826_redteam.py
     - name: Preprocessor rescanning, conditional comma, character constants, wchar_t and pragma rendering
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_frontend_preprocessor_rules.sh
+    - name: Feature capability truthfulness
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_feature_capabilities.sh
     - name: RISC-V shared-binding mutation controls
       run: python3 tests/linker/test_riscv_shared_binding.py
     - name: Verify manifest Rust-toolchain selection
@@ -1312,6 +1316,10 @@ jobs:
       run: python3 tests/regression/check_peephole_alloc_before_filter.py
     - name: Verify the allocate-before-filter ratchet contracts
       run: python3 tests/regression/test_check_peephole_alloc_before_filter.py
+    - name: SIMD commutativity must agree across the 128/256/512-bit layers
+      run: python3 tests/regression/check_simd_commutativity_agreement.py
+    - name: Verify the SIMD commutativity ratchet contracts
+      run: python3 tests/regression/test_check_simd_commutativity_agreement.py
     - name: Check builtin_cpu_supports runtime semantics
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_cpu_supports_runtime.sh
     - name: Host-clock macros against the zone database
@@ -1520,6 +1528,12 @@ jobs:
       run: |
         set -euo pipefail
         python3 -m unittest discover -s tests/simd -p 'test_*.py'
+        # SA-53: the audit pack's own self-tests ran here, but the driver was
+        # never run against the built compiler, so its `fixed` rows were
+        # decoration -- SA-05 and SA-33 stayed broken behind green CI.  The
+        # asm/diag rows need no host ISA; the runtime rows SKIP with an
+        # explicit reason where the runner lacks AVX-512.
+        python3 tests/simd/check_audit_2026-11-08.py --lccc target/fastbuild/lccc --reference gcc-16
         python3 tests/simd/check_scoreboard.py --check-clock-failure --lccc target/fastbuild/lccc --reference gcc-16
         python3 tests/simd/check_lightpixel.py --require-native --lccc target/fastbuild/lccc --reference gcc-16
         python3 tests/simd/check_joint_pixels.py --lccc target/fastbuild/lccc --reference gcc-16
@@ -1858,6 +1872,10 @@ jobs:
       run: bash tests/regression/check_seg_copy_sweep.sh
     - name: Run chroot bind regression
       run: bash tests/regression/check_chroot_bind.sh
+    - name: Vector reloads of a just-stored aligned home must be register copies
+      run: python3 tests/simd/check_aligned_vector_reload.py --lccc target/fastbuild/lccc
+    - name: Verify the aligned-vector-reload ratchet contracts
+      run: python3 tests/simd/test_check_aligned_vector_reload.py
     needs:
     - build
   backend:
@@ -2979,6 +2997,9 @@ jobs:
         python3 tests/regression/check_riscv_rvc_parity.py --lccc target/fastbuild/lccc-riscv
         bash tests/regression/check_gla_cross_reach_band.sh
         bash tests/regression/check_asm_goto_phi_edge.sh
+        # SV-03: address-only speculation must leave exactly one load, with
+        # a PROT_NONE untaken pointer as the trapping-load canary.
+        bash tests/regression/check_cond_load_sink.sh
         python3 scripts/edg_corpus_mine.py selftest
         # IPA-RA must not summarize weak/interposable bodies: a strong
         # override linked from another TU clobbers %r8-%r11 (was 55, not 79)
@@ -3693,6 +3714,17 @@ jobs:
         "$binary" --version | tee intel-evidence/version.txt
         "$binary" -E -dM -x c /dev/null > intel-evidence/macros.txt
         sha256sum "$binary" > intel-evidence/binary.sha256
+    - name: SV-03 conditional-load sink four-compiler execution proof
+      env:
+        CCC: target/fastbuild/lccc
+        GCC16: gcc-16
+      run: |
+        set -euo pipefail
+        mkdir -p intel-evidence
+        export CLANG23="${CLANG:-clang-23}"
+        export ICX="$LCCC_ICX_BIN"
+        bash tests/regression/check_cond_load_sink.sh --self-test
+        bash tests/regression/check_cond_load_sink.sh 2>&1 | tee intel-evidence/cond-load-sink.log
     - name: Vector integer-address snapshot against four compilers
       run: |
         set -euo pipefail

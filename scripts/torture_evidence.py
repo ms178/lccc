@@ -167,7 +167,7 @@ def validate(data: object) -> list[str]:
         if not isinstance(test, str) or not test.strip():
             errors.append(f"results[{index}] has no usable test name: {test!r}")
             continue
-        if status not in STATUSES:
+        if not isinstance(status, str) or status not in STATUSES:
             errors.append(f"results[{index}] ({test}) has unknown status {status!r}")
         if flag not in declared:
             # An undeclared configuration is how a failing -O3 result hides in a
@@ -212,7 +212,8 @@ def validate(data: object) -> list[str]:
         # satisfy it (and the digest, if it was rebuilt for the reduced row set)
         # while one whole declared configuration contributes nothing: -O3 quietly
         # disappearing is not the same claim as -O3 passing everything.
-        reported = {row.get("flags") for row in results if isinstance(row, dict)}
+        reported = {row["flags"] for row in results
+                    if isinstance(row, dict) and isinstance(row.get("flags"), str)}
         missing = sorted(set(declared) - reported)
         if missing:
             errors.append(f"declared configuration(s) with no rows in a complete report: "
@@ -225,7 +226,8 @@ def validate(data: object) -> list[str]:
                 not isinstance(k, str) or not _is_count(v) for k, v in counts.items()):
             errors.append("counts must map status names to non-negative integers")
         else:
-            recomputed = Counter(r["status"] for r in results if isinstance(r, dict))
+            recomputed = Counter(r["status"] for r in results
+                                 if isinstance(r, dict) and isinstance(r.get("status"), str))
             if dict(recomputed) != {k: v for k, v in counts.items()}:
                 errors.append(f"counts disagree with results: {dict(sorted(counts.items()))} "
                               f"vs {dict(sorted(recomputed.items()))}")

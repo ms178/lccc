@@ -25,6 +25,11 @@ on:
         required: false
         default: 'x86_64'
         type: string
+      audit_scaling:
+        description: 'Measure declaration scaling against GCC 16.2'
+        required: false
+        default: false
+        type: boolean
       flags:
         description: 'Comma-separated optimization configurations'
         required: false
@@ -61,13 +66,10 @@ jobs:
       # asserts this value at the point of use as well, so the pin survives a
       # provisioning step that silently fails to shadow `gcc-16`.
       GCC_TORTURE_GCC_VERSION: '16.2'
-      # A full corpus has candidate failures today (the campaign record
-      # inventories 49 x86-64 / 48 i686 compile-leg gaps, and known gap 1 says
-      # the per-test inventory is the deliverable). The driver publishes those
-      # -- both files are uploaded as this lane's artifact -- and keeps the lane
-      # green on runner exit 1, while exit 2 (all-skipped, reference preflight,
-      # mid-flight input drift) is still fatal. Flip to strict by removing this
-      # line once a baseline inventory is checked in.
+      # Preserve runner exit-1 reports for the separate per-case ratchet below;
+      # exit 2 remains fatal. A whole-corpus job passes only if the validated
+      # report matches the checked-in identity and every prior outcome. Filtered
+      # dispatches are explicitly advisory and do not run that ratchet.
       GCC_TORTURE_ADVISORY_FAILURES: '1'
       GCC_TORTURE_FLAGS: ${{ inputs.flags }}
       GCC_TORTURE_FILTER: ${{ inputs.filter }}
@@ -139,10 +141,51 @@ jobs:
           set -euo pipefail
           test "$(cat target/fastbuild/ci-build.commit)" = "$(git rev-parse HEAD)"
           sha256sum -c target/fastbuild/ci-build.sha256
+      - name: Measure declaration scaling against GCC 16.2
+        if: ${{ inputs.audit_scaling && inputs.arch == 'x86_64' }}
+        env:
+          RESULTS_DIR: ${{ runner.temp }}/gcc17-torture/${{ inputs.arch }}
+        run: |
+          python3 scripts/measure_decl_scaling.py \
+            --lccc target/fastbuild/lccc --gcc "$(command -v gcc-16)" \
+            --json "$RESULTS_DIR/declaration-scaling.json"
       - name: Run full GCC 17 compile + execute corpus
+        id: campaign
         env:
           GCC_TORTURE_RESULTS_DIR: ${{ runner.temp }}/gcc17-torture/${{ inputs.arch }}
         run: bash scripts/ci_gcc17_torture.sh "${{ inputs.arch }}"
+      - name: Publish validated case inventory to check annotations
+        if: ${{ steps.campaign.outcome == 'success' }}
+        env:
+          RESULTS_DIR: ${{ runner.temp }}/gcc17-torture/${{ inputs.arch }}
+          ARCH: ${{ inputs.arch }}
+        run: |
+          python3 scripts/torture_ci_summary.py \
+            "$RESULTS_DIR/$ARCH-execute.json" "$RESULTS_DIR/$ARCH-compile.json"
+      - name: Publish whole-corpus provenance
+        if: ${{ steps.campaign.outcome == 'success' && inputs.filter == '' }}
+        env:
+          RESULTS_DIR: ${{ runner.temp }}/gcc17-torture/${{ inputs.arch }}
+          ARCH: ${{ inputs.arch }}
+        run: |
+          python3 scripts/torture_ci_provenance.py \
+            "$RESULTS_DIR/$ARCH-execute.json" "$RESULTS_DIR/$ARCH-compile.json"
+      - name: Enforce whole-corpus per-case ratchet
+        if: ${{ steps.campaign.outcome == 'success' && inputs.filter == '' }}
+        env:
+          RESULTS_DIR: ${{ runner.temp }}/gcc17-torture/${{ inputs.arch }}
+          ARCH: ${{ inputs.arch }}
+        run: |
+          status=0
+          for mode in execute compile; do
+            python3 scripts/torture_ci_ratchet.py \
+              "$RESULTS_DIR/$ARCH-$mode.json" \
+              "engineering/evidence/gcc17-torture-baseline/$ARCH-$mode.json" || status=1
+          done
+          exit "$status"
+      - name: Mark filtered runs as advisory
+        if: ${{ steps.campaign.outcome == 'success' && inputs.filter != '' }}
+        run: echo '::warning title=Filtered corpus::Filtered dispatch is advisory and does not run the whole-corpus ratchet.'
       - name: Publish machine-readable reports and failures
         if: always()
         uses: actions/upload-artifact@v7

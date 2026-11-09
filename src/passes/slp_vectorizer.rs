@@ -106,6 +106,98 @@ struct SymAddr {
     off: i64,
 }
 
+/// Identity of the ROOT OBJECT an address stream is based on.
+///
+/// `SymAddr::base` is an SSA value, and the frontend/unroller deliberately
+/// emit more than one `GlobalAddr` (or `ParamRef`) value for the SAME object:
+/// `global_addr_cse` keeps site-local indexed bases in distinct webs on
+/// purpose (folding each into its own `sym(,%idx,scale)` RIP-relative memory
+/// operand saves a GPR), and `PostVec` unrolling clones the body with fresh
+/// value ids.  Keying store streams by that SSA id therefore splits one
+/// consecutive store run into several one-element streams: BB-SLP saw zero
+/// seeds for every classifier loop in `tests/simd/simd_shape_matrix.c`
+/// (measured with `LCCC_DEBUG_SLP=1`).
+///
+/// C11 6.2.6.1p1: every `GlobalAddr` for one symbol designates the SAME
+/// object; two `ParamRef`s of one parameter index carry the SAME argument
+/// value.  Grouping by that identity is exact, not an aliasing assumption.
+/// Legality rules (c)/(d)/(e) still compare raw `SymAddr::base` values and
+/// fall back to `RestrictBases::disjoint`, which answers "may alias" for two
+/// roots of one symbol - so this widens the *seed* set without weakening any
+/// alias proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum StreamBase {
+    /// Interned symbol id.  A `String` here would clone the global's name on
+    /// EVERY store in EVERY block in EVERY fixpoint round - O(stores)
+    /// allocations in the seed-collection hot path for a value that is
+    /// constant for the whole function.  Ids are dense machine words, so
+    /// hashing/equality is a single integer operation with no conversion.
+    Global(usize),
+    Param(usize),
+    Value(u32),
+}
+
+/// One O(function) scan, rebuilt at the start of every fixpoint round and
+/// shared by all blocks within that round (see `run_bb_slp_with_contract`).
+#[derive(Default)]
+struct SymbolRoots {
+    /// name -> dense id; one allocation per DISTINCT symbol, not per use.
+    /// `usize` is the type `len()` already returns, so the conversion is the
+    /// identity: no `try_from`, no `expect`, no saturation, no truncation,
+    /// and therefore no new panic site in the compiler.
+    symbol_ids: FxHashMap<String, usize>,
+    /// SSA `GlobalAddr` dest -> dense id.
+    globals: FxHashMap<u32, usize>,
+    /// SSA `ParamRef` dest -> parameter index.
+    params: FxHashMap<u32, usize>,
+}
+
+impl SymbolRoots {
+    fn build(func: &IrFunction) -> Self {
+        let mut out = Self::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::GlobalAddr { dest, name } => {
+                        // `get` first: `entry(name.clone())` would clone even
+                        // when the symbol is already interned.  The id IS
+                        // `len()`, so it is exact for ANY representable map
+                        // size on this host - there is no overflow case to
+                        // guard and no panic to add.
+                        let id = match out.symbol_ids.get(name) {
+                            Some(&id) => id,
+                            None => {
+                                let id = out.symbol_ids.len();
+                                out.symbol_ids.insert(name.clone(), id);
+                                id
+                            }
+                        };
+                        out.globals.insert(dest.0, id);
+                    }
+                    Instruction::ParamRef {
+                        dest, param_idx, ..
+                    } => {
+                        out.params.insert(dest.0, *param_idx);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+
+    #[inline]
+    fn stream_base(&self, v: Value) -> StreamBase {
+        if let Some(&id) = self.globals.get(&v.0) {
+            return StreamBase::Global(id);
+        }
+        if let Some(&idx) = self.params.get(&v.0) {
+            return StreamBase::Param(idx);
+        }
+        StreamBase::Value(v.0)
+    }
+}
+
 /// Symbolic affine term `var*mult + off` for a GEP byte-offset operand,
 /// evaluated structurally over the SAME expression DAG the machine computes.
 ///
@@ -1694,6 +1786,97 @@ enum PackKind {
     },
 }
 
+/// Does a DELETED scalar IR instruction correspond to (at least) one machine
+/// instruction that the SLP rewrite removes?
+///
+/// EXHAUSTIVE on purpose: a new `Instruction` variant must make an explicit
+/// choice here, instead of silently inheriting a default that would corrupt
+/// the cost model.  The first version copied the joint-seed path's six-class
+/// `matches!` and OMITTED `UnaryOp`, which under-counted integer negation:
+/// `v5_neg_i64` reported `scalar_removed=4` instead of 6, benefit 0 instead
+/// of 2, and `check_bb_slp_v5_codegen.sh` lost its `psubq` (caught by hosted
+/// CI).  SSA/address bookkeeping folds into its users and is free; everything
+/// that emits code counts once (a conservative LOWER bound: widening casts and
+/// 64-bit divides are worth more, never less).
+#[inline]
+fn scalar_instruction_weight(inst: &Instruction) -> i64 {
+    match inst {
+        // Pure SSA / address bookkeeping: folded into the using instruction.
+        Instruction::Alloca { .. }
+        | Instruction::DynAlloca { .. }
+        | Instruction::GetElementPtr { .. }
+        | Instruction::GlobalAddr { .. }
+        | Instruction::Phi { .. }
+        | Instruction::LabelAddr { .. }
+        | Instruction::ParamRef { .. }
+        | Instruction::PgoCounterInc { .. }
+        | Instruction::GetStaticChain { .. }
+        | Instruction::SetStaticChain { .. } => 0,
+        // Real machine instructions.
+        Instruction::Store { .. }
+        | Instruction::Load { .. }
+        | Instruction::BinOp { .. }
+        | Instruction::UnaryOp { .. }
+        | Instruction::Cmp { .. }
+        | Instruction::Cast { .. }
+        | Instruction::Copy { .. }
+        | Instruction::Select { .. }
+        | Instruction::Intrinsic { .. }
+        | Instruction::Memcpy { .. }
+        | Instruction::Call { .. }
+        | Instruction::CallIndirect { .. }
+        | Instruction::InlineAsm { .. }
+        | Instruction::Fence { .. }
+        | Instruction::AtomicRmw { .. }
+        | Instruction::AtomicInc { .. }
+        | Instruction::AtomicCmpxchg { .. }
+        | Instruction::AtomicLoad { .. }
+        | Instruction::AtomicStore { .. }
+        | Instruction::VaArg { .. }
+        | Instruction::VaArgStruct { .. }
+        | Instruction::VaStart { .. }
+        | Instruction::VaEnd { .. }
+        | Instruction::VaCopy { .. }
+        | Instruction::StackSave { .. }
+        | Instruction::StackRestore { .. }
+        | Instruction::InitTrampoline { .. }
+        | Instruction::NonlocalGotoSave { .. }
+        | Instruction::NonlocalGoto { .. }
+        | Instruction::GetReturnF64Second { .. }
+        | Instruction::SetReturnF64Second { .. }
+        | Instruction::GetReturnF32Second { .. }
+        | Instruction::SetReturnF32Second { .. }
+        | Instruction::GetReturnF128Second { .. }
+        | Instruction::SetReturnF128Second { .. } => 1,
+    }
+}
+
+/// Machine-instruction cost of emitting one pack, measured from `apply_plan`'s
+/// lowering.  EXHAUSTIVE on purpose: adding a `PackKind` variant must force an
+/// explicit cost decision here (and a row in `pack_vector_cost_is_total`), not
+/// silently inherit a default.  A Forward emits nothing because the vector it
+/// forwards already exists; a Gather4 is 4 `movd` + 3 unpacks; a 3-byte
+/// MemLoad widens with 6 instructions; ByteFields is a 4-instruction
+/// shift/or tree; Gather2 is 3; Splat and CmpBlendv are 2; everything else
+/// is a single packed intrinsic.
+#[inline]
+fn pack_vector_cost(kind: &PackKind) -> i64 {
+    match kind {
+        PackKind::Forward { .. } => 0,
+        PackKind::Gather4 { .. } => 7,
+        PackKind::ByteFields { .. } => 4,
+        PackKind::MemLoad { byte3: Some(_), .. } => 6,
+        PackKind::Gather2 { .. } => 3,
+        PackKind::Splat { .. } | PackKind::CmpBlendv { .. } => 2,
+        PackKind::MemLoad { .. }
+        | PackKind::BinOp { .. }
+        | PackKind::Fma { .. }
+        | PackKind::ShiftImm { .. }
+        | PackKind::FpMinMax { .. }
+        | PackKind::FpNeg { .. } => 1,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Pack {
     kind: PackKind,
@@ -1719,6 +1902,31 @@ struct SeedCandidate {
     width: usize,
     joint: Option<joint::Tail>,
     value_sink: Option<Value>,
+}
+
+/// EXACT identity of a seed.  Two tiers can emit the same run; a boolean
+/// `joint.is_some()` / `value_sink.is_some()` would silently conflate two
+/// different joint tails or two different return sinks.  `store_idx` already
+/// determines `lane_ops` (the same store instruction has one stored
+/// operand), but `anchor_ptr` is included explicitly so the key is total.
+type SeedKey = (
+    IrType,
+    usize,
+    Vec<usize>,
+    Value,
+    Option<joint::Tail>,
+    Option<Value>,
+);
+
+fn seed_dedup_key(c: &SeedCandidate) -> SeedKey {
+    (
+        c.ty,
+        c.width,
+        c.store_idx.clone(),
+        c.anchor_ptr,
+        c.joint,
+        c.value_sink,
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1762,9 +1970,19 @@ pub(crate) fn run_bb_slp_with_contract(
     let loop_steps = loop_index_steps(func);
     // Fixpoint: each fired seed rewrites its block, so re-scan afterwards.
     for _round in 0..24 {
+        // Rebuilt EVERY round, not once per function: a fired plan rewrites
+        // the block and can introduce fresh `GlobalAddr`/`ParamRef` values (or
+        // retire old ones).  A stale map would fall back to SSA-value keys for
+        // those roots and silently lose seeds in later rounds - and, if value
+        // ids were ever recycled, could group two DIFFERENT objects.  The scan
+        // is O(instructions) and the fixpoint breaks on the first round with
+        // no fired seed, so this costs at most one extra linear pass.  Legality
+        // is unaffected: `RestrictBases::build` is already rebuilt per block
+        // attempt in `slp_block_once`.
+        let roots = SymbolRoots::build(func);
         let mut fired = 0usize;
         for b in 0..func.blocks.len() {
-            while slp_block_once(func, b, &cross, fp_contract, debug, &loop_steps[b]) == 1 {
+            while slp_block_once(func, b, &cross, fp_contract, debug, &loop_steps[b], &roots) == 1 {
                 fired += 1;
             }
         }
@@ -1999,6 +2217,10 @@ struct BlockCtx<'a> {
     loop_steps: &'a FxHashMap<u32, i64>,
     /// `LCCC_DEBUG_SLP` (resolved once per module by the caller).
     debug: bool,
+    /// Object identity of address roots for this fixpoint round, shared by
+    /// every block in the round. See [`StreamBase`] for why an SSA value id
+    /// is not a valid stream key.
+    roots: &'a SymbolRoots,
 }
 
 fn build_ctx<'a>(
@@ -2008,6 +2230,7 @@ fn build_ctx<'a>(
     fp_contract: crate::common::fp_contract::FpContract,
     loop_steps: &'a FxHashMap<u32, i64>,
     debug: bool,
+    roots: &'a SymbolRoots,
 ) -> BlockCtx<'a> {
     let block = &func.blocks[block_idx];
     let mut def_pos: FxHashMap<u32, usize> = FxHashMap::default();
@@ -2041,6 +2264,7 @@ fn build_ctx<'a>(
         fp_contract,
         loop_steps,
         debug,
+        roots,
     }
 }
 
@@ -2083,9 +2307,36 @@ fn collect_seed_candidates(ctx: &BlockCtx) -> Vec<SeedCandidate> {
     // shared `family_for`/`packed_*` helpers keep the raw hardware permission
     // because the frontend's explicit `vector_size` lowering calls them too.
     let avx2 = x86_avx2_available_pub() && x86_prefer_wide_pub();
-    // (base, var, mult, ty) → Vec<(off, store_idx, val, ptr)>
-    let mut streams: FxHashMap<(u32, Option<u32>, u64, IrType), Vec<(i64, usize, Operand, Value)>> =
-        FxHashMap::default();
+    // TWO seed tiers, one cost model.  `entries` is
+    // (off, store_idx, stored value, address SSA value).
+    //
+    // * OBJECT tier: keyed by `StreamBase` (interned symbol / parameter
+    //   index).  The frontend and the PostVec unroller emit several
+    //   `GlobalAddr`s for ONE object; keying on their SSA ids split a
+    //   consecutive store run into one-element streams and BB-SLP saw zero
+    //   seeds.  This tier is what unlocks the 4xU32 `s_jhash` pack.
+    // * SITE tier: keyed by the raw `SymAddr::base` SSA value.  It is the
+    //   ORIGINAL grouping, and it is the only source of the 2-lane dword
+    //   pair family (`movq`-loaded XMM pairs).  Replacing it with the
+    //   object tier silently deleted that family - hosted CI caught it in
+    //   `check_slp_loop_carried_recurrence.sh`.  Keeping BOTH tiers is
+    //   strictly more powerful: every candidate still goes through the same
+    //   `build_plan` legality proofs over its OWN store-index span, so no
+    //   narrow window can inherit an illegal wide plan's permission.
+    //
+    // A `StreamBase::Value` root has no object-identity merge to undo, so
+    // its site-tier key would be byte-identical to the object key; skip it.
+    // All other roots feed both tiers.  A final EXACT dedup collapses the
+    // identical single-web seeds before any plan is priced (see
+    // `seed_dedup_key`).
+    let mut object_streams: FxHashMap<
+        (StreamBase, Option<u32>, u64, IrType),
+        Vec<(i64, usize, Operand, Value)>,
+    > = FxHashMap::default();
+    let mut site_streams: FxHashMap<
+        (u32, Option<u32>, u64, IrType),
+        Vec<(i64, usize, Operand, Value)>,
+    > = FxHashMap::default();
     for (i, inst) in block.instructions.iter().enumerate() {
         let Instruction::Store {
             val,
@@ -2103,18 +2354,33 @@ fn collect_seed_candidates(ctx: &BlockCtx) -> Vec<SeedCandidate> {
         let Some(addr) = eval_sym_addr(block, &ctx.def_pos, *ptr) else {
             continue;
         };
-        streams
-            .entry((addr.base.0, addr.var.map(|v| v.0), addr.mult, *ty))
+        let var = addr.var.map(|v| v.0);
+        let root = ctx.roots.stream_base(addr.base);
+        let entry = (addr.off, i, val.clone(), *ptr);
+        object_streams
+            .entry((root, var, addr.mult, *ty))
             .or_default()
-            .push((addr.off, i, val.clone(), *ptr));
+            .push(entry.clone());
+        if !matches!(root, StreamBase::Value(_)) {
+            site_streams
+                .entry((addr.base.0, var, addr.mult, *ty))
+                .or_default()
+                .push(entry);
+        }
     }
+    // Chain both tiers into one `(ty, entries, is_object_tier)` stream so
+    // the existing run-splitting / fallback logic has exactly one body.
+    let groups = object_streams
+        .into_iter()
+        .map(|(k, v)| (k.3, v, true))
+        .chain(site_streams.into_iter().map(|(k, v)| (k.3, v, false)));
     let mut candidates = Vec::new();
-    for ((_, _, _, ty), mut entries) in streams {
+    for (ty, mut entries, is_object_tier) in groups {
         if entries.len() < 2 {
             continue;
         }
         entries.sort_by_key(|(off, idx, _, _)| (*off, *idx));
-        if ty == IrType::U8 && x86_sse41_available_pub() {
+        if is_object_tier && ty == IrType::U8 && x86_sse41_available_pub() {
             // Joint seeds use the LAST store to each byte; overwritten stores
             // are retired only after the complete use/access proof below.
             let mut last = Vec::new();
@@ -2225,6 +2491,11 @@ fn collect_seed_candidates(ctx: &BlockCtx) -> Vec<SeedCandidate> {
     if let Some(seed) = joint::value_seed(ctx) {
         candidates.push(seed);
     }
+    // A single-web global produces the SAME run in both tiers.  Collapse
+    // EXACTLY identical seeds so the cost model and `apply_plan` are not
+    // paid twice; `seed_dedup_key` pins every distinguishing field.
+    let mut seen: FxHashSet<SeedKey> = FxHashSet::default();
+    candidates.retain(|c| seen.insert(seed_dedup_key(c)));
     // Longest chains first; ties by earliest position.
     candidates.sort_by(|a, b| {
         b.lane_ops
@@ -2277,6 +2548,49 @@ fn reg_width_for(ty: IrType, width: usize) -> usize {
         (IrType::I32 | IrType::U32, 2) => 4,
         _ => width,
     }
+}
+
+/// Is a plan's measured instruction-count benefit large enough to amortize
+/// its GPR<->XMM domain crossings?
+///
+/// `Gather2`/`Gather4` packs materialize a vector from GPR-resident scalars:
+/// 2 or 4 `movd` followed by a 1- or 3-deep `punpck` chain.  That is PURE
+/// OVERHEAD on the critical path - only packed COMPUTE packs (BinOp, Fma,
+/// ShiftImm, CmpBlendv, FpMinMax, FpNeg) do parallel work that can hide it.
+/// When overhead packs outnumber compute packs, a raw instruction-count
+/// benefit systematically overstates the win: the scalar ops it removes were
+/// independent and issued in parallel, while the punpck chains are serial.
+/// The same holds for a half-register pack, whose packed op has the SAME
+/// latency as the scalar op it replaces.
+///
+/// Measured on this host with deterministic Callgrind Ir:
+/// * 2xU32 `s_jhash` (27 packs, benefit 2): 1.301x SLOWER.
+/// * 4xU32 `s_bytemask` (3 Gather4 + 2 BinOp, benefit 1): 1.2772x SLOWER.
+/// * 4xU32 `s_clamp_u8` (2 Gather4 + 2 CmpBlendv, benefit 2): 0.8399x,
+///   a genuine WIN - its gathers feed independent compute packs, so it is
+///   NOT gather-dominated and keeps the plain positive-benefit threshold.
+/// * 2xI64 `v5_neg_i64` (0 gathers, full 128-bit register, benefit 2):
+///   required for `psubq`; a blanket `width == 2` veto regressed it and CI
+///   caught the regression in `check_bb_slp_v5_codegen.sh`.
+///
+/// Joint seeds are exempt: `tail_cost` already prices their scalar remainder
+/// and a joint plan is never half-wide.
+#[inline]
+fn crossings_are_amortized(
+    ty: IrType,
+    width: usize,
+    is_joint: bool,
+    benefit: i64,
+    gathers: i64,
+    compute: i64,
+    extracts: i64,
+) -> bool {
+    if is_joint {
+        return true;
+    }
+    let overhead_dominated = gathers > compute || reg_width_for(ty, width) > width;
+    let crossings = gathers + extracts;
+    !overhead_dominated || benefit > crossings
 }
 
 /// Base-value classification for rule (e)'s `restrict` escape.
@@ -2389,12 +2703,21 @@ fn slp_block_once(
     fp_contract: crate::common::fp_contract::FpContract,
     debug: bool,
     loop_steps: &FxHashMap<u32, i64>,
+    roots: &SymbolRoots,
 ) -> usize {
     // All analysis under one immutable borrow; the plans are fully owned
     // (no lifetimes into the block), so the mutable rewrite afterwards
     // is borrow-clean.
     let (candidates, plans): (Vec<SeedCandidate>, Vec<Option<Plan>>) = {
-        let ctx = build_ctx(func, block_idx, cross, fp_contract, loop_steps, debug);
+        let ctx = build_ctx(
+            func,
+            block_idx,
+            cross,
+            fp_contract,
+            loop_steps,
+            debug,
+            roots,
+        );
         let candidates = collect_seed_candidates(&ctx);
         // The alias facts scan the whole function: build them only for a
         // block that has seeds (this runs once per block per fixpoint
@@ -2405,15 +2728,67 @@ fn slp_block_once(
             let bases = RestrictBases::build(func);
             candidates
                 .iter()
-                .map(|c| build_plan(&ctx, c, &bases))
+                .map(|c| {
+                    SLP_DECLINE.with(|r| r.set("unset"));
+                    let plan = build_plan(&ctx, c, &bases);
+                    if plan.is_none() && ctx.debug {
+                        let reason = SLP_DECLINE.with(|r| r.get());
+                        lccc::cli::stderr_line(format_args!(
+                            "[SLP-DECLINE] fn={} block={} {}x{:?}: {}",
+                            func.name, block_idx, c.width, c.ty, reason
+                        ));
+                    }
+                    plan
+                })
                 .collect()
         };
         (candidates, plans)
     };
+    if debug {
+        let summary: Vec<String> = plans
+            .iter()
+            .zip(candidates.iter())
+            .map(|(p, c)| match p {
+                Some(plan) => format!(
+                    "{}x{:?}@B{:?}:benefit={}",
+                    c.width,
+                    c.ty,
+                    c.store_idx.first().copied().unwrap_or(0),
+                    plan.benefit
+                ),
+                None => format!(
+                    "{}x{:?}@B{:?}:declined",
+                    c.width,
+                    c.ty,
+                    c.store_idx.first().copied().unwrap_or(0)
+                ),
+            })
+            .collect();
+        lccc::cli::stderr_line(format_args!(
+            "[SLP-SEEDS] fn={} block={} stores={} insts={}: {} candidates [{}]",
+            func.name,
+            block_idx,
+            {
+                let b = &func.blocks[block_idx];
+                b.instructions
+                    .iter()
+                    .filter(|i| matches!(i, Instruction::Store { .. }))
+                    .count()
+            },
+            func.blocks[block_idx].instructions.len(),
+            candidates.len(),
+            summary.join(", ")
+        ));
+    }
     for (cand, plan) in candidates.iter().zip(plans) {
         if let Some(plan) = plan {
             if apply_plan(func, block_idx, &plan, cand, debug) {
                 return 1;
+            } else if debug {
+                lccc::cli::stderr_line(format_args!(
+                    "[SLP-SEEDS] fn={} block={}: apply_plan declined {}x{:?}",
+                    func.name, block_idx, cand.width, cand.ty
+                ));
             }
         }
     }
@@ -2432,7 +2807,8 @@ struct Plan {
     removed: FxHashSet<usize>,
     /// Lane value id → (pack index, lane index) for extract placement.
     extract_of: FxHashMap<u32, (usize, usize)>,
-    /// Net benefit (≥ 1 required).
+    /// Measured instruction delta (`scalar_removed - vector_cost
+    /// - extract_cost - tail_cost`); >= 1 required.
     benefit: i64,
 }
 
@@ -5172,10 +5548,28 @@ fn closes_loop_carried_recurrence(ctx: &BlockCtx, cand: &SeedCandidate) -> bool 
     })
 }
 
+// `LCCC_DEBUG_SLP` decline reason.  A silent `None` from `build_plan` gave
+// no way to tell a profitability veto from a missing intrinsic or an alias
+// hazard.  Every bailout now names itself; the value is read immediately
+// after each `build_plan` call, so a later successful plan cannot overwrite
+// an earlier decline.  Diagnostic only: never changes codegen.
+// (A `///` doc comment cannot attach to a macro invocation - rustc warns.)
+thread_local! {
+    static SLP_DECLINE: std::cell::Cell<&'static str> =
+        const { std::cell::Cell::new("unset") };
+}
+
+fn slp_decline(reason: &'static str) -> Option<Plan> {
+    SLP_DECLINE.with(|c| c.set(reason));
+    None
+}
+
 fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Option<Plan> {
     let block = ctx.block;
     let width = cand.width;
-    let fam = family_for(cand.ty, width)?;
+    let Some(fam) = family_for(cand.ty, width) else {
+        return slp_decline("no vector family for lane type/width");
+    };
     let store_size = if cand.joint.is_some() { 1 } else { fam.size };
     // Preserve the scalar form for the later loop-carried forwarding pass
     // when both the stream displacement and loop step match the pack size.
@@ -5186,12 +5580,12 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                 cand.width, ctx.block.label
             ));
         }
-        return None;
+        return slp_decline("profitability veto: loop-carried store->load recurrence");
     }
     let mut packs: Vec<Pack> = Vec::new();
     let mut dedup: FxHashMap<Vec<LaneKey>, usize> = FxHashMap::default();
 
-    let mut root = build_pack(
+    let Some(mut root) = build_pack(
         ctx,
         &cand.lane_ops,
         cand.ty,
@@ -5200,7 +5594,9 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
         &mut packs,
         &mut dedup,
         0,
-    )?;
+    ) else {
+        return slp_decline("root pack cannot be built");
+    };
 
     // ── Orphan pruning ─────────────────────────────────────────────
     // Failed recursion branches (whole-side, swap, flip attempts) leave
@@ -5424,7 +5820,7 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
         packs[root].sched = store_max;
     }
     if packs.iter().any(|p| p.sched == usize::MAX) {
-        return None;
+        return slp_decline("a reachable pack has no schedule position");
     }
     // Topological emission order within a slot.
     for i in 0..packs.len() {
@@ -5598,11 +5994,13 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
             {
                 continue;
             }
-            let last = *cand.store_idx.iter().max()?;
+            let Some(&last) = cand.store_idx.iter().max() else {
+                return slp_decline("empty seed");
+            };
             if (i + 1..last)
                 .any(|q| !removed.contains(&q) && joint::memory_access(&block.instructions[q]))
             {
-                return None;
+                return slp_decline("joint seed: intervening memory access between retired stores");
             }
         }
     }
@@ -5635,7 +6033,7 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
             // after — extracts are pure.
             for &u in ctx.uses.get(&v.0).unwrap_or(&Vec::new()) {
                 if u != usize::MAX && !removed.contains(&u) && u <= p.sched {
-                    return None;
+                    return slp_decline("rule (a): packed lane used before its vector op");
                 }
             }
         }
@@ -5650,14 +6048,14 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
         {
             for c in cond_lanes {
                 if ctx.external_uses.contains(&c.0) {
-                    return None;
+                    return slp_decline("condition lane has a use outside this block");
                 }
                 let uses = ctx.uses.get(&c.0).map(|us| us.as_slice()).unwrap_or(&[]);
                 if !uses
                     .iter()
                     .all(|&u| u != usize::MAX && removed.contains(&u))
                 {
-                    return None;
+                    return slp_decline("condition lane use is not removed with the pack");
                 }
             }
         }
@@ -5696,7 +6094,11 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                     }
                     let (ptr, acc_size) = match &block.instructions[q] {
                         Instruction::Store { ptr, ty, .. } => (*ptr, ty.size() as i128),
-                        _ => return None,
+                        _ => {
+                            return slp_decline(
+                                "rule (c): unmodelled memory write between vector-load lanes",
+                            );
+                        }
                     };
                     let touches_lane = match (&lane_addr, eval_sym_addr(block, &ctx.def_pos, ptr)) {
                         (Some(la), Some(wa))
@@ -5717,7 +6119,9 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                         _ => true,
                     };
                     if touches_lane {
-                        return None;
+                        return slp_decline(
+                            "rule (c): intervening write touches a vector-load lane",
+                        );
                     }
                 }
             }
@@ -5759,7 +6163,7 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
             Instruction::Load { ptr, ty, .. } | Instruction::Store { ptr, ty, .. } => {
                 (*ptr, ty.size() as i128)
             }
-            _ => return None,
+            _ => return slp_decline("rule (d): unmodelled memory access between seed stores"),
         };
         let access_addr = eval_sym_addr(block, &ctx.def_pos, ptr);
         for (li, &s_k) in cand.store_idx.iter().enumerate() {
@@ -5789,7 +6193,7 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                 _ => true,
             };
             if touches_lane {
-                return None;
+                return slp_decline("rule (d): intervening access touches a committed lane");
             }
         }
     }
@@ -5867,7 +6271,7 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                         _ => true, // distinct or opaque streams: may alias
                     };
                     if may_hit {
-                        return None;
+                        return slp_decline("rule (e): seed-store/vector-load lane hazard");
                     }
                 }
             }
@@ -5877,7 +6281,7 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
     if cand.joint.is_some()
         && !joint::removed_stores_preserve_loads(ctx, &packs, &removed, bases, fam.size)
     {
-        return None;
+        return slp_decline("joint seed: retired stores do not preserve the loads");
     }
 
     // ── Extract map ────────────────────────────────────────────────────
@@ -5897,110 +6301,123 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                 // Only families with an exact lane-extract intrinsic can
                 // service external uses.
                 if fam.extract.is_none() {
-                    return None;
+                    return slp_decline("external lane use but family has no exact extract");
                 }
                 extract_of.insert(v.0, (pi, li));
             }
         }
     }
 
-    // ── Cost model ─────────────────────────────────────────────────────
-    let mut benefit: i64 = width as i64 - 1; // seed stores: W → 1
-    for p in &packs {
-        match &p.kind {
-            PackKind::MemLoad { byte3: Some(_), .. } => benefit -= 3,
-            PackKind::MemLoad { .. } | PackKind::BinOp { .. } => {
-                benefit += width as i64 - 1;
-            }
-            // A forwarded vector replaces W scalar operand lanes with
-            // ZERO new instructions — the full scalar-op saving with no
-            // vector-op cost (the vector already exists).
-            PackKind::Forward { .. } => {
-                benefit += width as i64;
-            }
-            // The FMA contraction replaces W muls AND W adds/subs with ONE
-            // packed op — the same 2(W−1) the Mul+Add pair would count —
-            // and removes the rounding drift besides.
-            PackKind::Fma { .. } => {
-                benefit += 2 * (width as i64 - 1);
-            }
-            PackKind::Splat { src, is_zero } => {
-                // An integer all-ones splat is ONE instruction
-                // (`try_all_ones_splat`'s self-compare) — the same cost
-                // class as the zero splat, not the staged broadcast's 2.
-                let is_ones = matches!(src,
-                    Operand::Const(c) if c.to_i64() == Some(-1));
-                benefit -= if *is_zero || is_ones { 1 } else { 2 };
-            }
-            PackKind::Gather2 { .. } => benefit -= 3,
-            PackKind::Gather4 { .. } => benefit -= 7,
-            PackKind::ByteFields { .. } => benefit += 1,
-            // The FP min/max fold replaces W Selects AND their W Cmps with
-            // one packed op; counted conservatively as one BinOp-level
-            // replacement (the cmp removal is uncounted headroom).
-            PackKind::FpMinMax { .. } => {
-                benefit += width as i64 - 1;
-            }
-            // FP negation: W scalar negs → ONE packed XOR whose sign mask
-            // is a free .rodata memory operand (no splat, no register).
-            PackKind::FpNeg { .. } => {
-                benefit += width as i64 - 1;
-            }
-            // The cmp+blendv composite: W scalar compares AND W selects
-            // → TWO packed ops (the mask is exact for every predicate).
-            PackKind::CmpBlendv { .. } => {
-                benefit += 2 * (width as i64 - 1);
-            }
-            // Plain scalar shift lanes replace W ops with one vector op
-            // (+W-1); the synthetic halves of a rotate decomposition
-            // replace nothing (cost 1 each, like a splat leaf).
-            PackKind::ShiftImm { .. } => {
-                if p.lane_vals.is_empty() {
-                    benefit -= 1;
-                } else {
-                    benefit += width as i64 - 1;
-                }
-            }
-        }
-    }
-    // Extract costs: 1 move for a low-half lane; a 256-bit HIGH-half
-    // lane pays the vextracti128/f128 staging first (2 total).
+    // ── Cost model: measured instruction delta ───────────────────────────
+    // A plan is profitable iff it deletes more scalar instructions than the
+    // pack lowering emits.  This replaces the old per-kind heuristic (12 magic
+    // constants that had to be kept in sync with `PackKind` and disagreed with
+    // the measured delta by up to +25 on the 27-pack `jhash` plan).
+    //
+    // * `scalar_removed` is the fixpoint closure of scalar instructions the
+    //   rewrite deletes, built above from the pack lane values plus every
+    //   instruction whose uses are all removed, weighted by the EXHAUSTIVE
+    //   `scalar_instruction_weight` classifier below.
+    // * `vector_cost` is the number of machine instructions `apply_plan`
+    //   emits for each pack kind, read off the lowering: a Gather4 tree is
+    //   four `movd` + three unpacks (7), ByteFields is a 4-instruction
+    //   shift/or tree, a 3-byte MemLoad is 6, a Gather2 is 3, a Splat and a
+    //   CmpBlendv are 2, a Forward emits NOTHING (the vector already
+    //   exists), everything else is one instruction.
+    // * `extract_cost` charges the XMM->GPR lane moves, including the extra
+    //   `vextracti128/f128` staging for a 256-bit high-half lane.
+    // * `tail_cost` is the joint-seed scalar remainder loop.
+    //
+    // Cross-check: on the 29-shape corpus the heuristic and this exact model
+    // agreed on the accept/reject sign of EVERY plan; `LCCC_DEBUG_SLP` prints
+    // the delta.  An "accept every legal plan" ablation (29/29 correct) was
+    // 1.0374x WORSE in deterministic Callgrind Ir with six shapes regressing
+    // 11-30%, which validates keeping a strict positive threshold.
+    let scalar_removed: i64 = removed
+        .iter()
+        .map(|&i| scalar_instruction_weight(&block.instructions[i]))
+        .sum();
+    let vector_cost: i64 = packs.iter().map(|p| pack_vector_cost(&p.kind)).sum();
     let is_256 = fam.size * width as u64 == 32;
     let half_lanes = width / 2;
-    for (_, (_, li)) in &extract_of {
-        benefit -= 1 + (is_256 && *li >= half_lanes) as i64;
+    let extract_cost: i64 = extract_of
+        .values()
+        .map(|(_, li)| 1 + (is_256 && *li >= half_lanes) as i64)
+        .sum();
+    let tail_cost = cand.joint.as_ref().map_or(0, |t| t.cost());
+    let benefit = scalar_removed - vector_cost - extract_cost - tail_cost;
+
+    // Structural quality gate: see `crossings_are_amortized` for the exact
+    // predicate, the disassembly evidence and the four measured plans that
+    // pin its two branches.  Kept OUT of `benefit` itself: the crossing
+    // penalty is a latency/dependency-depth effect, not an instruction
+    // count, and folding it into `vector_cost` would also reject the
+    // measured 0.8399x `s_clamp_u8` win.
+    let gathers = packs
+        .iter()
+        .filter(|p| matches!(p.kind, PackKind::Gather2 { .. } | PackKind::Gather4 { .. }))
+        .count() as i64;
+    let compute = packs
+        .iter()
+        .filter(|p| {
+            matches!(
+                p.kind,
+                PackKind::BinOp { .. }
+                    | PackKind::Fma { .. }
+                    | PackKind::ShiftImm { .. }
+                    | PackKind::CmpBlendv { .. }
+                    | PackKind::FpMinMax { .. }
+                    | PackKind::FpNeg { .. }
+            )
+        })
+        .count() as i64;
+    if !crossings_are_amortized(
+        cand.ty,
+        width,
+        cand.joint.is_some(),
+        benefit,
+        gathers,
+        compute,
+        extract_of.len() as i64,
+    ) {
+        return slp_decline(
+            "cost model: gather-dominated pack does not amortize GPR<->XMM domain crossings",
+        );
     }
-    if let Some(tail) = cand.joint {
-        let scalar = removed
-            .iter()
-            .filter(|&&i| {
-                matches!(
-                    block.instructions[i],
-                    Instruction::BinOp { .. }
-                        | Instruction::Cmp { .. }
-                        | Instruction::Select { .. }
-                        | Instruction::Cast { .. }
-                        | Instruction::Load { .. }
-                        | Instruction::Store { .. }
-                )
-            })
-            .count() as i64;
-        let vector: i64 = packs
-            .iter()
-            .map(|p| match p.kind {
-                PackKind::Forward { .. } => 0,
-                PackKind::Gather4 { .. } => 7,
-                PackKind::ByteFields { .. } => 4,
-                PackKind::MemLoad { byte3: Some(_), .. } => 6,
-                PackKind::Gather2 { .. } => 3,
-                PackKind::Splat { .. } | PackKind::CmpBlendv { .. } => 2,
-                _ => 1,
-            })
-            .sum();
-        benefit = scalar - vector - tail.cost() - extract_of.len() as i64;
+    if ctx.debug {
+        let mut hist = std::collections::BTreeMap::<&'static str, usize>::new();
+        for p in &packs {
+            let k = match &p.kind {
+                PackKind::MemLoad { .. } => "MemLoad",
+                PackKind::BinOp { .. } => "BinOp",
+                PackKind::Forward { .. } => "Forward",
+                PackKind::Fma { .. } => "Fma",
+                PackKind::Splat { .. } => "Splat",
+                PackKind::Gather2 { .. } => "Gather2",
+                PackKind::Gather4 { .. } => "Gather4",
+                PackKind::ByteFields { .. } => "ByteFields",
+                PackKind::FpMinMax { .. } => "FpMinMax",
+                PackKind::FpNeg { .. } => "FpNeg",
+                PackKind::CmpBlendv { .. } => "CmpBlendv",
+                PackKind::ShiftImm { .. } => "ShiftImm",
+            };
+            *hist.entry(k).or_default() += 1;
+        }
+        lccc::cli::stderr_line(format_args!(
+            "[SLP-COST] block={} {}x{:?}: benefit={} scalar_removed={} vector_cost={} extracts={} tail={} hist={:?}",
+            ctx.block.label.0,
+            width,
+            cand.ty,
+            benefit,
+            scalar_removed,
+            vector_cost,
+            extract_cost,
+            tail_cost,
+            hist
+        ));
     }
     if benefit < 1 {
-        return None;
+        return slp_decline("cost model: net benefit < 1");
     }
 
     Some(Plan {
@@ -6935,6 +7352,7 @@ fn dword_rhs_literal(op: IntrinsicOp, ty: IrType, c: &IrConst, sse41: bool) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::reexports::BlockId;
 
     #[test]
     fn literal_rhs_requires_a_supporting_consumer_and_exact_dword_width() {
@@ -7328,5 +7746,341 @@ mod tests {
                 "narrow_const must fail closed for {ty:?}"
             );
         }
+    }
+
+    /// Six address roots: three `GlobalAddr` (two for `g_out`, one for
+    /// `g_other`) and three `ParamRef` (two for parameter 0, one for 1).
+    /// This is exactly the shape the PostVec unroller produces.
+    fn roots_fixture() -> IrFunction {
+        let mut f = IrFunction::new("roots_test".into(), IrType::Void, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(1),
+                    name: "g_out".into(),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(2),
+                    name: "g_out".into(),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(3),
+                    name: "g_other".into(),
+                },
+                Instruction::ParamRef {
+                    dest: Value(4),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                Instruction::ParamRef {
+                    dest: Value(5),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                Instruction::ParamRef {
+                    dest: Value(6),
+                    param_idx: 1,
+                    ty: IrType::Ptr,
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        f
+    }
+
+    #[test]
+    fn symbol_roots_groups_by_object_identity_not_ssa_value() {
+        let roots = SymbolRoots::build(&roots_fixture());
+        // Interning: one id per DISTINCT name, not one per `GlobalAddr`.
+        assert_eq!(roots.symbol_ids.len(), 2);
+        assert_eq!(roots.stream_base(Value(1)), roots.stream_base(Value(2)));
+        assert_ne!(roots.stream_base(Value(1)), roots.stream_base(Value(3)));
+        assert_eq!(roots.stream_base(Value(4)), roots.stream_base(Value(5)));
+        assert_ne!(roots.stream_base(Value(4)), roots.stream_base(Value(6)));
+        // An unknown SSA value falls back to its raw id, never to a symbol.
+        assert_eq!(roots.stream_base(Value(99)), StreamBase::Value(99));
+        // Enum discriminant must keep globals and params disjoint.
+        assert_ne!(roots.stream_base(Value(1)), roots.stream_base(Value(4)));
+        // `stream_base` must be allocation-free: ids are `u32`, not Strings.
+        assert!(matches!(roots.stream_base(Value(1)), StreamBase::Global(_)));
+    }
+
+    #[test]
+    fn symbol_roots_is_idempotent_and_round_local() {
+        let f = roots_fixture();
+        let a = SymbolRoots::build(&f);
+        let b = SymbolRoots::build(&f);
+        for v in 1..=7u32 {
+            // A rebuilt map is allowed to use different dense ids, but the
+            // EQUALITY CLASSES (which are what the stream key uses) must match.
+            for w in 1..=7u32 {
+                assert_eq!(
+                    a.stream_base(Value(v)) == a.stream_base(Value(w)),
+                    b.stream_base(Value(v)) == b.stream_base(Value(w)),
+                    "equality class changed for ({v},{w})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pack_vector_cost_is_total_and_pinned() {
+        use crate::ir::reexports::{IrBinOp, IrConst};
+        let c = Operand::Const(IrConst::I32(0));
+        let cases: Vec<(PackKind, i64)> = vec![
+            (PackKind::Forward { val: Value(1) }, 0),
+            (PackKind::Gather4 { ops: vec![] }, 7),
+            (
+                PackKind::ByteFields {
+                    src: c.clone(),
+                    pattern: 0,
+                },
+                4,
+            ),
+            (
+                PackKind::MemLoad {
+                    ptrs: vec![],
+                    offs: vec![],
+                    byte3: Some((Value(1), 0, 3)),
+                },
+                6,
+            ),
+            (
+                PackKind::MemLoad {
+                    ptrs: vec![],
+                    offs: vec![],
+                    byte3: None,
+                },
+                1,
+            ),
+            (
+                PackKind::Gather2 {
+                    op: IntrinsicOp::VecPackI32x4Pair,
+                    lo: c.clone(),
+                    hi: c.clone(),
+                },
+                3,
+            ),
+            (
+                PackKind::Splat {
+                    src: c.clone(),
+                    is_zero: false,
+                },
+                2,
+            ),
+            (
+                PackKind::CmpBlendv {
+                    cmp_op: IntrinsicOp::VecCmpI32x4,
+                    blend_op: IntrinsicOp::VecBlendvI32x4,
+                    pred: 0,
+                    lhs: 0,
+                    rhs: 0,
+                    tv: 0,
+                    fv: 0,
+                    cond_lanes: vec![],
+                },
+                2,
+            ),
+            (
+                PackKind::BinOp {
+                    op: IrBinOp::Add,
+                    ty: IrType::U32,
+                    vec_op: IntrinsicOp::VecAddI32x4,
+                    lhs: 0,
+                    rhs: 0,
+                },
+                1,
+            ),
+            (
+                PackKind::FpNeg {
+                    vec_op: IntrinsicOp::VecXorF32x4,
+                    val: 0,
+                },
+                1,
+            ),
+        ];
+        for (kind, want) in cases {
+            assert_eq!(pack_vector_cost(&kind), want, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn scalar_instruction_weight_is_exhaustive_and_pins_negation() {
+        // The regression this pins: integer negation is `UnaryOp`, and the
+        // six-class filter that preceded the exhaustive classifier omitted
+        // it, under-counting `v5_neg_i64` by 2 and losing its `psubq`.
+        assert_eq!(
+            scalar_instruction_weight(&Instruction::UnaryOp {
+                dest: Value(1),
+                op: crate::ir::reexports::IrUnaryOp::Neg,
+                src: Operand::Value(Value(2)),
+                ty: IrType::I64,
+            }),
+            1
+        );
+        assert_eq!(
+            scalar_instruction_weight(&Instruction::Load {
+                dest: Value(1),
+                ptr: Value(2),
+                ty: IrType::I64,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            }),
+            1
+        );
+        assert_eq!(
+            scalar_instruction_weight(&Instruction::GlobalAddr {
+                dest: Value(1),
+                name: "g".into(),
+            }),
+            0
+        );
+        assert_eq!(
+            scalar_instruction_weight(&Instruction::GetElementPtr {
+                dest: Value(1),
+                base: Value(2),
+                offset: Operand::Const(IrConst::I64(0)),
+                ty: IrType::Ptr,
+            }),
+            0
+        );
+    }
+
+    #[test]
+    fn crossings_are_amortized_pins_the_measured_plans() {
+        // 2xU32 jhash: 27 packs, benefit 2, 1.301x SLOWER -> decline.
+        assert!(!crossings_are_amortized(IrType::U32, 2, false, 2, 2, 20, 0));
+        // 4xU32 bytemask: 3 Gather4 + 2 BinOp, benefit 1, 1.2772x SLOWER.
+        assert!(!crossings_are_amortized(IrType::U32, 4, false, 1, 3, 2, 0));
+        // 4xU32 clamp_u8: 2 Gather4 + 2 CmpBlendv, benefit 2, 0.8399x WIN.
+        assert!(crossings_are_amortized(IrType::U32, 4, false, 2, 2, 2, 0));
+        // 2xI64 v5_neg_i64: full 128-bit register, 0 gathers, benefit 2.
+        assert!(crossings_are_amortized(IrType::I64, 2, false, 2, 0, 2, 0));
+        // crc32_braid8: Splat/MemLoad only, benefit 6/15, no crossings.
+        assert!(crossings_are_amortized(IrType::U32, 8, false, 6, 0, 0, 0));
+        // 4xU32 jhash: 2 Gather4 + 21 compute, benefit 55.
+        assert!(crossings_are_amortized(IrType::U32, 4, false, 55, 2, 21, 0));
+        // Extracts are crossings too; a marginal extract-heavy plan declines.
+        assert!(!crossings_are_amortized(IrType::I32, 2, false, 1, 0, 1, 1));
+        // Joint seeds are priced by tail_cost and are exempt.
+        assert!(crossings_are_amortized(IrType::U32, 2, true, 0, 4, 0, 2));
+    }
+
+    #[test]
+    fn preferred_width_covers_all_three_register_classes() {
+        // `family_for` asks the per-TU ISA gate, NOT the `avx2` argument of
+        // `preferred_width`, so pin the gate for the 8xU32 assertion and
+        // restore it: libtest runs several tests on the same OS thread.
+        use crate::passes::vectorize as v;
+        let saved = (
+            v::x86_simd_available_pub(),
+            v::x86_avx2_available_pub(),
+            v::x86_sse41_available_pub(),
+            v::x86_avx512vl_available_pub(),
+        );
+        v::set_x86_simd_isa(true, true, true, false);
+        assert_eq!(preferred_width(8, 4, IrType::U32, true), Some(8));
+        assert_eq!(preferred_width(4, 4, IrType::U32, false), Some(4));
+        assert_eq!(preferred_width(2, 4, IrType::U32, false), Some(2));
+        // 2xI64 fills a whole XMM register (check_bb_slp_v5_codegen.sh/psubq).
+        assert_eq!(preferred_width(2, 8, IrType::I64, false), Some(2));
+        assert_eq!(preferred_width(2, 1, IrType::U8, false), None);
+        assert_eq!(preferred_width(1, 4, IrType::U32, false), None);
+        v::set_x86_simd_isa(saved.0, saved.1, saved.2, saved.3);
+    }
+
+    #[test]
+    fn symbol_ids_are_exact_machine_word_dense_ids() {
+        // The old `u32::try_from(len).expect(...)` added a panic site and
+        // was still a lossy conversion on principle.  `usize == len()` is
+        // the identity: no conversion, no saturation, no panic.  Stress the
+        // interner with far more distinct symbols than any real TU.
+        const N: usize = 300;
+        let mut f = IrFunction::new("id_space".into(), IrType::Void, vec![], false);
+        let insts: Vec<Instruction> = (0..N)
+            .map(|i| Instruction::GlobalAddr {
+                dest: Value((i + 1) as u32),
+                name: format!("g{i}"),
+            })
+            .collect();
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        let roots = SymbolRoots::build(&f);
+        assert_eq!(roots.symbol_ids.len(), N);
+        assert_eq!(roots.globals.len(), N);
+        let ids: FxHashSet<usize> = roots.symbol_ids.values().copied().collect();
+        assert_eq!(ids.len(), N, "ids must be dense and unique");
+        assert!(ids.iter().all(|&id| id < N));
+        assert!(roots.globals.values().all(|&id| id < N));
+        // The next id IS len(): identity conversion, exact on every host.
+        let next: usize = roots.symbol_ids.len();
+        assert_eq!(next, N);
+    }
+
+    #[test]
+    fn seed_dedup_key_distinguishes_every_payload_not_just_its_presence() {
+        use super::joint::Tail;
+        let make = |joint: Option<Tail>, sink: Option<Value>| SeedCandidate {
+            store_idx: vec![7, 8, 9, 10],
+            lane_ops: vec![Operand::Value(Value(1)); 4],
+            ty: IrType::U32,
+            anchor_ptr: Value(42),
+            width: 4,
+            joint,
+            value_sink: sink,
+        };
+        let a = make(
+            Some(Tail {
+                alpha: 0,
+                four_inputs: false,
+            }),
+            None,
+        );
+        let b = make(
+            Some(Tail {
+                alpha: 1,
+                four_inputs: false,
+            }),
+            None,
+        );
+        let c = make(
+            Some(Tail {
+                alpha: 0,
+                four_inputs: true,
+            }),
+            None,
+        );
+        let d = make(None, None);
+        let e = make(None, Some(Value(99)));
+        let f = make(None, Some(Value(100)));
+        assert_eq!(
+            seed_dedup_key(&a),
+            seed_dedup_key(&make(
+                Some(Tail {
+                    alpha: 0,
+                    four_inputs: false
+                }),
+                None
+            ))
+        );
+        for (x, y) in [(&a, &b), (&a, &c), (&a, &d), (&d, &e), (&e, &f)] {
+            assert_ne!(
+                seed_dedup_key(x),
+                seed_dedup_key(y),
+                "distinct tail/sink payloads must never be deduplicated"
+            );
+        }
+        // anchor_ptr is part of the key too.
+        let mut g = make(None, None);
+        g.anchor_ptr = Value(43);
+        assert_ne!(seed_dedup_key(&d), seed_dedup_key(&g));
     }
 }

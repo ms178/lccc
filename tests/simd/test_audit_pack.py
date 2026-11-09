@@ -20,9 +20,11 @@ register's open findings are resolved; it is deliberately not a hard gate.
 from __future__ import annotations
 
 import importlib.util
+from functools import lru_cache
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -69,6 +71,46 @@ def load_driver_module():
 def run(cmd: list[str], timeout: float = 120.0) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True,
                           timeout=timeout, check=False)
+
+
+# A staged toolchain (gcc-16 from the harness cache, Clang 23, ICX) frequently
+# ships the compiler but NOT the ASan/UBSan runtimes.  The audit pack must not
+# then report a hard FAIL for an infrastructure reason: `check_simd_shape_matrix.py`
+# already documents exactly this fallback.  Only a MISSING SANITIZER RUNTIME
+# authorizes a fallback to the system compiler; a broken/absent configured
+# compiler must still fail closed (test_07b pins that behaviour).
+SAN_RUNTIME_MARKERS = ('libasan_preinit.o', '-lasan', '-lubsan',
+                       'libasan.so', 'libubsan.so', 'asan/asan_init')
+
+
+@lru_cache(maxsize=8)
+def sanitizer_compiler(cc: str, flags: tuple) -> str:
+    """Return a compiler able to LINK `flags`; else the configured `cc`.
+
+    `cc` is part of the cache key: test_07b mocks the module-level GCC with a
+    nonexistent binary and REQUIRES the gate to fail closed.  A cache keyed
+    only on flags would hand the mock the compiler chosen for the real GCC.
+    """
+    if not any('sanitize' in f for f in flags):
+        return cc
+    probe_src = Path(tempfile.gettempdir()) / 'lccc_san_probe.c'
+    probe_src.write_text('int main(void) { return 0; }\n', encoding='utf-8')
+    probe_out = Path(tempfile.gettempdir()) / 'lccc_san_probe.bin'
+    try:
+        first = run([cc, *flags, str(probe_src), '-o', str(probe_out)],
+                    timeout=60)
+        if first.returncode == 0:
+            return cc
+        diagnostic = (first.stdout + first.stderr).lower()
+        if not any(m in diagnostic for m in SAN_RUNTIME_MARKERS):
+            return cc  # real compiler failure - must fail closed
+        if cc == 'gcc' or shutil.which('gcc') is None:
+            return cc
+        second = run(['gcc', *flags, str(probe_src), '-o', str(probe_out)],
+                     timeout=60)
+        return 'gcc' if second.returncode == 0 else cc
+    except (OSError, subprocess.SubprocessError):
+        return cc
 
 
 class AuditPackTests(unittest.TestCase):
@@ -221,8 +263,8 @@ class AuditPackTests(unittest.TestCase):
         tag = 'san' if any('sanitize' in f for f in flags) else 'plain'
         exe = work / f'evex_probe_{tag}.bin'
         try:
-            proc = run([GCC, *flags, '-mavx512f', '-mavx512bw',
-                        str(src), '-o', str(exe)])
+            proc = run([sanitizer_compiler(GCC, tuple(flags)), *flags,
+                        '-mavx512f', '-mavx512bw', str(src), '-o', str(exe)])
             if proc.returncode != 0:
                 return False, (f'probe compile rc={proc.returncode}: '
                                f'{proc.stderr.strip()[:200]}')
@@ -263,7 +305,8 @@ class AuditPackTests(unittest.TestCase):
                                  ('avx512', ('-mavx512f', '-mavx512bw'))):
                 with self.subTest(src=src.name, isa=label):
                     exe = self.work / f'{src.stem}_{label}_san.bin'
-                    proc = run([GCC, *SAN_FLAGS, *extra, str(src), '-o', str(exe)])
+                    proc = run([sanitizer_compiler(GCC, SAN_FLAGS), *SAN_FLAGS,
+                                *extra, str(src), '-o', str(exe)])
                     self.assertEqual(proc.returncode, 0, proc.stderr)
                     if label != 'avx512' or san_ok:
                         for mode in modes:
@@ -397,8 +440,16 @@ class AuditPackTests(unittest.TestCase):
         """Spot-check headline claims that the register asserts as S-evidence.
         Snippets, not line numbers: line anchors drift, prose does not."""
         claims = (
+            # SA-33 is FIXED (§9c.10.4): the obligation is armed at the
+            # physical wide-register write, so the old opcode-name proxy is
+            # gone.  Pin the replacement invariant instead of the defect, and
+            # assert below that the proxy really was removed -- otherwise a
+            # revert would restore the snippet and silently satisfy a test
+            # that was only ever checking the bug still existed.
             ('src/backend/x86/codegen/intrinsics_simd.rs',
-             'format!("{:?}", op)'),
+             'zmm.starts_with("ymm") || zmm.starts_with("zmm")'),
+            ('src/backend/state.rs',
+             'reg.starts_with("ymm") || reg.starts_with("zmm")'),
             ('src/passes/vectorize.rs', 'debug_assert!(false'),
             ('scripts/gen_lcccsimd.py', '"vmovdqu64_load"'),
             ('scripts/gen_lcccsimd.py', '"vpshuflw512"'),
@@ -410,6 +461,14 @@ class AuditPackTests(unittest.TestCase):
                 self.assertTrue(path.is_file(), f'missing {rel}')
                 self.assertIn(snippet, path.read_text(errors='replace'),
                               f'{rel}: claim {snippet!r} no longer holds')
+        # The retired SA-33 proxy must NOT come back.
+        self.assertNotIn('format!("{:?}", op)',
+                         (ROOT / 'src/backend/x86/codegen/intrinsics_simd.rs').read_text(),
+                         'SA-33 regressed: the opcode-name vzeroupper proxy is back')
+        # SA-05 must stay non-commutative at 512 bits.
+        self.assertIn('"vpmaddubsw", false',
+                      (ROOT / 'src/backend/x86/codegen/intrinsics_simd.rs').read_text(),
+                      'SA-05 regressed: vpmaddubsw is commutative again')
 
     def test_12_register_is_complete(self):
         text = DOC.read_text()

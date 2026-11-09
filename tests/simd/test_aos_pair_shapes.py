@@ -57,14 +57,28 @@ class RunnerTests(unittest.TestCase):
                 aos.run([sys.executable, '-c', code], root, 2)
             self.assertLess(time.monotonic()-start, 10)
             pid = int((root/'child.pid').read_text())
-            # A killed orphan may briefly be a zombie awaiting init's reap.
+            # The contract is "the descendant did not survive the timeout",
+            # NOT "it is a zombie by the instant run() returns".  SIGKILL is
+            # asynchronous: the victim must still be scheduled before it can
+            # die, so on a loaded machine /proc/<pid>/stat legitimately still
+            # reads 'R' (or 'D') for a moment.  The original single read made
+            # that a hard failure and turned this gate flaky under parallel
+            # CI load.  Poll to a bounded deadline and accept either terminal
+            # outcome -- reaped (entry gone) or zombie awaiting init.
             stat = Path(f'/proc/{pid}/stat')
-            try:
-                state = stat.read_text().rsplit(')', 1)[1].split()[0]
-            except FileNotFoundError:
-                pass
-            else:
-                self.assertEqual(state, 'Z')
+            deadline = time.monotonic() + 10.0
+            state = None
+            while time.monotonic() < deadline:
+                try:
+                    state = stat.read_text().rsplit(')', 1)[1].split()[0]
+                except FileNotFoundError:
+                    state = None      # already reaped: the strongest outcome
+                    break
+                if state == 'Z':
+                    break
+                time.sleep(0.05)
+            self.assertIn(state, (None, 'Z'),
+                          f'descendant {pid} survived the timeout kill (state {state!r})')
 
     def test_empty_successful_output_is_not_an_oracle(self):
         with tempfile.TemporaryDirectory() as work, patch.object(aos, 'run', return_value=''):

@@ -376,7 +376,7 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 534.73,
+      "predicted_gate_seconds": 535.03,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
@@ -399,6 +399,10 @@
         {
           "measured_s": 0.25,
           "name": "bash tests/regression/check_asm_goto_phi_edge.sh"
+        },
+        {
+          "measured_s": 0.3,
+          "name": "bash tests/regression/check_cond_load_sink.sh"
         },
         {
           "measured_s": 0.25,
@@ -897,7 +901,7 @@
     "codegen-a": {
       "group": "codegen",
       "mode": "steps",
-      "predicted_gate_seconds": 411.24,
+      "predicted_gate_seconds": 412.87,
       "shards": 2,
       "steps": [
         {
@@ -1033,7 +1037,7 @@
           "name": "Compile-time fold refuses an unfinishable constant recursion"
         },
         {
-          "measured_s": 5.27,
+          "measured_s": 6.9,
           "name": "SIMD folded-index correctness and runner failure contracts"
         }
       ]
@@ -1041,7 +1045,7 @@
     "codegen-b": {
       "group": "codegen",
       "mode": "steps",
-      "predicted_gate_seconds": 403.36,
+      "predicted_gate_seconds": 405.31,
       "shards": 2,
       "steps": [
         {
@@ -1175,6 +1179,14 @@
         {
           "measured_s": 0.25,
           "name": "Run chroot bind regression"
+        },
+        {
+          "measured_s": 1.7,
+          "name": "Vector reloads of a just-stored aligned home must be register copies"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify the aligned-vector-reload ratchet contracts"
         }
       ]
     },
@@ -1437,7 +1449,7 @@
     "frontend-b": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 352.29,
+      "predicted_gate_seconds": 352.92,
       "shards": 3,
       "steps": [
         {
@@ -1569,6 +1581,10 @@
           "name": "Preprocessor rescanning, conditional comma, character constants, wchar_t and pragma rendering"
         },
         {
+          "measured_s": 0.63,
+          "name": "Feature capability truthfulness"
+        },
+        {
           "measured_s": 3.0,
           "name": "RISC-V shared-binding mutation controls"
         },
@@ -1661,7 +1677,7 @@
     "frontend-c": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 353.02,
+      "predicted_gate_seconds": 353.52,
       "shards": 3,
       "steps": [
         {
@@ -1755,6 +1771,14 @@
         {
           "measured_s": 0.25,
           "name": "Verify the allocate-before-filter ratchet contracts"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "SIMD commutativity must agree across the 128/256/512-bit layers"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify the SIMD commutativity ratchet contracts"
         },
         {
           "measured_s": 1.0,
@@ -1882,8 +1906,8 @@
   "provenance": {
     "backend-contracts": {
       "costs": "/tmp/gates.tsv",
-      "measured_seconds_total": 1064.77,
-      "source": "measured by scripts/ci_gate_costs.py; rootfs-write-policy gates measured locally (max of 3 runs); debug-acceptance-parity and asm-dialect-alternatives (4 commands) measured locally as max of 3 runs, floored at 0.25 s, +2.92 s"
+      "measured_seconds_total": 1065.07,
+      "source": "measured by scripts/ci_gate_costs.py; rootfs-write-policy gates measured locally (max of 3 runs); debug-acceptance-parity and asm-dialect-alternatives (4 commands) measured locally as max of 3 runs, floored at 0.25 s, +2.92 s; SV-03 cond-load-sink gate measured locally as max of 3 runs (0.30 s)"
     },
     "codegen": {
       "costs": "/home/user/.cache/tmp/codegen.tsv",
@@ -1892,8 +1916,8 @@
     },
     "frontend": {
       "costs": "/home/user/checkpoints/ci-main-union-costs.tsv",
-      "measured_seconds_total": 1058.94,
-      "source": "Union with main 662b771c0; retain both sides coverage and previously measured diagnostic gate costs. Four 2026-11-04 GCC-16.2 follow-up gates added to frontend-a with locally measured worst-of-3 wall times (scripts/ci_local.sh toolchain, fastbuild binaries): asm-constraints 1.65 s, vectorizer-openmp 0.93 s, gnu-declaration-corners 0.55 s, parser-depth-limits 0.34 s (worst-of-3 remeasured after the 64-spelling red-team differential gate landed). GNU object-placement declarator scopes added to frontend-a (local worst of three 2.00 s; fastbuild and GCC 16.2)."
+      "measured_seconds_total": 1059.57,
+      "source": "Union with main 662b771c0; retain both sides coverage and previously measured diagnostic gate costs. Four 2026-11-04 GCC-16.2 follow-up gates added to frontend-a with locally measured worst-of-3 wall times (scripts/ci_local.sh toolchain, fastbuild binaries): asm-constraints 1.65 s, vectorizer-openmp 0.93 s, gnu-declaration-corners 0.55 s, parser-depth-limits 0.34 s (worst-of-3 remeasured after the 64-spelling red-team differential gate landed). GNU object-placement declarator scopes added to frontend-a (local worst of three 2.00 s; fastbuild and GCC 16.2). Feature capability truthfulness added to frontend-b (local worst-of-3 wall 0.63 s; fastbuild, GCC 16.2 / Clang 23.1.5 oracles)."
     }
   }
 }

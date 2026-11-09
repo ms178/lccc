@@ -288,16 +288,19 @@ pub struct MacroTable {
     /// must survive an `#include`, which both oracles do and lccc did not (it
     /// re-materialised the header's name inside the header).
     user_owned: Cell<u8>,
-    /// Builtins the source removed with `#undef`.
+    /// Compiler-owned names the source removed with `#undef`.
     ///
-    /// A dynamic builtin is not a macro-table entry that `#undef` can simply
+    /// This covers both dynamic builtins and the special `__has_*` query
+    /// operators. Neither is necessarily a macro-table entry that `#undef` can simply
     /// delete: `__LINE__` and `__COUNTER__` are computed per token, and
     /// `__FILE__`, `__INCLUDE_LEVEL__` and `__TIMESTAMP__` are *re-materialised*
     /// on every file transition. Without this set, `#undef __FILE__` followed by
     /// any `#include` would silently bring the macro back (measured: GCC 16.2
     /// and Clang 23.1.4 both leave all five undefined for the rest of the
     /// translation unit), which is exactly the "did my `#undef` work?" question
-    /// that portable code asks in its own feature probes.
+    /// that portable code asks in its own feature probes. The same lifetime
+    /// rule applies to `__has_*`: after `#undef __has_feature`, both `#ifdef`
+    /// and evaluation must stop treating the spelling as a compiler operator.
     suppressed: FxHashSet<String>,
 }
 
@@ -392,6 +395,37 @@ pub(super) fn is_dynamic_builtin(name: &str) -> bool {
     }
 }
 
+/// The special preprocessor query operators. They have no MacroDef entry,
+/// but GCC and Clang both let `#undef` withdraw them and `#define` replace
+/// them. Keep one list so existence, suppression and evaluation cannot drift.
+/// `__has_warning` and `__building_module` are LCCC's documented
+/// Clang-compatible extensions; GCC does not define them, but LCCC's corpus
+/// and the Clang resource headers it consumes require them to remain
+/// available. `__building_module` always answers 0: LCCC has no Clang modules.
+#[inline]
+pub(super) fn is_query_operator(name: &str) -> bool {
+    is_gcc_query_operator(name) || matches!(name, "__has_warning" | "__building_module")
+}
+
+/// The subset GCC 16.2 itself defines. `__has_warning` and
+/// `__building_module` are LCCC's Clang-compatible extensions: they have the
+/// same #undef/#define lifetime, but GCC emits no builtin-macro directive
+/// warnings for them.
+#[inline]
+pub(super) fn is_gcc_query_operator(name: &str) -> bool {
+    matches!(
+        name,
+        "__has_builtin"
+            | "__has_attribute"
+            | "__has_c_attribute"
+            | "__has_feature"
+            | "__has_extension"
+            | "__has_include"
+            | "__has_include_next"
+            | "__has_embed"
+    )
+}
+
 impl MacroTable {
     pub fn new() -> Self {
         Self {
@@ -453,11 +487,13 @@ impl MacroTable {
             );
             self.user_owned
                 .set((self.user_owned.get() & !bit) | if saved.user_owned { bit } else { 0 });
-            if saved.suppressed {
-                self.suppressed.insert(name.to_string());
-            } else {
-                self.suppressed.remove(name);
-            }
+        }
+        // Query operators have no ownership bit, but their suppressed state
+        // is still part of the definition snapshot.
+        if saved.suppressed {
+            self.suppressed.insert(name.to_string());
+        } else {
+            self.suppressed.remove(name);
         }
     }
 
@@ -472,7 +508,7 @@ impl MacroTable {
             self.user_owned.set(self.user_owned.get() | bit);
             self.compiler_owned.set(self.compiler_owned.get() & !bit);
         }
-        if is_dynamic_builtin(&def.name) {
+        if is_dynamic_builtin(&def.name) || is_query_operator(&def.name) {
             self.suppressed.remove(&def.name);
         }
         self.macros.insert(def.name.clone(), def);
@@ -480,8 +516,8 @@ impl MacroTable {
 
     /// Undefine a macro.
     ///
-    /// For a dynamic builtin this also records the removal so that later file
-    /// transitions cannot re-materialise it (see `suppressed`).
+    /// For a dynamic builtin or query operator this also records the removal
+    /// so that later file transitions cannot re-materialise it (see `suppressed`).
     pub fn undefine(&mut self, name: &str) {
         self.macros.remove(name);
         if let Some(bit) = builtin_bit(name) {
@@ -489,7 +525,7 @@ impl MacroTable {
             self.compiler_owned.set(self.compiler_owned.get() & !bit);
             self.user_owned.set(self.user_owned.get() & !bit);
         }
-        if is_dynamic_builtin(name) {
+        if is_dynamic_builtin(name) || is_query_operator(name) {
             self.suppressed.insert(name.to_string());
         }
     }
@@ -513,7 +549,7 @@ impl MacroTable {
         }
     }
 
-    /// Whether the builtin `name` is currently suppressed by `#undef`.
+    /// Whether a compiler-owned `name` is currently suppressed by `#undef`.
     #[inline]
     pub(super) fn builtin_suppressed(&self, name: &str) -> bool {
         !self.suppressed.is_empty() && self.suppressed.contains(name)
@@ -536,18 +572,117 @@ impl MacroTable {
     pub fn is_defined(&self, name: &str) -> bool {
         (is_dynamic_builtin(name) && !self.builtin_suppressed(name))
             || self.macros.contains_key(name)
-            // These are special preprocessor operators, not real macros.
-            // They need to be recognized by #ifdef but are evaluated as
-            // special functions in #if expressions by resolve_defined_in_expr().
-            || name == "__has_builtin"
-            || name == "__has_attribute"
-            || name == "__has_c_attribute"
-            || name == "__has_feature"
-            || name == "__has_extension"
-            || name == "__has_include"
-            || name == "__has_include_next"
-            || name == "__has_embed"
-            || name == "__has_warning"
+            // Special preprocessor operators are visible to #ifdef until
+            // #undef withdraws them. A user definition is an ordinary macro
+            // and is already covered by the table lookup above.
+            || (is_query_operator(name) && !self.builtin_suppressed(name))
+    }
+
+    /// Whether `name` currently denotes a compiler-owned query operator.
+    /// A user macro of the same spelling wins in both #if and code lines;
+    /// `#undef` suppresses the operator until a new definition takes ownership
+    /// or `pop_macro` restores a snapshot taken while it was still active.
+    #[inline]
+    pub(super) fn query_operator_active(&self, name: &str) -> bool {
+        is_query_operator(name) && !self.builtin_suppressed(name) && !self.macros.contains_key(name)
+    }
+
+    /// Query operators whose operand must reach the resolver as the RAW token
+    /// sequence the programmer wrote (or a macro replacement produced), not as
+    /// the result of eagerly expanding every identifier inside the parentheses.
+    ///
+    /// The resolver owns the operator-specific operand rule: GCC's feature /
+    /// builtin / attribute queries macro-expand the operand themselves, while
+    /// Clang's `__building_module` and `__has_warning` do not. Expanding the
+    /// whole code line first destroyed that distinction (`__building_module(M)`
+    /// with `#define M foo bar` became a stray-token error instead of 0, and
+    /// `__has_warning(W)` with `#define W "-Wcpp"` silently answered 1 where
+    /// Clang requires a literal). Header-name operands (`__has_include` /
+    /// `__has_embed`) keep the historical whole-line expansion because their
+    /// resolver probes the expanded spelling.
+    #[inline]
+    fn query_operand_is_raw(name: &str) -> bool {
+        matches!(
+            name,
+            "__has_builtin"
+                | "__has_attribute"
+                | "__has_c_attribute"
+                | "__has_feature"
+                | "__has_extension"
+                | "__has_warning"
+                | "__building_module"
+        )
+    }
+
+    /// End offset (exclusive) of a balanced parenthesized query operand whose
+    /// opening `(` is at `open`. Literal-aware and bounded by the slice; an
+    /// unterminated operand consumes to EOL, matching the resolver's recovery.
+    fn query_arg_end(bytes: &[u8], open: usize) -> usize {
+        let len = bytes.len();
+        let mut k = open + 1;
+        let mut depth = 1usize;
+        while k < len {
+            match bytes[k] {
+                quote @ (b'"' | b'\'') => {
+                    k = super::utils::skip_literal_bytes(bytes, k, quote).min(len);
+                    continue;
+                }
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return k + 1;
+                    }
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        len
+    }
+
+    /// Copy an active query operator and its raw operand into `result`,
+    /// returning the source offset just past the operand. `i` points just after
+    /// the operator identifier. Returns `None` when there is no operand to
+    /// protect (the resolver will diagnose the missing `(` and the following
+    /// tokens expand normally).
+    fn protect_query_invocation(
+        &self,
+        text: &str,
+        bytes: &[u8],
+        i: usize,
+        ident: &str,
+        result: &mut String,
+    ) -> Option<usize> {
+        let len = bytes.len();
+        let mut j = i;
+        while j < len && (bytes[j] == b' ' || bytes[j] == b'\t') {
+            j += 1;
+        }
+        if j < len && bytes[j] == b'(' {
+            let end = Self::query_arg_end(bytes, j);
+            result.push_str(ident);
+            result.push_str(&text[i..end]);
+            return Some(end);
+        }
+        // GCC/Clang missing-`(` recovery absorbs a following identifier operand.
+        // Protect it too, so a macro operand is not expanded into several tokens
+        // before the resolver can absorb exactly one (`__building_module M`).
+        if !matches!(
+            ident,
+            "__has_warning" | "__has_include" | "__has_include_next" | "__has_embed"
+        ) && j < len
+            && is_ident_start_byte(bytes[j])
+        {
+            let mut k = j + 1;
+            while k < len && is_ident_cont_byte(bytes[k]) {
+                k += 1;
+            }
+            result.push_str(ident);
+            result.push_str(&text[i..k]);
+            return Some(k);
+        }
+        None
     }
 
     /// Iterate over all macro definitions.
@@ -920,6 +1055,40 @@ impl MacroTable {
         loop {
             let trailing = extract_trailing_ident(&expanded);
             if let Some(ref trail_ident) = trailing {
+                // A replacement list may end in an active query operator whose
+                // operand lives in the following source tokens. Protect that
+                // operand exactly as `expand_identifier` does for a directly
+                // written operator, so `#define BM __building_module` + `BM(M)`
+                // does not macro-expand M before the resolver sees it.
+                if Self::query_operand_is_raw(trail_ident)
+                    && self.query_operator_active(trail_ident)
+                    && !expanding.contains(trail_ident.as_str())
+                {
+                    let mut k = i;
+                    while k < len && bytes[k].is_ascii_whitespace() {
+                        k += 1;
+                    }
+                    if k < len && bytes[k] == b'(' {
+                        let end = Self::query_arg_end(bytes, k);
+                        expanded.push_str(bytes_to_str(bytes, i, end));
+                        i = end;
+                        continue;
+                    }
+                    if !matches!(
+                        trail_ident.as_str(),
+                        "__has_warning" | "__has_include" | "__has_include_next" | "__has_embed"
+                    ) && k < len
+                        && is_ident_start_byte(bytes[k])
+                    {
+                        let mut end = k + 1;
+                        while end < len && is_ident_cont_byte(bytes[end]) {
+                            end += 1;
+                        }
+                        expanded.push_str(bytes_to_str(bytes, i, end));
+                        i = end;
+                        continue;
+                    }
+                }
                 if !expanding.contains(trail_ident.as_str()) {
                     if let Some(trail_mac) = self.macros.get(trail_ident.as_str()) {
                         if trail_mac.is_function_like {
@@ -980,6 +1149,38 @@ impl MacroTable {
             || !et_bytes.iter().all(|&b| is_ident_cont_byte(b))
             || expanding.contains(expanded_trimmed)
         {
+            return None;
+        }
+        // An object-like macro may expand directly to an active query operator
+        // (`#define BM __building_module`). Its operand is the following source
+        // text, not a macro argument list; keep it raw for the resolver.
+        if Self::query_operand_is_raw(expanded_trimmed)
+            && self.query_operator_active(expanded_trimmed)
+        {
+            let mut j = i;
+            while j < len && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < len && bytes[j] == b'(' {
+                let end = Self::query_arg_end(bytes, j);
+                let mut out = expanded.to_string();
+                out.push_str(bytes_to_str(bytes, i, end));
+                return Some((out, end));
+            }
+            if !matches!(
+                expanded_trimmed,
+                "__has_warning" | "__has_include" | "__has_include_next" | "__has_embed"
+            ) && j < len
+                && is_ident_start_byte(bytes[j])
+            {
+                let mut end = j + 1;
+                while end < len && is_ident_cont_byte(bytes[end]) {
+                    end += 1;
+                }
+                let mut out = expanded.to_string();
+                out.push_str(bytes_to_str(bytes, i, end));
+                return Some((out, end));
+            }
             return None;
         }
         let target_mac = self.macros.get(expanded_trimmed)?;
@@ -1153,6 +1354,17 @@ impl MacroTable {
         // ordinary identifier -- before any of the name comparisons run, so
         // adding a builtin here costs tokens that are not builtins nothing.
         if bytes[start] == b'_' {
+            // Active query operators keep their operand raw during macro
+            // expansion; the preprocessor resolver applies the operator's own
+            // operand-expansion rule afterwards. This is what makes a query
+            // produced by a macro (`#define BM __building_module`) see the same
+            // operand tokens as one written directly in the source line.
+            if Self::query_operand_is_raw(ident) && self.query_operator_active(ident) {
+                if let Some(end) = self.protect_query_invocation(text, bytes, i, ident, result) {
+                    return end;
+                }
+            }
+
             // Handle _Pragma("string") operator (C99 §6.10.9): queue the
             // de-escaped string content as a pragma for the pipeline to execute
             // (`_Pragma("foo")` is equivalent to `#pragma foo`).
@@ -3145,5 +3357,137 @@ mod builtin_table_tests {
         // defend against.
         assert_eq!(builtin_bit("__BASE_FILE__"), Some(1 << 1));
         assert!(!is_dynamic_builtin("__BASE_FILE__"));
+    }
+}
+
+#[cfg(test)]
+mod query_operator_lifetime_tests {
+    use super::*;
+
+    fn def(name: &str, body: &str) -> MacroDef {
+        MacroDef {
+            name: name.to_string(),
+            is_function_like: true,
+            params: vec!["x".to_string()],
+            is_variadic: false,
+            has_named_variadic: false,
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn undef_withdraws_every_query_operator_until_redefined() {
+        for name in [
+            "__has_builtin",
+            "__has_attribute",
+            "__has_c_attribute",
+            "__has_feature",
+            "__has_extension",
+            "__has_include",
+            "__has_include_next",
+            "__has_embed",
+            "__has_warning",
+            "__building_module",
+        ] {
+            let mut t = MacroTable::new();
+            assert!(t.is_defined(name), "{name} initially defined");
+            assert!(t.query_operator_active(name), "{name} initially active");
+            t.undefine(name);
+            assert!(!t.is_defined(name), "{name} suppressed");
+            assert!(!t.query_operator_active(name), "{name} inactive");
+            t.define(def(name, "7"));
+            assert!(t.is_defined(name), "{name} user macro defined");
+            assert!(!t.query_operator_active(name), "{name} user macro wins");
+            t.undefine(name);
+            assert!(!t.is_defined(name), "{name} user macro removed");
+            assert!(!t.query_operator_active(name), "{name} stays suppressed");
+        }
+    }
+
+    #[test]
+    fn push_pop_restores_operator_suppression_state() {
+        let mut t = MacroTable::new();
+        let active = t.snapshot_definition("__has_feature");
+        t.undefine("__has_feature");
+        let suppressed = t.snapshot_definition("__has_feature");
+        t.restore_definition("__has_feature", active);
+        assert!(t.query_operator_active("__has_feature"));
+        t.undefine("__has_feature");
+        t.define(def("__has_feature", "7"));
+        t.restore_definition("__has_feature", suppressed);
+        assert!(!t.is_defined("__has_feature"));
+        assert!(t.builtin_suppressed("__has_feature"));
+    }
+
+    #[test]
+    fn ordinary_macros_do_not_gain_operator_lifetime_rules() {
+        let mut t = MacroTable::new();
+        assert!(!t.is_defined("MY_QUERY"));
+        t.undefine("MY_QUERY");
+        assert!(!t.builtin_suppressed("MY_QUERY"));
+        assert!(!t.query_operator_active("MY_QUERY"));
+        t.define(def("MY_QUERY", "7"));
+        assert!(t.is_defined("MY_QUERY"));
+        assert!(!t.query_operator_active("MY_QUERY"));
+    }
+
+    fn obj(name: &str, body: &str) -> MacroDef {
+        MacroDef {
+            name: name.to_string(),
+            is_function_like: false,
+            params: Vec::new(),
+            is_variadic: false,
+            has_named_variadic: false,
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn raw_query_operands_survive_direct_alias_and_prescan_expansion() {
+        let mut t = MacroTable::new();
+        t.define(obj("M", "foo bar"));
+        t.define(obj("W", "\"-Wcpp\""));
+        // The resolver, not the line expander, owns the operand rule.
+        assert_eq!(
+            t.expand_line("__building_module(M)"),
+            "__building_module(M)"
+        );
+        assert_eq!(t.expand_line("__has_warning(W)"), "__has_warning(W)");
+        assert_eq!(t.expand_line("__has_feature(M)"), "__has_feature(M)");
+        t.define(obj("BM", "__building_module"));
+        t.define(obj("HW", "__has_warning"));
+        assert_eq!(t.expand_line("BM(M)"), "__building_module(M)");
+        assert_eq!(t.expand_line("HW(W)"), "__has_warning(W)");
+        t.define(def("ID", "x"));
+        assert_eq!(
+            t.expand_line("ID(__building_module(M))"),
+            "__building_module(M)"
+        );
+        // Missing-`(` recovery absorbs exactly one raw identifier operand.
+        assert_eq!(t.expand_line("__building_module M"), "__building_module M");
+    }
+
+    #[test]
+    fn user_macros_and_suppression_disable_raw_operand_protection() {
+        let mut t = MacroTable::new();
+        t.define(obj("M", "foo bar"));
+        t.define(def("__building_module", "7"));
+        assert_eq!(t.expand_line("__building_module(M)"), "7");
+        t.undefine("__building_module");
+        // Withdrawn operator is an ordinary identifier; M expands normally.
+        assert_eq!(
+            t.expand_line("__building_module(M)"),
+            "__building_module(foo bar)"
+        );
+    }
+
+    #[test]
+    fn query_arg_end_is_literal_aware_and_bounded() {
+        assert_eq!(MacroTable::query_arg_end(b"(a(b))", 0), 6);
+        assert_eq!(MacroTable::query_arg_end(b"(\")\")", 0), 5);
+        assert_eq!(MacroTable::query_arg_end(b"(')')", 0), 5);
+        assert_eq!(MacroTable::query_arg_end(b"(unterminated", 0), 13);
+        assert_eq!(MacroTable::query_arg_end(b"(", 0), 1);
+        assert_eq!(MacroTable::query_arg_end(b"(\"open)", 0), 7);
     }
 }

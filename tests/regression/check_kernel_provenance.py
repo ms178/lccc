@@ -184,7 +184,9 @@ def main() -> int:
             PKGDIR=str(pkg),
             KERNEL_WORK=str(tmp),
             # This fixture pins 6.18, independently of a real-kernel session's
-            # exported KVER (for example 6.18.58).
+            # exported KVER (see the fallback pin in scripts/kernel_version.sh,
+            # which the cross-source check below keeps in step with
+            # scripts/lccc_paths.py).
             KVER="6.18",
             LCCC=str(cc),
             LCCC_LD=str(cc),

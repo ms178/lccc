@@ -107,14 +107,40 @@ impl Default for ConditionalStack {
 
 /// Evaluate a preprocessor #if expression.
 /// This handles basic constant expressions, defined() operator, and macro expansion.
-pub fn evaluate_condition(expr: &str, macros: &MacroTable) -> (bool, Vec<String>) {
+pub fn evaluate_condition(expr: &str, macros: &MacroTable) -> (bool, Vec<String>, Option<String>) {
     // First expand macros in the expression (except inside defined())
     let expanded = expand_condition_macros(expr, macros);
     // Then evaluate the constant expression
     let tokens = tokenize_expr(&expanded, CharModel::current());
     let mut parser = ExprParser::new(&tokens);
     let result = parser.parse_ternary().0 != 0;
-    (result, parser.undefined)
+    // C11 6.10.1p4: after replacement the line must be a valid integer
+    // constant expression. Silently ignoring trailing tokens let a withdrawn
+    // `__has_feature(tls)` evaluate as the identifier alone (0) instead of
+    // rejecting the stray argument list, and hid other malformed conditions.
+    let error = if tokens.is_empty() {
+        Some("#if with no expression".to_string())
+    } else if parser.pos < tokens.len() {
+        Some(format!(
+            "missing binary operator before token '{}'",
+            expr_token_text(&tokens[parser.pos])
+        ))
+    } else {
+        None
+    };
+    (result, parser.undefined, error)
+}
+
+/// Spelling used by GCC's "missing binary operator before token" diagnostic.
+fn expr_token_text(token: &ExprToken) -> String {
+    match token {
+        ExprToken::Num(n, _) => n.to_string(),
+        ExprToken::Ident(name) => name.clone(),
+        ExprToken::Op(op) => (*op).to_string(),
+        ExprToken::LParen => "(".to_string(),
+        ExprToken::RParen => ")".to_string(),
+        ExprToken::Defined => "defined".to_string(),
+    }
 }
 
 /// Expand macros in a condition expression, handling `defined(X)` and `defined X` specially.
@@ -1175,5 +1201,38 @@ mod char_constant_tests {
         assert!(!eval_const_expr_with("'", X86));
         assert!(!eval_const_expr_with("L'", X86));
         assert!(eval_const_expr_with("'' == 0", X86));
+    }
+}
+
+#[cfg(test)]
+mod trailing_token_tests {
+    use super::*;
+
+    #[test]
+    fn stray_argument_list_is_rejected() {
+        let t = MacroTable::new();
+        let (value, undefined, error) = evaluate_condition("__has_feature(tls)", &t);
+        assert!(!value);
+        assert_eq!(undefined, vec!["__has_feature".to_string()]);
+        assert_eq!(
+            error.as_deref(),
+            Some("missing binary operator before token '('")
+        );
+    }
+
+    #[test]
+    fn empty_condition_is_rejected() {
+        let t = MacroTable::new();
+        let (_, _, error) = evaluate_condition("", &t);
+        assert_eq!(error.as_deref(), Some("#if with no expression"));
+    }
+
+    #[test]
+    fn valid_condition_has_no_trailing_error() {
+        let t = MacroTable::new();
+        let (value, undefined, error) = evaluate_condition("1 + 2 == 3", &t);
+        assert!(value);
+        assert!(undefined.is_empty());
+        assert!(error.is_none());
     }
 }
