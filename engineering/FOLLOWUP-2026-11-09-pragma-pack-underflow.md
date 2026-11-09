@@ -25,6 +25,19 @@ LCCC to reject it; this models the old state transition but is not a mutated
 compiler binary. The fixture is a narrow layout witness, not exhaustive ABI
 proof.
 
+A subsequent audit found that `_Pragma("pack(...)")` queued the directive's
+preprocessor effects but discarded the returned layout marker. Common macro
+wrappers could therefore silently produce natural rather than packed layout.
+For the supported complete literal forms (reset, push, pop, and canonical
+decimal alignment), macro expansion now emits a blue-painted marker at the
+operator's source position; the existing queued effect still owns diagnostics.
+The regression places multiple operators on one line, tests nested macro
+expansion and block scope, defines macros named like internal markers, and
+checks that `-E` output can be compiled again. This catches the previous
+missing-marker behavior. It does not establish full pragma grammar or every
+possible placement; octal, hexadecimal, suffixed and named forms are not
+implemented by this operator path.
+
 ## Evidence and limits
 
 Locally, GCC 16.2 (verified against the repository's pinned archive SHA-256)

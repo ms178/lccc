@@ -42,6 +42,26 @@ void f(void) {
     _Static_assert(sizeof(struct F) == 6, "block unmatched pop changed packing");
 }
 '''
+# Marker-like identifiers are deliberately defined as macros to exercise
+# blue-painting during rescan, not just straightforward operator expansion.
+OPERATOR_SOURCE = r'''#define PUSH _Pragma("pack(push, 1)")
+#define POP _Pragma("pack(pop)")
+#define __ccc_pack_push_1 incorrect_macro_expansion
+#define __ccc_pack_pop incorrect_macro_expansion
+PUSH struct A { char c; int i; }; POP struct B { char c; int i; };
+_Static_assert(sizeof(struct A) == 5, "operator push must affect A");
+_Static_assert(sizeof(struct B) == 8, "operator pop must restore default");
+#pragma pack(2)
+PUSH struct C { char c; int i; }; POP struct D { char c; int i; };
+_Static_assert(sizeof(struct C) == 5, "operator push must affect C");
+_Static_assert(sizeof(struct D) == 6, "operator pop must restore 2");
+#pragma pack()
+void f(void) {
+    PUSH struct E { char c; int i; }; POP struct F { char c; int i; };
+    _Static_assert(sizeof(struct E) == 5, "block operator push");
+    _Static_assert(sizeof(struct F) == 8, "block operator pop");
+}
+'''
 MESSAGE = "'#pragma pack (pop)' encountered without matching '#pragma pack (push)'"
 
 
@@ -67,12 +87,15 @@ def main():
     with tempfile.TemporaryDirectory(prefix='lccc-pack-underflow-') as tmp:
         source = Path(tmp) / 'pack.c'
         source.write_text(SOURCE, encoding='utf-8')
+        operator = Path(tmp) / 'operator.c'
+        operator.write_text(OPERATOR_SOURCE, encoding='utf-8')
         for compiler, flags in ([(compiler, []) for compiler in args.reference] +
                                 [(compiler, ['-m32']) for compiler in args.reference32]):
             # This is a layout/stack comparison, not a diagnostic parity claim.
-            command = [compiler, *flags, '-w', '-fsyntax-only', str(source)]
-            result = run(command)
-            require(result[0] == 0, 'reference layout', command, result)
+            for fixture in (source, operator):
+                command = [compiler, *flags, '-w', '-fsyntax-only', str(fixture)]
+                result = run(command)
+                require(result[0] == 0, 'reference layout', command, result)
             print(f'PASS reference layout: {compiler} {flags}', flush=True)
         # Replace the first unmatched pop with a reset. This models the old
         # state transition at the fixture boundary, not a mutated compiler.
@@ -97,7 +120,19 @@ def main():
             command = [compiler, '-fsyntax-only', '-Wno-pragmas', str(mutant)]
             result = run(command)
             require(result[0] != 0, 'reset-on-underflow fixture mutation was not detected', command, result)
-            print(f'PASS LCCC layout, diagnostics and fixture mutation: {compiler}', flush=True)
+            command = [compiler, '-fsyntax-only', '-Werror', str(operator)]
+            result = run(command)
+            require(result[0] == 0, 'operator layout', command, result)
+            command = [compiler, '-E', str(operator)]
+            result = run(command)
+            require(result[0] == 0 and '__ccc_pack_' not in result[1],
+                    'operator preprocessing leaked markers', command, result)
+            preprocessed = Path(tmp) / 'operator.i'
+            preprocessed.write_text(result[1], encoding='utf-8')
+            command = [compiler, '-fsyntax-only', '-Werror', str(preprocessed)]
+            result = run(command)
+            require(result[0] == 0, 'operator preprocessed round trip', command, result)
+            print(f'PASS LCCC layout, diagnostics, operator and fixture mutation: {compiler}', flush=True)
 
 
 if __name__ == '__main__':
