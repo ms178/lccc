@@ -4147,6 +4147,17 @@ impl Parser {
                     return None;
                 }
                 if *is_packed {
+                    // A packed record can still be explicitly aligned, either
+                    // on the record itself or on a member. Do not cache a
+                    // guessed alignment that would corrupt later constant folds.
+                    let fields = fields.as_ref()?;
+                    if struct_aligned.is_some()
+                        || fields
+                            .iter()
+                            .any(|f| f.alignment.is_some() || f.alignas_type.is_some())
+                    {
+                        return None;
+                    }
                     return Some(1);
                 }
                 // Explicit struct/union-level __attribute__((aligned(N))) overrides
@@ -4214,6 +4225,19 @@ mod named_space_target_tests {
     use super::*;
     use crate::common::types::{set_target_elf_machine, target_elf_machine};
     use crate::frontend::lexer::Lexer;
+
+    #[test]
+    fn packed_record_with_explicit_alignment_is_not_cached_as_one() {
+        let source = "struct __attribute__((packed)) Plain { char c; int x; };
+                      struct __attribute__((packed)) Member { int x __attribute__((aligned(8))); };
+                      struct __attribute__((packed, aligned(8))) Record { char x; };";
+        let mut parser = Parser::new(Lexer::new(source, 0).tokenize());
+        parser.parse();
+        assert_eq!(parser.error_count, 0);
+        assert_eq!(parser.struct_tag_alignments.get("Plain"), Some(&1));
+        assert!(!parser.struct_tag_alignments.contains_key("Member"));
+        assert!(!parser.struct_tag_alignments.contains_key("Record"));
+    }
 
     #[test]
     fn named_space_target_contract() {

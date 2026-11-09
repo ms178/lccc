@@ -728,10 +728,8 @@ mod switch_frame_tests {
             let low = (seed % 200) as i128 - 100;
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
             let high = (seed % 200) as i128 - 100;
-            let reference = low <= high
-                && ranges
-                    .iter()
-                    .any(|&(l, h)| l <= h && l <= high && low <= h);
+            let reference =
+                low <= high && ranges.iter().any(|&(l, h)| l <= h && l <= high && low <= h);
             assert_eq!(f.overlaps(low, high), reference, "{low}..={high}");
             f.add_range(low, high, BlockId(0));
             ranges.push((low, high));
