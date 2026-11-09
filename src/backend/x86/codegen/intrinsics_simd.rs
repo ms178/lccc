@@ -3269,9 +3269,21 @@ mod simd_operand_role_and_upper_state_tests {
         );
         let out = cg.state.out.buf.clone();
         assert!(handled, "the Vbroadcastss arm must handle the op");
+        // The claim is VALID here, so the arm may use it -- and it does when
+        // that is the cheapest form. What must not happen is a REGISTER COPY:
+        // with the fold available (`vbroadcastss mem, %ymm0`) moving `%ymm3`
+        // into `%ymm0` first would be a wasted instruction. Assert the
+        // instruction count, not which of the two optimal spellings wins, so a
+        // better emitter is never regressed into a test failure.
         assert!(
-            out.contains("vbroadcastss %ymm3, %ymm0"),
-            "a width-matched claim must be reused: {out}"
+            out.contains("vbroadcastss %ymm3, %ymm0")
+                || out.contains("vbroadcastss -32(%rbp), %ymm0"),
+            "a width-matched claim must reach the broadcast without a register \
+             copy: {out}"
+        );
+        assert!(
+            !out.contains("vmovdqa"),
+            "no staging copy may be emitted when the value has a home: {out}"
         );
     }
 }
