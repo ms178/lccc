@@ -41,6 +41,9 @@ struct AllocaInfo {
     block: usize,
     instruction: usize,
     size: usize,
+    /// Declared alignment of the home, needed to decide whether a write that
+    /// is re-pointed at it still satisfies the producer's alignment contract.
+    align: usize,
     volatile: bool,
     semantic_volatile: bool,
 }
@@ -65,6 +68,7 @@ fn collect_allocas(func: &IrFunction) -> FxHashMap<u32, AllocaInfo> {
             if let Instruction::Alloca {
                 dest,
                 size,
+                align,
                 volatile,
                 semantic_volatile,
                 ..
@@ -76,6 +80,7 @@ fn collect_allocas(func: &IrFunction) -> FxHashMap<u32, AllocaInfo> {
                         block: block_idx,
                         instruction: instruction_idx,
                         size: *size,
+                        align: *align,
                         volatile: *volatile,
                         semantic_volatile: *semantic_volatile,
                     },
@@ -1533,6 +1538,37 @@ fn plan_home_forwards(func: &IrFunction, allocas: &FxHashMap<u32, AllocaInfo>) -
                             aborted = true;
                             break;
                         };
+                        // The producer now writes into `store_dest` rather
+                        // than the home, so the write has to satisfy that
+                        // object's contract, not the home's. The audited
+                        // table grants the unaligned-safe result only on an
+                        // exact width match, so a destination of a different
+                        // size can demand real alignment.
+                        // The producer now writes into `store_dest` instead of
+                        // the home, so when that destination is a stack home
+                        // the write must satisfy THAT object's contract: the
+                        // audited table grants the unaligned-safe result only
+                        // on an exact width match, so a home of a different
+                        // size can demand real alignment.
+                        //
+                        // A destination that is not a home (a parameter or a
+                        // GEP -- the `vmovdqu %ymm0,(%rdi)` epilogue store in
+                        // `avx_fp_private`) needs no check at all: the relay
+                        // store already writes exactly `width` bytes through
+                        // that pointer, so the producer writes the same bytes
+                        // to the same place under the same contract.
+                        if let Some(dst) = allocas.get(&store_dest) {
+                            if dst.volatile || dst.semantic_volatile || width > dst.size {
+                                aborted = true;
+                                break;
+                            }
+                            if intrinsic_dest_required_alignment(*op, dest.is_some(), dst.size)
+                                .is_none_or(|need| need > dst.align)
+                            {
+                                aborted = true;
+                                break;
+                            }
+                        }
                         // Dominance for the moved use: when the destination
                         // is a stack home it must be defined in this block
                         // before the producer. An earlier block is not
