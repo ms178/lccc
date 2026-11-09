@@ -20,9 +20,11 @@ register's open findings are resolved; it is deliberately not a hard gate.
 from __future__ import annotations
 
 import importlib.util
+from functools import lru_cache
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -69,6 +71,46 @@ def load_driver_module():
 def run(cmd: list[str], timeout: float = 120.0) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True,
                           timeout=timeout, check=False)
+
+
+# A staged toolchain (gcc-16 from the harness cache, Clang 23, ICX) frequently
+# ships the compiler but NOT the ASan/UBSan runtimes.  The audit pack must not
+# then report a hard FAIL for an infrastructure reason: `check_simd_shape_matrix.py`
+# already documents exactly this fallback.  Only a MISSING SANITIZER RUNTIME
+# authorizes a fallback to the system compiler; a broken/absent configured
+# compiler must still fail closed (test_07b pins that behaviour).
+SAN_RUNTIME_MARKERS = ('libasan_preinit.o', '-lasan', '-lubsan',
+                       'libasan.so', 'libubsan.so', 'asan/asan_init')
+
+
+@lru_cache(maxsize=8)
+def sanitizer_compiler(cc: str, flags: tuple) -> str:
+    """Return a compiler able to LINK `flags`; else the configured `cc`.
+
+    `cc` is part of the cache key: test_07b mocks the module-level GCC with a
+    nonexistent binary and REQUIRES the gate to fail closed.  A cache keyed
+    only on flags would hand the mock the compiler chosen for the real GCC.
+    """
+    if not any('sanitize' in f for f in flags):
+        return cc
+    probe_src = Path(tempfile.gettempdir()) / 'lccc_san_probe.c'
+    probe_src.write_text('int main(void) { return 0; }\n', encoding='utf-8')
+    probe_out = Path(tempfile.gettempdir()) / 'lccc_san_probe.bin'
+    try:
+        first = run([cc, *flags, str(probe_src), '-o', str(probe_out)],
+                    timeout=60)
+        if first.returncode == 0:
+            return cc
+        diagnostic = (first.stdout + first.stderr).lower()
+        if not any(m in diagnostic for m in SAN_RUNTIME_MARKERS):
+            return cc  # real compiler failure - must fail closed
+        if cc == 'gcc' or shutil.which('gcc') is None:
+            return cc
+        second = run(['gcc', *flags, str(probe_src), '-o', str(probe_out)],
+                     timeout=60)
+        return 'gcc' if second.returncode == 0 else cc
+    except (OSError, subprocess.SubprocessError):
+        return cc
 
 
 class AuditPackTests(unittest.TestCase):
@@ -221,8 +263,8 @@ class AuditPackTests(unittest.TestCase):
         tag = 'san' if any('sanitize' in f for f in flags) else 'plain'
         exe = work / f'evex_probe_{tag}.bin'
         try:
-            proc = run([GCC, *flags, '-mavx512f', '-mavx512bw',
-                        str(src), '-o', str(exe)])
+            proc = run([sanitizer_compiler(GCC, tuple(flags)), *flags,
+                        '-mavx512f', '-mavx512bw', str(src), '-o', str(exe)])
             if proc.returncode != 0:
                 return False, (f'probe compile rc={proc.returncode}: '
                                f'{proc.stderr.strip()[:200]}')
@@ -263,7 +305,8 @@ class AuditPackTests(unittest.TestCase):
                                  ('avx512', ('-mavx512f', '-mavx512bw'))):
                 with self.subTest(src=src.name, isa=label):
                     exe = self.work / f'{src.stem}_{label}_san.bin'
-                    proc = run([GCC, *SAN_FLAGS, *extra, str(src), '-o', str(exe)])
+                    proc = run([sanitizer_compiler(GCC, SAN_FLAGS), *SAN_FLAGS,
+                                *extra, str(src), '-o', str(exe)])
                     self.assertEqual(proc.returncode, 0, proc.stderr)
                     if label != 'avx512' or san_ok:
                         for mode in modes:
