@@ -1627,6 +1627,7 @@ impl<'a> SemaConstEval<'a> {
                             crate::common::types::StructLayout::for_struct_with_packing(
                                 &struct_fields,
                                 max_field_align,
+                                *pragma_pack,
                                 &*self.types.borrow_struct_layouts(),
                                 reverse_sso.is_some_and(|v| v),
                             );
@@ -1659,6 +1660,7 @@ impl<'a> SemaConstEval<'a> {
                         let mut layout = crate::common::types::StructLayout::for_union_with_packing(
                             &union_fields,
                             max_field_align,
+                            *pragma_pack,
                             &*self.types.borrow_struct_layouts(),
                             reverse_sso.is_some_and(|v| v),
                         );
@@ -1862,6 +1864,7 @@ impl<'a> SemaConstEval<'a> {
                             crate::common::types::StructLayout::for_struct_with_packing(
                                 &struct_fields,
                                 max_field_align,
+                                *pragma_pack,
                                 &*self.types.borrow_struct_layouts(),
                                 reverse_sso.is_some_and(|v| v),
                             );
@@ -1894,6 +1897,7 @@ impl<'a> SemaConstEval<'a> {
                         let mut layout = crate::common::types::StructLayout::for_union_with_packing(
                             &union_fields,
                             max_field_align,
+                            *pragma_pack,
                             &*self.types.borrow_struct_layouts(),
                             reverse_sso.is_some_and(|v| v),
                         );

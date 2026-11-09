@@ -479,6 +479,7 @@ impl Lowerer {
                 StructLayout::for_union_with_packing(
                     &struct_fields,
                     max_field_align,
+                    pragma_pack,
                     &*self.types.borrow_struct_layouts(),
                     reverse_sso,
                 )
@@ -486,6 +487,7 @@ impl Lowerer {
                 StructLayout::for_struct_with_packing(
                     &struct_fields,
                     max_field_align,
+                    pragma_pack,
                     &*self.types.borrow_struct_layouts(),
                     reverse_sso,
                 )

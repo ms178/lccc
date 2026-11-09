@@ -5,6 +5,8 @@
 //! (DeclAnalysis), lvalue representation, switch context, function signature
 //! metadata, and typedef helpers.
 
+use std::collections::BTreeMap;
+
 use crate::common::fx_hash::FxHashMap;
 use crate::common::types::{AddressSpace, CType, IrType, RcLayout, SsoMode};
 use crate::frontend::parser::ast::Declaration;
@@ -341,6 +343,9 @@ pub(super) struct SwitchFrame {
     pub cases: Vec<(i128, BlockId)>,
     /// GNU case ranges: (low, high, label)
     pub case_ranges: Vec<(i128, i128, BlockId)>,
+    /// Disjoint, inclusive intervals in switch-type order, used only for
+    /// duplicate diagnostics; dispatch retains the original labels above.
+    pub covered: BTreeMap<u128, u128>,
     pub default_label: Option<BlockId>,
     pub expr_type: IrType,
 }
@@ -373,13 +378,42 @@ impl SwitchFrame {
         if low > high {
             return false;
         }
-        self.cases
-            .iter()
-            .any(|&(v, _)| (low..=high).contains(&self.order_key(v)))
-            || self.case_ranges.iter().any(|&(l, h, _)| {
-                let (l, h) = (self.order_key(l), self.order_key(h));
-                l <= h && l <= high && low <= h
-            })
+        self.covered
+            .range(..=high)
+            .next_back()
+            .is_some_and(|(_, &end)| end >= low)
+    }
+
+    /// Insert the union of a case or range into the interval index. Invalid
+    /// empty ranges name nothing. Overlapping erroneous labels are merged too,
+    /// so subsequent diagnostics see the same set as the original scan.
+    fn cover(&mut self, low: i128, high: i128) {
+        let (mut low, mut high) = (self.order_key(low), self.order_key(high));
+        if low > high {
+            return;
+        }
+        if let Some((&start, &end)) = self.covered.range(..=low).next_back() {
+            if end >= low {
+                low = start;
+                high = high.max(end);
+                self.covered.remove(&start);
+            }
+        }
+        while let Some((&start, &end)) = self.covered.range(low..=high).next() {
+            high = high.max(end);
+            self.covered.remove(&start);
+        }
+        self.covered.insert(low, high);
+    }
+
+    pub(super) fn add_case(&mut self, value: i128, label: BlockId) {
+        self.cover(value, value);
+        self.cases.push((value, label));
+    }
+
+    pub(super) fn add_range(&mut self, low: i128, high: i128, label: BlockId) {
+        self.cover(low, high);
+        self.case_ranges.push((low, high, label));
     }
 }
 
@@ -668,12 +702,49 @@ mod switch_frame_tests {
     use crate::ir::reexports::BlockId;
 
     fn frame(ty: IrType, cases: &[i128], ranges: &[(i128, i128)]) -> SwitchFrame {
-        SwitchFrame {
-            cases: cases.iter().map(|&v| (v, BlockId(0))).collect(),
-            case_ranges: ranges.iter().map(|&(l, h)| (l, h, BlockId(0))).collect(),
+        let mut frame = SwitchFrame {
+            cases: Vec::new(),
+            case_ranges: Vec::new(),
+            covered: Default::default(),
             default_label: None,
             expr_type: ty,
+        };
+        for &value in cases {
+            frame.add_case(value, BlockId(0));
         }
+        for &(low, high) in ranges {
+            frame.add_range(low, high, BlockId(0));
+        }
+        frame
+    }
+
+    #[test]
+    fn indexed_ranges_match_linear_reference_with_overlaps_and_empty_ranges() {
+        let mut f = frame(IrType::I32, &[], &[]);
+        let mut ranges: Vec<(i128, i128)> = Vec::new();
+        let mut seed = 0x1234_5678u32;
+        for _ in 0..4000 {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let low = (seed % 200) as i128 - 100;
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let high = (seed % 200) as i128 - 100;
+            let reference =
+                low <= high && ranges.iter().any(|&(l, h)| l <= h && l <= high && low <= h);
+            assert_eq!(f.overlaps(low, high), reference, "{low}..={high}");
+            f.add_range(low, high, BlockId(0));
+            ranges.push((low, high));
+        }
+    }
+
+    #[test]
+    fn many_distinct_cases_are_indexed() {
+        let mut f = frame(IrType::I32, &[], &[]);
+        for value in 0..30_000 {
+            assert!(!f.overlaps(value, value));
+            f.add_case(value, BlockId(0));
+        }
+        assert!(f.overlaps(0, 29_999));
+        assert!(!f.overlaps(30_000, 30_001));
     }
 
     #[test]

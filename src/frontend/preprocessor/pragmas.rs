@@ -19,6 +19,39 @@ pub(super) fn strip_pragma_keyword<'a>(text: &'a str, keyword: &str) -> Option<&
     Some(rest.trim_start())
 }
 
+/// Translate the already-destringized operand of `_Pragma` for the forms the
+/// parser already handles. Require a complete directive and canonical decimal
+/// integers: other spellings must not be guessed (e.g. `010` is octal in C).
+/// The ordinary pragma handler still owns diagnostics when effects are drained.
+pub(super) fn pack_operator_marker(text: &str) -> Option<String> {
+    let content = strip_pragma_keyword(text.trim(), "pack")?.trim();
+    let inner = content.strip_prefix('(')?.strip_suffix(')')?.trim();
+    let decimal = |s: &str| -> Option<usize> {
+        let s = s.trim();
+        if s.is_empty()
+            || (s.len() > 1 && s.starts_with('0'))
+            || !s.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        s.parse().ok()
+    };
+    match inner {
+        "" => Some("__ccc_pack_reset".to_string()),
+        "pop" => Some("__ccc_pack_pop".to_string()),
+        "push" => Some("__ccc_pack_push_only".to_string()),
+        _ => {
+            if let Some(rest) = strip_pragma_keyword(inner, "push") {
+                let n = decimal(rest.strip_prefix(',')?)?;
+                Some(format!("__ccc_pack_push_{n}"))
+            } else {
+                let n = decimal(inner)?;
+                Some(format!("__ccc_pack_set_{n}"))
+            }
+        }
+    }
+}
+
 /// The byte length of the narrow string literal `"..."` that `text` starts
 /// with, closing quote included, or `None` when `text` does not start with a
 /// complete one (no opening quote, or a quote escaped up to the end).
@@ -696,6 +729,41 @@ mod message_pragma_tests {
             Some((vec![0xc3, 0xa9], ""))
         );
         assert_eq!(leading_string_literal("'x'"), None);
+    }
+}
+
+#[cfg(test)]
+mod pack_operator_tests {
+    use super::pack_operator_marker;
+
+    #[test]
+    fn only_complete_supported_pack_forms_produce_markers() {
+        for (input, expected) in [
+            ("pack()", "__ccc_pack_reset"),
+            ("pack(0)", "__ccc_pack_set_0"),
+            ("pack(2)", "__ccc_pack_set_2"),
+            ("pack(push)", "__ccc_pack_push_only"),
+            ("pack ( push , 1 )", "__ccc_pack_push_1"),
+            ("pack(pop)", "__ccc_pack_pop"),
+        ] {
+            assert_eq!(pack_operator_marker(input).as_deref(), Some(expected));
+        }
+        for input in [
+            "pack(1",
+            "pack((1))",
+            "pack(1) junk",
+            "pack(push,)",
+            "pack(push 1)",
+            "pack(pushx)",
+            "pack(010)",
+            "pack(0x2)",
+            "pack(2U)",
+            "pack(push, name)",
+            "packet(1)",
+            "pack(1))",
+        ] {
+            assert_eq!(pack_operator_marker(input), None, "{input}");
+        }
     }
 }
 

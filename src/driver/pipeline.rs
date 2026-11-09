@@ -239,6 +239,9 @@ pub struct Driver {
     pub(super) debug_prefix_map: crate::common::path_map::PathPrefixMap,
     pub(super) macro_prefix_map: crate::common::path_map::PathPrefixMap,
     pub(super) defines: Vec<CliDefine>,
+    /// Command-line `-A` assertion specs, in option order (`pred=answer`
+    /// asserts, `-pred=answer` cancels that answer).
+    pub(super) assertions: Vec<String>,
     pub(super) include_paths: Vec<String>,
     /// Quote-only include paths (from -iquote flags).
     /// Searched only for `#include "file"` (quoted includes), after the current
@@ -839,6 +842,7 @@ impl Driver {
             debug_prefix_map: Default::default(),
             macro_prefix_map: Default::default(),
             defines: Vec::new(),
+            assertions: Vec::new(),
             include_paths: Vec::new(),
             quote_include_paths: Vec::new(),
             isystem_include_paths: Vec::new(),
@@ -2468,8 +2472,26 @@ impl Driver {
         if self.freestanding {
             preprocessor.define_macro("__STDC_HOSTED__", "0");
         }
+        self.apply_command_line_macro_state(preprocessor);
+        self.configure_include_paths(preprocessor)
+    }
+
+    /// Apply the user's `-D` definitions and `-A` assertion specs, then the
+    /// mandatory `_FORTIFY_SOURCE` undefine.  Runs after target selection so
+    /// `-A-pred=ans` can cancel a predefined answer, and after the dialect
+    /// macros so an explicit `-D` still wins.
+    fn apply_command_line_macro_state(&self, preprocessor: &mut Preprocessor) {
         for def in &self.defines {
             preprocessor.define_macro(&def.name, &def.value);
+        }
+        // GNU assertions: GCC reports a malformed spec against <command-line>
+        // and keeps compiling (witnessed: `-Afoo` prints the error, exit 0).
+        for spec in &self.assertions {
+            if let Err(message) = preprocessor.apply_cli_assertion(spec) {
+                crate::common::cli_output::stderr_line(format_args!(
+                    "<command-line>: error: {message}"
+                ));
+            }
         }
         // Disable _FORTIFY_SOURCE: glibc's fortification headers define extern
         // always_inline wrapper functions that use __builtin_va_arg_pack() and
@@ -2479,7 +2501,6 @@ impl Driver {
         // (infinite recursion or wrong control flow). Undefining _FORTIFY_SOURCE
         // prevents these wrappers from being emitted.
         preprocessor.undefine_macro("_FORTIFY_SOURCE");
-        self.configure_include_paths(preprocessor)
     }
 
     /// Install explicit search paths and report invocation-level path errors.

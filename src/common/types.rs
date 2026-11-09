@@ -1494,6 +1494,7 @@ impl StructLayoutBuilder {
         &mut self,
         field: &StructField,
         max_field_align: Option<usize>,
+        pragma_pack: Option<usize>,
         ctx: &dyn StructLayoutProvider,
     ) -> (usize, usize) {
         let natural_align = field.type_align.unwrap_or_else(|| field.ty.align_ctx(ctx));
@@ -1510,25 +1511,40 @@ impl StructLayoutBuilder {
         } else {
             natural_align
         };
+        // Unlike the packed attribute, pragma pack also caps explicit member
+        // alignment, including when both forms of packing are present.
+        let field_align = if field.bit_width == Some(0) {
+            // GCC and Clang ignore both record/field packed attributes and
+            // pragma pack when choosing a zero-width bitfield boundary.
+            natural_align.max(field.alignment.unwrap_or(1))
+        } else {
+            pragma_pack.map_or(field_align, |cap| field_align.min(cap))
+        };
         let field_size = field.ty.size_ctx(ctx);
-        self.max_align = self.max_align.max(field_align);
-        self.user_align |= field_contributes_user_align(field, natural_align, ctx);
+        // AArch64 counts anonymous bitfields for aggregate alignment; the
+        // x86 and RISC-V ABIs do not. A zero-width AArch64 field retains its
+        // uncapped boundary alignment even inside a packed record.
+        if !field.name.is_empty() || field.bit_width.is_none() || target_elf_machine() == 183 {
+            self.max_align = self.max_align.max(field_align);
+            self.user_align |= field_contributes_user_align(field, natural_align, ctx);
+        }
         (field_align, field_size)
     }
 
     /// Handle zero-width bitfield: force alignment to next storage unit boundary.
     fn layout_zero_width_bitfield(&mut self, field_align: usize) {
-        if self.in_bitfield {
-            if self.is_packed_1 {
-                let total_bits = (self.bf_unit_offset * 8) as u32 + self.bf_bit_pos;
-                self.offset = align_up((total_bits as usize).div_ceil(8), 1);
-            } else {
-                self.offset = self.bf_unit_offset + self.bf_unit_size;
-            }
-        }
+        self.close_bitfield_run();
         self.offset = align_up(self.offset, field_align);
-        self.in_bitfield = false;
-        self.bf_bit_pos = 0;
+    }
+
+    /// Close a bitfield run at the next byte, not the end of its declared
+    /// storage unit: a following zero-width char field can require less padding.
+    fn close_bitfield_run(&mut self) {
+        if self.in_bitfield {
+            self.offset = self.bf_unit_offset + (self.bf_bit_pos as usize).div_ceil(8);
+            self.in_bitfield = false;
+            self.bf_bit_pos = 0;
+        }
     }
 
     /// Layout a bitfield with pack(1) — contiguous bit stream, may span storage units.
@@ -1540,9 +1556,8 @@ impl StructLayoutBuilder {
             self.bf_unit_size = field_size;
             self.in_bitfield = true;
         }
-        let total_bit_offset = (self.bf_unit_offset * 8) as u32 + self.bf_bit_pos;
-        let storage_offset = (total_bit_offset / 8) as usize;
-        let bit_offset_in_storage = total_bit_offset % 8;
+        let storage_offset = self.bf_unit_offset + (self.bf_bit_pos / 8) as usize;
+        let bit_offset_in_storage = self.bf_bit_pos % 8;
 
         // Widen storage type if bitfield spans beyond declared type.
         let needed_bits = bit_offset_in_storage + bw;
@@ -1696,12 +1711,7 @@ impl StructLayoutBuilder {
 
     /// Layout a regular (non-bitfield) field.
     fn layout_regular_field(&mut self, field: &StructField, field_size: usize, field_align: usize) {
-        if self.in_bitfield {
-            let total_bits = (self.bf_unit_offset * 8) as u32 + self.bf_bit_pos;
-            self.offset = (total_bits as usize).div_ceil(8);
-            self.in_bitfield = false;
-        }
-
+        self.close_bitfield_run();
         self.offset = align_up(self.offset, field_align);
 
         // Reverse SSO: scalar members are stored byte-reversed. Mark every
@@ -1739,11 +1749,7 @@ impl StructLayoutBuilder {
 
     /// Finalize the layout: account for trailing bitfield and padding.
     fn finalize(mut self) -> StructLayout {
-        if self.in_bitfield {
-            let total_bits = (self.bf_unit_offset * 8) as u32 + self.bf_bit_pos;
-            self.offset = (total_bits as usize).div_ceil(8);
-        }
-
+        self.close_bitfield_run();
         let size = align_up(self.offset, self.max_align);
         StructLayout {
             is_complete: true,
@@ -1946,25 +1952,35 @@ impl StructLayout {
     ///   For __attribute__((packed)), pass Some(1).
     ///   For #pragma pack(N), pass Some(N).
     ///   For normal structs, pass None.
+    /// `pragma_pack`: independently caps even explicitly aligned members.
     /// `ctx`: provides struct/union layout lookup for nested struct/union field types.
     pub fn for_struct_with_packing(
         fields: &[StructField],
         max_field_align: Option<usize>,
+        pragma_pack: Option<usize>,
         ctx: &dyn StructLayoutProvider,
         reverse_sso: bool,
     ) -> Self {
         let mut b = StructLayoutBuilder::new(fields.len(), max_field_align, reverse_sso);
 
         for field in fields {
-            let (field_align, field_size) = b.compute_field_alignment(field, max_field_align, ctx);
+            let (field_align, field_size) =
+                b.compute_field_alignment(field, max_field_align, pragma_pack, ctx);
 
             if let Some(bw) = field.bit_width {
                 if bw == 0 {
                     b.layout_zero_width_bitfield(field_align);
-                } else if b.is_packed_1 || field.is_packed {
-                    b.layout_packed_bitfield(field, bw, field_size);
                 } else {
-                    b.layout_standard_bitfield(field, bw, field_size, field_align);
+                    if let Some(explicit) = field.alignment {
+                        b.close_bitfield_run();
+                        let placement = pragma_pack.map_or(explicit, |cap| explicit.min(cap));
+                        b.offset = align_up(b.offset, placement);
+                    }
+                    if b.is_packed_1 || field.is_packed {
+                        b.layout_packed_bitfield(field, bw, field_size);
+                    } else {
+                        b.layout_standard_bitfield(field, bw, field_size, field_align);
+                    }
                 }
             } else {
                 b.layout_regular_field(field, field_size, field_align);
@@ -1979,9 +1995,11 @@ impl StructLayout {
     ///   For __attribute__((packed)), pass Some(1).
     ///   For #pragma pack(N), pass Some(N).
     ///   For normal unions, pass None.
+    /// `pragma_pack`: independently caps even explicitly aligned members.
     pub fn for_union_with_packing(
         fields: &[StructField],
         max_field_align: Option<usize>,
+        pragma_pack: Option<usize>,
         ctx: &dyn StructLayoutProvider,
         reverse_sso: bool,
     ) -> Self {
@@ -2005,10 +2023,28 @@ impl StructLayout {
             } else {
                 natural_align
             };
+            let field_align = if field.bit_width == Some(0) {
+                natural_align.max(field.alignment.unwrap_or(1))
+            } else {
+                pragma_pack.map_or(field_align, |cap| field_align.min(cap))
+            };
             let field_size = field.ty.size_ctx(ctx);
-            max_align = max_align.max(field_align);
-            max_size = max_size.max(field_size);
-            user_align |= field_contributes_user_align(field, natural_align, ctx);
+            if !field.name.is_empty() || field.bit_width.is_none() || target_elf_machine() == 183 {
+                max_align = max_align.max(field_align);
+                user_align |= field_contributes_user_align(field, natural_align, ctx);
+            }
+            // Unnamed bitfields are never accessed and contribute only the
+            // bytes covered by their width. Named fields retain the declared
+            // storage unit until lowering supports exact-width accesses for
+            // small packed union members (otherwise they would overrun).
+            let occupied = if field.name.is_empty() {
+                field
+                    .bit_width
+                    .map_or(field_size, |width| (width as usize).div_ceil(8))
+            } else {
+                field_size
+            };
+            max_size = max_size.max(occupied);
 
             // For union bitfield members, set bit_offset to 0 (all fields start at byte 0)
             // and propagate bit_width so extraction is performed on read.
@@ -5595,7 +5631,7 @@ mod conditional_type_tests {
                 pointer_quals: Vec::new(),
             },
         ];
-        let layout = super::StructLayout::for_struct_with_packing(&fields, None, &ctx, false);
+        let layout = super::StructLayout::for_struct_with_packing(&fields, None, None, &ctx, false);
         assert_eq!(layout.align, 2);
         assert_eq!(layout.size, 10);
         assert_eq!(layout.fields[1].offset, 2);
@@ -5621,7 +5657,7 @@ mod conditional_type_tests {
             counted_by: None,
             pointer_quals: Vec::new(),
         }];
-        let l1 = super::StructLayout::for_struct_with_packing(&packed_bf, None, &ctx, false);
+        let l1 = super::StructLayout::for_struct_with_packing(&packed_bf, None, None, &ctx, false);
         assert_eq!(l1.align, 1);
         assert_eq!(l1.size, 1);
 
@@ -5641,7 +5677,8 @@ mod conditional_type_tests {
             counted_by: None,
             pointer_quals: Vec::new(),
         }];
-        let l2 = super::StructLayout::for_struct_with_packing(&pack2_bf, Some(2), &ctx, false);
+        let l2 =
+            super::StructLayout::for_struct_with_packing(&pack2_bf, Some(2), None, &ctx, false);
         assert_eq!(l2.align, 2);
         assert_eq!(l2.size, 2);
     }
@@ -5676,7 +5713,7 @@ mod conditional_type_tests {
         ];
 
         // struct __attribute__((aligned(16))) T { long long a, b; }
-        let mut t = super::StructLayout::for_struct_with_packing(&pair, None, &ctx, false);
+        let mut t = super::StructLayout::for_struct_with_packing(&pair, None, None, &ctx, false);
         t.apply_struct_aligned(Some(16));
         assert_eq!((t.size, t.align, t.member_align), (16, 16, 8));
 
@@ -5686,7 +5723,7 @@ mod conditional_type_tests {
             field("a", CType::LongLong, None),
             field("b", CType::LongLong, Some(16)),
         ];
-        let m = super::StructLayout::for_struct_with_packing(&member, None, &ctx, false);
+        let m = super::StructLayout::for_struct_with_packing(&member, None, None, &ctx, false);
         assert_eq!((m.size, m.align, m.member_align), (32, 16, 16));
 
         // struct __attribute__((packed, aligned(4))) { char c; long long x; }
@@ -5694,7 +5731,8 @@ mod conditional_type_tests {
             field("c", CType::Char, None),
             field("x", CType::LongLong, None),
         ];
-        let mut p = super::StructLayout::for_struct_with_packing(&packed, Some(1), &ctx, false);
+        let mut p =
+            super::StructLayout::for_struct_with_packing(&packed, Some(1), None, &ctx, false);
         p.apply_struct_aligned(Some(4));
         assert_eq!((p.size, p.align, p.member_align), (12, 4, 1));
 
@@ -5703,7 +5741,7 @@ mod conditional_type_tests {
             field("a", CType::LongLong, None),
             field("d", CType::Double, None),
         ];
-        let mut u = super::StructLayout::for_union_with_packing(&members, None, &ctx, false);
+        let mut u = super::StructLayout::for_union_with_packing(&members, None, None, &ctx, false);
         u.apply_struct_aligned(Some(16));
         assert_eq!((u.size, u.align, u.member_align), (16, 16, 8));
     }
@@ -5905,7 +5943,7 @@ mod fp_aggregate_abi_tests {
 
     fn riscv(fields: &[StructField]) -> Option<FpAggClass> {
         let ctx: super::FxHashMap<String, RcLayout> = Default::default();
-        StructLayout::for_struct_with_packing(fields, None, &ctx, false)
+        StructLayout::for_struct_with_packing(fields, None, None, &ctx, false)
             .classify_riscv_float_fields(&ctx)
     }
 

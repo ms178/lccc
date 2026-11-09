@@ -380,6 +380,7 @@ impl Lowerer {
                     fields,
                     false,
                     max_field_align,
+                    *pragma_pack,
                     reverse_sso.is_some_and(|v| v),
                 )))
             }
@@ -399,6 +400,7 @@ impl Lowerer {
                     fields,
                     true,
                     max_field_align,
+                    *pragma_pack,
                     reverse_sso.is_some_and(|v| v),
                 )))
             }
@@ -417,6 +419,7 @@ impl Lowerer {
         fields: &[StructFieldDecl],
         is_union: bool,
         max_field_align: Option<usize>,
+        pragma_pack: Option<usize>,
         reverse_sso: bool,
     ) -> StructLayout {
         let struct_fields: Vec<StructField> = fields
@@ -476,6 +479,7 @@ impl Lowerer {
             StructLayout::for_union_with_packing(
                 &struct_fields,
                 max_field_align,
+                pragma_pack,
                 &*self.types.borrow_struct_layouts(),
                 reverse_sso,
             )
@@ -483,6 +487,7 @@ impl Lowerer {
             StructLayout::for_struct_with_packing(
                 &struct_fields,
                 max_field_align,
+                pragma_pack,
                 &*self.types.borrow_struct_layouts(),
                 reverse_sso,
             )

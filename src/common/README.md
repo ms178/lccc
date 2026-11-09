@@ -261,8 +261,8 @@ A `StructLayoutBuilder` handles the stateful layout algorithm, tracking the
 current byte offset, maximum alignment, and bitfield accumulation state.
 
 StructLayout public methods:
-- Construction: `for_struct_with_packing(fields, max_field_align, ctx)`,
-  `for_union_with_packing(fields, max_field_align, ctx)`, `empty()`,
+- Construction: `for_struct_with_packing(fields, max_field_align, pragma_pack, ctx, reverse_sso)`,
+  `for_union_with_packing(fields, max_field_align, pragma_pack, ctx, reverse_sso)`, `empty()`,
   `empty_union()`, `empty_rc()`, `empty_union_rc()`.
 - ABI classification: `classify_sysv_eightbytes(ctx)` -- System V AMD64 ABI
   eightbyte classification for register passing. Returns a vector of

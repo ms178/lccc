@@ -1648,6 +1648,19 @@ impl MacroTable {
                 .push(ExpansionEffect::Pragma(format!("message {expanded}"), line));
             return k + 1;
         }
+        if !self.asm_mode
+            && let Some(marker) = super::pragmas::pack_operator_marker(&content)
+        {
+            // Unlike preprocessor-only effects, pack changes parser-owned
+            // state. Emit its marker at the operator's position, not when the
+            // queued effects are drained after the line. Paint it so macro
+            // rescanning cannot rewrite the internal identifier.
+            result.push('\n');
+            result.push(BLUE_PAINT_MARKER as char);
+            result.push_str(&marker);
+            result.push_str(" ;\n");
+            result.push_str(&format!("# {line} {}\n", self.source_filename));
+        }
         if crate::common::diagnostic_pragma::is_diagnostic_pragma(content.trim()) {
             // Blue-paint the directive keywords: the replacement is rescanned,
             // but a user macro named GCC/diagnostic/push must not rewrite it.

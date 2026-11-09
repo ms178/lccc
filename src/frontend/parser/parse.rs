@@ -1610,6 +1610,14 @@ impl Parser {
     /// the error points at the previous token's end position and suggests inserting
     /// the missing token, which matches GCC's behavior.
     pub(super) fn expect_after(&mut self, expected: &TokenKind, context: &str) -> Span {
+        // `_Pragma` is permitted between a complete declaration and its
+        // semicolon (Clang PR28094). Its synthetic marker carries its own
+        // semicolon; consume that one before looking for the source delimiter.
+        if matches!(expected, TokenKind::Semicolon) {
+            while self.handle_pragma_pack_token() {
+                self.consume_if(&TokenKind::Semicolon);
+            }
+        }
         if std::mem::discriminant(self.peek()) == std::mem::discriminant(expected) {
             let span = self.peek_span();
             self.advance();
@@ -3773,13 +3781,18 @@ impl Parser {
                 true
             }
             TokenKind::PragmaPackPop => {
+                let span = self.peek_span();
                 self.advance();
-                // Pop previous alignment from stack
                 if let Some(prev) = self.pragma_pack_stack.pop() {
                     self.pragma_pack_align = prev;
                 } else {
-                    // Stack underflow: reset to default
-                    self.pragma_pack_align = None;
+                    // GCC leaves the current alignment unchanged on underflow.
+                    // Diagnose at the token so scoped -Wpragmas settings apply.
+                    self.diagnostics.warning_with_kind(
+                        "'#pragma pack (pop)' encountered without matching '#pragma pack (push)'",
+                        span,
+                        crate::common::error::WarningKind::Pragmas,
+                    );
                 }
                 true
             }
@@ -4134,6 +4147,24 @@ impl Parser {
                     return None;
                 }
                 if *is_packed {
+                    // A packed record can still be explicitly aligned, either
+                    // on the record itself or on a member. Do not cache a
+                    // guessed alignment that would corrupt later constant folds.
+                    let fields = fields.as_ref()?;
+                    if struct_aligned.is_some()
+                        || fields.iter().any(|f| {
+                            f.alignment.is_some()
+                                || f.alignas_type.is_some()
+                                // On AArch64 even an unnamed zero-width
+                                // bitfield can raise a packed record's
+                                // alignment; an unevaluated width is not safe
+                                // to guess at parser time.
+                                || (crate::common::types::target_elf_machine() == 183
+                                    && f.bit_width.is_some())
+                        })
+                    {
+                        return None;
+                    }
                     return Some(1);
                 }
                 // Explicit struct/union-level __attribute__((aligned(N))) overrides
@@ -4201,6 +4232,41 @@ mod named_space_target_tests {
     use super::*;
     use crate::common::types::{set_target_elf_machine, target_elf_machine};
     use crate::frontend::lexer::Lexer;
+
+    #[test]
+    fn packed_record_with_explicit_alignment_is_not_cached_as_one() {
+        let source = "struct __attribute__((packed)) Plain { char c; int x; };
+                      struct __attribute__((packed)) Member { int x __attribute__((aligned(8))); };
+                      struct __attribute__((packed, aligned(8))) Record { char x; };";
+        let mut parser = Parser::new(Lexer::new(source, 0).tokenize());
+        parser.parse();
+        assert_eq!(parser.error_count, 0);
+        assert_eq!(parser.struct_tag_alignments.get("Plain"), Some(&1));
+        assert!(!parser.struct_tag_alignments.contains_key("Member"));
+        assert!(!parser.struct_tag_alignments.contains_key("Record"));
+    }
+
+    #[test]
+    fn packed_zero_width_bitfield_is_not_cached_as_one_on_aarch64() {
+        struct RestoreTarget(u16);
+        impl Drop for RestoreTarget {
+            fn drop(&mut self) {
+                set_target_elf_machine(self.0);
+            }
+        }
+        let _restore = RestoreTarget(target_elf_machine());
+        let source = "struct __attribute__((packed)) Z { char c; unsigned :0; char x; };";
+        for machine in [3, 62, 183, 243] {
+            set_target_elf_machine(machine);
+            let mut parser = Parser::new(Lexer::new(source, 0).tokenize());
+            parser.parse();
+            assert_eq!(parser.error_count, 0);
+            assert_eq!(
+                parser.struct_tag_alignments.get("Z"),
+                if machine == 183 { None } else { Some(&1) }
+            );
+        }
+    }
 
     #[test]
     fn named_space_target_contract() {

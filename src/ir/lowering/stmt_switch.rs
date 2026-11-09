@@ -72,6 +72,7 @@ impl Lowerer {
         self.func_mut().switch_stack.push(SwitchFrame {
             cases: Vec::new(),
             case_ranges: Vec::new(),
+            covered: Default::default(),
             default_label: None,
             expr_type: switch_expr_ty,
         });
@@ -449,7 +450,7 @@ impl Lowerer {
             self.emit_error("duplicate case value", span);
         }
         if let Some(frame) = self.func_mut().switch_stack.last_mut() {
-            frame.cases.push((case_val, label));
+            frame.add_case(case_val, label);
         }
         // Fallthrough from previous case
         self.terminate(Terminator::Branch(label));
@@ -485,7 +486,7 @@ impl Lowerer {
             self.emit_error("duplicate (or overlapping) case value", span);
         }
         if let Some(frame) = self.func_mut().switch_stack.last_mut() {
-            frame.case_ranges.push((low_val, high_val, label));
+            frame.add_range(low_val, high_val, label);
         }
         self.terminate(Terminator::Branch(label));
         self.start_block(label);

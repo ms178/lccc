@@ -47,6 +47,13 @@ pub struct Lowerer {
     pub(super) next_label: u32,
     pub(super) next_string: u32,
     pub(super) next_anon_struct: u32,
+    /// Dynamic VLA metadata minted for anonymous record definitions the
+    /// current local declaration is registering: address of the exact
+    /// `TypeSpecifier` node -> layout key. Addresses disambiguate nested
+    /// anonymous definitions (including same-span macro clones) and MUST be
+    /// cleared when the declaration ends — the nodes may be temporary
+    /// resolved clones, so a stale entry would dangle.
+    pub(super) pending_anon_vla: FxHashMap<usize, String>,
     /// `(record key, layout address)` -> the key its debug DIEs are described
     /// under.  One entry per body-scope definition, shared by every variable
     /// that names it.
@@ -418,6 +425,7 @@ impl Lowerer {
             next_label: 0,
             next_string: 0,
             next_anon_struct: 0,
+            pending_anon_vla: FxHashMap::default(),
             debug_record_keys: FxHashMap::default(),
             debug_record_layouts: FxHashMap::default(),
             next_static_local: 0,

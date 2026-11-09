@@ -11000,6 +11000,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
                 StructLayout::for_union_with_packing(
                     &struct_fields,
                     max_field_align,
+                    pragma_pack,
                     &*self.result.type_context.borrow_struct_layouts(),
                     reverse_sso,
                 )
@@ -11007,6 +11008,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
                 StructLayout::for_struct_with_packing(
                     &struct_fields,
                     max_field_align,
+                    pragma_pack,
                     &*self.result.type_context.borrow_struct_layouts(),
                     reverse_sso,
                 )
@@ -11633,8 +11635,10 @@ mod record_layouts_correspond_tests {
         let layouts: FxHashMap<String, RcLayout> = FxHashMap::default();
         assert!(!StructLayout::empty().is_complete);
         assert!(!StructLayout::empty_union().is_complete);
-        assert!(StructLayout::for_struct_with_packing(&[], None, &layouts, false).is_complete);
-        assert!(StructLayout::for_union_with_packing(&[], None, &layouts, false).is_complete);
+        assert!(
+            StructLayout::for_struct_with_packing(&[], None, None, &layouts, false).is_complete
+        );
+        assert!(StructLayout::for_union_with_packing(&[], None, None, &layouts, false).is_complete);
     }
 
     #[test]
