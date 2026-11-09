@@ -1645,3 +1645,173 @@ wraparound, fully initialised load, no correctness assertion because it
 measures).  Re-run on this host: LCCC **2 384 374** vs GCC 16.2 **503 944**
 cycles / 200 000 calls = **4.73×**.  `f1` is byte-identical between them, so
 the ratio is entirely caller overhead.
+
+### 9c.10.14 FIXED: the vector reload round-trip — measured −40%, and the hypothesis that failed
+
+§9c.10.12 recorded the gap and three candidate causes.  Before writing any
+compiler code, each candidate was **priced** by hand-patching the emitted
+assembly of `tests/simd/vector_home_call_loop.c`, assembling, and timing it
+(best-of-20 `rdtsc`, 200 000 calls, this AVX-512 host):
+
+| variant | loop instrs | cycles | vs baseline |
+|---|---|---|---|
+| v0 baseline | 16 | 2 374 298 | — |
+| v1 drop the duplicated `leaq`+`andq` only | 14 | 2 401 392 | **+1.1% (no gain)** |
+| v2 v1 + store→reload forwarding | 14 | 1 425 636 | **−40.0%** |
+| v3 v2 + copy-propagation retires the dead spill | 10 | 1 338 942 | **−43.6%** |
+| v4 v3 + direct call instead of `@PLT` | 10 | 1 331 694 | −43.9% |
+
+**The obvious hypothesis was wrong.**  Removing the redundant address
+arithmetic — two instructions per iteration, the thing that *looks* wasteful
+— buys nothing: the ALU work is hidden by the out-of-order engine.  What
+costs is the **store-to-load forwarding stall** on the loop-carried
+dependency chain.  Without this measurement the effort would have gone into
+a CSE pass that shipped a 0% win.
+
+So the fix is `aligned_vector_reload::forward_aligned_vector_reload`
+(`src/backend/x86/codegen/peephole/passes/aligned_vector_reload.rs`), run in
+phase 2 **before** copy propagation so the register copy it creates lets the
+existing copy-propagation and dead-store passes retire the orphaned spill in
+the same round — that is how v2's −40.0% becomes v3's −43.6% without writing
+a dead-store pass.
+
+**Why a new pass instead of extending `global_store_forwarding`.**  That pass
+keys mappings by a literal `off(%rbp)` offset and models GP families plus the
+*scalar-FP* XMM sizes; its `MoveSize`/`RegHomes` invariants are woven through
+~2800 lines that assume a ≤64-bit value.  This shape is indirect-addressed
+and whole-register.  Widening those invariants would put every existing
+store-forwarding decision at risk; a separate walk whose whole state is
+provable from the instructions it just seen is auditable in one sitting.
+
+**Design: canonical frame keys, not register identity.**  The tracked
+address is `(disp, align)` relative to `%rbp`, established by
+`leaq K(%rbp), %r` and refined by `andq $-A, %r`.  That is what lets the
+reload fire even though `%rax` was re-derived in between — the failure mode
+a register-identity analysis would miss.  `%rbp` needs no frame-pointer
+proof: anything that could change it is not a recognised form and clears the
+state, and `leave` (which changes `%rbp` without naming it) is rejected
+explicitly.  `%rsp` is refused as a key base and as a tracked destination
+because it moves implicitly.
+
+**Blunt invalidation is the safety argument.**  A pending store survives only
+across the address idiom, inert directives/nops, and a reload it just
+forwarded into a *different* vector register.  Every other line — call,
+label, branch, `ret`, unknown store, ALU op, inline asm, data directive —
+clears everything.  "The source register is intact" and "nothing wrote that
+memory" are therefore true by construction, not by a clobber analysis that
+could be wrong.  The driver pins inline-asm and volatile regions at
+`passes/mod.rs:683-684`, **before** phase 2 at `:1782`, so those arrive as
+`pinned` and clear the state too; that ordering was verified in the source,
+not assumed.
+
+**Width and encoding class.**  A load *no wider* than the store forwards,
+with the source re-viewed at the load's width (`%ymm0` → `%xmm0`), because a
+narrower load at offset 0 reads exactly the low bytes of the stored
+register.  A wider load is refused.  The encoding class must match: a
+legacy-SSE 128-bit load preserves the upper YMM bits while a VEX-128 load
+zeroes them, so mixing classes would change the destination's upper half.
+The emitted instruction reuses the **load's own mnemonic** in register form
+— the smallest possible semantic delta, needing exactly the ISA feature the
+load already needed.
+
+**No cycles left behind in the compiler either.**  All pass state is `Copy`
+(`VecReg` is a (width, index) pair, not a `String`), the mnemonic is interned
+as a `&'static str` from the table rather than copied, and the only
+allocation is the one `format!` that builds a replacement that has already
+passed every filter.  `check_peephole_alloc_before_filter.py` **PASS**.
+
+**Placement was itself measured and corrected.**  The first version ran the
+fold in phase 2, which left the register copy it creates unpropagated: the
+post-global cleanup loop re-runs the GP passes but *not*
+`propagate_vector_copies` / `eliminate_dead_vector_copies` — those live in the
+phase-1 fixpoint (`passes/mod.rs:1412`, `:1421`).  Moving the fold into that
+fixpoint immediately before `vector_copy_prop` makes the existing propagator
+rewrite the consumer in the same iteration (`vmovups %ymm3, (%rax)` becomes
+`vmovups %ymm0, (%rax)`), with **zero new pass invocations**.  The alternative
+— duplicating vector cleanup into phase 2b — was rejected: the source records
+that an earlier *ungated* re-run there caused interaction miscompiles.
+
+**Final measurement, shipped placement.**  Single binary, toggling only
+`CCC_PEEPHOLE_SKIP=aligned_vec_reload`, six **interleaved** rounds so machine
+drift cannot bias one arm:
+
+| statistic | pass off | pass on | delta |
+|---|---|---|---|
+| best-of-6 | 2 803 904 | 1 728 838 | **−38.3%** |
+| median | 2 869 782 | 1 780 395 | **−38.0%** |
+
+The two statistics agreeing within 0.3 points is the reason to trust this
+number: a single timed run of this loop drifted between 2.37 M and 2.87 M
+cycles across the session, so any one-shot percentage quoted from it would
+have been noise.
+
+**Remaining headroom, priced but not claimed.**  After propagation the loop
+still carries a dead `vmovups %ymm0, %ymm3` and the now-orphaned spill store.
+Hand-removing both gives 1 695 212 cycles against 1 807 036 for the same
+assembly at that time (**−6.2%** further).  They survive because
+`eliminate_dead_stores` keys on a literal slot offset and this store is
+indirect `(%rax)` — the same root cause as §9c.10.12 defect 3.  That is a
+frame-layout question, recorded rather than forced.
+
+**GitHub CI on the delivered head: all green** — 23 successful check-runs,
+3 skipped, **0 failures**; the `CI` workflow 19/19.  The steps that exercise
+this change all passed: *Build and package compiler*, *Clippy*,
+*Assertion-enabled units and corpus* (the 42 unit tests under debug
+assertions and overflow checks), *Codegen and runtime contracts (shard b)*
+including both new gate steps.
+
+**Tests.**  42 Rust unit tests in the pass module (every refusal, both
+encoding classes, all three widths, narrowing, self-reload, two readers,
+`i64::MIN` mask, 20-digit displacement, unbalanced parens, idempotence, empty
+input); `tests/simd/aligned_vector_reload_diff.c` — 11 differential kernels
+whose checksums must match GCC 16.2 and Clang 23.1.5, warning-free under
+fourteen GCC flags; `tests/simd/check_aligned_vector_reload.py` + 26
+self-tests, a structural gate with an `--expect-defect` mode that proves it
+goes red on a pre-fix compiler.
+
+### 9c.10.15 Found while testing: `_Alignas` may silently REDUCE alignment (open)
+
+Writing the differential test for §9c.10.14 uncovered a **frontend
+conformance defect unrelated to SIMD**.  C11 6.7.5p3 makes it a constraint
+that an alignment specifier shall not be less strict than the type requires,
+so a diagnostic is mandatory.  Measured on this host:
+
+| source | GCC 16.2 | Clang 23.1.5 |
+|---|---|---|
+| `_Alignas(1) double d;` | **error** | **error** |
+| `_Alignas(4) double d;` | **error** | **error** |
+| `struct S { _Alignas(1) double d; };` | **error** | **error** |
+| `typedef double D; _Alignas(4) D d;` | **error** | **error** |
+| `double d __attribute__((aligned(1)));` | accepted | accepted |
+| `_Alignas(0) double d;` | accepted | accepted |
+| `_Alignas(1) _Alignas(8) double d;` | accepted | accepted |
+| `_Alignas(8) _Alignas(1) double d;` | accepted | accepted |
+| `_Alignas(1) char c;` | accepted | accepted |
+| `_Alignas(1) double d __attribute__((aligned(8)));` | **error** | **accepted** |
+
+LCCC accepts every row, including the four both references reject.
+
+Two facts make this more than a one-line check.  First, the **GNU attribute
+is allowed to reduce alignment** and both references accept it, so the fix
+must not diagnose that spelling — but LCCC's parser merges both into one
+`Declaration::alignment` with `.max()`
+(`src/frontend/parser/declarations.rs:2412` for `_Alignas`, `:2422` for the
+attribute), so the provenance is gone by the time sema sees it.  Second, the
+last row shows **GCC and Clang disagree** when an attribute raises the
+effective alignment back above the natural one: GCC checks each `_Alignas`
+specifier, Clang checks the effective alignment.
+
+The rule both agree on is "the max of the `_Alignas` specifiers must be at
+least the natural alignment, and `_Alignas(0)` has no effect".  A single
+provenance bit plus a check of the merged alignment in sema
+(`src/frontend/sema/analysis.rs:1988`) reproduces Clang's column exactly and
+differs from GCC only on the row where the two already disagree.
+
+**Why it is not in this PR.**  `parsed_alignas` is taken, saved, restored and
+merged at **47 sites** across four parser files, and one of those sites
+carries a comment recording a previous leak bug of exactly this kind
+(`declarators.rs:1067`).  Threading provenance through them is a frontend
+refactor whose blast radius is every declaration in the language; bundling
+it with a measured codegen win would put the whole delivery at risk.  It is
+recorded here with the full reference matrix so the next change starts from
+evidence.

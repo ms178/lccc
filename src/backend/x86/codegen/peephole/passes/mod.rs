@@ -23,6 +23,7 @@ use crate::backend::regalloc::RaConfig;
 
 // Submodule pass implementations
 mod abs_cmov;
+mod aligned_vector_reload;
 mod bmi2_mask;
 mod callee_saves;
 mod compare_branch;
@@ -1388,6 +1389,25 @@ fn peephole_optimize_inner(
                 trace("coalesce_vector_brackets", pass_count, c, &store, &infos);
                 changed |= c;
             }
+        }
+        // Full-width vector reloads of a just-stored over-aligned frame
+        // address (the `lea K(%rbp); and $-A; store; ...; reload` copy-out
+        // shape the codegen emits for an over-aligned home).
+        //
+        // Placed in the phase-1 fixpoint IMMEDIATELY BEFORE the vector copy
+        // propagator, not in phase 2: the reload becomes a register copy, and
+        // `propagate_vector_copies` + `eliminate_dead_vector_copies` below then
+        // retire that copy in the SAME iteration, after which the phase-2
+        // dead-store pass can drop the orphaned spill.  Running it in phase 2
+        // instead left the copy unpropagated, because the post-global cleanup
+        // loop re-runs the GP passes but not the vector ones — measured 17 loop
+        // instructions instead of 10, and 1 807 036 cycles instead of
+        // 1 695 212 on tests/simd/vector_home_call_loop.c.  This ordering buys
+        // that difference without adding a single new pass invocation.
+        if !sk("aligned_vec_reload") {
+            let c = aligned_vector_reload::forward_aligned_vector_reload(&mut store, &mut infos);
+            trace("aligned_vec_reload", pass_count, c, &store, &infos);
+            changed |= c;
         }
         if !sk("vector_copy_prop") {
             {
